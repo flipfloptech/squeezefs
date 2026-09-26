@@ -2058,8 +2058,15 @@ impl KvMetaBackend {
     }
 
     /// **The writer's bring-up after its door** — steps (6) and (7) of
-    /// [`Self::open_writer`], shared with every OFFLINE writable verb
-    /// (`claim clear`, `appender clear`, the harness's claim planter):
+    /// [`Self::open_writer`] (the mount's door and every offline verb that
+    /// opens through [`Self::open`] / [`Self::open_for_sym_upgrade`]),
+    /// walked by EVERY direct `open_inner(.., Writer, ..)` door as well —
+    /// [`Self::claim_clear`], both writer opens of
+    /// [`Self::appender_clear`] (PR 14 fix round 1, Issue 1 — the record's
+    /// §4.4bf: the verb flushed the crashed manager's replayed window under
+    /// `(0, 0)` and lost its acked creates), and the harness's claim
+    /// planter (`test_plant_writer_claim`); `tests/writer_door_bring_up_
+    /// tests.rs` is the rail that keeps a fourth door inside the law:
     /// prime the frame stamps, restore the own-residue pools, cover the
     /// bring-up residue BEFORE the volume serves (and before the cadence
     /// task exists — same inline-guarded-cycles posture as

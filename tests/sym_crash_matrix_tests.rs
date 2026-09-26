@@ -1408,6 +1408,149 @@ async fn appender_clear_refuses_a_live_lease_and_attests_a_dead_one() {
     reset_process_state();
 }
 
+/// **PR 14 fix round 1, Issue 1 (the record's §4.4bf) — the §4.4ax class
+/// through the operator's remedy.** `appender clear` is usable only once
+/// the manager's claim is stale, i.e. after the manager CRASHED, so the
+/// verb's own writer open replays the dead manager's UNCOVERED ring-0
+/// window — its last acked creates, dirty in RAM. The verb then flushed
+/// them with `checkpoint_now` on an open that never walked the writer's
+/// bring-up: no frame fence, so every slot-tree leaf the window touched
+/// was appended under the structural `(0, 0)` stamp, the ledger advanced
+/// past the window, and the next writer's rule-3 screen ended each such
+/// leaf's log at that frame — a rotor directory's leaf whose earlier
+/// frames stood at `g ≥ 1` lost every acked create of the window (the
+/// reviewer's probe: 8 of 8, `foreign_frames_screened` 0 → 1). Both of
+/// the verb's writer opens walk [`KvMetaBackend::writer_bring_up`] now
+/// (`claim clear`'s ladder: prime → own pools → cover → join), so the
+/// flush carries the leases' generations and the verb is a transient
+/// manager whose clean leave leaves page 0 `Free`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appender_clear_over_a_crashed_managers_window_stamps_the_leases_generation() {
+    use squeezefs::meta_backend::kv::META_KV_FOREIGN_FRAMES_SCREENED;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set_with_config(dir.path(), 1).await;
+    let path = std::path::Path::new(&uris[0]);
+    // A rotor directory with 8 CHECKPOINTED files: its leaf's frames stand
+    // at the slot's lease generation (≥ 1) before the crash window.
+    let (shared, rotor, seeded) = {
+        let routed = open_under(&uris, &Knobs::armed()).await;
+        let shared = seed_dir_in_slot(&routed, 0, SLOT_A, "shared").await;
+        let rotor = routed
+            .create(ROOT_INO, "rotor", libc::S_IFDIR | 0o755, 1000, 1000)
+            .await
+            .unwrap()
+            .ino;
+        let mut seeded = Vec::new();
+        for i in 0..8 {
+            let name = format!("k{i}");
+            let ino = routed
+                .create(rotor, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+                .unwrap()
+                .ino;
+            seeded.push((name, ino));
+        }
+        let vol = Arc::clone(&routed.volumes[0]);
+        vol.checkpoint_now().await.unwrap();
+        vol.release_slot_handover(0, SLOT_A).await.unwrap();
+        shutdown(&routed).await;
+        (shared, rotor, seeded)
+    };
+    // The crash: 3 creates in the declared region's ring and 8 acked
+    // creates under the rotor directory in ring 0 — the manager's own
+    // window, covered by nothing when the mount is DROPPED.
+    let x = foreign(72);
+    let (region_files, window_files) = {
+        let routed = open_under_retry(&uris, &Knobs::armed().partition("1:4"))
+            .await
+            .unwrap();
+        let venue = HoldersVenue::stand_up(&routed, &[1]).await;
+        let mut region_files = Vec::new();
+        for f in 0..3 {
+            let name = format!("r{f}");
+            let ino = routed
+                .create(shared, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+                .unwrap()
+                .ino;
+            region_files.push((name, ino));
+        }
+        let mut window_files = Vec::new();
+        for f in 0..8 {
+            let name = format!("a{f}");
+            let ino = routed
+                .create(rotor, &name, libc::S_IFREG | 0o644, 1000, 1000)
+                .await
+                .unwrap()
+                .ino;
+            window_files.push((name, ino));
+        }
+        venue.tear_down();
+        drop(routed);
+        park_gate::test_reset();
+        alloc_lease::test_clear_holdings();
+        (region_files, window_files)
+    };
+    restamp_page_identity(&uris[0], 1, x).await;
+    // The verb, straight after the crash: the killed manager's claim is
+    // fresh for the TTL and the parked-joiner bound follows it — the
+    // operator's wait is the seam (no clean mount cycle in between, so
+    // the verb's own open is what replays the window).
+    let screened0 = META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed);
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(
+        squeezefs::fuse_client::CLIENT_STALE_TTL_SECS + 7_200,
+        Ordering::SeqCst,
+    );
+    let out = KvMetaBackend::appender_clear(path, path, 1).await;
+    recovery::TEST_CLAIM_CLOCK_SKEW_SECS.store(0, Ordering::SeqCst);
+    match out {
+        Ok(recovery::AppenderClearOutcome::Cleared { was, identity, .. }) => {
+            assert_eq!(was, AppenderState::Live);
+            assert_eq!(
+                (identity.node_token, identity.mount_slot),
+                (x.node_token, x.mount_slot)
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // The pages as the verb left them (judged after the acked-loss law
+    // below — the Blocker's class is what a RED run names first).
+    let (page0_after_verb, page1_after_verb) = {
+        let probe = KvMetaBackend::open_probe(path).await.unwrap();
+        (
+            page_state(&uris[0], &probe, 0).await,
+            page_state(&uris[0], &probe, 1).await,
+        )
+    };
+    // The successor: every acked create of the dead manager's window
+    // resolves beside the seeded ones, nothing screened; the attested
+    // region is recovered before the set serves.
+    let routed = open_under_retry(&uris, &Knobs::armed()).await.unwrap();
+    let vol = Arc::clone(&routed.volumes[0]);
+    assert_all_resolve(&routed, rotor, &seeded).await;
+    assert_all_resolve(&routed, rotor, &window_files).await;
+    let rep = mount_path_custody_gate(&routed).await.unwrap();
+    assert_eq!(rep.recovered(), 1);
+    assert_all_resolve(&routed, shared, &region_files).await;
+    assert_eq!(
+        META_KV_FOREIGN_FRAMES_SCREENED.load(Ordering::Relaxed),
+        screened0,
+        "rule 3 screened a frame the verb's flush stamped below the leaf's generation"
+    );
+    assert_eq!(vol.appender_stats().unwrap().manager_verb_refusals, 0);
+    // The verb was a transient manager: its clean leave left page 0
+    // `Free`; the attested page is `Recovering`.
+    assert_eq!(page0_after_verb, Some(AppenderState::Free));
+    assert_eq!(page1_after_verb, Some(AppenderState::Recovering));
+    shutdown(&routed).await;
+    drop(vol);
+    drop(routed);
+    fsck_clean(&uris).await;
+    reset_process_state();
+}
+
 /// **Review round 7, Issue 34 — the custody QUARANTINE on the death
 /// path.** The plane's own recorders (the S6 eviction, the grace
 /// deadline) cannot write a death record before `T_owner`, and a writer

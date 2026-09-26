@@ -3054,11 +3054,39 @@ impl KvMetaBackend {
     /// marked `Recovering` (its `Live` slot entries stop contending at the
     /// next mount's C14 settle); the next mount recovers it before serving
     /// (C15). Audited (`appender_clear_runs`).
+    ///
+    /// **Every writer open of the verb walks [`Self::writer_bring_up`]
+    /// before its first write** (PR 14 fix round 1, Issue 1 — the record's
+    /// §4.4bf): the verb is usable only once the manager's claim is stale,
+    /// i.e. after the manager CRASHED, so its open replays the dead
+    /// manager's uncovered ring-0 window and its `checkpoint_now` FLUSHES
+    /// that window. Without the bring-up no frame fence is installed and
+    /// the flush stamps every slot-tree leaf it touches with the structural
+    /// `(0, 0)` — below the leaf's earlier frames' `g ≥ 1`, so the next
+    /// writer's rule-3 screen ends the leaf's log there: the dead manager's
+    /// last acked creates gone through the operator's own remedy (the
+    /// §4.4ax class). The bring-up is `claim clear`'s ladder — prime the
+    /// stamps, restore the own pools, cover, JOIN — so the verb is a
+    /// transient manager (page 0 `Live` under its identity for the verb's
+    /// duration; its clean leave writes it `Free`) and every frame it
+    /// writes carries the lease's generation. Every refusal above the
+    /// bring-up reads RAM alone, and the attested page goes `Recovering`
+    /// (a raw page write, no frame) BEFORE the bring-up: the verb is C14's
+    /// remedy, and the join's settle would otherwise refuse the very
+    /// conflict the verb clears. The one consequence for **appender 0**:
+    /// a foreign `Live` / `Recovering` page 0 is a dead MANAGER's, whose
+    /// region the D0 ladder's successor recovers — this verb's own open
+    /// included (the fixed ring replayed at the open, the bring-up's join
+    /// taking the page over, §5.9's successor arm) — so the verb refuses
+    /// to attest it and names the writer mount as the remedy: writing
+    /// `Recovering` over a page the join just made ours would be a
+    /// contradiction on the device.
     pub async fn appender_clear(
         path: &Path,
         vol0_path: &Path,
         appender_id: u32,
     ) -> std::result::Result<AppenderClearOutcome, KvError> {
+        let open_started = std::time::Instant::now();
         let guard_fd = match Self::acquire_writer_flock(path) {
             Ok(fd) => fd,
             Err(FlockOutcome::Held) => {
@@ -3129,6 +3157,7 @@ impl KvMetaBackend {
         }
         let mut inner = Self::open_inner(path, OpenPosture::Writer, None, false).await?;
         *inner.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = Some(guard_fd);
+        inner.writer_id = uuid::Uuid::new_v4().to_string();
         let be = Arc::new(inner);
         let _ = be.conveyor_self.set(Arc::downgrade(&be));
         let entries = read_directory(path, &be.sb).await?;
@@ -3168,6 +3197,24 @@ impl KvMetaBackend {
                 page.identity.mount_slot
             )));
         }
+        // Appender 0 is the MANAGER's page: a dead manager's region is the
+        // D0 ladder's successor's — any writer mount of the set replays its
+        // fixed ring and joins over the page (§5.9's successor arm), which
+        // is exactly what this verb's own bring-up below would do. There is
+        // nothing to attest and no coherent page to write.
+        if appender_id == 0 {
+            return Err(KvError::Busy(format!(
+                "{}: appender 0's page is the MANAGER's (node {:#018x}, mount slot {:#x}, {}) — \
+                 a dead manager's region is recovered by the D0 ladder's successor: mount the \
+                 set writable once its writer claim aged past the TTL (or `squeezefs claim \
+                 clear` it) and the mount replays the fixed ring and takes the page over; \
+                 `appender clear` attests joined appenders' pages (ids ≥ 1) only",
+                path.display(),
+                page.identity.node_token,
+                page.identity.mount_slot,
+                page.state.as_str()
+            )));
+        }
         // **The parked-joiner bound** (PR 12b review round 1, Issue 4(ii)):
         // a JOINED appender writes no `client:` heartbeat (PR 13's), so on
         // a MANAGER-LESS set the probes below cannot tell a live joiner
@@ -3180,30 +3227,29 @@ impl KvMetaBackend {
         // the joiner is dead or self-fenced by derivation, and the verb's
         // other probes govern. The bound is DERIVED (`park_gate::
         // t_park_max_for` over the volume's failover bound), never a knob.
-        if !super::super::appender::page_is_own(
-            appender_id,
-            &page.identity,
-            set.identity.node_token,
-            set.identity.mount_slot,
-            true,
-        ) && appender_id != 0
-        {
-            if let Some(age) = manager_claim_age_secs {
-                let failover_ms = be.appender_stats().map_or(0, |s| s.failover_bound_ms);
-                let park_max_ms =
-                    match crate::membership::LeaseClocks::derive(std::time::Duration::ZERO) {
-                        Ok(clocks) => crate::park_gate::t_park_max_for(failover_ms, &clocks),
-                        Err(_) => failover_ms,
-                    };
-                let stale_for_ms = age
-                    .saturating_sub(crate::fuse_client::CLIENT_STALE_TTL_SECS)
-                    .saturating_mul(1000);
-                if stale_for_ms < park_max_ms {
-                    return Err(KvError::Busy(format!(
-                        "{}: refusing to clear appender {appender_id} — the set's manager claim                          went stale only {stale_for_ms} ms ago and a LIVE joined appender parked                          at T_self reclaims against the successor for up to T_park_max =                          {park_max_ms} ms before it fences itself (appender_park_expiries); a                          clear inside that window would recover a live writer's ring. Mount the                          successor (its death ledger recovers what is dead) or retry after the                          bound",
-                        path.display()
-                    )));
-                }
+        // (The page is a foreign joiner's here: own residue and appender 0
+        // were refused above.)
+        if let Some(age) = manager_claim_age_secs {
+            let failover_ms = be.appender_stats().map_or(0, |s| s.failover_bound_ms);
+            let park_max_ms =
+                match crate::membership::LeaseClocks::derive(std::time::Duration::ZERO) {
+                    Ok(clocks) => crate::park_gate::t_park_max_for(failover_ms, &clocks),
+                    Err(_) => failover_ms,
+                };
+            let stale_for_ms = age
+                .saturating_sub(crate::fuse_client::CLIENT_STALE_TTL_SECS)
+                .saturating_mul(1000);
+            if stale_for_ms < park_max_ms {
+                return Err(KvError::Busy(format!(
+                    "{}: refusing to clear appender {appender_id} — the set's manager claim \
+                     went stale only {stale_for_ms} ms ago and a LIVE joined appender parked \
+                     at T_self reclaims against the successor for up to T_park_max = \
+                     {park_max_ms} ms before it fences itself (appender_park_expiries); a \
+                     clear inside that window would recover a live writer's ring. Mount the \
+                     successor (its death ledger recovers what is dead) or retry after the \
+                     bound",
+                    path.display()
+                )));
             }
         }
         // The liveness probe an offline verb has (the writer claims above,
@@ -3236,8 +3282,35 @@ impl KvMetaBackend {
             }
         }
         let window = be.window_entries_of(&page).await.unwrap_or(0);
-        // The death record — on volume 0's tree 0 (this open when `path`
-        // IS volume 0, a guarded open of volume 0 otherwise).
+        // Every refusal above read RAM alone. THE ORDER OF THE VERB'S WRITES:
+        // (1) the attested page goes `Recovering` FIRST — a raw page write
+        //     (both directory slots + a sync; no frame, no journal entry),
+        //     so its `Live` slot entries attest nothing at the very next
+        //     settle, which is (2)'s own: the verb is C14's remedy, and a
+        //     bring-up that settled against the page still `Live` would
+        //     refuse the conflict the verb exists to clear;
+        // (2) the writer's bring-up (the frame fence, the own pools, the
+        //     cover, the JOIN) — every frame the writes below flush carries
+        //     the leases' generations;
+        // (3) the death record + its checkpoint (on volume 0);
+        // (4) the clean leave (page 0 `Free`).
+        // A crash between (1) and (3) leaves a `Recovering` page the ledger
+        // does not name: the next mount refuses it naming this verb, and
+        // the re-run is idempotent (`Cleared { was: Recovering }`).
+        let was = page.state;
+        let mut page = page;
+        page.state = AppenderState::Recovering;
+        page.recovered_by_term = 0;
+        be.write_foreign_page(entry, &mut page).await?;
+        // (2) — a bring-up refusal tears down like a gate refusal (the
+        // flock released deterministically); the page stays `Recovering`
+        // for the re-run.
+        if let Err(e) = be.writer_bring_up(open_started).await {
+            drop(be.guard_fd.lock().unwrap_or_else(|e| e.into_inner()).take());
+            return Err(e);
+        }
+        // (3) The death record — on volume 0's tree 0 (this open when
+        // `path` IS volume 0, a guarded open of volume 0 otherwise).
         // The operator's attestation is an EARLY recorder (Issue 34): it
         // may run inside a surviving custody writer's `T_self`, so the
         // recovery quarantines fresh custody grants on the recovered slots
@@ -3262,21 +3335,26 @@ impl KvMetaBackend {
             be.sync_device().await.map_err(KvError::Io)?;
             be.checkpoint_now().await?;
         } else {
+            let v0_started = std::time::Instant::now();
             let mut v0 = Self::open_inner(vol0_path, OpenPosture::Writer, None, false).await?;
             *v0.guard_fd.get_mut().unwrap_or_else(|e| e.into_inner()) = vol0_guard;
+            v0.writer_id = uuid::Uuid::new_v4().to_string();
             let v0 = Arc::new(v0);
             let _ = v0.conveyor_self.set(Arc::downgrade(&v0));
+            // Volume 0's writer walks the same bring-up: its open replayed
+            // ITS dead manager's window too, and the record's checkpoint
+            // flushes it.
+            if let Err(e) = v0.writer_bring_up(v0_started).await {
+                drop(v0.guard_fd.lock().unwrap_or_else(|e| e.into_inner()).take());
+                return Err(e);
+            }
             v0.write_control_entry(vec![death_put], EntryAdmission::Try)
                 .await?;
             v0.sync_device().await.map_err(KvError::Io)?;
             v0.checkpoint_now().await?;
             v0.shutdown().await?;
         }
-        let was = page.state;
-        let mut page = page;
-        page.state = AppenderState::Recovering;
-        page.recovered_by_term = 0;
-        be.write_foreign_page(entry, &mut page).await?;
+        // (4)
         be.shutdown().await?;
         APPENDER_CLEAR_RUNS.fetch_add(1, Ordering::Relaxed);
         log::warn!(

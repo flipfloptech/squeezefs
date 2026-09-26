@@ -155,6 +155,24 @@ mount is a read-token client whose metadata is exact at the next resolve
   every checkpoint-class admission but the ring's oldest node keeps one
   SMO record's claim of class space, so every cycle flushes the node that
   moves each ring's tail.
+- **`squeezefs appender clear` lost the crashed manager's acked creates,
+  fixed red-first (the acceptance record's §4.4bf — the §4.4ax class
+  through the operator's own remedy):** the verb is usable only once the
+  manager's writer claim aged past its TTL, i.e. after the manager crashed,
+  so the verb's own open replays the dead manager's uncovered journal
+  window — and it then wrote (the death record, a checkpoint, on volume 0
+  too) from a bare writer open that never walked the writer's bring-up,
+  flushing that window's records into the slot-tree leaves under the
+  structural `(0, 0)` frame stamp; the next mount's §5.8.2 screen ended
+  every such leaf's log there (a rotor directory's 8 acked creates gone).
+  Both of the verb's writer opens walk the bring-up now — the verb is a
+  transient manager for its duration (page 0 `Live` under its own identity,
+  `Free` after its clean leave), every frame it flushes carries the lease's
+  generation — and `appender clear 0` refuses naming the writer mount: a
+  dead manager's region is recovered by any writer mount of the set once
+  its claim aged (the D0 ladder's successor), never attested. A static
+  rail (`tests/writer_door_bring_up_tests.rs`) keeps every direct writer
+  door of the KV backend inside the same law.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

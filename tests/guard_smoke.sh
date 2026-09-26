@@ -29,7 +29,9 @@
 #   0.  scrub: kill stale daemons, drain PR residue, wipe superblocks
 #   0b. Register-semantics probe (spec-strict vs lenient — PROBED, never
 #       assumed; kernel nvmet measured spec-strict 2026-07-17)
-#   1.  format + mount --daemon, writer_guard_mode == flock+pr
+#   1.  format --single-writer (the guard's ONE-writer class since the PR-14
+#       flip; a default-class set JOINS a second RW mount instead) + mount
+#       --daemon, writer_guard_mode == flock+pr
 #   2.  double-mount refusal while the first daemon serves
 #   3.  claim clear refused while live-mounted
 #   4.  kill -9 -> remount recovery x LOOPS (md5 data integrity per cycle);
@@ -204,8 +206,15 @@ fi
 run nvme resv-register "$META" --crkey=0xA11CE --rrega=1
 log "register semantics: $SEMANTICS"
 
-log "1. format + mount (cache-less)"
-run "$SQZ" format "sqmeta://$META" "sqdata://$DATA" --force || { fail "format"; exit 1; }
+# `--single-writer`: this rig's SUBJECT is the D0 single-writer mount
+# guard (leg 2's double-mount refusal, leg 3's live claim). Since the PR-14
+# default flip a plain `format` stamps the symmetric forest, on which a
+# second RW mount of the set JOINS the manager as a writer (the join
+# ladder — the fidelity tier's `sym-join-ladder` leg pins that law); the
+# ONE-writer posture the guard refuses a second writer under is the
+# `--single-writer` class's (design-symmetric-metadata §7.3).
+log "1. format --single-writer + mount (cache-less)"
+run "$SQZ" format "sqmeta://$META" "sqdata://$DATA" --force --single-writer || { fail "format"; exit 1; }
 mount_it
 wait_mounted || { fail "initial mount did not appear"; exit 1; }
 sleep 2

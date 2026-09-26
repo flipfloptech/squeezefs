@@ -226,8 +226,8 @@ the 6.12-class dual-variant backport build. C and D are fallbacks.
 
 ## 5. What happens after unblock
 
-Nothing in the test procedure changes: `docs/field-mpiio-runbook.md`
+The procedure (as written in 2026-08): `docs/field-mpiio-runbook.md`
 Preflights 1–4, then `tests/cluster_reset_v5_mw.sh --dry-run` → the reset
-→ the printed `SQZ_MWMATRIX_MOUNTS=… s11-mpiio` line. The row lands at
+→ the printed `SQZ_MWMATRIX_MOUNTS=… s11-mpiio` line — **the authority + co-writer recipe retired at PR 14 (the symmetric default flip; the reset script is deleted): the field shape is `tests/mw_fleet.sh create N=<n> --writers=K` + the `sym-*` legs of `tests/run_mw_matrix.sh`.** The row lands at
 measured-real tier beside the local verdict
 (`.benchmarks/2026-08-18-s11-mpiio-row.md`, 1.411×/2.273×).

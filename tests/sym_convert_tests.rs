@@ -42,8 +42,8 @@ use squeezefs::config_ops::{
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
-    digest_backend, digest_backend_kind_set, format_v3_stamped,
-    format_v3_stamped_multi_writer_flat, BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
+    digest_backend, digest_backend_kind_set, format_v3_stamped_multi_writer_flat,
+    format_v3_stamped_symmetric, BuilderConfig, FormatV3Options, ImageBuilder, ROOT_INO,
 };
 use squeezefs::meta_backend::kv::checkpoint::{read_newest_ledger, write_ledger_slot};
 use squeezefs::meta_backend::kv::journal::AppendPartition;
@@ -845,9 +845,10 @@ async fn an_already_symmetric_set_is_refused() {
     let p = dir.path().join("meta0");
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).unwrap();
-    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    // The forest EXPLICITLY (seam-blind): the premise is a stamped set.
+    format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
-        .expect("the default (forest) format");
+        .expect("the forest format");
     let uris = vec![p.display().to_string()];
     let err = enable_symmetric(&uris, &EnableSymOptions::default())
         .await
@@ -1061,10 +1062,12 @@ async fn the_public_symmetric_formatter_mounts_as_a_forest() {
     let p = dir.path().join("meta0");
     std::fs::File::create(&p).unwrap().set_len(VOL_LEN).unwrap();
     let plan = plan_meta_slot_set(1).unwrap();
-    // The DEFAULT class since PR 14 (`--symmetric` is its no-op spelling).
-    format_v3_stamped(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
+    // The public `--symmetric` formatter — the DEFAULT class since PR 14 (the
+    // flag is its no-op spelling), taken through the EXPLICIT builder so the
+    // contract is blind to the inverted matrix's flat seam.
+    format_v3_stamped_symmetric(&p, VOL_LEN, &set_opts(), plan.stamps[0].clone())
         .await
-        .expect("the default format");
+        .expect("the symmetric format");
     let uris = vec![p.display().to_string()];
     let sb = superblock_of(&uris[0]).await;
     assert!(is_symmetric(&sb));

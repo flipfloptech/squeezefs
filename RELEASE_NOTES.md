@@ -4,6 +4,74 @@ _Release train 1.3 — not yet tagged. Everything below is on `dev`._
 
 ## 1.3.0 — what changed
 
+**The symmetric metadata plane is the DEFAULT (PR 14 — the default flip,
+forward-only).** A plain `squeezefs format` stamps the symmetric forest
+(incompat bit 17 beside the nine multi-writer bits) and a plain
+`squeezefs mount` is ONE armed writer — the manager of its own set — with
+`dlm_rpcs` 0 by construction and every must-stay-0 gauge 0; every later RW
+mount of the set JOINS it over the wire as a full writer (its own ring,
+page, checkpoint task and listener; N unbounded by design), and every `-o ro`
+mount is a read-token client whose metadata is exact at the next resolve
+(`reader_staleness_bound_ms` reads 0). Design
+[docs/design-symmetric-metadata.md](docs/design-symmetric-metadata.md) §7.2 /
+§7.3 / row 14; operator surface
+[docs/operations.md → the default flip](docs/operations.md#symmetric-metadata-program--the-default-flip-pr-14).
+
+- **`--single-writer` is the flat opt-out** — the ONLY flat writable posture
+  after the flip, for a volume that will never see a second host; it
+  carries none of the multi-writer bits and mounts exactly the shipped solo
+  posture. `--symmetric` is accepted as the default's spelling (a no-op,
+  like `--multi-writer`).
+- **A multi-writer-class volume WITHOUT bit 17** (formatted between the
+  rung-10b flip of 2026-08-16 and this release) **refuses the writer's door
+  loud** — *"not symmetric-forest capable — run `squeezefs volume
+  enable-symmetric`"* (or `format --force`). Readers, probes, `fsck`,
+  `claim clear` and the conversion keep reading it; the conversion quiesces
+  a set that was not cleanly unmounted before it inspects anything. No knob
+  admits the class.
+- **`SQUEEZEFS_SYMMETRIC_META` defaults to `1`**; `=0` on a stamped volume
+  REFUSES the writable open naming the knob and `-o ro` ("once armed, stays
+  armed"); readers and probes open; the knob is inert on `--single-writer`.
+- **Retired, forward-only:** `SQUEEZEFS_MULTI_WRITER`, `SQUEEZEFS_MW_ROLE`,
+  `SQUEEZEFS_MW_AUTHORITY`, `SQUEEZEFS_MW_MEMBERS` and the eight S9 lane
+  knobs (`SQUEEZEFS_ALLOC_LANE_*`, `SQUEEZEFS_COWRITER_LANE_PLACEMENT`,
+  `SQUEEZEFS_FREE_GRACE_LANE_PUSH`, `SQUEEZEFS_REWRITE_SUPPLY_CLOSE`) refuse
+  at startup as RETIRED spellings naming the join ladder; `squeezefs volume
+  set-owners` / `get-owners` are hard errors naming `enable-symmetric`
+  (ownership is a slot LEASE); the co-writer, set-authority and
+  partial-authority mount postures, the S9 allocation-lane partition, the
+  PK4 co-writer pack-group wire and the S5 `=0` reader projection are
+  DELETED (`CLUSTER_WIRE_SCHEMA` 6, `PUBLISH_SCHEMA` 18, `CUSTODY_SCHEMA` 9
+  — same-commit fleets). `SQUEEZEFS_MW_BIND` stays: every writer serves.
+  `cluster_reset_v5_mw.sh` and the cloud rig's `assemble-mw` / `bench-mw`
+  (the co-writer recipe) are gone; `assemble-sym` / `bench-sym` are the mw
+  preset's one shape.
+- **What a mount-class operator notices:** a clean `umount` then a mount of
+  the same volume at ANOTHER mount point on one host is a same-node
+  successor of the data volume's allocation lease (the predecessor's death
+  is recorded off the flock's proof, its home recovered, the lease taken at
+  term + 1 — a `dead_member:` record for the previous mount slot is normal
+  residue); the packing dismount pass seals one open pack PER SLOT the rotor
+  spread a population over, so a small population packs into up to 65
+  blocks where the flat class packed into one (`setfattr -n
+  user.squeezefs.gather -v 1 <dir>` puts a directory's children into one
+  slot); the memlock prerequisite applies to every mount.
+- **Two defects the flip's mount-class migration found, each fixed
+  red-first:** the allocation lease's same-node takeover judged "the
+  predecessor is page 0" off a directory read taken after this open's join
+  had rewritten page 0 with its own identity, so every clean `umount` +
+  remount at another mount point refused `Busy` — the identity page 0
+  carried at OPEN is the witness (`AppenderSet::page0_at_open`); and the
+  online fsck census is now the population AS OF ITS START (bounded at the
+  per-slot ino watermarks it began with), so a creator that outpaces its
+  walk can no longer keep an online `squeezefs fsck` chasing the tree's
+  tail for the creator's whole life (the acceptance record's §4.4aw).
+- **The flip lands after the owner's cloud decision**: the box brackets of
+  every design §8 gate on the flip binary and the two-host / cloud rows are
+  what that decision reads (the record
+  [.benchmarks/2026-09-19-sym-acceptance.md](.benchmarks/2026-09-19-sym-acceptance.md)
+  §7 / §9).
+
 **SPDK retired as an NVMe-oF target (forward-only).** Owner ruling
 R-SYM-8 (2026-09-12, [docs/design-symmetric-metadata.md](docs/design-symmetric-metadata.md)
 §5.8.1, KD-SYM-23; record
@@ -807,7 +875,7 @@ The fstests runner now fails a test whose mount logged a request unreplied
   the previous phase's file kept, each lane holds 640 live blocks of a
   1,024-block share against a ≈ 3.4 s recycle transit (≈ 10 % under) —
   `.benchmarks/2026-09-07-cowriter-fpp-supply-residue.md` §8.5,
-  [docs/operations.md → Multi-writer capacity planning](docs/operations.md#multi-writer-capacity-planning--the-data-plane-allocation-partition).
+  docs/operations.md → Multi-writer capacity planning (the section retired with the lane partition at the 1.3.0 symmetric default flip).
 - **fsync of a partial active block escalates the whole block**: every
   256 KiB write + fsync reads and uploads 4 MiB (18.4× the user bytes, 80 %
   of the 6.9 ms fsync). Pre-existing, named by W-5's instrument, not fixed —

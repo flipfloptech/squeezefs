@@ -1,5 +1,16 @@
 # The FIELD MPI-IO runbook — the rung-18 shared-vs-disjoint ior row over a real nvme-tcp fabric
 
+> **Retired recipe (PR 14, the symmetric default flip — 2026-09-26).** This
+> runbook drives the authority + co-writer fleet (`SQUEEZEFS_MULTI_WRITER=1`,
+> `SQUEEZEFS_MW_ROLE=co-writer`) that `tests/cluster_reset_v5_mw.sh` built.
+> Both are GONE: the knobs refuse at startup naming the join ladder, and the
+> script is deleted. On the symmetric default every RW mount of a set is a
+> writer through the join ladder — the field shape is `tests/mw_fleet.sh
+> create N=<n> --writers=K` + `tests/run_mw_matrix.sh` (the `sym-*` legs), and
+> the S11 range-custody row (`SQUEEZEFS_RANGE_CUSTODY=1` on the writer mounts)
+> rides the per-holder custody lease. The text below is the record of how the
+> 2026-08 field row was run.
+
 This is the operator sequence for running the S11 MPI-IO acceptance row
 (`s11-mpiio`, `tests/run_mw_matrix.sh`) on the FIELD cluster: client
 `memp-s3ds-aqs-37` (32 CPU, 2×200GbE) + 5 storage nodes over nvme-tcp,

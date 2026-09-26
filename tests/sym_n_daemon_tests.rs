@@ -489,6 +489,82 @@ async fn a_second_daemon_joins_over_the_wire_and_commits_into_its_own_ring() {
     fsck_clean(&uris).await;
 }
 
+/// **The manager's census watermarks name only the keyspaces it holds a
+/// cursor for** (PR 14 — found by the `sym-crash` leg on the flip binary:
+/// after every SECOND manager failover the successor's online fsck read
+/// 4–10 false C2 "leaked" findings on LIVE 5 MiB files of the joined
+/// writers, the record's §4.4ba). §4.4aw bounded the online census at the
+/// per-slot ino watermarks read at its start (`slot_ino_watermarks`), and
+/// the first build folded EVERY lease-table entry's cursor word into that
+/// map — a slot a JOINER leases included, whose word at the manager is the
+/// GRANT-time cursor (KD-SYM-3: a leased slot's cursor travels with its
+/// lessee; the manager's table never sees a mint), so every ino the joiner
+/// minted read as "past the watermark" and the census skipped the
+/// joiner's files: their blocks had zero referencers, and the zero-FP
+/// ladder let a few through as C2. The map names the native keyspace,
+/// this mount's guest cursors, the slots THIS appender leases and tree 0's
+/// UNLEASED words (nobody mints there) — a foreign lessee's slot is absent,
+/// so the census walks it whole (its own doc's law). RED on the first
+/// build: the manager's map named SLOT_A at the grant-time cursor while
+/// the joiner had minted 24 inos into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_managers_census_watermarks_never_bound_a_slot_a_joiner_leases() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let (uris, dirs) = seeded_volume(dir.path(), &[(SLOT_A, "shared")]).await;
+    let shared = dirs[0];
+    let manager = open_under(&uris, &Knobs::armed()).await;
+    let mvol = Arc::clone(&manager.volumes[0]);
+    let venue = HoldersVenue::stand_up(&manager, &[]).await;
+    let joiner = join(&uris, &venue, &mvol, 1).await;
+    let jvol = Arc::clone(&joiner.volumes[0]);
+    let js = jvol.appender_stats().unwrap();
+    // The joiner's first touch acquires SLOT_A and mints 24 inos into it.
+    let files = create_files(&joiner, shared, "j", 24).await;
+    assert!(
+        matches!(
+            tree0_state(&mvol, SLOT_A).await,
+            Some(SlotState::Leased { appender_id, .. }) if appender_id == js.appender_id
+        ),
+        "the manager's tree 0 leases SLOT_A to the joiner"
+    );
+    let manager_marks = mvol.slot_ino_watermarks();
+    assert!(
+        !manager_marks.contains_key(&SLOT_A),
+        "the manager holds no cursor for a slot the joiner leases — its census must walk \
+         SLOT_A whole, never bound it at the grant-time word {:?}",
+        manager_marks.get(&SLOT_A)
+    );
+    // The lessee's own map DOES name it, above every ino it minted.
+    let joiner_marks = jvol.slot_ino_watermarks();
+    let ceiling = joiner_marks
+        .get(&SLOT_A)
+        .copied()
+        .expect("the lessee holds SLOT_A's cursor");
+    for (name, ino) in &files {
+        let (_, local) = joiner.route_ino(*ino);
+        let raw = local & (squeezefs::meta_backend::GUEST_NS_BASE - 1);
+        assert!(
+            raw < ceiling,
+            "{name}: local {raw} minted below the lessee's watermark {ceiling}"
+        );
+    }
+    // The manager's native keyspace stays bounded (its own cursor).
+    assert!(
+        manager_marks.contains_key(&0),
+        "the native keyspace is the manager's"
+    );
+    shutdown(&joiner).await;
+    drop(jvol);
+    drop(joiner);
+    venue.tear_down();
+    shutdown(&manager).await;
+    drop(mvol);
+    drop(manager);
+    fsck_clean(&uris).await;
+}
+
 /// **PR 13 (found by the `sym-scale` leg's N ladder — a PR 12b defect)**: a
 /// joiner that LEAVES cleanly and REJOINS under the same identity keeps
 /// committing — the manager never grants it an extent a live slot-tree

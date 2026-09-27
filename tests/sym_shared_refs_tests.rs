@@ -1467,3 +1467,124 @@ async fn a_holders_free_of_a_former_lessees_block_runs_the_owner_ladder_instead_
     alloc_lease::disarm_symmetric_roles();
     shutdown(&rig.routed).await;
 }
+
+/// **fsck C8's stale-record release lands on the record's OWN key on a
+/// forest** (record §4.4bu, review round 1 Issue 4): a forest volume keys
+/// a block reference by its owner's LOCAL form `(s + 1) << 40 | local`,
+/// the repair reads the durable ledger with every owner folded to its
+/// GLOBAL ino (`shared_refs::global_owner`) and commits the release
+/// through the routed door, whose `forest_ref_ops` re-keys the op to the
+/// local form — so the Delete meets the record. A guest-slot file's block
+/// 0 is displaced (the displaced block freed) and the old record
+/// re-planted through the same door; the offline repair releases exactly
+/// it, the live record stands, and the oracle reads clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_c8_stale_record_release_lands_on_the_records_own_key_on_a_forest() {
+    use squeezefs::fsck::{FsckCtx, FsckOptions, RepairOptions};
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    let rig = mount(&uris, data.path(), &Knobs::armed()).await;
+    let f = rig.mk_file("forest_c8").await;
+    let slot = slot_of_global(&rig.routed, f);
+    assert_ne!(slot, 0, "a child of `/` mints in a guest (rotor) slot");
+    let (_v, local) = rig.routed.route_ino(f);
+    assert_ne!(
+        local, f,
+        "the record's owner key is the LOCAL form, not the global ino"
+    );
+
+    let old = rig.publish_block(f, 0).await;
+    let live = rig.publish_block(f, 0).await;
+    assert_eq!(
+        flag(&rig, f, old, 0).await,
+        None,
+        "the displaced record left"
+    );
+    assert_eq!(flag(&rig, f, live, 0).await, Some(false));
+    assert!(rig.drift().await.is_empty(), "clean before the plant");
+
+    // The §4.4bt residue, planted through the routed door (the owner
+    // named GLOBALLY, re-keyed to the record's local form by the door).
+    rig.routed
+        .commit_block_refs_witnessed(
+            f,
+            &[BlockRefOp::taken(BlockRef {
+                vol_tag: rig.tag(),
+                block_idx: old / rig.alloc.chunk_size(),
+                owner_ino: f,
+                block_index: 0,
+            })],
+        )
+        .await
+        .expect("plant the stale record");
+    assert_eq!(
+        flag(&rig, f, old, 0).await,
+        Some(false),
+        "the stale record stands under the LOCAL owner key"
+    );
+    let drift = rig.drift().await;
+    assert_eq!(drift.len(), 1, "{drift:?}");
+    assert_eq!(
+        (drift[0].1, drift[0].2, drift[0].3),
+        (old / rig.alloc.chunk_size(), 1, 0)
+    );
+
+    let ctx = FsckCtx {
+        meta: rig.routed.clone(),
+        router: rig.router.clone(),
+        staging_dirs: Vec::new(),
+        expected_generation: None,
+    };
+    let quarantine = tempdir().unwrap();
+    let apply = RepairOptions {
+        apply: true,
+        quarantine_dir: Some(quarantine.path().to_path_buf()),
+        multi_owner: false,
+    };
+    let opts = FsckOptions {
+        settle: std::time::Duration::from_millis(0),
+        ..FsckOptions::offline()
+    };
+    let report = squeezefs::fsck::run(&ctx, &opts)
+        .await
+        .expect("offline fsck");
+    let object = format!("{DATA_VOL}:{old}");
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .filter(|x| x.class == "C8" && x.object == object)
+            .count(),
+        1,
+        "{:?}",
+        report
+            .findings
+            .iter()
+            .map(|x| (x.class.as_str(), x.object.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let fixed = squeezefs::fsck::repair(&ctx, &report, &apply)
+        .await
+        .expect("offline apply");
+    let applied: Vec<_> = fixed
+        .applied
+        .iter()
+        .filter(|p| p.class == "C8" && p.object == object)
+        .collect();
+    assert_eq!(applied.len(), 1, "{fixed:?}");
+    assert_eq!(applied[0].action, "release-stale-block-refs");
+    assert_eq!(
+        flag(&rig, f, old, 0).await,
+        None,
+        "the release met the record's own (local-owner) key"
+    );
+    assert_eq!(
+        flag(&rig, f, live, 0).await,
+        Some(false),
+        "the live record stands"
+    );
+    assert!(rig.drift().await.is_empty(), "the oracle reads clean");
+    rig.shutdown().await;
+}

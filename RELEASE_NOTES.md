@@ -397,6 +397,15 @@ mount is a read-token client whose metadata is exact at the next resolve
   offline run, and the online leaked-block repair (C2) declines a block
   the ledger still names — freeing it under a standing record is what
   refused the next mount (record §4.4bu).
+- **A full metadata volume could refuse deletes while its own recovery
+  churned** (shipped in 1.2.4 with the leaf merge): the heap-full merge
+  sweep runs after every checkpoint's barrier and claims at the same
+  compaction floor a delete's compaction needs, so the two "return
+  room" cycles a refused delete earns handed every returned extent to
+  the sweep and the delete came back `ENOSPC` with its room one barrier
+  away. The sweep (and the flush pass's opportunistic sibling merge) now
+  yield while a user commit is retrying for space — `meta_kv_merge_yields`
+  counts them — and resume at the next cycle (record §4.4bv).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a

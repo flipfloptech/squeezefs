@@ -597,21 +597,19 @@ fn a_healthy_mount_ticks_nothing_it_owes() {
 /// Contract 3 — **a fresh mount sends no request to itself** (the 1.3.0
 /// release chain's second attempt; record §4.4bq): contract 1's venue
 /// premise is that the seam's victim is THIS test's request on a queue
-/// only it uses. The daemon's IPC `st_dev` resolver broke it from inside:
-/// it CANONICALIZED the mountpoint after the mount — `realpath(3)` lstats
-/// the final component, the FUSE root, whose attributes are invalid at
-/// mount — so every mount issued one root GETATTR to itself, racing the
-/// arm; landing after it, that GETATTR was the first over-uring reply,
-/// the seam struck it, and the test's own `.stats` read on the same CPU's
-/// queue pumped the strand by an ordinary wake before the 100 ms tick
-/// (`transport_park_tick_commit_rescues` legitimately 0). The resolver
-/// compares the path canonicalized BEFORE the mount; from the arm to the
-/// resolver's answer, no traced delivery names a thread of the daemon as
-/// its requester. A desktop's probers (this box's `gvfsd-trash` sends a
-/// root GETATTR + `.Trash` + `.Trash-1000` LOOKUPs at every new mount)
-/// are read by the trace's `pid=` word and are not the law's subject —
-/// they are contract 1's venue premise, which the seam's budget of one
-/// makes them able to break; the daemon's own request must never be.
+/// only it uses, so a daemon that sent itself a request at the arm would
+/// break it from inside. The one candidate — the IPC `st_dev` resolver —
+/// reads `/proc/self/mountinfo` against the mountpoint canonicalized
+/// BEFORE the mount; canonicalizing after it runs `realpath(3)` over the
+/// mounted root, which glibc < 2.33 (the rocky8 dist target) walks by
+/// `lstat` — a root GETATTR from a daemon thread (on this box's glibc the
+/// walk is `readlink`-first and never asked; the law is pinned for every
+/// venue). From the arm to the resolver's answer, no traced delivery names
+/// a thread of the daemon as its requester. A desktop's probers (this
+/// box's `gvfsd-trash` sends a root GETATTR + `.Trash` + `.Trash-1000`
+/// LOOKUPs at every new mount) are read by the trace's `pid=` word and are
+/// not the law's subject — they are contract 1's venue premise, which the
+/// scoped seam holds; the daemon's own request must never be.
 #[test]
 fn a_fresh_mount_issues_no_request_to_itself() {
     if !mount_supported(site!()) {
@@ -632,17 +630,17 @@ fn a_fresh_mount_issues_no_request_to_itself() {
         log.display()
     );
     let text = std::fs::read_to_string(&log).expect("read daemon log");
-    // A delivery's `pid=` is the issuing THREAD's id; the daemon's threads
-    // (its blocking pool included) are long-lived, so a self-request's
-    // requester is still listed under the daemon's task directory.
+    // A delivery's `pid=` is the issuing THREAD's id, matched against the
+    // daemon's task directory. The blocking pool reaps an idle worker
+    // after 10 s (`sqz_blocking::IDLE_REAP`); this check runs right after
+    // the resolver's own log line, inside that bound for its thread.
     let issued_by_daemon = |line: &str| -> bool {
         line.split_whitespace()
             .find_map(|t| t.strip_prefix("pid="))
             .and_then(|p| p.parse::<u32>().ok())
-            .is_some_and(|tid| {
-                tid == daemon || Path::new(&format!("/proc/{daemon}/task/{tid}")).exists()
-            })
+            .is_some_and(|tid| Path::new(&format!("/proc/{daemon}/task/{tid}")).exists())
     };
+    // FUSE_INIT (op 26) is the kernel's, attributed to the mounting thread.
     let deliveries: Vec<&str> = text
         .lines()
         .filter(|l| l.starts_with("[XPORT] deliver") || l.starts_with("[XPORT] classical-deliver"))

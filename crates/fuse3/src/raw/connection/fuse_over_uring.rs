@@ -1724,8 +1724,8 @@ fn test_drop_commit_wake_tid() -> Option<u32> {
 }
 
 /// The scoped seam's candidate victim: `(qid, commit id)` of the LATEST
-/// delivery from the seam's thread (recorded while the budget lasts);
-/// `u64::MAX` = none. The reply path strikes when its own words match —
+/// delivery from the seam's thread (recorded on every match; only the
+/// strike consults the budget); `u64::MAX` = none. The reply path strikes when its own words match —
 /// a reply whose wake the coalescer elided leaves the budget untouched,
 /// so the thread's next request becomes the candidate.
 static SEAM_VICTIM: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -3536,7 +3536,7 @@ impl FuseOverUring {
             // coalescer armed — the message sits in commit_rx with no
             // wake in flight, the exact generic/795 posture. Env-gated
             // (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES`, scoped to one requester
-            // thread by `..._TID`); one relaxed load in production.
+            // thread by `..._TID`); two `OnceLock` reads in production.
             if test_drop_this_commit_wake(qid, commit_id) {
                 error!(
                     "fuse-over-uring qid={qid} ent={ent_idx}: TEST SEAM dropping commit wake \

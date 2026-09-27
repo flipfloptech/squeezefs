@@ -805,6 +805,13 @@ pub async fn arm_token_readers(
     // nothing that can change a record, on ANY layout — the token
     // posture's requirements below are a live manager's. This backend's
     // open replayed everything durable, so its claim word is current.
+    // Marked BEFORE the probe (review round 2, Issue 11): the poll is
+    // already running, and a pass pulled early into the gap between a
+    // no-writer probe and the mark would adopt a writer's bring-up record
+    // un-refused; a live writer unmarks.
+    for v in volumes {
+        v.set_quiescent_reader();
+    }
     let mut live = false;
     for v in volumes {
         if crate::meta_backend::live_manager_present(v).await {
@@ -812,10 +819,11 @@ pub async fn arm_token_readers(
             break;
         }
     }
-    if !live {
+    if live {
         for v in volumes {
-            v.set_quiescent_reader();
+            v.clear_quiescent_reader();
         }
+    } else {
         QUIESCENT_READER.store(true, Ordering::Release);
         log::warn!(
             "QUIESCENT-SET reader: no writer is mounted on this set (no local writer lock, no \

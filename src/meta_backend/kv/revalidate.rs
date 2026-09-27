@@ -523,6 +523,11 @@ impl KvMetaBackend {
         self.quiescent_reader.store(true, Ordering::Release);
     }
 
+    /// The arm's retraction: a live writer was found after the mark.
+    pub fn clear_quiescent_reader(&self) {
+        self.quiescent_reader.store(false, Ordering::Release);
+    }
+
     /// The reader's live epoch (0 = not a reader) — the seqlock-style handle
     /// a caller uses to detect that a multi-step read spanned a poll.
     pub fn reader_epoch(&self) -> u64 {

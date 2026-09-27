@@ -312,9 +312,12 @@ mount is a read-token client whose metadata is exact at the next resolve
   the seed, and a wire joiner's region is filled by its arm before its
   first flush pass — the fix makes the RAM lease set consistent from the
   first frame writer on every posture.
-- **The flip lands after the owner's cloud decision**: the box brackets of
-  every design §8 gate on the flip binary and the two-host / cloud rows are
-  what that decision reads (the record
+- **The flip LANDED on `dev` (`73181769`, 2026-09-27) by the owner's ruling**
+  — asked with design row 14's "cloud row first" beside it: the two-host
+  fixture already proves the multi-host shape, the cloud row is now the
+  per-node gate-3 measurement and runs after the landing under its own
+  approval; the box brackets of every design §8 gate on the flip binary and
+  the two-host / cloud rows remain the acceptance (the record
   [.benchmarks/2026-09-19-sym-acceptance.md](.benchmarks/2026-09-19-sym-acceptance.md)
   §7 / §9).
 

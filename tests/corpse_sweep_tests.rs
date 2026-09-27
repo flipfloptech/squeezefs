@@ -1062,27 +1062,31 @@ fn a_single_overcap_corpse_stopped_between_entries_is_finished_by_the_next_mount
 /// second snapshot after the hold that had to EQUAL the first: the frees
 /// landing between the two read as a torn seed ("the allocator moved during
 /// the arm … 37 → 0 set") and the mount failed at that rate. The arm now
-/// judges the second snapshot by DIRECTION — a free beside it is cleared in
-/// the holding with its delta journaled (`data_alloc_bitmap_arm_absorbed_
-/// frees`), an allocation beside it still refuses — so the same schedule
-/// arms, and no bit is left SET for a block nothing references.
+/// judges by DIRECTION on the allocator's own witnesses — a free beside it
+/// is a block the allocator free-lists, cleared in the holding with its
+/// delta journaled (`data_alloc_bitmap_arm_absorbed_frees`); an allocation
+/// beside it (a block off the list WITH a refcount, or the cursor raised)
+/// still refuses; a CLEAR bit the allocator holds live is the loss — so the
+/// same schedule arms, and no bit is left SET for a block nothing references.
 ///
-/// The race made certain: the reclaim worker's batch window is set to
-/// 1,500 ms (the registered knob — a queued free cannot land sooner after
-/// the sweep's enqueue) and the arm's seam parks its hold → re-snapshot
-/// window for 2,500 ms, so the frees land INSIDE the window whenever the
-/// mount path from the sweep's return to the arm's first snapshot takes
-/// under 1,500 ms (≈ 100–300 ms here; the margin is the timing-contract
-/// class's 5×). The outcome assertions hold in EVERY interleaving: the
-/// mount arms, and at quiesce the bitmap's population is exactly the
-/// granted blocks — a leaked bit would read `granted + 37`.
-#[test]
-fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
-    if !mount_supported(site!()) {
-        return;
-    }
+/// Two windows, one body: the frees land (a) between the hold and the
+/// second snapshot (`SQUEEZEFS_TEST_ALLOC_ARM_HOLD_MS` — the field's
+/// shape) or (b) between the second snapshot and the verdict
+/// (`SQUEEZEFS_TEST_ALLOC_ARM_VERDICT_HOLD_MS` — review round 2, Issue 6:
+/// the first build read the free list at two instants, so a free landing
+/// after the snapshot walked the list was SET there while its bit was
+/// already CLEAR — "LIVE read CLEAR", a false loss). The reclaim worker's
+/// batch window is set to 1,500 ms (the registered knob — a queued free
+/// cannot land sooner after the sweep's enqueue), so the frees land inside
+/// the parked window whenever the mount path from the sweep's return to
+/// the arm's first snapshot takes under 1,500 ms (≈ 100–300 ms here; the
+/// margin is the timing-contract class's 5×). The outcome assertions hold
+/// in EVERY interleaving: the mount arms, and at quiesce the bitmap's
+/// population is exactly the granted blocks — a leaked bit would read
+/// `granted + 37`.
+fn swept_frees_beside_the_arm(tag: &str, hold_ms: &str, verdict_hold_ms: &str) {
     const FIELD_CORPSE_BLOCKS: usize = 37;
-    let base = scratch("armabsorb");
+    let base = scratch(tag);
     let staging = base.join("staging");
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
@@ -1098,8 +1102,8 @@ fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
         drop(held);
     }
 
-    // Mount 2: the sweep queues the corpse's frees; the arm's window opens
-    // before they land and closes after.
+    // Mount 2: the sweep queues the corpse's frees; the arm's parked
+    // window opens before they land and closes after.
     let log2 = base.join("m2.log");
     let mut m2 = spawn_mount(
         &meta,
@@ -1107,7 +1111,8 @@ fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
         &log2,
         &[
             ("SQUEEZEFS_RECLAIM_BATCH_MS", "1500"),
-            ("SQUEEZEFS_TEST_ALLOC_ARM_HOLD_MS", "2500"),
+            ("SQUEEZEFS_TEST_ALLOC_ARM_HOLD_MS", hold_ms),
+            ("SQUEEZEFS_TEST_ALLOC_ARM_VERDICT_HOLD_MS", verdict_hold_ms),
         ],
     );
     assert!(
@@ -1116,8 +1121,8 @@ fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
         log2.display()
     );
     assert!(
-        !log_contains(&log2, "during the arm"),
-        "the arm must never read the sweep's frees as a torn snapshot (log: {})",
+        !log_contains(&log2, "during the arm") && !log_contains(&log2, "LIVE read CLEAR"),
+        "the arm must never read the sweep's frees as a torn snapshot or a loss (log: {})",
         log2.display()
     );
     assert!(
@@ -1134,7 +1139,7 @@ fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
          log: {})",
         log2.display()
     );
-    eprintln!("[armabsorb] frees absorbed by the arm: {absorbed} of {FIELD_CORPSE_BLOCKS}");
+    eprintln!("[{tag}] frees absorbed by the arm: {absorbed} of {FIELD_CORPSE_BLOCKS}");
     // The mount serves: a fresh file mints and reads back.
     let live = mnt.join("live.bin");
     let want = pattern(8, 2 * BLOCK);
@@ -1170,4 +1175,24 @@ fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
     assert_eq!(stat_u64(&mnt, "data_alloc_bitmap_drift"), 0);
     m2.umount_timed();
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Window (a): the frees land between the hold and the second snapshot.
+#[test]
+fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    swept_frees_beside_the_arm("armabsorb", "2500", "0");
+}
+
+/// Window (b): the frees land between the second snapshot and the verdict
+/// (review round 2, Issue 6 — RED on the list-at-two-instants verdict with
+/// "37 block(s) the derived allocator holds LIVE read CLEAR").
+#[test]
+fn a_swept_corpses_frees_landing_after_the_arms_snapshot_are_absorbed_too() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    swept_frees_beside_the_arm("armverdict", "1000", "1000");
 }

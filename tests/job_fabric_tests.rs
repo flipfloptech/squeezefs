@@ -313,7 +313,8 @@ async fn a_held_fabric_claims_no_job_until_admission_opens() {
     assert_eq!(
         status.state,
         JobState::Queued,
-        "a held fabric claims nothing (tasks_done {})",
+        "a held fabric claims nothing across two of the workers' 500 ms bounded parks \
+         (tasks_done {})",
         status.tasks_done
     );
     assert_eq!(status.tasks_done, 0);

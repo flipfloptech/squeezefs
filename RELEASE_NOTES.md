@@ -354,6 +354,18 @@ mount is a read-token client whose metadata is exact at the next resolve
   stale key's reference back under the live key; `block_pin_stale_keys`
   counts the class. Found by the 1.3.0 release chain's own `task check`
   (record §4.4bp).
+- **A `-o ro` mount of an idle set was refused outright on the 1.3
+  default** ("the writer must be mounted"): every read-only mount is a
+  token client under the flipped default, and the first build demanded a
+  live holder to dial — so a read-only inspection or backup mount of a
+  cleanly unmounted set, and every conformance suite's read-only cycle
+  mount (fstests generic/003, test 3 of 791), failed. A set with no live
+  writer is QUIESCENT: the mount is admitted as a quiescent reader serving
+  the checkpointed projection (exact — nothing writes; `reader_quiescent`
+  1), and its poll fail-stops it loud the moment a writer mounts the set
+  (`reader_quiescent_writer_appeared` 1, every metadata op `EIO`, `.stats`
+  still readable; remount to join as a token reader). Found by the 1.3.0
+  release chain's fstests leg (record §4.4br).
 - **Every `.stats` / `.config` close on a symmetric (1.3 default) mount
   routed a virtual inode through the metadata layer** (`SqueezefsFilesystem::
   custody_use_enter`, the probe every mutating handler runs first): a

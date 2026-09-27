@@ -5831,6 +5831,34 @@ the box's input to PR 14; the remaining box rows are the flip binary's.
    `EINVAL`). PR 13i gates PR 14's flip AND the cloud re-run (a NEW
    expressed owner approval for that run).
 
+21. **Two shipped-free laws without a wire pin — PR 14b, on the JOINER-
+   ROUTER fixture** (PR 14 review round 2, Issue 14; the round-1 Issue 2
+   ledger routed them "no wire pin"). The retirement's four served verdict
+   laws ride `sym_n_daemon_tests`' `FreeWire` fixture (a joiner's custody
+   lease at the holder, `FreeBlocks` over the wire); two SHIPPER-side laws
+   need what that fixture lacks — a joiner with its OWN `DataRouter`, so
+   the shipped free's per-verdict retire acts on real parked keys and real
+   in-flight writes: (a) **the `Freed`-under-a-new-generation retire**
+   (`shipped_free::retire_recomputed_parked_key` / the per-verdict retire in
+   `ship_displaced_frees` — a key whose stamp is no longer the offset's live
+   incarnation names a lifetime this mount already re-minted and is touched
+   by nobody), a shipper-LOCAL law reachable with a stub data router today;
+   (b) **the mid-write-reallocated refusal** (a served free of an offset a
+   write this mount holds in flight — the shipper's own registry answers the
+   refusal before the holder is asked). Both are the joiner-router fixture's
+   first two contracts; a PR 14b item beside the joiner's `df` (§4.4ay) and
+   the manager's zero-census open (item 4).
+
+22. **The journal ring override has no ceiling against the fold's widest
+   split — PR 14b** (§4.4bi, fix round 2 Issue 12): `SuperblockV3::plan`
+   admits any 4 KiB-multiple `--meta-journal-mb` at or above the floor, and
+   past ≈ 90 MiB with 64 KiB nodes a leaf holding a whole ring window of
+   uncovered records folds into a split whose ONE entry exceeds
+   `MAX_ENTRY_LEN` — an SMO the journal refuses (`EntryTooLarge`), the
+   compaction never landing. Every DEFAULT geometry is tied clear
+   (`derivation_sweep_tests`); the override wants a plan-time ceiling
+   (`ring ≤ node × MAX_ENTRY_LEN / per-part bytes`) or a chunked split.
+
 
 ## 8. Box footprint
 

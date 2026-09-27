@@ -7816,9 +7816,12 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
             format!("recompute {vol}'s derived used/free accounting from the tracked census"),
         ),
         FindingId::C8DurableRefDrift { vol, offset } => (
-            "restate-durable-refs",
+            "release-stale-block-refs",
             format!(
-                "restate {vol}:{offset}'s durable reference records from the layout                  walk's verified census (the layouts are the justification; the ledger                  is the index)"
+                "release every durable reference record of {vol}:{offset} whose owner's layout, \
+                 re-read offline under the writer guard, does not name the block at that map \
+                 index (a layout naming the block with no record stays report-only — a record \
+                 is never fabricated; the layouts are the justification, the ledger the index)"
             ),
         ),
         FindingId::C9Unreferenced { ino } => (
@@ -8259,6 +8262,22 @@ pub async fn repair(
     let vols = volume_allocators(ctx);
     let alloc_of = |vol: &str| vols.iter().find(|v| v.id == vol).map(|v| v.alloc.clone());
     let mut quarantine = Quarantine::new(ctx, opts);
+    // C8's repair (record §4.4bu): the open-pack ledger the detection pass
+    // exempts, and one durable-record scan per data volume shared by every
+    // C8 finding of the pass (owners folded to their GLOBAL ino).
+    let pack_ledger_repair: Vec<(Arc<BlockAllocator>, u64)> = crate::jobs::pack_open_ledger()
+        .iter()
+        .filter_map(|k| ctx.router.backend_router.allocator_for_key(k))
+        .collect();
+    let pack_open_repair = |alloc: &Arc<BlockAllocator>, offset: u64| {
+        pack_ledger_repair
+            .iter()
+            .any(|(a, o)| Arc::ptr_eq(a, alloc) && *o == offset)
+    };
+    let mut c8_records: std::collections::HashMap<
+        u64,
+        Vec<crate::meta_backend::kv::block_refs::BlockRef>,
+    > = std::collections::HashMap::new();
 
     // One fresh census for the allocator-class verifications (C2/C3),
     // walked ONCE — the repair-time ground truth.
@@ -8445,30 +8464,166 @@ pub async fn repair(
         match id {
             // ------------------------------------ C8 durable-ref drift
             //
-            // Repair is REFUSED, deliberately, and the refusal is the
-            // honest answer rather than a gap (§5.6a "no fabrication where
-            // redundancy does not exist"). Restating the ledger from the
-            // layout walk is a whole-volume mutation whose safe form needs
-            // every referencing ino's lease held across the restate, and a
-            // C8 finding means the accounting invariant ALREADY broke — the
-            // operator must see the divergence and its cause before a tool
-            // overwrites the evidence with the walk's opinion. The layouts
-            // are intact either way (they are the justification; the ledger
-            // is only its index), and mounting with
-            // `SQUEEZEFS_BLOCK_REFS_VERIFY=1` re-proves the state after any
-            // manual remedy.
+            // ONE direction repairs (record §4.4bu): a durable record whose
+            // OWNER's layout, re-read fresh, does not name this block at
+            // that map index is STALE — its reference was released in RAM
+            // (and its block may have freed) while the ledger kept it, the
+            // §4.4bt class — and is released through the ledger's own
+            // primitive, the record that would otherwise seed the block
+            // LIVE at every mount and refuse the flipped default's
+            // allocation arm at its loss check. The OTHER direction — a
+            // layout naming a block with no record — stays report-only:
+            // fabricating a record is never a repair (§5.6a), and the
+            // layouts remain authoritative. OFFLINE only: the repair takes
+            // the D0 writer guard, so no publish can re-name the block
+            // between the verification read and the release (the ledger
+            // commit takes the owner's 4a lease itself, so the two cannot
+            // be one lease-hold online). An OPEN pack block is under
+            // publication by construction and is refused whole.
             FindingId::C8DurableRefDrift { vol, offset } => {
-                refuse(
+                if online {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "durable block-reference drift at {vol}:{offset}: the stale-record \
+                             release runs OFFLINE only (unmount the set's writer, then \
+                             `squeezefs fsck <sqmeta-uri> --repair --apply`) — the verification \
+                             read and the release must not be interleaved by a live publish"
+                        ),
+                    );
+                    continue;
+                }
+                let Some(alloc) = alloc_of(vol) else {
+                    refuse(&mut out, f, "volume no longer registered".to_string());
+                    continue;
+                };
+                let chunk = alloc.chunk_size().max(1);
+                let idx = *offset / chunk;
+                if pack_open_repair(&alloc, *offset) {
+                    refuse(
+                        &mut out,
+                        f,
+                        "the block is the OPEN pack — under publication by construction"
+                            .to_string(),
+                    );
+                    continue;
+                }
+                let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(vol);
+                let records = match c8_records.get(&vol_tag) {
+                    Some(r) => r,
+                    None => {
+                        let mut all = Vec::new();
+                        for kv in &ctx.meta.volumes {
+                            let keying = if kv.symmetric_forest() {
+                                kv.mounted_ledger().membership_stamp.as_ref().map(|st| {
+                                    (u64::from(st.routing_width), st.resolved_native_slot())
+                                })
+                            } else {
+                                None
+                            };
+                            for mut r in kv.block_ref_scan(vol_tag).await? {
+                                if let Some((width, native)) = keying {
+                                    r.owner_ino =
+                                        crate::meta_backend::kv::shared_refs::global_owner(
+                                            r.owner_ino,
+                                            width,
+                                            native,
+                                        );
+                                }
+                                all.push(r);
+                            }
+                        }
+                        c8_records.entry(vol_tag).or_insert(all)
+                    }
+                };
+                let mut stale: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
+                let mut justified = 0usize;
+                for r in records.iter().filter(|r| r.block_idx == idx) {
+                    let (v_idx, local) = ctx.meta.route_ino(r.owner_ino);
+                    let Some(owner_kv) = ctx.meta.volumes.get(v_idx) else {
+                        continue;
+                    };
+                    let layout = match owner_kv.getxattr(local, "layout").await {
+                        Ok(Some(bytes)) => {
+                            if bytes.starts_with(b"{") {
+                                serde_json::from_slice::<crate::routing::LayoutMetadata>(&bytes)
+                                    .ok()
+                            } else {
+                                bincode::deserialize::<crate::routing::LayoutMetadata>(&bytes).ok()
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            refuse(
+                                &mut out,
+                                f,
+                                format!(
+                                    "owner ino {}'s layout unreadable at verify: {e}",
+                                    r.owner_ino
+                                ),
+                            );
+                            stale.clear();
+                            break;
+                        }
+                    };
+                    let named = match layout.as_ref() {
+                        Some(l) => {
+                            alloc
+                                .layout_names_block_at(
+                                    &ctx.router.backend_router,
+                                    owner_kv,
+                                    local,
+                                    l,
+                                    r.block_index,
+                                    idx,
+                                )
+                                .await
+                        }
+                        None => false,
+                    };
+                    if named {
+                        justified += 1;
+                    } else {
+                        stale.push(crate::meta_backend::kv::block_refs::BlockRef {
+                            vol_tag,
+                            block_idx: idx,
+                            owner_ino: r.owner_ino,
+                            block_index: r.block_index,
+                        });
+                    }
+                }
+                if stale.is_empty() {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "no stale durable record at {vol}:{offset} ({justified} record(s), each \
+                             justified by its owner's layout) — the drift is the derived-over-\
+                             durable direction (a layout naming the block with no record): \
+                             report-only, a record is never fabricated"
+                        ),
+                    );
+                    continue;
+                }
+                let mut released = 0usize;
+                for r in &stale {
+                    let op = crate::meta_backend::kv::block_refs::BlockRefOp::released(*r);
+                    ctx.meta
+                        .commit_block_refs_witnessed(r.owner_ino, &[op])
+                        .await?;
+                    released += 1;
+                }
+                apply_ok(
                     &mut out,
                     f,
+                    "release-stale-block-refs",
                     format!(
-                        "durable block-reference drift at {vol}:{offset} is reported, \
-                         never auto-repaired: the ledger and the layouts diverged, and \
-                         restating one from the other would erase the evidence of why. \
-                         The layouts remain authoritative"
+                        "{released} durable record(s) of {vol}:{offset} released — their owner's \
+                         layout names no such block at that index ({justified} justified record(s) \
+                         kept); the layouts stay authoritative"
                     ),
                 );
-                continue;
             }
             // ------------------------------------ C11 map-plane (kvmap)
             //

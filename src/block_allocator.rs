@@ -3069,6 +3069,67 @@ impl BlockAllocator {
         (out, indirect)
     }
 
+    /// Does `layout` (the owner's, read fresh) name block `block_idx` of
+    /// THIS volume at map index `block_index` — the justification a durable
+    /// reference record `(vol, block_idx, owner, block_index)` needs to
+    /// stand (fsck C8's repair, record §4.4bu)? `BLOCK_INDEX_MAP_BLOB`
+    /// names the indirect map's blob block itself; every other index is
+    /// resolved through the inline map, the indirect blob's entries or the
+    /// kvmap tree — the same three readers the derived census walks. A
+    /// layout of another type owns no block.
+    pub(crate) async fn layout_names_block_at(
+        &self,
+        backend_router: &crate::routing::BackendRouter,
+        kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+        local_ino: u64,
+        layout: &crate::routing::LayoutMetadata,
+        block_index: u32,
+        block_idx: u64,
+    ) -> bool {
+        if layout.file_type != "striped" && layout.file_type != "staged" {
+            return false;
+        }
+        let names =
+            |key: &str| self.owned_offset(backend_router, key) == Some(block_idx * self.chunk_size);
+        let indirect_key = layout
+            .block_map_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("indirect:"));
+        if block_index == crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB {
+            return indirect_key.is_some_and(names);
+        }
+        if let Some(key) = layout
+            .block_map
+            .as_ref()
+            .and_then(|bm| bm.get(&block_index))
+        {
+            if names(key) {
+                return true;
+            }
+        }
+        if let Some(indirect_key) = indirect_key {
+            let block_size = backend_router.block_size.load(Ordering::Relaxed) as usize;
+            if let Ok(raw) = backend_router.read_block(indirect_key, block_size).await {
+                if let Ok(entries) = crate::routing::decode_indirect_block_map(&raw) {
+                    if entries
+                        .iter()
+                        .any(|(b, key)| *b == block_index && names(key))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        if layout_is_kvmap(layout) {
+            return backend_router
+                .kvmap_layout_entries(kv, local_ino)
+                .await
+                .iter()
+                .any(|(b, key)| *b == block_index && names(key));
+        }
+        false
+    }
+
     /// The block indices THIS volume owns among an indirect block map's
     /// entries. The blob carries backend-true key strings (versioned v1
     /// blob): reducing them to bare offsets — the retired pre-versioned

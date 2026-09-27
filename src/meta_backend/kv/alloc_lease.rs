@@ -3129,7 +3129,12 @@ pub async fn arm_symmetric_allocation(
                 "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} block(s) the \
                  derived allocator holds LIVE read CLEAR in the recovered allocation bitmap \
                  (first: {:?}) — the loss direction; refusing to arm rather than re-grant them \
-                 (data_alloc_bitmap_drift; fsck's C6/C8 census is the oracle)",
+                 (data_alloc_bitmap_drift; fsck's C6/C8 census is the oracle). A block the \
+                 durable reference ledger names that no layout justifies reads live here \
+                 while the bitmap, moved by the free that happened, reads it clear: \
+                 `squeezefs fsck <sqmeta-uri> --json` reports it as C8 (`durable N vs derived \
+                 0`) and `squeezefs fsck <sqmeta-uri> --repair --apply`, offline, releases \
+                 the stale record (release-stale-block-refs); then mount again",
                 alloc.volume_id(),
                 loss.len(),
                 loss.first()

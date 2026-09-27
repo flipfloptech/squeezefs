@@ -130,6 +130,37 @@ fn pack_commit_stall_ms() -> u64 {
         .get_or_init(|| crate::env_knobs::int_knob::<u64>("SQUEEZEFS_TEST_PACK_COMMIT_STALL_MS", 0))
 }
 
+/// `SQUEEZEFS_TEST_GROWTH_COMMIT_STALL_MS` (test seam, registered): the
+/// staged → striped growth transition of [`DataRouter::write_file`] parks
+/// this long between its block DMA and its layout commit — the window a
+/// pressure promotion of the same file lands its packed tenant in (record
+/// §4.4bt). `u64::MAX` = not yet read; [`test_set_growth_commit_stall_ms`]
+/// presets it in-process.
+static GROWTH_COMMIT_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Growth commits that reached the seam's park (the harness's "the write
+/// is inside its window" witness).
+pub static TEST_GROWTH_COMMIT_STALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn growth_commit_stall_ms() -> u64 {
+    match GROWTH_COMMIT_STALL_MS.load(Ordering::Relaxed) {
+        u64::MAX => {
+            let ms = crate::env_knobs::int_knob::<u64>("SQUEEZEFS_TEST_GROWTH_COMMIT_STALL_MS", 0);
+            GROWTH_COMMIT_STALL_MS.store(ms, Ordering::Relaxed);
+            ms
+        }
+        ms => ms,
+    }
+}
+
+/// Test seam: `Some(ms)` presets the growth commit's park; `None` returns
+/// it to the knob.
+pub fn test_set_growth_commit_stall_ms(ms: Option<u64>) {
+    GROWTH_COMMIT_STALL_MS.store(ms.unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
 /// Test seam: `Some(on)` presets the packing lever; `None` returns it to
 /// the knob.
 pub fn test_set_small_file_packing(on: Option<bool>) {
@@ -8885,6 +8916,29 @@ impl DataRouter {
     /// Those sites build a whole map and save it, so they are already
     /// O(map); diffing per index adds no order of growth. The merge
     /// primitive's O(batch) path (`block_ref_ops`) stays the hot one.
+    /// The block map a whole-map swap DISPLACES (record §4.4bt): the RAM
+    /// entry's under the `INODE_META_LOCKS` guard when one is cached — the
+    /// last publish, which a pressure promotion of the same file may have
+    /// moved past the caller's snapshot (the merge worker's promotion takes
+    /// only this guard, never the block-0 guard the write holds) — else the
+    /// snapshot's (the backend's at the fetch). The swap's durable `−ref`s
+    /// and `release_superseded_staged`'s RAM releases must name the SAME
+    /// copies: computing the delta against the snapshot while releasing
+    /// the entry's map left a superseded pack tenant's record in the ledger
+    /// after its RAM reference was released and the pack block freed — fsck
+    /// C8 drift (`durable 1 vs derived 0`), and on the flipped default a
+    /// mount refusal at the allocation arm's loss check (fstests generic/751
+    /// → 752's scratch mount: 17 such blocks).
+    fn swap_displaced_map<'a>(
+        fresh: Option<&'a CachedMetadata>,
+        meta: &'a CachedMetadata,
+    ) -> Option<&'a std::collections::HashMap<u32, String>> {
+        match fresh {
+            Some(f) => f.block_map.as_deref(),
+            None => meta.block_map.as_deref(),
+        }
+    }
+
     pub(crate) fn block_ref_ops_for_map_swap(
         &self,
         ino: u64,
@@ -18537,6 +18591,16 @@ impl DataRouter {
                 block_map.insert(idx, key);
             }
 
+            // TEST SEAM (`SQUEEZEFS_TEST_GROWTH_COMMIT_STALL_MS`, record
+            // §4.4bt): park between the block DMA and the layout commit —
+            // the window a pressure promotion of this file publishes its
+            // packed tenant in.
+            let stall_ms = growth_commit_stall_ms();
+            if stall_ms > 0 {
+                TEST_GROWTH_COMMIT_STALLS.fetch_add(1, Ordering::Relaxed);
+                squeezefs_ipc::sqz_time::sleep(Duration::from_millis(stall_ms)).await;
+            }
+
             let commit_res = {
                 let _meta_guard = meta_lock_acquire(ino).await;
                 let fresh = self.metadata_cache.get(&ino);
@@ -18545,10 +18609,12 @@ impl DataRouter {
                 updated_meta.size = new_size as u64;
                 updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                 updated_meta.file_id = None;
-                // Spec §6.2 item 1: the promotion's whole-map swap, exactly.
+                // Spec §6.2 item 1: the promotion's whole-map swap, exactly
+                // — against the map this commit DISPLACES (record §4.4bt).
+                let old_map = Self::swap_displaced_map(fresh.as_ref(), &meta);
                 let refs = self.block_ref_ops_for_map_swap(
                     ino,
-                    meta.block_map.as_deref(),
+                    old_map,
                     updated_meta.block_map.as_deref(),
                 );
                 match self
@@ -18562,13 +18628,9 @@ impl DataRouter {
                         self.publish_layout_cache_entry(ino, updated_meta);
                         // The staged form is superseded: release its ring
                         // entry (budget) and any promoted/spilled durable
-                        // copy.
+                        // copy — the same map the swap's `−ref`s named.
                         Ok(self
-                            .release_superseded_staged(
-                                meta.file_id.as_deref(),
-                                fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                                None,
-                            )
+                            .release_superseded_staged(meta.file_id.as_deref(), old_map, None)
                             .await)
                     }
                     // The minted blocks never reached a persisted map —
@@ -18867,10 +18929,12 @@ impl DataRouter {
                     updated_meta.block_map = Some(std::sync::Arc::new(block_map));
                     // Durable backend write already happened — commit layout now.
                     updated_meta.layout_dirty = false;
-                    // Spec §6.2 item 1: the spill's whole-map swap.
+                    // Spec §6.2 item 1: the spill's whole-map swap — against
+                    // the map it DISPLACES (record §4.4bt).
+                    let old_map = Self::swap_displaced_map(fresh.as_ref(), &meta);
                     let refs = self.block_ref_ops_for_map_swap(
                         ino,
-                        meta.block_map.as_deref(),
+                        old_map,
                         updated_meta.block_map.as_deref(),
                     );
                     self.save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
@@ -18880,11 +18944,12 @@ impl DataRouter {
                     minted.disarm();
                     self.publish_layout_cache_entry(ino, updated_meta);
                     // Release the superseded stale ring entry (returns its
-                    // budget) and any older durable copy it had.
+                    // budget) and any older durable copy it had — the same
+                    // map the swap's `−ref`s named.
                     let deferred = self
                         .release_superseded_staged(
                             meta.file_id.as_deref(),
-                            fresh.as_ref().and_then(|f| f.block_map.as_deref()),
+                            old_map,
                             Some(&stored_block_key),
                         )
                         .await;
@@ -21155,10 +21220,13 @@ impl DataRouter {
                 // FIND-M11-A: the merge presents the ino's CURRENT
                 // generation, read at the last responsible moment.
                 let merge_token = self.dlm.get_fencing_token_ino(ino);
-                // Spec §6.2 item 1: the promotion's whole-map swap.
+                // Spec §6.2 item 1: the spill's whole-map swap — against the
+                // map it DISPLACES (record §4.4bt; `still_ours` above holds
+                // the identity, not the map: a promotion keeps both).
+                let old_map = Self::swap_displaced_map(fresh.as_ref(), &meta);
                 let refs = self.block_ref_ops_for_map_swap(
                     ino,
-                    meta.block_map.as_deref(),
+                    old_map,
                     updated_meta.block_map.as_deref(),
                 );
                 if let Err(e) = self
@@ -21178,13 +21246,10 @@ impl DataRouter {
                 self.note_landed_tenant_committed(&site);
                 self.cache.write_lru.remove(&file_path);
                 self.cache.read_lru.remove(&file_path);
-                // Release the superseded ring entry + any older durable copy.
+                // Release the superseded ring entry + any older durable copy
+                // — the same map the swap's `−ref`s named.
                 let deferred = self
-                    .release_superseded_staged(
-                        Some(&fid),
-                        fresh.as_ref().and_then(|f| f.block_map.as_deref()),
-                        Some(&stored_block_key),
-                    )
+                    .release_superseded_staged(Some(&fid), old_map, Some(&stored_block_key))
                     .await;
                 // RES-1: drop the level-3.5 guard BEFORE the device frees
                 // — each one can park at the reclaim cap. The landing site

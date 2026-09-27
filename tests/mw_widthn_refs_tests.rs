@@ -346,13 +346,41 @@ fn kid(key: &str) -> u64 {
     block_refs::volume_tag(key)
 }
 
+/// A durable reference's owner in the ROUTED layer's identity — the
+/// GLOBAL ino. On a forest volume (the default since PR 14) the record
+/// keys its owner in the LOCAL KEY form (`(s + 1) << 40 | local`; PR 7's
+/// law — the slot bits at offset 17 are what route the record to its
+/// owner's slot tree), which `shared_refs::global_owner` folds back — the
+/// kind-6 set oracle's own fold; a flat volume keys the global ino
+/// verbatim.
+fn owner_global(
+    be: &Arc<RoutedMetaBackend>,
+    kv: &squeezefs::meta_backend::kv::backend::KvMetaBackend,
+    owner: u64,
+) -> u64 {
+    if kv.superblock().symmetric_forest_stamped() {
+        squeezefs::meta_backend::kv::shared_refs::global_owner(
+            owner,
+            be.routing_width(),
+            kv.membership_stamp().and_then(|s| s.resolved_native_slot()),
+        )
+    } else {
+        owner
+    }
+}
+
 /// The durable ledger, as `(block_idx, owner_ino, block_index)` sorted —
-/// the oracle every pin compares against the composed map.
+/// the oracle every pin compares against the composed map; owners in the
+/// routed layer's GLOBAL identity ([`owner_global`]).
 async fn ledger(be: &Arc<RoutedMetaBackend>) -> Vec<(u64, u64, u32)> {
     let mut out = Vec::new();
     for kv in &be.volumes {
         for r in kv.block_ref_scan(TEST_TAG).await.expect("ledger scan") {
-            out.push((r.block_idx, r.owner_ino, r.block_index));
+            out.push((
+                r.block_idx,
+                owner_global(be, kv, r.owner_ino),
+                r.block_index,
+            ));
         }
     }
     out.sort_unstable();

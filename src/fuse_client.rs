@@ -11692,6 +11692,14 @@ impl SqueezefsFilesystem {
                 // (`ro_coherence::metadata_staleness_bound`). The poll's
                 // own cadence is `reader_revalidate_interval_ms` above.
                 "reader_staleness_bound_ms": 0,
+                // The QUIESCENT-SET posture (record §4.4br): a `-o ro`
+                // mount that found no live manager serves the checkpointed
+                // projection — exact, since nothing writes — and its poll
+                // fail-stops it once a writer appears (a remount joins as
+                // a token client). Both 0 on a write mount and on a token
+                // reader.
+                "reader_quiescent": u8::from(crate::ro_coherence::quiescent_reader()),
+                "reader_quiescent_writer_appeared": u8::from(crate::ro_coherence::quiescent_writer_appeared()),
                 // How many distinct OWNERS this mount's projection depends
                 // on (§5.11(a)'s tripwire pair, not a max): 0 on a write
                 // mount, 1 on today's reader/co-writer shape, K−1 on a
@@ -26532,10 +26540,24 @@ impl Filesystem for SqueezefsFilesystem {
             let tracked = crate::ro_coherence::revalidating_volumes(&routed.volumes);
             if !tracked.is_empty() {
                 crate::ro_coherence::arm_reader_coherence(&tracked, &self.router);
+                // The quiescent reader's fail-stop (record §4.4br): the
+                // cached block keys purged (nothing data-side serves
+                // stale) and the routed layer latched — every metadata op
+                // refuses EIO until the remount, the root's attributes
+                // excepted so `.stats` stays readable.
+                let fail_stop: std::sync::Arc<dyn Fn() + Send + Sync> = {
+                    let routed = std::sync::Arc::clone(routed);
+                    let cache = self.router.cache.clone();
+                    std::sync::Arc::new(move || {
+                        crate::ro_coherence::purge_reader_block_keys(&cache);
+                        routed.reader_fail_stop();
+                    })
+                };
                 crate::ro_coherence::spawn_reader_revalidation(
                     tracked,
                     self.dismount_once.clone(),
                     self.dismount_done.clone(),
+                    Some(fail_stop),
                 );
             }
             // PR 5 (design-symmetric-metadata §5.7.2): a `-o ro` mount under
@@ -26551,12 +26573,13 @@ impl Filesystem for SqueezefsFilesystem {
                 eprintln!("squeezefs: {msg}");
                 return Err(libc::EINVAL.into());
             }
-            if let Err(msg) =
-                crate::ro_coherence::arm_token_readers(&routed.volumes, &self.router).await
-            {
-                error!("{msg}");
-                eprintln!("squeezefs: {msg}");
-                return Err(libc::EINVAL.into());
+            match crate::ro_coherence::arm_token_readers(&routed.volumes, &self.router).await {
+                Ok(_) => {}
+                Err(msg) => {
+                    error!("{msg}");
+                    eprintln!("squeezefs: {msg}");
+                    return Err(libc::EINVAL.into());
+                }
             }
         }
 

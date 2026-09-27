@@ -694,6 +694,23 @@ pub fn join_dial_failed(e: &crate::error::SqueezefsError) -> bool {
     e.to_errno() == libc::EHOSTUNREACH
 }
 
+/// **Is a WRITER live on this volume?** — the D0 gate's own two words,
+/// read off a backend that holds no lock of its own (a probe, a `-o ro`
+/// reader): a LOCAL exclusive holder of the writer lock (another process
+/// on this host — the kernel's same-host proof), or a heartbeat-FRESH
+/// `writer_claim` of another writer (any host). The join target's decision
+/// (below) and the read-only mount's quiescence decision
+/// (`ro_coherence::arm_token_readers`) are this one function.
+pub async fn live_manager_present(volume: &kv::backend::KvMetaBackend) -> bool {
+    matches!(
+        kv::backend::KvMetaBackend::probe_shared_lock(volume.device_path()),
+        kv::backend::SharedProbe::LocalExclusiveHolder
+    ) || matches!(
+        volume.claim_standing().await,
+        kv::backend::ClaimStanding::Fresh
+    )
+}
+
 pub async fn symmetric_join_target(paths: &[String]) -> Result<Option<JoinedSetAdmission>> {
     let disc = discover_meta_set(paths).await?;
     let Some(first) = disc.ordered_paths.first() else {
@@ -703,14 +720,7 @@ pub async fn symmetric_join_target(paths: &[String]) -> Result<Option<JoinedSetA
     if !probe.superblock().symmetric_forest_stamped() {
         return Ok(None);
     }
-    let live_manager = matches!(
-        kv::backend::KvMetaBackend::probe_shared_lock(std::path::Path::new(first)),
-        kv::backend::SharedProbe::LocalExclusiveHolder
-    ) || matches!(
-        probe.claim_standing().await,
-        kv::backend::ClaimStanding::Fresh
-    );
-    if !live_manager {
+    if !live_manager_present(&probe).await {
         return Ok(None);
     }
     let endpoint = crate::sym_join::resolve_holder_endpoint(&probe, 0).await;
@@ -871,6 +881,12 @@ fn validate_slot_map(
 pub struct RoutedMetaBackend {
     pub volumes: Vec<std::sync::Arc<kv::backend::KvMetaBackend>>,
     pub disabled_volumes: std::sync::Arc<dashmap::DashMap<usize, bool, ahash::RandomState>>,
+    /// **The quiescent reader's fail-stop** (record §4.4br): a `-o ro`
+    /// mount that served an idle set's projection found a writer mounted
+    /// under it — every metadata op refuses from here (the root's own
+    /// attributes excepted, so `.stats` stays readable) until the remount
+    /// joins as a token client. One acquire load per op.
+    reader_fail_stop: std::sync::atomic::AtomicBool,
     /// The frozen routing width W (KD-7). Legacy: the volume count.
     routing_width: u64,
     /// The SWAPPABLE routing tables (PR VL5b): the slot→volume map and
@@ -1205,6 +1221,7 @@ impl RoutedMetaBackend {
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            reader_fail_stop: std::sync::atomic::AtomicBool::new(false),
             routing_width: n as u64,
             route: arc_swap::ArcSwap::from_pointee(RouteTable {
                 slot_to_volume: (0..n).collect(),
@@ -1270,6 +1287,7 @@ impl RoutedMetaBackend {
             disabled_volumes: std::sync::Arc::new(dashmap::DashMap::with_hasher(
                 ahash::RandomState::new(),
             )),
+            reader_fail_stop: std::sync::atomic::AtomicBool::new(false),
             routing_width,
             route: arc_swap::ArcSwap::from_pointee(RouteTable {
                 slot_to_volume,
@@ -2480,7 +2498,28 @@ impl RoutedMetaBackend {
         self.volumes[idx].dlm()
     }
 
+    /// Latch the quiescent reader's fail-stop (the revalidation poll's
+    /// writer watch, through the mount path's action).
+    pub fn reader_fail_stop(&self) {
+        self.reader_fail_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The quiescent reader fail-stopped (record §4.4br).
+    pub fn reader_fail_stopped(&self) -> bool {
+        self.reader_fail_stop
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn check_volume_enabled(&self, idx: usize) -> Result<()> {
+        if self.reader_fail_stopped() {
+            return Err(crate::error::SqueezefsError::refused(
+                libc::EIO,
+                "this -o ro mount served a QUIESCENT set's projection and a writer has since \
+                 mounted it — the reader fail-stopped (design-symmetric-metadata §5.7.2, \
+                 R-SYM-4); remount to join as a token reader",
+            ));
+        }
         if self.disabled_volumes.contains_key(&idx) {
             return Err(crate::error::SqueezefsError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
@@ -3665,7 +3704,12 @@ impl RoutedMetaBackend {
     /// the trait body verbatim.
     pub async fn getattr_local(&self, ino: Ino) -> Result<Inode> {
         let (v_idx, local_ino) = self.route_ino(ino);
-        self.check_volume_enabled(v_idx)?;
+        // The fail-stopped quiescent reader's ONE exception (PR 13c's
+        // token-reader precedent): the root's attributes, so the kernel's
+        // path walk to `.stats` — the operator's instrument — still lands.
+        if !(ino == 1 && self.reader_fail_stopped()) {
+            self.check_volume_enabled(v_idx)?;
+        }
         let mut inode = {
             let _guard = self.volumes[v_idx].dlm().lock_inode_shared(local_ino).await;
             self.read_inode_routed(v_idx, local_ino).await?

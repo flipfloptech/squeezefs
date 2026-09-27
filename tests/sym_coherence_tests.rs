@@ -4455,7 +4455,11 @@ async fn a_ro_mount_under_the_knob_arms_the_token_client_and_writes_nothing() {
     let armed = ro_coherence::arm_token_readers(&reader.volumes, &router)
         .await
         .expect("the posture's inputs are all present");
-    assert_eq!(armed, 1, "every read-only volume of the set arms");
+    assert_eq!(
+        armed,
+        ro_coherence::ReaderArm::TokenClient(1),
+        "every read-only volume of the set arms"
+    );
     let plane = Arc::clone(reader.volumes[0].token_reader().expect("armed"));
     wait_until("the recall channel completes its first round", || {
         plane.stats().channel_fresh

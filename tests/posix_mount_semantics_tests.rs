@@ -92,6 +92,11 @@ impl Drop for Mount {
 }
 
 fn spawn_mount(meta: &Path, mnt: &Path, log: &Path) -> Mount {
+    spawn_mount_with(meta, mnt, log, &[])
+}
+
+/// [`spawn_mount`] with extra mount arguments (`-o ro` for the reader).
+fn spawn_mount_with(meta: &Path, mnt: &Path, log: &Path, extra: &[&str]) -> Mount {
     std::fs::create_dir_all(mnt).expect("create mountpoint");
     let logf = std::fs::File::create(log).expect("create log");
     let child = Command::new(bin())
@@ -102,11 +107,12 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path) -> Mount {
         .arg(unsafe { libc::getuid() }.to_string())
         .arg("--gid")
         .arg(unsafe { libc::getgid() }.to_string())
+        .args(extra)
         .stdout(Stdio::from(logf.try_clone().expect("clone log fd")))
         .stderr(Stdio::from(logf))
         .spawn()
         .expect("spawn squeezefs mount");
-    let mount = Mount {
+    let mut mount = Mount {
         child,
         mnt: mnt.to_path_buf(),
     };
@@ -114,6 +120,12 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path) -> Mount {
     loop {
         if std::fs::read_to_string(mount.mnt.join(".stats")).is_ok() {
             break;
+        }
+        if let Ok(Some(status)) = mount.child.try_wait() {
+            panic!(
+                "mount exited before becoming ready ({status}); log:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
         }
         assert!(
             Instant::now() < deadline,
@@ -123,6 +135,18 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path) -> Mount {
         std::thread::sleep(Duration::from_millis(250));
     }
     mount
+}
+
+/// One integer from the mount's `.stats` JSON (a flat `"key": N` field).
+fn stats_metric(mnt: &Path, key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(mnt.join(".stats")).ok()?;
+    let needle = format!("\"{key}\":");
+    let at = text.find(&needle)? + needle.len();
+    let rest = text[at..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// `lseek(2)` straight through libc — no std wrapper hides the whence.
@@ -311,5 +335,108 @@ fn mount_symlink_size_is_correct_after_the_attr_ttl_lapses() {
         std::fs::read_link(&link).expect("readlink"),
         PathBuf::from(target)
     );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// **A `-o ro` mount of a QUIESCENT set serves what the writer left, and
+/// fail-stops loud the moment a writer appears** (the 1.3.0 release
+/// chain's third attempt — fstests generic/003's `_scratch_cycle_mount
+/// ro`, test 3 of 791, with nothing else mounted; record §4.4br). Under
+/// the flipped default every read-only mount is a token client, and the
+/// first build refused the mount outright with no live manager to dial
+/// ("the writer must be mounted"): a read-only inspection mount of an idle
+/// set — the commonest `-o ro` there is — failed, and so did every
+/// conformance test that cycles a mount read-only. With no live manager
+/// the set is quiescent: nothing can change a record, the checkpointed
+/// projection is exact, and the reader serves it (`reader_quiescent` 1).
+/// The poll watches for a writer: a rw mount of the same set (the D0
+/// flock + a fresh claim) fail-stops the reader within one poll — every
+/// metadata op answers an error, one loud line names the remount, the
+/// gauge latches — R-SYM-4's second method never serves beside a writer.
+#[test]
+fn a_read_only_mount_of_a_quiescent_set_serves_and_fail_stops_when_a_writer_appears() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("quiescent_ro");
+    let meta = format_volume(&base);
+    let mnt = base.join("mnt");
+    let payload = b"written before the cycle mount".to_vec();
+    {
+        let _rw = spawn_mount(&meta, &mnt, &base.join("rw.log"));
+        std::fs::write(mnt.join("file1"), &payload).expect("write file1");
+        std::fs::create_dir(mnt.join("dir")).expect("mkdir");
+        std::fs::write(mnt.join("dir").join("file2"), b"two").expect("write file2");
+    }
+
+    // The cycle mount, read-only, with NOTHING else mounted.
+    let ro_log = base.join("ro.log");
+    let ro = spawn_mount_with(&meta, &mnt, &ro_log, &["-o", "ro"]);
+    assert_eq!(
+        std::fs::read(mnt.join("file1")).expect("read file1 through the reader"),
+        payload,
+        "the reader serves the writer's bytes"
+    );
+    assert_eq!(
+        std::fs::read(mnt.join("dir").join("file2")).expect("read file2"),
+        b"two"
+    );
+    let names: Vec<String> = std::fs::read_dir(&mnt)
+        .expect("readdir")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    assert_eq!(names.len(), 2, "both names list: {names:?}");
+    assert!(
+        std::fs::read_to_string(mnt.join(".stats"))
+            .expect("stats")
+            .contains("\"read_only_mount\": true"),
+        "the posture word"
+    );
+    assert_eq!(
+        stats_metric(&mnt, "reader_quiescent"),
+        Some(1),
+        "no live manager ⇒ the quiescent projection posture"
+    );
+    assert_eq!(
+        stats_metric(&mnt, "reader_quiescent_writer_appeared"),
+        Some(0)
+    );
+    let err = std::fs::write(mnt.join("nope"), b"x").expect_err("a reader refuses writes");
+    assert_eq!(err.raw_os_error(), Some(libc::EROFS));
+
+    // A writer mounts the same set at a second mountpoint while the reader
+    // is up: the reader fail-stops within its poll.
+    let mnt2 = base.join("mnt2");
+    let _rw2 = spawn_mount(&meta, &mnt2, &base.join("rw2.log"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stats_metric(&mnt, "reader_quiescent_writer_appeared") != Some(1)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        stats_metric(&mnt, "reader_quiescent_writer_appeared"),
+        Some(1),
+        "the writer's appearance is latched within the poll (log: {})",
+        ro_log.display()
+    );
+    // Every metadata op refuses now (the path walk asks the daemon: TTLs
+    // are 0 on a reader), and the writer is untouched.
+    let refused = std::fs::metadata(mnt.join("file1"));
+    assert!(
+        refused.is_err(),
+        "a fail-stopped reader answers no metadata (got {refused:?})"
+    );
+    std::fs::write(mnt2.join("file3"), b"three").expect("the writer writes");
+    assert!(
+        std::fs::read_to_string(&ro_log)
+            .unwrap_or_default()
+            .contains("QUIESCENT"),
+        "the reader named its posture and the remount (log: {})",
+        ro_log.display()
+    );
+    drop(ro);
+    drop(_rw2);
     let _ = std::fs::remove_dir_all(&base);
 }

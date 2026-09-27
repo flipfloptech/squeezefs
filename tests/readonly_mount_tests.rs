@@ -60,7 +60,7 @@ use squeezefs::meta_backend::kv::builder::{
 use squeezefs::meta_backend::Metadata;
 use squeezefs::nvme_dev::NvmeBlockDev;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 const VOL_LEN: u64 = 64 * 1024 * 1024;
@@ -838,6 +838,7 @@ async fn reader_revalidation_task_exits_at_dismount() {
         vec![reader],
         stop.clone(),
         wake.clone(),
+        None,
     );
 
     // Dismount: latch first, then wake — the same order the mount path
@@ -1352,14 +1353,17 @@ async fn the_mount_path_token_arm_refuses_loud_on_a_flat_volume() {
 /// A token client IS a member-reader: the holder judges an unacked
 /// recall by the reader's membership lease, so a reader with no lease
 /// would be treated as dead at every recall while serving from its cache
-/// — the posture refuses loud instead, naming the plane the writer must
-/// arm. A reader with a lease and no declared holder endpoint refuses
-/// naming the endpoint knob.
+/// — under a LIVE manager the posture refuses loud instead, naming the
+/// plane the writer must arm. (With no live manager the set is QUIESCENT
+/// and the reader serves the projection — the next contract.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_mount_path_token_arm_refuses_loud_without_a_membership_lease() {
     let _serial = TOKEN_POSTURE.lock().await;
     let _latch = RoLatch::arm();
     let vol = stamped_volume().await;
+    // The live manager: a writer's open holds the D0 flock (the probe's
+    // `LocalExclusiveHolder` word) and its heartbeat-fresh claim.
+    let writer = KvMetaBackend::open(vol.path()).await.expect("writer");
     let reader = KvMetaBackend::open_read_only(vol.path())
         .await
         .expect("read-only mount");
@@ -1372,6 +1376,123 @@ async fn the_mount_path_token_arm_refuses_loud_without_a_membership_lease() {
         "the refusal names the plane the writer arms: {err}"
     );
     assert!(reader.token_reader().is_none(), "nothing armed on refusal");
+    assert!(!squeezefs::ro_coherence::quiescent_reader());
+    drop(reader);
+    writer.shutdown().await.expect("writer shutdown");
+}
+
+/// **A `-o ro` mount of a QUIESCENT set serves the checkpointed
+/// projection** (the 1.3.0 release chain's third attempt — fstests
+/// generic/003's cycle mount `ro` with nothing else mounted; record
+/// §4.4br): no live manager on any volume (no local exclusive writer lock,
+/// no heartbeat-fresh `writer_claim`) means no holder exists to grant a
+/// token, no membership owner to lease from, and nothing that can change a
+/// record — the projection is EXACT, and R-SYM-4's second method is not
+/// in play because there is no first. The arm answers `Quiescent`, arms
+/// no token client, and latches the posture the poll watches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_open_of_a_quiescent_set_serves_the_projection_without_a_token_client() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let _reset = QuiescentReset;
+    let vol = stamped_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_quiescent").await;
+    let arm = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect("a quiescent set is served, never refused");
+    assert_eq!(
+        arm,
+        squeezefs::ro_coherence::ReaderArm::Quiescent,
+        "no live manager ⇒ the quiescent projection"
+    );
+    assert!(
+        reader.token_reader().is_none(),
+        "no token client on a quiescent set"
+    );
+    assert!(squeezefs::ro_coherence::quiescent_reader());
+    assert!(!squeezefs::ro_coherence::quiescent_writer_appeared());
+    // The projection reads (ino 1 is the root).
+    let root = reader.getattr(1).await.expect("the root resolves");
+    assert_eq!(root.ino, 1);
+}
+
+/// **A writer appearing under a quiescent reader FAIL-STOPS the reader
+/// within one poll** (R-SYM-4: a bounded-staleness projection beside a
+/// live writer is the second read method; the honest posture is a loud
+/// refusal until the remount joins as a token client). The revalidation
+/// poll's writer watch sees the D0 flock / the fresh claim, runs the
+/// mount's fail-stop action ONCE, and latches the gauge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_appearing_under_a_quiescent_reader_fail_stops_it_within_the_poll() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let _reset = QuiescentReset;
+    let vol = stamped_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_quiescent_writer").await;
+    let arm = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect("quiescent");
+    assert_eq!(arm, squeezefs::ro_coherence::ReaderArm::Quiescent);
+    let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wake = Arc::new(squeezefs_ipc::sqz_notify::Notify::new());
+    let on_writer: Arc<dyn Fn() + Send + Sync> = {
+        let fired = Arc::clone(&fired);
+        Arc::new(move || {
+            fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let handle = squeezefs::ro_coherence::spawn_reader_revalidation(
+        vec![Arc::clone(&reader)],
+        stop.clone(),
+        wake.clone(),
+        Some(on_writer),
+    );
+    // Two quiet passes: nothing fires while the set stays quiescent.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // The writer mounts.
+    let writer = KvMetaBackend::open(vol.path()).await.expect("writer");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while fired.load(std::sync::atomic::Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        wake.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the writer's appearance fail-stops the quiescent reader exactly once"
+    );
+    assert!(squeezefs::ro_coherence::quiescent_writer_appeared());
+    // Later passes fire nothing more (the latch is one-shot).
+    wake.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    wake.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the revalidation task exits")
+        .expect("without panicking");
+    drop(reader);
+    writer.shutdown().await.expect("writer shutdown");
+}
+
+/// Resets the process-global quiescent-reader latches between contracts.
+struct QuiescentReset;
+
+impl Drop for QuiescentReset {
+    fn drop(&mut self) {
+        squeezefs::ro_coherence::test_reset_quiescent_reader();
+    }
 }
 
 // ===========================================================================

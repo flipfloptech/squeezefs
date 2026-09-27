@@ -2215,6 +2215,81 @@ async fn the_mount_arm_needs_a_cluster_secret_and_disarms_clean() {
     rig.shutdown().await;
 }
 
+/// **A virtual inode is never a custody object** (the 1.3.0 release chain's
+/// second attempt, record §4.4bq): `.stats` / `.config` / `.trace` and
+/// their per-lookup generation inos are the FUSE layer's own — no record,
+/// no slot, no holder — yet the custody-use probe every mutating handler
+/// runs FIRST (`custody_use_enter`, PR 9 round 3 Issue 20) routed them
+/// through the metadata layer on an ARMED mount: `route_ino` lands a
+/// generation ino in a guest slot with a raw local past the namespace
+/// (`0xffff_ffff_0000_0000` → slot `0xfffe`, local `0xffff_ffff_0001` ≥
+/// 2^40), the debug build's `guest_local_ino` assertion panics the handler
+/// lane and every `.stats` FLUSH / RELEASE answers a synthesized EIO — on
+/// every mount-class suite of the flipped default (the chain's test only
+/// read it as a lost rescue). The probe answers INERT for a virtual ino
+/// without touching the routed layer, and the handlers that carry it —
+/// FLUSH, RELEASE, FSYNC — answer their virtual arms exactly as unarmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_virtual_inos_custody_use_is_inert_and_its_handlers_never_route_it() {
+    use fuse3::raw::Filesystem;
+    use squeezefs::fuse_client::{
+        CONFIG_INODE, STATS_INODE, VIRTUAL_GEN_INO_FIRST, VIRTUAL_GEN_INO_LAST,
+    };
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let rig = common::sym::mount_fuse(&uris, data.path(), &Knobs::armed(), "32MB").await;
+    let venue = Venue::stand_up_on(&rig.routed, &[1]).await;
+    assert!(data_grant::slot_custody_armed(), "the plane is armed");
+    let s0 = data_grant::stats();
+
+    // The generation range's low bits carry the class (stats / config /
+    // trace); the canonical fixed inos beside them.
+    let virtuals = [
+        STATS_INODE,
+        CONFIG_INODE,
+        VIRTUAL_GEN_INO_FIRST,
+        VIRTUAL_GEN_INO_FIRST + 1,
+        VIRTUAL_GEN_INO_FIRST + 2,
+        VIRTUAL_GEN_INO_LAST,
+    ];
+    for ino in virtuals {
+        let probe = rig.fs.custody_use_enter(ino);
+        assert_eq!(
+            rig.fs.custody_uses(ino),
+            0,
+            "virtual ino {ino:#x}: the probe is inert — no use registered"
+        );
+        drop(probe);
+    }
+    // The handlers the kernel sends a `.stats` reader's close through.
+    for ino in virtuals {
+        rig.fs
+            .flush(common::sym::req(), ino, 7, 0)
+            .await
+            .unwrap_or_else(|e| panic!("FLUSH of virtual ino {ino:#x} failed: {e}"));
+        rig.fs
+            .release(common::sym::req(), ino, 7, 0, 0, false)
+            .await
+            .unwrap_or_else(|e| panic!("RELEASE of virtual ino {ino:#x} failed: {e}"));
+        rig.fs
+            .fsync(common::sym::req(), ino, 7, false)
+            .await
+            .unwrap_or_else(|e| panic!("FSYNC of virtual ino {ino:#x} failed: {e}"));
+    }
+    let s = data_grant::stats();
+    assert_eq!(
+        (s.via_slot_holder, s.grants),
+        (s0.via_slot_holder, s0.grants),
+        "a virtual ino costs no custody act"
+    );
+    assert_eq!(venue.owner.held(), 0, "no grant was asked of the holder");
+    venue.tear_down().await;
+    rig.shutdown().await;
+}
+
 /// Review round 3, Issue 20 — **the recall reaches the FUSE layer's cached
 /// lease**: a writer holding a foreign file's custody through the FUSE
 /// layer (`active_leases`, held from the first write to the last close)

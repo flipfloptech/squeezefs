@@ -363,8 +363,15 @@ mount is a read-token client whose metadata is exact at the next resolve
   A debug build panicked the handler lane (`close(2)` on `.stats` read
   EIO); a release build resolved a garbage local to "own file" and paid the
   routed load for nothing. The probe answers inert for a virtual ino before
-  any routing. Found by the 1.3.0 release chain's second `task check`
-  (record §4.4bq).
+  any routing. The same class on every layout, found by the fix's review:
+  `getxattr` / `listxattr` / `setxattr` / `removexattr` on a virtual inode
+  routed it too (a root `setfattr` on `.stats` wrote a durable record keyed
+  on a phantom guest local) — they answer the FUSE layer's own (ENODATA /
+  empty / EPERM). And the IPC `st_dev` resolver canonicalized its own
+  mountpoint AFTER the mount, which glibc < 2.33 (the rocky8 build) walks
+  by `lstat` — one GETATTR from the daemon to itself at every mount; it
+  compares the path resolved before the mount now. Found by the 1.3.0
+  release chain's second `task check` (record §4.4bq).
 - **`rename` locked the two parents' keys only** and staged a ctime
   `Delta` on the moved inode (and a `Put` on an overwritten destination) it
   never locked, so a concurrent layout publish of the same inode co-queued

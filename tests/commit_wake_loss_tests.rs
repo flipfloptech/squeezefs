@@ -26,7 +26,10 @@
 //! test seam `SQUEEZEFS_TEST_DROP_COMMIT_WAKES=N`: the reply path skips
 //! the first N eventfd wake writes after arming the coalescer — the
 //! commit message stays queued and the worker's PollAdd never fires,
-//! the exact interleave of the field capture.
+//! the exact interleave of the field capture. Its scoped form
+//! `SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID=<tid>` strikes only the replies
+//! to one thread's requests (the kernel's `fuse_in_header.pid`), so a
+//! desktop prober's request at the arm is never the victim.
 //!
 //! Contracts (red-first):
 //! 1. a lost commit wake resolves within the bounded park — the `stat`
@@ -36,7 +39,11 @@
 //!    was never needed, and the mount stays serviceable;
 //! 2. a healthy mount ticks nothing it owes — a burst of stats and reads
 //!    with the seam unloaded leaves both rescue counters at 0 (a nonzero
-//!    value IS the lost-wake tripwire).
+//!    value IS the lost-wake tripwire);
+//! 3. a fresh mount issues no request to itself — from the arm to the IPC
+//!    `st_dev` resolver's answer, no traced delivery names a daemon thread
+//!    as its requester (a prober's requests are read by the trace's
+//!    `pid=` word and are not the law's subject).
 //!
 //! Mount-class: self-skips through the testkit where a mount is not
 //! possible and rides the require-mount gate
@@ -64,15 +71,17 @@ fn bin() -> &'static str {
 /// `/tmp`, never `$HOME`: a desktop's volume monitor (GVfs) probes every
 /// `$HOME`-rooted mount within milliseconds of the arm — a burst of
 /// GETATTR/LOOKUP/READDIRPLUS across several CPUs' queues — and the
-/// FIRST over-uring reply is the one the seam drops. A prober's victim
-/// sits on a BUSY queue, where the prober's own next delivery pumps the
-/// stranded commit before the 100 ms tick can (measured: no rescue in 1
-/// of 3 runs); mounts under `/tmp` receive no such probe (measured: zero
-/// unprompted deliveries), so the victim is deterministically this
-/// test's request on a queue only it uses. Canonicalized here because the
-/// mountpoint is matched against `/proc/self/mountinfo` verbatim later,
-/// and resolving it after the mount would stat the mounted root — a FUSE
-/// request, which is the very thing a wedged mount never answers.
+/// FIRST over-uring reply is the one the unscoped seam drops. A prober's
+/// victim sits on a BUSY queue, where the prober's own next delivery pumps
+/// the stranded commit before the 100 ms tick can (measured: no rescue in
+/// 1 of 3 runs). `/tmp` keeps GVfs's mount browser away; its trash monitor
+/// (`gvfsd-trash`, once running) probes here too (the 1.3.0 chain's
+/// reading: a root GETATTR + `.Trash` + `.Trash-1000`), which is why
+/// contract 1 SCOPES the seam to its own stat thread and waits the burst
+/// out. Canonicalized here because the mountpoint is matched against
+/// `/proc/self/mountinfo` verbatim later, and resolving it after the mount
+/// would stat the mounted root — a FUSE request, which is the very thing a
+/// wedged mount never answers.
 fn scratch(tag: &str) -> PathBuf {
     let base = std::env::temp_dir().join(format!("sqfs_cwake_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -196,15 +205,17 @@ impl Drop for Mount {
 
 /// Spawn the real daemon on the field venue (zc OFF — the fstests runner's
 /// default, the capture's posture) with the commit-wake drop seam loaded
-/// for `drop_n` wakes. Readiness is read off the LOG ("transport armed for
-/// this session"), never off a `.stats` read: with the seam loaded the
-/// first over-uring reply's wake is the one that is dropped, and a probe
-/// read would be that reply — pre-fix the fixture itself would hang.
-fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, drop_n: u64) -> Mount {
+/// for `drop_n` wakes, SCOPED to the requests of thread `seam_tid` when
+/// one is named (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID`). Readiness is
+/// read off the LOG ("transport armed for this session"), never off a
+/// `.stats` read: with the seam loaded the first over-uring reply's wake
+/// is the one that is dropped, and a probe read would be that reply —
+/// pre-fix the fixture itself would hang.
+fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, drop_n: u64, seam_tid: Option<u32>) -> Mount {
     std::fs::create_dir_all(mnt).expect("create mountpoint");
     let logf = std::fs::File::create(log).expect("create log");
-    let child = Command::new(bin())
-        .arg("mount")
+    let mut cmd = Command::new(bin());
+    cmd.arg("mount")
         .arg(format!("sqmeta://{}", meta.display()))
         .arg(mnt)
         .arg("--uid")
@@ -213,7 +224,11 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, drop_n: u64) -> Mount {
         .arg("--gid")
         .arg(unsafe { libc::getgid() }.to_string())
         .env("SQUEEZEFS_FUSE_ZC", "0")
-        .env("SQUEEZEFS_TEST_DROP_COMMIT_WAKES", drop_n.to_string())
+        .env("SQUEEZEFS_TEST_DROP_COMMIT_WAKES", drop_n.to_string());
+    if let Some(tid) = seam_tid {
+        cmd.env("SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID", tid.to_string());
+    }
+    let child = cmd
         // Per-request deliver/reply/commit tracing: when this suite fails
         // the daemon log is the evidence (which request the seam hit, on
         // which queue, and what its worker did next).
@@ -289,6 +304,80 @@ fn bounded_stat(path: PathBuf, bound: Duration) -> Option<std::io::Result<std::f
     rx.recv_timeout(bound).ok()
 }
 
+/// ONE long-lived thread that issues the seam's victim stats, so the
+/// kernel attributes every one of them to a thread id known BEFORE the
+/// daemon starts (`fuse_in_header.pid` is the issuing thread's id — the
+/// scoped seam's key). A stat is still bounded from the caller's side: a
+/// strand leaves the thread parked in the kernel, which is the wedge the
+/// caller then names.
+struct StatThread {
+    tid: u32,
+    requests: mpsc::Sender<PathBuf>,
+    results: mpsc::Receiver<std::io::Result<std::fs::Metadata>>,
+}
+
+impl StatThread {
+    fn spawn() -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<PathBuf>();
+        let (res_tx, res_rx) = mpsc::channel();
+        let (tid_tx, tid_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            let _ = tid_tx.send(unsafe { libc::gettid() } as u32);
+            while let Ok(path) = req_rx.recv() {
+                if res_tx.send(std::fs::metadata(&path)).is_err() {
+                    break;
+                }
+            }
+        });
+        let tid = tid_rx.recv().expect("the stat thread reports its tid");
+        Self {
+            tid,
+            requests: req_tx,
+            results: res_rx,
+        }
+    }
+
+    fn bounded_stat(
+        &self,
+        path: PathBuf,
+        bound: Duration,
+    ) -> Option<std::io::Result<std::fs::Metadata>> {
+        self.requests.send(path).expect("the stat thread is alive");
+        self.results.recv_timeout(bound).ok()
+    }
+}
+
+/// Wait until the transport traced no NEW delivery for `quiet` (bounded by
+/// `bound`): a desktop's volume monitor probes every fresh mount within
+/// milliseconds of the arm (this box's `gvfsd-trash`: a root GETATTR +
+/// `.Trash` + `.Trash-1000` LOOKUPs), and contract 1's victim must sit on
+/// a queue nothing else is about to use.
+fn wait_deliveries_quiet(log: &Path, quiet: Duration, bound: Duration) -> usize {
+    let count = || {
+        std::fs::read_to_string(log)
+            .map(|t| {
+                t.lines()
+                    .filter(|l| l.starts_with("[XPORT] deliver"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + bound;
+    let mut last = count();
+    let mut since = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(25));
+        let now = count();
+        if now != last {
+            last = now;
+            since = Instant::now();
+        } else if since.elapsed() >= quiet || Instant::now() >= deadline {
+            return last;
+        }
+    }
+}
+
 /// Poll a stats-inode metric through BOUNDED reads until `accept` holds
 /// or `bound` elapses. Each `.stats` read runs on its own helper thread
 /// (a read that lands on the wedged queue strands pre-fix — exactly the
@@ -322,15 +411,25 @@ fn wait_metric(
     }
 }
 
-/// Contract 1: the seam drops the wake of the FIRST reply to travel the
-/// ring — this test's `stat` (the LOOKUP, or the root GETATTR the path
-/// walk issues first; either way the stat is what strands), on a queue
-/// nothing else uses (`scratch` explains the venue). The stranded reply
-/// must be committed inside the bounded park (one 100 ms tick and the
-/// pass that follows — well under 3 s), the rescue ledger must account
-/// it, the 5 s slot watchdog must never have been needed, and the mount
-/// must be serviceable afterwards. Pre-fix the victim's queue is wedged
-/// for good: the stat strands until the harness aborts the connection.
+/// Contract 1: the seam drops the wake of the FIRST reply to THIS test's
+/// stat thread (the LOOKUP, or the root GETATTR the path walk issues
+/// first; either way the stat is what strands), on a queue nothing else
+/// is using. The stranded reply must be committed inside the bounded park
+/// (one 100 ms tick and the pass that follows — well under 3 s), the
+/// rescue ledger must account it, the 5 s slot watchdog must never have
+/// been needed, and the mount must be serviceable afterwards. Pre-fix the
+/// victim's queue is wedged for good: the stat strands until the harness
+/// aborts the connection.
+///
+/// The venue premise, made a mechanism (the 1.3.0 release chain's second
+/// attempt; record §4.4bq): the seam is SCOPED to the stat thread's id,
+/// and the first stat waits for the arm's delivery burst to settle. The
+/// unscoped seam's victim was whichever reply travelled first — on this
+/// box `gvfsd-trash`'s root GETATTR at the arm — and the prober's own next
+/// LOOKUP on the same CPU's queue pumped the strand by an ordinary wake
+/// before the tick, leaving `transport_park_tick_commit_rescues` at 0 for
+/// a rescue that never had to happen (`scratch` records the earlier,
+/// `$HOME`-only reading of the same class).
 #[test]
 fn a_lost_commit_wake_resolves_within_the_bounded_park() {
     if !mount_supported(site!()) {
@@ -340,14 +439,17 @@ fn a_lost_commit_wake_resolves_within_the_bounded_park() {
     let meta = format_volume(&base);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mount = spawn_mount(&meta, &mnt, &log, 1);
+    let stats = StatThread::spawn();
+    let mount = spawn_mount(&meta, &mnt, &log, 1, Some(stats.tid));
+    let probed = wait_deliveries_quiet(&log, Duration::from_millis(400), Duration::from_secs(5));
+    eprintln!("{probed} delivery(ies) traced before this test's first stat (a prober's)");
 
     // Drive replies over the ring until the daemon names the dropped
     // wake. Every stat is bounded: a strand IS the wedge.
     let mut seam_fired = false;
     for attempt in 0..10u32 {
         let started = Instant::now();
-        let outcome = bounded_stat(
+        let outcome = stats.bounded_stat(
             mnt.join(format!("no-such-entry-{attempt}")),
             Duration::from_secs(3),
         );
@@ -443,7 +545,7 @@ fn a_healthy_mount_ticks_nothing_it_owes() {
     let meta = format_volume(&base);
     let mnt = base.join("mnt");
     let log = base.join("mount.log");
-    let mount = spawn_mount(&meta, &mnt, &log, 0);
+    let mount = spawn_mount(&meta, &mnt, &log, 0, None);
 
     let file = mnt.join("burst.bin");
     let payload = vec![0x5Au8; 64 * 1024];
@@ -485,6 +587,75 @@ fn a_healthy_mount_ticks_nothing_it_owes() {
     assert!(
         !log_contains(&log, SEAM_MARKER),
         "the seam must be inert at its default (log: {})",
+        log.display()
+    );
+
+    drop(mount);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Contract 3 — **a fresh mount sends no request to itself** (the 1.3.0
+/// release chain's second attempt; record §4.4bq): contract 1's venue
+/// premise is that the seam's victim is THIS test's request on a queue
+/// only it uses. The daemon's IPC `st_dev` resolver broke it from inside:
+/// it CANONICALIZED the mountpoint after the mount — `realpath(3)` lstats
+/// the final component, the FUSE root, whose attributes are invalid at
+/// mount — so every mount issued one root GETATTR to itself, racing the
+/// arm; landing after it, that GETATTR was the first over-uring reply,
+/// the seam struck it, and the test's own `.stats` read on the same CPU's
+/// queue pumped the strand by an ordinary wake before the 100 ms tick
+/// (`transport_park_tick_commit_rescues` legitimately 0). The resolver
+/// compares the path canonicalized BEFORE the mount; from the arm to the
+/// resolver's answer, no traced delivery names a thread of the daemon as
+/// its requester. A desktop's probers (this box's `gvfsd-trash` sends a
+/// root GETATTR + `.Trash` + `.Trash-1000` LOOKUPs at every new mount)
+/// are read by the trace's `pid=` word and are not the law's subject —
+/// they are contract 1's venue premise, which the seam's budget of one
+/// makes them able to break; the daemon's own request must never be.
+#[test]
+fn a_fresh_mount_issues_no_request_to_itself() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("quiet");
+    let meta = format_volume(&base);
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    let mount = spawn_mount(&meta, &mnt, &log, 0, None);
+    let daemon = mount.child.id();
+
+    // The resolver's own verdict is the quiet window's end: it ran to
+    // completion, so anything it sent has been traced.
+    assert!(
+        wait_log_contains(&log, "mount st_dev resolved", Duration::from_secs(20)),
+        "the IPC st_dev resolver never answered (log: {})",
+        log.display()
+    );
+    let text = std::fs::read_to_string(&log).expect("read daemon log");
+    // A delivery's `pid=` is the issuing THREAD's id; the daemon's threads
+    // (its blocking pool included) are long-lived, so a self-request's
+    // requester is still listed under the daemon's task directory.
+    let issued_by_daemon = |line: &str| -> bool {
+        line.split_whitespace()
+            .find_map(|t| t.strip_prefix("pid="))
+            .and_then(|p| p.parse::<u32>().ok())
+            .is_some_and(|tid| {
+                tid == daemon || Path::new(&format!("/proc/{daemon}/task/{tid}")).exists()
+            })
+    };
+    let deliveries: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("[XPORT] deliver") || l.starts_with("[XPORT] classical-deliver"))
+        .filter(|l| !l.split_whitespace().any(|t| t == "op=26"))
+        .collect();
+    let self_traffic: Vec<&&str> = deliveries.iter().filter(|l| issued_by_daemon(l)).collect();
+    assert!(
+        self_traffic.is_empty(),
+        "the daemon sent {} request(s) to its own mount: {:?} (every pre-client delivery: \
+         {:?}; log: {})",
+        self_traffic.len(),
+        self_traffic,
+        deliveries,
         log.display()
     );
 

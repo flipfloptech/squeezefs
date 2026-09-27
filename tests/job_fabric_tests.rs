@@ -275,6 +275,66 @@ async fn noop_job_runs_to_completion_and_records_are_durable() {
     assert_eq!(rec["state"], "completed", "terminal state durable: {rec}");
 }
 
+/// **A fabric started HELD claims nothing until admission opens** (record
+/// §4.4bs): the mount path re-queues every adopted job at the fabric's
+/// start, hundreds of milliseconds before the allocation lease arms over
+/// a seed snapshot nothing may move — an adopted mover, fsck repair or
+/// kvmap sweep allocates and frees the moment a worker claims it, and a
+/// refused arm exits the mount, whose next mount adopts the same record
+/// (a refusal loop). Held, the workers park on their bounded notify; the
+/// job stays `Queued` across two of their beats; `open_admission` runs it
+/// to completion. A fabric started open (every other caller) is
+/// byte-identical to before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_fabric_claims_no_job_until_admission_opens() {
+    let fx = fixture("fab-held").await;
+    let fab = JobFabric::start_held(fx.meta.clone(), 2, 100, None)
+        .await
+        .expect("fabric start (held)");
+    assert!(fab.admission_held());
+    let job_id = fab
+        .submit(JobSpec {
+            job_type: JobType::Noop {
+                tasks: 4,
+                task_ms: 1,
+            },
+            throttle_pct: 100,
+        })
+        .await
+        .expect("submit");
+    // Two worker beats (the bounded park is 500 ms): the job is never
+    // claimed while held.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let status = fab
+        .status(&job_id)
+        .await
+        .expect("status")
+        .expect("known job");
+    assert_eq!(
+        status.state,
+        JobState::Queued,
+        "a held fabric claims nothing (tasks_done {})",
+        status.tasks_done
+    );
+    assert_eq!(status.tasks_done, 0);
+
+    fab.open_admission();
+    assert!(!fab.admission_held());
+    fab.wait_terminal(&job_id, Duration::from_secs(30))
+        .await
+        .expect("the job runs once admission opens");
+    let status = fab
+        .status(&job_id)
+        .await
+        .expect("status")
+        .expect("known job");
+    assert_eq!(status.state, JobState::Completed);
+    assert_eq!(status.tasks_done, 4);
+    // Idempotent: a second open is a no-op.
+    fab.open_admission();
+    assert!(!fab.admission_held());
+}
+
 /// The throttle law itself (`job_throttle_sleep`, KD-3), deterministically:
 /// after a task of measured cost `e`, the worker sleeps `e × (100-pct)/pct`,
 /// so `e / (e + sleep) == pct`. No clock, no scheduler, no flake.

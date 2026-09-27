@@ -1051,27 +1051,38 @@ fn a_single_overcap_corpse_stopped_between_entries_is_finished_by_the_next_mount
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// **A swept corpse's frees have LANDED before the allocation lease arms**
-/// (the 1.3.0 release chain's fstests QUICK pre-pass, generic/590's scratch
-/// mount after generic/551 left a corpse; record §4.4bs). The sweep's
-/// terminal frees ride the background reclaim queue, whose `finish_free`
-/// lands at the worker's cadence — while PR 8's allocation arm, next in
-/// the mount path, seeds its bitmap from a snapshot of the allocator and
-/// REFUSES the mount when a second snapshot after the hold differs ("the
-/// allocator moved during the arm … 37 → 0 set"): the frees landing
-/// between the two snapshots read as a torn seed, and every mount of a set
-/// carrying a corpse with blocks failed at that rate. The sweep's
-/// postcondition — "blocks freed" — is literal at its return now: it
-/// drains the queue it filled, so the arm sees a quiescent allocator.
-/// The corpse is the field's size class (37 blocks); the remount must
-/// come up, name the sweep, hold the lease and mint fresh.
+/// **A swept corpse's frees landing beside the allocation lease's arm are
+/// ABSORBED, never a mount refusal** (the 1.3.0 release chain's fstests
+/// QUICK pre-pass, generic/590's scratch mount after generic/551 left a
+/// corpse; record §4.4bs). The sweep's terminal frees ride the background
+/// reclaim queue, whose `finish_free` lands at the worker's cadence — on a
+/// FILE-backed data volume (this rig's, every fstests scratch device's)
+/// they never run inline — while PR 8's allocation arm, next in the mount
+/// path, seeds its bitmap from a snapshot of the allocator and took a
+/// second snapshot after the hold that had to EQUAL the first: the frees
+/// landing between the two read as a torn seed ("the allocator moved during
+/// the arm … 37 → 0 set") and the mount failed at that rate. The arm now
+/// judges the second snapshot by DIRECTION — a free beside it is cleared in
+/// the holding with its delta journaled (`data_alloc_bitmap_arm_absorbed_
+/// frees`), an allocation beside it still refuses — so the same schedule
+/// arms, and no bit is left SET for a block nothing references.
+///
+/// The race made certain: the reclaim worker's batch window is set to
+/// 1,500 ms (the registered knob — a queued free cannot land sooner after
+/// the sweep's enqueue) and the arm's seam parks its hold → re-snapshot
+/// window for 2,500 ms, so the frees land INSIDE the window whenever the
+/// mount path from the sweep's return to the arm's first snapshot takes
+/// under 1,500 ms (≈ 100–300 ms here; the margin is the timing-contract
+/// class's 5×). The outcome assertions hold in EVERY interleaving: the
+/// mount arms, and at quiesce the bitmap's population is exactly the
+/// granted blocks — a leaked bit would read `granted + 37`.
 #[test]
-fn a_swept_corpses_frees_land_before_the_allocation_lease_arms() {
+fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
     if !mount_supported(site!()) {
         return;
     }
     const FIELD_CORPSE_BLOCKS: usize = 37;
-    let base = scratch("armdrain");
+    let base = scratch("armabsorb");
     let staging = base.join("staging");
     let meta = format_volume(&base, &staging);
     let mnt = base.join("mnt");
@@ -1087,21 +1098,16 @@ fn a_swept_corpses_frees_land_before_the_allocation_lease_arms() {
         drop(held);
     }
 
-    // Mount 2: the sweep frees the corpse's blocks, then the allocation
-    // lease arms over a quiescent allocator. The field's race, made
-    // certain: the reclaim worker's batch window is set to 250 ms (the
-    // registered knob — a queued free cannot land sooner) and the arm's
-    // seam parks its hold → re-snapshot window for 400 ms, so a free the
-    // sweep left in the queue lands INSIDE the arm's window; only a sweep
-    // whose frees have landed at its return passes.
+    // Mount 2: the sweep queues the corpse's frees; the arm's window opens
+    // before they land and closes after.
     let log2 = base.join("m2.log");
     let mut m2 = spawn_mount(
         &meta,
         &mnt,
         &log2,
         &[
-            ("SQUEEZEFS_RECLAIM_BATCH_MS", "250"),
-            ("SQUEEZEFS_TEST_ALLOC_ARM_HOLD_MS", "400"),
+            ("SQUEEZEFS_RECLAIM_BATCH_MS", "1500"),
+            ("SQUEEZEFS_TEST_ALLOC_ARM_HOLD_MS", "2500"),
         ],
     );
     assert!(
@@ -1110,8 +1116,8 @@ fn a_swept_corpses_frees_land_before_the_allocation_lease_arms() {
         log2.display()
     );
     assert!(
-        !log_contains(&log2, "moved during the arm"),
-        "the arm's seed must never read the sweep's frees as a torn snapshot (log: {})",
+        !log_contains(&log2, "during the arm"),
+        "the arm must never read the sweep's frees as a torn snapshot (log: {})",
         log2.display()
     );
     assert!(
@@ -1120,11 +1126,48 @@ fn a_swept_corpses_frees_land_before_the_allocation_lease_arms() {
         log2.display()
     );
     wait_reclaim_drained(&mnt, FIELD_CORPSE_BLOCKS as u64);
+    let absorbed = stat_u64(&mnt, "data_alloc_bitmap_arm_absorbed_frees");
+    assert!(
+        absorbed >= 1,
+        "the frees landed inside the arm's window and were absorbed (the pin's premise: the \
+         pre-arm mount path is shorter than the 1,500 ms batch window; absorbed = {absorbed}, \
+         log: {})",
+        log2.display()
+    );
+    eprintln!("[armabsorb] frees absorbed by the arm: {absorbed} of {FIELD_CORPSE_BLOCKS}");
     // The mount serves: a fresh file mints and reads back.
     let live = mnt.join("live.bin");
     let want = pattern(8, 2 * BLOCK);
     drop(write_fsync(&live, &want));
     assert_eq!(std::fs::read(&live).expect("read live"), want);
+    // No bit left SET for a block nothing references: the holder's
+    // population is exactly its granted blocks (one data volume, one
+    // holding). A free the arm had tolerated without clearing would read
+    // here as `granted + 37`.
+    let stats = stats_json(&mnt);
+    let holding = |key: &str| -> u64 {
+        stats["metrics"][key]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| panic!("{key}[0] exported on the stats inode"))
+    };
+    let granted = holding("block_grant_blocks");
+    let returned = holding("block_grant_returned");
+    let population = holding("data_alloc_bitmap_population");
+    assert!(
+        granted >= 2,
+        "the live file minted from a grant (granted = {granted})"
+    );
+    assert_eq!(
+        population,
+        granted - returned,
+        "every bit SET in the allocation bitmap is a granted block — the {FIELD_CORPSE_BLOCKS} \
+         swept blocks read CLEAR (granted {granted}, returned {returned}, absorbed {absorbed}; \
+         log: {})",
+        log2.display()
+    );
+    assert_eq!(stat_u64(&mnt, "data_alloc_bitmap_drift"), 0);
     m2.umount_timed();
     let _ = std::fs::remove_dir_all(&base);
 }

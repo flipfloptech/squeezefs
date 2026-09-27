@@ -354,6 +354,17 @@ mount is a read-token client whose metadata is exact at the next resolve
   stale key's reference back under the live key; `block_pin_stale_keys`
   counts the class. Found by the 1.3.0 release chain's own `task check`
   (record §4.4bp).
+- **Every `.stats` / `.config` close on a symmetric (1.3 default) mount
+  routed a virtual inode through the metadata layer** (`SqueezefsFilesystem::
+  custody_use_enter`, the probe every mutating handler runs first): a
+  virtual inode is the FUSE layer's own — no record, no slot — yet on an
+  armed mount its FLUSH / RELEASE / FSYNC resolved a custody holder for it,
+  landing a per-lookup generation ino in a guest slot past the namespace.
+  A debug build panicked the handler lane (`close(2)` on `.stats` read
+  EIO); a release build resolved a garbage local to "own file" and paid the
+  routed load for nothing. The probe answers inert for a virtual ino before
+  any routing. Found by the 1.3.0 release chain's second `task check`
+  (record §4.4bq).
 - **`rename` locked the two parents' keys only** and staged a ctime
   `Delta` on the moved inode (and a `Put` on an overwritten destination) it
   never locked, so a concurrent layout publish of the same inode co-queued

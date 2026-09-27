@@ -303,6 +303,93 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
     re.shutdown().await.unwrap();
 }
 
+/// **The heap-full merge sweep YIELDS to a user commit retrying for space**
+/// (1.3.0 release chain attempt 4, `task check` leg, a 1-in-10 of the
+/// contract above: `destroy must commit on a full volume: … 4 free extents
+/// with the 4-extent compaction reserve intact`). The §4.6a sweep runs at
+/// the END of every checkpoint cycle, after the barrier returned the
+/// parked retirements, and claims at the compaction floor — the same
+/// floor a user delete's compaction needs — so inside the §4.7 door's two
+/// "return room" cycles it re-took every returned extent (6 → 12 → 25
+/// merges, `pending_free` 13 → 50, `free` pinned on the floor) and the
+/// delete's one retry met the floor again: a full volume refusing its
+/// deletes while its own recovery churned, a priority inversion between a
+/// background recovery and the user delete it exists to serve.
+///
+/// Pinned at the mechanism, deterministically: on a FULL volume with a
+/// merge backlog, a cycle run while the door's space retry is held runs
+/// NO sweep and counts a yield (`meta_kv_merge_yields`); the next cycle,
+/// with the hold released, sweeps again. The hold is the pass's own
+/// (`begin_space_retry`), so the pin drives exactly the word the door
+/// raises. The composed shape stays pinned by the contract above, whose
+/// deletes now find the room the two cycles return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_merge_sweep_yields_to_a_user_commit_retrying_for_space() {
+    let (be, file) = fresh_volume().await;
+    let (landed, first_refusal) = tokio::time::timeout(FILL_BOUND, fill_until_refused(&be, 0))
+        .await
+        .expect("the fill reaches a refusal within the wall bound");
+    assert_eq!(first_refusal.to_errno(), libc::ENOSPC);
+    assert!(be.heap_full(), "the posture the sweep gates on");
+    // Deletes across the whole population leave underfull leaves for the
+    // sweep to find — a backlog it keeps working across cycles.
+    for i in (0..landed).step_by(2) {
+        if let Ok(ino) = be.unlink(ROOT_INO, &name(i)).await {
+            let _ = be.destroy_inode(ino).await;
+        }
+    }
+    let sweeps_before = be.merge_sweeps();
+    be.checkpoint_now().await.expect("a settling cycle");
+    be.checkpoint_now().await.expect("a second settling cycle");
+    assert!(
+        be.merge_sweeps() > sweeps_before,
+        "premise: the heap-full posture runs the sweep every cycle ({} → {})",
+        sweeps_before,
+        be.merge_sweeps()
+    );
+
+    // The door's hold: a cycle inside it sweeps nothing and counts a yield.
+    let sweeps = be.merge_sweeps();
+    let yields = be.merge_yields();
+    {
+        let _hold = be.begin_space_retry();
+        be.checkpoint_now()
+            .await
+            .expect("a cycle under the space retry");
+        be.checkpoint_now()
+            .await
+            .expect("a second cycle under the space retry");
+        assert_eq!(
+            be.merge_sweeps(),
+            sweeps,
+            "no sweep runs while a user commit is retrying for space"
+        );
+        assert!(
+            be.merge_yields() >= yields + 2,
+            "every due sweep under the hold is counted as a yield ({} → {})",
+            yields,
+            be.merge_yields()
+        );
+    }
+    // Released: the backlog stood, the next cycle sweeps again.
+    let yields_after = be.merge_yields();
+    be.checkpoint_now()
+        .await
+        .expect("a cycle after the release");
+    assert!(
+        be.merge_sweeps() > sweeps,
+        "the sweep resumes at the first cycle with no retry in flight"
+    );
+    assert_eq!(
+        be.merge_yields(),
+        yields_after,
+        "a cycle with no retry in flight yields nothing"
+    );
+    assert!(!be.is_failed());
+    be.shutdown().await.unwrap();
+    drop(file);
+}
+
 /// The wedged-tail audit's two classes (design-smo-replay-currency PR 4
 /// clause b, amended): a barriered cycle whose flush pass DEFERRED a node
 /// for `NoSpace` is a SPACE standstill — counted, loud, never terminal —

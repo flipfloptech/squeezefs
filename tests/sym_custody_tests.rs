@@ -2290,6 +2290,117 @@ async fn a_virtual_inos_custody_use_is_inert_and_its_handlers_never_route_it() {
     rig.shutdown().await;
 }
 
+/// **A virtual inode's xattr ops never reach the metadata layer, on any
+/// layout** (§4.4bq review round 1, Issue 3 — the same class as the probe
+/// above, pre-existing on the shipped path): `getxattr` / `listxattr` /
+/// `setxattr` / `removexattr` on `.stats` / `.config` / a generation ino
+/// routed the ino (`route_ino` — a guest slot on every volume formatted at
+/// the derived width, flat or forest, armed or not). A debug build panics
+/// the handler lane; a release build reads a garbage guest local (ENODATA
+/// / an empty list — harmless) and, for a root `setfattr`, WRITES a durable
+/// xattr record keyed on a phantom local. The FUSE layer answers them as
+/// its own: `getxattr` ENODATA, `listxattr` empty, `setxattr` /
+/// `removexattr` EPERM — nothing routed, nothing stored. The pin's RED is
+/// the debug profile's assertion (a release run of the unfixed product
+/// answers ENODATA by luck of the truncation); the debug gate is where it
+/// lives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_virtual_inos_xattr_ops_never_route_it_on_any_layout() {
+    use fuse3::raw::reply::ReplyXAttr;
+    use fuse3::raw::Filesystem;
+    use squeezefs::fuse_client::{
+        CONFIG_INODE, STATS_INODE, VIRTUAL_GEN_INO_FIRST, VIRTUAL_GEN_INO_LAST,
+    };
+    use std::ffi::OsStr;
+    let _g = SEAM.lock().await;
+    let _restore = Restore;
+    let dir = tempdir().unwrap();
+    let data = sym_data_file();
+    let virtuals = [
+        STATS_INODE,
+        CONFIG_INODE,
+        VIRTUAL_GEN_INO_FIRST,
+        VIRTUAL_GEN_INO_FIRST + 1,
+        VIRTUAL_GEN_INO_LAST,
+    ];
+    for (name, uris, knobs) in [
+        (
+            "flat-unarmed",
+            vec![common::sym::format_flat_member(dir.path(), "flat").await],
+            Knobs::unarmed(),
+        ),
+        (
+            "forest-armed",
+            vec![format_stamped_member(dir.path(), "forest").await],
+            Knobs::armed(),
+        ),
+    ] {
+        let rig = common::sym::mount_fuse(&uris, data.path(), &knobs, "32MB").await;
+        let refusals0 = squeezefs::fuse_client::METRICS
+            .fuse_reserved_xattr_refusals
+            .load(Ordering::Relaxed);
+        for ino in virtuals {
+            let got = rig
+                .fs
+                .getxattr(common::sym::req(), ino, OsStr::new("user.probe"), 0)
+                .await;
+            assert!(
+                matches!(got, Err(e) if e == fuse3::Errno::from(libc::ENODATA)),
+                "{name}: getxattr on virtual ino {ino:#x} answers ENODATA, got {got:?}"
+            );
+            let listed = rig
+                .fs
+                .listxattr(common::sym::req(), ino, 0)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: listxattr on virtual ino {ino:#x}: {e}"));
+            assert!(
+                matches!(listed, ReplyXAttr::Size(0)),
+                "{name}: listxattr on virtual ino {ino:#x} lists nothing, got {listed:?}"
+            );
+            let listed = rig
+                .fs
+                .listxattr(common::sym::req(), ino, 4096)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: listxattr on virtual ino {ino:#x}: {e}"));
+            assert!(
+                matches!(&listed, ReplyXAttr::Data(d) if d.is_empty()),
+                "{name}: a sized listxattr on virtual ino {ino:#x} carries no names, got {listed:?}"
+            );
+            let set = rig
+                .fs
+                .setxattr(
+                    common::sym::req(),
+                    ino,
+                    OsStr::new("user.probe"),
+                    b"x",
+                    0,
+                    0,
+                )
+                .await;
+            assert!(
+                matches!(set, Err(e) if e == fuse3::Errno::from(libc::EPERM)),
+                "{name}: setxattr on virtual ino {ino:#x} refuses EPERM, got {set:?}"
+            );
+            let removed = rig
+                .fs
+                .removexattr(common::sym::req(), ino, OsStr::new("user.probe"))
+                .await;
+            assert!(
+                matches!(removed, Err(e) if e == fuse3::Errno::from(libc::EPERM)),
+                "{name}: removexattr on virtual ino {ino:#x} refuses EPERM, got {removed:?}"
+            );
+        }
+        assert_eq!(
+            squeezefs::fuse_client::METRICS
+                .fuse_reserved_xattr_refusals
+                .load(Ordering::Relaxed),
+            refusals0,
+            "{name}: a virtual ino's refusal is its own arm, never the reserved-name screen's"
+        );
+        rig.shutdown().await;
+    }
+}
+
 /// Review round 3, Issue 20 — **the recall reaches the FUSE layer's cached
 /// lease**: a writer holding a foreign file's custody through the FUSE
 /// layer (`active_leases`, held from the first write to the last close)

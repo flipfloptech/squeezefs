@@ -1940,6 +1940,32 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   checkpoint cycles neither released one nor advanced the ledger tail`
   line on a volume with a free heap now names a genuine wedge, never the
   class's exhaustion.
+* **What the review's two fix rounds found and fixed (each red-first,
+  record §4.4bf–bk).** `squeezefs appender clear` flushed a crashed
+  manager's replayed window under an unprimed frame stamp through its bare
+  writer opens (§4.4bf — both walk the writer's bring-up now; `appender
+  clear 0` refuses naming the writer mount). An offline probe's — and a
+  live mount's, for the slots other writers lease — **inode population
+  read the native watermark alone** (§4.4bg: `squeezefs df` reported one
+  inode on a volume whose mount had created a thousand; every durable
+  cursor seeds the count now). **A manager's death between a checkpoint's
+  ledger record and its page write reopened its rotor slots one cycle
+  stale and the successor minted over live inodes** (§4.4bh — the page
+  with the live cursor words is written before the cycle's first barrier;
+  `meta_kv_cursor_page_writes` counts the cycles that did, 0 on a joined
+  writer, a reader, a probe and every flat mount); that write is a
+  cursor-only refresh of the entries the page already names (§4.4bj — its
+  first shape ran a publication whose refusal aborted the cycle before its
+  record). **A wide leaf split no longer fails the checkpoint** (§4.4bi —
+  the checkpoint class's keep is a quarter of the class and holds the
+  widest split a fold can build at every default geometry; an entry past
+  it is admitted and counted, `meta_kv_smo_entries_over_keep`, 0 on every
+  healthy mount). And **a read-only mount's census bounds nothing another
+  writer leases** (§4.4bk — the `-o ro` reader is the fleet's census
+  shard; it walked a live writer's slots whole before, bounded them at
+  the writer's last page word for one round, and walks them whole again,
+  its words re-read at every epoch step and its native watermark adopted
+  from each checkpoint record).
 * **What is owed past the flip** (the PR 14b board): the manager's zero-census
   open (the bitmap as the terminal-free engine), PR 7's un-share of a
   surviving sole owner, the SMO-record window economy (one pad per flush

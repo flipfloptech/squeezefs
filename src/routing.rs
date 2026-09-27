@@ -8936,7 +8936,15 @@ impl DataRouter {
         }
         match self.fetch_metadata_from_backend(ino).await {
             Ok(Some(durable)) => durable.block_map,
-            _ => meta.block_map.clone(),
+            Ok(None) => meta.block_map.clone(),
+            Err(e) => {
+                log::warn!(
+                    "ino {ino}: the whole-map swap's displaced map falls back to the write's \
+                     snapshot — no RAM entry, and the backend layout read failed ({e}); a copy \
+                     the snapshot does not name keeps its durable reference (fsck C8 names it)"
+                );
+                meta.block_map.clone()
+            }
         }
     }
 

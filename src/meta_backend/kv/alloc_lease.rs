@@ -2998,6 +2998,12 @@ pub async fn arm_symmetric_allocation(
                     alloc.volume_id()
                 ))
             })?;
+        // Test seam (record §4.4bs): widen the hold → re-snapshot window so
+        // a mount-time free still in the reclaim queue lands inside it.
+        let park_ms: u64 = crate::env_knobs::int_knob("SQUEEZEFS_TEST_ALLOC_ARM_HOLD_MS", 0);
+        if park_ms > 0 {
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(park_ms)).await;
+        }
         let after = alloc.derived_allocation_snapshot();
         if after != derived {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(

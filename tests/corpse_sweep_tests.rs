@@ -1050,3 +1050,81 @@ fn a_single_overcap_corpse_stopped_between_entries_is_finished_by_the_next_mount
     m4.umount_timed();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// **A swept corpse's frees have LANDED before the allocation lease arms**
+/// (the 1.3.0 release chain's fstests QUICK pre-pass, generic/590's scratch
+/// mount after generic/551 left a corpse; record §4.4bs). The sweep's
+/// terminal frees ride the background reclaim queue, whose `finish_free`
+/// lands at the worker's cadence — while PR 8's allocation arm, next in
+/// the mount path, seeds its bitmap from a snapshot of the allocator and
+/// REFUSES the mount when a second snapshot after the hold differs ("the
+/// allocator moved during the arm … 37 → 0 set"): the frees landing
+/// between the two snapshots read as a torn seed, and every mount of a set
+/// carrying a corpse with blocks failed at that rate. The sweep's
+/// postcondition — "blocks freed" — is literal at its return now: it
+/// drains the queue it filled, so the arm sees a quiescent allocator.
+/// The corpse is the field's size class (37 blocks); the remount must
+/// come up, name the sweep, hold the lease and mint fresh.
+#[test]
+fn a_swept_corpses_frees_land_before_the_allocation_lease_arms() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    const FIELD_CORPSE_BLOCKS: usize = 37;
+    let base = scratch("armdrain");
+    let staging = base.join("staging");
+    let meta = format_volume(&base, &staging);
+    let mnt = base.join("mnt");
+
+    // Mount 1: a 37-block corpse — written, fsynced, unlinked while open,
+    // the daemon SIGKILLed (the lost-FORGET shape).
+    {
+        let mut m1 = spawn_mount(&meta, &mnt, &base.join("m1.log"), &[]);
+        let corpse = mnt.join("corpse.bin");
+        let held = write_fsync(&corpse, &pattern(7, FIELD_CORPSE_BLOCKS * BLOCK));
+        std::fs::remove_file(&corpse).expect("unlink the held-open corpse");
+        m1.kill9();
+        drop(held);
+    }
+
+    // Mount 2: the sweep frees the corpse's blocks, then the allocation
+    // lease arms over a quiescent allocator. The field's race, made
+    // certain: the reclaim worker's batch window is set to 250 ms (the
+    // registered knob — a queued free cannot land sooner) and the arm's
+    // seam parks its hold → re-snapshot window for 400 ms, so a free the
+    // sweep left in the queue lands INSIDE the arm's window; only a sweep
+    // whose frees have landed at its return passes.
+    let log2 = base.join("m2.log");
+    let mut m2 = spawn_mount(
+        &meta,
+        &mnt,
+        &log2,
+        &[
+            ("SQUEEZEFS_RECLAIM_BATCH_MS", "250"),
+            ("SQUEEZEFS_TEST_ALLOC_ARM_HOLD_MS", "400"),
+        ],
+    );
+    assert!(
+        log_contains(&log2, &format!("{SWEEP_FOUND} 1 unlinked inode(s)")),
+        "the sweep found the corpse (log: {})",
+        log2.display()
+    );
+    assert!(
+        !log_contains(&log2, "moved during the arm"),
+        "the arm's seed must never read the sweep's frees as a torn snapshot (log: {})",
+        log2.display()
+    );
+    assert!(
+        grant_armed(&mnt),
+        "the allocation lease is held on the flipped default (log: {})",
+        log2.display()
+    );
+    wait_reclaim_drained(&mnt, FIELD_CORPSE_BLOCKS as u64);
+    // The mount serves: a fresh file mints and reads back.
+    let live = mnt.join("live.bin");
+    let want = pattern(8, 2 * BLOCK);
+    drop(write_fsync(&live, &want));
+    assert_eq!(std::fs::read(&live).expect("read live"), want);
+    m2.umount_timed();
+    let _ = std::fs::remove_dir_all(&base);
+}

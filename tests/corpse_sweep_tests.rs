@@ -1079,8 +1079,9 @@ fn a_single_overcap_corpse_stopped_between_entries_is_finished_by_the_next_mount
 /// batch window is set to 1,500 ms (the registered knob — a queued free
 /// cannot land sooner after the sweep's enqueue), so the frees land inside
 /// the parked window whenever the mount path from the sweep's return to
-/// the arm's first snapshot takes under 1,500 ms (≈ 100–300 ms here; the
-/// margin is the timing-contract class's 5×). The outcome assertions hold
+/// the arm's first snapshot takes under the window's near edge (≈ 100–300
+/// ms here against 1,500 ms for window (a) and ≈ 700 ms for window (b)'s
+/// lower margin — the timing-contract class's several-×). The outcome assertions hold
 /// in EVERY interleaving: the mount arms, and at quiesce the bitmap's
 /// population is exactly the granted blocks — a leaked bit would read
 /// `granted + 37`.
@@ -1188,11 +1189,14 @@ fn a_swept_corpses_frees_landing_beside_the_allocation_arm_are_absorbed() {
 
 /// Window (b): the frees land between the second snapshot and the verdict
 /// (review round 2, Issue 6 — RED on the list-at-two-instants verdict with
-/// "37 block(s) the derived allocator holds LIVE read CLEAR").
+/// "37 block(s) the derived allocator holds LIVE read CLEAR"). The second
+/// snapshot sits at ≈ pre-arm path + 500 ms and the verdict 2,000 ms after
+/// it, so the 1,500 ms frees land ≈ 800 ms past the snapshot and ≈ 1,200 ms
+/// before the verdict — both margins several times the pre-arm path.
 #[test]
 fn a_swept_corpses_frees_landing_after_the_arms_snapshot_are_absorbed_too() {
     if !mount_supported(site!()) {
         return;
     }
-    swept_frees_beside_the_arm("armverdict", "1000", "1000");
+    swept_frees_beside_the_arm("armverdict", "500", "2000");
 }

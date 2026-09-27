@@ -1187,8 +1187,6 @@ pub(super) struct ForestSlotWord {
     /// The slot's ino cursor as tree 0 records it (the release's for an
     /// unleased slot, the grant's for a leased one).
     pub cursor: u64,
-    /// The lessee tree 0 names (`None` unleased).
-    pub holder: Option<u32>,
 }
 
 pub struct KvMetaBackend {
@@ -3268,16 +3266,10 @@ impl KvMetaBackend {
                     super::slot_state::SlotState::Unleased { cursor, .. } => ForestSlotWord {
                         unleased: true,
                         cursor,
-                        holder: None,
                     },
-                    super::slot_state::SlotState::Leased {
-                        cursor,
-                        appender_id,
-                        ..
-                    } => ForestSlotWord {
+                    super::slot_state::SlotState::Leased { cursor, .. } => ForestSlotWord {
                         unleased: false,
                         cursor,
-                        holder: Some(appender_id),
                     },
                 };
                 words.insert(slot, word);
@@ -3299,8 +3291,6 @@ impl KvMetaBackend {
                 return Some(ForestSlotWord {
                     unleased: lease.state == crate::slot_lease_core::LeaseState::Unleased,
                     cursor: lease.words.cursor,
-                    holder: (lease.state != crate::slot_lease_core::LeaseState::Unleased)
-                        .then_some(lease.holder),
                 });
             }
         }

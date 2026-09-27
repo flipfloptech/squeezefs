@@ -1099,6 +1099,14 @@ impl BlockAllocator {
         self.trim_returned.notify_waiters();
     }
 
+    /// `true` while a discard-elision trim claim window is open on this
+    /// allocator (`claim_free_for_trim` bumps the count BEFORE its list
+    /// removal) — the allocation arm's witness that a block off the free
+    /// list without a refcount is a claim, not a mint in progress.
+    pub fn trim_window_open(&self) -> bool {
+        self.trim_claimed.load(Ordering::SeqCst) > 0
+    }
+
     /// Park for an open trim claim window's return edge (contract 9,
     /// `tests/discard_elision_tests.rs`). `false` = no window is open —
     /// nothing to wait for, the caller's verdict stands. Registers BEFORE

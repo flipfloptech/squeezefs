@@ -3051,12 +3051,22 @@ pub async fn arm_symmetric_allocation(
         if verdict_park_ms > 0 {
             squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(verdict_park_ms)).await;
         }
+        // A mint in progress (`claim_block_idx` inserts the refcount LAST)
+        // is off the list without one; a trim claim is the only legal
+        // shape of that — so a refcount-less off-list block is a mint
+        // unless a claim window is open or the block is in flight (review
+        // round 3, Issue 10).
         let verdict = || {
             let minted: Vec<u64> = derived
                 .free
                 .iter()
                 .copied()
-                .filter(|b| !alloc.free_list_contains(*b) && alloc.refcount(b * chunk).is_some())
+                .filter(|b| {
+                    let off = b * chunk;
+                    !alloc.free_list_contains(*b)
+                        && (alloc.refcount(off).is_some()
+                            || (!alloc.inflight_contains(off) && !alloc.trim_window_open()))
+                })
                 .collect();
             let loss: Vec<u64> = seed()
                 .filter(|b| {
@@ -3070,10 +3080,22 @@ pub async fn arm_symmetric_allocation(
                 .collect();
             (minted, loss)
         };
+        // A non-empty verdict is re-read while it SHRINKS (a free landing
+        // — the clear → insert gap, a claim window returning), at most
+        // three 5 ms yields; a stable set is the verdict.
         let (mut minted, mut loss) = verdict();
-        if !minted.is_empty() || !loss.is_empty() {
+        for _ in 0..3 {
+            if minted.is_empty() && loss.is_empty() {
+                break;
+            }
             squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(5)).await;
-            (minted, loss) = verdict();
+            let (m, l) = verdict();
+            let shrank = m.len() + l.len() < minted.len() + loss.len();
+            minted = m;
+            loss = l;
+            if !shrank {
+                break;
+            }
         }
         if !minted.is_empty() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(

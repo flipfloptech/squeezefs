@@ -16508,10 +16508,15 @@ impl SqueezefsFilesystem {
         backend.layout_head_version(ino).await
     }
 
-    /// Rung 17: install the AUTHORITY's production assembler executors
+    /// Rung 17: install the AUTHORITY's served-publish SCREENS and SINKS
     /// (the mount arm's act, beside the free/harvest executors; the
-    /// multi-writer disarm uninstalls them).
-    pub fn install_extent_assembler(&self) {
+    /// multi-writer disarm uninstalls them). None of these allocates — the
+    /// finding-28 binding probe screens every served layout publish, the
+    /// rung-18 and finding-51 sinks invalidate this fs's view of a served
+    /// object — so they install where the listener stands (rung 7); the
+    /// allocating extent executors are [`Self::install_extent_assembler`]'s,
+    /// installed after the allocation arm (record §4.4bs, review round 3).
+    pub fn install_served_publish_screens(&self) {
         // Finding 28: the served publish's binding probe — a caller's
         // stale map entry naming a DEAD incarnation is dropped instead
         // of regressing the head (the durable entry stands).
@@ -16519,28 +16524,6 @@ impl SqueezefsFilesystem {
         crate::meta_ship::publish::install_binding_probe(std::sync::Arc::new(move |k: &str| {
             br.block_key_incarnation_ok(k)
         }));
-        let fs = self.clone();
-        crate::meta_ship::publish::install_extent_merge_executor(std::sync::Arc::new(
-            move |frame: crate::meta_ship::publish::ExtentFrame| {
-                let fs = fs.clone();
-                Box::pin(async move {
-                    fs.assemble_shipped_extent(
-                        frame.ino,
-                        frame.block_index,
-                        frame.offset_in_block,
-                        bytes::Bytes::from(frame.data),
-                    )
-                    .await
-                })
-            },
-        ));
-        let fs = self.clone();
-        crate::meta_ship::publish::install_extent_flush_executor(std::sync::Arc::new(
-            move |ino: u64| {
-                let fs = fs.clone();
-                Box::pin(async move { fs.flush_shipped_extents(ino).await })
-            },
-        ));
         // Rung 18: the served-layout coherence sink — a co-writer's
         // SERVED publish commits on the backend directly, so this
         // authority fs's RAM view of the ino must refetch (its fold's
@@ -16561,7 +16544,7 @@ impl SqueezefsFilesystem {
         // kept alive, its settle read a dead lifetime for ever). The RAM
         // head is invalidated FIRST so an install racing this commit
         // refetches the durable head instead of capturing the displaced
-        // key; a capture that slipped in between is what the probe below
+        // key; a capture that slipped in between is what the probe above
         // and the settle's dead-capture belt still catch.
         let fs = self.clone();
         crate::meta_ship::publish::install_served_displacement_sink(std::sync::Arc::new(
@@ -16569,6 +16552,37 @@ impl SqueezefsFilesystem {
                 fs.router.metadata_cache.remove(&ino);
                 fs.attr_cache.invalidate(&ino);
                 fs.router.overlay_supersede_served_displaced(ino, indices);
+            },
+        ));
+    }
+
+    /// Rung 17: install the AUTHORITY's production assembler EXECUTORS —
+    /// the S11 extent merge / flush over this mount's own write path (a
+    /// shipped sub-block extent's flush MINTS on this allocator), so they
+    /// install only after the allocation arm has judged its seed (record
+    /// §4.4bs); the screens and sinks a served publish needs from the
+    /// listener's first frame are [`Self::install_served_publish_screens`].
+    pub fn install_extent_assembler(&self) {
+        let fs = self.clone();
+        crate::meta_ship::publish::install_extent_merge_executor(std::sync::Arc::new(
+            move |frame: crate::meta_ship::publish::ExtentFrame| {
+                let fs = fs.clone();
+                Box::pin(async move {
+                    fs.assemble_shipped_extent(
+                        frame.ino,
+                        frame.block_index,
+                        frame.offset_in_block,
+                        bytes::Bytes::from(frame.data),
+                    )
+                    .await
+                })
+            },
+        ));
+        let fs = self.clone();
+        crate::meta_ship::publish::install_extent_flush_executor(std::sync::Arc::new(
+            move |ino: u64| {
+                let fs = fs.clone();
+                Box::pin(async move { fs.flush_shipped_extents(ino).await })
             },
         ));
     }

@@ -6598,6 +6598,15 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
+            // Rung 17 (KD-MW-8): the AUTHORITY's served-publish SCREENS and
+            // SINKS — the finding-28 binding probe, the rung-18 and
+            // finding-51 invalidation sinks — install where the listener
+            // stands: a joiner's publish served here from the first frame
+            // is screened and invalidates this fs's view. None allocates;
+            // the assembler's extent EXECUTORS follow the allocation arm.
+            if multi_writer_arm.is_some() {
+                fs_engine.install_served_publish_screens();
+            }
             // Symmetric PR 13b: a colleague's served record verb / layout
             // publish of a file in a slot THIS mount leases invalidates
             // this daemon's own caches of the object (the router's RAM
@@ -6726,14 +6735,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::block_reclaim::release_trim_venue();
 
             // Rung 17 (KD-MW-8): the AUTHORITY's extent ASSEMBLER — the
-            // production merge/flush executors over this mount's own
+            // production merge/flush EXECUTORS over this mount's own
             // write path (sub-block-shared blocks' extents ship here and
             // the authority publishes once, as the single publisher).
             // Installed only on the authority posture; the mw disarm
             // uninstalls them beside the free/harvest executors. AFTER the
-            // arm (record §4.4bs, review round 2): a shipped extent's
-            // flush mints on this allocator, and nothing needs the
-            // assembler before the mount serves.
+            // arm (record §4.4bs, review rounds 2–3): a shipped extent's
+            // flush mints on this allocator; the screens and sinks a served
+            // publish needs from the first frame installed above.
             if multi_writer_arm.is_some() {
                 fs_engine.install_extent_assembler();
             }

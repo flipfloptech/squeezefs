@@ -483,7 +483,10 @@ pub fn hold_trim_venue() {
     TRIM_VENUE_HELD.store(true, Ordering::Release);
 }
 
-/// Release the mount-time hold; a parked drainer is woken to re-evaluate.
+/// Release the mount-time hold. A drainer with debt outstanding sits in
+/// its 50 ms deferred cadence while held and picks the release up at its
+/// next tick; one with nothing to drain is parked on its notify and has
+/// nothing to do.
 pub fn release_trim_venue() {
     TRIM_VENUE_HELD.store(false, Ordering::Release);
 }

@@ -390,8 +390,13 @@ mount is a read-token client whose metadata is exact at the next resolve
   (`release-stale-block-refs`) — the shape the fix above stops producing,
   which on the 1.3 default refused the mount at the allocation arm's
   loss check (the refusal names the verb). A layout naming a block with
-  no record stays report-only (a record is never fabricated); an online
-  `--apply` refuses naming the offline run (record §4.4bu).
+  no record stays report-only (a record is never fabricated); a
+  justification that cannot be read (a torn indirect block map, an
+  incomplete map walk) refuses the finding and releases nothing; a live
+  sibling tenant's record is kept; an online `--apply` refuses naming the
+  offline run, and the online leaked-block repair (C2) declines a block
+  the ledger still names — freeing it under a standing record is what
+  refused the next mount (record §4.4bu).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a

@@ -197,10 +197,21 @@ extraction would only ever test the re-implementation.
   running it pays the very walk the records exist to delete.
 * In **fsck**: class **C8** (`C8DurableRefDrift`), with the §5.6
   verify-before-report re-check. `meta_kv_block_refs_drift` is a
-  **must-stay-0** tripwire. C8 repair is deliberately **refused**: restating
-  the ledger from the walk would erase the evidence of *why* the invariant
-  broke, and the layouts remain authoritative either way (they are the
-  justification; the ledger is its index).
+  **must-stay-0** tripwire. C8 repairs in ONE direction (record §4.4bu,
+  2026-09-27): a durable record whose owner's layout — re-read OFFLINE
+  under the D0 writer guard — does not name the block at that map index
+  is stale and is **released** (`release-stale-block-refs`, counted on
+  `fsck_repair_classC8`); a justification that cannot be read (an
+  unreadable or undecodable indirect blob, an incomplete kvmap walk)
+  refuses the finding — a read failure is never a verdict. The other
+  direction — a layout naming a block with no record — stays
+  **refused**: fabricating a record would restate the ledger from the
+  walk and erase the evidence of *why* the invariant broke, and the
+  layouts remain authoritative either way (they are the justification;
+  the ledger is its index). Online, both directions refuse, and the C2
+  leaked-block arm declines a block the ledger still names — freeing it
+  under a standing record is what refuses the next mount at the
+  allocation arm's loss check.
 
   **C8 detection is gated on the same `SQUEEZEFS_BLOCK_REFS_VERIFY=1` knob
   until the write-path wiring is complete — see §11.** Everything else about

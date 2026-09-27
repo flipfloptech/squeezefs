@@ -30160,6 +30160,11 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
+        // A virtual inode stores nothing: the FUSE layer's own, never
+        // routed (the striping probe below routes too — record §4.4bq).
+        if is_virtual_ino(inode) {
+            return Err(Errno::from(libc::EPERM));
+        }
         // Namespace ALLOWLIST (VAL-2, generalizing the §5.1.2 screen and
         // the L4 BOOTSTRAP_XATTR rule): only `user.*` (minus
         // `user.squeezefs.`), `security.*` and `trusted.*` cross the FUSE
@@ -30252,6 +30257,11 @@ impl Filesystem for SqueezefsFilesystem {
             }
             return Ok(fuse3::raw::reply::ReplyXAttr::Data(blob.into()));
         }
+        // A virtual inode carries no xattr: the FUSE layer's own, never
+        // routed (the striping probe below routes too — record §4.4bq).
+        if is_virtual_ino(inode) {
+            return Err(Errno::from(libc::ENODATA));
+        }
         // Namespace ALLOWLIST (VAL-2): internal record bytes never serve
         // through FUSE (daemon/probe paths read the meta backend
         // directly). The bootstrap name above is the one deliberate
@@ -30321,6 +30331,15 @@ impl Filesystem for SqueezefsFilesystem {
         size: u32,
     ) -> FuseResult<fuse3::raw::reply::ReplyXAttr> {
         METRICS.fuse_ops.fetch_add(1, Ordering::Relaxed);
+        // A virtual inode lists nothing: the FUSE layer's own, never
+        // routed (record §4.4bq).
+        if is_virtual_ino(inode) {
+            return Ok(if size == 0 {
+                fuse3::raw::reply::ReplyXAttr::Size(0)
+            } else {
+                fuse3::raw::reply::ReplyXAttr::Data(bytes::Bytes::new())
+            });
+        }
         let backend = self
             .meta_backend
             .as_ref()
@@ -30353,6 +30372,11 @@ impl Filesystem for SqueezefsFilesystem {
             Some(s) => s,
             None => return Err(Errno::from(libc::EINVAL)),
         };
+        // A virtual inode stores nothing: the FUSE layer's own, never
+        // routed (record §4.4bq).
+        if is_virtual_ino(inode) {
+            return Err(Errno::from(libc::EPERM));
+        }
         // Namespace ALLOWLIST (VAL-2). Pre-VL2 this handler had NO
         // screen at all — `removexattr("user.squeezefs.format_config")`
         // deleted the durable format config from any unprivileged shell;
@@ -30458,9 +30482,13 @@ pub fn parse_custom_options(opts: &str) -> std::ffi::OsString {
 /// The live mount's `st_dev` from `/proc/self/mountinfo` (field 3
 /// `major:minor` of the entry whose mount point matches) — the §5.2 fd
 /// screen's device authority, resolved WITHOUT stat'ing our own mount
-/// (zero self-FUSE traffic). `None` until the mount is visible.
-fn mount_st_dev(mount_path: &Path) -> Option<u64> {
-    let want = mount_path.canonicalize().ok()?;
+/// (zero self-FUSE traffic). `want` is the mountpoint canonicalized
+/// BEFORE the mount (mountinfo records the resolved path): resolving it
+/// here would run `realpath(3)` over the mounted root, which glibc < 2.33
+/// (the rocky8 target's 2.28) walks by `lstat` — one GETATTR from this
+/// daemon to itself at every mount (record §4.4bq, review Issue 2).
+/// `None` until the mount is visible.
+fn mount_st_dev(want: &Path) -> Option<u64> {
     let data = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
     for line in data.lines() {
         let mut fields = line.split_whitespace();
@@ -31414,6 +31442,12 @@ pub async fn start_mount<P: AsRef<Path>>(
         }
     }
 
+    // The mountpoint as mountinfo will record it, resolved while it is
+    // still the underlying directory (`mount_st_dev`'s key).
+    let mount_path_canonical = mount_path
+        .canonicalize()
+        .unwrap_or_else(|_| mount_path.clone());
+
     let _dismount_wait = fs.dismount_wait;
     let nvme_cache = fs.router.cache.nvme.clone();
 
@@ -31627,10 +31661,10 @@ pub async fn start_mount<P: AsRef<Path>>(
     // L4 interception: resolve the live mount's `st_dev` for the §5.2 fd
     // screen (screen rule: `st_dev` must equal the mount device; binds
     // refuse class `mode` until this lands — fail-safe). Read from
-    // /proc/self/mountinfo, never by stat'ing our own mount (zero
-    // self-FUSE traffic).
+    // /proc/self/mountinfo against the pre-mount canonical path, never by
+    // stat'ing our own mount (zero self-FUSE traffic).
     if let Some(host) = fs.ipc_host.load().as_ref().as_ref().cloned() {
-        let mp = mount_path.clone();
+        let mp = mount_path_canonical;
         crate::meta_exec::spawn_meta("ipc_st_dev_resolver", async move {
             for _ in 0..100 {
                 let mp_probe = mp.clone();

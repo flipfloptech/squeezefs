@@ -362,10 +362,12 @@ mount is a read-token client whose metadata is exact at the next resolve
   mount (fstests generic/003, test 3 of 791), failed. A set with no live
   writer is QUIESCENT: the mount is admitted as a quiescent reader serving
   the checkpointed projection (exact — nothing writes; `reader_quiescent`
-  1), and its poll fail-stops it loud the moment a writer mounts the set
-  (`reader_quiescent_writer_appeared` 1, every metadata op `EIO`, `.stats`
-  still readable; remount to join as a token reader). Found by the 1.3.0
-  release chain's fstests leg (record §4.4br).
+  1), and its poll fail-stops it loud when a writer mounts the set — a
+  same-host writer by its lock at the next poll, a remote one by its first
+  checkpoint, which the poll refuses to adopt (`reader_quiescent_writer_appeared`
+  1, every metadata op `ESTALE`, `.stats` still readable; remount to join
+  as a token reader). Found by the 1.3.0 release chain's fstests leg
+  (record §4.4br).
 - **Every `.stats` / `.config` close on a symmetric (1.3 default) mount
   routed a virtual inode through the metadata layer** (`SqueezefsFilesystem::
   custody_use_enter`, the probe every mutating handler runs first): a

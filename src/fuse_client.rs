@@ -6528,7 +6528,7 @@ pub struct Metrics {
     /// only; MUST STAY 0 on every healthy striped tree and on every mount
     /// without an armed forest.
     pub fsck_stripe_findings: Align64<AtomicU64>,
-    /// `fsck_repair_classC12` — **structurally 0**, the C8 posture: two
+    /// `fsck_repair_classC12` — **structurally 0**, the C8 fabricate-direction posture: two
     /// overlapping tenants means at least one is wrong and nothing on the
     /// volume says which, so the class is reported and never
     /// auto-repaired (no arm of the repair engine increments this).

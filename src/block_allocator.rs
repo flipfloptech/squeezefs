@@ -3098,26 +3098,54 @@ impl BlockAllocator {
         if layout.file_type != "striped" && layout.file_type != "staged" {
             return LayoutNames::NotNamed;
         }
-        let names =
-            |key: &str| self.owned_offset(backend_router, key) == Some(block_idx * self.chunk_size);
+        // A map entry at the record's index that the router cannot PARSE
+        // is a justification-shaped entry that cannot be read — `Unknown`,
+        // never `NotNamed` (the census under-counts it the same way, so
+        // the finding exists; a repair reading it as stale would release).
+        let judge = |key: &str| -> LayoutNames {
+            let cleaned = crate::routing::clean_block_key(key);
+            if backend_router.parse_block_key_parts(&cleaned).is_err() {
+                return LayoutNames::Unknown(format!(
+                    "map entry '{key}' at index {block_index} is unparsable"
+                ));
+            }
+            if self.owned_offset(backend_router, key) == Some(block_idx * self.chunk_size) {
+                LayoutNames::Named
+            } else {
+                LayoutNames::NotNamed
+            }
+        };
+        // `Named` wins over every other entry at the index; an `Unknown`
+        // beside no `Named` is the verdict; else `NotNamed`.
+        let fold = |entries: &mut dyn Iterator<Item = LayoutNames>| -> LayoutNames {
+            let mut unknown = None;
+            for v in entries {
+                match v {
+                    LayoutNames::Named => return LayoutNames::Named,
+                    LayoutNames::Unknown(_) if unknown.is_none() => unknown = Some(v),
+                    _ => {}
+                }
+            }
+            unknown.unwrap_or(LayoutNames::NotNamed)
+        };
         let indirect_key = layout
             .block_map_id
             .as_deref()
             .and_then(|id| id.strip_prefix("indirect:"));
         if block_index == crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB {
-            return if indirect_key.is_some_and(names) {
-                LayoutNames::Named
-            } else {
-                LayoutNames::NotNamed
-            };
+            return indirect_key.map(judge).unwrap_or(LayoutNames::NotNamed);
         }
-        if layout
+        let mut pending_unknown: Option<LayoutNames> = None;
+        if let Some(key) = layout
             .block_map
             .as_ref()
             .and_then(|bm| bm.get(&block_index))
-            .is_some_and(|key| names(key))
         {
-            return LayoutNames::Named;
+            match judge(key) {
+                LayoutNames::Named => return LayoutNames::Named,
+                v @ LayoutNames::Unknown(_) => pending_unknown = Some(v),
+                LayoutNames::NotNamed => {}
+            }
         }
         if let Some(indirect_key) = indirect_key {
             let block_size = backend_router.block_size.load(Ordering::Relaxed) as usize;
@@ -3137,30 +3165,40 @@ impl BlockAllocator {
                     ))
                 }
             };
-            if entries
+            let mut at_index = entries
                 .iter()
-                .any(|(b, key)| *b == block_index && names(key))
-            {
-                return LayoutNames::Named;
+                .filter(|(b, _)| *b == block_index)
+                .map(|(_, key)| judge(key));
+            match fold(&mut at_index) {
+                LayoutNames::Named => return LayoutNames::Named,
+                v @ LayoutNames::Unknown(_) => {
+                    pending_unknown.get_or_insert(v);
+                }
+                LayoutNames::NotNamed => {}
             }
         }
         if layout_is_kvmap(layout) {
             let (entries, complete) = backend_router
                 .kvmap_layout_entries_complete(kv, local_ino)
                 .await;
-            if entries
+            let mut at_index = entries
                 .iter()
-                .any(|(b, key)| *b == block_index && names(key))
-            {
-                return LayoutNames::Named;
+                .filter(|(b, _)| *b == block_index)
+                .map(|(_, key)| judge(key));
+            match fold(&mut at_index) {
+                LayoutNames::Named => return LayoutNames::Named,
+                v @ LayoutNames::Unknown(_) => {
+                    pending_unknown.get_or_insert(v);
+                }
+                LayoutNames::NotNamed => {}
             }
             if !complete {
-                return LayoutNames::Unknown(format!(
+                pending_unknown.get_or_insert(LayoutNames::Unknown(format!(
                     "the kvmap tree of local ino {local_ino} walked INCOMPLETE"
-                ));
+                )));
             }
         }
-        LayoutNames::NotNamed
+        pending_unknown.unwrap_or(LayoutNames::NotNamed)
     }
 
     /// The block indices THIS volume owns among an indirect block map's

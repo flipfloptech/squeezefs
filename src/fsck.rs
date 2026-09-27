@@ -713,7 +713,7 @@ pub enum FindingId {
     /// C16 (design-symmetric-metadata §5.8.5, PR 7): **shared-index
     /// drift** — a SHARED-flagged reference the index home does not name
     /// (source or target ino), or an index entry whose ino holds no SHARED
-    /// reference. Report-only, the C8 posture: the flag and the index are
+    /// reference. Report-only, the C8 fabricate-direction posture: the flag and the index are
     /// two durable homes of one fact, and restating one from the other
     /// would erase the evidence of which side lied.
     C16SharedIndexDrift {
@@ -730,7 +730,7 @@ pub enum FindingId {
     /// map, a map naming a missing stripe (or an incomplete map under a
     /// commit marker), a dentry in stripe `i` whose `hash % K ≠ i`, or a
     /// name left in the directory's own tree after `migrating` cleared.
-    /// Report-only (the C8 posture); `fsck_stripe_findings` must stay 0.
+    /// Report-only (the C8 fabricate-direction posture); `fsck_stripe_findings` must stay 0.
     C17StripeInconsistency {
         /// The striped directory (0 when the shape names a stripe alone).
         dir: u64,
@@ -6222,7 +6222,7 @@ async fn recheck_suspects(
                     object: format!("dir{}/stripe{}", shape.dir(), shape.stripe()),
                     evidence: format!(
                         "{} — stable across two censuses. REPORT-ONLY (design-symmetric-\
-                         metadata §5.6.5, the C8 posture)",
+                         metadata §5.6.5, the C8 fabricate-direction posture)",
                         shape.evidence()
                     ),
                     identity: Some(FindingId::C17StripeInconsistency {
@@ -7897,7 +7897,7 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
             "report-only",
             format!(
                 "kvmap head on vol{vol} ino {ino} declares nonzero size with ZERO tree \
-                 records: REPORT-ONLY (the C8 posture) — restating the map would \
+                 records: REPORT-ONLY (the C8 fabricate-direction posture) — restating the map would \
                  fabricate data; the operator adjudicates"
             ),
         ),
@@ -7926,7 +7926,7 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
             format!(
                 "tenant windows of ino {ino_a} block {block_idx_a} and ino {ino_b} block \
                  {block_idx_b} intersect at different offsets on {vol}:{offset}: REPORT-ONLY \
-                 (design-small-file-packing §5.9, the C8 posture) — at least one tenant is \
+                 (design-small-file-packing §5.9, the C8 fabricate-direction posture) — at least one tenant is \
                  wrong and nothing on the volume says which; quarantining both would destroy \
                  the right one"
             ),
@@ -7979,7 +7979,7 @@ fn planned_action(id: &FindingId) -> (&'static str, String) {
             "report-only",
             format!(
                 "stripe inconsistency `{shape}` on directory {dir} / stripe {stripe} is \
-                 REPORT-ONLY (the C8 posture): the map and the stripes are the durable \
+                 REPORT-ONLY (the C8 fabricate-direction posture): the map and the stripes are the durable \
                  homes of one directory's names, and restating one from the other would \
                  erase the evidence of which side lied (design-symmetric-metadata §5.6.5)"
             ),
@@ -8274,10 +8274,14 @@ pub async fn repair(
             .iter()
             .any(|(a, o)| Arc::ptr_eq(a, alloc) && *o == offset)
     };
-    let mut c8_records: std::collections::HashMap<
-        u64,
-        Vec<crate::meta_backend::kv::block_refs::BlockRef>,
-    > = std::collections::HashMap::new();
+    /// One durable record beside the owner the ROUTED SET names for it
+    /// (`None` = a key the set cannot name as an inode — refused).
+    struct C8Record {
+        record: crate::meta_backend::kv::block_refs::BlockRef,
+        owner: Option<u64>,
+    }
+    let mut c8_records: std::collections::HashMap<u64, Vec<C8Record>> =
+        std::collections::HashMap::new();
 
     // One fresh census for the allocator-class verifications (C2/C3),
     // walked ONCE — the repair-time ground truth.
@@ -8529,23 +8533,49 @@ pub async fn repair(
                 // pin. A record whose owner has no global form (a control
                 // record's local) is kept under its raw key and judged
                 // by the layout read, which answers `None` for it.
+                //
+                // A record whose owner the routed set cannot NAME (a raw
+                // control local — no legitimate reference has one) has no
+                // readable justification: routing the raw as a global would
+                // read an unrelated inode's layout and release a key that
+                // is not the record's. Such a record is kept with its
+                // owner flagged and REFUSES its finding below (the C1 forest
+                // key law is where a malformed owner belongs). A ledger
+                // scan that fails refuses the finding, never the pass.
                 let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(vol);
                 let records = match c8_records.get(&vol_tag) {
                     Some(r) => r,
                     None => {
                         let mut all = Vec::new();
+                        let mut scan_failed: Option<String> = None;
                         for (kv_idx, kv) in ctx.meta.volumes.iter().enumerate() {
                             let forest = kv.symmetric_forest();
-                            for mut r in kv.block_ref_scan(vol_tag).await? {
-                                if forest {
-                                    if let Some(global) =
-                                        ctx.meta.try_make_global_ino(r.owner_ino, kv_idx)
-                                    {
-                                        r.owner_ino = global;
-                                    }
+                            let scanned = match kv.block_ref_scan(vol_tag).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    scan_failed = Some(format!("meta volume {kv_idx}: {e}"));
+                                    break;
                                 }
-                                all.push(r);
+                            };
+                            for r in scanned {
+                                let owner = if forest {
+                                    ctx.meta.try_make_global_ino(r.owner_ino, kv_idx)
+                                } else {
+                                    Some(r.owner_ino)
+                                };
+                                all.push(C8Record { record: r, owner });
                             }
+                        }
+                        if let Some(why) = scan_failed {
+                            refuse(
+                                &mut out,
+                                f,
+                                format!(
+                                    "the durable ledger could not be read ({why}) — no verdict, \
+                                     nothing released"
+                                ),
+                            );
+                            continue;
                         }
                         c8_records.entry(vol_tag).or_insert(all)
                     }
@@ -8560,16 +8590,29 @@ pub async fn repair(
                 // the file's only durable pointers.
                 let mut stale: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
                 let mut justified = 0usize;
-                for r in records.iter().filter(|r| r.block_idx == idx) {
-                    let (v_idx, local) = ctx.meta.route_ino(r.owner_ino);
+                for rec in records.iter().filter(|c| c.record.block_idx == idx) {
+                    let r = &rec.record;
+                    let Some(owner) = rec.owner else {
+                        refuse(
+                            &mut out,
+                            f,
+                            format!(
+                                "a record of {vol}:{offset} names owner key {} (index {}), which \
+                                 the routed set cannot name as an inode — no readable \
+                                 justification, nothing released (fsck C1 names the record)",
+                                r.owner_ino, r.block_index
+                            ),
+                        );
+                        continue 'findings;
+                    };
+                    let (v_idx, local) = ctx.meta.route_ino(owner);
                     let Some(owner_kv) = ctx.meta.volumes.get(v_idx) else {
                         refuse(
                             &mut out,
                             f,
                             format!(
-                                "owner ino {} routes to meta volume {v_idx}, which this set does \
-                                 not hold — no verdict, nothing released",
-                                r.owner_ino
+                                "owner ino {owner} routes to meta volume {v_idx}, which this set \
+                                 does not hold — no verdict, nothing released"
                             ),
                         );
                         continue 'findings;
@@ -8587,10 +8630,9 @@ pub async fn repair(
                                     &mut out,
                                     f,
                                     format!(
-                                        "owner ino {}'s layout record is undecodable — a read \
+                                        "owner ino {owner}'s layout record is undecodable — a read \
                                          failure is never a verdict; nothing released (fsck C1 \
-                                         names the record)",
-                                        r.owner_ino
+                                         names the record)"
                                     ),
                                 );
                                 continue 'findings;
@@ -8606,9 +8648,8 @@ pub async fn repair(
                                 &mut out,
                                 f,
                                 format!(
-                                    "owner ino {}'s layout unreadable at verify: {e} — a read \
-                                     failure is never a verdict; nothing released",
-                                    r.owner_ino
+                                    "owner ino {owner}'s layout unreadable at verify: {e} — a read \
+                                     failure is never a verdict; nothing released"
                                 ),
                             );
                             continue 'findings;
@@ -8635,7 +8676,7 @@ pub async fn repair(
                             stale.push(crate::meta_backend::kv::block_refs::BlockRef {
                                 vol_tag,
                                 block_idx: idx,
-                                owner_ino: r.owner_ino,
+                                owner_ino: owner,
                                 block_index: r.block_index,
                             });
                         }
@@ -8644,9 +8685,8 @@ pub async fn repair(
                                 &mut out,
                                 f,
                                 format!(
-                                    "owner ino {}'s justification cannot be read ({why}) — a read \
-                                     failure is never a verdict; nothing released",
-                                    r.owner_ino
+                                    "owner ino {owner}'s justification cannot be read ({why}) — a \
+                                     read failure is never a verdict; nothing released"
                                 ),
                             );
                             continue 'findings;
@@ -8714,7 +8754,7 @@ pub async fn repair(
             // ------------------------------------ C11 map-plane (kvmap)
             //
             // REPORT-ONLY, deliberately (design-kvmap-block-map-tree §3
-            // fsck + A3, the C8 posture): a false-positive quarantine of
+            // fsck + A3, the C8 fabricate-direction posture): a false-positive quarantine of
             // "orphan" records would hole a LIVE crossing's staged map —
             // silent wrong data, the exact failure the tree exists to
             // prevent — and an empty head has nothing safe to restate
@@ -8766,7 +8806,7 @@ pub async fn repair(
             }
             // ------------------------------------ C12 tenant ranges (packing)
             //
-            // REFUSED, deliberately — the C8 posture (design-small-file-
+            // REFUSED, deliberately — the C8 fabricate-direction posture (design-small-file-
             // packing §5.9): two tenants overlapping at different `off`
             // means at least one is wrong and nothing on the volume says
             // which, so quarantining both would destroy the one that is
@@ -9785,8 +9825,31 @@ pub async fn repair(
                 let tag = crate::meta_backend::kv::block_refs::volume_tag(vol);
                 let block_idx = *offset / alloc.chunk_size().max(1);
                 let mut durable = 0usize;
-                for kv in &ctx.meta.volumes {
-                    durable += kv.block_ref_count(tag, block_idx).await?;
+                let mut ledger_unread: Option<String> = None;
+                for (kv_idx, kv) in ctx.meta.volumes.iter().enumerate() {
+                    match kv.block_ref_count(tag, block_idx).await {
+                        Ok(n) => durable += n,
+                        Err(e) => {
+                            ledger_unread = Some(format!("meta volume {kv_idx}: {e}"));
+                            break;
+                        }
+                    }
+                }
+                // A ledger that cannot be read is no verdict either way —
+                // this finding refuses (the C8 arm's own posture), the pass
+                // proceeds. (On a manager with live lessees the count walks
+                // their PROJECTIONS, whose refresh can exhaust — that class
+                // lands here, never as an aborted pass.)
+                if let Some(why) = ledger_unread {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "the durable block-reference ledger could not be read for \
+                             {vol}:{offset} ({why}) — no verdict, the block is not freed"
+                        ),
+                    );
+                    continue;
                 }
                 if durable > 0 {
                     refuse(

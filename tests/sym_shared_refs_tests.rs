@@ -1472,7 +1472,8 @@ async fn a_holders_free_of_a_former_lessees_block_runs_the_owner_ladder_instead_
 /// forest** (record §4.4bu, review round 1 Issue 4): a forest volume keys
 /// a block reference by its owner's LOCAL form `(s + 1) << 40 | local`,
 /// the repair reads the durable ledger with every owner folded to its
-/// GLOBAL ino (`shared_refs::global_owner`) and commits the release
+/// GLOBAL ino (`RoutedMetaBackend::try_make_global_ino`, `route_ino`'s
+/// exact inverse over the set's live tables) and commits the release
 /// through the routed door, whose `forest_ref_ops` re-keys the op to the
 /// local form — so the Delete meets the record. A guest-slot file's block
 /// 0 is displaced (the displaced block freed) and the old record

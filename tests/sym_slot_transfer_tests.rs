@@ -5605,3 +5605,97 @@ async fn a_handover_of_a_tree_with_pending_structure_runs_the_holders_own_smos()
     assert_eq!(v.as_deref(), Some(value.as_slice()));
     shutdown(&routed).await;
 }
+
+/// **PR 14 fix round 1 (§4.4bh) — a page-named slot's cursor is durable
+/// BEFORE the ledger record whose tail passes its mints.** The manager's
+/// tail rides the ledger record and the cursors of the slots its page
+/// names ride page 0, written AFTER that record; a death between the two
+/// left the page one cycle stale while the tail had passed the mints —
+/// the successor reopened the slot at the page's word and minted over
+/// live inos (the overflow slots' cursors ride tree 0's pre-flush
+/// publication, §4.4bd's cursor law; a joiner's page names its own tail
+/// and cursors in one write — the window was region 0's alone). The
+/// cycle now writes page 0 with the live cursor words before barrier #1.
+/// Pinned: one rotor slot driven until its root MOVED (its publication's
+/// home is the page from then on), twelve mints into it, a checkpoint
+/// halted right after its ledger record (`TEST_CHECKPOINT_HALT_AFTER_
+/// LEDGER` — the page write never lands), a death, and the successor's
+/// first mint in that slot above every live raw. RED on the unfixed
+/// cycle: `the successor minted raw 104 at or below a live ino (115)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_named_slots_cursor_is_durable_before_the_record_whose_tail_passes_its_mints() {
+    use squeezefs::meta_backend::kv::checkpoint::TEST_CHECKPOINT_HALT_AFTER_LEDGER;
+    use squeezefs::meta_backend::kv::record::forest_slot_of_ino;
+    use squeezefs::meta_backend::{guest_local_ino, split_guest_local};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let tag = 0xB0DB;
+    // One rotor slot, taken off the routed mint (the rotor's own choice).
+    let routing = loop {
+        let (local, _global) = routed.allocate_local_ino(0).unwrap();
+        if let Some((routing, _)) = split_guest_local(local) {
+            break routing;
+        }
+    };
+    let mint = || guest_local_ino(routing, vol.allocate_guest_ino(routing).unwrap());
+    let first = mint();
+    let fslot = forest_slot_of_ino(first);
+    vol.commit_block_refs(first, &refs(tag, first, 10, 1))
+        .await
+        .unwrap();
+    vol.checkpoint_now().await.unwrap();
+    let root0 = vol.slot_tree_root(fslot).expect("the slot tree exists");
+    // Records into the slot tree until its root moves: a compaction or a
+    // split of the one leaf — the page is the publication's home after.
+    let mut moved = false;
+    for round in 0..6000u64 {
+        let next = mint();
+        vol.commit_block_refs(next, &refs(tag, next, 1_000 + round * 8, 8))
+            .await
+            .unwrap();
+        if round % 100 == 99 {
+            vol.checkpoint_now().await.unwrap();
+            if vol.slot_tree_root(fslot) != Some(root0) {
+                moved = true;
+                break;
+            }
+        }
+    }
+    assert!(moved, "premise: the slot tree's root moved");
+    vol.checkpoint_now().await.unwrap();
+    // Twelve mints the next checkpoint's tail passes, then the death in
+    // the window between its ledger record and its page write.
+    let mut top = 0u64;
+    for i in 0..12u64 {
+        let next = mint();
+        vol.commit_block_refs(next, &refs(tag, next, 50_000 + i, 1))
+            .await
+            .unwrap();
+        top = top.max(split_guest_local(next).unwrap().1);
+    }
+    let pre_barrier_writes =
+        squeezefs::meta_backend::kv::META_KV_CURSOR_PAGE_WRITES.load(Ordering::Relaxed);
+    TEST_CHECKPOINT_HALT_AFTER_LEDGER.store(true, Ordering::SeqCst);
+    assert!(vol.checkpoint_now().await.is_err(), "the halt fired");
+    TEST_CHECKPOINT_HALT_AFTER_LEDGER.store(false, Ordering::SeqCst);
+    let cursor_page_writes =
+        squeezefs::meta_backend::kv::META_KV_CURSOR_PAGE_WRITES.load(Ordering::Relaxed);
+    drop(vol);
+    drop(routed);
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let raw = vol.allocate_guest_ino(routing).unwrap();
+    shutdown(&routed).await;
+    assert!(
+        raw > top,
+        "routing slot {routing}: the successor minted raw {raw} at or below a live ino ({top}) \
+         — the page named the slot's cursor one cycle behind the record's tail"
+    );
+    assert!(
+        cursor_page_writes > pre_barrier_writes,
+        "the cycle wrote page 0's cursor words before its barrier (the engagement gauge)"
+    );
+}

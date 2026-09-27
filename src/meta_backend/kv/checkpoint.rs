@@ -2838,6 +2838,14 @@ impl KvMetaBackend {
         // by barrier #1 — BEFORE that record lands. A no-op on a mount
         // holding no lease.
         self.write_data_alloc_pages(ckpt_seq).await?;
+        // The manager's page-named CURSOR words, by the same law (PR 14
+        // fix round 1, §4.4bh): the record below passes every mint below
+        // `h`, and page 0 — those cursors' only durable home — is written
+        // after it; a death between the two reopened the slots one cycle
+        // stale. Page 0 with the live cells lands here, durable by
+        // barrier #1. A no-op on a joined appender (its page names its
+        // own tail) and on every unarmed or flat mount.
+        self.write_cursor_page_before_barrier(smo).await?;
         let t_pages = std::time::Instant::now();
 
         // ---- Barrier #1: node appends + bitmap pages + every completed

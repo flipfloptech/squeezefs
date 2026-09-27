@@ -230,6 +230,14 @@ pub static META_KV_FOREST_SLOT_TREES_MINTED: AtomicU64 = AtomicU64::new(0);
 /// mounts. Surfaced as `meta_kv_forest_root_publishes`.
 pub static META_KV_FOREST_ROOT_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 
+/// Region 0's pre-barrier page writes (PR 14 fix round 1, §4.4bh): the
+/// checkpoint cycles in which a page-named slot's cursor moved, so page 0
+/// was written with the live cursor words BEFORE barrier #1 — durable
+/// before the ledger record whose tail passes the mints. `≤ checkpoints`;
+/// 0 on a joined appender, a reader, a probe and every flat mount.
+/// Surfaced as `meta_kv_cursor_page_writes`.
+pub static META_KV_CURSOR_PAGE_WRITES: AtomicU64 = AtomicU64::new(0);
+
 /// Page-homed root publications DEMOTED because the page-budget cut
 /// moved past their slot (PR 13b, §4.4af): a leased slot's root the
 /// appender page named is published only while the page names it — a

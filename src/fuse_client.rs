@@ -13434,6 +13434,13 @@ impl SqueezefsFilesystem {
                     "meta_kv_forest_page_publications_demoted".into(),
                     load(&meta_kv::META_KV_FOREST_PAGE_PUBLICATIONS_DEMOTED),
                 );
+                // Region 0's pre-barrier page writes — a page-named
+                // slot's moved cursor reaching the device before the
+                // ledger record whose tail passes its mints (§4.4bh).
+                metrics.insert(
+                    "meta_kv_cursor_page_writes".into(),
+                    load(&meta_kv::META_KV_CURSOR_PAGE_WRITES),
+                );
                 metrics.insert(
                     "meta_kv_forest_key_violations".into(),
                     load(&meta_kv::META_KV_FOREST_KEY_VIOLATIONS),

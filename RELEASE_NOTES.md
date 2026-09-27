@@ -217,6 +217,23 @@ mount is a read-token client whose metadata is exact at the next resolve
   its claim aged (the D0 ladder's successor), never attested. A static
   rail (`tests/writer_door_bring_up_tests.rs`) keeps every direct writer
   door of the KV backend inside the same law.
+- **A manager's crash between a checkpoint's ledger record and its page
+  write reopened its rotor slots one cycle stale, fixed red-first (the
+  acceptance record's §4.4bh):** since the symmetric plane moved a slot's
+  ino cursor to its lease's homes, the cursors of the slots the manager's
+  own page names were written to the device only by the appender page, and
+  the checkpoint cycle wrote that page AFTER the ledger record whose tail
+  passes the cycle's mints — a death in the window (a kill −9, a power loss
+  with the record durable and the page not) left the successor seeding the
+  slot's cursor from the previous page and minting inos the leaves already
+  held: another file's inode record overwritten. The cycle now writes page
+  0 with the live cursor words before its first barrier (the allocation
+  bitmaps' own law — whatever covers records the ledger's tail passes is
+  on the device before the record), one extra 4 KiB write per manager
+  cycle in which a page-named slot minted; `meta_kv_cursor_page_writes`
+  counts them (0 on a joined appender, a reader, a probe and every flat
+  mount). A joined appender's page names its own tail and cursors in one
+  write and never had the window.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

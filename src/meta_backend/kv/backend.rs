@@ -11420,6 +11420,176 @@ impl KvMetaBackend {
         Ok(())
     }
 
+    /// The entries region `r`'s page names in one checkpoint cycle —
+    /// [`Self::write_appender_pages`]'s computation, shared with the
+    /// pre-barrier cursor write ([`Self::write_cursor_page_before_barrier`]).
+    async fn cycle_page_entries(
+        &self,
+        set: &super::appender::AppenderSet,
+        forest: &super::forest::SlotTrees,
+        trees: &[(super::record::ForestSlot, Arc<super::tree::KvTree>)],
+        r: &super::appender::AppenderRegion,
+        cycle: &super::tree::SmoContext,
+    ) -> std::result::Result<Vec<super::appender::SlotEntry>, KvError> {
+        let mut entries: Vec<super::appender::SlotEntry> = Vec::new();
+        if let Some(plane) = self.slot_leases() {
+            // The armed plane (PR 4, KD-SYM-3): every page names
+            // exactly the slots its region leases, with their live
+            // `g`, extent count, root and cursor — through the ONE
+            // page writer's invariant (Issue 2: a first touch that
+            // landed since this cycle's publication cannot evict a
+            // page-homed root un-named).
+            entries = match self
+                .prepare_page_entries(set, plane, r, &[], Some(cycle))
+                .await
+            {
+                Ok(e) => e,
+                // The cycle's OWN deferral class (the reserve — the
+                // same arm `publish_forest_roots` logs at the cycle's
+                // head): the page write fails, the tick retries, the
+                // previous image that named the slot stands.
+                Err(KvError::JournalReserveExhausted { needed }) => {
+                    log::debug!(
+                        "checkpoint: SMO reserve exhausted ({needed} B) publishing the \
+                         page-homed roots appender {}'s page would drop (publish-before-drop \
+                         deferred) — the page write is retried next cycle, the previous \
+                         page image stands",
+                        r.id
+                    );
+                    return Err(KvError::JournalReserveExhausted { needed });
+                }
+                Err(e) => return Err(e),
+            };
+        } else {
+            // The plane is not armed yet — the bring-up's cycles before
+            // `arm_slot_leases` (a re-mount's join checkpoint). The
+            // page's `g` words are the settle's business (a `Live`
+            // entry below tree 0's `g` is stale residue there), but its
+            // CURSOR words are a page-named slot's per-checkpoint home
+            // (PR 14, §4.4bd): named from the live cell — seeded at the
+            // open from the page as loaded — never 0, which this arm
+            // wrote over the predecessor's words at every re-mount
+            // (masked while the ledger stamp carried the cells; a
+            // mount that died before its next page write then left
+            // its successor minting from 2 in filled slots).
+            let cursor_of = |slot: super::record::ForestSlot| {
+                self.routing_slot_of_forest(slot)
+                    .ok()
+                    .and_then(|r| self.guest_cursor_snapshot(r))
+                    .unwrap_or(0)
+            };
+            if r.id == 0 {
+                for (slot, tree) in trees {
+                    if set.region_of_slot(*slot) != 0 {
+                        continue;
+                    }
+                    if entries.len() >= super::appender::SLOT_PAGE_BUDGET {
+                        break; // the rest ride tree 0 until PR 4's LRU release
+                    }
+                    let Ok(page_slot) =
+                        super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
+                    else {
+                        continue;
+                    };
+                    let root = tree.root();
+                    entries.push(super::appender::SlotEntry {
+                        slot: page_slot,
+                        state: super::appender::SlotEntryState::Live,
+                        g: 0,
+                        slot_tree_extents: 0,
+                        root,
+                        cursor: cursor_of(*slot),
+                    });
+                }
+            } else {
+                for slot in r.leases().iter() {
+                    let Ok(page_slot) =
+                        super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
+                    else {
+                        continue;
+                    };
+                    let root = forest
+                        .tree(*slot)
+                        .map_or(RootPtr { addr: 0, seq: 0 }, |t| t.root());
+                    entries.push(super::appender::SlotEntry {
+                        slot: page_slot,
+                        state: super::appender::SlotEntryState::Live,
+                        g: 0,
+                        slot_tree_extents: 0,
+                        root,
+                        cursor: cursor_of(*slot),
+                    });
+                }
+            }
+        }
+        entries.sort_by_key(|e| e.slot);
+        entries.dedup_by_key(|e| e.slot);
+        Ok(entries)
+    }
+
+    /// **Region 0's cursor words reach the device BEFORE barrier #1**
+    /// (PR 14 fix round 1, §4.4bh). The manager's tail rides the ledger
+    /// record and the cursors of the slots its page names ride page 0,
+    /// which the cycle writes AFTER that record — so a death between the
+    /// two left every page-named slot's cursor one cycle stale while the
+    /// record's tail had passed the mints: the successor reopened the
+    /// slot at the page's word and minted over live inos (a joiner's or
+    /// a declared region's page names ITS tail and cursors in one write,
+    /// so the window is region 0's alone; the overflow slots' cursors
+    /// ride tree 0's pre-flush publication, §4.4bd's cursor law). Every
+    /// record the record's tail passes sits below the cycle's head, so it
+    /// was minted before this write reads the cells: page 0 with the live
+    /// cursor words — the previous record's tail and seq, the roots as
+    /// the plan names them now — written here and made durable by the
+    /// barrier the record follows, the allocation bitmaps' own law. A
+    /// cycle whose page-named cursors did not move writes nothing; the
+    /// roots' publication stays the post-record write's.
+    pub(super) async fn write_cursor_page_before_barrier(
+        &self,
+        cycle: &super::tree::SmoContext,
+    ) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        if !set.joined.load(Ordering::Acquire)
+            || self.read_only
+            || self.non_writer
+            || !set.owns_region(0)
+        {
+            return Ok(());
+        }
+        let Some(forest) = self.forest() else {
+            return Ok(());
+        };
+        let Some(r) = set.regions.first().filter(|r| r.id == 0) else {
+            return Ok(());
+        };
+        if r.released.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let trees = forest.slot_trees();
+        let entries = self
+            .cycle_page_entries(set, forest, &trees, r, cycle)
+            .await?;
+        {
+            let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+            let moved = entries.iter().any(|e| {
+                e.cursor != 0
+                    && page
+                        .slots
+                        .iter()
+                        .find(|p| p.slot == e.slot)
+                        .is_none_or(|p| p.cursor < e.cursor)
+            });
+            if !moved {
+                return Ok(());
+            }
+            page.slots = entries;
+        }
+        super::META_KV_CURSOR_PAGE_WRITES.fetch_add(1, Ordering::Relaxed);
+        self.write_region_page(r).await
+    }
+
     /// **The appender PAGE writes of one checkpoint cycle** (§5.3.2 — the
     /// page IS the appender's ledger record; one write per checkpoint):
     /// region 0's mirrors the fixed ledger (its tail, this `ckpt_seq`) and
@@ -11463,99 +11633,9 @@ impl KvMetaBackend {
                     .find(|(id, _)| *id == r.id)
                     .map_or(0, |(_, t)| *t)
             };
-            let mut entries: Vec<super::appender::SlotEntry> = Vec::new();
-            if let Some(plane) = self.slot_leases() {
-                // The armed plane (PR 4, KD-SYM-3): every page names
-                // exactly the slots its region leases, with their live
-                // `g`, extent count, root and cursor — through the ONE
-                // page writer's invariant (Issue 2: a first touch that
-                // landed since this cycle's publication cannot evict a
-                // page-homed root un-named).
-                entries = match self
-                    .prepare_page_entries(set, plane, r, &[], Some(cycle))
-                    .await
-                {
-                    Ok(e) => e,
-                    // The cycle's OWN deferral class (the reserve — the
-                    // same arm `publish_forest_roots` logs at the cycle's
-                    // head): the page write fails, the tick retries, the
-                    // previous image that named the slot stands.
-                    Err(KvError::JournalReserveExhausted { needed }) => {
-                        log::debug!(
-                            "checkpoint: SMO reserve exhausted ({needed} B) publishing the \
-                             page-homed roots appender {}'s page would drop (publish-before-drop \
-                             deferred) — the page write is retried next cycle, the previous \
-                             page image stands",
-                            r.id
-                        );
-                        return Err(KvError::JournalReserveExhausted { needed });
-                    }
-                    Err(e) => return Err(e),
-                };
-            } else {
-                // The plane is not armed yet — the bring-up's cycles before
-                // `arm_slot_leases` (a re-mount's join checkpoint). The
-                // page's `g` words are the settle's business (a `Live`
-                // entry below tree 0's `g` is stale residue there), but its
-                // CURSOR words are a page-named slot's per-checkpoint home
-                // (PR 14, §4.4bd): named from the live cell — seeded at the
-                // open from the page as loaded — never 0, which this arm
-                // wrote over the predecessor's words at every re-mount
-                // (masked while the ledger stamp carried the cells; a
-                // mount that died before its next page write then left
-                // its successor minting from 2 in filled slots).
-                let cursor_of = |slot: super::record::ForestSlot| {
-                    self.routing_slot_of_forest(slot)
-                        .ok()
-                        .and_then(|r| self.guest_cursor_snapshot(r))
-                        .unwrap_or(0)
-                };
-                if r.id == 0 {
-                    for (slot, tree) in &trees {
-                        if set.region_of_slot(*slot) != 0 {
-                            continue;
-                        }
-                        if entries.len() >= super::appender::SLOT_PAGE_BUDGET {
-                            break; // the rest ride tree 0 until PR 4's LRU release
-                        }
-                        let Ok(page_slot) =
-                            super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
-                        else {
-                            continue;
-                        };
-                        let root = tree.root();
-                        entries.push(super::appender::SlotEntry {
-                            slot: page_slot,
-                            state: super::appender::SlotEntryState::Live,
-                            g: 0,
-                            slot_tree_extents: 0,
-                            root,
-                            cursor: cursor_of(*slot),
-                        });
-                    }
-                } else {
-                    for slot in r.leases().iter() {
-                        let Ok(page_slot) =
-                            super::appender::page_slot_of_forest_slot(*slot, set.native_slot)
-                        else {
-                            continue;
-                        };
-                        let root = forest
-                            .tree(*slot)
-                            .map_or(RootPtr { addr: 0, seq: 0 }, |t| t.root());
-                        entries.push(super::appender::SlotEntry {
-                            slot: page_slot,
-                            state: super::appender::SlotEntryState::Live,
-                            g: 0,
-                            slot_tree_extents: 0,
-                            root,
-                            cursor: cursor_of(*slot),
-                        });
-                    }
-                }
-            }
-            entries.sort_by_key(|e| e.slot);
-            entries.dedup_by_key(|e| e.slot);
+            let entries = self
+                .cycle_page_entries(set, forest, &trees, r, cycle)
+                .await?;
             // The grant's UNCLAIMED remainder (§5.3.3), read under the
             // grant guard BEFORE the page lock — the region's lock order
             // (`AppenderRegion`: `grant` before `page`; the commit path's

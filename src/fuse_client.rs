@@ -13441,6 +13441,13 @@ impl SqueezefsFilesystem {
                     "meta_kv_cursor_page_writes".into(),
                     load(&meta_kv::META_KV_CURSOR_PAGE_WRITES),
                 );
+                // SMO entries wider than the checkpoint class's keep — a
+                // split of a leaf whose overlay outgrew a quarter of the
+                // class (§4.4bi); admitted, counted, ≈ 0 when healthy.
+                metrics.insert(
+                    "meta_kv_smo_entries_over_keep".into(),
+                    load(&meta_kv::META_KV_SMO_ENTRIES_OVER_KEEP),
+                );
                 metrics.insert(
                     "meta_kv_forest_key_violations".into(),
                     load(&meta_kv::META_KV_FOREST_KEY_VIOLATIONS),

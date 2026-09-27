@@ -264,7 +264,8 @@ fn a_checkpoint_class_admission_keeps_one_smo_claim_of_class_space() {
     assert_eq!(
         keep,
         JOURNAL_PAGE_DATA_LEN + geo.max_pad(),
-        "the keep is one SMO record's worst-case claim: a page of data + the pad slack"
+        "at a two-page class the keep takes its FLOOR arm — a page of data + the pad slack \
+         (a quarter of a production class is wider: §4.4bi)"
     );
     // Fill the ring to exactly ONE free page: user admissions stop at the
     // reserve; the checkpoint class walks the reserve one record a page

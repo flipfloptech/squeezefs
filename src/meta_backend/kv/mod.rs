@@ -230,6 +230,13 @@ pub static META_KV_FOREST_SLOT_TREES_MINTED: AtomicU64 = AtomicU64::new(0);
 /// mounts. Surfaced as `meta_kv_forest_root_publishes`.
 pub static META_KV_FOREST_ROOT_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 
+/// SMO entries admitted WIDER than the checkpoint class's keep (PR 14 fix
+/// round 1, §4.4bi): a split of a leaf whose frozen delta outgrew the ≈ 860
+/// node capacities a quarter of the class holds — admitted without the
+/// keep's guarantee (one deferred cycle at worst), loud once. ≈ 0 on every
+/// healthy mount. Surfaced as `meta_kv_smo_entries_over_keep`.
+pub static META_KV_SMO_ENTRIES_OVER_KEEP: AtomicU64 = AtomicU64::new(0);
+
 /// Region 0's pre-barrier page writes (PR 14 fix round 1, §4.4bh): the
 /// checkpoint cycles in which a page-named slot's cursor moved, so page 0
 /// was written with the live cursor words BEFORE barrier #1 — durable

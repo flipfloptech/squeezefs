@@ -168,14 +168,23 @@ impl CoreGeometry {
     }
 
     /// The class space a checkpoint-class admission KEEPS behind it
-    /// ([`JournalCore::try_admit_keeping`]): one SMO record's worst-case
-    /// claim — a page of entry bytes (every SMO entry is under one page:
-    /// a split's pointers, its alloc records and the frees) plus the pad
-    /// slack. The flush pass's oldest node per ring is exempt; every other
-    /// checkpoint-class consumer leaves this much, so that node always
-    /// admits at the next cycle's start and the tail moves (PR 14 §4.4be).
+    /// ([`JournalCore::try_admit_keeping`]): the widest SMO entry the
+    /// tail-pinning node can need, plus the pad slack. The flush pass's
+    /// oldest node per ring is exempt; every other checkpoint-class
+    /// consumer leaves this much, so that node always admits at the next
+    /// cycle's start and the tail moves (PR 14 §4.4be). A split's entry
+    /// carries one pointer record per PART, and a fold partitions one
+    /// node's log PLUS its frozen delta — bounded by the leaf's overlay,
+    /// not the node: a leaf whose delta grew to dozens of node capacities
+    /// under a storm splits into that many parts (a 2.3 MiB fold → 62
+    /// parts → 4.6 KiB, past the page the first keep held, §4.4bi). The
+    /// keep is a QUARTER of the class (64 KiB at the 256 KiB floor —
+    /// ≈ 860 parts, a ≈ 50 MiB overlay on one leaf; 128 KiB on the 32 MiB
+    /// ring), floored at one page: three quarters of the class stay the
+    /// non-exempt wave's, and an entry wider than the keep is admitted
+    /// without its guarantee and counted, never refused.
     pub fn smo_keep(&self) -> u64 {
-        self.page_data_len + self.max_pad()
+        (self.reserve_bytes / 4).max(self.page_data_len) + self.max_pad()
     }
 
     /// Which lap `pos` belongs to.

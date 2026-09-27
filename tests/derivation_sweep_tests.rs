@@ -4392,19 +4392,24 @@ fn journal_pad_constants_tie_to_the_io_layers_framing() {
 /// slot-prefixed separator + `parts + 1` alloc deltas — the parts and a
 /// new root — + the old image's free delta), `try_merge_node` (a pointer
 /// put + a pointer delete + one alloc + two frees) and
-/// `collapse_root_chain` (one free). The tie: the record sets built here
+/// `collapse_root_chain` (one free). The tie: `smo_keep` = a QUARTER of
+/// the class floored at one page, plus the pad slack (§4.4bi — a split's
+/// entry carries one pointer per PART and a fold partitions one node's
+/// log PLUS its frozen delta, which a storm grows to dozens of node
+/// capacities: the page-sized keep's "three-part physical ceiling" was
+/// false, a 62-part split's 4.6 KiB entry hit the first rail's refusal
+/// and failed every later checkpoint), and the record sets built here
 /// exactly as `tree.rs` builds them, at the widest interior journal key
 /// the forest frames (`FOREST_SLOT_MAX` ‖ `KEY_SPACE_MAX`), fit under
-/// `smo_keep − max_pad` = `page_data_len` with the margin stated — the
-/// `SMO_IMAGES_MAX` split at a small fraction of the page, and a split
-/// wider than any fold can produce (`partition_records` over one node's
-/// log + its frozen delta) still inside it — and `admit_smo_entry`
-/// refuses an entry past the keep LOUD, so a wider record class fails
-/// this tie before it can under-keep. The multi-record oldest-node case
-/// (a root swap or a merge behind a split on ONE node inside one cycle)
-/// is STATED, not pinned: the second admission keeps, a ring left at
-/// exactly one keep defers that node to the next cycle, whose exemption
-/// covers it again — one extra cycle, never the deadlock.
+/// `smo_keep − max_pad` with the margin stated — the `SMO_IMAGES_MAX`
+/// split under an eighth of a page, the 62-part storm split inside it,
+/// and a split ≥ 512 parts wide still inside it at every production
+/// geometry. An entry past the keep is ADMITTED and counted
+/// (`meta_kv_smo_entries_over_keep`), never refused — the law degrades to
+/// one deferred cycle. The multi-record oldest-node case (a root swap or
+/// a merge behind a split on ONE node inside one cycle) is STATED, not
+/// pinned: the second admission keeps, a ring left at exactly one keep
+/// defers that node to the next cycle, whose exemption covers it again.
 #[test]
 fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
     use squeezefs::meta_backend::kv::alloc_ext::{alloc_record, free_record};
@@ -4432,7 +4437,9 @@ fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
     // slot's prefix ‖ the rightmost separator.
     let widest_key = || interior_journal_key(FOREST_SLOT_MAX, &KEY_SPACE_MAX);
     let interior_tag = tag_for(KIND_INTERIOR, 1);
-    let split_entry = |parts: usize| -> u64 {
+    // `None` past `MAX_ENTRY_LEN` — the journal's own bound on any entry,
+    // which a keep at a quarter of the 32 MiB ring's class reaches.
+    let split_entry_len = |parts: usize| -> Option<u64> {
         let mut recs: Vec<(u8, Record)> = Vec::new();
         for _ in 0..parts {
             recs.push((
@@ -4445,8 +4452,10 @@ fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
             recs.push(alloc_record(u64::MAX - e, 0));
         }
         recs.push(free_record(u64::MAX, u64::MAX, 0));
-        entry_len_for(&recs).expect("under MAX_ENTRY_LEN")
+        entry_len_for(&recs).ok()
     };
+    let split_entry =
+        |parts: usize| -> u64 { split_entry_len(parts).expect("under MAX_ENTRY_LEN") };
     let merge_entry = {
         let recs: Vec<(u8, Record)> = vec![
             (
@@ -4465,8 +4474,8 @@ fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
         let keep = geo.smo_keep();
         assert_eq!(
             keep,
-            geo.page_data_len + geo.max_pad(),
-            "grain {}: the keep is a page of entry bytes + the pad slack",
+            (geo.reserve_bytes / 4).max(geo.page_data_len) + geo.max_pad(),
+            "grain {}: the keep is a quarter of the class, floored at a page, + the pad slack",
             geo.grain
         );
         let fits = |len: u64| len + geo.max_pad() <= keep;
@@ -4479,7 +4488,7 @@ fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
         );
         assert!(
             widest_split * 8 <= geo.page_data_len,
-            "the widest physical split's entry ({widest_split} B) is under an eighth of the \
+            "the widest physical split's entry ({widest_split} B) is under an eighth of a \
              page ({}) — the stated margin",
             geo.page_data_len
         );
@@ -4489,18 +4498,22 @@ fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
             "grain {}: the root collapse's entry",
             geo.grain
         );
-        // The slack in PARTS: how wide a split the keep still holds. A fold
-        // partitions one node's log + its frozen delta at the ¾ fill, so a
-        // three-part split is the physical ceiling; the keep holds a split
-        // an order of magnitude wider.
-        let mut parts = SMO_IMAGES_MAX as usize;
-        while fits(split_entry(parts + 1)) {
+        // The storm's split (§4.4bi: a 2.3 MiB fold → 62 parts) and the
+        // slack in PARTS beyond it: the keep holds a split ≥ 512 parts
+        // wide at every production geometry.
+        assert!(
+            fits(split_entry(62)),
+            "grain {}: the 62-part storm split's entry ({} B) fits the keep ({keep})",
+            geo.grain,
+            split_entry(62)
+        );
+        let mut parts = 62usize;
+        while split_entry_len(parts + 1).is_some_and(fits) {
             parts += 1;
         }
         assert!(
-            parts >= 32,
-            "grain {}: the keep holds a {parts}-way split's entry — at least 32 parts of slack \
-             over the physical three",
+            parts >= 512,
+            "grain {}: the keep holds a {parts}-way split's entry — at least 512 parts",
             geo.grain
         );
     }

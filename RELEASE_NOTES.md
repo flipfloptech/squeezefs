@@ -234,6 +234,15 @@ mount is a read-token client whose metadata is exact at the next resolve
   counts them (0 on a joined appender, a reader, a probe and every flat
   mount). A joined appender's page names its own tail and cursors in one
   write and never had the window.
+- **A wide leaf split no longer fails the checkpoint (the acceptance
+  record's §4.4bi):** the checkpoint class's keep (§4.4be) presumed every
+  structural-modification entry fits one page and the fix round's first
+  rail refused a wider one loud; a leaf whose in-RAM overlay grew to dozens
+  of node capacities while a full heap deferred its compaction split into
+  62 parts, the refusal failed every later checkpoint, and a full volume's
+  deletes stayed at `ENOSPC`. The keep is a quarter of the class now
+  (≈ 860 parts at the floor) and an entry past it is admitted and counted
+  (`meta_kv_smo_entries_over_keep`), never refused.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

@@ -1706,6 +1706,59 @@ fn test_drop_commit_wake() -> bool {
         .is_ok()
 }
 
+/// The seam's SCOPED form (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID=<tid>`):
+/// the budget strikes only replies to requests the kernel attributes to
+/// this thread (`fuse_in_header.pid`). A desktop's volume monitor probes
+/// every new mount within milliseconds of the arm (`gvfsd-trash`: a root
+/// GETATTR + `.Trash` + `.Trash-1000`), and the unscoped seam's victim is
+/// whichever reply travels first — a prober's, on a queue the prober's own
+/// next delivery pumps before the bounded park's tick. `None` = unscoped.
+fn test_drop_commit_wake_tid() -> Option<u32> {
+    static TID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *TID.get_or_init(|| {
+        std::env::var("SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|t| *t != 0)
+    })
+}
+
+/// The scoped seam's candidate victim: `(qid, commit id)` of the LATEST
+/// delivery from the seam's thread (recorded while the budget lasts);
+/// `u64::MAX` = none. The reply path strikes when its own words match —
+/// a reply whose wake the coalescer elided leaves the budget untouched,
+/// so the thread's next request becomes the candidate.
+static SEAM_VICTIM: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn seam_victim_word(qid: u16, commit_id: u64) -> u64 {
+    (u64::from(qid) << 48) | (commit_id & ((1u64 << 48) - 1))
+}
+
+/// Delivery side of the scoped seam: a request from the seam's thread is
+/// the candidate. One `OnceLock` read per delivery when unset.
+fn test_note_delivery_for_seam(requester_pid: u32, qid: u16, commit_id: u64) {
+    let Some(tid) = test_drop_commit_wake_tid() else {
+        return;
+    };
+    if requester_pid == tid {
+        SEAM_VICTIM.store(seam_victim_word(qid, commit_id), Ordering::Relaxed);
+    }
+}
+
+/// Reply side of the seam, both forms: unscoped = the first N wakes;
+/// scoped = this reply is the recorded candidate AND the budget allows.
+fn test_drop_this_commit_wake(qid: u16, commit_id: u64) -> bool {
+    if test_drop_commit_wake_tid().is_none() {
+        return test_drop_commit_wake();
+    }
+    let word = seam_victim_word(qid, commit_id);
+    if SEAM_VICTIM.load(Ordering::Relaxed) != word || !test_drop_commit_wake() {
+        return false;
+    }
+    let _ = SEAM_VICTIM.compare_exchange(word, u64::MAX, Ordering::Relaxed, Ordering::Relaxed);
+    true
+}
+
 /// `SQUEEZEFS_TRANSPORT_DEBUG=1` — per-request transport tracing to stderr
 /// (delivery / reply / commit / CQE errors) for stuck-request forensics.
 pub fn transport_debug() -> bool {
@@ -3482,9 +3535,9 @@ impl FuseOverUring {
             // TEST SEAM (commit-wake-loss): skip the write, leave the
             // coalescer armed — the message sits in commit_rx with no
             // wake in flight, the exact generic/795 posture. Env-gated
-            // (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES`); one relaxed load in
-            // production.
-            if test_drop_commit_wake() {
+            // (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES`, scoped to one requester
+            // thread by `..._TID`); one relaxed load in production.
+            if test_drop_this_commit_wake(qid, commit_id) {
                 error!(
                     "fuse-over-uring qid={qid} ent={ent_idx}: TEST SEAM dropping commit wake \
                      write (cid={commit_id}) — the commit message stays queued and the \
@@ -7214,8 +7267,17 @@ fn queue_worker(
                 qid,
                 ent_idx, unique, commit_id, payload_sz, opcode, "fuse-over-uring inbound request"
             );
+            // The requester's pid (fuse_in_header bytes 32..36, the
+            // issuing THREAD's id): the trace's one way to tell a client's
+            // request from a daemon thread's own, and the scoped seam's key.
+            let requester_pid = u32::from_le_bytes(
+                m.ents[ent_idx].hdr().in_out[32..36]
+                    .try_into()
+                    .unwrap_or([0; 4]),
+            );
+            test_note_delivery_for_seam(requester_pid, qid, commit_id);
             xport_dbg!(
-                "[XPORT] deliver qid={qid} ent={ent_idx} unique={unique} op={opcode} cid={commit_id} psz={payload_sz}"
+                "[XPORT] deliver qid={qid} ent={ent_idx} unique={unique} op={opcode} cid={commit_id} psz={payload_sz} pid={requester_pid}"
             );
 
             // FUSE_FORGET (2) / FUSE_BATCH_FORGET (42) are "no reply" on classical.

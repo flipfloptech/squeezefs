@@ -1007,7 +1007,11 @@ impl FuseConnection {
                 if super::fuse_over_uring::transport_debug() {
                     let unique = u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]));
                     let op = u32::from_le_bytes(hdr[4..8].try_into().unwrap_or([0; 4]));
-                    eprintln!("[XPORT] classical-deliver unique={unique} op={op}");
+                    let pid = hdr
+                        .get(32..36)
+                        .filter(|_| *n >= 36)
+                        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap_or([0; 4])));
+                    eprintln!("[XPORT] classical-deliver unique={unique} op={op} pid={pid}");
                 }
             }
         }

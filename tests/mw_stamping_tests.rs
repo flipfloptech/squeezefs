@@ -43,7 +43,8 @@
 //!   EVERY adjacent bit pair — 8 windows + the marker-alone window),
 //!   MW-S2 (bit set, structure unminted — first-mount minting is the
 //!   existing crash-safe machinery), MW-S3 (old binary refuses loud via
-//!   `FEATURES_INCOMPAT_KNOWN`).
+//!   `FEATURES_INCOMPAT_KNOWN`); `--abort` over a crashed stamp REFUSES
+//!   naming the plain re-run, which converts (the forward-only law).
 //! - **Serialization**: the stamp asserts the D0 guard before its first
 //!   write; a second concurrent invocation refuses on the guard — extended
 //!   to cover the marker-tolerant resume open.
@@ -396,6 +397,82 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
     let routed = open_routed_meta_set(&paths)
         .await
         .expect("mount after resume");
+    for vol in &routed.volumes {
+        vol.shutdown().await.expect("clean shutdown");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The forward-only law at the stamp half: `--abort` over a crashed stamp
+// REFUSES naming the plain re-run, and the re-run converts (PR 14 fix
+// round 3 class B, review round 4 Issue 17c — the record's §4.4bm).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_over_a_crashed_stamp_refuses_naming_the_plain_rerun_which_converts() {
+    let dir = tempfile::tempdir().unwrap();
+    let metas = [
+        make_file(dir.path(), "m0.meta"),
+        make_file(dir.path(), "m1.meta"),
+    ];
+    format_single_writer_set(&metas).await;
+    let paths = uris(&metas);
+
+    // Kill inside the stamp half, mid-order on volume 0: four bits down,
+    // the `mw_upgrade:` marker up, nothing of the conversion begun.
+    upgrade_crashing_at(
+        &paths,
+        EnableMwCrash::AfterBit {
+            volume: 0,
+            bits_done: 4,
+        },
+    )
+    .await;
+    let f0_crashed = features_of(&metas[0]).await;
+    let f1_crashed = features_of(&metas[1]).await;
+    assert!(
+        !has_all_nine(f0_crashed) && !has_none_beyond_single_writer(f0_crashed),
+        "volume 0 carries a proper prefix of the stamp order"
+    );
+    assert!(has_none_beyond_single_writer(f1_crashed));
+    assert!(read_marker(&metas[0]).await.is_some());
+
+    // `--abort` refuses: incompat bits are forward-only, a crashed stamp
+    // has no undo — the refusal names the marker and the plain re-run.
+    let abort = EnableSymOptions {
+        abort: true,
+        ..EnableSymOptions::default()
+    };
+    let msg = enable_symmetric(&paths, &abort)
+        .await
+        .expect_err("--abort refuses over a crashed stamp")
+        .to_string();
+    assert!(
+        msg.contains("plain re-run")
+            && msg.contains("never undone")
+            && msg.contains(MW_UPGRADE_MARKER_XATTR),
+        "the refusal names the marker and the re-run as the remedy: {msg}"
+    );
+    // Nothing written by the refusal: the prefix and the marker stand.
+    assert_eq!(features_of(&metas[0]).await, f0_crashed);
+    assert_eq!(features_of(&metas[1]).await, f1_crashed);
+    assert!(read_marker(&metas[0]).await.is_some());
+
+    // The plain re-run completes the stamp (the prefix re-runs as no-ops)
+    // and converts in the same invocation: every member a forest, the
+    // marker gone, the set mountable.
+    let report = upgrade(&paths).await;
+    assert!(
+        report.multi_writer_bits_stamped > 0,
+        "the remaining bits landed on the re-run: {report:?}"
+    );
+    for m in &metas {
+        assert!(is_forest(features_of(m).await));
+    }
+    assert!(read_marker(&metas[0]).await.is_none());
+    let routed = open_routed_meta_set(&paths)
+        .await
+        .expect("mount after the re-run");
     for vol in &routed.volumes {
         vol.shutdown().await.expect("clean shutdown");
     }

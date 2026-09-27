@@ -3080,23 +3080,34 @@ pub async fn arm_symmetric_allocation(
                 .collect();
             (minted, loss)
         };
-        // A non-empty verdict is re-read while it SHRINKS (a free landing
-        // — the clear → insert gap, a claim window returning), at most
-        // three 5 ms yields; a stable set is the verdict.
-        let (mut minted, mut loss) = verdict();
+        // A candidate must PERSIST across two reads ≥ 5 ms apart to be the
+        // verdict (review round 4, Issue 12): under a large sweep the
+        // reclaim lanes keep a few blocks inside `publish_free_list`'s
+        // µs clear → insert gap at any instant, each read catching a
+        // different handful, so a size comparison read a stream of
+        // transients as a stable set; a genuine loss or mint is in EVERY
+        // read. At most three re-reads; a transient never survives one.
+        let intersect = |a: &[u64], b: &[u64]| -> Vec<u64> {
+            a.iter()
+                .copied()
+                .filter(|x| b.binary_search(x).is_ok())
+                .collect()
+        };
+        let mut prev = verdict();
+        let mut persisted: (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
         for _ in 0..3 {
-            if minted.is_empty() && loss.is_empty() {
+            if prev.0.is_empty() && prev.1.is_empty() {
                 break;
             }
             squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(5)).await;
-            let (m, l) = verdict();
-            let shrank = m.len() + l.len() < minted.len() + loss.len();
-            minted = m;
-            loss = l;
-            if !shrank {
+            let cur = verdict();
+            persisted = (intersect(&prev.0, &cur.0), intersect(&prev.1, &cur.1));
+            if !persisted.0.is_empty() || !persisted.1.is_empty() {
                 break;
             }
+            prev = cur;
         }
+        let (minted, loss) = persisted;
         if !minted.is_empty() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the allocator \

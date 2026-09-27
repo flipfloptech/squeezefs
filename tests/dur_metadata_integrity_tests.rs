@@ -464,14 +464,29 @@ async fn dur8c_replay_watermark_folds_dentry_and_xattr_inos() {
     use squeezefs::meta_backend::kv::journal::{entry_len_for, JournalRing};
     use squeezefs::meta_backend::kv::journal_core::AdmissionClass;
     use squeezefs::meta_backend::kv::record::{
-        dentry_key, dentry_name_hash54, xattr_key, xattr_name_hash56, DentryValue, Record,
-        XattrValue, TREE_DENTRIES, TREE_XATTRS,
+        dentry_key, dentry_name_hash54, forest_key, xattr_key, xattr_name_hash56, DentryValue,
+        Record, XattrValue, TREE_DENTRIES, TREE_XATTRS,
     };
 
     let _g = FaultGuard;
     let (kv, file) = sandbox(VOL_LEN).await;
     let path = file.path().to_path_buf();
-    let sb_journal = kv.superblock().journal;
+    // The RING part of the fixed journal extent: on the default forest
+    // volume appender 0's four page slots lead the extent, so the whole
+    // `journal` extent would recover (and forge into) the page slots, 16
+    // KiB short of the ring's head.
+    let sb_journal = KvMetaBackend::fixed_ring_extent(kv.superblock());
+    // A journaled record's key is the volume's LAYOUT's: the forest key
+    // (`ino ‖ kind ‖ rest`, design-symmetric-metadata §5.2.1) on the
+    // default, the shipped per-kind key on a `--single-writer` volume.
+    let forest = kv.superblock().symmetric_forest_stamped();
+    let frame = |kind: u8, legacy: &[u8]| -> Vec<u8> {
+        if forest {
+            forest_key(kind, legacy).expect("a well-formed legacy key frames")
+        } else {
+            legacy.to_vec()
+        }
+    };
     let hash_seed = 0u64;
     let dentry_ino: u64 = 4_000;
     let xattr_ino: u64 = 9_000;
@@ -496,7 +511,10 @@ async fn dur8c_replay_watermark_folds_dentry_and_xattr_inos() {
             (
                 TREE_DENTRIES,
                 Record::put(
-                    dentry_key(1, dentry_name_hash54(b"orphan", hash_seed), 0).to_vec(),
+                    frame(
+                        TREE_DENTRIES,
+                        &dentry_key(1, dentry_name_hash54(b"orphan", hash_seed), 0),
+                    ),
                     1,
                     DentryValue::encode_parts(dentry_ino, 8, b"orphan").expect("dentry"),
                 ),
@@ -504,7 +522,10 @@ async fn dur8c_replay_watermark_folds_dentry_and_xattr_inos() {
             (
                 TREE_XATTRS,
                 Record::put(
-                    xattr_key(xattr_ino, xattr_name_hash56(b"user.k", hash_seed), 0).to_vec(),
+                    frame(
+                        TREE_XATTRS,
+                        &xattr_key(xattr_ino, xattr_name_hash56(b"user.k", hash_seed), 0),
+                    ),
                     1,
                     XattrValue::encode_parts(b"user.k", b"v").expect("xattr"),
                 ),

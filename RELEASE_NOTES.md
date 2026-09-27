@@ -354,6 +354,16 @@ mount is a read-token client whose metadata is exact at the next resolve
   stale key's reference back under the live key; `block_pin_stale_keys`
   counts the class. Found by the 1.3.0 release chain's own `task check`
   (record §4.4bp).
+- **A set carrying a prior-era corpse could refuse to mount on the 1.3
+  default**: the mount-time corpse sweep frees an unlinked-but-never-
+  FORGOTTEN inode's blocks through the background reclaim queue, and the
+  allocation lease's arm, next in the mount path, refused the mount when
+  those frees landed between its two seed snapshots ("the allocator moved
+  during the arm … 37 → 0 set") — every abort-unmount or kill -9 that left
+  an open unlinked file armed the shape at the next mount. The sweep
+  drains its frees before it returns (its "blocks freed" is literal), so
+  the arm seeds from a quiescent allocator. Found by the 1.3.0 release
+  chain's fstests pre-pass (record §4.4bs).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a

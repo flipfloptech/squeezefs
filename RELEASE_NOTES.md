@@ -383,6 +383,15 @@ mount is a read-token client whose metadata is exact at the next resolve
   generic/751's ENOSPC fill, whose next scratch mount failed). All three
   swap sites now read the map they displace under the lock. Found by the
   1.3.0 release chain's fstests resume (record §4.4bt).
+- **A set carrying stale block-reference records from an earlier
+  release can be repaired instead of re-formatted**: `squeezefs fsck
+  <sqmeta-uri> --repair --apply`, run offline, now releases every C8
+  record whose owner's layout no longer names the block at that index
+  (`release-stale-block-refs`) — the shape the fix above stops producing,
+  which on the 1.3 default refused the mount at the allocation arm's
+  loss check (the refusal names the verb). A layout naming a block with
+  no record stays report-only (a record is never fabricated); an online
+  `--apply` refuses naming the offline run (record §4.4bu).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a

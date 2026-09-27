@@ -3478,21 +3478,31 @@ impl TokenReaderPlane {
     /// is in fact dead answers the release with a transport error, which
     /// the best-effort release drops — the dead-holder shape costs one
     /// bounded call and ends exactly as [`Self::stop_dead`].
+    ///
+    /// The entries are DROPPED before the release travels (PR 14 fix
+    /// round 3, class G): "serves nothing" is the fence's word, not the
+    /// wire's — the first build kept every entry `LIVE` across the
+    /// release's round trip and dropped them only after the holder had
+    /// answered, so a plane already retired still answered `holds` for a
+    /// token the holder had already retired. The drain + purge the
+    /// release runs read the entries through the collected `Arc`s, never
+    /// the cache.
     pub async fn stop_released(&self) {
         self.channel_ok.store(false, Ordering::Release);
+        self.stop.store(true, Ordering::Relaxed);
         let mut held: Vec<RecalledObject> = Vec::new();
-        self.cache.iter_sync(|ino, e| {
+        self.cache.retain_sync(|ino, e| {
+            e.state.store(ENTRY_REVOKED, Ordering::Release);
+            self.credit(e.bytes);
             held.push(RecalledObject {
                 ino: *ino,
                 entry: Some(Arc::clone(e)),
             });
-            true
+            false
         });
         if !held.is_empty() && self.channel_alive.load(Ordering::Acquire) {
             self.release_retired(held).await;
         }
-        self.stop.store(true, Ordering::Relaxed);
-        self.drop_all();
     }
 
     /// The reader-side Token family snapshot.

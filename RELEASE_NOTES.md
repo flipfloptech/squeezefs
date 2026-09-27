@@ -287,6 +287,13 @@ mount is a read-token client whose metadata is exact at the next resolve
   join (one extra barriered cycle at a forest mount, ≈ 1 ms); the mount
   path's routed open already covered per volume, so a real mount never
   served the residue — the per-volume door and every offline verb did.
+- **A retired per-holder token plane serves nothing from the instant its
+  fence decides (the acceptance record's §4.4bn):** the §4.4bc fence
+  released the plane's tokens at the live holder and dropped its cache
+  only after the holder had answered, so for one wire round trip the
+  retired plane still answered a token the holder had retired; the
+  entries are dropped before the release travels now (the eviction path's
+  own order).
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

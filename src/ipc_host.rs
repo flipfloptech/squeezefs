@@ -1513,8 +1513,9 @@ impl IpcHost {
         Ok(host)
     }
 
-    /// The mount device the fd screen requires (`fstat(mountpoint)` once
-    /// the mount is live; tests inject).
+    /// The mount device the fd screen requires (read off
+    /// `/proc/self/mountinfo` once the mount is live — never a stat of our
+    /// own mount; tests inject).
     pub fn set_expected_st_dev(&self, st_dev: u64) {
         self.expected_st_dev.store(st_dev, Ordering::Relaxed);
     }

@@ -305,7 +305,13 @@ mount is a read-token client whose metadata is exact at the next resolve
   on every walk of the range — the storm contract's 1-in-20 at its
   reopen). Tree 0's `Leased` words seed every own region's leases with
   the frame stamps, before any flush pass runs; pinned deterministically
-  on a crash image taken under a held SMO mutex.
+  on a crash image taken under a held SMO mutex. The class was reachable
+  only under the `SQUEEZEFS_TEST_SYM_APPENDER_SLOTS` seam's in-process
+  multi-region shape (a harness fixture): a production manager's own
+  regions are region 0 alone, whose SMOs scope to ring 0 with or without
+  the seed, and a wire joiner's region is filled by its arm before its
+  first flush pass — the fix makes the RAM lease set consistent from the
+  first frame writer on every posture.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

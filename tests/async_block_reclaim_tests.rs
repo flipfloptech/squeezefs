@@ -733,13 +733,15 @@ async fn open_v3_meta(
         .expect("open v3 meta volume")
 }
 
-/// The journal-head physical offset (the crash_kill_tests helper, verbatim).
+/// The journal-head physical offset (the crash_kill_tests helper, verbatim):
+/// the ring's ONE logical→physical step — on the default forest volume
+/// appender 0's ring starts past its four page slots, so `journal.start`
+/// arithmetic would arm the torn write 16 KiB short of the head.
 fn journal_physical_offset(
     be: &squeezefs::meta_backend::kv::backend::KvMetaBackend,
     pos: u64,
 ) -> u64 {
-    let geo = *be.journal_ring().core().geometry();
-    be.superblock().journal.start + geo.page_index(pos) * 4096 + 24 + geo.in_page_off(pos)
+    be.journal_ring().physical_offset_of(pos)
 }
 
 /// Drive the REAL D0 fail-stop through the sanctioned `uring_fs` fault

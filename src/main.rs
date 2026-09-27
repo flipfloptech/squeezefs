@@ -6348,7 +6348,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .with_fold(fs_engine.defrag_fold_hook());
                 squeezefs::defrag::spawn_gauge_worker(fs_engine.router.clone());
-                let fabric = squeezefs::jobs::JobFabric::start(
+                // Started HELD (record §4.4bs): an adopted mover, fsck repair
+                // or kvmap sweep allocates and frees the moment a worker
+                // claims it, and the allocation lease's arm below seeds
+                // from a snapshot nothing may move; admission opens once
+                // the arm has landed (`open_admission`, below).
+                let fabric = squeezefs::jobs::JobFabric::start_held(
                     // Cloned since DLM S6: the membership plane arms after
                     // this block and needs the same routed set.
                     routed_meta_backend.clone(),
@@ -6675,6 +6680,10 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     adm.manager_endpoint
                 );
             } else {
+                // The arm absorbs the mount path's frees (the corpse
+                // sweeps' queued reclaims, a served free) and refuses only
+                // an ALLOCATION beside its seed; the job fabric — the one
+                // mount-time allocator — is still held (record §4.4bs).
                 let held = squeezefs::meta_backend::kv::alloc_lease::arm_symmetric_allocation(
                     &routed_meta_backend,
                     &fs_engine.router.backend_router.distinct_allocators(),
@@ -6708,6 +6717,14 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // release rides the finding-34 gate (the ino's fsync-grade
                 // flush) once the in-flight custody uses drained.
                 fs_engine.install_slot_custody_hooks();
+            }
+
+            // Every mount-time actor that allocates or frees has run: the
+            // job fabric's adopted jobs may claim now (record §4.4bs — held
+            // since its start so no mover / repair / kvmap sweep could move
+            // the allocator under the allocation lease's seed snapshot).
+            if let Some(fabric) = fs_engine.job_fabric.load().as_ref().as_ref() {
+                fabric.open_admission();
             }
 
             // KD-MW-16 (rung 10c, docs/design-mw-fleet-jobs.md §2): a

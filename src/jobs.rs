@@ -1364,6 +1364,13 @@ pub struct JobFabric {
     mover: Option<MoverCtx>,
     work: Notify,
     shutdown: AtomicBool,
+    /// **The mount-time admission hold** (record §4.4bs): a fabric started
+    /// held re-queues its adopted jobs but claims none until the mount
+    /// path opens admission — after the allocation lease's arm, whose seed
+    /// is a snapshot of an allocator nothing may move (an adopted mover,
+    /// fsck repair or kvmap sweep allocates and frees the moment a worker
+    /// claims it). Offline verbs and tests start open.
+    admission_held: AtomicBool,
     /// The OWNED worker pool (first-party cancel-gated set on the
     /// sqz-meta lanes): `shutdown_abrupt` cancels it — a cancelled
     /// worker's future is dropped at its next poll boundary, so its
@@ -1391,6 +1398,29 @@ impl JobFabric {
         default_throttle: u32,
         mover: Option<MoverCtx>,
     ) -> crate::error::Result<Arc<Self>> {
+        Self::start_with_admission(meta, workers, default_throttle, mover, false).await
+    }
+
+    /// [`Self::start`] with the mount-time admission hold ENGAGED (record
+    /// §4.4bs): adopted jobs are re-queued and the workers spawned, but no
+    /// job is claimed until [`Self::open_admission`] — the mount path's
+    /// act once the allocation lease has armed over a quiescent allocator.
+    pub async fn start_held(
+        meta: Arc<RoutedMetaBackend>,
+        workers: usize,
+        default_throttle: u32,
+        mover: Option<MoverCtx>,
+    ) -> crate::error::Result<Arc<Self>> {
+        Self::start_with_admission(meta, workers, default_throttle, mover, true).await
+    }
+
+    async fn start_with_admission(
+        meta: Arc<RoutedMetaBackend>,
+        workers: usize,
+        default_throttle: u32,
+        mover: Option<MoverCtx>,
+        held: bool,
+    ) -> crate::error::Result<Arc<Self>> {
         let fabric = Arc::new(Self {
             meta,
             jobs: parking_lot::Mutex::new(HashMap::new()),
@@ -1398,6 +1428,7 @@ impl JobFabric {
             workers: workers.max(1),
             mover,
             work: Notify::new(),
+            admission_held: AtomicBool::new(held),
             shutdown: AtomicBool::new(false),
             workers_set: squeezefs_ipc::sqz_taskset::OwnedSet::new(
                 "job_worker",
@@ -1455,6 +1486,19 @@ impl JobFabric {
         }
         fabric.work.notify_waiters();
         Ok(fabric)
+    }
+
+    /// Open the mount-time admission hold ([`Self::start_held`]): every
+    /// Queued job becomes claimable and the workers are woken. Idempotent.
+    pub fn open_admission(&self) {
+        if self.admission_held.swap(false, Ordering::AcqRel) {
+            self.work.notify_waiters();
+        }
+    }
+
+    /// The mount-time admission hold is engaged (the contracts' face).
+    pub fn admission_held(&self) -> bool {
+        self.admission_held.load(Ordering::Acquire)
     }
 
     /// Submit a job: durable record first (whole-tx), then enqueue.
@@ -1842,6 +1886,9 @@ impl JobFabric {
     /// coordinator-local; a remote "completion" without it would be a
     /// lie). The local pool claims everything.
     pub(crate) fn claim_next(&self, for_wire: bool) -> Option<(String, Arc<JobCtl>)> {
+        if self.admission_held.load(Ordering::Acquire) {
+            return None;
+        }
         let jobs = self.jobs.lock();
         for (id, ctl) in jobs.iter() {
             if (for_wire && !ctl.job_type.wire_executable())

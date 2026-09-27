@@ -2939,9 +2939,10 @@ pub async fn arm_symmetric_allocation(
         // allocator holds live that the bitmap reads CLEAR would be re-
         // granted, so the arm refuses loud rather than allocate beside it.
         // The snapshot is 1 bit per block below the cursor (Issue 29a). The
-        // arm runs before FUSE serves (the mount path), so it is quiescent
-        // — and that is CHECKED, not assumed (Issue 29b): a second snapshot
-        // after the hold must equal the first.
+        // arm runs before FUSE serves (the mount path), so nothing ALLOCATES
+        // beside it — and that is CHECKED, not assumed (Issue 29b): a second
+        // snapshot after the hold may differ from the first only by FREES
+        // (record §4.4bs, below).
         let derived = alloc.derived_allocation_snapshot();
         // The seed's structural guard (review round 3, Issue 27): the
         // derived state is the mount-time by-block seed's — on a forest
@@ -3004,21 +3005,51 @@ pub async fn arm_symmetric_allocation(
         if park_ms > 0 {
             squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(park_ms)).await;
         }
+        // The second snapshot, judged by DIRECTION (record §4.4bs). The
+        // mount path's terminal frees ride the background reclaim queue —
+        // the corpse sweep's, a recovered slot's sweep, a joiner's shipped
+        // free served at a same-identity successor whose listener stands
+        // from rung 7 — and land at the worker's cadence, so a free INSIDE
+        // this window is a legal schedule the arm ABSORBS: a block SET at
+        // the first snapshot and free-listed at the second is cleared in
+        // the holding with its delta journaled (the terminal free's own
+        // CLEAR, `note_finish_free`; a free that landed after the hold
+        // registered already cleared it through `publish_free_list`, and
+        // the call is idempotent). The LOSS direction — the dense cursor
+        // raised, or a free-listed block MINTED — is an allocation beside
+        // the seed and refuses loud: the bitmap would read a live block
+        // CLEAR. Before this law any movement refused ("moved during the
+        // arm"), which made a swept corpse's frees a mount refusal on
+        // file-backed data volumes (fstests generic/590 after 551).
         let after = alloc.derived_allocation_snapshot();
-        if after != derived {
+        let minted: Vec<u64> = derived
+            .free
+            .iter()
+            .copied()
+            .filter(|b| after.is_set(*b))
+            .collect();
+        if after.highest != derived.highest || !minted.is_empty() {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the allocator \
-                 moved during the arm (cursor {} → {}, {} → {} set) — the seed is a snapshot \
-                 taken before FUSE serves and nothing may allocate or free beside it; refusing \
-                 to arm on a torn snapshot",
+                 ALLOCATED during the arm (cursor {} → {}, {} free-listed block(s) minted, \
+                 first: {:?}) — the seed is a snapshot taken before FUSE serves and nothing may \
+                 allocate beside it (frees are absorbed); refusing to arm on a torn snapshot",
                 alloc.volume_id(),
                 derived.highest,
                 after.highest,
-                derived.population(),
-                after.population()
+                minted.len(),
+                minted.first()
             )));
         }
-        let loss: Vec<u64> = seed().filter(|b| !holding.bitmap.is_set(*b)).collect();
+        // The frees that landed inside the window: SET at the first
+        // snapshot, free-listed at the second (ascending — `set_blocks`
+        // walks the cursor). A free that landed after the hold registered
+        // already CLEARED its bit through `publish_free_list`, so the loss
+        // check below must not read it as a live block the bitmap lost.
+        let freed: Vec<u64> = derived.set_blocks().filter(|b| !after.is_set(*b)).collect();
+        let loss: Vec<u64> = seed()
+            .filter(|b| !holding.bitmap.is_set(*b) && freed.binary_search(b).is_err())
+            .collect();
         if !loss.is_empty() {
             let report = crate::data_alloc_bitmap::DriftReport {
                 loss: loss.clone(),
@@ -3034,6 +3065,25 @@ pub async fn arm_symmetric_allocation(
                 loss.len(),
                 loss.first()
             )));
+        }
+        // Absorb the window's frees: a bit still SET (the free landed
+        // before the hold registered — the seed wrote it SET) is cleared
+        // with its delta journaled; one already CLEAR answers `false`.
+        let cleared_here = freed
+            .iter()
+            .filter(|b| holding.note_finish_free(**b))
+            .count();
+        if !freed.is_empty() {
+            crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_ARM_ABSORBED_FREES
+                .fetch_add(freed.len() as u64, Ordering::Relaxed);
+            log::info!(
+                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): {} block(s) freed \
+                 beside the arm — absorbed ({cleared_here} cleared here with their deltas \
+                 journaled, the rest by their own finish_free under the registered holding; \
+                 data_alloc_bitmap_arm_absorbed_frees)",
+                alloc.volume_id(),
+                freed.len()
+            );
         }
         // The oracle's LEAK half at the (re-)hold (PR 10; §5.5.1 / §5.8.5):
         // a SET bit that nothing references (derived-live ∪ durable) and
@@ -3111,9 +3161,14 @@ pub async fn arm_symmetric_allocation(
         // The bitmap IS the free list from here: the local list's blocks
         // read CLEAR in the bitmap and return through carves; the flat
         // free-list-first pass is gated on the armed allocator.
-        let drained = alloc.drain_free_list_into_grants();
+        let mut drained = alloc.drain_free_list_into_grants();
         let writer = crate::meta_ship::manager::wire_writer_name(&me.into());
         alloc.install_block_grant_arm(vol_tag, holder_block_grant_sink(vol0, vol_tag, writer));
+        // A free landing between the drain and the install cleared its bit
+        // (the holding is registered) and still reached the local list;
+        // the armed allocator never reads that list, so the entry is only
+        // tidied here.
+        drained += alloc.drain_free_list_into_grants();
         log::info!(
             "symmetric allocation arm: data volume '{}' — {} derived-live block(s) ({} durably \
              referenced) seeded/verified SET, {drained} free-listed block(s) drained into the \

@@ -8699,19 +8699,7 @@ impl DataRouter {
     /// its references (counted, one WARN) and retried by the next mount.
     /// Returns the number of corpses destroyed.
     pub async fn sweep_unlinked_corpses(&self) -> Result<u64> {
-        let n = self.sweep_corpses_in(None).await?;
-        if n > 0 {
-            // "Blocks freed" is literal at this return (record §4.4bs):
-            // the destroys' terminal frees ride the background reclaim
-            // queue, whose `finish_free` lands at the worker's cadence,
-            // and the allocation lease's arm — next in the mount path —
-            // seeds its bitmap from a snapshot of this allocator and
-            // refuses a mount whose snapshot moved under the hold. The
-            // queue is drained here, before FUSE serves, so the arm reads
-            // a quiescent allocator.
-            self.backend_router.reclaim_drain().await;
-        }
-        Ok(n)
+        self.sweep_corpses_in(None).await
     }
 
     /// **The recovery's corpse sweep** (acceptance record §7 item 19):

@@ -14530,6 +14530,12 @@ impl SqueezefsFilesystem {
                         "data_alloc_bitmap_leaks_released".into(),
                         load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_LEAKS_RELEASED),
                     );
+                    // Record §4.4bs: frees that landed between the arm's
+                    // derived snapshot and its hold, cleared by the arm.
+                    metrics.insert(
+                        "data_alloc_bitmap_arm_absorbed_frees".into(),
+                        load(&crate::data_alloc_bitmap::DATA_ALLOC_BITMAP_ARM_ABSORBED_FREES),
+                    );
                     // PR 12b: candidates left SET because another appender
                     // of the set was LIVE at the re-hold (a live joiner's
                     // window reads like a dead incarnation's remainder).

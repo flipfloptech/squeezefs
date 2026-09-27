@@ -3011,8 +3011,8 @@ pub async fn arm_symmetric_allocation(
         // free served at a same-identity successor whose listener stands
         // from rung 7 — and land at the worker's cadence, so a free INSIDE
         // this window is a legal schedule the arm ABSORBS: a block SET at
-        // the first snapshot and free-listed at the second is cleared in
-        // the holding with its delta journaled (the terminal free's own
+        // the first snapshot that the allocator now free-lists is cleared
+        // in the holding with its delta journaled (the terminal free's own
         // CLEAR, `note_finish_free`; a free that landed after the hold
         // registered already cleared it through `publish_free_list`, and
         // the call is idempotent). The LOSS direction — the dense cursor
@@ -3021,35 +3021,71 @@ pub async fn arm_symmetric_allocation(
         // CLEAR. Before this law any movement refused ("moved during the
         // arm"), which made a swept corpse's frees a mount refusal on
         // file-backed data volumes (fstests generic/590 after 551).
+        //
+        // The verdict reads the ALLOCATOR's own witnesses at verdict time,
+        // never free-list membership at two instants (review round 2,
+        // Issue 6): the snapshot's list walk is not atomic, a free clears
+        // its bit BEFORE it inserts into the list (`publish_free_list`),
+        // and the discard-elision trim claims free-listed blocks out of the
+        // list for one device command without minting them — so a mint is
+        // a block off the list WITH a refcount, a loss is a CLEAR bit the
+        // allocator still holds LIVE (off the list, not in flight, not in
+        // grace, not quarantined), and a non-empty verdict is re-read once
+        // after a yield (the clear → insert gap has no guard).
         let after = alloc.derived_allocation_snapshot();
-        let minted: Vec<u64> = derived
-            .free
-            .iter()
-            .copied()
-            .filter(|b| after.is_set(*b))
-            .collect();
-        if after.highest != derived.highest || !minted.is_empty() {
+        if after.highest != derived.highest {
             return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                 "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the allocator \
-                 ALLOCATED during the arm (cursor {} → {}, {} free-listed block(s) minted, \
-                 first: {:?}) — the seed is a snapshot taken before FUSE serves and nothing may \
-                 allocate beside it (frees are absorbed); refusing to arm on a torn snapshot",
+                 ALLOCATED during the arm (cursor {} → {}) — the seed is a snapshot taken \
+                 before FUSE serves and nothing may allocate beside it (frees are absorbed); \
+                 refusing to arm on a torn snapshot",
                 alloc.volume_id(),
                 derived.highest,
-                after.highest,
+                after.highest
+            )));
+        }
+        // Test seam (record §4.4bs, review round 2): park between the
+        // second snapshot and the verdict so a free lands in THAT gap.
+        let verdict_park_ms: u64 =
+            crate::env_knobs::int_knob("SQUEEZEFS_TEST_ALLOC_ARM_VERDICT_HOLD_MS", 0);
+        if verdict_park_ms > 0 {
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(verdict_park_ms)).await;
+        }
+        let verdict = || {
+            let minted: Vec<u64> = derived
+                .free
+                .iter()
+                .copied()
+                .filter(|b| !alloc.free_list_contains(*b) && alloc.refcount(b * chunk).is_some())
+                .collect();
+            let loss: Vec<u64> = seed()
+                .filter(|b| {
+                    let off = b * chunk;
+                    !holding.bitmap.is_set(*b)
+                        && !alloc.free_list_contains(*b)
+                        && !alloc.inflight_contains(off)
+                        && !alloc.grace_holds(off)
+                        && !alloc.is_quarantined(off)
+                })
+                .collect();
+            (minted, loss)
+        };
+        let (mut minted, mut loss) = verdict();
+        if !minted.is_empty() || !loss.is_empty() {
+            squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(5)).await;
+            (minted, loss) = verdict();
+        }
+        if !minted.is_empty() {
+            return Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                "symmetric allocation arm: data volume '{}' ({vol_tag:#018x}): the allocator \
+                 ALLOCATED during the arm ({} free-listed block(s) minted, first: {:?}) — the \
+                 seed is a snapshot taken before FUSE serves and nothing may allocate beside \
+                 it (frees are absorbed); refusing to arm on a torn snapshot",
+                alloc.volume_id(),
                 minted.len(),
                 minted.first()
             )));
         }
-        // The frees that landed inside the window: SET at the first
-        // snapshot, free-listed at the second (ascending — `set_blocks`
-        // walks the cursor). A free that landed after the hold registered
-        // already CLEARED its bit through `publish_free_list`, so the loss
-        // check below must not read it as a live block the bitmap lost.
-        let freed: Vec<u64> = derived.set_blocks().filter(|b| !after.is_set(*b)).collect();
-        let loss: Vec<u64> = seed()
-            .filter(|b| !holding.bitmap.is_set(*b) && freed.binary_search(b).is_err())
-            .collect();
         if !loss.is_empty() {
             let report = crate::data_alloc_bitmap::DriftReport {
                 loss: loss.clone(),
@@ -3066,9 +3102,16 @@ pub async fn arm_symmetric_allocation(
                 loss.first()
             )));
         }
-        // Absorb the window's frees: a bit still SET (the free landed
+        // Absorb the window's frees: every block the seed holds SET that
+        // the allocator now free-lists. A bit still SET (the free landed
         // before the hold registered — the seed wrote it SET) is cleared
-        // with its delta journaled; one already CLEAR answers `false`.
+        // here with its delta journaled; one the free already cleared under
+        // the registered holding answers `false`. Both classes count on the
+        // gauge — they are the frees the arm absorbed.
+        let freed: Vec<u64> = derived
+            .set_blocks()
+            .filter(|b| alloc.free_list_contains(*b))
+            .collect();
         let cleared_here = freed
             .iter()
             .filter(|b| holding.note_finish_free(**b))

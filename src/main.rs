@@ -6238,6 +6238,12 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // co-writer's writable-volume filter yields nothing; a partial
             // authority sweeps exactly the volumes it appends to.
             if !reader_mount {
+                // The debt drainer's trim venue is HELD until admission
+                // opens (record §4.4bs, review round 2): the sweep's
+                // elided frees on a block device would otherwise arm the
+                // idle venue, whose claim windows take free-listed blocks
+                // off the list under the allocation arm's verdict.
+                squeezefs::block_reclaim::hold_trim_venue();
                 match fs_engine.router.sweep_unlinked_corpses().await {
                     Ok(0) => {}
                     Ok(n) => log::info!(
@@ -6592,15 +6598,6 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            // Rung 17 (KD-MW-8): the AUTHORITY's extent ASSEMBLER — the
-            // production merge/flush executors over this mount's own
-            // write path (sub-block-shared blocks' extents ship here and
-            // the authority publishes once, as the single publisher).
-            // Installed only on the authority posture; the mw disarm
-            // uninstalls them beside the free/harvest executors.
-            if multi_writer_arm.is_some() {
-                fs_engine.install_extent_assembler();
-            }
             // Symmetric PR 13b: a colleague's served record verb / layout
             // publish of a file in a slot THIS mount leases invalidates
             // this daemon's own caches of the object (the router's RAM
@@ -6725,6 +6722,20 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // the allocator under the allocation lease's seed snapshot).
             if let Some(fabric) = fs_engine.job_fabric.load().as_ref().as_ref() {
                 fabric.open_admission();
+            }
+            squeezefs::block_reclaim::release_trim_venue();
+
+            // Rung 17 (KD-MW-8): the AUTHORITY's extent ASSEMBLER — the
+            // production merge/flush executors over this mount's own
+            // write path (sub-block-shared blocks' extents ship here and
+            // the authority publishes once, as the single publisher).
+            // Installed only on the authority posture; the mw disarm
+            // uninstalls them beside the free/harvest executors. AFTER the
+            // arm (record §4.4bs, review round 2): a shipped extent's
+            // flush mints on this allocator, and nothing needs the
+            // assembler before the mount serves.
+            if multi_writer_arm.is_some() {
+                fs_engine.install_extent_assembler();
             }
 
             // KD-MW-16 (rung 10c, docs/design-mw-fleet-jobs.md §2): a

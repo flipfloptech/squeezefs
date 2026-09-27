@@ -467,6 +467,32 @@ pub struct DebtDrainer {
 /// Idle-confirm horizon in 50 ms manners ticks (see `quiet_ticks`).
 const IDLE_CONFIRM_TICKS: u64 = 20;
 
+/// The mount-time HOLD on the debt drainer's trim venue (record §4.4bs,
+/// review round 2): a trim claims free-listed blocks out of the list for
+/// one device command without minting them, and the allocation lease's arm
+/// judges its seed against the allocator's witnesses — so the idle venue,
+/// which engages one quiet second after the corpse sweep's elided frees,
+/// is held until the mount path opens admission (`release_trim_venue`,
+/// beside the job fabric's `open_admission`). The fstrim / defrag verb's
+/// direct drain is a job and rides the fabric's hold.
+static TRIM_VENUE_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Hold the debt drainer's idle / pressure venues (the mount path, before
+/// the corpse sweep). The worker keeps ticking and defers every batch.
+pub fn hold_trim_venue() {
+    TRIM_VENUE_HELD.store(true, Ordering::Release);
+}
+
+/// Release the mount-time hold; a parked drainer is woken to re-evaluate.
+pub fn release_trim_venue() {
+    TRIM_VENUE_HELD.store(false, Ordering::Release);
+}
+
+/// `true` while the mount-time hold stands.
+pub fn trim_venue_held() -> bool {
+    TRIM_VENUE_HELD.load(Ordering::Acquire)
+}
+
 impl DebtDrainer {
     pub fn new(reclaim: Arc<ReclaimQueue>) -> Arc<Self> {
         let batch_blocks = reclaim.batch_blocks;
@@ -543,12 +569,19 @@ impl DebtDrainer {
                     let mut reclaimed_blocks = 0u64;
                     let mut deferred_any = false;
                     let fg = d.must_defer();
+                    // The mount-time hold (record §4.4bs): no claim window
+                    // opens before the allocation arm has judged its seed.
+                    let held = trim_venue_held();
                     for (device_path, allocator) in targets {
                         let debt = allocator.elided_debt_bytes_local();
                         if debt == 0 {
                             continue;
                         }
                         outstanding += debt;
+                        if held {
+                            deferred_any = true;
+                            continue;
+                        }
                         let within = debt_within_watermark(debt, allocator.virgin_bytes());
                         if fg && within {
                             deferred_any = true;

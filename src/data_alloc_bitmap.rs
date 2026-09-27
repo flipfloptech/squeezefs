@@ -1011,15 +1011,16 @@ pub static DATA_ALLOC_BITMAP_LEAKS_ADOPTED: AtomicU64 = AtomicU64::new(0);
 /// member inside D2's trust boundary.
 pub static DATA_ALLOC_BITMAP_DECLS_REJECTED: AtomicU64 = AtomicU64::new(0);
 
-/// `data_alloc_bitmap_arm_absorbed_frees` — blocks a terminal free landed
-/// on BETWEEN the arm's two snapshots of the allocator (record §4.4bs):
+/// `data_alloc_bitmap_arm_absorbed_frees` — blocks the arm's seed held SET
+/// that the allocator FREE-LISTED by the arm's verdict (record §4.4bs):
 /// the mount path's frees ride the background reclaim queue (the corpse
 /// sweep's, a recovered slot's sweep, a joiner's shipped free served at a
-/// successor), so the arm absorbs the LEAK direction — a bit the seed
-/// wrote SET is cleared here with its delta journaled, one the free
-/// already cleared under the registered holding is left as it is — and
-/// refuses only the LOSS direction (an allocation beside its seed). 0 on
-/// an idle mount; ≈ the swept corpses' blocks after a crash left one.
+/// successor), so the arm absorbs the LEAK direction — BOTH classes count:
+/// a bit the seed wrote SET is cleared by the arm with its delta journaled,
+/// one the free already cleared under the registered holding is left as it
+/// is (the log line splits them) — and refuses only the LOSS direction (an
+/// allocation beside its seed). 0 on an idle mount; ≈ the swept corpses'
+/// blocks after a crash left one.
 pub static DATA_ALLOC_BITMAP_ARM_ABSORBED_FREES: AtomicU64 = AtomicU64::new(0);
 
 /// Count a drift verdict's loss half on the process gauge; returns it.

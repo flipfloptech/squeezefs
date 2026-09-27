@@ -380,15 +380,25 @@ impl SmoContext {
     /// tail-pinning node needs at the next cycle's start).
     ///
     /// **The keep's bound is a census here, never a refusal** (review fix
-    /// round 1, Issue 5 → §4.4bi): the keep holds the widest SMO entry the
-    /// tail-pinning node can need (`CoreGeometry::smo_keep` — a quarter of
-    /// the class). An entry wider than the keep is a split of a leaf
-    /// whose frozen delta outgrew ≈ 860 node capacities; it is admitted
-    /// like any other (exempt, or keeping) — the law degrades to one
-    /// deferred cycle for such a node, never to a refused checkpoint — and
-    /// counted on `meta_kv_smo_entries_over_keep`, loud once. The first
-    /// rail refused it `Corrupt`, and a 62-part split (a 2.3 MiB fold
-    /// under a fill storm) failed every later checkpoint of the volume.
+    /// round 1, Issue 5 → §4.4bi; the bound stated in fix round 2, Issue
+    /// 12): the keep holds the widest SMO entry the tail-pinning node can
+    /// need (`CoreGeometry::smo_keep` — a quarter of the class), and what
+    /// makes a wider entry UNREACHABLE is the fold's arithmetic, not a
+    /// refusal: a fold partitions one node's log (≤ `fold_capacity`) plus
+    /// its frozen delta, whose records are journaled and UNCOVERED — the
+    /// node's dirty floor keeps the tail below them, so they lie inside
+    /// the ring window and `delta ≤ ring_len`; `parts ≤ ⌈(fold_capacity +
+    /// ring_len) / split_part_capacity⌉`, one interior pointer and one
+    /// alloc record each, and that entry fits `smo_keep − max_pad` at
+    /// every geometry the format admits (tied in `derivation_sweep_tests`
+    /// against the production rings and node sizes). An entry past the
+    /// keep is admitted like any other (exempt, or keeping) and counted on
+    /// `meta_kv_smo_entries_over_keep`, loud once — the honest worst case
+    /// of such an entry on the ring's OLDEST node would be a refusal every
+    /// cycle (the tail pinned, the class never freed: §4.4be's deadlock),
+    /// and the bound above is what excludes it. The first rail refused a
+    /// 62-part split's entry `Corrupt` (a 2.3 MiB fold under a fill storm)
+    /// and failed every later checkpoint of the volume.
     fn admit_smo_entry(&self, len: u64) -> Result<Option<super::journal_core::Admission>, KvError> {
         let ring = self.smo_ring().ok_or_else(|| {
             KvError::Corrupt("an SMO entry admission without a journal ring".to_string())
@@ -399,8 +409,9 @@ impl SmoContext {
             if seen == 0 {
                 log::warn!(
                     "an SMO entry of {len} B (+ {} B pad slack) exceeds the checkpoint class's \
-                     kept claim of {} B — a split wider than the keep's ≈ 860 parts; admitted \
-                     without the keep's guarantee (one deferred cycle at worst, PR 14 §4.4bi)",
+                     kept claim of {} B — a split wider than the fold's bound on this ring \
+                     (PR 14 §4.4bi); admitted without the keep's guarantee: on the ring's \
+                     oldest node such an entry could be refused every cycle",
                     geometry.max_pad(),
                     geometry.smo_keep()
                 );

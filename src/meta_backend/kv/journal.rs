@@ -218,7 +218,10 @@ pub fn ring_max_pad_for(path: &Path) -> u64 {
 /// (`smo_replace` reserves per record), so the reserve is
 /// `reserve / page_data_len` checkpoint-class SMO records per pass before
 /// the deferral class engages — 64 at the floor (256 KiB ÷ 4,072 B), 128
-/// on the 32 MiB ring (512 KiB); on a 512-grain device
+/// on the 32 MiB ring (512 KiB) — of which the NON-EXEMPT wave takes
+/// three quarters (48 / 96): every admission but the ring's oldest node
+/// keeps `smo_keep` = a quarter of the class (`CoreGeometry::smo_keep`,
+/// PR 14 §4.4be / §4.4bi); on a 512-grain device
 /// `reserve / (entry + max_pad)` ≈ 256 KiB ÷ (≈ 230 + 533 B) ≈ 340. The
 /// bytes are kept as the derivation (the record cost is the law's input;
 /// the grain multiplies it into a window count), and the economy that

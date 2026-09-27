@@ -178,11 +178,17 @@ impl CoreGeometry {
     /// not the node: a leaf whose delta grew to dozens of node capacities
     /// under a storm splits into that many parts (a 2.3 MiB fold → 62
     /// parts → 4.6 KiB, past the page the first keep held, §4.4bi). The
-    /// keep is a QUARTER of the class (64 KiB at the 256 KiB floor —
-    /// ≈ 860 parts, a ≈ 50 MiB overlay on one leaf; 128 KiB on the 32 MiB
-    /// ring), floored at one page: three quarters of the class stay the
-    /// non-exempt wave's, and an entry wider than the keep is admitted
-    /// without its guarantee and counted, never refused.
+    /// delta's records are journaled and uncovered (the node's dirty
+    /// floor keeps the tail below them), so `delta ≤ ring_len` and
+    /// `parts ≤ ⌈(fold_capacity + ring_len) / split_part_capacity⌉` — the
+    /// REAL bound (fix round 2, Issue 12). The keep is a QUARTER of the
+    /// class (`reserve = max(256 KiB, ring/64)`: 64 KiB at the floor,
+    /// 128 KiB on the 32 MiB ring), floored at one page, and it holds
+    /// that widest entry at every geometry the format admits (nodes
+    /// 64 KiB–1 MiB, rings from the 512 KiB floor up — tied in
+    /// `derivation_sweep_tests`): three quarters of the class stay the
+    /// non-exempt wave's, and an entry wider than the keep — unreachable
+    /// by the arithmetic — is admitted without its guarantee and counted.
     pub fn smo_keep(&self) -> u64 {
         (self.reserve_bytes / 4).max(self.page_data_len) + self.max_pad()
     }

@@ -4498,23 +4498,64 @@ fn the_checkpoint_class_keep_holds_every_smo_entry_the_tree_builds() {
             "grain {}: the root collapse's entry",
             geo.grain
         );
-        // The storm's split (§4.4bi: a 2.3 MiB fold → 62 parts) and the
-        // slack in PARTS beyond it: the keep holds a split ≥ 512 parts
-        // wide at every production geometry.
+        // The storm's split (§4.4bi: a 2.3 MiB fold → 62 parts) fits.
         assert!(
             fits(split_entry(62)),
             "grain {}: the 62-part storm split's entry ({} B) fits the keep ({keep})",
             geo.grain,
             split_entry(62)
         );
-        let mut parts = 62usize;
-        while split_entry_len(parts + 1).is_some_and(fits) {
-            parts += 1;
+    }
+    // **The REAL bound** (fix round 2, Issue 12): a fold partitions one
+    // node's log (≤ `fold_capacity`) plus its frozen delta, whose records
+    // are journaled and UNCOVERED (the node's dirty floor keeps the tail
+    // below them) — inside the ring window, so `delta ≤ ring_len` and
+    // `parts ≤ ⌈(fold_capacity + ring_len) / split_part_capacity⌉`. That
+    // widest split's entry fits `smo_keep − max_pad` AND the journal's own
+    // `MAX_ENTRY_LEN` at every geometry the DEFAULT derivation produces:
+    // rings from the joiner floor (`SYM_RING_FLOOR_BYTES`) through the
+    // `clamp(volume/64, 8 MiB, 32 MiB)` range, nodes 64 KiB–1 MiB, both
+    // grains. An operator's `--meta-journal-mb` override past that range
+    // is stated on the record's board (§4.4bi), not tied here.
+    use squeezefs::meta_backend::kv::appender::SYM_RING_FLOOR_BYTES;
+    use squeezefs::meta_backend::kv::journal::MAX_ENTRY_LEN;
+    use squeezefs::meta_backend::kv::node::NodeLayout;
+    use squeezefs::meta_backend::kv::superblock::{JOURNAL_RING_MAX, JOURNAL_RING_MIN};
+    let rings = [
+        SYM_RING_FLOOR_BYTES,
+        JOURNAL_RING_MIN,
+        16 * 1024 * 1024,
+        24 * 1024 * 1024,
+        JOURNAL_RING_MAX,
+    ];
+    let nodes = [64usize, 128, 256, 512, 1024].map(|kib| kib * 1024);
+    for ring_len in rings {
+        for node_size in nodes {
+            let layout = NodeLayout::new(node_size).expect("an admitted node size");
+            let parts_max =
+                (layout.fold_capacity() + ring_len as usize).div_ceil(layout.split_part_capacity());
+            let entry = split_entry_len(parts_max);
+            for grain in [512u64, 4096] {
+                let geo = CoreGeometry {
+                    page_data_len: JOURNAL_PAGE_DATA_LEN,
+                    pages: ring_len / 4096,
+                    reserve_bytes: checkpoint_reserve_bytes(ring_len),
+                    grain,
+                };
+                let entry = entry.unwrap_or_else(|| {
+                    panic!(
+                        "ring {ring_len} / node {node_size}: the widest split ({parts_max} \
+                         parts) exceeds MAX_ENTRY_LEN ({MAX_ENTRY_LEN}) — an SMO the journal \
+                         refuses"
+                    )
+                });
+                assert!(
+                    entry + geo.max_pad() <= geo.smo_keep(),
+                    "ring {ring_len} / node {node_size} / grain {grain}: the widest split's \
+                     entry ({parts_max} parts, {entry} B) + the pad slack exceeds the keep ({})",
+                    geo.smo_keep()
+                );
+            }
         }
-        assert!(
-            parts >= 512,
-            "grain {}: the keep holds a {parts}-way split's entry — at least 512 parts",
-            geo.grain
-        );
     }
 }

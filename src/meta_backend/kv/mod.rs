@@ -231,10 +231,12 @@ pub static META_KV_FOREST_SLOT_TREES_MINTED: AtomicU64 = AtomicU64::new(0);
 pub static META_KV_FOREST_ROOT_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 
 /// SMO entries admitted WIDER than the checkpoint class's keep (PR 14 fix
-/// round 1, §4.4bi): a split of a leaf whose frozen delta outgrew the ≈ 860
-/// node capacities a quarter of the class holds — admitted without the
-/// keep's guarantee (one deferred cycle at worst), loud once. ≈ 0 on every
-/// healthy mount. Surfaced as `meta_kv_smo_entries_over_keep`.
+/// round 1, §4.4bi): unreachable by the fold's arithmetic at every default
+/// geometry (a leaf's uncovered records fit the ring window, so a split has
+/// at most `(fold_capacity + ring_len) / split_part_capacity` parts, tied in
+/// `derivation_sweep_tests`) — admitted without the keep's guarantee, loud
+/// once; on the ring's oldest node such an entry could be refused every
+/// cycle. 0 on every healthy mount. Surfaced as `meta_kv_smo_entries_over_keep`.
 pub static META_KV_SMO_ENTRIES_OVER_KEEP: AtomicU64 = AtomicU64::new(0);
 
 /// Region 0's pre-barrier page writes (PR 14 fix round 1, §4.4bh): the

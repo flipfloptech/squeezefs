@@ -256,9 +256,14 @@ mount is a read-token client whose metadata is exact at the next resolve
   rail refused a wider one loud; a leaf whose in-RAM overlay grew to dozens
   of node capacities while a full heap deferred its compaction split into
   62 parts, the refusal failed every later checkpoint, and a full volume's
-  deletes stayed at `ENOSPC`. The keep is a quarter of the class now
-  (≈ 860 parts at the floor) and an entry past it is admitted and counted
-  (`meta_kv_smo_entries_over_keep`), never refused.
+  deletes stayed at `ENOSPC`. The keep is a quarter of the class now and
+  holds the widest split a fold can build (a leaf's uncovered records fit
+  the journal ring, so a split has at most `(node + ring) / (¾ node)`
+  parts — 731 on the 32 MiB ring with 64 KiB nodes, ≈ 47 KiB against a
+  128 KiB keep) at every default geometry; an entry past it is admitted
+  and counted (`meta_kv_smo_entries_over_keep`), never refused. Three
+  quarters of the checkpoint class stay the ordinary flush wave's (48 of
+  64 padded records per pass at the floor, 96 of 128 on the 32 MiB ring).
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

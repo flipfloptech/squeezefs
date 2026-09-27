@@ -29,6 +29,8 @@
 //!
 //! Rounds: `SQUEEZEFS_WCE_CRASH_ROUNDS` (default 10).
 
+mod common;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -280,11 +282,7 @@ async fn kill9_mid_publish_window_soak() {
         let m2 = KvMetaBackend::open(&vol)
             .await
             .unwrap_or_else(|e| panic!("round {round}: second remount failed: {e}"));
-        assert_eq!(
-            m2.replay_stats().entries,
-            0,
-            "round {round}: a clean shutdown must leave an empty replay window"
-        );
+        common::sym::assert_clean_leave_window(&m2, &format!("round {round}"));
         let d2 = digest_backend(&m2).await.unwrap();
         assert_eq!(
             d1, d2,

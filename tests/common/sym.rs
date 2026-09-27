@@ -636,6 +636,39 @@ pub async fn shutdown(routed: &RoutedMetaBackend) {
     }
 }
 
+/// The replay window a CLEAN shutdown leaves behind, asserted on the
+/// mount that replayed it — the clean-unmount law in its exact form
+/// (design-symmetric-metadata §5.1.3; PR 14 fix round 3, class A): a
+/// flat (`--single-writer`) volume's window is EMPTY; a forest's — the
+/// default since PR 14, the mount ARMED — holds the armed region's ONE
+/// `Unleased` release batch, written after the leave's coverage verdict
+/// (tree-0 control records alone, barriered, root-free, replayed
+/// idempotently), so the window's CONTENT-record count reads 0 on both
+/// layouts. The count form alone (`entries == 1`) could not tell the
+/// leave's batch from one acked user transaction the final checkpoint
+/// never covered; the content count can.
+pub fn assert_clean_leave_window(
+    kv: &squeezefs::meta_backend::kv::backend::KvMetaBackend,
+    ctx: &str,
+) {
+    let stats = kv.replay_stats();
+    let want = u64::from(kv.superblock().symmetric_forest_stamped());
+    assert_eq!(
+        stats.entries, want,
+        "{ctx}: a clean shutdown leaves the leave's own window — empty on a flat volume, the \
+         armed region's ONE release entry on the forest (§5.1.3); got {stats:?}"
+    );
+    assert_eq!(
+        stats.content_records, 0,
+        "{ctx}: the window after a clean shutdown holds control records alone — a content \
+         record here is an acked transaction the final checkpoint never covered; got {stats:?}"
+    );
+    assert_eq!(
+        stats.dropped_torn, 0,
+        "{ctx}: a torn entry after a clean shutdown is the §10 corruption alert; got {stats:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The DATA rig: the routed set bound to a file-backed data volume through
 // a `DataRouter`, with PR 7's arm run (`arm_shared_refs`).

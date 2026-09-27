@@ -24,6 +24,8 @@
 //!
 //! Suite runs `--test-threads=1` (process-global stats + fault shim).
 
+mod common;
+
 use squeezefs::meta_backend::kv::backend::{
     test_conveyor_hold_release, KvMetaBackend, TEST_CONVEYOR_HOLD_PRE_DRAIN,
     TEST_CONVEYOR_HOLD_STAGE,
@@ -1105,11 +1107,7 @@ async fn acked_commits_survive_kill9_while_windows_overlap() {
         m1.shutdown().await.unwrap();
         drop(m1);
         let m2 = KvMetaBackend::open(&vol).await.unwrap();
-        assert_eq!(
-            m2.replay_stats().entries,
-            0,
-            "clean shutdown ⇒ empty replay window"
-        );
+        common::sym::assert_clean_leave_window(&m2, &format!("round {round}"));
         assert_eq!(digest_backend(&m2).await.unwrap(), d1, "replay idempotence");
         m2.shutdown().await.unwrap();
     }

@@ -30,6 +30,8 @@
 //!     produced, and the shape dead-generation reformat residue takes on
 //!     a coin flip) is never admitted and never fails the load.
 
+mod common;
+
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{format_v3, FormatV3Options, ROOT_INO};
 use squeezefs::meta_backend::kv::checkpoint::read_newest_ledger;
@@ -233,11 +235,7 @@ async fn node_seq_mints_stay_above_every_persisted_stamp_across_remount() {
     let mut violations: Vec<String> = Vec::new();
     for cycle in 0..4 {
         let re = KvMetaBackend::open(file.path()).await.expect("remount");
-        assert_eq!(
-            re.replay_stats().entries,
-            0,
-            "precondition: clean shutdown ⇒ empty replay window (cycle {cycle})"
-        );
+        common::sym::assert_clean_leave_window(&re, &format!("precondition, cycle {cycle}"));
         assert!(
             re.mounted_ledger().node_seq_watermark >= ceiling,
             "cycle {cycle}: the persisted mint watermark ({}) must cover every stamp \

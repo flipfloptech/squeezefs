@@ -224,6 +224,16 @@ pub struct KvReplayStats {
     pub dropped_torn: u64,
     /// Wall-clock replay time.
     pub replay_ms: u64,
+    /// Level-0 records of the CONTENT kinds (inode / dentry / xattr /
+    /// block-ref / block-map — `record::is_slot_tree_kind`) the window
+    /// held, whatever tree they routed to. The clean-unmount law's exact
+    /// form (design-symmetric-metadata §5.1.3): a flat volume's window is
+    /// EMPTY after a clean leave; a forest's holds the armed region's ONE
+    /// `Unleased` release batch — tree-0 control records alone — so this
+    /// reads 0 on both, and a nonzero value under `entries == 1` names an
+    /// acked user transaction the final checkpoint never covered, which
+    /// the entry count alone cannot tell from the leave's batch.
+    pub content_records: u64,
 }
 
 /// Consecutive journal-write failures that latch the volume failed
@@ -2925,6 +2935,15 @@ impl KvMetaBackend {
             entries: recovery.entries.len() as u64,
             dropped_torn: recovery.dropped_torn,
             replay_ms: t0.elapsed().as_millis() as u64,
+            content_records: recovery
+                .entries
+                .iter()
+                .flat_map(|e| e.records.iter())
+                .filter(|(tag, _)| {
+                    let (kind, level) = untag(*tag);
+                    level == 0 && super::record::is_slot_tree_kind(kind)
+                })
+                .count() as u64,
         };
 
         // K6b wiring: strict/deferred mode, the SMO context with the

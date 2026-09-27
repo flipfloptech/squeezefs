@@ -100,14 +100,14 @@ enum Commands {
         /// opt-out is `--single-writer`.
         #[arg(long)]
         multi_writer: bool,
-        /// Format the single-writer (unstamped, FLAT) class — the explicit
+        /// Format the single-writer (unstamped, flat) class — the explicit
         /// opt-out
         ///
-        /// Withholds the nine multi-writer incompat bits AND the symmetric
+        /// Withholds the nine multi-writer incompat bits and the symmetric
         /// forest (bit 17), producing the flat solo class: one writer, no
         /// readers, no joiners — readable by pre-multi-writer binaries,
         /// e.g. a recovery scratch volume. Since the symmetric default
-        /// flip (PR 14) this is the ONLY flat class a writer may mount;
+        /// flip (PR 14) this is the only flat class a writer may mount;
         /// repair/fsck verbs run against either class, so fixing a
         /// filesystem never requires it. Upgrade later with `squeezefs
         /// volume enable-multi-writer` then `enable-symmetric`. Conflicts
@@ -117,7 +117,7 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["multi_writer", "symmetric"])]
         single_writer: bool,
         /// Format the symmetric slot-tree forest (incompat bit 17) — the
-        /// DEFAULT since PR 14
+        /// default since PR 14
         ///
         /// Every metadata volume is built as one mixed-kind tree per
         /// routing slot with a control tree and an appender directory —
@@ -1474,7 +1474,7 @@ enum VolumeActions {
     /// slot, the hosting volume's durable id, tree 0's word on the slot
     /// (the leasing appender and the lease generation `g`), and the
     /// stripe count of a striped directory. Read-only; safe on a mounted
-    /// set (a live mountpoint answers with the CURRENT ino).
+    /// set (a live mountpoint answers with the current ino).
     Locate {
         /// Live mountpoint or sqmeta:// URI
         target: String,

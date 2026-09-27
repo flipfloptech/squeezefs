@@ -25,7 +25,7 @@ use squeezefs::meta_backend::kv::superblock::{
     FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST, MULTI_WRITER_FORMAT_BITS,
 };
 use squeezefs::meta_backend::{
-    open_routed_meta_set, open_routed_meta_set_read_only, plan_meta_slot_set,
+    open_routed_meta_set, open_routed_meta_set_read_only, plan_meta_slot_set, Metadata,
 };
 use std::path::{Path, PathBuf};
 
@@ -487,5 +487,57 @@ fn the_posture_knobs_are_retired_and_the_plane_knob_defaults_on() {
     assert!(
         lookup(&retired_admit).is_none(),
         "the conversion's admission is the verb's own RAII guard, never a knob"
+    );
+}
+
+/// **An offline probe's inode population counts every slot's durable
+/// cursor** (PR 14 review fix round 1 — the require-mount gate's `df` row,
+/// a regression of the branch's own §4.4bd): since a forest's ledger stamp
+/// carries no per-slot cursors, the open seeded the guest cells from OUR
+/// regions' pages and leases alone — a probe holds none, so `squeezefs df`
+/// (`live_inodes`, `statfs`'s `f_files`) read ONE inode on a volume whose
+/// mount had created forty (they minted into the rotor's guest keyspaces,
+/// the native watermark unmoved). Every `Live` page's checkpoint-time slot
+/// entries and tree 0's word for every slot seed the cells as floors on
+/// every posture now; the count is the §4.8 law's pessimistic progression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probes_inode_population_counts_the_rotors_guest_cursors() {
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamped = format_default(dir.path(), "df-probe").await;
+    let uris = vec![stamped.display().to_string()];
+    std::env::set_var("SQUEEZEFS_SYM_ALLOW_NON_PR", "1");
+    let writer = open_routed_meta_set(&uris)
+        .await
+        .expect("the default opens the armed forest");
+    std::env::remove_var("SQUEEZEFS_SYM_ALLOW_NON_PR");
+    for i in 0..40 {
+        writer
+            .create(1, &format!("f{i:03}"), libc::S_IFREG | 0o644, 1000, 1000)
+            .await
+            .expect("create");
+    }
+    let live_at_writer = writer.volumes[0].live_inodes();
+    assert!(
+        live_at_writer >= 40,
+        "the writer counts its own mints: {live_at_writer}"
+    );
+    writer.volumes[0]
+        .checkpoint_now()
+        .await
+        .expect("checkpoint");
+    shutdown(&writer).await;
+    drop(writer);
+    let probe = KvMetaBackend::open_probe(&stamped)
+        .await
+        .expect("the offline probe");
+    let live = probe.live_inodes();
+    assert!(
+        live >= 40,
+        "a probe counts the rotor's guest cursors — forty creates, {live} counted"
+    );
+    assert!(
+        live <= live_at_writer,
+        "…and never above the writer's own progression ({live_at_writer}): {live}"
     );
 }

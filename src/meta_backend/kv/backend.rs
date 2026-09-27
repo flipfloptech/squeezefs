@@ -3144,19 +3144,34 @@ impl KvMetaBackend {
                 );
             }
         }
-        // A forest's page-named slots: OUR regions' `Live` page entries
-        // name each held slot's cursor as of the last checkpoint (PR 14,
-        // §4.4bd — the ledger stamp carries none there). Seeded HERE, before
-        // the bring-up's join checkpoint rewrites the pages from the live
-        // cells: seeded at the lease arm's settle instead, that rewrite
-        // named every page-named slot at cursor 0, and a mount that died
-        // before its next page write left the successor minting from 2
-        // in slots the predecessor had filled (a colliding create over a
-        // live record — the crash matrix's recoverer row found it).
+        // A forest's slot cursors live with their LEASES (PR 14, §4.4bd —
+        // the ledger stamp carries none there): every `Live` page's slot
+        // entries name the lessee's cursors as of its last checkpoint, and
+        // tree 0's words name every slot's grant-time / release-time
+        // cursor. EVERY slot's durable cursor is seeded as a FLOOR here,
+        // whatever this open's posture and whoever leases the slot: OUR
+        // regions' cells are the mint sources the bring-up's join
+        // checkpoint rewrites the pages from (seeded at the lease arm's
+        // settle instead, that rewrite named every page-named slot at
+        // cursor 0, and a mount that died before its next page write left
+        // the successor minting from 2 in slots the predecessor had filled
+        // — a colliding create over a live record, the crash matrix's
+        // recoverer row); every OTHER slot's cell is the population
+        // `live_inodes` counts (`statfs`'s `f_files`, the offline `df`) —
+        // pessimistically, the §4.8 law: a probe holds no region and
+        // seeded NOTHING after §4.4bd, so `squeezefs df` read one inode on
+        // a volume whose mount had created a thousand (they minted into
+        // the rotor's guest keyspaces; the require-mount gate's `df` row,
+        // review fix round 1). A foreign-leased slot never mints here (the
+        // door refuses `SlotBusy`), and a first touch floors its cell from
+        // tree 0's word at the grant, so a stale foreign cell is never a
+        // mint source. Seeded HERE, before the bring-up's join checkpoint.
         be.snapshot_forest_slot_words().await?;
         if let Some(set) = be.appenders.as_ref() {
-            for r in set.own_regions() {
-                let page = r.page.lock().unwrap_or_else(|e| e.into_inner());
+            for e in super::appender::read_directory(&be.path, &be.sb).await? {
+                let Some(page) = e.page else {
+                    continue;
+                };
                 if page.state != super::appender::AppenderState::Live {
                     continue;
                 }
@@ -3174,15 +3189,11 @@ impl KvMetaBackend {
                     }
                 }
             }
-            // And tree 0's `Leased` words for OUR regions' slots — an
-            // overflow slot's cursor home (the cursor law's record).
-            let own: Vec<u32> = set.own_regions().map(|r| r.id).collect();
+            // And tree 0's word for every slot — an overflow slot's cursor
+            // home (the cursor law's record), an unleased slot's only one.
             if let Some(words) = be.forest_slot_words.get() {
                 for (fslot, w) in words {
-                    if w.cursor == 0
-                        || *fslot == super::record::NATIVE_FOREST_SLOT
-                        || !w.holder.is_some_and(|h| own.contains(&h))
-                    {
+                    if w.cursor == 0 || *fslot == super::record::NATIVE_FOREST_SLOT {
                         continue;
                     }
                     if let Ok(routing) = be.routing_slot_of_forest(*fslot) {

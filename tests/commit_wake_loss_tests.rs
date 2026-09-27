@@ -27,7 +27,7 @@
 //! the first N eventfd wake writes after arming the coalescer — the
 //! commit message stays queued and the worker's PollAdd never fires,
 //! the exact interleave of the field capture. Its scoped form
-//! `SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID=<tid>` strikes only the replies
+//! `SQUEEZEFS_TEST_DROP_COMMIT_WAKE_TID=<tid>` strikes only the replies
 //! to one thread's requests (the kernel's `fuse_in_header.pid`), so a
 //! desktop prober's request at the arm is never the victim.
 //!
@@ -206,7 +206,7 @@ impl Drop for Mount {
 /// Spawn the real daemon on the field venue (zc OFF — the fstests runner's
 /// default, the capture's posture) with the commit-wake drop seam loaded
 /// for `drop_n` wakes, SCOPED to the requests of thread `seam_tid` when
-/// one is named (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID`). Readiness is
+/// one is named (`SQUEEZEFS_TEST_DROP_COMMIT_WAKE_TID`). Readiness is
 /// read off the LOG ("transport armed for this session"), never off a
 /// `.stats` read: with the seam loaded the first over-uring reply's wake
 /// is the one that is dropped, and a probe read would be that reply —
@@ -226,7 +226,7 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, drop_n: u64, seam_tid: Optio
         .env("SQUEEZEFS_FUSE_ZC", "0")
         .env("SQUEEZEFS_TEST_DROP_COMMIT_WAKES", drop_n.to_string());
     if let Some(tid) = seam_tid {
-        cmd.env("SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID", tid.to_string());
+        cmd.env("SQUEEZEFS_TEST_DROP_COMMIT_WAKE_TID", tid.to_string());
     }
     let child = cmd
         // Per-request deliver/reply/commit tracing: when this suite fails

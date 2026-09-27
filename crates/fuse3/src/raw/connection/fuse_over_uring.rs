@@ -1706,7 +1706,7 @@ fn test_drop_commit_wake() -> bool {
         .is_ok()
 }
 
-/// The seam's SCOPED form (`SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID=<tid>`):
+/// The seam's SCOPED form (`SQUEEZEFS_TEST_DROP_COMMIT_WAKE_TID=<tid>`):
 /// the budget strikes only replies to requests the kernel attributes to
 /// this thread (`fuse_in_header.pid`). A desktop's volume monitor probes
 /// every new mount within milliseconds of the arm (`gvfsd-trash`: a root
@@ -1716,7 +1716,7 @@ fn test_drop_commit_wake() -> bool {
 fn test_drop_commit_wake_tid() -> Option<u32> {
     static TID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *TID.get_or_init(|| {
-        std::env::var("SQUEEZEFS_TEST_DROP_COMMIT_WAKES_TID")
+        std::env::var("SQUEEZEFS_TEST_DROP_COMMIT_WAKE_TID")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|t| *t != 0)

@@ -1727,3 +1727,113 @@ async fn clone_then_clip_and_clip_then_clone_yield_nested_same_off_windows() {
     assert_eq!(fx.read(s, 8 * KIB).await, pattern(161, 8 * KIB));
     fx.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Record §4.4bt: a growth swap racing a pack promotion of the same file
+// ---------------------------------------------------------------------------
+
+/// **The staged → striped growth transition releases the durable reference
+/// of a pack tenant a pressure promotion published UNDER it** (record
+/// §4.4bt — fstests generic/751's ENOSPC fill on the 1.3.0 release chain,
+/// whose scratch remount refused with 17 durably-referenced blocks CLEAR in
+/// the allocation bitmap; the offline fsck read 59 C8 findings, 16 of them
+/// `durable 1 vs derived 0`). A 1 MiB staged file is ring-resident; a
+/// write that grows it past one block enters the growth transition, DMAs
+/// its striped blocks and PARKS at the seam before its layout commit; the
+/// merge worker's pressure promotion of the same file — which takes only
+/// the `INODE_META_LOCKS` guard, never the block-0 guard the write holds —
+/// lands the file into the open pack and publishes `block_map[0] =
+/// tenant`; the write resumes. Its commit released the tenant's RAM
+/// reference off the RAM entry it read under the guard, but computed the
+/// swap's durable delta against the snapshot it took BEFORE the park
+/// (`block_map: None`), so the tenant's `−ref` was never written: the
+/// ledger kept a reference to a slot no layout named, the pack block's RAM
+/// count ran below its records, and the next mount's census seeded the
+/// block live while the bitmap read it free. Pinned: the file is striped
+/// with its bytes exact, the ring entry is gone, and the C8 oracle is
+/// clean — RED on the snapshot-delta build with exactly the tenant's
+/// record (`durable 1 vs derived 0`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_growth_swap_racing_a_pack_promotion_releases_the_tenants_durable_reference() {
+    let _g = serial().await;
+    let _l = arm_levers();
+    let dir = tempfile::tempdir().unwrap();
+    let (_meta, fx) = open_fresh(dir.path(), 1, 4 << 30, "growswap", ROOMY_RING).await;
+    const MIB: usize = 1024 * KIB;
+    let (ino, fid) = fx.staged_file("g.bin", MIB, 170).await;
+    let path = squeezefs::keys::inode_path(ino);
+
+    // The write parks at the growth commit's seam; the promotion lands
+    // inside the park.
+    squeezefs::routing::test_set_growth_commit_stall_ms(Some(3_000));
+    let stalls0 = squeezefs::routing::TEST_GROWTH_COMMIT_STALLS.load(Ordering::Relaxed);
+    let grow = {
+        let fs = fx.fs.clone();
+        let tail = pattern(171, 4 * MIB);
+        tokio::spawn(async move {
+            fs.write(req(), ino, 0, MIB as u64, bytes::Bytes::from(tail), 0, 0)
+                .await
+        })
+    };
+    let parked = Instant::now() + Duration::from_secs(20);
+    while squeezefs::routing::TEST_GROWTH_COMMIT_STALLS.load(Ordering::Relaxed) == stalls0 {
+        assert!(
+            Instant::now() < parked,
+            "the growth write never reached the commit seam"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let token = fx.fs.router.dlm.get_fencing_token_ino(ino);
+    let promoted = fx
+        .fs
+        .router
+        .promote_staged_file(&path, &fid, token)
+        .await
+        .expect("the pressure promotion runs beside the parked write");
+    assert!(
+        matches!(promoted, Some(squeezefs::routing::PromotedInto::Packed)),
+        "fixture premise: the promotion packed the staged image ({promoted:?})"
+    );
+    let packed_map = fx.mapping_str(ino).await;
+    assert!(
+        packed_map.contains(':'),
+        "fixture premise: the tenant mapping is published under the parked write ({packed_map})"
+    );
+    let written = grow
+        .await
+        .expect("join")
+        .unwrap_or_else(|e| panic!("the growth write failed: {e:?}"))
+        .written;
+    assert_eq!(written as usize, 4 * MIB, "the growth write landed whole");
+    squeezefs::routing::test_set_growth_commit_stall_ms(None);
+
+    // The file is striped, its bytes exact, the ring entry released.
+    let m = fx
+        .fs
+        .router
+        .fetch_metadata(&path)
+        .await
+        .expect("layout after the growth");
+    assert_eq!(m.file_type, "striped", "the growth transition committed");
+    assert_eq!(m.size as usize, 5 * MIB);
+    let mut want = pattern(170, MIB);
+    want.extend_from_slice(&pattern(171, 4 * MIB));
+    assert_eq!(
+        fx.read(ino, 5 * MIB).await,
+        want,
+        "the grown file reads back exact"
+    );
+    assert!(
+        fx.fs.router.cache.nvme.read_staged(&fid).is_none(),
+        "the staged ring entry was consumed"
+    );
+    // The C8 oracle: the superseded tenant's record left with its
+    // reference — RED here on the snapshot-delta build (`durable 1 vs
+    // derived 0` on the pack block).
+    let drift = fx.drift().await;
+    assert!(
+        drift.is_empty(),
+        "a superseded pack tenant's durable reference survived the growth swap: {drift:?}"
+    );
+    fx.close().await;
+}

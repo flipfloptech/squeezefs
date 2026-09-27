@@ -294,6 +294,18 @@ mount is a read-token client whose metadata is exact at the next resolve
   retired plane still answered a token the holder had retired; the
   entries are dropped before the release travels now (the eviction path's
   own order).
+- **A leased slot's SMO at a crash-remount's first cover journals into its
+  lessee's ring (the acceptance record's §4.4bo):** on the armed plane a
+  declared region's RAM lease set — what scopes an SMO to the lessee's
+  ring and grant (§5.2.3) — was filled by the slot-lease arm, which runs
+  after the bring-up's cover cycles, so a leased leaf the replayed window
+  had filled past its node split under the manager's ring 0: its pointer
+  records stamped below the lessee's own earlier separator, the root
+  routing to the retired leaf for the mount's life (`child-retired ×256`
+  on every walk of the range — the storm contract's 1-in-20 at its
+  reopen). Tree 0's `Leased` words seed every own region's leases with
+  the frame stamps, before any flush pass runs; pinned deterministically
+  on a crash image taken under a held SMO mutex.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

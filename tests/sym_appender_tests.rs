@@ -1887,6 +1887,116 @@ async fn a_stalled_appender_ring_grows_a_segment_and_its_content_survives() {
     }
 }
 
+/// **A leased slot's SMO at a crash-remount's FIRST cover journals into
+/// its lessee's ring** (PR 14 fix round 3, class H — the suite's 1-in-20
+/// `child-retired ×256` routing loop at the reopen of
+/// `a_stalled_appender_ring_grows_a_segment_and_its_content_survives`).
+///
+/// The shape: region 1 leases slot 4 and fills its tree through its own
+/// ring — every split's pointer records stamped from ring 1's seq space,
+/// which runs far ahead of ring 0's (a 27 KB entry per commit against the
+/// manager's few control entries). A covered checkpoint, then — with the
+/// SMO mutex HELD so the threshold writeback cannot land it in the images
+/// — an UNCOVERED burst into the rightmost leaf wider than a 64 KiB node,
+/// barriered; the volume file copied under the hold is the crash image
+/// (the device as a kill at that instant leaves it: the burst in ring 1's
+/// window alone). The reopen replays the burst into the leaf and the
+/// bring-up's first cover cycle MUST split it: the SMO's pointer records
+/// for the root's rightmost separator — the SAME key the storm's last
+/// split of that leaf wrote at a high ring-1 seq — are stamped from the
+/// ring the scope resolver names. Since the flip every region's RAM lease
+/// set starts EMPTY on an armed plane (the arm fills it AFTER the cover),
+/// so the resolver named the MANAGER's ring 0: the new pointer folded
+/// BELOW the old one, the root kept routing to the retired leaf, and
+/// every walk of that range — the digest, a lookup — exhausted its
+/// restart budget child-retired. The law is PR 3's §5.2.3 (a leased
+/// slot's flips journal into ITS lessee's ring under its grant) at every
+/// SMO of the open, the first cover's included: tree 0's `Leased` words
+/// seed the region's RAM leases with the frame stamps
+/// (`prime_frame_stamps`), before any flush pass runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leased_slots_split_at_the_reopens_first_cover_journals_into_its_lessees_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let tag = volume_tag("vol-0011223344556677");
+    let guest_owner = guest_local_ino(3, 9);
+    let ra = open_with_partition(&uris, Some(PARTITION)).await;
+    let va = Arc::clone(&ra.volumes[0]);
+    // The tree past one leaf, its splits journaled into ring 1 at rising
+    // positions: 30 × 500 refs, the ring drained every sixth commit (the
+    // floor ring's user window holds ≈ 9 of these entries).
+    for i in 0..30u64 {
+        va.commit_block_refs(guest_owner, &refs(tag, guest_owner, i * 1000, 500))
+            .await
+            .unwrap();
+        if i % 6 == 5 {
+            va.checkpoint_now().await.unwrap();
+        }
+    }
+    // Covered: the leaves flushed, the roots on the page.
+    va.checkpoint_now().await.unwrap();
+    va.checkpoint_now().await.unwrap();
+    let (ring1_head, ring1_reusable) = va.region_ring_window(1).expect("region 1");
+    assert_eq!(
+        ring1_head, ring1_reusable,
+        "ring 1 drained before the burst"
+    );
+    // The SMO mutex held: the threshold wake's maintenance pass and the
+    // cadence park on it, so the burst stays in the leaf's RAM overlay
+    // and in ring 1's window — nothing of it reaches a node image.
+    let hold = loop {
+        if let Some(h) = va.test_hold_smo_as_service() {
+            break h;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    };
+    // The UNCOVERED burst: 2,000 contiguous keys above every earlier one,
+    // wider than a 64 KiB node — the rightmost leaf cannot absorb them at
+    // the replay's flush, so the first cover's SMO is certain.
+    for i in 0..4u64 {
+        va.commit_block_refs(guest_owner, &refs(tag, guest_owner, 100_000 + i * 500, 500))
+            .await
+            .unwrap();
+    }
+    va.sync_device().await.unwrap();
+    let live = digest_backend(&va).await.unwrap();
+    let crash_head = va.region_ring_window(1).expect("region 1").0;
+    // The crash image: the device's bytes at this instant.
+    let crashed = dir.path().join("meta0.crashed");
+    std::fs::copy(&uris[0], &crashed).unwrap();
+    drop(hold);
+    drop(va);
+    for v in &ra.volumes {
+        v.shutdown().await.unwrap();
+    }
+    drop(ra);
+    let crashed_uris = vec![crashed.display().to_string()];
+    let again = open_with_partition(&crashed_uris, Some(PARTITION)).await;
+    let v = &again.volumes[0];
+    let s = stats(v);
+    assert!(
+        s.regions[1].ring_entries >= 1,
+        "the reopen's first cover split the burst's leaf and journaled the SMO into region 1's \
+         ring — its lessee's — not the manager's ring 0: {:?}",
+        s.regions[1]
+    );
+    assert!(
+        v.region_ring_window(1).expect("region 1").0 > crash_head,
+        "region 1's head moved past the crash's by the cover's own entries"
+    );
+    // The outcome the routing loop denied: every acked reference resolves
+    // and the digest is the live one.
+    assert_eq!(digest_backend(v).await.unwrap(), live);
+    for i in [0u64, 17, 29] {
+        assert_eq!(v.block_ref_count(tag, i * 1000 + 7).await.unwrap(), 1);
+    }
+    assert_eq!(v.block_ref_count(tag, 101_999).await.unwrap(), 1);
+    for v in &again.volumes {
+        v.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_flush_ceiling_is_the_checkpoint_age_and_a_parked_device_moves_the_overrun_counter() {
     // KD-SYM-10's "within CHECKPOINT_MAX_AGE_MS" names the cadence

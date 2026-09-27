@@ -1967,7 +1967,7 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   its words re-read at every epoch step and its native watermark adopted
   from each checkpoint record).
 * **What the full test set's pre-screen found and fixed (fix round 3,
-  record §4.4bl–bm).** **A fresh writer served with its join's slot-acquire
+  record §4.4bl–bo).** **A fresh writer served with its join's slot-acquire
   entries uncovered** (§4.4bl): the D1.b bring-up law — "a write mount's
   bring-up commits are checkpoint-covered before the mount serves", so no
   one-shot admission crumb lets a committer parked on a wedged ring slip
@@ -1984,7 +1984,20 @@ act with these laws (`docs/design-symmetric-metadata.md` §7.2 / §7.3, row 14):
   marker-bracketed, crash-resumable stamp) and converts in the same
   invocation; the retired verb refuses loud naming it; the `mw_upgrade:`
   marker's and the bit-11 uniformity gate's writable-mount refusals name
-  it as the resume.
+  it as the resume. **A retired per-holder token plane serves nothing from
+  the instant its fence decides** (§4.4bn — the entries drop before the
+  release travels). **A leased slot's SMO at a crash-remount's first cover
+  journals into its lessee's ring** (§4.4bo): on the armed plane a declared
+  region's RAM lease set — what scopes an SMO to the lessee's ring and grant
+  (design §5.2.3) — was filled by the slot-lease arm, which runs after the
+  bring-up's cover cycles, so a leased leaf the replayed window had filled
+  past its node split under the manager's ring 0 and its pointer records
+  folded below the lessee's own earlier separator: the root routed to the
+  retired leaf for the mount's life (every walk of the range `child-retired
+  ×256`, the storm contract's 1-in-20 at its reopen). Tree 0's `Leased` words
+  seed every own region's leases with the frame stamps, before any flush
+  pass runs; the row-5 completion of a handover the identity died inside
+  drops the seeded lease with the release.
 * **What is owed past the flip** (the PR 14b board): the manager's zero-census
   open (the bitmap as the terminal-free engine), PR 7's un-share of a
   surviving sole owner, the SMO-record window economy (one pad per flush

@@ -5218,11 +5218,38 @@ impl KvMetaBackend {
     /// a_writer_recovering_an_exhausted_ring_inside_its_gate_stamps_the_
     /// leases_generation`). Every caller is idempotent, so the bring-up's
     /// prime stays for the offline verbs that never run the gate.
+    ///
+    /// **The SMO scope rides the same prime** (PR 14 fix round 3, class H
+    /// — the record's §4.4bo): a declared region's RAM lease set is what
+    /// the SMO context's resolver reads (`AppenderSet::region_of_slot` →
+    /// `SmoRegion { ring, grant }`), and on an armed plane the region open
+    /// leaves it EMPTY for the arm to fill — AFTER the cover cycles. So a
+    /// leased slot's leaf that the replayed window filled past its node
+    /// split at the first cover under the MANAGER's scope: its pointer
+    /// records reserved in ring 0, stamped from ring 0's seq space, which
+    /// on a busy region sits far below the lessee's — the root's earlier
+    /// separator record (the lessee's last split of that leaf) out-folded
+    /// the new one and the root kept routing to the retired leaf, every
+    /// walk of the range exhausting its restart budget child-retired
+    /// (`sym_appender_tests::a_leased_slots_split_at_the_reopens_first_
+    /// cover_journals_into_its_lessees_ring`; the storm contract's 1-in-20
+    /// `[0, 0, 0, 256, 0]` at its reopen). Tree 0's `Leased` words — the
+    /// same population the arm re-adopts (`held_by`) — seed every own
+    /// region's lease set here, so §5.2.3 holds at every SMO of the open;
+    /// the arm's `install_lease` re-adds them (a set — idempotent).
     async fn prime_frame_stamps(self: &Arc<Self>) -> std::result::Result<(), KvError> {
-        let Some(plane) = self.appenders.as_ref().and_then(|a| a.slot_leases()) else {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        let Some(plane) = set.slot_leases() else {
             return Ok(());
         };
         self.load_slot_leases(plane).await?;
+        for r in set.own_regions() {
+            for slot in plane.table.held_by(r.id) {
+                r.add_lease(slot);
+            }
+        }
         if let Ok(weak) = self.conveyor_identity() {
             self.cache
                 .install_frame_fence(Arc::new(SlotFrameFence { be: weak }));
@@ -5538,6 +5565,11 @@ impl KvMetaBackend {
                         };
                         self.manager_release_slot(r.id, slot, words, se.g, tails)
                             .await?;
+                        // The RAM half of the handover's step 5: the
+                        // region no longer journals the slot. The prime
+                        // seeded the set from tree 0's word BEFORE this
+                        // completion moved it (PR 14 fix round 3, class H).
+                        r.drop_lease(slot);
                         log::warn!(
                             "meta volume {}: appender {}'s page named slot {slot} RELEASING at g \
                              {} with tree 0 still leasing it — the handover this identity died \

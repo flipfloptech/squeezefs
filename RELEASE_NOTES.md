@@ -355,14 +355,21 @@ mount is a read-token client whose metadata is exact at the next resolve
   counts the class. Found by the 1.3.0 release chain's own `task check`
   (record §4.4bp).
 - **A set carrying a prior-era corpse could refuse to mount on the 1.3
-  default**: the mount-time corpse sweep frees an unlinked-but-never-
-  FORGOTTEN inode's blocks through the background reclaim queue, and the
-  allocation lease's arm, next in the mount path, refused the mount when
-  those frees landed between its two seed snapshots ("the allocator moved
-  during the arm … 37 → 0 set") — every abort-unmount or kill -9 that left
-  an open unlinked file armed the shape at the next mount. The sweep
-  drains its frees before it returns (its "blocks freed" is literal), so
-  the arm seeds from a quiescent allocator. Found by the 1.3.0 release
+  default — on file-backed data volumes, or with discard elision off**:
+  the mount-time corpse sweep frees an unlinked-but-never-FORGOTTEN
+  inode's blocks through the background reclaim queue, and the allocation
+  lease's arm, next in the mount path, refused the mount when those frees
+  landed between its two seed snapshots ("the allocator moved during the
+  arm … 37 → 0 set"). The shape needs a corpse that owns blocks and a
+  terminal free that rides the queue: a block-device data volume under the
+  default discard elision frees inline and never had it; a file-backed
+  data volume (every fstests scratch device, every dev sandbox) or a set
+  running `SQUEEZEFS_DISCARD_ELISION=0` did, at the reclaim worker's rate.
+  The arm now judges its second snapshot by direction — a free beside it
+  is absorbed into the bitmap with its delta journaled
+  (`data_alloc_bitmap_arm_absorbed_frees`), an allocation beside it still
+  refuses — and the job fabric's adopted jobs (the one mount-time
+  allocator) are held until the arm has landed. Found by the 1.3.0 release
   chain's fstests pre-pass (record §4.4bs).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a

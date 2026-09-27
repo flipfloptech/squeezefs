@@ -2181,25 +2181,12 @@ impl BlockAllocator {
         // Claim-cancels-debt (Idea 4, KD-4.3): the new owner's
         // write-before-publish rewrites the range — it owes no discard.
         self.cancel_elided_debt(offset);
-        if self
-            .refcounts
-            .insert_sync(offset, AtomicU32::new(1))
-            .is_err()
-        {
-            // A lingering refcount entry at claim time means the offset was
-            // free-listed while a tracked owner existed — the double-owner
-            // mint observed from the OTHER side. Loud: this is never legal.
-            crate::fuse_client::METRICS
-                .block_claim_anomalies
-                .fetch_add(1, Ordering::Relaxed);
-            log::error!(
-                "CLAIM ANOMALY: offset {offset} claimed from the free list while a \
-                 refcount entry lingers (count={:?}) (block_claim_anomalies)",
-                self.refcount(offset)
-            );
-        }
         // New incarnation, not yet durable: cache fills must not publish until
-        // the owner calls `publish_block` after its device write.
+        // the owner calls `publish_block` after its device write. The word
+        // and the stamp move BEFORE the refcount entry exists: a pin that
+        // lands between the two reads "untracked" and takes nothing, where
+        // the reverse order let it raise the new count against the OLD
+        // stamp and hold a reference no key could ever release.
         self.mark_incarnation_unstable(offset);
         // Spec §6.2 item 6: an allocation is the ONLY event that starts a
         // new lifetime of an offset, so this is the one place a lifetime
@@ -2221,6 +2208,23 @@ impl BlockAllocator {
                     ));
                 }
             }
+        }
+        if self
+            .refcounts
+            .insert_sync(offset, AtomicU32::new(1))
+            .is_err()
+        {
+            // A lingering refcount entry at claim time means the offset was
+            // free-listed while a tracked owner existed — the double-owner
+            // mint observed from the OTHER side. Loud: this is never legal.
+            crate::fuse_client::METRICS
+                .block_claim_anomalies
+                .fetch_add(1, Ordering::Relaxed);
+            log::error!(
+                "CLAIM ANOMALY: offset {offset} claimed from the free list while a \
+                 refcount entry lingers (count={:?}) (block_claim_anomalies)",
+                self.refcount(offset)
+            );
         }
         // PR VL6a (§5.6): while an fsck scan is latched, record the
         // minting epoch in the side map — one relaxed load when idle.

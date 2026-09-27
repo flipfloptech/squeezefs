@@ -4645,7 +4645,10 @@ impl BackendRouter {
     ///
     /// A pin is a promise about ONE lifetime, so the key's incarnation is
     /// checked AFTER the allocator's increment (the increment is what
-    /// fences the lifetime the check reads). A key whose lifetime is dead —
+    /// fences the lifetime the check reads in the FREE direction; in the
+    /// CLAIM direction `claim_block_idx` stamps the new lifetime before it
+    /// inserts the count, so a pin landing between the two reads
+    /// "untracked" and takes nothing). A key whose lifetime is dead —
     /// a mover census or a clone map naming a block the owner freed and the
     /// allocator reissued before the pin — takes NO reference: the raised
     /// count is handed back through the ladder under the offset's LIVE key
@@ -4696,11 +4699,31 @@ impl BackendRouter {
             incarnation_era(live)
         );
         let live_key = self.persist_block_key(&be_id, offset);
-        if let Err(e) = self.free_block_verdict(&live_key).await {
-            log::error!(
-                "pin undo of stale key '{block_key}' via live key '{live_key}' failed: {e} — \
-                 the live owner carries one phantom reference until remount"
-            );
+        // The undo of a reference THIS call took is never a wire act: on a
+        // grant-armed NON-holder (a joined writer) the router ladder's first
+        // arm SHIPS a free of the live key to the allocation holder, where
+        // the joiner's own mint is RAM-untracked and a pre-publish window
+        // reads `Freed` — the live owner's bit cleared. A non-holder
+        // releases the count locally (the word untouched: the holder owns
+        // the accounting); the holder and every unarmed allocator run the
+        // ladder, where the terminal case is legitimately ours.
+        let released_locally = self
+            .with_allocator_for_key(&live_key, |alloc, off| {
+                if alloc.holds_ownership_plane() {
+                    false
+                } else {
+                    alloc.release_shipped_free_tracking(off);
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if !released_locally {
+            if let Err(e) = self.free_block_verdict(&live_key).await {
+                log::error!(
+                    "pin undo of stale key '{block_key}' via live key '{live_key}' failed: {e} — \
+                     the live owner carries one phantom reference until remount"
+                );
+            }
         }
         PinOutcome::Refused
     }

@@ -343,7 +343,8 @@ mount is a read-token client whose metadata is exact at the next resolve
 - **A mover's pin through a census-stale block key raised a reference on
   the offset's NEW lifetime that nothing could release** (`BackendRouter::
   pin_block_validated`; incarnation-stamped volumes — the default since
-  1.2): a block the owner freed and the allocator reissued between the
+  1.2; `--single-writer` volumes carry no lifetime stamps and keep the
+  offset-keyed pin): a block the owner freed and the allocator reissued between the
   mover's census and its pin was pinned by OFFSET while the key-checked
   unpin refused the stale key, so the new owner's terminal free read
   nonterminal and the block stood claimed-and-unreferenced until a remount

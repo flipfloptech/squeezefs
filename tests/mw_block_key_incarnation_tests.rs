@@ -573,6 +573,75 @@ async fn a_stale_keys_pin_takes_no_reference_on_the_offsets_new_lifetime() {
     assert_eq!(alloc.refcount(off), Some(1));
 }
 
+/// The stale pin's UNDO on a grant-armed NON-holder (a joined writer since
+/// the flip) releases the reference LOCALLY and dials nobody: the router
+/// ladder's first arm ships a terminal free to the allocation holder, where
+/// the joiner's own mint is RAM-untracked and a pre-publish window reads
+/// `Freed` — the live owner's bit cleared under acked data. Found by the
+/// reviewer of the first fix (`free_ship_failures` 0 → 1 with the count
+/// still 2: the undo went to the wire, which was down, and the phantom
+/// stayed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_holders_stale_pin_undo_releases_locally_and_ships_nothing() {
+    use squeezefs::block_allocator::PinOutcome;
+    use squeezefs::block_grant::BlockGrant;
+    let data = data_file();
+    let (alloc, _dev, router) = bare_router(data.path()).await;
+    router
+        .engage_incarnation_keys(9, AppendPartition::SOLO)
+        .expect("engage");
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(DATA_VOL_ID);
+    // A grant-armed allocator whose lease THIS process does not hold, with a
+    // free target installed: the joined writer's posture. The sink answers
+    // no top-up; the window is what we install by hand.
+    let sink: squeezefs::block_grant::BlockGrantSink = Arc::new(|_, _| Box::pin(async { None }));
+    assert!(alloc.install_block_grant_arm(tag, sink));
+    squeezefs::block_grant::install_free_target(tag, "127.0.0.1:1".to_string());
+    assert!(squeezefs::meta_backend::kv::alloc_lease::holding(tag).is_none());
+    assert!(
+        !alloc.holds_ownership_plane(),
+        "the fixture is a non-holder"
+    );
+
+    // Lifetime 1 from the window, keyed, then released the joiner's way (the
+    // holder's word retired the local view).
+    assert!(alloc.install_block_grant(BlockGrant { start: 3, len: 1 }));
+    let off = alloc.allocate_block().await.expect("mint from the window");
+    assert_eq!(off / BLOCK, 3);
+    alloc.publish_block(off);
+    let stale_key = router.persist_block_key("backend_0", off);
+    alloc.retire_shipped_free_tracking(off);
+
+    // Lifetime 2: the same block re-granted and re-minted.
+    assert!(alloc.install_block_grant(BlockGrant { start: 3, len: 1 }));
+    let again = alloc.allocate_block().await.expect("re-mint");
+    assert_eq!(again, off);
+    alloc.publish_block(off);
+    let live_key = router.persist_block_key("backend_0", off);
+    assert_ne!(stale_key, live_key);
+    assert_eq!(alloc.refcount(off), Some(1));
+
+    let ship_failures_before = squeezefs::meta_ship::publish::stats().free_ship_failures;
+    let shipped_before = squeezefs::meta_ship::publish::stats().free_shipped_blocks;
+    let outcome = router.pin_block_validated(&stale_key).await;
+    assert!(matches!(outcome, PinOutcome::Refused), "got {outcome:?}");
+    assert_eq!(
+        alloc.refcount(off),
+        Some(1),
+        "the undo must release the LOCAL reference on a non-holder"
+    );
+    let after = squeezefs::meta_ship::publish::stats();
+    assert_eq!(
+        after.free_ship_failures, ship_failures_before,
+        "the undo dialed the holder (the wire is down here, so the failure counter moved)"
+    );
+    assert_eq!(
+        after.free_shipped_blocks, shipped_before,
+        "no free of the live owner's block may leave a non-holder"
+    );
+    squeezefs::block_grant::uninstall_free_target(tag);
+}
+
 // ===========================================================================
 // 3. §6.3's failure, made detectable.
 // ===========================================================================

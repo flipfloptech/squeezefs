@@ -697,7 +697,7 @@ async fn test_defrag_data_g_vl6_contiguity_tail_churn_zero_corruption() {
     // churn's last unlinks ENQUEUE their terminal frees and the manners law
     // defers the drain under the mover's own device writes, so unsettled
     // they publish AFTER the pass as holes it never saw (the report
-    // contract below settles the same way before it measures).
+    // contract above settles the same way before it measures).
     fx.fs.router.backend_router.reclaim_drain().await;
 
     // Quiescent convergence pass (the churn's own frees are new work).

@@ -462,6 +462,7 @@ campaign collapsed.
 | `block_key_incarnation_refusals` | **must stay 0** — reads/frees refused because the key named a dead lifetime of its offset. On a single-writer mount every republish precedes its free, so a live map can never name a dead lifetime; growth means a binding outlived its block |
 | `block_key_incarnation_unknown` | keys served whose lifetime could not be checked (§6.3's honest degradation) — the size of the gap S9 must close; structurally 0 on volumes without bit 13 |
 | `block_key_incarnation_exhausted` | **must stay 0** — the per-mount lifetime sequence ran out and keys degraded to unstamped |
+| `block_pin_stale_keys` | pins refused because the KEY named a dead lifetime of its offset — the mover's census-stale class, a legal race (INFO, never the refusal tripwire): the allocator's increment landed on the offset's NEW owner and was handed back (locally on a grant-armed non-holder; through the ladder under the live key on the holder). Before this check (release 1.3.0) the phantom reference stranded the new owner's block until a remount rebuilt the allocator |
 
 Item 5 adds no counter by design: the lane machinery is either inert (every
 mount today) or its engagement is visible in the ino values themselves —

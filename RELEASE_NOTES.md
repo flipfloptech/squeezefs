@@ -264,6 +264,17 @@ mount is a read-token client whose metadata is exact at the next resolve
   and counted (`meta_kv_smo_entries_over_keep`), never refused. Three
   quarters of the checkpoint class stay the ordinary flush wave's (48 of
   64 padded records per pass at the floor, 96 of 128 on the 32 MiB ring).
+- **A fresh forest writer no longer serves with its join's control entries
+  uncovered (the acceptance record's §4.4bl):** the D1.b bring-up law —
+  every bring-up commit is checkpoint-covered before a write mount serves,
+  so a committer parked on a wedged journal ring can never slip past the
+  fail-stop escalation through a one-shot admission crumb the first
+  checkpoint tick releases — held on a `--single-writer` volume and not on
+  the default forest, whose slot-lease arm writes control entries after the
+  join's own checkpoint cycle. The writer's door covers once more after the
+  join (one extra barriered cycle at a forest mount, ≈ 1 ms); the mount
+  path's routed open already covered per volume, so a real mount never
+  served the residue — the per-volume door and every offline verb did.
 - **The flip lands after the owner's cloud decision**: the box brackets of
   every design §8 gate on the flip binary and the two-host / cloud rows are
   what that decision reads (the record

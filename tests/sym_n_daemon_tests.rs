@@ -3444,6 +3444,22 @@ async fn a_joiners_rejoin_over_its_live_page_replays_its_window_as_own_residue()
     let s = avol.appender_stats().unwrap();
     assert_eq!(s.appender_id, id, "the rejoin answers the SAME region");
     assert_eq!(s.self_recoveries, 1, "own residue recovered");
+    // The D1.b bring-up law at the JOINED door (PR 14 fix round 3, class
+    // A′): the rejoin's own-residue window is covered before the set
+    // serves — `reusable_upto == head` on the joiner's OWN ring, so no
+    // uncovered residue is left for the first cadence tick to release as
+    // an admission crumb under a parked committer. The writer's door
+    // covers its join's control entries the same way.
+    let (head, reusable) = avol
+        .region_ring_window(id)
+        .expect("the rejoined region's ring window");
+    assert_eq!(
+        head,
+        reusable,
+        "the joined door serves with its own-residue window uncovered ({} B) — the D1.b \
+         bring-up law (a fresh writer serves with zero reclaimable journal residue)",
+        head - reusable
+    );
     let own = s.regions.iter().find(|r| r.id == id).unwrap();
     assert!(own.self_recovered);
     assert_all_resolve(&again, shared, &covered).await;

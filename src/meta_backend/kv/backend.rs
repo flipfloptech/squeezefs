@@ -2158,6 +2158,23 @@ impl KvMetaBackend {
     /// acked record gone (the `claim clear` of a once-armed volume wrote a
     /// claim removal nobody could read). The caller owns the flock and the
     /// teardown on `Err`.
+    ///
+    /// The join's OWN control entries are covered too (PR 14 fix round 3,
+    /// the record's §4.4bl): the arm's slot acquires — the native slot,
+    /// the rotor — are ring-0 control entries written AFTER the join's
+    /// barriered cycle, and left uncovered they are exactly the bring-up
+    /// residue the first cover exists to close: a one-shot admission crumb
+    /// the first cadence tick releases mid-park, through which a committer
+    /// parked on a wedged ring slips past the D1.b escalation and commits
+    /// silently. The layout changed the residue's author, not the law
+    /// ("a write mount's bring-up commits are checkpoint-covered before the
+    /// mount serves"), so the door covers ONCE more after the join — a
+    /// no-op read on a flat volume (nothing joined) and on a forest one
+    /// barriered cycle whose tail passes the arm's entries. A kill between
+    /// the arm and this cover recovers exactly as before: the entries sit
+    /// in ring 0's window and tree 0's replay applies them (PR 4's crash
+    /// rows); the cover changes what the window HOLDS at serve-start, never
+    /// what a replay of it recovers.
     pub(super) async fn writer_bring_up(
         self: &Arc<Self>,
         open_started: std::time::Instant,
@@ -2168,7 +2185,8 @@ impl KvMetaBackend {
         self.restore_own_pools().await?;
         self.cover_bring_up_residue().await?;
         self.join_appender_regions(open_started.elapsed().as_millis() as u64)
-            .await
+            .await?;
+        self.cover_bring_up_residue().await
     }
 
     /// Open for a **read-only probe** (the format-preflight guard and

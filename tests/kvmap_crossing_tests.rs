@@ -1115,21 +1115,19 @@ async fn a_shipped_crossing_is_witnessed_owner_ratcheted_and_era_gated() {
         sb.block_map_tree_stamped(),
         "the owner stamped bit 16 BEFORE its first record (the ratchet's ordering law)"
     );
-    let head_bytes = owner_be.volumes[0]
-        .getxattr(ino, "layout")
+    // The owner's head and records are read through the ROUTED layer —
+    // the identity every reader uses: on the default forest the served
+    // create minted `ino` into the owner's rotor slot, whose records key
+    // the LOCAL form (`route_ino`), so a per-volume read by the GLOBAL
+    // ino answers nothing there (it answered on the flat class only
+    // because the mint landed in the native slot, where the two coincide).
+    let head_bytes = Metadata::getxattr(owner_be.as_ref(), ino, "layout")
         .await
         .unwrap()
         .expect("owner head");
     let head: LayoutMetadata = bincode::deserialize(&head_bytes).unwrap();
     assert_eq!(head.block_map_id.as_deref(), Some("kvmap:1"));
-    assert_eq!(
-        owner_be.volumes[0]
-            .block_map_range(ino, 0, 16)
-            .await
-            .unwrap()
-            .len(),
-        3
-    );
+    assert_eq!(owner_be.block_map_range(ino, 0, 16).await.unwrap().len(), 3);
 
     // The replay: SAME frame, SAME witness — answered from the window,
     // nothing staged (journal-entry equality), counted as a replay.
@@ -1207,11 +1205,7 @@ async fn a_shipped_crossing_is_witnessed_owner_ratcheted_and_era_gated() {
     assert_eq!(publish::stats().stale_refusals - stale_before, 1);
     assert_eq!(journal_entries(), journal_before, "nothing applied");
     assert_eq!(
-        owner_be.volumes[0]
-            .block_map_range(ino, 0, 16)
-            .await
-            .unwrap()
-            .len(),
+        owner_be.block_map_range(ino, 0, 16).await.unwrap().len(),
         3,
         "the dead era's entries never landed"
     );

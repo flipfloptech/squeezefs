@@ -8907,6 +8907,39 @@ impl DataRouter {
         crate::meta_ship::publish::release_block_refs_witnessed(backend, ino, ops).await
     }
 
+    /// The block map a whole-map swap DISPLACES (record §4.4bt), read
+    /// under the `INODE_META_LOCKS` guard the caller holds: the RAM entry's
+    /// when one is cached — the last publish, which a pressure promotion of
+    /// the same file may have moved past the caller's snapshot (the merge
+    /// worker's promotion takes only this guard, never the block-0 guard
+    /// the write holds) — else the BACKEND's (one cold read on the
+    /// eviction-only path: a promotion's CLEAN publish can be evicted
+    /// before the commit's cache read, and the pre-park snapshot would then
+    /// miss the tenant it named — review round 1, Issue 1; a DIRTY snapshot
+    /// is pinned and never the one that went missing), else the snapshot's.
+    /// The swap's durable `−ref`s and `release_superseded_staged`'s RAM
+    /// releases must name the SAME copies: computing the delta against the
+    /// snapshot while releasing the entry's map left a superseded pack
+    /// tenant's record in the ledger after its RAM reference was released
+    /// and the pack block freed — fsck C8 drift (`durable 1 vs derived 0`),
+    /// and on the flipped default a mount refusal at the allocation arm's
+    /// loss check (fstests generic/751 → 752's scratch mount: 17 such
+    /// blocks).
+    async fn swap_displaced_map(
+        &self,
+        ino: u64,
+        fresh: Option<&CachedMetadata>,
+        meta: &CachedMetadata,
+    ) -> Option<std::sync::Arc<std::collections::HashMap<u32, String>>> {
+        if let Some(f) = fresh {
+            return f.block_map.clone();
+        }
+        match self.fetch_metadata_from_backend(ino).await {
+            Ok(Some(durable)) => durable.block_map,
+            _ => meta.block_map.clone(),
+        }
+    }
+
     /// The exact durable-reference delta between an ino's PREVIOUS block
     /// map and its NEW one (spec §6.2 item 1) — for the layout-REPLACING
     /// save sites that do not go through the merge primitive: the
@@ -8916,29 +8949,6 @@ impl DataRouter {
     /// Those sites build a whole map and save it, so they are already
     /// O(map); diffing per index adds no order of growth. The merge
     /// primitive's O(batch) path (`block_ref_ops`) stays the hot one.
-    /// The block map a whole-map swap DISPLACES (record §4.4bt): the RAM
-    /// entry's under the `INODE_META_LOCKS` guard when one is cached — the
-    /// last publish, which a pressure promotion of the same file may have
-    /// moved past the caller's snapshot (the merge worker's promotion takes
-    /// only this guard, never the block-0 guard the write holds) — else the
-    /// snapshot's (the backend's at the fetch). The swap's durable `−ref`s
-    /// and `release_superseded_staged`'s RAM releases must name the SAME
-    /// copies: computing the delta against the snapshot while releasing
-    /// the entry's map left a superseded pack tenant's record in the ledger
-    /// after its RAM reference was released and the pack block freed — fsck
-    /// C8 drift (`durable 1 vs derived 0`), and on the flipped default a
-    /// mount refusal at the allocation arm's loss check (fstests generic/751
-    /// → 752's scratch mount: 17 such blocks).
-    fn swap_displaced_map<'a>(
-        fresh: Option<&'a CachedMetadata>,
-        meta: &'a CachedMetadata,
-    ) -> Option<&'a std::collections::HashMap<u32, String>> {
-        match fresh {
-            Some(f) => f.block_map.as_deref(),
-            None => meta.block_map.as_deref(),
-        }
-    }
-
     pub(crate) fn block_ref_ops_for_map_swap(
         &self,
         ino: u64,
@@ -18611,7 +18621,8 @@ impl DataRouter {
                 updated_meta.file_id = None;
                 // Spec §6.2 item 1: the promotion's whole-map swap, exactly
                 // — against the map this commit DISPLACES (record §4.4bt).
-                let old_map = Self::swap_displaced_map(fresh.as_ref(), &meta);
+                let old_map_arc = self.swap_displaced_map(ino, fresh.as_ref(), &meta).await;
+                let old_map = old_map_arc.as_deref();
                 let refs = self.block_ref_ops_for_map_swap(
                     ino,
                     old_map,
@@ -18639,15 +18650,25 @@ impl DataRouter {
                     // refusal, a NotFound after destroy) leaks the whole
                     // batch's device space in the LIVE accounting (the
                     // statfs ENOSPC-drift bug's second face; the map keys
-                    // are captured for the post-guard free — RES-1).
-                    Err(e) => Err((
-                        e,
-                        updated_meta
-                            .block_map
-                            .as_deref()
-                            .map(|m| m.values().cloned().collect::<Vec<_>>())
-                            .unwrap_or_default(),
-                    )),
+                    // are captured for the post-guard free — RES-1). The
+                    // save's never-lossy refill re-noted this swap's own
+                    // ops for the ino's next persist; no map names the
+                    // mints and the displaced copy still stands, so they
+                    // come back out (PK4's retraction — record §4.4bt,
+                    // review round 1, Issue 2: left pending they landed
+                    // `+ref`s on freed blocks and a `−ref` on a live
+                    // tenant at the next save).
+                    Err(e) => {
+                        self.retract_block_ref_ops(ino, &refs);
+                        Err((
+                            e,
+                            updated_meta
+                                .block_map
+                                .as_deref()
+                                .map(|m| m.values().cloned().collect::<Vec<_>>())
+                                .unwrap_or_default(),
+                        ))
+                    }
                 }
             };
             // RES-1: guard dropped — orphan-free the failing commit's
@@ -18931,14 +18952,25 @@ impl DataRouter {
                     updated_meta.layout_dirty = false;
                     // Spec §6.2 item 1: the spill's whole-map swap — against
                     // the map it DISPLACES (record §4.4bt).
-                    let old_map = Self::swap_displaced_map(fresh.as_ref(), &meta);
+                    let old_map_arc = self.swap_displaced_map(ino, fresh.as_ref(), &meta).await;
+                    let old_map = old_map_arc.as_deref();
                     let refs = self.block_ref_ops_for_map_swap(
                         ino,
                         old_map,
                         updated_meta.block_map.as_deref(),
                     );
-                    self.save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
-                        .await?;
+                    if let Err(e) = self
+                        .save_metadata_to_backend_refs(ino, &updated_meta, fencing_token, &refs)
+                        .await
+                    {
+                        // The spilled block never took the layout: the
+                        // save's refill re-noted this swap's ops, which no
+                        // map names (PK4's retraction — record §4.4bt,
+                        // review round 1, Issue 2); the `MintedBlockGuard`
+                        // frees the block on the way out.
+                        self.retract_block_ref_ops(ino, &refs);
+                        return Err(e);
+                    }
                     // DUR-8f: the layout names the block — custody
                     // transferred; from here the ordinary free paths own it.
                     minted.disarm();
@@ -21223,7 +21255,8 @@ impl DataRouter {
                 // Spec §6.2 item 1: the spill's whole-map swap — against the
                 // map it DISPLACES (record §4.4bt; `still_ours` above holds
                 // the identity, not the map: a promotion keeps both).
-                let old_map = Self::swap_displaced_map(fresh.as_ref(), &meta);
+                let old_map_arc = self.swap_displaced_map(ino, fresh.as_ref(), &meta).await;
+                let old_map = old_map_arc.as_deref();
                 let refs = self.block_ref_ops_for_map_swap(
                     ino,
                     old_map,

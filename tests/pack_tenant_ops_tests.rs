@@ -1764,7 +1764,15 @@ async fn a_growth_swap_racing_a_pack_promotion_releases_the_tenants_durable_refe
     let path = squeezefs::keys::inode_path(ino);
 
     // The write parks at the growth commit's seam; the promotion lands
-    // inside the park.
+    // inside the park. The seam returns to the knob on every exit — a
+    // panic included — so a sibling test never inherits a 3 s park.
+    struct StallGuard;
+    impl Drop for StallGuard {
+        fn drop(&mut self) {
+            squeezefs::routing::test_set_growth_commit_stall_ms(None);
+        }
+    }
+    let _stall = StallGuard;
     squeezefs::routing::test_set_growth_commit_stall_ms(Some(3_000));
     let stalls0 = squeezefs::routing::TEST_GROWTH_COMMIT_STALLS.load(Ordering::Relaxed);
     let grow = {
@@ -1799,13 +1807,13 @@ async fn a_growth_swap_racing_a_pack_promotion_releases_the_tenants_durable_refe
         packed_map.contains(':'),
         "fixture premise: the tenant mapping is published under the parked write ({packed_map})"
     );
-    let written = grow
+    let written = tokio::time::timeout(Duration::from_secs(30), grow)
         .await
+        .expect("the growth write completed within 30 s of the promotion")
         .expect("join")
         .unwrap_or_else(|e| panic!("the growth write failed: {e:?}"))
         .written;
     assert_eq!(written as usize, 4 * MIB, "the growth write landed whole");
-    squeezefs::routing::test_set_growth_commit_stall_ms(None);
 
     // The file is striped, its bytes exact, the ring entry released.
     let m = fx

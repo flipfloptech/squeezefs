@@ -1234,7 +1234,7 @@ pub struct KvMetaBackend {
     alloc: Arc<ExtentAllocator>,
     /// §4.8 monotonic watermark, recovered at mount; the create path
     /// `fetch_add`s it.
-    next_ino: AtomicU64,
+    pub(super) next_ino: AtomicU64,
     /// **The writer era's ino floor** for this volume's NATIVE keyspace:
     /// the §4.8 watermark as recovered at open, before this mount minted
     /// anything. Inos are monotonic and never reused (§4.8), so
@@ -1261,10 +1261,12 @@ pub struct KvMetaBackend {
     /// AND at an offline probe — and sat above the ino bitmaps' raw
     /// ceiling. The LIVE word is the armed plane's lease table where one
     /// exists (`forest_slot_word`); this snapshot serves a probe, a
-    /// reader and an unarmed forest, whose tree 0 does not move under them
-    /// the way a manager's does under its own grants and releases.
-    forest_slot_words:
-        std::sync::OnceLock<std::collections::HashMap<super::record::ForestSlot, ForestSlotWord>>,
+    /// reader and an unarmed forest — read at the open and, on a reader,
+    /// again at every epoch step (`forest_reader_resync`), so a census
+    /// there reads the words of the projection it walks (§4.4bk).
+    forest_slot_words: arc_swap::ArcSwapOption<
+        std::collections::HashMap<super::record::ForestSlot, ForestSlotWord>,
+    >,
     /// Pre-RC spec §6.2 item 5 (incompat bit 12): **per-writer ino lane
     /// cursors**, keyed `(writer id, space)` where the space is the
     /// volume's native watermark or a hosted guest slot
@@ -3020,7 +3022,7 @@ impl KvMetaBackend {
             next_ino: AtomicU64::new(next_ino),
             era_ino_floor_native: next_ino,
             era_ino_floor_guest: std::sync::OnceLock::new(),
-            forest_slot_words: std::sync::OnceLock::new(),
+            forest_slot_words: arc_swap::ArcSwapOption::empty(),
             lane_cursors: scc::HashMap::new(),
             lanes_live: AtomicBool::new(false),
             destroyed_inodes: AtomicU64::new(0),
@@ -3176,41 +3178,7 @@ impl KvMetaBackend {
         // tree 0's word at the grant, so a stale foreign cell is never a
         // mint source. Seeded HERE, before the bring-up's join checkpoint.
         be.snapshot_forest_slot_words().await?;
-        if let Some(set) = be.appenders.as_ref() {
-            for e in super::appender::read_directory(&be.path, &be.sb).await? {
-                let Some(page) = e.page else {
-                    continue;
-                };
-                if page.state != super::appender::AppenderState::Live {
-                    continue;
-                }
-                for e in page
-                    .slots
-                    .iter()
-                    .filter(|e| e.state == super::appender::SlotEntryState::Live && e.cursor != 0)
-                {
-                    let fslot = super::appender::forest_slot_of_page_slot(e.slot, set.native_slot);
-                    if fslot == super::record::NATIVE_FOREST_SLOT {
-                        continue;
-                    }
-                    if let Ok(routing) = be.routing_slot_of_forest(fslot) {
-                        be.install_guest_cursor(routing, e.cursor);
-                    }
-                }
-            }
-            // And tree 0's word for every slot — an overflow slot's cursor
-            // home (the cursor law's record), an unleased slot's only one.
-            if let Some(words) = be.forest_slot_words.get() {
-                for (fslot, w) in words {
-                    if w.cursor == 0 || *fslot == super::record::NATIVE_FOREST_SLOT {
-                        continue;
-                    }
-                    if let Ok(routing) = be.routing_slot_of_forest(*fslot) {
-                        be.install_guest_cursor(routing, w.cursor);
-                    }
-                }
-            }
-        }
+        be.seed_guest_cells_from_durable_words().await?;
         // Replayed guest records for a slot the stamp carries no cursor
         // for (crash between the guest commit and the next checkpoint's
         // extended stamp): the replay fold is authoritative.
@@ -3242,7 +3210,7 @@ impl KvMetaBackend {
         // words are the lease arm's — a LOWER floor exempts, never
         // convicts). A probe's floors, C9's forest law (PR 13e) and the
         // flat volume's seeding are unchanged.
-        if let Some(words) = be.forest_slot_words.get() {
+        if let Some(words) = be.forest_slot_words.load().as_deref() {
             for (fslot, w) in words {
                 if *fslot == super::record::NATIVE_FOREST_SLOT || w.cursor == 0 {
                     continue;
@@ -3257,9 +3225,9 @@ impl KvMetaBackend {
         Ok(be)
     }
 
-    /// Read tree 0's slot words once at open (`forest_slot_words`) — a
-    /// no-op on a flat volume.
-    async fn snapshot_forest_slot_words(&self) -> std::result::Result<(), KvError> {
+    /// Read tree 0's slot words (`forest_slot_words`) — at the open, and
+    /// on a reader at every epoch step. A no-op on a flat volume.
+    pub(super) async fn snapshot_forest_slot_words(&self) -> std::result::Result<(), KvError> {
         let Some(control) = self.forest_control_tree() else {
             return Ok(());
         };
@@ -3286,7 +3254,66 @@ impl KvMetaBackend {
                 words.insert(slot, word);
             }
         }
-        let _ = self.forest_slot_words.set(words);
+        self.forest_slot_words.store(Some(Arc::new(words)));
+        Ok(())
+    }
+
+    /// **Every slot's durable cursor seeds this mount's guest cells as a
+    /// FLOOR** (PR 14 §4.4bg / §4.4bd's fourth face; §4.4bk): every `Live`
+    /// page's checkpoint-time slot entries (the whole directory) and tree
+    /// 0's word for every slot — an overflow slot's cursor home (the
+    /// cursor law's record), an unleased slot's only one — through
+    /// `install_guest_cursor` (a floor, never an overwrite). OUR regions'
+    /// cells are the mint sources the join checkpoint rewrites the pages
+    /// from (a mount that died before its next page write left its
+    /// successor minting from 2 in filled slots); every OTHER slot's cell
+    /// is the population `live_inodes` counts (`statfs`'s `f_files`, the
+    /// offline `df`) — a probe holds no region and seeded NOTHING after
+    /// §4.4bd, so `squeezefs df` read one inode on a volume whose mount had
+    /// created a thousand. A foreign-leased slot never mints here (the
+    /// door refuses `SlotBusy`) and a first touch floors its cell from tree
+    /// 0's word at the grant, so a stale foreign cell is never a mint
+    /// source — and never a CENSUS bound: `slot_ino_watermarks` excludes
+    /// every slot another appender leases on every posture. Run at the
+    /// open before the bring-up's join checkpoint, and on a reader at every
+    /// epoch step so its population follows the writer's.
+    pub(super) async fn seed_guest_cells_from_durable_words(
+        &self,
+    ) -> std::result::Result<(), KvError> {
+        let Some(set) = self.appenders.as_ref() else {
+            return Ok(());
+        };
+        for e in super::appender::read_directory(&self.path, &self.sb).await? {
+            let Some(page) = e.page else {
+                continue;
+            };
+            if page.state != super::appender::AppenderState::Live {
+                continue;
+            }
+            for e in page
+                .slots
+                .iter()
+                .filter(|e| e.state == super::appender::SlotEntryState::Live && e.cursor != 0)
+            {
+                let fslot = super::appender::forest_slot_of_page_slot(e.slot, set.native_slot);
+                if fslot == super::record::NATIVE_FOREST_SLOT {
+                    continue;
+                }
+                if let Ok(routing) = self.routing_slot_of_forest(fslot) {
+                    self.install_guest_cursor(routing, e.cursor);
+                }
+            }
+        }
+        if let Some(words) = self.forest_slot_words.load().as_deref() {
+            for (fslot, w) in words {
+                if w.cursor == 0 || *fslot == super::record::NATIVE_FOREST_SLOT {
+                    continue;
+                }
+                if let Ok(routing) = self.routing_slot_of_forest(*fslot) {
+                    self.install_guest_cursor(routing, w.cursor);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3306,7 +3333,8 @@ impl KvMetaBackend {
             }
         }
         self.forest_slot_words
-            .get()
+            .load()
+            .as_deref()
             .and_then(|m| m.get(&slot).copied())
     }
 
@@ -12200,7 +12228,7 @@ impl KvMetaBackend {
                 hi = hi.max(lease.words.cursor);
             }
         }
-        if let Some(words) = self.forest_slot_words.get() {
+        if let Some(words) = self.forest_slot_words.load().as_deref() {
             for w in words.values() {
                 hi = hi.max(w.cursor);
             }
@@ -12233,14 +12261,18 @@ impl KvMetaBackend {
         // The slots ANOTHER appender leases (KD-SYM-3 — the lessee's
         // cursor travels with its lease; every word this mount holds for
         // such a slot — a guest cursor left from before the grant, the
-        // table's grant-time word, tree 0's `Leased` snapshot — predates
-        // the lessee's mints), so bounding one would skip every ino the
-        // lessee minted since: the census's referencer walk lost the
-        // joiners' files and read their live blocks as C2 "leaked" after
-        // a manager failover (PR 14, the record's §4.4ba). Absent from the
-        // map ⇒ walked whole.
+        // table's grant-time word, tree 0's `Leased` snapshot, a Live
+        // page's checkpoint-time entry — predates the lessee's mints), so
+        // bounding one would skip every ino the lessee minted since: the
+        // census's referencer walk lost the joiners' files and read their
+        // live blocks as C2 "leaked" after a manager failover (PR 14, the
+        // record's §4.4ba); a reader's census skipped a live writer's
+        // rotor past its last page word (§4.4bk). Absent from the map ⇒
+        // walked whole. The set is the lease TABLE's on an armed open and
+        // tree 0's `Leased` words on a plane-less one.
         let mut foreign = std::collections::BTreeSet::new();
         let mut own_leases: Vec<(super::record::ForestSlot, u64)> = Vec::new();
+        let words = self.forest_slot_words.load();
         if let Some(plane) = self.slot_leases() {
             let own = self.own_appender_id();
             for (slot, lease) in plane.table.snapshot() {
@@ -12251,6 +12283,21 @@ impl KvMetaBackend {
                     own_leases.push((slot, lease.words.cursor));
                 } else {
                     foreign.insert(slot);
+                }
+            }
+        } else if let Some(words) = words.as_deref() {
+            // A PLANE-LESS forest open — a `-o ro` reader, an offline probe
+            // — leases nothing: every slot tree 0 leases is another
+            // appender's, whatever cell the seeding installed for it (a
+            // Live page's checkpoint-time word, the grant's), and the
+            // lessee's records past that word are in the leaves this open
+            // reads (a reader's projection, a dead joiner's uncovered
+            // window) — PR 14 fix round 2, §4.4bk: a reader's census bounded
+            // a live writer's rotor at the writer's last page word and
+            // skipped every later ino.
+            for (slot, w) in words {
+                if !w.unleased {
+                    foreign.insert(*slot);
                 }
             }
         }
@@ -12276,8 +12323,9 @@ impl KvMetaBackend {
         // Tree 0's UNLEASED words: nobody mints into an unleased slot, so
         // the recorded cursor is exact for it; a LEASED word is its
         // lessee's grant-time cursor — the table above has the live one
-        // for our own leases, a foreign lessee's stays absent.
-        if let Some(words) = self.forest_slot_words.get() {
+        // for our own leases, a foreign lessee's stays absent. On a reader
+        // the words are the adopted epoch's (re-read at every step).
+        if let Some(words) = words.as_deref() {
             for (slot, w) in words {
                 if w.unleased {
                     raise(*slot, w.cursor);
@@ -21993,6 +22041,13 @@ impl KvMetaBackend {
                 break;
             }
         }
+        // The census's words and the population's cells follow the adopted
+        // epoch (§4.4bk): tree 0's slot words re-read — a slot leased
+        // since the last step is another appender's from here, walked
+        // whole — and every durable cursor floored into the guest cells,
+        // so `live_inodes` counts what the projection now shows.
+        self.snapshot_forest_slot_words().await?;
+        self.seed_guest_cells_from_durable_words().await?;
         Ok(())
     }
 

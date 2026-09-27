@@ -4830,3 +4830,117 @@ async fn a_read_refused_not_a_member_parks_on_the_members_reclaim_and_never_answ
     shutdown(&writer).await;
     membership::uninstall();
 }
+
+/// **PR 14 fix round 2 (§4.4bk) — a reader's census bounds no slot a
+/// writer leases, and its native bound follows the epoch it adopted.**
+/// §4.4bg seeded every Live page's slot cursors and tree 0's Leased words
+/// into a `-o ro` reader's guest cells, and `slot_ino_watermarks` derived
+/// its foreign set from the lease TABLE — `None` on a plane-less open — so
+/// a reader's census BOUNDED every slot a live writer leases at the
+/// writer's last page word and `walk_census` skipped every ino the writer
+/// minted since (the reviewer's probe: reader watermark 23 against the
+/// writer's live 63, 40 of 40 later inos skipped — §4.4ba's class on the
+/// fleet's member-census posture, KD-MW-16). On a plane-less open every
+/// slot tree 0 leases is another appender's now (excluded — walked
+/// whole), tree 0's words are re-read at every epoch step, and the
+/// adopted record's `next_ino` floors the reader's native watermark
+/// (a pre-existing sibling: the native bound stood at the open's word
+/// for the reader's life). Pinned on the reviewer's shape: the writer
+/// creates 20 files (the rotor's slots + the native keyspace), a reader
+/// opens and polls, the writer creates 40 more and checkpoints twice, the
+/// reader polls — the reader names NO watermark for any slot the writer
+/// leases, none of the writer's guest inos lies at or past a reader
+/// watermark, and the reader's native bound is at or past the writer's.
+/// RED on `299d0ee1`: `slot 2 bounded at 23 against the writer's 63`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_readers_census_bounds_no_slot_the_writer_leases_and_follows_its_native_watermark() {
+    use squeezefs::meta_backend::kv::record::forest_slot_of_ino;
+    use squeezefs::meta_backend::split_guest_local;
+    let _g = SEAM.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = format_stamped(dir.path(), "reader-census").await;
+    let writer = open_armed_writer(&path).await;
+    let wv = Arc::clone(&writer.volumes[0]);
+    let mut minted: Vec<u64> = Vec::new();
+    for i in 0..20 {
+        let e = writer
+            .create(1, &format!("a{i:02}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create");
+        minted.push(writer.route_ino(e.ino).1);
+    }
+    wv.checkpoint_now().await.expect("checkpoint");
+    let uris = vec![path.display().to_string()];
+    let reader = open_routed_meta_set_read_only(&uris)
+        .await
+        .expect("read-only open");
+    let rv = Arc::clone(&reader.volumes[0]);
+    rv.arm_reader_revalidation(None).expect("arms");
+    rv.revalidate_reader().await.expect("poll");
+    // The writer mints past every word the reader could have read.
+    for i in 0..40 {
+        let e = writer
+            .create(1, &format!("b{i:02}"), libc::S_IFREG | 0o644, 0, 0)
+            .await
+            .expect("create");
+        minted.push(writer.route_ino(e.ino).1);
+    }
+    wv.checkpoint_now().await.expect("checkpoint");
+    wv.checkpoint_now().await.expect("checkpoint");
+    rv.revalidate_reader().await.expect("poll");
+    let reader_marks = rv.slot_ino_watermarks();
+    let writer_marks = wv.slot_ino_watermarks();
+    // Every slot the writer leases is walked whole at the reader.
+    let plane = wv.slot_leases().expect("the writer is armed");
+    let leased: Vec<u32> = plane
+        .table
+        .snapshot()
+        .into_iter()
+        .filter(|(s, l)| {
+            *s != squeezefs::meta_backend::kv::record::NATIVE_FOREST_SLOT
+                && l.state != squeezefs::slot_lease_core::LeaseState::Unleased
+        })
+        .map(|(s, _)| s)
+        .collect();
+    assert!(!leased.is_empty(), "premise: the writer leases its rotor");
+    for slot in &leased {
+        assert!(
+            !reader_marks.contains_key(slot),
+            "slot {slot} bounded at {:?} at the reader against the writer's {:?} — a slot \
+             another appender leases is walked whole",
+            reader_marks.get(slot),
+            writer_marks.get(slot)
+        );
+    }
+    // No minted guest ino lies at or past a reader watermark; the native
+    // bound follows the adopted record.
+    for local in &minted {
+        let fslot = forest_slot_of_ino(*local);
+        let raw = split_guest_local(*local).map_or(*local, |(_, raw)| raw);
+        if let Some(ceiling) = reader_marks.get(&fslot) {
+            assert!(
+                raw < *ceiling,
+                "ino {local:#x} (slot {fslot}, raw {raw}) at or past the reader's watermark \
+                 {ceiling} — the reader's census would skip it"
+            );
+        }
+    }
+    // The native keyspace: walked whole (tree 0 leases it to the manager)
+    // or bounded at a word no lower than the writer's own — never below.
+    assert!(
+        reader_marks
+            .get(&0)
+            .is_none_or(|r| *r >= writer_marks.get(&0).copied().unwrap_or(0)),
+        "the reader's native watermark ({:?}) is below the writer's ({:?})",
+        reader_marks.get(&0),
+        writer_marks.get(&0)
+    );
+    assert!(
+        rv.next_ino() >= wv.next_ino(),
+        "the reader adopted the record's native watermark ({} against the writer's {})",
+        rv.next_ino(),
+        wv.next_ino()
+    );
+    rv.shutdown().await.expect("reader shutdown");
+    wv.shutdown().await.expect("writer shutdown");
+}

@@ -240,6 +240,16 @@ mount is a read-token client whose metadata is exact at the next resolve
   window and aborted the cycle before its record on such a refusal, where
   the same refusal after the record leaves it landed and the tick
   retrying; nothing that can be refused runs in that window now.
+- **A read-only mount's census bounds nothing another writer leases (the
+  acceptance record's §4.4bk):** the inode-population fix above seeded a
+  `-o ro` reader's per-slot cursor cells from every writer's page, and the
+  reader's census — the fleet's census shard — took them as bounds, so it
+  skipped every inode a live writer minted past its last page word (40 of
+  40 in the reviewer's probe); the reader's native watermark likewise
+  stood at its open-time word for its life. On a read-only mount and an
+  offline probe every slot tree 0 leases is walked whole, the words are
+  re-read at every epoch step, and the reader adopts each checkpoint
+  record's native watermark.
 - **A wide leaf split no longer fails the checkpoint (the acceptance
   record's §4.4bi):** the checkpoint class's keep (§4.4be) presumed every
   structural-modification entry fits one page and the fix round's first

@@ -489,6 +489,12 @@ impl KvMetaBackend {
         let trees = self.all_trees();
         let out = revalidate_trees(self.node_cache(), &trees, &epoch);
         if out.advanced {
+            // The adopted record's native watermark is this reader's too
+            // (§4.4bk): the census bounds the native keyspace by it, and
+            // a reader that kept its open-time word skipped every native
+            // ino the writer minted since. A floor — the word never
+            // regresses; a reader mints nothing.
+            self.next_ino.fetch_max(epoch.next_ino, Ordering::AcqRel);
             self.forest_reader_resync().await?;
         }
         Ok(out)

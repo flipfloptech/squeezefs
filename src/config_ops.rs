@@ -1997,7 +1997,7 @@ pub enum AddMetaCrash {
 }
 
 /// The §6.2 MW-S1b crash seams of the nine-bit stamp
-/// ([`stamp_multi_writer_bits`] — `enable-symmetric`'s first half since
+/// (`stamp_multi_writer_bits` — `enable-symmetric`'s first half since
 /// PR 14; design-full-multi-writer §10): each injects a hard error AFTER
 /// the named durable write, so the on-media state is exactly the kill-9
 /// window's (the [`AddMetaCrash`] pattern). Reached through
@@ -2021,7 +2021,7 @@ pub enum EnableMwCrash {
 /// no writer's door admits since the default flip (design-symmetric-
 /// metadata §7.2 — presence-required on the forest), so the verb could
 /// only leave a set unmountable for writers. The nine-bit stamp is
-/// `enable-symmetric`'s FIRST half now ([`stamp_multi_writer_bits`]): one
+/// `enable-symmetric`'s FIRST half now (`stamp_multi_writer_bits`): one
 /// upgrade verb, one act.
 pub const ENABLE_MULTI_WRITER_RETIRED: &str = "squeezefs volume enable-multi-writer is RETIRED \
     (PR 14, the symmetric default flip — design-symmetric-metadata §7.2): it upgraded a set to \
@@ -3933,7 +3933,7 @@ pub struct EnableSymReport {
 /// invocation, crash-resumable) — **the ONE upgrade verb since PR 14**:
 /// on a `--single-writer` (flat, unstamped) set its FIRST half stamps the
 /// nine multi-writer format bits the forest presumes
-/// ([`stamp_multi_writer_bits`] — the retired `enable-multi-writer`'s
+/// (`stamp_multi_writer_bits` — the retired `enable-multi-writer`'s
 /// ordered, marker-bracketed, crash-resumable stamp, which left a set in
 /// the pre-flip class no writer's door admits), then the conversion
 /// below runs in the same invocation (PR 14 fix round 3, class B — the

@@ -17023,9 +17023,12 @@ impl SqueezefsFilesystem {
     /// continuations each hold one from entry to end, so a recall's
     /// release waits for every token-holder that predates the revoke. Own
     /// files (and every unarmed mount) pay one relaxed load and touch no
-    /// map — the guard is inert.
+    /// map — the guard is inert. A VIRTUAL ino (`.stats` / `.config` /
+    /// `.trace`, canonical or generation) is the FUSE layer's own and is
+    /// never routed: on an armed mount the routed layer would land a
+    /// generation ino in a guest slot past the namespace (record §4.4bq).
     pub fn custody_use_enter(&self, ino: u64) -> CustodyUse {
-        if crate::data_grant::slot_holder_home(ino).is_none() {
+        if is_virtual_ino(ino) || crate::data_grant::slot_holder_home(ino).is_none() {
             return CustodyUse::inert();
         }
         let core = std::sync::Arc::clone(&*self.custody_use.entry(ino).or_default());

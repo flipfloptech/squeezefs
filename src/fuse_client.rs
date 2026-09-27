@@ -8555,8 +8555,11 @@ fn map_squeezefs_err(e: SqueezefsError) -> Errno {
     let errno = e.to_errno();
     // ENOENT is the normal grammar of POSIX lookups (negative dentries,
     // unlink/stat probes): logging it at ERROR buried real faults under
-    // thousands of benign lines per bench/rsync run.
-    if errno == libc::ENOENT {
+    // thousands of benign lines per bench/rsync run. A fail-stopped
+    // quiescent reader's refusals are one class announced once by the
+    // poll that latched it; at TTL 0 every path walk would otherwise
+    // write the remount text again.
+    if errno == libc::ENOENT || matches!(e, SqueezefsError::ReaderFailStopped) {
         debug!("Squeezefs operational error: {:?}", e);
     } else {
         error!("Squeezefs operational error: {:?}", e);
@@ -26541,16 +26544,17 @@ impl Filesystem for SqueezefsFilesystem {
             if !tracked.is_empty() {
                 crate::ro_coherence::arm_reader_coherence(&tracked, &self.router);
                 // The quiescent reader's fail-stop (record §4.4br): the
-                // cached block keys purged (nothing data-side serves
-                // stale) and the routed layer latched — every metadata op
-                // refuses EIO until the remount, the root's attributes
-                // excepted so `.stats` stays readable.
+                // routed layer latched FIRST — every metadata op refuses
+                // ESTALE from here, the root's attributes excepted so
+                // `.stats` stays readable — then the cached block keys
+                // purged (a serve racing the purge is already refused, so
+                // it can re-admit nothing).
                 let fail_stop: std::sync::Arc<dyn Fn() + Send + Sync> = {
                     let routed = std::sync::Arc::clone(routed);
                     let cache = self.router.cache.clone();
                     std::sync::Arc::new(move || {
-                        crate::ro_coherence::purge_reader_block_keys(&cache);
                         routed.reader_fail_stop();
+                        crate::ro_coherence::purge_reader_block_keys(&cache);
                     })
                 };
                 crate::ro_coherence::spawn_reader_revalidation(
@@ -26560,12 +26564,13 @@ impl Filesystem for SqueezefsFilesystem {
                     Some(fail_stop),
                 );
             }
-            // PR 5 (design-symmetric-metadata §5.7.2): a `-o ro` mount under
-            // `SQUEEZEFS_SYMMETRIC_META=1` reads every user-visible object
-            // under a TOKEN from the volume's holder — exact at the next
-            // resolve, the TTLs above derived to 0 — and the S5 poll just
-            // armed stays the control plane. Refused loud (the mount fails)
-            // when the posture's inputs are absent; `Ok(0)` under `=0`.
+            // PR 5 (design-symmetric-metadata §5.7.2): a `-o ro` mount reads
+            // every user-visible object under a TOKEN from the volume's
+            // holder — exact at the next resolve, the TTLs above derived to
+            // 0 — and the S5 poll just armed stays the control plane; on a
+            // set with NO live writer it is the quiescent reader (record
+            // §4.4br) serving the projection the poll watches. Refused loud
+            // (the mount fails) when a live manager's posture lacks an input.
             if let Err(msg) =
                 crate::ro_coherence::refuse_explicit_ttls_under_tokens(&self.kernel_ttls)
             {
@@ -26573,13 +26578,12 @@ impl Filesystem for SqueezefsFilesystem {
                 eprintln!("squeezefs: {msg}");
                 return Err(libc::EINVAL.into());
             }
-            match crate::ro_coherence::arm_token_readers(&routed.volumes, &self.router).await {
-                Ok(_) => {}
-                Err(msg) => {
-                    error!("{msg}");
-                    eprintln!("squeezefs: {msg}");
-                    return Err(libc::EINVAL.into());
-                }
+            if let Err(msg) =
+                crate::ro_coherence::arm_token_readers(&routed.volumes, &self.router).await
+            {
+                error!("{msg}");
+                eprintln!("squeezefs: {msg}");
+                return Err(libc::EINVAL.into());
             }
         }
 

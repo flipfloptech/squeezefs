@@ -696,11 +696,15 @@ pub fn join_dial_failed(e: &crate::error::SqueezefsError) -> bool {
 
 /// **Is a WRITER live on this volume?** — the D0 gate's own two words,
 /// read off a backend that holds no lock of its own (a probe, a `-o ro`
-/// reader): a LOCAL exclusive holder of the writer lock (another process
-/// on this host — the kernel's same-host proof), or a heartbeat-FRESH
-/// `writer_claim` of another writer (any host). The join target's decision
-/// (below) and the read-only mount's quiescence decision
-/// (`ro_coherence::arm_token_readers`) are this one function.
+/// reader — a WRITER backend answers `true` of itself): a LOCAL exclusive
+/// holder of the writer lock (another process on this host — the kernel's
+/// same-host proof), or a heartbeat-FRESH `writer_claim` of another writer
+/// (any host) as this backend's own tree reads it — on a reader, the
+/// projection as of its last adopted record. The join target's decision
+/// (below) and the read-only mount's quiescence decision at its ARM
+/// (`ro_coherence::arm_token_readers`, whose open replayed everything
+/// durable) are this one function; the quiescent reader's LIVE watch is
+/// the ledger advance itself (`revalidate_reader`), never this read.
 pub async fn live_manager_present(volume: &kv::backend::KvMetaBackend) -> bool {
     matches!(
         kv::backend::KvMetaBackend::probe_shared_lock(volume.device_path()),
@@ -2513,12 +2517,7 @@ impl RoutedMetaBackend {
 
     pub fn check_volume_enabled(&self, idx: usize) -> Result<()> {
         if self.reader_fail_stopped() {
-            return Err(crate::error::SqueezefsError::refused(
-                libc::EIO,
-                "this -o ro mount served a QUIESCENT set's projection and a writer has since \
-                 mounted it — the reader fail-stopped (design-symmetric-metadata §5.7.2, \
-                 R-SYM-4); remount to join as a token reader",
-            ));
+            return Err(crate::error::SqueezefsError::ReaderFailStopped);
         }
         if self.disabled_volumes.contains_key(&idx) {
             return Err(crate::error::SqueezefsError::Io(std::io::Error::new(

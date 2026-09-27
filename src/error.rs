@@ -146,6 +146,21 @@ pub enum SqueezefsError {
     )]
     WriterGuardFenced,
 
+    /// The QUIESCENT-SET reader's fail-stop (record §4.4br): this `-o ro`
+    /// mount served an idle set's checkpointed projection and a writer has
+    /// since mounted the set (its ledger advanced, or its D0 lock appeared
+    /// on this host) — every metadata op refuses from here, `ESTALE` (the
+    /// remedy IS a remount: it joins the live manager as a token client).
+    /// Logged once by the poll that latched it; the per-op refusals are
+    /// debug-class (a TTL-0 reader's every path walk would otherwise write
+    /// an ERROR line).
+    #[error(
+        "read-only mount fail-stopped: this -o ro mount served a QUIESCENT set's projection \
+         and a writer has since mounted it (design-symmetric-metadata §5.7.2, R-SYM-4); \
+         remount to join as a token reader"
+    )]
+    ReaderFailStopped,
+
     #[error(
         "indirect block map: unsupported on-disk encoding ({detail}); \
          pre-beta or foreign blob — reformat required (no backwards compatibility)"
@@ -226,6 +241,7 @@ impl Clone for SqueezefsError {
                 msg: msg.clone(),
             },
             SqueezefsError::WriterGuardFenced => SqueezefsError::WriterGuardFenced,
+            SqueezefsError::ReaderFailStopped => SqueezefsError::ReaderFailStopped,
             SqueezefsError::IndirectMapFormat { detail } => SqueezefsError::IndirectMapFormat {
                 detail: detail.clone(),
             },
@@ -332,6 +348,7 @@ impl SqueezefsError {
             // cadence completes the intent, the application retries).
             SqueezefsError::Retryable { .. } => libc::EAGAIN,
             SqueezefsError::WriterGuardFenced => libc::EIO,
+            SqueezefsError::ReaderFailStopped => libc::ESTALE,
             SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
             // A fail-stopped lease reaching a data path is the same class
             // as a fenced writer guard: the I/O must not proceed.

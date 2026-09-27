@@ -2421,6 +2421,11 @@ pub struct RevalidateOutcome {
     pub skipped_dirty: u64,
     /// Block keys the R-6 purge sink dropped for this step.
     pub keys_purged: u64,
+    /// **A quiescent reader's ledger ADVANCED** (record §4.4br): nothing
+    /// writes on a quiescent set, so a newer record IS a writer's first
+    /// checkpoint — the pass refused the swap (`advanced` false, the epoch
+    /// unchanged) and the caller fail-stops the reader.
+    pub writer_appeared: bool,
 }
 
 /// Bounded re-reads for a reader whose extent read raced the writer's
@@ -3224,6 +3229,11 @@ impl NodeCache {
     /// The epoch in force (0 = un-armed; the shipped write-mount posture).
     pub fn revalidation_epoch(&self) -> u64 {
         self.env.epoch.probe()
+    }
+
+    /// The durable tail the epoch word carries (the reader's outcome face).
+    pub fn revalidation_tail(&self) -> u64 {
+        self.env.epoch.tail()
     }
 
     /// The ledger seq the reader adopted at its last poll (the epoch IS

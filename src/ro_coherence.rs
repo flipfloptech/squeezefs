@@ -666,8 +666,9 @@ pub fn refuse_explicit_ttls_under_tokens(
     }
     Err(format!(
         "a -o ro mount with an explicit non-zero kernel cache TTL ({}): a read-only mount is a \
-         READ-TOKEN client (every one since the PR-14 flip) and under read tokens every kernel \
-         TTL derives to 0 — a dentry or attribute the kernel keeps past a recall is a \
+         READ-TOKEN client (or, on an idle set, a quiescent reader that fail-stops when a \
+         writer appears) and under either every kernel TTL derives to 0 — a dentry or \
+         attribute the kernel keeps past a recall or past the fail-stop is a \
          bounded-staleness read method, which design-symmetric-metadata R-SYM-4 forbids. Drop \
          the option",
         nonzero.join(", ")
@@ -693,8 +694,12 @@ pub enum ReaderArm {
 /// The QUIESCENT-SET reader posture's latch (the arm sets it; the stats
 /// face reads it as `reader_quiescent`).
 static QUIESCENT_READER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The fail-stop's one-shot gate: the pass that first finds the writer
+/// wins it, runs the mount's action, THEN publishes the gauge below.
+static QUIESCENT_FIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A writer appeared under a quiescent reader and the reader FAIL-STOPPED
-/// (`reader_quiescent_writer_appeared`; one-shot).
+/// (`reader_quiescent_writer_appeared`) — set after the action ran, so a
+/// reader of the gauge never sees 1 while an op can still serve.
 static QUIESCENT_WRITER_APPEARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -712,29 +717,54 @@ pub fn quiescent_writer_appeared() -> bool {
     QUIESCENT_WRITER_APPEARED.load(Ordering::Acquire)
 }
 
-/// Test seam: clear both quiescent latches between in-process contracts.
+/// Test seam: clear the quiescent latches between in-process contracts.
 pub fn test_reset_quiescent_reader() {
     QUIESCENT_READER.store(false, Ordering::Release);
+    QUIESCENT_FIRING.store(false, Ordering::Release);
     QUIESCENT_WRITER_APPEARED.store(false, Ordering::Release);
 }
 
-/// The revalidation poll's WRITER WATCH on a quiescent reader: `true`
-/// exactly once — the pass that first finds a live manager on any volume
-/// ([`crate::meta_backend::live_manager_present`]); the caller runs the
-/// mount's fail-stop action on it. One flock probe + one claim read per
-/// volume per pass; nothing on a token reader or a write mount.
-pub async fn quiescent_writer_check(volumes: &[Arc<KvMetaBackend>]) -> bool {
-    if !quiescent_reader() || quiescent_writer_appeared() {
+/// The quiescent reader's SAME-HOST writer watch — the half of the watch
+/// that sees a writer BEFORE its first checkpoint: another process on this
+/// host holds the volume's exclusive writer lock (`probe_shared_lock`).
+/// One flock probe per volume per pass; nothing on a token reader, a write
+/// mount, or a reader already stopped. A REMOTE writer is seen by the
+/// other half — its first checkpoint advances the ledger, which
+/// `revalidate_reader` refuses to adopt on a quiescent volume
+/// (`RevalidateOutcome::writer_appeared`).
+pub fn quiescent_local_writer_present(volumes: &[Arc<KvMetaBackend>]) -> bool {
+    if !quiescent_reader() || QUIESCENT_FIRING.load(Ordering::Acquire) {
         return false;
     }
-    for v in volumes {
-        if crate::meta_backend::live_manager_present(v).await {
-            return QUIESCENT_WRITER_APPEARED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok();
-        }
+    volumes.iter().any(|v| {
+        matches!(
+            KvMetaBackend::probe_shared_lock(v.device_path()),
+            crate::meta_backend::kv::backend::SharedProbe::LocalExclusiveHolder
+        )
+    })
+}
+
+/// **The quiescent reader's fail-stop, once**: the first caller wins the
+/// gate, runs the mount's action (the routed gate latched FIRST, then the
+/// tier purge — a serve racing the purge is refused before it can
+/// re-admit a key), then publishes the gauge. `true` for the winner.
+pub fn quiescent_fire(on_writer_appeared: Option<&Arc<dyn Fn() + Send + Sync>>) -> bool {
+    if QUIESCENT_FIRING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
     }
-    false
+    log::error!(
+        "QUIESCENT-SET reader: a writer mounted this set — this -o ro mount served the \
+         checkpointed projection and now FAIL-STOPS (every metadata op refuses ESTALE); \
+         remount to join as a token reader (design-symmetric-metadata §5.7.2, R-SYM-4)"
+    );
+    if let Some(act) = on_writer_appeared {
+        act();
+    }
+    QUIESCENT_WRITER_APPEARED.store(true, Ordering::Release);
+    true
 }
 
 /// **The mount-path arm of the token client** (§5.7.2 — `-o ro` =
@@ -770,6 +800,33 @@ pub async fn arm_token_readers(
     let Some(first) = volumes.first() else {
         return Ok(ReaderArm::NotRequested);
     };
+    // The QUIESCENT-SET reader (record §4.4br), decided FIRST: with no
+    // live manager on any volume there is no holder to grant a token and
+    // nothing that can change a record, on ANY layout — the token
+    // posture's requirements below are a live manager's. This backend's
+    // open replayed everything durable, so its claim word is current.
+    let mut live = false;
+    for v in volumes {
+        if crate::meta_backend::live_manager_present(v).await {
+            live = true;
+            break;
+        }
+    }
+    if !live {
+        for v in volumes {
+            v.set_quiescent_reader();
+        }
+        QUIESCENT_READER.store(true, Ordering::Release);
+        log::warn!(
+            "QUIESCENT-SET reader: no writer is mounted on this set (no local writer lock, no \
+             heartbeat-fresh writer_claim on any volume) — this -o ro mount serves the \
+             checkpointed projection, which nothing changes; a writer that mounts later is \
+             seen at this reader's next poll (its lock on this host, or its first checkpoint \
+             advancing the ledger) and the reader FAIL-STOPS loud (every metadata op ESTALE; \
+             remount to join as a token reader — design-symmetric-metadata §5.7.2, R-SYM-4)"
+        );
+        return Ok(ReaderArm::Quiescent);
+    }
     for v in volumes {
         if !v.symmetric_forest() {
             return Err(format!(
@@ -809,24 +866,6 @@ pub async fn arm_token_readers(
         );
     }
     arm_serve_ledger();
-    let mut live = false;
-    for v in volumes {
-        if crate::meta_backend::live_manager_present(v).await {
-            live = true;
-            break;
-        }
-    }
-    if !live {
-        QUIESCENT_READER.store(true, Ordering::Release);
-        log::warn!(
-            "QUIESCENT-SET reader: no writer is mounted on this set (no local writer lock, no \
-             heartbeat-fresh writer_claim on any volume) — this -o ro mount serves the \
-             checkpointed projection, which nothing changes; if a writer mounts while this \
-             reader is up the reader FAIL-STOPS loud (every metadata op refuses; remount to \
-             join as a token reader — design-symmetric-metadata §5.7.2, R-SYM-4)"
-        );
-        return Ok(ReaderArm::Quiescent);
-    }
     let Some(member) = crate::membership::installed_member() else {
         return Err(
             "a -o ro mount whose reader holds no membership lease: a token client IS a \
@@ -1166,19 +1205,15 @@ pub fn spawn_reader_revalidation(
                 log::info!("reader revalidation stopping (dismount)");
                 return;
             }
-            // The QUIESCENT-SET reader's writer watch (record §4.4br):
-            // the first pass that finds a live manager runs the mount's
-            // fail-stop action once — inert on a token reader.
-            if quiescent_writer_check(&volumes).await {
-                log::error!(
-                    "QUIESCENT-SET reader: a writer mounted this set — this -o ro mount served \
-                     the checkpointed projection and now FAIL-STOPS (every metadata op refuses); \
-                     remount to join as a token reader (design-symmetric-metadata §5.7.2, \
-                     R-SYM-4)"
-                );
-                if let Some(act) = on_writer_appeared.as_ref() {
-                    act();
-                }
+            // The QUIESCENT-SET reader's writer watch (record §4.4br), the
+            // same-host half: a writer holding the lock on this host before
+            // its first checkpoint. A stopped reader adopts nothing more —
+            // its poll idles at the cadence until dismount.
+            if quiescent_local_writer_present(&volumes) {
+                quiescent_fire(on_writer_appeared.as_ref());
+            }
+            if quiescent_writer_appeared() {
+                continue;
             }
             // Spec §6.8 item 3: the pass's START is what qualifies an
             // acknowledgement (the ledger read must post-date the label
@@ -1190,6 +1225,12 @@ pub fn spawn_reader_revalidation(
             // a wake arrived early — contributes no entry).
             for (idx, res) in poller.poll_set_at(&volumes, pass_start).await {
                 match res {
+                    // The watch's other half: a quiescent volume's ledger
+                    // advanced — a writer's first checkpoint, refused by
+                    // the pass, fail-stopping the reader here.
+                    Ok(out) if out.writer_appeared => {
+                        quiescent_fire(on_writer_appeared.as_ref());
+                    }
                     Ok(out) if out.advanced => {
                         advanced_any = true;
                         log::debug!(

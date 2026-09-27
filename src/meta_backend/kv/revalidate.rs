@@ -486,6 +486,23 @@ impl KvMetaBackend {
             ));
         }
         let epoch = self.read_root_epoch().await?;
+        // The QUIESCENT-SET reader (record §4.4br): nothing writes on a
+        // quiescent set — a probe writes nothing, a second reader writes
+        // nothing, every writing offline verb holds the flock — so a record
+        // newer than the adopted one IS a writer's first checkpoint. The
+        // swap is refused (adopting it would serve a live writer's state
+        // from a projection, R-SYM-4's second method) and the caller
+        // fail-stops the reader.
+        let current = self.node_cache().revalidation_epoch();
+        if self.quiescent_reader.load(Ordering::Acquire) && epoch.ledger_seq > current {
+            return Ok(RevalidateOutcome {
+                writer_appeared: true,
+                from_epoch: current,
+                epoch: current,
+                tail: self.node_cache().revalidation_tail(),
+                ..Default::default()
+            });
+        }
         let trees = self.all_trees();
         let out = revalidate_trees(self.node_cache(), &trees, &epoch);
         if out.advanced {
@@ -498,6 +515,12 @@ impl KvMetaBackend {
             self.forest_reader_resync().await?;
         }
         Ok(out)
+    }
+
+    /// Declare this volume a QUIESCENT reader's (record §4.4br): from here a
+    /// ledger advance is a writer, refused by [`Self::revalidate_reader`].
+    pub fn set_quiescent_reader(&self) {
+        self.quiescent_reader.store(true, Ordering::Release);
     }
 
     /// The reader's live epoch (0 = not a reader) — the seqlock-style handle

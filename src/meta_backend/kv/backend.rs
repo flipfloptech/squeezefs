@@ -1516,6 +1516,10 @@ pub struct KvMetaBackend {
     /// predicted ledger slot — the gap belt's counter (PR 13, defect 25;
     /// `Self::read_root_epoch`). 0 on every write mount.
     pub(super) reader_poll_stops: AtomicU64,
+    /// The QUIESCENT-SET reader's word on this volume (record §4.4br —
+    /// `ro_coherence::arm_token_readers` sets it): a ledger advance is a
+    /// writer, refused by `revalidate_reader` instead of adopted.
+    pub(super) quiescent_reader: AtomicBool,
     /// The `journal_tail_seq` of the last ledger record written (starts
     /// at the mounted record's tail) — the §4.4 pt 4 hole discipline's
     /// progress observable ([`Self::checkpoint_past`]).
@@ -3046,6 +3050,7 @@ impl KvMetaBackend {
             // agree except after a genuine failed-cycle raise.
             checkpoint_seq: AtomicU64::new(ledger.seq.max(alloc.resume_generation())),
             reader_poll_stops: AtomicU64::new(0),
+            quiescent_reader: AtomicBool::new(false),
             last_ledger_tail: AtomicU64::new(ledger.journal_tail_seq),
             // PR VL5a (§5.5.1a): seed the live stamp from the mounted
             // record — every checkpoint re-writes it, so a slot-mapped

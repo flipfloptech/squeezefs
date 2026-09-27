@@ -1097,12 +1097,14 @@ impl FabricEndpoint {
 
 /// The durable **multi-writer upgrade-intent marker** record name
 /// (KD-MW-1, design-full-multi-writer §6.2 mechanism i): written as the
-/// FIRST act of `squeezefs volume enable-multi-writer` on **ino 1 of
-/// volume 0** (the KD-2 plane — whole-tx atomic, torn-immune, offline
-/// probe-readable; VAL-2-allowlist-invisible like `job:` /
-/// `alloc_lane:` / `fabric_endpoint:`), and DELETED as its LAST act
-/// after every volume's terminal bit (bit 11). A writable mount refuses
-/// while the marker exists — the enable verb's own D0-guarded open is
+/// FIRST act of the nine-bit stamp — `squeezefs volume enable-symmetric`'s
+/// first half on a `--single-writer` set since PR 14 (the retired
+/// `enable-multi-writer`'s body) — on **ino 1 of volume 0** (the KD-2
+/// plane — whole-tx atomic, torn-immune, offline probe-readable;
+/// VAL-2-allowlist-invisible like `job:` / `fabric_endpoint:`), and
+/// DELETED as the stamp's LAST act after every volume's terminal bit
+/// (bit 11). A writable mount refuses while the marker exists, naming
+/// `enable-symmetric` as the resume — the stamp's own D0-guarded open is
 /// the ONE marker-tolerant writable open (it never routes through
 /// [`meta_backend::open_routed_meta_set`]'s gate by construction).
 pub const MW_UPGRADE_MARKER_XATTR: &str = "mw_upgrade:intent";

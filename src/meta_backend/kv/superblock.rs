@@ -340,8 +340,8 @@ pub const FEATURE_INCOMPAT_KV_WRITER_SCOPED_STAGING: u64 = 1 << WRITER_SCOPED_ST
 /// Since the rung-10b **Phase-B flip** the public formatters stamp it as
 /// part of the one-act nine-bit [`MULTI_WRITER_FORMAT_BITS`] default
 /// (`--single-writer` opts out — never this bit alone), and
-/// [`set_multi_writer_data_bit`] is the `enable-multi-writer` upgrade
-/// path's TERMINAL stamp. A volume without it behaves exactly as before
+/// [`set_multi_writer_data_bit`] is the nine-bit upgrade stamp's TERMINAL
+/// write (`enable-symmetric`'s first half since PR 14). A volume without it behaves exactly as before
 /// and `SQUEEZEFS_MULTI_WRITER=1` refuses the mount loud, naming the bit.
 ///
 /// Old binaries refuse a bit-11 volume loud via their own
@@ -472,7 +472,7 @@ pub const FEATURE_INCOMPAT_KV_BLOCK_KEY_INCARNATION: u64 = 1 << 13;
 /// Since the rung-10b Phase-B flip the public formatters stamp it as part
 /// of the one-act nine-bit [`MULTI_WRITER_FORMAT_BITS`] default
 /// (`--single-writer` opts out), and [`set_claim_set_bit`] is the
-/// `enable-multi-writer` upgrade path's stamp.
+/// nine-bit upgrade stamp's write (`enable-symmetric`'s first half).
 ///
 /// Old binaries refuse a bit-12 volume loud via their own
 /// [`FEATURES_INCOMPAT_KNOWN`] gate — exactly right: they would read a set
@@ -595,7 +595,9 @@ pub const FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST: u64 = 1 << 17;
 /// `format` (all nine in one planned superblock write; the rung-10b
 /// Phase-B flip, with `--single-writer` the explicit unstamped-class
 /// opt-out) or the
-/// ordered, crash-resumable `squeezefs volume enable-multi-writer` verb
+/// ordered, crash-resumable nine-bit stamp — `squeezefs volume
+/// enable-symmetric`'s first half on a `--single-writer` set since PR 14,
+/// the retired `enable-multi-writer`'s body
 /// (per-volume order 7→9→15→12→13→8→10→14→11, bit 11 deliberately
 /// TERMINAL so *"bit 11 set ⇒ all nine set"* is an invariant the mount
 /// gate can enforce — [`crate::meta_backend::open_routed_meta_set`]'s
@@ -1677,7 +1679,8 @@ pub async fn set_block_refcounts_bit(path: &Path) -> Result<bool, KvError> {
 
 /// Stamp [`FEATURE_INCOMPAT_KV_PARTITIONED_APPEND`] on `path`'s superblock
 /// — the §6.2 items-2/3/4 upgrade path (the batched Phase-8 reformat
-/// window / the KD-MW-1 `enable-multi-writer` verb; **mount NEVER calls
+/// window / the KD-MW-1 nine-bit stamp, `enable-symmetric`'s first half;
+/// **mount NEVER calls
 /// this**, ruling D9). Returns whether the bit was newly set. The volume
 /// must be offline (the caller holds the D0 guard).
 ///

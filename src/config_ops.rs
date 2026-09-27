@@ -1996,10 +1996,12 @@ pub enum AddMetaCrash {
     SurvivorStamps,
 }
 
-/// The §6.2 MW-S1b crash seams of [`enable_multi_writer_with`]
-/// (design-full-multi-writer §10): each injects a hard error AFTER the
-/// named durable write, so the on-media state is exactly the kill-9
-/// window's (the [`AddMetaCrash`] pattern).
+/// The §6.2 MW-S1b crash seams of the nine-bit stamp
+/// ([`stamp_multi_writer_bits`] — `enable-symmetric`'s first half since
+/// PR 14; design-full-multi-writer §10): each injects a hard error AFTER
+/// the named durable write, so the on-media state is exactly the kill-9
+/// window's (the [`AddMetaCrash`] pattern). Reached through
+/// [`EnableSymCrash::Stamp`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnableMwCrash {
     /// After the `mw_upgrade:` intent marker landed durably on volume 0,
@@ -2013,21 +2015,22 @@ pub enum EnableMwCrash {
     AfterBit { volume: usize, bits_done: usize },
 }
 
-/// Test seams for [`enable_multi_writer_with`] (MW-S1/S1b).
-#[derive(Default)]
-pub struct EnableMwHooks {
-    pub crash_after: Option<EnableMwCrash>,
-}
-
-/// What [`enable_multi_writer`] did.
-#[derive(Debug, Clone)]
-pub struct EnableMwReport {
-    /// Newly-written bits across the whole set (0 = the set was already
-    /// fully multi-writer-capable and the verb wrote nothing).
-    pub bits_stamped: usize,
-    /// The set's volumes in canonical member order (volume 0 first).
-    pub volumes: Vec<String>,
-}
+/// The retired verb's refusal (PR 14 fix round 3, class B — the record's
+/// §4.4bm): `squeezefs volume enable-multi-writer` upgraded a
+/// `--single-writer` set to the PRE-FLIP multi-writer-flat class, which
+/// no writer's door admits since the default flip (design-symmetric-
+/// metadata §7.2 — presence-required on the forest), so the verb could
+/// only leave a set unmountable for writers. The nine-bit stamp is
+/// `enable-symmetric`'s FIRST half now ([`stamp_multi_writer_bits`]): one
+/// upgrade verb, one act.
+pub const ENABLE_MULTI_WRITER_RETIRED: &str = "squeezefs volume enable-multi-writer is RETIRED \
+    (PR 14, the symmetric default flip — design-symmetric-metadata §7.2): it upgraded a set to \
+    the pre-flip multi-writer-flat class, which no writer's door admits any more (presence-\
+    required on the forest), so it could only leave the set unmountable for writers. Run \
+    `squeezefs volume enable-symmetric <sqmeta-uri>` instead — on a `--single-writer` set it \
+    stamps the nine multi-writer format bits as its first act (the same ordered, marker-\
+    bracketed, crash-resumable stamp) and converts the set to the forest in the same \
+    invocation. Nothing was written";
 
 /// The §6.2 per-volume stamp order (KD-MW-1): dependencies first — bit 13
 /// after bit 7 per its own refusal law — and bit 11 deliberately
@@ -2055,70 +2058,86 @@ async fn stamp_mw_bit(
     }
 }
 
-/// `squeezefs volume enable-multi-writer <sqmeta-uri>` — the KD-MW-1
-/// upgrade verb for EXISTING volume sets (design-full-multi-writer §6.2
-/// pt 2): **offline** (the `add-meta` D0-guarded coordinator posture),
-/// all volumes of the set in ONE invocation, per-volume bit order
-/// `7→9→15→12→13→8→10→14→11` (`MW_ENABLE_ORDER`), each stamp barriered
-/// (the superblock bit-setters' existing
-/// semantics), idempotent (each setter is a no-op on a set bit) and
-/// crash-resumable (re-run with the same URI).
+/// Whether the set's canonical volume 0 carries the `mw_upgrade:` intent
+/// marker (a nine-bit stamp crashed mid-run) — one probe read, nothing
+/// written.
+async fn mw_upgrade_marker_present(vol0: &str) -> Result<bool> {
+    let be = crate::meta_backend::kv::backend::KvMetaBackend::open_probe(Path::new(vol0)).await?;
+    Ok(be
+        .getxattr(1, crate::MW_UPGRADE_MARKER_XATTR)
+        .await?
+        .is_some())
+}
+
+/// The nine multi-writer format bits each volume of `ordered` still
+/// lacks, summed — what [`stamp_multi_writer_bits`] would write (0 = the
+/// set is already of the multi-writer class).
+async fn multi_writer_bits_missing(ordered: &[String]) -> Result<usize> {
+    use crate::meta_backend::kv::superblock as sb;
+    let mut missing = 0usize;
+    for path in ordered {
+        let features = match sb::classify_volume(Path::new(path)).await? {
+            sb::VolumeFormat::V3(s) => s.features_incompat,
+            _ => 0,
+        };
+        missing += (sb::MULTI_WRITER_FORMAT_BITS & !features).count_ones() as usize;
+    }
+    Ok(missing)
+}
+
+/// **The nine-bit stamp — `enable-symmetric`'s FIRST half on a
+/// `--single-writer` set** (PR 14 fix round 3, class B; the record's
+/// §4.4bm — until then the body of the retired `volume enable-multi-
+/// writer`, design-full-multi-writer §6.2 pt 2, KD-MW-1): **offline**
+/// (the `add-meta` D0-guarded coordinator posture), all volumes of the
+/// set in ONE invocation, per-volume bit order `7→9→15→12→13→8→10→14→11`
+/// (`MW_ENABLE_ORDER`), each stamp barriered (the superblock
+/// bit-setters' existing semantics), idempotent (each setter is a no-op
+/// on a set bit) and crash-resumable (a re-run of `enable-symmetric`
+/// with the same URI completes it before it converts).
 ///
 /// The two §6.2 mechanisms:
 ///
-/// 1. **The `mw_upgrade:` intent marker** — the verb's FIRST act writes
+/// 1. **The `mw_upgrade:` intent marker** — the stamp's FIRST act writes
 ///    one [`crate::MwUpgradeMarker`] record on ino 1 of volume 0 (the
 ///    KD-2 plane) naming the target bit set + canonical volume list, and
 ///    its LAST act (after every volume's terminal bit 11) deletes it. A
-///    writable mount refuses while the marker exists.
-/// 2. **Serialization** — the verb asserts the D0 guard (a guarded
+///    writable mount refuses while the marker exists — naming
+///    `enable-symmetric` as the resume.
+/// 2. **Serialization** — the stamp asserts the D0 guard (a guarded
 ///    [`crate::meta_backend::kv::backend::KvMetaBackend::open`] of volume 0,
 ///    held across every write) before its first write, so
-///    `set_incompat_bit`'s unsynchronized RMW has
-///    exactly one setter: a second concurrent invocation refuses on the
-///    guard, and no runtime stamper can run because the set is offline.
-///    This guarded open is **the ONE marker-tolerant writable open**
-///    (scoped here by construction — it never routes through
+///    `set_incompat_bit`'s unsynchronized RMW has exactly one setter: a
+///    second concurrent invocation refuses on the guard, and no runtime
+///    stamper can run because the set is offline. This guarded open is
+///    **the ONE marker-tolerant writable open** (scoped here by
+///    construction — it never routes through
 ///    [`crate::meta_backend::open_routed_meta_set`]'s gate), which is what
-///    lets the verb resume its own crashed run.
-pub async fn enable_multi_writer(meta_lvs: &[String]) -> Result<EnableMwReport> {
-    enable_multi_writer_with(meta_lvs, &EnableMwHooks::default()).await
-}
-
-/// [`enable_multi_writer`] with the §10 MW-S1/S1b crash seams exposed.
-pub async fn enable_multi_writer_with(
-    meta_lvs: &[String],
-    hooks: &EnableMwHooks,
-) -> Result<EnableMwReport> {
+///    lets a re-run resume a crashed stamp; it runs under the conversion's
+///    [`crate::meta_backend::kv::backend::PreFlipAdmission`], since a
+///    volume 0 the crashed run already stamped is the pre-flip class the
+///    writer's door refuses presence-required.
+///
+/// Returns the newly-written bit count across the set (0 = already of
+/// the class, nothing written — the no-op that makes every
+/// `enable-symmetric` run idempotent here).
+async fn stamp_multi_writer_bits(
+    ordered: &[String],
+    crash_after: Option<EnableMwCrash>,
+) -> Result<usize> {
     use crate::meta_backend::kv::backend::KvMetaBackend;
     use crate::meta_backend::kv::superblock as sb;
 
-    // Live-client gate on EVERY volume before anything is touched (the
-    // add-meta posture; `true` = the already-formatted refusal does not
-    // apply — upgrading formatted volumes is the whole point).
-    for path in meta_lvs {
-        crate::meta_backend::kv::builder::format_preflight(Path::new(path), true)
-            .await
-            .map_err(|e| {
-                SqueezefsError::InvalidOperation(format!("volume enable-multi-writer refused: {e}"))
-            })?;
-    }
-
-    // Canonical member order (§5.5.1a discovery — volume 0 first). The
-    // marker lives on volume 0 of THIS order, so resume and mount-gate
-    // reads agree on where to look regardless of URI order.
-    let disc = crate::meta_backend::discover_meta_set(meta_lvs).await?;
-    let ordered = disc.ordered_paths.clone();
-
     // The D0 guard on volume 0, asserted BEFORE the first write and held
-    // across every write of the verb (the sole-setter serialization law).
+    // across every write of the stamp (the sole-setter serialization law).
+    let _admit = crate::meta_backend::kv::backend::admit_pre_flip_writers();
     let vol0 = KvMetaBackend::open(Path::new(&ordered[0])).await?;
 
     let body = async {
         let existing = vol0.getxattr(1, crate::MW_UPGRADE_MARKER_XATTR).await?;
         let already_uniform = {
             let mut all = true;
-            for path in &ordered {
+            for path in ordered {
                 let features = match sb::classify_volume(Path::new(path)).await? {
                     sb::VolumeFormat::V3(s) => s.features_incompat,
                     _ => 0,
@@ -2136,16 +2155,19 @@ pub async fn enable_multi_writer_with(
                 // whole set" true across a crash.
                 let marker = crate::MwUpgradeMarker::decode(raw).map_err(|e| {
                     SqueezefsError::InvalidOperation(format!(
-                        "volume enable-multi-writer: the crashed run's intent marker is \
-                         unusable ({e}) — refusing to guess the target set"
+                        "volume enable-symmetric: the crashed nine-bit stamp's intent marker \
+                         (`{}`) is unusable ({e}) — refusing to guess the target set",
+                        crate::MW_UPGRADE_MARKER_XATTR
                     ))
                 })?;
                 if marker.volumes != ordered {
                     return Err(SqueezefsError::InvalidOperation(format!(
-                        "volume enable-multi-writer: an upgrade-intent marker already \
-                         names volumes {:?} — re-run the verb with exactly that set \
+                        "volume enable-symmetric: a nine-bit stamp's intent marker (`{}`) \
+                         already names volumes {:?} — re-run the verb with exactly that set \
                          (this invocation named {:?})",
-                        marker.volumes, ordered
+                        crate::MW_UPGRADE_MARKER_XATTR,
+                        marker.volumes,
+                        ordered
                     )));
                 }
             }
@@ -2160,21 +2182,22 @@ pub async fn enable_multi_writer_with(
                 // volume 0 itself).
                 let marker = crate::MwUpgradeMarker {
                     bits: sb::MULTI_WRITER_FORMAT_BITS,
-                    volumes: ordered.clone(),
+                    volumes: ordered.to_vec(),
                 };
                 vol0.setxattr_internal(1, crate::MW_UPGRADE_MARKER_XATTR, &marker.encode())
                     .await?;
                 vol0.checkpoint_now().await.map_err(|e| {
                     SqueezefsError::InvalidOperation(format!(
-                        "volume enable-multi-writer: the intent marker did not land \
-                         durably: {e}"
+                        "volume enable-symmetric: the nine-bit stamp's intent marker did not \
+                         land durably: {e}"
                     ))
                 })?;
             }
         }
-        if hooks.crash_after == Some(EnableMwCrash::AfterMarker) {
+        if crash_after == Some(EnableMwCrash::AfterMarker) {
             return Err(SqueezefsError::InvalidOperation(
-                "crash injection (enable-multi-writer: after the intent marker)".to_string(),
+                "crash injection (enable-symmetric: the nine-bit stamp after its intent marker)"
+                    .to_string(),
             ));
         }
 
@@ -2189,15 +2212,15 @@ pub async fn enable_multi_writer_with(
                 if stamp_mw_bit(Path::new(path), *bit).await? {
                     stamped += 1;
                 }
-                if hooks.crash_after
+                if crash_after
                     == Some(EnableMwCrash::AfterBit {
                         volume: vi,
                         bits_done: bi + 1,
                     })
                 {
                     return Err(SqueezefsError::InvalidOperation(format!(
-                        "crash injection (enable-multi-writer: volume {vi} after \
-                         {} bit(s))",
+                        "crash injection (enable-symmetric: the nine-bit stamp on volume {vi} \
+                         after {} bit(s))",
                         bi + 1
                     )));
                 }
@@ -2210,7 +2233,8 @@ pub async fn enable_multi_writer_with(
             .await?;
         vol0.checkpoint_now().await.map_err(|e| {
             SqueezefsError::InvalidOperation(format!(
-                "volume enable-multi-writer: the marker delete did not land durably: {e}"
+                "volume enable-symmetric: the nine-bit stamp's marker delete did not land \
+                 durably: {e}"
             ))
         })?;
         Ok(stamped)
@@ -2221,12 +2245,9 @@ pub async fn enable_multi_writer_with(
     // the same way; the durable state the seams simulate is unchanged by
     // this clean release).
     if let Err(e) = vol0.shutdown().await {
-        log::warn!("releasing guard after enable-multi-writer: {e}");
+        log::warn!("releasing guard after the nine-bit stamp: {e}");
     }
-    Ok(EnableMwReport {
-        bits_stamped: body?,
-        volumes: ordered,
-    })
+    body
 }
 
 /// What `squeezefs volume locate` answers (design-symmetric-metadata
@@ -2403,7 +2424,8 @@ pub async fn add_meta_volume_with(
         return Err(SqueezefsError::InvalidOperation(
             "volume add-meta refused: bit-11 (multi-writer) presence differs across the \
              existing set — converge it first with `squeezefs volume \
-             enable-multi-writer <sqmeta-uri>` (idempotent), then re-run the add"
+             enable-symmetric <sqmeta-uri>` (its nine-bit stamp is idempotent and resumes a \
+             crashed one), then re-run the add"
                 .to_string(),
         ));
     }
@@ -2416,7 +2438,7 @@ pub async fn add_meta_volume_with(
             "volume add-meta refused: device {device} carries the multi-writer data-plane \
              bit (11) but the set it would join is not multi-writer-capable — the bit-11 \
              uniformity law (design-full-multi-writer §6.2) holds at the add in both \
-             directions. Upgrade the set first (`squeezefs volume enable-multi-writer`) \
+             directions. Upgrade the set first (`squeezefs volume enable-symmetric`) \
              or add an unformatted device"
         )));
     }
@@ -2424,7 +2446,7 @@ pub async fn add_meta_volume_with(
         return Err(SqueezefsError::InvalidOperation(format!(
             "volume add-meta refused: device {device} is a crashed prior member WITHOUT \
              the multi-writer bits while the set is multi-writer-capable — a mixed-era \
-             resume. Finish it with `squeezefs volume enable-multi-writer <sqmeta-uri>` \
+             resume. Finish it with `squeezefs volume enable-symmetric <sqmeta-uri>` \
              over the extended set after the add converges, or reformat the device"
         )));
     }
@@ -3780,6 +3802,11 @@ pub struct EnableSymOptions {
 /// (the [`EnableMwCrash`] pattern). `volume` indexes the canonical order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnableSymCrash {
+    /// Inside the nine-bit stamp (the verb's first half on a
+    /// `--single-writer` set): the MW-S1 / MW-S1b windows — after the
+    /// `mw_upgrade:` marker, after `bits_done` bits on a volume — before
+    /// any conversion marker exists.
+    Stamp(EnableMwCrash),
     /// Every volume's marker landed; no volume converted.
     AfterMarker,
     /// The forest nodes, tree 0, the directory extent, appender 0's page
@@ -3892,14 +3919,30 @@ pub struct EnableSymReport {
     /// `volume set-owners` assignments and solo bit-8 partition records —
     /// decodable, reported, never written under bit 17.
     pub dropped: Vec<String>,
+    /// The nine multi-writer format bits the verb's FIRST half stamped
+    /// across a `--single-writer` set (0 = every volume already carried
+    /// the class); under `--dry-run` the count it WOULD stamp.
+    pub multi_writer_bits_stamped: usize,
 }
 
 /// `squeezefs volume enable-symmetric <sqmeta-uri>` — the OFFLINE
 /// conversion of every volume of a set from the three shared per-kind
 /// trees to the slot-tree forest (design-symmetric-metadata §6.2 / §7.1;
-/// the `enable-multi-writer` posture: live-client preflight on every
+/// the D0-guarded coordinator posture: live-client preflight on every
 /// volume, the D0 ladder asserted per volume, whole-set in one
-/// invocation, crash-resumable).
+/// invocation, crash-resumable) — **the ONE upgrade verb since PR 14**:
+/// on a `--single-writer` (flat, unstamped) set its FIRST half stamps the
+/// nine multi-writer format bits the forest presumes
+/// ([`stamp_multi_writer_bits`] — the retired `enable-multi-writer`'s
+/// ordered, marker-bracketed, crash-resumable stamp, which left a set in
+/// the pre-flip class no writer's door admits), then the conversion
+/// below runs in the same invocation (PR 14 fix round 3, class B — the
+/// record's §4.4bm). The stamp is idempotent (a multi-writer-class set
+/// writes nothing there) and a stamp crashed mid-run resumes on the next
+/// plain run (its `mw_upgrade:` marker names this verb); `--dry-run`
+/// reports the bits it would stamp and plans the conversion without
+/// writing either; `--abort` refuses over a crashed stamp (forward-only
+/// — the re-run completes it).
 ///
 /// **Everything that can refuse runs BEFORE the first marker, and the
 /// marker is the verb's first write.** The live-client gate, the set
@@ -4122,7 +4165,9 @@ struct SymInspection {
     symmetric: bool,
     /// The volume is NOT of the multi-writer class (a `--single-writer`
     /// format): the forest presumes the nine bits (the join ladder's rung
-    /// 2), so the conversion refuses naming `enable-multi-writer` first.
+    /// 2). The stamp half runs before the inspections, so a real run
+    /// never reads this `true`; a dry run does, and reports the bits it
+    /// would stamp.
     single_writer_class: bool,
     marker: Option<SymUpgradeMarker>,
     /// The newest ledger record carries a NON-SOLO bit-8 partition.
@@ -4425,6 +4470,43 @@ pub async fn enable_symmetric_with(
     let disc = crate::meta_backend::discover_meta_set(meta_lvs).await?;
     let ordered = disc.ordered_paths.clone();
 
+    // ---- the NINE-BIT STAMP — the verb's first half (PR 14 fix round 3,
+    // class B): a `--single-writer` set, or one whose stamp crashed
+    // mid-run (the `mw_upgrade:` marker standing on volume 0), is brought
+    // to the multi-writer class here — the retired `enable-multi-writer`'s
+    // ordered, marker-bracketed, per-bit-idempotent stamp under its own
+    // D0 guard on volume 0, BEFORE this verb's own hold (the two flocks
+    // are one file's; a concurrent invocation refuses at whichever it
+    // meets first). A set already of the class writes nothing. A dry run
+    // reports what it would stamp and plans over the flat volumes (the
+    // plan is class-blind); `--abort` writes nothing new and refuses over
+    // a crashed stamp — incompat bits are forward-only, the re-run
+    // completes it.
+    let mw_missing = multi_writer_bits_missing(&ordered).await?;
+    let mw_marker = mw_upgrade_marker_present(&ordered[0]).await?;
+    let multi_writer_bits_stamped = if opts.abort {
+        if mw_marker {
+            return Err(SqueezefsError::InvalidOperation(format!(
+                "volume enable-symmetric --abort: a nine-bit stamp's intent marker (`{}`) \
+                 stands on {} — a crashed stamp is completed by a plain re-run of the verb, \
+                 never undone (incompat bits are forward-only); nothing to abort here",
+                crate::MW_UPGRADE_MARKER_XATTR,
+                ordered[0]
+            )));
+        }
+        0
+    } else if opts.dry_run {
+        mw_missing
+    } else if mw_missing > 0 || mw_marker {
+        let crash_after = match hooks.crash_after {
+            Some(EnableSymCrash::Stamp(c)) => Some(c),
+            _ => None,
+        };
+        stamp_multi_writer_bits(&ordered, crash_after).await?
+    } else {
+        0
+    };
+
     // The verb's D0 hold, BEFORE the inspection: from here a concurrent
     // invocation refuses at Layer A, so no two verbs pass the inspection
     // against the same extents.
@@ -4513,7 +4595,9 @@ pub async fn enable_symmetric_with(
             markers
         )));
     }
-    if opts.resume && markers.is_empty() {
+    // A crashed nine-bit stamp is a resumable state too: `--resume` over
+    // one completes the stamp above and converts as a plain run would.
+    if opts.resume && markers.is_empty() && multi_writer_bits_stamped == 0 {
         return Err(SqueezefsError::InvalidOperation(
             "volume enable-symmetric --resume: nothing to resume — no volume of the set \
              carries a conversion marker (run the verb without --resume to convert a flat set)"
@@ -4539,12 +4623,15 @@ pub async fn enable_symmetric_with(
                  dynamic-routing set member (reformat required)"
             )));
         }
-        if ins.single_writer_class {
+        if ins.single_writer_class && !opts.dry_run {
+            // The stamp half ran before this inspection on a real run; a
+            // volume still reading flat-class here is the invariant
+            // tripwire, never the operator's error.
             return Err(SqueezefsError::InvalidOperation(format!(
-                "volume enable-symmetric: {path} is a `--single-writer` (flat, unstamped) volume \
-                 — the forest presumes the nine multi-writer format bits (design-symmetric-\
-                 metadata §6.2; the join ladder's rung 2 demands them on every volume). Run \
-                 `squeezefs volume enable-multi-writer <sqmeta-uri>` offline first, then re-run"
+                "volume enable-symmetric: {path} still reads as a `--single-writer` (flat, \
+                 unstamped) volume after the verb's own nine-bit stamp — the forest presumes \
+                 the nine multi-writer format bits (design-symmetric-metadata §6.2; the join \
+                 ladder's rung 2 demands them on every volume); refusing"
             )));
         }
         if ins.window_entries > 0 && ins.marker.is_none() {
@@ -4639,6 +4726,7 @@ pub async fn enable_symmetric_with(
             volumes: ordered,
             rows,
             dropped,
+            multi_writer_bits_stamped,
         });
     }
 
@@ -4708,6 +4796,7 @@ pub async fn enable_symmetric_with(
         volumes: ordered,
         rows,
         dropped,
+        multi_writer_bits_stamped,
     })
 }
 
@@ -4797,6 +4886,7 @@ async fn abort_conversion(
         volumes: ordered.to_vec(),
         rows,
         dropped: Vec::new(),
+        multi_writer_bits_stamped: 0,
     })
 }
 

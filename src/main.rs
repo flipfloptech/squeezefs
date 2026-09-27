@@ -110,7 +110,8 @@ enum Commands {
         /// flip (PR 14) this is the only flat class a writer may mount;
         /// repair/fsck verbs run against either class, so fixing a
         /// filesystem never requires it. Upgrade later with `squeezefs
-        /// volume enable-multi-writer` then `enable-symmetric`. Conflicts
+        /// volume enable-symmetric` (one act: the nine multi-writer bits,
+        /// then the forest). Conflicts
         /// with `--multi-writer` and `--symmetric`: the flags declare
         /// contradictory format classes, and formatting either silently
         /// would produce the class the operator did not ask for.
@@ -1380,26 +1381,17 @@ enum VolumeActions {
         #[arg(long, default_value = "1")]
         take_slots: String,
     },
-    // Anchors: design-full-multi-writer §6.2 pt 2 (KD-MW-1); crash
-    // windows MW-S1/S1b/S2/S3 (§10). Offline D0-guarded coordinator,
-    // the add-meta posture.
-    /// Upgrade an existing volume set to multi-writer-capable
-    ///
-    /// For older sets that predate the default flip and for sets
-    /// formatted `--single-writer` (fresh `squeezefs format` stamps the
-    /// bits by default). Stamps the nine multi-writer incompat bits on
-    /// every metadata volume of the set in one invocation (dependency
-    /// order, bit 11 terminal), bracketed by a durable upgrade-intent
-    /// marker: a writable mount refuses while the upgrade is incomplete.
-    /// Idempotent and crash-resumable: re-run with the same URI. There
-    /// is no downgrade verb (forward-only); pre-multi-writer binaries
-    /// refuse to open the upgraded set.
-    ///
-    /// Offline verb: unmount first and pass the sqmeta:// URI. The
-    /// coordinator takes the exclusive writer guard before its first
-    /// write; a concurrent invocation refuses on the guard.
+    // RETIRED at PR 14 (design-symmetric-metadata §7.2, forward-only):
+    // the nine-bit stamp is `enable-symmetric`'s first act on a
+    // `--single-writer` set; a set left in the pre-flip multi-writer-flat
+    // class mounts for no writer. The verb stays declared so the refusal
+    // is ours (loud, naming the successor) instead of clap's generic
+    // unknown-verb error.
+    /// RETIRED: `volume enable-symmetric` stamps the nine multi-writer bits as its first act
+    #[command(hide = true)]
     EnableMultiWriter {
         /// sqmeta:// URI of the metadata volume set
+        #[arg(hide = true)]
         target: String,
     },
     // Anchors: design-symmetric-metadata §6.2 / §7.1–§7.3 (PR 11).
@@ -4175,7 +4167,8 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                      multi-writer format bits, no symmetric forest) — one writer, no \
                      readers or joiners; readable by pre-multi-writer binaries, e.g. a \
                      recovery scratch volume. Upgrade later with `squeezefs volume \
-                     enable-multi-writer` then `enable-symmetric`."
+                     enable-symmetric` (one act: the nine multi-writer bits, then the \
+                     forest)."
                 );
             } else {
                 if multi_writer {
@@ -4758,31 +4751,11 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 VolumeActions::EnableMultiWriter { target } => {
-                    if live(&target) {
-                        return Err("volume enable-multi-writer is an OFFLINE verb \
-                             (design-full-multi-writer §6.2: the ordered nine-bit stamp \
-                             runs under a D0-guarded coordinator, the add-meta posture): \
-                             unmount first and pass the sqmeta:// URI"
-                            .into());
-                    }
-                    let meta_lvs = parse_block_uri(&target, "sqmeta://")?;
-                    let report = squeezefs::config_ops::enable_multi_writer(&meta_lvs).await?;
-                    if report.bits_stamped == 0 {
-                        println!(
-                            "Volume set is already multi-writer-capable ({} volume(s)); \
-                             nothing written.",
-                            report.volumes.len()
-                        );
-                    } else {
-                        println!(
-                            "Upgraded {} metadata volume(s) to multi-writer-capable \
-                             ({} bit stamp(s) written; intent marker deleted). \
-                             Pre-multi-writer binaries refuse this set loud; there is \
-                             no downgrade verb — `format --force` reformats.",
-                            report.volumes.len(),
-                            report.bits_stamped
-                        );
-                    }
+                    return Err(format!(
+                        "{} (target {target})",
+                        squeezefs::config_ops::ENABLE_MULTI_WRITER_RETIRED
+                    )
+                    .into());
                 }
                 VolumeActions::EnableSymmetric {
                     target,
@@ -4793,7 +4766,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if live(&target) {
                         return Err("volume enable-symmetric is an OFFLINE verb \
                              (design-symmetric-metadata §6.2: the conversion runs under a \
-                             D0-guarded coordinator, the enable-multi-writer posture): \
+                             D0-guarded coordinator, the add-meta posture): \
                              unmount first and pass the sqmeta:// URI"
                             .into());
                     }
@@ -4804,6 +4777,23 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         abort,
                     };
                     let report = squeezefs::config_ops::enable_symmetric(&meta_lvs, &opts).await?;
+                    if report.multi_writer_bits_stamped > 0 {
+                        if dry_run {
+                            println!(
+                                "PLAN — the set is `--single-writer` class: the run stamps {} \
+                                 multi-writer format bit(s) first (the forest presumes the nine; \
+                                 ordered, marker-bracketed, crash-resumable), then converts \
+                                 (dry run; nothing written)",
+                                report.multi_writer_bits_stamped
+                            );
+                        } else {
+                            println!(
+                                "Stamped {} multi-writer format bit(s) across the set first (the \
+                                 forest presumes the nine; intent marker deleted).",
+                                report.multi_writer_bits_stamped
+                            );
+                        }
+                    }
                     for line in &report.dropped {
                         println!("DROPPED: {line}");
                     }

@@ -12,8 +12,9 @@
 //! possible and rides the require-mount gate. Layout-blind like its
 //! in-process sibling: the source is formatted `--single-writer` through
 //! the binary (the ONE flat writable class since the PR-14 flip; no seam
-//! is read by the binary's format arm), and the two operator verbs —
-//! `enable-multi-writer`, then `enable-symmetric` — are what stamp.
+//! is read by the binary's format arm), and the ONE operator verb —
+//! `enable-symmetric`, whose first half stamps the nine multi-writer bits
+//! (PR 14 fix round 3) — is what stamps.
 
 use squeezefs_testkit::{mount_supported, site};
 use std::io::Write as _;
@@ -345,20 +346,12 @@ fn a_populated_flat_set_converts_and_reads_back_byte_exact_through_a_forest_moun
     );
     writer.umount_clean();
 
-    // The conversion, through the binary — the operator's two verbs on a
+    // The conversion, through the binary — the operator's ONE verb on a
     // `--single-writer` volume (the ONE flat writable class since the
-    // flip; a pre-1.3.0 default volume already carries the nine
-    // multi-writer bits and skips the first): `enable-multi-writer`
-    // stamps the nine bits the forest presumes (design §6.2, the join
-    // ladder's rung 2), then `enable-symmetric` — a dry run first, writing
-    // nothing.
-    run_ok(
-        Command::new(bin())
-            .arg("volume")
-            .arg("enable-multi-writer")
-            .arg(format!("sqmeta://{}", meta.display())),
-        "squeezefs volume enable-multi-writer",
-    );
+    // flip): `enable-symmetric` stamps the nine bits the forest presumes
+    // as its first half (design §6.2, the join ladder's rung 2; a
+    // pre-1.3.0 default volume already carries them and skips it), then
+    // converts — a dry run first, writing nothing and naming the stamp.
     let dry = run_ok(
         Command::new(bin())
             .arg("volume")
@@ -370,6 +363,11 @@ fn a_populated_flat_set_converts_and_reads_back_byte_exact_through_a_forest_moun
     assert!(
         String::from_utf8_lossy(&dry.stdout).contains("PLAN"),
         "the dry run prints the plan: {}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&dry.stdout).contains("multi-writer format bit"),
+        "the dry run names the nine-bit stamp its real run writes first: {}",
         String::from_utf8_lossy(&dry.stdout)
     );
     let conv = run_ok(

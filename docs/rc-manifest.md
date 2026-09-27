@@ -190,7 +190,8 @@ Every claim cites its tier. **(i) measured-real** — rows from real mounts at l
 the rung-10b Phase-B flip** (2026-08-16, `.benchmarks/2026-08-16-mw-default-flip.md`
 — user ruling 2026-08-15; `--single-writer` formats the pre-flip unstamped
 class, and pre-flip sets upgrade offline with the one-act, ordered,
-crash-resumable `squeezefs volume enable-multi-writer`). The "at format
+crash-resumable nine-bit stamp — `squeezefs volume enable-symmetric`'s
+first half since PR 14 fix round 3; `enable-multi-writer` is retired). The "at format
 (10b flip)" rows below read as: stamped on the default class, absent on
 `--single-writer`/pre-flip volumes. Ruling D9 (build the bit, never stamp
 it) governed until the §6.3 evidence gates went green; the flip retired it.
@@ -216,8 +217,8 @@ it) governed until the §6.3 evidence gates went green; the flip retired it.
 | — | Post-RSA key wrap (KW-1) | — | Ruling D3; same window |
 | — | Sharded indirect map (DUR-6 ⊕ PERF-9) | — | Same window |
 
-Stamping is unanimous per volume SET (the `enable-multi-writer` verb's
-bit-11-terminal uniformity invariant: mixed-stamp sets refuse writable
+Stamping is unanimous per volume SET (the nine-bit stamp's
+bit-11-terminal uniformity invariant — `enable-symmetric`'s first half: mixed-stamp sets refuse writable
 mounts, naming the lagging volume; bit 10's half-stamped-set-stays-unscoped
 law is subsumed by it).
 

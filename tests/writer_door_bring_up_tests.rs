@@ -23,7 +23,7 @@
 //! rail follows no calls: a helper that opens and returns the backend for
 //! a caller to bring up would be flagged (over-approximation — flags more,
 //! never less); none exists today. Every OTHER offline writable verb
-//! (`enable-symmetric`, `enable-multi-writer`, fsck's repair, defrag,
+//! (`enable-symmetric` — its nine-bit stamp half included — fsck's repair, defrag,
 //! `set-cache-paths`, the volume verbs) opens through `KvMetaBackend::open`
 //! / `open_for_sym_upgrade` — the whole D0 ladder — or through
 //! `open_probe`, which writes nothing; those are not this rail's sites.

@@ -355,10 +355,11 @@ async fn open_intent_marker_refusal(
             };
             return refuse(format!(
                 "refusing a writable mount: a multi-writer upgrade-intent marker \
-                 (`{}`) is present on volume 0 {named} — a `squeezefs volume \
-                 enable-multi-writer` run crashed mid-upgrade. Re-run `squeezefs \
-                 volume enable-multi-writer <sqmeta-uri>` (idempotent, resumes \
-                 from the crash point); read-only mounts keep serving",
+                 (`{}`) is present on volume 0 {named} — the nine-bit stamp of a \
+                 `squeezefs volume enable-symmetric` run (its first act on a \
+                 `--single-writer` set) crashed mid-stamp. Re-run `squeezefs volume \
+                 enable-symmetric <sqmeta-uri>` (idempotent: it completes the stamp \
+                 from the crash point, then converts); read-only mounts keep serving",
                 crate::MW_UPGRADE_MARKER_XATTR
             ));
         }
@@ -412,9 +413,9 @@ pub async fn open_routed_meta_set(paths: &[String]) -> Result<std::sync::Arc<Rou
     let backends = open_meta_volume_set(&disc.ordered_paths).await?;
     // §6.2 mechanism i: a writable mount refuses while the `mw_upgrade:`
     // intent marker exists (covers shape (b) on ANY volume — the marker
-    // precedes any bit write). The `volume enable-multi-writer` verb's own
-    // D0-guarded per-volume opens are the ONE marker-tolerant writable
-    // open; they never route through this gate by construction.
+    // precedes any bit write). The nine-bit stamp's own D0-guarded open
+    // (`enable-symmetric`'s first half) is the ONE marker-tolerant
+    // writable open; it never routes through this gate by construction.
     let refusal = open_intent_marker_refusal(&backends[0]).await;
     if let Some(err) = refusal {
         for be in &backends {
@@ -6633,10 +6634,10 @@ pub async fn refuse_mixed_multi_writer_set(ordered_paths: &[String]) -> Result<(
         return Err(crate::error::SqueezefsError::InvalidOperation(format!(
             "refusing a writable mount: bit-11 (multi-writer) presence differs \
              across the metadata set — {mw:?} are multi-writer-capable while \
-             {lag:?} lag (a `squeezefs volume enable-multi-writer` run crashed \
-             between volumes). Re-run `squeezefs volume enable-multi-writer \
-             <sqmeta-uri>` (idempotent) to converge; read-only mounts keep \
-             serving",
+             {lag:?} lag (the nine-bit stamp of a `squeezefs volume enable-symmetric` \
+             run crashed between volumes). Re-run `squeezefs volume enable-symmetric \
+             <sqmeta-uri>` (idempotent: the stamp converges, then the set converts); \
+             read-only mounts keep serving",
             mw = mw_volumes,
             lag = lagging,
         )));

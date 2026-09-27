@@ -6,22 +6,30 @@
 //!
 //! - **Phase B (rung 10b — the DEFAULT FLIP, user ruling 2026-08-15)**:
 //!   the DEFAULT `format` stamps all nine at plan time (one plan, one
-//!   superblock write); `--single-writer` is the explicit opt-out that
-//!   formats the pre-flip unstamped class (of the mw set only bit 7, a
-//!   pre-mw fresh-format default, remains); `--multi-writer` survives
-//!   announced-inert; the contradictory pair refuses loud. (Phase A's
-//!   dark `--multi-writer` opt-in was rung 5's; this suite's enable-verb
-//!   contracts run against the single-writer class — the class the verb
-//!   exists to upgrade.)
-//! - **`volume enable-multi-writer`** (offline, D0-guarded, the add-meta
-//!   posture): per-volume bit order 7→9→15→12→13→8→10→14→11 (13 after 7 per
-//!   its own refusal law; 11 deliberately TERMINAL), each stamp barriered,
-//!   idempotent, crash-resumable.
-//! - **The `mw_upgrade:` intent marker** (§6.2 mechanism i): the verb's
+//!   superblock write) — and, since PR 14 (the symmetric default flip),
+//!   the forest bit 17 beside them; `--single-writer` is the explicit
+//!   opt-out that formats the flat unstamped class (of the mw set only
+//!   bit 7, a pre-mw fresh-format default, remains); `--multi-writer`
+//!   survives announced-inert; the contradictory pair refuses loud.
+//!   (Phase A's dark `--multi-writer` opt-in was rung 5's; this suite's
+//!   upgrade contracts run against the single-writer class — the class
+//!   the upgrade exists to lift.)
+//! - **The nine-bit stamp is `volume enable-symmetric`'s FIRST half** (PR
+//!   14 fix round 3, class B — design-symmetric-metadata §7.2): the
+//!   retired `volume enable-multi-writer` upgraded a set to the pre-flip
+//!   multi-writer-flat class no writer's door admits, so it REFUSES loud
+//!   naming its successor; `enable-symmetric` on a `--single-writer` set
+//!   stamps the nine (offline, D0-guarded, the add-meta posture; per-volume
+//!   bit order 7→9→15→12→13→8→10→14→11 — 13 after 7 per its own refusal
+//!   law, 11 deliberately TERMINAL; each stamp barriered, idempotent,
+//!   crash-resumable) and converts the set to the forest in the same
+//!   invocation.
+//! - **The `mw_upgrade:` intent marker** (§6.2 mechanism i): the stamp's
 //!   FIRST act writes one marker record on ino 1 of volume 0 (the KD-2
 //!   plane) naming the target bit set + volume list; its LAST act deletes
-//!   it; a writable mount refuses while it exists. The enable verb's own
-//!   guarded open is the ONE marker-tolerant writable open.
+//!   it; a writable mount refuses while it exists, naming
+//!   `enable-symmetric` as the resume. The stamp's own guarded open is the
+//!   ONE marker-tolerant writable open.
 //! - **The bit-11 uniformity invariant** (§6.2 mechanism ii): writable
 //!   mounts refuse iff the marker exists, OR bit-11 presence differs across
 //!   the set (shape a), OR any volume carries bit 11 without the other
@@ -36,15 +44,15 @@
 //!   MW-S2 (bit set, structure unminted — first-mount minting is the
 //!   existing crash-safe machinery), MW-S3 (old binary refuses loud via
 //!   `FEATURES_INCOMPAT_KNOWN`).
-//! - **Serialization**: the verb asserts the D0 guard before its first
+//! - **Serialization**: the stamp asserts the D0 guard before its first
 //!   write; a second concurrent invocation refuses on the guard — extended
 //!   to cover the marker-tolerant resume open.
 
 use std::path::{Path, PathBuf};
 
 use squeezefs::config_ops::{
-    add_meta_volume, enable_multi_writer, enable_multi_writer_with, EnableMwCrash, EnableMwHooks,
-    TakeSlots,
+    add_meta_volume, enable_symmetric, enable_symmetric_with, EnableMwCrash, EnableSymCrash,
+    EnableSymHooks, EnableSymOptions, TakeSlots,
 };
 use squeezefs::meta_backend::kv::backend::KvMetaBackend;
 use squeezefs::meta_backend::kv::builder::{
@@ -53,7 +61,8 @@ use squeezefs::meta_backend::kv::builder::{
 };
 use squeezefs::meta_backend::kv::superblock as sb;
 use squeezefs::meta_backend::kv::superblock::{
-    classify_volume, VolumeFormat, FEATURES_INCOMPAT_KNOWN, MULTI_WRITER_FORMAT_BITS,
+    classify_volume, VolumeFormat, FEATURES_INCOMPAT_KNOWN, FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
+    MULTI_WRITER_FORMAT_BITS,
 };
 use squeezefs::meta_backend::{
     open_routed_meta_set, open_volume_probe, plan_meta_slot_set, Metadata,
@@ -118,6 +127,34 @@ fn has_all_nine(features: u64) -> bool {
     features & MULTI_WRITER_FORMAT_BITS == MULTI_WRITER_FORMAT_BITS
 }
 
+/// The forest (bit 17) beside all nine — what `enable-symmetric` leaves.
+fn is_forest(features: u64) -> bool {
+    has_all_nine(features) && features & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST != 0
+}
+
+/// The plain upgrade: `enable-symmetric` with no flag.
+async fn upgrade(paths: &[String]) -> squeezefs::config_ops::EnableSymReport {
+    enable_symmetric(paths, &EnableSymOptions::default())
+        .await
+        .expect("enable-symmetric")
+}
+
+/// The upgrade with a stamp-half crash seam armed.
+async fn upgrade_crashing_at(paths: &[String], at: EnableMwCrash) -> String {
+    let hooks = EnableSymHooks {
+        crash_after: Some(EnableSymCrash::Stamp(at)),
+    };
+    let err = enable_symmetric_with(paths, &EnableSymOptions::default(), &hooks)
+        .await
+        .expect_err("injected crash surfaces");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("crash injection"),
+        "the seam's own error: {msg}"
+    );
+    msg
+}
+
 fn has_none_beyond_single_writer(features: u64) -> bool {
     // The single-writer (pre-flip) posture is bits 0/1/6/7 (+2/4 on
     // stamped set members): of the mw set only bit 7 may be present.
@@ -143,9 +180,11 @@ async fn read_marker(vol0: &Path) -> Option<Vec<u8>> {
 /// §6.2 pt 1 Phase B — the flip's library equality pin: the DEFAULT
 /// formatter stamps all NINE bits in one plan/one superblock write, the
 /// `--single-writer` opt-out's feature word is byte-for-byte the pre-flip
-/// posture, and the two classes differ by EXACTLY the nine-bit mask.
+/// posture, and the two classes differ by EXACTLY the nine-bit mask plus
+/// the forest bit 17 the symmetric default flip (PR 14) added to the
+/// default — the two flips changed the format default and nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn format_default_stamps_all_nine_and_single_writer_stays_the_preflip_posture() {
+async fn format_default_stamps_all_nine_and_the_forest_and_single_writer_stays_the_flat_posture() {
     let dir = tempfile::tempdir().unwrap();
 
     let sw_vol = make_file(dir.path(), "sw.meta");
@@ -175,9 +214,9 @@ async fn format_default_stamps_all_nine_and_single_writer_stays_the_preflip_post
     );
     assert_eq!(
         feat,
-        sw_feat | MULTI_WRITER_FORMAT_BITS,
-        "the two classes differ by EXACTLY the nine-bit mask — the flip \
-         changes the format default and nothing else"
+        sw_feat | MULTI_WRITER_FORMAT_BITS | FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
+        "the two classes differ by EXACTLY the nine-bit mask plus the forest bit 17 — the \
+         two flips change the format default and nothing else"
     );
 
     // The nine are exactly bits 7..=15 — the §6.1 set, pinned as a mask so
@@ -198,14 +237,16 @@ async fn format_default_stamps_all_nine_and_single_writer_stays_the_preflip_post
 }
 
 // ---------------------------------------------------------------------------
-// The enable verb: ordered, idempotent, marker-bracketed.
+// The upgrade: the nine-bit stamp (ordered, idempotent, marker-bracketed)
+// as `enable-symmetric`'s first half, the forest in the same act.
 // ---------------------------------------------------------------------------
 
-/// The happy path over a 2-volume set: every volume ends with all nine
-/// bits, the marker is gone, the set mounts writable, and a re-run is a
-/// counted no-op (idempotent per-bit).
+/// The happy path over a 2-volume `--single-writer` set: ONE invocation
+/// of `enable-symmetric` stamps the nine bits (reported), converts every
+/// volume to the forest, deletes both markers, and the set mounts
+/// writable; a re-run refuses as already symmetric with nothing written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enable_multi_writer_stamps_ordered_idempotent_and_deletes_the_marker() {
+async fn enable_symmetric_stamps_the_nine_bits_first_and_converts_in_one_act() {
     let dir = tempfile::tempdir().unwrap();
     let metas = [
         make_file(dir.path(), "m0.meta"),
@@ -214,24 +255,28 @@ async fn enable_multi_writer_stamps_ordered_idempotent_and_deletes_the_marker() 
     format_single_writer_set(&metas).await;
     let paths = uris(&metas);
 
-    let report = enable_multi_writer(&paths).await.expect("enable");
+    let report = upgrade(&paths).await;
     assert!(
-        report.bits_stamped > 0,
-        "a default-posture set has bits to stamp"
+        report.multi_writer_bits_stamped > 0,
+        "a single-writer set has nine-bit stamps to write: {report:?}"
     );
     for m in &metas {
         assert!(
-            has_all_nine(features_of(m).await),
-            "every member carries all nine after the verb"
+            is_forest(features_of(m).await),
+            "every member carries all nine AND the forest after the one act"
         );
     }
     assert!(
         read_marker(&metas[0]).await.is_none(),
-        "the verb's LAST act deletes the marker"
+        "the stamp's LAST act deletes the `mw_upgrade:` marker"
     );
 
-    // Writable mount gate admits the upgraded set.
+    // Writable mount gate admits the upgraded set — as the forest.
     let routed = open_routed_meta_set(&paths).await.expect("writable mount");
+    assert!(
+        routed.volumes[0].slot_lease_armed(),
+        "the upgraded set mounts as an ARMED forest writer"
+    );
     let ino = routed
         .create(1, "post_upgrade", libc::S_IFREG | 0o644, 1000, 1000)
         .await
@@ -242,13 +287,45 @@ async fn enable_multi_writer_stamps_ordered_idempotent_and_deletes_the_marker() 
         vol.shutdown().await.expect("clean shutdown");
     }
 
-    // Idempotent re-run: nothing left to stamp, no marker minted.
-    let rerun = enable_multi_writer(&paths).await.expect("re-run");
-    assert_eq!(
-        rerun.bits_stamped, 0,
-        "re-running an upgraded set is a no-op"
+    // A re-run has nothing to stamp and nothing to convert: it refuses
+    // loud as already symmetric, and writes nothing (no marker minted).
+    let err = enable_symmetric(&paths, &EnableSymOptions::default())
+        .await
+        .expect_err("an already-symmetric set refuses a re-run");
+    assert!(
+        err.to_string().contains("already symmetric"),
+        "the re-run's refusal: {err}"
     );
     assert!(read_marker(&metas[0]).await.is_none());
+}
+
+/// `volume enable-multi-writer` is RETIRED (PR 14 fix round 3): through
+/// the binary it exits nonzero naming `enable-symmetric`, and touches
+/// nothing — no marker, no bit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enable_multi_writer_is_retired_and_names_enable_symmetric() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = make_file(dir.path(), "m0.meta");
+    format_single_writer_set(std::slice::from_ref(&meta)).await;
+    let before = features_of(&meta).await;
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_squeezefs"))
+        .arg("volume")
+        .arg("enable-multi-writer")
+        .arg(format!("sqmeta://{}", meta.display()))
+        .output()
+        .expect("run squeezefs volume enable-multi-writer");
+    assert!(
+        !out.status.success(),
+        "the retired verb must refuse: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("RETIRED") && stderr.contains("enable-symmetric"),
+        "the refusal names the retirement and the successor: {stderr}"
+    );
+    assert_eq!(features_of(&meta).await, before, "nothing stamped");
+    assert!(read_marker(&meta).await.is_none(), "no marker minted");
 }
 
 // ---------------------------------------------------------------------------
@@ -265,23 +342,24 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
     format_single_writer_set(&metas).await;
     let paths = uris(&metas);
 
-    // Kill after volume 0's terminal bit (bit 11), before volume 1's first.
-    let hooks = EnableMwHooks {
-        crash_after: Some(EnableMwCrash::AfterBit {
+    // Kill inside the stamp half after volume 0's terminal bit (bit 11),
+    // before volume 1's first — no conversion marker exists yet.
+    upgrade_crashing_at(
+        &paths,
+        EnableMwCrash::AfterBit {
             volume: 0,
             bits_done: 9,
-        }),
-    };
-    let err = enable_multi_writer_with(&paths, &hooks)
-        .await
-        .expect_err("injected crash surfaces");
-    assert!(
-        err.to_string().contains("crash injection"),
-        "the seam's own error: {err}"
-    );
+        },
+    )
+    .await;
 
-    // State on media: volume 0 fully stamped, volume 1 untouched, marker up.
-    assert!(has_all_nine(features_of(&metas[0]).await));
+    // State on media: volume 0 fully stamped (nine, no forest), volume 1
+    // untouched, the `mw_upgrade:` marker up.
+    let f0 = features_of(&metas[0]).await;
+    assert!(
+        has_all_nine(f0) && !is_forest(f0),
+        "volume 0: the nine, not yet the forest"
+    );
     assert!(has_none_beyond_single_writer(features_of(&metas[1]).await));
     assert!(
         read_marker(&metas[0]).await.is_some(),
@@ -300,14 +378,20 @@ async fn mw_s1_crash_between_volumes_refuses_writable_and_resumes() {
         Err(e) => e.to_string(),
     };
     assert!(
-        msg.contains("enable-multi-writer"),
+        msg.contains("enable-symmetric"),
         "the refusal names the resume remedy: {msg}"
     );
 
-    // Resume: re-running converges (prefix re-runs as no-ops), marker gone.
-    let report = enable_multi_writer(&paths).await.expect("resume");
-    assert!(report.bits_stamped > 0, "volume 1's bits still had to land");
-    assert!(has_all_nine(features_of(&metas[1]).await));
+    // Resume: a plain re-run converges the stamp (the prefix re-runs as
+    // no-ops), then converts; both markers gone.
+    let report = upgrade(&paths).await;
+    assert!(
+        report.multi_writer_bits_stamped > 0,
+        "volume 1's bits still had to land: {report:?}"
+    );
+    for m in &metas {
+        assert!(is_forest(features_of(m).await));
+    }
     assert!(read_marker(&metas[0]).await.is_none());
     let routed = open_routed_meta_set(&paths)
         .await
@@ -334,8 +418,9 @@ async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
         format_single_writer_set(std::slice::from_ref(&meta)).await;
         let paths = uris(std::slice::from_ref(&meta));
 
-        let hooks = EnableMwHooks {
-            crash_after: Some(if bits_done == 0 {
+        upgrade_crashing_at(
+            &paths,
+            if bits_done == 0 {
                 // MW-S1's "kill before any bit": marker alone.
                 EnableMwCrash::AfterMarker
             } else {
@@ -343,11 +428,9 @@ async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
                     volume: 0,
                     bits_done,
                 }
-            }),
-        };
-        enable_multi_writer_with(&paths, &hooks)
-            .await
-            .expect_err("injected crash surfaces");
+            },
+        )
+        .await;
 
         // The volume carries a proper PREFIX of the order; bit 11 is
         // terminal by construction so it is absent in every window but
@@ -389,13 +472,14 @@ async fn mw_s1b_kill_between_every_adjacent_bit_pair_refuses_then_resumes() {
             Err(e) => e.to_string(),
         };
         assert!(
-            msg.contains("enable-multi-writer"),
+            msg.contains("enable-symmetric"),
             "window {bits_done}: the refusal names the resume remedy: {msg}"
         );
 
-        // Resume re-runs the prefix as no-ops and continues to the end.
-        enable_multi_writer(&paths).await.expect("resume");
-        assert!(has_all_nine(features_of(&meta).await));
+        // Resume re-runs the prefix as no-ops, continues to the end, and
+        // converts in the same act.
+        upgrade(&paths).await;
+        assert!(is_forest(features_of(&meta).await));
         assert!(read_marker(&meta).await.is_none());
         let routed = open_routed_meta_set(&paths)
             .await
@@ -418,7 +502,7 @@ async fn mw_s2_first_writable_mount_minting_acts_fire_and_are_idempotent() {
     let meta = make_file(dir.path(), "m0.meta");
     format_single_writer_set(std::slice::from_ref(&meta)).await;
     let paths = uris(std::slice::from_ref(&meta));
-    enable_multi_writer(&paths).await.expect("enable");
+    upgrade(&paths).await;
 
     // First writable mount after the stamp: bit 9's ledger root mints and
     // accounting engages; bit 8's partition read adopts the pre-partition
@@ -651,7 +735,7 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
     // A concurrent holder of volume 0's D0 guard (what a live first
     // invocation holds across its whole run).
     let holder = KvMetaBackend::open(&meta).await.expect("guard holder");
-    let err = enable_multi_writer(&paths)
+    let err = enable_symmetric(&paths, &EnableSymOptions::default())
         .await
         .expect_err("a second invocation refuses on the D0 guard");
     let msg = err.to_string();
@@ -667,18 +751,13 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
     );
 
     // Extended: the marker-tolerant RESUME open serializes the same way.
-    let hooks = EnableMwHooks {
-        crash_after: Some(EnableMwCrash::AfterMarker),
-    };
-    enable_multi_writer_with(&paths, &hooks)
-        .await
-        .expect_err("injected crash");
+    upgrade_crashing_at(&paths, EnableMwCrash::AfterMarker).await;
     assert!(
         read_marker(&meta).await.is_some(),
         "crashed state: marker up"
     );
     let holder = KvMetaBackend::open(&meta).await.expect("guard holder");
-    enable_multi_writer(&paths)
+    enable_symmetric(&paths, &EnableSymOptions::default())
         .await
         .expect_err("resume still refuses while the guard is held");
     assert!(
@@ -687,9 +766,9 @@ async fn concurrent_enable_invocation_refuses_on_the_d0_guard() {
     );
     holder.shutdown().await.expect("release");
 
-    // With the guard free the resume converges.
-    enable_multi_writer(&paths).await.expect("resume");
-    assert!(has_all_nine(features_of(&meta).await));
+    // With the guard free the resume converges — stamp and forest.
+    upgrade(&paths).await;
+    assert!(is_forest(features_of(&meta).await));
     assert!(read_marker(&meta).await.is_none());
 }
 
@@ -801,9 +880,8 @@ mod phase_b_cli {
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.to_lowercase().contains("single-writer")
-                && stdout.contains("enable-multi-writer"),
-            "the opt-out announces its class and the upgrade verb: {stdout}"
+            stdout.to_lowercase().contains("single-writer") && stdout.contains("enable-symmetric"),
+            "the opt-out announces its class and the ONE upgrade verb: {stdout}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

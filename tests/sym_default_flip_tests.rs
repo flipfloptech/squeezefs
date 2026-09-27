@@ -412,28 +412,70 @@ async fn symmetric_meta_zero_on_a_stamped_volume_refuses_the_writable_open_and_w
     shutdown(&armed).await;
 }
 
-/// **`enable-symmetric` refuses a `--single-writer` volume** naming
-/// `enable-multi-writer`: the forest presumes the nine bits (the join
-/// ladder's rung 2 demands them on every volume), so the upgrade path
-/// from the flat class is the two verbs in order.
+/// **`enable-symmetric` upgrades a `--single-writer` volume in ONE act**
+/// (PR 14 fix round 3, class B — design-symmetric-metadata §7.2): the
+/// forest presumes the nine multi-writer bits (the join ladder's rung 2
+/// demands them on every volume), so the verb stamps them as its first
+/// half and converts in the same invocation; `--dry-run` reports the
+/// stamps it would write and plans the conversion, writing nothing.
+/// `enable-multi-writer` — which left a set in the pre-flip class no
+/// writer's door admits — is retired.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enable_symmetric_refuses_a_single_writer_volume_naming_enable_multi_writer() {
+async fn enable_symmetric_upgrades_a_single_writer_volume_in_one_act() {
     let dir = tempfile::tempdir().unwrap();
     let single = format_single_writer(dir.path(), "single").await;
     let uris = vec![single.display().to_string()];
-    let opts = squeezefs::config_ops::EnableSymOptions::default();
-    let err = match squeezefs::config_ops::enable_symmetric(&uris, &opts).await {
-        Ok(_) => panic!("the forest presumes the multi-writer class"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("--single-writer"), "{err}");
-    assert!(err.contains("enable-multi-writer"), "{err}");
+    let before = features_of(&single).await;
+    let dry = squeezefs::config_ops::enable_symmetric(
+        &uris,
+        &squeezefs::config_ops::EnableSymOptions {
+            dry_run: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the dry run plans a single-writer volume");
+    assert_eq!(
+        dry.multi_writer_bits_stamped,
+        (MULTI_WRITER_FORMAT_BITS & !before).count_ones() as usize,
+        "the dry run reports every nine-bit stamp the real run writes: {dry:?}"
+    );
+    assert_eq!(
+        dry.rows.len(),
+        1,
+        "the dry run plans the conversion beside the stamp: {dry:?}"
+    );
+    assert_eq!(
+        features_of(&single).await,
+        before,
+        "a dry run writes nothing"
+    );
+    let report = squeezefs::config_ops::enable_symmetric(
+        &uris,
+        &squeezefs::config_ops::EnableSymOptions::default(),
+    )
+    .await
+    .expect("one act: the nine bits, then the forest");
+    assert_eq!(
+        report.multi_writer_bits_stamped,
+        dry.multi_writer_bits_stamped
+    );
     let f = features_of(&single).await;
     assert_eq!(
+        f & MULTI_WRITER_FORMAT_BITS,
+        MULTI_WRITER_FORMAT_BITS,
+        "the nine multi-writer bits stamped"
+    );
+    assert_ne!(
         f & FEATURE_INCOMPAT_KV_SYMMETRIC_FOREST,
         0,
-        "nothing stamped"
+        "the forest stamped in the same act"
     );
+    let armed = open_routed_meta_set(&uris)
+        .await
+        .expect("the upgraded volume mounts as the armed default");
+    assert!(armed.volumes[0].slot_lease_armed());
+    shutdown(&armed).await;
 }
 
 /// **The knob surface after the flip**: `SQUEEZEFS_SYMMETRIC_META`

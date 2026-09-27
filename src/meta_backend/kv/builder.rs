@@ -1292,7 +1292,8 @@ pub async fn format_v3(
 /// The opt-out exists for the format-CLASS boundary only: a stamped
 /// volume mounts solo verbatim, so repair/fsck never needs this
 /// (design-full-multi-writer §6.2 pt 1). Upgrade later with
-/// `squeezefs volume enable-multi-writer`.
+/// `squeezefs volume enable-symmetric` (PR 14: one act — the nine bits,
+/// then the forest).
 pub async fn format_v3_single_writer(
     path: &Path,
     volume_len: u64,
@@ -1366,10 +1367,11 @@ pub async fn format_v3_stamped_symmetric(
 /// [`format_v3_stamped`]'s PRE-FLIP class (design-symmetric-metadata
 /// §7.2's "bit 17 absent" row): the nine multi-writer bits WITHOUT the
 /// forest — every default-format volume between the rung-10b flip
-/// (2026-08-16) and PR 14, and what `squeezefs volume enable-multi-writer`
-/// still produces from a `--single-writer` volume. A writable mount of
-/// this class REFUSES since PR 14 (presence-required — `squeezefs volume
-/// enable-symmetric` is the remedy), so no CLI arm builds it; the
+/// (2026-08-16) and PR 14, and the class `enable-symmetric`'s nine-bit
+/// stamp (its first half on a `--single-writer` set) passes through on
+/// its way to the forest. A writable mount of this class REFUSES since
+/// PR 14 (presence-required — `squeezefs volume enable-symmetric` is the
+/// remedy), so no CLI arm builds it; the
 /// conversion contracts build their source volumes through it.
 pub async fn format_v3_stamped_multi_writer_flat(
     path: &Path,

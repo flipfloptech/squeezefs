@@ -28,7 +28,19 @@ mount is a read-token client whose metadata is exact at the next resolve
   and a flat volume has no holder to grant a token, so `mount -o ro` of
   one refuses at the token arm naming the class. The alternatives: read
   through the writer's own mount (the flat volume's one kernel), or format
-  the default and mount readers as `-o ro` token clients.
+  the default and mount readers as `-o ro` token clients. **Its upgrade is
+  ONE verb** (fix round 3 — the acceptance record's §4.4bm):
+  `squeezefs volume enable-symmetric` stamps the nine multi-writer bits as
+  its first act on a `--single-writer` set (the retired verb's ordered,
+  marker-bracketed, crash-resumable stamp — a plain re-run resumes a
+  crashed one; `--dry-run` reports the bits it would stamp; `--abort`
+  refuses over a crashed stamp, incompat bits being forward-only) and
+  converts to the forest in the same invocation. **`squeezefs volume
+  enable-multi-writer` is RETIRED**: since the flip it could only leave a
+  set in the pre-flip multi-writer-flat class no writer mounts; it refuses
+  loud naming `enable-symmetric`, and the `mw_upgrade:` marker's and the
+  bit-11 uniformity gate's writable-mount refusals name `enable-symmetric`
+  as the resume.
 - **The DEFAULT format needs a substrate that can FENCE — a plain `mount`
   of a default-format metadata volume on a non-PR BLOCK DEVICE REFUSES**
   (a loop device, an LVM logical volume, a raw SATA / SAS / virtio disk, an

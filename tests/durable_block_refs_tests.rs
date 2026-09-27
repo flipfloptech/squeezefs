@@ -1267,6 +1267,244 @@ async fn fsck_reports_no_durable_reference_drift_on_a_healthy_volume() {
 }
 
 // ---------------------------------------------------------------------------
+// 9a. fsck C8's REPAIR — the stale-record release (record §4.4bu)
+// ---------------------------------------------------------------------------
+
+/// **A durable reference record whose owner's layout no longer names the
+/// block is RELEASED by `fsck --repair --apply`, offline; a layout naming a
+/// block with no record stays report-only; online refuses naming the
+/// offline verb** (record §4.4bu — the remedy for the §4.4bt class: a
+/// 1.2.x set carrying such records refused to mount on the 1.3 default at
+/// the allocation arm's loss check with no path but `format --force`).
+/// The fixture plants the §4.4bt shape exactly: a striped file's block 1 is
+/// displaced through the merge primitive (its record correctly released
+/// and the block freed), then the OLD record `(vol, old block, ino, 1)` is
+/// re-committed as a stale `+ref` — durable 1, derived 0, the block free.
+/// Detection reports one C8 finding. The dry run PLANS
+/// `release-stale-block-refs` and applies nothing; the online apply refuses
+/// naming the offline verb; the offline apply releases exactly that record
+/// (`fsck_repair_classC8` +1), keeps the live records (the displacing
+/// block's, the untouched block 0's), and the oracle reads clean. A second
+/// planted shape — the live record of block 0 deleted directly, so the
+/// layout names a block with NO record — is refused ("a record is never
+/// fabricated") and the layout stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsck_repair_releases_a_stale_durable_reference_offline_and_never_fabricates_one() {
+    use squeezefs::fsck::{FsckCtx, FsckOptions, RepairOptions};
+    use squeezefs::meta_backend::kv::block_refs::{BlockRef, BlockRefOp};
+    use std::sync::atomic::Ordering;
+
+    let meta = NamedTempFile::new().unwrap();
+    format_meta_stamped(meta.path()).await;
+    let data = data_file();
+    let rig = mount(meta.path(), data.path()).await;
+    assert!(rig.routed.volumes[0].block_refs_engaged());
+    let chunk = rig.alloc.chunk_size();
+    let vol_tag = block_refs::volume_tag(DATA_VOL_ID);
+
+    let a = rig.mk_file("stale_a").await;
+    let b0 = rig.publish_block(a, 0).await;
+    let old1 = rig.publish_block(a, 1).await;
+    // The displacement: block 1 → a fresh block; the old one's record is
+    // released in the same tx and the block frees.
+    let new1 = rig.alloc.allocate_block().await.unwrap();
+    rig.alloc.publish_block(new1);
+    rig.router
+        .merge_block_mappings(
+            a,
+            BlockMapOp::Merge(&[(1, new1.to_string())]),
+            2 * 4 * 1024 * 1024,
+            LayoutFlip::KeepLayout,
+            rig.token(a),
+        )
+        .await
+        .expect("displacement");
+    rig.router.backend_router.reclaim_drain().await;
+    assert_eq!(
+        rig.durable_refcount(old1).await,
+        0,
+        "the displaced record left"
+    );
+    assert!(
+        rig.drift().await.is_empty(),
+        "fixture premise: clean before the plant"
+    );
+
+    // The §4.4bt residue, planted: the displaced block's record re-stated
+    // for (a, index 1) — a reference no layout justifies.
+    let stale = BlockRef {
+        vol_tag,
+        block_idx: old1 / chunk,
+        owner_ino: a,
+        block_index: 1,
+    };
+    rig.routed
+        .commit_block_refs_witnessed(a, &[BlockRefOp::taken(stale)])
+        .await
+        .expect("plant the stale record");
+    assert_eq!(
+        rig.durable_refcount(old1).await,
+        1,
+        "the stale record stands"
+    );
+    let drift = rig.drift().await;
+    assert_eq!(drift.len(), 1, "one drifting block: {drift:?}");
+    assert_eq!(
+        (drift[0].1, drift[0].2, drift[0].3),
+        (old1 / chunk, 1, 0),
+        "durable 1 vs derived 0 on the displaced block"
+    );
+
+    let ctx = FsckCtx {
+        meta: rig.routed.clone(),
+        router: rig.router.clone(),
+        staging_dirs: Vec::new(),
+        expected_generation: None,
+    };
+    let settle = |o: FsckOptions| FsckOptions {
+        settle: std::time::Duration::from_millis(0),
+        ..o
+    };
+    // The rig is cache-less: a repair needs a quarantine home (§5.6a).
+    let quarantine = tempfile::tempdir().unwrap();
+    let dry = RepairOptions {
+        apply: false,
+        quarantine_dir: Some(quarantine.path().to_path_buf()),
+        multi_owner: false,
+    };
+    let apply = RepairOptions {
+        apply: true,
+        quarantine_dir: Some(quarantine.path().to_path_buf()),
+        multi_owner: false,
+    };
+
+    // ONLINE: detected, planned, refused at apply naming the offline verb.
+    let online = squeezefs::fsck::run(&ctx, &settle(FsckOptions::online()))
+        .await
+        .expect("online fsck");
+    let c8: Vec<_> = online.findings.iter().filter(|f| f.class == "C8").collect();
+    assert_eq!(c8.len(), 1, "one C8 finding online: {c8:?}");
+    let plan = squeezefs::fsck::repair(&ctx, &online, &dry)
+        .await
+        .expect("dry run");
+    eprintln!(
+        "[c8-repair] online findings: {:?}",
+        online
+            .findings
+            .iter()
+            .map(|f| (f.class.as_str(), f.object.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(plan.counters.applied, 0);
+    assert!(
+        plan.planned
+            .iter()
+            .any(|a| a.class == "C8" && a.action == "release-stale-block-refs"),
+        "the C8 finding plans the release: {:?}",
+        plan.planned
+    );
+    let online_apply = squeezefs::fsck::repair(&ctx, &online, &apply)
+        .await
+        .expect("online apply");
+    assert!(
+        !online_apply.applied.iter().any(|a| a.class == "C8"),
+        "online never releases: {:?}",
+        online_apply.applied
+    );
+    let c8_refusal = online_apply
+        .refused
+        .iter()
+        .find(|a| a.class == "C8")
+        .expect("the C8 finding is refused online");
+    assert!(
+        c8_refusal.detail.contains("OFFLINE only"),
+        "the refusal names the offline verb: {}",
+        c8_refusal.detail
+    );
+    assert_eq!(rig.durable_refcount(old1).await, 1, "untouched online");
+
+    // OFFLINE: the stale record is released, the live ones kept.
+    let c8_before = METRICS.fsck_repair_class[7].load(Ordering::Relaxed);
+    let offline = squeezefs::fsck::run(&ctx, &settle(FsckOptions::offline()))
+        .await
+        .expect("offline fsck");
+    assert_eq!(
+        offline.findings.iter().filter(|f| f.class == "C8").count(),
+        1
+    );
+    let fixed = squeezefs::fsck::repair(&ctx, &offline, &apply)
+        .await
+        .expect("offline apply");
+    let c8_applied: Vec<_> = fixed.applied.iter().filter(|a| a.class == "C8").collect();
+    assert_eq!(c8_applied.len(), 1, "one release: {fixed:?}");
+    assert_eq!(c8_applied[0].action, "release-stale-block-refs");
+    assert_eq!(
+        METRICS.fsck_repair_class[7].load(Ordering::Relaxed) - c8_before,
+        1,
+        "fsck_repair_classC8 counts the release"
+    );
+    assert_eq!(
+        rig.durable_refcount(old1).await,
+        0,
+        "the stale record released"
+    );
+    assert_eq!(
+        rig.durable_refcount(new1).await,
+        1,
+        "the displacing block's record kept"
+    );
+    assert_eq!(rig.durable_refcount(b0).await, 1, "block 0's record kept");
+    assert!(
+        rig.drift().await.is_empty(),
+        "the oracle reads clean after the repair"
+    );
+
+    // The OTHER direction: block 0's live record deleted directly — the
+    // layout names a block with no record. Detected; the repair refuses.
+    rig.routed
+        .commit_block_refs_witnessed(
+            a,
+            &[BlockRefOp::released(BlockRef {
+                vol_tag,
+                block_idx: b0 / chunk,
+                owner_ino: a,
+                block_index: 0,
+            })],
+        )
+        .await
+        .expect("delete the live record");
+    let drift = rig.drift().await;
+    assert_eq!(drift.len(), 1);
+    assert_eq!((drift[0].1, drift[0].2, drift[0].3), (b0 / chunk, 0, 1));
+    let offline2 = squeezefs::fsck::run(&ctx, &settle(FsckOptions::offline()))
+        .await
+        .expect("offline fsck 2");
+    assert_eq!(
+        offline2.findings.iter().filter(|f| f.class == "C8").count(),
+        1
+    );
+    let refused = squeezefs::fsck::repair(&ctx, &offline2, &apply)
+        .await
+        .expect("offline apply 2");
+    assert!(
+        !refused.applied.iter().any(|a| a.class == "C8"),
+        "nothing fabricated: {refused:?}"
+    );
+    let c8_refusal = refused
+        .refused
+        .iter()
+        .find(|a| a.class == "C8")
+        .expect("the derived-over-durable finding is refused");
+    assert!(
+        c8_refusal.detail.contains("never fabricated"),
+        "{}",
+        c8_refusal.detail
+    );
+    assert_eq!(rig.durable_refcount(b0).await, 0, "no record was invented");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 9b. The by-block family REFUSES a malformed record on either layout
 //     (review round 3 of the symmetric-forest PR, Issue 22).
 // ---------------------------------------------------------------------------

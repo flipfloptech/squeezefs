@@ -3077,6 +3077,15 @@ impl BlockAllocator {
     /// resolved through the inline map, the indirect blob's entries or the
     /// kvmap tree — the same three readers the derived census walks. A
     /// layout of another type owns no block.
+    ///
+    /// Three-valued on purpose: a justification that could not be READ —
+    /// an unreadable or undecodable indirect blob, an incomplete kvmap
+    /// walk — is [`LayoutNames::Unknown`], never `NotNamed`. The census
+    /// WALKER may count such a layout as owning nothing (its under-count
+    /// is the conservative direction for a report); a REPAIR that took
+    /// the same reading would release every record of the file whose
+    /// blob is torn and hand its blocks to the next writer, with the
+    /// ledger — the one durable pointer left — gone.
     pub(crate) async fn layout_names_block_at(
         &self,
         backend_router: &crate::routing::BackendRouter,
@@ -3085,9 +3094,9 @@ impl BlockAllocator {
         layout: &crate::routing::LayoutMetadata,
         block_index: u32,
         block_idx: u64,
-    ) -> bool {
+    ) -> LayoutNames {
         if layout.file_type != "striped" && layout.file_type != "staged" {
-            return false;
+            return LayoutNames::NotNamed;
         }
         let names =
             |key: &str| self.owned_offset(backend_router, key) == Some(block_idx * self.chunk_size);
@@ -3096,38 +3105,62 @@ impl BlockAllocator {
             .as_deref()
             .and_then(|id| id.strip_prefix("indirect:"));
         if block_index == crate::meta_backend::kv::block_refs::BLOCK_INDEX_MAP_BLOB {
-            return indirect_key.is_some_and(names);
+            return if indirect_key.is_some_and(names) {
+                LayoutNames::Named
+            } else {
+                LayoutNames::NotNamed
+            };
         }
-        if let Some(key) = layout
+        if layout
             .block_map
             .as_ref()
             .and_then(|bm| bm.get(&block_index))
+            .is_some_and(|key| names(key))
         {
-            if names(key) {
-                return true;
-            }
+            return LayoutNames::Named;
         }
         if let Some(indirect_key) = indirect_key {
             let block_size = backend_router.block_size.load(Ordering::Relaxed) as usize;
-            if let Ok(raw) = backend_router.read_block(indirect_key, block_size).await {
-                if let Ok(entries) = crate::routing::decode_indirect_block_map(&raw) {
-                    if entries
-                        .iter()
-                        .any(|(b, key)| *b == block_index && names(key))
-                    {
-                        return true;
-                    }
+            let raw = match backend_router.read_block(indirect_key, block_size).await {
+                Ok(raw) => raw,
+                Err(e) => {
+                    return LayoutNames::Unknown(format!(
+                        "indirect block map at '{indirect_key}' unreadable: {e}"
+                    ))
                 }
+            };
+            let entries = match crate::routing::decode_indirect_block_map(&raw) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    return LayoutNames::Unknown(format!(
+                        "indirect block map at '{indirect_key}' undecodable: {e}"
+                    ))
+                }
+            };
+            if entries
+                .iter()
+                .any(|(b, key)| *b == block_index && names(key))
+            {
+                return LayoutNames::Named;
             }
         }
         if layout_is_kvmap(layout) {
-            return backend_router
-                .kvmap_layout_entries(kv, local_ino)
-                .await
+            let (entries, complete) = backend_router
+                .kvmap_layout_entries_complete(kv, local_ino)
+                .await;
+            if entries
                 .iter()
-                .any(|(b, key)| *b == block_index && names(key));
+                .any(|(b, key)| *b == block_index && names(key))
+            {
+                return LayoutNames::Named;
+            }
+            if !complete {
+                return LayoutNames::Unknown(format!(
+                    "the kvmap tree of local ino {local_ino} walked INCOMPLETE"
+                ));
+            }
         }
-        false
+        LayoutNames::NotNamed
     }
 
     /// The block indices THIS volume owns among an indirect block map's
@@ -3303,6 +3336,20 @@ fn layout_is_kvmap(layout: &crate::routing::LayoutMetadata) -> bool {
             .block_map_id
             .as_deref()
             .is_some_and(|id| id.starts_with(crate::meta_backend::kv::block_map::KVMAP_HEAD_PREFIX))
+}
+
+/// The verdict of [`BlockAllocator::layout_names_block_at`] (fsck C8's
+/// stale-record release, record §4.4bu).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LayoutNames {
+    /// The layout names the block at that index — the record is justified.
+    Named,
+    /// The layout was read WHOLE and names no such block — the record is
+    /// stale.
+    NotNamed,
+    /// The justification could not be read (the reason) — no verdict; a
+    /// repair refuses on it.
+    Unknown(String),
 }
 
 pub(crate) async fn walk_live_layouts<F>(

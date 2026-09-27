@@ -8400,7 +8400,7 @@ pub async fn repair(
         }
     };
 
-    for (f, id) in actionable {
+    'findings: for (f, id) in actionable {
         let what = format!("{}:{}", f.class, f.object);
         // ---- KD-PV-8 / §5.9.3: the repair-CONSEQUENCE split ----
         //
@@ -8410,7 +8410,10 @@ pub async fn repair(
         // own text: "the one C10 repair that could make a named inode
         // reclaimable if the count were wrong") and C10's
         // `remove-dangling-dentry` (a live name) — are REPORT-ONLY, on
-        // the C8 precedent (detect always, repair never automatic).
+        // the C8 precedent (detect always; repair only where one durable
+        // home justifies the other — C8's stale-record release runs
+        // offline against the layouts, and its fabricate direction never
+        // runs).
         //
         // The safe raises (C10-low, C10-zero-named) stay online: their
         // false-positive source is an OVERCOUNTED reference set, the
@@ -8478,8 +8481,10 @@ pub async fn repair(
             // the D0 writer guard, so no publish can re-name the block
             // between the verification read and the release (the ledger
             // commit takes the owner's 4a lease itself, so the two cannot
-            // be one lease-hold online). An OPEN pack block is under
-            // publication by construction and is refused whole.
+            // be one lease-hold online). The pack-open gate below is a
+            // BELT: the offline verb runs no packer, so its ledger is
+            // empty there by construction; the gate answers a harness
+            // report produced offline-mode on a live mount.
             FindingId::C8DurableRefDrift { vol, offset } => {
                 if online {
                     refuse(
@@ -8509,27 +8514,35 @@ pub async fn repair(
                     );
                     continue;
                 }
+                // The memo keys every record's owner as the ROUTED SET
+                // does — `try_make_global_ino` is `route_ino`'s exact
+                // inverse over the set's live tables (a forest volume
+                // stores the owner's LOCAL key form, `forest_ref_ops`'
+                // law; a flat volume the global ino, which W ≤ 1 leaves
+                // verbatim). The stamp's `(width, native slot)` fold is
+                // the OFFLINE converter's arithmetic for a caller with no
+                // routed set; read here it disagreed with the set the
+                // in-RAM constructor builds (width 1 over a stamped
+                // volume), folded a live owner to an ino that routed
+                // nowhere, read "no layout" and released a LIVE record —
+                // the first build's data-loss shape, caught by the mixed
+                // pin. A record whose owner has no global form (a control
+                // record's local) is kept under its raw key and judged
+                // by the layout read, which answers `None` for it.
                 let vol_tag = crate::meta_backend::kv::block_refs::volume_tag(vol);
                 let records = match c8_records.get(&vol_tag) {
                     Some(r) => r,
                     None => {
                         let mut all = Vec::new();
-                        for kv in &ctx.meta.volumes {
-                            let keying = if kv.symmetric_forest() {
-                                kv.mounted_ledger().membership_stamp.as_ref().map(|st| {
-                                    (u64::from(st.routing_width), st.resolved_native_slot())
-                                })
-                            } else {
-                                None
-                            };
+                        for (kv_idx, kv) in ctx.meta.volumes.iter().enumerate() {
+                            let forest = kv.symmetric_forest();
                             for mut r in kv.block_ref_scan(vol_tag).await? {
-                                if let Some((width, native)) = keying {
-                                    r.owner_ino =
-                                        crate::meta_backend::kv::shared_refs::global_owner(
-                                            r.owner_ino,
-                                            width,
-                                            native,
-                                        );
+                                if forest {
+                                    if let Some(global) =
+                                        ctx.meta.try_make_global_ino(r.owner_ino, kv_idx)
+                                    {
+                                        r.owner_ino = global;
+                                    }
                                 }
                                 all.push(r);
                             }
@@ -8537,37 +8550,71 @@ pub async fn repair(
                         c8_records.entry(vol_tag).or_insert(all)
                     }
                 };
+                // Every record of the block is judged before ANY is
+                // released, and a justification that cannot be READ
+                // refuses the whole finding: a read failure is never a
+                // verdict (the C1/C9/C10 arms' law) — a torn indirect
+                // blob makes the walker under-count and the oracle report
+                // `durable N vs derived 0` for every block of the file,
+                // and a repair that read that as "stale" would release
+                // the file's only durable pointers.
                 let mut stale: Vec<crate::meta_backend::kv::block_refs::BlockRef> = Vec::new();
                 let mut justified = 0usize;
                 for r in records.iter().filter(|r| r.block_idx == idx) {
                     let (v_idx, local) = ctx.meta.route_ino(r.owner_ino);
                     let Some(owner_kv) = ctx.meta.volumes.get(v_idx) else {
-                        continue;
+                        refuse(
+                            &mut out,
+                            f,
+                            format!(
+                                "owner ino {} routes to meta volume {v_idx}, which this set does \
+                                 not hold — no verdict, nothing released",
+                                r.owner_ino
+                            ),
+                        );
+                        continue 'findings;
                     };
                     let layout = match owner_kv.getxattr(local, "layout").await {
                         Ok(Some(bytes)) => {
-                            if bytes.starts_with(b"{") {
+                            let decoded = if bytes.starts_with(b"{") {
                                 serde_json::from_slice::<crate::routing::LayoutMetadata>(&bytes)
                                     .ok()
                             } else {
                                 bincode::deserialize::<crate::routing::LayoutMetadata>(&bytes).ok()
-                            }
+                            };
+                            let Some(l) = decoded else {
+                                refuse(
+                                    &mut out,
+                                    f,
+                                    format!(
+                                        "owner ino {}'s layout record is undecodable — a read \
+                                         failure is never a verdict; nothing released (fsck C1 \
+                                         names the record)",
+                                        r.owner_ino
+                                    ),
+                                );
+                                continue 'findings;
+                            };
+                            Some(l)
                         }
+                        // No layout at all (the owner's record is gone, or
+                        // it never carried one): nothing justifies the
+                        // reference — a complete answer, not a read failure.
                         Ok(None) => None,
                         Err(e) => {
                             refuse(
                                 &mut out,
                                 f,
                                 format!(
-                                    "owner ino {}'s layout unreadable at verify: {e}",
+                                    "owner ino {}'s layout unreadable at verify: {e} — a read \
+                                     failure is never a verdict; nothing released",
                                     r.owner_ino
                                 ),
                             );
-                            stale.clear();
-                            break;
+                            continue 'findings;
                         }
                     };
-                    let named = match layout.as_ref() {
+                    let verdict = match layout.as_ref() {
                         Some(l) => {
                             alloc
                                 .layout_names_block_at(
@@ -8580,17 +8627,30 @@ pub async fn repair(
                                 )
                                 .await
                         }
-                        None => false,
+                        None => crate::block_allocator::LayoutNames::NotNamed,
                     };
-                    if named {
-                        justified += 1;
-                    } else {
-                        stale.push(crate::meta_backend::kv::block_refs::BlockRef {
-                            vol_tag,
-                            block_idx: idx,
-                            owner_ino: r.owner_ino,
-                            block_index: r.block_index,
-                        });
+                    match verdict {
+                        crate::block_allocator::LayoutNames::Named => justified += 1,
+                        crate::block_allocator::LayoutNames::NotNamed => {
+                            stale.push(crate::meta_backend::kv::block_refs::BlockRef {
+                                vol_tag,
+                                block_idx: idx,
+                                owner_ino: r.owner_ino,
+                                block_index: r.block_index,
+                            });
+                        }
+                        crate::block_allocator::LayoutNames::Unknown(why) => {
+                            refuse(
+                                &mut out,
+                                f,
+                                format!(
+                                    "owner ino {}'s justification cannot be read ({why}) — a read \
+                                     failure is never a verdict; nothing released",
+                                    r.owner_ino
+                                ),
+                            );
+                            continue 'findings;
+                        }
                     }
                 }
                 if stale.is_empty() {
@@ -8606,13 +8666,39 @@ pub async fn repair(
                     );
                     continue;
                 }
+                // One commit per record, each under its owner's 4a lease
+                // (the ledger primitive's own). A commit that fails — a
+                // SlotBusy on an unrecovered dead lessee's slot, a device
+                // error — refuses THIS finding naming what landed; the
+                // rest of the pass proceeds, and the next run re-detects
+                // whatever still stands.
                 let mut released = 0usize;
+                let mut failed: Option<String> = None;
                 for r in &stale {
                     let op = crate::meta_backend::kv::block_refs::BlockRefOp::released(*r);
-                    ctx.meta
+                    match ctx
+                        .meta
                         .commit_block_refs_witnessed(r.owner_ino, &[op])
-                        .await?;
-                    released += 1;
+                        .await
+                    {
+                        Ok(_) => released += 1,
+                        Err(e) => {
+                            failed = Some(format!("owner ino {}: {e}", r.owner_ino));
+                            break;
+                        }
+                    }
+                }
+                if let Some(why) = failed {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "{released} of {} stale record(s) of {vol}:{offset} released, then the \
+                             release failed at {why} — re-run the repair for the rest",
+                            stale.len()
+                        ),
+                    );
+                    continue;
                 }
                 apply_ok(
                     &mut out,
@@ -9676,6 +9762,43 @@ pub async fn repair(
                         "offset is referenced or has a live in-flight owner now \
                          (published since the scan)"
                             .to_string(),
+                    );
+                    continue;
+                }
+                // A block the DURABLE ledger still names is C8's to judge,
+                // never this arm's: freeing it here leaves the record
+                // standing, so the next mount seeds the block LIVE from the
+                // record while the bitmap (moved by this free on a holder)
+                // reads it clear — the allocation arm's loss refusal
+                // (§4.4bs/§4.4bt), manufactured by the remedy verb. On a
+                // 1.2.x set carrying stale records — the population this
+                // arm meets online — the block reads TRACKED (the mount
+                // seeded its RAM map from the records) and unreferenced, so
+                // it is exactly this finding. C8 releases the record
+                // offline; with the record gone the next mount never
+                // tracks the block. Offline the derived-walk allocator
+                // never tracks such a block, so the two arms never meet
+                // there. (On a joined appender a foreign lessee's tree is
+                // a projection; a record that tree holds but this walk
+                // misses is the online C2 arm's standing exposure, out of
+                // this gate's reach.)
+                let tag = crate::meta_backend::kv::block_refs::volume_tag(vol);
+                let block_idx = *offset / alloc.chunk_size().max(1);
+                let mut durable = 0usize;
+                for kv in &ctx.meta.volumes {
+                    durable += kv.block_ref_count(tag, block_idx).await?;
+                }
+                if durable > 0 {
+                    refuse(
+                        &mut out,
+                        f,
+                        format!(
+                            "{durable} durable block-reference record(s) still name {vol}:{offset}: \
+                             the block is the ledger's to judge (fsck C8) — freeing it under a \
+                             standing record would refuse the next mount at the allocation arm; \
+                             run `squeezefs fsck <sqmeta-uri> --repair --apply` OFFLINE, which \
+                             releases the stale record"
+                        ),
                     );
                     continue;
                 }

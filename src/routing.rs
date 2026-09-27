@@ -4277,12 +4277,28 @@ impl BackendRouter {
         kv: &crate::meta_backend::kv::backend::KvMetaBackend,
         local_ino: u64,
     ) -> Vec<(u32, String)> {
+        self.kvmap_layout_entries_complete(kv, local_ino).await.0
+    }
+
+    /// [`Self::kvmap_layout_entries`] with its COMPLETENESS beside it:
+    /// `false` when the tree-7 scan failed or a record resolved to no
+    /// mounted volume — the walk's view is then partial. A WALKER treats
+    /// a partial view as conservative (fsck names the residue); a REPAIR
+    /// that judges a record against this view must refuse on `false`,
+    /// because a skipped entry reads as "not named" there (fsck C8's
+    /// stale-record release, record §4.4bu).
+    pub(crate) async fn kvmap_layout_entries_complete(
+        &self,
+        kv: &crate::meta_backend::kv::backend::KvMetaBackend,
+        local_ino: u64,
+    ) -> (Vec<(u32, String)>, bool) {
         // PR 6a: one of the TWO shared run-expansion surfaces (design
         // §12) — runs expand to per-index keys via the offset/stamp
         // arithmetic, and the §2 read law rides record ORDER: an exact
         // record inside a run's span follows the run in key order, so a
         // later insert at the same index OVERRIDES the run-derived one.
         let mut out: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+        let mut complete = true;
         let mut cursor = 0u32;
         loop {
             let page = match kv.block_map_range(local_ino, cursor, 512).await {
@@ -4292,6 +4308,7 @@ impl BackendRouter {
                         "kvmap extraction: tree-7 scan failed for local ino {local_ino}: {e} \
                          (the walk's view is INCOMPLETE — fsck names the residue)"
                     );
+                    complete = false;
                     break;
                 }
             };
@@ -4304,12 +4321,15 @@ impl BackendRouter {
                         Some(k) => {
                             out.insert(idx + delta, k);
                         }
-                        None => log::warn!(
-                            "kvmap extraction: unresolvable map record at local ino \
-                             {local_ino} index {} ({entry:?} + {delta}) — no mounted \
-                             volume carries its tag",
-                            idx + delta
-                        ),
+                        None => {
+                            complete = false;
+                            log::warn!(
+                                "kvmap extraction: unresolvable map record at local ino \
+                                 {local_ino} index {} ({entry:?} + {delta}) — no mounted \
+                                 volume carries its tag",
+                                idx + delta
+                            );
+                        }
                     }
                 }
             }
@@ -4318,7 +4338,7 @@ impl BackendRouter {
             };
             cursor = next;
         }
-        out.into_iter().collect()
+        (out.into_iter().collect(), complete)
     }
 
     /// **Durable block-reference recovery** (pre-RC engineering spec §6.2

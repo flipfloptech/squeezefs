@@ -6499,10 +6499,13 @@ pub struct Metrics {
     pub fsck_quarantined_blocks: Align64<AtomicU64>,
     pub fsck_quarantined_bytes: Align64<AtomicU64>,
     /// Applied repairs per class — index 0..9 ⇔ C1..C10
-    /// (`fsck_repair_classC{1..10}` on the stats inode). Index 7 (C8) is
-    /// never incremented by design: durable-block-reference drift is
-    /// reported and never auto-repaired (restating the ledger from the
-    /// walk would erase the evidence of why it broke).
+    /// (`fsck_repair_classC{1..10}` on the stats inode). Index 7 (C8)
+    /// counts the OFFLINE stale-record releases alone (record §4.4bu: a
+    /// durable reference whose owner's layout names no such block); the
+    /// other direction — a layout naming a block with no record — is
+    /// reported and never auto-repaired (a record is never fabricated;
+    /// restating the ledger from the walk would erase the evidence of
+    /// why it broke).
     pub fsck_repair_class: Align64<[AtomicU64; 10]>,
     // PK5 — fsck class C12, tenant-range consistency
     // (design-small-file-packing §5.9 / §10).
@@ -11618,7 +11621,7 @@ impl SqueezefsFilesystem {
                 "fsck_repair_classC5": METRICS.fsck_repair_class[4].load(Ordering::Relaxed),
                 "fsck_repair_classC6": METRICS.fsck_repair_class[5].load(Ordering::Relaxed),
                 "fsck_repair_classC7": METRICS.fsck_repair_class[6].load(Ordering::Relaxed),
-                // C8 is structurally 0 (reported, never auto-repaired).
+                // C8 counts the offline stale-record releases (record §4.4bu).
                 "fsck_repair_classC8": METRICS.fsck_repair_class[7].load(Ordering::Relaxed),
                 "fsck_repair_classC9": METRICS.fsck_repair_class[8].load(Ordering::Relaxed),
                 "fsck_repair_classC10": METRICS.fsck_repair_class[9].load(Ordering::Relaxed),

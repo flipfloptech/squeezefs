@@ -491,6 +491,17 @@ pub static TEST_SHUTDOWN_FIXPOINT_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub static TEST_JOIN_HOLD_AFTER_PAGE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test seam (PR 14 fix round 2, Issue 10 — §4.4bj): the NEXT
+/// `prepare_page_entries` — the page writer's publish-before-drop arm —
+/// answers `JournalReserveExhausted`, the checkpoint class's deferral, as
+/// if the publication's control entry found the class at its keep. What
+/// the pin reads is WHERE that refusal lands in the cycle: the pre-barrier
+/// cursor write must never reach it (the ledger record lands, the tick
+/// retries the page). One relaxed load per page write; `false` = off,
+/// cleared by the arm that fires.
+pub static TEST_PREPARE_PAGE_ENTRIES_REFUSE_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test seam (PR 13i F-C2): a JOINED appender's region open reads its own
 /// page as the manager's FIRST image — `Live` with the grant word cleared,
 /// before `write_wire_joiner_page_grant` named the runs — the image a
@@ -7505,6 +7516,14 @@ impl KvMetaBackend {
         releasing: &[super::record::ForestSlot],
         cycle: Option<&super::tree::SmoContext>,
     ) -> std::result::Result<Vec<super::appender::SlotEntry>, KvError> {
+        if TEST_PREPARE_PAGE_ENTRIES_REFUSE_ONCE
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Err(KvError::JournalReserveExhausted {
+                needed: super::journal::JOURNAL_PAGE_DATA_LEN,
+            });
+        }
         let plan = self.page_plan(set, plane, region, releasing);
         if !plan.off_page_homed.is_empty() {
             self.publish_roots_before_drop(plane, region, &plan.off_page_homed, cycle)
@@ -11421,8 +11440,9 @@ impl KvMetaBackend {
     }
 
     /// The entries region `r`'s page names in one checkpoint cycle —
-    /// [`Self::write_appender_pages`]'s computation, shared with the
-    /// pre-barrier cursor write ([`Self::write_cursor_page_before_barrier`]).
+    /// [`Self::write_appender_pages`]'s computation, the post-record page
+    /// write's alone (the pre-barrier cursor write refreshes the image it
+    /// already has — [`Self::write_cursor_page_before_barrier`]).
     async fn cycle_page_entries(
         &self,
         set: &super::appender::AppenderSet,
@@ -11528,25 +11548,39 @@ impl KvMetaBackend {
     }
 
     /// **Region 0's cursor words reach the device BEFORE barrier #1**
-    /// (PR 14 fix round 1, §4.4bh). The manager's tail rides the ledger
-    /// record and the cursors of the slots its page names ride page 0,
-    /// which the cycle writes AFTER that record — so a death between the
-    /// two left every page-named slot's cursor one cycle stale while the
-    /// record's tail had passed the mints: the successor reopened the
-    /// slot at the page's word and minted over live inos (a joiner's or
-    /// a declared region's page names ITS tail and cursors in one write,
-    /// so the window is region 0's alone; the overflow slots' cursors
-    /// ride tree 0's pre-flush publication, §4.4bd's cursor law). Every
-    /// record the record's tail passes sits below the cycle's head, so it
-    /// was minted before this write reads the cells: page 0 with the live
-    /// cursor words — the previous record's tail and seq, the roots as
-    /// the plan names them now — written here and made durable by the
-    /// barrier the record follows, the allocation bitmaps' own law. A
-    /// cycle whose page-named cursors did not move writes nothing; the
-    /// roots' publication stays the post-record write's.
+    /// (PR 14 fix round 1, §4.4bh; its shape §4.4bj). The manager's tail
+    /// rides the ledger record and the cursors of the slots its page names
+    /// ride page 0, which the cycle writes AFTER that record — so a death
+    /// between the two left every page-named slot's cursor one cycle stale
+    /// while the record's tail had passed the mints: the successor
+    /// reopened the slot at the page's word and minted over live inos (a
+    /// joiner's or a declared region's page names ITS tail and cursors in
+    /// one write, so the window is region 0's alone; the overflow slots'
+    /// cursors ride tree 0's pre-flush publication, §4.4bd's cursor law).
+    /// Every record the record's tail passes sits below the cycle's head,
+    /// so it was minted before this write reads the cells: page 0 with the
+    /// live cursor words, made durable by the barrier the record follows —
+    /// the allocation bitmaps' own law.
+    ///
+    /// **A CURSOR-ONLY refresh of the slots the page ALREADY names** (fix
+    /// round 2, Issue 10): the previous image's entries with each cursor
+    /// raised to its live cell — no page plan, no publish-before-drop, no
+    /// control-entry admission — because a checkpoint-class refusal in
+    /// this window would abort the cycle BEFORE its record where the
+    /// post-record page write's refusal leaves the record landed and the
+    /// tick retrying (§4.4bj: the demoted floors would clamp every later
+    /// tail with `reusable_upto` never moving — §4.4be's deadlock by
+    /// another door). A slot the page does not yet name rides the
+    /// post-record path as before: its root is unpublished until a page
+    /// names it, so its floor keeps its mints in the window (the replay
+    /// raises the cell), or tree 0 names its root and cursor at the grant
+    /// and §4.4bh's slot — a page-named slot whose root MOVED — IS in the
+    /// previous image. A cycle whose page-named cursors did not move
+    /// writes nothing; the roots' publication stays the post-record
+    /// write's. The page write itself is the one device write here, the
+    /// bitmap pages' class: an I/O error aborts the cycle as theirs does.
     pub(super) async fn write_cursor_page_before_barrier(
         &self,
-        cycle: &super::tree::SmoContext,
     ) -> std::result::Result<(), KvError> {
         let Some(set) = self.appenders.as_ref() else {
             return Ok(());
@@ -11558,33 +11592,35 @@ impl KvMetaBackend {
         {
             return Ok(());
         }
-        let Some(forest) = self.forest() else {
-            return Ok(());
-        };
         let Some(r) = set.regions.first().filter(|r| r.id == 0) else {
             return Ok(());
         };
         if r.released.load(Ordering::Acquire) {
             return Ok(());
         }
-        let trees = forest.slot_trees();
-        let entries = self
-            .cycle_page_entries(set, forest, &trees, r, cycle)
-            .await?;
+        let live_cursor = |page_slot: u16| -> u64 {
+            let fslot = super::appender::forest_slot_of_page_slot(page_slot, set.native_slot);
+            if fslot == super::record::NATIVE_FOREST_SLOT {
+                return 0;
+            }
+            self.routing_slot_of_forest(fslot)
+                .ok()
+                .and_then(|routing| self.guest_cursor_snapshot(routing))
+                .unwrap_or(0)
+        };
         {
             let mut page = r.page.lock().unwrap_or_else(|e| e.into_inner());
-            let moved = entries.iter().any(|e| {
-                e.cursor != 0
-                    && page
-                        .slots
-                        .iter()
-                        .find(|p| p.slot == e.slot)
-                        .is_none_or(|p| p.cursor < e.cursor)
-            });
+            let mut moved = false;
+            for e in page.slots.iter_mut() {
+                let live = live_cursor(e.slot);
+                if live > e.cursor {
+                    e.cursor = live;
+                    moved = true;
+                }
+            }
             if !moved {
                 return Ok(());
             }
-            page.slots = entries;
         }
         super::META_KV_CURSOR_PAGE_WRITES.fetch_add(1, Ordering::Relaxed);
         self.write_region_page(r).await

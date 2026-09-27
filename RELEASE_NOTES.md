@@ -233,7 +233,13 @@ mount is a read-token client whose metadata is exact at the next resolve
   cycle in which a page-named slot minted; `meta_kv_cursor_page_writes`
   counts them (0 on a joined appender, a reader, a probe and every flat
   mount). A joined appender's page names its own tail and cursors in one
-  write and never had the window.
+  write and never had the window. The write is a cursor-only refresh of
+  the entries the page already names (the acceptance record's §4.4bj): its
+  first shape ran the page writer's whole plan — a publication whose
+  checkpoint-class admission can be refused — inside the pre-barrier
+  window and aborted the cycle before its record on such a refusal, where
+  the same refusal after the record leaves it landed and the tick
+  retrying; nothing that can be refused runs in that window now.
 - **A wide leaf split no longer fails the checkpoint (the acceptance
   record's §4.4bi):** the checkpoint class's keep (§4.4be) presumed every
   structural-modification entry fits one page and the fix round's first

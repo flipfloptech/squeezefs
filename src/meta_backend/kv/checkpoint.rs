@@ -2843,9 +2843,12 @@ impl KvMetaBackend {
         // `h`, and page 0 — those cursors' only durable home — is written
         // after it; a death between the two reopened the slots one cycle
         // stale. Page 0 with the live cells lands here, durable by
-        // barrier #1. A no-op on a joined appender (its page names its
-        // own tail) and on every unarmed or flat mount.
-        self.write_cursor_page_before_barrier(smo).await?;
+        // barrier #1 — a cursor-only refresh of the image's own entries,
+        // no publication and no class admission in this window (§4.4bj: a
+        // refusal here would abort the cycle before its record). A no-op
+        // on a joined appender (its page names its own tail) and on every
+        // unarmed or flat mount.
+        self.write_cursor_page_before_barrier().await?;
         let t_pages = std::time::Instant::now();
 
         // ---- Barrier #1: node appends + bitmap pages + every completed

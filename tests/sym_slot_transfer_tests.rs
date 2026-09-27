@@ -26,7 +26,7 @@ use squeezefs::meta_backend::kv::appender::{
 };
 use squeezefs::meta_backend::kv::backend::{
     AcquireSlotReply, ControlAdmit, KvMetaBackend, TEST_HANDOVER_HOLD_AFTER_PAGE,
-    TEST_HANDOVER_HOLD_AFTER_TREE0,
+    TEST_HANDOVER_HOLD_AFTER_TREE0, TEST_PREPARE_PAGE_ENTRIES_REFUSE_ONCE,
 };
 use squeezefs::meta_backend::kv::block_refs::{volume_tag, BlockRef, BlockRefOp};
 use squeezefs::meta_backend::kv::builder::{
@@ -5698,4 +5698,82 @@ async fn a_page_named_slots_cursor_is_durable_before_the_record_whose_tail_passe
         cursor_page_writes > pre_barrier_writes,
         "the cycle wrote page 0's cursor words before its barrier (the engagement gauge)"
     );
+}
+
+/// **PR 14 fix round 2 (§4.4bj) — the pre-barrier cursor write never
+/// aborts the cycle before its record.** §4.4bh's first build computed
+/// page 0's entries through the page writer's whole plan — publish-before-
+/// drop included, a checkpoint-class admission — INSIDE the pre-barrier
+/// window and propagated its refusal, so a `JournalReserveExhausted` that
+/// used to leave the ledger record LANDED (the post-record page write's
+/// "the previous image stands, the tick retries") aborted the cycle
+/// before barrier #1: `reusable_upto` never moved, the class stayed
+/// consumed, the demoted floors clamped every later tail — §4.4be's
+/// deadlock by another door. The pre-barrier write is a cursor-only
+/// refresh of the image's own entries now. Pinned with the page writer's
+/// publish arm refusing ONCE (`TEST_PREPARE_PAGE_ENTRIES_REFUSE_ONCE`)
+/// during a cycle whose rotor cursors moved: the cycle's record LANDS
+/// (`meta_kv_checkpoints` +1, the tail advanced) whatever the page write
+/// answers, and the next cycle lands its page. RED on the first build:
+/// `checkpoints` +0 — the refusal reached the cycle ahead of its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_publish_refusal_never_reaches_the_cycle_ahead_of_its_ledger_record() {
+    use squeezefs::meta_backend::kv::META_KV_CHECKPOINTS;
+    use squeezefs::meta_backend::{guest_local_ino, split_guest_local};
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let routed = open_under(&uris, &Knobs::armed()).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let tag = 0xB0DC;
+    // A rotor slot on the page, then mints into it: the pre-barrier write
+    // has cursors to refresh.
+    let routing = loop {
+        let (local, _global) = routed.allocate_local_ino(0).unwrap();
+        if let Some((routing, _)) = split_guest_local(local) {
+            break routing;
+        }
+    };
+    let mint = || guest_local_ino(routing, vol.allocate_guest_ino(routing).unwrap());
+    let first = mint();
+    vol.commit_block_refs(first, &refs(tag, first, 10, 1))
+        .await
+        .unwrap();
+    vol.checkpoint_now().await.unwrap();
+    for i in 0..8u64 {
+        let next = mint();
+        vol.commit_block_refs(next, &refs(tag, next, 100 + i, 1))
+            .await
+            .unwrap();
+    }
+    let checkpoints_before = META_KV_CHECKPOINTS.load(Ordering::Relaxed);
+    let tail_before = vol.ledger_tail();
+    TEST_PREPARE_PAGE_ENTRIES_REFUSE_ONCE.store(true, Ordering::SeqCst);
+    // The cycle: the record lands whatever the page write answers after
+    // it (a refused page is the tick's to retry).
+    let outcome = vol.checkpoint_now().await;
+    let fired = !TEST_PREPARE_PAGE_ENTRIES_REFUSE_ONCE.load(Ordering::SeqCst);
+    TEST_PREPARE_PAGE_ENTRIES_REFUSE_ONCE.store(false, Ordering::SeqCst);
+    assert!(
+        fired,
+        "premise: the page writer's publish arm was reached and refused"
+    );
+    assert_eq!(
+        META_KV_CHECKPOINTS.load(Ordering::Relaxed),
+        checkpoints_before + 1,
+        "the cycle's ledger record landed despite the page refusal (outcome {outcome:?})"
+    );
+    assert!(
+        vol.ledger_tail() > tail_before,
+        "the record's tail advanced past the cycle's mints"
+    );
+    // The next cycle lands whole, and the volume is healthy.
+    vol.checkpoint_now()
+        .await
+        .expect("the retry lands its page");
+    assert!(
+        !vol.is_failed(),
+        "no wedge: the class was never consumed behind a lost record"
+    );
+    shutdown(&routed).await;
 }

@@ -1984,8 +1984,14 @@ impl KvTree {
     /// Opportunistic: a compaction-floor or ring-reserve refusal is a
     /// deferral (the heap-full sweep owns the retry), never this visit's
     /// error — the flush itself already succeeded and its floor stands
-    /// cleared.
+    /// cleared. Yields the same way to a user commit retrying for space
+    /// (`NodeCache::space_retry_inflight`): its claim is at the floor the
+    /// retry needs, and the sweep picks the candidate up later.
     async fn merge_after_flush(&self, ctx: &mut SmoContext, min_key: &[u8]) -> Result<(), KvError> {
+        if self.cache.space_retry_inflight() {
+            self.cache.note_merge_yield();
+            return Ok(());
+        }
         let layout = self.cache.config().layout;
         let cur = self.descend(min_key, 0).await?;
         if self.is_root(&cur) || cur.state().is_superseded() {

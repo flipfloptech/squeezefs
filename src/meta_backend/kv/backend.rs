@@ -12678,6 +12678,33 @@ impl KvMetaBackend {
         self.merge_sweeps.load(Ordering::Relaxed)
     }
 
+    /// `meta_kv_merge_yields`: opportunistic merges (the heap-full sweep,
+    /// the flush pass's sibling merge) that stood down for a user commit
+    /// retrying for space at the §4.7 door ([`NodeCache::merge_yields`]).
+    pub fn merge_yields(&self) -> u64 {
+        self.cache.merge_yields()
+    }
+
+    /// The §4.7 door's space retry, held across the "return room" cycles
+    /// and the re-admission ([`NodeCache::begin_space_retry`]) — the
+    /// opportunistic merges yield while it stands.
+    pub fn begin_space_retry(&self) -> super::node_cache::SpaceRetryHold<'_> {
+        self.cache.begin_space_retry()
+    }
+
+    /// Is a user commit retrying for space at the §4.7 door right now
+    /// ([`NodeCache::space_retry_inflight`])? The opportunistic merges'
+    /// yield predicate.
+    pub(super) fn space_retry_inflight(&self) -> bool {
+        self.cache.space_retry_inflight()
+    }
+
+    /// One opportunistic merge stood down for a space retry
+    /// ([`NodeCache::note_merge_yield`]).
+    pub(super) fn note_merge_yield(&self) {
+        self.cache.note_merge_yield();
+    }
+
     /// `meta_kv_merge_candidates` (§4.6a (h), EXACT as of the last
     /// completed sweep lap or census): underfull leaves standing on this
     /// volume.
@@ -23091,6 +23118,10 @@ impl KvMetaBackend {
         // §4.7 heap admission: whether this pass already spent its ONE
         // checkpoint cycle trying to return budget for a refused member.
         let mut cycled_for_space = false;
+        // The retry's hold on the opportunistic merges
+        // (`NodeCache::begin_space_retry`): taken before the "return room"
+        // cycles, released right after the re-admission they earn.
+        let mut space_retry: Option<super::node_cache::SpaceRetryHold<'_>> = None;
         let (res, seq_base, undo, failed) = loop {
             attempt += 1;
             if attempt > COMMIT_RETRY_BUDGET {
@@ -23187,6 +23218,9 @@ impl KvMetaBackend {
             // a member that cannot be promised refuses `NoSpace` ALONE,
             // before anything is reserved or applied.
             let refused = self.admit_heap_locked(&s.entries, &leaves, &lock_set, &mut guards);
+            // The re-admission the space retry earned has run: the
+            // opportunistic merges may resume whatever it answered.
+            drop(space_retry.take());
             if !refused.is_empty() {
                 record_hold();
                 drop(guards);
@@ -23205,9 +23239,19 @@ impl KvMetaBackend {
                 // covers, the second cycle's tail passes them. A refusal
                 // that survives (or finds nothing to return) is final:
                 // ENOSPC. No node lock is held across the cycles.
+                //
+                // The cycles run with the opportunistic merges YIELDING
+                // (`begin_space_retry`): the heap-full sweep claims at the
+                // same compaction floor this member needs and runs at the
+                // end of every cycle, after the barrier — so without the
+                // hold it re-claimed every extent the two cycles returned
+                // and the retry met the floor again while `pending_free`
+                // grew (a full volume refusing its deletes while its
+                // recovery churned). The hold spans the re-admission.
                 let returnable = self.cache.heap_promised() > 0 || self.alloc.pending_count() > 0;
                 if !cycled_for_space && returnable {
                     cycled_for_space = true;
+                    space_retry = Some(self.begin_space_retry());
                     for _ in 0..2 {
                         if let Err(e) = self.checkpoint_now().await {
                             log::warn!(

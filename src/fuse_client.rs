@@ -13432,6 +13432,10 @@ impl SqueezefsFilesystem {
                     "meta_kv_merge_sweeps".into(),
                     per_volume(&|be| be.merge_sweeps()),
                 );
+                metrics.insert(
+                    "meta_kv_merge_yields".into(),
+                    per_volume(&|be| be.merge_yields()),
+                );
                 // THE SLOT-TREE FOREST (design-symmetric-metadata §5.2,
                 // incompat bit 17 — PR 1, dark): `slot_trees_minted` =
                 // guest slot trees minted on a slot's first record (the

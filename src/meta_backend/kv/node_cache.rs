@@ -2397,6 +2397,19 @@ pub trait EpochPurgeSink: Send + Sync + std::fmt::Debug {
     fn on_epoch_advance(&self, from_epoch: u64, to_epoch: u64) -> u64;
 }
 
+/// A held §4.7 space retry ([`NodeCache::begin_space_retry`]): the
+/// opportunistic merges yield while it stands; the drop releases it.
+#[must_use = "the retry is in flight only while the hold lives"]
+pub struct SpaceRetryHold<'a> {
+    cache: &'a NodeCache,
+}
+
+impl Drop for SpaceRetryHold<'_> {
+    fn drop(&mut self) {
+        self.cache.space_retries.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// What one revalidation poll did — the RO mount's per-poll ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RevalidateOutcome {
@@ -2531,6 +2544,22 @@ pub struct NodeCache {
     /// Owned by the dirty halves through this handle (Drop-exact, like
     /// the charge).
     heap_promised: Arc<AtomicU64>,
+    /// User commits the pass is cycling the checkpoint for right now,
+    /// after a heap-admission refusal (the §4.7 door's one retry for
+    /// space). While ≥ 1, the OPPORTUNISTIC merges — the heap-full sweep
+    /// and the flush pass's sibling merge — YIELD: each claims at the
+    /// same compaction floor a user delete's compaction needs, and the
+    /// sweep runs at the END of every cycle, after the barrier returned
+    /// the parked retirements, so the door's two "return room" cycles
+    /// handed every returned extent to the sweep and the delete's retry
+    /// found the floor again (a full volume with mergeable leaves refused
+    /// deletes while its recovery churned — `pending_free` 13 → 50 at
+    /// `free` pinned on the floor). The backlog word keeps the sweep's
+    /// state; it resumes at the next cycle with no retry in flight.
+    space_retries: AtomicU64,
+    /// `meta_kv_merge_yields`: opportunistic merges (a sweep, a flush-pass
+    /// sibling merge) that stood down for a user commit's space retry.
+    merge_yields: AtomicU64,
     /// The shared per-cache environment (`epoch_core`): the **durable
     /// journal tail** (§4.5 torn-tail classifier input, §4.2 tombstone
     /// elision floor — K6b's checkpoint advances it, tests drive it
@@ -2690,6 +2719,8 @@ impl NodeCache {
             clock: scc::Queue::default(),
             cached_bytes: Arc::new(AtomicU64::new(0)),
             heap_promised: Arc::new(AtomicU64::new(0)),
+            space_retries: AtomicU64::new(0),
+            merge_yields: AtomicU64::new(0),
             env: Arc::new(NodeEnv::new(0)),
             lease: Arc::new(crate::slot_lease_core::LeaseGate::new()),
             purge_sink: OnceLock::new(),
@@ -2999,6 +3030,33 @@ impl NodeCache {
     /// the heap admission's `claimable − promised` term).
     pub fn heap_promised(&self) -> u64 {
         self.heap_promised.load(Ordering::Acquire)
+    }
+
+    /// The §4.7 door's space retry, held by the conveyor pass from the
+    /// first "return room" checkpoint cycle to the re-admission that
+    /// follows them: while one is held the opportunistic merges yield
+    /// (`space_retries`). RAII — a pass that fails out of the window
+    /// releases it with the guard.
+    pub fn begin_space_retry(&self) -> SpaceRetryHold<'_> {
+        self.space_retries.fetch_add(1, Ordering::AcqRel);
+        SpaceRetryHold { cache: self }
+    }
+
+    /// Is a user commit retrying for space right now? The opportunistic
+    /// merges' yield predicate.
+    pub fn space_retry_inflight(&self) -> bool {
+        self.space_retries.load(Ordering::Acquire) > 0
+    }
+
+    /// One opportunistic merge stood down for a space retry
+    /// (`meta_kv_merge_yields`).
+    pub fn note_merge_yield(&self) {
+        self.merge_yields.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `meta_kv_merge_yields` on this volume.
+    pub fn merge_yields(&self) -> u64 {
+        self.merge_yields.load(Ordering::Relaxed)
     }
 
     /// The cache's placement/policy config.

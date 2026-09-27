@@ -3225,7 +3225,28 @@ impl KvMetaBackend {
         // volume's lap completes across cycles without stalling the
         // cadence its ring reclamation rides. Zero cost in steady state:
         // the posture gates it.
-        if self.heap_full() || self.merge_backlog.load(Ordering::Acquire) {
+        //
+        // YIELDS to a user commit retrying for space
+        // (`NodeCache::space_retry_inflight`): the sweep's merge claims at
+        // the compaction floor — the same floor a user delete's compaction
+        // needs — and this arm runs AFTER the barrier returned the parked
+        // retirements, so inside the §4.7 door's two "return room" cycles
+        // it took every returned extent and the delete's one retry met the
+        // floor again (a full volume refusing its deletes while its
+        // recovery churned). The backlog word is untouched: the sweep
+        // resumes at the next cycle with no retry in flight.
+        let sweep_due = self.heap_full() || self.merge_backlog.load(Ordering::Acquire);
+        if sweep_due && self.space_retry_inflight() {
+            self.note_merge_yield();
+            log::debug!(
+                "checkpoint: merge sweep on {:?} yielded to a user commit retrying for space \
+                 (free={} promised={} pending-free={})",
+                self.device_path(),
+                self.allocator().free_extents(),
+                self.heap_promised(),
+                self.allocator().pending_count()
+            );
+        } else if sweep_due {
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(self.merge_sweep_budget_ms);
             match self.run_merge_sweep(smo, true, Some(deadline)).await {

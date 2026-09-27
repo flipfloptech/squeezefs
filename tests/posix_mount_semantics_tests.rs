@@ -422,11 +422,13 @@ fn a_read_only_mount_of_a_quiescent_set_serves_and_fail_stops_when_a_writer_appe
         ro_log.display()
     );
     // Every metadata op refuses now (the path walk asks the daemon: TTLs
-    // are 0 on a reader), and the writer is untouched.
-    let refused = std::fs::metadata(mnt.join("file1"));
-    assert!(
-        refused.is_err(),
-        "a fail-stopped reader answers no metadata (got {refused:?})"
+    // are 0 on a reader) with ESTALE — the word tools read as "remount" —
+    // and the writer is untouched.
+    let refused = std::fs::metadata(mnt.join("file1")).expect_err("a fail-stopped reader refuses");
+    assert_eq!(
+        refused.raw_os_error(),
+        Some(libc::ESTALE),
+        "the fail-stop's errno names the remedy (got {refused:?})"
     );
     std::fs::write(mnt2.join("file3"), b"three").expect("the writer writes");
     assert!(

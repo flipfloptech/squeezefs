@@ -98,6 +98,10 @@ impl RoLatch {
 impl Drop for RoLatch {
     fn drop(&mut self) {
         set_read_only_mount(false);
+        // The quiescent-reader latches are process-global too (record
+        // §4.4br): a contract that went quiescent must not leave the word
+        // for the next.
+        squeezefs::ro_coherence::test_reset_quiescent_reader();
     }
 }
 
@@ -1336,6 +1340,9 @@ async fn the_mount_path_token_arm_refuses_loud_on_a_flat_volume() {
     squeezefs::meta_backend::kv::builder::format_v3_single_writer(vol.path(), VOL_LEN, &opts())
         .await
         .expect("format the single-writer volume");
+    // Under a LIVE writer: with none the set is quiescent and the reader
+    // serves the projection on any layout (record §4.4br).
+    let writer = KvMetaBackend::open(vol.path()).await.expect("writer");
     let reader = KvMetaBackend::open_read_only(vol.path())
         .await
         .expect("read-only mount");
@@ -1348,6 +1355,8 @@ async fn the_mount_path_token_arm_refuses_loud_on_a_flat_volume() {
         "the refusal names the class and the remedy: {err}"
     );
     assert!(reader.token_reader().is_none(), "nothing armed on refusal");
+    drop(reader);
+    writer.shutdown().await.expect("writer shutdown");
 }
 
 /// A token client IS a member-reader: the holder judges an unacked
@@ -1394,7 +1403,6 @@ async fn the_mount_path_token_arm_refuses_loud_without_a_membership_lease() {
 async fn a_read_only_open_of_a_quiescent_set_serves_the_projection_without_a_token_client() {
     let _serial = TOKEN_POSTURE.lock().await;
     let _latch = RoLatch::arm();
-    let _reset = QuiescentReset;
     let vol = stamped_volume().await;
     let reader = KvMetaBackend::open_read_only(vol.path())
         .await
@@ -1419,32 +1427,37 @@ async fn a_read_only_open_of_a_quiescent_set_serves_the_projection_without_a_tok
     assert_eq!(root.ino, 1);
 }
 
-/// **A writer appearing under a quiescent reader FAIL-STOPS the reader
-/// within one poll** (R-SYM-4: a bounded-staleness projection beside a
-/// live writer is the second read method; the honest posture is a loud
-/// refusal until the remount joins as a token client). The revalidation
-/// poll's writer watch sees the D0 flock / the fresh claim, runs the
-/// mount's fail-stop action ONCE, and latches the gauge.
+/// **A SAME-HOST writer appearing under a quiescent reader FAIL-STOPS the
+/// reader within one poll** (R-SYM-4: a bounded-staleness projection
+/// beside a live writer is the second read method; the honest posture is
+/// a loud refusal until the remount joins as a token client). The
+/// revalidation poll's same-host watch sees the writer's D0 flock before
+/// its first checkpoint, runs the mount's fail-stop action ONCE, and
+/// publishes the gauge AFTER it. The waits are the poll's own derived
+/// cadence — product time under test, never a synchronization sleep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_writer_appearing_under_a_quiescent_reader_fail_stops_it_within_the_poll() {
     let _serial = TOKEN_POSTURE.lock().await;
     let _latch = RoLatch::arm();
-    let _reset = QuiescentReset;
     let vol = stamped_volume().await;
     let reader = KvMetaBackend::open_read_only(vol.path())
         .await
         .expect("read-only mount");
     let (router, _b) = data_router("ro_quiescent_writer").await;
+    squeezefs::ro_coherence::arm_reader_coherence(std::slice::from_ref(&reader), &router);
     let arm = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
         .await
         .expect("quiescent");
     assert_eq!(arm, squeezefs::ro_coherence::ReaderArm::Quiescent);
+    let cadence = squeezefs::ro_coherence::reader_revalidate_interval();
     let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let wake = Arc::new(squeezefs_ipc::sqz_notify::Notify::new());
     let on_writer: Arc<dyn Fn() + Send + Sync> = {
         let fired = Arc::clone(&fired);
         Arc::new(move || {
+            // The action runs BEFORE the gauge is published.
+            assert!(!squeezefs::ro_coherence::quiescent_writer_appeared());
             fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
     };
@@ -1455,12 +1468,12 @@ async fn a_writer_appearing_under_a_quiescent_reader_fail_stops_it_within_the_po
         Some(on_writer),
     );
     // Two quiet passes: nothing fires while the set stays quiescent.
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    tokio::time::sleep(cadence * 2 + cadence / 2).await;
     assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-    // The writer mounts.
+    // The writer mounts (the flock, before any checkpoint).
     let writer = KvMetaBackend::open(vol.path()).await.expect("writer");
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + cadence * 6;
     while fired.load(std::sync::atomic::Ordering::SeqCst) == 0 && Instant::now() < deadline {
         wake.notify_waiters();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1473,7 +1486,7 @@ async fn a_writer_appearing_under_a_quiescent_reader_fail_stops_it_within_the_po
     assert!(squeezefs::ro_coherence::quiescent_writer_appeared());
     // Later passes fire nothing more (the latch is one-shot).
     wake.notify_waiters();
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    tokio::time::sleep(cadence + cadence / 5).await;
     assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     stop.store(true, std::sync::atomic::Ordering::Release);
@@ -1486,13 +1499,76 @@ async fn a_writer_appearing_under_a_quiescent_reader_fail_stops_it_within_the_po
     writer.shutdown().await.expect("writer shutdown");
 }
 
-/// Resets the process-global quiescent-reader latches between contracts.
-struct QuiescentReset;
+/// **A REMOTE writer is seen by its ledger, and its checkpoint is never
+/// adopted** (§4.4br review round 1, Issue 1 — the two-host shape: the
+/// writer's D0 flock is on ANOTHER host, so the same-host watch sees
+/// nothing, and its claim record lives in the very checkpoint the poll
+/// would adopt). Nothing writes on a quiescent set, so a ledger record
+/// newer than the adopted one IS a writer's first checkpoint: the pass
+/// answers `writer_appeared` and REFUSES the swap — the reader's epoch
+/// stands, the writer's create never resolves through it. Modelled
+/// in-process by a writer that commits, checkpoints and LEAVES before the
+/// pass (no lock to see, its clean leave releases its claim), so the
+/// ledger advance is the only trace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ledger_advance_under_a_quiescent_reader_is_a_writer_and_is_never_adopted() {
+    let _serial = TOKEN_POSTURE.lock().await;
+    let _latch = RoLatch::arm();
+    let vol = stamped_volume().await;
+    let reader = KvMetaBackend::open_read_only(vol.path())
+        .await
+        .expect("read-only mount");
+    let (router, _b) = data_router("ro_quiescent_ledger").await;
+    squeezefs::ro_coherence::arm_reader_coherence(std::slice::from_ref(&reader), &router);
+    let arm = squeezefs::ro_coherence::arm_token_readers(std::slice::from_ref(&reader), &router)
+        .await
+        .expect("quiescent");
+    assert_eq!(arm, squeezefs::ro_coherence::ReaderArm::Quiescent);
+    let epoch0 = reader.reader_epoch();
+    let quiet = reader.revalidate_reader().await.expect("an idle pass");
+    assert!(
+        !quiet.writer_appeared && !quiet.advanced,
+        "an idle set: nothing to adopt"
+    );
 
-impl Drop for QuiescentReset {
-    fn drop(&mut self) {
-        squeezefs::ro_coherence::test_reset_quiescent_reader();
+    // The remote writer's whole life, from this reader's point of view:
+    // a create, a checkpoint (the ledger advances), a clean leave.
+    {
+        let writer = KvMetaBackend::open(vol.path()).await.expect("writer");
+        writer
+            .create(
+                1,
+                "written-by-the-remote-writer",
+                libc::S_IFREG | 0o644,
+                0,
+                0,
+            )
+            .await
+            .expect("create");
+        writer.checkpoint_now().await.expect("checkpoint");
+        writer.shutdown().await.expect("clean leave");
     }
+    assert!(
+        !squeezefs::ro_coherence::quiescent_local_writer_present(std::slice::from_ref(&reader)),
+        "no lock on this host remains to see"
+    );
+
+    let out = reader.revalidate_reader().await.expect("the pass");
+    assert!(
+        out.writer_appeared,
+        "a ledger advance on a quiescent volume IS a writer: {out:?}"
+    );
+    assert!(!out.advanced, "and its record is never adopted");
+    assert_eq!(reader.reader_epoch(), epoch0, "the reader's epoch stands");
+    let missed = reader
+        .lookup(1, "written-by-the-remote-writer")
+        .await
+        .expect_err("the writer's create never resolves through the refused projection");
+    assert_eq!(
+        missed.to_errno(),
+        libc::ENOENT,
+        "absent, as the quiescent set left it"
+    );
 }
 
 // ===========================================================================
@@ -1623,6 +1699,9 @@ async fn the_mount_path_token_arm_refuses_a_drain_lever_at_zero() {
     let _serial = TOKEN_POSTURE.lock().await;
     let _latch = RoLatch::arm();
     let vol = stamped_volume().await;
+    // Under a LIVE writer (the levers govern a token reader's ack; a
+    // quiescent reader acks nothing — record §4.4br).
+    let writer = KvMetaBackend::open(vol.path()).await.expect("writer");
     let reader = KvMetaBackend::open_read_only(vol.path())
         .await
         .expect("read-only mount");
@@ -1646,6 +1725,8 @@ async fn the_mount_path_token_arm_refuses_a_drain_lever_at_zero() {
     );
     squeezefs::ro_coherence::test_set_drain_epoch_stamp(None);
     assert!(reader.token_reader().is_none(), "nothing armed on refusal");
+    drop(reader);
+    writer.shutdown().await.expect("writer shutdown");
 }
 
 /// An explicit non-zero kernel TTL on a token reader is refused (review

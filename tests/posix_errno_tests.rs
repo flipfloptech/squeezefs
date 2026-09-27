@@ -60,6 +60,9 @@ fn pinned_errno(e: &SqueezefsError) -> libc::c_int {
         // the operation cannot be retried into success here, and a
         // successor mount owns the accounting.
         SqueezefsError::WriterGuardFenced => libc::EIO,
+        // The quiescent reader's fail-stop (record §4.4br): the remedy IS a
+        // remount — ESTALE is the word every tool reads that way.
+        SqueezefsError::ReaderFailStopped => libc::ESTALE,
         SqueezefsError::IndirectMapFormat { .. } => libc::EIO,
         // DLM S6: a fail-stopped lease reaching a data path is the same
         // class as a fenced writer guard — the I/O must not proceed.
@@ -134,6 +137,7 @@ fn one_of_each() -> Vec<SqueezefsError> {
         SqueezefsError::GdsError("gds".into()),
         SqueezefsError::CacheOverflow,
         SqueezefsError::Timeout,
+        SqueezefsError::ReaderFailStopped,
         SqueezefsError::PublishFailure {
             class: squeezefs::error::PublishFailureClass::TransportOutcomeUnknown,
             msg: "lost".into(),

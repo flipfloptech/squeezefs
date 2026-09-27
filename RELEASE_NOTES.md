@@ -371,6 +371,18 @@ mount is a read-token client whose metadata is exact at the next resolve
   refuses — and the job fabric's adopted jobs (the one mount-time
   allocator) are held until the arm has landed. Found by the 1.3.0 release
   chain's fstests pre-pass (record §4.4bs).
+- **A write that grew a staged file past one block while a pressure
+  promotion of the same file landed it in a pack block left the pack
+  tenant's durable reference behind**: the growth transition (and the
+  two spill escalations) computed the block-reference delta against the
+  layout snapshot taken before the commit lock while releasing the
+  entry's map read under it, so the superseded tenant kept its record
+  after its block was freed — fsck C8 drift (`durable 1 vs derived 0`),
+  and on the 1.3 default a refused remount at the allocation arm's loss
+  check (`… LIVE read CLEAR in the recovered allocation bitmap`; fstests
+  generic/751's ENOSPC fill, whose next scratch mount failed). All three
+  swap sites now read the map they displace under the lock. Found by the
+  1.3.0 release chain's fstests resume (record §4.4bt).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a

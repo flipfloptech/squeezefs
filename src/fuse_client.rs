@@ -6145,6 +6145,13 @@ pub struct Metrics {
     /// binding outlived its block (and, before incompat bit 13, was silent
     /// on a passthrough volume).
     pub block_key_incarnation_refusals: Align64<AtomicU64>,
+    /// Pins refused because the KEY named a dead lifetime of its offset: the
+    /// allocator's increment landed on the offset's new owner and was handed
+    /// back through the ladder under the live key (`BackendRouter::
+    /// pin_block_validated`). The mover's census-stale class — a legal race,
+    /// counted so a storm of it is visible; before the check it stranded the
+    /// new owner's block behind a phantom reference.
+    pub block_pin_stale_keys: Align64<AtomicU64>,
     /// Spec §6.2 item 6: keys served whose incarnation could not be
     /// checked because the offset has **no recorded lifetime** on this node
     /// — §6.3's honest degradation ("`UNKNOWN_STABLE` for any offset this
@@ -11413,6 +11420,7 @@ impl SqueezefsFilesystem {
                 "read_settle_stale_head_refetches": METRICS.read_settle_stale_head_refetches.load(Ordering::Relaxed),
                 "served_binding_witnesses": METRICS.served_binding_witnesses.load(Ordering::Relaxed),
                 "block_key_incarnation_refusals": METRICS.block_key_incarnation_refusals.load(Ordering::Relaxed),
+                "block_pin_stale_keys": METRICS.block_pin_stale_keys.load(Ordering::Relaxed),
                 "block_key_incarnation_unknown": METRICS.block_key_incarnation_unknown.load(Ordering::Relaxed),
                 "block_key_incarnation_exhausted": METRICS.block_key_incarnation_exhausted.load(Ordering::Relaxed),
                 "layout_striped_writes": METRICS.layout_striped_writes.load(Ordering::Relaxed),

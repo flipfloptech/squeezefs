@@ -693,6 +693,13 @@ async fn test_defrag_data_g_vl6_contiguity_tail_churn_zero_corruption() {
     stop.store(true, Ordering::Relaxed);
     churn.await.unwrap();
 
+    // Settle the async block reclaimer before the convergence pass: the
+    // churn's last unlinks ENQUEUE their terminal frees and the manners law
+    // defers the drain under the mover's own device writes, so unsettled
+    // they publish AFTER the pass as holes it never saw (the report
+    // contract below settles the same way before it measures).
+    fx.fs.router.backend_router.reclaim_drain().await;
+
     // Quiescent convergence pass (the churn's own frees are new work).
     let job_id = fx
         .fabric
@@ -710,6 +717,10 @@ async fn test_defrag_data_g_vl6_contiguity_tail_churn_zero_corruption() {
         .await
         .expect("terminal");
     assert_eq!(end, JobState::Completed);
+
+    // The mover's own source-block frees ride the same queue and publish
+    // after the job's terminal state — settle before measuring.
+    fx.fs.router.backend_router.reclaim_drain().await;
 
     // G-VL-6: D1 ≥ 0.9 and reclaimable tail ≥ 90 %.
     let after = squeezefs::defrag::measure_d1(&fx.fs.router);

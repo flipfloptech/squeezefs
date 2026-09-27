@@ -491,6 +491,88 @@ async fn the_reclaim_window_invariant_survives_lifetimes() {
     );
 }
 
+/// A pin is a promise about ONE lifetime. A key whose lifetime is dead —
+/// the mover's census names a block the owner freed and the allocator
+/// reissued to another file before the pin — must pin NOTHING: the offset
+/// now belongs to the new lifetime, and a reference raised on it is a
+/// phantom the key-checked ladder can never release (the unpin's
+/// `free_block(stale key)` refuses the stale binding — correctly — so the
+/// new owner's terminal free reads nonterminal and the block is stranded:
+/// claimed, refcount 1, referenced by nobody, until a remount rebuilds the
+/// allocator). Found by `defrag_tests`' G-VL-6 churn contract on the
+/// 1.3.0 release chain: the mover pinned a churn file's reissued block
+/// through its stale census key (1 in ~8 runs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_keys_pin_takes_no_reference_on_the_offsets_new_lifetime() {
+    use squeezefs::block_allocator::PinOutcome;
+    let data = data_file();
+    let (alloc, _dev, router) = bare_router(data.path()).await;
+    router
+        .engage_incarnation_keys(9, AppendPartition::SOLO)
+        .expect("engage");
+
+    // Lifetime 1: allocated, keyed, freed, published.
+    let off = alloc.allocate_block().await.expect("allocate");
+    let stale_key = router.persist_block_key("backend_0", off);
+    assert!(alloc.begin_free(off), "terminal free of lifetime 1");
+    alloc.finish_free(off);
+
+    // Lifetime 2: the same offset reissued to another owner.
+    let again = alloc.allocate_block().await.expect("reallocate");
+    assert_eq!(again, off, "the free list hands the same offset back");
+    alloc.publish_block(off);
+    let live_key = router.persist_block_key("backend_0", off);
+    assert_ne!(stale_key, live_key);
+    assert_eq!(
+        alloc.refcount(off),
+        Some(1),
+        "the new owner's one reference"
+    );
+
+    // The census-stale pin: REFUSED, and the new owner's count untouched.
+    let outcome = router.pin_block_validated(&stale_key).await;
+    assert!(
+        matches!(outcome, PinOutcome::Refused),
+        "a stale key pins nothing (got {outcome:?}) — the offset is another lifetime's"
+    );
+    assert_eq!(
+        alloc.refcount(off),
+        Some(1),
+        "the new lifetime's reference count must not carry the stale pin's phantom +1"
+    );
+
+    // The new owner's terminal free lands: the block frees, nothing strands.
+    assert!(
+        router.free_block_verdict(&live_key).await.expect("free"),
+        "the new owner's release is TERMINAL — a phantom pin would have made it nonterminal \
+         and stranded the block"
+    );
+    assert_eq!(
+        alloc.refcount(off),
+        None,
+        "no reference survives the terminal free"
+    );
+
+    // The valid-key pin still holds and unpins through the ladder. (The
+    // ladder's free rides the reclaim queue; settle it so the offset is
+    // reissued rather than a fresh block minted.)
+    router.reclaim_drain().await;
+    let third = alloc.allocate_block().await.expect("reallocate again");
+    assert_eq!(third, off);
+    alloc.publish_block(off);
+    let key3 = router.persist_block_key("backend_0", off);
+    assert!(matches!(
+        router.pin_block_validated(&key3).await,
+        PinOutcome::Pinned
+    ));
+    assert_eq!(alloc.refcount(off), Some(2), "the valid pin's reference");
+    assert!(
+        !router.free_block_verdict(&key3).await.expect("unpin"),
+        "the unpin is nonterminal"
+    );
+    assert_eq!(alloc.refcount(off), Some(1));
+}
+
 // ===========================================================================
 // 3. §6.3's failure, made detectable.
 // ===========================================================================

@@ -7302,7 +7302,7 @@ async fn reverify_scrub_failure(
         return false;
     }
     let clean = clean_key(&m.mapping);
-    match ctx.router.backend_router.pin_block_validated(&clean) {
+    match ctx.router.backend_router.pin_block_validated(&clean).await {
         crate::block_allocator::PinOutcome::Pinned => {
             let outcome = verify_stored_block(ctx, crypto, m, block_size).await;
             let _ = ctx.router.backend_router.free_block(&clean).await; // unpin

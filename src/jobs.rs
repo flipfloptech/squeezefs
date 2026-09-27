@@ -3155,7 +3155,7 @@ impl JobFabric {
         // patch/free exposure at all and moves pin-less, its frees
         // no-oping naturally.
         let mut pinned = true;
-        match br.pin_block_validated(&task.base_key) {
+        match br.pin_block_validated(&task.base_key).await {
             crate::block_allocator::PinOutcome::Pinned => {}
             crate::block_allocator::PinOutcome::PinnedUnstable => {
                 let _ = br.free_block(&task.base_key).await; // undo the pin
@@ -3648,7 +3648,7 @@ impl JobFabric {
         // an unstable word defers, a freed-meanwhile block is superseded,
         // an untracked one moves pin-less.
         let mut pinned = true;
-        match br.pin_block_validated(&victim.base_key) {
+        match br.pin_block_validated(&victim.base_key).await {
             crate::block_allocator::PinOutcome::Pinned => {}
             crate::block_allocator::PinOutcome::PinnedUnstable => {
                 let _ = br.free_block(&victim.base_key).await;

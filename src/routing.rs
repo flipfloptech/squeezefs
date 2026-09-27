@@ -4642,13 +4642,67 @@ impl BackendRouter {
     /// `PinnedUnstable` = the reference WAS taken but a patch may be
     /// mid-flight — the caller must unpin, refetch the authoritative map,
     /// and retry (the existing bounded refused-pin loop, extended).
+    ///
+    /// A pin is a promise about ONE lifetime, so the key's incarnation is
+    /// checked AFTER the allocator's increment (the increment is what
+    /// fences the lifetime the check reads). A key whose lifetime is dead —
+    /// a mover census or a clone map naming a block the owner freed and the
+    /// allocator reissued before the pin — takes NO reference: the raised
+    /// count is handed back through the ladder under the offset's LIVE key
+    /// (nonterminal in the ordinary case; the terminal free if the new owner
+    /// released between the two steps) and the outcome is `Refused`, the
+    /// arm every caller already reads as "re-resolve". Before this step the
+    /// offset-keyed increment landed a phantom reference on the new owner's
+    /// block that the key-checked unpin could never release
+    /// (`free_block(stale key)` refuses the stale binding), so the owner's
+    /// terminal free read nonterminal and the block was stranded until a
+    /// remount rebuilt the allocator — `block_pin_stale_keys` counts the
+    /// class (`tests/mw_block_key_incarnation_tests.rs`).
     #[must_use]
-    pub fn pin_block_validated(&self, block_key: &str) -> crate::block_allocator::PinOutcome {
+    pub async fn pin_block_validated(&self, block_key: &str) -> crate::block_allocator::PinOutcome {
         use crate::block_allocator::PinOutcome;
         // Decoration-tolerant, like `increment_refcount`: pin + word both
         // belong to the BASE block.
-        self.with_allocator_for_key(block_key, |alloc, offset| alloc.pin_block_validated(offset))
-            .unwrap_or(PinOutcome::Refused)
+        let Some((outcome, parts)) = self.with_allocator_for_key(block_key, |alloc, offset| {
+            let outcome = alloc.pin_block_validated(offset);
+            let parts = self
+                .split_block_key_ref(clean_block_key_ref(block_key))
+                .ok()
+                .map(|p| (p.be_id.to_string(), p.offset, p.incarnation));
+            (outcome, parts)
+        }) else {
+            return PinOutcome::Refused;
+        };
+        if matches!(outcome, PinOutcome::Refused) {
+            return outcome;
+        }
+        let Some((be_id, offset, incarnation)) = parts else {
+            return outcome;
+        };
+        if incarnation == INCARNATION_NONE {
+            return outcome;
+        }
+        let live = self.live_incarnation_for(&be_id, offset);
+        if live == INCARNATION_NONE || live == incarnation {
+            return outcome;
+        }
+        crate::fuse_client::METRICS
+            .block_pin_stale_keys
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::info!(
+            "pin of stale block key '{block_key}' refused: offset {offset} on '{be_id}' now \
+             lives as incarnation {live} (era {}) — the reference is handed back to the live \
+             owner (block_pin_stale_keys)",
+            incarnation_era(live)
+        );
+        let live_key = self.persist_block_key(&be_id, offset);
+        if let Err(e) = self.free_block_verdict(&live_key).await {
+            log::error!(
+                "pin undo of stale key '{block_key}' via live key '{live_key}' failed: {e} — \
+                 the live owner carries one phantom reference until remount"
+            );
+        }
+        PinOutcome::Refused
     }
 
     /// The allocator that owns a block key's offset (see incarnation seqlock in
@@ -21422,7 +21476,7 @@ impl DataRouter {
                 // later delete was TERMINAL: the block freed (and its
                 // incarnation retired) under the live clone until a remount
                 // re-derived the count.
-                let why = match self.backend_router.pin_block_validated(&bk) {
+                let why = match self.backend_router.pin_block_validated(&bk).await {
                     crate::block_allocator::PinOutcome::Pinned => break,
                     crate::block_allocator::PinOutcome::PinnedUnstable => {
                         // The reference WAS taken; a writer may be mid-DMA on
@@ -21527,7 +21581,7 @@ impl DataRouter {
                 let mut pinned: Vec<&String> = Vec::with_capacity(map.len());
                 let mut retry = None;
                 for bk in map.values() {
-                    match self.backend_router.pin_block_validated(bk) {
+                    match self.backend_router.pin_block_validated(bk).await {
                         crate::block_allocator::PinOutcome::Pinned => pinned.push(bk),
                         crate::block_allocator::PinOutcome::PinnedUnstable => {
                             // The unvalidated pin is undone with the rest.

@@ -322,8 +322,8 @@ mount is a read-token client whose metadata is exact at the next resolve
   §7 / §9).
 
 **Shipped-bug fixes on EVERY layout made along the symmetric program (PR 3
-→ PR 13h; each red-first, each pinned — `--single-writer` volumes and the
-pre-program flat path included):**
+→ PR 14 and the 1.3.0 release chain; each red-first, each pinned —
+`--single-writer` volumes and the pre-program flat path included):**
 
 - **The NVMe Reservation Report was read into a FIXED 4 KiB buffer**
   (`src/meta_backend/reservation.rs`), silently truncating at the 63rd
@@ -340,6 +340,19 @@ pre-program flat path included):**
   image. `ExtentAllocator::load` defers every replayed park and the mount
   drops a free whose extent a mounted root names once every tree is open
   (`meta_kv_replay_root_frees_dropped`, a WARN per drop).
+- **A mover's pin through a census-stale block key raised a reference on
+  the offset's NEW lifetime that nothing could release** (`BackendRouter::
+  pin_block_validated`; incarnation-stamped volumes — the default since
+  1.2): a block the owner freed and the allocator reissued between the
+  mover's census and its pin was pinned by OFFSET while the key-checked
+  unpin refused the stale key, so the new owner's terminal free read
+  nonterminal and the block stood claimed-and-unreferenced until a remount
+  rebuilt the allocator (one block per race — defrag, drain/evacuate,
+  `--pack`, fsck's scrub pin and `clone` all pin through this one door).
+  The pin now checks the key's lifetime after the increment and hands a
+  stale key's reference back under the live key; `block_pin_stale_keys`
+  counts the class. Found by the 1.3.0 release chain's own `task check`
+  (record §4.4bp).
 - **`rename` locked the two parents' keys only** and staged a ctime
   `Delta` on the moved inode (and a `Put` on an overwritten destination) it
   never locked, so a concurrent layout publish of the same inode co-queued

@@ -692,3 +692,288 @@ async fn the_write_enospc_refusals_gauge_counts_exactly_the_refused_writes() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 4. The never-lossy law's boundary is ACKED custody (record §7 item 24)
+// ---------------------------------------------------------------------------
+//
+// generic/751 on the 1.3.0 release chain: once the allocator refused for
+// space, every later write into a FRESH block was still ACKed into a
+// parked buffer, then degraded into the never-lossy staging fallback —
+// staging filled, the parked set grew past the memory-budget cap (a 74 GiB
+// daemon on a 24 GiB volume), the writeback ladder retried for ever, and
+// the unmount lost every block that never landed. The law now: a write
+// whose bytes would CREATE custody of a block nothing can land in — no
+// mapping, no parked buffer, no staged copy, while the set's allocators
+// have proven themselves out of supply — is refused `ENOSPC` BEFORE it is
+// acked; custody the daemon already acked keeps the ladder exactly as
+// before. Owner decision 2026-09-28 (option 1).
+
+fn fresh_refusals(stats: &serde_json::Value) -> u64 {
+    stats["metrics"]["write_fresh_block_enospc_refusals"]
+        .as_u64()
+        .expect("write_fresh_block_enospc_refusals rides the stats inode")
+}
+
+fn exhausted_volumes(stats: &serde_json::Value) -> u64 {
+    stats["metrics"]["alloc_fresh_supply_exhausted"]
+        .as_u64()
+        .expect("alloc_fresh_supply_exhausted rides the stats inode")
+}
+
+/// The ACK-early pipeline shape (the default the fstests venue runs): a
+/// full store, then eight whole-block writes into FRESH blocks of the
+/// striped filler. Every one is refused `ENOSPC` at the WRITE — none is
+/// acked — so no parked custody is created, the pipeline holds nothing,
+/// the refusals ride their own gauge, the set publishes its exhaustion,
+/// and `fsync` of the filler SUCCEEDS: nothing was acked that cannot
+/// land. RED on the pre-fix tree: every write acked, eight parked buffers,
+/// fsync `ENOSPC`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_block_writes_against_an_exhausted_set_are_refused_before_the_ack() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(None);
+    let h = make([0xF6; 16], "f24_fresh_refused", 4).await;
+    let ino = fill_store(&h, "filler.bin", 4).await;
+    let stats0 = bounded_stats(&h).await;
+    let g0 = fresh_refusals(&stats0);
+    let parked0 = squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes();
+    assert_eq!(
+        exhausted_volumes(&stats0),
+        1,
+        "the fill's own terminal refusal latched the volume exhausted"
+    );
+
+    for b in 4u64..12 {
+        let data = pattern(BS as usize, 0x40 + b as u8);
+        let r = bounded_write(&h.fs, h.req, ino, b * BS, data).await;
+        assert_eq!(
+            r,
+            Err(libc::ENOSPC),
+            "block {b}: a fresh block on an exhausted set is refused at the write, never acked"
+        );
+    }
+    let stats1 = bounded_stats(&h).await;
+    assert_eq!(
+        fresh_refusals(&stats1) - g0,
+        8,
+        "one count per refused write"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes(),
+        parked0,
+        "a refused write creates no parked custody"
+    );
+    await_pipeline_drained(&h).await;
+    assert_eq!(
+        stats1["metrics"]["write_pipeline_inflight_bytes"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        bounded_fsync(&h, ino).await,
+        Ok(()),
+        "nothing was acked that cannot land, so the durability boundary is clean"
+    );
+    assert_eq!(
+        bounded_getattr(&h, ino).await,
+        4 * BS,
+        "the size never led the data"
+    );
+}
+
+/// The synchronous shape (`SQUEEZEFS_WRITE_PIPELINE_DEPTH_BLOCKS=0`) — the
+/// write itself owns the allocation: the same law, the same gauge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_block_writes_are_refused_on_the_synchronous_shape_too() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(Some(0));
+    let h = make([0xF7; 16], "f24_fresh_refused_sync", 4).await;
+    let ino = fill_store(&h, "filler.bin", 4).await;
+    let g0 = fresh_refusals(&bounded_stats(&h).await);
+    for b in 4u64..8 {
+        let data = pattern(BS as usize, 0x50 + b as u8);
+        assert_eq!(
+            bounded_write(&h.fs, h.req, ino, b * BS, data).await,
+            Err(libc::ENOSPC),
+            "block {b}"
+        );
+    }
+    assert_eq!(fresh_refusals(&bounded_stats(&h).await) - g0, 4);
+    assert_eq!(bounded_fsync(&h, ino).await, Ok(()));
+}
+
+/// ACKED custody keeps the never-lossy ladder. Capacity 5, fill 4; the
+/// first half of block 4 is written (parked — custody, the block open),
+/// then a sibling file takes the last block durably and the set is
+/// exhausted. The SECOND half of block 4 is admitted (its block already
+/// has custody), the completed block cannot land (`fsync` → `ENOSPC`,
+/// honest), the bytes stay readable through the mount, and once the
+/// sibling's block returns the block lands, `fsync` succeeds and every
+/// byte reads back exact. Nothing acked is ever dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acked_custody_of_an_open_block_keeps_the_never_lossy_ladder() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(Some(0));
+    let h = make([0xF8; 16], "f24_acked_custody", 5).await;
+    let ino = create(&h, "grower.bin").await;
+    let base = pattern((4 * BS) as usize, 0x11);
+    bounded_write(&h.fs, h.req, ino, 0, base)
+        .await
+        .expect("4 blocks fit");
+    bounded_fsync(&h, ino).await.expect("durable");
+    let half = (BS / 2) as usize;
+    let first = pattern(half, 0x61);
+    let second = pattern(half, 0x62);
+    // The open block's first half: acked custody (parked, block 4 open).
+    assert_eq!(
+        bounded_write(&h.fs, h.req, ino, 4 * BS, first.clone()).await,
+        Ok(half as u32)
+    );
+    // The sibling takes the last block durably: the set is now exhausted.
+    let sib = create(&h, "sibling.bin").await;
+    let sib_data = pattern(BS as usize, 0x77);
+    bounded_write(&h.fs, h.req, sib, 0, sib_data.clone())
+        .await
+        .expect("the last block");
+    bounded_fsync(&h, sib)
+        .await
+        .expect("the sibling is durable");
+    let e = h
+        .alloc
+        .allocate_block()
+        .await
+        .expect_err("the store is full exactly");
+    assert!(is_storage_full(&e), "{e}");
+    let g0 = fresh_refusals(&bounded_stats(&h).await);
+
+    // The second half: the block HAS custody — admitted, never refused.
+    assert_eq!(
+        bounded_write(&h.fs, h.req, ino, 4 * BS + half as u64, second.clone()).await,
+        Ok(half as u32),
+        "a segment into a block this mount already holds custody of is acked"
+    );
+    assert_eq!(
+        fresh_refusals(&bounded_stats(&h).await),
+        g0,
+        "the fresh-block gauge never counts acked custody"
+    );
+    // Honest at the durability boundary, readable through the mount.
+    assert_eq!(bounded_fsync(&h, ino).await, Err(libc::ENOSPC));
+    let got = tokio::time::timeout(BOUND, h.fs.read(h.req, ino, 0, 4 * BS, BS as u32, 0))
+        .await
+        .expect("read answers")
+        .expect("read")
+        .data;
+    assert_eq!(&got[..half], &first[..], "the acked first half serves");
+    assert_eq!(&got[half..], &second[..], "the acked second half serves");
+
+    // Space returns: the sibling's block comes back; the open block lands.
+    tokio::time::timeout(BOUND, async {
+        h.fs.unlink(h.req, 1, OsStr::new("sibling.bin"))
+            .await
+            .expect("unlink");
+        let _ = h.fs.release(h.req, sib, sib, 0, 0, false).await;
+        h.fs.reclaim_orphaned_batch(vec![sib]).await;
+        h.fs.router.backend_router.reclaim_drain().await;
+    })
+    .await
+    .expect("the delete + reclaim drain terminate");
+    let t0 = Instant::now();
+    while h.alloc.free_block_indices().is_empty() {
+        assert!(
+            t0.elapsed() < BOUND,
+            "the freed block never reached the free list"
+        );
+        h.fs.router.backend_router.reclaim_drain().await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        bounded_fsync(&h, ino).await,
+        Ok(()),
+        "the acked block lands once space returns"
+    );
+    let got = tokio::time::timeout(BOUND, h.fs.read(h.req, ino, 0, 4 * BS, BS as u32, 0))
+        .await
+        .expect("read answers")
+        .expect("read")
+        .data;
+    assert_eq!(&got[..half], &first[..]);
+    assert_eq!(&got[half..], &second[..]);
+}
+
+/// The brim rewrite stays admitted: a whole-block rewrite of a MAPPED
+/// block at fill 1.0 is space-neutral (contract 9's in-place arm) and the
+/// exhaustion latch never touches it — the write lands, is durable, reads
+/// back exact, and the fresh-block gauge is unmoved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brim_rewrite_of_a_mapped_block_is_admitted_while_the_set_is_exhausted() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(Some(0));
+    let h = make([0xF9; 16], "f24_brim_rewrite", 4).await;
+    let ino = fill_store(&h, "filler.bin", 4).await;
+    assert_eq!(exhausted_volumes(&bounded_stats(&h).await), 1);
+    let g0 = fresh_refusals(&bounded_stats(&h).await);
+    let want = pattern(BS as usize, 0x99);
+    assert_eq!(
+        bounded_write(&h.fs, h.req, ino, 0, want.clone()).await,
+        Ok(BS as u32),
+        "a rewrite of block 0 needs no fresh block"
+    );
+    assert_eq!(bounded_fsync(&h, ino).await, Ok(()), "and lands in place");
+    let got = tokio::time::timeout(BOUND, h.fs.read(h.req, ino, 0, 0, BS as u32, 0))
+        .await
+        .expect("read answers")
+        .expect("read")
+        .data;
+    assert_eq!(&got[..], &want[..]);
+    assert_eq!(fresh_refusals(&bounded_stats(&h).await), g0);
+}
+
+/// The latch clears when supply returns: after the refusals, freeing the
+/// filler lets a fresh file's write land and the volume reads un-exhausted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_exhaustion_latch_clears_when_supply_returns() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(None);
+    let h = make([0xFA; 16], "f24_latch_clears", 4).await;
+    let full = fill_store(&h, "filler.bin", 4).await;
+    assert_eq!(
+        bounded_write(&h.fs, h.req, full, 4 * BS, pattern(BS as usize, 0x21)).await,
+        Err(libc::ENOSPC)
+    );
+    assert_eq!(exhausted_volumes(&bounded_stats(&h).await), 1);
+    tokio::time::timeout(BOUND, async {
+        h.fs.unlink(h.req, 1, OsStr::new("filler.bin"))
+            .await
+            .expect("unlink");
+        let _ = h.fs.release(h.req, full, full, 0, 0, false).await;
+        h.fs.reclaim_orphaned_batch(vec![full]).await;
+        h.fs.router.backend_router.reclaim_drain().await;
+    })
+    .await
+    .expect("the delete + reclaim drain terminate");
+    let t0 = Instant::now();
+    while h.alloc.free_block_indices().is_empty() {
+        assert!(t0.elapsed() < BOUND);
+        h.fs.router.backend_router.reclaim_drain().await;
+        tokio::task::yield_now().await;
+    }
+    let fresh = create(&h, "fresh.bin").await;
+    let data = pattern((2 * BS) as usize, 0x66);
+    assert_eq!(
+        bounded_write(&h.fs, h.req, fresh, 0, data.clone()).await,
+        Ok((2 * BS) as u32),
+        "supply returned: the write is admitted"
+    );
+    bounded_fsync(&h, fresh).await.expect("and durable");
+    assert_eq!(
+        exhausted_volumes(&bounded_stats(&h).await),
+        0,
+        "a landed allocation clears the latch"
+    );
+}

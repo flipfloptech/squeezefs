@@ -103,6 +103,11 @@ fn scratch(tag: &str) -> PathBuf {
 /// Format one meta + one data volume WITH a staging dir (the cache-path
 /// policy: paths are declared at format, never at mount).
 fn format_volume(base: &Path, staging: &Path) -> PathBuf {
+    format_volume_with_data(base, staging, 2 * 1024 * 1024 * 1024)
+}
+
+/// [`format_volume`] with the data volume's size chosen by the contract.
+fn format_volume_with_data(base: &Path, staging: &Path, data_len: u64) -> PathBuf {
     let meta = base.join("meta.bin");
     let data = base.join("data.bin");
     std::fs::File::create(&meta)
@@ -111,7 +116,7 @@ fn format_volume(base: &Path, staging: &Path) -> PathBuf {
         .expect("size meta file");
     std::fs::File::create(&data)
         .expect("create data file")
-        .set_len(2 * 1024 * 1024 * 1024)
+        .set_len(data_len)
         .expect("size data file");
     std::fs::create_dir_all(staging).expect("create staging dir");
     let out: Output = Command::new(bin())
@@ -614,5 +619,150 @@ fn a_promoted_staged_file_owns_its_block_in_the_durable_ledger() {
     );
 
     mount2.umount_timed();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ===========================================================================
+// Record §7 item 24 — a FULL data volume, live: the never-lossy law's
+// boundary is acked custody
+// ===========================================================================
+
+/// The generic/751 shape on the real kernel (writeback cache), scaled to a
+/// 64 MiB data volume: 4 MiB chunks written and fsynced one by one past
+/// the volume's capacity. The law: the exhaustion surfaces to the writer
+/// as `ENOSPC` within a bounded number of chunks past the fill (the
+/// pre-fix daemon ACKed every chunk for ever — fio's 320 GiB of attempts
+/// in the 1.3.0 chain), the refusals ride `write_fresh_block_enospc_
+/// refusals` with the volume published exhausted, the parked set never
+/// balloons (the 74 GiB daemon), the unmount lands its census well inside
+/// the default dismount wait (the retire wait is skipped for custody the
+/// exhausted set cannot land), and every chunk whose `fsync` RETURNED
+/// reads back byte-exact after a remount — nothing acked is lost.
+#[test]
+fn a_full_data_volume_refuses_new_bytes_before_the_ack_and_keeps_every_acked_byte() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    const CHUNK: usize = 4 * 1024 * 1024;
+    const CAPACITY_CHUNKS: usize = 16;
+    // The refusal must surface within this many chunks past the fill
+    // (the blocks in flight at the fill instant are the honest slack);
+    // the loop's cap is what the pre-fix daemon never reached.
+    const SLACK_CHUNKS: usize = 4;
+    const LOOP_CAP: usize = CAPACITY_CHUNKS * 4;
+
+    let base = scratch("fullvol");
+    let staging = base.join("staging");
+    let meta = format_volume_with_data(&base, &staging, (CAPACITY_CHUNKS * CHUNK) as u64);
+    let mnt = base.join("mnt");
+    let log = base.join("mount.log");
+    let mut mount = spawn_mount(&meta, &mnt, &log, &[]);
+
+    let path = mnt.join("fill.bin");
+    let mut f = std::fs::File::create(&path).expect("create fill.bin");
+    // fio's `ignore_error=ENOSPC` shape: the writer keeps going past the
+    // first refusal, and every later chunk must be refused too (the
+    // pre-fix daemon acked them all).
+    let mut synced_chunks = 0usize;
+    let mut first_error: Option<(usize, i32)> = None;
+    let mut acked_after_first_error = Vec::new();
+    for i in 0..LOOP_CAP {
+        let chunk = pattern(i, CHUNK);
+        let outcome = f.write_all(&chunk).and_then(|_| f.sync_all());
+        match (outcome, first_error) {
+            (Ok(()), None) => synced_chunks = i + 1,
+            (Ok(()), Some(_)) => acked_after_first_error.push(i),
+            (Err(e), None) => first_error = Some((i, e.raw_os_error().unwrap_or(0))),
+            (Err(e), Some(_)) => assert_eq!(
+                e.raw_os_error(),
+                Some(libc::ENOSPC),
+                "chunk {i}: every refusal is ENOSPC"
+            ),
+        }
+    }
+    drop(f);
+    let (at, errno) = first_error.expect(
+        "a full data volume must surface ENOSPC to the writer (the pre-fix daemon acked \
+         every chunk for ever)",
+    );
+    assert_eq!(errno, libc::ENOSPC, "the class is ENOSPC (chunk {at})");
+    assert!(
+        at < CAPACITY_CHUNKS + SLACK_CHUNKS,
+        "the exhaustion surfaced at chunk {at}: past the {CAPACITY_CHUNKS}-chunk volume plus \
+         the in-flight slack of {SLACK_CHUNKS} — bytes were acked that nothing could land"
+    );
+    assert!(
+        synced_chunks >= CAPACITY_CHUNKS - 1,
+        "the volume filled ({synced_chunks} chunks durable of {CAPACITY_CHUNKS})"
+    );
+    assert!(
+        acked_after_first_error.is_empty(),
+        "after the first refusal no later chunk may be acked as durable: {acked_after_first_error:?}"
+    );
+
+    // A second file past one block: refused, nothing acked. (A file of AT
+    // MOST one block is the STAGED layout's — it lands in this host's
+    // local staging ring, its durable home until promotion, whatever the
+    // data volume's fill; the ring's own fill is what refuses it.)
+    let mut g = std::fs::File::create(mnt.join("more.bin")).expect("create more.bin");
+    let more_res = g
+        .write_all(&pattern(99, CHUNK))
+        .and_then(|_| g.write_all(&pattern(100, CHUNK)))
+        .and_then(|_| g.sync_all());
+    assert_eq!(
+        more_res.map_err(|e| e.raw_os_error().unwrap_or(0)),
+        Err(libc::ENOSPC),
+        "a fresh file growing past one block on the exhausted volume is refused"
+    );
+    drop(g);
+
+    let stats = stats_json(&mnt);
+    let m = &stats["metrics"];
+    // One pre-ack refusal at least per chunk written past the first
+    // (the kernel splits a chunk into several FUSE WRITEs; the first
+    // refusal itself may be the never-lossy fsync of a block acked before
+    // the latch set).
+    let refused = m["write_fresh_block_enospc_refusals"].as_u64().unwrap_or(0);
+    assert!(
+        refused as usize >= LOOP_CAP - at - 1,
+        "the pre-ack refusals ride their gauge: {refused} for {} chunks past the first refusal",
+        LOOP_CAP - at - 1
+    );
+    assert_eq!(
+        m["alloc_fresh_supply_exhausted"].as_u64(),
+        Some(1),
+        "the one data volume publishes itself exhausted"
+    );
+    let parked = m["parked_full_buffer_bytes"].as_u64().unwrap_or(u64::MAX);
+    assert!(
+        parked <= (SLACK_CHUNKS * CHUNK) as u64,
+        "the parked set is bounded by the blocks in flight at the fill: {parked} bytes"
+    );
+
+    let elapsed = mount.umount_timed();
+    assert!(
+        elapsed < UNMOUNT_BOUND,
+        "the unmount of a full volume lands its census in {elapsed:?} — the retire wait is \
+         skipped for custody the exhausted set cannot land (bound {UNMOUNT_BOUND:?}); log: {}",
+        log.display()
+    );
+
+    // Every chunk whose fsync RETURNED is there after a remount.
+    let log2 = base.join("mount2.log");
+    let mut mount2 = spawn_mount(&meta, &mnt, &log2, &[]);
+    let got = std::fs::read(&path).expect("read fill.bin back");
+    assert!(
+        got.len() >= synced_chunks * CHUNK,
+        "the file holds every fsynced chunk ({} bytes for {synced_chunks} chunks)",
+        got.len()
+    );
+    for i in 0..synced_chunks {
+        assert_eq!(
+            &got[i * CHUNK..(i + 1) * CHUNK],
+            &pattern(i, CHUNK)[..],
+            "chunk {i} reads back exact after the remount"
+        );
+    }
+    let _ = mount2.umount_timed();
     let _ = std::fs::remove_dir_all(&base);
 }

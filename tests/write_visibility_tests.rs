@@ -2297,6 +2297,15 @@ async fn write_meeting_a_transiently_failing_settle_converges_never_eio() {
 /// never-lossy accumulation ladder under the same pressure. Declining
 /// IS the parked supply: the write must ACK through accumulation and
 /// the decline must be counted.
+///
+/// Record §7 item 24 re-scoped this contract to its own class: a write
+/// into a fresh block while the set is LATCHED exhausted is refused
+/// `ENOSPC` before the ack (`fresh_block_write_against_a_latched_store_
+/// is_refused_before_the_mint` below). The mint's decline is reached by
+/// the write the latch ADMITS — the first refusal of a not-yet-latched
+/// store, or the belt's one re-probe write per window — so this pin
+/// drains the store, waits the latch's re-probe window out, and drives
+/// that admitted write into the mint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
     use std::sync::atomic::Ordering as AtomOrd;
@@ -2321,6 +2330,23 @@ async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
         drained += 1;
         assert!(drained < 10_000, "free list never drained under the clamp");
     }
+    // The drain's final refusal LATCHED the store (item 24). The mint is
+    // reached by the write the latch admits: wait its re-probe window out
+    // (the longest legal allocation park — supply a park could have
+    // waited for surfaces within it), so the next fresh-block write is
+    // the belt's one admitted re-test.
+    assert!(
+        h.ba.fresh_supply_exhausted(),
+        "the drain's terminal refusal latched the store"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(
+        squeezefs::free_grace::pressure_park_wall_ms() + 50,
+    ))
+    .await;
+    assert!(
+        !h.ba.fresh_supply_exhausted(),
+        "past the re-probe window the latch admits one fresh-block write"
+    );
 
     // The write that walks the fresh-shape overlay screen (striped file,
     // aligned, single-block, overlay-class length, block 2 unmapped, no
@@ -2351,6 +2377,82 @@ async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
     );
 
     // Unclamp so teardown flushes cleanly.
+    h.ba.set_capacity_bytes(0);
+}
+
+/// Record §7 item 24 — the sibling of the decline pin above, the class it
+/// no longer covers: a fresh-shape write into a block nothing can land in
+/// while the store is LATCHED exhausted is refused `ENOSPC` BEFORE the
+/// mint — no overlay decline, no accumulation park, nothing acked (the
+/// `write_fresh_block_enospc_refusals` gauge counts it; the file's size
+/// stays where it was). Never `EIO`: the class is space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_block_write_against_a_latched_store_is_refused_before_the_mint() {
+    use std::sync::atomic::Ordering as AtomOrd;
+    let h = Arc::new(make().await);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    let ino = create(&h, "ovl_latched").await;
+    let pattern: Vec<u8> = (0..2 * BS as usize + OVL_SEG)
+        .map(|i| (i % 251) as u8 ^ 0x3C)
+        .collect();
+    write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
+    fsync(&h, ino).await;
+    h.ba.set_capacity_bytes(h.ba.chunk_size());
+    let mut drained = 0u32;
+    while h.ba.allocate_block().await.is_ok() {
+        drained += 1;
+        assert!(drained < 10_000, "free list never drained under the clamp");
+    }
+    assert!(
+        h.ba.fresh_supply_exhausted(),
+        "latched by the terminal refusal"
+    );
+
+    let declines0 = squeezefs::fuse_client::METRICS
+        .overlay_enospc_declines
+        .load(AtomOrd::Relaxed);
+    let refused0 = squeezefs::fuse_client::METRICS
+        .write_fresh_block_enospc_refusals
+        .load(AtomOrd::Relaxed);
+    let r =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            2 * BS,
+            bytes::Bytes::copy_from_slice(&pattern[2 * BS as usize..]),
+            0,
+            0,
+        )
+        .await;
+    assert_eq!(
+        r.map(|w| w.written).map_err(|e| i32::from(e).abs()),
+        Err(libc::ENOSPC),
+        "a fresh block on a latched store is refused before the ack, never EIO"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .write_fresh_block_enospc_refusals
+            .load(AtomOrd::Relaxed)
+            - refused0,
+        1
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .overlay_enospc_declines
+            .load(AtomOrd::Relaxed),
+        declines0,
+        "the mint was never reached"
+    );
+    let size =
+        h.fs.getattr(h.req, ino, None, 0)
+            .await
+            .expect("getattr")
+            .attr
+            .size;
+    assert_eq!(size, 2 * BS, "nothing acked: the size never moved");
+
     h.ba.set_capacity_bytes(0);
 }
 

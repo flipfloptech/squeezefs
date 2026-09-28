@@ -490,3 +490,139 @@ async fn the_dismount_teardown_closes_the_data_plane_to_the_workers_that_outlive
         "the refused unit's bytes stay staged"
     );
 }
+
+// ===========================================================================
+// Record §7 item 24 — the retire wait on custody the exhausted set cannot land
+// ===========================================================================
+
+/// The dismount's writeback-retire wait is SKIPPED when every unit the
+/// sweep could not land failed for SPACE: the allocators are exhausted,
+/// the writeback ladder cannot land those units either, and the wait
+/// would run its whole `dismount_wait` for nothing (the generic/751
+/// daemon spun all 10 s of it on 3 blocks). The units stay staged for the
+/// next mount at this mount point, the summary names the class, and the
+/// teardown completes well inside the wait. RED on the pre-fix tree: the
+/// teardown took the full `dismount_wait`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_dismount_retire_wait_skips_custody_the_exhausted_set_cannot_land() {
+    let (mut fs, req, _b, _m) = make().await;
+    fs.dismount_wait = 10;
+    let ba = fs.router.backend_router.default_allocator.clone();
+    // A one-block store, minted to capacity (capacity 0 is the UNBOUNDED
+    // allocator): every fresh mint from here refuses StorageFull at once,
+    // BEFORE the sweep's merge could classify the unit an orphan.
+    ba.set_capacity_bytes(ba.chunk_size());
+    let only = ba.allocate_block().await.expect("the one block");
+    ba.publish_block(only);
+    let e = ba.allocate_block().await.expect_err("full exactly");
+    assert!(
+        matches!(&e, squeezefs::error::SqueezefsError::Io(io)
+            if io.kind() == std::io::ErrorKind::StorageFull),
+        "the fixture is a full store: {e:?}"
+    );
+    for i in 0..3u32 {
+        assert!(fs.router.cache.nvme.put_active_block(
+            &format!("active_block:inode_99100{i}:block_0"),
+            &[0xD1; 4096],
+            1
+        ));
+    }
+    assert_eq!(fs.router.cache.nvme.active_block_custody_count(), 3);
+
+    let t0 = std::time::Instant::now();
+    fs.destroy(req).await;
+    let wall = t0.elapsed();
+    assert!(fs.dismount_started() && fs.dismount_complete());
+    assert!(
+        wall < std::time::Duration::from_secs(5),
+        "the retire wait is skipped for custody the exhausted set cannot land \
+         (teardown took {wall:?} against a 10-s dismount_wait)"
+    );
+    let staged: Vec<String> = fs
+        .router
+        .cache
+        .nvme
+        .list_staged_files()
+        .into_iter()
+        .filter(|k| k.starts_with("active_block:inode_99100"))
+        .collect();
+    assert_eq!(
+        staged.len(),
+        3,
+        "every unit the set could not land stays staged for the next mount: {staged:?}"
+    );
+}
+
+/// The dismount sweep FLUSHES a writer-SCOPED staged active block (record
+/// §4.4bz): every default-formatted mount since 1.2.0 mints its staging
+/// keys with the `:w_<node>.m<slot>` scope suffix, and the sweep's own key
+/// parser split on `:block_` and parsed the remainder as the block index —
+/// `"16:w_…"` is no `u32`, so the parser returned `Ok(())`, the unit was
+/// counted FLUSHED and never attempted, and every scoped mount's unmount
+/// left its acked active blocks in local staging (the census said so;
+/// the generic/751 daemon's "3 staged blocks" were this). RED on the
+/// pre-fix tree: the entry stays staged with `flushed == 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_dismount_sweep_flushes_a_writer_scoped_staged_block() {
+    struct Disengage;
+    impl Drop for Disengage {
+        fn drop(&mut self) {
+            squeezefs::writer_scope::engage(None);
+        }
+    }
+    let _d = Disengage;
+    squeezefs::writer_scope::engage(Some(squeezefs::writer_scope::WriterScope {
+        node: 0xae12_71e5_64b9_4323,
+        slot: 0x0389_7971,
+    }));
+    let (fs, req, _b, _m) = make().await;
+    // A real striped file whose block 0 is then RE-STAGED under the
+    // scoped key, exactly as the write-through fallback stages it.
+    let ino = fs
+        .create(
+            req,
+            1,
+            std::ffi::OsStr::new("scoped.bin"),
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .expect("create")
+        .attr
+        .ino;
+    let block = fs
+        .router
+        .block_size
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let want = vec![0xE7u8; block];
+    let written = fs
+        .write(req, ino, 0, 0, bytes::Bytes::from(want.clone()), 0, 0)
+        .await
+        .expect("write one block")
+        .written;
+    assert_eq!(written as usize, block);
+    fs.fsync(req, ino, 0, false).await.expect("durable");
+    let key: String = squeezefs::keys::active_block(ino, 0).to_string();
+    assert!(
+        key.contains(":w_"),
+        "the mint carries the scope suffix: {key}"
+    );
+    let newer = vec![0xE8u8; block];
+    let token = fs.router.dlm.get_fencing_token_ino(ino);
+    assert!(fs.router.cache.nvme.put_active_block(&key, &newer, token));
+
+    let summary = fs.flush_all_staged_blocks_to_backend().await;
+    assert_eq!(summary.attempted, 1, "{summary:?}");
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    assert_eq!(summary.flushed, 1, "{summary:?}");
+    assert!(
+        !fs.router.cache.nvme.has_staged_active_block(&key),
+        "the scoped entry was FLUSHED, not counted and skipped"
+    );
+    let got = fs
+        .read(req, ino, 0, 0, block as u32, 0)
+        .await
+        .expect("read")
+        .data;
+    assert_eq!(&got[..], &newer[..], "the re-staged bytes landed durably");
+}

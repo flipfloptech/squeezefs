@@ -3425,6 +3425,47 @@ impl BackendRouter {
         Ok((be_id, allocator, device, offset))
     }
 
+    /// Record §7 item 24 — the set's fresh-supply verdict for the WRITE
+    /// path's pre-ack refusal: `true` ⇔ every placement candidate
+    /// ([`Self::get_active_backend`]'s population — the healthy,
+    /// placement-eligible data volumes) reads
+    /// [`crate::block_allocator::BlockAllocator::fresh_supply_exhausted`]. An empty candidate set
+    /// answers `false` (no verdict — the allocation path refuses with its
+    /// own "no healthy backends"). One relaxed load per volume on a set
+    /// that never refused.
+    pub fn fresh_supply_exhausted(&self) -> bool {
+        self.fresh_supply_exhausted_volumes()
+            .is_some_and(|(exhausted, candidates)| exhausted == candidates)
+    }
+
+    /// `(exhausted, candidates)` over the placement population, or `None`
+    /// when it is empty — the `alloc_fresh_supply_exhausted` gauge's
+    /// numerator.
+    pub fn fresh_supply_exhausted_volumes(&self) -> Option<(usize, usize)> {
+        let mut candidates = 0usize;
+        let mut exhausted = 0usize;
+        if self.backends.is_empty() {
+            if self.is_backend_healthy("backend_0") {
+                candidates = 1;
+                if self.default_allocator.fresh_supply_exhausted() {
+                    exhausted = 1;
+                }
+            }
+        } else {
+            for entry in self.backends.iter() {
+                let be_id = entry.key();
+                if !self.placement_eligible(be_id) || !self.is_backend_healthy(be_id) {
+                    continue;
+                }
+                candidates += 1;
+                if entry.value().block_allocator.fresh_supply_exhausted() {
+                    exhausted += 1;
+                }
+            }
+        }
+        (candidates > 0).then_some((exhausted, candidates))
+    }
+
     /// The VL4 mover's destination pick (design-volume-lifecycle
     /// §5.4/§5.7): the LOWEST-fill placement-eligible backend, excluding
     /// `exclude` (the move source). Choosing the emptiest survivor both

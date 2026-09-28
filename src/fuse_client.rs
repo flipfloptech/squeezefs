@@ -6248,6 +6248,15 @@ pub struct Metrics {
     /// alternative was a write that never replied at all
     /// (`.benchmarks/2026-09-06-cowriter-enospc-wedge.md`).
     pub write_enospc_refusals: Align64<AtomicU64>,
+    /// Record §7 item 24 — the SUBSET of `write_enospc_refusals` refused
+    /// BEFORE the ack because the write would have created custody of a
+    /// block no data volume can allocate (no mapping, no parked buffer,
+    /// no staged copy; every placement candidate's allocator latched
+    /// exhausted — `alloc_fresh_supply_exhausted`). Nothing acked, nothing
+    /// parked: the never-lossy ladder covers acked custody alone. Growth
+    /// on a full set is the law working; growth with
+    /// `alloc_fresh_supply_exhausted` at 0 is a bug.
+    pub write_fresh_block_enospc_refusals: Align64<AtomicU64>,
     /// Writeback units resolved as SUPERSEDED no-ops (staged stamp no
     /// longer matches the unit's token: a newer write re-staged the block
     /// and owns its custody chain). The healthy churn outcome — the
@@ -8850,6 +8859,11 @@ pub struct TeardownFlushSummary {
     pub skipped: usize,
     /// First few failure reasons (bounded) for the aggregated log line.
     pub error_samples: Vec<String>,
+    /// The failures whose class was `StorageFull` (record §7 item 24):
+    /// units the exhausted set cannot land, which the writeback ladder
+    /// cannot land either — the dismount's retire wait is skipped when
+    /// every failure is one.
+    pub storage_full: usize,
 }
 
 /// Outcome of the IPC read fast-path's guarded probe
@@ -11120,6 +11134,15 @@ impl SqueezefsFilesystem {
             "backend_fill_spread": placement_table.fill_spread,
             "backends": placement_backends,
         });
+        // Record §7 item 24: the data volumes whose fresh supply is latched
+        // exhausted right now (over the placement population); at the
+        // candidate count, every fresh-block write is refused before its
+        // ack (`write_fresh_block_enospc_refusals`).
+        let alloc_fresh_supply_exhausted = self
+            .router
+            .backend_router
+            .fresh_supply_exhausted_volumes()
+            .map_or(0, |(exhausted, _)| exhausted as u64);
 
         // Hybrid lane gate (D14 corollary): the shim-side lane-split
         // ledger — reaped fold + live client stats pages, summed by the
@@ -11504,6 +11527,8 @@ impl SqueezefsFilesystem {
                 "writeback_errors_latched": METRICS.writeback_errors_latched.load(Ordering::Relaxed),
                 "writeback_errors_reported": METRICS.writeback_errors_reported.load(Ordering::Relaxed),
                 "write_enospc_refusals": METRICS.write_enospc_refusals.load(Ordering::Relaxed),
+                "write_fresh_block_enospc_refusals": METRICS.write_fresh_block_enospc_refusals.load(Ordering::Relaxed),
+                "alloc_fresh_supply_exhausted": alloc_fresh_supply_exhausted,
                 "fuse_reserved_xattr_refusals": METRICS.fuse_reserved_xattr_refusals.load(Ordering::Relaxed),
                 "pr_registrant_shared": METRICS.pr_registrant_shared.load(Ordering::Relaxed),
                 "job_submitted": METRICS.job_submitted.load(Ordering::Relaxed),
@@ -17256,6 +17281,53 @@ impl SqueezefsFilesystem {
             && (write_start > block_start || write_end < existing_block_end)
     }
 
+    /// Record §7 item 24 — would a striped write touching
+    /// `start_block..=end_block` CREATE custody of a block this mount holds
+    /// nothing of? A block is held when it is mapped, when the file's
+    /// size (the RAM floor, which every acked open block's postlude
+    /// raised) reaches into it, when a parked buffer exists, or when a
+    /// staged copy exists. RAM-only, no guard: run only under the set's
+    /// exhaustion verdict. A metadata-cache miss answers "held" — the
+    /// refusal must never fire on a block whose mapping it could not see
+    /// (one acked-and-parked block on a cold cache is the ladder's, never
+    /// a spurious `ENOSPC`).
+    fn write_would_create_fresh_custody(
+        &self,
+        ino: u64,
+        start_block: u64,
+        end_block: u64,
+        existing_size: u64,
+        block_size: u64,
+    ) -> bool {
+        let Some((mapped, live_size)) = self.router.metadata_cache.peek_with(&ino, |m| {
+            let mapped: Vec<bool> = (start_block..=end_block)
+                .map(|b| match m.block_map.as_ref() {
+                    Some(bm) => bm.contains_key(&(b as u32)),
+                    // An indirect map (spilled past the inline bound)
+                    // conservatively holds every block.
+                    None => m.file_type == "striped",
+                })
+                .collect();
+            (mapped, m.size)
+        }) else {
+            return false;
+        };
+        let size = existing_size.max(live_size);
+        for (i, b) in (start_block..=end_block).enumerate() {
+            if mapped[i] || size > b * block_size {
+                continue;
+            }
+            let key = crate::keys::active_block_stack(ino, b);
+            if self.active_block_buffers.contains_key(key.as_str())
+                || self.router.cache.nvme.has_staged_active_block(key.as_str())
+            {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
     /// Item B: fetch a deferred RMW seed's OLD block image. The
     /// binding-validated fetch is verbatim the old eager-seed discipline
     /// (the 8e3995e follow-up): `bk` can be displaced, freed, and
@@ -20608,6 +20680,46 @@ impl SqueezefsFilesystem {
         let payload_len = payload.len() as u64;
         let start_block = offset / block_size;
         let end_block = (offset + payload_len - 1) / block_size;
+
+        // Record §7 item 24 — the never-lossy law's boundary is ACKED
+        // custody. A write whose bytes would CREATE custody of a block no
+        // data volume can allocate is refused `ENOSPC` HERE, before any
+        // byte is recorded, so nothing is acked that nothing can land
+        // (generic/751 on the 1.3.0 chain: every post-fill write acked
+        // into a parked buffer, staging filled, the parked set grew past
+        // the memory cap to a 74 GiB daemon, and the unmount lost it
+        // all). The verdict is the allocators' own (their terminal
+        // `StorageFull` latches, their next landed allocation clears —
+        // `BackendRouter::fresh_supply_exhausted`, one relaxed load per
+        // volume on a set that never refused); the custody probe runs only
+        // under it and is RAM-only. A block with a mapping, a parked
+        // buffer or a staged copy is custody this mount already holds:
+        // its segments stay admitted (the brim rewrite of a mapped block
+        // is space-neutral; an open block's last segment completes it
+        // and rides the ladder, bounded by the blocks open at the fill).
+        // Decided for the WHOLE write ahead of every block future, so a
+        // refusal never leaves a span half-recorded behind an error reply.
+        if self.router.backend_router.fresh_supply_exhausted()
+            && self.write_would_create_fresh_custody(
+                ino,
+                start_block,
+                end_block,
+                existing_size,
+                block_size,
+            )
+        {
+            METRICS
+                .write_fresh_block_enospc_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(SqueezefsError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "write of ino {ino} at {offset} (+{payload_len}) needs a fresh block and \
+                     every data volume's fresh supply is exhausted — refused before the ack \
+                     (write_fresh_block_enospc_refusals; acked custody is unaffected)"
+                ),
+            )));
+        }
 
         // W1 sole-owner extent patch — the request-shape half of the §5.1
         // predicate (design-random-small-writes), evaluated once per
@@ -24429,21 +24541,20 @@ impl SqueezefsFilesystem {
                 async move {
                     let _permit = sem_clone.acquire().await.ok();
 
-                    let parts: Vec<&str> = key.split(":block_").collect();
-                    if parts.len() != 2 {
-                        return Ok(());
-                    }
-                    let ino_parts: Vec<&str> = parts[0].split("inode_").collect();
-                    if ino_parts.len() != 2 {
-                        return Ok(());
-                    }
-                    let ino = match ino_parts[1].parse::<u64>() {
-                        Ok(i) => i,
-                        Err(_) => return Ok(()),
-                    };
-                    let b = match parts[1].parse::<u32>() {
-                        Ok(idx) => idx,
-                        Err(_) => return Ok(()),
+                    // The ONE key parser (record §4.4bz): it strips the
+                    // writer-scope suffix every default-formatted mount
+                    // since 1.2.0 mints (`:w_<node>.m<slot>`). The sweep's
+                    // former ad-hoc split parsed `"16:w_…"` as the block
+                    // index, failed, and returned `Ok(())` — every scoped
+                    // mount's unmount counted its staged active blocks
+                    // FLUSHED without attempting one. A key this parser
+                    // refuses is a FAILURE the summary names, never a
+                    // silent success.
+                    let Some((ino, b)) = Self::parse_active_block_key(&key) else {
+                        return Err(SqueezefsError::InvalidOperation(format!(
+                            "dismount sweep: staged key {key:?} is not an active-block key \
+                             this binary can parse — left staged"
+                        )));
                     };
 
                     let meta = router_clone
@@ -24487,6 +24598,9 @@ impl SqueezefsFilesystem {
                 }
                 Ok(Err(e)) => {
                     summary.failed += 1;
+                    if crate::block_allocator::is_storage_full(&e) {
+                        summary.storage_full += 1;
+                    }
                     if summary.error_samples.len() < ERROR_SAMPLES {
                         summary.error_samples.push(format!("{e:?}"));
                     }
@@ -25627,13 +25741,30 @@ impl SqueezefsFilesystem {
         // → the backend. The summary is the teardown's only record of a
         // failed flush (each failed entry stays staged and is recovered at
         // the next mount) — never discarded on this path.
+        // Record §7 item 24: when every unit the sweep could not land
+        // failed for SPACE, the writeback ladder cannot land them either
+        // — the retire wait below would run its whole `dismount_wait` for
+        // nothing (generic/751's daemon spun all 10 s on 3 blocks), so it
+        // is skipped and the units stay staged for the next mount.
+        let mut retire_wait_pointless = false;
         match self.force_flush_all_staged_data().await {
-            Ok(summary) if summary.failed > 0 => error!(
-                "dismount: {} of {} staged active blocks failed to flush to the backend \
-                 (first errors: {:?}) — they stay in local staging and are recovered by \
-                 the next mount at this mount point",
-                summary.failed, summary.attempted, summary.error_samples
-            ),
+            Ok(summary) if summary.failed > 0 => {
+                retire_wait_pointless = summary.storage_full == summary.failed;
+                error!(
+                    "dismount: {} of {} staged active blocks failed to flush to the backend \
+                     ({} for space; first errors: {:?}) — they stay in local staging and are \
+                     recovered by the next mount at this mount point{}",
+                    summary.failed,
+                    summary.attempted,
+                    summary.storage_full,
+                    summary.error_samples,
+                    if retire_wait_pointless {
+                        "; every failure is StorageFull, so the writeback-retire wait is skipped"
+                    } else {
+                        ""
+                    }
+                );
+            }
             Ok(_) => {}
             Err(e) => error!("dismount: memory-buffer flush to staging failed: {e:?}"),
         }
@@ -25648,7 +25779,11 @@ impl SqueezefsFilesystem {
         // (.benchmarks/2026-09-09-dismount-staged-residue.md §1.3); the
         // staged-layout population has its own WORK pass below, not a wait.
         let start_wait = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_secs(self.dismount_wait);
+        let max_wait = if retire_wait_pointless {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(self.dismount_wait)
+        };
         loop {
             let n = self.router.cache.nvme.active_block_custody_count();
             if n == 0 || start_wait.elapsed() >= max_wait {
@@ -32770,7 +32905,10 @@ async fn flush_one_active_block(
             Some(t) => t,
             // Gone (flushed / truncated / newer write took RAM authority):
             // nothing to flush.
-            None => return Ok(()),
+            None => {
+                debug!("flush_one_active_block: ino {ino} block {b} has no staged entry — nothing to flush");
+                return Ok(());
+            }
         };
         if let Some(owner) = owner_token {
             if staged_token != owner {
@@ -32810,6 +32948,9 @@ async fn flush_one_active_block(
                 // Purged between probe and capture (truncate/punch/newer
                 // write): nothing to flush. Never-published: co-writer-
                 // aware abandon (d575be03 sweep).
+                debug!(
+                    "flush_one_active_block: ino {ino} block {b} purged between probe and capture"
+                );
                 minted.disarm();
                 let _ = block_allocator.abandon_unpublished_offset(offset).await;
                 return Ok(());

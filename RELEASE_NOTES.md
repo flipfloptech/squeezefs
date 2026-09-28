@@ -801,23 +801,56 @@ INIT reply (`init_negotiation_tests::the_kernel_uring_enable_precedes_the_init_r
 is the rail); a host whose parameter cannot be written is announced loud
 before the reply, naming the remedy.
 
+**A FULL data volume refuses new bytes before it acks them — the
+never-lossy law's boundary is ACKED custody (every layout; record §7 item
+24 / §4.4bz, owner decision 2026-09-28 — found by the 1.3.0 release chain
+on fstests generic/751, invisible to that test's `ignore_error=ENOSPC`).**
+Since 1.2.0, once the allocator refused a fresh block for space, every
+later write into a block nothing could land in was still ACKed into a
+parked buffer and degraded into the never-lossy staging fallback: staging
+filled, the parked set grew past the memory-budget cap (a 74 GiB daemon on
+a 24 GiB volume), the writeback ladder retried for ever, the unmount spun
+its whole `dismount_wait` and then lost every block that never landed
+(17,307 blocks ≈ 68 GiB in the chain's run) — and while it dismounted, a
+neighbouring mount on the same host failed to start for kernel memory
+(chain attempt 8). Now the allocator's terminal `StorageFull` LATCHES the
+volume exhausted (`alloc_fresh_supply_exhausted`; cleared by its next
+landed allocation, confirmed against the live supply so a free admits at
+once, re-probed once per allocation-park window), and while every data
+volume is latched a write that would CREATE custody of a block — no
+mapping, no parked buffer, no staged copy — is refused `ENOSPC` at the
+FUSE write, before any byte is recorded (`write_fresh_block_enospc_refusals`;
+under the kernel's writeback cache the application meets it at `fsync`/`close`,
+an `O_DIRECT`/`O_SYNC` writer at `write(2)`). Custody the daemon already
+holds rides the ladder exactly as before: a whole-block rewrite of a
+mapped block lands in place at fill 1.0, an open block's last segment
+completes it (bounded by the blocks open at the fill), a file of at most
+one block on a volume with a staging directory lands in the local ring.
+The dismount's writeback-retire wait is skipped when every unit its sweep
+could not land failed for space (they stay staged for the next mount).
+Pinned in process on both pipeline shapes and LIVE on the real kernel
+(`tests/dismount_staged_residue_tests.rs`: a 64 MiB volume written past
+full with fsync per chunk — `ENOSPC` within the in-flight slack, no later
+chunk acked, the parked set bounded, the unmount inside its wait, every
+fsynced chunk byte-exact after a remount).
+
+**The unmount's force-flush of staged active blocks never ran on a
+writer-scoped mount — every default-formatted mount since 1.2.0 (record
+§4.4bz; found by the live pin above).** The sweep parsed the staging key
+with its own splitter, which read the writer-scope suffix
+(`…:block_N:w_<node>.m<slot>`) as part of the block index, failed, and
+returned success: every scoped mount's clean unmount counted its staged
+active blocks FLUSHED without attempting one and left them in local
+staging (the census's "N active write block(s) remain in local staging"),
+recovered by the next mount at this mount point — other clients read the
+pre-write bytes until then. The sweep now runs the one scope-stripping key
+parser, and a key it cannot parse is a counted failure, never a silent
+success (`tests/dismount_teardown_tests.rs`). Nothing was lost by the
+defect; the clean unmount was not the durability boundary the census
+claimed for those blocks.
+
 **Known limitations — what this release does not claim.**
 
-- **A genuinely FULL data volume acks writes it can never land** (record
-  `.benchmarks/2026-09-19-sym-acceptance.md` §4.4bx, §7 item 24 — shipped
-  since 1.2.0; found by the 1.3.0 release chain on fstests generic/751 and
-  invisible to that test's `ignore_error=ENOSPC`). Once the allocator
-  refuses for space, the write path's never-lossy fallback stages the bytes
-  instead of returning `ENOSPC`; staging fills, the parked buffers stay in
-  RAM past the memory-budget cap, the writeback ladder retries for ever,
-  and the unmount tries — then loses at process exit — every block that
-  never landed (17,307 blocks ≈ 68 GiB in the chain's run, the daemon at
-  74 GiB RSS). Until the volume is full the never-lossy law holds exactly
-  as documented; on a full volume, acked bytes written after the fill are
-  lost at unmount and the daemon's memory grows to its budget. The remedy
-  direction (`ENOSPC` at `write(2)` for a block that cannot be allocated,
-  the never-lossy ladder for acked custody alone) is an owner decision on
-  the never-lossy law's boundary; keep data volumes below full.
 - **The 1.2.4 limitations** stand where this release did not name a
   change to them.
 

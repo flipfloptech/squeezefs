@@ -406,6 +406,14 @@ mount is a read-token client whose metadata is exact at the next resolve
   away. The sweep (and the flush pass's opportunistic sibling merge) now
   yield while a user commit is retrying for space — `meta_kv_merge_yields`
   counts them — and resume at the next cycle (record §4.4bv).
+- **A desktop launcher's zero realtime-CPU budget could kill the daemon
+  silently**: some launchers hand every process they spawn `RLIMIT_RTTIME`
+  0/0, and the kernel's RCU boost puts an ordinary thread into the realtime
+  class for one tick — at a zero budget the kernel SIGKILLs the whole
+  process with no log line. The daemon now lifts the budget at startup
+  (the hard limit where it may), `mount` refuses a zero it cannot lift,
+  and the test-suite runners lift it too (record §4.4bw; found by the
+  1.3.0 release chain on fstests generic/631).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a

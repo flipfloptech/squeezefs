@@ -414,6 +414,17 @@ mount is a read-token client whose metadata is exact at the next resolve
   (the hard limit where it may), `mount` refuses a zero it cannot lift,
   and the test-suite runners lift it too (record §4.4bw; found by the
   1.3.0 release chain on fstests generic/631).
+- **Remounting a mount point right after an unmount could be refused as a
+  collision** ("staging root … is HELD by a live process"): `umount(8)`
+  returns before the previous daemon finishes its dismount, the daemon held
+  its staging root's liveness lock until process exit, and the new mount
+  waited only 2 s — a dismount longer than that (a full volume's 10-s
+  writeback-retire wait, a large parked backlog) refused the successor.
+  The lock is now released when the dismount teardown completes, and a
+  successor at the same mount point waits for a dismounting predecessor up
+  to its exit guard (`dismount_wait` + 60 s) while a live collision (a FUSE
+  mount still at the path) is still refused at once (record §4.4bx; found
+  by the 1.3.0 release chain on fstests generic/751→752).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a

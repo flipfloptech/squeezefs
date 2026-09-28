@@ -310,25 +310,42 @@ fn is_mounted(mnt: &Path) -> bool {
         .any(|l| l.contains(&needle))
 }
 
-/// The external unmount's retry bound (record §4.4by): a desktop volume
+/// The external unmount's retry law (record §4.4by): a desktop volume
 /// monitor (`gvfs-udisks2-volume-monitor`, with `gvfsd-trash` probing
-/// `.Trash-<uid>`) enumerates every new mount under `$HOME` for about its
-/// first second, so a non-lazy `umount2` inside that window is EBUSY with
-/// no user-visible holder — measured ≈ 15 ms after the readiness read and
-/// gone after 1 s of mount age. The bound is the sibling live-mount suites'
-/// 5 s (`cache_path_policy_tests`, `encrypt_key_handling_tests`), at a
-/// grain below the window; the daemon's own self-unmount carries the same
-/// law (`fuse3::raw::session`, "desktop volume monitors inspect every new
-/// mount").
+/// `.Trash-<uid>`) enumerates every new mount under `$HOME`, and a
+/// directory fd held across its `getdents64` loop is a mount reference, so
+/// a non-lazy `umount2` inside that window is EBUSY with no user-visible
+/// holder. The tick is the daemon's own self-unmount grain
+/// (`fuse3::raw::session`, 10 × 100 ms — "desktop volume monitors inspect
+/// every new mount"); the bound is the sibling live-mount suites' 5 s
+/// (`cache_path_policy_tests` and the other 10 × 500 ms suites), five times
+/// the product's non-lazy bound and above the > 1 s the same bystander held
+/// on this desktop under gate load (commit `090b57d9` — the reading that
+/// made the daemon finish with a lazy detach). A lazy detach is NOT an
+/// option here: every law below is clocked from the kernel unmount, which
+/// `MNT_DETACH` would defer to the bystander's close.
 const UNMOUNT_RETRY_TICK: Duration = Duration::from_millis(100);
 const UNMOUNT_RETRY_ATTEMPTS: u32 = 50;
 
-/// `fusermount3 -u`, retried on a transient EBUSY within the bound above
-/// (the release chain's attempt 7 went RED on the one-shot form). Returns
-/// the instant the kernel unmount completed — every handover law below is
-/// clocked from it, so the retries never enter a measured window. The last
-/// attempt's stderr is the evidence when the bound is exhausted.
+/// The one class the retry absorbs: `fusermount3`'s `umount2` refused
+/// EBUSY. Any other failure (a mount already gone, a permission refusal)
+/// fails the test at once with that stderr — a daemon that died before the
+/// unmount is not retried for 5 s.
+const UNMOUNT_BUSY_CLASS: &str = "Device or resource busy";
+
+/// `fusermount3 -u`, retried on the transient busy class within the bound
+/// above (the release chain's attempt 7 went RED on the one-shot form).
+/// Returns the instant the kernel unmount completed — every handover law
+/// below is clocked from it, so the retries never enter a measured window
+/// (the predecessor's teardown, and every hold the seams put inside it,
+/// starts at the kernel unmount, which is the attempt that succeeded). A
+/// retry that was needed is announced on the UNCAPTURED stderr handle (the
+/// testkit's channel — `eprintln!` is swallowed on a passing test); at the
+/// bound the panic carries the last stderr and every holder under the mount
+/// this user can read in `/proc`, so a non-transient refusal is attributed
+/// from the gate transcript.
 fn unmount_external(mnt: &Path) -> Instant {
+    use std::io::Write;
     let started = Instant::now();
     let mut last_err = String::new();
     for attempt in 0..UNMOUNT_RETRY_ATTEMPTS {
@@ -342,23 +359,84 @@ fn unmount_external(mnt: &Path) -> Instant {
             .expect("run fusermount3 -u");
         if out.status.success() {
             if attempt > 0 {
-                eprintln!(
+                let mut err = std::io::stderr();
+                let _ = writeln!(
+                    err,
                     "note: fusermount3 -u {} landed at attempt {} (+{:?}) after a transient \
                      EBUSY — a bystander's fd on the fresh mount (record §4.4by)",
                     mnt.display(),
                     attempt + 1,
                     started.elapsed()
                 );
+                let _ = err.flush();
             }
             return Instant::now();
         }
         last_err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            last_err.contains(UNMOUNT_BUSY_CLASS),
+            "fusermount3 -u {} failed outside the transient busy class at attempt {}: {last_err}",
+            mnt.display(),
+            attempt + 1
+        );
     }
     panic!(
-        "fusermount3 -u {} stayed busy for {:?} ({UNMOUNT_RETRY_ATTEMPTS} attempts): {last_err}",
+        "fusermount3 -u {} stayed busy for {:?} ({UNMOUNT_RETRY_ATTEMPTS} attempts): {last_err}\n\
+         holders under the mount (readable /proc entries):\n{}",
         mnt.display(),
-        started.elapsed()
+        started.elapsed(),
+        mount_holders(mnt)
     );
+}
+
+/// Every fd / cwd / root this user can read in `/proc` that resolves under
+/// `mnt` — the attribution dump for a refusal the retry bound did not clear.
+fn mount_holders(mnt: &Path) -> String {
+    let mut lines = Vec::new();
+    for proc_entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let pid_dir = proc_entry.path();
+        let Some(pid) = pid_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let comm = std::fs::read_to_string(pid_dir.join("comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        for name in ["cwd", "root"] {
+            if let Ok(target) = std::fs::read_link(pid_dir.join(name)) {
+                if target.starts_with(mnt) {
+                    lines.push(format!(
+                        "  pid {pid} ({comm}) {name} -> {}",
+                        target.display()
+                    ));
+                }
+            }
+        }
+        for fd in std::fs::read_dir(pid_dir.join("fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Ok(target) = std::fs::read_link(fd.path()) {
+                if target.starts_with(mnt) {
+                    lines.push(format!(
+                        "  pid {pid} ({comm}) fd {} -> {}",
+                        fd.file_name().to_string_lossy(),
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        "  (none visible — the holder is another user's process or a kernel-side reference)"
+            .to_owned()
+    } else {
+        lines.join("\n")
+    }
 }
 
 /// The one staging root a scoped mount owns under `staging/squeezefs/`
@@ -564,9 +642,10 @@ fn a_daemon_successor_waits_out_a_dismounting_predecessor_past_the_parents_deadl
         "the predecessor exits once its held teardown completes"
     );
 
-    // The successor is a detached daemon: unmount it (the same bounded
-    // retry — the read-back above is a fresh touch) and wait for the
-    // mount to go.
+    // The successor is a detached daemon and a FRESH mount here: it landed
+    // when the predecessor's held teardown completed moments ago, so this
+    // unmount sits inside the same bystander window (the retry law, not a
+    // one-shot). Then wait for the mount to go.
     unmount_external(&mnt);
     let deadline = Instant::now() + Duration::from_secs(30);
     while is_mounted(&mnt) && Instant::now() < deadline {

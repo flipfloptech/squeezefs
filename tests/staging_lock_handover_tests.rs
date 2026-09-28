@@ -21,7 +21,10 @@
 //! with the predecessor's EXIT held past its teardown by the
 //! `SQUEEZEFS_TEST_EXIT_HOLD_MS` seam (the field's 74 GiB address space
 //! does it without a seam). RED on the pre-fix tree: the successor refuses
-//! at 2 s while the predecessor still holds the lock.
+//! at 2 s while the predecessor still holds the lock. The external unmount
+//! itself is the bounded retry `unmount_external` (record §4.4by): the
+//! desktop's volume monitor holds a transient fd on every fresh mount under
+//! `$HOME`, and the one-shot form was the release chain's attempt-7 red.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -307,6 +310,57 @@ fn is_mounted(mnt: &Path) -> bool {
         .any(|l| l.contains(&needle))
 }
 
+/// The external unmount's retry bound (record §4.4by): a desktop volume
+/// monitor (`gvfs-udisks2-volume-monitor`, with `gvfsd-trash` probing
+/// `.Trash-<uid>`) enumerates every new mount under `$HOME` for about its
+/// first second, so a non-lazy `umount2` inside that window is EBUSY with
+/// no user-visible holder — measured ≈ 15 ms after the readiness read and
+/// gone after 1 s of mount age. The bound is the sibling live-mount suites'
+/// 5 s (`cache_path_policy_tests`, `encrypt_key_handling_tests`), at a
+/// grain below the window; the daemon's own self-unmount carries the same
+/// law (`fuse3::raw::session`, "desktop volume monitors inspect every new
+/// mount").
+const UNMOUNT_RETRY_TICK: Duration = Duration::from_millis(100);
+const UNMOUNT_RETRY_ATTEMPTS: u32 = 50;
+
+/// `fusermount3 -u`, retried on a transient EBUSY within the bound above
+/// (the release chain's attempt 7 went RED on the one-shot form). Returns
+/// the instant the kernel unmount completed — every handover law below is
+/// clocked from it, so the retries never enter a measured window. The last
+/// attempt's stderr is the evidence when the bound is exhausted.
+fn unmount_external(mnt: &Path) -> Instant {
+    let started = Instant::now();
+    let mut last_err = String::new();
+    for attempt in 0..UNMOUNT_RETRY_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(UNMOUNT_RETRY_TICK);
+        }
+        let out = Command::new("fusermount3")
+            .arg("-u")
+            .arg(mnt)
+            .output()
+            .expect("run fusermount3 -u");
+        if out.status.success() {
+            if attempt > 0 {
+                eprintln!(
+                    "note: fusermount3 -u {} landed at attempt {} (+{:?}) after a transient \
+                     EBUSY — a bystander's fd on the fresh mount (record §4.4by)",
+                    mnt.display(),
+                    attempt + 1,
+                    started.elapsed()
+                );
+            }
+            return Instant::now();
+        }
+        last_err = String::from_utf8_lossy(&out.stderr).into_owned();
+    }
+    panic!(
+        "fusermount3 -u {} stayed busy for {:?} ({UNMOUNT_RETRY_ATTEMPTS} attempts): {last_err}",
+        mnt.display(),
+        started.elapsed()
+    );
+}
+
 /// The one staging root a scoped mount owns under `staging/squeezefs/`
 /// (the container holds it beside the shared `cache_segment`).
 fn owned_staging_root(base: &Path) -> PathBuf {
@@ -346,13 +400,7 @@ fn a_successor_mount_lands_while_its_predecessors_exit_outlives_the_dismount() {
         "the live mount holds its staging root's lock"
     );
 
-    let status = Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mnt)
-        .status()
-        .expect("fusermount3 -u");
-    assert!(status.success(), "the external unmount succeeds");
-    let unmounted_at = Instant::now();
+    let unmounted_at = unmount_external(&mnt);
     assert!(!is_mounted(&mnt), "the kernel mount is gone");
 
     // Law 1: the lock frees with the TEARDOWN, while the process lives on.
@@ -444,13 +492,7 @@ fn a_daemon_successor_waits_out_a_dismounting_predecessor_past_the_parents_deadl
     std::fs::write(mnt.join("f"), b"predecessor bytes").expect("write through the mount");
     let root = owned_staging_root(&base);
 
-    let status = Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mnt)
-        .status()
-        .expect("fusermount3 -u");
-    assert!(status.success(), "the external unmount succeeds");
-    let unmounted_at = Instant::now();
+    let unmounted_at = unmount_external(&mnt);
     assert!(!is_mounted(&mnt), "the kernel mount is gone");
     assert!(
         staging_root_owner_is_live(&root),
@@ -522,9 +564,10 @@ fn a_daemon_successor_waits_out_a_dismounting_predecessor_past_the_parents_deadl
         "the predecessor exits once its held teardown completes"
     );
 
-    // The successor is a detached daemon: unmount it and wait for the
+    // The successor is a detached daemon: unmount it (the same bounded
+    // retry — the read-back above is a fresh touch) and wait for the
     // mount to go.
-    let _ = Command::new("fusermount3").arg("-u").arg(&mnt).status();
+    unmount_external(&mnt);
     let deadline = Instant::now() + Duration::from_secs(30);
     while is_mounted(&mnt) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));

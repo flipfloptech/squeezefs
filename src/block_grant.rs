@@ -556,10 +556,23 @@ pub enum GrantAnswer {
     /// No holder answered (a dial or wire failure after the sink's own
     /// re-resolve-and-retry).
     Unreachable,
-    /// The holder answered and REFUSED the ask (a screened word, a lease
-    /// it does not hold — `manager_verb_rejected`'s class): deterministic,
-    /// neither exhaustion nor an outage; the allocator surfaces it loud
-    /// and latches nothing.
+    /// The holder answered "not this beat" (review round 3, Issue 25): its
+    /// ring-0 user window was full for the beat — `KvError::
+    /// JournalReserveExhausted`, the wire service's `Deferred` (PR 13i: under
+    /// the sector-pad law the holder's own storm fills ring 0 a page per
+    /// commit, so the window is full for a beat every cycle) — or the lease
+    /// is in motion (a handover, a re-hold, the leave: `KvError::Busy`
+    /// in-process, the wire's `HandoverDeferred`). The retryable class
+    /// (`RefusalClass::HolderDeferred`): nothing latches, the unit parks on
+    /// the never-lossy ladder, the next ask lands; a wire sink KEEPS its
+    /// session (a `Deferred` is an answer, never a dead venue).
+    Deferred(String),
+    /// The holder answered and REFUSED the ask outright: on the wire the
+    /// manager's `STATUS_REFUSED` (a screened word, a lease it does not hold
+    /// — `manager_verb_rejected`'s class); in-process a drain that failed in
+    /// a TERMINAL class (an I/O error, a corrupt ring — the volume's own
+    /// fail-stop lattice owns it). Neither exhaustion nor an outage; the
+    /// allocator surfaces it loud and latches nothing.
     Refused(String),
 }
 

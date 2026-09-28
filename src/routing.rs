@@ -3467,7 +3467,12 @@ impl BackendRouter {
     /// every striped write). The candidates are the rows placement
     /// judged eligible at the last refresh (healthy AND `active`); a
     /// registration refreshes the table, so a just-added volume is a
-    /// candidate at once. A bare router's table carries `backend_0`.
+    /// candidate at once; a volume that LOST health after the refresh stays
+    /// a candidate until the health worker's next cadence — the
+    /// conservative direction (the set reads not-exhausted for one cadence
+    /// and a write admitted then parks on the full sibling, the pre-fix
+    /// shape bounded to that cadence). A bare router's table carries
+    /// `backend_0`.
     fn fresh_supply_census(
         &self,
         probe: impl Fn(&crate::block_allocator::BlockAllocator) -> bool,

@@ -2289,6 +2289,16 @@ impl KvMetaBackend {
         let floor = holding.ledger.grant_frontier().unwrap_or(0);
         let outcome = holding.carve(writer, want, floor, held_unconsumed);
         if let CarveOutcome::Granted(g) = &outcome {
+            // The seam: the drain's ADMISSION class (ring 0's user window
+            // full for the beat) this many times — the bits go back exactly
+            // as a real refusal's do.
+            if TEST_HOLDER_GRANT_EXHAUST_N
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                let _ = holding.return_blocks(writer, *g);
+                return Err(KvError::JournalReserveExhausted { needed: 0 });
+            }
             if let Err(e) = self.drain_deltas(&holding).await {
                 let _ = holding.return_blocks(writer, *g);
                 return Err(e);
@@ -2649,6 +2659,14 @@ pub fn screen_bitmap_refs(
 // The PRODUCTION allocation arm (review round 1, Issue 7)
 // ---------------------------------------------------------------------------
 
+/// Test seam (record §7 item 24, review round 3, Issue 25): the next N
+/// `holder_block_grant` carves answer the drain's ADMISSION class
+/// (`KvError::JournalReserveExhausted` — ring 0's user window full for the
+/// beat, PR 13i's shape) with the bits returned — the DEFERRED answer's
+/// shape on both sinks (the in-process holder's and, through the manager
+/// service's `Deferred`, the wire's). Decremented per refusal.
+pub static TEST_HOLDER_GRANT_EXHAUST_N: AtomicU64 = AtomicU64::new(0);
+
 /// The in-process holder's grant sink for a writer named `writer`:
 /// `holder_block_grant` on the home volume.
 pub fn holder_block_grant_sink(
@@ -2670,9 +2688,28 @@ pub fn holder_block_grant_sink(
                 Ok(CarveOutcome::Granted(g)) => GrantAnswer::Granted(vec![g]),
                 Ok(CarveOutcome::Already(gs)) => GrantAnswer::Granted(gs),
                 Ok(CarveOutcome::Full) => GrantAnswer::Full,
+                // Classified by KIND (review round 3, Issue 25 — the wire
+                // service's own table): the grant's drain into ring 0 found
+                // the user window FULL for this beat (PR 13i: under the
+                // sector-pad law the holder's own storm fills ring 0 a page
+                // per commit) — the checkpoint task is kicked with the
+                // park's mark exactly as the wire service does and the ask
+                // is DEFERRED, never refused; before it every such beat on
+                // the default solo mount surfaced as `EINVAL` at the write.
+                Err(e @ KvError::JournalReserveExhausted { .. }) => {
+                    home.kick_checkpoint_for_ring_park();
+                    GrantAnswer::Deferred(e.to_string())
+                }
+                // The lease is in motion (not held / homed elsewhere right
+                // now — a handover, a re-hold, the leave): the next ask
+                // finds the holder.
+                Err(e @ KvError::Busy(_)) | Err(e @ KvError::HandoverDeferred(_)) => {
+                    GrantAnswer::Deferred(e.to_string())
+                }
+                // A drain that failed in a TERMINAL class (an I/O error, a
+                // corrupt ring — the volume's fail-stop lattice owns it):
+                // neither "full" nor an outage, surfaced loud.
                 Err(e) => {
-                    // A holder that REFUSED (a lease it does not hold, a
-                    // screened word) is neither "full" nor an outage.
                     log::warn!(
                         "block grant on data volume {vol_tag:#018x} refused by the holder: {e}"
                     );
@@ -2868,10 +2905,22 @@ pub fn wire_block_grant_sink(
                     // "nothing" that means no supply (item 24's latch).
                     Ok(Some(g)) => return crate::block_grant::GrantAnswer::Granted(g),
                     Ok(None) => return crate::block_grant::GrantAnswer::Full,
-                    Err(e) => {
+                    // The manager's typed `Deferred` (its ring 0 full for a
+                    // beat, a handover in flight — `EAGAIN`): an ANSWER, so
+                    // the session is KEPT (review round 3, Issue 26 — the
+                    // first build dropped it per beat, a reconnect against
+                    // the manager's listener cap every ring-full beat).
+                    Err(crate::error::SqueezefsError::Refused { errno, msg })
+                        if errno == libc::EAGAIN =>
+                    {
+                        return crate::block_grant::GrantAnswer::Deferred(msg);
+                    }
+                    // A transport failure: re-resolve the venue and retry
+                    // once; past that the holder is UNREACHABLE.
+                    Err(e) if crate::cluster_wire::is_transport_failure(&e) => {
                         *slot = None;
                         stale.store(true, Ordering::Release);
-                        if crate::cluster_wire::is_transport_failure(&e) && !retried {
+                        if !retried {
                             retried = true;
                             log::info!(
                                 "block grant over the wire failed ({e}) — re-resolving the \
@@ -2881,6 +2930,13 @@ pub fn wire_block_grant_sink(
                         }
                         log::warn!("block grant over the wire failed: {e}; reconnecting next ask");
                         return crate::block_grant::GrantAnswer::Unreachable;
+                    }
+                    // The manager's `STATUS_REFUSED` (a screened word, a
+                    // lease it does not hold): the one deterministic class
+                    // on the wire — the session stands.
+                    Err(e) => {
+                        log::warn!("block grant over the wire REFUSED by the holder: {e}");
+                        return crate::block_grant::GrantAnswer::Refused(e.to_string());
                     }
                 }
             }

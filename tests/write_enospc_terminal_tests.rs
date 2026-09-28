@@ -1166,6 +1166,9 @@ async fn a_rewrite_of_a_mapped_block_on_a_transformed_volume_is_refused_when_exh
 /// keep the census on every write of every later mount in the process.
 /// Also the count's own law: one refusal latches once (a second refusal
 /// on the same allocator moves nothing), and a landed allocation clears.
+/// The word is PROCESS-wide; every allocator-driving contract of this
+/// binary runs under `serial()` (and an integration-test file is its own
+/// process), so the exact deltas below see this test's allocator alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_latched_allocator_leaves_the_process_count() {
     let _s = serial();
@@ -1224,6 +1227,14 @@ fn a_retryable_class_is_never_a_terminal_writeback_error() {
         !squeezefs::fuse_client::writeback_error_is_terminal(&unreachable),
         "an unreachable holder is retried, never latched into the app's close"
     );
+    let deferred = SqueezefsError::Retryable {
+        class: RefusalClass::HolderDeferred,
+        msg: "block grant window empty and the allocation holder deferred the ask".to_string(),
+    };
+    assert!(
+        !squeezefs::fuse_client::writeback_error_is_terminal(&deferred),
+        "a holder's full-ring beat is retried too (review round 3, Issue 25)"
+    );
     let full = SqueezefsError::Io(std::io::Error::new(
         std::io::ErrorKind::StorageFull,
         "block grant window empty",
@@ -1237,6 +1248,7 @@ fn a_retryable_class_is_never_a_terminal_writeback_error() {
     );
     assert!(
         squeezefs::fuse_client::writeback_error_is_terminal(&refused),
-        "a holder's deterministic refusal is terminal"
+        "a holder's REFUSAL (the wire's STATUS_REFUSED; in-process a drain that failed in a \
+         terminal class) is terminal"
     );
 }

@@ -578,6 +578,9 @@ pub enum TopupOutcome {
     Full,
     /// No holder answered — the retryable class, never exhaustion.
     Unreachable,
+    /// The holder answered "not this beat" (its ring window full for the
+    /// beat, its lease in motion) — the retryable class, never exhaustion.
+    Deferred(String),
     /// The holder refused the ask (a deterministic verb rejection) — loud,
     /// never exhaustion.
     Refused(String),
@@ -836,6 +839,7 @@ impl BlockAllocator {
             }
             crate::block_grant::GrantAnswer::Full => TopupOutcome::Full,
             crate::block_grant::GrantAnswer::Unreachable => TopupOutcome::Unreachable,
+            crate::block_grant::GrantAnswer::Deferred(why) => TopupOutcome::Deferred(why),
             crate::block_grant::GrantAnswer::Refused(why) => TopupOutcome::Refused(why),
         }
     }
@@ -2251,6 +2255,24 @@ impl BlockAllocator {
                             "data volume {}: block grant window empty and the allocation \
                              holder could not be reached — the unit stays on the never-lossy \
                              ladder until the holder answers (block_grant_topups)",
+                            self._volume_id
+                        ),
+                    });
+                }
+                // Review round 3, Issue 25: a holder that answered "not this
+                // beat" — its ring-0 user window full for the beat (the
+                // default solo mount's own storm), its lease in motion — is
+                // the retryable class too: the unit parks on the never-lossy
+                // ladder and the next ask lands; before it the in-process
+                // sink filed these beats as refusals and a fresh mint under
+                // a storm surfaced `EINVAL` at the write.
+                TopupOutcome::Deferred(why) => {
+                    return Err(crate::error::SqueezefsError::Retryable {
+                        class: crate::error::RefusalClass::HolderDeferred,
+                        msg: format!(
+                            "data volume {}: block grant window empty and the allocation \
+                             holder deferred the ask ({why}) — the unit stays on the \
+                             never-lossy ladder until the next ask lands (block_grant_topups)",
                             self._volume_id
                         ),
                     });

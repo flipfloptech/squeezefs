@@ -848,8 +848,12 @@ on it (`overlay_unreachable_declines`), the writeback ladder retries the
 class, and every parked unit of that writer lands when the successor
 answers; a latched joined writer re-asks its holder off the write path
 once per membership renewal beat (`alloc_fresh_supply_reask_ms`). A
-holder that REFUSES the ask outright (a screened word) is a loud
-`EINVAL`, neither exhaustion nor an outage.
+holder that answers "not this beat" — its ring window full for the beat
+under its own storm, its lease in motion — is the same retryable class
+(nothing latches, the next ask lands; a wire session survives it), on
+the default solo mount included; only a holder that REFUSES the ask
+outright (a screened word on the wire; a drain that failed in a terminal
+class in-process) is a loud `EINVAL`, neither exhaustion nor an outage.
 The dismount's writeback-retire wait is skipped when every unit its sweep
 could not land failed for space (they stay staged for the next mount).
 Pinned in process on both pipeline shapes and LIVE on the real kernel

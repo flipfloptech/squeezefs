@@ -45,6 +45,15 @@ pub enum RefusalClass {
     /// §4.4bb: a joiner's first shipped step after a manager failover read
     /// `EINVAL` at `mkdir(2)`). Wire word 6.
     StaleOwnerEra,
+    /// The data volume's allocation-lease HOLDER answered a block-grant ask
+    /// "not this beat" (record §7 item 24, review round 3): its ring-0 user
+    /// window was full for the beat (`KvError::JournalReserveExhausted` —
+    /// the wire service's `Deferred`, PR 13i) or the lease is in motion (a
+    /// handover, a re-hold, the leave — `KvError::Busy` in-process). Neither
+    /// exhaustion nor an outage: the unit parks on the never-lossy ladder
+    /// and the next ask lands (`block_grant::GrantAnswer::Deferred`). Wire
+    /// word 7.
+    HolderDeferred,
 }
 
 impl RefusalClass {
@@ -57,6 +66,7 @@ impl RefusalClass {
             RefusalClass::MembershipPending => 4,
             RefusalClass::ListenerRefused => 5,
             RefusalClass::StaleOwnerEra => 6,
+            RefusalClass::HolderDeferred => 7,
         }
     }
 
@@ -71,6 +81,7 @@ impl RefusalClass {
             4 => Some(RefusalClass::MembershipPending),
             5 => Some(RefusalClass::ListenerRefused),
             6 => Some(RefusalClass::StaleOwnerEra),
+            7 => Some(RefusalClass::HolderDeferred),
             _ => None,
         }
     }

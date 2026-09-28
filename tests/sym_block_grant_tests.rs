@@ -3289,3 +3289,210 @@ async fn an_unreachable_holder_is_the_retryable_class_never_exhaustion() {
     );
     assert!(!b.fresh_supply_exhausted());
 }
+
+/// **A holder that answers "not this beat" is the retryable class, never
+/// exhaustion and never a refusal** (record §7 item 24, review round 3,
+/// Issue 25 — the default solo mount's own posture). The production arm's
+/// allocator asks its in-process holder; the grant's drain into ring 0
+/// meets the ADMISSION class (`JournalReserveExhausted` — the user window
+/// full for a beat under the holder's own storm, PR 13i's shape: the seam
+/// `TEST_HOLDER_GRANT_EXHAUST_N`) at every ask while the window drains to
+/// nothing, so the inline ask at the empty window answers DEFERRED:
+/// `Retryable { HolderDeferred }` (the unit parks on the never-lossy
+/// ladder), nothing latches, the holder's checkpoint task is kicked with
+/// the park's mark (a cycle runs — the seq advances), and the NEXT ask
+/// lands once the beat has passed. Before this round the in-process sink
+/// filed the beat as `Refused` → `InvalidOperation` → `EINVAL` at the
+/// write, the kernel dropped the pages and the close-time error latched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holders_full_ring_beat_defers_the_ask_and_the_next_ask_lands() {
+    use squeezefs::meta_backend::kv::alloc_lease::TEST_HOLDER_GRANT_EXHAUST_N;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    TEST_HOLDER_GRANT_EXHAUST_N.store(0, Ordering::SeqCst);
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let a = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(a.block_grant_armed());
+    // The initial grant lands at the first mint (the window is asked for
+    // at the mint, never at the arm); every ask from here meets the beat:
+    // the proactive top-ups past 50 % fail deferred (counted down), the
+    // window drains to nothing.
+    a.allocate_block()
+        .await
+        .expect("the initial grant lands at the first mint");
+    TEST_HOLDER_GRANT_EXHAUST_N.store(u64::MAX / 2, Ordering::SeqCst);
+    let mut minted = 1u64;
+    let e = loop {
+        match a.allocate_block().await {
+            Ok(_) => {
+                minted += 1;
+                assert!(minted < 100_000, "the window never drained under the seam");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(minted >= 2, "the initial grant was minted from first");
+    assert_eq!(a.block_grant_remaining(), 0, "the window is empty");
+    match &e {
+        squeezefs::error::SqueezefsError::Retryable { class, msg } => {
+            assert!(
+                matches!(class, squeezefs::error::RefusalClass::HolderDeferred),
+                "the holder's full beat is the DEFERRED class: {class:?} ({msg})"
+            );
+        }
+        other => panic!("a holder's full beat is neither StorageFull nor a refusal: {other:?}"),
+    }
+    assert!(
+        !a.fresh_supply_latched(),
+        "a deferred ask latches nothing — no fresh-block write is refused ENOSPC"
+    );
+    assert!(!a.fresh_supply_exhausted());
+    // The park's mark reached the holder's checkpoint task: a cycle runs.
+    let seq0 = vol.checkpoint_seq();
+    wait_until("the kicked checkpoint cycle lands", || {
+        vol.checkpoint_seq() > seq0
+    })
+    .await;
+    // The beat passes: the next ask lands and the window refills.
+    TEST_HOLDER_GRANT_EXHAUST_N.store(0, Ordering::SeqCst);
+    a.allocate_block()
+        .await
+        .expect("the next ask after the beat lands");
+    assert!(a.block_grant_remaining() >= 1);
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// **A holder whose lease is in motion defers too** (review round 3, Issue
+/// 25's second class): an in-process holder sink over a home that does not
+/// hold the data volume's allocation lease right now — a handover, a
+/// re-hold, the leave (`KvError::Busy`) — answers DEFERRED at the empty
+/// window: the retryable `HolderDeferred` class, nothing latched, never a
+/// refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_holder_whose_lease_is_in_motion_defers_the_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let vol_id = "vol-item24-lease-in-motion";
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(vol_id);
+    assert!(
+        alloc_lease::holding(tag).is_none(),
+        "premise: the lease is not held here"
+    );
+    let b = data_allocator(vol_id).await;
+    assert!(b.install_block_grant_arm(
+        tag,
+        alloc_lease::holder_block_grant_sink(&vol, tag, "writer-in-motion".to_string()),
+    ));
+    assert_eq!(b.block_grant_remaining(), 0);
+    let e = b
+        .allocate_block()
+        .await
+        .expect_err("an empty window whose holder's lease is in motion cannot mint yet");
+    match &e {
+        squeezefs::error::SqueezefsError::Retryable { class, msg } => {
+            assert!(
+                matches!(class, squeezefs::error::RefusalClass::HolderDeferred),
+                "a lease in motion is the DEFERRED class: {class:?} ({msg})"
+            );
+        }
+        other => panic!("a lease in motion is neither StorageFull nor a refusal: {other:?}"),
+    }
+    assert!(!b.fresh_supply_latched());
+    assert!(!b.fresh_supply_exhausted());
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
+/// **The wire sink keeps its session on the manager's `Deferred`** (review
+/// round 3, Issue 26): writer B's window is fed by the manager over the
+/// wire; the manager's `holder_block_grant` meets the beat (the seam) and
+/// answers `Deferred` — B's mint is the retryable `HolderDeferred` class
+/// with the SESSION KEPT (the listener admitted exactly one session from
+/// B before and after), and the next ask lands on the same session.
+/// The first build dropped the session per beat — a reconnect against the
+/// manager's listener cap every ring-full beat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wire_deferred_answer_keeps_the_grant_session() {
+    use squeezefs::meta_backend::kv::alloc_lease::TEST_HOLDER_GRANT_EXHAUST_N;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    TEST_HOLDER_GRANT_EXHAUST_N.store(0, Ordering::SeqCst);
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let vol = Arc::clone(&routed.volumes[0]);
+    let a = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let host = squeezefs::cluster_wire::RpcListener::start_async(
+        listener_cfg(),
+        SECRET.to_vec(),
+        ManagerService::new(Arc::clone(&vol)),
+    )
+    .expect("manager listener");
+    let endpoint = host.endpoint().to_string();
+    let b = data_allocator(DATA_ID).await;
+    assert!(b.install_block_grant_arm(
+        DATA_TAG,
+        alloc_lease::wire_block_grant_sink(
+            alloc_lease::HolderVenue::fixed(endpoint.clone()),
+            SECRET.to_vec(),
+            wire(successor_identity()),
+            0,
+            DATA_TAG,
+        ),
+    ));
+    // The first ask dials the session and meets the beat.
+    TEST_HOLDER_GRANT_EXHAUST_N.store(1, Ordering::SeqCst);
+    let e = b
+        .allocate_block()
+        .await
+        .expect_err("the beat defers the empty window's ask");
+    assert!(
+        matches!(
+            &e,
+            squeezefs::error::SqueezefsError::Retryable {
+                class: squeezefs::error::RefusalClass::HolderDeferred,
+                ..
+            }
+        ),
+        "the manager's Deferred is the DEFERRED class over the wire: {e:?}"
+    );
+    assert_eq!(
+        TEST_HOLDER_GRANT_EXHAUST_N.load(Ordering::SeqCst),
+        0,
+        "the beat was met at the holder"
+    );
+    assert!(!b.fresh_supply_latched());
+    let admitted = host.stats().sessions_admitted;
+    assert_eq!(admitted, 1, "one session dialed for the first ask");
+    // The next ask lands on the SAME session: no new connection.
+    b.allocate_block()
+        .await
+        .expect("the next ask after the beat lands");
+    assert_eq!(
+        host.stats().sessions_admitted,
+        admitted,
+        "a Deferred answer keeps the session — no re-dial"
+    );
+    shutdown(&routed).await;
+    reset_process_state();
+}

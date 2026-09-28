@@ -152,6 +152,10 @@ The pinned arena is also gauged live as `transport_payload_buffer_bytes` and att
 
 The release gate's require-mount leg (`tests/run_require_mount_gate.sh`) runs the same derivation as a preflight and refuses to start below the derived need (root and `unlimited` pass), so a box that cannot mount is named before a suite self-skips on it.
 
+### The realtime-CPU budget (`RLIMIT_RTTIME`) — a venue defect the suite runners refuse
+
+**Found by the 1.3.0 release chain (attempt 5, fstests generic/631, 2026-09-27):** a desktop launcher can hand every process it spawns a **zero** realtime-CPU hard limit (Omarchy's `quickshell` runs with `RLIMIT_RTTIME` 0/0 while its parent has `unlimited`; the terminal, its shell, and everything started from it inherit the zero). That is harmless until the kernel's **RCU-boost** kthreads (`CONFIG_RCU_BOOST=y`, `rcub/N`) priority-inherit an ordinary task caught in a preempted RCU read-side section into the realtime class for one tick — and at a zero budget that single tick trips the realtime watchdog: the kernel SIGKILLs the task (`posix_cpu_timers_work`, `SI_KERNEL`) with **no log line and no OOM report**. `rm`, `touch`, `mv` and `bash` died mid-test; a suite that spawns thousands of short-lived processes meets it within minutes (generic/631 runs ~150 per second). Nothing in SqueezeFS is involved: the same kill lands on any filesystem. `grep -i "realtime timeout" /proc/$$/limits` reads it; the three root runners (`tests/run_fstests.sh`, `run_pjdfstests.sh`, `run_ltp_syscalls.sh`) share `tests/suite_tree.sh`, which **lifts the budget to unlimited** (root's to raise) and **refuses** a zero it cannot lift — so a release gate never runs a suite under a launcher-inherited zero. For anything else you run from such a terminal (a fleet leg, a benchmark client), `sudo prlimit --pid $$ --rttime=unlimited:unlimited` in the invoking shell, or start from a TTY/ssh session, which inherits systemd's `DefaultLimitRTTIME=infinity`.
+
 ## Durability & crash contract
 
 ### Metadata Durability (crash contract)

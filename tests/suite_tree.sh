@@ -46,6 +46,31 @@ suite_tree_home() {
     echo "${HOME:-/root}/.cache/squeezefs-suites"
 }
 
+# The realtime-CPU budget (the 1.3.0 release chain, attempt 5 — fstests
+# generic/631, 2026-09-27): a desktop launcher (Omarchy's quickshell) runs
+# with RLIMIT_RTTIME hard = 0 and every process it spawns inherits it — the
+# terminal, the shell, the runner, every test. The kernel's RCU-boost
+# kthreads (CONFIG_RCU_BOOST) priority-inherit an ordinary task caught in a
+# preempted RCU read section into the realtime class for one tick, and at a
+# zero budget that tick trips the RT watchdog: the kernel SIGKILLs the task
+# (`posix_cpu_timers_work`, SI_KERNEL — no log line, no OOM report). rm /
+# touch / mv / bash died mid-test; a suite that spawns thousands of short
+# processes meets it within minutes. A VENUE defect — the runner lifts the
+# budget (the hard limit is root's to raise) and refuses a zero it cannot.
+suite_tree_lift_rttime() {
+    local was hard
+    was=$(awk '/Max realtime timeout/{print $5}' /proc/$$/limits 2>/dev/null || echo unlimited)
+    [ "$was" = "unlimited" ] && return 0
+    prlimit --pid $$ --rttime=unlimited:unlimited 2>/dev/null || true
+    hard=$(awk '/Max realtime timeout/{print $5}' /proc/$$/limits 2>/dev/null || echo unlimited)
+    if [ "$hard" != "unlimited" ]; then
+        echo "suite_tree: RLIMIT_RTTIME hard limit is ${hard} µs and could not be lifted — a zero realtime budget lets the kernel SIGKILL RCU-boosted test processes (fstests generic/631); the runners are root-only and root can raise it (sudo -n prlimit --pid \$\$ --rttime=unlimited:unlimited before invoking), or run from a session outside the desktop launcher (a TTY or ssh login inherits systemd's unlimited default)" >&2
+        return 1
+    fi
+    echo "suite_tree: RLIMIT_RTTIME lifted to unlimited (was ${was} µs — the desktop launcher's inherited zero budget)" >&2
+}
+suite_tree_lift_rttime || exit 2
+
 # suite_tree_ensure NAME REPO_URL MARKER [LEGACY_PATH]
 # Prints the tree's path on stdout; clones (or adopts / refreshes) as needed.
 suite_tree_ensure() {

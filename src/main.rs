@@ -3171,6 +3171,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Record §4.4bw: a desktop launcher's inherited ZERO realtime-CPU
+    // budget lets the kernel's RCU boost SIGKILL the whole daemon at the
+    // first boosted tick — silently. Lifted HERE, in the process that will
+    // run (the forked `--daemon` child), ahead of the bootstrap's volume
+    // probe: that probe already spins the blocking pool, and every thread
+    // this process spawns from now on is boostable. A `mount` under a zero
+    // that stands is REFUSED (the mount would die by statistics), over the
+    // handshake pipe — the child's stderr is /dev/null and the parent's
+    // console must name it. The verdict's log lines wait for logging.
+    let rttime_budget = squeezefs::lift_rttime_budget();
+    if rttime_budget == squeezefs::RttimeBudget::ZeroStands
+        && matches!(cli.command, Commands::Mount { .. })
+    {
+        mount_bootstrap_fail(
+            "RLIMIT_RTTIME hard limit is 0 µs and could not be lifted — the \
+             kernel's RCU boost SIGKILLs this daemon at the first realtime tick it \
+             hands a daemon thread, silently (record §4.4bw: a desktop launcher's \
+             inherited zero budget). Start the mount from a session with an \
+             unlimited budget (a TTY / ssh login, or `sudo prlimit --pid $$ \
+             --rttime=unlimited:unlimited` in the invoking shell).",
+        );
+    }
+
     #[cfg(unix)]
     {
         let uid = unsafe { libc::getuid() };
@@ -3464,12 +3487,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the soft limit in force — raised BEFORE any listener reads it.
     squeezefs::cluster_wire::raise_nofile_soft_limit();
 
-    // Record §4.4bw: a desktop launcher's inherited ZERO realtime-CPU
-    // budget lets the kernel's RCU boost SIGKILL the whole daemon at the
-    // first boosted tick — silently. Lift it; a `mount` under a zero that
-    // stands is REFUSED (the mount would die by statistics), a finite
-    // budget that stands is announced loud (a slow fuse).
-    match squeezefs::lift_rttime_budget() {
+    // Record §4.4bw: the realtime-budget verdict taken before the bootstrap
+    // (a `mount` under a zero that stands refused there); a finite budget
+    // that stands is announced loud — a slow fuse.
+    match rttime_budget {
         squeezefs::RttimeBudget::Unlimited => {}
         squeezefs::RttimeBudget::Lifted { was_us } => log::info!(
             "RLIMIT_RTTIME lifted to unlimited (was {was_us} µs — a launcher-inherited \
@@ -3482,24 +3503,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              from a session with an unlimited budget (a TTY / ssh login) or run \
              `sudo prlimit --pid $$ --rttime=unlimited:unlimited` before mounting"
         ),
-        squeezefs::RttimeBudget::ZeroStands => {
-            if matches!(cli.command, Commands::Mount { .. }) {
-                eprintln!(
-                    "Error: RLIMIT_RTTIME hard limit is 0 µs and could not be lifted — the \
-                     kernel's RCU boost SIGKILLs this daemon at the first realtime tick it \
-                     hands a daemon thread, silently (record §4.4bw: a desktop launcher's \
-                     inherited zero budget). Start the mount from a session with an \
-                     unlimited budget (a TTY / ssh login, or `sudo prlimit --pid $$ \
-                     --rttime=unlimited:unlimited` in the invoking shell)."
-                );
-                std::process::exit(1);
-            }
-            log::warn!(
-                "RLIMIT_RTTIME hard limit is 0 µs and could not be lifted — a launcher-inherited \
-                 zero realtime budget (record §4.4bw); a long-running verb under it can be \
-                 SIGKILLed at the first RCU-boosted tick"
-            );
-        }
+        squeezefs::RttimeBudget::ZeroStands => log::warn!(
+            "RLIMIT_RTTIME hard limit is 0 µs and could not be lifted — a launcher-inherited \
+             zero realtime budget (record §4.4bw); a long-running verb under it can be \
+             SIGKILLed at the first RCU-boosted tick"
+        ),
     }
 
     // rip-tokio-total: no runtime in the surviving process. The CLI

@@ -437,18 +437,23 @@ pub fn lift_rttime_budget() -> RttimeBudget {
             rlim_cur: libc::RLIM_INFINITY,
             rlim_max: libc::RLIM_INFINITY,
         };
-        let mut lifted = libc::setrlimit(libc::RLIMIT_RTTIME, &want) == 0;
-        if !lifted && hard != libc::RLIM_INFINITY && soft != hard {
-            // The hard limit is not ours to raise; the soft is.
+        if libc::setrlimit(libc::RLIMIT_RTTIME, &want) == 0 {
+            return rttime_budget_verdict(soft, hard, true);
+        }
+        if hard != libc::RLIM_INFINITY && soft != hard {
+            // The hard limit is not ours to raise; the soft is. The verdict
+            // judges the pair now IN FORCE — a `(0, 200 ms)` budget raised
+            // to `(200 ms, 200 ms)` is a finite budget that stands, never
+            // the zero it started as.
             let want = libc::rlimit {
                 rlim_cur: hard,
                 rlim_max: hard,
             };
-            if libc::setrlimit(libc::RLIMIT_RTTIME, &want) == 0 && hard == libc::RLIM_INFINITY {
-                lifted = true;
+            if libc::setrlimit(libc::RLIMIT_RTTIME, &want) == 0 {
+                return rttime_budget_verdict(hard, hard, false);
             }
         }
-        rttime_budget_verdict(soft, hard, lifted)
+        rttime_budget_verdict(soft, hard, false)
     }
 }
 

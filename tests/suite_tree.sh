@@ -58,16 +58,18 @@ suite_tree_home() {
 # processes meets it within minutes. A VENUE defect — the runner lifts the
 # budget (the hard limit is root's to raise) and refuses a zero it cannot.
 suite_tree_lift_rttime() {
+    # Fail CLOSED: an unreadable or missing limits line is refused like a
+    # finite budget, never read as unlimited.
     local was hard
-    was=$(awk '/Max realtime timeout/{print $5}' /proc/$$/limits 2>/dev/null || echo unlimited)
+    was=$(awk '/Max realtime timeout/{print $5}' /proc/$$/limits 2>/dev/null || true)
     [ "$was" = "unlimited" ] && return 0
     prlimit --pid $$ --rttime=unlimited:unlimited 2>/dev/null || true
-    hard=$(awk '/Max realtime timeout/{print $5}' /proc/$$/limits 2>/dev/null || echo unlimited)
+    hard=$(awk '/Max realtime timeout/{print $5}' /proc/$$/limits 2>/dev/null || true)
     if [ "$hard" != "unlimited" ]; then
-        echo "suite_tree: RLIMIT_RTTIME hard limit is ${hard} µs and could not be lifted — a zero realtime budget lets the kernel SIGKILL RCU-boosted test processes (fstests generic/631); the runners are root-only and root can raise it (sudo -n prlimit --pid \$\$ --rttime=unlimited:unlimited before invoking), or run from a session outside the desktop launcher (a TTY or ssh login inherits systemd's unlimited default)" >&2
+        echo "suite_tree: RLIMIT_RTTIME hard limit is '${hard:-unreadable}' µs and could not be lifted — a finite realtime budget lets the kernel SIGKILL RCU-boosted test processes (fstests generic/631; a zero budget at the first boosted tick, a finite one as the budget accumulates); the runners are root-only and root can raise it (sudo -n prlimit --pid \$\$ --rttime=unlimited:unlimited before invoking), or run from a session outside the desktop launcher (a TTY or ssh login inherits systemd's unlimited default)" >&2
         return 1
     fi
-    echo "suite_tree: RLIMIT_RTTIME lifted to unlimited (was ${was} µs — the desktop launcher's inherited zero budget)" >&2
+    echo "suite_tree: RLIMIT_RTTIME lifted to unlimited (was '${was:-unreadable}' µs — a launcher-inherited finite realtime budget)" >&2
 }
 suite_tree_lift_rttime || exit 2
 

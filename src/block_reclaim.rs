@@ -1110,12 +1110,6 @@ impl ReclaimQueue {
     /// per batch and by the ENOSPC valve — one atomic load when already
     /// halted, one cheap probe (a few atomic loads over the meta set)
     /// otherwise. Latches sticky and loud on the first observation.
-    /// Record §4.4bx: close this queue's device commands at the dismount
-    /// teardown's terminal step (see the `dismounted` field). Idempotent.
-    pub fn close_at_dismount(&self) {
-        self.dismounted.store(true, Ordering::Release);
-    }
-
     pub(crate) fn fence_halted(&self) -> bool {
         if self.halted.load(Ordering::Acquire) {
             return true;
@@ -1140,6 +1134,12 @@ impl ReclaimQueue {
             return true;
         }
         false
+    }
+
+    /// Record §4.4bx: close this queue's device commands at the dismount
+    /// teardown's data-plane close (see the `dismounted` field). Idempotent.
+    pub fn close_at_dismount(&self) {
+        self.dismounted.store(true, Ordering::Release);
     }
 
     /// Latch the sticky halt the writer-guard fence probe sets, directly:

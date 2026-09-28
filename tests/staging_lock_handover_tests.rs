@@ -423,7 +423,9 @@ fn a_successor_mount_lands_while_its_predecessors_exit_outlives_the_dismount() {
 /// and serves the predecessor's bytes. RED on the round-1 build: the
 /// successor was SIGKILLed by its own parent at 30 s ("mount did not
 /// become ready within 30 seconds") while the predecessor was healthy
-/// inside its guard; RED on the base: refused at 2 s.
+/// inside its guard. On the base the seam is an unregistered knob (the
+/// teardown is instant and the successor lands inside the 2-s wait), so
+/// the base RED is the `landed_after ≥ 30 s` and INFO assertions.
 #[test]
 fn a_daemon_successor_waits_out_a_dismounting_predecessor_past_the_parents_deadline() {
     if !mount_supported(site!()) {
@@ -455,7 +457,21 @@ fn a_daemon_successor_waits_out_a_dismounting_predecessor_past_the_parents_deadl
         "the predecessor still owns its staging root inside its held teardown"
     );
 
-    // The successor, at once, through the daemonizing parent.
+    // The successor, at once, through the daemonizing parent. It is a
+    // DETACHED daemon: the guard unmounts its path on every exit of this
+    // test, so a failed assertion leaves no live mount behind.
+    struct Unmount(PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let _ = Command::new("fusermount3")
+                .arg("-uz")
+                .arg(&self.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _successor = Unmount(mnt.clone());
     let second_log = base.join("second.log");
     let out = Command::new(bin())
         .arg("mount")

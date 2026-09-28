@@ -1478,12 +1478,12 @@ async fn same_mount_point_successor_adopts_its_own_pair_residue() {
 // ---------------------------------------------------------------------------
 
 /// The successor's wait where NO holder is expected (every prelude call
-/// below but the collision pin): the predicate is never consulted, the
-/// bound is the shipped default's guard.
+/// below but the collision pin, where its `|| false` IS the live-mount
+/// verdict): the bound is the shipped default's guard.
 const NO_HOLDER: squeezefs::config_ops::SuccessorWait<'static> =
     squeezefs::config_ops::SuccessorWait {
         holder_is_dismounting: &|| false,
-        dismounting_bound: std::time::Duration::from_secs(80),
+        dismounting_bound: squeezefs::fuse_client::dismount_exit_guard(10),
     };
 
 /// A minimal-but-complete format config (the `base_format_config` fixture

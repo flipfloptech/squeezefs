@@ -2684,10 +2684,17 @@ impl BackendRouter {
     /// same `(node, mount slot)` identity, re-holding the allocation lease
     /// as own residue) may have re-carved. Per-mount state on purpose —
     /// the in-process suites run several mount lifetimes per process.
-    pub fn close_data_plane_at_dismount(&self) {
-        self.default_device.close_at_dismount();
-        for backend in self.backends.iter() {
-            backend.value().device.close_at_dismount();
+    pub async fn close_data_plane_at_dismount(&self) {
+        // The word FIRST on every device (no new submission passes the
+        // gate), then every device's write lanes DRAINED (a DMA admitted
+        // before the word completes before the close is published), then
+        // the reclaim queue's device commands.
+        let devices = self.distinct_data_devices();
+        for dev in &devices {
+            dev.close_at_dismount();
+        }
+        for dev in &devices {
+            dev.drain_write_lanes_at_dismount().await;
         }
         self.reclaim.close_at_dismount();
     }

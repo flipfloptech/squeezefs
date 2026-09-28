@@ -1925,6 +1925,22 @@ impl NvmeBlockDev {
         }
     }
 
+    /// The dismount close's drain half: park until every write lane's
+    /// completions reach the watermark submitted before the word landed —
+    /// so a DMA admitted an instant before [`Self::close_at_dismount`]
+    /// has completed before the close is published. A lane whose worker
+    /// died is logged; the close stands regardless (nothing can submit
+    /// past the word).
+    pub async fn drain_write_lanes_at_dismount(&self) {
+        if let Err(e) = self.drain_write_lanes().await {
+            log::warn!(
+                "data volume {}: write-lane drain at the dismount close failed ({e}) — the \
+                 gate is closed; the lane's in-flight writes complete or fail on their own",
+                self.device_path
+            );
+        }
+    }
+
     /// `true` ⇔ [`Self::close_at_dismount`] ran on this device.
     pub fn dismounted(&self) -> bool {
         self.fence

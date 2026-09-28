@@ -2959,14 +2959,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // (record §4.4bx: a successor parked on a dismounting
                 // predecessor's staging-root lock reports the guard it
                 // waits under — `progress-deadline: <secs>` — and the
-                // parent waits that long plus its own margin instead of
-                // SIGKILLing a healthy child at 30 s with a wedge message).
-                let mut deadline = start + std::time::Duration::from_secs(30);
+                // parent gives it that long PLUS the bootstrap's own 30 s
+                // for everything after the wait, instead of SIGKILLing a
+                // healthy child at 30 s with a wedge message). The child's
+                // word is bounded before it reaches the clock: a value past
+                // `PROGRESS_DEADLINE_MAX_SECS` (the guard of a `dismount_wait`
+                // of one day — no legitimate teardown is longer) is clamped,
+                // so no word can overflow the `Instant` or the `poll` timeout.
+                const BOOTSTRAP_DEADLINE_SECS: u64 = 30;
+                const PROGRESS_DEADLINE_MAX_SECS: u64 = 2 * 86_400 + 60;
+                let mut deadline = start + std::time::Duration::from_secs(BOOTSTRAP_DEADLINE_SECS);
                 let mut progress_seen = 0usize;
                 loop {
                     let timeout = deadline
                         .saturating_duration_since(std::time::Instant::now())
-                        .as_millis() as i32;
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32;
                     if timeout == 0 {
                         break;
                     }
@@ -3011,7 +3019,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .and_then(|v| v.trim().parse::<u64>().ok())
                         {
                             let extended = std::time::Instant::now()
-                                + std::time::Duration::from_secs(secs.saturating_add(5));
+                                + std::time::Duration::from_secs(
+                                    secs.min(PROGRESS_DEADLINE_MAX_SECS) + BOOTSTRAP_DEADLINE_SECS,
+                                );
                             if extended > deadline {
                                 deadline = extended;
                             }

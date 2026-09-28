@@ -447,10 +447,9 @@ async fn the_dismount_teardown_closes_the_data_plane_to_the_workers_that_outlive
         }
         other => panic!("the dismount class is a typed refusal, got {other:?}"),
     }
-    assert_eq!(
-        METRICS.data_dma_dismount_refusals.load(Ordering::Relaxed) - refusals0,
-        1
-    );
+    // A process-global counter beside sibling tests that also destroy and
+    // DMA: exact under `--test-threads=1`, at least ours in parallel.
+    assert!(METRICS.data_dma_dismount_refusals.load(Ordering::Relaxed) > refusals0);
 
     // The reclaim queue: a free enqueued past the teardown issues no
     // device command.

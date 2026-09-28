@@ -25719,6 +25719,41 @@ impl SqueezefsFilesystem {
         // frees).
         self.router.backend_router.reclaim_drain().await;
 
+        // Record §4.4bx (review round 1 Issue 1, round 2 Issue 12): CLOSE
+        // this mount's DATA plane here — after the last device act the
+        // teardown owns (the drain above) and BEFORE `vol.shutdown()`
+        // releases the D0 guard below, so no writer can be admitted to the
+        // set while this process's DMA door is still open. The staging
+        // root is handed to the next mount at this mount point the instant
+        // `dismount_complete` is published (`start_mount` releases the
+        // liveness locks on it), while this process's writeback ladder,
+        // merge worker and reclaimer run until exit: a post-teardown retry
+        // must never DMA (the device gate) or discard (the reclaim queue)
+        // on an offset the successor may already own, and the close DRAINS
+        // every write lane so "closed" also means "nothing of ours is in
+        // flight". A refused unit stays staged for the successor — never a
+        // loss, never a fence. Everything below is metadata.
+        //
+        // TEST SEAM (`SQUEEZEFS_TEST_DISMOUNT_HOLD_MS`, record §4.4bx):
+        // hold the teardown OPEN here — mount gone, staging root still
+        // ours — so a successor at this mount point meets a dismounting
+        // predecessor for longer than the exit-grade bound (the field's
+        // full-volume retire wait does it without a seam). Read once;
+        // zero cost unset; never set in production.
+        {
+            static HOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let hold = *HOLD_MS.get_or_init(|| {
+                crate::env_knobs::int_knob("SQUEEZEFS_TEST_DISMOUNT_HOLD_MS", 0u64)
+            });
+            if hold > 0 {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+        }
+        self.router
+            .backend_router
+            .close_data_plane_at_dismount()
+            .await;
+
         // The census, in its two classes. `active_block:` records are
         // unflushed write custody — the WARN. Everything else is a
         // staged-LAYOUT file the promotion pass above left resident
@@ -25793,34 +25828,6 @@ impl SqueezefsFilesystem {
                 }
             }
         }
-
-        // Record §4.4bx (review Issue 1): the teardown's TERMINAL step
-        // closes this mount's DATA plane — `vol.shutdown()` closed the
-        // metadata one above. The staging root is handed to the next
-        // mount at this mount point the instant `dismount_complete` is
-        // published (`start_mount` releases the liveness locks on it),
-        // while this process's writeback ladder, merge worker and
-        // reclaimer run until exit: a post-teardown retry must never DMA
-        // (the device gate) or discard (the reclaim queue) on an offset
-        // the successor may already own. Its refused unit stays
-        // staged for the successor — never a loss, never a fence.
-        //
-        // TEST SEAM (`SQUEEZEFS_TEST_DISMOUNT_HOLD_MS`, record §4.4bx):
-        // hold the teardown OPEN here — mount gone, staging root still
-        // ours — so a successor at this mount point meets a dismounting
-        // predecessor for longer than the exit-grade bound (the field's
-        // full-volume retire wait does it without a seam). Read once;
-        // zero cost unset; never set in production.
-        {
-            static HOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let hold = *HOLD_MS.get_or_init(|| {
-                crate::env_knobs::int_knob("SQUEEZEFS_TEST_DISMOUNT_HOLD_MS", 0u64)
-            });
-            if hold > 0 {
-                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
-            }
-        }
-        self.router.backend_router.close_data_plane_at_dismount();
     }
 
     /// Wait until the dismount teardown (spawned by the winning `destroy`
@@ -32074,7 +32081,7 @@ pub async fn start_mount<P: AsRef<Path>>(
 /// `dismount_wait`; a successor mounted with a different `--dismount-wait`
 /// than its predecessor judges by its own guard (stated on the
 /// operations page).
-pub fn dismount_exit_guard(dismount_wait_secs: u64) -> std::time::Duration {
+pub const fn dismount_exit_guard(dismount_wait_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(dismount_wait_secs.saturating_mul(2).saturating_add(60))
 }
 
@@ -32217,6 +32224,22 @@ async fn run_constant_writeback_worker(
         // RES-8: the never-lossy writeback unit rides this detached
         // task; a panic loses the block's retry with no record.
         crate::meta_exec::spawn_meta("writeback_upload", async move {
+            // Record §4.4bx: a unit received under a CLOSED data plane (the
+            // dismount teardown completed; the staging root is the next
+            // mount's) is left staged for the successor before any work —
+            // no guard taken, no allocation, no attempt to refuse.
+            let left_staged = |what: &str| {
+                log::info!(
+                    "Constant Writeback: ino {} block {} left staged for the next mount at this \
+                     mount point — the dismount teardown completed ({what})",
+                    req.ino,
+                    req.block_idx
+                );
+            };
+            if router_clone.backend_router.data_plane_dismounted() {
+                left_staged("received after the close");
+                return;
+            }
             let _permit = match sem_clone.acquire().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -32229,6 +32252,10 @@ async fn run_constant_writeback_worker(
             let meta = match router_clone.fetch_metadata(&file_path).await {
                 Ok(m) => m,
                 Err(e) => {
+                    if router_clone.backend_router.data_plane_dismounted() {
+                        left_staged("metadata fetch refused after the close");
+                        return;
+                    }
                     log::error!(
                         "Constant Writeback: Failed to fetch metadata for {}: {:?}",
                         req.ino,
@@ -32277,12 +32304,7 @@ async fn run_constant_writeback_worker(
                     // (every retry would refuse identically until exit;
                     // the retry ladder outlives the teardown by design).
                     if router_clone.backend_router.data_plane_dismounted() {
-                        log::info!(
-                            "Constant Writeback: ino {} block {} left staged for the next mount at \
-                             this mount point — the dismount teardown completed ({e:?})",
-                            req.ino,
-                            req.block_idx
-                        );
+                        left_staged(&format!("{e:?}"));
                         return;
                     }
                     if matches!(e, SqueezefsError::FencingTokenExpired { .. }) {
@@ -32811,10 +32833,22 @@ async fn flush_one_active_block(
         )
         .await
         {
-            error!(
-                "flush_one_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
-                b, ino, e
-            );
+            // Record §4.4bx: a refusal at a CLOSED data plane (the dismount
+            // teardown completed) is the designed disposition for a unit
+            // that outlived it — the bytes stay staged for the next mount
+            // at this mount point — never a device failure.
+            if nvme_writer.dismounted() {
+                info!(
+                    "flush_one_active_block: block {} of inode {} left staged for the next mount \
+                     at this mount point — the data plane closed at dismount ({e:?})",
+                    b, ino
+                );
+            } else {
+                error!(
+                    "flush_one_active_block: Failed to upload block {} of inode {} to NVMe: {:?}",
+                    b, ino, e
+                );
+            }
             minted.disarm();
             // Never-published: co-writer-aware abandon (d575be03 sweep —
             // a fenced co-writer's flush sweep is the convicted

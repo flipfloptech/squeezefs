@@ -3175,11 +3175,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // budget lets the kernel's RCU boost SIGKILL the whole daemon at the
     // first boosted tick — silently. Lifted HERE, in the process that will
     // run (the forked `--daemon` child), ahead of the bootstrap's volume
-    // probe: that probe already spins the blocking pool, and every thread
-    // this process spawns from now on is boostable. A `mount` under a zero
-    // that stands is REFUSED (the mount would die by statistics), over the
+    // probe so the REFUSAL comes first: a `mount` under a zero that stands
+    // is REFUSED (the mount would die by statistics) before any volume is
+    // read and before the probe's own refusals can pre-empt it, over the
     // handshake pipe — the child's stderr is /dev/null and the parent's
-    // console must name it. The verdict's log lines wait for logging.
+    // console must name it. (The limit is the thread group's, so the lift
+    // covers every thread whenever it runs; the order is about which
+    // refusal the operator sees.) The verdict's log lines wait for logging.
     let rttime_budget = squeezefs::lift_rttime_budget();
     if rttime_budget == squeezefs::RttimeBudget::ZeroStands
         && matches!(cli.command, Commands::Mount { .. })

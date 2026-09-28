@@ -3464,6 +3464,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the soft limit in force — raised BEFORE any listener reads it.
     squeezefs::cluster_wire::raise_nofile_soft_limit();
 
+    // Record §4.4bw: a desktop launcher's inherited ZERO realtime-CPU
+    // budget lets the kernel's RCU boost SIGKILL the whole daemon at the
+    // first boosted tick — silently. Lift it; a `mount` under a zero that
+    // stands is REFUSED (the mount would die by statistics), a finite
+    // budget that stands is announced loud (a slow fuse).
+    match squeezefs::lift_rttime_budget() {
+        squeezefs::RttimeBudget::Unlimited => {}
+        squeezefs::RttimeBudget::Lifted { was_us } => log::info!(
+            "RLIMIT_RTTIME lifted to unlimited (was {was_us} µs — a launcher-inherited \
+             realtime budget; at zero, one RCU-boosted tick SIGKILLs the daemon)"
+        ),
+        squeezefs::RttimeBudget::FiniteStands { hard_us } => log::warn!(
+            "RLIMIT_RTTIME hard limit is {hard_us} µs and could not be lifted: a CFS process's \
+             realtime budget only ever accumulates (the kernel's RCU boost hands this daemon's \
+             threads realtime ticks), so this mount will be SIGKILLed once it is spent — start \
+             from a session with an unlimited budget (a TTY / ssh login) or run \
+             `sudo prlimit --pid $$ --rttime=unlimited:unlimited` before mounting"
+        ),
+        squeezefs::RttimeBudget::ZeroStands => {
+            if matches!(cli.command, Commands::Mount { .. }) {
+                eprintln!(
+                    "Error: RLIMIT_RTTIME hard limit is 0 µs and could not be lifted — the \
+                     kernel's RCU boost SIGKILLs this daemon at the first realtime tick it \
+                     hands a daemon thread, silently (record §4.4bw: a desktop launcher's \
+                     inherited zero budget). Start the mount from a session with an \
+                     unlimited budget (a TTY / ssh login, or `sudo prlimit --pid $$ \
+                     --rttime=unlimited:unlimited` in the invoking shell)."
+                );
+                std::process::exit(1);
+            }
+            log::warn!(
+                "RLIMIT_RTTIME hard limit is 0 µs and could not be lifted — a launcher-inherited \
+                 zero realtime budget (record §4.4bw); a long-running verb under it can be \
+                 SIGKILLed at the first RCU-boosted tick"
+            );
+        }
+    }
+
     // rip-tokio-total: no runtime in the surviving process. The CLI
     // future runs on THIS thread's park loop; every venue is first-party
     // (fuse3 lanes own the handlers and their pinning, sqz-meta owns the

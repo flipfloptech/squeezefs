@@ -364,6 +364,94 @@ pub fn sanitized_root_path(input: &str) -> String {
     kept.join(":")
 }
 
+/// The daemon's verdict on its inherited realtime-CPU budget
+/// (`RLIMIT_RTTIME` — record §4.4bw): what [`lift_rttime_budget`] found
+/// and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RttimeBudget {
+    /// The budget was unlimited as found — nothing to do.
+    Unlimited,
+    /// A finite budget was found and lifted to unlimited (the hard limit
+    /// was root's to raise, or the soft sat below an unlimited hard).
+    Lifted { was_us: u64 },
+    /// A ZERO budget stands and could not be lifted: every realtime tick
+    /// the kernel's RCU boost hands a daemon thread is a SIGKILL of the
+    /// whole daemon — a mount that WILL die silently under load. Refused.
+    ZeroStands,
+    /// A finite non-zero budget stands and could not be lifted: a slow
+    /// fuse (`rt.timeout` only ever accumulates on a CFS process) — the
+    /// mount proceeds, loud.
+    FiniteStands { hard_us: u64 },
+}
+
+/// The pure law over `(soft, hard)` as `getrlimit(RLIMIT_RTTIME)` reports
+/// them (`RLIM_INFINITY` = unlimited), and whether the lift succeeded.
+pub fn rttime_budget_verdict(soft: u64, hard: u64, lifted: bool) -> RttimeBudget {
+    if soft == libc::RLIM_INFINITY && hard == libc::RLIM_INFINITY {
+        return RttimeBudget::Unlimited;
+    }
+    if lifted {
+        return RttimeBudget::Lifted {
+            was_us: soft.min(hard),
+        };
+    }
+    if soft.min(hard) == 0 {
+        RttimeBudget::ZeroStands
+    } else {
+        RttimeBudget::FiniteStands {
+            hard_us: soft.min(hard),
+        }
+    }
+}
+
+/// Lift the daemon's `RLIMIT_RTTIME` to unlimited, once at startup (record
+/// §4.4bw). A desktop launcher can hand every process it spawns a ZERO
+/// realtime-CPU budget (Omarchy's `quickshell` — `0/0` under an unlimited
+/// parent), and the kernel's RCU-boost kthreads (`CONFIG_RCU_BOOST`)
+/// priority-inherit an ordinary task caught in a preempted RCU read
+/// section into the realtime class for one tick; at a zero budget that
+/// tick trips the RT watchdog and the kernel SIGKILLs the whole thread
+/// group — silently (no OOM report, no log line). The daemon's `sqz-*` /
+/// `fuse3-ur` threads are boostable like any CFS task, so a long-lived
+/// mount under such a budget dies by statistics. The soft limit is raised
+/// to the hard one always; the hard limit to unlimited where the process
+/// may (root, `CAP_SYS_RESOURCE`). Returns the verdict; the caller decides
+/// (`mount` refuses `ZeroStands`, warns on `FiniteStands`).
+pub fn lift_rttime_budget() -> RttimeBudget {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit into and from a stack struct with
+    // process-scoped constant arguments.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_RTTIME, &mut rl) != 0 {
+            // No reading: treat as unlimited (every Linux kernel answers).
+            return RttimeBudget::Unlimited;
+        }
+        let (soft, hard) = (rl.rlim_cur, rl.rlim_max);
+        if soft == libc::RLIM_INFINITY && hard == libc::RLIM_INFINITY {
+            return RttimeBudget::Unlimited;
+        }
+        let want = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        let mut lifted = libc::setrlimit(libc::RLIMIT_RTTIME, &want) == 0;
+        if !lifted && hard != libc::RLIM_INFINITY && soft != hard {
+            // The hard limit is not ours to raise; the soft is.
+            let want = libc::rlimit {
+                rlim_cur: hard,
+                rlim_max: hard,
+            };
+            if libc::setrlimit(libc::RLIMIT_RTTIME, &want) == 0 && hard == libc::RLIM_INFINITY {
+                lifted = true;
+            }
+        }
+        rttime_budget_verdict(soft, hard, lifted)
+    }
+}
+
 /// Apply [`sanitized_root_path`] to this process's `PATH` when running
 /// with euid 0 — one call at startup covers every root subprocess site.
 /// A no-op for unprivileged runs (there the caller's `PATH` is the

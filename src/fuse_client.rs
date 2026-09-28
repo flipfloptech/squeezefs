@@ -24681,7 +24681,7 @@ impl SqueezefsFilesystem {
     }
 
     /// `true` ⇔ the dismount teardown that [`Self::dismount_started`]
-    /// names has run to its terminal step (the data plane closed, the
+    /// names has run to its end (the data plane closed, the
     /// staging ownership ended).
     pub fn dismount_complete(&self) -> bool {
         self.dismount_complete.load(Ordering::Acquire)
@@ -25675,7 +25675,8 @@ impl SqueezefsFilesystem {
         // each bounded by it; its WORK steps (the block sweep, this pass)
         // run to completion, bounded by the work itself — one block + one
         // metadata commit per file — and the process-exit guard
-        // (`dismount_wait + 60 s`, `run_mount`) bounds the whole teardown.
+        // (`dismount_exit_guard` = 2 × `dismount_wait` + 60 s, `run_mount`)
+        // bounds the whole teardown.
         let promoted = self.promote_all_staged_files_at_dismount().await;
         // Every open pack seals AFTER the pass's last promotion and before
         // "Dismount clean" (design-small-file-packing §5.3 (b)): the pin
@@ -32048,7 +32049,7 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     // Record §4.4bx: the staging-root liveness locks guard the STAGING
     // OWNERSHIP, and that ends with the dismount teardown (its census is
-    // the last staging act, its terminal step closed this mount's data
+    // the last staging act, its data-plane close shut this mount's data
     // plane to every worker that outlives it, and the IPC host — the other
     // staging writer — is down above), never with the process. Released
     // HERE so the next mount at this mount point adopts the residue

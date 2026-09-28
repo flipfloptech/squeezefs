@@ -815,7 +815,7 @@ pub struct ReclaimQueue {
     /// — `failed` never clears in-process).
     halted: AtomicBool,
     /// Record §4.4bx: the clean-unmount twin of `halted` — set by
-    /// [`Self::close_at_dismount`] at the dismount teardown's terminal step
+    /// [`Self::close_at_dismount`] at the dismount teardown's data-plane close
     /// (after the teardown's own drain issued every reclaim it owned); a
     /// discard enqueued past it would land on an offset the next mount at
     /// this mount point may have re-carved. Its own count, never the fence.

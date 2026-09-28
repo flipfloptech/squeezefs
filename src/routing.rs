@@ -2674,7 +2674,8 @@ impl BackendRouter {
     }
 
     /// Record §4.4bx: close this mount's DATA plane at the dismount
-    /// teardown's terminal step — every device's DMA gate
+    /// teardown's data-plane close — after its last device act, ahead of
+    /// the metadata plane's D0 release — every device's DMA gate
     /// (`NvmeBlockDev::close_at_dismount`) and the reclaim queue's device
     /// commands (`ReclaimQueue::close_at_dismount`) refuse from here, the
     /// way `vol.shutdown()` closes the metadata plane. The staging root

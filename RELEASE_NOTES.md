@@ -420,8 +420,8 @@ mount is a read-token client whose metadata is exact at the next resolve
   its staging root's liveness lock until process exit, and the new mount
   waited only 2 s — a dismount longer than that (a full volume's 10-s
   writeback-retire wait, a large parked backlog) refused the successor.
-  The lock is now released when the dismount teardown completes — whose
-  last act also closes the daemon's data plane, so a writeback retry that
+  The lock is now released when the dismount teardown completes — which
+  also closes the daemon's data plane, so a writeback retry that
   outlives the teardown never lands on a block the next mount may own — and
   a successor at the same mount point waits for a dismounting predecessor
   up to its exit guard (2 × `dismount_wait` + 60 s; a `--daemon` parent's

@@ -2967,7 +2967,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // of one day — no legitimate teardown is longer) is clamped,
                 // so no word can overflow the `Instant` or the `poll` timeout.
                 const BOOTSTRAP_DEADLINE_SECS: u64 = 30;
-                const PROGRESS_DEADLINE_MAX_SECS: u64 = 2 * 86_400 + 60;
+                const PROGRESS_DEADLINE_MAX_SECS: u64 =
+                    squeezefs::fuse_client::dismount_exit_guard(86_400).as_secs();
                 let mut deadline = start + std::time::Duration::from_secs(BOOTSTRAP_DEADLINE_SECS);
                 let mut progress_seen = 0usize;
                 loop {

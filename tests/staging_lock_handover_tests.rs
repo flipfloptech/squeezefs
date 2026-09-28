@@ -412,7 +412,7 @@ fn a_successor_mount_lands_while_its_predecessors_exit_outlives_the_dismount() {
 
 /// Law 2 LIVE, in the fstests shape, composed with the `mount --daemon`
 /// parent's readiness deadline (review round 1, Issues 2 and 5): the
-/// predecessor's dismount teardown is held 34 s open at its terminal step
+/// predecessor's dismount teardown is held 34 s open before its data-plane close
 /// (`SQUEEZEFS_TEST_DISMOUNT_HOLD_MS` — mount gone, staging root still its
 /// own), `fusermount3 -u` returns at once, and a `--daemon` successor is
 /// started IMMEDIATELY. It meets the held lock, classifies the holder as

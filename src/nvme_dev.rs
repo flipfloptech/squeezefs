@@ -1439,7 +1439,7 @@ pub(crate) struct DeviceFence {
     signal: std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
     halted: std::sync::atomic::AtomicBool,
     /// Record §4.4bx: the clean-unmount twin of `halted` — set at the
-    /// dismount teardown's terminal step (`NvmeBlockDev::close_at_dismount`,
+    /// dismount teardown's data-plane close (`NvmeBlockDev::close_at_dismount`,
     /// the metadata plane's `vol.shutdown()` for the DATA namespace). The
     /// staging root is the next mount's from that instant while this
     /// process's writeback ladder runs until exit, so a post-teardown
@@ -1905,7 +1905,7 @@ impl NvmeBlockDev {
     }
 
     /// Record §4.4bx: close this device's data plane at the dismount
-    /// teardown's terminal step — every later DMA submission is refused
+    /// teardown's data-plane close — every later DMA submission is refused
     /// in the dismount class (`data_dma_dismount_refusals`), the unit's
     /// bytes staying staged for the next mount at this mount point.
     /// Shared across clones (the fence word is), idempotent, loud once.

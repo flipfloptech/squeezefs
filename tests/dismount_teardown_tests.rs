@@ -387,3 +387,107 @@ async fn test_cancelled_destroy_still_deregisters_heartbeat_records() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+// ===========================================================================
+// Record §4.4bx (review round 1, Issue 1): the teardown's terminal step
+// CLOSES this mount's data plane — the staging root is the next mount's
+// from the instant the teardown completes, while this process's writeback
+// ladder, merge worker and reclaimer run until exit.
+// ===========================================================================
+
+/// After `destroy` the device gate refuses every DMA in its own class
+/// (`EROFS`, `data_dma_dismount_refusals` — never the fence: a clean
+/// unmount poisons nothing), the reclaim queue issues no device command
+/// (`block_free_reclaim_dismount_halts`), and a staged unit the closed
+/// plane refuses STAYS staged for the successor. RED on the round-1
+/// build: the post-teardown DMA landed and the reclaim punched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_dismount_teardown_closes_the_data_plane_to_the_workers_that_outlive_it() {
+    use squeezefs::fuse_client::METRICS;
+    use std::sync::atomic::Ordering;
+    let (fs, req, _b, _m) = make().await;
+    let dev = fs.router.backend_router.default_device.clone();
+    let ba = fs.router.backend_router.default_allocator.clone();
+    let block = bytes::Bytes::from(vec![0x42u8; 4096]);
+    assert!(!fs.router.backend_router.data_plane_dismounted());
+    dev.write_block(0, block.clone())
+        .await
+        .expect("a DMA lands on a serving mount");
+    // A published block to free AFTER the teardown (the post-teardown
+    // abandon/free shape).
+    let victim = ba.allocate_block().await.expect("allocate");
+    ba.publish_block(victim);
+
+    let refusals0 = METRICS.data_dma_dismount_refusals.load(Ordering::Relaxed);
+    let halts0 = METRICS
+        .block_free_reclaim_dismount_halts
+        .load(Ordering::Relaxed);
+    let punches0 = METRICS.block_free_file_punches.load(Ordering::Relaxed);
+
+    fs.destroy(req).await;
+    assert!(fs.dismount_started() && fs.dismount_complete());
+    assert!(
+        fs.router.backend_router.data_plane_dismounted(),
+        "the teardown's terminal step closes the data plane"
+    );
+    assert!(
+        !squeezefs::data_custody::poisoned(),
+        "a clean unmount is not a fence"
+    );
+
+    // The device gate: its own class, counted.
+    let err = dev
+        .write_block(0, block)
+        .await
+        .expect_err("a post-teardown DMA is refused");
+    match &err {
+        squeezefs::error::SqueezefsError::Refused { errno, msg } => {
+            assert_eq!(*errno, libc::EROFS, "{msg}");
+            assert!(msg.contains("dismount teardown completed"), "{msg}");
+        }
+        other => panic!("the dismount class is a typed refusal, got {other:?}"),
+    }
+    assert_eq!(
+        METRICS.data_dma_dismount_refusals.load(Ordering::Relaxed) - refusals0,
+        1
+    );
+
+    // The reclaim queue: a free enqueued past the teardown issues no
+    // device command.
+    fs.router
+        .backend_router
+        .free_block(&victim.to_string())
+        .await
+        .expect("the terminal free itself is admitted");
+    fs.router.backend_router.reclaim_drain().await;
+    assert!(
+        METRICS
+            .block_free_reclaim_dismount_halts
+            .load(Ordering::Relaxed)
+            > halts0,
+        "the reclaim entry is halted in the dismount class"
+    );
+    assert_eq!(
+        METRICS.block_free_file_punches.load(Ordering::Relaxed),
+        punches0,
+        "no discard reaches the device past the teardown"
+    );
+
+    // A unit the closed plane refuses stays STAGED for the successor.
+    let key = "active_block:inode_991003:block_0";
+    assert!(fs.router.cache.nvme.put_active_block(key, &[0xCC; 4096], 1));
+    let summary = fs.flush_all_staged_blocks_to_backend().await;
+    assert!(
+        summary.failed >= 1,
+        "the sweep's upload meets the closed gate: {summary:?}"
+    );
+    assert!(
+        fs.router
+            .cache
+            .nvme
+            .list_staged_files()
+            .iter()
+            .any(|k| k == key),
+        "the refused unit's bytes stay staged"
+    );
+}

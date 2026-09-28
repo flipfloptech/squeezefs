@@ -29,10 +29,18 @@ use std::time::{Duration, Instant};
 
 use squeezefs::config_ops::{
     fuse_mount_present_in, hold_staging_root_lock, hold_staging_root_lock_waiting,
-    release_staging_root_locks, staging_root_owner_is_live, STAGING_OWNER_LOCK,
+    release_staging_root_locks, staging_root_owner_is_live, SuccessorWait, STAGING_OWNER_LOCK,
 };
 use squeezefs::fuse_client::dismount_exit_guard;
 use squeezefs_testkit::{mount_supported, site};
+
+/// A successor's wait with the holder's class injected.
+fn wait<'a>(dismounting: &'a dyn Fn() -> bool, bound: Duration) -> SuccessorWait<'a> {
+    SuccessorWait {
+        holder_is_dismounting: dismounting,
+        dismounting_bound: bound,
+    }
+}
 
 const MIB: u64 = 1024 * 1024;
 
@@ -82,7 +90,7 @@ async fn a_successor_waits_for_a_dismounting_holder_and_refuses_a_live_collision
         release_staging_root_locks();
     });
     let start = Instant::now();
-    hold_staging_root_lock_waiting(&root, &|| true, dismount_exit_guard(10))
+    hold_staging_root_lock_waiting(&root, &wait(&|| true, dismount_exit_guard(10)))
         .await
         .expect("a dismounting holder is waited for and the lock lands");
     let waited = start.elapsed();
@@ -97,7 +105,7 @@ async fn a_successor_waits_for_a_dismounting_holder_and_refuses_a_live_collision
     // point — is refused right after the exit-grade bound.
     hold_staging_root_lock(&root).expect("the collider takes the lock");
     let start = Instant::now();
-    let err = hold_staging_root_lock_waiting(&root, &|| false, dismount_exit_guard(10))
+    let err = hold_staging_root_lock_waiting(&root, &wait(&|| false, dismount_exit_guard(10)))
         .await
         .expect_err("a live collision is refused");
     let waited = start.elapsed();
@@ -113,7 +121,7 @@ async fn a_successor_waits_for_a_dismounting_holder_and_refuses_a_live_collision
     // Arm 3: a dismounting holder past the exit guard is wedged — refused,
     // naming the guard.
     let start = Instant::now();
-    let err = hold_staging_root_lock_waiting(&root, &|| true, Duration::from_secs(3))
+    let err = hold_staging_root_lock_waiting(&root, &wait(&|| true, Duration::from_secs(3)))
         .await
         .expect_err("a holder past the exit guard is refused");
     let waited = start.elapsed();
@@ -203,6 +211,18 @@ impl Drop for Mount {
 /// A foreground `mount` (the daemon is the child itself), optionally with
 /// the exit held `exit_hold_ms` past its teardown.
 fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, exit_hold_ms: u64) -> Mount {
+    let hold = exit_hold_ms.to_string();
+    let env: &[(&str, &str)] = if exit_hold_ms > 0 {
+        &[("SQUEEZEFS_TEST_EXIT_HOLD_MS", hold.as_str())]
+    } else {
+        &[]
+    };
+    spawn_mount_with_env(meta, mnt, log, env)
+}
+
+/// A foreground `mount` with the given seams in its environment; returns
+/// once the mount serves `.stats`.
+fn spawn_mount_with_env(meta: &Path, mnt: &Path, log: &Path, env: &[(&str, &str)]) -> Mount {
     std::fs::create_dir_all(mnt).expect("create mountpoint");
     let logf = std::fs::File::create(log).expect("create log");
     let mut cmd = Command::new(bin());
@@ -216,8 +236,8 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, exit_hold_ms: u64) -> Mount 
         .stdin(Stdio::null())
         .stdout(Stdio::from(logf.try_clone().expect("clone log fd")))
         .stderr(Stdio::from(logf));
-    if exit_hold_ms > 0 {
-        cmd.env("SQUEEZEFS_TEST_EXIT_HOLD_MS", exit_hold_ms.to_string());
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let child = cmd.spawn().expect("spawn squeezefs mount");
     let mount = Mount {
@@ -238,6 +258,45 @@ fn spawn_mount(meta: &Path, mnt: &Path, log: &Path, exit_hold_ms: u64) -> Mount 
         std::thread::sleep(Duration::from_millis(100));
     }
     mount
+}
+
+/// Event-driven wait for process exit (pidfd), bounded.
+fn wait_exit(child: &mut Child, bound: Duration) -> Option<Duration> {
+    let started = Instant::now();
+    // SAFETY: pidfd_open on our own child's pid; the fd is closed below.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+    assert!(
+        pidfd >= 0,
+        "pidfd_open: {}",
+        std::io::Error::last_os_error()
+    );
+    let deadline = started + bound;
+    let exited = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break false;
+        }
+        let mut pfd = libc::pollfd {
+            fd: pidfd as libc::c_int,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is valid for the duration of the call.
+        match unsafe { libc::poll(&mut pfd, 1, remaining.as_millis().clamp(1, 60_000) as i32) } {
+            1 => break true,
+            0 => continue,
+            _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => continue,
+            rc => panic!("poll(pidfd) rc {rc}: {}", std::io::Error::last_os_error()),
+        }
+    };
+    // SAFETY: closing the fd this function opened.
+    unsafe { libc::close(pidfd as libc::c_int) };
+    if exited {
+        let _ = child.wait();
+        Some(started.elapsed())
+    } else {
+        None
+    }
 }
 
 fn is_mounted(mnt: &Path) -> bool {
@@ -323,6 +382,10 @@ fn a_successor_mount_lands_while_its_predecessors_exit_outlives_the_dismount() {
         "the predecessor must still be alive when its lock frees (the seam holds its exit) \
          — otherwise this pin observed the process exit, not the teardown's release"
     );
+    assert!(
+        freed_at.duration_since(unmounted_at) < Duration::from_secs(8),
+        "the release trails the unmount by the teardown alone"
+    );
 
     // The successor, at once: the fstests `_scratch_unmount; _scratch_mount`
     // shape. It must land while the predecessor is still up.
@@ -341,9 +404,115 @@ fn a_successor_mount_lands_while_its_predecessors_exit_outlives_the_dismount() {
         !second_log.contains("HELD by a live process"),
         "the successor must never meet the collision refusal; log:\n{second_log}"
     );
-    let _ = freed_at;
     drop(second);
     assert!(!is_mounted(&mnt));
     let _ = first.child.wait();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Law 2 LIVE, in the fstests shape, composed with the `mount --daemon`
+/// parent's readiness deadline (review round 1, Issues 2 and 5): the
+/// predecessor's dismount teardown is held 34 s open at its terminal step
+/// (`SQUEEZEFS_TEST_DISMOUNT_HOLD_MS` — mount gone, staging root still its
+/// own), `fusermount3 -u` returns at once, and a `--daemon` successor is
+/// started IMMEDIATELY. It meets the held lock, classifies the holder as
+/// dismounting (no FUSE mount at the mount point), waits past the 2-s
+/// exit-grade bound AND past its parent's fixed 30-s readiness deadline
+/// (the child reports the bound it waits under on the handshake pipe and
+/// the parent stretches its deadline), lands when the teardown completes,
+/// and serves the predecessor's bytes. RED on the round-1 build: the
+/// successor was SIGKILLed by its own parent at 30 s ("mount did not
+/// become ready within 30 seconds") while the predecessor was healthy
+/// inside its guard; RED on the base: refused at 2 s.
+#[test]
+fn a_daemon_successor_waits_out_a_dismounting_predecessor_past_the_parents_deadline() {
+    if !mount_supported(site!()) {
+        return;
+    }
+    let base = scratch("daemon");
+    let meta = format_volume(&base);
+    let mnt = base.join("mnt");
+
+    let mut first = spawn_mount_with_env(
+        &meta,
+        &mnt,
+        &base.join("first.log"),
+        &[("SQUEEZEFS_TEST_DISMOUNT_HOLD_MS", "34000")],
+    );
+    std::fs::write(mnt.join("f"), b"predecessor bytes").expect("write through the mount");
+    let root = owned_staging_root(&base);
+
+    let status = Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mnt)
+        .status()
+        .expect("fusermount3 -u");
+    assert!(status.success(), "the external unmount succeeds");
+    let unmounted_at = Instant::now();
+    assert!(!is_mounted(&mnt), "the kernel mount is gone");
+    assert!(
+        staging_root_owner_is_live(&root),
+        "the predecessor still owns its staging root inside its held teardown"
+    );
+
+    // The successor, at once, through the daemonizing parent.
+    let second_log = base.join("second.log");
+    let out = Command::new(bin())
+        .arg("mount")
+        .arg(format!("sqmeta://{}", meta.display()))
+        .arg(&mnt)
+        .arg("--daemon")
+        .arg("--uid")
+        .arg(unsafe { libc::getuid() }.to_string())
+        .arg("--gid")
+        .arg(unsafe { libc::getgid() }.to_string())
+        .arg("--log-file")
+        .arg(&second_log)
+        .output()
+        .expect("run the successor mount --daemon");
+    let landed_after = unmounted_at.elapsed();
+    let console = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = std::fs::read_to_string(&second_log).unwrap_or_default();
+    assert!(
+        out.status.success(),
+        "the successor must land once the predecessor's teardown completes; console:\n\
+         {console}\nlog tail:\n{}",
+        log.lines().rev().take(15).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        landed_after >= Duration::from_secs(30) && landed_after < Duration::from_secs(60),
+        "the successor waited out the 34-s held teardown, past its parent's 30-s deadline \
+         (landed {landed_after:?} after the unmount)"
+    );
+    assert!(
+        log.contains("still held by the previous mount's daemon"),
+        "the successor announces the wait once; log:\n{log}"
+    );
+    assert!(
+        !console.contains("not ready within 30 seconds") && !console.contains("HELD by a live"),
+        "neither the parent's deadline nor the collision refusal may fire; console:\n{console}"
+    );
+    assert_eq!(
+        std::fs::read(mnt.join("f")).expect("read back through the successor"),
+        b"predecessor bytes",
+        "the successor serves the predecessor's durable bytes"
+    );
+    assert!(
+        wait_exit(&mut first.child, Duration::from_secs(30)).is_some(),
+        "the predecessor exits once its held teardown completes"
+    );
+
+    // The successor is a detached daemon: unmount it and wait for the
+    // mount to go.
+    let _ = Command::new("fusermount3").arg("-u").arg(&mnt).status();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while is_mounted(&mnt) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!is_mounted(&mnt), "the successor unmounts cleanly");
     let _ = std::fs::remove_dir_all(&base);
 }

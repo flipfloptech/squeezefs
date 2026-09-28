@@ -1477,6 +1477,15 @@ async fn same_mount_point_successor_adopts_its_own_pair_residue() {
 // discard / collision), over the config_ops machinery the mount wires in
 // ---------------------------------------------------------------------------
 
+/// The successor's wait where NO holder is expected (every prelude call
+/// below but the collision pin): the predicate is never consulted, the
+/// bound is the shipped default's guard.
+const NO_HOLDER: squeezefs::config_ops::SuccessorWait<'static> =
+    squeezefs::config_ops::SuccessorWait {
+        holder_is_dismounting: &|| false,
+        dismounting_bound: std::time::Duration::from_secs(80),
+    };
+
 /// A minimal-but-complete format config (the `base_format_config` fixture
 /// shape the fsck suites use — `FormatConfig` has no serde defaults).
 fn mw1b_format_config() -> squeezefs::FormatConfig {
@@ -1623,7 +1632,7 @@ async fn moved_mount_point_residue_is_reported_until_discarded() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .expect("the mount proceeds — the residue is not ours to touch");
@@ -1653,7 +1662,7 @@ async fn moved_mount_point_residue_is_reported_until_discarded() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .unwrap();
@@ -1693,7 +1702,7 @@ async fn moved_mount_point_residue_is_reported_until_discarded() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .unwrap();
@@ -1751,7 +1760,7 @@ async fn staging_adopt_rebinds_durable_residue_for_the_next_mount() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .unwrap();
@@ -1807,7 +1816,7 @@ async fn client_slot_override_adopts_the_exact_pair_residue() {
         std::slice::from_ref(&own_dir),
         "/mnt/after",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .unwrap();
@@ -1844,7 +1853,7 @@ async fn a_live_pair_collision_refuses_the_mount_and_the_verbs() {
         std::slice::from_ref(&own_dir),
         "/mnt/second",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .expect_err("two LIVE mounts must never share one client identity")
@@ -1896,7 +1905,7 @@ async fn unscoped_mount_prelude_is_a_structural_noop() {
         std::slice::from_ref(&own),
         "/mnt/solo",
         set, // UN-decorated: the solo posture
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .unwrap();
@@ -1993,7 +2002,7 @@ async fn own_root_flock_race_with_dying_predecessor_is_absorbed() {
         std::slice::from_ref(&own_dir),
         "/mnt/racy",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .expect("a dying predecessor's flock is absorbed, never refused");
@@ -2011,11 +2020,17 @@ async fn own_root_flock_race_with_dying_predecessor_is_absorbed() {
     squeezefs::config_ops::release_staging_root_locks();
 }
 
-/// The posture half: a holder that NEVER releases is a genuinely live
-/// co-located mount collision — after the bounded wait expires the loud
-/// refusal is unchanged (message verbatim: names the root and the held
-/// flock). The wait-out absorbs teardown races; it never weakens the
-/// collision refusal.
+/// The posture half: a holder that NEVER releases while a FUSE mount
+/// stands at the mount point is a genuinely LIVE co-located collision —
+/// after the exit-grade wait expires the loud refusal is unchanged
+/// (message verbatim: names the root and the held flock). The wait-out
+/// absorbs teardown races; it never weakens the collision refusal. The
+/// holder's class is the prelude's `SuccessorWait` predicate (record
+/// §4.4bx: the production predicate is "no FUSE mount at the mount
+/// point ⇒ dismounting", pinned in `tests/staging_lock_handover_tests.rs`;
+/// here the live-mount verdict is injected so this pin stays the
+/// COLLISION arm — a dismounting holder is waited for up to its exit
+/// guard, the other arm).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn own_root_flock_held_by_live_holder_still_refuses_loud() {
     let _g = serial().await;
@@ -2043,18 +2058,22 @@ async fn own_root_flock_held_by_live_holder_still_refuses_loud() {
         std::slice::from_ref(&own_dir),
         "/mnt/live",
         &our_gen,
-        squeezefs::fuse_client::dismount_exit_guard(10),
+        &NO_HOLDER,
     )
     .await
     .expect_err("a live holder must still refuse")
     .to_string();
+    let waited = started.elapsed();
     assert!(
-        started.elapsed() >= std::time::Duration::from_secs(2),
-        "the refusal comes only after the full wait bound"
+        waited >= std::time::Duration::from_secs(2) && waited < std::time::Duration::from_secs(4),
+        "the refusal comes right after the exit-grade wait, never the dismounting guard \
+         (waited {waited:?})"
     );
     assert!(
-        err.contains("HELD by a live process") && err.contains("unmount it first"),
-        "the refusal text is unchanged: {err}"
+        err.contains("HELD by a live process")
+            && err.contains("must be unmounted first")
+            && !err.contains("wedged"),
+        "the collision refusal names the held flock and the remedy: {err}"
     );
     drop(holder);
     squeezefs::config_ops::release_staging_root_locks();

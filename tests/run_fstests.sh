@@ -359,11 +359,24 @@ fi
 # daemon on top of that races fencing/recovery and corrupts the volume, and a
 # daemon dying mid-teardown leaves the mountpoint ENOTCONN. Serialize: wait
 # (up to 60s) for any prior daemon on this device to exit before mounting.
+#
+# The liveness proof is the PID, never the command line (record §4.4bx):
+# `pgrep -f` matches /proc/PID/cmdline, which the kernel empties at
+# `exit_mm` — the release chain's generic/751 daemon went pgrep-blind at
+# its last log line and held its staging-root flock for the 13 s of
+# `exit_mmap` that followed (74 GiB, 82 GiB swapped), so the successor
+# this gate had released met the lock. `kill -0` sees the task until it
+# is gone.
+prior_pids="$(pgrep -f "squeezefs mount sqmeta://$DEV " 2>/dev/null || true)"
 for _ in $(seq 1 600); do
-    pgrep -f "squeezefs mount sqmeta://$DEV " >/dev/null 2>&1 || break
+    alive=""
+    for p in $prior_pids; do
+        kill -0 "$p" 2>/dev/null && alive=1
+    done
+    [ -z "$alive" ] && break
     sleep 0.1
 done
-if pgrep -f "squeezefs mount sqmeta://$DEV " >/dev/null 2>&1; then
+if [ -n "${alive:-}" ]; then
     echo "mount.fuse.squeezefs: previous daemon for $DEV still running after 60s" >&2
     exit 32
 fi

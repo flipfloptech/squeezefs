@@ -1877,6 +1877,19 @@ fn mount_bootstrap_fail(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// The bootstrap progress sink (`config_ops::install_bootstrap_progress_sink`,
+/// record §4.4bx): a complete `progress-deadline: <secs>\n` line on the
+/// daemonized child's handshake pipe, which the parent reads as "still
+/// bootstrapping, inside a bound of <secs>" and extends its readiness
+/// deadline by. A foreground mount has no pipe and reports nothing.
+#[cfg(unix)]
+fn daemon_pipe_progress(line: &str) {
+    let fd = DAEMON_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let _ = unsafe { libc::write(fd, line.as_ptr() as *const libc::c_void, line.len()) };
+    }
+}
+
 /// Bounded tail of the daemon log (the parent's last diagnostic when a
 /// child died without a pipe message — e.g. SIGKILL'd by the OOM killer).
 #[cfg(unix)]
@@ -2941,9 +2954,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     revents: 0,
                 };
 
+                // The readiness deadline: 30 s for the bootstrap, EXTENDED
+                // while the child reports a bounded wait it is inside
+                // (record §4.4bx: a successor parked on a dismounting
+                // predecessor's staging-root lock reports the guard it
+                // waits under — `progress-deadline: <secs>` — and the
+                // parent waits that long plus its own margin instead of
+                // SIGKILLing a healthy child at 30 s with a wedge message).
+                let mut deadline = start + std::time::Duration::from_secs(30);
+                let mut progress_seen = 0usize;
                 loop {
-                    let elapsed = start.elapsed().as_millis() as i32;
-                    let timeout = (30000 - elapsed).max(0);
+                    let timeout = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis() as i32;
                     if timeout == 0 {
                         break;
                     }
@@ -2974,6 +2997,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if child_output.contains("ready\n") {
                         ready = true;
                         break;
+                    }
+                    // Complete lines only — a partial read's tail is re-read
+                    // whole on the next pass.
+                    for line in child_output
+                        .split_inclusive('\n')
+                        .filter(|l| l.ends_with('\n'))
+                        .skip(progress_seen)
+                    {
+                        progress_seen += 1;
+                        if let Some(secs) = line
+                            .strip_prefix(squeezefs::config_ops::BOOTSTRAP_PROGRESS_DEADLINE_PREFIX)
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                        {
+                            let extended = std::time::Instant::now()
+                                + std::time::Duration::from_secs(secs.saturating_add(5));
+                            if extended > deadline {
+                                deadline = extended;
+                            }
+                        }
                     }
                     // A complete failure line ends the wait immediately —
                     // the child is exiting, not becoming ready.
@@ -3091,7 +3133,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 libc::close(pipefd[0]);
 
-                let reason = child_output.replace("ready\n", "");
+                let reason: String = child_output
+                    .split_inclusive('\n')
+                    .filter(|l| {
+                        *l != "ready\n"
+                            && !l.starts_with(
+                                squeezefs::config_ops::BOOTSTRAP_PROGRESS_DEADLINE_PREFIX,
+                            )
+                    })
+                    .collect();
                 let reason = reason.trim();
                 if !reason.is_empty() {
                     eprintln!("Failed to start squeezefs daemon:\n{}", reason);
@@ -5959,12 +6009,27 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if writer_scope.is_some() {
                 let containers: Vec<PathBuf> =
                     staging_dirs.iter().map(|d| d.join(&fs_name)).collect();
+                // Record §4.4bx: a holder of our root with no FUSE mount at
+                // this mount point is our predecessor inside its dismount —
+                // waited for up to its exit guard, the wait reported on the
+                // handshake pipe so a `--daemon` parent's readiness deadline
+                // stretches with it (a live collision refuses as before).
+                squeezefs::config_ops::install_bootstrap_progress_sink(daemon_pipe_progress);
+                let mount_path = std::path::Path::new(&canonical_mount);
+                let holder_is_dismounting =
+                    squeezefs::config_ops::dismounting_predecessor_at(mount_path);
+                let wait = squeezefs::config_ops::SuccessorWait {
+                    holder_is_dismounting: &holder_is_dismounting,
+                    dismounting_bound: squeezefs::fuse_client::dismount_exit_guard(
+                        resolved_dismount_wait,
+                    ),
+                };
                 let scan = squeezefs::config_ops::mount_scoped_staging_prelude(
                     &containers,
                     &active_staging_dirs,
                     &canonical_mount,
                     &staging_generation,
-                    squeezefs::fuse_client::dismount_exit_guard(resolved_dismount_wait),
+                    &wait,
                 )
                 .await?;
                 for dir in scan.adopted {

@@ -3187,11 +3187,14 @@ pub fn staging_root_owner_is_live(dir: &Path) -> bool {
     }
 }
 
-/// Release every parked staging-root liveness lock — the unmount/teardown
-/// half of [`hold_staging_root_lock`] (a daemon exit releases them anyway;
-/// the in-process suites simulate successive mounts and need the explicit
-/// release, because `flock` treats a second fd of one file in one process
-/// as a second owner).
+/// Release every parked staging-root liveness lock — the handover half of
+/// [`hold_staging_root_lock`]. The PRODUCTION caller is `start_mount`'s
+/// tail once the dismount teardown completed (record §4.4bx: the staging
+/// ownership ends there, and the next mount at this mount point adopts
+/// the residue without waiting out this process's exit); the in-process
+/// suites call it between the mount lifetimes they simulate, because
+/// `flock` treats a second fd of one file in one process as a second
+/// owner.
 pub fn release_staging_root_locks() {
     STAGING_ROOT_LOCKS
         .lock()
@@ -3222,6 +3225,34 @@ pub fn hold_staging_root_lock(dir: &Path) -> Result<()> {
                 dir.display()
             ),
         ))),
+    }
+}
+
+/// The bootstrap progress line a `mount --daemon` child writes on its
+/// handshake pipe when it enters a BOUNDED wait — `<prefix><secs>\n`, the
+/// bound in seconds — so the forking parent extends its readiness
+/// deadline for that phase instead of killing a healthy child at its
+/// fixed 30 s (record §4.4bx, review Issue 2). The one writer is
+/// [`hold_staging_root_lock_waiting`]'s dismounting-predecessor arm.
+pub const BOOTSTRAP_PROGRESS_DEADLINE_PREFIX: &str = "progress-deadline: ";
+
+/// Where the progress line goes: installed ONCE by the daemon's `main`
+/// (a write on the handshake pipe fd); absent in-process, where the
+/// line is only logged.
+static BOOTSTRAP_PROGRESS_SINK: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Install the bootstrap progress sink (see
+/// [`BOOTSTRAP_PROGRESS_DEADLINE_PREFIX`]). Later calls are no-ops.
+pub fn install_bootstrap_progress_sink(sink: fn(&str)) {
+    let _ = BOOTSTRAP_PROGRESS_SINK.set(sink);
+}
+
+fn report_bootstrap_deadline(bound: std::time::Duration) {
+    if let Some(sink) = BOOTSTRAP_PROGRESS_SINK.get() {
+        sink(&format!(
+            "{BOOTSTRAP_PROGRESS_DEADLINE_PREFIX}{}\n",
+            bound.as_secs()
+        ));
     }
 }
 
@@ -3263,6 +3294,26 @@ pub fn fuse_mount_present_in(mountinfo: &str, mount_point: &Path) -> bool {
     })
 }
 
+/// How a successor at a mount point waits for its OWN staging root's
+/// liveness lock when a holder stands (record §4.4bx): the holder's
+/// class is told by `holder_is_dismounting` — the production predicate is
+/// [`dismounting_predecessor_at`] (no FUSE mount at the mount point ⇒ the
+/// holder is our predecessor inside its dismount) — and a dismounting
+/// holder is waited for up to `dismounting_bound`, the predecessor's own
+/// process-exit guard ([`crate::fuse_client::dismount_exit_guard`]).
+pub struct SuccessorWait<'a> {
+    pub holder_is_dismounting: &'a dyn Fn() -> bool,
+    pub dismounting_bound: std::time::Duration,
+}
+
+/// The production holder-class predicate: a holder of this mount point's
+/// root is a DISMOUNTING predecessor iff no FUSE mount stands at the mount
+/// point (the kernel unmount precedes the teardown that still owns the
+/// root); a FUSE mount there is a live co-located collision.
+pub fn dismounting_predecessor_at(mount_point: &Path) -> impl Fn() -> bool + '_ {
+    move || !fuse_mount_present(mount_point)
+}
+
 /// [`hold_staging_root_lock`] with the teardown-race wait-out.
 ///
 /// `umount(8)` returns when the kernel FUSE connection closes, but the
@@ -3272,8 +3323,8 @@ pub fn fuse_mount_present_in(mountinfo: &str, mount_point: &Path) -> bool {
 /// teardown releases the lock, through its process exit. Two classes of
 /// holder, told apart by the MOUNT POINT (2026-08-16 generic/003's
 /// zero-dwell remount; record §4.4bx — the 1.3.0 release chain's
-/// generic/752 met a 13-second dismount on a genuinely full volume against
-/// the 2-second wait that stood here):
+/// generic/752 met a predecessor whose exit outlived its teardown by 13 s
+/// against the 2-second wait that stood here):
 ///
 /// * inside `TEARDOWN_FLOCK_WAIT` every holder is waited for (the
 ///   exit-grade release a dying holder frees within one poll pass);
@@ -3284,15 +3335,17 @@ pub fn fuse_mount_present_in(mountinfo: &str, mount_point: &Path) -> bool {
 ///   the one that adopts its residue: wait for it up to
 ///   `dismounting_bound` — the predecessor's own process-exit guard
 ///   ([`crate::fuse_client::dismount_exit_guard`], the same law on both
-///   sides) — then refuse loud: a holder past its own guard is wedged.
+///   sides), reported once on the bootstrap progress sink so a
+///   `mount --daemon` parent extends its readiness deadline — then refuse
+///   loud: a holder past its own guard is wedged, or is a live mount that
+///   owns this root from a path the predicate cannot see (a spelling
+///   variant of this mount point sharing the sanitized root name, a
+///   lazily detached mount, another mount namespace); the refusal names
+///   both.
 ///
 /// Used ONLY for the prelude's own-dirs arm; probes and adoption arms
 /// stay one-shot.
-pub async fn hold_staging_root_lock_waiting(
-    dir: &Path,
-    holder_is_dismounting: &dyn Fn() -> bool,
-    dismounting_bound: std::time::Duration,
-) -> Result<()> {
+pub async fn hold_staging_root_lock_waiting(dir: &Path, wait: &SuccessorWait<'_>) -> Result<()> {
     /// Generous vs. a daemon exit's ms-grade lock release; a live
     /// collision pays it once before the refusal.
     const TEARDOWN_FLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -3309,14 +3362,18 @@ pub async fn hold_staging_root_lock_waiting(
                     squeezefs_ipc::sqz_time::sleep(POLL).await;
                     continue;
                 }
-                if !holder_is_dismounting() {
+                if !(wait.holder_is_dismounting)() {
                     return Err(SqueezefsError::InvalidOperation(msg));
                 }
-                if waited >= dismounting_bound {
+                if waited >= wait.dismounting_bound {
                     return Err(SqueezefsError::InvalidOperation(format!(
-                        "{msg}; the holder's mount is gone and its dismount did not finish \
-                         within {dismounting_bound:?} — past its own exit guard, the \
-                         previous mount's daemon is wedged"
+                        "{msg}; no FUSE mount stands at this mount point and the holder did not \
+                         release within {:?} — either the previous mount's daemon is wedged \
+                         inside its dismount (past its own exit guard; `squeezefs clients` names \
+                         it), or a live mount owns this root from a path this mount cannot see \
+                         (a spelling variant of this mount point that sanitizes to the same \
+                         root name, a lazily detached mount, another mount namespace)",
+                        wait.dismounting_bound
                     )));
                 }
                 if !announced {
@@ -3324,9 +3381,11 @@ pub async fn hold_staging_root_lock_waiting(
                     log::info!(
                         "staging root {} is still held by the previous mount's daemon at this \
                          mount point (its mount is gone; its dismount teardown is running) — \
-                         waiting up to {dismounting_bound:?} for the handover",
-                        dir.display()
+                         waiting up to {:?} for the handover",
+                        dir.display(),
+                        wait.dismounting_bound
                     );
+                    report_bootstrap_deadline(wait.dismounting_bound.saturating_sub(waited));
                 }
                 squeezefs_ipc::sqz_time::sleep(DISMOUNT_POLL).await;
             }
@@ -3440,7 +3499,7 @@ pub async fn mount_scoped_staging_prelude(
     own_dirs: &[PathBuf],
     mount_point: &str,
     staging_generation: &str,
-    dismount_exit_guard: std::time::Duration,
+    wait: &SuccessorWait<'_>,
 ) -> Result<ScopedSiblingScan> {
     use crate::writer_scope::GenerationBinding;
     let (_, Some(ours)) = crate::writer_scope::split_staging_generation(staging_generation) else {
@@ -3449,18 +3508,16 @@ pub async fn mount_scoped_staging_prelude(
             residue: Vec::new(),
         });
     };
-    let mount_path = Path::new(mount_point);
-    let holder_is_dismounting = || !fuse_mount_present(mount_path);
     for dir in own_dirs {
         // The waiting form: absorbs the predecessor daemon's dismount and
         // exit racing a zero-dwell remount (see
         // `hold_staging_root_lock_waiting`).
-        hold_staging_root_lock_waiting(dir, &holder_is_dismounting, dismount_exit_guard)
+        hold_staging_root_lock_waiting(dir, wait)
             .await
             .map_err(|e| {
                 SqueezefsError::InvalidOperation(format!(
-                    "cannot own this mount's staging root: {e}. If a previous mount at this \
-                     mount point is still running, unmount it first",
+                    "cannot own this mount's staging root: {e}. A live mount at this mount \
+                     point must be unmounted first; a dismounting one is waited for",
                 ))
             })?;
     }

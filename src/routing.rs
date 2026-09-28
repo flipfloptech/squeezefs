@@ -2673,6 +2673,31 @@ impl BackendRouter {
         .await;
     }
 
+    /// Record §4.4bx: close this mount's DATA plane at the dismount
+    /// teardown's terminal step — every device's DMA gate
+    /// (`NvmeBlockDev::close_at_dismount`) and the reclaim queue's device
+    /// commands (`ReclaimQueue::close_at_dismount`) refuse from here, the
+    /// way `vol.shutdown()` closes the metadata plane. The staging root
+    /// is the next mount's the instant the teardown completes, while this
+    /// process's writeback ladder, merge worker and reclaimer run until
+    /// exit: nothing of theirs may reach an offset the successor (the
+    /// same `(node, mount slot)` identity, re-holding the allocation lease
+    /// as own residue) may have re-carved. Per-mount state on purpose —
+    /// the in-process suites run several mount lifetimes per process.
+    pub fn close_data_plane_at_dismount(&self) {
+        self.default_device.close_at_dismount();
+        for backend in self.backends.iter() {
+            backend.value().device.close_at_dismount();
+        }
+        self.reclaim.close_at_dismount();
+    }
+
+    /// `true` ⇔ [`Self::close_data_plane_at_dismount`] ran (the default
+    /// device carries the mount-wide word; every device closes together).
+    pub fn data_plane_dismounted(&self) -> bool {
+        self.default_device.dismounted()
+    }
+
     /// Wire the terminal-free read-tier purge (see the field doc). Called
     /// once by `DataRouter::new`; later calls are no-ops.
     pub fn set_read_tier_purge(&self, purge: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {

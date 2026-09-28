@@ -814,6 +814,12 @@ pub struct ReclaimQueue {
     /// PERMANENTLY for this queue (a fenced holder is dead until remount
     /// — `failed` never clears in-process).
     halted: AtomicBool,
+    /// Record §4.4bx: the clean-unmount twin of `halted` — set by
+    /// [`Self::close_at_dismount`] at the dismount teardown's terminal step
+    /// (after the teardown's own drain issued every reclaim it owned); a
+    /// discard enqueued past it would land on an offset the next mount at
+    /// this mount point may have re-carved. Its own count, never the fence.
+    dismounted: AtomicBool,
 
     batch_blocks: u64,
     batch_ms: u64,
@@ -914,6 +920,7 @@ impl ReclaimQueue {
             worker_armed: AtomicBool::new(false),
             fence_signal: std::sync::OnceLock::new(),
             halted: AtomicBool::new(false),
+            dismounted: AtomicBool::new(false),
             // Defaults are MEASURED constants (derivation-sweep filing —
             // honest measured evidence, never derivation theater):
             // batch 64 blocks / 2 ms = the shipped coalesce shape of the
@@ -1103,6 +1110,12 @@ impl ReclaimQueue {
     /// per batch and by the ENOSPC valve — one atomic load when already
     /// halted, one cheap probe (a few atomic loads over the meta set)
     /// otherwise. Latches sticky and loud on the first observation.
+    /// Record §4.4bx: close this queue's device commands at the dismount
+    /// teardown's terminal step (see the `dismounted` field). Idempotent.
+    pub fn close_at_dismount(&self) {
+        self.dismounted.store(true, Ordering::Release);
+    }
+
     pub(crate) fn fence_halted(&self) -> bool {
         if self.halted.load(Ordering::Acquire) {
             return true;
@@ -1644,6 +1657,18 @@ impl ReclaimQueue {
         if self.fence_halted() {
             METRICS
                 .block_free_reclaim_fence_halts
+                .fetch_add(entries.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        // Record §4.4bx: past the dismount teardown the data plane is
+        // closed to this process (the teardown's own reclaim drain issued
+        // every reclaim it owned) — a discard enqueued by a post-teardown
+        // writer's abandon would land on an offset the next mount at this
+        // mount point may have re-carved. Same halt as the fence, its own
+        // count; the successor's derivation owns the accounting.
+        if self.dismounted.load(Ordering::Acquire) {
+            METRICS
+                .block_free_reclaim_dismount_halts
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
             return;
         }

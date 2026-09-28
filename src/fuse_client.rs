@@ -6723,6 +6723,15 @@ pub struct Metrics {
     /// moved under in-flight authorizations — read it beside
     /// `writer_guard_fenced` and `dlm_quarantined_offsets`.
     pub data_dma_epoch_refusals: Align64<AtomicU64>,
+    /// Record §4.4bx: data-plane DMA submissions refused because this
+    /// mount's DISMOUNT TEARDOWN had completed (`NvmeBlockDev::close_at_dismount`
+    /// — the clean-unmount twin of the fence latch, its own class): the
+    /// staging root is the next mount's from that instant, so a post-
+    /// teardown writeback retry (the ladder runs until process exit) never
+    /// lands a block on an offset the successor may have re-carved; the
+    /// unit's bytes stay staged for it. Moves only in the seconds between
+    /// a teardown and the exit, never on a serving mount.
+    pub data_dma_dismount_refusals: Align64<AtomicU64>,
     /// DLM **S7**: device offsets currently in the dead-epoch
     /// **do-not-reallocate** quarantine across every volume (a live
     /// gauge — admissions minus releases). 0 on every single-writer mount.
@@ -7134,6 +7143,14 @@ pub struct Metrics {
     /// this daemon was fenced — always investigate alongside
     /// `writer_guard_fenced`.
     pub block_free_reclaim_fence_halts: Align64<AtomicU64>,
+    /// Record §4.4bx: reclaim entries dropped-without-finish_free because
+    /// this mount's DISMOUNT TEARDOWN had completed (`ReclaimQueue::
+    /// close_at_dismount` — the clean-unmount twin of the fence halt): the
+    /// teardown's own drain issued every reclaim it owned, and a discard
+    /// enqueued after it would land on an offset the next mount at this
+    /// mount point may have re-carved. The successor's derivation owns
+    /// the accounting. Moves only between a teardown and the exit.
+    pub block_free_reclaim_dismount_halts: Align64<AtomicU64>,
     /// At-cap enqueue PARKS (write-wall iteration 1 — park-don't-spill):
     /// a terminal free found the queue at the deferred-space cap
     /// (`SQUEEZEFS_RECLAIM_QUEUE_MAX_BLOCKS`) and parked (async, bounded
@@ -11752,6 +11769,7 @@ impl SqueezefsFilesystem {
                 // above, the dead-epoch quarantine ledger, and the data
                 // plane's guarantee class (1 = device-enforced WERO).
                 "data_dma_epoch_refusals": METRICS.data_dma_epoch_refusals.load(Ordering::Relaxed),
+                "data_dma_dismount_refusals": METRICS.data_dma_dismount_refusals.load(Ordering::Relaxed),
                 "dlm_quarantined_offsets": METRICS.dlm_quarantined_offsets.load(Ordering::Relaxed),
                 "dlm_quarantine_releases": METRICS.dlm_quarantine_releases.load(Ordering::Relaxed),
                 "data_plane_fence_mode": METRICS.data_plane_fence_mode.load(Ordering::Relaxed),
@@ -12111,6 +12129,7 @@ impl SqueezefsFilesystem {
                 "block_free_reclaim_batches": METRICS.block_free_reclaim_batches.load(Ordering::Relaxed),
                 "block_free_reclaim_sync_drains": METRICS.block_free_reclaim_sync_drains.load(Ordering::Relaxed),
                 "block_free_reclaim_fence_halts": METRICS.block_free_reclaim_fence_halts.load(Ordering::Relaxed),
+                "block_free_reclaim_dismount_halts": METRICS.block_free_reclaim_dismount_halts.load(Ordering::Relaxed),
                 "block_free_reclaim_cap_parks": METRICS.block_free_reclaim_cap_parks.load(Ordering::Relaxed),
                 "block_free_reclaim_cap_overflow": METRICS.block_free_reclaim_cap_overflow.load(Ordering::Relaxed),
                 // W-4 reclaim derivation: the measured inputs + the live
@@ -24661,6 +24680,13 @@ impl SqueezefsFilesystem {
         self.dismount_once.load(Ordering::Acquire)
     }
 
+    /// `true` ⇔ the dismount teardown that [`Self::dismount_started`]
+    /// names has run to its terminal step (the data plane closed, the
+    /// staging ownership ended).
+    pub fn dismount_complete(&self) -> bool {
+        self.dismount_complete.load(Ordering::Acquire)
+    }
+
     /// The largest representable file size: block indices are **u32**
     /// across the striped layout (`block_map` keys, patch/extent records,
     /// prefetch lanes), so content past `block_size × (2^32 − 1)` cannot
@@ -25767,6 +25793,34 @@ impl SqueezefsFilesystem {
                 }
             }
         }
+
+        // Record §4.4bx (review Issue 1): the teardown's TERMINAL step
+        // closes this mount's DATA plane — `vol.shutdown()` closed the
+        // metadata one above. The staging root is handed to the next
+        // mount at this mount point the instant `dismount_complete` is
+        // published (`start_mount` releases the liveness locks on it),
+        // while this process's writeback ladder, merge worker and
+        // reclaimer run until exit: a post-teardown retry must never DMA
+        // (the device gate) or discard (the reclaim queue) on an offset
+        // the successor may already own. Its refused unit stays
+        // staged for the successor — never a loss, never a fence.
+        //
+        // TEST SEAM (`SQUEEZEFS_TEST_DISMOUNT_HOLD_MS`, record §4.4bx):
+        // hold the teardown OPEN here — mount gone, staging root still
+        // ours — so a successor at this mount point meets a dismounting
+        // predecessor for longer than the exit-grade bound (the field's
+        // full-volume retire wait does it without a seam). Read once;
+        // zero cost unset; never set in production.
+        {
+            static HOLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let hold = *HOLD_MS.get_or_init(|| {
+                crate::env_knobs::int_knob("SQUEEZEFS_TEST_DISMOUNT_HOLD_MS", 0u64)
+            });
+            if hold > 0 {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+        }
+        self.router.backend_router.close_data_plane_at_dismount();
     }
 
     /// Wait until the dismount teardown (spawned by the winning `destroy`
@@ -31987,29 +32041,41 @@ pub async fn start_mount<P: AsRef<Path>>(
 
     // Record §4.4bx: the staging-root liveness locks guard the STAGING
     // OWNERSHIP, and that ends with the dismount teardown (its census is
-    // the last staging act; the IPC host — the other staging writer — is
-    // down above), never with the process. Released HERE so the next
-    // mount at this mount point adopts the residue without waiting out
-    // this process's exit — the disarms that follow and the address-space
-    // teardown. A teardown that missed its guard KEEPS them: its task may
-    // still be flushing, and two writers on one staging root is the
-    // collision the lock exists to refuse (the exit releases them then).
-    if teardown_done {
+    // the last staging act, its terminal step closed this mount's data
+    // plane to every worker that outlives it, and the IPC host — the other
+    // staging writer — is down above), never with the process. Released
+    // HERE so the next mount at this mount point adopts the residue
+    // without waiting out this process's exit — the disarms that follow
+    // and the address-space teardown. Keyed on a teardown that RAN and
+    // COMPLETED: a teardown that missed its guard KEEPS them (its task may
+    // still be flushing — two writers on one staging root is the collision
+    // the lock exists to refuse), and a session that ended with no
+    // `destroy` ran no census and closed nothing, so the exit releases
+    // them as before (the D0 flock is this process's until then).
+    if fs.dismount_started() && fs.dismount_complete() {
         crate::config_ops::release_staging_root_locks();
     }
 
     Ok(())
 }
 
-/// The process-exit guard on a dismount: the teardown's graceful drain
-/// window (`dismount_wait`) plus a flush margin. ONE law for both sides of
-/// a mount-point handover — the predecessor's `start_mount` waits this
-/// long for its own teardown before exiting, and a successor at the same
-/// mount point waits this long for the predecessor's staging-root lock
+/// The process-exit guard on a dismount, ONE law for both sides of a
+/// mount-point handover: the predecessor's `start_mount` waits this long
+/// for its own teardown before exiting, and a successor at the same mount
+/// point waits this long for the predecessor's staging-root lock
 /// (`config_ops::hold_staging_root_lock_waiting`) before calling it
-/// wedged.
+/// wedged. Derived from the teardown's own shape: its two PARKING steps
+/// (`run_dismount_teardown`'s write-pipeline quiesce and its writeback-
+/// retire wait) are each bounded by `dismount_wait`, and its WORK steps
+/// (the custody sweep, the promotion pass, the reclaim drain, the volume
+/// checkpoints) are bounded by the work — the 60 s is their allowance,
+/// the margin every 1.2.x `start_mount` shipped (the one term with no
+/// derivation of its own). Both sides read the mount's OWN
+/// `dismount_wait`; a successor mounted with a different `--dismount-wait`
+/// than its predecessor judges by its own guard (stated on the
+/// operations page).
 pub fn dismount_exit_guard(dismount_wait_secs: u64) -> std::time::Duration {
-    std::time::Duration::from_secs(dismount_wait_secs.saturating_add(60))
+    std::time::Duration::from_secs(dismount_wait_secs.saturating_mul(2).saturating_add(60))
 }
 
 pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, SqueezefsError> {
@@ -32199,6 +32265,21 @@ async fn run_constant_writeback_worker(
                     if writeback_fence_resolution(&e) {
                         log::error!(
                             "Constant Writeback: ino {} block {} resolved as a fencing-stale                              no-op — this mount's custody era is dead (poison latch set);                              bytes remain staged until remount (writeback_fence_noops)",
+                            req.ino,
+                            req.block_idx
+                        );
+                        return;
+                    }
+                    // Record §4.4bx: past the dismount teardown the data
+                    // plane is CLOSED to this process (the staging root
+                    // is the next mount's) — a unit that failed under it
+                    // is left STAGED for the successor, never retried
+                    // (every retry would refuse identically until exit;
+                    // the retry ladder outlives the teardown by design).
+                    if router_clone.backend_router.data_plane_dismounted() {
+                        log::info!(
+                            "Constant Writeback: ino {} block {} left staged for the next mount at \
+                             this mount point — the dismount teardown completed ({e:?})",
                             req.ino,
                             req.block_idx
                         );

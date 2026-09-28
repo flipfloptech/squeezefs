@@ -1438,6 +1438,16 @@ struct NodeProbe {
 pub(crate) struct DeviceFence {
     signal: std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
     halted: std::sync::atomic::AtomicBool,
+    /// Record §4.4bx: the clean-unmount twin of `halted` — set at the
+    /// dismount teardown's terminal step (`NvmeBlockDev::close_at_dismount`,
+    /// the metadata plane's `vol.shutdown()` for the DATA namespace). The
+    /// staging root is the next mount's from that instant while this
+    /// process's writeback ladder runs until exit, so a post-teardown
+    /// retry must never DMA into an offset the successor may have
+    /// re-carved. Its own class, never the fence: a clean unmount is not
+    /// a fail-stop, and the refused unit's bytes stay staged for the
+    /// successor. Sticky for the device's life.
+    dismounted: std::sync::atomic::AtomicBool,
 }
 
 impl DeviceFence {
@@ -1445,6 +1455,7 @@ impl DeviceFence {
         Self {
             signal: std::sync::OnceLock::new(),
             halted: std::sync::atomic::AtomicBool::new(false),
+            dismounted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1893,6 +1904,34 @@ impl NvmeBlockDev {
         self.fence.halted(&self.device_path)
     }
 
+    /// Record §4.4bx: close this device's data plane at the dismount
+    /// teardown's terminal step — every later DMA submission is refused
+    /// in the dismount class (`data_dma_dismount_refusals`), the unit's
+    /// bytes staying staged for the next mount at this mount point.
+    /// Shared across clones (the fence word is), idempotent, loud once.
+    pub fn close_at_dismount(&self) {
+        if !self
+            .fence
+            .dismounted
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            log::info!(
+                "data volume {}: data plane CLOSED at dismount — the staging root is the \
+                 next mount's from here and no DMA of this process is admitted again (a \
+                 refused writeback unit stays staged for the successor; \
+                 data_dma_dismount_refusals)",
+                self.device_path
+            );
+        }
+    }
+
+    /// `true` ⇔ [`Self::close_at_dismount`] ran on this device.
+    pub fn dismounted(&self) -> bool {
+        self.fence
+            .dismounted
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// RES-6 + DLM **S7** submit gate: the D0 latch probe (which poisons
     /// process custody on its first observation) followed by THE
     /// authorization point, [`crate::data_custody::authorize_dma`] — which
@@ -1921,7 +1960,28 @@ impl NvmeBlockDev {
                 self.device_path
             ));
         }
-        crate::data_custody::authorize_dma(carried).map(|_| ())
+        crate::data_custody::authorize_dma(carried)?;
+        // Record §4.4bx: the dismount class, judged AFTER the fence so a
+        // fenced holder keeps its own verdict.
+        if self
+            .fence
+            .dismounted
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            crate::fuse_client::METRICS
+                .data_dma_dismount_refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(crate::error::SqueezefsError::Refused {
+                errno: libc::EROFS,
+                msg: format!(
+                    "data volume {}: DMA refused — this mount's dismount teardown completed \
+                     and the staging root belongs to the next mount at this mount point; the \
+                     unit stays staged for it (data_dma_dismount_refusals)",
+                    self.device_path
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// The ONE write-outcome funnel: every data-plane DMA outcome — real

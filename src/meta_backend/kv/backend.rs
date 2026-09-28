@@ -12685,6 +12685,22 @@ impl KvMetaBackend {
         self.cache.merge_yields()
     }
 
+    /// §4.6a (d): the sweep's BACKLOG word — a lap the floor, the budget,
+    /// the ring reserve or a space-retry hold cut, or a lap that merged
+    /// (its successors can pair again); the next cycle sweeps again even
+    /// once the heap-full posture clears. `false` only at the fixed
+    /// point: a completed lap with no merge and no refusal.
+    pub fn merge_backlog(&self) -> bool {
+        self.merge_backlog.load(Ordering::Acquire)
+    }
+
+    /// Is the heap-full merge sweep DUE at the next checkpoint cycle —
+    /// the posture or the backlog ([`Self::merge_backlog`])? The cycle's
+    /// arm runs it (or yields it, counted) exactly when this reads true.
+    pub fn merge_sweep_due(&self) -> bool {
+        self.heap_full() || self.merge_backlog()
+    }
+
     /// The §4.7 door's space retry, held across the "return room" cycles
     /// and the re-admission ([`NodeCache::begin_space_retry`]) — the
     /// opportunistic merges yield while it stands.

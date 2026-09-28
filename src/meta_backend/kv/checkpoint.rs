@@ -3233,10 +3233,18 @@ impl KvMetaBackend {
         // retirements, so inside the §4.7 door's two "return room" cycles
         // it took every returned extent and the delete's one retry met the
         // floor again (a full volume refusing its deletes while its
-        // recovery churned). The backlog word is untouched: the sweep
-        // resumes at the next cycle with no retry in flight.
-        let sweep_due = self.heap_full() || self.merge_backlog.load(Ordering::Acquire);
+        // recovery churned). A yield STANDS the backlog word — "a lap the
+        // hold cut" — so the sweep is due at the next cycle with no retry
+        // in flight whatever `heap_full` reads then: the retry's returned
+        // room lets the NEXT cycle's flush pass clear the posture before
+        // that cycle's arm runs, and a yield that left the word as it
+        // stood (false at the fixed point the deletes' candidates were
+        // made after) stopped the sweep with candidates standing until the
+        // next growth refusal re-latched it — the stall §4.6a (d) added
+        // the word to prevent (review round 1, Issue 2).
+        let sweep_due = self.merge_sweep_due();
         if sweep_due && self.space_retry_inflight() {
+            self.merge_backlog.store(true, Ordering::Release);
             self.note_merge_yield();
             log::debug!(
                 "checkpoint: merge sweep on {:?} yielded to a user commit retrying for space \

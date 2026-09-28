@@ -1988,10 +1988,6 @@ impl KvTree {
     /// (`NodeCache::space_retry_inflight`): its claim is at the floor the
     /// retry needs, and the sweep picks the candidate up later.
     async fn merge_after_flush(&self, ctx: &mut SmoContext, min_key: &[u8]) -> Result<(), KvError> {
-        if self.cache.space_retry_inflight() {
-            self.cache.note_merge_yield();
-            return Ok(());
-        }
         let layout = self.cache.config().layout;
         let cur = self.descend(min_key, 0).await?;
         if self.is_root(&cur) || cur.state().is_superseded() {
@@ -2004,6 +2000,12 @@ impl KvTree {
                 + g.overlay_bytes()
         };
         if bound > layout.merge_candidate_capacity() {
+            return Ok(());
+        }
+        // A certain candidate under a space retry: the merge it would have
+        // attempted is the yield counted (the sweep picks it up later).
+        if self.cache.space_retry_inflight() {
+            self.cache.note_merge_yield();
             return Ok(());
         }
         let mut o = MaintenanceOutcome::default();

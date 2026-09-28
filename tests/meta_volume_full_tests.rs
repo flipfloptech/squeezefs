@@ -316,13 +316,22 @@ async fn full_metadata_volume_is_enospc_not_a_failstop() {
 /// deletes while its own recovery churned, a priority inversion between a
 /// background recovery and the user delete it exists to serve.
 ///
-/// Pinned at the mechanism, deterministically: on a FULL volume with a
-/// merge backlog, a cycle run while the door's space retry is held runs
-/// NO sweep and counts a yield (`meta_kv_merge_yields`); the next cycle,
-/// with the hold released, sweeps again. The hold is the pass's own
-/// (`begin_space_retry`), so the pin drives exactly the word the door
-/// raises. The composed shape stays pinned by the contract above, whose
-/// deletes now find the room the two cycles return.
+/// Pinned at the mechanism, deterministically: a fill to the refusal
+/// (the posture set — a sweep is DUE), then the door's own hold
+/// (`begin_space_retry`, the word the pass raises) taken BEFORE three
+/// quarters of the files are deleted, so every cycle from then on — the
+/// deletes' ring-park cycles and two explicit ones — meets the hold: no
+/// sweep runs, every due sweep counts a yield, and the FIRST yield stands
+/// the BACKLOG (review round 1, Issue 2: a yield that left the word as it
+/// read let the next cycle's flush pass clear `heap_full` and the sweep
+/// stopped with candidates standing) — `merge_sweep_due`, the arm's own
+/// predicate, reads true at the release whatever `heap_full` reads then.
+/// The first cycle after the release sweeps again and yields nothing.
+/// (An earlier shape took the hold after a settling cycle; the deletes'
+/// kicked cycles had reached the sweep's fixed point first, and nothing
+/// was due — on a fast machine the pin read RED on the fixed tree.) The
+/// composed shape stays pinned by the contract above, whose deletes now
+/// find the room the two cycles return (base 5/20 red, fixed 0/20).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_merge_sweep_yields_to_a_user_commit_retrying_for_space() {
     let (be, file) = fresh_volume().await;
@@ -331,28 +340,21 @@ async fn the_merge_sweep_yields_to_a_user_commit_retrying_for_space() {
         .expect("the fill reaches a refusal within the wall bound");
     assert_eq!(first_refusal.to_errno(), libc::ENOSPC);
     assert!(be.heap_full(), "the posture the sweep gates on");
-    // Deletes across the whole population leave underfull leaves for the
-    // sweep to find — a backlog it keeps working across cycles.
-    for i in (0..landed).step_by(2) {
-        if let Ok(ino) = be.unlink(ROOT_INO, &name(i)).await {
-            let _ = be.destroy_inode(ino).await;
-        }
-    }
-    let sweeps_before = be.merge_sweeps();
-    be.checkpoint_now().await.expect("a settling cycle");
-    be.checkpoint_now().await.expect("a second settling cycle");
-    assert!(
-        be.merge_sweeps() > sweeps_before,
-        "premise: the heap-full posture runs the sweep every cycle ({} → {})",
-        sweeps_before,
-        be.merge_sweeps()
-    );
+    assert!(be.merge_sweep_due(), "a sweep is due on a full volume");
 
-    // The door's hold: a cycle inside it sweeps nothing and counts a yield.
-    let sweeps = be.merge_sweeps();
-    let yields = be.merge_yields();
+    let sweeps0 = be.merge_sweeps();
+    let yields0 = be.merge_yields();
     {
         let _hold = be.begin_space_retry();
+        // Three of every four files deleted under the hold: each xattr
+        // leaf keeps ≤ one 12 KiB payload of a 61 KiB capacity — certain
+        // merge candidates the sweep would take, and their commits' ring
+        // parks kick cycles of their own.
+        for i in (0..landed).filter(|i| i % 4 != 0) {
+            if let Ok(ino) = be.unlink(ROOT_INO, &name(i)).await {
+                let _ = be.destroy_inode(ino).await;
+            }
+        }
         be.checkpoint_now()
             .await
             .expect("a cycle under the space retry");
@@ -361,23 +363,30 @@ async fn the_merge_sweep_yields_to_a_user_commit_retrying_for_space() {
             .expect("a second cycle under the space retry");
         assert_eq!(
             be.merge_sweeps(),
-            sweeps,
+            sweeps0,
             "no sweep runs while a user commit is retrying for space"
         );
         assert!(
-            be.merge_yields() >= yields + 2,
-            "every due sweep under the hold is counted as a yield ({} → {})",
-            yields,
+            be.merge_yields() >= yields0 + 2,
+            "every due sweep under the hold is counted as a yield ({yields0} → {})",
             be.merge_yields()
         );
+        assert!(
+            be.merge_backlog(),
+            "a yield STANDS the backlog — the sweep is due at the next free cycle whatever \
+             heap_full reads then (heap_full={})",
+            be.heap_full()
+        );
+        assert!(be.merge_sweep_due());
     }
-    // Released: the backlog stood, the next cycle sweeps again.
+    // Released: the next cycle sweeps again and yields nothing.
     let yields_after = be.merge_yields();
     be.checkpoint_now()
         .await
         .expect("a cycle after the release");
-    assert!(
-        be.merge_sweeps() > sweeps,
+    assert_eq!(
+        be.merge_sweeps(),
+        sweeps0 + 1,
         "the sweep resumes at the first cycle with no retry in flight"
     );
     assert_eq!(

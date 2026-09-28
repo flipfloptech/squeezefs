@@ -420,11 +420,14 @@ mount is a read-token client whose metadata is exact at the next resolve
   its staging root's liveness lock until process exit, and the new mount
   waited only 2 s — a dismount longer than that (a full volume's 10-s
   writeback-retire wait, a large parked backlog) refused the successor.
-  The lock is now released when the dismount teardown completes, and a
-  successor at the same mount point waits for a dismounting predecessor up
-  to its exit guard (`dismount_wait` + 60 s) while a live collision (a FUSE
-  mount still at the path) is still refused at once (record §4.4bx; found
-  by the 1.3.0 release chain on fstests generic/751→752).
+  The lock is now released when the dismount teardown completes — whose
+  last act also closes the daemon's data plane, so a writeback retry that
+  outlives the teardown never lands on a block the next mount may own — and
+  a successor at the same mount point waits for a dismounting predecessor
+  up to its exit guard (2 × `dismount_wait` + 60 s; a `--daemon` parent's
+  readiness deadline stretches with it), while a live collision (a FUSE
+  mount still at the path) is still refused after the 2-s wait (record
+  §4.4bx; found by the 1.3.0 release chain on fstests generic/751→752).
 - **A `-o ro` mount of an idle set was refused outright on the 1.3
   default** ("the writer must be mounted"): every read-only mount is a
   token client under the flipped default, and the first build demanded a
@@ -797,6 +800,26 @@ had the parameter at Y from a previous mount. The enable now precedes the
 INIT reply (`init_negotiation_tests::the_kernel_uring_enable_precedes_the_init_reply`
 is the rail); a host whose parameter cannot be written is announced loud
 before the reply, naming the remedy.
+
+**Known limitations — what this release does not claim.**
+
+- **A genuinely FULL data volume acks writes it can never land** (record
+  `.benchmarks/2026-09-19-sym-acceptance.md` §4.4bx, §7 item 24 — shipped
+  since 1.2.0; found by the 1.3.0 release chain on fstests generic/751 and
+  invisible to that test's `ignore_error=ENOSPC`). Once the allocator
+  refuses for space, the write path's never-lossy fallback stages the bytes
+  instead of returning `ENOSPC`; staging fills, the parked buffers stay in
+  RAM past the memory-budget cap, the writeback ladder retries for ever,
+  and the unmount tries — then loses at process exit — every block that
+  never landed (17,307 blocks ≈ 68 GiB in the chain's run, the daemon at
+  74 GiB RSS). Until the volume is full the never-lossy law holds exactly
+  as documented; on a full volume, acked bytes written after the fill are
+  lost at unmount and the daemon's memory grows to its budget. The remedy
+  direction (`ENOSPC` at `write(2)` for a block that cannot be allocated,
+  the never-lossy ladder for acked custody alone) is an owner decision on
+  the never-lossy law's boundary; keep data volumes below full.
+- **The 1.2.4 limitations** stand where this release did not name a
+  change to them.
 
 ---
 

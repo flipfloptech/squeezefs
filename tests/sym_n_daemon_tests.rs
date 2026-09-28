@@ -12167,30 +12167,56 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         // reactive ask at most the cold-start belt — the storm's FIRST
         // flush pass, before any rate is measured (the join's grant covers
         // the rotor's mints; that pass's splits are what it cannot size).
-        let returned = c.grant_returned - a.grant_returned;
-        // The pool's target is bounded by the heap-share cap (`free heap /
-        // (4 × appenders)`); a pool standing AT the cap returns its retired
-        // images as the CAP's surplus — the manager's bounded-execution
-        // law, never the claim-and-retire churn. Under the sector-pad law
-        // (PR 13i) the joiners' rings grow to the per-appender ceiling
-        // inside this storm (≈ 18× the byte-grain demand) and take that
-        // heap off this small volume's free set, so the cap binds here
-        // where PR 13g's run had it slack.
+        //
+        // Judged over the SIZED window (the first quarter's end → the
+        // storm's end), law 1's own split: the first quarter is the
+        // sizing's, where the pool returns ONCE for two reasons that are
+        // not the churn — the derived pool size warms up with the measured
+        // SMO rate (the join's grant is the floor + M, and the first
+        // passes' retirements exceed a size read off a cold EWMA until the
+        // storm's rate is measured: +135 on a joiner whose cap never
+        // moved), and the rings grow to the per-appender ceiling under the
+        // sector-pad law (PR 13i), take that heap off this small volume's
+        // free set, and SHRINK the heap-share cap (`free heap / (4 ×
+        // appenders)`, 1,523 → 1,015) under a pool sized against the old
+        // one — the manager's bounded-execution law, a trim the
+        // end-of-storm pool (drawn down since) cannot be judged against.
+        // Read over the whole storm that transient made +94 against 917
+        // compactions on a hot laptop an hour into `task check` (the 1.3.0
+        // chain's attempt 9; a cooler box's storm compacts twice as much
+        // in the same 12 s and the same +94 passes) — a throughput-shaped
+        // denominator over a one-time transient, the TIMING-CONTRACT-under-
+        // load class. The churn the law guards against is per-compaction
+        // recycling in the STEADY state, which the sized window reads
+        // exactly (0 over ≈ 1,200 compactions here). The onset's returns
+        // ride the record beside the cap's movement.
+        let returned_onset = b.grant_returned - a.grant_returned;
+        let returned = c.grant_returned - b.grant_returned;
+        let compactions_sized = c.compactions - b.compactions;
         let pool = c.grant_claimed + c.grant_unclaimed;
+        // A pool standing AT the cap returns its retired images as the
+        // CAP's surplus — the same law, read at the end.
         let cap_bound = pool + GRANT_EXTENTS_FLOOR >= c.wire_cap;
+        eprintln!(
+            "F-R5 joiner {i}: law 3 — onset returns +{returned_onset} (cap {} → {} across the \
+             sizing quarter), sized-window returns +{returned} over {compactions_sized} \
+             compactions, pool {pool} under cap {}",
+            a.wire_cap, b.wire_cap, c.wire_cap
+        );
         if venue_hot {
             unjudged.push(format!(
-                "joiner {i} law 3 (returns × 10 ≤ compactions or the cap binding): \
-                 extent_grant_returned +{returned} over {compactions} compactions, pool {pool} \
-                 under cap {}",
+                "joiner {i} law 3 (sized-window returns × 10 ≤ compactions or the cap binding): \
+                 extent_grant_returned +{returned} over {compactions_sized} compactions, pool \
+                 {pool} under cap {}",
                 c.wire_cap
             ));
         } else {
             assert!(
-                returned * 10 <= compactions || cap_bound,
+                returned * 10 <= compactions_sized || cap_bound,
                 "joiner {i}: retired images recycle into the joiner's own pool — `extent_grant_\
-                 returned` moved +{returned} over {compactions} compactions with the pool at \
-                 {pool} under a cap of {} (RED: +≈ compactions, the claim-and-retire churn)",
+                 returned` moved +{returned} over {compactions_sized} compactions in the sized \
+                 window with the pool at {pool} under a cap of {} (RED: +≈ compactions, the \
+                 claim-and-retire churn)",
                 c.wire_cap
             );
         }

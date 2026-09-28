@@ -11948,10 +11948,14 @@ async fn floor_ring_storm(
 /// 3. **the pool**: retired images RECYCLE into the joiner's own unclaimed
 ///    set up to the derived size (a pressure-driven cadence returns
 ///    nothing), so `extent_grant_returned` stays flat while its
-///    compactions run, and the flush pass never asks one SMO's images on a
-///    healthy heap (`joined_wire_reactive_grants` 0); the manager's verbs
-///    per joiner per storm fall by an order of magnitude against the
-///    base's (≈ 195 → ≈ 10 on this fixture — the record's §4.4ao).
+///    compactions run — judged over the SIZED window (the first quarter's
+///    end → the storm's end; record §4.4ca: the sizing quarter's returns
+///    are `shrink_to` trims of FRESH extents as the derived target settles,
+///    bounded by what that quarter's asks landed), and the flush pass never
+///    asks one SMO's images on a healthy heap (`joined_wire_reactive_grants`
+///    0); the manager's verbs per joiner per storm fall by an order of
+///    magnitude against the base's (≈ 195 → ≈ 10 on this fixture — the
+///    record's §4.4ao).
 /// Every acked name resolves at every daemon, fsck clean after every
 /// joiner left.
 ///
@@ -12170,29 +12174,38 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         //
         // Judged over the SIZED window (the first quarter's end → the
         // storm's end), law 1's own split: the first quarter is the
-        // sizing's, where the pool returns ONCE for two reasons that are
-        // not the churn — the derived pool size warms up with the measured
-        // SMO rate (the join's grant is the floor + M, and the first
-        // passes' retirements exceed a size read off a cold EWMA until the
-        // storm's rate is measured: +135 on a joiner whose cap never
-        // moved), and the rings grow to the per-appender ceiling under the
-        // sector-pad law (PR 13i), take that heap off this small volume's
-        // free set, and SHRINK the heap-share cap (`free heap / (4 ×
-        // appenders)`, 1,523 → 1,015) under a pool sized against the old
-        // one — the manager's bounded-execution law, a trim the
-        // end-of-storm pool (drawn down since) cannot be judged against.
-        // Read over the whole storm that transient made +94 against 917
-        // compactions on a hot laptop an hour into `task check` (the 1.3.0
-        // chain's attempt 9; a cooler box's storm compacts twice as much
-        // in the same 12 s and the same +94 passes) — a throughput-shaped
-        // denominator over a one-time transient, the TIMING-CONTRACT-under-
-        // load class. The churn the law guards against is per-compaction
-        // recycling in the STEADY state, which the sized window reads
-        // exactly (0 over ≈ 1,200 compactions here). The onset's returns
-        // ride the record beside the cap's movement.
-        let returned_onset = b.grant_returned - a.grant_returned;
-        let returned = c.grant_returned - b.grant_returned;
-        let compactions_sized = c.compactions - b.compactions;
+        // sizing's, where the pool's returns are FRESH unclaimed extents
+        // `RegionGrant::shrink_to` trims as the derived target — a 1/8 EWMA
+        // of the SMO rate, folded across the drain-then-grow's idle cycles
+        // — dips between asks (up to +249 against 138 process-wide
+        // compactions in one quarter: more than every retirement, so not
+        // retired images, and not the claim-and-retire churn); the onset
+        // returns across runs (94 / 96, 82 / 135, 249 / 24, 25 / 94) are
+        // uncorrelated with the cap's motion — the printed cap step
+        // (1,523 → 1,015 on joiner 0) is the `appenders_known` 2 → 3 census
+        // refresh at its first cadence, on a free-heap projection FROZEN at
+        // the join (joiner 1's reads flat through a ≈ 1,850-extent carve),
+        // and sized nothing. Read over the whole storm, that transient
+        // divided by a RETIREMENT-rate denominator was mis-specified on
+        // every venue (+249 × 10 > 1,218 on a cool isolated run; +94 × 10 >
+        // 917 on the hot laptop an hour into `task check` — the 1.3.0
+        // chain's attempt 9, the run that tripped it). The churn the law
+        // guards against is per-compaction recycling in the STEADY state,
+        // which the sized window reads exactly (0 over ≈ 1,200 compactions
+        // here). The onset carries its own loose bound below — a trim of
+        // fresh extents cannot exceed what the quarter's asks landed (a
+        // runaway trim — a target of 0 every quiet cycle — fails it) — and
+        // rides the record line beside the cap's step.
+        // `b` is a MID-STORM sample of a gauge that is monotone only at
+        // rest (`take_returnable` +N and `recycle` −k run under two lock
+        // acquisitions per cadence), so both deltas saturate — a saturated
+        // 0 under-reads by at most one cycle's batch, which the 10× law
+        // absorbs.
+        let returned_onset = b.grant_returned.saturating_sub(a.grant_returned);
+        let landed_onset = (b.grant_claimed + b.grant_unclaimed)
+            .saturating_sub(a.grant_claimed + a.grant_unclaimed);
+        let returned = c.grant_returned.saturating_sub(b.grant_returned);
+        let compactions_sized = c.compactions.saturating_sub(b.compactions);
         let pool = c.grant_claimed + c.grant_unclaimed;
         // A pool standing AT the cap returns its retired images as the
         // CAP's surplus — the same law, read at the end.
@@ -12205,9 +12218,10 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
         );
         if venue_hot {
             unjudged.push(format!(
-                "joiner {i} law 3 (sized-window returns × 10 ≤ compactions or the cap binding): \
-                 extent_grant_returned +{returned} over {compactions_sized} compactions, pool \
-                 {pool} under cap {}",
+                "joiner {i} law 3 (sized-window returns × 10 ≤ compactions or the cap binding; \
+                 onset returns ≤ onset landed): extent_grant_returned +{returned} over \
+                 {compactions_sized} compactions, pool {pool} under cap {}; onset \
+                 +{returned_onset} of {landed_onset} landed",
                 c.wire_cap
             ));
         } else {
@@ -12218,6 +12232,12 @@ async fn a_joiners_extent_supply_under_a_create_storm_grows_its_ring_and_recycle
                  window with the pool at {pool} under a cap of {} (RED: +≈ compactions, the \
                  claim-and-retire churn)",
                 c.wire_cap
+            );
+            assert!(
+                returned_onset <= landed_onset,
+                "joiner {i}: the sizing quarter's trims (+{returned_onset}) exceed the fresh \
+                 extents its asks landed ({landed_onset}) — a runaway `shrink_to` (a target of 0 \
+                 every quiet cycle), not a sizing transient"
             );
         }
         assert!(

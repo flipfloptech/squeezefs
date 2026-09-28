@@ -17283,43 +17283,88 @@ impl SqueezefsFilesystem {
 
     /// Record §7 item 24 — would a striped write touching
     /// `start_block..=end_block` CREATE custody of a block this mount holds
-    /// nothing of? A block is held when it is mapped, when the file's
-    /// size (the RAM floor, which every acked open block's postlude
-    /// raised) reaches into it, when a parked buffer exists, or when a
-    /// staged copy exists. RAM-only, no guard: run only under the set's
-    /// exhaustion verdict. A metadata-cache miss answers "held" — the
-    /// refusal must never fire on a block whose mapping it could not see
-    /// (one acked-and-parked block on a cold cache is the ladder's, never
-    /// a spurious `ENOSPC`).
-    fn write_would_create_fresh_custody(
-        &self,
-        ino: u64,
-        start_block: u64,
-        end_block: u64,
-        existing_size: u64,
-        block_size: u64,
-    ) -> bool {
-        let Some((mapped, live_size)) = self.router.metadata_cache.peek_with(&ino, |m| {
-            let mapped: Vec<bool> = (start_block..=end_block)
+    /// nothing of? A block is HELD when custody exists in any of its forms:
+    /// a mapping (the durable block), a parked buffer (RAM custody), a
+    /// staged copy of the whole block or a spilled extent record (staging
+    /// custody), an open device-overlay record (a dest allocated before the
+    /// set latched, unpublished). A HOLE — below EOF or past it — holds
+    /// nothing: `fallocate` mode 0 and `truncate` only grow the size here,
+    /// so a pre-sized file's every block is fresh until written (review
+    /// round 1, Issue 2: a size-floor arm read every block below EOF as
+    /// held and kept the sink for exactly that shape). RAM-only, no guard:
+    /// run only under the set's exhaustion verdict. A metadata-cache miss
+    /// answers "held" — the refusal must never fire on a block whose
+    /// mapping it could not see (one acked-and-parked block on a cold cache
+    /// is the ladder's, never a spurious `ENOSPC`).
+    fn write_would_create_fresh_custody(&self, ino: u64, start_block: u64, end_block: u64) -> bool {
+        let block_size = self.router.block_size.load(Ordering::Relaxed);
+        // Per block: `Some(mapping)` = mapped (the key), `None` with the
+        // second word `true` = held by an indirect map, else unmapped.
+        let Some(mapped) = self.router.metadata_cache.peek_with(&ino, |m| {
+            (start_block..=end_block)
                 .map(|b| match m.block_map.as_ref() {
-                    Some(bm) => bm.contains_key(&(b as u32)),
-                    // An indirect map (spilled past the inline bound)
-                    // conservatively holds every block.
-                    None => m.file_type == "striped",
+                    Some(bm) => (bm.get(&(b as u32)).cloned(), false),
+                    // An indirect map (spilled past the inline bound) is
+                    // not in RAM: a block INSIDE the file's extent is
+                    // conservatively held (it may be mapped — a hole there
+                    // is the stated residual), a block past the size is
+                    // fresh by construction (a truncate prunes beyond it).
+                    None => (
+                        None,
+                        m.file_type == "striped" && b.saturating_mul(block_size) < m.size,
+                    ),
                 })
-                .collect();
-            (mapped, m.size)
+                .collect::<Vec<(Option<String>, bool)>>()
         }) else {
             return false;
         };
-        let size = existing_size.max(live_size);
+        let passthrough = self.router.get_crypto().is_passthrough();
         for (i, b) in (start_block..=end_block).enumerate() {
-            if mapped[i] || size > b * block_size {
+            let (mapping, indirect_held) = &mapped[i];
+            if *indirect_held {
                 continue;
             }
+            if let Some(mapping) = mapping {
+                // A MAPPED block is held only where a write to it can land
+                // WITHOUT a fresh block (review round 1, Issue 6): the
+                // in-place arms — W1's sub-block patch and the brim
+                // whole-block rewrite of the seeded image — need a
+                // passthrough volume, an undecorated whole-block mapping
+                // and a sole owner (the RAM verdict; the durable probe
+                // runs at the patch). A transformed volume, a packed
+                // tenant or a clone-shared block CoWs, which needs the
+                // block nothing can allocate: refused like growth.
+                let in_place =
+                    passthrough
+                        && crate::routing::is_whole_block_mapping(mapping)
+                        && self
+                            .router
+                            .backend_router
+                            .parse_block_key(mapping)
+                            .ok()
+                            .and_then(|(be_id, off)| {
+                                self.router.backend_router.get_backend(&be_id).ok().map(
+                                    |(alloc, _)| {
+                                        alloc.refcount(off) == Some(1) && !alloc.is_shared(off)
+                                    },
+                                )
+                            })
+                            .unwrap_or(false);
+                if in_place {
+                    continue;
+                }
+                return true;
+            }
             let key = crate::keys::active_block_stack(ino, b);
+            let ext = crate::keys::active_block_ext_stack(ino, b);
             if self.active_block_buffers.contains_key(key.as_str())
                 || self.router.cache.nvme.has_staged_active_block(key.as_str())
+                || self
+                    .router
+                    .cache
+                    .nvme
+                    .has_staged_extent_record(ext.as_str())
+                || self.device_overlays.get(ino, b as u32).is_some()
             {
                 continue;
             }
@@ -20693,20 +20738,17 @@ impl SqueezefsFilesystem {
         // `BackendRouter::fresh_supply_exhausted`, one relaxed load per
         // volume on a set that never refused); the custody probe runs only
         // under it and is RAM-only. A block with a mapping, a parked
-        // buffer or a staged copy is custody this mount already holds:
-        // its segments stay admitted (the brim rewrite of a mapped block
-        // is space-neutral; an open block's last segment completes it
-        // and rides the ladder, bounded by the blocks open at the fill).
+        // buffer, a staged copy or extent record, or an open overlay
+        // record is custody this mount already holds: its segments stay
+        // admitted (a passthrough whole-block rewrite of a mapped block
+        // lands in place — space-neutral; an open block's last segment
+        // completes it and rides the ladder, bounded by the blocks open at
+        // the fill). A hole below EOF holds nothing and is refused like
+        // growth.
         // Decided for the WHOLE write ahead of every block future, so a
         // refusal never leaves a span half-recorded behind an error reply.
         if self.router.backend_router.fresh_supply_exhausted()
-            && self.write_would_create_fresh_custody(
-                ino,
-                start_block,
-                end_block,
-                existing_size,
-                block_size,
-            )
+            && self.write_would_create_fresh_custody(ino, start_block, end_block)
         {
             METRICS
                 .write_fresh_block_enospc_refusals

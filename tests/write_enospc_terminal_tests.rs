@@ -466,6 +466,11 @@ async fn full_store_writes_terminate_and_the_mount_keeps_answering() {
 
     // The durability boundary is honest: whatever was acked under the
     // never-lossy ladder cannot land, and fsync says so — within the bound.
+    // (Under item 24 the fill's terminal refusal latched the store, so
+    // every storm write is refused pre-ack and `acked` reads 0 — the fsync
+    // arm below is then the pre-item-24 law kept for the shape where a
+    // write was acked before the latch; the acked-custody contract in §4
+    // exercises it directly.)
     let acked = outcomes.iter().filter(|o| o.is_ok()).count();
     let fsync = bounded_fsync(&h, ino).await;
     if acked > 0 {
@@ -739,10 +744,14 @@ async fn fresh_block_writes_against_an_exhausted_set_are_refused_before_the_ack(
     let stats0 = bounded_stats(&h).await;
     let g0 = fresh_refusals(&stats0);
     let parked0 = squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes();
+    // The latch here is set by `fill_store`'s own probe (`allocate_block`
+    // → `StorageFull` — the harness's terminal refusal, exactly what a
+    // write's allocation would have produced); the live pin drives it
+    // through a real write.
     assert_eq!(
         exhausted_volumes(&stats0),
         1,
-        "the fill's own terminal refusal latched the volume exhausted"
+        "the fill's terminal refusal latched the volume exhausted"
     );
 
     for b in 4u64..12 {
@@ -976,4 +985,171 @@ async fn the_exhaustion_latch_clears_when_supply_returns() {
         0,
         "a landed allocation clears the latch"
     );
+}
+
+/// Review round 1, Issue 1: there is no belt that admits "one write per
+/// window" — EIGHT concurrent fresh-block writers against a latched store
+/// are ALL refused, nothing is acked, nothing parks. (The first build's
+/// re-probe window cleared the latch for every concurrent writer at once:
+/// generic/751's 32 jobs would have parked 32 blocks per window.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fresh_block_writers_against_a_latched_store_are_all_refused() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(None);
+    let h = make([0xFB; 16], "f24_concurrent_refused", 4).await;
+    let ino = fill_store(&h, "filler.bin", 4).await;
+    let parked0 = squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes();
+    let g0 = fresh_refusals(&bounded_stats(&h).await);
+    let mut writes = Vec::new();
+    for b in 4u64..12 {
+        let fs = h.fs.clone();
+        let req = h.req;
+        let data = pattern(BS as usize, 0x70 + b as u8);
+        writes.push(tokio::spawn(async move {
+            bounded_write(&fs, req, ino, b * BS, data).await
+        }));
+    }
+    for (i, w) in writes.into_iter().enumerate() {
+        assert_eq!(
+            w.await.expect("write task"),
+            Err(libc::ENOSPC),
+            "concurrent writer {i}: refused, never the belt's admitted one"
+        );
+    }
+    assert_eq!(fresh_refusals(&bounded_stats(&h).await) - g0, 8);
+    assert_eq!(
+        squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes(),
+        parked0,
+        "no concurrent writer created parked custody"
+    );
+    assert_eq!(bounded_fsync(&h, ino).await, Ok(()));
+}
+
+/// Review round 1, Issue 2: a HOLE below EOF holds nothing. A file
+/// pre-sized past the fill (`truncate` — `fallocate` mode 0 grows the size
+/// the same way, no blocks) is every pre-sized shape: fio's default
+/// `fallocate=native`, sparse images, databases. A write into its hole on
+/// an exhausted set is refused like growth (the first build's size-floor
+/// arm read every block below EOF as held and kept the sink for exactly
+/// this shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_into_a_hole_below_eof_of_a_pre_sized_file_is_refused_when_exhausted() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(None);
+    // Capacity 5: the sparse file's block 0 (striped by construction) +
+    // the 4-block fill.
+    let h = make([0xFC; 16], "f24_hole_below_eof", 5).await;
+    let sparse = create(&h, "sparse.bin").await;
+    bounded_write(&h.fs, h.req, sparse, 0, pattern(BS as usize, 0x08))
+        .await
+        .expect("block 0 lands");
+    bounded_fsync(&h, sparse).await.expect("durable");
+    tokio::time::timeout(
+        BOUND,
+        h.fs.setattr(
+            h.req,
+            sparse,
+            None,
+            fuse3::SetAttr {
+                size: Some(8 * BS),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("setattr answers")
+    .expect("truncate grows the size with no blocks");
+    assert_eq!(bounded_getattr(&h, sparse).await, 8 * BS);
+    let _full = fill_store(&h, "filler.bin", 4).await;
+    let parked0 = squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes();
+    let g0 = fresh_refusals(&bounded_stats(&h).await);
+    for b in [1u64, 3, 7] {
+        assert_eq!(
+            bounded_write(
+                &h.fs,
+                h.req,
+                sparse,
+                b * BS,
+                pattern(BS as usize, 0x80 + b as u8)
+            )
+            .await,
+            Err(libc::ENOSPC),
+            "block {b} of the pre-sized file is a hole: refused, never parked"
+        );
+    }
+    assert_eq!(fresh_refusals(&bounded_stats(&h).await) - g0, 3);
+    assert_eq!(
+        squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes(),
+        parked0
+    );
+    assert_eq!(
+        bounded_fsync(&h, sparse).await,
+        Ok(()),
+        "nothing acked into the holes"
+    );
+}
+
+/// Review round 1, Issue 6: "mapped ⇒ held" holds only where an in-place
+/// arm can land the write. On a COMPRESSED volume the brim whole-block
+/// rewrite declines (a transformed image's stored length varies with
+/// content), so a rewrite of a mapped block needs the block nothing can
+/// allocate: it is refused before the ack like growth. (The passthrough
+/// twin — `a_brim_rewrite_of_a_mapped_block_is_admitted_while_the_set_is_
+/// exhausted` — lands in place.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewrite_of_a_mapped_block_on_a_transformed_volume_is_refused_when_exhausted() {
+    let _s = serial();
+    let _r = restore();
+    write_pipeline::set_depth_override(Some(0));
+    let h = make([0xFD; 16], "f24_transformed_rewrite", 4).await;
+    h.fs.router
+        .set_crypto(squeezefs::crypto_compress::CryptoCompressState::new(
+            "lz4".to_string(),
+            "none".to_string(),
+            None,
+        ));
+    // Incompressible content so every block stores as one whole chunk
+    // and the store fills exactly like the passthrough fixture.
+    let ino = create(&h, "filler.bin").await;
+    let mut data = vec![0u8; (4 * BS) as usize];
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for byte in data.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *byte = x as u8;
+    }
+    bounded_write(&h.fs, h.req, ino, 0, data.clone())
+        .await
+        .expect("the store's capacity fits");
+    bounded_fsync(&h, ino).await.expect("durable");
+    let e = h
+        .alloc
+        .allocate_block()
+        .await
+        .expect_err("the store is full exactly");
+    assert!(is_storage_full(&e), "{e}");
+    let g0 = fresh_refusals(&bounded_stats(&h).await);
+    let parked0 = squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes();
+    let rewrite: Vec<u8> = data[..BS as usize].iter().map(|b| b ^ 0xFF).collect();
+    assert_eq!(
+        bounded_write(&h.fs, h.req, ino, 0, rewrite).await,
+        Err(libc::ENOSPC),
+        "a transformed volume's mapped block cannot take a rewrite in place: refused"
+    );
+    assert_eq!(fresh_refusals(&bounded_stats(&h).await) - g0, 1);
+    assert_eq!(
+        squeezefs::fuse_client::SqueezefsFilesystem::parked_gauge_bytes(),
+        parked0
+    );
+    // The original bytes are intact and the file is clean.
+    let got = tokio::time::timeout(BOUND, h.fs.read(h.req, ino, 0, 0, BS as u32, 0))
+        .await
+        .expect("read answers")
+        .expect("read")
+        .data;
+    assert_eq!(&got[..], &data[..BS as usize]);
+    assert_eq!(bounded_fsync(&h, ino).await, Ok(()));
 }

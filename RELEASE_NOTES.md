@@ -815,17 +815,23 @@ its whole `dismount_wait` and then lost every block that never landed
 neighbouring mount on the same host failed to start for kernel memory
 (chain attempt 8). Now the allocator's terminal `StorageFull` LATCHES the
 volume exhausted (`alloc_fresh_supply_exhausted`; cleared by its next
-landed allocation, confirmed against the live supply so a free admits at
-once, re-probed once per allocation-park window), and while every data
+landed allocation, confirmed against every source it mints from so a
+free or a grant admits at once — a holder that is UNREACHABLE across a
+failover is the retryable class and never latches), and while every data
 volume is latched a write that would CREATE custody of a block — no
-mapping, no parked buffer, no staged copy — is refused `ENOSPC` at the
-FUSE write, before any byte is recorded (`write_fresh_block_enospc_refusals`;
-under the kernel's writeback cache the application meets it at `fsync`/`close`,
-an `O_DIRECT`/`O_SYNC` writer at `write(2)`). Custody the daemon already
-holds rides the ladder exactly as before: a whole-block rewrite of a
-mapped block lands in place at fill 1.0, an open block's last segment
-completes it (bounded by the blocks open at the fill), a file of at most
-one block on a volume with a staging directory lands in the local ring.
+mapping a write could land in place, no parked buffer, no staged copy or
+extent record, no open overlay record; a hole below EOF of a pre-sized
+file included — is refused `ENOSPC` at the FUSE write, before any byte is
+recorded (`write_fresh_block_enospc_refusals`; under the kernel's
+writeback cache the application meets it at `fsync`/`close`, an
+`O_DIRECT`/`O_SYNC` writer at `write(2)`). Custody the daemon already
+holds rides the ladder exactly as before: a rewrite of a mapped block
+that can land in place (a passthrough volume, an undecorated mapping, a
+sole owner) does so at fill 1.0, an open block's last segment completes
+it (bounded by the blocks open at the fill), a file of at most one block
+on a volume with a staging directory lands in the local ring; a rewrite
+that would CoW (a compressed or encrypted volume, a packed tenant, a
+clone-shared block) is refused like growth.
 The dismount's writeback-retire wait is skipped when every unit its sweep
 could not land failed for space (they stay staged for the next mount).
 Pinned in process on both pipeline shapes and LIVE on the real kernel

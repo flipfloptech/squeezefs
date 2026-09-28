@@ -2656,21 +2656,27 @@ pub fn holder_block_grant_sink(
     vol_tag: u64,
     writer: String,
 ) -> crate::block_grant::BlockGrantSink {
+    use crate::block_grant::GrantAnswer;
     let home = Arc::downgrade(home);
     Arc::new(move |want, held| {
         let home = home.clone();
         let writer = writer.clone();
         Box::pin(async move {
-            let home = home.upgrade()?;
+            // The home backend is gone (its shutdown): no holder answers.
+            let Some(home) = home.upgrade() else {
+                return GrantAnswer::Unreachable;
+            };
             match home.holder_block_grant(vol_tag, &writer, want, held).await {
-                Ok(CarveOutcome::Granted(g)) => Some(vec![g]),
-                Ok(CarveOutcome::Already(gs)) => Some(gs),
-                Ok(CarveOutcome::Full) => None,
+                Ok(CarveOutcome::Granted(g)) => GrantAnswer::Granted(vec![g]),
+                Ok(CarveOutcome::Already(gs)) => GrantAnswer::Granted(gs),
+                Ok(CarveOutcome::Full) => GrantAnswer::Full,
                 Err(e) => {
+                    // A holder that REFUSED (a lease it does not hold, a
+                    // screened word) is not "full": nothing latches.
                     log::warn!(
                         "block grant on data volume {vol_tag:#018x} refused by the holder: {e}"
                     );
-                    None
+                    GrantAnswer::Unreachable
                 }
             }
         })
@@ -2847,16 +2853,21 @@ pub fn wire_block_grant_sink(
                                 retried = true;
                                 continue;
                             }
-                            return None;
+                            return crate::block_grant::GrantAnswer::Unreachable;
                         }
                     }
                 }
-                let c = slot.as_mut()?;
+                let Some(c) = slot.as_mut() else {
+                    return crate::block_grant::GrantAnswer::Unreachable;
+                };
                 // The holder's derivation answers `want == 0`; the wire
                 // carries a u32 ask.
                 let ask = u32::try_from(want).unwrap_or(u32::MAX);
                 match c.block_grant(vol_tag, writer, ask, held).await {
-                    Ok(g) => return g,
+                    // The holder ANSWERED: its `None` is `Full` — the one
+                    // "nothing" that means no supply (item 24's latch).
+                    Ok(Some(g)) => return crate::block_grant::GrantAnswer::Granted(g),
+                    Ok(None) => return crate::block_grant::GrantAnswer::Full,
                     Err(e) => {
                         *slot = None;
                         stale.store(true, Ordering::Release);
@@ -2869,7 +2880,7 @@ pub fn wire_block_grant_sink(
                             continue;
                         }
                         log::warn!("block grant over the wire failed: {e}; reconnecting next ask");
-                        return None;
+                        return crate::block_grant::GrantAnswer::Unreachable;
                     }
                 }
             }

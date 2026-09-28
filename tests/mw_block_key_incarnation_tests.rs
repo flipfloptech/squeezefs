@@ -594,7 +594,8 @@ async fn a_non_holders_stale_pin_undo_releases_locally_and_ships_nothing() {
     // A grant-armed allocator whose lease THIS process does not hold, with a
     // free target installed: the joined writer's posture. The sink answers
     // no top-up; the window is what we install by hand.
-    let sink: squeezefs::block_grant::BlockGrantSink = Arc::new(|_, _| Box::pin(async { None }));
+    let sink: squeezefs::block_grant::BlockGrantSink =
+        Arc::new(|_, _| Box::pin(async { squeezefs::block_grant::GrantAnswer::Full }));
     assert!(alloc.install_block_grant_arm(tag, sink));
     squeezefs::block_grant::install_free_target(tag, "127.0.0.1:1".to_string());
     assert!(squeezefs::meta_backend::kv::alloc_lease::holding(tag).is_none());

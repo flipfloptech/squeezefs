@@ -3428,37 +3428,60 @@ impl BackendRouter {
     /// Record §7 item 24 — the set's fresh-supply verdict for the WRITE
     /// path's pre-ack refusal: `true` ⇔ every placement candidate
     /// ([`Self::get_active_backend`]'s population — the healthy,
-    /// placement-eligible data volumes) reads
-    /// [`crate::block_allocator::BlockAllocator::fresh_supply_exhausted`]. An empty candidate set
-    /// answers `false` (no verdict — the allocation path refuses with its
-    /// own "no healthy backends"). One relaxed load per volume on a set
-    /// that never refused.
+    /// placement-eligible data volumes) is latched exhausted with no
+    /// supply in sight. The hot path pays ONE relaxed load of the
+    /// process-wide latched count (`0` — every set that never refused a
+    /// fresh block — answers `false` with no census); the census over
+    /// the volumes runs only while some allocator in the process is
+    /// latched. An empty candidate set answers `false` (no verdict — the
+    /// allocation path refuses with its own "no healthy backends"). This
+    /// is the DECIDING form: a latched armed writer's holder is re-asked
+    /// off the write path (rate-limited) by the per-volume probe.
     pub fn fresh_supply_exhausted(&self) -> bool {
-        self.fresh_supply_exhausted_volumes()
+        if crate::block_allocator::fresh_supply_latched_volumes() == 0 {
+            return false;
+        }
+        self.fresh_supply_census(|a| a.fresh_supply_exhausted())
             .is_some_and(|(exhausted, candidates)| exhausted == candidates)
     }
 
-    /// `(exhausted, candidates)` over the placement population, or `None`
-    /// when it is empty — the `alloc_fresh_supply_exhausted` gauge's
-    /// numerator.
+    /// The PURE census (the `.stats` face — `alloc_fresh_supply_exhausted`):
+    /// `(latched, candidates)` over the placement population, or `None`
+    /// when it is empty. Reads every volume's pure probe; asks no holder,
+    /// moves no latch.
     pub fn fresh_supply_exhausted_volumes(&self) -> Option<(usize, usize)> {
+        if crate::block_allocator::fresh_supply_latched_volumes() == 0 {
+            // No latched allocator anywhere: the count is 0 without a
+            // census — but the candidate count still needs one row.
+            return self.fresh_supply_census(|_| false);
+        }
+        self.fresh_supply_census(|a| a.fresh_supply_latched())
+    }
+
+    /// `(volumes answering `probe`, candidates)` over the placement
+    /// population: the named volumes that are placement-eligible (which
+    /// includes the health gate) or, on a bare router, `backend_0` when
+    /// healthy.
+    fn fresh_supply_census(
+        &self,
+        probe: impl Fn(&crate::block_allocator::BlockAllocator) -> bool,
+    ) -> Option<(usize, usize)> {
         let mut candidates = 0usize;
         let mut exhausted = 0usize;
         if self.backends.is_empty() {
             if self.is_backend_healthy("backend_0") {
                 candidates = 1;
-                if self.default_allocator.fresh_supply_exhausted() {
+                if probe(&self.default_allocator) {
                     exhausted = 1;
                 }
             }
         } else {
             for entry in self.backends.iter() {
-                let be_id = entry.key();
-                if !self.placement_eligible(be_id) || !self.is_backend_healthy(be_id) {
+                if !self.placement_eligible(entry.key()) {
                     continue;
                 }
                 candidates += 1;
-                if entry.value().block_allocator.fresh_supply_exhausted() {
+                if probe(&entry.value().block_allocator) {
                     exhausted += 1;
                 }
             }

@@ -645,10 +645,13 @@ fn a_full_data_volume_refuses_new_bytes_before_the_ack_and_keeps_every_acked_byt
     }
     const CHUNK: usize = 4 * 1024 * 1024;
     const CAPACITY_CHUNKS: usize = 16;
-    // The refusal must surface within this many chunks past the fill
-    // (the blocks in flight at the fill instant are the honest slack);
-    // the loop's cap is what the pre-fix daemon never reached.
-    const SLACK_CHUNKS: usize = 4;
+    // The refusal must surface within this many chunks past the fill: a
+    // SERIAL writer with fsync per chunk has one block in flight — the
+    // chunk whose upload met the first `StorageFull` (acked before the
+    // latch set, reported at its fsync) — plus one for the latch racing
+    // that chunk's own writeback; the loop's cap is what the pre-fix
+    // daemon never reached.
+    const SLACK_CHUNKS: usize = 2;
     const LOOP_CAP: usize = CAPACITY_CHUNKS * 4;
 
     let base = scratch("fullvol");

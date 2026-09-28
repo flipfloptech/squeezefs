@@ -539,20 +539,34 @@ impl GrantWindow {
     }
 }
 
+/// A holder's answer to a top-up ask (record §7 item 24 / §4.4bz, review
+/// round 1 Issue 4): the two "nothing" answers are DIFFERENT CLASSES — a
+/// holder that said `Full` has no supply (the allocator's `StorageFull`,
+/// which latches the volume exhausted and refuses fresh-block writes
+/// before their ack), a holder that could not be REACHED may have plenty
+/// (a manager failover: the retryable `HolderUnreachable` class — the
+/// never-lossy ladder parks the unit and lands it when the holder returns,
+/// and nothing latches). The pre-fix `Option` conflated them.
+#[derive(Debug)]
+pub enum GrantAnswer {
+    /// Grants the holder carved or re-attested.
+    Granted(Vec<BlockGrant>),
+    /// The holder answered: nothing left on this volume.
+    Full,
+    /// No holder answered (a dial or wire failure after the sink's own
+    /// re-resolve-and-retry).
+    Unreachable,
+}
+
 /// The writer's top-up sink: asked for `want` more blocks on this volume
 /// (`0` = the holder's derivation) while it still holds `held_unconsumed`
 /// blocks of earlier grants (the §5.3.5 idempotency witness), answers the
 /// grants the holder carved or re-attested (in-process: the holder's
 /// ledger directly — `kv::alloc_lease::holder_block_grant_sink`; over the
 /// wire: `ManagerCall::BlockGrant` — `kv::alloc_lease::wire_block_grant_
-/// sink`). `None` = the holder had nothing (full, or unreachable — the
-/// caller refuses `StorageFull`-class, never `ENOSPC`-poisons anything).
+/// sink`), or one of the two typed "nothing" answers ([`GrantAnswer`]).
 pub type BlockGrantSink = Arc<
-    dyn Fn(
-            u64,
-            u64,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<BlockGrant>>> + Send>>
+    dyn Fn(u64, u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = GrantAnswer> + Send>>
         + Send
         + Sync,
 >;

@@ -160,6 +160,21 @@ pub type SpacePending = Arc<dyn Fn() -> bool + Send + Sync>;
 /// `pending` true.
 const ENOSPC_VALVE_MAX_ATTEMPTS: u32 = 32;
 
+/// Record §7 item 24: the number of allocators in this process whose
+/// fresh-supply latch is SET (`BlockAllocator::note_fresh_supply_exhausted`
+/// / `note_fresh_supply_available` keep it exact). The write hot path
+/// reads it once, relaxed, and runs no census while it is 0 — which is
+/// every set that never refused a fresh block.
+static FRESH_SUPPLY_LATCHED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The process-wide latched-allocator count (the write hot path's one
+/// relaxed load — `0` on every set that never refused a fresh block).
+#[inline]
+pub fn fresh_supply_latched_volumes() -> usize {
+    FRESH_SUPPLY_LATCHED.load(Ordering::Relaxed)
+}
+
 pub(crate) fn is_storage_full(e: &crate::error::SqueezefsError) -> bool {
     matches!(e, crate::error::SqueezefsError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
 }
@@ -356,6 +371,10 @@ pub struct BlockAllocator {
     /// allocation, consulted by [`Self::fresh_supply_exhausted`] — the
     /// WRITE path's pre-ack verdict on a block it would have to allocate.
     fresh_supply_exhausted_since_ns: AtomicU64,
+    /// The last instant the exhausted probe re-asked an ARMED writer's
+    /// holder for supply (`mono_core` ns; rate-limited to one ask per
+    /// allocation-park wall).
+    topup_rekick_at_ns: AtomicU64,
 }
 
 /// The allocator's derived allocation truth at one instant (PR 8 —
@@ -536,6 +555,20 @@ struct IncarnationMinter {
     seq: crate::lane_core::LaneCursor,
 }
 
+/// The outcome of one inline top-up ask ([`BlockAllocator::block_grant_topup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopupOutcome {
+    /// No arm, or the window is above its refill point.
+    NotAsked,
+    /// A grant landed in the window.
+    Landed,
+    /// The holder answered `Full` (or every grant it answered was already
+    /// installed) — no supply.
+    Full,
+    /// No holder answered — the retryable class, never exhaustion.
+    Unreachable,
+}
+
 impl BlockAllocator {
     pub async fn new(volume_id: &str) -> Result<Self> {
         Ok(Self {
@@ -563,6 +596,7 @@ impl BlockAllocator {
             grace: crate::free_grace::GraceRing::derived(),
             block_grant: std::sync::OnceLock::new(),
             fresh_supply_exhausted_since_ns: AtomicU64::new(0),
+            topup_rekick_at_ns: AtomicU64::new(0),
         })
     }
 
@@ -572,24 +606,25 @@ impl BlockAllocator {
     // custody of a block this set cannot allocate is refused before the
     // ack (`SqueezefsFilesystem::write_file_staged`). The verdict is the
     // allocator's own: its terminal `StorageFull` latches, its next landed
-    // allocation clears, and the probe below confirms against the live
-    // supply so a free that lands between the two admits at once.
+    // allocation clears, and the probe confirms against the LIVE supply —
+    // every source this allocator mints from (the free list and virgin
+    // tail, or the grant window + the held bitmap; the grace ring; an open
+    // trim claim window; a queued reclaim) — so a free that lands between
+    // the two admits at once, and a latch no clear ever reached stays
+    // INERT whenever supply is visible. There is deliberately NO
+    // time-bounded re-probe that admits a write: an admitted write on a
+    // still-full volume is acked custody that can never land (one parked
+    // block per window per volume for ever — the sink at a lower rate);
+    // the probe's conjuncts ARE the mint sources, and a mint source added
+    // later must join them. A latched ARMED writer re-asks its holder off
+    // the write path (the proactive top-up, rate-limited) so a holder that
+    // regained supply is found without a write being acked for it.
     // -----------------------------------------------------------------
 
-    /// The latch's re-probe window: past it a latched volume ADMITS one
-    /// fresh-block write, whose allocation re-tests fullness for real
-    /// (and re-latches on refusal) — the belt that heals a latch no
-    /// supply-return event cleared, at the cost of at most one acked
-    /// block per volume per window. The window is the longest legal
-    /// allocation park ([`crate::free_grace::pressure_park_wall_ms`] —
-    /// 2 × the routine fence bound, floored at 1 s): supply a park could
-    /// have waited for surfaces within it.
-    fn fresh_supply_reprobe_window_ns() -> u64 {
-        crate::free_grace::pressure_park_wall_ms().saturating_mul(1_000_000)
-    }
-
     /// Latch: a TERMINAL `StorageFull` from this allocator (every valve
-    /// pass, top-up ask and grace park exhausted).
+    /// pass, top-up ask and grace park exhausted). The process-wide
+    /// latched count ([`fresh_supply_latched_volumes`]) is the write hot
+    /// path's ONE relaxed load on a set that never refused.
     fn note_fresh_supply_exhausted(&self) {
         let now = crate::mono_core::monotonic_ns_u64().max(1);
         if self
@@ -597,52 +632,76 @@ impl BlockAllocator {
             .compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            log::info!(
-                "allocator {}: fresh supply EXHAUSTED — writes that would create custody of a \
-                 block this volume cannot allocate are refused ENOSPC before they are acked \
-                 (acked custody keeps the never-lossy ladder); the latch clears at the next \
-                 landed allocation (alloc_fresh_supply_exhausted)",
-                self._volume_id
-            );
+            FRESH_SUPPLY_LATCHED.fetch_add(1, Ordering::AcqRel);
+            // Logged only when the latch is EFFECTIVE (no supply in sight):
+            // a grace-ring park's per-slice `StorageFull` latches too, and
+            // there the probe's grace conjunct keeps the latch inert.
+            if !self.fresh_supply_visible() {
+                log::info!(
+                    "allocator {}: fresh supply EXHAUSTED — writes that would create custody \
+                     of a block this volume cannot allocate are refused ENOSPC before they \
+                     are acked (acked custody keeps the never-lossy ladder); the latch clears \
+                     at the next landed allocation (alloc_fresh_supply_exhausted)",
+                    self._volume_id
+                );
+            }
         }
     }
 
     /// Clear: an allocation LANDED on this volume.
     fn note_fresh_supply_available(&self) {
-        if self.fresh_supply_exhausted_since_ns.load(Ordering::Relaxed) != 0 {
-            self.fresh_supply_exhausted_since_ns
-                .store(0, Ordering::Release);
+        if self
+            .fresh_supply_exhausted_since_ns
+            .swap(0, Ordering::AcqRel)
+            != 0
+        {
+            FRESH_SUPPLY_LATCHED.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
-    /// `true` ⇔ a write that needs a FRESH block of this volume would be
-    /// refused for space right now: the latch is set inside its window
-    /// AND no supply is in sight — the free list and virgin tail (or the
-    /// grant window + held bitmap) read 0, the grace ring holds nothing a
-    /// park could release, no trim claim window is open, and no reclaim
-    /// is queued. One relaxed load on every volume that never refused.
-    /// A latched ARMED writer kicks its proactive top-up so a holder that
-    /// regained supply is asked off the write path.
-    pub fn fresh_supply_exhausted(&self) -> bool {
-        let since = self.fresh_supply_exhausted_since_ns.load(Ordering::Relaxed);
-        if since == 0 {
-            return false;
-        }
-        let now = crate::mono_core::monotonic_ns_u64();
-        if now.saturating_sub(since) >= Self::fresh_supply_reprobe_window_ns() {
-            // The belt: re-test fullness with a real allocation.
-            self.note_fresh_supply_available();
-            return false;
-        }
-        if self.free_supply_blocks() > 0
+    /// Supply this allocator could mint from right now, by every source it
+    /// has: the free list + virgin tail (or the grant window + held bitmap
+    /// on an armed writer), offsets a pressure park could release from the
+    /// grace ring, an open trim claim window, a queued reclaim.
+    fn fresh_supply_visible(&self) -> bool {
+        self.free_supply_blocks() > 0
             || self.reclaimable_supply_exists()
             || self.trim_claimed.load(Ordering::SeqCst) > 0
             || self.space_pending.get().is_some_and(|p| p())
-        {
+    }
+
+    /// PURE (the `.stats` face and the set census): `true` ⇔ this volume is
+    /// latched exhausted AND no supply is in sight. Never mutates, never
+    /// asks a holder.
+    pub fn fresh_supply_latched(&self) -> bool {
+        self.fresh_supply_exhausted_since_ns.load(Ordering::Relaxed) != 0
+            && !self.fresh_supply_visible()
+    }
+
+    /// The WRITE path's deciding probe: [`Self::fresh_supply_latched`], and
+    /// on a latched ARMED writer (whose window reads 0 while its holder may
+    /// have regained supply — the joined writer's shape) the proactive
+    /// top-up is kicked at most once per [`crate::free_grace::
+    /// pressure_park_wall_ms`] (the longest legal allocation park — the
+    /// cadence at which supply a park could have waited for surfaces), so
+    /// the holder is re-asked off the write path and a `Granted` answer
+    /// makes the window read positive at the next probe.
+    pub fn fresh_supply_exhausted(&self) -> bool {
+        if !self.fresh_supply_latched() {
             return false;
         }
         if self.block_grant_armed() {
-            self.kick_block_grant_topup();
+            let now = crate::mono_core::monotonic_ns_u64();
+            let cadence = crate::free_grace::pressure_park_wall_ms().saturating_mul(1_000_000);
+            let last = self.topup_rekick_at_ns.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= cadence
+                && self
+                    .topup_rekick_at_ns
+                    .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.kick_block_grant_topup();
+            }
         }
         true
     }
@@ -733,20 +792,28 @@ impl BlockAllocator {
     /// derived-size grant when the window wants one. `true` ⇔ a grant was
     /// installed. The refill cadence's tick and the exhausted mint both
     /// run it.
-    pub async fn block_grant_topup(&self) -> bool {
+    pub async fn block_grant_topup(&self) -> TopupOutcome {
         let Some(arm) = self.block_grant.get() else {
-            return false;
+            return TopupOutcome::NotAsked;
         };
         if !arm.window.wants_topup() {
-            return false;
+            return TopupOutcome::NotAsked;
         }
         arm.topups.fetch_add(1, Ordering::Relaxed);
         let held = arm.window.remaining();
         match (arm.sink)(0, held).await {
-            Some(grants) => grants
-                .into_iter()
-                .fold(false, |any, g| arm.window.install(g) || any),
-            None => false,
+            crate::block_grant::GrantAnswer::Granted(grants) => {
+                if grants
+                    .into_iter()
+                    .fold(false, |any, g| arm.window.install(g) || any)
+                {
+                    TopupOutcome::Landed
+                } else {
+                    TopupOutcome::Full
+                }
+            }
+            crate::block_grant::GrantAnswer::Full => TopupOutcome::Full,
+            crate::block_grant::GrantAnswer::Unreachable => TopupOutcome::Unreachable,
         }
     }
 
@@ -2135,7 +2202,7 @@ impl BlockAllocator {
         // the other carries the grant — the window, not the answer, is
         // the truth (found by the full-cursor supply pin).
         if is_storage_full(&e) && self.block_grant_armed() {
-            let _ = self.block_grant_topup().await;
+            let answer = self.block_grant_topup().await;
             if let ok @ Ok(_) = self.try_allocate_block() {
                 return ok;
             }
@@ -2143,6 +2210,23 @@ impl BlockAllocator {
                 if let ok @ Ok(_) = self.try_allocate_block() {
                     return ok;
                 }
+            }
+            // Item 24 (review round 1, Issue 4): an empty window whose holder
+            // could not be REACHED is not exhaustion — a manager failover on
+            // a joined writer with a drained window. The retryable class
+            // parks the unit on the never-lossy ladder (it lands when the
+            // holder returns) and never latches the volume; only a holder's
+            // own `Full` stays `StorageFull`.
+            if matches!(answer, TopupOutcome::Unreachable) {
+                return Err(crate::error::SqueezefsError::Retryable {
+                    class: crate::error::RefusalClass::HolderUnreachable { holder: 0 },
+                    msg: format!(
+                        "data volume {}: block grant window empty and the allocation holder \
+                         could not be reached — the unit stays on the never-lossy ladder \
+                         until the holder answers (block_grant_topups)",
+                        self._volume_id
+                    ),
+                });
             }
         }
         if !is_storage_full(&e) {

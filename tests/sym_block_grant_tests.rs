@@ -3235,3 +3235,57 @@ async fn a_joined_appenders_never_published_mint_returns_to_its_grant_window() {
         vec![BlockGrant { start: 102, len: 1 }]
     );
 }
+
+/// **Record §7 item 24, review round 1 Issue 4 — a JOINED writer's empty
+/// window with an UNREACHABLE holder is the retryable class, never
+/// exhaustion.** A manager failover leaves a joiner's grant window
+/// drained while the holder's venue does not answer; the mint's top-up
+/// ask fails at the dial. That is `RefusalClass::HolderUnreachable`
+/// (`EAGAIN` — the never-lossy ladder parks the unit and lands it when
+/// the successor answers), NOT `StorageFull`: the volume is not latched
+/// exhausted, and a fresh-block write is not refused `ENOSPC`. Only a
+/// holder's own `Full` answer latches. (The first build conflated the
+/// two `None`s of the grant sink.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_holder_is_the_retryable_class_never_exhaustion() {
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let vol_id = "vol-item24-unreachable";
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag(vol_id);
+    assert!(alloc_lease::holding(tag).is_none(), "premise: a non-holder");
+    let b = data_allocator(vol_id).await;
+    assert!(b.install_block_grant_arm(
+        tag,
+        alloc_lease::wire_block_grant_sink(
+            alloc_lease::HolderVenue::fixed("127.0.0.1:1".to_string()),
+            SECRET.to_vec(),
+            wire(successor_identity()),
+            0,
+            tag,
+        ),
+    ));
+    // An EMPTY window from the start: the mint's inline ask meets the
+    // dead venue.
+    assert_eq!(b.block_grant_remaining(), 0);
+    let e = b
+        .allocate_block()
+        .await
+        .expect_err("an empty window with no holder answering cannot mint");
+    match &e {
+        squeezefs::error::SqueezefsError::Retryable { class, msg } => {
+            assert!(
+                matches!(
+                    class,
+                    squeezefs::error::RefusalClass::HolderUnreachable { .. }
+                ),
+                "the retryable class names the unreachable holder: {class:?} ({msg})"
+            );
+        }
+        other => panic!("an unreachable holder is never StorageFull: {other:?}"),
+    }
+    assert!(
+        !b.fresh_supply_latched(),
+        "an outage latches nothing — a fresh-block write is not refused ENOSPC"
+    );
+    assert!(!b.fresh_supply_exhausted());
+}

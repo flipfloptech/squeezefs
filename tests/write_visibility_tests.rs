@@ -2302,10 +2302,11 @@ async fn write_meeting_a_transiently_failing_settle_converges_never_eio() {
 /// into a fresh block while the set is LATCHED exhausted is refused
 /// `ENOSPC` before the ack (`fresh_block_write_against_a_latched_store_
 /// is_refused_before_the_mint` below). The mint's decline is reached by
-/// the write the latch ADMITS — the first refusal of a not-yet-latched
-/// store, or the belt's one re-probe write per window — so this pin
-/// drains the store, waits the latch's re-probe window out, and drives
-/// that admitted write into the mint.
+/// the FIRST refusal of a not-yet-latched store — the allocator's
+/// terminal `StorageFull` is what latches, and nothing before it has
+/// refused — so this pin drains the store to its last block WITHOUT a
+/// refusal (exactly its visible supply) and drives the write that meets
+/// the first refusal into the mint: the decline, the accumulation ACK.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
     use std::sync::atomic::Ordering as AtomOrd;
@@ -2325,27 +2326,23 @@ async fn fresh_overlay_mint_under_space_pressure_declines_never_eio() {
     // regardless of the clamp): the next allocate is StorageFull — the
     // transient-pressure shape, held deterministically.
     h.ba.set_capacity_bytes(h.ba.chunk_size());
-    let mut drained = 0u32;
-    while h.ba.allocate_block().await.is_ok() {
-        drained += 1;
-        assert!(drained < 10_000, "free list never drained under the clamp");
-    }
-    // The drain's final refusal LATCHED the store (item 24). The mint is
-    // reached by the write the latch admits: wait its re-probe window out
-    // (the longest legal allocation park — supply a park could have
-    // waited for surfaces within it), so the next fresh-block write is
-    // the belt's one admitted re-test.
+    // Drain EXACTLY the visible supply — every allocation lands, none
+    // refuses, so nothing latches: the write below meets the FIRST
+    // refusal at its own mint (item 24's latch is the terminal refusal's).
+    let supply = h.ba.free_supply_blocks();
     assert!(
-        h.ba.fresh_supply_exhausted(),
-        "the drain's terminal refusal latched the store"
+        supply < 10_000,
+        "unbounded supply under the clamp: {supply}"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(
-        squeezefs::free_grace::pressure_park_wall_ms() + 50,
-    ))
-    .await;
+    for _ in 0..supply {
+        h.ba.allocate_block()
+            .await
+            .expect("inside the visible supply");
+    }
+    assert_eq!(h.ba.free_supply_blocks(), 0, "the store is empty");
     assert!(
-        !h.ba.fresh_supply_exhausted(),
-        "past the re-probe window the latch admits one fresh-block write"
+        !h.ba.fresh_supply_latched(),
+        "no refusal happened yet, so nothing is latched"
     );
 
     // The write that walks the fresh-shape overlay screen (striped file,

@@ -2672,11 +2672,11 @@ pub fn holder_block_grant_sink(
                 Ok(CarveOutcome::Full) => GrantAnswer::Full,
                 Err(e) => {
                     // A holder that REFUSED (a lease it does not hold, a
-                    // screened word) is not "full": nothing latches.
+                    // screened word) is neither "full" nor an outage.
                     log::warn!(
                         "block grant on data volume {vol_tag:#018x} refused by the holder: {e}"
                     );
-                    GrantAnswer::Unreachable
+                    GrantAnswer::Refused(e.to_string())
                 }
             }
         })

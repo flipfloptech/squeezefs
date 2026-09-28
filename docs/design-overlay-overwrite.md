@@ -259,7 +259,11 @@ Load-bearing points, each with its measured or structural reason:
   the epoch's ENOSPC early-close ladder (KD-1.7) reclaims — the
   accumulation fallback triggers it; a propagated error would fail a
   write that the ladder can serve. Counted `overlay_enospc_declines`.
-  Every other mint error stays loud.
+  The typed retryable class declines the same way (record §7 item 24,
+  review round 2 — a joined writer's grant window empty with its
+  allocation holder unreachable across a manager failover: the outage,
+  not space), counted `overlay_unreachable_declines`. Every other mint
+  error stays loud.
 * **The hold gates** (`overlay_hold_eligible:12754`,
   `zc_write_hold_eligible:17912`) relax identically — mapped blocks
   become hold-eligible under the same conjuncts — so the slot is
@@ -986,7 +990,7 @@ family (`src/fuse_client.rs:5854+`):
 | `overlay_epoch_feeds` / `overlay_feed_fallbacks` | arm (a) vs the shadow-off degenerate; `fallbacks > 0` with the lever ON is a bug |
 | `overlay_gap_seed_old_bytes` | the §5.8 falsifier instrument (subset of `overlay_gap_seed_bytes`); ≈ 0 on sequential shapes |
 | `overlay_gap_seed_read_bytes` / `overlay_gap_seed_ranged_bytes` | the §5.8 seed-bytes law (W-6): device bytes READ to source gap seeds (the amplification numerator — `read ÷ old` ≈ 1 with the ranged seed engaged, = block window ÷ Σ gaps on the `SQUEEZEFS_GAP_SEED_RANGED=0` control) / the old-sourced seed bytes that rode the ranged funnel (⊆ `overlay_gap_seed_old_bytes`; 0 with the lever off, on decorated bindings and where Σ gaps ≥ the window) |
-| `overlay_ineligible_shadow_bound`, `overlay_enospc_declines` | the two new decline ledgers (§5.1) |
+| `overlay_ineligible_shadow_bound`, `overlay_enospc_declines`, `overlay_unreachable_declines` | the decline ledgers (§5.1) — the third is the retryable-class twin of the ENOSPC decline (an unreachable allocation holder on a joined writer; 0 on every unarmed mount) |
 | `overlay_ineligible_range_shared` | the S11 rung-16 range clause (§5.1) — the W1 clause-7 twin, kept apart from `patch_ineligible_range_shared` and from `overlay_ineligible_shadow_bound` (the ledgers must not merge). **0 on every shipped mount** (whole-file leases ARE whole-inode custody; no verb issues ranges without the mw arm) and **0 on block-aligned ranged rows** (`design-full-multi-writer.md` §9.5's MPI-IO gate: nothing should share a block) — growth means range custody engaged on sub-block-shared blocks (rung 17's demotion territory) or the predicate rotted |
 | `overlay_ineligible_sub_cap` | the §5.1 **length floor** (finding 47): aligned single-block passthrough segments every other shape conjunct admitted but whose length is ≤ the W1 cap (`patch_max_bytes()`, block_size/8) — sent down the W1/W2 ladder instead, BOTH shapes. Grows ≈ per sub-cap aligned write on overlay-armed mounts by design; `overlay_gap_seed_old_bytes` growing on a rand-4k row while this stays flat is the predicate rotting. 0 under `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0 empties the sub-cap class) |
 | `patch_ineligible_device_overlay` | W1 clause 8 (kept apart from both the W2 `patch_ineligible_overlay` bucket and the S11 clause-7 `patch_ineligible_range_shared`) |

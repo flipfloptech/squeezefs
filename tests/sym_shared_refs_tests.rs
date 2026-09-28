@@ -1589,3 +1589,113 @@ async fn the_c8_stale_record_release_lands_on_the_records_own_key_on_a_forest() 
     assert!(rig.drift().await.is_empty(), "the oracle reads clean");
     rig.shutdown().await;
 }
+
+/// **Record §7 item 24, review round 2 (Issue 18) — the pre-ack probe
+/// shares W1's POSTURE clause.** A full set refuses a write that would
+/// create custody of a block nothing can allocate BEFORE the ack; a MAPPED
+/// block is "held" only where an in-place arm can land the rewrite. The
+/// first build judged that from the mapping alone (passthrough, whole
+/// block, refcount 1, unshared) — every clause true of a JOINED writer's
+/// own mint — but a non-holder of the volume's ownership plane never
+/// patches in place (`SoleOwnerVerdict::NonHolder`, the W1 ledger's
+/// `patch_ineligible_posture`): its rewrite CoWs, needs the block nothing
+/// can grant, and rode the sink. The probe now runs the ONE sync posture
+/// half W1 runs (`DataRouter::sole_owner_posture_verdict`), so on an armed
+/// mount whose allocator is grant-armed with the lease held elsewhere
+/// (`holds_ownership_plane() == false`) the rewrite of its own mapped
+/// block is refused `ENOSPC` with nothing acked and nothing parked, the
+/// original bytes intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_holders_rewrite_of_its_own_mapped_block_is_refused_on_a_full_set() {
+    use common::sym::{mount_fuse, pattern, req};
+    use fuse3::raw::prelude::Filesystem;
+    use squeezefs::block_grant::{BlockGrant, BlockGrantSink, GrantAnswer};
+    use squeezefs::fuse_client::{SqueezefsFilesystem, METRICS};
+    let dir = tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    let uris = vec![format_stamped_member(dir.path(), "meta0").await];
+    let data = data_file();
+    let rig = mount_fuse(&uris, data.path(), &Knobs::armed(), "64MB").await;
+    assert!(
+        rig.fs.router.symmetric_armed(),
+        "premise: the router half of the plane is armed"
+    );
+    // The joined writer's allocator posture: a block-grant arm with a
+    // two-block window whose holder — another daemon, in production — is
+    // FULL past it; this process holds no allocation lease for the volume.
+    let sink: BlockGrantSink = Arc::new(|_, _| Box::pin(async { GrantAnswer::Full }));
+    assert!(rig.alloc.install_block_grant_arm(rig.tag(), sink));
+    assert!(rig
+        .alloc
+        .install_block_grant(BlockGrant { start: 0, len: 2 }));
+    assert!(
+        !rig.alloc.holds_ownership_plane(),
+        "premise: a non-holder of the ownership plane"
+    );
+    let bs = rig.fs.router.block_size.load(Ordering::Relaxed) as usize;
+
+    // Its own two-block striped file, durable: the window is spent.
+    let ino = rig.create("own_mapped").await;
+    let image = pattern(11, 2 * bs);
+    rig.write_at(ino, 0, &image).await;
+    rig.fs
+        .fsync(req(), ino, 0, false)
+        .await
+        .expect("the fill is durable");
+    let mapping = rig.mapping0(ino).await.expect("block 0 is mapped");
+    assert!(
+        squeezefs::routing::is_whole_block_mapping(&mapping),
+        "premise: an undecorated whole-block mapping — every SHAPE clause of the in-place arms"
+    );
+    let mut drained = 0u32;
+    while rig.alloc.allocate_block().await.is_ok() {
+        drained += 1;
+        assert!(drained < 16, "the window never drained");
+    }
+    assert!(
+        rig.alloc.fresh_supply_exhausted(),
+        "premise: the holder's Full latched the volume"
+    );
+
+    let refused0 = METRICS
+        .write_fresh_block_enospc_refusals
+        .load(Ordering::Relaxed);
+    let parked0 = SqueezefsFilesystem::parked_gauge_bytes();
+    let rewrite: Vec<u8> = image[..bs].iter().map(|b| b ^ 0xFF).collect();
+    let r = rig
+        .fs
+        .write(
+            req(),
+            ino,
+            0,
+            0,
+            bytes::Bytes::copy_from_slice(&rewrite),
+            0,
+            0,
+        )
+        .await;
+    assert_eq!(
+        r.map(|w| w.written).map_err(|e| i32::from(e).abs()),
+        Err(libc::ENOSPC),
+        "a non-holder's rewrite of its own mapped block needs a fresh block: refused before the ack"
+    );
+    assert_eq!(
+        METRICS
+            .write_fresh_block_enospc_refusals
+            .load(Ordering::Relaxed)
+            - refused0,
+        1
+    );
+    assert_eq!(
+        SqueezefsFilesystem::parked_gauge_bytes(),
+        parked0,
+        "nothing parked"
+    );
+    assert_eq!(
+        rig.read(ino, bs).await,
+        &image[..bs],
+        "the original bytes stand"
+    );
+    assert!(rig.drift().await.is_empty(), "C8 clean");
+    rig.shutdown().await;
+}

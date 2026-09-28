@@ -3459,31 +3459,29 @@ impl BackendRouter {
     }
 
     /// `(volumes answering `probe`, candidates)` over the placement
-    /// population: the named volumes that are placement-eligible (which
-    /// includes the health gate) or, on a bare router, `backend_0` when
-    /// healthy.
+    /// population — the PLACEMENT TABLE's snapshot (one `ArcSwap` load, the
+    /// pick path's own; every row carries its allocator, so the census is
+    /// N relaxed loads and touches no `DashMap` — review round 2, Issue 17:
+    /// an inert latch on one permanently full sibling keeps the process
+    /// count above 0 for the mount's life, and the census then runs on
+    /// every striped write). The candidates are the rows placement
+    /// judged eligible at the last refresh (healthy AND `active`); a
+    /// registration refreshes the table, so a just-added volume is a
+    /// candidate at once. A bare router's table carries `backend_0`.
     fn fresh_supply_census(
         &self,
         probe: impl Fn(&crate::block_allocator::BlockAllocator) -> bool,
     ) -> Option<(usize, usize)> {
+        let table = self.placement_table.load();
         let mut candidates = 0usize;
         let mut exhausted = 0usize;
-        if self.backends.is_empty() {
-            if self.is_backend_healthy("backend_0") {
-                candidates = 1;
-                if probe(&self.default_allocator) {
-                    exhausted = 1;
-                }
+        for row in &table.rows {
+            if !row.eligible {
+                continue;
             }
-        } else {
-            for entry in self.backends.iter() {
-                if !self.placement_eligible(entry.key()) {
-                    continue;
-                }
-                candidates += 1;
-                if probe(&entry.value().block_allocator) {
-                    exhausted += 1;
-                }
+            candidates += 1;
+            if probe(&row.allocator) {
+                exhausted += 1;
             }
         }
         (candidates > 0).then_some((exhausted, candidates))
@@ -8063,6 +8061,33 @@ impl DataRouter {
         self.sole_owner_verdict(ino, allocator, offset).await == SoleOwnerVerdict::Sole
     }
 
+    /// The SYNC posture half of [`Self::sole_owner_verdict`] (symmetric PR
+    /// 9 / 13; item 24 review round 2, Issue 18 — ONE function so the
+    /// write path's pre-ack probe and W1 cannot drift): `Some(refusal)`
+    /// when no in-place arm exists for this mount on this block — a
+    /// non-holder of the volume's ownership plane (`NonHolder`) or a file
+    /// whose custody a slot holder grants (`ForeignCustody`) — and `None`
+    /// when the durable clause decides. Inert on an unarmed mount.
+    pub fn sole_owner_posture_verdict(
+        &self,
+        ino: u64,
+        allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
+    ) -> Option<SoleOwnerVerdict> {
+        if !self.symmetric_armed() {
+            return None;
+        }
+        // PR 13: the ownership-accounting plane first — a non-holder's
+        // patch would be refused at the allocator's gate with an ERROR per
+        // attempt; decide it here as the counted posture clause.
+        if !allocator.holds_ownership_plane() {
+            return Some(SoleOwnerVerdict::NonHolder);
+        }
+        if crate::data_grant::slot_holder_home(ino).is_some() {
+            return Some(SoleOwnerVerdict::ForeignCustody);
+        }
+        None
+    }
+
     /// [`Self::sole_owner_durably`] with the refusal's CLASS (symmetric
     /// PR 9, review round 2 — Issue 12: the W1 ledger names which clause
     /// declined): a file whose custody this mount holds from its SLOT
@@ -8079,17 +8104,11 @@ impl DataRouter {
         allocator: &std::sync::Arc<crate::block_allocator::BlockAllocator>,
         offset: u64,
     ) -> SoleOwnerVerdict {
+        if let Some(refused) = self.sole_owner_posture_verdict(ino, allocator) {
+            return refused;
+        }
         if !self.symmetric_armed() {
             return SoleOwnerVerdict::Sole;
-        }
-        // PR 13: the ownership-accounting plane first — a non-holder's
-        // patch would be refused at the allocator's gate with an ERROR per
-        // attempt; decide it here as the counted posture clause.
-        if !allocator.holds_ownership_plane() {
-            return SoleOwnerVerdict::NonHolder;
-        }
-        if crate::data_grant::slot_holder_home(ino).is_some() {
-            return SoleOwnerVerdict::ForeignCustody;
         }
         let Some(mb) = self.inner.meta_backend.get() else {
             return SoleOwnerVerdict::Sole;

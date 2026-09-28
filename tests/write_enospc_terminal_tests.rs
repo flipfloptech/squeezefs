@@ -1153,3 +1153,90 @@ async fn a_rewrite_of_a_mapped_block_on_a_transformed_volume_is_refused_when_exh
     assert_eq!(&got[..], &data[..BS as usize]);
     assert_eq!(bounded_fsync(&h, ino).await, Ok(()));
 }
+
+// ---------------------------------------------------------------------------
+// 5. Review round 2 — the latch's process count, the typed retry class
+// ---------------------------------------------------------------------------
+
+/// Review round 2, Issue 17: a LATCHED allocator that is retired — a
+/// removed volume, a re-mounted set, a test fixture — takes its latch out
+/// of the process-wide count with it. The count is what every striped
+/// write reads first (`BackendRouter::fresh_supply_exhausted` runs no
+/// census while it is 0), so a latch that outlived its allocator would
+/// keep the census on every write of every later mount in the process.
+/// Also the count's own law: one refusal latches once (a second refusal
+/// on the same allocator moves nothing), and a landed allocation clears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_latched_allocator_leaves_the_process_count() {
+    let _s = serial();
+    let _r = restore();
+    let before = squeezefs::block_allocator::fresh_supply_latched_volumes();
+    let a = allocator("f24_drop_count", 1).await;
+    a.allocate_block().await.expect("the one block");
+    for _ in 0..3 {
+        let e = a.allocate_block().await.expect_err("full");
+        assert!(is_storage_full(&e), "{e}");
+    }
+    assert!(a.fresh_supply_latched());
+    assert_eq!(
+        squeezefs::block_allocator::fresh_supply_latched_volumes(),
+        before + 1,
+        "three refusals latch ONCE"
+    );
+    // A landed allocation clears the latch and the count with it.
+    a.set_capacity_bytes(2 * a.chunk_size());
+    a.allocate_block().await.expect("supply returned");
+    assert!(!a.fresh_supply_latched());
+    assert_eq!(
+        squeezefs::block_allocator::fresh_supply_latched_volumes(),
+        before
+    );
+    // Latched again, then DROPPED: the count follows the allocator out.
+    let e = a.allocate_block().await.expect_err("full again");
+    assert!(is_storage_full(&e), "{e}");
+    assert_eq!(
+        squeezefs::block_allocator::fresh_supply_latched_volumes(),
+        before + 1
+    );
+    drop(a);
+    assert_eq!(
+        squeezefs::block_allocator::fresh_supply_latched_volumes(),
+        before,
+        "a retired allocator's latch leaves the process count"
+    );
+}
+
+/// Review round 2, Issue 16: the typed retryable classes are the writeback
+/// ladder's RETRY verdict, never a terminal (close-time-reported) error —
+/// a joined writer whose allocation holder is unreachable across a
+/// failover has its bytes safe in staging; they land when the successor
+/// answers. Before the class was typed the same outage travelled as
+/// `StorageFull`, which the ENOSPC arm already retries — the two must
+/// agree. A refusal stays terminal.
+#[test]
+fn a_retryable_class_is_never_a_terminal_writeback_error() {
+    use squeezefs::error::RefusalClass;
+    let unreachable = SqueezefsError::Retryable {
+        class: RefusalClass::HolderUnreachable { holder: 0 },
+        msg: "block grant window empty and the allocation holder could not be reached".to_string(),
+    };
+    assert!(
+        !squeezefs::fuse_client::writeback_error_is_terminal(&unreachable),
+        "an unreachable holder is retried, never latched into the app's close"
+    );
+    let full = SqueezefsError::Io(std::io::Error::new(
+        std::io::ErrorKind::StorageFull,
+        "block grant window empty",
+    ));
+    assert!(
+        !squeezefs::fuse_client::writeback_error_is_terminal(&full),
+        "the ENOSPC arm the typed class replaced is retried too"
+    );
+    let refused = SqueezefsError::InvalidOperation(
+        "block grant window empty and the allocation holder REFUSED the ask".to_string(),
+    );
+    assert!(
+        squeezefs::fuse_client::writeback_error_is_terminal(&refused),
+        "a holder's deterministic refusal is terminal"
+    );
+}

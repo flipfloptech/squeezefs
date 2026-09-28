@@ -556,6 +556,11 @@ pub enum GrantAnswer {
     /// No holder answered (a dial or wire failure after the sink's own
     /// re-resolve-and-retry).
     Unreachable,
+    /// The holder answered and REFUSED the ask (a screened word, a lease
+    /// it does not hold — `manager_verb_rejected`'s class): deterministic,
+    /// neither exhaustion nor an outage; the allocator surfaces it loud
+    /// and latches nothing.
+    Refused(String),
 }
 
 /// The writer's top-up sink: asked for `want` more blocks on this volume

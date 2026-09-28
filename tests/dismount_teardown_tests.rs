@@ -564,11 +564,12 @@ async fn the_dismount_retire_wait_skips_custody_the_exhausted_set_cannot_land() 
 /// pre-fix tree: the entry stays staged with `flushed == 1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_dismount_sweep_flushes_a_writer_scoped_staged_block() {
-    // The writer scope is PROCESS-GLOBAL (every sibling mints keys through
-    // it): hold this suite's scope lock for the engaged window so the pin
-    // is safe under the parallel runner too (the gate runs serial).
-    static SCOPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _scope = SCOPE.lock().await;
+    // The writer scope is PROCESS-GLOBAL. Its engaged window is harmless
+    // to this suite's siblings: each mints and reads its keys under
+    // whatever scope is in force at that instant (a scoped key is `Mine`
+    // to the sweep, an unscoped literal is `Legacy` — both flushed), and
+    // none asserts an unscoped key literal against a minted one. The gate
+    // runs the suite serial in any case.
     struct Disengage;
     impl Drop for Disengage {
         fn drop(&mut self) {

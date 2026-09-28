@@ -4264,6 +4264,26 @@ fn membership_reassertion_wait_bound_is_two_renewal_beats() {
     );
 }
 
+/// **A latched armed writer re-asks its allocation holder at the renewal
+/// beat** (record §7 item 24, review round 2, Issue 21): the write path's
+/// deciding probe (`BlockAllocator::fresh_supply_exhausted`) re-kicks the
+/// proactive block-grant top-up at most once per
+/// `topup_rekick_cadence_ms`, which IS `membership::renewal_beat_ms` —
+/// the grant's own carriage, the beat at which a holder's state reaches
+/// its members anyway (the first build borrowed the allocation park's
+/// wall, whose reason is the park's). Published as
+/// `alloc_fresh_supply_reask_ms`; a drift between the two is red here.
+#[test]
+fn fresh_supply_reask_cadence_is_the_renewal_beat() {
+    let beat_ms = squeezefs::membership::renewal_beat_ms();
+    assert!(beat_ms > 0);
+    assert_eq!(
+        squeezefs::block_allocator::BlockAllocator::topup_rekick_cadence_ms(),
+        beat_ms,
+        "the latched writer's re-ask cadence is exactly renewal_beat_ms ({beat_ms} ms)"
+    );
+}
+
 /// **A reclaim hint carries at most one FORGET batch** (symmetric PR 13h,
 /// review round 1, Issue 1): the wire's per-hint ino cap
 /// (`meta_ship::RECLAIM_HINT_MAX_INOS` — the served side REJECTS a longer

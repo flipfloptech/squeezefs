@@ -831,7 +831,25 @@ sole owner) does so at fill 1.0, an open block's last segment completes
 it (bounded by the blocks open at the fill), a file of at most one block
 on a volume with a staging directory lands in the local ring; a rewrite
 that would CoW (a compressed or encrypted volume, a packed tenant, a
-clone-shared block) is refused like growth.
+clone-shared block) is refused like growth — and so is a mapped block
+THIS mount cannot rewrite in place whatever its shape: a joined writer
+holds no ownership plane and a file another slot holder grants custody
+of never patches here (the write path runs the one posture clause W1
+runs). A striped file whose block map is not held in RAM (the kvmap
+partial store) has no in-place arm, so on a full set a hole inside it
+and a rewrite of its mapped block are both refused.
+One behaviour change beside it on the symmetric default: a JOINED writer
+whose grant window is drained while its allocation holder cannot be
+reached (a manager failover) now answers the retryable `EAGAIN` for the
+write-owned mints (the inline→striped promotion, a sparse-stripe mint)
+where 1.2.x answered `ENOSPC` — an outage is not exhaustion: nothing
+latches, the fresh-shape overlay mint declines to the accumulation ladder
+on it (`overlay_unreachable_declines`), the writeback ladder retries the
+class, and every parked unit of that writer lands when the successor
+answers; a latched joined writer re-asks its holder off the write path
+once per membership renewal beat (`alloc_fresh_supply_reask_ms`). A
+holder that REFUSES the ask outright (a screened word) is a loud
+`EINVAL`, neither exhaustion nor an outage.
 The dismount's writeback-retire wait is skipped when every unit its sweep
 could not land failed for space (they stay staged for the next mount).
 Pinned in process on both pipeline shapes and LIVE on the real kernel

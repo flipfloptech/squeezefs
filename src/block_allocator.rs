@@ -555,8 +555,19 @@ struct IncarnationMinter {
     seq: crate::lane_core::LaneCursor,
 }
 
+impl Drop for BlockAllocator {
+    fn drop(&mut self) {
+        // A latched allocator that is retired (a removed volume, a test
+        // fixture) must not keep the process-wide count above 0 for ever —
+        // review round 2, Issue 17.
+        if self.fresh_supply_exhausted_since_ns.load(Ordering::Relaxed) != 0 {
+            FRESH_SUPPLY_LATCHED.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// The outcome of one inline top-up ask ([`BlockAllocator::block_grant_topup`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopupOutcome {
     /// No arm, or the window is above its refill point.
     NotAsked,
@@ -567,6 +578,9 @@ pub enum TopupOutcome {
     Full,
     /// No holder answered — the retryable class, never exhaustion.
     Unreachable,
+    /// The holder refused the ask (a deterministic verb rejection) — loud,
+    /// never exhaustion.
+    Refused(String),
 }
 
 impl BlockAllocator {
@@ -670,6 +684,16 @@ impl BlockAllocator {
             || self.space_pending.get().is_some_and(|p| p())
     }
 
+    /// The cadence at which a latched ARMED writer re-asks its holder for
+    /// supply: the membership RENEWAL beat (`membership::renewal_beat_ms`)
+    /// — the grant's own carriage, the beat at which a holder's state
+    /// reaches its members anyway (review round 2, Issue 21; the first
+    /// build borrowed the allocation park's wall, whose reason is the
+    /// park's). Published as `alloc_fresh_supply_reask_ms`.
+    pub fn topup_rekick_cadence_ms() -> u64 {
+        crate::membership::renewal_beat_ms()
+    }
+
     /// PURE (the `.stats` face and the set census): `true` ⇔ this volume is
     /// latched exhausted AND no supply is in sight. Never mutates, never
     /// asks a holder.
@@ -681,10 +705,8 @@ impl BlockAllocator {
     /// The WRITE path's deciding probe: [`Self::fresh_supply_latched`], and
     /// on a latched ARMED writer (whose window reads 0 while its holder may
     /// have regained supply — the joined writer's shape) the proactive
-    /// top-up is kicked at most once per [`crate::free_grace::
-    /// pressure_park_wall_ms`] (the longest legal allocation park — the
-    /// cadence at which supply a park could have waited for surfaces), so
-    /// the holder is re-asked off the write path and a `Granted` answer
+    /// top-up is kicked at most once per [`Self::topup_rekick_cadence_ms`],
+    /// so the holder is re-asked off the write path and a `Granted` answer
     /// makes the window read positive at the next probe.
     pub fn fresh_supply_exhausted(&self) -> bool {
         if !self.fresh_supply_latched() {
@@ -692,7 +714,7 @@ impl BlockAllocator {
         }
         if self.block_grant_armed() {
             let now = crate::mono_core::monotonic_ns_u64();
-            let cadence = crate::free_grace::pressure_park_wall_ms().saturating_mul(1_000_000);
+            let cadence = Self::topup_rekick_cadence_ms().saturating_mul(1_000_000);
             let last = self.topup_rekick_at_ns.load(Ordering::Relaxed);
             if now.saturating_sub(last) >= cadence
                 && self
@@ -814,6 +836,7 @@ impl BlockAllocator {
             }
             crate::block_grant::GrantAnswer::Full => TopupOutcome::Full,
             crate::block_grant::GrantAnswer::Unreachable => TopupOutcome::Unreachable,
+            crate::block_grant::GrantAnswer::Refused(why) => TopupOutcome::Refused(why),
         }
     }
 
@@ -2217,16 +2240,30 @@ impl BlockAllocator {
             // parks the unit on the never-lossy ladder (it lands when the
             // holder returns) and never latches the volume; only a holder's
             // own `Full` stays `StorageFull`.
-            if matches!(answer, TopupOutcome::Unreachable) {
-                return Err(crate::error::SqueezefsError::Retryable {
-                    class: crate::error::RefusalClass::HolderUnreachable { holder: 0 },
-                    msg: format!(
+            match answer {
+                TopupOutcome::Unreachable => {
+                    return Err(crate::error::SqueezefsError::Retryable {
+                        // The class word is PR 13b's slot-holder shape; the
+                        // ALLOCATION holder is not an appender id, so 0
+                        // stands for "the holder of this volume's lease".
+                        class: crate::error::RefusalClass::HolderUnreachable { holder: 0 },
+                        msg: format!(
+                            "data volume {}: block grant window empty and the allocation \
+                             holder could not be reached — the unit stays on the never-lossy \
+                             ladder until the holder answers (block_grant_topups)",
+                            self._volume_id
+                        ),
+                    });
+                }
+                TopupOutcome::Refused(why) => {
+                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
                         "data volume {}: block grant window empty and the allocation holder \
-                         could not be reached — the unit stays on the never-lossy ladder \
-                         until the holder answers (block_grant_topups)",
+                         REFUSED the ask ({why}) — a verb rejection, neither exhaustion nor \
+                         an outage",
                         self._volume_id
-                    ),
-                });
+                    )));
+                }
+                TopupOutcome::NotAsked | TopupOutcome::Landed | TopupOutcome::Full => {}
             }
         }
         if !is_storage_full(&e) {

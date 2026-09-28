@@ -2453,6 +2453,112 @@ async fn fresh_block_write_against_a_latched_store_is_refused_before_the_mint() 
     h.ba.set_capacity_bytes(0);
 }
 
+/// Record §7 item 24, review round 2 (Issue 15) — the decline pin's THIRD
+/// class: a JOINED writer's grant window is empty and its allocation
+/// holder cannot be REACHED (a manager failover). The mint's inline
+/// top-up answers the typed retryable `HolderUnreachable` class (never
+/// `StorageFull`, so nothing latches and no pre-ack refusal fires), the
+/// fresh-shape overlay mint DECLINES to accumulation on it exactly as it
+/// does on `StorageFull` — counted on `overlay_unreachable_declines`, the
+/// sibling gauge — the write ACKs into the parked ladder, and the bytes
+/// LAND once the holder answers (the sink flips to `Granted`, the fsync
+/// drives the parked unit through the refilled window). Never `EIO`, and
+/// never a spurious `ENOSPC`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_overlay_mint_against_an_unreachable_holder_declines_and_lands_later() {
+    use squeezefs::block_grant::{BlockGrant, GrantAnswer};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+    let h = Arc::new(make().await);
+    squeezefs::device_overlay::set_device_overlay_for_tests(true, true);
+
+    let ino = create(&h, "ovl_unreachable").await;
+    let pattern: Vec<u8> = (0..2 * BS as usize + OVL_SEG)
+        .map(|i| (i % 251) as u8 ^ 0x7E)
+        .collect();
+    write_at(&h, ino, 0, &pattern[..2 * BS as usize]).await;
+    fsync(&h, ino).await;
+
+    // The joined writer's posture on this allocator: a block-grant arm
+    // whose window is EMPTY and whose holder is unreachable — until the
+    // successor answers (the flag), when it grants a fresh run well past
+    // every block the fixture minted.
+    let reachable = Arc::new(AtomicBool::new(false));
+    let sink_flag = Arc::clone(&reachable);
+    let sink: squeezefs::block_grant::BlockGrantSink = Arc::new(move |_, _| {
+        let up = sink_flag.load(AtomOrd::Acquire);
+        Box::pin(async move {
+            if up {
+                GrantAnswer::Granted(vec![BlockGrant {
+                    start: 1024,
+                    len: 4,
+                }])
+            } else {
+                GrantAnswer::Unreachable
+            }
+        })
+    });
+    let tag = squeezefs::meta_backend::kv::block_refs::volume_tag("wvis_test");
+    assert!(h.ba.install_block_grant_arm(tag, sink));
+    assert_eq!(h.ba.free_supply_blocks(), 0, "the window is empty");
+    assert!(!h.ba.fresh_supply_latched(), "nothing refused yet");
+
+    let declines0 = squeezefs::fuse_client::METRICS
+        .overlay_unreachable_declines
+        .load(AtomOrd::Relaxed);
+    let enospc0 = squeezefs::fuse_client::METRICS
+        .overlay_enospc_declines
+        .load(AtomOrd::Relaxed);
+    let refused0 = squeezefs::fuse_client::METRICS
+        .write_fresh_block_enospc_refusals
+        .load(AtomOrd::Relaxed);
+    // The fresh-shape overlay write: the mint asks the holder, the holder
+    // is unreachable, the mint declines, the write acks into the park.
+    write_at(&h, ino, 2 * BS, &pattern[2 * BS as usize..]).await;
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .overlay_unreachable_declines
+            .load(AtomOrd::Relaxed)
+            - declines0,
+        1,
+        "the fresh-shape mint took the UNREACHABLE decline (engagement law)"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .overlay_enospc_declines
+            .load(AtomOrd::Relaxed),
+        enospc0,
+        "not the ENOSPC decline: the class is the outage, not space"
+    );
+    assert_eq!(
+        squeezefs::fuse_client::METRICS
+            .write_fresh_block_enospc_refusals
+            .load(AtomOrd::Relaxed),
+        refused0,
+        "an unreachable holder never latches, so the pre-ack refusal never fires"
+    );
+    assert!(
+        !h.ba.fresh_supply_latched(),
+        "the retryable class latches nothing"
+    );
+    let got = read_at(&h, ino, 2 * BS, OVL_SEG as u32).await;
+    assert_eq!(
+        &got[..],
+        &pattern[2 * BS as usize..],
+        "the acked bytes serve from the accumulation park"
+    );
+
+    // The successor answers: the next ask is granted, the parked unit
+    // lands through the refilled window, and the bytes are durable.
+    reachable.store(true, AtomOrd::Release);
+    fsync(&h, ino).await;
+    assert!(
+        h.ba.block_grant_remaining() < 4,
+        "the parked unit minted from the successor's grant"
+    );
+    let got = read_at(&h, ino, 2 * BS, OVL_SEG as u32).await;
+    assert_eq!(&got[..], &pattern[2 * BS as usize..]);
+}
+
 /// generic/795 round-4 falsification, arm 2 (writer starvation): the
 /// round-3 escalation SETTLED every live record it met — an OPEN record
 /// is the writer's live streaming vehicle, so each reader escalation

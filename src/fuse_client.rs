@@ -2096,6 +2096,12 @@ pub fn writeback_error_is_terminal(e: &SqueezefsError) -> bool {
         SqueezefsError::FencingTokenExpired { .. } | SqueezefsError::LockFailed { .. } => false,
         // Deadline/backpressure/memory-pressure classes: retried.
         SqueezefsError::Timeout | SqueezefsError::CacheOverflow => false,
+        // The typed retryable classes ARE the retry verdict (item 24,
+        // review round 2, Issue 16: a joined writer's allocation holder
+        // unreachable across a failover — the bytes are safe in staging
+        // and land when the successor answers; before the class was typed
+        // the same outage travelled as `StorageFull`, in the list above).
+        SqueezefsError::Retryable { .. } => false,
         SqueezefsError::Io(io) => {
             !matches!(
                 io.raw_os_error(),
@@ -8165,6 +8171,13 @@ pub struct Metrics {
     /// arm to accumulation (whose epoch KD-1.7 early-close ladder
     /// recycles the parked displaced supply) — never a write error.
     pub overlay_enospc_declines: Align64<AtomicU64>,
+    /// Item 24 (review round 2, Issue 15): the fresh-shape device-overlay
+    /// mint declined to accumulation because the allocation holder could
+    /// not be REACHED (the retryable `HolderUnreachable` class — a joined
+    /// writer across a manager failover), the sibling of
+    /// `overlay_enospc_declines`. The write ACKs into the parked ladder
+    /// and lands when the holder answers.
+    pub overlay_unreachable_declines: Align64<AtomicU64>,
     /// GAUGE: live overlay records — must return to 0 at quiesce (the
     /// `rewrite_shadow_open_epochs` law); the read/write probe hooks'
     /// `overlay_open == 0` fast path rides it.
@@ -11529,6 +11542,7 @@ impl SqueezefsFilesystem {
                 "write_enospc_refusals": METRICS.write_enospc_refusals.load(Ordering::Relaxed),
                 "write_fresh_block_enospc_refusals": METRICS.write_fresh_block_enospc_refusals.load(Ordering::Relaxed),
                 "alloc_fresh_supply_exhausted": alloc_fresh_supply_exhausted,
+                "alloc_fresh_supply_reask_ms": crate::block_allocator::BlockAllocator::topup_rekick_cadence_ms(),
                 "fuse_reserved_xattr_refusals": METRICS.fuse_reserved_xattr_refusals.load(Ordering::Relaxed),
                 "pr_registrant_shared": METRICS.pr_registrant_shared.load(Ordering::Relaxed),
                 "job_submitted": METRICS.job_submitted.load(Ordering::Relaxed),
@@ -12489,6 +12503,7 @@ impl SqueezefsFilesystem {
                 "overlay_ineligible_range_shared": METRICS.overlay_ineligible_range_shared.load(Ordering::Relaxed),
                 "overlay_ineligible_sub_cap": METRICS.overlay_ineligible_sub_cap.load(Ordering::Relaxed),
                 "overlay_enospc_declines": METRICS.overlay_enospc_declines.load(Ordering::Relaxed),
+                "overlay_unreachable_declines": METRICS.overlay_unreachable_declines.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
                 "overlay_gap_seed_bytes": METRICS.overlay_gap_seed_bytes.load(Ordering::Relaxed),
                 "overlay_open": METRICS.overlay_open.load(Ordering::Relaxed),
@@ -17284,72 +17299,84 @@ impl SqueezefsFilesystem {
     /// Record §7 item 24 — would a striped write touching
     /// `start_block..=end_block` CREATE custody of a block this mount holds
     /// nothing of? A block is HELD when custody exists in any of its forms:
-    /// a mapping (the durable block), a parked buffer (RAM custody), a
-    /// staged copy of the whole block or a spilled extent record (staging
-    /// custody), an open device-overlay record (a dest allocated before the
-    /// set latched, unpublished). A HOLE — below EOF or past it — holds
-    /// nothing: `fallocate` mode 0 and `truncate` only grow the size here,
-    /// so a pre-sized file's every block is fresh until written (review
-    /// round 1, Issue 2: a size-floor arm read every block below EOF as
-    /// held and kept the sink for exactly that shape). RAM-only, no guard:
-    /// run only under the set's exhaustion verdict. A metadata-cache miss
-    /// answers "held" — the refusal must never fire on a block whose
-    /// mapping it could not see (one acked-and-parked block on a cold cache
-    /// is the ladder's, never a spurious `ENOSPC`).
+    /// a mapping a write can land IN PLACE (the durable block), a parked
+    /// buffer (RAM custody), a staged copy of the whole block or a spilled
+    /// extent record (staging custody), an open device-overlay record (a
+    /// dest allocated before the set latched, unpublished). A HOLE — below
+    /// EOF or past it — holds nothing: `fallocate` mode 0 and `truncate`
+    /// only grow the size here, so a pre-sized file's every block is fresh
+    /// until written (review round 1, Issue 2: a size-floor arm read every
+    /// block below EOF as held and kept the sink for exactly that shape).
+    /// RAM-only, no guard: run only under the set's exhaustion verdict. A
+    /// metadata-cache miss answers "held" — the refusal must never fire on
+    /// a block whose mapping it could not see (one acked-and-parked block
+    /// on a cold cache is the ladder's, never a spurious `ENOSPC`). A
+    /// striped entry with NO inline map in RAM — the kvmap PARTIAL store
+    /// (design-kvmap-block-map-tree §14, PR 6c-i; an `indirect:` blob
+    /// rehydrates into RAM at the fetch, so this is the one striped shape
+    /// whose map is not here) — has NO in-place arm: `try_inplace_rewrite`
+    /// and the W1 patch resolve the mapping from the RAM map alone, so a
+    /// tree-mapped block of such a file CoWs on a rewrite exactly as a
+    /// hole allocates, and both are the fresh class unless RAM / staging /
+    /// overlay custody holds the block (review round 2, Issue 19 — the
+    /// first build read every block inside such a file's size as held).
     fn write_would_create_fresh_custody(&self, ino: u64, start_block: u64, end_block: u64) -> bool {
-        let block_size = self.router.block_size.load(Ordering::Relaxed);
-        // Per block: `Some(mapping)` = mapped (the key), `None` with the
-        // second word `true` = held by an indirect map, else unmapped.
+        // Per block: `Some(mapping)` = mapped in RAM (the key), `None` =
+        // unmapped here — a hole, a block past the size, or a partial-store
+        // block whose only landable custody is the RAM / staging / overlay
+        // kind checked below.
         let Some(mapped) = self.router.metadata_cache.peek_with(&ino, |m| {
             (start_block..=end_block)
-                .map(|b| match m.block_map.as_ref() {
-                    Some(bm) => (bm.get(&(b as u32)).cloned(), false),
-                    // An indirect map (spilled past the inline bound) is
-                    // not in RAM: a block INSIDE the file's extent is
-                    // conservatively held (it may be mapped — a hole there
-                    // is the stated residual), a block past the size is
-                    // fresh by construction (a truncate prunes beyond it).
-                    None => (
-                        None,
-                        m.file_type == "striped" && b.saturating_mul(block_size) < m.size,
-                    ),
+                .map(|b| {
+                    m.block_map
+                        .as_ref()
+                        .and_then(|bm| bm.get(&(b as u32)).cloned())
                 })
-                .collect::<Vec<(Option<String>, bool)>>()
+                .collect::<Vec<Option<String>>>()
         }) else {
             return false;
         };
         let passthrough = self.router.get_crypto().is_passthrough();
         for (i, b) in (start_block..=end_block).enumerate() {
-            let (mapping, indirect_held) = &mapped[i];
-            if *indirect_held {
-                continue;
-            }
-            if let Some(mapping) = mapping {
+            if let Some(mapping) = &mapped[i] {
                 // A MAPPED block is held only where a write to it can land
-                // WITHOUT a fresh block (review round 1, Issue 6): the
-                // in-place arms — W1's sub-block patch and the brim
-                // whole-block rewrite of the seeded image — need a
-                // passthrough volume, an undecorated whole-block mapping
-                // and a sole owner (the RAM verdict; the durable probe
-                // runs at the patch). A transformed volume, a packed
-                // tenant or a clone-shared block CoWs, which needs the
-                // block nothing can allocate: refused like growth.
-                let in_place =
-                    passthrough
-                        && crate::routing::is_whole_block_mapping(mapping)
-                        && self
-                            .router
-                            .backend_router
-                            .parse_block_key(mapping)
-                            .ok()
-                            .and_then(|(be_id, off)| {
-                                self.router.backend_router.get_backend(&be_id).ok().map(
-                                    |(alloc, _)| {
-                                        alloc.refcount(off) == Some(1) && !alloc.is_shared(off)
-                                    },
-                                )
-                            })
-                            .unwrap_or(false);
+                // WITHOUT a fresh block (review round 1, Issue 6; round 2,
+                // Issue 18): the in-place arms — W1's sub-block patch and
+                // the brim whole-block rewrite of the seeded image — need a
+                // passthrough volume, an undecorated whole-block mapping on
+                // an ACTIVE volume, the mount holding the volume's
+                // ownership plane with no slot holder over the file (the
+                // one sync posture half W1 runs, `sole_owner_posture_
+                // verdict`), and a sole owner by the RAM verdict (the
+                // durable probe runs at the patch). A transformed volume,
+                // a packed tenant, a clone-shared block, a joined writer's
+                // block or a Draining volume's CoWs, which needs the block
+                // nothing can allocate: refused like growth.
+                let in_place = passthrough
+                    && crate::routing::is_whole_block_mapping(mapping)
+                    && self
+                        .router
+                        .backend_router
+                        .parse_block_key(mapping)
+                        .ok()
+                        .and_then(|(be_id, off)| {
+                            let active = self
+                                .router
+                                .backend_router
+                                .volume_state_for_key_backend(&be_id)
+                                .is_none_or(|state| state == crate::VOL_STATE_ACTIVE);
+                            let (alloc, _) = self.router.backend_router.get_backend(&be_id).ok()?;
+                            Some(
+                                active
+                                    && self
+                                        .router
+                                        .sole_owner_posture_verdict(ino, &alloc)
+                                        .is_none()
+                                    && alloc.refcount(off) == Some(1)
+                                    && !alloc.is_shared(off),
+                            )
+                        })
+                        .unwrap_or(false);
                 if in_place {
                     continue;
                 }
@@ -18935,6 +18962,20 @@ impl SqueezefsFilesystem {
                         {
                             METRICS
                                 .overlay_enospc_declines
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Ok(false);
+                        }
+                        // Item 24 (review round 2, Issue 15): a joined
+                        // writer's drained window whose HOLDER could not be
+                        // reached (a manager failover) is the retryable
+                        // class — the same transient the arm above
+                        // declines for, typed (before it, that outage was
+                        // `StorageFull` and declined here). Accumulation is
+                        // the never-lossy vehicle: parked, then landed when
+                        // the successor answers.
+                        Err(SqueezefsError::Retryable { .. }) => {
+                            METRICS
+                                .overlay_unreachable_declines
                                 .fetch_add(1, Ordering::Relaxed);
                             return Ok(false);
                         }
@@ -20735,9 +20776,9 @@ impl SqueezefsFilesystem {
         // the memory cap to a 74 GiB daemon, and the unmount lost it
         // all). The verdict is the allocators' own (their terminal
         // `StorageFull` latches, their next landed allocation clears —
-        // `BackendRouter::fresh_supply_exhausted`, one relaxed load per
-        // volume on a set that never refused); the custody probe runs only
-        // under it and is RAM-only. A block with a mapping, a parked
+        // `BackendRouter::fresh_supply_exhausted`, one relaxed load of the
+        // process-wide latched count on a set that never refused); the
+        // custody probe runs only under it and is RAM-only. A block with a mapping, a parked
         // buffer, a staged copy or extent record, or an open overlay
         // record is custody this mount already holds: its segments stay
         // admitted (a passthrough whole-block rewrite of a mapped block

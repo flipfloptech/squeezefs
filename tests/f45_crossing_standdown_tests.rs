@@ -134,6 +134,7 @@ struct H {
     fs: SqueezefsFilesystem,
     req: Request,
     routed: Arc<RoutedMetaBackend>,
+    alloc: Arc<BlockAllocator>,
     _b: NamedTempFile,
     _m: NamedTempFile,
     _staging: TempDir,
@@ -163,7 +164,7 @@ async fn mount_live_shape() -> H {
     )
     .await
     .unwrap();
-    let router = DataRouter::new(dlm.clone(), cache, ba, nvme);
+    let router = DataRouter::new(dlm.clone(), cache, ba.clone(), nvme);
     let mut fs = SqueezefsFilesystem::new(router, dlm.clone(), 1000, 1000);
 
     let m = NamedTempFile::new().unwrap();
@@ -202,6 +203,7 @@ async fn mount_live_shape() -> H {
         fs,
         req,
         routed,
+        alloc: ba,
         _b: b,
         _m: m,
         _staging: staging,
@@ -397,6 +399,159 @@ async fn an_under_budget_crossing_crosses_whole_map_on_live_default_bits() {
     );
     assert_eq!(
         fuse_read(&h, ino, 0, BS as u32).await,
+        vec![b'f'; BS as usize]
+    );
+}
+
+// ===========================================================================
+// Record §7 item 24, review round 2 (Issue 19): the PARTIAL store's hole
+// under exhaustion — the one striped shape whose map the write path's
+// RAM probe cannot read
+// ===========================================================================
+
+/// A full set refuses a write that would CREATE custody of a block nothing
+/// can allocate BEFORE it acks it (record §7 item 24). The RAM-only probe
+/// reads the entry's inline map; a PARTIAL-store ino carries none, so the
+/// first build read every block inside such a file's size as HELD and
+/// both a hole and a rewrite there kept the RAM sink verbatim. The
+/// partial store has NO in-place arm — `try_inplace_rewrite` and the W1
+/// patch resolve the mapping from the RAM map alone (the first version of
+/// this pin asked the brim rewrite to land on such a file and read
+/// `ENOSPC` at its fsync: the write had been ACKED into the sink) — so a
+/// tree-mapped block's rewrite CoWs exactly as a hole allocates: on an
+/// exhausted set BOTH are refused `ENOSPC` before the ack, nothing acked,
+/// nothing parked, the file's bytes intact, its fsync clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hole_and_a_rewrite_inside_a_partial_store_file_are_refused_when_the_set_is_exhausted() {
+    let _serial = serial();
+    let _budget = shrink_budget();
+    let h = mount_live_shape().await;
+    let ino = fuse_create(&h, "f45-item24.bin").await;
+    let (crossed, blocks) = write_until_crossed(&h, ino).await;
+    assert!(crossed, "premise: the ino crossed into the tree");
+    h.fs.fsync(h.req, ino, 0, false).await.expect("fsync");
+    assert!(
+        h.fs.router.kvmap_partial_mode(ino),
+        "premise: the over-budget crossing landed in PARTIAL mode"
+    );
+    assert_eq!(
+        h.fs.router
+            .metadata_cache
+            .peek_with(&ino, |m| m.block_map.is_some()),
+        Some(false),
+        "premise: no inline map in RAM — the probe's blind shape"
+    );
+
+    // Grow the size by four blocks with no write: blocks `blocks..blocks+4`
+    // are holes INSIDE the file's size.
+    let grown = (blocks + 4) * BS;
+    h.fs.setattr(
+        h.req,
+        ino,
+        None,
+        fuse3::SetAttr {
+            size: Some(grown),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("truncate grows the size with no blocks");
+
+    // Exhaust the store exactly where it stands: cap the allocator at its
+    // dense frontier and drain whatever the free list holds — the next
+    // fresh mint is the terminal `StorageFull` that latches the volume.
+    h.alloc
+        .set_capacity_bytes(h.alloc.highest_block_index() * h.alloc.chunk_size());
+    let mut drained = 0u32;
+    while h.alloc.allocate_block().await.is_ok() {
+        drained += 1;
+        assert!(
+            drained < 10_000,
+            "the free list never drained under the cap"
+        );
+    }
+    assert!(
+        h.alloc.fresh_supply_exhausted(),
+        "premise: latched by the terminal refusal"
+    );
+
+    let refused0 = METRICS
+        .write_fresh_block_enospc_refusals
+        .load(Ordering::Relaxed);
+    let parked0 = SqueezefsFilesystem::parked_gauge_bytes();
+    // The hole: no custody of any kind — fresh, refused before the ack.
+    let hole = blocks + 1;
+    let r =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            hole * BS,
+            bytes::Bytes::from(vec![b'h'; BS as usize]),
+            0,
+            0,
+        )
+        .await;
+    assert_eq!(
+        r.map(|w| w.written).map_err(|e| i32::from(e).abs()),
+        Err(libc::ENOSPC),
+        "a hole inside a partial-store file on an exhausted set is refused before the ack"
+    );
+    assert_eq!(
+        METRICS
+            .write_fresh_block_enospc_refusals
+            .load(Ordering::Relaxed)
+            - refused0,
+        1
+    );
+    assert_eq!(
+        SqueezefsFilesystem::parked_gauge_bytes(),
+        parked0,
+        "nothing parked"
+    );
+    assert_eq!(
+        fuse_read(&h, ino, hole * BS, BS as u32).await,
+        vec![0u8; BS as usize],
+        "the hole still reads as zeros"
+    );
+
+    // A MAPPED block of the same file: no in-place arm exists for the
+    // partial store, so the rewrite would CoW into a block nothing can
+    // allocate — refused like the hole, the original bytes untouched.
+    let r =
+        h.fs.write(
+            h.req,
+            ino,
+            0,
+            0,
+            bytes::Bytes::from(vec![b'r'; BS as usize]),
+            0,
+            0,
+        )
+        .await;
+    assert_eq!(
+        r.map(|w| w.written).map_err(|e| i32::from(e).abs()),
+        Err(libc::ENOSPC),
+        "a partial-store file's mapped block has no in-place arm: its rewrite is refused too"
+    );
+    assert_eq!(
+        METRICS
+            .write_fresh_block_enospc_refusals
+            .load(Ordering::Relaxed)
+            - refused0,
+        2
+    );
+    assert_eq!(SqueezefsFilesystem::parked_gauge_bytes(), parked0);
+    h.fs.fsync(h.req, ino, 0, false)
+        .await
+        .expect("nothing was acked that cannot land: the fsync is clean");
+    assert_eq!(
+        fuse_read(&h, ino, 0, BS as u32).await,
+        vec![b'f'; BS as usize],
+        "the mapped block's bytes stand"
+    );
+    assert_eq!(
+        fuse_read(&h, ino, (blocks - 1) * BS, BS as u32).await,
         vec![b'f'; BS as usize]
     );
 }

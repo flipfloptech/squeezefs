@@ -31972,11 +31972,12 @@ pub async fn start_mount<P: AsRef<Path>>(
     // `client:`/`writer_claim` heartbeat records deregister instead of
     // lingering to the 45 s staleness TTL. Bound: the teardown's own graceful
     // drain window plus flush margin — never an unbounded hang on exit.
-    let teardown_wait = std::time::Duration::from_secs(fs.dismount_wait.saturating_add(60));
-    if squeezefs_ipc::sqz_time::timeout(teardown_wait, fs.wait_dismount_teardown())
-        .await
-        .is_err()
-    {
+    let teardown_wait = dismount_exit_guard(fs.dismount_wait);
+    let teardown_done =
+        squeezefs_ipc::sqz_time::timeout(teardown_wait, fs.wait_dismount_teardown())
+            .await
+            .is_ok();
+    if !teardown_done {
         warn!(
             "Dismount teardown did not complete within {:?}; heartbeat records \
              may linger to the staleness TTL",
@@ -31984,7 +31985,31 @@ pub async fn start_mount<P: AsRef<Path>>(
         );
     }
 
+    // Record §4.4bx: the staging-root liveness locks guard the STAGING
+    // OWNERSHIP, and that ends with the dismount teardown (its census is
+    // the last staging act; the IPC host — the other staging writer — is
+    // down above), never with the process. Released HERE so the next
+    // mount at this mount point adopts the residue without waiting out
+    // this process's exit — the disarms that follow and the address-space
+    // teardown. A teardown that missed its guard KEEPS them: its task may
+    // still be flushing, and two writers on one staging root is the
+    // collision the lock exists to refuse (the exit releases them then).
+    if teardown_done {
+        crate::config_ops::release_staging_root_locks();
+    }
+
     Ok(())
+}
+
+/// The process-exit guard on a dismount: the teardown's graceful drain
+/// window (`dismount_wait`) plus a flush margin. ONE law for both sides of
+/// a mount-point handover — the predecessor's `start_mount` waits this
+/// long for its own teardown before exiting, and a successor at the same
+/// mount point waits this long for the predecessor's staging-root lock
+/// (`config_ops::hold_staging_root_lock_waiting`) before calling it
+/// wedged.
+pub fn dismount_exit_guard(dismount_wait_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(dismount_wait_secs.saturating_add(60))
 }
 
 pub async fn get_volume_status(meta_lv_path: &str) -> Result<serde_json::Value, SqueezefsError> {

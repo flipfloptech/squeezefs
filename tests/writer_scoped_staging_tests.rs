@@ -1623,6 +1623,7 @@ async fn moved_mount_point_residue_is_reported_until_discarded() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .expect("the mount proceeds — the residue is not ours to touch");
@@ -1652,6 +1653,7 @@ async fn moved_mount_point_residue_is_reported_until_discarded() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .unwrap();
@@ -1691,6 +1693,7 @@ async fn moved_mount_point_residue_is_reported_until_discarded() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .unwrap();
@@ -1748,6 +1751,7 @@ async fn staging_adopt_rebinds_durable_residue_for_the_next_mount() {
         std::slice::from_ref(&own_dir),
         "/mnt/new",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .unwrap();
@@ -1803,6 +1807,7 @@ async fn client_slot_override_adopts_the_exact_pair_residue() {
         std::slice::from_ref(&own_dir),
         "/mnt/after",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .unwrap();
@@ -1839,6 +1844,7 @@ async fn a_live_pair_collision_refuses_the_mount_and_the_verbs() {
         std::slice::from_ref(&own_dir),
         "/mnt/second",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .expect_err("two LIVE mounts must never share one client identity")
@@ -1890,6 +1896,7 @@ async fn unscoped_mount_prelude_is_a_structural_noop() {
         std::slice::from_ref(&own),
         "/mnt/solo",
         set, // UN-decorated: the solo posture
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .unwrap();
@@ -1986,6 +1993,7 @@ async fn own_root_flock_race_with_dying_predecessor_is_absorbed() {
         std::slice::from_ref(&own_dir),
         "/mnt/racy",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .expect("a dying predecessor's flock is absorbed, never refused");
@@ -2035,6 +2043,7 @@ async fn own_root_flock_held_by_live_holder_still_refuses_loud() {
         std::slice::from_ref(&own_dir),
         "/mnt/live",
         &our_gen,
+        squeezefs::fuse_client::dismount_exit_guard(10),
     )
     .await
     .expect_err("a live holder must still refuse")

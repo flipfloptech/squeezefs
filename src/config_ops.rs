@@ -3225,29 +3225,110 @@ pub fn hold_staging_root_lock(dir: &Path) -> Result<()> {
     }
 }
 
-/// [`hold_staging_root_lock`] with the bounded teardown-race wait-out
-/// (2026-08-16, the stamped-solo QUICK gate's first live catch —
-/// generic/003's zero-dwell remount): `umount(8)` returns when the kernel
-/// FUSE connection closes, but the predecessor daemon's flock releases
-/// only at PROCESS EXIT, so a successor mount at the same mount point can
-/// meet its OWN root held by a holder that is milliseconds from gone. A
-/// dying holder frees the flock within one poll pass; a genuinely live
-/// co-located collision never does and pays the bound ONCE before the
-/// unchanged loud refusal (the `await_transient_flock_release`
-/// posture, applied to the staging plane — the lock file carries no
-/// holder claim, and every holder of a mount's OWN root is same-mount-
-/// point class, so the bound applies to all of them). Used ONLY for the
-/// prelude's own-dirs arm; probes and adoption arms stay one-shot.
-pub async fn hold_staging_root_lock_waiting(dir: &Path) -> Result<()> {
+/// Is a FUSE mount present at `mount_point` according to
+/// `/proc/self/mountinfo`? An unreadable table answers `false` — the
+/// direction that WAITS in [`hold_staging_root_lock_waiting`] (a wait
+/// ends in the same loud refusal at its bound; a wrong "collision" would
+/// refuse a legitimate successor at once).
+pub fn fuse_mount_present(mount_point: &Path) -> bool {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|table| fuse_mount_present_in(&table, mount_point))
+        .unwrap_or(false)
+}
+
+/// The pure half of [`fuse_mount_present`]: field 5 of a mountinfo line is
+/// the mount point (octal-escaped: `\040` space, `\011` tab, `\012`
+/// newline, `\134` backslash) and the first field after the ` - `
+/// separator is the filesystem type (`fuse.squeezefs` on a live mount of
+/// ours — any `fuse*` type counts: a collision at our mount point is a
+/// collision whatever the daemon's subtype).
+pub fn fuse_mount_present_in(mountinfo: &str, mount_point: &Path) -> bool {
+    mountinfo.lines().any(|line| {
+        let Some((left, right)) = line.split_once(" - ") else {
+            return false;
+        };
+        let Some(escaped) = left.split_whitespace().nth(4) else {
+            return false;
+        };
+        let unescaped = escaped
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\");
+        Path::new(&unescaped) == mount_point
+            && right
+                .split_whitespace()
+                .next()
+                .is_some_and(|fstype| fstype.starts_with("fuse"))
+    })
+}
+
+/// [`hold_staging_root_lock`] with the teardown-race wait-out.
+///
+/// `umount(8)` returns when the kernel FUSE connection closes, but the
+/// predecessor daemon at the same mount point still owns the root through
+/// its dismount TEARDOWN (the custody sweep, the writeback retire wait,
+/// the promotion pass — each bounded, none instant) and, until the
+/// teardown releases the lock, through its process exit. Two classes of
+/// holder, told apart by the MOUNT POINT (2026-08-16 generic/003's
+/// zero-dwell remount; record §4.4bx — the 1.3.0 release chain's
+/// generic/752 met a 13-second dismount on a genuinely full volume against
+/// the 2-second wait that stood here):
+///
+/// * inside `TEARDOWN_FLOCK_WAIT` every holder is waited for (the
+///   exit-grade release a dying holder frees within one poll pass);
+/// * past it, a holder whose mount point still carries a FUSE mount is a
+///   LIVE co-located collision — the unchanged loud refusal;
+/// * a holder whose mount is GONE is our predecessor inside its dismount
+///   (`holder_is_dismounting`), and the next mount at this mount point is
+///   the one that adopts its residue: wait for it up to
+///   `dismounting_bound` — the predecessor's own process-exit guard
+///   ([`crate::fuse_client::dismount_exit_guard`], the same law on both
+///   sides) — then refuse loud: a holder past its own guard is wedged.
+///
+/// Used ONLY for the prelude's own-dirs arm; probes and adoption arms
+/// stay one-shot.
+pub async fn hold_staging_root_lock_waiting(
+    dir: &Path,
+    holder_is_dismounting: &dyn Fn() -> bool,
+    dismounting_bound: std::time::Duration,
+) -> Result<()> {
     /// Generous vs. a daemon exit's ms-grade lock release; a live
     /// collision pays it once before the refusal.
     const TEARDOWN_FLOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
     const POLL: std::time::Duration = std::time::Duration::from_millis(5);
-    let deadline = std::time::Instant::now() + TEARDOWN_FLOCK_WAIT;
+    /// The dismounting-predecessor wait polls at the teardown's grain.
+    const DISMOUNT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let start = std::time::Instant::now();
+    let mut announced = false;
     loop {
         match hold_staging_root_lock(dir) {
-            Err(SqueezefsError::InvalidOperation(_)) if std::time::Instant::now() < deadline => {
-                squeezefs_ipc::sqz_time::sleep(POLL).await;
+            Err(SqueezefsError::InvalidOperation(msg)) => {
+                let waited = start.elapsed();
+                if waited < TEARDOWN_FLOCK_WAIT {
+                    squeezefs_ipc::sqz_time::sleep(POLL).await;
+                    continue;
+                }
+                if !holder_is_dismounting() {
+                    return Err(SqueezefsError::InvalidOperation(msg));
+                }
+                if waited >= dismounting_bound {
+                    return Err(SqueezefsError::InvalidOperation(format!(
+                        "{msg}; the holder's mount is gone and its dismount did not finish \
+                         within {dismounting_bound:?} — past its own exit guard, the \
+                         previous mount's daemon is wedged"
+                    )));
+                }
+                if !announced {
+                    announced = true;
+                    log::info!(
+                        "staging root {} is still held by the previous mount's daemon at this \
+                         mount point (its mount is gone; its dismount teardown is running) — \
+                         waiting up to {dismounting_bound:?} for the handover",
+                        dir.display()
+                    );
+                }
+                squeezefs_ipc::sqz_time::sleep(DISMOUNT_POLL).await;
             }
             outcome => return outcome,
         }
@@ -3359,6 +3440,7 @@ pub async fn mount_scoped_staging_prelude(
     own_dirs: &[PathBuf],
     mount_point: &str,
     staging_generation: &str,
+    dismount_exit_guard: std::time::Duration,
 ) -> Result<ScopedSiblingScan> {
     use crate::writer_scope::GenerationBinding;
     let (_, Some(ours)) = crate::writer_scope::split_staging_generation(staging_generation) else {
@@ -3367,15 +3449,20 @@ pub async fn mount_scoped_staging_prelude(
             residue: Vec::new(),
         });
     };
+    let mount_path = Path::new(mount_point);
+    let holder_is_dismounting = || !fuse_mount_present(mount_path);
     for dir in own_dirs {
-        // The waiting form: absorbs the predecessor daemon's exit racing a
-        // zero-dwell remount (see `hold_staging_root_lock_waiting`).
-        hold_staging_root_lock_waiting(dir).await.map_err(|e| {
-            SqueezefsError::InvalidOperation(format!(
-                "cannot own this mount's staging root: {e}. If a previous mount at this \
-                 mount point is still running, unmount it first",
-            ))
-        })?;
+        // The waiting form: absorbs the predecessor daemon's dismount and
+        // exit racing a zero-dwell remount (see
+        // `hold_staging_root_lock_waiting`).
+        hold_staging_root_lock_waiting(dir, &holder_is_dismounting, dismount_exit_guard)
+            .await
+            .map_err(|e| {
+                SqueezefsError::InvalidOperation(format!(
+                    "cannot own this mount's staging root: {e}. If a previous mount at this \
+                     mount point is still running, unmount it first",
+                ))
+            })?;
     }
     let mut scan = ScopedSiblingScan {
         adopted: Vec::new(),

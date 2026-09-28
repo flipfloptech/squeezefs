@@ -5964,6 +5964,7 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &active_staging_dirs,
                     &canonical_mount,
                     &staging_generation,
+                    squeezefs::fuse_client::dismount_exit_guard(resolved_dismount_wait),
                 )
                 .await?;
                 for dir in scan.adopted {
@@ -6928,6 +6929,17 @@ async fn run_app(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             squeezefs::data_grant::disarm_slot_custody().await;
             if let Some(membership) = membership_arm {
                 membership.disarm().await;
+            }
+            // TEST SEAM (`SQUEEZEFS_TEST_EXIT_HOLD_MS`, record §4.4bx): hold
+            // the process alive past its whole teardown — the successor-
+            // mount pin needs a predecessor whose EXIT outlives its
+            // dismount, the shape a 74 GiB address space produces in the
+            // field. Zero cost unset; never set in production.
+            let exit_hold_ms: u64 =
+                squeezefs::env_knobs::int_knob("SQUEEZEFS_TEST_EXIT_HOLD_MS", 0);
+            if exit_hold_ms > 0 {
+                squeezefs_ipc::sqz_time::sleep(std::time::Duration::from_millis(exit_hold_ms))
+                    .await;
             }
             mount_result?;
         }

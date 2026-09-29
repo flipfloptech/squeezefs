@@ -293,6 +293,16 @@ fn shadow_bytes() -> u64 {
 fn shadow_fallbacks() -> u64 {
     METRICS.rewrite_shadow_fallbacks.load(Ordering::Relaxed)
 }
+fn pressure_closes() -> u64 {
+    METRICS
+        .rewrite_shadow_pressure_closes
+        .load(Ordering::Relaxed)
+}
+fn pressure_close_busy() -> u64 {
+    METRICS
+        .rewrite_shadow_pressure_close_busy
+        .load(Ordering::Relaxed)
+}
 fn shadow_fence_drops() -> u64 {
     METRICS.rewrite_shadow_fence_drops.load(Ordering::Relaxed)
 }
@@ -644,6 +654,16 @@ async fn a_process_local_lease_rotation_converges_the_close() {
 // Contract 5 — ENOSPC early-close frees parked supply and converges.
 // ---------------------------------------------------------------------------
 
+/// KD-1.7: a mid-epoch `StorageFull` closes the epoch (the swap frees the
+/// parked A supply) and the allocation retries once. Since record §4.4cd
+/// the close runs at the ONE allocation act (`allocate_placed_block`'s
+/// pressure close, `rewrite_shadow_pressure_closes`) — so the write
+/// pipeline's own arm (`rewrite_shadow_fallbacks`, the PARKING close that
+/// follows a `StorageFull` the act still surfaced) is reached only when
+/// the act's non-parking close found the ino's stripe held; here nothing
+/// holds it, so the act closes and the arm counts nothing. The law the
+/// contract pins is the SUM: exactly one early-close of either face, the
+/// rewrite converged, no refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enospc_early_close_frees_supply_and_converges() {
     let _g = serial().await;
@@ -666,18 +686,250 @@ async fn enospc_early_close_frees_supply_and_converges() {
     let len = (blocks * FBS) as usize;
     let ino = striped_fixture(&h, "f1", blocks, 6).await;
 
-    let fb0 = shadow_fallbacks();
+    let (fb0, pc0, busy0) = (shadow_fallbacks(), pressure_closes(), pressure_close_busy());
+    let refused0 = METRICS
+        .write_fresh_block_enospc_refusals
+        .load(Ordering::Relaxed);
     let v1 = pattern(len, 13);
     write_at(&h, ino, 0, &v1).await;
     h.fs.fsync(h.req, ino, 0, false).await.expect("fsync");
     quiesce(&h).await;
 
+    let early_closes = (shadow_fallbacks() - fb0) + (pressure_closes() - pc0);
     assert!(
-        shadow_fallbacks() - fb0 >= 1,
-        "the mid-epoch StorageFull must be a counted early-close \
-         (rewrite_shadow_fallbacks — the loud fallback to today's CoW)"
+        early_closes >= 1,
+        "the mid-epoch StorageFull must be a counted early-close on one of its two faces \
+         (rewrite_shadow_pressure_closes at the allocation act, or rewrite_shadow_fallbacks \
+         at the pipeline's parking arm)"
+    );
+    assert_eq!(
+        pressure_closes() - pc0,
+        1,
+        "the allocation act's non-parking close is the face that fires when nothing holds \
+         the ino's stripe — the pipeline's arm is its fallback"
+    );
+    assert_eq!(
+        pressure_close_busy() - busy0,
+        0,
+        "no stripe was held: the act never skipped the epoch"
+    );
+    assert_eq!(
+        METRICS
+            .write_fresh_block_enospc_refusals
+            .load(Ordering::Relaxed),
+        refused0,
+        "the parked supply was never a refusal"
     );
     assert_eq!(read_all(&h, ino, len).await, v1, "the rewrite converged");
+    squeezefs::block_reclaim::set_elision_class_all(false);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 5b — a WRITEBACK flush's StorageFull closes the epoch that
+// holds the supply (record §4.4cd — release chain attempt 12, generic/551).
+// ---------------------------------------------------------------------------
+
+/// The 1.3.0 release chain's attempt 12 hung in fstests generic/551 for
+/// 4.6 h: a random O_DIRECT overwrite of one file parked every displaced
+/// block in the file's open rewrite epoch until the 24 GiB scratch volume
+/// read FULL (6,089 of 6,144 blocks SET, 55 referenced), and the
+/// exhaustion landed on the WRITEBACK worker's flush of a staged partial
+/// block — `flush_one_active_block`'s allocation, which had no KD-1.7 arm
+/// — so the flush retried `StorageFull` for ever with the space it needed
+/// parked in the epoch only a close could free; the file's next
+/// `truncate` parked behind it and the mount was dead. The write path's
+/// own StorageFull closes the epoch and retries (contract 5); the fsync
+/// ladder flushes the staged blocks BEFORE its own epoch close (step 1
+/// before step 2), so an fsync met the same wall. The law: the ONE
+/// allocation act (`BackendRouter::allocate_placed_block`) answers a
+/// `StorageFull` by closing every open rewrite epoch of the mount (the
+/// parked supply is this mount's own) and retrying the mint once —
+/// counted per closed epoch on `rewrite_shadow_pressure_closes` — so
+/// every fresh-block site meets KD-1.7 where only the pipeline's arm
+/// did. Shape: capacity 8, a 4-block file, blocks 0–1 rewritten twice
+/// (four displaced keys parked, the volume exactly full, nothing refused
+/// yet), then a 1 KiB write into a NEW block (staged, acked) and `fsync`:
+/// the flush's mint meets `StorageFull`, closes the epoch (4 blocks
+/// free), lands. RED on the unfixed tree: the fsync fails `ENOSPC` and
+/// the epoch stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writeback_flush_that_meets_storage_full_closes_the_epoch_and_lands() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(true);
+    squeezefs::block_reclaim::set_elision_class_all(true);
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let m = NamedTempFile::new().unwrap();
+    let h = make_harness_on("shadow_wb_enospc", backing, m, true, Some(8)).await;
+    let blocks = 4u64;
+    let ino = striped_fixture(&h, "f1", blocks, 21).await;
+    let ba = &h.fs.router.block_allocator;
+
+    // Two partial rewrites of blocks 0–1: each displaces the current
+    // binding into the epoch (KD-1.6 parks it), none closes it (coverage
+    // < file) — four parked keys, the volume exactly full.
+    let (oe0, pb0) = (open_epochs(), parked_bytes());
+    for seed in [31u8, 41] {
+        write_at(&h, ino, 0, &pattern(2 * FBS as usize, seed)).await;
+        quiesce(&h).await;
+    }
+    assert_eq!(open_epochs() - oe0, 1, "premise: one epoch open");
+    assert!(parked_bytes() > pb0, "premise: displaced keys parked");
+    assert_eq!(
+        ba.free_supply_blocks(),
+        0,
+        "premise: the epoch's parked keys + the live map fill the volume exactly"
+    );
+    assert!(!ba.fresh_supply_latched(), "premise: nothing refused yet");
+
+    // A 1 KiB write into a NEW block: staged and acked (the pre-ack
+    // probe sees no latch).
+    let tail = pattern(1024, 51);
+    write_at(&h, ino, blocks * FBS, &tail).await;
+    let refused0 = METRICS
+        .write_fresh_block_enospc_refusals
+        .load(Ordering::Relaxed);
+    let (pc0, fb0) = (pressure_closes(), shadow_fallbacks());
+    // The fsync's data step flushes the staged block: its mint meets
+    // StorageFull with the supply parked in THIS file's epoch — the flush
+    // closes it and lands.
+    h.fs.fsync(h.req, ino, 0, false)
+        .await
+        .expect("the writeback flush closes the epoch that holds the supply and lands");
+    assert_eq!(
+        open_epochs() - oe0,
+        0,
+        "the pressure close retired the epoch"
+    );
+    assert_eq!(
+        pressure_closes() - pc0,
+        1,
+        "the close is counted on the allocation act's own face"
+    );
+    assert_eq!(
+        shadow_fallbacks() - fb0,
+        0,
+        "the flush unit has no pipeline arm — the act's close is the one that fired"
+    );
+    assert_eq!(
+        METRICS
+            .write_fresh_block_enospc_refusals
+            .load(Ordering::Relaxed),
+        refused0,
+        "acked custody was never refused"
+    );
+    assert!(
+        !ba.fresh_supply_latched(),
+        "the landed allocation cleared the latch"
+    );
+    let got = read_all(&h, ino, (blocks * FBS) as usize + 1024).await;
+    assert_eq!(
+        &got[(blocks * FBS) as usize..],
+        &tail[..],
+        "the staged tail is durable"
+    );
+    assert_eq!(
+        &got[..2 * FBS as usize],
+        &pattern(2 * FBS as usize, 41)[..],
+        "the last rewrite's bytes stand"
+    );
+    squeezefs::block_reclaim::set_elision_class_all(false);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 5c — the pressure close's LOCK LAW: never park on a held 3.5
+// stripe (record §4.4cd).
+// ---------------------------------------------------------------------------
+
+/// A mint may run under a `BLOCK_FLUSH_LOCKS` guard (the writeback flush
+/// unit) and the epoch's close takes the ino's `INODE_META_LOCKS` stripe —
+/// so the pressure close acquires it in the NON-PARKING form: a held
+/// stripe (a write or persist of that ino mid-flight, or the closing task's
+/// own hold on a re-entry) SKIPS the epoch (`rewrite_shadow_pressure_close_
+/// busy`), the `StorageFull` stands for that attempt, and the mint's own
+/// retry ladder runs the close again once the stripe drops. Shape: the
+/// contract-5b premise (one epoch, the volume exactly full), the ino's 3.5
+/// stripe HELD by the test, one direct call of the allocation act — it must
+/// return within the bound with `StorageFull`, `busy` +1, the epoch still
+/// open; the stripe dropped, the next call closes (`pressure_closes` +1)
+/// and lands. On the parking form the first call deadlocks against the
+/// test's own guard and the bound fails it loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pressure_close_never_parks_on_a_held_meta_stripe() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(true);
+    squeezefs::block_reclaim::set_elision_class_all(true);
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let m = NamedTempFile::new().unwrap();
+    let h = make_harness_on("shadow_busy_stripe", backing, m, true, Some(8)).await;
+    let blocks = 4u64;
+    let ino = striped_fixture(&h, "f1", blocks, 21).await;
+    let ba = &h.fs.router.block_allocator;
+
+    let oe0 = open_epochs();
+    for seed in [31u8, 41] {
+        write_at(&h, ino, 0, &pattern(2 * FBS as usize, seed)).await;
+        quiesce(&h).await;
+    }
+    assert_eq!(open_epochs() - oe0, 1, "premise: one epoch open");
+    assert_eq!(
+        ba.free_supply_blocks(),
+        0,
+        "premise: the volume is exactly full"
+    );
+
+    let (pc0, busy0) = (pressure_closes(), pressure_close_busy());
+    let held = squeezefs::routing::meta_lock_acquire(ino).await;
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        h.fs.router.backend_router.allocate_placed_block(),
+    )
+    .await
+    .expect("the act never parks behind a held 3.5 stripe (the parking form deadlocks here)");
+    let verdict = res.as_ref().map(|_| "landed").map_err(|e| e.to_string());
+    assert!(
+        matches!(&res, Err(squeezefs::error::SqueezefsError::Io(io))
+            if io.kind() == std::io::ErrorKind::StorageFull),
+        "with the epoch's stripe held the refusal stands for this attempt: {verdict:?}"
+    );
+    assert_eq!(
+        pressure_close_busy() - busy0,
+        1,
+        "the held stripe's epoch was skipped, counted"
+    );
+    assert_eq!(
+        pressure_closes() - pc0,
+        0,
+        "nothing closed under the held stripe"
+    );
+    assert_eq!(open_epochs() - oe0, 1, "the epoch stays registered");
+    drop(held);
+
+    let (_, allocator, _, offset) =
+        h.fs.router
+            .backend_router
+            .allocate_placed_block()
+            .await
+            .expect("the stripe dropped: the act closes the epoch and the mint lands");
+    assert_eq!(pressure_closes() - pc0, 1, "the retry's close is counted");
+    assert_eq!(open_epochs() - oe0, 0, "the epoch closed");
+    assert!(
+        !ba.fresh_supply_latched(),
+        "the landed allocation cleared the latch"
+    );
+    // The probe's block never enters a map: hand it back.
+    let _ = allocator.abandon_unpublished_offset(offset).await;
     squeezefs::block_reclaim::set_elision_class_all(false);
 }
 

@@ -1478,8 +1478,27 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
 /// native pin cannot reach): every rotor slot's root leaf fills and
 /// compacts/splits; the checkpoint publishes the swapped roots; a remount
 /// reopens each guest at the root tree 0 names and serves everything.
+///
+/// The cadence is PARKED for the pin's duration (the suite's idiom): the
+/// swap this pin asserts is the one ITS `checkpoint_now` performs between
+/// the `before` and `after` snapshots, and a background tick landing at
+/// the end of the storm — the trigger is ≈ 1 s from the open, the 240
+/// commits take that long on a slow box (the 1.3.0 release chain's
+/// attempt 11, an hour into `task check` on the hot laptop) — swapped the
+/// roots BEFORE `before` was read, so the explicit cycle had nothing left
+/// to swap and the pin read "no guest root swapped" against a mechanism
+/// that had worked (record §4.4cc; the parked-cadence precedent is
+/// `230e95dd`'s ring-head pin).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_guest_root_swap_is_covered_through_tree_zero() {
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
+        }
+    }
+    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
+    let _cleanup = Cleanup;
     let dir = tempfile::tempdir().unwrap();
     let uris = stamped_forest_set_width(dir.path(), 8).await;
     let routed = open_routed_meta_set(&uris).await.expect("open");

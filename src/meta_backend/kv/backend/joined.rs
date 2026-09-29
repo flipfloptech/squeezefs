@@ -372,7 +372,17 @@ impl JoinedWire {
                     vol.device_path().display()
                 );
             }
-            if let Some(e) = crate::sym_join::resolve_holder_endpoint(vol, 0).await {
+            // The resolve rides the wire itself (`joined_resolve_endpoint`
+            // → `with_client("ResolveEndpoint")` → this fn), so this await
+            // is the edge that closes the opaque future's cycle: erased to
+            // `dyn Future` here — the cold re-dial path — the type is
+            // finite for every compiler (the nightly solver refuses the
+            // unboxed cycle with E0275; stable 1.98 accepted it; record
+            // §4.4cf).
+            let resolved: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Option<String>> + Send + '_>,
+            > = Box::pin(crate::sym_join::resolve_holder_endpoint(vol, 0));
+            if let Some(e) = resolved.await {
                 endpoint = e;
             }
         }

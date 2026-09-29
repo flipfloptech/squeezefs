@@ -264,6 +264,24 @@ tasks:
       - cargo check --bins
       - cargo fmt --check
 
+  check:fuzz-nightly:
+    desc: >-
+      The fuzz workspace BUILDS under the nightly the fuzz tier runs on —
+      the pre-chain line the 1.3.0 release chain lacked: `check:fuzz`
+      type-checks on STABLE by design, and the nightly trait solver
+      refused a recursive `impl Future` (`JoinedWire::with_client`'s
+      re-dial cycle, E0275) that stable 1.98 accepted, so attempt 14 went
+      red at its LAST leg after six green product legs (record
+      2026-09-19-sym-acceptance §4.4cf). One `cargo +nightly fuzz build`
+      (sanitizer RUSTFLAGS as the tier's own; its own target dir), no
+      run. Requires a nightly toolchain + cargo-fuzz — the release gate's
+      machines have both; NOT part of `task check` (CI has no nightly).
+      Run before every release chain launch and after any change to an
+      `impl Future`-returning door.
+    dir: fuzz
+    cmds:
+      - cargo +nightly fuzz build
+
   audit:
     desc: >-
       ENG-2: cargo-audit over BOTH lockfiles (the root workspace and the

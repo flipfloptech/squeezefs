@@ -470,29 +470,60 @@ async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
         );
     }
 
-    // Term 3: FORGET-side destroys at healthy fill — 1 entry per BATCH,
-    // recorded in the destroy-fill histogram's ≤64 bucket (index 7 of the
-    // QueueDepthHistogram labels: 0,1,2,≤4,≤8,≤16,≤32,≤64,…). The
-    // background drain task is asynchronous — a cadence tick landing
-    // inside this window commits its own (counted) entries, so the
-    // mechanism assertion is exact MODULO the measured drain commits.
+    // Term 3: FORGET-side destroys at healthy fill — ONE COMMIT per BATCH,
+    // judged at the destroy tx's own commit SITE (calibrated on one corpse
+    // below), and recorded in the destroy-fill histogram's ≤64 bucket
+    // (index 7 of the QueueDepthHistogram labels: 0,1,2,≤4,≤8,≤16,≤32,
+    // ≤64,…). The process-global ENTRY counter is written by every actor
+    // of the process — an SMO's record from the checkpoint task, a
+    // cadence drain commit whose entry landed before its DRAIN_COMMITS
+    // increment (the count moves after the ack) — so an exact law over
+    // it is a schedule assertion: the 1.3.0 release chain's attempt 13
+    // read 6 against 5 with two concurrent drain commits already
+    // excluded (record §4.4ce). The drain is quiesced first (an explicit
+    // drain of the echoes, so the calibration meets no concurrent
+    // committer) and the entry counter keeps its LOWER bound: a batch's
+    // commit is at least one entry.
+    backend.volumes[0]
+        .drain_pending_times_now()
+        .await
+        .expect("explicit pending-times drain");
+    let destroy_site = calibrate_single_site("one-corpse destroy", || {
+        let b = backend.clone();
+        let corpse = inos[0];
+        async move {
+            b.destroy_inodes(&[corpse])
+                .await
+                .expect("single-corpse destroy must commit");
+        }
+    })
+    .await;
+    let rest = &inos[1..];
     let fills_le64_before = METRICS.meta_reclaim_batch_size.buckets[7].load(Ordering::Relaxed);
     let drains2 = META_KV_TIMES_ECHO_DRAIN_COMMITS.load(Ordering::Relaxed);
     let e2 = entries_now();
-    for chunk in inos.chunks(FILL) {
+    let s2 = sites_now();
+    for chunk in rest.chunks(FILL) {
         backend
             .destroy_inodes(chunk)
             .await
             .expect("batched FORGET-side destroy");
     }
+    let destroy_sites = site_deltas(&s2, &sites_now());
     let drain_d3 = META_KV_TIMES_ECHO_DRAIN_COMMITS.load(Ordering::Relaxed) - drains2;
     let destroy_delta = entries_now() - e2;
-    let n_batches = inos.len().div_ceil(FILL) as u64;
+    let n_batches = rest.len().div_ceil(FILL) as u64;
     assert_eq!(
-        destroy_delta - drain_d3,
+        destroy_sites.get(&destroy_site).copied().unwrap_or(0),
         n_batches,
-        "destroys amortize to ONE entry per batch ({n_batches} batches for \
-         {N} corpses; {drain_d3} concurrent drain commits excluded)"
+        "destroys amortize to ONE commit per batch at the destroy site {destroy_site} \
+         ({n_batches} batches for {} corpses); sites moved: {destroy_sites:?}",
+        rest.len()
+    );
+    assert!(
+        destroy_delta >= n_batches,
+        "every batch's commit is at least one journal entry ({destroy_delta} entries for \
+         {n_batches} batches; {drain_d3} drain commits inside the window)"
     );
     let fills_le64_after = METRICS.meta_reclaim_batch_size.buckets[7].load(Ordering::Relaxed);
     assert_eq!(
@@ -502,11 +533,12 @@ async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
     );
 
     // The model, assembled: 1 (unlink tx) + echo term (absorbed ⇒ ≤ the
-    // N/32 drain-noise bound asserted above) + exactly 1/fill destroys.
+    // N/32 drain-noise bound asserted above) + 1/fill destroys (+ the
+    // window's ambient entries, bounded by the ≤ 1.05 law itself).
     // At-scale amortization (drains INCLUDED) is the acceptance table's
     // job — 100 k-op storms measure 1.018/op; this sandbox pin proves the
     // per-term mechanism at N = 320.
-    let total = unlink_delta + echo_delta + (destroy_delta - drain_d3);
+    let total = unlink_delta + echo_delta + destroy_delta.saturating_sub(drain_d3);
     let per_op = total as f64 / N as f64;
     assert!(
         per_op <= 1.05,

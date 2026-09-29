@@ -945,11 +945,11 @@ async fn the_pressure_close_never_parks_on_a_held_meta_stripe() {
 /// ladder answers a `StorageFull` from its data-flush step by running its
 /// own epoch close EARLY (behind a data barrier — DUR-1) and retrying the
 /// step once (`fsync_flush_enospc_retries`). Shape: the contract-5b
-/// premise, the ino's stripe HELD by a sibling task that releases it
-/// 300 ms into the fsync — the flush's mint meets the wall (the hook reads
-/// the stripe `Busy`), the ladder's own PARKING close waits the sibling
-/// out, closes, and the retried flush lands. RED without the arm:
-/// `Errno(28)` at the fsync.
+/// premise, the ino's stripe HELD by a sibling task that releases it once
+/// the SEAM observed the fsync's mint read it `Busy` — the flush's mint
+/// meets the wall, the ladder's own PARKING close waits the sibling out,
+/// closes, and the retried flush lands. RED without the arm: `Errno(28)`
+/// at the fsync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_fsync_whose_flush_met_a_busy_skip_closes_its_own_epoch_and_lands() {
     let _g = serial().await;
@@ -987,11 +987,15 @@ async fn an_fsync_whose_flush_met_a_busy_skip_closes_its_own_epoch_and_lands() {
         pressure_close_busy(),
         METRICS.fsync_flush_enospc_retries.load(Ordering::Relaxed),
     );
-    // The sibling: holds the epoch ino's stripe across the fsync's first
-    // mint and releases it 300 ms later.
+    // The sibling: holds the epoch ino's stripe until the SEAM observed the
+    // fsync's mint read it Busy (§4.4ah's harness law — the actor is named
+    // by what the seam saw, never by a timer), then releases it.
     let held = squeezefs::routing::meta_lock_acquire(ino).await;
     let sibling = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pressure_close_busy() == busy0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
         drop(held);
     });
     let res = tokio::time::timeout(
@@ -1024,6 +1028,98 @@ async fn an_fsync_whose_flush_met_a_busy_skip_closes_its_own_epoch_and_lands() {
         &tail[..],
         "the staged tail is durable"
     );
+    squeezefs::block_reclaim::set_elision_class_all(false);
+}
+
+// ---------------------------------------------------------------------------
+// Contract 5e — one epoch's per-file fence never fails the sweep (record
+// §4.4cd, review round 2 Issue 1).
+// ---------------------------------------------------------------------------
+
+/// A close can answer `WriterGuardFenced` WITHOUT the process-wide poison:
+/// its shipped save refused as a stale lease at its holder — "a dead
+/// frame, not a dead era" (PR 9's scoped class) — and the close drops THAT
+/// epoch (W5, `rewrite_shadow_fence_drops`). The pressure close treats it
+/// as one epoch's outcome: the sweep continues, the sibling epoch closes,
+/// the mint lands. The round-1 build propagated it and failed an
+/// UNRELATED mint with a fence-class error (EIO at `fsync(2)` on a live
+/// mount). Shape: two files each holding an open epoch (the volume exactly
+/// full with both), the seam naming f1's close fenced, one direct call of
+/// the act — it lands; f1 dropped (`fence_drops` +1), f2 closed
+/// (`pressure_closes` +1), no epoch left. RED on the round-1 build:
+/// `Err(WriterGuardFenced)` whichever epoch the sweep met first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_epochs_per_file_fence_never_fails_the_pressure_sweep() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(true);
+    squeezefs::block_reclaim::set_elision_class_all(true);
+    struct SeamOff;
+    impl Drop for SeamOff {
+        fn drop(&mut self) {
+            squeezefs::routing::TEST_CLOSE_SAVE_FENCE_INO.store(0, Ordering::Relaxed);
+        }
+    }
+    let _seam = SeamOff;
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let m = NamedTempFile::new().unwrap();
+    // Capacity 14: two 3-block files (6 live) + two epochs of four parked
+    // keys each (8) = exactly full.
+    let h = make_harness_on("shadow_fence_sweep", backing, m, true, Some(14)).await;
+    let ino1 = striped_fixture(&h, "f1", 3, 21).await;
+    let ino2 = striped_fixture(&h, "f2", 3, 22).await;
+    let ba = &h.fs.router.block_allocator;
+
+    let oe0 = open_epochs();
+    for ino in [ino1, ino2] {
+        for seed in [31u8, 41] {
+            write_at(&h, ino, 0, &pattern(2 * FBS as usize, seed)).await;
+            quiesce(&h).await;
+        }
+    }
+    assert_eq!(open_epochs() - oe0, 2, "premise: two epochs open");
+    assert_eq!(
+        ba.free_supply_blocks(),
+        0,
+        "premise: the volume is exactly full"
+    );
+
+    let (pc0, fd0) = (pressure_closes(), shadow_fence_drops());
+    squeezefs::routing::TEST_CLOSE_SAVE_FENCE_INO.store(ino1, Ordering::Relaxed);
+    let (_, allocator, _, offset) = h
+        .fs
+        .router
+        .backend_router
+        .allocate_placed_block()
+        .await
+        .expect("one epoch's per-file fence drops that epoch; the sibling's close frees the mint");
+    assert_eq!(
+        shadow_fence_drops() - fd0,
+        1,
+        "f1's epoch was dropped (W5), counted"
+    );
+    assert_eq!(
+        pressure_closes() - pc0,
+        1,
+        "f2's epoch closed and is counted"
+    );
+    assert_eq!(open_epochs() - oe0, 0, "no epoch is left open");
+    assert!(
+        !ba.fresh_supply_latched(),
+        "the landed allocation cleared the latch"
+    );
+    // f2's last rewrite stands (its close published it).
+    assert_eq!(
+        &read_all(&h, ino2, 2 * FBS as usize).await[..],
+        &pattern(2 * FBS as usize, 41)[..],
+        "the closed epoch's bytes are durable"
+    );
+    let _ = allocator.abandon_unpublished_offset(offset).await;
     squeezefs::block_reclaim::set_elision_class_all(false);
 }
 

@@ -863,6 +863,55 @@ impl BlockAllocator {
         }
     }
 
+    /// The ONE law over an exhausted mint's top-up answer — the inline ask
+    /// ahead of the ENOSPC valve and the re-ask after a drain that landed
+    /// frees (record §4.4cd) classify alike. Item 24 (review round 1,
+    /// Issue 4): an empty window whose holder could not be REACHED is not
+    /// exhaustion — a manager failover on a joined writer with a drained
+    /// window — so the retryable class parks the unit on the never-lossy
+    /// ladder (it lands when the holder returns) and never latches the
+    /// volume; a holder that answered "not this beat" (review round 3,
+    /// Issue 25 — its ring-0 user window full for the beat, its lease in
+    /// motion) is the retryable class too, where the in-process sink once
+    /// filed these beats as refusals and a fresh mint under a storm
+    /// surfaced `EINVAL`; a holder that REFUSED outright is a verb
+    /// rejection, loud; `Full` / `Landed` / `NotAsked` leave the verdict
+    /// to the window.
+    fn classify_topup_answer(&self, answer: TopupOutcome) -> Result<()> {
+        match answer {
+            TopupOutcome::Unreachable => Err(crate::error::SqueezefsError::Retryable {
+                // The class word is PR 13b's slot-holder shape; the
+                // ALLOCATION holder is not an appender id, so 0 stands for
+                // "the holder of this volume's lease".
+                class: crate::error::RefusalClass::HolderUnreachable { holder: 0 },
+                msg: format!(
+                    "data volume {}: block grant window empty and the allocation holder \
+                     could not be reached — the unit stays on the never-lossy ladder until \
+                     the holder answers (block_grant_topups)",
+                    self._volume_id
+                ),
+            }),
+            TopupOutcome::Deferred(why) => Err(crate::error::SqueezefsError::Retryable {
+                class: crate::error::RefusalClass::HolderDeferred,
+                msg: format!(
+                    "data volume {}: block grant window empty and the allocation holder \
+                     deferred the ask ({why}) — the unit stays on the never-lossy ladder \
+                     until the next ask lands (block_grant_topups)",
+                    self._volume_id
+                ),
+            }),
+            TopupOutcome::Refused(why) => {
+                Err(crate::error::SqueezefsError::InvalidOperation(format!(
+                    "data volume {}: block grant window empty and the allocation holder \
+                     REFUSED the ask ({why}) — a verb rejection, neither exhaustion nor an \
+                     outage",
+                    self._volume_id
+                )))
+            }
+            TopupOutcome::NotAsked | TopupOutcome::Landed | TopupOutcome::Full => Ok(()),
+        }
+    }
+
     /// The PROACTIVE half of the 50 % law (review round 1, Issue 7): a
     /// mint that left the window below its refill point asks for the
     /// top-up off the write path — one detached ask in flight per
@@ -2238,55 +2287,7 @@ impl BlockAllocator {
                     return ok;
                 }
             }
-            // Item 24 (review round 1, Issue 4): an empty window whose holder
-            // could not be REACHED is not exhaustion — a manager failover on
-            // a joined writer with a drained window. The retryable class
-            // parks the unit on the never-lossy ladder (it lands when the
-            // holder returns) and never latches the volume; only a holder's
-            // own `Full` stays `StorageFull`.
-            match answer {
-                TopupOutcome::Unreachable => {
-                    return Err(crate::error::SqueezefsError::Retryable {
-                        // The class word is PR 13b's slot-holder shape; the
-                        // ALLOCATION holder is not an appender id, so 0
-                        // stands for "the holder of this volume's lease".
-                        class: crate::error::RefusalClass::HolderUnreachable { holder: 0 },
-                        msg: format!(
-                            "data volume {}: block grant window empty and the allocation \
-                             holder could not be reached — the unit stays on the never-lossy \
-                             ladder until the holder answers (block_grant_topups)",
-                            self._volume_id
-                        ),
-                    });
-                }
-                // Review round 3, Issue 25: a holder that answered "not this
-                // beat" — its ring-0 user window full for the beat (the
-                // default solo mount's own storm), its lease in motion — is
-                // the retryable class too: the unit parks on the never-lossy
-                // ladder and the next ask lands; before it the in-process
-                // sink filed these beats as refusals and a fresh mint under
-                // a storm surfaced `EINVAL` at the write.
-                TopupOutcome::Deferred(why) => {
-                    return Err(crate::error::SqueezefsError::Retryable {
-                        class: crate::error::RefusalClass::HolderDeferred,
-                        msg: format!(
-                            "data volume {}: block grant window empty and the allocation \
-                             holder deferred the ask ({why}) — the unit stays on the \
-                             never-lossy ladder until the next ask lands (block_grant_topups)",
-                            self._volume_id
-                        ),
-                    });
-                }
-                TopupOutcome::Refused(why) => {
-                    return Err(crate::error::SqueezefsError::InvalidOperation(format!(
-                        "data volume {}: block grant window empty and the allocation holder \
-                         REFUSED the ask ({why}) — a verb rejection, neither exhaustion nor \
-                         an outage",
-                        self._volume_id
-                    )));
-                }
-                TopupOutcome::NotAsked | TopupOutcome::Landed | TopupOutcome::Full => {}
-            }
+            self.classify_topup_answer(answer)?;
         }
         if !is_storage_full(&e) {
             return Err(e);
@@ -2345,10 +2346,16 @@ impl BlockAllocator {
             // (PR 8's "the valve is inert on an armed allocator" gap; a
             // regular-file backing queues every free, so the pressure
             // close's frees landed here and the retry never saw them). The
-            // ask's outcome is the window's (a `Full` answer falls through
-            // to the next pass; the retryable classes were decided above).
+            // answer is classified by the inline ask's own law — a holder
+            // that went unreachable or deferred BETWEEN the two asks is the
+            // retryable class here too, never a latched `StorageFull`; a
+            // `Full` falls through to the next pass. `pending` is the
+            // router-wide reclaim queue's word, so on a multi-volume set a
+            // sibling's queued frees cost this mint one extra ask per pass
+            // (≤ ENOSPC_VALVE_MAX_ATTEMPTS, each answered `Full`/`Already`).
             if pending && self.block_grant_armed() {
-                let _ = self.block_grant_topup().await;
+                let answer = self.block_grant_topup().await;
+                self.classify_topup_answer(answer)?;
             }
             if !pending {
                 // Nothing was owed before the final drain: the verdict

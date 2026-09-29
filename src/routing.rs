@@ -3458,7 +3458,8 @@ impl BackendRouter {
     /// chain's attempt 12 in fstests generic/551): the verdict runs the
     /// pressure-supply hook (`pressure_supply_hook` — the open rewrite
     /// epochs' parked displaced keys, KD-1.6) and, when it freed anything,
-    /// retries the mint ONCE on the same pick; the allocation's own ENOSPC
+    /// retries the mint ONCE — a fresh §5.9 pick, so the retry may land on
+    /// a sibling volume the closes restocked; the allocation's own ENOSPC
     /// valve drains the frees (and, on a grant-armed allocator, re-asks the
     /// holder after the drain — the window is the mint source there).
     /// Nothing parked ⇒ the refusal stands as before. The verdict is ONE
@@ -3480,7 +3481,8 @@ impl BackendRouter {
     /// adjudicated (a stripe collision, or a two-task cycle against any
     /// canonical multi-ino `lock_many`). A caller holding either class
     /// calls [`Self::allocate_placed_block_under_guard`]; the call-site
-    /// census is pinned in `tests/derivation_sweep_tests.rs`.
+    /// census of both forms is pinned in
+    /// `tests/allocation_act_lock_law_tests.rs`.
     pub async fn allocate_placed_block(
         &self,
     ) -> Result<(
@@ -5897,6 +5899,16 @@ pub static TEST_TIER_PUBLISH_MID_WINDOW_STALL_MS: std::sync::atomic::AtomicU64 =
 /// post-fix: the validated insert refused, so there is nothing to see).
 /// One relaxed load per deferred publish, zero-cost when unset.
 pub static TEST_TIER_PUBLISH_POST_PUT_STALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam (record §4.4cd, review round 2 Issue 1): the ino whose rewrite
+/// epoch's CLOSE answers `WriterGuardFenced` from its save WITHOUT the
+/// process-wide poison — the stand-in for a shipped publish refused as a
+/// stale lease at its holder ("a dead frame, not a dead era", the per-file
+/// W5 drop) — so the pressure close's law over a sweep with one fenced
+/// epoch is pinned in-process. One relaxed load per close's dirty arm,
+/// zero-cost when unset (`0` = off).
+pub static TEST_CLOSE_SAVE_FENCE_INO: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Test seam (same contract as [`TEST_TIER_PUBLISH_DELAY_MS`]): artificial
@@ -16674,10 +16686,17 @@ impl DataRouter {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) if crate::data_custody::poisoned() => return Err(e),
-                // The W5 fence class dropped the epoch (counted on
-                // `rewrite_shadow_fence_drops` inside the close) — this
-                // mount is fenced and its mint is dead too.
-                Err(e @ SqueezefsError::WriterGuardFenced) => return Err(e),
+                // The W5 fence class WITHOUT the poison: one epoch's shipped
+                // save refused as a stale lease at its holder — "a dead
+                // frame, not a dead era" (`meta_ship::publish`; PR 9's
+                // scoped class) — so the close dropped THAT epoch (counted on
+                // `rewrite_shadow_fence_drops` inside it) and this mount's
+                // mint is alive: the sweep continues, `closed` decides.
+                Err(SqueezefsError::WriterGuardFenced) => log::warn!(
+                    "pressure close of ino {ino}'s rewrite epoch met a stale-lease fence: the \
+                     epoch is DROPPED (rewrite_shadow_fence_drops — W5, successor accounting), \
+                     the other epochs still close"
+                ),
                 Err(e) => log::warn!(
                     "pressure close of ino {ino}'s rewrite epoch failed transiently: {e:?} — the \
                      epoch re-registers, its next trigger retries"
@@ -16742,6 +16761,11 @@ impl DataRouter {
         let save_res: Result<(bool, Vec<crate::meta_backend::kv::block_refs::BlockRef>)> =
             match current {
                 _ if crate::data_custody::poisoned() => Err(SqueezefsError::WriterGuardFenced),
+                // The seam: this ino's shipped save refused as a stale lease
+                // at its holder (the per-file fence, no poison).
+                Some(_) if TEST_CLOSE_SAVE_FENCE_INO.load(Ordering::Relaxed) == ino => {
+                    Err(SqueezefsError::WriterGuardFenced)
+                }
                 Some(mut cur) if cur.layout_dirty => {
                     cur.layout_dirty = false;
                     cur.cached_at = std::time::Instant::now();

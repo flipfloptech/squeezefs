@@ -372,13 +372,17 @@ impl JoinedWire {
                     vol.device_path().display()
                 );
             }
-            // The resolve rides the wire itself (`joined_resolve_endpoint`
-            // → `with_client("ResolveEndpoint")` → this fn), so this await
-            // is the edge that closes the opaque future's cycle: erased to
-            // `dyn Future` here — the cold re-dial path — the type is
-            // finite for every compiler (the nightly solver refuses the
-            // unboxed cycle with E0275; stable 1.98 accepted it; record
-            // §4.4cf).
+            // The resolve's FUTURE TYPE contains this door's own: its
+            // `ClaimSet::load` → `getxattr` → `token_serve` →
+            // `foreign_read_plane` → `bind_holder_endpoint_on_demand` →
+            // `joined_resolve_endpoint` → `with_client` — a type-level
+            // cycle, never a runtime one (a re-dial reads the claim set
+            // from the device: `claim_set` is not token-carried, and the
+            // wire is what just failed). Erased to `dyn Future` here — the
+            // cold re-dial path — the type is finite for every compiler:
+            // the nightly solver refuses the unboxed cycle with E0275
+            // (the RPIT's `+ Send` bound re-proven against its own
+            // instantiation), stable 1.98 accepted it; record §4.4cf.
             let resolved: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Option<String>> + Send + '_>,
             > = Box::pin(crate::sym_join::resolve_holder_endpoint(vol, 0));

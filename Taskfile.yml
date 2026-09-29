@@ -198,8 +198,11 @@ tasks:
       # only (seconds) — the model RUN is tests/run_loom.sh.
       - task: check:loom
       # The fuzz workspace is excluded too (sanitizer RUSTFLAGS); its
-      # targets type-check on STABLE — only the instrumented RUN needs
-      # nightly + cargo-fuzz. Check only.
+      # targets type-check on STABLE here. The nightly BUILD is a distinct
+      # verdict (`check:fuzz-nightly` — a recursive `impl Future` the
+      # stable solver accepted failed it, record §4.4cf) and, with the
+      # instrumented RUN, needs nightly + cargo-fuzz: both stay out of this
+      # aggregate (CI is stable-pinned) and run before every release chain.
       - task: check:fuzz
       - task: check:docs
       # ENG-2: supply chain. Last so a dependency advisory does not mask a

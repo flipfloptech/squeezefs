@@ -483,19 +483,25 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
     if n < 8 {
         // The divisor is DERIVED per venue (`op_trace::derive_geometry`):
         // a box sampling 1 in ≥ 33 leaves fewer than 8 chains from 256
-        // reads — the containment laws are not judged, said so.
-        eprintln!(
-            "note: zc bridge containment laws not judged — {n} sampled chains (divisor \
-             {divisor}) of {READS} reads, fewer than 8"
+        // reads — a PARTIAL skip on the ledger (uncaptured; promoted to a
+        // failure under SQUEEZEFS_TEST_REQUIRE_VENUE): the containment
+        // laws take no verdict, the exact laws above already did.
+        let _ = squeezefs_testkit::declare(
+            site!(),
+            squeezefs_testkit::SkipClass::Venue,
+            &format!(
+                "zc bridge containment laws not judged — {n} sampled chains (divisor \
+                 {divisor}) of {READS} reads, fewer than 8"
+            ),
         );
     } else {
         for (i, p) in BRIDGE_PHASES.iter().enumerate() {
             let deltas = bucket_deltas(&pre, &post, "zc_bridge_phase_ns", p);
             let pop_bucket = median_bucket(&deltas);
-            let mut sample = spans[i].clone();
+            let sample = &mut spans[i];
             sample.sort_unstable();
             // (a) membership.
-            for span in &sample {
+            for span in sample.iter() {
                 let b = squeezefs::latency_core::latency_bucket_index(span / 1_000);
                 let populated = deltas[b] > 0 || (*p == "wake_hop" && b > 0 && deltas[b - 1] > 0);
                 assert!(

@@ -1477,9 +1477,11 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
 /// A GUEST root swap is covered through tree 0 (the new mechanism the
 /// native pin cannot reach): every rotor slot's root leaf fills and
 /// compacts/splits under the storm; the swapped roots reach their durable
-/// home (tree 0 on this unarmed forest; a lessee's page under the armed
-/// plane, tree 0 at its leave); a remount reopens each guest at the root
-/// its home names and serves everything.
+/// home (a leased guest's root rides its lessee's page while the mount
+/// runs — this fixture is ARMED — and tree 0 names it at the clean leave;
+/// an unarmed forest publishes it into tree 0 at the checkpoint); a
+/// remount reopens each guest at the root its home names and serves
+/// everything.
 ///
 /// The law is judged over the WHOLE storm against each guest's FIRST-SEEN
 /// root (its mint), never between a snapshot and this pin's own
@@ -1517,7 +1519,8 @@ async fn a_guest_root_swap_is_covered_through_tree_zero() {
         }
     };
     note_roots(vol.forest_roots());
-    // 8 rotor slots × 15 files × 4 KB xattrs: every guest root leaf's
+    // 120 files × 4 KB xattrs over the 7 guest slots (the 8-wide set's
+    // native slot takes none): ≈ 17 per guest, every guest root leaf's
     // log fills past one 64 KiB node.
     let mut inos = Vec::new();
     for i in 0..120u32 {
@@ -1534,6 +1537,10 @@ async fn a_guest_root_swap_is_covered_through_tree_zero() {
         note_roots(vol.forest_roots());
         inos.push(f);
     }
+    assert!(
+        vol.symmetric_arm_engaged(),
+        "premise: the fixture is the ARMED forest (a leased root's home is its lessee's page)"
+    );
     vol.checkpoint_now().await.unwrap();
     let after: Vec<(u32, RootPtr)> = vol.forest_roots();
     let guests = after

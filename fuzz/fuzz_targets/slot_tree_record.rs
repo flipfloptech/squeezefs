@@ -87,12 +87,32 @@ fuzz_target!(|data: &[u8]| {
         let b = u64::from_be_bytes(data[9..17].try_into().unwrap());
         let c = u64::from_be_bytes(data[17..25].try_into().unwrap());
         let d = u32::from_be_bytes(data[25..29].try_into().unwrap());
-        // Every kind's own legacy key, plus the wrong-length probe.
+        // Every kind's own legacy key, plus the wrong-length probe. The
+        // block-map codec refuses ONE index of its own (`u32::MAX`, the
+        // MAP_BLOB sentinel — design A5): that is the per-kind codec's
+        // law, not the forest framing's, so a refused constructive key
+        // never makes kind 7 a non-content kind — the first oracle routed
+        // it into the "never a slot-tree kind" arm and the 1.3.0 fuzz leg
+        // found the well-formed 12-byte key framing under it (record
+        // §4.4cg). The sentinel's own law is asserted, the framing law is
+        // judged on the raw bytes below like every other kind's.
         let legacy: Option<Vec<u8>> = match kind {
             TREE_INODES => Some(inode_key(a).to_vec()),
             TREE_DENTRIES => Some(dentry_key(a, b & ((1 << 54) - 1), d as u8).to_vec()),
             TREE_XATTRS => Some(xattr_key(a, b & ((1 << 56) - 1), d as u8).to_vec()),
-            TREE_BLOCK_MAP => block_map_key(a, d).ok().map(|k| k.to_vec()),
+            TREE_BLOCK_MAP => match block_map_key(a, d) {
+                Ok(k) => Some(k.to_vec()),
+                Err(_) => {
+                    assert_eq!(
+                        d,
+                        u32::MAX,
+                        "the block-map codec refuses the sentinel alone"
+                    );
+                    let mut raw = a.to_be_bytes().to_vec();
+                    raw.extend_from_slice(&d.to_be_bytes());
+                    Some(raw)
+                }
+            },
             TREE_BLOCK_REFS => Some(block_ref_key(b, c, a, d).to_vec()),
             _ => None,
         };

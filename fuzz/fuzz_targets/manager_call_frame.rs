@@ -98,12 +98,17 @@ fn check_service_edge(call: &ManagerCall, total_extents: u64, record_seed: &[u8]
             // input; the intersection emits each record extent at most
             // once — strictly ascending by construction, no dedup step
             // exists to hide an over-allocation behind (Issue 2's
-            // residual: the pre-dedup list was ∝ runs × record).
+            // residual: the pre-dedup list was ∝ runs × record). Two
+            // output runs touch ONLY where the codec split a merged run
+            // longer than the wire's `u32` into `u32::MAX`-long pieces
+            // (PR 3 review round 3, Issue 20) — the oracle's strict gap
+            // was the 1.3.0 fuzz leg's find (record §4.4cg).
             let coalesced = coalesce_runs(&runs);
             assert!(coalesced.len() <= runs.len());
-            assert!(coalesced
-                .windows(2)
-                .all(|w| { w[0].start + u64::from(w[0].len) < w[1].start }));
+            assert!(coalesced.windows(2).all(|w| {
+                let end = w[0].start + u64::from(w[0].len);
+                end < w[1].start || (end == w[1].start && w[0].len == u32::MAX)
+            }));
             assert!(runs_extent_count(&coalesced) <= runs_extent_count(&runs));
             let inside = intersect_coalesced_with_record(&coalesce_runs(&runs), &record);
             assert!(

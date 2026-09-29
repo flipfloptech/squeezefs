@@ -1085,12 +1085,17 @@ proptest! {
         }
         // The coalesce (Issue 2's residual): bounded by the frame's own
         // run count, disjoint and ascending, naming no more than the input
-        // and exactly the input's distinct extents.
+        // and exactly the input's distinct extents. Two output runs touch
+        // only where the codec split a merged run longer than the wire's
+        // `u32` into `u32::MAX`-long pieces (PR 3 review round 3, Issue 20
+        // — the law the fuzz oracle's strict gap missed, record §4.4cg).
         let coalesced = coalesce_runs(&runs);
         prop_assert!(coalesced.len() <= runs.len());
-        prop_assert!(coalesced
-            .windows(2)
-            .all(|w| w[0].start + u64::from(w[0].len) < w[1].start));
+        let disjoint_ascending = coalesced.windows(2).all(|w| {
+            let end = w[0].start + u64::from(w[0].len);
+            end < w[1].start || (end == w[1].start && w[0].len == u32::MAX)
+        });
+        prop_assert!(disjoint_ascending, "adjacent pieces only at a u32::MAX cut");
         prop_assert!(runs_extent_count(&coalesced) <= runs_extent_count(&runs));
         let distinct: std::collections::BTreeSet<u64> = runs
             .iter()
@@ -2906,4 +2911,105 @@ proptest! {
         let decl = WindowDecl { vol_tag: 1, ranges };
         prop_assert_eq!(screen_window_decl(&decl, blocks), Ok(()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The 1.3.0 release chain's two fuzz finds, ported (record §4.4cg): both were
+// ORACLE defects — the product behaved as its code documents — and each is
+// pinned here as the corrected law, deterministic, on stable.
+// ---------------------------------------------------------------------------
+
+/// `manager_call_frame`'s artifact shape: two return runs whose merge is
+/// longer than the wire's `u32`. The codec splits the merged run into
+/// `u32::MAX`-long ADJACENT pieces (PR 3 review round 3, Issue 20 — every
+/// piece, so the merge walk reads the whole run); the oracle asserted a
+/// strict gap between consecutive output runs and panicked on the touch.
+/// The law: ascending and non-overlapping, a touch only after a
+/// `u32::MAX` piece, the extent count conserved.
+#[test]
+fn coalesce_runs_splits_an_over_u32_merge_into_adjacent_pieces() {
+    use squeezefs::meta_backend::kv::appender::{coalesce_runs, runs_extent_count, GrantRun};
+    let runs = [
+        GrantRun {
+            start: 0,
+            len: u32::MAX,
+        },
+        GrantRun {
+            start: u64::from(u32::MAX) - 1,
+            len: 3,
+        },
+    ];
+    let coalesced = coalesce_runs(&runs);
+    assert_eq!(
+        coalesced,
+        vec![
+            GrantRun {
+                start: 0,
+                len: u32::MAX
+            },
+            GrantRun {
+                start: u64::from(u32::MAX),
+                len: 2
+            }
+        ],
+        "one merged run of u32::MAX + 2 extents, cut at the wire's u32"
+    );
+    assert!(
+        coalesced.windows(2).all(|w| {
+            let end = w[0].start + u64::from(w[0].len);
+            end < w[1].start || (end == w[1].start && w[0].len == u32::MAX)
+        }),
+        "adjacent pieces only at a u32::MAX cut"
+    );
+    assert_eq!(
+        runs_extent_count(&coalesced),
+        u64::from(u32::MAX) + 2,
+        "the merge names the union, once"
+    );
+    // The old oracle's strict-gap law reads this exact output as a defect.
+    assert!(
+        !coalesced
+            .windows(2)
+            .all(|w| w[0].start + u64::from(w[0].len) < w[1].start),
+        "the strict gap is NOT the codec's law (the fuzz oracle's find)"
+    );
+}
+
+/// `slot_tree_record`'s artifact shape: kind 7 (`TREE_BLOCK_MAP`) with the
+/// block-map codec's ONE reserved index (`u32::MAX`, the MAP_BLOB sentinel).
+/// `block_map_key` refuses it — the per-kind codec's law — while the forest
+/// framing judges LENGTH and the owner ino's slot namespace alone and frames
+/// the well-formed 12-byte key: kind 7 is a slot-tree kind whatever its
+/// index reads. The oracle routed the refused constructive key into its
+/// "never a slot-tree kind" arm and panicked when the framing succeeded.
+#[test]
+fn a_block_map_key_at_the_reserved_index_is_refused_by_its_codec_and_framed_by_the_forest() {
+    use squeezefs::meta_backend::kv::block_map::{block_map_key, BLOCK_MAP_KEY_LEN};
+    use squeezefs::meta_backend::kv::record::{
+        forest_key, forest_key_slot, is_slot_tree_kind, split_forest_key, TREE_BLOCK_MAP,
+    };
+    let ino: u64 = 4242;
+    assert!(
+        is_slot_tree_kind(TREE_BLOCK_MAP),
+        "kind 7 is a content kind"
+    );
+    assert!(
+        block_map_key(ino, u32::MAX).is_err(),
+        "the block-map codec's own law: the sentinel index is refused"
+    );
+    let mut raw = ino.to_be_bytes().to_vec();
+    raw.extend_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(raw.len(), BLOCK_MAP_KEY_LEN);
+    let framed =
+        forest_key(TREE_BLOCK_MAP, &raw).expect("the forest frames a well-formed 12-byte key");
+    assert_eq!(framed.len(), BLOCK_MAP_KEY_LEN + 1, "one kind byte");
+    let (kind, legacy) = split_forest_key(&framed).expect("a framed key splits");
+    assert_eq!((kind, &legacy[..]), (TREE_BLOCK_MAP, &raw[..]));
+    assert_eq!(
+        forest_key_slot(&framed).expect("routes"),
+        0,
+        "a native-slot ino"
+    );
+    // The wrong-length probe is the framing law's own refusal, index or no index.
+    assert!(forest_key(TREE_BLOCK_MAP, &raw[..BLOCK_MAP_KEY_LEN - 1]).is_err());
 }

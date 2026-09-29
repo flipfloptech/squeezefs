@@ -7330,12 +7330,14 @@ pub struct Metrics {
     /// Barrier steps that joined ≥ 2 legs concurrently — the
     /// parallel-legs lever's engagement.
     pub fsync_parallel_joins: Align64<AtomicU64>,
-    /// fsyncs whose staged flush met `StorageFull` (record §4.4cd — the
+    /// fsyncs whose data-flush step met `StorageFull` (record §4.4cd — the
     /// pressure close at the flush's mint found the supply's stripe held
-    /// by a sibling, or the supply is this ino's own epoch) and ran the
-    /// ladder's own epoch close EARLY behind a data barrier, then retried
-    /// the flush ONCE. ≈ 0 except at genuine space pressure under load; a
-    /// retry that still met the wall surfaces the honest `ENOSPC`.
+    /// by a sibling, or the supply is this ino's own epoch) and TOOK the
+    /// ladder's arm: a data barrier, its own epoch close EARLY, the step
+    /// retried ONCE. Counted at the arm's entry — an arm whose barrier or
+    /// close fails still counts and fails the fsync loud. ≈ 0 except at
+    /// genuine space pressure under load; a retry that still met the wall
+    /// surfaces the honest `ENOSPC`.
     pub fsync_flush_enospc_retries: Align64<AtomicU64>,
     /// Histograms for lock wait times and queue depths.
     pub write_lock_wait: ShardedLatencyHistogram,
@@ -23233,9 +23235,11 @@ impl SqueezefsFilesystem {
             // over the siblings' epochs. A second wall is the honest
             // `ENOSPC`.
             Err(e) if crate::block_allocator::is_storage_full(&e) => {
-                // Counted at the arm's ENTRY: the fsyncs that took it (a
-                // contract's sibling releases the stripe it holds on this
-                // word, before the close below parks on it).
+                // Counted at the arm's ENTRY — the fsyncs that took the arm,
+                // whatever the barrier and close below answer (a failure
+                // fails the fsync loud and is still one arm taken); the
+                // word is also the witness contract 5d's sibling releases
+                // its held stripe on, ahead of the parking close.
                 METRICS
                     .fsync_flush_enospc_retries
                     .fetch_add(1, Ordering::Relaxed);

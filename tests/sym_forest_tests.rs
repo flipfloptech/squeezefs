@@ -1476,29 +1476,28 @@ async fn a_deferred_root_publication_keeps_the_unpublished_roots_in_the_window()
 
 /// A GUEST root swap is covered through tree 0 (the new mechanism the
 /// native pin cannot reach): every rotor slot's root leaf fills and
-/// compacts/splits; the checkpoint publishes the swapped roots; a remount
-/// reopens each guest at the root tree 0 names and serves everything.
+/// compacts/splits under the storm; the swapped roots reach their durable
+/// home (tree 0 on this unarmed forest; a lessee's page under the armed
+/// plane, tree 0 at its leave); a remount reopens each guest at the root
+/// its home names and serves everything.
 ///
-/// The cadence is PARKED for the pin's duration (the suite's idiom): the
-/// swap this pin asserts is the one ITS `checkpoint_now` performs between
-/// the `before` and `after` snapshots, and a background tick landing at
-/// the end of the storm — the trigger is ≈ 1 s from the open, the 240
-/// commits take that long on a slow box (the 1.3.0 release chain's
-/// attempt 11, an hour into `task check` on the hot laptop) — swapped the
-/// roots BEFORE `before` was read, so the explicit cycle had nothing left
-/// to swap and the pin read "no guest root swapped" against a mechanism
-/// that had worked (record §4.4cc; the parked-cadence precedent is
-/// `230e95dd`'s ring-head pin).
+/// The law is judged over the WHOLE storm against each guest's FIRST-SEEN
+/// root (its mint), never between a snapshot and this pin's own
+/// `checkpoint_now` (record §4.4cc): three background actors swap roots
+/// while the storm runs — the threshold maintenance pass (every ≥ 4 KiB
+/// commit wakes the checkpoint task, whose `maintain_node` compacts or
+/// splits a full root leaf: cadence-independent), the ring's park-kick /
+/// pressure cycles (241 page-padded commits on this 1 MiB ring exhaust
+/// the user window mid-storm), and once a root leaf has split the root is
+/// an interior node that stops moving — so the explicit cycle has
+/// nothing left to swap whenever the maintenance keeps pace with the
+/// storm (a 1 ms/commit pace reads 0 swaps between the two snapshots
+/// 9 / 9; the 1.3.0 release chain's attempt 11 read it on the hot laptop
+/// at ≈ 10× the idle storm's wall). Whoever performs the SMO, ≈ 62 KB of
+/// records per rotor slot against a 61.3 KB `fold_capacity` forces at
+/// least one — the first-seen law is actor- and pace-blind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_guest_root_swap_is_covered_through_tree_zero() {
-    struct Cleanup;
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            std::env::remove_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS");
-        }
-    }
-    std::env::set_var("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "60000");
-    let _cleanup = Cleanup;
     let dir = tempfile::tempdir().unwrap();
     let uris = stamped_forest_set_width(dir.path(), 8).await;
     let routed = open_routed_meta_set(&uris).await.expect("open");
@@ -1508,6 +1507,16 @@ async fn a_guest_root_swap_is_covered_through_tree_zero() {
         .await
         .unwrap()
         .ino;
+    // Each guest's FIRST-SEEN root — its mint — sampled after every
+    // commit (a slot tree is minted lazily at its first record).
+    let mut first_seen: std::collections::BTreeMap<u32, RootPtr> =
+        std::collections::BTreeMap::new();
+    let mut note_roots = |roots: Vec<(u32, RootPtr)>| {
+        for (slot, root) in roots {
+            first_seen.entry(slot).or_insert(root);
+        }
+    };
+    note_roots(vol.forest_roots());
     // 8 rotor slots × 15 files × 4 KB xattrs: every guest root leaf's
     // log fills past one 64 KiB node.
     let mut inos = Vec::new();
@@ -1517,23 +1526,30 @@ async fn a_guest_root_swap_is_covered_through_tree_zero() {
             .await
             .unwrap()
             .ino;
+        note_roots(vol.forest_roots());
         routed
             .setxattr(f, "user.pad", &vec![0x44; 4000])
             .await
             .unwrap();
+        note_roots(vol.forest_roots());
         inos.push(f);
     }
-    let before: Vec<(u32, RootPtr)> = vol.forest_roots();
     vol.checkpoint_now().await.unwrap();
     let after: Vec<(u32, RootPtr)> = vol.forest_roots();
-    let swapped = before
+    let guests = after
         .iter()
-        .zip(&after)
-        .filter(|((s0, r0), (s1, r1))| s0 == s1 && s0 != &NATIVE_FOREST_SLOT && r0 != r1)
+        .filter(|(s, _)| s != &NATIVE_FOREST_SLOT)
         .count();
+    let swapped = after
+        .iter()
+        .filter(|(s, r)| {
+            s != &NATIVE_FOREST_SLOT && first_seen.get(s).is_some_and(|mint| mint != r)
+        })
+        .count();
+    eprintln!("forest root swaps under the storm: {swapped} of {guests} guest roots moved from their mint");
     assert!(
         swapped >= 1,
-        "at least one guest root swapped under the churn"
+        "at least one guest root swapped under the churn ({guests} guests; first seen {first_seen:?}, after {after:?})"
     );
     let census = vol.forest_census().unwrap();
     assert_eq!(census.control_records, census.slot_trees - 1);

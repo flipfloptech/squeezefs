@@ -199,6 +199,51 @@ fn phase(m: &serde_json::Value, family: &str, phase: &str) -> (u64, u64) {
 
 const BRIDGE_PHASES: [&str; 4] = ["msg_hop", "sq_wait", "device_cq", "wake_hop"];
 
+/// The phase histogram's per-bucket deltas between two stats snapshots,
+/// in the latency core's bucket order (`<=1us`, then one bucket per power
+/// of two).
+fn bucket_deltas(
+    pre: &serde_json::Value,
+    post: &serde_json::Value,
+    family: &str,
+    phase: &str,
+) -> Vec<u64> {
+    squeezefs::latency_core::LATENCY_BUCKET_LABELS
+        .iter()
+        .map(|label| {
+            let b0 = pre[family][phase]["buckets"][*label].as_u64().unwrap_or(0);
+            let b1 = post[family][phase]["buckets"][*label].as_u64().unwrap_or(0);
+            b1 - b0
+        })
+        .collect()
+}
+
+/// The bucket holding the population's MEDIAN sample.
+fn median_bucket(deltas: &[u64]) -> usize {
+    let total: u64 = deltas.iter().sum();
+    let half = total.div_ceil(2).max(1);
+    let mut seen = 0u64;
+    for (i, d) in deltas.iter().enumerate() {
+        seen += d;
+        if seen >= half {
+            return i;
+        }
+    }
+    deltas.len() - 1
+}
+
+/// A bucket's `(lower, upper]` edge in microseconds (`<=1us` is `(0, 1]`;
+/// bucket `i ≥ 1` is `(2^(i-1), 2^i]`; the last is open above).
+fn bucket_edges_us(i: usize) -> (u64, u64) {
+    if i == 0 {
+        (0, 1)
+    } else if i + 1 >= squeezefs::latency_core::LATENCY_BUCKETS {
+        (1u64 << (i - 1), u64::MAX)
+    } else {
+        (1u64 << (i - 1), 1u64 << i)
+    }
+}
+
 /// A durably-published file of `len` bytes with a per-4 KiB pattern.
 fn publish_file(mnt: &Path, name: &str, len: usize) -> PathBuf {
     let p = mnt.join(name);
@@ -388,6 +433,7 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
         "read_validated",
     ];
     let mut span_sums = [0u64; 4];
+    let mut spans: [Vec<u64>; 4] = Default::default();
     for c in &bridged {
         let ns: Vec<u64> = ORDER
             .iter()
@@ -399,39 +445,46 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
         );
         for (i, acc) in span_sums.iter_mut().enumerate() {
             // bridge_sent→bridge_taken→dev_submit→dev_complete→block_fetched
-            *acc += ns[i + 2] - ns[i + 1];
+            let span = ns[i + 2] - ns[i + 1];
+            *acc += span;
+            spans[i].push(span);
         }
     }
-    // The chain's spans vs the histograms' means (the stitch tool's
-    // containment law): exact for the first three (shared clock reads);
-    // `wake_hop`'s chain end is `block_fetched`, read a few hundred ns
-    // after the handler's own `wake_hop` end, so PER OP it may only be
-    // LONGER. The comparison below is a 1-in-`divisor` SAMPLE's mean
-    // against the POPULATION's mean, so the per-op fact is a bound only
-    // once the sample is large; at n = 13 a 12 % dip is ordinary sampling
-    // (the 2026-09-08 release gate read 7,057 vs 7,991 ns on a passing
-    // tree, 8/8 green on rerun). The ≥ 0.9 arm applies from 64 samples;
-    // below that the sample rides the loose band every other phase uses.
+    // The chain's spans vs the histograms (the stitch tool's containment
+    // law): exact for the first three (shared clock reads); `wake_hop`'s
+    // chain end is `block_fetched`, read a few hundred ns after the
+    // handler's own `wake_hop` end, so PER OP it may only be LONGER. The
+    // trace is a 1-in-`divisor` SAMPLE of the population the histogram
+    // holds, so the comparison is between the sample's MEDIAN span and the
+    // bucket holding the population's median (± one power-of-two bucket —
+    // the quantization the histogram has, and the containment a wrong
+    // clock read at either end could not survive). Never the means: the
+    // device's completion time (`device_cq`) is heavy-tailed by nature —
+    // the 1.3.0 release chain's attempt 10 read a 13-chain sample mean of
+    // 10.9 µs against a 256-read population mean of 48.9 µs (a few slow
+    // completions on a laptop four hours into the gate), which the earlier
+    // 0.25..4 mean-ratio band called a stitch error; the population's
+    // median bucket sat where the sample's did. (The 2026-09-08 release
+    // gate's 7,057-vs-7,991 ns `wake_hop` dip at n = 13 was the same
+    // sample-vs-population reading.)
     let n = bridged.len() as u64;
     for (i, p) in BRIDGE_PHASES.iter().enumerate() {
-        let (n0, s0) = phase(&pre, "zc_bridge_phase_ns", p);
-        let (n1, s1) = phase(&post, "zc_bridge_phase_ns", p);
-        let hist_mean = (s1 - s0) as f64 / (n1 - n0) as f64;
-        let trace_mean = span_sums[i] as f64 / n as f64;
-        let ratio = trace_mean / hist_mean.max(1.0);
-        if *p == "wake_hop" && n >= 64 {
-            assert!(
-                ratio >= 0.9,
-                "{p}: trace {trace_mean} vs hist {hist_mean} (n={n})"
-            );
-        } else if n >= 8 {
-            // A 1-in-N sample of a tight distribution: loose bound, the
-            // exact law is the sum check above.
-            assert!(
-                (0.25..=4.0).contains(&ratio),
-                "{p}: trace mean {trace_mean} vs hist mean {hist_mean} (n={n})"
-            );
+        if n < 8 {
+            break;
         }
+        let deltas = bucket_deltas(&pre, &post, "zc_bridge_phase_ns", p);
+        let pop_bucket = median_bucket(&deltas);
+        let (lo, _) = bucket_edges_us(pop_bucket.saturating_sub(1));
+        let (_, hi) = bucket_edges_us(pop_bucket + 1);
+        let mut sample = spans[i].clone();
+        sample.sort_unstable();
+        let sample_median_us = sample[sample.len() / 2] / 1000;
+        assert!(
+            sample_median_us >= lo && sample_median_us <= hi,
+            "{p}: the sampled chains' median span {sample_median_us} µs lies outside the \
+             population's median bucket ± 1 ({lo}..={hi} µs; bucket {pop_bucket}, n={n}) — \
+             the chain's clock reads are not the histogram's"
+        );
     }
     eprintln!(
         "zc bridge: {READS} reads, {} traced chains (divisor {divisor}); means µs: {}",

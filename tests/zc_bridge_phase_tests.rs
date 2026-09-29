@@ -20,8 +20,11 @@
 //! 3. **The per-op chain**: a traced read's `.trace` chain carries
 //!    `bridge_sent ≤ bridge_taken ≤ dev_submit ≤ dev_complete ≤
 //!    block_fetched` in that order between `keys_resolved` and
-//!    `read_validated`, and the chain's spans agree with the histogram
-//!    means (the stitch tool's containment law, checked here in-process).
+//!    `read_validated`, and the chain's spans sit where the histogram's
+//!    population sits (the stitch tool's containment law, checked here
+//!    in-process: every sampled chain's span lands in a populated bucket,
+//!    and the sample's median within one bucket below / two above the
+//!    population's median bucket).
 
 use squeezefs_testkit::{mount_supported, site};
 use std::io::Write as _;
@@ -211,8 +214,12 @@ fn bucket_deltas(
     squeezefs::latency_core::LATENCY_BUCKET_LABELS
         .iter()
         .map(|label| {
-            let b0 = pre[family][phase]["buckets"][*label].as_u64().unwrap_or(0);
-            let b1 = post[family][phase]["buckets"][*label].as_u64().unwrap_or(0);
+            let b0 = pre[family][phase]["buckets"][*label]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{family}.{phase}.buckets.{label} (pre)"));
+            let b1 = post[family][phase]["buckets"][*label]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{family}.{phase}.buckets.{label} (post)"));
             b1 - b0
         })
         .collect()
@@ -230,18 +237,6 @@ fn median_bucket(deltas: &[u64]) -> usize {
         }
     }
     deltas.len() - 1
-}
-
-/// A bucket's `(lower, upper]` edge in microseconds (`<=1us` is `(0, 1]`;
-/// bucket `i ≥ 1` is `(2^(i-1), 2^i]`; the last is open above).
-fn bucket_edges_us(i: usize) -> (u64, u64) {
-    if i == 0 {
-        (0, 1)
-    } else if i + 1 >= squeezefs::latency_core::LATENCY_BUCKETS {
-        (1u64 << (i - 1), u64::MAX)
-    } else {
-        (1u64 << (i - 1), 1u64 << i)
-    }
 }
 
 /// A durably-published file of `len` bytes with a per-4 KiB pattern.
@@ -432,7 +427,6 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
         "block_fetched",
         "read_validated",
     ];
-    let mut span_sums = [0u64; 4];
     let mut spans: [Vec<u64>; 4] = Default::default();
     for c in &bridged {
         let ns: Vec<u64> = ORDER
@@ -443,11 +437,9 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
             ns.windows(2).all(|w| w[0] <= w[1]),
             "bridge chain is ordered: {c:?}"
         );
-        for (i, acc) in span_sums.iter_mut().enumerate() {
+        for (i, per_phase) in spans.iter_mut().enumerate() {
             // bridge_sent→bridge_taken→dev_submit→dev_complete→block_fetched
-            let span = ns[i + 2] - ns[i + 1];
-            *acc += span;
-            spans[i].push(span);
+            per_phase.push(ns[i + 2] - ns[i + 1]);
         }
     }
     // The chain's spans vs the histograms (the stitch tool's containment
@@ -455,36 +447,75 @@ fn cold_zc_reads_decompose_into_four_exact_hops_with_a_per_op_chain() {
     // chain end is `block_fetched`, read a few hundred ns after the
     // handler's own `wake_hop` end, so PER OP it may only be LONGER. The
     // trace is a 1-in-`divisor` SAMPLE of the population the histogram
-    // holds, so the comparison is between the sample's MEDIAN span and the
-    // bucket holding the population's median (± one power-of-two bucket —
-    // the quantization the histogram has, and the containment a wrong
-    // clock read at either end could not survive). Never the means: the
-    // device's completion time (`device_cq`) is heavy-tailed by nature —
-    // the 1.3.0 release chain's attempt 10 read a 13-chain sample mean of
-    // 10.9 µs against a 256-read population mean of 48.9 µs (a few slow
-    // completions on a laptop four hours into the gate), which the earlier
-    // 0.25..4 mean-ratio band called a stitch error; the population's
-    // median bucket sat where the sample's did. (The 2026-09-08 release
-    // gate's 7,057-vs-7,991 ns `wake_hop` dip at n = 13 was the same
-    // sample-vs-population reading.)
+    // holds — and a BIASED one: a traced op's op-trace push runs INSIDE
+    // each of its own spans (the stamp follows the boundary's clock read
+    // and precedes the next act), ≈ 0.5–1 µs on the debug daemon, so the
+    // sample is the population shifted UP by one push — negligible against
+    // `device_cq`, comparable to the sub-µs `sq_wait`. Two laws, in bucket
+    // space (the histogram's own power-of-two µs buckets, the ONE law
+    // `latency_bucket_index` — the same truncated `ns / 1000` the recorder
+    // feeds it):
+    //   (a) MEMBERSHIP, deterministic: every sampled chain's span bucket
+    //       is POPULATED in the population's deltas — for the first three
+    //       phases the sampled op's own recorded value IS its trace span;
+    //       `wake_hop`'s may sit one bucket above (the later chain end).
+    //       A collapsed phase, a unit error, a phase recorded under the
+    //       wrong name cannot pass it.
+    //   (b) the sample's MEDIAN bucket within one bucket below / two
+    //       above the population's median bucket — the push's bias is
+    //       one-directional (up), the extra bucket above is its room.
+    // Never the means: the device's completion time (`device_cq`) is
+    // heavy-tailed — one or two reads per 256 land a 4–16 ms `io_uring_
+    // enter → CQE` (the worker's reap latency or the device's power-state
+    // exit; unnamed, a board item) — and the 1.3.0 release chain's
+    // attempt 10 read a 13-chain sample mean of 10.9 µs against a
+    // population mean of 48.9 µs, which the earlier 0.25..4 mean-ratio
+    // band called a stitch error; the population's median bucket sat
+    // where the sample's did (as it did on every re-run: means 18–47 µs,
+    // medians 5–10 µs). The 2026-09-08 release gate's 7,057-vs-7,991 ns
+    // `wake_hop` dip at n = 13 was the same sample-vs-population reading,
+    // and its `≥ 0.9 at n ≥ 64` arm was unreachable at this test's n
+    // (13 at divisor 20); the chain-order assert above keeps the
+    // direction. Sub-bucket skews and swaps among phases that share a
+    // bucket on this venue are outside both laws — the exact sum law is
+    // what pins the partition.
     let n = bridged.len() as u64;
-    for (i, p) in BRIDGE_PHASES.iter().enumerate() {
-        if n < 8 {
-            break;
-        }
-        let deltas = bucket_deltas(&pre, &post, "zc_bridge_phase_ns", p);
-        let pop_bucket = median_bucket(&deltas);
-        let (lo, _) = bucket_edges_us(pop_bucket.saturating_sub(1));
-        let (_, hi) = bucket_edges_us(pop_bucket + 1);
-        let mut sample = spans[i].clone();
-        sample.sort_unstable();
-        let sample_median_us = sample[sample.len() / 2] / 1000;
-        assert!(
-            sample_median_us >= lo && sample_median_us <= hi,
-            "{p}: the sampled chains' median span {sample_median_us} µs lies outside the \
-             population's median bucket ± 1 ({lo}..={hi} µs; bucket {pop_bucket}, n={n}) — \
-             the chain's clock reads are not the histogram's"
+    if n < 8 {
+        // The divisor is DERIVED per venue (`op_trace::derive_geometry`):
+        // a box sampling 1 in ≥ 33 leaves fewer than 8 chains from 256
+        // reads — the containment laws are not judged, said so.
+        eprintln!(
+            "note: zc bridge containment laws not judged — {n} sampled chains (divisor \
+             {divisor}) of {READS} reads, fewer than 8"
         );
+    } else {
+        for (i, p) in BRIDGE_PHASES.iter().enumerate() {
+            let deltas = bucket_deltas(&pre, &post, "zc_bridge_phase_ns", p);
+            let pop_bucket = median_bucket(&deltas);
+            let mut sample = spans[i].clone();
+            sample.sort_unstable();
+            // (a) membership.
+            for span in &sample {
+                let b = squeezefs::latency_core::latency_bucket_index(span / 1_000);
+                let populated = deltas[b] > 0 || (*p == "wake_hop" && b > 0 && deltas[b - 1] > 0);
+                assert!(
+                    populated,
+                    "{p}: a sampled chain's span {span} ns falls in bucket {b}, which the \
+                     population never recorded ({deltas:?}) — the chain's clock reads are \
+                     not the histogram's"
+                );
+            }
+            // (b) the median band (the population's convention: the lower
+            // median for an even count).
+            let sample_median_us = sample[(sample.len() - 1) / 2] / 1_000;
+            let sample_bucket = squeezefs::latency_core::latency_bucket_index(sample_median_us);
+            assert!(
+                sample_bucket + 1 >= pop_bucket && sample_bucket <= pop_bucket + 2,
+                "{p}: the sampled chains' median span {sample_median_us} µs (bucket \
+                 {sample_bucket}) lies outside the population's median bucket {pop_bucket} \
+                 −1..+2 (n={n}) — the chain's clock reads are not the histogram's"
+            );
+        }
     }
     eprintln!(
         "zc bridge: {READS} reads, {} traced chains (divisor {divisor}); means µs: {}",

@@ -6911,6 +6911,22 @@ pub struct Metrics {
     /// ENOSPC-forced early closes (the loud fallback to CoW supply —
     /// KD-1.7). ≈ 0 except at genuine space pressure.
     pub rewrite_shadow_fallbacks: Align64<AtomicU64>,
+    /// Epochs closed by the PRESSURE close (record §4.4cd — KD-1.7 at the
+    /// ONE allocation act, `BackendRouter::allocate_placed_block`, for
+    /// every open epoch of the mount): a mint that met `StorageFull` at
+    /// every eligible volume freed the supply this mount had parked and
+    /// retried once. Counted per closed epoch; ≈ 0 except at genuine
+    /// space pressure — the writeback flush that met the wall retried it
+    /// for ever before.
+    pub rewrite_shadow_pressure_closes: Align64<AtomicU64>,
+    /// Epochs the pressure close SKIPPED because their ino's level-3.5
+    /// stripe was held (the close's non-parking acquire — a write or
+    /// persist of that ino mid-flight, or the closing task's own hold on a
+    /// re-entry): the epoch stays registered and the mint's own retry
+    /// ladder runs the hook again. Growth with `rewrite_shadow_
+    /// pressure_closes` flat under `StorageFull` is a hot stripe, never a
+    /// lost supply.
+    pub rewrite_shadow_pressure_close_busy: Align64<AtomicU64>,
     /// Fenced closes: published nothing, freed nothing (W5 — successor
     /// accounting). The GENUINE fence class only — the D0 custody poison
     /// or a `WriterGuardFenced` publish refusal (a dead custody era).
@@ -11901,6 +11917,8 @@ impl SqueezefsFilesystem {
                 "rewrite_shadow_swaps": METRICS.rewrite_shadow_swaps.load(Ordering::Relaxed),
                 "rewrite_shadow_bytes": METRICS.rewrite_shadow_bytes.load(Ordering::Relaxed),
                 "rewrite_shadow_fallbacks": METRICS.rewrite_shadow_fallbacks.load(Ordering::Relaxed),
+                "rewrite_shadow_pressure_closes": METRICS.rewrite_shadow_pressure_closes.load(Ordering::Relaxed),
+                "rewrite_shadow_pressure_close_busy": METRICS.rewrite_shadow_pressure_close_busy.load(Ordering::Relaxed),
                 "rewrite_shadow_fence_drops": METRICS.rewrite_shadow_fence_drops.load(Ordering::Relaxed),
                 "rewrite_shadow_close_retries": METRICS.rewrite_shadow_close_retries.load(Ordering::Relaxed),
                 "rewrite_shadow_open_epochs": METRICS.rewrite_shadow_open_epochs.load(Ordering::Relaxed),

@@ -877,6 +877,35 @@ success (`tests/dismount_teardown_tests.rs`). Nothing was lost by the
 defect; the clean unmount was not the durability boundary the census
 claimed for those blocks.
 
+**A mount that fills its data volume with one file's random overwrites
+now lands them instead of retrying the wall for ever (every layout;
+record §4.4cd — found by the 1.3.0 release chain on fstests generic/551,
+`aio-dio-write-verify`, which hung the chain 4.6 h).** Since 1.2.0 the
+rewrite program PARKS every displaced block of a partial overwrite in
+the file's open rewrite epoch until a close (full coverage, `fsync`, the
+last close), and the ENOSPC early-close that frees that parked supply
+(KD-1.7) existed at ONE site — the write pipeline's own upload. A random
+O_DIRECT overwrite of one file completes no coverage and parked its every
+displaced block until the volume read FULL (6,089 of 6,144 blocks on the
+chain's scratch volume, 55 referenced), the exhaustion landed on the
+WRITEBACK worker's flush of a staged partial block — an allocation with
+no early-close arm — and the never-lossy ladder retried `StorageFull`
+every backoff while the file's `truncate` parked behind it; the fsync
+ladder flushes its staged blocks BEFORE its own epoch close, so an
+`fsync` met the same wall. Now the ONE allocation act every fresh-block
+site calls (`allocate_placed_block`) answers a `StorageFull` verdict by
+closing every open rewrite epoch of the mount and retrying the mint once
+(`rewrite_shadow_pressure_closes`; nothing parked ⇒ the refusal stands as
+before), taking each epoch's inode stripe without parking — a stripe a
+write or persist of that inode holds skips the epoch this pass
+(`rewrite_shadow_pressure_close_busy`) and the flush's own retry closes
+it next — so the writeback flush, the `fsync` ladder and the fold and
+overlay uploads meet the law where only the pipeline's arm did. Pinned in
+process (`tests/rewrite_shadow_tests.rs` 5b: a staged write into a new
+block of a file whose epoch parks the volume's last four blocks fsyncs
+`ENOSPC` on 1.2.4 and lands here with the epoch closed; 5c: the act
+never parks behind a held inode stripe).
+
 **Known limitations — what this release does not claim.**
 
 - **The 1.2.4 limitations** stand where this release did not name a

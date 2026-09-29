@@ -1563,6 +1563,29 @@ pub const METADATA_CACHE_TTI_SECS: u64 = 300;
 /// bindings on a gone-quiet ino).
 pub const EPOCH_IDLE_HORIZON_MS: u64 = METADATA_CACHE_TTI_SECS * 1000 / 10;
 
+/// How a rewrite-epoch close takes the ino's level-3.5 stripe
+/// (`DataRouter::close_rewrite_epoch_with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochCloseGuard {
+    /// Park for the stripe — every trigger site (none holds a 3.5 stripe).
+    Park,
+    /// Non-parking — the pressure close (record §4.4cd), which may run
+    /// under a `BLOCK_FLUSH_LOCKS` guard and skips a held stripe's epoch.
+    Try,
+}
+
+/// One rewrite-epoch close's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochClose {
+    /// The epoch closed: bindings published, displaced keys freed.
+    Closed,
+    /// No epoch is open for the ino.
+    Absent,
+    /// The ino's 3.5 stripe is held (`EpochCloseGuard::Try` only) — the
+    /// epoch stays registered; the caller's retry runs the close again.
+    Busy,
+}
+
 /// One ino's open rewrite epoch (all mutation happens under that ino's
 /// `INODE_META_LOCKS` — records and closes serialize there; the fields
 /// are lock-free structures so no additional latch exists).
@@ -1815,6 +1838,10 @@ impl crate::meta_backend::kv::shared_refs::RoutedSharedRefs for RoutedSharedRefH
     }
 }
 
+/// See `BackendRouter::pressure_supply_hook`.
+pub type PressureSupplyHook =
+    std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<bool>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct BackendRouter {
     pub default_allocator: std::sync::Arc<crate::block_allocator::BlockAllocator>,
@@ -1836,6 +1863,15 @@ pub struct BackendRouter {
     /// (`OnceCell`: the tiers outlive the router; bare routers in tests
     /// simply have no tiers to purge).
     read_tier_purge: once_cell::sync::OnceCell<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    /// The PRESSURE-SUPPLY hook (record §4.4cd): run by
+    /// [`Self::allocate_placed_block`] when every eligible volume refused
+    /// `StorageFull`, it frees the supply this mount itself parked (the
+    /// open rewrite epochs' displaced keys — `DataRouter::
+    /// close_all_rewrite_epochs_for_space`) and answers whether anything
+    /// moved; the allocation then retries once. Installed by
+    /// `DataRouter::new` through a `Weak` to its inner (no cycle); a bare
+    /// `BackendRouter` has none and refuses as before.
+    pressure_supply_hook: once_cell::sync::OnceCell<PressureSupplyHook>,
     /// Symmetric metadata PR 7 (design §5.4.4 step 4): the shared-block
     /// index's TERMINAL-FREE gate — a release of a block whose RAM SHARED
     /// mark stands asks the index home (`ReleaseShared`) instead of
@@ -2415,6 +2451,7 @@ impl BackendRouter {
             )),
             block_size,
             read_tier_purge: once_cell::sync::OnceCell::new(),
+            pressure_supply_hook: once_cell::sync::OnceCell::new(),
             shared_free_gate: once_cell::sync::OnceCell::new(),
             untracked_free_gate: once_cell::sync::OnceCell::new(),
             dma_fence: once_cell::sync::OnceCell::new(),
@@ -2704,6 +2741,12 @@ impl BackendRouter {
     /// device carries the mount-wide word; every device closes together).
     pub fn data_plane_dismounted(&self) -> bool {
         self.default_device.dismounted()
+    }
+
+    /// Wire the pressure-supply hook (see the field doc). First wiring
+    /// wins (the `read_tier_purge` posture).
+    pub fn set_pressure_supply_hook(&self, hook: PressureSupplyHook) {
+        let _ = self.pressure_supply_hook.set(hook);
     }
 
     /// Wire the terminal-free read-tier purge (see the field doc). Called
@@ -3411,8 +3454,58 @@ impl BackendRouter {
     /// offset)`. Every fresh-block site (write-through, overlay, flush and
     /// fold uploads, spills, blobs) calls this instead of pairing the two
     /// itself. "Full" is full: every volume's whole free list (or, on an
-    /// armed writer, its grant window) is this mount's.
+    /// armed writer, its grant window) is this mount's — MINUS the supply
+    /// this mount itself parked (record §4.4cd, the 1.3.0 release chain's
+    /// attempt 12 in fstests generic/551): a `StorageFull` verdict runs the
+    /// pressure-supply hook (`pressure_supply_hook` — the open rewrite
+    /// epochs' parked displaced keys, KD-1.6) and, when it freed anything,
+    /// retries the mint ONCE; the allocation's own ENOSPC valve drains the
+    /// frees. Nothing parked ⇒ the refusal stands as before.
+    ///
+    /// **Lock law** (`src/stripe_locks.rs`): callers may hold
+    /// `active_inode_locks` (1) and `BLOCK_FLUSH_LOCKS` (3) — the writeback
+    /// flush unit, the overlay store — and the hook takes every level-3.5
+    /// stripe in its NON-PARKING form (a held stripe's epoch is skipped this
+    /// pass, so the hook adds no wait-for edge and re-enters harmlessly) and
+    /// frees only after each guard drops (RES-1). A caller that HOLDS a
+    /// level-3.5 stripe (the CoW indirect-map blob mint inside a layout
+    /// save) must call [`Self::allocate_placed_block_under_meta_lock`]:
+    /// frees under its stripe would break RES-1, and the stripe it holds is
+    /// the one its own epoch's close would need.
     pub async fn allocate_placed_block(
+        &self,
+    ) -> Result<(
+        String,
+        std::sync::Arc<crate::block_allocator::BlockAllocator>,
+        std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
+        u64,
+    )> {
+        match self.allocate_placed_block_under_meta_lock().await {
+            Ok(placed) => Ok(placed),
+            Err(e) if crate::block_allocator::is_storage_full(&e) => {
+                let Some(hook) = self.pressure_supply_hook.get() else {
+                    return Err(e);
+                };
+                if !hook().await? {
+                    return Err(e);
+                }
+                log::info!(
+                    "allocation met StorageFull with supply parked in this mount's open rewrite \
+                     epochs — closed, retrying the mint once (rewrite_shadow_pressure_closes)"
+                );
+                self.allocate_placed_block_under_meta_lock().await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::allocate_placed_block`] WITHOUT the pressure-supply hook —
+    /// the form a caller holding a level-3.5 `INODE_META_LOCKS` stripe must
+    /// use (see the lock law there). Its one caller is the layout save's
+    /// CoW indirect-map blob mint (`DataRouter::stage_layout_save`); a
+    /// `StorageFull` there is the DUR-6 allocate-before-free class at fill
+    /// 1.0, refused as before.
+    pub async fn allocate_placed_block_under_meta_lock(
         &self,
     ) -> Result<(
         String,
@@ -10804,8 +10897,12 @@ impl DataRouter {
                     }
                 }
             }
-            let (be_id, block_allocator, nvme_writer, offset) =
-                self.backend_router.allocate_placed_block().await?;
+            // The caller holds this ino's level-3.5 stripe (RES-1): the
+            // hook-less form — see `allocate_placed_block`'s lock law.
+            let (be_id, block_allocator, nvme_writer, offset) = self
+                .backend_router
+                .allocate_placed_block_under_meta_lock()
+                .await?;
             _blob_inflight = Some(block_allocator.inflight_register(offset));
             // RES-9 mint guard: any `?` between here and the layout commit
             // frees the fresh blob instead of leaking an allocated block
@@ -11491,6 +11588,25 @@ impl DataRouter {
                 .set_read_tier_purge(std::sync::Arc::new(move |block_key: &str| {
                     // ALL FOUR block-key tiers (R4 §5.4) — the unified purge.
                     cache.purge_block_key(block_key);
+                }));
+        }
+        {
+            // Record §4.4cd: the ONE allocation act frees the supply this
+            // router parked (its open rewrite epochs) before it refuses.
+            // A `Weak` — the hook lives inside the router it reaches.
+            let weak = std::sync::Arc::downgrade(&router.inner);
+            router
+                .backend_router
+                .set_pressure_supply_hook(std::sync::Arc::new(move || {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        let Some(inner) = weak.upgrade() else {
+                            return Ok(false);
+                        };
+                        DataRouter::from_inner(inner)
+                            .close_all_rewrite_epochs_for_space()
+                            .await
+                    })
                 }));
         }
         router
@@ -16481,16 +16597,103 @@ impl DataRouter {
     /// * **Transient save failure**: the epoch RE-REGISTERS (never-lossy
     ///   — bindings stay in RAM + registry; the next close trigger
     ///   retries).
+    /// **The pressure close** (KD-1.7 generalized — record §4.4cd, the
+    /// 1.3.0 release chain's attempt 12 in fstests generic/551): a mint
+    /// that met `StorageFull` at every eligible volume closes the supply
+    /// THIS MOUNT parked — every open rewrite epoch, whose parked
+    /// displaced keys are exactly the space the mint could not find (a
+    /// random overwrite of one file parks its every displaced block until
+    /// the volume reads FULL — 6,089 of 6,144 blocks on the chain's
+    /// 24 GiB scratch volume, 55 referenced). Run by
+    /// [`BackendRouter::allocate_placed_block`], the ONE pick+allocate act
+    /// every fresh-block site calls, which then retries its mint once
+    /// (the allocation's own ENOSPC valve drains the frees synchronously)
+    /// — so the writeback flush (`flush_one_active_block`), the fsync
+    /// ladder's durability-now escalation and every other site meet the
+    /// law where the write pipeline's own KD-1.7 arm already did; before
+    /// it the writeback worker retried the wall for ever with the fsync
+    /// ladder's own close (its step 2) unreachable behind its step-1
+    /// flush, and the mount was dead. Returns `Ok(true)` when any epoch
+    /// closed; a fenced close propagates (the mint is dead too); a
+    /// transient failure on one epoch leaves the others closing. Counted
+    /// per closed epoch on `rewrite_shadow_pressure_closes`.
+    ///
+    /// **Lock law**: the mint that runs this may hold `BLOCK_FLUSH_LOCKS`
+    /// (3), so every epoch's level-3.5 stripe is taken in the NON-PARKING
+    /// form ([`meta_lock_try_acquire`]) — a held stripe (a write or persist
+    /// of that ino mid-flight, or this very task's own hold on a re-entry)
+    /// skips the epoch this pass (`rewrite_shadow_pressure_close_busy`;
+    /// the mint's own retry ladder runs the hook again) — so the hook adds
+    /// no wait-for edge to the (3) → (3.5) order and never parks behind a
+    /// stripe that is waiting on the mint it serves.
+    pub async fn close_all_rewrite_epochs_for_space(&self) -> Result<bool> {
+        let mut inos = Vec::new();
+        self.inner.rewrite_epochs.iter_sync(|ino, _| {
+            inos.push(*ino);
+            true
+        });
+        let mut closed = 0u64;
+        for ino in inos {
+            let token = self.dlm.get_fencing_token_ino(ino);
+            match self
+                .close_rewrite_epoch_with(ino, token, EpochCloseGuard::Try)
+                .await
+            {
+                Ok(EpochClose::Closed) => closed += 1,
+                Ok(EpochClose::Absent) => {}
+                Ok(EpochClose::Busy) => {
+                    crate::fuse_client::METRICS
+                        .rewrite_shadow_pressure_close_busy
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) if crate::data_custody::poisoned() => return Err(e),
+                Err(e) => log::warn!(
+                    "pressure close of ino {ino}'s rewrite epoch failed: {e:?} — the epoch \
+                     re-registers, its next trigger retries"
+                ),
+            }
+        }
+        if closed > 0 {
+            crate::fuse_client::METRICS
+                .rewrite_shadow_pressure_closes
+                .fetch_add(closed, Ordering::Relaxed);
+        }
+        Ok(closed > 0)
+    }
+
     pub async fn close_rewrite_epoch(&self, ino: u64, fencing_token: u64) -> Result<bool> {
+        Ok(matches!(
+            self.close_rewrite_epoch_with(ino, fencing_token, EpochCloseGuard::Park)
+                .await?,
+            EpochClose::Closed
+        ))
+    }
+
+    /// [`Self::close_rewrite_epoch`]'s body with the level-3.5 acquisition
+    /// named by the caller: `Park` (every trigger site — none holds a 3.5
+    /// stripe) or `Try` (the pressure close, which may run under a block
+    /// guard and answers `Busy` for a held stripe instead of parking).
+    async fn close_rewrite_epoch_with(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+        guard: EpochCloseGuard,
+    ) -> Result<EpochClose> {
         if self
             .inner
             .rewrite_epochs
             .read_sync(&ino, |_, _| ())
             .is_none()
         {
-            return Ok(false);
+            return Ok(EpochClose::Absent);
         }
-        let map_guard = meta_lock_acquire(ino).await;
+        let map_guard = match guard {
+            EpochCloseGuard::Park => meta_lock_acquire(ino).await,
+            EpochCloseGuard::Try => match meta_lock_try_acquire(ino) {
+                Some(g) => g,
+                None => return Ok(EpochClose::Busy),
+            },
+        };
         // Resolve the entry WHILE the epoch is still registered (a cache
         // miss refetch-composes the shadow — KD-1.9).
         let current = match self.metadata_cache.get(&ino) {
@@ -16498,7 +16701,7 @@ impl DataRouter {
             None => self.fetch_metadata_from_backend(ino).await?,
         };
         let Some((_, epoch)) = self.inner.rewrite_epochs.remove_sync(&ino) else {
-            return Ok(false);
+            return Ok(EpochClose::Absent);
         };
         // Finding 36: the close's frees follow the verdict of the publish
         // that COVERED the recorded bindings — this save's own on the
@@ -16594,7 +16797,7 @@ impl DataRouter {
                 } else {
                     self.free_deferred_keys(deferred).await;
                 }
-                Ok(true)
+                Ok(EpochClose::Closed)
             }
             Err(e @ SqueezefsError::WriterGuardFenced) => {
                 while epoch.displaced.pop().is_some() {}

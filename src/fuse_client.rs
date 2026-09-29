@@ -23233,11 +23233,14 @@ impl SqueezefsFilesystem {
             // over the siblings' epochs. A second wall is the honest
             // `ENOSPC`.
             Err(e) if crate::block_allocator::is_storage_full(&e) => {
-                self.router.backend_router.flush_data_devices().await?;
-                self.router.close_rewrite_epoch(ino, fencing_token).await?;
+                // Counted at the arm's ENTRY: the fsyncs that took it (a
+                // contract's sibling releases the stripe it holds on this
+                // word, before the close below parks on it).
                 METRICS
                     .fsync_flush_enospc_retries
                     .fetch_add(1, Ordering::Relaxed);
+                self.router.backend_router.flush_data_devices().await?;
+                self.router.close_rewrite_epoch(ino, fencing_token).await?;
                 self.fsync_data_flush_step(ino, fencing_token).await?;
             }
             Err(e) => return Err(e),

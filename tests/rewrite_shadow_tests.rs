@@ -657,13 +657,20 @@ async fn a_process_local_lease_rotation_converges_the_close() {
 /// KD-1.7: a mid-epoch `StorageFull` closes the epoch (the swap frees the
 /// parked A supply) and the allocation retries once. Since record §4.4cd
 /// the close runs at the ONE allocation act (`allocate_placed_block`'s
-/// pressure close, `rewrite_shadow_pressure_closes`) — so the write
+/// pressure close, `rewrite_shadow_pressure_closes`) — the write
 /// pipeline's own arm (`rewrite_shadow_fallbacks`, the PARKING close that
-/// follows a `StorageFull` the act still surfaced) is reached only when
-/// the act's non-parking close found the ino's stripe held; here nothing
-/// holds it, so the act closes and the arm counts nothing. The law the
-/// contract pins is the SUM: exactly one early-close of either face, the
-/// rewrite converged, no refusal.
+/// follows a `StorageFull` the act still surfaced) is its fallback. The
+/// shape is a 4-block write-through on a 6-block volume: blocks 0–1 mint
+/// the virgin blocks, blocks 2–3 meet the wall CONCURRENTLY (detached
+/// uploads), and two schedules are legal — the first waller's close frees
+/// the supply, its retry lands and RE-OPENS the epoch, the second waller
+/// closes it again (two closes); or both wall inside one window and the
+/// second reads the first's stripe `Busy` and falls to the pipeline's arm
+/// (one close, one fallback). The laws are schedule-blind: the act's
+/// face fired at least once (nothing external holds the stripe here — the
+/// held-stripe face is contract 5c's), the early-close SUM is ≥ 1, no
+/// refusal, the rewrite converged. An exact count here was a schedule
+/// assertion (review round 3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enospc_early_close_frees_supply_and_converges() {
     let _g = serial().await;
@@ -686,7 +693,7 @@ async fn enospc_early_close_frees_supply_and_converges() {
     let len = (blocks * FBS) as usize;
     let ino = striped_fixture(&h, "f1", blocks, 6).await;
 
-    let (fb0, pc0, busy0) = (shadow_fallbacks(), pressure_closes(), pressure_close_busy());
+    let (fb0, pc0) = (shadow_fallbacks(), pressure_closes());
     let refused0 = METRICS
         .write_fresh_block_enospc_refusals
         .load(Ordering::Relaxed);
@@ -702,16 +709,10 @@ async fn enospc_early_close_frees_supply_and_converges() {
          (rewrite_shadow_pressure_closes at the allocation act, or rewrite_shadow_fallbacks \
          at the pipeline's parking arm)"
     );
-    assert_eq!(
-        pressure_closes() - pc0,
-        1,
-        "the allocation act's non-parking close is the face that fires when nothing holds \
-         the ino's stripe — the pipeline's arm is its fallback"
-    );
-    assert_eq!(
-        pressure_close_busy() - busy0,
-        0,
-        "no stripe was held: the act never skipped the epoch"
+    assert!(
+        pressure_closes() - pc0 >= 1,
+        "the allocation act's non-parking close fires when nothing external holds the ino's \
+         stripe — the pipeline's arm is its fallback"
     );
     assert_eq!(
         METRICS
@@ -946,10 +947,13 @@ async fn the_pressure_close_never_parks_on_a_held_meta_stripe() {
 /// own epoch close EARLY (behind a data barrier — DUR-1) and retrying the
 /// step once (`fsync_flush_enospc_retries`). Shape: the contract-5b
 /// premise, the ino's stripe HELD by a sibling task that releases it once
-/// the SEAM observed the fsync's mint read it `Busy` — the flush's mint
-/// meets the wall, the ladder's own PARKING close waits the sibling out,
-/// closes, and the retried flush lands. RED without the arm: `Errno(28)`
-/// at the fsync.
+/// the SEAM observed the ladder ENTER its arm (`fsync_flush_enospc_retries`
+/// moved — counted at the arm's entry, before its parking close) — so
+/// whichever half of step 1 the tail rides (the FsyncDurable RAM half,
+/// whose own settle+drain+retry re-runs the act, or the staged half's one
+/// act call), every mint before the arm meets the held stripe (`Busy`),
+/// the ladder's own PARKING close waits the sibling out, closes, and the
+/// retried step lands. RED without the arm: `Errno(28)` at the fsync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_fsync_whose_flush_met_a_busy_skip_closes_its_own_epoch_and_lands() {
     let _g = serial().await;
@@ -988,12 +992,18 @@ async fn an_fsync_whose_flush_met_a_busy_skip_closes_its_own_epoch_and_lands() {
         METRICS.fsync_flush_enospc_retries.load(Ordering::Relaxed),
     );
     // The sibling: holds the epoch ino's stripe until the SEAM observed the
-    // fsync's mint read it Busy (§4.4ah's harness law — the actor is named
-    // by what the seam saw, never by a timer), then releases it.
+    // ladder ENTER its arm (§4.4ah's harness law — the actor is named by
+    // what the seam saw, never by a timer; review round 3, Issue 3: an
+    // earlier witness — the first `Busy` — let the FsyncDurable half's own
+    // inner retry re-run the act after the release and land through the
+    // act's close, a different law), then releases it so the arm's parking
+    // close can proceed.
     let held = squeezefs::routing::meta_lock_acquire(ino).await;
     let sibling = tokio::spawn(async move {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while pressure_close_busy() == busy0 && std::time::Instant::now() < deadline {
+        while METRICS.fsync_flush_enospc_retries.load(Ordering::Relaxed) == retries0
+            && std::time::Instant::now() < deadline
+        {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         drop(held);
@@ -1016,11 +1026,14 @@ async fn an_fsync_whose_flush_met_a_busy_skip_closes_its_own_epoch_and_lands() {
         "the hook read the held stripe Busy at least once"
     );
     assert_eq!(open_epochs() - oe0, 0, "the epoch closed");
-    assert_eq!(
-        pressure_closes() - pc0,
-        0,
-        "the ladder's own PARKING close retired the epoch, so the retry's mint found nothing \
-         parked and the act's face never fired"
+    // Who retired it is schedule: the ladder's own PARKING close, or the
+    // staging leg's queued writeback unit meeting the wall inside the
+    // release window and closing it through the act — at most one close
+    // of either face, the supply freed once.
+    assert!(
+        pressure_closes() - pc0 <= 1,
+        "one epoch closes once (act closes {})",
+        pressure_closes() - pc0
     );
     let got = read_all(&h, ino, (blocks * FBS) as usize + 1024).await;
     assert_eq!(

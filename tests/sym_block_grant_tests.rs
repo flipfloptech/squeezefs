@@ -1680,6 +1680,133 @@ async fn an_armed_holders_supply_terms_read_the_window_and_the_clear_population(
     reset_process_state();
 }
 
+/// **An armed holder's allocation sees the frees the ENOSPC valve drained
+/// in the SAME attempt** (record §4.4cd, review round 1 Issue 2 — the
+/// reviewer's probe): on a grant-armed allocator the window is the ONE
+/// mint source and a terminal free's `finish_free` CLEARS a bit in the
+/// holder's bitmap — supply the window sees only through a carve. A
+/// regular-file backing (the release chain's own `/dev/shm` scratch)
+/// QUEUES every free, so at the wall the pressure close's frees land only
+/// inside `allocate_block`'s valve drain — and the inline top-up ask ran
+/// BEFORE that drain, so the loop read `StorageFull` with the freed
+/// blocks clear in the bitmap and nothing re-asked the holder (the next
+/// attempt — a writeback backoff later — landed; the fsync ladder and
+/// the write path's growth arm have no next attempt). The law: a drain
+/// that landed frees is followed by a top-up ask before the verdict.
+/// Shape: the volume minted full through grants, four `begin_free`s whose
+/// `finish_free` runs only inside the installed valve (the queued-reclaim
+/// model), ONE `allocate_block` — it must land. RED on the first build:
+/// `StorageFull` ("block grant window empty") with the bitmap reading
+/// four clear bits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_armed_holders_mint_lands_on_the_frees_the_valve_drained_in_the_same_attempt() {
+    use std::sync::atomic::AtomicU64;
+    let dir = tempfile::tempdir().unwrap();
+    let _g = SEAM.lock().await;
+    reset_process_state();
+    let uris = format_stamped_set(dir.path(), 1).await;
+    let routed = open_armed(&uris).await;
+    let a = data_allocator(DATA_ID).await;
+    assert_eq!(
+        alloc_lease::arm_symmetric_allocation(&routed, &[Arc::clone(&a)])
+            .await
+            .unwrap(),
+        1
+    );
+    let holding = alloc_lease::holding(DATA_TAG).expect("held");
+    // The queued-reclaim model: `begin_free` now, `finish_free` only when
+    // the valve drains (the regular-file backing's reclaim worker).
+    let queued: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let drains = Arc::new(AtomicU64::new(0));
+    {
+        let a2 = Arc::clone(&a);
+        let q = Arc::clone(&queued);
+        let d = Arc::clone(&drains);
+        let q2 = Arc::clone(&queued);
+        a.set_space_pressure_valve(
+            Arc::new(move || {
+                let a2 = Arc::clone(&a2);
+                let q = Arc::clone(&q);
+                let d = Arc::clone(&d);
+                Box::pin(async move {
+                    d.fetch_add(1, Ordering::Relaxed);
+                    let offs: Vec<u64> = std::mem::take(&mut *q.lock().unwrap());
+                    for off in offs {
+                        a2.finish_free(off);
+                    }
+                })
+            }),
+            Arc::new(move || !q2.lock().unwrap().is_empty()),
+        );
+    }
+    let mut minted = Vec::with_capacity(DATA_BLOCKS as usize);
+    for _ in 0..DATA_BLOCKS {
+        minted.push(a.allocate_block().await.unwrap());
+    }
+    assert_eq!(holding.bitmap.population(), DATA_BLOCKS);
+    assert_eq!(a.free_supply_blocks(), 0, "genuinely full");
+    wait_until("no proactive ask in flight", || {
+        !a.block_grant_topup_inflight()
+    })
+    .await;
+    // The wall: the allocation the pressure close answers.
+    let e = a
+        .allocate_block()
+        .await
+        .map(|_| ())
+        .expect_err("the full volume refuses");
+    assert!(
+        matches!(&e, squeezefs::error::SqueezefsError::Io(io)
+            if io.kind() == std::io::ErrorKind::StorageFull),
+        "{e:?}"
+    );
+    assert!(a.fresh_supply_latched());
+    // The close's frees: four terminal frees whose `finish_free` is QUEUED
+    // — the bits stay SET until the valve drains.
+    for off in &minted[..4] {
+        assert!(a.begin_free(*off));
+        queued.lock().unwrap().push(*off);
+    }
+    assert_eq!(
+        holding.bitmap.population(),
+        DATA_BLOCKS,
+        "premise: the bits are still SET while the frees are queued"
+    );
+    // The retry-once: ONE attempt, which must drain, re-ask and land.
+    let d0 = drains.load(Ordering::Relaxed);
+    let r = a.allocate_block().await;
+    assert!(
+        r.is_ok(),
+        "the attempt after the frees must land in ONE call: the valve drained them and the \
+         window re-asked the holder (drains {}): {:?}",
+        drains.load(Ordering::Relaxed) - d0,
+        r.map(|_| ()).map_err(|e| e.to_string())
+    );
+    assert!(
+        drains.load(Ordering::Relaxed) > d0,
+        "the frees landed through the valve, not before it"
+    );
+    assert!(
+        !a.fresh_supply_latched(),
+        "the landed allocation cleared the latch"
+    );
+    wait_until("the mint's own top-up has landed", || {
+        !a.block_grant_topup_inflight()
+    })
+    .await;
+    // Conservation: four freed, one minted — the rest is the window's
+    // remainder plus whatever the carve left clear.
+    assert_eq!(
+        a.free_supply_blocks(),
+        3,
+        "the supply is the four frees minus the one mint (window {} + clear {})",
+        a.block_grant_remaining(),
+        DATA_BLOCKS - holding.bitmap.population()
+    );
+    shutdown(&routed).await;
+    reset_process_state();
+}
+
 /// **An armed holder's USED count follows the bitmap** (PR 14 — found by
 /// the require-mount gate on the flipped default: `statfs_tests` read
 /// `df`'s free never recovering after delete + reclaim, `pack_compaction_

@@ -260,9 +260,14 @@ pub fn indirect_map_io_for(
                 serialized.resize(aligned_len, 0);
                 // Finding 29: the serve-side blob mint rides the bounded
                 // form too — an authority mid grace-storm must park for
-                // the fence, not fail the served publish.
+                // the fence, not fail the served publish. Record §4.4cd:
+                // the compose arms that call this hold the ino's 4a
+                // `I{}` guard (the Lever-B pass task's whole batch, the
+                // direct delta path, the chained spill) across the mint,
+                // so it is the UNDER-GUARD form — the pressure close's own
+                // save takes 4a and would park behind them.
                 let (be_id, block_allocator, nvme_writer, offset) =
-                    router.allocate_placed_block().await?;
+                    router.allocate_placed_block_under_guard().await?;
                 let inflight = block_allocator.inflight_register(offset);
                 // RES-9: any `?` between here and the caller's naming commit
                 // frees the fresh blob instead of leaking an allocated block

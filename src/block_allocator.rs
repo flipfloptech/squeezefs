@@ -2143,12 +2143,12 @@ impl BlockAllocator {
     }
 
     /// One park decision of the bounded allocation
-    /// ([`Self::allocate_block_grace_bounded`]), shared with the
-    /// router-level placed allocation (`BackendRouter::allocate_placed_block`
-    /// — which parks only after EVERY eligible volume refused, and passes the
-    /// set's `reclaimable` verdict). `Err(e)` = the refusal is terminal (no
-    /// reclaimable supply, or the wall passed); `Ok(())` = one slice parked,
-    /// the caller retries.
+    /// ([`Self::allocate_block_grace_bounded`] — its one caller; the
+    /// router-level placed allocation, `BackendRouter::allocate_placed_block`,
+    /// runs the bounded allocation on its ONE picked volume and passes no
+    /// set-wide verdict). `Err(e)` = the refusal is terminal (no reclaimable
+    /// supply, or the wall passed); `Ok(())` = one slice parked, the caller
+    /// retries.
     pub(crate) async fn park_for_reclaimable_supply(
         &self,
         e: crate::error::SqueezefsError,
@@ -2336,6 +2336,20 @@ impl BlockAllocator {
             };
             let pending = self.space_pending.get().map(|p| p()).unwrap_or(false);
             valve().await;
+            // Record §4.4cd (review round 1, Issue 2): on a grant-armed
+            // allocator the window is the ONE mint source, and a drain's
+            // landed `finish_free`s CLEAR bits in the holder's bitmap —
+            // supply the window sees only through a carve. The inline ask
+            // above ran BEFORE the drain, so without this re-ask the loop
+            // read `StorageFull` with the freed blocks clear in the bitmap
+            // (PR 8's "the valve is inert on an armed allocator" gap; a
+            // regular-file backing queues every free, so the pressure
+            // close's frees landed here and the retry never saw them). The
+            // ask's outcome is the window's (a `Full` answer falls through
+            // to the next pass; the retryable classes were decided above).
+            if pending && self.block_grant_armed() {
+                let _ = self.block_grant_topup().await;
+            }
             if !pending {
                 // Nothing was owed before the final drain: the verdict
                 // stands (genuine fullness refuses StorageFull) — unless

@@ -3453,25 +3453,34 @@ impl BackendRouter {
     /// allocation on the picked volume — `(be_id, allocator, device,
     /// offset)`. Every fresh-block site (write-through, overlay, flush and
     /// fold uploads, spills, blobs) calls this instead of pairing the two
-    /// itself. "Full" is full: every volume's whole free list (or, on an
-    /// armed writer, its grant window) is this mount's — MINUS the supply
-    /// this mount itself parked (record §4.4cd, the 1.3.0 release chain's
-    /// attempt 12 in fstests generic/551): a `StorageFull` verdict runs the
+    /// itself. The picked volume's `StorageFull` is judged against the
+    /// supply this mount itself PARKED (record §4.4cd, the 1.3.0 release
+    /// chain's attempt 12 in fstests generic/551): the verdict runs the
     /// pressure-supply hook (`pressure_supply_hook` — the open rewrite
     /// epochs' parked displaced keys, KD-1.6) and, when it freed anything,
-    /// retries the mint ONCE; the allocation's own ENOSPC valve drains the
-    /// frees. Nothing parked ⇒ the refusal stands as before.
+    /// retries the mint ONCE on the same pick; the allocation's own ENOSPC
+    /// valve drains the frees (and, on a grant-armed allocator, re-asks the
+    /// holder after the drain — the window is the mint source there).
+    /// Nothing parked ⇒ the refusal stands as before. The verdict is ONE
+    /// volume's (the §5.9 band can pick a full volume beside a sibling with
+    /// room); the hook closes every open epoch of the mount, and a close is
+    /// one durable publish + its frees, so a mint at the wall pays N closes
+    /// — bounded by the open-epoch population, the alternative being the
+    /// hang the rung fixed.
     ///
     /// **Lock law** (`src/stripe_locks.rs`): callers may hold
     /// `active_inode_locks` (1) and `BLOCK_FLUSH_LOCKS` (3) — the writeback
-    /// flush unit, the overlay store — and the hook takes every level-3.5
-    /// stripe in its NON-PARKING form (a held stripe's epoch is skipped this
-    /// pass, so the hook adds no wait-for edge and re-enters harmlessly) and
-    /// frees only after each guard drops (RES-1). A caller that HOLDS a
-    /// level-3.5 stripe (the CoW indirect-map blob mint inside a layout
-    /// save) must call [`Self::allocate_placed_block_under_meta_lock`]:
-    /// frees under its stripe would break RES-1, and the stripe it holds is
-    /// the one its own epoch's close would need.
+    /// flush unit, the overlay store — and must hold NO level-3.5 stripe and
+    /// NO 4a DLM guard: the hook takes every epoch's level-3.5 stripe in
+    /// its NON-PARKING form (a held stripe's epoch is skipped this pass, so
+    /// the hook adds no wait-for edge at 3.5) and frees only after each
+    /// guard drops (RES-1), but each close's SAVE takes the epoch ino's 4a
+    /// guard PARKING (`lock_inode_exclusive` — the M7 full-Put class), which
+    /// under a held 4a guard is the self-deadlock class `fe62cb0e`
+    /// adjudicated (a stripe collision, or a two-task cycle against any
+    /// canonical multi-ino `lock_many`). A caller holding either class
+    /// calls [`Self::allocate_placed_block_under_guard`]; the call-site
+    /// census is pinned in `tests/derivation_sweep_tests.rs`.
     pub async fn allocate_placed_block(
         &self,
     ) -> Result<(
@@ -3480,7 +3489,7 @@ impl BackendRouter {
         std::sync::Arc<crate::nvme_dev::NvmeBlockDev>,
         u64,
     )> {
-        match self.allocate_placed_block_under_meta_lock().await {
+        match self.allocate_placed_block_under_guard().await {
             Ok(placed) => Ok(placed),
             Err(e) if crate::block_allocator::is_storage_full(&e) => {
                 let Some(hook) = self.pressure_supply_hook.get() else {
@@ -3489,23 +3498,32 @@ impl BackendRouter {
                 if !hook().await? {
                     return Err(e);
                 }
-                log::info!(
+                log::debug!(
                     "allocation met StorageFull with supply parked in this mount's open rewrite \
                      epochs — closed, retrying the mint once (rewrite_shadow_pressure_closes)"
                 );
-                self.allocate_placed_block_under_meta_lock().await
+                self.allocate_placed_block_under_guard().await
             }
             Err(e) => Err(e),
         }
     }
 
     /// [`Self::allocate_placed_block`] WITHOUT the pressure-supply hook —
-    /// the form a caller holding a level-3.5 `INODE_META_LOCKS` stripe must
-    /// use (see the lock law there). Its one caller is the layout save's
-    /// CoW indirect-map blob mint (`DataRouter::stage_layout_save`); a
-    /// `StorageFull` there is the DUR-6 allocate-before-free class at fill
-    /// 1.0, refused as before.
-    pub async fn allocate_placed_block_under_meta_lock(
+    /// the form for a caller that HOLDS a guard the hook's close would
+    /// take: a level-3.5 `INODE_META_LOCKS` stripe (the layout save's CoW
+    /// indirect-map blob mint, `DataRouter::stage_layout_save` — frees
+    /// under its stripe would break RES-1, and the stripe it holds is the
+    /// one its own epoch's close needs) or a 4a DLM `I{}` guard (the
+    /// owner-side compose arms' blob mint, `multi_writer::
+    /// indirect_map_io_for` — the close's save parks on 4a). A
+    /// `StorageFull` at either is the DUR-6 allocate-before-free class at
+    /// fill 1.0, refused as before: a legacy indirect-blob file (a
+    /// beyond-inline map minted before the kvmap arm, or under
+    /// `SQUEEZEFS_KVMAP=0`) keeps the pre-§4.4cd disposition at the wall —
+    /// its own epoch's close cannot mint the blob its save needs, the
+    /// epoch re-registers, and the remedy is the kvmap store (the default
+    /// for every new crossing).
+    pub async fn allocate_placed_block_under_guard(
         &self,
     ) -> Result<(
         String,
@@ -10898,10 +10916,10 @@ impl DataRouter {
                 }
             }
             // The caller holds this ino's level-3.5 stripe (RES-1): the
-            // hook-less form — see `allocate_placed_block`'s lock law.
+            // under-guard form — see `allocate_placed_block`'s lock law.
             let (be_id, block_allocator, nvme_writer, offset) = self
                 .backend_router
-                .allocate_placed_block_under_meta_lock()
+                .allocate_placed_block_under_guard()
                 .await?;
             _blob_inflight = Some(block_allocator.inflight_register(offset));
             // RES-9 mint guard: any `?` between here and the layout commit
@@ -16599,33 +16617,42 @@ impl DataRouter {
     ///   retries).
     /// **The pressure close** (KD-1.7 generalized — record §4.4cd, the
     /// 1.3.0 release chain's attempt 12 in fstests generic/551): a mint
-    /// that met `StorageFull` at every eligible volume closes the supply
-    /// THIS MOUNT parked — every open rewrite epoch, whose parked
-    /// displaced keys are exactly the space the mint could not find (a
-    /// random overwrite of one file parks its every displaced block until
-    /// the volume reads FULL — 6,089 of 6,144 blocks on the chain's
-    /// 24 GiB scratch volume, 55 referenced). Run by
-    /// [`BackendRouter::allocate_placed_block`], the ONE pick+allocate act
-    /// every fresh-block site calls, which then retries its mint once
-    /// (the allocation's own ENOSPC valve drains the frees synchronously)
-    /// — so the writeback flush (`flush_one_active_block`), the fsync
-    /// ladder's durability-now escalation and every other site meet the
-    /// law where the write pipeline's own KD-1.7 arm already did; before
-    /// it the writeback worker retried the wall for ever with the fsync
-    /// ladder's own close (its step 2) unreachable behind its step-1
+    /// whose picked volume answered `StorageFull` closes the supply THIS
+    /// MOUNT parked — every open rewrite epoch, whose parked displaced keys
+    /// are exactly the space the mint could not find (a random overwrite
+    /// of one file parks its every displaced block until the volume reads
+    /// FULL — 6,089 of 6,144 blocks on the chain's 24 GiB scratch volume,
+    /// 55 referenced). Run by [`BackendRouter::allocate_placed_block`],
+    /// the ONE pick+allocate act every fresh-block site calls, which then
+    /// retries its mint once — the allocation's own ENOSPC valve drains the
+    /// frees (a bdev-class volume elides the reclaim and its `finish_free`
+    /// is synchronous; a regular-file backing queues every free and the
+    /// valve lands them, then re-asks the grant holder on an armed
+    /// allocator) — so the writeback flush (`flush_one_active_block`), the
+    /// fsync ladder's durability-now escalation and every other site meet
+    /// the law where the write pipeline's own KD-1.7 arm already did;
+    /// before it the writeback worker retried the wall for ever with the
+    /// fsync ladder's own close (its step 2) unreachable behind its step-1
     /// flush, and the mount was dead. Returns `Ok(true)` when any epoch
     /// closed; a fenced close propagates (the mint is dead too); a
     /// transient failure on one epoch leaves the others closing. Counted
-    /// per closed epoch on `rewrite_shadow_pressure_closes`.
+    /// per closed epoch on `rewrite_shadow_pressure_closes`. The frees run
+    /// while the caller holds its block guard — each terminal free may park
+    /// at the reclaim cap for its bounded slice, so a mint at the wall with
+    /// thousands of parked keys pays those slices (the alternative is the
+    /// hang).
     ///
     /// **Lock law**: the mint that runs this may hold `BLOCK_FLUSH_LOCKS`
     /// (3), so every epoch's level-3.5 stripe is taken in the NON-PARKING
     /// form ([`meta_lock_try_acquire`]) — a held stripe (a write or persist
-    /// of that ino mid-flight, or this very task's own hold on a re-entry)
-    /// skips the epoch this pass (`rewrite_shadow_pressure_close_busy`;
-    /// the mint's own retry ladder runs the hook again) — so the hook adds
-    /// no wait-for edge to the (3) → (3.5) order and never parks behind a
-    /// stripe that is waiting on the mint it serves.
+    /// of that ino mid-flight, or a SIBLING pressure close: two mints at
+    /// the wall run the hook concurrently and the second reads the first's
+    /// stripe held) skips the epoch this pass
+    /// (`rewrite_shadow_pressure_close_busy`; the mint's own retry ladder
+    /// runs the hook again) — so the hook adds no wait-for edge to the (3)
+    /// → (3.5) order and never parks behind a stripe that is waiting on the
+    /// mint it serves. The close's SAVE takes the epoch ino's 4a guard
+    /// parking, which is why no hooked caller may hold 4a (the act's law).
     pub async fn close_all_rewrite_epochs_for_space(&self) -> Result<bool> {
         let mut inos = Vec::new();
         self.inner.rewrite_epochs.iter_sync(|ino, _| {
@@ -16647,9 +16674,13 @@ impl DataRouter {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) if crate::data_custody::poisoned() => return Err(e),
+                // The W5 fence class dropped the epoch (counted on
+                // `rewrite_shadow_fence_drops` inside the close) — this
+                // mount is fenced and its mint is dead too.
+                Err(e @ SqueezefsError::WriterGuardFenced) => return Err(e),
                 Err(e) => log::warn!(
-                    "pressure close of ino {ino}'s rewrite epoch failed: {e:?} — the epoch \
-                     re-registers, its next trigger retries"
+                    "pressure close of ino {ino}'s rewrite epoch failed transiently: {e:?} — the \
+                     epoch re-registers, its next trigger retries"
                 ),
             }
         }

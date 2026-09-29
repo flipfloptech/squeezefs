@@ -900,11 +900,24 @@ before), taking each epoch's inode stripe without parking — a stripe a
 write or persist of that inode holds skips the epoch this pass
 (`rewrite_shadow_pressure_close_busy`) and the flush's own retry closes
 it next — so the writeback flush, the `fsync` ladder and the fold and
-overlay uploads meet the law where only the pipeline's arm did. Pinned in
-process (`tests/rewrite_shadow_tests.rs` 5b: a staged write into a new
-block of a file whose epoch parks the volume's last four blocks fsyncs
-`ENOSPC` on 1.2.4 and lands here with the epoch closed; 5c: the act
-never parks behind a held inode stripe).
+overlay uploads meet the law where only the pipeline's arm did; on the
+default (grant-armed) allocator the allocation's ENOSPC valve now re-asks
+the holder after it drains queued frees, so on a regular-file backing the
+freed blocks reach the retry in the same attempt (before, the ask ran
+ahead of the drain and the retry read the wall with the blocks already
+free); and an `fsync` whose flush still met the wall runs its own epoch
+close early, behind a data barrier, and retries once
+(`fsync_flush_enospc_retries`). Two residuals stay: a file whose
+beyond-inline block map is a legacy indirect blob (minted before the
+kvmap store, or under `SQUEEZEFS_KVMAP=0`) keeps the 1.2.4 disposition at
+the wall, since its epoch's close must mint a blob the same wall refuses;
+and a JOINED writer's shipped frees can reach its retry one renewal beat
+late. Pinned in process (`tests/rewrite_shadow_tests.rs` 5b: a staged
+write into a new block of a file whose epoch parks the volume's last four
+blocks fsyncs `ENOSPC` on 1.2.4 and lands here with the epoch closed; 5c:
+the act never parks behind a held inode stripe; 5d: an `fsync` whose
+flush met a held stripe lands through its own close;
+`sym_block_grant_tests`: the armed allocator's re-ask after the drain).
 
 **Known limitations — what this release does not claim.**
 

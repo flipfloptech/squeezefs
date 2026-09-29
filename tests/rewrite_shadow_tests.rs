@@ -934,6 +934,100 @@ async fn the_pressure_close_never_parks_on_a_held_meta_stripe() {
 }
 
 // ---------------------------------------------------------------------------
+// Contract 5d — an fsync whose flush met a Busy skip lands (record §4.4cd,
+// review round 1 Issue 4).
+// ---------------------------------------------------------------------------
+
+/// The pressure close skips an epoch whose ino's level-3.5 stripe a
+/// sibling holds (contract 5c), and the fsync ladder's step-1 flush had
+/// no retry below it — the skip surfaced as `ENOSPC` to `fsync(2)` on a
+/// volume whose free space was parked in this mount's own epoch. Now the
+/// ladder answers a `StorageFull` from its data-flush step by running its
+/// own epoch close EARLY (behind a data barrier — DUR-1) and retrying the
+/// step once (`fsync_flush_enospc_retries`). Shape: the contract-5b
+/// premise, the ino's stripe HELD by a sibling task that releases it
+/// 300 ms into the fsync — the flush's mint meets the wall (the hook reads
+/// the stripe `Busy`), the ladder's own PARKING close waits the sibling
+/// out, closes, and the retried flush lands. RED without the arm:
+/// `Errno(28)` at the fsync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_fsync_whose_flush_met_a_busy_skip_closes_its_own_epoch_and_lands() {
+    let _g = serial().await;
+    let _l = LeverGuard;
+    squeezefs::fuse_client::set_patch_max_bytes(0);
+    squeezefs::routing::set_rewrite_shadow(true);
+    squeezefs::block_reclaim::set_elision_class_all(true);
+    let backing = NamedTempFile::new().unwrap();
+    std::fs::File::create(backing.path())
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let m = NamedTempFile::new().unwrap();
+    let h = make_harness_on("shadow_fsync_busy", backing, m, true, Some(8)).await;
+    let blocks = 4u64;
+    let ino = striped_fixture(&h, "f1", blocks, 21).await;
+    let ba = &h.fs.router.block_allocator;
+
+    let oe0 = open_epochs();
+    for seed in [31u8, 41] {
+        write_at(&h, ino, 0, &pattern(2 * FBS as usize, seed)).await;
+        quiesce(&h).await;
+    }
+    assert_eq!(open_epochs() - oe0, 1, "premise: one epoch open");
+    assert_eq!(
+        ba.free_supply_blocks(),
+        0,
+        "premise: the volume is exactly full"
+    );
+    let tail = pattern(1024, 51);
+    write_at(&h, ino, blocks * FBS, &tail).await;
+
+    let (pc0, busy0, retries0) = (
+        pressure_closes(),
+        pressure_close_busy(),
+        METRICS.fsync_flush_enospc_retries.load(Ordering::Relaxed),
+    );
+    // The sibling: holds the epoch ino's stripe across the fsync's first
+    // mint and releases it 300 ms later.
+    let held = squeezefs::routing::meta_lock_acquire(ino).await;
+    let sibling = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        drop(held);
+    });
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        h.fs.fsync(h.req, ino, 0, false),
+    )
+    .await
+    .expect("the fsync's own close waits the sibling out and returns");
+    sibling.await.unwrap();
+    res.expect("the fsync lands once the sibling's stripe drops: its own close frees the supply");
+    assert_eq!(
+        METRICS.fsync_flush_enospc_retries.load(Ordering::Relaxed) - retries0,
+        1,
+        "the ladder ran its early close + one retry"
+    );
+    assert!(
+        pressure_close_busy() - busy0 >= 1,
+        "the hook read the held stripe Busy at least once"
+    );
+    assert_eq!(open_epochs() - oe0, 0, "the epoch closed");
+    assert_eq!(
+        pressure_closes() - pc0,
+        0,
+        "the ladder's own PARKING close retired the epoch, so the retry's mint found nothing \
+         parked and the act's face never fired"
+    );
+    let got = read_all(&h, ino, (blocks * FBS) as usize + 1024).await;
+    assert_eq!(
+        &got[(blocks * FBS) as usize..],
+        &tail[..],
+        "the staged tail is durable"
+    );
+    squeezefs::block_reclaim::set_elision_class_all(false);
+}
+
+// ---------------------------------------------------------------------------
 // Contract 6 — fsck composition: B offsets are live-owner registered.
 // ---------------------------------------------------------------------------
 

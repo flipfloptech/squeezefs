@@ -6921,11 +6921,11 @@ pub struct Metrics {
     pub rewrite_shadow_pressure_closes: Align64<AtomicU64>,
     /// Epochs the pressure close SKIPPED because their ino's level-3.5
     /// stripe was held (the close's non-parking acquire — a write or
-    /// persist of that ino mid-flight, or the closing task's own hold on a
-    /// re-entry): the epoch stays registered and the mint's own retry
-    /// ladder runs the hook again. Growth with `rewrite_shadow_
-    /// pressure_closes` flat under `StorageFull` is a hot stripe, never a
-    /// lost supply.
+    /// persist of that ino mid-flight, or a sibling pressure close from
+    /// another mint at the wall): the epoch stays registered and the
+    /// mint's own retry ladder runs the hook again. Growth with
+    /// `rewrite_shadow_pressure_closes` flat under `StorageFull` is a hot
+    /// stripe, never a lost supply.
     pub rewrite_shadow_pressure_close_busy: Align64<AtomicU64>,
     /// Fenced closes: published nothing, freed nothing (W5 — successor
     /// accounting). The GENUINE fence class only — the D0 custody poison
@@ -7330,6 +7330,13 @@ pub struct Metrics {
     /// Barrier steps that joined ≥ 2 legs concurrently — the
     /// parallel-legs lever's engagement.
     pub fsync_parallel_joins: Align64<AtomicU64>,
+    /// fsyncs whose staged flush met `StorageFull` (record §4.4cd — the
+    /// pressure close at the flush's mint found the supply's stripe held
+    /// by a sibling, or the supply is this ino's own epoch) and ran the
+    /// ladder's own epoch close EARLY behind a data barrier, then retried
+    /// the flush ONCE. ≈ 0 except at genuine space pressure under load; a
+    /// retry that still met the wall surfaces the honest `ENOSPC`.
+    pub fsync_flush_enospc_retries: Align64<AtomicU64>,
     /// Histograms for lock wait times and queue depths.
     pub write_lock_wait: ShardedLatencyHistogram,
     // ---- Write lock-scope CANDIDATE ledger (design-write-inode-convoy
@@ -12797,6 +12804,7 @@ impl SqueezefsFilesystem {
                 "fsync_write_through_skips": METRICS.fsync_write_through_skips.load(Ordering::Relaxed),
                 "fsync_touched_unresolved": METRICS.fsync_touched_unresolved.load(Ordering::Relaxed),
                 "fsync_parallel_joins": METRICS.fsync_parallel_joins.load(Ordering::Relaxed),
+                "fsync_flush_enospc_retries": METRICS.fsync_flush_enospc_retries.load(Ordering::Relaxed),
                 // Constant "3" per volume (v3 is the only metadata
                 // format); kept as a field because operators key on it.
                 "meta_format_version": self
@@ -23139,6 +23147,19 @@ impl SqueezefsFilesystem {
         Ok(())
     }
 
+    /// The fsync ladder's DATA-FLUSH step (its step 1): the durability-now
+    /// driver over the RAM buffers, then the staged active blocks.
+    async fn fsync_data_flush_step(
+        &self,
+        ino: u64,
+        fencing_token: u64,
+    ) -> Result<(), SqueezefsError> {
+        self.flush_memory_buffers_driven(ino, fencing_token, FlushDriver::FsyncDurable)
+            .await?;
+        self.flush_active_blocks_with_retry(ino, fencing_token)
+            .await
+    }
+
     /// Public flush of staged active blocks + dirty layout for an inode.
     /// Propagates I/O errors so callers (fsync, tests) can fail the durable op.
     /// Runs the ladder under its own `fsync_phase_ns` clock (the handler
@@ -23194,10 +23215,33 @@ impl SqueezefsFilesystem {
         // leg escalates to one durable upload instead of
         // `put_active_block` + a queued writeback the caller cannot wait
         // for (the FLUSH/RELEASE handlers stay soft by design).
-        self.flush_memory_buffers_driven(ino, fencing_token, FlushDriver::FsyncDurable)
-            .await?;
-        self.flush_active_blocks_with_retry(ino, fencing_token)
-            .await?;
+        match self.fsync_data_flush_step(ino, fencing_token).await {
+            Ok(()) => {}
+            // Record §4.4cd (review round 1, Issue 4): a flush's mint met
+            // `StorageFull` and the allocation act's pressure close could
+            // not free the supply — a sibling held an epoch's level-3.5
+            // stripe (`rewrite_shadow_pressure_close_busy`), or the space
+            // is this ino's own epoch. Both halves of the step fail the
+            // fsync on a second wall and the ladder's own epoch close is
+            // step 2, behind them — so step 2 runs EARLY here: a data
+            // barrier first (DUR-1 — the epoch's bindings name blocks
+            // whose bytes must be durable before their predecessors free;
+            // the OQ-5 arm every non-fsync close trigger is priced
+            // against), then the PARKING close of THIS ino's epoch (the
+            // ladder holds no block guard and no 3.5 stripe here), then
+            // the step retried ONCE — its mints re-run the pressure close
+            // over the siblings' epochs. A second wall is the honest
+            // `ENOSPC`.
+            Err(e) if crate::block_allocator::is_storage_full(&e) => {
+                self.router.backend_router.flush_data_devices().await?;
+                self.router.close_rewrite_epoch(ino, fencing_token).await?;
+                METRICS
+                    .fsync_flush_enospc_retries
+                    .fetch_add(1, Ordering::Relaxed);
+                self.fsync_data_flush_step(ino, fencing_token).await?;
+            }
+            Err(e) => return Err(e),
+        }
         let promote_lever = crate::fsync_economy::promote_staged_enabled();
         let layout = match self.router.metadata_cache.get(&ino) {
             Some(m) => Some(m),

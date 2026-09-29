@@ -373,7 +373,9 @@ async fn mount_shaped_rename_meets_g4_one_entry_per_op() {
 #[tokio::test]
 async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
     let (_t, backend) = routed_sandbox().await;
-    const N: u64 = 320;
+    // N corpses for the five full-fill destroy batches + ONE for the
+    // destroy site's calibration probe (term 3).
+    const N: u64 = 320 + 1;
     const FILL: usize = 64; // SQUEEZEFS_INODE_RECLAIM_BATCH default
 
     let mut inos = Vec::new();
@@ -470,24 +472,35 @@ async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
         );
     }
 
-    // Term 3: FORGET-side destroys at healthy fill — ONE COMMIT per BATCH,
-    // judged at the destroy tx's own commit SITE (calibrated on one corpse
-    // below), and recorded in the destroy-fill histogram's ≤64 bucket
-    // (index 7 of the QueueDepthHistogram labels: 0,1,2,≤4,≤8,≤16,≤32,
-    // ≤64,…). The process-global ENTRY counter is written by every actor
-    // of the process — an SMO's record from the checkpoint task, a
-    // cadence drain commit whose entry landed before its DRAIN_COMMITS
-    // increment (the count moves after the ack) — so an exact law over
-    // it is a schedule assertion: the 1.3.0 release chain's attempt 13
-    // read 6 against 5 with two concurrent drain commits already
-    // excluded (record §4.4ce). The drain is quiesced first (an explicit
-    // drain of the echoes, so the calibration meets no concurrent
-    // committer) and the entry counter keeps its LOWER bound: a batch's
-    // commit is at least one entry.
+    // Term 3: FORGET-side destroys at healthy fill — ONE COMMIT per BATCH
+    // and NO other committer in the window, judged at the destroy tx's own
+    // commit SITE (calibrated on one corpse below), and recorded in the
+    // destroy-fill histogram's ≤64 bucket (index 7 of the
+    // QueueDepthHistogram labels: 0,1,2,≤4,≤8,≤16,≤32,≤64,…). The
+    // process-global ENTRY counter is written by every actor of the
+    // process — an SMO's record from the checkpoint task (this fixture's
+    // native leaf runs within one threshold frame of a compaction exactly
+    // where the destroys append), a cadence drain commit whose entry
+    // landed before its DRAIN_COMMITS increment (the count moves after
+    // the ack) — so an exact law over it is a schedule assertion: the
+    // 1.3.0 release chain's attempt 13 read 6 against 5 with two
+    // concurrent drain commits already excluded, the actor undecidable
+    // post hoc (record §4.4ce). The drain is quiesced first: an explicit
+    // drain of the echoes — the cadence's in-flight batch keeps its inos
+    // in the map until after its increment, so the explicit drain parks
+    // behind it on the overlapping `lock_many` and an empty map afterwards
+    // means no iteration can still commit — and the premise is asserted.
+    // The entry counter keeps its LOWER bound: a batch's commit is at
+    // least one entry.
     backend.volumes[0]
         .drain_pending_times_now()
         .await
         .expect("explicit pending-times drain");
+    assert_eq!(
+        backend.volumes[0].pending_times_len(),
+        0,
+        "the explicit drain left nothing parked (the quiesce premise)"
+    );
     let destroy_site = calibrate_single_site("one-corpse destroy", || {
         let b = backend.clone();
         let corpse = inos[0];
@@ -514,10 +527,15 @@ async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
     let destroy_delta = entries_now() - e2;
     let n_batches = rest.len().div_ceil(FILL) as u64;
     assert_eq!(
-        destroy_sites.get(&destroy_site).copied().unwrap_or(0),
-        n_batches,
-        "destroys amortize to ONE commit per batch at the destroy site {destroy_site} \
-         ({n_batches} batches for {} corpses); sites moved: {destroy_sites:?}",
+        rest.len() % FILL,
+        0,
+        "premise: every destroy batch is a full fill"
+    );
+    assert_eq!(
+        destroy_sites,
+        HashMap::from([(destroy_site.clone(), n_batches)]),
+        "destroys amortize to ONE commit per batch at the destroy site {destroy_site} and no \
+         other site commits in the window ({n_batches} batches for {} corpses)",
         rest.len()
     );
     assert!(
@@ -537,7 +555,7 @@ async fn unlink_entry_economy_meets_g4_via_echo_absorption() {
     // window's ambient entries, bounded by the ≤ 1.05 law itself).
     // At-scale amortization (drains INCLUDED) is the acceptance table's
     // job — 100 k-op storms measure 1.018/op; this sandbox pin proves the
-    // per-term mechanism at N = 320.
+    // per-term mechanism at N = 320 (+ the calibration corpse).
     let total = unlink_delta + echo_delta + destroy_delta.saturating_sub(drain_d3);
     let per_op = total as f64 / N as f64;
     assert!(

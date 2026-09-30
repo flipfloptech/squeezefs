@@ -110,6 +110,9 @@ fuzz_target!(|data: &[u8]| {
                     );
                     let mut raw = a.to_be_bytes().to_vec();
                     raw.extend_from_slice(&d.to_be_bytes());
+                    // The two-layer law: the forest frames it (below), the
+                    // per-kind decoder refuses it.
+                    assert!(decode_block_map_key(&raw).is_err());
                     Some(raw)
                 }
             },

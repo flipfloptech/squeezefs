@@ -1056,7 +1056,18 @@ proptest! {
     /// explicit `ExtentGrant { want }` is clamped to the derivation's cap.
     #[test]
     fn manager_service_edge_is_bounded_by_durable_state(
-        runs in prop::collection::vec((any::<u64>(), any::<u32>()), 0..16),
+        // Two arms (§4.4cg review, Issue 1): uniform `u64` starts never land
+        // two runs within `u32::MAX` of each other (≈ 2⁻²⁴ per case), so the
+        // merge, the over-`u32` split and the distinct-extent clause were
+        // coverage-dead; the CLUSTERED arm draws starts inside one small
+        // window with lengths that reach past `u32::MAX`.
+        runs in prop_oneof![
+            prop::collection::vec((any::<u64>(), any::<u32>()), 0..16),
+            prop::collection::vec(
+                (0u64..1024, prop_oneof![0u32..128, Just(u32::MAX), any::<u32>()]),
+                0..16
+            ),
+        ],
         total in 1u64..(1 << 40),
         record_seed in prop::collection::vec(0u64..(1 << 16), 0..64),
         want in any::<u32>(),
@@ -2984,7 +2995,9 @@ fn coalesce_runs_splits_an_over_u32_merge_into_adjacent_pieces() {
 /// "never a slot-tree kind" arm and panicked when the framing succeeded.
 #[test]
 fn a_block_map_key_at_the_reserved_index_is_refused_by_its_codec_and_framed_by_the_forest() {
-    use squeezefs::meta_backend::kv::block_map::{block_map_key, BLOCK_MAP_KEY_LEN};
+    use squeezefs::meta_backend::kv::block_map::{
+        block_map_key, decode_block_map_key, BLOCK_MAP_KEY_LEN,
+    };
     use squeezefs::meta_backend::kv::record::{
         forest_key, forest_key_slot, is_slot_tree_kind, split_forest_key, TREE_BLOCK_MAP,
     };
@@ -3005,6 +3018,12 @@ fn a_block_map_key_at_the_reserved_index_is_refused_by_its_codec_and_framed_by_t
     assert_eq!(framed.len(), BLOCK_MAP_KEY_LEN + 1, "one kind byte");
     let (kind, legacy) = split_forest_key(&framed).expect("a framed key splits");
     assert_eq!((kind, &legacy[..]), (TREE_BLOCK_MAP, &raw[..]));
+    // The two-layer law the find rests on: the framing accepts, the
+    // per-kind DECODER refuses the legacy it hands back.
+    assert!(
+        decode_block_map_key(&legacy).is_err(),
+        "the block-map decoder refuses the sentinel index the forest framed"
+    );
     assert_eq!(
         forest_key_slot(&framed).expect("routes"),
         0,

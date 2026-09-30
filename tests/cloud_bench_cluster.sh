@@ -249,9 +249,10 @@ IO500_STONEWALL="${IO500_STONEWALL:-60}"   # seconds per stonewalled phase. 300 
                                            # row this rig defaults to (labelled so)
 IO500_PPN="${IO500_PPN:-4}"                # MPI ranks per writer node (i4i.2xlarge = 8
                                            # vCPU, the daemon's lanes take the rest)
-IO500_REF="${IO500_REF:-}"                 # a git ref of github.com/IO500/io500 to check
-                                           # out; EMPTY = the default branch — the commit
-                                           # built is recorded in the manifest either way
+IO500_REF="${IO500_REF:-io500-sc25}"       # the git ref of github.com/IO500/io500 built —
+                                           # pinned to the SC25 list's tag (a moving default
+                                           # branch is not an instrument); the commits built
+                                           # are recorded in VERSIONS + the manifest
 IO500_REPO="${IO500_REPO:-https://github.com/IO500/io500.git}"
 SYM_ARM_A="${SYM_ARM_A:-0}"                # 1 = ALSO run the design's "vs today" A arm
                                            # (authority + co-writers at the same N, the same
@@ -2124,7 +2125,28 @@ grep -qF "$PUBKEY" /root/.ssh/authorized_keys || echo "$PUBKEY" >> /root/.ssh/au
 EOS
   done
 
-  log "bench-io500 2/6: build the harness on client0 (io500 + ior/mdtest + pfind — prepare.sh)"
+  # Open MPI 5.x (the Ubuntu 26.04 package) launches the remote daemons
+  # through PRRTE's ssh PLM, which has no `plm_rsh_args`: the key travels
+  # through root's ssh CONFIG on client0, one Host block per writer node
+  # (review round 1, Issue 1 — the 4.x flag would be silently dropped and
+  # every remote launch would run a bare `ssh` and fail).
+  local hosts_priv=""
+  for c in "${clients[@]}"; do hosts_priv+="$(node_priv "$c") "; done
+  remote "$c0_pub" HOSTS_PRIV="$hosts_priv" <<'EOS'
+set -euo pipefail
+install -d -m 0700 /root/.ssh
+{
+  for h in $HOSTS_PRIV; do
+    printf 'Host %s\n  IdentityFile /root/.ssh/io500_ed25519\n  IdentitiesOnly yes\n  BatchMode yes\n  StrictHostKeyChecking accept-new\n  User root\n' "$h"
+  done
+} > /root/.ssh/config.io500
+# keep any existing root config; our blocks first (first match wins per Host)
+touch /root/.ssh/config && chmod 0600 /root/.ssh/config
+grep -q '^# io500 hosts (ephemeral)$' /root/.ssh/config || { { echo '# io500 hosts (ephemeral)'; cat /root/.ssh/config.io500; cat /root/.ssh/config; } > /root/.ssh/config.new && mv /root/.ssh/config.new /root/.ssh/config && chmod 0600 /root/.ssh/config; }
+echo "root ssh config: $(grep -c '^Host ' /root/.ssh/config) host block(s)"
+EOS
+
+  log "bench-io500 2/6: build the harness on client0 (io500 + ior/mdtest + pfind — prepare.sh, ref $IO500_REF)"
   remote "$c0_pub" IO500_REPO="$IO500_REPO" IO500_REF="$IO500_REF" <<'EOS'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -2133,8 +2155,9 @@ need=""; for p in git autoconf automake libtool pkg-config; do dpkg -s "$p" >/de
 if [ -n "$need" ]; then apt-get -qq update && apt-get -qq install -y --no-install-recommends $need; fi
 if [ ! -d /opt/io500/.git ]; then git clone -q "$IO500_REPO" /opt/io500; fi
 cd /opt/io500
-[ -z "$IO500_REF" ] || git checkout -q "$IO500_REF"
-[ -x ./io500 ] && [ -x ./bin/ior ] && [ -x ./bin/mdtest ] && [ -x ./bin/pfind ] || ./prepare.sh > /opt/io500/prepare.log 2>&1
+git fetch -q --tags origin && git checkout -q "$IO500_REF"
+# A ref change rebuilds: the built commit is stamped beside the binaries.
+if [ -x ./io500 ] && [ -x ./bin/ior ] && [ -x ./bin/mdtest ] && [ -x ./bin/pfind ] && [ "$(cat .built-at 2>/dev/null)" = "$(git rev-parse HEAD)" ]; then :; else ./prepare.sh > /opt/io500/prepare.log 2>&1 && git rev-parse HEAD > .built-at; fi
 for b in ./io500 ./bin/ior ./bin/mdtest ./bin/pfind; do [ -x "$b" ] || { echo "FATAL: $b not built (see /opt/io500/prepare.log)" >&2; tail -30 /opt/io500/prepare.log >&2; exit 1; }; done
 {
   echo "io500=$(git rev-parse HEAD) ($(git describe --tags --always 2>/dev/null))"
@@ -2179,8 +2202,8 @@ INI
 mkdir -p "$MNT/io500-data"
 tar -C /opt -cf /tmp/io500-built.tar io500/io500 io500/bin io500/config-sqz.ini io500/hosts io500/VERSIONS
 for h in $(awk '{print $1}' hosts | tail -n +2); do
-  scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i /root/.ssh/io500_ed25519 /tmp/io500-built.tar root@$h:/tmp/io500-built.tar
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i /root/.ssh/io500_ed25519 root@$h 'mkdir -p /opt && tar -C /opt -xf /tmp/io500-built.tar && test -x /opt/io500/io500'
+  scp -q /tmp/io500-built.tar root@$h:/tmp/io500-built.tar
+  ssh -n root@$h 'mkdir -p /opt && tar -C /opt -xf /tmp/io500-built.tar && test -x /opt/io500/io500 && test -x /opt/io500/bin/pfind'
 done
 echo "harness on $(wc -l < hosts) node(s); config-sqz.ini stonewall=$SW datadir=$MNT/io500-data"
 EOS
@@ -2193,23 +2216,31 @@ cat "$MNT/.stats"
 EOS
   done
 
-  log "bench-io500 5/6: mpirun io500 — $ranks ranks ($IO500_PPN per node x ${#clients[@]} nodes), stonewall ${IO500_STONEWALL}s per phase ($sw_label)"
+  # The run's bound: 6 stonewalled phases (ior-easy/hard write + read,
+  # mdtest-easy/hard create) at IO500_STONEWALL each, the stat / find /
+  # delete phases proportional to what they created — budget 12 x the
+  # stonewall + 15 min, and never past the cluster guard's deadline.
+  local run_bound=$(( IO500_STONEWALL * 12 + 900 ))
+  if ! $DRY_RUN && [ -n "${DEADLINE_EPOCH:-}" ]; then
+    local remaining=$(( DEADLINE_EPOCH - $(date +%s) ))
+    [ "$remaining" -gt $(( run_bound + 600 )) ] \
+      || die "bench-io500: the cluster guard tears down in $(( remaining / 60 )) min — the run needs ~$(( run_bound / 60 )) min + 10 min to pull evidence (lower IO500_STONEWALL, or relaunch with a longer MAX_CLUSTER_HOURS)"
+  fi
+  log "bench-io500 5/6: mpirun io500 — $ranks ranks ($IO500_PPN per node x ${#clients[@]} nodes), stonewall ${IO500_STONEWALL}s per phase ($sw_label), bound $(( run_bound / 60 )) min"
   spot_monitor_start
   assert_fleet_running
   local run_rc=0
   local run_log=/dev/null
   $DRY_RUN || run_log="$out/run.log"
-  remote "$c0_pub" RANKS="$ranks" <<'EOS' 2>&1 | tee "$run_log" || run_rc=$?
+  remote "$c0_pub" RANKS="$ranks" BOUND="$run_bound" <<'EOS' 2>&1 | tee "$run_log"
 set -euo pipefail
 cd /opt/io500
 export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-# 13 stonewalled phases + the finds and deletes: bounded well inside the cluster guard.
-timeout 5400 mpirun --allow-run-as-root --hostfile hosts --map-by node -np "$RANKS" \
-  --mca plm_rsh_args "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -i /root/.ssh/io500_ed25519" \
-  --mca btl_tcp_if_exclude lo,docker0 \
+timeout "$BOUND" mpirun --allow-run-as-root --hostfile hosts --map-by node -np "$RANKS" \
+  --mca btl_tcp_if_exclude lo \
   ./io500 config-sqz.ini
 EOS
-  [ "${PIPESTATUS[0]:-0}" -eq 0 ] || run_rc="${PIPESTATUS[0]}"
+  run_rc="${PIPESTATUS[0]}"
   spot_monitor_stop
 
   log "bench-io500 6/6: .stats AFTER (every node) + the results"
@@ -2230,11 +2261,22 @@ cp /opt/io500/config-sqz.ini /opt/io500/hosts /opt/io500/VERSIONS /opt/io500/pre
 chmod -R a+rX /tmp/io500-pull
 EOS
     scp -r "${SSH_OPTS[@]}" -i "$SSH_KEY_FILE" "$REMOTE_USER@$c0_pub:/tmp/io500-pull/." "$out/" || warn "could not pull the io500 results from client0"
+    # The per-node daemon logs (0600 root — staged world-readable), as bench-sym does.
+    for c in "${clients[@]}"; do
+      mkdir -p "$out/logs/$c"
+      remote "$(node_pub "$c")" <<'EOS' || true
+set -euo pipefail
+mkdir -p /tmp/io500-logs && rm -rf /tmp/io500-logs/*
+for f in /tmp/sqz-sym-*.log /tmp/sqz-sym-*.log.* /tmp/sqz-sym-*.mount.out; do [ -f "$f" ] && install -m 0644 "$f" /tmp/io500-logs/ || true; done
+chmod -R a+rX /tmp/io500-logs
+EOS
+      scp -r "${SSH_OPTS[@]}" -i "$SSH_KEY_FILE" "$REMOTE_USER@$(node_pub "$c"):/tmp/io500-logs/." "$out/logs/$c/" || warn "could not pull $c's daemon logs"
+    done
   fi
   local manifest
   manifest="cluster=$CID preset=$PRESET symmetric=1 instance_type=$INSTANCE_TYPE az=$AWS_AZ region=$AWS_REGION market=$MARKET placement=$PLACEMENT_STRATEGY
 instrument=IO500 (the official harness: ior-easy/hard, mdtest-easy/hard, pfind) — $ranks MPI ranks = $IO500_PPN per node x ${#clients[@]} writer nodes, --map-by node (rank 0 on client0 = the manager), as ROOT
-stonewall=${IO500_STONEWALL}s per phase — $sw_label
+stonewall=${IO500_STONEWALL}s per phase — $sw_label; ior-hard = the S11 shared-single-file shape under the default-off SQUEEZEFS_RANGE_CUSTODY (every rank appends to ONE file — the whole-file custody arbitration is the number, by design)
 fleet: manager $c0:$MOUNTPOINT + $((${#clients[@]} - 1)) joined writer node(s) ${clients[*]:1}; format=--symmetric CACHE-LESS
 substrate=aws-$MARKET/$INSTANCE_TYPE/$AWS_AZ/pg-$PLACEMENT_STRATEGY (instance-store NVMe over nvmet-tcp, single NIC) — cloud substrate, a THIRD class: never spliced into devsub or squeeze-test medians
 harness commits: see VERSIONS (pulled from client0)
@@ -2244,17 +2286,47 @@ ts=$ts run_rc=$run_rc"
     echo "-- manifest.txt would contain:"; printf '%s\n' "$manifest" | sed 's/^/   /'
   else
     printf '%s\n' "$manifest" > "$out/manifest.txt"
-    # The must-stay-0 tripwires beside the score (read off the AFTER snapshots).
-    if command -v jq >/dev/null 2>&1; then
+    # The must-stay-0 tripwires beside the score: the law library's own
+    # key list, as the Σ-folded DELTA across the run (the stats nest under
+    # `metrics`, the symmetric families publish per volume as arrays —
+    # `sym_rows_lib.sh`'s readers; an absolute read would attribute the
+    # gate rows' residue to this pass).
+    # shellcheck source=tests/sym_rows_lib.sh
+    if . "$(dirname "$SCRIPT_PATH")/sym_rows_lib.sh" 2>/dev/null; then
       {
-        echo "node  invariant_tripwires  record_refusals  joined_control_refusals  meta_kv_forest_key_violations  dlm_token_recall_timeouts_live  writeback_errors_latched"
+        echo "node key delta"
         for c in "${clients[@]}"; do
-          f="$out/stats/$c.after.json"
-          [ -s "$f" ] || { echo "$c  (no snapshot)"; continue; }
-          jq -r --arg n "$c" '[$n, (.invariant_tripwires // "-"), ((.meta_ship.record_refusals // "-")|tostring), ((.joined_control_refusals // "-")|tostring), ((.meta_kv_forest_key_violations // "-")|tostring), ((.dlm_token_recall_timeouts_live // "-")|tostring), ((.writeback_errors_latched // "-")|tostring)] | @tsv' "$f" 2>/dev/null || echo "$c  (unreadable)"
+          local b="$out/stats/$c.before.json" a="$out/stats/$c.after.json"
+          [ -s "$b" ] && [ -s "$a" ] || { echo "$c - (no snapshot pair)"; continue; }
+          for k in $SYM_ZERO_KEYS; do
+            local d
+            d=$(python3 - "$b" "$a" "$k" <<'PYEOF'
+import json, sys
+b, a, key = sys.argv[1:4]
+def flat(d, out=None, pfx=""):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict): flat(v, out, pfx + k + ".")
+        else: out[pfx + k] = v
+    return out
+def fold(v):
+    if isinstance(v, list): return sum(x for x in v if isinstance(x, (int, float)))
+    return v if isinstance(v, (int, float)) else 0
+def load(p):
+    root = json.load(open(p)); return flat(root.get("metrics", root))
+x, y = load(b), load(a)
+print(int(fold(y.get(key, 0)) - fold(x.get(key, 0))))
+PYEOF
+) || d="?"
+            [ "$d" = "0" ] || echo "$c $k $d"
+          done
         done
       } | column -t > "$out/tripwires.txt" 2>/dev/null || true
-      cat "$out/tripwires.txt" 2>/dev/null || true
+      if [ "$(wc -l < "$out/tripwires.txt")" -le 1 ]; then
+        echo "must-stay-0 set (${SYM_ZERO_KEYS// / }): every delta 0 on every node" | tee -a "$out/tripwires.txt"
+      else
+        echo "must-stay-0 set: NONZERO deltas —"; cat "$out/tripwires.txt"
+      fi
     fi
     [ -f "$out/results/"*/result_summary.txt ] 2>/dev/null && { echo; cat "$out"/results/*/result_summary.txt; } || true
   fi

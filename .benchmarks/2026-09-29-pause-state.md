@@ -218,6 +218,60 @@ before the ruling), its logs copied into `~/tmp/sym-run-state/attempts/`.
    (regenerable); `dhat-heap.json` in the main checkout is gitignored
    residue; `~/tmp/g551-evidence/` as above.
 
+## Pause point 2026-09-30 (after the cloud row and the §4.4ci fix rung)
+
+**Where it stands.** `dev` = `origin/dev` = `5497ddd0` (the cloud row's
+record + evidence). The 1.3.0 tag `stable-2026.09.5` = `7d1ae20b` stands.
+The fix rung for the row's product finding is the branch
+**`fix/write-grid-straddle-overlay`**, pushed, 6 commits over `dev`:
+`802c4dcc` (the RED contract `tests/write_grid_straddle_tests.rs`),
+`79a32d02` (the fix: the overlay's per-piece screen + the install-only
+length floor), `336b6b4c` (docs), `5c62557a` (review round 1: the
+`overlay_sub_cap_joins` counter, the slot leg's zc-fd fallback, the
+`any_open_fast` idiom), `e068f81b` (review round 2, M-2: a whole-block
+piece of a spanning write keeps the write-through), and the docs commit
+after it (the record's M-2 clause). Reviewer verdict after three rounds:
+**LANDABLE** (`~/tmp/sym-run-state/grok-exec-review-4.4ci.md`). Both
+clippy configs, fmt and the docs link check are clean; 25+ neighbouring
+suites green; the live repro on the 3 ms-delay tcp devsub read the
+skewed stream's fsync 6.2 s → 0.06 s (laptop, a mechanism reading).
+
+**The gate.** `task check` on `e068f81b` is the remaining precondition
+to land. Attempt 1 died on `cli_version_tests` (a concurrent `cargo
+test` in the same checkout rebuilt the debug binary mid-gate — never run
+cargo beside a gate); attempt 2 on `posix_mount_semantics_tests`'
+two-daemon leg with `IORING_REGISTER_KMBUF_RING … ENOMEM` after six
+retries (kernel page fragmentation from the repro's 16 GiB memory-backed
+devsub + 75 GB of page cache; the suite passes alone); attempt 3 runs
+from a compacted, devsub-free box —
+`~/tmp/ci-gate/taskcheck.e068f81b.log` (`task-check rc=0` at its end is
+GREEN; the two earlier logs sit beside it with their cause in the name).
+
+**To land (after GREEN):** `git checkout dev && git merge --ff-only
+fix/write-grid-straddle-overlay && git branch -d
+fix/write-grid-straddle-overlay && git push origin dev`; if the tree
+moved under the branch, rebase first. A red that is a venue artifact
+(kmbuf ENOMEM, a concurrent-cargo race) is re-run from a compacted idle
+box; a red naming the branch's surface is a round-4 review item.
+
+**Owed after it (record §7):** item 26's second lever — the pipelined
+partial-buffer flush — and the stolen-settle ladder re-run (the ≤ 0.3 %
+residual: a piece reaching a block whose record already completed);
+items 27 / 28 (a departed holder's per-holder planes and custody
+clients outliving its clean leave; the silent `record_refusals`); the
+`bench-io500` verb (`feat/cloud-bench-io500` @ `91449ede`, pushed):
+round 2 NOT LANDABLE on two one-liners — `tar -chf` for the dangling
+`bin/pfind` symlink, `|| run_rc=$?` restored on the `mpirun | tee`
+pipeline — plus a ≥ 60 min run bound, then round 3; the cloud re-run
+(gate 3 N = 1/2/4/8 + IO500) under a NEW expressed approval on a binary
+carrying the fix.
+
+**Run hygiene here:** the tcp devsub is torn down; `~/tmp/ci-repro/`
+holds the repro scripts (`run.sh`, `run2.sh`, `misaligned.py` — the
+last also committed under the cloud evidence dir) and its daemon log;
+`~/tmp/ci-gate/` the gate logs; `~/tmp/release-1.3.0/cloud/` the run's
+local state. The reader-side scratch under `/mnt/ci-repro` is unmounted.
+
 ## Standing hazards
 
 - Every tool shell that mounts: the `prlimit` + `ulimit -l unlimited`

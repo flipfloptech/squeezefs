@@ -169,8 +169,8 @@ verdict instead of declining:
 
 ```
 mapped(b) ∧ striped-authority ∧ passthrough ∧ ¬write_verification
-        ∧ aligned single-block segment (4 KiB offset+len, one block)
-        ∧ len > patch_max_bytes()              — the LENGTH FLOOR (finding 47), BOTH shapes
+        ∧ page-aligned PIECE (4 KiB offset+len; single-block by the write split — §4.4ci)
+        ∧ (len > patch_max_bytes() ∨ a record is Open on b) — the LENGTH FLOOR (finding 47) governs the INSTALL
         ∧ no RAM accumulation (active_block_buffers)         [existing]
         ∧ no staged custody (active_block / active_block_ext) [existing]
         ∧ no live W2 extent overlay on the block              [existing]
@@ -211,6 +211,50 @@ Load-bearing points, each with its measured or structural reason:
   `ActiveBlockBuf` into ONE whole-block write-through (request size =
   the block) instead of one overlay store per op (`wareq-sz` collapsing
   to bs).
+
+* **The screen judges each PIECE, and the floor governs the INSTALL
+  (§4.4ci, 2026-09-30 — the cloud row's 64 GiB ingest,
+  `.benchmarks/2026-09-19-sym-acceptance.md` §4.4ci; contracts
+  `tests/write_grid_straddle_tests.rs`).** `write_file_staged` splits a
+  WRITE that spans two blocks into two single-block, page-aligned pieces,
+  one per block future. The shape screen used to judge the WHOLE write
+  (`start_block == end_block`, the alignment of `offset` / `payload_len`,
+  the floor over `payload_len`), so BOTH pieces of a straddling write
+  declined into the accumulation path — and the kernel's writeback grid
+  straddles: it batches a dirty file into `max_write` (1 MiB) WRITEs from
+  an arbitrary page, so once a chunk end falls off the grid every fourth
+  WRITE of a 4 MiB block spans a boundary, while the 256-deep queue
+  delivers a block's segments out of order. The tail piece then found
+  its block's record Open with ≈ 2 of 4 segments, the one-authority
+  screen SETTLED it (published with a zero-seeded 2 MiB gap) and opened
+  an `ActiveBlockBuf` whose coverage union could never complete (the
+  published segments are not in it), and the fsync flush's `deferred`
+  arm re-read the whole block and uploaded it whole again, one block at
+  a time under its guard: 7,286 of 16,384 blocks, 1,068 s, `dev/user`
+  1.445 on the cloud; 414 of 512 blocks and fsync 0.13 → 6.2 s on the
+  laptop repro (`hang-evidence/ingest-class-bracket.txt`). Now the
+  write-wide half of the screen is passthrough / verification / vehicle
+  alone; alignment is judged per piece (single-block by construction);
+  and a piece of ANY page-aligned length JOINS a record already Open on
+  its block — the dest is minted and the store is one aligned DMA into
+  it — while the floor keeps governing the INSTALL of a fresh record (a
+  sub-cap segment that would mint a dest is still the Random-small-write
+  program's, and `overlay_ineligible_sub_cap` keeps reading "segments the
+  floor alone sent down the ladder": judged ahead of the state screen, as
+  the write-wide floor was). A slot payload stays unmaterialized only for
+  a single-block, aligned, above-floor write (its direct DMA needs the
+  whole payload as one piece); a straddling slot write materializes and
+  its pieces ride the bytes vehicle. The law the contracts pin: for a
+  stream whose every segment is page-aligned, a block lands ONCE — by
+  the overlay when its first segment opened a record, by write-through
+  when its first segment took the accumulation path — so the flush finds
+  no partial buffer, reads nothing back and uploads nothing twice, on the
+  aligned grid, the skewed grid in order and the skewed grid delivered
+  inner-segments-first. What remains of the class is the genuinely MIXED
+  block — page-aligned segments beside an unaligned one in a block with
+  an Open record — whose flush stays the serialized seed-read + re-upload
+  (the pipelined partial-buffer flush is the acceptance record's §7 item
+  26's second lever, owed).
 
 * **Shared blocks are eligible.** Unlike W1 (refcount == 1 mandatory —
   in-place mutation of a pinned block is corruption), B4 is CoW: the old

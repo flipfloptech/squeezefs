@@ -130,10 +130,13 @@ machinery — never a second discipline.
   overwriting live mapped bytes under ACK-early (a crash mid-DMA would
   tear durable data the map still names: a never-lossy violation, not a
   perf trade).
-* **Multi-block request spans.** `try_overlay` keeps
-  `start_block == end_block` (`src/fuse_client.rs:13818`); a slot cannot
-  be sliced across per-block futures (`deferred_slot`, `:13832`).
-  Per-block bytes-vehicle spans are a named P2 follow-on (§14 OQ-1).
+* **Multi-block request spans.** Judged PER PIECE since §4.4ci (§14
+  OQ-1 RESOLVED): each per-block future screens its own page-aligned
+  slice, so both pieces of a straddling write may overlay. A slot cannot
+  be sliced across per-block futures, so a slot payload stays
+  unmaterialized only for a single-block, aligned, above-floor write
+  (`overlay_single_block` / `deferred_slot`); a straddling slot write
+  materializes and its pieces ride the bytes vehicle.
 * **Transformed volumes** — excluded by the parent §7 impossibility
   argument (frame math), unchanged.
 * **Co-writer / multi-writer stores** — PR B9's, after S9 arms. The
@@ -223,7 +226,7 @@ Load-bearing points, each with its measured or structural reason:
   declined into the accumulation path — and the kernel's writeback grid
   straddles: it batches a dirty file into `max_write` (1 MiB) WRITEs from
   an arbitrary page, so once a chunk end falls off the grid every fourth
-  WRITE of a 4 MiB block spans a boundary, while the 256-deep queue
+  WRITE of a 4 MiB block spans a boundary, while the bounded background queue
   delivers a block's segments out of order. The tail piece then found
   its block's record Open with ≈ 2 of 4 segments, the one-authority
   screen SETTLED it (published with a zero-seeded 2 MiB gap) and opened
@@ -232,16 +235,26 @@ Load-bearing points, each with its measured or structural reason:
   arm re-read the whole block and uploaded it whole again, one block at
   a time under its guard: 7,286 of 16,384 blocks, 1,068 s, `dev/user`
   1.445 on the cloud; 414 of 512 blocks and fsync 0.13 → 6.2 s on the
-  laptop repro (`hang-evidence/ingest-class-bracket.txt`). Now the
+  laptop's deterministic repro (`hang-evidence/misaligned.py`, a
+  mechanism reading — the record's §4.4ci carries the transcript). Now the
   write-wide half of the screen is passthrough / verification / vehicle
   alone; alignment is judged per piece (single-block by construction);
   and a piece of ANY page-aligned length JOINS a record already Open on
   its block — the dest is minted and the store is one aligned DMA into
   it — while the floor keeps governing the INSTALL of a fresh record (a
   sub-cap segment that would mint a dest is still the Random-small-write
-  program's, and `overlay_ineligible_sub_cap` keeps reading "segments the
-  floor alone sent down the ladder": judged ahead of the state screen, as
-  the write-wide floor was). A slot payload stays unmaterialized only for
+  program's, and `overlay_ineligible_sub_cap` keeps reading "installs the
+  floor alone refused": judged ahead of the state screen, as the
+  write-wide floor was; the joins ride `overlay_sub_cap_joins`, so the
+  sub-cap pieces reaching the arm ≡ the two counters' sum and the §11
+  rot rule reads that sum). Two faces of the join, stated: on a MIXED
+  stream (one above-floor piece, then sub-cap pieces into the same block)
+  the sub-cap run stores per op into the dest — request size = the piece,
+  where the pre-§4.4ci settle-then-accumulate would have written one
+  whole block (finding 47's `wareq-sz` rationale holds where no record is
+  open); and a whole-block piece is the whole-block overwrite's shape
+  (unreachable at the shipped 4 MiB / 1 MiB geometry — a kernel WRITE
+  spans at most two blocks, neither piece whole). A slot payload stays unmaterialized only for
   a single-block, aligned, above-floor write (its direct DMA needs the
   whole payload as one piece); a straddling slot write materializes and
   its pieces ride the bytes vehicle. The law the contracts pin: for a
@@ -1036,7 +1049,8 @@ family (`src/fuse_client.rs:5854+`):
 | `overlay_gap_seed_read_bytes` / `overlay_gap_seed_ranged_bytes` | the §5.8 seed-bytes law (W-6): device bytes READ to source gap seeds (the amplification numerator — `read ÷ old` ≈ 1 with the ranged seed engaged, = block window ÷ Σ gaps on the `SQUEEZEFS_GAP_SEED_RANGED=0` control) / the old-sourced seed bytes that rode the ranged funnel (⊆ `overlay_gap_seed_old_bytes`; 0 with the lever off, on decorated bindings and where Σ gaps ≥ the window) |
 | `overlay_ineligible_shadow_bound`, `overlay_enospc_declines`, `overlay_unreachable_declines` | the decline ledgers (§5.1) — the third is the retryable-class twin of the ENOSPC decline (an unreachable allocation holder on a joined writer; 0 on every unarmed mount) |
 | `overlay_ineligible_range_shared` | the S11 rung-16 range clause (§5.1) — the W1 clause-7 twin, kept apart from `patch_ineligible_range_shared` and from `overlay_ineligible_shadow_bound` (the ledgers must not merge). **0 on every shipped mount** (whole-file leases ARE whole-inode custody; no verb issues ranges without the mw arm) and **0 on block-aligned ranged rows** (`design-full-multi-writer.md` §9.5's MPI-IO gate: nothing should share a block) — growth means range custody engaged on sub-block-shared blocks (rung 17's demotion territory) or the predicate rotted |
-| `overlay_ineligible_sub_cap` | the §5.1 **length floor** (finding 47): aligned single-block passthrough segments every other shape conjunct admitted but whose length is ≤ the W1 cap (`patch_max_bytes()`, block_size/8) — sent down the W1/W2 ladder instead, BOTH shapes. Grows ≈ per sub-cap aligned write on overlay-armed mounts by design; `overlay_gap_seed_old_bytes` growing on a rand-4k row while this stays flat is the predicate rotting. 0 under `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0 empties the sub-cap class) |
+| `overlay_ineligible_sub_cap` | the §5.1 **length floor** (finding 47): page-aligned passthrough pieces that reached the overlay arm (the W1 patch declined them) with NO record Open on their block and a length ≤ the W1 cap (`patch_max_bytes()`, block_size/8) — the INSTALL the floor refused, sent down the W2 ladder; BOTH shapes. Sub-cap pieces reaching the arm ≡ this + `overlay_sub_cap_joins` (§4.4ci); `overlay_gap_seed_old_bytes` growing on a rand-4k row while that SUM stays flat is the predicate rotting. 0 under `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0 empties the sub-cap class) |
+| `overlay_sub_cap_joins` | §5.1 / §4.4ci: sub-cap page-aligned pieces that JOINED a record already Open on their block (a join mints nothing — one aligned DMA into the minted dest); the tail piece of a WRITE that straddles a block boundary on a misaligned writeback grid is this piece. 0 on an aligned grid; ≈ one per block on the cloud's grid |
 | `patch_ineligible_device_overlay` | W1 clause 8 (kept apart from both the W2 `patch_ineligible_overlay` bucket and the S11 clause-7 `patch_ineligible_range_shared`) |
 | `overlay_mover_skips` | the §5.7 `MergeExpected` skip engaging — counted at BOTH layers (the mover quiesce-probe deferral and the primitive belt for guard-less callers); acked custody preserved, mover/repair re-plans or refuses — growth under mover passes is the hook working |
 | `overlay_superseded_by_merge` | the §5.7 DISCARDING-class belt engaging (`TruncateFrom`/`RemoveBlocks` reaching the primitive un-drained) — pair with `rewrite_shadow_superseded`; a FOREIGN un-marked `Merge` additionally trips `invariant_tripwires` (`overlay_foreign_merge`) — **must stay 0 on healthy mounts** now that the settle's own publish is provenance-exempted (§5.7): any growth is a real one-authority-screen escape, never publish noise |
@@ -1084,11 +1098,14 @@ Existing gauges (`overlay_open`, `overlay_inflight_bytes` R5 component,
 
 ## 14. Open Questions
 
-1. **OQ-1 — multi-block bytes-vehicle spans** (P2): relax
-   `start_block == end_block` for materialized payloads so each
-   per-block future can overlay its slice? Needs per-future eligibility
-   + slot-vs-bytes split at delivery. Deferred until a counted row shows
-   multi-block requests material on an overwrite venue.
+1. **OQ-1 — multi-block bytes-vehicle spans — RESOLVED 2026-09-30
+   (§4.4ci, §5.1's per-piece screen)**: the counted row was the cloud
+   fleet's 64 GiB ingest, where the kernel's misaligned writeback grid
+   made every fourth WRITE a straddle and the write-wide screen cost
+   1,068 s of fsync; each per-block future now screens its own
+   page-aligned slice, the slot-vs-bytes split is `overlay_single_block`
+   (a slot stays deferred only for a single-block, aligned, above-floor
+   write; a straddling slot write materializes).
 2. **OQ-2 — gap-serve venue**: this design serves gaps from the captured
    `old_binding` key through the fetch funnel (identity-stable, no
    recursion). The alternative — re-enter the ordinary read path with an

@@ -23,14 +23,19 @@
 //! aligned length; the length floor governs the INSTALL of a record,
 //! never a join), by write-through when its first segment took the
 //! accumulation path — so the fsync flush finds no partial buffer, reads
-//! nothing back and uploads nothing twice; device bytes ≡ user bytes.
+//! nothing back and uploads nothing twice; device bytes ≡ user bytes to
+//! within the first block's constant (the fresh cache-less file's first
+//! segment lands through the router's striped route, which has no face
+//! on this ledger).
 //!
 //! Geometry: 64 KiB blocks (derived W1 cap 8 KiB), 16 KiB segments (the
 //! 1 MiB analog), a ONE-PAGE skew (the cloud's grid: 534 short chunk
 //! ends over 65,536 MiB). The skewed stream is delivered as the kernel
 //! delivers it: the inner segments of every block first, the straddles
 //! after (phase 2) — the shape that filled half a record before the
-//! decline. Two controls: the aligned grid and the skewed grid in order.
+//! decline. Beside it the skewed grid in order (write-through for every
+//! block after the first — the floor still refuses a fresh install) and
+//! the aligned grid (the overlay whole).
 //! ACK-early is pinned OFF so every counter is settled when `write`
 //! returns (the device_overlay_tests convention).
 
@@ -225,6 +230,8 @@ struct Snap {
     durable_upload_other: u64,
     patch_write_bytes: u64,
     fold_passes: u64,
+    overlay_ineligible_sub_cap: u64,
+    overlay_sub_cap_joins: u64,
 }
 
 fn snap() -> Snap {
@@ -243,6 +250,8 @@ fn snap() -> Snap {
             + m(&METRICS.durable_upload_bytes_self_flush),
         patch_write_bytes: METRICS.patch_write_bytes.load(Ordering::Relaxed),
         fold_passes: m(&METRICS.fold_passes),
+        overlay_ineligible_sub_cap: m(&METRICS.overlay_ineligible_sub_cap),
+        overlay_sub_cap_joins: m(&METRICS.overlay_sub_cap_joins),
     }
 }
 
@@ -347,7 +356,10 @@ fn assert_landed_once(label: &str, before: Snap, after: Snap, blocks: u64) {
     );
 }
 
-async fn run(label: &str, skew: u64, reorder: bool) {
+/// `sub_cap` = the expected `(overlay_ineligible_sub_cap, overlay_sub_cap_joins)`
+/// deltas — the floor's INSTALL refusals and the pieces that JOINED an
+/// open record; sub-cap pieces reaching the arm ≡ their sum.
+async fn run(label: &str, skew: u64, reorder: bool, sub_cap: (u64, u64)) {
     let _g = serial().await;
     let (h, _lever) = make(label).await;
     let ino = create(&h, &format!("{label}.bin")).await;
@@ -394,26 +406,38 @@ async fn run(label: &str, skew: u64, reorder: bool) {
         delta!(after, before, fold_passes),
     );
     assert_landed_once(label, before, after, BLOCKS);
+    assert_eq!(
+        (
+            delta!(after, before, overlay_ineligible_sub_cap),
+            delta!(after, before, overlay_sub_cap_joins)
+        ),
+        sub_cap,
+        "{label}: the sub-cap ledger (installs the floor refused, joins into an open record)"
+    );
 }
 
 /// The cloud row's shape (§3.11 / §4.4ci): a one-page-skewed grid whose
 /// straddling segments arrive after the inner ones. RED on the base:
-/// every block re-read and re-uploaded at fsync.
+/// every block re-read and re-uploaded at fsync. Every block's 4 KiB head
+/// piece is sub-cap and finds its record Open — 24 joins, 0 refusals.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_skewed_grid_delivered_out_of_order_lands_every_block_once() {
-    run("skewed_ooo", PAGE, true).await;
+    run("skewed_ooo", PAGE, true, (0, BLOCKS)).await;
 }
 
-/// Control: the same skewed grid delivered in order — every block's
-/// first piece opens an active buffer, the rest join it, write-through.
+/// The same skewed grid delivered in order: every block after the first
+/// meets its sub-cap head piece FIRST — the floor refuses the install
+/// (23 refusals, 0 joins), the piece parks, the rest accumulate,
+/// write-through. Block 0's head is the inline write and its first inner
+/// piece the router's striped route (the first-block constant).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_skewed_grid_delivered_in_order_lands_every_block_once() {
-    run("skewed_inorder", PAGE, false).await;
+    run("skewed_inorder", PAGE, false, (BLOCKS - 1, 0)).await;
 }
 
 /// Control: the aligned grid, in order — every block rides the overlay
-/// whole (the laptop's shape).
+/// whole (the laptop's shape); no sub-cap piece exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_aligned_grid_lands_every_block_once() {
-    run("aligned", 0, false).await;
+    run("aligned", 0, false, (0, 0)).await;
 }

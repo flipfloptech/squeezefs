@@ -8182,16 +8182,23 @@ pub struct Metrics {
     /// predicate rotted.
     pub overlay_ineligible_range_shared: Align64<AtomicU64>,
     /// §5.1 **length floor** (finding 47; [`overlay_length_eligible`]):
-    /// aligned single-block passthrough segments that every OTHER
-    /// overlay shape conjunct admitted but whose length is ≤ the W1 cap
-    /// (`patch_max_bytes()`, block_size/8) — sent down the W1/W2 ladder
-    /// instead (patch in place when eligible, else the extent park /
-    /// accumulation). BOTH shapes. Grows ≈ per sub-cap aligned write on
-    /// overlay-armed mounts by design; a sub-cap shape reaching the
-    /// overlay ledgers (`overlay_gap_seed_old_bytes` growing on a rand-4k
-    /// row) while this stays flat is the predicate rotting. 0 under
-    /// `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0 empties the sub-cap class).
+    /// page-aligned passthrough pieces that reached the overlay arm (the
+    /// W1 patch declined them) with NO record Open on their block and a
+    /// length ≤ the W1 cap (`patch_max_bytes()`, block_size/8) — the
+    /// INSTALL the floor refused; sent down the W2 ladder (extent park /
+    /// accumulation). BOTH shapes. Sub-cap pieces reaching the arm ≡ this
+    /// + [`Self::overlay_sub_cap_joins`] (§4.4ci); `overlay_gap_seed_old_
+    /// bytes` growing on a rand-4k row while that SUM stays flat is the
+    /// predicate rotting. 0 under `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0
+    /// empties the sub-cap class).
     pub overlay_ineligible_sub_cap: Align64<AtomicU64>,
+    /// §5.1 (§4.4ci): sub-cap page-aligned pieces that JOINED a record
+    /// already Open on their block — the floor governs the INSTALL, a
+    /// join mints nothing and stores one aligned DMA into the minted
+    /// dest. The tail of a WRITE that straddles a block boundary on a
+    /// misaligned writeback grid is this piece; refusing it settled the
+    /// record half-filled and opened a buffer that never completed.
+    pub overlay_sub_cap_joins: Align64<AtomicU64>,
     /// §5.1 / KD-B4-8: a `StorageFull` dest mint declined the overwrite
     /// arm to accumulation (whose epoch KD-1.7 early-close ladder
     /// recycles the parked displaced supply) — never a write error.
@@ -12529,6 +12536,7 @@ impl SqueezefsFilesystem {
                 "overlay_ineligible_shadow_bound": METRICS.overlay_ineligible_shadow_bound.load(Ordering::Relaxed),
                 "overlay_ineligible_range_shared": METRICS.overlay_ineligible_range_shared.load(Ordering::Relaxed),
                 "overlay_ineligible_sub_cap": METRICS.overlay_ineligible_sub_cap.load(Ordering::Relaxed),
+                "overlay_sub_cap_joins": METRICS.overlay_sub_cap_joins.load(Ordering::Relaxed),
                 "overlay_enospc_declines": METRICS.overlay_enospc_declines.load(Ordering::Relaxed),
                 "overlay_unreachable_declines": METRICS.overlay_unreachable_declines.load(Ordering::Relaxed),
                 "overlay_gap_seeds": METRICS.overlay_gap_seeds.load(Ordering::Relaxed),
@@ -18787,8 +18795,9 @@ impl SqueezefsFilesystem {
         // is the W1/W2 program's whatever its block's state, so the slot
         // follows the patch ladder's hold rules (the HELD-slot late
         // WRITE_FIXED vehicle, the opposite of the overlay's
-        // extract-at-delivery posture) or extracts at delivery. Same
-        // predicate as the handler's authoritative screen.
+        // extract-at-delivery posture) or extracts at delivery. The hold
+        // gate keeps the floor for HOLDING; a sub-cap piece the handler
+        // JOINS to an Open record (§4.4ci) rides the pooled vehicle.
         if !overlay_length_eligible(u64::from(len)) {
             return false;
         }
@@ -18882,16 +18891,21 @@ impl SqueezefsFilesystem {
         // piece on every misaligned writeback grid. Judged ahead of the
         // state screen (as the write-wide floor was), so the bucket keeps
         // reading "segments the floor alone sent down the ladder".
-        if !overlay_length_eligible(len as u64)
-            && !self
-                .device_overlays
-                .get(ino, b)
-                .is_some_and(|r| r.core.state() == OverlayState::Open)
-        {
+        if !overlay_length_eligible(len as u64) {
+            let joins_open = crate::device_overlay::any_open_fast()
+                && self
+                    .device_overlays
+                    .get(ino, b)
+                    .is_some_and(|r| r.core.state() == OverlayState::Open);
+            if !joins_open {
+                METRICS
+                    .overlay_ineligible_sub_cap
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
             METRICS
-                .overlay_ineligible_sub_cap
+                .overlay_sub_cap_joins
                 .fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
         }
 
         // ---- The §7 state screen (sync probes, under the held guard).
@@ -19220,8 +19234,14 @@ impl SqueezefsFilesystem {
         // in-process suites' bytes-seam vehicle).
         let mut stored = false;
         let mut was_fallback = false;
-        if let Some(z) = payload.slot() {
-            let fd = rec.device.zc_write_fd().expect("screened above");
+        // A record installed through the Bytes vehicle was never screened
+        // for the device's zc write fd (the install screen runs for a slot
+        // payload alone); a slot piece joining such a record falls to the
+        // pooled vehicle when the fd is absent.
+        if let Some((z, fd)) = payload
+            .slot()
+            .and_then(|z| rec.device.zc_write_fd().map(|fd| (z, fd)))
+        {
             if let Err(e) = rec.device.authorize_zc_store() {
                 // Fence/custody refusal: fail THIS write loud through
                 // the common exit (never a second submission path — the

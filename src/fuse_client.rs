@@ -18868,6 +18868,32 @@ impl SqueezefsFilesystem {
         let block_size = self.router.block_size.load(Ordering::Relaxed) as usize;
         debug_assert!(rel % 4096 == 0 && len % 4096 == 0 && len > 0 && rel + len <= block_size);
 
+        // ---- Finding 47 — the LENGTH FLOOR (`overlay_length_eligible`)
+        // governs the INSTALL of a record: a sub-cap segment that would
+        // mint a fresh CoW dest is the Random-small-write program's,
+        // whatever the patch's state verdict — below the floor the ladder
+        // falls through exactly as before the overlay landed (W1 when
+        // eligible, else the W2 extent park / accumulation). A piece of
+        // ANY page-aligned length JOINS a record already Open on its
+        // block (§4.4ci): the dest is minted, the store is one aligned
+        // DMA into it, and refusing the piece would settle the record
+        // half-filled and start a buffer whose coverage never completes
+        // — the tail of a WRITE that straddles a block boundary is that
+        // piece on every misaligned writeback grid. Judged ahead of the
+        // state screen (as the write-wide floor was), so the bucket keeps
+        // reading "segments the floor alone sent down the ladder".
+        if !overlay_length_eligible(len as u64)
+            && !self
+                .device_overlays
+                .get(ino, b)
+                .is_some_and(|r| r.core.state() == OverlayState::Open)
+        {
+            METRICS
+                .overlay_ineligible_sub_cap
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+
         // ---- The §7 state screen (sync probes, under the held guard).
         // Striped authority only (§7.1: AFTER promotion drained AND
         // published — file_type IS the durable flip witness), and the
@@ -20878,37 +20904,33 @@ impl SqueezefsFilesystem {
             true
         };
 
-        // Device-overlay (Approach B, PR B2): the SHAPE half of the
-        // eligibility ladder, decided BEFORE the extraction so an
-        // eligible slot never pays the bounce (the extraction-delete
-        // charter). Single-block, LBA-aligned, passthrough, no write
-        // verification; the STATE half (striped authority, fresh block,
-        // no staged/RAM/shadow custody) runs in the per-block future
-        // under the held block guard.
+        // Device-overlay (Approach B, PR B2): the WRITE-wide half of the
+        // SHAPE screen — passthrough, no write verification, a vehicle
+        // for the payload — decided BEFORE the extraction so an eligible
+        // slot never pays the bounce (the extraction-delete charter). The
+        // per-PIECE half (page alignment; single-block by construction)
+        // and the length floor run in the per-block future: a WRITE that
+        // straddles a block boundary is two single-block pieces, each
+        // judged on its own (§4.4ci — judging the WHOLE write sent both
+        // pieces down the accumulation path, and the tail piece settled
+        // its block's half-filled record and opened a buffer that could
+        // never complete). The STATE half (striped authority, fresh
+        // block, no staged/RAM/shadow custody) runs under the held block
+        // guard in `try_device_overlay_store`.
         let overlay_shape = crate::device_overlay::device_overlay_enabled()
             && !payload.is_empty()
-            && start_block == end_block
-            && offset % 4096 == 0
-            && payload_len % 4096 == 0
             && (payload.slot().is_some() || crate::device_overlay::bytes_vehicle_armed())
             && !crate::write_verification_enabled()
             && self.router.get_crypto().is_passthrough();
-        // Finding 47 — the LENGTH FLOOR (`overlay_length_eligible`):
-        // a sub-cap segment is the Random-small-write program's, whatever
-        // the patch's state verdict — below the floor the ladder falls
-        // through exactly as before the overlay landed (W1 when
-        // eligible, else the W2 extent park / accumulation). Counted only
-        // when every other shape conjunct held, so the bucket reads
-        // "segments the floor alone sent down the ladder".
-        let try_overlay = overlay_shape && {
-            let above = overlay_length_eligible(payload_len);
-            if !above {
-                METRICS
-                    .overlay_ineligible_sub_cap
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            above
-        };
+        // The slot payload's direct DMA needs the WHOLE payload as one
+        // piece: only a single-block, page-aligned write may stay
+        // unmaterialized for the overlay (a straddling slot write
+        // materializes and its pieces ride the bytes vehicle).
+        let overlay_single_block = overlay_shape
+            && start_block == end_block
+            && offset % 4096 == 0
+            && payload_len % 4096 == 0
+            && overlay_length_eligible(payload_len);
 
         // D14: a slot payload stays UNMATERIALIZED only for the
         // single-block patch/overlay shapes (the direct slot→device DMA
@@ -20918,7 +20940,7 @@ impl SqueezefsFilesystem {
         // the handler prelude it overlaps with. Bytes payloads are a
         // zero-cost clone.
         let _phase = write_phase_begin(ino, offset);
-        let deferred_slot = (try_patch || try_overlay) && payload.slot().is_some();
+        let deferred_slot = (try_patch || overlay_single_block) && payload.slot().is_some();
         let data: bytes::Bytes = if deferred_slot {
             bytes::Bytes::new()
         } else {
@@ -21022,13 +21044,17 @@ impl SqueezefsFilesystem {
                     }
                 }
 
-                // Device-overlay (Approach B, PR B2): the state half of
-                // the eligibility ladder + install/claim/store/CQE, under
-                // this held guard. `Ok(true)` = ACKed off the overlay
-                // (ACK-after-CQE — KD-OV-7); `Ok(false)` = declined
-                // structurally (fall through to the accumulation path);
-                // `Err` = the store failed loud for exactly this write.
-                if try_overlay {
+                // Device-overlay (Approach B, PR B2): the per-PIECE half
+                // of the shape screen (page-aligned; single-block by
+                // construction of the split), then the state half + the
+                // length floor + install/claim/store/CQE, under this held
+                // guard. `Ok(true)` = ACKed off the overlay (ACK-after-CQE
+                // — KD-OV-7); `Ok(false)` = declined structurally (fall
+                // through to the accumulation path); `Err` = the store
+                // failed loud for exactly this write.
+                let piece_overlay =
+                    overlay_shape && write_start % 4096 == 0 && slice_len % 4096 == 0;
+                if piece_overlay {
                     let rel = (write_start - b_start_offset) as usize;
                     write_phase(ino, offset, b as u32, WP_OVERLAY_STORE);
                     match self

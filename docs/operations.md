@@ -89,7 +89,7 @@ squeezefs --version        # or -V
 # the same tree with uncommitted tracked changes — `-dirty` rides BOTH hashes:
 #   squeezefs 1.3.0 (227ac3739311-dirty / 227ac37393117000a5364c1039d79f24b2fd505a-dirty) built 2026-09-29T23:40:00Z profile release
 # release build from the 1.3.0 tag commit, dist profile:
-#   squeezefs 1.3.0 (<release-act commit> / <full>, tag stable-2026.09.5) built <utc> profile dist
+#   squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T00:51:54Z profile dist
 # a dhat-on / coz-on build appends " [PROFILING BUILD: <features> — NOT measurement-valid]" (ENG-8); `profile debug` = a plain `cargo build`
 grep -E '"build_(commit|tag|profile)"' <mountpoint>/.stats   # the fleet mixed-version detector
 ```

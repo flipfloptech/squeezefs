@@ -3,12 +3,15 @@
 FROM docker.io/library/ubuntu:24.04
 
 # Distro build deps: toolchain + pkg-config + FUSE 3 + libclang (bindgen)
-# + binutils (objdump for the glibc-ceiling assertion) + curl/CA for rustup.
+# + binutils (objdump for the glibc-ceiling assertion) + curl/CA for rustup
+# + python3 (docker/check-split-debug.sh's .gnu_debuglink CRC check — the
+# Rocky images carry it through dnf; the 1.3.0 dist:all was the check's
+# first run on an Ubuntu image and it was missing here).
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential pkg-config git curl ca-certificates binutils file \
-      fuse3 libfuse3-dev clang libclang-dev \
+      fuse3 libfuse3-dev clang libclang-dev python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # rustup: rust-toolchain.toml pins the CHANNEL (stable) plus the gate

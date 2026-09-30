@@ -68,11 +68,14 @@ the fixed tip; the release act names both shas. Its result:
 
 ## State at the move
 
-- `dev` = `origin/dev` = the release-act commit for **1.3.0** over
-  `227ac373` (§4.4cf `585d7377` + fold, §4.4cg `1ce23c8e` + fold — every
-  branch landed ff-only and deleted). The tag `stable-2026.09.5` is the
-  OWNER's act on that commit (asked, not taken); `task dist:all` and the
-  rocky8 pair to `squeeze-test` follow the tag.
+- **1.3.0 is TAGGED and SHIPPED**: `stable-2026.09.5` → `7d1ae20b` (the
+  owner's act, pushed); four `dist` artifact sets built from the tag and
+  checked (the Ubuntu ones through the Taskfile's container step run by
+  hand with the `python3`-fixed images — §4.4ch, the one build-tooling
+  defect the act found, landed on `dev` right after), kept at
+  `~/tmp/sqz-dist-1.3.0/`; the rocky8 pair on `squeeze-test` at
+  `/scratch/tmp/` with the previous binary beside it. `dev` = `origin/dev`
+  = the §4.4ch landing over the release-act commit.
 - **The 1.3.0 release gate is GREEN as a composed chain**: six product
   legs on `b2cfb3e4` (attempt 14), the fuzz leg on `1ce23c8e` — 18 / 18
   targets, 0 artifacts, ≈ 5.5 × 10⁸ executions — after two fuzz-leg

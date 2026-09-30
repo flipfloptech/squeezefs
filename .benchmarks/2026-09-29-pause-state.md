@@ -272,6 +272,28 @@ last also committed under the cloud evidence dir) and its daemon log;
 `~/tmp/ci-gate/` the gate logs; `~/tmp/release-1.3.0/cloud/` the run's
 local state. The reader-side scratch under `/mnt/ci-repro` is unmounted.
 
+**Paused 2026-09-30 (evening) — resume on the Linux box in a few days
+(owner decision).** The tip `dev` = `origin/dev` = `4d26af20` is landed,
+gated and pushed; no branch is open (`feat/cloud-bench-io500` @
+`91449ede` stays pushed with its two one-liners owed). The interim
+machine (a macOS aarch64 host, 36 GiB, Lima + colima + QEMU present,
+111 GB free) was inventoried and NOT used: the product is Linux-only, so
+a Mac venue is a Lima aarch64 VM (Ubuntu 25.10, `fuse.enable_uring=Y`;
+covers build / clippy / every cargo suite incl. mount-class; never zc,
+x86_64 artifacts or a number) — worth shipping as a repo template +
+`task dev:vm:*` verbs when a macOS contributor needs it; AWS as a dev
+box was priced at ≈ $110–220 / month at 8 h × 20 days (c6i.4xlarge –
+c6i.8xlarge) + ≈ $32 / month for a 400 GB gp3 root, one-off chains ≈
+$7–10 — a standing box only if the Mac VM is too cramped. **Resume
+order on the box:** (1) the laptop's run state is still local there
+(`~/tmp/sym-run-state/` review trail incl. `grok-exec-review-4.4ci.md`,
+`~/tmp/ci-gate/` gate logs, `~/tmp/release-1.3.0/cloud/`); (2) the
+`bench-io500` round-2 one-liners + round 3, land; (3) §7 item 26's
+second lever (the pipelined partial-buffer flush + the stolen-settle
+ladder re-run — the ≤ 0.3 % residual) red-first; (4) items 27 / 28; (5)
+the cloud re-run (gate 3 N = 1/2/4/8 + IO500) on a binary carrying
+§4.4ci, under a NEW expressed approval; (6) 1.3.1 when the owner says.
+
 ## Standing hazards
 
 - Every tool shell that mounts: the `prlimit` + `ulimit -l unlimited`

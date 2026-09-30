@@ -1,0 +1,14 @@
+# 2026-09-30 ~13:20Z — manager (client0, 54.235.36.11), /scratch/mnt, binary 7d1ae20b (1.3.0), kernel 7.0.0-1011-aws
+# 4 GiB dd bs=4M count=1024 conv=fsync; .stats deltas of /scratch/mnt around each dd
+===== buffered 4 GiB
+dd wall 6.03 s
+deltas: {"write_through_blocks": 312, "overlay_stores": 2152, "overlay_publishes": 711, "overlay_gap_seed_bytes": 731930624, "flush_seed_read_bytes": 1224736768, "durable_upload_bytes_escalation": 1224736768, "overlay_teardown_waits": 292, "active_block_ooo_runs": 817, "extent_parks": 398, "extent_escalations": 331, "patch_ineligible_adjacent": 1793, "patch_ineligible_oversize": 2316, "fsync_calls": 1, "meta_kv_journal_entries": 1828, "write_pipeline_inflight_blocks": 0}
+fsync data_flush: 1068683 -> 1071630 ms (+2947 ms for this fsync)
+===== direct 4 GiB (oflag=direct)
+dd wall 2.92 s
+deltas: {"write_through_blocks": 1023, "overlay_stores": 0, "overlay_publishes": 0, "overlay_gap_seed_bytes": 0, "flush_seed_read_bytes": 1048560, "durable_upload_bytes_escalation": 4194304, "overlay_teardown_waits": 0, "active_block_ooo_runs": 1237, "extent_parks": 470, "extent_escalations": 455, "patch_ineligible_adjacent": 2418, "patch_ineligible_oversize": 2701, "fsync_calls": 1, "meta_kv_journal_entries": 1067, "write_pipeline_inflight_blocks": 0}
+fsync data_flush: 1071630 -> 1071815 ms (+185 ms)
+# The 64 GiB row (sym-scale N=1, 12:33-12:52Z): create-end -> ingest-end deltas on the manager:
+#   write_through_blocks +7517, overlay_stores +18308, overlay_publishes +8866, flush_seed_read_bytes +30.5 GiB (7286 blocks),
+#   durable_upload_bytes_escalation +30.5 GiB, overlay_teardown_waits +7275, block_lock_wait sum +643 s, fuse3-tpc CPU +1040 s,
+#   fsync data_flush 1068 s with pipeline_inflight_blocks 0 throughout; dd wall 1118 s (59 MB/s); dev/user 1.445

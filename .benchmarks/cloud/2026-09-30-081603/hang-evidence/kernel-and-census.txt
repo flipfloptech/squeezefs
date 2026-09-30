@@ -1,0 +1,10 @@
+/sys/fs/fuse/connections/50 waiting= congestion= max_bg=
+/sys/fs/fuse/connections/57 waiting= congestion= max_bg=
+--- dd stack
+
+--- fsync census line (full)
+[2026-09-30T12:35:12Z ERROR squeezefs::fuse_client] wedge census: meta_conveyor_passes=322381 meta_conveyor_queued=0 meta_conveyor_windows_inflight=0 meta_conveyor_durability_passes=322261 meta_commit_parked=0 meta_publish_parked=0 meta_journal_entries=331971 meta_checkpoints=904 pipeline_inflight_blocks=0 pipeline_admission_waits=0 reclaim_queue_bytes=0 rewrite_open_epochs=1 transport_leases_outstanding=0 transport_parked_commits=16958 transport_unparked_commits=16958 lock_ticked_reregisters=0 lane_exec_tick_rescues=238 lane_exec_task_panics=0
+[2026-09-30T12:52:27Z ERROR squeezefs::fuse_client] wedge census: meta_conveyor_passes=329490 meta_conveyor_queued=0 meta_conveyor_windows_inflight=0 meta_conveyor_durability_passes=329370 meta_commit_parked=0 meta_publish_parked=0 meta_journal_entries=347123 meta_checkpoints=1938 pipeline_inflight_blocks=0 pipeline_admission_waits=0 reclaim_queue_bytes=0 rewrite_open_epochs=0 transport_leases_outstanding=0 transport_parked_commits=16958 transport_unparked_commits=16958 lock_ticked_reregisters=0 lane_exec_tick_rescues=434 lane_exec_task_panics=0
+--- first watchdog line + the lines before the hang began
+first watchdog at 2026-09-30T12:35:12
+920

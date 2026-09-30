@@ -1,0 +1,109 @@
+[sym-rows] venue=cloud rows=tarx,shared,scale rt=60s rowdir=.benchmarks/cloud/2026-09-30-081603/sym-rows
+[sym-rows] preflight: the fleet's posture from every node's .stats
+[sym-rows] preflight: manager m0 + 7 joined writer(s) + 1 token reader — appenders_known=8
+[sym-rows] tools preflight: every row tool resolves on every node
+[sym-rows] corpus: /home/justin/tmp/sym-corpus/sym-corpus-linux-7.2.3-fs.tar (2468 entries) shipped to m0 and m60
+[sym-rows] gate 2 (sym-tarx): corpus 2468 entries; venue = joined writer m60 (34.207.236.56) extracting into a directory IT created over the REAL fabric (rtt min/avg/max/mdev = 0.152/0.172/0.195/0.012 ms), vs S0 = the manager's own extract on m0 (54.235.36.11) with the 7 joiner(s) + the reader mounted and idle; A-B-B-A; 1 extraction(s) per arm — the box's shape
+   acked-writes present (sym-tarx sym-1): 2469 entries / 47271033 bytes acked at m60 read back identical through m0
+   acked-writes present (sym-tarx local-1): 2469 entries / 47271033 bytes acked at m0 read back identical through m60
+   acked-writes present (sym-tarx local-2): 2469 entries / 47271033 bytes acked at m0 read back identical through m60
+   acked-writes present (sym-tarx sym-2): 2469 entries / 47271033 bytes acked at m60 read back identical through m0
+# row=sym-tarx
+# order=1
+# instrument=the matrix's sym legs' instruments (tar -xf the shipped corpus; tests/mdstorm.c T=4; dd bs=4M conv=fsync; python3 O_CREAT|O_EXCL creators; ls -l)
+# substrate=aws-on-demand/i4i.2xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC; one symmetric writer per node)
+# format=--symmetric cache-less (no --disk-cache-paths)
+# venue=cloud cluster=sqzbench-20260930-080952 — one symmetric writer per node; the cloud row is a THIRD substrate class, never spliced into devsub or squeeze-test medians
+# rt=60 s (the sustained window per measured phase)
+# rtt=min/avg/max/mdev = 0.152/0.172/0.195/0.012 ms (writer m60 → the manager)
+# node m0=manager host=54.235.36.11 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m60=writer host=34.207.236.56 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m61=writer host=54.236.7.114 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m62=writer host=54.167.50.244 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m63=writer host=100.53.19.22 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m64=writer host=3.94.196.102 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m65=writer host=54.226.5.24 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m66=writer host=54.92.203.52 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m1=reader host=54.235.36.11 mnt=/scratch/mnt-ro kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# ts=2026-09-30T12:17:27Z
+# cmd=tar -xf /opt/squeezefs-bench/sym-rows/corpus.tar (entries=2468) ×reps; A-B-B-A sym-1 local-1 local-2 sym-2
+== gate 2: tar -x on a JOINED WRITER node (m60) over the real fabric vs S0 = the manager's own extract (m0; joiners idle and mounted — the matrix's shape) — entries=2468 per rep; 1 extraction(s) per arm ==
+ARM        WALL/REP_S REPS  OPS_S    ENGAGEMENT
+sym-1      4.786      1     516      wire=4 xv=1 ship=3 pub=0 verbs/entry=0.0032 handovers=0
+local-1    4.135      1     597      manager-local-S0(joiners-idle-mounted)
+local-2    4.099      1     602      manager-local-S0(joiners-idle-mounted)
+sym-2      4.471      1     552      wire=0 xv=1 ship=3 pub=0 verbs/entry=0.0016 handovers=0
+gate 2: joined writer 4.63s vs manager-local 4.12s -> 1.12x of S0 (gate <= 1.10x): MISS
+both orders: sym-1 4.79 local-1 4.13 | local-2 4.10 sym-2 4.47
+[sym-rows] sym-tarx: oracle clean (fsck findings 0, C8 drift 0, the must-stay-0 set flat on every writer)
+[sym-rows] sym-tarx PUBLISHED (rows + verdict + snapshots in .benchmarks/cloud/2026-09-30-081603/sym-rows)
+[sym-rows] pilot (--size-to-rt=auto): N = 1 on the manager — 5000 creates (4 threads) + 256 MiB ingest, then a shared-dir wave by every creator; sizing the rows to fill RT=60 s
+[sym-rows] WARN: pilot: the ingest sized to RT wants 73728 MiB per writer, capped at --ingest-cap-mb=65536 (the ingest phase may read sub-RT — INVALID on the cloud venue)
+[sym-rows] pilot: create 2472.0/s, ingest 983.0 MiB/s, shared 132.9/creator/s → --files=186000 --ingest-mb=65536 shared per-creator=23250 (RT 60 s, 25 % headroom)
+# pilot(size-to-rt): create=2472.0/s ingest=983.0MiB/s shared_per_creator=132.9/s -> files=186000 ingest_mb=65536 shared_per_writer=23250
+[sym-rows] gate 3b (sym-shared-dir): 8 creator NODES × 23250 files into ONE directory held by m60 (34.207.236.56); the flip to K stripes (K derives from MINT_SPREAD = 64) on the holder's observed creator count
+   acked-writes present (sym-shared-dir): 186000 entries / 0 bytes acked at m60 read back identical through m0
+# row=sym-shared-dir
+# order=2
+# instrument=the matrix's sym legs' instruments (tar -xf the shipped corpus; tests/mdstorm.c T=4; dd bs=4M conv=fsync; python3 O_CREAT|O_EXCL creators; ls -l)
+# substrate=aws-on-demand/i4i.2xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC; one symmetric writer per node)
+# format=--symmetric cache-less (no --disk-cache-paths)
+# venue=cloud cluster=sqzbench-20260930-080952 — one symmetric writer per node; the cloud row is a THIRD substrate class, never spliced into devsub or squeeze-test medians
+# rt=60 s (the sustained window per measured phase)
+# rtt=min/avg/max/mdev = 0.152/0.172/0.195/0.012 ms (writer m60 → the manager)
+# node m0=manager host=54.235.36.11 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m60=writer host=34.207.236.56 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m61=writer host=54.236.7.114 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m62=writer host=54.167.50.244 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m63=writer host=100.53.19.22 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m64=writer host=3.94.196.102 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m65=writer host=54.226.5.24 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m66=writer host=54.92.203.52 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m1=reader host=54.235.36.11 mnt=/scratch/mnt-ro kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# ts=2026-09-30T12:23:21Z
+# cmd=python3 O_CREAT|O_EXCL creators: 8 nodes × 23250 into ONE directory held by m60
+== gate 3b: 8 creator nodes × 23250 into ONE directory (holder m60): wall 177.20 s, 1050 creates/s aggregate (RT 60 s) ==
+   flips=1 at [m60(1) ] striped_dirs(holder)=1 K_D=64 K_root=0 xv_shipped=162741 xv_served=162741 dir_stripe_ships=162728 handovers=0
+[sym-rows] sym-shared-dir: flip at the holder, 162728 stripe ships, closure shipped ≡ served (162741), 0 handovers
+[sym-rows] WARN: sym-shared-dir-ls: the reader's per-holder plane count CHANGED across the listing (planes [1] → [7]) — a first-touch plane dial inside the window (expected on a cold reader: the counters above stayed monotone, so the deltas stand)
+== sym-shared-dir-ls: cold readdir + stat of 186000 children over K_D=64 stripes (root K_root=0) on token reader m1 (54.235.36.11): 145.72 s; dlm_token_grants=186067 (law: K_D + K_root + C = 186064, + the directory itself, its parent and the reader's root) readdir_merges=231 node_cache_misses=31 token_hits=37782442 ==
+[sym-rows] sym-shared-dir-ls: 186067 tokens for K_D=64 + K_root=0 + C=186000, 0 data-leaf reads for the listing (31 misses = the poll's 31 dropped images over 29 epoch steps + ≤ K tree-0 lessee reads)
+[sym-rows] sym-shared-dir: oracle clean (fsck findings 0, C8 drift 0, the must-stay-0 set flat on every writer)
+[sym-rows] sym-shared-dir PUBLISHED (rows + snapshots in .benchmarks/cloud/2026-09-30-081603/sym-rows)
+[sym-rows] gate 3 (sym-scale): N ∈ {1 2 4 8} writer NODES each creating 186000 files (4 threads) in its OWN directory, then ingesting 65536 MiB (4 MiB blocks, conv=fsync); exactly N appenders live per row (the idle writers LEAVE — mount hook)
+# row=sym-scale
+# order=3
+# instrument=the matrix's sym legs' instruments (tar -xf the shipped corpus; tests/mdstorm.c T=4; dd bs=4M conv=fsync; python3 O_CREAT|O_EXCL creators; ls -l)
+# substrate=aws-on-demand/i4i.2xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC; one symmetric writer per node)
+# format=--symmetric cache-less (no --disk-cache-paths)
+# venue=cloud cluster=sqzbench-20260930-080952 — one symmetric writer per node; the cloud row is a THIRD substrate class, never spliced into devsub or squeeze-test medians
+# rt=60 s (the sustained window per measured phase)
+# rtt=min/avg/max/mdev = 0.152/0.172/0.195/0.012 ms (writer m60 → the manager)
+# node m0=manager host=54.235.36.11 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m60=writer host=34.207.236.56 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m61=writer host=54.236.7.114 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m62=writer host=54.167.50.244 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m63=writer host=100.53.19.22 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m64=writer host=3.94.196.102 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m65=writer host=54.226.5.24 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m66=writer host=54.92.203.52 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m1=reader host=54.235.36.11 mnt=/scratch/mnt-ro kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# ts=2026-09-30T12:31:35Z
+# cmd=mdstorm T=4 F=186000 create per writer node; dd bs=4M count=16384 conv=fsync per writer node; N ∈ {1 2 4 8}
+N    CREATE_S   RATIO    C/CPU-S   INGEST_MBS RATIO    MGR_LOAD  MGR_CPU  HANDOV   SHIPS    RPCS   VERDICT
+  unmounted /scratch/mnt on client1
+  unmounted /scratch/mnt on client2
+  unmounted /scratch/mnt on client3
+  unmounted /scratch/mnt on client4
+  unmounted /scratch/mnt on client5
+  unmounted /scratch/mnt on client6
+  unmounted /scratch/mnt on client7
+1    2337       1.00x    2653      59         1.00x    1         97%      0        0        0      MET
+   N=1 walls: create 79.6s ingest 1118.0s (RT 60 s); appenders_known=1; ingest amplification: dev_bytes=99280224256 user_bytes=68719476736 dev/user=1.445 wareq_sz=128517B write_ops=772509; block_free (row window, Σ writers): discards=0 discard_bytes=0 file_punches=0 punch_bytes=0 reclaim_skipped=0 reclaim_commands=0
+Traceback (most recent call last):
+  File "<stdin>", line 9, in <module>
+OSError: [Errno 22] Invalid argument: '/scratch/mnt-ro/scale-1790771495-n1-w0/f82165'
+[sym-rows] ERROR: exit 1 at line 314: "${sshv[@]}" "$(ssh_target "$host")" "sudo env ${envq}bash -s" <<< "$script"
+[sym-rows] ERROR: exit 1 at line 720: "${sshv[@]}" "$(ssh_target "$host")" "sudo env ${envq}bash -s" <<< "$script"
+[sym-rows] ERROR: exit 1 at line 756: "${sshv[@]}" "$(ssh_target "$host")" "sudo env ${envq}bash -s" <<< "$script"
+[sym-rows] ERROR: sym-scale N=1 m0: ACKED WRITES NOT PRESENT through m1 (54.235.36.11:/scratch/mnt-ro) — the writer saw 186001 entries / 68719476736 bytes, the read-back sees  entries /  bytes (a lost acked write, never a slow one)

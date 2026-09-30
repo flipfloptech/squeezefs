@@ -1,0 +1,14 @@
+cluster=sqzbench-20260930-080952 venue=cloud substrate=aws-on-demand/i4i.2xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC; one symmetric writer per node) format=--symmetric cache-less (no --disk-cache-paths)
+rows=tarx,shared,scale rt=60 files=40000 threads=4 ingest_mb=1024 scale_ns=1,2,4,8
+manager m0=54.235.36.11:/scratch/mnt
+writer m60=34.207.236.56:/scratch/mnt
+writer m61=54.236.7.114:/scratch/mnt
+writer m62=54.167.50.244:/scratch/mnt
+writer m63=100.53.19.22:/scratch/mnt
+writer m64=3.94.196.102:/scratch/mnt
+writer m65=54.226.5.24:/scratch/mnt
+writer m66=54.92.203.52:/scratch/mnt
+reader m1=54.235.36.11:/scratch/mnt-ro
+storage=18.212.225.246:/dev/nvme1n1,54.196.222.91:/dev/nvme1n1,54.162.172.167:/dev/nvme1n1,54.88.203.246:/dev/nvme1n1,98.94.9.244:/dev/nvme1n1,54.90.177.21:/dev/nvme1n1,184.72.135.210:/dev/nvme1n1,54.163.200.135:/dev/nvme1n1 rtt=min/avg/max/mdev = 0.152/0.172/0.195/0.012 ms mount_hook=/home/justin/Source/squeezefs/tests/cloud_bench_cluster.sh sym-hook --preset mw --symmetric --cluster-id sqzbench-20260930-080952
+repo_commit=a6babb50b957cc034e5ec77c27aed18f06c7d385
+ts=2026-09-30T12:16:29Z

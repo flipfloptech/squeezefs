@@ -1,0 +1,341 @@
+SqueezeFS version 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist
+======================================================================
+  Mount Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            13.64 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme2n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+  - [enabled] /dev/nvme8n1 (health: 1000)
+  - [enabled] /dev/nvme9n1 (health: 1000)
+  - [enabled] /dev/nvme10n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+----------------------------------------------------------------------
+Mount Options:
+  Mountpoint:          "/scratch/mnt"
+  Writeback Cache:     enabled
+  Allow Other:         enabled
+======================================================================
+[2026-09-30T12:14:28Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme3n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs] writer-scoped staging ENGAGED: client scope w_2890fda5ded34fc9.mae9dc892 (staging generation "v3:23050a363da24b178d1cb0b296a76cd7@node:2890fda5ded34fc9.mae9dc892") — staging keys carry the scope and this client's staging roots are bound to it
+[2026-09-30T12:14:28Z INFO  squeezefs::cache::gds] GPU Direct Storage: No discrete GPU environment found. GDS bypassed.
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme3n1' at path /dev/nvme3n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme4n1' at path /dev/nvme4n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme5n1' at path /dev/nvme5n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme6n1' at path /dev/nvme6n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme7n1' at path /dev/nvme7n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme8n1' at path /dev/nvme8n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme8n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme9n1' at path /dev/nvme9n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme9n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs] Registering data volume 'nvme10n1' at path /dev/nvme10n1 (state active)
+[2026-09-30T12:14:28Z INFO  squeezefs::nvme_dev] data volume /dev/nvme10n1: write_cache=write-through (durability barrier: io_uring Fsync/DATASYNC per device, coalesced)
+[2026-09-30T12:14:28Z INFO  squeezefs::meta_backend::kv::backend::joined] meta volume /dev/nvme2n1: joined-appender open — the manager is on another host
+[2026-09-30T12:14:28Z WARN  squeezefs::data_custody] data-plane WERO: REGISTERED as a co-writer under the standing hold on 1 namespace(s), key 0x38950fa195c7a64e — this node may write, and the authority's preempt of this key is what fences it (DLM S9 admission rung 5)
+[2026-09-30T12:14:28Z INFO  squeezefs::meta_backend::kv::backend::joined] meta volume /dev/nvme2n1: joined appender's rung 4 on the METADATA namespace — REGISTERED under the manager's rtype-3 hold (holder key 0x38950fa195c7a64e, our key 0x38950fa195c7a64e)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: appender 3 joined over the wire (mount slot 0xae9dc892, term 1) — its ring stands at head 42232 with an empty window
+[2026-09-30T12:14:29Z INFO  squeezefs::dlm] fencing: durable writer term 1 adopted (was 0); every token this process mints now dominates every earlier era's (spec §6.7 decision 4)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::backend::joined] meta volume /dev/nvme2n1: joined appender 3 ARMED — 64 slot(s) leased (0 re-adopted, 64 rotor), M = 64, manager 172.31.30.43:45999
+[2026-09-30T12:14:29Z WARN  squeezefs::meta_backend::kv::backend::joined] meta volume /dev/nvme2n1: mounted as a JOINED symmetric appender 3 (manager at 172.31.30.43:45999, fresh join, remote: a registrant under the manager's hold) — no writer_claim, no reservation of its own; its ring, page and slot trees are its own, tree 0 and the manager's trees a projection. Guarantee class: joined-appender
+[2026-09-30T12:14:29Z INFO  squeezefs] meta volume /dev/nvme2n1: format=3 ledger_seq=10 replay_entries=3 replay_dropped_torn=0 replay_ms=114 free_extents=7152186 next_ino=2 meta_volume_atomicity=cow-checksummed meta_volume_atomicity_physical=unknown writer_guard_mode=joined-appender
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] Dynamic reclaim concurrency limit configured: 8
+[2026-09-30T12:14:29Z INFO  squeezefs::routing] shared-block index armed (symmetric PR 7): 0 SHARED mark(s) seeded, the terminal-free gate installed; the holder's untracked-free ladder installed (PR 13)
+[2026-09-30T12:14:29Z INFO  squeezefs] joined-appender mount: block-ownership recovery skipped entirely (this mount allocates nothing outside a granted lane and frees nothing locally; the walk's free-completing arm must never run on a snapshot view)
+[2026-09-30T12:14:29Z INFO  squeezefs] writer mount: job fabric, job wire and the frag-gauge worker are NOT armed (maintenance coordination is the slot-0 volume owner's; this mount cannot write their durable records)
+[2026-09-30T12:14:29Z INFO  squeezefs::membership] membership member 'node_2890fda5ded34fc9.mae9dc892' (writer) holds lease epoch 3 in term 1: owner deadline 45000 ms, MY deadline 42956 ms (T_owner − 2·skew_max − D_purge, anchored on my send instant), renewing every 10000 ms
+[2026-09-30T12:14:29Z INFO  squeezefs::membership] membership MEMBER armed: writer 'node_2890fda5ded34fc9.mae9dc892' holds a lease from owner 'd19e96fb-aded-4008-b8b3-22d391219083' at 172.31.30.43:46443 — visible in `squeezefs clients` with ZERO metadata writes, and the same channel §6.8 item 3's freed-offset acknowledgements ride (DLM S6)
+[2026-09-30T12:14:29Z WARN  squeezefs::data_custody] data-plane WERO: REGISTERED as a co-writer under the standing hold on 8 namespace(s), key 0x38950fa195c7a64e — this node may write, and the authority's preempt of this key is what fences it (DLM S9 admission rung 5)
+[2026-09-30T12:14:29Z INFO  squeezefs::data_grant] write-custody authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' armed in era 1 (superseding 0): client lease TTL 45s, member deadline T_self 42.955s, renewal cadence 10s, grace 45s. Only CUSTODY travels here — a co-writer's bytes go straight to the device (DLM S9, spec §6.9)
+[2026-09-30T12:14:29Z INFO  squeezefs::multi_writer] read-token verbs served on the S8 listener for 1 volume(s) (design-symmetric-metadata §5.7)
+[2026-09-30T12:14:29Z INFO  squeezefs::cluster_wire] cluster wire: listener 172.31.17.58:45999 (plaintext) — thread-per-connection, max 128 connections, 8192 B pre-authn frame cap, handshake deadline 10s, challenge freshness 30s; every admitted frame carries a session MAC derived from the shared volume's job:enroll secret
+[2026-09-30T12:14:29Z WARN  squeezefs::meta_ship::owners] metadata function shipping ARMED (DLM S8): 1 of 1 volumes owned locally, 0 shipped to 0 peer(s) []; 65536 slots home locally. Metadata verbs on a foreign volume now travel to its owner; the DATA plane still refuses foreign-home custody loud (S9 ships that half)
+[2026-09-30T12:14:29Z WARN  squeezefs::multi_writer] WRITER PLANES ARMED on 172.31.17.58:45999: era 1, custody authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae', data-plane fence class pr, 1 metadata volume(s). Peers may now acquire write custody here and DMA directly to the shared namespaces — only custody travels, never data (spec §6.9 S9)
+[2026-09-30T12:14:29Z WARN  squeezefs::sym_join] SYMMETRIC WRITER JOINED as a NON-MANAGER appender (design-symmetric-metadata §7.3, PR 12b): rungs ["declaration", "bits", "membership", "registrant", "join_appender", "acquire_slots", "planes"]; 8 data namespace(s) registered; serving on 172.31.17.58:45999
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme3n1' (0xad7b1d37b0829b08, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme10n1' (0xdcae0614fe6cb488, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme5n1' (0x661e45b9c45ba8c4, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme6n1' (0x9dd2127c29a5e9c2, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme8n1' (0x2e128587d82a70b1, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme7n1' (0xd2109978bd6043e1, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme4n1' (0xc5e11286df218556, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs::meta_backend::kv::alloc_lease] joined allocation arm: data volume 'nvme9n1' (0x91fab8373ab74873, 447034 block(s)) mints from ranged block grants of the holder's venue at 172.31.30.43:45999; its terminal frees ship there (both follow the holder across a failover)
+[2026-09-30T12:14:29Z INFO  squeezefs] symmetric metadata (joined appender): 8 data volume allocator(s) mint from the manager's ranged block grants at 172.31.30.43:45999
+[2026-09-30T12:14:29Z INFO  squeezefs::data_grant] symmetric PR 9: write custody by the SLOT HOLDER armed for 'node_2890fda5ded34fc9.mae9dc892' — a foreign file's custody is acquired from the appender leasing its slot (tree 0 + SlotHolderCache), the grant carrying the file's records; own files stay local
+Mounting Squeezefs at "/scratch/mnt"...
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] Transport payload-buffer cap: 5534 MiB (memory budget 44278 MiB)
+[2026-09-30T12:14:29Z WARN  squeezefs::ipc_host] SQUEEZEFS_IPC_ALLOW_DEV is set — the KD-7 build-commit skew gate is RELAXED for this mount (degenerate `unknown`/`-dirty` identities will be admitted, counted in ipc_binds_dev_override). Dev boxes only: a mismatched daemon/shim pair is undefined behavior.
+[2026-09-30T12:14:29Z INFO  squeezefs::ipc_host] ipc host: path ctl socket at /run/squeezefs/sqz-il0-3092-bda61835.sock
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] IPC session host armed (socket sqz-il0-3092-bda61835, session shm cap 5534 MiB)
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] SqueezeFS version 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist initializing mount
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Mounting squeezefs at "/scratch/mnt"...
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Metadata connection active.
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] device-overlay armed: transport streaming holds enabled (SQUEEZEFS_DEVICE_OVERLAY)
+[92mOK[0m Squeezefs is ready at "/scratch/mnt"
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] IPC session host: mount st_dev resolved (56)
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] FUSE Daemon: Initialized Squeezefs Filesystem mount (version 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist).
+squeezefs: mount ready (version 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist, exe hint: rebuild target/release and reinstall)
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] FUSE kernel protocol 7.45 (init flags 0x5ff73fffffb): FOPEN_NOFLUSH advertised + honored on non-writeback opens (kernel ≥ 7.35) (D2.a; under writeback cache the elision switch is the clean-FLUSH ENOSYS latch — uapi: NOFLUSH applies 'unless FUSE_WRITEBACK_CACHE'); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+squeezefs: FUSE kernel 7.45 — FOPEN_NOFLUSH advertised (wb-cache elision = clean-FLUSH ENOSYS latch); UNKNOWN init capability bits 0x40000000000 advertised — investigate whether an atomic-open-class capability is among them (D2.d adoption follow-up)
+[2026-09-30T12:14:29Z INFO  squeezefs::fuse_client] FUSE_HANDLE_KILLPRIV_V2 negotiated (kernel killpriv probe deleted; daemon owns suid/sgid/caps clearing) for this mount
+[2026-09-30T12:14:29Z INFO  fuse3::raw::connection::fuse_over_uring] enabled kernel fuse.enable_uring=Y
+[2026-09-30T12:14:29Z WARN  fuse3::raw::connection::kmbuf] SQUEEZEFS_FUSE_ZC=1 declined: the kmbuf/zc io_uring surface is Absent on this kernel — continuing on the userspace-ent path (fuse3_zc_replies stays 0; the sqz kernel series carries the surface)
+[2026-09-30T12:14:29Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring queue-ring setup probe: SINGLE_ISSUER+DEFER_TASKRUN available
+FUSE-over-io_uring registered: queues=8 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=54 sqpoll=off drain_groups=4(width<=2)
+[2026-09-30T12:14:29Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring registered: queues=8 depth=32 payload_sz=1048576 max_write=1048576 max_pages=256 buffers=user-ents kmbuf_ops=absent fd=54 sqpoll=off drain_groups=4(width<=2)
+FUSE-over-io_uring session path armed (ready=true, queues=8)
+FUSE-over-io_uring transport armed for this session
+[2026-09-30T12:14:29Z INFO  fuse3::raw::session] FUSE-over-io_uring transport armed for this session
+FUSE-over-io_uring: classical sideband servicer armed (primary session; FORGET/INTERRUPT/resend + switchover stragglers)
+[2026-09-30T12:14:29Z INFO  squeezefs::membership] membership member 'node_2890fda5ded34fc9.mae9dc892' (writer) holds lease epoch 3 in term 1: owner deadline 45000 ms, MY deadline 42956 ms (T_owner − 2·skew_max − D_purge, anchored on my send instant), renewing every 10000 ms
+[2026-09-30T12:14:30Z INFO  squeezefs::meta_backend::kv::backend::joined] meta volume /dev/nvme2n1: joined appender 3's ring grew by one segment of 262144 bytes at 0x5cc0000 (516096 → 778240 bytes, 2 segments; derived 524288, stalled false; appender_ring_grows, joined_wire_ring_grows)
+[2026-09-30T12:18:27Z INFO  squeezefs::membership] membership member 'node_2890fda5ded34fc9.mae9dc892' (writer) holds lease epoch 4 in term 1: owner deadline 45000 ms, MY deadline 42956 ms (T_owner − 2·skew_max − D_purge, anchored on my send instant), renewing every 10000 ms
+[2026-09-30T12:18:30Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:36730 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:32Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:36744 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:32Z INFO  squeezefs::data_grant] S9: co-writer 'node_3ae6937d5089a026.mae9dc892' joined authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' in era 1 with lease epoch 1 (custody epoch 0x10000000001, registrant key 0x61da2d1c26cf76c6)
+[2026-09-30T12:18:32Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:36756 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:32Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:36758 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:32Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:36762 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:33Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:36766 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:37Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:48138 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:42Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:48142 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:47884 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::data_grant] S9: co-writer 'node_e56e47de7cb413eb.mae9dc892' joined authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' in era 1 with lease epoch 2 (custody epoch 0x10000000002, registrant key 0x460480790c731327)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:47894 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:47910 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:47922 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:36156 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:36288 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:56254 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:44804 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::data_grant] S9: co-writer 'node_cb6d8109092da502.mae9dc892' joined authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' in era 1 with lease epoch 3 (custody epoch 0x10000000003, registrant key 0xde0fc7d0d7b545d7)
+[2026-09-30T12:18:49Z INFO  squeezefs::data_grant] S9: co-writer 'node_b55dc422bb98e1fe.mae9dc892' joined authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' in era 1 with lease epoch 4 (custody epoch 0x10000000004, registrant key 0xced3f650199f8708)
+[2026-09-30T12:18:49Z INFO  squeezefs::data_grant] S9: co-writer 'node_e1d61247f95c3608.mae9dc892' joined authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' in era 1 with lease epoch 5 (custody epoch 0x10000000005, registrant key 0x4c90b84de7ec120f)
+[2026-09-30T12:18:49Z INFO  squeezefs::data_grant] S9: co-writer 'node_2823b2e37c513f57.mae9dc892' joined authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' in era 1 with lease epoch 6 (custody epoch 0x10000000006, registrant key 0xb9fa26bd006379a4)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:36168 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:56272 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:36172 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:56270 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:44812 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:36302 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:44814 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:36290 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:36180 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:36304 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:56290 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:44824 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:35266 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::data_grant] S9: co-writer 'node_10f1abcb51003fb7.mae9dc892' joined authority 'mw-7ff80400-260f-4d72-bc7b-25db881070ae' in era 1 with lease epoch 7 (custody epoch 0x10000000007, registrant key 0x7715c2da3f09359a)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:35278 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:35282 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:49Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:35286 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:47936 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:36190 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:56300 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:44832 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:36314 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:36328 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:36332 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:35296 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:56302 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:56318 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:36200 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:50Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:36212 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:44842 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:44852 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:47944 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:47958 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:35298 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:51Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:35310 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:59Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:43226 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:59Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' admitted from 172.31.25.189:47148 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:59Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' admitted from 172.31.24.157:42042 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:59Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' admitted from 172.31.26.45:46354 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:59Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' admitted from 172.31.31.182:40482 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:18:59Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' admitted from 172.31.22.240:43372 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:19:32Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:19:40Z INFO  squeezefs::meta_backend::kv::backend::joined] joined appender 3: ExtentGrant failed on the wire (Invalid operation: cluster wire: the coordinator closed the session) — re-dialing the manager and retrying once
+[2026-09-30T12:19:40Z WARN  squeezefs::meta_backend::kv::backend::joined] joined appender 3 RE-DIALED the manager at 172.31.30.43:45999
+[2026-09-30T12:19:49Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:19:49Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:19:49Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:19:49Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:19:49Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:19:49Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:20:17Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:20:17Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:20:17Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:20:17Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:21:54Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:35438 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:21:55Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:35454 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:22:28Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:28Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:28Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:28Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:30Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:30Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:30Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:30Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_cb6d8109092da502.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:35Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:35Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:36Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:36Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:36Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:36Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_2823b2e37c513f57.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:36Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:37Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_10f1abcb51003fb7.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:39Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:48980 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:22:39Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' admitted from 172.31.30.43:48986 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e1d61247f95c3608.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:22:45Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_b55dc422bb98e1fe.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:23:23Z INFO  squeezefs::cluster_wire] cluster wire: peer 'dee94bac-4304-4c55-9208-9cbd4fb3c4af' admitted from 172.31.30.43:47340 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:23:24Z INFO  squeezefs::cluster_wire] cluster wire: peer 'dee94bac-4304-4c55-9208-9cbd4fb3c4af' admitted from 172.31.30.43:47354 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:23:27Z INFO  squeezefs::cluster_wire] cluster wire: peer 'dee94bac-4304-4c55-9208-9cbd4fb3c4af' admitted from 172.31.30.43:47364 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:23:38Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:23:38Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:24:17Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:24:17Z WARN  squeezefs::cluster_wire] cluster wire: peer 'node_e56e47de7cb413eb.mae9dc892' sent no frame within 60s — closing the idle session
+[2026-09-30T12:25:01Z WARN  squeezefs::cluster_wire] cluster wire: peer 'dee94bac-4304-4c55-9208-9cbd4fb3c4af' sent no frame within 60s — closing the idle session
+[2026-09-30T12:25:01Z WARN  squeezefs::cluster_wire] cluster wire: peer 'dee94bac-4304-4c55-9208-9cbd4fb3c4af' sent no frame within 60s — closing the idle session
+[2026-09-30T12:25:53Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:54734 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:25:53Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:54744 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:25:53Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:54746 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:25:53Z INFO  squeezefs::cluster_wire] cluster wire: peer 'node_3ae6937d5089a026.mae9dc892' admitted from 172.31.26.170:54758 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:25:58Z INFO  squeezefs::meta_backend::kv::backend::joined] joined appender 3: ExtentGrant failed on the wire (Invalid operation: cluster wire: the coordinator closed the session) — re-dialing the manager and retrying once
+[2026-09-30T12:25:58Z WARN  squeezefs::meta_backend::kv::backend::joined] joined appender 3 RE-DIALED the manager at 172.31.30.43:45999
+[2026-09-30T12:29:41Z INFO  squeezefs::meta_backend::kv::backend::joined] joined appender 3: ExtentGrant failed on the wire (Invalid operation: cluster wire: the coordinator closed the session) — re-dialing the manager and retrying once
+[2026-09-30T12:29:41Z WARN  squeezefs::meta_backend::kv::backend::joined] joined appender 3 RE-DIALED the manager at 172.31.30.43:45999
+[2026-09-30T12:31:23Z INFO  squeezefs::cluster_wire] cluster wire: peer 'dee94bac-4304-4c55-9208-9cbd4fb3c4af' admitted from 172.31.30.43:49424 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:31:23Z INFO  squeezefs::cluster_wire] cluster wire: peer 'dee94bac-4304-4c55-9208-9cbd4fb3c4af' admitted from 172.31.30.43:49428 (plaintext, storage-trust proof, per-frame MAC)
+[2026-09-30T12:31:40Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 failed: Invalid operation: cluster wire: the coordinator closed the session — every token is dropped (fail-closed) until a round completes
+[2026-09-30T12:31:40Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection reset by peer (os error 104) (retry in 100ms)
+[2026-09-30T12:31:40Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 200ms)
+[2026-09-30T12:31:40Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 400ms)
+[2026-09-30T12:31:41Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 800ms)
+[2026-09-30T12:31:42Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 1.6s)
+[2026-09-30T12:31:43Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 3.2s)
+[2026-09-30T12:31:46Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 5s)
+[2026-09-30T12:31:47Z WARN  squeezefs::data_grant] S9: custody verb 0x202 to 172.31.26.170:45999 failed (I/O error: Connection refused (os error 111)) — reconnecting and resending (the verb is idempotent)
+[2026-09-30T12:31:47Z WARN  squeezefs::data_grant] custody renewal failed (I/O error: Connection refused (os error 111)) — retried in 10000 ms (the cadence law over the window left to T_self, strictly earlier than the authority's TTL)
+[2026-09-30T12:31:51Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 5s)
+[SIG] Received SIGTERM (or signal watcher exited); shutting down.
+[SIG] Shutdown resolved. Running shutdown logic...
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] Received shutdown signal. Force flushing memory buffers to staging...
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: Destroying mount. Force flushing all staged and memory data...
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all in-memory write buffers to local NVMe staging...
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: All in-memory write buffers flushed to local NVMe staging.
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: Force flushing all staged active blocks to NVMe-oF backend...
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: No staged active blocks to flush.
+[2026-09-30T12:31:53Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring qid=0 ent=0: disconnect CQE err=107; shutting down
+[2026-09-30T12:31:53Z INFO  fuse3::raw::connection::fuse_over_uring] FUSE-over-io_uring shutting down (fd=54)
+[2026-09-30T12:31:53Z INFO  fuse3::raw::connection::fuse_over_uring] fuse-over-uring watch: /dev/fuse revents=0x8 (abort/unmount); shutting down
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme3n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme10n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme5n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme6n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme8n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme7n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme4n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::nvme_dev] data volume /dev/nvme9n1: data plane CLOSED at dismount — the staging root is the next mount's from here and no DMA of this process is admitted again (a refused writeback unit stays staged for the successor; data_dma_dismount_refusals)
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] FUSE Daemon: Dismount clean. All write staged blocks successfully flushed to backend.
+[2026-09-30T12:31:53Z WARN  squeezefs::meta_ship::router] S8: batch to 172.31.30.43:45999 failed (Invalid operation: cluster wire: the coordinator closed the session) — reconnecting and resending the same request ids (the owner's dedup window makes the resend exactly-once)
+[2026-09-30T12:31:53Z INFO  squeezefs::fuse_client] Cleanly unmounted filesystem on exit.
+[2026-09-30T12:31:53Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 194 released by appender 3 (g 1, root 0x3580000, cursor 374, 1 extents) — flush 21068 µs, page 245 µs, tree 0 38249 µs
+[2026-09-30T12:31:53Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 195 released by appender 3 (g 1, root 0x6bc0000, cursor 374, 1 extents) — flush 18362 µs, page 221 µs, tree 0 39424 µs
+[2026-09-30T12:31:53Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 196 released by appender 3 (g 1, root 0x3cc0000, cursor 374, 1 extents) — flush 17826 µs, page 211 µs, tree 0 37929 µs
+[2026-09-30T12:31:53Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 197 released by appender 3 (g 1, root 0x10f80000, cursor 374, 1 extents) — flush 17659 µs, page 228 µs, tree 0 38739 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 198 released by appender 3 (g 1, root 0x16300000, cursor 374, 1 extents) — flush 17915 µs, page 199 µs, tree 0 36864 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 199 released by appender 3 (g 1, root 0x6700000, cursor 374, 1 extents) — flush 18450 µs, page 222 µs, tree 0 38230 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 200 released by appender 3 (g 1, root 0xf640000, cursor 374, 1 extents) — flush 18999 µs, page 209 µs, tree 0 36381 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 201 released by appender 3 (g 1, root 0x11f80000, cursor 373, 1 extents) — flush 17516 µs, page 203 µs, tree 0 36576 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 202 released by appender 3 (g 1, root 0x163c0000, cursor 373, 1 extents) — flush 17613 µs, page 209 µs, tree 0 36460 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 203 released by appender 3 (g 1, root 0x8100000, cursor 373, 1 extents) — flush 18258 µs, page 230 µs, tree 0 36911 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 204 released by appender 3 (g 1, root 0x2a80000, cursor 373, 1 extents) — flush 17570 µs, page 205 µs, tree 0 36056 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 205 released by appender 3 (g 1, root 0x8480000, cursor 373, 1 extents) — flush 18723 µs, page 222 µs, tree 0 36688 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 206 released by appender 3 (g 1, root 0x13480000, cursor 373, 1 extents) — flush 17951 µs, page 220 µs, tree 0 38139 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 207 released by appender 3 (g 1, root 0xb9c0000, cursor 373, 1 extents) — flush 18245 µs, page 196 µs, tree 0 37292 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 208 released by appender 3 (g 1, root 0x16500000, cursor 373, 1 extents) — flush 16840 µs, page 203 µs, tree 0 37614 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 209 released by appender 3 (g 1, root 0x3400000, cursor 373, 1 extents) — flush 17096 µs, page 226 µs, tree 0 36994 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 210 released by appender 3 (g 1, root 0xf3c0000, cursor 373, 1 extents) — flush 17412 µs, page 202 µs, tree 0 36474 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 211 released by appender 3 (g 1, root 0x152c0000, cursor 373, 1 extents) — flush 17491 µs, page 210 µs, tree 0 36825 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 212 released by appender 3 (g 1, root 0x8580000, cursor 373, 1 extents) — flush 17667 µs, page 198 µs, tree 0 38064 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 213 released by appender 3 (g 1, root 0x3080000, cursor 373, 1 extents) — flush 17239 µs, page 219 µs, tree 0 36389 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 214 released by appender 3 (g 1, root 0xc540000, cursor 373, 1 extents) — flush 18567 µs, page 242 µs, tree 0 38371 µs
+[2026-09-30T12:31:54Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 215 released by appender 3 (g 1, root 0x164c0000, cursor 373, 1 extents) — flush 18849 µs, page 245 µs, tree 0 38926 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 216 released by appender 3 (g 1, root 0x16580000, cursor 373, 1 extents) — flush 18277 µs, page 239 µs, tree 0 35555 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 217 released by appender 3 (g 1, root 0x6c00000, cursor 373, 1 extents) — flush 17797 µs, page 207 µs, tree 0 36196 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 218 released by appender 3 (g 1, root 0x2680000, cursor 373, 1 extents) — flush 18042 µs, page 206 µs, tree 0 35055 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 219 released by appender 3 (g 1, root 0x1e2c0000, cursor 373, 1 extents) — flush 17646 µs, page 226 µs, tree 0 35409 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 220 released by appender 3 (g 1, root 0x1e200000, cursor 373, 1 extents) — flush 17028 µs, page 197 µs, tree 0 35534 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 221 released by appender 3 (g 1, root 0x16640000, cursor 373, 1 extents) — flush 17182 µs, page 192 µs, tree 0 39325 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 222 released by appender 3 (g 1, root 0xabc0000, cursor 373, 1 extents) — flush 18479 µs, page 200 µs, tree 0 37748 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 223 released by appender 3 (g 1, root 0xf440000, cursor 373, 1 extents) — flush 17719 µs, page 177 µs, tree 0 37384 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 224 released by appender 3 (g 1, root 0xd540000, cursor 373, 1 extents) — flush 17400 µs, page 196 µs, tree 0 37535 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 225 released by appender 3 (g 1, root 0x4340000, cursor 373, 1 extents) — flush 16812 µs, page 193 µs, tree 0 35733 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 226 released by appender 3 (g 1, root 0x166c0000, cursor 373, 1 extents) — flush 18892 µs, page 195 µs, tree 0 36970 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 227 released by appender 3 (g 1, root 0x11f00000, cursor 373, 1 extents) — flush 17622 µs, page 188 µs, tree 0 36856 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 228 released by appender 3 (g 1, root 0xbbc0000, cursor 373, 1 extents) — flush 18309 µs, page 194 µs, tree 0 39881 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 229 released by appender 3 (g 1, root 0x1e300000, cursor 373, 1 extents) — flush 17901 µs, page 193 µs, tree 0 36562 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 230 released by appender 3 (g 1, root 0x1e140000, cursor 373, 1 extents) — flush 19922 µs, page 220 µs, tree 0 38020 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 231 released by appender 3 (g 1, root 0x4580000, cursor 373, 1 extents) — flush 16961 µs, page 198 µs, tree 0 36324 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 232 released by appender 3 (g 1, root 0x1e100000, cursor 373, 1 extents) — flush 16847 µs, page 190 µs, tree 0 35554 µs
+[2026-09-30T12:31:55Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 233 released by appender 3 (g 1, root 0x1e240000, cursor 373, 1 extents) — flush 17822 µs, page 205 µs, tree 0 36142 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 234 released by appender 3 (g 1, root 0x1e340000, cursor 373, 1 extents) — flush 17341 µs, page 202 µs, tree 0 35066 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 235 released by appender 3 (g 1, root 0x1d940000, cursor 373, 1 extents) — flush 17348 µs, page 185 µs, tree 0 39070 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 236 released by appender 3 (g 1, root 0x1ab00000, cursor 373, 1 extents) — flush 17012 µs, page 195 µs, tree 0 35505 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 237 released by appender 3 (g 1, root 0x6d80000, cursor 373, 1 extents) — flush 16440 µs, page 180 µs, tree 0 33941 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 238 released by appender 3 (g 1, root 0x1e280000, cursor 373, 1 extents) — flush 17137 µs, page 184 µs, tree 0 35308 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 239 released by appender 3 (g 1, root 0x94c0000, cursor 373, 1 extents) — flush 16825 µs, page 197 µs, tree 0 35107 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 240 released by appender 3 (g 1, root 0xba00000, cursor 373, 1 extents) — flush 17380 µs, page 208 µs, tree 0 34920 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 241 released by appender 3 (g 1, root 0xab80000, cursor 373, 1 extents) — flush 17243 µs, page 220 µs, tree 0 35988 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 242 released by appender 3 (g 1, root 0xf400000, cursor 373, 1 extents) — flush 17090 µs, page 197 µs, tree 0 36357 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 243 released by appender 3 (g 1, root 0xb440000, cursor 373, 1 extents) — flush 17986 µs, page 203 µs, tree 0 36730 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 244 released by appender 3 (g 1, root 0x9000000, cursor 373, 1 extents) — flush 17356 µs, page 193 µs, tree 0 36017 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 245 released by appender 3 (g 1, root 0xbb40000, cursor 373, 1 extents) — flush 18048 µs, page 212 µs, tree 0 35558 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 246 released by appender 3 (g 1, root 0x6f00000, cursor 373, 1 extents) — flush 16652 µs, page 186 µs, tree 0 34390 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 247 released by appender 3 (g 1, root 0x1e180000, cursor 373, 1 extents) — flush 16730 µs, page 190 µs, tree 0 36748 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 248 released by appender 3 (g 1, root 0x85c0000, cursor 373, 1 extents) — flush 17375 µs, page 224 µs, tree 0 36772 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 249 released by appender 3 (g 1, root 0x5d80000, cursor 373, 1 extents) — flush 16096 µs, page 189 µs, tree 0 35579 µs
+[2026-09-30T12:31:56Z WARN  squeezefs::meta_ship::token_plane] token recall channel to 172.31.26.170:45999 could not connect: I/O error: Connection refused (os error 111) (retry in 5s)
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 250 released by appender 3 (g 1, root 0xc580000, cursor 373, 1 extents) — flush 17075 µs, page 190 µs, tree 0 35953 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 251 released by appender 3 (g 1, root 0x1e380000, cursor 373, 1 extents) — flush 17124 µs, page 182 µs, tree 0 35898 µs
+[2026-09-30T12:31:56Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 252 released by appender 3 (g 1, root 0x16340000, cursor 373, 1 extents) — flush 17431 µs, page 172 µs, tree 0 37140 µs
+[2026-09-30T12:31:57Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 253 released by appender 3 (g 1, root 0x1e1c0000, cursor 373, 1 extents) — flush 16904 µs, page 195 µs, tree 0 36548 µs
+[2026-09-30T12:31:57Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 254 released by appender 3 (g 1, root 0x16440000, cursor 373, 1 extents) — flush 18947 µs, page 217 µs, tree 0 37801 µs
+[2026-09-30T12:31:57Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 255 released by appender 3 (g 1, root 0x13100000, cursor 373, 1 extents) — flush 18564 µs, page 172 µs, tree 0 37569 µs
+[2026-09-30T12:31:57Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 256 released by appender 3 (g 1, root 0xf380000, cursor 373, 1 extents) — flush 17404 µs, page 199 µs, tree 0 41277 µs
+[2026-09-30T12:31:57Z INFO  squeezefs::meta_backend::kv::backend] meta volume /dev/nvme2n1: slot 257 released by appender 3 (g 1, root 0xf280000, cursor 373, 1 extents) — flush 17673 µs, page 176 µs, tree 0 37198 µs
+[2026-09-30T12:31:57Z INFO  squeezefs::meta_backend::kv::backend::joined] meta volume /dev/nvme2n1: joined appender 3 LEFT (LeaveAppender) — its page is Free, its ring and 72 unclaimed extent(s) returned to the manager's heap
+[2026-09-30T12:31:57Z INFO  squeezefs::data_custody] data-plane WERO Registrant released on 1 namespace(s) (last reference departed)
+[2026-09-30T12:31:57Z WARN  squeezefs::data_grant] S9: custody verb 0x202 to 172.31.26.170:45999 failed (I/O error: Connection refused (os error 111)) — reconnecting and resending (the verb is idempotent)
+[2026-09-30T12:31:57Z WARN  squeezefs::data_grant] custody renewal failed (I/O error: Connection refused (os error 111)) — retried in 7633 ms (the cadence law over the window left to T_self, strictly earlier than the authority's TTL)
+[2026-09-30T12:31:59Z WARN  squeezefs::meta_ship::owners] metadata function shipping DISARMED (DLM S8): solo authority restored
+[2026-09-30T12:31:59Z INFO  squeezefs::data_custody] data-plane WERO Registrant released on 8 namespace(s) (last reference departed)
+[2026-09-30T12:31:59Z WARN  squeezefs::multi_writer] multi-writer DISARMED: solo authority restored, no custody is granted to peers, and the data-namespace WERO hold is released
+[2026-09-30T12:31:59Z INFO  squeezefs::membership] membership: member 'node_2890fda5ded34fc9.mae9dc892' left the census cleanly at disarm (no TTL wait)

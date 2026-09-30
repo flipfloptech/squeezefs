@@ -1,0 +1,714 @@
+
+[1m== assemble-sym 1/9: client kernel floor — FUSE-over-io_uring (v6.14+) on EVERY client node[0m
+client0 kernel 7.0.0-1011-aws: fuse.enable_uring present
+client1 kernel 7.0.0-1011-aws: fuse.enable_uring present
+client2 kernel 7.0.0-1011-aws: fuse.enable_uring present
+client3 kernel 7.0.0-1011-aws: fuse.enable_uring present
+client4 kernel 7.0.0-1011-aws: fuse.enable_uring present
+client5 kernel 7.0.0-1011-aws: fuse.enable_uring present
+client6 kernel 7.0.0-1011-aws: fuse.enable_uring present
+client7 kernel 7.0.0-1011-aws: fuse.enable_uring present
+
+[1m== assemble-sym 2/9: client prologue on EVERY client node — unmount + disconnect survivors (idempotency)[0m
+
+[1m== assemble-sym 3/9: node identities — /etc/machine-id DISTINCT across the client nodes (the daemon's node token is derived from it)[0m
+  client0: machine-id ec27a15bb474e658e1c0530e32af2390
+WARNING: client1: /etc/machine-id ec27a15bb474e658e1c0530e32af2390 duplicates client0's (a baked AMI's clone); regenerating with systemd-machine-id-setup
+Initializing machine ID from SMBIOS/DMI UUID.
+  client1: machine-id ec21321e9300ddc8b6674f6353a5ce13
+WARNING: client2: /etc/machine-id ec27a15bb474e658e1c0530e32af2390 duplicates client0's (a baked AMI's clone); regenerating with systemd-machine-id-setup
+Initializing machine ID from SMBIOS/DMI UUID.
+  client2: machine-id ec247d286f54d5c4405e601b662f56a2
+WARNING: client3: /etc/machine-id ec27a15bb474e658e1c0530e32af2390 duplicates client0's (a baked AMI's clone); regenerating with systemd-machine-id-setup
+Initializing machine ID from SMBIOS/DMI UUID.
+  client3: machine-id ec2258750d07feab65e2861147128529
+WARNING: client4: /etc/machine-id ec27a15bb474e658e1c0530e32af2390 duplicates client0's (a baked AMI's clone); regenerating with systemd-machine-id-setup
+Initializing machine ID from SMBIOS/DMI UUID.
+  client4: machine-id ec2544faf6c16b2778ff72bee6c1a1e7
+WARNING: client5: /etc/machine-id ec27a15bb474e658e1c0530e32af2390 duplicates client0's (a baked AMI's clone); regenerating with systemd-machine-id-setup
+Initializing machine ID from SMBIOS/DMI UUID.
+  client5: machine-id ec274c6f7d2e42b8f7db1763c82ac770
+WARNING: client6: /etc/machine-id ec27a15bb474e658e1c0530e32af2390 duplicates client0's (a baked AMI's clone); regenerating with systemd-machine-id-setup
+Initializing machine ID from SMBIOS/DMI UUID.
+  client6: machine-id ec269890ee685d60538fd6b4ba50c58b
+WARNING: client7: /etc/machine-id ec27a15bb474e658e1c0530e32af2390 duplicates client0's (a baked AMI's clone); regenerating with systemd-machine-id-setup
+Initializing machine ID from SMBIOS/DMI UUID.
+  client7: machine-id ec2d772d7405b54d6769e795a9be339c
+
+[1m== assemble-sym 4/9: host identities — every client node its OWN registrant (nvme-cli hostnqn AND hostid, each DISTINCT across the fleet)[0m
+  client0: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 hostid 0d7241e1-7e19-42f4-8685-164fbf435e75
+WARNING: client1: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 duplicates client0's; hostid 0d7241e1-7e19-42f4-8685-164fbf435e75 duplicates client0's (the PR registrant KEY) (a baked AMI's clone); regenerating both
+  client1: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec21321e-9300-ddc8-b667-4f6353a5ce13 hostid 7589eda9-11b1-4fb8-b2f0-2ece3b319c3f
+WARNING: client2: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 duplicates client0's; hostid 0d7241e1-7e19-42f4-8685-164fbf435e75 duplicates client0's (the PR registrant KEY) (a baked AMI's clone); regenerating both
+  client2: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec247d28-6f54-d5c4-405e-601b662f56a2 hostid 04f996a3-43c2-413b-86d7-5aaef4d3f390
+WARNING: client3: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 duplicates client0's; hostid 0d7241e1-7e19-42f4-8685-164fbf435e75 duplicates client0's (the PR registrant KEY) (a baked AMI's clone); regenerating both
+  client3: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec225875-0d07-feab-65e2-861147128529 hostid 1bc6c7ea-f655-4b5b-92b3-dd1defb010da
+WARNING: client4: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 duplicates client0's; hostid 0d7241e1-7e19-42f4-8685-164fbf435e75 duplicates client0's (the PR registrant KEY) (a baked AMI's clone); regenerating both
+  client4: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec2544fa-f6c1-6b27-78ff-72bee6c1a1e7 hostid 16b72781-ef44-433e-87ea-89d1b1a53b7d
+WARNING: client5: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 duplicates client0's; hostid 0d7241e1-7e19-42f4-8685-164fbf435e75 duplicates client0's (the PR registrant KEY) (a baked AMI's clone); regenerating both
+  client5: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec274c6f-7d2e-42b8-f7db-1763c82ac770 hostid 34e23cb7-236c-4034-b388-02da99d1e7a7
+WARNING: client6: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 duplicates client0's; hostid 0d7241e1-7e19-42f4-8685-164fbf435e75 duplicates client0's (the PR registrant KEY) (a baked AMI's clone); regenerating both
+  client6: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec269890-ee68-5d60-538f-d6b4ba50c58b hostid 078f61aa-ab7e-4ab7-b52c-5cdf9289b2c8
+WARNING: client7: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec27a15b-b474-e658-e1c0-530e32af2390 duplicates client0's; hostid 0d7241e1-7e19-42f4-8685-164fbf435e75 duplicates client0's (the PR registrant KEY) (a baked AMI's clone); regenerating both
+  client7: hostnqn nqn.2014-08.org.nvmexpress:uuid:ec2d772d-7405-b54d-6769-e795a9be339c hostid f44417df-2148-491b-9f22-192fe49e6d9e
+
+[1m== assemble-sym 5/9: storage nodes — instance-store share + nvmet PR assert (resv_enable=1; v6.13+ floor)[0m
+-- mds0 (13.217.200.31, fabric 172.31.29.233)
+[2026-09-30T12:13:06Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:06Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:mds0-d0 backing=/dev/nvme1n1 ns_uuid=0258818a-98ba-44e2-8ff8-7520935a92ae listeners=172.31.29.233:4420#53037 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:mds0-d0 @ 172.31.29.233
+-- oss0 (18.212.225.246, fabric 172.31.17.65)
+[2026-09-30T12:13:07Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:07Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss0-d0 backing=/dev/nvme1n1 ns_uuid=515349a7-c345-407e-89ec-35c7d6a641ac listeners=172.31.17.65:4420#53733 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss0-d0 @ 172.31.17.65
+-- oss1 (54.196.222.91, fabric 172.31.16.42)
+[2026-09-30T12:13:07Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:07Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss1-d0 backing=/dev/nvme1n1 ns_uuid=d02d41ac-ba2b-466a-aa55-4775b8a8ace7 listeners=172.31.16.42:4420#53179 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss1-d0 @ 172.31.16.42
+-- oss2 (54.162.172.167, fabric 172.31.30.42)
+[2026-09-30T12:13:08Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:08Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss2-d0 backing=/dev/nvme1n1 ns_uuid=c1a6556f-dba9-4965-bec3-452b1b9f4454 listeners=172.31.30.42:4420#53263 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss2-d0 @ 172.31.30.42
+-- oss3 (54.88.203.246, fabric 172.31.28.179)
+[2026-09-30T12:13:09Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:09Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss3-d0 backing=/dev/nvme1n1 ns_uuid=d90feaef-7797-4023-b971-46e9ba6ecfff listeners=172.31.28.179:4420#53629 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss3-d0 @ 172.31.28.179
+-- oss4 (98.94.9.244, fabric 172.31.28.112)
+[2026-09-30T12:13:09Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:09Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss4-d0 backing=/dev/nvme1n1 ns_uuid=25705f79-8404-4c8a-b9f4-7ac9a1de2215 listeners=172.31.28.112:4420#53624 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss4-d0 @ 172.31.28.112
+-- oss5 (54.90.177.21, fabric 172.31.24.83)
+[2026-09-30T12:13:10Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:10Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss5-d0 backing=/dev/nvme1n1 ns_uuid=e97f1bfe-8f8f-46dd-af35-194da2ad0011 listeners=172.31.24.83:4420#53151 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss5-d0 @ 172.31.24.83
+-- oss6 (184.72.135.210, fabric 172.31.19.0)
+[2026-09-30T12:13:11Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:11Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss6-d0 backing=/dev/nvme1n1 ns_uuid=7c253e05-8fc2-4599-9bdb-a5fb4eef155a listeners=172.31.19.0:4420#53712 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss6-d0 @ 172.31.19.0
+-- oss7 (54.163.200.135, fabric 172.31.19.115)
+[2026-09-30T12:13:12Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+[2026-09-30T12:13:12Z INFO  squeezefs::nvmeof] nvmeof share: stack=nvmet nqn=nqn.2026-07.io.squeezefs:oss7-d0 backing=/dev/nvme1n1 ns_uuid=ebae4218-903c-4f32-85fb-fdd92336b66a listeners=172.31.19.115:4420#53523 allow_hosts=0
+   shared nqn.2026-07.io.squeezefs:oss7-d0 @ 172.31.19.115
+  PR assert: 1 namespace(s) resv_enable=1 on mds0
+  PR assert: 1 namespace(s) resv_enable=1 on oss0
+  PR assert: 1 namespace(s) resv_enable=1 on oss1
+  PR assert: 1 namespace(s) resv_enable=1 on oss2
+  PR assert: 1 namespace(s) resv_enable=1 on oss3
+  PR assert: 1 namespace(s) resv_enable=1 on oss4
+  PR assert: 1 namespace(s) resv_enable=1 on oss5
+  PR assert: 1 namespace(s) resv_enable=1 on oss6
+  PR assert: 1 namespace(s) resv_enable=1 on oss7
+
+[1m== assemble-sym 6/9: client0 — single-path connect, PR verify, format --symmetric CACHE-LESS (no --disk-cache-paths: the box/local fleets' shape; the manager's node formats, nobody mounts yet)[0m
+[2026-09-30T12:13:21Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:13:21Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:13:21Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:13:21Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:13:21Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:13:22Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:13:22Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:13:22Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:13:22Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+format (CACHE-LESS): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1 --force --symmetric
+Total physical data volume capacity: 13.64 TiB
+[2026-09-30T12:13:22Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Meta routing: derived virtual width W = 65536 over 1 volume(s), mint spread 64 slots/volume — grow any time with `volume add-meta` / `migrate-meta-slot` (no planning knob; pre-dynamic-routing binaries refuse this set).
+Note: --symmetric is the default since the symmetric flip (PR 14) — the flag is accepted and has no effect.
+Symmetric forest (the default): stamping the nine multi-writer format bits (7,8,9,10,11,12,13,14,15) and the forest bit (17) on every metadata volume — one act (KD-MW-1, KD-SYM-12): one tree per routing slot, a control tree and an appender directory; every RW mount is an equal metadata authority. Pre-symmetric binaries refuse this set loud; there is no downgrade verb (opt out at format with --single-writer).
+[2026-09-30T12:13:22Z INFO  squeezefs::uring_fs] metadata device /dev/nvme2n1: O_DIRECT (grain 512 B, buffer alignment 512 B) — shared-LUN coherent metadata I/O (design-symmetric-metadata §5.12)
+SqueezeFS version 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist
+======================================================================
+  Format Configuration Summary
+----------------------------------------------------------------------
+  Volume Name:         squeezefs
+  Capacity:            13.64 TiB
+  Block Size:          4.00 MiB
+  Compression:         none
+  Encryption:          none
+----------------------------------------------------------------------
+Metadata Volumes:
+  - [enabled] /dev/nvme2n1 (health: 1000)
+Data Volumes:
+  - [enabled] /dev/nvme3n1 (health: 1000)
+  - [enabled] /dev/nvme4n1 (health: 1000)
+  - [enabled] /dev/nvme5n1 (health: 1000)
+  - [enabled] /dev/nvme6n1 (health: 1000)
+  - [enabled] /dev/nvme7n1 (health: 1000)
+  - [enabled] /dev/nvme8n1 (health: 1000)
+  - [enabled] /dev/nvme9n1 (health: 1000)
+  - [enabled] /dev/nvme10n1 (health: 1000)
+----------------------------------------------------------------------
+Cache/Staging:
+  Memory Cache Size:   1GB
+  Disk Cache Size:     10GB
+  Staging Paths:       none (cache-less)
+======================================================================
+Format complete.
+[2026-09-30T12:13:22Z INFO  squeezefs] Successfully formatted (v3) and recorded config on metadata volume.
+
+[1m== assemble-sym 7/9: client1 client2 client3 client4 client5 client6 client7 — single-path connect + PR verify (no format: a joining node)[0m
+-- client1
+[2026-09-30T12:13:29Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:13:29Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:13:30Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:13:30Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:13:30Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:13:30Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:13:30Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:13:30Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:13:30Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+connected (no format — a joining node): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1
+-- client2
+[2026-09-30T12:13:38Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:13:38Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:13:38Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:13:38Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:13:38Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:13:38Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:13:39Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:13:39Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:13:39Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+connected (no format — a joining node): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1
+-- client3
+[2026-09-30T12:13:46Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:13:46Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:13:46Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:13:46Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:13:47Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:13:47Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:13:47Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:13:47Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:13:47Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+connected (no format — a joining node): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1
+-- client4
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:13:55Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:13:56Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+connected (no format — a joining node): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1
+-- client5
+[2026-09-30T12:14:03Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:14:03Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:14:03Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:14:03Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:14:03Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:14:03Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:14:04Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:14:04Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:14:04Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+connected (no format — a joining node): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1
+-- client6
+[2026-09-30T12:14:11Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:14:11Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:14:11Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:14:11Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:14:11Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:14:11Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:14:12Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:14:12Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:14:12Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+connected (no format — a joining node): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1
+-- client7
+[2026-09-30T12:14:19Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.29.233:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme2n1
+  nqn.2026-07.io.squeezefs:mds0-d0 -> /dev/nvme2n1
+[2026-09-30T12:14:19Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.17.65:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme3n1
+[2026-09-30T12:14:19Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.16.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme4n1
+[2026-09-30T12:14:20Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.30.42:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme5n1
+[2026-09-30T12:14:20Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.179:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme6n1
+[2026-09-30T12:14:20Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.28.112:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme7n1
+[2026-09-30T12:14:20Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.24.83:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme8n1
+[2026-09-30T12:14:20Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.0:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme9n1
+[2026-09-30T12:14:20Z INFO  squeezefs::cluster_wire] RLIMIT_NOFILE soft raised 1024 → 524288 (the fd budget the listener caps derive from)
+Connecting to NVMe-oF target at 172.31.19.115:4420...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+Connection successful!
+Attached Remote Disk: /dev/nvme10n1
+  nqn.2026-07.io.squeezefs:oss0-d0 -> /dev/nvme3n1
+  nqn.2026-07.io.squeezefs:oss1-d0 -> /dev/nvme4n1
+  nqn.2026-07.io.squeezefs:oss2-d0 -> /dev/nvme5n1
+  nqn.2026-07.io.squeezefs:oss3-d0 -> /dev/nvme6n1
+  nqn.2026-07.io.squeezefs:oss4-d0 -> /dev/nvme7n1
+  nqn.2026-07.io.squeezefs:oss5-d0 -> /dev/nvme8n1
+  nqn.2026-07.io.squeezefs:oss6-d0 -> /dev/nvme9n1
+  nqn.2026-07.io.squeezefs:oss7-d0 -> /dev/nvme10n1
+PR verify: resv-report OK on all 8 data namespaces
+connected (no format — a joining node): sqmeta:///dev/nvme2n1 sqdata:///dev/nvme3n1,/dev/nvme4n1,/dev/nvme5n1,/dev/nvme6n1,/dev/nvme7n1,/dev/nvme8n1,/dev/nvme9n1,/dev/nvme10n1
+
+[1m== assemble-sym 8/9: mount the symmetric fleet — the MANAGER on client0, then a JOINED writer per node (client1 client2 client3 client4 client5 client6 client7), then + a token reader on client0[0m
+MANAGER_ENDPOINT 172.31.30.43:45999
+  manager up at /scratch/mnt (posture writer, lease held, WERO held, membership owner, serving on 172.31.30.43:45999)
+  joined writer up at /scratch/mnt on client1 (appender 1, manager_lease=peer:0xe56e47de7cb413eb, 64 slot(s), registrant=registrant, serving on 172.31.26.170:45999)
+  joined writer up at /scratch/mnt on client2 (appender 2, manager_lease=peer:0xe56e47de7cb413eb, 64 slot(s), registrant=registrant, serving on 172.31.22.240:45999)
+  joined writer up at /scratch/mnt on client3 (appender 3, manager_lease=peer:0xe56e47de7cb413eb, 64 slot(s), registrant=registrant, serving on 172.31.17.58:45999)
+  joined writer up at /scratch/mnt on client4 (appender 4, manager_lease=peer:0xe56e47de7cb413eb, 64 slot(s), registrant=registrant, serving on 172.31.26.45:45999)
+  joined writer up at /scratch/mnt on client5 (appender 5, manager_lease=peer:0xe56e47de7cb413eb, 64 slot(s), registrant=registrant, serving on 172.31.31.182:45999)
+  joined writer up at /scratch/mnt on client6 (appender 6, manager_lease=peer:0xe56e47de7cb413eb, 64 slot(s), registrant=registrant, serving on 172.31.24.157:45999)
+  joined writer up at /scratch/mnt on client7 (appender 7, manager_lease=peer:0xe56e47de7cb413eb, 64 slot(s), registrant=registrant, serving on 172.31.25.189:45999)
+  token reader up at /scratch/mnt-ro (reader_staleness_bound_ms=0)
+  fleet gates: appenders_known=8 membership_members=8 membership_writers=7 membership_readers=1
+
+[1m== assemble-sym 8b/9: the device's registrant count — nvme resv-report -e on every namespace of the set reads 8 distinct Host IDs (the manager + 7 joined writers)[0m
+  /dev/nvme2n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme3n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme4n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme5n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme6n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme7n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme8n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme9n1: 8 distinct registrant Host IDs (the device's report)
+  /dev/nvme10n1: 8 distinct registrant Host IDs (the device's report)
+  manager pr_registrants_per_namespace (the daemon's REGCTL read, 10 s heartbeat on the metadata namespaces): 
+
+[1m== assemble-sym 9/9: build_commit verification ritual on every node[0m
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit OK: /scratch/mnt-ro -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 2 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 1 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 1 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 1 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 1 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 1 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 1 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+build_commit OK: /scratch/mnt -> 7d1ae20b92897b533de1622cee997dce3a78ca7e
+build_commit ritual: 1 mount(s) verified against 'squeezefs 1.3.0 (7d1ae20b9289 / 7d1ae20b92897b533de1622cee997dce3a78ca7e, tag stable-2026.09.5) built 2026-09-30T01:35:22Z profile dist'
+
+Symmetric fleet assembled: manager client0:/scratch/mnt (serving on 172.31.30.43:45999) + 7 joined writer(s) on client1 client2 client3 client4 client5 client6 client7 + token reader client0:/scratch/mnt-ro.
+Next: PRESET=mw N_CLIENT=8 tests/cloud_bench_cluster.sh bench-sym
+tests/cloud_bench_cluster.sh: line 2438: syntax error near unexpected token `)'

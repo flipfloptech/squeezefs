@@ -1,0 +1,21 @@
+# row=sym-scale
+# order=3
+# instrument=the matrix's sym legs' instruments (tar -xf the shipped corpus; tests/mdstorm.c T=4; dd bs=4M conv=fsync; python3 O_CREAT|O_EXCL creators; ls -l)
+# substrate=aws-on-demand/i4i.2xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC; one symmetric writer per node)
+# format=--symmetric cache-less (no --disk-cache-paths)
+# venue=cloud cluster=sqzbench-20260930-080952 — one symmetric writer per node; the cloud row is a THIRD substrate class, never spliced into devsub or squeeze-test medians
+# rt=60 s (the sustained window per measured phase)
+# rtt=min/avg/max/mdev = 0.152/0.172/0.195/0.012 ms (writer m60 → the manager)
+# node m0=manager host=54.235.36.11 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m60=writer host=34.207.236.56 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m61=writer host=54.236.7.114 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m62=writer host=54.167.50.244 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m63=writer host=100.53.19.22 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m64=writer host=3.94.196.102 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m65=writer host=54.226.5.24 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m66=writer host=54.92.203.52 mnt=/scratch/mnt kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# node m1=reader host=54.235.36.11 mnt=/scratch/mnt-ro kernel=7.0.0-1011-aws build=7d1ae20b92897b533de1622cee997dce3a78ca7e
+# ts=2026-09-30T12:31:35Z
+# cmd=mdstorm T=4 F=186000 create per writer node; dd bs=4M count=16384 conv=fsync per writer node; N ∈ {1 2 4 8}
+N    CREATE_S   RATIO    C/CPU-S   INGEST_MBS RATIO    MGR_LOAD  MGR_CPU  HANDOV   SHIPS    RPCS   VERDICT
+1    2337       1.00x    2653      59         1.00x    1         97%      0        0        0      MET

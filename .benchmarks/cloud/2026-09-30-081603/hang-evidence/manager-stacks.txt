@@ -1,0 +1,904 @@
+903 /tmp/manager-stacks.txt
+0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 74 (Thread 0x7f14addfe6c0 (LWP 3020) "squeezefs-uring"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a99812d0745 in crossbeam_channel::context::Context::wait_until (deadline=..., self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:162
+#6  crossbeam_channel::flavors::array::{impl#1}::recv::{closure#1}<squeezefs::uring_fs::FsReq> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:432
+#7  0x00005a99812c3d29 in crossbeam_channel::context::{impl#0}::with::{closure#0}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:52
+#8  crossbeam_channel::context::{impl#0}::with::{closure#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cell=0x7f14addfe620) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:60
+#9  std::thread::local::LocalKey<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>>::try_with<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>, crossbeam_channel::context::{impl#0}::with::{closure_env#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()>, ()> (self=<optimized out>, f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/local.rs:463
+#10 crossbeam_channel::context::Context::with<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (f=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:56
+#11 crossbeam_channel::flavors::array::Channel<squeezefs::uring_fs::FsReq>::recv<squeezefs::uring_fs::FsReq> (self=0x7f14aea09a00, deadline=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:421
+
+Thread 73 (Thread 0x7f14adbfd6c0 (LWP 3021) "squeezefs-uring"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a99812d0745 in crossbeam_channel::context::Context::wait_until (deadline=..., self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:162
+#6  crossbeam_channel::flavors::array::{impl#1}::recv::{closure#1}<squeezefs::uring_fs::FsReq> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:432
+#7  0x00005a99812c3d29 in crossbeam_channel::context::{impl#0}::with::{closure#0}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:52
+#8  crossbeam_channel::context::{impl#0}::with::{closure#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cell=0x7f14adbfd620) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:60
+#9  std::thread::local::LocalKey<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>>::try_with<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>, crossbeam_channel::context::{impl#0}::with::{closure_env#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()>, ()> (self=<optimized out>, f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/local.rs:463
+#10 crossbeam_channel::context::Context::with<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (f=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:56
+#11 crossbeam_channel::flavors::array::Channel<squeezefs::uring_fs::FsReq>::recv<squeezefs::uring_fs::FsReq> (self=0x7f14aea09a00, deadline=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:421
+
+Thread 72 (Thread 0x7f14ad9fc6c0 (LWP 3022) "squeezefs-uring"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a99812d0745 in crossbeam_channel::context::Context::wait_until (deadline=..., self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:162
+#6  crossbeam_channel::flavors::array::{impl#1}::recv::{closure#1}<squeezefs::uring_fs::FsReq> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:432
+#7  0x00005a99812c3d29 in crossbeam_channel::context::{impl#0}::with::{closure#0}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:52
+#8  crossbeam_channel::context::{impl#0}::with::{closure#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cell=0x7f14ad9fc620) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:60
+#9  std::thread::local::LocalKey<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>>::try_with<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>, crossbeam_channel::context::{impl#0}::with::{closure_env#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()>, ()> (self=<optimized out>, f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/local.rs:463
+#10 crossbeam_channel::context::Context::with<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (f=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:56
+#11 crossbeam_channel::flavors::array::Channel<squeezefs::uring_fs::FsReq>::recv<squeezefs::uring_fs::FsReq> (self=0x7f14aea09a00, deadline=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:421
+
+Thread 71 (Thread 0x7f14ad7fb6c0 (LWP 3023) "squeezefs-uring"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a99812d0745 in crossbeam_channel::context::Context::wait_until (deadline=..., self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:162
+#6  crossbeam_channel::flavors::array::{impl#1}::recv::{closure#1}<squeezefs::uring_fs::FsReq> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:432
+#7  0x00005a99812c3d29 in crossbeam_channel::context::{impl#0}::with::{closure#0}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cx=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:52
+#8  crossbeam_channel::context::{impl#0}::with::{closure#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (cell=0x7f14ad7fb620) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:60
+#9  std::thread::local::LocalKey<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>>::try_with<core::cell::Cell<core::option::Option<crossbeam_channel::context::Context>>, crossbeam_channel::context::{impl#0}::with::{closure_env#1}<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()>, ()> (self=<optimized out>, f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/local.rs:463
+#10 crossbeam_channel::context::Context::with<crossbeam_channel::flavors::array::{impl#1}::recv::{closure_env#1}<squeezefs::uring_fs::FsReq>, ()> (f=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/context.rs:56
+#11 crossbeam_channel::flavors::array::Channel<squeezefs::uring_fs::FsReq>::recv<squeezefs::uring_fs::FsReq> (self=0x7f14aea09a00, deadline=...) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crossbeam-channel-0.5.15/src/flavors/array.rs:421
+
+Thread 70 (Thread 0x7f14ad7fb6c0 (LWP 3030) "iou-wrk-3023"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 69 (Thread 0x7f14ad9fc6c0 (LWP 3031) "iou-wrk-3022"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 68 (Thread 0x7f149ccff6c0 (LWP 3032) "sqz-nvme0m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=15, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c160, wake=0x7f14aeb0b0b0) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f149ccfde50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 67 (Thread 0x7f149c5ff6c0 (LWP 3034) "sqz-meta0m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14aea23338, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14aea23330, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#7  0x00005a99812d2137 in squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure#0} () at src/meta_exec.rs:116
+#8  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99812d2095 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 66 (Thread 0x7f149c3fe6c0 (LWP 3035) "sqz-meta1m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14aea23378, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14aea23370, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#7  0x00005a99812d2137 in squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure#0} () at src/meta_exec.rs:116
+#8  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99812d2095 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 65 (Thread 0x7f14947ff6c0 (LWP 3036) "sqz-timerm2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce0daf in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_time::Registry> (self=<optimized out>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_time::service_loop (svc=0x7f1494c02000) at crates/squeezefs-ipc/src/sqz_time.rs:151
+#6  squeezefs_ipc::sqz_time::service::{closure#0}::{closure#0} () at crates/squeezefs-ipc/src/sqz_time.rs:105
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs_ipc::sqz_time::service::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce409e in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs_ipc::sqz_time::service::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs_ipc::sqz_time::service::{closure#0}::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs_ipc::sqz_time::service::{closure#0}::{closure_env#0}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs_ipc::sqz_time::service::{closure#0}::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 64 (Thread 0x7f1487dff6c0 (LWP 3037) "squeezefs"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a99819357b4 in squeezefs_ipc::sqz_blocking::block_on<squeezefs::routing::{impl#30}::new::{closure#0}::{async_block_env#0}> (fut=...) at crates/squeezefs-ipc/src/sqz_blocking.rs:93
+#6  squeezefs::routing::{impl#30}::new::{closure#0} () at src/routing.rs:23906
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::routing::{impl#30}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b80905 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::routing::{impl#30}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::routing::{impl#30}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::routing::{impl#30}::new::{closure_env#0}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::routing::{impl#30}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 63 (Thread 0x7f1487bfe6c0 (LWP 3038) "sqz-nvme1m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=19, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c010, wake=0x7f14aea234f0) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f1487bfce50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 62 (Thread 0x7f1486fff6c0 (LWP 3039) "sqz-nvme2m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=24, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c080, wake=0x7f14aea235b0) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f1486ffde50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 61 (Thread 0x7f1486dfe6c0 (LWP 3041) "sqz-nvme3m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=28, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c0f0, wake=0x7f14aea23790) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f1486dfce50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 60 (Thread 0x7f14867ff6c0 (LWP 3042) "sqz-nvme4m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=29, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c240, wake=0x7f14aea23990) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f14867fde50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 59 (Thread 0x7f1485bff6c0 (LWP 3043) "sqz-nvme5m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=33, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c2b0, wake=0x7f14aea23b70) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f1485bfde50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 58 (Thread 0x7f14855ff6c0 (LWP 3045) "sqz-nvme6m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=36, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c320, wake=0x7f14aeb0b1b0) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f14855fde50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 57 (Thread 0x7f14853fe6c0 (LWP 3047) "sqz-nvme7m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a99818f62d0 in io_uring::sys::io_uring_enter (fd=37, min_complete=1, flags=0, arg=0x0, size=128, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=1, flag=0, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (want=1, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:137
+#4  io_uring::IoUring<io_uring::squeue::Entry, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry, io_uring::cqueue::Entry> (self=<error reading variable: Cannot access memory at address 0x0>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  squeezefs::nvme_dev::worker_thread_loop (device_path=..., rx=..., wm=0x7f14aea9c390, wake=0x7f14aeb0b3f0) at src/nvme_dev.rs:1308
+#6  0x00005a99818f2f0c in squeezefs::nvme_dev::{impl#6}::new::{closure#0} () at src/nvme_dev.rs:624
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b12b12 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>, ()> (data=0x7f14853fce50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::nvme_dev::{impl#6}::new::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 56 (Thread 0x7f14addfe6c0 (LWP 3083) "iou-wrk-3020"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 55 (Thread 0x7f145bbff6c0 (LWP 3084) "sqz-blk1"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f14ac4171d0) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 54 (Thread 0x7f145b3ff6c0 (LWP 3085) "sqz-jrnl0m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981607c27 in io_uring::sys::io_uring_enter (min_complete=1, flags=1530910672, arg=0x7f145b3fd7d0, size=24, fd=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<io_uring::sys::io_uring_getevents_arg> (min_complete=1, flag=1530910672, arg=..., self=<optimized out>, to_submit=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_with_args (want=1, args=0x7f145b3fd7d0, self=<optimized out>) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/submit.rs:162
+#4  squeezefs::uring_fs::OwnedReactor::park (self=<optimized out>, tick=...) at src/uring_fs.rs:2785
+#5  squeezefs::meta_backend::kv::journal_lane::{impl#0}::park::{closure#0} (r=0x7f145b3fe800) at src/meta_backend/kv/journal_lane.rs:87
+#6  std::thread::local::LocalKey<core::cell::RefCell<core::option::Option<squeezefs::uring_fs::OwnedReactor>>>::try_with<core::cell::RefCell<core::option::Option<squeezefs::uring_fs::OwnedReactor>>, squeezefs::meta_backend::kv::journal_lane::{impl#0}::park::{closure_env#0}, bool> (self=<optimized out>, f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/local.rs:463
+#7  std::thread::local::LocalKey<core::cell::RefCell<core::option::Option<squeezefs::uring_fs::OwnedReactor>>>::with<core::cell::RefCell<core::option::Option<squeezefs::uring_fs::OwnedReactor>>, squeezefs::meta_backend::kv::journal_lane::{impl#0}::park::{closure_env#0}, bool> (self=<optimized out>, f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/local.rs:427
+#8  squeezefs::meta_backend::kv::journal_lane::{impl#0}::park (self=<optimized out>, tick=...) at src/meta_backend/kv/journal_lane.rs:83
+#9  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#10 0x00005a99816066c4 in squeezefs::meta_backend::kv::journal_lane::{impl#1}::spawn::{closure#0} () at src/meta_backend/kv/journal_lane.rs:148
+#11 std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::meta_backend::kv::journal_lane::{impl#1}::spawn::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+
+Thread 53 (Thread 0x7f145b3ff6c0 (LWP 3086) "iou-wrk-3085"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 52 (Thread 0x7f145abff6c0 (LWP 3087) "sqz-jw-accept"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea857c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aeef7f02 in clock_nanosleep () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9980f15522 in std::sys::thread::unix::sleep::nanosleep () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/thread/unix.rs:566
+#4  std::sys::thread::unix::sleep () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/thread/unix.rs:592
+#5  std::thread::functions::sleep () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/functions.rs:293
+#6  squeezefs::job_wire::JobWireHost::accept_loop (self=..., listener=...) at src/job_wire.rs:1653
+#7  squeezefs::job_wire::{impl#11}::start::{async_fn#0}::{closure#2} () at src/job_wire.rs:1481
+#8  core::ops::function::FnOnce::call_once<squeezefs::job_wire::{impl#11}::start::{async_fn#0}::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#9  0x00005a9980a34dcd in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> (self=..., args=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2319
+#10 std::sys::backtrace::__rust_begin_short_backtrace<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#11 0x00005a9980f11571 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+
+Thread 51 (Thread 0x7f145a9fe6c0 (LWP 3088) "sqz-jw-dispatch"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a9980f1839a in squeezefs_ipc::sqz_blocking::block_on<squeezefs::job_wire::{impl#11}::dispatcher_loop::{async_fn_env#0}> (fut=...) at crates/squeezefs-ipc/src/sqz_blocking.rs:93
+#6  squeezefs::job_wire::{impl#11}::start::{async_fn#0}::{closure#3} () at src/job_wire.rs:1487
+#7  core::ops::function::FnOnce::call_once<squeezefs::job_wire::{impl#11}::start::{async_fn#0}::{closure_env#3}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#8  0x00005a9980a34dcd in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> (self=..., args=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2319
+#9  std::sys::backtrace::__rust_begin_short_backtrace<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#10 0x00005a9980f11571 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#11 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+
+Thread 50 (Thread 0x7f145a7fd6c0 (LWP 3089) "sqz-jw-sweep"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a9980f1adde in squeezefs_ipc::sqz_blocking::block_on<squeezefs::job_wire::{impl#11}::sweeper_loop::{async_fn_env#0}> (fut=...) at crates/squeezefs-ipc/src/sqz_blocking.rs:93
+#6  squeezefs::job_wire::{impl#11}::start::{async_fn#0}::{closure#4} () at src/job_wire.rs:1492
+#7  core::ops::function::FnOnce::call_once<squeezefs::job_wire::{impl#11}::start::{async_fn#0}::{closure_env#4}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#8  0x00005a9980a34dcd in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> (self=..., args=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/boxed.rs:2319
+#9  std::sys::backtrace::__rust_begin_short_backtrace<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#10 0x00005a9980f11571 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#11 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<alloc::boxed::Box<(dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global>, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+
+Thread 49 (Thread 0x7f1459dff6c0 (LWP 3090) "sqz-clw-accept"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981934430 in squeezefs::cluster_wire::wait_for_accept (tick=..., listener=<optimized out>) at src/cluster_wire.rs:1190
+#4  squeezefs::cluster_wire::RpcListener::accept_loop (self=..., listener=...) at src/cluster_wire.rs:2313
+#5  squeezefs::cluster_wire::{impl#26}::start_arm::{closure#3} () at src/cluster_wire.rs:2237
+#6  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#7  0x00005a9981a0349f in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#8  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#9  std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#10 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+#11 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359
+
+Thread 48 (Thread 0x7f1458fff6c0 (LWP 3107) "sqz-clw-accept"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981934430 in squeezefs::cluster_wire::wait_for_accept (tick=..., listener=<optimized out>) at src/cluster_wire.rs:1190
+#4  squeezefs::cluster_wire::RpcListener::accept_loop (self=..., listener=...) at src/cluster_wire.rs:2313
+#5  squeezefs::cluster_wire::{impl#26}::start_arm::{closure#3} () at src/cluster_wire.rs:2237
+#6  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#7  0x00005a9981a0349f in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#8  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#9  std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#10 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+#11 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::start_arm::{closure_env#3}, ()>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359
+
+Thread 47 (Thread 0x7f14587ff6c0 (LWP 3148) "sqz-ipc-accepm2"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef40fc2 in accept4 () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a998192e867 in squeezefs::ipc_host::IpcHost::accept_loop (self=..., on=<optimized out>) at src/ipc_host.rs:1809
+#4  0x00005a998192e7d8 in squeezefs::ipc_host::{impl#18}::spawn::{closure#3} () at src/ipc_host.rs:1487
+#5  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#3}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#6  0x00005a9981b75c05 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#3}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#7  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#3}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#8  std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#3}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#9  std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#3}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+#10 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#3}, ()>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359
+#11 std::thread::lifecycle::spawn_unchecked::{closure#1}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#3}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:68
+
+Thread 46 (Thread 0x7f14585fe6c0 (LWP 3149) "sqz-ipc-accpm2"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef40fc2 in accept4 () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a998192e867 in squeezefs::ipc_host::IpcHost::accept_loop (self=..., on=<optimized out>) at src/ipc_host.rs:1809
+#4  0x00005a998192f5fb in squeezefs::ipc_host::{impl#18}::spawn::{closure#4} () at src/ipc_host.rs:1498
+#5  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#4}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#6  0x00005a9981b75b05 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#4}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#7  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#4}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#8  std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#4}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#9  std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#4}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+#10 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#4}, ()>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359
+#11 std::thread::lifecycle::spawn_unchecked::{closure#1}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#4}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:68
+
+Thread 45 (Thread 0x7f14583fd6c0 (LWP 3150) "sqz-ipc-reapm2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d25417 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park_timeout () at library/std/src/sys/sync/thread_parking/futex.rs:75
+#3  std::thread::thread::Thread::park_timeout () at library/std/src/thread/thread.rs:132
+#4  std::thread::functions::park_timeout () at library/std/src/thread/functions.rs:600
+#5  0x00005a998192f701 in squeezefs::ipc_host::IpcHost::reap_loop (self=...) at src/ipc_host.rs:1536
+#6  squeezefs::ipc_host::{impl#18}::spawn::{closure#5} () at src/ipc_host.rs:1506
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#5}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981b75a45 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#5}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#5}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#5}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::ipc_host::{impl#18}::spawn::{closure_env#5}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 44 (Thread 0x7f1432bff6c0 (LWP 3152) "fuse3-mountm2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a9980a37e33 in fuse3::sqz_blocking::block_on<fuse3::raw::session::{impl#14}::inner_mount::{async_fn_env#0}<squeezefs::fuse_client::SqueezefsFilesystem>> (fut=<error reading variable: Cannot access memory at address 0x180>) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_blocking.rs:93
+#6  fuse3::raw::session::{impl#8}::spawn::{closure#0}<fuse3::raw::session::{impl#14}::inner_mount::{async_fn_env#0}<squeezefs::fuse_client::SqueezefsFilesystem>> () at crates/fuse3/src/raw/session.rs:460
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#8}::spawn::{closure_env#0}<fuse3::raw::session::{impl#14}::inner_mount::{async_fn_env#0}<squeezefs::fuse_client::SqueezefsFilesystem>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9980f11671 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#8}::spawn::{closure_env#0}<fuse3::raw::session::{impl#14}::inner_mount::{async_fn_env#0}<squeezefs::fuse_client::SqueezefsFilesystem>>, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#8}::spawn::{closure_env#0}<fuse3::raw::session::{impl#14}::inner_mount::{async_fn_env#0}<squeezefs::fuse_client::SqueezefsFilesystem>>, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#8}::spawn::{closure_env#0}<fuse3::raw::session::{impl#14}::inner_mount::{async_fn_env#0}<squeezefs::fuse_client::SqueezefsFilesystem>>, ()>>, ()> (data=0x7f1432bfc760) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#8}::spawn::{closure_env#0}<fuse3::raw::session::{impl#14}::inner_mount::{async_fn_env#0}<squeezefs::fuse_client::SqueezefsFilesystem>>, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 43 (Thread 0x7f14323ff6c0 (LWP 3153) "sqz-signalm2"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981945085 in squeezefs::signals::arm::{closure#1} () at src/signals.rs:88
+#4  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::signals::arm::{closure_env#1}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#5  0x00005a9981c2a76f in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::signals::arm::{closure_env#1}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#6  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::signals::arm::{closure_env#1}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#7  std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::signals::arm::{closure_env#1}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#8  std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::signals::arm::{closure_env#1}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+#9  std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::signals::arm::{closure_env#1}, ()>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359
+#10 std::thread::lifecycle::spawn_unchecked::{closure#1}<squeezefs::signals::arm::{closure_env#1}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:68
+#11 core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<squeezefs::signals::arm::{closure_env#1}, ()>, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+
+Thread 42 (Thread 0x7f1431bff6c0 (LWP 3154) "f3-ur0-1m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a998118079b in io_uring::sys::io_uring_enter (min_complete=<optimized out>, flags=<optimized out>, arg=0x0, size=128, fd=<optimized out>, to_submit=<optimized out>) at src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=<optimized out>, flag=<optimized out>, arg=..., self=<optimized out>, to_submit=<optimized out>) at src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (self=<optimized out>, want=<optimized out>) at src/submit.rs:137
+#4  0x00005a9981135867 in io_uring::IoUring<io_uring::squeue::Entry128, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry128, io_uring::cqueue::Entry> (self=0x7f1431bfd6f0, want=1) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  fuse3::raw::connection::fuse_over_uring::queue_worker (pool=..., group_idx=<optimized out>, depth=32, payload_sz=<optimized out>, commit_rx=..., wake_fd=66) at crates/fuse3/src/raw/connection/fuse_over_uring.rs:6420
+#6  0x00005a998112a317 in fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure#5} () at crates/fuse3/src/raw/connection/fuse_over_uring.rs:3170
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a998116af9b in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>, ()> (data=0x7f1431bfde40) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 41 (Thread 0x7f14319fe6c0 (LWP 3155) "f3-ur2-3m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a998118079b in io_uring::sys::io_uring_enter (min_complete=<optimized out>, flags=<optimized out>, arg=0x0, size=128, fd=<optimized out>, to_submit=<optimized out>) at src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=<optimized out>, flag=<optimized out>, arg=..., self=<optimized out>, to_submit=<optimized out>) at src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (self=<optimized out>, want=<optimized out>) at src/submit.rs:137
+#4  0x00005a9981135867 in io_uring::IoUring<io_uring::squeue::Entry128, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry128, io_uring::cqueue::Entry> (self=0x7f14319fc6f0, want=1) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  fuse3::raw::connection::fuse_over_uring::queue_worker (pool=..., group_idx=<optimized out>, depth=32, payload_sz=<optimized out>, commit_rx=..., wake_fd=67) at crates/fuse3/src/raw/connection/fuse_over_uring.rs:6420
+#6  0x00005a998112a317 in fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure#5} () at crates/fuse3/src/raw/connection/fuse_over_uring.rs:3170
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a998116af9b in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>, ()> (data=0x7f14319fce40) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 40 (Thread 0x7f14317fd6c0 (LWP 3156) "f3-ur4-5m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a998118079b in io_uring::sys::io_uring_enter (min_complete=<optimized out>, flags=<optimized out>, arg=0x0, size=128, fd=<optimized out>, to_submit=<optimized out>) at src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=<optimized out>, flag=<optimized out>, arg=..., self=<optimized out>, to_submit=<optimized out>) at src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (self=<optimized out>, want=<optimized out>) at src/submit.rs:137
+#4  0x00005a9981135867 in io_uring::IoUring<io_uring::squeue::Entry128, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry128, io_uring::cqueue::Entry> (self=0x7f14317fb6f0, want=1) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  fuse3::raw::connection::fuse_over_uring::queue_worker (pool=..., group_idx=<optimized out>, depth=32, payload_sz=<optimized out>, commit_rx=..., wake_fd=68) at crates/fuse3/src/raw/connection/fuse_over_uring.rs:6420
+#6  0x00005a998112a317 in fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure#5} () at crates/fuse3/src/raw/connection/fuse_over_uring.rs:3170
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a998116af9b in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>, ()> (data=0x7f14317fbe40) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 39 (Thread 0x7f14311ff6c0 (LWP 3157) "f3-ur6-7m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a998118079b in io_uring::sys::io_uring_enter (min_complete=<optimized out>, flags=<optimized out>, arg=0x0, size=128, fd=<optimized out>, to_submit=<optimized out>) at src/sys/mod.rs:114
+#2  io_uring::submit::Submitter::enter<libc::unix::linux_like::linux::gnu::b64::sigset_t> (min_complete=<optimized out>, flag=<optimized out>, arg=..., self=<optimized out>, to_submit=<optimized out>) at src/submit.rs:95
+#3  io_uring::submit::Submitter::submit_and_wait (self=<optimized out>, want=<optimized out>) at src/submit.rs:137
+#4  0x00005a9981135867 in io_uring::IoUring<io_uring::squeue::Entry128, io_uring::cqueue::Entry>::submit_and_wait<io_uring::squeue::Entry128, io_uring::cqueue::Entry> (self=0x7f14311fd6f0, want=1) at /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-uring-0.6.4/src/lib.rs:194
+#5  fuse3::raw::connection::fuse_over_uring::queue_worker (pool=..., group_idx=<optimized out>, depth=32, payload_sz=<optimized out>, commit_rx=..., wake_fd=69) at crates/fuse3/src/raw/connection/fuse_over_uring.rs:6420
+#6  0x00005a998112a317 in fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure#5} () at crates/fuse3/src/raw/connection/fuse_over_uring.rs:3170
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a998116af9b in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>, ()> (data=0x7f14311fde40) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#5}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 38 (Thread 0x7f14307ff6c0 (LWP 3158) "f3-ur-watchm2"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981157a73 in fuse3::raw::connection::fuse_over_uring::connection_watch (pool=...) at crates/fuse3/src/raw/connection/fuse_over_uring.rs:4592
+#4  fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure#6} () at crates/fuse3/src/raw/connection/fuse_over_uring.rs:3237
+#5  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#6}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#6  0x00005a998116b095 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#6}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#7  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#6}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#8  std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#6}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#9  std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#6}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+#10 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#6}, ()>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359
+#11 std::thread::lifecycle::spawn_unchecked::{closure#1}<fuse3::raw::connection::fuse_over_uring::{impl#19}::try_start::{closure_env#6}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:68
+
+Thread 37 (Thread 0x7f14305fe6c0 (LWP 3159) "fuse3-tpc0m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14324a6438, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14324a6430, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981121a57 in fuse3::sqz_exec::LaneExec::run (self=0x7f14305fcea0) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_exec.rs:241
+#7  fuse3::raw::session::{impl#15}::new::{closure#2} () at crates/fuse3/src/raw/session.rs:6064
+#8  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99811215ec in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>>, ()> (data=0x7f14305fce60) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 36 (Thread 0x7f14303fd6c0 (LWP 3160) "fuse3-tpc1m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14324a6498, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14324a6490, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981121a57 in fuse3::sqz_exec::LaneExec::run (self=0x7f14303fbea0) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_exec.rs:241
+#7  fuse3::raw::session::{impl#15}::new::{closure#2} () at crates/fuse3/src/raw/session.rs:6064
+#8  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99811215ec in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>>, ()> (data=0x7f14303fbe60) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 35 (Thread 0x7f13d7fff6c0 (LWP 3161) "fuse3-tpc2m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14324a64f8, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14324a64f0, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981121a57 in fuse3::sqz_exec::LaneExec::run (self=0x7f13d7ffdea0) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_exec.rs:241
+#7  fuse3::raw::session::{impl#15}::new::{closure#2} () at crates/fuse3/src/raw/session.rs:6064
+#8  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99811215ec in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>>, ()> (data=0x7f13d7ffde60) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 34 (Thread 0x7f13d7dfe6c0 (LWP 3162) "fuse3-tpc3m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14324a6558, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14324a6550, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981121a57 in fuse3::sqz_exec::LaneExec::run (self=0x7f13d7dfcea0) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_exec.rs:241
+#7  fuse3::raw::session::{impl#15}::new::{closure#2} () at crates/fuse3/src/raw/session.rs:6064
+#8  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99811215ec in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>>, ()> (data=0x7f13d7dfce60) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 33 (Thread 0x7f13d7bfd6c0 (LWP 3163) "fuse3-tpc4m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14324a6398, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14324a6390, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981121a57 in fuse3::sqz_exec::LaneExec::run (self=0x7f13d7bfbea0) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_exec.rs:241
+#7  fuse3::raw::session::{impl#15}::new::{closure#2} () at crates/fuse3/src/raw/session.rs:6064
+#8  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99811215ec in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>>, ()> (data=0x7f13d7bfbe60) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 32 (Thread 0x7f13d79fc6c0 (LWP 3164) "fuse3-tpc5m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14324a6478, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14324a6470, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981121a57 in fuse3::sqz_exec::LaneExec::run (self=0x7f13d79faea0) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_exec.rs:241
+#7  fuse3::raw::session::{impl#15}::new::{closure#2} () at crates/fuse3/src/raw/session.rs:6064
+#8  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99811215ec in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>>, ()> (data=0x7f13d79fae60) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 31 (Thread 0x7f13d77fb6c0 (LWP 3165) "fuse3-tpc6m2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14324a6518, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14324a6510, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981121a57 in fuse3::sqz_exec::LaneExec::run (self=0x7f13d77f9ea0) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_exec.rs:241
+#7  fuse3::raw::session::{impl#15}::new::{closure#2} () at crates/fuse3/src/raw/session.rs:6064
+#8  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99811215ec in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::raw::session::{impl#15}::new::{closure_env#2}, ()>>, ()> (data=0x7f13d77f9e60) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 30 (Thread 0x7f13d75fa6c0 (LWP 3166) "sqz-timerm2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a998112a070 in std::sync::poison::condvar::Condvar::wait_timeout<fuse3::sqz_time::Registry> (self=<optimized out>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  fuse3::sqz_time::service_loop (svc=0x7f14ac96f000) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_time.rs:151
+#6  fuse3::sqz_time::service::{closure#0}::{closure#0} () at crates/fuse3/src/../../squeezefs-ipc/src/sqz_time.rs:105
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::sqz_time::service::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a998115c0ae in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::sqz_time::service::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::sqz_time::service::{closure#0}::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::sqz_time::service::{closure#0}::{closure_env#0}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::sqz_time::service::{closure#0}::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 29 (Thread 0x7f13d65ff6c0 (LWP 3168) "sqz-fdwatchm2"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef3f955 in epoll_wait () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a99811294df in fuse3::sqz_fdwatch::service_loop (w=<optimized out>) at crates/fuse3/src/../../squeezefs-ipc/src/sqz_fdwatch.rs:90
+#4  fuse3::sqz_fdwatch::watch::{closure#0}::{closure#0} () at crates/fuse3/src/../../squeezefs-ipc/src/sqz_fdwatch.rs:79
+#5  std::sys::backtrace::__rust_begin_short_backtrace<fuse3::sqz_fdwatch::watch::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#6  0x00005a998116e9de in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fuse3::sqz_fdwatch::watch::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#7  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::sqz_fdwatch::watch::{closure#0}::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#8  std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::sqz_fdwatch::watch::{closure#0}::{closure_env#0}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#9  std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::sqz_fdwatch::watch::{closure#0}::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+#10 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fuse3::sqz_fdwatch::watch::{closure#0}::{closure_env#0}, ()>>, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panic.rs:359
+#11 std::thread::lifecycle::spawn_unchecked::{closure#1}<fuse3::sqz_fdwatch::watch::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:68
+
+Thread 28 (Thread 0x7f1312bfa6c0 (LWP 3364) "sqz-clw-conn"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981932838 in squeezefs::cluster_wire::{impl#29}::park (self=0x7f14aea98f10, tick=...) at src/cluster_wire.rs:2875
+#4  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#5  0x00005a99819312a4 in squeezefs::cluster_wire::RpcListener::serve_conn (tcp=..., peer=..., self=<optimized out>) at src/cluster_wire.rs:2558
+#6  squeezefs::cluster_wire::{impl#26}::accept_loop::{closure#0} () at src/cluster_wire.rs:2382
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981935615 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>, ()> (data=0x7f1312bf8e50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 27 (Thread 0x7f13127f86c0 (LWP 3376) "sqz-clw-conn"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981932838 in squeezefs::cluster_wire::{impl#29}::park (self=0x7f14aca39010, tick=...) at src/cluster_wire.rs:2875
+#4  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#5  0x00005a99819312a4 in squeezefs::cluster_wire::RpcListener::serve_conn (tcp=..., peer=..., self=<optimized out>) at src/cluster_wire.rs:2558
+#6  squeezefs::cluster_wire::{impl#26}::accept_loop::{closure#0} () at src/cluster_wire.rs:2382
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981935615 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>, ()> (data=0x7f13127f6e50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 26 (Thread 0x7f13125f76c0 (LWP 3392) "sqz-jw-conn"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef411ff in recv () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a99814b1534 in std::sys::net::connection::socket::unix::Socket::recv_with_flags () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/net/connection/socket/unix.rs:291
+#4  std::sys::net::connection::socket::unix::Socket::read () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/net/connection/socket/unix.rs:306
+#5  std::sys::net::connection::socket::TcpStream::read () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/net/connection/socket/mod.rs:416
+#6  std::net::tcp::{impl#1}::read () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/net/tcp.rs:682
+#7  squeezefs::cluster_wire::{impl#23}::read (buf=..., self=<error reading variable: Cannot access memory at address 0x0>) at src/cluster_wire.rs:2054
+#8  std::io::default_read_exact<squeezefs::cluster_wire::ClusterReadHalf> (buf=..., this=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/mod.rs:561
+#9  std::io::Read::read_exact<squeezefs::cluster_wire::ClusterReadHalf> (self=<optimized out>, buf=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/io/mod.rs:1032
+#10 0x00005a99814b0e3f in squeezefs::cluster_wire::read_framed_bytes<squeezefs::cluster_wire::ClusterReadHalf> (r=0x7f13125f54f8, max_len=16777216, trailer=32, body_timeout=...) at src/cluster_wire.rs:377
+#11 0x00005a99818d781a in squeezefs::cluster_wire::FrameRx::recv<squeezefs::cluster_wire::ClusterReadHalf, squeezefs::job_wire::WireFrame> (self=0x7f13125f5518, r=0x7f13125f4ba4, max_len=16777216, body_timeout=...) at src/cluster_wire.rs:594
+
+Thread 25 (Thread 0x7f131a5fd6c0 (LWP 4663) "sqz-leasem2"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce4bd0 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x7f14ac800db8, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_exec::{impl#0}::park (self=0x7f14ac800db0, tick=...) at crates/squeezefs-ipc/src/sqz_exec.rs:81
+#6  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#7  0x00005a99812d2137 in squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure#0} () at src/meta_exec.rs:116
+#8  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#9  0x00005a99812d2095 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#10 core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#11 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::meta_exec::LEASE_EXEC::{closure#0}::{closure_env#0}, ()>>, ()> (data=<error reading variable: Cannot access memory at address 0x0>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+
+Thread 24 (Thread 0x7f135c3ea6c0 (LWP 4664) "sqz-blk3"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f13d4364810) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 23 (Thread 0x7f13b46ff6c0 (LWP 4665) "sqz-blk4"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f14875fce70) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 22 (Thread 0x7f14adbfd6c0 (LWP 5207) "iou-wrk-3021"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 21 (Thread 0x7f149ccff6c0 (LWP 5775) "iou-wrk-3032"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 20 (Thread 0x7f130a0fc6c0 (LWP 6004) "sqz-blk6"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f13d43b9060) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 19 (Thread 0x7f135d9f16c0 (LWP 6134) "sqz-blk7"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f145a002350) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 18 (Thread 0x7f13184ef6c0 (LWP 6135) "sqz-blk8"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f13d5d18c90) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 17 (Thread 0x7f135c7ec6c0 (LWP 6136) "sqz-blk9"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f13d4365860) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 16 (Thread 0x7f131bbfd6c0 (LWP 6137) "sqz-blk10"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f1310363aa0) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 15 (Thread 0x7f130c9fe6c0 (LWP 6138) "sqz-blk11"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f14ac416cc0) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 14 (Thread 0x7f130c7fd6c0 (LWP 6139) "sqz-blk12"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f13d5c13d10) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 13 (Thread 0x7f130a6ff6c0 (LWP 6140) "sqz-blk13"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f13d4365b90) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 12 (Thread 0x7f130a4fe6c0 (LWP 6141) "sqz-blk14"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f13103637d0) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 11 (Thread 0x7f130bff96c0 (LWP 6143) "sqz-blk16"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d1329b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait_timeout () at library/std/src/sys/sync/condvar/futex.rs:37
+#4  0x00005a9981ce124e in std::sync::poison::condvar::Condvar::wait_timeout<squeezefs_ipc::sqz_blocking::PoolState> (self=0x5a9981f7b1e8 <squeezefs_ipc::sqz_blocking::pool::P+72>, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#5  squeezefs_ipc::sqz_blocking::worker_loop () at crates/squeezefs-ipc/src/sqz_blocking.rs:192
+#6  core::ops::function::FnOnce::call_once<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/ops/function.rs:250
+#7  std::sys::backtrace::__rust_begin_short_backtrace<fn(), ()> (f=<optimized out>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981ce6252 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<fn(), ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>, ()> (data=0x7f1430a04480) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<fn(), ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 10 (Thread 0x7f1485bff6c0 (LWP 7048) "iou-wrk-3043"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 9 (Thread 0x7f1487bfe6c0 (LWP 7049) "iou-wrk-3038"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 8 (Thread 0x7f14867ff6c0 (LWP 7050) "iou-wrk-3042"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 7 (Thread 0x7f14853fe6c0 (LWP 7051) "iou-wrk-3047"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 6 (Thread 0x7f14855ff6c0 (LWP 7052) "iou-wrk-3045"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 5 (Thread 0x7f1486dfe6c0 (LWP 7053) "iou-wrk-3041"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 4 (Thread 0x7f1486fff6c0 (LWP 7054) "iou-wrk-3039"):
+#0  0x0000000000000000 in ?? ()
+Backtrace stopped: Cannot access memory at address 0x0
+
+Thread 3 (Thread 0x7f135ffff6c0 (LWP 7464) "sqz-clw-conn"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981932838 in squeezefs::cluster_wire::{impl#29}::park (self=0x7f1432c38010, tick=...) at src/cluster_wire.rs:2875
+#4  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#5  0x00005a99819312a4 in squeezefs::cluster_wire::RpcListener::serve_conn (tcp=..., peer=..., self=<optimized out>) at src/cluster_wire.rs:2558
+#6  squeezefs::cluster_wire::{impl#26}::accept_loop::{closure#0} () at src/cluster_wire.rs:2382
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981935615 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>, ()> (data=0x7f135fffde50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 2 (Thread 0x7f130c1fa6c0 (LWP 7465) "sqz-clw-conn"):
+#0  0x00007f14aeeb4a12 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f14aeea860c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f14aef302fe in poll () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00005a9981932838 in squeezefs::cluster_wire::{impl#29}::park (self=0x7f1485674010, tick=...) at src/cluster_wire.rs:2875
+#4  0x00005a9981ce4fab in squeezefs_ipc::sqz_exec::LaneExec::run (self=<optimized out>) at crates/squeezefs-ipc/src/sqz_exec.rs:241
+#5  0x00005a99819312a4 in squeezefs::cluster_wire::RpcListener::serve_conn (tcp=..., peer=..., self=<optimized out>) at src/cluster_wire.rs:2558
+#6  squeezefs::cluster_wire::{impl#26}::accept_loop::{closure#0} () at src/cluster_wire.rs:2382
+#7  std::sys::backtrace::__rust_begin_short_backtrace<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+#8  0x00005a9981935615 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/lifecycle.rs:70
+#9  core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>> (self=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panic/unwind_safe.rs:275
+#10 std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>, ()> (data=0x7f130c1f8e50) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:576
+#11 std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<squeezefs::cluster_wire::{impl#26}::accept_loop::{closure_env#0}, ()>>> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/panicking.rs:544
+
+Thread 1 (Thread 0x7f14af1736c0 (LWP 3019) "squeezefs"):
+#0  0x00007f14aef3cbad in syscall () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00005a9981d28497 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::thread_parking::futex::Parker::park () at library/std/src/sys/sync/thread_parking/futex.rs:55
+#3  std::thread::thread::Thread::park () at library/std/src/thread/thread.rs:121
+#4  std::thread::functions::park () at library/std/src/thread/functions.rs:533
+#5  0x00005a9980f3bbfc in squeezefs_ipc::sqz_blocking::block_on<squeezefs::main::{async_block_env#11}> (fut=...) at crates/squeezefs-ipc/src/sqz_blocking.rs:93
+#6  squeezefs::main () at src/main.rs:3580
+[Inferior 1 (process 3019) detached]

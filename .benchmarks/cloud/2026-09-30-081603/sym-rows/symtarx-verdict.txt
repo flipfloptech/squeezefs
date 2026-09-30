@@ -1,0 +1,2 @@
+gate 2: joined writer 4.63s vs manager-local 4.12s -> 1.12x of S0 (gate <= 1.10x): MISS
+both orders: sym-1 4.79 local-1 4.13 | local-2 4.10 sym-2 4.47

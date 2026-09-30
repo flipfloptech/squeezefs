@@ -1,0 +1,9 @@
+cluster=sqzbench-20260930-080952 preset=mw symmetric=1 instance_type=i4i.2xlarge az=us-east-1a region=us-east-1 market=on-demand placement=cluster
+rows=tarx,shared,scale (gate 2 sym-tarx | gate 3 sym-scale N in {1,2,4,8} | gate 3b sym-shared-dir + -ls) — tests/cloud_sym_rows.sh over ssh, laws = tests/sym_rows_lib.sh (the matrix's)
+fleet: manager client0:/scratch/mnt + 7 joined writer node(s) client1 client2 client3 client4 client5 client6 client7 + token reader client0:/scratch/mnt-ro; ONE symmetric writer per node; storage=18.212.225.246:/dev/nvme1n1,54.196.222.91:/dev/nvme1n1,54.162.172.167:/dev/nvme1n1,54.88.203.246:/dev/nvme1n1,98.94.9.244:/dev/nvme1n1,54.90.177.21:/dev/nvme1n1,184.72.135.210:/dev/nvme1n1,54.163.200.135:/dev/nvme1n1
+format=--symmetric CACHE-LESS (no --disk-cache-paths; the box/local fleets' shape) rt=60 files=40000 threads=4 ingest_mb=1024 corpus=/home/justin/tmp/sym-corpus/sym-corpus-linux-7.2.3-fs.tar
+instrument=tar -xf (the shipped corpus), tests/mdstorm.c, dd bs=4M conv=fsync, python3 O_CREAT|O_EXCL creators, ls -l (the matrix's sym legs' instruments)
+substrate=aws-on-demand/i4i.2xlarge/us-east-1a/pg-cluster (instance-store NVMe over nvmet-tcp, single NIC; one symmetric writer per node) — cloud substrate, a THIRD class: never spliced into devsub loop/tcp or squeeze-test medians (docs/rc-manifest.md tiers)
+repo_commit=a6babb50b957cc034e5ec77c27aed18f06c7d385
+discipline: an instance leaving running mid-row => COUNT ABORTED, restart from zero (never splice); every rate row RT >= 60 s
+ts=2026-09-30-081603

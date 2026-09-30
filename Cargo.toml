@@ -5,7 +5,7 @@ name = "squeezefs"
 # the fine-grained identity; stable-*/lts-* tags remain the release names.
 # The first-party crates (crates/fuse3, crates/squeezefs-{ipc,preload})
 # track the same train.
-version = "1.2.4"
+version = "1.3.0"
 edition = "2021"
 license-file = "LICENSE"
 # ENG-16: `cargo publish` is unrepresentable here — the crate depends on
@@ -60,7 +60,7 @@ rcgen = "0.13"
 # Resolves ONLY via the [patch.crates-io] path entry below (crates.io has
 # no fuse3 1.1 — the fully-diverged first-party fork carries the SqueezeFS
 # release train; see the workspace-topology note above).
-fuse3 = { version = "1.2", features = ["tokio-runtime", "unprivileged"] }
+fuse3 = { version = "1.3", features = ["tokio-runtime", "unprivileged"] }
 io-uring = "0.6"
 dashmap = "5.5"
 serde = { version = "1.0", features = ["derive"] }

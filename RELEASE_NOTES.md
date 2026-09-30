@@ -1,6 +1,6 @@
-# SqueezeFS 1.3.0 (unreleased)
+# SqueezeFS 1.3.0
 
-_Release train 1.3 — not yet tagged. Everything below is on `dev`._
+_Release date: 2026-09-29 (tag `stable-2026.09.5`)_
 
 ## 1.3.0 — what changed
 
@@ -923,6 +923,36 @@ flush met a held stripe lands through its own close;
 
 - **The 1.2.4 limitations** stand where this release did not name a
   change to them.
+- **The box brackets on the flip binary are owed** (design
+  `design-symmetric-metadata.md` §8's gates 1 / 2 / 3 / 3b / 3c / 5 / 7 on
+  `squeeze-test`, and the cloud row under a new approval): every number in
+  this release's gate record is a pass/fail verdict from the dev laptop,
+  never a performance claim.
+
+**Verification.** The release gate ran as ONE chain from zero — attempt 14
+of the 1.3.0 campaign, on the tested tree `b2cfb3e4` — through `task check`
+(394 suites, 5,409 tests, 18 stages, both audits), fstests `-g auto` (791
+ran, 788 clean, 3 expected-shape, 0 unexpected; `generic/650` excluded on
+the gate laptop; `generic/551`, which hung the campaign's attempt 12 for
+4.6 hours before the fix above, passed in 76 s), pjdfstests (8,798), LTP
+(1,963 TPASS, 0 fail, 0 broken), require-mount (23 suites, 150 tests) and
+zc-capability (197 tests, empty skip ledger — the laptop's sqz kernel); its
+fuzz leg then failed to COMPILE under nightly (a recursive `impl Future`
+in the joined writer's re-dial door, which stable accepts — fixed by one
+type-erased await, `585d7377`), and on that fix the 18-target campaign ran
+and found two defects in the fuzz ORACLES themselves (a stale strict-gap
+law against the run coalescer's documented `u32` split; a refused sentinel
+index routed into a "never a slot-tree kind" arm — both ported to stable as
+deterministic pins, `1ce23c8e`); the campaign then ran clean on that tree:
+**18 targets × 90 s × 2 jobs, 0 crashes, ≈ 5.5 × 10⁸ executions**. The
+owner ruled the six product legs' verdict stands and the fuzz leg re-runs
+alone: the product diff between `b2cfb3e4` and the fuzz leg's `1ce23c8e`
+is the one boxed await. Every attempt before 14 is attributed and fixed in
+the acceptance record's §4.4bp–§4.4cg. Record:
+[.benchmarks/2026-09-29-1.3.0-release-gate.md](.benchmarks/2026-09-29-1.3.0-release-gate.md).
+
+The rest of this document is the 1.2.4, 1.2.3, 1.2.2, 1.2.1 and 1.2.0
+record, which 1.3.0 inherits.
 
 ---
 

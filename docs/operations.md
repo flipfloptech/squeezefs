@@ -76,7 +76,7 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 
 **A SqueezeFS build carries two identities, both surfaced** (user directive 2026-07-24, superseding the commit-only 2026-07-18 policy):
 
-1. **The release-train version** — `Cargo.toml`'s package `version` (currently **1.2.4**, the 1.2 train; its release is tag `stable-2026.09.4`), bumped **as a release act** (never by CI, never per commit). The first-party crates (`crates/fuse3` — the fully-diverged fork, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) carry the same version. What each release changed for operators is [`RELEASE_NOTES.md`](../RELEASE_NOTES.md) (one entry per 1.2.x point release plus 1.2.0's upgrade story from 1.1, newest first).
+1. **The release-train version** — `Cargo.toml`'s package `version` (currently **1.3.0**, the 1.3 train; its release is tag `stable-2026.09.5`), bumped **as a release act** (never by CI, never per commit). The first-party crates (`crates/fuse3` — the fully-diverged fork, `crates/squeezefs-ipc`, `crates/squeezefs-preload`) carry the same version. What each release changed for operators is [`RELEASE_NOTES.md`](../RELEASE_NOTES.md) (one entry per 1.2.x point release plus 1.2.0's upgrade story from 1.1, newest first).
 2. **The git commit the build was produced from** — the fine-grained identity. Periodic releases remain **annotated git tags on specific commits** — `stable-YYYY.MM[.N]` and `lts-YYYY.MM` — created manually as a release act. The tag names the release; the commit pins the exact build. Tags are the **only** release names.
 
 **Verify what a node is running** (the two surfaces carry the same build-time capture):
@@ -85,11 +85,11 @@ This is the operator reference for SqueezeFS: the durability contract and its gu
 squeezefs --version        # or -V
 # shape:  squeezefs <train> (<short12>[-dirty] / <full40>[-dirty][, tag <tag>]) built <utc-rfc3339> profile <profile>
 # dev build of an untagged commit, release profile (timestamps below are illustrative):
-#   squeezefs 1.2.4 (2fd8c37cbd92 / 2fd8c37cbd92af6d3fd627d078d0491175406659) built 2026-09-12T13:10:41Z profile release
+#   squeezefs 1.3.0 (227ac3739311 / 227ac37393117000a5364c1039d79f24b2fd505a) built 2026-09-29T23:40:00Z profile release
 # the same tree with uncommitted tracked changes — `-dirty` rides BOTH hashes:
-#   squeezefs 1.2.4 (2fd8c37cbd92-dirty / 2fd8c37cbd92af6d3fd627d078d0491175406659-dirty) built 2026-09-12T13:10:41Z profile release
-# release build from the 1.2.4 tag commit, dist profile:
-#   squeezefs 1.2.4 (1193c6b7afdd / 1193c6b7afdd47fd3a86603151ab2e6a2590024e, tag stable-2026.09.4) built 2026-09-12T02:31:07Z profile dist
+#   squeezefs 1.3.0 (227ac3739311-dirty / 227ac37393117000a5364c1039d79f24b2fd505a-dirty) built 2026-09-29T23:40:00Z profile release
+# release build from the 1.3.0 tag commit, dist profile:
+#   squeezefs 1.3.0 (<release-act commit> / <full>, tag stable-2026.09.5) built <utc> profile dist
 # a dhat-on / coz-on build appends " [PROFILING BUILD: <features> — NOT measurement-valid]" (ENG-8); `profile debug` = a plain `cargo build`
 grep -E '"build_(commit|tag|profile)"' <mountpoint>/.stats   # the fleet mixed-version detector
 ```

@@ -236,23 +236,23 @@ clippy configs, fmt and the docs link check are clean; 25+ neighbouring
 suites green; the live repro on the 3 ms-delay tcp devsub read the
 skewed stream's fsync 6.2 s → 0.06 s (laptop, a mechanism reading).
 
-**The gate.** `task check` on `e068f81b` is the remaining precondition
-to land. Attempt 1 died on `cli_version_tests` (a concurrent `cargo
-test` in the same checkout rebuilt the debug binary mid-gate — never run
-cargo beside a gate); attempt 2 on `posix_mount_semantics_tests`'
-two-daemon leg with `IORING_REGISTER_KMBUF_RING … ENOMEM` after six
-retries (kernel page fragmentation from the repro's 16 GiB memory-backed
-devsub + 75 GB of page cache; the suite passes alone); attempt 3 runs
-from a compacted, devsub-free box —
-`~/tmp/ci-gate/taskcheck.e068f81b.log` (`task-check rc=0` at its end is
-GREEN; the two earlier logs sit beside it with their cause in the name).
-
-**To land (after GREEN):** `git checkout dev && git merge --ff-only
-fix/write-grid-straddle-overlay && git branch -d
-fix/write-grid-straddle-overlay && git push origin dev`; if the tree
-moved under the branch, rebase first. A red that is a venue artifact
-(kmbuf ENOMEM, a concurrent-cargo race) is re-run from a compacted idle
-box; a red naming the branch's surface is a round-4 review item.
+**The gate — GREEN, and the branch LANDED.** `task check` on
+`e068f81b` (the last product commit; the tip `a9c96e25` is docs over it)
+ran GREEN from zero on attempt 3: 395 suites / 5,414 tests, every one of
+the 18 stages including both audits, 16:46 → 18:03 UTC
+(`~/tmp/ci-gate/taskcheck.e068f81b.log`). Attempt 1 had died on
+`cli_version_tests` (a concurrent `cargo test` in the same checkout
+rebuilt the debug binary mid-gate — never run cargo beside a gate) and
+attempt 2 on `posix_mount_semantics_tests`' two-daemon leg with
+`IORING_REGISTER_KMBUF_RING … ENOMEM` after six retries (kernel page
+fragmentation from the repro's 16 GiB memory-backed devsub + 75 GB of
+page cache; the suite passes alone; the box was compacted and the
+devsub torn down before attempt 3) — both logs beside it with their
+cause in the name. Landed `--ff-only` onto `dev` and pushed: **`dev` =
+`origin/dev` = `a9c96e25`**; the branch is deleted locally and on
+origin. Every code landing since the tag is gated; the tip is
+releasable as 1.3.1 (the record's §7 items 26–28 and the io500 verb
+stay owed).
 
 **Owed after it (record §7):** item 26's second lever — the pipelined
 partial-buffer flush — and the stolen-settle ladder re-run (the ≤ 0.3 %

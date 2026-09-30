@@ -8192,12 +8192,14 @@ pub struct Metrics {
     /// predicate rotting. 0 under `SQUEEZEFS_PATCH_MAX_BYTES=0` (cap 0
     /// empties the sub-cap class).
     pub overlay_ineligible_sub_cap: Align64<AtomicU64>,
-    /// §5.1 (§4.4ci): sub-cap page-aligned pieces that JOINED a record
-    /// already Open on their block — the floor governs the INSTALL, a
-    /// join mints nothing and stores one aligned DMA into the minted
-    /// dest. The tail of a WRITE that straddles a block boundary on a
-    /// misaligned writeback grid is this piece; refusing it settled the
-    /// record half-filled and opened a buffer that never completed.
+    /// §5.1 (§4.4ci): sub-cap page-aligned pieces admitted PAST the floor
+    /// onto a record already Open on their block — the floor governs the
+    /// INSTALL, a join mints nothing and stores one aligned DMA into the
+    /// minted dest (counted at the floor; a state-screen decline behind
+    /// it still counts here, so the SUM law is exact). The tail of a
+    /// WRITE that straddles a block boundary on a misaligned writeback
+    /// grid is this piece; refusing it settled the record half-filled and
+    /// opened a buffer that never completed.
     pub overlay_sub_cap_joins: Align64<AtomicU64>,
     /// §5.1 / KD-B4-8: a `StorageFull` dest mint declined the overwrite
     /// arm to accumulation (whose epoch KD-1.7 early-close ladder
@@ -21071,9 +21073,15 @@ impl SqueezefsFilesystem {
                 // guard. `Ok(true)` = ACKed off the overlay (ACK-after-CQE
                 // — KD-OV-7); `Ok(false)` = declined structurally (fall
                 // through to the accumulation path); `Err` = the store
-                // failed loud for exactly this write.
-                let piece_overlay =
-                    overlay_shape && write_start % 4096 == 0 && slice_len % 4096 == 0;
+                // failed loud for exactly this write. A WHOLE-block piece
+                // of a spanning write keeps the accumulation path's
+                // complete-block write-through (the venue it always had —
+                // the §4.4ci class is the PARTIAL pieces' alone, and a
+                // whole piece leaves no partial buffer behind).
+                let piece_overlay = overlay_shape
+                    && write_start % 4096 == 0
+                    && slice_len % 4096 == 0
+                    && (start_block == end_block || (slice_len as u64) < block_size);
                 if piece_overlay {
                     let rel = (write_start - b_start_offset) as usize;
                     write_phase(ino, offset, b as u32, WP_OVERLAY_STORE);

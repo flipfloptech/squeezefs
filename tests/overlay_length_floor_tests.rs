@@ -15,10 +15,12 @@
 //! (design-random-small-writes §5.2) owns that population: W1 in place
 //! when eligible, else the W2 byte-budgeted extent park + amortized fold.
 //!
-//! The floor is DERIVED, never a constant: overlay-eligible by length
-//! ⇔ `len > patch_max_bytes()` — literally the W1 predicate-5 oversize
-//! verdict, so the two classes tile the sub-block population exactly
-//! (≤ cap ⇒ W1/W2; > cap ⇒ overlay/accumulation). Composition with the
+//! The floor is DERIVED, never a constant: an overlay record is
+//! INSTALLED by length iff `len > patch_max_bytes()` — literally the W1
+//! predicate-5 oversize verdict, so the two classes tile the sub-block
+//! population exactly (≤ cap ⇒ W1/W2; > cap ⇒ overlay/accumulation); a
+//! page-aligned piece of any length JOINS a record already open on its
+//! block (§4.4ci, `tests/write_grid_straddle_tests.rs`). Composition with the
 //! `SQUEEZEFS_PATCH_MAX_BYTES=0` A/B lever: cap 0 empties the W1 class,
 //! so every length is overlay-eligible — exactly as it makes none
 //! patch-eligible.

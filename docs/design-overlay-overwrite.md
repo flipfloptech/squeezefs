@@ -172,7 +172,8 @@ verdict instead of declining:
 
 ```
 mapped(b) ∧ striped-authority ∧ passthrough ∧ ¬write_verification
-        ∧ page-aligned PIECE (4 KiB offset+len; single-block by the write split — §4.4ci)
+        ∧ page-aligned PIECE (4 KiB offset+len; single-block by the write split — §4.4ci;
+                             a WHOLE-block piece of a spanning write keeps the write-through)
         ∧ (len > patch_max_bytes() ∨ a record is Open on b) — the LENGTH FLOOR (finding 47) governs the INSTALL
         ∧ no RAM accumulation (active_block_buffers)         [existing]
         ∧ no staged custody (active_block / active_block_ext) [existing]
@@ -252,9 +253,13 @@ Load-bearing points, each with its measured or structural reason:
   the sub-cap run stores per op into the dest — request size = the piece,
   where the pre-§4.4ci settle-then-accumulate would have written one
   whole block (finding 47's `wareq-sz` rationale holds where no record is
-  open); and a whole-block piece is the whole-block overwrite's shape
-  (unreachable at the shipped 4 MiB / 1 MiB geometry — a kernel WRITE
-  spans at most two blocks, neither piece whole). A slot payload stays unmaterialized only for
+  open); and a WHOLE-block piece of a spanning write keeps the
+  accumulation path's complete-block write-through (review round 2, M-2:
+  the class is the partial pieces' alone, a whole piece leaves no partial
+  buffer, and moving it to the overlay would have displaced the
+  write-through venue on sub-1 MiB-block volumes and the CFR / S11
+  per-block callers unmeasured — the displacement law; a single-block
+  whole write rides the overlay as it always did). A slot payload stays unmaterialized only for
   a single-block, aligned, above-floor write (its direct DMA needs the
   whole payload as one piece); a straddling slot write materializes and
   its pieces ride the bytes vehicle. The law the contracts pin: for a

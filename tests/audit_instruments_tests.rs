@@ -563,22 +563,17 @@ async fn pipeline_dma_contains_the_funnel_split() {
     // The CoW pipeline venue (the write_pipeline_phase_tests posture): the
     // fresh small-file route promotes via staging, so the measured pass is
     // the striped coverage-complete REWRITE, routed CoW (not in place, no
-    // rewrite shadow, no device overlay — under the harness's cap 0 every
-    // length is overlay-eligible and each 4 KiB piece of the 8-block
-    // rewrite is a whole block the overlay's overwrite arm would take
-    // since the per-piece screen, §4.4ci) so every block pays `dma`.
+    // rewrite shadow) so every block pays `dma`.
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
             squeezefs::routing::set_rewrite_shadow(true);
             squeezefs::fuse_client::set_inplace_overwrite(false);
-            squeezefs::device_overlay::clear_device_overlay_for_tests();
         }
     }
     let _r = Restore;
     squeezefs::routing::set_rewrite_shadow(false);
     squeezefs::fuse_client::set_inplace_overwrite(false);
-    squeezefs::device_overlay::set_device_overlay_for_tests(false, false);
     // 4 KiB blocks, one coverage-complete 8-block write (the
     // write_pipeline_phase_tests venue): fixture write + fsync promotes to
     // striped; the measured pass is the 8-block rewrite.

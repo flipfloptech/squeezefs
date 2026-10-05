@@ -1,6 +1,10 @@
 # 0003 — Quirk review before rung 3: findings, work packages, rulings
 
-Status: proposed 2026-10-05 (owner asked to "re-examine all quirks before continuing").
+Status: ACCEPTED 2026-10-05 with the owner's rulings: Q1 yes (aligned headers), Q2+Q3 yes (one key
+layout; `--single-writer` is a one-member forest; the bit-8 partition machinery is deleted), Q4
+derive, Q5 the fail-stop lattice (the per-read timeout and its knob go), Q6 rename the thread classes
+to `sqz-fuse-lane<N>` / `sqz-fuse-ur<qid>` (charter §9 amended), Q7 every `.tuning` row becomes an
+A/B lever or is deleted, Q8 `dist` = ReleaseSafe + fat LTO, Q9 deferred to rung 3 as recorded.
 Inputs: `docs/audits/2026-10-05-quirks/{format,runtime,foundation}.md` (105 findings over
 everything landed in rungs 1–2). Law: decision 0002 — the charter's mechanisms, invariants and
 derivations are requirements; the reference's incidental choices are not; no compatibility with

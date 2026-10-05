@@ -38,9 +38,11 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
-    // @anchor:meta_lane_import
-    // @anchor:meta_pure_import
-    // @anchor:meta_dlm_import
+    pub const journal_lane = if (builtin.os.tag == .linux) @import("meta/journal_lane.zig") else struct {};
+    pub const tx = @import("meta/tx.zig");
+    pub const heap_law = @import("meta/heap_law.zig");
+    pub const inos = @import("meta/inos.zig");
+    pub const dlm = @import("meta/dlm.zig");
     pub const key = @import("meta/key.zig");
     pub const record = @import("meta/record.zig");
     pub const bset = @import("meta/bset.zig");
@@ -62,7 +64,7 @@ pub const meta = struct {
 };
 
 // ---- sync primitives (charter §9), written over std.Io's futex ops ----
-// @anchor:sync_import
+pub const sync = @import("sync/sync.zig");
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
@@ -85,10 +87,12 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:sync_test
-    // @anchor:meta_lane_test
-    // @anchor:meta_pure_test
-    // @anchor:meta_dlm_test
+    _ = sync;
+    if (builtin.os.tag == .linux) _ = meta.journal_lane;
+    _ = meta.tx;
+    _ = meta.heap_law;
+    _ = meta.inos;
+    _ = meta.dlm;
     _ = meta.key;
     _ = meta.record;
     _ = meta.bset;

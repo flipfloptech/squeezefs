@@ -100,6 +100,9 @@ pub const registry = [_]Knob{
     .{ .key = "SQUEEZEFS_URING_FS_WORKERS", .kind = .{ .int = .{ .lo = 1, .hi = 64 } }, .default = "derived", .class = .derived_override, .doc = "io_uring file-layer worker count for ad-hoc local file I/O (derived clamp(cpus/4, 4, 64))." },
     .{ .key = "SQUEEZEFS_TEST_META_BUFFERED", .kind = .bool, .default = "0", .class = .test_seam, .doc = "Test seam: keep every registered metadata device on BUFFERED I/O (the shared-LUN coherence repro's control arm)." },
 
+    // ---- metadata commit pipeline (journal lane) ----
+    .{ .key = "SQUEEZEFS_META_FLUSH_INTERVAL_MS", .kind = .{ .int = .{ .lo = 0, .hi = MS_MAX } }, .default = "50", .class = .tuning, .doc = "Coalesced journal barrier period, ms (the durability lane sets needs_flush and barriers at this cadence); 0 = strict: ONE barrier per group before any ack." },
+
     // ---- NVMe block device workers ----
     .{ .key = "SQUEEZEFS_NVME_READ_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device READ submission fan-out lanes (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
     .{ .key = "SQUEEZEFS_NVME_WRITE_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device DATA-WRITE submission fan-out lanes, block-offset affinity (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
@@ -110,6 +113,9 @@ pub const registry = [_]Knob{
     .{ .key = "SQUEEZEFS_IPC_MEM_MAX", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "ipc_session_arenas admission cap, MiB (absolute > pct > derived budget/8)." },
     .{ .key = "SQUEEZEFS_IPC_MEM_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "ipc_session_arenas admission cap as a percentage of the R5 budget." },
     .{ .key = "SQUEEZEFS_IPC_ARENA_MB", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 20 } }, .default = "derived", .class = .derived_override, .doc = "Per-session IPC payload arena, MiB (derived max(64 MiB, align_down(ipc cap / session population target, 4 MiB)))." },
+
+    // ---- 4a metadata object locks (read by meta/dlm.zig) ----
+    .{ .key = "SQUEEZEFS_DLM_STRIPES", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 24 } }, .default = "derived", .class = .derived_override, .doc = "D-3: the stripe population of the 4a DlmLockManager inode + dentry classes (shipped floor 4096). Explicit wins verbatim (rounded UP to a power of two — the index is a mask); derived = next_pow2(max(4096, 16 × possible_cpus × q_depth)) so a false-sharing wait — which on the 4a tables costs a whole commit — hits at most one acquire in 16 at full ring occupancy. MEASUREMENT lever: 4096 is the shipped-4a A/B control, 1 the everything-serializes crucible. Engagement: dlm_{inode,dentry}_stripes; conviction: dlm_*_stripe_collisions vs dlm_*_key_waits." },
 };
 
 pub fn lookup(key: []const u8) ?*const Knob {

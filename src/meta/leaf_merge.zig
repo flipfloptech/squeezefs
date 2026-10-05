@@ -584,7 +584,7 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
     var prep: ?smo.PreparedEntry = null;
     defer if (prep) |*p| p.deinit();
     if (ctx.journal) |j| {
-        j.barrier();
+        try j.barrier();
         var recs = smo.SmoEntry.init(gpa);
         errdefer recs.deinit();
         try recs.putInterior(t, left.level + 1, right.max_key, dst, dst_seq);

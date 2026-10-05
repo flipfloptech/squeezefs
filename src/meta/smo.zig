@@ -71,7 +71,6 @@ pub const NodeCache = node_cache.NodeCache;
 pub const OwnedRec = node_cache.OwnedRec;
 pub const Record = rec.Record;
 pub const RecordRef = rec.RecordRef;
-pub const Hook = node_cache.Hook;
 pub const Reservation = jc.Reservation;
 pub const Admission = jc.Admission;
 
@@ -94,6 +93,9 @@ pub const stats = struct {
     /// SMO entry writes that failed after the swap: the §5.2 crash-
     /// equivalent hole, loud and counted, never fatal.
     pub var meta_kv_smo_entry_write_failures: counters.ShardedCounter = .{};
+    /// Pre-lock image barriers that failed: the SMO is abandoned whole
+    /// (nothing published) and the failure counts on the FAILED latch.
+    pub var meta_kv_smo_barrier_failures: counters.ShardedCounter = .{};
 };
 
 pub const Error = tree.Error || node_cache.FreezeError || node_cache.AppendError || journal.Error || error{
@@ -106,6 +108,10 @@ pub const Error = tree.Error || node_cache.FreezeError || node_cache.AppendError
     /// The pending-free FIFO has no room for this SMO's retirement(s) under
     /// the threshold posture: the caller forces a cycle and retries.
     PendingFreeFull,
+    /// The images-before-pointers barrier failed: the SMO is abandoned
+    /// whole (its fresh extents released, nothing published) and the node
+    /// stays dirty for the retry; counts toward the FAILED latch.
+    BarrierFailed,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,7 +151,12 @@ pub const SmoJournal = struct {
     /// The historical §4.7 retire tag stamped into free-record VALUES
     /// (byte-for-byte format compat; the gate is the record's position).
     retire_seq: std.atomic.Value(u64) = .init(0),
-    barrier_hook: ?Hook = null,
+    /// The device barrier (the backend binds the metadata device's
+    /// `fdatasync`); null on the in-RAM image, durable by construction.
+    barrier_hook: ?checkpoint_cycle.BarrierSink = null,
+    /// The volume's FAILED latch: the barrier's class counts here (the same
+    /// run the checkpointer's `syncDevice` feeds); null in the standalone tests.
+    latch: ?*journal.FailureLatch = null,
     device: ?DeviceHooks = null,
     barriers: std.atomic.Value(u64) = .init(0),
     stats: journal.RingStats = .{},
@@ -157,9 +168,16 @@ pub const SmoJournal = struct {
 
     /// Successor images durable BEFORE any pointer record to them can
     /// exist in the ring: a replayed pointer must never route to a torn
-    /// image.
-    pub fn barrier(self: *SmoJournal) void {
-        if (self.barrier_hook) |h| h.call(h.ctx);
+    /// image. A failure is the SMO's: counted, on the latch's barrier
+    /// class, and returned so the caller abandons the build (charter §1.8:
+    /// never a silent fallback to publishing pointers to unbarriered images).
+    pub fn barrier(self: *SmoJournal) error{BarrierFailed}!void {
+        if (self.barrier_hook) |h| h.barrier(h.ctx) catch {
+            stats.meta_kv_smo_barrier_failures.inc();
+            if (self.latch) |l| _ = l.noteFailure(.barrier);
+            return error.BarrierFailed;
+        };
+        if (self.latch) |l| l.noteSuccess(.barrier);
         _ = self.barriers.fetchAdd(1, .monotonic);
     }
 
@@ -890,7 +908,7 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
     var prep: ?PreparedEntry = null;
     defer if (prep) |*p| p.deinit();
     if (ctx.journal) |j| {
-        j.barrier();
+        try j.barrier();
         // At-cap headroom (clause a): this SMO pushes exactly one pending
         // free at P5 and the serialized task is the FIFO's only producer,
         // so headroom observed here still holds post-swap. Refusing NOW
@@ -1183,7 +1201,8 @@ pub const CheckpointSeam = struct {
             error.PendingFreeFull => .pending_free_full,
             error.NoSpace => .no_space,
             error.OutOfMemory => .{ .failed = .out_of_memory },
-            error.Io => .{ .failed = .io },
+            // The device's classes: the cycle aborts and the tick retries.
+            error.Io, error.BarrierFailed => .{ .failed = .io },
             else => .{ .failed = .corrupt },
         };
         return .{ .replaced = .{ .images = self.ctx.images_written - before } };
@@ -2228,6 +2247,94 @@ test "an SMO entry write failure after the swap is the crash-equivalent hole: lo
     const t2 = re.treeOf(key.TREE_INODES);
     try testing.expectEqual(old_leaf, try leafAddrOf(t2, &ikey(10)));
     for (0..80) |i| try expectLookup(t2, &ikey(i), tree.testValue(i * 11 + spins - 1, 40, &buf));
+}
+
+/// Interior (pointer) records in the ring image: every SMO that published
+/// under an interior root wrote at least one.
+fn interiorRecordCount(gpa: Allocator, vol: *TestVolume) !usize {
+    var recovery = try journal.replayScanImage(gpa, vol.ring_image, vol.journal.geo, 0, 0);
+    defer recovery.deinit();
+    const interior = try journal.interiorRecordsSorted(gpa, recovery.entries);
+    defer gpa.free(interior);
+    return interior.len;
+}
+
+/// A barrier sink that fails its next `fail_next` calls (the SMO's
+/// images-before-pointers barrier).
+const FailingBarrier = struct {
+    fail_next: u32 = 0,
+    calls: u32 = 0,
+
+    fn sink(self: *FailingBarrier) checkpoint_cycle.BarrierSink {
+        return .{ .ctx = self, .barrier = barrier };
+    }
+
+    fn barrier(ctx: *anyopaque) checkpoint_cycle.IoError!void {
+        const self: *FailingBarrier = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.fail_next > 0) {
+            self.fail_next -= 1;
+            return error.Io;
+        }
+    }
+};
+
+test "the SMO's pre-lock barrier failure fails the SMO loud: BarrierFailed, no pointer record in the ring, the claimed extents released, the routing unchanged, one barrier failure on the latch; the retry completes it" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{ .journaled = true });
+    defer vol.deinit();
+    var latch: journal.FailureLatch = .{};
+    vol.journal.latch = &latch;
+    var fb: FailingBarrier = .{};
+    vol.journal.barrier_hook = fb.sink();
+    const t = try vol.createTree(key.TREE_INODES);
+    var buf: [64]u8 = undefined;
+    var n: u64 = 0;
+    while (try t.rootLevel() == 0) {
+        for (0..64) |_| {
+            try vol.commit(t, &ikey(n), .put, tree.testValue(n, 40, &buf));
+            n += 1;
+        }
+        _ = try vol.drain(t);
+    }
+    _ = try vol.checkpoint();
+    const old_leaf = try leafAddrOf(t, &ikey(10));
+    const ptrs0 = try interiorRecordCount(gpa, &vol);
+    const free0 = vol.alloc.freeExtents();
+    const c0 = stats.meta_kv_node_compactions.load() + stats.meta_kv_node_splits.load();
+    const failures0 = stats.meta_kv_smo_barrier_failures.load();
+    // Commits onto the leaf until a drain needs an SMO; the SMO's barrier fails.
+    fb.fail_next = 1;
+    var spins: u64 = 0;
+    var failed = false;
+    while (!failed and stats.meta_kv_node_compactions.load() + stats.meta_kv_node_splits.load() == c0) : (spins += 1) {
+        for (0..80) |i| try vol.commit(t, &ikey(i), .put, tree.testValue(i * 11 + spins, 40, &buf));
+        _ = vol.drain(t) catch |e| blk: {
+            try testing.expectEqual(error.BarrierFailed, e);
+            failed = true;
+            break :blk MaintenanceOutcome{};
+        };
+        try testing.expect(spins < 10_000);
+    }
+    try testing.expect(failed);
+    try testing.expectEqual(c0, stats.meta_kv_node_compactions.load() + stats.meta_kv_node_splits.load());
+    try testing.expectEqual(failures0 + 1, stats.meta_kv_smo_barrier_failures.load());
+    try testing.expectEqual(@as(u32, 1), latch.barrier_failures.load(.acquire));
+    try testing.expect(!latch.isFailed());
+    // Nothing published: no pointer record, the images' extents back, the
+    // old routing.
+    try testing.expectEqual(ptrs0, try interiorRecordCount(gpa, &vol));
+    try testing.expectEqual(free0, vol.alloc.freeExtents());
+    try testing.expectEqual(old_leaf, try leafAddrOf(t, &ikey(10)));
+    for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + spins - 1, 40, &buf));
+    // The node stays dirty for the retry: the next drain's barrier succeeds
+    // and the SMO completes, resetting the latch's barrier run.
+    try vol.flushDirty(t);
+    try testing.expect(stats.meta_kv_node_compactions.load() + stats.meta_kv_node_splits.load() > c0);
+    try testing.expect(try interiorRecordCount(gpa, &vol) > ptrs0);
+    try testing.expectEqual(@as(u32, 0), latch.barrier_failures.load(.acquire));
+    try testing.expect(fb.calls >= 2);
+    for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + spins - 1, 40, &buf));
 }
 
 test "property: random puts/deletes with SMOs interleaved ⇒ lookup ≡ an AutoHashMap oracle; replay of the ring over the images reproduces the final routing and the oracle" {

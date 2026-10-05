@@ -479,7 +479,7 @@ pub const KvBackend = struct {
             else => return error.LaneSpawnFailed,
         };
         errdefer be.lane.deinit();
-        be.smo_journal = .{ .gpa = gpa, .layout = ring_layout, .geo = geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = .{ .ctx = be, .call = smoBarrierHook }, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook } };
+        be.smo_journal = .{ .gpa = gpa, .layout = ring_layout, .geo = geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook } };
         be.smo_journal.retire_seq.store(mounted.seq + 1, .release);
         be.smo_ctx = smo.SmoContext.withJournal(&be.alloc, &be.smo_journal);
         be.ckpt_seam = .{ .ctx = &be.smo_ctx, .trees = be.trees };
@@ -682,11 +682,6 @@ pub const KvBackend = struct {
         const sink = be.dev.ledgerSink();
         try sink.writeSlot(sink.ctx, slot, image);
         if (test_seams.after_ledger) |h| h.call(h.ctx);
-    }
-
-    fn smoBarrierHook(ctx: *anyopaque) void {
-        const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        be.dev.barrier() catch {};
     }
 
     fn smoWriteHook(ctx: *anyopaque, ops: []const journal.WriteOp) error{Io}!void {

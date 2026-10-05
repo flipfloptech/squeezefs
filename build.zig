@@ -62,10 +62,14 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.lto = switch (profile) {
-        .gate => .thin,
-        .dist => .full,
-    };
+    // LTO needs LLD, which Zig drives on Linux (the product target). The macOS
+    // dev box builds portable modules only and never ships a binary.
+    if (target.result.os.tag == .linux) {
+        exe.lto = switch (profile) {
+            .gate => .thin,
+            .dist => .full,
+        };
+    }
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the squeezefs binary");
@@ -150,6 +154,12 @@ const train_version = "0.1.0";
 /// `git describe`-style identity: short commit, `-dirty` when the tree has
 /// uncommitted changes, `unknown` outside a repository (a tarball build).
 fn gitCommit(b: *std.Build) []const u8 {
+    // The identity depends on the repository state, which the configure cache
+    // cannot track (a working-tree edit without `git add` must still read
+    // `-dirty`: the daemon and shim refuse to pair across builds, so a stale
+    // "clean" here would be a lie). Poisoning re-runs this configure logic on
+    // every `zig build` — two git subprocesses, milliseconds.
+    b.graph.poisonCache();
     var code: u8 = 0;
     const raw = b.runAllowFail(&.{ "git", "rev-parse", "--short=12", "HEAD" }, &code, .ignore) catch return "unknown";
     const commit = std.mem.trim(u8, raw, " \n\r\t");

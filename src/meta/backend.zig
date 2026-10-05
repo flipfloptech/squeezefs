@@ -262,7 +262,8 @@ pub const KvBackend = struct {
     /// The volume's structural (SMO) context lock: the task's ticks, the
     /// lane's hole checkpoints, a committer's space retry, `checkpointNow`.
     smo_lock: Io.Mutex = .init,
-    /// Admission parkers wait here (woken by the task when `reusable_upto` moves).
+    /// Admission parkers wait here; the checkpointer's `afterDurableBarrier`
+    /// is the ONE notifier (every barrier that moves `reusable_upto`).
     space: sync.Notify = .init,
     ckpt_thread: ?std.Thread = null,
     cv: *conveyor.Conveyor,
@@ -508,9 +509,9 @@ pub const KvBackend = struct {
         });
         errdefer be.cp.deinit();
         be.smo_ctx.space_retry = be.cp.spaceRetryHold();
+        be.cp.space_wake = .{ .notify = &be.space, .io = io };
         be.task = checkpoint_cycle.CheckpointTask.init(&be.cp, io);
         be.task.serial = &be.smo_lock;
-        be.task.space_wake = &be.space;
         be.cache.installCheckpointKick(be.task.hook());
         // The bring-up cover: the volume serves with an empty replay window
         // and zero reclaimable residue (the D1.b wedge-crumb class).
@@ -1461,6 +1462,8 @@ test "the admission park on the device: the smallest ring fills under a serial c
     }
     for (acked.items) |ino| try testing.expect(try present(be, ino));
     try testing.expect(cs.full_stalls.load() > 0);
+    // Every park resumed on the barrier's own wake, never the backstop tick.
+    try testing.expectEqual(@as(u64, 0), cs.park_tick_rescues.load());
     try testing.expect(checkpoint.stats.meta_kv_checkpoint_park_cycles.load() > park_cycles0);
     try testing.expectEqual(acked.items.len, cs.acks.load());
     try testing.expectEqual(@as(u64, 0), cs.refusals.load());

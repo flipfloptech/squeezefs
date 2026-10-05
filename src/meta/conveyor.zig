@@ -124,10 +124,12 @@ pub const COMMIT_RETRY_BUDGET: u32 = node.RETRY_BUDGET;
 /// `SQUEEZEFS_TIMEOUT` default: a pass parked longer at ring admission is
 /// the wedged-not-failed class (D1.b audit row 2).
 pub const DEFAULT_TIMEOUT_S: u64 = 30;
-/// The admission park's tick: the longest a parked pass waits for the
-/// space wake before re-trying on its own — the reference's 10 ms floor on
-/// `timeout(until_crossing, notified)`; the wake normally ends the park
-/// first, the tick is the lost-wake backstop.
+/// The admission park's tick: a LOST-WAKE BACKSTOP only — every barrier
+/// that moves `reusable_upto` notifies the parkers itself
+/// (`checkpoint_cycle.afterDurableBarrier`), whichever thread ran it, so a
+/// tick that finds room is counted (`park_tick_rescues`, ≈ 0). 10 ms is the
+/// reference's floor: five barrier walls (≈ 2 ms measured) of dead time at
+/// worst if a wake were ever lost, far inside the 1 s cadence.
 pub const PARK_TICK_NS: u64 = 10 * std.time.ns_per_ms;
 
 // ---------------------------------------------------------------------------
@@ -331,9 +333,12 @@ pub const Stats = struct {
     drained_txs: counters.ShardedCounter = .{},
     acks: counters.ShardedCounter = .{},
     refusals: counters.ShardedCounter = .{},
-    /// `meta_kv_journal_full_stalls`: ring-admission parks; steady growth
-    /// ⇒ the checkpoint lags.
+    /// `meta_kv_journal_full_stalls`: ring-admission parks (one per park
+    /// entry); steady growth ⇒ the checkpoint lags.
     full_stalls: counters.ShardedCounter = .{},
+    /// `meta_conveyor_park_tick_rescues`: parks the 10 ms backstop tick
+    /// ended with room already there — a wake nobody sent (≈ 0 healthy).
+    park_tick_rescues: counters.ShardedCounter = .{},
     /// `meta_conveyor_rollbacks`: windows rolled back after a failed write;
     /// `meta_conveyor_compensations`: escaped records compensated.
     rollbacks: counters.ShardedCounter = .{},
@@ -359,7 +364,7 @@ pub const Stats = struct {
         for (GroupSizeHistogram.labels, 0..) |l, i| {
             try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", l, self.group_size.load(i) });
         }
-        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d}}}", .{
+        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d}}}", .{
             self.group_bytes.load(),
             self.leader_passes.load(),
             self.group_commits.load(),
@@ -373,6 +378,7 @@ pub const Stats = struct {
             self.acks.load(),
             self.refusals.load(),
             self.full_stalls.load(),
+            self.park_tick_rescues.load(),
             self.rollbacks.load(),
             self.compensations.load(),
             self.pass_panics.load(),
@@ -392,6 +398,11 @@ pub const TestSeams = struct {
     /// batch deterministically); `held` publishes the park.
     hold_pre_drain: std.atomic.Value(u32) = .init(0),
     held: std.atomic.Value(u32) = .init(0),
+    /// 1 ⇒ a pass parked at ring admission holds between its registration
+    /// on `space` and its wait (the window a wake must reach); `park_held`
+    /// publishes the hold.
+    hold_at_park: std.atomic.Value(u32) = .init(0),
+    park_held: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -840,14 +851,24 @@ pub const Conveyor = struct {
     fn admitUserBudget(self: *Conveyor, len: u64, err: *Error) ?jc.Admission {
         const io = self.deps.io;
         const core = self.deps.core;
-        var parked_since: ?u64 = null;
+        if (core.tryAdmit(len, .user)) |a| return a;
+        // ONE stall per park entry, however many wakes and ticks it spans.
+        self.stats.full_stalls.inc();
+        var since = clock.monotonicNs();
+        // The waiter node is kept across a TICK-ended wait (it stays
+        // registered, unlinked), so the next `enable` answers whether a wake
+        // landed since that wait's registration — a late wake vs none; a
+        // wake-ended wait consumed it and a fresh node registers.
+        var n = self.deps.checkpoint.space.notified();
+        var ticked = false;
         while (true) {
-            if (core.tryAdmit(len, .user)) |a| return a;
-            self.stats.full_stalls.inc();
-            var n = self.deps.checkpoint.space.notified();
-            _ = n.enable(io);
+            const woken = n.enable(io);
             if (core.tryAdmit(len, .user)) |a| {
                 n.cancel(io);
+                // The backstop tick found room no wake announced (≈ 0
+                // healthy — every barrier that moves `reusable_upto`
+                // notifies `space` itself).
+                if (ticked and !woken) self.stats.park_tick_rescues.inc();
                 return a;
             }
             if (self.isClosing() or self.deps.latch.isFailed()) {
@@ -856,15 +877,23 @@ pub const Conveyor = struct {
                 return null;
             }
             self.deps.checkpoint.kickPark(self.deps.checkpoint.ctx);
+            while (test_seams.hold_at_park.load(.acquire) != 0) {
+                test_seams.park_held.store(1, .release);
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
             const now = clock.monotonicNs();
-            const since = parked_since orelse now;
-            parked_since = since;
             const until_crossing = self.deps.park_escalation_ns -| (now - since);
-            _ = n.waitUntilUncancelable(io, now + @min(PARK_TICK_NS, @max(until_crossing, 1)));
+            switch (n.waitUntilUncancelable(io, now + @min(PARK_TICK_NS, @max(until_crossing, 1)))) {
+                .deadline => ticked = true,
+                .notified => {
+                    ticked = false;
+                    n = self.deps.checkpoint.space.notified();
+                },
+            }
             if (clock.monotonicNs() - since >= self.deps.park_escalation_ns) {
                 log.err("meta volume {s}: conveyor pass parked {d} ms (≥ {d} ms) waiting for journal-ring admission ({d} B) — the drain is not advancing (wedged-not-failed class); escalating through the journal-failure lattice (D1.b audit row 2)", .{ self.deps.volume, (clock.monotonicNs() - since) / std.time.ns_per_ms, self.deps.park_escalation_ns / std.time.ns_per_ms, len });
                 _ = self.deps.latch.noteFailure(.journal_write);
-                parked_since = null;
+                since = clock.monotonicNs();
             }
         }
     }
@@ -1890,6 +1919,17 @@ const Harness = struct {
         return true;
     }
 
+    /// Cycle until at least half the user slice is reusable again (a dying
+    /// floor from a flush-pass SMO clamps one cycle's tail: reclamation
+    /// lags a cycle, as it does on the device).
+    fn coverRing(h: *Harness, user_cap: u64) !void {
+        for (0..8) |_| {
+            if (h.vol.core.headPos() - h.vol.core.reusableUpto() <= user_cap / 2) return;
+            _ = try h.checkpoint();
+        }
+        return error.RingNotCovered;
+    }
+
     fn checkpointPastFn(ctx: *anyopaque, pos: u64) bool {
         const h: *Harness = @ptrCast(@alignCast(ctx));
         if (h.fail_checkpoint_past) return false;
@@ -2270,8 +2310,76 @@ test "the admission park: a ring too full for the batch parks the pass holding n
     }
     try testing.expect(h.park_kicks > first_kicks);
     try testing.expect(h.cv.stats.full_stalls.load() > 0);
+    try testing.expectEqual(@as(u64, 0), h.cv.stats.park_tick_rescues.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
     try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
+}
+
+/// A committer thread that commits until the conveyor's stall count moves
+/// past `stalls_before` (its own pass parked and resumed).
+const ParkingCommitter = struct {
+    h: *Harness,
+    stalls_before: u64,
+    tag: []const u8,
+    err: ?anyerror = null,
+
+    fn run(self: *ParkingCommitter) void {
+        var n: u64 = 0;
+        while (self.h.cv.stats.full_stalls.load() == self.stalls_before) : (n += 1) {
+            var nb: [16]u8 = undefined;
+            _ = self.h.commitCreate(std.fmt.bufPrint(&nb, "{s}{d}", .{ self.tag, n }) catch unreachable) catch |e| {
+                self.err = e;
+                return;
+            };
+        }
+    }
+};
+
+test "the admission park wakes on the notify, never the tick: a pass parked on a full ring resumes on another thread's space wake with zero tick rescues; the tick alone (no wake) is counted as the rescue it is" {
+    const h = try Harness.create(.{ .ring_pages = 80 }, null, false);
+    defer h.destroy();
+    // The kick runs nothing: the ring is opened by the OTHER thread below.
+    h.park_runs_cycle = false;
+    defer test_seams.hold_at_park.store(0, .release);
+    const user_cap = ringUserCapacity(h.vol.journal.geo);
+    var i: u64 = 0;
+    while (h.vol.core.headPos() + 4096 < user_cap / 2) : (i += 1) {
+        var nb: [12]u8 = undefined;
+        _ = try h.commitCreate(try std.fmt.bufPrint(&nb, "fill{d}", .{i}));
+    }
+    // Round 1: the pass parks and is held in the window between its
+    // registration on `space` and its wait; this thread covers the ring and
+    // sends THE wake (what `afterDurableBarrier` does on every barrier that
+    // moves `reusable_upto`); released, the pass resumes on the wake.
+    test_seams.hold_at_park.store(1, .release);
+    test_seams.park_held.store(0, .release);
+    var p: ParkingCommitter = .{ .h = h, .stalls_before = 0, .tag = "park" };
+    const t = try std.Thread.spawn(.{}, ParkingCommitter.run, .{&p});
+    while (test_seams.park_held.load(.acquire) == 0) try std.Thread.yield();
+    try h.coverRing(user_cap);
+    h.space.notifyWaiters(testing.io);
+    test_seams.hold_at_park.store(0, .release);
+    t.join();
+    if (p.err) |e| return e;
+    try testing.expectEqual(@as(u64, 1), h.cv.stats.full_stalls.load());
+    try testing.expectEqual(@as(u64, 0), h.cv.stats.park_tick_rescues.load());
+    // Round 2: the ring is covered WITHOUT a wake — only the backstop tick
+    // can end the park, and it is counted as the rescue it is.
+    while (h.vol.core.headPos() + 4096 < h.vol.core.reusableUpto() + user_cap / 2) : (i += 1) {
+        var nb: [12]u8 = undefined;
+        _ = try h.commitCreate(try std.fmt.bufPrint(&nb, "fill{d}", .{i}));
+    }
+    test_seams.hold_at_park.store(1, .release);
+    test_seams.park_held.store(0, .release);
+    var p2: ParkingCommitter = .{ .h = h, .stalls_before = 1, .tag = "late" };
+    const t2 = try std.Thread.spawn(.{}, ParkingCommitter.run, .{&p2});
+    while (test_seams.park_held.load(.acquire) == 0) try std.Thread.yield();
+    try h.coverRing(user_cap);
+    test_seams.hold_at_park.store(0, .release);
+    t2.join();
+    if (p2.err) |e| return e;
+    try testing.expectEqual(@as(u64, 2), h.cv.stats.full_stalls.load());
+    try testing.expectEqual(@as(u64, 1), h.cv.stats.park_tick_rescues.load());
 }
 
 test "coalesced vs strict: a coalesced ack precedes the barrier (acked ≠ durable until the trailing barrier); a strict ack never precedes it; fsync is the trailing barrier" {
@@ -2372,7 +2480,7 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_pass_panics" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
 }

@@ -237,6 +237,13 @@ pub const MaintenanceSource = struct {
     }
 };
 
+/// The admission parkers' futex Notify with the `Io` its wake needs (a
+/// barrier is never a hot path).
+pub const SpaceWake = struct {
+    notify: *sync.Notify,
+    io: Io,
+};
+
 /// The heap-full sweep's report.
 pub const SweepReport = struct {
     merges: u64 = 0,
@@ -412,8 +419,12 @@ pub const Checkpointer = struct {
     barrier_starts: std.atomic.Value(u64) = .init(0),
     barrier_durable: std.atomic.Value(u64) = .init(0),
     reclaim: ledger.ReclaimQueue,
-    /// Admission parkers register here; bumped when `reusable_upto` moves.
-    space_notify: jc.Notify = .{},
+    /// THE admission-parker wake: the conveyor's Σ-admission parks on this
+    /// Notify and `afterDurableBarrier` is its one notifier, whichever
+    /// thread's barrier moved `reusable_upto` (the task's, the lane's, a
+    /// committer's space retry) — so the park's tick is a lost-wake
+    /// backstop, never the transport. Null until the backend binds it.
+    space_wake: ?SpaceWake = null,
 
     // ---- the cadence's references ----
     /// The last cycle's END (the flat age law's reference).
@@ -575,7 +586,7 @@ pub const Checkpointer = struct {
         }
         if (moved) {
             self.reusable_upto.set(self.deps.core.reusableUpto());
-            self.space_notify.notifyWaiters();
+            if (self.space_wake) |w| w.notify.notifyWaiters(w.io);
         }
     }
 
@@ -1160,11 +1171,6 @@ pub const CheckpointTask = struct {
     /// checkpoint — held around every `runOnce`; the tests' solo task runs
     /// unlocked.
     serial: ?*Io.Mutex = null,
-    /// Admission parkers (the conveyor's Σ-admission) wait here; woken
-    /// after a run that moved `reusable_upto` (the futex face of the
-    /// checkpointer's `space_notify` poll word).
-    space_wake: ?*sync.Notify = null,
-    last_reusable_upto: u64 = 0,
 
     pub fn init(cp: *Checkpointer, io: Io) CheckpointTask {
         const period = ckpt.checkpointTickPeriodMs(cp.cfg.flush_interval_ms) * ns_per_ms;
@@ -1251,13 +1257,6 @@ pub const CheckpointTask = struct {
                 defer if (self.serial) |m| m.unlock(self.io);
                 break :blk self.runOnce(woke, clock.monotonicNs());
             };
-            if (self.space_wake) |n| {
-                const r = self.cp.deps.core.reusableUpto();
-                if (r != self.last_reusable_upto) {
-                    self.last_reusable_upto = r;
-                    n.notifyWaiters(self.io);
-                }
-            }
             if (!more) return;
         }
     }
@@ -1499,8 +1498,11 @@ test "a full cycle over an in-RAM volume: dirty nodes are flushed and their floo
     try testing.expect(tape.total_ns > 0);
     // The second barrier (the lane's next trailing one, here direct):
     // all three watermarks move on one clock; the free inside the window
-    // releases, the one past the tail stays parked.
-    const token = v.cp.space_notify.register();
+    // releases, the one past the tail stays parked; the parkers wake.
+    var space: sync.Notify = .init;
+    v.cp.space_wake = .{ .notify = &space, .io = testing.io };
+    var parker = space.notified();
+    try testing.expect(!parker.enable(testing.io));
     try v.cp.syncDevice();
     try testing.expectEqual(@as(u64, 2), v.barriers);
     try testing.expectEqual(head, v.core.reusableUpto());
@@ -1510,7 +1512,8 @@ test "a full cycle over an in-RAM volume: dirty nodes are flushed and their floo
     try testing.expect(!v.alloc.isAllocated(e_in));
     try testing.expect(v.alloc.isAllocated(e_out));
     try testing.expectEqual(@as(usize, 0), v.cp.reclaim.len());
-    try testing.expect(v.cp.space_notify.firedSince(token));
+    try testing.expect(parker.enable(testing.io));
+    parker.cancel(testing.io);
     // A barrier with nothing pending moves nothing.
     try v.cp.syncDevice();
     try testing.expectEqual(head, v.core.reusableUpto());
@@ -1854,6 +1857,42 @@ test "the task on its own thread under std.testing.io: the cadence fires off the
     const h = task.hook();
     h.call(h.ctx);
     try testing.expect(task.wake.permit);
+}
+
+test "ONE space wake: every barrier that moves reusable_upto — a direct checkpointNow (a committer's space retry, the lane's hole checkpoint), another issuer's landed ticket — wakes the admission parkers' Notify itself, with no task loop and no tick in between" {
+    const v = try TestVol.create(50, 1000);
+    defer v.destroy();
+    try v.writeLeaf(0, 1);
+    const a = (try v.cache.load(TestVol.addrOf(0))).?;
+    defer a.release();
+    var space: sync.Notify = .init;
+    v.cp.space_wake = .{ .notify = &space, .io = testing.io };
+    // A parker registers, then re-checks (the enable-then-recheck law);
+    // nothing has moved yet.
+    var parker = space.notified();
+    try testing.expect(!parker.enable(testing.io));
+    _ = try v.commit(a, &.{"a1"}, 100);
+    // The committer's own space-retry cycle, on ITS thread: no `runOnce`.
+    try v.cp.checkpointNow();
+    try testing.expectEqual(v.core.headPos(), v.core.reusableUpto());
+    try testing.expect(parker.enable(testing.io));
+    parker.cancel(testing.io);
+    // Another issuer's barrier (the lane's) landing a ticket wakes too.
+    var parker2 = space.notified();
+    try testing.expect(!parker2.enable(testing.io));
+    _ = try v.commit(a, &.{"a2"}, 100);
+    try v.cp.checkpointCadence();
+    try testing.expect(!parker2.enable(testing.io));
+    v.cp.barrierLanded(v.cp.barrierStarted());
+    try testing.expectEqual(v.core.headPos(), v.core.reusableUpto());
+    try testing.expect(parker2.enable(testing.io));
+    parker2.cancel(testing.io);
+    // A barrier that moves nothing wakes nobody.
+    var parker3 = space.notified();
+    try testing.expect(!parker3.enable(testing.io));
+    try v.cp.syncDevice();
+    try testing.expect(!parker3.enable(testing.io));
+    parker3.cancel(testing.io);
 }
 
 test "cover loops: coverBringUpResidue cycles until reusable_upto == head and is a no-op when covered; checkpointPast clears a hole end within the bound and refuses loud past it" {

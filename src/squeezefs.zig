@@ -38,11 +38,22 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
-    // @anchor:meta_k1_import
-    // @anchor:meta_k3_import
-    // @anchor:meta_k4_import
+    pub const key = @import("meta/key.zig");
+    pub const record = @import("meta/record.zig");
+    pub const bset = @import("meta/bset.zig");
+    pub const journal_core = @import("meta/journal_core.zig");
+    pub const journal_core_model = @import("meta/journal_core_model.zig");
+    pub const journal = @import("meta/journal.zig");
+    pub const ledger = @import("meta/ledger.zig");
+    pub const alloc_core = @import("meta/alloc_core.zig");
+    pub const alloc_ext = @import("meta/alloc_ext.zig");
+    pub const superblock = @import("meta/superblock.zig");
+    pub const geometry = @import("meta/geometry.zig");
     // @anchor:meta_k2_import
     // @anchor:meta_k6_import
+    pub const node_state_core = @import("meta/node_state_core.zig");
+    pub const epoch_core = @import("meta/epoch_core.zig");
+    pub const conveyor_core = @import("meta/conveyor_core.zig");
 };
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
@@ -66,11 +77,22 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:meta_k1_test
-    // @anchor:meta_k3_test
-    // @anchor:meta_k4_test
+    _ = meta.key;
+    _ = meta.record;
+    _ = meta.bset;
+    _ = meta.journal_core;
+    _ = meta.journal_core_model;
+    _ = meta.journal;
+    _ = meta.ledger;
+    _ = meta.alloc_core;
+    _ = meta.alloc_ext;
+    _ = meta.superblock;
+    _ = meta.geometry;
     // @anchor:meta_k2_test
     // @anchor:meta_k6_test
+    _ = meta.node_state_core;
+    _ = meta.epoch_core;
+    _ = meta.conveyor_core;
     _ = mem_budget;
     _ = align_probe;
     if (builtin.os.tag == .linux) _ = uring_fs;

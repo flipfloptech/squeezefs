@@ -70,6 +70,7 @@ const alloc_ext = @import("alloc_ext.zig");
 const heap_law = @import("heap_law.zig");
 const inos = @import("inos.zig");
 const node_seq = @import("node_seq.zig");
+const tree = @import("tree.zig");
 const ckpt = @import("checkpoint.zig");
 
 pub const CachedNode = node_cache.CachedNode;
@@ -199,6 +200,41 @@ pub const SmoOutcome = union(enum) {
     /// No structural task is bound (`SmoSeam.none`).
     declined,
     failed: FlushFailure,
+};
+
+/// The threshold maintenance queue the task drains — the trees' lock-free
+/// `tree.MaintenanceQueue`s, which the commit path fills (A10) and the
+/// backend round-robins over; one queue in the portable tests. ONE queue
+/// family, one drain: a second queue the commit path never fills left the
+/// writeback threshold inert on every mounted volume.
+pub const MaintenanceSource = struct {
+    ctx: *anyopaque,
+    /// The next queued address, or null when every queue is empty.
+    pop: *const fn (ctx: *anyopaque) ?u64,
+    /// Whether anything is queued (the task's re-arm test).
+    pending: *const fn (ctx: *anyopaque) bool,
+    /// Queue `addr` again for the next drain (a reserve deferral's retry).
+    requeue: *const fn (ctx: *anyopaque, addr: u64) void,
+
+    /// One `tree.MaintenanceQueue` as the source (tests, a one-tree volume).
+    pub fn ofQueue(q: *tree.MaintenanceQueue) MaintenanceSource {
+        return .{ .ctx = q, .pop = queuePop, .pending = queuePending, .requeue = queueRequeue };
+    }
+
+    fn queuePop(ctx: *anyopaque) ?u64 {
+        const q: *tree.MaintenanceQueue = @ptrCast(@alignCast(ctx));
+        return q.pop();
+    }
+
+    fn queuePending(ctx: *anyopaque) bool {
+        const q: *tree.MaintenanceQueue = @ptrCast(@alignCast(ctx));
+        return !q.isEmpty();
+    }
+
+    fn queueRequeue(ctx: *anyopaque, addr: u64) void {
+        const q: *tree.MaintenanceQueue = @ptrCast(@alignCast(ctx));
+        if (!q.push(addr)) tree.stats.meta_kv_maintenance_queue_full.inc();
+    }
 };
 
 /// The heap-full sweep's report.
@@ -352,6 +388,7 @@ pub const Deps = struct {
     pages: PageSink,
     record: RecordSource,
     smo: SmoSeam,
+    maintenance: MaintenanceSource,
 };
 
 /// The per-volume checkpoint state and protocol. SERIALIZED: every cycle,
@@ -419,9 +456,7 @@ pub const Checkpointer = struct {
     space_retry: heap_law.SpaceRetryHold = .{},
     merge_backlog: bool = false,
 
-    // ---- the threshold maintenance queue (the trees enqueue, the task drains) ----
-    maint_lock: jc.SpinLock = .{},
-    maintenance: std.ArrayList(u64) = .empty,
+    // ---- the threshold drain ----
     /// The addr whose last maintenance item deferred for the reserve: a second
     /// deferral in a row leaves it to the cadence's flush pass (no spin).
     reserve_deferred_addr: ?u64 = null,
@@ -443,7 +478,6 @@ pub const Checkpointer = struct {
 
     pub fn deinit(self: *Checkpointer) void {
         self.reclaim.deinit();
-        self.maintenance.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -495,24 +529,9 @@ pub const Checkpointer = struct {
 
     // ---- the maintenance queue ----
 
-    /// A node crossed the writeback threshold: queue it for the next drain.
-    pub fn enqueueMaintenance(self: *Checkpointer, addr: u64) Allocator.Error!void {
-        self.maint_lock.lock();
-        defer self.maint_lock.unlock();
-        try self.maintenance.append(self.gpa, addr);
-    }
-
-    pub fn maintenancePending(self: *Checkpointer) bool {
-        self.maint_lock.lock();
-        defer self.maint_lock.unlock();
-        return self.maintenance.items.len != 0;
-    }
-
-    fn popMaintenance(self: *Checkpointer) ?u64 {
-        self.maint_lock.lock();
-        defer self.maint_lock.unlock();
-        if (self.maintenance.items.len == 0) return null;
-        return self.maintenance.orderedRemove(0);
+    /// Whether the trees' queues hold a node for the drain.
+    pub fn maintenancePending(self: *const Checkpointer) bool {
+        return self.deps.maintenance.pending(self.deps.maintenance.ctx);
     }
 
     // ---- the barrier (DUR-3) ----
@@ -1023,10 +1042,11 @@ pub const Checkpointer = struct {
     /// cycle and retries the item once; a `NoSpace` deferral latches the
     /// posture and leaves the node to the cadence's flush pass.
     pub fn drainMaintenance(self: *Checkpointer, budget_in: DrainBudget) CycleError!void {
+        const src = self.deps.maintenance;
         var budget = budget_in;
         var sample: ckpt.FlushPassSample = .{};
         while (budget.admits(clock.monotonicNs())) {
-            const addr = self.popMaintenance() orelse break;
+            const addr = src.pop(src.ctx) orelse break;
             const n = self.deps.cache.tryGet(addr) orelse continue;
             defer n.release();
             const t0 = clock.monotonicNs();
@@ -1042,9 +1062,7 @@ pub const Checkpointer = struct {
                     }
                     self.reserve_deferred_addr = addr;
                     try self.checkpointCycle(true);
-                    self.maint_lock.lock();
-                    defer self.maint_lock.unlock();
-                    try self.maintenance.insert(self.gpa, 0, addr);
+                    src.requeue(src.ctx, addr);
                 },
                 .deferred_space => _ = self.posture.enter(self.cfg.volume, "threshold maintenance: the SMO could not claim an extent", self.spaceSnapshot()),
                 .failed => return failureError(r.failure),
@@ -1277,6 +1295,8 @@ const TestVol = struct {
     seq_handle: node_seq.NodeSeqHandle,
     roots: [1]TreeRoot,
     flusher: CacheFlusher,
+    /// The one tree queue the threshold drain pops from.
+    maintenance: tree.MaintenanceQueue,
     cp: Checkpointer,
     barriers: u64 = 0,
     fail_barrier: bool = false,
@@ -1316,6 +1336,8 @@ const TestVol = struct {
         const boot = try ledger.bootstrapRecord(&v.roots, 2, 100, null).encodeSlot();
         @memcpy(v.ledger_image[4096 .. 2 * 4096], &boot);
         v.flusher = .{ .cache = v.cache, .smo = SmoSeam.none };
+        v.maintenance = try tree.MaintenanceQueue.init(gpa, tree.MAINTENANCE_QUEUE_FLOOR);
+        errdefer v.maintenance.deinit(gpa);
         v.cp = Checkpointer.init(gpa, .{
             .volume = "test-vol",
             .max_age_ms = max_age_ms,
@@ -1335,6 +1357,7 @@ const TestVol = struct {
             .pages = .{ .ctx = v, .writePage = writePageFn },
             .record = .{ .ctx = v, .treeRoots = treeRootsFn, .next_ino = &v.ino, .node_seq = &v.seq_handle },
             .smo = SmoSeam.none,
+            .maintenance = MaintenanceSource.ofQueue(&v.maintenance),
         });
         return v;
     }
@@ -1342,6 +1365,7 @@ const TestVol = struct {
     fn destroy(v: *TestVol) void {
         const gpa = v.gpa;
         v.cp.deinit();
+        v.maintenance.deinit(gpa);
         v.slots_written.deinit(gpa);
         gpa.free(v.ledger_image);
         gpa.free(v.bitmap);
@@ -1769,7 +1793,8 @@ test "the task: a park-mark kick makes an immediate barriered cycle with a caden
     // A threshold wake: the maintenance pass appends the queued node; no
     // record, no barrier.
     _ = try v.commit(a, &.{"a1"}, 100);
-    try v.cp.enqueueMaintenance(a.addr);
+    try testing.expect(v.maintenance.push(a.addr));
+    try testing.expect(v.cp.maintenancePending());
     task.kick(.threshold);
     try testing.expect(task.runOnce(true, now));
     try testing.expectEqual(@as(u64, 1), v.ram.appends.load(.monotonic));

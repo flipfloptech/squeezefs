@@ -268,6 +268,8 @@ pub const KvBackend = struct {
     cv: *conveyor.Conveyor,
     ino: inos.InoWatermark,
     replay: ReplayStats,
+    /// The threshold drain's round-robin position over `trees` (task-owned).
+    maintenance_cursor: usize = 0,
     closed: bool = false,
 
     // ---- open ----
@@ -502,6 +504,7 @@ pub const KvBackend = struct {
             .pages = be.dev.pageSink(),
             .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membership_stamp = be.mounted.membership_stamp },
             .smo = be.ckpt_seam.seam(),
+            .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
         });
         errdefer be.cp.deinit();
         be.smo_ctx.space_retry = be.cp.spaceRetryHold();
@@ -636,6 +639,39 @@ pub const KvBackend = struct {
     fn treeRootsFn(ctx: *anyopaque, gpa: Allocator, out: *std.ArrayList(ledger.TreeRoot)) Allocator.Error!void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         for (be.trees) |t| try out.append(gpa, t.ledgerRoot());
+    }
+
+    /// The threshold drain's source: the trees' queues, round-robin from
+    /// the tree after the last pop so a storm on one tree never starves
+    /// another's items (every queue is lock-free; the task is the one popper).
+    fn popMaintenance(ctx: *anyopaque) ?u64 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const n = be.trees.len;
+        for (0..n) |_| {
+            be.maintenance_cursor = (be.maintenance_cursor + 1) % n;
+            if (be.trees[be.maintenance_cursor].popMaintenance()) |addr| return addr;
+        }
+        return null;
+    }
+
+    fn maintenancePending(ctx: *anyopaque) bool {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        for (be.trees) |t| if (t.maintenancePending()) return true;
+        return false;
+    }
+
+    /// A deferred item goes back on its owner's queue; a node the cache no
+    /// longer maps has nothing left to maintain.
+    fn requeueMaintenance(ctx: *anyopaque, addr: u64) void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const n = be.cache.tryGet(addr) orelse return;
+        defer n.release();
+        for (be.trees) |t| {
+            if (t.owns(n)) {
+                t.enqueueMaintenance(addr);
+                return;
+            }
+        }
     }
 
     /// The ledger slot through the device, with the kill matrix's C9/C10
@@ -1328,6 +1364,40 @@ test "4-thread commit storm with concurrent checkpoints, then reopen: every ack 
         for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
     }
     if (try fsckClean(gpa, v.path())) |clean| try testing.expect(clean);
+}
+
+test "threshold writeback on a mounted volume: commits that push one leaf over the writeback threshold are drained by the checkpoint task — the bset page is appended before any cadence cycle, the tree's queue empties, queue_full stays 0" {
+    const gpa = testing.allocator;
+    // A 600 s flush interval: no cadence tick and no lane barrier fires on
+    // its own, so every append below is the threshold drain's.
+    const v = try TestVol.create(gpa, "threshold", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    const xattrs = be.treeOf(key.TREE_XATTRS).?;
+    const items0 = checkpoint.stats.meta_kv_maintenance_items.load();
+    const appends0 = device_loader.stats.appends.load();
+    const checkpoints0 = checkpoint.stats.meta_kv_checkpoints.load();
+    const queue_full0 = tree.stats.meta_kv_maintenance_queue_full.load();
+    // One page of xattr value per create: the xattr leaf's open delta
+    // crosses `writeback_delta_bytes` (one bset page) on every commit.
+    for (0..3) |i| {
+        var nb: [16]u8 = undefined;
+        const t = try be.begin(@src());
+        _ = try stageCreate(be, t, try std.fmt.bufPrint(&nb, "thr-{d}", .{i}), node_cache.DEFAULT_WRITEBACK_DELTA_BYTES);
+        try be.commit(t);
+    }
+    // The task drains on its own thread; the bound is a failure, not a wait.
+    const started = clock.monotonicNs();
+    while (xattrs.maintenancePending() or checkpoint.stats.meta_kv_maintenance_items.load() == items0) {
+        if (clock.monotonicNs() - started > 10 * std.time.ns_per_s) return error.ThresholdDrainNeverRan;
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(checkpoint.stats.meta_kv_maintenance_items.load() > items0);
+    try testing.expect(device_loader.stats.appends.load() > appends0);
+    try testing.expectEqual(checkpoints0, checkpoint.stats.meta_kv_checkpoints.load());
+    try testing.expectEqual(queue_full0, tree.stats.meta_kv_maintenance_queue_full.load());
+    for (be.trees) |t| try testing.expect(!t.maintenancePending());
 }
 
 test "the admission park on the device: the smallest ring fills under a serial create stream (every commit a grain-padded window), the pass parks holding no node lock, the park kick runs a barriered cycle, every commit lands" {

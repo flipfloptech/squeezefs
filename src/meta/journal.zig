@@ -1101,6 +1101,13 @@ pub const FailureLatch = struct {
         self.counter(class).store(0, .release);
     }
 
+    /// The protocol-terminal latch for non-write, non-barrier terminals (the
+    /// §4.7 wedged-tail bound): FAILED at once; true iff THIS call latched
+    /// (the caller logs once on true).
+    pub fn failStop(self: *FailureLatch) bool {
+        return !self.failed.swap(true, .acq_rel);
+    }
+
     pub fn isFailed(self: *const FailureLatch) bool {
         return self.failed.load(.acquire);
     }
@@ -2024,6 +2031,12 @@ test "failure latch: three consecutive journal failures latch once; a success re
     // Already latched: no second log, no second "latched now".
     try testing.expect(!latch.noteFailure(.barrier));
     try testing.expectEqual(JOURNAL_FAILURE_LATCH, @as(u32, 3));
+    // The protocol-terminal latch: once, then inert.
+    var wedge: FailureLatch = .{};
+    try testing.expect(wedge.failStop());
+    try testing.expect(wedge.isFailed());
+    try testing.expect(!wedge.failStop());
+    try testing.expectError(error.VolumeFailed, wedge.admitMutation());
 }
 
 test "power-cut harness: unsynced writes revert in reverse order; synced writes survive" {

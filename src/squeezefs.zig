@@ -38,6 +38,10 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
+    pub const tree = @import("meta/tree.zig");
+    pub const smo = @import("meta/smo.zig");
+    pub const leaf_merge = @import("meta/leaf_merge.zig");
+    pub const checkpoint = @import("meta/checkpoint.zig");
     pub const node_snapshot = @import("meta/node_snapshot.zig");
     pub const node_cache = @import("meta/node_cache.zig");
     pub const economy = @import("meta/economy.zig");
@@ -90,6 +94,10 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    _ = meta.tree;
+    _ = meta.smo;
+    _ = meta.leaf_merge;
+    _ = meta.checkpoint;
     _ = meta.node_snapshot;
     _ = meta.node_cache;
     _ = meta.economy;

@@ -36,6 +36,8 @@ pub const Outcome = enum {
     woken,
     /// One full tick elapsed with the word still 0: re-register and re-contend.
     ticked,
+    /// The caller's own deadline (`parkUntil`) passed first with the word still 0.
+    deadline,
 };
 
 /// Park while `word` reads 0, for at most one tick. Spurious returns
@@ -44,21 +46,40 @@ pub const Outcome = enum {
 /// closes the window between the caller's registration and the sleep: a
 /// token stored before the sleep makes the wait return at once.
 pub fn park(io: Io, word: *std.atomic.Value(u32), counter: *counters.ShardedCounter) Io.Cancelable!Outcome {
-    const deadline = clock.monotonicNs() + tick_ns;
+    return parkUntil(io, word, std.math.maxInt(u64), counter);
+}
+
+/// `park` bounded by the caller's own monotonic deadline as well: returns
+/// `.deadline` when `deadline_ns` passes before a token or the tick (the
+/// cadence task's `timeout_at(next_tick, notified())`). The tick stays the
+/// liveness backstop underneath and still counts.
+pub fn parkUntil(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter: *counters.ShardedCounter) Io.Cancelable!Outcome {
+    const tick_deadline = clock.monotonicNs() + tick_ns;
+    const until = @min(tick_deadline, deadline_ns);
     while (true) {
         // acquire pairs with the waker's release swap: a woken caller sees
         // every write the waker made before handing over the token.
         if (word.load(.acquire) != 0) return .woken;
         const now = clock.monotonicNs();
-        if (now >= deadline) {
+        if (now >= until) {
+            if (deadline_ns <= tick_deadline) return .deadline;
             counter.inc();
             return .ticked;
         }
         try io.futexWaitTimeout(u32, &word.raw, 0, .{ .duration = .{
-            .raw = .fromNanoseconds(@intCast(deadline - now)),
+            .raw = .fromNanoseconds(@intCast(until - now)),
             .clock = .awake,
         } });
     }
+}
+
+/// `parkUntil` without a cancellation point (see `parkUncancelable`).
+pub fn parkUntilUncancelable(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter: *counters.ShardedCounter) Outcome {
+    const old = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(old);
+    return parkUntil(io, word, deadline_ns, counter) catch |err| switch (err) {
+        error.Canceled => unreachable,
+    };
 }
 
 /// `park` without a cancellation point (committers are never cancelled —
@@ -113,4 +134,28 @@ test "the uncancelable park under blocked protection returns .woken on a token" 
     var word: std.atomic.Value(u32) = .init(1);
     var c: counters.ShardedCounter = .{};
     try testing.expectEqual(Outcome.woken, parkUncancelable(io, &word, &c));
+}
+
+test "parkUntil: a passed deadline returns .deadline without counting a tick; a token still wins; a far deadline leaves the tick as the backstop" {
+    const io = testing.io;
+    var word: std.atomic.Value(u32) = .init(0);
+    var c: counters.ShardedCounter = .{};
+    try testing.expectEqual(Outcome.deadline, parkUntilUncancelable(io, &word, clock.monotonicNs() -| 1, &c));
+    try testing.expectEqual(Outcome.deadline, try parkUntil(io, &word, 0, &c));
+    try testing.expectEqual(@as(u64, 0), c.load());
+    wake(io, &word);
+    try testing.expectEqual(Outcome.woken, try parkUntil(io, &word, 0, &c));
+    // A deadline past the tick: the wait is the tick's (the futex timeout is
+    // bounded by it), so a token delivered from another thread ends it as
+    // .woken exactly like `park`.
+    word.store(0, .monotonic);
+    const Waker = struct {
+        fn run(w: *std.atomic.Value(u32)) void {
+            wake(testing.io, w);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Waker.run, .{&word});
+    try testing.expectEqual(Outcome.woken, try parkUntil(io, &word, std.math.maxInt(u64), &c));
+    t.join();
+    try testing.expectEqual(@as(u64, 0), c.load());
 }

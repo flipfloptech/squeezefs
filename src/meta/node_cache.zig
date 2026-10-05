@@ -187,15 +187,20 @@ pub var test_freeze_encode_fail: std.atomic.Value(u64) = .init(0);
 
 pub const LoaderError = error{Io};
 
-/// The device binding: one extent read, one tail-page append. Both are
-/// synchronous from the caller's view (the binding parks the task in its
-/// own ring).
+/// The device binding: one extent read, one tail-page append, one whole
+/// fresh-image write. All are synchronous from the caller's view (the
+/// binding parks the task in its own ring).
 pub const NodeLoader = struct {
     ctx: *anyopaque,
     /// Fill `buf` (`node_size` bytes, `NODE_PAGE`-aligned) from `addr`.
     readExtent: *const fn (ctx: *anyopaque, addr: u64, buf: []u8) LoaderError!void,
     /// Write `bytes` (a 4 KiB-padded frame) at `addr + off`.
     appendBset: *const fn (ctx: *anyopaque, addr: u64, off: usize, bytes: []const u8) LoaderError!void,
+    /// Land a fresh node image (`node.WrittenNode.image`: header page ‖
+    /// base frame) whole at `addr` — an SMO successor, a tree's first root.
+    /// Always a FRESH extent (CoW law §5.1), never an in-place rewrite of
+    /// a mapped one; the SMO task is its only caller.
+    writeImage: *const fn (ctx: *anyopaque, addr: u64, bytes: []const u8) LoaderError!void,
 };
 
 /// An in-RAM volume: the contracts' device.
@@ -203,6 +208,8 @@ pub const RamLoader = struct {
     bytes: []u8,
     reads: std.atomic.Value(u64) = .init(0),
     appends: std.atomic.Value(u64) = .init(0),
+    /// Fresh node images landed through `writeImage`.
+    images: std.atomic.Value(u64) = .init(0),
     /// Test seam: every append fails `error.Io`.
     fail_appends: std.atomic.Value(bool) = .init(false),
 
@@ -218,7 +225,13 @@ pub const RamLoader = struct {
     }
 
     pub fn loader(self: *RamLoader) NodeLoader {
-        return .{ .ctx = self, .readExtent = readExtent, .appendBset = appendBset };
+        return .{ .ctx = self, .readExtent = readExtent, .appendBset = appendBset, .writeImage = writeImage };
+    }
+
+    fn writeImage(ctx: *anyopaque, addr: u64, bytes: []const u8) LoaderError!void {
+        const self: *RamLoader = @ptrCast(@alignCast(ctx));
+        _ = self.images.fetchAdd(1, .monotonic);
+        self.write(addr, bytes);
     }
 
     fn readExtent(ctx: *anyopaque, addr: u64, buf: []u8) LoaderError!void {

@@ -120,6 +120,10 @@ pub const registry = [_]Knob{
     // ---- MetaLV node cache (read by meta/node_cache.zig) ----
     .{ .key = "SQUEEZEFS_META_NODE_CACHE_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "Per-volume node-cache budget, MiB, verbatim (absolute > SQUEEZEFS_META_NODE_CACHE_PCT > derived max(mem_budget/16, 512 MiB))." },
     .{ .key = "SQUEEZEFS_META_NODE_CACHE_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "Per-volume node-cache budget as a percentage of the R5 memory budget (below the absolute MiB knob, above the derived default)." },
+
+    // ---- MetaLV checkpoint task (read by meta/checkpoint.zig) ----
+    .{ .key = "SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 32 } }, .default = "derived", .class = .derived_override, .doc = "Dirty-node checkpoint cap = the mount-replay working-set bound: a cycle is due once more nodes than this hold un-durable records. Explicit wins verbatim; derived max(4096, mem_budget/32 ÷ node_size) — bounds the RAM pinned by dirty nodes AND the replay working set, 4096 the shipped floor (never regress below shipped: a lower cap checkpoints more often than any box ran, pure overhead)." },
+    .{ .key = "SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", .kind = .{ .int = .{ .lo = 1, .hi = MS_MAX } }, .default = "1000", .class = .tuning, .doc = "Checkpoint cadence ceiling, ms: a cycle runs at least this often with no other trigger (charter §5.3 'every ≤ 1 s'); also the reader's staleness term and the base of the landing ceiling max_age + 2 × tick (KD-SYM-10, 1,100 ms shipped). Floor 1 ms = the physical minimum of a cadence; ceiling the timing-knob bound." },
 };
 
 pub fn lookup(key: []const u8) ?*const Knob {

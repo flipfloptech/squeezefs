@@ -28,6 +28,7 @@ const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
 const tick = @import("tick.zig");
+const clock = @import("../core/clock.zig");
 
 pub const Notify = struct {
     interior: Io.Mutex = .init,
@@ -86,6 +87,45 @@ pub const Notify = struct {
             s.interior.lockUncancelable(io);
             defer s.interior.unlock(io);
             if (n.linked) s.unlinkLocked(n);
+        }
+
+        pub const WaitOutcome = enum {
+            /// A permit or an epoch bump satisfied the waiter (consumed, as `wait`).
+            notified,
+            /// The monotonic deadline passed first: the waiter is unregistered
+            /// and a permit stored for it stays for the next arrival (the
+            /// dropped-future shape of `cancel`).
+            deadline,
+        };
+
+        /// `waitUncancelable` bounded by a monotonic deadline — the cadence
+        /// task's `timeout_at(next_tick, wake.notified())`. The deadline is
+        /// judged under the interior lock, so a notify landing before it is
+        /// never reported as a timeout.
+        pub fn waitUntilUncancelable(n: *Notified, io: Io, deadline_ns: u64) WaitOutcome {
+            const s = n.notify;
+            while (true) {
+                {
+                    s.interior.lockUncancelable(io);
+                    defer s.interior.unlock(io);
+                    if (n.registered and s.epoch > n.registered_epoch) {
+                        if (n.linked) s.unlinkLocked(n);
+                        return .notified;
+                    }
+                    if (s.permit) {
+                        s.permit = false;
+                        if (n.linked) s.unlinkLocked(n);
+                        return .notified;
+                    }
+                    if (clock.monotonicNs() >= deadline_ns) {
+                        if (n.linked) s.unlinkLocked(n);
+                        return .deadline;
+                    }
+                    if (!n.linked) s.linkLocked(n);
+                    n.state.store(0, .monotonic);
+                }
+                _ = tick.parkUntilUncancelable(io, &n.state, deadline_ns, &tick.channel_ticked_reregisters);
+            }
         }
 
         fn waitInner(n: *Notified, io: Io, comptime cancelable: bool) Io.Cancelable!void {
@@ -325,4 +365,36 @@ test "a cancelled parked wait unregisters; the enable-then-recheck idiom over a 
     p.join();
     c.join();
     try testing.expectEqual(@as(u32, 0), s.n.waiters(io));
+}
+
+test "waitUntil: a passed deadline unregisters and keeps a later permit; a stored permit or epoch wins over the deadline; a cross-thread notify ends a far-deadline wait" {
+    const io = testing.io;
+    var n: Notify = .init;
+    var w = n.notified();
+    try testing.expectEqual(Notify.Notified.WaitOutcome.deadline, w.waitUntilUncancelable(io, 0));
+    try testing.expectEqual(@as(u32, 0), n.waiters(io));
+    // A permit stored after the timeout serves the next wait at once.
+    n.notifyOne(io);
+    var w2 = n.notified();
+    try testing.expectEqual(Notify.Notified.WaitOutcome.notified, w2.waitUntilUncancelable(io, 0));
+    try testing.expect(!n.permit);
+    // An epoch bump between enable and the wait completes it despite a passed deadline.
+    var w3 = n.notified();
+    try testing.expect(!w3.enable(io));
+    n.notifyWaiters(io);
+    try testing.expectEqual(Notify.Notified.WaitOutcome.notified, w3.waitUntilUncancelable(io, 0));
+    // A far deadline parks; a notify from another thread ends it.
+    const Parked = struct {
+        fn run(nt: *Notify, out: *Notify.Notified.WaitOutcome) void {
+            var pw = nt.notified();
+            out.* = pw.waitUntilUncancelable(testing.io, std.math.maxInt(u64));
+        }
+    };
+    var out: Notify.Notified.WaitOutcome = .deadline;
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ &n, &out });
+    while (n.waiters(io) == 0) try std.Thread.yield();
+    n.notifyOne(io);
+    t.join();
+    try testing.expectEqual(Notify.Notified.WaitOutcome.notified, out);
+    try testing.expect(!n.permit);
 }

@@ -1,0 +1,1233 @@
+//! The CoW btree over the node cache: traversal, the commit-side apply and
+//! mount replay (charter §5.1 "Node" — interior values `(child_addr,
+//! child_node_seq)`, a seq mismatch at read is a concurrent SMO ⇒ reload
+//! the parent snapshot and retry (bounded); §5.3 "SMOs" — writers resolve
+//! → lock → revalidate → retry (`commit_smo_retries`), replay is
+//! two-phase; §2 lock order 4b — the commit path locks LEAVES only; survey
+//! `docs/porting/kv_tree_cache_commit_survey.md` §2.11, §3.7, §7 row 6,
+//! §7.1; the reference's `tree.rs` `KvTree`).
+//!
+//! - `descend` is LATCH-FREE: every step reads an arc-swapped snapshot and
+//!   takes no node lock. A stale route (root retired / root seq / routing
+//!   hole / child retired / child seq) is a racing SMO's swap window and
+//!   restarts the walk from the (possibly swapped) root, yielding between
+//!   attempts, bounded by `node.RETRY_BUDGET`; the per-reason tallies ride
+//!   the exhaustion error because a budget exhaustion is a protocol bug
+//!   and the tallies make it self-describing (the K7 storm's
+//!   `[0,0,0,256,0]` — every restart on a retired child — WAS the
+//!   retire-before-flip ordering bug).
+//! - `applyAtSeqClass` is THE ONE lock-window primitive both live commits
+//!   and replay use: lock → revalidate (not superseded ∧ `min ≤ key ≤ max`
+//!   — SUPERSEDED is set before any mapping change, so it IS the "address
+//!   still bound to this object" check) → seq assigned INSIDE the window
+//!   (minted, reserved by the caller's stamper, or the replayed record's
+//!   own with the per-key LWW gate) → `applyLocked` → unlock → threshold
+//!   enqueue. A failed revalidation is `.stale`, counted on
+//!   `meta_kv_commit_smo_retries`; the caller re-resolves and retries,
+//!   bounded by the same budget.
+//! - Interior locks belong to the serialized SMO task (`smo.zig`,
+//!   `leaf_merge.zig`); this file touches one only for mount replay's
+//!   phase 1, which runs single-threaded before any SMO can exist.
+//!
+//! The SMO state machine and leaf merge live in `smo.zig` /
+//! `leaf_merge.zig`; this file is what they build on.
+
+const std = @import("std");
+const counters = @import("../core/counters.zig");
+const log = @import("../core/log.zig");
+const key = @import("key.zig");
+const rec = @import("record.zig");
+const node = @import("node.zig");
+const node_cache = @import("node_cache.zig");
+const node_seq = @import("node_seq.zig");
+const snapshot = @import("node_snapshot.zig");
+const journal = @import("journal.zig");
+const ledger = @import("ledger.zig");
+const alloc_ext = @import("alloc_ext.zig");
+const derive = @import("../core/derive.zig");
+const arc_swap = @import("../sync/arc_swap.zig");
+const leaf_merge = @import("leaf_merge.zig");
+
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+
+pub const Arc = arc_swap.Arc;
+pub const ArcSwap = arc_swap.ArcSwap;
+pub const NodeCache = node_cache.NodeCache;
+pub const CachedNode = node_cache.CachedNode;
+pub const NodeDirty = node_cache.NodeDirty;
+pub const OwnedRec = node_cache.OwnedRec;
+pub const NodeSeqHandle = node_seq.NodeSeqHandle;
+pub const RecordKind = rec.RecordKind;
+pub const ForestSlot = key.ForestSlot;
+pub const KEY_SPACE_MAX = key.KEY_SPACE_MAX;
+
+// ---------------------------------------------------------------------------
+// Observability (survey §5.5 names).
+// ---------------------------------------------------------------------------
+
+pub const stats = struct {
+    /// `meta_kv_commit_smo_retries`: lock-revalidate failures (an SMO
+    /// raced the resolve → lock window).
+    pub var meta_kv_commit_smo_retries: counters.ShardedCounter = .{};
+    /// A threshold enqueue found the bounded maintenance queue full: the
+    /// node stays dirty and the checkpoint's dirty walk flushes it (a
+    /// counted deferral, never a loss).
+    pub var meta_kv_maintenance_queue_full: counters.ShardedCounter = .{};
+};
+
+// ---------------------------------------------------------------------------
+// Errors.
+// ---------------------------------------------------------------------------
+
+pub const Error = node_cache.ChildError || rec.FoldError || error{
+    /// A traversal or writer retry budget exhausted (`node.RETRY_BUDGET`):
+    /// revalidation never passed — a routing loop, an SMO protocol bug.
+    RetryBudgetExhausted,
+    /// A content key must be non-empty and sort strictly below
+    /// `KEY_SPACE_MAX`; an interior separator at-or-below it.
+    InvalidKey,
+    /// A root pointer naming a node of another incarnation or tree, a
+    /// malformed interior value, a double supersede.
+    Corrupt,
+    /// The node-seq mint space is exhausted (remount for a fresh one).
+    SpaceExhausted,
+    /// The partitioning gate refused a mutation (a reader, a non-authority
+    /// interior write, an unleased leaf).
+    PartitionRefused,
+    /// A value above the per-volume cap `min(64 KiB, node_size/4) + 256`.
+    ValueTooLarge,
+};
+
+// ---------------------------------------------------------------------------
+// Root pointer, seq plans, outcomes.
+// ---------------------------------------------------------------------------
+
+/// A tree root pointer: the ledger's `(node_addr, node_seq)` pair.
+pub const RootPtr = struct {
+    addr: u64,
+    seq: u64,
+};
+
+/// A record's stamp: its seq and the §4.6 pt 2 floor contribution — the
+/// containing journal entry's START (FIND-SMO-TAIL §1b: a mid-entry tail
+/// drops the entry's ≥-tail acked records at replay; a fresh single-record
+/// apply is its own entry start).
+pub const Stamp = struct {
+    seq: u64,
+    entry_start: u64,
+};
+
+/// A caller that reserves its journal range INSIDE the leaf lock window:
+/// `stamp` runs after revalidation passes, with the lock held, and answers
+/// the record's seq and entry start — the conveyor's reserve-in-window
+/// discipline for one record (§5.2: per-key seq order equals RAM apply
+/// order only because the reservation is taken under the lock).
+pub const Stamper = struct {
+    ctx: *anyopaque,
+    /// The registry's open list grows only past its pre-sized capacity;
+    /// that allocation is the one way a reservation can fail.
+    stamp: *const fn (ctx: *anyopaque) Allocator.Error!Stamp,
+};
+
+/// How `applyAtSeqClass` assigns the record's seq inside the window.
+pub const SeqPlan = union(enum) {
+    /// Mint from the tree's seq handle (the record IS its own entry start)
+    /// — the standalone shape every tree-level contract drives.
+    mint,
+    /// Mount replay: the record's ORIGINAL seq and its entry start, with
+    /// the per-key LWW gate (a seq at-or-below the node's newest for the
+    /// key is already folded in — skipped, identical by the fold theorem).
+    replay: Stamp,
+    /// A live commit whose reservation the caller takes under the lock.
+    reserve: Stamper,
+};
+
+/// What `applyAtSeqClass` did.
+pub const ApplyOutcome = enum {
+    /// Records applied and the snapshot swapped (or, in replay, already
+    /// folded in).
+    applied,
+    /// Revalidation failed: the leaf was superseded or the key left its
+    /// range between resolution and lock (an SMO) — re-resolve and retry.
+    stale,
+};
+
+/// A live `(key, value)` a range walk returned; owned copies.
+pub const KeyValue = struct {
+    key: []u8,
+    value: []u8,
+
+    pub fn deinit(self: *KeyValue, gpa: Allocator) void {
+        gpa.free(self.key);
+        gpa.free(self.value);
+        self.* = undefined;
+    }
+};
+
+pub fn deinitKeyValues(gpa: Allocator, list: *std.ArrayList(KeyValue)) void {
+    for (list.items) |*kv| kv.deinit(gpa);
+    list.deinit(gpa);
+}
+
+// ---------------------------------------------------------------------------
+// The maintenance queue — a bounded lock-free MPMC ring of node addresses.
+// ---------------------------------------------------------------------------
+
+/// Maintenance-queue capacity floor: the smallest cache (16 shards × 1
+/// node) still queues a storm's worth of distinct nodes.
+pub const MAINTENANCE_QUEUE_FLOOR: u64 = 64;
+/// Capacity cap: one slot per node of the largest budget (`budget /
+/// node_size` at 16 GiB / 64 KiB = 2^18); 2^20 bounds the table at 16 MiB.
+pub const MAINTENANCE_QUEUE_CAP: u64 = 1 << 20;
+
+/// `clamp(next_pow2(budget_nodes), 64, 2^20)`: every node the cache can
+/// hold queues once legitimately (an address is re-queued only after its
+/// pop); duplicates beyond that are benign to drop — the flush pass's
+/// dirty walk flushes what the queue could not name.
+pub fn maintenanceQueueCapacity(budget_nodes: u64) usize {
+    return @intCast(derive.clamp(derive.nextPow2(@max(budget_nodes, 1)), MAINTENANCE_QUEUE_FLOOR, MAINTENANCE_QUEUE_CAP));
+}
+
+/// Read `addr`'s extent through the loader and build an UNPUBLISHED node
+/// for it — an SMO successor's load-back (verifies the fresh image and
+/// builds its snapshot zero-copy), a tree's first root. `cache.publish`
+/// maps it; the caller releases its reference.
+pub fn loadFresh(cache: *NodeCache, addr: u64, pinned: bool) node_cache.LoadError!*CachedNode {
+    const buf = try snapshot.SharedBuf.createExtent(cache.gpa, cache.cfg.layout.node_size);
+    cache.loader.readExtent(cache.loader.ctx, addr, buf.data) catch |e| {
+        buf.release();
+        return e;
+    };
+    return cache.buildNode(addr, buf, pinned);
+}
+
+/// Vyukov's bounded MPMC ring over `u64` addresses: commit threads push
+/// (one CAS on the producer cursor, then the payload store, then the
+/// slot-stamp RELEASE), the serialized SMO task pops (one CAS on the
+/// consumer cursor, the payload load, the vacate stamp RELEASE). The stamp
+/// publishes the payload: a consumer that observes `stamp == pos + 1`
+/// (acquire) sees the producer's address store. Publishing the stamp
+/// BEFORE the payload is the weakening `MaintenanceQueueModel` proves
+/// fails (a stale address pops). Hot ops allocate nothing.
+pub const MaintenanceQueue = struct {
+    const Slot = struct {
+        stamp: std.atomic.Value(usize),
+        addr: std.atomic.Value(u64),
+    };
+
+    slots: []Slot,
+    mask: usize,
+    head: std.atomic.Value(usize) align(std.atomic.cache_line),
+    tail: std.atomic.Value(usize) align(std.atomic.cache_line),
+
+    pub fn init(gpa: Allocator, capacity: usize) Allocator.Error!MaintenanceQueue {
+        assert(std.math.isPowerOfTwo(capacity));
+        const slots = try gpa.alloc(Slot, capacity);
+        for (slots, 0..) |*s, i| s.* = .{ .stamp = .init(i), .addr = .init(0) };
+        return .{ .slots = slots, .mask = capacity - 1, .head = .init(0), .tail = .init(0) };
+    }
+
+    pub fn deinit(self: *MaintenanceQueue, gpa: Allocator) void {
+        gpa.free(self.slots);
+        self.* = undefined;
+    }
+
+    /// Enqueue; `false` when full (the caller counts and lets the dirty
+    /// walk cover the node).
+    pub fn push(self: *MaintenanceQueue, addr: u64) bool {
+        var pos = self.head.load(.monotonic);
+        while (true) {
+            const slot = &self.slots[pos & self.mask];
+            // acquire pairs with the consumer's vacate release store.
+            const stamp = slot.stamp.load(.acquire);
+            if (stamp == pos) {
+                // acq_rel CAS: the winner owns the slot for this lap.
+                if (self.head.cmpxchgWeak(pos, pos + 1, .acq_rel, .monotonic)) |cur| {
+                    pos = cur;
+                    continue;
+                }
+                slot.addr.store(addr, .monotonic);
+                // release pairs with the consumer's acquire stamp load: the
+                // address store above is visible once the stamp publishes.
+                slot.stamp.store(pos + 1, .release);
+                return true;
+            } else if (stamp < pos) {
+                return false; // a lap behind: full
+            } else {
+                pos = self.head.load(.monotonic);
+            }
+        }
+    }
+
+    pub fn pop(self: *MaintenanceQueue) ?u64 {
+        var pos = self.tail.load(.monotonic);
+        while (true) {
+            const slot = &self.slots[pos & self.mask];
+            // acquire pairs with the producer's publish release store.
+            const stamp = slot.stamp.load(.acquire);
+            if (stamp == pos + 1) {
+                if (self.tail.cmpxchgWeak(pos, pos + 1, .acq_rel, .monotonic)) |cur| {
+                    pos = cur;
+                    continue;
+                }
+                const addr = slot.addr.load(.monotonic);
+                // release: vacate for the producer a lap ahead.
+                slot.stamp.store(pos + self.mask + 1, .release);
+                return addr;
+            } else if (stamp < pos + 1) {
+                return null; // empty
+            } else {
+                pos = self.tail.load(.monotonic);
+            }
+        }
+    }
+
+    /// Whether anything is queued (a snapshot; the SMO task's wake test).
+    pub fn isEmpty(self: *const MaintenanceQueue) bool {
+        return self.tail.load(.acquire) >= self.head.load(.acquire);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The tree.
+// ---------------------------------------------------------------------------
+
+/// One logical btree (per `tree_id`) over a shared per-volume `NodeCache`.
+pub const KvTree = struct {
+    gpa: Allocator,
+    tree_id: u8,
+    cache: *NodeCache,
+    /// The live root pointer — latch-free (`ArcSwap`); swapped only inside
+    /// an SMO's lock window.
+    root: ArcSwap(RootPtr),
+    /// The volume-shared node-seq mint; also the record-seq source of the
+    /// standalone (`.mint`) commit shape, assigned INSIDE the node-lock
+    /// window so per-key seq order equals RAM apply order.
+    seq: *NodeSeqHandle,
+    /// Addresses whose open delta crossed the writeback threshold —
+    /// drained by the SMO task's maintenance pass (duplicates benign).
+    maintenance: MaintenanceQueue,
+    /// The §4.6a merge sweep's resumable lap state — touched only by the
+    /// serialized SMO task that owns the `SmoContext`.
+    merge_cursor: leaf_merge.SweepCursor = .{},
+    /// `Some(slot)` ⇔ a SLOT TREE of a forest volume (every node carries
+    /// header id 0 and the slot stamp); null on every per-kind tree.
+    forest_slot: ?ForestSlot,
+    /// The journal position the LIVE root came into force at (0 = the root
+    /// the tree was opened with — durably named already). A root swap's
+    /// durable form is exclusively the next ledger record, so until one
+    /// lands the checkpoint tail must not pass this position.
+    root_floor: std.atomic.Value(u64),
+
+    /// Format a fresh, empty tree: claim one extent (`.internal` — tree
+    /// roots are format/checkpoint internals), write an empty leaf root
+    /// spanning the whole key space, publish it pinned.
+    pub fn create(gpa: Allocator, cache: *NodeCache, alloc: *const alloc_ext.ExtentAllocator, tree_id: u8, seq: *NodeSeqHandle) (Error || error{NoSpace})!*KvTree {
+        const extent = try alloc.claimInternal();
+        errdefer alloc.releaseUnpublished(extent);
+        const addr = cache.extentAddr(extent);
+        const ns = try seq.mint();
+        var w = try node.writeNode(gpa, cache.cfg.layout, .{
+            .node_addr = addr,
+            .node_seq = ns,
+            .tree_id = tree_id,
+            .level = 0,
+            .min_key = "",
+            .max_key = &KEY_SPACE_MAX,
+        }, &.{}, 0, null);
+        defer w.deinit(gpa);
+        try cache.loader.writeImage(cache.loader.ctx, addr, w.image);
+        const root_node = try loadFresh(cache, addr, true);
+        defer root_node.release();
+        try cache.publish(root_node);
+        return init(gpa, cache, tree_id, .{ .addr = addr, .seq = ns }, seq, null, 0);
+    }
+
+    /// Re-attach to an existing tree from its root pointer (the mount path:
+    /// superblock → ledger → roots). Verifies the root node's incarnation
+    /// and tree id against the pointer (a torn or stale ledger word never
+    /// installs an unverified root) and pins it.
+    pub fn open(gpa: Allocator, cache: *NodeCache, tree_id: u8, root: RootPtr, seq: *NodeSeqHandle) Error!*KvTree {
+        const n = try cache.get(root.addr);
+        defer n.release();
+        if (n.node_seq != root.seq) {
+            log.err("root pointer stale: ledger says node_seq {d}, extent 0x{x} holds {d}", .{ root.seq, root.addr, n.node_seq });
+            return error.Corrupt;
+        }
+        if (n.tree_id != tree_id) {
+            log.err("root tree_id mismatch: expected {d}, extent 0x{x} holds {d}", .{ tree_id, root.addr, n.tree_id });
+            return error.Corrupt;
+        }
+        n.pin();
+        return init(gpa, cache, tree_id, root, seq, null, 0);
+    }
+
+    /// `open` from a ledger record: the root the record names for
+    /// `tree_id` (`error.Corrupt` when the record names no such tree).
+    pub fn openFromLedger(gpa: Allocator, cache: *NodeCache, record: *const ledger.LedgerRecord, tree_id: u8, seq: *NodeSeqHandle) Error!*KvTree {
+        for (record.tree_roots) |r| {
+            if (r.tree_id == tree_id) return open(gpa, cache, tree_id, .{ .addr = r.node_addr, .seq = r.node_seq }, seq);
+        }
+        log.err("ledger record {d} names no root for tree {d}", .{ record.seq, tree_id });
+        return error.Corrupt;
+    }
+
+    fn init(gpa: Allocator, cache: *NodeCache, tree_id: u8, root: RootPtr, seq: *NodeSeqHandle, slot: ?ForestSlot, root_floor: u64) Allocator.Error!*KvTree {
+        const root_arc = try Arc(RootPtr).create(gpa, root);
+        errdefer root_arc.release();
+        var queue = try MaintenanceQueue.init(gpa, maintenanceQueueCapacity(cache.cfg.budget_bytes / @max(cache.cfg.layout.node_size, 1)));
+        errdefer queue.deinit(gpa);
+        const self = try gpa.create(KvTree);
+        self.* = .{
+            .gpa = gpa,
+            .tree_id = tree_id,
+            .cache = cache,
+            .root = .init(root_arc),
+            .seq = seq,
+            .maintenance = queue,
+            .forest_slot = slot,
+            .root_floor = .init(root_floor),
+        };
+        return self;
+    }
+
+    pub fn destroy(self: *KvTree) void {
+        self.root.deinit();
+        self.maintenance.deinit(self.gpa);
+        self.gpa.destroy(self);
+    }
+
+    // ---- identity ----
+
+    /// The current root pointer (what a checkpoint names in its ledger
+    /// record).
+    pub fn rootPtr(self: *KvTree) RootPtr {
+        const a = self.root.load();
+        defer a.release();
+        return a.value;
+    }
+
+    /// Swap the root pointer — SMO-only, inside the lock window.
+    pub fn storeRoot(self: *KvTree, root: RootPtr) Allocator.Error!void {
+        self.root.store(try Arc(RootPtr).create(self.gpa, root));
+    }
+
+    /// The ledger face of the root.
+    pub fn ledgerRoot(self: *KvTree) ledger.TreeRoot {
+        const r = self.rootPtr();
+        return .{ .tree_id = self.tree_id, .node_addr = r.addr, .node_seq = r.seq };
+    }
+
+    pub fn rootFloor(self: *const KvTree) u64 {
+        return self.root_floor.load(.acquire);
+    }
+
+    /// A root swap came into force at journal position `floor`: release
+    /// pairs with `rootFloor`'s acquire (the ledger writer's read).
+    pub fn setRootFloor(self: *KvTree, floor: u64) void {
+        self.root_floor.store(floor, .release);
+    }
+
+    pub fn isRoot(self: *KvTree, n: *const CachedNode) bool {
+        return self.rootPtr().addr == n.addr;
+    }
+
+    /// Whether `n` belongs to THIS tree: by header id — and, on a slot
+    /// tree, by the owner stamp too.
+    pub fn owns(self: *const KvTree, n: *const CachedNode) bool {
+        if (n.tree_id != self.tree_id) return false;
+        const slot = self.forest_slot orelse return true;
+        return n.forestSlot() == slot;
+    }
+
+    /// Stamp `n` with this tree's slot (a no-op on per-kind trees).
+    pub fn stamp(self: *const KvTree, n: *CachedNode) void {
+        if (self.forest_slot) |s| n.stampForestSlot(s);
+    }
+
+    /// The JOURNAL key of one of this tree's interior pointer records: the
+    /// separator itself on a per-kind tree; `slot ‖ separator` on a slot
+    /// tree (a separator alone cannot name the tree — every tree's top one
+    /// is `KEY_SPACE_MAX`).
+    pub fn interiorJournalKey(self: *const KvTree, separator: []const u8) key.KeyBuf {
+        if (self.forest_slot) |s| return key.interiorJournalKey(s, separator);
+        return key.KeyBuf.fromSlice(separator);
+    }
+
+    /// This tree's elision tail — the ONE tail every fold / merge decision
+    /// of this tree reads.
+    pub fn durableTail(self: *const KvTree) u64 {
+        return self.cache.durableTail();
+    }
+
+    /// Root level: 0 = a single-leaf tree, 1 = one interior level, …
+    pub fn rootLevel(self: *KvTree) Error!u8 {
+        const n = try self.cache.get(self.rootPtr().addr);
+        defer n.release();
+        return n.level;
+    }
+
+    // ---- maintenance queue ----
+
+    pub fn maintenancePending(self: *const KvTree) bool {
+        return !self.maintenance.isEmpty();
+    }
+
+    /// Enqueue a node for the next maintenance pass (duplicates benign; a
+    /// full queue is a counted deferral the dirty walk covers).
+    pub fn enqueueMaintenance(self: *KvTree, addr: u64) void {
+        if (!self.maintenance.push(addr)) stats.meta_kv_maintenance_queue_full.inc();
+    }
+
+    pub fn popMaintenance(self: *KvTree) ?u64 {
+        return self.maintenance.pop();
+    }
+
+    // ---- latch-free traversal ----
+
+    /// `tryGet` then the demand page; `null` = a retired extent (stale route).
+    fn fetch(self: *KvTree, addr: u64) node_cache.LoadError!?*CachedNode {
+        if (self.cache.tryGet(addr)) |n| return n;
+        return self.cache.loadForSlot(addr, self.forest_slot);
+    }
+
+    /// Descend from the current root to the node of `target_level` whose
+    /// range holds `k` — latch-free (module doc). The caller releases the
+    /// returned reference.
+    pub fn descend(self: *KvTree, k: []const u8, target_level: u8) Error!*CachedNode {
+        const gpa = self.cache.gpa;
+        // Restart-reason tallies `[root-retired, root-seq, routing-hole,
+        // child-retired, child-seq]`, carried into the exhaustion error.
+        var reasons: [5]u32 = @splat(0);
+        var attempt: u32 = 0;
+        restart: while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
+            // Cooperative restart: every reason to be here is a racing
+            // SMO's swap window and the cache misses short-circuit
+            // synchronously, so a spinning walker would burn the whole
+            // budget inside one held window; yielding turns the budget
+            // into 256 scheduling opportunities, not 256 spins.
+            if (attempt > 0) std.Thread.yield() catch std.atomic.spinLoopHint();
+            const root = self.rootPtr();
+            var cur = (try self.fetch(root.addr)) orelse {
+                reasons[0] += 1;
+                continue :restart;
+            };
+            // A device error mid-walk drops the reference the walk holds.
+            errdefer cur.release();
+            if (cur.node_seq != root.seq) {
+                cur.release();
+                reasons[1] += 1;
+                continue :restart;
+            }
+            while (true) {
+                if (cur.level == target_level) {
+                    self.stamp(cur);
+                    return cur;
+                }
+                if (cur.level < target_level) {
+                    // A §4.6a root collapse lowered the height under this
+                    // walk (the ONLY way a tree shrinks): restart at the
+                    // new root.
+                    cur.release();
+                    continue :restart;
+                }
+                const snap = cur.snapshotLoad();
+                defer snap.release();
+                var live = (try snap.value.nextLive(gpa, k, null)) orelse {
+                    cur.release();
+                    reasons[2] += 1;
+                    continue :restart; // routing hole: a stale snapshot raced an SMO
+                };
+                defer live.deinit();
+                const iv = key.InteriorValue.decode(live.value) catch return error.Corrupt;
+                const child = (try self.fetch(iv.childAddr())) orelse {
+                    cur.release();
+                    reasons[3] += 1;
+                    continue :restart; // retired extent: stale route
+                };
+                if (child.node_seq != iv.childSeq()) {
+                    child.release();
+                    cur.release();
+                    reasons[4] += 1;
+                    continue :restart; // §5.1 stale pointer
+                }
+                cur.release();
+                cur = child;
+            }
+        }
+        const root = self.rootPtr();
+        log.err("tree {d} (root 0x{x}@{d}): traversal retry budget exhausted descending to level {d} (routing loop — SMO protocol bug) restarts [root-retired, root-seq, routing-hole, child-retired, child-seq] = {any}", .{ self.tree_id, root.addr, root.seq, target_level, reasons });
+        return error.RetryBudgetExhausted;
+    }
+
+    /// Resolve `k` to its leaf — the commit path's latch-free step.
+    pub fn resolveLeaf(self: *KvTree, k: []const u8) Error!*CachedNode {
+        return self.descend(k, 0);
+    }
+
+    /// Resolve `n`'s parent: descend to `n.level + 1` routing by `n.min_key`
+    /// (the partition rule makes the child's own separator the first one
+    /// ≥ its min). Stable during an SMO — SMOs are serialized.
+    pub fn resolveParent(self: *KvTree, n: *const CachedNode) Error!*CachedNode {
+        return self.descend(n.min_key, n.level + 1);
+    }
+
+    // ---- point reads ----
+
+    /// Latch-free point lookup: pinned-interior traverse + leaf snapshot
+    /// fold. `null` for tombstoned and never-written keys alike; the
+    /// value is an OWNED copy (`gpa.free`).
+    pub fn lookup(self: *KvTree, gpa: Allocator, k: []const u8) Error!?[]u8 {
+        const leaf = try self.resolveLeaf(k);
+        defer leaf.release();
+        const snap = leaf.snapshotLoad();
+        defer snap.release();
+        var l = try snap.value.lookup(gpa, k);
+        defer l.deinit();
+        const v = l.liveValue() orelse return null;
+        return try gpa.dupe(u8, v);
+    }
+
+    // ---- the commit path: resolve → lock → revalidate → apply ----
+
+    /// THE lock-window primitive (module doc). Never performs I/O and
+    /// never touches an interior lock on the live path.
+    pub fn applyAtSeqClass(self: *KvTree, leaf: *CachedNode, k: []const u8, kind: RecordKind, value: []const u8, plan: SeqPlan, structural: bool) Error!ApplyOutcome {
+        const io = self.cache.io;
+        const d = leaf.lockWrite(io);
+        if (leaf.state.isSuperseded() or key.lessThan(k, leaf.min_key) or key.lessThan(leaf.max_key, k)) {
+            leaf.unlockWrite(io);
+            stats.meta_kv_commit_smo_retries.inc();
+            return .stale;
+        }
+        const st: Stamp = switch (plan) {
+            .replay => |s| blk: {
+                // Per-key LWW replay gate: an old-ledger mount reads node
+                // bsets that already materialized part of the window; a
+                // record whose seq is ≤ the node's newest for the key is
+                // already folded in — re-applying it would sort an overlay
+                // record BELOW the base and break the newest-first order.
+                const snap = leaf.snapshotLoad();
+                defer snap.release();
+                if (snap.value.newestSeqOf(k)) |newest| {
+                    if (newest >= s.seq) {
+                        leaf.unlockWrite(io);
+                        return .applied;
+                    }
+                }
+                break :blk s;
+            },
+            .mint => blk: {
+                const s = self.seq.mint() catch {
+                    leaf.unlockWrite(io);
+                    return error.SpaceExhausted;
+                };
+                break :blk .{ .seq = s, .entry_start = s };
+            },
+            .reserve => |r| r.stamp(r.ctx) catch {
+                leaf.unlockWrite(io);
+                return error.OutOfMemory;
+            },
+        };
+        var recs = [_]OwnedRec{OwnedRec.fromRecordRef(self.gpa, .{ .key = k, .seq = st.seq, .kind = kind, .value = value }) catch {
+            leaf.unlockWrite(io);
+            return error.OutOfMemory;
+        }};
+        const applied = if (structural) leaf.applyLockedStructural(d, &recs, st.entry_start) else leaf.applyLocked(d, &recs, st.entry_start);
+        applied catch |e| {
+            leaf.unlockWrite(io);
+            return switch (e) {
+                // Superseded under our lock: a mapping replaced outside the
+                // SMO path — the revalidation class, retried.
+                error.Superseded => blk: {
+                    stats.meta_kv_commit_smo_retries.inc();
+                    break :blk .stale;
+                },
+                error.ReaderMayNotMutate, error.NonAuthorityInterior, error.LeafLeaseRefused => error.PartitionRefused,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
+        const over_threshold = d.overlayBytes() >= self.cache.cfg.writeback_delta_bytes;
+        leaf.unlockWrite(io);
+        if (over_threshold) self.enqueueMaintenance(leaf.addr);
+        return .applied;
+    }
+
+    /// The single-record live shape: minted seq, content class.
+    pub fn applyAt(self: *KvTree, leaf: *CachedNode, k: []const u8, kind: RecordKind, value: []const u8) Error!ApplyOutcome {
+        return self.applyAtSeqClass(leaf, k, kind, value, .mint, false);
+    }
+
+    fn checkKey(k: []const u8) Error!void {
+        if (k.len == 0 or !key.lessThan(k, &KEY_SPACE_MAX)) return error.InvalidKey;
+    }
+
+    /// Interior separators live in a wider domain: the rightmost sibling's
+    /// is exactly `KEY_SPACE_MAX`, and every rightmost-leaf SMO journals a
+    /// pointer record under it — replay must accept it.
+    fn checkInteriorKey(k: []const u8) Error!void {
+        if (k.len == 0 or key.lessThan(&KEY_SPACE_MAX, k)) return error.InvalidKey;
+    }
+
+    /// The writer loop: resolve → `applyAtSeqClass` → retry on `.stale`,
+    /// bounded by `node.RETRY_BUDGET`.
+    pub fn mutate(self: *KvTree, k: []const u8, kind: RecordKind, value: []const u8, plan: SeqPlan) Error!void {
+        try checkKey(k);
+        var attempt: u32 = 0;
+        while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
+            const leaf = try self.resolveLeaf(k);
+            defer leaf.release();
+            switch (try self.applyAtSeqClass(leaf, k, kind, value, plan, false)) {
+                .applied => return,
+                .stale => continue,
+            }
+        }
+        log.err("tree {d}: writer retry budget exhausted (revalidation never passed — SMO protocol bug)", .{self.tree_id});
+        return error.RetryBudgetExhausted;
+    }
+
+    /// Insert / overwrite `k` (a `Put`; per-key LWW by seq). Values above
+    /// the per-volume cap are refused typed.
+    pub fn insert(self: *KvTree, k: []const u8, value: []const u8) Error!void {
+        if (value.len > self.cache.cfg.layout.recordValueCapOf()) return error.ValueTooLarge;
+        return self.mutate(k, .put, value, .mint);
+    }
+
+    /// Delete `k` (a tombstone; unconditional — elided at compaction once
+    /// durable).
+    pub fn delete(self: *KvTree, k: []const u8) Error!void {
+        return self.mutate(k, .delete, &.{}, .mint);
+    }
+
+    // ---- mount replay (two-phase) ----
+
+    /// Phase-2 content replay: resolve → lock → revalidate → apply with
+    /// the record's JOURNAL seq (per-key LWW must reproduce the pre-crash
+    /// history, so replay never mints). The seq handle is floored above
+    /// the replayed seq so post-replay mints stay newer.
+    pub fn applyReplayed(self: *KvTree, k: []const u8, seq: u64, kind: RecordKind, value: []const u8, entry_start: u64) Error!void {
+        try checkKey(k);
+        self.seq.raiseTo(seq);
+        var attempt: u32 = 0;
+        while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
+            const leaf = try self.resolveLeaf(k);
+            defer leaf.release();
+            switch (try self.applyAtSeqClass(leaf, k, kind, value, .{ .replay = .{ .seq = seq, .entry_start = entry_start } }, false)) {
+                .applied => return,
+                .stale => continue,
+            }
+        }
+        log.err("tree {d}: replay retry budget exhausted (no SMO can be running at mount)", .{self.tree_id});
+        return error.RetryBudgetExhausted;
+    }
+
+    /// Phase-1 interior replay: route to the level-`level` node covering
+    /// `k` and apply with the record's journal seq. `false` = DROPPED, never
+    /// loud: the mounted (older) ledger may predate a root growth, so the
+    /// mounted tree is shorter than the crashed one and the pointer's
+    /// target parent does not exist — sound, because content replays by
+    /// key through the old routing; the successor extents stay allocated
+    /// but unreferenced (a bounded crash-window leak for fsck).
+    pub fn applyReplayedInterior(self: *KvTree, k: []const u8, level: u8, seq: u64, kind: RecordKind, value: []const u8, entry_start: u64) Error!bool {
+        try checkInteriorKey(k);
+        self.seq.raiseTo(seq);
+        if (try self.rootLevel() < level) return false;
+        var attempt: u32 = 0;
+        while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
+            const target = try self.descend(k, level);
+            defer target.release();
+            switch (try self.applyAtSeqClass(target, k, kind, value, .{ .replay = .{ .seq = seq, .entry_start = entry_start } }, true)) {
+                .applied => return true,
+                .stale => continue,
+            }
+        }
+        log.err("tree {d}: interior replay retry budget exhausted (no SMO can be running at mount)", .{self.tree_id});
+        return error.RetryBudgetExhausted;
+    }
+
+    // ---- range scans ----
+
+    /// Append up to `max` live `(key, value)` with `start ≤ key ≤ end`
+    /// (memcmp order) to `out`, fold-walked leaf by leaf over held
+    /// snapshots — latch-free; a concurrent SMO at worst retries the NEXT
+    /// leaf's resolution. Resume with `start = key_successor(last key)`.
+    pub fn range(self: *KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(KeyValue)) Error!void {
+        if (max == 0 or key.lessThan(end, start)) return;
+        var cursor = key.KeyBuf.fromSlice(start);
+        var got: usize = 0;
+        while (true) {
+            const leaf = try self.descend(cursor.slice(), 0);
+            defer leaf.release();
+            const snap = leaf.snapshotLoad();
+            defer snap.release();
+            var pos = cursor;
+            while (got < max) {
+                // Bounded by `end` BEFORE any fold: the walk never folds the
+                // tombstone desert beyond the requested window.
+                var live = (try snap.value.nextLive(gpa, pos.slice(), end)) orelse break;
+                defer live.deinit();
+                const k = try gpa.dupe(u8, live.key);
+                errdefer gpa.free(k);
+                const v = try gpa.dupe(u8, live.value);
+                errdefer gpa.free(v);
+                try out.append(gpa, .{ .key = k, .value = v });
+                got += 1;
+                pos = key.keySuccessor(live.key);
+            }
+            if (got >= max or !key.lessThan(leaf.max_key, end)) return;
+            // The next leaf: the partition rule makes successor(max_key) the
+            // right sibling's exact min_key.
+            cursor = key.keySuccessor(leaf.max_key);
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The two-phase replay driver over a volume's mounted trees.
+// ---------------------------------------------------------------------------
+
+/// What one replay pass did.
+pub const ReplayOutcome = struct {
+    /// Phase-1 pointer records routed into an interior node.
+    interior_applied: u64 = 0,
+    /// Phase-1 pointer records the mounted (shorter) structure could not
+    /// route — dropped sound and silent.
+    interior_dropped: u64 = 0,
+    /// Phase-2 content records applied (or LWW-skipped).
+    content: u64 = 0,
+    /// Records of trees not in `trees` (allocator deltas, unmounted kinds).
+    skipped: u64 = 0,
+};
+
+fn treeFor(trees: []const *KvTree, tree_id: u8) ?*KvTree {
+    for (trees) |t| if (t.tree_id == tree_id) return t;
+    return null;
+}
+
+fn kindOf(k: journal.RecordKind) RecordKind {
+    return @fromBackingInt(@intCast(@backingInt(k)));
+}
+
+/// Mount replay, two-phase (charter §5.3): phase 1 applies every interior
+/// record ordered `(level DESC, seq)` — upper flips route lower ones, and a
+/// leaf-SMO flip is itself "content" to the interior it applies to, so a
+/// pure-seq order would strand it exactly as single-pass replay stranded
+/// leaf content; the node-seq mint is raised above every child incarnation
+/// a `Put` names. Phase 2 applies content records at their original seqs
+/// by key through the now-FINAL routing, so every record folds into the
+/// node covering its key in the final structure (whose image the SMO
+/// barriered before its flip could exist). Both phases walk the SAME
+/// checksummed entries, so neither can see half a transaction. Replay is
+/// read-only into the cache and `(level DESC, seq)` is a deterministic
+/// total order — replaying twice folds to one digest.
+pub fn replayEntries(gpa: Allocator, trees: []const *KvTree, entries: []const journal.ReplayedEntry) Error!ReplayOutcome {
+    var out: ReplayOutcome = .{};
+    const interior = try journal.interiorRecordsSorted(gpa, entries);
+    defer gpa.free(interior);
+    for (interior) |r| {
+        const t = treeFor(trees, r.tree_id) orelse {
+            out.skipped += 1;
+            continue;
+        };
+        const kind = kindOf(r.record.kind);
+        if (kind == .put) {
+            if (key.InteriorValue.decode(r.record.value)) |iv| t.seq.raiseTo(iv.childSeq()) else |_| {}
+        }
+        if (try t.applyReplayedInterior(r.record.key, r.level, r.record.seq, kind, r.record.value, r.entry_seq)) {
+            out.interior_applied += 1;
+        } else {
+            out.interior_dropped += 1;
+        }
+    }
+    for (entries) |e| {
+        var it = e.records();
+        while (it.next()) |r| {
+            const tag = journal.untag(r.tag);
+            if (tag.level > 0) continue; // phase 1 applied it
+            const t = treeFor(trees, tag.tree_id) orelse {
+                out.skipped += 1;
+                continue;
+            };
+            try t.applyReplayed(r.key, r.seq, kindOf(r.kind), r.value, e.seq);
+            out.content += 1;
+        }
+    }
+    return out;
+}
+
+/// The ledger writer's roots: one `TreeRoot` per tree, in `trees` order.
+pub fn roots(trees: []const *KvTree, out: []ledger.TreeRoot) []ledger.TreeRoot {
+    assert(out.len >= trees.len);
+    for (trees, 0..) |t, i| out[i] = t.ledgerRoot();
+    return out[0..trees.len];
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the row-6 contracts over the standalone (`.mint`) shape; the SMO
+// contracts live in `smo.zig` and `leaf_merge.zig` over `smo.TestVolume`.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const smo = @import("smo.zig");
+const explorer = @import("../model/explorer.zig");
+
+fn ikey(i: u64) [key.INODE_KEY_LEN]u8 {
+    return key.inodeKey(i);
+}
+
+/// A `len`-byte value carrying `i` in its first 8 bytes.
+pub fn testValue(i: u64, len: usize, buf: []u8) []u8 {
+    assert(len >= 8 and buf.len >= len);
+    @memset(buf[0..len], @truncate(i % 251));
+    std.mem.writeInt(u64, buf[0..8], i, .little);
+    return buf[0..len];
+}
+
+fn expectLookup(t: *KvTree, k: []const u8, want: ?[]const u8) !void {
+    const got = try t.lookup(testing.allocator, k);
+    defer if (got) |g| testing.allocator.free(g);
+    if (want) |w| {
+        try testing.expectEqualSlices(u8, w, got orelse return error.TestExpectedLive);
+    } else {
+        try testing.expectEqual(@as(?[]u8, null), got);
+    }
+}
+
+test "maintenance queue capacity tie: clamp(next_pow2(budget_nodes), 64, 2^20)" {
+    try testing.expectEqual(@as(usize, 64), maintenanceQueueCapacity(0));
+    try testing.expectEqual(@as(usize, 64), maintenanceQueueCapacity(37));
+    try testing.expectEqual(@as(usize, 2048), maintenanceQueueCapacity(2048));
+    try testing.expectEqual(@as(usize, 4096), maintenanceQueueCapacity(2049));
+    try testing.expectEqual(@as(usize, 1 << 20), maintenanceQueueCapacity(1 << 30));
+}
+
+test "maintenance queue: FIFO, bounded, full is a refusal, pop on empty is null, wraps across laps" {
+    var q = try MaintenanceQueue.init(testing.allocator, 4);
+    defer q.deinit(testing.allocator);
+    try testing.expect(q.isEmpty());
+    try testing.expectEqual(@as(?u64, null), q.pop());
+    for (1..5) |i| try testing.expect(q.push(i * 100));
+    try testing.expect(!q.push(999));
+    try testing.expect(!q.isEmpty());
+    try testing.expectEqual(@as(?u64, 100), q.pop());
+    try testing.expectEqual(@as(?u64, 200), q.pop());
+    try testing.expect(q.push(500));
+    try testing.expect(q.push(600));
+    try testing.expectEqual(@as(?u64, 300), q.pop());
+    try testing.expectEqual(@as(?u64, 400), q.pop());
+    try testing.expectEqual(@as(?u64, 500), q.pop());
+    try testing.expectEqual(@as(?u64, 600), q.pop());
+    try testing.expectEqual(@as(?u64, null), q.pop());
+    try testing.expect(q.isEmpty());
+}
+
+test "maintenance queue: 8 producers × 256 pushes against one consumer lose and duplicate nothing" {
+    var q = try MaintenanceQueue.init(testing.allocator, 1 << 12);
+    defer q.deinit(testing.allocator);
+    const Producer = struct {
+        fn run(queue: *MaintenanceQueue, base: u64) void {
+            for (0..256) |i| while (!queue.push(base + i)) std.atomic.spinLoopHint();
+        }
+    };
+    var ts: [8]std.Thread = undefined;
+    for (&ts, 0..) |*t, w| t.* = try std.Thread.spawn(.{}, Producer.run, .{ &q, @as(u64, w) * 1000 });
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    var got: usize = 0;
+    while (got < 8 * 256) {
+        const a = q.pop() orelse {
+            std.atomic.spinLoopHint();
+            continue;
+        };
+        try testing.expect(!seen.contains(a));
+        try seen.put(a, {});
+        got += 1;
+    }
+    for (ts) |t| t.join();
+    try testing.expectEqual(@as(?u64, null), q.pop());
+}
+
+/// The queue's dependency-free MODEL (charter §9): two producers, one
+/// consumer, capacity 2, every atomic action a step. The consumer must
+/// never pop an address no producer pushed (a stale slot payload), never
+/// pop one twice, and at the end the two pushed addresses were popped
+/// exactly once (or still sit in the queue). `publish_before_payload` is
+/// the WEAKENING: the producer stores the stamp before the address, and
+/// the consumer pops the slot's stale `0`.
+fn MaintenanceQueueModel(comptime publish_before_payload: bool) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const cap: usize = 2;
+
+        stamp: [cap]usize = .{ 0, 1 },
+        addr: [cap]u64 = .{ 0, 0 },
+        head: usize = 0,
+        tail: usize = 0,
+        pc: [3]u8 = @splat(0),
+        pos: [3]usize = @splat(0),
+        seen: [3]usize = @splat(0),
+        popped: [2]u8 = @splat(0),
+        pops: u8 = 0,
+        bad_pop: bool = false,
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return self.pc[t] == 255;
+        }
+
+        pub fn key(self: *const Self) u64 {
+            var h = std.hash.Wyhash.init(0);
+            std.hash.autoHash(&h, self.*);
+            return h.final();
+        }
+
+        fn producerAddr(t: usize) u64 {
+            return @as(u64, t) + 1;
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            if (t < 2) {
+                // Producer: 0 load head; 1 load stamp; 2 CAS head; 3/4 the
+                // two stores (order by the weakening); 255 done.
+                switch (self.pc[t]) {
+                    0 => {
+                        self.pos[t] = self.head;
+                        self.pc[t] = 1;
+                    },
+                    1 => {
+                        self.seen[t] = self.stamp[self.pos[t] % cap];
+                        self.pc[t] = if (self.seen[t] == self.pos[t]) 2 else 0;
+                    },
+                    2 => {
+                        if (self.head == self.pos[t]) {
+                            self.head += 1;
+                            self.pc[t] = 3;
+                        } else self.pc[t] = 0;
+                    },
+                    3 => {
+                        if (publish_before_payload) self.stamp[self.pos[t] % cap] = self.pos[t] + 1 else self.addr[self.pos[t] % cap] = producerAddr(t);
+                        self.pc[t] = 4;
+                    },
+                    4 => {
+                        if (publish_before_payload) self.addr[self.pos[t] % cap] = producerAddr(t) else self.stamp[self.pos[t] % cap] = self.pos[t] + 1;
+                        self.pc[t] = 255;
+                    },
+                    else => unreachable,
+                }
+                return;
+            }
+            // Consumer: pops until it has taken two addresses or observed
+            // both producers done with an empty queue.
+            switch (self.pc[t]) {
+                0 => {
+                    self.pos[t] = self.tail;
+                    self.pc[t] = 1;
+                },
+                1 => {
+                    self.seen[t] = self.stamp[self.pos[t] % cap];
+                    if (self.seen[t] == self.pos[t] + 1) {
+                        self.pc[t] = 2;
+                    } else if (self.pc[0] == 255 and self.pc[1] == 255 and self.tail == self.head) {
+                        self.pc[t] = 255;
+                    } else self.pc[t] = 0;
+                },
+                2 => {
+                    if (self.tail == self.pos[t]) {
+                        self.tail += 1;
+                        self.pc[t] = 3;
+                    } else self.pc[t] = 0;
+                },
+                3 => {
+                    const a = self.addr[self.pos[t] % cap];
+                    if (a == 0 or a > 2 or self.popped[@intCast(a - 1)] != 0) self.bad_pop = true else self.popped[@intCast(a - 1)] = 1;
+                    self.pops += 1;
+                    self.pc[t] = 4;
+                },
+                4 => {
+                    self.stamp[self.pos[t] % cap] = self.pos[t] + cap;
+                    self.pc[t] = if (self.pops == 2) 255 else 0;
+                },
+                else => unreachable,
+            }
+        }
+
+        pub fn invariant(self: *const Self) !void {
+            if (self.bad_pop) return error.StalePayloadPopped;
+        }
+
+        pub fn final(self: *const Self) !void {
+            if (self.head != 2 or self.tail != 2) return error.NotDrained;
+            if (self.popped[0] != 1 or self.popped[1] != 1) return error.LostPush;
+        }
+    };
+}
+
+test "model: the maintenance queue publishes each address exactly once; the stamp-before-payload weakening pops a stale slot" {
+    try explorer.expectHolds(MaintenanceQueueModel(false), .{});
+    try explorer.expectFails(MaintenanceQueueModel(true), .{}, error.InvariantViolated);
+}
+
+test "interior value roundtrip and bounds (the traversal's pointer format)" {
+    const v = key.encodeInteriorValue(0x1234_5678_9ABC_DEF0, 42);
+    try testing.expectEqual(@as(usize, 16), v.len);
+    const iv = try key.InteriorValue.decode(&v);
+    try testing.expectEqual(@as(u64, 0x1234_5678_9ABC_DEF0), iv.childAddr());
+    try testing.expectEqual(@as(u64, 42), iv.childSeq());
+    try testing.expectError(error.Corrupt, key.InteriorValue.decode(v[0..15]));
+    const oversized: [17]u8 = @splat(0);
+    try testing.expectError(error.Corrupt, key.InteriorValue.decode(&oversized));
+}
+
+test "point_ops_insert_overwrite_delete_reinsert: LWW by seq, tombstones fold to absent, keys are non-empty and below the sentinel" {
+    var vol = try smo.TestVolume.init(testing.allocator, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(key.TREE_INODES);
+    var buf: [64]u8 = undefined;
+    try expectLookup(t, &ikey(7), null);
+    try t.insert(&ikey(7), testValue(7, 32, &buf));
+    try expectLookup(t, &ikey(7), testValue(7, 32, &buf));
+    try t.insert(&ikey(7), testValue(700, 48, &buf));
+    try expectLookup(t, &ikey(7), testValue(700, 48, &buf));
+    try t.delete(&ikey(7));
+    try expectLookup(t, &ikey(7), null);
+    try t.insert(&ikey(7), testValue(7000, 16, &buf));
+    try expectLookup(t, &ikey(7), testValue(7000, 16, &buf));
+    try testing.expectError(error.InvalidKey, t.insert("", "x"));
+    try testing.expectError(error.InvalidKey, t.insert(&KEY_SPACE_MAX, "x"));
+    // The value cap: 64 KiB nodes ⇒ 16 KiB + the 256 B xattr envelope.
+    const cap = vol.cache.cfg.layout.recordValueCapOf();
+    try testing.expectEqual(@as(usize, 16 * 1024 + 256), cap);
+    const big = try testing.allocator.alloc(u8, cap + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    try t.insert(&ikey(1), big[0..cap]);
+    try testing.expectError(error.ValueTooLarge, t.insert(&ikey(2), big));
+}
+
+test "range_scan_folds_orders_and_resumes: tombstones and overwrites fold through the scan; chunks stitch; both bounds hold" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(key.TREE_INODES);
+    var buf: [64]u8 = undefined;
+    for (0..200) |i| try t.insert(&ikey(i), testValue(i, 24, &buf));
+    var i: u64 = 0;
+    while (i < 200) : (i += 3) try t.delete(&ikey(i));
+    try t.insert(&ikey(100), testValue(9999, 40, &buf));
+
+    var all: std.ArrayList(KeyValue) = .empty;
+    defer deinitKeyValues(gpa, &all);
+    try t.range(gpa, &ikey(0), &ikey(199), std.math.maxInt(usize), &all);
+    var want: usize = 0;
+    for (0..200) |n| {
+        if (n % 3 == 0) continue;
+        try testing.expectEqualSlices(u8, &ikey(n), all.items[want].key);
+        if (n == 100) try testing.expectEqualSlices(u8, testValue(9999, 40, &buf), all.items[want].value);
+        want += 1;
+    }
+    try testing.expectEqual(want, all.items.len);
+
+    // Bounded + resumable: chunks of 7 stitch to the same stream.
+    var resumed: std.ArrayList(KeyValue) = .empty;
+    defer deinitKeyValues(gpa, &resumed);
+    var start = key.KeyBuf.fromSlice(&ikey(0));
+    while (true) {
+        const before = resumed.items.len;
+        try t.range(gpa, start.slice(), &ikey(199), 7, &resumed);
+        if (resumed.items.len == before) break;
+        start = key.keySuccessor(resumed.items[resumed.items.len - 1].key);
+    }
+    try testing.expectEqual(all.items.len, resumed.items.len);
+    for (all.items, resumed.items) |a, r| try testing.expectEqualSlices(u8, a.key, r.key);
+
+    // Sub-ranges respect both bounds.
+    var mid: std.ArrayList(KeyValue) = .empty;
+    defer deinitKeyValues(gpa, &mid);
+    try t.range(gpa, &ikey(50), &ikey(60), std.math.maxInt(usize), &mid);
+    var want_mid: usize = 0;
+    for (50..61) |n| want_mid += @intFromBool(n % 3 != 0);
+    try testing.expectEqual(want_mid, mid.items.len);
+    try testing.expectEqualSlices(u8, &ikey(50), mid.items[0].key);
+    // An inverted window and a zero cap return nothing.
+    try t.range(gpa, &ikey(60), &ikey(50), 10, &mid);
+    try t.range(gpa, &ikey(0), &ikey(199), 0, &mid);
+    try testing.expectEqual(want_mid, mid.items.len);
+}
+
+test "reads_proceed_while_writer_holds_the_node_lock: lookups and scans take no node lock" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(key.TREE_INODES);
+    var buf: [64]u8 = undefined;
+    for (0..300) |i| try t.insert(&ikey(i), testValue(i, 32, &buf));
+    const leaf = try t.resolveLeaf(&ikey(150));
+    defer leaf.release();
+    _ = leaf.lockWrite(testing.io); // a writer mid-apply
+    defer leaf.unlockWrite(testing.io);
+    try expectLookup(t, &ikey(150), testValue(150, 32, &buf));
+    var all: std.ArrayList(KeyValue) = .empty;
+    defer deinitKeyValues(gpa, &all);
+    try t.range(gpa, &ikey(0), &ikey(299), std.math.maxInt(usize), &all);
+    try testing.expectEqual(@as(usize, 300), all.items.len);
+}
+
+test "open verifies the root pointer: a stale ledger node_seq or a foreign tree id is refused loud; roots() is the ledger face" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(key.TREE_INODES);
+    var buf: [64]u8 = undefined;
+    try t.insert(&ikey(1), testValue(1, 24, &buf));
+    try vol.flushDirty(t);
+    const root = t.rootPtr();
+    var out: [1]ledger.TreeRoot = undefined;
+    const rs = roots(&.{t}, &out);
+    try testing.expectEqual(ledger.TreeRoot{ .tree_id = key.TREE_INODES, .node_addr = root.addr, .node_seq = root.seq }, rs[0]);
+    var fresh = try vol.freshCache();
+    defer fresh.deinit();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Corrupt, KvTree.open(gpa, fresh, key.TREE_INODES, .{ .addr = root.addr, .seq = root.seq + 1 }, vol.seq));
+    try log.testing.expectAllFired();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Corrupt, KvTree.open(gpa, fresh, key.TREE_DENTRIES, root, vol.seq));
+    try log.testing.expectAllFired();
+    const reopened = try KvTree.open(gpa, fresh, key.TREE_INODES, root, vol.seq);
+    defer reopened.destroy();
+    try expectLookup(reopened, &ikey(1), testValue(1, 24, &buf));
+    // From a ledger record.
+    var record = ledger.bootstrapRecord(rs, 2, vol.seq.load(), null);
+    const via_ledger = try KvTree.openFromLedger(gpa, fresh, &record, key.TREE_INODES, vol.seq);
+    defer via_ledger.destroy();
+    try testing.expectEqual(root, via_ledger.rootPtr());
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Corrupt, KvTree.openFromLedger(gpa, fresh, &record, key.TREE_XATTRS, vol.seq));
+    try log.testing.expectAllFired();
+}
+
+test "replay LWW gate: a replayed record at-or-below the node's newest seq for its key is skipped as applied; a newer one lands with its own seq" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(key.TREE_INODES);
+    var buf: [64]u8 = undefined;
+    try t.insert(&ikey(5), testValue(5, 24, &buf));
+    const newest = vol.seq.load();
+    // At or below: skipped (the old value stands).
+    try t.applyReplayed(&ikey(5), newest, .put, testValue(55, 24, &buf), newest);
+    try expectLookup(t, &ikey(5), testValue(5, 24, &buf));
+    try t.applyReplayed(&ikey(5), newest - 1, .delete, &.{}, newest - 1);
+    try expectLookup(t, &ikey(5), testValue(5, 24, &buf));
+    // Above: applied; the handle is floored above it.
+    try t.applyReplayed(&ikey(5), newest + 100, .put, testValue(555, 24, &buf), newest + 100);
+    try expectLookup(t, &ikey(5), testValue(555, 24, &buf));
+    try testing.expect(vol.seq.load() >= newest + 100);
+    // A replayed interior record on a single-leaf tree is unroutable: dropped, never loud.
+    try testing.expect(!try t.applyReplayedInterior(&KEY_SPACE_MAX, 1, newest + 200, .put, &key.encodeInteriorValue(0, 1), newest + 200));
+    try testing.expectError(error.InvalidKey, t.applyReplayedInterior("", 1, 1, .put, &.{}, 1));
+}

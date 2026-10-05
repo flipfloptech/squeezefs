@@ -66,6 +66,12 @@ module — a row nothing reads is dead code and goes red). Keep it green on both
   (`.empty`, pass the allocator); format with `std.Io.Writer` (`{f}` calls a type's
   `format(self, *Writer)`); file I/O in tests through `std.testing.io` and
   `std.Io.Dir.cwd()`.
+- **Model checks**: every lock-free core is written as a standalone, dependency-free MODEL
+  (plain value type, explicit per-thread program counters, one atomic action per `step`) and
+  explored exhaustively with `src/model/explorer.zig` (`expectHolds`). Every model ships with
+  its WEAKENING (the fence or step whose removal breaks it) proven to fail (`expectFails`), and
+  the evidence note records which weakening fails each model. Store buffering is modelled
+  explicitly (a per-thread pending store the fence step drains) where a core depends on it.
 - **Red-first**: tests define the contract; a bug lands with a red repro first. No
   sleeps for synchronization; `SQUEEZEFS_TEST_*` seams hold the exact window a pin
   needs.

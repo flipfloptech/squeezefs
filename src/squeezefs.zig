@@ -31,6 +31,11 @@ pub const log = @import("core/log.zig");
 pub const counters = @import("core/counters.zig");
 pub const thread_name = @import("core/thread_name.zig");
 
+// ---- model checking: the exhaustive interleaving explorer (portable) ----
+pub const model = struct {
+    pub const explorer = @import("model/explorer.zig");
+};
+
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
 
@@ -51,6 +56,7 @@ test {
     _ = log;
     _ = counters;
     _ = thread_name;
+    _ = model.explorer;
     _ = mem_budget;
     _ = align_probe;
     if (builtin.os.tag == .linux) _ = uring_fs;

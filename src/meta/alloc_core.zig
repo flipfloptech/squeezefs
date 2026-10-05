@@ -702,8 +702,6 @@ pub const CycleObservations = struct {
     deferred_for_grant: u64,
     /// Nodes the flush pass deferred for `NoSpace`.
     deferred_for_space: u64,
-    /// `heapGrowthFloorClear` at the end of the flush pass.
-    growth_floor_clear: bool,
 };
 
 pub const CycleVerdict = enum {
@@ -723,42 +721,21 @@ pub const CycleVerdict = enum {
     wedge_failed,
 };
 
-pub const PostureTransition = enum { none, entered_heap_full, left_heap_full };
-
 pub const CycleOutcome = struct {
     verdict: CycleVerdict,
-    /// `meta_kv_heap_full` latch movement this cycle (loud once per
-    /// transition).
-    posture: PostureTransition,
     /// The wedge rung after this cycle (`pending_free_stalled_cycles`).
     stalled_cycles: u64,
 };
 
-/// The pure audit: the flush pass's heap-full latch plus the wedged-tail
-/// rung. The wrapper counts and logs; nothing here has side effects.
+/// The pure wedged-tail audit: the rung alone. The heap-full POSTURE is
+/// `heap_law.HeapFullPosture`'s (the one word, the gauge, the log lines);
+/// this audit only keeps the space class OUT of the wedge rung. The
+/// wrapper counts and logs; nothing here has side effects.
 pub const SpaceAudit = struct {
     stalled_cycles: u64 = 0,
-    heap_full: bool = false,
-    /// `meta_kv_heap_full_cycles`.
-    heap_full_cycles: u64 = 0,
     failed: bool = false,
 
     pub fn tick(self: *SpaceAudit, obs: CycleObservations) CycleOutcome {
-        // The flush-pass half: a pass that deferred for space is the space
-        // class (counted per cycle, latched once); a pass that deferred
-        // nothing clears the latch once the growth floor is clear again.
-        var posture: PostureTransition = .none;
-        if (obs.deferred_for_space > 0) {
-            self.heap_full_cycles += 1;
-            if (!self.heap_full) {
-                self.heap_full = true;
-                posture = .entered_heap_full;
-            }
-        } else if (obs.growth_floor_clear and self.heap_full) {
-            self.heap_full = false;
-            posture = .left_heap_full;
-        }
-        // The post-barrier audit.
         const verdict: CycleVerdict = blk: {
             if (obs.pending_after == 0 or obs.pending_after < obs.pending_before or obs.tail > obs.tail_before) {
                 self.stalled_cycles = 0;
@@ -773,7 +750,7 @@ pub const SpaceAudit = struct {
             }
             break :blk .wedge_rung;
         };
-        return .{ .verdict = verdict, .posture = posture, .stalled_cycles = self.stalled_cycles };
+        return .{ .verdict = verdict, .stalled_cycles = self.stalled_cycles };
     }
 };
 
@@ -1062,33 +1039,25 @@ test "heap admission: splits need the whole reserve, compactions the floor; prom
 
 test "space audit: progress resets the rung; grant and space standstills never advance it; 8 wedged cycles fail" {
     var audit: SpaceAudit = .{};
-    const base = CycleObservations{ .pending_before = 3, .pending_after = 3, .tail_before = 10, .tail = 10, .deferred_for_grant = 0, .deferred_for_space = 0, .growth_floor_clear = true };
-    // Space standstill: counted, latched once, never terminal, rung untouched.
+    const base = CycleObservations{ .pending_before = 3, .pending_after = 3, .tail_before = 10, .tail = 10, .deferred_for_grant = 0, .deferred_for_space = 0 };
+    // Space standstill: never terminal, rung untouched, however many cycles.
     var obs = base;
     obs.deferred_for_space = 2;
     var out = audit.tick(obs);
     try testing.expectEqual(CycleVerdict.space_standstill, out.verdict);
-    try testing.expectEqual(PostureTransition.entered_heap_full, out.posture);
     try testing.expectEqual(@as(u64, 0), out.stalled_cycles);
     out = audit.tick(obs);
-    try testing.expectEqual(PostureTransition.none, out.posture);
-    try testing.expectEqual(@as(u64, 2), audit.heap_full_cycles);
-    // A pass that deferred nothing with the floor clear leaves the posture.
+    try testing.expectEqual(CycleVerdict.space_standstill, out.verdict);
+    try testing.expectEqual(@as(u64, 0), out.stalled_cycles);
+    // The manager dependency: rung untouched too.
     obs = base;
     obs.deferred_for_grant = 1;
     out = audit.tick(obs);
     try testing.expectEqual(CycleVerdict.manager_dependency, out.verdict);
-    try testing.expectEqual(PostureTransition.left_heap_full, out.posture);
-    // A latched posture stays while the floor is not clear.
-    obs = base;
-    obs.deferred_for_space = 1;
-    _ = audit.tick(obs);
-    obs = base;
-    obs.growth_floor_clear = false;
-    out = audit.tick(obs);
-    try testing.expectEqual(PostureTransition.none, out.posture);
-    try testing.expect(audit.heap_full);
-    // The wedge: that tick was rung 1; seven more reach the terminal.
+    try testing.expectEqual(@as(u64, 0), out.stalled_cycles);
+    // The wedge: a non-advancing cycle that deferred nothing is rung 1;
+    // seven more reach the terminal.
+    out = audit.tick(base);
     try testing.expectEqual(CycleVerdict.wedge_rung, out.verdict);
     try testing.expectEqual(@as(u64, 1), out.stalled_cycles);
     var n: u64 = 2;

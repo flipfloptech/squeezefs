@@ -766,62 +766,6 @@ pub fn resumeCheckpointSeq(ledger_seq: u64, resume_generation: u64) u64 {
     return @max(ledger_seq, resume_generation);
 }
 
-/// `heap_promised` bookkeeping around `alloc_core.admitLeaf`: promises are
-/// consumed by the SMO or retracted on a later-leaf refusal of the same
-/// member; the gauge reads 0 at quiesce.
-pub const HeapPromises = struct {
-    promised: u64 = 0,
-
-    pub fn admit(self: *HeapPromises, alloc: *const ExtentAllocator, need: u64, already_promised: u64) alloc_core.AdmissionVerdict {
-        const v = alloc_core.admitLeaf(alloc.freeExtents(), self.promised, alloc.reserveExtents(), need, already_promised);
-        if (v == .admitted) self.add(v.admitted.delta);
-        return v;
-    }
-
-    fn add(self: *HeapPromises, n: u64) void {
-        self.promised += n;
-        meta_kv_heap_promised.set(self.promised);
-    }
-
-    pub fn retract(self: *HeapPromises, n: u64) void {
-        std.debug.assert(n <= self.promised);
-        self.promised -= n;
-        meta_kv_heap_promised.set(self.promised);
-    }
-
-    /// The SMO claimed what was promised.
-    pub fn consume(self: *HeapPromises, n: u64) void {
-        self.retract(n);
-    }
-
-    pub fn growthFloorClear(self: *const HeapPromises, alloc: *const ExtentAllocator, min_split: u64) bool {
-        return alloc_core.heapGrowthFloorClear(alloc.freeExtents(), self.promised, min_split, alloc.reserveExtents());
-    }
-};
-
-/// Count and log one barriered cycle's verdict (the pure `SpaceAudit` makes
-/// the decision). Returns true when the volume must latch FAILED.
-pub fn recordCycle(audit: *alloc_core.SpaceAudit, alloc: *const ExtentAllocator, promised: u64, volume: []const u8, obs: alloc_core.CycleObservations) bool {
-    const out = audit.tick(obs);
-    switch (out.posture) {
-        .entered_heap_full => {
-            meta_kv_heap_full.set(1);
-            log.warn("meta volume {s}: metadata heap FULL — the flush pass deferred {d} node(s) whose SMO could not claim an extent (free={d} claimable, {d} promised to pending SMOs, reserve={d}); growth needing a new leaf answers ENOSPC, reads and deletes continue, the volume is NOT failed (§4.7 space standstill class)", .{ volume, obs.deferred_for_space, alloc.freeExtents(), promised, alloc.reserveExtents() });
-        },
-        .left_heap_full => {
-            meta_kv_heap_full.set(0);
-            log.info("meta volume {s}: metadata heap no longer full — a flush pass deferred nothing and the growth floor is clear (free={d} claimable, {d} promised, reserve={d})", .{ volume, alloc.freeExtents(), promised, alloc.reserveExtents() });
-        },
-        .none => {},
-    }
-    if (obs.deferred_for_space > 0) meta_kv_heap_full_cycles.inc();
-    if (out.verdict == .wedge_failed) {
-        log.err("pending-free retirements wedged ({d} parked) and {d} consecutive barriered checkpoint cycles neither released one nor advanced the ledger tail (stuck at {d}) — the durable tail is pinned by something no flush pass can discharge (§4.7 wedged-tail bound, design-smo-replay-currency PR 4 clause b)", .{ obs.pending_after, out.stalled_cycles, obs.tail });
-        return true;
-    }
-    return false;
-}
-
 // ---------------------------------------------------------------------------
 // Tests (PURE: byte images stand in for the device).
 // ---------------------------------------------------------------------------
@@ -1213,35 +1157,6 @@ test "partitioned format dirties only owned pages; a foreign page write is count
     try testing.expectEqualSlices(u32, &.{0}, w2);
     try testing.expectEqual(@as(u64, 1), alloc.foreignPageWrites());
     try testing.expectEqual(@as(u64, 2), (try decodeBitmapPage(region[0..page_len], 0)).generation);
-}
-
-test "heap promises move the gauge and the audit wrapper counts the space class, latches the posture and names the wedge terminal" {
-    const gpa = testing.allocator;
-    var alloc = try ExtentAllocator.format(gpa, 100, 8, 4);
-    defer alloc.deinit();
-    var promises: HeapPromises = .{};
-    const v = promises.admit(&alloc, 3, 0);
-    try testing.expectEqual(@as(u64, 3), v.admitted.delta);
-    try testing.expectEqual(@as(u64, 3), meta_kv_heap_promised.load());
-    promises.consume(2);
-    promises.retract(1);
-    try testing.expectEqual(@as(u64, 0), meta_kv_heap_promised.load());
-    try testing.expect(promises.growthFloorClear(&alloc, 4));
-    var audit: alloc_core.SpaceAudit = .{};
-    const standstill = alloc_core.CycleObservations{ .pending_before = 1, .pending_after = 1, .tail_before = 3, .tail = 3, .deferred_for_grant = 0, .deferred_for_space = 1, .growth_floor_clear = false };
-    const cycles_before = meta_kv_heap_full_cycles.load();
-    try testing.expect(!recordCycle(&audit, &alloc, 0, "/dev/meta0", standstill));
-    try testing.expectEqual(@as(u64, 1), meta_kv_heap_full.load());
-    try testing.expectEqual(cycles_before + 1, meta_kv_heap_full_cycles.load());
-    var wedged = standstill;
-    wedged.deferred_for_space = 0;
-    wedged.growth_floor_clear = true;
-    var i: u64 = 1;
-    while (i < alloc_core.pending_free_force_cycles) : (i += 1) try testing.expect(!recordCycle(&audit, &alloc, 0, "/dev/meta0", wedged));
-    try testing.expectEqual(@as(u64, 0), meta_kv_heap_full.load());
-    log.testing.expectErrorLogs(1);
-    try testing.expect(recordCycle(&audit, &alloc, 0, "/dev/meta0", wedged));
-    try log.testing.expectAllFired();
 }
 
 test "invariant drift surfaces as a loud NoSpace at the wrapper" {

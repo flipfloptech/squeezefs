@@ -27,8 +27,10 @@
 //! extents (the geometric recovery wave 8 → 16 → 32 → 64 → 128 merges), so
 //! latching FAILED would turn a recoverable state into EIO-until-remount.
 //! Only the wedge class — parked retirements with no release and no tail
-//! advance for `pending_free_force_cycles` barriered cycles — is terminal,
-//! and `alloc_core.SpaceAudit` keeps the two apart.
+//! advance for `pending_free_force_cycles` barriered cycles — is terminal.
+//! `HeapFullPosture` here is THE posture word (one per volume); the wedge
+//! rung is `alloc_core.SpaceAudit`'s, and it keeps the space class out of
+//! the rung without a posture of its own.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -931,11 +933,46 @@ test "full-heap contract: every admitted member is flushable (in place or promis
     var audit: alloc_core.SpaceAudit = .{};
     var i: u32 = 0;
     while (i < 3 * alloc_core.pending_free_force_cycles) : (i += 1) {
-        const out = audit.tick(.{ .pending_before = 5, .pending_after = 5, .tail_before = 100, .tail = 100, .deferred_for_grant = 0, .deferred_for_space = 2, .growth_floor_clear = false });
+        const out = audit.tick(.{ .pending_before = 5, .pending_after = 5, .tail_before = 100, .tail = 100, .deferred_for_grant = 0, .deferred_for_space = 2 });
         try testing.expectEqual(alloc_core.CycleVerdict.space_standstill, out.verdict);
         try testing.expect(!audit.failed);
     }
     _ = posture.leave("test-vol", "test", .{ .free = 0, .promised = 0, .reserve = reserve });
+}
+
+test "ONE posture, one wedge rung: a deferring cycle counts heap_full_cycles exactly once (the posture's path) and latches the gauge while the audit answers the space class; clear cycles leave the posture and climb the rung to the terminal" {
+    var posture: HeapFullPosture = .{};
+    var audit: alloc_core.SpaceAudit = .{};
+    const snap: SpaceSnapshot = .{ .free = 3, .promised = 0, .reserve = 8 };
+    const standstill = alloc_core.CycleObservations{ .pending_before = 1, .pending_after = 1, .tail_before = 3, .tail = 3, .deferred_for_grant = 0, .deferred_for_space = 1 };
+    const cycles0 = alloc_ext.meta_kv_heap_full_cycles.load();
+    // The cycle's C5 then C12, as the checkpointer runs them.
+    posture.cycleFlushPass("v", standstill.deferred_for_space, false, snap);
+    var out = audit.tick(standstill);
+    try testing.expectEqual(alloc_core.CycleVerdict.space_standstill, out.verdict);
+    try testing.expect(posture.isFull());
+    try testing.expectEqual(@as(u64, 1), alloc_ext.meta_kv_heap_full.load());
+    try testing.expectEqual(cycles0 + 1, alloc_ext.meta_kv_heap_full_cycles.load());
+    try testing.expect(!audit.failed);
+    // Cycles that defer nothing with the floor clear: the posture leaves at
+    // the first, the counter stands, and the rung climbs.
+    var wedged = standstill;
+    wedged.deferred_for_space = 0;
+    var i: u64 = 1;
+    while (i < alloc_core.pending_free_force_cycles) : (i += 1) {
+        posture.cycleFlushPass("v", 0, true, snap);
+        out = audit.tick(wedged);
+        try testing.expectEqual(alloc_core.CycleVerdict.wedge_rung, out.verdict);
+        try testing.expectEqual(i, out.stalled_cycles);
+        try testing.expect(!audit.failed);
+    }
+    try testing.expect(!posture.isFull());
+    try testing.expectEqual(@as(u64, 0), alloc_ext.meta_kv_heap_full.load());
+    try testing.expectEqual(cycles0 + 1, alloc_ext.meta_kv_heap_full_cycles.load());
+    posture.cycleFlushPass("v", 0, true, snap);
+    out = audit.tick(wedged);
+    try testing.expectEqual(alloc_core.CycleVerdict.wedge_failed, out.verdict);
+    try testing.expect(audit.failed);
 }
 
 test "the posture word transitions loud once per edge; the cycle half counts heap_full_cycles and clears only with the growth floor clear" {

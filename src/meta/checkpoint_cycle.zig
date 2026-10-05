@@ -865,7 +865,6 @@ pub const Checkpointer = struct {
                 .tail = tail,
                 .deferred_for_grant = deferred_for_grant,
                 .deferred_for_space = deferred_for_space,
-                .growth_floor_clear = growth_clear,
             });
         }
         // ---- C13: the heap-full sweep, after the barrier.

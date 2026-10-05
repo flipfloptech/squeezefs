@@ -9,6 +9,12 @@ extracted from it (derivations, knob rows, gauge names, test contracts, measured
 numbers with their WHY). Port from the spec; open the Rust only to settle a detail the
 spec leaves open, and then add the detail to the spec.
 
+**The reference is evidence, not law** (`docs/decisions/0002-no-compatibility-obligation.md`):
+the charter's mechanisms, invariants and derivations are requirements; the reference's
+incidental choices are not, and no compatibility with its volumes or wire is owed. When a
+spec item is a quirk (a serialization-library artifact, a legacy slot reuse, a known race),
+take the better design and add a row to the ledger in decision 0002 before diverging.
+
 ## Venue
 
 Linux only (charter §1.2). The dev box is macOS; the Linux venue is the macOS

@@ -1139,6 +1139,16 @@ pub const CheckpointTask = struct {
     stopped: std.atomic.Value(bool) = .init(false),
     period_ns: u64,
     next_tick_ns: u64,
+    /// The volume's structural (SMO) context lock when other callers share
+    /// it — `checkpointNow` from a committer's space retry, the lane's hole
+    /// checkpoint — held around every `runOnce`; the tests' solo task runs
+    /// unlocked.
+    serial: ?*Io.Mutex = null,
+    /// Admission parkers (the conveyor's Σ-admission) wait here; woken
+    /// after a run that moved `reusable_upto` (the futex face of the
+    /// checkpointer's `space_notify` poll word).
+    space_wake: ?*sync.Notify = null,
+    last_reusable_upto: u64 = 0,
 
     pub fn init(cp: *Checkpointer, io: Io) CheckpointTask {
         const period = ckpt.checkpointTickPeriodMs(cp.cfg.flush_interval_ms) * ns_per_ms;
@@ -1221,7 +1231,19 @@ pub const CheckpointTask = struct {
         while (true) {
             var w = self.wake.notified();
             const woke = w.waitUntilUncancelable(self.io, self.next_tick_ns) == .notified;
-            if (!self.runOnce(woke, clock.monotonicNs())) return;
+            const more = blk: {
+                if (self.serial) |m| m.lockUncancelable(self.io);
+                defer if (self.serial) |m| m.unlock(self.io);
+                break :blk self.runOnce(woke, clock.monotonicNs());
+            };
+            if (self.space_wake) |n| {
+                const r = self.cp.deps.core.reusableUpto();
+                if (r != self.last_reusable_upto) {
+                    self.last_reusable_upto = r;
+                    n.notifyWaiters(self.io);
+                }
+            }
+            if (!more) return;
         }
     }
 };

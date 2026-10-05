@@ -26,8 +26,9 @@
 //! permanent hole) → hole checkpoints for acked windows with in-window apply
 //! failures → ONE barrier (`FSYNC|DATASYNC` on the same ring; strict cadence
 //! = per group, else `needs_flush` at the flush interval) → acks in journal
-//! order through per-window futex slots. Acks only after the entry landed;
-//! strict: after the barrier.
+//! order through per-window futex slots, or through the window's `DoneHook`
+//! on this thread (the conveyor's fan-out). Acks only after the entry
+//! landed; strict: after the barrier.
 //!
 //! Lane-native only: every window reaches the ring through the inbound
 //! queue whatever thread built it, so there is no off-lane submitter, hence
@@ -351,6 +352,17 @@ pub const Outcome = struct {
     acked_ns: u64,
 };
 
+/// A window's terminal-outcome hook (`submitWriteBatchDetached`): runs ON
+/// the lane thread at the ack instant, in journal order, instead of a
+/// ticket — the conveyor's fan-out (guards drop, then the committers'
+/// oneshots), so the thread that reaped the CQE is the thread that acks
+/// (no scheduler hop between landing and answer). Must never wait on this
+/// lane.
+pub const DoneHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, outcome: Outcome) void,
+};
+
 const Kind = enum(u8) { window, barrier };
 
 /// One inbound message = one cell: the caller fills it, publishes its index,
@@ -366,6 +378,8 @@ const Cell = struct {
     entries: u64 = 0,
     bytes: u64 = 0,
     apply_holes: bool = false,
+    /// Detached window: the hook answers and the lane frees the cell.
+    done_hook: ?DoneHook = null,
     // ---- lane-owned ----
     runs_in_flight: u32 = 0,
     first_err: ?Error = null,
@@ -389,6 +403,7 @@ const Cell = struct {
         self.entries = 0;
         self.bytes = 0;
         self.apply_holes = false;
+        self.done_hook = null;
         self.runs_in_flight = 0;
         self.first_err = null;
         self.landed = false;
@@ -619,6 +634,18 @@ pub const JournalLane = struct {
     /// tripwire fires here), a FAILED volume, a stopped lane, a full queue.
     /// Everything after that is the ticket's outcome.
     pub fn submitWriteBatch(self: *JournalLane, req: WriteRequest) Error!Ticket {
+        return self.submitWindow(req, null);
+    }
+
+    /// `submitWriteBatch` whose outcome is DELIVERED through `done` on the
+    /// lane thread (journal order, at the ack instant) rather than observed
+    /// through a ticket; the cell returns to the pool right after the hook.
+    /// A refusal answers here, synchronously, and the hook never runs.
+    pub fn submitWriteBatchDetached(self: *JournalLane, req: WriteRequest, done: DoneHook) Error!void {
+        _ = try self.submitWindow(req, done);
+    }
+
+    fn submitWindow(self: *JournalLane, req: WriteRequest, done: ?DoneHook) Error!Ticket {
         try self.refuseMisaligned(req.ops);
         if (self.latch.isFailed()) return error.VolumeFailed;
         const idx = self.acquireCell() orelse {
@@ -633,6 +660,7 @@ pub const JournalLane = struct {
         c.entries = req.entries;
         c.bytes = req.bytes;
         c.apply_holes = req.apply_holes;
+        c.done_hook = done;
         return self.publish(idx);
     }
 
@@ -779,7 +807,19 @@ fn laneMain(lane: *JournalLane) void {
 fn answerUnrun(lane: *JournalLane, idx: u32, err: Error) void {
     const c = &lane.cells[idx];
     const now = clock.monotonicNs();
-    c.outcome = .{ .result = err, .ack_seq = 0, .landed_ns = now, .acked_ns = now };
+    deliver(lane, c, .{ .result = err, .ack_seq = 0, .landed_ns = now, .acked_ns = now });
+}
+
+/// Publish a cell's outcome: through its hook (then the cell is free), or
+/// through the ticket word. Release publishes `outcome`; the ticket's
+/// acquire load pairs with it.
+fn deliver(lane: *JournalLane, c: *Cell, outcome: Outcome) void {
+    if (c.done_hook) |h| {
+        h.call(h.ctx, outcome);
+        lane.freeCell(@intCast((@intFromPtr(c) - @intFromPtr(lane.cells.ptr)) / @sizeOf(Cell)));
+        return;
+    }
+    c.outcome = outcome;
     c.state.store(Cell.done, .release);
     futexWakeAll(&c.state);
 }
@@ -1364,10 +1404,7 @@ const Worker = struct {
     fn publish(w: *Worker, c: *Cell, result: Error!void, now: u64) void {
         w.ack_seq += 1;
         LaneStats.bump(&w.lane.stats.acks);
-        c.outcome = .{ .result = result, .ack_seq = w.ack_seq, .landed_ns = c.landed_ns, .acked_ns = now };
-        // Release publishes `outcome`; the ticket's acquire load pairs with it.
-        c.state.store(Cell.done, .release);
-        futexWakeAll(&c.state);
+        deliver(w.lane, c, .{ .result = result, .ack_seq = w.ack_seq, .landed_ns = c.landed_ns, .acked_ns = now });
     }
 
     // ---- barriers ----

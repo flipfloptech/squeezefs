@@ -92,22 +92,33 @@ pub fn errno(e: HeapError) std.os.linux.E {
 /// to the next admission's load (the pairing is RMW ↔ `load(.acquire)`).
 /// Mirrors `alloc_ext.meta_kv_heap_promised` by delta (Σ over volumes).
 pub const HeapLedger = struct {
-    promised: std.atomic.Value(u64) = .init(0),
+    own: counters.Gauge = .{},
+    /// The volume's live ledger when bound (the node cache's
+    /// `heap_promised` gauge, which the SMO task's releases move too);
+    /// `own` stands in for the pure tests.
+    gauge: ?*counters.Gauge = null,
+
+    /// Bound to the volume's gauge: `load` reads what every promise and
+    /// release on the volume moved.
+    pub fn bound(gauge: *counters.Gauge) HeapLedger {
+        return .{ .gauge = gauge };
+    }
 
     pub fn load(self: *const HeapLedger) u64 {
-        return self.promised.load(.acquire);
+        return (self.gauge orelse &self.own).load();
     }
 
     fn add(self: *HeapLedger, n: u64) void {
         if (n == 0) return;
-        _ = self.promised.fetchAdd(n, .acq_rel);
+        (self.gauge orelse &self.own).add(n);
         alloc_ext.meta_kv_heap_promised.add(n);
     }
 
     fn sub(self: *HeapLedger, n: u64) void {
         if (n == 0) return;
-        const prev = self.promised.fetchSub(n, .acq_rel);
-        assert(prev >= n);
+        const g = self.gauge orelse &self.own;
+        assert(g.load() >= n);
+        g.sub(n);
         alloc_ext.meta_kv_heap_promised.sub(n);
     }
 };

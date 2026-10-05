@@ -112,11 +112,25 @@ pub const Error = tree.Error || node_cache.FreezeError || node_cache.AppendError
 // The journal seam.
 // ---------------------------------------------------------------------------
 
+/// The device binding of the checkpoint-class entry path (SMO entries, the
+/// rollback's compensation): `write` lands one entry's aligned runs on the
+/// device SYNCHRONOUSLY through the io pool — never through the journal
+/// lane, whose own thread runs hole checkpoints (a lane-thread SMO parking
+/// on a lane ticket would wait on itself); `completed` runs right after the
+/// reservation completes (the lane's kick — a stage-B prefix wait may sit
+/// behind a reservation the lane never saw).
+pub const DeviceHooks = struct {
+    ctx: *anyopaque,
+    write: *const fn (ctx: *anyopaque, ops: []const journal.WriteOp) error{Io}!void,
+    completed: *const fn (ctx: *anyopaque) void,
+};
+
 /// The SMO task's journal: a ring image + the reservation core + the
 /// in-flight registry, admission from the CHECKPOINT class, the entry write
-/// (`journal.buildEntryWrite` landed on the image), and the barrier hook
-/// the device binding installs (the in-RAM image is durable by
-/// construction: the default hook is a counted no-op).
+/// (`journal.buildEntryWrite` landed on the image, or on the device through
+/// `DeviceHooks`), and the barrier hook the device binding installs (the
+/// in-RAM image is durable by construction: the default hook is a counted
+/// no-op).
 pub const SmoJournal = struct {
     gpa: Allocator,
     layout: journal.RingLayout,
@@ -124,12 +138,15 @@ pub const SmoJournal = struct {
     core: *jc.JournalCore,
     reg: *jc.InflightRegistry,
     /// The ring extent's image; `layout.base` is its first byte's offset.
+    /// Empty on a device-bound journal (`device` set): the device is the
+    /// image.
     image: []u8,
     writer_id: u16 = journal.ROOT_AUTHORITY_WRITER,
     /// The historical §4.7 retire tag stamped into free-record VALUES
     /// (byte-for-byte format compat; the gate is the record's position).
     retire_seq: std.atomic.Value(u64) = .init(0),
     barrier_hook: ?Hook = null,
+    device: ?DeviceHooks = null,
     barriers: std.atomic.Value(u64) = .init(0),
     stats: journal.RingStats = .{},
     /// The last SMO entry this seam committed (the tear harness's target).
@@ -154,12 +171,23 @@ pub const SmoJournal = struct {
 
     /// Write one entry after release and complete its reservation on
     /// either outcome (an unwritten range still completes for the
-    /// watermark; replay's checksum walk drops it).
+    /// watermark; replay's checksum walk drops it). A device write failure
+    /// is `error.Corrupt` to the caller's crash-equivalent-hole arm.
     pub fn commitEntry(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame) journal.Error!void {
-        defer self.reg.complete(self.core, res);
+        const written = self.writeEntry(res, frames);
+        self.reg.complete(self.core, res);
+        if (self.device) |d| d.completed(d.ctx);
+        return written;
+    }
+
+    fn writeEntry(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame) journal.Error!void {
         var img = try journal.buildEntryWrite(self.gpa, self.layout, self.geo, self.writer_id, res, frames);
         defer img.deinit();
-        journal.applyOps(self.image, self.layout.base, img.ops);
+        if (self.device) |d| {
+            d.write(d.ctx, img.ops) catch return error.Corrupt;
+        } else {
+            journal.applyOps(self.image, self.layout.base, img.ops);
+        }
         self.stats.noteEntriesWritten(1, res.len);
         self.stats.notePadWritten(res.pad);
         self.last_entry = res;
@@ -169,6 +197,7 @@ pub const SmoJournal = struct {
     /// for the watermark (replay's checksum walk drops the hole).
     pub fn abandonEntry(self: *SmoJournal, res: Reservation) void {
         self.reg.complete(self.core, res);
+        if (self.device) |d| d.completed(d.ctx);
     }
 
     fn testFailArmed(self: *SmoJournal) bool {

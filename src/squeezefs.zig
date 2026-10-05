@@ -38,6 +38,9 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
+    pub const conveyor = @import("meta/conveyor.zig");
+    pub const device_loader = if (builtin.os.tag == .linux) @import("meta/device_loader.zig") else struct {};
+    pub const backend = if (builtin.os.tag == .linux) @import("meta/backend.zig") else struct {};
     pub const tree = @import("meta/tree.zig");
     pub const smo = @import("meta/smo.zig");
     pub const leaf_merge = @import("meta/leaf_merge.zig");
@@ -94,6 +97,9 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    _ = meta.conveyor;
+    if (builtin.os.tag == .linux) _ = meta.device_loader;
+    if (builtin.os.tag == .linux) _ = meta.backend;
     _ = meta.tree;
     _ = meta.smo;
     _ = meta.leaf_merge;

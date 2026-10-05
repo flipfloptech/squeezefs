@@ -56,6 +56,7 @@ const node = @import("node.zig");
 const node_state_core = @import("node_state_core.zig");
 const epoch_core = @import("epoch_core.zig");
 const journal_core = @import("journal_core.zig");
+const alloc_ext = @import("alloc_ext.zig");
 const snapshot = @import("node_snapshot.zig");
 const arc_swap = @import("../sync/arc_swap.zig");
 const sync = @import("../sync/sync.zig");
@@ -419,6 +420,10 @@ pub const NodeDirty = struct {
     /// since — the cheap re-check below the layout's growth window.
     promise_basis: usize = 0,
     promise_added: usize = 0,
+    /// The volume's ledger (`NodeCache.heap_promised`); every move mirrors
+    /// into the process-wide `alloc_ext.meta_kv_heap_promised` so the
+    /// conveyor's `heap_law.HeapLedger` adds and the SMO task's releases
+    /// here read as one population.
     heap_promised: *counters.Gauge,
 
     pub fn overlayBytes(self: *const NodeDirty) usize {
@@ -503,6 +508,7 @@ pub const NodeDirty = struct {
         self.promise_basis = basis;
         self.promise_added = 0;
         self.heap_promised.add(extents);
+        alloc_ext.meta_kv_heap_promised.add(extents);
     }
 
     /// Return `extents` of a promise made for a member that was then
@@ -513,6 +519,7 @@ pub const NodeDirty = struct {
         const take = @min(extents, self.promised);
         self.promised -= take;
         self.heap_promised.sub(take);
+        alloc_ext.meta_kv_heap_promised.sub(take);
         if (self.promised == 0) {
             self.promise_basis = 0;
             self.promise_added = 0;
@@ -529,6 +536,7 @@ pub const NodeDirty = struct {
     pub fn releasePromise(self: *NodeDirty) void {
         if (self.promised > 0) {
             self.heap_promised.sub(self.promised);
+            alloc_ext.meta_kv_heap_promised.sub(self.promised);
             self.promised = 0;
         }
         self.promise_basis = 0;
@@ -1142,7 +1150,19 @@ pub const CachedNode = struct {
                 self.state.abortFreeze();
             }
         }
-        if (dirty.overlay.items.len == 0) return null;
+        if (dirty.overlay.items.len == 0) {
+            // A rollback emptied the overlay under this lock and left the
+            // word DIRTY with nothing to write: the EMPTY freeze (begin →
+            // end) closes it, so the node is collectable and evictable
+            // again — without it the flush pass re-collected the node every
+            // cycle and a hole checkpoint behind a failed window never
+            // converged.
+            if (self.state.isDirty() and !self.state.isFreezing() and !self.state.isSuperseded()) {
+                self.state.beginFreeze() catch {};
+                _ = self.state.endFreeze();
+            }
+            return null;
+        }
         self.state.beginFreeze() catch |e| return switch (e) {
             error.NotDirty => error.FreezeRefusedNotDirty,
             error.AlreadyFreezing => error.FreezeRefusedAlreadyFreezing,
@@ -2495,6 +2515,31 @@ test "a mid-range rollback removal folds exactly: the stale head above the remov
     _ = try vol.apply(leaf, &k, .delta, d_after.encode().slice());
     d_after.apply(&expected);
     try expectLive(leaf, &k, &expected.encode());
+}
+
+test "a rollback that empties the overlay leaves a DIRTY word with nothing to write: the next freeze closes it (Clean, evictable) instead of re-collecting the node forever" {
+    var vol = try Vol.init(2, 8);
+    defer vol.deinit();
+    vol.arm();
+    try vol.writeEmptyLeaf(0, 1, 0);
+    const leaf = (try vol.cache.load(Vol.addrOf(0))).?;
+    defer leaf.release();
+    const k = key.inodeKey(5);
+    const s = try vol.apply(leaf, &k, .put, &iv(1).encode());
+    try testing.expect(leaf.state.isDirty());
+    {
+        const d = leaf.lockWrite(testing.io);
+        defer leaf.unlockWrite(testing.io);
+        try testing.expectEqual(@as(usize, 1), try leaf.removeOverlayRecordsLocked(d, &k, SeqSpan.stamped(s, 1)));
+        try testing.expect(leaf.state.isDirty());
+        // The flush pass's freeze: nothing to write — and the word is closed.
+        const ff = try leaf.flushFreezeLocked(d, vol.layout);
+        try testing.expect(!ff.frozen);
+        try testing.expect(!leaf.state.isDirty());
+        try testing.expect(!leaf.state.isFreezing());
+    }
+    try testing.expectEqual(no_floor, leaf.dirtyFloor());
+    try testing.expect(leaf.state.tryEvict());
 }
 
 const Mirror = struct { r: Record, frozen: bool = false, removed: bool = false };

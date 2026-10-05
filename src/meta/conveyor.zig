@@ -552,9 +552,14 @@ pub const Conveyor = struct {
     batch_buf: []Queued,
     closing: std.atomic.Value(bool) = .init(false),
     /// Windows between handoff and terminal outcome, by reservation start
-    /// (the rollback hook addresses a window by its reservation).
+    /// (the rollback hook addresses a window by its reservation). Sized
+    /// ONCE at init for `inflight_cap` entries: the lane holds at most
+    /// `queueCapacity(pages)` windows (its inbound cells follow the same
+    /// law) plus the one a pass tracks before the lane refuses it — so
+    /// `track` never allocates under the spin lock (charter §1.3).
     inflight_lock: jc.SpinLock = .{},
     inflight: std.AutoHashMapUnmanaged(u64, *Window) = .empty,
+    inflight_cap: usize,
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -564,7 +569,10 @@ pub const Conveyor = struct {
         errdefer gpa.free(slots);
         const batch_buf = try gpa.alloc(Queued, @max(deps.caps.max_txs, 1));
         errdefer gpa.free(batch_buf);
-        self.* = .{ .deps = deps, .slots = slots, .core = undefined, .batch_buf = batch_buf };
+        const inflight_cap = queueCapacity(deps.geo.pages) + 1;
+        self.* = .{ .deps = deps, .slots = slots, .core = undefined, .batch_buf = batch_buf, .inflight_cap = inflight_cap };
+        errdefer self.inflight.deinit(gpa);
+        try self.inflight.ensureTotalCapacity(gpa, @intCast(inflight_cap));
         self.core = Core.init(deps.io, slots, &self.stats.queued);
         return self;
     }
@@ -1344,11 +1352,14 @@ pub const Conveyor = struct {
 
     /// Register a window for stage B's hooks (the rollback addresses it by
     /// its reservation). A window the map cannot name must not be
-    /// submitted: its failed write could not be rolled back.
+    /// submitted: its failed write could not be rolled back. Nothing is
+    /// allocated here: the map was sized for the whole population at init,
+    /// and a population past it is refused as the map growth it would need.
     fn track(self: *Conveyor, w: *Window) Allocator.Error!void {
         self.inflight_lock.lock();
         defer self.inflight_lock.unlock();
-        try self.inflight.put(self.deps.gpa, w.res.start, w);
+        if (self.inflight.count() >= self.inflight_cap) return error.OutOfMemory;
+        self.inflight.putAssumeCapacity(w.res.start, w);
         const n = self.stats.windows_inflight.load() + 1;
         self.stats.windows_inflight.set(n);
         if (n > self.stats.windows_inflight_hwm.load()) self.stats.windows_inflight_hwm.set(n);
@@ -2342,6 +2353,30 @@ test "a rollback that cannot complete (out of memory on its first allocation) is
     try testing.expectEqual(@as(u64, 1), h.cv.stats.divergence_rollback.load());
     try testing.expect(try h.present(base));
     try testing.expectError(error.VolumeFailed, h.commitCreate("post"));
+    try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
+}
+
+test "the in-flight window map is sized at init: tracking a full population of windows allocates nothing (never an allocation under inflight_lock)" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.createWithGpa(.{}, null, false, fa.allocator());
+    defer h.destroy();
+    // Every allocation from here on fails: a `track` that allocates is red.
+    fa.fail_index = fa.alloc_index;
+    defer fa.fail_index = std.math.maxInt(usize);
+    const n = h.cv.inflight_cap;
+    try testing.expectEqual(queueCapacity(h.vol.journal.geo.pages) + 1, n);
+    const windows = try testing.allocator.alloc(Window, n);
+    defer testing.allocator.free(windows);
+    for (windows, 0..) |*w, i| {
+        w.* = .{ .conveyor = h.cv, .arena = std.heap.ArenaAllocator.init(testing.allocator), .members = &.{}, .failed = &.{}, .res = Reservation.unpadded(@as(u64, i) * 4096, 100), .seq_base = 0, .undo = &.{}, .image = null, .entries = 0, .bytes = 0, .t_handoff_ns = 0 };
+        try h.cv.track(w);
+    }
+    try testing.expectEqual(n, h.cv.inflight.count());
+    try testing.expectEqual(@as(u64, n), h.cv.windowsInflight());
+    // One past the population is refused loud, not grown under the lock.
+    var extra: Window = .{ .conveyor = h.cv, .arena = std.heap.ArenaAllocator.init(testing.allocator), .members = &.{}, .failed = &.{}, .res = Reservation.unpadded(@as(u64, n) * 4096, 100), .seq_base = 0, .undo = &.{}, .image = null, .entries = 0, .bytes = 0, .t_handoff_ns = 0 };
+    try testing.expectError(error.OutOfMemory, h.cv.track(&extra));
+    for (windows) |*w| h.cv.untrack(w);
     try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
 }
 

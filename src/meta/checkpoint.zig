@@ -600,6 +600,11 @@ pub const stats = struct {
     pub var meta_kv_merge_sweeps: counters.ShardedCounter = .{};
     /// The wedge rung (`pending_free_stalled_cycles`) as the last barriered cycle left it.
     pub var pending_free_stalled_cycles: counters.Gauge = .{};
+    /// A journal reservation still open at the shutdown tick: `close`
+    /// quiesces the conveyor and shuts the lane down BEFORE the task stops,
+    /// so nothing can be open — the ordering the final tick relies on, as a
+    /// must-stay-0 (a wait here would be on a completer that no longer exists).
+    pub var final_tick_open_reservations: counters.Tripwire = .init("checkpoint_final_tick_open_reservations");
 };
 
 // ---------------------------------------------------------------------------

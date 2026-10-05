@@ -1086,15 +1086,18 @@ pub const Checkpointer = struct {
         self.noteFlushPass(sample);
     }
 
-    /// Shutdown: wait every in-flight reservation out UNTIL THE HEAD IS
-    /// STABLE (a commit past the gate can reserve after a one-shot sample
-    /// and sit past the final tail — the next mount would replay it).
-    fn waitHeadStable(self: *Checkpointer) void {
-        for (0..64) |_| {
-            const head0 = self.deps.core.headPos();
-            self.deps.inflight.waitCompletedUpto(head0);
-            if (self.deps.core.headPos() == head0) return;
-        }
+    /// Shutdown: the registry must be QUIET — `close` quiesces the conveyor
+    /// (nothing queued, no pass, no window in flight) and shuts the lane
+    /// down (every window completed) BEFORE the task stops, and the task's
+    /// own SMO entries complete synchronously, so no reservation can be
+    /// open here and nothing could complete one (the lane is gone). The
+    /// ordering is made executable: an open reservation fires the tripwire
+    /// and the tick proceeds — its tail clamps below the open start and
+    /// the next mount replays the residue — instead of waiting on a
+    /// completer that no longer exists (a wedge under `smo_lock`).
+    fn checkHeadStable(self: *Checkpointer) void {
+        const open = self.deps.inflight.openCount();
+        if (open != 0) ckpt.stats.final_tick_open_reservations.fire("a journal reservation is still open at the shutdown tick: close() must quiesce the conveyor and shut the lane down before the task stops");
     }
 
     fn uncovered(self: *const Checkpointer) bool {
@@ -1110,7 +1113,7 @@ pub const Checkpointer = struct {
     /// iterates to the fixpoint (`tail == head ∧ no dirty pages`: an empty
     /// replay window).
     pub fn tick(self: *Checkpointer, final_cycle: bool, drain_deadline_ns: ?u64, park_kick: bool, tick_ms: u64) CycleError!void {
-        if (final_cycle) self.waitHeadStable();
+        if (final_cycle) self.checkHeadStable();
         var decided_at = clock.monotonicNs();
         var decision: ?Decision = if (final_cycle) null else self.decide(decided_at, park_kick, false);
         const run_drain = if (decision) |d| !d.runsACycle() else true;
@@ -1892,6 +1895,31 @@ test "ONE space wake: every barrier that moves reusable_upto — a direct checkp
     try v.cp.syncDevice();
     try testing.expect(!parker3.enable(testing.io));
     parker3.cancel(testing.io);
+}
+
+test "the close ordering is executable: a reservation still open at the final tick fires the tripwire and the tick proceeds (its tail clamps below the open start) instead of waiting on a completer that no longer exists" {
+    const v = try TestVol.create(50, 1000);
+    defer v.destroy();
+    try v.writeLeaf(0, 1);
+    const a = (try v.cache.load(TestVol.addrOf(0))).?;
+    defer a.release();
+    _ = try v.commit(a, &.{"a1"}, 100);
+    // A reservation nobody will complete: the shape `close` orders away
+    // (the conveyor quiesced and the lane shut down before the task stops).
+    const adm = v.core.tryAdmit(100, .user) orelse return error.RingFull;
+    const open = try v.inflight.reserveRegistered(&v.core, adm);
+    const fired0 = ckpt.stats.final_tick_open_reservations.load();
+    log.testing.expectErrorLogs(1);
+    try v.cp.tick(true, null, false, 50);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fired0 + 1, ckpt.stats.final_tick_open_reservations.load());
+    try testing.expectEqual(open.res.start, v.cp.lastLedgerTail());
+    try testing.expectEqual(node_cache.no_floor, a.dirtyFloor());
+    v.inflight.complete(&v.core, open.res);
+    // A quiet registry at the final tick fires nothing.
+    try v.cp.tick(true, null, false, 50);
+    try testing.expectEqual(fired0 + 1, ckpt.stats.final_tick_open_reservations.load());
+    try testing.expectEqual(v.core.headPos(), v.cp.lastLedgerTail());
 }
 
 test "cover loops: coverBringUpResidue cycles until reusable_upto == head and is a no-op when covered; checkpointPast clears a hole end within the bound and refuses loud past it" {

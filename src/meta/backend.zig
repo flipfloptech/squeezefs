@@ -895,7 +895,9 @@ pub const KvBackend = struct {
             be.cv.close();
             be.cv.quiesce();
             // The lane first: its windows are answered and its trailing
-            // barrier runs before the task's final tick waits the head stable.
+            // barrier runs before the task's final tick, which asserts the
+            // registry quiet (`checkpoint_final_tick_open_reservations`)
+            // rather than waiting on a completer that no longer exists.
             be.lane.shutdown();
             be.task.stop();
             if (be.ckpt_thread) |th| {

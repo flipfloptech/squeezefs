@@ -116,6 +116,10 @@ pub const registry = [_]Knob{
 
     // ---- 4a metadata object locks (read by meta/dlm.zig) ----
     .{ .key = "SQUEEZEFS_DLM_STRIPES", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 24 } }, .default = "derived", .class = .derived_override, .doc = "D-3: the stripe population of the 4a DlmLockManager inode + dentry classes (shipped floor 4096). Explicit wins verbatim (rounded UP to a power of two — the index is a mask); derived = next_pow2(max(4096, 16 × possible_cpus × q_depth)) so a false-sharing wait — which on the 4a tables costs a whole commit — hits at most one acquire in 16 at full ring occupancy. MEASUREMENT lever: 4096 is the shipped-4a A/B control, 1 the everything-serializes crucible. Engagement: dlm_{inode,dentry}_stripes; conviction: dlm_*_stripe_collisions vs dlm_*_key_waits." },
+
+    // ---- MetaLV node cache (read by meta/node_cache.zig) ----
+    .{ .key = "SQUEEZEFS_META_NODE_CACHE_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "Per-volume node-cache budget, MiB, verbatim (absolute > SQUEEZEFS_META_NODE_CACHE_PCT > derived max(mem_budget/16, 512 MiB))." },
+    .{ .key = "SQUEEZEFS_META_NODE_CACHE_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "Per-volume node-cache budget as a percentage of the R5 memory budget (below the absolute MiB knob, above the derived default)." },
 };
 
 pub fn lookup(key: []const u8) ?*const Knob {

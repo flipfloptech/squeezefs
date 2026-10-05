@@ -13,6 +13,7 @@ pub const flight = @import("flight.zig");
 pub const once = @import("once.zig");
 pub const channel = @import("channel.zig");
 pub const taskset = @import("taskset.zig");
+pub const arc_swap = @import("arc_swap.zig");
 
 pub const RwLock = rwlock.RwLock;
 pub const Mutex = mutex.Mutex;
@@ -37,4 +38,5 @@ test {
     _ = once;
     _ = channel;
     _ = taskset;
+    _ = arc_swap;
 }

@@ -38,6 +38,9 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
+    pub const node_snapshot = @import("meta/node_snapshot.zig");
+    pub const node_cache = @import("meta/node_cache.zig");
+    pub const economy = @import("meta/economy.zig");
     pub const journal_lane = if (builtin.os.tag == .linux) @import("meta/journal_lane.zig") else struct {};
     pub const tx = @import("meta/tx.zig");
     pub const heap_law = @import("meta/heap_law.zig");
@@ -87,6 +90,9 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    _ = meta.node_snapshot;
+    _ = meta.node_cache;
+    _ = meta.economy;
     _ = sync;
     if (builtin.os.tag == .linux) _ = meta.journal_lane;
     _ = meta.tx;

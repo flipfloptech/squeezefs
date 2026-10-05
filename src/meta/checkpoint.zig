@@ -18,8 +18,8 @@
 //! (which makes the cycle due with an immediate barrier: the parked
 //! committer waits on `reusable_upto`, which only the barrier advances — and
 //! the pressure law `distance > L/2` is unreachable on a ring whose reserve is
-//! half of it), or at shutdown. The deferred-mode `needs_flush` (a commit
-//! group's trailing coalesced barrier) rides the same tick as its own term.
+//! half of it), or at shutdown. The trailing coalesced barrier is the journal
+//! lane's own; it reaches the checkpointer only through the DUR-3 faces.
 //!
 //! ## The anticipating trigger (KD-SYM-10)
 //!
@@ -204,12 +204,12 @@ pub fn projectedFlushWallNs(dirty_nodes: u64, node_unit_ns: u64, promised_extent
     return (dirty_nodes *| node_unit_ns) +| (promised_extents *| @max(image_unit_ns, node_unit_ns));
 }
 
-/// The covering barriers a due cycle pays between its decision and its
-/// landing: barrier #1 always; on a DEFERRED-mode volume the tick's
-/// deferred-flush barrier too (a strict volume's commits barrier themselves).
-pub fn coveringBarriers(strict: bool) u64 {
-    return if (strict) 1 else 2;
-}
+/// The barriers a due cycle pays between its decision and its landing:
+/// barrier #1, exactly. The record's own durability rides a barrier PAST
+/// the landing (barrier #2 on an immediate cycle, else the lane's next
+/// trailing barrier through the DUR-3 faces), so no second barrier sits
+/// inside the term the cadence anticipates.
+pub const CYCLE_COVERING_BARRIERS: u64 = 1;
 
 /// The LIVE projection of the next cycle's wall from decision to landing:
 /// the flush projection plus the covering barriers at the measured barrier
@@ -315,9 +315,6 @@ pub const Observations = struct {
     max_dirty: u64,
     /// A committer parked at ring admission kicked the task.
     park_mark: bool,
-    /// The deferred-mode `needs_flush`: a commit group asked for the trailing
-    /// coalesced barrier.
-    fsync_pending: bool,
     /// `meta_kv_heap_full`: the merge sweep arm is due at the cycle's end.
     heap_full: bool,
     /// `max(horizon term, live projection)`, ms — the forest's anticipated
@@ -341,8 +338,6 @@ pub const Decision = struct {
     immediate_barrier: bool,
     /// Something to cover: dirty nodes, an uncovered ring, or the final cycle.
     covers_something: bool,
-    /// The deferred-mode barrier the tick runs whether or not a cycle does.
-    deferred_barrier: bool,
     /// The heap-full merge sweep runs at the end of the cycle.
     sweep_due: bool,
     /// The trigger in force, ms.
@@ -385,7 +380,6 @@ pub fn decideCheckpoint(obs: Observations) Decision {
         .reason = reason,
         .immediate_barrier = obs.final_cycle or ring_pressure or obs.park_mark,
         .covers_something = obs.final_cycle or obs.dirty_nodes > 0 or obs.journal_distance > 0,
-        .deferred_barrier = obs.fsync_pending,
         .sweep_due = obs.heap_full,
         .trigger_ms = trigger_ms,
         .age_late_ns = age_late_ns,
@@ -573,8 +567,6 @@ pub const stats = struct {
     /// Every ledger slot write (cycles + DENSE restatements).
     pub var meta_kv_ledger_writes: counters.ShardedCounter = .{};
     pub var meta_kv_checkpoint_phase_ns: PhaseHistograms = .{};
-    /// Deferred-mode tick barriers.
-    pub var meta_flush_deferred: counters.ShardedCounter = .{};
     /// Every `syncDevice`.
     pub var meta_device_syncs: counters.ShardedCounter = .{};
     /// One barrier's wall.
@@ -683,7 +675,7 @@ test "cycle term tie: prebarrier_wall + (min(late, cap) − tick)⁺; the cap is
     try testing.expectEqual(std.math.maxInt(u64), checkpointCycleTermNs(std.math.maxInt(u64), 132 * ms_ns, 50 * ms_ns, cap));
 }
 
-test "flush units and the projection: wall/count per class, none without the class; the horizon MAXIMUM over 64 passes; image unit floored at the node unit; covering barriers 2 deferred / 1 strict; saturating" {
+test "flush units and the projection: wall/count per class, none without the class; the horizon MAXIMUM over 64 passes; image unit floored at the node unit; one covering barrier; saturating" {
     try testing.expectEqual(@as(?u64, null), flushUnitNs(0, 0));
     try testing.expectEqual(@as(?u64, null), flushUnitNs(999 * ms_ns, 0));
     try testing.expectEqual(@as(?u64, 2 * ms_ns), flushUnitNs(80 * ms_ns, 40));
@@ -723,11 +715,12 @@ test "flush units and the projection: wall/count per class, none without the cla
     try testing.expectEqual(@as(u64, 140 * 250_000), projectedFlushWallNs(100, 250_000, 40, 0));
     try testing.expectEqual(@as(u64, 140 * 250_000), projectedFlushWallNs(100, 250_000, 40, 100_000));
     try testing.expectEqual(std.math.maxInt(u64), projectedFlushWallNs(std.math.maxInt(u64), 2, 1, 1));
-    try testing.expectEqual(@as(u64, 2), coveringBarriers(false));
-    try testing.expectEqual(@as(u64, 1), coveringBarriers(true));
+    // ONE covering barrier inside the term: barrier #1 (the record's own
+    // durability rides a barrier past the landing).
+    try testing.expectEqual(@as(u64, 1), CYCLE_COVERING_BARRIERS);
     const flush = projectedFlushWallNs(100, 250_000, 40, 2 * ms_ns);
-    try testing.expectEqual(flush + 300 * ms_ns, projectedCycleWallNs(flush, coveringBarriers(false), 150 * ms_ns));
-    try testing.expectEqual(flush + 150 * ms_ns, projectedCycleWallNs(flush, coveringBarriers(true), 150 * ms_ns));
+    try testing.expectEqual(flush + 150 * ms_ns, projectedCycleWallNs(flush, CYCLE_COVERING_BARRIERS, 150 * ms_ns));
+    try testing.expectEqual(flush + 300 * ms_ns, projectedCycleWallNs(flush, 2, 150 * ms_ns));
     try testing.expectEqual(@as(u64, 0), projectedCycleWallNs(0, 2, 0));
     try testing.expectEqual(std.math.maxInt(u64), projectedCycleWallNs(std.math.maxInt(u64) - 1, 2, 150 * ms_ns));
     // The trigger anticipates the larger of the horizon and the projection.
@@ -735,7 +728,7 @@ test "flush units and the projection: wall/count per class, none without the cla
     try testing.expectEqual(@as(u64, 105), projected_ms);
     try testing.expectEqual(CHECKPOINT_MAX_AGE_MS - 105, checkpointTriggerMs(CHECKPOINT_MAX_AGE_MS, anticipatedTermMs(0, projected_ms)));
     try testing.expectEqual(CHECKPOINT_MAX_AGE_MS - 133, checkpointTriggerMs(CHECKPOINT_MAX_AGE_MS, anticipatedTermMs(133, projected_ms)));
-    try testing.expectEqual(CHECKPOINT_MAX_AGE_MS - 302, checkpointTriggerMs(CHECKPOINT_MAX_AGE_MS, projectedCycleWallNs(2 * ms_ns, coveringBarriers(false), 150 * ms_ns) / ms_ns));
+    try testing.expectEqual(CHECKPOINT_MAX_AGE_MS - 152, checkpointTriggerMs(CHECKPOINT_MAX_AGE_MS, projectedCycleWallNs(2 * ms_ns, CYCLE_COVERING_BARRIERS, 150 * ms_ns) / ms_ns));
 }
 
 test "an outlier flush unit saturates the trigger for at most the horizon: 63 sane pushes keep it, the 64th evicts it" {
@@ -785,18 +778,17 @@ fn observed(now_ms: u64) Observations {
         .dirty_nodes = 0,
         .max_dirty = 4096,
         .park_mark = false,
-        .fsync_pending = false,
         .heap_full = false,
         .term_projection_ms = 0,
     };
 }
 
-test "decision matrix: every trigger alone, their priorities, the immediate-barrier set, covers_something, the deferred barrier and the sweep as their own terms" {
+test "decision matrix: every trigger alone, their priorities, the immediate-barrier set, covers_something, the sweep as its own term" {
     // Nothing: not due.
     const idle = decideCheckpoint(observed(10));
     try testing.expect(!idle.due);
     try testing.expectEqual(Reason.none, idle.reason);
-    try testing.expect(!idle.immediate_barrier and !idle.covers_something and !idle.deferred_barrier and !idle.sweep_due);
+    try testing.expect(!idle.immediate_barrier and !idle.covers_something and !idle.sweep_due);
     try testing.expectEqual(CHECKPOINT_MAX_AGE_MS, idle.trigger_ms);
     try testing.expectEqual(@as(?u64, null), idle.age_late_ns);
     // Age alone: due at exactly the max age, not before; no immediate barrier;
@@ -882,12 +874,11 @@ test "decision matrix: every trigger alone, their priorities, the immediate-barr
     try testing.expect(d.age_late_ns != null);
     o.dirty_nodes = 1;
     try testing.expectEqual(Reason.age, decideCheckpoint(o).reason);
-    // The deferred barrier and the sweep are their own terms, never `due`.
+    // The sweep is its own term, never `due`.
     o = observed(10);
-    o.fsync_pending = true;
     o.heap_full = true;
     d = decideCheckpoint(o);
-    try testing.expect(!d.due and d.deferred_barrier and d.sweep_due);
+    try testing.expect(!d.due and d.sweep_due);
 }
 
 test "flush-ceiling audit: inside at the ceiling, an overrun one ns past it, a structural hold's excused overlap turns an overrun into an extension; the tripwire fires per overrun" {

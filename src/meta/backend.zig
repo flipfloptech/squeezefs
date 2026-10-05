@@ -472,7 +472,7 @@ pub const KvBackend = struct {
             .core = &be.core,
             .registry = &be.reg,
             .ring_stats = &be.ring_stats,
-            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook },
+            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook },
             .test_error_logs = opts.test_error_logs,
         }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -705,6 +705,18 @@ pub const KvBackend = struct {
     fn laneCheckpointPastHook(ctx: ?*anyopaque, padded_end: u64) bool {
         const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
         return be.checkpointPast(padded_end);
+    }
+
+    /// DUR-3 on the lane's barriers (coalesced, strict, fsync): the same
+    /// tickets and the same drain as the checkpointer's own `syncDevice`.
+    fn laneBarrierStartedHook(ctx: ?*anyopaque) u64 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
+        return be.cp.barrierStarted();
+    }
+
+    fn laneBarrierLandedHook(ctx: ?*anyopaque, ticket: u64) void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx.?));
+        be.cp.barrierLanded(ticket);
     }
 
     fn mapSubmitError(e: journal_lane.Error) Error {
@@ -1144,6 +1156,39 @@ test "strict vs coalesced: a strict ack follows one barrier per group; a coalesc
         try be.fsync();
         try testing.expectEqual(@as(u64, 1), be.laneSnapshot().barriers_coalesced);
     }
+}
+
+test "DUR-3 on the lane's barriers: a cadence cycle's record (no immediate barrier) becomes reusable_upto when the lane's coalesced barrier lands, with no checkpointer barrier involved" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "lane-dur3", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    _ = try commitCreate(be, "a");
+    // One cadence-shaped cycle: barrier #1, the record, NO barrier #2 — the
+    // record's durability rides the next barrier on the device, whoever
+    // issues it.
+    be.smo_lock.lockUncancelable(be.io);
+    be.cp.checkpointCadence() catch |e| {
+        be.smo_lock.unlock(be.io);
+        return e;
+    };
+    be.smo_lock.unlock(be.io);
+    const tail = be.cp.lastLedgerTail();
+    try testing.expect(tail > 0);
+    try testing.expect(be.core.reusableUpto() < tail);
+    try testing.expectEqual(@as(usize, 1), be.cp.reclaim.len());
+    const syncs0 = checkpoint.stats.meta_device_syncs.load();
+    // The lane's trailing coalesced barrier (fsync): the ONE barrier stream
+    // the ring reclamation, the allocator's coverage clock and the cache's
+    // elision tail all move on.
+    try be.fsync();
+    try testing.expectEqual(@as(u64, 1), be.laneSnapshot().barriers_coalesced);
+    try testing.expectEqual(syncs0, checkpoint.stats.meta_device_syncs.load());
+    try testing.expectEqual(tail, be.core.reusableUpto());
+    try testing.expectEqual(tail, be.cache.durableTail());
+    try testing.expectEqual(@as(usize, 0), be.cp.reclaim.len());
+    try testing.expectEqual(tail, be.cp.reusable_upto.load());
 }
 
 test "rollback on the device: a synthetically failed window answers JournalWriteFailed and is rolled back, the volume stays open; three in a row latch FAILED and later commits are refused" {

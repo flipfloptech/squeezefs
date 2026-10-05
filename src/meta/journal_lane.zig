@@ -320,6 +320,15 @@ pub const Hooks = struct {
     /// Checkpoint past a permanent hole ending at `padded_end` (zero ring
     /// bytes); false = the cycle could not drain (the volume escalates).
     checkpoint_past: ?*const fn (ctx: ?*anyopaque, padded_end: u64) bool = null,
+    /// DUR-3: a barrier is about to be issued on this ring — its start
+    /// ticket (the checkpointer's `barrierStarted`), taken BEFORE the FSYNC
+    /// SQE so a ledger record pushed after the ticket is never drained by it.
+    barrier_started: ?*const fn (ctx: ?*anyopaque) u64 = null,
+    /// DUR-3: the barrier with `ticket` completed on the device — every
+    /// record it covers becomes `reusable_upto` (the checkpointer's
+    /// `barrierLanded`): the lane's barriers and the checkpointer's move the
+    /// ring, the allocator's coverage clock and the elision tail on one clock.
+    barrier_landed: ?*const fn (ctx: ?*anyopaque, ticket: u64) void = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -855,6 +864,8 @@ const Worker = struct {
     group_hole_err: ?Error = null,
     group_barrier_out: Error!void = {},
     barrier_in_flight: ?BarrierKind = null,
+    /// The in-flight barrier's DUR-3 ticket (`Hooks.barrier_started`).
+    barrier_ticket: u64 = 0,
     /// Barrier tickets: a request is satisfied by a barrier STARTED after it.
     barriers_started: u64 = 0,
     barriers_done: u64 = 0,
@@ -1430,6 +1441,9 @@ const Worker = struct {
         w.barriers_started += 1;
         w.needs_flush = false;
         w.barrier_in_flight = kind;
+        // The DUR-3 ticket BEFORE the device op (a wasted ticket on an issue
+        // failure only makes later pushes wait for a later barrier).
+        w.barrier_ticket = if (w.lane.hooks.barrier_started) |f| f(w.lane.hooks.ctx) else 0;
         switch (kind) {
             .strict_group => {
                 stats.barriers_strict.inc();
@@ -1447,8 +1461,9 @@ const Worker = struct {
         sqe.user_data = ud_barrier;
     }
 
-    /// The barrier's outcome: the latch's barrier class, the strict group's
-    /// ack gate, and every fsync request whose ticket it satisfies.
+    /// The barrier's outcome: the latch's barrier class, DUR-3 coverage (so
+    /// an fsync caller returns with `reusable_upto` advanced), the strict
+    /// group's ack gate, and every fsync request whose ticket it satisfies.
     fn barrierDone(w: *Worker, result: Error!void, now: u64) void {
         const kind = w.barrier_in_flight.?;
         w.barrier_in_flight = null;
@@ -1456,6 +1471,7 @@ const Worker = struct {
         w.last_barrier_ns = now;
         if (result) |_| {
             w.lane.latch.noteSuccess(.barrier);
+            if (w.lane.hooks.barrier_landed) |f| f(w.lane.hooks.ctx, w.barrier_ticket);
         } else |e| {
             log.warn("journal lane {d}: barrier failed: {s}", .{ w.lane.index, @errorName(e) });
             stats.barrier_failures.inc();
@@ -1824,6 +1840,56 @@ test "coalesced cadence: acks precede the barrier; an fsync request is answered 
         }
     }{ .l = h2.lane.? });
     try testing.expectEqual(@as(u64, 0), h2.lane.?.snapshot().tick_rescues);
+}
+
+/// The DUR-3 faces as a ticket counter: `started` hands out 1, 2, …;
+/// `landed` records the tickets handed back.
+const Dur3Log = struct {
+    started: std.atomic.Value(u64) = .init(0),
+    landed: std.atomic.Value(u64) = .init(0),
+    last_landed: std.atomic.Value(u64) = .init(0),
+    /// A ticket landed that was never started, or out of order.
+    bad: std.atomic.Value(u64) = .init(0),
+
+    fn barrierStarted(ctx: ?*anyopaque) u64 {
+        const self: *Dur3Log = @ptrCast(@alignCast(ctx.?));
+        return self.started.fetchAdd(1, .acq_rel) + 1;
+    }
+
+    fn barrierLanded(ctx: ?*anyopaque, ticket: u64) void {
+        const self: *Dur3Log = @ptrCast(@alignCast(ctx.?));
+        if (ticket == 0 or ticket > self.started.load(.acquire) or ticket <= self.last_landed.load(.acquire)) _ = self.bad.fetchAdd(1, .acq_rel);
+        self.last_landed.store(ticket, .release);
+        _ = self.landed.fetchAdd(1, .acq_rel);
+    }
+
+    fn hooks(self: *Dur3Log) Hooks {
+        return .{ .ctx = self, .barrier_started = barrierStarted, .barrier_landed = barrierLanded };
+    }
+};
+
+test "DUR-3 hooks: every lane barrier (strict group, coalesced, fsync) takes a start ticket before the device op and lands the SAME ticket, in order, before its requester is answered" {
+    const h = try Harness.init(testing.allocator, "dur3");
+    defer h.deinit();
+    var d3: Dur3Log = .{};
+    try h.spawnLane(d3.hooks(), "0", 0);
+    const lane = h.lane.?;
+    var k: u64 = 1;
+    while (k <= 3) : (k += 1) {
+        const a = try h.append(k, 500, 0x5A);
+        try a.ticket.wait().result;
+        // The strict group's barrier landed its ticket before the ack.
+        try testing.expectEqual(k, d3.started.load(.acquire));
+        try testing.expectEqual(k, d3.landed.load(.acquire));
+        try testing.expectEqual(k, d3.last_landed.load(.acquire));
+    }
+    const t = try lane.requestBarrier();
+    try t.wait().result;
+    try testing.expectEqual(@as(u64, 4), d3.started.load(.acquire));
+    try testing.expectEqual(@as(u64, 4), d3.landed.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), d3.bad.load(.acquire));
+    lane.shutdown();
+    try testing.expectEqual(@as(u64, 4), d3.landed.load(.acquire));
 }
 
 const RollbackLog = struct {

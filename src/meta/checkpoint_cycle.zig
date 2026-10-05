@@ -414,8 +414,6 @@ pub const Checkpointer = struct {
     reclaim: ledger.ReclaimQueue,
     /// Admission parkers register here; bumped when `reusable_upto` moves.
     space_notify: jc.Notify = .{},
-    /// The deferred-mode `needs_flush` a commit group sets.
-    needs_flush: std.atomic.Value(bool) = .init(false),
 
     // ---- the cadence's references ----
     /// The last cycle's END (the flat age law's reference).
@@ -499,20 +497,10 @@ pub const Checkpointer = struct {
         return self.deps.latch.isFailed();
     }
 
-    pub fn strict(self: *const Checkpointer) bool {
-        return self.cfg.flush_interval_ms == 0;
-    }
-
     pub fn lastCycle(self: *Checkpointer) CycleTape {
         self.tape_lock.lock();
         defer self.tape_lock.unlock();
         return self.last_cycle;
-    }
-
-    /// The commit group's deferred-mode barrier request (the trailing
-    /// coalesced barrier the next tick runs).
-    pub fn requestFlush(self: *Checkpointer) void {
-        self.needs_flush.store(true, .release);
     }
 
     /// The DUR-3 push epoch: barriers already started, none of which can
@@ -536,39 +524,56 @@ pub const Checkpointer = struct {
 
     // ---- the barrier (DUR-3) ----
 
-    /// The device barrier with its start ticket: on success coverage is
-    /// published BEFORE the drain so everything this barrier releases drains
-    /// against it; a failure counts toward the FAILED lattice (three in a row
-    /// latch) and covers nothing.
+    /// The checkpointer's own device barrier through the sink: a DUR-3
+    /// ticket around it; a failure counts toward the FAILED lattice (three
+    /// in a row latch) and covers nothing.
     pub fn syncDevice(self: *Checkpointer) IoError!void {
         ckpt.stats.meta_device_syncs.inc();
-        // acq_rel pairs with `barrierPushEpoch`'s acquire: a push that read
-        // this ticket as "started" is never drained by this barrier.
-        const started_at = self.barrier_starts.fetchAdd(1, .acq_rel) + 1;
+        const started_at = self.barrierStarted();
         const t0 = clock.monotonicNs();
         self.deps.barrier.barrier(self.deps.barrier.ctx) catch |e| {
             _ = self.deps.latch.noteFailure(.barrier);
             return e;
         };
-        _ = self.barrier_durable.fetchMax(started_at, .acq_rel);
         self.deps.latch.noteSuccess(.barrier);
         ckpt.stats.meta_barrier.record(clock.monotonicNs() -| t0);
+        self.barrierLanded(started_at);
+    }
+
+    /// DUR-3 start ticket for a barrier about to be issued on the device —
+    /// by this checkpointer or by the journal lane's own FSYNC SQE: every
+    /// barrier on the volume moves the same three watermarks on one clock.
+    /// Take it BEFORE the device op. acq_rel pairs with `barrierPushEpoch`'s
+    /// acquire: a push that read this ticket as "started" is never drained
+    /// by this barrier.
+    pub fn barrierStarted(self: *Checkpointer) u64 {
+        return self.barrier_starts.fetchAdd(1, .acq_rel) + 1;
+    }
+
+    /// The barrier with ticket `started_at` completed on the device: coverage
+    /// is published BEFORE the drain so everything it releases drains
+    /// against it. Any thread (the task's, the lane's, an fsync caller's).
+    pub fn barrierLanded(self: *Checkpointer, started_at: u64) void {
+        _ = self.barrier_durable.fetchMax(started_at, .acq_rel);
         self.afterDurableBarrier();
     }
 
     /// Every record pushed with an epoch below the completed barrier's start
     /// is durable: its tail opens the ring, releases the pending frees it
     /// covers and advances the cache's elision tail — all three on one clock.
+    /// Concurrent callers are safe: the queue pops under its own lock and
+    /// every advance is a monotonic fetchMax, so the gauge reads the ring's
+    /// own word after the drain rather than a stale local.
     fn afterDurableBarrier(self: *Checkpointer) void {
         const covered = self.barrier_durable.load(.acquire);
-        var last: ?u64 = null;
+        var moved = false;
         while (self.reclaim.popCovered(covered)) |e| {
             _ = self.deps.alloc.advanceDurable(e.tail);
             self.deps.core.advanceReusableUpto(e.tail);
-            last = e.tail;
+            self.deps.cache.setDurableTail(e.tail);
+            moved = true;
         }
-        if (last) |tail| {
-            self.deps.cache.setDurableTail(tail);
+        if (moved) {
             self.reusable_upto.set(self.deps.core.reusableUpto());
             self.space_notify.notifyWaiters();
         }
@@ -591,7 +596,7 @@ pub const Checkpointer = struct {
     /// The live projection of the next cycle's decision-to-landing wall, ms.
     pub fn projectedMsFor(self: *const Checkpointer, dirty_nodes: u64) u64 {
         const flush = ckpt.projectedFlushWallNs(dirty_nodes, self.node_units.anticipatedNs(), self.deps.cache.heapPromised(), self.image_units.anticipatedNs());
-        return ckpt.projectedCycleWallNs(flush, ckpt.coveringBarriers(self.strict()), self.barriers.anticipatedNs()) / ns_per_ms;
+        return ckpt.projectedCycleWallNs(flush, ckpt.CYCLE_COVERING_BARRIERS, self.barriers.anticipatedNs()) / ns_per_ms;
     }
 
     /// Read the decision's inputs once and take it.
@@ -609,7 +614,6 @@ pub const Checkpointer = struct {
             .dirty_nodes = dirty,
             .max_dirty = self.cfg.max_dirty_nodes,
             .park_mark = park_kick,
-            .fsync_pending = self.needs_flush.load(.acquire),
             .heap_full = self.posture.isFull(),
             .term_projection_ms = term_projection,
             .max_age_ms = self.cfg.max_age_ms,
@@ -1089,22 +1093,18 @@ pub const Checkpointer = struct {
 
     /// One task tick: decide BEFORE the drain (a drain ahead of a due cycle
     /// is work the cycle repeats) → the threshold drain within the budget
-    /// when no cycle is due → the deferred-mode barrier → decide again → the
-    /// cycle. The shutdown tick drains FIRST and unbounded, forces a full
-    /// cycle with an immediate barrier and iterates to the fixpoint
-    /// (`tail == head ∧ no dirty pages`: an empty replay window).
+    /// when no cycle is due → decide again → the cycle. The coalesced
+    /// trailing barrier is the LANE's (its DUR-3 hooks move the watermarks);
+    /// the tick issues none of its own. The shutdown tick drains FIRST and
+    /// unbounded, forces a full cycle with an immediate barrier and
+    /// iterates to the fixpoint (`tail == head ∧ no dirty pages`: an empty
+    /// replay window).
     pub fn tick(self: *Checkpointer, final_cycle: bool, drain_deadline_ns: ?u64, park_kick: bool, tick_ms: u64) CycleError!void {
         if (final_cycle) self.waitHeadStable();
         var decided_at = clock.monotonicNs();
         var decision: ?Decision = if (final_cycle) null else self.decide(decided_at, park_kick, false);
         const run_drain = if (decision) |d| !d.runsACycle() else true;
         if (run_drain) try self.drainMaintenance(if (drain_deadline_ns) |d| DrainBudget.bounded(d) else DrainBudget.unbounded);
-        if (self.needs_flush.swap(false, .acq_rel)) {
-            ckpt.stats.meta_flush_deferred.inc();
-            const t0 = clock.monotonicNs();
-            try self.syncDevice();
-            self.noteCheckpointBarrier(clock.monotonicNs() -| t0);
-        }
         if (run_drain) {
             decided_at = clock.monotonicNs();
             decision = self.decide(decided_at, park_kick, final_cycle);
@@ -1144,8 +1144,6 @@ pub const KickMark = enum {
     ring_park,
     /// The memory budget's shed lever: an early run of the cadence's drain.
     shed,
-    /// A commit group's deferred-mode barrier request.
-    flush,
 };
 
 pub const CheckpointTask = struct {
@@ -1179,7 +1177,6 @@ pub const CheckpointTask = struct {
         switch (mark) {
             // release pairs with the task's acq_rel swap in `runOnce`.
             .ring_park => self.ring_park_kick.store(true, .release),
-            .flush => self.cp.requestFlush(),
             .threshold, .shed => {},
         }
         self.wake.notifyOne(self.io);
@@ -1500,7 +1497,7 @@ test "a full cycle over an in-RAM volume: dirty nodes are flushed and their floo
     try testing.expectEqual(@as(u64, 2), tape.nodes_appended);
     try testing.expectEqual(tape.total_ns, tape.phasesSum());
     try testing.expect(tape.total_ns > 0);
-    // The second barrier (the next tick's deferred barrier, here direct):
+    // The second barrier (the lane's next trailing one, here direct):
     // all three watermarks move on one clock; the free inside the window
     // releases, the one past the tail stays parked.
     const token = v.cp.space_notify.register();
@@ -1815,14 +1812,11 @@ test "the task: a park-mark kick makes an immediate barriered cycle with a caden
     // The mark was consumed: the next wake is a plain one.
     try testing.expect(task.runOnce(true, now + 2));
     try testing.expectEqual(@as(u64, 2), v.cp.checkpointSeq());
-    // A flush request: a threshold-shaped wake barriers nothing (appends
-    // only); the deferred barrier rides the next CADENCE tick, which with
-    // nothing dirty and the ring covered runs no cycle (nothing to cover).
-    task.kick(.flush);
-    try testing.expect(task.runOnce(true, now + 3));
-    try testing.expectEqual(@as(u64, 2), v.barriers);
+    // A cadence tick with nothing dirty and the ring covered runs no cycle
+    // and issues no barrier of its own (the trailing coalesced barrier is
+    // the lane's).
     try testing.expect(task.runOnce(false, task.next_tick_ns));
-    try testing.expectEqual(@as(u64, 3), v.barriers);
+    try testing.expectEqual(@as(u64, 2), v.barriers);
     try testing.expectEqual(@as(u64, 2), v.cp.checkpointSeq());
     // Stop: the final tick cycles to the fixpoint and the loop exits.
     _ = try v.commit(a, &.{"a2"}, 100);
@@ -1889,7 +1883,7 @@ test "cover loops: coverBringUpResidue cycles until reusable_upto == head and is
     v.inflight.complete(&v.core, stuck.res);
 }
 
-test "the tick: a due tick with the park mark records the decision words on the tape; the deferred barrier rides a tick without a cycle; a dirty-cap tick cycles without an immediate barrier" {
+test "the tick: a due tick with the park mark records the decision words on the tape; another issuer's barrier (the lane's) drains the pending record through the DUR-3 faces; a dirty-cap tick cycles without an immediate barrier" {
     const v = try TestVol.create(50, 1000);
     defer v.destroy();
     for (0..5) |e| try v.writeLeaf(e, e + 1);
@@ -1909,15 +1903,34 @@ test "the tick: a due tick with the park mark records the decision words on the 
     try testing.expectEqual(@as(u64, 2), v.cp.checkpointSeq());
     try testing.expectEqual(@as(u64, 1), v.barriers);
     try testing.expectEqual(@as(u64, 0), v.core.reusableUpto());
-    // A flush request without anything due: one deferred barrier, which
-    // drains the pending record — reclamation lags one tick.
-    const deferred0 = ckpt.stats.meta_flush_deferred.load();
-    v.cp.requestFlush();
+    // A tick with nothing due issues no barrier of its own; the record's
+    // durability rides ANOTHER issuer's barrier (the lane's coalesced one):
+    // a ticket taken before its device op, landed after — the pending
+    // record drains and all three watermarks move, with no sink barrier.
+    const syncs0 = ckpt.stats.meta_device_syncs.load();
     try v.cp.tick(false, clock.monotonicNs() + 50 * ns_per_ms, false, 50);
-    try testing.expectEqual(deferred0 + 1, ckpt.stats.meta_flush_deferred.load());
-    try testing.expectEqual(@as(u64, 2), v.barriers);
+    try testing.expectEqual(@as(u64, 1), v.barriers);
+    try testing.expectEqual(@as(u64, 0), v.core.reusableUpto());
+    const ticket = v.cp.barrierStarted();
+    try testing.expectEqual(@as(usize, 1), v.cp.reclaim.len());
+    v.cp.barrierLanded(ticket);
+    try testing.expectEqual(syncs0, ckpt.stats.meta_device_syncs.load());
+    try testing.expectEqual(@as(u64, 1), v.barriers);
     try testing.expectEqual(v.cp.lastLedgerTail(), v.core.reusableUpto());
+    try testing.expectEqual(v.cp.lastLedgerTail(), v.cache.durableTail());
+    try testing.expectEqual(@as(usize, 0), v.cp.reclaim.len());
     try testing.expectEqual(@as(u64, 2), v.cp.checkpointSeq());
+    // A ticket taken BEFORE a record's push never drains that record: the
+    // push's epoch counted it as started.
+    const early = v.cp.barrierStarted();
+    _ = try v.commit(nodes[1], &.{"y"}, 100);
+    try v.cp.checkpointCadence();
+    try testing.expectEqual(@as(usize, 1), v.cp.reclaim.len());
+    v.cp.barrierLanded(early);
+    try testing.expectEqual(@as(usize, 1), v.cp.reclaim.len());
+    v.cp.barrierLanded(v.cp.barrierStarted());
+    try testing.expectEqual(@as(usize, 0), v.cp.reclaim.len());
+    try testing.expectEqual(v.cp.lastLedgerTail(), v.core.reusableUpto());
     // Age-due on a forest volume records the decision words and folds a
     // term: the trigger is the max age less the anticipated term the same
     // decision measured, and the lateness is the span past it.
@@ -1926,7 +1939,7 @@ test "the tick: a due tick with the park mark records the decision words on the 
     _ = try v.commit(nodes[0], &.{"z"}, 100);
     v.cp.collected_ns.store(clock.monotonicNs() -| 250 * ns_per_ms, .release);
     try v.cp.tick(false, clock.monotonicNs() + 50 * ns_per_ms, false, 50);
-    try testing.expectEqual(@as(u64, 3), v.cp.checkpointSeq());
+    try testing.expectEqual(@as(u64, 4), v.cp.checkpointSeq());
     const tape = v.cp.lastCycle();
     try testing.expectEqual(ckpt.checkpointTriggerMs(100, ckpt.anticipatedTermMs(tape.anticipated_ms, tape.projected_ms)), tape.trigger_ms);
     try testing.expect(tape.trigger_ms <= 100);

@@ -38,6 +38,9 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
+    // @anchor:meta_lane_import
+    // @anchor:meta_pure_import
+    // @anchor:meta_dlm_import
     pub const key = @import("meta/key.zig");
     pub const record = @import("meta/record.zig");
     pub const bset = @import("meta/bset.zig");
@@ -57,6 +60,9 @@ pub const meta = struct {
     pub const epoch_core = @import("meta/epoch_core.zig");
     pub const conveyor_core = @import("meta/conveyor_core.zig");
 };
+
+// ---- sync primitives (charter §9), written over std.Io's futex ops ----
+// @anchor:sync_import
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
@@ -79,6 +85,10 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:sync_test
+    // @anchor:meta_lane_test
+    // @anchor:meta_pure_test
+    // @anchor:meta_dlm_test
     _ = meta.key;
     _ = meta.record;
     _ = meta.bset;

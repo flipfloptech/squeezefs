@@ -66,6 +66,10 @@ module — a row nothing reads is dead code and goes red). Keep it green on both
   (`.empty`, pass the allocator); format with `std.Io.Writer` (`{f}` calls a type's
   `format(self, *Writer)`); file I/O in tests through `std.testing.io` and
   `std.Io.Dir.cwd()`.
+- **Executor & waiting** (`docs/decisions/0001-executor-is-an-io-implementation.md`): code that
+  waits, spawns or does non-hot-path I/O takes an `io: std.Io` parameter (tests pass
+  `std.testing.io`); the charter's primitives live in `src/sync/` over the `Io` futex ops; hot
+  paths never take an `Io`. Our own `Io` implementation (`src/exec/`) lands with rung 3.
 - **Model checks**: every lock-free core is written as a standalone, dependency-free MODEL
   (plain value type, explicit per-thread program counters, one atomic action per `step`) and
   explored exhaustively with `src/model/explorer.zig` (`expectHolds`). Every model ships with

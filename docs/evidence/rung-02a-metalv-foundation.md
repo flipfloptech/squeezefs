@@ -83,9 +83,35 @@ this correction; the reference should be told.
 - `std.Thread.Mutex` does not exist in Zig 0.17; the conveyor's sanctioned mutex is `std.Io.Mutex`
   (`lockUncancelable` — committer cancellation is designed out, charter §9).
 
+## Wave 2 (same rung): node format, `format`, builder — byte-identical to the reference
+
+`meta/node_seq.zig`, `meta/node.zig` (K2: header page with `@offsetOf` assertions, `NodeLayout` ties
+C = 257,984 / ¾C = 193,488 / ¼C = 64,496, fanout 7,166 ⇒ depth ≤ 3 at 100 M, `verifyNodeExtentScreened`
+per the spec pseudocode with the four-rule frame screen and the torn-tail stride pass, compact /
+split with same-key cohesion / merge images), `meta/format.zig` (the 13-step plan as
+`[]Step{offset, bytes, barrier_after}` + `formatImage`), `meta/builder.zig` (`ImageBuilder`,
+`TreeWriter` ¾-fill packing, digest walks). 39 tests. Gate: Linux **442/442**, macOS 384 + 6 skips
+(4 are venue-only cross-checks).
+
+**Oracle: the reference binary** (v1.3.0 debug, copied from the user's `sqz-gate` into the venue at
+`/build/ref/squeezefs`).
+- Reference `format` → Zig loaders: both classes (`--single-writer` flat, default symmetric forest)
+  decode end to end — superblock, newest ledger slot (seq 1 → slot 1), every root node, every record;
+  ino 1 decodes `S_IFDIR|0o755`, nlink 2; the `format_config` xattr key's hash56 recomputes from the
+  sector-0 seed; bitmap slot A bits `0b111`; `KVAD` header and appender-0 `Free` page byte-identical to
+  `geometry.zig`'s images; the DUR-5 tail copy identical to sector 0.
+- Zig `formatImage` → reference `fsck --offline`: with the reference's identity pinned as inputs,
+  Zig's image is **byte-identical** to the reference's for both classes (`cmp` over 256 MiB: no
+  difference) and for a `--meta-node-kib 64 --meta-journal-mb 1` pair at 128 MiB; with fresh uuids,
+  215/174 differing bytes — all expected randomness (node seqs, checksums, uuid/hash_seed, xattr key
+  hash). Every Zig image: `fsck` exit 0, `findings: 0 (clean)`. Both directions are durable venue tests.
+
+Spec corrections from this wave (`kv_alloc_superblock.md` updated in place): `usable_budget` is
+46,032 (64 KiB) / 193,488 (256 KiB) — the header page is subtracted; the frame term is the v1 32 B on
+every layout; step 13's fdatasync coincides with step 12's (3 barriers total).
+
 ## Owed (rung 2b)
 
-Node format + node_seq (K2), `format` build + builder (K6a's second half), node snapshot + node
-cache, tree + SMO + leaf merge, 4a object locks, tx staging, the journal lane, the conveyor +
+Node snapshot + node cache, tree + SMO + leaf merge, 4a object locks, tx staging, the journal lane, the conveyor +
 durability lane, checkpoint, heap law, inos, the journal economy — `docs/porting/kv_tree_cache_commit_survey.md`
 §7 is the ordered plan with the tests per module.

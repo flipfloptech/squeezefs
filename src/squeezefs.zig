@@ -49,8 +49,10 @@ pub const meta = struct {
     pub const alloc_ext = @import("meta/alloc_ext.zig");
     pub const superblock = @import("meta/superblock.zig");
     pub const geometry = @import("meta/geometry.zig");
-    // @anchor:meta_k2_import
-    // @anchor:meta_k6_import
+    pub const node_seq = @import("meta/node_seq.zig");
+    pub const node = @import("meta/node.zig");
+    pub const builder = @import("meta/builder.zig");
+    pub const format = @import("meta/format.zig");
     pub const node_state_core = @import("meta/node_state_core.zig");
     pub const epoch_core = @import("meta/epoch_core.zig");
     pub const conveyor_core = @import("meta/conveyor_core.zig");
@@ -88,8 +90,10 @@ test {
     _ = meta.alloc_ext;
     _ = meta.superblock;
     _ = meta.geometry;
-    // @anchor:meta_k2_test
-    // @anchor:meta_k6_test
+    _ = meta.node_seq;
+    _ = meta.node;
+    _ = meta.builder;
+    _ = meta.format;
     _ = meta.node_state_core;
     _ = meta.epoch_core;
     _ = meta.conveyor_core;

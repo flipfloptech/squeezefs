@@ -70,7 +70,7 @@ Bit numbering collisions happened 4× in Rust (8/9, 10/11, 12/13, 12/14); disjoi
 Fresh-format feature word (`SuperblockV3::plan`, `:797-800`): `bit0|bit1|bit6|bit7`.
 Builder adds (`builder.rs:496-560`): `bit2|bit4` iff membership stamp (always, in public format);
 `MULTI_WRITER_FORMAT_BITS` iff `multi_writer`; `bit17` iff `symmetric`; test seams bit 9 / bit 10.
-⇒ **default `format`** word = `0b11_1111_1111_1101_0111` = `0x3FFD7` (bits 0,1,2,4,6,7,8,9,10,11,12,13,14,15,17).
+⇒ **default `format`** word = `0b10_1111_1111_1101_0111` = `0x2FFD7` (bits 0,1,2,4,6,7,8,9,10,11,12,13,14,15,17 — bit 16 is NEVER stamped at format; verified against `ref-sym.img` sector 0 bytes [16..24) = `d7 ff 02 00 …`).
 ⇒ **`--single-writer`** word = bits {0,1,2,4,6,7} = `0xD7`.
 
 ### 1.3 Decoder totality (`decode_sector_with_known`, `:924-1033`) — order of checks, exact messages
@@ -190,7 +190,7 @@ Public entry points → `format_v3_inner(path, len, opts, stamp, class)`:
     write_ledger_slot(path, sb.root_ledger.start, &ledger)      // slot = 1 % 32 = 1 ⇒ offset root_ledger.start + 4096  (NOT slot 0)
 11. fdatasync                                                    // barrier over everything the SB references
 12. write_superblock_v3(path, &sb)                               // backup+fdatasync, then sector 0+fdatasync (§1.6)
-13. fdatasync
+13. fdatasync                                                    // nothing written since 12's own trailing fdatasync: the same barrier (a step list of (offset, bytes, barrier_after) collapses it)
 → BuiltImage { superblock, ledger_seq: 1, next_ino, nodes_written, extents_allocated: nodes_written + (symmetric ? 1 : 0) }
 ```
 Atomicity: sector 0 is zeroed at step 3 and rewritten LAST — no crash prefix is mountable by any
@@ -258,7 +258,7 @@ in add order; `coll_seq` assigned in name-sorted order within a `(parent, hash54
 `coll` in `(ino, name)`-sorted order within `(ino, hash56)`.
 
 ### 3.2 `TreeWriter` — bottom-up packing (`:769-966`)
-- `usable_budget = (node_size − NODE_PAGE(4096) − BSET_FRAME_LEN(32) − BSET_HEADER_LEN(32)) × 3 / 4` (the K5 ¾ split-fill convention; e.g. 64 KiB ⇒ 49,104 B; 256 KiB ⇒ 196,560 B).
+- `usable_budget = (node_size − NODE_PAGE(4096) − BSET_FRAME_LEN(32) − BSET_HEADER_LEN(32)) × 3 / 4` (the K5 ¾ split-fill convention; 64 KiB ⇒ 46,032 B; 256 KiB ⇒ 193,488 B = the v1 `split_part_capacity`). The frame term is the v1 `BSET_FRAME_LEN` on EVERY layout — a forest image (v2 40 B frames) packs with the same budget (`usable_budget_of`, builder.rs:853–859); the Zig port keeps the quirk for byte identity.
 - `chunk_by_encoded_len`: greedy runs of key-ascending records, each run ≤ budget encoded bytes (a single record never exceeds it — the value cap guarantees it); empty input ⇒ one empty chunk.
 - `write_level(tree_id, level, records)`: per chunk `i`: `max_key = last chunk ? KEY_SPACE_MAX : chunk.last().key`; `extent = alloc.claim_internal()` (lowest-first); `addr = heap.start + extent × node_size`; `node_seq = ++next_node_seq`; `write_node(path, layout, {addr, node_seq, tree_id, level, min_key, max_key}, chunk, journal_seq_horizon 0)`; `min_key = key_successor(max_key) = max_key ‖ 0x00`. First `min_key = ""`.
 - `write_tree`: level 0 over records; while > 1 node: separators `Record::put(max_key, 0, encode_interior_value(addr, seq) = addr u64 LE ‖ seq u64 LE)`, next level; > 255 levels ⇒ Corrupt. Returns `(root_addr, root_seq)`.
@@ -583,7 +583,7 @@ Directory extent (one heap extent, claimed from the bitmap, zeroed): pairs at `d
 
 | class | CLI | incompat word | trees in the ledger | appender region | writable mount |
 |---|---|---|---|---|---|
-| `Symmetric` (DEFAULT) | `format` | `0x3FFD7` (0,1,2,4,6,7,8..15,17) | `[(8, ctrl), (0, native)]` | dir extent + page 0 | forest (`SQUEEZEFS_SYMMETRIC_META` unset or `=1`) |
+| `Symmetric` (DEFAULT) | `format` | `0x2FFD7` (0,1,2,4,6,7,8..15,17) | `[(8, ctrl), (0, native)]` | dir extent + page 0 | forest (`SQUEEZEFS_SYMMETRIC_META` unset or `=1`) |
 | `SingleWriter` | `format --single-writer` | `0xD7` (0,1,2,4,6,7) | `[(1),(2),(3)]` | none | flat solo |
 | `MultiWriterFlat` (pre-flip, tests only) | — | `0x1FFD7` (no 17) | `[(1),(2),(3),(6)]` | none | REFUSED: `"{path}: not symmetric-forest capable (incompat bit 17 absent) — a multi-writer-class volume formatted before the symmetric default flip (PR 14). Run `squeezefs volume enable-symmetric <sqmeta-uri>` offline (design-symmetric-metadata §7.2), or `format --force` a fresh set; a writable mount of this class is presence-required …"` (half-converted variant names the `sym_upgrade:` marker and `--resume`/`--abort`) |
 

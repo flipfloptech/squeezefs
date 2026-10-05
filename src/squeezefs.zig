@@ -36,6 +36,15 @@ pub const model = struct {
     pub const explorer = @import("model/explorer.zig");
 };
 
+// ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
+pub const meta = struct {
+    // @anchor:meta_k1_import
+    // @anchor:meta_k3_import
+    // @anchor:meta_k4_import
+    // @anchor:meta_k2_import
+    // @anchor:meta_k6_import
+};
+
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
 
@@ -57,6 +66,11 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:meta_k1_test
+    // @anchor:meta_k3_test
+    // @anchor:meta_k4_test
+    // @anchor:meta_k2_test
+    // @anchor:meta_k6_test
     _ = mem_budget;
     _ = align_probe;
     if (builtin.os.tag == .linux) _ = uring_fs;

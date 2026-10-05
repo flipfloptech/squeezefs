@@ -58,13 +58,13 @@ const align_probe = @import("../io/align_probe.zig");
 const clock = @import("../core/clock.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
-const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const nd = @import("../io/nvme_derive.zig");
 const thread_name = @import("../core/thread_name.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const jc = @import("journal_core.zig");
 const journal = @import("journal.zig");
+const checkpoint = @import("checkpoint.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("journal_lane is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -91,11 +91,6 @@ pub const ring_entries: u16 = uring_fs.journal_ring_entries;
 /// three orders above the quiet journal round trip (116 µs) and a tenth of
 /// the 1 s checkpoint cadence it would otherwise hold back.
 pub const park_backstop_ns: u64 = 100 * std.time.ns_per_ms;
-
-/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` default: the legacy v2 flusher cadence
-/// reused as the coalesced barrier's period; 0 = strict (one barrier per
-/// group before any ack).
-pub const default_flush_interval_ms: u64 = 50;
 
 /// `user_data` of the wake READ (`uring_fs.wake_ud`) and of the one barrier
 /// in flight; run slots are small indices. `u64::MAX − 1` stays reserved in
@@ -127,9 +122,11 @@ pub fn cadenceFrom(interval_ms: u64) Cadence {
     return .{ .strict = interval_ms == 0, .interval_ns = interval_ms * std.time.ns_per_ms };
 }
 
-/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` (0..=600000, default 50; 0 = strict).
+/// The cadence over the checkpointer's ONE flush-interval derivation (the
+/// explicit row wins; 0 = strict): the lane and the tick period read the
+/// same number from the same place.
 pub fn resolveFlushCadence(env: *const std.process.Environ.Map) Cadence {
-    return cadenceFrom(knobs.intKnob(u64, env, "SQUEEZEFS_META_FLUSH_INTERVAL_MS", default_flush_interval_ms));
+    return cadenceFrom(checkpoint.flushIntervalMsFromEnv(env));
 }
 
 // ---------------------------------------------------------------------------
@@ -1700,11 +1697,12 @@ fn spinUntil(cond: anytype) void {
     while (!cond.ready()) std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
-test "the flush cadence knob: default 50 ms coalesced; 0 is strict; junk keeps the default loudly" {
+test "the flush cadence: the checkpointer's derived default (50 ms) coalesced; 0 is strict; junk keeps the default loudly" {
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     const d = resolveFlushCadence(&env);
     try testing.expect(!d.strict);
+    try testing.expectEqual(checkpoint.DEFAULT_FLUSH_INTERVAL_MS * std.time.ns_per_ms, d.interval_ns);
     try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), d.interval_ns);
     try env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
     try testing.expect(resolveFlushCadence(&env).strict);

@@ -82,8 +82,23 @@ pub const DIRTY_NODES_BUDGET_DIVISOR: u64 = 32;
 /// 100 ms = a tenth of the max age: ten decisions per cadence ceiling.
 pub const STRICT_TICK_PERIOD_MS: u64 = 100;
 
-/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` default (the lane's; one source).
-pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 50;
+/// Coalesced barriers per checkpoint window: the trailing barrier's period
+/// is the cadence ceiling split twenty ways, so acked-but-volatile metadata
+/// (a coalesced ack precedes its barrier) is bounded to 5 % of the cadence
+/// while the barrier rate stays ≤ 20/s — ≤ 4 % of the device at the
+/// measured 1.3–1.9 ms barrier. The kill -9 law (§1.10) is independent of
+/// it (a completed O_DIRECT write survives the process); the exposure is a
+/// power cut's, and `fsync` is the trailing barrier.
+pub const FLUSHES_PER_CHECKPOINT_WINDOW: u64 = 20;
+
+/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` default: `CHECKPOINT_MAX_AGE_MS / 20`
+/// = 50 ms, derived HERE and nowhere else — the journal lane imports it and
+/// the registry row's default string ties to it (`flushIntervalMsFromEnv`'s
+/// test). The row is the explicit override; its 0 is strict.
+pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = CHECKPOINT_MAX_AGE_MS / FLUSHES_PER_CHECKPOINT_WINDOW;
+comptime {
+    std.debug.assert(DEFAULT_FLUSH_INTERVAL_MS == 50);
+}
 
 /// §4.7 wedged-tail bound: consecutive barriered cycles with retirements
 /// parked, none released and no tail advance before the volume fails loud.
@@ -138,10 +153,16 @@ pub fn maxAgeMsFromEnv(env: *const std.process.Environ.Map) u64 {
     return knobs.intKnob(u64, env, "SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", CHECKPOINT_MAX_AGE_MS);
 }
 
-/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` (0..=600000, default 50; 0 = strict) —
-/// the tick period's input; the same row the journal lane reads.
+/// Explicit wins verbatim (0 = strict); derived otherwise.
+pub fn resolveFlushIntervalMs(explicit: ?u64) u64 {
+    return explicit orelse DEFAULT_FLUSH_INTERVAL_MS;
+}
+
+/// `SQUEEZEFS_META_FLUSH_INTERVAL_MS` (0..=600000; 0 = strict) over the
+/// derived default — the ONE reader of the row: the tick period's input
+/// and the journal lane's cadence alike.
 pub fn flushIntervalMsFromEnv(env: *const std.process.Environ.Map) u64 {
-    return knobs.intKnob(u64, env, "SQUEEZEFS_META_FLUSH_INTERVAL_MS", DEFAULT_FLUSH_INTERVAL_MS);
+    return resolveFlushIntervalMs(knobs.optIntKnob(u64, env, "SQUEEZEFS_META_FLUSH_INTERVAL_MS"));
 }
 
 /// The task's tick period: the flush interval verbatim; strict (`0`) reads
@@ -626,6 +647,30 @@ test "dirty-node cap tie: max(4096, budget/32 ÷ node_size); explicit verbatim; 
     try testing.expectEqual(@as(u64, 64), maxDirtyNodesFromEnv(&env, 176 * GiB, node));
     try testing.expectEqual(@as(u64, 500), maxAgeMsFromEnv(&env));
     try testing.expectEqual(@as(u64, 0), flushIntervalMsFromEnv(&env));
+}
+
+test "flush interval tie: the coalesced default is CHECKPOINT_MAX_AGE_MS / 20 = 50 ms (one derivation); the registry row's default string parses to it; explicit wins verbatim and 0 is strict" {
+    try testing.expectEqual(CHECKPOINT_MAX_AGE_MS / FLUSHES_PER_CHECKPOINT_WINDOW, DEFAULT_FLUSH_INTERVAL_MS);
+    try testing.expectEqual(@as(u64, 50), DEFAULT_FLUSH_INTERVAL_MS);
+    // Twenty barriers per window bound the acked-but-volatile exposure to
+    // 5 % of the cadence.
+    try testing.expectEqual(CHECKPOINT_MAX_AGE_MS / 20, DEFAULT_FLUSH_INTERVAL_MS);
+    const row = knobs.lookup("SQUEEZEFS_META_FLUSH_INTERVAL_MS").?;
+    try testing.expectEqual(DEFAULT_FLUSH_INTERVAL_MS, try std.fmt.parseInt(u64, row.default, 10));
+    try testing.expectEqual(@as(i128, 0), row.kind.int.lo);
+    try testing.expectEqual(knobs.MS_MAX, row.kind.int.hi);
+    try testing.expectEqual(DEFAULT_FLUSH_INTERVAL_MS, resolveFlushIntervalMs(null));
+    try testing.expectEqual(@as(u64, 0), resolveFlushIntervalMs(0));
+    try testing.expectEqual(@as(u64, 600_000), resolveFlushIntervalMs(600_000));
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expectEqual(DEFAULT_FLUSH_INTERVAL_MS, flushIntervalMsFromEnv(&env));
+    try env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
+    try testing.expectEqual(@as(u64, 0), flushIntervalMsFromEnv(&env));
+    try env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "junk");
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(DEFAULT_FLUSH_INTERVAL_MS, flushIntervalMsFromEnv(&env));
+    try log.testing.expectAllFired();
 }
 
 test "cadence ties: tick = flush (0 ⇒ 100); sweep budget = tick; landing ceiling = max_age + 2 × tick (1,100 at 50; 1,200 strict); trigger = max_age − term saturating; trigger + 2 × tick + term ≡ ceiling" {

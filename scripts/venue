@@ -22,7 +22,9 @@ CPUS=${SQZ_VENUE_CPUS:-8}
 MEM=${SQZ_VENUE_MEM:-16G}
 
 # ZIG_GLOBAL_CACHE_DIR is honoured by the compiler; --cache-dir is the build flag.
-ZIG_CACHE_ARGS=(--cache-dir /build/zig-cache)
+# The install prefix is per venue: the repo (and so zig-out/) is shared with
+# macOS through the mount, and a Linux binary must never overwrite the host's.
+ZIG_CACHE_ARGS=(--cache-dir /build/zig-cache --prefix zig-out-linux)
 export_cache="export ZIG_GLOBAL_CACHE_DIR=/build/zig-global-cache"
 
 up() {
@@ -63,7 +65,7 @@ run_in() {
 case "${1:-}" in
   up) up ;;
   status)
-    run_in 'uname -r; zig version; echo "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"; echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"; nproc; free -g | sed -n 2p'
+    run_in 'uname -r; zig version; echo "install prefix: zig-out-linux/"; echo "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"; echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"; nproc; free -g | sed -n 2p'
     ;;
   test)
     shift

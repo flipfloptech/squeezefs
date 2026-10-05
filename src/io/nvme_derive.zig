@@ -46,11 +46,6 @@ pub const ranged_buf_size: usize = 64 * derive.KiB;
 /// the SQ independently of completions.
 pub const sq_push_retries: u32 = 3;
 
-/// Default caller-side read wait. "A wedged device/worker must not freeze
-/// the whole FUSE session"; measured cost ≤ 3 % daemon CPU, < 0.2 % clat
-/// (AGENTS.md:922 of the reference). Tests shorten it through the knob.
-pub const read_timeout_default_ms: u64 = 30_000;
-
 /// Node-liveness probe TTL: a per-call `Path::exists()` was 0.76 statx/op
 /// (the L3 transport-economy regression).
 pub const node_probe_ttl_ms: u64 = 1000;
@@ -249,9 +244,10 @@ pub const Terminal = error{
     OutOfMemory,
 };
 
-/// Retryable: nothing final happened.
+/// Retryable: nothing final happened. No timeout class: an op the device
+/// never answers is OVERDUE (`OverdueCensus`), the watchdog's business
+/// (charter §4), never a per-op error.
 pub const Retryable = error{
-    ReadTimedOut,
     Interrupted,
     Again,
 };
@@ -264,7 +260,7 @@ pub fn classOf(e: DeviceError) ErrorClass {
     return switch (e) {
         error.QueueFull, error.WorkerClosed, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported => .refusal,
         error.DeviceIo, error.ShortRead, error.ReservationConflict, error.NoSpace, error.InvalidArgument, error.SubmissionQueueFull, error.WorkerShutdown, error.OutOfMemory => .terminal,
-        error.ReadTimedOut, error.Interrupted, error.Again => .retryable,
+        error.Interrupted, error.Again => .retryable,
     };
 }
 
@@ -290,7 +286,7 @@ pub fn errnoToError(e: std.os.linux.E) DeviceError {
 
 /// Class → errno for the reply path: the fence class is EIO
 /// (`WriterGuardFenced`, error.rs:361), dismount EROFS, refusals the
-/// reference's `InvalidOperation` = EINVAL, a caller timeout ETIMEDOUT.
+/// reference's `InvalidOperation` = EINVAL.
 pub fn errnoFor(e: DeviceError) std.os.linux.E {
     return switch (e) {
         error.ReservationConflict => .BADE,
@@ -299,17 +295,32 @@ pub fn errnoFor(e: DeviceError) std.os.linux.E {
         error.QueueFull, error.WorkerClosed, error.WorkerShutdown, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.InvalidArgument => .INVAL,
         error.NoSpace => .NOSPC,
         error.OutOfMemory => .NOMEM,
-        error.ReadTimedOut => .TIMEDOUT,
         error.Interrupted => .INTR,
         error.Again => .AGAIN,
     };
 }
 
-/// Caller read wait bound: `SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS` else
-/// 30 000 ms, clamped ≥ 1.
-pub fn resolveReadTimeoutMs(env: *const std.process.Environ.Map) u64 {
-    return @max(knobs.intKnob(u64, env, "SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", read_timeout_default_ms), 1);
-}
+// ---------------------------------------------------------------------------
+// The overdue census (charter §4: the watchdog logs overdue ops loudly;
+// per-op timeout wrappers are banned; §1.8: a device that never answers
+// fences the volume through the lattice).
+// ---------------------------------------------------------------------------
+
+/// The watchdog's view of one device's in-flight ops (`Device.overdueCensus`
+/// folds every lane's submit stamps through `note`): how many are in
+/// flight, how many have aged past the watchdog's bound, and the oldest's
+/// age. Pure; the bound and the escalation are the watchdog's.
+pub const OverdueCensus = struct {
+    in_flight: u32 = 0,
+    overdue: u32 = 0,
+    oldest_age_ns: u64 = 0,
+
+    pub fn note(self: *OverdueCensus, age_ns: u64, bound_ns: u64) void {
+        self.in_flight += 1;
+        if (age_ns >= bound_ns) self.overdue += 1;
+        self.oldest_age_ns = @max(self.oldest_age_ns, age_ns);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Node-liveness probe cache (spec §3).
@@ -777,30 +788,32 @@ test "errno table: EBADE is the reservation-conflict (fence) class; classes are 
     try testing.expectEqual(ErrorClass.terminal, classOf(error.DeviceIo));
     try testing.expectEqual(ErrorClass.terminal, classOf(error.InvalidArgument));
     try testing.expectEqual(ErrorClass.retryable, classOf(error.Again));
-    try testing.expectEqual(ErrorClass.retryable, classOf(error.ReadTimedOut));
     try testing.expectEqual(ErrorClass.refusal, classOf(error.QueueFull));
     try testing.expectEqual(ErrorClass.refusal, classOf(error.WriterGuardFenced));
     try testing.expectEqual(ErrorClass.refusal, classOf(error.DismountRefused));
     // The reply half: fence ⇒ EIO, dismount ⇒ EROFS, EBADE is 52 on the
-    // generic table, timeout ⇒ ETIMEDOUT, refusals ⇒ EINVAL.
+    // generic table, refusals ⇒ EINVAL.
     try testing.expectEqual(std.os.linux.E.IO, errnoFor(error.WriterGuardFenced));
     try testing.expectEqual(std.os.linux.E.ROFS, errnoFor(error.DismountRefused));
     try testing.expectEqual(std.os.linux.E.BADE, errnoFor(error.ReservationConflict));
-    try testing.expectEqual(std.os.linux.E.TIMEDOUT, errnoFor(error.ReadTimedOut));
     try testing.expectEqual(std.os.linux.E.INVAL, errnoFor(error.QueueFull));
     // Every kernel errno round-trips through its class to a reply errno.
     for ([_]std.os.linux.E{ .BADE, .INVAL, .NOSPC, .INTR, .AGAIN, .NOMEM }) |e| try testing.expectEqual(e, errnoFor(errnoToError(e)));
 }
 
-test "read timeout: default 30 000 ms, knob overrides, clamp ≥ 1" {
-    const gpa = testing.allocator;
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    try testing.expectEqual(@as(u64, 30_000), resolveReadTimeoutMs(&env));
-    try env.put("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", "250");
-    try testing.expectEqual(@as(u64, 250), resolveReadTimeoutMs(&env));
-    try env.put("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", "0");
-    try testing.expectEqual(@as(u64, 1), resolveReadTimeoutMs(&env));
+test "overdue census: counts every in-flight op, those at or past the bound as overdue, and keeps the oldest age; nothing is timed out" {
+    var c: OverdueCensus = .{};
+    try testing.expectEqual(@as(u32, 0), c.in_flight);
+    c.note(10, 100);
+    c.note(100, 100);
+    c.note(250, 100);
+    try testing.expectEqual(@as(u32, 3), c.in_flight);
+    try testing.expectEqual(@as(u32, 2), c.overdue);
+    try testing.expectEqual(@as(u64, 250), c.oldest_age_ns);
+    c.note(5, 100);
+    try testing.expectEqual(@as(u32, 4), c.in_flight);
+    try testing.expectEqual(@as(u32, 2), c.overdue);
+    try testing.expectEqual(@as(u64, 250), c.oldest_age_ns);
 }
 
 test "node probe TTL: fresh within 1 s, re-probes after, 0 is the never-probed sentinel" {

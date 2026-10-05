@@ -106,7 +106,6 @@ pub const registry = [_]Knob{
     // ---- NVMe block device workers ----
     .{ .key = "SQUEEZEFS_NVME_READ_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device READ submission fan-out lanes (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
     .{ .key = "SQUEEZEFS_NVME_WRITE_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device DATA-WRITE submission fan-out lanes, block-offset affinity (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
-    .{ .key = "SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", .kind = .{ .int = .{ .lo = 1, .hi = MS_MAX } }, .default = "30000", .class = .test_seam, .doc = "Test seam: NVMe read timeout, ms." },
 
     // ---- R5 fleet share + IPC arena sizing (read by mem/) ----
     .{ .key = "SQUEEZEFS_FLEET_SHARE", .kind = .{ .int = .{ .lo = 1, .hi = 4096 } }, .default = "1", .class = .tuning, .doc = "N co-located daemons sharing one machine: divides the cgroup/RAM roots and the cgroup unreclaimable sample (ceil) BEFORE the ×0.8/×0.7 laws; explicit budgets and floors are never divided." },

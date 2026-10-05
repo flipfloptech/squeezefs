@@ -286,20 +286,23 @@ const Cell = struct {
     /// write bounce copy. `.none` for an aligned caller-owned write source
     /// (the caller is parked for the whole DMA, so its slice outlives it).
     buf: Buf = .empty,
-    enq_ns: u64 = 0,
+    /// The submit stamp, 0 while idle — the overdue census's input (read by
+    /// the watchdog's thread as a sample, so atomic; the worker's queue
+    /// histograms read it too). Relaxed: nothing is published through it.
+    enq_ns: std.atomic.Value(u64) = .init(0),
     submitted_ns: u64 = 0,
     res: i32 = 0,
-    /// Oneshot word: 0 pending, 1 completed (worker won), 2 abandoned
-    /// (caller timed out and left; the worker frees everything at the CQE).
+    /// Oneshot word: 0 pending, 1 completed. The caller is parked for the
+    /// whole op (no per-op timeout, so no abandonment state): the worker
+    /// owns `buf` until the CQE and the caller owns the cell after it.
     state: std.atomic.Value(u32) = .init(0),
 
     const pending: u32 = 0;
     const completed: u32 = 1;
-    const abandoned: u32 = 2;
 };
 
-fn futexWait(word: *const std.atomic.Value(u32), expect: u32, timeout: ?*const linux.timespec) linux.E {
-    return linux.errno(linux.futex_4arg(&word.raw, .{ .cmd = .WAIT, .private = true }, expect, timeout));
+fn futexWait(word: *const std.atomic.Value(u32), expect: u32) linux.E {
+    return linux.errno(linux.futex_4arg(&word.raw, .{ .cmd = .WAIT, .private = true }, expect, null));
 }
 
 fn futexWakeAll(word: *const std.atomic.Value(u32)) void {
@@ -364,7 +367,7 @@ const WriteWatermark = struct {
             // Re-check under the registered waiter (the Dekker half).
             if (self.completed.load(.seq_cst) >= target) return;
             if (self.dead.load(.seq_cst)) return error.WorkerShutdown;
-            _ = futexWait(&self.epoch, e, null);
+            _ = futexWait(&self.epoch, e);
         }
     }
 };
@@ -454,7 +457,7 @@ const Lane = struct {
     /// Block until the worker armed (or failed); the caller deinits a
     /// failed lane.
     fn awaitArmed(self: *Lane) error{ DirectIoUnsupported, SystemResources }!void {
-        while (self.ready.load(.acquire) == arming) _ = futexWait(&self.ready, arming, null);
+        while (self.ready.load(.acquire) == arming) _ = futexWait(&self.ready, arming);
         return switch (self.ready.load(.acquire)) {
             armed => {},
             open_refused => error.DirectIoUnsupported,
@@ -516,50 +519,29 @@ const Lane = struct {
         _ = linux.write(self.wake_fd, @ptrCast(&one), 8);
     }
 
-    /// Caller side: park on the oneshot. `timeout_ns == null` is unbounded
-    /// (writes, barriers — under the lock-wait census). Returns false when
-    /// the wait expired and the cell was abandoned to the worker.
-    fn wait(self: *Lane, idx: u32, timeout_ns: ?u64) bool {
+    /// Caller side: park on the oneshot until the worker publishes the
+    /// outcome — UNBOUNDED for every class. A per-op timeout is banned
+    /// (charter §4): an op the device never answers is OVERDUE in
+    /// `Device.overdueCensus` for the watchdog to log loudly and, past its
+    /// bound, to fence the VOLUME through the lattice (§1.8) — never one
+    /// EIO per op after 30 s while the writes behind it park on the same
+    /// lane (decision 0003 Q5).
+    fn wait(self: *Lane, idx: u32) void {
         const c = &self.cells[idx];
-        var deadline: u64 = 0;
-        if (timeout_ns) |t| deadline = clock.monotonicNs() + t;
-        while (true) {
-            // Acquire pairs with the worker's release CAS so `res`/`buf`
-            // are visible once the state reads completed.
-            if (c.state.load(.acquire) == Cell.completed) return true;
-            var ts: linux.timespec = undefined;
-            var ts_ptr: ?*const linux.timespec = null;
-            if (timeout_ns != null) {
-                const now = clock.monotonicNs();
-                if (now >= deadline) {
-                    // Abandon: if the worker already completed, take it.
-                    if (c.state.cmpxchgStrong(Cell.pending, Cell.abandoned, .acq_rel, .acquire)) |_| return true;
-                    return false;
-                }
-                const left = deadline - now;
-                ts = .{ .sec = @intCast(left / std.time.ns_per_s), .nsec = @intCast(left % std.time.ns_per_s) };
-                ts_ptr = &ts;
-            }
-            _ = futexWait(&c.state, Cell.pending, ts_ptr);
-        }
+        // Acquire pairs with the worker's release swap so `res`/`buf` are
+        // visible once the state reads completed.
+        while (c.state.load(.acquire) != Cell.completed) _ = futexWait(&c.state, Cell.pending);
     }
 
-    /// Worker side: publish the outcome. True when the caller is still
-    /// there (it now owns the cell); false when it abandoned (the worker
-    /// releases `buf` and frees the cell).
-    fn complete(self: *Lane, idx: u32) bool {
+    /// Worker side: publish the outcome; the parked caller owns the cell
+    /// from here. Release publishes `res`/`buf`/`verdict`.
+    fn complete(self: *Lane, idx: u32) void {
         const c = &self.cells[idx];
         c.in_flight = false;
-        // Release publishes `res`/`buf`/`verdict`; acquire on failure sees
-        // the caller's abandonment before we free its resources.
-        if (c.state.cmpxchgStrong(Cell.pending, Cell.completed, .release, .acquire) == null) {
-            futexWakeAll(&c.state);
-            return true;
-        }
-        c.buf.release();
-        c.buf = .empty;
-        self.freeCell(idx);
-        return false;
+        c.enq_ns.store(0, .monotonic);
+        const prev = c.state.swap(Cell.completed, .release);
+        std.debug.assert(prev == Cell.pending);
+        futexWakeAll(&c.state);
     }
 
     /// Stop + join (idempotent): refuse new submitters → wait for in-flight
@@ -612,7 +594,7 @@ fn drainQueueAtExit(lane: *Lane) void {
         if (c.op != .read) lane.wm.noteCompleted();
         c.buf.release();
         c.buf = .empty;
-        _ = lane.complete(idx);
+        lane.complete(idx);
     }
 }
 
@@ -799,12 +781,12 @@ fn pumpOne(w: *Worker, idx: u32) bool {
             if (takeArmed(&dev.seams.slow_reads)) slow_link_ms = dev.seams.slow_read_ms.load(.monotonic);
             // ONE clock read stamps the queue phase and the service start.
             c.submitted_ns = clock.monotonicNs();
-            stats.read_fill_dev_queue_ns.record(c.submitted_ns -| c.enq_ns);
+            stats.read_fill_dev_queue_ns.record(c.submitted_ns -| c.enq_ns.load(.monotonic));
         },
         .write => {
             if (takeArmed(&dev.seams.stall_writes)) sleepMs(dev.seams.stall_write_ms.load(.monotonic));
             c.submitted_ns = clock.monotonicNs();
-            stats.write_pipeline_dev_queue_ns.record(c.submitted_ns -| c.enq_ns);
+            stats.write_pipeline_dev_queue_ns.record(c.submitted_ns -| c.enq_ns.load(.monotonic));
         },
         .fsync => {},
     }
@@ -832,7 +814,7 @@ fn pumpOne(w: *Worker, idx: u32) bool {
         if (c.op != .read) lane.wm.noteCompleted();
         c.buf.release();
         c.buf = .empty;
-        _ = lane.complete(idx);
+        lane.complete(idx);
         return false;
     };
     switch (c.op) {
@@ -900,21 +882,21 @@ fn completeOne(lane: *Lane, idx: u32, res: i32) void {
     switch (c.op) {
         .read => {
             stats.read_fill_dev_service_ns.record(clock.monotonicNs() -| c.submitted_ns);
-            // The read buffer travels to the caller; `complete` releases it
-            // only if the caller abandoned (MEM-1: the worker, never the
-            // caller's timeout, owns the DMA destination until the CQE).
-            _ = lane.complete(idx);
+            // The read buffer travels to the parked caller (MEM-1: the
+            // worker owns the DMA destination until this CQE, the caller
+            // from here).
+            lane.complete(idx);
         },
         .write => {
             stats.write_pipeline_dev_service_ns.record(clock.monotonicNs() -| c.submitted_ns);
             lane.wm.noteCompleted();
             c.buf.release();
             c.buf = .empty;
-            _ = lane.complete(idx);
+            lane.complete(idx);
         },
         .fsync => {
             lane.wm.noteCompleted();
-            _ = lane.complete(idx);
+            lane.complete(idx);
         },
     }
 }
@@ -1017,11 +999,6 @@ fn spawnArmedLane(gpa: std.mem.Allocator, dev: *Device) !*Lane {
     return lane;
 }
 
-pub const OpenOptions = struct {
-    /// The process environment the knobs are read from.
-    env: *const std.process.Environ.Map,
-};
-
 pub const ReadOutcome = union(enum) {
     full: Buf,
     /// Bytes the kernel returned (the buffer went home).
@@ -1047,12 +1024,11 @@ pub const Device = struct {
     fence: Fence = .{},
     seams: Seams = .{},
     write_cache: nd.WriteCacheClass,
-    read_timeout_ms: u64,
     closed: bool = false,
 
     /// `open_checked`: `probeDirectIo` FIRST (loud refusal), spawn lane 0,
     /// probe the write cache once, log the class.
-    pub fn open(gpa: std.mem.Allocator, path: [:0]const u8, opts: OpenOptions) (DeviceError || std.mem.Allocator.Error || std.Thread.SpawnError || error{SystemResources})!*Device {
+    pub fn open(gpa: std.mem.Allocator, path: [:0]const u8) (DeviceError || std.mem.Allocator.Error || std.Thread.SpawnError || error{SystemResources})!*Device {
         try probeDirectIo(path);
         try initPools();
         const dev = try gpa.create(Device);
@@ -1063,11 +1039,10 @@ pub const Device = struct {
             .gpa = gpa,
             .path = owned,
             .write_cache = probeWriteCache(path),
-            .read_timeout_ms = nd.resolveReadTimeoutMs(opts.env),
         };
         dev.lanes[0] = try spawnArmedLane(gpa, dev);
         dev.lane_count.store(1, .release);
-        log.info("data volume {s}: write cache {s}, read timeout {d} ms", .{ path, dev.write_cache.name(), dev.read_timeout_ms });
+        log.info("data volume {s}: write cache {s}", .{ path, dev.write_cache.name() });
         return dev;
     }
 
@@ -1225,6 +1200,25 @@ pub const Device = struct {
         return seen;
     }
 
+    /// The watchdog's census (charter §4 "a deadline watchdog that logs
+    /// overdue ops loudly"): every op submitted and not yet completed on
+    /// any lane, those older than `bound_ns`, and the oldest's age — a
+    /// sample over the cells' submit stamps, taken from any thread. The
+    /// watchdog (rung 3) owns the bounds and the escalation (log, then the
+    /// volume fence through the lattice); nothing here times an op out.
+    pub fn overdueCensus(self: *const Device, now_ns: u64, bound_ns: u64) nd.OverdueCensus {
+        var out: nd.OverdueCensus = .{};
+        const n = self.lane_count.load(.acquire);
+        for (self.lanes[0..n]) |l| {
+            for (l.?.cells) |*c| {
+                const since = c.enq_ns.load(.monotonic);
+                if (since == 0) continue;
+                out.note(now_ns -| since, bound_ns);
+            }
+        }
+        return out;
+    }
+
     /// Per-device stats face: `data_volume_write_cache`, lane gauges and
     /// per-lane `submitted` watermarks.
     pub fn writeStatsFaceJson(self: *const Device, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1257,10 +1251,6 @@ pub const Device = struct {
     pub fn setTestReadSlow(self: *Device, count: u32, ms: u64) void {
         self.seams.slow_read_ms.store(ms, .seq_cst);
         self.seams.slow_reads.store(count, .seq_cst);
-    }
-
-    pub fn setTestReadTimeoutMs(self: *Device, ms: u64) void {
-        self.read_timeout_ms = @max(ms, 1);
     }
 
     // ---- writes (spec §2.1, §2.2) ----
@@ -1309,7 +1299,7 @@ pub const Device = struct {
         c.dma_ptr = dma.ptr;
         c.dma_len = dma.len;
         c.buf = bounce;
-        c.enq_ns = clock.monotonicNs();
+        c.enq_ns.store(clock.monotonicNs(), .monotonic);
         // Balanced by `noteCompleted` on every terminal outcome, including a
         // refused submit.
         lane.wm.noteSubmitted();
@@ -1325,7 +1315,7 @@ pub const Device = struct {
         // NO timeout; the census names a lost completion.
         stats.device_lock_waiters.add(1);
         defer stats.device_lock_waiters.sub(1);
-        std.debug.assert(lane.wait(idx, null));
+        lane.wait(idx);
         defer lane.freeCell(idx);
         switch (c.verdict) {
             .shutdown => return error.WorkerShutdown,
@@ -1386,7 +1376,7 @@ pub const Device = struct {
         c.dma_ptr = buf.ptr;
         c.dma_len = size;
         c.buf = buf;
-        c.enq_ns = clock.monotonicNs();
+        c.enq_ns.store(clock.monotonicNs(), .monotonic);
         if (!lane.submit(idx)) {
             lane.freeCell(idx);
             stats.uring_queue_full.inc();
@@ -1395,12 +1385,9 @@ pub const Device = struct {
         // The worker owns `buf` from here until the CQE.
         buf = .empty;
 
-        if (!lane.wait(idx, self.read_timeout_ms * std.time.ns_per_ms)) {
-            // The SQE stays in flight; the worker releases the buffer at the
-            // late CQE (MEM-1).
-            log.warn("NvmeBlockDev read timed out after {d} ms (offset={d}, size={d}) on {s}", .{ self.read_timeout_ms, offset, size, self.path });
-            return error.ReadTimedOut;
-        }
+        // Unbounded (charter §4: no per-op timeout); a read the device never
+        // answers sits in `overdueCensus` for the watchdog.
+        lane.wait(idx);
         defer lane.freeCell(idx);
         const got_buf = c.buf;
         c.buf = .empty;
@@ -1417,7 +1404,11 @@ pub const Device = struct {
         }
         if (c.res < 0) {
             got_buf.release();
-            return nd.errnoToError(@fromBackingInt(@intCast(@as(u16, @intCast(-c.res)))));
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-c.res))));
+            // A device ERROR (not a delay) classifies through the one
+            // funnel: an EBADE on a read is the same reservation conflict.
+            self.classifyDmaOutcome(e);
+            return nd.errnoToError(e);
         }
         switch (nd.finishRead(@intCast(c.res), size)) {
             .full => {
@@ -1460,7 +1451,7 @@ pub const Device = struct {
         }
         stats.device_lock_waiters.add(1);
         defer stats.device_lock_waiters.sub(1);
-        std.debug.assert(lane.wait(idx, null));
+        lane.wait(idx);
         defer lane.freeCell(idx);
         switch (c.verdict) {
             .shutdown => return error.WorkerShutdown,
@@ -1531,10 +1522,6 @@ const TestFile = struct {
     }
 };
 
-fn testEnv() std.process.Environ.Map {
-    return std.process.Environ.Map.init(testing.allocator);
-}
-
 /// Deterministic payload: `(offset + i) * 2654435761 >> 24` keeps every 4 KiB
 /// distinct so a misplaced DMA cannot pass by accident.
 fn fillPattern(buf: []u8, seed: u64) void {
@@ -1555,9 +1542,7 @@ test "test_write_block_to_offset: a 4 MiB aligned write lands byte-exact at 4 Mi
     var tf: TestFile = .{};
     try tf.create(16 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const payload = try testing.allocator.alignedAlloc(u8, .fromByteUnits(nd.dma_align), nd.block_buf_size);
     defer testing.allocator.free(payload);
@@ -1576,9 +1561,7 @@ test "test_read_block_from_offset: write then read_block round-trips 4 MiB exact
     var tf: TestFile = .{};
     try tf.create(16 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const payload = try testing.allocator.alignedAlloc(u8, .fromByteUnits(nd.dma_align), nd.block_buf_size);
     defer testing.allocator.free(payload);
@@ -1609,9 +1592,7 @@ test "test_concurrent_stress: 16 threads × 16 (write 4 MiB to one of 4 offsets 
     var tf: TestFile = .{};
     try tf.create(16 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const Stress = struct {
         fn run(d: *Device, seed: u64, failed: *std.atomic.Value(u32)) void {
@@ -1648,9 +1629,7 @@ test "test_pooled_write_sources_take_aligned_dma_branch: a pool buffer is 4096-a
     var tf: TestFile = .{};
     try tf.create(8 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const src = try acquireBlockBuf();
     defer src.release();
@@ -1668,9 +1647,7 @@ test "test_unaligned_length_write_counts_fallback: 123 bytes at 4096 bump the co
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     var payload: [123]u8 = undefined;
     fillPattern(&payload, 9);
@@ -1690,9 +1667,7 @@ test "test_drop_device_during_unaligned_writes_joins_cleanly: close while 8 thre
     var tf: TestFile = .{};
     try tf.create(8 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const Writer = struct {
         fn run(d: *Device, seed: u64, ok: *std.atomic.Value(u32), errs: *std.atomic.Value(u32)) void {
@@ -1731,9 +1706,7 @@ test "test_drop_after_unaligned_burst_does_not_hang: 32 sequential unaligned wri
     var tf: TestFile = .{};
     try tf.create(8 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     var payload: [5000]u8 = undefined;
     var i: u64 = 0;
@@ -1750,9 +1723,7 @@ test "test_read_block_exceeds_pool_size: a 5 MiB pooled read is refused at the d
     var tf: TestFile = .{};
     try tf.create(8 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const fills = stats.dev_fills.load();
     try testing.expectError(error.ReadSizeExceedsPool, dev.readBlock(0, 5 * derive.MiB));
@@ -1763,9 +1734,7 @@ test "zero-length read: empty result, no SQE, no device op" {
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const fills = stats.dev_fills.load();
     const buf = try dev.readBlock(4096, 0);
@@ -1778,9 +1747,7 @@ test "test_read_past_eof_errors_instead_of_recycled_garbage: a read at file_len 
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const ranged_before = pools().ranged.allocated_bytes.load();
     try testing.expectError(error.ShortRead, dev.readBlock(1 * derive.MiB, 4096));
@@ -1792,9 +1759,7 @@ test "test_read_straddling_eof_errors_instead_of_garbage_tail: [len-2048, +4096)
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     var head: [4096]u8 align(4096) = undefined;
     fillPattern(&head, 1);
@@ -1837,9 +1802,7 @@ test "write_lane_pool_spreads_by_offset_and_stays_byte_exact" {
     var tf: TestFile = .{};
     try tf.create(16 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     try testing.expectEqual(@as(u32, 1), dev.writeLanes());
     const grain: u64 = 1 * derive.MiB;
@@ -1893,9 +1856,7 @@ test "flush_completes_no_earlier_than_writes_on_every_lane: a stalled write on l
     var tf: TestFile = .{};
     try tf.create(16 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const grain: u64 = 1 * derive.MiB;
     try dev.setWriteLanes(4, grain);
@@ -1935,9 +1896,7 @@ test "read_lane_pool_serves_exact_bytes_and_leaves_writes_on_lane_zero" {
     var tf: TestFile = .{};
     try tf.create(16 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     try testing.expectEqual(@as(u32, 1), dev.readLanes());
     try dev.setReadLanes(4);
@@ -1987,9 +1946,7 @@ test "fill-issue economy: 64 queued fills behind a stalled lane ride ≤ 4 submi
     var tf: TestFile = .{};
     try tf.create(4 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const wakes_before = stats.dev_wake_writes.load();
     const b0 = try dev.readBlock(0, 4096);
@@ -2033,9 +1990,7 @@ test "slow-read seam: a fast fill completes while a linked-timeout slow fill hol
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     // Warm the lane so both reads below are queued, not the first arrival.
     const warm = try dev.readBlock(0, 4096);
@@ -2069,23 +2024,45 @@ test "slow-read seam: a fast fill completes while a linked-timeout slow fill hol
     try testing.expect(fast_ns < slow_ns);
 }
 
-test "read timeout: a stalled read times out on the caller side; the worker still owns the buffer until the CQE and recycles it" {
+test "a stalled read is an OVERDUE op in the census (count, oldest age) and never a per-op timeout: the caller stays parked, gets its data, and the census empties at the CQE" {
     var tf: TestFile = .{};
     try tf.create(4 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    try env.put("SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", "20");
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
-    try testing.expectEqual(@as(u64, 20), dev.read_timeout_ms);
     const r0 = pools().ranged.allocated_bytes.load();
-    dev.setTestReadStall(1, 300);
-    try testing.expectError(error.ReadTimedOut, dev.readBlock(0, 4096));
-    // The slot is still checked out: the DMA is in flight.
+    try testing.expectEqual(@as(u32, 0), dev.overdueCensus(clock.monotonicNs(), 0).in_flight);
+    const stall_ms: u64 = 300;
+    dev.setTestReadStall(1, stall_ms);
+    const Stalled = struct {
+        fn run(d: *Device, elapsed_ns: *u64, failed: *bool) void {
+            const t0 = clock.monotonicNs();
+            const b = d.readBlock(0, 4096) catch {
+                failed.* = true;
+                return;
+            };
+            b.release();
+            elapsed_ns.* = clock.monotonicNs() - t0;
+        }
+    };
+    var elapsed_ns: u64 = 0;
+    var failed = false;
+    const t = try std.Thread.spawn(.{}, Stalled.run, .{ dev, &elapsed_ns, &failed });
+    // The read is in flight (the worker is stalled ahead of its SQE); the
+    // census names it, and with a bound it has aged past, as overdue.
+    var census = dev.overdueCensus(clock.monotonicNs(), 0);
+    while (census.in_flight == 0) : (census = dev.overdueCensus(clock.monotonicNs(), 0)) std.atomic.spinLoopHint();
+    try testing.expectEqual(@as(u32, 1), census.in_flight);
+    try testing.expectEqual(@as(u32, 1), census.overdue);
+    try testing.expectEqual(@as(u32, 0), dev.overdueCensus(clock.monotonicNs(), 60 * std.time.ns_per_s).overdue);
+    // The DMA slot is checked out while the op is in flight (MEM-1).
     try testing.expectEqual(r0 + nd.ranged_buf_size, pools().ranged.allocated_bytes.load());
-    // Closing joins the worker, which reaps the late CQE and releases it.
-    dev.close();
+    t.join();
+    try testing.expect(!failed);
+    try testing.expect(elapsed_ns >= stall_ms * std.time.ns_per_ms);
+    try testing.expect(census.oldest_age_ns <= elapsed_ns);
+    // Completed: nothing in flight, the slot recycled.
+    try testing.expectEqual(@as(u32, 0), dev.overdueCensus(clock.monotonicNs(), 0).in_flight);
     try testing.expectEqual(r0, pools().ranged.allocated_bytes.load());
 }
 
@@ -2101,9 +2078,7 @@ test "probeDirectIo: a path that cannot be opened O_DIRECT is refused LOUDLY; ca
     // A regular file classifies as file-backed; the stats face names it.
     try testing.expectEqual(nd.WriteCacheClass.file_backed, probeWriteCache(tf.path));
     try testing.expectEqual(nd.WriteCacheClass.unknown, probeWriteCache("/nonexistent/sqz-nvme-no-such-volume"));
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     try testing.expectEqual(nd.WriteCacheClass.file_backed, dev.writeCache());
     var buf: [256]u8 = undefined;
@@ -2113,16 +2088,14 @@ test "probeDirectIo: a path that cannot be opened O_DIRECT is refused LOUDLY; ca
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "=file-backed\"") != null);
     // Open itself refuses loudly on a bad path (no worker is ever spawned).
     log.testing.expectErrorLogs(1);
-    try testing.expectError(error.DirectIoUnsupported, Device.open(testing.allocator, "/nonexistent/sqz-nvme-no-such-volume", .{ .env = &env }));
+    try testing.expectError(error.DirectIoUnsupported, Device.open(testing.allocator, "/nonexistent/sqz-nvme-no-such-volume"));
     try log.testing.expectAllFired();
 }
 
 test "node liveness: TTL-cached existence; a deleted node is seen after the TTL window" {
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     try testing.expect(dev.nodeExistsCached());
     tf.destroy();
@@ -2137,9 +2110,7 @@ test "fence latch: an injected EBADE write latches the fence, poisons custody, r
     var tf: TestFile = .{};
     try tf.create(4 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     defer clearCustodyPoisonForTest();
     var hook_fired: std.atomic.Value(u32) = .init(0);
@@ -2179,7 +2150,7 @@ test "fence latch: an injected EBADE write latches the fence, poisons custody, r
     // A classless injected failure passes through untouched — a transient
     // hiccup never self-inflicts a fail-stop (checked on a fresh device).
     clearCustodyPoisonForTest();
-    const dev2 = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev2 = try Device.open(testing.allocator, tf.path);
     defer dev2.deinit();
     dev2.setFailNextWritesErrno(1, .IO);
     try testing.expectError(error.DeviceIo, dev2.writeBlock(0, &payload));
@@ -2191,9 +2162,7 @@ test "fence signal: the installed per-volume latch halts the device on first pol
     var tf: TestFile = .{};
     try tf.create(4 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     defer clearCustodyPoisonForTest();
     const Sig = struct {
@@ -2217,7 +2186,7 @@ test "fence signal: the installed per-volume latch halts the device on first pol
     // Dismount class on a fresh device: judged AFTER the fence, so a clean
     // device refuses EROFS-class and counts it.
     clearCustodyPoisonForTest();
-    const dev2 = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev2 = try Device.open(testing.allocator, tf.path);
     defer dev2.deinit();
     try testing.expect(!dev2.dismounted());
     const d0 = stats.data_dma_dismount_refusals.load();
@@ -2231,9 +2200,7 @@ test "thread names: lanes are numbered process-wide as sqz-nvme<N>; the write ph
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
     defer tf.destroy();
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, tf.path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const n0 = dev.laneNumber(0);
     try dev.setReadLanes(2);
@@ -2281,9 +2248,7 @@ test "loop device: capacity by seek(End), write-cache class from sysfs, aligned 
     std.debug.print("loop write_cache class: {s}\n", .{class.name()});
     try testing.expect(class == .write_back or class == .write_through);
 
-    var env = testEnv();
-    defer env.deinit();
-    const dev = try Device.open(testing.allocator, dev_path, .{ .env = &env });
+    const dev = try Device.open(testing.allocator, dev_path);
     defer dev.deinit();
     const payload = try testing.allocator.alignedAlloc(u8, .fromByteUnits(nd.dma_align), 64 * derive.KiB);
     defer testing.allocator.free(payload);

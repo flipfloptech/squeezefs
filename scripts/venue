@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# The Linux venue: run a command inside the `sqz-zig` macOS container
+# (Ubuntu 24.04 on the sqz kernel series, Zig 0.17, this repo mounted rw at the
+# same path, the Rust reference mounted ro at ~/Source/squeezefs).
+#
+#   scripts/venue                 # interactive shell in the repo
+#   scripts/venue zig build gate  # run the gate in the container
+#   scripts/venue test [filter]   # shorthand: zig build test [-- filter]
+#   scripts/venue up              # (re)create the container
+#   scripts/venue status          # kernel, zig, fuse/uring facts
+#
+# Zig caches live on the `squeezefs-zig-cache` volume (/build) — never on the
+# virtiofs mount, where the cache's rename/lock traffic is slow.
+set -euo pipefail
+
+NAME=${SQZ_VENUE_NAME:-sqz-zig}
+IMAGE=${SQZ_VENUE_IMAGE:-squeezefs-build:ubuntu2404}
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REF=${SQZ_REFERENCE:-"$HOME/Source/squeezefs"}
+CACHE_VOL=${SQZ_VENUE_CACHE_VOLUME:-squeezefs-zig-cache}
+CPUS=${SQZ_VENUE_CPUS:-8}
+MEM=${SQZ_VENUE_MEM:-16G}
+
+# ZIG_GLOBAL_CACHE_DIR is honoured by the compiler; --cache-dir is the build flag.
+ZIG_CACHE_ARGS=(--cache-dir /build/zig-cache)
+export_cache="export ZIG_GLOBAL_CACHE_DIR=/build/zig-global-cache"
+
+up() {
+  container volume create "$CACHE_VOL" >/dev/null 2>&1 || true
+  if container inspect "$NAME" >/dev/null 2>&1; then
+    echo "venue: $NAME exists; 'container rm -f $NAME' first to recreate" >&2
+    return 1
+  fi
+  container run -d --name "$NAME" -c "$CPUS" -m "$MEM" \
+    --mount "type=virtiofs,source=$REPO,target=$REPO" \
+    --mount "type=virtiofs,source=$REF,target=$REF,readonly" \
+    -v "$CACHE_VOL:/build" \
+    "$IMAGE" sleep infinity
+  container exec "$NAME" mkdir -p /build/zig-cache /build/zig-global-cache
+}
+
+ensure_running() {
+  local state
+  state=$(container inspect "$NAME" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d[0] if isinstance(d,list) else d).get("status",""))' 2>/dev/null || true)
+  case "$state" in
+    running) ;;
+    "") echo "venue: container $NAME does not exist; run 'scripts/venue up'" >&2; exit 1 ;;
+    *) container start "$NAME" >/dev/null ;;
+  esac
+}
+
+run_in() {
+  ensure_running
+  # -lc so PATH picks up /usr/local/bin/zig; cd into the repo at the same path.
+  container exec -i "$NAME" bash -lc "$export_cache; cd '$REPO' && $*"
+}
+
+case "${1:-}" in
+  up) up ;;
+  status)
+    run_in 'uname -r; zig version; echo "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"; echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"; nproc; free -g | sed -n 2p'
+    ;;
+  test)
+    shift
+    if [ $# -gt 0 ]; then
+      run_in "zig build ${ZIG_CACHE_ARGS[*]} test -Dtest-filter=\"$*\""
+    else
+      run_in "zig build ${ZIG_CACHE_ARGS[*]} test"
+    fi
+    ;;
+  zig)
+    shift
+    # `scripts/venue zig build X` -> inject the cache dirs after `build`.
+    if [ "${1:-}" = build ]; then
+      shift
+      run_in "zig build ${ZIG_CACHE_ARGS[*]} $*"
+    else
+      run_in "zig $*"
+    fi
+    ;;
+  "")
+    ensure_running
+    exec container exec -it "$NAME" bash -lc "cd '$REPO' && exec bash"
+    ;;
+  *) run_in "$*" ;;
+esac

@@ -339,6 +339,13 @@ pub const Stats = struct {
     /// `meta_conveyor_park_tick_rescues`: parks the 10 ms backstop tick
     /// ended with room already there — a wake nobody sent (≈ 0 healthy).
     park_tick_rescues: counters.ShardedCounter = .{},
+    /// RAM ≠ replay: a roll-out, rollback or compensation that could not
+    /// complete (allocation, resolution, a lock budget) left RAM holding
+    /// what the ring never will (or the reverse). Each fires once per
+    /// exit and latches the volume FAILED (`divergedFromReplay`).
+    divergence_rollout: counters.Tripwire = .init("conveyor_divergence_rollout"),
+    divergence_rollback: counters.Tripwire = .init("conveyor_divergence_rollback"),
+    divergence_compensation: counters.Tripwire = .init("conveyor_divergence_compensation"),
     /// `meta_conveyor_rollbacks`: windows rolled back after a failed write;
     /// `meta_conveyor_compensations`: escaped records compensated.
     rollbacks: counters.ShardedCounter = .{},
@@ -1312,7 +1319,9 @@ pub const Conveyor = struct {
             if (apply_err == null and poison != 0 and namesInode(m.q.recs, poison)) apply_err = error.Corrupt;
             if (apply_err) |e| {
                 for (m.q.recs, r.leaf_of[qi]) |rec, g| {
-                    _ = r.lock_set[g].removeOverlayRecordsLocked(dirties[g], rec.key, member_span) catch {};
+                    _ = r.lock_set[g].removeOverlayRecordsLocked(dirties[g], rec.key, member_span) catch {
+                        self.divergedFromReplay(&self.stats.divergence_rollout, "a failed member's record could not be removed from its leaf in-window (out of memory); its entry is never written");
+                    };
                 }
                 failed[qi] = e;
             }
@@ -1402,6 +1411,18 @@ pub const Conveyor = struct {
 
     const Comp = struct { tree_id: u8, key: []const u8, kind: record.RecordKind, value: []const u8 };
 
+    /// RAM ≠ replay: a roll-out, rollback or compensation exited before it
+    /// could make RAM agree with what the ring will replay. Loud, counted
+    /// on the site's tripwire, and TERMINAL — the volume latches FAILED
+    /// (mutations EIO until remount, where replay rebuilds RAM) rather than
+    /// serving a state no recovery can reproduce (charter §1.8).
+    fn divergedFromReplay(self: *Conveyor, site: *counters.Tripwire, detail: []const u8) void {
+        site.fire(detail);
+        if (self.deps.latch.failStop()) {
+            log.err("meta volume {s}: RAM diverged from replay ({s}: {s}) — volume marked FAILED; mutations return EIO until remount", .{ self.deps.volume, site.site, detail });
+        }
+    }
+
     /// Phase 1 under re-acquired ascending locks: remove every record of the
     /// window's STAMPED span for each undo key; probe the key's newest seq —
     /// still inside the span ⇒ a record escaped the open overlay (a freeze
@@ -1415,24 +1436,19 @@ pub const Conveyor = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         var comps: std.ArrayList(Comp) = .empty;
+        const site = &self.stats.divergence_rollback;
         var attempt: u32 = 0;
         while (attempt < COMMIT_RETRY_BUDGET) : (attempt += 1) {
             comps.clearRetainingCapacity();
-            const leaves = arena.alloc(*CachedNode, undo.len) catch return;
+            const leaves = arena.alloc(*CachedNode, undo.len) catch return self.divergedFromReplay(site, "out of memory before the rollback's leaf resolution; the window's records stay applied");
             var n: usize = 0;
             defer for (leaves[0..n]) |l| l.release();
             for (undo) |u| {
-                const t = self.treeFor(u.tree_id) orelse {
-                    log.err("rollback: a dirty key names tree {d}, which is not mounted", .{u.tree_id});
-                    return;
-                };
-                leaves[n] = t.resolveLeaf(u.key) catch |e| {
-                    log.err("rollback: leaf resolution failed for a dirty key: {s}", .{@errorName(e)});
-                    return;
-                };
+                const t = self.treeFor(u.tree_id) orelse return self.divergedFromReplay(site, "a dirty key names a tree that is not mounted; the window's records stay applied");
+                leaves[n] = t.resolveLeaf(u.key) catch return self.divergedFromReplay(site, "leaf resolution failed for a dirty key; the window's records stay applied");
                 n += 1;
             }
-            const lock_set = arena.dupe(*CachedNode, leaves) catch return;
+            const lock_set = arena.dupe(*CachedNode, leaves) catch return self.divergedFromReplay(site, "out of memory building the rollback's lock set; the window's records stay applied");
             std.mem.sort(*CachedNode, lock_set, {}, addrLess);
             var out: usize = 0;
             for (lock_set) |l| {
@@ -1441,7 +1457,7 @@ pub const Conveyor = struct {
                 out += 1;
             }
             const set = lock_set[0..out];
-            const dirties = arena.alloc(*NodeDirty, set.len) catch return;
+            const dirties = arena.alloc(*NodeDirty, set.len) catch return self.divergedFromReplay(site, "out of memory taking the rollback's locks; the window's records stay applied");
             self.lockAll(set, dirties);
             var is_stale = false;
             for (undo, leaves) |u, leaf| {
@@ -1452,23 +1468,28 @@ pub const Conveyor = struct {
                 tree.stats.meta_kv_commit_smo_retries.inc();
                 continue;
             }
+            var diverged = false;
             for (undo, leaves) |u, leaf| {
                 const gi = for (set, 0..) |l, i| {
                     if (l.addr == leaf.addr) break i;
                 } else unreachable;
-                _ = leaf.removeOverlayRecordsLocked(dirties[gi], u.key, span) catch {};
+                _ = leaf.removeOverlayRecordsLocked(dirties[gi], u.key, span) catch {
+                    diverged = true;
+                };
                 const snap = leaf.snapshotLoad();
                 defer snap.release();
                 if (tx.UndoKey.escaped(span, snap.value.newestSeqOf(u.key))) {
                     const c = u.compensation();
-                    comps.append(arena, .{ .tree_id = u.tree_id, .key = u.key, .kind = c.kind, .value = c.value }) catch {};
+                    comps.append(arena, .{ .tree_id = u.tree_id, .key = u.key, .kind = c.kind, .value = c.value }) catch {
+                        diverged = true;
+                    };
                 }
             }
             self.unlockAll(set);
+            if (diverged) return self.divergedFromReplay(site, "out of memory removing a window's records or recording an escaped record's compensation");
             break;
         } else {
-            log.err("meta volume {s}: rollback retry budget exhausted (SMO protocol bug)", .{self.deps.volume});
-            return;
+            return self.divergedFromReplay(site, "the rollback's lock-revalidate retry budget is exhausted (SMO protocol bug); the window's records stay applied");
         }
         if (comps.items.len == 0) return;
         self.commitCompensation(span, comps.items);
@@ -1478,21 +1499,20 @@ pub const Conveyor = struct {
     /// entry through the direct writer — admitted from the reserve (never
     /// parks behind user admissions), leaves locked ascending, skip-if-newer
     /// re-checked under the locks, reserved inside, applied, written after
-    /// release. A failure here escalates through the lattice.
+    /// release. An escaped record left uncompensated is RAM ≠ replay: every
+    /// exit short of the written entry is a divergence (terminal); only the
+    /// entry write itself is the ring's crash-equivalent hole class.
     fn commitCompensation(self: *Conveyor, span: SeqSpan, comps: []const Comp) void {
         const gpa = self.deps.gpa;
         const j = self.deps.smo_journal;
+        const site = &self.stats.divergence_compensation;
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const frames = arena.alloc(journal.RecordFrame, comps.len) catch return;
+        const frames = arena.alloc(journal.RecordFrame, comps.len) catch return self.divergedFromReplay(site, "out of memory building the compensation frames; escaped records stand uncompensated");
         for (comps, frames) |c, *f| f.* = .{ .tag = journal.tagFor(c.tree_id, 0), .key = c.key, .kind = @fromBackingInt(@intCast(@backingInt(c.kind))), .seq = 0, .value = c.value };
-        const len = journal.entryLenFor(frames) catch return;
-        const adm = self.deps.core.tryAdmit(len, .checkpoint) orelse {
-            log.err("meta volume {s}: rollback compensation could not admit {d} B from the checkpoint reserve — volume escalating", .{ self.deps.volume, len });
-            _ = self.deps.latch.noteFailure(.journal_write);
-            return;
-        };
+        const len = journal.entryLenFor(frames) catch return self.divergedFromReplay(site, "the compensation entry does not encode; escaped records stand uncompensated");
+        const adm = self.deps.core.tryAdmit(len, .checkpoint) orelse return self.divergedFromReplay(site, "the checkpoint reserve could not admit the compensation entry; escaped records stand uncompensated");
         var attempt: u32 = 0;
         while (attempt < COMMIT_RETRY_BUDGET) : (attempt += 1) {
             const leaves = arena.alloc(*CachedNode, comps.len) catch break;
@@ -1544,32 +1564,40 @@ pub const Conveyor = struct {
             }
             const reg = j.reserve(adm) catch {
                 // The core transferred the claim before the registry's append
-                // failed: the range is the ring's now, un-registered — loud.
+                // failed: the range is the ring's now, un-registered.
                 self.unlockAll(set);
-                log.err("meta volume {s}: rollback compensation could not register its reservation — volume escalating", .{self.deps.volume});
-                _ = self.deps.latch.noteFailure(.journal_write);
-                return;
+                return self.divergedFromReplay(site, "the compensation's reservation could not be registered (out of memory); escaped records stand uncompensated");
             };
             for (frames, 0..) |*f, i| f.seq = reg.seq_base + i;
+            // The frame IS written below, so a record that cannot be applied
+            // to RAM is a divergence in the other direction.
+            var diverged = false;
             for (comps, leaves, live, frames) |c, leaf, lv, f| {
                 if (!lv) continue;
                 const gi = for (set, 0..) |l, i| {
                     if (l.addr == leaf.addr) break i;
                 } else unreachable;
-                var one = [_]OwnedRec{OwnedRec.fromRecordRef(gpa, .{ .key = c.key, .seq = f.seq, .kind = c.kind, .value = c.value }) catch continue};
-                leaf.applyLocked(dirties[gi], &one, reg.res.start) catch {};
+                var one = [_]OwnedRec{OwnedRec.fromRecordRef(gpa, .{ .key = c.key, .seq = f.seq, .kind = c.kind, .value = c.value }) catch {
+                    diverged = true;
+                    continue;
+                }};
+                leaf.applyLocked(dirties[gi], &one, reg.res.start) catch {
+                    diverged = true;
+                };
             }
             self.unlockAll(set);
+            if (diverged) self.divergedFromReplay(site, "a compensating record could not be applied to RAM while its frame is written to the ring");
             self.stats.compensations.add(comps.len);
-            j.commitEntry(reg.res, frames) catch |e| {
-                log.err("meta volume {s}: rollback compensation entry write failed ({s}) — volume escalating", .{ self.deps.volume, @errorName(e) });
-                _ = self.deps.latch.noteFailure(.journal_write);
+            // The entry's hole (the write never landed) leaves the escaped
+            // bset record standing for replay while RAM holds the
+            // compensation: unlike an SMO entry's hole, nothing folds back.
+            j.commitEntry(reg.res, frames) catch {
+                self.divergedFromReplay(site, "the compensation entry's write failed; the escaped record stands for replay while RAM holds its compensation");
             };
             return;
         }
         self.deps.core.release(adm);
-        log.err("meta volume {s}: rollback compensation could not take its leaf locks — volume escalating", .{self.deps.volume});
-        _ = self.deps.latch.noteFailure(.journal_write);
+        self.divergedFromReplay(site, "the compensation could not resolve or lock its leaves (out of memory or the lock-revalidate budget); escaped records stand uncompensated");
     }
 };
 
@@ -1593,6 +1621,9 @@ pub const RamLane = struct {
     held: std.ArrayList(Held) = .empty,
     /// Fail the next N windows' writes synthetically (nothing lands).
     fail_next: u32 = 0,
+    /// Arm this allocator to fail from the rollback hook's FIRST allocation
+    /// on (the conveyor's `gpa` is its face): the rollback-under-OOM seam.
+    oom_on_rollback: ?*std.testing.FailingAllocator = null,
     /// The conveyor's hooks: set once the conveyor exists.
     conveyor: ?*Conveyor = null,
     checkpoint_past: ?*const fn (ctx: *anyopaque, pos: u64) bool = null,
@@ -1697,7 +1728,9 @@ pub const RamLane = struct {
             defer self.gpa.free(verdicts);
             for (group, verdicts) |h, *v| {
                 if (h.fail) {
+                    if (self.oom_on_rollback) |fa| fa.fail_index = fa.alloc_index;
                     cv.rollbackHook(h.w.span(), h.w.res);
+                    if (self.oom_on_rollback) |fa| fa.fail_index = std.math.maxInt(usize);
                     _ = self.latch.noteFailure(.journal_write);
                     if (!self.checkpointPast(h.w.res.paddedEnd())) _ = self.latch.noteFailure(.journal_write);
                     v.* = error.JournalWriteFailed;
@@ -1829,6 +1862,12 @@ const Harness = struct {
     const inos_mod = @import("inos.zig");
 
     fn create(cfg: smo.TestVolume.Config, caps: ?Caps, strict: bool) !*Harness {
+        return createWithGpa(cfg, caps, strict, testing.allocator);
+    }
+
+    /// `create` with the CONVEYOR's allocator chosen (a `FailingAllocator`
+    /// for the OOM contracts); the fixture itself stays on `testing.allocator`.
+    fn createWithGpa(cfg: smo.TestVolume.Config, caps: ?Caps, strict: bool, cv_gpa: Allocator) !*Harness {
         const gpa = testing.allocator;
         const h = try gpa.create(Harness);
         errdefer gpa.destroy(h);
@@ -1846,9 +1885,9 @@ const Harness = struct {
         h.lane.checkpoint_ctx = h;
         h.vol.journal.device = .{ .ctx = h, .write = smoWrite, .completed = smoCompleted };
         const geo = h.vol.journal.geo;
-        h.cv = try Conveyor.init(gpa, .{
+        h.cv = try Conveyor.init(cv_gpa, .{
             .io = testing.io,
-            .gpa = gpa,
+            .gpa = cv_gpa,
             .volume = "ram-vol",
             .trees = h.vol.trees.items,
             .cache = h.vol.cache,
@@ -2283,6 +2322,27 @@ test "an escaped record (a freeze raced the failed write) is compensated through
     defer r.deinit();
     try testing.expect(!try Harness.replayedPresent(&r, victim));
     try testing.expect(try Harness.replayedPresent(&r, base));
+}
+
+test "a rollback that cannot complete (out of memory on its first allocation) is RAM ≠ replay: the volume latches FAILED at once, the divergence tripwire fires, the stuck records are never served as acked" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const h = try Harness.createWithGpa(.{}, null, false, fa.allocator());
+    defer h.destroy();
+    const base = try h.commitCreate("base");
+    // The failed window's rollback runs out of memory before it can remove
+    // the window's records from the leaf: RAM holds records whose entry
+    // never landed — the one class §1.8 says must never be silent.
+    h.lane.fail_next = 1;
+    h.lane.oom_on_rollback = &fa;
+    log.testing.expectErrorLogs(2);
+    try testing.expectError(error.JournalWriteFailed, h.commitCreate("victim"));
+    try log.testing.expectAllFired();
+    h.lane.oom_on_rollback = null;
+    try testing.expect(h.latch.isFailed());
+    try testing.expectEqual(@as(u64, 1), h.cv.stats.divergence_rollback.load());
+    try testing.expect(try h.present(base));
+    try testing.expectError(error.VolumeFailed, h.commitCreate("post"));
+    try testing.expectEqual(@as(u64, 0), h.cv.windowsInflight());
 }
 
 test "the admission park: a ring too full for the batch parks the pass holding no node lock, kicks the checkpoint with the park mark, and resolves without a timer" {

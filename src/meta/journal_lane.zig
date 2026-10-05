@@ -211,6 +211,9 @@ pub const Stats = struct {
     prefix_waits: counters.ShardedCounter = .{},
     queue_full: counters.ShardedCounter = .{},
     volumes_failed: counters.ShardedCounter = .{},
+    /// Rings that died under a lane (`io_uring_enter` / the CQE read
+    /// failed): each latches its volume FAILED.
+    rings_dead: counters.ShardedCounter = .{},
     wake_arm_failed: counters.Tripwire = .init("journal_lane_wake_arm_failed"),
     cqe_orphan: counters.Tripwire = .init("journal_lane_cqe_orphan"),
     queue_push_with_cell: counters.Tripwire = .init("journal_lane_queue_push_with_cell"),
@@ -220,7 +223,7 @@ pub var stats: Stats = .{};
 
 /// `{"journal_lanes_spawned":n,…}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_wake_arm_failed\":{d},\"journal_lane_cqe_orphan\":{d}}}", .{
+    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_wake_arm_failed\":{d},\"journal_lane_cqe_orphan\":{d}}}", .{
         stats.lanes_spawned.load(),
         stats.lanes_live.load(),
         stats.lane_writes.load(),
@@ -236,6 +239,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.prefix_waits.load(),
         stats.queue_full.load(),
         stats.volumes_failed.load(),
+        stats.rings_dead.load(),
         stats.wake_arm_failed.load(),
         stats.cqe_orphan.load(),
     });
@@ -302,6 +306,10 @@ pub const TestSeams = struct {
     /// between two lane passes deterministically.
     hold_before_park: std.atomic.Value(u32) = .init(0),
     held: std.atomic.Value(u32) = .init(0),
+    /// 1 ⇒ the next lane pass kills the ring after its scan, as a failed
+    /// `io_uring_enter` would (every in-flight op fails, the volume latches
+    /// FAILED); self-disarming.
+    kill_ring: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -925,6 +933,7 @@ const Worker = struct {
             const sealed = lane.sealed.load(.acquire);
             while (lane.inbound.tryPop()) |idx| w.admit(idx);
             if (sealed) w.disconnected = true;
+            if (test_seams.kill_ring.swap(0, .acq_rel) != 0) w.failAll(error.RingFailed);
             w.advanceDurability();
             var now = clock.monotonicNs();
             // The trailing barrier before exit: ONE, after the last ack, so
@@ -1183,10 +1192,18 @@ const Worker = struct {
     }
 
     /// The ring broke: every in-flight run and the barrier fail with `err`;
-    /// later windows fail at admission.
+    /// later windows fail at admission; and the VOLUME latches FAILED at
+    /// once — a ring that cannot `io_uring_enter` is a device fence, which
+    /// charter §1.8 names terminal (three later window verdicts would leave
+    /// a quiet volume "dead lane, not FAILED").
     fn failAll(w: *Worker, err: Error) void {
         w.ring_dead = true;
         w.wake_armed = false;
+        stats.rings_dead.inc();
+        if (w.lane.latch.failStop()) {
+            stats.volumes_failed.inc();
+            log.err("journal lane {d}: the ring is dead ({s}) — latching the volume FAILED; mutations answer EIO until remount (charter §1.8: a device fence is terminal)", .{ w.lane.index, @errorName(err) });
+        }
         const now = clock.monotonicNs();
         for (w.slots.items, 0..) |slot, i| {
             if (slot == null) continue;
@@ -2215,12 +2232,41 @@ test "shutdown drains: windows submitted and never awaited are still landed, ack
     h.reg.complete(&h.core, r.res);
 }
 
+test "a dead ring latches the volume FAILED at once (a device fence is terminal), counted on journal_lane_rings_dead; the in-flight window fails RingFailed; later requests refuse VolumeFailed" {
+    const h = try Harness.init(testing.allocator, "deadring");
+    defer h.deinit();
+    // ONE error log on the lane thread: the latch line.
+    try h.spawnLane(.{}, "600000", 1);
+    const lane = h.lane.?;
+    const dead0 = stats.rings_dead.load();
+    const failed0 = stats.volumes_failed.load();
+    const a = try h.append(1, 500, 0x11);
+    try a.ticket.wait().result;
+    try testing.expect(!lane.isFailed());
+    // The next lane pass admits the window, then the ring dies under it as
+    // a failed `io_uring_enter` would kill it.
+    test_seams.kill_ring.store(1, .release);
+    const b = try h.append(2, 500, 0x22);
+    try testing.expectError(error.RingFailed, b.ticket.wait().result);
+    try testing.expect(lane.isFailed());
+    try testing.expectEqual(dead0 + 1, stats.rings_dead.load());
+    try testing.expectEqual(failed0 + 1, stats.volumes_failed.load());
+    try testing.expectError(error.VolumeFailed, lane.requestBarrier());
+    lane.shutdown();
+    try testing.expectEqual(@as(usize, 1), lane.testErrorLogsFired());
+    // The healthy entry stands on the device; the dead one never landed.
+    var rec = try h.replay(0);
+    defer rec.deinit();
+    var inos: [4]u64 = undefined;
+    try testing.expectEqualSlices(u64, &.{1}, recoveredInos(&rec, &inos));
+}
+
 test "the stats JSON names every lane counter" {
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_wake_arm_failed\":", "\"journal_lane_cqe_orphan\":" }) |needle| {
+    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_rings_dead\":", "\"journal_lane_wake_arm_failed\":", "\"journal_lane_cqe_orphan\":" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, s, needle) != null);
     }
 }

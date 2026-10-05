@@ -87,9 +87,8 @@ pub const MIB_MAX: i128 = BYTES_MAX >> 20;
 /// THE REGISTRY. Grouped by subsystem; rows land with the module that reads
 /// them (the inverse-census rail refuses a row nothing reads).
 pub const registry = [_]Knob{
-    // ---- build identity / observability ----
-    .{ .key = "SQUEEZEFS_OP_PROFILE", .kind = .bool, .default = "off", .class = .switch_, .doc = "Per-op phase histograms (zero cost off)." },
-    .{ .key = "SQUEEZEFS_STATS_KEY_CENSUS", .kind = .bool, .default = "off", .class = .switch_, .doc = "Arm the `.stats` key census (live object keys + per-inode write custody — a debugging surface)." },
+    // (`SQUEEZEFS_OP_PROFILE` and `SQUEEZEFS_STATS_KEY_CENSUS` land with the
+    // `.stats` inode in rung 5 — a row nothing reads is dead code.)
 
     // ---- R5 memory budget ----
     .{ .key = "SQUEEZEFS_MEM_BUDGET_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "R5 memory budget, MiB (absolute > cgroup memory.max × 0.8 > 70 % RAM)." },
@@ -105,11 +104,12 @@ pub const registry = [_]Knob{
     .{ .key = "SQUEEZEFS_NVME_READ_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device READ submission fan-out lanes (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
     .{ .key = "SQUEEZEFS_NVME_WRITE_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device DATA-WRITE submission fan-out lanes, block-offset affinity (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
     .{ .key = "SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS", .kind = .{ .int = .{ .lo = 1, .hi = MS_MAX } }, .default = "30000", .class = .test_seam, .doc = "Test seam: NVMe read timeout, ms." },
-    // @anchor:nvme_dev_knobs
 
-    // @anchor:mem_budget_knobs
-
-    // @anchor:uring_fs_knobs
+    // ---- R5 fleet share + IPC arena sizing (read by mem/) ----
+    .{ .key = "SQUEEZEFS_FLEET_SHARE", .kind = .{ .int = .{ .lo = 1, .hi = 4096 } }, .default = "1", .class = .tuning, .doc = "N co-located daemons sharing one machine: divides the cgroup/RAM roots and the cgroup unreclaimable sample (ceil) BEFORE the ×0.8/×0.7 laws; explicit budgets and floors are never divided." },
+    .{ .key = "SQUEEZEFS_IPC_MEM_MAX", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "ipc_session_arenas admission cap, MiB (absolute > pct > derived budget/8)." },
+    .{ .key = "SQUEEZEFS_IPC_MEM_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "ipc_session_arenas admission cap as a percentage of the R5 budget." },
+    .{ .key = "SQUEEZEFS_IPC_ARENA_MB", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 20 } }, .default = "derived", .class = .derived_override, .doc = "Per-session IPC payload arena, MiB (derived max(64 MiB, align_down(ipc cap / session population target, 4 MiB)))." },
 };
 
 pub fn lookup(key: []const u8) ?*const Knob {
@@ -436,17 +436,17 @@ test "gate: every offender at once, sorted; unknown announced not refused" {
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    try env.put("SQUEEZEFS_OP_PROFILE", "yess");
+    try env.put("SQUEEZEFS_TEST_META_BUFFERED", "yess");
     try env.put("SQUEEZEFS_URING_FS_WORKERS", "65");
     try env.put("SQUEEZEFS_TRANSPORT_MEM_PCT", "250");
     try env.put("SQUEEZEFS_NOT_A_KNOB", "1");
     try env.put("PATH", "/usr/bin");
-    try env.put("SQUEEZEFS_STATS_KEY_CENSUS", "   ");
+    try env.put("SQUEEZEFS_PARKED_GATE_ASSIST_MS", "   ");
 
     var v = try validateVars(gpa, &env);
     defer v.deinit(gpa);
     try testing.expectEqual(@as(usize, 3), v.errors.items.len);
-    try testing.expectEqualStrings("SQUEEZEFS_OP_PROFILE='yess' is invalid: " ++ bool_want, v.errors.items[0]);
+    try testing.expectEqualStrings("SQUEEZEFS_TEST_META_BUFFERED='yess' is invalid: " ++ bool_want, v.errors.items[0]);
     try testing.expectEqualStrings("SQUEEZEFS_TRANSPORT_MEM_PCT='250' is invalid: expected an integer in 1..=100", v.errors.items[1]);
     try testing.expectEqualStrings("SQUEEZEFS_URING_FS_WORKERS='65' is invalid: expected an integer in 1..=64", v.errors.items[2]);
     try testing.expectEqual(@as(usize, 1), v.unknown.items.len);
@@ -457,7 +457,7 @@ test "gate: every offender at once, sorted; unknown announced not refused" {
     var warn: std.Io.Writer = .fixed(&warn_buf);
     const report = (try refusalReport(gpa, &env, &warn)).?;
     defer gpa.free(report);
-    try testing.expect(std.mem.startsWith(u8, report, "refusing to start: invalid SqueezeFS environment knob(s)\n  - SQUEEZEFS_OP_PROFILE="));
+    try testing.expect(std.mem.startsWith(u8, report, "refusing to start: invalid SqueezeFS environment knob(s)\n  - SQUEEZEFS_TEST_META_BUFFERED="));
     try testing.expect(std.mem.endsWith(u8, report, "(a malformed knob is never silently defaulted — fix or unset it; empty means unset)"));
     try testing.expect(std.mem.indexOf(u8, warn.buffered(), "Warning: SQUEEZEFS_NOT_A_KNOB is not a SqueezeFS knob (typo?") != null);
 }
@@ -467,7 +467,7 @@ test "gate: a clean environment yields no report; an unknown alone is not a refu
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     try env.put("SQUEEZEFS_TYPO_KNOB", "1");
-    try env.put("SQUEEZEFS_OP_PROFILE", "on");
+    try env.put("SQUEEZEFS_TEST_META_BUFFERED", "on");
     var warn_buf: [256]u8 = undefined;
     var warn: std.Io.Writer = .fixed(&warn_buf);
     try testing.expectEqual(@as(?[]u8, null), try refusalReport(gpa, &env, &warn));
@@ -495,18 +495,18 @@ test "readers: =0 disables a default-ON knob; bogus keeps the default; absent ke
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    try testing.expect(boolKnob(&env, "SQUEEZEFS_OP_PROFILE", true));
+    try testing.expect(boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", true));
     for (bool_false) |f| {
-        try env.put("SQUEEZEFS_OP_PROFILE", f);
-        try testing.expect(!boolKnob(&env, "SQUEEZEFS_OP_PROFILE", true));
+        try env.put("SQUEEZEFS_TEST_META_BUFFERED", f);
+        try testing.expect(!boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", true));
     }
     for (bool_true) |t| {
-        try env.put("SQUEEZEFS_OP_PROFILE", t);
-        try testing.expect(boolKnob(&env, "SQUEEZEFS_OP_PROFILE", false));
+        try env.put("SQUEEZEFS_TEST_META_BUFFERED", t);
+        try testing.expect(boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", false));
     }
-    try env.put("SQUEEZEFS_OP_PROFILE", "bogus");
+    try env.put("SQUEEZEFS_TEST_META_BUFFERED", "bogus");
     log.testing.expectErrorLogs(1);
-    try testing.expect(boolKnob(&env, "SQUEEZEFS_OP_PROFILE", true));
+    try testing.expect(boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", true));
     try log.testing.expectAllFired();
     try testing.expectEqual(@as(?u32, null), optIntKnob(u32, &env, "SQUEEZEFS_URING_FS_WORKERS"));
     try env.put("SQUEEZEFS_URING_FS_WORKERS", "12");

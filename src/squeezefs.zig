@@ -32,13 +32,15 @@ pub const counters = @import("core/counters.zig");
 pub const thread_name = @import("core/thread_name.zig");
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
-// @anchor:mem_budget_import
+pub const mem_budget = @import("mem/budget.zig");
 
 // ---- I/O: the io_uring file layer + metadata device posture (Linux only) ----
-// @anchor:uring_fs_import
+pub const align_probe = @import("io/align_probe.zig");
+pub const uring_fs = if (builtin.os.tag == .linux) @import("io/uring_fs.zig") else struct {};
 
 // ---- I/O: NVMe block device workers (Linux only) ----
-// @anchor:nvme_dev_import
+pub const nvme_derive = @import("io/nvme_derive.zig");
+pub const nvme_dev = if (builtin.os.tag == .linux) @import("io/nvme_dev.zig") else struct {};
 
 test {
     std.testing.refAllDecls(@This());
@@ -49,7 +51,9 @@ test {
     _ = log;
     _ = counters;
     _ = thread_name;
-    // @anchor:mem_budget_test
-    // @anchor:uring_fs_test
-    // @anchor:nvme_dev_test
+    _ = mem_budget;
+    _ = align_probe;
+    if (builtin.os.tag == .linux) _ = uring_fs;
+    _ = nvme_derive;
+    if (builtin.os.tag == .linux) _ = nvme_dev;
 }

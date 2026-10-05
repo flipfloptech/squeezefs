@@ -1,0 +1,1451 @@
+//! R5 memory-budget authority (charter §6.2 "Memory budget authority (R5)";
+//! porting spec `docs/porting/mem_budget.md`).
+//!
+//! One budget, one pressure signal, three levels. RAM consumers register a
+//! `Component` {gauge, floor, weight, shed} into an append-only registry; a
+//! 1 Hz sampler resolves the budget, samples RSS and the cgroup-v2
+//! unreclaimable set into two 5-slot max-of-window buffers, computes
+//! `pressure = max(Σ non-reclaimable gauges, rss_max, unreclaim_max)`, runs
+//! the hysteresis level machine, and on Red ticks sheds ∝ weight over floors.
+//! Enforcement is advisory-at-admission: growth paths call `level()` (one
+//! relaxed load) and apply their own response.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const derive = @import("../core/derive.zig");
+const knobs = @import("../core/knobs.zig");
+const counters = @import("../core/counters.zig");
+const log = @import("../core/log.zig");
+const thread_name = @import("../core/thread_name.zig");
+
+/// The budget-derived caps (transport, IPC, dentry) and the fleet-share
+/// floor refusal (spec §4 helpers).
+pub const sizing = @import("sizing.zig");
+
+const MiB = derive.MiB;
+const GiB = derive.GiB;
+const linux = std.os.linux;
+
+// ---------------------------------------------------------------------------
+// Constants (spec §7), each with its WHY.
+// ---------------------------------------------------------------------------
+
+/// Level edges, percent of budget. 4-point enter/exit gaps so a pressure
+/// hovering AT a boundary cannot flap the level (R-7).
+pub const yellow_enter_pct: u64 = 80;
+pub const yellow_exit_pct: u64 = 76;
+pub const red_enter_pct: u64 = 95;
+pub const red_exit_pct: u64 = 91;
+/// Red shed target: mid-Yellow — a target below the Yellow-exit edge would
+/// oscillate the level itself.
+pub const shed_target_pct: u64 = 85;
+/// Floors may claim at most this share of the budget before the
+/// proportional clamp engages.
+pub const floor_cap_pct: u64 = 90;
+/// Window length in 1 Hz samples — the decay horizon (5 s). Max over the
+/// window: a spike ages out on the 5th subsequent tick; explicitly NOT a
+/// ratchet.
+pub const window_len = 5;
+/// One or two over-budget ticks is a spike the normal Red response absorbs;
+/// three is a convergence failure.
+pub const backstop_sustain_ticks: u64 = 3;
+/// Re-read the cgroup cage within a second; × `window_len` = the 5 s decay.
+pub const sampler_period_ns: u64 = std.time.ns_per_s;
+/// The sampler's comm name ("other" CPU class, like the reference's
+/// blocking-pool thread).
+pub const sampler_thread_name = "sqz-membudget";
+/// Registry capacity: the production registry (spec §2.5) is ~30 components;
+/// 64 is the next power of two with headroom. Overflow fires `registry_full`
+/// and drops the component — never a panic at mount.
+pub const max_components = 64;
+
+/// Fired when a 65th component registers: the registry is sized to the
+/// production census, so this is a porting error, not a runtime condition.
+pub var registry_full: counters.Tripwire = .init("mem_budget_registry_full");
+
+pub const Level = enum(u8) {
+    green = 0,
+    yellow = 1,
+    red = 2,
+
+    /// 2 ⇒ Red, 1 ⇒ Yellow, anything else ⇒ Green.
+    pub fn fromU8(v: u8) Level {
+        return switch (v) {
+            2 => .red,
+            1 => .yellow,
+            else => .green,
+        };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// §1 Budget derivation (pure).
+// ---------------------------------------------------------------------------
+
+/// flag → env → cgroup `memory.max` / 10 × 8 → RAM / 10 × 7. Flag and env
+/// are the explicit tiers (verbatim); cgroup and RAM are the derived tier.
+pub fn resolveBudgetFrom(flag: ?u64, env_bytes: ?u64, cgroup_max: ?u64, ram: u64) u64 {
+    if (flag) |f| return f;
+    if (env_bytes) |e| return e;
+    if (cgroup_max) |c| return derive.tenths(c, 8);
+    return derive.tenths(ram, 7);
+}
+
+/// `ceil(value / max(share, 1))`: ONE divisor at the system roots so N
+/// co-located daemons split the machine; share ≤ 1 is the identity. Written
+/// without `value + d - 1` so `u64::MAX` cannot overflow.
+pub fn fleetSharedRoot(value: u64, share: u32) u64 {
+    const d: u64 = @max(share, 1);
+    return value / d + @intFromBool(value % d != 0);
+}
+
+/// The fleet-share form: the SYSTEM roots (cgroup cage, RAM) are divided
+/// BEFORE the ×0.8/×0.7 laws; flag/env pass through undivided.
+pub fn resolveBudgetFromShared(flag: ?u64, env_bytes: ?u64, cgroup_max: ?u64, ram: u64, share: u32) u64 {
+    const shared_cgroup: ?u64 = if (cgroup_max) |c| fleetSharedRoot(c, share) else null;
+    return resolveBudgetFrom(flag, env_bytes, shared_cgroup, fleetSharedRoot(ram, share));
+}
+
+/// The `Facts`-shaped tie: explicit `SQUEEZEFS_MEM_BUDGET_MB` → cgroup × 0.8
+/// → 70 % RAM, solo posture.
+pub fn resolveBudget(facts: derive.Facts, explicit_mb: ?u64, cgroup_max: ?u64) u64 {
+    const env_bytes: ?u64 = if (explicit_mb) |mb| mb *| MiB else null;
+    return resolveBudgetFrom(null, env_bytes, cgroup_max, facts.total_ram);
+}
+
+pub const TickInputs = struct { budget: u64, rss: u64, unreclaimable: u64 };
+
+/// Per-tick input composition: the cgroup unreclaimable sample is ONE
+/// `memory.stat` shared by N co-located daemons, so it enters divided by the
+/// share like every system root; RSS is per-process and never divided (the
+/// N=32 fleet row: all 32 daemons in Red with hard backstops at 0.5 GB of
+/// own ledger each when the whole cage was compared against a 1/32 budget).
+pub fn tickInputs(budget: u64, rss: u64, raw_unreclaimable: u64, share: u32) TickInputs {
+    return .{ .budget = budget, .rss = rss, .unreclaimable = fleetSharedRoot(raw_unreclaimable, share) };
+}
+
+/// Red halves the parked-buffer spill threshold (the never-lossy staging
+/// spill engages at half the count); floor 1 so a cap of 1 stays usable.
+pub fn effectiveParkedCap(cap: u64, level_now: Level) u64 {
+    return if (level_now == .red) @max(cap / 2, 1) else cap;
+}
+
+// ---------------------------------------------------------------------------
+// Knob faces: the registry rows this module consumes.
+// ---------------------------------------------------------------------------
+
+/// `SQUEEZEFS_FLEET_SHARE`, floored at 1 (the gate refuses 0).
+pub fn fleetShare(env: *const std.process.Environ.Map) u32 {
+    return @max(1, knobs.intKnob(u32, env, "SQUEEZEFS_FLEET_SHARE", 1));
+}
+
+/// `SQUEEZEFS_MEM_BUDGET_MB` × 1 MiB; null when absent.
+fn envBudgetBytes(env: *const std.process.Environ.Map) ?u64 {
+    const mb = knobs.optIntKnob(u64, env, "SQUEEZEFS_MEM_BUDGET_MB") orelse return null;
+    return mb *| MiB;
+}
+
+/// Red parked-gate drain-assist window before a writer self-flushes
+/// (`SQUEEZEFS_PARKED_GATE_ASSIST_MS`, shipped 200 ms).
+pub fn parkedGateAssistMs(env: *const std.process.Environ.Map) u64 {
+    return knobs.intKnob(u64, env, "SQUEEZEFS_PARKED_GATE_ASSIST_MS", 200);
+}
+
+// ---------------------------------------------------------------------------
+// §1.4–1.6 Sampler inputs: pure parsers + the Linux readers.
+// ---------------------------------------------------------------------------
+
+/// The kill-relevant subset of cgroup-v2 `memory.stat`: bytes the kernel
+/// cannot reclaim without I/O or at all. Clean file cache is deliberately
+/// EXCLUDED — counting it would pin healthy warm mounts (5 GiB of clean
+/// tier mmap by design) in permanent Red. Lines without two fields are
+/// skipped, unknown keys ignored, unparsable values count 0.
+pub fn parseUnreclaimableMemoryStat(stat: []const u8) u64 {
+    var sum: u64 = 0;
+    var lines = std.mem.splitScalar(u8, stat, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const key = fields.next() orelse continue;
+        const val = fields.next() orelse continue;
+        if (isUnreclaimableKey(key)) sum +|= std.fmt.parseInt(u64, val, 10) catch 0;
+    }
+    return sum;
+}
+
+fn isUnreclaimableKey(key: []const u8) bool {
+    const keys = [_][]const u8{ "anon", "file_dirty", "file_writeback", "shmem", "unevictable", "slab_unreclaimable" };
+    for (keys) |k| if (std.mem.eql(u8, k, key)) return true;
+    return false;
+}
+
+/// The `0::<path>` unified line of `/proc/self/cgroup` (cgroup v2 ONLY: no
+/// v1 `memory.limit_in_bytes`, no mountinfo walk); null when absent.
+pub fn parseCgroupV2Path(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "0::")) return std.mem.trim(u8, line[3..], " \t\r");
+    }
+    return null;
+}
+
+/// `memory.max`: the literal `max` (an uncapped cage) and junk both mean
+/// "no cgroup tier" ⇒ fall to 70 % RAM.
+pub fn parseMemoryMax(text: []const u8) ?u64 {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (std.mem.eql(u8, t, "max")) return null;
+    return std.fmt.parseInt(u64, t, 10) catch null;
+}
+
+/// `/proc/self/statm` field 2 (resident pages); 0 on any malformed input.
+pub fn parseStatmResidentPages(text: []const u8) u64 {
+    var fields = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    _ = fields.next() orelse return 0;
+    const resident = fields.next() orelse return 0;
+    return std.fmt.parseInt(u64, resident, 10) catch 0;
+}
+
+/// cgroup v2 `memory.max` of THIS process, re-read every tick so a
+/// runtime-lowered cage tightens the budget within one tick. Null off-Linux,
+/// off-cgroup, on `max`, or on any read error.
+pub fn readCgroupMemoryMax() ?u64 {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [64]u8 = undefined;
+    const text = linuxCgroupFile("memory.max", &buf) orelse return null;
+    return parseMemoryMax(text);
+}
+
+/// cgroup v2 `memory.stat` unreclaimable sample of THIS process; null
+/// off-cgroup (the arm disengages; statm + gauges remain).
+pub fn readCgroupUnreclaimable() ?u64 {
+    if (builtin.os.tag != .linux) return null;
+    // memory.stat is ~60 lines × ~30 B ≈ 2 KiB on the 7.x kernels; 16 KiB
+    // leaves room for future keys without a second read.
+    var buf: [16 * 1024]u8 = undefined;
+    const text = linuxCgroupFile("memory.stat", &buf) orelse return null;
+    return parseUnreclaimableMemoryStat(text);
+}
+
+/// `/proc/self/statm` resident pages × page size; 0 off-Linux or on a read
+/// failure.
+pub fn readRssBytes() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var buf: [256]u8 = undefined;
+    const text = linuxReadSmallFile("/proc/self/statm", &buf) orelse return 0;
+    return parseStatmResidentPages(text) * @as(u64, @intCast(std.heap.pageSize()));
+}
+
+/// `/sys/fs/cgroup<path>/<leaf>` for this process's v2 cgroup.
+fn linuxCgroupFile(comptime leaf: []const u8, buf: []u8) ?[]const u8 {
+    var cg_buf: [4096]u8 = undefined;
+    const cg = linuxReadSmallFile("/proc/self/cgroup", &cg_buf) orelse return null;
+    const path = parseCgroupV2Path(cg) orelse return null;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const full = std.mem.printSentinel(&path_buf, "/sys/fs/cgroup{s}/" ++ leaf, .{path}, 0) catch return null;
+    return linuxReadSmallFile(full, buf);
+}
+
+/// Read a procfs/sysfs file into `buf` (these files report their size as 0,
+/// so read until EOF or the buffer is full); null on any error.
+fn linuxReadSmallFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const fd_raw = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd_raw) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n_raw = linux.read(fd, buf[len..].ptr, buf.len - len);
+        if (linux.errno(n_raw) != .SUCCESS) return null;
+        if (n_raw == 0) break;
+        len += n_raw;
+    }
+    return buf[0..len];
+}
+
+// ---------------------------------------------------------------------------
+// §2 Component model.
+// ---------------------------------------------------------------------------
+
+pub const GaugeFn = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque) u64 };
+pub const ShedFn = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, target: u64) void };
+
+/// Where a component's logical bytes come from: a plain ledger read
+/// directly, or a computed level. Callable from the sampler thread without
+/// locks; may be called twice per Red tick (sum pass + shed pass), so it
+/// must be cheap and side-effect free.
+pub const Source = union(enum) {
+    gauge: *const counters.Gauge,
+    func: GaugeFn,
+
+    pub fn current(self: Source) u64 {
+        return switch (self) {
+            .gauge => |g| g.load(),
+            .func => |f| f.call(f.ctx),
+        };
+    }
+};
+
+pub const Component = struct {
+    name: []const u8,
+    source: Source,
+    /// Bytes it may always keep (clamped proportionally when Σ floors > 90 %
+    /// of the budget).
+    floor: u64,
+    /// Red-shed share; 0 ⇒ never shed (attribution-only).
+    weight: u64,
+    /// The never-lossy mechanism (early flush, drop probation, trim); null
+    /// ⇒ no-op (in-flight DMAs drain by completion). Invoked with no lock
+    /// held, from the sampler thread; must be synchronous and non-blocking.
+    shed: ?ShedFn,
+    /// Attribution-only: counted in `gauge_sum`, excluded from pressure
+    /// (logical bytes over reclaimed page cache are phantom pressure — the
+    /// f1 trace: 5 GiB of reclaimed tier bytes pinned Red; their kill-relevant
+    /// residue arrives via the unreclaimable arm).
+    kernel_reclaimable: bool = false,
+    sheds: std.atomic.Value(u64) = .init(0),
+
+    pub fn init(name: []const u8, floor: u64, weight: u64, source: Source, shed: ?ShedFn) Component {
+        return .{ .name = name, .source = source, .floor = floor, .weight = weight, .shed = shed };
+    }
+
+    /// Builder flag for the mmap tiers.
+    pub fn kernelReclaimable(self: Component) Component {
+        var c = self;
+        c.kernel_reclaimable = true;
+        return c;
+    }
+
+    pub fn current(self: *const Component) u64 {
+        return self.source.current();
+    }
+
+    /// Shed calls received.
+    pub fn shedCount(self: *const Component) u64 {
+        return self.sheds.load(.monotonic);
+    }
+
+    fn callShed(self: *const Component, target: u64) void {
+        if (self.shed) |s| s.call(s.ctx, target);
+    }
+};
+
+/// What the live `tick` needs from the process: the Io handle (the sampler's
+/// timed wait), the environment (knobs re-read every tick) and the machine.
+pub const Host = struct {
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    facts: derive.Facts,
+};
+
+// ---------------------------------------------------------------------------
+// §3 The authority.
+// ---------------------------------------------------------------------------
+
+/// Every scalar is a single-word atomic read and written Relaxed: racy-
+/// tolerant by design (a stale level read costs one admission decision,
+/// never correctness) and no cross-word invariant exists. The ONLY
+/// release/acquire pair is the registry publish.
+pub const MemBudget = struct {
+    slots: [max_components]Component = undefined,
+    /// Tickets handed to registrants; `count` trails it and only ever covers
+    /// fully written slots.
+    reserved: std.atomic.Value(usize) = .init(0),
+    count: std.atomic.Value(usize) = .init(0),
+
+    flag_budget: std.atomic.Value(u64) = .init(0),
+    budget: std.atomic.Value(u64) = .init(0),
+    pressure: std.atomic.Value(u64) = .init(0),
+    gauge_sum: std.atomic.Value(u64) = .init(0),
+    unreclaimable: std.atomic.Value(u64) = .init(0),
+    level_raw: std.atomic.Value(u8) = .init(@backingInt(Level.green)),
+    yellow_events: std.atomic.Value(u64) = .init(0),
+    red_events: std.atomic.Value(u64) = .init(0),
+    hard_backstops: std.atomic.Value(u64) = .init(0),
+    backstop_over_ticks: std.atomic.Value(u64) = .init(0),
+    rss_window: [window_len]std.atomic.Value(u64) = @splat(.init(0)),
+    rss_idx: std.atomic.Value(usize) = .init(0),
+    unreclaim_window: [window_len]std.atomic.Value(u64) = @splat(.init(0)),
+    unreclaim_idx: std.atomic.Value(usize) = .init(0),
+    floors_clamped: std.atomic.Value(bool) = .init(false),
+    tier_paused: std.atomic.Value(bool) = .init(false),
+    backstop_on: std.atomic.Value(bool) = .init(false),
+
+    sampler_started: std.atomic.Value(bool) = .init(false),
+    sampler_stop: std.Io.Event = .unset,
+    sampler_thread: ?std.Thread = null,
+
+    // ---- registry ----
+
+    /// Append-only, mount-time, never removed. Readers never block: one
+    /// acquire load of `count` covers every published slot.
+    pub fn register(self: *MemBudget, c: Component) void {
+        const idx = self.reserved.fetchAdd(1, .monotonic);
+        if (idx >= max_components) {
+            registry_full.fire(c.name);
+            return;
+        }
+        self.slots[idx] = c;
+        // Publish in ticket order so `count` never covers an unwritten
+        // slot: wait for every earlier ticket, then release ours. The
+        // release pairs with the acquire load in `registry`/`components`.
+        while (self.count.cmpxchgWeak(idx, idx + 1, .release, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn registry(self: *MemBudget) []Component {
+        // Acquire pairs with the release CAS in `register`.
+        return self.slots[0..self.count.load(.acquire)];
+    }
+
+    /// The published registry (stats, floors, callers).
+    pub fn components(self: *const MemBudget) []const Component {
+        // Acquire pairs with the release CAS in `register`.
+        return self.slots[0..self.count.load(.acquire)];
+    }
+
+    // ---- accessors (relaxed loads; hot-path safe) ----
+
+    /// The one-atomic-load admission check every growth path uses.
+    pub fn level(self: *const MemBudget) Level {
+        return Level.fromU8(self.level_raw.load(.monotonic));
+    }
+    pub fn budgetBytes(self: *const MemBudget) u64 {
+        return self.budget.load(.monotonic);
+    }
+    pub fn pressureBytes(self: *const MemBudget) u64 {
+        return self.pressure.load(.monotonic);
+    }
+    pub fn gaugeSumBytes(self: *const MemBudget) u64 {
+        return self.gauge_sum.load(.monotonic);
+    }
+    pub fn unreclaimableBytes(self: *const MemBudget) u64 {
+        return self.unreclaimable.load(.monotonic);
+    }
+    pub fn yellowEvents(self: *const MemBudget) u64 {
+        return self.yellow_events.load(.monotonic);
+    }
+    pub fn redEvents(self: *const MemBudget) u64 {
+        return self.red_events.load(.monotonic);
+    }
+    pub fn hardBackstops(self: *const MemBudget) u64 {
+        return self.hard_backstops.load(.monotonic);
+    }
+    pub fn floorsClamped(self: *const MemBudget) bool {
+        return self.floors_clamped.load(.monotonic);
+    }
+    pub fn backstopActive(self: *const MemBudget) bool {
+        return self.backstop_on.load(.monotonic);
+    }
+    pub fn tierPublishPaused(self: *const MemBudget) bool {
+        return self.tier_paused.load(.monotonic);
+    }
+
+    /// `--mem-budget`, bytes; 0 = unset.
+    pub fn setFlagBudget(self: *MemBudget, bytes: u64) void {
+        self.flag_budget.store(bytes, .monotonic);
+    }
+
+    /// Test seams: consumers' tests pin a level / the publish gate without a
+    /// live sampler.
+    pub fn forceLevelForTest(self: *MemBudget, l: Level) void {
+        self.level_raw.store(@backingInt(l), .monotonic);
+    }
+    pub fn forceTierPublishPausedForTest(self: *MemBudget, paused: bool) void {
+        self.tier_paused.store(paused, .monotonic);
+    }
+
+    // ---- §2.4 floor law ----
+
+    /// Index-aligned with the registry. Σ floors ≤ 90 % of the budget ⇒
+    /// verbatim; otherwise `floor_i × cap / sum` (proportional, not
+    /// truncation-ordered), observable via `floorsClamped` and ONE warn line
+    /// on the false→true edge — never a mount failure. Budget 0 ⇒ cap 0 ⇒
+    /// every non-zero floor clamps to 0.
+    pub fn effectiveFloors(self: *MemBudget, budget: u64, out: *[max_components]u64) []const u64 {
+        const reg = self.registry();
+        var sum: u64 = 0;
+        for (reg) |*c| sum +|= c.floor;
+        const cap = mulPct(budget, floor_cap_pct);
+        if (sum <= cap or sum == 0) {
+            self.floors_clamped.store(false, .monotonic);
+            for (reg, 0..) |*c, i| out[i] = c.floor;
+            return out[0..reg.len];
+        }
+        if (!self.floors_clamped.swap(true, .monotonic)) {
+            log.warn("mem_budget: component floors sum to {d} B > {d}% of the {d} B budget — floors proportionally clamped (raise --mem-budget or lower component floors)", .{ sum, floor_cap_pct, budget });
+        }
+        for (reg, 0..) |*c, i| out[i] = @intCast(@as(u128, c.floor) * cap / sum);
+        return out[0..reg.len];
+    }
+
+    // ---- §3.1 one tick ----
+
+    /// One sampler tick with injected inputs — the pure form every test
+    /// drives. Order: budget → windows → gauges → pressure → (0-check) →
+    /// tier pause → backstop → level + events → shed.
+    pub fn tickInner(self: *MemBudget, budget_now: u64, rss_sample: u64, unreclaimable_sample: u64) void {
+        self.budget.store(budget_now, .monotonic);
+        const rss_max = pushWindow(&self.rss_window, &self.rss_idx, rss_sample);
+        const unreclaim_max = pushWindow(&self.unreclaim_window, &self.unreclaim_idx, unreclaimable_sample);
+        self.unreclaimable.store(unreclaim_max, .monotonic);
+
+        // Full registry sum = the attribution surface; the pressure basis
+        // excludes kernel-reclaimable components.
+        const reg = self.registry();
+        var gauge_sum: u64 = 0;
+        var pressure_gauges: u64 = 0;
+        for (reg) |*c| {
+            const cur = c.current();
+            gauge_sum +|= cur;
+            if (!c.kernel_reclaimable) pressure_gauges +|= cur;
+        }
+        self.gauge_sum.store(gauge_sum, .monotonic);
+        const pressure_now = @max(pressure_gauges, rss_max, unreclaim_max);
+        self.pressure.store(pressure_now, .monotonic);
+
+        // No budget (off-Linux probe, 0 RAM fact): idle Green with every
+        // escalation cleared — before events and sheds.
+        if (budget_now == 0) {
+            self.level_raw.store(@backingInt(Level.green), .monotonic);
+            self.tier_paused.store(false, .monotonic);
+            self.backstop_over_ticks.store(0, .monotonic);
+            self.backstop_on.store(false, .monotonic);
+            return;
+        }
+
+        // Disk-tier publish pause: the unreclaimable arm ALONE (the dirty-
+        // flood / anon-balloon kill signature). Gauge- or RSS-driven Red must
+        // not pause publishes: logical tier bytes over clean page cache are
+        // kernel-reclaimable. `swap` makes each edge log exactly once.
+        const upct = (unreclaim_max *| 100) / budget_now;
+        if (upct >= red_enter_pct) {
+            if (!self.tier_paused.swap(true, .monotonic)) {
+                log.warn("mem_budget: unreclaimable {d} B >= {d}% of the {d} B budget — disk-tier publishes paused", .{ unreclaim_max, red_enter_pct, budget_now });
+            }
+        } else if (upct < red_exit_pct and self.tier_paused.swap(false, .monotonic)) {
+            log.info("mem_budget: unreclaimable pressure receded — disk-tier publishes resume", .{});
+        }
+
+        // Hard backstop on the WINDOWED unreclaimable max: ≥ 100 % for
+        // `backstop_sustain_ticks` means Red sheds are not converging against
+        // admission. Kernel accounting, not gauges, so it holds when a gauge
+        // undercounts. Any sub-budget tick resets the run; release needs the
+        // window below the Red-exit edge, not merely below 100 %.
+        if (unreclaim_max >= budget_now) {
+            const over = self.backstop_over_ticks.fetchAdd(1, .monotonic) + 1;
+            if (over >= backstop_sustain_ticks and !self.backstop_on.swap(true, .monotonic)) {
+                _ = self.hard_backstops.fetchAdd(1, .monotonic);
+                log.warn("mem_budget: HARD BACKSTOP — unreclaimable {d} B >= the full {d} B budget for {d} consecutive ticks; Red sheds escalate to component floors until the pressure recedes", .{ unreclaim_max, budget_now, over });
+            }
+        } else {
+            self.backstop_over_ticks.store(0, .monotonic);
+            if (upct < red_exit_pct and self.backstop_on.swap(false, .monotonic)) {
+                log.info("mem_budget: hard backstop released", .{});
+            }
+        }
+
+        // The level machine. Red can drop straight to Green.
+        const pct = (pressure_now *| 100) / budget_now;
+        const prev = self.level();
+        const next: Level = switch (prev) {
+            .green => if (pct >= red_enter_pct) .red else if (pct >= yellow_enter_pct) .yellow else .green,
+            .yellow => if (pct >= red_enter_pct) .red else if (pct < yellow_exit_pct) .green else .yellow,
+            .red => if (pct >= red_exit_pct) .red else if (pct >= yellow_exit_pct) .yellow else .green,
+        };
+        if (next != prev) {
+            switch (next) {
+                .yellow => if (prev == .green) {
+                    _ = self.yellow_events.fetchAdd(1, .monotonic);
+                },
+                .red => {
+                    // Entering Red from Green counts both edges.
+                    if (prev == .green) _ = self.yellow_events.fetchAdd(1, .monotonic);
+                    _ = self.red_events.fetchAdd(1, .monotonic);
+                },
+                .green => {},
+            }
+            self.level_raw.store(@backingInt(next), .monotonic);
+        }
+
+        // EVERY Red tick sheds, not just the entry edge. The reference also
+        // purges jemalloc's retained dirty pages here (`arena.4096.purge`);
+        // the std allocators expose no release-to-OS call, so there is no
+        // allocator lever in this port — retained-page drift shows up in the
+        // statm arm.
+        if (next == .red) self.shedToWeights(budget_now, pressure_now, reg);
+    }
+
+    /// Red response: distribute the excess over the 85 % target (or over Σ
+    /// effective floors under the backstop) across sheddable components ∝
+    /// weight, floor-clamped, in ONE pass — a shortfall reappears as
+    /// pressure next tick. The last sheddable component takes the integer
+    /// remainder so cuts sum exactly to the excess when headroom allows.
+    fn shedToWeights(self: *MemBudget, budget_now: u64, pressure_now: u64, reg: []Component) void {
+        var floors_buf: [max_components]u64 = undefined;
+        const floors = self.effectiveFloors(budget_now, &floors_buf);
+        var target_total: u64 = 0;
+        if (self.backstop_on.load(.monotonic)) {
+            for (floors) |f| target_total +|= f;
+        } else {
+            target_total = mulPct(budget_now, shed_target_pct);
+        }
+        if (pressure_now <= target_total) return;
+        var excess = pressure_now - target_total;
+
+        const Sheddable = struct { idx: usize, headroom: u64, weight: u64 };
+        var sheddable: [max_components]Sheddable = undefined;
+        var n: usize = 0;
+        var weight_sum: u64 = 0;
+        var headroom_sum: u64 = 0;
+        for (reg, 0..) |*c, i| {
+            const headroom = c.current() -| floors[i];
+            if (headroom > 0 and c.weight > 0) {
+                weight_sum +|= c.weight;
+                headroom_sum +|= headroom;
+                sheddable[n] = .{ .idx = i, .headroom = headroom, .weight = c.weight };
+                n += 1;
+            }
+        }
+        if (weight_sum == 0) return;
+        // Never ask for more than exists over the floors.
+        excess = @min(excess, headroom_sum);
+        var remaining = excess;
+        for (sheddable[0..n], 0..) |s, k| {
+            const proportional: u64 = @intCast(@as(u128, excess) * s.weight / weight_sum);
+            var share = if (k + 1 == n) remaining else @min(proportional, s.headroom);
+            share = @min(share, s.headroom, remaining);
+            remaining -= share;
+            // At-target components get no call.
+            if (share == 0) continue;
+            const c = &reg[s.idx];
+            const target = c.current() -| share;
+            _ = c.sheds.fetchAdd(1, .monotonic);
+            c.callShed(target);
+        }
+    }
+
+    // ---- live resolution and the production tick ----
+
+    /// flag → `SQUEEZEFS_MEM_BUDGET_MB` → cgroup × 0.8 (re-read NOW) → 70 %
+    /// RAM, system roots divided by the fleet share. Called every tick and
+    /// by mount-time sizers so their footprint agrees with what the sampler
+    /// will enforce.
+    pub fn resolveBudgetNow(self: *const MemBudget, host: Host) u64 {
+        const flag = self.flag_budget.load(.monotonic);
+        return resolveBudgetFromShared(if (flag == 0) null else flag, envBudgetBytes(host.env), readCgroupMemoryMax(), host.facts.total_ram, fleetShare(host.env));
+    }
+
+    /// An explicit tier (flag or absolute env) is engaged — the tiers the
+    /// fleet-share divisor never touches, so the floor refusal stands down.
+    pub fn explicitBudgetEngaged(self: *const MemBudget, env: *const std.process.Environ.Map) bool {
+        return self.flag_budget.load(.monotonic) != 0 or envBudgetBytes(env) != null;
+    }
+
+    /// The mount-time face of `sizing.fleetShareFloorRefusal`; null = mount
+    /// proceeds.
+    pub fn fleetShareMountRefusal(self: *const MemBudget, host: Host, buf: *sizing.RefusalBuf) ?[]const u8 {
+        const share = fleetShare(host.env);
+        if (share <= 1 or self.explicitBudgetEngaged(host.env)) return null;
+        const divided = resolveBudgetFromShared(null, null, readCgroupMemoryMax(), host.facts.total_ram, share);
+        return sizing.fleetShareFloorRefusal(share, divided, host.facts.possible_cpus, buf);
+    }
+
+    /// Production tick: resolve + probe + `tickInputs` + `tickInner`.
+    pub fn tick(self: *MemBudget, host: Host) void {
+        const in = tickInputs(self.resolveBudgetNow(host), readRssBytes(), readCgroupUnreclaimable() orelse 0, fleetShare(host.env));
+        self.tickInner(in.budget, in.rss, in.unreclaimable);
+    }
+
+    // ---- §3.5 the sampler thread ----
+
+    /// Spawn the sampler (mount-time; idempotent — one thread per
+    /// authority). Returns whether THIS call spawned it. The tick runs on its
+    /// own thread, never on a request worker: it does procfs reads plus every
+    /// gauge call, precisely when the daemon is under memory pressure.
+    pub fn spawnSampler(self: *MemBudget, host: Host, period_ns: u64) std.Thread.SpawnError!bool {
+        if (self.sampler_started.swap(true, .acq_rel)) return false;
+        self.sampler_thread = std.Thread.spawn(.{}, samplerMain, .{ self, host, period_ns }) catch |err| {
+            self.sampler_started.store(false, .release);
+            return err;
+        };
+        return true;
+    }
+
+    /// Stop and join the sampler (umount). Wakes the timed wait immediately.
+    pub fn stopSampler(self: *MemBudget, io: std.Io) void {
+        self.sampler_stop.set(io);
+        if (self.sampler_thread) |t| {
+            t.join();
+            self.sampler_thread = null;
+        }
+    }
+
+    fn samplerMain(self: *MemBudget, host: Host, period_ns: u64) void {
+        var name_buf: thread_name.CommBuf = undefined;
+        _ = thread_name.nameCurrentThread(&name_buf, sampler_thread_name);
+        const period: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(period_ns)), .clock = .awake } };
+        while (true) {
+            // Interval semantics: the next period starts after the previous
+            // tick RETURNED (first tick after one full period, no catch-up
+            // bursts, ticks never overlap — the level ladder, the backstop
+            // run and the shed pass are single-tick state machines).
+            if (self.sampler_stop.waitTimeout(host.io, period)) |_| {
+                return;
+            } else |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return,
+            }
+            self.tick(host);
+        }
+    }
+
+    // ---- §5 stats ----
+
+    /// Every spec key as one JSON object; `floor` is the RAW floor, not the
+    /// clamped one.
+    pub fn writeStatsJson(self: *const MemBudget, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{{\"mem_budget_bytes\":{d},\"mem_budget_pressure_bytes\":{d},\"mem_budget_gauge_sum_bytes\":{d},\"mem_budget_level\":{d},", .{ self.budgetBytes(), self.pressureBytes(), self.gaugeSumBytes(), @backingInt(self.level()) });
+        try w.print("\"mem_budget_yellow_events\":{d},\"mem_budget_red_events\":{d},\"mem_budget_floors_clamped\":{},\"mem_budget_unreclaimable_bytes\":{d},", .{ self.yellowEvents(), self.redEvents(), self.floorsClamped(), self.unreclaimableBytes() });
+        try w.print("\"mem_budget_hard_backstops\":{d},\"mem_budget_backstop_active\":{},\"mem_budget_tier_publish_paused\":{},", .{ self.hardBackstops(), self.backstopActive(), self.tierPublishPaused() });
+        try w.writeAll("\"mem_budget_components\":{");
+        for (self.components(), 0..) |*c, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.print("\"{s}\":{{\"current\":{d},\"floor\":{d},\"weight\":{d},\"sheds\":{d}}}", .{ c.name, c.current(), c.floor, c.weight, c.shedCount() });
+        }
+        try w.writeAll("}}");
+    }
+};
+
+/// Overwrite the oldest slot (monotone index mod the length) and return the
+/// max over every slot; zeros count.
+fn pushWindow(window: *[window_len]std.atomic.Value(u64), idx: *std.atomic.Value(usize), sample: u64) u64 {
+    const i = idx.fetchAdd(1, .monotonic) % window_len;
+    window[i].store(sample, .monotonic);
+    var max: u64 = 0;
+    for (window) |*s| max = @max(max, s.load(.monotonic));
+    return max;
+}
+
+/// `v × p / 100` — the reference's integer form for the 85 % shed target and
+/// the 90 % floor cap (multiply first; `derive.pct` truncates to a hundredth
+/// first and would disagree by up to 99 B). Widened so a flag budget near
+/// `u64::MAX` cannot overflow.
+fn mulPct(v: u64, p: u64) u64 {
+    return @intCast(@as(u128, v) * p / 100);
+}
+
+// ---------------------------------------------------------------------------
+// The process authority.
+// ---------------------------------------------------------------------------
+
+/// Consumers register at mount, the sampler ticks it at 1 Hz, growth paths
+/// read `level()`.
+pub var authority: MemBudget = .{};
+
+/// The one-atomic-load admission check (process global).
+pub fn level() Level {
+    return authority.level();
+}
+
+/// Disk-tier publish gate (process global).
+pub fn tierPublishPaused() bool {
+    return authority.tierPublishPaused();
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the contract (spec §9.1 pure tests, §9.3 derivation ties).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test {
+    _ = sizing;
+}
+
+/// The 320 GiB fleet box of the fleet-share ties.
+const fleet_ram: u64 = 320 * GiB;
+
+const ShedLog = struct {
+    const Entry = struct { name: []const u8, target: u64 };
+    entries: [32]Entry = undefined,
+    len: usize = 0,
+
+    fn push(self: *ShedLog, name: []const u8, target: u64) void {
+        self.entries[self.len] = .{ .name = name, .target = target };
+        self.len += 1;
+    }
+    fn clear(self: *ShedLog) void {
+        self.len = 0;
+    }
+    fn find(self: *const ShedLog, name: []const u8) ?u64 {
+        for (self.entries[0..self.len]) |e| if (std.mem.eql(u8, e.name, name)) return e.target;
+        return null;
+    }
+    fn slice(self: *const ShedLog) []const Entry {
+        return self.entries[0..self.len];
+    }
+};
+
+/// A test component: an atomic gauge plus a shed callback that either
+/// records `(name, target)` or clamps the gauge to the target.
+const TestComp = struct {
+    gauge: std.atomic.Value(u64),
+    name: []const u8,
+    shed_log: *ShedLog,
+
+    fn init(name: []const u8, value: u64, shed_log: *ShedLog) TestComp {
+        return .{ .gauge = .init(value), .name = name, .shed_log = shed_log };
+    }
+    fn current(ctx: *anyopaque) u64 {
+        const self: *TestComp = @ptrCast(@alignCast(ctx));
+        return self.gauge.load(.monotonic);
+    }
+    fn record(ctx: *anyopaque, target: u64) void {
+        const self: *TestComp = @ptrCast(@alignCast(ctx));
+        self.shed_log.push(self.name, target);
+    }
+    fn clamp(ctx: *anyopaque, target: u64) void {
+        const self: *TestComp = @ptrCast(@alignCast(ctx));
+        self.gauge.store(target, .monotonic);
+    }
+    fn set(self: *TestComp, v: u64) void {
+        self.gauge.store(v, .monotonic);
+    }
+    fn get(self: *const TestComp) u64 {
+        return self.gauge.load(.monotonic);
+    }
+    /// Shed records the target (the reference tests' `comp` helper).
+    fn recording(self: *TestComp, floor: u64, weight: u64) Component {
+        return Component.init(self.name, floor, weight, .{ .func = .{ .ctx = self, .call = current } }, .{ .ctx = self, .call = record });
+    }
+    /// Shed clamps the gauge (the storm test's working lever).
+    fn clamping(self: *TestComp, floor: u64, weight: u64) Component {
+        return Component.init(self.name, floor, weight, .{ .func = .{ .ctx = self, .call = current } }, .{ .ctx = self, .call = clamp });
+    }
+    /// No shed at all (attribution-only).
+    fn inert(self: *TestComp, floor: u64, weight: u64) Component {
+        return Component.init(self.name, floor, weight, .{ .func = .{ .ctx = self, .call = current } }, null);
+    }
+};
+
+// ---- §1 budget derivation ----
+
+test "budget resolution order: flag > env > cgroup memory.max / 10 * 8 > RAM / 10 * 7" {
+    try testing.expectEqual(2 * GiB, resolveBudgetFrom(2 * GiB, 3 * GiB, 8 * GiB, 64 * GiB));
+    try testing.expectEqual(3 * GiB, resolveBudgetFrom(null, 3 * GiB, 8 * GiB, 64 * GiB));
+    try testing.expectEqual(8 * GiB, resolveBudgetFrom(null, null, 10 * GiB, 64 * GiB));
+    try testing.expectEqual(7 * GiB, resolveBudgetFrom(null, null, null, 10 * GiB));
+    // The integer shape: divide by 10 first, then multiply (never ×0.8 float).
+    const odd: u64 = 25_769_803_777;
+    try testing.expectEqual(odd / 10 * 8, resolveBudgetFrom(null, null, odd, 1));
+    try testing.expectEqual(odd / 10 * 7, resolveBudgetFrom(null, null, null, odd));
+}
+
+test "resolveBudget(facts) tie: explicit MiB > tenths(cgroup, 8) > tenths(ram, 7)" {
+    const facts = derive.Facts.synthetic(32, 251_000_000_000);
+    try testing.expectEqual(3 * GiB, resolveBudget(facts, 3072, 10 * GiB));
+    try testing.expectEqual(derive.tenths(10 * GiB, 8), resolveBudget(facts, null, 10 * GiB));
+    try testing.expectEqual(derive.tenths(251_000_000_000, 7), resolveBudget(facts, null, null));
+    // A 0 RAM fact (off-Linux probe) derives a 0 budget: the authority idles Green.
+    try testing.expectEqual(@as(u64, 0), resolveBudget(derive.Facts.synthetic(1, 0), null, null));
+}
+
+test "fleet share divides the memory ROOT, derived tier only; ceil, never floor" {
+    // 320 GiB ÷ 4 = 80 GiB effective RAM ⇒ 70 % = 56 GiB.
+    try testing.expectEqual(56 * GiB, resolveBudgetFromShared(null, null, null, fleet_ram, 4));
+    // 10 GiB cage ÷ 4 = 2.5 GiB ⇒ × 0.8 = 2 GiB.
+    try testing.expectEqual(2 * GiB, resolveBudgetFromShared(null, null, 10 * GiB, fleet_ram, 4));
+    // Explicit tiers are never divided.
+    try testing.expectEqual(2 * GiB, resolveBudgetFromShared(2 * GiB, 3 * GiB, 8 * GiB, fleet_ram, 4));
+    try testing.expectEqual(3 * GiB, resolveBudgetFromShared(null, 3 * GiB, 8 * GiB, fleet_ram, 4));
+    // fleet_shared_root(v, share) = ceil(v / max(share, 1)).
+    try testing.expectEqual(@as(u64, 3), fleetSharedRoot(10, 4));
+    try testing.expectEqual(@as(u64, 5), fleetSharedRoot(5, 1));
+    try testing.expectEqual(@as(u64, 5), fleetSharedRoot(5, 0));
+    try testing.expectEqual(std.math.maxInt(u64) / 2 + 1, fleetSharedRoot(std.math.maxInt(u64), 2));
+}
+
+test "fleet share 1 is byte-identical to the whole-machine posture" {
+    for ([_]u64{ 4 * GiB, 251_000_000_000, fleet_ram }) |ram| {
+        try testing.expectEqual(resolveBudgetFrom(null, null, null, ram), resolveBudgetFromShared(null, null, null, ram, 1));
+        try testing.expectEqual(resolveBudgetFrom(null, null, 10 * GiB, ram), resolveBudgetFromShared(null, null, 10 * GiB, ram, 1));
+        try testing.expectEqual(resolveBudgetFrom(2 * GiB, null, null, ram), resolveBudgetFromShared(2 * GiB, null, null, ram, 1));
+    }
+}
+
+test "fleet share quarters every divisible derived cap: budget, transport cap, ipc cap" {
+    const whole = resolveBudgetFromShared(null, null, null, fleet_ram, 1);
+    const shared = resolveBudgetFromShared(null, null, null, fleet_ram, 4);
+    try testing.expectEqual(224 * GiB, whole);
+    try testing.expectEqual(56 * GiB, shared);
+    try testing.expectEqual(7 * GiB, sizing.transportBufferCap(shared));
+    try testing.expectEqual(sizing.transportBufferCap(whole) / 4, sizing.transportBufferCap(shared));
+    try testing.expectEqual(7 * GiB, sizing.ipcArenaCap(shared));
+}
+
+test "fleet share floors hold and are never divided at every share" {
+    // The population floor 128 holds for a 32-CPU root at any share.
+    for ([_]u32{ 2, 4, 32, 4096 }) |share| {
+        try testing.expectEqual(@as(u64, 128), sizing.ipcSessionPopulationTarget(@intCast(fleetSharedRoot(32, share))));
+    }
+    try testing.expectEqual(@as(u64, 4), sizing.transport_q_depth_floor);
+    try testing.expectEqual(1 * MiB, sizing.transport_payload_base);
+}
+
+test "tick_inputs divides the unreclaimable sample by the fleet share; budget and RSS pass through" {
+    const solo = tickInputs(2 * GiB, GiB, 5 * GiB, 1);
+    try testing.expectEqual(2 * GiB, solo.budget);
+    try testing.expectEqual(GiB, solo.rss);
+    try testing.expectEqual(5 * GiB, solo.unreclaimable);
+    const fleet = tickInputs(2 * GiB, GiB, 5 * GiB, 32);
+    try testing.expectEqual(2 * GiB, fleet.budget);
+    try testing.expectEqual(GiB, fleet.rss);
+    try testing.expectEqual(5 * GiB / 32, fleet.unreclaimable);
+    try testing.expectEqual(5 * GiB / 32 + 1, tickInputs(2 * GiB, GiB, 5 * GiB + 1, 32).unreclaimable);
+}
+
+test "parked cap halves under Red: max(cap / 2, 1)" {
+    try testing.expectEqual(@as(u64, 256), effectiveParkedCap(256, .green));
+    try testing.expectEqual(@as(u64, 256), effectiveParkedCap(256, .yellow));
+    try testing.expectEqual(@as(u64, 128), effectiveParkedCap(256, .red));
+    try testing.expectEqual(@as(u64, 1), effectiveParkedCap(1, .red));
+    try testing.expectEqual(@as(u64, 1), effectiveParkedCap(0, .red));
+}
+
+test "Level: Green < Yellow < Red; fromU8 maps unknown codes to Green" {
+    try testing.expect(@backingInt(Level.green) < @backingInt(Level.yellow));
+    try testing.expect(@backingInt(Level.yellow) < @backingInt(Level.red));
+    try testing.expectEqual(Level.red, Level.fromU8(2));
+    try testing.expectEqual(Level.yellow, Level.fromU8(1));
+    try testing.expectEqual(Level.green, Level.fromU8(0));
+    try testing.expectEqual(Level.green, Level.fromU8(7));
+}
+
+// ---- §2 component model ----
+
+test "floor sum clamp is proportional and loud; the flag tracks the live budget" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var a = TestComp.init("a", 0, &shed_log);
+    var c = TestComp.init("b", 0, &shed_log);
+    b.register(a.recording(600, 1));
+    b.register(c.recording(300, 1));
+    var out: [max_components]u64 = undefined;
+    // Σ floors = 900 ≤ 0.9 × 1000: verbatim.
+    const f1 = b.effectiveFloors(1000, &out);
+    try testing.expectEqualSlices(u64, &.{ 600, 300 }, f1);
+    try testing.expect(!b.floorsClamped());
+    // Σ floors = 900 > 0.9 × 800 = 720: proportional (× 0.8), not truncation-ordered.
+    const f2 = b.effectiveFloors(800, &out);
+    try testing.expectEqualSlices(u64, &.{ 480, 240 }, f2);
+    try testing.expect(b.floorsClamped());
+    // Budget 0: cap 0 ⇒ every floor clamps to 0.
+    try testing.expectEqualSlices(u64, &.{ 0, 0 }, b.effectiveFloors(0, &out));
+    // Back to a roomy budget: the flag clears.
+    _ = b.effectiveFloors(1000, &out);
+    try testing.expect(!b.floorsClamped());
+}
+
+test "registry: fixed capacity; overflow trips the must-stay-0 tripwire and drops the component" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var comps: [max_components + 1]TestComp = undefined;
+    for (&comps) |*tc| tc.* = TestComp.init("x", 1, &shed_log);
+    for (comps[0..max_components]) |*tc| b.register(tc.inert(0, 0));
+    try testing.expectEqual(max_components, b.components().len);
+    const before = registry_full.load();
+    log.testing.expectErrorLogs(1);
+    b.register(comps[max_components].inert(0, 0));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(before + 1, registry_full.load());
+    try testing.expectEqual(max_components, b.components().len);
+    b.tickInner(1000, 0, 0);
+    try testing.expectEqual(@as(u64, max_components), b.gaugeSumBytes());
+}
+
+test "a counters.Gauge is a component source directly" {
+    var b: MemBudget = .{};
+    var g: counters.Gauge = .{};
+    g.set(420);
+    b.register(Component.init("ledger", 0, 0, .{ .gauge = &g }, null));
+    b.tickInner(1000, 0, 0);
+    try testing.expectEqual(@as(u64, 420), b.pressureBytes());
+    try testing.expectEqual(@as(u64, 420), b.components()[0].current());
+}
+
+// ---- §3 pressure, windows, level machine, escalations ----
+
+test "level transitions: 80/76 and 95/91 hysteresis; entry edges counted once" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var g = TestComp.init("g", 0, &shed_log);
+    b.register(g.recording(0, 1));
+    const steps = [_]struct { p: u64, l: Level }{
+        .{ .p = 790, .l = .green },
+        .{ .p = 800, .l = .yellow }, // enter at ≥ 80 %
+        .{ .p = 940, .l = .yellow },
+        .{ .p = 950, .l = .red }, // enter at ≥ 95 %
+        .{ .p = 920, .l = .red }, // stays Red until < 91 %
+        .{ .p = 905, .l = .yellow },
+        .{ .p = 770, .l = .yellow }, // stays Yellow until < 76 %
+        .{ .p = 759, .l = .green },
+        .{ .p = 800, .l = .yellow },
+        .{ .p = 700, .l = .green },
+    };
+    for (steps) |s| {
+        g.set(s.p);
+        b.tickInner(1000, 0, 0);
+        try testing.expectEqual(s.l, b.level());
+    }
+    try testing.expectEqual(@as(u64, 2), b.yellowEvents());
+    try testing.expectEqual(@as(u64, 1), b.redEvents());
+}
+
+test "entering Red from Green counts both edges; Red can drop straight to Green" {
+    var b: MemBudget = .{};
+    b.tickInner(1000, 990, 0);
+    try testing.expectEqual(Level.red, b.level());
+    try testing.expectEqual(@as(u64, 1), b.yellowEvents());
+    try testing.expectEqual(@as(u64, 1), b.redEvents());
+    for (0..5) |_| b.tickInner(1000, 10, 0);
+    try testing.expectEqual(Level.green, b.level());
+    // Downward moves count nothing.
+    try testing.expectEqual(@as(u64, 1), b.yellowEvents());
+    try testing.expectEqual(@as(u64, 1), b.redEvents());
+}
+
+test "windowed RSS max decays, never ratchets" {
+    var b: MemBudget = .{};
+    b.tickInner(1000, 960, 0);
+    try testing.expectEqual(Level.red, b.level());
+    for (0..4) |_| {
+        b.tickInner(1000, 100, 0);
+        try testing.expectEqual(Level.red, b.level());
+    }
+    b.tickInner(1000, 100, 0);
+    try testing.expectEqual(Level.green, b.level());
+    try testing.expect(b.pressureBytes() <= 100);
+}
+
+test "Red sheds ∝ weight over floors, once per tick; at-floor components get no call; Yellow never sheds" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var a = TestComp.init("a", 500, &shed_log);
+    var bb = TestComp.init("b", 400, &shed_log);
+    var c = TestComp.init("c", 80, &shed_log);
+    b.register(a.recording(100, 3));
+    b.register(bb.recording(100, 1));
+    b.register(c.recording(80, 1));
+    // 980 / 1000 = 98 % ⇒ Red; target 85 % ⇒ excess 130 over {a:3, b:1}; c is at its floor.
+    b.tickInner(1000, 0, 0);
+    try testing.expectEqual(Level.red, b.level());
+    try testing.expectEqual(@as(usize, 2), shed_log.len);
+    try testing.expectEqual(@as(?u64, null), shed_log.find("c"));
+    const ta = shed_log.find("a").?;
+    const tb = shed_log.find("b").?;
+    try testing.expect(ta >= 100 and tb >= 100);
+    const cut_a: i64 = @intCast(500 - ta);
+    const cut_b: i64 = @intCast(400 - tb);
+    try testing.expect(@abs(cut_a - 3 * cut_b) <= 3);
+    try testing.expectEqual(@as(i64, 130), cut_a + cut_b);
+    try testing.expectEqual(@as(u64, 1), b.components()[0].shedCount());
+    try testing.expectEqual(@as(u64, 0), b.components()[2].shedCount());
+    // Yellow must not shed: 980 / 1200 = 82 %.
+    shed_log.clear();
+    b.tickInner(1200, 0, 0);
+    try testing.expectEqual(Level.yellow, b.level());
+    try testing.expectEqual(@as(usize, 0), shed_log.len);
+}
+
+test "shed remainder goes to the last sheddable component so cuts sum exactly to the excess" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var x = TestComp.init("x", 320, &shed_log);
+    var y = TestComp.init("y", 320, &shed_log);
+    var z = TestComp.init("z", 320, &shed_log);
+    b.register(x.recording(0, 1));
+    b.register(y.recording(0, 1));
+    b.register(z.recording(0, 1));
+    // 960 / 1000 ⇒ Red; excess 110 over three equal weights: 36 + 36 + 38.
+    b.tickInner(1000, 0, 0);
+    try testing.expectEqual(@as(u64, 320 - 36), shed_log.find("x").?);
+    try testing.expectEqual(@as(u64, 320 - 36), shed_log.find("y").?);
+    try testing.expectEqual(@as(u64, 320 - 38), shed_log.find("z").?);
+}
+
+test "shed excess is capped by Σ headroom when pressure is RSS-driven and gauges are small" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var g = TestComp.init("g", 150, &shed_log);
+    b.register(g.recording(100, 1));
+    // Pressure 2000 from RSS, excess 1150, but only 50 B of headroom exist.
+    b.tickInner(1000, 2000, 0);
+    try testing.expectEqual(Level.red, b.level());
+    try testing.expectEqual(@as(u64, 100), shed_log.find("g").?);
+    // Weight 0 is never shed even with headroom.
+    var b2: MemBudget = .{};
+    var shed_log2: ShedLog = .{};
+    var h = TestComp.init("h", 900, &shed_log2);
+    b2.register(h.recording(0, 0));
+    b2.tickInner(1000, 990, 0);
+    try testing.expectEqual(Level.red, b2.level());
+    try testing.expectEqual(@as(usize, 0), shed_log2.len);
+}
+
+test "budget 0 short-circuits: Green, escalation state cleared, no events, no sheds; levels still published" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var g = TestComp.init("g", 500, &shed_log);
+    b.register(g.recording(100, 1));
+    for (0..3) |_| b.tickInner(1000, 0, 1100);
+    try testing.expect(b.backstopActive());
+    try testing.expect(b.tierPublishPaused());
+    try testing.expectEqual(Level.red, b.level());
+    shed_log.clear();
+    b.tickInner(0, 0, 1100);
+    try testing.expectEqual(Level.green, b.level());
+    try testing.expect(!b.backstopActive());
+    try testing.expect(!b.tierPublishPaused());
+    try testing.expectEqual(@as(usize, 0), shed_log.len);
+    try testing.expectEqual(@as(u64, 0), b.budgetBytes());
+    try testing.expectEqual(@as(u64, 1100), b.pressureBytes());
+    try testing.expectEqual(@as(u64, 500), b.gaugeSumBytes());
+    const y = b.yellowEvents();
+    const r = b.redEvents();
+    b.tickInner(0, 0, 1100);
+    try testing.expectEqual(y, b.yellowEvents());
+    try testing.expectEqual(r, b.redEvents());
+    // The run counter was cleared: a fresh over-budget run needs 3 ticks again.
+    b.tickInner(1000, 0, 1100);
+    b.tickInner(1000, 0, 1100);
+    try testing.expect(!b.backstopActive());
+    b.tickInner(1000, 0, 1100);
+    try testing.expect(b.backstopActive());
+}
+
+test "lock-free level reads stay valid and immediately visible across 100 ticks" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var g = TestComp.init("g", 990, &shed_log);
+    // Weight 1 with a no-op shed (the in-flight-DMA shape): every tick is Red and sheds.
+    b.register(g.inert(0, 1));
+    const Reader = struct {
+        fn run(mb: *const MemBudget) void {
+            for (0..10_000) |_| {
+                const raw = @backingInt(mb.level());
+                std.debug.assert(raw <= 2);
+            }
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Reader.run, .{&b});
+    for (0..100) |_| b.tickInner(1000, 0, 0);
+    for (threads) |t| t.join();
+    try testing.expectEqual(Level.red, b.level());
+}
+
+test "pressure counts the windowed unreclaimable arm alone; it decays like RSS" {
+    var b: MemBudget = .{};
+    b.tickInner(1000, 0, 960);
+    try testing.expectEqual(Level.red, b.level());
+    try testing.expect(b.pressureBytes() >= 960);
+    try testing.expectEqual(@as(u64, 960), b.unreclaimableBytes());
+    for (0..4) |_| {
+        b.tickInner(1000, 0, 100);
+        try testing.expectEqual(Level.red, b.level());
+    }
+    b.tickInner(1000, 0, 100);
+    try testing.expectEqual(Level.green, b.level());
+    try testing.expect(b.unreclaimableBytes() <= 100);
+}
+
+test "tier-publish pause keys on the unreclaimable arm only, with 95/91 hysteresis" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var g = TestComp.init("hot", 990, &shed_log);
+    b.register(g.recording(0, 1));
+    b.tickInner(1000, 0, 100);
+    try testing.expectEqual(Level.red, b.level());
+    try testing.expect(!b.tierPublishPaused());
+    b.tickInner(1000, 0, 950);
+    try testing.expect(b.tierPublishPaused());
+    g.set(0);
+    for (0..5) |_| b.tickInner(1000, 0, 920);
+    try testing.expect(b.tierPublishPaused());
+    for (0..5) |_| b.tickInner(1000, 0, 900);
+    try testing.expect(!b.tierPublishPaused());
+    // The test seam pins it without a sampler.
+    b.forceTierPublishPausedForTest(true);
+    try testing.expect(b.tierPublishPaused());
+    b.forceTierPublishPausedForTest(false);
+    try testing.expect(!b.tierPublishPaused());
+}
+
+test "hard backstop: 3 consecutive ticks ≥ 100 % collapse the shed target to the floors; release < 91 %" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var a = TestComp.init("a", 500, &shed_log);
+    b.register(a.recording(100, 1));
+    b.tickInner(1000, 0, 1100);
+    b.tickInner(1000, 0, 1100);
+    try testing.expectEqual(Level.red, b.level());
+    try testing.expectEqual(@as(u64, 0), b.hardBackstops());
+    try testing.expect(!b.backstopActive());
+    for (shed_log.slice()) |e| try testing.expect(e.target > 100);
+    shed_log.clear();
+    b.tickInner(1000, 0, 1100);
+    try testing.expectEqual(@as(u64, 1), b.hardBackstops());
+    try testing.expect(b.backstopActive());
+    try testing.expectEqual(@as(u64, 100), shed_log.find("a").?);
+    for (0..5) |_| b.tickInner(1000, 0, 200);
+    try testing.expect(!b.backstopActive());
+    try testing.expectEqual(@as(u64, 1), b.hardBackstops());
+    // A gauge-only overage never trips the backstop.
+    var b2: MemBudget = .{};
+    var phantom = TestComp.init("phantom", 1500, &shed_log);
+    b2.register(phantom.recording(0, 1));
+    for (0..5) |_| b2.tickInner(1000, 0, 100);
+    try testing.expectEqual(Level.red, b2.level());
+    try testing.expectEqual(@as(u64, 0), b2.hardBackstops());
+}
+
+test "backstop subtlety: one over-budget SAMPLE trips on the 3rd tick because the window holds the max" {
+    var b: MemBudget = .{};
+    b.tickInner(1000, 0, 1100);
+    b.tickInner(1000, 0, 10);
+    try testing.expect(!b.backstopActive());
+    b.tickInner(1000, 0, 10);
+    try testing.expect(b.backstopActive());
+    try testing.expectEqual(@as(u64, 1), b.hardBackstops());
+    // Still ≥ 100 % on the 4th and 5th tick; the 6th tick decays below 91 % and releases.
+    b.tickInner(1000, 0, 10);
+    b.tickInner(1000, 0, 10);
+    try testing.expect(b.backstopActive());
+    b.tickInner(1000, 0, 10);
+    try testing.expect(!b.backstopActive());
+    // The run resets on any tick whose window max is below the budget. With
+    // a constant budget the window itself keeps the max ≥ budget for 5
+    // ticks, so only a budget move (a raised cage) can show the reset.
+    var b2: MemBudget = .{};
+    b2.tickInner(1000, 0, 1100); // over = 1
+    b2.tickInner(2000, 0, 10); // 1100 < 2000 ⇒ run reset
+    b2.tickInner(2000, 0, 10);
+    b2.tickInner(2000, 0, 10);
+    b2.tickInner(1000, 0, 10); // the window still holds 1100 ⇒ over = 1
+    try testing.expect(!b2.backstopActive());
+    b2.tickInner(1000, 0, 10); // the spike aged out ⇒ reset again
+    try testing.expect(!b2.backstopActive());
+    try testing.expectEqual(@as(u64, 0), b2.hardBackstops());
+}
+
+test "Red convergence under an admission storm: every tick sheds to ≤ 85 %, the backstop pins the floor" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var storm = TestComp.init("storm", 0, &shed_log);
+    b.register(storm.clamping(100, 1));
+    var post_shed: [6]u64 = undefined;
+    for (&post_shed) |*p| {
+        storm.set(storm.get() + 400);
+        b.tickInner(1000, 0, 1200);
+        p.* = storm.get();
+    }
+    try testing.expectEqual(Level.red, b.level());
+    for (post_shed) |v| try testing.expect(v <= 850);
+    try testing.expect(b.hardBackstops() >= 1);
+    try testing.expectEqual(@as(u64, 100), storm.get());
+}
+
+test "kernel_reclaimable components count in gauge_sum but never in pressure" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var anon = TestComp.init("anon_ish", 400, &shed_log);
+    var tier = TestComp.init("tier_mmap", 5000, &shed_log);
+    b.register(anon.recording(0, 1));
+    b.register(tier.inert(0, 0).kernelReclaimable());
+    b.tickInner(1000, 0, 0);
+    try testing.expectEqual(Level.green, b.level());
+    try testing.expectEqual(@as(u64, 400), b.pressureBytes());
+    try testing.expectEqual(@as(u64, 5400), b.gaugeSumBytes());
+    b.tickInner(1000, 0, 990);
+    try testing.expectEqual(Level.red, b.level());
+}
+
+test "memory.stat parser sums exactly the unreclaimable set; junk and empty degrade to 0" {
+    const fixture =
+        \\anon 1048576
+        \\file 8388608
+        \\kernel 262144
+        \\kernel_stack 65536
+        \\pagetables 131072
+        \\shmem 4096
+        \\file_mapped 2097152
+        \\file_dirty 524288
+        \\file_writeback 262144
+        \\anon_thp 0
+        \\inactive_anon 1000000
+        \\active_anon 48576
+        \\inactive_file 6000000
+        \\active_file 2388608
+        \\unevictable 8192
+        \\slab_reclaimable 100000
+        \\slab_unreclaimable 200000
+        \\slab 300000
+        \\workingset_refault_anon 5
+        \\pgscan 12345
+        \\
+    ;
+    try testing.expectEqual(@as(u64, 1048576 + 524288 + 262144 + 4096 + 8192 + 200000), parseUnreclaimableMemoryStat(fixture));
+    try testing.expectEqual(@as(u64, 0), parseUnreclaimableMemoryStat(""));
+    try testing.expectEqual(@as(u64, 12), parseUnreclaimableMemoryStat("anon garbage\nfile_dirty 12\n"));
+    try testing.expectEqual(@as(u64, 0), parseUnreclaimableMemoryStat("anon\n"));
+}
+
+test "cgroup v2 path, memory.max and statm parsers" {
+    try testing.expectEqualStrings("/user.slice/x", parseCgroupV2Path("12:memory:/foo\n0::/user.slice/x\n").?);
+    try testing.expectEqualStrings("/", parseCgroupV2Path("0::/\n").?);
+    try testing.expectEqual(@as(?[]const u8, null), parseCgroupV2Path("12:memory:/foo\n"));
+    try testing.expectEqual(@as(?[]const u8, null), parseCgroupV2Path(""));
+    try testing.expectEqual(@as(?u64, null), parseMemoryMax("max\n"));
+    try testing.expectEqual(@as(?u64, 17179869184), parseMemoryMax("17179869184\n"));
+    try testing.expectEqual(@as(?u64, null), parseMemoryMax("garbage"));
+    try testing.expectEqual(@as(u64, 307), parseStatmResidentPages("605 307 285 7 0 119 0\n"));
+    try testing.expectEqual(@as(u64, 0), parseStatmResidentPages("605"));
+    try testing.expectEqual(@as(u64, 0), parseStatmResidentPages(""));
+}
+
+// ---- §5 stats surface ----
+
+test "stats JSON carries every spec key with live values" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var g = TestComp.init("hot_block_tier", 960, &shed_log);
+    b.register(g.recording(100, 4));
+    b.tickInner(1000, 0, 0);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try b.writeStatsJson(&w);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqual(@as(i64, 1000), o.get("mem_budget_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 960), o.get("mem_budget_pressure_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 960), o.get("mem_budget_gauge_sum_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 2), o.get("mem_budget_level").?.integer);
+    try testing.expectEqual(@as(i64, 1), o.get("mem_budget_yellow_events").?.integer);
+    try testing.expectEqual(@as(i64, 1), o.get("mem_budget_red_events").?.integer);
+    try testing.expectEqual(false, o.get("mem_budget_floors_clamped").?.bool);
+    try testing.expectEqual(@as(i64, 0), o.get("mem_budget_unreclaimable_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 0), o.get("mem_budget_hard_backstops").?.integer);
+    try testing.expectEqual(false, o.get("mem_budget_backstop_active").?.bool);
+    try testing.expectEqual(false, o.get("mem_budget_tier_publish_paused").?.bool);
+    const comps = o.get("mem_budget_components").?.object;
+    const hot = comps.get("hot_block_tier").?.object;
+    try testing.expectEqual(@as(i64, 960), hot.get("current").?.integer);
+    try testing.expectEqual(@as(i64, 100), hot.get("floor").?.integer);
+    try testing.expectEqual(@as(i64, 4), hot.get("weight").?.integer);
+    try testing.expectEqual(@as(i64, 1), hot.get("sheds").?.integer);
+}
+
+// ---- §6 knob faces ----
+
+test "knob faces: SQUEEZEFS_MEM_BUDGET_MB wins verbatim and undivided; absent falls to the derived tier" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var b: MemBudget = .{};
+    const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(8, 10 * GiB) };
+    try testing.expect(!b.explicitBudgetEngaged(&env));
+    // Off a cgroup the derived tier is 70 % of RAM (on Linux the venue's cage may win; both are the pure form).
+    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(), 10 * GiB, 1), b.resolveBudgetNow(host));
+    try env.put("SQUEEZEFS_MEM_BUDGET_MB", "3072");
+    try testing.expect(b.explicitBudgetEngaged(&env));
+    try testing.expectEqual(3 * GiB, b.resolveBudgetNow(host));
+    try env.put("SQUEEZEFS_FLEET_SHARE", "4");
+    try testing.expectEqual(3 * GiB, b.resolveBudgetNow(host));
+    // The flag beats the env.
+    b.setFlagBudget(2 * GiB);
+    try testing.expectEqual(2 * GiB, b.resolveBudgetNow(host));
+    b.setFlagBudget(0);
+    try testing.expectEqual(3 * GiB, b.resolveBudgetNow(host));
+    // A live tick publishes the resolved budget.
+    b.tick(host);
+    try testing.expectEqual(3 * GiB, b.budgetBytes());
+}
+
+test "knob faces: fleet share floors at 1; parked-gate assist ships at 200 ms; explicit values win" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try testing.expectEqual(@as(u32, 1), fleetShare(&env));
+    try testing.expectEqual(@as(u64, 200), parkedGateAssistMs(&env));
+    try env.put("SQUEEZEFS_FLEET_SHARE", "4");
+    try env.put("SQUEEZEFS_PARKED_GATE_ASSIST_MS", "250");
+    try testing.expectEqual(@as(u32, 4), fleetShare(&env));
+    try testing.expectEqual(@as(u64, 250), parkedGateAssistMs(&env));
+}
+
+test "fleet share mount refusal: share 1 or an explicit tier stands down; a divided root below the floor refuses" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var buf: sizing.RefusalBuf = undefined;
+    var b: MemBudget = .{};
+    // 4096 possible CPUs × 4 × 1 MiB = 16 GiB floor against a 1 GiB RAM root.
+    const tiny = Host{ .io = testing.io, .env = &env, .facts = .{ .cpus = 4096, .possible_cpus = 4096, .page_size = 4096, .total_ram = GiB } };
+    try testing.expectEqual(@as(?[]const u8, null), b.fleetShareMountRefusal(tiny, &buf));
+    try env.put("SQUEEZEFS_FLEET_SHARE", "2");
+    try testing.expect(b.fleetShareMountRefusal(tiny, &buf) != null);
+    try env.put("SQUEEZEFS_MEM_BUDGET_MB", "1");
+    try testing.expectEqual(@as(?[]const u8, null), b.fleetShareMountRefusal(tiny, &buf));
+}
+
+// ---- Linux readers and the sampler thread ----
+
+test "linux: cgroup/proc readers return plausible values" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page: u64 = @intCast(std.heap.pageSize());
+    const rss = readRssBytes();
+    try testing.expect(rss > 0);
+    try testing.expectEqual(@as(u64, 0), rss % page);
+    // The venue kernel is cgroup-v2 only: the unified line is always present.
+    var cg_buf: [4096]u8 = undefined;
+    try testing.expect(parseCgroupV2Path(linuxReadSmallFile("/proc/self/cgroup", &cg_buf).?) != null);
+    // A capped cage reads as a positive byte count (the venue runs under a
+    // 16 GiB cap); an uncapped one as null. Either way the unreclaimable set
+    // of a running process is non-zero (its own anon pages) and plausible.
+    if (readCgroupMemoryMax()) |max| try testing.expect(max > 0);
+    const unreclaimable = readCgroupUnreclaimable().?;
+    try testing.expect(unreclaimable > 0 and unreclaimable < derive.TiB);
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var b: MemBudget = .{};
+    const facts = derive.Facts.probe();
+    const host = Host{ .io = testing.io, .env = &env, .facts = facts };
+    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(), facts.total_ram, 1), b.resolveBudgetNow(host));
+    try testing.expect(b.resolveBudgetNow(host) > 0);
+    b.tick(host);
+    try testing.expect(b.budgetBytes() > 0);
+    // The tick re-samples RSS; it cannot have halved between two reads.
+    try testing.expect(b.pressureBytes() >= rss / 2);
+    try testing.expect(b.unreclaimableBytes() > 0);
+}
+
+test "sampler thread: idempotent spawn, ticks on its period, stops" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("SQUEEZEFS_MEM_BUDGET_MB", "1");
+    var b: MemBudget = .{};
+    const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB) };
+    try testing.expect(try b.spawnSampler(host, 1 * std.time.ns_per_ms));
+    try testing.expect(!try b.spawnSampler(host, 1 * std.time.ns_per_ms));
+    // Bounded wait for two ticks: a wait on a condition, not a timed assumption.
+    const deadline = std.time.ns_per_s * 30;
+    const t0 = std.Io.Timestamp.now(testing.io, .awake);
+    while (b.rss_idx.load(.monotonic) < 2) {
+        try std.Thread.yield();
+        if (t0.durationTo(.now(testing.io, .awake)).nanoseconds > deadline) return error.SamplerNeverTicked;
+    }
+    b.stopSampler(testing.io);
+    try testing.expectEqual(1 * MiB, b.budgetBytes());
+    try testing.expect(@backingInt(b.level()) <= 2);
+}

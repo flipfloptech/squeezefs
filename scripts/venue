@@ -31,7 +31,12 @@ up() {
     echo "venue: $NAME exists; 'container rm -f $NAME' first to recreate" >&2
     return 1
   fi
+  # CAP_IPC_LOCK + unlimited memlock: io_uring fixed-buffer registration
+  # (REGISTER_BUFFERS) pins pages against RLIMIT_MEMLOCK unless the process
+  # holds CAP_IPC_LOCK; without it the venue silently exercises only the
+  # plain-Read fallback and never the ReadFixed leg.
   container run -d --name "$NAME" -c "$CPUS" -m "$MEM" \
+    --cap-add CAP_IPC_LOCK --ulimit memlock=-1:-1 \
     --mount "type=virtiofs,source=$REPO,target=$REPO" \
     --mount "type=virtiofs,source=$REF,target=$REF,readonly" \
     -v "$CACHE_VOL:/build" \

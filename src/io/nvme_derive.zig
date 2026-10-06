@@ -85,8 +85,8 @@ pub const Lanes = struct { read: u32, write: u32 };
 pub fn resolveLanes(env: *const std.process.Environ.Map, cpus: u32, data_devices: u32) Lanes {
     const derived = ioLanesFor(cpus, data_devices);
     return .{
-        .read = knobs.optIntKnob(u32, env, "SQUEEZEFS_NVME_READ_LANES") orelse derived,
-        .write = knobs.optIntKnob(u32, env, "SQUEEZEFS_NVME_WRITE_LANES") orelse derived,
+        .read = knobs.optIntKnob("SQUEEZEFS_NVME_READ_LANES", u32, env) orelse derived,
+        .write = knobs.optIntKnob("SQUEEZEFS_NVME_WRITE_LANES", u32, env) orelse derived,
     };
 }
 
@@ -376,93 +376,13 @@ pub const WakeCoalescer = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Bounded MPMC queue (Vyukov) — the caller → lane channel and the pool
-// free-lists. Producers `tryPush` (never block), the consumer `tryPop`
-// (never blocks): the single park is the ring's `submit_and_wait(1)`.
+// Bounded MPMC queue — the ONE implementation lives in `sync/mpmc.zig`; this
+// is the lane's name for it (the caller → lane channel and the pool
+// free-lists: producers `tryPush`, the consumer `tryPop`, nobody blocks —
+// the single park is the ring's).
 // ---------------------------------------------------------------------------
 
-pub fn BoundedMpmcQueue(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        const Cell = struct {
-            /// Vyukov sequence: `== pos` ⇒ free for the producer at `pos`;
-            /// `== pos + 1` ⇒ filled for the consumer at `pos`.
-            seq: std.atomic.Value(usize),
-            data: T,
-        };
-
-        cells: []Cell,
-        mask: usize,
-        enqueue_pos: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
-        dequeue_pos: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
-
-        /// `cap` is rounded up to a power of two (the Vyukov mask).
-        pub fn init(gpa: std.mem.Allocator, cap: usize) !Self {
-            const n: usize = @intCast(derive.nextPow2(@max(cap, 2)));
-            const cells = try gpa.alloc(Cell, n);
-            for (cells, 0..) |*c, i| c.* = .{ .seq = .init(i), .data = undefined };
-            return .{ .cells = cells, .mask = n - 1 };
-        }
-
-        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
-            gpa.free(self.cells);
-        }
-
-        pub fn capacity(self: *const Self) usize {
-            return self.cells.len;
-        }
-
-        /// False when full. The data store is published by the release
-        /// store of `seq`, paired with the consumer's acquire load. Closing
-        /// is the owner's protocol (a SeqCst flag + in-flight census above
-        /// the queue), not the queue's.
-        pub fn tryPush(self: *Self, item: T) bool {
-            var pos = self.enqueue_pos.load(.monotonic);
-            while (true) {
-                const cell = &self.cells[pos & self.mask];
-                const seq = cell.seq.load(.acquire);
-                const diff = @as(isize, @bitCast(seq)) -% @as(isize, @bitCast(pos));
-                if (diff == 0) {
-                    if (self.enqueue_pos.cmpxchgWeak(pos, pos +% 1, .monotonic, .monotonic)) |actual| {
-                        pos = actual;
-                        continue;
-                    }
-                    cell.data = item;
-                    cell.seq.store(pos +% 1, .release);
-                    return true;
-                } else if (diff < 0) {
-                    return false;
-                } else {
-                    pos = self.enqueue_pos.load(.monotonic);
-                }
-            }
-        }
-
-        /// Null when empty.
-        pub fn tryPop(self: *Self) ?T {
-            var pos = self.dequeue_pos.load(.monotonic);
-            while (true) {
-                const cell = &self.cells[pos & self.mask];
-                const seq = cell.seq.load(.acquire);
-                const diff = @as(isize, @bitCast(seq)) -% @as(isize, @bitCast(pos +% 1));
-                if (diff == 0) {
-                    if (self.dequeue_pos.cmpxchgWeak(pos, pos +% 1, .monotonic, .monotonic)) |actual| {
-                        pos = actual;
-                        continue;
-                    }
-                    const item = cell.data;
-                    cell.seq.store(pos +% self.mask +% 1, .release);
-                    return item;
-                } else if (diff < 0) {
-                    return null;
-                } else {
-                    pos = self.dequeue_pos.load(.monotonic);
-                }
-            }
-        }
-    };
-}
+pub const BoundedMpmcQueue = @import("../sync/mpmc.zig").BoundedMpmc;
 
 // ---------------------------------------------------------------------------
 // Stats (spec §7). Counters are per-thread striped; histograms exact-sum;
@@ -837,63 +757,6 @@ test "wake coalescer: first arm pays, re-arms elide until the worker disarms" {
     try testing.expect(!c.arm());
     c.disarm();
     try testing.expect(c.arm());
-}
-
-test "bounded MPMC queue: FIFO, full refuses, wraps, empty is null" {
-    const Q = BoundedMpmcQueue(u32);
-    var q = try Q.init(testing.allocator, 4);
-    defer q.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 4), q.capacity());
-    try testing.expect(q.tryPush(1));
-    try testing.expect(q.tryPush(2));
-    try testing.expect(q.tryPush(3));
-    try testing.expect(q.tryPush(4));
-    try testing.expect(!q.tryPush(5));
-    try testing.expectEqual(@as(?u32, 1), q.tryPop());
-    try testing.expect(q.tryPush(5));
-    try testing.expectEqual(@as(?u32, 2), q.tryPop());
-    try testing.expectEqual(@as(?u32, 3), q.tryPop());
-    try testing.expectEqual(@as(?u32, 4), q.tryPop());
-    try testing.expectEqual(@as(?u32, 5), q.tryPop());
-    try testing.expectEqual(@as(?u32, null), q.tryPop());
-    // Many wraps keep FIFO exact.
-    var i: u32 = 0;
-    while (i < 1000) : (i += 1) {
-        try testing.expect(q.tryPush(i));
-        try testing.expectEqual(@as(?u32, i), q.tryPop());
-    }
-}
-
-test "bounded MPMC queue: 8 producers × 1 consumer deliver every item exactly once" {
-    const Q = BoundedMpmcQueue(u32);
-    const producers = 8;
-    const per = 2000;
-    var q = try Q.init(testing.allocator, 256);
-    defer q.deinit(testing.allocator);
-    const Producer = struct {
-        fn run(queue: *Q, base: u32) void {
-            var i: u32 = 0;
-            while (i < per) {
-                if (queue.tryPush(base + i)) i += 1 else std.atomic.spinLoopHint();
-            }
-        }
-    };
-    var threads: [producers]std.Thread = undefined;
-    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Producer.run, .{ &q, @as(u32, @intCast(i * per)) });
-    var seen = try testing.allocator.alloc(bool, producers * per);
-    defer testing.allocator.free(seen);
-    @memset(seen, false);
-    var got: usize = 0;
-    while (got < producers * per) {
-        if (q.tryPop()) |v| {
-            try testing.expect(!seen[v]);
-            seen[v] = true;
-            got += 1;
-        } else std.atomic.spinLoopHint();
-    }
-    for (threads) |t| t.join();
-    for (seen) |s| try testing.expect(s);
-    try testing.expectEqual(@as(?u32, null), q.tryPop());
 }
 
 test "fence: no signal never halts; a true signal latches once (one loud log) and stays sticky; dismount is a separate latch" {

@@ -145,12 +145,12 @@ pub fn resolveMaxDirtyNodes(budget_bytes: u64, node_size: u64, explicit: ?u64) u
 
 /// The registry face of `resolveMaxDirtyNodes`.
 pub fn maxDirtyNodesFromEnv(env: *const std.process.Environ.Map, budget_bytes: u64, node_size: u64) u64 {
-    return resolveMaxDirtyNodes(budget_bytes, node_size, knobs.optIntKnob(u64, env, "SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES"));
+    return resolveMaxDirtyNodes(budget_bytes, node_size, knobs.optIntKnob("SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES", u64, env));
 }
 
 /// `SQUEEZEFS_CHECKPOINT_MAX_AGE_MS` (1..=600000, default 1000).
 pub fn maxAgeMsFromEnv(env: *const std.process.Environ.Map) u64 {
-    return knobs.intKnob(u64, env, "SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", CHECKPOINT_MAX_AGE_MS);
+    return knobs.intKnob("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", u64, env);
 }
 
 /// Explicit wins verbatim (0 = strict); derived otherwise.
@@ -162,7 +162,7 @@ pub fn resolveFlushIntervalMs(explicit: ?u64) u64 {
 /// derived default — the ONE reader of the row: the tick period's input
 /// and the journal lane's cadence alike.
 pub fn flushIntervalMsFromEnv(env: *const std.process.Environ.Map) u64 {
-    return resolveFlushIntervalMs(knobs.optIntKnob(u64, env, "SQUEEZEFS_META_FLUSH_INTERVAL_MS"));
+    return resolveFlushIntervalMs(knobs.optIntKnob("SQUEEZEFS_META_FLUSH_INTERVAL_MS", u64, env));
 }
 
 /// The task's tick period: the flush interval verbatim; strict (`0`) reads
@@ -639,7 +639,7 @@ test "dirty-node cap tie: max(4096, budget/32 ÷ node_size); explicit verbatim; 
     const age = knobs.lookup("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS").?;
     try testing.expectEqual(@as(i128, 1), age.kind.int.lo);
     try testing.expectEqual(knobs.MS_MAX, age.kind.int.hi);
-    try testing.expectEqual(knobs.Class.tuning, age.class);
+    try testing.expectEqual(knobs.Class.ab_lever, age.class);
     try testing.expectEqualStrings("1000", age.default);
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();

@@ -5,6 +5,14 @@
 
 const std = @import("std");
 const squeezefs = @import("squeezefs");
+const build_options = @import("build_options");
+
+/// The build identity this binary names (charter §11): train, commit, profile.
+const version: squeezefs.Version = .{
+    .train = build_options.train,
+    .git_commit = build_options.git_commit,
+    .profile = build_options.profile,
+};
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -29,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len >= 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "version"))) {
-        try squeezefs.version.write(stdout);
+        try version.write(stdout);
         try stdout.flush();
         return;
     }

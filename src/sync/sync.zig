@@ -3,7 +3,15 @@
 //! Every primitive takes `io: std.Io` where it parks and allocates nothing
 //! per operation (waiter nodes live on the caller's frame; the bounded
 //! tables are inline). `tick.zig` holds the 2 s ticked-park law they share.
+//!
+//! The lane-class pieces take no `Io` (decision 0001 §4): `futex.zig` is the
+//! ONE futex wrapper (both faces), `mpmc.zig` the ONE bounded MPMC queue and
+//! `completion.zig` the ONE completion cell a caller parks on while a
+//! ring-owning lane runs its request.
 
+pub const futex = @import("futex.zig");
+pub const mpmc = @import("mpmc.zig");
+pub const completion = @import("completion.zig");
 pub const tick = @import("tick.zig");
 pub const rwlock = @import("rwlock.zig");
 pub const mutex = @import("mutex.zig");
@@ -25,8 +33,13 @@ pub const Oneshot = channel.Oneshot;
 pub const Mpsc = channel.Mpsc;
 pub const Watch = channel.Watch;
 pub const TaskSet = taskset.TaskSet;
+pub const BoundedMpmc = mpmc.BoundedMpmc;
+pub const Completion = completion.Completion;
 
 test {
+    _ = futex;
+    _ = mpmc;
+    _ = completion;
     _ = tick;
     _ = rwlock;
     _ = @import("rwlock_model.zig");

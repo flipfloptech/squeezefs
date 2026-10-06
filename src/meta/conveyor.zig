@@ -25,7 +25,7 @@
 //!   liveness flags → A2 ONE ring admission for Σ sizes BEFORE any node
 //!   lock (a parked committer holds no node lock; the park kicks the
 //!   checkpoint task with the park mark and escalates through the
-//!   journal-failure lattice past `SQUEEZEFS_TIMEOUT`) → A3 resolve every
+//!   journal-failure lattice past `PARK_ESCALATION_NS`) → A3 resolve every
 //!   record's leaf latch-free → A4 lock the UNION ascending by address,
 //!   deduped → A5 revalidate every member (any member moved ⇒ drop ALL,
 //!   re-resolve ALL) → A6 heap admission (`heap_law.admitHeapLocked`: a
@@ -121,9 +121,13 @@ pub const BATCH_BYTES_RING_DIVISOR: u64 = 16;
 /// The lock-revalidate retry budget (`COMMIT_RETRY_BUDGET`): SMOs are rare
 /// and serialized, so exhaustion is a protocol bug.
 pub const COMMIT_RETRY_BUDGET: u32 = node.RETRY_BUDGET;
-/// `SQUEEZEFS_TIMEOUT` default: a pass parked longer at ring admission is
-/// the wedged-not-failed class (D1.b audit row 2).
-pub const DEFAULT_TIMEOUT_S: u64 = 30;
+/// A pass parked longer than this at ring admission is the wedged-not-failed
+/// class (D1.b audit row 2): the watchdog's escalation threshold. 30 s is the
+/// reference's measured ceiling on a healthy drain (three orders above the
+/// 1 s checkpoint cadence that frees ring space); a knob for it was a free-
+/// floating constant with an operator in the loop (decision 0003 Q7), and
+/// the per-op timeout wrapper it could resemble is banned (charter §4).
+pub const PARK_ESCALATION_NS: u64 = 30 * std.time.ns_per_s;
 /// The admission park's tick: a LOST-WAKE BACKSTOP only — every barrier
 /// that moves `reusable_upto` notifies the parkers itself
 /// (`checkpoint_cycle.afterDurableBarrier`), whichever thread ran it, so a
@@ -170,14 +174,9 @@ pub fn resolveBatchBytes(explicit: ?u64, ring_user_capacity: u64) u64 {
 pub fn resolveCaps(env: *const std.process.Environ.Map, cpus: u32, geo: jc.CoreGeometry) Caps {
     const cap = ringUserCapacity(geo);
     return .{
-        .max_txs = resolveBatchTxs(knobs.optIntKnob(usize, env, "SQUEEZEFS_META_COMMIT_BATCH_TXS"), cpus),
-        .max_bytes = resolveBatchBytes(knobs.optIntKnob(u64, env, "SQUEEZEFS_META_COMMIT_BATCH_BYTES"), cap),
+        .max_txs = resolveBatchTxs(knobs.optIntKnob("SQUEEZEFS_META_COMMIT_BATCH_TXS", usize, env), cpus),
+        .max_bytes = resolveBatchBytes(knobs.optIntKnob("SQUEEZEFS_META_COMMIT_BATCH_BYTES", u64, env), cap),
     };
-}
-
-/// `SQUEEZEFS_TIMEOUT` in nanoseconds.
-pub fn resolveParkEscalationNs(env: *const std.process.Environ.Map) u64 {
-    return knobs.intKnob(u64, env, "SQUEEZEFS_TIMEOUT", DEFAULT_TIMEOUT_S) * std.time.ns_per_s;
 }
 
 /// Queue cells: one per ring page (on a padded ring every window occupies
@@ -535,7 +534,7 @@ pub const Deps = struct {
     /// entry (never parks behind user admissions; never the lane).
     smo_journal: *smo.SmoJournal,
     caps: Caps,
-    /// `SQUEEZEFS_TIMEOUT`: the park escalation threshold.
+    /// `PARK_ESCALATION_NS`: the park escalation threshold.
     park_escalation_ns: u64,
     framing: tx.KeyFraming,
 };
@@ -861,7 +860,7 @@ pub const Conveyor = struct {
     /// A2 / the re-admission: ONE admission for Σ sizes, parking with NO
     /// node lock held; the park kicks the checkpoint task with the park
     /// mark and escalates through the journal-failure lattice at the
-    /// `SQUEEZEFS_TIMEOUT` crossing (a wedged-not-failed drain). Null ⇒ the
+    /// `PARK_ESCALATION_NS` crossing (a wedged-not-failed drain). Null ⇒ the
     /// batch fails (`err` names why).
     fn admitUserBudget(self: *Conveyor, len: u64, err: *Error) ?jc.Admission {
         const io = self.deps.io;
@@ -1813,9 +1812,7 @@ test "batch caps tie: txs max(64, cpus × 2), bytes max(256 KiB, ring/16) clampe
     const e = resolveCaps(&env, 8, geo);
     try testing.expectEqual(@as(usize, 3), e.max_txs);
     try testing.expectEqual(@as(u64, 8192), e.max_bytes);
-    try testing.expectEqual(@as(u64, 30 * std.time.ns_per_s), resolveParkEscalationNs(&env));
-    try env.put("SQUEEZEFS_TIMEOUT", "2");
-    try testing.expectEqual(@as(u64, 2 * std.time.ns_per_s), resolveParkEscalationNs(&env));
+    try testing.expectEqual(@as(u64, 30 * std.time.ns_per_s), PARK_ESCALATION_NS);
     try testing.expectEqual(@as(usize, 64), queueCapacity(10));
     try testing.expectEqual(@as(usize, 2048), queueCapacity(2048));
     try testing.expectEqual(@as(usize, 8192), queueCapacity(1 << 20));
@@ -1913,7 +1910,7 @@ const Harness = struct {
             .checkpoint = .{ .ctx = h, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowFn, .checkpointPast = checkpointPastFn, .space = &h.space, .posture = &h.posture, .space_retry = &h.space_retry },
             .smo_journal = h.vol.journal,
             .caps = caps orelse .{ .max_txs = deriveBatchTxs(8), .max_bytes = resolveBatchBytes(null, ringUserCapacity(geo)) },
-            .park_escalation_ns = DEFAULT_TIMEOUT_S * std.time.ns_per_s,
+            .park_escalation_ns = PARK_ESCALATION_NS,
             .framing = .flat,
         });
         h.lane.conveyor = h.cv;

@@ -538,7 +538,7 @@ pub const KvBackend = struct {
             .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
             .smo_journal = &be.smo_journal,
             .caps = conveyor.resolveCaps(opts.env, cpus, geo),
-            .park_escalation_ns = conveyor.resolveParkEscalationNs(opts.env),
+            .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
             .framing = .flat,
         });
         errdefer be.cv.deinit();

@@ -11,6 +11,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Notify = @import("notify.zig").Notify;
+const futex = @import("futex.zig");
 
 pub fn OnceCell(comptime T: type) type {
     return struct {
@@ -132,14 +133,14 @@ const Ctx = struct {
 
     fn initializer(c: *Ctx, io: Io) anyerror!u64 {
         const n = c.inits.fetchAdd(1, .acq_rel) + 1;
-        while (c.gate.load(.acquire) == 0) try io.futexWaitTimeout(u32, &c.gate.raw, 0, .none);
+        while (c.gate.load(.acquire) == 0) try futex.ioWaitTimeout(io, &c.gate, 0, null);
         if (c.fail_first and n == 1) return error.LeaderDied;
         return c.value;
     }
 
     fn open(c: *Ctx, io: Io) void {
         c.gate.store(1, .release);
-        io.futexWake(u32, &c.gate.raw, std.math.maxInt(u32));
+        futex.ioWake(io, &c.gate, std.math.maxInt(u32));
     }
 };
 

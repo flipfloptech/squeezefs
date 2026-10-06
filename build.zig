@@ -3,10 +3,15 @@
 //! Two build profiles (charter §11 "Two build profiles"):
 //!   - `gate` (default): the fast dev/gate profile — ReleaseSafe + thin LTO.
 //!     Every assertion and tripwire stays armed; this is what the gate runs.
-//!   - `dist`: fat LTO, ReleaseFast, debug info kept in the binary and then
+//!   - `dist`: ReleaseSafe + fat LTO, debug info kept in the binary and then
 //!     split into `<name>.debug` with a `.gnu_debuglink` by the `dist` step.
+//!     ReleaseSafe, not ReleaseFast (decision 0003 Q8): a true bug aborts
+//!     loud (charter §1.8; decision 0002 row 9) instead of becoming UB; the
+//!     1–3 % the bounds checks cost on the hot paths is a counted A/B at
+//!     rung 9, which must PRECEDE taking the faster posture (charter §1).
 //! The binary names its profile (`squeezefs --version` prints train, commit,
-//! profile — see `build_options`).
+//! profile — `build_options`, imported by `main` alone: the library never
+//! depends on the commit string, so a HEAD move invalidates only the exe).
 //!
 //! Steps:
 //!   zig build              — build the `squeezefs` binary for the host target.
@@ -22,15 +27,10 @@ const Profile = enum { gate, dist };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const profile = b.option(Profile, "profile", "Build profile: gate (default, ReleaseSafe + thin LTO) or dist (ReleaseFast + fat LTO + split debug)") orelse .gate;
-    // The profile picks the optimize mode unless -Doptimize overrides it (tests
-    // want Debug for the best diagnostics; `zig build -Doptimize=Debug test`).
-    const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = switch (profile) {
-            .gate => .ReleaseSafe,
-            .dist => .ReleaseFast,
-        },
-    });
+    const profile = b.option(Profile, "profile", "Build profile: gate (default, ReleaseSafe + thin LTO) or dist (ReleaseSafe + fat LTO + split debug)") orelse .gate;
+    // Both profiles are ReleaseSafe (see the module doc); -Doptimize overrides
+    // it (tests want Debug for the best diagnostics; `zig build -Doptimize=Debug test`).
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
 
     // ---- build identity: train, commit, profile (charter §11 "Versioning") ----
     const build_options = b.addOptions();
@@ -39,14 +39,11 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "git_commit", gitCommit(b));
     const build_options_mod = build_options.createModule();
 
-    // ---- the library module every artifact imports ----
+    // ---- the library module every artifact imports (no build identity) ----
     const squeezefs_mod = b.addModule("squeezefs", .{
         .root_source_file = b.path("src/squeezefs.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "build_options", .module = build_options_mod },
-        },
     });
 
     // ---- the one CLI binary (charter §8) ----

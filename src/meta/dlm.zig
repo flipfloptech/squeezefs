@@ -80,7 +80,7 @@ pub fn resolveStripes(explicit: ?usize, shipped: usize, possible_cpus: usize, q_
 /// clamped to the desired depth, else the desired depth — the transport
 /// supplies it; sizing for the ceiling is the conservative direction).
 pub fn resolveWidth(env: *const std.process.Environ.Map, facts: derive.Facts, q_depth: usize) usize {
-    return resolveStripes(knobs.optIntKnob(usize, env, "SQUEEZEFS_DLM_STRIPES"), dlm_stripes_shipped, facts.possible_cpus, q_depth);
+    return resolveStripes(knobs.optIntKnob("SQUEEZEFS_DLM_STRIPES", usize, env), dlm_stripes_shipped, facts.possible_cpus, q_depth);
 }
 
 // ===========================================================================

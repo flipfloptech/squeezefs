@@ -59,14 +59,14 @@ from the record, `destroy_inodes` batching, `RETRY_BUDGET`/`READER_LOAD_RETRIES`
 
 | Row | Change | Why |
 |---|---|---|
-| 12, 13, 14, 15 | ONE ring-park primitive (`io/ring_park.zig`: eventfd wake + armed READ + EXT_ARG timed park + the coalescer), ONE futex wrapper, ONE `Oneshot` (`sync`), ONE bounded MPMC — used by `uring_fs`, `nvme_dev`, `journal_lane`, and rung 3's `f3-ur` workers; `OwnedRing` either becomes that primitive or goes | §1.9; §9 |
-| 23 | ONE errno table / ONE typed error set across io + meta; backpressure is `EAGAIN`-class, never `EINVAL` | §12 |
-| 4–8 | Knob layer: readers return a diagnostic (no threadlocal `last_error`); readers enforce the row's range (no duplicated defaults); delete `sizing.zig`'s second lenient parser (it clamps `>100` — banned); reclassify the three `derived_override` rows that are A/B levers; `SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS` is not a seam (see Q5) | §1.6 |
-| 3 | Delete the unused `m<x>` mount tag (ends the 13-char truncation) | §1.9 |
-| 10 | `Facts.probe()` is the ONE source of cpus/page size (three modules bypass it); fleet share divides the CPU root too | §1.5 |
-| 18 | cgroup `memory.max`/`memory.high` read along the ANCESTOR chain (a systemd slice cap today falls silently to 70 % RAM) | §1.8 |
-| 24 | `build_options` imported only by `main`, not the library | hygiene |
-| 27 | Rails: the inverse census counts only product readers; the quote scan handles `'"'` | §11 |
+| 12, 13, 14, 15 | ONE ring-park primitive (`io/ring_park.zig`: eventfd wake + armed READ + EXT_ARG timed park + the coalescer), ONE futex wrapper, ONE `Oneshot` (`sync`), ONE bounded MPMC — used by `uring_fs`, `nvme_dev`, `journal_lane`, and rung 3's `sqz-fuse-ur` workers; `OwnedRing` either becomes that primitive or goes | §1.9; §9 — **landed 2026-10-05** (`ring_park.ParkedRing`, `sync/futex.zig`, `sync/completion.zig` — the lane-class cell; `sync.Oneshot` stays the `Io` task channel — `sync/mpmc.zig`; `OwnedRing` deleted; `uring_fs` pools its request cells; the journal lane lives on the primitive; `nvme_dev` — outside WP-C's files — embeds `ParkedRing` and the completion cell in a follow-up) |
+| 23 | ONE errno table / ONE typed error set across io + meta; backpressure is `EAGAIN`-class, never `EINVAL` | §12 — **landed 2026-10-05** (`core/errors.zig`; `uring_fs` adopted; `nvme_derive`/`nvme_dev` and meta adopt by import in the WP-F pass) |
+| 4–8 | Knob layer: readers return a diagnostic (no threadlocal `last_error`); readers enforce the row's range (no duplicated defaults); delete `sizing.zig`'s second lenient parser (it clamps `>100` — banned); reclassify the three `derived_override` rows that are A/B levers; `SQUEEZEFS_TEST_NVME_READ_TIMEOUT_MS` is not a seam (see Q5) | §1.6 — **landed 2026-10-05** (`Parsed(T)`/`Diagnostic`; `comptime key` readers with `intDefault`/`boolDefault`; `Class.tuning` deleted per Q7: `SQUEEZEFS_TIMEOUT` and `SQUEEZEFS_PARKED_GATE_ASSIST_MS` deleted, `CHECKPOINT_MAX_AGE_MS`/`META_FLUSH_INTERVAL_MS`/`NVME_*_LANES`/`DLM_STRIPES` → `ab_lever` naming the arm; the registry test `class == test_seam ⇔ SQUEEZEFS_TEST_ ∧ inert default` is green with Q5's deletion of the timeout row) |
+| 3 | Delete the unused `m<x>` mount tag (ends the 13-char truncation) | §1.9 — **landed 2026-10-05** |
+| 10 | `Facts.probe()` is the ONE source of cpus/page size (three modules bypass it); fleet share divides the CPU root too | §1.5 — **landed 2026-10-05** (`derive.facts()`, `Facts.withFleetShare`; `counters`, `uring_fs`, `budget` route through it; `nvme_dev`'s two bypasses — outside WP-C's files — follow) |
+| 18 | cgroup `memory.max`/`memory.high` read along the ANCESTOR chain (a systemd slice cap today falls silently to 70 % RAM) | §1.8 — **landed 2026-10-05** (`budget.walkCgroupCage`, synthetic-tree tests) |
+| 24 | `build_options` imported only by `main`, not the library | hygiene — **landed 2026-10-05** (+ Q8: `dist` = ReleaseSafe + full LTO) |
+| 27 | Rails: the inverse census counts only product readers; the quote scan handles `'"'` | §11 — **landed 2026-10-05** (`std.zig.Tokenizer` scan; `test`-block depth tracking; `tests/` excluded from product scope) |
 
 KEEP: Tripwire rate limit, the lane reactor shape, fixed buffers only where they pay, the watermark
 barrier, the ring-flag probe ladder, the O_DIRECT posture law and grain ladder, cgroup v2-only, the

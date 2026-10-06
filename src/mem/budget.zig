@@ -24,7 +24,6 @@ pub const sizing = @import("sizing.zig");
 
 const MiB = derive.MiB;
 const GiB = derive.GiB;
-const linux = std.os.linux;
 
 // ---------------------------------------------------------------------------
 // Constants (spec §7), each with its WHY.
@@ -134,21 +133,18 @@ pub fn effectiveParkedCap(cap: u64, level_now: Level) u64 {
 // Knob faces: the registry rows this module consumes.
 // ---------------------------------------------------------------------------
 
-/// `SQUEEZEFS_FLEET_SHARE`, floored at 1 (the gate refuses 0).
-pub fn fleetShare(env: *const std.process.Environ.Map) u32 {
-    return @max(1, knobs.intKnob(u32, env, "SQUEEZEFS_FLEET_SHARE", 1));
+/// The fleet share in force: the `SQUEEZEFS_TEST_FLEET_SHARE` seam when
+/// present, else the per-tick census of squeezefs daemons sharing this
+/// process's cgroup (`censusFleetShare`); 1 off-cgroup or off-Linux.
+pub fn fleetShare(io: std.Io, env: *const std.process.Environ.Map) u32 {
+    if (knobs.optIntKnob("SQUEEZEFS_TEST_FLEET_SHARE", u32, env)) |pinned| return pinned;
+    return readFleetShare(io);
 }
 
 /// `SQUEEZEFS_MEM_BUDGET_MB` × 1 MiB; null when absent.
 fn envBudgetBytes(env: *const std.process.Environ.Map) ?u64 {
-    const mb = knobs.optIntKnob(u64, env, "SQUEEZEFS_MEM_BUDGET_MB") orelse return null;
+    const mb = knobs.optIntKnob("SQUEEZEFS_MEM_BUDGET_MB", u64, env) orelse return null;
     return mb *| MiB;
-}
-
-/// Red parked-gate drain-assist window before a writer self-flushes
-/// (`SQUEEZEFS_PARKED_GATE_ASSIST_MS`, shipped 200 ms).
-pub fn parkedGateAssistMs(env: *const std.process.Environ.Map) u64 {
-    return knobs.intKnob(u64, env, "SQUEEZEFS_PARKED_GATE_ASSIST_MS", 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -188,8 +184,8 @@ pub fn parseCgroupV2Path(text: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `memory.max`: the literal `max` (an uncapped cage) and junk both mean
-/// "no cgroup tier" ⇒ fall to 70 % RAM.
+/// `memory.max` / `memory.high`: the literal `max` (uncapped at this level)
+/// and junk both mean "no cap here".
 pub fn parseMemoryMax(text: []const u8) ?u64 {
     const t = std.mem.trim(u8, text, " \t\r\n");
     if (std.mem.eql(u8, t, "max")) return null;
@@ -204,61 +200,167 @@ pub fn parseStatmResidentPages(text: []const u8) u64 {
     return std.fmt.parseInt(u64, resident, 10) catch 0;
 }
 
-/// cgroup v2 `memory.max` of THIS process, re-read every tick so a
-/// runtime-lowered cage tightens the budget within one tick. Null off-Linux,
-/// off-cgroup, on `max`, or on any read error.
-pub fn readCgroupMemoryMax() ?u64 {
+/// The cage a cgroup v2 path lives in, read along the ANCESTOR chain. A
+/// systemd slice caps the slice and leaves the service leaf at `max`, so
+/// the leaf alone reads "uncapped" and would fall silently to 70 % RAM — the
+/// weaker posture charter §1.8 bans. `max` is the hard cap, `high` the
+/// kernel's throttle point (its own Yellow): the effective cage is the
+/// tightest of both over every level, and `level` names the directory it
+/// came from (relative to the cgroup root; "" = the root itself).
+pub const CgroupCage = struct {
+    max: ?u64 = null,
+    high: ?u64 = null,
+    /// The tightest `memory.max`'s level.
+    max_level: []const u8 = "",
+    /// The tightest `memory.high`'s level.
+    high_level: []const u8 = "",
+
+    /// The value the budget derives from: `min(max, high)`; null = uncapped.
+    pub fn effective(self: CgroupCage) ?u64 {
+        if (self.max) |m| return if (self.high) |h| @min(m, h) else m;
+        return self.high;
+    }
+
+    /// The file and level that bound `effective()` (for the log line).
+    pub fn boundBy(self: CgroupCage) ?struct { file: []const u8, level: []const u8 } {
+        const e = self.effective() orelse return null;
+        if (self.max) |m| if (m == e) return .{ .file = "memory.max", .level = self.max_level };
+        return .{ .file = "memory.high", .level = self.high_level };
+    }
+};
+
+/// Walk `<root><path>`, `<root><parent>`, …, `<root>` reading both files at
+/// each level; `level_buf` holds the bound levels' text. Pure over the
+/// filesystem rooted at `root` so a synthetic tree tests it.
+pub fn walkCgroupCage(io: std.Io, root: []const u8, path: []const u8, level_buf: *[2][std.Io.Dir.max_path_bytes]u8) CgroupCage {
+    var cage: CgroupCage = .{};
+    var lvl = std.mem.trimEnd(u8, path, "/");
+    while (true) {
+        var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var buf: [64]u8 = undefined;
+        if (std.fmt.bufPrint(&file_buf, "{s}{s}/memory.max", .{ root, lvl })) |f| {
+            if (readSmallFile(io, f, &buf)) |text| if (parseMemoryMax(text)) |v| if (cage.max == null or v < cage.max.?) {
+                cage.max = v;
+                cage.max_level = copyLevel(&level_buf[0], lvl);
+            };
+        } else |_| {}
+        if (std.fmt.bufPrint(&file_buf, "{s}{s}/memory.high", .{ root, lvl })) |f| {
+            if (readSmallFile(io, f, &buf)) |text| if (parseMemoryMax(text)) |v| if (cage.high == null or v < cage.high.?) {
+                cage.high = v;
+                cage.high_level = copyLevel(&level_buf[1], lvl);
+            };
+        } else |_| {}
+        if (lvl.len == 0) break;
+        lvl = lvl[0 .. std.mem.lastIndexOfScalar(u8, lvl, '/') orelse 0];
+    }
+    return cage;
+}
+
+fn copyLevel(buf: *[std.Io.Dir.max_path_bytes]u8, lvl: []const u8) []const u8 {
+    @memcpy(buf[0..lvl.len], lvl);
+    return buf[0..lvl.len];
+}
+
+/// The cgroup v2 root every production read starts from.
+pub const cgroup_root = "/sys/fs/cgroup";
+
+/// This process's cage (`walkCgroupCage` from its `/proc/self/cgroup` path),
+/// re-read every tick so a runtime-lowered cap tightens the budget within
+/// one tick. Null off-Linux or off-cgroup.
+pub fn readCgroupCage(io: std.Io, level_buf: *[2][std.Io.Dir.max_path_bytes]u8) ?CgroupCage {
     if (builtin.os.tag != .linux) return null;
-    var buf: [64]u8 = undefined;
-    const text = linuxCgroupFile("memory.max", &buf) orelse return null;
-    return parseMemoryMax(text);
+    var cg_buf: [4096]u8 = undefined;
+    const cg = readSmallFile(io, "/proc/self/cgroup", &cg_buf) orelse return null;
+    const path = parseCgroupV2Path(cg) orelse return null;
+    return walkCgroupCage(io, cgroup_root, path, level_buf);
+}
+
+/// The effective cgroup cap of THIS process (`CgroupCage.effective`).
+pub fn readCgroupMemoryMax(io: std.Io) ?u64 {
+    var level_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
+    return (readCgroupCage(io, &level_buf) orelse return null).effective();
 }
 
 /// cgroup v2 `memory.stat` unreclaimable sample of THIS process; null
 /// off-cgroup (the arm disengages; statm + gauges remain).
-pub fn readCgroupUnreclaimable() ?u64 {
+pub fn readCgroupUnreclaimable(io: std.Io) ?u64 {
     if (builtin.os.tag != .linux) return null;
     // memory.stat is ~60 lines × ~30 B ≈ 2 KiB on the 7.x kernels; 16 KiB
     // leaves room for future keys without a second read.
     var buf: [16 * 1024]u8 = undefined;
-    const text = linuxCgroupFile("memory.stat", &buf) orelse return null;
+    const text = cgroupFile(io, "memory.stat", &buf) orelse return null;
     return parseUnreclaimableMemoryStat(text);
 }
 
-/// `/proc/self/statm` resident pages × page size; 0 off-Linux or on a read
-/// failure.
-pub fn readRssBytes() u64 {
+/// The fleet share census: the pids of `<cgroup_root><path>/cgroup.procs`
+/// whose `<proc_root>/<pid>/comm` equals `my_comm` — the squeezefs daemons
+/// sharing this cage. Floor 1 (this process is one of them). Pure over the
+/// two roots so a synthetic tree tests it; null when the cgroup's process
+/// list is unreadable (the caller falls back to 1, loudly).
+pub fn censusFleetShare(io: std.Io, cgroup_root_dir: []const u8, path: []const u8, proc_root: []const u8, my_comm: []const u8) ?u32 {
+    var file_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const procs_path = std.fmt.bufPrint(&file_buf, "{s}{s}/cgroup.procs", .{ cgroup_root_dir, std.mem.trimEnd(u8, path, "/") }) catch return null;
+    // A cage with thousands of pids is not a daemon's: 64 KiB of pids
+    // (~8k entries) is the most this census needs to see.
+    var procs_buf: [64 * 1024]u8 = undefined;
+    const procs = readSmallFile(io, procs_path, &procs_buf) orelse return null;
+    var n: u32 = 0;
+    var lines = std.mem.tokenizeAny(u8, procs, " \t\r\n");
+    while (lines.next()) |pid| {
+        var comm_path: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const cp = std.fmt.bufPrint(&comm_path, "{s}/{s}/comm", .{ proc_root, pid }) catch continue;
+        var comm_buf: [64]u8 = undefined;
+        const comm = readSmallFile(io, cp, &comm_buf) orelse continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, comm, " \t\r\n"), my_comm)) n += 1;
+    }
+    return @max(n, 1);
+}
+
+var fleet_census_warned: std.atomic.Value(bool) = .init(false);
+
+/// This process's fleet share from the census of its own cgroup; 1 off-Linux
+/// or off-cgroup (the cage already divides); 1 with ONE warning when the
+/// process list is unreadable.
+pub fn readFleetShare(io: std.Io) u32 {
+    if (builtin.os.tag != .linux) return 1;
+    var cg_buf: [4096]u8 = undefined;
+    const cg = readSmallFile(io, "/proc/self/cgroup", &cg_buf) orelse return 1;
+    const path = parseCgroupV2Path(cg) orelse return 1;
+    var comm_buf: [64]u8 = undefined;
+    const my_comm = std.mem.trim(u8, readSmallFile(io, "/proc/self/comm", &comm_buf) orelse return 1, " \t\r\n");
+    return censusFleetShare(io, cgroup_root, path, "/proc", my_comm) orelse {
+        if (!fleet_census_warned.swap(true, .monotonic)) {
+            log.warn("mem_budget: {s}{s}/cgroup.procs is unreadable — fleet share falls back to 1 (the whole-machine posture; co-located daemons will not divide the roots)", .{ cgroup_root, path });
+        }
+        return 1;
+    };
+}
+
+/// `/proc/self/statm` resident pages × the page size; 0 off-Linux or on a
+/// read failure.
+pub fn readRssBytes(io: std.Io, page_size: u64) u64 {
     if (builtin.os.tag != .linux) return 0;
     var buf: [256]u8 = undefined;
-    const text = linuxReadSmallFile("/proc/self/statm", &buf) orelse return 0;
-    return parseStatmResidentPages(text) * @as(u64, @intCast(std.heap.pageSize()));
+    const text = readSmallFile(io, "/proc/self/statm", &buf) orelse return 0;
+    return parseStatmResidentPages(text) * page_size;
 }
 
 /// `/sys/fs/cgroup<path>/<leaf>` for this process's v2 cgroup.
-fn linuxCgroupFile(comptime leaf: []const u8, buf: []u8) ?[]const u8 {
+fn cgroupFile(io: std.Io, comptime leaf: []const u8, buf: []u8) ?[]const u8 {
     var cg_buf: [4096]u8 = undefined;
-    const cg = linuxReadSmallFile("/proc/self/cgroup", &cg_buf) orelse return null;
+    const cg = readSmallFile(io, "/proc/self/cgroup", &cg_buf) orelse return null;
     const path = parseCgroupV2Path(cg) orelse return null;
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const full = std.mem.printSentinel(&path_buf, "/sys/fs/cgroup{s}/" ++ leaf, .{path}, 0) catch return null;
-    return linuxReadSmallFile(full, buf);
+    const full = std.fmt.bufPrint(&path_buf, cgroup_root ++ "{s}/" ++ leaf, .{path}) catch return null;
+    return readSmallFile(io, full, buf);
 }
 
-/// Read a procfs/sysfs file into `buf` (these files report their size as 0,
-/// so read until EOF or the buffer is full); null on any error.
-fn linuxReadSmallFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
-    const fd_raw = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return null;
-    const fd: linux.fd_t = @intCast(fd_raw);
-    defer _ = linux.close(fd);
-    var len: usize = 0;
-    while (len < buf.len) {
-        const n_raw = linux.read(fd, buf[len..].ptr, buf.len - len);
-        if (linux.errno(n_raw) != .SUCCESS) return null;
-        if (n_raw == 0) break;
-        len += n_raw;
-    }
-    return buf[0..len];
+/// Read a procfs/sysfs-class file into `buf` (these files report their size
+/// as 0, so read until EOF or the buffer is full); null on any error. The
+/// sampler is not a hot path, so it reads through the `Io` like every other
+/// non-hot-path I/O (decision 0001).
+fn readSmallFile(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {
+    return std.Io.Dir.cwd().readFile(io, path, buf) catch null;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +454,8 @@ pub const MemBudget = struct {
     count: std.atomic.Value(usize) = .init(0),
 
     flag_budget: std.atomic.Value(u64) = .init(0),
+    /// The effective cgroup cage of the last resolution (0 = uncapped).
+    cgroup_cap: std.atomic.Value(u64) = .init(0),
     budget: std.atomic.Value(u64) = .init(0),
     pressure: std.atomic.Value(u64) = .init(0),
     gauge_sum: std.atomic.Value(u64) = .init(0),
@@ -624,13 +728,34 @@ pub const MemBudget = struct {
 
     // ---- live resolution and the production tick ----
 
-    /// flag → `SQUEEZEFS_MEM_BUDGET_MB` → cgroup × 0.8 (re-read NOW) → 70 %
-    /// RAM, system roots divided by the fleet share. Called every tick and
-    /// by mount-time sizers so their footprint agrees with what the sampler
-    /// will enforce.
-    pub fn resolveBudgetNow(self: *const MemBudget, host: Host) u64 {
+    /// flag → `SQUEEZEFS_MEM_BUDGET_MB` → cgroup cage × 0.8 (re-read NOW,
+    /// along the ancestor chain) → 70 % RAM, system roots divided by the
+    /// fleet share. Called every tick and by mount-time sizers so their
+    /// footprint agrees with what the sampler will enforce. The binding
+    /// cgroup level is logged when it changes.
+    pub fn resolveBudgetNow(self: *MemBudget, host: Host) u64 {
         const flag = self.flag_budget.load(.monotonic);
-        return resolveBudgetFromShared(if (flag == 0) null else flag, envBudgetBytes(host.env), readCgroupMemoryMax(), host.facts.total_ram, fleetShare(host.env));
+        var level_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
+        const cage = readCgroupCage(host.io, &level_buf);
+        self.noteCage(cage);
+        return resolveBudgetFromShared(if (flag == 0) null else flag, envBudgetBytes(host.env), if (cage) |c| c.effective() else null, host.facts.total_ram, fleetShare(host.io, host.env));
+    }
+
+    /// Publish the cage and log the level that binds it on every change
+    /// (never per tick).
+    fn noteCage(self: *MemBudget, cage: ?CgroupCage) void {
+        const effective: u64 = if (cage) |c| c.effective() orelse 0 else 0;
+        if (self.cgroup_cap.swap(effective, .monotonic) == effective) return;
+        if (cage) |c| if (c.boundBy()) |b| {
+            log.info("mem_budget: cgroup cage {d} B bound by {s}{s}/{s}", .{ effective, cgroup_root, b.level, b.file });
+            return;
+        };
+        log.info("mem_budget: no cgroup cage (uncapped at every level) — the derived tier is 70 % of RAM", .{});
+    }
+
+    /// The effective cgroup cage the last resolution saw (0 = uncapped).
+    pub fn cgroupCapBytes(self: *const MemBudget) u64 {
+        return self.cgroup_cap.load(.monotonic);
     }
 
     /// An explicit tier (flag or absolute env) is engaged — the tiers the
@@ -642,15 +767,15 @@ pub const MemBudget = struct {
     /// The mount-time face of `sizing.fleetShareFloorRefusal`; null = mount
     /// proceeds.
     pub fn fleetShareMountRefusal(self: *const MemBudget, host: Host, buf: *sizing.RefusalBuf) ?[]const u8 {
-        const share = fleetShare(host.env);
+        const share = fleetShare(host.io, host.env);
         if (share <= 1 or self.explicitBudgetEngaged(host.env)) return null;
-        const divided = resolveBudgetFromShared(null, null, readCgroupMemoryMax(), host.facts.total_ram, share);
+        const divided = resolveBudgetFromShared(null, null, readCgroupMemoryMax(host.io), host.facts.total_ram, share);
         return sizing.fleetShareFloorRefusal(share, divided, host.facts.possible_cpus, buf);
     }
 
     /// Production tick: resolve + probe + `tickInputs` + `tickInner`.
     pub fn tick(self: *MemBudget, host: Host) void {
-        const in = tickInputs(self.resolveBudgetNow(host), readRssBytes(), readCgroupUnreclaimable() orelse 0, fleetShare(host.env));
+        const in = tickInputs(self.resolveBudgetNow(host), readRssBytes(host.io, host.facts.page_size), readCgroupUnreclaimable(host.io) orelse 0, fleetShare(host.io, host.env));
         self.tickInner(in.budget, in.rss, in.unreclaimable);
     }
 
@@ -1354,11 +1479,11 @@ test "knob faces: SQUEEZEFS_MEM_BUDGET_MB wins verbatim and undivided; absent fa
     const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(8, 10 * GiB) };
     try testing.expect(!b.explicitBudgetEngaged(&env));
     // Off a cgroup the derived tier is 70 % of RAM (on Linux the venue's cage may win; both are the pure form).
-    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(), 10 * GiB, 1), b.resolveBudgetNow(host));
+    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(testing.io), 10 * GiB, 1), b.resolveBudgetNow(host));
     try env.put("SQUEEZEFS_MEM_BUDGET_MB", "3072");
     try testing.expect(b.explicitBudgetEngaged(&env));
     try testing.expectEqual(3 * GiB, b.resolveBudgetNow(host));
-    try env.put("SQUEEZEFS_FLEET_SHARE", "4");
+    try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "4");
     try testing.expectEqual(3 * GiB, b.resolveBudgetNow(host));
     // The flag beats the env.
     b.setFlagBudget(2 * GiB);
@@ -1370,16 +1495,94 @@ test "knob faces: SQUEEZEFS_MEM_BUDGET_MB wins verbatim and undivided; absent fa
     try testing.expectEqual(3 * GiB, b.budgetBytes());
 }
 
-test "knob faces: fleet share floors at 1; parked-gate assist ships at 200 ms; explicit values win" {
+test "knob faces: the fleet share is the census unless the SQUEEZEFS_TEST_FLEET_SHARE seam pins it; out of range is ignored loudly" {
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    try testing.expectEqual(@as(u32, 1), fleetShare(&env));
-    try testing.expectEqual(@as(u64, 200), parkedGateAssistMs(&env));
-    try env.put("SQUEEZEFS_FLEET_SHARE", "4");
-    try env.put("SQUEEZEFS_PARKED_GATE_ASSIST_MS", "250");
-    try testing.expectEqual(@as(u32, 4), fleetShare(&env));
-    try testing.expectEqual(@as(u64, 250), parkedGateAssistMs(&env));
+    // Absent: the census (this test process alone in its cage, or off-cgroup) — never 0.
+    try testing.expect(fleetShare(testing.io, &env) >= 1);
+    try testing.expectEqual(readFleetShare(testing.io), fleetShare(testing.io, &env));
+    try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "4");
+    try testing.expectEqual(@as(u32, 4), fleetShare(testing.io, &env));
+    try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "0");
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(readFleetShare(testing.io), fleetShare(testing.io, &env));
+    try log.testing.expectAllFired();
+}
+
+test "fleet census over a synthetic tree: only pids whose comm is ours count; floor 1; an unreadable list is null" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var cg_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cg_root = try std.fmt.bufPrint(&cg_root_buf, "{s}/cgroup", .{root});
+    var proc_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const proc_root = try std.fmt.bufPrint(&proc_root_buf, "{s}/proc", .{root});
+    try tmp.dir.createDirPath(testing.io, "cgroup/sqz.slice/a.service");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "cgroup/sqz.slice/a.service/cgroup.procs", .data = "100\n101\n102\n7\n" });
+    for ([_]struct { pid: []const u8, comm: []const u8 }{ .{ .pid = "100", .comm = "squeezefs\n" }, .{ .pid = "101", .comm = "squeezefs\n" }, .{ .pid = "102", .comm = "bash\n" } }) |e| {
+        var dir_buf: [64]u8 = undefined;
+        try tmp.dir.createDirPath(testing.io, try std.fmt.bufPrint(&dir_buf, "proc/{s}", .{e.pid}));
+        var file_buf: [64]u8 = undefined;
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&file_buf, "proc/{s}/comm", .{e.pid}), .data = e.comm });
+    }
+    // Two squeezefs daemons, one bash, one pid without a /proc entry (exited).
+    try testing.expectEqual(@as(?u32, 2), censusFleetShare(testing.io, cg_root, "/sqz.slice/a.service", proc_root, "squeezefs"));
+    // Nobody with our comm: the floor is 1 (this process is one).
+    try testing.expectEqual(@as(?u32, 1), censusFleetShare(testing.io, cg_root, "/sqz.slice/a.service", proc_root, "nothing"));
+    // An unreadable process list is null: the caller falls back to 1 loudly.
+    try testing.expectEqual(@as(?u32, null), censusFleetShare(testing.io, cg_root, "/sqz.slice/missing", proc_root, "squeezefs"));
+}
+
+test "cgroup cage walks the ancestor chain: a slice cap binds over an uncapped leaf; memory.high tightens; the binding level is named" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    try tmp.dir.createDirPath(testing.io, "sqz.slice/a.service");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "memory.max", .data = "max\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sqz.slice/memory.max", .data = "17179869184\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sqz.slice/a.service/memory.max", .data = "max\n" });
+    var level_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
+    // The leaf alone reads uncapped; the walk finds the slice's 16 GiB.
+    const slice_bound = walkCgroupCage(testing.io, root, "/sqz.slice/a.service", &level_buf);
+    try testing.expectEqual(@as(?u64, 16 * GiB), slice_bound.max);
+    try testing.expectEqual(@as(?u64, null), slice_bound.high);
+    try testing.expectEqual(@as(?u64, 16 * GiB), slice_bound.effective());
+    try testing.expectEqualStrings("/sqz.slice", slice_bound.max_level);
+    try testing.expectEqualStrings("memory.max", slice_bound.boundBy().?.file);
+    // A tighter leaf cap wins over the slice.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sqz.slice/a.service/memory.max", .data = "4294967296\n" });
+    const leaf_bound = walkCgroupCage(testing.io, root, "/sqz.slice/a.service", &level_buf);
+    try testing.expectEqual(@as(?u64, 4 * GiB), leaf_bound.effective());
+    try testing.expectEqualStrings("/sqz.slice/a.service", leaf_bound.max_level);
+    // memory.high at the root tightens below every max: it is the kernel's own Yellow.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "memory.high", .data = "2147483648\n" });
+    const high_bound = walkCgroupCage(testing.io, root, "/sqz.slice/a.service", &level_buf);
+    try testing.expectEqual(@as(?u64, 4 * GiB), high_bound.max);
+    try testing.expectEqual(@as(?u64, 2 * GiB), high_bound.high);
+    try testing.expectEqual(@as(?u64, 2 * GiB), high_bound.effective());
+    try testing.expectEqualStrings("", high_bound.high_level);
+    try testing.expectEqualStrings("memory.high", high_bound.boundBy().?.file);
+    // The root cgroup itself ("/") and a trailing slash read the same tree; junk is "no cap here".
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sqz.slice/memory.high", .data = "garbage\n" });
+    try testing.expectEqual(@as(?u64, 2 * GiB), walkCgroupCage(testing.io, root, "/sqz.slice/a.service/", &level_buf).effective());
+    try testing.expectEqual(@as(?u64, 2 * GiB), walkCgroupCage(testing.io, root, "/", &level_buf).effective());
+    // Uncapped everywhere: null, so the budget falls to 70 % RAM — never silently from a capped slice.
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var root2_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root2_len = try tmp2.dir.realPath(testing.io, &root2_buf);
+    try tmp2.dir.createDirPath(testing.io, "x");
+    try tmp2.dir.writeFile(testing.io, .{ .sub_path = "x/memory.max", .data = "max\n" });
+    const none = walkCgroupCage(testing.io, root2_buf[0..root2_len], "/x", &level_buf);
+    try testing.expectEqual(@as(?u64, null), none.effective());
+    try testing.expect(none.boundBy() == null);
+    // The resolution tie: the slice-bound cage × 0.8, not 70 % of RAM.
+    try testing.expectEqual(derive.tenths(16 * GiB, 8), resolveBudgetFromShared(null, null, slice_bound.effective(), 320 * GiB, 1));
 }
 
 test "fleet share mount refusal: share 1 or an explicit tier stands down; a divided root below the floor refuses" {
@@ -1391,7 +1594,7 @@ test "fleet share mount refusal: share 1 or an explicit tier stands down; a divi
     // 4096 possible CPUs × 4 × 1 MiB = 16 GiB floor against a 1 GiB RAM root.
     const tiny = Host{ .io = testing.io, .env = &env, .facts = .{ .cpus = 4096, .possible_cpus = 4096, .page_size = 4096, .total_ram = GiB } };
     try testing.expectEqual(@as(?[]const u8, null), b.fleetShareMountRefusal(tiny, &buf));
-    try env.put("SQUEEZEFS_FLEET_SHARE", "2");
+    try env.put("SQUEEZEFS_TEST_FLEET_SHARE", "2");
     try testing.expect(b.fleetShareMountRefusal(tiny, &buf) != null);
     try env.put("SQUEEZEFS_MEM_BUDGET_MB", "1");
     try testing.expectEqual(@as(?[]const u8, null), b.fleetShareMountRefusal(tiny, &buf));
@@ -1401,18 +1604,20 @@ test "fleet share mount refusal: share 1 or an explicit tier stands down; a divi
 
 test "linux: cgroup/proc readers return plausible values" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const page: u64 = @intCast(std.heap.pageSize());
-    const rss = readRssBytes();
+    const page: u64 = derive.facts().page_size;
+    const rss = readRssBytes(testing.io, page);
     try testing.expect(rss > 0);
     try testing.expectEqual(@as(u64, 0), rss % page);
     // The venue kernel is cgroup-v2 only: the unified line is always present.
     var cg_buf: [4096]u8 = undefined;
-    try testing.expect(parseCgroupV2Path(linuxReadSmallFile("/proc/self/cgroup", &cg_buf).?) != null);
+    try testing.expect(parseCgroupV2Path(readSmallFile(testing.io, "/proc/self/cgroup", &cg_buf).?) != null);
     // A capped cage reads as a positive byte count (the venue runs under a
     // 16 GiB cap); an uncapped one as null. Either way the unreclaimable set
     // of a running process is non-zero (its own anon pages) and plausible.
-    if (readCgroupMemoryMax()) |max| try testing.expect(max > 0);
-    const unreclaimable = readCgroupUnreclaimable().?;
+    if (readCgroupMemoryMax(testing.io)) |max| try testing.expect(max > 0);
+    // The census sees at least this process.
+    try testing.expect(readFleetShare(testing.io) >= 1);
+    const unreclaimable = readCgroupUnreclaimable(testing.io).?;
     try testing.expect(unreclaimable > 0 and unreclaimable < derive.TiB);
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
@@ -1420,7 +1625,7 @@ test "linux: cgroup/proc readers return plausible values" {
     var b: MemBudget = .{};
     const facts = derive.Facts.probe();
     const host = Host{ .io = testing.io, .env = &env, .facts = facts };
-    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(), facts.total_ram, 1), b.resolveBudgetNow(host));
+    try testing.expectEqual(resolveBudgetFromShared(null, null, readCgroupMemoryMax(testing.io), facts.total_ram, 1), b.resolveBudgetNow(host));
     try testing.expect(b.resolveBudgetNow(host) > 0);
     b.tick(host);
     try testing.expect(b.budgetBytes() > 0);

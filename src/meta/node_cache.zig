@@ -140,8 +140,8 @@ pub fn resolveNodeCacheBudget(budget_bytes: u64, mb: ?u64, pct: ?u64) u64 {
 pub fn nodeCacheBudgetFromEnv(env: *const std.process.Environ.Map, budget_bytes: u64) u64 {
     return resolveNodeCacheBudget(
         budget_bytes,
-        knobs.optIntKnob(u64, env, "SQUEEZEFS_META_NODE_CACHE_MB"),
-        knobs.optIntKnob(u64, env, "SQUEEZEFS_META_NODE_CACHE_PCT"),
+        knobs.optIntKnob("SQUEEZEFS_META_NODE_CACHE_MB", u64, env),
+        knobs.optIntKnob("SQUEEZEFS_META_NODE_CACHE_PCT", u64, env),
     );
 }
 

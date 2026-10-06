@@ -3,12 +3,16 @@
 //! `docs/porting/uring_fs.md`). Linux only.
 //!
 //! Shape: N worker threads, each owning ONE plain io_uring, consuming ONE
-//! shared bounded MPMC queue of requests. A caller pushes a request carrying a
-//! futex oneshot and parks on it; the worker burst-admits, builds one SQE per
-//! op, `submit_and_wait(1)`, reaps, resubmits short reads/writes from the reap
-//! pass, and completes the oneshots. The owned-ring variant (`OwnedRing`)
-//! reuses the same reactor on the thread that also awaits completions (the
-//! journal lane) and parks in `io_uring_enter` with an eventfd READ armed.
+//! shared bounded MPMC queue of request-cell indices. A caller fills a
+//! preallocated cell (the cell pool and the queue share one bound, so a held
+//! cell always has a queue slot), pushes its index and parks on the cell's
+//! completion; the worker burst-admits, builds one SQE per op,
+//! `submit_and_wait(1)`, reaps, resubmits short reads/writes from the reap
+//! pass, and completes the cells. Nothing is allocated per op for the
+//! handshake (charter §12); a batch's prepared-op array is the one per-batch
+//! allocation. Ring-owning lanes that park in their own ring are
+//! `io/ring_park.zig`'s business (the journal lane); this pool parks idle
+//! workers on the queue's futex word.
 //!
 //! The posture law (charter §5.1) is applied on the CALLER's thread before a
 //! request is queued: a misaligned product write is refused (tripwire), a
@@ -39,9 +43,13 @@ const align_probe = @import("align_probe.zig");
 const clock = @import("../core/clock.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
+const errors = @import("../core/errors.zig");
 const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const thread_name = @import("../core/thread_name.zig");
+const completion = @import("../sync/completion.zig");
+const futex = @import("../sync/futex.zig");
+const mpmc = @import("../sync/mpmc.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("uring_fs is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -51,9 +59,9 @@ comptime {
 // Constants (`docs/porting/uring_fs.md` §7).
 // ---------------------------------------------------------------------------
 
-/// Backpressure, not custody: the queue holds small request structs while the
-/// payload bytes stay with the caller until service. Parity with
-/// `nvme_dev`'s request queue. Power of two for the MPMC ring arithmetic.
+/// Backpressure, not custody: the queue holds request-cell indices while the
+/// payload bytes stay with the caller until service; the cell pool is this
+/// deep too (one bound). Parity with `nvme_dev`'s request queue.
 pub const queue_cap: usize = 4096;
 
 /// SQ depth per worker ring; the kernel sizes the CQ at 2×.
@@ -62,16 +70,6 @@ pub const ring_entries: u16 = 512;
 /// Max ops a worker admits/keeps in flight. Continuations reuse their slot,
 /// so SQ pressure is bounded by this plus one burst of resubmits.
 pub const admit_cap: usize = 256;
-
-/// The journal lane's owned ring: a window's entries (≤ the commit batch cap,
-/// each one or two segment SQEs plus its owned page headers) plus the wake
-/// READ.
-pub const journal_ring_entries: u16 = 512;
-
-/// `user_data` of the owned ring's eventfd READ: never a slot index (slots
-/// are small integers). `u64::MAX − 1` stays reserved for the fault shim's
-/// linked timeout so a future seam cannot collide either.
-pub const wake_ud: u64 = std.math.maxInt(u64);
 
 /// `clamp(cpus/4, 4, 64)`: cpus/4 is the measured drain-thread slope; floor 4
 /// is the shipped floor (Hang-1 "pinned-first-toucher sizing poison" — a tiny
@@ -90,7 +88,7 @@ pub fn fdCacheCapFrom(nofile_soft: u64, workers: u32) u32 {
 }
 
 /// Worker thread base name; `sqz-uring-fs` + two digits fits the kernel's 15
-/// visible comm chars untagged (12 + 2 = 14).
+/// visible comm chars (12 + 2 = 14).
 pub fn workerBase(buf: *[24]u8, index: u32) []const u8 {
     return std.fmt.bufPrint(buf, "sqz-uring-fs{d}", .{index}) catch unreachable;
 }
@@ -122,7 +120,7 @@ pub const Config = struct {
     /// The product's derivation: knob override, process parallelism, the
     /// nofile limit as found.
     pub fn resolve(env: *const std.process.Environ.Map, facts: derive.Facts) Config {
-        const override = knobs.optIntKnob(u32, env, "SQUEEZEFS_URING_FS_WORKERS");
+        const override = knobs.optIntKnob("SQUEEZEFS_URING_FS_WORKERS", u32, env);
         const workers = resolveWorkerCount(override, facts.cpus);
         return .{ .workers = workers, .fd_cache_cap = fdCacheCapFrom(nofileSoftAsFound(), workers) };
     }
@@ -143,143 +141,34 @@ fn publishConfigInForce(c: Config) void {
     _ = config_in_force.cmpxchgStrong(0, packed_cfg, .monotonic, .monotonic);
 }
 
+/// Before any pool published its config, the derived shape of the process
+/// facts in force (never the calling thread's affinity — `derive.facts()`).
 pub fn configInForce() Config {
     const v = config_in_force.load(.monotonic);
     if (v == 0) {
-        const workers = resolveWorkerCount(null, @intCast(@max(1, std.Thread.getCpuCount() catch 1)));
+        const workers = resolveWorkerCount(null, derive.facts().cpus);
         return .{ .workers = workers, .fd_cache_cap = fdCacheCapFrom(nofileSoftAsFound(), workers) };
     }
     return .{ .workers = @intCast(v >> 32), .fd_cache_cap = @truncate(v) };
 }
 
 // ---------------------------------------------------------------------------
-// Errors: one typed set, three classes, ONE errno table.
+// Errors: the ONE typed set and the ONE errno table (`core/errors.zig`).
 // ---------------------------------------------------------------------------
 
-pub const Error = error{
-    // ---- retryable: the caller may try again later ----
-    /// The request queue is full (backpressure; `uring_queue_full` counts it).
-    QueueFull,
-    Interrupted,
-    WouldBlock,
-    // ---- terminal: this op is lost; the device or the file said no ----
-    InputOutput,
-    NoSpaceLeft,
-    QuotaExceeded,
-    FileNotFound,
-    AccessDenied,
-    BadFileDescriptor,
-    IsDir,
-    NotDir,
-    PathAlreadyExists,
-    TooManyOpenFiles,
-    NameTooLong,
-    FileTooBig,
-    ReadOnlyFileSystem,
-    NotSupported,
-    Canceled,
-    OutOfMemory,
-    /// The kernel said EINVAL (e.g. an O_DIRECT shape the driver rejects).
-    InvalidArgument,
-    /// A write SQE completed with 0 bytes.
-    ShortWrite,
-    /// An SQE could not be pushed even after flushing the SQ.
-    SubmissionQueueOverflow,
-    /// The worker's ring broke; every op it held failed with this.
-    RingFailed,
-    /// The pool shut down before the op completed.
-    WorkerClosed,
-    /// An errno outside the table (logged with its number).
-    Unexpected,
-    // ---- refusal: a caller bug or an inadmissible device; never retried ----
-    UnalignedDirectWrite,
-    GrainNotAdmissible,
-    NotADeviceOrFile,
-    DirectOpenRefused,
-    CannotStat,
-};
-
-pub const ErrorClass = enum { retryable, terminal, refusal };
-
-pub fn classOf(err: Error) ErrorClass {
-    return switch (err) {
-        error.QueueFull, error.Interrupted, error.WouldBlock => .retryable,
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat => .refusal,
-        else => .terminal,
-    };
-}
+pub const Error = errors.Error;
+pub const ErrorClass = errors.Class;
+pub const classOf = errors.classOf;
+pub const fromErrno = errors.fromErrno;
+pub const toErrno = errors.toErrno;
 
 /// Registration's own error set (a subset of `Error`).
 pub const RegisterError = error{ CannotStat, NotADeviceOrFile, GrainNotAdmissible, DirectOpenRefused, OutOfMemory, NameTooLong };
 
-const ErrnoRow = struct { e: linux.E, err: Error };
-
-/// THE errno table, read in both directions. A CQE's negative `res` maps
-/// through `fromErrno`; a FUSE reply maps back through `toErrno`.
-const errno_table = [_]ErrnoRow{
-    .{ .e = .IO, .err = error.InputOutput },
-    .{ .e = .NOSPC, .err = error.NoSpaceLeft },
-    .{ .e = .DQUOT, .err = error.QuotaExceeded },
-    .{ .e = .NOENT, .err = error.FileNotFound },
-    .{ .e = .ACCES, .err = error.AccessDenied },
-    .{ .e = .PERM, .err = error.AccessDenied },
-    .{ .e = .BADF, .err = error.BadFileDescriptor },
-    .{ .e = .ISDIR, .err = error.IsDir },
-    .{ .e = .NOTDIR, .err = error.NotDir },
-    .{ .e = .EXIST, .err = error.PathAlreadyExists },
-    .{ .e = .MFILE, .err = error.TooManyOpenFiles },
-    .{ .e = .NFILE, .err = error.TooManyOpenFiles },
-    .{ .e = .NAMETOOLONG, .err = error.NameTooLong },
-    .{ .e = .FBIG, .err = error.FileTooBig },
-    .{ .e = .ROFS, .err = error.ReadOnlyFileSystem },
-    .{ .e = .OPNOTSUPP, .err = error.NotSupported },
-    .{ .e = .CANCELED, .err = error.Canceled },
-    .{ .e = .NOMEM, .err = error.OutOfMemory },
-    .{ .e = .INVAL, .err = error.InvalidArgument },
-    .{ .e = .INTR, .err = error.Interrupted },
-    .{ .e = .AGAIN, .err = error.WouldBlock },
-};
-
-pub fn fromErrno(e: linux.E) Error {
-    for (errno_table) |row| if (row.e == e) return row.err;
-    log.warn("uring-fs: errno {d} ({s}) is outside the table — reported as Unexpected (EIO)", .{ @backingInt(e), @tagName(e) });
-    return error.Unexpected;
-}
-
-pub fn toErrno(err: Error) linux.E {
-    for (errno_table) |row| if (row.err == err) return row.e;
-    return switch (err) {
-        // The reference replies EINVAL for backpressure and for every refusal.
-        error.QueueFull, error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat => .INVAL,
-        else => .IO,
-    };
-}
-
-/// A CQE's `res`: negative is `-errno`.
-fn cqeError(res: i32) Error {
-    return fromErrno(@fromBackingInt(@intCast(@as(u16, @intCast(-res)))));
-}
-
-// ---------------------------------------------------------------------------
-// Futex primitives (Linux raw; `std.Io`'s take an Io handle — none here).
-// ---------------------------------------------------------------------------
-
-fn futexWait(word: *const std.atomic.Value(u32), expect: u32) void {
-    // EAGAIN (word != expect) and EINTR both mean "re-check"; the callers loop.
-    _ = linux.futex_4arg(&word.raw, .{ .cmd = .WAIT, .private = true }, expect, null);
-}
-
-fn futexWake(word: *const std.atomic.Value(u32), max_waiters: u32) void {
-    // FUTEX_WAKE's count is a C int: anything above INT_MAX reads as negative
-    // and wakes exactly ONE waiter (a `close` that must wake every parked
-    // worker would strand the rest in `join`).
-    _ = linux.futex_3arg(&word.raw, .{ .cmd = .WAKE, .private = true }, @min(max_waiters, std.math.maxInt(i32)));
-}
-
 /// A minimal mutex for the rare writer paths (registry rebuilds). Never on an
 /// I/O path.
 const FutexMutex = struct {
-    state: std.atomic.Value(u32) = .init(unlocked),
+    state: futex.Word = .init(unlocked),
     const unlocked = 0;
     const locked = 1;
     const contended = 2;
@@ -288,170 +177,73 @@ const FutexMutex = struct {
         // acquire pairs with unlock's release swap: the critical section sees
         // the previous holder's writes.
         if (self.state.cmpxchgStrong(unlocked, locked, .acquire, .monotonic) == null) return;
-        while (self.state.swap(contended, .acquire) != unlocked) futexWait(&self.state, contended);
+        while (self.state.swap(contended, .acquire) != unlocked) futex.wait(&self.state, contended);
     }
 
     fn unlock(self: *FutexMutex) void {
-        if (self.state.swap(unlocked, .release) == contended) futexWake(&self.state, 1);
+        if (self.state.swap(unlocked, .release) == contended) futex.wakeOne(&self.state);
     }
 };
 
-/// The reply channel (worker → caller): a futex word plus the value, shared
-/// by two parties with a refcount so either may drop first.
-fn Oneshot(comptime T: type) type {
-    return struct {
-        const Self = @This();
-        const pending = 0;
-        const done = 1;
+/// The caller → worker channel: the ONE bounded MPMC carrying cell indices,
+/// plus the pool's own consumer park (idle workers sleep on `epoch`;
+/// producers wake one). Producers never block (`trySend`).
+const ParkedQueue = struct {
+    ring: mpmc.BoundedMpmc(u32),
+    /// Bumped by every send and by close; the consumers' futex word.
+    epoch: futex.Word align(std.atomic.cache_line) = .init(0),
+    /// Consumers parked (or about to park) on `epoch`.
+    sleepers: std.atomic.Value(u32) = .init(0),
+    closed: std.atomic.Value(bool) = .init(false),
 
-        /// The futex word: `pending` until `complete` publishes the value.
-        state: std.atomic.Value(u32) = .init(pending),
-        /// Two parties: the completer and the waiter. The last one frees.
-        refs: std.atomic.Value(u32) = .init(2),
-        value: T = undefined,
-        gpa: Allocator,
+    fn init(gpa: Allocator, cap: usize) Allocator.Error!ParkedQueue {
+        return .{ .ring = try mpmc.BoundedMpmc(u32).init(gpa, cap) };
+    }
 
-        fn create(gpa: Allocator) error{OutOfMemory}!*Self {
-            const self = try gpa.create(Self);
-            self.* = .{ .gpa = gpa };
-            return self;
+    fn deinit(self: *ParkedQueue, gpa: Allocator) void {
+        self.ring.deinit(gpa);
+    }
+
+    fn trySend(self: *ParkedQueue, idx: u32) error{ Full, Closed }!void {
+        // seq_cst pairs with `close`'s store. A producer that observed open
+        // may still push after the consumers' final drain; the owner drains
+        // once more after joining them (Pool.shutdown), so nothing is
+        // stranded.
+        if (self.closed.load(.seq_cst)) return error.Closed;
+        if (!self.ring.tryPush(idx)) return error.Full;
+        _ = self.epoch.fetchAdd(1, .seq_cst);
+        // seq_cst: a consumer that registered as a sleeper before our epoch
+        // bump is seen here; one that registers after sees the bump.
+        if (self.sleepers.load(.seq_cst) != 0) futex.wakeOne(&self.epoch);
+    }
+
+    fn tryRecv(self: *ParkedQueue) ?u32 {
+        return self.ring.tryPop();
+    }
+
+    /// Park until an index arrives; null once closed AND drained.
+    fn recvBlocking(self: *ParkedQueue) ?u32 {
+        while (true) {
+            if (self.ring.tryPop()) |idx| return idx;
+            if (self.closed.load(.seq_cst)) return self.ring.tryPop();
+            _ = self.sleepers.fetchAdd(1, .seq_cst);
+            defer _ = self.sleepers.fetchSub(1, .seq_cst);
+            const e = self.epoch.load(.seq_cst);
+            // Re-check after registering: a send between the first tryPop
+            // and the registration bumped epoch, so the wait below returns
+            // at once (EAGAIN) and we loop.
+            if (self.ring.tryPop()) |idx| return idx;
+            if (self.closed.load(.seq_cst)) continue;
+            futex.wait(&self.epoch, e);
         }
+    }
 
-        /// Publish the value and wake the waiter. The release store pairs
-        /// with `wait`'s acquire load so the value is visible with the state.
-        fn complete(self: *Self, value: T) void {
-            self.value = value;
-            self.state.store(done, .release);
-            futexWake(&self.state, std.math.maxInt(u32));
-            self.release();
-        }
-
-        fn isDone(self: *const Self) bool {
-            return self.state.load(.acquire) == done;
-        }
-
-        /// Park until the value is published; the caller then `release`s.
-        fn wait(self: *Self) T {
-            while (self.state.load(.acquire) == pending) futexWait(&self.state, pending);
-            return self.value;
-        }
-
-        /// Drop this party's reference. The acq_rel RMW pairs with the other
-        /// party's: whoever frees has seen every access the other made.
-        fn release(self: *Self) void {
-            if (self.refs.fetchSub(1, .acq_rel) == 1) self.gpa.destroy(self);
-        }
-
-        /// A request that never reached a worker has no completer: both
-        /// references are the caller's.
-        fn destroyUnsent(self: *Self) void {
-            self.gpa.destroy(self);
-        }
-    };
-}
-
-/// Bounded MPMC ring (the Vyukov cell-sequence queue) with a futex-parked
-/// consumer side. Producers never block (`trySend`); consumers may park when
-/// idle (`recvBlocking`). `cap` is a power of two.
-fn Mpmc(comptime T: type, comptime cap: usize) type {
-    comptime std.debug.assert(std.math.isPowerOfTwo(cap));
-    return struct {
-        const Self = @This();
-        const mask = cap - 1;
-
-        const Cell = struct {
-            /// The cell's turn: equals its index when empty for position
-            /// `index + k*cap`, index+1 when full.
-            seq: std.atomic.Value(usize),
-            data: T,
-        };
-
-        cells: [cap]Cell = undefined,
-        enqueue_pos: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
-        dequeue_pos: std.atomic.Value(usize) align(std.atomic.cache_line) = .init(0),
-        /// Bumped by every send and by close; the consumer's futex word.
-        epoch: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
-        /// Consumers parked (or about to park) on `epoch`.
-        sleepers: std.atomic.Value(u32) = .init(0),
-        closed: std.atomic.Value(bool) = .init(false),
-
-        fn init(self: *Self) void {
-            self.* = .{};
-            for (&self.cells, 0..) |*c, i| c.seq = .init(i);
-        }
-
-        pub fn trySend(self: *Self, item: T) error{ Full, Closed }!void {
-            // seq_cst pairs with `close`'s store. A producer that observed
-            // open may still push after the consumers' final drain; the owner
-            // drains once more after joining them (Pool.deinit), so nothing
-            // is stranded.
-            if (self.closed.load(.seq_cst)) return error.Closed;
-            var pos = self.enqueue_pos.load(.monotonic);
-            const cell = while (true) {
-                const c = &self.cells[pos & mask];
-                // acquire pairs with the consumer's release of the cell.
-                const seq = c.seq.load(.acquire);
-                const dif = @as(isize, @bitCast(seq -% pos));
-                if (dif == 0) {
-                    if (self.enqueue_pos.cmpxchgWeak(pos, pos + 1, .monotonic, .monotonic)) |actual| pos = actual else break c;
-                } else if (dif < 0) {
-                    return error.Full;
-                } else {
-                    pos = self.enqueue_pos.load(.monotonic);
-                }
-            };
-            cell.data = item;
-            // release publishes `data` with the turn; the consumer's acquire load sees both.
-            cell.seq.store(pos + 1, .release);
-            _ = self.epoch.fetchAdd(1, .seq_cst);
-            // seq_cst: a consumer that registered as a sleeper before our
-            // epoch bump is seen here; one that registers after sees the bump.
-            if (self.sleepers.load(.seq_cst) != 0) futexWake(&self.epoch, 1);
-        }
-
-        pub fn tryRecv(self: *Self) ?T {
-            var pos = self.dequeue_pos.load(.monotonic);
-            const cell = while (true) {
-                const c = &self.cells[pos & mask];
-                const seq = c.seq.load(.acquire);
-                const dif = @as(isize, @bitCast(seq -% (pos + 1)));
-                if (dif == 0) {
-                    if (self.dequeue_pos.cmpxchgWeak(pos, pos + 1, .monotonic, .monotonic)) |actual| pos = actual else break c;
-                } else if (dif < 0) {
-                    return null;
-                } else {
-                    pos = self.dequeue_pos.load(.monotonic);
-                }
-            };
-            const item = cell.data;
-            cell.seq.store(pos +% mask +% 1, .release);
-            return item;
-        }
-
-        /// Park until an item arrives; null once closed AND drained.
-        pub fn recvBlocking(self: *Self) ?T {
-            while (true) {
-                if (self.tryRecv()) |item| return item;
-                if (self.closed.load(.seq_cst)) return self.tryRecv();
-                _ = self.sleepers.fetchAdd(1, .seq_cst);
-                defer _ = self.sleepers.fetchSub(1, .seq_cst);
-                const e = self.epoch.load(.seq_cst);
-                // Re-check after registering: a send between the first
-                // tryRecv and the registration bumped epoch, so the wait
-                // below returns at once (EAGAIN) and we loop.
-                if (self.tryRecv()) |item| return item;
-                if (self.closed.load(.seq_cst)) continue;
-                futexWait(&self.epoch, e);
-            }
-        }
-
-        pub fn close(self: *Self) void {
-            self.closed.store(true, .seq_cst);
-            _ = self.epoch.fetchAdd(1, .seq_cst);
-            futexWake(&self.epoch, std.math.maxInt(u32));
-        }
-    };
-}
+    fn close(self: *ParkedQueue) void {
+        self.closed.store(true, .seq_cst);
+        _ = self.epoch.fetchAdd(1, .seq_cst);
+        futex.wakeAll(&self.epoch);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Aligned buffers and read results.
@@ -526,44 +318,49 @@ pub const WriteOutcome = struct {
     woken_at: u64,
 };
 
-const WriteDone = Oneshot(WriteOutcome);
-const ReadDone = Oneshot(Error!ReadResult);
-const SyncDone = Oneshot(Error!void);
+/// What a request cell answers with.
+const Outcome = union(enum) {
+    write: WriteOutcome,
+    read: Error!ReadResult,
+    sync: Error!void,
+};
 
 /// One op of a prepared batch: the slice to submit (the caller's or the
 /// bounce's) and the bounce it may own.
 const PreparedOp = struct { offset: u64, data: []const u8, bounce: ?AlignedBuf };
 
-/// What the queue carries. Every slice is the CALLER's and must stay alive
-/// until the completion is observed; every `AlignedBuf` and the `ops` array
-/// are owned by the request and freed by whoever finishes it.
+/// What a cell carries into the queue. Every slice is the CALLER's and must
+/// stay alive until the completion is observed; every `AlignedBuf` and the
+/// `ops` array are owned by the request and freed by whoever finishes it.
 const Request = union(enum) {
-    write_all: struct { path: []const u8, data: []const u8, done: *WriteDone },
-    read_all: struct { path: []const u8, done: *ReadDone },
-    read_at: struct { path: []const u8, start: u64, skip: usize, want: usize, grain: u64, direct: bool, buf: AlignedBuf, done: *ReadDone },
-    write_at: struct { path: []const u8, offset: u64, data: []const u8, bounce: ?AlignedBuf, direct: bool, done: *WriteDone },
-    write_at_batch: struct { path: []const u8, ops: []PreparedOp, direct: bool, done: *WriteDone },
-    fdatasync: struct { path: []const u8, direct: bool, done: *SyncDone },
+    write_all: struct { path: []const u8, data: []const u8 },
+    read_all: struct { path: []const u8 },
+    read_at: struct { path: []const u8, start: u64, skip: usize, want: usize, grain: u64, direct: bool, buf: AlignedBuf },
+    write_at: struct { path: []const u8, offset: u64, data: []const u8, bounce: ?AlignedBuf, direct: bool },
+    write_at_batch: struct { path: []const u8, ops: []PreparedOp, direct: bool },
+    fdatasync: struct { path: []const u8, direct: bool },
 };
 
-/// Complete a request that never reached a reactor (queue closed, broken
-/// ring, shutdown leftovers), freeing what it owns.
-fn failRequest(gpa: Allocator, req: Request, err: Error) void {
+/// One preallocated request cell: the request, and the ONE completion the
+/// caller parks on (`sync/completion.zig`). The queue carries its index.
+const Cell = struct {
+    req: Request = .{ .fdatasync = .{ .path = &.{}, .direct = false } },
+    done: completion.Completion(Outcome) = .{},
+};
+
+/// Release what a request that never reached a reactor still owns (queue
+/// closed, broken ring, shutdown leftovers) and answer it with `err`.
+fn failedOutcome(gpa: Allocator, req: Request, err: Error) Outcome {
     const now = clock.monotonicNs();
+    const write_failed: Outcome = .{ .write = .{ .result = err, .admitted_at = now, .woken_at = now } };
     switch (req) {
-        .write_all => |r| r.done.complete(.{ .result = err, .admitted_at = now, .woken_at = now }),
-        .read_all => |r| r.done.complete(err),
-        .read_at => |r| {
-            var b = r.buf;
-            b.deinit();
-            r.done.complete(err);
-        },
+        .write_all => return write_failed,
         .write_at => |r| {
             if (r.bounce) |b| {
                 var bb = b;
                 bb.deinit();
             }
-            r.done.complete(.{ .result = err, .admitted_at = now, .woken_at = now });
+            return write_failed;
         },
         .write_at_batch => |r| {
             for (r.ops) |op| if (op.bounce) |b| {
@@ -571,9 +368,15 @@ fn failRequest(gpa: Allocator, req: Request, err: Error) void {
                 bb.deinit();
             };
             gpa.free(r.ops);
-            r.done.complete(.{ .result = err, .admitted_at = now, .woken_at = now });
+            return write_failed;
         },
-        .fdatasync => |r| r.done.complete(err),
+        .read_all => return .{ .read = err },
+        .read_at => |r| {
+            var b = r.buf;
+            b.deinit();
+            return .{ .read = err };
+        },
+        .fdatasync => return .{ .sync = err },
     }
 }
 
@@ -582,10 +385,12 @@ pub const WritePhase = enum(u2) { queue_hop = 0, device = 1, wake_hop = 2, total
 pub const Observed = struct { result: Error!void, stamps: WriteStamps };
 
 /// The awaitable handle of a submitted write. `wait`/`waitStamped` consume
-/// it; `deinit` drops an unobserved one. The phases are recorded ONCE, at
-/// first observation.
+/// it; `deinit` drops an unobserved one (the write still lands; the worker
+/// frees the cell). The phases are recorded ONCE, at first observation. A
+/// handle must be consumed or dropped before the pool is torn down.
 pub const WriteCompletion = struct {
-    done: ?*WriteDone,
+    pool: ?*Pool,
+    cell: u32,
     submitted_at: u64,
     observed: ?Observed,
 
@@ -596,17 +401,17 @@ pub const WriteCompletion = struct {
     /// Non-blocking: true once the outcome is in hand (retained for `wait`).
     pub fn pollDone(self: *WriteCompletion) bool {
         if (self.observed != null) return true;
-        const d = self.done orelse return true;
-        if (!d.isDone()) return false;
-        self.observe(d);
+        const p = self.pool orelse return true;
+        const outcome = p.cells[self.cell].done.poll() orelse return false;
+        self.observe(p, outcome.write);
         return true;
     }
 
     pub fn waitStamped(self: *WriteCompletion) Observed {
         if (self.observed) |o| return o;
-        const d = self.done.?;
-        _ = d.wait();
-        self.observe(d);
+        const p = self.pool.?;
+        const outcome = p.cells[self.cell].done.wait();
+        self.observe(p, outcome.write);
         return self.observed.?;
     }
 
@@ -614,18 +419,18 @@ pub const WriteCompletion = struct {
         return self.waitStamped().result;
     }
 
-    /// Drop a handle without observing it (the write still lands).
+    /// Drop a handle without observing it (the write still lands). Exactly
+    /// one party frees the cell: the worker if it has not completed yet,
+    /// this caller otherwise.
     pub fn deinit(self: *WriteCompletion) void {
-        if (self.done) |d| {
-            d.release();
-            self.done = null;
-        }
+        const p = self.pool orelse return;
+        self.pool = null;
+        if (!p.cells[self.cell].done.abandon()) p.freeCell(self.cell);
     }
 
-    fn observe(self: *WriteCompletion, d: *WriteDone) void {
-        const outcome = d.value;
-        d.release();
-        self.done = null;
+    fn observe(self: *WriteCompletion, p: *Pool, outcome: WriteOutcome) void {
+        p.freeCell(self.cell);
+        self.pool = null;
         const stamps: WriteStamps = .{
             .submitted_at = self.submitted_at,
             .admitted_at = outcome.admitted_at,
@@ -638,7 +443,7 @@ pub const WriteCompletion = struct {
 
     fn alreadyDone(result: Error!void) WriteCompletion {
         const now = clock.monotonicNs();
-        return .{ .done = null, .submitted_at = now, .observed = .{ .result = result, .stamps = .{ .submitted_at = now, .admitted_at = now, .woken_at = now, .observed_at = now } } };
+        return .{ .pool = null, .cell = 0, .submitted_at = now, .observed = .{ .result = result, .stamps = .{ .submitted_at = now, .admitted_at = now, .woken_at = now, .observed_at = now } } };
     }
 };
 
@@ -661,8 +466,13 @@ pub const Stats = struct {
     read_widened: counters.ShardedCounter = .{},
     /// `canonicalize` calls: flat under a steady stream of I/O to known paths.
     mode_resolves: counters.ShardedCounter = .{},
-    /// `trySend` refusals.
+    /// `trySend` refusals (a full queue; the cell pool shares its bound).
     queue_full: counters.ShardedCounter = .{},
+    /// Cells and the queue share one bound, so neither can happen: a held
+    /// cell could not return to the free list / the queue refused a push
+    /// while a cell was held.
+    cell_return_refused: counters.Tripwire = .init("uring_fs_cell_return_refused"),
+    queue_push_with_cell: counters.Tripwire = .init("uring_fs_queue_push_refused_with_cell"),
     phases: [4]counters.ShardedLatencyHistogram = @splat(.{}),
 };
 
@@ -818,9 +628,9 @@ const FdCache = struct {
 // The reactor: one ring, slot-indexed in-flight ops, a reap/advance machine.
 // ---------------------------------------------------------------------------
 
-/// Who to tell when a write unit lands: one caller, or a batch aggregate.
+/// Who to tell when a write unit lands: one caller's cell, or a batch aggregate.
 const UnitDone = union(enum) {
-    single: struct { done: *WriteDone, admitted_at: u64 },
+    single: struct { cell: u32, admitted_at: u64 },
     batch: *BatchState,
 };
 
@@ -829,34 +639,35 @@ const UnitDone = union(enum) {
 const BatchState = struct {
     remaining: usize,
     first_err: ?Error,
-    done: *WriteDone,
+    cell: u32,
     admitted_at: u64,
 };
 
 /// One in-flight op. OWNS everything its SQE references.
 const Pending = union(enum) {
-    read: struct { file: *CachedFile, buf: AlignedBuf, file_offset: u64, filled: usize, skip: usize, want: usize, grain: u64, done: *ReadDone },
+    read: struct { file: *CachedFile, buf: AlignedBuf, file_offset: u64, filled: usize, skip: usize, want: usize, grain: u64, cell: u32 },
     write: struct { file: *CachedFile, data: []const u8, bounce: ?AlignedBuf, file_offset: u64, written: usize, done: UnitDone },
-    fsync: struct { file: *CachedFile, done: *SyncDone },
+    fsync: struct { file: *CachedFile, cell: u32 },
 };
 
 pub const InitError = error{ OutOfMemory, RingSetupFailed, ThreadSpawnFailed };
 
 const Reactor = struct {
     gpa: Allocator,
+    pool: *Pool,
     ring: IoUring,
     slots: std.ArrayList(?Pending) = .empty,
     free: std.ArrayList(u32) = .empty,
     inflight: usize = 0,
     cache: FdCache,
 
-    fn init(gpa: Allocator, entries: u16, fd_cache_cap: u32) InitError!Reactor {
+    fn init(gpa: Allocator, pool: *Pool, entries: u16, fd_cache_cap: u32) InitError!Reactor {
         var ring = IoUring.init(entries, 0) catch |e| {
             log.err("uring-fs: io_uring_setup({d}) failed: {s} — the io_uring file layer cannot start (charter §1.2: no classical fallback)", .{ entries, @errorName(e) });
             return error.RingSetupFailed;
         };
         errdefer ring.deinit();
-        var self: Reactor = .{ .gpa = gpa, .ring = ring, .cache = .{ .gpa = gpa, .cap = fd_cache_cap } };
+        var self: Reactor = .{ .gpa = gpa, .pool = pool, .ring = ring, .cache = .{ .gpa = gpa, .cap = fd_cache_cap } };
         // One burst (admit_cap) plus a resubmit burst never reallocates the
         // slot table; a batch wider than that grows it.
         try self.slots.ensureTotalCapacity(gpa, 2 * admit_cap);
@@ -919,39 +730,40 @@ const Reactor = struct {
         return file;
     }
 
-    fn admit(self: *Reactor, req: Request) void {
+    fn admit(self: *Reactor, idx: u32) void {
         // BEFORE the open: a cold fd-cache miss counts against the device span.
         const admitted_at = clock.monotonicNs();
+        const req = self.pool.cells[idx].req;
         switch (req) {
             .write_all => |r| {
-                const file = self.openTruncate(r.path) catch |e| return sendWriteNow(r.done, e, admitted_at);
+                const file = self.openTruncate(r.path) catch |e| return self.completeWriteNow(idx, e, admitted_at);
                 if (r.data.len == 0) {
                     file.release(self.gpa);
-                    return sendWriteNow(r.done, {}, admitted_at);
+                    return self.completeWriteNow(idx, {}, admitted_at);
                 }
-                self.enqueueWrite(file, r.data, null, 0, .{ .single = .{ .done = r.done, .admitted_at = admitted_at } });
+                self.enqueueWrite(file, r.data, null, 0, .{ .single = .{ .cell = idx, .admitted_at = admitted_at } });
             },
             .read_all => |r| {
-                const st = (align_probe.statPath(r.path) catch null) orelse return r.done.complete(error.FileNotFound);
-                const fd = openPath(r.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch |e| return r.done.complete(e);
-                const file = CachedFile.create(self.gpa, fd) catch |e| return r.done.complete(e);
+                const st = (align_probe.statPath(r.path) catch null) orelse return self.completeCell(idx, .{ .read = error.FileNotFound });
+                const fd = openPath(r.path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch |e| return self.completeCell(idx, .{ .read = e });
+                const file = CachedFile.create(self.gpa, fd) catch |e| return self.completeCell(idx, .{ .read = e });
                 if (st.size == 0) {
                     file.release(self.gpa);
-                    return r.done.complete(ReadResult.empty(self.gpa));
+                    return self.completeCell(idx, .{ .read = ReadResult.empty(self.gpa) });
                 }
                 const buf = AlignedBuf.zeroed(self.gpa, @intCast(st.size), 1) catch |e| {
                     file.release(self.gpa);
-                    return r.done.complete(e);
+                    return self.completeCell(idx, .{ .read = e });
                 };
-                self.enqueueRead(file, buf, 0, 0, @intCast(st.size), 1, r.done);
+                self.enqueueRead(file, buf, 0, 0, @intCast(st.size), 1, idx);
             },
             .read_at => |r| {
                 const file = self.cachedOpen(r.path, r.direct, true) catch |e| {
                     var b = r.buf;
                     b.deinit();
-                    return r.done.complete(e);
+                    return self.completeCell(idx, .{ .read = e });
                 };
-                self.enqueueRead(file, r.buf, r.start, r.skip, r.want, r.grain, r.done);
+                self.enqueueRead(file, r.buf, r.start, r.skip, r.want, r.grain, idx);
             },
             .write_at => |r| {
                 const file = self.cachedOpen(r.path, r.direct, true) catch |e| {
@@ -959,9 +771,9 @@ const Reactor = struct {
                         var bb = b;
                         bb.deinit();
                     }
-                    return sendWriteNow(r.done, e, admitted_at);
+                    return self.completeWriteNow(idx, e, admitted_at);
                 };
-                self.enqueueWrite(file, r.data, r.bounce, r.offset, .{ .single = .{ .done = r.done, .admitted_at = admitted_at } });
+                self.enqueueWrite(file, r.data, r.bounce, r.offset, .{ .single = .{ .cell = idx, .admitted_at = admitted_at } });
             },
             .write_at_batch => |r| {
                 // The ops array is admission metadata; bounces move into slots.
@@ -971,7 +783,7 @@ const Reactor = struct {
                         var bb = b;
                         bb.deinit();
                     };
-                    return sendWriteNow(r.done, e, admitted_at);
+                    return self.completeWriteNow(idx, e, admitted_at);
                 };
                 const batch = self.gpa.create(BatchState) catch {
                     for (r.ops) |op| if (op.bounce) |b| {
@@ -979,9 +791,9 @@ const Reactor = struct {
                         bb.deinit();
                     };
                     file.release(self.gpa);
-                    return sendWriteNow(r.done, error.OutOfMemory, admitted_at);
+                    return self.completeWriteNow(idx, error.OutOfMemory, admitted_at);
                 };
-                batch.* = .{ .remaining = r.ops.len, .first_err = null, .done = r.done, .admitted_at = admitted_at };
+                batch.* = .{ .remaining = r.ops.len, .first_err = null, .cell = idx, .admitted_at = admitted_at };
                 for (r.ops) |op| {
                     file.retain();
                     self.enqueueWrite(file, op.data, op.bounce, op.offset, .{ .batch = batch });
@@ -989,15 +801,15 @@ const Reactor = struct {
                 file.release(self.gpa);
             },
             .fdatasync => |r| {
-                const file = self.cachedOpen(r.path, r.direct, false) catch |e| return r.done.complete(e);
-                self.enqueueFsync(file, r.done);
+                const file = self.cachedOpen(r.path, r.direct, false) catch |e| return self.completeCell(idx, .{ .sync = e });
+                self.enqueueFsync(file, idx);
             },
         }
     }
 
     /// Takes ownership of one `file` reference and of `buf`.
-    fn enqueueRead(self: *Reactor, file: *CachedFile, buf: AlignedBuf, start: u64, skip: usize, want: usize, grain: u64, done: *ReadDone) void {
-        const p: Pending = .{ .read = .{ .file = file, .buf = buf, .file_offset = start, .filled = 0, .skip = skip, .want = want, .grain = grain, .done = done } };
+    fn enqueueRead(self: *Reactor, file: *CachedFile, buf: AlignedBuf, start: u64, skip: usize, want: usize, grain: u64, cell: u32) void {
+        const p: Pending = .{ .read = .{ .file = file, .buf = buf, .file_offset = start, .filled = 0, .skip = skip, .want = want, .grain = grain, .cell = cell } };
         const i = self.claimSlot(p) catch |e| return self.finishFailed(p, e, clock.monotonicNs());
         self.pushSlot(i);
     }
@@ -1009,8 +821,8 @@ const Reactor = struct {
         self.pushSlot(i);
     }
 
-    fn enqueueFsync(self: *Reactor, file: *CachedFile, done: *SyncDone) void {
-        const p: Pending = .{ .fsync = .{ .file = file, .done = done } };
+    fn enqueueFsync(self: *Reactor, file: *CachedFile, cell: u32) void {
+        const p: Pending = .{ .fsync = .{ .file = file, .cell = cell } };
         const i = self.claimSlot(p) catch |e| return self.finishFailed(p, e, clock.monotonicNs());
         self.pushSlot(i);
     }
@@ -1052,26 +864,20 @@ const Reactor = struct {
     }
 
     /// Reap every ready CQE; one clock read per pass (the `woken_at` stamp);
-    /// continuations are pushed after the CQEs are consumed. Returns whether
-    /// the owned ring's wake READ completed.
-    fn reap(self: *Reactor) bool {
-        var saw_wake = false;
+    /// continuations are pushed after the CQEs are consumed.
+    fn reap(self: *Reactor) void {
         var cqes: [64]linux.io_uring_cqe = undefined;
         while (true) {
             const n = self.ring.copy_cqes(&cqes, 0) catch |e| {
                 log.err("uring-fs: completion queue read failed: {s} — failing every in-flight op", .{@errorName(e)});
                 self.failAll(error.RingFailed);
-                return saw_wake;
+                return;
             };
             if (n == 0) break;
             const now = clock.monotonicNs();
             var cont: [64]u32 = undefined;
             var nc: usize = 0;
             for (cqes[0..n]) |cqe| {
-                if (cqe.user_data == wake_ud) {
-                    saw_wake = true;
-                    continue;
-                }
                 const i: u32 = @intCast(cqe.user_data);
                 if (self.advance(i, cqe.res, now)) {
                     cont[nc] = i;
@@ -1080,7 +886,6 @@ const Reactor = struct {
             }
             for (cont[0..nc]) |i| self.pushContinue(i);
         }
-        return saw_wake;
     }
 
     /// Apply one CQE. True ⇒ the op continues (short read/write) and must be
@@ -1097,10 +902,10 @@ const Reactor = struct {
                 done.file.release(self.gpa);
                 if (res < 0) {
                     done.buf.deinit();
-                    done.done.complete(cqeError(res));
+                    self.completeCell(done.cell, .{ .read = errors.fromCqeRes(res) });
                 } else {
                     const b = align_probe.readSliceBounds(done.filled, done.skip, done.want);
-                    done.done.complete(ReadResult{ .buf = done.buf, .lo = b.lo, .hi = b.hi });
+                    self.completeCell(done.cell, .{ .read = ReadResult{ .buf = done.buf, .lo = b.lo, .hi = b.hi } });
                 }
             },
             .write => |*w| {
@@ -1111,13 +916,13 @@ const Reactor = struct {
                 var done = self.releaseSlot(i).write;
                 done.file.release(self.gpa);
                 if (done.bounce) |*b| b.deinit();
-                const result: Error!void = if (res < 0) cqeError(res) else if (res == 0) error.ShortWrite else {};
+                const result: Error!void = if (res < 0) errors.fromCqeRes(res) else if (res == 0) error.ShortWrite else {};
                 self.completeUnit(done.done, result, now);
             },
             .fsync => {
                 const done = self.releaseSlot(i).fsync;
                 done.file.release(self.gpa);
-                done.done.complete(if (res < 0) cqeError(res) else {});
+                self.completeCell(done.cell, .{ .sync = if (res < 0) errors.fromCqeRes(res) else {} });
             },
         }
         return false;
@@ -1125,18 +930,26 @@ const Reactor = struct {
 
     fn completeUnit(self: *Reactor, unit: UnitDone, result: Error!void, now: u64) void {
         switch (unit) {
-            .single => |s| s.done.complete(.{ .result = result, .admitted_at = s.admitted_at, .woken_at = now }),
+            .single => |s| self.completeCell(s.cell, .{ .write = .{ .result = result, .admitted_at = s.admitted_at, .woken_at = now } }),
             .batch => |b| {
                 result catch |e| if (b.first_err == null) {
                     b.first_err = e;
                 };
                 b.remaining -= 1;
                 if (b.remaining == 0) {
-                    b.done.complete(.{ .result = if (b.first_err) |e| e else {}, .admitted_at = b.admitted_at, .woken_at = now });
+                    self.completeCell(b.cell, .{ .write = .{ .result = if (b.first_err) |e| e else {}, .admitted_at = b.admitted_at, .woken_at = now } });
                     self.gpa.destroy(b);
                 }
             },
         }
+    }
+
+    fn completeWriteNow(self: *Reactor, cell: u32, result: Error!void, now: u64) void {
+        self.completeCell(cell, .{ .write = .{ .result = result, .admitted_at = now, .woken_at = now } });
+    }
+
+    fn completeCell(self: *Reactor, cell: u32, outcome: Outcome) void {
+        self.pool.completeCell(cell, outcome);
     }
 
     /// A slot that never got its SQE (or the ring broke): release everything
@@ -1147,7 +960,7 @@ const Reactor = struct {
                 var rr = r;
                 rr.file.release(self.gpa);
                 rr.buf.deinit();
-                rr.done.complete(err);
+                self.completeCell(rr.cell, .{ .read = err });
             },
             .write => |w| {
                 var ww = w;
@@ -1157,7 +970,7 @@ const Reactor = struct {
             },
             .fsync => |f| {
                 f.file.release(self.gpa);
-                f.done.complete(err);
+                self.completeCell(f.cell, .{ .sync = err });
             },
         }
     }
@@ -1172,22 +985,21 @@ const Reactor = struct {
     }
 };
 
-fn sendWriteNow(done: *WriteDone, result: Error!void, now: u64) void {
-    done.complete(.{ .result = result, .admitted_at = now, .woken_at = now });
-}
-
 // ---------------------------------------------------------------------------
 // The pool.
 // ---------------------------------------------------------------------------
 
-const Queue = Mpmc(Request, queue_cap);
-
 pub const Pool = struct {
     gpa: Allocator,
     config: Config,
-    queue: *Queue,
+    /// The request cells; `queue` carries indices into them, `free_cells`
+    /// hands them out. One bound for all three.
+    cells: []Cell,
+    free_cells: mpmc.BoundedMpmc(u32),
+    queue: ParkedQueue,
     reactors: []Reactor,
     threads: []std.Thread,
+    stopped: bool = false,
 
     /// Rings are created HERE, on the caller, so a box that cannot do io_uring
     /// refuses at startup rather than degrading a worker later.
@@ -1196,17 +1008,23 @@ pub const Pool = struct {
         std.debug.assert(config.workers >= 1);
         const self = try gpa.create(Pool);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .config = config, .queue = undefined, .reactors = &.{}, .threads = &.{} };
-        self.queue = try gpa.create(Queue);
-        errdefer gpa.destroy(self.queue);
-        self.queue.init();
+        self.* = .{ .gpa = gpa, .config = config, .cells = &.{}, .free_cells = undefined, .queue = undefined, .reactors = &.{}, .threads = &.{} };
+        self.cells = try gpa.alloc(Cell, queue_cap);
+        errdefer gpa.free(self.cells);
+        for (self.cells) |*c| c.* = .{};
+        self.free_cells = try mpmc.BoundedMpmc(u32).init(gpa, queue_cap);
+        errdefer self.free_cells.deinit(gpa);
+        var i: u32 = 0;
+        while (i < queue_cap) : (i += 1) std.debug.assert(self.free_cells.tryPush(i));
+        self.queue = try ParkedQueue.init(gpa, queue_cap);
+        errdefer self.queue.deinit(gpa);
 
         self.reactors = try gpa.alloc(Reactor, config.workers);
         errdefer gpa.free(self.reactors);
         var made: usize = 0;
         errdefer for (self.reactors[0..made]) |*r| r.deinit();
         while (made < self.reactors.len) : (made += 1) {
-            self.reactors[made] = try Reactor.init(gpa, ring_entries, config.fd_cache_cap);
+            self.reactors[made] = try Reactor.init(gpa, self, ring_entries, config.fd_cache_cap);
         }
 
         self.threads = try gpa.alloc(std.Thread, config.workers);
@@ -1228,15 +1046,26 @@ pub const Pool = struct {
 
     /// Close the queue so every idle worker's `recvBlocking` ends, join them
     /// (a worker with in-flight ops finishes them first), then fail anything a
-    /// producer slipped in between the last drain and the join.
-    pub fn deinit(self: *Pool) void {
+    /// producer slipped in between the last drain and the join. Idempotent;
+    /// every outstanding handle is answered when this returns and may still
+    /// be observed until `deinit`.
+    pub fn shutdown(self: *Pool) void {
+        if (self.stopped) return;
+        self.stopped = true;
         self.queue.close();
         for (self.threads) |t| t.join();
-        while (self.queue.tryRecv()) |req| failRequest(self.gpa, req, error.WorkerClosed);
+        while (self.queue.tryRecv()) |idx| self.completeCell(idx, failedOutcome(self.gpa, self.cells[idx].req, error.WorkerClosed));
+    }
+
+    /// `shutdown`, then free. Every handle must have been consumed or dropped.
+    pub fn deinit(self: *Pool) void {
+        self.shutdown();
         for (self.reactors) |*r| r.deinit();
         self.gpa.free(self.threads);
         self.gpa.free(self.reactors);
-        self.gpa.destroy(self.queue);
+        self.queue.deinit(self.gpa);
+        self.free_cells.deinit(self.gpa);
+        self.gpa.free(self.cells);
         self.gpa.destroy(self);
     }
 
@@ -1244,39 +1073,74 @@ pub const Pool = struct {
         return self.threads.len;
     }
 
-    /// Non-blocking push. Full ⇒ `QueueFull` (counted); closed ⇒ `WorkerClosed`.
-    fn send(self: *Pool, req: Request) Error!void {
-        self.queue.trySend(req) catch |e| switch (e) {
-            error.Full => {
-                stats.queue_full.inc();
-                return error.QueueFull;
-            },
-            error.Closed => return error.WorkerClosed,
+    /// Take a cell (reset) or refuse: the pool and the queue share one bound,
+    /// so an empty free list IS a full queue.
+    fn acquireCell(self: *Pool, req: Request) Error!u32 {
+        const idx = self.free_cells.tryPop() orelse {
+            stats.queue_full.inc();
+            return error.QueueFull;
         };
+        const c = &self.cells[idx];
+        c.req = req;
+        c.done.reset();
+        return idx;
+    }
+
+    fn freeCell(self: *Pool, idx: u32) void {
+        if (!self.free_cells.tryPush(idx)) stats.cell_return_refused.fire("a request cell could not return to the free list");
+    }
+
+    /// Worker side: publish the outcome; when the caller abandoned its
+    /// handle, release what the outcome still owns and free the cell here.
+    fn completeCell(self: *Pool, idx: u32, outcome: Outcome) void {
+        if (self.cells[idx].done.complete(outcome)) return;
+        switch (outcome) {
+            .read => |r| if (r) |res| {
+                var rr = res;
+                rr.deinit();
+            } else |_| {},
+            .write, .sync => {},
+        }
+        self.freeCell(idx);
+    }
+
+    /// Fill a cell and push its index. Full ⇒ `QueueFull` (counted); closed
+    /// ⇒ `WorkerClosed`. The cell is released again on a refusal so the
+    /// caller's resources inside `req` can be freed by the caller.
+    fn send(self: *Pool, req: Request) Error!u32 {
+        const idx = try self.acquireCell(req);
+        self.queue.trySend(idx) catch |e| {
+            self.freeCell(idx);
+            return switch (e) {
+                error.Full => blk: {
+                    stats.queue_push_with_cell.fire("the request queue refused a push while a cell was held");
+                    break :blk error.QueueFull;
+                },
+                error.Closed => error.WorkerClosed,
+            };
+        };
+        return idx;
+    }
+
+    /// Park on a cell's completion and give the cell back.
+    fn waitCell(self: *Pool, idx: u32) Outcome {
+        const outcome = self.cells[idx].done.wait();
+        self.freeCell(idx);
+        return outcome;
     }
 
     /// Create|truncate the whole file (control path: buffered by definition);
     /// parents are created.
     pub fn writeAll(self: *Pool, path: []const u8, data: []const u8) Error!void {
-        const done = try WriteDone.create(self.gpa);
-        var handle: WriteCompletion = .{ .done = done, .submitted_at = clock.monotonicNs(), .observed = null };
-        self.send(.{ .write_all = .{ .path = path, .data = data, .done = done } }) catch |e| {
-            done.destroyUnsent();
-            return e;
-        };
+        const idx = try self.send(.{ .write_all = .{ .path = path, .data = data } });
+        var handle: WriteCompletion = .{ .pool = self, .cell = idx, .submitted_at = clock.monotonicNs(), .observed = null };
         return handle.wait();
     }
 
     /// The whole file; length from stat.
     pub fn readAll(self: *Pool, path: []const u8) Error!ReadResult {
-        const done = try ReadDone.create(self.gpa);
-        self.send(.{ .read_all = .{ .path = path, .done = done } }) catch |e| {
-            done.destroyUnsent();
-            return e;
-        };
-        const result = done.wait();
-        done.release();
-        return result;
+        const idx = try self.send(.{ .read_all = .{ .path = path } });
+        return self.waitCell(idx).read;
     }
 
     /// Positional read. On a direct path the window is widened to the grain
@@ -1288,14 +1152,8 @@ pub const Pool = struct {
         var buf = try AlignedBuf.zeroed(self.gpa, @intCast(span.len), mode.memAlign());
         if (size == 0) return .{ .buf = buf, .lo = 0, .hi = 0 };
         errdefer buf.deinit();
-        const done = try ReadDone.create(self.gpa);
-        self.send(.{ .read_at = .{ .path = path, .start = span.start, .skip = span.skip, .want = size, .grain = mode.grain(), .direct = mode.isDirect(), .buf = buf, .done = done } }) catch |e| {
-            done.destroyUnsent();
-            return e;
-        };
-        const result = done.wait();
-        done.release();
-        return result;
+        const idx = try self.send(.{ .read_at = .{ .path = path, .start = span.start, .skip = span.skip, .want = size, .grain = mode.grain(), .direct = mode.isDirect(), .buf = buf } });
+        return self.waitCell(idx).read;
     }
 
     /// Positional write with the direct preflight (refuse / bounce). `data`
@@ -1310,13 +1168,9 @@ pub const Pool = struct {
         const mode = metaIoMode(path) orelse @as(MetaIoMode, .buffered);
         var prepared = try prepareDirectWrite(self.gpa, mode, path, offset, data);
         errdefer prepared.deinit();
-        const done = try WriteDone.create(self.gpa);
         const submitted_at = clock.monotonicNs();
-        self.send(.{ .write_at = .{ .path = path, .offset = offset, .data = prepared.data, .bounce = prepared.bounce, .direct = mode.isDirect(), .done = done } }) catch |e| {
-            done.destroyUnsent();
-            return e;
-        };
-        return .{ .done = done, .submitted_at = submitted_at, .observed = null };
+        const idx = try self.send(.{ .write_at = .{ .path = path, .offset = offset, .data = prepared.data, .bounce = prepared.bounce, .direct = mode.isDirect() } });
+        return .{ .pool = self, .cell = idx, .submitted_at = submitted_at, .observed = null };
     }
 
     /// One logical commit of N positional writes: every op is preflighted
@@ -1345,13 +1199,9 @@ pub const Pool = struct {
             prepared[n] = .{ .offset = op.offset, .data = p.data, .bounce = p.bounce };
             n += 1;
         }
-        const done = try WriteDone.create(self.gpa);
         const submitted_at = clock.monotonicNs();
-        self.send(.{ .write_at_batch = .{ .path = path, .ops = prepared, .direct = mode.isDirect(), .done = done } }) catch |e| {
-            done.destroyUnsent();
-            return e;
-        };
-        return .{ .done = done, .submitted_at = submitted_at, .observed = null };
+        const idx = try self.send(.{ .write_at_batch = .{ .path = path, .ops = prepared, .direct = mode.isDirect() } });
+        return .{ .pool = self, .cell = idx, .submitted_at = submitted_at, .observed = null };
     }
 
     pub fn writeAtBatch(self: *Pool, path: []const u8, ops: []const WriteOp) Error!void {
@@ -1362,14 +1212,8 @@ pub const Pool = struct {
     /// `IORING_FSYNC_DATASYNC` on the cached O_RDWR fd.
     pub fn fdatasync(self: *Pool, path: []const u8) Error!void {
         const mode = metaIoMode(path) orelse @as(MetaIoMode, .buffered);
-        const done = try SyncDone.create(self.gpa);
-        self.send(.{ .fdatasync = .{ .path = path, .direct = mode.isDirect(), .done = done } }) catch |e| {
-            done.destroyUnsent();
-            return e;
-        };
-        const result = done.wait();
-        done.release();
-        return result;
+        const idx = try self.send(.{ .fdatasync = .{ .path = path, .direct = mode.isDirect() } });
+        return self.waitCell(idx).sync;
     }
 };
 
@@ -1384,12 +1228,12 @@ fn workerMain(pool: *Pool, index: u32) void {
     const r = &pool.reactors[index];
     while (true) {
         if (r.inflight == 0) {
-            const req = pool.queue.recvBlocking() orelse return;
-            r.admit(req);
+            const idx = pool.queue.recvBlocking() orelse return;
+            r.admit(idx);
         }
         while (r.inflight < admit_cap) {
-            const req = pool.queue.tryRecv() orelse break;
-            r.admit(req);
+            const idx = pool.queue.tryRecv() orelse break;
+            r.admit(idx);
         }
         if (r.inflight == 0) continue;
         _ = r.ring.submit_and_wait(1) catch |e| switch (e) {
@@ -1399,11 +1243,11 @@ fn workerMain(pool: *Pool, index: u32) void {
                 r.failAll(error.RingFailed);
                 // The failing lane: this worker keeps draining its share of the
                 // queue so callers see a loud error instead of a hang.
-                while (pool.queue.recvBlocking()) |req| failRequest(pool.gpa, req, error.RingFailed);
+                while (pool.queue.recvBlocking()) |idx| pool.completeCell(idx, failedOutcome(pool.gpa, pool.cells[idx].req, error.RingFailed));
                 return;
             },
         };
-        _ = r.reap();
+        r.reap();
     }
 }
 
@@ -1668,7 +1512,7 @@ pub fn registerMetaDevice(gpa: Allocator, env: *const std.process.Environ.Map, p
     };
     const mem_align = align_probe.memAlignFor(probe.mem_align, grain);
 
-    const mode: MetaIoMode = if (knobs.boolKnob(env, "SQUEEZEFS_TEST_META_BUFFERED", false)) seam: {
+    const mode: MetaIoMode = if (knobs.boolKnob("SQUEEZEFS_TEST_META_BUFFERED", env)) seam: {
         log.warn("metadata device {s}: SQUEEZEFS_TEST_META_BUFFERED=1 keeps it BUFFERED (the pre-posture control arm); meta_io_buffered_fallback counts it", .{path});
         stats.buffered_fallback.inc();
         break :seam .buffered;
@@ -1738,177 +1582,6 @@ pub fn padToGrain(gpa: Allocator, path: []const u8, image: *std.ArrayList(u8)) e
 }
 
 // ---------------------------------------------------------------------------
-// The owned ring (the journal lane's): the same reactor, driven by the thread
-// that also awaits completions, parked in io_uring_enter with an eventfd READ
-// armed so a task wake and a device CQE are ONE wait.
-// ---------------------------------------------------------------------------
-
-/// Cross-thread wake of a parked owned ring: `write(eventfd, 1u64)`. The
-/// counter is sticky, so a park not yet entered returns at once.
-pub const RingWake = struct {
-    fd: linux.fd_t,
-
-    pub fn wake(self: RingWake) void {
-        const one: u64 = 1;
-        // EAGAIN (counter at u64::MAX−1) is impossible at one increment per
-        // wake and harmless: the park is already pending.
-        _ = linux.write(self.fd, @ptrCast(&one), @sizeOf(u64));
-    }
-};
-
-pub const OwnedRing = struct {
-    gpa: Allocator,
-    reactor: Reactor,
-    event_fd: linux.fd_t,
-    /// The wake READ's target: heap, stable address across parks.
-    wake_buf: *u64,
-    wake_armed: bool = false,
-
-    pub fn init(gpa: Allocator, entries: u16, fd_cache_cap: u32) InitError!*OwnedRing {
-        const self = try gpa.create(OwnedRing);
-        errdefer gpa.destroy(self);
-        const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-        if (linux.errno(efd_rc) != .SUCCESS) {
-            log.err("uring-fs: eventfd for the owned ring failed: {s}", .{@tagName(linux.errno(efd_rc))});
-            return error.RingSetupFailed;
-        }
-        const efd: linux.fd_t = @intCast(efd_rc);
-        errdefer _ = linux.close(efd);
-        const wake_buf = try gpa.create(u64);
-        errdefer gpa.destroy(wake_buf);
-        wake_buf.* = 0;
-        self.* = .{ .gpa = gpa, .reactor = try Reactor.init(gpa, entries, fd_cache_cap), .event_fd = efd, .wake_buf = wake_buf };
-        return self;
-    }
-
-    /// Drains anything still in flight (the kernel may still be writing into
-    /// those buffers), then tears down. The armed wake READ is cancelled by
-    /// the ring's close; its buffer is freed after.
-    pub fn deinit(self: *OwnedRing) void {
-        while (self.reactor.inflight != 0) {
-            _ = self.reactor.ring.submit_and_wait(1) catch |e| switch (e) {
-                error.SignalInterrupt => continue,
-                else => {
-                    self.reactor.failAll(error.RingFailed);
-                    break;
-                },
-            };
-            _ = self.reactor.reap();
-        }
-        self.reactor.deinit();
-        _ = linux.close(self.event_fd);
-        self.gpa.destroy(self.wake_buf);
-        self.gpa.destroy(self);
-    }
-
-    pub fn wakeHandle(self: *const OwnedRing) RingWake {
-        return .{ .fd = self.event_fd };
-    }
-
-    /// Admit a batch on the owning thread and `submit()` without waiting. The
-    /// completion is observed through `park`/`service`.
-    pub fn submitWriteAtBatch(self: *OwnedRing, path: []const u8, ops: []const WriteOp) Error!WriteCompletion {
-        var live: usize = 0;
-        for (ops) |op| if (op.data.len != 0) {
-            live += 1;
-        };
-        if (live == 0) return WriteCompletion.alreadyDone({});
-        const mode = metaIoMode(path) orelse @as(MetaIoMode, .buffered);
-        const prepared = try self.gpa.alloc(PreparedOp, live);
-        var n: usize = 0;
-        errdefer {
-            for (prepared[0..n]) |*p| if (p.bounce) |*b| b.deinit();
-            self.gpa.free(prepared);
-        }
-        for (ops) |op| {
-            if (op.data.len == 0) continue;
-            const p = try prepareDirectWrite(self.gpa, mode, path, op.offset, op.data);
-            prepared[n] = .{ .offset = op.offset, .data = p.data, .bounce = p.bounce };
-            n += 1;
-        }
-        const done = try WriteDone.create(self.gpa);
-        const submitted_at = clock.monotonicNs();
-        self.reactor.admit(.{ .write_at_batch = .{ .path = path, .ops = prepared, .direct = mode.isDirect(), .done = done } });
-        _ = self.reactor.ring.submit() catch |e| switch (e) {
-            error.SignalInterrupt => {},
-            else => {
-                log.err("uring-fs: owned ring submit failed: {s} — failing every in-flight op", .{@errorName(e)});
-                self.reactor.failAll(error.RingFailed);
-            },
-        };
-        return .{ .done = done, .submitted_at = submitted_at, .observed = null };
-    }
-
-    /// Park until a CQE (a device completion or the wake READ) or the tick.
-    /// True ⇒ the tick fired. The wake READ is armed once and re-armed only
-    /// after it completes.
-    pub fn park(self: *OwnedRing, tick_ns: u64) bool {
-        if (!self.wake_armed) self.armWake();
-        const ring = &self.reactor.ring;
-        // Flush pending SQEs in their own enter FIRST: when io_uring_enter
-        // submits anything it returns the submitted count and DISCARDS the
-        // wait's verdict, so a combined submit-and-timed-wait never reports
-        // ETIME (liburing waits in a separate to_submit=0 call for the same
-        // reason).
-        _ = ring.submit() catch |e| switch (e) {
-            error.SignalInterrupt => {},
-            else => {
-                log.err("uring-fs: owned ring submit failed: {s} — failing every in-flight op", .{@errorName(e)});
-                self.reactor.failAll(error.RingFailed);
-                return false;
-            },
-        };
-        if (ring.features & linux.IORING_FEAT_EXT_ARG == 0) return self.untimedWait();
-        var ts: linux.kernel_timespec = .{ .sec = @intCast(tick_ns / std.time.ns_per_s), .nsec = @intCast(tick_ns % std.time.ns_per_s) };
-        var arg: linux.io_uring_getevents_arg = .{ .sigmask = 0, .sigmask_sz = 0, .pad = 0, .ts = @intFromPtr(&ts) };
-        // The kernel reads `arg`/`ts` during this call only.
-        const rc = linux.syscall6(.io_uring_enter, @as(u32, @bitCast(ring.fd)), 0, 1, linux.IORING_ENTER_GETEVENTS | linux.IORING_ENTER_EXT_ARG, @intFromPtr(&arg), @sizeOf(linux.io_uring_getevents_arg));
-        return switch (linux.errno(rc)) {
-            .SUCCESS => false,
-            .TIME => true,
-            .INTR => false,
-            // Pre-5.11 kernels without EXT_ARG: an untimed wait.
-            .INVAL => self.untimedWait(),
-            else => |e| {
-                log.err("uring-fs: owned ring io_uring_enter failed: {s} — failing every in-flight op", .{@tagName(e)});
-                self.reactor.failAll(error.RingFailed);
-                return false;
-            },
-        };
-    }
-
-    fn untimedWait(self: *OwnedRing) bool {
-        _ = self.reactor.ring.submit_and_wait(1) catch |e| switch (e) {
-            error.SignalInterrupt => {},
-            else => {
-                log.err("uring-fs: owned ring io_uring_enter failed: {s} — failing every in-flight op", .{@errorName(e)});
-                self.reactor.failAll(error.RingFailed);
-            },
-        };
-        return false;
-    }
-
-    fn armWake(self: *OwnedRing) void {
-        const ring = &self.reactor.ring;
-        const sqe = ring.get_sqe() catch blk: {
-            _ = ring.submit() catch {};
-            break :blk ring.get_sqe() catch {
-                log.err("uring-fs: owned ring cannot arm its wake READ (SQ full after a flush)", .{});
-                return;
-            };
-        };
-        sqe.prep_read(self.event_fd, std.mem.asBytes(self.wake_buf), 0);
-        sqe.user_data = wake_ud;
-        self.wake_armed = true;
-    }
-
-    /// Reap on the owning thread; a completed wake READ re-arms at the next park.
-    pub fn service(self: *OwnedRing) void {
-        if (self.reactor.reap()) self.wake_armed = false;
-    }
-};
-
-// ---------------------------------------------------------------------------
 // Tests: the contract (`docs/porting/uring_fs.md` §6).
 // ---------------------------------------------------------------------------
 
@@ -1975,27 +1648,20 @@ test "thread names fit the kernel comm budget for every worker index" {
     try testing.expect(n.len <= thread_name.comm_max);
 }
 
-test "errno table: every mapped error round-trips to its errno; unknown errnos become Unexpected, which replies EIO" {
+test "the pool's errors are the ONE table's: a refusal replies EINVAL, backpressure EAGAIN (never EINVAL), a lost op EIO" {
     try testing.expectEqual(Error.InputOutput, fromErrno(.IO));
     try testing.expectEqual(linux.E.IO, toErrno(Error.InputOutput));
-    try testing.expectEqual(Error.NoSpaceLeft, fromErrno(.NOSPC));
-    try testing.expectEqual(Error.FileNotFound, fromErrno(.NOENT));
-    try testing.expectEqual(Error.InvalidArgument, fromErrno(.INVAL));
-    try testing.expectEqual(Error.Unexpected, fromErrno(.NOTSOCK));
-    try testing.expectEqual(linux.E.IO, toErrno(Error.Unexpected));
-    // The refusals and the backpressure class map as the reference does: EINVAL.
     try testing.expectEqual(linux.E.INVAL, toErrno(Error.UnalignedDirectWrite));
-    try testing.expectEqual(linux.E.INVAL, toErrno(Error.QueueFull));
+    try testing.expectEqual(linux.E.AGAIN, toErrno(Error.QueueFull));
+    try testing.expectEqual(linux.E.IO, toErrno(Error.WorkerClosed));
     try testing.expectEqual(ErrorClass.retryable, classOf(Error.QueueFull));
     try testing.expectEqual(ErrorClass.terminal, classOf(Error.InputOutput));
     try testing.expectEqual(ErrorClass.refusal, classOf(Error.UnalignedDirectWrite));
 }
 
-test "the bounded queue: try-send never blocks, a full queue refuses, close drains then ends the consumer" {
-    const Q = Mpmc(u32, 8);
-    const q = try testing.allocator.create(Q);
-    defer testing.allocator.destroy(q);
-    q.init();
+test "the parked queue: try-send never blocks, a full queue refuses, a parked consumer wakes, close drains then ends it" {
+    var q = try ParkedQueue.init(testing.allocator, 8);
+    defer q.deinit(testing.allocator);
     var i: u32 = 0;
     while (i < 8) : (i += 1) try q.trySend(i);
     try testing.expectError(error.Full, q.trySend(99));
@@ -2009,36 +1675,19 @@ test "the bounded queue: try-send never blocks, a full queue refuses, close drai
     try testing.expectEqual(@as(?u32, null), q.tryRecv());
 
     const Consumer = struct {
-        fn run(queue: *Q, got: *std.atomic.Value(u32)) void {
+        fn run(queue: *ParkedQueue, got: *std.atomic.Value(u32)) void {
             while (queue.recvBlocking()) |v| _ = got.fetchAdd(v, .monotonic);
         }
     };
     var got: std.atomic.Value(u32) = .init(0);
-    const t = try std.Thread.spawn(.{}, Consumer.run, .{ q, &got });
+    const t = try std.Thread.spawn(.{}, Consumer.run, .{ &q, &got });
+    while (q.sleepers.load(.seq_cst) == 0) try std.Thread.yield();
     try q.trySend(5);
     try q.trySend(7);
     q.close();
     try testing.expectError(error.Closed, q.trySend(1));
     t.join();
     try testing.expectEqual(@as(u32, 12), got.load(.monotonic));
-}
-
-test "the oneshot: complete wakes a parked waiter; either side may drop first" {
-    const Done = Oneshot(u32);
-    const d = try Done.create(testing.allocator);
-    const Completer = struct {
-        fn run(done: *Done) void {
-            done.complete(42);
-        }
-    };
-    const t = try std.Thread.spawn(.{}, Completer.run, .{d});
-    try testing.expectEqual(@as(u32, 42), d.wait());
-    d.release();
-    t.join();
-    // Caller gives up first: the completer's release frees it.
-    const e = try Done.create(testing.allocator);
-    e.release();
-    e.complete(1);
 }
 
 test "AlignedBuf honours the alignment it was asked for and copies a slice" {
@@ -2078,6 +1727,53 @@ test "write_all then read_all round-trips 12,345 bytes; fdatasync succeeds; pare
     var none = try pool.readAt(path, 0, 0);
     defer none.deinit();
     try testing.expectEqual(@as(usize, 0), none.bytes().len);
+}
+
+/// Counts allocation CALLS through to `inner` (the per-op allocation pin).
+const CountingAllocator = struct {
+    inner: Allocator,
+    allocs: std.atomic.Value(u64) = .init(0),
+
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.allocs.fetchAdd(1, .monotonic);
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "a warm positional write and fdatasync allocate nothing for their handshake (the cell is pooled; charter §12)" {
+    var tp = try TmpPath.init();
+    defer tp.deinit();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = tp.join(&pbuf, "warm.dat");
+    var counting: CountingAllocator = .{ .inner = testing.allocator };
+    const pool = try Pool.init(counting.allocator(), Config.fixed(1, 1024));
+    defer pool.deinit();
+    var block: [4096]u8 = @splat(0x5C);
+    // Warm the fd cache and the slot table, then pin.
+    try pool.writeAt(path, 0, &block);
+    try pool.fdatasync(path);
+    const before = counting.allocs.load(.monotonic);
+    try pool.writeAt(path, 4096, &block);
+    try pool.fdatasync(path);
+    try testing.expectEqual(before, counting.allocs.load(.monotonic));
 }
 
 test "the pool runs at least the shipped floor of workers and names them" {
@@ -2330,10 +2026,11 @@ test "shutdown drains and joins: every outstanding handle completes, none hangs"
     }
     // One handle is dropped unobserved: the write still lands and nothing leaks.
     handles[0].deinit();
-    pool.deinit();
+    pool.shutdown();
     for (handles[1..]) |*h| {
         h.wait() catch |e| try testing.expectEqual(Error.WorkerClosed, e);
     }
+    pool.deinit();
     const pool2 = try testPool(1);
     defer pool2.deinit();
     var got = try pool2.readAt(path, 0, 4096);
@@ -2581,57 +2278,6 @@ test "the stats JSON names every meta_io counter, the four write phases and the 
     for ([_][]const u8{ "\"meta_io\":{", "\"meta_io_direct_paths\":", "\"meta_io_buffered_fallback\":", "\"meta_io_bounce_bytes\":", "\"meta_io_unaligned_refusals\":", "\"meta_io_read_widened\":", "\"uring_fs_write_phase_ns\":{", "\"queue_hop\":", "\"device\":", "\"wake_hop\":", "\"total\":", "\"uring_queue_full\":" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, s, needle) != null);
     }
-}
-
-test "the owned ring: a timed park returns on the tick, a wake returns it early, and a batch completes through service" {
-    var tp = try TmpPath.init();
-    defer tp.deinit();
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = tp.join(&pbuf, "lane.dat");
-    {
-        const pool = try testPool(1);
-        defer pool.deinit();
-        try pool.writeAll(path, "");
-    }
-    const ring = try OwnedRing.init(testing.allocator, journal_ring_entries, 16);
-    defer ring.deinit();
-
-    // Nothing in flight: the tick fires.
-    try testing.expect(ring.park(2 * std.time.ns_per_ms));
-    // A wake from another thread ends the park before a long tick.
-    const Waker = struct {
-        fn run(w: RingWake) void {
-            w.wake();
-        }
-    };
-    const t = try std.Thread.spawn(.{}, Waker.run, .{ring.wakeHandle()});
-    try testing.expect(!ring.park(10 * std.time.ns_per_s));
-    t.join();
-    ring.service();
-    // A wake delivered before the park is sticky: the next park returns at once.
-    ring.wakeHandle().wake();
-    try testing.expect(!ring.park(10 * std.time.ns_per_s));
-    ring.service();
-
-    var blocks: [3][4096]u8 = undefined;
-    for (&blocks, 0..) |*b, i| @memset(b, @as(u8, @truncate(0x10 + i)));
-    const ops = [_]WriteOp{
-        .{ .offset = 0, .data = &blocks[0] },
-        .{ .offset = 4096, .data = &blocks[1] },
-        .{ .offset = 8192, .data = &blocks[2] },
-    };
-    var handle = try ring.submitWriteAtBatch(path, &ops);
-    while (!handle.pollDone()) {
-        _ = ring.park(std.time.ns_per_s);
-        ring.service();
-    }
-    try handle.wait();
-    const pool = try testPool(1);
-    defer pool.deinit();
-    var got = try pool.readAll(path);
-    defer got.deinit();
-    try testing.expectEqual(@as(usize, 3 * 4096), got.bytes().len);
-    for (got.bytes(), 0..) |x, i| try testing.expectEqual(@as(u8, @truncate(0x10 + i / 4096)), x);
 }
 
 test "a block device registers direct with its logical block size as the grain (loop device; skipped without loop control)" {

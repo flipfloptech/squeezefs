@@ -18,6 +18,7 @@ const std = @import("std");
 const Io = std.Io;
 const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
+const futex = @import("futex.zig");
 
 /// The liveness tick: the backstop's re-contend period.
 pub const tick_ns: u64 = 2 * std.time.ns_per_s;
@@ -66,10 +67,7 @@ pub fn parkUntil(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter
             counter.inc();
             return .ticked;
         }
-        try io.futexWaitTimeout(u32, &word.raw, 0, .{ .duration = .{
-            .raw = .fromNanoseconds(@intCast(until - now)),
-            .clock = .awake,
-        } });
+        try futex.ioWaitTimeout(io, word, 0, until - now);
     }
 }
 
@@ -100,7 +98,7 @@ pub fn parkUncancelable(io: Io, word: *std.atomic.Value(u32), counter: *counters
 /// node alive across this call (every caller does it under the primitive's
 /// interior mutex, which the waiter needs before it can unlink).
 pub fn wake(io: Io, word: *std.atomic.Value(u32)) void {
-    if (word.swap(1, .release) == 0) io.futexWake(u32, &word.raw, 1);
+    if (word.swap(1, .release) == 0) futex.ioWake(io, word, 1);
 }
 
 const testing = std.testing;

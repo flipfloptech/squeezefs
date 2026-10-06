@@ -19,7 +19,9 @@ const log = @import("log.zig");
 
 /// Stripe count: `clamp(next_pow2(cpus), 1, 64)` — derived from the machine,
 /// capped at 64 because above 64 live threads stripes are shared and still
-/// exact; a wider table only costs cache (64 × 64 B = 4 KiB per counter).
+/// exact; a wider table only costs cache: `std.atomic.cache_line` is 128 B
+/// on x86_64 and aarch64, so a counter is 64 × 128 B = 8 KiB (a histogram
+/// twice that).
 pub const max_stripes = 64;
 
 pub fn stripeCount(cpus: u32) usize {
@@ -28,10 +30,12 @@ pub fn stripeCount(cpus: u32) usize {
 
 var stripe_count_cache: std.atomic.Value(usize) = .init(0);
 
+/// The live count keys on the process facts in force (`derive.facts()`),
+/// never on the first toucher's own affinity.
 fn stripeCountLive() usize {
     const cached = stripe_count_cache.load(.monotonic);
     if (cached != 0) return cached;
-    const n = stripeCount(@intCast(@max(1, std.Thread.getCpuCount() catch 1)));
+    const n = stripeCount(derive.facts().cpus);
     stripe_count_cache.store(n, .monotonic);
     return n;
 }

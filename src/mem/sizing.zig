@@ -1,14 +1,14 @@
 //! R5-derived sizing laws (spec `docs/porting/mem_budget.md` §4 helpers;
 //! charter §1.5 "Every constant is DERIVED"). Every cap here is a pure
 //! function of the resolved budget (and the core count); the family
-//! resolvers apply `explicit > percentage > derived` and never refuse — the
-//! startup gate already did, so a junk string here only warns and falls
-//! through.
+//! resolvers take knob values the ONE parser (`core/knobs.zig`) already
+//! admitted — the gate refused a fraction or `> 100` (§1.6: never clamps),
+//! so there is no second parser and nothing to warn about here — and apply
+//! `explicit > percentage > derived`.
 
 const std = @import("std");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
-const log = @import("../core/log.zig");
 
 const MiB = derive.MiB;
 const GiB = derive.GiB;
@@ -46,42 +46,28 @@ pub fn ipcArenaCap(budget: u64) u64 {
     return budget / 8;
 }
 
-/// `SQUEEZEFS_TRANSPORT_MEM_MAX` (MiB, verbatim incl. 0) > `_PCT` (percent of
-/// budget, clamped into (0, 100]) > budget / 8. Lenient: junk warns and falls
-/// through (this resolver is the family's own parser).
-pub fn resolveTransportBufferCap(budget: u64, mem_max_mib: ?[]const u8, mem_pct: ?[]const u8) u64 {
-    return resolveCapFamily("SQUEEZEFS_TRANSPORT_MEM_MAX", "SQUEEZEFS_TRANSPORT_MEM_PCT", budget, mem_max_mib, mem_pct);
+/// `SQUEEZEFS_TRANSPORT_MEM_MAX` (MiB, verbatim) > `_PCT` (1..=100, percent
+/// of budget) > budget / 8.
+pub fn resolveTransportBufferCap(budget: u64, mem_max_mib: ?u64, mem_pct: ?u64) u64 {
+    return resolveCapFamily(budget, mem_max_mib, mem_pct);
 }
 
 /// `SQUEEZEFS_IPC_MEM_MAX` > `SQUEEZEFS_IPC_MEM_PCT` > budget / 8; same law
 /// as the transport family.
-pub fn resolveIpcArenaCap(budget: u64, mem_max_mib: ?[]const u8, mem_pct: ?[]const u8) u64 {
-    return resolveCapFamily("SQUEEZEFS_IPC_MEM_MAX", "SQUEEZEFS_IPC_MEM_PCT", budget, mem_max_mib, mem_pct);
+pub fn resolveIpcArenaCap(budget: u64, mem_max_mib: ?u64, mem_pct: ?u64) u64 {
+    return resolveCapFamily(budget, mem_max_mib, mem_pct);
 }
 
-fn resolveCapFamily(comptime max_key: []const u8, comptime pct_key: []const u8, budget: u64, mem_max_mib: ?[]const u8, mem_pct: ?[]const u8) u64 {
-    if (mem_max_mib) |raw| {
-        if (std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10)) |mib| {
-            return mib *| MiB;
-        } else |_| {
-            log.warn(max_key ++ "='{s}' is not a MiB integer — ignored", .{raw});
-        }
-    }
-    if (mem_pct) |raw| {
-        if (std.fmt.parseFloat(f64, std.mem.trim(u8, raw, " \t\r\n"))) |p| {
-            if (std.math.isFinite(p) and p > 0.0) {
-                var pct = p;
-                if (p > 100.0) {
-                    log.warn(pct_key ++ "='{s}' > 100 — clamped to 100", .{raw});
-                    pct = 100.0;
-                }
-                return std.math.lossyCast(u64, @as(f64, @floatFromInt(budget)) * (pct / 100.0));
-            }
-            log.warn(pct_key ++ "='{s}' must be a percent in (0, 100] — ignored", .{raw});
-        } else |_| {
-            log.warn(pct_key ++ "='{s}' is not a number — ignored", .{raw});
-        }
-    }
+/// `v × pct / 100`, widened: the integer percentage of a budget (multiply
+/// first so a 12.5 %-class fraction is impossible by construction and a 3 %
+/// of 4096 rounds like the reference's float form, 122).
+fn pctOf(v: u64, pct: u64) u64 {
+    return @intCast(@as(u128, v) * pct / 100);
+}
+
+fn resolveCapFamily(budget: u64, mem_max_mib: ?u64, mem_pct: ?u64) u64 {
+    if (mem_max_mib) |mib| return mib *| MiB;
+    if (mem_pct) |pct| return pctOf(budget, pct);
     return budget / 8;
 }
 
@@ -95,18 +81,12 @@ pub fn ipcSessionPopulationTarget(cpus: u32) u64 {
     return @max(128, @as(u64, cpus) * exa_canon_qd);
 }
 
-/// Per-session arena: `SQUEEZEFS_IPC_ARENA_MB` (> 0, verbatim MiB) else
-/// `max(64 MiB, align_down(cap / population_target(cpus), 4 MiB))` — so a
-/// full population of default arenas fills the admission cap exactly.
-pub fn resolveIpcArenaBytes(arena_mb_env: ?[]const u8, arena_cap_bytes: u64, cpus: u32) u64 {
-    if (arena_mb_env) |raw| {
-        if (std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10)) |mib| {
-            if (mib > 0) return mib *| MiB;
-            log.warn("SQUEEZEFS_IPC_ARENA_MB must be > 0 — ignored", .{});
-        } else |_| {
-            log.warn("SQUEEZEFS_IPC_ARENA_MB='{s}' is not a MiB integer — ignored", .{raw});
-        }
-    }
+/// Per-session arena: `SQUEEZEFS_IPC_ARENA_MB` (verbatim MiB; the row's
+/// range starts at 1) else `max(64 MiB, align_down(cap /
+/// population_target(cpus), 4 MiB))` — so a full population of default
+/// arenas fills the admission cap exactly.
+pub fn resolveIpcArenaBytes(arena_mib: ?u64, arena_cap_bytes: u64, cpus: u32) u64 {
+    if (arena_mib) |mib| return mib *| MiB;
     const derived = derive.alignDown(arena_cap_bytes / ipcSessionPopulationTarget(cpus), ipc_arena_dma_align_bytes);
     return @max(ipc_arena_floor_bytes, derived);
 }
@@ -126,7 +106,7 @@ pub fn dirEntryCapacity(total_memory: u64) u64 {
     return @max(50_000, total_memory / 200_000);
 }
 
-const refusal_template = "SQUEEZEFS_FLEET_SHARE={d}: the divided derived memory budget {d} B cannot satisfy the never-divided transport payload floor {d} B (= {d} kernel possible CPUs × Q_DEPTH_FLOOR {d} × {d} B payload — kernel-mandated queue geometry, fleet-share EXEMPT). Floors hold per daemon regardless of share, so this share oversubscribes the machine instead of dividing it: reduce the share, or set an explicit SQUEEZEFS_MEM_BUDGET_MB (absolute overrides win verbatim and own their own arithmetic)";
+const refusal_template = "fleet share {d} (squeezefs daemons in this cgroup): the divided derived memory budget {d} B cannot satisfy the never-divided transport payload floor {d} B (= {d} kernel possible CPUs × Q_DEPTH_FLOOR {d} × {d} B payload — kernel-mandated queue geometry, fleet-share EXEMPT). Floors hold per daemon regardless of share, so this many daemons oversubscribe the machine instead of dividing it: run fewer daemons in this cage, or set an explicit SQUEEZEFS_MEM_BUDGET_MB (absolute overrides win verbatim and own their own arithmetic)";
 /// Six `{d}` of at most 20 digits each on top of the template.
 pub const RefusalBuf = [refusal_template.len + 6 * 20]u8;
 
@@ -144,25 +124,18 @@ pub fn fleetShareFloorRefusal(share: u32, divided_budget: u64, possible_cpus: u3
     return std.fmt.bufPrint(buf, refusal_template, .{ share, divided_budget, floor, possible_cpus, transport_q_depth_floor, transport_payload_base }) catch unreachable;
 }
 
-// ---- knob faces ----
-
-/// The raw present string of a knob whose family resolver is the parser by
-/// contract (the resolvers above are lenient on purpose).
-fn knobStr(env: *const std.process.Environ.Map, key: []const u8) ?[]const u8 {
-    std.debug.assert(knobs.lookup(key) != null);
-    return knobs.parseStr(env.get(key));
-}
+// ---- knob faces (the rows' ranges are enforced by the readers) ----
 
 pub fn transportBufferCapFromEnv(env: *const std.process.Environ.Map, budget: u64) u64 {
-    return resolveTransportBufferCap(budget, knobStr(env, "SQUEEZEFS_TRANSPORT_MEM_MAX"), knobStr(env, "SQUEEZEFS_TRANSPORT_MEM_PCT"));
+    return resolveTransportBufferCap(budget, knobs.optIntKnob("SQUEEZEFS_TRANSPORT_MEM_MAX", u64, env), knobs.optIntKnob("SQUEEZEFS_TRANSPORT_MEM_PCT", u64, env));
 }
 
 pub fn ipcArenaCapFromEnv(env: *const std.process.Environ.Map, budget: u64) u64 {
-    return resolveIpcArenaCap(budget, knobStr(env, "SQUEEZEFS_IPC_MEM_MAX"), knobStr(env, "SQUEEZEFS_IPC_MEM_PCT"));
+    return resolveIpcArenaCap(budget, knobs.optIntKnob("SQUEEZEFS_IPC_MEM_MAX", u64, env), knobs.optIntKnob("SQUEEZEFS_IPC_MEM_PCT", u64, env));
 }
 
 pub fn ipcArenaBytesFromEnv(env: *const std.process.Environ.Map, arena_cap_bytes: u64, cpus: u32) u64 {
-    return resolveIpcArenaBytes(knobStr(env, "SQUEEZEFS_IPC_ARENA_MB"), arena_cap_bytes, cpus);
+    return resolveIpcArenaBytes(knobs.optIntKnob("SQUEEZEFS_IPC_ARENA_MB", u64, env), arena_cap_bytes, cpus);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,31 +156,33 @@ test "transport_buffer_cap = budget / 8, no fixed ceiling" {
     try testing.expectEqual(@as(u64, 0), transportBufferCap(0));
 }
 
-test "transport cap resolution: absolute MiB > pct in (0,100] > budget/8; junk warns and falls through" {
-    try testing.expectEqual(2 * GiB, resolveTransportBufferCap(8 * GiB, "2048", "50"));
-    try testing.expectEqual(@as(u64, 0), resolveTransportBufferCap(8 * GiB, "0", null));
-    try testing.expectEqual(4 * GiB, resolveTransportBufferCap(8 * GiB, null, "50"));
-    try testing.expectEqual(GiB, resolveTransportBufferCap(8 * GiB, null, "12.5"));
+test "transport cap resolution: absolute MiB > pct in 1..=100 > budget/8 — integer values the ONE parser admitted, no second parser" {
+    try testing.expectEqual(2 * GiB, resolveTransportBufferCap(8 * GiB, 2048, 50));
+    try testing.expectEqual(@as(u64, 0), resolveTransportBufferCap(8 * GiB, 0, null));
+    try testing.expectEqual(4 * GiB, resolveTransportBufferCap(8 * GiB, null, 50));
     try testing.expectEqual(GiB, resolveTransportBufferCap(8 * GiB, null, null));
-    try testing.expectEqual(2 * GiB, resolveTransportBufferCap(8 * GiB, "lots", "25"));
-    try testing.expectEqual(GiB, resolveTransportBufferCap(8 * GiB, "junk", "nope"));
-    try testing.expectEqual(8 * GiB, resolveTransportBufferCap(8 * GiB, null, "250"));
-    try testing.expectEqual(GiB, resolveTransportBufferCap(8 * GiB, null, "-3"));
-    try testing.expectEqual(GiB, resolveTransportBufferCap(8 * GiB, null, "nan"));
-    try testing.expectEqual(GiB, resolveTransportBufferCap(8 * GiB, null, "inf"));
-    try testing.expectEqual(GiB, resolveTransportBufferCap(8 * GiB, null, "0"));
-    // Whitespace is trimmed like the knob convention.
-    try testing.expectEqual(2 * GiB, resolveTransportBufferCap(8 * GiB, " 2048 ", null));
+    try testing.expectEqual(8 * GiB, resolveTransportBufferCap(8 * GiB, null, 100));
+    try testing.expectEqual(8 * GiB * 12 / 100, resolveTransportBufferCap(8 * GiB, null, 12));
+    // Multiply-first: 3 % of 4096 is 122 (the reference's float form rounds the same way).
+    try testing.expectEqual(@as(u64, 122), resolveTransportBufferCap(4096, null, 3));
+    // A fraction or a value above 100 never reaches here: the gate refuses them (knobs.zig).
+    try testing.expectEqual(@as(?u64, null), switch (knobs.parseIntIn(u64, "SQUEEZEFS_TRANSPORT_MEM_PCT", "250", 1, 100)) {
+        .value => |v| @as(?u64, v),
+        else => null,
+    });
+    try testing.expectEqual(@as(?u64, null), switch (knobs.parseIntIn(u64, "SQUEEZEFS_TRANSPORT_MEM_PCT", "12.5", 1, 100)) {
+        .value => |v| @as(?u64, v),
+        else => null,
+    });
 }
 
 test "ipc arena cap resolution mirrors the transport family: absolute > pct > budget/8" {
     try testing.expectEqual(22 * GiB, ipcArenaCap(field_budget));
-    try testing.expectEqual(2 * GiB, resolveIpcArenaCap(8 * GiB, "2048", "50"));
-    try testing.expectEqual(@as(u64, 0), resolveIpcArenaCap(8 * GiB, "0", null));
-    try testing.expectEqual(4 * GiB, resolveIpcArenaCap(8 * GiB, null, "50"));
+    try testing.expectEqual(2 * GiB, resolveIpcArenaCap(8 * GiB, 2048, 50));
+    try testing.expectEqual(@as(u64, 0), resolveIpcArenaCap(8 * GiB, 0, null));
+    try testing.expectEqual(4 * GiB, resolveIpcArenaCap(8 * GiB, null, 50));
     try testing.expectEqual(GiB, resolveIpcArenaCap(8 * GiB, null, null));
-    try testing.expectEqual(GiB, resolveIpcArenaCap(8 * GiB, "junk", "nope"));
-    try testing.expectEqual(8 * GiB, resolveIpcArenaCap(8 * GiB, null, "250"));
+    try testing.expectEqual(8 * GiB, resolveIpcArenaCap(8 * GiB, null, 100));
 }
 
 test "dir_entry_capacity = max(50_000, total / 200_000) with the shipped floor" {
@@ -247,12 +222,11 @@ test "ipc arena default = max(64 MiB, align_down(cap / population_target(cpus), 
             try testing.expectEqual(@as(u64, 0), resolveIpcArenaBytes(null, cap_mib * MiB, cpus) % ipc_arena_dma_align_bytes);
         }
     }
-    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes("64", 22 * GiB, 32));
-    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes("junk", floor_budget, 2));
-    try testing.expectEqual(80 * MiB, resolveIpcArenaBytes("80", 22 * GiB, 32));
-    try testing.expectEqual(90 * MiB, resolveIpcArenaBytes("90", 22 * GiB, 32));
-    // 0 warns and falls through to the derivation.
-    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes("0", cap, 32));
+    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(64, 22 * GiB, 32));
+    try testing.expectEqual(80 * MiB, resolveIpcArenaBytes(80, 22 * GiB, 32));
+    try testing.expectEqual(90 * MiB, resolveIpcArenaBytes(90, 22 * GiB, 32));
+    // 0 never reaches here: the row's range starts at 1 and the gate refuses it.
+    try testing.expectEqual(@as(i128, 1), knobs.row("SQUEEZEFS_IPC_ARENA_MB").kind.int.lo);
 }
 
 test "ipc per-uid session cap = clamp(cap / max(arena, 1), 64, 4096); monotone non-increasing in arena" {
@@ -281,7 +255,7 @@ test "fleet share unsatisfiable floor refuses naming the arithmetic; share 1 nev
     try testing.expectEqual(@as(?[]const u8, null), fleetShareFloorRefusal(2, floor, 32, &buf));
     try testing.expectEqual(@as(?[]const u8, null), fleetShareFloorRefusal(2, floor + 1, 32, &buf));
     const msg = fleetShareFloorRefusal(1024, floor - 1, 32, &buf).?;
-    try testing.expect(std.mem.indexOf(u8, msg, "SQUEEZEFS_FLEET_SHARE=1024") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "fleet share 1024") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "134217727") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "134217728") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "Q_DEPTH_FLOOR") != null);

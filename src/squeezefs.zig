@@ -9,16 +9,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const build_options = @import("build_options");
+/// Build identity (charter §11 "Versioning"): the strings are the exe's
+/// (`build_options`, imported by `main` alone), so the library never changes
+/// when HEAD moves.
+pub const Version = struct {
+    train: []const u8,
+    git_commit: []const u8,
+    profile: []const u8,
 
-/// Build identity: train, commit, profile (charter §11 "Versioning").
-pub const version = struct {
-    pub const train = build_options.train;
-    pub const git_commit = build_options.git_commit;
-    pub const profile = build_options.profile;
-
-    pub fn write(w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("squeezefs {s} ({s}, {s} profile, zig {s})\n", .{ train, git_commit, profile, builtin.zig_version_string });
+    pub fn write(self: Version, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("squeezefs {s} ({s}, {s} profile, zig {s})\n", .{ self.train, self.git_commit, self.profile, builtin.zig_version_string });
     }
 };
 
@@ -28,6 +28,7 @@ pub const clock = @import("core/clock.zig");
 pub const derive = @import("core/derive.zig");
 pub const knobs = @import("core/knobs.zig");
 pub const log = @import("core/log.zig");
+pub const errors = @import("core/errors.zig");
 pub const counters = @import("core/counters.zig");
 pub const thread_name = @import("core/thread_name.zig");
 
@@ -79,8 +80,9 @@ pub const sync = @import("sync/sync.zig");
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
 
-// ---- I/O: the io_uring file layer + metadata device posture (Linux only) ----
+// ---- I/O: the ring-park primitive, the io_uring file layer + metadata device posture (Linux only) ----
 pub const align_probe = @import("io/align_probe.zig");
+pub const ring_park = if (builtin.os.tag == .linux) @import("io/ring_park.zig") else struct {};
 pub const uring_fs = if (builtin.os.tag == .linux) @import("io/uring_fs.zig") else struct {};
 
 // ---- I/O: NVMe block device workers (Linux only) ----
@@ -94,6 +96,7 @@ test {
     _ = derive;
     _ = knobs;
     _ = log;
+    _ = errors;
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
@@ -133,6 +136,7 @@ test {
     _ = meta.conveyor_core;
     _ = mem_budget;
     _ = align_probe;
+    if (builtin.os.tag == .linux) _ = ring_park;
     if (builtin.os.tag == .linux) _ = uring_fs;
     _ = nvme_derive;
     if (builtin.os.tag == .linux) _ = nvme_dev;

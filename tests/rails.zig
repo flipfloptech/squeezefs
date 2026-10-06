@@ -7,6 +7,12 @@
 //! recursively for `.zig`; a file-count sanity floor so a wrong root fails
 //! loud; exemption lists are explicit constants, never heuristics; the failure
 //! message lists every violation with `path:line`.
+//!
+//! The scan is `std.zig.Tokenizer`'s: string literals come out as tokens, so
+//! a `'"'` char literal or an escaped quote cannot desync it, and `test`
+//! blocks are tracked by brace depth so the inverse census counts PRODUCT
+//! readers only — a knob read only by a test, or only under `tests/`, is a
+//! dead knob (decision 0003 WP-C row 27).
 
 const std = @import("std");
 const squeezefs = @import("squeezefs");
@@ -18,20 +24,32 @@ const roots = [_][]const u8{ "src", "tests" };
 /// vacuously. Raised as the tree grows.
 const min_files = 8;
 
-/// Literals the census ignores: the bare prefixes `isOurs` tests, and the
-/// deliberate fakes the knob tests use.
+/// Literals the census ignores: the bare prefixes `isOurs` tests, the
+/// deliberate fakes the knob tests use, and this file's scanner fixture.
 const census_exempt = [_][]const u8{
     "SQUEEZEFS_",
     "SQZ_",
+    "SQUEEZEFS_TEST_",
     "SQUEEZEFS_X",
     "SQUEEZEFS_N",
     "SQUEEZEFS_D",
     "SQUEEZEFS_E",
     "SQUEEZEFS_TYPO_KNOB",
     "SQUEEZEFS_NOT_A_KNOB",
+    "SQUEEZEFS_RAIL_FIXTURE_A",
+    "SQUEEZEFS_RAIL_FIXTURE_B",
+    "SQUEEZEFS_RAIL_FIXTURE_C",
+    "SQUEEZEFS_RAIL_FIXTURE_D",
+    "SQUEEZEFS_RAIL_FIXTURE_E",
 };
 
-const Hit = struct { path: []u8, line: usize, lit: []u8 };
+const Hit = struct {
+    path: []u8,
+    line: usize,
+    lit: []u8,
+    /// Product scope: outside every `test` block and not under `tests/`.
+    product: bool,
+};
 
 fn isExempt(lit: []const u8) bool {
     for (census_exempt) |e| if (std.mem.eql(u8, e, lit)) return true;
@@ -51,17 +69,49 @@ fn lineOf(text: []const u8, off: usize) usize {
     return std.mem.count(u8, text[0..off], "\n") + 1;
 }
 
-/// Scan `"`-delimited spans — exactly the reference's scan: pair every quote
-/// with the next; the all-uppercase filter rejects the inter-literal text.
-fn scanFile(gpa: std.mem.Allocator, path: []const u8, text: []const u8, hits: *std.ArrayList(Hit)) !void {
-    var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, text, i, '"')) |open| {
-        const close = std.mem.indexOfScalarPos(u8, text, open + 1, '"') orelse break;
-        const lit = text[open + 1 .. close];
-        if (isKnobShaped(lit) and !isExempt(lit)) {
-            try hits.append(gpa, .{ .path = try gpa.dupe(u8, path), .line = lineOf(text, open), .lit = try gpa.dupe(u8, lit) });
+/// Tokenize the file; every `string_literal` token is a candidate, tagged
+/// with whether it sits inside a `test` block (`test` keyword → the next
+/// `{` opens the block; its matching `}` closes it).
+fn scanFile(gpa: std.mem.Allocator, path: []const u8, text: [:0]const u8, hits: *std.ArrayList(Hit)) !void {
+    const under_tests = std.mem.startsWith(u8, path, "tests/") or std.mem.startsWith(u8, path, "tests\\");
+    var tok = std.zig.Tokenizer.init(text);
+    var depth: usize = 0;
+    // Brace depth at which the current `test` block's body opened; null outside.
+    var test_depth: ?usize = null;
+    var pending_test = false;
+    while (true) {
+        const t = tok.next();
+        switch (t.tag) {
+            .eof => break,
+            .keyword_test => pending_test = true,
+            .l_brace => {
+                depth += 1;
+                if (pending_test) {
+                    test_depth = depth;
+                    pending_test = false;
+                }
+            },
+            .r_brace => {
+                if (test_depth) |d| if (d == depth) {
+                    test_depth = null;
+                };
+                depth -|= 1;
+            },
+            .string_literal => {
+                const raw = text[t.loc.start..t.loc.end];
+                // Strip the delimiting quotes; a knob-shaped literal has no escapes.
+                const lit = raw[1 .. raw.len - 1];
+                if (isKnobShaped(lit)) {
+                    try hits.append(gpa, .{
+                        .path = try gpa.dupe(u8, path),
+                        .line = lineOf(text, t.loc.start),
+                        .lit = try gpa.dupe(u8, lit),
+                        .product = test_depth == null and !under_tests,
+                    });
+                }
+            },
+            else => {},
         }
-        i = close + 1;
     }
 }
 
@@ -98,7 +148,7 @@ fn collectHits(gpa: std.mem.Allocator, io: std.Io) !struct { hits: std.ArrayList
     }
     var hits: std.ArrayList(Hit) = .empty;
     for (files.items) |path| {
-        const text = try cwd.readFileAlloc(io, path, gpa, .limited(16 << 20));
+        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
         defer gpa.free(text);
         try scanFile(gpa, path, text, &hits);
     }
@@ -122,7 +172,7 @@ test "knob census: every SQUEEZEFS_/SQZ_ literal in the tree is a registered kno
     var violations: std.Io.Writer.Allocating = .init(gpa);
     defer violations.deinit();
     for (r.hits.items) |h| {
-        if (knobs.lookup(h.lit) == null) {
+        if (!isExempt(h.lit) and knobs.lookup(h.lit) == null) {
             try violations.writer.print("  {s}:{d}: \"{s}\" is not in the registry (src/core/knobs.zig)\n", .{ h.path, h.line, h.lit });
         }
     }
@@ -132,7 +182,7 @@ test "knob census: every SQUEEZEFS_/SQZ_ literal in the tree is a registered kno
     }
 }
 
-test "inverse census: every registered non-retired knob is read somewhere (no dead knobs)" {
+test "inverse census: every registered non-retired knob is read by PRODUCT code (no dead knobs; a test-only reader does not count)" {
     const gpa = std.testing.allocator;
     var r = try collectHits(gpa, std.testing.io);
     defer freeHits(gpa, &r.hits);
@@ -144,16 +194,49 @@ test "inverse census: every registered non-retired knob is read somewhere (no de
         var seen = false;
         for (r.hits.items) |h| {
             // The registry row itself is a literal too; a knob must appear in
-            // at least one OTHER file.
-            if (std.mem.eql(u8, h.lit, k.key) and !std.mem.endsWith(u8, h.path, "core/knobs.zig")) {
+            // at least one OTHER file, in product scope.
+            if (h.product and std.mem.eql(u8, h.lit, k.key) and !std.mem.endsWith(u8, h.path, "core/knobs.zig")) {
                 seen = true;
                 break;
             }
         }
-        if (!seen) try violations.writer.print("  {s}: registered but no source outside the registry reads it\n", .{k.key});
+        if (!seen) try violations.writer.print("  {s}: registered but no product code outside the registry reads it\n", .{k.key});
     }
     if (violations.written().len != 0) {
         std.debug.print("dead knob(s):\n{s}", .{violations.written()});
         return error.DeadKnob;
     }
+}
+
+test "the scan is a tokenizer's: a '\"' char literal and an escaped quote do not desync it; a test-block literal is not product scope" {
+    const gpa = std.testing.allocator;
+    const fixture: [:0]const u8 =
+        \\const a = '"';
+        \\const b = "SQUEEZEFS_RAIL_FIXTURE_A";
+        \\const c = "quote \" inside";
+        \\const d = "SQUEEZEFS_RAIL_FIXTURE_B";
+        \\test "t" {
+        \\    const e = "SQUEEZEFS_RAIL_FIXTURE_C";
+        \\    if (true) { const f = "SQUEEZEFS_RAIL_FIXTURE_D"; }
+        \\}
+        \\const g = "SQUEEZEFS_RAIL_FIXTURE_E";
+    ;
+    var hits: std.ArrayList(Hit) = .empty;
+    defer freeHits(gpa, &hits);
+    try scanFile(gpa, "src/fixture.zig", fixture, &hits);
+    try std.testing.expectEqual(@as(usize, 5), hits.items.len);
+    try std.testing.expectEqualStrings("SQUEEZEFS_RAIL_FIXTURE_A", hits.items[0].lit);
+    try std.testing.expectEqual(@as(usize, 2), hits.items[0].line);
+    try std.testing.expect(hits.items[0].product);
+    try std.testing.expectEqualStrings("SQUEEZEFS_RAIL_FIXTURE_B", hits.items[1].lit);
+    try std.testing.expect(hits.items[1].product);
+    try std.testing.expect(!hits.items[2].product);
+    try std.testing.expect(!hits.items[3].product);
+    try std.testing.expectEqualStrings("SQUEEZEFS_RAIL_FIXTURE_E", hits.items[4].lit);
+    try std.testing.expect(hits.items[4].product);
+    // Under tests/ nothing is product scope.
+    var hits2: std.ArrayList(Hit) = .empty;
+    defer freeHits(gpa, &hits2);
+    try scanFile(gpa, "tests/fixture.zig", fixture, &hits2);
+    for (hits2.items) |h| try std.testing.expect(!h.product);
 }

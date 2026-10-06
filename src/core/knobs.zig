@@ -49,16 +49,20 @@ pub const Kind = union(enum) {
     harness,
 };
 
+/// The charter's classes (§1.6: delete / `SQUEEZEFS_TEST_*` seam / A/B
+/// lever) plus the sizing and bookkeeping shapes. There is no "tuning" class:
+/// a literal shipped default with a knob on top is a free-floating constant
+/// (§1.5) — such a row is an A/B lever whose doc names the control arm, or it
+/// is deleted (decision 0003 Q7).
 pub const Class = enum {
     /// A real feature/posture toggle.
     switch_,
     /// Int whose absence means "derive it"; explicit wins verbatim.
     derived_override,
-    /// Int with a literal shipped default.
-    tuning,
     /// Product code armed only by suites (`SQUEEZEFS_TEST_*`); default-inert.
     test_seam,
-    /// Same-binary measurement control arm; logged at mount when non-default.
+    /// Same-binary measurement control arm; the doc names the arm; logged at
+    /// mount when non-default.
     ab_lever,
     /// Paths, URIs, addresses.
     config,
@@ -70,8 +74,10 @@ pub const Class = enum {
 pub const Knob = struct {
     key: []const u8,
     kind: Kind,
-    /// Documentation of the default ("derived", "on", "4096", "-"), never a
-    /// parsed value: call sites carry their own typed default.
+    /// The default: "derived" (absent ⇒ derive; read through `optIntKnob`),
+    /// a literal the typed readers parse at comptime (`intKnob`, `boolKnob`,
+    /// `enumKnob` — the ONE source of the default, never a call-site
+    /// literal), or "-" (no default: harness, retired).
     default: []const u8,
     class: Class,
     doc: []const u8,
@@ -94,27 +100,26 @@ pub const registry = [_]Knob{
     .{ .key = "SQUEEZEFS_MEM_BUDGET_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "R5 memory budget, MiB (absolute > cgroup memory.max × 0.8 > 70 % RAM)." },
     .{ .key = "SQUEEZEFS_TRANSPORT_MEM_MAX", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "Transport payload-buffer cap, MiB (absolute > pct > derived budget/8)." },
     .{ .key = "SQUEEZEFS_TRANSPORT_MEM_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "Transport payload-buffer cap as a percentage of the R5 budget." },
-    .{ .key = "SQUEEZEFS_PARKED_GATE_ASSIST_MS", .kind = .{ .int = .{ .lo = 0, .hi = MS_MAX } }, .default = "200", .class = .tuning, .doc = "R5-Red parked-gate self-flush assist window, ms." },
 
     // ---- io_uring file layer / metadata device posture ----
     .{ .key = "SQUEEZEFS_URING_FS_WORKERS", .kind = .{ .int = .{ .lo = 1, .hi = 64 } }, .default = "derived", .class = .derived_override, .doc = "io_uring file-layer worker count for ad-hoc local file I/O (derived clamp(cpus/4, 4, 64))." },
     .{ .key = "SQUEEZEFS_TEST_META_BUFFERED", .kind = .bool, .default = "0", .class = .test_seam, .doc = "Test seam: keep every registered metadata device on BUFFERED I/O (the shared-LUN coherence repro's control arm)." },
 
     // ---- metadata commit pipeline (journal lane) ----
-    .{ .key = "SQUEEZEFS_META_FLUSH_INTERVAL_MS", .kind = .{ .int = .{ .lo = 0, .hi = MS_MAX } }, .default = "50", .class = .tuning, .doc = "Coalesced journal barrier period, ms (the durability lane sets needs_flush and barriers at this cadence); 0 = strict: ONE barrier per group before any ack." },
+    .{ .key = "SQUEEZEFS_META_FLUSH_INTERVAL_MS", .kind = .{ .int = .{ .lo = 0, .hi = MS_MAX } }, .default = "50", .class = .ab_lever, .doc = "Coalesced journal barrier period, ms (the durability lane sets needs_flush and barriers at this cadence). A/B lever: 0 is the strict control arm — ONE barrier per group before any ack." },
 
     // ---- NVMe block device workers ----
-    .{ .key = "SQUEEZEFS_NVME_READ_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device READ submission fan-out lanes (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
-    .{ .key = "SQUEEZEFS_NVME_WRITE_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .derived_override, .doc = "Per-device DATA-WRITE submission fan-out lanes, block-offset affinity (derived cpus ÷ data devices); 1 = the single-worker A/B posture." },
+    .{ .key = "SQUEEZEFS_NVME_READ_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .ab_lever, .doc = "Per-device READ submission fan-out lanes (derived cpus ÷ data devices). A/B lever: 1 is the single-submitter control arm (11.5 GB/s vs 16.7 GB/s at 4 lanes on the 8-namespace box)." },
+    .{ .key = "SQUEEZEFS_NVME_WRITE_LANES", .kind = .{ .int = .{ .lo = 1, .hi = 1024 } }, .default = "derived", .class = .ab_lever, .doc = "Per-device DATA-WRITE submission fan-out lanes, block-offset affinity (derived cpus ÷ data devices). A/B lever: 1 is the single-submitter control arm." },
 
     // ---- R5 fleet share + IPC arena sizing (read by mem/) ----
-    .{ .key = "SQUEEZEFS_FLEET_SHARE", .kind = .{ .int = .{ .lo = 1, .hi = 4096 } }, .default = "1", .class = .tuning, .doc = "N co-located daemons sharing one machine: divides the cgroup/RAM roots and the cgroup unreclaimable sample (ceil) BEFORE the ×0.8/×0.7 laws; explicit budgets and floors are never divided." },
+    .{ .key = "SQUEEZEFS_TEST_FLEET_SHARE", .kind = .{ .int = .{ .lo = 1, .hi = 4096 } }, .default = "derived", .class = .test_seam, .doc = "Test seam: pin the fleet share — N co-located daemons sharing one machine — instead of the per-tick census of squeezefs daemons in this process's cgroup (`cgroup.procs` ∩ comm). The share divides the cgroup/RAM roots, the CPU root and the cgroup unreclaimable sample (ceil) BEFORE the ×0.8/×0.7 laws; explicit budgets and floors are never divided." },
     .{ .key = "SQUEEZEFS_IPC_MEM_MAX", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "ipc_session_arenas admission cap, MiB (absolute > pct > derived budget/8)." },
     .{ .key = "SQUEEZEFS_IPC_MEM_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "ipc_session_arenas admission cap as a percentage of the R5 budget." },
     .{ .key = "SQUEEZEFS_IPC_ARENA_MB", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 20 } }, .default = "derived", .class = .derived_override, .doc = "Per-session IPC payload arena, MiB (derived max(64 MiB, align_down(ipc cap / session population target, 4 MiB)))." },
 
     // ---- 4a metadata object locks (read by meta/dlm.zig) ----
-    .{ .key = "SQUEEZEFS_DLM_STRIPES", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 24 } }, .default = "derived", .class = .derived_override, .doc = "D-3: the stripe population of the 4a DlmLockManager inode + dentry classes (shipped floor 4096). Explicit wins verbatim (rounded UP to a power of two — the index is a mask); derived = next_pow2(max(4096, 16 × possible_cpus × q_depth)) so a false-sharing wait — which on the 4a tables costs a whole commit — hits at most one acquire in 16 at full ring occupancy. MEASUREMENT lever: 4096 is the shipped-4a A/B control, 1 the everything-serializes crucible. Engagement: dlm_{inode,dentry}_stripes; conviction: dlm_*_stripe_collisions vs dlm_*_key_waits." },
+    .{ .key = "SQUEEZEFS_DLM_STRIPES", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 24 } }, .default = "derived", .class = .ab_lever, .doc = "D-3: the stripe population of the 4a DlmLockManager inode + dentry classes (shipped floor 4096). Explicit wins verbatim (rounded UP to a power of two — the index is a mask); derived = next_pow2(max(4096, 16 × possible_cpus × q_depth)) so a false-sharing wait — which on the 4a tables costs a whole commit — hits at most one acquire in 16 at full ring occupancy. A/B lever: 4096 is the shipped-4a control arm, 1 the everything-serializes crucible. Engagement: dlm_{inode,dentry}_stripes; conviction: dlm_*_stripe_collisions vs dlm_*_key_waits." },
 
     // ---- MetaLV node cache (read by meta/node_cache.zig) ----
     .{ .key = "SQUEEZEFS_META_NODE_CACHE_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "Per-volume node-cache budget, MiB, verbatim (absolute > SQUEEZEFS_META_NODE_CACHE_PCT > derived max(mem_budget/16, 512 MiB))." },
@@ -122,12 +127,11 @@ pub const registry = [_]Knob{
 
     // ---- MetaLV checkpoint task (read by meta/checkpoint.zig) ----
     .{ .key = "SQUEEZEFS_META_CHECKPOINT_MAX_DIRTY_NODES", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 32 } }, .default = "derived", .class = .derived_override, .doc = "Dirty-node checkpoint cap = the mount-replay working-set bound: a cycle is due once more nodes than this hold un-durable records. Explicit wins verbatim; derived max(4096, mem_budget/32 ÷ node_size) — bounds the RAM pinned by dirty nodes AND the replay working set, 4096 the shipped floor (never regress below shipped: a lower cap checkpoints more often than any box ran, pure overhead)." },
-    .{ .key = "SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", .kind = .{ .int = .{ .lo = 1, .hi = MS_MAX } }, .default = "1000", .class = .tuning, .doc = "Checkpoint cadence ceiling, ms: a cycle runs at least this often with no other trigger (charter §5.3 'every ≤ 1 s'); also the reader's staleness term and the base of the landing ceiling max_age + 2 × tick (KD-SYM-10, 1,100 ms shipped). Floor 1 ms = the physical minimum of a cadence; ceiling the timing-knob bound." },
+    .{ .key = "SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", .kind = .{ .int = .{ .lo = 1, .hi = MS_MAX } }, .default = "1000", .class = .ab_lever, .doc = "Checkpoint cadence ceiling, ms: a cycle runs at least this often with no other trigger (charter §5.3 'every ≤ 1 s'); also the reader's staleness term and the base of the landing ceiling max_age + 2 × tick (KD-SYM-10, 1,100 ms shipped). A/B lever: 1000 is the charter's shipped arm; a shorter age is the replay-bound crucible (tighter mount replay for more checkpoint I/O). Floor 1 ms = the physical minimum of a cadence; ceiling the timing-knob bound." },
 
     // ---- the commit conveyor (read by meta/conveyor.zig, meta/backend.zig) ----
     .{ .key = "SQUEEZEFS_META_COMMIT_BATCH_TXS", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 20 } }, .default = "derived", .class = .ab_lever, .doc = "M7 commit-conveyor batch cap, transactions per drained batch. Explicit wins verbatim; derived max(64, cpus × 2) — arrivals scale with handler parallelism, 64 the shipped M7 floor. A/B lever: 1 is the per-tx pre-conveyor control arm." },
-    .{ .key = "SQUEEZEFS_META_COMMIT_BATCH_BYTES", .kind = .{ .int = .{ .lo = 1, .hi = BYTES_MAX } }, .default = "derived", .class = .ab_lever, .doc = "M7 commit-conveyor batch cap, Σ entry bytes per drained batch. Explicit wins verbatim; derived max(256 KiB, ring/16) so ≥ 16 batch reservations always cycle the ring; both forms are clamped at open to the ring's user-admissible capacity so one Σ-admission can always eventually succeed." },
-    .{ .key = "SQUEEZEFS_TIMEOUT", .kind = .{ .int = .{ .lo = 1, .hi = 86_400 } }, .default = "30", .class = .tuning, .doc = "Metadata-operation timeout, seconds: a conveyor pass parked this long at journal-ring admission is the wedged-not-failed class and escalates through the journal-failure lattice (D1.b audit row 2) — the watchdog's threshold, never a per-op cancellation." },
+    .{ .key = "SQUEEZEFS_META_COMMIT_BATCH_BYTES", .kind = .{ .int = .{ .lo = 1, .hi = BYTES_MAX } }, .default = "derived", .class = .ab_lever, .doc = "M7 commit-conveyor batch cap, Σ entry bytes per drained batch. Explicit wins verbatim; derived max(256 KiB, ring/16) so ≥ 16 batch reservations always cycle the ring; both forms are clamped at open to the ring's user-admissible capacity so one Σ-admission can always eventually succeed. A/B lever: the byte half of the batch-vs-per-tx arm (`_TXS = 1`); a byte cap never splits a single transaction." },
     .{ .key = "SQUEEZEFS_TEST_CRASH_CHILD", .kind = .harness, .default = "-", .class = .harness, .doc = "Harness: the kill -9 matrix's re-exec'd child marker — the metadata volume path the child opens and churns (its ack ledger is `<path>.acks`); the parent test SIGKILLs it mid-stream and reopens." },
 };
 
@@ -136,25 +140,65 @@ pub fn lookup(key: []const u8) ?*const Knob {
     return null;
 }
 
+/// The row of a key known at compile time: an unregistered key is a compile
+/// error, so a reader cannot exist without its row.
+pub fn row(comptime key: []const u8) *const Knob {
+    return comptime lookup(key) orelse @compileError(key ++ " is not a registry row (src/core/knobs.zig)");
+}
+
 /// Is this name in our namespace? (`SQUEEZEFS_` or `SQZ_` prefix.)
 pub fn isOurs(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "SQUEEZEFS_") or std.mem.startsWith(u8, key, "SQZ_");
 }
 
 // ---------------------------------------------------------------------------
-// The ONE parser. Pure: no logging, no env reads, no syscalls.
+// The ONE parser. Pure: no logging, no env reads, no syscalls, no side
+// channel — a parse yields a VALUE (`Parsed(T)`), and the detail of a
+// refusal travels inside it as a `Diagnostic`.
 // ---------------------------------------------------------------------------
 
-pub const KnobError = struct {
-    key: []const u8,
-    /// The TRIMMED raw value.
-    raw: []const u8,
-    want: []const u8,
+/// What an admissible value would have looked like; formats on demand.
+pub const Want = union(enum) {
+    boolean,
+    integer,
+    int_range: struct { lo: i128, hi: i128 },
+    enum_set: []const []const u8,
 
-    pub fn format(self: KnobError, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{s}='{s}' is invalid: {s}", .{ self.key, self.raw, self.want });
+    pub fn format(self: Want, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .boolean => try w.writeAll(bool_want),
+            .integer => try w.writeAll("expected an integer"),
+            .int_range => |r| try w.print("expected an integer in {d}..={d}", .{ r.lo, r.hi }),
+            .enum_set => |allowed| {
+                try w.writeAll("expected one of ");
+                for (allowed, 0..) |a, i| {
+                    if (i != 0) try w.writeByte('|');
+                    try w.writeAll(a);
+                }
+            },
+        }
     }
 };
+
+/// The refusal detail: the key, the TRIMMED raw value, what was wanted.
+pub const Diagnostic = struct {
+    key: []const u8,
+    raw: []const u8,
+    want: Want,
+
+    pub fn format(self: Diagnostic, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{s}='{s}' is invalid: {f}", .{ self.key, self.raw, self.want });
+    }
+};
+
+/// A parse outcome: absent, a value, or a refusal with its diagnostic.
+pub fn Parsed(comptime T: type) type {
+    return union(enum) {
+        absent,
+        value: T,
+        invalid: Diagnostic,
+    };
+}
 
 /// Absent = unset / empty / whitespace-only; otherwise the trimmed value.
 pub fn present(raw: ?[]const u8) ?[]const u8 {
@@ -171,69 +215,31 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-pub fn parseBool(key: []const u8, raw: ?[]const u8) error{Knob}!?bool {
-    const v = present(raw) orelse return null;
-    for (bool_true) |t| if (eqlIgnoreCase(v, t)) return true;
-    for (bool_false) |f| if (eqlIgnoreCase(v, f)) return false;
-    last_error = .{ .key = key, .raw = v, .want = bool_want };
-    return error.Knob;
-}
-
-/// Parse an integer of type `T`; the failure message names the type class
-/// only ("expected an integer") — call sites that know a range use
-/// `parseIntIn`, whose message names the range.
-pub fn parseInt(comptime T: type, key: []const u8, raw: ?[]const u8) error{Knob}!?T {
-    const v = present(raw) orelse return null;
-    return std.fmt.parseInt(T, v, 10) catch {
-        last_error = .{ .key = key, .raw = v, .want = "expected an integer" };
-        return error.Knob;
-    };
+pub fn parseBool(key: []const u8, raw: ?[]const u8) Parsed(bool) {
+    const v = present(raw) orelse return .absent;
+    for (bool_true) |t| if (eqlIgnoreCase(v, t)) return .{ .value = true };
+    for (bool_false) |f| if (eqlIgnoreCase(v, f)) return .{ .value = false };
+    return .{ .invalid = .{ .key = key, .raw = v, .want = .boolean } };
 }
 
 /// Inclusive range. Parse failure AND out-of-range share ONE message naming
 /// the admissible range. Out-of-range REFUSES, never clamps.
-pub fn parseIntIn(comptime T: type, key: []const u8, raw: ?[]const u8, lo: T, hi: T) error{Knob}!?T {
-    const v = present(raw) orelse return null;
-    const parsed = std.fmt.parseInt(T, v, 10) catch null;
-    if (parsed) |p| if (p >= lo and p <= hi) return p;
-    last_error = .{ .key = key, .raw = v, .want = rangeWant(T, lo, hi) };
-    return error.Knob;
+pub fn parseIntIn(comptime T: type, key: []const u8, raw: ?[]const u8, lo: T, hi: T) Parsed(T) {
+    const v = present(raw) orelse return .absent;
+    const parsed: ?T = std.fmt.parseInt(T, v, 10) catch null;
+    if (parsed) |p| if (p >= lo and p <= hi) return .{ .value = p };
+    return .{ .invalid = .{ .key = key, .raw = v, .want = .{ .int_range = .{ .lo = lo, .hi = hi } } } };
 }
 
 /// Case-insensitive match returning the CANONICAL spelling from `allowed`.
-pub fn parseEnum(key: []const u8, raw: ?[]const u8, allowed: []const []const u8) error{Knob}!?[]const u8 {
-    const v = present(raw) orelse return null;
-    for (allowed) |a| if (eqlIgnoreCase(v, a)) return a;
-    last_error = .{ .key = key, .raw = v, .want = enumWant(allowed) };
-    return error.Knob;
+pub fn parseEnum(key: []const u8, raw: ?[]const u8, allowed: []const []const u8) Parsed([]const u8) {
+    const v = present(raw) orelse return .absent;
+    for (allowed) |a| if (eqlIgnoreCase(v, a)) return .{ .value = a };
+    return .{ .invalid = .{ .key = key, .raw = v, .want = .{ .enum_set = allowed } } };
 }
 
 pub fn parseStr(raw: ?[]const u8) ?[]const u8 {
     return present(raw);
-}
-
-/// The parser is pure and allocation-free; the detail of the most recent
-/// failure on this thread lives here so callers that only need `error.Knob`
-/// pay nothing and the report builder can read the detail right after.
-threadlocal var last_error: KnobError = .{ .key = "", .raw = "", .want = "" };
-threadlocal var want_buf: [160]u8 = undefined;
-
-pub fn lastError() KnobError {
-    return last_error;
-}
-
-fn rangeWant(comptime T: type, lo: T, hi: T) []const u8 {
-    return std.fmt.bufPrint(&want_buf, "expected an integer in {d}..={d}", .{ lo, hi }) catch "expected an integer in range";
-}
-
-fn enumWant(allowed: []const []const u8) []const u8 {
-    var w: std.Io.Writer = .fixed(&want_buf);
-    w.writeAll("expected one of ") catch return "expected one of the allowed values";
-    for (allowed, 0..) |a, i| {
-        if (i != 0) w.writeAll("|") catch break;
-        w.writeAll(a) catch break;
-    }
-    return w.buffered();
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +268,13 @@ pub const Validation = struct {
 /// (caller-owned) or null when acceptable.
 pub fn validateOne(gpa: std.mem.Allocator, knob: *const Knob, raw: []const u8) !?[]u8 {
     switch (knob.kind) {
-        .bool => {
-            _ = parseBool(knob.key, raw) catch return try std.fmt.allocPrint(gpa, "{f}", .{last_error});
+        .bool => switch (parseBool(knob.key, raw)) {
+            .invalid => |d| return try std.fmt.allocPrint(gpa, "{f}", .{d}),
+            .absent, .value => {},
         },
-        .int => |r| {
-            _ = parseIntIn(i128, knob.key, raw, r.lo, r.hi) catch return try std.fmt.allocPrint(gpa, "{f}", .{last_error});
+        .int => |r| switch (parseIntIn(i128, knob.key, raw, r.lo, r.hi)) {
+            .invalid => |d| return try std.fmt.allocPrint(gpa, "{f}", .{d}),
+            .absent, .value => {},
         },
         .enumeration => |e| {
             const v = present(raw) orelse return null;
@@ -276,7 +284,10 @@ pub fn validateOne(gpa: std.mem.Allocator, knob: *const Knob, raw: []const u8) !
             for (e.retired) |rv| if (eqlIgnoreCase(v, rv.value)) {
                 return try std.fmt.allocPrint(gpa, "{s}='{s}' was RETIRED (forward-only — never a silent alias): {s}", .{ knob.key, v, rv.why });
             };
-            _ = parseEnum(knob.key, raw, e.allowed) catch return try std.fmt.allocPrint(gpa, "{f}", .{last_error});
+            switch (parseEnum(knob.key, raw, e.allowed)) {
+                .invalid => |d| return try std.fmt.allocPrint(gpa, "{f}", .{d}),
+                .absent, .value => {},
+            }
         },
         .str, .harness => {},
         .retired => |r| {
@@ -333,41 +344,96 @@ pub fn refusalReport(gpa: std.mem.Allocator, env: *const std.process.Environ.Map
 }
 
 // ---------------------------------------------------------------------------
-// In-process readers. They never panic and never refuse: the gate already
-// did. A malformed value here (only reachable when the gate was bypassed —
-// e.g. a knob set after startup) is logged and the default kept.
+// In-process readers. The key is comptime: the row is resolved at compile
+// time (an unregistered key cannot compile), the row's range is enforced
+// and the row's default is THE default — a call site carries none. They
+// never panic and never refuse: the gate already did. A malformed value here
+// (only reachable when the gate was bypassed — e.g. a knob set after
+// startup) is logged and the default kept.
 // ---------------------------------------------------------------------------
 
-pub fn boolKnob(env: *const std.process.Environ.Map, key: []const u8, default: bool) bool {
-    std.debug.assert(lookup(key) != null);
-    return (parseBool(key, env.get(key)) catch {
-        log.err("{f} — keeping the default ({})", .{ last_error, default });
-        return default;
-    }) orelse default;
+fn intRange(comptime key: []const u8, comptime T: type) struct { lo: T, hi: T } {
+    const r = comptime row(key);
+    comptime if (r.kind != .int) @compileError(key ++ " is not an integer row");
+    return comptime .{ .lo = @intCast(r.kind.int.lo), .hi = @intCast(r.kind.int.hi) };
 }
 
-pub fn intKnob(comptime T: type, env: *const std.process.Environ.Map, key: []const u8, default: T) T {
-    std.debug.assert(lookup(key) != null);
-    return (parseInt(T, key, env.get(key)) catch {
-        log.err("{f} — keeping the default ({d})", .{ last_error, default });
-        return default;
-    }) orelse default;
-}
-
-pub fn optIntKnob(comptime T: type, env: *const std.process.Environ.Map, key: []const u8) ?T {
-    std.debug.assert(lookup(key) != null);
-    return parseInt(T, key, env.get(key)) catch {
-        log.err("{f} — ignoring the override", .{last_error});
-        return null;
+/// A Bool row's default (`"0"`/`"1"`/`"on"`/…), typed at compile time.
+pub fn boolDefault(comptime key: []const u8) bool {
+    const r = comptime row(key);
+    comptime if (r.kind != .bool) @compileError(key ++ " is not a Bool row");
+    return comptime switch (parseBool(key, r.default)) {
+        .value => |v| v,
+        else => @compileError(key ++ " has no literal boolean default"),
     };
 }
 
-pub fn enumKnob(env: *const std.process.Environ.Map, key: []const u8, allowed: []const []const u8, default: []const u8) []const u8 {
-    std.debug.assert(lookup(key) != null);
-    return (parseEnum(key, env.get(key), allowed) catch {
-        log.err("{f} — keeping the default ({s})", .{ last_error, default });
-        return default;
-    }) orelse default;
+/// An Int row's literal default, typed and range-checked at compile time; a
+/// "derived" row has none (read it through `optIntKnob`).
+pub fn intDefault(comptime key: []const u8, comptime T: type) T {
+    const r = comptime row(key);
+    const range = comptime intRange(key, T);
+    return comptime switch (parseIntIn(T, key, r.default, range.lo, range.hi)) {
+        .value => |v| v,
+        else => @compileError(key ++ " has no literal integer default inside its range — derived rows are read with optIntKnob"),
+    };
+}
+
+pub fn boolKnob(comptime key: []const u8, env: *const std.process.Environ.Map) bool {
+    const default = comptime boolDefault(key);
+    return switch (parseBool(key, env.get(key))) {
+        .value => |v| v,
+        .absent => default,
+        .invalid => |d| blk: {
+            log.err("{f} — keeping the default ({})", .{ d, default });
+            break :blk default;
+        },
+    };
+}
+
+pub fn intKnob(comptime key: []const u8, comptime T: type, env: *const std.process.Environ.Map) T {
+    const default = comptime intDefault(key, T);
+    const range = comptime intRange(key, T);
+    return switch (parseIntIn(T, key, env.get(key), range.lo, range.hi)) {
+        .value => |v| v,
+        .absent => default,
+        .invalid => |d| blk: {
+            log.err("{f} — keeping the default ({d})", .{ d, default });
+            break :blk default;
+        },
+    };
+}
+
+/// A derived-default Int: null = absent (derive it); an out-of-range or
+/// malformed value is logged and ignored (derive it), never clamped.
+pub fn optIntKnob(comptime key: []const u8, comptime T: type, env: *const std.process.Environ.Map) ?T {
+    const range = comptime intRange(key, T);
+    return switch (parseIntIn(T, key, env.get(key), range.lo, range.hi)) {
+        .value => |v| v,
+        .absent => null,
+        .invalid => |d| blk: {
+            log.err("{f} — ignoring the override", .{d});
+            break :blk null;
+        },
+    };
+}
+
+pub fn enumKnob(comptime key: []const u8, env: *const std.process.Environ.Map) []const u8 {
+    const r = comptime row(key);
+    comptime if (r.kind != .enumeration) @compileError(key ++ " is not an enumeration row");
+    const allowed = r.kind.enumeration.allowed;
+    const default = comptime switch (parseEnum(key, r.default, allowed)) {
+        .value => |v| v,
+        else => @compileError(key ++ " has no default among its allowed values"),
+    };
+    return switch (parseEnum(key, env.get(key), allowed)) {
+        .value => |v| v,
+        .absent => default,
+        .invalid => |d| blk: {
+            log.err("{f} — keeping the default ({s})", .{ d, default });
+            break :blk default;
+        },
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -376,52 +442,70 @@ pub fn enumKnob(env: *const std.process.Environ.Map, key: []const u8, allowed: [
 
 const testing = std.testing;
 
+fn wantOf(comptime T: type, parsed: Parsed(T)) ![]const u8 {
+    return switch (parsed) {
+        .invalid => |d| std.fmt.bufPrint(&want_buf, "{f}", .{d.want}),
+        else => error.TestExpectedInvalid,
+    };
+}
+var want_buf: [160]u8 = undefined;
+
+fn rawOf(comptime T: type, parsed: Parsed(T)) ![]const u8 {
+    return switch (parsed) {
+        .invalid => |d| d.raw,
+        else => error.TestExpectedInvalid,
+    };
+}
+
 test "absent: unset, empty, whitespace-only are all absent; values are trimmed" {
     try testing.expectEqual(@as(?[]const u8, null), present(null));
     try testing.expectEqual(@as(?[]const u8, null), present(""));
     try testing.expectEqual(@as(?[]const u8, null), present("   "));
     try testing.expectEqual(@as(?[]const u8, null), present("\t\n"));
     try testing.expectEqualStrings("7", present(" 7 ").?);
-    try testing.expectEqual(@as(?bool, null), try parseBool("SQUEEZEFS_X", "  "));
-    try testing.expectEqual(@as(?i64, null), try parseIntIn(i64, "SQUEEZEFS_X", "", 0, 10));
+    try testing.expectEqual(Parsed(bool).absent, parseBool("SQUEEZEFS_X", "  "));
+    try testing.expectEqual(Parsed(i64).absent, parseIntIn(i64, "SQUEEZEFS_X", "", 0, 10));
 }
 
-test "booleans: all eight spellings, case-insensitive; =0 disables; junk refuses" {
-    for (bool_true) |t| try testing.expectEqual(@as(?bool, true), try parseBool("SQUEEZEFS_X", t));
-    for (bool_false) |f| try testing.expectEqual(@as(?bool, false), try parseBool("SQUEEZEFS_X", f));
-    try testing.expectEqual(@as(?bool, true), try parseBool("SQUEEZEFS_X", "YES"));
-    try testing.expectEqual(@as(?bool, true), try parseBool("SQUEEZEFS_X", "On"));
-    try testing.expectEqual(@as(?bool, false), try parseBool("SQUEEZEFS_X", "FALSE"));
-    try testing.expectError(error.Knob, parseBool("SQUEEZEFS_X", "yess"));
-    try testing.expectEqualStrings(bool_want, lastError().want);
-    try testing.expectEqualStrings("yess", lastError().raw);
+test "booleans: all eight spellings, case-insensitive; =0 disables; junk refuses with its diagnostic" {
+    for (bool_true) |t| try testing.expectEqual(Parsed(bool){ .value = true }, parseBool("SQUEEZEFS_X", t));
+    for (bool_false) |f| try testing.expectEqual(Parsed(bool){ .value = false }, parseBool("SQUEEZEFS_X", f));
+    try testing.expectEqual(Parsed(bool){ .value = true }, parseBool("SQUEEZEFS_X", "YES"));
+    try testing.expectEqual(Parsed(bool){ .value = true }, parseBool("SQUEEZEFS_X", "On"));
+    try testing.expectEqual(Parsed(bool){ .value = false }, parseBool("SQUEEZEFS_X", "FALSE"));
+    const bad = parseBool("SQUEEZEFS_X", "yess");
+    try testing.expectEqualStrings(bool_want, try wantOf(bool, bad));
+    try testing.expectEqualStrings("yess", try rawOf(bool, bad));
 }
 
 test "integers: range inclusive; out-of-range refuses naming the range, never clamps" {
-    try testing.expectEqual(@as(?u32, 1), try parseIntIn(u32, "SQUEEZEFS_X", "1", 1, 32));
-    try testing.expectEqual(@as(?u32, 32), try parseIntIn(u32, "SQUEEZEFS_X", "32", 1, 32));
-    try testing.expectError(error.Knob, parseIntIn(u32, "SQUEEZEFS_X", "64", 1, 32));
-    try testing.expectEqualStrings("expected an integer in 1..=32", lastError().want);
-    try testing.expectError(error.Knob, parseIntIn(u32, "SQUEEZEFS_X", "0", 1, 32));
-    try testing.expectError(error.Knob, parseIntIn(u32, "SQUEEZEFS_X", "4 2", 1, 32));
-    try testing.expectError(error.Knob, parseIntIn(u32, "SQUEEZEFS_X", "1e6", 1, 32));
-    try testing.expectError(error.Knob, parseIntIn(u32, "SQUEEZEFS_X", "5s", 1, 600_000));
-    try testing.expectError(error.Knob, parseInt(u64, "SQUEEZEFS_X", "-1"));
-    try testing.expectError(error.Knob, parseIntIn(i128, "SQUEEZEFS_X", "12.5", 1, 100));
+    try testing.expectEqual(Parsed(u32){ .value = 1 }, parseIntIn(u32, "SQUEEZEFS_X", "1", 1, 32));
+    try testing.expectEqual(Parsed(u32){ .value = 32 }, parseIntIn(u32, "SQUEEZEFS_X", "32", 1, 32));
+    try testing.expectEqualStrings("expected an integer in 1..=32", try wantOf(u32, parseIntIn(u32, "SQUEEZEFS_X", "64", 1, 32)));
+    try testing.expect(parseIntIn(u32, "SQUEEZEFS_X", "0", 1, 32) == .invalid);
+    try testing.expect(parseIntIn(u32, "SQUEEZEFS_X", "4 2", 1, 32) == .invalid);
+    try testing.expect(parseIntIn(u32, "SQUEEZEFS_X", "1e6", 1, 32) == .invalid);
+    try testing.expect(parseIntIn(u32, "SQUEEZEFS_X", "5s", 1, 600_000) == .invalid);
+    try testing.expect(parseIntIn(u64, "SQUEEZEFS_X", "-1", 0, 10) == .invalid);
+    // A percentage knob refuses a fraction and refuses > 100: never clamped, never parsed as a float.
+    try testing.expect(parseIntIn(i128, "SQUEEZEFS_X", "12.5", 1, 100) == .invalid);
+    try testing.expectEqualStrings("expected an integer in 1..=100", try wantOf(i128, parseIntIn(i128, "SQUEEZEFS_X", "250", 1, 100)));
 }
 
 test "enums: case-insensitive, canonical spelling returned; miss names the set" {
     const allowed = [_][]const u8{ "first-touch", "second-touch" };
-    try testing.expectEqualStrings("second-touch", (try parseEnum("SQUEEZEFS_X", "SECOND-TOUCH", &allowed)).?);
-    try testing.expectError(error.Knob, parseEnum("SQUEEZEFS_X", "third", &allowed));
-    try testing.expectEqualStrings("expected one of first-touch|second-touch", lastError().want);
+    try testing.expectEqualStrings("second-touch", parseEnum("SQUEEZEFS_X", "SECOND-TOUCH", &allowed).value);
+    try testing.expectEqualStrings("expected one of first-touch|second-touch", try wantOf([]const u8, parseEnum("SQUEEZEFS_X", "third", &allowed)));
 }
 
-test "KnobError formats as key='raw' is invalid: want" {
-    const e = KnobError{ .key = "SQUEEZEFS_X", .raw = "zz", .want = "expected an integer in 1..=4" };
-    var buf: [128]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, "{f}", .{e});
-    try testing.expectEqualStrings("SQUEEZEFS_X='zz' is invalid: expected an integer in 1..=4", s);
+test "Diagnostic formats as key='raw' is invalid: want — a value, no thread-local, two diagnostics coexist" {
+    const a = Diagnostic{ .key = "SQUEEZEFS_X", .raw = "zz", .want = .{ .int_range = .{ .lo = 1, .hi = 4 } } };
+    const b = Diagnostic{ .key = "SQUEEZEFS_N", .raw = "q", .want = .boolean };
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("SQUEEZEFS_X='zz' is invalid: expected an integer in 1..=4", try std.fmt.bufPrint(&buf, "{f}", .{a}));
+    try testing.expectEqualStrings("SQUEEZEFS_N='q' is invalid: " ++ bool_want, try std.fmt.bufPrint(&buf, "{f}", .{b}));
+    // The first diagnostic is intact after the second was formatted.
+    try testing.expectEqualStrings("SQUEEZEFS_X='zz' is invalid: expected an integer in 1..=4", try std.fmt.bufPrint(&buf, "{f}", .{a}));
 }
 
 test "registry hygiene: unique keys, non-empty default and doc, our namespace" {
@@ -460,7 +544,7 @@ test "gate: every offender at once, sorted; unknown announced not refused" {
     try env.put("SQUEEZEFS_TRANSPORT_MEM_PCT", "250");
     try env.put("SQUEEZEFS_NOT_A_KNOB", "1");
     try env.put("PATH", "/usr/bin");
-    try env.put("SQUEEZEFS_PARKED_GATE_ASSIST_MS", "   ");
+    try env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "   ");
 
     var v = try validateVars(gpa, &env);
     defer v.deinit(gpa);
@@ -510,25 +594,60 @@ test "validateOne: retired knob refuses only when present; retired enum value na
     try testing.expectEqual(@as(?[]u8, null), try validateOne(gpa, &enum_knob, "B"));
 }
 
-test "readers: =0 disables a default-ON knob; bogus keeps the default; absent keeps the default" {
+test "readers: the row is the default and the range; =0 disables a default-ON knob; bogus keeps the default loudly; out-of-range is ignored, never clamped" {
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    try testing.expect(boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", true));
-    for (bool_false) |f| {
-        try env.put("SQUEEZEFS_TEST_META_BUFFERED", f);
-        try testing.expect(!boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", true));
-    }
+    // The Bool row's default comes from the row ("0").
+    try testing.expect(!boolKnob("SQUEEZEFS_TEST_META_BUFFERED", &env));
     for (bool_true) |t| {
         try env.put("SQUEEZEFS_TEST_META_BUFFERED", t);
-        try testing.expect(boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", false));
+        try testing.expect(boolKnob("SQUEEZEFS_TEST_META_BUFFERED", &env));
+    }
+    for (bool_false) |f| {
+        try env.put("SQUEEZEFS_TEST_META_BUFFERED", f);
+        try testing.expect(!boolKnob("SQUEEZEFS_TEST_META_BUFFERED", &env));
     }
     try env.put("SQUEEZEFS_TEST_META_BUFFERED", "bogus");
     log.testing.expectErrorLogs(1);
-    try testing.expect(boolKnob(&env, "SQUEEZEFS_TEST_META_BUFFERED", true));
+    try testing.expect(!boolKnob("SQUEEZEFS_TEST_META_BUFFERED", &env));
     try log.testing.expectAllFired();
-    try testing.expectEqual(@as(?u32, null), optIntKnob(u32, &env, "SQUEEZEFS_URING_FS_WORKERS"));
+    // A derived row: absent is null; the row's range (1..=64) is enforced.
+    try testing.expectEqual(@as(?u32, null), optIntKnob("SQUEEZEFS_URING_FS_WORKERS", u32, &env));
     try env.put("SQUEEZEFS_URING_FS_WORKERS", "12");
-    try testing.expectEqual(@as(?u32, 12), optIntKnob(u32, &env, "SQUEEZEFS_URING_FS_WORKERS"));
-    try testing.expectEqual(@as(u32, 12), intKnob(u32, &env, "SQUEEZEFS_URING_FS_WORKERS", 4));
+    try testing.expectEqual(@as(?u32, 12), optIntKnob("SQUEEZEFS_URING_FS_WORKERS", u32, &env));
+    try env.put("SQUEEZEFS_URING_FS_WORKERS", "65");
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(@as(?u32, null), optIntKnob("SQUEEZEFS_URING_FS_WORKERS", u32, &env));
+    try log.testing.expectAllFired();
+    // A literal-default row: the row's "1000" is THE default; out-of-range keeps it.
+    try testing.expectEqual(@as(u64, 1000), intDefault("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", u64));
+    try testing.expectEqual(@as(u64, 1000), intKnob("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", u64, &env));
+    try env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "500");
+    try testing.expectEqual(@as(u64, 500), intKnob("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", u64, &env));
+    try env.put("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", "0");
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(@as(u64, 1000), intKnob("SQUEEZEFS_CHECKPOINT_MAX_AGE_MS", u64, &env));
+    try log.testing.expectAllFired();
+    try testing.expect(!boolDefault("SQUEEZEFS_TEST_META_BUFFERED"));
+}
+
+test "classes: every row is one of the charter's shapes; a seam is named SQUEEZEFS_TEST_ and default-inert; every A/B lever names its arm" {
+    for (registry) |k| {
+        const is_seam = std.mem.startsWith(u8, k.key, "SQUEEZEFS_TEST_");
+        switch (k.class) {
+            .test_seam => {
+                try testing.expect(is_seam);
+                // Default-inert: absent derives, or the off/zero arm.
+                try testing.expect(std.mem.eql(u8, k.default, "derived") or std.mem.eql(u8, k.default, "0") or std.mem.eql(u8, k.default, "off"));
+            },
+            .ab_lever => try testing.expect(std.mem.indexOf(u8, k.doc, "A/B lever:") != null),
+            .harness => try testing.expect(is_seam and k.kind == .harness),
+            .derived_override => {
+                try testing.expectEqualStrings("derived", k.default);
+                try testing.expect(k.kind == .int);
+            },
+            .switch_, .config, .enum_select, .retired => {},
+        }
+    }
 }

@@ -30,11 +30,14 @@ than wakers), and swapping scheduling policy inside std is not an option.
    `std.testing.io` (`Io.Threaded`) today; the Linux venue runs the same tests.
 2. **Executor:** `src/exec/` will provide our own `Io` implementation (`SqzIo`) satisfying §9:
    per-core handler lanes keyed by CPU/NUMA node, the `sqz-meta` pool, journal-lane threads that
-   park in their own ring (`io/uring_fs.OwnedRing` already is that ring), the blocking pool
+   park in their own ring (`io/ring_park.ParkedRing` is that ring: the eventfd wake through the
+   coalescer, the armed READ, the submit-first EXT_ARG park), the blocking pool
    (`cap = cpus × 16`, floor 8), the timer thread (binary heap + cancel-safe tombstones), the
    fd-watch thread, waker-based task futures. It lands with rung 3 (the FUSE transport needs the
-   lanes); rung 2b's device-bound pieces (the journal lane) use `OwnedRing` directly because a lane
-   thread IS an OS thread owning a ring — no `Io` needed for its own parking.
+   lanes); rung 2b's device-bound pieces (the journal lane, `meta/journal_lane.Worker`) embed
+   `ParkedRing` directly because a lane thread IS an OS thread owning a ring — no `Io` needed for
+   its own parking; the caller side parks on the lane-class `sync/completion.zig` cell over the raw
+   futex (`sync/futex.zig`), never on an `Io` (item 4).
 3. **Primitives:** `src/sync/` implements the charter's primitives over the `Io` futex ops so
    they work under ANY `Io` (Threaded today, `SqzIo` later): `Mutex`/`RwLock` (release flips free
    and wakes the queue front; woken waiters re-contend; a fresh attempt takes a free lock only when

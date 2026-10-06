@@ -93,6 +93,15 @@ pub const fuse = struct {
 // ---- the CLI verbs (charter §8; the volume verbs are Linux-only inside) ----
 pub const cli = @import("cli/cli.zig");
 
+// ---- the data plane (charter §6) ----
+pub const data = struct {
+    // @anchor:data_layouts_import
+    // @anchor:data_alloc_import
+    // @anchor:data_transform_import
+    // @anchor:data_write_import
+    // @anchor:data_read_import
+};
+
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
 
@@ -117,6 +126,11 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:data_layouts_test
+    // @anchor:data_alloc_test
+    // @anchor:data_transform_test
+    // @anchor:data_write_test
+    // @anchor:data_read_test
     _ = exec;
     _ = fuse.abi;
     _ = fuse.codec;

@@ -33,22 +33,22 @@ pub const page_bits: u64 = page_data_len * 8;
 /// u64 words per page (`4072 / 8`); 32,576 = 509 × 64, so page boundaries
 /// fall on word boundaries and the mirror serializes word-wise.
 pub const words_per_page: usize = page_data_len / 8;
-/// "KVAB".
-pub const page_magic: u32 = 0x4B56_4142;
+/// ASCII "KVAB" read as a little-endian u32: ASCII order on disk.
+pub const page_magic: u32 = std.mem.readInt(u32, "KVAB", .little);
 const off_magic = 0;
 const off_page_index = 4;
 const off_generation = 8;
 const off_checksum = 16;
 
-/// Allocator deltas ride the journal under this tree id.
+/// Heap-allocator deltas ride the journal under this tree id (the DATA
+/// allocation bitmap's deltas of rung 6 take `key.TREE_DATA_ALLOC_RESERVED`
+/// = 5 — a distinct kind, never a key-length arm under this one; decision
+/// 0002 row 44).
 pub const tree_alloc_reserved: u8 = 4;
 pub const rec_allocated: u8 = 1;
 pub const rec_freed: u8 = 2;
 /// Big-endian u64 — memcmp-ordered like every key.
 pub const extent_key_len: usize = 8;
-/// A DATA allocation delta shares the kind under a `vol_tag`-prefixed
-/// 16-byte key; the heap allocator's replay skips it.
-pub const data_alloc_key_len: usize = 16;
 
 /// The pressure valve's cap: far above steady state (any parked retirement
 /// drains within 2 barriered cycles); `builder_pending_cap` because the
@@ -203,24 +203,6 @@ pub fn pageSlotOffset(page: u64, slot: u8) u64 {
 // The wrapper.
 // ---------------------------------------------------------------------------
 
-/// Which appender an allocator instance IS. The allocator's view only: the
-/// ledger/journal validate the full partition (writers ∈ 1..=16, power of
-/// two, id < writers); here it names the owned pages.
-pub const AppendPartition = struct {
-    writer_id: u16,
-    writers: u16,
-
-    pub const solo: AppendPartition = .{ .writer_id = 0, .writers = 1 };
-
-    pub fn isSolo(self: AppendPartition) bool {
-        return self.writers == 1;
-    }
-};
-
-fn partitionMapFor(part: AppendPartition) alloc_core.PartitionMap {
-    return if (part.isSolo()) alloc_core.PartitionMap.solo(page_bits) else alloc_core.PartitionMap.new(part.writers, page_bits);
-}
-
 const PageState = struct {
     generation: std.atomic.Value(u64),
     /// 0 = A, 1 = B, `slot_none` = fresh.
@@ -231,7 +213,7 @@ pub const ReplayRecord = struct { tree_id: u8, key: []const u8, value: []const u
 
 /// One recovered journal entry: records in position order, so record `i`'s
 /// position (the park gate) is `seq + i`.
-pub const ReplayEntry = struct { writer_id: u16 = 0, seq: u64, records: []const ReplayRecord };
+pub const ReplayEntry = struct { seq: u64, records: []const ReplayRecord };
 
 pub const NoSpace = struct {
     free: u64,
@@ -250,24 +232,21 @@ pub const PendingFreeFull = struct {
     }
 };
 
-pub const LoadError = error{ MalformedDelta, PartitionViolation, OutOfMemory };
+pub const LoadError = error{ MalformedDelta, OutOfMemory };
 
 pub const LoadRefusal = union(enum) {
     delta: DeltaRefusal,
-    partition: struct { extent: u64, writer: u16, seq: u64, owner: u16 },
 
     pub fn write(self: LoadRefusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .delta => |d| try d.write(w),
-            .partition => |p| try w.print("replayed allocator delta for extent {d} came from writer {d} at seq {d}, but that extent belongs to writer {d}'s bitmap partition (spec §6.2 item 3 — the appenders were not disjoint)", .{ p.extent, p.writer, p.seq, p.owner }),
         }
     }
 };
 
-const ReplayedPark = struct { writer: u16, seq: u64, extent: u64 };
+const ReplayedPark = struct { seq: u64, extent: u64 };
 
 fn parkLess(_: void, a: ReplayedPark, b: ReplayedPark) bool {
-    if (a.writer != b.writer) return a.writer < b.writer;
     if (a.seq != b.seq) return a.seq < b.seq;
     return a.extent < b.extent;
 }
@@ -280,38 +259,23 @@ pub const ExtentAllocator = struct {
     /// One bit per page: diverged from the newest on-disk copy since the last
     /// `beginDirtyPageWrite`.
     dirty: []std.atomic.Value(u64),
-    partition: AppendPartition,
-    /// Pages this appender persisted that it does NOT own — the ownership
-    /// tripwire; legitimately nonzero exactly once, on a recovery mount.
-    /// Heap-allocated so the serialized writer bumps it through the shared
-    /// `*const` handle every claimer holds.
-    foreign_page_writes: *std.atomic.Value(u64),
     /// Replayed in-window frees `load` deferred until `parkReplayedFrees`
     /// knows the mounted roots. Mount-time only (single-threaded).
     replayed_parks: std.ArrayList(ReplayedPark),
 
+    /// All-free, EVERY page dirty (the first checkpoint persists the whole
+    /// bitmap).
     pub fn format(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize) !ExtentAllocator {
-        return formatPartitioned(gpa, total, reserve, pending_cap, .solo);
-    }
-
-    /// All-free. Solo starts EVERY page dirty (the first checkpoint persists
-    /// the whole bitmap); a partitioned appender starts only its OWN pages
-    /// dirty — writing a foreign page is the A/B clobber the partition
-    /// exists to prevent.
-    pub fn formatPartitioned(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize, part: AppendPartition) !ExtentAllocator {
-        var self = try initEmpty(gpa, total, reserve, pending_cap, part);
+        var self = try initEmpty(gpa, total, reserve, pending_cap);
         errdefer self.deinit();
-        const map = partitionMapFor(part);
         var page: u64 = 0;
-        while (page < self.pages) : (page += 1) {
-            if (part.isSolo() or map.ownerOfPage(page) == part.writer_id) self.markPageDirty(page);
-        }
+        while (page < self.pages) : (page += 1) self.markPageDirty(page);
         return self;
     }
 
-    fn initEmpty(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize, part: AppendPartition) !ExtentAllocator {
+    fn initEmpty(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize) !ExtentAllocator {
         const pages = bitmapPagesFor(total);
-        var core = try ExtCore.initPartitioned(gpa, total, reserve, pending_cap, partitionMapFor(part));
+        var core = try ExtCore.init(gpa, total, reserve, pending_cap);
         errdefer core.deinit();
         const states = try gpa.alloc(PageState, @intCast(pages));
         errdefer gpa.free(states);
@@ -319,22 +283,17 @@ pub const ExtentAllocator = struct {
         const dirty = try gpa.alloc(std.atomic.Value(u64), @intCast((pages + 63) / 64));
         errdefer gpa.free(dirty);
         for (dirty) |*d| d.* = .init(0);
-        const foreign = try gpa.create(std.atomic.Value(u64));
-        foreign.* = .init(0);
         return .{
             .gpa = gpa,
             .core = core,
             .pages = pages,
             .page_states = states,
             .dirty = dirty,
-            .partition = part,
-            .foreign_page_writes = foreign,
             .replayed_parks = .empty,
         };
     }
 
     pub fn deinit(self: *ExtentAllocator) void {
-        self.gpa.destroy(self.foreign_page_writes);
         self.replayed_parks.deinit(self.gpa);
         self.gpa.free(self.dirty);
         self.gpa.free(self.page_states);
@@ -342,20 +301,13 @@ pub const ExtentAllocator = struct {
         self.* = undefined;
     }
 
-    /// Mount (solo): `region` is the bitmap region as read (short ⇒
-    /// zero-extended: zeros verify nothing and read as fresh pages),
-    /// `mounted_tail` the selected ledger record's `journal_tail_seq`,
-    /// `replay` the recovered window in order.
+    /// Mount: `region` is the bitmap region as read (short ⇒ zero-extended:
+    /// zeros verify nothing and read as fresh pages), `mounted_tail` the
+    /// selected ledger record's `journal_tail_seq`, `replay` the recovered
+    /// window in order.
     pub fn load(gpa: std.mem.Allocator, region: []const u8, total: u64, reserve: u64, pending_cap: usize, mounted_tail: u64, replay: []const ReplayEntry, diag: ?*LoadRefusal) LoadError!ExtentAllocator {
-        return loadPartitioned(gpa, region, total, reserve, pending_cap, .solo, &.{mounted_tail}, replay, diag);
-    }
-
-    /// `load` for appender `part`: one mounted tail per appender (index =
-    /// writer id; a missing one seeds 0 — nothing covered).
-    pub fn loadPartitioned(gpa: std.mem.Allocator, region: []const u8, total: u64, reserve: u64, pending_cap: usize, part: AppendPartition, mounted_tails: []const u64, replay: []const ReplayEntry, diag: ?*LoadRefusal) LoadError!ExtentAllocator {
-        var self = try initEmpty(gpa, total, reserve, pending_cap, part);
+        var self = try initEmpty(gpa, total, reserve, pending_cap);
         errdefer self.deinit();
-        const map = partitionMapFor(part);
 
         // 1–2. Per page: both slots decoded; newest valid wins (strict >, A
         // wins ties — writes never produce ties, law 2); none valid ⇒ fresh.
@@ -381,38 +333,27 @@ pub const ExtentAllocator = struct {
             }
         }
 
-        // 3. Seed every coverage clock at its mounted tail: nothing at or
+        // 3. Seed the coverage clock at the mounted tail: nothing at or
         // after it is covered, so no replayed free drains before a
         // POST-mount checkpoint's tail passes it.
-        var w: u64 = 0;
-        while (w < part.writers) : (w += 1) {
-            const tail = if (w < mounted_tails.len) mounted_tails[@intCast(w)] else 0;
-            _ = self.core.advanceDurableIn(w, tail, {}, ignoreRelease);
-        }
+        _ = self.core.advanceDurable(mounted_tail, {}, ignoreRelease);
 
         // 4. Fold the window's deltas per extent, newest wins (the gate is
         // the record's POSITION). Folding first is load-bearing: a free
         // superseded by a later in-window re-alloc must fold AWAY, or its
         // post-mount drain would clear a LIVE extent's bit.
-        const Folded = struct { writer: u16, seq: u64, delta: AllocDelta };
+        const Folded = struct { seq: u64, delta: AllocDelta };
         var folded: std.AutoHashMapUnmanaged(u64, Folded) = .empty;
         defer folded.deinit(gpa);
         for (replay) |entry| {
             for (entry.records, 0..) |rec, i| {
                 if (rec.tree_id != tree_alloc_reserved) continue;
-                if (rec.key.len == data_alloc_key_len) continue;
                 var ddiag: DeltaRefusal = undefined;
                 const delta = decodeAllocRecord(rec.key, rec.value, &ddiag) catch {
                     if (diag) |d| d.* = .{ .delta = ddiag };
                     return error.MalformedDelta;
                 };
-                const extent = delta.extent();
-                const owner: u16 = @intCast(map.ownerOfExtent(extent));
-                if (owner != entry.writer_id) {
-                    if (diag) |d| d.* = .{ .partition = .{ .extent = extent, .writer = entry.writer_id, .seq = entry.seq, .owner = owner } };
-                    return error.PartitionViolation;
-                }
-                try folded.put(gpa, extent, .{ .writer = entry.writer_id, .seq = entry.seq + i, .delta = delta });
+                try folded.put(gpa, delta.extent(), .{ .seq = entry.seq + i, .delta = delta });
             }
         }
 
@@ -431,7 +372,7 @@ pub const ExtentAllocator = struct {
                     // claimed-while-pending contract holds; the park itself
                     // waits for the roots.
                     self.core.markAllocated(extent);
-                    try self.replayed_parks.append(gpa, .{ .writer = kv.value_ptr.writer, .seq = kv.value_ptr.seq, .extent = extent });
+                    try self.replayed_parks.append(gpa, .{ .seq = kv.value_ptr.seq, .extent = extent });
                 },
             }
             self.markDirty(extent);
@@ -479,14 +420,6 @@ pub const ExtentAllocator = struct {
         return self.core.total;
     }
 
-    pub fn ownsExtent(self: *const ExtentAllocator, extent: u64) bool {
-        return self.core.map.ownerOfExtent(extent) == self.partition.writer_id;
-    }
-
-    pub fn foreignPageWrites(self: *const ExtentAllocator) u64 {
-        return self.foreign_page_writes.load(.monotonic);
-    }
-
     pub fn reserveExtents(self: *const ExtentAllocator) u64 {
         return self.core.reserve;
     }
@@ -500,7 +433,7 @@ pub const ExtentAllocator = struct {
     }
 
     pub fn durableSeq(self: *const ExtentAllocator) u64 {
-        return self.core.durableSeqIn(self.partition.writer_id);
+        return self.core.durableSeq();
     }
 
     pub fn isAllocated(self: *const ExtentAllocator, extent: u64) bool {
@@ -524,14 +457,9 @@ pub const ExtentAllocator = struct {
         return max;
     }
 
-    /// The typed ENOSPC detail for a `.user` refusal on `writer`'s
-    /// partition — THIS partition's budget, never the aggregate.
-    pub fn noSpaceIn(self: *const ExtentAllocator, writer: u16) NoSpace {
-        return .{ .free = self.core.freeExtentsIn(writer), .reserve = self.core.reserve };
-    }
-
+    /// The typed ENOSPC detail for a `.user` refusal.
     pub fn noSpace(self: *const ExtentAllocator) NoSpace {
-        return self.noSpaceIn(self.partition.writer_id);
+        return .{ .free = self.core.freeExtents(), .reserve = self.core.reserve };
     }
 
     pub fn pendingFreeFull(self: *const ExtentAllocator) PendingFreeFull {
@@ -539,25 +467,19 @@ pub const ExtentAllocator = struct {
     }
 
     pub fn claimUser(self: *const ExtentAllocator) error{NoSpace}!u64 {
-        return self.claimIn(self.partition.writer_id, .user);
-    }
-
-    /// On ANOTHER appender's partition (a mount holding the volume alone
-    /// allocating for an absent peer).
-    pub fn claimUserIn(self: *const ExtentAllocator, writer: u16) error{NoSpace}!u64 {
-        return self.claimIn(writer, .user);
+        return self.claim(.user);
     }
 
     /// May consume the reserve; `NoSpace` here is a genuinely exhausted heap.
     pub fn claimInternal(self: *const ExtentAllocator) error{NoSpace}!u64 {
-        return self.claimIn(self.partition.writer_id, .internal);
+        return self.claim(.internal);
     }
 
-    fn claimIn(self: *const ExtentAllocator, writer: u16, class: AllocClass) error{NoSpace}!u64 {
-        const extent = self.core.claimIn(writer, class) catch |err| switch (err) {
+    fn claim(self: *const ExtentAllocator, class: AllocClass) error{NoSpace}!u64 {
+        const extent = self.core.claim(class) catch |err| switch (err) {
             error.NoSpace => return error.NoSpace,
             error.InvariantDrift => {
-                log.err("KV extent allocator INVARIANT DRIFT: the free budget won an entitlement the bitmap could not honour after {d} full rescans (free={d}, reserve={d}, total={d}). Refusing the claim instead of spinning; the volume needs an fsck (class C2/C3)", .{ alloc_core.claim_rescan_limit, self.core.freeExtentsIn(writer), self.core.reserve, self.core.total });
+                log.err("KV extent allocator INVARIANT DRIFT: the free budget won an entitlement the bitmap could not honour after {d} full rescans (free={d}, reserve={d}, total={d}). Refusing the claim instead of spinning; the volume needs an fsck (class C2/C3)", .{ alloc_core.claim_rescan_limit, self.core.freeExtents(), self.core.reserve, self.core.total });
                 return error.NoSpace;
             },
         };
@@ -580,22 +502,18 @@ pub const ExtentAllocator = struct {
     }
 
     pub fn pendingHasRoom(self: *const ExtentAllocator) bool {
-        return self.core.pendingHasRoomIn(self.partition.writer_id);
+        return self.core.pendingHasRoom();
     }
 
     /// For an SMO that parks `n` retirements (a merge parks two).
     pub fn pendingHasRoomFor(self: *const ExtentAllocator, n: u64) bool {
-        return self.core.pendingRoomIn(self.partition.writer_id) >= n;
+        return self.core.pendingRoom() >= n;
     }
 
     /// The coverage gate: `tail` is a post-barrier ledger record's
-    /// `journal_tail_seq` of THIS appender. Released pages are dirtied.
+    /// `journal_tail_seq`. Released pages are dirtied.
     pub fn advanceDurable(self: *const ExtentAllocator, tail: u64) u64 {
-        return self.advanceDurableIn(self.partition.writer_id, tail);
-    }
-
-    pub fn advanceDurableIn(self: *const ExtentAllocator, writer: u16, tail: u64) u64 {
-        const n = self.core.advanceDurableIn(writer, tail, self, markDirtyCb);
+        const n = self.core.advanceDurable(tail, self, markDirtyCb);
         if (n > 0) meta_kv_pending_free_released.add(n);
         meta_kv_pending_free.set(self.core.pendingCount());
         return n;
@@ -702,21 +620,6 @@ pub const ExtentAllocator = struct {
         const pages = page_buf[0..n_pages];
         if (pages.len == 0) return .{ .gpa = self.gpa, .writes = &.{}, .settled = true };
 
-        if (!self.partition.isSolo()) {
-            var foreign: u64 = 0;
-            var first_foreign: [4]u32 = undefined;
-            for (pages) |p| {
-                if (self.core.map.ownerOfPage(p) != self.partition.writer_id) {
-                    if (foreign < 4) first_foreign[@intCast(foreign)] = p;
-                    foreign += 1;
-                }
-            }
-            if (foreign > 0) {
-                _ = self.foreign_page_writes.fetchAdd(foreign, .monotonic);
-                log.warn("bitmap: appender {d} is persisting {d} page(s) it does not own ({any}…) — legitimate only for a recovery mount holding the volume alone; in steady multi-appender operation this is a partition leak (spec §6.2 item 3)", .{ self.partition.writer_id, foreign, first_foreign[0..@intCast(@min(foreign, 4))] });
-            }
-        }
-
         self.core.snapshotWords(words);
         const writes = self.gpa.alloc(PageWrite, pages.len) catch |err| {
             // Law 1: the snapshot is this write's only copy.
@@ -817,9 +720,9 @@ test "bitmap page image: exact round-trip; wrong magic, index, checksum and an o
     bits[4071] = 0x80;
     var img: [page_len]u8 = undefined;
     try encodeBitmapPage(3, 42, &bits, &img);
-    // The u32 magic is little-endian on disk: "KVAB" read as a BE word.
+    // ASCII order on disk.
     try testing.expectEqual(page_magic, std.mem.readInt(u32, img[0..4], .little));
-    try testing.expectEqualSlices(u8, &.{ 0x42, 0x41, 0x56, 0x4B }, img[0..4]);
+    try testing.expectEqualStrings("KVAB", img[0..4]);
     try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, img[4..8], .little));
     try testing.expectEqual(@as(u64, 42), std.mem.readInt(u64, img[8..16], .little));
     const d = try decodeBitmapPage(&img, 3);
@@ -1075,7 +978,7 @@ test "replayed parks beyond the FIFO cap overflow (counted, warned) instead of r
     try testing.expectEqual(@as(u64, 3), alloc.advanceDurable(6));
 }
 
-test "load refuses a malformed replayed delta loud, ignores other kinds and 16-byte data-alloc keys, and refuses a cross-partition delta" {
+test "load refuses a malformed replayed delta loud (a 16 B key under kind 4 included: the data bitmap's deltas are kind 5) and ignores other kinds" {
     const gpa = testing.allocator;
     var region: [8192]u8 = @splat(0);
     const k1 = extentKey(1);
@@ -1085,22 +988,19 @@ test "load refuses a malformed replayed delta loud, ignores other kinds and 16-b
     try testing.expectError(error.MalformedDelta, ExtentAllocator.load(gpa, &region, 8, 0, 2, 0, &.{.{ .seq = 1, .records = &malformed }}, &diag));
     var buf: [256]u8 = undefined;
     try testing.expectEqualStrings("malformed allocator delta value (2 bytes, tag Some(9)) for extent 1", fmtRefusal(&buf, diag));
-    // Kind 1 garbage and a 16-byte key under kind 4 are both ignored.
     const data_key: [16]u8 = @splat(0xAB);
+    const wide = [_]ReplayRecord{.{ .tree_id = tree_alloc_reserved, .key = &data_key, .value = &allocRecordValue() }};
+    try testing.expectError(error.MalformedDelta, ExtentAllocator.load(gpa, &region, 8, 0, 2, 0, &.{.{ .seq = 1, .records = &wide }}, &diag));
+    try testing.expectEqualStrings("extent key must be 8 bytes, got 16", fmtRefusal(&buf, diag));
+    // Kind 1 garbage and a kind-5 (data-alloc) record are both ignored.
+    const key = @import("key.zig");
     const ignored = [_]ReplayRecord{
         .{ .tree_id = 1, .key = &k1, .value = &bad },
-        .{ .tree_id = tree_alloc_reserved, .key = &data_key, .value = &bad },
+        .{ .tree_id = key.TREE_DATA_ALLOC_RESERVED, .key = &data_key, .value = &bad },
     };
     var ok = try ExtentAllocator.load(gpa, &region, 8, 0, 2, 0, &.{.{ .seq = 1, .records = &ignored }}, &diag);
     defer ok.deinit();
     try testing.expectEqual(@as(u64, 8), ok.freeExtents());
-    // Writer 1 naming extent 1 (page 0 = writer 0's) on a 2-way partition.
-    const av = allocRecordValue();
-    const foreign = [_]ReplayRecord{.{ .tree_id = tree_alloc_reserved, .key = &k1, .value = &av }};
-    const part: AppendPartition = .{ .writer_id = 1, .writers = 2 };
-    var big_region: [4 * 8192]u8 = @splat(0);
-    try testing.expectError(error.PartitionViolation, ExtentAllocator.loadPartitioned(gpa, &big_region, 2 * page_bits, 8, 4, part, &.{ 0, 0 }, &.{.{ .writer_id = 1, .seq = 3, .records = &foreign }}, &diag));
-    try testing.expectEqualStrings("replayed allocator delta for extent 1 came from writer 1 at seq 3, but that extent belongs to writer 0's bitmap partition (spec §6.2 item 3 — the appenders were not disjoint)", fmtRefusal(&buf, diag));
 }
 
 test "DUR-4: abort restores the dirty set (law 1); a retry at a stale generation is raised above the newest copy (law 2) and counted" {
@@ -1133,30 +1033,6 @@ test "DUR-4: abort restores the dirty set (law 1); a retry at a stale generation
     var empty = try alloc.beginDirtyPageWrite(7);
     try testing.expectEqual(@as(usize, 0), empty.writes.len);
     empty.deinit();
-}
-
-test "partitioned format dirties only owned pages; a foreign page write is counted and warned, still written" {
-    const gpa = testing.allocator;
-    const total = 3 * page_bits;
-    const region = try gpa.alloc(u8, bitmapRegionLen(total));
-    defer gpa.free(region);
-    @memset(region, 0);
-    const part: AppendPartition = .{ .writer_id = 1, .writers = 2 };
-    var alloc = try ExtentAllocator.formatPartitioned(gpa, total, 16, 8, part);
-    defer alloc.deinit();
-    const w1 = try alloc.writeDirtyPagesToRegion(region, 1);
-    defer gpa.free(w1);
-    try testing.expectEqualSlices(u32, &.{1}, w1);
-    try testing.expect(alloc.ownsExtent(page_bits));
-    try testing.expect(!alloc.ownsExtent(0));
-    // Recovery: this appender allocates in writer 0's partition.
-    const e = try alloc.claimUserIn(0);
-    try testing.expect(e < page_bits);
-    const w2 = try alloc.writeDirtyPagesToRegion(region, 2);
-    defer gpa.free(w2);
-    try testing.expectEqualSlices(u32, &.{0}, w2);
-    try testing.expectEqual(@as(u64, 1), alloc.foreignPageWrites());
-    try testing.expectEqual(@as(u64, 2), (try decodeBitmapPage(region[0..page_len], 0)).generation);
 }
 
 test "invariant drift surfaces as a loud NoSpace at the wrapper" {

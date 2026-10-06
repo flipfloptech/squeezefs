@@ -35,6 +35,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const counters = @import("../core/counters.zig");
+const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const alloc_core = @import("alloc_core.zig");
 const alloc_ext = @import("alloc_ext.zig");
@@ -75,10 +76,10 @@ pub const NoSpace = struct {
 /// for the volume).
 pub const HeapError = error{NoSpace};
 
-/// `NoSpace → ENOSPC` — the one row of the errno table this module owns.
-pub fn errno(e: HeapError) std.os.linux.E {
+/// `NoSpace` is the ONE table's `NoSpaceLeft` (ENOSPC).
+pub fn coreError(e: HeapError) errors.Error {
     return switch (e) {
-        error.NoSpace => .NOSPC,
+        error.NoSpace => error.NoSpaceLeft,
     };
 }
 
@@ -920,8 +921,8 @@ test "full-heap contract: every admitted member is flushable (in place or promis
     const before = stats.meta_kv_enospc_refusals.load();
     const e = finalizeRefusal(&posture, "test-vol", refused.items[0].why, ledger.load());
     try testing.expectEqual(HeapError.NoSpace, e);
-    try testing.expectEqual(std.os.linux.E.NOSPC, errno(e));
-    try testing.expectEqual(@as(u16, 28), @backingInt(errno(e)));
+    try testing.expectEqual(std.os.linux.E.NOSPC, errors.toErrno(coreError(e)));
+    try testing.expectEqual(@as(u16, 28), @backingInt(errors.toErrno(coreError(e))));
     try testing.expectEqual(before + 1, stats.meta_kv_enospc_refusals.load());
     try testing.expect(posture.isFull());
     try testing.expectEqual(@as(u64, 1), alloc_ext.meta_kv_heap_full.load());

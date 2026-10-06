@@ -14,19 +14,36 @@
 //! at the consumed seq, so a reader polling the predicted next slot never
 //! stops on a gap.
 //!
-//! Slot image (little-endian; always a FULL zero-padded 4096 B write so a
-//! shorter record can never leave a longer predecessor's tail parseable):
+//! Slot image (little-endian; ONE fixed layout, format v4 — decision 0002
+//! row 39; always a FULL zero-padded 4096 B write so a shorter record can
+//! never leave a longer predecessor's tail parseable):
 //!
-//!     [0..4)   magic "KVRL"   [4..8) len = payload_len   [8..16) seq
-//!     [16..24) xxh3( image[0..16] ‖ 0⁸ ‖ payload )
-//!     payload @24: journal_tail_seq u64 ‖ next_ino u64 ‖ alloc_bitmap_generation u64 ‖
-//!                  node_seq_watermark u64 ‖ n_roots u16 ‖ n_roots × {tree_id u8 ‖ node_addr u64 ‖ node_seq u64}
-//!                  [membership stamp] [append partition: writer_id u16 ‖ writer_count u16]
+//!     [0..4)   magic "KVRL"   [4..6) version u16 = 1   [6..8) len = payload_len
+//!     [8..16)  seq            [16..24) xxh3( image[0..16] ‖ 0⁸ ‖ payload )
+//!     payload @24:
+//!       journal_tail_seq u64 ‖ next_ino u64 ‖ alloc_bitmap_generation u64 ‖
+//!       node_seq_watermark u64 ‖
+//!       n_roots u16 ‖ n_roots × {root_id u16 ‖ node_addr u64 ‖ node_seq u64} ‖
+//!       membership stamp (ALWAYS): set_uuid[16] ‖ set_epoch u64 ‖
+//!         member_position u16 ‖ member_count u16 ‖
+//!         native_slot_present u8 ‖ native_slot u16 ‖
+//!         n_runs u16 ‖ n_runs × {start u16 ‖ stride u16 (≥ 1) ‖ count u32 (≥ 1)} ‖
+//!         n_cursors u16 ‖ n_cursors × {slot u16 ‖ next_local_ino u64}
 //!
-//! `node_seq_watermark` is not in the charter's field list but IS on the wire
-//! (incompat bit NODE_SEQ_WATERMARK): a mount reseeds the node-seq mint at or
-//! above it so node incarnation seqs never repeat within a generation — the
-//! invariant the bset `node_seq_at_write == node_seq` admission relies on.
+//! Every field is read by position; nothing is decided by residual length
+//! (the v3 record's four length-decided tail shapes are gone). The routing
+//! width is not stored: `W = 2^16` is DERIVED from the u16 slot wire type
+//! (charter §5.4), and a stored copy could only disagree with the law.
+//!
+//! `node_seq_watermark` is not in the charter's field list but IS
+//! load-bearing: a mount reseeds the node-seq mint at or above it so node
+//! incarnation seqs never repeat within a generation — the invariant the
+//! bset `node_seq_at_write == node_seq` admission relies on.
+//!
+//! Roots are named by `RootId`: exactly two roots live in the fixed ledger
+//! (charter §5.5 "fixed ledger names tree 0 + native slot tree") — the
+//! control tree by its kind and the native slot tree by a ROLE id past the
+//! u8 kind space. The interior kind byte 0 is never a root identity.
 //!
 //! PORTABLE: encode yields a slot image, decode consumes one; the io task
 //! binds `slotOffset` to `write_at`/`read_at`.
@@ -35,10 +52,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const checksum = @import("../core/checksum.zig");
 const counters = @import("../core/counters.zig");
+const key = @import("key.zig");
 const jc = @import("journal_core.zig");
 const journal = @import("journal.zig");
 
-pub const AppendPartition = journal.AppendPartition;
 const CoreGeometry = jc.CoreGeometry;
 
 // ---------------------------------------------------------------------------
@@ -49,44 +66,45 @@ pub const ROOT_LEDGER_SLOTS: u64 = 32;
 pub const ROOT_LEDGER_SLOT_LEN: u64 = 4096;
 /// 128 KiB — the mount-read unit.
 pub const ROOT_LEDGER_LEN: u64 = ROOT_LEDGER_SLOTS * ROOT_LEDGER_SLOT_LEN;
-/// "KVRL".
-pub const ROOT_LEDGER_MAGIC: u32 = 0x4B56_524C;
-/// `magic ‖ len ‖ seq ‖ xxh3`.
+/// ASCII "KVRL" read as a little-endian u32: ASCII order on disk.
+pub const ROOT_LEDGER_MAGIC: u32 = std.mem.readInt(u32, "KVRL", .little);
+/// The record layout's version: the v4 format's first (and only) one.
+pub const ROOT_LEDGER_VERSION: u16 = 1;
+/// `magic ‖ version ‖ len ‖ seq ‖ xxh3`.
 pub const ROOT_LEDGER_HDR_LEN: usize = 24;
-/// `4 × u64 + n_roots u16` (the watermark widened it by 8).
+/// `4 × u64 + n_roots u16`.
 pub const PAYLOAD_FIXED_LEN: usize = 8 + 8 + 8 + 8 + 2;
-/// `tree_id u8 ‖ node_addr u64 ‖ node_seq u64`.
-pub const ROOT_ENC_LEN: usize = 1 + 8 + 8;
-/// `set_uuid ‖ set_epoch ‖ member_position ‖ member_count ‖ routing_width ‖ n_runs`.
-pub const STAMP_FIXED_LEN: usize = 16 + 8 + 2 + 2 + 4 + 2;
+/// `root_id u16 ‖ node_addr u64 ‖ node_seq u64`.
+pub const ROOT_ENC_LEN: usize = 2 + 8 + 8;
+/// `set_uuid ‖ set_epoch ‖ member_position ‖ member_count ‖
+/// native_slot_present ‖ native_slot ‖ n_runs`.
+pub const STAMP_FIXED_LEN: usize = 16 + 8 + 2 + 2 + 1 + 2 + 2;
 /// `start u16 ‖ stride u16 ‖ count u32`.
 pub const RUN_ENC_LEN: usize = 2 + 2 + 4;
 /// `slot u16 ‖ next_local_ino u64`.
 pub const CURSOR_ENC_LEN: usize = 2 + 8;
 /// The stamp's encoding budget: a volume may host tens of thousands of slots
 /// as ONE stride run; what the 4096 B slot bounds is encoding COMPLEXITY.
-/// 128 runs + 256 cursors keep the worst-case record at 3,765 B with 19 spare
-/// roots; MINT_SPREAD (64) fresh mint cursors are ¼ of the cursor cap.
+/// 128 runs + 256 cursors keep the worst-case record at 3,767 B with 18
+/// spare roots; MINT_SPREAD (64) fresh mint cursors are ¼ of the cursor cap.
 pub const STAMP_MAX_RUNS: usize = 128;
 pub const STAMP_MAX_CURSORS: usize = 256;
-pub const APPEND_PARTITION_ENC_LEN: usize = 4;
 /// Charter §5.3: a checkpoint cycle at least every second; the reader poll
 /// cadence derives from it.
 pub const CHECKPOINT_MAX_AGE_MS: u64 = 1000;
 
-/// The worst-case stamped record: header + fixed payload + 5 roots + a full
-/// stamp + the partition suffix — must fit a slot. (The reference's comment
-/// quotes 3,765: it omits the 2 B `n_cursors` and the 4 B suffix; the wire
-/// below carries both.)
-pub const WORST_CASE_STAMPED_RECORD_LEN: usize = ROOT_LEDGER_HDR_LEN + PAYLOAD_FIXED_LEN + 5 * ROOT_ENC_LEN + (STAMP_FIXED_LEN + STAMP_MAX_RUNS * RUN_ENC_LEN + 4 + 2 + STAMP_MAX_CURSORS * CURSOR_ENC_LEN) + APPEND_PARTITION_ENC_LEN;
+/// The worst-case record: header + fixed payload + 5 roots + a full stamp —
+/// must fit a slot.
+pub const WORST_CASE_STAMPED_RECORD_LEN: usize = ROOT_LEDGER_HDR_LEN + PAYLOAD_FIXED_LEN + 5 * ROOT_ENC_LEN + (STAMP_FIXED_LEN + STAMP_MAX_RUNS * RUN_ENC_LEN + 2 + STAMP_MAX_CURSORS * CURSOR_ENC_LEN);
 
 comptime {
     std.debug.assert(ROOT_LEDGER_LEN == 131072);
     std.debug.assert(PAYLOAD_FIXED_LEN == 34);
-    std.debug.assert(STAMP_FIXED_LEN == 34);
-    // 24 + 34 + 85 + (34 + 1024 + 4 + 2 + 2560) + 4 = 3771 ≤ 4096: the budget closes with 19 spare roots.
-    std.debug.assert(WORST_CASE_STAMPED_RECORD_LEN == 3771);
+    std.debug.assert(STAMP_FIXED_LEN == 33);
+    // 24 + 34 + 90 + (33 + 1024 + 2 + 2560) = 3767 ≤ 4096: the budget closes with 18 spare roots.
+    std.debug.assert(WORST_CASE_STAMPED_RECORD_LEN == 3767);
     std.debug.assert(WORST_CASE_STAMPED_RECORD_LEN <= ROOT_LEDGER_SLOT_LEN);
+    std.debug.assert((ROOT_LEDGER_SLOT_LEN - WORST_CASE_STAMPED_RECORD_LEN) / ROOT_ENC_LEN == 18);
     // The ledger extent the journal's placement assumes is this one.
     std.debug.assert(journal.ROOT_LEDGER_LEN == ROOT_LEDGER_LEN);
 }
@@ -102,9 +120,35 @@ pub const Error = error{
 // Record types.
 // ---------------------------------------------------------------------------
 
-/// One tree root: `(tree_id, node_addr, node_seq)`.
+/// What a ledger root names. The control tree is its kind (8); the native
+/// slot tree is a ROLE: the first id past the u8 kind space, so no kind byte
+/// can ever be mistaken for it (a guest slot tree's root lives in tree 0,
+/// never here — charter §5.5).
+pub const RootId = enum(u16) {
+    control = key.TREE_CONTROL,
+    native_slot = 0x0100,
+
+    pub fn fromWire(v: u16) Error!RootId {
+        return switch (v) {
+            @backingInt(RootId.control) => .control,
+            @backingInt(RootId.native_slot) => .native_slot,
+            else => error.Corrupt,
+        };
+    }
+
+    /// The node-header class byte of this root's tree: `TREE_CONTROL` for
+    /// the control tree, `KIND_INTERIOR` for every slot tree.
+    pub fn headerTreeId(self: RootId) u8 {
+        return switch (self) {
+            .control => key.TREE_CONTROL,
+            .native_slot => key.KIND_INTERIOR,
+        };
+    }
+};
+
+/// One tree root: `(root_id, node_addr, node_seq)`.
 pub const TreeRoot = struct {
-    tree_id: u8,
+    id: RootId,
     node_addr: u64,
     node_seq: u64,
 };
@@ -112,7 +156,7 @@ pub const TreeRoot = struct {
 /// One arithmetic progression of slot ids `{start + k·stride | 0 ≤ k < count}`.
 pub const SlotRun = struct {
     start: u16,
-    /// A singleton's stride is canonically 1.
+    /// ≥ 1: a singleton's stride is 1 (one encoding per set).
     stride: u16,
     /// ≥ 1.
     count: u32,
@@ -124,25 +168,23 @@ pub const SlotRun = struct {
     fn contains(self: SlotRun, slot: u16) bool {
         const s: u64 = slot;
         if (s < self.start or s > self.last()) return false;
-        if (self.stride == 0) return s == self.start;
         return (s - self.start) % self.stride == 0;
     }
 };
 
 /// The hosted-slot set as validated runs, ascending by start.
 pub const SlotSet = struct {
-    runs: []SlotRun,
+    runs: []const SlotRun,
 
     pub const empty: SlotSet = .{ .runs = &.{} };
 
-    /// Validate-before-trust: a zero count, a repeating zero stride, a run
-    /// escaping the u16 namespace or any overlap refuses. Takes ownership of
-    /// `runs` (sorted in place).
+    /// Validate-before-trust: a zero count, a zero stride, a run escaping
+    /// the u16 namespace or any overlap refuses. Sorts `runs` in place and
+    /// keeps them.
     pub fn fromRuns(runs: []SlotRun) Error!SlotSet {
         var seen: std.StaticBitSet(1 << 16) = .empty;
         for (runs) |r| {
-            if (r.count == 0) return error.Corrupt;
-            if (r.stride == 0 and r.count > 1) return error.Corrupt;
+            if (r.count == 0 or r.stride == 0) return error.Corrupt;
             if (r.last() > std.math.maxInt(u16)) return error.Corrupt;
             var k: u32 = 0;
             while (k < r.count) : (k += 1) {
@@ -173,26 +215,61 @@ pub const SlotSet = struct {
 
 pub const SlotCursor = struct { slot: u16, next_local_ino: u64 };
 
+/// Member `position` of `count` hosts the stride run `{start: position,
+/// stride: count, count: ceil((W − position) / count)}` (charter §5.4 "one
+/// arithmetic-progression run per volume").
+pub fn memberRun(position: u16, count: u16) SlotRun {
+    std.debug.assert(count >= 1 and position < count);
+    const w: u32 = key.FOREST_SLOT_MAX;
+    return .{ .start = position, .stride = count, .count = (w - position + count - 1) / count };
+}
+
+const one_member_runs = [_]SlotRun{memberRun(0, 1)};
+
 /// The per-volume set-membership stamp: rides the ledger record because it is
 /// the one structure already A/B-rotating, checksummed and rewritable without
-/// relocation. `member_position` defines the canonical set order.
+/// relocation. `member_position` defines the canonical set order. Present on
+/// EVERY record (every volume is a stamped set member).
 pub const MembershipStamp = struct {
     set_uuid: [16]u8,
     set_epoch: u64,
     member_position: u16,
     member_count: u16,
-    /// The DERIVED routing width W, stored — never re-derived at mount.
-    routing_width: u32,
     slots_hosted: SlotSet,
-    /// The slot whose records live in this volume's LEGACY keyspace; null on
-    /// fresh members (all their slots are guests). u32 `plus1` on the wire: a
-    /// u16 plus1 would overflow at slot 65535.
+    /// The slot whose records live in this volume's native keyspace; null on
+    /// a member whose every slot is a guest. `present u8 ‖ slot u16` on the
+    /// wire.
     native_slot: ?u16,
     /// Per-slot GUEST ino cursors for hosted slots that minted or travelled in.
     slot_cursors: []const SlotCursor,
 
-    pub fn resolvedNativeSlot(self: MembershipStamp) ?u16 {
-        return self.native_slot;
+    /// A fresh set's member `position` of `count`: epoch 1, its stride run,
+    /// native slot = its position, no cursors. `run` is the caller's storage
+    /// for the one run.
+    pub fn member(set_uuid: [16]u8, position: u16, count: u16, run: *[1]SlotRun) MembershipStamp {
+        run[0] = memberRun(position, count);
+        return .{
+            .set_uuid = set_uuid,
+            .set_epoch = 1,
+            .member_position = position,
+            .member_count = count,
+            .slots_hosted = .{ .runs = run },
+            .native_slot = position,
+            .slot_cursors = &.{},
+        };
+    }
+
+    /// The one-member forest's stamp: one member hosting every slot.
+    pub fn oneMember(set_uuid: [16]u8) MembershipStamp {
+        return .{
+            .set_uuid = set_uuid,
+            .set_epoch = 1,
+            .member_position = 0,
+            .member_count = 1,
+            .slots_hosted = .{ .runs = &one_member_runs },
+            .native_slot = 0,
+            .slot_cursors = &.{},
+        };
     }
 
     pub fn cursorFor(self: MembershipStamp, slot: u16) ?u64 {
@@ -201,7 +278,7 @@ pub const MembershipStamp = struct {
     }
 
     fn encodedLen(self: MembershipStamp) usize {
-        return STAMP_FIXED_LEN + self.slots_hosted.runs.len * RUN_ENC_LEN + 4 + 2 + self.slot_cursors.len * CURSOR_ENC_LEN;
+        return STAMP_FIXED_LEN + self.slots_hosted.runs.len * RUN_ENC_LEN + 2 + self.slot_cursors.len * CURSOR_ENC_LEN;
     }
 };
 
@@ -215,25 +292,23 @@ pub const LedgerRecord = struct {
     next_ino: u64,
     alloc_bitmap_generation: u64,
     node_seq_watermark: u64,
-    /// Present on every slot-mapped volume; null forever on legacy volumes
-    /// (byte-identical to the pre-stamp encoding).
-    membership_stamp: ?MembershipStamp,
-    /// Null on every un-stamped volume: such a record encodes byte-identically
-    /// to the pre-partition image and places itself with `seq % 32`.
-    append_partition: ?AppendPartition,
+    membership_stamp: MembershipStamp,
 
     /// Free what `decodeSlot` allocated.
     pub fn deinit(self: *LedgerRecord, gpa: Allocator) void {
         gpa.free(self.tree_roots);
-        if (self.membership_stamp) |st| {
-            gpa.free(st.slots_hosted.runs);
-            gpa.free(st.slot_cursors);
-        }
+        gpa.free(self.membership_stamp.slots_hosted.runs);
+        gpa.free(self.membership_stamp.slot_cursors);
     }
 
     pub fn slotIndex(self: LedgerRecord) u64 {
-        if (self.append_partition) |part| return ledgerSlotFor(self.seq, part);
         return self.seq % ROOT_LEDGER_SLOTS;
+    }
+
+    /// The root named `id`, if the record names one.
+    pub fn root(self: LedgerRecord, id: RootId) ?TreeRoot {
+        for (self.tree_roots) |r| if (r.id == id) return r;
+        return null;
     }
 
     /// The DENSE rule's restatement: this record at `seq` (a checkpoint-class
@@ -251,18 +326,15 @@ pub const LedgerRecord = struct {
     /// refuses LOUD (the caps exist so the worst case fits); the total-size
     /// check stays as defence in depth for the root count.
     pub fn encodeSlot(self: LedgerRecord) Error![ROOT_LEDGER_SLOT_LEN]u8 {
-        var stamp_len: usize = 0;
-        if (self.membership_stamp) |st| {
-            if (st.slots_hosted.runs.len > STAMP_MAX_RUNS) return error.Corrupt;
-            if (st.slot_cursors.len > STAMP_MAX_CURSORS) return error.Corrupt;
-            stamp_len = st.encodedLen();
-        }
-        const part_len: usize = if (self.append_partition != null) APPEND_PARTITION_ENC_LEN else 0;
-        const payload_len = PAYLOAD_FIXED_LEN + self.tree_roots.len * ROOT_ENC_LEN + stamp_len + part_len;
+        const st = self.membership_stamp;
+        if (st.slots_hosted.runs.len > STAMP_MAX_RUNS) return error.Corrupt;
+        if (st.slot_cursors.len > STAMP_MAX_CURSORS) return error.Corrupt;
+        const payload_len = PAYLOAD_FIXED_LEN + self.tree_roots.len * ROOT_ENC_LEN + st.encodedLen();
         if (ROOT_LEDGER_HDR_LEN + payload_len > ROOT_LEDGER_SLOT_LEN or self.tree_roots.len > std.math.maxInt(u16)) return error.Corrupt;
         var image: [ROOT_LEDGER_SLOT_LEN]u8 = @splat(0);
         std.mem.writeInt(u32, image[0..4], ROOT_LEDGER_MAGIC, .little);
-        std.mem.writeInt(u32, image[4..8], @intCast(payload_len), .little);
+        std.mem.writeInt(u16, image[4..6], ROOT_LEDGER_VERSION, .little);
+        std.mem.writeInt(u16, image[6..8], @intCast(payload_len), .little);
         std.mem.writeInt(u64, image[8..16], self.seq, .little);
         var pos: usize = ROOT_LEDGER_HDR_LEN;
         std.mem.writeInt(u64, image[pos..][0..8], self.journal_tail_seq, .little);
@@ -275,49 +347,38 @@ pub const LedgerRecord = struct {
         pos += 8;
         std.mem.writeInt(u16, image[pos..][0..2], @intCast(self.tree_roots.len), .little);
         pos += 2;
-        for (self.tree_roots) |root| {
-            image[pos] = root.tree_id;
-            std.mem.writeInt(u64, image[pos + 1 ..][0..8], root.node_addr, .little);
-            std.mem.writeInt(u64, image[pos + 9 ..][0..8], root.node_seq, .little);
+        for (self.tree_roots) |r| {
+            std.mem.writeInt(u16, image[pos..][0..2], @backingInt(r.id), .little);
+            std.mem.writeInt(u64, image[pos + 2 ..][0..8], r.node_addr, .little);
+            std.mem.writeInt(u64, image[pos + 10 ..][0..8], r.node_seq, .little);
             pos += ROOT_ENC_LEN;
         }
-        if (self.membership_stamp) |st| {
-            image[pos..][0..16].* = st.set_uuid;
-            pos += 16;
-            std.mem.writeInt(u64, image[pos..][0..8], st.set_epoch, .little);
-            pos += 8;
-            std.mem.writeInt(u16, image[pos..][0..2], st.member_position, .little);
-            pos += 2;
-            std.mem.writeInt(u16, image[pos..][0..2], st.member_count, .little);
-            pos += 2;
-            std.mem.writeInt(u32, image[pos..][0..4], st.routing_width, .little);
-            pos += 4;
-            std.mem.writeInt(u16, image[pos..][0..2], @intCast(st.slots_hosted.runs.len), .little);
-            pos += 2;
-            for (st.slots_hosted.runs) |run| {
-                std.mem.writeInt(u16, image[pos..][0..2], run.start, .little);
-                std.mem.writeInt(u16, image[pos + 2 ..][0..2], run.stride, .little);
-                std.mem.writeInt(u32, image[pos + 4 ..][0..4], run.count, .little);
-                pos += RUN_ENC_LEN;
-            }
-            const native_plus1: u32 = if (st.native_slot) |s| @as(u32, s) + 1 else 0;
-            std.mem.writeInt(u32, image[pos..][0..4], native_plus1, .little);
-            pos += 4;
-            std.mem.writeInt(u16, image[pos..][0..2], @intCast(st.slot_cursors.len), .little);
-            pos += 2;
-            for (st.slot_cursors) |c| {
-                std.mem.writeInt(u16, image[pos..][0..2], c.slot, .little);
-                std.mem.writeInt(u64, image[pos + 2 ..][0..8], c.next_local_ino, .little);
-                pos += CURSOR_ENC_LEN;
-            }
+        image[pos..][0..16].* = st.set_uuid;
+        pos += 16;
+        std.mem.writeInt(u64, image[pos..][0..8], st.set_epoch, .little);
+        pos += 8;
+        std.mem.writeInt(u16, image[pos..][0..2], st.member_position, .little);
+        pos += 2;
+        std.mem.writeInt(u16, image[pos..][0..2], st.member_count, .little);
+        pos += 2;
+        image[pos] = @intFromBool(st.native_slot != null);
+        pos += 1;
+        std.mem.writeInt(u16, image[pos..][0..2], st.native_slot orelse 0, .little);
+        pos += 2;
+        std.mem.writeInt(u16, image[pos..][0..2], @intCast(st.slots_hosted.runs.len), .little);
+        pos += 2;
+        for (st.slots_hosted.runs) |run| {
+            std.mem.writeInt(u16, image[pos..][0..2], run.start, .little);
+            std.mem.writeInt(u16, image[pos + 2 ..][0..2], run.stride, .little);
+            std.mem.writeInt(u32, image[pos + 4 ..][0..4], run.count, .little);
+            pos += RUN_ENC_LEN;
         }
-        // The partition suffix rides AFTER the stamp: the stamp's own length
-        // equation closes exactly, so the decoder tells "no suffix" from
-        // "one suffix" (exactly four more bytes) without ambiguity.
-        if (self.append_partition) |part| {
-            std.mem.writeInt(u16, image[pos..][0..2], part.writer_id, .little);
-            std.mem.writeInt(u16, image[pos + 2 ..][0..2], part.writers, .little);
-            pos += APPEND_PARTITION_ENC_LEN;
+        std.mem.writeInt(u16, image[pos..][0..2], @intCast(st.slot_cursors.len), .little);
+        pos += 2;
+        for (st.slot_cursors) |c| {
+            std.mem.writeInt(u16, image[pos..][0..2], c.slot, .little);
+            std.mem.writeInt(u64, image[pos + 2 ..][0..8], c.next_local_ino, .little);
+            pos += CURSOR_ENC_LEN;
         }
         std.debug.assert(pos == ROOT_LEDGER_HDR_LEN + payload_len);
         std.mem.writeInt(u64, image[16..24], slotChecksum(&image, payload_len), .little);
@@ -325,16 +386,15 @@ pub const LedgerRecord = struct {
     }
 
     /// Decode + verify one slot image. TOTAL: every length is checked against
-    /// its container before any byte it governs is touched; any failure means
-    /// "this slot holds no valid record" — the selection treats it as absent,
-    /// never loud. The tail after the roots is one of exactly four shapes
-    /// decided by LENGTH: nothing; exactly 4 B = a partition suffix; a stamp;
-    /// a stamp then the suffix.
+    /// its container before any byte it governs is touched; the payload must
+    /// close EXACTLY on the last cursor; any failure means "this slot holds
+    /// no valid record" — the selection treats it as absent, never loud.
     pub fn decodeSlot(gpa: Allocator, buf: []const u8) Error!LedgerRecord {
         if (buf.len < ROOT_LEDGER_HDR_LEN) return error.Corrupt;
         if (std.mem.readInt(u32, buf[0..4], .little) != ROOT_LEDGER_MAGIC) return error.Corrupt;
-        const payload_len: usize = std.mem.readInt(u32, buf[4..8], .little);
-        if (payload_len < PAYLOAD_FIXED_LEN or ROOT_LEDGER_HDR_LEN + payload_len > buf.len) return error.Corrupt;
+        if (std.mem.readInt(u16, buf[4..6], .little) != ROOT_LEDGER_VERSION) return error.Corrupt;
+        const payload_len: usize = std.mem.readInt(u16, buf[6..8], .little);
+        if (payload_len < PAYLOAD_FIXED_LEN + STAMP_FIXED_LEN + 2 or ROOT_LEDGER_HDR_LEN + payload_len > buf.len) return error.Corrupt;
         const seq = std.mem.readInt(u64, buf[8..16], .little);
         const stored = std.mem.readInt(u64, buf[16..24], .little);
         if (stored != slotChecksum(buf, payload_len)) return error.ChecksumMismatch;
@@ -344,35 +404,20 @@ pub const LedgerRecord = struct {
         const alloc_bitmap_generation = std.mem.readInt(u64, payload[16..24], .little);
         const node_seq_watermark = std.mem.readInt(u64, payload[24..32], .little);
         const n_roots: usize = std.mem.readInt(u16, payload[32..34], .little);
-        const roots_end = PAYLOAD_FIXED_LEN + n_roots * ROOT_ENC_LEN;
-        if (roots_end > payload_len) return error.Corrupt;
+        var pos: usize = PAYLOAD_FIXED_LEN;
+        if (pos + n_roots * ROOT_ENC_LEN + STAMP_FIXED_LEN + 2 > payload_len) return error.Corrupt;
         const roots = try gpa.alloc(TreeRoot, n_roots);
         errdefer gpa.free(roots);
-        var pos: usize = PAYLOAD_FIXED_LEN;
         for (roots) |*r| {
             r.* = .{
-                .tree_id = payload[pos],
-                .node_addr = std.mem.readInt(u64, payload[pos + 1 ..][0..8], .little),
-                .node_seq = std.mem.readInt(u64, payload[pos + 9 ..][0..8], .little),
+                .id = try RootId.fromWire(std.mem.readInt(u16, payload[pos..][0..2], .little)),
+                .node_addr = std.mem.readInt(u64, payload[pos + 2 ..][0..8], .little),
+                .node_seq = std.mem.readInt(u64, payload[pos + 10 ..][0..8], .little),
             };
             pos += ROOT_ENC_LEN;
         }
-        var rec: LedgerRecord = .{
-            .seq = seq,
-            .tree_roots = roots,
-            .journal_tail_seq = journal_tail_seq,
-            .next_ino = next_ino,
-            .alloc_bitmap_generation = alloc_bitmap_generation,
-            .node_seq_watermark = node_seq_watermark,
-            .membership_stamp = null,
-            .append_partition = null,
-        };
-        if (pos == payload_len) return rec;
-        if (payload_len - pos == APPEND_PARTITION_ENC_LEN) {
-            rec.append_partition = try decodeAppendPartition(payload[pos..]);
-            return rec;
-        }
-        if (pos + STAMP_FIXED_LEN > payload_len) return error.Corrupt;
+        // Each root id names one tree: a duplicate is a writer bug.
+        for (roots, 0..) |r, i| for (roots[0..i]) |p| if (p.id == r.id) return error.Corrupt;
         var st: MembershipStamp = undefined;
         st.set_uuid = payload[pos..][0..16].*;
         pos += 16;
@@ -382,12 +427,21 @@ pub const LedgerRecord = struct {
         pos += 2;
         st.member_count = std.mem.readInt(u16, payload[pos..][0..2], .little);
         pos += 2;
-        st.routing_width = std.mem.readInt(u32, payload[pos..][0..4], .little);
-        pos += 4;
+        const native_present = payload[pos];
+        pos += 1;
+        const native_slot = std.mem.readInt(u16, payload[pos..][0..2], .little);
+        pos += 2;
+        // `present` is a boolean byte and an absent slot is written 0:
+        // exactly the encoder's form decodes.
+        st.native_slot = switch (native_present) {
+            0 => if (native_slot != 0) return error.Corrupt else null,
+            1 => native_slot,
+            else => return error.Corrupt,
+        };
         const n_runs: usize = std.mem.readInt(u16, payload[pos..][0..2], .little);
         pos += 2;
         if (n_runs > STAMP_MAX_RUNS) return error.Corrupt;
-        if (pos + n_runs * RUN_ENC_LEN > payload_len) return error.Corrupt;
+        if (pos + n_runs * RUN_ENC_LEN + 2 > payload_len) return error.Corrupt;
         const runs = try gpa.alloc(SlotRun, n_runs);
         errdefer gpa.free(runs);
         for (runs) |*r| {
@@ -399,14 +453,10 @@ pub const LedgerRecord = struct {
             pos += RUN_ENC_LEN;
         }
         st.slots_hosted = try SlotSet.fromRuns(runs);
-        if (pos + 4 + 2 > payload_len) return error.Corrupt;
-        const native_plus1 = std.mem.readInt(u32, payload[pos..][0..4], .little);
-        pos += 4;
         const n_cursors: usize = std.mem.readInt(u16, payload[pos..][0..2], .little);
         pos += 2;
         if (n_cursors > STAMP_MAX_CURSORS) return error.Corrupt;
-        const cursors_end = pos + n_cursors * CURSOR_ENC_LEN;
-        if (cursors_end != payload_len and cursors_end + APPEND_PARTITION_ENC_LEN != payload_len) return error.Corrupt;
+        if (pos + n_cursors * CURSOR_ENC_LEN != payload_len) return error.Corrupt;
         const cursors = try gpa.alloc(SlotCursor, n_cursors);
         errdefer gpa.free(cursors);
         for (cursors) |*c| {
@@ -417,13 +467,15 @@ pub const LedgerRecord = struct {
             pos += CURSOR_ENC_LEN;
         }
         st.slot_cursors = cursors;
-        st.native_slot = if (native_plus1 == 0) null else blk: {
-            if (native_plus1 - 1 > std.math.maxInt(u16)) return error.Corrupt;
-            break :blk @intCast(native_plus1 - 1);
+        return .{
+            .seq = seq,
+            .tree_roots = roots,
+            .journal_tail_seq = journal_tail_seq,
+            .next_ino = next_ino,
+            .alloc_bitmap_generation = alloc_bitmap_generation,
+            .node_seq_watermark = node_seq_watermark,
+            .membership_stamp = st,
         };
-        if (pos < payload_len) rec.append_partition = try decodeAppendPartition(payload[pos..]);
-        rec.membership_stamp = st;
-        return rec;
     }
 };
 
@@ -437,33 +489,9 @@ fn slotChecksum(image: []const u8, payload_len: usize) u64 {
     return h.final();
 }
 
-/// The 4 B suffix through `AppendPartition.new`: an illegal count or id is a
-/// writer-bug screen (the checksum already verified).
-fn decodeAppendPartition(tail: []const u8) Error!AppendPartition {
-    std.debug.assert(tail.len >= APPEND_PARTITION_ENC_LEN);
-    const writer_id = std.mem.readInt(u16, tail[0..2], .little);
-    const writers = std.mem.readInt(u16, tail[2..4], .little);
-    return AppendPartition.new(writers, writer_id) catch error.Corrupt;
-}
-
 // ---------------------------------------------------------------------------
 // Placement and selection.
 // ---------------------------------------------------------------------------
-
-/// Slots each appender owns under a `writers`-way partition. The floor of 2
-/// is normative: newest-valid-wins with a torn newest slot must fall back to
-/// a predecessor OF THE SAME APPENDER — `MAX_APPENDERS` derives from this.
-pub fn ledgerSlotsPerWriter(writers: u16) u64 {
-    return ROOT_LEDGER_SLOTS / writers;
-}
-
-/// Solo: `seq % 32` verbatim; partitioned: the appender's contiguous range,
-/// round-robin inside it.
-pub fn ledgerSlotFor(seq: u64, part: AppendPartition) u64 {
-    if (part.isSolo()) return seq % ROOT_LEDGER_SLOTS;
-    const per = ledgerSlotsPerWriter(part.writers);
-    return @as(u64, part.writer_id) * per + seq % per;
-}
 
 /// Device offset of `slot` in a ledger based at `base`.
 pub fn slotOffset(base: u64, slot: u64) u64 {
@@ -497,9 +525,8 @@ pub fn newestValid(gpa: Allocator, image: []const u8) Allocator.Error!?LedgerRec
 }
 
 /// Format's bootstrap record: fresh ring (tail 0), the ino watermark,
-/// generation 1 bitmap, the pre-partition form regardless of stamped bits
-/// (partition ADOPTION is a first-writable-mount minting act).
-pub fn bootstrapRecord(tree_roots: []const TreeRoot, next_ino: u64, node_seq_watermark: u64, stamp: ?MembershipStamp) LedgerRecord {
+/// generation 1 bitmap, the member's stamp.
+pub fn bootstrapRecord(tree_roots: []const TreeRoot, next_ino: u64, node_seq_watermark: u64, stamp: MembershipStamp) LedgerRecord {
     return .{
         .seq = 1,
         .tree_roots = tree_roots,
@@ -508,7 +535,6 @@ pub fn bootstrapRecord(tree_roots: []const TreeRoot, next_ino: u64, node_seq_wat
         .alloc_bitmap_generation = 1,
         .node_seq_watermark = node_seq_watermark,
         .membership_stamp = stamp,
-        .append_partition = null,
     };
 }
 
@@ -603,22 +629,22 @@ pub var meta_kv_ledger_restatements: counters.ShardedCounter = .{};
 
 const testing = std.testing;
 
-const roots3 = [_]TreeRoot{
-    .{ .tree_id = 1, .node_addr = 0x10000, .node_seq = 11 },
-    .{ .tree_id = 2, .node_addr = 0x20000, .node_seq = 22 },
-    .{ .tree_id = 7, .node_addr = 0x70000, .node_seq = 77 },
+const roots2 = [_]TreeRoot{
+    .{ .id = .control, .node_addr = 0x10000, .node_seq = 11 },
+    .{ .id = .native_slot, .node_addr = 0x20000, .node_seq = 22 },
 };
+
+const test_set_uuid: [16]u8 = "set-uuid-fixture".*;
 
 fn plainRecord(seq: u64) LedgerRecord {
     return .{
         .seq = seq,
-        .tree_roots = &roots3,
+        .tree_roots = &roots2,
         .journal_tail_seq = 4000 * seq,
         .next_ino = 1000 + seq,
         .alloc_bitmap_generation = seq,
         .node_seq_watermark = 500 + seq,
-        .membership_stamp = null,
-        .append_partition = null,
+        .membership_stamp = MembershipStamp.oneMember(test_set_uuid),
     };
 }
 
@@ -629,27 +655,37 @@ fn expectRecordEq(want: LedgerRecord, got: LedgerRecord) !void {
     try testing.expectEqual(want.next_ino, got.next_ino);
     try testing.expectEqual(want.alloc_bitmap_generation, got.alloc_bitmap_generation);
     try testing.expectEqual(want.node_seq_watermark, got.node_seq_watermark);
-    try testing.expectEqual(want.append_partition, got.append_partition);
-    try testing.expectEqual(want.membership_stamp == null, got.membership_stamp == null);
-    if (want.membership_stamp) |w| {
-        const g = got.membership_stamp.?;
-        try testing.expectEqualSlices(u8, &w.set_uuid, &g.set_uuid);
-        try testing.expectEqual(w.set_epoch, g.set_epoch);
-        try testing.expectEqual(w.member_position, g.member_position);
-        try testing.expectEqual(w.member_count, g.member_count);
-        try testing.expectEqual(w.routing_width, g.routing_width);
-        try testing.expectEqualSlices(SlotRun, w.slots_hosted.runs, g.slots_hosted.runs);
-        try testing.expectEqual(w.native_slot, g.native_slot);
-        try testing.expectEqualSlices(SlotCursor, w.slot_cursors, g.slot_cursors);
-    }
+    const w = want.membership_stamp;
+    const g = got.membership_stamp;
+    try testing.expectEqualSlices(u8, &w.set_uuid, &g.set_uuid);
+    try testing.expectEqual(w.set_epoch, g.set_epoch);
+    try testing.expectEqual(w.member_position, g.member_position);
+    try testing.expectEqual(w.member_count, g.member_count);
+    try testing.expectEqualSlices(SlotRun, w.slots_hosted.runs, g.slots_hosted.runs);
+    try testing.expectEqual(w.native_slot, g.native_slot);
+    try testing.expectEqualSlices(SlotCursor, w.slot_cursors, g.slot_cursors);
 }
 
-test "slot byte layout: magic KVRL, len, seq, checksum = xxh3(hdr[0..16] ‖ 0⁸ ‖ payload); payload field offsets; zero-padded to 4096" {
+/// The stamp's byte offset inside a slot image holding `n_roots` roots.
+fn stampAt(n_roots: usize) usize {
+    return ROOT_LEDGER_HDR_LEN + PAYLOAD_FIXED_LEN + n_roots * ROOT_ENC_LEN;
+}
+
+/// Restamp a doctored image whose length field still fits the slot (one
+/// that does not is refused on length before any checksum is read).
+fn restamp(img: *[ROOT_LEDGER_SLOT_LEN]u8) void {
+    const plen: usize = std.mem.readInt(u16, img[6..8], .little);
+    if (ROOT_LEDGER_HDR_LEN + plen > img.len) return;
+    std.mem.writeInt(u64, img[16..24], slotChecksum(img, plen), .little);
+}
+
+test "slot byte layout: KVRL, version 1, len u16, seq, checksum = xxh3(hdr[0..16] ‖ 0⁸ ‖ payload); payload offsets incl. the always-present stamp; zero-padded to 4096" {
     const rec = plainRecord(5);
     const img = try rec.encodeSlot();
-    try testing.expectEqualSlices(u8, &.{ 0x4C, 0x52, 0x56, 0x4B }, img[0..4]);
-    const payload_len = PAYLOAD_FIXED_LEN + 3 * ROOT_ENC_LEN;
-    try testing.expectEqual(@as(u32, payload_len), std.mem.readInt(u32, img[4..8], .little));
+    try testing.expectEqualStrings("KVRL", img[0..4]);
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, img[4..6], .little));
+    const payload_len = PAYLOAD_FIXED_LEN + 2 * ROOT_ENC_LEN + STAMP_FIXED_LEN + RUN_ENC_LEN + 2;
+    try testing.expectEqual(@as(u16, payload_len), std.mem.readInt(u16, img[6..8], .little));
     try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, img[8..16], .little));
     var concat: [16 + 8 + payload_len]u8 = undefined;
     @memcpy(concat[0..16], img[0..16]);
@@ -660,19 +696,38 @@ test "slot byte layout: magic KVRL, len, seq, checksum = xxh3(hdr[0..16] ‖ 0�
     try testing.expectEqual(@as(u64, 1005), std.mem.readInt(u64, img[32..40], .little));
     try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, img[40..48], .little));
     try testing.expectEqual(@as(u64, 505), std.mem.readInt(u64, img[48..56], .little));
-    try testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, img[56..58], .little));
-    try testing.expectEqual(@as(u8, 1), img[58]);
-    try testing.expectEqual(@as(u64, 0x10000), std.mem.readInt(u64, img[59..67], .little));
-    try testing.expectEqual(@as(u64, 11), std.mem.readInt(u64, img[67..75], .little));
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, img[56..58], .little));
+    // Root 0: the control tree by its kind (8); root 1: the native slot role (256).
+    try testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, img[58..60], .little));
+    try testing.expectEqual(@as(u64, 0x10000), std.mem.readInt(u64, img[60..68], .little));
+    try testing.expectEqual(@as(u64, 11), std.mem.readInt(u64, img[68..76], .little));
+    try testing.expectEqual(@as(u16, 0x0100), std.mem.readInt(u16, img[76..78], .little));
+    // The stamp: uuid, epoch 1, position 0 of 1, native present ‖ 0, one run {0, 1, 65536}, no cursors.
+    const st = stampAt(2);
+    try testing.expectEqual(@as(usize, 94), st);
+    try testing.expectEqualSlices(u8, &test_set_uuid, img[st..][0..16]);
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, img[st + 16 ..][0..8], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, img[st + 24 ..][0..2], .little));
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, img[st + 26 ..][0..2], .little));
+    try testing.expectEqual(@as(u8, 1), img[st + 28]);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, img[st + 29 ..][0..2], .little));
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, img[st + 31 ..][0..2], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, img[st + 33 ..][0..2], .little));
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, img[st + 35 ..][0..2], .little));
+    try testing.expectEqual(@as(u32, 65536), std.mem.readInt(u32, img[st + 37 ..][0..4], .little));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, img[st + 41 ..][0..2], .little));
+    try testing.expectEqual(st + 43, ROOT_LEDGER_HDR_LEN + payload_len);
     for (img[24 + payload_len ..]) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
-test "slot encode/decode round trip; a flipped byte, [..50], [..10] and zeros are errors" {
+test "slot encode/decode round trip; a flipped byte, [..50], [..10], zeros, a foreign version and a lying length are errors" {
     const rec = plainRecord(9);
     const img = try rec.encodeSlot();
     var got = try LedgerRecord.decodeSlot(testing.allocator, &img);
     defer got.deinit(testing.allocator);
     try expectRecordEq(rec, got);
+    try testing.expectEqual(roots2[1], got.root(.native_slot).?);
+    try testing.expectEqual(roots2[0], got.root(.control).?);
     var bad = img;
     bad[30] ^= 0x01;
     try testing.expectError(error.ChecksumMismatch, LedgerRecord.decodeSlot(testing.allocator, &bad));
@@ -683,22 +738,25 @@ test "slot encode/decode round trip; a flipped byte, [..50], [..10] and zeros ar
     try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, img[0..10]));
     const zeros: [4096]u8 = @splat(0);
     try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &zeros));
+    // A foreign record version: refused before the checksum.
+    bad = img;
+    std.mem.writeInt(u16, bad[4..6], 2, .little);
+    try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &bad));
     // A lying length is refused before any byte it governs is read.
     bad = img;
-    std.mem.writeInt(u32, bad[4..8], 5000, .little);
+    std.mem.writeInt(u16, bad[6..8], 5000, .little);
     try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &bad));
-    std.mem.writeInt(u32, bad[4..8], 33, .little);
+    std.mem.writeInt(u16, bad[6..8], 33, .little);
     try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &bad));
     // n_roots inconsistent with the payload length (restamped so only the
     // length rule can reject it).
     bad = img;
     std.mem.writeInt(u16, bad[56..58], 4, .little);
-    const plen: usize = std.mem.readInt(u32, bad[4..8], .little);
-    std.mem.writeInt(u64, bad[16..24], slotChecksum(&bad, plen), .little);
+    restamp(&bad);
     try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &bad));
 }
 
-test "the four tail shapes by length: nothing / partition suffix / stamp / stamp + suffix" {
+test "the stamp is ONE fixed layout: a member of 4 with runs and cursors; a native-absent stamp; every field by position, never by residual length" {
     var runs = [_]SlotRun{ .{ .start = 100, .stride = 7, .count = 3 }, .{ .start = 5, .stride = 1, .count = 1 } };
     const cursors = [_]SlotCursor{ .{ .slot = 5, .next_local_ino = 42 }, .{ .slot = 114, .next_local_ino = 7 } };
     const stamp: MembershipStamp = .{
@@ -706,7 +764,6 @@ test "the four tail shapes by length: nothing / partition suffix / stamp / stamp
         .set_epoch = 3,
         .member_position = 1,
         .member_count = 4,
-        .routing_width = 65536,
         .slots_hosted = try SlotSet.fromRuns(&runs),
         .native_slot = 5,
         .slot_cursors = &cursors,
@@ -718,165 +775,160 @@ test "the four tail shapes by length: nothing / partition suffix / stamp / stamp
     try testing.expectEqual(@as(usize, 4), stamp.slots_hosted.len());
     try testing.expectEqual(@as(?u64, 42), stamp.cursorFor(5));
     try testing.expectEqual(@as(?u64, null), stamp.cursorFor(6));
-    const part = try AppendPartition.new(4, 2);
     var base = plainRecord(12);
-    // Shape 2: suffix only.
-    base.append_partition = part;
-    {
-        const img = try base.encodeSlot();
-        try testing.expectEqual(@as(u32, PAYLOAD_FIXED_LEN + 3 * ROOT_ENC_LEN + 4), std.mem.readInt(u32, img[4..8], .little));
-        var got = try LedgerRecord.decodeSlot(testing.allocator, &img);
-        defer got.deinit(testing.allocator);
-        try expectRecordEq(base, got);
-        try testing.expectEqual(@as(u64, 2 * 8 + 12 % 8), got.slotIndex());
-    }
-    // Shape 3: stamp only.
-    base.append_partition = null;
     base.membership_stamp = stamp;
     {
         const img = try base.encodeSlot();
-        const expect_len = PAYLOAD_FIXED_LEN + 3 * ROOT_ENC_LEN + STAMP_FIXED_LEN + 2 * RUN_ENC_LEN + 4 + 2 + 2 * CURSOR_ENC_LEN;
-        try testing.expectEqual(@as(u32, expect_len), std.mem.readInt(u32, img[4..8], .little));
+        const expect_len = PAYLOAD_FIXED_LEN + 2 * ROOT_ENC_LEN + STAMP_FIXED_LEN + 2 * RUN_ENC_LEN + 2 + 2 * CURSOR_ENC_LEN;
+        try testing.expectEqual(@as(u16, expect_len), std.mem.readInt(u16, img[6..8], .little));
         var got = try LedgerRecord.decodeSlot(testing.allocator, &img);
         defer got.deinit(testing.allocator);
         try expectRecordEq(base, got);
         try testing.expectEqual(@as(u64, 12), got.slotIndex());
     }
-    // Shape 4: stamp then suffix.
-    base.append_partition = part;
-    {
-        const img = try base.encodeSlot();
-        var got = try LedgerRecord.decodeSlot(testing.allocator, &img);
-        defer got.deinit(testing.allocator);
-        try expectRecordEq(base, got);
-    }
-    // No native slot encodes plus1 = 0 and round-trips as null.
+    // No native slot encodes `present 0 ‖ slot 0` and round-trips as null.
     var no_native = stamp;
     no_native.native_slot = null;
     base.membership_stamp = no_native;
-    base.append_partition = null;
     {
         const img = try base.encodeSlot();
+        const st = stampAt(2);
+        try testing.expectEqual(@as(u8, 0), img[st + 28]);
+        try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, img[st + 29 ..][0..2], .little));
         var got = try LedgerRecord.decodeSlot(testing.allocator, &img);
         defer got.deinit(testing.allocator);
-        try testing.expectEqual(@as(?u16, null), got.membership_stamp.?.resolvedNativeSlot());
+        try testing.expectEqual(@as(?u16, null), got.membership_stamp.native_slot);
     }
+    // The member constructor: position 1 of 4 hosts {1, 4, 16384}; the
+    // last member of 3 hosts 21845; one member hosts every slot natively.
+    var run: [1]SlotRun = undefined;
+    const m = MembershipStamp.member(test_set_uuid, 1, 4, &run);
+    try testing.expectEqual(SlotRun{ .start = 1, .stride = 4, .count = 16384 }, m.slots_hosted.runs[0]);
+    try testing.expectEqual(@as(?u16, 1), m.native_slot);
+    try testing.expectEqual(@as(u64, 1), m.set_epoch);
+    try testing.expectEqual(@as(u32, 21845), memberRun(2, 3).count);
+    const one = MembershipStamp.oneMember(test_set_uuid);
+    try testing.expectEqual(SlotRun{ .start = 0, .stride = 1, .count = 65536 }, one.slots_hosted.runs[0]);
+    try testing.expectEqual(@as(usize, 65536), one.slots_hosted.len());
+    try testing.expectEqual(@as(?u16, 0), one.native_slot);
 }
 
-test "decode refusals: illegal partition, n_runs over the cap, run geometry, truncated stamp tail, cursors not closing, native slot past u16" {
+test "decode refusals: unknown or duplicate root id, n_runs over the cap, run geometry (stride 0 included), a payload that does not close on the cursors, a non-boolean present byte, an absent native slot with a non-zero value" {
     var base = plainRecord(1);
-    // Illegal partition (writers 3) in a suffix-only tail.
-    {
-        base.append_partition = try AppendPartition.new(4, 1);
-        var img = try base.encodeSlot();
-        const plen: usize = std.mem.readInt(u32, img[4..8], .little);
-        std.mem.writeInt(u16, img[24 + plen - 2 ..][0..2], 3, .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen), .little);
-        try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
-        base.append_partition = null;
-    }
     var runs = [_]SlotRun{.{ .start = 1, .stride = 1, .count = 2 }};
-    const stamp: MembershipStamp = .{
+    base.membership_stamp = .{
         .set_uuid = @splat(9),
         .set_epoch = 1,
         .member_position = 0,
         .member_count = 1,
-        .routing_width = 65536,
         .slots_hosted = try SlotSet.fromRuns(&runs),
         .native_slot = null,
         .slot_cursors = &.{},
     };
-    base.membership_stamp = stamp;
-    const stamp_at = ROOT_LEDGER_HDR_LEN + PAYLOAD_FIXED_LEN + 3 * ROOT_ENC_LEN;
-    const n_runs_at = stamp_at + 16 + 8 + 2 + 2 + 4;
-    // n_runs over the cap.
+    const st = stampAt(2);
+    const present_at = st + 28;
+    const n_runs_at = st + 31;
+    // Root ids: the interior kind 0 is no root identity; a duplicate refuses.
     {
         var img = try base.encodeSlot();
-        const plen: usize = std.mem.readInt(u32, img[4..8], .little);
-        std.mem.writeInt(u16, img[n_runs_at..][0..2], STAMP_MAX_RUNS + 1, .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen), .little);
+        std.mem.writeInt(u16, img[58..60], 0, .little);
+        restamp(&img);
         try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
-        // n_runs under the cap but not fitting the payload.
-        std.mem.writeInt(u16, img[n_runs_at..][0..2], 100, .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen), .little);
+        img = try base.encodeSlot();
+        std.mem.writeInt(u16, img[58..60], 0x0100, .little);
+        restamp(&img);
+        try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
+        img = try base.encodeSlot();
+        std.mem.writeInt(u16, img[58..60], 1, .little);
+        restamp(&img);
         try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
     }
-    // Run geometry: count 0; overlapping runs; stride 0 repeating; namespace escape.
+    // n_runs over the cap; under the cap but not fitting the payload.
     {
         var img = try base.encodeSlot();
-        const plen: usize = std.mem.readInt(u32, img[4..8], .little);
+        std.mem.writeInt(u16, img[n_runs_at..][0..2], STAMP_MAX_RUNS + 1, .little);
+        restamp(&img);
+        try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
+        std.mem.writeInt(u16, img[n_runs_at..][0..2], 100, .little);
+        restamp(&img);
+        try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
+    }
+    // Run geometry: count 0; stride 0 (even a singleton); overlap; escape.
+    {
+        var img = try base.encodeSlot();
         std.mem.writeInt(u32, img[n_runs_at + 2 + 4 ..][0..4], 0, .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen), .little);
+        restamp(&img);
+        try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
+        img = try base.encodeSlot();
+        std.mem.writeInt(u16, img[n_runs_at + 2 + 2 ..][0..2], 0, .little);
+        restamp(&img);
         try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
         var r_overlap = [_]SlotRun{ .{ .start = 1, .stride = 2, .count = 3 }, .{ .start = 3, .stride = 1, .count = 1 } };
         try testing.expectError(error.Corrupt, SlotSet.fromRuns(&r_overlap));
         var r_stride0 = [_]SlotRun{.{ .start = 1, .stride = 0, .count = 2 }};
         try testing.expectError(error.Corrupt, SlotSet.fromRuns(&r_stride0));
+        var r_single0 = [_]SlotRun{.{ .start = 9, .stride = 0, .count = 1 }};
+        try testing.expectError(error.Corrupt, SlotSet.fromRuns(&r_single0));
         var r_escape = [_]SlotRun{.{ .start = 65535, .stride = 1, .count = 2 }};
         try testing.expectError(error.Corrupt, SlotSet.fromRuns(&r_escape));
-        var r_single0 = [_]SlotRun{.{ .start = 9, .stride = 0, .count = 1 }};
-        const ok = try SlotSet.fromRuns(&r_single0);
+        var r_single1 = [_]SlotRun{.{ .start = 9, .stride = 1, .count = 1 }};
+        const ok = try SlotSet.fromRuns(&r_single1);
         try testing.expect(ok.contains(9));
+        try testing.expect(!ok.contains(10));
     }
-    // A stamp tail shorter than the fixed prefix (neither empty nor 4 B).
+    // The payload must close exactly on the cursors: one byte long, one short.
     {
         var img = try base.encodeSlot();
-        const plen: usize = PAYLOAD_FIXED_LEN + 3 * ROOT_ENC_LEN + 10;
-        std.mem.writeInt(u32, img[4..8], @intCast(plen), .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen), .little);
+        const plen: usize = std.mem.readInt(u16, img[6..8], .little);
+        std.mem.writeInt(u16, img[6..8], @intCast(plen + 1), .little);
+        restamp(&img);
         try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
-    }
-    // Cursors that do not close to the payload end (nor leave exactly 4 B).
-    {
-        var img = try base.encodeSlot();
-        const plen: usize = std.mem.readInt(u32, img[4..8], .little);
-        std.mem.writeInt(u32, img[4..8], @intCast(plen + 3), .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen + 3), .little);
+        std.mem.writeInt(u16, img[6..8], @intCast(plen - 1), .little);
+        restamp(&img);
         try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
         // n_cursors over the cap.
-        std.mem.writeInt(u32, img[4..8], @intCast(plen), .little);
-        const n_cursors_at = n_runs_at + 2 + RUN_ENC_LEN + 4;
+        std.mem.writeInt(u16, img[6..8], @intCast(plen), .little);
+        const n_cursors_at = n_runs_at + 2 + RUN_ENC_LEN;
         std.mem.writeInt(u16, img[n_cursors_at..][0..2], STAMP_MAX_CURSORS + 1, .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen), .little);
+        restamp(&img);
         try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
     }
-    // native_plus1 − 1 past the u16 namespace.
+    // The present byte is boolean; an absent slot is written 0.
     {
         var img = try base.encodeSlot();
-        const plen: usize = std.mem.readInt(u32, img[4..8], .little);
-        const native_at = n_runs_at + 2 + RUN_ENC_LEN;
-        std.mem.writeInt(u32, img[native_at..][0..4], 65537, .little);
-        std.mem.writeInt(u64, img[16..24], slotChecksum(&img, plen), .little);
+        img[present_at] = 2;
+        restamp(&img);
+        try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
+        img = try base.encodeSlot();
+        std.mem.writeInt(u16, img[present_at + 1 ..][0..2], 7, .little);
+        restamp(&img);
         try testing.expectError(error.Corrupt, LedgerRecord.decodeSlot(testing.allocator, &img));
     }
     // Encode refusals: runs past the cap; a record that cannot fit a slot.
     {
         var too_many: [STAMP_MAX_RUNS + 1]SlotRun = undefined;
         for (&too_many, 0..) |*r, i| r.* = .{ .start = @intCast(i * 2), .stride = 1, .count = 1 };
-        var st = stamp;
-        st.slots_hosted = try SlotSet.fromRuns(&too_many);
-        base.membership_stamp = st;
+        var st_many = base.membership_stamp;
+        st_many.slots_hosted = try SlotSet.fromRuns(&too_many);
+        base.membership_stamp = st_many;
         try testing.expectError(error.Corrupt, base.encodeSlot());
-        base.membership_stamp = null;
-        var many_roots: [240]TreeRoot = undefined;
-        for (&many_roots, 0..) |*r, i| r.* = .{ .tree_id = @intCast(i % 9 + 1), .node_addr = i, .node_seq = i };
+        base.membership_stamp = MembershipStamp.oneMember(test_set_uuid);
+        var many_roots: [230]TreeRoot = undefined;
+        for (&many_roots, 0..) |*r, i| r.* = .{ .id = .control, .node_addr = i, .node_seq = i };
         base.tree_roots = &many_roots;
         try testing.expectError(error.Corrupt, base.encodeSlot());
-        base.tree_roots = many_roots[0..237];
-        _ = try base.encodeSlot(); // 24 + 34 + 237 × 17 = 4087 fits
+        // 24 + 34 + 43 (the one-member stamp) + 221 × 18 = 4079 fits; 222 does not.
+        base.tree_roots = many_roots[0..221];
+        _ = try base.encodeSlot();
+        base.tree_roots = many_roots[0..222];
+        try testing.expectError(error.Corrupt, base.encodeSlot());
     }
 }
 
-test "placement: solo seq % 32; partitioned writer range; slots per writer; offsets" {
+test "placement: seq % 32 for every record; offsets" {
     try testing.expectEqual(@as(u64, 8), plainRecord(40).slotIndex());
     try testing.expectEqual(@as(u64, 8), plainRecord(8).slotIndex());
     try testing.expectEqual(@as(u64, 31), plainRecord(31).slotIndex());
-    try testing.expectEqual(@as(u64, 7), ledgerSlotFor(7, AppendPartition.solo));
-    try testing.expectEqual(@as(u64, 2), ledgerSlotsPerWriter(16));
-    try testing.expectEqual(@as(u64, 8), ledgerSlotsPerWriter(4));
-    const p = try AppendPartition.new(16, 15);
-    try testing.expectEqual(@as(u64, 30), ledgerSlotFor(100, p));
-    try testing.expectEqual(@as(u64, 31), ledgerSlotFor(101, p));
     try testing.expectEqual(@as(u64, 4096 + 8 * 4096), slotOffset(4096, 8));
 }
 
@@ -940,12 +992,11 @@ test "newest-valid-wins over the 128 KiB image; a torn newest slot falls back to
     }
 }
 
-test "bootstrap record: seq 1, tail 0, generation 1, no partition; encodes and decodes" {
-    const rec = bootstrapRecord(&roots3, 2, 17, null);
+test "bootstrap record: seq 1, tail 0, generation 1, the member's stamp; encodes and decodes" {
+    const rec = bootstrapRecord(&roots2, 2, 17, MembershipStamp.oneMember(test_set_uuid));
     try testing.expectEqual(@as(u64, 1), rec.seq);
     try testing.expectEqual(@as(u64, 0), rec.journal_tail_seq);
     try testing.expectEqual(@as(u64, 1), rec.alloc_bitmap_generation);
-    try testing.expectEqual(@as(?AppendPartition, null), rec.append_partition);
     try testing.expectEqual(@as(u64, 1), rec.slotIndex());
     const img = try rec.encodeSlot();
     var got = try LedgerRecord.decodeSlot(testing.allocator, &img);
@@ -963,6 +1014,40 @@ test "the DENSE rule: a restatement is the same record at the consumed seq, coun
     try testing.expectEqual(rec.node_seq_watermark, restated.node_seq_watermark);
     try testing.expectEqualSlices(TreeRoot, rec.tree_roots, restated.tree_roots);
     try testing.expectEqual(before + 1, meta_kv_ledger_restatements.load());
+}
+
+test "property: slot decode is total on arbitrary and restamped bytes; a decoded record re-encodes to its image" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1ED6E4);
+    const r = prng.random();
+    var buf: [ROOT_LEDGER_SLOT_LEN]u8 = undefined;
+    const base = try plainRecord(3).encodeSlot();
+    for (0..4000) |i| {
+        if (i % 2 == 0) {
+            const len = r.intRangeAtMost(usize, 0, 400);
+            r.bytes(buf[0..len]);
+            if (LedgerRecord.decodeSlot(gpa, buf[0..len])) |*rec| {
+                var rr = rec.*;
+                rr.deinit(gpa);
+            } else |_| {}
+            continue;
+        }
+        // Mutations of a valid RECORD (header + payload; the slot's zero
+        // pad is the full-write law's, outside the codec) behind a fresh
+        // checksum reach the structural gates; whatever decodes re-encodes
+        // to the same bytes.
+        buf = base;
+        const record_len = ROOT_LEDGER_HDR_LEN + @as(usize, std.mem.readInt(u16, base[6..8], .little));
+        const flips = r.intRangeAtMost(usize, 1, 4);
+        for (0..flips) |_| buf[r.intRangeLessThan(usize, 0, record_len)] ^= @as(u8, 1) << r.int(u3);
+        restamp(&buf);
+        if (LedgerRecord.decodeSlot(gpa, &buf)) |*rec| {
+            var rr = rec.*;
+            defer rr.deinit(gpa);
+            const again = try rr.encodeSlot();
+            try testing.expectEqualSlices(u8, &buf, &again);
+        } else |_| {}
+    }
 }
 
 test "tail rule: min over H and the entry-start inputs; ring pressure at L/2" {

@@ -90,73 +90,62 @@ const Reader = struct {
     }
 };
 
-/// LEB128 (the inode value's leading version tag). A u64 needs at most 10
-/// bytes; the 10th may carry only its low bit.
-const VARINT_MAX_LEN: usize = 10;
-
-fn encodeVarint(v_: u64, out: *[VARINT_MAX_LEN]u8) usize {
-    var v = v_;
-    var i: usize = 0;
-    while (true) : (i += 1) {
-        const byte: u8 = @truncate(v & 0x7F);
-        v >>= 7;
-        if (v == 0) {
-            out[i] = byte;
-            return i + 1;
-        }
-        out[i] = byte | 0x80;
-    }
-}
-
-const Varint = struct { value: u64, used: usize };
-
-/// Refuses a truncated varint and one that runs past 64 bits.
-fn decodeVarint(buf: []const u8) DecodeError!Varint {
-    var v: u64 = 0;
-    for (buf, 0..) |b, i| {
-        if (i * 7 >= 64) return error.Corrupt;
-        v |= @as(u64, b & 0x7F) << @intCast(i * 7);
-        if (b & 0x80 == 0) return .{ .value = v, .used = i + 1 };
-    }
-    return error.Corrupt;
-}
-
 // ---------------------------------------------------------------------------
-// §2.1 Inode value — 57 B.
+// §2.1 Inode value — 68 B, fixed width (format v4; decision 0002 row 4).
 // ---------------------------------------------------------------------------
 
-/// Leading varint version tag, for future extension.
-pub const INODE_VALUE_VERSION: u64 = 1;
-/// varint(1) + 6 × u32 + 4 × u64.
-pub const INODE_VALUE_LEN: usize = 57;
-
-/// The fixed fields after the version tag, all LE. `rdev` occupies the word
-/// historically named `flags2`: reserved and never written by any live
-/// binary, so every existing volume holds 0 there; now the mknod device
-/// number (`new_encode_dev` u32), 0 for non-devices. Times are u64 bit
-/// patterns of the i64 ns the charter names — same bytes.
-pub const InodeFields = extern struct {
+/// The ONE field table of the inode value: the wire struct's fields in
+/// order, every one little-endian. The `Put` encoder lays them in this
+/// order and the Δinode record's mask bit `i` names field `i` — one source
+/// for both (decision 0002 row 3's one-Delta-kind preparation). Times are
+/// the i64 ns the charter names (the RAM struct carries their u64 bit
+/// patterns: same bytes). `rdev` is the full u64 `dev_t`. `reserved` must
+/// read 0 (§12: exactly the encoder's form decodes).
+pub const InodeValueWire = extern struct {
     mode_le: [4]u8,
     uid_le: [4]u8,
     gid_le: [4]u8,
     nlink_le: [4]u8,
     flags_le: [4]u8,
-    rdev_le: [4]u8,
+    rdev_le: [8]u8,
     size_le: [8]u8,
     atime_le: [8]u8,
     mtime_le: [8]u8,
     ctime_le: [8]u8,
+    flags2_le: [4]u8,
+    reserved: [4]u8,
 };
 
-pub const InodeValueWire = extern struct {
-    /// `varint(INODE_VALUE_VERSION)`: one byte for version 1.
-    version: u8,
-    fields: InodeFields,
-};
+pub const INODE_VALUE_LEN: usize = @sizeOf(InodeValueWire);
 
 comptime {
-    assert(@sizeOf(InodeFields) == 56);
-    assert(@sizeOf(InodeValueWire) == INODE_VALUE_LEN);
+    assert(INODE_VALUE_LEN == 68);
+    assert(@offsetOf(InodeValueWire, "rdev_le") == 20);
+    assert(@offsetOf(InodeValueWire, "ctime_le") == 52);
+    assert(@offsetOf(InodeValueWire, "flags2_le") == 60);
+    assert(@offsetOf(InodeValueWire, "reserved") == 64);
+}
+
+/// One row of the inode field table: the RAM field, its mask bit and its
+/// wire width — DERIVED from `InodeValueWire` at comptime (every `*_le`
+/// field in declaration order), never written twice.
+const InodeFieldSpec = struct { bit: u16, name: []const u8, wire: []const u8, width: usize };
+
+const inode_field_table = blk: {
+    const info = @typeInfo(InodeValueWire).@"struct";
+    var rows: [info.field_names.len]InodeFieldSpec = undefined;
+    var n: usize = 0;
+    for (info.field_names, info.field_types) |name, T| {
+        if (!std.mem.endsWith(u8, name, "_le")) continue;
+        rows[n] = .{ .bit = 1 << n, .name = name[0 .. name.len - "_le".len], .wire = name, .width = @sizeOf(T) };
+        n += 1;
+    }
+    break :blk rows[0..n].*;
+};
+
+fn inodeFieldBit(comptime name: []const u8) u16 {
+    for (inode_field_table) |f| if (std.mem.eql(u8, f.name, name)) return f.bit;
+    unreachable;
 }
 
 pub const InodeValue = struct {
@@ -165,53 +154,41 @@ pub const InodeValue = struct {
     gid: u32 = 0,
     nlink: u32 = 0,
     flags: u32 = 0,
-    rdev: u32 = 0,
+    rdev: u64 = 0,
     size: u64 = 0,
     atime: u64 = 0,
     mtime: u64 = 0,
     ctime: u64 = 0,
+    flags2: u32 = 0,
 
     pub fn encode(self: InodeValue) [INODE_VALUE_LEN]u8 {
         var w: InodeValueWire = undefined;
-        var tag: [VARINT_MAX_LEN]u8 = undefined;
-        // Version 1 is a one-byte varint; the wire struct pins that shape.
-        assert(encodeVarint(INODE_VALUE_VERSION, &tag) == 1);
-        w.version = tag[0];
-        std.mem.writeInt(u32, &w.fields.mode_le, self.mode, .little);
-        std.mem.writeInt(u32, &w.fields.uid_le, self.uid, .little);
-        std.mem.writeInt(u32, &w.fields.gid_le, self.gid, .little);
-        std.mem.writeInt(u32, &w.fields.nlink_le, self.nlink, .little);
-        std.mem.writeInt(u32, &w.fields.flags_le, self.flags, .little);
-        std.mem.writeInt(u32, &w.fields.rdev_le, self.rdev, .little);
-        std.mem.writeInt(u64, &w.fields.size_le, self.size, .little);
-        std.mem.writeInt(u64, &w.fields.atime_le, self.atime, .little);
-        std.mem.writeInt(u64, &w.fields.mtime_le, self.mtime, .little);
-        std.mem.writeInt(u64, &w.fields.ctime_le, self.ctime, .little);
+        inline for (inode_field_table) |f| {
+            std.mem.writeInt(@FieldType(InodeValue, f.name), &@field(w, f.wire), @field(self, f.name), .little);
+        }
+        w.reserved = @splat(0);
         return std.mem.toBytes(w);
     }
 
-    /// varint → version gate → exactly the 56 fixed bytes (truncation and
-    /// trailing bytes both refuse).
+    /// Exactly `INODE_VALUE_LEN` bytes with a zero reserved tail (truncation,
+    /// trailing bytes and a non-zero reserved byte all refuse).
     pub fn decode(bytes: []const u8) DecodeError!InodeValue {
-        const tag = try decodeVarint(bytes);
-        if (tag.value != INODE_VALUE_VERSION) return error.Corrupt;
-        const body = bytes[tag.used..];
-        if (body.len != @sizeOf(InodeFields)) return error.Corrupt;
-        const f = std.mem.bytesToValue(InodeFields, body[0..@sizeOf(InodeFields)]);
-        return .{
-            .mode = std.mem.readInt(u32, &f.mode_le, .little),
-            .uid = std.mem.readInt(u32, &f.uid_le, .little),
-            .gid = std.mem.readInt(u32, &f.gid_le, .little),
-            .nlink = std.mem.readInt(u32, &f.nlink_le, .little),
-            .flags = std.mem.readInt(u32, &f.flags_le, .little),
-            .rdev = std.mem.readInt(u32, &f.rdev_le, .little),
-            .size = std.mem.readInt(u64, &f.size_le, .little),
-            .atime = std.mem.readInt(u64, &f.atime_le, .little),
-            .mtime = std.mem.readInt(u64, &f.mtime_le, .little),
-            .ctime = std.mem.readInt(u64, &f.ctime_le, .little),
-        };
+        if (bytes.len != INODE_VALUE_LEN) return error.Corrupt;
+        const w = std.mem.bytesToValue(InodeValueWire, bytes[0..INODE_VALUE_LEN]);
+        if (!std.mem.allEqual(u8, &w.reserved, 0)) return error.Corrupt;
+        var v: InodeValue = .{};
+        inline for (inode_field_table) |f| {
+            @field(v, f.name) = std.mem.readInt(@FieldType(InodeValue, f.name), &@field(w, f.wire), .little);
+        }
+        return v;
     }
 };
+
+comptime {
+    // Every RAM field is a wire field and vice versa: the table is total.
+    assert(inode_field_table.len == @typeInfo(InodeValue).@"struct".field_names.len);
+    for (inode_field_table) |f| assert(@sizeOf(@FieldType(InodeValue, f.name)) == f.width);
+}
 
 // ---------------------------------------------------------------------------
 // §2.2 Dentry value: `child_ino u64 LE ‖ file_type u8 ‖ name_len u8 ‖ name`.
@@ -547,25 +524,29 @@ fn validateRunLen(len: u32) DecodeError!void {
 // §2.6 Inode delta payload — the Δtime record.
 // ---------------------------------------------------------------------------
 
-pub const DELTA_MODE: u16 = 1 << 0;
-pub const DELTA_UID: u16 = 1 << 1;
-pub const DELTA_GID: u16 = 1 << 2;
-pub const DELTA_NLINK: u16 = 1 << 3;
-pub const DELTA_FLAGS: u16 = 1 << 4;
-pub const DELTA_RDEV: u16 = 1 << 5;
-pub const DELTA_SIZE: u16 = 1 << 6;
-pub const DELTA_ATIME: u16 = 1 << 7;
-pub const DELTA_MTIME: u16 = 1 << 8;
-pub const DELTA_CTIME: u16 = 1 << 9;
-/// The 10 defined bits; anything else is a decode error. The layout-delta
-/// magic 0x4C31 lies outside on purpose.
-pub const DELTA_MASK_ALL: u16 = 0x3FF;
+/// The mask bits: bit `i` IS field `i` of `InodeValueWire` (the one table).
+pub const DELTA_MODE: u16 = inodeFieldBit("mode");
+pub const DELTA_UID: u16 = inodeFieldBit("uid");
+pub const DELTA_GID: u16 = inodeFieldBit("gid");
+pub const DELTA_NLINK: u16 = inodeFieldBit("nlink");
+pub const DELTA_FLAGS: u16 = inodeFieldBit("flags");
+pub const DELTA_RDEV: u16 = inodeFieldBit("rdev");
+pub const DELTA_SIZE: u16 = inodeFieldBit("size");
+pub const DELTA_ATIME: u16 = inodeFieldBit("atime");
+pub const DELTA_MTIME: u16 = inodeFieldBit("mtime");
+pub const DELTA_CTIME: u16 = inodeFieldBit("ctime");
+pub const DELTA_FLAGS2: u16 = inodeFieldBit("flags2");
+/// The defined bits (one per wire field); anything else is a decode error.
+/// The layout-delta magic 0x4C31 lies outside on purpose.
+pub const DELTA_MASK_ALL: u16 = (1 << inode_field_table.len) - 1;
 /// The Δtime mask: mtime + ctime, never value fields.
 pub const DELTA_TIMES: u16 = DELTA_MTIME | DELTA_CTIME;
-/// mask + 6 × u32 + 4 × u64.
-pub const INODE_DELTA_MAX_LEN: usize = 2 + 6 * 4 + 4 * 8;
+/// mask + every field: the inode value's fixed bytes minus its reserved tail.
+pub const INODE_DELTA_MAX_LEN: usize = 2 + INODE_VALUE_LEN - @sizeOf(@FieldType(InodeValueWire, "reserved"));
 
 comptime {
+    assert(DELTA_MASK_ALL == 0x7FF);
+    assert(INODE_DELTA_MAX_LEN == 66);
     assert(LAYOUT_DELTA_MAGIC & ~DELTA_MASK_ALL != 0);
 }
 
@@ -605,20 +586,8 @@ pub const InodeDelta = struct {
         return n;
     }
 
-    const FieldSpec = struct { bit: u16, name: []const u8, width: usize };
-    /// The canonical field order: bit 0 first.
-    const field_table = [_]FieldSpec{
-        .{ .bit = DELTA_MODE, .name = "mode", .width = 4 },
-        .{ .bit = DELTA_UID, .name = "uid", .width = 4 },
-        .{ .bit = DELTA_GID, .name = "gid", .width = 4 },
-        .{ .bit = DELTA_NLINK, .name = "nlink", .width = 4 },
-        .{ .bit = DELTA_FLAGS, .name = "flags", .width = 4 },
-        .{ .bit = DELTA_RDEV, .name = "rdev", .width = 4 },
-        .{ .bit = DELTA_SIZE, .name = "size", .width = 8 },
-        .{ .bit = DELTA_ATIME, .name = "atime", .width = 8 },
-        .{ .bit = DELTA_MTIME, .name = "mtime", .width = 8 },
-        .{ .bit = DELTA_CTIME, .name = "ctime", .width = 8 },
-    };
+    /// The canonical field order IS the `Put` value's: bit 0 first.
+    const field_table = inode_field_table;
 
     /// `mask u16 LE ‖ the masked fields in canonical order`.
     pub fn encode(self: InodeDelta) InodeDeltaBuf {
@@ -1120,19 +1089,25 @@ pub const RecordKind = enum(u8) {
     }
 };
 
-/// `key_len u16 ‖ kind u8 ‖ seq u64 ‖ val_len u32`, LE. There is NO flags
-/// field (the charter's prose lists one; the bytes do not).
+/// `key_len u16 ‖ kind u8 ‖ flags u8 ‖ val_len u32 ‖ seq u64`, LE — 16 B,
+/// naturally aligned (format v4, decision 0003 Q1). `flags` is the one
+/// reserved must-be-zero byte a forward-only format keeps as cheap
+/// insurance; a non-zero value refuses (§12: exactly the encoder's form
+/// decodes).
 pub const RecordHeader = extern struct {
     key_len_le: [2]u8,
     kind: u8,
-    seq_le: [8]u8,
+    flags: u8,
     val_len_le: [4]u8,
+    seq_le: [8]u8,
 };
 
-pub const RECORD_HEADER_LEN: usize = 15;
+pub const RECORD_HEADER_LEN: usize = 16;
 
 comptime {
     assert(@sizeOf(RecordHeader) == RECORD_HEADER_LEN);
+    assert(@offsetOf(RecordHeader, "val_len_le") == 4);
+    assert(@offsetOf(RecordHeader, "seq_le") == 8);
 }
 
 /// The smallest encodable record: a header and a one-byte key (keys are
@@ -1161,8 +1136,9 @@ pub const RecordRef = struct {
         var h: RecordHeader = undefined;
         std.mem.writeInt(u16, &h.key_len_le, @intCast(self.key.len), .little);
         h.kind = @backingInt(self.kind);
-        std.mem.writeInt(u64, &h.seq_le, self.seq, .little);
+        h.flags = 0;
         std.mem.writeInt(u32, &h.val_len_le, @intCast(self.value.len), .little);
+        std.mem.writeInt(u64, &h.seq_le, self.seq, .little);
         out[0..RECORD_HEADER_LEN].* = std.mem.toBytes(h);
         @memcpy(out[RECORD_HEADER_LEN..][0..self.key.len], self.key);
         @memcpy(out[RECORD_HEADER_LEN + self.key.len ..][0..self.value.len], self.value);
@@ -1178,12 +1154,13 @@ pub const RecordRef = struct {
 
     /// Decode one record from the front of `buf`. Every length is checked
     /// against the container before use; tombstones carry no value; unknown
-    /// kinds and empty keys refuse.
+    /// kinds, a non-zero flags byte and empty keys refuse.
     pub fn decode(buf: []const u8) DecodeError!Decoded {
         if (buf.len < RECORD_HEADER_LEN) return error.Corrupt;
         const h = std.mem.bytesToValue(RecordHeader, buf[0..RECORD_HEADER_LEN]);
         const key_len: usize = std.mem.readInt(u16, &h.key_len_le, .little);
         const kind = try RecordKind.fromByte(h.kind);
+        if (h.flags != 0) return error.Corrupt;
         const seq = std.mem.readInt(u64, &h.seq_le, .little);
         const val_len: usize = std.mem.readInt(u32, &h.val_len_le, .little);
         if (key_len == 0) return error.Corrupt;
@@ -1581,38 +1558,65 @@ fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     return out;
 }
 
-test "inode value is 57 B: varint(1) + 6×u32 + 4×u64 with rdev in the old flags2 slot" {
-    const v: InodeValue = .{ .mode = 1, .uid = 2, .gid = 3, .nlink = 4, .flags = 5, .rdev = 6, .size = 7, .atime = 8, .mtime = 9, .ctime = 10 };
+test "inode value is 68 B fixed width: 5×u32 ‖ rdev u64 ‖ size u64 ‖ 3×i64 ns ‖ flags2 u32 ‖ reserved[4] = 0; exactly that form decodes" {
+    const v: InodeValue = .{ .mode = 1, .uid = 2, .gid = 3, .nlink = 4, .flags = 5, .rdev = 6, .size = 7, .atime = 8, .mtime = 9, .ctime = 10, .flags2 = 11 };
     const bytes = v.encode();
-    try testing.expectEqual(@as(usize, 57), bytes.len);
-    try testing.expectEqual(@as(u8, 1), bytes[0]);
-    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, bytes[1..5]);
-    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, bytes[5..9]);
-    try testing.expectEqualSlices(u8, &.{ 3, 0, 0, 0 }, bytes[9..13]);
-    try testing.expectEqualSlices(u8, &.{ 4, 0, 0, 0 }, bytes[13..17]);
-    try testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0 }, bytes[17..21]);
-    try testing.expectEqualSlices(u8, &.{ 6, 0, 0, 0 }, bytes[21..25]);
-    try testing.expectEqualSlices(u8, &.{ 7, 0, 0, 0, 0, 0, 0, 0 }, bytes[25..33]);
-    try testing.expectEqualSlices(u8, &.{ 8, 0, 0, 0, 0, 0, 0, 0 }, bytes[33..41]);
-    try testing.expectEqualSlices(u8, &.{ 9, 0, 0, 0, 0, 0, 0, 0 }, bytes[41..49]);
-    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0, 0, 0, 0, 0 }, bytes[49..57]);
+    try testing.expectEqual(@as(usize, 68), bytes.len);
+    try testing.expectEqual(@as(usize, 68), INODE_VALUE_LEN);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, bytes[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, bytes[4..8]);
+    try testing.expectEqualSlices(u8, &.{ 3, 0, 0, 0 }, bytes[8..12]);
+    try testing.expectEqualSlices(u8, &.{ 4, 0, 0, 0 }, bytes[12..16]);
+    try testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0 }, bytes[16..20]);
+    try testing.expectEqualSlices(u8, &.{ 6, 0, 0, 0, 0, 0, 0, 0 }, bytes[20..28]);
+    try testing.expectEqualSlices(u8, &.{ 7, 0, 0, 0, 0, 0, 0, 0 }, bytes[28..36]);
+    try testing.expectEqualSlices(u8, &.{ 8, 0, 0, 0, 0, 0, 0, 0 }, bytes[36..44]);
+    try testing.expectEqualSlices(u8, &.{ 9, 0, 0, 0, 0, 0, 0, 0 }, bytes[44..52]);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0, 0, 0, 0, 0 }, bytes[52..60]);
+    try testing.expectEqualSlices(u8, &.{ 11, 0, 0, 0 }, bytes[60..64]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, bytes[64..68]);
     try testing.expectEqual(v, try InodeValue.decode(&bytes));
     var with_rdev = iv(7);
-    with_rdev.rdev = 1;
+    with_rdev.rdev = 0x0001_0000_0000_0501;
     try testing.expectEqual(with_rdev, try InodeValue.decode(&with_rdev.encode()));
-    // Unknown future version — refused, not misparsed.
-    var future = bytes;
-    future[0] = 2;
-    try testing.expectError(error.Corrupt, InodeValue.decode(&future));
-    // Multi-byte varint version (129) — refused.
-    const big = [_]u8{ 0x81, 0x01 } ++ bytes[1..].*;
-    try testing.expectError(error.Corrupt, InodeValue.decode(&big));
+    // The one form: a non-zero reserved byte, truncation and trailing bytes
+    // all refuse.
+    var reserved = bytes;
+    reserved[66] = 1;
+    try testing.expectError(error.Corrupt, InodeValue.decode(&reserved));
     try testing.expectError(error.Corrupt, InodeValue.decode(bytes[0 .. bytes.len - 1]));
     try testing.expectError(error.Corrupt, InodeValue.decode(&(bytes ++ [_]u8{0})));
     try testing.expectError(error.Corrupt, InodeValue.decode(&.{}));
-    // A varint running past 64 bits, and a truncated one.
-    try testing.expectError(error.Corrupt, InodeValue.decode(&@as([11]u8, @splat(0x80))));
-    try testing.expectError(error.Corrupt, InodeValue.decode(&.{0x80}));
+    // The pre-v4 57 B varint form (`01 ‖ 56 fixed bytes`) and its
+    // non-canonical twin (`81 00 ‖ …`, which the LEB128 decoder accepted —
+    // format audit row 4) are both refused: no version tag exists to be
+    // non-canonical about.
+    const legacy = [_]u8{0x01} ++ @as([56]u8, @splat(0));
+    try testing.expectError(error.Corrupt, InodeValue.decode(&legacy));
+    const legacy_noncanonical = [_]u8{ 0x81, 0x00 } ++ @as([56]u8, @splat(0));
+    try testing.expectError(error.Corrupt, InodeValue.decode(&legacy_noncanonical));
+}
+
+test "the inode field table is derived from the wire struct: 11 fields, bit i = field i, widths = wire widths; the delta mask covers exactly them" {
+    try testing.expectEqual(@as(usize, 11), inode_field_table.len);
+    try testing.expectEqualStrings("mode", inode_field_table[0].name);
+    try testing.expectEqualStrings("flags2", inode_field_table[10].name);
+    try testing.expectEqual(@as(u16, 1 << 5), DELTA_RDEV);
+    try testing.expectEqual(@as(usize, 8), inode_field_table[5].width);
+    try testing.expectEqual(@as(u16, 1 << 10), DELTA_FLAGS2);
+    try testing.expectEqual(@as(u16, 0x7FF), DELTA_MASK_ALL);
+    try testing.expectEqual(@as(u16, 0x300), DELTA_TIMES);
+    var acc: u16 = 0;
+    var width: usize = 0;
+    for (inode_field_table, 0..) |f, i| {
+        try testing.expectEqual(@as(u16, 1) << @intCast(i), f.bit);
+        acc |= f.bit;
+        width += f.width;
+    }
+    try testing.expectEqual(DELTA_MASK_ALL, acc);
+    // The Put value's bytes are the fields in table order, then reserved.
+    try testing.expectEqual(INODE_VALUE_LEN - 4, width);
+    try testing.expectEqual(@as(usize, 66), INODE_DELTA_MAX_LEN);
 }
 
 test "dentry value roundtrips and caps the name at 255" {
@@ -1778,20 +1782,23 @@ test "inode delta: times is 18 B with mask 0x300 and touches only the time field
     try testing.expectEqual(orig, base);
 }
 
-test "inode delta: full mask is 58 B in canonical field order; unknown bits, truncation, trailing bytes refuse" {
+test "inode delta: full mask is 66 B in the Put value's field order; unknown bits, truncation, trailing bytes refuse" {
     const full: InodeDelta = .{ .mask = DELTA_MASK_ALL, .fields = iv(9) };
     const enc = full.encode();
-    try testing.expectEqual(@as(usize, 58), enc.slice().len);
+    try testing.expectEqual(@as(usize, 66), enc.slice().len);
     try testing.expectEqual(full, try InodeDelta.decode(enc.slice()));
     var base: InodeValue = .{};
     full.apply(&base);
     try testing.expectEqual(iv(9), base);
-    // Canonical order: mode, uid, gid, nlink, flags, rdev, size, atime, mtime, ctime.
+    // Canonical order = the Put value's: a full-mask delta's fields ARE the
+    // Put value's bytes minus the reserved tail (one table for both).
     const f = iv(9);
+    try testing.expectEqualSlices(u8, f.encode()[0 .. INODE_VALUE_LEN - 4], enc.slice()[2..]);
     try testing.expectEqual(f.mode, std.mem.readInt(u32, enc.slice()[2..6], .little));
-    try testing.expectEqual(f.rdev, std.mem.readInt(u32, enc.slice()[22..26], .little));
-    try testing.expectEqual(f.size, std.mem.readInt(u64, enc.slice()[26..34], .little));
-    try testing.expectEqual(f.ctime, std.mem.readInt(u64, enc.slice()[50..58], .little));
+    try testing.expectEqual(f.rdev, std.mem.readInt(u64, enc.slice()[22..30], .little));
+    try testing.expectEqual(f.size, std.mem.readInt(u64, enc.slice()[30..38], .little));
+    try testing.expectEqual(f.ctime, std.mem.readInt(u64, enc.slice()[54..62], .little));
+    try testing.expectEqual(f.flags2, std.mem.readInt(u32, enc.slice()[62..66], .little));
     // A sparse mask skips unmasked fields: {uid, size} = 2 + 4 + 8.
     const sparse: InodeDelta = .{ .mask = DELTA_UID | DELTA_SIZE, .fields = .{ .uid = 7, .size = 8 } };
     const sb = sparse.encode();
@@ -2047,7 +2054,7 @@ test "restamp: zero version copies; a versioned wire is patched at [3..19); an u
     try testing.expectError(error.Corrupt, restampDeltaVersions(gpa, "garbage", 1, 2));
 }
 
-test "record framing: 15 B header without a flags field; all three kinds roundtrip sequentially" {
+test "record framing: 16 B header {key_len u16, kind u8, flags u8 = 0, val_len u32, seq u64}; all three kinds roundtrip sequentially" {
     const gpa = testing.allocator;
     var records = [_]Record{
         try Record.put(gpa, &key.inodeKey(5), 9, &iv(1).encode()),
@@ -2064,8 +2071,9 @@ test "record framing: 15 B header without a flags field; all three kinds roundtr
         try rec.ref().appendTo(gpa, &buf);
         try testing.expectEqual(rec.ref().encodedLen(), buf.items.len - before);
     }
-    // Header bytes of the first record: key_len 8, kind 1, seq 9, val_len 57.
-    try testing.expectEqualSlices(u8, &.{ 8, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0, 57, 0, 0, 0 }, buf.items[0..15]);
+    // Header bytes of the first record: key_len 9, kind 1, flags 0, val_len 68, seq 9.
+    try testing.expectEqual(@as(usize, 16), RECORD_HEADER_LEN);
+    try testing.expectEqualSlices(u8, &.{ 9, 0, 1, 0, 68, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0 }, buf.items[0..16]);
     var cursor: usize = 0;
     for (&records) |*rec| {
         const d = try RecordRef.decode(buf.items[cursor..]);
@@ -2075,7 +2083,7 @@ test "record framing: 15 B header without a flags field; all three kinds roundtr
     try testing.expectEqual(buf.items.len, cursor);
 }
 
-test "record decode rejects malformed framing: truncation, lying lengths, bad kinds, empty key, tombstone with value" {
+test "record decode rejects malformed framing: truncation, lying lengths, bad kinds, a non-zero flags byte, empty key, tombstone with value" {
     const gpa = testing.allocator;
     var rec = try Record.put(gpa, &key.inodeKey(5), 9, &iv(1).encode());
     defer rec.deinit(gpa);
@@ -2091,14 +2099,21 @@ test "record decode rejects malformed framing: truncation, lying lengths, bad ki
     std.mem.writeInt(u16, lying[0..2], std.math.maxInt(u16), .little);
     try testing.expectError(error.Corrupt, RecordRef.decode(lying));
     lying[0..2].* = b[0..2].*;
-    std.mem.writeInt(u32, lying[11..15], std.math.maxInt(u32), .little);
+    std.mem.writeInt(u32, lying[4..8], std.math.maxInt(u32), .little);
     try testing.expectError(error.Corrupt, RecordRef.decode(lying));
-    lying[11..15].* = b[11..15].*;
+    lying[4..8].* = b[4..8].*;
     for ([_]u8{ 0, 4, 0xFF }) |bad_kind| {
         lying[2] = bad_kind;
         try testing.expectError(error.Corrupt, RecordRef.decode(lying));
     }
     lying[2] = 1;
+    // The reserved flags byte: every non-zero value refuses.
+    for ([_]u8{ 1, 0x80, 0xFF }) |flags| {
+        lying[3] = flags;
+        try testing.expectError(error.Corrupt, RecordRef.decode(lying));
+    }
+    lying[3] = 0;
+    _ = try RecordRef.decode(lying);
     std.mem.writeInt(u16, lying[0..2], 0, .little);
     try testing.expectError(error.Corrupt, RecordRef.decode(lying));
     var del = try Record.delete(gpa, &key.inodeKey(5), 1);
@@ -2106,7 +2121,7 @@ test "record decode rejects malformed framing: truncation, lying lengths, bad ki
     var dbuf: std.ArrayList(u8) = .empty;
     defer dbuf.deinit(gpa);
     try del.ref().appendTo(gpa, &dbuf);
-    std.mem.writeInt(u32, dbuf.items[11..15], 1, .little);
+    std.mem.writeInt(u32, dbuf.items[4..8], 1, .little);
     try dbuf.append(gpa, 0xFF);
     try testing.expectError(error.Corrupt, RecordRef.decode(dbuf.items));
 }
@@ -2664,7 +2679,7 @@ test "property: encode∘decode = id for every value codec under a deterministic
     var scratch2: [1024]u8 = undefined;
     for (0..2000) |_| {
         // Inode value.
-        const v: InodeValue = .{ .mode = r.int(u32), .uid = r.int(u32), .gid = r.int(u32), .nlink = r.int(u32), .flags = r.int(u32), .rdev = r.int(u32), .size = r.int(u64), .atime = r.int(u64), .mtime = r.int(u64), .ctime = r.int(u64) };
+        const v: InodeValue = .{ .mode = r.int(u32), .uid = r.int(u32), .gid = r.int(u32), .nlink = r.int(u32), .flags = r.int(u32), .rdev = r.int(u64), .size = r.int(u64), .atime = r.int(u64), .mtime = r.int(u64), .ctime = r.int(u64), .flags2 = r.int(u32) };
         try testing.expectEqual(v, try InodeValue.decode(&v.encode()));
         // Inode delta with a random mask.
         const d: InodeDelta = .{ .mask = r.intRangeAtMost(u16, 0, DELTA_MASK_ALL), .fields = v };
@@ -2788,7 +2803,7 @@ test "fuzz: every decoder is total on arbitrary bytes" {
     try std.testing.fuzz({}, decodersTotalFuzz, .{ .corpus = &.{
         fuzzSlice(&fixture_layout_a),
         fuzzSlice(&fixture_delta_g),
-        fuzzSlice(&.{ 8, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 }),
+        fuzzSlice(&.{ 9, 0, 1, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1 }),
         fuzzSlice(&.{ 1, 5, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0 }),
         fuzzSlice(&.{ 0xFF, 0x03, 0, 0 }),
     } });

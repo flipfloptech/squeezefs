@@ -73,6 +73,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const counters = @import("../core/counters.zig");
+const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
@@ -222,27 +223,33 @@ pub const Error = error{
     RetryBudgetExhausted,
 };
 
-pub const ErrorClass = enum { retryable, terminal, refusal };
+pub const ErrorClass = errors.Class;
 
-pub fn classOf(e: Error) ErrorClass {
+/// This module's names onto the ONE error set (`core/errors.zig`): the
+/// errno and the class are the table's. Backpressure is `QueueFull`
+/// (EAGAIN); a closing volume is the dismount (EROFS); a reader mount's or
+/// an unleased tree's mutation is read-only; protocol failures are EIO.
+pub fn coreError(e: Error) errors.Error {
     return switch (e) {
-        error.NoSpace, error.ValueTooLarge, error.EntryTooLarge, error.ForestKeyRefused, error.PartitionRefused, error.VolumeClosed => .refusal,
-        error.ConveyorFull, error.OutOfMemory => .retryable,
-        error.VolumeFailed, error.JournalWriteFailed, error.HoleCheckpointFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => .terminal,
+        error.NoSpace => error.NoSpaceLeft,
+        error.ValueTooLarge, error.EntryTooLarge => error.ValueTooLarge,
+        error.ForestKeyRefused => error.MalformedKey,
+        error.PartitionRefused => error.ReadOnlyFileSystem,
+        error.VolumeClosed => error.DismountRefused,
+        error.ConveyorFull => error.QueueFull,
+        error.OutOfMemory => error.OutOfMemory,
+        error.VolumeFailed => error.VolumeFailed,
+        error.HoleCheckpointFailed => error.HoleCheckpointFailed,
+        error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,
     };
 }
 
-/// THE errno table: one row per class member.
+pub fn classOf(e: Error) ErrorClass {
+    return errors.classOf(coreError(e));
+}
+
 pub fn errnoOf(e: Error) std.os.linux.E {
-    return switch (e) {
-        error.NoSpace => .NOSPC,
-        error.ValueTooLarge, error.EntryTooLarge => .@"2BIG",
-        error.ForestKeyRefused => .INVAL,
-        error.PartitionRefused => .ROFS,
-        error.ConveyorFull => .AGAIN,
-        error.OutOfMemory => .NOMEM,
-        error.VolumeClosed, error.VolumeFailed, error.JournalWriteFailed, error.HoleCheckpointFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => .IO,
-    };
+    return errors.toErrno(coreError(e));
 }
 
 fn mapBuildError(e: tx.BuildError) Error {
@@ -526,7 +533,9 @@ pub const Deps = struct {
     reg: *jc.InflightRegistry,
     ring_layout: journal.RingLayout,
     geo: jc.CoreGeometry,
-    writer_id: u16,
+    /// The appender the ring's page headers name (`journal.FIXED_RING_APPENDER`
+    /// on the fixed ring).
+    appender_id: u32,
     latch: *journal.FailureLatch,
     lane: LaneSeam,
     checkpoint: CheckpointHooks,
@@ -536,7 +545,6 @@ pub const Deps = struct {
     caps: Caps,
     /// `PARK_ESCALATION_NS`: the park escalation threshold.
     park_escalation_ns: u64,
-    framing: tx.KeyFraming,
 };
 
 // ---------------------------------------------------------------------------
@@ -715,7 +723,7 @@ pub const Conveyor = struct {
             t.deinit();
             return error.VolumeFailed;
         };
-        const q = tx.buildQueuedTx(t, self.deps.framing, self.deps.cache.cfg.layout.node_size, null) catch |e| return mapBuildError(e);
+        const q = tx.buildQueuedTx(t, self.deps.cache.cfg.layout.node_size, null) catch |e| return mapBuildError(e);
         return .{ .q = q, .done = done, .enqueued_ns = clock.monotonicNs() };
     }
 
@@ -755,11 +763,10 @@ pub const Conveyor = struct {
         }
     }
 
-    /// Resolve a record's tree by id; a record naming no mounted tree is
-    /// the batch's `Corrupt`.
-    fn treeFor(self: *const Conveyor, tree_id: u8) ?*KvTree {
-        for (self.deps.trees) |t| if (t.tree_id == tree_id) return t;
-        return null;
+    /// Resolve a record's tree by `tree.route` (the ONE routing law); a
+    /// record no mounted tree takes is the batch's `Corrupt`.
+    fn treeFor(self: *const Conveyor, tree_id: u8, k: []const u8) ?*KvTree {
+        return tree.routeContent(self.deps.trees, tree_id, k);
     }
 
     fn treeOf(self: *const Conveyor, n: *const CachedNode) ?*KvTree {
@@ -811,7 +818,7 @@ pub const Conveyor = struct {
             leaves[qi] = try arena.alloc(*CachedNode, m.q.recs.len);
             leaf_of[qi] = try arena.alloc(usize, m.q.recs.len);
             for (m.q.recs, 0..) |r, ri| {
-                const t = self.treeFor(r.tree_id) orelse return error.Corrupt;
+                const t = self.treeFor(r.tree_id, r.key) orelse return error.Corrupt;
                 const leaf = t.resolveLeaf(r.key) catch |e| return mapTreeError(e);
                 leaves[qi][ri] = leaf;
                 all[n] = leaf;
@@ -1208,7 +1215,7 @@ pub const Conveyor = struct {
         window.entries = survivors;
         window.bytes = bytes;
         if (!encode_failed and parts.items.len != 0) {
-            window.image = journal.buildBatchWrite(gpa, self.deps.ring_layout, self.deps.geo, self.deps.writer_id, window.res, parts.items) catch null;
+            window.image = journal.buildBatchWrite(gpa, self.deps.ring_layout, self.deps.geo, self.deps.appender_id, window.res, parts.items) catch null;
             encode_failed = window.image == null;
         }
         window.t_handoff_ns = clock.monotonicNs();
@@ -1317,7 +1324,7 @@ pub const Conveyor = struct {
                 n.applyLocked(d, group.items, entry_start) catch |e| {
                     apply_err = switch (e) {
                         error.Superseded => error.Corrupt,
-                        error.ReaderMayNotMutate, error.NonAuthorityInterior, error.LeafLeaseRefused => error.PartitionRefused,
+                        error.ReaderMayNotMutate, error.LeafLeaseRefused => error.PartitionRefused,
                         error.OutOfMemory => error.OutOfMemory,
                     };
                     break;
@@ -1338,11 +1345,7 @@ pub const Conveyor = struct {
     fn namesInode(recs: []const tx.Rec, ino: u64) bool {
         const ik = key.inodeKey(ino);
         for (recs) |r| {
-            if (r.tree_id != key.TREE_INODES) continue;
-            if (std.mem.eql(u8, r.key, &ik)) return true;
-            if (key.splitForestKey(r.key)) |s| {
-                if (s.kind == key.TREE_INODES and std.mem.eql(u8, s.legacy.slice(), &ik)) return true;
-            } else |_| {}
+            if (r.tree_id == key.TREE_INODES and std.mem.eql(u8, r.key, &ik)) return true;
         }
         return false;
     }
@@ -1454,7 +1457,7 @@ pub const Conveyor = struct {
             var n: usize = 0;
             defer for (leaves[0..n]) |l| l.release();
             for (undo) |u| {
-                const t = self.treeFor(u.tree_id) orelse return self.divergedFromReplay(site, "a dirty key names a tree that is not mounted; the window's records stay applied");
+                const t = self.treeFor(u.tree_id, u.key) orelse return self.divergedFromReplay(site, "a dirty key names a tree that is not mounted; the window's records stay applied");
                 leaves[n] = t.resolveLeaf(u.key) catch return self.divergedFromReplay(site, "leaf resolution failed for a dirty key; the window's records stay applied");
                 n += 1;
             }
@@ -1529,7 +1532,7 @@ pub const Conveyor = struct {
             var n: usize = 0;
             defer for (leaves[0..n]) |l| l.release();
             for (comps) |c| {
-                const t = self.treeFor(c.tree_id) orelse break;
+                const t = self.treeFor(c.tree_id, c.key) orelse break;
                 leaves[n] = t.resolveLeaf(c.key) catch break;
                 n += 1;
             }
@@ -1818,18 +1821,23 @@ test "batch caps tie: txs max(64, cpus × 2), bytes max(256 KiB, ring/16) clampe
     try testing.expectEqual(@as(usize, 8192), queueCapacity(1 << 20));
 }
 
-test "the error table: every class member has one errno and one class" {
+test "the error table is the ONE table: every member maps onto a core member with its errno and class" {
     inline for (@typeInfo(Error).error_set.error_names.?) |name| {
         const err: Error = @field(Error, name);
         _ = errnoOf(err);
         _ = classOf(err);
     }
     try testing.expectEqual(std.os.linux.E.NOSPC, errnoOf(error.NoSpace));
-    try testing.expectEqual(ErrorClass.refusal, classOf(error.NoSpace));
+    try testing.expectEqual(ErrorClass.terminal, classOf(error.NoSpace));
     try testing.expectEqual(std.os.linux.E.IO, errnoOf(error.VolumeFailed));
-    try testing.expectEqual(ErrorClass.terminal, classOf(error.VolumeFailed));
+    try testing.expectEqual(ErrorClass.refusal, classOf(error.VolumeFailed));
     try testing.expectEqual(ErrorClass.retryable, classOf(error.ConveyorFull));
     try testing.expectEqual(std.os.linux.E.AGAIN, errnoOf(error.ConveyorFull));
+    try testing.expectEqual(std.os.linux.E.@"2BIG", errnoOf(error.ValueTooLarge));
+    try testing.expectEqual(std.os.linux.E.INVAL, errnoOf(error.ForestKeyRefused));
+    try testing.expectEqual(std.os.linux.E.ROFS, errnoOf(error.PartitionRefused));
+    try testing.expectEqual(std.os.linux.E.ROFS, errnoOf(error.VolumeClosed));
+    try testing.expectEqual(std.os.linux.E.IO, errnoOf(error.JournalWriteFailed));
 }
 
 test "group size histogram buckets: 1–8 exact, ≤16, ≤32, ≤64, >64; Σ buckets ≡ records" {
@@ -1884,9 +1892,8 @@ const Harness = struct {
         h.* = .{ .gpa = gpa, .vol = undefined, .image = undefined, .lane = undefined, .cv = undefined, .inos = inos_mod.InoWatermark.init(2) };
         h.vol = try smo.TestVolume.init(gpa, c);
         errdefer h.vol.deinit();
-        _ = try h.vol.createTree(key.TREE_INODES);
-        _ = try h.vol.createTree(key.TREE_DENTRIES);
-        _ = try h.vol.createTree(key.TREE_XATTRS);
+        _ = try h.vol.createTree(.control);
+        _ = try h.vol.createTree(.native);
         h.image = journal.VolatileImage.init(gpa, h.vol.ring_image, 0);
         h.lane = RamLane.init(gpa, testing.io, h.vol.core, h.vol.reg, &h.latch, &h.vol.journal.stats, &h.image, strict);
         h.lane.checkpoint_past = checkpointPastFn;
@@ -1904,14 +1911,13 @@ const Harness = struct {
             .reg = h.vol.reg,
             .ring_layout = h.vol.journal.layout,
             .geo = geo,
-            .writer_id = h.vol.journal.writer_id,
+            .appender_id = h.vol.journal.appender_id,
             .latch = &h.latch,
             .lane = h.lane.seam(),
             .checkpoint = .{ .ctx = h, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowFn, .checkpointPast = checkpointPastFn, .space = &h.space, .posture = &h.posture, .space_retry = &h.space_retry },
             .smo_journal = h.vol.journal,
             .caps = caps orelse .{ .max_txs = deriveBatchTxs(8), .max_bytes = resolveBatchBytes(null, ringUserCapacity(geo)) },
             .park_escalation_ns = PARK_ESCALATION_NS,
-            .framing = .flat,
         });
         h.lane.conveyor = h.cv;
         return h;
@@ -1987,8 +1993,8 @@ const Harness = struct {
         return false;
     }
 
-    fn treeOf(h: *Harness, id: u8) *KvTree {
-        for (h.vol.trees.items) |t| if (t.tree_id == id) return t;
+    fn treeOf(h: *Harness, identity: tree.TreeIdentity) *KvTree {
+        for (h.vol.trees.items) |t| if (t.identity.eql(identity)) return t;
         unreachable;
     }
 
@@ -2010,7 +2016,7 @@ const Harness = struct {
     }
 
     fn present(h: *Harness, ino: u64) !bool {
-        const got = try h.treeOf(key.TREE_INODES).lookup(h.gpa, &key.inodeKey(ino));
+        const got = try h.treeOf(.native).lookup(h.gpa, &key.inodeKey(ino));
         defer if (got) |g| h.gpa.free(g);
         return got != null;
     }
@@ -2023,7 +2029,7 @@ const Harness = struct {
     }
 
     fn replayedPresent(r: *smo.TestVolume.Reopened, ino: u64) !bool {
-        const got = try r.treeOf(key.TREE_INODES).lookup(testing.allocator, &key.inodeKey(ino));
+        const got = try r.treeOf(.native).lookup(testing.allocator, &key.inodeKey(ino));
         defer if (got) |g| testing.allocator.free(g);
         return got != null;
     }
@@ -2261,7 +2267,7 @@ test "rollback: a failed window answers JournalWriteFailed, its records are roll
     try testing.expectEqual(@as(u64, 2), h.cv.windowsInflight());
     // Both applied to RAM; the parent's newest record is B's Δ.
     const newest_before = blk: {
-        const leaf = try h.treeOf(key.TREE_INODES).resolveLeaf(&parent_key);
+        const leaf = try h.treeOf(.native).resolveLeaf(&parent_key);
         defer leaf.release();
         const snap = leaf.snapshotLoad();
         defer snap.release();
@@ -2276,7 +2282,7 @@ test "rollback: a failed window answers JournalWriteFailed, its records are roll
     try testing.expect(try h.present(ino_b));
     // The parent's newest record is still B's (A's Δ was removed, B's stands).
     {
-        const leaf = try h.treeOf(key.TREE_INODES).resolveLeaf(&parent_key);
+        const leaf = try h.treeOf(.native).resolveLeaf(&parent_key);
         defer leaf.release();
         const snap = leaf.snapshotLoad();
         defer snap.release();
@@ -2509,7 +2515,7 @@ test "power cut after an acked coalesced commit loses it (never barriered); afte
     var kvs: std.ArrayList(tree.KeyValue) = .empty;
     defer tree.deinitKeyValues(h.gpa, &kvs);
     const range = tx.dentryChainRange(1, key.dentryNameHash54("acked-not-barriered", h.hash_seed));
-    try r.treeOf(key.TREE_DENTRIES).range(h.gpa, &range.start, &range.end, 8, &kvs);
+    try r.treeOf(.native).range(h.gpa, &range.start, &range.end, 8, &kvs);
     try testing.expectEqual(@as(usize, 0), kvs.items.len);
 
     const s = try Harness.create(.{}, null, true);

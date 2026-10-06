@@ -3,14 +3,13 @@
 //! Every key is a big-endian composite so that memcmp order IS logical
 //! order: the tree, the bset binary search and the n-way merge compare raw
 //! bytes and never decode a key (`order`). The kind byte is the historical
-//! tree id. Two layouts exist on disk:
-//!
-//!   - LEGACY (per-kind trees, bit 17 absent): the composite alone;
-//!   - FOREST (bit 17): the kind byte INSERTED at offset 8 for the ino-major
-//!     family and PREPENDED for block refs, so one mixed-kind tree per
-//!     routing slot stays memcmp-ordered per kind and refs sort after every
-//!     ino-major key (their first byte is 0x06; an ino-major key's first byte
-//!     is ≤ 0x01 because `(slot + 1) << 40 ≤ 2^56`).
+//! tree id and it is PRESENT ON EVERY KEY — there is ONE key layout, the
+//! charter's (format v4; decision 0002 row 35): INSERTED at offset 8 for the
+//! ino-major family (an inode, its xattrs and its children's dentries share
+//! one leaf region) and PREPENDED for block refs (refs sort by block so
+//! `refcount(block)` is one range probe, charter §5.6), so one mixed-kind
+//! tree per routing slot stays memcmp-ordered per kind and refs sort after
+//! every ino-major key.
 //!
 //! Every length here is a format law pinned by byte-literal tests; the
 //! decoders are total (any byte string yields a key or a typed refusal).
@@ -29,20 +28,23 @@ pub const DecodeError = error{Corrupt};
 // ---------------------------------------------------------------------------
 
 /// Interior record of a slot tree (legal iff level ≥ 1); also the node
-/// header `tree_id` of every slot-tree node.
+/// header `tree_id` of every slot-tree node (a CLASS byte there — a slot
+/// tree is named by its slot, never by this byte; the ledger names roots by
+/// `ledger.RootId`).
 pub const KIND_INTERIOR: u8 = 0;
 pub const TREE_INODES: u8 = 1;
 pub const TREE_DENTRIES: u8 = 2;
 pub const TREE_XATTRS: u8 = 3;
-/// Reserved (snapshots).
+/// Heap-allocator deltas (`alloc_ext`), journaled under 8 B extent keys.
 pub const TREE_ALLOC_RESERVED: u8 = 4;
-/// Reserved.
-pub const TREE_BACKPTR_RESERVED: u8 = 5;
-/// Durable block refs (incompat bit 8).
+/// Reserved for the DATA-allocation deltas of rung 6 (decision 0002 row 44):
+/// a distinct kind, never a key-length arm under kind 4.
+pub const TREE_DATA_ALLOC_RESERVED: u8 = 5;
+/// Durable block refs.
 pub const TREE_BLOCK_REFS: u8 = 6;
-/// Block-map tree (incompat bit 16).
+/// Block-map tree (capability `BLOCK_MAP_TREE`).
 pub const TREE_BLOCK_MAP: u8 = 7;
-/// Tree 0 of a forest volume (incompat bit 17); NEVER a slot-tree kind.
+/// Tree 0 of the forest; NEVER a slot-tree kind.
 pub const TREE_CONTROL: u8 = 8;
 /// Reserved; its own tree, never a slot-tree kind.
 pub const TREE_SHARED_INDEX: u8 = 9;
@@ -56,15 +58,15 @@ comptime {
 }
 
 /// Is `kind` a content family that lives INSIDE a slot tree? Exactly
-/// {1,2,3,6,7} — this set IS incompat bit 17's meaning: a new slot-tree kind
+/// {1,2,3,6,7} — this set IS the forest's meaning: a new slot-tree kind
 /// needs a NEW incompat bit so an older binary refuses the volume instead
 /// of skipping (and fsck-deleting) records it cannot name.
 pub fn isSlotTreeKind(kind: u8) bool {
-    return legacyKeyLen(kind) != null;
+    return slotTreeKeyLen(kind) != null;
 }
 
-/// The legacy key length of a slot-tree kind; null for any other kind.
-pub fn legacyKeyLen(kind: u8) ?usize {
+/// The key length of a slot-tree kind; null for any other kind.
+pub fn slotTreeKeyLen(kind: u8) ?usize {
     return switch (kind) {
         TREE_INODES => INODE_KEY_LEN,
         TREE_DENTRIES => DENTRY_KEY_LEN,
@@ -146,22 +148,31 @@ fn readBe64(bytes: []const u8, off: usize) u64 {
 }
 
 // ---------------------------------------------------------------------------
-// §1.2 Legacy (per-kind) keys — the shapes the per-kind codecs read.
+// §1.2 The keys — the kind byte at offset 8 (ino-major) or 0 (refs).
 // ---------------------------------------------------------------------------
 
-pub const INODE_KEY_LEN: usize = 8;
-pub const DENTRY_KEY_LEN: usize = 16;
-pub const XATTR_KEY_LEN: usize = 16;
-pub const BLOCK_MAP_KEY_LEN: usize = 12;
-pub const BLOCK_REF_KEY_LEN: usize = 28;
-/// The refcount prefix `vol_tag ‖ block_idx` of a block-ref key.
-pub const BLOCK_REF_PREFIX_LEN: usize = 16;
+/// `ino ‖ 01`.
+pub const INODE_KEY_LEN: usize = 8 + 1;
+/// `parent ‖ 02 ‖ hash54 ‖ coll_seq`.
+pub const DENTRY_KEY_LEN: usize = 8 + 1 + 8;
+/// `ino ‖ 03 ‖ hash56 ‖ coll`.
+pub const XATTR_KEY_LEN: usize = 8 + 1 + 8;
+/// `owner ‖ 07 ‖ block_index`.
+pub const BLOCK_MAP_KEY_LEN: usize = 8 + 1 + 4;
+/// `06 ‖ vol_tag ‖ block_idx ‖ owner_ino ‖ block_index`.
+pub const BLOCK_REF_KEY_LEN: usize = 1 + 8 + 8 + 8 + 4;
+/// The refcount prefix `06 ‖ vol_tag ‖ block_idx` of a block-ref key:
+/// `refcount(block)` = the population of this prefix (charter §5.6).
+pub const BLOCK_REF_PREFIX_LEN: usize = 1 + 8 + 8;
 /// The OWNER ino sits right after the refcount prefix; the forest routes a
 /// reference by it.
 pub const BLOCK_REF_OWNER_OFF: usize = BLOCK_REF_PREFIX_LEN;
+/// The kind byte's offset in an ino-major key.
+pub const INO_MAJOR_KIND_OFF: usize = 8;
 /// `block_index` sentinel: "this ref is the indirect map blob". u32 indices
-/// address 16 EiB at 4 MiB blocks, so the top value is unreachable as a real
-/// index; the block-map tree refuses it as a key for the same reason.
+/// address 2^32 × 4 MiB = 16 PiB (charter §5.6 "Ceiling 16 PiB at 4 MiB
+/// blocks"), so the top value is unreachable as a real index; the block-map
+/// tree refuses it as a key for the same reason.
 pub const BLOCK_INDEX_MAP_BLOB: u32 = std.math.maxInt(u32);
 
 /// 54 hash bits leave room for `coll_seq` (8) + the readdir bias inside a
@@ -170,12 +181,13 @@ pub const HASH54_MAX: u64 = (1 << 54) - 1;
 /// No cookie constraint on xattrs (`listxattr` has no resume): 56 bits.
 pub const HASH56_MAX: u64 = (1 << 56) - 1;
 
-/// Inode key: `[0..8) ino u64 BE`.
+/// Inode key: `[0..8) ino u64 BE ‖ [8] 0x01`.
 pub const InodeKey = extern struct {
     ino_be: [8]u8,
+    kind: u8,
 
     pub fn init(ino_: u64) InodeKey {
-        var k: InodeKey = undefined;
+        var k: InodeKey = .{ .ino_be = undefined, .kind = TREE_INODES };
         std.mem.writeInt(u64, &k.ino_be, ino_, .big);
         return k;
     }
@@ -186,19 +198,22 @@ pub const InodeKey = extern struct {
 
     pub fn decode(key: []const u8) DecodeError!InodeKey {
         if (key.len != INODE_KEY_LEN) return error.Corrupt;
-        return std.mem.bytesToValue(InodeKey, key[0..INODE_KEY_LEN]);
+        const k = std.mem.bytesToValue(InodeKey, key[0..INODE_KEY_LEN]);
+        if (k.kind != TREE_INODES) return error.Corrupt;
+        return k;
     }
 };
 
-/// Dentry key: `[0..8) parent_ino u64 BE ‖ [8..16) suffix u64 BE`, where
-/// `suffix = (hash54 << 8) | coll_seq` (62 bits; the top 2 bits are
-/// structurally zero and refused on decode).
+/// Dentry key: `[0..8) parent_ino u64 BE ‖ [8] 0x02 ‖ [9..17) suffix u64
+/// BE`, where `suffix = (hash54 << 8) | coll_seq` (62 bits; the top 2 bits
+/// are structurally zero and refused on decode).
 pub const DentryKey = extern struct {
     parent_ino_be: [8]u8,
+    kind: u8,
     suffix_be: [8]u8,
 
     pub fn init(parent_ino_: u64, hash54_: u64, coll_seq: u8) DentryKey {
-        var k: DentryKey = undefined;
+        var k: DentryKey = .{ .parent_ino_be = undefined, .kind = TREE_DENTRIES, .suffix_be = undefined };
         std.mem.writeInt(u64, &k.parent_ino_be, parent_ino_, .big);
         std.mem.writeInt(u64, &k.suffix_be, dentryKeySuffix(hash54_, coll_seq), .big);
         return k;
@@ -223,21 +238,24 @@ pub const DentryKey = extern struct {
     pub fn decode(key: []const u8) DecodeError!DentryKey {
         if (key.len != DENTRY_KEY_LEN) return error.Corrupt;
         const k = std.mem.bytesToValue(DentryKey, key[0..DENTRY_KEY_LEN]);
+        if (k.kind != TREE_DENTRIES) return error.Corrupt;
         // 54 + 8 = 62 bits: the builder never sets the top two.
         if (k.suffix() >> 62 != 0) return error.Corrupt;
         return k;
     }
 };
 
-/// Xattr key: `[0..8) ino u64 BE ‖ [8..16) ((hash56 << 8) | coll_seq) u64 BE`.
-/// 56 + 8 = 64: no structural-zero bits, hence no top-bit check on decode.
+/// Xattr key: `[0..8) ino u64 BE ‖ [8] 0x03 ‖ [9..17) ((hash56 << 8) |
+/// coll_seq) u64 BE`. 56 + 8 = 64: no structural-zero bits, hence no top-bit
+/// check on decode.
 pub const XattrKey = extern struct {
     ino_be: [8]u8,
+    kind: u8,
     suffix_be: [8]u8,
 
     pub fn init(ino_: u64, hash56_: u64, coll_seq: u8) XattrKey {
         assert(hash56_ <= HASH56_MAX);
-        var k: XattrKey = undefined;
+        var k: XattrKey = .{ .ino_be = undefined, .kind = TREE_XATTRS, .suffix_be = undefined };
         std.mem.writeInt(u64, &k.ino_be, ino_, .big);
         std.mem.writeInt(u64, &k.suffix_be, ((hash56_ & HASH56_MAX) << 8) | coll_seq, .big);
         return k;
@@ -257,15 +275,18 @@ pub const XattrKey = extern struct {
 
     pub fn decode(key: []const u8) DecodeError!XattrKey {
         if (key.len != XATTR_KEY_LEN) return error.Corrupt;
-        return std.mem.bytesToValue(XattrKey, key[0..XATTR_KEY_LEN]);
+        const k = std.mem.bytesToValue(XattrKey, key[0..XATTR_KEY_LEN]);
+        if (k.kind != TREE_XATTRS) return error.Corrupt;
+        return k;
     }
 };
 
-/// Block-map key: `[0..8) owner_ino u64 BE ‖ [8..12) block_index u32 BE`.
-/// `block_index == u32::MAX` is RESERVED (the MAP_BLOB sentinel): refused at
-/// encode AND decode; it appears only as a range END bound.
+/// Block-map key: `[0..8) owner_ino u64 BE ‖ [8] 0x07 ‖ [9..13) block_index
+/// u32 BE`. `block_index == u32::MAX` is RESERVED (the MAP_BLOB sentinel):
+/// refused at encode AND decode; it appears only as a range END bound.
 pub const BlockMapKey = extern struct {
     owner_ino_be: [8]u8,
+    kind: u8,
     block_index_be: [4]u8,
 
     pub fn init(owner_ino_: u64, block_index_: u32) DecodeError!BlockMapKey {
@@ -276,7 +297,7 @@ pub const BlockMapKey = extern struct {
     /// The unchecked form the range bounds use (the reserved index as an
     /// inclusive END is exact: no record carries it).
     fn initRaw(owner_ino_: u64, block_index_: u32) BlockMapKey {
-        var k: BlockMapKey = undefined;
+        var k: BlockMapKey = .{ .owner_ino_be = undefined, .kind = TREE_BLOCK_MAP, .block_index_be = undefined };
         std.mem.writeInt(u64, &k.owner_ino_be, owner_ino_, .big);
         std.mem.writeInt(u32, &k.block_index_be, block_index_, .big);
         return k;
@@ -293,21 +314,23 @@ pub const BlockMapKey = extern struct {
     pub fn decode(key: []const u8) DecodeError!BlockMapKey {
         if (key.len != BLOCK_MAP_KEY_LEN) return error.Corrupt;
         const k = std.mem.bytesToValue(BlockMapKey, key[0..BLOCK_MAP_KEY_LEN]);
+        if (k.kind != TREE_BLOCK_MAP) return error.Corrupt;
         if (k.blockIndex() == BLOCK_INDEX_MAP_BLOB) return error.Corrupt;
         return k;
     }
 };
 
-/// Block-ref key: `[0..8) vol_tag ‖ [8..16) block_idx ‖ [16..24) owner_ino
-/// (all u64 BE) ‖ [24..28) block_index u32 BE`.
+/// Block-ref key: `[0] 0x06 ‖ [1..9) vol_tag ‖ [9..17) block_idx ‖ [17..25)
+/// owner_ino (all u64 BE) ‖ [25..29) block_index u32 BE`.
 pub const BlockRefKey = extern struct {
+    kind: u8,
     vol_tag_be: [8]u8,
     block_idx_be: [8]u8,
     owner_ino_be: [8]u8,
     block_index_be: [4]u8,
 
     pub fn init(vol_tag_: u64, block_idx_: u64, owner_ino_: u64, block_index_: u32) BlockRefKey {
-        var k: BlockRefKey = undefined;
+        var k: BlockRefKey = .{ .kind = TREE_BLOCK_REFS, .vol_tag_be = undefined, .block_idx_be = undefined, .owner_ino_be = undefined, .block_index_be = undefined };
         std.mem.writeInt(u64, &k.vol_tag_be, vol_tag_, .big);
         std.mem.writeInt(u64, &k.block_idx_be, block_idx_, .big);
         std.mem.writeInt(u64, &k.owner_ino_be, owner_ino_, .big);
@@ -338,7 +361,9 @@ pub const BlockRefKey = extern struct {
 
     pub fn decode(key: []const u8) DecodeError!BlockRefKey {
         if (key.len != BLOCK_REF_KEY_LEN) return error.Corrupt;
-        return std.mem.bytesToValue(BlockRefKey, key[0..BLOCK_REF_KEY_LEN]);
+        const k = std.mem.bytesToValue(BlockRefKey, key[0..BLOCK_REF_KEY_LEN]);
+        if (k.kind != TREE_BLOCK_REFS) return error.Corrupt;
+        return k;
     }
 };
 
@@ -348,6 +373,12 @@ comptime {
     assert(@sizeOf(XattrKey) == XATTR_KEY_LEN);
     assert(@sizeOf(BlockMapKey) == BLOCK_MAP_KEY_LEN);
     assert(@sizeOf(BlockRefKey) == BLOCK_REF_KEY_LEN);
+    assert(@offsetOf(InodeKey, "kind") == INO_MAJOR_KIND_OFF);
+    assert(@offsetOf(DentryKey, "kind") == INO_MAJOR_KIND_OFF);
+    assert(@offsetOf(XattrKey, "kind") == INO_MAJOR_KIND_OFF);
+    assert(@offsetOf(BlockMapKey, "kind") == INO_MAJOR_KIND_OFF);
+    assert(@offsetOf(BlockRefKey, "kind") == 0);
+    assert(@offsetOf(BlockRefKey, "owner_ino_be") == BLOCK_REF_OWNER_OFF);
 }
 
 pub fn inodeKey(ino: u64) [INODE_KEY_LEN]u8 {
@@ -400,7 +431,7 @@ pub const KeyRange = struct { lo: KeyBuf, hi: KeyBuf };
 /// Every reference on one data volume. `hi` is the next tag's first key,
 /// or — for the last tag, which has no successor — a key one byte LONGER
 /// than any real key and all 0xFF (memcmp: a prefix precedes its
-/// extensions, so it sorts strictly after every 28-byte key).
+/// extensions, so it sorts strictly after every 29-byte key).
 pub fn volumeRange(vol_tag: u64) KeyRange {
     const lo = KeyBuf.fromSlice(&blockRefKey(vol_tag, 0, 0, 0));
     if (vol_tag == std.math.maxInt(u64)) {
@@ -436,10 +467,9 @@ pub fn volumeTag(volume_id: []const u8) u64 {
     return checksum.xxh3(volume_id);
 }
 
-/// Exactly Rust's `u64::from_str_radix(s, 16)` acceptance: an optional
-/// leading `+`, then ≥ 1 hex digits of either case — no whitespace, no `_`
-/// separators (which `std.fmt.parseInt` would admit and so mint a tag the
-/// reference hashes instead).
+/// Strict hex: ≥ 1 hex digits of either case after an optional leading `+`
+/// — no whitespace, no `_` separators (which `std.fmt.parseInt` would admit
+/// and so mint a tag another parser hashes instead).
 fn parseHexU64Strict(s: []const u8) ?u64 {
     const digits = if (s.len > 0 and s[0] == '+') s[1..] else s;
     if (digits.len == 0 or digits.len > 16) return null;
@@ -475,6 +505,13 @@ pub fn guestForestSlot(slot: u16) ForestSlot {
 /// belongs to no slot and is refused at the one codec in both directions.
 pub const FOREST_SLOT_MAX: ForestSlot = guestForestSlot(std.math.maxInt(u16));
 
+comptime {
+    // The classification ladder's soundness: every routing ino is below
+    // 2^57, so an ino-major key's first byte is ≤ 0x01 and can never read
+    // as the refs kind byte (0x06).
+    assert((@as(u64, FOREST_SLOT_MAX) + 1) << GUEST_NS_SHIFT <= @as(u64, 0x02) << 56);
+}
+
 /// The guest-namespace key ino of guest slot `slot`'s raw local `local`.
 pub fn guestLocalIno(slot: u16, local: u64) u64 {
     assert(local < GUEST_NS_BASE);
@@ -504,17 +541,8 @@ pub fn checkedForestSlot(key_ino: u64) error{SlotOutOfNamespace}!ForestSlot {
 }
 
 // ---------------------------------------------------------------------------
-// §1.3 Forest keys — the kind byte inserted.
+// §1.3 The slot-tree key codec: kind and slot of a raw key.
 // ---------------------------------------------------------------------------
-
-pub const FOREST_INODE_KEY_LEN: usize = INODE_KEY_LEN + 1;
-pub const FOREST_DENTRY_KEY_LEN: usize = DENTRY_KEY_LEN + 1;
-pub const FOREST_XATTR_KEY_LEN: usize = XATTR_KEY_LEN + 1;
-pub const FOREST_BLOCK_MAP_KEY_LEN: usize = BLOCK_MAP_KEY_LEN + 1;
-pub const FOREST_BLOCK_REF_KEY_LEN: usize = BLOCK_REF_KEY_LEN + 1;
-/// Owner ino of a forest block-ref key: one kind byte after the legacy
-/// offset.
-pub const FOREST_BLOCK_REF_OWNER_OFF: usize = 1 + BLOCK_REF_OWNER_OFF;
 
 /// How a key a slot tree holds fails the codec — the defect CLASSES as a
 /// typed error set. fsck's raw C1 repair deletes ONLY `MalformedKnownKind`
@@ -553,56 +581,20 @@ pub const RawKeyDefect = union(enum) {
     }
 };
 
-/// Offset of the ROUTING ino inside a forest key of `kind`: the owner for
-/// refs, the leading ino otherwise.
-pub fn forestRouteOff(kind: u8) usize {
-    return if (kind == TREE_BLOCK_REFS) FOREST_BLOCK_REF_OWNER_OFF else 0;
-}
-
-fn legacyRouteOff(kind: u8) usize {
+/// Offset of the ROUTING ino inside a key of `kind`: the owner for refs,
+/// the leading ino otherwise.
+pub fn routeOff(kind: u8) usize {
     return if (kind == TREE_BLOCK_REFS) BLOCK_REF_OWNER_OFF else 0;
-}
-
-fn checkLegacyShape(kind: u8, legacy: []const u8) ForestKeyError!void {
-    const want = legacyKeyLen(kind) orelse return error.UnknownKind;
-    if (legacy.len != want) return error.MalformedKnownKind;
-}
-
-/// Frame a legacy key as its forest key. Refuses a kind outside the
-/// slot-tree set, a legacy key of the wrong length for its kind, and a
-/// routing ino above the slot namespace — a mis-framed key would route to
-/// a foreign slot or fail at every later read, so it is refused at the one
-/// encoder.
-pub fn forestKey(kind: u8, legacy: []const u8) ForestKeyError!KeyBuf {
-    try checkLegacyShape(kind, legacy);
-    _ = try checkedForestSlot(readBe64(legacy, legacyRouteOff(kind)));
-    var out: KeyBuf = .{};
-    if (kind == TREE_BLOCK_REFS) {
-        out.appendByte(kind);
-        out.appendSlice(legacy);
-    } else {
-        out.appendSlice(legacy[0..8]);
-        out.appendByte(kind);
-        out.appendSlice(legacy[8..]);
-    }
-    return out;
-}
-
-/// The slot a `(kind, LEGACY key)` pair routes to, without framing it —
-/// the commit path's per-record probe.
-pub fn legacyKeySlot(kind: u8, legacy: []const u8) ForestKeyError!ForestSlot {
-    try checkLegacyShape(kind, legacy);
-    return checkedForestSlot(readBe64(legacy, legacyRouteOff(kind)));
 }
 
 const KeyShape = union(enum) { kind: u8, defect: RawKeyDefect };
 
-/// The ONE refusal ladder, in the reference's order: empty ⇒ Truncated;
-/// first byte 0x06 ⇒ refs; first byte > 0x01 ⇒ neither family (a known
-/// ino-major kind there is Malformed, anything else Unknown); else the kind
-/// at offset 8 (missing ⇒ Truncated; 0x06 there ⇒ Malformed, refs are never
-/// ino-major); not a slot-tree kind ⇒ Unknown; wrong length ⇒ Malformed;
-/// routing slot above the namespace ⇒ SlotOutOfNamespace.
+/// The ONE refusal ladder: empty ⇒ Truncated; first byte 0x06 ⇒ refs;
+/// first byte > 0x01 ⇒ neither family (a known ino-major kind there is
+/// Malformed, anything else Unknown); else the kind at offset 8 (missing ⇒
+/// Truncated; 0x06 there ⇒ Malformed, refs are never ino-major); not a
+/// slot-tree kind ⇒ Unknown; wrong length ⇒ Malformed; routing slot above
+/// the namespace ⇒ SlotOutOfNamespace.
 fn classifyKey(key: []const u8) KeyShape {
     if (key.len == 0) return .{ .defect = .{ .truncated = .{ .got = 0 } } };
     const first = key[0];
@@ -610,35 +602,35 @@ fn classifyKey(key: []const u8) KeyShape {
     if (first == TREE_BLOCK_REFS) {
         kind = TREE_BLOCK_REFS;
     } else if (first > 0x01) {
-        if (legacyKeyLen(first)) |want| {
-            return .{ .defect = .{ .malformed_known_kind = .{ .kind = first, .want = want + 1, .got = key.len } } };
+        if (slotTreeKeyLen(first)) |want| {
+            return .{ .defect = .{ .malformed_known_kind = .{ .kind = first, .want = want, .got = key.len } } };
         }
         return .{ .defect = .{ .unknown_kind = .{ .kind = first } } };
     } else {
-        if (key.len <= 8) return .{ .defect = .{ .truncated = .{ .got = key.len } } };
-        kind = key[8];
+        if (key.len <= INO_MAJOR_KIND_OFF) return .{ .defect = .{ .truncated = .{ .got = key.len } } };
+        kind = key[INO_MAJOR_KIND_OFF];
         if (kind == TREE_BLOCK_REFS) {
-            return .{ .defect = .{ .malformed_known_kind = .{ .kind = TREE_BLOCK_REFS, .want = FOREST_BLOCK_REF_KEY_LEN, .got = key.len } } };
+            return .{ .defect = .{ .malformed_known_kind = .{ .kind = TREE_BLOCK_REFS, .want = BLOCK_REF_KEY_LEN, .got = key.len } } };
         }
     }
-    const want = legacyKeyLen(kind) orelse return .{ .defect = .{ .unknown_kind = .{ .kind = kind } } };
-    if (key.len != want + 1) {
-        return .{ .defect = .{ .malformed_known_kind = .{ .kind = kind, .want = want + 1, .got = key.len } } };
+    const want = slotTreeKeyLen(kind) orelse return .{ .defect = .{ .unknown_kind = .{ .kind = kind } } };
+    if (key.len != want) {
+        return .{ .defect = .{ .malformed_known_kind = .{ .kind = kind, .want = want, .got = key.len } } };
     }
-    const slot = forestSlotOfIno(readBe64(key, forestRouteOff(kind)));
+    const slot = forestSlotOfIno(readBe64(key, routeOff(kind)));
     if (slot > FOREST_SLOT_MAX) return .{ .defect = .{ .slot_out_of_namespace = .{ .kind = kind, .slot = slot } } };
     return .{ .kind = kind };
 }
 
-/// The kind byte of a forest key WITHOUT materializing its legacy form.
-pub fn forestKeyKind(key: []const u8) ForestKeyError!u8 {
+/// The kind byte of a slot-tree key, or the typed refusal.
+pub fn slotTreeKeyKind(key: []const u8) ForestKeyError!u8 {
     return switch (classifyKey(key)) {
         .kind => |k| k,
         .defect => |d| d.toError(),
     };
 }
 
-/// Classify a key the forest codec refuses; null iff it decodes.
+/// Classify a key the codec refuses; null iff it decodes.
 pub fn classifyRefusedKey(key: []const u8) ?RawKeyDefect {
     return switch (classifyKey(key)) {
         .kind => null,
@@ -646,27 +638,23 @@ pub fn classifyRefusedKey(key: []const u8) ?RawKeyDefect {
     };
 }
 
-pub const SplitForestKey = struct { kind: u8, legacy: KeyBuf };
-
-/// The exact inverse of `forestKey`.
-pub fn splitForestKey(key: []const u8) ForestKeyError!SplitForestKey {
-    const kind = try forestKeyKind(key);
-    var legacy: KeyBuf = .{};
-    if (kind == TREE_BLOCK_REFS) {
-        legacy.appendSlice(key[1..]);
-    } else {
-        legacy.appendSlice(key[0..8]);
-        legacy.appendSlice(key[9..]);
-    }
-    return .{ .kind = kind, .legacy = legacy };
+/// The slot a slot-tree key routes to: `key_ino >> 40` of the routing ino
+/// (charter §5.5 "a record's slot is `key_ino >> 40` (refs by their owner
+/// ino)"). Interior separator keys are real keys of the tree and route the
+/// same way.
+pub fn slotTreeKeySlot(key: []const u8) ForestKeyError!ForestSlot {
+    const kind = try slotTreeKeyKind(key);
+    // The ladder already refused an ino above the namespace.
+    return forestSlotOfIno(readBe64(key, routeOff(kind)));
 }
 
-/// The slot a forest key routes to: `key_ino >> 40` of the routing ino.
-/// Interior separator keys are real keys of the tree and route the same way.
-pub fn forestKeySlot(key: []const u8) ForestKeyError!ForestSlot {
-    const kind = try forestKeyKind(key);
-    // The ladder already refused an ino above the namespace.
-    return forestSlotOfIno(readBe64(key, forestRouteOff(kind)));
+/// The commit-side agreement check: a staged `(kind, key)` whose key does
+/// not decode as that kind would route to a foreign slot or fail at every
+/// later read, so it is refused at the one choke point every tx passes.
+pub fn checkSlotTreeKey(kind: u8, key: []const u8) ForestKeyError!ForestSlot {
+    const got = try slotTreeKeyKind(key);
+    if (got != kind) return error.MalformedKnownKind;
+    return forestSlotOfIno(readBe64(key, routeOff(kind)));
 }
 
 // ---------------------------------------------------------------------------
@@ -856,7 +844,7 @@ test "tree ids pin the on-disk format and fit the journal tag nibble" {
     try testing.expectEqual(@as(u8, 2), TREE_DENTRIES);
     try testing.expectEqual(@as(u8, 3), TREE_XATTRS);
     try testing.expectEqual(@as(u8, 4), TREE_ALLOC_RESERVED);
-    try testing.expectEqual(@as(u8, 5), TREE_BACKPTR_RESERVED);
+    try testing.expectEqual(@as(u8, 5), TREE_DATA_ALLOC_RESERVED);
     try testing.expectEqual(@as(u8, 6), TREE_BLOCK_REFS);
     try testing.expectEqual(@as(u8, 7), TREE_BLOCK_MAP);
     try testing.expectEqual(@as(u8, 8), TREE_CONTROL);
@@ -880,8 +868,26 @@ test "journal tag packs tree_id | level << 4 and untag inverts it; admissibility
     try testing.expect(!tagTreeIdAdmissible(0x0F, 2));
 }
 
-test "inode key is big-endian and memcmp-ordered; wrong lengths refuse" {
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 1 }, &inodeKey(1));
+test "v4 key lengths: the kind byte is on EVERY key — 9/17/17/13/29; the slot-tree lengths table agrees" {
+    try testing.expectEqual(@as(usize, 9), INODE_KEY_LEN);
+    try testing.expectEqual(@as(usize, 17), DENTRY_KEY_LEN);
+    try testing.expectEqual(@as(usize, 17), XATTR_KEY_LEN);
+    try testing.expectEqual(@as(usize, 13), BLOCK_MAP_KEY_LEN);
+    try testing.expectEqual(@as(usize, 29), BLOCK_REF_KEY_LEN);
+    try testing.expectEqual(@as(usize, 17), BLOCK_REF_OWNER_OFF);
+    try testing.expectEqual(@as(usize, 17), BLOCK_REF_PREFIX_LEN);
+    try testing.expectEqual(@as(?usize, 9), slotTreeKeyLen(TREE_INODES));
+    try testing.expectEqual(@as(?usize, 17), slotTreeKeyLen(TREE_DENTRIES));
+    try testing.expectEqual(@as(?usize, 17), slotTreeKeyLen(TREE_XATTRS));
+    try testing.expectEqual(@as(?usize, 29), slotTreeKeyLen(TREE_BLOCK_REFS));
+    try testing.expectEqual(@as(?usize, 13), slotTreeKeyLen(TREE_BLOCK_MAP));
+    try testing.expectEqual(@as(?usize, null), slotTreeKeyLen(TREE_CONTROL));
+    try testing.expectEqual(@as(?usize, null), slotTreeKeyLen(KIND_INTERIOR));
+    try testing.expectEqual(@as(usize, 36), KEY_BUF_CAP);
+}
+
+test "inode key is ino BE ‖ 01, memcmp-ordered; wrong lengths and a wrong kind byte refuse" {
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 1, 0x01 }, &inodeKey(1));
     try testing.expectEqual(@as(u64, 0xDEAD_BEEF_F00D), try decodeInodeKey(&inodeKey(0xDEAD_BEEF_F00D)));
     var prng = std.Random.DefaultPrng.init(1);
     const r = prng.random();
@@ -890,16 +896,20 @@ test "inode key is big-endian and memcmp-ordered; wrong lengths refuse" {
         const b = r.int(u64);
         try testing.expectEqual(std.math.order(a, b), order(&inodeKey(a), &inodeKey(b)));
     }
-    try testing.expectError(error.Corrupt, decodeInodeKey(&@as([7]u8, @splat(0))));
-    try testing.expectError(error.Corrupt, decodeInodeKey(&@as([9]u8, @splat(0))));
+    try testing.expectError(error.Corrupt, decodeInodeKey(&@as([8]u8, @splat(0))));
+    try testing.expectError(error.Corrupt, decodeInodeKey(&@as([10]u8, @splat(0))));
+    var wrong_kind = inodeKey(5);
+    wrong_kind[8] = TREE_DENTRIES;
+    try testing.expectError(error.Corrupt, decodeInodeKey(&wrong_kind));
 }
 
-test "dentry key orders parent, then hash54, then coll_seq; the suffix's top two bits are structurally clear" {
+test "dentry key is parent ‖ 02 ‖ (hash54 << 8 | coll); orders parent, then hash54, then coll_seq; the suffix's top two bits are structurally clear" {
     const key = dentryKey(2, 0x2A5, 7);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 2 }, key[0..8]);
+    try testing.expectEqual(TREE_DENTRIES, key[8]);
     var suffix_be: [8]u8 = undefined;
     std.mem.writeInt(u64, &suffix_be, (0x2A5 << 8) | 7, .big);
-    try testing.expectEqualSlices(u8, &suffix_be, key[8..16]);
+    try testing.expectEqualSlices(u8, &suffix_be, key[9..17]);
     try testing.expectEqual(@as(u64, 0), dentryKeySuffix(HASH54_MAX, 0xFF) >> 62);
     const d = try DentryKey.decode(&key);
     try testing.expectEqual(@as(u64, 2), d.parentIno());
@@ -916,18 +926,22 @@ test "dentry key orders parent, then hash54, then coll_seq; the suffix's top two
         if (want == .eq) want = std.math.order(t1[2], t2[2]);
         try testing.expectEqual(want, order(&dentryKey(t1[0], t1[1], t1[2]), &dentryKey(t2[0], t2[1], t2[2])));
     }
-    try testing.expectError(error.Corrupt, DentryKey.decode(key[0..15]));
+    try testing.expectError(error.Corrupt, DentryKey.decode(key[0..16]));
     var bad = key;
-    bad[8] |= 0x80;
+    bad[9] |= 0x80;
+    try testing.expectError(error.Corrupt, DentryKey.decode(&bad));
+    bad = key;
+    bad[8] = TREE_XATTRS;
     try testing.expectError(error.Corrupt, DentryKey.decode(&bad));
 }
 
-test "xattr key orders ino, then hash56, then coll_seq; len 12 refuses" {
+test "xattr key is ino ‖ 03 ‖ (hash56 << 8 | coll); orders ino, then hash56, then coll_seq; len 16 and a wrong kind refuse" {
     const key = xattrKey(9, 0xBEEF, 3);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 9 }, key[0..8]);
+    try testing.expectEqual(TREE_XATTRS, key[8]);
     var suffix_be: [8]u8 = undefined;
     std.mem.writeInt(u64, &suffix_be, (0xBEEF << 8) | 3, .big);
-    try testing.expectEqualSlices(u8, &suffix_be, key[8..16]);
+    try testing.expectEqualSlices(u8, &suffix_be, key[9..17]);
     const x = try XattrKey.decode(&key);
     try testing.expectEqual(@as(u64, 9), x.ino());
     try testing.expectEqual(@as(u64, 0xBEEF), x.hash56());
@@ -942,38 +956,45 @@ test "xattr key orders ino, then hash56, then coll_seq; len 12 refuses" {
         if (want == .eq) want = std.math.order(t1[2], t2[2]);
         try testing.expectEqual(want, order(&xattrKey(t1[0], t1[1], t1[2]), &xattrKey(t2[0], t2[1], t2[2])));
     }
-    try testing.expectError(error.Corrupt, XattrKey.decode(key[0..12]));
+    try testing.expectError(error.Corrupt, XattrKey.decode(key[0..16]));
     // 56 + 8 = 64: a top bit set is a legal hash, not a structural refusal.
     var top = key;
-    top[8] |= 0x80;
+    top[9] |= 0x80;
     _ = try XattrKey.decode(&top);
+    var bad = key;
+    bad[8] = TREE_DENTRIES;
+    try testing.expectError(error.Corrupt, XattrKey.decode(&bad));
 }
 
-test "block-map key is owner BE ‖ index BE; the reserved index refuses at encode and decode but bounds a range" {
+test "block-map key is owner BE ‖ 07 ‖ index BE; the reserved index refuses at encode and decode but bounds a range" {
     const key = try blockMapKey(0x0102, 0x0A0B0C0D);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 1, 2, 0x0A, 0x0B, 0x0C, 0x0D }, &key);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 1, 2, 0x07, 0x0A, 0x0B, 0x0C, 0x0D }, &key);
     const k = try BlockMapKey.decode(&key);
     try testing.expectEqual(@as(u64, 0x0102), k.ownerIno());
     try testing.expectEqual(@as(u32, 0x0A0B0C0D), k.blockIndex());
     try testing.expectError(error.Corrupt, blockMapKey(1, BLOCK_INDEX_MAP_BLOB));
-    try testing.expectError(error.Corrupt, BlockMapKey.decode(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF }));
-    try testing.expectError(error.Corrupt, BlockMapKey.decode(key[0..11]));
+    try testing.expectError(error.Corrupt, BlockMapKey.decode(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1, 0x07, 0xFF, 0xFF, 0xFF, 0xFF }));
+    try testing.expectError(error.Corrupt, BlockMapKey.decode(key[0..12]));
+    var bad = key;
+    bad[8] = TREE_INODES;
+    try testing.expectError(error.Corrupt, BlockMapKey.decode(&bad));
     const range = indexRangeFrom(5, 100);
     try testing.expectEqualSlices(u8, &(try blockMapKey(5, 100)), &range.lo);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 5, 0xFF, 0xFF, 0xFF, 0xFF }, &range.hi);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 5, 0x07, 0xFF, 0xFF, 0xFF, 0xFF }, &range.hi);
     // Every legal index of ino 5 lies inside; nothing of ino 6 does.
     try testing.expect(order(&range.lo, &(try blockMapKey(5, 0xFFFF_FFFE))) == .lt);
     try testing.expect(order(&(try blockMapKey(5, 0xFFFF_FFFE)), &range.hi) == .lt);
     try testing.expect(order(&range.hi, &(try blockMapKey(6, 0))) == .lt);
 }
 
-test "block-ref key is vol_tag ‖ block_idx ‖ owner ‖ index, all BE; the owner sits at offset 16" {
+test "block-ref key is 06 ‖ vol_tag ‖ block_idx ‖ owner ‖ index, all BE; the owner sits at offset 17; the refcount prefix is 17 B" {
     const key = blockRefKey(0x11, 0x22, 0x33, 0x44);
-    try testing.expectEqual(@as(usize, 28), key.len);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x11 }, key[0..8]);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x22 }, key[8..16]);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x33 }, key[BLOCK_REF_OWNER_OFF..24]);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0x44 }, key[24..28]);
+    try testing.expectEqual(@as(usize, 29), key.len);
+    try testing.expectEqual(TREE_BLOCK_REFS, key[0]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x11 }, key[1..9]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x22 }, key[9..17]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x33 }, key[BLOCK_REF_OWNER_OFF..25]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0x44 }, key[25..29]);
     const r = try BlockRefKey.decode(&key);
     try testing.expectEqual(@as(u64, 0x11), r.volTag());
     try testing.expectEqual(@as(u64, 0x22), r.blockIdx());
@@ -981,7 +1002,12 @@ test "block-ref key is vol_tag ‖ block_idx ‖ owner ‖ index, all BE; the ow
     try testing.expectEqual(@as(u32, 0x44), r.blockIndex());
     try testing.expect(!r.isMapBlob());
     try testing.expect((try BlockRefKey.decode(&blockRefKey(1, 2, 3, BLOCK_INDEX_MAP_BLOB))).isMapBlob());
-    try testing.expectError(error.Corrupt, BlockRefKey.decode(key[0..27]));
+    try testing.expectError(error.Corrupt, BlockRefKey.decode(key[0..28]));
+    var bad = key;
+    bad[0] = TREE_BLOCK_MAP;
+    try testing.expectError(error.Corrupt, BlockRefKey.decode(&bad));
+    // Two refs of one block share the 17 B refcount prefix whatever their owner.
+    try testing.expectEqualSlices(u8, key[0..BLOCK_REF_PREFIX_LEN], blockRefKey(0x11, 0x22, 0x99, 0)[0..BLOCK_REF_PREFIX_LEN]);
 }
 
 test "volume and block ranges are half-open and cover exactly their prefix" {
@@ -989,9 +1015,9 @@ test "volume and block ranges are half-open and cover exactly their prefix" {
     try testing.expectEqualSlices(u8, &blockRefKey(7, 0, 0, 0), vr.lo.slice());
     try testing.expectEqualSlices(u8, &blockRefKey(8, 0, 0, 0), vr.hi.slice());
     try testing.expect(order(&blockRefKey(7, std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u32)), vr.hi.slice()) == .lt);
-    // The last tag has no successor: 29 × 0xFF sorts after every 28-byte key.
+    // The last tag has no successor: 30 × 0xFF sorts after every 29-byte key.
     const last = volumeRange(std.math.maxInt(u64));
-    try testing.expectEqual(@as(usize, 29), last.hi.slice().len);
+    try testing.expectEqual(@as(usize, 30), last.hi.slice().len);
     try testing.expect(order(&blockRefKey(std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u32)), last.hi.slice()) == .lt);
     const br = blockRange(7, 9);
     try testing.expectEqualSlices(u8, &blockRefKey(7, 9, 0, 0), br.lo.slice());
@@ -1008,8 +1034,8 @@ test "volume tag: vol-<16 hex> decodes verbatim; anything else hashes with unsee
     try testing.expectEqual(checksum.xxh3("vol-0123456789abcdefg"), volumeTag("vol-0123456789abcdefg"));
     try testing.expectEqual(checksum.xxh3("vol-zz23456789abcdef"), volumeTag("vol-zz23456789abcdef"));
     try testing.expectEqual(checksum.xxh3("nvme0n1"), volumeTag("nvme0n1"));
-    // Rust `from_str_radix` acceptance, exactly: either case; a leading `+`;
-    // never `_` separators or whitespace.
+    // Strict hex acceptance: either case; a leading `+`; never `_`
+    // separators or whitespace.
     try testing.expectEqual(@as(u64, 0x0123_4567_89AB_CDEF), volumeTag("vol-0123456789ABCDEF"));
     try testing.expectEqual(@as(u64, 0x0_0123_4567_89AB_CDE), volumeTag("vol-+0123456789abcde"));
     try testing.expectEqual(checksum.xxh3("vol-0123_456789abcde"), volumeTag("vol-0123_456789abcde"));
@@ -1031,124 +1057,84 @@ test "guest keyspace: (slot+1) << 40 | local, split inverts, natives are below 2
     try testing.expectError(error.SlotOutOfNamespace, checkedForestSlot(@as(u64, FOREST_SLOT_MAX + 1) << 40));
 }
 
-test "forest keys: the kind byte is inserted at offset 8 for ino-major kinds and prepended for refs" {
+test "every key names its kind and routes by its ino: ino-major kinds by the leading ino, refs by the owner; refs sort after every ino-major key" {
     const ino = guestLocalIno(1, 0x42);
-    const fi = try forestKey(TREE_INODES, &inodeKey(ino));
-    try testing.expectEqual(@as(usize, FOREST_INODE_KEY_LEN), fi.slice().len);
-    try testing.expectEqualSlices(u8, &inodeKey(ino), fi.slice()[0..8]);
-    try testing.expectEqual(TREE_INODES, fi.slice()[8]);
-
+    const ik = inodeKey(ino);
     const dk = dentryKey(ino, 0x1234, 9);
-    const fd = try forestKey(TREE_DENTRIES, &dk);
-    try testing.expectEqual(@as(usize, FOREST_DENTRY_KEY_LEN), fd.slice().len);
-    try testing.expectEqualSlices(u8, dk[0..8], fd.slice()[0..8]);
-    try testing.expectEqual(TREE_DENTRIES, fd.slice()[8]);
-    try testing.expectEqualSlices(u8, dk[8..16], fd.slice()[9..17]);
-
     const xk = xattrKey(ino, 0x55, 1);
-    const fx = try forestKey(TREE_XATTRS, &xk);
-    try testing.expectEqual(@as(usize, FOREST_XATTR_KEY_LEN), fx.slice().len);
-    try testing.expectEqual(TREE_XATTRS, fx.slice()[8]);
-
     const mk = try blockMapKey(ino, 3);
-    const fm = try forestKey(TREE_BLOCK_MAP, &mk);
-    try testing.expectEqual(@as(usize, FOREST_BLOCK_MAP_KEY_LEN), fm.slice().len);
-    try testing.expectEqual(TREE_BLOCK_MAP, fm.slice()[8]);
-    try testing.expectEqualSlices(u8, mk[8..12], fm.slice()[9..13]);
-
     const rk = blockRefKey(0xAAAA, 0xBBBB, ino, 7);
-    const fr = try forestKey(TREE_BLOCK_REFS, &rk);
-    try testing.expectEqual(@as(usize, FOREST_BLOCK_REF_KEY_LEN), fr.slice().len);
-    try testing.expectEqual(TREE_BLOCK_REFS, fr.slice()[0]);
-    try testing.expectEqualSlices(u8, &rk, fr.slice()[1..29]);
-    try testing.expectEqualSlices(u8, &inodeKey(ino), fr.slice()[FOREST_BLOCK_REF_OWNER_OFF..][0..8]);
-
-    // Every forest key splits back to its legacy form and names its slot.
-    inline for (.{ .{ TREE_INODES, fi }, .{ TREE_DENTRIES, fd }, .{ TREE_XATTRS, fx }, .{ TREE_BLOCK_MAP, fm }, .{ TREE_BLOCK_REFS, fr } }) |pair| {
-        const split = try splitForestKey(pair[1].slice());
-        try testing.expectEqual(@as(u8, pair[0]), split.kind);
-        const re = try forestKey(pair[0], split.legacy.slice());
-        try testing.expectEqualSlices(u8, pair[1].slice(), re.slice());
-        try testing.expectEqual(@as(ForestSlot, 2), try forestKeySlot(pair[1].slice()));
-        try testing.expectEqual(@as(ForestSlot, 2), try legacyKeySlot(pair[0], split.legacy.slice()));
-        try testing.expectEqual(@as(u8, pair[0]), try forestKeyKind(pair[1].slice()));
-        try testing.expectEqual(@as(?RawKeyDefect, null), classifyRefusedKey(pair[1].slice()));
+    try testing.expectEqualSlices(u8, &inodeKey(ino), rk[BLOCK_REF_OWNER_OFF..][0..8] ++ [_]u8{TREE_INODES});
+    inline for (.{ .{ TREE_INODES, &ik }, .{ TREE_DENTRIES, &dk }, .{ TREE_XATTRS, &xk }, .{ TREE_BLOCK_MAP, &mk }, .{ TREE_BLOCK_REFS, &rk } }) |pair| {
+        try testing.expectEqual(@as(u8, pair[0]), try slotTreeKeyKind(pair[1]));
+        try testing.expectEqual(@as(ForestSlot, 2), try slotTreeKeySlot(pair[1]));
+        try testing.expectEqual(@as(ForestSlot, 2), try checkSlotTreeKey(pair[0], pair[1]));
+        try testing.expectEqual(@as(?RawKeyDefect, null), classifyRefusedKey(pair[1]));
     }
-
-    // Both transforms preserve memcmp order among keys of one kind.
-    var prng = std.Random.DefaultPrng.init(0x5EED);
-    const r = prng.random();
-    for (0..1000) |_| {
-        const a = dentryKey(r.intRangeAtMost(u64, 0, @as(u64, FOREST_SLOT_MAX + 1) << 40 - 1), r.intRangeAtMost(u64, 0, HASH54_MAX), r.int(u8));
-        const b = dentryKey(r.intRangeAtMost(u64, 0, @as(u64, FOREST_SLOT_MAX + 1) << 40 - 1), r.intRangeAtMost(u64, 0, HASH54_MAX), r.int(u8));
-        const fa = try forestKey(TREE_DENTRIES, &a);
-        const fb = try forestKey(TREE_DENTRIES, &b);
-        try testing.expectEqual(order(&a, &b), order(fa.slice(), fb.slice()));
-    }
+    // ino 1's records lead and sit together: inode < dentries < xattrs < map.
+    try testing.expect(order(&inodeKey(1), &dentryKey(1, 0, 0)) == .lt);
+    try testing.expect(order(&dentryKey(1, HASH54_MAX, 0xFF), &xattrKey(1, 0, 0)) == .lt);
+    try testing.expect(order(&xattrKey(1, HASH56_MAX, 0xFF), &(try blockMapKey(1, 0))) == .lt);
+    try testing.expect(order(&(try blockMapKey(1, 0xFFFF_FFFE)), &inodeKey(2)) == .lt);
     // Refs sort after every ino-major key.
-    try testing.expect(order(fx.slice(), fr.slice()) == .lt);
+    try testing.expect(order(&xattrKey(std.math.maxInt(u64) >> 7, HASH56_MAX, 0xFF), &blockRefKey(0, 0, 0, 0)) == .lt);
+    try testing.expect(order(&xk, &rk) == .lt);
+    // The kind/key agreement check refuses a mismatched pair.
+    try testing.expectError(error.MalformedKnownKind, checkSlotTreeKey(TREE_DENTRIES, &ik));
+    try testing.expectError(error.MalformedKnownKind, checkSlotTreeKey(TREE_INODES, &rk));
+    try testing.expectError(error.UnknownKind, checkSlotTreeKey(TREE_CONTROL, "slot_state:7"));
 }
 
-test "forest key encoder refusals: kind outside the slot set, wrong legacy length, slot above the namespace" {
-    try testing.expectError(error.UnknownKind, forestKey(TREE_CONTROL, &inodeKey(1)));
-    try testing.expectError(error.UnknownKind, forestKey(KIND_INTERIOR, &inodeKey(1)));
-    try testing.expectError(error.UnknownKind, forestKey(TREE_SHARED_INDEX, &inodeKey(1)));
-    try testing.expectError(error.MalformedKnownKind, forestKey(TREE_INODES, &dentryKey(1, 2, 3)));
-    try testing.expectError(error.MalformedKnownKind, forestKey(TREE_BLOCK_REFS, &inodeKey(1)));
-    const too_high = @as(u64, FOREST_SLOT_MAX + 1) << 40;
-    try testing.expectError(error.SlotOutOfNamespace, forestKey(TREE_INODES, &inodeKey(too_high)));
-    try testing.expectError(error.SlotOutOfNamespace, forestKey(TREE_BLOCK_REFS, &blockRefKey(1, 2, too_high, 3)));
-    try testing.expectError(error.SlotOutOfNamespace, legacyKeySlot(TREE_INODES, &inodeKey(too_high)));
-    // The highest slot still frames.
-    _ = try forestKey(TREE_INODES, &inodeKey(@as(u64, FOREST_SLOT_MAX) << 40));
-}
-
-test "forest_key_kind's refusal ladder yields the defect classes in the reference's order" {
+test "the refusal ladder yields the defect classes: truncated, malformed known kind, unknown kind, slot out of namespace; the repair line" {
     // Empty ⇒ Truncated{0}.
-    try testing.expectError(error.Truncated, forestKeyKind(&.{}));
+    try testing.expectError(error.Truncated, slotTreeKeyKind(&.{}));
     try testing.expectEqual(RawKeyDefect{ .truncated = .{ .got = 0 } }, classifyRefusedKey(&.{}).?);
     // First byte > 0x01 that is a known ino-major kind: a shape it never takes.
     const bad_prefix = [_]u8{0x07} ++ @as([12]u8, @splat(0));
-    try testing.expectError(error.MalformedKnownKind, forestKeyKind(&bad_prefix));
+    try testing.expectError(error.MalformedKnownKind, slotTreeKeyKind(&bad_prefix));
     try testing.expectEqual(RawKeyDefect{ .malformed_known_kind = .{ .kind = 7, .want = 13, .got = 13 } }, classifyRefusedKey(&bad_prefix).?);
     // First byte > 0x01 that no kind claims.
     const unknown_prefix = [_]u8{0x09} ++ @as([8]u8, @splat(0));
-    try testing.expectError(error.UnknownKind, forestKeyKind(&unknown_prefix));
+    try testing.expectError(error.UnknownKind, slotTreeKeyKind(&unknown_prefix));
     try testing.expectEqual(RawKeyDefect{ .unknown_kind = .{ .kind = 9 } }, classifyRefusedKey(&unknown_prefix).?);
-    // Ino-major with no kind byte.
-    try testing.expectError(error.Truncated, forestKeyKind(&inodeKey(5)));
-    try testing.expectEqual(RawKeyDefect{ .truncated = .{ .got = 8 } }, classifyRefusedKey(&inodeKey(5)).?);
+    // Ino-major with no kind byte (the pre-v4 kindless shape).
+    const kindless = inodeKey(5)[0..8];
+    try testing.expectError(error.Truncated, slotTreeKeyKind(kindless));
+    try testing.expectEqual(RawKeyDefect{ .truncated = .{ .got = 8 } }, classifyRefusedKey(kindless).?);
     // 0x06 at offset 8: refs are by-block, never ino-major.
-    const refs_at_8 = inodeKey(5) ++ [_]u8{0x06};
-    try testing.expectError(error.MalformedKnownKind, forestKeyKind(&refs_at_8));
+    const refs_at_8 = inodeKey(5)[0..8].* ++ [_]u8{0x06};
+    try testing.expectError(error.MalformedKnownKind, slotTreeKeyKind(&refs_at_8));
     try testing.expectEqual(RawKeyDefect{ .malformed_known_kind = .{ .kind = 6, .want = 29, .got = 9 } }, classifyRefusedKey(&refs_at_8).?);
     // Kind byte that is another tree's id.
-    const control = inodeKey(5) ++ [_]u8{TREE_CONTROL};
-    try testing.expectError(error.UnknownKind, forestKeyKind(&control));
+    const control = inodeKey(5)[0..8].* ++ [_]u8{TREE_CONTROL};
+    try testing.expectError(error.UnknownKind, slotTreeKeyKind(&control));
     try testing.expectEqual(RawKeyDefect{ .unknown_kind = .{ .kind = 8 } }, classifyRefusedKey(&control).?);
     // Known kind, wrong length.
-    const short_dentry = inodeKey(5) ++ [_]u8{TREE_DENTRIES} ++ @as([3]u8, @splat(0));
-    try testing.expectError(error.MalformedKnownKind, forestKeyKind(&short_dentry));
+    const short_dentry = inodeKey(5)[0..8].* ++ [_]u8{TREE_DENTRIES} ++ @as([3]u8, @splat(0));
+    try testing.expectError(error.MalformedKnownKind, slotTreeKeyKind(&short_dentry));
     try testing.expectEqual(RawKeyDefect{ .malformed_known_kind = .{ .kind = 2, .want = 17, .got = 12 } }, classifyRefusedKey(&short_dentry).?);
     const short_refs = [_]u8{0x06} ++ @as([20]u8, @splat(0));
-    try testing.expectError(error.MalformedKnownKind, forestKeyKind(&short_refs));
+    try testing.expectError(error.MalformedKnownKind, slotTreeKeyKind(&short_refs));
     try testing.expectEqual(RawKeyDefect{ .malformed_known_kind = .{ .kind = 6, .want = 29, .got = 21 } }, classifyRefusedKey(&short_refs).?);
     // Right kind, right length, routing ino above the namespace.
     const too_high = @as(u64, FOREST_SLOT_MAX + 1) << 40;
-    const high_inode = inodeKey(too_high) ++ [_]u8{TREE_INODES};
-    try testing.expectError(error.SlotOutOfNamespace, forestKeyKind(&high_inode));
+    const high_inode = inodeKey(too_high);
+    try testing.expectError(error.SlotOutOfNamespace, slotTreeKeyKind(&high_inode));
     try testing.expectEqual(RawKeyDefect{ .slot_out_of_namespace = .{ .kind = 1, .slot = FOREST_SLOT_MAX + 1 } }, classifyRefusedKey(&high_inode).?);
-    const high_refs = [_]u8{0x06} ++ blockRefKey(1, 2, too_high, 3);
-    try testing.expectError(error.SlotOutOfNamespace, forestKeyKind(&high_refs));
-    try testing.expectError(error.SlotOutOfNamespace, forestKeySlot(&high_refs));
+    const high_refs = blockRefKey(1, 2, too_high, 3);
+    try testing.expectError(error.SlotOutOfNamespace, slotTreeKeyKind(&high_refs));
+    try testing.expectError(error.SlotOutOfNamespace, slotTreeKeySlot(&high_refs));
+    try testing.expectError(error.SlotOutOfNamespace, checkSlotTreeKey(TREE_INODES, &high_inode));
+    // The highest slot still decodes.
+    try testing.expectEqual(FOREST_SLOT_MAX, try slotTreeKeySlot(&inodeKey(@as(u64, FOREST_SLOT_MAX) << 40)));
     // The repair line: only the two "known kind, impossible shape" classes.
     try testing.expect(classifyRefusedKey(&high_inode).?.repairable());
     try testing.expect(classifyRefusedKey(&short_dentry).?.repairable());
     try testing.expect(!classifyRefusedKey(&control).?.repairable());
-    try testing.expect(!classifyRefusedKey(&inodeKey(5)).?.repairable());
+    try testing.expect(!classifyRefusedKey(kindless).?.repairable());
 }
 
-test "forest key classification is total: every byte string yields a kind or a defect, and the two views agree" {
+test "key classification is total: every byte string yields a kind or a defect, the two views agree, and every decoded key is exactly its typed codec's" {
     var prng = std.Random.DefaultPrng.init(77);
     const r = prng.random();
     var buf: [40]u8 = undefined;
@@ -1159,11 +1145,21 @@ test "forest key classification is total: every byte string yields a kind or a d
         if (len > 0 and r.boolean()) buf[0] = r.intRangeAtMost(u8, 0, 8);
         if (len > 8 and r.boolean()) buf[8] = r.intRangeAtMost(u8, 0, 8);
         const key = buf[0..len];
-        if (forestKeyKind(key)) |kind| {
+        if (slotTreeKeyKind(key)) |kind| {
             try testing.expect(isSlotTreeKind(kind));
             try testing.expectEqual(@as(?RawKeyDefect, null), classifyRefusedKey(key));
-            const split = try splitForestKey(key);
-            try testing.expectEqualSlices(u8, key, (try forestKey(split.kind, split.legacy.slice())).slice());
+            try testing.expectEqual(try slotTreeKeySlot(key), try checkSlotTreeKey(kind, key));
+            // The typed codec of that kind accepts it (the dentry's two
+            // structural-zero bits and the map-blob sentinel are the only
+            // extra refusals a typed codec adds).
+            switch (kind) {
+                TREE_INODES => _ = try InodeKey.decode(key),
+                TREE_XATTRS => _ = try XattrKey.decode(key),
+                TREE_BLOCK_REFS => _ = try BlockRefKey.decode(key),
+                TREE_DENTRIES => if (DentryKey.decode(key)) |_| {} else |_| try testing.expect(key[9] >> 6 != 0),
+                TREE_BLOCK_MAP => if (BlockMapKey.decode(key)) |_| {} else |_| try testing.expectEqual(BLOCK_INDEX_MAP_BLOB, std.mem.readInt(u32, key[9..13], .big)),
+                else => unreachable,
+            }
         } else |err| {
             try testing.expectEqual(err, classifyRefusedKey(key).?.toError());
         }
@@ -1261,10 +1257,10 @@ test "readdir cookie: reserved offsets, bias 3, sign bit always clear, roundtrip
         try testing.expect(cookie >= READDIR_COOKIE_BIAS);
         try testing.expect(@as(i64, @bitCast(cookie)) > 0);
         try testing.expectEqual(ReaddirPos{ .after_entry = .{ .hash54 = h, .coll_seq = c } }, try decodeReaddirCookie(cookie));
-        // The cookie payload IS the dentry key's [8..16) word.
+        // The cookie payload IS the dentry key's [9..17) word.
         try testing.expectEqual(dentryKeySuffix(h, c), cookie - READDIR_COOKIE_BIAS);
         const key = dentryKey(9, h, c);
-        try testing.expectEqual(cookie - READDIR_COOKIE_BIAS, std.mem.readInt(u64, key[8..16], .big));
+        try testing.expectEqual(cookie - READDIR_COOKIE_BIAS, std.mem.readInt(u64, key[9..17], .big));
     }
     // Order-preserving: resume-by-strictly-greater needs cookie order == key order.
     for (0..1000) |_| {

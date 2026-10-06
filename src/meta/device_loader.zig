@@ -286,7 +286,7 @@ test "the loader round-trips a node image and an appended bset through O_DIRECT;
     try testing.expectEqual(@as(u64, 8 << 20), try volumeLength(d.path()));
     const layout = try node.NodeLayout.new(node.MIN_NODE_SIZE, null);
     const addr: u64 = 2 << 20;
-    var w = try node.writeNode(gpa, layout, .{ .node_addr = addr, .node_seq = 7, .tree_id = key.TREE_INODES, .level = 0, .min_key = "", .max_key = &key.KEY_SPACE_MAX }, &.{}, 0, null);
+    var w = try node.writeNode(gpa, layout, .{ .node_addr = addr, .node_seq = 7, .tree_id = key.KIND_INTERIOR, .level = 0, .min_key = "", .max_key = &key.KEY_SPACE_MAX }, &.{}, 0, null);
     defer w.deinit(gpa);
     const ld = d.dev.loader();
     try ld.writeImage(ld.ctx, addr, w.image);
@@ -343,7 +343,7 @@ test "a format plan written through the device lands byte-identical to the in-RA
     const len: u64 = 64 << 20;
     const d = try TestDevice.create(gpa, "format", len);
     defer d.destroy();
-    const opts: format.FormatOptions = .{ .node_size = 65536, .journal_len_override = 1 << 20, .class = .single_writer, .uuid = "device-loader-t!".*, .set_uuid = "device-loader-s!".* };
+    const opts: format.FormatOptions = .{ .node_size = 65536, .journal_len_override = 1 << 20, .uuid = "device-loader-t!".*, .set = .{ .set_uuid = "device-loader-s!".*, .hash_seed = 0x5EED_CAFE_F00D_D00D } };
     var plan = try format.planFormat(gpa, len, opts, null);
     defer plan.deinit();
     const barriers0 = stats.barriers.load();

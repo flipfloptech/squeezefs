@@ -1,8 +1,8 @@
 //! The offline image builder (charter §5.1; `docs/porting/kv_alloc_superblock.md`
 //! §3): an in-memory volume DESCRIPTION (dirs / files / hard links /
-//! xattrs) → key-sorted seq-0 records per kind → bottom-up ¾-fill packed
-//! node images through the K2 node layer. PORTABLE: images in, images out;
-//! `format.zig` lays them into a volume plan.
+//! xattrs) → key-sorted seq-0 records of the native slot tree → bottom-up
+//! ¾-fill packed node images through the K2 node layer. PORTABLE: images
+//! in, images out; `format.zig` lays them into a volume plan.
 //!
 //! Determinism: identical descriptions (including `hash_seed` and `uuid`)
 //! build byte-identical images — inos are assigned monotonically from 2 in
@@ -29,9 +29,6 @@ const NodeLayout = node.NodeLayout;
 /// ino 0 is reserved, 1 is the root; `next_ino` starts above the built
 /// population.
 pub const ROOT_INO: u64 = 1;
-/// The root-ino xattr recording the volume-set format configuration; the
-/// mount bootstrap reads it back off the first volume.
-pub const FORMAT_CONFIG_XATTR = "user.squeezefs.format_config";
 /// Per-mount guard records the digest walk excludes: unique to every mount
 /// by design, never user-visible content.
 pub const WRITER_CLAIM_XATTR = "writer_claim";
@@ -55,7 +52,8 @@ pub const BuilderConfig = struct {
     node_size: usize,
     /// `--meta-journal-mb` in bytes; null = the clamp.
     journal_len_override: ?u64,
-    /// Set-wide `xxh3(set_uuid)` in production; fixed in tests.
+    /// The set's independent random seed (`geometry.SetIdentity`); fixed
+    /// in tests.
     hash_seed: u64,
     /// Per-volume, random in production.
     uuid: [16]u8,
@@ -304,28 +302,22 @@ pub const ImageBuilder = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    /// The forest's native slot tree: every record of kinds 1, 2, 3 re-keyed
-    /// by `forestKey(kind, legacy)`, memcmp-sorted.
+    /// The native slot tree's records: kinds 1, 2, 3 merged and memcmp-
+    /// sorted — every key carries its kind byte (charter §5.1), so the
+    /// merge interleaves an ino's inode, dentries and xattrs.
     pub fn nativeRecords(self: *const ImageBuilder, gpa: Allocator) DescribeError![]Record {
         var out: std.ArrayList(Record) = .empty;
         errdefer freeRecords(gpa, &out);
         inline for (.{ key.TREE_INODES, key.TREE_DENTRIES, key.TREE_XATTRS }) |kind| {
-            const legacy = switch (kind) {
+            const records = switch (kind) {
                 key.TREE_INODES => try self.inodeRecords(gpa),
                 key.TREE_DENTRIES => try self.dentryRecords(gpa),
                 key.TREE_XATTRS => try self.xattrRecords(gpa),
                 else => unreachable,
             };
-            defer {
-                rec.deinitRecords(gpa, legacy);
-                gpa.free(legacy);
-            }
-            for (legacy) |*r| {
-                // Every legacy key is well-formed and its ino is native
-                // (minted below 2^40).
-                const fk = key.forestKey(kind, r.key) catch unreachable;
-                try out.append(gpa, try Record.put(gpa, fk.slice(), 0, r.value));
-            }
+            defer gpa.free(records);
+            errdefer rec.deinitRecords(gpa, records);
+            try out.appendSlice(gpa, records);
         }
         std.mem.sort(Record, out.items, {}, recordKeyLess);
         return out.toOwnedSlice(gpa);
@@ -333,7 +325,7 @@ pub const ImageBuilder = struct {
 
     /// The post-fold digest of the description's USER content: xxh3 over
     /// `kind ‖ (len ‖ key ‖ len ‖ value)*` for kinds 1, 2, 3 in kind-then-
-    /// key order (legacy keys — the same on both layouts).
+    /// key order.
     pub fn digest(self: *const ImageBuilder, gpa: Allocator) DescribeError!u64 {
         var h = std.hash.XxHash3.init(0);
         inline for (.{ key.TREE_INODES, key.TREE_DENTRIES, key.TREE_XATTRS }) |kind| {
@@ -434,15 +426,12 @@ pub fn digestKindSet(records: []const RecordRef) KindSetDigest {
 // §3.2 TreeWriter — bottom-up packing.
 // ---------------------------------------------------------------------------
 
-/// `(node_size − 4096 − 32 − 32) × 3/4`: leaves pack to ¾ of a node's usable
-/// bytes (the K5 split-fill convention — append headroom before the first
-/// SMO). The frame term is the v1 32 B on EVERY layout, forest included
-/// (the reference's `usable_budget_of` reads `BSET_FRAME_LEN`), so a forest
-/// image packs byte-identically to the reference. 64 KiB ⇒ 46,032; 256 KiB
-/// ⇒ 193,488 (= the v1 `split_part_capacity`; the spec's worked 49,104 /
-/// 196,560 drop the header-page term the code subtracts).
+/// `(node_size − 4096 − 40 − 32) × 3/4` = `NodeLayout.splitPartCapacity`:
+/// leaves pack to ¾ of a node's usable bytes (the K5 split-fill convention
+/// — append headroom before the first SMO). 64 KiB ⇒ 46,026; 256 KiB ⇒
+/// 193,482.
 pub fn usableBudgetOf(layout: NodeLayout) usize {
-    return (layout.node_size - node.NODE_PAGE - bset.BSET_FRAME_LEN - bset.BSET_HEADER_LEN) * 3 / 4;
+    return (layout.node_size - node.NODE_PAGE - node.FRAME_LEN - bset.BSET_HEADER_LEN) * 3 / 4;
 }
 
 /// Greedy chunking of key-ascending records into runs of ≤ `budget` encoded
@@ -616,15 +605,15 @@ test "a fresh description holds the root alone: ino 1 S_IFDIR|0755, 0:0, nlink 2
     try testing.expectEqual(@as(u64, 0), root.mtime);
     try testing.expectEqual(@as(u8, 4), dtOf(S_IFDIR));
     try testing.expectEqual(@as(u8, 8), dtOf(S_IFREG | 0o644));
-    // The root inode record is exactly the reference's bytes (ref-sw.img:
-    // `01 ‖ ed 41 00 00 ‖ uid 0 ‖ gid 0 ‖ nlink 2 ‖ …`).
+    // The root inode record is the v4 bytes: key `ino ‖ 01`, value the
+    // 68 B fixed layout (`ed 41 00 00 ‖ uid 0 ‖ gid 0 ‖ nlink 2 ‖ …`).
     const recs = try b.inodeRecords(testing.allocator);
     defer freeOwned(testing.allocator, recs);
     try testing.expectEqual(@as(usize, 1), recs.len);
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 1 }, recs[0].key);
-    try testing.expectEqual(@as(usize, 57), recs[0].value.len);
-    try testing.expectEqualSlices(u8, &.{ 0x01, 0xed, 0x41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0 }, recs[0].value[0..17]);
-    try testing.expect(std.mem.allEqual(u8, recs[0].value[17..], 0));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 1, key.TREE_INODES }, recs[0].key);
+    try testing.expectEqual(rec.INODE_VALUE_LEN, recs[0].value.len);
+    try testing.expectEqualSlices(u8, &.{ 0xed, 0x41, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0 }, recs[0].value[0..16]);
+    try testing.expect(std.mem.allEqual(u8, recs[0].value[16..], 0));
     try b.setOwner(ROOT_INO, 1000, 1000);
     try testing.expectEqual(@as(u32, 1000), b.inode(ROOT_INO).?.gid);
     try b.setTimes(ROOT_INO, 1, 2, 3);
@@ -661,13 +650,13 @@ test "describe: dirs raise the parent's nlink; files nlink 1; links bump nlink; 
     @memset(big, 7);
     try testing.expectError(error.ValueTooLarge, b.setXattr(ROOT_INO, "user", big));
     try testing.expectError(error.NoSuchIno, b.setXattr(99, "user.x", "v"));
-    try b.setXattr(ROOT_INO, FORMAT_CONFIG_XATTR, "{}");
-    try b.setXattr(ROOT_INO, FORMAT_CONFIG_XATTR, "{\"v\":1}"); // replace
+    try b.setXattr(ROOT_INO, "user.note", "one");
+    try b.setXattr(ROOT_INO, "user.note", "two"); // replace
     try testing.expectEqual(@as(usize, 1), b.xattrs.items.len);
-    try testing.expectEqualStrings("{\"v\":1}", b.xattrs.items[0].value);
+    try testing.expectEqualStrings("two", b.xattrs.items[0].value);
 }
 
-test "record assembly: inode records in ino order; dentry keys hash-shuffled then memcmp-sorted with name-ordered coll_seq; xattr keys by (ino, hash56); the native forest re-keying sorts across kinds" {
+test "record assembly: inode records in ino order; dentry keys hash-shuffled then memcmp-sorted with name-ordered coll_seq; xattr keys by (ino, hash56); the native slot tree merges the kinds ino-major" {
     const gpa = testing.allocator;
     var b = try ImageBuilder.init(gpa, test_cfg);
     defer b.deinit();
@@ -711,13 +700,13 @@ test "record assembly: inode records in ino order; dentry keys hash-shuffled the
     try testing.expectEqual(@as(usize, 12), native.len);
     for (native[1..], 1..) |r, i| try testing.expect(key.lessThan(native[i - 1].key, r.key));
     // ino 1's records lead: inode (kind 1), dentries (kind 2), xattrs (kind 3).
-    try testing.expectEqual(key.TREE_INODES, try key.forestKeyKind(native[0].key));
-    try testing.expectEqual(key.TREE_DENTRIES, try key.forestKeyKind(native[1].key));
-    try testing.expectEqual(key.TREE_XATTRS, try key.forestKeyKind(native[4].key));
-    try testing.expectEqual(key.TREE_INODES, try key.forestKeyKind(native[6].key));
-    const split = try key.splitForestKey(native[0].key);
-    try testing.expectEqualSlices(u8, &key.inodeKey(1), split.legacy.slice());
-    // The digest is the same whichever layout will hold the records.
+    try testing.expectEqual(key.TREE_INODES, try key.slotTreeKeyKind(native[0].key));
+    try testing.expectEqual(key.TREE_DENTRIES, try key.slotTreeKeyKind(native[1].key));
+    try testing.expectEqual(key.TREE_XATTRS, try key.slotTreeKeyKind(native[4].key));
+    try testing.expectEqual(key.TREE_INODES, try key.slotTreeKeyKind(native[6].key));
+    try testing.expectEqualSlices(u8, &key.inodeKey(1), native[0].key);
+    for (native) |r| try testing.expectEqual(@as(key.ForestSlot, 0), try key.slotTreeKeySlot(r.key));
+    // The digest is a function of the description alone.
     const d1 = try b.digest(gpa);
     var b2 = try ImageBuilder.init(gpa, test_cfg);
     defer b2.deinit();
@@ -740,13 +729,14 @@ test "coll_seq chains: a same-hash group takes 0, 1, … 255 in call (name) orde
     try testing.expectEqual(@as(?u8, 1), try nextInChain([2]u64, gpa, &xgroups, .{ 1, 7 }));
 }
 
-test "TreeWriter: the ¾ budget (64 KiB ⇒ 46,032; 256 KiB ⇒ 193,488, v1 frame term on every layout); greedy chunks; an empty tree is one real leaf; separators and bounds; planned_nodes == written" {
+test "TreeWriter: the ¾ budget (64 KiB ⇒ 46,026; 256 KiB ⇒ 193,482 = splitPartCapacity); greedy chunks; an empty tree is one real leaf; separators and bounds; planned_nodes == written" {
     const gpa = testing.allocator;
     const small = try NodeLayout.new(65536, null);
-    try testing.expectEqual(@as(usize, 46_032), usableBudgetOf(small));
+    try testing.expectEqual(@as(usize, 46_026), usableBudgetOf(small));
     try testing.expectEqual(small.splitPartCapacity(), usableBudgetOf(small));
-    try testing.expectEqual(@as(usize, 193_488), usableBudgetOf(try NodeLayout.new(262144, null)));
-    try testing.expectEqual(@as(usize, 193_488), usableBudgetOf(try NodeLayout.newSymmetric(262144, null)));
+    const large = try NodeLayout.new(262144, null);
+    try testing.expectEqual(@as(usize, 193_482), usableBudgetOf(large));
+    try testing.expectEqual(large.splitPartCapacity(), usableBudgetOf(large));
     // Chunking.
     var recs: [10]Record = undefined;
     const v: [100]u8 = @splat(1);
@@ -756,7 +746,7 @@ test "TreeWriter: the ¾ budget (64 KiB ⇒ 46,032; 256 KiB ⇒ 193,488, v1 fram
     defer gpa.free(refs);
     var chunks: std.ArrayList([]const RecordRef) = .empty;
     defer chunks.deinit(gpa);
-    try chunkByEncodedLen(gpa, refs, 3 * (15 + 8 + 100), &chunks);
+    try chunkByEncodedLen(gpa, refs, 3 * (rec.RECORD_HEADER_LEN + key.INODE_KEY_LEN + 100), &chunks);
     try testing.expectEqual(@as(usize, 4), chunks.items.len);
     try testing.expectEqual(@as(usize, 3), chunks.items[0].len);
     try testing.expectEqual(@as(usize, 1), chunks.items[3].len);
@@ -790,8 +780,8 @@ test "TreeWriter: the ¾ budget (64 KiB ⇒ 46,032; 256 KiB ⇒ 193,488, v1 fram
     try testing.expectEqual(@as(u64, 502), tw.nodeSeqWatermark());
     try testing.expectEqual(@as(u64, 1), try TreeWriter.plannedNodes(gpa, small, refs));
     try testing.expectEqual(@as(u64, 1), try TreeWriter.plannedNodes(gpa, small, &.{}));
-    // Many records: a two-level tree. 2,000 × (15 + 8 + 100) = 246,000 B
-    // over a 46,032 budget (374 records per leaf) ⇒ 6 leaves + 1 root.
+    // Many records: a two-level tree. 2,000 × (16 + 9 + 100) = 250,000 B
+    // over a 46,026 budget (368 records per leaf) ⇒ 6 leaves + 1 root.
     var many: [2000]Record = undefined;
     for (&many, 0..) |*r, i| r.* = try Record.put(gpa, &key.inodeKey(i + 1), 0, &v);
     defer rec.deinitRecords(gpa, &many);

@@ -1022,7 +1022,7 @@ test "stale_writer_revalidates_and_retries_after_a_merge: two underfull leaves m
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [128]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() < 1) : (n += 1) {
@@ -1054,7 +1054,7 @@ test "fold_equivalence_holds_across_a_merge_storm: three 90 %-delete rounds with
     const KEYS: u64 = 12_000;
     var vol = try TestVolume.init(gpa, .{ .extents = 512 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var shadow = std.AutoHashMap(u64, u64).init(gpa);
     defer shadow.deinit();
     var buf: [128]u8 = undefined;
@@ -1118,7 +1118,7 @@ test "height_three_tree_collapses_to_a_root_leaf_gap_free_with_readers_mid_walk:
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .extents = 2048 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     const collapses0 = stats.meta_kv_root_collapses.load();
     // 32-byte keys ⇒ 974 leaves per full interior (the smo.zig depth-3 shape).
     const n = try vol.growToRootLevel(t, 2, 32, 4096, 60_000);
@@ -1199,7 +1199,7 @@ test "cross_parent_underfull_leaves_shrink_through_interior_merges_to_a_fixed_po
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .extents = 4096 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     const im0 = stats.meta_kv_interior_merges.load();
     // Grow until the root is level 2 with ≥ 4 level-1 interiors (32-byte
     // keys ⇒ 974 leaves per full interior, ascending inserts ⇒ ~2,400
@@ -1288,7 +1288,7 @@ test "merge_sweep_is_bounded_per_call_and_resumes_from_its_cursor: an expired de
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .extents = 512 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [128]u8 = undefined;
     const perm = try permutation(gpa, 6000, 3);
     defer gpa.free(perm);
@@ -1328,7 +1328,7 @@ test "a_merge_is_admitted_at_the_compaction_floor_and_returns_extents: the merge
     // 64 extents, reserve 8 ⇒ floor 4.
     var vol = try TestVolume.init(gpa, .{ .extents = 64, .reserve = 8 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [128]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() < 1) : (n += 1) {
@@ -1368,7 +1368,7 @@ test "replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse: the 
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [128]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() < 1) : (n += 1) {
@@ -1399,7 +1399,7 @@ test "replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse: the 
         var re = try vol.crashReplay(led);
         defer re.deinit();
         try testing.expect(re.outcome.interior_applied >= 2); // Put + Delete
-        const t2 = re.treeOf(key.TREE_INODES);
+        const t2 = re.treeOf(.native);
         try testing.expectEqual(root_at_ledger, t2.rootPtr());
         var i: u64 = 0;
         while (i < n) : (i += 1) {
@@ -1420,7 +1420,7 @@ test "replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse: the 
     {
         var re = try vol.crashReplay(led);
         defer re.deinit();
-        const t2 = re.treeOf(key.TREE_INODES);
+        const t2 = re.treeOf(.native);
         try testing.expectEqual(root_at_ledger, t2.rootPtr());
         try testing.expectEqual(@as(u8, 1), try t2.rootLevel());
         var i: u64 = 0;
@@ -1435,16 +1435,16 @@ test "replay_converges_across_crash_windows_of_a_merge_and_a_root_collapse: the 
     try testing.expectEqual(t.rootPtr().addr, led2.roots[0].node_addr);
     var re = try vol.crashReplay(led2);
     defer re.deinit();
-    try testing.expectEqual(@as(u8, 0), try re.treeOf(key.TREE_INODES).rootLevel());
+    try testing.expectEqual(@as(u8, 0), try re.treeOf(.native).rootLevel());
     var i: u64 = 0;
-    while (i < n) : (i += 20) try expectLookup(re.treeOf(key.TREE_INODES), &ikey(i), tree.testValue(i, 64, &buf));
+    while (i < n) : (i += 20) try expectLookup(re.treeOf(.native), &ikey(i), tree.testValue(i, 64, &buf));
 }
 
 test "merge_after_flush prefilter: a leaf whose flush-step compaction leaves a tiny log merges with its sibling; a tombstone-heavy full log is not a prefilter candidate; a space retry in flight yields and counts" {
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [128]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() < 1) : (n += 1) {

@@ -10,18 +10,22 @@
 //! 1,209/1,130 µs journal-write round trip = 62 % / 59 % on the shared lane;
 //! the lane takes it to 53–107 µs). Nothing here touches a device.
 //!
-//! Format in one picture (all little-endian):
+//! Format in one picture (all little-endian; format v4):
 //!
 //!     page k (4096 B) = header (24 B) ‖ data (4072 B)
-//!       header: magic "KVJP" u32 ‖ lap u32 ‖ first_entry_off u16 ‖ 0 u16 ‖
-//!               writer_id u16 ‖ 0 u16 ‖ xxh3(bytes[0..16]) u64
+//!       header: magic "KVJP" u32 ‖ lap u32 ‖ first_entry_off u16 ‖
+//!               reserved u16 (= 0, checked) ‖ appender_id u32 ‖
+//!               xxh3(bytes[0..16]) u64
 //!     logical byte space = the data areas back to back, never wrapping
-//!     entry at logical pos p: seq u64 (== p) ‖ len u32 (payload only) ‖
-//!               xxh3(seq ‖ len ‖ payload) u64 ‖ payload
+//!     entry at logical pos p: pos u64 (== p) ‖ len u32 (payload only) ‖
+//!               kind u8 (0 = records, 1 = PAD) ‖ reserved[3] (= 0, checked) ‖
+//!               xxh3(bytes[0..16] ‖ payload) u64 ‖ payload
 //!       payload = repeated ( tag u8 ‖ record frame )
 //!       record frame (K1's codec; only its framing is needed here) =
-//!               key_len u16 ‖ kind u8 ‖ seq u64 ‖ val_len u32 ‖ key ‖ value
-//!     PAD entry at a reservation's end: an ordinary entry, payload FF 00 … 00
+//!               key_len u16 ‖ kind u8 ‖ flags u8 (= 0) ‖ val_len u32 ‖
+//!               seq u64 ‖ key ‖ value
+//!     PAD entry at a reservation's end: an ordinary checksummed entry of
+//!     kind PAD whose payload is `pad − 24` zero bytes (charter §5.1)
 //!
 //! One transaction = one entry = the atomicity unit; an entry packs back to
 //! back with the next (its header may straddle a page-data boundary) and
@@ -46,31 +50,34 @@ pub const Reservation = jc.Reservation;
 
 /// The page = the atomic sector unit and the O_DIRECT grain ceiling.
 pub const PAGE_LEN: u64 = 4096;
-/// 20 B of fields + 4 B pad so the u64 checksum at `[16..24)` is 8-aligned.
+/// `{magic u32, lap u32, first_entry_off u16, reserved u16, appender_id u32,
+/// xxh3 u64}`: naturally aligned, the checksum over the first 16 B.
 pub const PAGE_HDR_LEN: u64 = 24;
 pub const PAGE_DATA_LEN: u64 = PAGE_LEN - PAGE_HDR_LEN;
-/// "KVJP".
-pub const PAGE_MAGIC: u32 = 0x4B56_4A50;
+/// ASCII "KVJP" read as a little-endian u32: ASCII order on disk.
+pub const PAGE_MAGIC: u32 = std.mem.readInt(u32, "KVJP", .little);
 /// An impossible physical in-page offset (> 4095): "no entry starts here" —
 /// the page is continuation bytes of an entry begun earlier.
 pub const FIRST_ENTRY_NONE: u16 = 0xFFFF;
-/// `seq u64 ‖ len u32 ‖ xxh3 u64`.
-pub const ENTRY_HDR_LEN: u64 = 20;
-/// Whole-entry cap, header included: 2× the largest legal record (a 64 KiB
-/// xattr) plus framing. The writer-side guard; replay's bound (a `len`
-/// implying more is dropped without ever being dereferenced).
+/// `pos u64 ‖ len u32 ‖ kind u8 ‖ reserved[3] ‖ xxh3 u64` (format v4,
+/// decision 0003 Q1): naturally aligned, the entry kind explicit.
+pub const ENTRY_HDR_LEN: u64 = 24;
+/// Whole-entry cap, header included — a charter law (§5.1 "max 128 KiB").
+/// WHY it holds: ONE maximal record (a `recordValueCap(1 MiB)` = 65,792 B
+/// value under a 17 B xattr key: 65,826 B framed) plus the refs and Δtimes
+/// that ride its transaction fits with ~62 KiB to spare, and 128 KiB is one
+/// page-aligned run of 32 pages on a 4 KiB-grain ring. It is NOT 2× a
+/// maximal record: two maximal values do not fit one entry (the typed
+/// `EntryTooLarge` refusal at admission; the tie test below pins both
+/// facts). Replay's bound too: a `len` implying more is dropped without
+/// ever being dereferenced.
 pub const MAX_ENTRY_LEN: u64 = 128 * 1024;
-/// The PAD payload marker: `untag(0xFF) = (15, 15)` is outside the tree table
-/// at every level, so a pre-pad decoder drops it as a foreign record.
-pub const PAD_TAG: u8 = 0xFF;
-/// The record frame header K1 writes: `key_len u16 ‖ kind u8 ‖ seq u64 ‖
-/// val_len u32` (no flags field — the bytes have none).
-pub const RECORD_HEADER_LEN: u64 = 15;
-/// 32 ledger slots / 16 = 2 slots per appender: a torn newest slot must have
-/// its OWN predecessor to fall back to.
-pub const MAX_APPENDERS: u16 = 16;
-/// The appender that owns the volume's structural state (tree roots).
-pub const ROOT_AUTHORITY_WRITER: u16 = 0;
+/// The record frame header K1 writes: `key_len u16 ‖ kind u8 ‖ flags u8 ‖
+/// val_len u32 ‖ seq u64` (`record.RECORD_HEADER_LEN` asserts equality).
+pub const RECORD_HEADER_LEN: u64 = 16;
+/// Appender 0 = the format-time fixed ring (charter §5.5); the one-member
+/// forest's only writer, and the manager's id on every ring page it owns.
+pub const FIXED_RING_APPENDER: u32 = 0;
 /// Consecutive journal-write (or barrier) failures that latch the volume
 /// FAILED (mutations EIO until remount).
 pub const JOURNAL_FAILURE_LATCH: u32 = 3;
@@ -91,11 +98,20 @@ pub const ROOT_LEDGER_START: u64 = SUPERBLOCK_LEN;
 pub const ROOT_LEDGER_LEN: u64 = 32 * 4096;
 pub const JOURNAL_START: u64 = ROOT_LEDGER_START + ROOT_LEDGER_LEN;
 
+/// What an entry carries (the header's `kind` byte).
+pub const EntryKind = enum(u8) {
+    /// Records: `payload = (tag ‖ record frame)*`.
+    records = 0,
+    /// The sector-pad law's PAD entry: `payload = 0^len`, skipped as a chain
+    /// link by replay.
+    pad = 1,
+};
+
 comptime {
     // The pad law's two constants live in the dependency-free core; drift
     // between them and the framing here is refused at compile time.
     std.debug.assert(jc.PAGE_HDR_LEN == PAGE_HDR_LEN);
-    std.debug.assert(jc.PAD_MIN == ENTRY_HDR_LEN + 1);
+    std.debug.assert(jc.PAD_MIN == ENTRY_HDR_LEN);
     std.debug.assert(PAGE_DATA_LEN == 4072);
     std.debug.assert(JOURNAL_START == 135168);
     std.debug.assert(RING_OVERRIDE_FLOOR == 393216);
@@ -200,90 +216,46 @@ pub const RingLayout = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Append partition.
-// ---------------------------------------------------------------------------
-
-/// Which appender a partitioned structure belongs to and how many appenders
-/// the volume's structures are partitioned for. `solo` is the shipped
-/// single-appender posture — every structure byte-identical to the
-/// pre-partition image.
-pub const AppendPartition = struct {
-    writers: u16,
-    writer_id: u16,
-
-    pub const solo: AppendPartition = .{ .writers = 1, .writer_id = 0 };
-
-    /// Refuses what the partitioned formats cannot express: zero appenders,
-    /// more than `MAX_APPENDERS`, a count that does not split the 32 ledger
-    /// slots evenly (a power of two), or an id outside the set.
-    pub fn new(writers: u16, writer_id: u16) Error!AppendPartition {
-        if (writers == 0 or writers > MAX_APPENDERS) return error.Corrupt;
-        if (!std.math.isPowerOfTwo(writers)) return error.Corrupt;
-        if (writer_id >= writers) return error.Corrupt;
-        return .{ .writers = writers, .writer_id = writer_id };
-    }
-
-    pub fn isSolo(self: AppendPartition) bool {
-        return self.writers == 1;
-    }
-
-    pub fn isRootAuthority(self: AppendPartition) bool {
-        return self.writer_id == ROOT_AUTHORITY_WRITER;
-    }
-};
-
-/// Pages in each appender's sub-ring (solo owns every page).
-pub fn partitionRingPages(total_pages: u64, writers: u16) u64 {
-    return total_pages / writers;
-}
-
-/// Byte offset of `part`'s sub-ring inside the extent based at `base`:
-/// equal, contiguous regions in writer order.
-pub fn partitionRingBase(base: u64, total_pages: u64, part: AppendPartition) u64 {
-    return base + partitionRingPages(total_pages, part.writers) * part.writer_id * PAGE_LEN;
-}
-
-/// Every appender must get at least one page.
-pub fn partitionedRingGeometryOk(total_pages: u64, writers: u16) bool {
-    return writers >= 1 and partitionRingPages(total_pages, writers) >= 1;
-}
-
-// ---------------------------------------------------------------------------
 // Page header (`docs/porting/kv_journal_ledger.md` §1.2).
 // ---------------------------------------------------------------------------
 
 pub const PageHeader = struct {
-    /// Low 32 bits of the page's lap.
+    /// Low 32 bits of the page's lap (2^32 laps × 8 MiB ≈ 36 PB of journal
+    /// writes before a wrap — bounded, stated).
     lap: u32,
     /// PHYSICAL in-page offset (24..4095) of the first entry that STARTS in
     /// this page; `FIRST_ENTRY_NONE` = none.
     first_entry_off: u16,
-    /// 0 for solo (byte-identical to pre-partition images).
-    writer_id: u16,
+    /// The appender whose ring segment this page belongs to: a detection-
+    /// grade screen of the same class as the frame stamp (charter §5.5
+    /// zeroes every carved ring extent, so a foreign page is never
+    /// legitimate). u32, the one appender-id width everywhere.
+    appender_id: u32,
 };
 
-/// The 24 B header image: `[10..12)` and `[14..16)` are explicit zero pads,
+/// The 24 B header image: `[10..12)` is the explicit zero reserved field,
 /// all 16 covered by the checksum.
-pub fn pageHeaderImage(lap: u32, first_entry_off: u16, writer_id: u16) [PAGE_HDR_LEN]u8 {
+pub fn pageHeaderImage(lap: u32, first_entry_off: u16, appender_id: u32) [PAGE_HDR_LEN]u8 {
     var hdr: [PAGE_HDR_LEN]u8 = @splat(0);
     std.mem.writeInt(u32, hdr[0..4], PAGE_MAGIC, .little);
     std.mem.writeInt(u32, hdr[4..8], lap, .little);
     std.mem.writeInt(u16, hdr[8..10], first_entry_off, .little);
-    std.mem.writeInt(u16, hdr[12..14], writer_id, .little);
+    std.mem.writeInt(u32, hdr[12..16], appender_id, .little);
     std.mem.writeInt(u64, hdr[16..24], checksum.xxh3(hdr[0..16]), .little);
     return hdr;
 }
 
-/// Total: magic mismatch ⇒ null; checksum mismatch ⇒ null. The pad fields
-/// are covered by the checksum but not validated.
+/// Total: magic mismatch ⇒ null; checksum mismatch ⇒ null; a non-zero
+/// reserved field ⇒ null (a verified liar is not a header).
 pub fn parsePageHeader(page: []const u8) ?PageHeader {
     if (page.len < PAGE_HDR_LEN) return null;
     if (std.mem.readInt(u32, page[0..4], .little) != PAGE_MAGIC) return null;
     if (std.mem.readInt(u64, page[16..24], .little) != checksum.xxh3(page[0..16])) return null;
+    if (std.mem.readInt(u16, page[10..12], .little) != 0) return null;
     return .{
         .lap = std.mem.readInt(u32, page[4..8], .little),
         .first_entry_off = std.mem.readInt(u16, page[8..10], .little),
-        .writer_id = std.mem.readInt(u16, page[12..14], .little),
+        .appender_id = std.mem.readInt(u32, page[12..16], .little),
     };
 }
 
@@ -329,7 +301,7 @@ pub const RecordFrame = struct {
     seq: u64,
     value: []const u8,
 
-    /// `1 + 15 + key + value`.
+    /// `1 + 16 + key + value`.
     pub fn frameLen(self: RecordFrame) u64 {
         return recordFrameLen(self.key.len, self.value.len);
     }
@@ -341,10 +313,11 @@ pub const RecordFrame = struct {
         buf[0] = self.tag;
         std.mem.writeInt(u16, buf[1..3], @intCast(self.key.len), .little);
         buf[3] = @backingInt(self.kind);
-        std.mem.writeInt(u64, buf[4..12], self.seq, .little);
-        std.mem.writeInt(u32, buf[12..16], @intCast(self.value.len), .little);
-        @memcpy(buf[16 .. 16 + self.key.len], self.key);
-        @memcpy(buf[16 + self.key.len ..], self.value);
+        buf[4] = 0;
+        std.mem.writeInt(u32, buf[5..9], @intCast(self.value.len), .little);
+        std.mem.writeInt(u64, buf[9..17], self.seq, .little);
+        @memcpy(buf[17 .. 17 + self.key.len], self.key);
+        @memcpy(buf[17 + self.key.len ..], self.value);
     }
 };
 
@@ -388,8 +361,9 @@ pub fn encodeEntryPayload(buf: []u8, records: []const RecordFrame) void {
 pub const Decoded = struct { frame: RecordFrame, used: usize };
 
 /// Decode one `tag ‖ frame` element. Total (§9): the tag must be admissible,
-/// the header must fit, `key_len ≠ 0`, `kind ∈ {1,2,3}`, Delete ⇒ `val_len
-/// == 0`, and `15 + key_len + val_len` (no overflow in u64) must fit.
+/// the header must fit, `key_len ≠ 0`, `kind ∈ {1,2,3}`, `flags == 0`,
+/// Delete ⇒ `val_len == 0`, and `16 + key_len + val_len` (no overflow in
+/// u64) must fit.
 pub fn decodeRecordFrame(buf: []const u8) Error!Decoded {
     if (buf.len < 1 + RECORD_HEADER_LEN) return error.Corrupt;
     const tag = buf[0];
@@ -404,8 +378,9 @@ pub fn decodeRecordFrame(buf: []const u8) Error!Decoded {
         3 => .delete,
         else => return error.Corrupt,
     };
-    const seq = std.mem.readInt(u64, hdr[3..11], .little);
-    const val_len: u64 = std.mem.readInt(u32, hdr[11..15], .little);
+    if (hdr[3] != 0) return error.Corrupt;
+    const val_len: u64 = std.mem.readInt(u32, hdr[4..8], .little);
+    const seq = std.mem.readInt(u64, hdr[8..16], .little);
     if (kind == .delete and val_len != 0) return error.Corrupt;
     const total = 1 + RECORD_HEADER_LEN + key_len + val_len;
     if (total > buf.len) return error.Corrupt;
@@ -446,36 +421,37 @@ pub const FrameIter = struct {
 // Entry framing (`docs/porting/kv_journal_ledger.md` §1.4, §1.6).
 // ---------------------------------------------------------------------------
 
-/// `xxh3_64(seq ‖ len ‖ payload)` with the payload as slices (no copy).
-pub fn entryChecksumParts(seq: u64, len: u32, parts: []const []const u8) u64 {
+/// The entry header's checksummed prefix: `pos u64 ‖ len u32 ‖ kind u8 ‖
+/// reserved[3]` — the 16 B before the checksum.
+pub const ENTRY_HDR_CHECKSUM_OFF: usize = 16;
+
+fn entryHeaderPrefix(pos: u64, len: u32, kind: EntryKind) [ENTRY_HDR_CHECKSUM_OFF]u8 {
+    var prefix: [ENTRY_HDR_CHECKSUM_OFF]u8 = @splat(0);
+    std.mem.writeInt(u64, prefix[0..8], pos, .little);
+    std.mem.writeInt(u32, prefix[8..12], len, .little);
+    prefix[12] = @backingInt(kind);
+    return prefix;
+}
+
+/// `xxh3_64(pos ‖ len ‖ kind ‖ reserved ‖ payload)` with the payload as
+/// slices (no copy).
+pub fn entryChecksumParts(pos: u64, len: u32, kind: EntryKind, parts: []const []const u8) u64 {
     var h = std.hash.XxHash3.init(0);
-    var seq_bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &seq_bytes, seq, .little);
-    h.update(&seq_bytes);
-    var len_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, len, .little);
-    h.update(&len_bytes);
+    h.update(&entryHeaderPrefix(pos, len, kind));
     for (parts) |p| h.update(p);
     return h.final();
 }
 
-pub fn entryChecksum(seq: u64, payload: []const u8) u64 {
-    return entryChecksumParts(seq, @intCast(payload.len), &.{payload});
+pub fn entryChecksum(pos: u64, kind: EntryKind, payload: []const u8) u64 {
+    return entryChecksumParts(pos, @intCast(payload.len), kind, &.{payload});
 }
 
-/// Frame one entry at logical `start` into `buf` (sized `20 + payload.len`).
-pub fn frameEntry(buf: []u8, start: u64, payload: []const u8) void {
+/// Frame one entry at logical `start` into `buf` (sized `24 + payload.len`).
+pub fn frameEntry(buf: []u8, start: u64, kind: EntryKind, payload: []const u8) void {
     std.debug.assert(buf.len == ENTRY_HDR_LEN + payload.len);
-    std.mem.writeInt(u64, buf[0..8], start, .little);
-    std.mem.writeInt(u32, buf[8..12], @intCast(payload.len), .little);
-    std.mem.writeInt(u64, buf[12..20], entryChecksum(start, payload), .little);
-    @memcpy(buf[20..], payload);
-}
-
-/// The PAD entry's payload: `FF` then zeros to the pad's end.
-pub fn padPayload(buf: []u8) void {
-    @memset(buf, 0);
-    buf[0] = PAD_TAG;
+    buf[0..ENTRY_HDR_CHECKSUM_OFF].* = entryHeaderPrefix(start, @intCast(payload.len), kind);
+    std.mem.writeInt(u64, buf[ENTRY_HDR_CHECKSUM_OFF..][0..8], entryChecksum(start, kind, payload), .little);
+    @memcpy(buf[ENTRY_HDR_LEN..], payload);
 }
 
 /// `first_entry_off` for the header of the page starting at `page_start`
@@ -519,15 +495,15 @@ fn opLessThan(_: void, a: WriteOp, b: WriteOp) bool {
     return a.offset < b.offset;
 }
 
-/// One framed entry (20 B header + `payload`) at logical `start`: payload
+/// One framed entry (24 B header + `payload`) at logical `start`: payload
 /// segment ops (slices of ONE whole-entry buffer) then the owned page
 /// headers. The order within one batch carries no durability meaning
 /// (unordered writeback is the crash model either way); it lets the torn-
 /// batch harness exercise payload-landed/header-lost shapes.
-fn framedEntryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, writer_id: u16, start: u64, payload: []const u8, ops: *std.ArrayList(WriteOp)) Allocator.Error!void {
+fn framedEntryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, start: u64, kind: EntryKind, payload: []const u8, ops: *std.ArrayList(WriteOp)) Allocator.Error!void {
     const whole = ENTRY_HDR_LEN + payload.len;
     const entry = try arena.alloc(u8, @intCast(whole));
-    frameEntry(entry, start, payload);
+    frameEntry(entry, start, kind, payload);
     const end = start + whole;
     var consumed: usize = 0;
     var segs = geo.segments(start, whole);
@@ -542,29 +518,30 @@ fn framedEntryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, write
     while (owned.next()) |page_start| {
         const feo = firstEntryOffFor(geo, start, end, page_start);
         const hdr = try arena.alloc(u8, PAGE_HDR_LEN);
-        hdr[0..PAGE_HDR_LEN].* = pageHeaderImage(@truncate(geo.lap(page_start)), feo, writer_id);
+        hdr[0..PAGE_HDR_LEN].* = pageHeaderImage(@truncate(geo.lap(page_start)), feo, appender_id);
         try ops.append(arena, .{ .offset = layout.pageOffset(geo.pageIndex(page_start)), .bytes = hdr });
     }
 }
 
 /// The entry's own bytes: `entryLenFor(records)` must equal `res.len`.
-fn entryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, writer_id: u16, res: Reservation, records: []const RecordFrame, ops: *std.ArrayList(WriteOp)) Error!void {
+fn entryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, res: Reservation, records: []const RecordFrame, ops: *std.ArrayList(WriteOp)) Error!void {
     const need = try entryLenFor(records);
     if (need != res.len) return error.Corrupt;
     const payload = try arena.alloc(u8, @intCast(payloadLenFor(records)));
     encodeEntryPayload(payload, records);
-    try framedEntryOps(arena, layout, geo, writer_id, res.start, payload, ops);
+    try framedEntryOps(arena, layout, geo, appender_id, res.start, .records, payload, ops);
 }
 
-/// The PAD entry behind a reservation: an ordinary checksummed entry at `end`
-/// spanning `pad` bytes, owning (and writing the headers of) the pages whose
-/// first byte it covers exactly as an entry would. Nothing when `pad == 0`.
-fn padOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, writer_id: u16, end: u64, pad: u64, ops: *std.ArrayList(WriteOp)) Allocator.Error!void {
+/// The PAD entry behind a reservation: an ordinary checksummed entry of kind
+/// PAD at `end` spanning `pad` bytes (a zero payload of `pad − 24`), owning
+/// (and writing the headers of) the pages whose first byte it covers exactly
+/// as an entry would. Nothing when `pad == 0`.
+fn padOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, end: u64, pad: u64, ops: *std.ArrayList(WriteOp)) Allocator.Error!void {
     if (pad == 0) return;
     std.debug.assert(pad >= jc.PAD_MIN);
     const payload = try arena.alloc(u8, @intCast(pad - ENTRY_HDR_LEN));
-    padPayload(payload);
-    try framedEntryOps(arena, layout, geo, writer_id, end, payload, ops);
+    @memset(payload, 0);
+    try framedEntryOps(arena, layout, geo, appender_id, end, .pad, payload, ops);
 }
 
 /// THE ring's aligned form (charter §5.1 "a window's ops coalesce into one
@@ -617,13 +594,13 @@ pub fn alignedOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, start
 /// One entry's write: its bytes plus the reservation's PAD entry, in the
 /// ring's aligned form. One op ⇒ `write_at`; more ⇒ `write_at_batch`
 /// (the io binding's choice).
-pub fn buildEntryWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, writer_id: u16, res: Reservation, records: []const RecordFrame) Error!WriteImage {
+pub fn buildEntryWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, res: Reservation, records: []const RecordFrame) Error!WriteImage {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     var ops: std.ArrayList(WriteOp) = .empty;
-    try entryOps(a, layout, geo, writer_id, res, records, &ops);
-    try padOps(a, layout, geo, writer_id, res.end(), res.pad, &ops);
+    try entryOps(a, layout, geo, appender_id, res, records, &ops);
+    try padOps(a, layout, geo, appender_id, res.end(), res.pad, &ops);
     const aligned = try alignedOps(a, layout, geo, res.start, res.paddedEnd(), ops.items);
     return .{ .arena = arena, .ops = aligned };
 }
@@ -644,13 +621,13 @@ pub const BatchPart = struct {
 /// survivor owns the page's first byte). Each member's bytes are BY
 /// CONSTRUCTION identical to a solo `buildEntryWrite` of the same
 /// reservation (shared `entryOps`) — the batch-of-1 equivalence.
-pub fn buildBatchWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, writer_id: u16, window: Reservation, parts: []const BatchPart) Error!WriteImage {
+pub fn buildBatchWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, window: Reservation, parts: []const BatchPart) Error!WriteImage {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     var ops: std.ArrayList(WriteOp) = .empty;
-    for (parts) |p| try entryOps(a, layout, geo, writer_id, p.res, p.records, &ops);
-    try padOps(a, layout, geo, writer_id, window.end(), window.pad, &ops);
+    for (parts) |p| try entryOps(a, layout, geo, appender_id, p.res, p.records, &ops);
+    try padOps(a, layout, geo, appender_id, window.end(), window.pad, &ops);
     const aligned = try alignedOps(a, layout, geo, window.start, window.paddedEnd(), ops.items);
     return .{ .arena = arena, .ops = aligned };
 }
@@ -729,7 +706,7 @@ pub const HeadAlignment = struct {
 /// them); nothing is written on that answer. The RMW is honest here alone:
 /// at open, no reservation open, single writer, the sector's prefix the
 /// durable image just replayed. A reader never calls this.
-pub fn planHeadAlignment(gpa: Allocator, core: *jc.JournalCore, reg: *jc.InflightRegistry, layout: RingLayout, writer_id: u16) Error!?HeadAlignment {
+pub fn planHeadAlignment(gpa: Allocator, core: *jc.JournalCore, reg: *jc.InflightRegistry, layout: RingLayout, appender_id: u32) Error!?HeadAlignment {
     const geo = core.geometry();
     const head = core.headPos();
     const pad = geo.padOf(head);
@@ -741,7 +718,7 @@ pub fn planHeadAlignment(gpa: Allocator, core: *jc.JournalCore, reg: *jc.Infligh
     errdefer arena.deinit();
     const a = arena.allocator();
     var ops: std.ArrayList(WriteOp) = .empty;
-    try padOps(a, layout, geo, writer_id, r.res.start, r.res.pad, &ops);
+    try padOps(a, layout, geo, appender_id, r.res.start, r.res.pad, &ops);
     const spans = try rmwSpans(a, geo.grain, ops.items);
     return .{ .arena = arena, .res = r.res, .ops = ops.items, .spans = spans };
 }
@@ -814,39 +791,53 @@ fn readLogical(image: []const u8, geo: CoreGeometry, pos: u64, out: []u8) void {
 }
 
 /// Parse + verify the entry at logical `pos`. Check ORDER: the header fits the
-/// window; `seq == pos` (the stale-lap / end-of-log rejector); `len` bounded
-/// by the cap AND the window BEFORE any byte it governs is read; the checksum
-/// straight out of the image segments (no copy); then PAD or payload decode.
+/// window; `pos` field == pos (the stale-lap / end-of-log rejector); `len`
+/// bounded by the cap AND the window BEFORE any byte it governs is read; the
+/// checksum straight out of the image segments (no copy); then the kind
+/// decides: PAD ⇒ an all-zero payload; records ⇒ the payload decodes. The
+/// reserved bytes and an unknown kind fail like any non-canonical bytes
+/// (they are under the checksum, so a verified one is a writer bug).
 fn parseEntryAt(arena: Allocator, image: []const u8, geo: CoreGeometry, pos: u64, chain_end: u64) Allocator.Error!Parsed {
     if (pos + ENTRY_HDR_LEN > chain_end) return .fail;
     var hdr: [ENTRY_HDR_LEN]u8 = undefined;
     readLogical(image, geo, pos, &hdr);
-    const seq = std.mem.readInt(u64, hdr[0..8], .little);
+    const stamped_pos = std.mem.readInt(u64, hdr[0..8], .little);
     const len = std.mem.readInt(u32, hdr[8..12], .little);
-    const stored = std.mem.readInt(u64, hdr[12..20], .little);
-    if (seq != pos) return .fail;
+    const stored = std.mem.readInt(u64, hdr[ENTRY_HDR_CHECKSUM_OFF..][0..8], .little);
+    if (stamped_pos != pos) return .fail;
     const whole = ENTRY_HDR_LEN + @as(u64, len);
     // The garbage-len guard: rejected on bounds alone.
     if (whole > MAX_ENTRY_LEN or pos + whole > chain_end) return .fail;
     const payload_pos = pos + ENTRY_HDR_LEN;
     var h = std.hash.XxHash3.init(0);
-    h.update(hdr[0..12]);
+    h.update(hdr[0..ENTRY_HDR_CHECKSUM_OFF]);
     var segs = geo.segments(payload_pos, len);
     while (segs.next()) |seg| {
         const at = imageOffset(seg);
         h.update(image[at .. at + @as(usize, @intCast(seg.len))]);
     }
     if (h.final() != stored) return .fail;
+    if (!std.mem.allEqual(u8, hdr[13..16], 0)) return .fail;
+    const kind: EntryKind = switch (hdr[12]) {
+        @backingInt(EntryKind.records) => .records,
+        @backingInt(EntryKind.pad) => .pad,
+        else => return .fail,
+    };
     const payload = try arena.alloc(u8, len);
     readLogical(image, geo, payload_pos, payload);
-    if (payload.len > 0 and payload[0] == PAD_TAG) {
-        for (payload[1..]) |b| if (b != 0) return .fail;
-        return .{ .pad = pos + whole };
+    switch (kind) {
+        .pad => {
+            if (!std.mem.allEqual(u8, payload, 0)) return .fail;
+            return .{ .pad = pos + whole };
+        },
+        .records => {
+            // The checksum verified but the records do not decode: a
+            // writer-bug class — dropped like any invalid chain structure,
+            // never loud.
+            _ = validateEntryPayload(payload) catch return .fail;
+            return .{ .entry = .{ .payload = payload, .end = pos + whole } };
+        },
     }
-    // The checksum verified but the records do not decode: a writer-bug
-    // class — dropped like any invalid chain structure, never loud.
-    _ = validateEntryPayload(payload) catch return .fail;
-    return .{ .entry = .{ .payload = payload, .end = pos + whole } };
 }
 
 /// The replay scan over a ring image (`pages × 4096` bytes; a short device
@@ -861,7 +852,7 @@ fn parseEntryAt(arena: Allocator, image: []const u8, geo: CoreGeometry, pos: u64
 /// is still read at chain-known offsets and its checksum decides. Failures
 /// are PENDING until a later link confirms them (`dropped_torn`); a trailing
 /// failure is end-of-log.
-pub fn replayScanImage(gpa: Allocator, image: []const u8, geo: CoreGeometry, tail: u64, expect_writer: u16) Allocator.Error!JournalRecovery {
+pub fn replayScanImage(gpa: Allocator, image: []const u8, geo: CoreGeometry, tail: u64, expect_appender: u32) Allocator.Error!JournalRecovery {
     std.debug.assert(image.len >= geo.pages * PAGE_LEN);
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -880,7 +871,7 @@ pub fn replayScanImage(gpa: Allocator, image: []const u8, geo: CoreGeometry, tai
     for (headers, 0..) |*h, k| {
         h.* = parsePageHeader(image[k * @as(usize, PAGE_LEN) ..][0..PAGE_HDR_LEN]);
         if (h.*) |ph| {
-            if (ph.writer_id != expect_writer) foreign_pages += 1;
+            if (ph.appender_id != expect_appender) foreign_pages += 1;
         }
     }
 
@@ -929,7 +920,7 @@ pub fn replayScanImage(gpa: Allocator, image: []const u8, geo: CoreGeometry, tai
                 pending += 1;
                 continue;
             };
-            if (ph.writer_id != expect_writer) {
+            if (ph.appender_id != expect_appender) {
                 // Foreign (checked BEFORE the lap gate so a foreign page whose
                 // lap matches is never followed): a discovery hole, attributed
                 // in `foreign_pages`, never a tear.
@@ -1277,20 +1268,40 @@ fn recoveredInos(rec: *const JournalRecovery, out: []u64) []u64 {
     return out[0..n];
 }
 
-test "constants: 24 B header, 4072 B data, magic KVJP, sentinel, cap, pad tag, extent placement" {
+test "constants: 24 B page header, 4072 B data, ASCII KVJP, sentinel, 24 B entry header, entry kinds, cap, extent placement" {
     try testing.expectEqual(@as(u64, 4096), PAGE_LEN);
     try testing.expectEqual(@as(u64, 24), PAGE_HDR_LEN);
     try testing.expectEqual(@as(u64, 4072), PAGE_DATA_LEN);
-    try testing.expectEqual(@as(u32, 0x4B564A50), PAGE_MAGIC);
+    try testing.expectEqual(@as(u32, 0x504A564B), PAGE_MAGIC);
     const hdr = pageHeaderImage(0, 24, 0);
-    try testing.expectEqualSlices(u8, &.{ 0x50, 0x4A, 0x56, 0x4B }, hdr[0..4]);
+    try testing.expectEqualStrings("KVJP", hdr[0..4]);
     try testing.expectEqual(@as(u16, 0xFFFF), FIRST_ENTRY_NONE);
-    try testing.expectEqual(@as(u64, 20), ENTRY_HDR_LEN);
+    try testing.expectEqual(@as(u64, 24), ENTRY_HDR_LEN);
+    try testing.expectEqual(@as(usize, 16), ENTRY_HDR_CHECKSUM_OFF);
+    try testing.expectEqual(@as(u8, 0), @backingInt(EntryKind.records));
+    try testing.expectEqual(@as(u8, 1), @backingInt(EntryKind.pad));
+    try testing.expectEqual(@as(u64, 16), RECORD_HEADER_LEN);
     try testing.expectEqual(@as(u64, 131072), MAX_ENTRY_LEN);
-    try testing.expectEqual(@as(u64, 131052), entryPayloadCap());
-    try testing.expectEqual(@as(u8, 0xFF), PAD_TAG);
-    try testing.expectEqual(Tag{ .tree_id = 15, .level = 15 }, untag(PAD_TAG));
+    try testing.expectEqual(@as(u64, 131048), entryPayloadCap());
+    try testing.expectEqual(@as(u32, 0), FIXED_RING_APPENDER);
     try testing.expectEqual(ExtentRef{ .start = 135168, .len = 8 * derive.MiB }, try journalExtent(100 * derive.MiB, null));
+}
+
+test "MAX_ENTRY_LEN tie: one maximal record (the 1 MiB node's value cap under a 17 B xattr key) plus a 4 KiB-grain pad fits with margin; two maximal values do not — the cap is a law, not 2× a record" {
+    const record = @import("record.zig");
+    const key = @import("key.zig");
+    const max_value = record.recordValueCap(1024 * 1024);
+    try testing.expectEqual(@as(usize, 65_792), max_value);
+    const one = ENTRY_HDR_LEN + recordFrameLen(key.XATTR_KEY_LEN, max_value);
+    try testing.expectEqual(@as(u64, 24 + 1 + 16 + 17 + 65_792), one);
+    try testing.expect(one + ringMaxPadFor(4096) <= MAX_ENTRY_LEN);
+    // The margin left for the refs and Δtimes that ride the transaction.
+    try testing.expect(MAX_ENTRY_LEN - one > 60 * 1024);
+    const two = ENTRY_HDR_LEN + 2 * recordFrameLen(key.XATTR_KEY_LEN, max_value);
+    try testing.expect(two > MAX_ENTRY_LEN);
+    // 128 KiB is one page-aligned run of 32 ring pages.
+    try testing.expectEqual(@as(u64, 0), MAX_ENTRY_LEN % PAGE_LEN);
+    try testing.expectEqual(@as(u64, 32), MAX_ENTRY_LEN / PAGE_LEN);
 }
 
 test "ring sizing: clamp(volume/64, 8 MiB, 32 MiB) rounded to pages; the override floor refuses" {
@@ -1325,44 +1336,33 @@ test "ring grain: a power of two ≤ 4096 verbatim, anything else is the unpadde
     try testing.expectEqual(@as(u64, 1), ringGrainFor(8192));
     try testing.expectEqual(@as(u64, 1), ringGrainFor(3072));
     try testing.expectEqual(@as(u64, 1), ringGrainFor(0));
-    try testing.expectEqual(@as(u64, 4117), ringMaxPadFor(4096));
-    try testing.expectEqual(@as(u64, 533), ringMaxPadFor(512));
+    try testing.expectEqual(@as(u64, 4120), ringMaxPadFor(4096));
+    try testing.expectEqual(@as(u64, 536), ringMaxPadFor(512));
     try testing.expectEqual(@as(u64, 0), ringMaxPadFor(1));
 }
 
-test "append partition: solo is byte-identical posture; refusals; sub-ring placement" {
-    try testing.expect(AppendPartition.solo.isSolo());
-    try testing.expect(AppendPartition.solo.isRootAuthority());
-    const p = try AppendPartition.new(4, 2);
-    try testing.expect(!p.isSolo());
-    try testing.expect(!p.isRootAuthority());
-    try testing.expectError(error.Corrupt, AppendPartition.new(0, 0));
-    try testing.expectError(error.Corrupt, AppendPartition.new(32, 0));
-    try testing.expectError(error.Corrupt, AppendPartition.new(3, 0));
-    try testing.expectError(error.Corrupt, AppendPartition.new(4, 4));
-    try testing.expectEqual(@as(u64, 512), partitionRingPages(2048, 4));
-    try testing.expectEqual(JOURNAL_START + 2 * 512 * PAGE_LEN, partitionRingBase(JOURNAL_START, 2048, p));
-    try testing.expect(partitionedRingGeometryOk(16, 16));
-    try testing.expect(!partitionedRingGeometryOk(8, 16));
-}
-
-test "page header: byte layout, checksum over [0..16), parse total" {
+test "page header: byte layout {magic, lap, first_entry_off, reserved = 0, appender_id u32, xxh3 over [0..16)}; parse total; a non-zero reserved field is refused" {
     const hdr = pageHeaderImage(7, 24, 0);
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, hdr[4..8], .little));
     try testing.expectEqual(@as(u16, 24), std.mem.readInt(u16, hdr[8..10], .little));
     try testing.expectEqualSlices(u8, &.{ 0, 0 }, hdr[10..12]);
-    try testing.expectEqualSlices(u8, &.{ 0, 0 }, hdr[12..14]);
-    try testing.expectEqualSlices(u8, &.{ 0, 0 }, hdr[14..16]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, hdr[12..16]);
     try testing.expectEqual(checksum.xxh3(hdr[0..16]), std.mem.readInt(u64, hdr[16..24], .little));
     const parsed = parsePageHeader(&hdr).?;
-    try testing.expectEqual(PageHeader{ .lap = 7, .first_entry_off = 24, .writer_id = 0 }, parsed);
-    const w = pageHeaderImage(1, FIRST_ENTRY_NONE, 3);
-    try testing.expectEqual(@as(u16, 3), parsePageHeader(&w).?.writer_id);
+    try testing.expectEqual(PageHeader{ .lap = 7, .first_entry_off = 24, .appender_id = 0 }, parsed);
+    const w = pageHeaderImage(1, FIRST_ENTRY_NONE, 0x0001_0003);
+    try testing.expectEqualSlices(u8, &.{ 3, 0, 1, 0 }, w[12..16]);
+    try testing.expectEqual(@as(u32, 0x0001_0003), parsePageHeader(&w).?.appender_id);
     var bad = hdr;
     bad[0] ^= 1;
     try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(&bad));
     bad = hdr;
     bad[9] ^= 1;
+    try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(&bad));
+    // Reserved is CHECKED: restamped so only the reserved rule rejects.
+    bad = hdr;
+    bad[10] = 1;
+    std.mem.writeInt(u64, bad[16..24], checksum.xxh3(bad[0..16]), .little);
     try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(&bad));
     try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(hdr[0..20]));
     const zeros: [24]u8 = @splat(0);
@@ -1387,7 +1387,7 @@ test "entry payload round trip; truncations, tag 0 / tag 10, empty key, bad kind
         .{ .tag = tagFor(0, 1), .key = "sep", .kind = .put, .seq = 9, .value = "ptr" },
     };
     const n = payloadLenFor(&recs);
-    try testing.expectEqual(@as(u64, (16 + 2 + 5) + (16 + 7) + (16 + 3 + 3)), n);
+    try testing.expectEqual(@as(u64, (17 + 2 + 5) + (17 + 7) + (17 + 3 + 3)), n);
     var buf: [128]u8 = undefined;
     encodeEntryPayload(buf[0..@intCast(n)], &recs);
     try testing.expectEqual(@as(u32, 3), try validateEntryPayload(buf[0..@intCast(n)]));
@@ -1422,33 +1422,41 @@ test "entry payload round trip; truncations, tag 0 / tag 10, empty key, bad kind
     try testing.expectError(error.Corrupt, validateEntryPayload(bad[0..@intCast(n)]));
     bad[3] = 4;
     try testing.expectError(error.Corrupt, validateEntryPayload(bad[0..@intCast(n)]));
+    // A non-zero flags byte.
+    bad = buf;
+    bad[4] = 1;
+    try testing.expectError(error.Corrupt, validateEntryPayload(bad[0..@intCast(n)]));
     // A tombstone with a value.
     bad = buf;
-    bad[23 + 12] = 1; // second record's val_len low byte
+    bad[24 + 5] = 1; // second record's val_len low byte
     try testing.expectError(error.Corrupt, validateEntryPayload(bad[0..@intCast(n)]));
     // Lengths beyond the buffer are refused without being dereferenced.
     bad = buf;
-    bad[12] = 0xFF;
-    bad[13] = 0xFF;
-    bad[14] = 0xFF;
-    bad[15] = 0xFF;
+    bad[5] = 0xFF;
+    bad[6] = 0xFF;
+    bad[7] = 0xFF;
+    bad[8] = 0xFF;
     try testing.expectError(error.Corrupt, validateEntryPayload(bad[0..@intCast(n)]));
     // The cap: exactly 128 KiB legal, one more refused.
     var big: [MAX_ENTRY_LEN]u8 = undefined;
-    const exact = [_]RecordFrame{.{ .tag = 1, .key = "k", .kind = .put, .seq = 1, .value = big[0..@intCast(MAX_ENTRY_LEN - ENTRY_HDR_LEN - 16 - 1)] }};
+    const exact = [_]RecordFrame{.{ .tag = 1, .key = "k", .kind = .put, .seq = 1, .value = big[0..@intCast(MAX_ENTRY_LEN - ENTRY_HDR_LEN - 17 - 1)] }};
     try testing.expectEqual(MAX_ENTRY_LEN, try entryLenFor(&exact));
-    const over = [_]RecordFrame{.{ .tag = 1, .key = "k", .kind = .put, .seq = 1, .value = big[0..@intCast(MAX_ENTRY_LEN - ENTRY_HDR_LEN - 16)] }};
+    const over = [_]RecordFrame{.{ .tag = 1, .key = "k", .kind = .put, .seq = 1, .value = big[0..@intCast(MAX_ENTRY_LEN - ENTRY_HDR_LEN - 17)] }};
     try testing.expectError(error.EntryTooLarge, entryLenFor(&over));
 }
 
-test "entry checksum: streaming over seq ‖ len ‖ payload parts equals the one-shot hash of the concatenation" {
+test "entry checksum: streaming over pos ‖ len ‖ kind ‖ reserved ‖ payload parts equals the one-shot hash of the concatenation; the kind is under the checksum" {
     const payload = "some payload bytes that cross the 16 B boundary";
-    var concat: [12 + payload.len]u8 = undefined;
+    var concat: [16 + payload.len]u8 = undefined;
+    @memset(&concat, 0);
     std.mem.writeInt(u64, concat[0..8], 12345, .little);
     std.mem.writeInt(u32, concat[8..12], payload.len, .little);
-    @memcpy(concat[12..], payload);
-    try testing.expectEqual(checksum.xxh3(&concat), entryChecksum(12345, payload));
-    try testing.expectEqual(checksum.xxh3(&concat), entryChecksumParts(12345, payload.len, &.{ payload[0..10], payload[10..] }));
+    @memcpy(concat[16..], payload);
+    try testing.expectEqual(checksum.xxh3(&concat), entryChecksum(12345, .records, payload));
+    try testing.expectEqual(checksum.xxh3(&concat), entryChecksumParts(12345, payload.len, .records, &.{ payload[0..10], payload[10..] }));
+    concat[12] = 1;
+    try testing.expectEqual(checksum.xxh3(&concat), entryChecksum(12345, .pad, payload));
+    try testing.expect(entryChecksum(12345, .pad, payload) != entryChecksum(12345, .records, payload));
 }
 
 test "single-page entry: page-0 header magic / lap 0 / feo 24 / checksum; replay equals; head_pos == end" {
@@ -1457,11 +1465,13 @@ test "single-page entry: page-0 header magic / lap 0 / feo 24 / checksum; replay
     const r = try ring.append(1, 300, 0xA1);
     try testing.expectEqual(@as(u64, 0), r.start);
     const hdr = parsePageHeader(ring.image[0..24]).?;
-    try testing.expectEqual(PageHeader{ .lap = 0, .first_entry_off = 24, .writer_id = 0 }, hdr);
-    // The entry header at physical 24: seq 0, len 280.
+    try testing.expectEqual(PageHeader{ .lap = 0, .first_entry_off = 24, .appender_id = 0 }, hdr);
+    // The entry header at physical 24: pos 0, len 276, kind records, reserved 0.
     try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, ring.image[24..32], .little));
-    try testing.expectEqual(@as(u32, 280), std.mem.readInt(u32, ring.image[32..36], .little));
-    try testing.expectEqual(ring.image[24 + 20], tagFor(TREE_INODES, 0));
+    try testing.expectEqual(@as(u32, 276), std.mem.readInt(u32, ring.image[32..36], .little));
+    try testing.expectEqual(@backingInt(EntryKind.records), ring.image[36]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, ring.image[37..40]);
+    try testing.expectEqual(ring.image[24 + 24], tagFor(TREE_INODES, 0));
     // Page 1 untouched.
     try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(ring.image[4096..][0..24]));
     var rec = try ring.replay(0);
@@ -1509,16 +1519,16 @@ test "multi-page entry: 64 KiB over 17 pages; continuation feo 0xFFFF; end page 
     try testing.expectEqual(next.end(), rec.head_pos);
 }
 
-test "entry header straddles a page-data boundary: first entry 4062 B, second header split 10/10; exact page fill hands the next header to the successor" {
+test "entry header straddles a page-data boundary: first entry 4060 B, second header split 12/12; exact page fill hands the next header to the successor" {
     {
         var ring = try TestRing.init(testing.allocator, 0, 4, 0, 1);
         defer ring.deinit();
-        _ = try ring.append(1, 4062, 0xC1);
+        _ = try ring.append(1, 4060, 0xC1);
         const b = try ring.append(2, 300, 0xC2);
-        try testing.expectEqual(@as(u64, 4062), b.start);
-        // B's header: 10 bytes at the end of page 0's data, 10 at the start of page 1's.
-        try testing.expectEqual(@as(u64, 4062), std.mem.readInt(u64, ring.image[24 + 4062 ..][0..8], .little));
-        try testing.expectEqual(@as(u16, 24 + 4062 - 4072 + 300), parsePageHeader(ring.image[4096..][0..24]).?.first_entry_off);
+        try testing.expectEqual(@as(u64, 4060), b.start);
+        // B's header: 12 bytes at the end of page 0's data, 12 at the start of page 1's.
+        try testing.expectEqual(@as(u64, 4060), std.mem.readInt(u64, ring.image[24 + 4060 ..][0..8], .little));
+        try testing.expectEqual(@as(u16, 24 + 4060 - 4072 + 300), parsePageHeader(ring.image[4096..][0..24]).?.first_entry_off);
         var rec = try ring.replay(0);
         defer rec.deinit();
         var inos: [8]u64 = undefined;
@@ -1719,7 +1729,7 @@ test "replay: a stale previous-lap entry at the window end is rejected by seq �
     try testing.expectEqual(@as(u64, 16000), rec.head_pos);
 }
 
-test "PAD entry bytes: seq = end, len = pad − 20, payload FF 00…; replay skips it as a chain link; aligned runs are page-based images" {
+test "PAD entry bytes: pos = end, len = pad − 24, kind PAD, zero payload; replay skips it as a chain link; aligned runs are page-based images" {
     var ring = try TestRing.init(testing.allocator, 0, 8, 0, 4096);
     defer ring.deinit();
     const a = try ring.append(1, 300, 0x51);
@@ -1728,9 +1738,10 @@ test "PAD entry bytes: seq = end, len = pad − 20, payload FF 00…; replay ski
     // The PAD entry at logical 300: physical 24 + 300.
     const at = ring.phys(300);
     try testing.expectEqual(@as(u64, 300), std.mem.readInt(u64, ring.image[at..][0..8], .little));
-    try testing.expectEqual(@as(u32, @intCast(a.pad - 20)), std.mem.readInt(u32, ring.image[at + 8 ..][0..4], .little));
-    try testing.expectEqual(PAD_TAG, ring.image[at + 20]);
-    for (ring.image[at + 21 .. 4096]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(@as(u32, @intCast(a.pad - 24)), std.mem.readInt(u32, ring.image[at + 8 ..][0..4], .little));
+    try testing.expectEqual(@backingInt(EntryKind.pad), ring.image[at + 12]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, ring.image[at + 13 .. at + 16]);
+    for (ring.image[at + 24 .. 4096]) |b| try testing.expectEqual(@as(u8, 0), b);
     const b = try ring.append(2, 100, 0x52);
     try testing.expectEqual(PAGE_DATA_LEN, b.start);
     try testing.expectEqual(@as(u64, 2), ring.stats.written_entries.load());
@@ -1754,24 +1765,33 @@ test "PAD entry bytes: seq = end, len = pad − 20, payload FF 00…; replay ski
     try testing.expect(parsePageHeader(img.ops[0].bytes[0..24]) != null);
 }
 
-test "PAD payload with a nonzero byte behind the marker is a Fail, not a link" {
-    var ring = try TestRing.init(testing.allocator, 0, 8, 0, 4096);
-    defer ring.deinit();
-    const a = try ring.append(1, 300, 0x61);
-    _ = try ring.append(2, 300, 0x62);
-    // Corrupt the pad's payload beyond the marker AND restamp its checksum so
-    // only the marker rule can reject it.
-    const at = ring.phys(a.end());
-    const pad_len: usize = @intCast(a.pad);
-    const entry = ring.image[at .. at + pad_len];
-    entry[25] = 1;
-    std.mem.writeInt(u64, entry[12..20], entryChecksum(a.end(), entry[20..]), .little);
-    var rec = try ring.replay(0);
-    defer rec.deinit();
-    var inos: [8]u64 = undefined;
-    // The chain breaks at the pad; page 1's header names entry 2 ⇒ resync; one confirmed drop.
-    try testing.expectEqualSlices(u64, &.{ 1, 2 }, recoveredInos(&rec, &inos));
-    try testing.expectEqual(@as(u64, 1), rec.dropped_torn);
+test "a PAD entry with a nonzero payload byte, an unknown entry kind or a non-zero reserved byte is a Fail, not a link (all three restamped)" {
+    for ([_]u8{ 0, 1, 2 }) |variant| {
+        var ring = try TestRing.init(testing.allocator, 0, 8, 0, 4096);
+        defer ring.deinit();
+        const a = try ring.append(1, 300, 0x61);
+        _ = try ring.append(2, 300, 0x62);
+        // Doctor the pad entry AND restamp its checksum so only the
+        // structural rule can reject it.
+        const at = ring.phys(a.end());
+        const pad_len: usize = @intCast(a.pad);
+        const entry = ring.image[at .. at + pad_len];
+        switch (variant) {
+            0 => entry[ENTRY_HDR_LEN + 5] = 1,
+            1 => entry[12] = 2,
+            else => entry[14] = 1,
+        }
+        var h = std.hash.XxHash3.init(0);
+        h.update(entry[0..ENTRY_HDR_CHECKSUM_OFF]);
+        h.update(entry[ENTRY_HDR_LEN..]);
+        std.mem.writeInt(u64, entry[ENTRY_HDR_CHECKSUM_OFF..][0..8], h.final(), .little);
+        var rec = try ring.replay(0);
+        defer rec.deinit();
+        var inos: [8]u64 = undefined;
+        // The chain breaks at the pad; page 1's header names entry 2 ⇒ resync; one confirmed drop.
+        try testing.expectEqualSlices(u64, &.{ 1, 2 }, recoveredInos(&rec, &inos));
+        try testing.expectEqual(@as(u64, 1), rec.dropped_torn);
+    }
 }
 
 test "aligned runs: a window spanning pages coalesces adjacent pages into one image, a rolled-back member is a zero hole, a misaligned run is refused" {
@@ -1800,7 +1820,7 @@ test "aligned runs: a window spanning pages coalesces adjacent pages into one im
     try testing.expectEqual(@as(u64, 0), img.ops[0].bytes.len % 512);
     applyOps(ring.image, 0, img.ops);
     // The hole: member 2's bytes are zero.
-    for (ring.image[ring.phys(m1.end() + 20) .. ring.phys(m1.end() + 20) + 100]) |b| try testing.expectEqual(@as(u8, 0), b);
+    for (ring.image[ring.phys(m1.end() + ENTRY_HDR_LEN) .. ring.phys(m1.end() + ENTRY_HDR_LEN) + 100]) |b| try testing.expectEqual(@as(u8, 0), b);
     // Page 1's header: owned by the hole's range (member 2 spans 1000..5000 ⇒ page 1 starts at 4072) — no survivor owns it ⇒ zeros.
     try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(ring.image[4096..][0..24]));
     var rec = try ring.replay(0);

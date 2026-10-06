@@ -147,7 +147,9 @@ pub const SmoJournal = struct {
     /// Empty on a device-bound journal (`device` set): the device is the
     /// image.
     image: []u8,
-    writer_id: u16 = journal.ROOT_AUTHORITY_WRITER,
+    /// The appender every page header of this ring names (the fixed ring's
+    /// is appender 0 until rung 6 hands rings to joiners).
+    appender_id: u32 = journal.FIXED_RING_APPENDER,
     /// The historical §4.7 retire tag stamped into free-record VALUES
     /// (byte-for-byte format compat; the gate is the record's position).
     retire_seq: std.atomic.Value(u64) = .init(0),
@@ -199,7 +201,7 @@ pub const SmoJournal = struct {
     }
 
     fn writeEntry(self: *SmoJournal, res: Reservation, frames: []const journal.RecordFrame) journal.Error!void {
-        var img = try journal.buildEntryWrite(self.gpa, self.layout, self.geo, self.writer_id, res, frames);
+        var img = try journal.buildEntryWrite(self.gpa, self.layout, self.geo, self.appender_id, res, frames);
         defer img.deinit();
         if (self.device) |d| {
             d.write(d.ctx, img.ops) catch return error.Corrupt;
@@ -389,12 +391,13 @@ pub fn interiorFanout(layout: node.NodeLayout, key_len: usize) usize {
 
 /// The widest SMO entry a node of `layout` can need on a ring of
 /// `ring_len` logical bytes: `parts = ⌈(foldCapacity + ring_len) /
-/// splitPartCapacity⌉` pointer + alloc records of 8-byte keys, plus the
-/// free record, plus the entry header — the bound `admitSmoEntry`'s keep
-/// is sized against.
+/// splitPartCapacity⌉` pointer records under the widest journal key (a
+/// slot tree's `slot ‖ KEY_SPACE_MAX`) + alloc records of 8-byte keys,
+/// plus the free record, plus the entry header — the bound
+/// `admitSmoEntry`'s keep is sized against.
 pub fn widestSmoEntryLen(layout: node.NodeLayout, ring_len: u64) u64 {
     const parts: u64 = @intCast((layout.foldCapacity() + ring_len + layout.splitPartCapacity() - 1) / layout.splitPartCapacity());
-    const ptr = journal.recordFrameLen(key.KEY_SPACE_MAX.len, key.InteriorValue.LEN);
+    const ptr = journal.recordFrameLen(key.KEY_BUF_CAP, key.InteriorValue.LEN);
     const alloc = journal.recordFrameLen(alloc_ext.extent_key_len, 1);
     const free = journal.recordFrameLen(alloc_ext.extent_key_len, 9);
     return journal.ENTRY_HDR_LEN + parts * (ptr + alloc) + free;
@@ -545,12 +548,21 @@ pub fn writeEntryAfterRelease(j: *SmoJournal, r: jc.InflightRegistry.Registered,
 // Test seam: the build-window pause.
 // ---------------------------------------------------------------------------
 
-/// Arm with a tree id to park the next `smoReplace`/`smoMerge` of that tree
-/// in its BUILD WINDOW — after the successor images are written and loaded
-/// back, before the lock window — so a test can inject racing commits whose
-/// reservations land BELOW the SMO's in-lock flip reservation (the
-/// stranding shape). `0` = off; unarmed cost is one monotonic load per SMO.
+/// Arm (`testSmoBuildPauseArm`) to park the next `smoReplace`/`smoMerge`
+/// of a tree in its BUILD WINDOW — after the successor images are written
+/// and loaded back, before the lock window — so a test can inject racing
+/// commits whose reservations land BELOW the SMO's in-lock flip reservation
+/// (the stranding shape). Holds `header id + 1` (a slot tree's header id
+/// is 0); `0` = off; unarmed cost is one monotonic load per SMO.
 pub var test_smo_build_pause_tree: std.atomic.Value(u64) = .init(0);
+
+fn pauseArmFor(t: *const KvTree) u64 {
+    return @as(u64, t.tree_id) + 1;
+}
+
+pub fn testSmoBuildPauseArm(t: *const KvTree) void {
+    test_smo_build_pause_tree.store(pauseArmFor(t), .seq_cst);
+}
 /// Whether an SMO is parked right now (release pairs with the test's
 /// acquire; `test_smo_pause_info` is valid while true).
 pub var test_smo_build_paused: std.atomic.Value(bool) = .init(false);
@@ -573,10 +585,10 @@ pub fn testSmoBuildPauseRelease() void {
 }
 
 pub fn testSmoBuildPause(t: *const KvTree, level: u8, is_root: bool, is_merge: bool, min_key: []const u8, max_key: []const u8) void {
-    if (test_smo_build_pause_tree.load(.monotonic) != @as(u64, t.tree_id)) return;
+    if (test_smo_build_pause_tree.load(.monotonic) != pauseArmFor(t)) return;
     test_smo_pause_info = .{ .tree_id = t.tree_id, .level = level, .is_root = is_root, .is_merge = is_merge, .min_key = key.KeyBuf.fromSlice(min_key), .max_key = key.KeyBuf.fromSlice(max_key) };
     test_smo_build_paused.store(true, .release);
-    while (test_smo_build_pause_tree.load(.acquire) == @as(u64, t.tree_id)) std.Thread.yield() catch std.atomic.spinLoopHint();
+    while (test_smo_build_pause_tree.load(.acquire) == pauseArmFor(t)) std.Thread.yield() catch std.atomic.spinLoopHint();
     test_smo_build_paused.store(false, .release);
 }
 
@@ -737,7 +749,7 @@ pub fn applyLeftovers(cache: *NodeCache, succ: *CachedNode, leftovers: []OwnedRe
 pub fn mapApply(e: node_cache.ApplyError) Error {
     return switch (e) {
         error.Superseded => error.Corrupt,
-        error.ReaderMayNotMutate, error.NonAuthorityInterior, error.LeafLeaseRefused => error.PartitionRefused,
+        error.ReaderMayNotMutate, error.LeafLeaseRefused => error.PartitionRefused,
         error.OutOfMemory => error.OutOfMemory,
     };
 }
@@ -1339,8 +1351,8 @@ pub const TestVolume = struct {
         self.* = undefined;
     }
 
-    pub fn createTree(self: *TestVolume, tree_id: u8) !*KvTree {
-        const t = try KvTree.create(self.gpa, self.cache, self.alloc, tree_id, self.seq);
+    pub fn createTree(self: *TestVolume, identity: tree.TreeIdentity) !*KvTree {
+        const t = try KvTree.create(self.gpa, self.cache, self.alloc, identity, self.seq);
         errdefer t.destroy();
         try self.trees.append(self.gpa, t);
         return t;
@@ -1414,7 +1426,12 @@ pub const TestVolume = struct {
     /// record), its entry written to the ring image.
     pub fn commit(self: *TestVolume, t: *KvTree, k: []const u8, kind: rec.RecordKind, value: []const u8) !void {
         assert(self.cfg.journaled);
-        var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(t.tree_id, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
+        // The tag is the record's kind: the key's own on a slot tree.
+        const tag_kind: u8 = switch (t.identity) {
+            .control => key.TREE_CONTROL,
+            .slot => try key.slotTreeKeyKind(k),
+        };
+        var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(tag_kind, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
         const len = try journal.entryLenFor(&frames);
         const adm = self.core.tryAdmit(len, .user) orelse return error.RingFull;
         var st: StampCtx = .{ .j = self.journal, .adm = adm };
@@ -1497,8 +1514,8 @@ pub const TestVolume = struct {
             self.* = undefined;
         }
 
-        pub fn treeOf(self: *const Reopened, tree_id: u8) *KvTree {
-            for (self.trees.items) |t| if (t.tree_id == tree_id) return t;
+        pub fn treeOf(self: *const Reopened, identity: tree.TreeIdentity) *KvTree {
+            for (self.trees.items) |t| if (t.identity.eql(identity)) return t;
             unreachable;
         }
     };
@@ -1517,12 +1534,12 @@ pub const TestVolume = struct {
             trees.deinit(gpa);
         }
         for (led.roots[0..led.n]) |r| {
-            const t = try KvTree.open(gpa, cache, r.tree_id, .{ .addr = r.node_addr, .seq = r.node_seq }, seq);
+            const t = try KvTree.open(gpa, cache, .fromRootId(r.id), .{ .addr = r.node_addr, .seq = r.node_seq }, seq);
             errdefer t.destroy();
             seq.raiseTo(r.node_seq);
             try trees.append(gpa, t);
         }
-        var recovery = try journal.replayScanImage(gpa, self.ring_image, self.journal.geo, led.tail, self.journal.writer_id);
+        var recovery = try journal.replayScanImage(gpa, self.ring_image, self.journal.geo, led.tail, self.journal.appender_id);
         errdefer recovery.deinit();
         const outcome = try tree.replayEntries(gpa, trees.items, recovery.entries);
         return .{ .gpa = gpa, .cache = cache, .seq = seq, .trees = trees, .recovery = recovery, .outcome = outcome };
@@ -1611,14 +1628,17 @@ test "derivation ties: interior fanout; the SMO keep covers the widest entry at 
     const l64 = try node.NodeLayout.new(64 * 1024, null);
     const l256 = try node.NodeLayout.new(node.DEFAULT_NODE_SIZE, null);
     const l1m = try node.NodeLayout.new(node.MAX_NODE_SIZE, null);
-    try testing.expectEqual(@as(usize, 46_032 / 39), interiorFanout(l64, 8));
-    try testing.expectEqual(@as(usize, 193_488 / 39), interiorFanout(l256, 8));
+    // v4: a separator record over an inode key is 16 + 9 + 16 = 41 B.
+    try testing.expectEqual(@as(usize, 46_026 / 41), interiorFanout(l64, key.INODE_KEY_LEN));
+    try testing.expectEqual(@as(usize, 1_122), interiorFanout(l64, key.INODE_KEY_LEN));
+    try testing.expectEqual(@as(usize, 193_482 / 41), interiorFanout(l256, key.INODE_KEY_LEN));
+    try testing.expectEqual(@as(usize, 4_719), interiorFanout(l256, key.INODE_KEY_LEN));
     // The charter's "≈ 7,000 at 256 KiB": the full fold's separators,
-    // 257,984 / 39.
-    try testing.expectEqual(@as(usize, 6_614), l256.foldCapacity() / 39);
+    // 257,976 / 41.
+    try testing.expectEqual(@as(usize, 6_292), l256.foldCapacity() / 41);
     // 100 M records of ~100 B at the ¾ fill ≈ 52 k leaves ≪ fanout² ⇒ depth ≤ 3.
     const leaves_100m: u64 = 100_000_000 * 100 / l256.splitPartCapacity();
-    try testing.expect(leaves_100m < @as(u64, interiorFanout(l256, 8)) * interiorFanout(l256, 8));
+    try testing.expect(leaves_100m < @as(u64, interiorFanout(l256, key.INODE_KEY_LEN)) * interiorFanout(l256, key.INODE_KEY_LEN));
     for ([_]u64{ journal.RING_MIN, 16 * 1024 * 1024, journal.RING_MAX }) |ring| {
         for ([_]u64{ 1, 512, 4096 }) |grain| {
             const geo = journal.productionGeometry(ring / journal.PAGE_LEN, grain);
@@ -1661,7 +1681,7 @@ test "writeback_appends_then_compacts_then_splits: threshold appends never move 
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     const root0 = t.rootPtr();
     const c0 = stats.meta_kv_node_compactions.load();
     const s0 = stats.meta_kv_node_splits.load();
@@ -1713,7 +1733,7 @@ test "interior_recursion_grows_root_to_depth_three: the level-1 root splits itse
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .extents = 2048 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     // 32-byte keys ⇒ 63 B separators: the level-1 root's fold passes
     // `foldCapacity` after 61,376 / 63 = 974 leaves of ~7–14 four-KiB
     // records, and it splits itself.
@@ -1742,7 +1762,7 @@ test "stale_writer_revalidates_and_retries_after_smo: a leaf resolved before an 
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     for (0..200) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
     _ = try vol.drain(t);
@@ -1770,7 +1790,7 @@ test "reopen_from_disk_after_flush_serves_everything: flushDirty makes the volum
     const n: u64 = 800;
     var buf: [64]u8 = undefined;
     const root = blk: {
-        const t = try vol.createTree(key.TREE_INODES);
+        const t = try vol.createTree(.native);
         for (0..n) |i| try t.insert(&ikey(i), tree.testValue(i, 48, &buf));
         var i: u64 = 0;
         while (i < n) : (i += 5) try t.delete(&ikey(i));
@@ -1780,7 +1800,7 @@ test "reopen_from_disk_after_flush_serves_everything: flushDirty makes the volum
     const cache = try vol.freshCache();
     defer cache.deinit();
     var seq2 = node_seq.NodeSeqHandle.shared(1 << 32);
-    const t2 = try KvTree.open(gpa, cache, key.TREE_INODES, root, &seq2);
+    const t2 = try KvTree.open(gpa, cache, .native, root, &seq2);
     defer t2.destroy();
     for (0..n) |i| {
         if (i % 5 == 0) try expectLookup(t2, &ikey(i), null) else try expectLookup(t2, &ikey(i), tree.testValue(i, 48, &buf));
@@ -1795,7 +1815,7 @@ test "split_vs_commit_storm_loses_nothing: 8 writers against the serialized SMO 
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .extents = 1024, .writeback_delta_bytes = 2048 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_DENTRIES);
+    const t = try vol.createTree(.native);
     const s0 = stats.meta_kv_node_splits.load();
     const WRITERS: u64 = 8;
     const PER_WRITER: u64 = 1500;
@@ -1860,7 +1880,7 @@ test "scale: ≥ 100k keys at 64 KiB nodes ⇒ depth ≤ 3 (the fanout tie), eve
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .extents = 1024 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     const KEYS: u64 = 100_000;
     var buf: [64]u8 = undefined;
     for (0..KEYS) |i| {
@@ -1886,7 +1906,7 @@ test "the dying floor of a root swap pins the tail at the entry start; a root sw
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     // Fill the root leaf until it splits (a root swap).
     var n: u64 = 0;
@@ -1948,14 +1968,17 @@ test "the dying floor of a root swap pins the tail at the entry start; a root sw
         if (r.entry_seq != leaf_smo.start) continue;
         ptrs += 1;
         try testing.expectEqual(@as(u8, 1), r.level);
-        try testing.expectEqual(key.TREE_INODES, r.tree_id);
+        try testing.expectEqual(key.KIND_INTERIOR, r.tree_id);
         try testing.expectEqual(journal.RecordKind.put, r.record.kind);
         try testing.expectEqual(@as(u32, 0), r.index); // the flips are records 0..n
         const iv = try key.InteriorValue.decode(r.record.value);
         const succ = try vol.cache.get(iv.childAddr());
         defer succ.release();
         try testing.expectEqual(iv.childSeq(), succ.node_seq);
-        try testing.expectEqualSlices(u8, succ.max_key, r.record.key);
+        // A slot tree's pointer record rides `slot ‖ separator`.
+        const jk = try key.splitInteriorJournalKey(r.record.key);
+        try testing.expectEqual(key.NATIVE_FOREST_SLOT, jk.slot);
+        try testing.expectEqualSlices(u8, succ.max_key, jk.separator);
     }
     try testing.expectEqual(@as(u32, 1), ptrs);
 }
@@ -1964,7 +1987,7 @@ test "rightmost_separator_pointer_record_replays_clean: an SMO of the rightmost 
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() == 0) {
@@ -1991,14 +2014,14 @@ test "rightmost_separator_pointer_record_replays_clean: an SMO of the rightmost 
     defer gpa.free(interior);
     var saw_top = false;
     for (interior) |r| {
-        if (r.entry_seq == smo_entry.start and std.mem.eql(u8, r.record.key, &key.KEY_SPACE_MAX)) saw_top = true;
+        if (r.entry_seq == smo_entry.start and std.mem.eql(u8, r.record.key, t.interiorJournalKey(&key.KEY_SPACE_MAX).slice())) saw_top = true;
     }
     try testing.expect(saw_top);
     var re = try vol.crashReplay(led);
     defer re.deinit();
     try testing.expect(re.outcome.interior_applied >= 1);
     try testing.expectEqual(@as(u64, 0), re.outcome.interior_dropped);
-    const t2 = re.treeOf(key.TREE_INODES);
+    const t2 = re.treeOf(.native);
     for (n - 32..n) |i| try expectLookup(t2, &ikey(i), tree.testValue(i * 5 + spins - 1, 40, &buf));
     try testing.expectEqual(t.rootPtr(), t2.rootPtr());
 }
@@ -2017,7 +2040,7 @@ test "SMO completeness: an SMO entry torn, or the ring cut right after it, repla
     for ([_]Variant{ .intact, .torn_entry, .cut_after }) |variant| {
         var vol = try TestVolume.init(gpa, .{ .journaled = true });
         defer vol.deinit();
-        const t = try vol.createTree(key.TREE_INODES);
+        const t = try vol.createTree(.native);
         var n: u64 = 0;
         while (try t.rootLevel() == 0) {
             for (0..64) |_| {
@@ -2054,7 +2077,7 @@ test "SMO completeness: an SMO entry torn, or the ring cut right after it, repla
         }
         var re = try vol.crashReplay(led);
         defer re.deinit();
-        const t2 = re.treeOf(key.TREE_INODES);
+        const t2 = re.treeOf(.native);
         const new_routing = re.outcome.interior_applied > 0;
         switch (variant) {
             .intact, .cut_after => try testing.expect(new_routing),
@@ -2093,7 +2116,7 @@ test "stranded_build_window_commits_survive_crash: commits racing an SMO's build
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() == 0) {
@@ -2121,7 +2144,7 @@ test "stranded_build_window_commits_survive_crash: commits racing an SMO's build
         try testing.expect(spins < 10_000);
     }
     const c0 = stats.meta_kv_node_compactions.load() + stats.meta_kv_node_splits.load();
-    test_smo_build_pause_tree.store(key.TREE_INODES, .seq_cst);
+    testSmoBuildPauseArm(t);
     defer testSmoBuildPauseRelease();
     const Smo = struct {
         fn run(v: *TestVolume, tr: *KvTree, failed: *std.atomic.Value(bool)) void {
@@ -2131,7 +2154,7 @@ test "stranded_build_window_commits_survive_crash: commits racing an SMO's build
     var failed: std.atomic.Value(bool) = .init(false);
     const th = try std.Thread.spawn(.{}, Smo.run, .{ &vol, t, &failed });
     while (!test_smo_build_paused.load(.acquire)) std.Thread.yield() catch {};
-    try testing.expectEqual(key.TREE_INODES, test_smo_pause_info.tree_id);
+    try testing.expectEqual(key.KIND_INTERIOR, test_smo_pause_info.tree_id);
     try testing.expect(!test_smo_pause_info.is_root);
     // The racing commits: ACKED puts inside the paused leaf's range, with
     // reservations BELOW the flip's.
@@ -2159,7 +2182,7 @@ test "stranded_build_window_commits_survive_crash: commits racing an SMO's build
     var re = try vol.crashReplay(led);
     defer re.deinit();
     try testing.expect(re.outcome.interior_applied >= 1);
-    const t2 = re.treeOf(key.TREE_INODES);
+    const t2 = re.treeOf(.native);
     for (0..80) |i| {
         const k = ikey(i);
         if (key.lessThan(&k, test_smo_pause_info.min_key.slice()) or key.lessThan(test_smo_pause_info.max_key.slice(), &k)) continue;
@@ -2171,7 +2194,7 @@ test "replay_twice_digest_stable_across_smo_windows: two reopens of the same pos
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() == 0) {
@@ -2196,13 +2219,13 @@ test "replay_twice_digest_stable_across_smo_windows: two reopens of the same pos
     var b = try vol.crashReplay(led);
     defer b.deinit();
     try testing.expectEqual(a.outcome, b.outcome);
-    try testing.expectEqual(a.treeOf(key.TREE_INODES).rootPtr(), b.treeOf(key.TREE_INODES).rootPtr());
+    try testing.expectEqual(a.treeOf(.native).rootPtr(), b.treeOf(.native).rootPtr());
     var la: std.ArrayList(KeyValue) = .empty;
     defer tree.deinitKeyValues(gpa, &la);
     var lb: std.ArrayList(KeyValue) = .empty;
     defer tree.deinitKeyValues(gpa, &lb);
-    try a.treeOf(key.TREE_INODES).range(gpa, &ikey(0), &ikey(n), std.math.maxInt(usize), &la);
-    try b.treeOf(key.TREE_INODES).range(gpa, &ikey(0), &ikey(n), std.math.maxInt(usize), &lb);
+    try a.treeOf(.native).range(gpa, &ikey(0), &ikey(n), std.math.maxInt(usize), &la);
+    try b.treeOf(.native).range(gpa, &ikey(0), &ikey(n), std.math.maxInt(usize), &lb);
     try testing.expectEqual(la.items.len, lb.items.len);
     for (la.items, lb.items) |x, y| {
         try testing.expectEqualSlices(u8, x.key, y.key);
@@ -2214,7 +2237,7 @@ test "an SMO entry write failure after the swap is the crash-equivalent hole: lo
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() == 0) {
@@ -2244,7 +2267,7 @@ test "an SMO entry write failure after the swap is the crash-equivalent hole: lo
     var re = try vol.crashReplay(led);
     defer re.deinit();
     try testing.expectEqual(@as(u64, 0), re.outcome.interior_applied);
-    const t2 = re.treeOf(key.TREE_INODES);
+    const t2 = re.treeOf(.native);
     try testing.expectEqual(old_leaf, try leafAddrOf(t2, &ikey(10)));
     for (0..80) |i| try expectLookup(t2, &ikey(i), tree.testValue(i * 11 + spins - 1, 40, &buf));
 }
@@ -2287,7 +2310,7 @@ test "the SMO's pre-lock barrier failure fails the SMO loud: BarrierFailed, no p
     vol.journal.latch = &latch;
     var fb: FailingBarrier = .{};
     vol.journal.barrier_hook = fb.sink();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     var n: u64 = 0;
     while (try t.rootLevel() == 0) {
@@ -2341,7 +2364,7 @@ test "property: random puts/deletes with SMOs interleaved ⇒ lookup ≡ an Auto
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true, .extents = 256 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var oracle = std.AutoHashMap(u64, u64).init(gpa);
     defer oracle.deinit();
     var buf: [256]u8 = undefined;
@@ -2375,7 +2398,7 @@ test "property: random puts/deletes with SMOs interleaved ⇒ lookup ≡ an Auto
     // The replay over the images from the mid-run ledger.
     var re = try vol.crashReplay(led.?);
     defer re.deinit();
-    const t2 = re.treeOf(key.TREE_INODES);
+    const t2 = re.treeOf(.native);
     for (0..KEYS) |k| try expectOracle(t2, k, oracle.get(k), &buf);
     if (t.rootPtr().addr == led.?.roots[0].node_addr) {
         // No root swap since the ledger: the FINAL routing is reproduced
@@ -2400,7 +2423,7 @@ test "checkpointFlushNode: freezes and takes the floor in one window, appends ou
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     const addr = t.rootPtr().addr;
     try checkpointFlushNode(t, &vol.ctx, addr); // clean: nothing to write
@@ -2431,7 +2454,7 @@ test "runMaintenanceUntil: an expired deadline still runs the first item (the pr
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     for (0..20) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
     const addr = t.rootPtr().addr;
@@ -2450,7 +2473,7 @@ test "CheckpointSeam: the checkpoint's CacheFlusher appends in place, hands a fu
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var seam_ctx: CheckpointSeam = .{ .ctx = &vol.ctx, .trees = vol.trees.items };
     var flusher: checkpoint_cycle.CacheFlusher = .{ .cache = vol.cache, .smo = seam_ctx.seam() };
     const sink = flusher.sink();
@@ -2503,7 +2526,7 @@ test "threshold SMO under the FIFO valve refuses PendingFreeFull pre-swap with n
     const gpa = testing.allocator;
     var vol = try TestVolume.init(gpa, .{ .journaled = true, .pending_cap = 2 });
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     const Fill = struct {
         fn run(v: *TestVolume, tr: *KvTree, b: []u8, salt: u64) !void {

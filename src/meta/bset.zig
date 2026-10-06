@@ -26,10 +26,9 @@ const RecordKind = rec.RecordKind;
 // §4.1 Bset image.
 // ---------------------------------------------------------------------------
 
-/// A NUMERIC constant serialized little-endian: the bytes on disk are
-/// `54 45 53 42` ("TESB"), not ASCII "BSET" — contrast `KVND`/`KBSF`, which
-/// are `from_le_bytes` of the ASCII and appear in ASCII order on disk.
-pub const BSET_MAGIC: u32 = 0x4253_4554;
+/// ASCII "BSET" read as a little-endian u32: appears in ASCII order on disk,
+/// the ONE magic convention of every unit (format v4; decision 0002 row 36).
+pub const BSET_MAGIC: u32 = std.mem.readInt(u32, "BSET", .little);
 pub const BSET_VERSION: u16 = 1;
 pub const BSET_HEADER_LEN: usize = 32;
 /// The checksum field: xxh3 over `[0..24) ‖ 8 × 0x00 ‖ [32..)`.
@@ -433,89 +432,46 @@ pub fn compact(gpa: Allocator, sources: []const BsetView, durable_tail: u64, out
 pub const NODE_PAGE: usize = 4096;
 /// ASCII "KBSF" read as a little-endian u32: appears in ASCII order on disk.
 pub const BSET_FRAME_MAGIC: u32 = std.mem.readInt(u32, "KBSF", .little);
-/// The frame every bit-17-ABSENT volume writes and reads.
+/// The ONE frame (format v4; decision 0002 row 37): `magic u32 ‖ version
+/// u16 ‖ reserved u16 (= 0, checked) ‖ node_seq_at_write u64 ‖ padded_len
+/// u32 ‖ bset_len u32 ‖ appender_id u32 ‖ g u32 ‖ xxh3 u64` over `[0..32)`.
+/// The fencing stamp is on EVERY frame — charter §5.5 "Detection-grade
+/// frame screen on every bset frame"; `(0, 0)` is the manager's structural
+/// stamp and the one-member forest's.
 pub const BSET_FRAME_VERSION: u16 = 1;
-pub const BSET_FRAME_LEN: usize = 32;
-/// The frame every bit-17 (symmetric forest) volume writes and reads: v1's
-/// fields plus the `appender_id ‖ g` fencing stamp before the checksum.
-pub const BSET_FRAME_VERSION_V2: u16 = 2;
-pub const BSET_FRAME_V2_LEN: usize = 40;
+pub const BSET_FRAME_LEN: usize = 40;
+pub const BSET_FRAME_CHECKSUM_OFF: usize = 32;
 
-/// The fields both versions share: `magic u32 ‖ version u16 ‖ reserved u16 ‖
-/// node_seq_at_write u64 ‖ padded_len u32 ‖ bset_len u32`, LE.
-pub const FrameCommon = extern struct {
+pub const FrameHeaderWire = extern struct {
     magic_le: [4]u8,
     version_le: [2]u8,
-    /// Written 0; NOT checked on read.
     reserved_le: [2]u8,
     node_seq_at_write_le: [8]u8,
     padded_len_le: [4]u8,
     bset_len_le: [4]u8,
-};
-
-/// v1: common ‖ checksum = xxh3 over `[0..24)`.
-pub const FrameHeaderV1 = extern struct {
-    common: FrameCommon,
-    checksum_le: [8]u8,
-};
-
-/// v2: common ‖ appender_id u32 ‖ g u32 ‖ checksum = xxh3 over `[0..32)`.
-pub const FrameHeaderV2 = extern struct {
-    common: FrameCommon,
     appender_id_le: [4]u8,
     g_le: [4]u8,
     checksum_le: [8]u8,
 };
 
 comptime {
-    assert(@sizeOf(FrameCommon) == 24);
-    assert(@sizeOf(FrameHeaderV1) == BSET_FRAME_LEN);
-    assert(@sizeOf(FrameHeaderV2) == BSET_FRAME_V2_LEN);
-    assert(@offsetOf(FrameHeaderV2, "appender_id_le") == 24);
-    assert(@offsetOf(FrameHeaderV2, "g_le") == 28);
-    assert(@offsetOf(FrameHeaderV2, "checksum_le") == 32);
+    assert(@sizeOf(FrameHeaderWire) == BSET_FRAME_LEN);
+    assert(@offsetOf(FrameHeaderWire, "appender_id_le") == 24);
+    assert(@offsetOf(FrameHeaderWire, "g_le") == 28);
+    assert(@offsetOf(FrameHeaderWire, "checksum_le") == BSET_FRAME_CHECKSUM_OFF);
 }
 
-/// The v2 fencing stamp: the writing appender and the SLOT's lease
-/// generation at the write (a slot's generations are ONE sequence, which is
-/// why the stamp is the slot's `g` and never the appender's dlm_term).
-/// `(0, 0)` is the manager's structural stamp for tree 0, the native slot
-/// and every unleased tree it maintains.
+/// The fencing stamp: the writing appender and the SLOT's lease generation
+/// at the write (a slot's generations are ONE sequence, which is why the
+/// stamp is the slot's `g` and never the appender's dlm_term). `(0, 0)` is
+/// the manager's structural stamp for tree 0, the native slot and every
+/// unleased tree it maintains — and so the one-member forest's only stamp.
 pub const FrameStamp = struct {
     appender_id: u32 = 0,
     g: u32 = 0,
 
     pub fn eql(a: FrameStamp, b: FrameStamp) bool {
         return a.appender_id == b.appender_id and a.g == b.g;
-    }
-};
-
-/// Which frame a volume writes and admits — exactly ONE: v2-on-v1 and
-/// v1-on-v2 are both foreign.
-pub const FrameFormat = union(enum) {
-    v1,
-    /// With the stamp the next write carries.
-    v2: FrameStamp,
-
-    pub fn version(self: FrameFormat) u16 {
-        return switch (self) {
-            .v1 => BSET_FRAME_VERSION,
-            .v2 => BSET_FRAME_VERSION_V2,
-        };
-    }
-
-    pub fn frameLen(self: FrameFormat) usize {
-        return switch (self) {
-            .v1 => BSET_FRAME_LEN,
-            .v2 => BSET_FRAME_V2_LEN,
-        };
-    }
-
-    pub fn stamp(self: FrameFormat) ?FrameStamp {
-        return switch (self) {
-            .v1 => null,
-            .v2 => |s| s,
-        };
     }
 };
 
@@ -526,9 +482,9 @@ pub fn pageAlign(n: usize) usize {
 
 /// On-disk length of the frame `record_bytes` of encoded records produce:
 /// frame + bset headers, padded to 4 KiB; 0 for no records.
-pub fn appendFrameLen(format: FrameFormat, record_bytes: usize) usize {
+pub fn appendFrameLen(record_bytes: usize) usize {
     if (record_bytes == 0) return 0;
-    return pageAlign(format.frameLen() + BSET_HEADER_LEN + record_bytes);
+    return pageAlign(BSET_FRAME_LEN + BSET_HEADER_LEN + record_bytes);
 }
 
 pub const FrameEncodeError = BuildError || error{
@@ -540,43 +496,31 @@ pub const FrameEncodeError = BuildError || error{
 /// 4 KiB multiple`. The pad is deliberately NOT covered by any checksum (a
 /// torn append may truncate it harmlessly); the bset carries its own. Every
 /// `value.len > recordValueCap(node_size)` refuses before anything is built.
-pub fn encodeBsetFrame(gpa: Allocator, format: FrameFormat, node_size: usize, node_seq_at_write: u64, records: []const RecordRef, journal_seq_horizon: u64) FrameEncodeError![]u8 {
+pub fn encodeBsetFrame(gpa: Allocator, stamp: FrameStamp, node_size: usize, node_seq_at_write: u64, records: []const RecordRef, journal_seq_horizon: u64) FrameEncodeError![]u8 {
     const cap = rec.recordValueCap(node_size);
     for (records) |r| if (r.value.len > cap) return error.ValueTooLarge;
     const bset = try buildBset(gpa, records, journal_seq_horizon);
     defer gpa.free(bset);
     // `buildBset` bounded `data_len` by u32; `32 + data_len` still fits.
     const bset_len: u32 = @intCast(bset.len);
-    const frame_len = format.frameLen();
-    const padded_len = pageAlign(frame_len + bset.len);
+    const padded_len = pageAlign(BSET_FRAME_LEN + bset.len);
     if (padded_len > std.math.maxInt(u32)) return error.BsetTooLarge;
     const out = try gpa.alloc(u8, padded_len);
     @memset(out, 0);
-    var common: FrameCommon = undefined;
-    std.mem.writeInt(u32, &common.magic_le, BSET_FRAME_MAGIC, .little);
-    std.mem.writeInt(u16, &common.version_le, format.version(), .little);
-    std.mem.writeInt(u16, &common.reserved_le, 0, .little);
-    std.mem.writeInt(u64, &common.node_seq_at_write_le, node_seq_at_write, .little);
-    std.mem.writeInt(u32, &common.padded_len_le, @intCast(padded_len), .little);
-    std.mem.writeInt(u32, &common.bset_len_le, bset_len, .little);
+    var h: FrameHeaderWire = undefined;
+    std.mem.writeInt(u32, &h.magic_le, BSET_FRAME_MAGIC, .little);
+    std.mem.writeInt(u16, &h.version_le, BSET_FRAME_VERSION, .little);
+    std.mem.writeInt(u16, &h.reserved_le, 0, .little);
+    std.mem.writeInt(u64, &h.node_seq_at_write_le, node_seq_at_write, .little);
+    std.mem.writeInt(u32, &h.padded_len_le, @intCast(padded_len), .little);
+    std.mem.writeInt(u32, &h.bset_len_le, bset_len, .little);
+    std.mem.writeInt(u32, &h.appender_id_le, stamp.appender_id, .little);
+    std.mem.writeInt(u32, &h.g_le, stamp.g, .little);
     // The checksum follows the bytes it covers: everything before it.
-    switch (format) {
-        .v1 => {
-            var h: FrameHeaderV1 = .{ .common = common, .checksum_le = undefined };
-            const covered = std.mem.asBytes(&h)[0..@offsetOf(FrameHeaderV1, "checksum_le")];
-            std.mem.writeInt(u64, &h.checksum_le, checksum.xxh3(covered), .little);
-            out[0..BSET_FRAME_LEN].* = std.mem.toBytes(h);
-        },
-        .v2 => |s| {
-            var h: FrameHeaderV2 = .{ .common = common, .appender_id_le = undefined, .g_le = undefined, .checksum_le = undefined };
-            std.mem.writeInt(u32, &h.appender_id_le, s.appender_id, .little);
-            std.mem.writeInt(u32, &h.g_le, s.g, .little);
-            const covered = std.mem.asBytes(&h)[0..@offsetOf(FrameHeaderV2, "checksum_le")];
-            std.mem.writeInt(u64, &h.checksum_le, checksum.xxh3(covered), .little);
-            out[0..BSET_FRAME_V2_LEN].* = std.mem.toBytes(h);
-        },
-    }
-    @memcpy(out[frame_len..][0..bset.len], bset);
+    const covered = std.mem.asBytes(&h)[0..BSET_FRAME_CHECKSUM_OFF];
+    std.mem.writeInt(u64, &h.checksum_le, checksum.xxh3(covered), .little);
+    out[0..BSET_FRAME_LEN].* = std.mem.toBytes(h);
+    @memcpy(out[BSET_FRAME_LEN..][0..bset.len], bset);
     return out;
 }
 
@@ -585,8 +529,8 @@ pub const FrameHeader = struct {
     node_seq_at_write: u64,
     padded_len: usize,
     bset_len: usize,
-    /// The v2 fencing stamp; null on a v1 layout.
-    stamp: ?FrameStamp,
+    /// The fencing stamp.
+    stamp: FrameStamp,
 };
 
 /// Outcome of inspecting one 4 KiB-aligned frame slot.
@@ -594,8 +538,8 @@ pub const FrameProbe = union(enum) {
     /// No frame magic: not this node's log (unwritten tail, stale garbage,
     /// or a tear that kept less than the magic).
     clean_end,
-    /// Magic present but the header does not verify, or its version is
-    /// foreign to the layout.
+    /// Magic present but the header does not verify, its version is foreign
+    /// or its reserved field is not zero (a verified liar).
     garbage,
     /// A verified frame of ANOTHER incarnation (recycled extent residue —
     /// any other value, higher or lower): a clean end, never loud.
@@ -603,32 +547,27 @@ pub const FrameProbe = union(enum) {
     frame: FrameHeader,
 };
 
-/// Probe the frame slot at `pos` (the caller guarantees `pos + frameLen ≤
-/// buf.len`). Order: magic → checksum over `frame_len − 8` bytes → version
-/// → `node_seq_at_write` → (v2) stamp. Branches ONLY on checksum-verified
-/// bytes.
-pub fn probeFrame(buf: []const u8, pos: usize, node_seq: u64, format: FrameFormat) FrameProbe {
-    const frame_len = format.frameLen();
-    const hdr = buf[pos..][0..frame_len];
-    const common = std.mem.bytesToValue(FrameCommon, hdr[0..@sizeOf(FrameCommon)]);
-    if (std.mem.readInt(u32, &common.magic_le, .little) != BSET_FRAME_MAGIC) return .clean_end;
-    const covered = frame_len - 8;
-    if (std.mem.readInt(u64, hdr[covered..][0..8], .little) != checksum.xxh3(hdr[0..covered])) return .garbage;
-    if (std.mem.readInt(u16, &common.version_le, .little) != format.version()) return .garbage;
-    const node_seq_at_write = std.mem.readInt(u64, &common.node_seq_at_write_le, .little);
+/// Probe the frame slot at `pos` (the caller guarantees `pos +
+/// BSET_FRAME_LEN ≤ buf.len`). Order: magic → checksum over `[0..32)` →
+/// version → reserved → `node_seq_at_write`. Branches ONLY on
+/// checksum-verified bytes.
+pub fn probeFrame(buf: []const u8, pos: usize, node_seq: u64) FrameProbe {
+    const hdr = buf[pos..][0..BSET_FRAME_LEN];
+    const h = std.mem.bytesToValue(FrameHeaderWire, hdr);
+    if (std.mem.readInt(u32, &h.magic_le, .little) != BSET_FRAME_MAGIC) return .clean_end;
+    if (std.mem.readInt(u64, &h.checksum_le, .little) != checksum.xxh3(hdr[0..BSET_FRAME_CHECKSUM_OFF])) return .garbage;
+    if (std.mem.readInt(u16, &h.version_le, .little) != BSET_FRAME_VERSION) return .garbage;
+    if (std.mem.readInt(u16, &h.reserved_le, .little) != 0) return .garbage;
+    const node_seq_at_write = std.mem.readInt(u64, &h.node_seq_at_write_le, .little);
     if (node_seq_at_write != node_seq) return .stale_incarnation;
-    const stamp: ?FrameStamp = switch (format) {
-        .v1 => null,
-        .v2 => .{
-            .appender_id = std.mem.readInt(u32, hdr[24..28], .little),
-            .g = std.mem.readInt(u32, hdr[28..32], .little),
-        },
-    };
     return .{ .frame = .{
         .node_seq_at_write = node_seq_at_write,
-        .padded_len = std.mem.readInt(u32, &common.padded_len_le, .little),
-        .bset_len = std.mem.readInt(u32, &common.bset_len_le, .little),
-        .stamp = stamp,
+        .padded_len = std.mem.readInt(u32, &h.padded_len_le, .little),
+        .bset_len = std.mem.readInt(u32, &h.bset_len_le, .little),
+        .stamp = .{
+            .appender_id = std.mem.readInt(u32, &h.appender_id_le, .little),
+            .g = std.mem.readInt(u32, &h.g_le, .little),
+        },
     } };
 }
 
@@ -636,12 +575,12 @@ pub fn probeFrame(buf: []const u8, pos: usize, node_seq: u64, format: FrameForma
 /// 4 KiB-multiple `padded_len` within the extent, a bset no smaller than
 /// its header and no larger than the frame. A VERIFIED liar is corruption,
 /// never a tear.
-pub fn frameGeometryOk(f: FrameHeader, pos: usize, node_size: usize, frame_len: usize) bool {
+pub fn frameGeometryOk(f: FrameHeader, pos: usize, node_size: usize) bool {
     return f.padded_len >= NODE_PAGE and
         f.padded_len % NODE_PAGE == 0 and
         pos <= node_size and f.padded_len <= node_size - pos and
         f.bset_len >= BSET_HEADER_LEN and
-        frame_len + f.bset_len <= f.padded_len;
+        BSET_FRAME_LEN + f.bset_len <= f.padded_len;
 }
 
 /// The lessee-side input to the frame screen for ONE leaf.
@@ -691,32 +630,6 @@ pub const FrameScreen = struct {
     }
 };
 
-/// What the destination page of an append already holds — the foreign-
-/// append probe's answer.
-pub const TailPage = union(enum) {
-    /// No verified frame of this incarnation: free to append.
-    clear,
-    /// A verified frame of this incarnation under OUR stamp (or any stamp
-    /// on a v1 layout): a peer of our identity appended into a node we cache.
-    ours,
-    /// A verified frame of this incarnation under ANOTHER stamp: a zombie
-    /// predecessor wrote at our remembered tail.
-    foreign: FrameStamp,
-};
-
-/// Classify `page` (the node's log area at a 4 KiB boundary) for an append
-/// about to land there. Branches only on verified bytes.
-pub fn probeTailPage(page: []const u8, node_seq: u64, format: FrameFormat) TailPage {
-    if (page.len < format.frameLen()) return .clear;
-    return switch (probeFrame(page, 0, node_seq, format)) {
-        .frame => |f| blk: {
-            if (f.stamp) |found| if (format.stamp()) |ours| if (!found.eql(ours)) break :blk .{ .foreign = found };
-            break :blk .ours;
-        },
-        else => .clear,
-    };
-}
-
 // ---------------------------------------------------------------------------
 // Tests — build/verify/search/merge/frame contracts.
 // ---------------------------------------------------------------------------
@@ -756,13 +669,14 @@ fn freeAll(gpa: Allocator, list: *std.ArrayList(Record)) void {
     list.deinit(gpa);
 }
 
-test "bset header magic is the numeric 0x42534554 LE: bytes 54 45 53 42 on disk; KBSF is ASCII-ordered" {
+test "bset header magic is ASCII BSET on disk (one magic convention); KBSF too" {
     const gpa = testing.allocator;
     var recs = [_]Record{try put(gpa, 1, 1)};
     defer rec.deinitRecords(gpa, &recs);
     const img = try buildFrom(gpa, &recs, 1);
     defer gpa.free(img);
-    try testing.expectEqualSlices(u8, &.{ 0x54, 0x45, 0x53, 0x42 }, img[0..4]);
+    try testing.expectEqualStrings("BSET", img[0..4]);
+    try testing.expectEqual(@as(u32, 0x54455342), BSET_MAGIC);
     try testing.expectEqualSlices(u8, &.{ 1, 0 }, img[4..6]);
     try testing.expectEqualSlices(u8, &.{ 0, 0 }, img[6..8]);
     try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, img[8..12]);
@@ -797,7 +711,7 @@ test "bset build/parse roundtrip preserves records and header" {
     try testing.expectEqual(@as(usize, 4), i);
     try testing.expectEqual(RecordKind.delete, view.record(3).kind);
     // Zero-copy: the record's key points into the image.
-    try testing.expectEqual(@intFromPtr(img.ptr) + 32 + 15, @intFromPtr(view.record(0).key.ptr));
+    try testing.expectEqual(@intFromPtr(img.ptr) + BSET_HEADER_LEN + rec.RECORD_HEADER_LEN, @intFromPtr(view.record(0).key.ptr));
 }
 
 test "bset build rejects empty, unsorted and duplicate inputs" {
@@ -853,7 +767,7 @@ test "bset parse bounds-checks every length field behind a restamped checksum" {
     const bad = try gpa.dupe(u8, img);
     defer gpa.free(bad);
     // A record's val_len lying past the data area.
-    std.mem.writeInt(u32, bad[BSET_HEADER_LEN + 11 ..][0..4], std.math.maxInt(u32), .little);
+    std.mem.writeInt(u32, bad[BSET_HEADER_LEN + 4 ..][0..4], std.math.maxInt(u32), .little);
     stampChecksum(bad);
     try testing.expectError(error.Corrupt, BsetView.parse(gpa, bad));
     // record_count lying high (the walk runs out of data).
@@ -873,7 +787,7 @@ test "bset parse bounds-checks every length field behind a restamped checksum" {
     try testing.expectError(error.Corrupt, BsetView.parse(gpa, bad));
 }
 
-test "TEST-4: a lying record_count is never an allocation authority (count ≤ data_len / 16)" {
+test "TEST-4: a lying record_count is never an allocation authority (count ≤ data_len / RECORD_MIN_LEN)" {
     const gpa = testing.allocator;
     // A 32 B image claiming u32::MAX records with a digest that verifies.
     var img: [BSET_HEADER_LEN]u8 = @splat(0);
@@ -888,15 +802,16 @@ test "TEST-4: a lying record_count is never an allocation authority (count ≤ d
     var empty = try BsetView.parse(gpa, &img);
     defer empty.deinit(gpa);
     try testing.expect(empty.isEmpty());
-    // The bound holds across data lengths: count = data_len/16 + 1 refuses
-    // before the walk, count = data_len/16 reaches it.
-    for ([_]usize{ 16, 17, 31, 32, 160, 1000 }) |data_len| {
+    // The bound holds across data lengths: count = data_len/17 + 1 refuses
+    // before the walk, count = data_len/17 reaches it.
+    try testing.expectEqual(@as(usize, 17), rec.RECORD_MIN_LEN);
+    for ([_]usize{ 17, 18, 33, 34, 170, 1000 }) |data_len| {
         const buf = try gpa.alloc(u8, BSET_HEADER_LEN + data_len);
         defer gpa.free(buf);
         @memset(buf, 0);
         buf[0..BSET_HEADER_LEN].* = img;
         std.mem.writeInt(u32, buf[12..16], @intCast(data_len), .little);
-        std.mem.writeInt(u32, buf[8..12], @intCast(data_len / 16 + 1), .little);
+        std.mem.writeInt(u32, buf[8..12], @intCast(data_len / rec.RECORD_MIN_LEN + 1), .little);
         stampChecksum(buf);
         try testing.expectError(error.Corrupt, BsetView.parse(gpa, buf));
     }
@@ -1279,36 +1194,89 @@ test "forced collision chain resolves by full name and orders cookies like keys"
     try testing.expect(key.lessThan(&key.dentryKey(parent, hash54, 0), &key.dentryKey(parent, hash54, 1)));
 }
 
-test "the real FIND-VS-A predecessor bset image parses byte-for-byte (skipped when the reference checkout is absent)" {
+// ---------------------------------------------------------------------------
+// The FIND-VS-A fixture: a populated predecessor leaf of the shape the
+// reference's capture had (a directory's dentries interleaved with their
+// inodes, Puts and Δtimes, no tombstones), generated deterministically here
+// so the committed bytes under `tests/fixtures/` never depend on the
+// reference's image (decision 0002 §3). `tests/fixtures/README.md` records
+// the recipe.
+// ---------------------------------------------------------------------------
+
+/// The committed fixture's path, relative to the repository root (the test
+/// binary's cwd).
+pub const findvsa_fixture_path = "tests/fixtures/findvsa_pred_bset.v4.bin";
+pub const findvsa_fixture_seed: u64 = 0xF1D5_A000_0000_0004;
+pub const findvsa_fixture_horizon: u64 = 72_220_661;
+/// Files under the fixture's one directory: enough that the leaf is a
+/// real multi-page image (≈ 250 KiB) like the capture's.
+pub const findvsa_fixture_files: usize = 1640;
+
+/// The fixture image: directory ino 2 with `findvsa_fixture_files` children
+/// — one inode Put each, one dentry Put each (seeded hash54 so the keys
+/// hash-shuffle as a real directory's do), and a Δtime on every seventh
+/// inode — all records seq-ascending through one PRNG, memcmp-sorted.
+pub fn findVsAFixtureImage(gpa: Allocator) (BuildError || rec.EncodeError)![]u8 {
+    var prng = std.Random.DefaultPrng.init(findvsa_fixture_seed);
+    const r = prng.random();
+    var recs: std.ArrayList(Record) = .empty;
+    defer freeAll(gpa, &recs);
+    const dir_ino: u64 = 2;
+    var seq: u64 = findvsa_fixture_horizon - 4 * findvsa_fixture_files;
+    var name_buf: [32]u8 = undefined;
+    var dbuf: [64]u8 = undefined;
+    for (0..findvsa_fixture_files) |i| {
+        const ino = dir_ino + 1 + @as(u64, i);
+        const name = std.fmt.bufPrint(&name_buf, "f{d}-{x}", .{ i, r.int(u32) }) catch unreachable;
+        const v: rec.InodeValue = .{ .mode = 0o100644, .uid = 1000, .gid = 1000, .nlink = 1, .size = r.intRangeAtMost(u64, 0, 1 << 30), .atime = seq, .mtime = seq, .ctime = seq };
+        try recs.append(gpa, try Record.put(gpa, &key.inodeKey(ino), seq, &v.encode()));
+        seq += 1;
+        const dv = try (rec.DentryValue{ .child_ino = ino, .file_type = 8, .name = name }).encodeInto(&dbuf);
+        try recs.append(gpa, try Record.put(gpa, &key.dentryKey(dir_ino, key.dentryNameHash54(name, findvsa_fixture_seed), 0), seq, dv));
+        seq += 1;
+        if (i % 7 == 0) {
+            try recs.append(gpa, try Record.delta(gpa, &key.inodeKey(ino), seq, rec.InodeDelta.times(seq, seq)));
+            seq += 1;
+        }
+    }
+    std.mem.sort(Record, recs.items, {}, struct {
+        fn lt(_: void, a: Record, b: Record) bool {
+            return keySeqLess(a.ref(), b.ref());
+        }
+    }.lt);
+    const refs = try gpa.alloc(RecordRef, recs.items.len);
+    defer gpa.free(refs);
+    for (recs.items, refs) |*rr, *o| o.* = rr.ref();
+    return buildBset(gpa, refs, findvsa_fixture_horizon);
+}
+
+test "the committed FIND-VS-A fixture is the generator's bytes; it parses, every key is a v4 inode or dentry key, no tombstones; compaction at the harshest legal tail keeps every live key" {
     const gpa = testing.allocator;
-    const io = testing.io;
-    // The reference lives beside this repo (`~/Source/squeezefs`, read-only
-    // in both venues); the test binary runs from the repository root.
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, "../squeezefs/tests/fixtures/findvsa_pred_bset.bin", gpa, .limited(1 << 20)) catch |e| switch (e) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return e,
-    };
+    const generated = try findVsAFixtureImage(gpa);
+    defer gpa.free(generated);
+    // The pin: the committed file never drifts from the in-tree generator.
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(testing.io, findvsa_fixture_path, gpa, .limited(1 << 20));
     defer gpa.free(bytes);
-    try testing.expectEqual(@as(usize, 255_738), bytes.len);
+    try testing.expectEqualSlices(u8, generated, bytes);
+    try testing.expectEqual(@as(usize, 254_932), bytes.len);
     var view = try BsetView.parse(gpa, bytes);
     defer view.deinit(gpa);
-    try testing.expectEqual(@as(usize, 4334), view.len());
-    try testing.expectEqual(@as(u64, 72_220_661), view.journal_seq_horizon);
-    // Every key is a dentry (16 B) or an inode (8 B) key, `find` locates
-    // itself, and the capture holds no tombstones.
+    try testing.expectEqual(@as(usize, 3515), view.len());
+    try testing.expectEqual(findvsa_fixture_horizon, view.journal_seq_horizon);
     var it = view.iter();
     var i: usize = 0;
-    while (it.next()) |r| : (i += 1) {
-        try testing.expect(r.key.len == key.DENTRY_KEY_LEN or r.key.len == key.INODE_KEY_LEN);
-        try testing.expect(r.kind != .delete);
-        const range = view.find(r.key);
+    while (it.next()) |rr| : (i += 1) {
+        const kind = try key.slotTreeKeyKind(rr.key);
+        try testing.expect(kind == key.TREE_DENTRIES or kind == key.TREE_INODES);
+        try testing.expect(rr.kind != .delete);
+        const range = view.find(rr.key);
         try testing.expect(range.lo <= i and i < range.hi);
     }
-    // Compaction at the real split's durable tail (higher than every input
-    // seq — the harshest legal elision) keeps every live key.
+    // Compaction at a durable tail higher than every input seq (the harshest
+    // legal elision) keeps every live key.
     var out: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &out);
-    try compact(gpa, &.{view}, 76_036_303, &out);
+    try compact(gpa, &.{view}, findvsa_fixture_horizon + 1, &out);
     var distinct: usize = 1;
     for (1..view.len()) |j| {
         if (!std.mem.eql(u8, view.record(j - 1).key, view.record(j).key)) distinct += 1;
@@ -1316,15 +1284,17 @@ test "the real FIND-VS-A predecessor bset image parses byte-for-byte (skipped wh
     try testing.expectEqual(distinct, out.items.len);
 }
 
-test "frame v1: 32 B header, checksum over [0..24), bset at 32, zero pad to a 4 KiB multiple; probe order" {
+test "frame: 40 B header {KBSF, version 1, reserved 0, node_seq, padded_len, bset_len, appender_id, g, xxh3 over [0..32)}, bset at 40, zero pad to a 4 KiB multiple; probe order" {
     const gpa = testing.allocator;
     var recs = [_]Record{ try put(gpa, 1, 1), try put(gpa, 2, 2) };
     defer rec.deinitRecords(gpa, &recs);
     var rbuf: [8]RecordRef = undefined;
     const refs = refsOf(&recs, &rbuf);
     const node_size: usize = 64 * 1024;
-    const frame = try encodeBsetFrame(gpa, .v1, node_size, 0xABCD, refs, 2);
+    const stamp: FrameStamp = .{ .appender_id = 0x0102, .g = 0x0304 };
+    const frame = try encodeBsetFrame(gpa, stamp, node_size, 0xABCD, refs, 2);
     defer gpa.free(frame);
+    try testing.expectEqual(@as(usize, 40), BSET_FRAME_LEN);
     try testing.expectEqual(@as(usize, NODE_PAGE), frame.len);
     try testing.expectEqualStrings("KBSF", frame[0..4]);
     try testing.expectEqualSlices(u8, &.{ 1, 0 }, frame[4..6]);
@@ -1332,88 +1302,62 @@ test "frame v1: 32 B header, checksum over [0..24), bset at 32, zero pad to a 4 
     try testing.expectEqual(@as(u64, 0xABCD), std.mem.readInt(u64, frame[8..16], .little));
     try testing.expectEqual(@as(u32, NODE_PAGE), std.mem.readInt(u32, frame[16..20], .little));
     const bset_len = std.mem.readInt(u32, frame[20..24], .little);
-    try testing.expectEqual(checksum.xxh3(frame[0..24]), std.mem.readInt(u64, frame[24..32], .little));
+    try testing.expectEqualSlices(u8, &.{ 2, 1, 0, 0 }, frame[24..28]);
+    try testing.expectEqualSlices(u8, &.{ 4, 3, 0, 0 }, frame[28..32]);
+    try testing.expectEqual(checksum.xxh3(frame[0..32]), std.mem.readInt(u64, frame[32..40], .little));
     const bset = try buildBset(gpa, refs, 2);
     defer gpa.free(bset);
     try testing.expectEqual(@as(u32, @intCast(bset.len)), bset_len);
-    try testing.expectEqualSlices(u8, bset, frame[32..][0..bset.len]);
-    for (frame[32 + bset.len ..]) |b| try testing.expectEqual(@as(u8, 0), b);
-    try testing.expectEqual(frame.len, appendFrameLen(.v1, bset.len - BSET_HEADER_LEN));
-    try testing.expectEqual(@as(usize, 0), appendFrameLen(.v1, 0));
+    try testing.expectEqualSlices(u8, bset, frame[40..][0..bset.len]);
+    for (frame[40 + bset.len ..]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(frame.len, appendFrameLen(bset.len - BSET_HEADER_LEN));
+    try testing.expectEqual(@as(usize, 0), appendFrameLen(0));
     // The pad is not covered: a torn pad still probes as the frame.
     const torn = try gpa.dupe(u8, frame);
     defer gpa.free(torn);
     torn[torn.len - 1] = 0xFF;
-    const p = probeFrame(torn, 0, 0xABCD, .v1);
+    const p = probeFrame(torn, 0, 0xABCD);
     try testing.expectEqual(@as(usize, NODE_PAGE), p.frame.padded_len);
     try testing.expectEqual(@as(usize, bset.len), p.frame.bset_len);
-    try testing.expectEqual(@as(?FrameStamp, null), p.frame.stamp);
-    try testing.expect(frameGeometryOk(p.frame, 0, node_size, BSET_FRAME_LEN));
+    try testing.expect(p.frame.stamp.eql(stamp));
+    try testing.expect(frameGeometryOk(p.frame, 0, node_size));
     var parsed = try BsetView.parse(gpa, torn[BSET_FRAME_LEN..][0..p.frame.bset_len]);
     defer parsed.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), parsed.len());
     // Probe order: magic ⇒ clean end; checksum ⇒ garbage; version ⇒ garbage;
-    // node_seq ⇒ stale incarnation.
+    // reserved ⇒ garbage; node_seq ⇒ stale incarnation.
     @memcpy(torn, frame);
     torn[0] ^= 0xFF;
-    try testing.expectEqual(FrameProbe.clean_end, probeFrame(torn, 0, 0xABCD, .v1));
+    try testing.expectEqual(FrameProbe.clean_end, probeFrame(torn, 0, 0xABCD));
     @memcpy(torn, frame);
     torn[9] ^= 0x01;
-    try testing.expectEqual(FrameProbe.garbage, probeFrame(torn, 0, 0xABCD, .v1));
-    try testing.expectEqual(FrameProbe.garbage, probeFrame(frame, 0, 0xABCD, .{ .v2 = .{} }));
-    try testing.expectEqual(FrameProbe.stale_incarnation, probeFrame(frame, 0, 0xABCE, .v1));
-    try testing.expectEqual(FrameProbe.stale_incarnation, probeFrame(frame, 0, 0xABCC, .v1));
-    // Reserved is written 0 but not checked: a restamped nonzero reserved
-    // still probes.
+    try testing.expectEqual(FrameProbe.garbage, probeFrame(torn, 0, 0xABCD));
+    @memcpy(torn, frame);
+    torn[4] = 2;
+    std.mem.writeInt(u64, torn[32..40], checksum.xxh3(torn[0..32]), .little);
+    try testing.expectEqual(FrameProbe.garbage, probeFrame(torn, 0, 0xABCD));
+    // Reserved is CHECKED: a restamped non-zero reserved is a verified liar.
     @memcpy(torn, frame);
     torn[6] = 1;
-    std.mem.writeInt(u64, torn[24..32], checksum.xxh3(torn[0..24]), .little);
-    try testing.expect(probeFrame(torn, 0, 0xABCD, .v1) == .frame);
-    // A frame whose bset spills past the 4 KiB page pads to the next.
-    var big: [100]Record = undefined;
-    for (&big, 0..) |*r, idx| r.* = try put(gpa, idx + 1, idx + 1);
-    defer rec.deinitRecords(gpa, &big);
-    var bigbuf: [100]RecordRef = undefined;
-    const big_frame = try encodeBsetFrame(gpa, .v1, node_size, 1, refsOf(&big, &bigbuf), 100);
-    defer gpa.free(big_frame);
-    try testing.expectEqual(@as(usize, 2 * NODE_PAGE), big_frame.len);
-    try testing.expectEqual(big_frame.len, pageAlign(BSET_FRAME_LEN + std.mem.readInt(u32, big_frame[20..24], .little)));
-}
-
-test "frame v2: 40 B header with appender_id ‖ g at [24..32), checksum over [0..32); v1 and v2 are mutually foreign" {
-    const gpa = testing.allocator;
-    var recs = [_]Record{try put(gpa, 1, 1)};
-    defer rec.deinitRecords(gpa, &recs);
-    var rbuf: [8]RecordRef = undefined;
-    const refs = refsOf(&recs, &rbuf);
-    const stamp: FrameStamp = .{ .appender_id = 0x0102, .g = 0x0304 };
-    const frame = try encodeBsetFrame(gpa, .{ .v2 = stamp }, 256 * 1024, 7, refs, 1);
-    defer gpa.free(frame);
-    try testing.expectEqualStrings("KBSF", frame[0..4]);
-    try testing.expectEqualSlices(u8, &.{ 2, 0 }, frame[4..6]);
-    try testing.expectEqualSlices(u8, &.{ 2, 1, 0, 0 }, frame[24..28]);
-    try testing.expectEqualSlices(u8, &.{ 4, 3, 0, 0 }, frame[28..32]);
-    try testing.expectEqual(checksum.xxh3(frame[0..32]), std.mem.readInt(u64, frame[32..40], .little));
-    const bset_len = std.mem.readInt(u32, frame[20..24], .little);
-    // The bset image is identical on v1 and v2 volumes.
-    const v1 = try encodeBsetFrame(gpa, .v1, 256 * 1024, 7, refs, 1);
-    defer gpa.free(v1);
-    try testing.expectEqualSlices(u8, v1[32..][0..bset_len], frame[40..][0..bset_len]);
-    const p = probeFrame(frame, 0, 7, .{ .v2 = stamp });
-    try testing.expect(p.frame.stamp.?.eql(stamp));
-    try testing.expect(frameGeometryOk(p.frame, 0, 256 * 1024, BSET_FRAME_V2_LEN));
-    // A v2 frame on a v1 layout is foreign (and vice versa).
-    try testing.expectEqual(FrameProbe.garbage, probeFrame(frame, 0, 7, .v1));
-    try testing.expectEqual(FrameProbe.garbage, probeFrame(v1, 0, 7, .{ .v2 = stamp }));
-    // The tail-page probe: ours under our stamp, foreign under another, clear otherwise.
-    try testing.expectEqual(TailPage.ours, probeTailPage(frame, 7, .{ .v2 = stamp }));
+    std.mem.writeInt(u64, torn[32..40], checksum.xxh3(torn[0..32]), .little);
+    try testing.expectEqual(FrameProbe.garbage, probeFrame(torn, 0, 0xABCD));
+    try testing.expectEqual(FrameProbe.stale_incarnation, probeFrame(frame, 0, 0xABCE));
+    try testing.expectEqual(FrameProbe.stale_incarnation, probeFrame(frame, 0, 0xABCC));
+    // The verified frame carries its stamp; another stamp is distinguishable.
+    try testing.expect(probeFrame(frame, 0, 0xABCD).frame.stamp.eql(stamp));
     const other: FrameStamp = .{ .appender_id = 9, .g = 0x0304 };
-    try testing.expect(probeTailPage(frame, 7, .{ .v2 = other }).foreign.eql(stamp));
-    try testing.expectEqual(TailPage.clear, probeTailPage(frame, 8, .{ .v2 = stamp }));
-    try testing.expectEqual(TailPage.clear, probeTailPage(frame[0..39], 7, .{ .v2 = stamp }));
-    try testing.expectEqual(TailPage.ours, probeTailPage(v1, 7, .v1));
+    try testing.expect(!probeFrame(frame, 0, 0xABCD).frame.stamp.eql(other));
     // Default stamp is the manager's (0, 0).
     try testing.expect((FrameStamp{}).eql(.{ .appender_id = 0, .g = 0 }));
+    // A frame whose bset spills past the 4 KiB page pads to the next.
+    var big: [100]Record = undefined;
+    for (&big, 0..) |*rr, idx| rr.* = try put(gpa, idx + 1, idx + 1);
+    defer rec.deinitRecords(gpa, &big);
+    var bigbuf: [100]RecordRef = undefined;
+    const big_frame = try encodeBsetFrame(gpa, .{}, node_size, 1, refsOf(&big, &bigbuf), 100);
+    defer gpa.free(big_frame);
+    try testing.expectEqual(@as(usize, 3 * NODE_PAGE), big_frame.len);
+    try testing.expectEqual(big_frame.len, pageAlign(BSET_FRAME_LEN + std.mem.readInt(u32, big_frame[20..24], .little)));
 }
 
 test "frame encoder refuses a record value over the node's cap; geometry refuses impossible shapes" {
@@ -1423,28 +1367,28 @@ test "frame encoder refuses a record value over the node's cap; geometry refuses
     const over = try gpa.alloc(u8, cap + 1);
     defer gpa.free(over);
     @memset(over, 0xAA);
-    try testing.expectError(error.ValueTooLarge, encodeBsetFrame(gpa, .v1, node_size, 1, &.{.{ .key = "k", .seq = 1, .kind = .put, .value = over }}, 1));
-    const fits = try encodeBsetFrame(gpa, .v1, node_size, 1, &.{.{ .key = "k", .seq = 1, .kind = .put, .value = over[0..cap] }}, 1);
+    try testing.expectError(error.ValueTooLarge, encodeBsetFrame(gpa, .{}, node_size, 1, &.{.{ .key = "k", .seq = 1, .kind = .put, .value = over }}, 1));
+    const fits = try encodeBsetFrame(gpa, .{}, node_size, 1, &.{.{ .key = "k", .seq = 1, .kind = .put, .value = over[0..cap] }}, 1);
     defer gpa.free(fits);
-    try testing.expectError(error.EmptyBset, encodeBsetFrame(gpa, .v1, node_size, 1, &.{}, 1));
-    const ok: FrameHeader = .{ .node_seq_at_write = 1, .padded_len = NODE_PAGE, .bset_len = 100, .stamp = null };
-    try testing.expect(frameGeometryOk(ok, 0, node_size, BSET_FRAME_LEN));
-    try testing.expect(frameGeometryOk(ok, node_size - NODE_PAGE, node_size, BSET_FRAME_LEN));
-    try testing.expect(!frameGeometryOk(ok, node_size - NODE_PAGE + 1, node_size, BSET_FRAME_LEN));
-    try testing.expect(!frameGeometryOk(ok, node_size + 1, node_size, BSET_FRAME_LEN));
+    try testing.expectError(error.EmptyBset, encodeBsetFrame(gpa, .{}, node_size, 1, &.{}, 1));
+    const ok: FrameHeader = .{ .node_seq_at_write = 1, .padded_len = NODE_PAGE, .bset_len = 100, .stamp = .{} };
+    try testing.expect(frameGeometryOk(ok, 0, node_size));
+    try testing.expect(frameGeometryOk(ok, node_size - NODE_PAGE, node_size));
+    try testing.expect(!frameGeometryOk(ok, node_size - NODE_PAGE + 1, node_size));
+    try testing.expect(!frameGeometryOk(ok, node_size + 1, node_size));
     var bad = ok;
     bad.padded_len = NODE_PAGE - 1;
-    try testing.expect(!frameGeometryOk(bad, 0, node_size, BSET_FRAME_LEN));
+    try testing.expect(!frameGeometryOk(bad, 0, node_size));
     bad.padded_len = NODE_PAGE + 1;
-    try testing.expect(!frameGeometryOk(bad, 0, node_size, BSET_FRAME_LEN));
+    try testing.expect(!frameGeometryOk(bad, 0, node_size));
     bad = ok;
     bad.bset_len = BSET_HEADER_LEN - 1;
-    try testing.expect(!frameGeometryOk(bad, 0, node_size, BSET_FRAME_LEN));
+    try testing.expect(!frameGeometryOk(bad, 0, node_size));
     bad = ok;
     bad.bset_len = NODE_PAGE - BSET_FRAME_LEN + 1;
-    try testing.expect(!frameGeometryOk(bad, 0, node_size, BSET_FRAME_LEN));
+    try testing.expect(!frameGeometryOk(bad, 0, node_size));
     bad.bset_len = NODE_PAGE - BSET_FRAME_LEN;
-    try testing.expect(frameGeometryOk(bad, 0, node_size, BSET_FRAME_LEN));
+    try testing.expect(frameGeometryOk(bad, 0, node_size));
 }
 
 test "frame screen: the four foreign rules in order; breach class is rules 1 and 4; current-own" {
@@ -1499,7 +1443,7 @@ test "property: bset round-trips under a deterministic PRNG and parse is total o
             std.mem.writeInt(u16, buf[4..6], BSET_VERSION, .little);
             std.mem.writeInt(u16, buf[6..8], 0, .little);
             std.mem.writeInt(u32, buf[12..16], @intCast(len - BSET_HEADER_LEN), .little);
-            if (r.boolean()) std.mem.writeInt(u32, buf[8..12], @intCast(r.intRangeAtMost(usize, 0, (len - BSET_HEADER_LEN) / 16 + 1)), .little);
+            if (r.boolean()) std.mem.writeInt(u32, buf[8..12], @intCast(r.intRangeAtMost(usize, 0, (len - BSET_HEADER_LEN) / rec.RECORD_MIN_LEN + 1)), .little);
             stampChecksum(buf[0..len]);
             if (BsetView.parse(gpa, buf[0..len])) |*v| {
                 var vv = v.*;
@@ -1543,11 +1487,12 @@ test "property: bset round-trips under a deterministic PRNG and parse is total o
         try testing.expectEqual(refs.len, view.len());
         for (refs, 0..) |want, i| try testing.expect(want.eql(view.record(i)));
         // The frame round-trips through the probe.
-        const frame = try encodeBsetFrame(gpa, .{ .v2 = .{ .appender_id = 1, .g = 2 } }, 64 * 1024, 99, refs, seq);
+        const frame = try encodeBsetFrame(gpa, .{ .appender_id = 1, .g = 2 }, 64 * 1024, 99, refs, seq);
         defer gpa.free(frame);
-        const p = probeFrame(frame, 0, 99, .{ .v2 = .{ .appender_id = 1, .g = 2 } });
+        const p = probeFrame(frame, 0, 99);
         try testing.expectEqual(img.len, p.frame.bset_len);
-        try testing.expectEqualSlices(u8, img, frame[BSET_FRAME_V2_LEN..][0..img.len]);
+        try testing.expect(p.frame.stamp.eql(.{ .appender_id = 1, .g = 2 }));
+        try testing.expectEqualSlices(u8, img, frame[BSET_FRAME_LEN..][0..img.len]);
     }
 }
 
@@ -1570,18 +1515,15 @@ fn bsetParseFuzz(_: void, smith: *std.testing.Smith) !void {
             }
         } else |_| {}
     }
-    for ([_]FrameFormat{ .v1, .{ .v2 = .{} } }) |format| {
-        if (len >= format.frameLen()) _ = probeFrame(buf[0..len], 0, 0, format);
-        _ = probeTailPage(buf[0..len], 0, format);
-    }
+    if (len >= BSET_FRAME_LEN) _ = probeFrame(buf[0..len], 0, 0);
 }
 
 test "fuzz: bset parse and the frame probe are total on arbitrary and restamped bytes" {
     try std.testing.fuzz({}, bsetParseFuzz, .{
         .corpus = &.{
             // u32 LE len ‖ bytes: a 32 B header claiming u32::MAX records.
-            &([_]u8{ 32, 0, 0, 0 } ++ [_]u8{ 0x54, 0x45, 0x53, 0x42, 1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF } ++ @as([20]u8, @splat(0))),
-            &([_]u8{ 40, 0, 0, 0 } ++ "KBSF".* ++ [_]u8{ 2, 0, 0, 0 } ++ @as([32]u8, @splat(0))),
+            &([_]u8{ 32, 0, 0, 0 } ++ "BSET".* ++ [_]u8{ 1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF } ++ @as([20]u8, @splat(0))),
+            &([_]u8{ 40, 0, 0, 0 } ++ "KBSF".* ++ [_]u8{ 1, 0, 0, 0 } ++ @as([32]u8, @splat(0))),
         },
     });
 }

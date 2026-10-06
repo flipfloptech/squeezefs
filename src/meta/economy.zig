@@ -1380,14 +1380,15 @@ test "a staged rename builds ONE conveyor queue entry carrying every record in s
     const staged = t.staged.items.len;
     try testing.expectEqual(@as(usize, 5), staged);
     // Consumes the tx: its arena moves into the entry.
-    var q = try tx.buildQueuedTx(&t, .forest, 256 * 1024, null);
+    var q = try tx.buildQueuedTx(&t, 256 * 1024, null);
     defer q.deinit();
     try testing.expectEqual(staged, q.recs.len);
     try testing.expect(q.len <= journal.MAX_ENTRY_LEN);
     try testing.expectEqual(record.RecordKind.delta, q.recs[0].kind);
     try testing.expectEqual(record.RecordKind.delete, q.recs[2].kind);
-    try testing.expectEqual(key.FOREST_DENTRY_KEY_LEN, q.recs[3].key.len);
-    try testing.expectEqualSlices(u8, &out.new_key, (try key.splitForestKey(q.recs[3].key)).legacy.slice());
+    try testing.expectEqual(key.DENTRY_KEY_LEN, q.recs[3].key.len);
+    try testing.expectEqualSlices(u8, &out.new_key, q.recs[3].key);
+    try testing.expectEqual(key.TREE_DENTRIES, try key.slotTreeKeyKind(q.recs[3].key));
     try testing.expectEqual(record.RecordKind.delta, q.recs[4].kind);
 }
 
@@ -1950,7 +1951,7 @@ test "unlink economy burst: N unlink txs + the gathered destroys packed into who
     var start: usize = 0;
     while (start < corpses.items.len) {
         const end = @min(start + fill, corpses.items.len);
-        var payloads: [fill]u64 = @splat(inos.destroyEntryBytes(.flat, 1));
+        var payloads: [fill]u64 = @splat(inos.destroyEntryBytes(1));
         const chunks = try inos.packDestroyEntries(gpa, payloads[0 .. end - start]);
         defer gpa.free(chunks);
         for (chunks) |c| {

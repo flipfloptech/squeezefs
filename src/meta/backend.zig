@@ -15,14 +15,16 @@
 //!    io pool, the volume length.
 //! 3. Both superblock copies (DUR-5: a primary that classifies is
 //!    authoritative; the tail copy serves only when sector 0 errors) →
-//!    v3, no unknown incompat bit, not the symmetric forest (rung 6).
-//! 4. The newest valid ledger slot (none on a v3 volume is corruption).
+//!    format v4 with no capability bit (each of the four names a later
+//!    rung's mechanism).
+//! 4. The newest valid ledger slot (none on a v4 volume is corruption).
 //! 5. The ring replayed from the record's tail (`replayScanImage`: nothing
 //!    inside the window fails loud; torn entries drop and count —
 //!    `replay_dropped_torn > 0` after a CLEAN unmount is the tripwire).
 //! 6. The allocator from the newest A/B pages + the window's deltas.
-//! 7. The node cache over the device loader; every tree the record names
-//!    opened at its root; the two-phase replay into the cache; the
+//! 7. The node cache over the device loader; the one-member forest's two
+//!    trees (the control tree and the native slot tree) opened at the
+//!    record's roots; the two-phase replay into the cache; the
 //!    replayed in-window frees parked (a live root's dropped); `next_ino =
 //!    max(ledger, replayed + 1)`.
 //! 8. The journal core resumed at the recovered head, the registry, the
@@ -52,6 +54,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const counters = @import("../core/counters.zig");
+const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
@@ -92,16 +95,17 @@ pub const KvTree = tree.KvTree;
 pub const Outcome = conveyor.Outcome;
 pub const Error = conveyor.Error;
 
-/// Why a mount refused (loud, typed; the errno table is one row each).
+/// Why a mount refused (loud, typed; each name maps onto the ONE errno
+/// table through `openCoreError`).
 pub const OpenError = error{
     /// Layer A: another writer holds the flock.
     Busy,
     /// Blank superblock: `squeezefs format` first.
     NotFormatted,
-    /// A format-v2 volume: reformat required.
+    /// A pre-v4 volume: reformat required.
     LegacyFormat,
-    /// Unknown incompat bits / the symmetric forest (rung 6): reformat or
-    /// a later binary.
+    /// Unknown incompat bits, or a capability bit of a later rung: reformat
+    /// or a later binary.
     UnsupportedFormat,
     /// Corruption outside the replay window (no ledger record, a root that
     /// does not verify, a malformed allocator delta).
@@ -113,13 +117,21 @@ pub const OpenError = error{
     ThreadSpawnFailed,
 };
 
-pub fn openErrno(e: OpenError) linux.E {
+/// The mount refusals onto the ONE error set: the guard is `Busy`; a volume
+/// this binary does not mount is `UnsupportedVolume` (EINVAL); a device the
+/// io plane refuses is its `DirectOpenRefused`; everything broken is EIO.
+pub fn openCoreError(e: OpenError) errors.Error {
     return switch (e) {
-        error.Busy => .BUSY,
-        error.NotFormatted, error.LegacyFormat, error.UnsupportedFormat => .INVAL,
-        error.Corrupt, error.Io, error.DeviceRefused, error.LaneSpawnFailed, error.ThreadSpawnFailed => .IO,
-        error.OutOfMemory => .NOMEM,
+        error.Busy => error.Busy,
+        error.NotFormatted, error.LegacyFormat, error.UnsupportedFormat => error.UnsupportedVolume,
+        error.DeviceRefused => error.DirectOpenRefused,
+        error.Corrupt, error.Io, error.LaneSpawnFailed, error.ThreadSpawnFailed => error.InputOutput,
+        error.OutOfMemory => error.OutOfMemory,
     };
+}
+
+pub fn openErrno(e: OpenError) linux.E {
+    return errors.toErrno(openCoreError(e));
 }
 
 pub const Stats = struct {
@@ -181,12 +193,13 @@ pub const FormatOptions = struct {
     pool: ?*uring_fs.Pool = null,
     node_size: u64 = superblock.default_node_size,
     journal_len_override: ?u64 = null,
-    class: geometry.FormatClass = .single_writer,
+    /// Per-volume identity (the CLI mints it from `Io.randomSecure`).
     uuid: [16]u8,
-    set_uuid: [16]u8,
+    /// The set's identity (`geometry.mintSetIdentity` for a new set; the
+    /// first member's for a joiner).
+    set: geometry.SetIdentity,
     root_uid: u32 = 0,
     root_gid: u32 = 0,
-    format_config_xattr: ?[]const u8 = null,
 };
 
 pub const FormatError = error{ DeviceRefused, Io, OutOfMemory, Corrupt, VolumeTooSmall, InvalidNodeSize, InvalidJournalOverride, CannotStat, NotADeviceOrFile, Unexpected };
@@ -205,12 +218,10 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
     var plan = format.planFormat(gpa, volume_len, .{
         .node_size = opts.node_size,
         .journal_len_override = opts.journal_len_override,
-        .class = opts.class,
         .uuid = opts.uuid,
-        .set_uuid = opts.set_uuid,
+        .set = opts.set,
         .root_uid = opts.root_uid,
         .root_gid = opts.root_gid,
-        .format_config_xattr = opts.format_config_xattr,
     }, &diag) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.VolumeTooSmall => error.VolumeTooSmall,
@@ -220,7 +231,7 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
     };
     defer plan.deinit();
     try dev.writeSteps(plan.steps);
-    log.info("formatted {s}: {d} B, node {d} B, journal {d} B, {d} extents, class {s}", .{ path, volume_len, opts.node_size, plan.superblock.journal.len, plan.superblock.totalExtents(), @tagName(plan.class) });
+    log.info("formatted {s}: format v4 one-member forest, {d} B, node {d} B, journal {d} B, {d} extents", .{ path, volume_len, opts.node_size, plan.superblock.journal.len, plan.superblock.totalExtents() });
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +249,7 @@ pub const KvBackend = struct {
     pool: *uring_fs.Pool,
     pool_owned: bool,
     volume_len: u64,
-    sb: superblock.SuperblockV3,
+    sb: superblock.Superblock,
     /// The mounted record (its stamp rides every checkpoint record).
     mounted: ledger.LedgerRecord,
     dev: device_loader.DeviceLoader,
@@ -294,7 +305,7 @@ pub const KvBackend = struct {
         // 3. The superblock, both copies.
         const sector0 = try dev.readRange(gpa, 0, superblock.sector_len);
         defer gpa.free(sector0);
-        const backup: ?[]u8 = if (superblock.backupOffset(volume_len)) |off| try dev.readRange(gpa, off, superblock.sector_len) else null;
+        const backup: ?[]u8 = if (superblock.backupOffsetFor(volume_len)) |off| try dev.readRange(gpa, off, superblock.sector_len) else null;
         defer if (backup) |b| gpa.free(b);
         var sb_diag: superblock.Refusal = undefined;
         const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &sb_diag) catch {
@@ -309,19 +320,22 @@ pub const KvBackend = struct {
                 log.err("{s} is not formatted (zeroed superblock) — run `squeezefs format` first", .{path});
                 return error.NotFormatted;
             },
-            .v2_legacy => {
-                log.err("{s} is a legacy format-v2 volume — v2 support was removed; reformat required", .{path});
+            .legacy => |v| {
+                log.err("{s} is a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required", .{ path, v });
                 return error.LegacyFormat;
             },
-            .v3 => |s| s,
+            .v4 => |s| s,
         };
         if (classified.slot == .backup) log.err("{s}: sector 0 is unreadable — mounting from the redundant superblock copy; investigate the device", .{path});
         if (sb.unknownIncompat() != 0) {
             log.err("{s}: unknown incompat feature bits {x} — this binary cannot mount it (reformat required)", .{ path, sb.unknownIncompat() });
             return error.UnsupportedFormat;
         }
-        if (sb.symmetricForestStamped()) {
-            log.err("{s}: a symmetric-forest volume (bit 17) — the forest mount lands with rung 6; this rung mounts the --single-writer class", .{path});
+        if (sb.features_incompat != 0) {
+            // The four capability bits each name a mechanism of a later
+            // rung (the symmetric plane, layout deltas, the block-map tree,
+            // the volume lifecycle); this rung mounts the one-member forest.
+            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat });
             return error.UnsupportedFormat;
         }
         dev.ledger_base = sb.root_ledger.start;
@@ -331,7 +345,7 @@ pub const KvBackend = struct {
         const ledger_img = try dev.readRange(gpa, sb.root_ledger.start, @intCast(sb.root_ledger.len));
         defer gpa.free(ledger_img);
         var mounted = (try ledger.newestValid(gpa, ledger_img)) orelse {
-            log.err("{s}: no valid root-ledger record in any of the 32 slots — the volume carries a v3 superblock, so this is corruption, not a fresh format", .{path});
+            log.err("{s}: no valid root-ledger record in any of the 32 slots — the volume carries a v4 superblock, so this is corruption, not a fresh format", .{path});
             return error.Corrupt;
         };
         errdefer mounted.deinit(gpa);
@@ -341,7 +355,7 @@ pub const KvBackend = struct {
         const geo = journal.productionGeometry(ring_layout.pages, mode.grain());
         const ring_img = try dev.readRange(gpa, ring_layout.base, @intCast(ring_layout.ringBytes()));
         defer gpa.free(ring_img);
-        var recovery = try journal.replayScanImage(gpa, ring_img, geo, mounted.journal_tail_seq, journal.ROOT_AUTHORITY_WRITER);
+        var recovery = try journal.replayScanImage(gpa, ring_img, geo, mounted.journal_tail_seq, journal.FIXED_RING_APPENDER);
         defer recovery.deinit();
         const clean_unmount = recovery.entries.len == 0 and recovery.head_pos == mounted.journal_tail_seq;
         journal.noteReplay(&recovery, clean_unmount);
@@ -411,8 +425,10 @@ pub const KvBackend = struct {
             for (trees.items) |t| t.destroy();
             trees.deinit(gpa);
         }
+        // The one-member forest: the control tree and the native slot tree,
+        // both named by the ledger (a guest slot tree's root is tree 0's).
         for (be.mounted.tree_roots) |r| {
-            const t = KvTree.openFromLedger(gpa, be.cache, &be.mounted, r.tree_id, &be.seq) catch |e| switch (e) {
+            const t = KvTree.openFromLedger(gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Io => return error.Io,
                 else => return error.Corrupt,
@@ -450,9 +466,9 @@ pub const KvBackend = struct {
             }
             _ = try be.alloc.parkReplayedFrees(roots_buf[0..n]);
         }
-        var fold: inos.RecoveryFold = .{};
+        var fold: inos.RecoveryFold = .{ .native_slot = mounted.membership_stamp.native_slot };
         defer fold.deinit(gpa);
-        fold.foldEntries(gpa, .flat, recovery.entries) catch |e| switch (e) {
+        fold.foldEntries(gpa, recovery.entries) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Corrupt => return error.Corrupt,
         };
@@ -532,14 +548,13 @@ pub const KvBackend = struct {
             .reg = &be.reg,
             .ring_layout = ring_layout,
             .geo = geo,
-            .writer_id = journal.ROOT_AUTHORITY_WRITER,
+            .appender_id = journal.FIXED_RING_APPENDER,
             .latch = &be.lane.latch,
             .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier },
             .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
             .smo_journal = &be.smo_journal,
             .caps = conveyor.resolveCaps(opts.env, cpus, geo),
             .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
-            .framing = .flat,
         });
         errdefer be.cv.deinit();
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
@@ -585,7 +600,7 @@ pub const KvBackend = struct {
     /// read-modify-write at open, nothing in flight) so the first
     /// reservation begins aligned.
     fn alignRingHead(be: *KvBackend) OpenError!void {
-        var plan = (journal.planHeadAlignment(be.gpa, &be.core, &be.reg, be.ring_layout, journal.ROOT_AUTHORITY_WRITER) catch |e| switch (e) {
+        var plan = (journal.planHeadAlignment(be.gpa, &be.core, &be.reg, be.ring_layout, journal.FIXED_RING_APPENDER) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.JournalReserveExhausted => {
                 log.err("meta volume {s}: the recovered journal head stands mid-sector and the ring admits not even its pad — refusing the mount (the checkpoint-cycle deferral of the pad lands with the covering loop)", .{be.path});
@@ -639,7 +654,7 @@ pub const KvBackend = struct {
 
     fn treeRootsFn(ctx: *anyopaque, gpa: Allocator, out: *std.ArrayList(ledger.TreeRoot)) Allocator.Error!void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        for (be.trees) |t| try out.append(gpa, t.ledgerRoot());
+        for (be.trees) |t| if (t.ledgerRoot()) |r| try out.append(gpa, r);
     }
 
     /// The threshold drain's source: the trees' queues, round-robin from
@@ -822,14 +837,19 @@ pub const KvBackend = struct {
         for (txs) |t| be.gpa.destroy(t);
     }
 
-    pub fn treeOf(be: *KvBackend, tree_id: u8) ?*KvTree {
-        for (be.trees) |t| if (t.tree_id == tree_id) return t;
+    pub fn treeOf(be: *KvBackend, identity: tree.TreeIdentity) ?*KvTree {
+        for (be.trees) |t| if (t.identity.eql(identity)) return t;
         return null;
     }
 
+    /// The tree a `(kind, key)` routes to (`tree.route`, the ONE law).
+    fn treeForKey(be: *KvBackend, kind: u8, k: []const u8) ?*KvTree {
+        return tree.routeContent(be.trees, kind, k);
+    }
+
     /// Point lookup through the tree (latch-free); an owned copy.
-    pub fn lookup(be: *KvBackend, gpa: Allocator, tree_id: u8, k: []const u8) Error!?[]u8 {
-        const t = be.treeOf(tree_id) orelse return error.Corrupt;
+    pub fn lookup(be: *KvBackend, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
+        const t = be.treeForKey(kind, k) orelse return error.Corrupt;
         return t.lookup(gpa, k) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
@@ -837,8 +857,11 @@ pub const KvBackend = struct {
         };
     }
 
-    pub fn range(be: *KvBackend, gpa: Allocator, tree_id: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
-        const t = be.treeOf(tree_id) orelse return error.Corrupt;
+    /// Range scan over `[start, end]` of one kind; both bounds route to the
+    /// same slot tree (a slot IS a contiguous key range).
+    pub fn range(be: *KvBackend, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        const t = be.treeForKey(kind, start) orelse return error.Corrupt;
+        if (be.treeForKey(kind, end) != t) return error.Corrupt;
         t.range(gpa, start, end, max, out) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
@@ -925,27 +948,23 @@ pub const KvBackend = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Tests (Linux; regular files on the venue's ext4 under /build/tmp, O_DIRECT;
-// the reference `fsck --offline` as the oracle when present).
+// Tests (Linux; regular files on the venue's ext4 under /build/tmp, O_DIRECT).
+// The oracle is OUR invariants: every acked record present after a reopen,
+// replay ≡ RAM, a clean unmount's empty window, the torn tripwire at 0.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const economy = @import("economy.zig");
 
 const test_dir = "/build/tmp";
-const ref_binary = "/build/ref/squeezefs";
 const test_volume_len: u64 = 64 << 20;
-/// The data image the format config names (the reference's fsck resolves
-/// `data_lv` from the config; an existing file keeps it quiet).
-const test_data_image = "/build/tmp/ref-sw-data.img";
+const test_set: geometry.SetIdentity = .{ .set_uuid = "kv-backend-set!!".*, .hash_seed = 0x5EED_CAFE_F00D_D00D };
 
 const TestVol = struct {
     gpa: Allocator,
     env: std.process.Environ.Map,
     path_buf: [128]u8 = undefined,
     path_len: usize = 0,
-    config_buf: [512]u8 = undefined,
-    config_len: usize = 0,
     /// Error logs the lane thread will emit (the FAILED latch's one line).
     lane_error_logs: usize = 0,
 
@@ -953,7 +972,7 @@ const TestVol = struct {
         return self.path_buf[0..self.path_len];
     }
 
-    /// A fresh `--single-writer` volume formatted through the device path.
+    /// A fresh one-member forest formatted through the device path.
     fn create(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8) !*TestVol {
         return createWithRing(gpa, name, flush_ms, 1 << 20);
     }
@@ -968,14 +987,12 @@ const TestVol = struct {
         _ = linux.mkdirat(linux.AT.FDCWD, try align_probe.pathZ(&zbuf, test_dir), 0o755);
         self.path_len = (try std.fmt.bufPrint(&self.path_buf, "{s}/sqz-be-{d}-{s}.img", .{ test_dir, linux.getpid(), name })).len;
         try truncateFile(self.path(), test_volume_len);
-        self.config_len = (try std.fmt.bufPrint(&self.config_buf, "{{\"name\":\"squeezefs\",\"block_size\":4194304,\"capacity\":67108864,\"inodes\":1000000,\"compression\":\"none\",\"encrypt_algo\":\"none\",\"data_lv\":[\"{s}\"],\"upload_delay\":\"500ms\",\"meta_routing_width\":65536,\"meta_slot_runs\":[[[0,1,65536]]],\"meta_volumes\":[{{\"id\":\"vol-{x}\",\"backing_dev\":\"{s}\",\"member_position\":0,\"added_ts\":1791205148}}]}}", .{ test_data_image, @as(u32, @intCast(linux.getpid())), self.path() })).len;
         try formatVolume(gpa, self.path(), .{
             .env = &self.env,
             .node_size = 65536,
             .journal_len_override = journal_len,
             .uuid = "kv-backend-uuid!".*,
-            .set_uuid = "kv-backend-set!!".*,
-            .format_config_xattr = self.config_buf[0..self.config_len],
+            .set = test_set,
         });
         return self;
     }
@@ -1011,31 +1028,12 @@ fn unlinkPath(path: []const u8) void {
     } else |_| {}
 }
 
-fn fileExists(path: []const u8) bool {
-    return (align_probe.statPath(path) catch null) != null;
-}
-
-/// The oracle: `fsck --offline` on the image; null when the reference is
-/// absent (the test skips).
-fn fsckClean(gpa: Allocator, path: []const u8) !?bool {
-    if (!fileExists(ref_binary)) return null;
-    var uri_buf: [256]u8 = undefined;
-    const uri = try std.fmt.bufPrint(&uri_buf, "sqmeta://{s}", .{path});
-    const r = try std.process.run(gpa, testing.io, .{ .argv = &.{ ref_binary, "fsck", "--offline", uri }, .cwd = .{ .path = test_dir } });
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
-    unlinkPath(test_dir ++ "/dhat-heap.json");
-    const clean = r.term.success() and std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") != null;
-    if (!clean) std.debug.print("\nfsck {s}: term {f}\n--- stdout ---\n{s}\n--- stderr (tail) ---\n{s}\n", .{ path, r.term, r.stdout, r.stderr[r.stderr.len -| 2048..] });
-    return clean;
-}
-
 /// One create under the root through `economy.stageCreate`; the ino.
 fn stageCreate(be: *KvBackend, t: *KvTx, name: []const u8, value_len: usize) !u64 {
     const ino = be.allocateIno();
     const parent_value: record.InodeValue = .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2 };
     // The dentry names the GLOBAL ino (charter §5.4: `(local − 2)·W + slot
-    // + 2`, slot 0 on the single volume) — what the reference fsck resolves.
+    // + 2`, slot 0 on the single volume).
     _ = try economy.stageCreate(t, .{ .hash_seed = be.hashSeed(), .now = 1000, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = ino, .global_ino = inos.makeGlobalIno(ino, 0, inos.ROUTING_WIDTH) });
     if (value_len > 0) {
         const v = try be.gpa.alloc(u8, value_len);
@@ -1069,16 +1067,24 @@ fn dentryPresent(be: *KvBackend, name: []const u8) !bool {
     return kvs.items.len != 0;
 }
 
-test "format (device path) → open → N creates (singles + a group of 8) → lookup each → checkpointNow → close → reopen: every record present, a clean unmount, fsck clean" {
+test "format (device path) → open → N creates (singles + a group of 8) → lookup each → checkpointNow → close → reopen: every record present, a clean unmount; the mount is the one-member forest" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "e2e", null);
     defer v.destroy();
-    if (try fsckClean(gpa, v.path())) |clean| try testing.expect(clean);
     var acked: [24]u64 = undefined;
     {
         const be = try v.open();
         try testing.expect(be.replayStats().clean_unmount);
         try testing.expectEqual(@as(u64, 0), be.replayStats().entries);
+        // The forest shape: the control tree and the native slot tree,
+        // features 0, the stamp the format wrote.
+        try testing.expectEqual(@as(usize, 2), be.trees.len);
+        try testing.expect(be.treeOf(.control) != null);
+        try testing.expect(be.treeOf(.native) != null);
+        try testing.expectEqual(@as(u64, 0), be.sb.features_incompat);
+        try testing.expectEqualSlices(u8, &test_set.set_uuid, &be.mounted.membership_stamp.set_uuid);
+        try testing.expectEqual(test_set.hash_seed, be.hashSeed());
+        try testing.expectEqual(@as(?u16, 0), be.mounted.membership_stamp.native_slot);
         var i: usize = 0;
         while (i < 16) : (i += 1) {
             var nb: [16]u8 = undefined;
@@ -1118,8 +1124,12 @@ test "format (device path) → open → N creates (singles + a group of 8) → l
         for (acked) |ino| try testing.expect(try present(be, ino));
         try testing.expect(be.nextIno() > acked[23]);
         try testing.expect(try dentryPresent(be, "group-7"));
+        // The restated ledger record carries the stamp and both roots.
+        try testing.expectEqual(@as(usize, 2), be.mounted.tree_roots.len);
+        try testing.expect(be.mounted.root(.control) != null);
+        try testing.expect(be.mounted.root(.native_slot) != null);
+        try testing.expectEqualSlices(u8, &test_set.set_uuid, &be.mounted.membership_stamp.set_uuid);
     }
-    if (try fsckClean(gpa, v.path())) |clean| try testing.expect(clean);
 }
 
 test "the single-writer guard: a second open of a held volume refuses Busy loud; a closed volume opens again" {
@@ -1224,14 +1234,55 @@ test "rollback on the device: a synthetically failed window answers JournalWrite
 
 /// Snapshot the device image to `dst` (a power cut: the device's landed
 /// bytes, nothing in any cache).
+/// The cut: a copy of the live image holding every write that COMPLETED
+/// before this instant (the kill -9 model: a completed O_DIRECT write
+/// survives the process). `fdatasync` first — ext4 completes a direct write
+/// into a sparse file's unwritten extent before converting the extent, and
+/// until the conversion lands a concurrent reader of the range sees zeros —
+/// then O_DIRECT reads, never the page cache of a direct-written file
+/// (open(2): the two must not mix on one file).
 fn snapshotImage(src: []const u8, dst: []const u8) !void {
-    try std.Io.Dir.copyFileAbsolute(src, dst, testing.io, .{});
+    var zsrc: [linux.PATH_MAX]u8 = undefined;
+    const src_z = try align_probe.pathZ(&zsrc, src);
+    const src_rc = linux.open(src_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECT = true }, 0);
+    if (linux.errno(src_rc) != .SUCCESS) return error.CannotOpenSource;
+    const src_fd: linux.fd_t = @intCast(src_rc);
+    defer _ = linux.close(src_fd);
+    if (linux.errno(linux.fdatasync(src_fd)) != .SUCCESS) return error.SnapshotSyncFailed;
+    var zdst: [linux.PATH_MAX]u8 = undefined;
+    const dst_z = try align_probe.pathZ(&zdst, dst);
+    const dst_rc = linux.open(dst_z, .{ .ACCMODE = .WRONLY, .CLOEXEC = true, .CREAT = true, .TRUNC = true }, 0o644);
+    if (linux.errno(dst_rc) != .SUCCESS) return error.CannotCreateSnapshot;
+    const dst_fd: linux.fd_t = @intCast(dst_rc);
+    defer _ = linux.close(dst_fd);
+    const chunk = 1 << 20;
+    const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), chunk);
+    defer std.heap.page_allocator.free(buf);
+    var off: u64 = 0;
+    while (true) {
+        const got = linux.pread(src_fd, buf.ptr, chunk, @intCast(off));
+        if (linux.errno(got) != .SUCCESS) return error.SnapshotReadFailed;
+        if (got == 0) break;
+        var written: usize = 0;
+        while (written < got) {
+            const w = linux.pwrite(dst_fd, buf.ptr + written, got - written, @intCast(off + written));
+            if (linux.errno(w) != .SUCCESS) return error.SnapshotWriteFailed;
+            written += w;
+        }
+        off += got;
+    }
+    if (linux.errno(linux.fdatasync(dst_fd)) != .SUCCESS) return error.SnapshotSyncFailed;
 }
 
 const CutCtx = struct {
     src: []const u8,
     dst: []const u8,
     fired: std.atomic.Value(u32) = .init(0),
+    /// Acks the committer had received when the cut was taken (release by
+    /// the committer after each ack, acquire here): the cut must hold
+    /// exactly these; later acks are not owed.
+    acked: *const std.atomic.Value(usize),
+    acked_at_cut: usize = 0,
 
     fn hook(self: *CutCtx) node_cache.Hook {
         return .{ .ctx = self, .call = call };
@@ -1240,6 +1291,7 @@ const CutCtx = struct {
     fn call(ctx: *anyopaque) void {
         const self: *CutCtx = @ptrCast(@alignCast(ctx));
         if (self.fired.swap(1, .acq_rel) != 0) return;
+        self.acked_at_cut = self.acked.load(.acquire);
         snapshotImage(self.src, self.dst) catch |e| {
             log.warn("cut snapshot failed: {s}", .{@errorName(e)});
         };
@@ -1248,8 +1300,9 @@ const CutCtx = struct {
 
 const Cut = enum { after_ack_before_barrier, before_ledger, after_ledger, before_smo_entry };
 
-/// One row of the kill matrix: the cut's image reopened — every acked
-/// (coalesced: landed) tx present whole, no partial tx, fsck clean.
+/// One row of the kill matrix: the cut's image reopened — every tx acked
+/// (coalesced: landed) BEFORE the cut present whole, no partial tx anywhere,
+/// the watermark the DUR-8c law's.
 fn killMatrixRow(gpa: Allocator, cut: Cut) !void {
     var name_buf: [32]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "cut-{s}", .{@tagName(cut)});
@@ -1258,7 +1311,8 @@ fn killMatrixRow(gpa: Allocator, cut: Cut) !void {
     var dst_buf: [160]u8 = undefined;
     const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
     defer unlinkPath(dst);
-    var ctx: CutCtx = .{ .src = v.path(), .dst = dst };
+    var acked_n: std.atomic.Value(usize) = .init(0);
+    var ctx: CutCtx = .{ .src = v.path(), .dst = dst, .acked = &acked_n };
     defer test_seams = .{};
     var acked: std.ArrayList(u64) = .empty;
     defer acked.deinit(gpa);
@@ -1275,6 +1329,7 @@ fn killMatrixRow(gpa: Allocator, cut: Cut) !void {
             const n = try std.fmt.allocPrint(gpa, "base-{d}", .{i});
             try names.append(gpa, n);
             try acked.append(gpa, try commitCreate(be, n));
+            acked_n.store(acked.items.len, .release);
         }
         try be.checkpointNow();
         // Armed AFTER the durable baseline: the cut falls inside the window
@@ -1291,8 +1346,10 @@ fn killMatrixRow(gpa: Allocator, cut: Cut) !void {
                     const n = try std.fmt.allocPrint(gpa, "win-{d}", .{i});
                     try names.append(gpa, n);
                     try acked.append(gpa, try commitCreate(be, n));
+                    acked_n.store(acked.items.len, .release);
                 }
                 minted_max = be.nextIno() - 1;
+                ctx.acked_at_cut = acked.items.len;
                 try snapshotImage(v.path(), dst);
             },
             .before_ledger, .after_ledger => {
@@ -1300,52 +1357,62 @@ fn killMatrixRow(gpa: Allocator, cut: Cut) !void {
                     const n = try std.fmt.allocPrint(gpa, "win-{d}", .{i});
                     try names.append(gpa, n);
                     try acked.append(gpa, try commitCreate(be, n));
+                    acked_n.store(acked.items.len, .release);
                 }
                 minted_max = be.nextIno() - 1;
                 try be.checkpointNow();
                 try testing.expectEqual(@as(u32, 1), ctx.fired.load(.acquire));
+                try testing.expectEqual(acked.items.len, ctx.acked_at_cut);
             },
             .before_smo_entry => {
-                // Overflow the xattr leaf (64 KiB nodes): ~20 × 4 KiB values
-                // force a split at the flush.
+                // 4 KiB xattr values per create push the native leaf past
+                // its in-place log: the threshold drain replaces it
+                // mid-stream (the first SMO entry — the cut), the flush
+                // replaces again. Commits acked after the cut are not owed.
                 for (0..24) |i| {
                     const n = try std.fmt.allocPrint(gpa, "big-{d}", .{i});
                     try names.append(gpa, n);
                     const t = try be.begin(@src());
                     try acked.append(gpa, try stageCreate(be, t, n, 4000));
                     try be.commit(t);
+                    acked_n.store(acked.items.len, .release);
                 }
                 minted_max = be.nextIno() - 1;
                 try be.checkpointNow();
                 try testing.expectEqual(@as(u32, 1), ctx.fired.load(.acquire));
+                try testing.expect(ctx.acked_at_cut > 8);
             },
         }
         // The live mount goes on (the kill is the copy); close it cleanly so
         // the live image is itself consistent.
         be.close();
     }
-    // Reopen the CUT image.
+    // Reopen the CUT image: every tx acked before the cut is present whole.
     const copy = try KvBackend.open(gpa, testing.io, dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
     defer copy.close();
-    for (acked.items, names.items) |ino, n| {
+    const owed = ctx.acked_at_cut;
+    for (acked.items[0..owed], names.items[0..owed]) |ino, n| {
         try testing.expect(try present(copy, ino));
         try testing.expect(try dentryPresent(copy, n));
     }
-    try testing.expect(copy.nextIno() > minted_max);
-    // A partial tx never shows: every dentry's child inode is present.
+    // DUR-8c: `max(ledger, replayed + 1)` — above every ino the cut holds and
+    // never beyond the next one the live mount minted (a dentry's GLOBAL
+    // child ino is routed back to its local before it feeds the watermark).
+    try testing.expect(copy.nextIno() > acked.items[owed - 1]);
+    try testing.expect(copy.nextIno() <= minted_max + 1);
+    // A partial tx never shows: every dentry present names a present inode,
+    // and nothing beyond the acks is there.
     var kvs: std.ArrayList(tree.KeyValue) = .empty;
     defer tree.deinitKeyValues(gpa, &kvs);
     const lo = key.dentryKey(1, 0, 0);
     const hi = key.dentryKey(1, std.math.maxInt(u64) >> 10, std.math.maxInt(u8));
     try copy.range(gpa, key.TREE_DENTRIES, &lo, &hi, 1024, &kvs);
-    try testing.expectEqual(acked.items.len, kvs.items.len);
+    try testing.expect(kvs.items.len >= owed and kvs.items.len <= acked.items.len);
     for (kvs.items) |kv| {
         const dv = try record.DentryValue.decode(kv.value);
         try testing.expect(try present(copy, inos.routeIno(dv.child_ino, inos.ROUTING_WIDTH).local));
     }
-    const verdict = try fsckClean(gpa, dst);
-    if (verdict) |clean| try testing.expect(clean);
-    std.debug.print("\nkill matrix: cut {s} → reopened {d} acked txs whole, next_ino {d} > {d}, replay entries {d}, torn dropped {d}; fsck {s}\n", .{ @tagName(cut), acked.items.len, copy.nextIno(), minted_max, copy.replayStats().entries, copy.replayStats().dropped_torn, if (verdict) |c| (if (c) "clean" else "FINDINGS") else "absent" });
+    std.debug.print("\nkill matrix: cut {s} → reopened {d} of {d} acked txs whole ({d} owed), next_ino {d} ≤ {d}, replay entries {d}, torn dropped {d}\n", .{ @tagName(cut), kvs.items.len, acked.items.len, owed, copy.nextIno(), minted_max + 1, copy.replayStats().entries, copy.replayStats().dropped_torn });
 }
 
 test "kill matrix: after ack before the barrier (coalesced) — the landed entries replay whole" {
@@ -1364,7 +1431,7 @@ test "kill matrix: mid-SMO entry — the swap happened, the entry never landed; 
     try killMatrixRow(testing.allocator, .before_smo_entry);
 }
 
-test "4-thread commit storm with concurrent checkpoints, then reopen: every ack present, identities close at quiesce, fsck clean" {
+test "4-thread commit storm with concurrent checkpoints, then reopen: every ack present, identities close at quiesce" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "storm", "20");
     defer v.destroy();
@@ -1406,7 +1473,6 @@ test "4-thread commit storm with concurrent checkpoints, then reopen: every ack 
         try testing.expect(be.replayStats().clean_unmount);
         for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
     }
-    if (try fsckClean(gpa, v.path())) |clean| try testing.expect(clean);
 }
 
 test "threshold writeback on a mounted volume: commits that push one leaf over the writeback threshold are drained by the checkpoint task — the bset page is appended before any cadence cycle, the tree's queue empties, queue_full stays 0" {
@@ -1417,7 +1483,7 @@ test "threshold writeback on a mounted volume: commits that push one leaf over t
     defer v.destroy();
     const be = try v.open();
     defer be.close();
-    const xattrs = be.treeOf(key.TREE_XATTRS).?;
+    const native = be.treeOf(.native).?;
     const items0 = checkpoint.stats.meta_kv_maintenance_items.load();
     const appends0 = device_loader.stats.appends.load();
     const checkpoints0 = checkpoint.stats.meta_kv_checkpoints.load();
@@ -1432,7 +1498,7 @@ test "threshold writeback on a mounted volume: commits that push one leaf over t
     }
     // The task drains on its own thread; the bound is a failure, not a wait.
     const started = clock.monotonicNs();
-    while (xattrs.maintenancePending() or checkpoint.stats.meta_kv_maintenance_items.load() == items0) {
+    while (native.maintenancePending() or checkpoint.stats.meta_kv_maintenance_items.load() == items0) {
         if (clock.monotonicNs() - started > 10 * std.time.ns_per_s) return error.ThresholdDrainNeverRan;
         std.Thread.yield() catch {};
     }
@@ -1531,7 +1597,7 @@ fn ledgerLineCount(gpa: Allocator, path: []const u8) !usize {
     return std.mem.count(u8, buf[0..got], "\n");
 }
 
-test "kill -9: a child mid-commit-stream is SIGKILLed; the reopened volume holds every ledger-acked create whole, next_ino is above every minted ino, fsck is clean, the torn tripwire never fires" {
+test "kill -9: a child mid-commit-stream is SIGKILLed; the reopened volume holds every ledger-acked create whole, next_ino is above every minted ino, the torn tripwire never fires" {
     const gpa = testing.allocator;
     const idx = childTestIndex() orelse return error.SkipZigTest;
     const exe = "/proc/self/exe";
@@ -1593,9 +1659,7 @@ test "kill -9: a child mid-commit-stream is SIGKILLed; the reopened volume holds
         try testing.expect(!be.replayStats().clean_unmount or be.replayStats().entries == 0);
         const rs = be.replayStats();
         be.close();
-        const verdict = try fsckClean(gpa, v.path());
-        if (verdict) |clean| try testing.expect(clean);
-        std.debug.print("\nkill -9 round: {d} acked creates present after SIGKILL; replay {d} entries, {d} torn dropped, next_ino > {d}; fsck {s}\n", .{ acked_n, rs.entries, rs.dropped_torn, max_ino, if (verdict) |c| (if (c) "clean" else "FINDINGS") else "absent" });
+        std.debug.print("\nkill -9 round: {d} acked creates present after SIGKILL; replay {d} entries, {d} torn dropped, next_ino > {d}\n", .{ acked_n, rs.entries, rs.dropped_torn, max_ino });
     }
     try testing.expectEqual(tripwire0, journal.replay_dropped_after_clean_unmount.load());
 }

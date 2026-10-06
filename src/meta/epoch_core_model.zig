@@ -1,10 +1,9 @@
-//! Explorer models of the revalidation pair and the append gate
-//! (`epoch_core.zig`; survey §3.2; the loom models `epoch_core_*` in the
-//! reference's `loom-models/src/lib.rs`).
+//! Explorer models of the revalidation pair (`epoch_core.zig`; survey §3.2;
+//! the loom models `epoch_core_*` in the reference's
+//! `loom-models/src/lib.rs`).
 //!
 //! Plain value types: the epoch and tail are `u8` fields (the values are
-//! tiny), the gate word is the real `u32` layout, and every `step` is ONE
-//! atomic action — a load, a store, a fetchMax, or one CAS attempt (a failed
+//! tiny), and every `step` is ONE atomic action — a load, a store, a fetchMax, or one CAS attempt (a failed
 //! CAS re-reads and the thread stays on the same program counter). The
 //! explorer runs sequentially consistent, so an ordering weakening is
 //! expressed as the REORDERING it permits: the publisher's two stores
@@ -14,7 +13,6 @@
 //!   1 loader_never_sees_an_epoch_newer_than_its_tail — publish epoch-then-tail; load tail-then-epoch
 //!   2 racing_pollers_step_the_epoch_exactly_once     — the epoch CAS as a plain store
 //!   3 a_node_published_across_an_advance_is_adopted_or_rejected — stamp from a post-read re-probe
-//!   4 gate_declarations_never_clobber_each_other     — `setAppender`'s CAS as a plain store
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -264,77 +262,6 @@ fn PublishAcrossAdvance(comptime weakening: enum { none, stamp_from_reprobe }) t
 }
 
 // ---------------------------------------------------------------------------
-// 4. the gate word
-// ---------------------------------------------------------------------------
-
-/// A reader declaration (`fetchOr` of bit 31) and an appender declaration
-/// (a CAS loop preserving the reader bit) race on the packed word: neither
-/// clobbers the other, so "armed reader ⇒ mutates nothing" cannot be lost.
-///
-/// Weakening `.appender_store` (`setAppender` as load-then-store): the
-/// appender loads 0, the reader ORs bit 31, the appender stores its bits
-/// over it — the reader declaration is lost.
-fn GateDeclarations(comptime weakening: enum { none, appender_store }) type {
-    return struct {
-        const Self = @This();
-        pub const thread_count: usize = 2;
-        const reader = 0;
-        const appender = 1;
-        const reader_bit: u32 = @bitCast(core.GateState{ .writer_id = 0, .writers = 0, .reader = true });
-        const appender_bits: u32 = @bitCast(core.GateState{ .writer_id = 3, .writers = 4, .reader = false });
-
-        word: u32 = 0,
-        cur: u32 = 0,
-        pc: [2]u8 = @splat(0),
-
-        pub fn init() Self {
-            return .{};
-        }
-        pub fn done(self: *const Self, t: usize) bool {
-            return self.pc[t] == done_pc;
-        }
-        pub fn step(self: *Self, t: usize) void {
-            switch (t) {
-                reader => {
-                    self.word |= reader_bit;
-                    self.pc[t] = done_pc;
-                },
-                appender => switch (self.pc[t]) {
-                    0 => {
-                        self.cur = self.word;
-                        self.pc[t] = 1;
-                    },
-                    1 => {
-                        const next = (self.cur & reader_bit) | appender_bits;
-                        switch (weakening) {
-                            .appender_store => {
-                                self.word = next;
-                                self.pc[t] = done_pc;
-                            },
-                            .none => if (self.word == self.cur) {
-                                self.word = next;
-                                self.pc[t] = done_pc;
-                            } else {
-                                self.cur = self.word;
-                            },
-                        }
-                    },
-                    else => unreachable,
-                },
-                else => unreachable,
-            }
-        }
-        pub fn invariant(_: *const Self) !void {}
-        pub fn final(self: *const Self) !void {
-            const g: core.GateState = @bitCast(self.word);
-            if (!g.reader) return error.ReaderDeclarationLost;
-            if (g.writers != 4 or g.writer_id != 3) return error.AppenderDeclarationLost;
-            if (g.isAuthority() or g.isSolo()) return error.DecodeDrift;
-        }
-    };
-}
-
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -354,14 +281,9 @@ test "epoch_core_a_node_published_across_an_advance_is_adopted_or_rejected: hold
     try explorer.expectFails(PublishAcrossAdvance(.stamp_from_reprobe), .{}, error.FinalViolated);
 }
 
-test "epoch_core_gate_declarations_never_clobber_each_other: holds; setAppender as a store fails" {
-    try explorer.expectHolds(GateDeclarations(.none), .{});
-    try explorer.expectFails(GateDeclarations(.appender_store), .{}, error.FinalViolated);
-}
-
 // The state counts the evidence note records.
 test "epoch models: exhaustive within the explorer's default limits" {
-    inline for (.{ LoaderPair(.none), RacingPollers(.none), PublishAcrossAdvance(.none), GateDeclarations(.none) }) |Model| {
+    inline for (.{ LoaderPair(.none), RacingPollers(.none), PublishAcrossAdvance(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

@@ -9,45 +9,43 @@
 //!
 //! - **Claim** = budget-then-bit. One bit per extent in `words` (set ==
 //!   allocated OR pending-free); a `fetchOr` decides the unique 0→1 winner.
-//!   The claim first wins an entitlement on the partition's `free_budget`
-//!   (a CAS against the class floor), THEN scans for a clear bit. Invariant:
-//!   `clear_bits ≥ free_budget + budget-winners-without-a-bit`. Every
-//!   release path CLEARS THE BIT BEFORE INCREMENTING THE BUDGET, so a budget
-//!   winner's clear bit is already visible when its scan runs (the budget
-//!   CAS's acquire pairs with the release's acq_rel increment). A racing
-//!   claimer may steal the specific bit a scanner eyed — never the last one
-//!   it is entitled to — so the scan retries and terminates; `claim_rescan_limit`
-//!   bounds the retry (RES-14: the pre-fix loop spun forever on drift).
-//! - **Pending-free coverage gate.** A freed extent enters its OWNER
-//!   partition's bounded Vyukov FIFO as `(extent, gate_seq)` with the bit
-//!   STILL SET and the budget NOT credited. `gate_seq` is the freeing SMO
-//!   entry's free-record journal POSITION. It is released only by
-//!   `advanceDurableIn(writer, tail)` where `tail` is the `journal_tail_seq`
-//!   of a root-ledger record written by THAT appender that a COMPLETED
-//!   barrier covers: `gate ≤ tail` (tails are entry boundaries and the free
-//!   record is never record 0 of an SMO entry, so `≤` ≡ the design's strict
-//!   `tail > free.seq`). Coverage of the TAIL — never durability of a ledger
-//!   RECORD — is what proves every flip of the freeing entry is materialized,
-//!   so any ledger slot a mount may select references only never-overwritten
-//!   extents. The drain stops at the first uncovered entry; complete because
-//!   gates are non-decreasing in push order (one serialized producer per
-//!   partition). The FIFO cap is a PRESSURE VALVE, never a liveness gate:
-//!   `freePendingForced` parks in an unbounded overflow at cap (the flush
-//!   pass's own compactions and mount-side re-parking must never be refused —
-//!   refusing them closes the pinned-floor dependency cycle {parked frees ↔
-//!   pinned tail ↔ refused compaction}, P2 2026-07-26 §9).
+//!   The claim first wins an entitlement on `free_budget` (a CAS against the
+//!   class floor), THEN scans for a clear bit. Invariant: `clear_bits ≥
+//!   free_budget + budget-winners-without-a-bit`. Every release path CLEARS
+//!   THE BIT BEFORE INCREMENTING THE BUDGET, so a budget winner's clear bit
+//!   is already visible when its scan runs (the budget CAS's acquire pairs
+//!   with the release's acq_rel increment). A racing claimer may steal the
+//!   specific bit a scanner eyed — never the last one it is entitled to — so
+//!   the scan retries and terminates; `claim_rescan_limit` bounds the retry
+//!   (RES-14: the pre-fix loop spun forever on drift).
+//! - **Pending-free coverage gate.** A freed extent enters the bounded
+//!   Vyukov FIFO as `(extent, gate_seq)` with the bit STILL SET and the
+//!   budget NOT credited. `gate_seq` is the freeing SMO entry's free-record
+//!   journal POSITION. It is released only by `advanceDurable(tail)` where
+//!   `tail` is the `journal_tail_seq` of a root-ledger record that a
+//!   COMPLETED barrier covers: `gate ≤ tail` (tails are entry boundaries and
+//!   the free record is never record 0 of an SMO entry, so `≤` ≡ the
+//!   design's strict `tail > free.seq`). Coverage of the TAIL — never
+//!   durability of a ledger RECORD — is what proves every flip of the
+//!   freeing entry is materialized, so any ledger slot a mount may select
+//!   references only never-overwritten extents. The drain stops at the first
+//!   uncovered entry; complete because gates are non-decreasing in push
+//!   order (one serialized producer: the SMO task). The FIFO cap is a
+//!   PRESSURE VALVE, never a liveness gate: `freePendingForced` parks in an
+//!   unbounded overflow at cap (the flush pass's own compactions and
+//!   mount-side re-parking must never be refused — refusing them closes the
+//!   pinned-floor dependency cycle {parked frees ↔ pinned tail ↔ refused
+//!   compaction}, P2 2026-07-26 §9).
 //! - **Reserve accounting.** `reserve` extents (`max(8, 2 %)`) are claimable
 //!   by `.internal` only; a `.user` claim fails once the budget would dip
 //!   to-or-below the reserve — ENOSPC while compaction can still fold and
 //!   free space (no write-to-free-space deadlock).
 //!
-//! **Append partitioning** splits the bitmap by PAGE (the A/B write unit),
-//! ownership `page % writers` (interleaved: a dense low-end allocation spreads
-//! evenly). Each partition carries its own budget, hint, reserve floor,
-//! FIFO + overflow and coverage clock — gate seqs are positions in the
-//! freeing appender's OWN ring, so one shared clock would release a peer's
-//! parked extent that replay still routes into. Solo is one partition owning
-//! everything: the shipped flat sweep, the shipped costs.
+//! ONE owner per bitmap (format v4, decision 0003 Q3): the volume's heap
+//! has one allocator and one coverage clock — its manager's. The charter's
+//! appenders receive extent GRANTS from this pool (§5.5), never a
+//! page-interleaved share of the bitmap, so no page ownership, per-writer
+//! budget or per-writer clock exists here.
 
 const std = @import("std");
 const Atomic = std.atomic.Value;
@@ -113,38 +111,6 @@ pub fn compactionFloorExtents(reserve: u64) u64 {
     return reserve / 2;
 }
 
-/// How the bitmap is split across appenders: the partition unit is the
-/// bitmap PAGE (the A/B write unit) and ownership is `page % writers`.
-pub const PartitionMap = struct {
-    writers: u64,
-    extents_per_page: u64,
-
-    /// The shipped single-appender map: one partition owning every page.
-    pub fn solo(extents_per_page: u64) PartitionMap {
-        return new(1, extents_per_page);
-    }
-
-    pub fn new(writers: u64, extents_per_page: u64) PartitionMap {
-        std.debug.assert(writers > 0);
-        std.debug.assert(extents_per_page > 0);
-        return .{ .writers = writers, .extents_per_page = extents_per_page };
-    }
-
-    pub fn isSolo(self: PartitionMap) bool {
-        return self.writers == 1;
-    }
-
-    pub fn ownerOfPage(self: PartitionMap, page: u64) u64 {
-        return page % self.writers;
-    }
-
-    /// Solo answers 0 without a division (the claim/release hot path).
-    pub fn ownerOfExtent(self: PartitionMap, extent: u64) u64 {
-        if (self.writers == 1) return 0;
-        return self.ownerOfPage(extent / self.extents_per_page);
-    }
-};
-
 /// One FIFO slot, Vyukov-stamped: a producer at position `pos` fills the
 /// slot only while `stamp == pos` and publishes with `stamp = pos + 1`; the
 /// consumer that wins `pos` vacates with `stamp = pos + cap`.
@@ -174,166 +140,88 @@ const SpinLock = struct {
     }
 };
 
-/// One appender's half of the allocator: its budget, scan hint, FIFO +
-/// overflow and its own coverage clock. Cursors sit on their own lines: the
-/// producer (SMO task) and consumer (post-barrier drain) touch different
-/// words and must not false-share.
-const Partition = struct {
+/// The one owner's mutable allocator state, heap-allocated so the
+/// serialized producer, the claimers and the drain all mutate it through
+/// the shared `*const ExtCore` handle every claimer holds. Cursors sit on
+/// their own lines: the producer (SMO task) and consumer (post-barrier
+/// drain) touch different words and must not false-share.
+const State = struct {
     free_budget: Atomic(u64) align(std.atomic.cache_line),
     hint: Atomic(u64),
-    /// Non-decreasing-gate debug guard (per partition: one serialized
-    /// producer each).
+    /// Non-decreasing-gate debug guard (one serialized producer).
     last_retire_seq: Atomic(u64),
     pending_head: Atomic(u64) align(std.atomic.cache_line),
     pending_tail: Atomic(u64) align(std.atomic.cache_line),
     durable_seq: Atomic(u64),
-    pending: []PendingSlot,
+    /// The unbounded overflow behind the FIFO's cap: a deque over an
+    /// ArrayList (pops advance `overflow_front`; a drain that empties it
+    /// resets both); `overflow_len` is the lock-free mirror of its length
+    /// for the hot-path emptiness check.
     overflow_lock: SpinLock,
     overflow: std.ArrayList(OverflowEntry),
-    /// Index of the overflow's front entry (a deque over an ArrayList: pops
-    /// advance the front, a drain that empties it resets both).
     overflow_front: usize,
-    /// Lock-free mirror of the overflow's length for the hot-path emptiness
-    /// check.
     overflow_len: Atomic(u64),
+};
 
-    fn init(gpa: std.mem.Allocator, budget: u64, first_extent: u64, pending_cap: usize) !Partition {
+pub const ExtCore = struct {
+    gpa: std.mem.Allocator,
+    /// One bit per extent.
+    words: []Atomic(u64),
+    total: u64,
+    reserve: u64,
+    pending: []PendingSlot,
+    st: *State,
+
+    /// An all-free core.
+    pub fn init(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize) !ExtCore {
+        std.debug.assert(total > 0);
+        std.debug.assert(reserve < total);
+        std.debug.assert(pending_cap >= min_pending_cap);
+        const words = try gpa.alloc(Atomic(u64), (total + 63) / 64);
+        errdefer gpa.free(words);
+        for (words) |*w| w.* = .init(0);
         const pending = try gpa.alloc(PendingSlot, pending_cap);
+        errdefer gpa.free(pending);
         for (pending, 0..) |*slot, i| slot.* = .{ .stamp = .init(i), .extent = .init(0), .retire_seq = .init(0) };
-        return .{
-            .free_budget = .init(budget),
-            .hint = .init(first_extent),
+        const st = try gpa.create(State);
+        st.* = .{
+            .free_budget = .init(total),
+            .hint = .init(0),
             .last_retire_seq = .init(0),
             .pending_head = .init(0),
             .pending_tail = .init(0),
             .durable_seq = .init(0),
-            .pending = pending,
             .overflow_lock = .{},
             .overflow = .empty,
             .overflow_front = 0,
             .overflow_len = .init(0),
         };
-    }
-
-    fn deinit(self: *Partition, gpa: std.mem.Allocator) void {
-        gpa.free(self.pending);
-        self.overflow.deinit(gpa);
-    }
-
-    fn fifoCount(self: *const Partition) u64 {
-        const head = self.pending_head.load(.acquire);
-        const tail = self.pending_tail.load(.acquire);
-        return head -| tail;
-    }
-};
-
-/// Extents in `writer`'s partition — its initial free budget.
-fn partitionExtentCount(total: u64, map: PartitionMap, writer: u64) u64 {
-    if (map.isSolo()) return total;
-    const epp = map.extents_per_page;
-    const pages = (total + epp - 1) / epp;
-    var count: u64 = 0;
-    var page = writer;
-    while (page < pages) : (page += map.writers) {
-        const lo = page * epp;
-        count += @min(lo + epp, total) - lo;
-    }
-    return count;
-}
-
-/// The first extent `writer` owns (its scan-hint seed).
-fn firstExtentOf(map: PartitionMap, writer: u64) u64 {
-    return if (map.isSolo()) 0 else writer * map.extents_per_page;
-}
-
-pub const ExtCore = struct {
-    gpa: std.mem.Allocator,
-    /// One bit per extent, SHARED across partitions (a bit is a bit); every
-    /// mutation routes to the OWNING partition's accounting.
-    words: []Atomic(u64),
-    total: u64,
-    /// Per-partition reserve (the whole-volume reserve on a solo volume).
-    reserve: u64,
-    map: PartitionMap,
-    parts: []Partition,
-
-    /// An all-free solo core: the shipped single-appender allocator.
-    pub fn init(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize) !ExtCore {
-        // One partition owning every page: `extents_per_page = total` makes
-        // the whole bitmap page 0 by construction.
-        return initPartitioned(gpa, total, reserve, pending_cap, PartitionMap.solo(total));
-    }
-
-    /// `reserve` and `pending_cap` are WHOLE-volume figures divided across
-    /// appenders (each keeps its own fold-and-free headroom; a partition's
-    /// SMO rate is ~1/N of the volume's, so the footprint stays constant).
-    pub fn initPartitioned(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize, map: PartitionMap) !ExtCore {
-        std.debug.assert(total > 0);
-        std.debug.assert(reserve < total);
-        std.debug.assert(pending_cap >= min_pending_cap);
-        const writers = map.writers;
-        const per_reserve = if (writers == 1) reserve else (reserve + writers - 1) / writers;
-        const per_pending: usize = if (writers == 1) pending_cap else @max(min_pending_cap, pending_cap / @as(usize, @intCast(writers)));
-
-        const words = try gpa.alloc(Atomic(u64), (total + 63) / 64);
-        errdefer gpa.free(words);
-        for (words) |*w| w.* = .init(0);
-
-        const parts = try gpa.alloc(Partition, @intCast(writers));
-        var built: usize = 0;
-        errdefer {
-            for (parts[0..built]) |*p| p.deinit(gpa);
-            gpa.free(parts);
-        }
-        for (parts, 0..) |*p, w| {
-            const budget = partitionExtentCount(total, map, w);
-            std.debug.assert(per_reserve < budget or budget == 0);
-            p.* = try Partition.init(gpa, budget, firstExtentOf(map, w), per_pending);
-            built += 1;
-        }
-        return .{ .gpa = gpa, .words = words, .total = total, .reserve = per_reserve, .map = map, .parts = parts };
+        return .{ .gpa = gpa, .words = words, .total = total, .reserve = reserve, .pending = pending, .st = st };
     }
 
     pub fn deinit(self: *ExtCore) void {
-        for (self.parts) |*p| p.deinit(self.gpa);
-        self.gpa.free(self.parts);
+        self.st.overflow.deinit(self.gpa);
+        self.gpa.destroy(self.st);
+        self.gpa.free(self.pending);
         self.gpa.free(self.words);
         self.* = undefined;
     }
 
-    /// INDEX, never modulo: `writer % parts.len` on a runtime length emits a
-    /// 64-bit division on the claim/release path — measured ~7 ns/claim,
-    /// ≈ 11 % of a solo claim (`.benchmarks/2026-08-05-mw-partitioned-append.md`
-    /// §3). An out-of-range writer is a caller bug.
-    fn part(self: *const ExtCore, writer: u64) *Partition {
-        std.debug.assert(writer < self.parts.len);
-        return &self.parts[@intCast(writer)];
-    }
-
-    /// Claimable extents across every partition (excludes allocated and
-    /// pending-free).
+    /// Claimable extents (excludes allocated and pending-free).
     pub fn freeExtents(self: *const ExtCore) u64 {
-        var sum: u64 = 0;
-        for (self.parts) |*p| sum += p.free_budget.load(.acquire);
-        return sum;
+        return self.st.free_budget.load(.acquire);
     }
 
-    pub fn freeExtentsIn(self: *const ExtCore, writer: u64) u64 {
-        return self.part(writer).free_budget.load(.acquire);
+    fn fifoCount(self: *const ExtCore) u64 {
+        const head = self.st.pending_head.load(.acquire);
+        const tail = self.st.pending_tail.load(.acquire);
+        return head -| tail;
     }
 
-    /// Parked retirements awaiting coverage: the FIFO plus the overflow,
-    /// summed over partitions (the wedge detector counts every parked
-    /// retirement wherever it is parked).
+    /// Parked retirements awaiting coverage: the FIFO plus the overflow (the
+    /// wedge detector counts every parked retirement wherever it is parked).
     pub fn pendingCount(self: *const ExtCore) u64 {
-        var sum: u64 = 0;
-        for (self.parts) |*p| sum += p.fifoCount() + p.overflow_len.load(.acquire);
-        return sum;
-    }
-
-    pub fn pendingCountIn(self: *const ExtCore, writer: u64) u64 {
-        const p = self.part(writer);
-        return p.fifoCount() + p.overflow_len.load(.acquire);
+        return self.fifoCount() + self.st.overflow_len.load(.acquire);
     }
 
     /// Producer-side headroom probe (the at-cap protocol's admission check).
@@ -341,70 +229,51 @@ pub const ExtCore = struct {
     /// a racing drain only ever VACATES slots, so headroom observed here
     /// still holds at the later push (the model pins exactly this). Speaks
     /// only for the bounded FIFO; forced retirements never consult it.
-    pub fn pendingHasRoomIn(self: *const ExtCore, writer: u64) bool {
-        const p = self.part(writer);
-        return p.fifoCount() < p.pending.len;
-    }
-
     pub fn pendingHasRoom(self: *const ExtCore) bool {
-        return self.pendingHasRoomIn(0);
+        return self.fifoCount() < self.pending.len;
     }
 
-    /// Free FIFO slots in `writer`'s partition (a merge parks two).
-    pub fn pendingRoomIn(self: *const ExtCore, writer: u64) u64 {
-        const p = self.part(writer);
-        return @as(u64, p.pending.len) -| p.fifoCount();
-    }
-
-    pub fn durableSeqIn(self: *const ExtCore, writer: u64) u64 {
-        return self.part(writer).durable_seq.load(.acquire);
+    /// Free FIFO slots (a merge parks two).
+    pub fn pendingRoom(self: *const ExtCore) u64 {
+        return @as(u64, self.pending.len) -| self.fifoCount();
     }
 
     pub fn durableSeq(self: *const ExtCore) u64 {
-        return self.durableSeqIn(0);
+        return self.st.durable_seq.load(.acquire);
     }
 
+    /// Budget-then-bit (module docs). `.user` must leave the reserve behind;
+    /// the entitlement CAS is acq_rel so the winner sees every bit a release
+    /// cleared before its budget increment.
     pub fn claim(self: *const ExtCore, class: AllocClass) ClaimError!u64 {
-        return self.claimIn(0, class);
-    }
-
-    /// Budget-then-bit (module docs). `.user` must leave the partition's
-    /// reserve behind; the entitlement CAS is acq_rel so the winner sees
-    /// every bit a release cleared before its budget increment.
-    pub fn claimIn(self: *const ExtCore, writer: u64, class: AllocClass) ClaimError!u64 {
-        const p = self.part(writer);
         const floor: u64 = switch (class) {
             .user => self.reserve,
             .internal => 0,
         };
-        var free = p.free_budget.load(.acquire);
+        var free = self.st.free_budget.load(.acquire);
         while (true) {
             if (free <= floor) return error.NoSpace;
             // acq_rel pairs with `release`'s acq_rel `fetchAdd` on the budget.
-            free = p.free_budget.cmpxchgWeak(free, free - 1, .acq_rel, .acquire) orelse break;
+            free = self.st.free_budget.cmpxchgWeak(free, free - 1, .acq_rel, .acquire) orelse break;
         }
-        const start = @min(p.hint.load(.monotonic), self.total);
+        const start = @min(self.st.hint.load(.monotonic), self.total);
         var pass: u32 = 0;
         while (pass < claim_rescan_limit) : (pass += 1) {
-            if (self.map.isSolo()) {
-                // The shipped flat sweep: `start..total` then `0..start`.
-                var k: u64 = 0;
-                while (k < self.total) : (k += 1) {
-                    const idx = if (start + k < self.total) start + k else start + k - self.total;
-                    if (self.tryTakeBit(idx)) {
-                        p.hint.store(idx + 1, .monotonic);
-                        return idx;
-                    }
+            // The flat sweep: `start..total` then `0..start`.
+            var k: u64 = 0;
+            while (k < self.total) : (k += 1) {
+                const idx = if (start + k < self.total) start + k else start + k - self.total;
+                if (self.tryTakeBit(idx)) {
+                    self.st.hint.store(idx + 1, .monotonic);
+                    return idx;
                 }
-            } else if (self.scanPartition(writer, p, start)) |idx| {
-                return idx;
             }
             // A release between the budget win and this pass can land behind
             // the cursor; the budget win guarantees a clear bit exists.
             std.atomic.spinLoopHint();
         }
         // RES-14: hand the entitlement back and refuse loud in its own class.
-        _ = p.free_budget.fetchAdd(1, .acq_rel);
+        _ = self.st.free_budget.fetchAdd(1, .acq_rel);
         return error.InvariantDrift;
     }
 
@@ -414,62 +283,14 @@ pub const ExtCore = struct {
         return self.words[@intCast(idx / 64)].fetchOr(mask, .acq_rel) & mask == 0;
     }
 
-    /// One partitioned scan pass over `writer`'s own pages only, ascending
-    /// from `start`'s page and wrapping once to the partition's first page;
-    /// pass 3 covers the head of the hint's own page that pass 1 skipped.
-    /// Page granularity skips a foreign page in one step instead of one
-    /// modulo per bit. `writer`'s pages are `{writer, writer+n, …}`.
-    fn scanPartition(self: *const ExtCore, writer: u64, p: *Partition, start: u64) ?u64 {
-        const epp = self.map.extents_per_page;
-        const n = self.map.writers;
-        const pages = (self.total + epp - 1) / epp;
-        const start_page = @min(start / epp, pages);
-        const first = if (start_page <= writer) writer else writer + ((start_page - writer + n - 1) / n) * n;
-
-        // Pass 1: owned pages from `first` to the end; the hint's own page
-        // starts at the hint.
-        var page = first;
-        while (page < pages) : (page += n) {
-            const lo = page * epp;
-            const hi = @min(lo + epp, self.total);
-            const from = if (page == start_page and start > lo and start < hi) start else lo;
-            if (self.takeRange(p, from, hi)) |idx| return idx;
-        }
-        // Pass 2: wrap — owned pages below `first`.
-        page = writer;
-        while (page < @min(first, pages)) : (page += n) {
-            const lo = page * epp;
-            if (self.takeRange(p, lo, @min(lo + epp, self.total))) |idx| return idx;
-        }
-        // Pass 3: the head of the hint's own page, skipped by pass 1.
-        if (start_page < pages and self.map.ownerOfPage(start_page) == writer) {
-            const lo = start_page * epp;
-            if (start > lo) {
-                if (self.takeRange(p, lo, @min(start, self.total))) |idx| return idx;
-            }
-        }
-        return null;
-    }
-
-    fn takeRange(self: *const ExtCore, p: *Partition, from: u64, to: u64) ?u64 {
-        var idx = from;
-        while (idx < to) : (idx += 1) {
-            if (self.tryTakeBit(idx)) {
-                p.hint.store(idx + 1, .monotonic);
-                return idx;
-            }
-        }
-        return null;
-    }
-
     /// TEST SEAM (RES-14): inflate the budget without clearing a bit — the
     /// drift the protocol says cannot happen, so the bounded-and-loud refusal
     /// can be pinned deterministically.
     pub fn inflateFreeBudgetForTest(self: *const ExtCore, n: u64) void {
-        _ = self.part(0).free_budget.fetchAdd(n, .acq_rel);
+        _ = self.st.free_budget.fetchAdd(n, .acq_rel);
     }
 
-    /// Mount seeding ONLY: sets the bit THEN decrements the owner's budget,
+    /// Mount seeding ONLY: sets the bit THEN decrements the budget,
     /// transiently violating the invariant in the other direction — hence
     /// `*ExtCore` (never concurrent with claims). Idempotent; out of range
     /// ignored.
@@ -477,24 +298,23 @@ pub const ExtCore = struct {
         if (extent >= self.total) return;
         const mask = @as(u64, 1) << @intCast(extent % 64);
         if (self.words[@intCast(extent / 64)].fetchOr(mask, .acq_rel) & mask == 0) {
-            const prev = self.part(self.map.ownerOfExtent(extent)).free_budget.fetchSub(1, .acq_rel);
+            const prev = self.st.free_budget.fetchSub(1, .acq_rel);
             std.debug.assert(prev >= 1);
         }
     }
 
-    /// Bit cleared, THEN the owner's budget incremented (module docs). Only
-    /// for extents no root-ledger record references (an unpublished build,
-    /// or the covered drain below). Idempotent; out of range ignored.
+    /// Bit cleared, THEN the budget incremented (module docs). Only for
+    /// extents no root-ledger record references (an unpublished build, or
+    /// the covered drain below). Idempotent; out of range ignored.
     pub fn release(self: *const ExtCore, extent: u64) void {
         if (extent >= self.total) return;
         const mask = @as(u64, 1) << @intCast(extent % 64);
         if (self.words[@intCast(extent / 64)].fetchAnd(~mask, .acq_rel) & mask != 0) {
-            const p = self.part(self.map.ownerOfExtent(extent));
             // acq_rel pairs with the claim's budget CAS: the cleared bit is
             // visible to whoever wins this increment.
-            _ = p.free_budget.fetchAdd(1, .acq_rel);
+            _ = self.st.free_budget.fetchAdd(1, .acq_rel);
             // Prefer reusing low freed extents (locality under churn).
-            _ = p.hint.fetchMin(extent, .monotonic);
+            _ = self.st.hint.fetchMin(extent, .monotonic);
         }
     }
 
@@ -503,23 +323,22 @@ pub const ExtCore = struct {
         return self.words[@intCast(extent / 64)].load(.acquire) & mask != 0;
     }
 
-    /// Park `extent` in its OWNER's FIFO gated on `retire_seq` (the free
-    /// record's journal position). Contract: `extent < total`, bit set, gates
-    /// non-decreasing per partition (the serialized SMO task).
+    /// Park `extent` in the FIFO gated on `retire_seq` (the free record's
+    /// journal position). Contract: `extent < total`, bit set, gates
+    /// non-decreasing (the serialized SMO task).
     pub fn freePending(self: *const ExtCore, extent: u64, retire_seq: u64) PendingFreeError!void {
         std.debug.assert(extent < self.total);
         std.debug.assert(self.bitIsSet(extent));
-        const p = self.part(self.map.ownerOfExtent(extent));
-        const prev_retire = p.last_retire_seq.fetchMax(retire_seq, .acq_rel);
+        const prev_retire = self.st.last_retire_seq.fetchMax(retire_seq, .acq_rel);
         std.debug.assert(prev_retire <= retire_seq);
-        const cap: u64 = p.pending.len;
-        var pos = p.pending_head.load(.acquire);
+        const cap: u64 = self.pending.len;
+        var pos = self.st.pending_head.load(.acquire);
         while (true) {
-            const slot = &p.pending[@intCast(pos % cap)];
+            const slot = &self.pending[@intCast(pos % cap)];
             const stamp = slot.stamp.load(.acquire);
             if (stamp == pos) {
                 // Vacant for this position: claim it.
-                if (p.pending_head.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire)) |cur| {
+                if (self.st.pending_head.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire)) |cur| {
                     pos = cur;
                     continue;
                 }
@@ -537,13 +356,13 @@ pub const ExtCore = struct {
                 // headroom probe reads the cursors, so a cursor-level vacancy
                 // must be pushable. Distinguish by cursor distance and spin
                 // out the consumer's store (it is instructions away).
-                const tail = p.pending_tail.load(.acquire);
+                const tail = self.st.pending_tail.load(.acquire);
                 if (pos -| tail >= cap) return error.PendingFreeFull;
                 std.atomic.spinLoopHint();
-                pos = p.pending_head.load(.acquire);
+                pos = self.st.pending_head.load(.acquire);
             } else {
                 // A racing producer advanced the head past our read.
-                pos = p.pending_head.load(.acquire);
+                pos = self.st.pending_head.load(.acquire);
             }
         }
     }
@@ -555,40 +374,34 @@ pub const ExtCore = struct {
     /// typed rather than swallowed.
     pub fn freePendingForced(self: *const ExtCore, extent: u64, retire_seq: u64) std.mem.Allocator.Error!bool {
         self.freePending(extent, retire_seq) catch {
-            const p = self.part(self.map.ownerOfExtent(extent));
-            p.overflow_lock.lock();
-            defer p.overflow_lock.unlock();
-            if (p.overflow.items.len > p.overflow_front) {
-                std.debug.assert(p.overflow.items[p.overflow.items.len - 1].gate <= retire_seq);
+            const st = self.st;
+            st.overflow_lock.lock();
+            defer st.overflow_lock.unlock();
+            if (st.overflow.items.len > st.overflow_front) {
+                std.debug.assert(st.overflow.items[st.overflow.items.len - 1].gate <= retire_seq);
             }
-            try p.overflow.append(self.gpa, .{ .extent = extent, .gate = retire_seq });
-            p.overflow_len.store(p.overflow.items.len - p.overflow_front, .release);
+            try st.overflow.append(self.gpa, .{ .extent = extent, .gate = retire_seq });
+            st.overflow_len.store(st.overflow.items.len - st.overflow_front, .release);
             return true;
         };
         return false;
     }
 
-    /// `advanceDurableIn(0, …)`: the solo/authority clock.
-    pub fn advanceDurable(self: *const ExtCore, seq: u64, ctx: anytype, comptime onRelease: fn (@TypeOf(ctx), u64) void) u64 {
-        return self.advanceDurableIn(0, seq, ctx, onRelease);
-    }
-
-    /// Advance `writer`'s coverage clock to `seq` (monotonic `fetchMax`;
-    /// stale advances are no-ops) and drain every entry it now covers: bit
+    /// Advance the coverage clock to `seq` (monotonic `fetchMax`; stale
+    /// advances are no-ops) and drain every entry it now covers: bit
     /// cleared, budget credited — claimable again, and only now. `onRelease`
     /// fires per released extent (the wrapper dirties its page); returns the
     /// count.
-    pub fn advanceDurableIn(self: *const ExtCore, writer: u64, seq: u64, ctx: anytype, comptime onRelease: fn (@TypeOf(ctx), u64) void) u64 {
-        const p = self.part(writer);
-        _ = p.durable_seq.fetchMax(seq, .acq_rel);
-        const durable = p.durable_seq.load(.acquire);
-        const cap: u64 = p.pending.len;
+    pub fn advanceDurable(self: *const ExtCore, seq: u64, ctx: anytype, comptime onRelease: fn (@TypeOf(ctx), u64) void) u64 {
+        _ = self.st.durable_seq.fetchMax(seq, .acq_rel);
+        const durable = self.st.durable_seq.load(.acquire);
+        const cap: u64 = self.pending.len;
         var released: u64 = 0;
         while (true) {
-            const pos = p.pending_tail.load(.acquire);
-            const head = p.pending_head.load(.acquire);
+            const pos = self.st.pending_tail.load(.acquire);
+            const head = self.st.pending_head.load(.acquire);
             if (pos == head) break;
-            const slot = &p.pending[@intCast(pos % cap)];
+            const slot = &self.pending[@intCast(pos % cap)];
             // acquire pairs with the producer's release stamp store.
             const stamp = slot.stamp.load(.acquire);
             // Unpublished producer (or a racing consumer just vacated it): a
@@ -602,7 +415,7 @@ pub const ExtCore = struct {
             // is releasable either.
             if (retire_seq > durable) break;
             const extent = slot.extent.load(.monotonic);
-            if (p.pending_tail.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null) {
+            if (self.st.pending_tail.cmpxchgWeak(pos, pos + 1, .acq_rel, .acquire) == null) {
                 // Exclusive owner: vacate for the producer a lap ahead, then
                 // release the extent.
                 slot.stamp.store(pos + cap, .release);
@@ -613,22 +426,23 @@ pub const ExtCore = struct {
         }
         // The overflow drains on the SAME clock with the same front-stop;
         // lock-free when empty (the steady state).
-        if (p.overflow_len.load(.acquire) > 0) {
-            p.overflow_lock.lock();
-            defer p.overflow_lock.unlock();
-            while (p.overflow_front < p.overflow.items.len) {
-                const front = p.overflow.items[p.overflow_front];
+        const st = self.st;
+        if (st.overflow_len.load(.acquire) > 0) {
+            st.overflow_lock.lock();
+            defer st.overflow_lock.unlock();
+            while (st.overflow_front < st.overflow.items.len) {
+                const front = st.overflow.items[st.overflow_front];
                 if (front.gate > durable) break;
-                p.overflow_front += 1;
+                st.overflow_front += 1;
                 self.release(front.extent);
                 released += 1;
                 onRelease(ctx, front.extent);
             }
-            if (p.overflow_front == p.overflow.items.len) {
-                p.overflow.clearRetainingCapacity();
-                p.overflow_front = 0;
+            if (st.overflow_front == st.overflow.items.len) {
+                st.overflow.clearRetainingCapacity();
+                st.overflow_front = 0;
             }
-            p.overflow_len.store(p.overflow.items.len - p.overflow_front, .release);
+            st.overflow_len.store(st.overflow.items.len - st.overflow_front, .release);
         }
         return released;
     }
@@ -787,19 +601,6 @@ test "compaction reserve policy: max(8, total/50) pinned at 1, 100, 400, 450, 10
     try testing.expectEqual(@as(u64, 41_943), compactionFloorExtents(83_886));
 }
 
-test "partition map: solo owns everything without a division; interleaved page ownership otherwise" {
-    const solo = PartitionMap.solo(32576);
-    try testing.expect(solo.isSolo());
-    try testing.expectEqual(@as(u64, 0), solo.ownerOfExtent(1_000_000));
-    const two = PartitionMap.new(2, 2);
-    try testing.expectEqual(@as(u64, 0), two.ownerOfExtent(1));
-    try testing.expectEqual(@as(u64, 1), two.ownerOfExtent(2));
-    try testing.expectEqual(@as(u64, 0), two.ownerOfExtent(4));
-    try testing.expectEqual(@as(u64, 2), partitionExtentCount(4, two, 0));
-    try testing.expectEqual(@as(u64, 1), partitionExtentCount(3, two, 1));
-    try testing.expectEqual(@as(u64, 2), firstExtentOf(two, 1));
-}
-
 test "core claims unique, reserve isolated: 16/4 — 12 unique user claims then NoSpace; 4 internal; exhausted refuses internal" {
     var core = try ExtCore.init(testing.allocator, 16, 4, 8);
     defer core.deinit();
@@ -861,7 +662,7 @@ test "pending free cap and lap recycling: cap 2 refuses the third, extent stays 
     try core.freePending(a, 1);
     try core.freePending(b, 2);
     try testing.expect(!core.pendingHasRoom());
-    try testing.expectEqual(@as(u64, 0), core.pendingRoomIn(0));
+    try testing.expectEqual(@as(u64, 0), core.pendingRoom());
     try testing.expectError(error.PendingFreeFull, core.freePending(c, 3));
     try testing.expect(core.isAllocated(c));
     try testing.expectEqual(@as(u64, 2), core.pendingCount());
@@ -912,51 +713,6 @@ test "RES-14: a budget the bitmap cannot honour refuses InvariantDrift after bou
     core.inflateFreeBudgetForTest(1);
     try testing.expectError(error.InvariantDrift, core.claim(.user));
     try testing.expectEqual(@as(u64, 1), core.freeExtents());
-}
-
-test "partitioned: claims stay in the owner's pages, hints seed per partition, releases credit the owner" {
-    var core = try ExtCore.initPartitioned(testing.allocator, 6, 0, 4, PartitionMap.new(2, 2));
-    defer core.deinit();
-    // Pages: 0 → {0,1} writer 0; 1 → {2,3} writer 1; 2 → {4,5} writer 0.
-    try testing.expectEqual(@as(u64, 4), core.freeExtentsIn(0));
-    try testing.expectEqual(@as(u64, 2), core.freeExtentsIn(1));
-    try testing.expectEqual(@as(u64, 2), core.claimIn(1, .internal));
-    try testing.expectEqual(@as(u64, 3), core.claimIn(1, .internal));
-    try testing.expectError(error.NoSpace, core.claimIn(1, .internal));
-    try testing.expectEqual(@as(u64, 0), core.claimIn(0, .internal));
-    try testing.expectEqual(@as(u64, 1), core.claimIn(0, .internal));
-    try testing.expectEqual(@as(u64, 4), core.claimIn(0, .internal));
-    try testing.expectEqual(@as(u64, 5), core.claimIn(0, .internal));
-    try testing.expectError(error.NoSpace, core.claimIn(0, .internal));
-    // A release of writer 1's extent credits writer 1, whoever calls it.
-    core.release(3);
-    try testing.expectEqual(@as(u64, 1), core.freeExtentsIn(1));
-    try testing.expectEqual(@as(u64, 0), core.freeExtentsIn(0));
-    // The wrap: with hint past page 2, the scan wraps to page 0 then the
-    // head of the hint's own page.
-    core.release(0);
-    core.release(5);
-    try testing.expectEqual(@as(u64, 0), core.claimIn(0, .internal));
-    try testing.expectEqual(@as(u64, 5), core.claimIn(0, .internal));
-}
-
-test "partitioned coverage clocks never cross: writer 0's tail releases only writer 0's parked extent" {
-    var core = try ExtCore.initPartitioned(testing.allocator, 4, 0, 4, PartitionMap.new(2, 2));
-    defer core.deinit();
-    const mine = try core.claimIn(0, .internal);
-    const theirs = try core.claimIn(1, .internal);
-    try core.freePending(mine, 100);
-    try core.freePending(theirs, 100);
-    var r0: std.ArrayList(u64) = .empty;
-    defer r0.deinit(testing.allocator);
-    _ = core.advanceDurableIn(0, 100, &r0, collect);
-    try testing.expectEqualSlices(u64, &.{mine}, r0.items);
-    try testing.expect(core.isAllocated(theirs));
-    try testing.expectEqual(@as(u64, 0), core.durableSeqIn(1));
-    try testing.expectEqual(@as(u64, 1), core.pendingCountIn(1));
-    try testing.expectEqual(@as(u64, 0), core.advanceDurableIn(1, 99, {}, ignoreRelease));
-    try testing.expectEqual(@as(u64, 1), core.advanceDurableIn(1, 100, {}, ignoreRelease));
-    try testing.expect(!core.isAllocated(theirs));
 }
 
 test "concurrent claims unique across a pending drain: 2048 extents, 32 parked, 8 claimers vs a drainer" {

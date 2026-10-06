@@ -57,6 +57,7 @@ const align_probe = @import("../io/align_probe.zig");
 const clock = @import("../core/clock.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
+const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const ring_park = @import("../io/ring_park.zig");
 const thread_name = @import("../core/thread_name.zig");
@@ -132,37 +133,21 @@ pub fn resolveFlushCadence(env: *const std.process.Environ.Map) Cadence {
 }
 
 // ---------------------------------------------------------------------------
-// Errors: the io layer's classes plus the lane's own.
+// Errors: the ONE set (`core/errors.zig`). The lane's own members —
+// `VolumeFailed` (the FAILED latch), `LaneStopped`, `LaneQueueFull` (the
+// inbound backpressure, `journal_lane_queue_full`), `HoleCheckpointFailed`
+// — are rows of that table.
 // ---------------------------------------------------------------------------
 
-pub const Error = uring_fs.Error || error{
-    /// The volume latched FAILED (`JOURNAL_FAILURE_LATCH` consecutive
-    /// failures): every later op answers this until remount.
-    VolumeFailed,
-    /// The lane is stopping or stopped.
-    LaneStopped,
-    /// The inbound queue is full (backpressure; `journal_lane_queue_full`).
-    LaneQueueFull,
-    /// The checkpoint past a hole this ack depended on could not drain.
-    HoleCheckpointFailed,
-};
-
-pub const ErrorClass = uring_fs.ErrorClass;
-
-pub fn classOf(err: Error) ErrorClass {
-    return switch (err) {
-        error.VolumeFailed, error.LaneStopped => .refusal,
-        error.LaneQueueFull => .retryable,
-        error.HoleCheckpointFailed => .terminal,
-        else => |e| uring_fs.classOf(@errorCast(e)),
-    };
-}
+pub const Error = errors.Error;
+pub const ErrorClass = errors.Class;
+pub const classOf = errors.classOf;
 
 pub const SpawnError = error{ OutOfMemory, RingSetupFailed, ThreadSpawnFailed, DeviceOpenFailed } || uring_fs.RegisterError;
 
 /// A CQE's `res`: negative is `-errno`.
 fn cqeError(res: i32) Error {
-    return uring_fs.fromErrno(@fromBackingInt(@as(u16, @intCast(-res))));
+    return errors.fromCqeRes(res);
 }
 
 // ---------------------------------------------------------------------------

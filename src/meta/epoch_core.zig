@@ -1,10 +1,12 @@
-//! The node cache's revalidation epoch and append gate (charter §5.3 "Node
+//! The node cache's revalidation epoch and reader gate (charter §5.3 "Node
 //! cache", §5.5 symmetric metadata; survey `docs/porting/
 //! kv_tree_cache_commit_survey.md` §3.2, §7.1): the lock-free words that
 //! make one node cache safe to share with a second process — a coherent
 //! READER that polls the root ledger and drops every cached node the new
-//! roots do not cover (`RevalidationEpoch`), and the partitioning verdict
-//! "two writers never cache the same node" (`AppendGate`). `NodeEnv` is the
+//! roots do not cover (`RevalidationEpoch`) and mutates nothing
+//! (`ReaderGate`). Which appender may mutate a slot tree is the lease
+//! gate's verdict (`node_cache.LeaseGate`); the pre-forest per-volume
+//! appender partition is gone (decision 0003 Q3). `NodeEnv` is the
 //! per-cache bundle every node shares; `StructuralHolds` is the hold-Σ
 //! ledger the flush-ceiling audit reads. `epoch_core_model.zig` explores
 //! the races with `model/explorer.zig`.
@@ -46,12 +48,6 @@ const std = @import("std");
 /// every node is stamped with it, so the hit-path compare always agrees and
 /// no revalidation can drop a mapping the local mount owns.
 pub const unarmed_epoch: u64 = 0;
-
-/// Appender id of the volume's root authority — the one appender owning
-/// structural state (roots, interior nodes, SMOs). Must equal the journal
-/// module's root-authority writer id; the tie is that module's test, because
-/// this one stays dependency-free.
-pub const root_authority: u16 = 0;
 
 /// A coherent read of the pair: the epoch a node loaded now may claim and
 /// the durable tail its torn-tail classification must use.
@@ -145,78 +141,23 @@ pub const RevalidationEpoch = struct {
     }
 };
 
-/// The decoded `AppendGate` word — byte-exact with the packed layout: bits
-/// 0..16 appender id, bits 16..31 appender count, bit 31 reader.
-pub const GateState = packed struct(u32) {
-    /// This mount's appender id.
-    writer_id: u16,
-    /// Appenders the volume's structures are partitioned for (0/1 = solo —
-    /// today's every mount). 15 bits: bit 31 is the reader flag.
-    writers: u15,
-    /// This mount declared itself a coherent READER: it mutates no node.
-    reader: bool,
+/// The ONE RAM-mutation gate `apply_locked` pays a single monotonic load
+/// for: a mount that declared itself a coherent READER mutates no node (its
+/// cache is a projection of somebody else's tree).
+pub const ReaderGate = struct {
+    reader: std.atomic.Value(bool) = .init(false),
 
-    /// Whether this appender owns the volume's structural state — interior
-    /// nodes, tree roots, SMOs.
-    pub inline fn isAuthority(self: GateState) bool {
-        return self.writer_id == root_authority;
+    /// Not a reader: the write mount's posture.
+    pub const writer: ReaderGate = .{};
+
+    pub inline fn isReader(self: *const ReaderGate) bool {
+        return self.reader.load(.monotonic);
     }
 
-    /// A volume with exactly one appender: the shipped posture, where every
-    /// partitioning check is structurally inert.
-    pub inline fn isSolo(self: GateState) bool {
-        return self.writers <= 1;
-    }
-};
-
-const reader_bit: u32 = @bitCast(GateState{ .writer_id = 0, .writers = 0, .reader = true });
-/// The largest appender count the 15-bit field holds.
-pub const max_writers: u16 = std.math.maxInt(u15);
-
-comptime {
-    // The packed layout IS the wire layout the reference ships (reader bit
-    // 31, writers 16..31, writer_id 0..16).
-    std.debug.assert(reader_bit == 1 << 31);
-    std.debug.assert(@as(u32, @bitCast(GateState{ .writer_id = 0, .writers = 1, .reader = false })) == 1 << 16);
-    std.debug.assert(@as(u32, @bitCast(GateState{ .writer_id = 1, .writers = 0, .reader = false })) == 1);
-}
-
-/// One packed word carrying both mutation gates, so the ONE RAM-mutation
-/// choke point (`apply_locked`) pays a single monotonic load instead of two:
-/// reader ⇒ refuse every mutation; `level > 0 ∧ ¬authority` ⇒ refuse.
-pub const AppendGate = struct {
-    /// Word 0 = solo authority, not a reader: the shipped posture.
-    word: std.atomic.Value(u32) = .init(0),
-
-    pub const solo: AppendGate = .{};
-
-    /// One monotonic load — the whole cost of both gates (a declaration
-    /// happens once per mount, before any mutation it gates).
-    pub inline fn load(self: *const AppendGate) GateState {
-        return @bitCast(self.word.load(.monotonic));
-    }
-
-    /// Declare this mount a coherent reader (idempotent).
-    pub fn setReader(self: *AppendGate) void {
-        // acq_rel fetchOr paired with `setAppender`'s acq_rel CAS: the two
-        // declarations compose on the one word, never clobber (model
-        // `gate_declarations_never_clobber_each_other`).
-        _ = self.word.fetchOr(reader_bit, .acq_rel);
-    }
-
-    /// Declare this mount appender `writer_id` of `writers`. Refuses an
-    /// out-of-range partition (the count must fit its 15 bits, the id must
-    /// be inside its own count, zero appenders is nonsense) — structural
-    /// nonsense never reaches the partitioning checks.
-    pub fn setAppender(self: *AppendGate, writers: u16, writer_id: u16) error{InvalidPartition}!void {
-        if (writers == 0 or writers > max_writers or writer_id >= writers) return error.InvalidPartition;
-        const bits: u32 = @bitCast(GateState{ .writer_id = writer_id, .writers = @intCast(writers), .reader = false });
-        var cur = self.word.load(.monotonic);
-        while (true) {
-            // acq_rel CAS preserving the reader bit — a plain store here is
-            // the weakening the model proves loses a racing `setReader`.
-            cur = self.word.cmpxchgWeak(cur, (cur & reader_bit) | bits, .acq_rel, .monotonic) orelse return;
-        }
+    /// Declare this mount a coherent reader (idempotent; once per mount,
+    /// before any mutation it gates).
+    pub fn setReader(self: *ReaderGate) void {
+        self.reader.store(true, .release);
     }
 };
 
@@ -286,17 +227,17 @@ pub const StructuralHolds = struct {
 };
 
 /// The per-cache environment every cached node shares: the revalidation
-/// pair, the mutation gates and the hold ledger. One per cache, handed to
+/// pair, the reader gate and the hold ledger. One per cache, handed to
 /// every node at construction — the node needs it to answer "may I be
 /// mutated?" at the choke point, the cache to answer "is this node still
 /// current?" on every hit.
 pub const NodeEnv = struct {
     epoch: RevalidationEpoch,
-    gate: AppendGate,
+    gate: ReaderGate,
     holds: StructuralHolds,
 
     pub fn init(durable_tail: u64) NodeEnv {
-        return .{ .epoch = .init(durable_tail), .gate = .solo, .holds = .none };
+        return .{ .epoch = .init(durable_tail), .gate = .writer, .holds = .none };
     }
 };
 
@@ -327,25 +268,12 @@ test "epoch: arming is once per mount; publish is inert un-armed and on a non-ne
     try testing.expectEqual(@as(u64, 30), ep.tail());
 }
 
-test "gate: word 0 is the solo authority; declarations compose; refusals are typed" {
-    var gate: AppendGate = .solo;
-    const g0 = gate.load();
-    try testing.expect(!g0.reader and g0.isSolo() and g0.isAuthority());
-    try testing.expectError(error.InvalidPartition, gate.setAppender(0, 0));
-    try testing.expectError(error.InvalidPartition, gate.setAppender(4, 4));
-    try testing.expectError(error.InvalidPartition, gate.setAppender(max_writers + 1, 0));
-    try gate.setAppender(4, 3);
+test "gate: a write mount is no reader; the reader declaration is idempotent and sticky" {
+    var gate: ReaderGate = .writer;
+    try testing.expect(!gate.isReader());
     gate.setReader();
     gate.setReader();
-    const g = gate.load();
-    try testing.expect(g.reader);
-    try testing.expectEqual(@as(u16, 4), @as(u16, g.writers));
-    try testing.expectEqual(@as(u16, 3), g.writer_id);
-    try testing.expect(!g.isAuthority() and !g.isSolo());
-    try testing.expectEqual(@as(u32, (1 << 31) | (4 << 16) | 3), gate.word.load(.monotonic));
-    // A later appender declaration keeps the reader bit.
-    try gate.setAppender(max_writers, 0);
-    try testing.expect(gate.load().reader and gate.load().isAuthority());
+    try testing.expect(gate.isReader());
 }
 
 test "structural holds: the outermost guard brackets a nested hold; Σ is exact and includes the active part" {
@@ -366,11 +294,11 @@ test "structural holds: the outermost guard brackets a nested hold; Σ is exact 
     try testing.expectEqual([2]u64{ 9, 100 }, holds.snapshot(10));
 }
 
-test "node env: un-armed, solo, no holds" {
+test "node env: un-armed, a writer, no holds" {
     const env: NodeEnv = .init(7);
     try testing.expect(!env.epoch.isArmed());
     try testing.expectEqual(@as(u64, 7), env.epoch.tail());
-    try testing.expect(env.gate.load().isSolo());
+    try testing.expect(!env.gate.isReader());
     try testing.expectEqual([2]u64{ 0, 0 }, env.holds.snapshot(1));
 }
 

@@ -38,9 +38,6 @@ const BsetView = bset.BsetView;
 
 pub const FrameStamp = bset.FrameStamp;
 pub const FrameScreen = bset.FrameScreen;
-pub const FrameFormat = bset.FrameFormat;
-pub const TailPage = bset.TailPage;
-pub const probeTailPage = bset.probeTailPage;
 pub const encodeBsetFrame = bset.encodeBsetFrame;
 pub const keySuccessor = key.keySuccessor;
 
@@ -201,54 +198,31 @@ fn refuse(diag: ?*Refusal, r: Refusal) Error {
 }
 
 // ---------------------------------------------------------------------------
-// §1.4 NodeLayout — the validated node-size knob and the frame version.
+// §1.4 NodeLayout — the validated node-size knob and the frame stamp.
 // ---------------------------------------------------------------------------
+
+/// The ONE frame's header length (format v4): every node of every volume.
+pub const FRAME_LEN: usize = bset.BSET_FRAME_LEN;
 
 pub const NodeLayout = struct {
     node_size: usize,
-    frame: FrameFormat,
+    /// The fencing stamp the next frame write carries: `(0, 0)` — the
+    /// manager's structural stamp — until `stamped` names a lessee.
+    stamp: FrameStamp = .{},
 
     /// Valid iff `64 KiB ≤ ns ≤ 1 MiB ∧ ns % 4096 == 0`; anything else is a
-    /// format bug. The layout of every bit-17-ABSENT volume: v1 frames.
+    /// format bug.
     pub fn new(node_size: usize, diag: ?*Refusal) Error!NodeLayout {
         if (node_size < MIN_NODE_SIZE or node_size > MAX_NODE_SIZE or node_size % NODE_PAGE != 0) {
             return refuse(diag, .{ .invalid_node_size = node_size });
         }
-        return .{ .node_size = node_size, .frame = .v1 };
-    }
-
-    /// The layout of a symmetric-forest volume (incompat bit 17): v2 frames,
-    /// the manager's `(0, 0)` stamp until `stamped` names the writer.
-    pub fn newSymmetric(node_size: usize, diag: ?*Refusal) Error!NodeLayout {
-        var l = try new(node_size, diag);
-        l.frame = .{ .v2 = .{} };
-        return l;
+        return .{ .node_size = node_size };
     }
 
     /// This layout with `stamp` as the stamp the next write carries — a
-    /// per-write copy; a no-op on a v1 layout (the shipped frame carries no
-    /// stamp).
+    /// per-write copy.
     pub fn stamped(self: NodeLayout, stamp: FrameStamp) NodeLayout {
-        return switch (self.frame) {
-            .v1 => self,
-            .v2 => .{ .node_size = self.node_size, .frame = .{ .v2 = stamp } },
-        };
-    }
-
-    pub fn symmetricFrames(self: NodeLayout) bool {
-        return self.frame == .v2;
-    }
-
-    pub fn frameVersion(self: NodeLayout) u16 {
-        return self.frame.version();
-    }
-
-    pub fn frameLen(self: NodeLayout) usize {
-        return self.frame.frameLen();
-    }
-
-    pub fn frameStamp(self: NodeLayout) ?FrameStamp {
-        return self.frame.stamp();
+        return .{ .node_size = self.node_size, .stamp = stamp };
     }
 
     pub fn nodeSize(self: NodeLayout) usize {
@@ -264,13 +238,13 @@ pub const NodeLayout = struct {
     }
 
     /// Encoded record bytes ONE node image holds after its header page and
-    /// one bset frame: the compaction-vs-split line. 256 KiB v1: 257,984.
+    /// one bset frame: the compaction-vs-split line. 256 KiB: 257,976.
     pub fn foldCapacity(self: NodeLayout) usize {
-        return self.node_size - NODE_PAGE - self.frameLen() - bset.BSET_HEADER_LEN;
+        return self.node_size - NODE_PAGE - FRAME_LEN - bset.BSET_HEADER_LEN;
     }
 
     /// ¾ of `foldCapacity`: the per-part fill target on a split, so appends
-    /// have headroom. 256 KiB v1: 193,488.
+    /// have headroom. 256 KiB: 193,482.
     pub fn splitPartCapacity(self: NodeLayout) usize {
         return self.foldCapacity() * 3 / 4;
     }
@@ -286,7 +260,7 @@ pub const NodeLayout = struct {
     /// byte midpoint, so every fresh half holds `> ½C` and never pairs with
     /// an underfull node (`> ½C + ≤ ¼C > ¾C`) — a split is never undone by
     /// the next merge; a merge successor needs `> ¼C` of growth to split
-    /// again. 256 KiB v1: 64,496.
+    /// again. 256 KiB: 64,494.
     pub fn mergeCandidateCapacity(self: NodeLayout) usize {
         return self.splitPartCapacity() - self.foldCapacity() / 2;
     }
@@ -308,7 +282,8 @@ pub const NodeLayout = struct {
     /// On-disk length of the append frame `bytes` of encoded records
     /// produce; 0 for no records.
     pub fn appendFrameLen(self: NodeLayout, bytes: usize) usize {
-        return bset.appendFrameLen(self.frame, bytes);
+        _ = self;
+        return bset.appendFrameLen(bytes);
     }
 };
 
@@ -473,7 +448,7 @@ fn checkAddrAlignment(node_addr: u64, diag: ?*Refusal) Error!void {
 
 /// The frame encoder with this module's typed refusals.
 fn encodeFrame(gpa: Allocator, layout: NodeLayout, node_seq_at_write: u64, records: []const RecordRef, horizon: u64, diag: ?*Refusal) Error![]u8 {
-    return bset.encodeBsetFrame(gpa, layout.frame, layout.node_size, node_seq_at_write, records, horizon) catch |e| switch (e) {
+    return bset.encodeBsetFrame(gpa, layout.stamp, layout.node_size, node_seq_at_write, records, horizon) catch |e| switch (e) {
         error.ValueTooLarge => {
             const cap = layout.recordValueCapOf();
             var len: usize = 0;
@@ -635,8 +610,8 @@ pub fn deinitViews(gpa: Allocator, views: []BsetView) void {
     gpa.free(views);
 }
 
-/// `verify_node_extent`: every v1 load, and a v2 load with no lease plane
-/// (rule 3 alone).
+/// `verify_node_extent`: a load with no lease plane (rule 3 alone — the
+/// one-member forest's every load).
 pub fn verifyNodeExtent(gpa: Allocator, buf: []const u8, layout: NodeLayout, node_addr: u64, durable_tail: u64, diag: ?*Refusal) Error!LoadedNode {
     return verifyNodeExtentScreened(gpa, buf, layout, node_addr, durable_tail, null, diag);
 }
@@ -649,7 +624,6 @@ const ScreenedAt = struct { pos: usize, stamp: FrameStamp, rule: u8 };
 /// (§2.4). Branches only on checksum-verified bytes.
 pub fn verifyNodeExtentScreened(gpa: Allocator, buf: []const u8, layout: NodeLayout, node_addr: u64, durable_tail: u64, screen: ?FrameScreen, diag: ?*Refusal) Error!LoadedNode {
     const node_size = layout.node_size;
-    const frame_len = layout.frameLen();
     if (buf.len != node_size) return refuse(diag, .{ .extent_length = .{ .got = buf.len, .node_size = node_size } });
     const header = try decodeHeaderPage(buf[0..NODE_PAGE], diag);
     if (header.node_addr != node_addr) return refuse(diag, .{ .self_address_mismatch = .{ .header = header.node_addr, .read = node_addr } });
@@ -664,29 +638,27 @@ pub fn verifyNodeExtentScreened(gpa: Allocator, buf: []const u8, layout: NodeLay
     var prev_g: ?u32 = null;
     var screened_at: ?ScreenedAt = null;
     walk: while (pos < node_size) {
-        switch (bset.probeFrame(buf, pos, header.node_seq, layout.frame)) {
+        switch (bset.probeFrame(buf, pos, header.node_seq)) {
             .clean_end, .stale_incarnation => break :walk,
             .garbage => {
                 torn_stop = true;
                 break :walk;
             },
             .frame => |f| {
-                if (!bset.frameGeometryOk(f, pos, node_size, frame_len)) {
+                if (!bset.frameGeometryOk(f, pos, node_size)) {
                     // A verified same-incarnation frame lying about its
                     // geometry cannot be a tear (a torn prefix breaks the
                     // checksum): writer bug or real corruption.
                     return refuse(diag, .{ .impossible_geometry = .{ .node_addr = node_addr, .pos = pos, .seq = f.node_seq_at_write, .padded_len = f.padded_len, .bset_len = f.bset_len } });
                 }
-                if (f.stamp) |stamp| {
-                    // Rule 3 needs no plane; rules 1–2–4 read the screen.
-                    const rule: ?u8 = if (screen) |sc| sc.foreignRule(stamp, pos, prev_g) else if (prev_g != null and stamp.g < prev_g.?) 3 else null;
-                    if (rule) |r| {
-                        screened_at = .{ .pos = pos, .stamp = stamp, .rule = r };
-                        break :walk;
-                    }
-                    prev_g = stamp.g;
+                // Rule 3 needs no plane; rules 1–2–4 read the screen.
+                const rule: ?u8 = if (screen) |sc| sc.foreignRule(f.stamp, pos, prev_g) else if (prev_g != null and f.stamp.g < prev_g.?) 3 else null;
+                if (rule) |r| {
+                    screened_at = .{ .pos = pos, .stamp = f.stamp, .rule = r };
+                    break :walk;
                 }
-                const bset_start = pos + frame_len;
+                prev_g = f.stamp.g;
+                const bset_start = pos + FRAME_LEN;
                 var view = BsetView.parse(gpa, buf[bset_start .. bset_start + f.bset_len]) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     // The frame header landed, the records did not. Never
@@ -724,13 +696,12 @@ pub fn verifyNodeExtentScreened(gpa: Allocator, buf: []const u8, layout: NodeLay
             log.warn("node 0x{x}: bset frame at offset {d} (appender {d}, slot generation {d}) screened FOREIGN by rule {d} (design-symmetric-metadata §5.8.2; the lessee's current generation is {d}) — the log ends before it", .{ node_addr, s.pos, s.stamp.appender_id, s.stamp.g, s.rule, g_current });
         }
         var probe = s.pos +| NODE_PAGE;
-        while (probe + frame_len <= node_size) : (probe += NODE_PAGE) {
-            switch (bset.probeFrame(buf, probe, header.node_seq, layout.frame)) {
+        while (probe + FRAME_LEN <= node_size) : (probe += NODE_PAGE) {
+            switch (bset.probeFrame(buf, probe, header.node_seq)) {
                 .frame => |f| {
-                    if (!bset.frameGeometryOk(f, probe, node_size, frame_len)) continue;
-                    const stamp = f.stamp orelse continue;
+                    if (!bset.frameGeometryOk(f, probe, node_size)) continue;
                     const sc = screen orelse continue;
-                    if (sc.isCurrentOwn(stamp)) {
+                    if (sc.isCurrentOwn(f.stamp)) {
                         meta_kv_foreign_frame_overwrite_detected.inc();
                         return refuse(diag, .{ .zombie_overwrite = .{ .node_addr = node_addr, .stamp = s.stamp, .at = s.pos, .probe = probe } });
                     }
@@ -750,11 +721,11 @@ pub fn verifyNodeExtentScreened(gpa: Allocator, buf: []const u8, layout: NodeLay
     var dropped: u64 = @intFromBool(torn_stop);
     if (screened_at == null) {
         var probe = pos +| NODE_PAGE;
-        while (probe + frame_len <= node_size) : (probe += NODE_PAGE) {
-            switch (bset.probeFrame(buf, probe, header.node_seq, layout.frame)) {
+        while (probe + FRAME_LEN <= node_size) : (probe += NODE_PAGE) {
+            switch (bset.probeFrame(buf, probe, header.node_seq)) {
                 .frame => |f| {
-                    if (!bset.frameGeometryOk(f, probe, node_size, frame_len)) continue;
-                    const bset_start = probe + frame_len;
+                    if (!bset.frameGeometryOk(f, probe, node_size)) continue;
+                    const bset_start = probe + FRAME_LEN;
                     var view = BsetView.parse(gpa, buf[bset_start .. bset_start + f.bset_len]) catch |e| switch (e) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.Corrupt, error.ChecksumMismatch => continue,
@@ -783,11 +754,11 @@ pub fn verifyNodeExtentScreened(gpa: Allocator, buf: []const u8, layout: NodeLay
 
 /// §2.6 The highest node-seq stamp the RESIDUE of one extent carries: the
 /// header's `node_seq` if the page decodes, and `node_seq_at_write` of every
-/// frame header at any 4 KiB slot whose magic is KBSF and whose version
-/// ∈ {1, 2} verifies over ITS OWN checked span (24 or 32 B) — whatever
-/// incarnation stamped it; geometry is never trusted (only the stamp is
-/// read). 0 when nothing verifies. The offline census reclaim floors the
-/// writer's seq above it.
+/// frame header at any 4 KiB slot whose magic is KBSF and whose checksum
+/// verifies over `[0..32)` — whatever incarnation stamped it; geometry,
+/// version and reserved are never trusted (only the stamp is read). 0 when
+/// nothing verifies. The offline census reclaim floors the writer's seq
+/// above it.
 pub fn residueSeqCeiling(buf: []const u8) u64 {
     var ceiling: u64 = 0;
     if (buf.len >= NODE_PAGE) {
@@ -796,14 +767,10 @@ pub fn residueSeqCeiling(buf: []const u8) u64 {
         } else |_| {}
     }
     var pos: usize = NODE_PAGE;
-    while (pos + bset.BSET_FRAME_V2_LEN <= buf.len) : (pos += NODE_PAGE) {
-        const hdr = buf[pos..][0..bset.BSET_FRAME_V2_LEN];
+    while (pos + FRAME_LEN <= buf.len) : (pos += NODE_PAGE) {
+        const hdr = buf[pos..][0..FRAME_LEN];
         if (std.mem.readInt(u32, hdr[0..4], .little) != bset.BSET_FRAME_MAGIC) continue;
-        const checked: usize = switch (std.mem.readInt(u16, hdr[4..6], .little)) {
-            bset.BSET_FRAME_VERSION => bset.BSET_FRAME_LEN - 8,
-            bset.BSET_FRAME_VERSION_V2 => bset.BSET_FRAME_V2_LEN - 8,
-            else => continue,
-        };
+        const checked = bset.BSET_FRAME_CHECKSUM_OFF;
         if (std.mem.readInt(u64, hdr[checked..][0..8], .little) != checksum.xxh3(hdr[0..checked])) continue;
         ceiling = @max(ceiling, std.mem.readInt(u64, hdr[8..16], .little));
     }
@@ -915,7 +882,7 @@ pub fn compactNode(gpa: Allocator, layout: NodeLayout, src: *const LoadedNode, e
     var folded = try foldNodeSources(gpa, &.{src}, &.{extra}, durable_tail);
     defer folded.deinit(gpa);
     if (folded.records.items.len > 0) {
-        const image_len = NODE_PAGE + bset.pageAlign(layout.frameLen() + bset.BSET_HEADER_LEN + folded.encodedBytes());
+        const image_len = NODE_PAGE + bset.pageAlign(FRAME_LEN + bset.BSET_HEADER_LEN + folded.encodedBytes());
         if (image_len > layout.node_size) return refuse(diag, .{ .node_full = .{ .needed = image_len, .available = layout.node_size } });
     }
     const refs = try folded.refs(gpa);
@@ -1035,7 +1002,7 @@ pub fn mergeNodes(gpa: Allocator, layout: NodeLayout, left: *const LoadedNode, r
     var folded = try foldNodeSources(gpa, &.{ left, right }, &.{ extra_left, extra_right }, durable_tail);
     defer folded.deinit(gpa);
     if (folded.records.items.len > 0) {
-        const image_len = NODE_PAGE + bset.pageAlign(layout.frameLen() + bset.BSET_HEADER_LEN + folded.encodedBytes());
+        const image_len = NODE_PAGE + bset.pageAlign(FRAME_LEN + bset.BSET_HEADER_LEN + folded.encodedBytes());
         if (image_len > layout.node_size) return refuse(diag, .{ .node_full = .{ .needed = image_len, .available = layout.node_size } });
     }
     const refs = try folded.refs(gpa);
@@ -1135,9 +1102,7 @@ test "NodeLayout validates the format knob: 64 KiB/128 KiB/256 KiB/1 MiB accepte
     for ([_]usize{ MIN_NODE_SIZE, 128 * 1024, DEFAULT_NODE_SIZE, MAX_NODE_SIZE }) |good| {
         const l = try NodeLayout.new(good, null);
         try testing.expectEqual(good, l.nodeSize());
-        try testing.expectEqual(@as(u16, 1), l.frameVersion());
-        try testing.expectEqual(@as(usize, 32), l.frameLen());
-        try testing.expect(!l.symmetricFrames());
+        try testing.expectEqual(FrameStamp{}, l.stamp);
     }
     var diag: Refusal = undefined;
     for ([_]usize{ 0, NODE_PAGE, MIN_NODE_SIZE - NODE_PAGE, DEFAULT_NODE_SIZE + 1, DEFAULT_NODE_SIZE + 512, MAX_NODE_SIZE * 2 }) |bad| {
@@ -1148,20 +1113,17 @@ test "NodeLayout validates the format knob: 64 KiB/128 KiB/256 KiB/1 MiB accepte
     var w: std.Io.Writer = .fixed(&buf);
     try diag.write(&w);
     try testing.expectEqualStrings("invalid node_size 2097152: must be a 4 KiB multiple in [65536, 1048576]", w.buffered());
-    // The symmetric layout: v2 frames stamped (0, 0); `stamped` is a
-    // per-write copy and a no-op on v1.
-    const sym = try NodeLayout.newSymmetric(DEFAULT_NODE_SIZE, null);
-    try testing.expect(sym.symmetricFrames());
-    try testing.expectEqual(@as(u16, 2), sym.frameVersion());
-    try testing.expectEqual(@as(usize, 40), sym.frameLen());
-    try testing.expectEqual(FrameStamp{}, sym.frameStamp().?);
-    const st = sym.stamped(.{ .appender_id = 3, .g = 9 });
-    try testing.expectEqual(FrameStamp{ .appender_id = 3, .g = 9 }, st.frameStamp().?);
-    try testing.expectEqual(FrameStamp{}, sym.frameStamp().?);
-    try testing.expectEqual(@as(?FrameStamp, null), defaultLayout().stamped(.{ .g = 1 }).frameStamp());
+    // ONE frame: 40 B stamped (0, 0) by default; `stamped` is a per-write
+    // copy that leaves the original's stamp alone.
+    try testing.expectEqual(@as(usize, 40), FRAME_LEN);
+    const l = defaultLayout();
+    const st = l.stamped(.{ .appender_id = 3, .g = 9 });
+    try testing.expectEqual(FrameStamp{ .appender_id = 3, .g = 9 }, st.stamp);
+    try testing.expectEqual(FrameStamp{}, l.stamp);
+    try testing.expectEqual(l.node_size, st.node_size);
 }
 
-test "record value cap is min(ceiling, node/4) + the 256 envelope; the §1.4 geometry ties: C 257,984 / ¾C 193,488 / ¼C 64,496 at 256 KiB v1; the 64 KiB variants; v2 loses 8" {
+test "record value cap is min(ceiling, node/4) + the 256 envelope; the §1.4 geometry ties: C 257,976 / ¾C 193,482 / ¼C 64,494 at 256 KiB; the 64 KiB variants" {
     try testing.expectEqual(@as(usize, 256), XATTR_RECORD_ENVELOPE_MAX);
     try testing.expectEqual(@as(usize, 65_536), xattrValueCap(DEFAULT_NODE_SIZE));
     try testing.expectEqual(@as(usize, 16_384), xattrValueCap(MIN_NODE_SIZE));
@@ -1174,18 +1136,18 @@ test "record value cap is min(ceiling, node/4) + the 256 envelope; the §1.4 geo
     const l = defaultLayout();
     try testing.expectEqual(@as(usize, 65_792), l.recordValueCapOf());
     try testing.expectEqual(@as(usize, 65_536), l.xattrValueCapOf());
-    try testing.expectEqual(@as(usize, 257_984), l.foldCapacity());
-    try testing.expectEqual(@as(usize, 193_488), l.splitPartCapacity());
-    try testing.expectEqual(@as(usize, 193_488), l.mergePairCapacity());
-    try testing.expectEqual(@as(usize, 64_496), l.mergeCandidateCapacity());
-    try testing.expectEqual(@as(usize, 127_696), l.splitGrowthWindow());
+    // C = node − 4096 (header page) − 40 (frame) − 32 (bset header).
+    try testing.expectEqual(DEFAULT_NODE_SIZE - NODE_PAGE - FRAME_LEN - bset.BSET_HEADER_LEN, l.foldCapacity());
+    try testing.expectEqual(@as(usize, 257_976), l.foldCapacity());
+    try testing.expectEqual(@as(usize, 193_482), l.splitPartCapacity());
+    try testing.expectEqual(@as(usize, 193_482), l.mergePairCapacity());
+    try testing.expectEqual(@as(usize, 64_494), l.mergeCandidateCapacity());
+    try testing.expectEqual(@as(usize, 127_690), l.splitGrowthWindow());
     const small = try NodeLayout.new(MIN_NODE_SIZE, null);
     try testing.expectEqual(@as(usize, 16_640), small.recordValueCapOf());
-    try testing.expectEqual(@as(usize, 61_376), small.foldCapacity());
-    try testing.expectEqual(@as(usize, 46_032), small.splitPartCapacity());
-    try testing.expectEqual(@as(usize, 15_344), small.mergeCandidateCapacity());
-    const sym = try NodeLayout.newSymmetric(DEFAULT_NODE_SIZE, null);
-    try testing.expectEqual(@as(usize, 257_976), sym.foldCapacity());
+    try testing.expectEqual(@as(usize, 61_368), small.foldCapacity());
+    try testing.expectEqual(@as(usize, 46_026), small.splitPartCapacity());
+    try testing.expectEqual(@as(usize, 15_342), small.mergeCandidateCapacity());
     // smo_extents_for_parts: 1 for a fit, parts + 2 past it.
     try testing.expectEqual(@as(u64, 1), l.smoExtentsForParts(l.foldCapacity(), 7));
     try testing.expectEqual(@as(u64, 4), l.smoExtentsForParts(l.foldCapacity() + 1, 2));
@@ -1193,16 +1155,21 @@ test "record value cap is min(ceiling, node/4) + the 256 envelope; the §1.4 geo
     // frame + bset headers push a page-filling batch to the next page.
     try testing.expectEqual(@as(usize, 0), l.appendFrameLen(0));
     try testing.expectEqual(@as(usize, 4096), l.appendFrameLen(100));
-    try testing.expectEqual(@as(usize, 8192), l.appendFrameLen(4096 - 64 + 1));
-    try testing.expectEqual(@as(usize, 4096), l.appendFrameLen(4096 - 64));
-    // Fanout: an interior record ≈ 15 hdr + 16 value + 8–16 key ≈ 36–40 B
-    // ⇒ ≈ 7,000 children at 256 KiB ⇒ 100 M records at depth ≤ 3.
+    try testing.expectEqual(@as(usize, 8192), l.appendFrameLen(4096 - 72 + 1));
+    try testing.expectEqual(@as(usize, 4096), l.appendFrameLen(4096 - 72));
+    // Fanout (format v4): an interior record = 16 B header + 16 B value +
+    // the separator key — 41 B over a 9 B inode key (the shortest real
+    // separator of a slot tree) ⇒ 6,292 children at 256 KiB ⇒ 2.5×10¹¹
+    // records at depth ≤ 3, inside the charter's "≈ 7,000 ⇒ 100 M at depth
+    // ≤ 3" envelope (the v3 estimate was 36 B ⇒ 7,166; the 16 B header and
+    // the kind byte on every key cost 2 B per child). A ref record frames
+    // at 16 + 29 + 4 = 49 B (the reference measured 46 B).
     const interior_record_len = rec.RECORD_HEADER_LEN + key.InteriorValue.LEN + key.INODE_KEY_LEN;
-    try testing.expectEqual(@as(usize, 39), interior_record_len);
-    try testing.expectEqual(@as(usize, 7_166), l.foldCapacity() / 36);
-    try testing.expect(l.foldCapacity() / interior_record_len >= 6_500);
+    try testing.expectEqual(@as(usize, 41), interior_record_len);
+    try testing.expectEqual(@as(usize, 6_292), l.foldCapacity() / interior_record_len);
     const fanout = l.foldCapacity() / interior_record_len;
     try testing.expect(fanout * fanout * fanout >= 100_000_000);
+    try testing.expectEqual(@as(usize, 49), rec.RECORD_HEADER_LEN + key.BLOCK_REF_KEY_LEN + rec.BLOCK_REF_VALUE_LEN);
     // Interior values are exactly 16 B.
     const iv = key.encodeInteriorValue(0x840000, 7);
     try testing.expectEqual(@as(usize, 16), iv.len);
@@ -1581,7 +1548,7 @@ test "torn-tail classifier: a torn unit truncates the view and is counted (prior
     // the walk stops there; the third bset (horizon 20) is beyond it.
     const pristine = try gpa.dupe(u8, vol.bytes);
     defer gpa.free(pristine);
-    vol.bytes[t1 + 32 + 40] ^= 0xFF;
+    vol.bytes[t1 + FRAME_LEN + 40] ^= 0xFF;
     const dropped_before = meta_kv_node_dropped_tail_bsets.load();
     {
         // durable_tail 15 < 20: the trailing bset is the replay window ⇒
@@ -1627,13 +1594,13 @@ test "torn-tail classifier: a torn unit truncates the view and is counted (prior
     // A verified frame lying about its geometry is Corrupt, never a tear.
     @memcpy(vol.bytes, pristine);
     std.mem.writeInt(u32, vol.bytes[t1 + 16 ..][0..4], DEFAULT_NODE_SIZE, .little);
-    std.mem.writeInt(u64, vol.bytes[t1 + 24 ..][0..8], checksum.xxh3(vol.bytes[t1..][0..24]), .little);
+    restampFrame(vol.bytes[t1..][0..FRAME_LEN]);
     var diag: Refusal = undefined;
     try testing.expectError(error.Corrupt, verifyNodeExtent(gpa, vol.extent(l, 0), l, 0, 0, &diag));
     try testing.expectEqual(t1, diag.impossible_geometry.pos);
     @memcpy(vol.bytes, pristine);
     std.mem.writeInt(u32, vol.bytes[t1 + 20 ..][0..4], 31, .little);
-    std.mem.writeInt(u64, vol.bytes[t1 + 24 ..][0..8], checksum.xxh3(vol.bytes[t1..][0..24]), .little);
+    restampFrame(vol.bytes[t1..][0..FRAME_LEN]);
     try testing.expectError(error.Corrupt, verifyNodeExtent(gpa, vol.extent(l, 0), l, 0, 0, &diag));
     try testing.expect(diag == .impossible_geometry);
     // Untouched: everything loads, nothing dropped.
@@ -1644,16 +1611,23 @@ test "torn-tail classifier: a torn unit truncates the view and is counted (prior
     try testing.expectEqual(@as(u64, 0), clean.dropped_tail_bsets);
 }
 
-/// A v2 frame image with an explicit stamp, for the screen tests.
+/// Restamp a doctored frame header: the frame's checksum covers `[0..32)`
+/// (not the field-zeroed whole header), so the structural gates behind it
+/// are reachable.
+fn restampFrame(hdr: *[FRAME_LEN]u8) void {
+    std.mem.writeInt(u64, hdr[bset.BSET_FRAME_CHECKSUM_OFF..][0..8], checksum.xxh3(hdr[0..bset.BSET_FRAME_CHECKSUM_OFF]), .little);
+}
+
+/// A frame image with an explicit stamp, for the screen tests.
 fn stampedFrame(gpa: Allocator, ns: usize, node_seq: u64, stamp: FrameStamp, ino: u64, seq: u64) ![]u8 {
     const v = inodeValue(seq).encode();
     const r = RecordRef{ .key = &key.inodeKey(ino), .seq = seq, .kind = .put, .value = &v };
-    return bset.encodeBsetFrame(gpa, .{ .v2 = stamp }, ns, node_seq, &.{r}, seq);
+    return bset.encodeBsetFrame(gpa, stamp, ns, node_seq, &.{r}, seq);
 }
 
 test "the frame screen: rule 3 alone without a plane ((0,0) priming law); rules 1→2→3→4 in order with a plane; a screened stop skips the torn-tail pass; breach + fenced trips the tripwire" {
     const gpa = testing.allocator;
-    const l = try NodeLayout.newSymmetric(MIN_NODE_SIZE, null);
+    const l = try NodeLayout.new(MIN_NODE_SIZE, null);
     var vol = try Volume.init(gpa, MIN_NODE_SIZE);
     defer vol.deinit(gpa);
     var hdr = try vol.writeNodeAt(gpa, l, wp(0, 1, "", "\xff"), &.{}, 0);
@@ -1760,7 +1734,7 @@ test "the frame screen: rule 3 alone without a plane ((0,0) priming law); rules 
 
 test "screened-stop zombie-overwrite scan: a foreign frame BEFORE the lessee's own current-generation frame is foreign_frame_overwrite_detected ⇒ Corrupt" {
     const gpa = testing.allocator;
-    const l = try NodeLayout.newSymmetric(MIN_NODE_SIZE, null);
+    const l = try NodeLayout.new(MIN_NODE_SIZE, null);
     var vol = try Volume.init(gpa, MIN_NODE_SIZE);
     defer vol.deinit(gpa);
     var hdr = try vol.writeNodeAt(gpa, l, wp(0, 1, "", "\xff"), &.{}, 0);
@@ -1790,38 +1764,46 @@ test "screened-stop zombie-overwrite scan: a foreign frame BEFORE the lessee's o
     defer node.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), node.bsetCount());
     try testing.expectEqual(@as(u64, 1), node.foreign_frames_screened);
-    // The tail-page probe over the same bytes: ours / foreign / clear.
-    try testing.expectEqual(TailPage.ours, probeTailPage(vol.bytes[NODE_PAGE..], 1, l.stamped(.{ .appender_id = 7, .g = 3 }).frame));
-    try testing.expectEqual(TailPage{ .foreign = .{ .appender_id = 6, .g = 2 } }, probeTailPage(vol.bytes[2 * NODE_PAGE ..], 1, l.stamped(.{ .appender_id = 7, .g = 3 }).frame));
-    try testing.expectEqual(TailPage.clear, probeTailPage(vol.bytes[4 * NODE_PAGE ..], 1, l.frame));
-    try testing.expectEqual(TailPage.clear, probeTailPage(vol.bytes[NODE_PAGE..], 2, l.frame));
 }
 
-test "a v1 frame on a v2 layout and a v2 frame on a v1 layout are both Garbage (a counted torn stop)" {
+test "a frame with a foreign version or a non-zero reserved field is Garbage (a counted torn stop); the one-member forest's (0, 0) frames load everywhere" {
     const gpa = testing.allocator;
-    const v1 = try NodeLayout.new(MIN_NODE_SIZE, null);
-    const v2 = try NodeLayout.newSymmetric(MIN_NODE_SIZE, null);
+    const l = try NodeLayout.new(MIN_NODE_SIZE, null);
     var vol = try Volume.init(gpa, MIN_NODE_SIZE);
     defer vol.deinit(gpa);
-    var hdr = try vol.writeNodeAt(gpa, v1, wp(0, 1, "", "\xff"), &.{}, 0);
+    var hdr = try vol.writeNodeAt(gpa, l, wp(0, 1, "", "\xff"), &.{}, 0);
     defer hdr.deinit(gpa);
     const f = try stampedFrame(gpa, MIN_NODE_SIZE, 1, .{}, 1, 1);
     defer gpa.free(f);
     vol.write(NODE_PAGE, f);
-    // The header is layout-agnostic; the v2 frame on the v1 layout is
-    // garbage (torn stop, dropped 1) …
-    var n1 = try vol.load(gpa, v1, 0, 0);
-    defer n1.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), n1.bsetCount());
-    try testing.expectEqual(@as(u64, 1), n1.dropped_tail_bsets);
-    // … and the same frame on the v2 layout is a frame.
-    var n2 = try vol.load(gpa, v2, 0, 0);
-    defer n2.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), n2.bsetCount());
-    try testing.expectEqual(@as(u64, 0), n2.dropped_tail_bsets);
+    {
+        var n = try vol.load(gpa, l, 0, 0);
+        defer n.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), n.bsetCount());
+        try testing.expectEqual(@as(u64, 0), n.dropped_tail_bsets);
+    }
+    // A foreign frame version, restamped so only the version rule rejects.
+    std.mem.writeInt(u16, vol.bytes[NODE_PAGE + 4 ..][0..2], 2, .little);
+    restampFrame(vol.bytes[NODE_PAGE..][0..FRAME_LEN]);
+    {
+        var n = try vol.load(gpa, l, 0, 0);
+        defer n.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), n.bsetCount());
+        try testing.expectEqual(@as(u64, 1), n.dropped_tail_bsets);
+    }
+    // A non-zero reserved field, restamped: the same verified-liar class.
+    vol.write(NODE_PAGE, f);
+    std.mem.writeInt(u16, vol.bytes[NODE_PAGE + 6 ..][0..2], 1, .little);
+    restampFrame(vol.bytes[NODE_PAGE..][0..FRAME_LEN]);
+    {
+        var n = try vol.load(gpa, l, 0, 0);
+        defer n.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), n.bsetCount());
+        try testing.expectEqual(@as(u64, 1), n.dropped_tail_bsets);
+    }
 }
 
-test "residue ceiling: the header's seq and every verifying frame stamp of either version at any 4 KiB slot; 0 for nothing" {
+test "residue ceiling: the header's seq and every verifying frame stamp at any 4 KiB slot; 0 for nothing" {
     const gpa = testing.allocator;
     const l = defaultLayout();
     var vol = try Volume.init(gpa, DEFAULT_NODE_SIZE);
@@ -1831,12 +1813,12 @@ test "residue ceiling: the header's seq and every verifying frame stamp of eithe
     var hdr = try vol.writeNodeAt(gpa, l, wp(0, 40, "", "\xff"), &.{}, 0);
     defer hdr.deinit(gpa);
     try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes));
-    // A v1 frame of another incarnation deep in the extent, and a v2 frame
-    // elsewhere: both count; a frame with a broken checksum does not.
+    // Frames of other incarnations deep in the extent, under any stamp:
+    // every verifying one counts; a frame with a broken checksum does not.
     var r = [_]Record{try putIno(gpa, 1, 1)};
     defer rec.deinitRecords(gpa, &r);
     var rbuf: [1]RecordRef = undefined;
-    const f1 = try bset.encodeBsetFrame(gpa, .v1, DEFAULT_NODE_SIZE, 77, refsOf(&r, &rbuf), 1);
+    const f1 = try bset.encodeBsetFrame(gpa, .{}, DEFAULT_NODE_SIZE, 77, refsOf(&r, &rbuf), 1);
     defer gpa.free(f1);
     vol.write(10 * NODE_PAGE, f1);
     try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes));
@@ -1846,9 +1828,12 @@ test "residue ceiling: the header's seq and every verifying frame stamp of eithe
     try testing.expectEqual(@as(u64, 90), residueSeqCeiling(vol.bytes));
     vol.bytes[20 * NODE_PAGE + 9] ^= 1;
     try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes));
-    // A frame with an unknown version is not a candidate.
+    // The ceiling trusts only the checksum: a verifying frame of a foreign
+    // VERSION still names its incarnation (residue is residue).
     std.mem.writeInt(u16, vol.bytes[10 * NODE_PAGE + 4 ..][0..2], 3, .little);
-    std.mem.writeInt(u64, vol.bytes[10 * NODE_PAGE + 24 ..][0..8], checksum.xxh3(vol.bytes[10 * NODE_PAGE ..][0..24]), .little);
+    restampFrame(vol.bytes[10 * NODE_PAGE ..][0..FRAME_LEN]);
+    try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes));
+    vol.bytes[10 * NODE_PAGE + 9] ^= 1;
     try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes));
 }
 
@@ -1910,7 +1895,7 @@ test "compact folds into a fresh extent, old untouched: in-place refused; durabl
     try testing.expectEqual(@as(usize, 3), again.bsetCount());
     // f(N): the fold's encoded bytes under the same rule.
     const fb = try foldBytes(gpa, &src, &.{}, 6);
-    try testing.expectEqual(@as(usize, (15 + 8 + 57) + (15 + 8)), fb);
+    try testing.expectEqual(@as(usize, (16 + 9 + 68) + (16 + 9)), fb);
 }
 
 test "split partitions the key space into two fresh nodes: left == right and dst == src refused; folds concatenate; right.min == key_successor(left.max); bounds inclusive; < 2 records refused" {
@@ -2008,7 +1993,7 @@ test "compact overflow signals split: a full 64 KiB log + 8 × 4 KiB-value extra
     try testing.expectEqual(@as(usize, 15), src.bsetCount());
     try testing.expectEqual(MIN_NODE_SIZE, src.tail_offset);
     const v4k: [4096]u8 = @splat(0x22);
-    var keys: [8][8]u8 = undefined;
+    var keys: [8][key.INODE_KEY_LEN]u8 = undefined;
     var extra: [8]RecordRef = undefined;
     for (&extra, 0..) |*e, i| {
         keys[i] = key.inodeKey(100 + i);
@@ -2124,176 +2109,6 @@ test "finding 41: a split never cuts a same-key group (a versioned layout chain'
     try testing.expectEqual(@as(?usize, 1), splitCut(&back));
 }
 
-/// The reference binary's format output under `/build/tmp` in the Linux
-/// venue (`scripts/venue '/build/ref/squeezefs format [--single-writer] -f
-/// sqmeta:///build/tmp/ref-{sw,sym}.img …'`); absent elsewhere ⇒ the
-/// cross-check tests (here and in `format.zig`) skip.
-pub const ReferenceVolume = struct {
-    file: std.Io.File,
-    io: std.Io,
-
-    pub fn open(io: std.Io, path: []const u8) !?ReferenceVolume {
-        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |e| switch (e) {
-            error.FileNotFound => return null,
-            else => return e,
-        };
-        return .{ .file = file, .io = io };
-    }
-
-    pub fn close(self: *ReferenceVolume) void {
-        self.file.close(self.io);
-    }
-
-    pub fn length(self: *ReferenceVolume) !u64 {
-        return self.file.length(self.io);
-    }
-
-    pub fn readAt(self: *ReferenceVolume, gpa: Allocator, offset: u64, len: usize) ![]u8 {
-        const buf = try gpa.alloc(u8, len);
-        errdefer gpa.free(buf);
-        const got = try self.file.readPositionalAll(self.io, buf, offset);
-        try testing.expectEqual(len, got);
-        return buf;
-    }
-};
-
-/// Cross-check 1: a reference-formatted volume decodes end to end through
-/// the Zig codecs — superblock → newest ledger slot → every root node →
-/// its bsets and records — and the root inode is a directory.
-fn crossCheckReferenceVolume(gpa: Allocator, path: []const u8, expect_forest: bool) !bool {
-    const superblock = @import("superblock.zig");
-    const ledger = @import("ledger.zig");
-    const alloc_ext = @import("alloc_ext.zig");
-    const node_seq = @import("node_seq.zig");
-    var vol = (try ReferenceVolume.open(testing.io, path)) orelse return false;
-    defer vol.close();
-    const sector0 = try vol.readAt(gpa, 0, superblock.sector_len);
-    defer gpa.free(sector0);
-    const fmt = try superblock.classifySector0(sector0, null);
-    const sb = fmt.v3;
-    try testing.expectEqual(expect_forest, sb.symmetricForestStamped());
-    try testing.expectEqual(expect_forest, sb.multiWriterClass());
-    try testing.expectEqual(@as(u32, DEFAULT_NODE_SIZE), sb.node_size);
-    const layout = if (expect_forest) try NodeLayout.newSymmetric(sb.node_size, null) else try NodeLayout.new(sb.node_size, null);
-    const ledger_img = try vol.readAt(gpa, sb.root_ledger.start, @intCast(sb.root_ledger.len));
-    defer gpa.free(ledger_img);
-    var record = (try ledger.newestValid(gpa, ledger_img)) orelse return error.TestUnexpectedResult;
-    defer record.deinit(gpa);
-    try testing.expectEqual(@as(u64, 1), record.seq);
-    try testing.expectEqual(@as(u64, 0), record.journal_tail_seq);
-    try testing.expectEqual(@as(u64, 2), record.next_ino);
-    try testing.expectEqual(@as(u64, 1), record.alloc_bitmap_generation);
-    try testing.expectEqual(@as(?journal_part, null), record.append_partition);
-    const stamp = record.membership_stamp orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u32, 65536), stamp.routing_width);
-    try testing.expectEqual(@as(?u16, 0), stamp.native_slot);
-    try testing.expectEqual(checksum.xxh3(&stamp.set_uuid), sb.hash_seed);
-    // Node seqs: base + 1, base + 2, … in tree order; the watermark is the
-    // last mint.
-    const base = node_seq.nodeSeqBase(sb.uuid);
-    try testing.expectEqual(@as(usize, if (expect_forest) 2 else 3), record.tree_roots.len);
-    try testing.expectEqual(base + record.tree_roots.len, record.node_seq_watermark);
-    const expected_trees: []const u8 = if (expect_forest) &.{ 8, 0 } else &.{ 1, 2, 3 };
-    var saw_root_dir = false;
-    var saw_format_config = false;
-    for (record.tree_roots, 0..) |root, i| {
-        try testing.expectEqual(expected_trees[i], root.tree_id);
-        try testing.expectEqual(base + i + 1, root.node_seq);
-        try testing.expectEqual(sb.heap.start + i * sb.node_size, root.node_addr);
-        const extent = try vol.readAt(gpa, root.node_addr, sb.node_size);
-        defer gpa.free(extent);
-        var node = try verifyNodeExtent(gpa, extent, layout, root.node_addr, record.journal_tail_seq, null);
-        defer node.deinit(gpa);
-        try testing.expectEqual(root.tree_id, node.header.tree_id);
-        try testing.expectEqual(root.node_seq, node.header.node_seq);
-        try testing.expectEqual(@as(u8, 0), node.header.level);
-        try testing.expectEqualStrings("", node.header.min_key);
-        try testing.expectEqualSlices(u8, &key.KEY_SPACE_MAX, node.header.max_key);
-        try testing.expectEqual(@as(u64, 0), node.dropped_tail_bsets);
-        try testing.expectEqual(@as(u64, 0), node.foreign_frames_screened);
-        try testing.expect(node.bsetCount() <= 1);
-        try testing.expectEqual(NODE_PAGE * (1 + node.bsetCount()), node.tail_offset);
-        if (node.bsetCount() == 0) continue;
-        var view = try node.bsetAt(gpa, 0);
-        defer view.deinit(gpa);
-        try testing.expectEqual(@as(u64, 0), view.journal_seq_horizon);
-        for (0..view.len()) |ri| {
-            const r = view.record(ri);
-            try testing.expectEqual(@as(u64, 0), r.seq);
-            try testing.expectEqual(rec.RecordKind.put, r.kind);
-            const kind: u8 = if (expect_forest) try key.forestKeyKind(r.key) else root.tree_id;
-            const legacy: []const u8 = if (expect_forest) (try key.splitForestKey(r.key)).legacy.slice() else r.key;
-            switch (kind) {
-                key.TREE_INODES => {
-                    try testing.expectEqual(@as(u64, 1), try key.decodeInodeKey(legacy));
-                    const iv = try InodeValue.decode(r.value);
-                    try testing.expectEqual(@as(u32, 0o040000), iv.mode & 0o170000);
-                    try testing.expectEqual(@as(u32, 0o755), iv.mode & 0o7777);
-                    try testing.expectEqual(@as(u32, 2), iv.nlink);
-                    saw_root_dir = true;
-                },
-                key.TREE_XATTRS => {
-                    const x = try rec.XattrValue.decode(r.value);
-                    try testing.expectEqualStrings("user.squeezefs.format_config", x.name);
-                    try testing.expect(std.mem.startsWith(u8, x.value, "{\"name\":\"squeezefs\""));
-                    const xk = try key.XattrKey.decode(legacy);
-                    try testing.expectEqual(@as(u64, 1), xk.ino());
-                    try testing.expectEqual(key.xattrNameHash56(x.name, sb.hash_seed), xk.hash56());
-                    saw_format_config = true;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        }
-        // The point lookup through the one algebra.
-        const ino1_key = if (expect_forest) (try key.forestKey(key.TREE_INODES, &key.inodeKey(1))).slice() else &key.inodeKey(1);
-        if (root.tree_id == 1 or root.tree_id == 0) {
-            var f = try node.lookup(gpa, ino1_key);
-            defer f.deinit(gpa);
-            try testing.expect(f == .put and !f.put.owned);
-        }
-    }
-    try testing.expect(saw_root_dir);
-    try testing.expect(saw_format_config);
-    // The bitmap: slot A at generation 1 claims exactly the nodes (+ the
-    // directory extent on a forest).
-    const region = try vol.readAt(gpa, sb.alloc_bitmap.start, @intCast(sb.alloc_bitmap.len));
-    defer gpa.free(region);
-    const page = try alloc_ext.decodeBitmapPage(region[0..alloc_ext.page_len], 0);
-    try testing.expectEqual(@as(u64, 1), page.generation);
-    // Flat: three roots; forest: two roots + the directory extent.
-    try testing.expectEqual(@as(u8, 0b111), page.bits[0]);
-    try testing.expect(std.mem.allEqual(u8, page.bits[1..], 0));
-    if (expect_forest) {
-        const geometry = @import("geometry.zig");
-        try testing.expectEqual(sb.heap.start + 2 * sb.node_size, sb.appender_dir.start);
-        const dir_hdr = try vol.readAt(gpa, geometry.dirHeaderOffset(sb.appender_dir), 4096);
-        defer gpa.free(dir_hdr);
-        var want_dir: [4096]u8 = undefined;
-        geometry.dirHeaderPage(sb.node_size, &want_dir);
-        try testing.expectEqualSlices(u8, &want_dir, dir_hdr);
-        const page0 = try vol.readAt(gpa, geometry.appender0FormatPageOffset(sb.journal), 4096);
-        defer gpa.free(page0);
-        var want_page: [4096]u8 = undefined;
-        geometry.appender0FreePage(sb.journal, &want_page);
-        try testing.expectEqualSlices(u8, &want_page, page0);
-    }
-    // The DUR-5 tail copy is byte-identical to sector 0.
-    const tail = try vol.readAt(gpa, superblock.backupSlotFor(sb, 256 << 20).?, superblock.sector_len);
-    defer gpa.free(tail);
-    try testing.expectEqualSlices(u8, sector0, tail);
-    return true;
-}
-
-const journal_part = @import("journal.zig").AppendPartition;
-
-test "cross-check 1: the reference `format --single-writer` volume decodes through the Zig codecs (skipped when /build/tmp/ref-sw.img is absent)" {
-    if (!try crossCheckReferenceVolume(testing.allocator, "/build/tmp/ref-sw.img", false)) return error.SkipZigTest;
-}
-
-test "cross-check 1: the reference default (symmetric forest) volume decodes through the Zig codecs (skipped when /build/tmp/ref-sym.img is absent)" {
-    if (!try crossCheckReferenceVolume(testing.allocator, "/build/tmp/ref-sym.img", true)) return error.SkipZigTest;
-}
-
 test "merge: f(L)+f(R) ≤ ¾C ∧ min ≤ ¼C; adjacency required; the successor spans [L.min, R.max] with one fold; parent records Put(R.max → succ) + Delete(L.max)" {
     const gpa = testing.allocator;
     const l = defaultLayout();
@@ -2302,8 +2117,8 @@ test "merge: f(L)+f(R) ≤ ¾C ∧ min ≤ ¼C; adjacency required; the successo
     try testing.expect(mergeable(l, 60_000, 100_000));
     try testing.expect(!mergeable(l, 100_000, 100_000)); // both above ¼C
     try testing.expect(!mergeable(l, 10_000, 190_000)); // sum above ¾C
-    try testing.expect(mergeable(l, 64_496, 128_992));
-    try testing.expect(!mergeable(l, 64_497, 128_991));
+    try testing.expect(mergeable(l, 64_494, 128_988));
+    try testing.expect(!mergeable(l, 64_495, 128_987));
     // A fresh half (> ½C) never pairs with an underfull node.
     try testing.expect(!mergeable(l, l.foldCapacity() / 2 + 1, l.mergeCandidateCapacity()));
     var vol = try Volume.init(gpa, 4 * DEFAULT_NODE_SIZE);

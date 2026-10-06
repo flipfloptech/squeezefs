@@ -6,8 +6,10 @@
 //! differential test at the bottom runs both over the same sequential op
 //! lists so a drift between core and model goes red.
 //!
-//! Seven models port the reference's loom models; each ships with the
-//! WEAKENING that breaks it (`Weakening`), proven to fail with `expectFails`:
+//! Five models — the single-owner invariants (format v4 deleted the
+//! page-interleaved append partition, decision 0003 Q3, with its two
+//! cross-appender models); each ships with the WEAKENING that breaks it
+//! (`Weakening`), proven to fail with `expectFails`:
 //!
 //! | model | pins | weakening that fails it |
 //! |---|---|---|
@@ -16,8 +18,6 @@
 //! | 3 headroom holds at push | `pending_has_room` observed true ⇒ the push succeeds | `full_on_stale_stamp` |
 //! | 4 forced overflow | the overflow rides the same gate; extents conserved | `overflow_without_front_stop` |
 //! | 5 reserve isolation | user claims never consume the reserve | `user_floor_strict` |
-//! | 6 partitioned claims | two appenders' claims never cross | `shared_budget` |
-//! | 7 partitioned clocks | one appender's tail never releases a peer's extent | `shared_clock` |
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -37,10 +37,6 @@ pub const Weakening = enum {
     overflow_without_front_stop,
     /// The user floor is checked with `<` instead of `≤`.
     user_floor_strict,
-    /// One free budget shared by every partition.
-    shared_budget,
-    /// One coverage clock shared by every partition.
-    shared_clock,
 };
 
 pub const Class = enum(u8) { user, internal };
@@ -48,17 +44,16 @@ pub const Class = enum(u8) { user, internal };
 /// One operation of a thread's program; the model runs each as a chain of
 /// single-atomic-action micro-steps.
 pub const Op = union(enum) {
-    claim: struct { writer: u8 = 0, class: Class = .user },
+    claim: struct { class: Class = .user },
     free_pending: struct { extent: u8, gate: u16 },
     free_pending_forced: struct { extent: u8, gate: u16 },
     /// `if pending_has_room() { free_pending(extent, gate) }` — the SMO
     /// task's admission probe then post-swap push.
     free_pending_if_room: struct { extent: u8, gate: u16 },
-    advance: struct { writer: u8 = 0, seq: u16 },
-    /// Σ budgets (`freeExtents`): one load per partition folded into one
-    /// step — the sum is a diagnostic, not a protocol action.
+    advance: struct { seq: u16 },
+    /// `freeExtents`: one load (a diagnostic, not a protocol action).
     read_free,
-    read_durable: u8,
+    read_durable,
     join: u8,
 };
 
@@ -81,9 +76,6 @@ pub const Config = struct {
     total: u8,
     reserve: u8,
     cap: u8,
-    writers: u8 = 1,
-    /// 0 ⇒ `total` (the solo map).
-    extents_per_page: u8 = 0,
     /// Run single-threaded to completion in `init`.
     setup: []const Op,
     programs: []const []const Op,
@@ -92,14 +84,13 @@ pub const Config = struct {
 
 const max_extents = 8;
 const max_cap = 2;
-const max_writers = 2;
 const max_threads = 2;
 const max_ops = 8;
 const max_overflow = 3;
 
 const Micro = enum(u8) {
     start,
-    // claim (ExtCore.claimIn)
+    // claim (ExtCore.claim)
     c_cas,
     c_hint,
     c_scan,
@@ -123,7 +114,7 @@ const Micro = enum(u8) {
     // pending_has_room
     h_load_head,
     h_load_tail,
-    // advance_durable (ExtCore.advanceDurableIn)
+    // advance_durable (ExtCore.advanceDurable)
     a_fetch_max,
     a_load_durable,
     a_load_tail,
@@ -145,7 +136,8 @@ const Micro = enum(u8) {
 const Slot = struct { stamp: u16 = 0, extent: u8 = 0, gate: u16 = 0 };
 const Entry = struct { extent: u8 = 0, gate: u16 = 0 };
 
-const Part = struct {
+/// The one owner's allocator state (the production `ExtCore` minus its bits).
+const Core = struct {
     budget: u8 = 0,
     hint: u8 = 0,
     durable: u16 = 0,
@@ -188,14 +180,11 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
     comptime {
         std.debug.assert(cfg.total <= max_extents);
         std.debug.assert(cfg.cap <= max_cap and cfg.cap >= alloc_core.min_pending_cap);
-        std.debug.assert(cfg.writers <= max_writers);
         std.debug.assert(cfg.programs.len <= max_threads);
         std.debug.assert(cfg.setup.len <= max_ops);
         for (cfg.programs) |p| std.debug.assert(p.len <= max_ops);
     }
     const W = cfg.weakening;
-    const epp: u8 = if (cfg.extents_per_page == 0) cfg.total else cfg.extents_per_page;
-    const map = alloc_core.PartitionMap.new(cfg.writers, epp);
     const setup_thread: usize = cfg.programs.len;
 
     return struct {
@@ -204,33 +193,16 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
         pub const config = cfg;
 
         words: u64 = 0,
-        parts: [max_writers]Part = @splat(.{}),
+        core: Core = .{},
         threads: [max_threads + 1]Thread = @splat(.{}),
 
         pub fn init() Self {
             var m: Self = .{};
-            var w: u8 = 0;
-            while (w < cfg.writers) : (w += 1) {
-                // The weakened shared budget is ONE pool of every extent.
-                m.parts[w].budget = if (W == .shared_budget) (if (w == 0) cfg.total else 0) else @intCast(partitionExtentCount(w));
-                m.parts[w].hint = if (map.isSolo()) 0 else w * epp;
-                var i: u8 = 0;
-                while (i < cfg.cap) : (i += 1) m.parts[w].slots[i].stamp = i;
-            }
+            m.core.budget = cfg.total;
+            var i: u8 = 0;
+            while (i < cfg.cap) : (i += 1) m.core.slots[i].stamp = i;
             while (!m.done(setup_thread)) m.step(setup_thread);
             return m;
-        }
-
-        fn partitionExtentCount(writer: u8) u64 {
-            if (map.isSolo()) return cfg.total;
-            const pages = (@as(u64, cfg.total) + epp - 1) / epp;
-            var count: u64 = 0;
-            var page: u64 = writer;
-            while (page < pages) : (page += cfg.writers) {
-                const lo = page * epp;
-                count += @min(lo + epp, cfg.total) - lo;
-            }
-            return count;
         }
 
         pub fn key(self: *const Self) u64 {
@@ -255,22 +227,6 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
             return self.threads[t].results[0..cfg.programs[t].len];
         }
 
-        // ---- shared-state accessors mirroring the core's routing ----
-
-        /// `shared_budget` collapses every partition's budget onto writer 0.
-        fn budgetPart(self: *Self, writer: u8) *Part {
-            return &self.parts[if (W == .shared_budget) 0 else writer];
-        }
-
-        /// `shared_clock` collapses every partition's durable clock onto writer 0.
-        fn clockPart(self: *Self, writer: u8) *Part {
-            return &self.parts[if (W == .shared_clock) 0 else writer];
-        }
-
-        fn owner(extent: u8) u8 {
-            return @intCast(map.ownerOfExtent(extent));
-        }
-
         fn bitSet(self: *const Self, idx: u8) bool {
             return self.words & (@as(u64, 1) << @intCast(idx)) != 0;
         }
@@ -284,17 +240,11 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
         }
 
         pub fn freeExtents(self: *const Self) u64 {
-            var sum: u64 = 0;
-            var w: u8 = 0;
-            while (w < cfg.writers) : (w += 1) sum += self.parts[w].budget;
-            return sum;
+            return self.core.budget;
         }
 
         pub fn pendingCount(self: *const Self) u64 {
-            var sum: u64 = 0;
-            var w: u8 = 0;
-            while (w < cfg.writers) : (w += 1) sum += (self.parts[w].head - self.parts[w].tail) + self.parts[w].overflow_len;
-            return sum;
+            return (self.core.head - self.core.tail) + self.core.overflow_len;
         }
 
         pub fn isAllocated(self: *const Self, extent: u8) bool {
@@ -325,71 +275,34 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
                 th.micro = firstMicro(op);
                 // The first micro of a claim is the budget LOAD.
                 if (op == .claim) {
-                    th.free = self.budgetPart(op.claim.writer).budget;
+                    th.free = self.core.budget;
                     return;
                 }
             }
             switch (op) {
-                .claim => |c| self.stepClaim(t, c.writer, c.class),
+                .claim => |c| self.stepClaim(t, c.class),
                 .free_pending => |f| self.stepFreePending(t, f.extent, f.gate, false),
                 .free_pending_forced => |f| self.stepFreePending(t, f.extent, f.gate, true),
                 .free_pending_if_room => |f| self.stepIfRoom(t, f.extent, f.gate),
-                .advance => |a| self.stepAdvance(t, a.writer, a.seq),
+                .advance => |a| self.stepAdvance(t, a.seq),
                 .read_free => self.finish(t, .{ .free = @intCast(self.freeExtents()) }),
-                .read_durable => |w| self.finish(t, .{ .durable = self.clockPart(w).durable }),
+                .read_durable => self.finish(t, .{ .durable = self.core.durable }),
                 .join => |other| if (self.done(other)) self.finish(t, .joined),
             }
         }
 
-        // ---- claim: ExtCore.claimIn ----
+        // ---- claim: ExtCore.claim ----
 
-        fn buildScanOrder(self: *Self, t: usize, writer: u8) void {
+        /// The flat sweep: `start..total` then `0..start`.
+        fn buildScanOrder(self: *Self, t: usize) void {
             const th = &self.threads[t];
             const start: u8 = th.start;
-            th.scan_len = 0;
-            if (map.isSolo()) {
-                // `start..total` then `0..start`.
-                var k: u8 = 0;
-                while (k < cfg.total) : (k += 1) {
-                    const s: u16 = @as(u16, start) + k;
-                    th.scan[k] = @intCast(if (s < cfg.total) s else s - cfg.total);
-                }
-                th.scan_len = cfg.total;
-                return;
+            var k: u8 = 0;
+            while (k < cfg.total) : (k += 1) {
+                const s: u16 = @as(u16, start) + k;
+                th.scan[k] = @intCast(if (s < cfg.total) s else s - cfg.total);
             }
-            // ExtCore.scanPartition's three passes.
-            const n: u8 = cfg.writers;
-            const pages: u8 = (cfg.total + epp - 1) / epp;
-            const start_page: u8 = @min(start / epp, pages);
-            const first: u8 = if (start_page <= writer) writer else writer + ((start_page - writer + n - 1) / n) * n;
-            var page = first;
-            while (page < pages) : (page += n) {
-                const lo = page * epp;
-                const hi = @min(lo + epp, cfg.total);
-                var from = lo;
-                if (page == start_page and start > lo and start < hi) from = start;
-                var i = from;
-                while (i < hi) : (i += 1) self.pushScan(t, i);
-            }
-            page = writer;
-            while (page < @min(first, pages)) : (page += n) {
-                const lo = page * epp;
-                var i = lo;
-                while (i < @min(lo + epp, cfg.total)) : (i += 1) self.pushScan(t, i);
-            }
-            if (start_page < pages and map.ownerOfPage(start_page) == writer) {
-                const lo = start_page * epp;
-                if (start > lo) {
-                    var i = lo;
-                    while (i < @min(start, cfg.total)) : (i += 1) self.pushScan(t, i);
-                }
-            }
-        }
-
-        fn pushScan(self: *Self, t: usize, idx: u8) void {
-            const th = &self.threads[t];
-            th.scan[th.scan_len] = idx;
-            th.scan_len += 1;
+            th.scan_len = cfg.total;
         }
 
         fn advanceScan(self: *Self, t: usize) void {
@@ -403,8 +316,9 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
             }
         }
 
-        fn stepClaim(self: *Self, t: usize, writer: u8, class: Class) void {
+        fn stepClaim(self: *Self, t: usize, class: Class) void {
             const th = &self.threads[t];
+            const c = &self.core;
             switch (th.micro) {
                 .c_cas => {
                     // `free <= floor ⇒ NoSpace`, else CAS(free → free − 1).
@@ -413,20 +327,19 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
                     // under test is the reserve breach, not an underflow.
                     const refused = if (W == .user_floor_strict) th.free == 0 or th.free < floor else th.free <= floor;
                     if (refused) return self.finish(t, .no_space);
-                    const bp = self.budgetPart(writer);
-                    if (bp.budget == th.free) {
-                        bp.budget -= 1;
+                    if (c.budget == th.free) {
+                        c.budget -= 1;
                         th.micro = .c_hint;
                     } else {
-                        th.free = bp.budget;
+                        th.free = c.budget;
                     }
                 },
                 .c_hint => {
                     // `start = hint.load(Relaxed).min(total)`.
-                    th.start = @min(self.parts[writer].hint, cfg.total);
+                    th.start = @min(c.hint, cfg.total);
                     th.k = 0;
                     th.pass = 0;
-                    self.buildScanOrder(t, writer);
+                    self.buildScanOrder(t);
                     th.micro = .c_scan;
                 },
                 .c_scan => {
@@ -451,17 +364,16 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
                 },
                 .c_store_hint => {
                     // `hint.store(idx + 1, Relaxed)`.
-                    self.parts[writer].hint = th.idx + 1;
+                    c.hint = th.idx + 1;
                     th.micro = .c_read_durable;
                 },
                 .c_read_durable => {
                     // The model's post-claim `durable_seq()` read (one load).
-                    const d = self.clockPart(writer).durable;
-                    self.finish(t, .{ .claimed = .{ .extent = th.idx, .durable_seen = d } });
+                    self.finish(t, .{ .claimed = .{ .extent = th.idx, .durable_seen = c.durable } });
                 },
                 .c_drift_refund => {
                     // RES-14: `free_budget.fetch_add(1)` then InvariantDrift.
-                    self.budgetPart(writer).budget += 1;
+                    c.budget += 1;
                     self.finish(t, .drift);
                 },
                 else => unreachable,
@@ -472,14 +384,13 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
 
         fn releaseStep(self: *Self, t: usize, extent: u8) bool {
             const th = &self.threads[t];
-            const o = owner(extent);
-            const bp = self.budgetPart(o);
+            const c = &self.core;
             if (W == .release_budget_before_bit) {
                 switch (th.rel_step) {
-                    0 => bp.budget += 1,
+                    0 => c.budget += 1,
                     1 => self.clearBit(extent),
                     else => {
-                        self.parts[o].hint = @min(self.parts[o].hint, extent);
+                        c.hint = @min(c.hint, extent);
                         return true;
                     },
                 }
@@ -493,10 +404,10 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
                     self.clearBit(extent);
                     if (!was_set) return true;
                 },
-                1 => bp.budget += 1,
+                1 => c.budget += 1,
                 else => {
                     // `hint.fetch_min(extent, Relaxed)`.
-                    self.parts[o].hint = @min(self.parts[o].hint, extent);
+                    c.hint = @min(c.hint, extent);
                     return true;
                 },
             }
@@ -508,7 +419,7 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
 
         fn stepIfRoom(self: *Self, t: usize, extent: u8, gate: u16) void {
             const th = &self.threads[t];
-            const p = &self.parts[owner(extent)];
+            const p = &self.core;
             switch (th.micro) {
                 .h_load_head => {
                     th.head = p.head;
@@ -529,7 +440,7 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
 
         fn stepFreePending(self: *Self, t: usize, extent: u8, gate: u16, forced: bool) void {
             const th = &self.threads[t];
-            const p = &self.parts[owner(extent)];
+            const p = &self.core;
             switch (th.micro) {
                 .p_fetch_max => {
                     std.debug.assert(self.bitSet(extent));
@@ -615,19 +526,18 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
             }
         }
 
-        // ---- advance_durable: ExtCore.advanceDurableIn ----
+        // ---- advance_durable: ExtCore.advanceDurable ----
 
-        fn stepAdvance(self: *Self, t: usize, writer: u8, seq: u16) void {
+        fn stepAdvance(self: *Self, t: usize, seq: u16) void {
             const th = &self.threads[t];
-            const p = &self.parts[writer];
-            const clock = self.clockPart(writer);
+            const p = &self.core;
             switch (th.micro) {
                 .a_fetch_max => {
-                    clock.durable = @max(clock.durable, seq);
+                    p.durable = @max(p.durable, seq);
                     th.micro = .a_load_durable;
                 },
                 .a_load_durable => {
-                    th.durable = clock.durable;
+                    th.durable = p.durable;
                     th.count = 0;
                     th.micro = .a_load_tail;
                 },
@@ -758,8 +668,8 @@ const testing = std.testing;
 const expectHolds = explorer.expectHolds;
 const expectFails = explorer.expectFails;
 
-fn claimOp(writer: u8, class: Class) Op {
-    return .{ .claim = .{ .writer = writer, .class = class } };
+fn claimOp(class: Class) Op {
+    return .{ .claim = .{ .class = class } };
 }
 
 const NoExtraInvariant = struct {
@@ -768,8 +678,8 @@ const NoExtraInvariant = struct {
 
 // ---- model 1: no double alloc under concurrent claimers ----
 
-const m1_setup = [_]Op{ claimOp(0, .user), .{ .free_pending = .{ .extent = 0, .gate = 1 } }, .{ .advance = .{ .seq = 1 } } };
-const m1_prog = [_]Op{ claimOp(0, .user), claimOp(0, .user) };
+const m1_setup = [_]Op{ claimOp(.user), .{ .free_pending = .{ .extent = 0, .gate = 1 } }, .{ .advance = .{ .seq = 1 } } };
+const m1_prog = [_]Op{ claimOp(.user), claimOp(.user) };
 
 const Model1Checks = struct {
     pub fn invariant(m: anytype) !void {
@@ -798,8 +708,8 @@ test "model 1: racing claimers never share an extent, including a just-drained p
 
 // ---- model 2: a pending-freed extent is never claimable before the covering tail ----
 
-const m2_setup = [_]Op{ claimOp(0, .user), .{ .free_pending = .{ .extent = 0, .gate = 7 } }, .{ .advance = .{ .seq = 6 } } };
-const m2_main = [_]Op{ claimOp(0, .user), .{ .join = 1 }, claimOp(0, .user) };
+const m2_setup = [_]Op{ claimOp(.user), .{ .free_pending = .{ .extent = 0, .gate = 7 } }, .{ .advance = .{ .seq = 6 } } };
+const m2_main = [_]Op{ claimOp(.user), .{ .join = 1 }, claimOp(.user) };
 const m2_ckpt = [_]Op{.{ .advance = .{ .seq = 8 } }};
 
 const Model2Checks = struct {
@@ -835,7 +745,7 @@ test "model 2: the coverage gate — never claimable before the tail passes the 
 
 // ---- model 3: headroom observed at admission holds at the post-swap push ----
 
-const m34_setup = [_]Op{ claimOp(0, .user), claimOp(0, .user), claimOp(0, .user) };
+const m34_setup = [_]Op{ claimOp(.user), claimOp(.user), claimOp(.user) };
 const m3_setup = m34_setup ++ [_]Op{ .{ .free_pending = .{ .extent = 0, .gate = 3 } }, .{ .free_pending = .{ .extent = 1, .gate = 5 } } };
 const m3_main = [_]Op{.{ .free_pending_if_room = .{ .extent = 2, .gate = 9 } }};
 const m3_ckpt = [_]Op{.{ .advance = .{ .seq = 4 } }};
@@ -868,13 +778,13 @@ test "model 3: headroom observed at admission holds at the push against a racing
 const m4_setup = m34_setup ++ [_]Op{ .{ .free_pending = .{ .extent = 1, .gate = 3 } }, .{ .free_pending = .{ .extent = 2, .gate = 5 } } };
 const m4_main = [_]Op{
     .{ .free_pending_forced = .{ .extent = 0, .gate = 7 } },
-    claimOp(0, .user),
-    claimOp(0, .user),
+    claimOp(.user),
+    claimOp(.user),
     .{ .join = 1 },
     .{ .advance = .{ .seq = 8 } },
-    claimOp(0, .user),
-    claimOp(0, .user),
-    claimOp(0, .user),
+    claimOp(.user),
+    claimOp(.user),
+    claimOp(.user),
 };
 const m4_ckpt = [_]Op{.{ .advance = .{ .seq = 6 } }};
 
@@ -909,8 +819,8 @@ test "model 4: a forced retirement at cap overflows, rides the same gate and con
 
 // ---- model 5: the reserve is isolated from user claims ----
 
-const m5_main = [_]Op{ claimOp(0, .user), .{ .join = 1 }, .read_free, claimOp(0, .internal), claimOp(0, .user), claimOp(0, .internal), claimOp(0, .internal) };
-const m5_peer = [_]Op{claimOp(0, .user)};
+const m5_main = [_]Op{ claimOp(.user), .{ .join = 1 }, .read_free, claimOp(.internal), claimOp(.user), claimOp(.internal), claimOp(.internal) };
+const m5_peer = [_]Op{claimOp(.user)};
 
 const Model5Checks = struct {
     pub fn invariant(_: anytype) !void {}
@@ -937,66 +847,6 @@ test "model 5: exactly one of two racing user claims fits above the reserve, int
     try expectFails(model5(.user_floor_strict), .{}, error.FinalViolated);
 }
 
-// ---- model 6: partitioned claims never cross ----
-
-const m6_w0 = [_]Op{ claimOp(0, .user), claimOp(0, .user), claimOp(0, .user) };
-const m6_w1 = [_]Op{ claimOp(1, .user), claimOp(1, .user), claimOp(1, .user) };
-
-const Model6Checks = struct {
-    pub fn invariant(m: anytype) !void {
-        var buf: [max_ops]u8 = undefined;
-        for (m.claimedOf(0, &buf)) |e| if (e >= 2) return error.Writer0ClaimedForeignPage;
-        for (m.claimedOf(1, &buf)) |e| if (e < 2) return error.Writer1ClaimedForeignPage;
-    }
-    pub fn final(m: anytype) !void {
-        var buf: [max_ops]u8 = undefined;
-        if (m.claimedOf(0, &buf).len != 2 or m.claimedOf(1, &buf).len != 2) return error.PartitionNotExactlyTwo;
-        if (m.results(0)[2] != .no_space or m.results(1)[2] != .no_space) return error.ThirdClaimNotRefused;
-        if (m.freeExtents() != 0) return error.BudgetDidNotSettle;
-    }
-};
-
-fn model6(comptime w: Weakening) type {
-    return Model(.{ .total = 4, .reserve = 0, .cap = 2, .writers = 2, .extents_per_page = 2, .setup = &.{}, .programs = &.{ &m6_w0, &m6_w1 }, .weakening = w }, Model6Checks);
-}
-
-test "model 6: two appenders' claims never cross pages and each exhausts exactly its own; fails with one shared budget (a win no owned page can honour)" {
-    try expectHolds(model6(.none), .{});
-    try expectFails(model6(.shared_budget), .{}, error.InvariantViolated);
-}
-
-// ---- model 7: per-appender coverage clocks never cross ----
-
-const m7_setup = [_]Op{ claimOp(0, .internal), claimOp(1, .internal), .{ .free_pending = .{ .extent = 0, .gate = 100 } }, .{ .free_pending = .{ .extent = 2, .gate = 100 } } };
-const m7_main = [_]Op{ .{ .advance = .{ .writer = 0, .seq = 100 } }, .{ .join = 1 }, .{ .read_durable = 1 }, .{ .advance = .{ .writer = 1, .seq = 99 } }, .{ .advance = .{ .writer = 1, .seq = 100 } } };
-const m7_peer = [_]Op{claimOp(1, .internal)};
-
-const Model7Checks = struct {
-    pub fn invariant(m: anytype) !void {
-        // A racing peer claim must never win its own parked extent before
-        // its own tail covered the gate.
-        const p = m.results(1)[0];
-        if (p == .claimed and p.claimed.extent == 2) return error.PeerWonParkedExtent;
-    }
-    pub fn final(m: anytype) !void {
-        const r = m.results(0);
-        if (r[0] != .released or r[0].released != 1) return error.OwnEntryNotReleased;
-        if (m.isAllocated(0)) return error.OwnExtentStillParked;
-        if (r[2] != .durable or r[2].durable != 0) return error.PeerClockMoved;
-        if (r[3] != .released or r[3].released != 0) return error.UncoveredPeerGateReleased;
-        if (r[4] != .released or r[4].released != 1) return error.PeerTailDidNotRelease;
-    }
-};
-
-fn model7(comptime w: Weakening) type {
-    return Model(.{ .total = 4, .reserve = 0, .cap = 2, .writers = 2, .extents_per_page = 2, .setup = &m7_setup, .programs = &.{ &m7_main, &m7_peer }, .weakening = w }, Model7Checks);
-}
-
-test "model 7: one appender's tail releases only its own parked extent; fails with a shared clock" {
-    try expectHolds(model7(.none), .{});
-    try expectFails(model7(.shared_clock), .{}, error.FinalViolated);
-}
-
 // ---- the differential test: model ≡ production over sequential op lists ----
 
 fn noRelease(_: void, _: u64) void {}
@@ -1006,11 +856,11 @@ fn runProduction(core: *const alloc_core.ExtCore, ops: []const Op, out: []Result
         out[i] = switch (op) {
             .claim => |c| blk: {
                 const class: alloc_core.AllocClass = if (c.class == .user) .user else .internal;
-                const e = core.claimIn(c.writer, class) catch |err| switch (err) {
+                const e = core.claim(class) catch |err| switch (err) {
                     error.NoSpace => break :blk .no_space,
                     error.InvariantDrift => break :blk .drift,
                 };
-                break :blk .{ .claimed = .{ .extent = @intCast(e), .durable_seen = @intCast(core.durableSeqIn(c.writer)) } };
+                break :blk .{ .claimed = .{ .extent = @intCast(e), .durable_seen = @intCast(core.durableSeq()) } };
             },
             .free_pending => |f| blk: {
                 core.freePending(f.extent, f.gate) catch break :blk .full;
@@ -1018,13 +868,13 @@ fn runProduction(core: *const alloc_core.ExtCore, ops: []const Op, out: []Result
             },
             .free_pending_forced => |f| if (try core.freePendingForced(f.extent, f.gate)) .overflowed else .parked,
             .free_pending_if_room => |f| blk: {
-                if (!core.pendingHasRoomIn(core.map.ownerOfExtent(f.extent))) break :blk .skipped;
+                if (!core.pendingHasRoom()) break :blk .skipped;
                 core.freePending(f.extent, f.gate) catch break :blk .full;
                 break :blk .parked;
             },
-            .advance => |a| .{ .released = @intCast(core.advanceDurableIn(a.writer, a.seq, {}, noRelease)) },
+            .advance => |a| .{ .released = @intCast(core.advanceDurable(a.seq, {}, noRelease)) },
             .read_free => .{ .free = @intCast(core.freeExtents()) },
-            .read_durable => |w| .{ .durable = @intCast(core.durableSeqIn(w)) },
+            .read_durable => .{ .durable = @intCast(core.durableSeq()) },
             .join => .joined,
         };
     }
@@ -1041,8 +891,7 @@ fn expectSameTrace(comptime M: type) !void {
         while (!m.done(t)) m.step(t);
     }
     // Production over the same sequence.
-    const epp: u64 = if (cfg.extents_per_page == 0) cfg.total else cfg.extents_per_page;
-    var core = try alloc_core.ExtCore.initPartitioned(testing.allocator, cfg.total, cfg.reserve, cfg.cap, alloc_core.PartitionMap.new(cfg.writers, epp));
+    var core = try alloc_core.ExtCore.init(testing.allocator, cfg.total, cfg.reserve, cfg.cap);
     defer core.deinit();
     var got: [max_ops]Result = undefined;
     try runProduction(&core, cfg.setup, &got);
@@ -1057,18 +906,16 @@ fn expectSameTrace(comptime M: type) !void {
     try testing.expectEqual(m.pendingCount(), core.pendingCount());
 }
 
-test "the model and the production core agree on every sequential trace of the seven models" {
+test "the model and the production core agree on every sequential trace of the five models" {
     try expectSameTrace(model1(.none));
     try expectSameTrace(model2(.none));
     try expectSameTrace(model3(.none));
     try expectSameTrace(model4(.none));
     try expectSameTrace(model5(.none));
-    try expectSameTrace(model6(.none));
-    try expectSameTrace(model7(.none));
 }
 
 test "model state counts stay within the explorer's default limits" {
-    inline for (.{ model1(.none), model2(.none), model3(.none), model4(.none), model5(.none), model6(.none), model7(.none) }) |M| {
+    inline for (.{ model1(.none), model2(.none), model3(.none), model4(.none), model5(.none) }) |M| {
         var report: explorer.Report = undefined;
         try explorer.explore(M, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

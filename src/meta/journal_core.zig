@@ -76,14 +76,15 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// The physical page-header length the pad law accounts for: a logical page
-/// start maps to the byte AFTER it. 20 B of fields + 4 B so the u64 checksum
-/// at `[16..24)` is 8-aligned (`journal.zig` asserts equality).
+/// start maps to the byte AFTER it. `{magic u32, lap u32, first_entry_off
+/// u16, reserved u16, appender_id u32, xxh3 u64}` (`journal.zig` asserts
+/// equality).
 pub const PAGE_HDR_LEN: u64 = 24;
 
-/// The smallest pad the ring can WRITE: a PAD entry is an entry header (20 B)
-/// plus its one marker byte. A gap shorter than this is padded to the
-/// boundary after the next.
-pub const PAD_MIN: u64 = 21;
+/// The smallest pad the ring can WRITE: a PAD entry is its 24 B entry header
+/// alone (entry kind PAD, a zero-length payload — format v4). A gap shorter
+/// than this is padded to the boundary after the next.
+pub const PAD_MIN: u64 = 24;
 
 /// Ring geometry: everything the pure core needs to derive laps, offsets, page
 /// indices and physical segments from monotonic logical positions.
@@ -141,7 +142,7 @@ pub const CoreGeometry = struct {
 
     /// The largest pad any reservation carries (`PAD_MIN` short of a boundary,
     /// then a whole grain to the next): the slack every admission claims.
-    /// 4117 at grain 4096, 533 at 512; 0 on an unpadded ring.
+    /// 4120 at grain 4096, 536 at 512; 0 on an unpadded ring.
     pub fn maxPad(self: CoreGeometry) u64 {
         return if (self.grain <= 1) 0 else PAD_MIN + self.grain;
     }
@@ -777,16 +778,17 @@ fn collectOwned(geo: CoreGeometry, start: u64, len: u64, out: []u64) []u64 {
     return out[0..n];
 }
 
-test "pad law: PAD_MIN is an entry header plus its marker; max_pad and smo_keep at the production grains" {
-    try testing.expectEqual(@as(u64, 21), PAD_MIN);
+test "pad law: PAD_MIN is the 24 B entry header alone (a PAD entry carries no payload); max_pad and smo_keep at the production grains" {
+    try testing.expectEqual(@as(u64, 24), PAD_MIN);
+    try testing.expectEqual(PAGE_HDR_LEN, PAD_MIN);
     const g4096: CoreGeometry = .{ .page_data_len = PAGE_DATA, .pages = 2048, .reserve_bytes = 256 * 1024, .grain = 4096 };
     const g512: CoreGeometry = .{ .page_data_len = PAGE_DATA, .pages = 2048, .reserve_bytes = 256 * 1024, .grain = 512 };
     const g1: CoreGeometry = .{ .page_data_len = PAGE_DATA, .pages = 2048, .reserve_bytes = 256 * 1024, .grain = 1 };
-    try testing.expectEqual(@as(u64, 4117), g4096.maxPad());
-    try testing.expectEqual(@as(u64, 533), g512.maxPad());
+    try testing.expectEqual(@as(u64, 4120), g4096.maxPad());
+    try testing.expectEqual(@as(u64, 536), g512.maxPad());
     try testing.expectEqual(@as(u64, 0), g1.maxPad());
-    // smo_keep = max(reserve/4, page) + max_pad: 64 KiB + 4117 at the floor.
-    try testing.expectEqual(@as(u64, 65536 + 4117), g4096.smoKeep());
+    // smo_keep = max(reserve/4, page) + max_pad: 64 KiB + 4120 at the floor.
+    try testing.expectEqual(@as(u64, 65536 + 4120), g4096.smoKeep());
     try testing.expectEqual(@as(u64, 65536), g1.smoKeep());
 }
 
@@ -802,8 +804,8 @@ test "pad law at grain 4096: the only aligned in-page position is a page start, 
     // Fewer than PAD_MIN bytes short of the page end: the pad runs into the
     // NEXT page's end — PAD_MIN short of a boundary, then the whole page.
     try testing.expectEqual(PAGE_DATA + 10, geo.padOf(PAGE_DATA - 10));
-    try testing.expectEqual(PAGE_DATA + 20, geo.padOf(PAGE_DATA - 20));
-    try testing.expectEqual(@as(u64, 21), geo.padOf(PAGE_DATA - 21));
+    try testing.expectEqual(PAGE_DATA + 23, geo.padOf(PAGE_DATA - 23));
+    try testing.expectEqual(@as(u64, 24), geo.padOf(PAGE_DATA - 24));
     // Every pad is 0 or in [PAD_MIN, max_pad] and lands aligned.
     var end: u64 = 0;
     while (end < 3 * PAGE_DATA) : (end += 7) {

@@ -2,11 +2,11 @@
 //! never reused, recovered as `max(ledger, replayed window max) + 1`; ino 1
 //! = root"; §5.4 the slot ↔ ino arithmetic; §5.2 "Journal economy": batched
 //! `destroy_inodes`; survey `docs/porting/kv_tree_cache_commit_survey.md`
-//! §2.14, §2.16, §7 row 15; reference `ino_lane.rs` + `lane_core.rs`).
-//! PORTABLE: atomics and arithmetic; the open path feeds it the replayed
-//! window, the committer the mint, `statfs` the derivation.
+//! §2.14, §2.16, §7 row 15). PORTABLE: atomics and arithmetic; the open path
+//! feeds it the replayed window, the committer the mint, `statfs` the
+//! derivation.
 //!
-//! Three laws share this module:
+//! Two laws share this module:
 //!
 //! - **The watermark.** One `fetch_add` per create, no reuse, no
 //!   free-on-failure (a failed create burns the ino; crash-skipped ranges
@@ -21,13 +21,11 @@
 //!   torn-dropped create whose dentry or xattr survived would otherwise let
 //!   the watermark fall back and RE-MINT that ino over the survivor. Guest
 //!   keyspaces keep per-slot maxima.
-//! - **Lanes** (`lane_core`): over a space based at `base` and partitioned
-//!   `writers` ways, value `v` belongs to lane `(v − base) % writers` and
-//!   appender `w` mints only lane-`w` values — a residue class, so the
-//!   partition is arbitration-free (an appender needs only its own id) and
-//!   every ino is ATTRIBUTABLE to its minter. Solo (`writers == 1`) is the
-//!   shipped path and is arithmetically identical to the dense counter
-//!   (a tie test, not a comment).
+//!
+//! Every appender mints in its OWN slot's keyspace (`key.guestLocalIno`;
+//! charter §5.5, §5.9 "cursor = max(recorded, page, window max + 1)" per
+//! slot), so one cursor per slot is the whole partition — there is no
+//! residue-class lane over a shared space (decision 0003 Q3).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -39,8 +37,6 @@ const geometry = @import("geometry.zig");
 const tx = @import("tx.zig");
 
 const assert = std.debug.assert;
-
-pub const AppendPartition = journal.AppendPartition;
 
 /// Ino 1 is the root (pinned to routing slot 0).
 pub const ROOT_INO: u64 = 1;
@@ -110,6 +106,9 @@ pub fn recoverNextIno(ledger_next_ino: u64, replayed_max: u64) u64 {
 
 /// The maxima the replayed window mentions, per keyspace.
 pub const RecoveryFold = struct {
+    /// The slot whose locals are this volume's native keyspace (the
+    /// membership stamp's `native_slot`; null on an all-guest member).
+    native_slot: ?u16 = 0,
     /// Native locals (`< 2^40`): the watermark's input.
     native_max: u64 = 0,
     /// Per guest slot: the RAW local maxima (each slot is its own cursor).
@@ -121,51 +120,55 @@ pub const RecoveryFold = struct {
     }
 
     /// Fold ONE replayed record frame. Interior records (level > 0) and
-    /// non-slot-tree kinds mention no ino. On a forest volume the key is
-    /// the forest key: its kind byte must agree with the tag (a disagreeing
-    /// pair is counted as a forest-key violation and refuses the mount).
-    /// A value that does not decode (a dentry `Delete` has none) mentions
-    /// nothing — the surviving dentry's PUT is what names the child.
-    pub fn noteRecord(self: *RecoveryFold, gpa: Allocator, framing: tx.KeyFraming, frame: journal.RecordFrame) (Allocator.Error || error{Corrupt})!void {
+    /// non-slot-tree kinds mention no ino. A slot-tree key carries its kind
+    /// byte, which must agree with the tag (a disagreeing pair is counted as
+    /// a forest-key violation and refuses the mount). A value that does not
+    /// decode (a dentry `Delete` has none) mentions nothing — the surviving
+    /// dentry's PUT is what names the child. Keys mention KEY inos (native
+    /// locals or `guestLocalIno` forms); a dentry value names the GLOBAL
+    /// child ino (charter §5.4), routed back to `(slot, local)` first.
+    pub fn noteRecord(self: *RecoveryFold, gpa: Allocator, frame: journal.RecordFrame) (Allocator.Error || error{Corrupt})!void {
         const t = journal.untag(frame.tag);
         if (t.level > 0) return;
         if (!key.isSlotTreeKind(t.tree_id)) return;
-        var legacy_buf: key.KeyBuf = undefined;
-        const legacy: []const u8 = switch (framing) {
-            .flat => frame.key,
-            .forest => blk: {
-                const split = key.splitForestKey(frame.key) catch {
-                    tx.stats.meta_kv_forest_key_violations.inc();
-                    return error.Corrupt;
-                };
-                if (split.kind != t.tree_id) {
-                    tx.stats.meta_kv_forest_key_violations.inc();
-                    return error.Corrupt;
+        _ = key.checkSlotTreeKey(t.tree_id, frame.key) catch {
+            tx.stats.meta_kv_forest_key_violations.inc();
+            return error.Corrupt;
+        };
+        switch (t.tree_id) {
+            key.TREE_INODES => try self.noteKeyIno(gpa, key.decodeInodeKey(frame.key) catch return),
+            key.TREE_XATTRS => try self.noteKeyIno(gpa, (key.XattrKey.decode(frame.key) catch return).ino()),
+            key.TREE_DENTRIES => {
+                const d = record.DentryValue.decode(frame.value) catch return;
+                const r = routeIno(d.child_ino, ROUTING_WIDTH);
+                if (self.native_slot != null and self.native_slot.? == r.slot) {
+                    self.native_max = @max(self.native_max, r.local);
+                } else {
+                    try self.noteGuest(gpa, @intCast(r.slot), r.local);
                 }
-                legacy_buf = split.legacy;
-                break :blk legacy_buf.slice();
             },
-        };
-        const mentioned: ?u64 = switch (t.tree_id) {
-            key.TREE_INODES => key.decodeInodeKey(legacy) catch null,
-            key.TREE_DENTRIES => if (record.DentryValue.decode(frame.value)) |d| d.child_ino else |_| null,
-            key.TREE_XATTRS => if (key.XattrKey.decode(legacy)) |x| x.ino() else |_| null,
-            else => null,
-        };
-        const ino = mentioned orelse return;
+            else => {},
+        }
+    }
+
+    fn noteKeyIno(self: *RecoveryFold, gpa: Allocator, ino: u64) Allocator.Error!void {
         if (key.splitGuestLocal(ino)) |g| {
-            const e = try self.guest_max.getOrPutValue(gpa, g.slot, 0);
-            e.value_ptr.* = @max(e.value_ptr.*, g.local);
+            try self.noteGuest(gpa, g.slot, g.local);
         } else {
             self.native_max = @max(self.native_max, ino);
         }
     }
 
+    fn noteGuest(self: *RecoveryFold, gpa: Allocator, slot: u16, local: u64) Allocator.Error!void {
+        const e = try self.guest_max.getOrPutValue(gpa, slot, 0);
+        e.value_ptr.* = @max(e.value_ptr.*, local);
+    }
+
     /// Fold every content record of the replayed entries (seq order).
-    pub fn foldEntries(self: *RecoveryFold, gpa: Allocator, framing: tx.KeyFraming, entries: []const journal.ReplayedEntry) (Allocator.Error || error{Corrupt})!void {
+    pub fn foldEntries(self: *RecoveryFold, gpa: Allocator, entries: []const journal.ReplayedEntry) (Allocator.Error || error{Corrupt})!void {
         for (entries) |e| {
             var it = e.records();
-            while (it.next()) |frame| try self.noteRecord(gpa, framing, frame);
+            while (it.next()) |frame| try self.noteRecord(gpa, frame);
         }
     }
 
@@ -189,15 +192,13 @@ pub const RecoveryFold = struct {
 /// The live inode population of one volume: the progression of EVERY
 /// allocation cursor — the native watermark and each hosted guest cursor
 /// (`cursor − 2`: the reserved base is 2 everywhere; the root is added back
-/// ONCE by the caller across the set) plus each lane cursor's EXACT mint
-/// count (a lane strides by `writers`, so `cursor − 2` would over-report by
-/// that factor) — minus the destroys committed on the volume. An
-/// over-report, never an under-report: `statfs` may only be pessimistic
-/// about free slots, and burned inos count as the §4.8 law describes.
-pub fn liveInodes(native_next: u64, guest_cursors: []const u64, lane_minted: []const u64, destroyed: u64) u64 {
+/// ONCE by the caller across the set) — minus the destroys committed on the
+/// volume. An over-report, never an under-report: `statfs` may only be
+/// pessimistic about free slots, and burned inos count as the §4.8 law
+/// describes.
+pub fn liveInodes(native_next: u64, guest_cursors: []const u64, destroyed: u64) u64 {
     var allocated: u64 = native_next -| LOCAL_INO_BASE;
     for (guest_cursors) |c| allocated +|= c -| LOCAL_INO_BASE;
-    for (lane_minted) |m| allocated +|= m;
     return allocated -| destroyed;
 }
 
@@ -238,13 +239,11 @@ pub fn stageDestroy(t: *tx.KvTx, ino: u64, xattr_keys: []const []const u8) Alloc
 }
 
 /// The journal payload bytes `stageDestroy` costs for an ino with
-/// `xattr_keys` xattrs, in the admission's own framing (`tx.entryLenFor`'s
-/// arithmetic) — the chunk planner's input, so a planned chunk fits ONE
-/// entry by the arithmetic the commit enforces rather than a guessed
-/// constant. Forest keys are one kind byte longer.
-pub fn destroyEntryBytes(framing: tx.KeyFraming, xattr_keys: usize) u64 {
-    const extra: usize = if (framing == .forest) 1 else 0;
-    return journal.recordFrameLen(key.INODE_KEY_LEN + extra, 0) + @as(u64, xattr_keys) * journal.recordFrameLen(key.XATTR_KEY_LEN + extra, 0);
+/// `xattr_keys` xattrs (`tx.entryLenFor`'s arithmetic) — the chunk
+/// planner's input, so a planned chunk fits ONE entry by the arithmetic the
+/// commit enforces rather than a guessed constant.
+pub fn destroyEntryBytes(xattr_keys: usize) u64 {
+    return journal.recordFrameLen(key.INODE_KEY_LEN, 0) + @as(u64, xattr_keys) * journal.recordFrameLen(key.XATTR_KEY_LEN, 0);
 }
 
 pub const Range = struct { start: usize, end: usize };
@@ -287,135 +286,6 @@ pub fn unlinkEntriesPerOp(ops: u64, gather_fill: u64, drain_commits: u64) f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Lanes (`lane_core`): one law, two consumers (inos here; block-key
-// incarnation stamps in the data plane).
-// ---------------------------------------------------------------------------
-
-/// The lane `value` belongs to — the ATTRIBUTION function. `writers ≤ 1`
-/// is not a partition; it reads as solo.
-pub fn laneOf(value: u64, base: u64, writers: u64) u64 {
-    if (writers <= 1) return 0;
-    return (value -% base) % writers;
-}
-
-/// The first value appender `writer` may ever mint.
-pub fn firstInLane(base: u64, writers: u64, writer: u64) u64 {
-    if (writers <= 1) return base;
-    return base + (writer % writers);
-}
-
-/// The smallest lane-`writer` value `≥ floor` — the recovery/migration
-/// rounding. Idempotent: a floor already in the lane is returned
-/// unchanged, so re-seeding never advances a cursor.
-pub fn nextInLaneAtOrAbove(floor: u64, base: u64, writers: u64, writer: u64) u64 {
-    if (writers <= 1) return @max(floor, base);
-    const first = firstInLane(base, writers, writer);
-    if (floor <= first) return first;
-    const ahead = laneOf(floor, base, writers);
-    const want = writer % writers;
-    if (ahead == want) return floor;
-    // Distance forward from `floor`'s lane to ours, in the ring of lanes.
-    return floor + (want + writers - ahead) % writers;
-}
-
-/// Values a lane cursor SEEDED at `start` has minted standing at `cursor`.
-/// `start` is load-bearing (POSIX-1): a lane cursor is seeded from the
-/// space's recovered DENSE watermark, which already counts every value
-/// below it in every lane — counting from the lane's absolute first value
-/// would count the seeding gap as mints and over-report `IUsed`.
-pub fn mintedBetween(cursor: u64, start: u64, writers: u64) u64 {
-    return (cursor -| start) / @max(writers, 1);
-}
-
-/// One appender's monotone cursor over its own lane.
-pub const LaneCursor = struct {
-    next: std.atomic.Value(u64),
-    /// Where this cursor was seeded (raised in lockstep by `installFloor`,
-    /// which is recovery, not minting) — the base `minted` counts from.
-    start: std.atomic.Value(u64),
-    base: u64,
-    writers: u64,
-    writer: u64,
-
-    /// For appender `writer` of `writers` over the space based at `base`,
-    /// seeded at the smallest lane value `≥ floor`.
-    pub fn init(base: u64, writers: u64, writer: u64, floor: u64) LaneCursor {
-        const w = @max(writers, 1);
-        const id = writer % w;
-        const seed = nextInLaneAtOrAbove(floor, base, w, id);
-        return .{ .next = .init(seed), .start = .init(seed), .base = base, .writers = w, .writer = id };
-    }
-
-    /// `fetch_add(writers)`: no reuse, no free-on-failure. Solo is
-    /// `fetch_add(1)` — the dense counter, instruction for instruction.
-    pub fn mint(self: *LaneCursor) u64 {
-        return self.next.fetchAdd(self.writers, .acq_rel);
-    }
-
-    /// The publication snapshot (what a durable watermark carries).
-    pub fn snapshot(self: *const LaneCursor) u64 {
-        return self.next.load(.acquire);
-    }
-
-    /// Raise to at least the smallest lane value `≥ floor`; monotone and
-    /// idempotent. Re-bases the mint count too: the installed gap is not
-    /// this cursor's work.
-    pub fn installFloor(self: *LaneCursor, floor: u64) void {
-        const want = nextInLaneAtOrAbove(floor, self.base, self.writers, self.writer);
-        _ = self.next.fetchMax(want, .acq_rel);
-        _ = self.start.fetchMax(want, .acq_rel);
-    }
-
-    pub fn minted(self: *const LaneCursor) u64 {
-        return mintedBetween(self.snapshot(), self.startValue(), self.writers);
-    }
-
-    pub fn startValue(self: *const LaneCursor) u64 {
-        return self.start.load(.acquire);
-    }
-};
-
-// ---- the ino face (`ino_lane.rs`) ----
-
-/// Which local-ino space a lane cursor belongs to.
-pub const InoSpace = union(enum) {
-    /// The volume's native watermark space.
-    native,
-    /// A hosted guest slot's space.
-    guest: u16,
-};
-
-/// The appender that minted local ino `local` in a `writers`-way partition.
-pub fn inoLaneOf(local: u64, writers: u16) u64 {
-    return laneOf(local, LOCAL_INO_BASE, writers);
-}
-
-/// The first local ino appender `part` may ever mint.
-pub fn firstInoInLane(part: AppendPartition) u64 {
-    return firstInLane(LOCAL_INO_BASE, part.writers, part.writer_id);
-}
-
-/// This appender's ino-cursor floor after a mount: `max(ledger watermark,
-/// replayed + 1)` rounded UP into the lane. `ledger_next_ino` is the
-/// watermark of THIS appender's own newest ledger record; `replayed_max`
-/// the highest local the merged replay window mentions for the space (0 if
-/// none). The values the rounding skips are burned.
-pub fn recoverInoFloor(ledger_next_ino: u64, replayed_max: u64, part: AppendPartition) u64 {
-    return nextInLaneAtOrAbove(recoverNextIno(ledger_next_ino, replayed_max), LOCAL_INO_BASE, part.writers, part.writer_id);
-}
-
-/// A fresh lane cursor for `part`, seeded from a dense floor.
-pub fn laneCursor(part: AppendPartition, floor: u64) LaneCursor {
-    return LaneCursor.init(LOCAL_INO_BASE, part.writers, part.writer_id, @max(floor, LOCAL_INO_BASE));
-}
-
-/// Inos `part` has minted with a cursor seeded at `start` now at `cursor` —
-/// the exact count `statfs` needs. Solo collapses to `cursor − start`.
-pub fn mintedInInoLane(cursor: u64, start: u64, part: AppendPartition) u64 {
-    return mintedBetween(cursor, start, part.writers);
-}
-
-// ---------------------------------------------------------------------------
 // Global ino routing (charter §5.4).
 // ---------------------------------------------------------------------------
 
@@ -447,15 +317,11 @@ pub fn makeGlobalIno(local: u64, slot: u64, width: u64) u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — `mw_ino_lane_tests.rs`'s pure contracts, the DUR-8c fold, the
-// destroy economy, the §5.4 ties.
+// Tests — the watermark, the DUR-8c fold, the destroy economy, the §5.4
+// ties.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-
-fn testPart(writers: u16, writer: u16) AppendPartition {
-    return AppendPartition.new(writers, writer) catch unreachable;
-}
 
 test "the watermark mints one fetch_add from max(seed, 2), never below 2, snapshots dominate every mint, and a stale floor never regresses" {
     var w = InoWatermark.init(0);
@@ -490,53 +356,67 @@ test "DUR-8c fold: inode keys, dentry child inos and xattr keys all raise the wa
     defer fold.deinit(testing.allocator);
     const gpa = testing.allocator;
     const iv = (record.InodeValue{ .mode = 0o100644, .nlink = 1 }).encode();
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_INODES, 0, &key.inodeKey(40), .put, &iv));
+    try fold.noteRecord(gpa, testFrame(key.TREE_INODES, 0, &key.inodeKey(40), .put, &iv));
     try testing.expectEqual(@as(u64, 40), fold.native_max);
-    // A dentry whose child outlives its torn-dropped inode record.
+    // A dentry whose child outlives its torn-dropped inode record: the
+    // value names the GLOBAL ino; the fold routes it back to local 77.
     var dbuf: [64]u8 = undefined;
-    const dv = try (record.DentryValue{ .child_ino = 77, .file_type = 8, .name = "survivor" }).encodeInto(&dbuf);
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_DENTRIES, 0, &key.dentryKey(1, 5, 0), .put, dv));
+    const dv = try (record.DentryValue{ .child_ino = makeGlobalIno(77, 0, ROUTING_WIDTH), .file_type = 8, .name = "survivor" }).encodeInto(&dbuf);
+    try testing.expect(makeGlobalIno(77, 0, ROUTING_WIDTH) > 1 << 22);
+    try fold.noteRecord(gpa, testFrame(key.TREE_DENTRIES, 0, &key.dentryKey(1, 5, 0), .put, dv));
     try testing.expectEqual(@as(u64, 77), fold.native_max);
     // An xattr naming a yet-higher ino (the crash leg's shape).
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_XATTRS, 0, &key.xattrKey(90, 3, 0), .put, "\x04userv"));
+    try fold.noteRecord(gpa, testFrame(key.TREE_XATTRS, 0, &key.xattrKey(90, 3, 0), .put, "\x04userv"));
     try testing.expectEqual(@as(u64, 90), fold.native_max);
     // A dentry Delete carries no value: mentions nothing.
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_DENTRIES, 0, &key.dentryKey(1, 6, 0), .delete, &.{}));
+    try fold.noteRecord(gpa, testFrame(key.TREE_DENTRIES, 0, &key.dentryKey(1, 6, 0), .delete, &.{}));
     // An inode Delete DOES mention its key's ino (never re-mint a corpse).
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_INODES, 0, &key.inodeKey(95), .delete, &.{}));
+    try fold.noteRecord(gpa, testFrame(key.TREE_INODES, 0, &key.inodeKey(95), .delete, &.{}));
     try testing.expectEqual(@as(u64, 95), fold.native_max);
     // Interior records and non-slot kinds: nothing.
-    try fold.noteRecord(gpa, .flat, testFrame(key.KIND_INTERIOR, 1, &key.inodeKey(5000), .put, &key.encodeInteriorValue(1, 2)));
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_INODES, 2, &key.inodeKey(6000), .put, &iv));
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_CONTROL, 0, "slot_state:9", .put, "x"));
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_BLOCK_REFS, 0, &key.blockRefKey(1, 2, 7000, 0), .put, &.{ 1, 0, 0, 0 }));
+    try fold.noteRecord(gpa, testFrame(key.KIND_INTERIOR, 1, &key.inodeKey(5000), .put, &key.encodeInteriorValue(1, 2)));
+    try fold.noteRecord(gpa, testFrame(key.TREE_INODES, 2, &key.inodeKey(6000), .put, &iv));
+    try fold.noteRecord(gpa, testFrame(key.TREE_CONTROL, 0, "slot_state:9", .put, "x"));
+    try fold.noteRecord(gpa, testFrame(key.TREE_BLOCK_REFS, 0, &key.blockRefKey(1, 2, 7000, 0), .put, &.{ 1, 0, 0, 0 }));
     try testing.expectEqual(@as(u64, 95), fold.native_max);
     // Guest keyspaces: raw locals per slot, never the native watermark.
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_INODES, 0, &key.inodeKey(key.guestLocalIno(7, 300)), .put, &iv));
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_INODES, 0, &key.inodeKey(key.guestLocalIno(7, 120)), .put, &iv));
-    try fold.noteRecord(gpa, .flat, testFrame(key.TREE_XATTRS, 0, &key.xattrKey(key.guestLocalIno(9, 8), 1, 0), .put, "\x01av"));
+    try fold.noteRecord(gpa, testFrame(key.TREE_INODES, 0, &key.inodeKey(key.guestLocalIno(7, 300)), .put, &iv));
+    try fold.noteRecord(gpa, testFrame(key.TREE_INODES, 0, &key.inodeKey(key.guestLocalIno(7, 120)), .put, &iv));
+    try fold.noteRecord(gpa, testFrame(key.TREE_XATTRS, 0, &key.xattrKey(key.guestLocalIno(9, 8), 1, 0), .put, "\x01av"));
+    // A dentry naming a child of slot 7 (global form) raises slot 7's cursor.
+    var gbuf: [64]u8 = undefined;
+    const gdv = try (record.DentryValue{ .child_ino = makeGlobalIno(400, 7, ROUTING_WIDTH), .file_type = 8, .name = "g" }).encodeInto(&gbuf);
+    try fold.noteRecord(gpa, testFrame(key.TREE_DENTRIES, 0, &key.dentryKey(1, 9, 0), .put, gdv));
     try testing.expectEqual(@as(u64, 95), fold.native_max);
-    try testing.expectEqual(@as(u64, 301), fold.guestCursor(7, 0));
+    try testing.expectEqual(@as(u64, 401), fold.guestCursor(7, 0));
     try testing.expectEqual(@as(u64, 500), fold.guestCursor(7, 500));
+    // An all-guest member routes every dentry child to a guest cursor.
+    var all_guest: RecoveryFold = .{ .native_slot = null };
+    defer all_guest.deinit(gpa);
+    try all_guest.noteRecord(gpa, testFrame(key.TREE_DENTRIES, 0, &key.dentryKey(1, 5, 0), .put, dv));
+    try testing.expectEqual(@as(u64, 0), all_guest.native_max);
+    try testing.expectEqual(@as(u64, 78), all_guest.guestCursor(0, 0));
     try testing.expectEqual(@as(u64, 9), fold.guestCursor(9, 0));
     try testing.expectEqual(LOCAL_INO_BASE, fold.guestCursor(11, 0));
     try testing.expectEqual(@as(u64, 96), fold.nextIno(10));
     try testing.expectEqual(@as(u64, 500), fold.nextIno(500));
 }
 
-test "DUR-8c fold on a forest volume: the kind byte is split off and must agree with the tag; a disagreeing pair is a counted violation that refuses" {
+test "DUR-8c fold: a slot-tree key's kind byte must agree with the tag; a disagreeing or malformed pair is a counted violation that refuses" {
     var fold: RecoveryFold = .{};
     defer fold.deinit(testing.allocator);
     const gpa = testing.allocator;
-    const fk = try key.forestKey(key.TREE_INODES, &key.inodeKey(1234));
-    try fold.noteRecord(gpa, .forest, testFrame(key.TREE_INODES, 0, fk.slice(), .delete, &.{}));
+    try fold.noteRecord(gpa, testFrame(key.TREE_INODES, 0, &key.inodeKey(1234), .delete, &.{}));
     try testing.expectEqual(@as(u64, 1234), fold.native_max);
-    const xk = try key.forestKey(key.TREE_XATTRS, &key.xattrKey(key.guestLocalIno(2, 55), 9, 1));
-    try fold.noteRecord(gpa, .forest, testFrame(key.TREE_XATTRS, 0, xk.slice(), .put, "\x01av"));
+    try fold.noteRecord(gpa, testFrame(key.TREE_XATTRS, 0, &key.xattrKey(key.guestLocalIno(2, 55), 9, 1), .put, "\x01av"));
     try testing.expectEqual(@as(u64, 56), fold.guestCursor(2, 0));
     const before = tx.stats.meta_kv_forest_key_violations.load();
-    try testing.expectError(error.Corrupt, fold.noteRecord(gpa, .forest, testFrame(key.TREE_DENTRIES, 0, fk.slice(), .put, "x")));
-    try testing.expectError(error.Corrupt, fold.noteRecord(gpa, .forest, testFrame(key.TREE_INODES, 0, &key.inodeKey(5), .put, "x")));
+    // An inode key tagged as a dentry: the kind byte disagrees.
+    try testing.expectError(error.Corrupt, fold.noteRecord(gpa, testFrame(key.TREE_DENTRIES, 0, &key.inodeKey(1234), .put, "x")));
+    // A kindless 8-byte key under the inode tag: malformed for its kind.
+    var kindless: [8]u8 = undefined;
+    std.mem.writeInt(u64, &kindless, 5, .big);
+    try testing.expectError(error.Corrupt, fold.noteRecord(gpa, testFrame(key.TREE_INODES, 0, &kindless, .put, "x")));
     try testing.expectEqual(before + 2, tx.stats.meta_kv_forest_key_violations.load());
 }
 
@@ -544,7 +424,7 @@ test "the fold over a replayed window (entries end to end) equals the per-record
     const gpa = testing.allocator;
     const iv = (record.InodeValue{ .mode = 0o100644, .nlink = 1 }).encode();
     var dbuf: [64]u8 = undefined;
-    const dv = try (record.DentryValue{ .child_ino = 2001, .file_type = 8, .name = "n" }).encodeInto(&dbuf);
+    const dv = try (record.DentryValue{ .child_ino = makeGlobalIno(2001, 0, ROUTING_WIDTH), .file_type = 8, .name = "n" }).encodeInto(&dbuf);
     const frames = [_]journal.RecordFrame{
         testFrame(key.TREE_INODES, 0, &key.inodeKey(1500), .put, &iv),
         testFrame(key.TREE_DENTRIES, 0, &key.dentryKey(1, 1, 0), .put, dv),
@@ -557,18 +437,17 @@ test "the fold over a replayed window (entries end to end) equals the per-record
     const entries = [_]journal.ReplayedEntry{.{ .seq = 0, .payload = payload }};
     var fold: RecoveryFold = .{};
     defer fold.deinit(gpa);
-    try fold.foldEntries(gpa, .flat, &entries);
+    try fold.foldEntries(gpa, &entries);
     try testing.expectEqual(@as(u64, 2001), fold.native_max);
     try testing.expectEqual(@as(u64, 2002), fold.nextIno(100));
 }
 
-test "live inodes: every cursor's progression counts from its reserved base 2, lanes count exactly their mints, destroys subtract, never below 0; statfs adds the root once" {
-    try testing.expectEqual(@as(u64, 0), liveInodes(2, &.{}, &.{}, 0));
-    try testing.expectEqual(@as(u64, 5), liveInodes(7, &.{}, &.{}, 0));
-    try testing.expectEqual(@as(u64, 5 + 3 + 10), liveInodes(7, &.{ 5, 12 }, &.{}, 0));
-    try testing.expectEqual(@as(u64, 5 + 3 + 10 + 4), liveInodes(7, &.{ 5, 12 }, &.{ 1, 3 }, 0));
-    try testing.expectEqual(@as(u64, 2), liveInodes(7, &.{}, &.{}, 3));
-    try testing.expectEqual(@as(u64, 0), liveInodes(7, &.{}, &.{}, 50));
+test "live inodes: every cursor's progression counts from its reserved base 2, destroys subtract, never below 0; statfs adds the root once" {
+    try testing.expectEqual(@as(u64, 0), liveInodes(2, &.{}, 0));
+    try testing.expectEqual(@as(u64, 5), liveInodes(7, &.{}, 0));
+    try testing.expectEqual(@as(u64, 5 + 3 + 10), liveInodes(7, &.{ 5, 12 }, 0));
+    try testing.expectEqual(@as(u64, 2), liveInodes(7, &.{}, 3));
+    try testing.expectEqual(@as(u64, 0), liveInodes(7, &.{}, 50));
     var tally: DestroyTally = .{};
     const g0 = stats.destroyed_inodes.load();
     tally.noteCommitted(3);
@@ -577,177 +456,6 @@ test "live inodes: every cursor's progression counts from its reserved base 2, l
     try testing.expectEqual(g0 + 5, stats.destroyed_inodes.load());
     try testing.expectEqual(@as(u64, 1 + 10 + 20), publishLiveInodes(&.{ 10, 20 }));
     try testing.expectEqual(@as(u64, 31), stats.live_inodes.load());
-}
-
-// ---- mw_ino_lane_tests ----
-
-test "lanes_are_disjoint_monotone_and_attributable: four appenders minting from their own lanes produce no duplicate, every ino names its minter, each sequence is strictly monotone" {
-    const W: u16 = 4;
-    const N: u64 = 1_000;
-    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer seen.deinit(testing.allocator);
-    var writer: u16 = 0;
-    while (writer < W) : (writer += 1) {
-        const p = testPart(W, writer);
-        var cursor = LaneCursor.init(LOCAL_INO_BASE, W, writer, LOCAL_INO_BASE);
-        var prev: u64 = 0;
-        var i: u64 = 0;
-        while (i < N) : (i += 1) {
-            const ino = cursor.mint();
-            try testing.expect(ino > prev);
-            prev = ino;
-            try testing.expectEqual(@as(u64, writer), inoLaneOf(ino, W));
-            const gop = try seen.getOrPut(testing.allocator, ino);
-            try testing.expect(!gop.found_existing);
-        }
-        try testing.expectEqual(LOCAL_INO_BASE + writer, firstInoInLane(p));
-        try testing.expectEqual(N, mintedInInoLane(cursor.snapshot(), cursor.startValue(), p));
-        try testing.expectEqual(N, cursor.minted());
-    }
-    try testing.expectEqual(N * W, seen.count());
-}
-
-test "solo_lane_cursor_ties_the_shipped_cursor: solo is arithmetically identical to the dense watermark from any floor (drift is red)" {
-    for ([_]u64{ 2, 3, 17, 4096, 1 << 20 }) |floor| {
-        var lane = LaneCursor.init(LOCAL_INO_BASE, 1, 0, floor);
-        var dense = InoWatermark.init(floor);
-        var expect = @max(floor, LOCAL_INO_BASE);
-        var i: usize = 0;
-        while (i < 64) : (i += 1) {
-            const l = lane.mint();
-            const d = dense.allocate();
-            try testing.expectEqual(d, l);
-            try testing.expectEqual(expect, l);
-            expect += 1;
-        }
-        try testing.expectEqual(lane.snapshot() - LOCAL_INO_BASE, mintedInInoLane(lane.snapshot(), LOCAL_INO_BASE, AppendPartition.solo));
-    }
-}
-
-test "recovery_rounds_into_the_lane_and_never_re_mints: the recovered floor is in the lane, dominates every committed ino, is idempotent, and a stale install never regresses" {
-    const W: u16 = 4;
-    var writer: u16 = 0;
-    while (writer < W) : (writer += 1) {
-        const p = testPart(W, writer);
-        var cursor = LaneCursor.init(LOCAL_INO_BASE, W, writer, LOCAL_INO_BASE);
-        var committed: [37]u64 = undefined;
-        for (&committed) |*c| c.* = cursor.mint();
-        const max = std.mem.max(u64, &committed);
-        const floor = recoverInoFloor(max + 1, max, p);
-        try testing.expectEqual(@as(u64, writer), inoLaneOf(floor, W));
-        for (committed) |c| try testing.expect(floor > c);
-        try testing.expectEqual(floor, recoverInoFloor(floor, 0, p));
-        var fresh = LaneCursor.init(LOCAL_INO_BASE, W, writer, floor);
-        const ahead = fresh.mint();
-        fresh.installFloor(LOCAL_INO_BASE);
-        try testing.expect(fresh.mint() > ahead);
-        // The install re-bases the mint count: the gap is not minting.
-        var seeded = LaneCursor.init(LOCAL_INO_BASE, W, writer, LOCAL_INO_BASE);
-        seeded.installFloor(1000);
-        try testing.expectEqual(@as(u64, 0), seeded.minted());
-        _ = seeded.mint();
-        try testing.expectEqual(@as(u64, 1), seeded.minted());
-    }
-}
-
-test "laned_locals_keep_global_ino_stability: sparse laned locals round-trip through the frozen width and every global ino is unique" {
-    const W: u16 = 4;
-    var globals: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer globals.deinit(testing.allocator);
-    var writer: u16 = 0;
-    while (writer < W) : (writer += 1) {
-        var cursor = LaneCursor.init(LOCAL_INO_BASE, W, writer, LOCAL_INO_BASE);
-        for ([_]u64{ 0, 1, 63, 65_535 }) |slot| {
-            var i: usize = 0;
-            while (i < 8) : (i += 1) {
-                const local = cursor.mint();
-                const global = makeGlobalIno(local, slot, ROUTING_WIDTH);
-                const back = routeIno(global, ROUTING_WIDTH);
-                try testing.expectEqual(slot, back.slot);
-                try testing.expectEqual(local, back.local);
-                const gop = try globals.getOrPut(testing.allocator, global);
-                try testing.expect(!gop.found_existing);
-            }
-        }
-    }
-}
-
-test "a_crash_and_remount_never_re_mints_a_lane_ino: records that only MENTION laned inos (xattr keys) feed the fold; the recovered floor rounds into the lane above every committed ino" {
-    const gpa = testing.allocator;
-    const p = testPart(4, 2);
-    var committed: [6]u64 = undefined;
-    var fold: RecoveryFold = .{};
-    defer fold.deinit(gpa);
-    {
-        var cursor = laneCursor(p, LOCAL_INO_BASE);
-        for (&committed) |*c| {
-            c.* = cursor.mint();
-            // The crash skips the final checkpoint: recovery comes from the
-            // window, where only an xattr names the ino (no inode record).
-            try fold.noteRecord(gpa, .flat, testFrame(key.TREE_XATTRS, 0, &key.xattrKey(c.*, 0x55, 0), .put, "\x09user.lane1"));
-        }
-    }
-    // Remount: the ledger's watermark is stale (the pre-crash record).
-    const next_ino = fold.nextIno(LOCAL_INO_BASE);
-    try testing.expectEqual(std.mem.max(u64, &committed) + 1, next_ino);
-    const floor = recoverInoFloor(next_ino, 0, p);
-    for (committed) |c| try testing.expect(floor > c);
-    var cursor = laneCursor(p, LOCAL_INO_BASE);
-    cursor.installFloor(next_ino);
-    const next = cursor.mint();
-    for (committed) |c| try testing.expect(next > c);
-    try testing.expectEqual(@as(u64, 2), inoLaneOf(next, 4));
-}
-
-test "live_inode_count_is_exact_under_lanes: dense, lane and guest-lane mints each count exactly once" {
-    var dense = InoWatermark.init(LOCAL_INO_BASE);
-    var minted: u64 = 0;
-    var i: usize = 0;
-    while (i < 5) : (i += 1) {
-        _ = dense.allocate();
-        minted += 1;
-    }
-    var lanes: [4]LaneCursor = undefined;
-    var guest_lanes: [4]LaneCursor = undefined;
-    var lane_minted: [8]u64 = undefined;
-    for (&lanes, &guest_lanes, 0..) |*l, *g, w| {
-        const p = testPart(4, @intCast(w));
-        l.* = laneCursor(p, dense.snapshot());
-        g.* = laneCursor(p, LOCAL_INO_BASE);
-        var j: usize = 0;
-        while (j < 7) : (j += 1) {
-            _ = l.mint();
-            minted += 1;
-        }
-        j = 0;
-        while (j < 3) : (j += 1) {
-            _ = g.mint();
-            minted += 1;
-        }
-        lane_minted[w] = l.minted();
-        lane_minted[4 + w] = g.minted();
-    }
-    try testing.expectEqual(minted, liveInodes(dense.snapshot(), &.{}, &lane_minted, 0));
-    // A dense count of a strided cursor would over-report by `writers`.
-    try testing.expect(lanes[0].snapshot() - lanes[0].startValue() > lanes[0].minted());
-}
-
-test "lane arithmetic: solo reads lane 0 / base; rounding forward wraps the ring of lanes; minted_between divides by writers" {
-    try testing.expectEqual(@as(u64, 0), laneOf(12345, 2, 1));
-    try testing.expectEqual(@as(u64, 0), laneOf(12345, 2, 0));
-    try testing.expectEqual(@as(u64, 3), laneOf(9, 2, 4));
-    try testing.expectEqual(@as(u64, 2), firstInLane(2, 1, 5));
-    try testing.expectEqual(@as(u64, 3), firstInLane(2, 4, 5));
-    try testing.expectEqual(@as(u64, 7), nextInLaneAtOrAbove(7, 2, 1, 0));
-    try testing.expectEqual(@as(u64, 2), nextInLaneAtOrAbove(0, 2, 1, 0));
-    try testing.expectEqual(@as(u64, 5), nextInLaneAtOrAbove(0, 2, 4, 3));
-    try testing.expectEqual(@as(u64, 9), nextInLaneAtOrAbove(9, 2, 4, 3));
-    try testing.expectEqual(@as(u64, 13), nextInLaneAtOrAbove(10, 2, 4, 3));
-    try testing.expectEqual(@as(u64, 10), nextInLaneAtOrAbove(10, 2, 4, 0));
-    try testing.expectEqual(@as(u64, 11), nextInLaneAtOrAbove(10, 2, 4, 1));
-    try testing.expectEqual(@as(u64, 25), mintedBetween(102, 2, 4));
-    try testing.expectEqual(@as(u64, 100), mintedBetween(102, 2, 1));
-    try testing.expectEqual(@as(u64, 0), mintedBetween(2, 102, 4));
 }
 
 // ---- §5.4 ties ----
@@ -783,7 +491,7 @@ test "W = 2^16 is the u16 slot-id wire type, frozen; slot/local/global formulas 
 
 // ---- the destroy economy ----
 
-test "destroy staging is one entry of inode + xattr Deletes priced by the admission's own framing (flat and forest)" {
+test "destroy staging is one entry of inode + xattr Deletes priced by the admission's own arithmetic" {
     var t = tx.KvTx.init(testing.allocator, @src());
     const xk1 = key.xattrKey(500, 1, 0);
     const xk2 = key.xattrKey(500, 2, 0);
@@ -791,17 +499,11 @@ test "destroy staging is one entry of inode + xattr Deletes priced by the admiss
     try stageDestroy(&t, 501, &.{});
     try testing.expectEqual(@as(usize, 4), t.staged.items.len);
     for (t.staged.items) |s| try testing.expectEqual(record.RecordKind.delete, s.kind);
-    var q = try tx.buildQueuedTx(&t, .flat, 256 * 1024, null);
+    var q = try tx.buildQueuedTx(&t, 256 * 1024, null);
     defer q.deinit();
-    try testing.expectEqual(journal.ENTRY_HDR_LEN + destroyEntryBytes(.flat, 2) + destroyEntryBytes(.flat, 0), q.len);
-    try testing.expectEqual(@as(u64, 1 + 15 + 8), destroyEntryBytes(.flat, 0));
-    try testing.expectEqual(@as(u64, 1 + 15 + 9 + 2 * (1 + 15 + 17)), destroyEntryBytes(.forest, 2));
-
-    var f = tx.KvTx.init(testing.allocator, @src());
-    try stageDestroy(&f, 500, &.{&xk1});
-    var fq = try tx.buildQueuedTx(&f, .forest, 256 * 1024, null);
-    defer fq.deinit();
-    try testing.expectEqual(journal.ENTRY_HDR_LEN + destroyEntryBytes(.forest, 1), fq.len);
+    try testing.expectEqual(journal.ENTRY_HDR_LEN + destroyEntryBytes(2) + destroyEntryBytes(0), q.len);
+    try testing.expectEqual(@as(u64, 1 + 16 + 9), destroyEntryBytes(0));
+    try testing.expectEqual(@as(u64, 1 + 16 + 9 + 2 * (1 + 16 + 17)), destroyEntryBytes(2));
 }
 
 test "destroy chunks pack greedily under the payload cap, in order, one member always goes" {
@@ -821,8 +523,8 @@ test "destroy chunks pack greedily under the payload cap, in order, one member a
     defer gpa.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
     // A realistic batch — 64 corpses with one `layout` xattr each — is ONE
-    // entry on either layout.
-    var batch: [64]u64 = @splat(destroyEntryBytes(.forest, 1));
+    // entry.
+    var batch: [64]u64 = @splat(destroyEntryBytes(1));
     const one = try packDestroyEntries(gpa, &batch);
     defer gpa.free(one);
     try testing.expectEqual(@as(usize, 1), one.len);

@@ -117,14 +117,15 @@ pub const PageSink = struct {
 /// The ledger record's identity inputs.
 pub const RecordSource = struct {
     ctx: *anyopaque,
-    /// Every mounted tree's root `(tree_id, addr, node_seq)`, appended to `out`.
+    /// Every ledger-rooted tree's root `(id, addr, node_seq)`, appended to `out`.
     treeRoots: *const fn (ctx: *anyopaque, gpa: Allocator, out: *std.ArrayList(TreeRoot)) Allocator.Error!void,
     next_ino: *const inos.InoWatermark,
     /// Every tree shares ONE mint, so any handle's snapshot is the volume's
     /// watermark (captured AFTER the flush loop, whose SMOs mint).
     node_seq: *const node_seq.NodeSeqHandle,
-    /// Rides every record of a slot-mapped volume; null forever on legacy ones.
-    membership_stamp: ?ledger.MembershipStamp = null,
+    /// The mounted record's stamp, restated on every record (every volume
+    /// is a stamped set member).
+    membership_stamp: ledger.MembershipStamp,
 };
 
 pub const FlushFailure = enum { none, io, corrupt, out_of_memory };
@@ -373,8 +374,9 @@ pub const Config = struct {
     flush_interval_ms: u64 = ckpt.DEFAULT_FLUSH_INTERVAL_MS,
     /// `checkpoint.resolveMaxDirtyNodes` at open.
     max_dirty_nodes: u64,
-    /// A bit-17 forest: the anticipating trigger measured from the last
-    /// collection. A flat volume keeps the shipped law verbatim.
+    /// A `SYMMETRIC_PLANE` member: the anticipating trigger measured from
+    /// the last collection. A one-member forest keeps the shipped law
+    /// verbatim.
     forest: bool = false,
     /// The mount's first seq: `alloc_ext.resumeCheckpointSeq(ledger.seq, alloc.resumeGeneration())`.
     checkpoint_seq: u64,
@@ -837,7 +839,6 @@ pub const Checkpointer = struct {
             .alloc_bitmap_generation = ckpt_seq,
             .node_seq_watermark = self.deps.record.node_seq.load(),
             .membership_stamp = self.deps.record.membership_stamp,
-            .append_partition = null,
         };
         self.writeLedgerRecord(record) catch |e| {
             // The covering record never landed: the previous record stays
@@ -1010,7 +1011,6 @@ pub const Checkpointer = struct {
             .alloc_bitmap_generation = ckpt_seq,
             .node_seq_watermark = self.deps.record.node_seq.load(),
             .membership_stamp = self.deps.record.membership_stamp,
-            .append_partition = null,
         };
         try self.writeLedgerRecord(last.restatement(ckpt_seq));
         self.retire_seq.store(ckpt_seq + 1, .release);
@@ -1275,6 +1275,7 @@ const node = @import("node.zig");
 const key = @import("key.zig");
 
 const NODE_SIZE: usize = node.MIN_NODE_SIZE;
+const test_stamp = ledger.MembershipStamp.oneMember("set-uuid-fixture".*);
 const EXTENTS: u64 = 16;
 const RING_PAGES: u64 = 64;
 
@@ -1325,13 +1326,13 @@ const TestVol = struct {
         v.latch = .{};
         v.ino = inos.InoWatermark.init(2);
         v.seq_handle = node_seq.NodeSeqHandle.shared(100);
-        v.roots = .{.{ .tree_id = key.TREE_INODES, .node_addr = 0, .node_seq = 1 }};
+        v.roots = .{.{ .id = .native_slot, .node_addr = 0, .node_seq = 1 }};
         v.barriers = 0;
         v.fail_barrier = false;
         v.fail_ledger = false;
         v.slots_written = .empty;
         // The bootstrap record at seq 1 (slot 1), as format writes it.
-        const boot = try ledger.bootstrapRecord(&v.roots, 2, 100, null).encodeSlot();
+        const boot = try ledger.bootstrapRecord(&v.roots, 2, 100, test_stamp).encodeSlot();
         @memcpy(v.ledger_image[4096 .. 2 * 4096], &boot);
         v.flusher = .{ .cache = v.cache, .smo = SmoSeam.none };
         v.maintenance = try tree.MaintenanceQueue.init(gpa, tree.MAINTENANCE_QUEUE_FLOOR);
@@ -1353,7 +1354,7 @@ const TestVol = struct {
             .barrier = .{ .ctx = v, .barrier = barrierFn },
             .ledger = .{ .ctx = v, .writeSlot = writeSlotFn },
             .pages = .{ .ctx = v, .writePage = writePageFn },
-            .record = .{ .ctx = v, .treeRoots = treeRootsFn, .next_ino = &v.ino, .node_seq = &v.seq_handle },
+            .record = .{ .ctx = v, .treeRoots = treeRootsFn, .next_ino = &v.ino, .node_seq = &v.seq_handle, .membership_stamp = test_stamp },
             .smo = SmoSeam.none,
             .maintenance = MaintenanceSource.ofQueue(&v.maintenance),
         });
@@ -1405,7 +1406,7 @@ const TestVol = struct {
     /// A header-only leaf spanning the whole key space at extent `ext`.
     fn writeLeaf(v: *TestVol, ext: u64, seq: u64) !void {
         const gpa = v.gpa;
-        var w = try node.writeNode(gpa, v.layout, .{ .node_addr = addrOf(ext), .node_seq = seq, .tree_id = key.TREE_INODES, .level = 0, .min_key = "", .max_key = &key.KEY_SPACE_MAX }, &.{}, 0, null);
+        var w = try node.writeNode(gpa, v.layout, .{ .node_addr = addrOf(ext), .node_seq = seq, .tree_id = key.KIND_INTERIOR, .level = 0, .min_key = "", .max_key = &key.KEY_SPACE_MAX }, &.{}, 0, null);
         defer w.deinit(gpa);
         v.ram.write(w.node_addr, w.image);
     }

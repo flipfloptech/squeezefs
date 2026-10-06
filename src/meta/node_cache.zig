@@ -165,11 +165,10 @@ pub const stats = struct {
     pub var meta_kv_reader_load_retries: counters.ShardedCounter = .{};
 };
 
-/// A reader or a non-authority mutated a node population it does not own,
-/// or a foreign append was detected at our tail.
+/// An armed reader mount tried to mutate a node.
 pub var partition_refusals: counters.Tripwire = .init("meta_kv_node_partition_refusals");
-/// A leaf of a slot this mount does not lease (the symmetric plane's third
-/// gate state).
+/// A node of a slot this mount does not lease (the symmetric plane's
+/// lease gate).
 pub var leaf_lease_refusals: counters.Tripwire = .init("meta_kv_leaf_lease_refusals");
 /// FREEZING latched with no frozen delta — a third unknown window (RES-22).
 pub var freeze_latched_recovered: counters.Tripwire = .init("kv_freeze_latched_recovered");
@@ -306,9 +305,7 @@ pub const ApplyError = error{
     /// This mount armed reader revalidation and may not write the volume
     /// it is reading.
     ReaderMayNotMutate,
-    /// A structural mutation by an appender that is not the root authority.
-    NonAuthorityInterior,
-    /// A leaf of a slot this mount does not lease (or mid-handover).
+    /// A node of a slot this mount does not lease (or mid-handover).
     LeafLeaseRefused,
     /// The node was superseded first: nothing accepted, re-resolve.
     Superseded,
@@ -332,7 +329,7 @@ pub const LoadError = node.Error || LoaderError || error{ FlightTableFull, Cance
 /// `getChild`: the pointer's `child_node_seq` does not match the loaded
 /// image — a concurrent SMO; reload the parent and retry (bounded).
 pub const ChildError = LoadError || error{ ReloadParent, RetiredExtent };
-pub const AppendError = node.Error || LoaderError || error{ ForeignAppend, ForeignFrameOverwrite };
+pub const AppendError = node.Error || LoaderError;
 
 /// `CachedNode.flushFreezeLocked`'s answer.
 pub const FlushFreeze = struct { floor: u64, frozen: bool };
@@ -854,30 +851,19 @@ pub const CachedNode = struct {
 
     fn applyLockedClass(self: *CachedNode, dirty: *NodeDirty, records: []OwnedRec, floor: u64, structural: bool) ApplyError!void {
         const gpa = self.cache.gpa;
-        // The partitioning gate — the ONE place every RAM mutation passes:
-        // an armed READER mutates nothing (its cache is a projection of
-        // somebody else's tree); interior nodes have ONE cacher and ONE
-        // mutator, the root authority (the RAM face of lock order 4b).
-        // Leaves are deliberately NOT arbitrated here: which appender owns
-        // which key range is the slot map's job, and a gate that pretended
-        // otherwise would be mistaken for cross-writer custody. One
-        // monotonic load; on a solo volume the word is 0.
-        const gate = self.cache.env.gate.load();
-        if (gate.reader) {
+        // The reader gate — the ONE place every RAM mutation passes: an
+        // armed READER mutates nothing (its cache is a projection of
+        // somebody else's tree). One monotonic load.
+        if (self.cache.env.gate.isReader()) {
             consume(records);
             partition_refusals.fire("a mount that armed reader revalidation tried to mutate a node");
             return error.ReaderMayNotMutate;
         }
-        if (self.level > 0 and !gate.isAuthority()) {
-            consume(records);
-            partition_refusals.fire("a non-authority appender tried a structural mutation of an interior node");
-            return error.NonAuthorityInterior;
-        }
-        // The THIRD gate state: "appender for my own leaves". A slot tree
-        // has exactly one writer-cacher — its lessee — so on an ARMED mount a
-        // leaf of a slot this mount does not lease, or one mid-handover, is
-        // refused here under the node's write lock. Flat volumes never reach
-        // the hook: the stamp is unset.
+        // The lease gate: a slot tree has exactly one writer-cacher — its
+        // lessee — so on an ARMED mount a node of a slot this mount does not
+        // lease, or one mid-handover, is refused here under the node's write
+        // lock (structural moves ask with `structural`). The control tree
+        // carries no stamp: it is the manager's.
         if (self.forestSlot()) |slot| {
             switch (self.cache.lease.verdict(self.cache.lease.ctx, slot, structural)) {
                 .unarmed, .allowed => {},
@@ -1215,7 +1201,7 @@ pub const CachedNode = struct {
         const refs = try gpa.alloc(RecordRef, frozen_records.len);
         defer gpa.free(refs);
         for (frozen_records, refs) |*r, *o| o.* = r.ref();
-        const frame = node.encodeBsetFrame(gpa, layout.frame, layout.node_size, self.node_seq, refs, horizon) catch |e| switch (e) {
+        const frame = node.encodeBsetFrame(gpa, layout.stamp, layout.node_size, self.node_seq, refs, horizon) catch |e| switch (e) {
             error.ValueTooLarge => return error.ValueTooLarge,
             error.BsetTooLarge => return error.Corrupt,
             error.OutOfMemory => return error.OutOfMemory,
@@ -1223,7 +1209,7 @@ pub const CachedNode = struct {
             error.EmptyBset, error.RecordsNotAscending => unreachable,
         };
         const frame_len = frame.len;
-        const frame_hdr = layout.frameLen();
+        const frame_hdr = node.FRAME_LEN;
         const bset_len: usize = std.mem.readInt(u32, frame[20..24], .little);
         const whole = Bytes.fromOwned(gpa, frame) catch |e| {
             gpa.free(frame);
@@ -1500,10 +1486,6 @@ pub const NodeCache = struct {
     /// Advance the durable tail (monotone).
     pub fn setDurableTail(self: *NodeCache, tail: u64) void {
         self.env.epoch.advanceTail(tail);
-    }
-
-    pub fn setAppender(self: *NodeCache, writers: u16, writer_id: u16) error{InvalidPartition}!void {
-        return self.env.gate.setAppender(writers, writer_id);
     }
 
     pub fn installLeaseGate(self: *NodeCache, gate: LeaseGate) void {
@@ -1921,28 +1903,6 @@ pub const NodeCache = struct {
             };
         }
         defer plan.deinit(gpa);
-        // The foreign-append probe, on a PARTITIONED volume only: a peer
-        // that appended into this node's log while we held it cached would
-        // be silently overwritten (the append writes at our remembered tail
-        // and validates only the incarnation). One read of the destination
-        // page turns it into a loud refusal. Solo volumes have no peers by
-        // construction and pay nothing.
-        if (!self.env.gate.load().isSolo()) {
-            const probe = try SharedBuf.createExtent(gpa, layout.node_size);
-            defer probe.release();
-            try self.loader.readExtent(self.loader.ctx, n.addr, probe.data);
-            switch (bset.probeTailPage(probe.data[tail..][0..bset.NODE_PAGE], n.node_seq, layout.frame)) {
-                .clear => {},
-                .ours => {
-                    partition_refusals.fire("foreign append detected: the destination page already holds a verified frame of this incarnation");
-                    return error.ForeignAppend;
-                },
-                .foreign => {
-                    node.meta_kv_foreign_frame_overwrite_detected.inc();
-                    return error.ForeignFrameOverwrite;
-                },
-            }
-        }
         try self.loader.appendBset(self.loader.ctx, n.addr, tail, plan.frame);
         {
             const d = n.lockWrite(io);
@@ -2117,7 +2077,7 @@ const Vol = struct {
             o.* = r.ref();
             horizon = @max(horizon, r.seq);
         }
-        var w = try node.writeNode(gpa, self.layout, .{ .node_addr = addrOf(ext), .node_seq = node_seq, .tree_id = key.TREE_INODES, .level = level, .min_key = min_key, .max_key = max_key }, refs, horizon, null);
+        var w = try node.writeNode(gpa, self.layout, .{ .node_addr = addrOf(ext), .node_seq = node_seq, .tree_id = key.KIND_INTERIOR, .level = level, .min_key = min_key, .max_key = max_key }, refs, horizon, null);
         defer w.deinit(gpa);
         self.ram.write(w.node_addr, w.image);
     }
@@ -2232,7 +2192,7 @@ fn applyOne(n: *CachedNode, k: []const u8, seq: u64, kind: RecordKind, value: []
     return n.applyLocked(d, &recs, seq);
 }
 
-test "the partition gate is inert on a solo volume and does not arbitrate leaves; a non-authority appender may not mutate an interior node; an armed reader may not mutate any node" {
+test "the reader gate: a write mount mutates interior nodes and leaves alike; an armed reader may not mutate any node" {
     var vol = try Vol.init(4, 8);
     defer vol.deinit();
     vol.arm();
@@ -2243,21 +2203,17 @@ test "the partition gate is inert on a solo volume and does not arbitrate leaves
     const leaf = (try vol.cache.load(Vol.addrOf(1))).?;
     defer leaf.release();
     try testing.expect(interior.isPinned() and !leaf.isPinned());
-    // Solo: the appender IS the authority.
     try applyOne(interior, "k", 1, .put, "v");
-    // Appender 2 of 4: leaves are its own business; structure is refused loud.
-    try vol.cache.setAppender(4, 2);
     try applyOne(leaf, "k", 2, .put, "v");
     const before = partition_refusals.load();
-    expectTripwireLog(&partition_refusals);
-    try testing.expectError(error.NonAuthorityInterior, applyOne(interior, "k", 3, .put, "v"));
-    try log.testing.expectAllFired();
-    try testing.expectEqual(before + 1, partition_refusals.load());
     // An armed reader mutates nothing.
     try vol.cache.armRevalidation(1, 0);
     try testing.expectError(error.AlreadyArmed, vol.cache.armRevalidation(2, 0));
     expectTripwireLog(&partition_refusals);
     try testing.expectError(error.ReaderMayNotMutate, applyOne(leaf, "k", 4, .put, "v"));
+    try log.testing.expectAllFired();
+    expectTripwireLog(&partition_refusals);
+    try testing.expectError(error.ReaderMayNotMutate, applyOne(interior, "k", 5, .put, "v"));
     try log.testing.expectAllFired();
     try testing.expectEqual(before + 2, partition_refusals.load());
 }
@@ -2889,7 +2845,7 @@ test "the torn-tail classifier through the cache: a torn tail bset is dropped an
     // Tear the second frame's bset bytes (the frame header verifies, the
     // records do not): the load truncates there and counts one drop.
     const second = Vol.addrOf(0) + 2 * bset.NODE_PAGE;
-    vol.ram.bytes[second + vol.layout.frameLen() + bset.BSET_HEADER_LEN + 3] ^= 0x55;
+    vol.ram.bytes[second + node.FRAME_LEN + bset.BSET_HEADER_LEN + 3] ^= 0x55;
     const dropped0 = node.meta_kv_node_dropped_tail_bsets.load();
     var fresh = try NodeCache.init(gpa, testing.io, vol.cache.cfg, vol.ram.loader());
     defer fresh.deinit();
@@ -2901,9 +2857,9 @@ test "the torn-tail classifier through the cache: a torn tail bset is dropped an
     // A verifying bset AFTER a torn unit whose horizon (2) ≤ the durable
     // tail is checkpoint-covered data after a tear: loud. Tear the FIRST
     // frame instead and leave the second intact.
-    vol.ram.bytes[second + vol.layout.frameLen() + bset.BSET_HEADER_LEN + 3] ^= 0x55;
+    vol.ram.bytes[second + node.FRAME_LEN + bset.BSET_HEADER_LEN + 3] ^= 0x55;
     const first = Vol.addrOf(0) + bset.NODE_PAGE;
-    vol.ram.bytes[first + vol.layout.frameLen() + bset.BSET_HEADER_LEN + 3] ^= 0x55;
+    vol.ram.bytes[first + node.FRAME_LEN + bset.BSET_HEADER_LEN + 3] ^= 0x55;
     var loud = try NodeCache.init(gpa, testing.io, vol.cache.cfg, vol.ram.loader());
     defer loud.deinit();
     loud.setDurableTail(5);
@@ -3213,50 +3169,6 @@ test "publish over a NON-CLEAN mapping is loud and folds its floor into the dyin
     try vol.cache.publish(third);
     try testing.expect(second.state.isSuperseded());
     try testing.expectEqual(no_floor, vol.cache.takeDyingFloors());
-}
-
-test "the foreign-append probe: a peer's frame at our remembered tail is refused on a partitioned volume and never consulted on a solo one" {
-    const gpa = testing.allocator;
-    var vol = try Vol.init(2, 8);
-    defer vol.deinit();
-    vol.arm();
-    try vol.writeEmptyLeaf(0, 1, 0);
-    const leaf = (try vol.cache.load(Vol.addrOf(0))).?;
-    defer leaf.release();
-    const peer_rec = [_]Record{try Record.put(gpa, &key.inodeKey(9), 9, &iv(9).encode())};
-    defer gpa.free(peer_rec[0].key);
-    defer gpa.free(peer_rec[0].value);
-    const refs = [_]RecordRef{peer_rec[0].ref()};
-    // Solo: the same shape appends without complaint.
-    {
-        const frame = try node.encodeBsetFrame(gpa, vol.layout.frame, NODE_SIZE, leaf.node_seq, &refs, 9);
-        defer gpa.free(frame);
-        vol.ram.write(Vol.addrOf(0) + bset.NODE_PAGE, frame);
-        _ = try vol.apply(leaf, &key.inodeKey(10), .put, &iv(10).encode());
-        try vol.freezeAndAppend(leaf);
-    }
-    // Partitioned (appender 1 of 2): a peer's frame at our tail refuses loud.
-    try vol.cache.setAppender(2, 1);
-    const tail = blk: {
-        const d = leaf.lockRead(testing.io);
-        defer leaf.unlockRead(testing.io);
-        break :blk d.tail_offset;
-    };
-    const frame = try node.encodeBsetFrame(gpa, vol.layout.frame, NODE_SIZE, leaf.node_seq, &refs, 9);
-    defer gpa.free(frame);
-    vol.ram.write(Vol.addrOf(0) + tail, frame);
-    _ = try vol.apply(leaf, &key.inodeKey(11), .put, &iv(11).encode());
-    {
-        const d = leaf.lockWrite(testing.io);
-        defer leaf.unlockWrite(testing.io);
-        try testing.expect((try leaf.freezeLocked(d, vol.layout)) != null);
-    }
-    const before = partition_refusals.load();
-    expectTripwireLog(&partition_refusals);
-    try testing.expectError(error.ForeignAppend, vol.cache.appendFrozen(leaf));
-    try log.testing.expectAllFired();
-    try testing.expectEqual(before + 1, partition_refusals.load());
-    try testing.expectEqual(@as(u64, 1), vol.ram.appends.load(.monotonic));
 }
 
 test "the cache registers as a sheddable mem_budget component: gauge, 64 MiB floor, weight 1; a Red tick kicks the checkpoint" {

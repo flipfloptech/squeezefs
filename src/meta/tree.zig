@@ -92,8 +92,7 @@ pub const Error = node_cache.ChildError || rec.FoldError || error{
     Corrupt,
     /// The node-seq mint space is exhausted (remount for a fresh one).
     SpaceExhausted,
-    /// The partitioning gate refused a mutation (a reader, a non-authority
-    /// interior write, an unleased leaf).
+    /// The mutation gates refused (a reader mount, an unleased slot tree).
     PartitionRefused,
     /// A value above the per-volume cap `min(64 KiB, node_size/4) + 256`.
     ValueTooLarge,
@@ -293,9 +292,60 @@ pub const MaintenanceQueue = struct {
 // The tree.
 // ---------------------------------------------------------------------------
 
-/// One logical btree (per `tree_id`) over a shared per-volume `NodeCache`.
+/// What a mounted tree IS (charter §5.5): the manager's control tree
+/// (header id `TREE_CONTROL`) or ONE slot tree (header id `KIND_INTERIOR`,
+/// every node RAM-stamped with its slot). The one-member forest mounts
+/// `.control` and `.native`; a guest slot tree's root lives in tree 0.
+pub const TreeIdentity = union(enum) {
+    control,
+    slot: ForestSlot,
+
+    pub const native: TreeIdentity = .{ .slot = key.NATIVE_FOREST_SLOT };
+
+    /// The node-header class byte every node of the tree carries.
+    pub fn headerTreeId(self: TreeIdentity) u8 {
+        return switch (self) {
+            .control => key.TREE_CONTROL,
+            .slot => key.KIND_INTERIOR,
+        };
+    }
+
+    pub fn forestSlot(self: TreeIdentity) ?ForestSlot {
+        return switch (self) {
+            .control => null,
+            .slot => |s| s,
+        };
+    }
+
+    pub fn fromRootId(id: ledger.RootId) TreeIdentity {
+        return switch (id) {
+            .control => .control,
+            .native_slot => .native,
+        };
+    }
+
+    /// The ledger root this tree publishes under; null for a guest slot
+    /// tree (its root is a tree-0 `slot_state` record, charter §5.5).
+    pub fn rootId(self: TreeIdentity) ?ledger.RootId {
+        return switch (self) {
+            .control => .control,
+            .slot => |s| if (s == key.NATIVE_FOREST_SLOT) .native_slot else null,
+        };
+    }
+
+    pub fn eql(a: TreeIdentity, b: TreeIdentity) bool {
+        return switch (a) {
+            .control => b == .control,
+            .slot => |sa| b == .slot and b.slot == sa,
+        };
+    }
+};
+
+/// One logical btree over a shared per-volume `NodeCache`.
 pub const KvTree = struct {
     gpa: Allocator,
+    identity: TreeIdentity,
+    /// `identity.headerTreeId()`: what every node header of the tree says.
     tree_id: u8,
     cache: *NodeCache,
     /// The live root pointer — latch-free (`ArcSwap`); swapped only inside
@@ -311,8 +361,8 @@ pub const KvTree = struct {
     /// The §4.6a merge sweep's resumable lap state — touched only by the
     /// serialized SMO task that owns the `SmoContext`.
     merge_cursor: leaf_merge.SweepCursor = .{},
-    /// `Some(slot)` ⇔ a SLOT TREE of a forest volume (every node carries
-    /// header id 0 and the slot stamp); null on every per-kind tree.
+    /// `identity.forestSlot()`: `Some(slot)` ⇔ a slot tree (every node
+    /// carries header id 0 and the slot stamp); null on the control tree.
     forest_slot: ?ForestSlot,
     /// The journal position the LIVE root came into force at (0 = the root
     /// the tree was opened with — durably named already). A root swap's
@@ -323,7 +373,7 @@ pub const KvTree = struct {
     /// Format a fresh, empty tree: claim one extent (`.internal` — tree
     /// roots are format/checkpoint internals), write an empty leaf root
     /// spanning the whole key space, publish it pinned.
-    pub fn create(gpa: Allocator, cache: *NodeCache, alloc: *const alloc_ext.ExtentAllocator, tree_id: u8, seq: *NodeSeqHandle) (Error || error{NoSpace})!*KvTree {
+    pub fn create(gpa: Allocator, cache: *NodeCache, alloc: *const alloc_ext.ExtentAllocator, identity: TreeIdentity, seq: *NodeSeqHandle) (Error || error{NoSpace})!*KvTree {
         const extent = try alloc.claimInternal();
         errdefer alloc.releaseUnpublished(extent);
         const addr = cache.extentAddr(extent);
@@ -331,7 +381,7 @@ pub const KvTree = struct {
         var w = try node.writeNode(gpa, cache.cfg.layout, .{
             .node_addr = addr,
             .node_seq = ns,
-            .tree_id = tree_id,
+            .tree_id = identity.headerTreeId(),
             .level = 0,
             .min_key = "",
             .max_key = &KEY_SPACE_MAX,
@@ -340,40 +390,40 @@ pub const KvTree = struct {
         try cache.loader.writeImage(cache.loader.ctx, addr, w.image);
         const root_node = try loadFresh(cache, addr, true);
         defer root_node.release();
+        if (identity.forestSlot()) |slot| root_node.stampForestSlot(slot);
         try cache.publish(root_node);
-        return init(gpa, cache, tree_id, .{ .addr = addr, .seq = ns }, seq, null, 0);
+        return init(gpa, cache, identity, .{ .addr = addr, .seq = ns }, seq, 0);
     }
 
     /// Re-attach to an existing tree from its root pointer (the mount path:
     /// superblock → ledger → roots). Verifies the root node's incarnation
-    /// and tree id against the pointer (a torn or stale ledger word never
-    /// installs an unverified root) and pins it.
-    pub fn open(gpa: Allocator, cache: *NodeCache, tree_id: u8, root: RootPtr, seq: *NodeSeqHandle) Error!*KvTree {
+    /// and header id against the pointer (a torn or stale ledger word never
+    /// installs an unverified root), stamps it with the slot and pins it.
+    pub fn open(gpa: Allocator, cache: *NodeCache, identity: TreeIdentity, root: RootPtr, seq: *NodeSeqHandle) Error!*KvTree {
         const n = try cache.get(root.addr);
         defer n.release();
         if (n.node_seq != root.seq) {
             log.err("root pointer stale: ledger says node_seq {d}, extent 0x{x} holds {d}", .{ root.seq, root.addr, n.node_seq });
             return error.Corrupt;
         }
-        if (n.tree_id != tree_id) {
-            log.err("root tree_id mismatch: expected {d}, extent 0x{x} holds {d}", .{ tree_id, root.addr, n.tree_id });
+        if (n.tree_id != identity.headerTreeId()) {
+            log.err("root tree_id mismatch: expected {d}, extent 0x{x} holds {d}", .{ identity.headerTreeId(), root.addr, n.tree_id });
             return error.Corrupt;
         }
+        if (identity.forestSlot()) |slot| n.stampForestSlot(slot);
         n.pin();
-        return init(gpa, cache, tree_id, root, seq, null, 0);
+        return init(gpa, cache, identity, root, seq, 0);
     }
 
-    /// `open` from a ledger record: the root the record names for
-    /// `tree_id` (`error.Corrupt` when the record names no such tree).
-    pub fn openFromLedger(gpa: Allocator, cache: *NodeCache, record: *const ledger.LedgerRecord, tree_id: u8, seq: *NodeSeqHandle) Error!*KvTree {
-        for (record.tree_roots) |r| {
-            if (r.tree_id == tree_id) return open(gpa, cache, tree_id, .{ .addr = r.node_addr, .seq = r.node_seq }, seq);
-        }
-        log.err("ledger record {d} names no root for tree {d}", .{ record.seq, tree_id });
+    /// `open` from a ledger record: the root the record names for `id`
+    /// (`error.Corrupt` when the record names no such root).
+    pub fn openFromLedger(gpa: Allocator, cache: *NodeCache, record: *const ledger.LedgerRecord, id: ledger.RootId, seq: *NodeSeqHandle) Error!*KvTree {
+        if (record.root(id)) |r| return open(gpa, cache, .fromRootId(id), .{ .addr = r.node_addr, .seq = r.node_seq }, seq);
+        log.err("ledger record {d} names no root {d}", .{ record.seq, @backingInt(id) });
         return error.Corrupt;
     }
 
-    fn init(gpa: Allocator, cache: *NodeCache, tree_id: u8, root: RootPtr, seq: *NodeSeqHandle, slot: ?ForestSlot, root_floor: u64) Allocator.Error!*KvTree {
+    fn init(gpa: Allocator, cache: *NodeCache, identity: TreeIdentity, root: RootPtr, seq: *NodeSeqHandle, root_floor: u64) Allocator.Error!*KvTree {
         const root_arc = try Arc(RootPtr).create(gpa, root);
         errdefer root_arc.release();
         var queue = try MaintenanceQueue.init(gpa, maintenanceQueueCapacity(cache.cfg.budget_bytes / @max(cache.cfg.layout.node_size, 1)));
@@ -381,12 +431,13 @@ pub const KvTree = struct {
         const self = try gpa.create(KvTree);
         self.* = .{
             .gpa = gpa,
-            .tree_id = tree_id,
+            .identity = identity,
+            .tree_id = identity.headerTreeId(),
             .cache = cache,
             .root = .init(root_arc),
             .seq = seq,
             .maintenance = queue,
-            .forest_slot = slot,
+            .forest_slot = identity.forestSlot(),
             .root_floor = .init(root_floor),
         };
         return self;
@@ -413,10 +464,11 @@ pub const KvTree = struct {
         self.root.store(try Arc(RootPtr).create(self.gpa, root));
     }
 
-    /// The ledger face of the root.
-    pub fn ledgerRoot(self: *KvTree) ledger.TreeRoot {
+    /// The ledger face of the root; null for a guest slot tree.
+    pub fn ledgerRoot(self: *KvTree) ?ledger.TreeRoot {
+        const id = self.identity.rootId() orelse return null;
         const r = self.rootPtr();
-        return .{ .tree_id = self.tree_id, .node_addr = r.addr, .node_seq = r.seq };
+        return .{ .id = id, .node_addr = r.addr, .node_seq = r.seq };
     }
 
     pub fn rootFloor(self: *const KvTree) u64 {
@@ -441,15 +493,15 @@ pub const KvTree = struct {
         return n.forestSlot() == slot;
     }
 
-    /// Stamp `n` with this tree's slot (a no-op on per-kind trees).
+    /// Stamp `n` with this tree's slot (a no-op on the control tree).
     pub fn stamp(self: *const KvTree, n: *CachedNode) void {
         if (self.forest_slot) |s| n.stampForestSlot(s);
     }
 
     /// The JOURNAL key of one of this tree's interior pointer records: the
-    /// separator itself on a per-kind tree; `slot ‖ separator` on a slot
+    /// separator itself on the control tree; `slot ‖ separator` on a slot
     /// tree (a separator alone cannot name the tree — every tree's top one
-    /// is `KEY_SPACE_MAX`).
+    /// is `KEY_SPACE_MAX`). `route` is the inverse.
     pub fn interiorJournalKey(self: *const KvTree, separator: []const u8) key.KeyBuf {
         if (self.forest_slot) |s| return key.interiorJournalKey(s, separator);
         return key.KeyBuf.fromSlice(separator);
@@ -644,7 +696,7 @@ pub const KvTree = struct {
                     stats.meta_kv_commit_smo_retries.inc();
                     break :blk .stale;
                 },
-                error.ReaderMayNotMutate, error.NonAuthorityInterior, error.LeafLeaseRefused => error.PartitionRefused,
+                error.ReaderMayNotMutate, error.LeafLeaseRefused => error.PartitionRefused,
                 error.OutOfMemory => error.OutOfMemory,
             };
         };
@@ -800,9 +852,42 @@ pub const ReplayOutcome = struct {
     skipped: u64 = 0,
 };
 
-fn treeFor(trees: []const *KvTree, tree_id: u8) ?*KvTree {
-    for (trees) |t| if (t.tree_id == tree_id) return t;
+/// A routed record: the tree it belongs to and the key the tree applies.
+pub const Route = struct { tree: *KvTree, key: []const u8 };
+
+/// THE record routing law (charter §5.5 "a record's slot is `key_ino >> 40`
+/// (refs by their owner ino)"), the inverse of every tag a commit or SMO
+/// writes: a content record of a slot-tree kind belongs to the slot tree
+/// its key's slot names; a control record (kind 8) to the control tree; an
+/// interior record (level > 0) to the tree of its header id — a slot
+/// tree's is named by the `slot ‖ separator` journal key, and the tree
+/// applies the separator. Null = no mounted tree takes it (an allocator
+/// delta, an unmounted slot, a key that decodes as no kind).
+pub fn route(trees: []const *KvTree, tree_id: u8, level: u8, k: []const u8) ?Route {
+    if (level > 0) {
+        if (tree_id == key.KIND_INTERIOR) {
+            const split = key.splitInteriorJournalKey(k) catch return null;
+            for (trees) |t| if (t.forest_slot == split.slot) return .{ .tree = t, .key = split.separator };
+            return null;
+        }
+        for (trees) |t| if (t.forest_slot == null and t.tree_id == tree_id) return .{ .tree = t, .key = k };
+        return null;
+    }
+    if (key.isSlotTreeKind(tree_id)) {
+        // The key must decode as the tagged kind (admission and the mount
+        // fold refuse a disagreeing pair; here it routes nowhere).
+        const slot = key.checkSlotTreeKey(tree_id, k) catch return null;
+        for (trees) |t| if (t.forest_slot == slot) return .{ .tree = t, .key = k };
+        return null;
+    }
+    for (trees) |t| if (t.forest_slot == null and t.tree_id == tree_id) return .{ .tree = t, .key = k };
     return null;
+}
+
+/// `route` for a content record (level 0).
+pub fn routeContent(trees: []const *KvTree, tree_id: u8, k: []const u8) ?*KvTree {
+    const r = route(trees, tree_id, 0, k) orelse return null;
+    return r.tree;
 }
 
 fn kindOf(k: journal.RecordKind) RecordKind {
@@ -826,15 +911,16 @@ pub fn replayEntries(gpa: Allocator, trees: []const *KvTree, entries: []const jo
     const interior = try journal.interiorRecordsSorted(gpa, entries);
     defer gpa.free(interior);
     for (interior) |r| {
-        const t = treeFor(trees, r.tree_id) orelse {
+        const routed = route(trees, r.tree_id, r.level, r.record.key) orelse {
             out.skipped += 1;
             continue;
         };
+        const t = routed.tree;
         const kind = kindOf(r.record.kind);
         if (kind == .put) {
             if (key.InteriorValue.decode(r.record.value)) |iv| t.seq.raiseTo(iv.childSeq()) else |_| {}
         }
-        if (try t.applyReplayedInterior(r.record.key, r.level, r.record.seq, kind, r.record.value, r.entry_seq)) {
+        if (try t.applyReplayedInterior(routed.key, r.level, r.record.seq, kind, r.record.value, r.entry_seq)) {
             out.interior_applied += 1;
         } else {
             out.interior_dropped += 1;
@@ -845,7 +931,7 @@ pub fn replayEntries(gpa: Allocator, trees: []const *KvTree, entries: []const jo
         while (it.next()) |r| {
             const tag = journal.untag(r.tag);
             if (tag.level > 0) continue; // phase 1 applied it
-            const t = treeFor(trees, tag.tree_id) orelse {
+            const t = routeContent(trees, tag.tree_id, r.key) orelse {
                 out.skipped += 1;
                 continue;
             };
@@ -856,11 +942,18 @@ pub fn replayEntries(gpa: Allocator, trees: []const *KvTree, entries: []const jo
     return out;
 }
 
-/// The ledger writer's roots: one `TreeRoot` per tree, in `trees` order.
+/// The ledger writer's roots: one `TreeRoot` per ledger-rooted tree, in
+/// `trees` order.
 pub fn roots(trees: []const *KvTree, out: []ledger.TreeRoot) []ledger.TreeRoot {
     assert(out.len >= trees.len);
-    for (trees, 0..) |t, i| out[i] = t.ledgerRoot();
-    return out[0..trees.len];
+    var n: usize = 0;
+    for (trees) |t| {
+        if (t.ledgerRoot()) |r| {
+            out[n] = r;
+            n += 1;
+        }
+    }
+    return out[0..n];
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,7 +1179,7 @@ test "interior value roundtrip and bounds (the traversal's pointer format)" {
 test "point_ops_insert_overwrite_delete_reinsert: LWW by seq, tombstones fold to absent, keys are non-empty and below the sentinel" {
     var vol = try smo.TestVolume.init(testing.allocator, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     try expectLookup(t, &ikey(7), null);
     try t.insert(&ikey(7), testValue(7, 32, &buf));
@@ -1113,7 +1206,7 @@ test "range_scan_folds_orders_and_resumes: tombstones and overwrites fold throug
     const gpa = testing.allocator;
     var vol = try smo.TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     for (0..200) |i| try t.insert(&ikey(i), testValue(i, 24, &buf));
     var i: u64 = 0;
@@ -1163,7 +1256,7 @@ test "reads_proceed_while_writer_holds_the_node_lock: lookups and scans take no 
     const gpa = testing.allocator;
     var vol = try smo.TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     for (0..300) |i| try t.insert(&ikey(i), testValue(i, 32, &buf));
     const leaf = try t.resolveLeaf(&ikey(150));
@@ -1181,40 +1274,83 @@ test "open verifies the root pointer: a stale ledger node_seq or a foreign tree 
     const gpa = testing.allocator;
     var vol = try smo.TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     try t.insert(&ikey(1), testValue(1, 24, &buf));
     try vol.flushDirty(t);
     const root = t.rootPtr();
     var out: [1]ledger.TreeRoot = undefined;
     const rs = roots(&.{t}, &out);
-    try testing.expectEqual(ledger.TreeRoot{ .tree_id = key.TREE_INODES, .node_addr = root.addr, .node_seq = root.seq }, rs[0]);
+    try testing.expectEqual(ledger.TreeRoot{ .id = .native_slot, .node_addr = root.addr, .node_seq = root.seq }, rs[0]);
     var fresh = try vol.freshCache();
     defer fresh.deinit();
     log.testing.expectErrorLogs(1);
-    try testing.expectError(error.Corrupt, KvTree.open(gpa, fresh, key.TREE_INODES, .{ .addr = root.addr, .seq = root.seq + 1 }, vol.seq));
+    try testing.expectError(error.Corrupt, KvTree.open(gpa, fresh, .native, .{ .addr = root.addr, .seq = root.seq + 1 }, vol.seq));
     try log.testing.expectAllFired();
     log.testing.expectErrorLogs(1);
-    try testing.expectError(error.Corrupt, KvTree.open(gpa, fresh, key.TREE_DENTRIES, root, vol.seq));
+    try testing.expectError(error.Corrupt, KvTree.open(gpa, fresh, .control, root, vol.seq));
     try log.testing.expectAllFired();
-    const reopened = try KvTree.open(gpa, fresh, key.TREE_INODES, root, vol.seq);
+    const reopened = try KvTree.open(gpa, fresh, .native, root, vol.seq);
     defer reopened.destroy();
     try expectLookup(reopened, &ikey(1), testValue(1, 24, &buf));
+    const root_node = try reopened.cache.get(root.addr);
+    defer root_node.release();
+    try testing.expect(reopened.owns(root_node));
     // From a ledger record.
-    var record = ledger.bootstrapRecord(rs, 2, vol.seq.load(), null);
-    const via_ledger = try KvTree.openFromLedger(gpa, fresh, &record, key.TREE_INODES, vol.seq);
+    var record = ledger.bootstrapRecord(rs, 2, vol.seq.load(), .oneMember("set-uuid-fixture".*));
+    const via_ledger = try KvTree.openFromLedger(gpa, fresh, &record, .native_slot, vol.seq);
     defer via_ledger.destroy();
     try testing.expectEqual(root, via_ledger.rootPtr());
     log.testing.expectErrorLogs(1);
-    try testing.expectError(error.Corrupt, KvTree.openFromLedger(gpa, fresh, &record, key.TREE_XATTRS, vol.seq));
+    try testing.expectError(error.Corrupt, KvTree.openFromLedger(gpa, fresh, &record, .control, vol.seq));
     try log.testing.expectAllFired();
+    // A guest slot tree publishes no ledger root: its root is tree 0's.
+    const guest = try vol.createTree(.{ .slot = key.guestForestSlot(3) });
+    try testing.expectEqual(@as(?ledger.TreeRoot, null), guest.ledgerRoot());
+    var two: [2]ledger.TreeRoot = undefined;
+    try testing.expectEqual(@as(usize, 1), roots(&.{ t, guest }, &two).len);
+}
+
+test "the routing law: slot-tree kinds route by the key's slot (the key must decode as the tagged kind), control by kind 8, interior by header id — slot trees through the slot ‖ separator key; alloc deltas and unmounted slots route nowhere" {
+    var vol = try smo.TestVolume.init(testing.allocator, .{});
+    defer vol.deinit();
+    const native = try vol.createTree(.native);
+    const control = try vol.createTree(.control);
+    const guest = try vol.createTree(.{ .slot = key.guestForestSlot(7) });
+    const trees = [_]*KvTree{ native, control, guest };
+    try testing.expectEqual(native, routeContent(&trees, key.TREE_INODES, &key.inodeKey(5)));
+    try testing.expectEqual(native, routeContent(&trees, key.TREE_DENTRIES, &key.dentryKey(1, 2, 0)));
+    try testing.expectEqual(native, routeContent(&trees, key.TREE_XATTRS, &key.xattrKey(1, 2, 0)));
+    try testing.expectEqual(native, routeContent(&trees, key.TREE_BLOCK_REFS, &key.blockRefKey(1, 2, 9, 0)));
+    try testing.expectEqual(guest, routeContent(&trees, key.TREE_INODES, &key.inodeKey(key.guestLocalIno(7, 9))));
+    try testing.expectEqual(control, routeContent(&trees, key.TREE_CONTROL, "slot_state:3"));
+    // Nowhere: an unmounted slot, a disagreeing (tag, key) pair, a kindless
+    // key, an allocator delta.
+    try testing.expect(routeContent(&trees, key.TREE_INODES, &key.inodeKey(key.guestLocalIno(8, 9))) == null);
+    try testing.expect(routeContent(&trees, key.TREE_INODES, &key.dentryKey(1, 2, 0)) == null);
+    try testing.expect(routeContent(&trees, key.TREE_INODES, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 5 }) == null);
+    try testing.expect(routeContent(&trees, alloc_ext.tree_alloc_reserved, &alloc_ext.extentKey(4)) == null);
+    // Interior: a slot tree's pointer record rides `slot ‖ separator`; the
+    // tree applies the separator. The control tree's rides the separator.
+    const jk = native.interiorJournalKey(&key.inodeKey(100));
+    const r = route(&trees, key.KIND_INTERIOR, 1, jk.slice()).?;
+    try testing.expectEqual(native, r.tree);
+    try testing.expectEqualSlices(u8, &key.inodeKey(100), r.key);
+    const gk = guest.interiorJournalKey(&KEY_SPACE_MAX);
+    try testing.expectEqual(guest, route(&trees, key.KIND_INTERIOR, 1, gk.slice()).?.tree);
+    const ck = control.interiorJournalKey("slot_state:3");
+    const cr = route(&trees, key.TREE_CONTROL, 2, ck.slice()).?;
+    try testing.expectEqual(control, cr.tree);
+    try testing.expectEqualStrings("slot_state:3", cr.key);
+    try testing.expect(route(&trees, key.KIND_INTERIOR, 1, key.interiorJournalKey(key.guestForestSlot(8), "x").slice()) == null);
+    try testing.expect(route(&trees, key.TREE_INODES, 1, &key.inodeKey(1)) == null);
 }
 
 test "replay LWW gate: a replayed record at-or-below the node's newest seq for its key is skipped as applied; a newer one lands with its own seq" {
     const gpa = testing.allocator;
     var vol = try smo.TestVolume.init(gpa, .{});
     defer vol.deinit();
-    const t = try vol.createTree(key.TREE_INODES);
+    const t = try vol.createTree(.native);
     var buf: [64]u8 = undefined;
     try t.insert(&ikey(5), testValue(5, 24, &buf));
     const newest = vol.seq.load();

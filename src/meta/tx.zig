@@ -3,17 +3,18 @@
 //! cache)"; survey `docs/porting/kv_tree_cache_commit_survey.md` §2.1, §7
 //! row 10). PORTABLE: nothing here touches a device, a lock or a clock.
 //!
-//! A `KvTx` is one op's staged records in stage order — `(tree_id, legacy
-//! key, kind, value)`, seqs UNASSIGNED (the conveyor pass stamps them from
-//! its reservation inside the leaf-lock window). Ops thread one `KvTx`
+//! A `KvTx` is one op's staged records in stage order — `(tree_id, key,
+//! kind, value)`, seqs UNASSIGNED (the conveyor pass stamps them from its
+//! reservation inside the leaf-lock window). Ops thread one `KvTx`
 //! explicitly; kv ops never nest transactions. `buildQueuedTx` is the
-//! pre-queue admission: it frames the keys for the volume's layout (the
-//! forest key's kind byte inserted ONCE here, so every downstream step sees
-//! one key shape), enforces the per-volume record-value cap at the ONE
-//! commit-side choke point every tx passes (an over-cap record fails ITS OWN
-//! commit, never the checkpoint's freeze — the 2026-08-19 AlreadyFreezing
-//! wedge's third leg), fixes the exact entry length (the Σ-admission size,
-//! taken BEFORE any lock) and yields the queue entry.
+//! pre-queue admission: it checks every slot-tree record's key against its
+//! kind through the ONE key codec (a key that does not decode as its kind
+//! would route to a foreign slot or fail at every later read), enforces the
+//! per-volume record-value cap at the ONE commit-side choke point every tx
+//! passes (an over-cap record fails ITS OWN commit, never the checkpoint's
+//! freeze — the 2026-08-19 AlreadyFreezing wedge's third leg), fixes the
+//! exact entry length (the Σ-admission size, taken BEFORE any lock) and
+//! yields the queue entry.
 //!
 //! The entry the pass writes for a `QueuedTx` is, by construction, the entry
 //! `journal.buildEntryWrite` writes for the same frames — `frames()` is the
@@ -41,9 +42,9 @@ pub const AdmissionClass = jc.AdmissionClass;
 pub const SeqSpan = jc.SeqSpan;
 
 pub const stats = struct {
-    /// `meta_kv_forest_key_violations`: a staged `(kind, legacy key)` the
-    /// forest codec refused at framing — a mis-framed key would route to a
-    /// foreign slot or fail at every later read, so it fails its commit.
+    /// `meta_kv_forest_key_violations`: a staged `(kind, key)` the key codec
+    /// refused at admission — the key does not decode as its kind, or its
+    /// routing ino is above the slot namespace — so it fails its commit.
     pub var meta_kv_forest_key_violations: counters.ShardedCounter = .{};
 };
 
@@ -86,8 +87,8 @@ pub const GuardSet = struct {
 // KvTx — staging.
 // ---------------------------------------------------------------------------
 
-/// One staged record: the LEGACY key as the op built it (the forest kind
-/// byte is framed at `buildQueuedTx`), bytes owned by the tx's arena.
+/// One staged record: the key as the op built it (the charter's key, kind
+/// byte included), bytes owned by the tx's arena.
 pub const Staged = struct {
     tree_id: u8,
     key: []const u8,
@@ -172,7 +173,7 @@ pub const KvTx = struct {
 // ---------------------------------------------------------------------------
 
 /// The occupied `coll_seq`s of one hash chain `[start, end]` (same-kind
-/// legacy keys whose LAST byte is the `coll_seq`): the live range scan's
+/// keys whose LAST byte is the `coll_seq`): the live range scan's
 /// keys (`live_chain_keys`, the caller's scan of exactly that range) folded
 /// through the tx overlay — a slot this tx staged a `Delete` for (rename
 /// EXCHANGE) is free for its re-insert; a slot it staged a `Put` for is
@@ -258,7 +259,7 @@ pub const Compensation = struct { kind: RecordKind, value: []const u8 };
 
 pub const UndoKey = struct {
     tree_id: u8,
-    /// The STAGED key (framed on a forest volume).
+    /// The staged key.
     key: []const u8,
     pre: PreImage,
 
@@ -287,11 +288,6 @@ pub const UndoKey = struct {
 // ---------------------------------------------------------------------------
 // buildQueuedTx — pre-queue admission.
 // ---------------------------------------------------------------------------
-
-/// How a staged legacy key is journaled: verbatim on a flat volume; framed
-/// with its kind byte on a forest volume (bit 17). Tree 0's control
-/// records are keyed by their own codec and never framed.
-pub const KeyFraming = enum { flat, forest };
 
 /// One record of the queue entry: the tag's tree id and the record, seq 0
 /// until the pass stamps it.
@@ -387,7 +383,7 @@ comptime {
     assert(@backingInt(journal.RecordKind.delete) == @backingInt(RecordKind.delete));
 }
 
-/// Exact whole-entry size for staged records (header + Σ `1 + 15 + key +
+/// Exact whole-entry size for staged records (header + Σ `1 + 16 + key +
 /// value`), refusing past the 128 KiB whole-entry cap — `journal.entryLenFor`
 /// over the entry's frames, so a planner sizing a tx ahead of staging it
 /// (the destroy chunker) derives from the arithmetic the admission enforces.
@@ -404,8 +400,9 @@ pub fn entryLenFor(recs: []const Rec) error{EntryTooLarge}!u64 {
 /// deinit'ed afterwards; on a refusal its guards and bytes are released
 /// here). `node_size` is the volume's: the record-value cap is
 /// `min(64 KiB, node_size/4)` plus the xattr envelope, the very check the
-/// freeze runs.
-pub fn buildQueuedTx(tx: *KvTx, framing: KeyFraming, node_size: usize, diag: ?*BuildRefusal) BuildError!QueuedTx {
+/// freeze runs. Tree 0's control records are keyed by their own codec and
+/// pass the key check untouched.
+pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildError!QueuedTx {
     var arena = tx.arena;
     var guards = tx.guards;
     const staged = tx.staged.items;
@@ -425,18 +422,14 @@ pub fn buildQueuedTx(tx: *KvTx, framing: KeyFraming, node_size: usize, diag: ?*B
             if (diag) |d| d.* = .{ .value_too_large = .{ .len = s.value.len, .cap = cap } };
             return error.ValueTooLarge;
         }
-        const k: []const u8 = switch (framing) {
-            .flat => s.key,
-            .forest => if (s.tree_id == key.TREE_CONTROL) s.key else blk: {
-                const framed = key.forestKey(s.tree_id, s.key) catch |e| {
-                    stats.meta_kv_forest_key_violations.inc();
-                    if (diag) |d| d.* = .{ .forest_key = e };
-                    return error.ForestKeyRefused;
-                };
-                break :blk try a.dupe(u8, framed.slice());
-            },
-        };
-        recs[i] = .{ .tree_id = s.tree_id, .key = k, .kind = s.kind, .value = s.value };
+        if (key.isSlotTreeKind(s.tree_id)) {
+            _ = key.checkSlotTreeKey(s.tree_id, s.key) catch |e| {
+                stats.meta_kv_forest_key_violations.inc();
+                if (diag) |d| d.* = .{ .forest_key = e };
+                return error.ForestKeyRefused;
+            };
+        }
+        recs[i] = .{ .tree_id = s.tree_id, .key = s.key, .kind = s.kind, .value = s.value };
     }
     const len = entryLenFor(recs) catch {
         if (diag) |d| d.* = .{ .entry_too_large = .{ .len = journal.ENTRY_HDR_LEN + rawPayloadLen(recs), .cap = journal.MAX_ENTRY_LEN } };
@@ -503,7 +496,7 @@ test "staging keeps stage order, kinds and bytes; seqs are unassigned until the 
     const d = try record.InodeDelta.decode(tx.staged.items[2].value);
     try testing.expectEqual(record.DELTA_TIMES, d.mask);
 
-    var q = try buildQueuedTx(&tx, .flat, 256 * 1024, null);
+    var q = try buildQueuedTx(&tx, 256 * 1024, null);
     defer q.deinit();
     for (q.recs) |r| try testing.expectEqual(@as(u64, 0), r.seq);
     const span = q.stampSeqs(1000);
@@ -519,10 +512,10 @@ test "staging keeps stage order, kinds and bytes; seqs are unassigned until the 
 test "entry length is the exact journal arithmetic; the queue entry's frames are byte-identical to journal.buildEntryWrite of the same records (batch-of-one shape)" {
     var tx = KvTx.init(testing.allocator, @src());
     try stageCreate(&tx, 1, 77, "batch-of-one", 0x5EED);
-    var q = try buildQueuedTx(&tx, .flat, 256 * 1024, null);
+    var q = try buildQueuedTx(&tx, 256 * 1024, null);
     defer q.deinit();
 
-    // The exact size: 20 + Σ (1 + 15 + key + value).
+    // The exact size: 24 + Σ (1 + 16 + key + value).
     var want: u64 = journal.ENTRY_HDR_LEN;
     for (q.recs) |r| want += 1 + journal.RECORD_HEADER_LEN + r.key.len + r.value.len;
     try testing.expectEqual(want, q.len);
@@ -572,36 +565,34 @@ test "entry length is the exact journal arithmetic; the queue entry's frames are
     try testing.expectEqual(q.recs.len, i);
 }
 
-test "forest framing inserts the kind byte once and routes by the owner; control records stay verbatim; a refused key counts and fails the commit alone" {
+test "admission checks every slot-tree key against its kind and routes by the owner; control records pass untouched; a refused key counts and fails the commit alone" {
     var tx = KvTx.init(testing.allocator, @src());
     try tx.stagePut(key.TREE_INODES, &key.inodeKey(key.guestLocalIno(3, 9)), "v");
     try tx.stagePut(key.TREE_BLOCK_REFS, &key.blockRefKey(0x11, 5, 9, 2), &.{ 1, 0, 0, 0 });
     try tx.stagePut(key.TREE_CONTROL, "slot_state:7", "x");
-    var q = try buildQueuedTx(&tx, .forest, 64 * 1024, null);
+    var q = try buildQueuedTx(&tx, 64 * 1024, null);
     defer q.deinit();
-    try testing.expectEqual(key.FOREST_INODE_KEY_LEN, q.recs[0].key.len);
+    try testing.expectEqual(key.INODE_KEY_LEN, q.recs[0].key.len);
     try testing.expectEqual(key.TREE_INODES, q.recs[0].key[8]);
-    try testing.expectEqual(@as(key.ForestSlot, 4), try key.forestKeySlot(q.recs[0].key));
-    try testing.expectEqual(key.FOREST_BLOCK_REF_KEY_LEN, q.recs[1].key.len);
+    try testing.expectEqual(@as(key.ForestSlot, 4), try key.slotTreeKeySlot(q.recs[0].key));
+    try testing.expectEqual(key.BLOCK_REF_KEY_LEN, q.recs[1].key.len);
     try testing.expectEqual(key.TREE_BLOCK_REFS, q.recs[1].key[0]);
-    try testing.expectEqual(@as(key.ForestSlot, 0), try key.forestKeySlot(q.recs[1].key));
+    try testing.expectEqual(@as(key.ForestSlot, 0), try key.slotTreeKeySlot(q.recs[1].key));
     try testing.expectEqualStrings("slot_state:7", q.recs[2].key);
 
-    // Flat: verbatim.
-    var flat = KvTx.init(testing.allocator, @src());
-    try flat.stagePut(key.TREE_INODES, &key.inodeKey(9), "v");
-    var fq = try buildQueuedTx(&flat, .flat, 64 * 1024, null);
-    defer fq.deinit();
-    try testing.expectEqual(key.INODE_KEY_LEN, fq.recs[0].key.len);
-
-    // A key of the wrong shape for its kind refuses, counted.
+    // A key of the wrong shape for its kind refuses, counted; so does a
+    // routing ino above the slot namespace.
     const before = stats.meta_kv_forest_key_violations.load();
     var bad = KvTx.init(testing.allocator, @src());
     try bad.stagePut(key.TREE_DENTRIES, &key.inodeKey(5), "v");
     var diag: BuildRefusal = undefined;
-    try testing.expectError(error.ForestKeyRefused, buildQueuedTx(&bad, .forest, 64 * 1024, &diag));
+    try testing.expectError(error.ForestKeyRefused, buildQueuedTx(&bad, 64 * 1024, &diag));
     try testing.expectEqual(key.ForestKeyError.MalformedKnownKind, diag.forest_key);
-    try testing.expectEqual(before + 1, stats.meta_kv_forest_key_violations.load());
+    var high = KvTx.init(testing.allocator, @src());
+    try high.stagePut(key.TREE_INODES, &key.inodeKey(@as(u64, key.FOREST_SLOT_MAX + 1) << 40), "v");
+    try testing.expectError(error.ForestKeyRefused, buildQueuedTx(&high, 64 * 1024, &diag));
+    try testing.expectEqual(key.ForestKeyError.SlotOutOfNamespace, diag.forest_key);
+    try testing.expectEqual(before + 2, stats.meta_kv_forest_key_violations.load());
 }
 
 test "value cap min(64 KiB, node_size/4) + envelope is enforced at the choke point as a typed refusal; the whole-entry cap refuses past 128 KiB" {
@@ -615,7 +606,7 @@ test "value cap min(64 KiB, node_size/4) + envelope is enforced at the choke poi
     try tx.stagePut(key.TREE_XATTRS, &key.xattrKey(9, 1, 0), big[0..cap_64k]);
     try tx.stagePut(key.TREE_XATTRS, &key.xattrKey(9, 2, 0), big);
     var diag: BuildRefusal = undefined;
-    try testing.expectError(error.ValueTooLarge, buildQueuedTx(&tx, .flat, 64 * 1024, &diag));
+    try testing.expectError(error.ValueTooLarge, buildQueuedTx(&tx, 64 * 1024, &diag));
     try testing.expectEqual(cap_64k + 1, diag.value_too_large.len);
     try testing.expectEqual(cap_64k, diag.value_too_large.cap);
 
@@ -624,7 +615,7 @@ test "value cap min(64 KiB, node_size/4) + envelope is enforced at the choke poi
     try testing.expectEqual(@as(usize, 65_536 + 256), record.recordValueCap(256 * 1024));
     var ok = KvTx.init(testing.allocator, @src());
     try ok.stagePut(key.TREE_XATTRS, &key.xattrKey(9, 2, 0), big);
-    var q = try buildQueuedTx(&ok, .flat, 256 * 1024, null);
+    var q = try buildQueuedTx(&ok, 256 * 1024, null);
     q.deinit();
 
     // Two maximal values exceed the whole-entry cap: EntryTooLarge, typed.
@@ -634,7 +625,7 @@ test "value cap min(64 KiB, node_size/4) + envelope is enforced at the choke poi
     var over = KvTx.init(testing.allocator, @src());
     try over.stagePut(key.TREE_XATTRS, &key.xattrKey(9, 1, 0), maxv);
     try over.stagePut(key.TREE_XATTRS, &key.xattrKey(9, 2, 0), maxv);
-    try testing.expectError(error.EntryTooLarge, buildQueuedTx(&over, .flat, 256 * 1024, &diag));
+    try testing.expectError(error.EntryTooLarge, buildQueuedTx(&over, 256 * 1024, &diag));
     try testing.expectEqual(journal.MAX_ENTRY_LEN, diag.entry_too_large.cap);
     try testing.expect(diag.entry_too_large.len > journal.MAX_ENTRY_LEN);
 }
@@ -644,7 +635,7 @@ test "guards travel with the entry and release exactly once at the terminal outc
     var tx = KvTx.init(testing.allocator, @src());
     tx.holdGuards(g.set());
     try tx.stagePut(key.TREE_INODES, &key.inodeKey(3), "v");
-    var q = try buildQueuedTx(&tx, .flat, 64 * 1024, null);
+    var q = try buildQueuedTx(&tx, 64 * 1024, null);
     try testing.expect(q.guards.isHeld());
     try testing.expectEqual(@as(u32, 0), g.released);
     // Fan-out drops the guards BEFORE the ack; a later deinit is a no-op.
@@ -663,7 +654,7 @@ test "guards travel with the entry and release exactly once at the terminal outc
     defer testing.allocator.free(big);
     @memset(big, 0);
     try bad.stagePut(key.TREE_XATTRS, &key.xattrKey(9, 1, 0), big);
-    try testing.expectError(error.ValueTooLarge, buildQueuedTx(&bad, .flat, 64 * 1024, null));
+    try testing.expectError(error.ValueTooLarge, buildQueuedTx(&bad, 64 * 1024, null));
     try testing.expectEqual(@as(u32, 1), g2.released);
 
     // A tx that never becomes an entry releases on its own deinit.
@@ -743,7 +734,7 @@ test "undo pre-images project to their compensating records: live ⇒ Put(pre), 
 
 test "an empty tx builds an empty entry of exactly the header length (the degenerate group member)" {
     var tx = KvTx.init(testing.allocator, @src());
-    var q = try buildQueuedTx(&tx, .forest, 64 * 1024, null);
+    var q = try buildQueuedTx(&tx, 64 * 1024, null);
     defer q.deinit();
     try testing.expectEqual(@as(usize, 0), q.recs.len);
     try testing.expectEqual(journal.ENTRY_HDR_LEN, q.len);

@@ -1,0 +1,120 @@
+//! The one CLI binary's verbs (charter §8): `format`, `mount` (`--daemon
+//! --supervise --log-file`), `umount`, `status`, `--version`. `src/main.zig`
+//! runs the knob gate first (charter §1.6) and then hands argv to `run`.
+//!
+//! Portable here: the grammar (`args.zig`), the ONE URI parser (`uri.zig`),
+//! the log sink (`log_sink.zig`) and the supervisor's pure state machine
+//! (`supervisor.zig`). The verbs that touch a volume or a mount are Linux
+//! only (charter §1.2) and gated, never stubbed.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const is_linux = builtin.os.tag == .linux;
+
+pub const args = @import("args.zig");
+pub const uri = @import("uri.zig");
+pub const log_sink = @import("log_sink.zig");
+pub const supervisor = @import("supervisor.zig");
+
+pub const format = if (is_linux) @import("format.zig") else struct {};
+pub const status = if (is_linux) @import("status.zig") else struct {};
+pub const umount = if (is_linux) @import("umount.zig") else struct {};
+pub const fusermount = if (is_linux) @import("fusermount.zig") else struct {};
+pub const daemon = if (is_linux) @import("daemon.zig") else struct {};
+pub const mount = if (is_linux) @import("mount.zig") else struct {};
+pub const smoke = if (is_linux) @import("smoke.zig") else struct {};
+
+/// Exit codes (charter §8; `sysexits`-free, three outcomes): 0 success,
+/// 1 a refused or failed verb (the reason on stderr), 2 a usage error.
+pub const exit_ok: u8 = 0;
+pub const exit_failed: u8 = 1;
+pub const exit_usage: u8 = 2;
+
+/// What a verb needs from the process.
+pub const Process = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    argv: []const []const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    version: *const fn (*std.Io.Writer) std.Io.Writer.Error!void,
+};
+
+/// Parse and dispatch; returns the exit code. A usage refusal prints the
+/// diagnostic and the verb's usage on stderr.
+pub fn run(p: Process) u8 {
+    var diag: args.Refusal = undefined;
+    const verb = args.parse(p.argv, &diag) catch {
+        p.stderr.print("squeezefs: {f}\n{s}", .{ diag, args.usage(verbOf(p.argv)) }) catch {};
+        return exit_usage;
+    };
+    switch (verb) {
+        .version => {
+            p.version(p.stdout) catch return exit_failed;
+            return exit_ok;
+        },
+        .help => {
+            p.stdout.writeAll(args.usage(null)) catch return exit_failed;
+            return exit_ok;
+        },
+        .format => |f| return if (is_linux) format.run(p, f) else linuxOnly(p, "format"),
+        .mount => |m| return if (is_linux) mount.run(p, m) else linuxOnly(p, "mount"),
+        .umount => |u| return if (is_linux) umount.run(p, u) else linuxOnly(p, "umount"),
+        .status => |s| return if (is_linux) status.run(p, s) else linuxOnly(p, "status"),
+    }
+}
+
+/// The verb word of argv, for the usage line of a refusal.
+fn verbOf(argv: []const []const u8) ?std.meta.Tag(args.Verb) {
+    if (argv.len < 2) return null;
+    return std.meta.stringToEnum(std.meta.Tag(args.Verb), argv[1]);
+}
+
+/// The dev box builds the binary for `--version`; every volume verb is
+/// Linux only (charter §1.2).
+fn linuxOnly(p: Process, verb: []const u8) u8 {
+    p.stderr.print("squeezefs {s}: Linux only (charter §1.2) — this host runs the portable test suite and `--version`\n", .{verb}) catch {};
+    return exit_failed;
+}
+
+test {
+    _ = args;
+    _ = uri;
+    _ = log_sink;
+    _ = supervisor;
+    if (is_linux) {
+        _ = format;
+        _ = status;
+        _ = umount;
+        _ = fusermount;
+        _ = daemon;
+        _ = mount;
+        _ = smoke;
+    }
+}
+
+const testing = std.testing;
+
+test "run: a usage refusal prints the diagnostic and the verb's usage, exit 2; --version prints through the injected writer, exit 0" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var err: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer err.deinit();
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    const V = struct {
+        fn write(w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.writeAll("squeezefs test-train\n");
+        }
+    };
+    var p: Process = .{ .gpa = testing.allocator, .io = testing.io, .env = &env, .argv = &.{ "squeezefs", "mount", "sqmeta:///m" }, .stdout = &out.writer, .stderr = &err.writer, .version = V.write };
+    try testing.expectEqual(exit_usage, run(p));
+    try testing.expect(std.mem.indexOf(u8, err.written(), "mount: missing the mountpoint") != null);
+    try testing.expect(std.mem.indexOf(u8, err.written(), "usage: squeezefs mount") != null);
+    p.argv = &.{ "squeezefs", "--version" };
+    try testing.expectEqual(exit_ok, run(p));
+    try testing.expectEqualStrings("squeezefs test-train\n", out.written());
+    p.argv = &.{"squeezefs"};
+    try testing.expectEqual(exit_usage, run(p));
+}

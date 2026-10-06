@@ -90,6 +90,9 @@ pub const fuse = struct {
     pub const handler = @import("fuse/handler.zig");
 };
 
+// ---- the CLI verbs (charter §8; the volume verbs are Linux-only inside) ----
+pub const cli = @import("cli/cli.zig");
+
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
 
@@ -121,6 +124,7 @@ test {
     _ = fuse.mount_options;
     _ = fuse.transport;
     _ = fuse.handler;
+    _ = cli;
     if (builtin.os.tag == .linux) _ = uring128;
     _ = meta.conveyor;
     if (builtin.os.tag == .linux) _ = meta.device_loader;

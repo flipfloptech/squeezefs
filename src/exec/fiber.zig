@@ -404,7 +404,19 @@ pub const Fiber = struct {
 
     /// Switch to the lane's idle context with `msg`; returns when the lane
     /// switches back in.
-    fn switchToLane(f: *Fiber, msg: Message) void {
+    ///
+    /// `noinline` (and the same on `switchIn`): `Io.fiber.contextSwitch`'s
+    /// inline asm declares every allocatable register clobbered EXCEPT the
+    /// AArch64 platform register x18, which Linux leaves allocatable and
+    /// caller-saved. Inlined into an optimized caller (the LTO link runs
+    /// the O2 pipeline over every module), the caller may keep a live value
+    /// in x18 across the asm and read garbage after the resume — the lane's
+    /// `f` after `switchIn`, a sleeper's `f` after `park` (the daemon's
+    /// first 5 s watchdog wake crashed at `f.msg = msg` with a code address
+    /// in `f`). A call boundary is the ABI's own fence: no caller value is
+    /// live in a caller-saved register across it, and nothing in these two
+    /// bodies is live past the switch.
+    noinline fn switchToLane(f: *Fiber, msg: Message) void {
         f.msg = msg;
         var sw: Io.fiber.Switch = .{ .old = &f.ctx, .new = &f.lane.idle_ctx };
         _ = Io.fiber.contextSwitch(&sw);
@@ -422,8 +434,8 @@ pub const Fiber = struct {
     }
 
     /// The lane side: switch into `f`; returns when it switches out
-    /// (`f.msg` carries why).
-    pub fn switchIn(f: *Fiber) void {
+    /// (`f.msg` carries why). `noinline`: see `switchToLane`.
+    pub noinline fn switchIn(f: *Fiber) void {
         var sw: Io.fiber.Switch = .{ .old = &f.lane.idle_ctx, .new = &f.ctx };
         _ = Io.fiber.contextSwitch(&sw);
     }

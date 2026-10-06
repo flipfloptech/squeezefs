@@ -1,11 +1,16 @@
-//! The one CLI binary (charter §8). Subcommands land with their rungs; today:
-//! `--version`. The FIRST thing main does — before argument parsing, before
-//! any volume is opened or mounted — is the knob gate: a malformed
-//! `SQUEEZEFS_*` knob refuses the process naming every offender (charter §1.6).
+//! The one CLI binary (charter §8): `format`, `mount` (`--daemon
+//! --supervise --log-file`), `umount`, `status`, `--version`. The FIRST
+//! thing main does — before argument parsing, before any volume is opened
+//! or mounted — is the knob gate: a malformed `SQUEEZEFS_*` knob refuses
+//! the process naming every offender (charter §1.6). Then `cli.run`.
 
 const std = @import("std");
 const squeezefs = @import("squeezefs");
 const build_options = @import("build_options");
+
+/// `std.log` goes to stderr until `mount --daemon --log-file` installs the
+/// file sink (`cli/log_sink.zig`).
+pub const std_options: std.Options = .{ .logFn = squeezefs.cli.log_sink.logFn };
 
 /// The build identity this binary names (charter §11): train, commit, profile.
 const version: squeezefs.Version = .{
@@ -13,6 +18,10 @@ const version: squeezefs.Version = .{
     .git_commit = build_options.git_commit,
     .profile = build_options.profile,
 };
+
+fn writeVersion(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try version.write(w);
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -36,19 +45,16 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_writer.interface;
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len >= 2 and (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "version"))) {
-        try version.write(stdout);
-        try stdout.flush();
-        return;
-    }
-
-    try stderr.writeAll(
-        \\usage: squeezefs --version
-        \\
-        \\The filesystem verbs (format, mount, umount, status, fsck, …) land with
-        \\their delivery rungs; see docs/charter.md §13.
-        \\
-    );
+    const code = squeezefs.cli.run(.{
+        .gpa = gpa,
+        .io = io,
+        .env = init.environ_map,
+        .argv = args,
+        .stdout = stdout,
+        .stderr = stderr,
+        .version = writeVersion,
+    });
+    try stdout.flush();
     try stderr.flush();
-    std.process.exit(2);
+    if (code != 0) std.process.exit(code);
 }

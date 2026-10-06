@@ -18,8 +18,11 @@
 //!   zig build test         — unit tests (portable modules run everywhere;
 //!                            Linux-only modules compile their tests only on Linux).
 //!   zig build rails        — static-rail tests (knob literals registered, …).
+//!   zig build smoke        — THE SMOKE: the built binary as a child process
+//!                            against a real mount (the Linux venue; skips
+//!                            loudly elsewhere).
 //!   zig build fmt          — `zig fmt --check` over the tree.
-//!   zig build gate         — fmt + test + rails: the per-commit gate.
+//!   zig build gate         — fmt + test + rails + smoke: the per-commit gate.
 //!   zig build dist         — the dist profile artifact + split debug info.
 const std = @import("std");
 
@@ -104,6 +107,20 @@ pub fn build(b: *std.Build) void {
     const rails_step = b.step("rails", "Run static-rail convention tests");
     rails_step.dependOn(&run_rails_tests.step);
 
+    // ---- the smoke: the library's `smoke:` tests with the binary under
+    //      test as `./squeezefs` in the cwd (the emitted-bin directory, so
+    //      the smoke drives the binary of THIS build and the step depends
+    //      on it); in the unit run above they find no binary and skip ----
+    const smoke_tests = b.addTest(.{
+        .name = "squeezefs-smoke",
+        .root_module = squeezefs_mod,
+        .filters = &.{"smoke:"},
+    });
+    const run_smoke_tests = b.addRunArtifact(smoke_tests);
+    run_smoke_tests.setCwd(exe.getEmittedBinDirectory());
+    const smoke_step = b.step("smoke", "Run the smoke (format/mount/umount/status against a real mount)");
+    smoke_step.dependOn(&run_smoke_tests.step);
+
     // ---- fmt check ----
     const fmt_step = b.step("fmt", "Check formatting (zig fmt --check)");
     const fmt = b.addFmt(.{
@@ -113,10 +130,11 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 
     // ---- the per-commit gate ----
-    const gate_step = b.step("gate", "fmt + unit tests + rails (the per-commit gate)");
+    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke (the per-commit gate)");
     gate_step.dependOn(fmt_step);
     gate_step.dependOn(test_step);
     gate_step.dependOn(rails_step);
+    gate_step.dependOn(smoke_step);
 
     // ---- dist: split debug info with a debuglink ----
     // objcopy --only-keep-debug squeezefs squeezefs.debug

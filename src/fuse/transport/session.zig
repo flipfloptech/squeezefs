@@ -154,6 +154,23 @@ pub const MountError = error{
     EveryEntRetired,
 };
 
+/// A caller's callback with its context (the daemon's hooks).
+pub const Hook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque) void,
+
+    pub fn fire(self: Hook) void {
+        self.call(self.ctx);
+    }
+};
+
+/// The unprivileged path's unmounter (`fusermount3 -u`): true once the
+/// mountpoint is detached.
+pub const Unmounter = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, mountpoint: [:0]const u8) bool,
+};
+
 pub const Config = struct {
     opts: mount_options.MountOptions = .{},
     /// The volume's block size: the INIT `max_write` desire is
@@ -163,6 +180,16 @@ pub const Config = struct {
     mem_budget_bytes: u64,
     /// Register the arena as a non-sheddable component here.
     budget: ?*mem_budget.MemBudget = null,
+    /// A `/dev/fuse` fd an unprivileged mount already received from
+    /// `fusermount3` (`cli/fusermount.zig`): the session skips `open` and
+    /// `mount(2)` and unmounts through `unmounter` (root's `umount2` is
+    /// EPERM there).
+    fuse_fd: ?linux.fd_t = null,
+    unmounter: ?Unmounter = null,
+    /// Fired ONCE when the session shuts down for any reason — DESTROY
+    /// from the kernel (an external umount), a disconnect, a failed queue,
+    /// or `close` — so the daemon's main task can begin its teardown.
+    on_shutdown: ?Hook = null,
     /// Error logs each worker/sideband thread expects in a test.
     test_error_logs: usize = 0,
 };
@@ -392,6 +419,12 @@ const Sideband = struct {
             _ = self.ring.park(null);
             self.reap();
         }
+        // A connection gone without DESTROY (a lazy umount, a sysfs abort,
+        // a dead ring): the session ends here too.
+        if (self.disconnected or self.ring.isDead()) {
+            self.session.mounted.store(false, .release);
+            self.session.shutdown();
+        }
         self.finish();
     }
 
@@ -496,6 +529,8 @@ const Sideband = struct {
             .destroy => {
                 s.destroyOnce();
                 self.replyInline(codec.replyOk(d.header.unique));
+                // The kernel is unmounting (release: `unmount` acquires).
+                s.mounted.store(false, .release);
                 s.shutdown();
             },
             .unsupported => self.replyInline(codec.replyEnosys(d.header.unique)),
@@ -562,7 +597,13 @@ pub const Session = struct {
     mountpoint: [:0]u8,
     source: [:0]u8,
     fuse_fd: linux.fd_t = -1,
-    mounted: bool = false,
+    /// Whether the mountpoint is attached. Cleared by the sideband at
+    /// DESTROY (the kernel is unmounting: our own `umount2` afterwards
+    /// could detach a NEW mount at the path) — release there, acquire in
+    /// `unmount`, ordered through `shutdown`'s swap.
+    mounted: std.atomic.Value(bool) = .init(false),
+    unmounter: ?Unmounter = null,
+    on_shutdown: ?Hook = null,
     init_reply: codec.InitReply = undefined,
     init_unique: u64 = 0,
     plan: geometry.Plan = undefined,
@@ -721,25 +762,35 @@ pub const Session = struct {
         self.source = try gpa.dupeSentinel(u8, cfg.opts.fsName(), 0);
         errdefer gpa.free(self.source);
         self.tx = .{ .ctx = self, .submit = txSubmit, .submit_fd_body = txSubmitFdBody, .submit_prefilled = txSubmitPrefilled, .fail = txFail };
+        self.unmounter = cfg.unmounter;
+        self.on_shutdown = cfg.on_shutdown;
 
-        // 0. The device and the mount.
-        const fd_rc = linux.open(dev_fuse_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-        if (linux.errno(fd_rc) != .SUCCESS) {
-            log.err("transport: open({s}) failed ({t})", .{ dev_fuse_path, linux.errno(fd_rc) });
-            return error.DevFuseOpenFailed;
+        // 0. The device and the mount: root opens `/dev/fuse` and calls
+        //    `mount(2)`; an unprivileged mount arrives with the fd
+        //    `fusermount3` sent (already mounted).
+        if (cfg.fuse_fd) |fd| {
+            self.fuse_fd = fd;
+        } else {
+            const fd_rc = linux.open(dev_fuse_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+            if (linux.errno(fd_rc) != .SUCCESS) {
+                log.err("transport: open({s}) failed ({t})", .{ dev_fuse_path, linux.errno(fd_rc) });
+                return error.DevFuseOpenFailed;
+            }
+            self.fuse_fd = @intCast(fd_rc);
         }
-        self.fuse_fd = @intCast(fd_rc);
         errdefer self.closeFd();
-        var data_buf: [512]u8 = undefined;
-        var w: Io.Writer = .fixed(&data_buf);
-        cfg.opts.writeKernelData(self.fuse_fd, &w) catch return error.MountFailed;
-        w.writeByte(0) catch return error.MountFailed;
-        const mount_rc = linux.mount(self.source.ptr, self.mountpoint.ptr, "fuse", cfg.opts.msFlags(), @intFromPtr(w.buffered().ptr));
-        if (linux.errno(mount_rc) != .SUCCESS) {
-            log.err("transport: mount(2) of {s} at {s} failed ({t}); data '{s}'", .{ self.source, self.mountpoint, linux.errno(mount_rc), w.buffered()[0 .. w.buffered().len - 1] });
-            return error.MountFailed;
+        if (cfg.fuse_fd == null) {
+            var data_buf: [512]u8 = undefined;
+            var w: Io.Writer = .fixed(&data_buf);
+            cfg.opts.writeKernelData(self.fuse_fd, &w) catch return error.MountFailed;
+            w.writeByte(0) catch return error.MountFailed;
+            const mount_rc = linux.mount(self.source.ptr, self.mountpoint.ptr, "fuse", cfg.opts.msFlags(), @intFromPtr(w.buffered().ptr));
+            if (linux.errno(mount_rc) != .SUCCESS) {
+                log.err("transport: mount(2) of {s} at {s} failed ({t}); data '{s}'", .{ self.source, self.mountpoint, linux.errno(mount_rc), w.buffered()[0 .. w.buffered().len - 1] });
+                return error.MountFailed;
+            }
         }
-        self.mounted = true;
+        self.mounted.store(true, .release);
         errdefer self.unmountDetached();
 
         // 1. The classical INIT read on the sideband ring. The buffer covers
@@ -908,12 +959,20 @@ pub const Session = struct {
         self.fs.destroy();
     }
 
-    /// Idempotent: flip `active`, wake every worker and the sideband.
+    /// Idempotent: flip `active`, wake every worker and the sideband, fire
+    /// the daemon's hook once.
     pub fn shutdown(self: *Session) void {
         if (!self.shared.shutdown()) return;
         if (self.ready.swap(false, .acq_rel)) sessions_active.sub(1);
         for (self.groups) |g| g.forceWake();
         if (self.have_sideband) self.sideband.requestStop();
+        if (self.on_shutdown) |h| h.fire();
+    }
+
+    /// Whether the mountpoint is still attached (false once the kernel
+    /// unmounted it or `close` detached it).
+    pub fn isMounted(self: *const Session) bool {
+        return self.mounted.load(.acquire);
     }
 
     // ---- teardown ----
@@ -954,13 +1013,21 @@ pub const Session = struct {
     /// syscall or closing its fd — a bounded retry, never a lazy detach by
     /// default (that would hide an owed reply behind MNT_DETACH).
     fn unmount(self: *Session) void {
-        if (!self.mounted) return;
+        if (!self.mounted.load(.acquire)) return;
+        if (self.unmounter) |u| {
+            // The unprivileged path: `fusermount3 -u` (bounded retries
+            // inside); a failure leaves the mount for the operator — a
+            // non-root process has no `MNT_DETACH`.
+            if (!u.call(u.ctx, self.mountpoint)) log.err("transport: fusermount3 -u {s} failed — a mount is left behind", .{self.mountpoint});
+            self.mounted.store(false, .release);
+            return;
+        }
         const deadline = clock.monotonicNs() + UMOUNT_RETRY_NS;
         while (true) {
             const rc = linux.umount2(self.mountpoint.ptr, 0);
             const e = linux.errno(rc);
             if (e == .SUCCESS) {
-                self.mounted = false;
+                self.mounted.store(false, .release);
                 return;
             }
             if (e != .BUSY or clock.monotonicNs() >= deadline) {
@@ -974,10 +1041,15 @@ pub const Session = struct {
     }
 
     fn unmountDetached(self: *Session) void {
-        if (!self.mounted) return;
+        if (!self.mounted.load(.acquire)) return;
+        if (self.unmounter) |u| {
+            if (!u.call(u.ctx, self.mountpoint)) log.err("transport: fusermount3 -u {s} failed — a mount is left behind", .{self.mountpoint});
+            self.mounted.store(false, .release);
+            return;
+        }
         const rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
         if (linux.errno(rc) != .SUCCESS) log.err("transport: umount2({s}, MNT_DETACH) failed ({t}) — a mount is left behind", .{ self.mountpoint, linux.errno(rc) });
-        self.mounted = false;
+        self.mounted.store(false, .release);
     }
 
     fn closeFd(self: *Session) void {
@@ -1451,7 +1523,7 @@ test "e2e: teardown with an in-flight request — the drain synthesizes the erro
     try testing.expect(s.owedCount() >= 1);
     // Phase 1: the drain answers the owed slot; umount succeeds.
     s.close();
-    try testing.expect(!s.mounted);
+    try testing.expect(!s.isMounted());
     t.join();
     try testing.expectError(error.ReadFailed, result);
     const after = Snapshot.take();

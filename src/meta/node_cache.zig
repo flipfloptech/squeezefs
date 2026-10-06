@@ -2131,7 +2131,7 @@ fn expectGone(n: *CachedNode, k: []const u8) !void {
 /// rate limiter (one line per second) is reset so the contract is
 /// deterministic across tests that fire the same site.
 fn expectTripwireLog(tw: *counters.Tripwire) void {
-    tw.last_log_s.store(0, .monotonic);
+    tw.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
 }
 

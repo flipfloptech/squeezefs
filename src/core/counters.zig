@@ -188,10 +188,12 @@ pub const ShardedLatencyHistogram = struct {
 pub const Tripwire = struct {
     site: []const u8,
     count: std.atomic.Value(u64) = .init(0),
-    last_log_s: std.atomic.Value(u64) = .init(0),
-    /// Intrusive lock-free registration list for the stats fold.
-    next: ?*Tripwire = null,
-    registered: std.atomic.Value(bool) = .init(false),
+    /// The global per-site slot, resolved on the first fire (`?*Slot` is
+    /// stable for the process lifetime: the table is static and keyed by
+    /// the site NAME, so an instance that dies — a `Conveyor`, a lane — leaves
+    /// nothing dangling in the registry; `tripwireCount(site)` sums every
+    /// instance of the site).
+    slot: std.atomic.Value(?*Slot) = .init(null),
 
     pub fn init(site: []const u8) Tripwire {
         return .{ .site = site };
@@ -200,45 +202,116 @@ pub const Tripwire = struct {
     pub fn fire(self: *Tripwire, detail: []const u8) void {
         _ = self.count.fetchAdd(1, .monotonic);
         _ = tripwire_total.fetchAdd(1, .monotonic);
-        self.registerOnce();
+        const slot = self.resolveSlot();
+        if (slot) |sl| _ = sl.count.fetchAdd(1, .monotonic);
         const now = clock.realtimeCoarseS();
-        // One log line per site per second: swap in `now`; equal ⇒ quiet.
-        if (self.last_log_s.swap(now, .monotonic) != now) {
+        // One log line per site per second: swap in `now` on the SITE's slot
+        // (so N instances of one site share the budget); equal ⇒ quiet.
+        const last = if (slot) |sl| &sl.last_log_s else &overflow_last_log_s;
+        if (last.swap(now, .monotonic) != now) {
             log.err("INVARIANT TRIPWIRE '{s}': {s} — a concurrency outcome the design says cannot happen just happened. Counted in invariant_tripwires; the daemon proceeds (a panic here would lose a FUSE reply, which is strictly worse than a wrong-but-served op)", .{ self.site, detail });
         }
     }
 
+    /// This instance's count (an aggregate across instances is `tripwireCount`).
     pub fn load(self: *const Tripwire) u64 {
         return self.count.load(.monotonic);
     }
 
-    fn registerOnce(self: *Tripwire) void {
-        // Winner of the CAS pushes itself onto the global list. The `next`
-        // publication is paired with the acquire load in `iterate`.
-        if (self.registered.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) return;
-        var head = tripwire_head.load(.acquire);
-        while (true) {
-            self.next = head;
-            head = tripwire_head.cmpxchgWeak(head, self, .release, .acquire) orelse return;
-        }
+    /// Test seam: reset the SITE's one-line-per-second budget so the next
+    /// fire logs deterministically regardless of what an earlier test fired.
+    pub fn resetLogBudgetForTest(self: *Tripwire) void {
+        std.debug.assert(@import("builtin").is_test);
+        const last = if (self.resolveSlot()) |sl| &sl.last_log_s else &overflow_last_log_s;
+        last.store(0, .monotonic);
+    }
+
+    fn resolveSlot(self: *Tripwire) ?*Slot {
+        if (self.slot.load(.acquire)) |sl| return sl;
+        const sl = siteSlot(self.site) orelse return null;
+        self.slot.store(sl, .release);
+        return sl;
     }
 };
 
-var tripwire_total: std.atomic.Value(u64) = .init(0);
-var tripwire_head: std.atomic.Value(?*Tripwire) = .init(null);
+/// One registry row per SITE name. The site is always a string literal
+/// (static lifetime), so the table never points into a dead instance.
+pub const Slot = struct {
+    site: std.atomic.Value(?[*]const u8) = .init(null),
+    site_len: usize = 0,
+    count: std.atomic.Value(u64) = .init(0),
+    last_log_s: std.atomic.Value(u64) = .init(0),
+};
 
-/// `invariant_tripwires` — the total across every site.
+/// Capacity of the site table: a compile-time property of the codebase
+/// (every `Tripwire.init("…")` literal is one site). 512 leaves 4× headroom
+/// over the charter's named must-stay-0 families; overflow is itself a
+/// tripwire-class event (`tripwire_sites_overflow`, counted in the total,
+/// logged through the shared overflow rate limit) and never a crash.
+pub const max_sites = 512;
+var sites: [max_sites]Slot = @splat(.{});
+var sites_used: std.atomic.Value(usize) = .init(0);
+var tripwire_total: std.atomic.Value(u64) = .init(0);
+var tripwire_sites_overflow: std.atomic.Value(u64) = .init(0);
+var overflow_last_log_s: std.atomic.Value(u64) = .init(0);
+
+/// Find or claim the slot for `site`. Lock-free: a claimer bumps `sites_used`
+/// (the publication of the slot's existence, paired with the acquire scan),
+/// then publishes the name with a release store the scan reads with acquire.
+fn siteSlot(site: []const u8) ?*Slot {
+    var i: usize = 0;
+    while (true) {
+        const used = sites_used.load(.acquire);
+        while (i < used) : (i += 1) {
+            const sl = &sites[i];
+            // A claimed-but-unpublished slot spins until its name lands.
+            const ptr = while (true) {
+                if (sl.site.load(.acquire)) |p| break p;
+                std.atomic.spinLoopHint();
+            };
+            if (sl.site_len == site.len and std.mem.eql(u8, ptr[0..sl.site_len], site)) return sl;
+        }
+        if (used >= max_sites) {
+            _ = tripwire_sites_overflow.fetchAdd(1, .monotonic);
+            return null;
+        }
+        if (sites_used.cmpxchgWeak(used, used + 1, .acq_rel, .acquire) == null) {
+            const sl = &sites[used];
+            sl.site_len = site.len;
+            sl.site.store(site.ptr, .release);
+            return sl;
+        }
+        // Lost the race: rescan from `used` (the winner's slot may be ours).
+    }
+}
+
+/// `invariant_tripwires` — the total across every site and instance.
 pub fn invariantTripwires() u64 {
     return tripwire_total.load(.monotonic);
 }
 
-/// Per-site count; 0 for a site that never fired.
+/// Per-site count across every instance of the site; 0 for a site that never fired.
 pub fn tripwireCount(site: []const u8) u64 {
-    var cur = tripwire_head.load(.acquire);
-    while (cur) |t| : (cur = t.next) {
-        if (std.mem.eql(u8, t.site, site)) return t.load();
+    const used = sites_used.load(.acquire);
+    for (sites[0..used]) |*sl| {
+        const ptr = sl.site.load(.acquire) orelse continue;
+        if (sl.site_len == site.len and std.mem.eql(u8, ptr[0..sl.site_len], site)) return sl.count.load(.monotonic);
     }
     return 0;
+}
+
+/// Sites whose table slot could not be claimed (must-stay-0 itself).
+pub fn tripwireSitesOverflow() u64 {
+    return tripwire_sites_overflow.load(.monotonic);
+}
+
+/// Visit every site that ever fired (for the `.stats` fold).
+pub fn forEachTripwireSite(ctx: anytype, comptime visit: fn (@TypeOf(ctx), site: []const u8, count: u64) void) void {
+    const used = sites_used.load(.acquire);
+    for (sites[0..used]) |*sl| {
+        const ptr = sl.site.load(.acquire) orelse continue;
+        visit(ctx, ptr[0..sl.site_len], sl.count.load(.monotonic));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,4 +385,26 @@ test "tripwire: one fire increments the total and the site by exactly 1, logs lo
     S.tw.fire("again");
     try testing.expectEqual(@as(u64, 2), S.tw.load());
     try log.testing.expectAllFired();
+}
+
+test "tripwire: an instance embedded in a dying struct leaves nothing dangling; the site sums its instances" {
+    const Owner = struct { tw: Tripwire = .init("counters_test_embedded_site") };
+    const before_total = invariantTripwires();
+    {
+        var a: Owner = .{};
+        log.testing.expectErrorLogs(1);
+        a.tw.fire("first instance");
+        try log.testing.expectAllFired();
+        try testing.expectEqual(@as(u64, 1), a.tw.load());
+    } // `a` is gone; its memory is reused below.
+    var junk: [64]u8 = @splat(0xAA);
+    _ = &junk;
+    // The registry never pointed into `a`: the site count is readable and exact.
+    try testing.expectEqual(@as(u64, 1), tripwireCount("counters_test_embedded_site"));
+    var b: Owner = .{};
+    b.tw.fire("second instance, rate-limited on the shared site budget");
+    try testing.expectEqual(@as(u64, 1), b.tw.load());
+    try testing.expectEqual(@as(u64, 2), tripwireCount("counters_test_embedded_site"));
+    try testing.expectEqual(before_total + 2, invariantTripwires());
+    try testing.expectEqual(@as(u64, 0), tripwireSitesOverflow());
 }

@@ -957,7 +957,7 @@ test "flush-ceiling audit: inside at the ceiling, an overrun one ns past it, a s
     try testing.expectEqual(@as(u64, 0), quiet.overruns);
     try testing.expectEqual(before, appender_flush_ceiling_overruns.load());
     // One ns later: region 0 and region 1 overrun, region 2 is excused.
-    appender_flush_ceiling_overruns.last_log_s.store(0, .monotonic);
+    appender_flush_ceiling_overruns.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
     const out = auditFlushCeiling(&leaves, since + ceiling + 1, ceiling);
     try log.testing.expectAllFired();

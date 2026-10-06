@@ -77,6 +77,16 @@ pub const meta = struct {
 // ---- sync primitives (charter §9), written over std.Io's futex ops ----
 pub const sync = @import("sync/sync.zig");
 
+// ---- the executor: our own std.Io implementation (decision 0001) ----
+// @anchor:exec_import
+
+// ---- the FUSE library (charter §4) ----
+pub const fuse = struct {
+    // @anchor:fuse_abi_import
+    // @anchor:fuse_transport_import
+    // @anchor:fuse_session_import
+};
+
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
 
@@ -100,6 +110,11 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:exec_test
+    // @anchor:fuse_abi_test
+    // @anchor:fuse_transport_test
+    // @anchor:fuse_session_test
+    // @anchor:uring128_test
     _ = meta.conveyor;
     if (builtin.os.tag == .linux) _ = meta.device_loader;
     if (builtin.os.tag == .linux) _ = meta.backend;

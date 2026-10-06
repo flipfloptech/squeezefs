@@ -1,0 +1,379 @@
+//! The `Filesystem` interface the daemon implements (`docs/porting/
+//! fuse_abi_session.md` §6; `fuse_handlers_lanes.md` §5; charter §4).
+//!
+//! A vtable with one entry per opcode of the must-implement set and the
+//! optional set; every entry has ONE shape — `fn (impl: *anyopaque, c: *Ctx,
+//! args: <Op>Args) Error!<Op>Reply` — so an implementation is bound by
+//! `Filesystem.of(T, ptr)`: for every entry `T` declares a same-named method
+//! it is wrapped, the rest keep the default. Errors are the ONE typed set
+//! (`core/errors.zig`); the lifecycle encodes each through the ONE errno
+//! table (`-errno` header-only). The default of every optional op is
+//! `error.NotImplemented` (ENOSYS): the kernel latches `fc->no_<op>` and
+//! stops asking — for FSYNC/FLUSH/RELEASE that latch IS the elision the
+//! daemon wants (the clean-handle `no_flush`), so no default lies `Ok`.
+//!
+//! Rung 3's first mount MUST implement: init, destroy, lookup, forget,
+//! getattr, setattr, readlink, symlink, mknod, mkdir, unlink, rmdir, rename
+//! (both opcodes land here with `flags`), link, open, read, write, flush,
+//! release, fsync, opendir, readdir, readdirplus, releasedir, fsyncdir,
+//! statfs, {set,get,list,remove}xattr, create, access (ENOSYS under
+//! `default_permissions` is honest). Rung 4 adds fallocate, lseek,
+//! copy_file_range, ioctl, bmap, poll. Never: getlk/setlk (POSIX_LOCKS is
+//! never advertised — the kernel arbitrates), notify_reply (no RETRIEVE is
+//! ever sent), interrupt (decoded, counted, ignored by the lifecycle: a hook
+//! with no effect is dead code — ledger L3).
+//!
+//! Replies that carry bytes (READ, READLINK, GETXATTR/LISTXATTR data,
+//! READDIR/READDIRPLUS) are written by the implementation straight into the
+//! reply WINDOW the ctx carries (`Ctx.window`: the transport's ent payload
+//! region, or the loopback's buffer) and return the byte count — no copy in
+//! the codec, no allocation on the reply path (L5).
+
+const std = @import("std");
+const Io = std.Io;
+const abi = @import("../abi.zig");
+const codec = @import("../codec.zig");
+const errors = @import("../../core/errors.zig");
+const economy = @import("../../meta/economy.zig");
+const op_trace = @import("op_trace.zig");
+const watchdog = @import("watchdog.zig");
+
+pub const Error = errors.Error;
+
+/// The request's identity and the op's venue.
+pub const Ctx = struct {
+    unique: u64,
+    uid: u32,
+    gid: u32,
+    pid: u32,
+    io: Io,
+    trace: *op_trace.OpTrace,
+    /// The watchdog slot (null when the registry was exhausted).
+    wd_slot: ?*watchdog.OpSlot,
+    /// The reply window.
+    window: []u8,
+
+    /// Stamp a stage: the trace moves (a clock read only under profiling)
+    /// and the watchdog station follows (one relaxed store).
+    pub fn stage(self: *Ctx, s: op_trace.Stage) void {
+        self.trace.stamp(s);
+        if (self.wd_slot) |sl| sl.setStation(s);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Typed replies.
+// ---------------------------------------------------------------------------
+
+pub const Entry = codec.EntryReply;
+pub const Attr = codec.AttrReply;
+pub const Statfs = codec.Statfs;
+pub const Opened = struct { fh: u64, open_flags: u32 };
+pub const Created = struct { entry: Entry, fh: u64, open_flags: u32 };
+/// `len` bytes written into `Ctx.window[0..len]`.
+pub const Data = struct { len: usize };
+pub const Written = struct { size: u32 };
+pub const Xattr = union(enum) {
+    /// The size probe (`size == 0` in the request): a SUCCESS reply with
+    /// `fuse_getxattr_out{size}`.
+    size: u32,
+    /// `len` bytes in the window.
+    data: usize,
+};
+pub const Lseek = struct { offset: u64 };
+pub const Bmap = struct { block: u64 };
+pub const Poll = struct { revents: u32 };
+pub const Ioctl = struct { out: abi.fuse_ioctl_out, data_len: usize };
+
+// ---------------------------------------------------------------------------
+// SETATTR's decoded request.
+// ---------------------------------------------------------------------------
+
+/// `fuse_setattr_in` decoded by its `valid` bits; `*_NOW` resolved against
+/// `now_ns` (the coarse realtime stamp the mutation carries). Times are
+/// i64-ns bit patterns in u64 (the inode value's form).
+pub const SetAttr = struct {
+    mode: ?u32 = null,
+    uid: ?u32 = null,
+    gid: ?u32 = null,
+    size: ?u64 = null,
+    atime: ?u64 = null,
+    mtime: ?u64 = null,
+    ctime: ?u64 = null,
+    fh: ?u64 = null,
+    lock_owner: ?u64 = null,
+    /// `FATTR_KILL_SUIDGID`: the daemon owns the suid/sgid/caps clearing.
+    kill_suidgid: bool = false,
+
+    pub fn fromWire(in: abi.fuse_setattr_in, now_ns: u64) SetAttr {
+        const v = in.valid;
+        return .{
+            .mode = if (v & abi.FATTR_MODE != 0) in.mode else null,
+            .uid = if (v & abi.FATTR_UID != 0) in.uid else null,
+            .gid = if (v & abi.FATTR_GID != 0) in.gid else null,
+            .size = if (v & abi.FATTR_SIZE != 0) in.size else null,
+            .atime = if (v & abi.FATTR_ATIME_NOW != 0) now_ns else if (v & abi.FATTR_ATIME != 0) timeNs(in.atime, in.atimensec) else null,
+            .mtime = if (v & abi.FATTR_MTIME_NOW != 0) now_ns else if (v & abi.FATTR_MTIME != 0) timeNs(in.mtime, in.mtimensec) else null,
+            .ctime = if (v & abi.FATTR_CTIME != 0) timeNs(in.ctime, in.ctimensec) else null,
+            .fh = if (v & abi.FATTR_FH != 0) in.fh else null,
+            .lock_owner = if (v & abi.FATTR_LOCKOWNER != 0) in.lock_owner else null,
+            .kill_suidgid = v & abi.FATTR_KILL_SUIDGID != 0,
+        };
+    }
+
+    /// The economy's request shape (the absorber + the field RMW).
+    pub fn toEconomy(self: SetAttr) economy.SetattrReq {
+        return .{ .mode = self.mode, .uid = self.uid, .gid = self.gid, .size = self.size, .atime = self.atime, .mtime = self.mtime, .ctime = self.ctime };
+    }
+};
+
+/// `(time_t bit pattern, nsec)` → the i64-ns word, saturating (the kernel
+/// clamps to the daemon's advertised range under FUSE_TIME_LIMITS; without
+/// it a stamp past ±292 years saturates rather than wraps).
+pub fn timeNs(sec: u64, nsec: u32) u64 {
+    const s: i64 = @bitCast(sec);
+    return @bitCast(s *| @as(i64, std.time.ns_per_s) +| @as(i64, nsec));
+}
+
+// ---------------------------------------------------------------------------
+// Per-op argument records (the nodeid of the request is the op's ino).
+// ---------------------------------------------------------------------------
+
+/// What INIT negotiated: the folded capability word the kernel will apply
+/// and the protocol minor (the two facts a filesystem's posture keys on).
+pub const InitArgs = struct {
+    negotiated: u64,
+    minor: u32,
+
+    pub fn has(self: InitArgs, bit: u64) bool {
+        return self.negotiated & bit != 0;
+    }
+};
+pub const DestroyArgs = struct {};
+pub const LookupArgs = struct { parent: u64, name: []const u8 };
+/// `evicted`: the open table's verdict — the kernel's last reference went
+/// (the filesystem invalidates its caches and queues the reclaim iff the
+/// ino is not open); a partial forget hands the count through unchanged.
+pub const ForgetArgs = struct { ino: u64, nlookup: u64, evicted: bool };
+pub const GetattrArgs = struct { ino: u64, fh: ?u64 };
+pub const SetattrArgs = struct { ino: u64, attr: SetAttr };
+pub const ReadlinkArgs = struct { ino: u64 };
+pub const SymlinkArgs = struct { parent: u64, name: []const u8, link: []const u8 };
+pub const MknodArgs = struct { parent: u64, name: []const u8, mode: u32, rdev: u32, umask: u32 };
+pub const MkdirArgs = struct { parent: u64, name: []const u8, mode: u32, umask: u32 };
+pub const UnlinkArgs = struct { parent: u64, name: []const u8 };
+pub const RenameArgs = struct { parent: u64, name: []const u8, newparent: u64, newname: []const u8, flags: u32 };
+pub const LinkArgs = struct { ino: u64, newparent: u64, newname: []const u8 };
+pub const OpenArgs = struct { ino: u64, flags: u32, open_flags: u32 };
+pub const ReadArgs = struct { ino: u64, fh: u64, offset: u64, size: u32, flags: u32 };
+pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8, write_flags: u32, flags: u32 };
+pub const FlushArgs = struct { ino: u64, fh: u64, lock_owner: u64 };
+pub const ReleaseArgs = struct { ino: u64, fh: u64, flags: u32, lock_owner: u64, flush: bool };
+pub const FsyncArgs = struct { ino: u64, fh: u64, datasync: bool };
+pub const ReaddirArgs = struct { ino: u64, fh: u64, offset: u64, size: u32 };
+pub const StatfsArgs = struct { ino: u64 };
+pub const SetxattrArgs = struct { ino: u64, name: []const u8, value: []const u8, flags: u32 };
+pub const GetxattrArgs = struct { ino: u64, name: []const u8, size: u32 };
+pub const ListxattrArgs = struct { ino: u64, size: u32 };
+pub const RemovexattrArgs = struct { ino: u64, name: []const u8 };
+pub const AccessArgs = struct { ino: u64, mask: u32 };
+pub const CreateArgs = struct { parent: u64, name: []const u8, mode: u32, flags: u32, umask: u32, open_flags: u32 };
+pub const BmapArgs = struct { ino: u64, blocksize: u32, block: u64 };
+pub const IoctlArgs = struct { ino: u64, fh: u64, flags: u32, cmd: u32, arg: u64, in: []const u8, out_size: u32 };
+pub const PollArgs = struct { ino: u64, fh: u64, kh: u64, flags: u32, events: u32 };
+pub const FallocateArgs = struct { ino: u64, fh: u64, offset: u64, length: u64, mode: u32 };
+pub const LseekArgs = struct { ino: u64, fh: u64, offset: u64, whence: u32 };
+pub const CopyFileRangeArgs = struct { ino_in: u64, fh_in: u64, off_in: u64, ino_out: u64, fh_out: u64, off_out: u64, len: u64, flags: u64 };
+
+fn Op(comptime Args: type, comptime Reply: type) type {
+    return *const fn (*anyopaque, *Ctx, Args) Error!Reply;
+}
+
+/// The vtable: every entry defaults to ENOSYS except the three with no
+/// reply shape (init, destroy, forget), which default to no-ops.
+pub const VTable = struct {
+    init: *const fn (*anyopaque, *Ctx, InitArgs) Error!void = &defaults.init,
+    destroy: *const fn (*anyopaque, *Ctx, DestroyArgs) void = &defaults.destroy,
+    forget: *const fn (*anyopaque, *Ctx, ForgetArgs) void = &defaults.forget,
+    lookup: Op(LookupArgs, Entry) = &defaults.enosys(LookupArgs, Entry),
+    getattr: Op(GetattrArgs, Attr) = &defaults.enosys(GetattrArgs, Attr),
+    setattr: Op(SetattrArgs, Attr) = &defaults.enosys(SetattrArgs, Attr),
+    readlink: Op(ReadlinkArgs, Data) = &defaults.enosys(ReadlinkArgs, Data),
+    symlink: Op(SymlinkArgs, Entry) = &defaults.enosys(SymlinkArgs, Entry),
+    mknod: Op(MknodArgs, Entry) = &defaults.enosys(MknodArgs, Entry),
+    mkdir: Op(MkdirArgs, Entry) = &defaults.enosys(MkdirArgs, Entry),
+    unlink: Op(UnlinkArgs, void) = &defaults.enosys(UnlinkArgs, void),
+    rmdir: Op(UnlinkArgs, void) = &defaults.enosys(UnlinkArgs, void),
+    rename: Op(RenameArgs, void) = &defaults.enosys(RenameArgs, void),
+    link: Op(LinkArgs, Entry) = &defaults.enosys(LinkArgs, Entry),
+    open: Op(OpenArgs, Opened) = &defaults.enosys(OpenArgs, Opened),
+    read: Op(ReadArgs, Data) = &defaults.enosys(ReadArgs, Data),
+    write: Op(WriteArgs, Written) = &defaults.enosys(WriteArgs, Written),
+    flush: Op(FlushArgs, void) = &defaults.enosys(FlushArgs, void),
+    release: Op(ReleaseArgs, void) = &defaults.enosys(ReleaseArgs, void),
+    fsync: Op(FsyncArgs, void) = &defaults.enosys(FsyncArgs, void),
+    opendir: Op(OpenArgs, Opened) = &defaults.enosys(OpenArgs, Opened),
+    readdir: Op(ReaddirArgs, Data) = &defaults.enosys(ReaddirArgs, Data),
+    readdirplus: Op(ReaddirArgs, Data) = &defaults.enosys(ReaddirArgs, Data),
+    releasedir: Op(ReleaseArgs, void) = &defaults.enosys(ReleaseArgs, void),
+    fsyncdir: Op(FsyncArgs, void) = &defaults.enosys(FsyncArgs, void),
+    statfs: Op(StatfsArgs, Statfs) = &defaults.enosys(StatfsArgs, Statfs),
+    setxattr: Op(SetxattrArgs, void) = &defaults.enosys(SetxattrArgs, void),
+    getxattr: Op(GetxattrArgs, Xattr) = &defaults.enosys(GetxattrArgs, Xattr),
+    listxattr: Op(ListxattrArgs, Xattr) = &defaults.enosys(ListxattrArgs, Xattr),
+    removexattr: Op(RemovexattrArgs, void) = &defaults.enosys(RemovexattrArgs, void),
+    access: Op(AccessArgs, void) = &defaults.enosys(AccessArgs, void),
+    create: Op(CreateArgs, Created) = &defaults.enosys(CreateArgs, Created),
+    bmap: Op(BmapArgs, Bmap) = &defaults.enosys(BmapArgs, Bmap),
+    ioctl: Op(IoctlArgs, Ioctl) = &defaults.enosys(IoctlArgs, Ioctl),
+    poll: Op(PollArgs, Poll) = &defaults.enosys(PollArgs, Poll),
+    fallocate: Op(FallocateArgs, void) = &defaults.enosys(FallocateArgs, void),
+    lseek: Op(LseekArgs, Lseek) = &defaults.enosys(LseekArgs, Lseek),
+    copy_file_range: Op(CopyFileRangeArgs, Written) = &defaults.enosys(CopyFileRangeArgs, Written),
+};
+
+const defaults = struct {
+    fn init(_: *anyopaque, _: *Ctx, _: InitArgs) Error!void {}
+    fn destroy(_: *anyopaque, _: *Ctx, _: DestroyArgs) void {}
+    fn forget(_: *anyopaque, _: *Ctx, _: ForgetArgs) void {}
+    fn enosys(comptime Args: type, comptime Reply: type) fn (*anyopaque, *Ctx, Args) Error!Reply {
+        return struct {
+            fn f(_: *anyopaque, _: *Ctx, _: Args) Error!Reply {
+                return error.NotImplemented;
+            }
+        }.f;
+    }
+};
+
+/// The bound interface: a type-erased implementation and its vtable.
+pub const Filesystem = struct {
+    impl: *anyopaque,
+    vtable: *const VTable,
+
+    /// Bind `T`: every vtable entry `T` declares as `pub fn <name>(self: *T,
+    /// c: *Ctx, args: <Op>Args) Error!<Op>Reply` is wrapped; the rest
+    /// default. A declared method of the wrong shape is a compile error at
+    /// the wrapper.
+    pub fn of(comptime T: type, impl: *T) Filesystem {
+        const Holder = struct {
+            const vt: VTable = build();
+
+            fn build() VTable {
+                var v: VTable = .{};
+                const info = @typeInfo(VTable).@"struct";
+                inline for (info.field_names, info.field_types) |name, FnPtr| {
+                    if (@hasDecl(T, name)) @field(v, name) = &Thunk(T, name, FnPtr).call;
+                }
+                return v;
+            }
+        };
+        return .{ .impl = impl, .vtable = &Holder.vt };
+    }
+
+    fn Thunk(comptime T: type, comptime name: []const u8, comptime FnPtr: type) type {
+        const Fn = @typeInfo(FnPtr).pointer.child;
+        const info = @typeInfo(Fn).@"fn";
+        const Args = info.param_types[2].?;
+        const R = info.return_type.?;
+        return struct {
+            fn call(impl: *anyopaque, c: *Ctx, args: Args) R {
+                const self: *T = @ptrCast(@alignCast(impl));
+                return @field(T, name)(self, c, args);
+            }
+        };
+    }
+
+    /// Whether `T` provides every op of rung 3's must-implement set (a
+    /// mount-time check, so a missing op refuses loud instead of answering
+    /// ENOSYS to the first user).
+    pub fn implementsMustSet(comptime T: type) bool {
+        inline for (must_implement) |name| {
+            if (!@hasDecl(T, name)) return false;
+        }
+        return true;
+    }
+
+    pub const must_implement = [_][]const u8{
+        "init",      "destroy",     "lookup",     "forget",   "getattr", "setattr",  "readlink",
+        "symlink",   "mknod",       "mkdir",      "unlink",   "rmdir",   "rename",   "link",
+        "open",      "read",        "write",      "flush",    "release", "fsync",    "opendir",
+        "readdir",   "readdirplus", "releasedir", "fsyncdir", "statfs",  "setxattr", "getxattr",
+        "listxattr", "removexattr", "create",
+    };
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+const Minimal = struct {
+    lookups: u32 = 0,
+    destroyed: bool = false,
+
+    pub fn lookup(self: *Minimal, c: *Ctx, a: LookupArgs) Error!Entry {
+        self.lookups += 1;
+        c.stage(.meta_backend_start);
+        if (a.name.len == 0) return error.InvalidArgument;
+        return .{ .nodeid = 2, .entry_ttl_ns = 1, .attr_ttl_ns = 2, .attr = abi.zeroed(abi.fuse_attr) };
+    }
+
+    pub fn destroy(self: *Minimal, _: *Ctx, _: DestroyArgs) void {
+        self.destroyed = true;
+    }
+};
+
+fn testCtx(trace: *op_trace.OpTrace, window: []u8) Ctx {
+    return .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = trace, .wd_slot = null, .window = window };
+}
+
+test "binding: a declared op is wrapped, an undeclared one answers ENOSYS, destroy/forget/init default to no-ops" {
+    var m: Minimal = .{};
+    const fs = Filesystem.of(Minimal, &m);
+    var tr = op_trace.OpTrace.begin(1, .lookup);
+    var win: [16]u8 = undefined;
+    var c = testCtx(&tr, &win);
+    const e = try fs.vtable.lookup(fs.impl, &c, .{ .parent = 1, .name = "x" });
+    try testing.expectEqual(@as(u64, 2), e.nodeid);
+    try testing.expectEqual(@as(u32, 1), m.lookups);
+    try testing.expectEqual(op_trace.Stage.meta_backend_start, tr.last_stage);
+    try testing.expectError(error.InvalidArgument, fs.vtable.lookup(fs.impl, &c, .{ .parent = 1, .name = "" }));
+    try testing.expectError(error.NotImplemented, fs.vtable.getattr(fs.impl, &c, .{ .ino = 1, .fh = null }));
+    try testing.expectError(error.NotImplemented, fs.vtable.fsync(fs.impl, &c, .{ .ino = 1, .fh = 0, .datasync = false }));
+    try testing.expectError(error.NotImplemented, fs.vtable.copy_file_range(fs.impl, &c, .{ .ino_in = 1, .fh_in = 0, .off_in = 0, .ino_out = 2, .fh_out = 0, .off_out = 0, .len = 1, .flags = 0 }));
+    try fs.vtable.init(fs.impl, &c, .{ .negotiated = 0, .minor = abi.FUSE_KERNEL_MINOR_VERSION });
+    fs.vtable.forget(fs.impl, &c, .{ .ino = 5, .nlookup = 1, .evicted = true });
+    fs.vtable.destroy(fs.impl, &c, .{});
+    try testing.expect(m.destroyed);
+    try testing.expect(!Filesystem.implementsMustSet(Minimal));
+    tr.finish();
+}
+
+test "SetAttr decodes by valid bits; *_NOW resolves to now; times are ns-exact and saturating" {
+    const now: u64 = 1_700_000_000 * std.time.ns_per_s + 5;
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_MODE | abi.FATTR_SIZE | abi.FATTR_ATIME_NOW | abi.FATTR_MTIME | abi.FATTR_CTIME | abi.FATTR_KILL_SUIDGID | abi.FATTR_FH;
+    in.mode = 0o644;
+    in.size = 4096;
+    in.mtime = 1_600_000_000;
+    in.mtimensec = 123;
+    in.ctime = @bitCast(@as(i64, -1));
+    in.ctimensec = 999_999_999;
+    in.fh = 77;
+    const s = SetAttr.fromWire(in, now);
+    try testing.expectEqual(@as(?u32, 0o644), s.mode);
+    try testing.expectEqual(@as(?u32, null), s.uid);
+    try testing.expectEqual(@as(?u64, 4096), s.size);
+    try testing.expectEqual(@as(?u64, now), s.atime);
+    try testing.expectEqual(@as(?u64, 1_600_000_000 * std.time.ns_per_s + 123), s.mtime);
+    // −1 s + 999 999 999 ns = −1 ns.
+    try testing.expectEqual(@as(i64, -1), @as(i64, @bitCast(s.ctime.?)));
+    try testing.expectEqual(@as(?u64, 77), s.fh);
+    try testing.expect(s.kill_suidgid);
+    try testing.expect(!s.toEconomy().timesOnly());
+    // Saturation: a time_t past the i64-ns range never wraps.
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), @as(i64, @bitCast(timeNs(1 << 40, 0))));
+    const echo = SetAttr.fromWire(.{ .valid = abi.FATTR_MTIME | abi.FATTR_CTIME, .padding = 0, .fh = 0, .size = 0, .lock_owner = 0, .atime = 0, .mtime = 1, .ctime = 2, .atimensec = 0, .mtimensec = 0, .ctimensec = 0, .mode = 0, .unused4 = 0, .uid = 0, .gid = 0, .unused5 = 0 }, now);
+    try testing.expect(echo.toEconomy().timesOnly());
+}

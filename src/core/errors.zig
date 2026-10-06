@@ -70,6 +70,17 @@ pub const Terminal = error{
     ReservationConflict,
     /// The checkpoint past a journal hole this ack depended on could not drain.
     HoleCheckpointFailed,
+    /// `rmdir`/`rename` onto a directory that still has entries (ENOTEMPTY).
+    DirectoryNotEmpty,
+    /// `link` at the hard-link ceiling (EMLINK).
+    TooManyLinks,
+    /// The caller's buffer cannot hold the value (ERANGE: `getxattr`/`listxattr`).
+    BufferTooSmall,
+    /// No such extended attribute (ENODATA; Linux's ENOATTR).
+    NoAttribute,
+    /// An operation this filesystem does not implement (ENOSYS: the kernel
+    /// latches `fc->no_<op>` and stops asking).
+    NotImplemented,
     /// An errno outside the table (logged with its number; replies EIO).
     Unexpected,
 };
@@ -148,6 +159,11 @@ const table = [_]Row{
     .{ .e = .BADE, .err = error.ReservationConflict },
     .{ .e = .BUSY, .err = error.Busy },
     .{ .e = .@"2BIG", .err = error.ValueTooLarge },
+    .{ .e = .NOTEMPTY, .err = error.DirectoryNotEmpty },
+    .{ .e = .MLINK, .err = error.TooManyLinks },
+    .{ .e = .RANGE, .err = error.BufferTooSmall },
+    .{ .e = .NODATA, .err = error.NoAttribute },
+    .{ .e = .NOSYS, .err = error.NotImplemented },
 };
 
 /// Kernel → error. An errno outside the table is `Unexpected`, logged once
@@ -223,6 +239,15 @@ test "classes: backpressure is retryable and replies EAGAIN, never EINVAL; refus
     try testing.expectEqual(linux.E.INVAL, toErrno(error.MalformedKey));
     try testing.expectEqual(Class.refusal, classOf(error.ValueTooLarge));
     try testing.expectEqual(linux.E.@"2BIG", toErrno(error.ValueTooLarge));
+    // The FUSE handlers' POSIX rows: every one terminal, every one a
+    // kernel errno the application reads by name.
+    try testing.expectEqual(linux.E.NOTEMPTY, toErrno(error.DirectoryNotEmpty));
+    try testing.expectEqual(linux.E.MLINK, toErrno(error.TooManyLinks));
+    try testing.expectEqual(linux.E.RANGE, toErrno(error.BufferTooSmall));
+    try testing.expectEqual(linux.E.NODATA, toErrno(error.NoAttribute));
+    try testing.expectEqual(linux.E.NOSYS, toErrno(error.NotImplemented));
+    try testing.expectEqual(error.NotImplemented, fromErrno(.NOSYS));
+    try testing.expectEqual(Class.terminal, classOf(error.NoAttribute));
 }
 
 test "toErrno is total: every member of the set has an errno" {

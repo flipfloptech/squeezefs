@@ -86,8 +86,8 @@ pub const fuse = struct {
     pub const codec = @import("fuse/codec.zig");
     pub const geometry = @import("fuse/geometry.zig");
     pub const mount_options = @import("fuse/mount_options.zig");
-    // @anchor:fuse_transport_import
-    // @anchor:fuse_session_import
+    pub const transport = @import("fuse/transport.zig");
+    pub const handler = @import("fuse/handler.zig");
 };
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
@@ -119,8 +119,8 @@ test {
     _ = fuse.codec;
     _ = fuse.geometry;
     _ = fuse.mount_options;
-    // @anchor:fuse_transport_test
-    // @anchor:fuse_session_test
+    _ = fuse.transport;
+    _ = fuse.handler;
     if (builtin.os.tag == .linux) _ = uring128;
     _ = meta.conveyor;
     if (builtin.os.tag == .linux) _ = meta.device_loader;

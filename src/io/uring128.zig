@@ -308,7 +308,11 @@ pub const Ring128 = struct {
     pub fn enter(self: *Ring128, to_submit: u32, min_complete: u32, flags: u32, arg: ?*const linux.io_uring_getevents_arg) errors.Error!Entered {
         const argp: usize = if (arg) |a| @intFromPtr(a) else 0;
         const argsz: usize = if (arg != null) @sizeOf(linux.io_uring_getevents_arg) else 0;
-        const enter_flags: u32 = flags | (if (arg != null) @as(u32, linux.IORING_ENTER_EXT_ARG) else 0);
+        var enter_flags: u32 = flags | (if (arg != null) @as(u32, linux.IORING_ENTER_EXT_ARG) else 0);
+        // SQPOLL (the transport's A/B lever): an idle poller must be woken
+        // to see the flushed tail; the kernel raises NEED_WAKEUP in
+        // `sq.flags` when it went to sleep.
+        if (self.flags & linux.IORING_SETUP_SQPOLL != 0 and self.sqFlags() & linux.IORING_SQ_NEED_WAKEUP != 0) enter_flags |= linux.IORING_ENTER_SQ_WAKEUP;
         // The kernel reads `arg` and its timespec during this call only.
         const rc = linux.syscall6(.io_uring_enter, @as(usize, @intCast(self.fd)), to_submit, min_complete, enter_flags, argp, argsz);
         return switch (linux.errno(rc)) {

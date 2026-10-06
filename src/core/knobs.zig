@@ -93,8 +93,8 @@ pub const MIB_MAX: i128 = BYTES_MAX >> 20;
 /// THE REGISTRY. Grouped by subsystem; rows land with the module that reads
 /// them (the inverse-census rail refuses a row nothing reads).
 pub const registry = [_]Knob{
-    // (`SQUEEZEFS_OP_PROFILE` and `SQUEEZEFS_STATS_KEY_CENSUS` land with the
-    // `.stats` inode in rung 5 — a row nothing reads is dead code.)
+    // (`SQUEEZEFS_STATS_KEY_CENSUS` lands with the `.stats` inode in rung 5 —
+    // a row nothing reads is dead code.)
 
     // ---- R5 memory budget ----
     .{ .key = "SQUEEZEFS_MEM_BUDGET_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "R5 memory budget, MiB (absolute > cgroup memory.max × 0.8 > 70 % RAM)." },
@@ -151,6 +151,15 @@ pub const registry = [_]Knob{
     .{ .key = "SQUEEZEFS_NUMA", .kind = .bool, .default = "on", .class = .ab_lever, .doc = "NUMA placement actions (lane affinity by node, node-grouped dispatch). A/B lever: 0 makes no affinity call and ignores node groups while the node map and gauges stay live — the single-node-posture control arm; structurally inert on single-node hosts." },
     .{ .key = "SQUEEZEFS_FUSE_SAME_LANE_DISPATCH", .kind = .bool, .default = "1", .class = .ab_lever, .doc = "A spawn issued from a lane thread lands on THAT lane instead of the fuse-lane rotation (deletes one cross-thread wake per op; the rotation measured 412 µs dispatch_lag at 256 in flight). A/B lever: 0 is the rotation control arm." },
     .{ .key = "SQUEEZEFS_TEST_EXEC_DROP_WAKE", .kind = .bool, .default = "0", .class = .test_seam, .doc = "Test seam: every lane drops the FIRST cross-thread eventfd wake write after it starts, so the park tick's lost-wake rescue (exec_lane_tick_rescues) is exercised deterministically." },
+
+    // ---- the FUSE handler layer (read by fuse/handler/{op_trace,op_guard}.zig) ----
+    .{ .key = "SQUEEZEFS_OP_PROFILE", .kind = .bool, .default = "0", .class = .ab_lever, .doc = "Per-op phase histograms (fuse_op_phase_ns[class][handler_to_backend|backend|backend_to_reply|total], exact-sum) armed at mount: three extra CLOCK_MONOTONIC reads per op. A/B lever: 0 is the shipped arm — the prologue is ONE relaxed load of the armed word, no clock read, no allocation; the `.stats` surface of a disarmed mount is byte-identical." },
+    .{ .key = "SQUEEZEFS_WRITE_SHARED", .kind = .bool, .default = "1", .class = .ab_lever, .doc = "Shared-mode inode admission for cache-resident striped writes (charter §6.2: a WRITE whose range the resident caches prove within-EOF takes the per-inode op guard SHARED; readers run concurrently). A/B lever: 1 is the shipped arm (+7–8 % rand-4k IOPS, 523/530 k vs 489/491 k A-B-B-A); 0 is the exclusive control arm — every write classifies EntireOp/MetaPrepOnly and the 1.12 ms/op scheduler-wake convoy at 32 × qd32 returns." },
+
+    // ---- the FUSE library: the ring transport (read by fuse/transport/session.zig) ----
+    .{ .key = "SQUEEZEFS_FUSE_READ_FUSION", .kind = .bool, .default = "0", .class = .ab_lever, .doc = "READ dispatch law arm (b): on a zero-copy session a READ at or under the fusion ceiling (payload/8, floor 4096) is polled on the worker's own fused lane instead of a handler lane. A/B lever: 0 is the shipped arm — composed behind the inline warm-ladder serve the fusion read −6.5 % IOPS (481k vs 514k), p50 +70 µs, p99 1.5 vs 4.3 ms: the two levers converge on the reap thread's per-op serialization; standing alone it won +15.5 %. Inert on a UserEnts (stock) session." },
+    .{ .key = "SQUEEZEFS_FUSE_SQPOLL", .kind = .bool, .default = "0", .class = .ab_lever, .doc = "Build each transport worker's ring with IORING_SETUP_SQPOLL (a kernel submission poller per ring; never composed with DEFER_TASKRUN, which the poller's task-work ownership forbids). A/B lever: 0 is the shipped arm — SQPOLL was measured, not recommended (M10): the worker already carries every SQE in the ONE loop-bottom enter it needs for the wait, so the poller buys a core and saves no syscall on the saturated path." },
+    .{ .key = "SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", .kind = .{ .int = .{ .lo = 0, .hi = 1 << 20 } }, .default = "0", .class = .test_seam, .doc = "Test seam: the first N REGISTER pushes across the session's workers are answered as refused (EBUSY) without reaching the kernel, so the backoff ladder (1 ms doubling to 128 ms, retirement on the 8th) and the arm barrier's submission count are exercised deterministically." },
 };
 
 pub fn lookup(key: []const u8) ?*const Knob {

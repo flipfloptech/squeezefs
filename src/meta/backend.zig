@@ -979,6 +979,27 @@ pub const KvBackend = struct {
         return be.sb.hash_seed;
     }
 
+    pub fn nodeSize(be: *const KvBackend) usize {
+        return be.sb.node_size;
+    }
+
+    /// The `statfs` view of the heap: node-sized extents, the allocator's
+    /// free population.
+    pub const Space = struct { total_bytes: u64, free_bytes: u64 };
+
+    pub fn space(be: *const KvBackend) Space {
+        return .{ .total_bytes = be.sb.heap.len, .free_bytes = be.alloc.freeExtents() * be.sb.node_size };
+    }
+
+    /// The store face `fuse/handler/kv_fs.KvFs` binds to: this backend's
+    /// error set and its names onto the ONE error set (the conveyor's
+    /// table: the commit outcomes are its).
+    pub const StoreError = Error;
+
+    pub fn coreError(e: Error) errors.Error {
+        return conveyor.coreError(e);
+    }
+
     pub fn isFailed(be: *const KvBackend) bool {
         return be.lane.latch.isFailed();
     }

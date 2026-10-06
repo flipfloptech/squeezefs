@@ -424,6 +424,39 @@ pub const SqzIo = struct {
         return spawnTyped(self.lanes[idx], function, args, .unblocked);
     }
 
+    /// The lane `spawnHome` would pick (the transport's handoff target
+    /// resolved once per delivery): the fuse lane homed on `cpu`, else the
+    /// node's round-robin, else the rotation; the meta pool when no fuse
+    /// lanes exist; dead lanes walked around, every lane dead aborts loud.
+    pub fn homeLane(self: *SqzIo, cpu: ?u16, node: ?u16) *Lane {
+        const idx = self.fuse_placement.pickHome(cpu, node) orelse {
+            if (self.fuse_count == 0) return self.pickMeta() orelse abortAllDead("meta");
+            abortAllDead("fuse");
+        };
+        return self.lanes[idx];
+    }
+
+    /// A GROUP member on a chosen lane: the transport's fire-and-forget
+    /// handler fiber (the lane recycles it at finish; the session's
+    /// `Io.Group` is the join at teardown). Allocates nothing.
+    pub fn spawnGroupOn(self: *SqzIo, lane: *Lane, g: *Io.Group, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Io.ConcurrentError!void {
+        _ = self;
+        const Args = @TypeOf(args);
+        comptime assert(@sizeOf(Args) <= fiber_mod.max_context_size);
+        comptime assert(@alignOf(Args) <= fiber_mod.max_context_align.toByteUnits());
+        const TypeErased = struct {
+            fn start(context: *const anyopaque) void {
+                const a: *const Args = @ptrCast(@alignCast(context));
+                @call(.auto, function, a.*);
+            }
+        };
+        group_mod.addMember(g);
+        _ = lane.spawn(.group, .{ .group = TypeErased.start }, std.mem.asBytes(&args), g, .unblocked) catch |err| {
+            group_mod.removeMember(g);
+            return err;
+        };
+    }
+
     /// The `sqz-meta` pool, round-robin.
     pub fn spawnMeta(self: *SqzIo, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) Io.ConcurrentError!Io.Future(ReturnOf(function)) {
         return spawnTyped(self.pickMeta() orelse abortAllDead("meta"), function, args, .unblocked);

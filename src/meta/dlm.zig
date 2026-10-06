@@ -113,8 +113,9 @@ pub var lock_phase_dlm_guard_hold: counters.ShardedLatencyHistogram = .{};
 pub const first_touch_spins: u32 = 256;
 
 /// splitmix64 finalizer — the ONE mix every stripe index and census key word
-/// derives from.
-fn splitmix64(v: u64) u64 {
+/// derives from (the level-1 op guard's table, `fuse/handler/op_guard.zig`,
+/// indexes by the same mix so an ino's two stripes never diverge in shape).
+pub fn splitmix64(v: u64) u64 {
     var x = v;
     x ^= x >> 30;
     x *%= 0xbf58476d1ce4e5b9;

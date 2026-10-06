@@ -31,9 +31,21 @@ pub fn realtimeCoarseS() u64 {
     return if (ts.sec < 0) 0 else @intCast(ts.sec);
 }
 
+/// The i64-ns realtime stamp a metadata mutation carries (atime/mtime/
+/// ctime): COARSE on Linux because the kernel authors its own cmtime from
+/// the same coarse clock — a fine daemon clock could LEAD the kernel's
+/// writeback-cache stamp by a tick and invert cross-inode ctime order
+/// (fstests generic/423).
+pub fn realtimeCoarseNs() i64 {
+    const clock: posix.clockid_t = if (builtin.os.tag == .linux) .REALTIME_COARSE else .REALTIME;
+    const ts = read(clock);
+    return @as(i64, @intCast(ts.sec)) *| std.time.ns_per_s +| @as(i64, @intCast(ts.nsec));
+}
+
 test "monotonic never goes backwards; realtime is after 2020" {
     const a = monotonicNs();
     const b = monotonicNs();
     try std.testing.expect(b >= a);
     try std.testing.expect(realtimeCoarseS() > 1_577_836_800);
+    try std.testing.expect(realtimeCoarseNs() > 1_577_836_800 * std.time.ns_per_s);
 }

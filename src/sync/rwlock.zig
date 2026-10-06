@@ -299,13 +299,13 @@ pub const RwLock = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Tests: the reference's `sqz_sync` suite, under `std.testing.io`.
+// Tests: the reference's `sqz_sync` suite, under BOTH executors (`testing.zig`).
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
-test "rwlock_readers_share_writers_exclude: readers coexist, writers exclude, write preference holds" {
-    const io = testing.io;
+fn readersShareWritersExclude(io: Io) !void {
     var l: RwLock = .init;
     try l.lockShared(io);
     try l.lockShared(io);
@@ -321,8 +321,11 @@ test "rwlock_readers_share_writers_exclude: readers coexist, writers exclude, wr
     try testing.expectEqual(RwLock.init, l);
 }
 
-test "a fresh exclusive attempt queues behind ANY waiter and a fresh shared attempt behind a queued writer (bounded barging)" {
-    const io = testing.io;
+test "rwlock_readers_share_writers_exclude: readers coexist, writers exclude, write preference holds" {
+    try sync_testing.underBoth(readersShareWritersExclude);
+}
+
+fn boundedBarging(io: Io) !void {
     var l: RwLock = .init;
     try l.lockShared(io);
     var dead: Waiter = .{ .mode = .exclusive };
@@ -349,8 +352,11 @@ test "a fresh exclusive attempt queues behind ANY waiter and a fresh shared atte
     try testing.expectEqual(RwLock.init, l);
 }
 
-test "release_wakes_leading_shared_or_one_exclusive: the FIFO wake shape, tokens only" {
-    const io = testing.io;
+test "a fresh exclusive attempt queues behind ANY waiter and a fresh shared attempt behind a queued writer (bounded barging)" {
+    try sync_testing.underBoth(boundedBarging);
+}
+
+fn releaseWakeShape(io: Io) !void {
     var l: RwLock = .init;
     try l.lock(io);
     var w1: Waiter = .{ .mode = .shared };
@@ -389,18 +395,21 @@ test "release_wakes_leading_shared_or_one_exclusive: the FIFO wake shape, tokens
     try testing.expectEqual(RwLock.init, l);
 }
 
-test "cancelling_the_front_waiter_hands_the_wake_to_the_next: a cancelled parked acquire unlinks and passes its token on" {
-    const io = testing.io;
+test "release_wakes_leading_shared_or_one_exclusive: the FIFO wake shape, tokens only" {
+    try sync_testing.underBoth(releaseWakeShape);
+}
+
+fn cancelFrontHandsWake(io: Io) !void {
     var l: RwLock = .init;
     try l.lock(io);
     var next: Waiter = .{ .mode = .exclusive };
     const Parked = struct {
-        fn run(lk: *RwLock) Io.Cancelable!void {
-            try lk.lock(testing.io);
-            lk.unlock(testing.io);
+        fn run(io_: Io, lk: *RwLock) Io.Cancelable!void {
+            try lk.lock(io_);
+            lk.unlock(io_);
         }
     };
-    var fut = io.concurrent(Parked.run, .{&l}) catch |err| switch (err) {
+    var fut = io.concurrent(Parked.run, .{ io, &l }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     // The task is queued behind the holder; the harness waiter behind it.
@@ -416,8 +425,11 @@ test "cancelling_the_front_waiter_hands_the_wake_to_the_next: a cancelled parked
     try testing.expectEqual(RwLock.init, l);
 }
 
-test "a_dead_waiter_never_wedges_the_lock: a registered waiter that never re-contends costs a fresh contender one tick, never a wedge" {
-    const io = testing.io;
+test "cancelling_the_front_waiter_hands_the_wake_to_the_next: a cancelled parked acquire unlinks and passes its token on" {
+    try sync_testing.underBoth(cancelFrontHandsWake);
+}
+
+fn deadWaiterNeverWedges(io: Io) !void {
     var l: RwLock = .init;
     try l.lock(io);
     var dead: Waiter = .{ .mode = .exclusive };
@@ -437,18 +449,21 @@ test "a_dead_waiter_never_wedges_the_lock: a registered waiter that never re-con
     try testing.expectEqual(RwLock.init, l);
 }
 
-test "tick_backstop_reregisters_and_recovers: a waiter parked past a tick counts a recovery and still acquires on release" {
-    const io = testing.io;
+test "a_dead_waiter_never_wedges_the_lock: a registered waiter that never re-contends costs a fresh contender one tick, never a wedge" {
+    try sync_testing.underBoth(deadWaiterNeverWedges);
+}
+
+fn tickBackstopRecovers(io: Io) !void {
     var l: RwLock = .init;
     try l.lock(io);
     const before = tick.lock_ticked_reregisters.load();
     const Parked = struct {
-        fn run(lk: *RwLock) void {
-            lk.lockUncancelable(testing.io);
-            lk.unlock(testing.io);
+        fn run(io_: Io, lk: *RwLock) void {
+            lk.lockUncancelable(io_);
+            lk.unlock(io_);
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{&l});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &l });
     while (l.waiters(io) == 0) try std.Thread.yield();
     // The hold window is longer than a tick, so the parked waiter MUST tick
     // at least once before the release lets it in.
@@ -459,28 +474,32 @@ test "tick_backstop_reregisters_and_recovers: a waiter parked past a tick counts
     try testing.expectEqual(RwLock.init, l);
 }
 
-test "writer_storm_never_starves_a_waiter: a 100 %-duty release→relock writer cannot barge past queued waiters" {
+test "tick_backstop_reregisters_and_recovers: a waiter parked past a tick counts a recovery and still acquires on release" {
+    try sync_testing.underBoth(tickBackstopRecovers);
+}
+
+fn writerStormNeverStarves(io: Io) !void {
     const Shared = struct {
         l: RwLock = .init,
         stop: std.atomic.Value(bool) = .init(false),
         acquired: std.atomic.Value(u32) = .init(0),
-        fn storm(s: *@This()) void {
+        fn storm(io_: Io, s: *@This()) void {
             while (!s.stop.load(.acquire)) {
-                s.l.lockUncancelable(testing.io);
+                s.l.lockUncancelable(io_);
                 std.Thread.yield() catch {};
-                s.l.unlock(testing.io);
+                s.l.unlock(io_);
             }
         }
-        fn waiter(s: *@This()) void {
-            s.l.lockUncancelable(testing.io);
+        fn waiter(io_: Io, s: *@This()) void {
+            s.l.lockUncancelable(io_);
             _ = s.acquired.fetchAdd(1, .release);
-            s.l.unlock(testing.io);
+            s.l.unlock(io_);
         }
     };
     var s: Shared = .{};
-    const storm = try std.Thread.spawn(.{}, Shared.storm, .{&s});
+    const storm = try std.Thread.spawn(.{}, Shared.storm, .{ io, &s });
     var ws: [4]std.Thread = undefined;
-    for (&ws) |*w| w.* = try std.Thread.spawn(.{}, Shared.waiter, .{&s});
+    for (&ws) |*w| w.* = try std.Thread.spawn(.{}, Shared.waiter, .{ io, &s });
     const t0 = clock.monotonicNs();
     for (ws) |w| w.join();
     const waited = clock.monotonicNs() - t0;
@@ -491,8 +510,11 @@ test "writer_storm_never_starves_a_waiter: a 100 %-duty release→relock writer 
     try testing.expect(waited < tick.tick_ns);
 }
 
-test "owned_guards_work: guards acquire, exclude, travel by value and release" {
-    const io = testing.io;
+test "writer_storm_never_starves_a_waiter: a 100 %-duty release→relock writer cannot barge past queued waiters" {
+    try sync_testing.underBoth(writerStormNeverStarves);
+}
+
+fn ownedGuards(io: Io) !void {
     var l: RwLock = .init;
     const w = try l.acquireGuard(io, .exclusive);
     try testing.expect(!l.tryLockShared(io));
@@ -506,7 +528,11 @@ test "owned_guards_work: guards acquire, exclude, travel by value and release" {
     try testing.expectEqual(RwLock.init, l);
 }
 
-test "readers and writers under contention keep two words equal (exclusion across threads)" {
+test "owned_guards_work: guards acquire, exclude, travel by value and release" {
+    try sync_testing.underBoth(ownedGuards);
+}
+
+fn contentionKeepsWordsEqual(io: Io) !void {
     const Runner = struct {
         l: RwLock = .init,
         a: usize = 0,
@@ -515,12 +541,12 @@ test "readers and writers under contention keep two words equal (exclusion acros
         writes: usize = 0,
         const num_writes = 500;
         const num_reads = 2000;
-        fn reader(r: *@This(), seed: usize) !void {
+        fn reader(io_: Io, r: *@This(), seed: usize) !void {
             var prng = std.Random.DefaultPrng.init(seed);
             const rnd = prng.random();
             while (true) {
-                r.l.lockSharedUncancelable(testing.io);
-                defer r.l.unlockShared(testing.io);
+                r.l.lockSharedUncancelable(io_);
+                defer r.l.unlockShared(io_);
                 if (r.reads.fetchAdd(1, .monotonic) >= num_reads) break;
                 const a: *const volatile usize = &r.a;
                 const b: *const volatile usize = &r.b;
@@ -529,12 +555,12 @@ test "readers and writers under contention keep two words equal (exclusion acros
                 try testing.expectEqual(old_a, b.*);
             }
         }
-        fn writer(r: *@This(), seed: usize) !void {
+        fn writer(io_: Io, r: *@This(), seed: usize) !void {
             var prng = std.Random.DefaultPrng.init(seed);
             const rnd = prng.random();
             while (true) {
-                r.l.lockUncancelable(testing.io);
-                defer r.l.unlock(testing.io);
+                r.l.lockUncancelable(io_);
+                defer r.l.unlock(io_);
                 if (r.writes == num_writes) break;
                 const a: *volatile usize = &r.a;
                 const b: *volatile usize = &r.b;
@@ -551,10 +577,61 @@ test "readers and writers under contention keep two words equal (exclusion acros
     var run: Runner = .{};
     var ws: [2]std.Thread = undefined;
     var rs: [4]std.Thread = undefined;
-    for (&ws, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Runner.writer, .{ &run, i });
-    for (&rs, 10..) |*t, i| t.* = try std.Thread.spawn(.{}, Runner.reader, .{ &run, i });
+    for (&ws, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Runner.writer, .{ io, &run, i });
+    for (&rs, 10..) |*t, i| t.* = try std.Thread.spawn(.{}, Runner.reader, .{ io, &run, i });
     for (ws) |t| t.join();
     for (rs) |t| t.join();
     try testing.expectEqual(@as(usize, Runner.num_writes), run.writes);
     try testing.expectEqual(RwLock.init, run.l);
+}
+
+test "readers and writers under contention keep two words equal (exclusion across threads)" {
+    try sync_testing.underBoth(contentionKeepsWordsEqual);
+}
+
+/// The lock contended by FIBERS on both meta lanes and by raw threads at
+/// once: every acquire lands and the lock returns to init.
+fn fibersAndThreadsContend(io: Io) !void {
+    const Shared = struct {
+        l: RwLock = .init,
+        n: u64 = 0,
+        fn fiberWorker(io_: Io, s: *@This()) Io.Cancelable!void {
+            var i: usize = 0;
+            while (i < 200) : (i += 1) {
+                try s.l.lock(io_);
+                s.n += 1;
+                s.l.unlock(io_);
+                s.l.lockSharedUncancelable(io_);
+                s.l.unlockShared(io_);
+            }
+        }
+        fn threadWorker(io_: Io, s: *@This()) void {
+            var i: usize = 0;
+            while (i < 200) : (i += 1) {
+                s.l.lockUncancelable(io_);
+                s.n += 1;
+                s.l.unlock(io_);
+            }
+        }
+    };
+    var s: Shared = .{};
+    var futs: [4]Io.Future(Io.Cancelable!void) = undefined;
+    var spawned: usize = 0;
+    for (&futs) |*f| {
+        f.* = io.concurrent(Shared.fiberWorker, .{ io, &s }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => break,
+        };
+        spawned += 1;
+    }
+    var ts: [2]std.Thread = undefined;
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.threadWorker, .{ io, &s });
+    for (ts) |t| t.join();
+    for (futs[0..spawned]) |*f| try f.await(io);
+    if (spawned == 0) return error.SkipZigTest;
+    try testing.expectEqual(@as(u64, 200 * (spawned + 2)), s.n);
+    try testing.expectEqual(RwLock.init, s.l);
+}
+
+test "fibers on both lanes and raw threads contend for one lock: every acquire lands" {
+    try sync_testing.underBoth(fibersAndThreadsContend);
 }

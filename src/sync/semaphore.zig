@@ -170,9 +170,9 @@ pub const Semaphore = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
-test "permits_bound_and_release_restores" {
-    const io = testing.io;
+fn permitsBound(io: Io) !void {
     var s = Semaphore.init(2);
     const p1 = s.tryAcquire(io, 1).?;
     const p2 = s.tryAcquire(io, 1).?;
@@ -185,8 +185,11 @@ test "permits_bound_and_release_restores" {
     try testing.expectEqual(@as(usize, 2), s.available(io));
 }
 
-test "forget_leaks_the_permit_by_contract" {
-    const io = testing.io;
+test "permits_bound_and_release_restores" {
+    try sync_testing.underBoth(permitsBound);
+}
+
+fn forgetLeaks(io: Io) !void {
     var s = Semaphore.init(1);
     var p = s.tryAcquire(io, 1).?;
     p.forget();
@@ -196,17 +199,20 @@ test "forget_leaks_the_permit_by_contract" {
     try testing.expectEqual(@as(usize, 1), s.available(io));
 }
 
-test "parked_acquire_wakes_on_release_fifo" {
-    const io = testing.io;
+test "forget_leaks_the_permit_by_contract" {
+    try sync_testing.underBoth(forgetLeaks);
+}
+
+fn parkedAcquireWakes(io: Io) !void {
     var s = Semaphore.init(1);
     const held = s.tryAcquire(io, 1).?;
     const Parked = struct {
-        fn run(sem: *Semaphore) void {
-            const p = sem.acquireUncancelable(testing.io, 1);
-            p.release(testing.io);
+        fn run(io_: Io, sem: *Semaphore) void {
+            const p = sem.acquireUncancelable(io_, 1);
+            p.release(io_);
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{&s});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &s });
     while (s.waiters(io) == 0) try std.Thread.yield();
     held.release(io);
     t.join();
@@ -214,17 +220,20 @@ test "parked_acquire_wakes_on_release_fifo" {
     try testing.expectEqual(@as(u32, 0), s.waiters(io));
 }
 
-test "fresh_acquire_queues_behind_waiter_but_try_barges" {
-    const io = testing.io;
+test "parked_acquire_wakes_on_release_fifo" {
+    try sync_testing.underBoth(parkedAcquireWakes);
+}
+
+fn freshQueuesTryBarges(io: Io) !void {
     var s = Semaphore.init(1);
     const held = s.tryAcquire(io, 1).?;
     const Parked = struct {
-        fn run(sem: *Semaphore) void {
-            const p = sem.acquireUncancelable(testing.io, 1);
-            p.release(testing.io);
+        fn run(io_: Io, sem: *Semaphore) void {
+            const p = sem.acquireUncancelable(io_, 1);
+            p.release(io_);
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{&s});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &s });
     while (s.waiters(io) == 0) try std.Thread.yield();
     // The pool is empty: even the barging try refuses.
     try testing.expect(s.tryAcquire(io, 1) == null);
@@ -232,13 +241,13 @@ test "fresh_acquire_queues_behind_waiter_but_try_barges" {
     t.join();
     // A free pool with a queued waiter: a fresh acquire queues, a try takes.
     const Dead = struct {
-        fn run(sem: *Semaphore) Io.Cancelable!void {
-            const p = try sem.acquire(testing.io, 1);
-            p.release(testing.io);
+        fn run(io_: Io, sem: *Semaphore) Io.Cancelable!void {
+            const p = try sem.acquire(io_, 1);
+            p.release(io_);
         }
     };
     const big = s.tryAcquire(io, 1).?;
-    var fut = io.concurrent(Dead.run, .{&s}) catch |err| switch (err) {
+    var fut = io.concurrent(Dead.run, .{ io, &s }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     while (s.waiters(io) == 0) try std.Thread.yield();
@@ -249,17 +258,20 @@ test "fresh_acquire_queues_behind_waiter_but_try_barges" {
     try testing.expectEqual(@as(usize, 1), s.available(io));
 }
 
-test "a cancelled parked acquire unlinks and hands the pool to the next waiter" {
-    const io = testing.io;
+test "fresh_acquire_queues_behind_waiter_but_try_barges" {
+    try sync_testing.underBoth(freshQueuesTryBarges);
+}
+
+fn cancelledAcquireUnlinks(io: Io) !void {
     var s = Semaphore.init(1);
     const held = s.tryAcquire(io, 1).?;
     const Parked = struct {
-        fn run(sem: *Semaphore) Io.Cancelable!void {
-            const p = try sem.acquire(testing.io, 1);
-            p.release(testing.io);
+        fn run(io_: Io, sem: *Semaphore) Io.Cancelable!void {
+            const p = try sem.acquire(io_, 1);
+            p.release(io_);
         }
     };
-    var fut = io.concurrent(Parked.run, .{&s}) catch |err| switch (err) {
+    var fut = io.concurrent(Parked.run, .{ io, &s }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     while (s.waiters(io) == 0) try std.Thread.yield();
@@ -269,28 +281,36 @@ test "a cancelled parked acquire unlinks and hands the pool to the next waiter" 
     try testing.expectEqual(@as(usize, 1), s.available(io));
 }
 
-test "concurrency never exceeds the permit count under a storm" {
+test "a cancelled parked acquire unlinks and hands the pool to the next waiter" {
+    try sync_testing.underBoth(cancelledAcquireUnlinks);
+}
+
+fn concurrencyNeverExceeds(io: Io) !void {
     const Shared = struct {
         s: Semaphore = Semaphore.init(2),
         inside: std.atomic.Value(u32) = .init(0),
         peak: std.atomic.Value(u32) = .init(0),
-        fn run(sh: *@This()) void {
+        fn run(io_: Io, sh: *@This()) void {
             var i: usize = 0;
             while (i < 300) : (i += 1) {
-                const p = sh.s.acquireUncancelable(testing.io, 1);
+                const p = sh.s.acquireUncancelable(io_, 1);
                 const now = sh.inside.fetchAdd(1, .acq_rel) + 1;
                 _ = sh.peak.fetchMax(now, .acq_rel);
                 std.Thread.yield() catch {};
                 _ = sh.inside.fetchSub(1, .acq_rel);
-                p.release(testing.io);
+                p.release(io_);
             }
         }
     };
     var sh: Shared = .{};
     var ts: [6]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{&sh});
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{ io, &sh });
     for (ts) |t| t.join();
     try testing.expect(sh.peak.load(.acquire) <= 2);
     try testing.expect(sh.peak.load(.acquire) >= 1);
-    try testing.expectEqual(@as(usize, 2), sh.s.available(testing.io));
+    try testing.expectEqual(@as(usize, 2), sh.s.available(io));
+}
+
+test "concurrency never exceeds the permit count under a storm" {
+    try sync_testing.underBoth(concurrencyNeverExceeds);
 }

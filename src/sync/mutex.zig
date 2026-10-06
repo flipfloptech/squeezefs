@@ -38,44 +38,52 @@ pub const Mutex = struct {
 };
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
-test "mutex_excludes_under_contention: 8 threads × 1000 increments land exactly" {
+fn excludesUnderContention(io: Io) !void {
     const Shared = struct {
         m: Mutex = .init,
         n: u64 = 0,
-        fn run(s: *@This()) void {
+        fn run(io_: Io, s: *@This()) void {
             var i: usize = 0;
             while (i < 1000) : (i += 1) {
-                s.m.lockUncancelable(testing.io);
+                s.m.lockUncancelable(io_);
                 s.n += 1;
-                s.m.unlock(testing.io);
+                s.m.unlock(io_);
             }
         }
     };
     var s: Shared = .{};
     var ts: [8]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{&s});
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{ io, &s });
     for (ts) |t| t.join();
-    try s.m.lock(testing.io);
+    try s.m.lock(io);
     try testing.expectEqual(@as(u64, 8000), s.n);
-    s.m.unlock(testing.io);
+    s.m.unlock(io);
     try testing.expectEqual(Mutex.init, s.m);
 }
 
-test "tryLock refuses a held mutex and a free one with a queued waiter; the release reaches the waiter" {
-    const io = testing.io;
+test "mutex_excludes_under_contention: 8 threads × 1000 increments land exactly" {
+    try sync_testing.underBoth(excludesUnderContention);
+}
+
+fn tryLockCourtesy(io: Io) !void {
     var m: Mutex = .init;
     try testing.expect(m.tryLock(io));
     try testing.expect(!m.tryLock(io));
     const Parked = struct {
-        fn run(mx: *Mutex) void {
-            mx.lockUncancelable(testing.io);
-            mx.unlock(testing.io);
+        fn run(io_: Io, mx: *Mutex) void {
+            mx.lockUncancelable(io_);
+            mx.unlock(io_);
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{&m});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &m });
     while (m.waiters(io) == 0) try std.Thread.yield();
     m.unlock(io);
     t.join();
     try testing.expectEqual(Mutex.init, m);
+}
+
+test "tryLock refuses a held mutex and a free one with a queued waiter; the release reaches the waiter" {
+    try sync_testing.underBoth(tryLockCourtesy);
 }

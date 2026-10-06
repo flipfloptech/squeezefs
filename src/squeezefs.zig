@@ -78,11 +78,14 @@ pub const meta = struct {
 pub const sync = @import("sync/sync.zig");
 
 // ---- the executor: our own std.Io implementation (decision 0001) ----
-// @anchor:exec_import
+pub const exec = @import("exec/exec.zig");
 
 // ---- the FUSE library (charter §4) ----
 pub const fuse = struct {
-    // @anchor:fuse_abi_import
+    pub const abi = @import("fuse/abi.zig");
+    pub const codec = @import("fuse/codec.zig");
+    pub const geometry = @import("fuse/geometry.zig");
+    pub const mount_options = @import("fuse/mount_options.zig");
     // @anchor:fuse_transport_import
     // @anchor:fuse_session_import
 };
@@ -93,6 +96,7 @@ pub const mem_budget = @import("mem/budget.zig");
 // ---- I/O: the ring-park primitive, the io_uring file layer + metadata device posture (Linux only) ----
 pub const align_probe = @import("io/align_probe.zig");
 pub const ring_park = if (builtin.os.tag == .linux) @import("io/ring_park.zig") else struct {};
+pub const uring128 = if (builtin.os.tag == .linux) @import("io/uring128.zig") else struct {};
 pub const uring_fs = if (builtin.os.tag == .linux) @import("io/uring_fs.zig") else struct {};
 
 // ---- I/O: NVMe block device workers (Linux only) ----
@@ -110,11 +114,14 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:exec_test
-    // @anchor:fuse_abi_test
+    _ = exec;
+    _ = fuse.abi;
+    _ = fuse.codec;
+    _ = fuse.geometry;
+    _ = fuse.mount_options;
     // @anchor:fuse_transport_test
     // @anchor:fuse_session_test
-    // @anchor:uring128_test
+    if (builtin.os.tag == .linux) _ = uring128;
     _ = meta.conveyor;
     if (builtin.os.tag == .linux) _ = meta.device_loader;
     if (builtin.os.tag == .linux) _ = meta.backend;

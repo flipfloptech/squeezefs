@@ -1,0 +1,893 @@
+//! FUSE-over-io_uring transport geometry — the ONE pure derivation of the
+//! queue count, ring depth, `max_write`/`max_pages`/`payload_sz`,
+//! `max_background`/`congestion_threshold`, the drain-group plan and the
+//! per-group SQ size (charter §4 "Geometry" + "Drain groups";
+//! `docs/porting/fuse_abi_session.md` §3, `fuse_uring_transport.md` §1.7,
+//! §3, §12, §14). Resolved ONCE, before the INIT reply is serialized, and
+//! published as the `transport_*` level gauges when the session arms.
+//!
+//! Every input is injected (`Inputs`): the kernel's possible CPU count, the
+//! `/proc/sys/fs/fuse/max_pages_limit` sysctl (the Linux reader lives behind
+//! `builtin.os.tag == .linux`; the fallback 256 is the compiled-in default of
+//! kernels without the sysctl), the page size, the payload-buffer cap
+//! (`mem/sizing.resolveTransportBufferCap` = `SQUEEZEFS_TRANSPORT_MEM_MAX` >
+//! `_PCT` > budget / 8), the knob overrides. The plan is total: it never
+//! refuses (the startup gate already did) and every tie row of the specs is
+//! a test below.
+//!
+//! The kernel mirror being matched (`fuse_uring_create` / `process_init_reply`):
+//!   fc->max_pages   = min(limit, max(arg->max_pages, 1))
+//!   fc->max_write   = max(4096, arg->max_write)
+//!   ring->max_payload_sz = max(FUSE_MIN_READ_BUFFER, fc->max_write, fc->max_pages × PAGE)
+//!   REGISTER refuses iov[1].iov_len < ring->max_payload_sz
+//! so `payload_sz == max_payload_sz` makes REGISTER acceptance structural
+//! (the pre-fix planner pinned 256 pages while advertising `max_pages =
+//! u16::MAX`: every REGISTER refused on a raised-sysctl box, mount failed).
+
+const std = @import("std");
+const builtin = @import("builtin");
+const derive = @import("../core/derive.zig");
+const knobs = @import("../core/knobs.zig");
+const counters = @import("../core/counters.zig");
+const sizing = @import("../mem/sizing.zig");
+const abi = @import("abi.zig");
+
+const MiB = derive.MiB;
+const GiB = derive.GiB;
+
+/// Measured-best per-queue depth: QD32 + max_background 256 took the
+/// decomposition box from 44 k to 316 k IOPS (7.2×); depth 16 alone was
+/// +2.2×, mb 256 alone +0 — both together 316 k.
+pub const Q_DEPTH_DESIRED: u32 = 32;
+/// The pre-L1 shipped posture; at the floor the arena is exactly yesterday's
+/// `queues × 4 × payload_sz` (never regress below shipped).
+pub const Q_DEPTH_FLOOR: u32 = @intCast(sizing.transport_q_depth_floor);
+/// The pre-4 MiB-campaign shipped ent = 256 × 4 KiB; `max_write` degrades
+/// toward it under a small budget and never below it.
+pub const PAYLOAD_BASE: u64 = sizing.transport_payload_base;
+/// The historical dead-letter `max_background=64` option's intent.
+pub const MAX_BACKGROUND_FLOOR: u32 = 64;
+/// `fuse_init_out.max_background` is a u16: a protocol bound, not a policy
+/// constant (the fixed 256 was retired 2026-08-04).
+pub const MAX_BACKGROUND_CEILING: u32 = std.math.maxInt(u16);
+/// The compiled-in default of kernels without the `max_pages_limit` sysctl.
+pub const MAX_PAGES_LIMIT_FALLBACK: u32 = 256;
+/// `fuse_init_out.max_pages` is a u16.
+pub const MAX_PAGES_LIMIT_CEILING: u32 = std.math.maxInt(u16);
+/// The queue-count rail of the testing seam (`fuse_uring_create` sizes by
+/// possible CPUs; 512 is the largest box the reference planned for).
+pub const MAX_QUEUES: u32 = 512;
+/// Smallest page the plan admits (a sysconf lie below the 512 B sector
+/// floor would make `pages_for` explode).
+pub const MIN_PAGE: u32 = 512;
+/// The kernel's `max(4096, arg->max_write)`.
+pub const MIN_MAX_WRITE: u32 = 4096;
+
+comptime {
+    std.debug.assert(Q_DEPTH_FLOOR == 4);
+    std.debug.assert(PAYLOAD_BASE == 1 * MiB);
+    std.debug.assert(MAX_BACKGROUND_FLOOR <= MAX_BACKGROUND_CEILING);
+}
+
+/// Everything `plan` keys on; every field injected so a test states any box.
+pub const Inputs = struct {
+    /// Kernel possible CPUs (`derive.Facts.possible_cpus`): qid == CPU id is
+    /// what NUMA placement relies on; fewer queues never becomes ready.
+    kernel_nqueues: u32,
+    /// `SQUEEZEFS_TEST_FUSE_QUEUES` (testing only).
+    env_queues: ?u32 = null,
+    /// `SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH`: wins verbatim, bypasses the ladder.
+    env_depth: ?u32 = null,
+    /// The daemon's DESIRE (`desiredMaxWrite`).
+    desired_max_write: u32,
+    /// `/proc/sys/fs/fuse/max_pages_limit`; null = unreadable ⇒ the fallback.
+    max_pages_limit: ?u32,
+    page_size: u32,
+    /// The payload-arena cap in bytes (`sizing.resolveTransportBufferCap`).
+    buffer_cap: u64,
+    /// `-o max_background=` / `-o congestion_threshold=` (> 0 only).
+    max_background_override: ?u16 = null,
+    congestion_override: ?u16 = null,
+};
+
+pub const Plan = struct {
+    nqueues: u32,
+    depth: u32,
+    max_write: u32,
+    /// Describes `max_write` EXACTLY (`pages_for(max_write)`).
+    max_pages: u16,
+    /// The kernel's `ring->max_payload_sz` mirror.
+    payload_sz: u32,
+    max_background: u16,
+    congestion_threshold: u16,
+    /// The page and the limit the plan was made with (for the log line and
+    /// the kernel-mirror check).
+    page: u32,
+    max_pages_limit: u32,
+
+    pub fn payloadBuffers(self: Plan) u64 {
+        return @as(u64, self.nqueues) * self.depth;
+    }
+
+    /// `nqueues × depth × payload_sz`: the pinned arena.
+    pub fn totalPayloadBytes(self: Plan) u64 {
+        return self.payloadBuffers() * self.payload_sz;
+    }
+};
+
+/// `max(page_sz, 512)`.
+fn pageOf(page_sz: u32) u32 {
+    return @max(page_sz, MIN_PAGE);
+}
+
+/// `clamp(limit ?? 256, 1, 65535)`.
+pub fn pagesLimit(max_pages_limit: ?u32) u32 {
+    return @intCast(derive.clamp(max_pages_limit orelse MAX_PAGES_LIMIT_FALLBACK, 1, MAX_PAGES_LIMIT_CEILING));
+}
+
+/// `clamp(ceil(mw / page), 1, limit)`.
+pub fn pagesFor(max_write: u64, page: u32, limit: u32) u32 {
+    return @intCast(derive.clamp(derive.ceilDiv(max_write, page), 1, limit));
+}
+
+/// `max(8192, mw, pages_for(mw) × page)` — the kernel's `ring->max_payload_sz`.
+pub fn payloadFor(max_write: u64, page: u32, limit: u32) u64 {
+    return @max(@as(u64, abi.FUSE_MIN_READ_BUFFER), @max(max_write, @as(u64, pagesFor(max_write, page, limit)) * page));
+}
+
+/// What the kernel computes from an INIT reply `(max_write, max_pages)`
+/// under `limit` — the acceptance bound every planned geometry must equal.
+pub fn kernelRingMaxPayloadSz(limit: u32, max_write: u32, max_pages: u16, page: u32) u64 {
+    const fc_max_pages: u64 = @min(limit, @max(@as(u32, max_pages), 1));
+    const fc_max_write: u64 = @max(MIN_MAX_WRITE, max_write);
+    return @max(@as(u64, abi.FUSE_MIN_READ_BUFFER), @max(fc_max_write, fc_max_pages * page));
+}
+
+/// `clamp(cap / (nqueues × payload_for(mw)), 4, 32)`.
+fn depthAt(cap: u64, nqueues: u32, max_write: u64, page: u32, limit: u32) u32 {
+    const per_depth = @as(u64, nqueues) * payloadFor(max_write, page, limit);
+    return @intCast(derive.clamp(cap / per_depth, Q_DEPTH_FLOOR, Q_DEPTH_DESIRED));
+}
+
+/// THE plan (fuse_over_uring.rs `TransportGeometry::plan`, line for line).
+pub fn plan(in: Inputs) Plan {
+    const page = pageOf(in.page_size);
+    const limit = pagesLimit(in.max_pages_limit);
+    // The kernel clamps max_write to [4096, limit × page]; a desire outside
+    // that band is a desire the kernel would silently correct — plan the
+    // corrected value so every published gauge is what the kernel runs.
+    const target: u64 = derive.clamp(in.desired_max_write, @max(page, MIN_MAX_WRITE), @as(u64, limit) * page);
+    const nqueues: u32 = @intCast(derive.clamp(in.env_queues orelse in.kernel_nqueues, 1, MAX_QUEUES));
+    const cap = in.buffer_cap;
+
+    var max_write: u64 = target;
+    var depth: u32 = undefined;
+    if (in.env_depth) |d| {
+        // Explicit wins verbatim and bypasses BOTH ladder legs.
+        depth = @intCast(derive.clamp(d, 1, Q_DEPTH_DESIRED));
+    } else {
+        depth = depthAt(cap, nqueues, target, page, limit);
+        const floor_arena = @as(u64, nqueues) * Q_DEPTH_FLOOR * payloadFor(target, page, limit);
+        const base = @min(target, PAYLOAD_BASE);
+        // The payload leg engages only when depth sits AT the floor, the
+        // floor arena still overflows the cap, and there is room to shrink
+        // toward the 1 MiB base: degrade max_write page-aligned, never
+        // below the base, and re-derive the depth it affords.
+        if (!(depth > Q_DEPTH_FLOOR or floor_arena <= cap or target <= base)) {
+            const fit = cap / (@as(u64, nqueues) * Q_DEPTH_FLOOR);
+            max_write = derive.clamp(fit / page * page, base, target);
+            depth = depthAt(cap, nqueues, max_write, page, limit);
+        }
+    }
+
+    const max_pages = pagesFor(max_write, page, limit);
+    const payload_sz = payloadFor(max_write, page, limit);
+    const mb: u32 = if (in.max_background_override) |o| (if (o > 0) o else policyMaxBackground(nqueues, depth)) else policyMaxBackground(nqueues, depth);
+    const ct: u32 = if (in.congestion_override) |o| (if (o > 0) o else mb / 4 * 3) else mb / 4 * 3;
+    return .{
+        .nqueues = nqueues,
+        .depth = depth,
+        .max_write = @intCast(max_write),
+        .max_pages = @intCast(max_pages),
+        .payload_sz = @intCast(payload_sz),
+        .max_background = @intCast(mb),
+        .congestion_threshold = @intCast(ct),
+        .page = page,
+        .max_pages_limit = limit,
+    };
+}
+
+/// `clamp(nqueues × depth, 64, u16::MAX)`: each uring queue's background
+/// share (`max_background / nr_queues` under the sqz per-queue accounting)
+/// is then exactly its ent count.
+pub fn policyMaxBackground(nqueues: u32, depth: u32) u32 {
+    return @intCast(derive.clamp(@as(u64, nqueues) * depth, MAX_BACKGROUND_FLOOR, MAX_BACKGROUND_CEILING));
+}
+
+/// The INIT `max_write` DESIRE: `SQUEEZEFS_FUSE_MAX_WRITE` verbatim, else
+/// `max(block_size, 1 MiB)` clamped to `[4096, u32::MAX]` — still
+/// sysctl-gated by `plan`.
+pub fn desiredMaxWrite(block_size: u64, explicit: ?u32) u32 {
+    if (explicit) |e| return e;
+    return @intCast(derive.clamp(@max(block_size, PAYLOAD_BASE), MIN_MAX_WRITE, std.math.maxInt(u32)));
+}
+
+/// `/proc/sys/fs/fuse/max_pages_limit` text → value; null on junk (the
+/// caller then takes the fallback, exactly as for an absent sysctl).
+pub fn parseMaxPagesLimit(text: []const u8) ?u32 {
+    return std.fmt.parseInt(u32, std.mem.trim(u8, text, " \t\r\n"), 10) catch null;
+}
+
+pub const max_pages_limit_path = "/proc/sys/fs/fuse/max_pages_limit";
+
+/// The sysctl on this kernel; null off-Linux or when unreadable (startup
+/// control path: through the `Io` like every non-hot-path read).
+pub fn readMaxPagesLimit(io: std.Io) ?u32 {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [64]u8 = undefined;
+    const text = std.Io.Dir.cwd().readFile(io, max_pages_limit_path, &buf) catch return null;
+    return parseMaxPagesLimit(text);
+}
+
+// ---------------------------------------------------------------------------
+// Knob faces: the rows' ranges are enforced by the readers; the plan never
+// refuses.
+// ---------------------------------------------------------------------------
+
+/// `Inputs` from the machine facts, the environment, the volume's block size
+/// and the resolved memory budget (the cap through `sizing`).
+pub fn resolveInputs(facts: derive.Facts, env: *const std.process.Environ.Map, block_size: u64, mem_budget: u64, max_pages_limit: ?u32, max_background_override: ?u16, congestion_override: ?u16) Inputs {
+    return .{
+        .kernel_nqueues = facts.possible_cpus,
+        .env_queues = knobs.optIntKnob("SQUEEZEFS_TEST_FUSE_QUEUES", u32, env),
+        .env_depth = knobs.optIntKnob("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH", u32, env),
+        .desired_max_write = desiredMaxWrite(block_size, knobs.optIntKnob("SQUEEZEFS_FUSE_MAX_WRITE", u32, env)),
+        .max_pages_limit = max_pages_limit,
+        .page_size = facts.page_size,
+        .buffer_cap = sizing.transportBufferCapFromEnv(env, mem_budget),
+        .max_background_override = max_background_override,
+        .congestion_override = congestion_override,
+    };
+}
+
+/// `SQUEEZEFS_FUSE_DRAIN_GROUP`: an explicit width (never spans a node).
+pub fn drainGroupWidthOverride(env: *const std.process.Environ.Map) ?u32 {
+    return knobs.optIntKnob("SQUEEZEFS_FUSE_DRAIN_GROUP", u32, env);
+}
+
+// ---------------------------------------------------------------------------
+// Published gauges (LEVELS: zero until a session arms, stored once).
+// ---------------------------------------------------------------------------
+
+pub const Gauges = struct {
+    /// `transport_queues`
+    queues: counters.Gauge = .{},
+    /// `transport_q_depth`
+    q_depth: counters.Gauge = .{},
+    /// `transport_payload_buffer_bytes` = queues × depth × payload_sz
+    payload_buffer_bytes: counters.Gauge = .{},
+    /// `transport_payload_buffers` = queues × depth
+    payload_buffers: counters.Gauge = .{},
+    /// `transport_max_background`
+    max_background: counters.Gauge = .{},
+    /// `transport_max_write`
+    max_write: counters.Gauge = .{},
+    /// `transport_max_pages`
+    max_pages: counters.Gauge = .{},
+    /// `transport_max_readahead`: the kernel's, echoed verbatim and never
+    /// consulted (the prefetch window is independent of it).
+    max_readahead: counters.Gauge = .{},
+    /// `transport_drain_groups`
+    drain_groups: counters.Gauge = .{},
+    /// `transport_drain_group_width`: `groups == queues` ⇒ the lever is inert.
+    drain_group_width: counters.Gauge = .{},
+
+    pub fn publish(self: *Gauges, p: Plan, max_readahead: u32) void {
+        self.queues.set(p.nqueues);
+        self.q_depth.set(p.depth);
+        self.payload_buffer_bytes.set(p.totalPayloadBytes());
+        self.payload_buffers.set(p.payloadBuffers());
+        self.max_background.set(p.max_background);
+        self.max_write.set(p.max_write);
+        self.max_pages.set(p.max_pages);
+        self.max_readahead.set(max_readahead);
+    }
+
+    pub fn publishDrainGroups(self: *Gauges, groups: *const DrainGroups) void {
+        self.drain_groups.set(groups.count());
+        self.drain_group_width.set(groups.maxWidth());
+    }
+};
+
+/// The process-wide `transport_*` levels.
+pub var gauges: Gauges = .{};
+
+// ---------------------------------------------------------------------------
+// Drain groups (charter §4; fuse_uring_transport.md §3)
+// ---------------------------------------------------------------------------
+
+/// The buffer-mode lattice (charter §4): kmbuf/zc registration is per ring
+/// per queue, so those sessions keep width 1.
+pub const BufferMode = enum { user_ents, buf_ring, zero_copy };
+
+/// `max(n / 4, 1)`: the cpus/4 drain-parallelism slope. Measured 2026-08-05
+/// on a 32-possible single-node box: widths 1–8 at IOPS par on a ~340 k
+/// ceiling, width 8 halving drain cost (commit batch 1.48 → 2.98 SQEs per
+/// enter, eventfd wakes/op 0.687 → 0.340); whole-node width −15 % on the
+/// single-thread drain ceiling; one context per CPU anti-scaled (32×8 =
+/// 273 k vs 8×32 = 357 k IOPS).
+pub fn drainGroupWidth(n: u32) u32 {
+    return @max(n / 4, 1);
+}
+
+/// `BufRing | ZeroCopy ⇒ 1`; `UserEnts ⇒ the explicit knob`, else derived.
+pub fn forcedWidth(mode: BufferMode, explicit: ?u32) ?u32 {
+    return switch (mode) {
+        .buf_ring, .zero_copy => 1,
+        .user_ents => if (explicit) |w| @intCast(derive.clamp(w, 1, MAX_QUEUES)) else null,
+    };
+}
+
+/// `node_of(cpu)`: the NUMA node of a CPU, null for an unknown (offline or
+/// isolated possible CPU — sysfs cpulists carry only online CPUs).
+pub const Topology = struct {
+    ctx: ?*const anyopaque = null,
+    node_of: *const fn (ctx: ?*const anyopaque, cpu: u32) ?u32,
+
+    pub fn nodeOf(self: Topology, cpu: u32) ?u32 {
+        return self.node_of(self.ctx, cpu);
+    }
+};
+
+/// The plan: `qids` holds every qid exactly once, group `i` is
+/// `qids[bounds[i]..bounds[i + 1]]`, ascending within a group.
+pub const DrainGroups = struct {
+    qids: []u16,
+    bounds: []u32,
+
+    pub fn deinit(self: *DrainGroups, gpa: std.mem.Allocator) void {
+        gpa.free(self.qids);
+        gpa.free(self.bounds);
+        self.* = undefined;
+    }
+
+    pub fn count(self: *const DrainGroups) usize {
+        return self.bounds.len - 1;
+    }
+
+    pub fn group(self: *const DrainGroups, i: usize) []const u16 {
+        return self.qids[self.bounds[i]..self.bounds[i + 1]];
+    }
+
+    pub fn maxWidth(self: *const DrainGroups) usize {
+        var w: usize = 0;
+        for (0..self.count()) |i| w = @max(w, self.group(i).len);
+        return w;
+    }
+};
+
+/// Partition `0..nqueues` by NUMA node MEMBERSHIP (never contiguity: 2-socket
+/// boxes number CPUs round-robin, so a run-based plan silently produced 32
+/// singletons in the field), nodes in ascending id, each node set chunked at
+/// `forced ?? drainGroupWidth(set.len)`; qids with no node (and every qid
+/// when `qid_is_cpu` is false — a testing queue count is not a CPU id, so
+/// `node_of` is never consulted) form a RESIDUAL set chunked at the machine
+/// width `drainGroupWidth(nqueues)`. Startup only: allocates the plan.
+pub fn drainGroupPlan(gpa: std.mem.Allocator, nqueues: u32, qid_is_cpu: bool, topology: Topology, forced: ?u32) std.mem.Allocator.Error!DrainGroups {
+    std.debug.assert(nqueues >= 1 and nqueues <= MAX_QUEUES);
+    // Node id per qid; `unknown` for the residual set.
+    const unknown = std.math.maxInt(u32);
+    const node = try gpa.alloc(u32, nqueues);
+    defer gpa.free(node);
+    for (node, 0..) |*n, q| n.* = if (qid_is_cpu) (topology.nodeOf(@intCast(q)) orelse unknown) else unknown;
+
+    const qids = try gpa.alloc(u16, nqueues);
+    errdefer gpa.free(qids);
+    var bounds: std.ArrayList(u32) = .empty;
+    errdefer bounds.deinit(gpa);
+    try bounds.append(gpa, 0);
+    var filled: u32 = 0;
+
+    // Ascending node order: visit the smallest unvisited node id each pass.
+    var current: u32 = 0;
+    var passes: u32 = 0;
+    while (passes <= nqueues) : (passes += 1) {
+        var next: u32 = unknown;
+        for (node) |n| if (n >= current and n < next) {
+            next = n;
+        };
+        if (next == unknown) break;
+        const set_len = blk: {
+            var c: u32 = 0;
+            for (node) |n| if (n == next) {
+                c += 1;
+            };
+            break :blk c;
+        };
+        const width = forced orelse drainGroupWidth(set_len);
+        try chunkInto(gpa, node, next, width, qids, &filled, &bounds);
+        current = next + 1;
+    }
+    // The residual set at the machine span.
+    const residual_len = blk: {
+        var c: u32 = 0;
+        for (node) |n| if (n == unknown) {
+            c += 1;
+        };
+        break :blk c;
+    };
+    if (residual_len > 0) {
+        const width = forced orelse drainGroupWidth(nqueues);
+        try chunkInto(gpa, node, unknown, width, qids, &filled, &bounds);
+    }
+    std.debug.assert(filled == nqueues);
+    return .{ .qids = qids, .bounds = try bounds.toOwnedSlice(gpa) };
+}
+
+/// Append the qids whose node is `which`, ascending, in chunks of `width`.
+fn chunkInto(gpa: std.mem.Allocator, node: []const u32, which: u32, width: u32, qids: []u16, filled: *u32, bounds: *std.ArrayList(u32)) std.mem.Allocator.Error!void {
+    var in_chunk: u32 = 0;
+    for (node, 0..) |n, q| {
+        if (n != which) continue;
+        qids[filled.*] = @intCast(q);
+        filled.* += 1;
+        in_chunk += 1;
+        if (in_chunk == width) {
+            try bounds.append(gpa, filled.*);
+            in_chunk = 0;
+        }
+    }
+    if (in_chunk != 0) try bounds.append(gpa, filled.*);
+}
+
+/// Per-group SQ entries: `max(next_pow2(width × depth + 8), 16)` — every
+/// member's REGISTERs plus the wake PollAdd and a commit batch in flight; the
+/// CQ is sized `sq × 2` by the ring binding (worst pass `2 × depth + 1`).
+pub fn sqEntries(width: u32, depth: u32) u32 {
+    return @intCast(@max(derive.nextPow2(@as(u64, width) * depth + 8), 16));
+}
+
+// ---------------------------------------------------------------------------
+// Tie tests (fuse_abi_session.md §3; fuse_uring_transport.md §1.7, §3, §12).
+// Every planned geometry satisfies `payload_sz == kernelRingMaxPayloadSz`.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn in32(desired: u32, limit: u32, cap: u64) Inputs {
+    return .{ .kernel_nqueues = 32, .desired_max_write = desired, .max_pages_limit = limit, .page_size = 4096, .buffer_cap = cap };
+}
+
+fn expectMirror(p: Plan) !void {
+    try testing.expectEqual(@as(u64, p.payload_sz), kernelRingMaxPayloadSz(p.max_pages_limit, p.max_write, p.max_pages, p.page));
+    try testing.expectEqual(pagesFor(p.max_write, p.page, p.max_pages_limit), @as(u32, p.max_pages));
+    try testing.expect(p.depth >= 1 and p.depth <= Q_DEPTH_DESIRED);
+}
+
+test "default shape is byte-identical: (32q, 1 MiB, limit 256, cap 2 GiB) → depth 32, payload 1 MiB, max_pages 256, mb 1024, ct 768, arena 1 GiB" {
+    const p = plan(in32(1 * MiB, 256, 2 * GiB));
+    try testing.expectEqual(@as(u32, 32), p.nqueues);
+    try testing.expectEqual(Q_DEPTH_DESIRED, p.depth);
+    try testing.expectEqual(@as(u32, 1 * MiB), p.max_write);
+    try testing.expectEqual(@as(u32, 1 * MiB), p.payload_sz);
+    try testing.expectEqual(@as(u16, 256), p.max_pages);
+    try testing.expectEqual(@as(u16, 1024), p.max_background);
+    try testing.expectEqual(@as(u16, 768), p.congestion_threshold);
+    try testing.expectEqual(1 * GiB, p.totalPayloadBytes());
+    try testing.expectEqual(@as(u64, 1024), p.payloadBuffers());
+    try expectMirror(p);
+    // The formula restated: depth = clamp(cap / (q × payload), 4, 32); mb = clamp(q × d, 64, 65535).
+    try testing.expectEqual(derive.clamp(2 * GiB / (32 * MiB), 4, 32), @as(u64, p.depth));
+    try testing.expectEqual(derive.clamp(32 * 32, 64, 65535), @as(u64, p.max_background));
+    try testing.expectEqual(@as(u64, p.max_background) / 4 * 3, @as(u64, p.congestion_threshold));
+}
+
+test "raised sysctl: limit ∈ {512, 1024, 4096, 65535} with a 1 MiB desire keeps payload 1 MiB and max_pages 256 (the REGISTER bound holds)" {
+    for ([_]u32{ 512, 1024, 4096, 65535 }) |limit| {
+        const p = plan(in32(1 * MiB, limit, 2 * GiB));
+        try testing.expectEqual(@as(u32, 1 * MiB), p.payload_sz);
+        try testing.expectEqual(@as(u16, 256), p.max_pages);
+        try testing.expectEqual(@as(u32, 1 * MiB), p.max_write);
+        try expectMirror(p);
+    }
+}
+
+test "4 MiB max_write is sysctl-gated: (4 MiB, limit 1024, 2 GiB) → mw 4 MiB, pages 1024, depth 16, mb 512, arena 2 GiB; (4 MiB, limit 256) → mw 1 MiB" {
+    const p = plan(in32(4 * MiB, 1024, 2 * GiB));
+    try testing.expectEqual(@as(u32, 4 * MiB), p.max_write);
+    try testing.expectEqual(@as(u16, 1024), p.max_pages);
+    try testing.expectEqual(@as(u32, 16), p.depth);
+    try testing.expectEqual(@as(u16, 512), p.max_background);
+    try testing.expectEqual(2 * GiB, p.totalPayloadBytes());
+    try expectMirror(p);
+    const q = plan(in32(4 * MiB, 256, 2 * GiB));
+    try testing.expectEqual(@as(u32, 1 * MiB), q.max_write);
+    try testing.expectEqual(@as(u16, 256), q.max_pages);
+    try expectMirror(q);
+}
+
+test "a small sysctl stops the inflation: (1 MiB, limit 64) → mw 256 KiB, pages 64" {
+    const p = plan(in32(1 * MiB, 64, 2 * GiB));
+    try testing.expectEqual(@as(u32, 64 * 4096), p.max_write);
+    try testing.expectEqual(@as(u16, 64), p.max_pages);
+    try testing.expectEqual(@as(u32, 64 * 4096), p.payload_sz);
+    try expectMirror(p);
+}
+
+test "budget ladder degrades payload before violating the depth floor: 819 MiB → depth 6 @ 4 MiB; 256 MiB → depth 4 @ 2 MiB/512 pages; 64 MiB and cap 0 → depth 4 @ 1 MiB" {
+    const a = plan(in32(4 * MiB, 1024, 819 * MiB));
+    try testing.expectEqual(@as(u32, 6), a.depth);
+    try testing.expectEqual(@as(u32, 4 * MiB), a.max_write);
+    try expectMirror(a);
+    const b = plan(in32(4 * MiB, 1024, 256 * MiB));
+    try testing.expectEqual(Q_DEPTH_FLOOR, b.depth);
+    try testing.expectEqual(@as(u32, 2 * MiB), b.max_write);
+    try testing.expectEqual(@as(u16, 512), b.max_pages);
+    try testing.expect(b.totalPayloadBytes() <= 256 * MiB);
+    try expectMirror(b);
+    const c = plan(in32(4 * MiB, 1024, 64 * MiB));
+    try testing.expectEqual(Q_DEPTH_FLOOR, c.depth);
+    try testing.expectEqual(@as(u32, 1 * MiB), c.max_write);
+    try expectMirror(c);
+    const d = plan(in32(4 * MiB, 1024, 0));
+    try testing.expectEqual(Q_DEPTH_FLOOR, d.depth);
+    try testing.expectEqual(@as(u32, 1 * MiB), d.max_write);
+    try expectMirror(d);
+    // Never below the 1 MiB base: the floor arena at cap 0 is the shipped posture.
+    try testing.expectEqual(32 * 4 * 1 * MiB, d.totalPayloadBytes());
+}
+
+test "a 4096 max_write does not inflate to 256 pages: (8q, 4096, limit 256, 32 MiB) → mw 4096, pages 1, payload 8192, depth 32" {
+    const p = plan(.{ .kernel_nqueues = 8, .desired_max_write = 4096, .max_pages_limit = 256, .page_size = 4096, .buffer_cap = 32 * MiB });
+    try testing.expectEqual(@as(u32, 4096), p.max_write);
+    try testing.expectEqual(@as(u16, 1), p.max_pages);
+    try testing.expectEqual(abi.FUSE_MIN_READ_BUFFER, p.payload_sz);
+    try testing.expectEqual(Q_DEPTH_DESIRED, p.depth);
+    try expectMirror(p);
+}
+
+test "an explicit depth bypasses the payload ladder: env depth 8 with cap 64 MiB → depth 8, mw 4 MiB; env 64 → 32; env 0 → 1" {
+    var in = in32(4 * MiB, 1024, 64 * MiB);
+    in.env_depth = 8;
+    const p = plan(in);
+    try testing.expectEqual(@as(u32, 8), p.depth);
+    try testing.expectEqual(@as(u32, 4 * MiB), p.max_write);
+    try expectMirror(p);
+    in.env_depth = 64;
+    try testing.expectEqual(Q_DEPTH_DESIRED, plan(in).depth);
+    in.env_depth = 0;
+    try testing.expectEqual(@as(u32, 1), plan(in).depth);
+    // The row refuses both at the gate; the plan is total regardless.
+    try testing.expectEqual(@as(i128, 1), knobs.row("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH").kind.int.lo);
+    try testing.expectEqual(@as(i128, 32), knobs.row("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH").kind.int.hi);
+}
+
+test "the budget sweep of the measured class: 819 MiB → depth 25, mb 800; 128 MiB → depth 4, mb 128, ct 96; (4q, 179 MiB) → depth 32, mb 128; (256q, 2 GiB) → depth 8, mb 2048; (256q, 9.5 GiB) → depth 32, arena 8 GiB; (1q, depth 4) → mb 64, ct 48" {
+    const a = plan(in32(1 * MiB, 256, 819 * MiB));
+    try testing.expectEqual(@as(u32, 25), a.depth);
+    try testing.expectEqual(@as(u16, 800), a.max_background);
+    const b = plan(in32(1 * MiB, 256, 128 * MiB));
+    try testing.expectEqual(@as(u32, 4), b.depth);
+    try testing.expectEqual(@as(u16, 128), b.max_background);
+    try testing.expectEqual(@as(u16, 96), b.congestion_threshold);
+    const c = plan(.{ .kernel_nqueues = 4, .desired_max_write = 1 * MiB, .max_pages_limit = 256, .page_size = 4096, .buffer_cap = 179 * MiB });
+    try testing.expectEqual(@as(u32, 32), c.depth);
+    try testing.expectEqual(@as(u16, 128), c.max_background);
+    const d = plan(.{ .kernel_nqueues = 256, .desired_max_write = 1 * MiB, .max_pages_limit = 256, .page_size = 4096, .buffer_cap = 2 * GiB });
+    try testing.expectEqual(@as(u32, 8), d.depth);
+    try testing.expectEqual(@as(u16, 2048), d.max_background);
+    const e = plan(.{ .kernel_nqueues = 256, .desired_max_write = 1 * MiB, .max_pages_limit = 256, .page_size = 4096, .buffer_cap = 9 * GiB + 512 * MiB });
+    try testing.expectEqual(@as(u32, 32), e.depth);
+    try testing.expectEqual(8 * GiB, e.totalPayloadBytes());
+    const f = plan(.{ .kernel_nqueues = 1, .desired_max_write = 1 * MiB, .max_pages_limit = 256, .page_size = 4096, .buffer_cap = 0 });
+    try testing.expectEqual(@as(u32, 4), f.depth);
+    try testing.expectEqual(@as(u16, 64), f.max_background);
+    try testing.expectEqual(@as(u16, 48), f.congestion_threshold);
+    for ([_]Plan{ a, b, c, d, e, f }) |p| try expectMirror(p);
+}
+
+test "max_background is bounded by the u16 wire field, never a fixed 256: (512q × 32) → 16384; (65535/32 + 1 queues…) saturates at 65535 only through the clamp" {
+    const p = plan(.{ .kernel_nqueues = 512, .desired_max_write = 1 * MiB, .max_pages_limit = 256, .page_size = 4096, .buffer_cap = 1 << 40 });
+    try testing.expectEqual(@as(u16, 16384), p.max_background);
+    try testing.expectEqual(@as(u32, 65535), policyMaxBackground(4096, 32));
+    try testing.expectEqual(@as(u32, 64), policyMaxBackground(1, 1));
+    try testing.expectEqual(MAX_BACKGROUND_CEILING, @as(u32, std.math.maxInt(u16)));
+}
+
+test "queue count: env wins (clamped 1..=512 — the row refuses outside), else the kernel's possible CPUs; 4096 → 512, 0 → 1" {
+    var in = in32(1 * MiB, 256, 2 * GiB);
+    try testing.expectEqual(@as(u32, 32), plan(in).nqueues);
+    in.env_queues = 4096;
+    try testing.expectEqual(@as(u32, 512), plan(in).nqueues);
+    in.env_queues = 0;
+    try testing.expectEqual(@as(u32, 1), plan(in).nqueues);
+    in.env_queues = 8;
+    try testing.expectEqual(@as(u32, 8), plan(in).nqueues);
+    try testing.expectEqual(@as(i128, 512), knobs.row("SQUEEZEFS_TEST_FUSE_QUEUES").kind.int.hi);
+}
+
+test "mount-option overrides: mb/ct 96/80 verbatim; mb 100 alone → ct 75; 0/0 → policy" {
+    var in = in32(1 * MiB, 256, 2 * GiB);
+    in.max_background_override = 96;
+    in.congestion_override = 80;
+    var p = plan(in);
+    try testing.expectEqual(@as(u16, 96), p.max_background);
+    try testing.expectEqual(@as(u16, 80), p.congestion_threshold);
+    in.congestion_override = null;
+    in.max_background_override = 100;
+    p = plan(in);
+    try testing.expectEqual(@as(u16, 100), p.max_background);
+    try testing.expectEqual(@as(u16, 75), p.congestion_threshold);
+    in.max_background_override = 0;
+    in.congestion_override = 0;
+    p = plan(in);
+    try testing.expectEqual(@as(u16, 1024), p.max_background);
+    try testing.expectEqual(@as(u16, 768), p.congestion_threshold);
+}
+
+test "page and sysctl inputs: a sub-512 page is floored, the sysctl fallback is 256 and clamps to [1, 65535]; the text parser is total" {
+    try testing.expectEqual(@as(u32, 256), pagesLimit(null));
+    try testing.expectEqual(@as(u32, 1), pagesLimit(0));
+    try testing.expectEqual(@as(u32, 65535), pagesLimit(1 << 20));
+    try testing.expectEqual(@as(u32, 1024), pagesLimit(1024));
+    try testing.expectEqual(@as(?u32, 256), parseMaxPagesLimit("256\n"));
+    try testing.expectEqual(@as(?u32, 65535), parseMaxPagesLimit(" 65535 "));
+    try testing.expectEqual(@as(?u32, null), parseMaxPagesLimit(""));
+    try testing.expectEqual(@as(?u32, null), parseMaxPagesLimit("lots"));
+    try testing.expectEqual(@as(?u32, null), parseMaxPagesLimit("-1"));
+    const p = plan(.{ .kernel_nqueues = 8, .desired_max_write = 1 * MiB, .max_pages_limit = null, .page_size = 64, .buffer_cap = 1 * GiB });
+    try testing.expectEqual(MIN_PAGE, p.page);
+    try testing.expectEqual(@as(u32, 256), p.max_pages_limit);
+    // With a 512 B page the 256-page limit caps max_write at 128 KiB.
+    try testing.expectEqual(@as(u32, 256 * 512), p.max_write);
+    try expectMirror(p);
+    // The kernel mirror stated directly.
+    try testing.expectEqual(@as(u64, 1 * MiB), kernelRingMaxPayloadSz(256, 1 * MiB, 256, 4096));
+    try testing.expectEqual(@as(u64, 8192), kernelRingMaxPayloadSz(256, 4096, 1, 4096));
+    try testing.expectEqual(@as(u64, 1 * MiB), kernelRingMaxPayloadSz(256, 4096, 65535, 4096));
+}
+
+test "desired max_write: explicit verbatim, else max(block, 1 MiB) in [4096, u32::MAX] (a 64 KiB block keeps the 1 MiB floor; a 4 MiB block asks 4 MiB)" {
+    try testing.expectEqual(@as(u32, 1 * MiB), desiredMaxWrite(64 * 1024, null));
+    try testing.expectEqual(@as(u32, 4 * MiB), desiredMaxWrite(4 * MiB, null));
+    try testing.expectEqual(@as(u32, 2 * MiB), desiredMaxWrite(4 * MiB, 2 * MiB));
+    try testing.expectEqual(@as(u32, 4096), desiredMaxWrite(0, 4096));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), desiredMaxWrite(1 << 40, null));
+    try testing.expectEqual(@as(i128, 4096), knobs.row("SQUEEZEFS_FUSE_MAX_WRITE").kind.int.lo);
+}
+
+test "the venue's shape (9 possible CPUs, 16 GiB RAM, limit 256): budget 70 % RAM, cap budget/8, depth 32, mb 288, ct 216, payload 1 MiB, arena 288 MiB; the 8-CPU form mb 256/ct 192" {
+    const ram: u64 = 16_491_296 * 1024;
+    const budget = derive.tenths(ram, 7);
+    const cap = sizing.transportBufferCap(budget);
+    const p = plan(.{ .kernel_nqueues = 9, .desired_max_write = desiredMaxWrite(64 * 1024, null), .max_pages_limit = 256, .page_size = 4096, .buffer_cap = cap });
+    try testing.expectEqual(@as(u32, 9), p.nqueues);
+    try testing.expectEqual(Q_DEPTH_DESIRED, p.depth);
+    try testing.expectEqual(@as(u32, 1 * MiB), p.max_write);
+    try testing.expectEqual(@as(u16, 256), p.max_pages);
+    try testing.expectEqual(@as(u32, 1 * MiB), p.payload_sz);
+    try testing.expectEqual(@as(u16, 288), p.max_background);
+    try testing.expectEqual(@as(u16, 216), p.congestion_threshold);
+    try testing.expectEqual(288 * MiB, p.totalPayloadBytes());
+    try expectMirror(p);
+    const q = plan(.{ .kernel_nqueues = 8, .desired_max_write = 1 * MiB, .max_pages_limit = 256, .page_size = 4096, .buffer_cap = sizing.transportBufferCap(derive.tenths(16 * GiB, 7)) });
+    try testing.expectEqual(@as(u16, 256), q.max_background);
+    try testing.expectEqual(@as(u16, 192), q.congestion_threshold);
+    try testing.expectEqual(256 * MiB, q.totalPayloadBytes());
+}
+
+test "knob faces: Inputs read the rows through the registry; absent derives; the cap follows SQUEEZEFS_TRANSPORT_MEM_MAX/PCT" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const facts = derive.Facts.synthetic(32, 64 * GiB);
+    var in = resolveInputs(facts, &env, 64 * 1024, 8 * GiB, 256, null, null);
+    try testing.expectEqual(@as(u32, 32), in.kernel_nqueues);
+    try testing.expectEqual(@as(?u32, null), in.env_queues);
+    try testing.expectEqual(@as(?u32, null), in.env_depth);
+    try testing.expectEqual(@as(u32, 1 * MiB), in.desired_max_write);
+    try testing.expectEqual(1 * GiB, in.buffer_cap);
+    try testing.expectEqual(@as(?u32, null), drainGroupWidthOverride(&env));
+    try env.put("SQUEEZEFS_TEST_FUSE_QUEUES", "4");
+    try env.put("SQUEEZEFS_FUSE_OVER_IO_URING_Q_DEPTH", "8");
+    try env.put("SQUEEZEFS_FUSE_MAX_WRITE", "2097152");
+    try env.put("SQUEEZEFS_TRANSPORT_MEM_PCT", "50");
+    try env.put("SQUEEZEFS_FUSE_DRAIN_GROUP", "3");
+    in = resolveInputs(facts, &env, 64 * 1024, 8 * GiB, 1024, 96, 80);
+    try testing.expectEqual(@as(?u32, 4), in.env_queues);
+    try testing.expectEqual(@as(?u32, 8), in.env_depth);
+    try testing.expectEqual(@as(u32, 2 * MiB), in.desired_max_write);
+    try testing.expectEqual(4 * GiB, in.buffer_cap);
+    try testing.expectEqual(@as(?u16, 96), in.max_background_override);
+    try testing.expectEqual(@as(?u32, 3), drainGroupWidthOverride(&env));
+    const p = plan(in);
+    try testing.expectEqual(@as(u32, 4), p.nqueues);
+    try testing.expectEqual(@as(u32, 8), p.depth);
+    try testing.expectEqual(@as(u32, 2 * MiB), p.max_write);
+    try testing.expectEqual(@as(u16, 96), p.max_background);
+}
+
+test "gauges publish the armed plan as levels (zero before) and the drain-group shape" {
+    var g: Gauges = .{};
+    try testing.expectEqual(@as(u64, 0), g.queues.load());
+    const p = plan(in32(1 * MiB, 256, 2 * GiB));
+    g.publish(p, 131072);
+    try testing.expectEqual(@as(u64, 32), g.queues.load());
+    try testing.expectEqual(@as(u64, 32), g.q_depth.load());
+    try testing.expectEqual(1 * GiB, g.payload_buffer_bytes.load());
+    try testing.expectEqual(@as(u64, 1024), g.payload_buffers.load());
+    try testing.expectEqual(@as(u64, 1024), g.max_background.load());
+    try testing.expectEqual(@as(u64, 1 * MiB), g.max_write.load());
+    try testing.expectEqual(@as(u64, 256), g.max_pages.load());
+    try testing.expectEqual(@as(u64, 131072), g.max_readahead.load());
+    var groups = try drainGroupPlan(testing.allocator, 32, true, one_node, null);
+    defer groups.deinit(testing.allocator);
+    g.publishDrainGroups(&groups);
+    try testing.expectEqual(@as(u64, 4), g.drain_groups.load());
+    try testing.expectEqual(@as(u64, 8), g.drain_group_width.load());
+}
+
+// ---- drain groups ----
+
+fn nodeInterleaved(_: ?*const anyopaque, cpu: u32) ?u32 {
+    return cpu % 2;
+}
+fn nodeBy16(_: ?*const anyopaque, cpu: u32) ?u32 {
+    return cpu / 16;
+}
+fn nodeZero(_: ?*const anyopaque, _: u32) ?u32 {
+    return 0;
+}
+fn nodeOfFour(_: ?*const anyopaque, cpu: u32) ?u32 {
+    return cpu / 4;
+}
+const holes = [_]u32{ 4, 6, 14, 16, 22, 24, 30 };
+fn nodeWithHoles(_: ?*const anyopaque, cpu: u32) ?u32 {
+    for (holes) |h| if (h == cpu) return null;
+    return 0;
+}
+fn nodeNever(_: ?*const anyopaque, _: u32) ?u32 {
+    @panic("node_of consulted with qid_is_cpu = false");
+}
+const one_node: Topology = .{ .node_of = nodeZero };
+
+fn expectCoverage(g: *const DrainGroups, nqueues: u32) !void {
+    var seen = try testing.allocator.alloc(bool, nqueues);
+    defer testing.allocator.free(seen);
+    @memset(seen, false);
+    var leads_with_zero: usize = 0;
+    for (0..g.count()) |i| {
+        const grp = g.group(i);
+        try testing.expect(grp.len >= 1);
+        if (grp[0] == 0) leads_with_zero += 1;
+        for (grp, 0..) |q, k| {
+            try testing.expect(!seen[q]);
+            seen[q] = true;
+            if (k > 0) try testing.expect(grp[k - 1] < q);
+        }
+    }
+    for (seen) |s| try testing.expect(s);
+    // Exactly one group leads with qid 0 (the SQPOLL leader election keys on it).
+    try testing.expectEqual(@as(usize, 1), leads_with_zero);
+}
+
+test "drain groups: membership not contiguity — interleaved node = cpu % 2 on 32q ⇒ 8 groups of 4, plan[0] = [0,2,4,6]" {
+    var g = try drainGroupPlan(testing.allocator, 32, true, .{ .node_of = nodeInterleaved }, null);
+    defer g.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 8), g.count());
+    try testing.expectEqualSlices(u16, &.{ 0, 2, 4, 6 }, g.group(0));
+    try testing.expectEqualSlices(u16, &.{ 24, 26, 28, 30 }, g.group(3));
+    try testing.expectEqualSlices(u16, &.{ 1, 3, 5, 7 }, g.group(4));
+    try expectCoverage(&g, 32);
+}
+
+test "drain groups: node = cpu / 16 ⇒ 8 contiguous groups of 4; one node 64q ⇒ 4 of 16; 32q ⇒ 4 of 8; 4q ⇒ 4 singletons" {
+    var a = try drainGroupPlan(testing.allocator, 32, true, .{ .node_of = nodeBy16 }, null);
+    defer a.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 8), a.count());
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3 }, a.group(0));
+    try testing.expectEqualSlices(u16, &.{ 16, 17, 18, 19 }, a.group(4));
+    try expectCoverage(&a, 32);
+    var b = try drainGroupPlan(testing.allocator, 64, true, one_node, null);
+    defer b.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), b.count());
+    try testing.expectEqual(@as(usize, 16), b.group(0).len);
+    try expectCoverage(&b, 64);
+    var c = try drainGroupPlan(testing.allocator, 32, true, one_node, null);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), c.count());
+    try testing.expectEqual(@as(usize, 8), c.maxWidth());
+    try expectCoverage(&c, 32);
+    var d = try drainGroupPlan(testing.allocator, 4, true, one_node, null);
+    defer d.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), d.count());
+    try testing.expectEqual(@as(usize, 1), d.maxWidth());
+    try expectCoverage(&d, 4);
+}
+
+test "drain groups: kmbuf/zc force width 1 (singletons); an explicit width 3 on nodes of 4 ⇒ [[0,1,2],[3],[4,5,6],[7]] — never spanning a node" {
+    try testing.expectEqual(@as(?u32, 1), forcedWidth(.buf_ring, null));
+    try testing.expectEqual(@as(?u32, 1), forcedWidth(.zero_copy, 7));
+    try testing.expectEqual(@as(?u32, null), forcedWidth(.user_ents, null));
+    try testing.expectEqual(@as(?u32, 3), forcedWidth(.user_ents, 3));
+    try testing.expectEqual(@as(?u32, 512), forcedWidth(.user_ents, 4096));
+    var a = try drainGroupPlan(testing.allocator, 32, true, one_node, forcedWidth(.buf_ring, null));
+    defer a.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 32), a.count());
+    try testing.expectEqual(@as(usize, 1), a.maxWidth());
+    var b = try drainGroupPlan(testing.allocator, 8, true, .{ .node_of = nodeOfFour }, 3);
+    defer b.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), b.count());
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, b.group(0));
+    try testing.expectEqualSlices(u16, &.{3}, b.group(1));
+    try testing.expectEqualSlices(u16, &.{ 4, 5, 6 }, b.group(2));
+    try testing.expectEqualSlices(u16, &.{7}, b.group(3));
+    try expectCoverage(&b, 8);
+}
+
+test "drain groups: qid_is_cpu = false never consults node_of — 5q ⇒ singletons, 32q ⇒ 4 of 8 at the machine width" {
+    var a = try drainGroupPlan(testing.allocator, 5, false, .{ .node_of = nodeNever }, null);
+    defer a.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 5), a.count());
+    try expectCoverage(&a, 5);
+    var b = try drainGroupPlan(testing.allocator, 32, false, .{ .node_of = nodeNever }, null);
+    defer b.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), b.count());
+    try testing.expectEqual(@as(usize, 8), b.maxWidth());
+    try expectCoverage(&b, 32);
+}
+
+test "drain groups: holes {4,6,14,16,22,24,30} on one node ⇒ 5 node chunks (6,6,6,6,1) + ONE residual group of the holes" {
+    var g = try drainGroupPlan(testing.allocator, 32, true, .{ .node_of = nodeWithHoles }, null);
+    defer g.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 6), g.count());
+    try testing.expectEqual(@as(usize, 6), g.group(0).len);
+    try testing.expectEqual(@as(usize, 6), g.group(3).len);
+    try testing.expectEqual(@as(usize, 1), g.group(4).len);
+    try testing.expectEqualSlices(u16, &.{ 4, 6, 14, 16, 22, 24, 30 }, g.group(5));
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 5, 7 }, g.group(0));
+    try expectCoverage(&g, 32);
+}
+
+test "drain width = max(n/4, 1); sq entries = max(next_pow2(width × depth + 8), 16)" {
+    try testing.expectEqual(@as(u32, 8), drainGroupWidth(32));
+    try testing.expectEqual(@as(u32, 1), drainGroupWidth(3));
+    try testing.expectEqual(@as(u32, 1), drainGroupWidth(0));
+    try testing.expectEqual(@as(u32, 128), drainGroupWidth(512));
+    try testing.expectEqual(@as(u32, 512), sqEntries(8, 32));
+    try testing.expectEqual(@as(u32, 64), sqEntries(1, 32));
+    try testing.expectEqual(@as(u32, 16), sqEntries(1, 4));
+    try testing.expectEqual(@as(u32, 16), sqEntries(1, 8));
+    try testing.expectEqual(@as(u32, 32), sqEntries(1, 9));
+    try testing.expectEqual(@as(u32, 16), sqEntries(1, 1));
+    // 128 × 32 + 8 = 4104 → the next power of two above it.
+    try testing.expectEqual(@as(u32, 8192), sqEntries(128, 32));
+    try testing.expectEqual(@as(u32, 4096), sqEntries(127, 32));
+}
+
+test "the plan is total over a sweep of shapes and every result satisfies the kernel mirror" {
+    var prng = std.Random.DefaultPrng.init(0x6E0);
+    const r = prng.random();
+    for (0..5000) |_| {
+        const in: Inputs = .{
+            .kernel_nqueues = r.intRangeAtMost(u32, 0, 1024),
+            .env_queues = if (r.boolean()) r.intRangeAtMost(u32, 0, 1024) else null,
+            .env_depth = if (r.boolean()) r.intRangeAtMost(u32, 0, 64) else null,
+            .desired_max_write = r.intRangeAtMost(u32, 0, std.math.maxInt(u32)),
+            .max_pages_limit = if (r.boolean()) r.intRangeAtMost(u32, 0, 1 << 20) else null,
+            .page_size = @as(u32, 1) << r.intRangeAtMost(u5, 0, 16),
+            .buffer_cap = r.intRangeAtMost(u64, 0, 1 << 44),
+            .max_background_override = if (r.boolean()) r.int(u16) else null,
+            .congestion_override = if (r.boolean()) r.int(u16) else null,
+        };
+        const p = plan(in);
+        try expectMirror(p);
+        try testing.expect(p.nqueues >= 1 and p.nqueues <= MAX_QUEUES);
+        try testing.expect(p.max_write >= MIN_MAX_WRITE);
+        try testing.expect(p.payload_sz >= abi.FUSE_MIN_READ_BUFFER);
+        try testing.expect(p.payload_sz >= p.max_write);
+        if (in.env_depth == null) try testing.expect(p.depth >= Q_DEPTH_FLOOR);
+        if ((in.max_background_override orelse 0) == 0) try testing.expect(p.max_background >= MAX_BACKGROUND_FLOOR);
+        if ((in.congestion_override orelse 0) == 0) try testing.expectEqual(@as(u16, p.max_background / 4 * 3), p.congestion_threshold);
+    }
+}

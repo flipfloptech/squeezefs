@@ -393,6 +393,14 @@ LEVELS (zero until a session arms), stored once by `try_start`. Zig: `counters.G
   `from_op = min(body_need − payload.len(), op_in.len())`, `from_payload = …` copied in order (:933–947);
   **if `filled == 0`, a heuristic fallback copies payload first then a NUL-terminated prefix of `op_in`**
   (:948–968). QUIRK Q4 (§15).
+- Settled detail (dev_uring.c `fuse_uring_args_to_ring` + `fuse_set_zero_arg0`, confirmed against the
+  reference's "LOOKUP often has name only in payload" comment, uring_conn.rs:949): `op_in` receives
+  `in_args[0]` ONLY; for the opcodes whose arg0 is the kernel's zero-size placeholder — LOOKUP, SYMLINK,
+  UNLINK, RMDIR, REMOVEXATTR, NOTIFY_REPLY (`fuse_retrieve`) — `op_in` is EMPTY (stale bytes from earlier
+  deliveries) and every argument, including NOTIFY_REPLY's `fuse_notify_retrieve_in`, leads the payload.
+  Classically a zero-size arg contributes nothing, so the logical body `in_args[0] ‖ in_args[1..]` is
+  identical on both venues: the port's per-opcode table carries `in_args[0].size` (0 for those six) and ONE
+  parser serves both (`codec.Delivery`, decision 0002 row 54).
 - **Body bounds** (`validated_body`, session.rs:5846–5863; pinned :6861–6940): `declared = len − 40`
   (underflow ⇒ `ShortHeader`); `available = filled + payload_len`; `declared > available` ⇒ `Overdeclared`;
   else `Valid(min(declared, filled, buf_len))`. Refusal ⇒ reply `-EINVAL`, never present the slice

@@ -102,9 +102,9 @@ pub fn wake(io: Io, word: *std.atomic.Value(u32)) void {
 }
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
-test "a token stored before the park returns at once as .woken" {
-    const io = testing.io;
+fn tokenBeforePark(io: Io) !void {
     var word: std.atomic.Value(u32) = .init(0);
     var c: counters.ShardedCounter = .{};
     wake(io, &word);
@@ -112,30 +112,39 @@ test "a token stored before the park returns at once as .woken" {
     try testing.expectEqual(@as(u64, 0), c.load());
 }
 
-test "a wake from another thread ends the park as .woken without a tick" {
-    const io = testing.io;
+test "a token stored before the park returns at once as .woken" {
+    try sync_testing.underBoth(tokenBeforePark);
+}
+
+fn foreignWake(io: Io) !void {
     var word: std.atomic.Value(u32) = .init(0);
     var c: counters.ShardedCounter = .{};
     const Waker = struct {
-        fn run(w: *std.atomic.Value(u32)) void {
-            wake(testing.io, w);
+        fn run(io_: Io, w: *std.atomic.Value(u32)) void {
+            wake(io_, w);
         }
     };
-    const t = try std.Thread.spawn(.{}, Waker.run, .{&word});
+    const t = try std.Thread.spawn(.{}, Waker.run, .{ io, &word });
     try testing.expectEqual(Outcome.woken, try park(io, &word, &c));
     t.join();
     try testing.expectEqual(@as(u64, 0), c.load());
 }
 
-test "the uncancelable park under blocked protection returns .woken on a token" {
-    const io = testing.io;
+test "a wake from another thread ends the park as .woken without a tick" {
+    try sync_testing.underBoth(foreignWake);
+}
+
+fn uncancelableToken(io: Io) !void {
     var word: std.atomic.Value(u32) = .init(1);
     var c: counters.ShardedCounter = .{};
     try testing.expectEqual(Outcome.woken, parkUncancelable(io, &word, &c));
 }
 
-test "parkUntil: a passed deadline returns .deadline without counting a tick; a token still wins; a far deadline leaves the tick as the backstop" {
-    const io = testing.io;
+test "the uncancelable park under blocked protection returns .woken on a token" {
+    try sync_testing.underBoth(uncancelableToken);
+}
+
+fn parkUntilBody(io: Io) !void {
     var word: std.atomic.Value(u32) = .init(0);
     var c: counters.ShardedCounter = .{};
     try testing.expectEqual(Outcome.deadline, parkUntilUncancelable(io, &word, clock.monotonicNs() -| 1, &c));
@@ -148,12 +157,41 @@ test "parkUntil: a passed deadline returns .deadline without counting a tick; a 
     // .woken exactly like `park`.
     word.store(0, .monotonic);
     const Waker = struct {
-        fn run(w: *std.atomic.Value(u32)) void {
-            wake(testing.io, w);
+        fn run(io_: Io, w: *std.atomic.Value(u32)) void {
+            wake(io_, w);
         }
     };
-    const t = try std.Thread.spawn(.{}, Waker.run, .{&word});
+    const t = try std.Thread.spawn(.{}, Waker.run, .{ io, &word });
     try testing.expectEqual(Outcome.woken, try parkUntil(io, &word, std.math.maxInt(u64), &c));
     t.join();
     try testing.expectEqual(@as(u64, 0), c.load());
+}
+
+test "parkUntil: a passed deadline returns .deadline without counting a tick; a token still wins; a far deadline leaves the tick as the backstop" {
+    try sync_testing.underBoth(parkUntilBody);
+}
+
+/// The park on a FIBER: the token is delivered by a raw thread while the
+/// waiter is parked on its lane (the futex table's fiber path, the lane's
+/// timer as the tick bound).
+fn fiberPark(io: Io) !void {
+    const Parked = struct {
+        fn run(io_: Io, w: *std.atomic.Value(u32), c: *counters.ShardedCounter) Io.Cancelable!Outcome {
+            return park(io_, w, c);
+        }
+    };
+    var word: std.atomic.Value(u32) = .init(0);
+    var c: counters.ShardedCounter = .{};
+    var fut = io.concurrent(Parked.run, .{ io, &word, &c }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    // The waiter is parked (or about to be): the token ends it either way.
+    std.Thread.yield() catch {};
+    wake(io, &word);
+    try testing.expectEqual(Outcome.woken, try fut.await(io));
+    try testing.expectEqual(@as(u64, 0), c.load());
+}
+
+test "a parked concurrent waiter is woken by a raw thread's token without a tick" {
+    try sync_testing.underBoth(fiberPark);
 }

@@ -122,6 +122,7 @@ pub fn OnceCell(comptime T: type) type {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
 const Cell = OnceCell(u64);
 
@@ -144,17 +145,16 @@ const Ctx = struct {
     }
 };
 
-test "init_runs_exactly_once_across_racers" {
-    const io = testing.io;
+fn initRunsOnce(io: Io) !void {
     var cell: Cell = .init;
     var c: Ctx = .{};
     const Racer = struct {
-        fn run(cl: *Cell, cx: *Ctx) !void {
-            try testing.expectEqual(@as(u64, 42), (try cl.getOrInit(testing.io, cx, Ctx.initializer)).*);
+        fn run(io_: Io, cl: *Cell, cx: *Ctx) !void {
+            try testing.expectEqual(@as(u64, 42), (try cl.getOrInit(io_, cx, Ctx.initializer)).*);
         }
     };
     var ts: [8]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ &cell, &c });
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ io, &cell, &c });
     while (cell.changed.waiters(io) < 7) try std.Thread.yield();
     c.open(io);
     for (ts) |t| t.join();
@@ -162,32 +162,39 @@ test "init_runs_exactly_once_across_racers" {
     try testing.expectEqual(@as(u64, 42), cell.get().?.*);
 }
 
-test "a racer that read an unset cell and elects after the leader published never runs a second initializer (the election re-checks under the latch)" {
+test "init_runs_exactly_once_across_racers" {
+    try sync_testing.underBoth(initRunsOnce);
+}
+
+fn electionRechecks(io: Io) !void {
     const Shared = struct {
         cells: [200]Cell = @splat(.init),
         inits: std.atomic.Value(u32) = .init(0),
         fn instant(s: *@This(), _: Io) anyerror!u64 {
             return s.inits.fetchAdd(1, .acq_rel);
         }
-        fn run(s: *@This()) !void {
-            for (&s.cells) |*c| _ = try c.getOrInit(testing.io, s, instant);
+        fn run(io_: Io, s: *@This()) !void {
+            for (&s.cells) |*c| _ = try c.getOrInit(io_, s, instant);
         }
     };
     var s: Shared = .{};
     var ts: [4]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{&s});
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{ io, &s });
     for (ts) |t| t.join();
     try testing.expectEqual(@as(u32, s.cells.len), s.inits.load(.acquire));
 }
 
-test "cancelled_leader_releases_leadership: a failed leader's error is its own; a parked racer re-elects and initializes" {
-    const io = testing.io;
+test "a racer that read an unset cell and elects after the leader published never runs a second initializer (the election re-checks under the latch)" {
+    try sync_testing.underBoth(electionRechecks);
+}
+
+fn cancelledLeaderReleases(io: Io) !void {
     var cell: Cell = .init;
     var c: Ctx = .{ .fail_first = true };
     const Shared = struct {
         errors: std.atomic.Value(u32) = .init(0),
-        fn run(cl: *Cell, cx: *Ctx, s: *@This()) void {
-            if (cl.getOrInit(testing.io, cx, Ctx.initializer)) |v| {
+        fn run(io_: Io, cl: *Cell, cx: *Ctx, s: *@This()) void {
+            if (cl.getOrInit(io_, cx, Ctx.initializer)) |v| {
                 std.debug.assert(v.* == 42);
             } else |_| {
                 _ = s.errors.fetchAdd(1, .acq_rel);
@@ -196,7 +203,7 @@ test "cancelled_leader_releases_leadership: a failed leader's error is its own; 
     };
     var sh: Shared = .{};
     var ts: [3]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{ &cell, &c, &sh });
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.run, .{ io, &cell, &c, &sh });
     while (cell.changed.waiters(io) < 2) try std.Thread.yield();
     c.open(io);
     for (ts) |t| t.join();
@@ -208,11 +215,11 @@ test "cancelled_leader_releases_leadership: a failed leader's error is its own; 
     var cell2: Cell = .init;
     var c2: Ctx = .{};
     const Leader = struct {
-        fn run(cl: *Cell, cx: *Ctx) anyerror!u64 {
-            return (try cl.getOrInit(testing.io, cx, Ctx.initializer)).*;
+        fn run(io_: Io, cl: *Cell, cx: *Ctx) anyerror!u64 {
+            return (try cl.getOrInit(io_, cx, Ctx.initializer)).*;
         }
     };
-    var fut = io.concurrent(Leader.run, .{ &cell2, &c2 }) catch |err| switch (err) {
+    var fut = io.concurrent(Leader.run, .{ io, &cell2, &c2 }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     while (c2.inits.load(.acquire) == 0) try std.Thread.yield();
@@ -222,19 +229,22 @@ test "cancelled_leader_releases_leadership: a failed leader's error is its own; 
     try testing.expectEqual(@as(u64, 42), (try cell2.getOrInit(io, &c2, Ctx.initializer)).*);
 }
 
-test "manual_leader_parks_racers_and_completes_them: no racer runs its initializer; a second claim is refused" {
-    const io = testing.io;
+test "cancelled_leader_releases_leadership: a failed leader's error is its own; a parked racer re-elects and initializes" {
+    try sync_testing.underBoth(cancelledLeaderReleases);
+}
+
+fn manualLeaderCompletes(io: Io) !void {
     var cell: Cell = .init;
     var c: Ctx = .{};
     try testing.expect(cell.claimInit(io));
     try testing.expect(!cell.claimInit(io));
     const Racer = struct {
-        fn run(cl: *Cell, cx: *Ctx) !void {
-            try testing.expectEqual(@as(u64, 7), (try cl.getOrInit(testing.io, cx, Ctx.initializer)).*);
+        fn run(io_: Io, cl: *Cell, cx: *Ctx) !void {
+            try testing.expectEqual(@as(u64, 7), (try cl.getOrInit(io_, cx, Ctx.initializer)).*);
         }
     };
     var ts: [4]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ &cell, &c });
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ io, &cell, &c });
     while (cell.changed.waiters(io) < 4) try std.Thread.yield();
     cell.completeInit(io, 7);
     for (ts) |t| t.join();
@@ -242,21 +252,28 @@ test "manual_leader_parks_racers_and_completes_them: no racer runs its initializ
     try testing.expect(!cell.claimInit(io));
 }
 
-test "abandoned_manual_leader_lets_a_racer_reelect" {
-    const io = testing.io;
+test "manual_leader_parks_racers_and_completes_them: no racer runs its initializer; a second claim is refused" {
+    try sync_testing.underBoth(manualLeaderCompletes);
+}
+
+fn abandonedLeaderReelects(io: Io) !void {
     var cell: Cell = .init;
     var c: Ctx = .{};
     c.open(io);
     try testing.expect(cell.claimInit(io));
     const Racer = struct {
-        fn run(cl: *Cell, cx: *Ctx) !void {
-            try testing.expectEqual(@as(u64, 42), (try cl.getOrInit(testing.io, cx, Ctx.initializer)).*);
+        fn run(io_: Io, cl: *Cell, cx: *Ctx) !void {
+            try testing.expectEqual(@as(u64, 42), (try cl.getOrInit(io_, cx, Ctx.initializer)).*);
         }
     };
-    const t = try std.Thread.spawn(.{}, Racer.run, .{ &cell, &c });
+    const t = try std.Thread.spawn(.{}, Racer.run, .{ io, &cell, &c });
     while (cell.changed.waiters(io) == 0) try std.Thread.yield();
     cell.abandonInit(io);
     t.join();
     try testing.expectEqual(@as(u32, 1), c.inits.load(.acquire));
     try testing.expectEqual(@as(u64, 42), cell.get().?.*);
+}
+
+test "abandoned_manual_leader_lets_a_racer_reelect" {
+    try sync_testing.underBoth(abandonedLeaderReelects);
 }

@@ -227,9 +227,9 @@ pub const Notify = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
-test "permit_satisfies_late_waiter: a notifyOne before the waiter registers serves it" {
-    const io = testing.io;
+fn permitSatisfiesLateWaiter(io: Io) !void {
     var n: Notify = .init;
     n.notifyOne(io);
     var w = n.notified();
@@ -239,24 +239,30 @@ test "permit_satisfies_late_waiter: a notifyOne before the waiter registers serv
     try testing.expectEqual(@as(u32, 0), n.waiters(io));
 }
 
-test "notify_one_wakes_a_parked_waiter" {
-    const io = testing.io;
+test "permit_satisfies_late_waiter: a notifyOne before the waiter registers serves it" {
+    try sync_testing.underBoth(permitSatisfiesLateWaiter);
+}
+
+fn notifyOneWakesParked(io: Io) !void {
     var n: Notify = .init;
     const Parked = struct {
-        fn run(nt: *Notify) void {
+        fn run(io_: Io, nt: *Notify) void {
             var w = nt.notified();
-            w.waitUncancelable(testing.io);
+            w.waitUncancelable(io_);
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{&n});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &n });
     while (n.waiters(io) == 0) try std.Thread.yield();
     n.notifyOne(io);
     t.join();
     try testing.expect(!n.permit);
 }
 
-test "enabled_waiter_never_loses_a_pre_await_notify: a notifyWaiters or notifyOne between enable and wait completes the waiter" {
-    const io = testing.io;
+test "notify_one_wakes_a_parked_waiter" {
+    try sync_testing.underBoth(notifyOneWakesParked);
+}
+
+fn enabledWaiterNeverLoses(io: Io) !void {
     var n: Notify = .init;
     var w = n.notified();
     try testing.expect(!w.enable(io));
@@ -272,16 +278,19 @@ test "enabled_waiter_never_loses_a_pre_await_notify: a notifyWaiters or notifyOn
     try testing.expect(!n2.permit);
 }
 
-test "notify_waiters_releases_registered_only: no permit is stored for a later waiter" {
-    const io = testing.io;
+test "enabled_waiter_never_loses_a_pre_await_notify: a notifyWaiters or notifyOne between enable and wait completes the waiter" {
+    try sync_testing.underBoth(enabledWaiterNeverLoses);
+}
+
+fn notifyWaitersRegisteredOnly(io: Io) !void {
     var n: Notify = .init;
     const Parked = struct {
-        fn run(nt: *Notify) void {
+        fn run(io_: Io, nt: *Notify) void {
             var w = nt.notified();
-            w.waitUncancelable(testing.io);
+            w.waitUncancelable(io_);
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{&n});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &n });
     while (n.waiters(io) == 0) try std.Thread.yield();
     n.notifyWaiters(io);
     t.join();
@@ -292,8 +301,11 @@ test "notify_waiters_releases_registered_only: no permit is stored for a later w
     try testing.expectEqual(@as(u32, 0), n.waiters(io));
 }
 
-test "two notifyOne calls reach two waiters in FIFO order; a permit never accumulates past one" {
-    const io = testing.io;
+test "notify_waiters_releases_registered_only: no permit is stored for a later waiter" {
+    try sync_testing.underBoth(notifyWaitersRegisteredOnly);
+}
+
+fn fifoPermits(io: Io) !void {
     var n: Notify = .init;
     var a = n.notified();
     var b = n.notified();
@@ -315,16 +327,19 @@ test "two notifyOne calls reach two waiters in FIFO order; a permit never accumu
     try testing.expectEqual(@as(u32, 0), n.waiters(io));
 }
 
-test "a cancelled parked wait unregisters; the enable-then-recheck idiom over a shared flag under a storm loses nothing" {
-    const io = testing.io;
+test "two notifyOne calls reach two waiters in FIFO order; a permit never accumulates past one" {
+    try sync_testing.underBoth(fifoPermits);
+}
+
+fn cancelledWaitAndStorm(io: Io) !void {
     var n: Notify = .init;
     const Parked = struct {
-        fn run(nt: *Notify) Io.Cancelable!void {
+        fn run(io_: Io, nt: *Notify) Io.Cancelable!void {
             var w = nt.notified();
-            try w.wait(testing.io);
+            try w.wait(io_);
         }
     };
-    var fut = io.concurrent(Parked.run, .{&n}) catch |err| switch (err) {
+    var fut = io.concurrent(Parked.run, .{ io, &n }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     while (n.waiters(io) == 0) try std.Thread.yield();
@@ -335,40 +350,43 @@ test "a cancelled parked wait unregisters; the enable-then-recheck idiom over a 
         n: Notify = .init,
         ready: std.atomic.Value(u32) = .init(0),
         const rounds = 2000;
-        fn producer(s: *@This()) void {
+        fn producer(io_: Io, s: *@This()) void {
             var i: u32 = 1;
             while (i <= rounds) : (i += 1) {
                 while (s.ready.load(.acquire) != 0) std.atomic.spinLoopHint();
                 s.ready.store(i, .release);
-                s.n.notifyOne(testing.io);
+                s.n.notifyOne(io_);
             }
         }
-        fn consumer(s: *@This()) void {
+        fn consumer(io_: Io, s: *@This()) void {
             var i: u32 = 1;
             while (i <= rounds) : (i += 1) {
                 while (true) {
                     var w = s.n.notified();
-                    _ = w.enable(testing.io);
+                    _ = w.enable(io_);
                     if (s.ready.load(.acquire) == i) {
-                        w.cancel(testing.io);
+                        w.cancel(io_);
                         break;
                     }
-                    w.waitUncancelable(testing.io);
+                    w.waitUncancelable(io_);
                 }
                 s.ready.store(0, .release);
             }
         }
     };
     var s: Shared = .{};
-    const p = try std.Thread.spawn(.{}, Shared.producer, .{&s});
-    const c = try std.Thread.spawn(.{}, Shared.consumer, .{&s});
+    const p = try std.Thread.spawn(.{}, Shared.producer, .{ io, &s });
+    const c = try std.Thread.spawn(.{}, Shared.consumer, .{ io, &s });
     p.join();
     c.join();
     try testing.expectEqual(@as(u32, 0), s.n.waiters(io));
 }
 
-test "waitUntil: a passed deadline unregisters and keeps a later permit; a stored permit or epoch wins over the deadline; a cross-thread notify ends a far-deadline wait" {
-    const io = testing.io;
+test "a cancelled parked wait unregisters; the enable-then-recheck idiom over a shared flag under a storm loses nothing" {
+    try sync_testing.underBoth(cancelledWaitAndStorm);
+}
+
+fn waitUntilBody(io: Io) !void {
     var n: Notify = .init;
     var w = n.notified();
     try testing.expectEqual(Notify.Notified.WaitOutcome.deadline, w.waitUntilUncancelable(io, 0));
@@ -385,16 +403,20 @@ test "waitUntil: a passed deadline unregisters and keeps a later permit; a store
     try testing.expectEqual(Notify.Notified.WaitOutcome.notified, w3.waitUntilUncancelable(io, 0));
     // A far deadline parks; a notify from another thread ends it.
     const Parked = struct {
-        fn run(nt: *Notify, out: *Notify.Notified.WaitOutcome) void {
+        fn run(io_: Io, nt: *Notify, out: *Notify.Notified.WaitOutcome) void {
             var pw = nt.notified();
-            out.* = pw.waitUntilUncancelable(testing.io, std.math.maxInt(u64));
+            out.* = pw.waitUntilUncancelable(io_, std.math.maxInt(u64));
         }
     };
     var out: Notify.Notified.WaitOutcome = .deadline;
-    const t = try std.Thread.spawn(.{}, Parked.run, .{ &n, &out });
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, &n, &out });
     while (n.waiters(io) == 0) try std.Thread.yield();
     n.notifyOne(io);
     t.join();
     try testing.expectEqual(Notify.Notified.WaitOutcome.notified, out);
     try testing.expect(!n.permit);
+}
+
+test "waitUntil: a passed deadline unregisters and keeps a later permit; a stored permit or epoch wins over the deadline; a cross-thread notify ends a far-deadline wait" {
+    try sync_testing.underBoth(waitUntilBody);
 }

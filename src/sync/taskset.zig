@@ -104,6 +104,7 @@ pub const TaskSet = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 const Notify = @import("notify.zig").Notify;
 
 const Probe = struct {
@@ -114,12 +115,12 @@ const Probe = struct {
 
     /// Parks on a notify nobody ever fires; the code after the park must
     /// never run under cancellation.
-    fn parkForever(p: *Probe) Io.Cancelable!void {
+    fn parkForever(io: Io, p: *Probe) Io.Cancelable!void {
         _ = p.ran.fetchAdd(1, .acq_rel);
         var w = p.never.notified();
-        _ = w.enable(testing.io);
+        _ = w.enable(io);
         _ = p.parked.fetchAdd(1, .acq_rel);
-        try w.wait(testing.io);
+        try w.wait(io);
         _ = p.resumed.fetchAdd(1, .acq_rel);
     }
 
@@ -128,12 +129,11 @@ const Probe = struct {
     }
 };
 
-test "cancel_wakes_parked_tasks_that_would_never_wake: deinit returns only after every member unwound at its park" {
-    const io = testing.io;
+fn cancelWakesParked(io: Io) !void {
     var p: Probe = .{};
     var set: TaskSet = .init;
     const n = 4;
-    for (0..n) |_| set.spawn(io, Probe.parkForever, .{&p}) catch |err| switch (err) {
+    for (0..n) |_| set.spawn(io, Probe.parkForever, .{ io, &p }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     while (p.parked.load(.acquire) < n) try std.Thread.yield();
@@ -146,8 +146,11 @@ test "cancel_wakes_parked_tasks_that_would_never_wake: deinit returns only after
     try testing.expectEqual(@as(u32, 0), p.never.waiters(io));
 }
 
-test "cancelled_before_first_poll_never_runs: a member spawned into a cancelled set is refused at its gate" {
-    const io = testing.io;
+test "cancel_wakes_parked_tasks_that_would_never_wake: deinit returns only after every member unwound at its park" {
+    try sync_testing.underBoth(cancelWakesParked);
+}
+
+fn cancelledBeforeFirstPoll(io: Io) !void {
     var p: Probe = .{};
     var set: TaskSet = .init;
     set.cancel(io);
@@ -161,8 +164,11 @@ test "cancelled_before_first_poll_never_runs: a member spawned into a cancelled 
     try testing.expectEqual(@as(u64, 0), set.live());
 }
 
-test "wait joins normal completion; deinit on a quiesced set is immediate; live tracks spawned − finished" {
-    const io = testing.io;
+test "cancelled_before_first_poll_never_runs: a member spawned into a cancelled set is refused at its gate" {
+    try sync_testing.underBoth(cancelledBeforeFirstPoll);
+}
+
+fn waitJoins(io: Io) !void {
     var p: Probe = .{};
     var set: TaskSet = .init;
     for (0..3) |_| set.spawn(io, Probe.quick, .{&p}) catch |err| switch (err) {
@@ -174,4 +180,8 @@ test "wait joins normal completion; deinit on a quiesced set is immediate; live 
     try testing.expectEqual(@as(u64, 0), set.cancelled_tasks.load(.monotonic));
     set.deinit(io);
     try testing.expectEqual(@as(u64, 3), set.spawned.load(.monotonic));
+}
+
+test "wait joins normal completion; deinit on a quiesced set is immediate; live tracks spawned − finished" {
+    try sync_testing.underBoth(waitJoins);
 }

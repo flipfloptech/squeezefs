@@ -114,19 +114,22 @@ test "raw: wakeAll wakes EVERY parked waiter (the C-int clamp), not just one" {
     for (threads) |t| t.join();
 }
 
-test "io face: a wake ends a timed wait; a timeout returns without a wake" {
-    const io = testing.io;
+fn ioFace(io: Io) !void {
     var word: Word = .init(0);
     try ioWaitTimeout(io, &word, 1, 0);
     const Waker = struct {
-        fn run(w: *Word) void {
+        fn run(io_: Io, w: *Word) void {
             w.store(1, .release);
-            ioWake(testing.io, w, 1);
+            ioWake(io_, w, 1);
         }
     };
-    const t = try std.Thread.spawn(.{}, Waker.run, .{&word});
+    const t = try std.Thread.spawn(.{}, Waker.run, .{ io, &word });
     while (word.load(.acquire) == 0) try ioWaitTimeout(io, &word, 0, std.time.ns_per_s);
     t.join();
     // A zero count is a no-op on both faces.
     ioWake(io, &word, 0);
+}
+
+test "io face: a wake ends a timed wait; a timeout returns without a wake" {
+    try @import("testing.zig").underBoth(ioFace);
 }

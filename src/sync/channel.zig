@@ -528,16 +528,16 @@ pub fn Watch(comptime T: type) type {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
-test "oneshot_delivers_and_close_errors" {
-    const io = testing.io;
+fn oneshotDelivers(io: Io) !void {
     var ch: Oneshot(u32) = .init;
     const Sender = struct {
-        fn run(c: *Oneshot(u32)) void {
-            c.send(testing.io, 7) catch unreachable;
+        fn run(io_: Io, c: *Oneshot(u32)) void {
+            c.send(io_, 7) catch unreachable;
         }
     };
-    const t = try std.Thread.spawn(.{}, Sender.run, .{&ch});
+    const t = try std.Thread.spawn(.{}, Sender.run, .{ io, &ch });
     try testing.expectEqual(@as(u32, 7), try ch.recv(io));
     t.join();
 
@@ -557,26 +557,29 @@ test "oneshot_delivers_and_close_errors" {
     try testing.expectError(error.Closed, ch4.tryRecv(io));
 }
 
-test "oneshot: a parked receiver is woken by the send and by a close; a cancelled receiver unregisters" {
-    const io = testing.io;
+test "oneshot_delivers_and_close_errors" {
+    try sync_testing.underBoth(oneshotDelivers);
+}
+
+fn oneshotParkedReceiver(io: Io) !void {
     var ch: Oneshot(u32) = .init;
     const Rx = struct {
-        fn run(c: *Oneshot(u32)) !void {
-            try testing.expectEqual(@as(u32, 11), try c.recvUncancelable(testing.io));
+        fn run(io_: Io, c: *Oneshot(u32)) !void {
+            try testing.expectEqual(@as(u32, 11), try c.recvUncancelable(io_));
         }
     };
-    const t = try std.Thread.spawn(.{}, Rx.run, .{&ch});
+    const t = try std.Thread.spawn(.{}, Rx.run, .{ io, &ch });
     while (!ch.receiverParked(io)) try std.Thread.yield();
     try ch.send(io, 11);
     t.join();
 
     var ch2: Oneshot(u32) = .init;
     const Cancelled = struct {
-        fn run(c: *Oneshot(u32)) Oneshot(u32).RecvError!u32 {
-            return c.recv(testing.io);
+        fn run(io_: Io, c: *Oneshot(u32)) Oneshot(u32).RecvError!u32 {
+            return c.recv(io_);
         }
     };
-    var fut = io.concurrent(Cancelled.run, .{&ch2}) catch |err| switch (err) {
+    var fut = io.concurrent(Cancelled.run, .{ io, &ch2 }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     while (!ch2.receiverParked(io)) try std.Thread.yield();
@@ -584,8 +587,11 @@ test "oneshot: a parked receiver is woken by the send and by a close; a cancelle
     try testing.expect(!ch2.receiverParked(io));
 }
 
-test "mpsc_bounded_backpressures_and_drains" {
-    const io = testing.io;
+test "oneshot: a parked receiver is woken by the send and by a close; a cancelled receiver unregisters" {
+    try sync_testing.underBoth(oneshotParkedReceiver);
+}
+
+fn mpscBackpressures(io: Io) !void {
     var ch: Mpsc(u32, 2) = .init;
     const tx = ch.sender(io);
     try tx.trySend(io, 1);
@@ -594,11 +600,11 @@ test "mpsc_bounded_backpressures_and_drains" {
     // A parked async send completes once the receiver drains.
     const tx2 = ch.sender(io);
     const Parked = struct {
-        fn run(s: Mpsc(u32, 2).Sender) void {
-            s.sendUncancelable(testing.io, 3) catch unreachable;
+        fn run(io_: Io, s: Mpsc(u32, 2).Sender) void {
+            s.sendUncancelable(io_, 3) catch unreachable;
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{tx2});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, tx2 });
     while (ch.sendWaiters(io) == 0) try std.Thread.yield();
     try testing.expectEqual(@as(?u32, 1), try ch.recv(io));
     t.join();
@@ -611,8 +617,11 @@ test "mpsc_bounded_backpressures_and_drains" {
     try testing.expectError(error.Disconnected, ch.tryRecv(io));
 }
 
-test "mpsc close semantics: a closed channel refuses sends and drains" {
-    const io = testing.io;
+test "mpsc_bounded_backpressures_and_drains" {
+    try sync_testing.underBoth(mpscBackpressures);
+}
+
+fn mpscClose(io: Io) !void {
     var ch: Mpsc(u32, 4) = .init;
     const tx = ch.sender(io);
     try tx.trySend(io, 1);
@@ -626,33 +635,39 @@ test "mpsc close semantics: a closed channel refuses sends and drains" {
     tx.deinit(io);
 }
 
-test "mpsc_receiver_drop_fails_parked_senders" {
-    const io = testing.io;
+test "mpsc close semantics: a closed channel refuses sends and drains" {
+    try sync_testing.underBoth(mpscClose);
+}
+
+fn mpscReceiverDrop(io: Io) !void {
     var ch: Mpsc(u32, 1) = .init;
     const tx = ch.sender(io);
     try tx.trySend(io, 1);
     const Parked = struct {
-        fn run(s: Mpsc(u32, 1).Sender) !void {
-            try testing.expectError(error.Closed, s.sendUncancelable(testing.io, 2));
+        fn run(io_: Io, s: Mpsc(u32, 1).Sender) !void {
+            try testing.expectError(error.Closed, s.sendUncancelable(io_, 2));
         }
     };
-    const t = try std.Thread.spawn(.{}, Parked.run, .{tx});
+    const t = try std.Thread.spawn(.{}, Parked.run, .{ io, tx });
     while (ch.sendWaiters(io) == 0) try std.Thread.yield();
     ch.closeReceiver(io);
     t.join();
     tx.deinit(io);
 }
 
-test "mpsc: the last sender's departure wakes a parked receiver; a cancelled parked send unregisters" {
-    const io = testing.io;
+test "mpsc_receiver_drop_fails_parked_senders" {
+    try sync_testing.underBoth(mpscReceiverDrop);
+}
+
+fn mpscLastSenderAndCancel(io: Io) !void {
     var ch: Mpsc(u32, 1) = .init;
     const tx = ch.sender(io);
     const Rx = struct {
-        fn run(c: *Mpsc(u32, 1)) !void {
-            try testing.expectEqual(@as(?u32, null), c.recvUncancelable(testing.io));
+        fn run(io_: Io, c: *Mpsc(u32, 1)) !void {
+            try testing.expectEqual(@as(?u32, null), c.recvUncancelable(io_));
         }
     };
-    const t = try std.Thread.spawn(.{}, Rx.run, .{&ch});
+    const t = try std.Thread.spawn(.{}, Rx.run, .{ io, &ch });
     while (!ch.receiverParked(io)) try std.Thread.yield();
     tx.deinit(io);
     t.join();
@@ -661,11 +676,11 @@ test "mpsc: the last sender's departure wakes a parked receiver; a cancelled par
     const tx2 = ch2.sender(io);
     try tx2.trySend(io, 1);
     const Cancelled = struct {
-        fn run(s: Mpsc(u32, 1).Sender) Mpsc(u32, 1).SendError!void {
-            return s.send(testing.io, 2);
+        fn run(io_: Io, s: Mpsc(u32, 1).Sender) Mpsc(u32, 1).SendError!void {
+            return s.send(io_, 2);
         }
     };
-    var fut = io.concurrent(Cancelled.run, .{tx2}) catch |err| switch (err) {
+    var fut = io.concurrent(Cancelled.run, .{ io, tx2 }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => return error.SkipZigTest,
     };
     while (ch2.sendWaiters(io) == 0) try std.Thread.yield();
@@ -674,27 +689,31 @@ test "mpsc: the last sender's departure wakes a parked receiver; a cancelled par
     tx2.deinit(io);
 }
 
-test "mpsc: every send lands exactly once across producers racing a parking consumer (no lost send)" {
+test "mpsc: the last sender's departure wakes a parked receiver; a cancelled parked send unregisters" {
+    try sync_testing.underBoth(mpscLastSenderAndCancel);
+}
+
+fn mpscNoLostSend(io: Io) !void {
     const Chan = Mpsc(u64, 4);
     const Shared = struct {
         ch: Chan = .init,
         sum: u64 = 0,
         const per_producer = 2000;
-        fn producer(tx: Chan.Sender, base: u64) void {
+        fn producer(io_: Io, tx: Chan.Sender, base: u64) void {
             var i: u64 = 0;
-            while (i < per_producer) : (i += 1) tx.sendUncancelable(testing.io, base + i) catch unreachable;
-            tx.deinit(testing.io);
+            while (i < per_producer) : (i += 1) tx.sendUncancelable(io_, base + i) catch unreachable;
+            tx.deinit(io_);
         }
-        fn consumer(s: *@This()) void {
-            while (s.ch.recvUncancelable(testing.io)) |v| s.sum += v;
+        fn consumer(io_: Io, s: *@This()) void {
+            while (s.ch.recvUncancelable(io_)) |v| s.sum += v;
         }
     };
     var s: Shared = .{};
     var txs: [4]Chan.Sender = undefined;
-    for (&txs) |*tx| tx.* = s.ch.sender(testing.io);
-    const c = try std.Thread.spawn(.{}, Shared.consumer, .{&s});
+    for (&txs) |*tx| tx.* = s.ch.sender(io);
+    const c = try std.Thread.spawn(.{}, Shared.consumer, .{ io, &s });
     var ps: [4]std.Thread = undefined;
-    for (&ps, 0..) |*p, i| p.* = try std.Thread.spawn(.{}, Shared.producer, .{ txs[i], @as(u64, i) * 1_000_000 });
+    for (&ps, 0..) |*p, i| p.* = try std.Thread.spawn(.{}, Shared.producer, .{ io, txs[i], @as(u64, i) * 1_000_000 });
     for (ps) |p| p.join();
     c.join();
     var expected: u64 = 0;
@@ -705,8 +724,11 @@ test "mpsc: every send lands exactly once across producers racing a parking cons
     try testing.expectEqual(expected, s.sum);
 }
 
-test "watch_publishes_and_changed_fires" {
-    const io = testing.io;
+test "mpsc: every send lands exactly once across producers racing a parking consumer (no lost send)" {
+    try sync_testing.underBoth(mpscNoLostSend);
+}
+
+fn watchPublishes(io: Io) !void {
     var w = Watch(u32).init(0);
     var rx = w.subscribe(io);
     try testing.expectEqual(@as(u32, 0), w.load(io));
@@ -715,12 +737,12 @@ test "watch_publishes_and_changed_fires" {
     try testing.expectEqual(@as(u32, 5), rx.loadAndUpdate(io));
     // No re-fire for a seen version: a concurrent publish unparks the waiter.
     const Publisher = struct {
-        fn run(wt: *Watch(u32)) void {
-            while (wt.parked(testing.io) == 0) std.Thread.yield() catch {};
-            wt.send(testing.io, 6);
+        fn run(io_: Io, wt: *Watch(u32)) void {
+            while (wt.parked(io_) == 0) std.Thread.yield() catch {};
+            wt.send(io_, 6);
         }
     };
-    const t = try std.Thread.spawn(.{}, Publisher.run, .{&w});
+    const t = try std.Thread.spawn(.{}, Publisher.run, .{ io, &w });
     try rx.changed(io);
     try testing.expectEqual(@as(u32, 6), w.load(io));
     t.join();
@@ -729,4 +751,49 @@ test "watch_publishes_and_changed_fires" {
     var late = w.subscribe(io);
     w.closeSender(io);
     try testing.expectError(error.SenderGone, late.changedUncancelable(io));
+}
+
+test "watch_publishes_and_changed_fires" {
+    try sync_testing.underBoth(watchPublishes);
+}
+
+/// A fiber producer and a fiber consumer on the two meta lanes exchange
+/// through a bounded mpsc: every park is a fiber park, every wake a
+/// cross-lane inbox push.
+fn mpscAcrossLanes(io: Io) !void {
+    const Chan = Mpsc(u64, 2);
+    const Shared = struct {
+        ch: Chan = .init,
+        const count = 500;
+        fn producer(io_: Io, s: *@This()) Io.Cancelable!void {
+            const tx = s.ch.sender(io_);
+            var i: u64 = 0;
+            while (i < count) : (i += 1) tx.send(io_, i) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                error.Closed => unreachable,
+            };
+            tx.deinit(io_);
+        }
+        fn consumer(io_: Io, s: *@This()) Io.Cancelable!u64 {
+            var sum: u64 = 0;
+            while (try s.ch.recv(io_)) |v| sum += v;
+            return sum;
+        }
+    };
+    var s: Shared = .{};
+    var p = io.concurrent(Shared.producer, .{ io, &s }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    var c = io.concurrent(Shared.consumer, .{ io, &s }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => {
+            try p.await(io);
+            return error.SkipZigTest;
+        },
+    };
+    try p.await(io);
+    try testing.expectEqual(@as(u64, Shared.count * (Shared.count - 1) / 2), try c.await(io));
+}
+
+test "mpsc between two concurrent tasks: a producer and a consumer park and wake each other" {
+    try sync_testing.underBoth(mpscAcrossLanes);
 }

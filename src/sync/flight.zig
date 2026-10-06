@@ -197,6 +197,7 @@ pub fn SingleFlight(comptime K: type, comptime V: type, comptime max_flights: us
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const sync_testing = @import("testing.zig");
 
 const Flight = SingleFlight(u64, u32, 4);
 
@@ -221,18 +222,17 @@ fn opens(c: *Ctx, io: Io) void {
     futex.ioWake(io, &c.gate, std.math.maxInt(u32));
 }
 
-test "cohort_receives_the_leaders_value: eight racers for one key compute once and all read it" {
-    const io = testing.io;
+fn cohortReceivesValue(io: Io) !void {
     var f: Flight = .init;
     var c: Ctx = .{};
     const Racer = struct {
-        fn run(fl: *Flight, cx: *Ctx) !void {
+        fn run(io_: Io, fl: *Flight, cx: *Ctx) !void {
             _ = cx.joined.fetchAdd(1, .acq_rel);
-            try testing.expectEqual(@as(u32, 42), try fl.run(testing.io, 7, cx, Ctx.compute));
+            try testing.expectEqual(@as(u32, 42), try fl.run(io_, 7, cx, Ctx.compute));
         }
     };
     var ts: [8]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ &f, &c });
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ io, &f, &c });
     while (c.joined.load(.acquire) < 8 or f.inFlight(io) == 0) try std.Thread.yield();
     opens(&c, io);
     for (ts) |t| t.join();
@@ -240,8 +240,11 @@ test "cohort_receives_the_leaders_value: eight racers for one key compute once a
     try testing.expectEqual(@as(usize, 0), f.inFlight(io));
 }
 
-test "leader_death_re_elects: a failed leader gets its own error and the cohort computes anew" {
-    const io = testing.io;
+test "cohort_receives_the_leaders_value: eight racers for one key compute once and all read it" {
+    try sync_testing.underBoth(cohortReceivesValue);
+}
+
+fn leaderDeathReelects(io: Io) !void {
     var f: Flight = .init;
     var c: Ctx = .{ .fail_first = true };
     const Shared = struct {
@@ -250,9 +253,9 @@ test "leader_death_re_elects: a failed leader gets its own error and the cohort 
     };
     var sh: Shared = .{};
     const Racer = struct {
-        fn run(fl: *Flight, cx: *Ctx, s: *Shared) void {
+        fn run(io_: Io, fl: *Flight, cx: *Ctx, s: *Shared) void {
             _ = cx.joined.fetchAdd(1, .acq_rel);
-            if (fl.run(testing.io, 9, cx, Ctx.compute)) |v| {
+            if (fl.run(io_, 9, cx, Ctx.compute)) |v| {
                 std.debug.assert(v == 42);
                 _ = s.values.fetchAdd(1, .acq_rel);
             } else |_| {
@@ -261,7 +264,7 @@ test "leader_death_re_elects: a failed leader gets its own error and the cohort 
         }
     };
     var ts: [4]std.Thread = undefined;
-    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ &f, &c, &sh });
+    for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{ io, &f, &c, &sh });
     while (c.joined.load(.acquire) < 4 or f.inFlight(io) == 0) try std.Thread.yield();
     opens(&c, io);
     for (ts) |t| t.join();
@@ -271,8 +274,11 @@ test "leader_death_re_elects: a failed leader gets its own error and the cohort 
     try testing.expectEqual(@as(usize, 0), f.inFlight(io));
 }
 
-test "distinct keys fly independently and a late arrival starts a fresh flight" {
-    const io = testing.io;
+test "leader_death_re_elects: a failed leader gets its own error and the cohort computes anew" {
+    try sync_testing.underBoth(leaderDeathReelects);
+}
+
+fn distinctKeys(io: Io) !void {
     var f: Flight = .init;
     var c: Ctx = .{};
     opens(&c, io);
@@ -282,17 +288,20 @@ test "distinct keys fly independently and a late arrival starts a fresh flight" 
     try testing.expectEqual(@as(usize, 0), f.inFlight(io));
 }
 
-test "the table bound is a refusal, never an allocation" {
-    const io = testing.io;
+test "distinct keys fly independently and a late arrival starts a fresh flight" {
+    try sync_testing.underBoth(distinctKeys);
+}
+
+fn tableBoundRefuses(io: Io) !void {
     var f: Flight = .init;
     var c: Ctx = .{};
     const Leader = struct {
-        fn run(fl: *Flight, cx: *Ctx, key: u64) !void {
-            try testing.expectEqual(@as(u32, 42), try fl.run(testing.io, key, cx, Ctx.compute));
+        fn run(io_: Io, fl: *Flight, cx: *Ctx, key: u64) !void {
+            try testing.expectEqual(@as(u32, 42), try fl.run(io_, key, cx, Ctx.compute));
         }
     };
     var ts: [4]std.Thread = undefined;
-    for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Leader.run, .{ &f, &c, @as(u64, i) });
+    for (&ts, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Leader.run, .{ io, &f, &c, @as(u64, i) });
     while (f.inFlight(io) < 4) try std.Thread.yield();
     try testing.expectError(error.FlightTableFull, f.run(io, 99, &c, Ctx.compute));
     opens(&c, io);
@@ -300,24 +309,31 @@ test "the table bound is a refusal, never an allocation" {
     try testing.expectEqual(@as(u32, 4), c.computes.load(.acquire));
 }
 
-test "a cancelled cohort member leaves without disturbing the flight" {
-    const io = testing.io;
+test "the table bound is a refusal, never an allocation" {
+    try sync_testing.underBoth(tableBoundRefuses);
+}
+
+fn cancelledCohortLeaves(io: Io) !void {
     var f: Flight = .init;
     var c: Ctx = .{};
     const Leader = struct {
-        fn run(fl: *Flight, cx: *Ctx) !void {
-            try testing.expectEqual(@as(u32, 42), try fl.run(testing.io, 5, cx, Ctx.compute));
+        fn run(io_: Io, fl: *Flight, cx: *Ctx) !void {
+            try testing.expectEqual(@as(u32, 42), try fl.run(io_, 5, cx, Ctx.compute));
         }
     };
     const Member = struct {
-        fn run(fl: *Flight, cx: *Ctx) anyerror!u32 {
-            return fl.run(testing.io, 5, cx, Ctx.compute);
+        fn run(io_: Io, fl: *Flight, cx: *Ctx) anyerror!u32 {
+            return fl.run(io_, 5, cx, Ctx.compute);
         }
     };
-    const leader = try std.Thread.spawn(.{}, Leader.run, .{ &f, &c });
+    const leader = try std.Thread.spawn(.{}, Leader.run, .{ io, &f, &c });
     while (f.inFlight(io) == 0) try std.Thread.yield();
-    var fut = io.concurrent(Member.run, .{ &f, &c }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    var fut = io.concurrent(Member.run, .{ io, &f, &c }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => {
+            opens(&c, io);
+            leader.join();
+            return error.SkipZigTest;
+        },
     };
     while (f.cohort(io, 5) == 0) try std.Thread.yield();
     try testing.expectError(error.Canceled, fut.cancel(io));
@@ -325,4 +341,8 @@ test "a cancelled cohort member leaves without disturbing the flight" {
     leader.join();
     try testing.expectEqual(@as(u32, 1), c.computes.load(.acquire));
     try testing.expectEqual(@as(usize, 0), f.inFlight(io));
+}
+
+test "a cancelled cohort member leaves without disturbing the flight" {
+    try sync_testing.underBoth(cancelledCohortLeaves);
 }

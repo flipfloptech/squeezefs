@@ -7,6 +7,7 @@ const std = @import("std");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const counters = @import("../core/counters.zig");
+const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 
 const testing = std.testing;
@@ -15,16 +16,29 @@ const testing = std.testing;
 // Constants with their measured reasons (spec §9).
 // ---------------------------------------------------------------------------
 
-/// Per-lane request queue bound. "P1-6: bound io_uring request queue to
-/// apply backpressure under overload" — a full queue refuses (`QueueFull`,
-/// counted in `uring_queue_full`) instead of letting an overloaded lane grow
-/// without bound. The queue also bounds the in-flight slot table, so a slot
-/// index (the SQE `user_data`) is always `< uring_req_queue_cap`.
+/// Requests a lane ADMITS (queued or in the ring) before it refuses
+/// (`QueueFull`, counted in `uring_queue_full`): the backpressure door, and
+/// the cell table's size, so a slot index (the SQE `user_data`) is always
+/// `< uring_req_queue_cap`. WHY 4096: the reference's "P1-6: bound io_uring
+/// request queue to apply backpressure under overload" — a bound, not a
+/// measurement; rung 4's write-pipeline governor derives the device depth
+/// from its BDP and this becomes `ceil(device_depth / lanes)` (foundation
+/// audit #16). Until then the reference's figure, said so.
 pub const uring_req_queue_cap: u32 = 4096;
 
-/// Ring depth per lane (the reference's constant; the slot table is bounded
-/// by the queue above, the SQ by this).
-pub const ring_entries: u16 = 1024;
+/// SQ depth per lane, DERIVED from the admitted depth: the SQ is the
+/// per-enter batch, not an in-flight bound (a full SQ is flushed by a plain
+/// `submit()` and refilled in the same pass), so a saturated pass drains the
+/// whole admitted depth in `uring_req_queue_cap / ring_entries = 4` enters.
+/// The kernel sizes the CQ at 2× (= half the admitted depth); completions
+/// past it are buffered (`IORING_FEAT_NODROP`) — the overflow tripwire is
+/// owed with the governor (foundation #16).
+pub const ring_entries: u16 = uring_req_queue_cap / 4;
+
+/// The park's backstop when the wake READ could not be armed (past the
+/// `wake_arm_failed` tripwire — the ONE case nothing but a tick could end
+/// an idle park): the arrival latency a lane then pays.
+pub const wake_unarmed_backstop_ns: u64 = 1 * std.time.ns_per_ms;
 
 /// O_DIRECT / pooled-buffer contract (`POOLED_BUF_ALIGN`, pool.rs:28): the
 /// kernel requires offset, length and buffer address aligned to the logical
@@ -51,12 +65,12 @@ pub const sq_push_retries: u32 = 3;
 pub const node_probe_ttl_ms: u64 = 1000;
 
 /// SQE `user_data` sentinels. Slot indices are small (`< uring_req_queue_cap`);
-/// anything `>= UD_RESERVED` is never a request.
-pub const UD_RESERVED: u64 = std.math.maxInt(u64) - 1;
-/// The slow-read seam's linked TIMEOUT.
-pub const UD_SEAM: u64 = std.math.maxInt(u64) - 1;
-/// The armed eventfd READ that wakes a parked lane.
-pub const UD_WAKE: u64 = std.math.maxInt(u64);
+/// `ring_park.wake_ud` (`u64::MAX`) is the standing wake READ and
+/// `ring_park.reserved_ud` (`u64::MAX − 1`) the primitive's cancel tag; the
+/// slow-read seam's linked TIMEOUT sits just below them (the Linux half
+/// pins the order). Anything `>= UD_RESERVED` is never a request.
+pub const UD_SEAM: u64 = std.math.maxInt(u64) - 2;
+pub const UD_RESERVED: u64 = UD_SEAM;
 
 // ---------------------------------------------------------------------------
 // Lane derivations (spec §1.1, §1.2).
@@ -211,93 +225,30 @@ pub fn finishRead(got: usize, size: usize) ReadVerdict {
     return if (got == size) .full else .{ .short = got };
 }
 
-/// Refusals: the request never reached the device.
-pub const Refusal = error{
-    /// Lane queue full or closed (backpressure); counted in `uring_queue_full`.
-    QueueFull,
-    /// The worker dropped its receiver (lane dead).
-    WorkerClosed,
-    /// Pooled read larger than the 4 MiB pool slot.
-    ReadSizeExceedsPool,
-    /// Fence latched / custody poisoned (errno class EIO).
-    WriterGuardFenced,
-    /// Dismount teardown completed (errno class EROFS).
-    DismountRefused,
-    /// O_DIRECT open failed — buffered device I/O is not a supported mode.
-    DirectIoUnsupported,
-};
+// Errors: the ONE typed set and the ONE errno table (`core/errors.zig`,
+// decision 0003 WP-C row 23). The device layer's classes are the shared
+// ones — a full or closing lane is `QueueFull` (backpressure: EAGAIN, never
+// EINVAL), the fence `WriterGuardFenced` (EIO), dismount `DismountRefused`
+// (EROFS), a short transfer `ShortRead`/`ShortWrite`, the lane's exit drain
+// `WorkerShutdown`, a dead ring `RingFailed`. No timeout class: an op the
+// device never answers is OVERDUE (`OverdueCensus`), the watchdog's business
+// (charter §4), never a per-op error.
 
-/// Terminal: the device/kernel answered and the answer is final for this op.
-pub const Terminal = error{
-    DeviceIo,
-    /// The kernel returned fewer bytes than asked (past-EOF on a file).
-    ShortRead,
-    /// EBADE — the block layer's `BLK_STS_RESV_CONFLICT`; latches the fence.
-    ReservationConflict,
-    NoSpace,
-    /// Misaligned O_DIRECT shape or another EINVAL from the kernel.
-    InvalidArgument,
-    /// The worker could not push the SQE after `sq_push_retries`.
-    SubmissionQueueFull,
-    /// Teardown drained the request before it reached the ring.
-    WorkerShutdown,
-    OutOfMemory,
-};
-
-/// Retryable: nothing final happened. No timeout class: an op the device
-/// never answers is OVERDUE (`OverdueCensus`), the watchdog's business
-/// (charter §4), never a per-op error.
-pub const Retryable = error{
-    Interrupted,
-    Again,
-};
-
-pub const DeviceError = Refusal || Terminal || Retryable;
-
-pub const ErrorClass = enum { refusal, terminal, retryable };
-
-pub fn classOf(e: DeviceError) ErrorClass {
-    return switch (e) {
-        error.QueueFull, error.WorkerClosed, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported => .refusal,
-        error.DeviceIo, error.ShortRead, error.ReservationConflict, error.NoSpace, error.InvalidArgument, error.SubmissionQueueFull, error.WorkerShutdown, error.OutOfMemory => .terminal,
-        error.Interrupted, error.Again => .retryable,
-    };
-}
+pub const Refusal = errors.Refusal;
+pub const Terminal = errors.Terminal;
+pub const Retryable = errors.Retryable;
+pub const DeviceError = errors.Error;
+pub const ErrorClass = errors.Class;
+pub const classOf = errors.classOf;
+pub const errnoToError = errors.fromErrno;
+pub const errnoFor = errors.toErrno;
 
 /// `EBADE` (52): the block layer's mapping of `BLK_STS_RESV_CONFLICT`
-/// (reservation.rs:462-469) — the ONE errno that fences.
+/// (reservation.rs:462-469) — the ONE errno that fences. The predicate of
+/// the write-outcome funnel (`Device.classifyDmaOutcome`); the table's
+/// `ReservationConflict` row is its error form.
 pub fn isReservationConflict(e: std.os.linux.E) bool {
     return e == .BADE;
-}
-
-/// THE errno table, kernel → class (charter §12: errno mapping lives in
-/// one table; `errnoFor` is its other half).
-pub fn errnoToError(e: std.os.linux.E) DeviceError {
-    return switch (e) {
-        .BADE => error.ReservationConflict,
-        .INVAL => error.InvalidArgument,
-        .NOSPC => error.NoSpace,
-        .INTR => error.Interrupted,
-        .AGAIN => error.Again,
-        .NOMEM => error.OutOfMemory,
-        else => error.DeviceIo,
-    };
-}
-
-/// Class → errno for the reply path: the fence class is EIO
-/// (`WriterGuardFenced`, error.rs:361), dismount EROFS, refusals the
-/// reference's `InvalidOperation` = EINVAL.
-pub fn errnoFor(e: DeviceError) std.os.linux.E {
-    return switch (e) {
-        error.ReservationConflict => .BADE,
-        error.WriterGuardFenced, error.DeviceIo, error.ShortRead, error.SubmissionQueueFull => .IO,
-        error.DismountRefused => .ROFS,
-        error.QueueFull, error.WorkerClosed, error.WorkerShutdown, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.InvalidArgument => .INVAL,
-        error.NoSpace => .NOSPC,
-        error.OutOfMemory => .NOMEM,
-        error.Interrupted => .INTR,
-        error.Again => .AGAIN,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,15 +325,6 @@ pub const WakeCoalescer = struct {
         _ = self.armed.swap(false, .seq_cst);
     }
 };
-
-// ---------------------------------------------------------------------------
-// Bounded MPMC queue — the ONE implementation lives in `sync/mpmc.zig`; this
-// is the lane's name for it (the caller → lane channel and the pool
-// free-lists: producers `tryPush`, the consumer `tryPop`, nobody blocks —
-// the single park is the ring's).
-// ---------------------------------------------------------------------------
-
-pub const BoundedMpmcQueue = @import("../sync/mpmc.zig").BoundedMpmc;
 
 // ---------------------------------------------------------------------------
 // Stats (spec §7). Counters are per-thread striped; histograms exact-sum;
@@ -559,6 +501,15 @@ pub const Seams = struct {
     stall_write_ms: std.atomic.Value(u64) = .init(0),
     slow_reads: std.atomic.Value(u32) = .init(0),
     slow_read_ms: std.atomic.Value(u64) = .init(0),
+    /// 1 ⇒ every lane of the device publishes `held = 1` and waits here
+    /// BEFORE its next park (after the pass's disarm + scan + pump), so a
+    /// test can place N publishes between two lane passes. Futex words.
+    hold_before_park: std.atomic.Value(u32) = .init(0),
+    held: std.atomic.Value(u32) = .init(0),
+    /// Armed count: the next lane pass declares its ring dead (the
+    /// `ring_park` dead-ring verdict without a broken kernel) — every
+    /// in-flight op and every later request answers `RingFailed`.
+    kill_ring: std.atomic.Value(u32) = .init(0),
 };
 
 /// Seam CAS-decrement: true when this call consumed one armed count; one
@@ -695,30 +646,38 @@ test "finishRead: exact-length contract — a short read is an error, never recy
     try testing.expectEqual(ReadVerdict{ .short = 8192 }, finishRead(8192, 4096));
 }
 
-test "errno table: EBADE is the reservation-conflict (fence) class; classes are typed" {
+test "errno table: EBADE is the reservation-conflict (fence) class and round-trips through the ONE table; backpressure is EAGAIN-class, the fence EIO, dismount EROFS" {
     try testing.expect(isReservationConflict(.BADE));
     try testing.expect(!isReservationConflict(.IO));
     try testing.expectEqual(DeviceError.ReservationConflict, errnoToError(.BADE));
-    try testing.expectEqual(DeviceError.DeviceIo, errnoToError(.IO));
+    try testing.expectEqual(DeviceError.InputOutput, errnoToError(.IO));
     try testing.expectEqual(DeviceError.InvalidArgument, errnoToError(.INVAL));
-    try testing.expectEqual(DeviceError.NoSpace, errnoToError(.NOSPC));
+    try testing.expectEqual(DeviceError.NoSpaceLeft, errnoToError(.NOSPC));
     try testing.expectEqual(DeviceError.Interrupted, errnoToError(.INTR));
-    try testing.expectEqual(DeviceError.Again, errnoToError(.AGAIN));
+    try testing.expectEqual(DeviceError.WouldBlock, errnoToError(.AGAIN));
     try testing.expectEqual(ErrorClass.terminal, classOf(error.ReservationConflict));
-    try testing.expectEqual(ErrorClass.terminal, classOf(error.DeviceIo));
+    try testing.expectEqual(ErrorClass.terminal, classOf(error.InputOutput));
     try testing.expectEqual(ErrorClass.terminal, classOf(error.InvalidArgument));
-    try testing.expectEqual(ErrorClass.retryable, classOf(error.Again));
-    try testing.expectEqual(ErrorClass.refusal, classOf(error.QueueFull));
+    try testing.expectEqual(ErrorClass.terminal, classOf(error.RingFailed));
+    try testing.expectEqual(ErrorClass.terminal, classOf(error.WorkerShutdown));
+    try testing.expectEqual(ErrorClass.retryable, classOf(error.WouldBlock));
+    // A full or closing lane is backpressure: the caller may retry (EAGAIN),
+    // never "bad argument" (decision 0002 ledger; the reference's EINVAL).
+    try testing.expectEqual(ErrorClass.retryable, classOf(error.QueueFull));
+    try testing.expectEqual(std.os.linux.E.AGAIN, errnoFor(error.QueueFull));
     try testing.expectEqual(ErrorClass.refusal, classOf(error.WriterGuardFenced));
     try testing.expectEqual(ErrorClass.refusal, classOf(error.DismountRefused));
+    try testing.expectEqual(ErrorClass.refusal, classOf(error.ReadSizeExceedsPool));
+    try testing.expectEqual(ErrorClass.refusal, classOf(error.DirectIoUnsupported));
     // The reply half: fence ⇒ EIO, dismount ⇒ EROFS, EBADE is 52 on the
-    // generic table, refusals ⇒ EINVAL.
+    // generic table, a caller's shape refusal ⇒ EINVAL.
     try testing.expectEqual(std.os.linux.E.IO, errnoFor(error.WriterGuardFenced));
     try testing.expectEqual(std.os.linux.E.ROFS, errnoFor(error.DismountRefused));
     try testing.expectEqual(std.os.linux.E.BADE, errnoFor(error.ReservationConflict));
-    try testing.expectEqual(std.os.linux.E.INVAL, errnoFor(error.QueueFull));
-    // Every kernel errno round-trips through its class to a reply errno.
-    for ([_]std.os.linux.E{ .BADE, .INVAL, .NOSPC, .INTR, .AGAIN, .NOMEM }) |e| try testing.expectEqual(e, errnoFor(errnoToError(e)));
+    try testing.expectEqual(std.os.linux.E.INVAL, errnoFor(error.ReadSizeExceedsPool));
+    try testing.expectEqual(std.os.linux.E.IO, errnoFor(error.RingFailed));
+    // Every kernel errno a device CQE can carry round-trips through its class.
+    for ([_]std.os.linux.E{ .BADE, .IO, .INVAL, .NOSPC, .INTR, .AGAIN, .NOMEM }) |e| try testing.expectEqual(e, errnoFor(errnoToError(e)));
 }
 
 test "overdue census: counts every in-flight op, those at or past the bound as overdue, and keeps the oldest age; nothing is timed out" {
@@ -841,9 +800,18 @@ test "stats JSON names every family the spec lists" {
     try testing.expect(json[0] == '{' and json[json.len - 1] == '}');
 }
 
-test "user_data sentinels: slot indices are small; anything ≥ UD_RESERVED is never a request" {
-    try testing.expectEqual(std.math.maxInt(u64), UD_WAKE);
-    try testing.expectEqual(std.math.maxInt(u64) - 1, UD_SEAM);
+test "user_data sentinels: slot indices are small; anything ≥ UD_RESERVED is never a request; the seam sits below the park primitive's two tags" {
+    try testing.expectEqual(std.math.maxInt(u64) - 2, UD_SEAM);
     try testing.expectEqual(UD_SEAM, UD_RESERVED);
     try testing.expect(UD_RESERVED > @as(u64, uring_req_queue_cap));
+}
+
+test "lane depth and ring depth: the SQ is a quarter of the admitted depth (a saturated pass drains it in 4 enters); the backstop tick is the unarmed-wake case only" {
+    try testing.expectEqual(@as(u32, 4096), uring_req_queue_cap);
+    try testing.expectEqual(@as(u16, 1024), ring_entries);
+    try testing.expectEqual(@as(u32, 4), uring_req_queue_cap / ring_entries);
+    // `io_uring_setup` wants a power of two; the CQ (2×) is half the depth.
+    try testing.expect(std.math.isPowerOfTwo(ring_entries));
+    try testing.expectEqual(@as(u32, uring_req_queue_cap / 2), @as(u32, ring_entries) * 2);
+    try testing.expectEqual(std.time.ns_per_ms, wake_unarmed_backstop_ns);
 }

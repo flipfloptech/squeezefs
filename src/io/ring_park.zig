@@ -103,8 +103,18 @@ pub const ParkedRing = struct {
     dead: bool = false,
     gpa: Allocator,
 
-    /// `flags` are the owner's `io_uring_setup` flags (its probe ladder).
+    /// `flags` are the owner's `io_uring_setup` flags.
     pub fn init(gpa: Allocator, entries: u16, flags: u32) InitError!ParkedRing {
+        var rung: usize = undefined;
+        return initProbing(gpa, entries, &.{flags}, &rung);
+    }
+
+    /// `init` over the owner's probe ladder of setup flags (charter §3: a
+    /// runtime ladder, never a kernel-version table): the first rung the
+    /// kernel accepts wins and `rung` receives its index; a refused rung is
+    /// a debug line, only exhaustion is the error.
+    pub fn initProbing(gpa: Allocator, entries: u16, ladder: []const u32, rung: *usize) InitError!ParkedRing {
+        std.debug.assert(ladder.len != 0);
         // Level-triggered counter; non-blocking so a READ racing a late
         // write never blocks a plain read.
         const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -117,8 +127,17 @@ pub const ParkedRing = struct {
         const wake_buf = try gpa.create(u64);
         errdefer gpa.destroy(wake_buf);
         wake_buf.* = 0;
-        const ring = IoUring.init(entries, flags) catch |e| {
-            log.err("ring_park: io_uring_setup({d}) failed: {s} — the lane cannot start (charter §1.2: no classical fallback)", .{ entries, @errorName(e) });
+        var last_err: anyerror = error.RingSetupFailed;
+        const ring = for (ladder, 0..) |flags, i| {
+            if (IoUring.init(entries, flags)) |r| {
+                rung.* = i;
+                break r;
+            } else |e| {
+                last_err = e;
+                if (ladder.len > 1) log.debug("ring_park: io_uring_setup({d}, flags 0x{x}) refused ({s}); next rung", .{ entries, flags, @errorName(e) });
+            }
+        } else {
+            log.err("ring_park: io_uring_setup({d}) failed on every rung: {s} — the lane cannot start (charter §1.2: no classical fallback)", .{ entries, @errorName(last_err) });
             return error.RingSetupFailed;
         };
         return .{ .ring = ring, .event_fd = efd, .wake_buf = wake_buf, .gpa = gpa };
@@ -126,13 +145,23 @@ pub const ParkedRing = struct {
 
     /// Cancel the armed wake READ and reap its CQE, then tear down. The
     /// owner has already drained its own in-flight ops (it knows them; this
-    /// primitive does not). Only the ONE expected CQE is consumed here.
+    /// primitive does not). Only the ONE expected CQE is consumed here. On
+    /// the ring's own thread, or after `quiesce` ran there.
     pub fn deinit(self: *ParkedRing) void {
-        if (self.wake_armed and !self.dead) self.cancelWake();
+        self.quiesce();
         self.ring.deinit();
         _ = linux.close(self.event_fd);
         self.gpa.destroy(self.wake_buf);
         self.* = undefined;
+    }
+
+    /// Phase 1 of a two-thread teardown, ON the ring's thread: cancel the
+    /// standing READ and reap its CQE, so nothing lands in `wake_buf` later
+    /// and `deinit` may run on the joining thread (a `SINGLE_ISSUER` ring
+    /// refuses another thread's enter). The eventfd stays open until
+    /// `deinit`, so the closer's `forceWake` never races the lane's exit.
+    pub fn quiesce(self: *ParkedRing) void {
+        if (self.wake_armed and !self.dead) self.cancelWake();
     }
 
     pub fn wakeHandle(self: *ParkedRing) Wake {
@@ -382,6 +411,45 @@ test "an owner's SQE completes through the park beside the standing wake READ; d
     try testing.expectEqual(@as(i32, 0), cqes[0].res);
     try testing.expect(pr.wake_armed);
     // `deinit` (deferred) cancels the standing READ and reaps its CQE.
+}
+
+test "initProbing: a refused rung falls through to the next (its index reported); a ladder the kernel refuses entirely is the one loud error" {
+    // DEFER_TASKRUN without SINGLE_ISSUER is EINVAL on every kernel that
+    // knows the flag, and an unknown flag before that: a reliably refused rung.
+    const ladder = [_]u32{ linux.IORING_SETUP_DEFER_TASKRUN, 0 };
+    var rung: usize = undefined;
+    var pr = try ParkedRing.initProbing(testing.allocator, 8, &ladder, &rung);
+    defer pr.deinit();
+    try testing.expectEqual(@as(usize, 1), rung);
+    try testing.expect(pr.armWake());
+    try testing.expectEqual(Verdict.tick, pr.park(2 * std.time.ns_per_ms));
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.RingSetupFailed, ParkedRing.initProbing(testing.allocator, 8, ladder[0..1], &rung));
+    try log.testing.expectAllFired();
+}
+
+test "quiesce on the ring's thread, deinit on the joiner's: the standing READ is cancelled and reaped first, the eventfd outlives the ring thread" {
+    // The ring is built on the lane thread (SINGLE_ISSUER: its only
+    // submitter) and freed by the joiner, as the NVMe lanes do.
+    var pr: ParkedRing = undefined;
+    const Owner = struct {
+        fn run(p: *ParkedRing) void {
+            p.* = ParkedRing.init(testing.allocator, 8, linux.IORING_SETUP_SINGLE_ISSUER) catch @panic("ring setup failed");
+            std.debug.assert(p.armWake());
+            // A wake pending in the eventfd: the READ completes rather than
+            // cancels — either way exactly its CQE is reaped.
+            p.forceWake();
+            p.quiesce();
+            std.debug.assert(!p.wake_armed);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Owner.run, .{&pr});
+    t.join();
+    // The closer's late wake lands in a live eventfd (nothing reads it).
+    pr.forceWake();
+    var cqes: [4]linux.io_uring_cqe = undefined;
+    try testing.expectEqual(@as(u32, 0), try pr.ring.copy_cqes(&cqes, 0));
+    pr.deinit();
 }
 
 test "a dead ring parks on the eventfd alone: the tick still fires, a wake still arrives and is consumed" {

@@ -7,19 +7,27 @@
 //! io_uring, one O_DIRECT fd, one bounded request queue, one write watermark
 //! and one eventfd wake. Callers never block on the queue (try-push) and the
 //! worker never blocks on it (try-pop): the single park is the ring's
-//! `submit_and_wait(1)`, with the eventfd READ kept armed so an arrival wakes
-//! the lane THROUGH the ring (measured on the stock kernel before this
-//! shape: `dev_queue` 500 µs vs `dev_service` 285 µs — the queue wait cost
-//! more than the device).
+//! (`ring_park.ParkedRing` — the ONE ring-park primitive, decision 0003
+//! WP-C), with the eventfd READ kept armed so an arrival wakes the lane
+//! THROUGH the ring (measured on the stock kernel before this shape:
+//! `dev_queue` 500 µs vs `dev_service` 285 µs — the queue wait cost more
+//! than the device). A request is a preallocated cell whose index is the
+//! SQE `user_data`; the caller parks on the cell's `sync.Completion`, the
+//! queue is the ONE `sync.BoundedMpmc`, errors are the ONE table
+//! (`core/errors.zig`).
 //!
 //! Not here: discard/trim lives in the reclaim module (`block_reclaim`:
 //! `fallocate(PUNCH_HOLE)` on files, `BLKDISCARD` on block devices, plain
 //! syscalls) — never a device-layer concern.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
-const IoUring = linux.IoUring;
 const nd = @import("nvme_derive.zig");
+const ring_park = @import("ring_park.zig");
+const mpmc = @import("../sync/mpmc.zig");
+const completion = @import("../sync/completion.zig");
+const futex = @import("../sync/futex.zig");
 const derive = @import("../core/derive.zig");
 const counters = @import("../core/counters.zig");
 const log = @import("../core/log.zig");
@@ -94,15 +102,17 @@ fn mapAnon(len: usize) Terminal![*]u8 {
 }
 
 /// Ad-hoc mappings carry their page count in `slot` so `release` can unmap
-/// the exact length.
+/// the exact length; the page is the kernel's (`derive.facts()`, the ONE
+/// source).
 fn mapAdhoc(len: usize) Terminal!Buf {
-    const pages: u32 = @intCast(derive.ceilDiv(len, std.heap.pageSize()));
-    const ptr = try mapAnon(pages * std.heap.pageSize());
+    const page: usize = derive.facts().page_size;
+    const pages: u32 = @intCast(derive.ceilDiv(len, page));
+    const ptr = try mapAnon(pages * page);
     return .{ .ptr = ptr, .len = len, .kind = .adhoc, .slot = pages };
 }
 
 fn unmapAdhoc(ptr: [*]u8, pages: u32) void {
-    _ = linux.munmap(ptr, pages * std.heap.pageSize());
+    _ = linux.munmap(ptr, pages * @as(usize, derive.facts().page_size));
 }
 
 /// The ranged read-bounce slab: `rangedPoolCapacity(cpus)` × 64 KiB in ONE
@@ -112,13 +122,13 @@ const RangedSlab = struct {
     base: [*]u8,
     len: usize,
     cap: u32,
-    free: nd.BoundedMpmcQueue(u32),
+    free: mpmc.BoundedMpmc(u32),
     allocated_bytes: counters.Gauge = .{},
 
     fn init(gpa: std.mem.Allocator, cap: u32) !RangedSlab {
         const len = @as(usize, cap) * nd.ranged_buf_size;
         const base = try mapAnon(len);
-        var free = try nd.BoundedMpmcQueue(u32).init(gpa, cap);
+        var free = try mpmc.BoundedMpmc(u32).init(gpa, cap);
         var i: u32 = 0;
         while (i < cap) : (i += 1) std.debug.assert(free.tryPush(i));
         return .{ .base = base, .len = len, .cap = cap, .free = free };
@@ -154,11 +164,11 @@ const RangedSlab = struct {
 /// registered as a fixed buffer: pinning cores×16×4 MiB (GiBs) trades real
 /// RAM for a pin cost already amortized across 4 MiB DMAs.
 const BlockPool = struct {
-    free: nd.BoundedMpmcQueue(usize),
+    free: mpmc.BoundedMpmc(usize),
     allocated_bytes: counters.Gauge = .{},
 
     fn init(gpa: std.mem.Allocator, cap: u32) !BlockPool {
-        return .{ .free = try nd.BoundedMpmcQueue(usize).init(gpa, cap) };
+        return .{ .free = try mpmc.BoundedMpmc(usize).init(gpa, cap) };
     }
 
     fn acquire(self: *BlockPool, len: usize) Terminal!Buf {
@@ -189,11 +199,13 @@ var pools_storage: Pools = undefined;
 /// 0 = uninitialised, 1 = initialising, 2 = ready, 3 = failed.
 var pools_state: std.atomic.Value(u8) = .init(0);
 
-/// Build the process pools once, from the live CPU count (the reference's
-/// `process_parallelism` root). The release store of the ready state pairs
-/// with the acquire loads in `pools()` so every thread sees the built pools.
-/// A failure is terminal for the process's data plane and is reported, not
-/// panicked, to the opener.
+/// Build the process pools once, from the process CPU root in force
+/// (`derive.facts().cpus` — never the calling thread's affinity: whichever
+/// thread first opens a device must not size process-wide pools by its own
+/// pin). The release store of the ready state pairs with the acquire loads
+/// in `pools()` so every thread sees the built pools. A failure is terminal
+/// for the process's data plane and is reported, not panicked, to the
+/// opener.
 pub fn initPools() Terminal!void {
     switch (pools_state.load(.acquire)) {
         2 => return,
@@ -201,7 +213,7 @@ pub fn initPools() Terminal!void {
         else => {},
     }
     if (pools_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
-        const cpus: u32 = @intCast(@max(1, std.Thread.getCpuCount() catch 1));
+        const cpus = derive.facts().cpus;
         // Process-lifetime pool memory: never freed, so the page allocator
         // (not a test allocator that would report it as a leak).
         const gpa = std.heap.page_allocator;
@@ -253,31 +265,30 @@ pub fn acquireBlockBuf() Terminal!Buf {
 }
 
 // ---------------------------------------------------------------------------
-// Request cells and the futex oneshot.
+// Request cells and their completion.
 // ---------------------------------------------------------------------------
 
 const Op = enum(u8) { read, write, fsync };
 
 /// How the worker answered: a kernel result, or a synthetic class.
-const Verdict = enum(u8) {
-    /// `res` is the CQE result (≥ 0 bytes, < 0 is `-errno`).
-    io,
+const Outcome = union(enum) {
+    /// The CQE result (≥ 0 bytes, < 0 is `-errno`).
+    io: i32,
     /// Teardown drained the request before it reached the ring.
     shutdown,
     /// The SQ stayed full after `sq_push_retries` flushes.
     sq_full,
+    /// The lane's ring died with the request in it, or before it was pushed.
+    ring_failed,
 };
 
 /// One request = one slot. Cells are preallocated per lane (the queue bound
 /// IS the slot bound, so `user_data = cell index < uring_req_queue_cap`); the
-/// hot path allocates nothing.
+/// hot path allocates nothing. A cell is handed off with the queue push
+/// (release) and back with the completion CAS (release), never raced; the
+/// worker's own "in the ring" mark is `Worker.in_ring`.
 const Cell = struct {
     op: Op = .read,
-    /// Set while the request sits in the queue or in the ring (tripwire
-    /// bookkeeping for orphan CQEs). Handed off with the queue push
-    /// (release) and the completion CAS (release), never raced.
-    in_flight: bool = false,
-    verdict: Verdict = .io,
     offset: u64 = 0,
     /// What the SQE names.
     dma_ptr: [*]u8 = undefined,
@@ -286,28 +297,18 @@ const Cell = struct {
     /// write bounce copy. `.none` for an aligned caller-owned write source
     /// (the caller is parked for the whole DMA, so its slice outlives it).
     buf: Buf = .empty,
-    /// The submit stamp, 0 while idle — the overdue census's input (read by
-    /// the watchdog's thread as a sample, so atomic; the worker's queue
+    /// The enqueue stamp, 0 while idle — the overdue census's input (read
+    /// by the watchdog's thread as a sample, so atomic; the worker's queue
     /// histograms read it too). Relaxed: nothing is published through it.
     enq_ns: std.atomic.Value(u64) = .init(0),
+    /// The submit stamp: the service phase's origin (worker-written).
     submitted_ns: u64 = 0,
-    res: i32 = 0,
-    /// Oneshot word: 0 pending, 1 completed. The caller is parked for the
-    /// whole op (no per-op timeout, so no abandonment state): the worker
-    /// owns `buf` until the CQE and the caller owns the cell after it.
-    state: std.atomic.Value(u32) = .init(0),
-
-    const pending: u32 = 0;
-    const completed: u32 = 1;
+    /// The ONE completion cell (`sync/completion.zig`). The caller parks on
+    /// it for the whole op — no per-op timeout (charter §4; decision 0003
+    /// Q5), so it is never abandoned: the worker owns `buf` until it
+    /// completes, the caller owns the cell after.
+    done: completion.Completion(Outcome) = .{},
 };
-
-fn futexWait(word: *const std.atomic.Value(u32), expect: u32) linux.E {
-    return linux.errno(linux.futex_4arg(&word.raw, .{ .cmd = .WAIT, .private = true }, expect, null));
-}
-
-fn futexWakeAll(word: *const std.atomic.Value(u32)) void {
-    _ = linux.futex_3arg(&word.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
-}
 
 // ---------------------------------------------------------------------------
 // Write watermark (spec §4): per-lane submitted/completed counters the
@@ -326,7 +327,7 @@ const WriteWatermark = struct {
     dead: std.atomic.Value(bool) = .init(false),
     /// Futex word bumped on every notify so a waiter never sleeps on a
     /// stale observation.
-    epoch: std.atomic.Value(u32) = .init(0),
+    epoch: futex.Word = .init(0),
 
     /// Caller thread, BEFORE the queue push.
     fn noteSubmitted(self: *WriteWatermark) void {
@@ -343,7 +344,7 @@ const WriteWatermark = struct {
 
     fn notify(self: *WriteWatermark) void {
         _ = self.epoch.fetchAdd(1, .seq_cst);
-        futexWakeAll(&self.epoch);
+        futex.wakeAll(&self.epoch);
     }
 
     /// Every exit path of the worker: parked barriers fail loud, never
@@ -367,7 +368,7 @@ const WriteWatermark = struct {
             // Re-check under the registered waiter (the Dekker half).
             if (self.completed.load(.seq_cst) >= target) return;
             if (self.dead.load(.seq_cst)) return error.WorkerShutdown;
-            _ = futexWait(&self.epoch, e);
+            futex.wait(&self.epoch, e);
         }
     }
 };
@@ -387,19 +388,24 @@ pub fn laneThreadName(n: u32) []const u8 {
     return std.fmt.bufPrint(&S.buf, "sqz-nvme{d}", .{n}) catch unreachable;
 }
 
+/// The arming handshake's verdict: the fd, the ring and the registrations
+/// are done, or which of the two openings refused.
+const ArmVerdict = enum { armed, open_refused, ring_failed };
+
 const Lane = struct {
     dev: *Device,
     /// Process-global lane number (the thread name's `<N>`).
     number: u32,
-    queue: nd.BoundedMpmcQueue(u32),
+    queue: mpmc.BoundedMpmc(u32),
     cells: []Cell,
-    free_cells: nd.BoundedMpmcQueue(u32),
+    free_cells: mpmc.BoundedMpmc(u32),
     wm: WriteWatermark = .{},
-    wake_fd: linux.fd_t,
-    coalescer: nd.WakeCoalescer = .{},
-    /// Landing buffer of the armed eventfd READ; the worker cancels that
-    /// read synchronously before tearing the ring down, so it may live here.
-    wake_buf: [8]u8 = @splat(0),
+    /// The ring, its eventfd wake and the park (`ring_park.ParkedRing`).
+    /// Built ON the lane thread (`SINGLE_ISSUER`: the thread that sets the
+    /// ring up is its only submitter) and quiesced there at exit; freed by
+    /// the closer after the join. Other threads touch only its wake face,
+    /// and only between `ready == .armed` and the seal.
+    park: ring_park.ParkedRing = undefined,
     /// Refuses new submitters (SeqCst — Dekker with `inflight_submitters`).
     closing: std.atomic.Value(bool) = .init(false),
     /// Producers inside `submit`. The closer waits for 0 before sealing.
@@ -407,23 +413,17 @@ const Lane = struct {
     /// Set only after every in-flight submitter left: the worker's
     /// disconnect signal, after which the queue can only drain.
     sealed: std.atomic.Value(bool) = .init(false),
-    /// Arming handshake (futex word): 0 arming, 1 armed (fd + ring +
-    /// registrations done), 2 O_DIRECT open refused, 3 ring setup failed.
-    /// `spawn` waits for it so an opener never gets a zombie lane and a
-    /// node that vanishes between the probe and the worker's open is
-    /// reported at open time, not at first I/O.
-    ready: std.atomic.Value(u32) = .init(0),
-    /// Registration outcomes, published before `ready` (engagement facts
-    /// for the stats face and the tests: a ReadFixed row is invalid unless
-    /// the slab is registered on the lane that served it).
-    fixed_file: std.atomic.Value(bool) = .init(false),
-    fixed_buf: std.atomic.Value(bool) = .init(false),
+    /// The arming handshake (a `sync.Completion`): `spawn` waits for it so
+    /// an opener never gets a zombie lane and a node that vanishes between
+    /// the probe and the worker's open is reported at open time, not at
+    /// first I/O. Its release publishes `park`, `fixed_file`, `fixed_buf`.
+    ready: completion.Completion(ArmVerdict) = .{},
+    /// Registration outcomes, published by `ready` (engagement facts for
+    /// the stats face and the tests: a ReadFixed row is invalid unless the
+    /// slab is registered on the lane that served it).
+    fixed_file: bool = false,
+    fixed_buf: bool = false,
     thread: ?std.Thread = null,
-
-    const arming: u32 = 0;
-    const armed: u32 = 1;
-    const open_refused: u32 = 2;
-    const ring_failed: u32 = 3;
 
     fn spawn(gpa: std.mem.Allocator, dev: *Device) !*Lane {
         const lane = try gpa.create(Lane);
@@ -431,24 +431,18 @@ const Lane = struct {
         const cells = try gpa.alloc(Cell, nd.uring_req_queue_cap);
         errdefer gpa.free(cells);
         @memset(cells, .{});
-        var queue = try nd.BoundedMpmcQueue(u32).init(gpa, nd.uring_req_queue_cap);
+        var queue = try mpmc.BoundedMpmc(u32).init(gpa, nd.uring_req_queue_cap);
         errdefer queue.deinit(gpa);
-        var free_cells = try nd.BoundedMpmcQueue(u32).init(gpa, nd.uring_req_queue_cap);
+        var free_cells = try mpmc.BoundedMpmc(u32).init(gpa, nd.uring_req_queue_cap);
         errdefer free_cells.deinit(gpa);
         var i: u32 = 0;
         while (i < nd.uring_req_queue_cap) : (i += 1) std.debug.assert(free_cells.tryPush(i));
-        // Level-triggered counter semaphore; non-blocking so a worker that
-        // raced a late write never blocks in a plain read.
-        const efd_raw = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-        if (linux.errno(efd_raw) != .SUCCESS) return error.SystemResources;
-        errdefer _ = linux.close(@intCast(efd_raw));
         lane.* = .{
             .dev = dev,
             .number = next_lane.fetchAdd(1, .monotonic),
             .queue = queue,
             .cells = cells,
             .free_cells = free_cells,
-            .wake_fd = @intCast(efd_raw),
         };
         lane.thread = try std.Thread.spawn(.{}, workerMain, .{lane});
         return lane;
@@ -457,17 +451,23 @@ const Lane = struct {
     /// Block until the worker armed (or failed); the caller deinits a
     /// failed lane.
     fn awaitArmed(self: *Lane) error{ DirectIoUnsupported, SystemResources }!void {
-        while (self.ready.load(.acquire) == arming) _ = futexWait(&self.ready, arming);
-        return switch (self.ready.load(.acquire)) {
-            armed => {},
-            open_refused => error.DirectIoUnsupported,
-            else => error.SystemResources,
+        return switch (self.ready.wait()) {
+            .armed => {},
+            .open_refused => error.DirectIoUnsupported,
+            .ring_failed => error.SystemResources,
         };
     }
 
-    fn publishReady(self: *Lane, state: u32) void {
-        self.ready.store(state, .release);
-        futexWakeAll(&self.ready);
+    fn publishReady(self: *Lane, verdict: ArmVerdict) void {
+        // The opener is parked on the handshake and never leaves it early.
+        const opener_waits = self.ready.complete(verdict);
+        std.debug.assert(opener_waits);
+    }
+
+    /// The park exists exactly when the lane armed (the worker built it
+    /// before publishing, and tears it down only after the seal).
+    fn hasPark(self: *Lane) bool {
+        return if (self.ready.poll()) |v| v == .armed else false;
     }
 
     /// Caller side: a free cell or null (the backpressure door; the queue
@@ -480,7 +480,6 @@ const Lane = struct {
     }
 
     fn freeCell(self: *Lane, idx: u32) void {
-        self.cells[idx].in_flight = false;
         std.debug.assert(self.free_cells.tryPush(idx));
     }
 
@@ -493,55 +492,43 @@ const Lane = struct {
         _ = self.inflight_submitters.fetchAdd(1, .seq_cst);
         defer _ = self.inflight_submitters.fetchSub(1, .release);
         if (self.closing.load(.seq_cst)) return false;
-        self.cells[idx].in_flight = true;
         if (!self.queue.tryPush(idx)) {
             stats.queue_push_with_cell.fire("lane queue refused a push while a cell was held");
-            self.cells[idx].in_flight = false;
             return false;
         }
         self.wake();
         return true;
     }
 
+    /// The producer half of the wake pair (`ring_park.Wake`, always through
+    /// the coalescer): N publishes between two lane passes cost ONE eventfd
+    /// write, the rest elide — `dev_wake_{writes,elided}`.
     fn wake(self: *Lane) void {
-        if (self.coalescer.arm()) {
-            self.writeEventfd();
-            stats.dev_wake_writes.inc();
-        } else {
-            stats.dev_wakes_elided.inc();
-        }
+        if (self.park.wake()) stats.dev_wake_writes.inc() else stats.dev_wakes_elided.inc();
     }
 
-    /// Unconditional 8-byte write (teardown): the worker parks on the ring,
-    /// so a closed queue is only observable through the wake.
-    fn writeEventfd(self: *Lane) void {
-        const one: u64 = 1;
-        _ = linux.write(self.wake_fd, @ptrCast(&one), 8);
-    }
-
-    /// Caller side: park on the oneshot until the worker publishes the
-    /// outcome — UNBOUNDED for every class. A per-op timeout is banned
-    /// (charter §4): an op the device never answers is OVERDUE in
+    /// Caller side: park on the cell until the worker publishes the outcome
+    /// — UNBOUNDED for every class. A per-op timeout is banned (charter
+    /// §4): an op the device never answers is OVERDUE in
     /// `Device.overdueCensus` for the watchdog to log loudly and, past its
     /// bound, to fence the VOLUME through the lattice (§1.8) — never one
     /// EIO per op after 30 s while the writes behind it park on the same
     /// lane (decision 0003 Q5).
-    fn wait(self: *Lane, idx: u32) void {
-        const c = &self.cells[idx];
-        // Acquire pairs with the worker's release swap so `res`/`buf` are
-        // visible once the state reads completed.
-        while (c.state.load(.acquire) != Cell.completed) _ = futexWait(&c.state, Cell.pending);
+    fn wait(self: *Lane, idx: u32) Outcome {
+        // The completion's acquire pairs with the worker's release CAS so
+        // `buf` is visible with the outcome.
+        return self.cells[idx].done.wait();
     }
 
     /// Worker side: publish the outcome; the parked caller owns the cell
-    /// from here. Release publishes `res`/`buf`/`verdict`.
-    fn complete(self: *Lane, idx: u32) void {
+    /// from here (the completion's release CAS publishes `buf`). A caller
+    /// never abandons (no per-op timeout), so the completer never inherits
+    /// the cleanup.
+    fn complete(self: *Lane, idx: u32, outcome: Outcome) void {
         const c = &self.cells[idx];
-        c.in_flight = false;
         c.enq_ns.store(0, .monotonic);
-        const prev = c.state.swap(Cell.completed, .release);
-        std.debug.assert(prev == Cell.pending);
-        futexWakeAll(&c.state);
+        const waiter_owns = c.done.complete(outcome);
+        std.debug.assert(waiter_owns);
     }
 
     /// Stop + join (idempotent): refuse new submitters → wait for in-flight
@@ -551,9 +538,13 @@ const Lane = struct {
     fn shutdown(self: *Lane) void {
         self.closing.store(true, .seq_cst);
         while (self.inflight_submitters.load(.seq_cst) != 0) std.Thread.yield() catch {};
+        // Release: every push that preceded the seal is visible to the
+        // worker's sealed-then-scan (acquire) pass.
         self.sealed.store(true, .release);
-        self.writeEventfd();
         if (self.thread) |t| {
+            // The eventfd outlives the worker (freed in `deinit`, after the
+            // join), so this write never races the lane's teardown.
+            if (self.hasPark()) self.park.forceWake();
             t.join();
             self.thread = null;
         }
@@ -561,7 +552,9 @@ const Lane = struct {
 
     fn deinit(self: *Lane, gpa: std.mem.Allocator) void {
         self.shutdown();
-        _ = linux.close(self.wake_fd);
+        // The worker quiesced the ring on its own thread; what is left is
+        // the close and the free, legal from the joining thread.
+        if (self.hasPark()) self.park.deinit();
         self.queue.deinit(gpa);
         self.free_cells.deinit(gpa);
         gpa.free(self.cells);
@@ -588,14 +581,18 @@ fn workerMain(lane: *Lane) void {
 
 /// Fail every still-queued request with the shutdown verdict.
 fn drainQueueAtExit(lane: *Lane) void {
-    while (lane.queue.tryPop()) |idx| {
-        const c = &lane.cells[idx];
-        c.verdict = .shutdown;
-        if (c.op != .read) lane.wm.noteCompleted();
-        c.buf.release();
-        c.buf = .empty;
-        lane.complete(idx);
-    }
+    while (lane.queue.tryPop()) |idx| answerUnrun(lane, idx, .shutdown);
+}
+
+/// Answer a request the ring will never complete (the exit drain, an
+/// SQ-full refusal, a dead ring): writes and fsyncs balance the watermark,
+/// the worker's buffer goes home, the outcome publishes.
+fn answerUnrun(lane: *Lane, idx: u32, outcome: Outcome) void {
+    const c = &lane.cells[idx];
+    if (c.op != .read) lane.wm.noteCompleted();
+    c.buf.release();
+    c.buf = .empty;
+    lane.complete(idx, outcome);
 }
 
 /// Runtime probe ladder, never a kernel-version table (charter §3):
@@ -603,31 +600,36 @@ fn drainQueueAtExit(lane: *Lane) void {
 /// the ring is its only submitter); `DEFER_TASKRUN` moves completion
 /// task-work onto this thread's own `io_uring_enter` instead of async
 /// IPI/task_work interrupts; `COOP_TASKRUN` is the milder variant. Each
-/// refusal falls back one rung; the last rung is a plain ring.
-fn buildWorkerRing() !struct { ring: IoUring, rung: []const u8 } {
-    const ladder = [_]struct { flags: u32, rung: []const u8 }{
-        .{ .flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN, .rung = "single_issuer+defer_taskrun" },
-        .{ .flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN, .rung = "single_issuer+coop_taskrun" },
-        .{ .flags = linux.IORING_SETUP_SINGLE_ISSUER, .rung = "single_issuer" },
-    };
-    for (ladder) |rung| {
-        if (IoUring.init(nd.ring_entries, rung.flags)) |ring| return .{ .ring = ring, .rung = rung.rung } else |_| {}
-    }
-    return .{ .ring = try IoUring.init(nd.ring_entries, 0), .rung = "plain" };
-}
+/// refusal falls back one rung (`ParkedRing.initProbing`); the last rung is
+/// a plain ring.
+const ring_ladder = [_]struct { flags: u32, rung: []const u8 }{
+    .{ .flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN, .rung = "single_issuer+defer_taskrun" },
+    .{ .flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN, .rung = "single_issuer+coop_taskrun" },
+    .{ .flags = linux.IORING_SETUP_SINGLE_ISSUER, .rung = "single_issuer" },
+    .{ .flags = 0, .rung = "plain" },
+};
+
+const ring_ladder_flags = blk: {
+    var flags: [ring_ladder.len]u32 = undefined;
+    for (ring_ladder, 0..) |rung, i| flags[i] = rung.flags;
+    break :blk flags;
+};
 
 const Worker = struct {
     lane: *Lane,
-    ring: *IoUring,
+    park: *ring_park.ParkedRing,
     fd: linux.fd_t,
     /// `register_files([fd])` succeeded: hot SQEs name fixed file 0.
     use_fixed_file: bool,
     /// The ranged slab is fixed buffer 0 on this ring.
     use_fixed_buf: bool,
-    wake_armed: bool = false,
-    wake_consumed: bool = false,
+    /// Cells whose SQE is in the ring (worker-private, by cell index): the
+    /// dead-ring sweep's input, never read through a caller's reset.
+    in_ring: []bool,
     active_count: usize = 0,
     disconnected: bool = false,
+    /// The ring broke: every request answers `RingFailed` (`failInFlight`).
+    ring_dead: bool = false,
     cqes: [256]linux.io_uring_cqe = undefined,
 
     /// The fd an SQE names: the fixed-file index or the raw fd.
@@ -645,21 +647,12 @@ const Worker = struct {
     fn getSqe(self: *Worker) ?*linux.io_uring_sqe {
         var attempt: u32 = 0;
         while (true) {
-            if (self.ring.get_sqe()) |sqe| return sqe else |_| {}
+            if (self.park.ring.get_sqe()) |sqe| return sqe else |_| {}
             if (attempt == nd.sq_push_retries) return null;
             attempt += 1;
             stats.dev_enters.inc();
-            _ = self.ring.submit() catch {};
+            _ = self.park.ring.submit() catch {};
         }
-    }
-
-    /// Push the eventfd READ under `UD_WAKE`. Level-triggered: a write that
-    /// races the re-arm completes the next read immediately.
-    fn armWake(self: *Worker) bool {
-        const sqe = self.getSqe() orelse return false;
-        sqe.prep_read(self.lane.wake_fd, &self.lane.wake_buf, 0);
-        sqe.user_data = nd.UD_WAKE;
-        return true;
     }
 };
 
@@ -677,26 +670,37 @@ fn workerThreadLoop(lane: *Lane) void {
     const fd_raw = linux.open(dev.path, .{ .ACCMODE = .RDWR, .DIRECT = true, .CLOEXEC = true }, 0);
     if (linux.errno(fd_raw) != .SUCCESS) {
         log.err("REFUSING data volume {s}: O_DIRECT open failed ({t}). Buffered device I/O is not a supported data-plane mode (DUR-2)", .{ dev.path, linux.errno(fd_raw) });
-        lane.publishReady(Lane.open_refused);
+        lane.publishReady(.open_refused);
         return;
     }
     const fd: linux.fd_t = @intCast(fd_raw);
     defer _ = linux.close(fd);
 
-    var built = buildWorkerRing() catch |e| {
-        log.err("NvmeBlockDev lane {d} ({s}): io_uring setup failed ({t}); the lane is dead", .{ lane.number, dev.path, e });
-        lane.publishReady(Lane.ring_failed);
+    const in_ring = dev.gpa.alloc(bool, lane.cells.len) catch {
+        log.err("NvmeBlockDev lane {d} ({s}): out of memory at start; the lane is dead", .{ lane.number, dev.path });
+        lane.publishReady(.ring_failed);
         return;
     };
-    defer built.ring.deinit();
-    log.debug("NvmeBlockDev lane {d} ({s}): ring rung {s}", .{ lane.number, dev.path, built.rung });
+    defer dev.gpa.free(in_ring);
+    @memset(in_ring, false);
+
+    // The ring, its eventfd and the park — on THIS thread (SINGLE_ISSUER),
+    // over the probe ladder. Freed by the closer after the join (`Lane.deinit`).
+    var rung: usize = undefined;
+    lane.park = ring_park.ParkedRing.initProbing(dev.gpa, nd.ring_entries, &ring_ladder_flags, &rung) catch {
+        log.err("NvmeBlockDev lane {d} ({s}): io_uring setup failed; the lane is dead", .{ lane.number, dev.path });
+        lane.publishReady(.ring_failed);
+        return;
+    };
+    // At exit, still on this thread: cancel the standing READ and reap its
+    // CQE, so nothing lands in the wake buffer after the lane is gone.
+    defer lane.park.quiesce();
+    log.debug("NvmeBlockDev lane {d} ({s}): ring rung {s}", .{ lane.number, dev.path, ring_ladder[rung].rung });
 
     // Fixed FILE: hot SQEs then name index 0 with IOSQE_FIXED_FILE (one fd
     // lookup/refcount per op saved). Refusal ⇒ plain fd.
-    const use_fixed_file = if (built.ring.register_files(&.{fd})) |_| true else |e| blk: {
-        log.debug("NvmeBlockDev lane {d}: register_files failed ({t}); using the raw fd", .{ lane.number, e });
-        break :blk false;
-    };
+    const use_fixed_file = lane.park.registerFile(fd);
+    if (!use_fixed_file) log.debug("NvmeBlockDev lane {d}: register_files refused; using the raw fd", .{lane.number});
 
     // Fixed BUFFER: the ranged read-bounce slab as ONE registered buffer
     // (index 0), so slab-resident cold-fill DMAs ride ReadFixed and skip the
@@ -705,7 +709,7 @@ fn workerThreadLoop(lane: *Lane) void {
     // pool is deliberately NOT registered: pinning cores×16×4 MiB (GiBs)
     // trades real RAM for a pin cost already amortized across 4 MiB DMAs.
     var iov = pools().ranged.iovec();
-    const use_fixed_buf = if (built.ring.register_buffers((&iov)[0..1])) |_| blk: {
+    const use_fixed_buf = if (lane.park.ring.register_buffers((&iov)[0..1])) |_| blk: {
         log.debug("NvmeBlockDev lane {d}: registered read-bounce slab ({d} MiB) as fixed buffer 0", .{ lane.number, iov.len >> 20 });
         break :blk true;
     } else |e| blk: {
@@ -713,58 +717,87 @@ fn workerThreadLoop(lane: *Lane) void {
         break :blk false;
     };
 
-    var w: Worker = .{ .lane = lane, .ring = &built.ring, .fd = fd, .use_fixed_file = use_fixed_file, .use_fixed_buf = use_fixed_buf };
-    lane.fixed_file.store(use_fixed_file, .monotonic);
-    lane.fixed_buf.store(use_fixed_buf, .monotonic);
-    lane.publishReady(Lane.armed);
+    var w: Worker = .{ .lane = lane, .park = &lane.park, .fd = fd, .use_fixed_file = use_fixed_file, .use_fixed_buf = use_fixed_buf, .in_ring = in_ring };
+    lane.fixed_file = use_fixed_file;
+    lane.fixed_buf = use_fixed_buf;
+    lane.publishReady(.armed);
     workerPasses(&w);
-    cancelWake(&w);
 }
 
 /// One pass per iteration: disarm-if-consumed → re-arm the wake → pump the
-/// queue (never blocks) → ONE `submit_and_wait(1)` → reap.
+/// queue (never blocks) → ONE park → reap.
 fn workerPasses(w: *Worker) void {
     const lane = w.lane;
+    const dev = lane.dev;
     while (true) {
         // Drain → disarm → scan: the worker half of the coalescer protocol.
-        if (w.wake_consumed) {
-            lane.coalescer.disarm();
-            w.wake_consumed = false;
+        _ = w.park.service();
+        if (takeArmed(&dev.seams.kill_ring)) {
+            // The seam's loud line is declared on the thread that logs it.
+            // The ring is healthy here, so the standing READ is cancelled
+            // first: a dead park polls the eventfd itself.
+            if (builtin.is_test) log.testing.expectErrorLogs(1);
+            w.park.quiesce();
+            w.park.markDead();
+            failInFlight(w);
         }
-        var pass_fills: usize = 0;
-        if (!w.wake_armed) {
-            w.wake_armed = w.armWake();
-            if (!w.wake_armed) stats.wake_arm_failed.fire("eventfd READ could not be queued after an SQ flush");
-        }
+        if (!w.ring_dead and !w.park.armWake()) stats.wake_arm_failed.fire("eventfd READ could not be queued after an SQ flush");
 
         // Sealed is read BEFORE the pump: every push ordered before the
         // seal (release/acquire through `sealed`) is visible to this scan.
         const sealed = lane.sealed.load(.acquire);
+        var pass_fills: usize = 0;
         while (lane.queue.tryPop()) |idx| {
+            if (w.ring_dead) {
+                answerUnrun(lane, idx, .ring_failed);
+                continue;
+            }
             if (!pumpOne(w, idx)) break;
             w.active_count += 1;
             pass_fills += 1;
         }
         if (sealed) w.disconnected = true;
         if (w.disconnected and w.active_count == 0) break;
+        holdIfArmed(&dev.seams);
 
-        // THE enter: flushes every SQE pushed this pass (requests + the
-        // re-armed wake) and parks for the FIRST event of either class.
+        // THE enter (`ring_park.park`): flushes every SQE pushed this pass
+        // (requests + the re-armed wake) and parks for the FIRST event of
+        // either class. Untimed: the wake ends an idle park, a CQE a busy
+        // one; the backstop tick exists only for the unarmed-wake case
+        // (tripwired above). A dead ring parks on the eventfd alone.
         stats.dev_enters.inc();
         if (pass_fills > 0) stats.dev_submit_enters.inc();
-        if (w.wake_armed or w.active_count > 0) {
-            _ = w.ring.submit_and_wait(1) catch |e| switch (e) {
-                error.SignalInterrupt => {},
-                else => log.warn("NvmeBlockDev lane {d}: io_uring_enter failed ({t})", .{ lane.number, e }),
-            };
-        } else {
-            // Nothing to wait for and no wake armed (tripwired above):
-            // flush and yield rather than spin.
-            _ = w.ring.submit() catch {};
-            std.Thread.yield() catch {};
-        }
+        const tick: ?u64 = if (w.ring_dead or w.park.wake_armed) null else nd.wake_unarmed_backstop_ns;
+        _ = w.park.park(tick);
+        if (w.park.isDead() and !w.ring_dead) failInFlight(w);
         reap(w);
     }
+}
+
+/// The hold seam: park-adjacent, so a test can place N publishes between
+/// two lane passes (`Seams.hold_before_park`).
+fn holdIfArmed(seams: *Seams) void {
+    if (seams.hold_before_park.load(.acquire) == 0) return;
+    seams.held.store(1, .release);
+    futex.wakeAll(&seams.held);
+    while (seams.hold_before_park.load(.acquire) != 0) futex.wait(&seams.hold_before_park, 1);
+}
+
+/// The ring broke (the park found its enter failing, or the seam killed
+/// it): every request IN the ring fails with `RingFailed` — once, here,
+/// loud — and every later one at the pump; the lane stays up to answer
+/// them (charter §1.2: no classical fallback; §1.8: fail loud). Nothing on
+/// a dead ring completes, so its CQEs are never read again.
+fn failInFlight(w: *Worker) void {
+    const lane = w.lane;
+    w.ring_dead = true;
+    log.err("NvmeBlockDev lane {d} ({s}): the ring is dead — failing {d} in-flight ops and every later request on this lane (RingFailed; charter §1.2: no classical fallback)", .{ lane.number, lane.dev.path, w.active_count });
+    for (w.in_ring, 0..) |*in_ring, i| {
+        if (!in_ring.*) continue;
+        in_ring.* = false;
+        answerUnrun(lane, @intCast(i), .ring_failed);
+    }
+    w.active_count = 0;
 }
 
 /// Build and push one request's SQE(s). False ⇒ the request was refused
@@ -810,11 +843,7 @@ fn pumpOne(w: *Worker, idx: u32) bool {
         // Queue-full refusal: terminal for this request; writes/fsyncs
         // balance the watermark here.
         log.err("NvmeBlockDev lane {d} ({s}): submission queue full after {d} flushes; refusing a {t} at offset {d}", .{ lane.number, dev.path, nd.sq_push_retries, c.op, c.offset });
-        c.verdict = .sq_full;
-        if (c.op != .read) lane.wm.noteCompleted();
-        c.buf.release();
-        c.buf = .empty;
-        lane.complete(idx);
+        answerUnrun(lane, idx, .sq_full);
         return false;
     };
     switch (c.op) {
@@ -841,28 +870,27 @@ fn pumpOne(w: *Worker, idx: u32) bool {
     }
     w.markFixed(sqe);
     sqe.user_data = idx;
+    w.in_ring[idx] = true;
     return true;
 }
 
-/// Reap every ready CQE after the pass's enter.
+/// Reap every ready CQE after the pass's park. A dead ring's CQEs are never
+/// read: its in-flight ops were already answered.
 fn reap(w: *Worker) void {
+    if (w.ring_dead) return;
     const lane = w.lane;
     var completed: usize = 0;
     while (true) {
-        const n = w.ring.copy_cqes(&w.cqes, 0) catch 0;
+        const n = w.park.ring.copy_cqes(&w.cqes, 0) catch 0;
         if (n == 0) break;
         for (w.cqes[0..n]) |cqe| {
-            if (cqe.user_data == nd.UD_WAKE) {
-                w.wake_consumed = true;
-                w.wake_armed = false;
-                continue;
-            }
+            if (w.park.consumeWake(cqe)) continue;
             if (cqe.user_data >= nd.UD_RESERVED) continue;
-            if (cqe.user_data >= lane.cells.len or !lane.cells[cqe.user_data].in_flight) {
+            if (cqe.user_data >= lane.cells.len or !w.in_ring[cqe.user_data]) {
                 stats.cqe_orphan_slot.fire("CQE named a slot with no in-flight request");
                 continue;
             }
-            completeOne(lane, @intCast(cqe.user_data), cqe.res);
+            completeOne(w, @intCast(cqe.user_data), cqe.res);
             completed += 1;
         }
     }
@@ -872,56 +900,32 @@ fn reap(w: *Worker) void {
     }
 }
 
-/// ORDER MATTERS: service phase → watermark (BEFORE the oneshot, so barrier
-/// drains never depend on caller scheduling) → release what the worker owns
-/// → publish.
-fn completeOne(lane: *Lane, idx: u32, res: i32) void {
+/// ORDER MATTERS: service phase → watermark (BEFORE the completion, so
+/// barrier drains never depend on caller scheduling) → release what the
+/// worker owns → publish.
+fn completeOne(w: *Worker, idx: u32, res: i32) void {
+    const lane = w.lane;
     const c = &lane.cells[idx];
-    c.res = res;
-    c.verdict = .io;
+    w.in_ring[idx] = false;
     switch (c.op) {
         .read => {
             stats.read_fill_dev_service_ns.record(clock.monotonicNs() -| c.submitted_ns);
             // The read buffer travels to the parked caller (MEM-1: the
             // worker owns the DMA destination until this CQE, the caller
             // from here).
-            lane.complete(idx);
+            lane.complete(idx, .{ .io = res });
         },
         .write => {
             stats.write_pipeline_dev_service_ns.record(clock.monotonicNs() -| c.submitted_ns);
             lane.wm.noteCompleted();
             c.buf.release();
             c.buf = .empty;
-            lane.complete(idx);
+            lane.complete(idx, .{ .io = res });
         },
         .fsync => {
             lane.wm.noteCompleted();
-            lane.complete(idx);
+            lane.complete(idx, .{ .io = res });
         },
-    }
-}
-
-/// Before the ring goes away: cancel the armed eventfd READ and reap its
-/// CQE, so no in-kernel completion can land in `wake_buf` after the lane
-/// is freed (the reference leaks the 8 bytes instead). Bounded: the cancel
-/// either finds the read (ECANCELED CQE) or it already completed (its CQE
-/// is pending) — either way one UD_WAKE CQE arrives.
-fn cancelWake(w: *Worker) void {
-    if (!w.wake_armed) return;
-    if (w.ring.cancel(nd.UD_RESERVED, nd.UD_WAKE, 0)) |_| {} else |_| {
-        _ = w.ring.submit() catch {};
-        _ = w.ring.cancel(nd.UD_RESERVED, nd.UD_WAKE, 0) catch return;
-    }
-    var rounds: u32 = 0;
-    while (w.wake_armed and rounds < 64) : (rounds += 1) {
-        _ = w.ring.submit_and_wait(1) catch |e| switch (e) {
-            error.SignalInterrupt => {},
-            else => return,
-        };
-        const n = w.ring.copy_cqes(&w.cqes, 0) catch return;
-        for (w.cqes[0..n]) |cqe| if (cqe.user_data == nd.UD_WAKE) {
-            w.wake_armed = false;
-        };
     }
 }
 
@@ -1076,7 +1080,7 @@ pub const Device = struct {
     /// Lane 0's registration outcomes: `(fixed file, fixed buffer)`.
     pub fn registrations(self: *const Device) struct { fixed_file: bool, fixed_buf: bool } {
         const l = self.lanes[0].?;
-        return .{ .fixed_file = l.fixed_file.load(.monotonic), .fixed_buf = l.fixed_buf.load(.monotonic) };
+        return .{ .fixed_file = l.fixed_file, .fixed_buf = l.fixed_buf };
     }
 
     /// Monotone, idempotent growth to `n` lanes.
@@ -1265,7 +1269,7 @@ pub const Device = struct {
         // latches the fence exactly like a device verdict).
         if (takeArmed(&self.seams.fail_next_writes)) {
             const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(self.seams.fail_errno.load(.seq_cst)))));
-            if (e == .SUCCESS) return error.DeviceIo;
+            if (e == .SUCCESS) return error.InputOutput;
             self.classifyDmaOutcome(e);
             return nd.errnoToError(e);
         }
@@ -1315,19 +1319,20 @@ pub const Device = struct {
         // NO timeout; the census names a lost completion.
         stats.device_lock_waiters.add(1);
         defer stats.device_lock_waiters.sub(1);
-        lane.wait(idx);
+        const outcome = lane.wait(idx);
         defer lane.freeCell(idx);
-        switch (c.verdict) {
+        const res = switch (outcome) {
             .shutdown => return error.WorkerShutdown,
-            .sq_full => return error.SubmissionQueueFull,
-            .io => {},
-        }
-        if (c.res < 0) {
-            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-c.res))));
+            .sq_full => return error.SubmissionQueueOverflow,
+            .ring_failed => return error.RingFailed,
+            .io => |res| res,
+        };
+        if (res < 0) {
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
             self.classifyDmaOutcome(e);
             return nd.errnoToError(e);
         }
-        if (@as(usize, @intCast(c.res)) != dma.len) return error.ShortRead;
+        if (@as(usize, @intCast(res)) != dma.len) return error.ShortWrite;
         stats.put_obj.inc();
     }
 
@@ -1387,30 +1392,34 @@ pub const Device = struct {
 
         // Unbounded (charter §4: no per-op timeout); a read the device never
         // answers sits in `overdueCensus` for the watchdog.
-        lane.wait(idx);
+        const outcome = lane.wait(idx);
         defer lane.freeCell(idx);
         const got_buf = c.buf;
         c.buf = .empty;
-        switch (c.verdict) {
+        const res = switch (outcome) {
             .shutdown => {
                 got_buf.release();
                 return error.WorkerShutdown;
             },
             .sq_full => {
                 got_buf.release();
-                return error.SubmissionQueueFull;
+                return error.SubmissionQueueOverflow;
             },
-            .io => {},
-        }
-        if (c.res < 0) {
+            .ring_failed => {
+                got_buf.release();
+                return error.RingFailed;
+            },
+            .io => |res| res,
+        };
+        if (res < 0) {
             got_buf.release();
-            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-c.res))));
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
             // A device ERROR (not a delay) classifies through the one
             // funnel: an EBADE on a read is the same reservation conflict.
             self.classifyDmaOutcome(e);
             return nd.errnoToError(e);
         }
-        switch (nd.finishRead(@intCast(c.res), size)) {
+        switch (nd.finishRead(@intCast(res), size)) {
             .full => {
                 if (count_in_get_obj) stats.get_obj.inc();
                 return .{ .full = got_buf };
@@ -1451,16 +1460,17 @@ pub const Device = struct {
         }
         stats.device_lock_waiters.add(1);
         defer stats.device_lock_waiters.sub(1);
-        lane.wait(idx);
+        const outcome = lane.wait(idx);
         defer lane.freeCell(idx);
-        switch (c.verdict) {
+        const res = switch (outcome) {
             .shutdown => return error.WorkerShutdown,
-            .sq_full => return error.SubmissionQueueFull,
-            .io => {},
-        }
-        if (c.res < 0) {
+            .sq_full => return error.SubmissionQueueOverflow,
+            .ring_failed => return error.RingFailed,
+            .io => |res| res,
+        };
+        if (res < 0) {
             // A barrier is a write-class command: EBADE latches the fence.
-            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-c.res))));
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
             self.classifyDmaOutcome(e);
             return nd.errnoToError(e);
         }
@@ -1670,7 +1680,7 @@ test "test_drop_device_during_unaligned_writes_joins_cleanly: close while 8 thre
     const dev = try Device.open(testing.allocator, tf.path);
     defer dev.deinit();
     const Writer = struct {
-        fn run(d: *Device, seed: u64, ok: *std.atomic.Value(u32), errs: *std.atomic.Value(u32)) void {
+        fn run(d: *Device, seed: u64, ok: *std.atomic.Value(u32), errs: *std.atomic.Value(u32), unexpected: *std.atomic.Value(u32)) void {
             var payload: [123]u8 = undefined;
             var i: u64 = 0;
             while (i < 8) : (i += 1) {
@@ -1679,27 +1689,30 @@ test "test_drop_device_during_unaligned_writes_joins_cleanly: close while 8 thre
                     _ = ok.fetchAdd(1, .monotonic);
                 } else |e| {
                     _ = errs.fetchAdd(1, .monotonic);
-                    switch (nd.classOf(e)) {
-                        .refusal, .terminal => {},
-                        .retryable => unreachable,
-                    }
+                    // The closing door (QueueFull: backpressure, EAGAIN-class)
+                    // or the exit drain (WorkerShutdown): nothing else.
+                    if (e != error.QueueFull and e != error.WorkerShutdown) _ = unexpected.fetchAdd(1, .monotonic);
                 }
             }
         }
     };
     var ok: std.atomic.Value(u32) = .init(0);
     var errs: std.atomic.Value(u32) = .init(0);
+    var unexpected: std.atomic.Value(u32) = .init(0);
     var threads: [8]std.Thread = undefined;
     const t0 = clock.monotonicNs();
-    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Writer.run, .{ dev, @as(u64, i), &ok, &errs });
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Writer.run, .{ dev, @as(u64, i), &ok, &errs, &unexpected });
     dev.close();
     for (threads) |t| t.join();
     const elapsed_s = (clock.monotonicNs() - t0) / std.time.ns_per_s;
     try testing.expectEqual(@as(u32, 64), ok.load(.monotonic) + errs.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), unexpected.load(.monotonic));
     try testing.expect(elapsed_s < 30);
-    // After close every submit is a refusal, never a hang.
+    // After close every submit is a refusal, never a hang; the class is
+    // backpressure (the caller may retry elsewhere), not "bad argument".
     var p: [16]u8 = undefined;
     try testing.expectError(error.QueueFull, dev.writeBlock(0, &p));
+    try testing.expectEqual(nd.ErrorClass.retryable, nd.classOf(error.QueueFull));
 }
 
 test "test_drop_after_unaligned_burst_does_not_hang: 32 sequential unaligned writes then close < 10 s" {
@@ -1986,6 +1999,156 @@ test "fill-issue economy: 64 queued fills behind a stalled lane ride ≤ 4 submi
     try testing.expect(stats.dev_submit_enters.load() - enters_before <= 4);
 }
 
+test "wake coalescing: N publishes between two lane passes cost ONE eventfd write — elision ≥ N−1" {
+    var tf: TestFile = .{};
+    try tf.create(1 * derive.MiB);
+    defer tf.destroy();
+    const dev = try Device.open(testing.allocator, tf.path);
+    defer dev.deinit();
+    // Warm: after this completion the lane consumed its wake, disarmed the
+    // coalescer and parked.
+    const warm = try dev.readBlock(0, 4096);
+    warm.release();
+    const seams = &dev.seams;
+    seams.held.store(0, .release);
+    seams.hold_before_park.store(1, .release);
+    const Reader = struct {
+        fn run(d: *Device, failed: *std.atomic.Value(u32)) void {
+            const b = d.readBlock(0, 4096) catch {
+                _ = failed.fetchAdd(1, .monotonic);
+                return;
+            };
+            b.release();
+        }
+    };
+    var failed: std.atomic.Value(u32) = .init(0);
+    var threads: [9]std.Thread = undefined;
+    // The first arrival wakes the parked lane; the pass pumps it and holds
+    // BEFORE its park.
+    threads[0] = try std.Thread.spawn(.{}, Reader.run, .{ dev, &failed });
+    while (seams.held.load(.acquire) == 0) futex.wait(&seams.held, 0);
+    const w0 = stats.dev_wake_writes.load();
+    const e0 = stats.dev_wakes_elided.load();
+    // N publishes between this pass and the next: the first pays the
+    // write (the pass disarmed), every other elides.
+    for (threads[1..]) |*t| t.* = try std.Thread.spawn(.{}, Reader.run, .{ dev, &failed });
+    const held_publishes: u64 = threads.len - 1;
+    while (stats.dev_wake_writes.load() + stats.dev_wakes_elided.load() - (w0 + e0) < held_publishes) std.atomic.spinLoopHint();
+    try testing.expectEqual(w0 + 1, stats.dev_wake_writes.load());
+    try testing.expectEqual(e0 + held_publishes - 1, stats.dev_wakes_elided.load());
+    seams.hold_before_park.store(0, .release);
+    futex.wakeAll(&seams.hold_before_park);
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
+    std.debug.print("\nmeasurement: {d} publishes between two lane passes: eventfd writes {d}, elided {d}\n", .{ held_publishes, stats.dev_wake_writes.load() - w0, stats.dev_wakes_elided.load() - e0 });
+}
+
+/// Counts allocation CALLS through to `inner` (the per-op allocation pin).
+const CountingAllocator = struct {
+    inner: std.mem.Allocator,
+    allocs: std.atomic.Value(u64) = .init(0),
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.allocs.fetchAdd(1, .monotonic);
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "a warm readBlock, writeBlock and flush allocate nothing (preallocated cells, pooled DMA buffers; charter §12)" {
+    var tf: TestFile = .{};
+    try tf.create(1 * derive.MiB);
+    defer tf.destroy();
+    var counting: CountingAllocator = .{ .inner = testing.allocator };
+    const dev = try Device.open(counting.allocator(), tf.path);
+    defer dev.deinit();
+    var payload: [4096]u8 align(4096) = undefined;
+    fillPattern(&payload, 21);
+    // Warm the lane and the pools, then pin.
+    try dev.writeBlock(0, &payload);
+    const warm = try dev.readBlock(0, 4096);
+    warm.release();
+    try dev.flush();
+    const before = counting.allocs.load(.monotonic);
+    try dev.writeBlock(4096, &payload);
+    const buf = try dev.readBlock(4096, 4096);
+    try expectPattern(buf.bytes(), 21);
+    buf.release();
+    try dev.flush();
+    try testing.expectEqual(before, counting.allocs.load(.monotonic));
+}
+
+test "a dead ring fails every in-flight op and every later request with RingFailed, balances the watermark, sends the DMA slots home, and the lane still joins cleanly" {
+    var tf: TestFile = .{};
+    try tf.create(1 * derive.MiB);
+    defer tf.destroy();
+    const dev = try Device.open(testing.allocator, tf.path);
+    defer dev.deinit();
+    const warm = try dev.readBlock(0, 4096);
+    warm.release();
+    const r0 = pools().ranged.allocated_bytes.load();
+    // Read A sits IN the ring behind a 300 ms linked timeout (the slow seam).
+    dev.setTestReadSlow(1, 300);
+    const Slow = struct {
+        fn run(d: *Device, got: *?anyerror) void {
+            const b = d.readBlock(0, 4096) catch |e| {
+                got.* = e;
+                return;
+            };
+            b.release();
+        }
+    };
+    var slow_err: ?anyerror = null;
+    const submit_enters = stats.dev_submit_enters.load();
+    const t = try std.Thread.spawn(.{}, Slow.run, .{ dev, &slow_err });
+    // A's pass reached its enter: the scan is over, A is in the ring.
+    while (stats.dev_submit_enters.load() == submit_enters) std.atomic.spinLoopHint();
+    // The kill lands at the next pass top; read B's arrival is that pass:
+    // A fails in the ring, B at the pump.
+    dev.seams.kill_ring.store(1, .seq_cst);
+    try testing.expectError(error.RingFailed, dev.readBlock(4096, 4096));
+    t.join();
+    try testing.expectEqual(@as(?anyerror, error.RingFailed), slow_err);
+    // Nothing in flight, both bounce slots recycled (MEM-1 held to the end).
+    try testing.expectEqual(@as(u32, 0), dev.overdueCensus(clock.monotonicNs(), 0).in_flight);
+    try testing.expectEqual(r0, pools().ranged.allocated_bytes.load());
+    // Write-class ops on the dead lane: RingFailed too, and the barrier's
+    // watermark drain never waits on them (submitted == completed).
+    var payload: [4096]u8 align(4096) = undefined;
+    fillPattern(&payload, 3);
+    try testing.expectError(error.RingFailed, dev.writeBlock(0, &payload));
+    try testing.expectError(error.RingFailed, dev.flush());
+    var wm: [1]Watermark = undefined;
+    const w = dev.writeLaneWatermarks(&wm)[0];
+    try testing.expectEqual(w.submitted, w.completed);
+    try testing.expect(!dev.fenced());
+    // `deinit` (deferred): the dead lane parks on its eventfd and the
+    // closer's wake ends it — a join, never a hang.
+}
+
+test "user_data sentinels: the seam's linked timeout sits below the park primitive's two tags, every slot index below all three" {
+    try testing.expect(nd.UD_SEAM < ring_park.reserved_ud);
+    try testing.expect(ring_park.reserved_ud < ring_park.wake_ud);
+    try testing.expect(@as(u64, nd.uring_req_queue_cap) < nd.UD_RESERVED);
+}
+
 test "slow-read seam: a fast fill completes while a linked-timeout slow fill holds the same lane (no head-of-line blocking)" {
     var tf: TestFile = .{};
     try tf.create(1 * derive.MiB);
@@ -2153,7 +2316,7 @@ test "fence latch: an injected EBADE write latches the fence, poisons custody, r
     const dev2 = try Device.open(testing.allocator, tf.path);
     defer dev2.deinit();
     dev2.setFailNextWritesErrno(1, .IO);
-    try testing.expectError(error.DeviceIo, dev2.writeBlock(0, &payload));
+    try testing.expectError(error.InputOutput, dev2.writeBlock(0, &payload));
     try testing.expect(!dev2.fenced());
     try dev2.writeBlock(0, &payload);
 }
@@ -2263,5 +2426,5 @@ test "loop device: capacity by seek(End), write-cache class from sysfs, aligned 
     if (past) |b| {
         b.release();
         return error.TestUnexpectedResult;
-    } else |e| try testing.expect(e == error.ShortRead or e == error.DeviceIo or e == error.InvalidArgument);
+    } else |e| try testing.expect(e == error.ShortRead or e == error.InputOutput or e == error.InvalidArgument);
 }

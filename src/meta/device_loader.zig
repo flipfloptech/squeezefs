@@ -14,10 +14,11 @@
 //! flush — so `barrier()` here (the pool's `IORING_FSYNC_DATASYNC` on its
 //! cached fd) covers everything written to the device BEFORE it started
 //! through any fd: node appends and images (this loader), bitmap pages and
-//! ledger slots (the sinks), SMO and compensation entries (`writeOps`), AND
-//! the journal lane's entries (its own fd on the same inode). The lane's
-//! barrier (an `FSYNC|DATASYNC` SQE on the lane's ring) covers the same
-//! population from its side. "Barrier only what the op touched" holds at
+//! ledger slots (the sinks), the recovery pad (`writeOps`), AND the journal
+//! lane's entries — user windows and the structural SMO/compensation
+//! entries alike (its own fd on the same inode). The lane's barrier (an
+//! `FSYNC|DATASYNC` SQE on the lane's ring) covers the same population from
+//! its side. "Barrier only what the op touched" holds at
 //! the device grain: a checkpoint barriers its own volume, never a
 //! sibling's; nothing here reaches another device.
 //!
@@ -90,14 +91,6 @@ pub const DeviceLoader = struct {
 
     pub fn pageSink(self: *DeviceLoader) checkpoint_cycle.PageSink {
         return .{ .ctx = self, .writePage = writePageFn };
-    }
-
-    /// The SMO journal's device path: entries' aligned runs through the
-    /// pool (never the lane — see `smo.DeviceHooks`); `completed` is the
-    /// backend's (it owns the lane to kick).
-    pub fn smoWrite(ctx: *anyopaque, ops: []const journal.WriteOp) error{Io}!void {
-        const self: *DeviceLoader = @ptrCast(@alignCast(ctx));
-        return self.writeOps(ops);
     }
 
     fn ioFailed(self: *const DeviceLoader, what: []const u8, offset: u64, len: usize, e: uring_fs.Error) LoaderError {

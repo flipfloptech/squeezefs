@@ -131,6 +131,10 @@ pub fn Parked(comptime F: type) type {
         /// A wake CQE was reaped and not yet disarmed (`service` closes it).
         wake_consumed: bool = false,
         dead: bool = false,
+        /// `io_uring_enter` calls this ring paid (submits, waits, flushes):
+        /// the owner's enters-per-op instrument (written by the owner
+        /// thread, read by any).
+        enters: std.atomic.Value(u64) = .init(0),
         gpa: Allocator,
 
         /// `flags` are the owner's `io_uring_setup` flags.
@@ -222,8 +226,15 @@ pub fn Parked(comptime F: type) type {
         /// independently of completions.
         pub fn getSqe(self: *Self) ?*Sqe {
             if (F.getSqe(&self.ring)) |sqe| return sqe;
-            _ = F.submit(&self.ring) catch {};
+            self.flush();
             return F.getSqe(&self.ring);
+        }
+
+        /// A non-blocking submit of every prepared SQE (one enter, no wait):
+        /// the owner's flush between parks.
+        pub fn flush(self: *Self) void {
+            _ = self.enters.fetchAdd(1, .monotonic);
+            _ = F.submit(&self.ring) catch {};
         }
 
         /// Push the eventfd READ under `wake_ud` unless it already stands. True
@@ -266,6 +277,7 @@ pub fn Parked(comptime F: type) type {
             const tick = tick_ns orelse return self.untimedWait();
             // Submit FIRST, in its own enter (see the module doc: a submitting
             // enter discards the wait's ETIME).
+            _ = self.enters.fetchAdd(1, .monotonic);
             _ = F.submit(ring) catch |e| switch (e) {
                 error.Interrupted => {},
                 else => return self.enterFailed(@errorName(e)),
@@ -274,6 +286,7 @@ pub fn Parked(comptime F: type) type {
             var ts: linux.kernel_timespec = .{ .sec = @intCast(tick / std.time.ns_per_s), .nsec = @intCast(tick % std.time.ns_per_s) };
             var arg: linux.io_uring_getevents_arg = .{ .sigmask = 0, .sigmask_sz = 0, .pad = 0, .ts = @intFromPtr(&ts) };
             // The kernel reads `arg`/`ts` during this call only.
+            _ = self.enters.fetchAdd(1, .monotonic);
             const rc = linux.syscall6(.io_uring_enter, @as(u32, @bitCast(ring.fd)), 0, 1, linux.IORING_ENTER_GETEVENTS | linux.IORING_ENTER_EXT_ARG, @intFromPtr(&arg), @sizeOf(linux.io_uring_getevents_arg));
             return switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => .event,
@@ -285,6 +298,7 @@ pub fn Parked(comptime F: type) type {
         }
 
         fn untimedWait(self: *Self) Verdict {
+            _ = self.enters.fetchAdd(1, .monotonic);
             _ = F.submitAndWait(&self.ring, 1) catch |e| switch (e) {
                 error.Interrupted => {},
                 else => return self.enterFailed(@errorName(e)),
@@ -336,6 +350,7 @@ pub fn Parked(comptime F: type) type {
             const sqe = self.getSqe() orelse return;
             F.prepCancel(sqe, wake_ud);
             sqe.user_data = reserved_ud;
+            _ = self.enters.fetchAdd(1, .monotonic);
             _ = F.submit(&self.ring) catch return;
             var cqes: [8]Cqe = undefined;
             var seen_wake = false;

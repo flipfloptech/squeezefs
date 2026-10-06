@@ -334,8 +334,14 @@ pub const Fiber = struct {
         const top = f.stack.?.top();
         f.ctx = switch (builtin.cpu.arch) {
             .aarch64, .riscv64 => .{ .sp = top, .fp = 0, .pc = @intFromPtr(&entry) },
-            // The ABI expects `rsp + 8` 16-aligned at entry (as after a `call`).
-            .x86_64 => .{ .rsp = top - 8, .rbp = 0, .rip = @intFromPtr(&entry) },
+            // The ABI expects `rsp + 8` 16-aligned at entry (as after a `call`);
+            // the slot at `rsp` is the first frame's return address: 0, so a
+            // stack walk ends here (see `entry`).
+            .x86_64 => blk: {
+                const ra: *usize = @ptrFromInt(top - 8);
+                ra.* = 0;
+                break :blk .{ .rsp = top - 8, .rbp = 0, .rip = @intFromPtr(&entry) };
+            },
             else => unreachable,
         };
     }
@@ -422,16 +428,24 @@ pub const Fiber = struct {
         _ = Io.fiber.contextSwitch(&sw);
     }
 
+    /// The link register is ZEROED before the first frame: the switch
+    /// arrives with the lane thread's return address in it, and a stack
+    /// walk (a panic trace, the test allocator's capture) that followed it
+    /// would apply the lane frames' unwind rules to the fiber's stack and
+    /// read garbage. A zero return address ends every walker (`fp = 0`
+    /// ends the frame-pointer chain the same way).
     fn entry() callconv(.naked) void {
         switch (builtin.cpu.arch) {
             .aarch64 => asm volatile (
                 \\ mov x0, x1
+                \\ mov x30, xzr
                 \\ b %[call]
                 :
                 : [call] "X" (&call),
             ),
             .riscv64 => asm volatile (
                 \\ mv a0, a1
+                \\ mv ra, zero
                 \\ tail %[call]@plt
                 :
                 : [call] "X" (&call),

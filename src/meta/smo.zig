@@ -120,11 +120,14 @@ pub const Error = tree.Error || node_cache.FreezeError || node_cache.AppendError
 
 /// The device binding of the checkpoint-class entry path (SMO entries, the
 /// rollback's compensation): `write` lands one entry's aligned runs on the
-/// device SYNCHRONOUSLY through the io pool — never through the journal
-/// lane, whose own thread runs hole checkpoints (a lane-thread SMO parking
-/// on a lane ticket would wait on itself); `completed` runs right after the
-/// reservation completes (the lane's kick — a stage-B prefix wait may sit
-/// behind a reservation the lane never saw).
+/// device and returns once they LANDED — on a mounted volume a STRUCTURAL
+/// submission through the journal lane (`journal_lane.submitStructural`:
+/// the same aligned-run path as a user window, no group, no ack, no
+/// barrier; a lane-thread caller parks as a fiber and the lane's own CQE
+/// answers it, so a compensation inside a verdict never waits on itself);
+/// `completed` runs right after the reservation completes (the lane's kick
+/// — a stage-B prefix wait may sit behind a reservation the lane's groups
+/// never saw).
 pub const DeviceHooks = struct {
     ctx: *anyopaque,
     write: *const fn (ctx: *anyopaque, ops: []const journal.WriteOp) error{Io}!void,

@@ -65,6 +65,46 @@ Wake coalescing on the lane: 8 publishes between parks → 1 eventfd write, 7 el
 window: 2 coalesced (wake + CQE), 3 strict (+ the barrier CQE); a 4×32 strict storm ran 1.6–2.0
 parks/window with 0 tick rescues. (Scoping rows on a virtual aarch64 box; not acceptance numbers.)
 
+### ONE thread per volume (landed 2026-10-06; charter §5.2, decision 0002 row 6)
+
+What moved: `meta/journal_lane.zig` onto `exec.Lane{.class = .journal}` — the lane's `ParkedRing`
+is the journal ring (fixed file 0, the FSYNC SQE), stage B is the lane's `Resident` CQE sink
+(runs, landings, the barrier's outcome) plus ONE lane-resident fiber (groups, prefix wait,
+verdicts, hooks, barriers, acks; its park a fiber park bounded by the owed-completion backstop and
+the flush due), the conveyor pass is a SECOND fiber on the same lane that the election winner
+wakes (`conveyor.PassSeam`; `backend.passEntry`), and SMO/compensation entries are structural
+submissions on the lane (`submitStructural`). A lane-thread caller (the pass fiber's handoff, the
+stage-B fiber's compensation inside a verdict) is admitted directly and waits as a fiber; a
+foreign caller rides the bounded inbound queue and one coalesced wake. The backend requires
+`SqzIo`'s `Io` (asserted at `open`): the admission park must park the fiber, not the lane thread.
+Close order became quiesce → pass fiber → task's final tick → lane shutdown (the tick's SMO entries
+ride the live lane).
+
+Instrument: `scripts/venue`, Debug test profile, 8 vCPU aarch64, ext4 regular file under O_DIRECT,
+grain 512 B. Test: `backend.zig` "ONE thread per volume…": 4 threads × 64 single-record txs,
+coalesced at the knob's ceiling (no barrier in the count); the `io_uring_enter` counter is
+`ring_park.Parked.enters` (every submit, wait, flush). **Scoping rows, not acceptance numbers.**
+
+| | windows (passes) | `io_uring_enter` / commit | / window | fiber parks / window | tick rescues |
+|---|---|---|---|---|---|
+| before (`dev` @ 09cc671, the pass on the committer's thread, 3 runs) | 191–193 | **2.98–3.01** | 4.00 | 2.00 (lane parks) | 0 |
+| after (both stages on `sqz-jrnl<N>`, 5 runs) | 161–204 | **1.58–1.66** | 1.99–2.63 | 1.19–1.34 | 0 |
+
+Pinned by the test: the pass ran on the lane's tid (`Conveyor.passThread() == JournalLane.threadId()`),
+`lane_writes ≡ leader_passes ≡ lane_handoffs`, `journal_lane_park_tick_rescues == 0`, the
+`journal_lane_ack_out_of_order` tripwire 0, fiber parks ≤ 2 per window + 1. Sequential single
+windows still cost 2 parks and 4 enters each (the lane's park is a submit + an EXT_ARG wait; the
+empty-submit enter is a `ring_park` follow-up). The kill matrix, the kill -9 rounds and the storm
+with concurrent checkpoints are unchanged in verdict (`before_smo_entry` now cuts at the lane's
+structural write: 23 owed of 24 acked present, 1 torn dropped on the cut image, the live close clean).
+
+Owed from this cut-over: a lane TICKET waited from a fiber on another lane (a handler lane's
+`fsync`) still parks on the cell's raw futex and holds that thread — it takes an `Io` route when
+the FUSE handlers land; the checkpointer's own `syncDevice` from a hole checkpoint run on the
+stage-B fiber is still the pool's `fdatasync` (a blocking wait on the lane thread, as before, on
+the failure path only); the `main` CLI still constructs no `SqzIo`, so the backend is reachable
+only from tests until rung 3's `run` becomes the daemon's entry.
+
 ## Model checks added this half (with the weakening that fails each)
 
 rwlock: a parking waiter racing release is never stranded (try-then-register split; park's
@@ -87,11 +127,16 @@ swap; flush by store). tree: the maintenance queue (stamp before payload).
 
 ## Deviations (deliberate) and owed
 
-- The conveyor pass runs inline on the election winner's thread; both stages on ONE OS thread per
-  volume arrives with the executor (`src/exec/`, decision 0001, rung 3). Stage B's ack IS already
-  delivered on the lane thread.
-- `journal_lane` owns its own ring (`uring_fs.OwnedRing` lacks an FSYNC SQE and fixed files); a
-  ~15-line `OwnedRing.submitFdatasync` lets it move back — owed.
+- ~~The conveyor pass runs inline on the election winner's thread; both stages on ONE OS thread per
+  volume arrives with the executor (`src/exec/`, decision 0001, rung 3).~~ **Landed 2026-10-06**
+  (see "ONE thread per volume" below): the pass is a fiber on the journal lane, woken by the
+  election winner; the inline arm survives only as the portable contracts' `PassSeam` binding.
+- ~~`journal_lane` owns its own ring (`uring_fs.OwnedRing` lacks an FSYNC SQE and fixed files).~~
+  **Landed 2026-10-06**: the lane IS an `exec.Lane{.class = .journal}`; its ring is the lane's
+  `ParkedRing`, its park the lane's pass (no second park protocol).
+- ~~SMO and compensation entries go through the io pool, never the lane.~~ **Landed 2026-10-06**:
+  structural submissions through the lane (`submitStructural`), the ONE reservation core ordering
+  both writer classes.
 - Only the `--single-writer` class mounts; the symmetric forest refuses `UnsupportedFormat` until
   rung 6. D0 layers B1 (PR) and B2 (the claim record) are later rungs; layer A (`flock`) is in.
 - Zig has no unwinding: the reference's panic-guarded sentinels are explicit failure arms

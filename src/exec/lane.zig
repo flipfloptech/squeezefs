@@ -23,6 +23,12 @@
 //!      counted rescue (`exec_lane_tick_rescues` ≈ 0) and disarms the
 //!      coalescer so the lost write cannot silence later producers.
 //!
+//! A lane may carry ONE `Resident` (the journal lane's stage B): a protocol
+//! whose ring ops are tagged below the fiber space and routed to it at
+//! step 2, and which is told the thread's start and exit. Its own waiting
+//! is a fiber's (the lane's park IS its park); only the CQE routing and the
+//! two thread edges are the hook.
+//!
 //! Lost-wake freedom (the reference's L33–37 argument, re-based on the
 //! coalescer): every foreign push is followed by `arm` (a SeqCst RMW); the
 //! lane's `service` disarm is a SeqCst RMW followed by the scan. A push whose
@@ -71,12 +77,38 @@ pub const tick_ns: u64 = tick_law.tick_ns;
 /// never takes it, short enough that a lost CQE wake is a hiccup.
 pub const backstop_ns: u64 = 100 * std.time.ns_per_ms;
 
-/// `user_data` values below this are the lane's own tags, never a fiber
-/// (fibers live above the first page).
+/// `user_data` values below this are the lane's own tags or its resident's,
+/// never a fiber (fibers live above the first page).
 const first_fiber_ud: u64 = 4096;
 /// The tag of an `ASYNC_CANCEL` SQE the lane issued (its CQE is ignored:
 /// the original op's CQE releases the fiber).
 const cancel_ud: u64 = 1;
+/// The resident's tag space: `[resident_ud_min, resident_ud_max]` — above
+/// the lane's own tags, below any fiber.
+pub const resident_ud_min: u64 = cancel_ud + 1;
+pub const resident_ud_max: u64 = first_fiber_ud - 1;
+
+/// A protocol that LIVES on a lane and owns ring ops of its own (the
+/// journal lane's stage B: many WRITE SQEs per window plus the one FSYNC,
+/// tagged below `first_fiber_ud`): the lane routes their CQEs to it and
+/// gives it the thread's start and exit. Everything else it does — issuing
+/// SQEs on `lane.ring`, parking, timers — it does as an ordinary fiber on
+/// the lane, so there is ONE park protocol (the lane's pass).
+pub const Resident = struct {
+    ctx: *anyopaque,
+    /// On the lane thread once the ring stands, before `start` returns.
+    started: *const fn (ctx: *anyopaque) void,
+    /// A CQE under a resident tag.
+    cqe: *const fn (ctx: *anyopaque, cqe: linux.io_uring_cqe) void,
+    /// The ring died (an enter or a CQE read failed): fail every owed op.
+    ringDead: *const fn (ctx: *anyopaque) void,
+    /// On the lane thread after the last pass, before the ring is quiesced.
+    stopping: *const fn (ctx: *anyopaque) void,
+};
+
+/// What a cross-thread `enqueue` paid: nothing (same lane: the ready FIFO),
+/// an eventfd write, or an elided one (the coalescer saw a wake pending).
+pub const WakeCost = enum { same_lane, written, elided };
 
 /// Ring entries from the fiber population: one SQE per fiber in flight +
 /// the standing wake READ + cancels, rounded to the power of two the kernel
@@ -119,6 +151,11 @@ pub const Options = struct {
     poll_budget: u16 = 0,
     /// `SQUEEZEFS_TEST_EXEC_DROP_WAKE`: drop the first foreign wake write.
     drop_first_wake: bool = false,
+    /// The ring's SQ depth; null = `ringEntriesFor(fiber_capacity)`. A
+    /// resident that issues many SQEs per fiber (the journal lane's runs)
+    /// sizes the ring from its own population.
+    ring_entries: ?u16 = null,
+    resident: ?Resident = null,
 };
 
 /// Set on a lane thread for its lifetime.
@@ -176,6 +213,8 @@ pub const Lane = struct {
     affinity: ?placement.CpuSet,
     poll_budget: u16,
     drop_next_wake: std.atomic.Value(bool),
+    ring_entries: u16,
+    resident: ?Resident,
     ring_dead_logged: bool = false,
 
     pub const InitError = std.mem.Allocator.Error;
@@ -207,6 +246,8 @@ pub const Lane = struct {
             .affinity = options.affinity,
             .poll_budget = options.poll_budget,
             .drop_next_wake = .init(options.drop_first_wake),
+            .ring_entries = options.ring_entries orelse ringEntriesFor(options.fiber_capacity),
+            .resident = options.resident,
         };
         self.name = commNameFor(&self.name_src, options.class, options.index);
         self.inbox = try mpmc.BoundedMpmc(Msg).init(gpa, 2 * options.fiber_capacity);
@@ -292,17 +333,27 @@ pub const Lane = struct {
             futex.wakeAll(&self.started);
             return;
         };
+        // The resident's start (a fixed-file registration, its thread-local
+        // seams) precedes the ready signal so `start` returns a lane whose
+        // ring is fully set.
+        if (self.resident) |r| r.started(r.ctx);
         self.started.store(1, .release);
         futex.wakeAll(&self.started);
         self.runLoop();
+        if (self.resident) |r| r.stopping(r.ctx);
         self.ring.quiesce();
         self.alive.store(false, .release);
     }
 
     fn initRingHere(self: *Lane) error{RingSetupFailed}!void {
         var rung: usize = undefined;
-        self.ring = ring_park.ParkedRing.initProbing(self.gpa, ringEntriesFor(self.fiber_capacity), &setup_ladder, &rung) catch return error.RingSetupFailed;
+        self.ring = ring_park.ParkedRing.initProbing(self.gpa, self.ring_entries, &setup_ladder, &rung) catch return error.RingSetupFailed;
         if (rung != 0) log.debug("exec: lane {d} ({s}) ring on setup rung {d}", .{ self.index, self.name, rung });
+    }
+
+    /// `io_uring_enter` calls this lane's ring paid so far.
+    pub fn enters(self: *const Lane) u64 {
+        return self.ring.enters.load(.monotonic);
     }
 
     /// The `main` class: the CALLING thread is the lane (`SqzIo.run`'s
@@ -387,15 +438,21 @@ pub const Lane = struct {
     /// Same lane thread ⇒ the ready FIFO with no eventfd write (the
     /// `CURRENT_FUSED_LANE` elision); otherwise the inbox + the coalesced wake.
     pub fn enqueue(self: *Lane, f: *Fiber) void {
+        _ = self.enqueueReporting(f);
+    }
+
+    /// `enqueue` that reports what the wake cost (a producer's own
+    /// `wake_{writes,elided}` mirror).
+    pub fn enqueueReporting(self: *Lane, f: *Fiber) WakeCost {
         assert(f.lane == self);
         if (current_lane == self) {
             stats.same_lane_wakes.inc();
             self.pushReady(f);
-            return;
+            return .same_lane;
         }
         stats.cross_lane_wakes.inc();
         if (!self.inbox.tryPush(.{ .run = f })) stats.inbox_overflow.fire("lane inbox full on a run message");
-        self.wakeFromForeign();
+        return self.wakeFromForeign();
     }
 
     /// Ask the OWNING lane to `ASYNC_CANCEL` the ring op `f` is parked on.
@@ -405,13 +462,18 @@ pub const Lane = struct {
             return;
         }
         if (!self.inbox.tryPush(.{ .cancel_op = f })) stats.inbox_overflow.fire("lane inbox full on a cancel message");
-        self.wakeFromForeign();
+        _ = self.wakeFromForeign();
     }
 
-    fn wakeFromForeign(self: *Lane) void {
+    fn wakeFromForeign(self: *Lane) WakeCost {
         // The seam: one dropped write, healed by the tick rescue.
-        if (self.drop_next_wake.load(.monotonic) and self.drop_next_wake.swap(false, .acq_rel)) return;
-        if (self.ring.wake()) stats.wake_writes.inc() else stats.wake_elided.inc();
+        if (self.drop_next_wake.load(.monotonic) and self.drop_next_wake.swap(false, .acq_rel)) return .elided;
+        if (self.ring.wake()) {
+            stats.wake_writes.inc();
+            return .written;
+        }
+        stats.wake_elided.inc();
+        return .elided;
     }
 
     // ---- the lane thread's SQE face ----
@@ -487,7 +549,10 @@ pub const Lane = struct {
             };
             for (cqes[0..n]) |cqe| {
                 if (self.ring.consumeWake(cqe)) continue;
-                if (cqe.user_data < first_fiber_ud) continue;
+                if (cqe.user_data < first_fiber_ud) {
+                    if (cqe.user_data >= resident_ud_min) if (self.resident) |r| r.cqe(r.ctx, cqe);
+                    continue;
+                }
                 const f: *Fiber = @ptrFromInt(cqe.user_data);
                 f.cqe_res = cqe.res;
                 f.cqe_flags = cqe.flags;
@@ -573,12 +638,12 @@ pub const Lane = struct {
         if (!self.ring.armWake()) tick = @min(tick, backstop_ns);
         if (self.ready_head != null or tick == 0) {
             // Work in hand: a non-blocking flush of this pass's SQEs and loop.
-            _ = self.ring.ring.submit() catch {};
+            self.ring.flush();
             return;
         }
         if (self.inbox.tryPop()) |m| {
             self.handleMsg(m);
-            _ = self.ring.ring.submit() catch {};
+            self.ring.flush();
             return;
         }
         const verdict = self.ring.park(tick);
@@ -602,6 +667,7 @@ pub const Lane = struct {
         if (!self.ring_dead_logged) {
             self.ring_dead_logged = true;
             log.err("exec: lane {d} ({s}) ring is dead — {d} in-flight ring ops fail EIO; the lane keeps serving its parked fibers on the eventfd and takes no new spawns", .{ self.index, self.name, self.in_flight });
+            if (self.resident) |r| r.ringDead(r.ctx);
         }
         for (self.fibers) |*f| {
             if (f.cancelWord().awaiting != .ring_op) continue;
@@ -929,6 +995,60 @@ test "the exit edges: a stop while parked returns at once; a stop with ready wor
     gate.done.store(1, .release);
     waitQuiescent(l2);
     try testing.expectEqual(@as(u32, 2), gate.hits.load(.acquire));
+}
+
+test "a resident: started/stopping run on the lane thread, a NOP under a resident tag completes to its cqe hook (never to a fiber), the ring depth override holds, enters are counted" {
+    const Res = struct {
+        started_on: std.atomic.Value(u64) = .init(0),
+        stopped_on: std.atomic.Value(u64) = .init(0),
+        cqe_ud: std.atomic.Value(u64) = .init(0),
+        done: futex.Word = .init(0),
+
+        fn started(ctx: *anyopaque) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.started_on.store(@intCast(linux.gettid()), .release);
+        }
+        fn cqe(ctx: *anyopaque, c: linux.io_uring_cqe) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.cqe_ud.store(c.user_data, .release);
+            r.done.store(1, .release);
+            futex.wakeAll(&r.done);
+        }
+        fn ringDead(_: *anyopaque) void {}
+        fn stopping(ctx: *anyopaque) void {
+            const r: *@This() = @ptrCast(@alignCast(ctx));
+            r.stopped_on.store(@intCast(linux.gettid()), .release);
+        }
+        fn resident(r: *@This()) Resident {
+            return .{ .ctx = r, .started = started, .cqe = cqe, .ringDead = ringDead, .stopping = stopping };
+        }
+        /// Issued from a fiber on the lane (the resident's own thread).
+        fn issue(context: *const anyopaque) void {
+            const l = ctxOf(context).lane;
+            const sqe = l.ring.getSqe().?;
+            sqe.prep_nop();
+            sqe.user_data = resident_ud_max;
+        }
+    };
+    var r: Res = .{};
+    const page = std.heap.pageSize();
+    const l = try Lane.init(testing.allocator, .{ .index = 5, .class = .journal, .fiber_capacity = 4, .stack_size = fiber_mod.stackSizeFor(.journal, page), .page = page, .ring_entries = 256, .resident = r.resident() });
+    defer l.deinit();
+    try l.start();
+    try testing.expectEqualStrings("sqz-jrnl5", l.name);
+    try testing.expect(r.started_on.load(.acquire) != 0);
+    try testing.expect(r.started_on.load(.acquire) != @as(u64, @intCast(linux.gettid())));
+    try testing.expectEqual(@as(u32, 256), l.ring.ring.sq.sqes.len);
+    const enters_before = l.enters();
+    var g = membersGroup(1);
+    var p: Probe = .{};
+    _ = try spawnTest(l, &g, Res.issue, .{ .probe = &p, .lane = l });
+    while (r.done.load(.acquire) == 0) futex.wait(&r.done, 0);
+    try testing.expectEqual(resident_ud_max, r.cqe_ud.load(.acquire));
+    try testing.expect(l.enters() > enters_before);
+    waitQuiescent(l);
+    l.stopAndJoin();
+    try testing.expectEqual(r.started_on.load(.acquire), r.stopped_on.load(.acquire));
 }
 
 test "ring entries derivation: power of two above the fiber population + wake + cancels, floor 8, ceiling 4096" {

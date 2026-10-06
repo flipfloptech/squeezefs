@@ -12,12 +12,17 @@
 //! A committer builds its queue entry (`tx.buildQueuedTx`: the exact entry
 //! length, the value cap — an over-cap tx fails ALONE), enqueues it with
 //! its completion channel, leader-elects (`conveyor_core`: no suspension
-//! point between the two) and parks on the channel. The election winner
-//! runs the pass on its own thread until the queue is empty and
-//! leadership is released (`unleadAndRecheck`) — the detached pass of
-//! charter §9 without an executor (decision 0001: the pass moves to the
-//! metadata pool when `SqzIo` lands; its lifetime is bound to leadership,
-//! not to the winner's own tx, which the lane answers like every other).
+//! point between the two) and parks on the channel. The election is the
+//! "is a pass already scheduled" latch: the winner WAKES the pass through
+//! the `PassSeam` (one wake; a loser's entry is drained by the pass the
+//! winner woke — the no-lost-wakeup theorem) and parks like every follower.
+//! The pass (`runScheduledPass`) runs until the queue is empty and
+//! leadership is released (`unleadAndRecheck`). On a mounted volume the
+//! pass is a fiber on the volume's journal lane (`backend.zig`; charter
+//! §5.2 "both stages on ONE OS thread per writable volume", decision 0002
+//! row 6): stage A hands its window to stage B on the SAME thread, so a
+//! task wake and a device CQE are one `io_uring_enter` wait. The portable
+//! contracts below bind the seam to an inline call.
 //!
 //! Stage A per drained batch, the survey's 14 steps:
 //!   A0 drain (caps: `max(64, cpus × 2)` txs / `max(256 KiB, ring/16)`
@@ -407,10 +412,6 @@ pub const TestSeams = struct {
     /// Fail ONE member's apply after it applied (the in-window roll-out
     /// machinery runs for real): the member whose records name this inode.
     poison_apply_ino: std.atomic.Value(u64) = .init(0),
-    /// 1 ⇒ the leader parks BEFORE its drain (arrivals accumulate into one
-    /// batch deterministically); `held` publishes the park.
-    hold_pre_drain: std.atomic.Value(u32) = .init(0),
-    held: std.atomic.Value(u32) = .init(0),
     /// 1 ⇒ a pass parked at ring admission holds between its registration
     /// on `space` and its wait (the window a wake must reach); `park_held`
     /// publishes the hold.
@@ -419,11 +420,6 @@ pub const TestSeams = struct {
 };
 
 pub var test_seams: TestSeams = .{};
-
-/// Release a leader parked at `hold_pre_drain`.
-pub fn testReleasePreDrain() void {
-    test_seams.hold_pre_drain.store(0, .release);
-}
 
 // ---------------------------------------------------------------------------
 // Queue entries, windows, the seams.
@@ -489,6 +485,15 @@ pub const Window = struct {
     }
 };
 
+/// The pass's venue: `wake` is called by the committer that won the
+/// election and must make `runScheduledPass` run — on the journal lane's
+/// pass fiber (the backend), inline on the caller (the portable contracts).
+/// Never a suspension point for the caller.
+pub const PassSeam = struct {
+    ctx: *anyopaque,
+    wake: *const fn (ctx: *anyopaque) void,
+};
+
 /// Stage B's binding: the journal lane (Linux) or the in-RAM lane.
 pub const LaneSeam = struct {
     ctx: *anyopaque,
@@ -538,6 +543,7 @@ pub const Deps = struct {
     appender_id: u32,
     latch: *journal.FailureLatch,
     lane: LaneSeam,
+    pass: PassSeam,
     checkpoint: CheckpointHooks,
     /// The checkpoint-class direct writer: the rollback's compensation
     /// entry (never parks behind user admissions; never the lane).
@@ -567,6 +573,9 @@ pub const Conveyor = struct {
     inflight_lock: jc.SpinLock = .{},
     inflight: std.AutoHashMapUnmanaged(u64, *Window) = .empty,
     inflight_cap: usize,
+    /// The thread the last pass ran on (`std.Thread.getCurrentId`): the
+    /// venue witness — ≡ the journal lane's tid on a mounted volume.
+    pass_thread: std.atomic.Value(u64) = .init(0),
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -732,10 +741,23 @@ pub const Conveyor = struct {
     }
 
     /// Enqueue + elect — no suspension point between: a committer that
-    /// disappears can never strand an entry leaderless. The winner runs
-    /// the pass on this thread until leadership is released.
+    /// disappears can never strand an entry leaderless. The winner wakes
+    /// the pass (ONE wake per election; the pass holds leadership until an
+    /// empty drain releases it).
     fn leadIfElected(self: *Conveyor) void {
-        if (self.core.tryLead()) self.pass();
+        if (self.core.tryLead()) self.deps.pass.wake(self.deps.pass.ctx);
+    }
+
+    /// The pass venue's body: run the pass iff an election scheduled one
+    /// (the leader latch is set). A wake that finds no leader is spurious
+    /// (the previous pass drained the entry before the wake landed).
+    pub fn runScheduledPass(self: *Conveyor) void {
+        if (self.core.leader.load(.seq_cst)) self.pass();
+    }
+
+    /// The thread the last pass ran on (0 before any).
+    pub fn passThread(self: *const Conveyor) u64 {
+        return self.pass_thread.load(.acquire);
     }
 
     fn park(self: *Conveyor, done: *Done) Error!void {
@@ -747,13 +769,11 @@ pub const Conveyor = struct {
     // ---- the pass (stage A) ----
 
     /// The leader's loop: drain → `runBatch` until an empty drain releases
-    /// leadership (release THEN re-check: the no-lost-wakeup theorem).
+    /// leadership (release THEN re-check: the no-lost-wakeup theorem). The
+    /// caller holds leadership.
     pub fn pass(self: *Conveyor) void {
+        self.pass_thread.store(@intCast(std.Thread.getCurrentId()), .release);
         while (true) {
-            while (test_seams.hold_pre_drain.load(.acquire) != 0) {
-                test_seams.held.store(1, .release);
-                std.Thread.yield() catch std.atomic.spinLoopHint();
-            }
             const batch = self.core.drainBatch(self.deps.caps, self.batch_buf);
             if (batch.len == 0) {
                 if (!self.core.unleadAndRecheck()) return;
@@ -1914,6 +1934,7 @@ const Harness = struct {
             .appender_id = h.vol.journal.appender_id,
             .latch = &h.latch,
             .lane = h.lane.seam(),
+            .pass = .{ .ctx = h, .wake = passInline },
             .checkpoint = .{ .ctx = h, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowFn, .checkpointPast = checkpointPastFn, .space = &h.space, .posture = &h.posture, .space_retry = &h.space_retry },
             .smo_journal = h.vol.journal,
             .caps = caps orelse .{ .max_txs = deriveBatchTxs(8), .max_bytes = resolveBatchBytes(null, ringUserCapacity(geo)) },
@@ -1940,6 +1961,13 @@ const Harness = struct {
     }
 
     fn smoCompleted(_: *anyopaque) void {}
+
+    /// The contracts' pass venue: the election winner's own thread, inline
+    /// (deterministic: a commit returns with its pass run).
+    fn passInline(ctx: *anyopaque) void {
+        const h: *Harness = @ptrCast(@alignCast(ctx));
+        h.cv.runScheduledPass();
+    }
 
     fn kickPark(ctx: *anyopaque) void {
         const h: *Harness = @ptrCast(@alignCast(ctx));
@@ -2064,6 +2092,8 @@ test "a single commit: the pass drains one, the lane lands it and acks after the
     try testing.expectEqual(@as(u64, 0), h.cv.stats.commit_parked.load());
     try testing.expectEqual(@as(usize, 0), h.cv.pending());
     try testing.expect(!h.cv.core.leader.load(.seq_cst));
+    // The contracts' venue: the pass ran inline on the committer's thread.
+    try testing.expectEqual(@as(u64, @intCast(std.Thread.getCurrentId())), h.cv.passThread());
     try testing.expectEqual(@as(usize, 0), h.vol.reg.openCount());
     try testing.expectEqual(h.vol.core.headPos(), h.vol.reg.completedUpto());
     // The entry replays whole from the image.

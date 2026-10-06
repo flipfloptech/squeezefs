@@ -63,7 +63,12 @@ that break each law.
 - Lane-local timers remove by index (no tombstones) — 0002 row 64 records why.
 - `Io.Batch.awaitAsync` on a lane aborts (its error set admits no refusal) — row 70; `awaitConcurrent`
   refuses.
-- Journal-class lanes (`sqz-jrnl<N>`) have their names, stack class and tests here; the cutover of
+- ~~Journal-class lanes (`sqz-jrnl<N>`) have their names, stack class and tests here; the cutover of
   `meta/journal_lane.zig` onto `Lane{.class = .journal}` (0002 row 6) is the rung-3 transport agent's
-  follow-up, as is the `fuse_ur` worker's use of `poll_budget = 1`.
+  follow-up~~ — landed 2026-10-06 (`rung-02b` evidence, "ONE thread per volume"). The lane gained
+  the `Resident` hook (a CQE sink below the fiber tag space + the thread's start/exit edges), a
+  `ring_entries` override, `enqueueReporting` (the producer's wake-cost mirror) and `enters()`; the
+  fiber trampoline zeroes the link register so a stack walk (a panic trace, the test allocator's
+  capture) ends at the fiber's first frame. The `fuse_ur` worker's `poll_budget = 1` remains the
+  transport agent's.
 - The `main` CLI still runs on `Io.Threaded`; `SqzIo.run` is tested and waits for the FUSE session.

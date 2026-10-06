@@ -29,14 +29,25 @@
 //!    max(ledger, replayed + 1)`.
 //! 8. The journal core resumed at the recovered head, the registry, the
 //!    head's sector pad when a torn window left it mid-sector.
-//! 9. The journal lane (`sqz-jrnl<N>`) → the checkpointer bound to the
-//!    device sinks → the bring-up residue covered → the conveyor → the
-//!    checkpoint task's thread.
+//! 9. The journal lane (`sqz-jrnl<N>`: an `exec.Lane` whose ring is the
+//!    volume's journal ring) → the checkpointer bound to the device sinks →
+//!    the bring-up residue covered → the conveyor → the conveyor's PASS
+//!    FIBER on the journal lane (charter §5.2: both stages on ONE OS thread
+//!    per writable volume; decision 0002 row 6) → the checkpoint task's
+//!    thread.
+//!
+//! The backend's `io` must be `SqzIo`'s (asserted at `open`): the pass is a
+//! lane fiber and every wait it takes — the ring-admission park on the
+//! space `Notify`, a contended leaf lock, the SMO lock — must park the
+//! FIBER, which only our executor's futex ops do; under `Io.Threaded` the
+//! park would hold the lane thread, and with it the CQEs whose completion
+//! frees the ring the pass is waiting for.
 //!
 //! `close` is the clean dismount: no new commits, the conveyor quiesced,
-//! the lane drained (its trailing barrier), the checkpoint task's final
-//! tick (the fixpoint: `tail == head`, no dirty bitmap page — an empty
-//! replay window for the next mount), the flock released.
+//! the pass fiber stopped, the checkpoint task's final tick (the fixpoint:
+//! `tail == head`, no dirty bitmap page — an empty replay window for the
+//! next mount; its SMO entries ride the still-live lane), the lane drained
+//! (its trailing barrier), the flock released.
 //!
 //! ## Durability posture
 //!
@@ -62,6 +73,7 @@ const knobs = @import("../core/knobs.zig");
 const align_probe = @import("../io/align_probe.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const sync = @import("../sync/sync.zig");
+const exec = @import("../exec/exec.zig");
 const key = @import("key.zig");
 const record = @import("record.zig");
 const node = @import("node.zig");
@@ -177,7 +189,7 @@ pub const OpenOptions = struct {
     /// The process's io pool; one is created (and owned) when null.
     pool: ?*uring_fs.Pool = null,
     /// `sqz-jrnl<index>`.
-    index: u32 = 0,
+    index: u16 = 0,
     /// The node-cache budget (the R5 share `max(budget/16, 512 MiB)` at the
     /// daemon; tests shrink it).
     cache_budget_bytes: u64 = node_cache.DEFAULT_CACHE_BUDGET_BYTES,
@@ -243,7 +255,7 @@ pub const KvBackend = struct {
     io: Io,
     env: *const std.process.Environ.Map,
     path: []u8,
-    index: u32,
+    index: u16,
     /// Layer A: the dedicated flock fd, held until `close`.
     guard_fd: linux.fd_t,
     pool: *uring_fs.Pool,
@@ -275,9 +287,14 @@ pub const KvBackend = struct {
     smo_lock: Io.Mutex = .init,
     /// Admission parkers wait here; the checkpointer's `afterDurableBarrier`
     /// is the ONE notifier (every barrier that moves `reusable_upto`).
-    space: sync.Notify = .init,
+    space_notify: sync.Notify = .init,
     ckpt_thread: ?std.Thread = null,
     cv: *conveyor.Conveyor,
+    /// The conveyor's pass: a committer fiber on the journal lane, woken by
+    /// the election winner, joined through its group at `close`.
+    pass_fiber: ?*exec.fiber.Fiber = null,
+    pass_group: Io.Group = .init,
+    pass_stop: std.atomic.Value(bool) = .init(false),
     ino: inos.InoWatermark,
     replay: ReplayStats,
     /// The threshold drain's round-robin position over `trees` (task-owned).
@@ -287,6 +304,8 @@ pub const KvBackend = struct {
     // ---- open ----
 
     pub fn open(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions) OpenError!*KvBackend {
+        // The pass is a lane fiber: its waits must park the fiber (module doc).
+        std.debug.assert(io.vtable == &exec.SqzIo.vtable);
         const t0 = clock.monotonicNs();
         // 1. Layer A.
         const guard_fd = try acquireWriterFlock(path);
@@ -525,7 +544,7 @@ pub const KvBackend = struct {
         });
         errdefer be.cp.deinit();
         be.smo_ctx.space_retry = be.cp.spaceRetryHold();
-        be.cp.space_wake = .{ .notify = &be.space, .io = io };
+        be.cp.space_wake = .{ .notify = &be.space_notify, .io = io };
         be.task = checkpoint_cycle.CheckpointTask.init(&be.cp, io);
         be.task.serial = &be.smo_lock;
         be.cache.installCheckpointKick(be.task.hook());
@@ -551,12 +570,15 @@ pub const KvBackend = struct {
             .appender_id = journal.FIXED_RING_APPENDER,
             .latch = &be.lane.latch,
             .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier },
-            .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
+            .pass = .{ .ctx = be, .wake = wakePass },
+            .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space_notify, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
             .smo_journal = &be.smo_journal,
             .caps = conveyor.resolveCaps(opts.env, cpus, geo),
             .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
         });
         errdefer be.cv.deinit();
+        try be.startPass();
+        errdefer be.stopPass();
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
         be.replay.replay_ns = clock.monotonicNs() - t0;
         stats.mounts.inc();
@@ -566,6 +588,55 @@ pub const KvBackend = struct {
 
     fn ckptMain(be: *KvBackend) void {
         be.task.runUntilStopped();
+    }
+
+    // ---- the pass fiber (stage A on the journal lane) ----
+
+    /// Spawn the pass as a committer fiber (cancel protection blocked — a
+    /// committer is never cancelled) on the journal lane; a group member,
+    /// so the lane recycles it at exit and `stopPass` joins it.
+    fn startPass(be: *KvBackend) OpenError!void {
+        exec.group.addMember(&be.pass_group);
+        be.pass_fiber = be.lane.execLane().spawn(.group, .{ .group = passEntry }, std.mem.asBytes(&be), &be.pass_group, .blocked) catch {
+            exec.group.removeMember(&be.pass_group);
+            log.err("meta volume {s}: the conveyor's pass fiber could not be spawned on the journal lane", .{be.path});
+            return error.ThreadSpawnFailed;
+        };
+    }
+
+    /// Stop + join the pass fiber (idempotent). The conveyor is quiesced
+    /// first (nothing queued, no leader), so the fiber is parked or about
+    /// to park; the stop latch is observed at its next poll.
+    fn stopPass(be: *KvBackend) void {
+        // release pairs with the fiber's acquire loads in `passEntry`.
+        be.pass_stop.store(true, .release);
+        wakePass(be);
+        exec.group.awaitGroup(&be.pass_group, exec.lane.currentFiber(), &.{}) catch {};
+        be.pass_fiber = null;
+    }
+
+    /// The pass fiber's loop: run the scheduled pass, park until the next
+    /// election wakes it. A wake that lands mid-pass parks the delivery
+    /// word as NOTIFIED and the next park returns at once (law 1), so an
+    /// election that fires while the pass is draining is never lost.
+    fn passEntry(context: *const anyopaque) void {
+        const p: *const *KvBackend = @ptrCast(@alignCast(context));
+        const be = p.*;
+        const f = exec.lane.currentFiber().?;
+        while (true) {
+            if (be.pass_stop.load(.acquire)) return;
+            be.cv.runScheduledPass();
+            if (be.pass_stop.load(.acquire)) return;
+            f.park();
+        }
+    }
+
+    /// `conveyor.PassSeam.wake`: the election winner's one wake, from any
+    /// thread (a committer) — same-lane callers take the ready FIFO.
+    fn wakePass(ctx: *anyopaque) void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const f = be.pass_fiber orelse return;
+        if (f.state.wake()) f.lane.enqueue(f);
     }
 
     /// Layer A of the D0 guard: `flock(LOCK_EX | LOCK_NB)` on a dedicated
@@ -700,14 +771,28 @@ pub const KvBackend = struct {
         if (test_seams.after_ledger) |h| h.call(h.ctx);
     }
 
+    /// A structural entry (an SMO's, the rollback's compensation) through
+    /// the lane: the same aligned-run path as a user window, answered when
+    /// it LANDED. The caller may be the checkpoint task's thread (a futex
+    /// park), the pass fiber (a space-retry cycle) or the stage-B fiber
+    /// itself (a compensation inside a verdict) — the latter two park as
+    /// fibers and the lane's own CQE answers them. A full queue is the
+    /// lane draining; the structural writer waits for it.
     fn smoWriteHook(ctx: *anyopaque, ops: []const journal.WriteOp) error{Io}!void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         if (test_seams.before_smo_entry) |h| h.call(h.ctx);
-        return be.dev.writeOps(ops);
+        const t = while (true) {
+            if (be.lane.submitStructural(ops)) |t| break t else |e| {
+                if (e != error.LaneQueueFull) return error.Io;
+                std.Thread.yield() catch {};
+            }
+        };
+        t.wait().result catch return error.Io;
     }
 
-    /// A reservation completed outside the lane: kick it (a stage-B prefix
-    /// wait may sit behind it).
+    /// A reservation completed outside stage B's groups (a structural
+    /// entry, an abandoned window): kick the lane (a stage-B prefix wait
+    /// may sit behind it).
     fn smoCompletedHook(ctx: *anyopaque) void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         be.lane.kick();
@@ -916,17 +1001,22 @@ pub const KvBackend = struct {
         if (!be.closed) {
             be.closed = true;
             be.cv.close();
+            // Nothing queued, no leader, no window in flight: the registry
+            // holds no user reservation past this point.
             be.cv.quiesce();
-            // The lane first: its windows are answered and its trailing
-            // barrier runs before the task's final tick, which asserts the
-            // registry quiet (`checkpoint_final_tick_open_reservations`)
-            // rather than waiting on a completer that no longer exists.
-            be.lane.shutdown();
+            be.stopPass();
+            // The task's final tick BEFORE the lane goes: its SMO entries are
+            // structural writes on the lane. The tick asserts the registry
+            // quiet (`checkpoint_final_tick_open_reservations`) — the
+            // quiesce above is what makes that true.
             be.task.stop();
             if (be.ckpt_thread) |th| {
                 th.join();
                 be.ckpt_thread = null;
             }
+            // The lane last: its trailing barrier leaves every acked entry
+            // durable.
+            be.lane.shutdown();
             be.dev.barrier() catch {};
             stats.clean_unmounts.inc();
             log.info("meta volume {s}: clean unmount (checkpoint seq {d}, tail {d}, head {d})", .{ be.path, be.cp.checkpointSeq(), be.cp.lastLedgerTail(), be.core.headPos() });
@@ -963,6 +1053,8 @@ const test_set: geometry.SetIdentity = .{ .set_uuid = "kv-backend-set!!".*, .has
 const TestVol = struct {
     gpa: Allocator,
     env: std.process.Environ.Map,
+    /// The executor the mount runs on (the pass fiber's futex ops).
+    sqz: *exec.SqzIo,
     path_buf: [128]u8 = undefined,
     path_len: usize = 0,
     /// Error logs the lane thread will emit (the FAILED latch's one line).
@@ -970,6 +1062,10 @@ const TestVol = struct {
 
     fn path(self: *const TestVol) []const u8 {
         return self.path_buf[0..self.path_len];
+    }
+
+    fn io(self: *TestVol) Io {
+        return self.sqz.io();
     }
 
     /// A fresh one-member forest formatted through the device path.
@@ -980,8 +1076,10 @@ const TestVol = struct {
     fn createWithRing(gpa: Allocator, name: []const u8, flush_ms: ?[]const u8, journal_len: u64) !*TestVol {
         const self = try gpa.create(TestVol);
         errdefer gpa.destroy(self);
-        self.* = .{ .gpa = gpa, .env = std.process.Environ.Map.init(gpa) };
+        self.* = .{ .gpa = gpa, .env = std.process.Environ.Map.init(gpa), .sqz = undefined };
         errdefer self.env.deinit();
+        self.sqz = try exec.SqzIo.testInstance();
+        errdefer self.sqz.deinit();
         if (flush_ms) |v| try self.env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", v);
         var zbuf: [linux.PATH_MAX]u8 = undefined;
         _ = linux.mkdirat(linux.AT.FDCWD, try align_probe.pathZ(&zbuf, test_dir), 0o755);
@@ -1002,12 +1100,13 @@ const TestVol = struct {
         if (align_probe.pathZ(&zbuf, self.path())) |z| {
             _ = linux.unlink(z);
         } else |_| {}
+        self.sqz.deinit();
         self.env.deinit();
         self.gpa.destroy(self);
     }
 
     fn open(self: *TestVol) !*KvBackend {
-        return KvBackend.open(self.gpa, testing.io, self.path(), .{ .env = &self.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .test_error_logs = self.lane_error_logs });
+        return KvBackend.open(self.gpa, self.io(), self.path(), .{ .env = &self.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .test_error_logs = self.lane_error_logs });
     }
 };
 
@@ -1388,7 +1487,7 @@ fn killMatrixRow(gpa: Allocator, cut: Cut) !void {
         be.close();
     }
     // Reopen the CUT image: every tx acked before the cut is present whole.
-    const copy = try KvBackend.open(gpa, testing.io, dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
+    const copy = try KvBackend.open(gpa, v.io(), dst, .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .index = 1 });
     defer copy.close();
     const owed = ctx.acked_at_cut;
     for (acked.items[0..owed], names.items[0..owed]) |ino, n| {
@@ -1473,6 +1572,50 @@ test "4-thread commit storm with concurrent checkpoints, then reopen: every ack 
         try testing.expect(be.replayStats().clean_unmount);
         for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
     }
+}
+
+test "ONE thread per volume: the pass runs on sqz-jrnl<N>; a 4-thread storm of single-record txs measures io_uring_enter per commit, fiber parks per window ≤ 2 (coalesced), 0 tick rescues, lane_writes ≡ passes, acks in order" {
+    const gpa = testing.allocator;
+    // Coalesced at the knob's ceiling: no barrier shares the count.
+    const v = try TestVol.create(gpa, "enters", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    const threads = 4;
+    const per_thread = 64;
+    const Storm = struct {
+        fn run(b: *KvBackend, lane_id: u64) void {
+            for (0..per_thread) |i| {
+                const t = b.begin(@src()) catch unreachable;
+                const ino: u64 = 1000 + lane_id * per_thread + i;
+                var xb: [256]u8 = undefined;
+                const xv = (record.XattrValue{ .name = "user.one", .value = "x" }).encodeInto(&xb) catch unreachable;
+                t.stagePut(key.TREE_XATTRS, &key.xattrKey(ino, key.xattrNameHash56("user.one", b.hashSeed()), 0), xv) catch unreachable;
+                b.commit(t) catch unreachable;
+            }
+        }
+    };
+    var handles: [threads]std.Thread = undefined;
+    for (&handles, 0..) |*h, i| h.* = try std.Thread.spawn(.{}, Storm.run, .{ be, @as(u64, i) });
+    for (handles) |h| h.join();
+    be.cv.quiesce();
+    const cs = be.conveyorStats();
+    const snap = be.laneSnapshot();
+    const total: u64 = threads * per_thread;
+    try testing.expectEqual(total, cs.acks.load());
+    try testing.expectEqual(@as(u64, 0), cs.refusals.load());
+    // lane_writes ≡ passes ≡ handoffs: every pass handed off exactly one window.
+    try testing.expectEqual(cs.leader_passes.load(), cs.lane_handoffs.load());
+    try testing.expectEqual(cs.lane_handoffs.load(), snap.lane_writes);
+    try testing.expectEqual(@as(u64, 0), snap.tick_rescues);
+    try testing.expectEqual(@as(u64, 0), journal_lane.stats.ack_out_of_order.load());
+    // Parks per window: the wake (admit) and the CQE (group + ack) at most;
+    // + 1 for the idle park after the last window.
+    try testing.expect(snap.parks <= 2 * snap.lane_writes + 1);
+    // THE venue pin: stage A ran on the journal lane's thread.
+    try testing.expect(cs.leader_passes.load() > 0);
+    try testing.expectEqual(@as(u64, @intCast(be.lane.threadId())), be.cv.passThread());
+    std.debug.print("\nmeasurement: {d} single-record commits in {d} passes/windows: io_uring_enter {d} ({d}.{d:0>2} per commit, {d}.{d:0>2} per window), fiber parks {d} ({d}.{d:0>2} per window), tick rescues {d}, barriers {d}\n", .{ total, snap.lane_writes, snap.enters, snap.enters / total, (snap.enters * 100 / total) % 100, snap.enters / snap.lane_writes, (snap.enters * 100 / snap.lane_writes) % 100, snap.parks, snap.parks / snap.lane_writes, (snap.parks * 100 / snap.lane_writes) % 100, snap.tick_rescues, snap.barriers_coalesced + snap.barriers_strict });
 }
 
 test "threshold writeback on a mounted volume: commits that push one leaf over the writeback threshold are drained by the checkpoint task — the bset page is appended before any cadence cycle, the tree's queue empties, queue_full stays 0" {
@@ -1566,7 +1709,9 @@ test "crash child: churn creates until killed" {
     const vol = env.get(crash_child_knob) orelse return error.SkipZigTest;
     var ledger_buf: [192]u8 = undefined;
     const ledger_path = try std.fmt.bufPrint(&ledger_buf, "{s}.acks", .{vol});
-    const be = try KvBackend.open(gpa, testing.io, vol, .{ .env = &env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
+    const sqz = try exec.SqzIo.testInstance();
+    defer sqz.deinit();
+    const be = try KvBackend.open(gpa, sqz.io(), vol, .{ .env = &env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
     var i: u64 = 0;
     while (true) : (i += 1) {
         var nb: [24]u8 = undefined;

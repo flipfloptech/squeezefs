@@ -1087,17 +1087,17 @@ pub const Checkpointer = struct {
     }
 
     /// Shutdown: the registry must be QUIET — `close` quiesces the conveyor
-    /// (nothing queued, no pass, no window in flight) and shuts the lane
-    /// down (every window completed) BEFORE the task stops, and the task's
-    /// own SMO entries complete synchronously, so no reservation can be
-    /// open here and nothing could complete one (the lane is gone). The
-    /// ordering is made executable: an open reservation fires the tripwire
-    /// and the tick proceeds — its tail clamps below the open start and
-    /// the next mount replays the residue — instead of waiting on a
-    /// completer that no longer exists (a wedge under `smo_lock`).
+    /// (nothing queued, no pass, no window in flight: every user
+    /// reservation completed) BEFORE the task stops, and the task's own SMO
+    /// entries complete synchronously, so no reservation can be open here.
+    /// The lane outlives this tick (its SMO entries are structural writes
+    /// on it) and shuts down after. The ordering is made executable: an
+    /// open reservation fires the tripwire and the tick proceeds — its tail
+    /// clamps below the open start and the next mount replays the residue —
+    /// instead of waiting on a completer under `smo_lock` (a wedge).
     fn checkHeadStable(self: *Checkpointer) void {
         const open = self.deps.inflight.openCount();
-        if (open != 0) ckpt.stats.final_tick_open_reservations.fire("a journal reservation is still open at the shutdown tick: close() must quiesce the conveyor and shut the lane down before the task stops");
+        if (open != 0) ckpt.stats.final_tick_open_reservations.fire("a journal reservation is still open at the shutdown tick: close() must quiesce the conveyor before the task stops");
     }
 
     fn uncovered(self: *const Checkpointer) bool {

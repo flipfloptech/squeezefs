@@ -99,3 +99,15 @@ in the explorer (R3, before the payload-lease and doorbell models), seam split b
 WP-R's bugs (rows 4, 6, 3, 9, 20, 21) first — they are independent of every ruling. Then WP-C (the
 primitives rung 3 composes). Then WP-F as one branch, once Q1–Q3 are ruled. Every change lands with
 its red test first and a row in 0002's ledger.
+
+## D. Rung-3 design calls (2026-10-06, from `docs/porting/exec.md` §3.15 and the fuse specs' quirk ledgers)
+
+| Call | Decision | Why |
+|---|---|---|
+| Q-A lane thread name | `sqz-fuse-ln<N>` (11 chars + up to 4 digits) replaces `sqz-fuse-lane<N>`; `sqz-fuse-ur<qid>` stays | the 15-char comm budget; arbitrary core counts (charter §1.4) |
+| Q-B timers / fd-watch | Per-lane timer heaps and `POLL_ADD` on the lane's own ring for lane-resident tasks; ONE `sqz-timer` thread remains only for non-lane contexts (main, the blocking pool). The epoll fd-watch thread is not built | 0.38 timer arms per kernel READ each paying a global lock + a cross-thread hop; the hop measured 59–62 % of a journal write round trip; a lane that parks in its ring must be woken by its ring |
+| Q-C core-0 reservation | Derived from `isolcpus`/`nohz_full`/the affinity mask, never "drop the lowest CPU by index"; the `core` pin scope is the A/B control arm | charter §1.4–§1.5 |
+| Q-D `Io.Batch` on a lane | Fails loud in v1 (`error.Unsupported` at the vtable); implemented over the lane ring only when a measured caller needs it | charter §1.8: unsupported fails loud, never degrades |
+| SQE128 | Zig 0.17's `std.os.linux.IoUring` indexes SQEs at a 64 B stride; the FUSE uring command needs the 80 B command area at offset 48. A first-party SQE128/CQE32 binding `src/io/uring128.zig` carries the `ParkedRing` park/wake/dead protocol for the transport workers; the sideband/INIT ring stays a plain `ParkedRing` | charter §12 "io_uring through Zig's own liburing-equivalent bindings (SQE128/CQE32 …)" |
+
+Charter §9 amended accordingly (lane names; the timer/fd-watch bullet).

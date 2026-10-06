@@ -45,13 +45,13 @@ pub fn nameCurrentThread(buf: *CommBuf, base: []const u8) [:0]const u8 {
 }
 
 /// The CPU accounting classes (charter §9, amended 2026-10-05: the
-/// per-core FUSE handler lanes are `sqz-fuse-lane<N>`, the ring workers
+/// per-core FUSE handler lanes are `sqz-fuse-ln<N>`, the ring workers
 /// `sqz-fuse-ur<qid>`), first prefix match wins; `other` catches the rest
 /// (main, `sqz-lease*`, `sqz-clw-*`, `sqz-fdwatch`, `sqz-signal`).
 pub const Class = struct { prefix: []const u8, class: []const u8 };
 
 pub const classes = [_]Class{
-    .{ .prefix = "sqz-fuse-lane", .class = "sqz-fuse-lane" },
+    .{ .prefix = "sqz-fuse-ln", .class = "sqz-fuse-ln" },
     .{ .prefix = "sqz-fuse-ur", .class = "sqz-fuse-ur" },
     .{ .prefix = "sqz-ipc-svc", .class = "sqz-ipc-svc" },
     .{ .prefix = "sqz-ipc-dd", .class = "sqz-ipc-dd" },
@@ -73,9 +73,9 @@ const testing = std.testing;
 
 test "every charter pattern at its widest index fits the 15-char budget with the index intact" {
     // `sqz-fuse-ur` + a qid up to 4 digits (`possible_cpus` ≤ 8192 on the
-    // kernel's `CONFIG_NR_CPUS` ceiling); `sqz-fuse-lane` + 2 digits is the
+    // kernel's `CONFIG_NR_CPUS` ceiling); `sqz-fuse-ln` + 4 digits is the
     // lane count a 15-char comm can carry.
-    const worst = [_][]const u8{ "sqz-ipc-svc63", "sqz-jrnl9999", "sqz-fuse-lane99", "sqz-fuse-ur8191", "sqz-uring-fs63", "sqz-nvme1023", "sqz-membudget", "sqz-timer" };
+    const worst = [_][]const u8{ "sqz-ipc-svc63", "sqz-jrnl9999", "sqz-fuse-ln9999", "sqz-fuse-ur8191", "sqz-uring-fs63", "sqz-nvme1023", "sqz-membudget", "sqz-timer" };
     var buf: CommBuf = undefined;
     for (worst) |base| {
         try testing.expect(fitsBudget(base));
@@ -84,13 +84,13 @@ test "every charter pattern at its widest index fits the 15-char budget with the
         try testing.expectEqual(@as(u8, 0), n[n.len]);
         try testing.expect(n.len <= comm_max);
     }
-    try testing.expect(!fitsBudget("sqz-fuse-lane100"));
+    try testing.expect(!fitsBudget("sqz-fuse-ln10000"));
     try testing.expectEqualStrings("sqz-timer", commName(&buf, "sqz-timer"));
 }
 
 test "classification: the amended charter names; first prefix wins; other catches the rest" {
     try testing.expectEqualStrings("sqz-fuse-ur", classify("sqz-fuse-ur17"));
-    try testing.expectEqualStrings("sqz-fuse-lane", classify("sqz-fuse-lane3"));
+    try testing.expectEqualStrings("sqz-fuse-ln", classify("sqz-fuse-ln3"));
     try testing.expectEqualStrings("sqz-nvme", classify("sqz-nvme0"));
     try testing.expectEqualStrings("sqz-jrnl", classify("sqz-jrnl1"));
     try testing.expectEqualStrings("other", classify("sqz-lease-io"));

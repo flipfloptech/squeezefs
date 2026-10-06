@@ -20,21 +20,26 @@ invariants (replay ≡ RAM, SMO completeness, the kill matrix) stand on their ow
 
 | Row | Change | Charter clause |
 |---|---|---|
-| 1 | ONE key layout — the charter's, with the kind byte. Delete the kindless "legacy" layout, `KeyFraming`, `splitForestKey`, the builder re-key, the `extra = 1 if forest` size term. `--single-writer` becomes a one-member forest (control tree + native slot tree; no appender directory) | §5.1 Keys list the kind byte; §5.5 "one mixed-kind KV tree per routing slot" |
-| 3–4 | Fixed-width `extern struct` inode value with explicit `rdev` and `flags2`; drop the LEB128 version tag (verified non-canonical: `0x81 0x00` decodes) | §5.1 "packed inode {…} ≈ 96 B"; §12 canonical total codecs |
-| 8 | One magic convention (ASCII tags) | §12 |
-| 9–10 | ONE stamped bset frame (drop v1); check `reserved` on read | §5.5 frame screen "v2"; §12 total decode |
-| 11 | Page header: `appender_id u32` (not `writer_id u16` from `MAX_APPENDERS = 16`); pads validated | §5.5 capacity `heap/16 ÷ ring` |
-| 16–18, 36–37 | Ledger record: ONE fixed layout with an explicit version; drop decode-by-length, the frozen `routing_width`, the bit-8 suffix, `tree_id = 0` as a root identity, `stride == 0` singletons | §12; §5.4 W is derived |
-| 19, 21, 22 | Superblock re-laid: explicit-endian fields, checksum LAST, `volume_len` so the DUR-5 backup is self-located, `hash_seed` an independent RANDOM seed (today `xxh3(uuid)`) | §5.1 "random `hash_seed`"; §12 |
-| 20 | Feature word: `version = 4` absorbs every always-on bit; four real capability bits remain (`SYMMETRIC_PLANE`, `LAYOUT_DELTAS`, `BLOCK_MAP_TREE`, `VOLUME_LIFECYCLE`); DELETE the bit-8 partitioned-append machinery (~135 refs, the pre-forest multi-writer model) | §1.7 "Capability bits mean one complete thing each"; §1.9 no dead code |
-| 26 | Validator enforces `heap_start % node_size == 0` | §5.1 |
-| 32 | Stop writing the `format_config` JSON xattr on ino 1 | 0002 row 8 |
-| 29, 31 | Comment fixes (16 PiB; `MAX_ENTRY_LEN` WHY) | §1.5 |
+| 1 | ONE key layout — the charter's, with the kind byte. Delete the kindless "legacy" layout, `KeyFraming`, `splitForestKey`, the builder re-key, the `extra = 1 if forest` size term. `--single-writer` becomes a one-member forest (control tree + native slot tree; no appender directory) | §5.1 Keys list the kind byte; §5.5 "one mixed-kind KV tree per routing slot" — **landed 2026-10-05** (0002 row 35; `key.checkSlotTreeKey`, `tree.TreeIdentity`/`tree.route` = the ONE routing law; the backend mounts the forest) |
+| 3–4 | Fixed-width `extern struct` inode value with explicit `rdev` and `flags2`; drop the LEB128 version tag (verified non-canonical: `0x81 0x00` decodes) | §5.1 "packed inode {…} ≈ 96 B"; §12 canonical total codecs — **landed 2026-10-05** (0002 row 36; 68 B `InodeValueWire`, the Δ field table derived at comptime) |
+| 8 | One magic convention (ASCII tags) | §12 — **landed 2026-10-05** (0002 row 38) |
+| 9–10 | ONE stamped bset frame (drop v1); check `reserved` on read | §5.5 frame screen "v2"; §12 total decode — **landed 2026-10-05** (0002 row 39) |
+| 11 | Page header: `appender_id u32` (not `writer_id u16` from `MAX_APPENDERS = 16`); pads validated | §5.5 capacity `heap/16 ÷ ring` — **landed 2026-10-05** (0002 rows 37, 40; PAD = entry kind 1, charter §5.1 amended) |
+| 16–18, 36–37 | Ledger record: ONE fixed layout with an explicit version; drop decode-by-length, the frozen `routing_width`, the bit-8 suffix, `tree_id = 0` as a root identity, `stride == 0` singletons | §12; §5.4 W is derived — **landed 2026-10-05** (0002 row 41) |
+| 19, 21, 22 | Superblock re-laid: explicit-endian fields, checksum LAST, `volume_len` so the DUR-5 backup is self-located, `hash_seed` an independent RANDOM seed (today `xxh3(uuid)`) | §5.1 "random `hash_seed`"; §12 — **landed 2026-10-05** (0002 rows 42, 43; `geometry.mintSetIdentity` draws from `Io.randomSecure`) |
+| 20 | Feature word: `version = 4` absorbs every always-on bit; four real capability bits remain (`SYMMETRIC_PLANE`, `LAYOUT_DELTAS`, `BLOCK_MAP_TREE`, `VOLUME_LIFECYCLE`); DELETE the bit-8 partitioned-append machinery (~135 refs, the pre-forest multi-writer model) | §1.7 "Capability bits mean one complete thing each"; §1.9 no dead code — **landed 2026-10-05** (0002 rows 43, 45; the ino lanes and the RAM appender gate went with it) |
+| 26 | Validator enforces `heap_start % node_size == 0` | §5.1 — **landed 2026-10-05** (0002 row 43) |
+| 32 | Stop writing the `format_config` JSON xattr on ino 1 | 0002 row 8 — **landed 2026-10-05** (0002 row 46) |
+| 29, 31 | Comment fixes (16 PiB; `MAX_ENTRY_LEN` WHY) | §1.5 — **landed 2026-10-05** (0002 row 47) |
+| 25, 34, 38 | Rung-6 layouts (alloc deltas vs DATA-alloc deltas as distinct kinds; the appender page and directory) written into the porting specs as v4 decisions so rung 6 never re-imports the reference's layout | §5.5 — **spec amended 2026-10-05** (0002 row 44; `docs/porting/kv_alloc_superblock.md` §"v4 decisions", `kv_journal_ledger.md` §"v4 decisions") |
+| — | The reference oracle (`fsck --offline`, the byte-identity cross-checks, the reference FIND-VS-A fixture) | 0002 §3 — **retired 2026-10-05** (0002 row 50; the Zig invariants are the oracle; `tests/fixtures/` holds a Zig-generated FIND-VS-A fixture) |
+| — | `core/errors.zig` adopted across `src/meta/*` (WP-C row 23's second half) | §12 — **landed 2026-10-05** (0002 row 48) |
 
-Net size ≈ −600 lines. KEEP (charter-mandated or good): kind-byte placement asymmetry (refs by
-block = the refcount range probe), `seq ≡ position`, PAD-by-payload, `0xFFFF`, the node header,
-`KVAB` 32,576 bits (derived), the ledger/journal offsets, `K = 38`, u32 block index, u16 slot.
+Landed as one branch of commits on `dev` (2026-10-05); net ≈ −1,500 lines. KEEP (charter-mandated
+or good): kind-byte placement asymmetry (refs by block = the refcount range probe), `seq ≡
+position`, `0xFFFF`, the node header, `KVAB` 32,576 bits (derived), the ledger/journal offsets,
+`K = 38`, u32 block index, u16 slot. PAD-by-payload became PAD-by-kind with the aligned entry header
+(Q1).
 
 ### WP-R — Runtime correctness (runtime audit rows 3, 4, 6, 9, 20, 21, 1–2, 5, 15, 27, 31)
 

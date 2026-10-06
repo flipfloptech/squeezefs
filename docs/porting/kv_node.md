@@ -1,5 +1,17 @@
 # PORTING SPEC — MetaLV node layer ("PR K2"): format, load, append, compact/split, node_seq, lifecycle word
 
+> **v4 decisions (format v4, 2026-10-05; decision 0003 WP-F).** The header page below is unchanged
+> (`KVND`, the `@offsetOf` layout, the four-rule frame screen); what moved under it: the bset frame is
+> the ONE 40 B stamped frame (`node.FRAME_LEN = bset.BSET_FRAME_LEN = 40`; `NodeLayout{node_size, stamp}`
+> — the v1/v2 split and `NodeLayout.frame` are gone), records carry the 16 B header and kind-carrying
+> keys. **v4 ties** (256 KiB / 64 KiB): `foldCapacity = node_size − 4096 − 40 − 32` = 257,976 / 61,368;
+> `splitPartCapacity = ¾C` = 193,482 / 46,026; `mergeCandidateCapacity = ¼C` = 64,494 / 15,342;
+> `splitGrowthWindow` 127,690; interior separator record over an inode key = 16 + 9 + 16 = 41 B ⇒ fanout
+> `193,482 / 41 = 4,719` (64 KiB: 1,122) and the full fold's `257,976 / 41 = 6,292` separators (the
+> charter's "≈ 7,000"; 100 M records still at depth ≤ 3); a ref separator record is 49 B. A slot tree's
+> nodes carry header id 0 and the RAM slot stamp; the control tree's carry 8. The byte-identity
+> cross-check against the reference's `ref-sw.img` is retired (0002 row 50).
+
 Source of truth (read-only): `/Users/joberdorf/Source/squeezefs/src/meta_backend/kv/{node.rs, node_seq.rs, node_state_core.rs}`,
 `loom-models/src/lib.rs` (`node_state_core` model, lines 2050–2287), `docs/design-cow-kv-metadata.md`
 §4.1/§4.2/§4.5/§4.6/§4.6a/§4.9a, `docs/design-symmetric-metadata.md` §5.8.2.

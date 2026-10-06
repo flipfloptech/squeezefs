@@ -1,5 +1,48 @@
 # PORTING SPEC — MetaLV journal ring + reservation core + root ledger ("PR K3")
 
+> **v4 decisions (format v4, 2026-10-05; decision 0003 WP-F; 0002 rows 37, 40, 41).** The tables below
+> are the reference's v3 bytes — evidence for the derivations; where a "v4:" row exists it is what
+> `squeezefs-zig` writes. No compatibility with the reference is owed (0002 §2); the "Zig-side
+> byte-identity checklist" at the end is retired.
+>
+> **v4: page header** (`journal.zig`, 24 B, xxh3 over `[0..16)`): `magic "KVJP" u32 @0 ‖ lap u32 @4 ‖
+> first_entry_off u16 @8 (physical in-page offset 24..4095, `0xFFFF` = none) ‖ reserved u16 = 0 @10
+> (checked) ‖ appender_id u32 @12 ‖ xxh3 u64 @16`. `writer_id u16` and `MAX_APPENDERS = 16` are gone;
+> the fixed ring's appender is 0 (`FIXED_RING_APPENDER`); replay verifies `appender_id` against the
+> mount's and counts other appenders' pages in `foreign_pages`. Page data = 4072 B.
+>
+> **v4: entry header** (24 B): `pos u64 @0 (== logical position; the stale-lap/end-of-log rejector) ‖
+> len u32 @8 (payload bytes; `24 + len ≤ MAX_ENTRY_LEN = 128 KiB`) ‖ kind u8 @12 {0 = records, 1 = PAD} ‖
+> reserved[3] = 0 @13 (checked) ‖ xxh3 u64 @16` over `header[0..16] ‖ payload`. A PAD entry is
+> `kind = 1` with an all-zero payload of `pad − 24` bytes (charter §5.1 amended: "entry kind PAD"); the
+> `0xFF` payload-tag sniff is gone. `PAD_MIN = 24` (one header), `maxPad = 24 + grain` (4120 @ 4096,
+> 536 @ 512); `smoKeep = max(reserve/4, 4072) + maxPad` (65,536 + 4,120 on the 8 MiB floor).
+>
+> **v4: payload element** = `tag u8 (tree_id | level << 4)` ‖ **16 B record header** `{key_len u16, kind
+> u8 {Put 0, Delete 1, Delta 2}, flags u8 = 0 (checked), val_len u32, seq u64}` ‖ key ‖ value; so a frame
+> costs `1 + 16 + key + value` (an inode Put is `1 + 16 + 9 + 68`). Interior pointer records of a slot
+> tree carry the journal key `slot u32 BE ‖ separator` (`key.interiorJournalKey`; `KEY_BUF_CAP = 36`);
+> the control tree's carry the separator alone; `tree.route` is the inverse.
+>
+> **v4: root ledger record** (`ledger.zig`; 32 × 4096 B slots, slot = `seq % 32`, newest-valid-wins):
+> header `magic "KVRL" u32 @0 ‖ version u16 = 1 @4 ‖ payload_len u16 @6 ‖ seq u64 @8 ‖ xxh3 u64 @16` (over
+> `header[0..16] ‖ 0⁸ ‖ payload`); payload `journal_tail_seq u64 ‖ next_ino u64 ‖ alloc_bitmap_generation
+> u64 ‖ node_seq_watermark u64 ‖ n_roots u16 ‖ roots[n]{root_id u16, node_addr u64, node_seq u64} ‖
+> stamp {set_uuid[16], set_epoch u64, member_position u16, member_count u16, native_slot_present u8,
+> native_slot u16, n_runs u16, runs[n]{start u16, stride u16 ≥ 1, count u32 ≥ 1}, n_cursors u16,
+> cursors[n]{slot u16, next_local_ino u64}}`. `RootId = {control = 8, native_slot = 0x0100}` — a kind byte
+> is never a root identity (a slot tree's header id is 0) and a guest slot tree's root is a tree-0
+> `slot_state` record. The stamp is on EVERY record (every volume is a stamped set member; the
+> one-member forest's is `(set_uuid, 0 of 1, native 0, run {0, 1, 65536})`). Decode-by-length, the
+> frozen `routing_width` (W = 2^16 is derived from the u16 slot id), the bit-8 partition suffix and
+> `stride == 0` singletons are gone. Budget: 128 runs + 256 cursors ⇒ worst case 3,767 B with 18 spare
+> roots. `WORST_CASE_STAMPED_RECORD_LEN` is the comptime tie.
+>
+> **v4: the bit-8 partitioned-append model is deleted** (0003 Q3): no `AppendPartition`, no
+> page-interleaved ring ownership, no per-appender ledger slot arithmetic. Rung 6 gives every appender
+> its OWN ring (segment table on its page) stamping `position + seq_offset`; the `seq_floor` of a
+> released slot lives in tree 0 (charter §5.5 "the record-seq space is monotone across rings").
+
 Source of truth (read-only): `/Users/joberdorf/Source/squeezefs` (abbrev. `R/`).
 Target: `/Users/joberdorf/Source/squeezefs-zig` per charter §5.1–§5.3.
 Files: `R/src/meta_backend/kv/journal_core.rs` (641), `journal.rs` (2425),

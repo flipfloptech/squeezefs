@@ -1,5 +1,62 @@
 # PORTING SPEC — MetaLV superblock v3, volume format/image builder, extent allocator
 
+> **v4 decisions (format v4, 2026-10-05; decision 0003 WP-F; 0002 rows 42–47).** The byte tables below
+> are the reference's v3 layout — EVIDENCE, read for derivations and the WHY of every number. Where a
+> "v4:" row exists it is what `squeezefs-zig` writes; nothing below obliges compatibility with the
+> reference (0002 §2), and the acceptance bar of the preamble (the Rust binary mounting a Zig image) is
+> retired. Rung 6 lands the appender plane against THESE tables, never the reference's.
+>
+> **v4: superblock** (`superblock.zig` `SuperblockWire`, 192 B inside the 4096 B sector, every field LE,
+> `@offsetOf`-asserted): `magic "SQZMETLV"[8] @0 ‖ version u16 = 4 @8 ‖ reserved u16 = 0 @10 ‖
+> node_size u32 @12 ‖ volume_len u64 @16 ‖ features_incompat u64 @24 ‖ features_ro u64 @32 ‖
+> root_ledger {start, len} @40 ‖ journal @56 ‖ alloc_bitmap @72 ‖ heap @88 ‖ appender_dir @104 (`{0, 0}`
+> = none) ‖ uuid[16] @120 ‖ set_uuid[16] @136 ‖ hash_seed u64 @152 ‖ sb_generation u64 @160 ‖
+> reserved[16] = 0 @168 ‖ xxh3 u64 @184` over the whole sector with the field zeroed. The legacy magic
+> `METALV01` classifies as `legacy{version}` → "reformat required". Capability bits (each ONE thing;
+> every always-on mechanism is the version): `SYMMETRIC_PLANE = 1<<0`, `LAYOUT_DELTAS = 1<<1`,
+> `BLOCK_MAP_TREE = 1<<2`, `VOLUME_LIFECYCLE = 1<<3`; a one-member format sets none. The DUR-5 copy
+> lives at `volume_len − 4096` and is accepted only when its own `volume_len` names the slot it was read
+> from. `validateGeometry` additionally refuses `heap.start % node_size != 0`. `hash_seed` is an
+> INDEPENDENT `getrandom` draw (`geometry.mintSetIdentity`), never `xxh3(uuid)`.
+>
+> **v4: geometry/format.** One format class: the one-member forest — control tree (header id 8,
+> empty leaf) then the native slot tree (header id 0, the description's records under kind-carrying
+> keys), both roots in the ledger (`RootId{control = 8, native_slot = 0x0100}`); no appender directory,
+> no appender-0 page at format (`sb.appender_dir = none`). Build order: register → zero `[0, heap.start)`
+> → control image → native image → bitmap pages (gen 1) → ledger record (seq 1, slot 1, the one-member
+> stamp `(set_uuid, pos 0 of 1, native slot 0, run {0, 1, 65536})`) → barrier → superblock (tail,
+> barrier, sector 0, barrier) — 9 steps, 3 barriers. The `--single-writer` word, `FORMAT_FLAT` seam,
+> `format_config` xattr and `multi_writer_flat` class are gone. Builder budget `usableBudgetOf =
+> (node_size − 4096 − 40 − 32) × ¾` = 46,026 (64 KiB) / 193,482 (256 KiB) = `splitPartCapacity`.
+>
+> **v4: allocator.** One owner per bitmap (0003 Q3): `PartitionMap`, partitioned claims and
+> per-appender coverage clocks are deleted; `KVAB` page = `magic "KVAB" u32 ‖ page_index u32 ‖
+> generation u64 ‖ xxh3 u64` + 32,576 bits (ASCII magic in disk order). Journal deltas: kind **4** is the
+> HEAP allocator's — key `extent u64 BE` (8 B) ONLY, value `0x01` alloc / `0x00 ‖ retire_tag u64` free;
+> a 16 B key under kind 4 is `MalformedDelta`. Kind **5** (`key.TREE_DATA_ALLOC_RESERVED`) is reserved
+> for the DATA-allocation bitmap deltas of charter §5.5 (rung 6): key `vol_tag u64 BE ‖ block_or_extent
+> u64 BE`, value `{op u8, holder_term u64}` — a distinct kind, never a length-discriminated arm of kind 4.
+>
+> **v4 WILL write (rung 6; decided now so the reference's layout is not re-imported):**
+> - Appender page (4096 B, A/B over FOUR slots per charter §5.5): `magic "KVAP" u32 @0 ‖ layout_version
+>   u16 = 1 @4 ‖ reserved u16 = 0 @6 ‖ appender_id u32 @8 ‖ generation u64 @16 ‖ identity {node_token u64,
+>   mount_slot u32, writer_id u32} @24 ‖ term u64 @40 ‖ state u8 {Free 0, Live 1, Recovering 2, Recovered 3}
+>   @48 ‖ is_manager u8 @49 ‖ home_volume u16 @50 ‖ n_segments u8 ≤ 8 @52 ‖ n_grants u8 ≤ 4 @53 ‖
+>   n_slots u16 ≤ SLOT_PAGE_BUDGET @54 ‖ head_hint u64 @56 ‖ ledger_tail_seq u64 @64 ‖ ckpt_seq u64 @72 ‖
+>   seq_offset u64 @80 ‖ segments[8]{start u64, len u64} @88 ‖ grants[4]{start u64, len u64} @216 ‖ slot
+>   entries[n] {slot u16, state u8, pad u8, g u32, root_addr u64, root_seq u64, cursor u64, extents
+>   {start u64, len u64}} (40 B each) from @280 ‖ xxh3 u64 @4088` over `[0..4088)`. The version sits
+>   right after the magic; `home_volume` is u16 (member positions are u16); `appender_id` is the u32 every
+>   frame and page header carries. `SLOT_PAGE_BUDGET = (4088 − 280) / 40 = 95` at these widths.
+> - Appender directory extent (`sb.appender_dir`, one node-size extent per chain link): the header page
+>   FIRST at `dir.start` — `magic "KVAD" u32 ‖ version u16 = 1 ‖ reserved u16 ‖ pairs u32 ‖ next_link
+>   {start u64, len u64} ‖ xxh3 u64` — then appender pairs at `dir.start + 4096 + pair × 8192` (slots A/B);
+>   appender 0's four page slots are the fixed ring's first four pages (charter §5.5). The reference put
+>   the header LAST (audit row 38); v4 puts it first like every other unit.
+> - Stamping `SYMMETRIC_PLANE` is `enable-symmetric`'s ONE act: directory extent claimed and zeroed, header
+>   page, appender-0 `Free` page, then the superblock with the bit and `appender_dir` set (one barriered
+>   superblock write; `Superblock.setSymmetricPlane` refuses a repoint).
+
 Reference (read-only): `~/Source/squeezefs` (Rust). Target: `~/Source/squeezefs-zig`.
 Charter anchors: §1.7 (forward-only format; unknown incompat ⇒ "reformat required"; old
 binaries refuse new volumes loud), §5.1 (superblock / bitmap / heap), §5.3 "Space".

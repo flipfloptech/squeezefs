@@ -110,6 +110,53 @@ Spec corrections from this wave (`kv_alloc_superblock.md` updated in place): `us
 46,032 (64 KiB) / 193,488 (256 KiB) — the header page is subtracted; the frame term is the v1 32 B on
 every layout; step 13's fdatasync coincides with step 12's (3 barriers total).
 
+## Format v4 (2026-10-05) — ONE format act (decision 0003 WP-F; 0002 rows 35–50)
+
+`superblock.version = 4`; the Rust reference refuses every Zig image loud and **the reference
+oracle is retired for the trees**: the byte-identity cross-checks above (node cross-check 1,
+format cross-check 2), the `fsck --offline` calls in the backend tests and the reference-generated
+FIND-VS-A fixture are gone. The Zig invariants are the oracle: encode∘decode = id and decoder
+totality under `std.testing.fuzz` for every codec (keys, records, inode value, bset + frame, journal
+entry + page header, ledger record, superblock), replay ≡ RAM (`crashReplay` over `smo.TestVolume`),
+SMO completeness, the Linux kill matrix (every tx acked BEFORE the cut present whole, no partial tx,
+the DUR-8c watermark `max(ledger, replayed + 1)` exactly), `format → open → commit → close → open`
+on the one-member forest. `tests/fixtures/findvsa_pred_bset.v4.bin` is Zig-generated
+(`tests/fixtures/gen_findvsa_pred_bset.zig`; README records the seed, horizon and counts) and pinned
+to 254,932 bytes / 3,515 records.
+
+What changed, per module (every byte table in `docs/porting/*.md` carries a "v4:" row):
+
+| Unit | v3 (reference) | v4 |
+|---|---|---|
+| Keys (`key.zig`) | two layouts: kindless legacy + forest transform | ONE layout, kind byte on every key: inode 9 B, dentry/xattr 17 B, block map 13 B, refs 29 B (`06` prepended); slot = `key_ino >> 40`; `checkSlotTreeKey` at admission, in the mount fold and in `tree.route` |
+| Inode value (`record.zig`) | LEB128 tag + 57 B | 68 B LE `extern struct`, size-asserted; Δ field table derived from it at comptime; `0x81 0x00` refused |
+| Record header | 14 B + leading kind byte | 16 B `{key_len u16, kind u8, flags u8 = 0, val_len u32, seq u64}` |
+| Entry header (`journal.zig`) | 16 B, PAD by payload sniff | 24 B `{pos, len, kind (0 records / 1 PAD), reserved[3] = 0, xxh3 u64}`; `PAD_MIN = 24`, `maxPad` 4120 @ 4096 / 536 @ 512 |
+| Page header | `writer_id u16`, `MAX_APPENDERS = 16` | `{magic, lap, first_entry_off, reserved u16 = 0, appender_id u32, xxh3}` (24 B) |
+| Bset frame (`bset.zig`) | v1 32 B / v2 40 B | ONE 40 B stamped frame; `BSET` ASCII magic; reserved checked; `(0, 0)` = the one-member forest's stamp |
+| Ledger (`ledger.zig`) | decode-by-length, optional stamp, bit-8 suffix, `routing_width` | ONE layout with `version u16`; `RootId{control = 8, native_slot = 0x0100}`; stamp always; stride ≥ 1; worst case 3,767 B |
+| Superblock (`superblock.zig`) | 152 B hand table, 18 bits | 192 B `extern struct`, checksum last, `volume_len`, 4 capability bits, `set_uuid` + independent `hash_seed` |
+| Geometry/format/builder | three format classes, appender plane at format | one plan: control tree (empty) + native slot tree; 9 build steps; no appender directory/page; `SetIdentity{set_uuid, hash_seed}` minted by `mintSetIdentity` (getrandom) |
+| Allocator | `PartitionMap`, partitioned claims/clocks, 7 models | one owner per bitmap, 5 single-owner models; kind 4 = heap deltas only, kind 5 reserved for data-alloc deltas |
+| Trees (`tree.zig`) | per-kind trees, `treeFor(tree_id)` | `TreeIdentity{control, slot}`; `tree.route` = THE routing law (content by key slot and kind, interior by header id through `slot ‖ separator`) shared by replay, the conveyor and the backend |
+| Gate (`epoch_core.zig`) | `AppendGate{writers, writer_id}` + foreign-append probe | `ReaderGate` alone; slot ownership is the lease gate's verdict |
+| Inos (`inos.zig`) | ino lanes (`lane_core`), dentry child read as a local | one cursor per slot; the fold routes a dentry's GLOBAL child back to `(slot, local)` |
+| Errors | three errno tables | `core/errors.zig` through `coreError` (rows `Busy`, `UnsupportedVolume`, `MalformedKey`, `ValueTooLarge` added) |
+
+New tie numbers (256 KiB / 64 KiB nodes): fold capacity 257,976 / 61,368; split part 193,482 /
+46,026 (= the builder's `usableBudgetOf`); merge candidate 64,494 / 15,342; interior fanout at 9 B
+inode keys 193,482 / 41 = 4,719 (64 KiB: 1,122); the full fold's separators 257,976 / 41 = 6,292
+(the charter's "≈ 7,000"); ref separator record 49 B; `smoKeep` 65,536 + 4,120; the widest SMO
+entry's pointer key is `KEY_BUF_CAP = 36` B (`slot ‖ KEY_SPACE_MAX`).
+
+Gate: Linux **738 pass + 1 skip (739) + 3 rails**, exit 0; macOS **641 pass + 7 skips (648) + 3
+rails**, exit 0. Two bugs found by the invariants while retiring the oracle: (1) the DUR-8c fold
+burned ~W inos per crash replay (0002 row 49; the kill matrix now asserts `next_ino ≤ minted + 1`);
+(2) the kill-matrix harness owed every ack ever made, including those acked after the cut — with
+the native leaf now receiving every kind the threshold drain replaces it mid-stream, the cut moved
+and the harness now owes exactly the acks it saw (an atomic acked counter read at the cut, the copy
+through `fdatasync` + O_DIRECT reads).
+
 ## Owed (rung 2b)
 
 Node snapshot + node cache, tree + SMO + leaf merge, 4a object locks, tx staging, the journal lane, the conveyor +

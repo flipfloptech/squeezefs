@@ -1,5 +1,39 @@
 # PORTING SPEC — MetaLV record / bset layer ("PR K1")
 
+> **v4 decisions (format v4, 2026-10-05; decision 0003 WP-F; 0002 rows 35–39, 47).** The bytes below are
+> the reference's v3 — evidence; where a "v4:" row exists it is what `squeezefs-zig` writes. §10's
+> "the Zig port must match the BYTES" is retired (0002 §2): the Zig codecs are pinned by their own
+> encode∘decode = id, totality fuzzers and the Zig-generated FIND-VS-A fixture
+> (`tests/fixtures/findvsa_pred_bset.v4.bin`, 254,932 B, 3,515 records).
+>
+> **v4: keys — ONE layout, the kind byte on every key** (`key.zig`): inode `ino u64 BE ‖ 01` (9 B);
+> dentry `parent u64 BE ‖ 02 ‖ hash54_coll u64 BE` (17 B); xattr `ino ‖ 03 ‖ hash56_coll` (17 B); block map
+> `owner ‖ 07 ‖ block_index u32 BE` (13 B); block refs `06 ‖ vol_tag u64 ‖ block_idx u64 ‖ owner_ino u64 ‖
+> block_index u32` (29 B; prefix 17 B = the refcount range probe); control (kind 8) string keys. The
+> ino-major kinds carry the kind at offset 8, refs prepend it (`routeOff`); a record's slot is `key_ino
+> >> 40` (`FOREST_SLOT_MAX = 65536`; the ladder's soundness `(FOREST_SLOT_MAX + 1) << 40 < 0x02 << 56` is a
+> comptime assertion). `checkSlotTreeKey(kind, key)` is the one agreement check (admission, mount fold,
+> routing). The kindless legacy layout, `forestKey/splitForestKey`, `KeyFraming` are gone.
+> `KEY_SPACE_MAX = 0xFF × 32`; `KEY_BUF_CAP = 36`.
+>
+> **v4: record header** (16 B, LE): `key_len u16 ‖ kind u8 {Put 0, Delete 1, Delta 2} ‖ flags u8 = 0
+> (checked) ‖ val_len u32 ‖ seq u64`; `RECORD_MIN_LEN = 17`.
+>
+> **v4: inode value** = `InodeValueWire` extern struct, 68 B LE, size- and offset-asserted: `mode u32 @0 ‖
+> uid u32 @4 ‖ gid u32 @8 ‖ nlink u32 @12 ‖ flags u32 @16 ‖ rdev u64 @20 ‖ size u64 @28 ‖ atime i64 @36 ‖
+> mtime i64 @44 ‖ ctime i64 @52 ‖ flags2 u32 @60 ‖ reserved[4] = 0 @64`. Any other length refuses (the
+> LEB128 version tag and its non-canonical `0x81 0x00` spelling are gone). The Δinode field table
+> (`inode_field_table`) is DERIVED from the struct's field names at comptime: mask bits in field order
+> (mode 0 … ctime 9, flags2 10; `DELTA_MASK_ALL = 0x7FF`, `INODE_DELTA_MAX_LEN = 66`) — ONE source for the
+> Put and the Delta (0002 row 3's one Delta kind at rung 4 builds on it).
+>
+> **v4: bset header** (32 B): `magic "BSET" u32 ‖ version u16 = 1 ‖ reserved u16 = 0 (checked) ‖
+> record_count u32 ‖ data_len u32 ‖ journal_seq_horizon u64 ‖ xxh3 u64` (ASCII magic in disk order; the
+> reference's numeric `54 45 53 42` is gone). **v4: bset frame** (40 B, the ONE frame): `magic "KBSF" u32 ‖
+> version u16 = 1 ‖ reserved u16 = 0 (checked) ‖ node_seq_at_write u64 ‖ padded_len u32 ‖ bset_len u32 ‖
+> appender_id u32 ‖ g u32 ‖ xxh3 u64` over `[0..32)`; the stamp is on every frame and `(0, 0)` is the
+> manager's / the one-member forest's.
+
 Reference (read-only): `/Users/joberdorf/Source/squeezefs` — `R=src/meta_backend/kv`.
 Target: `/Users/joberdorf/Source/squeezefs-zig`. Charter laws pinned: §5.1 "Keys",
 "Record kinds and ONE fold algebra", "Checksums everywhere", bset `{…}` framing.

@@ -661,7 +661,7 @@ Closure: `lock_phase_ns.dlm_guard_wait.count ≡ Σ both classes' (collisions + 
 | `meta_kv_fold_memo_bytes` | G | Drop-exact; rides the node-cache budget | `:656` |
 | `META_KV_FOLD_RECORD_DECODES` | C (test pin only) | a head/memo serve moves it by exactly 0 | `:667` |
 | `meta_kv_node_dropped_tail_bsets` | C | > 0 after a CLEAN unmount = corruption alert | `:105` |
-| `meta_kv_node_partition_refusals` | C ★ | a reader or non-authority mutated / a foreign append detected | `:189` |
+| `meta_kv_node_partition_refusals` | C ★ | an armed reader mount mutated a node (v4: the appender partition and its foreign-append probe are gone — decision 0002 row 45) | `:189` |
 | `meta_kv_leaf_lease_refusals` | C ★ | a leaf of a slot this mount does not lease (symmetric) | `:307` |
 | `kv_freeze_latched_recovered` | C ★ (invariant tripwire) | FREEZING latched with no frozen delta — a third unknown window | `node_cache.rs:2169-2171` |
 | `meta_kv_revalidate_polls/_epochs/_nodes_dropped/_stale_serves/_dirty_skips★/_keys_purged/_ledger_read_bytes/_ledger_full_reads/_gap_scans` | C | reader-side (0 for the life of a write mount) | `mod.rs:134-176`, `:429` |

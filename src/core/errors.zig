@@ -1,6 +1,8 @@
-//! ONE typed error set and ONE errno table for the I/O plane (charter §12
-//! "Errors are error unions with typed classes … errno mapping lives in one
-//! table"; decision 0003 WP-C row 23).
+//! ONE typed error set and ONE errno table for the I/O and metadata planes
+//! (charter §12 "Errors are error unions with typed classes … errno mapping
+//! lives in one table"; decision 0003 WP-C row 23). A metadata module keeps
+//! its own error NAMES and maps each onto a member here (`coreError`); the
+//! errno and the class are read from this table alone.
 //!
 //! Three classes, three sub-sets — a module declares its own `Error` as a
 //! union of the sub-sets (or of `Error` itself) so coercion between layers
@@ -91,6 +93,17 @@ pub const Refusal = error{
     VolumeFailed,
     /// The lane is stopping or stopped.
     LaneStopped,
+    /// Another writer holds the volume's single-writer guard (EBUSY).
+    Busy,
+    /// A blank, pre-v4 or capability-stamped volume this binary does not
+    /// mount (EINVAL: reformat or a later binary).
+    UnsupportedVolume,
+    /// A key that decodes as no kind, or not as the kind it was staged
+    /// under (EINVAL: a caller bug).
+    MalformedKey,
+    /// A record value or journal entry above its cap (E2BIG, `setxattr(2)`'s
+    /// "exceeds a filesystem-specific limit").
+    ValueTooLarge,
 };
 
 pub const Error = Retryable || Terminal || Refusal;
@@ -100,7 +113,7 @@ pub const Class = enum { retryable, terminal, refusal };
 pub fn classOf(err: Error) Class {
     return switch (err) {
         error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock => .retryable,
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped => .refusal,
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge => .refusal,
         else => .terminal,
     };
 }
@@ -133,6 +146,8 @@ const table = [_]Row{
     .{ .e = .INTR, .err = error.Interrupted },
     .{ .e = .AGAIN, .err = error.WouldBlock },
     .{ .e = .BADE, .err = error.ReservationConflict },
+    .{ .e = .BUSY, .err = error.Busy },
+    .{ .e = .@"2BIG", .err = error.ValueTooLarge },
 };
 
 /// Kernel → error. An errno outside the table is `Unexpected`, logged once
@@ -155,7 +170,7 @@ pub fn toErrno(err: Error) linux.E {
         // Backpressure: retry, never "bad argument".
         error.QueueFull, error.LaneQueueFull => .AGAIN,
         // Refusals: the caller's shape or the device's admissibility.
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported => .INVAL,
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey => .INVAL,
         error.DismountRefused => .ROFS,
         // The fence, a dead lane, a lost op, a short transfer: EIO.
         error.WriterGuardFenced, error.VolumeFailed, error.LaneStopped, error.RingFailed, error.WorkerClosed, error.WorkerShutdown, error.ShortWrite, error.ShortRead, error.SubmissionQueueOverflow, error.HoleCheckpointFailed, error.Unexpected => .IO,
@@ -197,6 +212,25 @@ test "classes: backpressure is retryable and replies EAGAIN, never EINVAL; refus
     try testing.expectEqual(Class.terminal, classOf(error.RingFailed));
     try testing.expectEqual(linux.E.IO, toErrno(error.RingFailed));
     try testing.expectEqual(linux.E.IO, toErrno(error.WorkerClosed));
+    // The metadata plane's refusals: the guard, an unmountable volume, a
+    // malformed key, an oversized value.
+    try testing.expectEqual(Class.refusal, classOf(error.Busy));
+    try testing.expectEqual(linux.E.BUSY, toErrno(error.Busy));
+    try testing.expectEqual(error.Busy, fromErrno(.BUSY));
+    try testing.expectEqual(Class.refusal, classOf(error.UnsupportedVolume));
+    try testing.expectEqual(linux.E.INVAL, toErrno(error.UnsupportedVolume));
+    try testing.expectEqual(Class.refusal, classOf(error.MalformedKey));
+    try testing.expectEqual(linux.E.INVAL, toErrno(error.MalformedKey));
+    try testing.expectEqual(Class.refusal, classOf(error.ValueTooLarge));
+    try testing.expectEqual(linux.E.@"2BIG", toErrno(error.ValueTooLarge));
+}
+
+test "toErrno is total: every member of the set has an errno" {
+    inline for (@typeInfo(Error).error_set.error_names.?) |name| {
+        const err: Error = @field(Error, name);
+        _ = toErrno(err);
+        _ = classOf(err);
+    }
 }
 
 test "toErrno is total: every member of the set has a reply errno" {

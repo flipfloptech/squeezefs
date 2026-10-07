@@ -41,6 +41,7 @@ const futex = @import("../sync/futex.zig");
 const mem_budget = @import("../mem/budget.zig");
 const fiber_mod = @import("fiber.zig");
 const lane_mod = @import("lane.zig");
+const lock_order = @import("../sync/lock_order.zig");
 const group_mod = @import("group.zig");
 const futex_table = @import("futex_table.zig");
 const placement = @import("placement.zig");
@@ -134,6 +135,10 @@ pub const SqzIo = struct {
     fuse_homes: []placement.Placement.LaneHome,
     stack_component: mem_budget.Component,
 
+    fn fiberContext() usize {
+        return @intFromPtr(lane_mod.currentFiber() orelse return 0);
+    }
+
     pub fn init(gpa: std.mem.Allocator, options: Options) InitError!*SqzIo {
         const self = try gpa.create(SqzIo);
         errdefer gpa.destroy(self);
@@ -174,6 +179,9 @@ pub const SqzIo = struct {
         };
         self.config = placement.Config.fromEnv(self.env);
         self.same_lane_dispatch = knobs.boolKnob("SQUEEZEFS_FUSE_SAME_LANE_DISPATCH", self.env);
+        // The lock-order rail keys its ledger by fiber on a lane thread
+        // (fibers interleave on one thread and never migrate).
+        lock_order.current_context = &fiberContext;
         // Neither limit admits a pool thread: a stray delegate path can never
         // spawn Threaded workers (risk §3.12.6).
         self.threaded = Io.Threaded.init(gpa, .{ .async_limit = .nothing, .concurrent_limit = .nothing });

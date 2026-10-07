@@ -17,10 +17,12 @@
 //! sheddable R5 component), and the fsck C11 record walk (report-only).
 //!
 //! Who holds what: every mutation here stages into the caller's `KvTx`; the
-//! data plane (`plane.zig`) owns the locks (the per-ino layout lock across a
-//! merge, a crossing train and a sweep chunk), the head record, the terminal
-//! frees (after the lock drops — RES-1) and the device. Stride = the format's
-//! CHUNK (the device bytes one block occupies), never stored.
+//! data plane (`plane.zig`) owns the locks (the per-ino layout lock, level
+//! (3.7), across a merge, a crossing train, a sweep chunk — and across
+//! kv_fs's shrink / corpse-mark transactions through `Data.lockLayout`, so
+//! the head has ONE authority), the head record, the terminal frees (after
+//! the lock drops — RES-1) and the device. Stride = the format's CHUNK (the
+//! device bytes one block occupies), never stored.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

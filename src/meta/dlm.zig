@@ -45,6 +45,7 @@ const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
 const checksum = @import("../core/checksum.zig");
 const rwlock = @import("../sync/rwlock.zig");
+const lock_order = @import("../sync/lock_order.zig");
 
 pub const Mode = rwlock.Mode;
 pub const Class = enum { inode, dentry };
@@ -163,6 +164,7 @@ pub const Guard = struct {
     pub fn release(g: Guard, io: Io) void {
         if (g.acquired_ns != 0) lock_phase_dlm_guard_hold.record(clock.monotonicNs() -| g.acquired_ns);
         (rwlock.RwLock.Guard{ .lock = g.lock, .mode = g.mode }).release(io);
+        lock_order.released(.object);
     }
 };
 
@@ -237,6 +239,8 @@ const LockClass = struct {
     /// classifies, times the park, then stamps.
     fn lockStripe(self: *LockClass, io: Io, stripe: usize, key: u64, mode: Mode, hold_timed: bool, comptime cancelable: bool) Io.Cancelable!Guard {
         const cell = &self.locks[stripe];
+        lock_order.acquiring(.object);
+        errdefer lock_order.released(.object);
         if (cell.tryAcquireGuard(io, mode) == null) {
             self.classifyContended(stripe, key);
             const t0 = clock.monotonicNs();
@@ -254,6 +258,7 @@ const LockClass = struct {
     fn tryLockStripe(self: *LockClass, io: Io, stripe: usize, key: u64, mode: Mode, hold_timed: bool) ?Guard {
         const cell = &self.locks[stripe];
         if (cell.tryAcquireGuard(io, mode) == null) return null;
+        lock_order.acquiredTry(.object);
         self.stamp(stripe, key);
         return .{ .lock = cell, .mode = mode, .acquired_ns = if (hold_timed) clock.monotonicNs() else 0 };
     }

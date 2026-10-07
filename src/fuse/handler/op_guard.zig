@@ -73,6 +73,7 @@ const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
 const rwlock = @import("../../sync/rwlock.zig");
+const lock_order = @import("../../sync/lock_order.zig");
 const dlm = @import("../../meta/dlm.zig");
 const counters = @import("../../core/counters.zig");
 const clock = @import("../../core/clock.zig");
@@ -284,6 +285,7 @@ pub const Guard = struct {
     pub fn release(self: Guard, io: Io) void {
         if (self.scope) |s| holdHistogram(s).record(clock.monotonicNs() -| self.since_ns);
         (rwlock.RwLock.Guard{ .lock = &self.table.locks[self.stripe], .mode = self.mode }).release(io);
+        lock_order.released(.op_guard);
     }
 };
 
@@ -343,6 +345,7 @@ pub const Table = struct {
         const stripe = self.stripeOf(ino);
         const cell = &self.locks[stripe];
         var since: u64 = undefined;
+        lock_order.acquiring(.op_guard);
         if (cell.tryAcquireGuard(io, mode) == null) {
             const holder = self.holders[stripe].load(.monotonic);
             if (holder != 0 and holder != ino) inode_guard_stripe_collisions.inc() else inode_guard_key_waits.inc();
@@ -366,6 +369,7 @@ pub const Table = struct {
     pub fn tryAcquire(self: *Table, io: Io, ino: u64, mode: Mode) ?Guard {
         const stripe = self.stripeOf(ino);
         if (self.locks[stripe].tryAcquireGuard(io, mode) == null) return null;
+        lock_order.acquiredTry(.op_guard);
         self.holders[stripe].store(ino, .monotonic);
         return .{ .table = self, .stripe = stripe, .mode = mode, .since_ns = clock.monotonicNs() };
     }

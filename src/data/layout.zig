@@ -35,6 +35,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
+const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
@@ -42,6 +43,7 @@ const key = @import("../meta/key.zig");
 const record = @import("../meta/record.zig");
 const tx = @import("../meta/tx.zig");
 const sync_mutex = @import("../sync/mutex.zig");
+const lock_order = @import("../sync/lock_order.zig");
 
 // ---------------------------------------------------------------------------
 // Geometry: the two grains every mapping law is written in.
@@ -1182,7 +1184,8 @@ pub fn inlineMaxFromEnv(env: *const std.process.Environ.Map, facts: derive.Facts
 }
 
 // ---------------------------------------------------------------------------
-// Lock level 3.5: the per-ino block-map meta stripe.
+// Lock levels 3.5 and 3.7: the per-ino block-map meta stripe and the plane's
+// per-ino layout lock (charter §2; `data/plane.zig` module doc declares 3.7).
 // ---------------------------------------------------------------------------
 
 /// 4096-way: the read→merge→save hold of a block-map publish, never held
@@ -1190,6 +1193,9 @@ pub fn inlineMaxFromEnv(env: *const std.process.Environ.Map, facts: derive.Facts
 /// a collision to one short section in 4096 at full handler parallelism,
 /// the same load factor the 4a stripes use.
 pub const INODE_META_STRIPES: usize = 4096;
+/// The layout lock's width: the same load factor (one short commit-length
+/// section in 4096 at full handler parallelism).
+pub const LAYOUT_LOCK_STRIPES: usize = 4096;
 
 /// A PARKING mutex, not a spin: the bound `MapSeam.merge` commits the
 /// layout transaction through the conveyor INSIDE the section (the
@@ -1205,23 +1211,123 @@ pub const MetaStripes = struct {
 
         pub fn release(self: Guard, io: Io) void {
             self.lock.unlock(io);
+            lock_order.released(.meta_stripe);
         }
     };
 
     /// Fibonacci-spread: consecutive mints land on different lines.
-    fn stripeOf(ino: u64) usize {
+    pub fn stripeOf(ino: u64) usize {
         return @intCast((ino *% 0x9E3779B97F4A7C15) >> (64 - 12));
     }
 
     pub fn acquire(self: *MetaStripes, io: Io, ino: u64) Guard {
         const l = &self.locks[stripeOf(ino)];
+        lock_order.acquiring(.meta_stripe);
         l.lockUncancelable(io);
         return .{ .lock = l };
+    }
+
+    /// Parked acquirers on `ino`'s stripe (a test observable).
+    pub fn waiters(self: *MetaStripes, io: Io, ino: u64) u32 {
+        return self.locks[stripeOf(ino)].waiters(io);
+    }
+};
+
+/// Level (3.7) — the plane's per-ino LAYOUT lock: every layout-record
+/// read→stage→commit of one ino serializes here (the merge, the crossing,
+/// the sweep chunk, the promotion, kv_fs's truncate and corpse
+/// transactions). It sits BETWEEN (3.5) and (4a): a block-map publish takes
+/// it INSIDE the upload's meta stripe (`accumulate`, `device_overlay`,
+/// `writeback` hold (3.5) around `MapSeam.merge`, which takes this), and
+/// kv_fs takes it BEFORE its 4a set. A parking mutex (the commit parks;
+/// the same lane argument as `MetaStripes`). Never held across a terminal
+/// block free (RES-1).
+pub const LayoutLocks = struct {
+    locks: [LAYOUT_LOCK_STRIPES]sync_mutex.Mutex = @splat(.init),
+
+    pub const Guard = struct {
+        lock: *sync_mutex.Mutex,
+
+        pub fn release(self: Guard, io: Io) void {
+            self.lock.unlock(io);
+            lock_order.released(.layout);
+        }
+    };
+
+    /// The op guard's mix (`dlm.splitmix64`), so an ino's two tables keep
+    /// one shape; a different mix from the meta stripe's, so the two
+    /// levels' collisions are independent.
+    pub fn stripeOf(ino: u64) usize {
+        return @intCast(splitmix64(ino) & (LAYOUT_LOCK_STRIPES - 1));
+    }
+
+    pub fn acquire(self: *LayoutLocks, io: Io, ino: u64) Guard {
+        const l = &self.locks[stripeOf(ino)];
+        lock_order.acquiring(.layout);
+        l.lockUncancelable(io);
+        return .{ .lock = l };
+    }
+
+    /// Parked acquirers on `ino`'s stripe (a test observable).
+    pub fn waiters(self: *LayoutLocks, io: Io, ino: u64) u32 {
+        return self.locks[stripeOf(ino)].waiters(io);
+    }
+};
+
+/// splitmix64 finalizer — `meta/dlm.zig`'s ONE mix, restated here so the
+/// portable layout module owes the metadata plane nothing.
+fn splitmix64(v: u64) u64 {
+    var x = v;
+    x ^= x >> 30;
+    x *%= 0xbf58476d1ce4e5b9;
+    x ^= x >> 27;
+    x *%= 0x94d049bb133111eb;
+    x ^= x >> 31;
+    return x;
+}
+
+/// A test seam: a promotion parks here between its two acquisitions.
+pub const PromotionPark = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque) void,
+};
+
+/// The two publish levels together with the ONE order a staged promotion
+/// takes them in — (3.5) THEN (3.7). The promotion's identity re-check and
+/// its commit need both: the stripe against a sibling block-map publish of
+/// the ino, the layout lock against the merge / the sweep / kv_fs. Taking
+/// them the other way round inverted the charter's order against every
+/// upload (which holds (3.5) and merges under (3.7)): two inos colliding on
+/// both tables deadlocked (`plane_locks_model.PromotionOrderModel` proves
+/// the inverted order fails; 0002 row 209).
+pub const PublishLocks = struct {
+    stripes: MetaStripes = .{},
+    layouts: LayoutLocks = .{},
+    /// Runs between the stripe and the layout lock; null = inert.
+    promotion_park: ?PromotionPark = null,
+
+    pub const PromotionGuard = struct {
+        stripe: MetaStripes.Guard,
+        layout: LayoutLocks.Guard,
+
+        /// Reverse order of acquisition.
+        pub fn release(self: PromotionGuard, io: Io) void {
+            self.layout.release(io);
+            self.stripe.release(io);
+        }
+    };
+
+    pub fn lockPromotion(self: *PublishLocks, io: Io, ino: u64) PromotionGuard {
+        const stripe = self.stripes.acquire(io, ino);
+        if (self.promotion_park) |p| p.call(p.ctx);
+        const l = self.layouts.acquire(io, ino);
+        return .{ .stripe = stripe, .layout = l };
     }
 };
 
 comptime {
     assert(INODE_META_STRIPES == 1 << 12);
+    assert(LAYOUT_LOCK_STRIPES == 1 << 12);
 }
 
 // ---------------------------------------------------------------------------
@@ -2075,6 +2181,105 @@ test "the meta stripe is 4096-way, spreads consecutive inos, and a guard release
     g.release(io);
     try testing.expect(stripes.locks[MetaStripes.stripeOf(7)].tryLock(io));
     stripes.locks[MetaStripes.stripeOf(7)].unlock(io);
+}
+
+/// Two inos that collide on BOTH publish tables (found by a scan from
+/// ino 8 upward against ino 7; the tie test restates both hashes): the
+/// shape under which an inverted promotion order deadlocks against an
+/// upload.
+pub const colliding_inos = struct {
+    pub const promoted: u64 = 7;
+    pub const uploaded: u64 = 57_110_667;
+    pub const layout_stripe: usize = 3860;
+    pub const meta_stripe: usize = 1336;
+};
+
+test "the layout lock is 4096-way on the op guard's mix; the recorded pair collides on BOTH tables (the tie test of the two-thread test's shape)" {
+    try testing.expectEqual(@as(usize, 4096), LAYOUT_LOCK_STRIPES);
+    try testing.expectEqual(colliding_inos.layout_stripe, LayoutLocks.stripeOf(colliding_inos.promoted));
+    try testing.expectEqual(colliding_inos.layout_stripe, LayoutLocks.stripeOf(colliding_inos.uploaded));
+    try testing.expectEqual(colliding_inos.meta_stripe, MetaStripes.stripeOf(colliding_inos.promoted));
+    try testing.expectEqual(colliding_inos.meta_stripe, MetaStripes.stripeOf(colliding_inos.uploaded));
+    // Consecutive inos spread on the layout table too.
+    var seen: [4096]bool = @splat(false);
+    var distinct: usize = 0;
+    for (0..256) |i| {
+        const s = LayoutLocks.stripeOf(@intCast(i + 2));
+        if (!seen[s]) distinct += 1;
+        seen[s] = true;
+    }
+    try testing.expect(distinct >= 240);
+}
+
+/// The two-thread lock-order test's wall: well past any scheduler hiccup,
+/// far short of the gate's patience. Monotonic time, never a sleep.
+const LOCK_ORDER_WALL_NS: u64 = 20 * std.time.ns_per_s;
+
+test "a staged promotion ((3.5) then (3.7)) completes against an upload holding (3.5) and merging under (3.7) on inos colliding on BOTH tables; the park seam holds the promotion between its two acquisitions until the upload is parked; the rail stays silent" {
+    if (!lock_order.enabled) return error.SkipZigTest;
+    const io = testing.io;
+    const locks = try testing.allocator.create(PublishLocks);
+    defer testing.allocator.destroy(locks);
+    locks.* = .{};
+    const X = colliding_inos.promoted;
+    const Y = colliding_inos.uploaded;
+    const Park = struct {
+        locks: *PublishLocks,
+        parked: std.atomic.Value(u32) = .init(0),
+        /// The promotion holds its first lock until the upload is parked on
+        /// EITHER table (whichever the order under test makes it wait on),
+        /// so the inverted order's wedge is reached deterministically.
+        fn call(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.parked.fetchAdd(1, .acq_rel);
+            while (self.locks.stripes.waiters(testing.io, Y) + self.locks.layouts.waiters(testing.io, Y) == 0) std.Thread.yield() catch {};
+        }
+    };
+    var park: Park = .{ .locks = locks };
+    locks.promotion_park = .{ .ctx = &park, .call = &Park.call };
+    const Promotion = struct {
+        fn run(io_: Io, l: *PublishLocks, done: *std.atomic.Value(bool)) void {
+            const g = l.lockPromotion(io_, X);
+            g.release(io_);
+            done.store(true, .release);
+        }
+    };
+    // `accumulate.uploadParkedBlock`'s shape: (3.5) around `MapSeam.merge`,
+    // which takes (3.7) first thing (`plane.mapMerge`).
+    const Upload = struct {
+        fn run(io_: Io, l: *PublishLocks, done: *std.atomic.Value(bool)) void {
+            const sg = l.stripes.acquire(io_, Y);
+            const lg = l.layouts.acquire(io_, Y);
+            lg.release(io_);
+            sg.release(io_);
+            done.store(true, .release);
+        }
+    };
+    const inv0 = lock_order.lock_order_inversions.load();
+    var promo_done: std.atomic.Value(bool) = .init(false);
+    var upload_done: std.atomic.Value(bool) = .init(false);
+    const ta = try std.Thread.spawn(.{}, Promotion.run, .{ io, locks, &promo_done });
+    // The upload starts only once the promotion holds its first lock.
+    while (park.parked.load(.acquire) == 0) try std.Thread.yield();
+    const tb = try std.Thread.spawn(.{}, Upload.run, .{ io, locks, &upload_done });
+    const t0 = clock.monotonicNs();
+    while (!(promo_done.load(.acquire) and upload_done.load(.acquire))) {
+        if (clock.monotonicNs() -| t0 > LOCK_ORDER_WALL_NS) {
+            // The ABBA wedge: the promotion parked on the stripe the upload
+            // holds, the upload parked on the layout lock the promotion holds.
+            std.debug.print("\nlock-order wedge: promotion parked on meta stripe {d}: {d}; upload parked on layout stripe {d}: {d}; park seam fired {d}\n", .{ colliding_inos.meta_stripe, locks.stripes.waiters(io, X), colliding_inos.layout_stripe, locks.layouts.waiters(io, Y), park.parked.load(.acquire) });
+            ta.detach();
+            tb.detach();
+            return error.LockOrderWedge;
+        }
+        try std.Thread.yield();
+    }
+    ta.join();
+    tb.join();
+    try testing.expectEqual(@as(u32, 1), park.parked.load(.acquire));
+    try testing.expectEqual(inv0, lock_order.lock_order_inversions.load());
+    try testing.expectEqual(@as(u32, 0), locks.stripes.waiters(io, X));
+    try testing.expectEqual(@as(u32, 0), locks.layouts.waiters(io, X));
 }
 
 test "stats JSON names every instrument" {

@@ -35,7 +35,6 @@ const sync_notify = @import("../sync/notify.zig");
 const layout = @import("layout.zig");
 const staging = @import("staging.zig");
 const pack = @import("pack.zig");
-const tx = @import("../meta/tx.zig");
 const block_alloc = @import("block_alloc.zig");
 const enospc = @import("enospc.zig");
 const seams = @import("write_seams.zig");
@@ -452,17 +451,15 @@ pub const PromoteDeps = struct {
     inline_max: u64,
     chunk: u64,
     inline_seam: InlineSeam,
-    /// The packed arm (`pack.Packer.prepare` → `commit`); null = own block.
-    packer: ?*pack.Packer = null,
-    pack_key: pack.PackKey = .{ .vol_tag = 0, .scope = 0 },
-    pack_ctx: ?pack.CommitCtx = null,
 };
 
-pub const Promoted = enum { inline_, own_block, packed_, stale, failed };
+pub const Promoted = enum { inline_, own_block, stale, failed };
 
-/// ONE primitive dispatching on size (`pack.dispatch`): fits inline ⇒ into
-/// inline; `slot > CHUNK/2` ⇒ its own block; else a packed slot. True iff
-/// the entry left the ring.
+/// The portable half of the ONE primitive, dispatching on size
+/// (`pack.dispatch`): fits inline ⇒ into inline; else its own block through
+/// the flush. The packed arm lives in the plane alone (`plane.promoteStaged`
+/// → `pack.commitLocked` under the (3.5) + (3.7) section the plane owns),
+/// so a packed verdict lands as an own block here.
 pub fn promoteStaged(pd: PromoteDeps, io: Io, key: staging.StagingKey, size: u64) Promoted {
     const d = pd.flush;
     const gen = d.seg.residentGeneration(key) orelse return .stale;
@@ -484,29 +481,7 @@ pub fn promoteStaged(pd: PromoteDeps, io: Io, key: staging.StagingKey, size: u64
             stats.layout_promoted_inline.inc();
             return .inline_;
         },
-        .packed_ => {
-            if (pd.packer) |pk| if (pd.pack_ctx) |ctx| {
-                const bytes = lease.bytes();
-                const prepared = (pk.prepare(io, pd.pack_key, bytes[0..@intCast(@min(size, image_len))], clock.monotonicNs()) catch {
-                    lease.release();
-                    return .failed;
-                }) orelse {
-                    lease.release();
-                    return .failed;
-                };
-                lease.release();
-                var t = tx.KvTx.init(d.pool.gpa, @src());
-                defer t.deinit();
-                return switch (pk.commit(io, prepared, ctx, &t)) {
-                    .committed => .packed_,
-                    .stale => .stale,
-                    .failed => .failed,
-                };
-            };
-            lease.release();
-            return promoteOwnBlock(pd, io, key, gen, size);
-        },
-        .own_block => {
+        .packed_, .own_block => {
             lease.release();
             return promoteOwnBlock(pd, io, key, gen, size);
         },

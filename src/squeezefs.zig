@@ -133,6 +133,7 @@ pub const data = struct {
     pub const read_path = @import("data/read_path.zig");
     pub const warm_ladder = @import("data/warm_ladder.zig");
     pub const plane = if (builtin.os.tag == .linux) @import("data/plane.zig") else struct {};
+    pub const plane_locks_model = @import("data/plane_locks_model.zig");
 };
 
 // ---- observability surface: the .stats inode + CLI families (charter §10) ----
@@ -201,6 +202,7 @@ test {
     _ = data.read_path;
     _ = data.warm_ladder;
     if (builtin.os.tag == .linux) _ = data.plane;
+    _ = data.plane_locks_model;
     _ = exec;
     _ = fuse.abi;
     _ = fuse.codec;

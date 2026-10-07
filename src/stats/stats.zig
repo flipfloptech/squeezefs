@@ -80,6 +80,7 @@ const cpu_class = @import("../exec/cpu_class.zig");
 const sqz_io = if (is_linux) @import("../exec/sqz_io.zig") else struct {};
 const tick = @import("../sync/tick.zig");
 const arc_swap = @import("../sync/arc_swap.zig");
+const lock_order = @import("../sync/lock_order.zig");
 const uring_fs = if (is_linux) @import("../io/uring_fs.zig") else struct {};
 const nvme_derive = @import("../io/nvme_derive.zig");
 const mem_budget = @import("../mem/budget.zig");
@@ -231,6 +232,7 @@ pub const sources = [_]Source{
     .{ .path = "src/exec/placement.zig", .family = "exec" },
     .{ .path = "src/sync/tick.zig", .family = "sync" },
     .{ .path = "src/sync/arc_swap.zig", .family = "sync" },
+    .{ .path = "src/sync/lock_order.zig", .family = "sync" },
     .{ .path = "src/io/uring_fs.zig", .family = "io" },
     .{ .path = "src/io/nvme_derive.zig", .family = "io" },
     .{ .path = "src/mem/budget.zig", .family = "mem_budget" },
@@ -475,6 +477,8 @@ fn writeSync(_: *Sources, w: *Writer) Error!void {
     try counters.writeNamespaceJson(tick, w);
     try w.writeAll(",\"arc_swap\":");
     try counters.writeNamespaceJson(arc_swap, w);
+    try w.writeAll(",\"lock_order\":");
+    try counters.writeNamespaceJson(lock_order, w);
     try w.writeByte('}');
 }
 
@@ -822,7 +826,7 @@ test "every instrument declared in a generated namespace is a key of the documen
     const p = try r.render();
     defer p.deinit(testing.allocator);
     const text = p.bytes();
-    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, transform.stats, write_seams.stats, stats }) |Ns| {
+    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats }) |Ns| {
         inline for (comptime counters.instrumentNames(Ns)) |name| {
             const T = @TypeOf(@field(Ns, name));
             const k = if (T == counters.Tripwire) @field(Ns, name).site else name;

@@ -27,11 +27,13 @@
 //!
 //! Per tenant: `prepare` (the staging image, ONE DMA of exactly `slot`
 //! bytes at `base + off` — the completion mints the `DmaProof`) then
-//! `commit` (under the ino's meta stripe: re-check staged + same file_id +
-//! same generation; the packed layout with the tenant mapping, its `+ref`
-//! and any displaced `−ref` in the SAME tx; release the ring entry inside
-//! the guard; free the displaced block after the guard drops — RES-1). DMA
-//! strictly precedes commit: `commit` takes the `Prepared` the DMA minted.
+//! `commitLocked` (under the CALLER's (3.5) meta stripe + (3.7) layout
+//! lock, `layout.PublishLocks.lockPromotion`: re-check staged + same
+//! file_id + same generation; the packed layout with the tenant mapping,
+//! its `+ref` and any displaced `−ref` in the SAME tx; release the ring
+//! entry inside the section; the displaced block RETURNED for the caller
+//! to free after its locks drop — RES-1). DMA strictly precedes commit:
+//! `commitLocked` takes the `Prepared` the DMA minted.
 //! Crash contract: nothing durable records the open block; ≥ 1 committed
 //! tenant ⇒ the block recovers ALLOCATED at `refcount = N` from the refs
 //! records; none ⇒ FREE.
@@ -332,9 +334,11 @@ pub const Prepared = struct {
 pub const ReserveError = error{ PackTableFull, StorageFull, VolumeFailed, OutOfMemory, Canceled, FlightTableFull };
 pub const PrepareError = ReserveError || layout.DmaError;
 
-pub const CommitOutcome = enum {
-    /// The layout flipped to packed; the ring entry released.
-    committed,
+pub const CommitOutcome = union(enum) {
+    /// The layout flipped to packed; the ring entry released. The payload
+    /// is the displaced durable copy (a re-staged file's earlier tenant),
+    /// the caller's to `releaseTenantRef` AFTER its locks drop.
+    committed: ?Mapping,
     /// The identity moved (re-staged, promoted elsewhere, gone): the slot is
     /// abandoned, nothing published.
     stale,
@@ -343,7 +347,6 @@ pub const CommitOutcome = enum {
 };
 
 pub const CommitCtx = struct {
-    stripes: *layout.MetaStripes,
     /// The LOCAL key ino.
     ino: u64,
     hash_seed: u64,
@@ -629,44 +632,43 @@ pub const Packer = struct {
         };
     }
 
-    /// Under the ino's meta stripe (3.5): the identity must still be
+    /// Under the CALLER's locks — the ino's meta stripe (3.5) and the
+    /// plane's layout lock (3.7), taken in that order by
+    /// `layout.PublishLocks.lockPromotion` (0002 row 209: this function
+    /// taking the stripe itself under the caller's layout lock inverted the
+    /// charter's order against every upload): the identity must still be
     /// `staged ∧ same file_id ∧ same ring generation`; the packed layout
     /// (`size = max(size, image)` — never persist a size below the image)
     /// with its `+ref` and the displaced copy's `−ref` in ONE tx; the ring
-    /// entry released INSIDE the guard, generation-gated (released outside
-    /// it landed inside an RMW's stage→commit window and freed the sole
-    /// copy); the displaced block freed AFTER the guard (RES-1). A failed
-    /// save leaves the refs retracted with the tx and abandons the slot.
-    pub fn commit(self: *Packer, io: Io, prepared: Prepared, c: CommitCtx, t: *tx.KvTx) CommitOutcome {
-        const guard = c.stripes.acquire(io, c.ino);
+    /// entry released INSIDE the section, generation-gated (released
+    /// outside it landed inside an RMW's stage→commit window and freed the
+    /// sole copy). The displaced durable copy is RETURNED for the caller to
+    /// release once its locks drop (RES-1: a tenant release can be the
+    /// block's terminal free). A failed save leaves the refs retracted with
+    /// the tx and abandons the slot.
+    pub fn commitLocked(self: *Packer, prepared: Prepared, c: CommitCtx, t: *tx.KvTx) CommitOutcome {
         const sk = staging.StagingKey.init(c.file_id, c.ino);
         const cur = c.lookup.current(c.lookup.ctx, c.ino);
         const bound = if (cur) |l| l.kind == .staged and std.mem.eql(u8, &l.file_id, &c.file_id) else false;
         if (!bound or c.seg.residentGeneration(sk) != c.generation) {
-            guard.release(io);
             self.releaseLandedSite(prepared.tenant);
             return .stale;
         }
         const prev = cur.?;
         const new = layout.Layout.packedTenant(@max(prev.size, prepared.image_len), c.file_id, prepared.mapping);
         layout.publishLayout(t, .{ .ino = c.ino, .hash_seed = c.hash_seed, .coll_seq = c.coll_seq, .prev = prev, .layout = new, .proofs = &.{prepared.proof} }, c.refs, c.geo) catch {
-            guard.release(io);
             self.releaseLandedSite(prepared.tenant);
             return .failed;
         };
         c.commit.commit(c.commit.ctx, t) catch {
-            guard.release(io);
             self.releaseLandedSite(prepared.tenant);
             return .failed;
         };
         _ = staging.releaseStaged(c.pool, c.seg, sk, c.generation);
-        const displaced = prev.durableCopy();
-        guard.release(io);
-        if (displaced) |d| self.releaseTenantRef(d);
         _ = prepared.tenant.pack.inflight.fetchSub(1, .acq_rel);
         _ = prepared.tenant.pack.committed.fetchAdd(1, .acq_rel);
         stats.layout_promoted_packed.inc();
-        return .committed;
+        return .{ .committed = prev.durableCopy() };
     }
 
     /// The tenant's own reference leaves without a commit: TERMINAL when the
@@ -1193,7 +1195,7 @@ fn fill(comptime len: usize, b: u8) [len]u8 {
 const Fixture = struct {
     world: World,
     packer: Packer,
-    stripes: *layout.MetaStripes,
+    locks: *layout.PublishLocks,
     pool: staging.Pool,
     image: []u8,
     seg: staging.Segment,
@@ -1203,8 +1205,8 @@ const Fixture = struct {
         errdefer gpa.destroy(f);
         f.world = .{ .gpa = gpa };
         f.packer = try Packer.init(gpa, CHUNK, Policy.resolve(true, null, CHUNK), f.world.allocSeam(), f.world.dmaSeam(), f.world.readSeam(), 8);
-        f.stripes = try gpa.create(layout.MetaStripes);
-        f.stripes.* = .{};
+        f.locks = try gpa.create(layout.PublishLocks);
+        f.locks.* = .{};
         f.pool = staging.Pool.init(gpa, 64 * derive.MiB, .none);
         f.image = try gpa.alloc(u8, 8 * derive.MiB);
         @memset(f.image, 0);
@@ -1217,7 +1219,7 @@ const Fixture = struct {
         self.seg.deinit();
         gpa.free(self.image);
         self.pool.deinit();
-        gpa.destroy(self.stripes);
+        gpa.destroy(self.locks);
         self.packer.deinit();
         self.world.deinit();
         gpa.destroy(self);
@@ -1237,7 +1239,17 @@ const Fixture = struct {
     }
 
     fn ctx(self: *Fixture, ino: u64, seed: u8, generation: u64) CommitCtx {
-        return .{ .stripes = self.stripes, .ino = ino, .hash_seed = SEED, .file_id = fid(seed), .generation = generation, .lookup = self.world.lookupSeam(), .refs = self.world.refsSeam(), .commit = self.world.commitSeam(), .pool = &self.pool, .seg = &self.seg, .geo = self.world.geo };
+        return .{ .ino = ino, .hash_seed = SEED, .file_id = fid(seed), .generation = generation, .lookup = self.world.lookupSeam(), .refs = self.world.refsSeam(), .commit = self.world.commitSeam(), .pool = &self.pool, .seg = &self.seg, .geo = self.world.geo };
+    }
+
+    /// The plane's commit section: `commitLocked` under (3.5) then (3.7),
+    /// the displaced copy released after both drop.
+    fn commit(self: *Fixture, io: Io, prepared: Prepared, c: CommitCtx, t: *tx.KvTx) CommitOutcome {
+        const g = self.locks.lockPromotion(io, c.ino);
+        const out = self.packer.commitLocked(prepared, c, t);
+        g.release(io);
+        if (out == .committed) if (out.committed) |d| self.packer.releaseTenantRef(d);
+        return out;
     }
 
     /// The ONE primitive: read the ring image, prepare, commit.
@@ -1248,7 +1260,7 @@ const Fixture = struct {
         const prepared = (try self.packer.prepare(io, k, lease.bytes(), 1)) orelse return error.ArmStopped;
         var t = tx.KvTx.init(self.world.gpa, @src());
         defer t.deinit();
-        return self.packer.commit(io, prepared, self.ctx(ino, seed, generation), &t);
+        return self.commit(io, prepared, self.ctx(ino, seed, generation), &t);
     }
 };
 
@@ -1265,7 +1277,7 @@ test "prepare → commit: ONE DMA of the slot before the type flip, the packed l
     for (payloads, 0..) |p, i| gens[i] = (try f.stage(@intCast(10 + i), @intCast(i), p)).generation;
     const before_dmas = f.world.dmas;
     const packed0 = stats.layout_promoted_packed.load();
-    for (payloads, 0..) |_, i| try testing.expectEqual(CommitOutcome.committed, try f.promote(io, @intCast(10 + i), @intCast(i), gens[i]));
+    for (payloads, 0..) |_, i| try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, @intCast(10 + i), @intCast(i), gens[i])));
     try testing.expectEqual(before_dmas + 3, f.world.dmas);
     try testing.expectEqual(packed0 + 3, stats.layout_promoted_packed.load());
     // One block opened; the pin + 3 committed = 4; every tenant's ref is durable.
@@ -1308,7 +1320,7 @@ test "prepare → commit: ONE DMA of the slot before the type flip, the packed l
     try testing.expectEqual(@as(u64, 1), stats.pack_open_scopes.load());
 }
 
-test "commit re-checks the identity under the stripe: a re-stage (new generation), a different file id or a non-staged layout ⇒ stale, the slot abandoned, nothing published; a failed KV commit retracts the refs and abandons the slot" {
+test "commitLocked re-checks the identity under the caller's stripe + layout lock: a re-stage (new generation), a different file id or a non-staged layout ⇒ stale, the slot abandoned, nothing published; a failed KV commit retracts the refs and abandons the slot" {
     const gpa = testing.allocator;
     const io = testing.io;
     const f = try Fixture.init(gpa);
@@ -1323,7 +1335,7 @@ test "commit re-checks the identity under the stripe: a re-stage (new generation
     const abandoned0 = stats.pack_slots_abandoned.load();
     var t = tx.KvTx.init(gpa, @src());
     defer t.deinit();
-    try testing.expectEqual(CommitOutcome.stale, f.packer.commit(io, prepared, f.ctx(20, 1, g1), &t));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).stale, std.meta.activeTag(f.commit(io, prepared, f.ctx(20, 1, g1), &t)));
     try testing.expectEqual(abandoned0 + 1, stats.pack_slots_abandoned.load());
     try testing.expectEqual(layout.Kind.staged, World.current(&f.world, 20).?.kind);
     try testing.expectEqual(@as(u32, 0), f.world.durableRefcount(0x11, 0));
@@ -1336,7 +1348,7 @@ test "commit re-checks the identity under the stripe: a re-stage (new generation
     lease2.release();
     var t2 = tx.KvTx.init(gpa, @src());
     defer t2.deinit();
-    try testing.expectEqual(CommitOutcome.stale, f.packer.commit(io, prepared2, f.ctx(20, 9, g2), &t2));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).stale, std.meta.activeTag(f.commit(io, prepared2, f.ctx(20, 9, g2), &t2)));
     // A failed KV commit: refs retracted (nothing durable), slot abandoned, the layout unchanged, the ring entry kept.
     const lease3 = f.seg.get(staging.StagingKey.init(Fixture.fid(1), 20)).?;
     const prepared3 = (try f.packer.prepare(io, k, lease3.bytes(), 1)).?;
@@ -1344,13 +1356,13 @@ test "commit re-checks the identity under the stripe: a re-stage (new generation
     f.world.commit_fail_next = true;
     var t3 = tx.KvTx.init(gpa, @src());
     defer t3.deinit();
-    try testing.expectEqual(CommitOutcome.failed, f.packer.commit(io, prepared3, f.ctx(20, 1, g2), &t3));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).failed, std.meta.activeTag(f.commit(io, prepared3, f.ctx(20, 1, g2), &t3)));
     try testing.expectEqual(@as(u32, 0), f.world.durableRefcount(0x11, 0));
     try testing.expectEqual(layout.Kind.staged, World.current(&f.world, 20).?.kind);
     try testing.expect(f.seg.get(staging.StagingKey.init(Fixture.fid(1), 20)) != null);
     f.seg.get(staging.StagingKey.init(Fixture.fid(1), 20)).?.release();
     // Finally the real commit lands.
-    try testing.expectEqual(CommitOutcome.committed, try f.promote(io, 20, 1, g2));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, 20, 1, g2)));
     try testing.expectEqual(@as(u32, 1), f.world.durableRefcount(0x11, 0));
     try testing.expectEqual(@as(u32, 2), World.refcount(&f.world, 0x11, 0));
 }
@@ -1397,7 +1409,7 @@ test "overflow seals FULL exactly once and the next reservation refills into a f
     for (0..3) |i| gens[i] = (try f.stage(@intCast(30 + i), @intCast(i), half)).generation;
     const full0 = stats.pack_blocks_sealed_full.load();
     const opened0 = stats.pack_blocks_opened.load();
-    for (0..3) |i| try testing.expectEqual(CommitOutcome.committed, try f.promote(io, @intCast(30 + i), @intCast(i), gens[i]));
+    for (0..3) |i| try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, @intCast(30 + i), @intCast(i), gens[i])));
     try testing.expectEqual(full0 + 1, stats.pack_blocks_sealed_full.load());
     try testing.expectEqual(opened0 + 2, stats.pack_blocks_opened.load());
     try testing.expectEqual(@as(u32, 2), f.world.allocs);
@@ -1416,7 +1428,7 @@ test "overflow seals FULL exactly once and the next reservation refills into a f
     try testing.expect(f.packer.openPack(k) == null);
     // A new tenant opens block 2; dismount seals it; an abandoned (empty) pack counts.
     const g = (try f.stage(40, 7, &fill(10, 'z'))).generation;
-    try testing.expectEqual(CommitOutcome.committed, try f.promote(io, 40, 7, g));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, 40, 7, g)));
     try testing.expect(f.packer.openPack(k) != null);
     const k2: PackKey = .{ .vol_tag = 0x11, .scope = 9 };
     _ = (try f.packer.reserve(io, k2, 4096)).?;
@@ -1452,8 +1464,8 @@ test "crash contract over the RAM seams: ≥ 1 committed tenant ⇒ the block re
     var gens: [4]u64 = undefined;
     for (0..4) |i| gens[i] = (try f.stage(@intCast(50 + i), @intCast(i), &fill(3000, 'p'))).generation;
     // Two commit, one is prepared (DMA done) when the "crash" hits, one never started.
-    try testing.expectEqual(CommitOutcome.committed, try f.promote(io, 50, 0, gens[0]));
-    try testing.expectEqual(CommitOutcome.committed, try f.promote(io, 51, 1, gens[1]));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, 50, 0, gens[0])));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, 51, 1, gens[1])));
     const lease = f.seg.get(staging.StagingKey.init(Fixture.fid(2), 52)).?;
     _ = (try f.packer.prepare(io, k, lease.bytes(), 1)).?;
     lease.release();
@@ -1493,7 +1505,7 @@ test "binding validation: a moved identity re-resolves (counted) and a 64th move
     const f = try Fixture.init(gpa);
     defer f.deinit();
     const g = (try f.stage(60, 3, &fill(2000, 'r'))).generation;
-    try testing.expectEqual(CommitOutcome.committed, try f.promote(io, 60, 3, g));
+    try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, 60, 3, g)));
     var out: [8192]u8 = undefined;
     // Stale incarnation while still bound: EIO + the tripwire.
     f.world.stale_reads = 1;

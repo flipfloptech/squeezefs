@@ -23,6 +23,7 @@ const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const dlm = @import("../meta/dlm.zig");
 const sync_mutex = @import("../sync/mutex.zig");
+const lock_order = @import("../sync/lock_order.zig");
 const slot = @import("../fuse/transport/slot.zig");
 const layout = @import("layout.zig");
 const block_alloc = @import("block_alloc.zig");
@@ -322,6 +323,7 @@ pub const BlockLocks = struct {
 
         pub fn release(self: Guard, io: Io) void {
             self.lock.unlock(io);
+            lock_order.released(.block);
         }
     };
 
@@ -346,6 +348,7 @@ pub const BlockLocks = struct {
     pub fn acquire(self: *BlockLocks, io: Io, ino: u64, block: u32, site: LockSite) Guard {
         const l = &self.locks[self.stripeOf(ino, block)];
         stats.block_lock_acquires.inc();
+        lock_order.acquiring(.block);
         if (l.tryLock(io)) return .{ .lock = l };
         stats.block_lock_contended.inc();
         const t0 = clock.monotonicNs();
@@ -357,6 +360,7 @@ pub const BlockLocks = struct {
     pub fn tryAcquire(self: *BlockLocks, io: Io, ino: u64, block: u32) ?Guard {
         const l = &self.locks[self.stripeOf(ino, block)];
         if (!l.tryLock(io)) return null;
+        lock_order.acquiredTry(.block);
         stats.block_lock_acquires.inc();
         return .{ .lock = l };
     }

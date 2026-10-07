@@ -131,6 +131,8 @@ reads its last intact image.
 | `staging.GenerationAbaModel` | 4 | recycled generations: a stale release frees the re-staged sole copy |
 | `pack.PinModel` / `pack.SealModel` | 9 / 4 | the nonzero check removed: the pin arithmetic; a load-then-store seal releases the pin twice |
 | `write_epoch_model.CloseVisibilityModel` (the save vs a writer on its block; the follow-up commit) | 22 | `unbind_before_save` (the epoch out of sight before its merge): the writer patches/bases on the A key the save displaces; `base_from_map` (the base from the durable map under a shadow): the park's complement misses the bytes only B held |
+| `plane_locks_model.PromotionOrderModel` (a staged promotion vs an upload on inos colliding on both tables; the lock-order commit) | 16 | the promotion taking the layout lock first (HEAD's order, the stripe inside `pack.commit`): the ABBA wedge |
+| `plane_locks_model.HeadFoldModel` (a truncate vs a sweep chunk on one tree-mapped head) | 17 | the truncate outside the layout lock (the pre-fix kv_fs): the chunk's Put restores the old size |
 
 ## Gate totals
 
@@ -258,6 +260,45 @@ reads its last intact image.
   carries to the cohort like a fill, an LRU hit dissolves the flight to the elected waiter). RED
   FIRST: the `before_flight` seam holds a reader in the window while a sibling's read completes
   — `expected 1, found 2` on the old code, deterministic; 150/150 loop passes after.
+- **CLOSED (2026-10-07) — two LATENT lock-order hazards from the lock-order audit** (no repro at
+  HEAD; both real by construction; 0002 rows 209–210). (1) **The layout lock → (3.5) inversion**:
+  the plane's per-ino layout lock had NO declared level; `promoteStaged` held it and let
+  `pack.commit` take the (3.5) meta stripe inside, while every upload holds (3.5) and merges
+  under the layout lock (`accumulate.zig`, `device_overlay.zig`, `writeback.zig` → `plane.
+  mapMerge`) — two inos colliding on BOTH 4096-way tables ABBA. DECLARED: the layout lock is
+  level **(3.7)**, between (3.5) and (4a) (charter §2 amended; `layout.LayoutLocks`,
+  `plane.zig` module doc); the promotion takes (3.5) THEN (3.7) (`layout.PublishLocks.
+  lockPromotion`, the ONE order with a park seam between the two) and `pack.commitLocked` runs
+  under the caller's section, RETURNING the displaced copy for the release after both drop
+  (RES-1). RED FIRST: the two-thread test over the computed colliding pair (`layout.
+  colliding_inos`: inos 7 and 57 110 667 share layout stripe 3860 and meta stripe 1336; the tie
+  test restates both hashes) parks the promotion between its two acquisitions until the upload
+  is parked, then bounds the join on the monotonic clock — on HEAD's order it reports
+  `lock-order wedge: promotion parked on meta stripe 1336: 1; upload parked on layout stripe
+  3860: 1` and the rail fires `lock_order_inversions: (3.5) meta stripe`; on the new order it
+  completes with the rail silent. `plane_locks_model.PromotionOrderModel` holds over every
+  schedule and the inverted order fails (`error.Deadlock`, the recorded weakening). (2) **Two
+  authorities for the tree-mapped head**: kv_fs's shrink (`stageKvmapShrink`) and corpse mark
+  published the head under the level-1 exclusive guard + 4a but NOT the layout lock, the
+  background sweep's chunk under the layout lock — the module doc's claim that kv_fs's layout
+  transactions took the lock was FALSE, and a truncate racing a chunk folded last-writer-wins
+  (the chunk's Put restores the old size; the residue in `[new, old)` is never swept). FIX: ONE
+  authority — kv_fs's truncate (every layout kind; SETATTR size and `O_TRUNC`) and the tree-mapped
+  corpse mark take the layout lock through the data face (`Data.lockLayout`) BEFORE their 4a set
+  and hold it until the commit landed (released before `afterCommit`, whose synchronous sweep
+  takes it again); the sweep's chunk re-reads the head under the same lock, so the fold is
+  last-writer-wins over SERIAL writers; `stageKvmapShrink` counts a Put staged outside the lock
+  (`kvmap_head_put_unlocked`, debug). `plane_locks_model.HeadFoldModel` holds (every final head is
+  one of the two serial outcomes) and the unlocked truncate fails (`TruncateSizeLost`, the
+  recorded weakening); the kv_fs Harness pins one acquisition per truncate with balance 0 across
+  the refusal path and the O_TRUNC open, none for a chmod. (3) **The lock-level RAIL**
+  (`sync/lock_order.zig`, debug builds or `force_enabled`): a per-thread ledger of held levels
+  tagged by execution context (fibers interleave on a lane thread and never migrate; the
+  executor installs the fiber identity), checked at the (1), (3), (3.5), (3.7) and (4a) acquire
+  sites BEFORE the park (the wedge happens at the attempt); try-acquires are recorded, not
+  checked (the charter's sanctioned try-only addition); a 4a set is `handedOff` when its tx is
+  submitted (the conveyor releases it on its thread). `lock_order_inversions` and
+  `lock_order_ledger_overflows` must stay 0 — exported under `sync.lock_order`.
 - **Per-ino inline layout record** is the map authority (read latch-free through the node cache,
   one decode per probe); a RAM layout cache is owed with the kvmap crossing.
 - `status`'s reference census walks the ledger (one page per 512 refs); fsck C8 offline is rung 8.

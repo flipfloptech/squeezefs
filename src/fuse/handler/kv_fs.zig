@@ -40,7 +40,13 @@
 //! conveyor drops it at the terminal outcome BEFORE the ack (D-3). A
 //! striped write takes NO 4a guard across its data I/O: the pieces run
 //! under the write path's level (3) and the inode's size claim is a
-//! postlude transaction (SIZE NEVER LEADS DATA).
+//! postlude transaction (SIZE NEVER LEADS DATA). A TRUNCATE (SETATTR size,
+//! `O_TRUNC`) and the tree-mapped corpse mark take the data plane's
+//! per-ino layout lock — level (3.7), `Data.lockLayout` — BEFORE the 4a
+//! set and hold it until the commit landed: the layout record they read is
+//! the one their commit lands on, against the plane's merges, sweeps and
+//! promotions (the head's ONE authority; 0002 row 210). It drops before
+//! `afterCommit`, whose synchronous sweep takes it again.
 //!
 //! Records: inode `ino ‖ 01` (`record.InodeValue`), dentry `parent ‖ 02 ‖
 //! hash54 ‖ coll` (the GLOBAL child ino), xattr `ino ‖ 03 ‖ hash56 ‖ coll`
@@ -98,6 +104,7 @@ const record = @import("../../meta/record.zig");
 const tx = @import("../../meta/tx.zig");
 const tree = @import("../../meta/tree.zig");
 const dlm = @import("../../meta/dlm.zig");
+const lock_order = @import("../../sync/lock_order.zig");
 const economy = @import("../../meta/economy.zig");
 const guard_claim = @import("../../meta/guard/claim.zig");
 const virtual_inodes = @import("virtual_inodes.zig");
@@ -251,7 +258,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "releaseStaged", "stagedLease", "readMappingImage", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -731,6 +738,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn commit(self: *Self, c: *Ctx, t: *tx.KvTx) Error!void {
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
+            // The 4a set leaves this frame with the tx (the conveyor drops it
+            // at the terminal outcome, on its thread).
+            lock_order.handedOff(.object);
             self.store.commit(t) catch |e| return storeErr(e);
         }
 
@@ -1198,7 +1208,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                             // A tree-mapped corpse: its own tx marks it
                             // (head {size 0, sweep 0}); the sweep's terminal
                             // chunk destroys the inode and its xattrs.
-                            try self.markKvmapCorpse(c, ino, l, kv.key[kv.key.len - 1], v.size);
+                            try self.markKvmapCorpse(c, ino, l, v.size);
                             tree_mapped = true;
                             break;
                         }
@@ -1249,13 +1259,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// judged off the durable head alone; the inode record stays (nlink
         /// 0, unreachable) until the sweep destroys it. Idempotent: a mount
         /// sweep that meets an already-marked corpse only re-kicks the drain.
-        fn markKvmapCorpse(self: *Self, c: *Ctx, ino: u64, l: Layout, coll_seq: u8, size: u64) Error!void {
+        fn markKvmapCorpse(self: *Self, c: *Ctx, ino: u64, l: Layout, size: u64) Error!void {
             const head = l.kvmapHead().?;
             if (!(head.sweep == 0 and l.size == 0)) {
-                const t = try self.store.begin(@src());
-                errdefer self.store.abandon(t);
-                try self.data.stageKvmapCorpse(t, ino, l, coll_seq);
-                try self.commit(c, t);
+                // (3.7) across the mark: the head is re-read under it so the
+                // Put's `prev` is the record the commit lands on (a sweep
+                // chunk or a crossing may have moved it since the gather).
+                const layout_lock = self.data.lockLayout(self.io, ino);
+                defer layout_lock.release(self.io);
+                const fresh = try self.readLayout(ino);
+                defer self.freeLayout(fresh);
+                if (fresh) |cur| if (cur.layout.isKvmap() and !(cur.layout.kvmapHead().?.sweep == 0 and cur.layout.size == 0)) {
+                    const t = try self.store.begin(@src());
+                    errdefer self.store.abandon(t);
+                    try self.data.stageKvmapCorpse(t, ino, cur.layout, cur.coll_seq);
+                    try self.commit(c, t);
+                };
             }
             _ = self.pending.retire(ino);
             var after: AfterCommit = .{};
@@ -1281,6 +1300,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var after: AfterCommit = .{};
             var old_size: u64 = 0;
             var kind: layout.Kind = .inline_;
+            var layout_lock: ?Data.LayoutGuard = null;
+            errdefer if (layout_lock) |g| g.release(self.io);
             if (a.attr.size) |_| {
                 const probe = (try self.readInodeOpt(local)) orelse return error.FileNotFound;
                 if (!(probe.mode & S.IFMT == S.IFREG)) return error.InvalidArgument;
@@ -1290,6 +1311,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 // Under the lifecycle's exclusive guard: the custody lands
                 // before the clip (the layout read below is then the truth).
                 self.settleCustody(local, kind);
+                // (3.7) before the 4a set, held across the commit (module doc).
+                layout_lock = self.data.lockLayout(self.io, local);
             }
             const t = try self.beginExclusive(local, @src());
             errdefer self.store.abandon(t);
@@ -1304,6 +1327,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var out = try economy.stageSetattr(t, &self.pending, local, stored, req, now());
             if (out.verdict == .absorbed) {
                 self.store.abandon(t);
+                if (layout_lock) |g| g.release(self.io);
+                layout_lock = null;
                 return self.attrReply(a.ino, out.value);
             }
             if (a.attr.kill_suidgid) {
@@ -1315,6 +1340,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
             }
             try self.commit(c, t);
+            if (layout_lock) |g| g.release(self.io);
+            layout_lock = null;
             _ = self.pending.retire(local);
             if (a.attr.size) |sz| {
                 self.afterCommit(&after);
@@ -1580,6 +1607,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.freeLayout(rec);
                 self.settleCustody(local, kind);
                 var after: AfterCommit = .{};
+                // (3.7) before the 4a set, held across the commit (module doc).
+                var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
+                errdefer if (layout_lock) |g| g.release(self.io);
                 const t = try self.beginExclusive(local, @src());
                 errdefer self.store.abandon(t);
                 var stored = try self.readInode(local);
@@ -1591,6 +1621,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 if (a.open_flags & abi.FUSE_OPEN_KILL_SUIDGID != 0) try self.killpriv(t, local, &stored);
                 try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &stored.encode());
                 try self.commit(c, t);
+                layout_lock.?.release(self.io);
+                layout_lock = null;
                 _ = self.pending.retire(local);
                 self.afterCommit(&after);
                 self.data.noteShape(local, 0, if (kind == .striped) .striped else .inline_);
@@ -2071,6 +2103,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 pub const NoData = struct {
     /// The derived inline bound at one page (charter §6.1).
     inline_max: u64 = layout.INLINE_MAX_FLOOR,
+    /// `lockLayout` acquisitions and the balance (test observables).
+    layout_locks_taken: u32 = 0,
+    layout_lock_held: u32 = 0,
 
     pub const OwnBlock = struct { mapping: Mapping, proof: layout.DmaProof };
     pub const Space = struct { total_bytes: u64, free_bytes: u64 };
@@ -2132,6 +2167,23 @@ pub const NoData = struct {
     }
     pub fn readMappingImage(_: *NoData, _: Mapping, _: []u8) Error![]const u8 {
         return error.NotSupported;
+    }
+    /// The (3.7) layout lock of a plane-less set: nothing to exclude, but
+    /// the acquisition is RECORDED (the rail sees (1) → (3.7) → (4a) on
+    /// the truncate paths) and counted for the tests.
+    pub const LayoutGuard = struct {
+        owner: *NoData,
+
+        pub fn release(self: LayoutGuard, _: Io) void {
+            lock_order.released(.layout);
+            self.owner.layout_lock_held -= 1;
+        }
+    };
+    pub fn lockLayout(self: *NoData, _: Io, _: u64) LayoutGuard {
+        lock_order.acquiring(.layout);
+        self.layout_locks_taken += 1;
+        self.layout_lock_held += 1;
+        return .{ .owner = self };
     }
     pub fn stageKvmapShrink(_: *NoData, _: *tx.KvTx, _: u64, _: Layout, _: u8, _: u64) Error!u32 {
         unreachable; // no tree-mapped head exists on a volume-less set
@@ -2596,6 +2648,47 @@ test "POSIX: create → write → read → stat; an overlay write grows the file
     try testing.expectEqual(linux.E.FBIG, h.setattr(f, sa).errno().?);
     h.release(f);
     try testing.expectEqual(@as(u32, 0), h.opens.get(f).?.count);
+}
+
+test "a truncate (SETATTR size, O_TRUNC) takes the data face's (3.7) layout lock exactly once — before its 4a set, released after the commit (balance 0), a refused size included; a chmod takes none; the lock-order rail stays silent across the op's (1) → (3.7) → (4a)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const inv0 = lock_order.lock_order_inversions.load();
+    const f = try h.create(1, "f", 0o644);
+    _ = h.write(f, 0, "0123456789", 0);
+    try testing.expectEqual(@as(u32, 0), h.nodata.layout_locks_taken);
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_SIZE;
+    sa.size = 4;
+    try testing.expectEqual(@as(u64, 4), (try h.attr(h.setattr(f, sa))).size);
+    try testing.expectEqual(@as(u32, 1), h.nodata.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    // The refusal path (EFBIG past the inline bound) releases too.
+    sa.size = 1 << 20;
+    try testing.expectEqual(linux.E.FBIG, h.setattr(f, sa).errno().?);
+    try testing.expectEqual(@as(u32, 2), h.nodata.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    // A chmod: no layout mutation, no lock.
+    var sm = abi.zeroed(abi.fuse_setattr_in);
+    sm.valid = abi.FATTR_MODE;
+    sm.mode = 0o600;
+    try testing.expectEqual(@as(u32, S.IFREG | 0o600), (try h.attr(h.setattr(f, sm))).mode);
+    try testing.expectEqual(@as(u32, 2), h.nodata.layout_locks_taken);
+    // A size the file already has (no layout mutation) still balances.
+    sa.size = 4;
+    _ = h.setattr(f, sa);
+    try testing.expectEqual(@as(u32, 3), h.nodata.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    h.release(f);
+    // O_TRUNC rides the open under the lock.
+    const op = h.call(.{ .open = .{ .flags = O_TRUNC, .open_flags = 0 } }, f);
+    try testing.expectEqual(@as(?linux.E, null), op.errno());
+    try testing.expectEqual(@as(u64, 0), (try h.getattr(f)).size);
+    try testing.expectEqual(@as(u32, 4), h.nodata.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    h.release(f);
+    try testing.expectEqual(inv0, lock_order.lock_order_inversions.load());
 }
 
 test "POSIX: mkdir/readdir/rmdir — dot entries, cookie continuation, ENOTEMPTY, a removed directory looks up negative; lookup of . and .." {

@@ -24,13 +24,26 @@
 //! path's `Meta`, and the read seam over the write side
 //! (`write_side_view.Composite` adapted to `read_path.WriteSide`).
 //!
-//! Locks (charter §2): the plane's per-ino LAYOUT lock serializes every
-//! layout-record read→stage→commit (the merge, kv_fs's inline/staged/
-//! truncate/destroy transactions) — a PARKING mutex (the commit parks),
-//! 4096 stripes at the 4a load factor; it nests INSIDE the write side's
-//! (3.5) meta stripe when a core holds one and is taken alone by the epoch
-//! close and kv_fs. Never held across a terminal block free (RES-1): every
-//! displaced binding is freed by the caller after its transaction landed.
+//! Locks (charter §2): the plane's per-ino LAYOUT lock is level **(3.7)**
+//! — BETWEEN the write side's (3.5) meta stripe and the 4a object locks
+//! (`layout.LayoutLocks`; 0002 row 209): every block-map publish takes it
+//! INSIDE the upload's stripe (`accumulate`/`device_overlay`/`writeback`
+//! hold (3.5) around `MapSeam.merge`), the staged PROMOTION takes the
+//! stripe first and the layout lock second (`layout.PublishLocks.
+//! lockPromotion`; `pack.commitLocked` runs under both), and kv_fs takes it
+//! BEFORE its 4a set. It serializes every layout-record read→stage→commit
+//! of an ino: the merge, the crossing, the window merge, the sweep chunk,
+//! the promotion — and kv_fs's TRUNCATE transactions (every layout kind)
+//! and its tree-mapped CORPSE mark, which take it through the data face
+//! (`Data.lockLayout`, from before the layout read until the commit
+//! landed) so the tree-mapped head has ONE authority (0002 row 210).
+//! kv_fs's write-routing transactions (inline / staged / promote-to-
+//! striped) and the destroy rider run under the level-1 exclusive op guard
+//! alone; the background promotion meets them only through the identity
+//! re-check under both locks. A PARKING mutex (the commit parks), 4096
+//! stripes at the 4a load factor. Never held across a terminal block free
+//! (RES-1): every displaced binding is freed by the caller after its
+//! transaction landed and its locks dropped.
 //!
 //! The block-map tree (charter §5.6; `data/kvmap.zig`): a merge that would
 //! push the inline map past the record cap runs the CROSSING under the
@@ -67,6 +80,7 @@ const log = @import("../core/log.zig");
 const budget = @import("../mem/budget.zig");
 const exec = @import("../exec/exec.zig");
 const sync_mutex = @import("../sync/mutex.zig");
+const lock_order = @import("../sync/lock_order.zig");
 const taskset = @import("../sync/taskset.zig");
 const nvme_dev = @import("../io/nvme_dev.zig");
 const uring_fs = @import("../io/uring_fs.zig");
@@ -123,9 +137,6 @@ pub const BlockKey = read_size_class.BlockKey;
 // Constants with their reasons.
 // ---------------------------------------------------------------------------
 
-/// The per-ino layout lock width: the 4a stripes' load factor (a collision
-/// is one short commit-length section in 4096 at full handler parallelism).
-pub const LAYOUT_LOCK_STRIPES: usize = 4096;
 /// The staging segment takes a QUARTER of the cache root's free space
 /// (`cache/mod.rs`'s write-half law: the read tier and the host's own
 /// files share the device) and never more than an EIGHTH of the memory
@@ -165,6 +176,10 @@ pub const stats = struct {
     /// `kvmap_sweep_spawn_refusals`: a background sweep the executor could
     /// not spawn (it resumes at the next mount from its durable cursor).
     pub var kvmap_sweep_spawn_refusals: counters.ShardedCounter = .{};
+    /// `kvmap_head_put_unlocked`: a tree-mapped head Put staged by a
+    /// context not holding the (3.7) layout lock (debug builds; must stay
+    /// 0 — the head's ONE authority, 0002 row 210).
+    pub var kvmap_head_put_unlocked: counters.Tripwire = .init("kvmap_head_put_unlocked");
     /// The promotion dispatch at dismount / pressure / fsync.
     pub var promotions_run: counters.ShardedCounter = .{};
     pub var promotions_stale: counters.ShardedCounter = .{};
@@ -200,7 +215,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures") });
+    try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked") });
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +318,9 @@ pub const Options = struct {
 pub const OpenError = error{ OutOfMemory, DeviceRefused, IdentityMismatch, Io, StagingRefused, TransformRefused, ReclaimRefused, InlineMaxAboveFormatBound };
 
 pub const DataPlane = struct {
+    /// The (3.7) guard kv_fs holds across a truncate / corpse transaction.
+    pub const LayoutGuard = layout.LayoutLocks.Guard;
+
     /// The own-block act's result: the whole-block mapping and the proof
     /// the layout publish consumes.
     pub const OwnBlock = struct {
@@ -328,8 +346,8 @@ pub const DataPlane = struct {
     rt: router.Router,
     reclaimer: *reclaim.Reclaimer,
     reclaim_free: seams.ReclaimFree,
-    stripes: layout.MetaStripes = .{},
-    layout_locks: [LAYOUT_LOCK_STRIPES]sync_mutex.Mutex = @splat(.init),
+    /// Levels (3.5) and (3.7) with the promotion's order (module doc).
+    locks: layout.PublishLocks = .{},
     stage: ?Staging = null,
     xform: ?Xform = null,
     packer: ?pack.Packer = null,
@@ -468,7 +486,7 @@ pub const DataPlane = struct {
             .free = self.reclaim_free.seam(),
             .purge = self.purgeSeam(),
             .valve = enospc.Valve.fromReclaimer(self.reclaimer),
-            .stripes = &self.stripes,
+            .stripes = &self.locks.stripes,
             .mem = &budget.authority,
             .budget_bytes = opts.budget_bytes,
             .transform = self.transformSeam(),
@@ -789,12 +807,12 @@ pub const DataPlane = struct {
         self.shape.forget(ino);
     }
 
-    /// The per-ino layout lock (module doc): kv_fs's layout transactions
-    /// and the map merge serialize here.
-    pub fn lockLayout(self: *DataPlane, io: Io, ino: u64) *sync_mutex.Mutex {
-        const l = &self.layout_locks[@intCast(dlm.splitmix64(ino) & (LAYOUT_LOCK_STRIPES - 1))];
-        l.lockUncancelable(io);
-        return l;
+    /// The per-ino layout lock, level (3.7) (module doc). kv_fs takes it
+    /// through the data face around its truncate / corpse transactions,
+    /// BEFORE its 4a set and released after the commit landed; the plane's
+    /// own sections take it inside.
+    pub fn lockLayout(self: *DataPlane, io: Io, ino: u64) layout.LayoutLocks.Guard {
+        return self.locks.layouts.acquire(io, ino);
     }
 
     /// Whether a HELD slot may ride the write path unmaterialized (the
@@ -996,8 +1014,11 @@ pub const DataPlane = struct {
 
     /// The ONE primitive (charter §6.1): dispatch on size — fits inline ⇒
     /// inline; `slot > CHUNK/2` ⇒ its own block; else a packed tenant. The
-    /// identity is re-checked under the layout lock (still staged, same
-    /// file id, same ring generation); true iff the entry left the ring.
+    /// identity is re-checked under the promotion's locks — the (3.5) stripe
+    /// THEN the (3.7) layout lock (module doc; `PublishLocks.lockPromotion`)
+    /// — (still staged, same file id, same ring generation); true iff the
+    /// entry left the ring. A displaced durable copy is released after the
+    /// locks drop (RES-1).
     pub fn promoteStaged(self: *DataPlane, k: staging.StagingKey) bool {
         const io = self.io;
         const st = &(self.stage orelse return false);
@@ -1010,41 +1031,49 @@ pub const DataPlane = struct {
         defer lease.release();
         const generation = lease.generation();
         const image = lease.bytes();
-        const lock = self.lockLayout(io, ino);
-        defer lock.unlock(io);
-        const cur_bytes = (self.layoutRecord(ino) catch return false) orelse {
+        const locks = self.locks.lockPromotion(io, ino);
+        const out = self.promoteLocked(io, ino, k, generation, image);
+        locks.release(io);
+        if (out.displaced) |d| if (self.packer) |*p| p.releaseTenantRef(d);
+        return out.ok;
+    }
+
+    const Promoted = struct { ok: bool, displaced: ?Mapping = null };
+
+    fn promoteLocked(self: *DataPlane, io: Io, ino: u64, k: staging.StagingKey, generation: u64, image: []const u8) Promoted {
+        const st = &self.stage.?;
+        const cur_bytes = (self.layoutRecord(ino) catch return .{ .ok = false }) orelse {
             stats.promotions_stale.inc();
-            return false;
+            return .{ .ok = false };
         };
         defer self.gpa.free(cur_bytes.value);
-        const cur = layout.XattrLayout.decode(cur_bytes.value, self.geo) catch return false;
+        const cur = layout.XattrLayout.decode(cur_bytes.value, self.geo) catch return .{ .ok = false };
         if (cur.kind != .staged or !std.mem.eql(u8, &cur.file_id, &k.file_id) or st.seg.residentGeneration(k) != generation) {
             stats.promotions_stale.inc();
-            return false;
+            return .{ .ok = false };
         }
         const policy = if (self.packer) |*p| p.policy else pack.Policy{ .enabled = false, .max_slot = self.chunk / 2 };
         const stored_len: u64 = if (self.xform != null) blk: {
             const x = &self.xform.?;
             x.lock.lockUncancelable(io);
             defer x.lock.unlock(io);
-            const img = x.t.processWrite(image, x.scratch) catch return false;
+            const img = x.t.processWrite(image, x.scratch) catch return .{ .ok = false };
             break :blk img.len;
         } else image.len;
         const d = pack.dispatch(policy, cur.size, stored_len, self.inline_max, self.chunk) catch {
             stats.promotions_failed.inc();
-            return false;
+            return .{ .ok = false };
         };
-        const ok = switch (d) {
-            .inline_ => self.promoteInline(io, ino, cur, cur_bytes.coll_seq, image, k, generation),
-            .own_block => self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, image, k, generation),
-            .packed_ => self.promotePacked(io, ino, cur, cur_bytes.coll_seq, image, k, generation),
+        const out: Promoted = switch (d) {
+            .inline_ => .{ .ok = self.promoteInline(ino, cur, cur_bytes.coll_seq, image, k, generation) },
+            .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, image, k, generation) },
+            .packed_ => self.promotePacked(io, ino, cur_bytes.coll_seq, image, k, generation),
         };
-        if (ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else stats.promotions_failed.inc();
-        return ok;
+        if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else stats.promotions_failed.inc();
+        return out;
     }
 
-    fn promoteInline(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) bool {
-        _ = io;
+    fn promoteInline(self: *DataPlane, ino: u64, prev: layout.Layout, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) bool {
         const data = image[0..@intCast(@min(image.len, prev.size))];
         const t = self.backend.begin(@src()) catch return false;
         layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.inlineData(prev.size, data), .proofs = &.{} }, self.refsSeam(), self.geo) catch {
@@ -1078,18 +1107,19 @@ pub const DataPlane = struct {
         return true;
     }
 
-    fn promotePacked(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) bool {
-        _ = prev;
-        const p = &(self.packer orelse return false);
+    /// The packed arm under the caller's (3.5) + (3.7): `pack.commitLocked`
+    /// re-checks the identity and commits; its displaced copy rides back
+    /// for the release after the locks drop.
+    fn promotePacked(self: *DataPlane, io: Io, ino: u64, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) Promoted {
+        const p = &(self.packer orelse return .{ .ok = false });
         const st = &self.stage.?;
-        const tag = (self.rt.pickVolume() catch return false) orelse return false;
-        const stored = self.transformWrite(tag, image) catch return false;
-        const prepared = (p.prepare(io, .{ .vol_tag = tag, .scope = self.scope }, stored, clock.monotonicNs()) catch return false) orelse return false;
+        const tag = (self.rt.pickVolume() catch return .{ .ok = false }) orelse return .{ .ok = false };
+        const stored = self.transformWrite(tag, image) catch return .{ .ok = false };
+        const prepared = (p.prepare(io, .{ .vol_tag = tag, .scope = self.scope }, stored, clock.monotonicNs()) catch return .{ .ok = false }) orelse return .{ .ok = false };
         const t = self.backend.begin(@src()) catch {
-            return false;
+            return .{ .ok = false };
         };
-        const outcome = p.commit(io, prepared, .{
-            .stripes = &self.stripes,
+        const outcome = p.commitLocked(prepared, .{
             .ino = ino,
             .hash_seed = self.hash_seed,
             .coll_seq = coll_seq,
@@ -1103,10 +1133,10 @@ pub const DataPlane = struct {
             .geo = self.geo,
         }, t);
         return switch (outcome) {
-            .committed => true,
+            .committed => |displaced| .{ .ok = true, .displaced = displaced },
             .stale, .failed => blk: {
                 self.backend.abandon(t);
-                break :blk false;
+                break :blk .{ .ok = false };
             },
         };
     }
@@ -1503,7 +1533,7 @@ pub const DataPlane = struct {
         const gpa = self.gpa;
         if (req.fencing != 1) return error.FencingTokenExpired;
         const lock = self.lockLayout(io, req.ino);
-        defer lock.unlock(io);
+        defer lock.release(io);
         const rec = (self.layoutRecord(req.ino) catch return error.Transient);
         defer if (rec) |r| gpa.free(r.value);
         var prev: ?layout.Layout = null;
@@ -1816,8 +1846,12 @@ pub const DataPlane = struct {
     /// caller's tx: ONE head Put `{size, sweep = min(existing, K)}`, K =
     /// ceil(size / block) — nothing else (a 1 PiB truncate is one record);
     /// the records at or above the cursor are residue the sweep drains
-    /// (`drainKvmapSweep` after the commit). Returns the cursor planted.
+    /// (`drainKvmapSweep` after the commit). The caller HOLDS the ino's
+    /// layout lock (3.7) from before it read `prev` until its commit landed
+    /// (`lockLayout`; module doc) — the head's one authority; a Put staged
+    /// outside it is counted. Returns the cursor planted.
     pub fn stageKvmapShrink(self: *DataPlane, t: *tx_mod.KvTx, ino: u64, prev: layout.Layout, coll_seq: u8, new_size: u64) Error!u32 {
+        if (!lock_order.holds(.layout)) stats.kvmap_head_put_unlocked.fire("a tree-mapped head Put staged outside the layout lock");
         const head = prev.kvmapHead() orelse return error.InvalidArgument;
         const k: u32 = @intCast(@min(self.blocksOf(new_size), std.math.maxInt(u32) - 1));
         const cursor = if (head.sweep) |c| @min(c, k) else k;
@@ -1910,8 +1944,14 @@ pub const DataPlane = struct {
     /// records deleted and a corpse (head size 0) sweeps whole — one page
     /// by the index budget, ONE tx = the Deletes / shortened Puts + their
     /// `−ref` + the cursor advance (the terminal chunk clears the cursor,
-    /// or destroys the corpse: inode + xattrs). The freed blocks go to the
-    /// reclaimer AFTER the lock drops (RES-1).
+    /// or destroys the corpse: inode + xattrs). The head Put is CONDITIONAL
+    /// on the re-read: `prev` is the record as it stands at commit time
+    /// because the lock spans read → stage → commit, and every other head
+    /// writer (the merge, kv_fs's shrink and corpse mark) commits under the
+    /// same lock — so the fold is last-writer-wins over SERIAL writers and a
+    /// truncate racing a chunk never loses its size nor the chunk its
+    /// cursor (`plane_locks_model.HeadFoldModel`; 0002 row 210). The freed
+    /// blocks go to the reclaimer AFTER the lock drops (RES-1).
     fn sweepChunk(self: *DataPlane, ino: u64) Error!ChunkOutcome {
         const io = self.io;
         const gpa = self.gpa;
@@ -1920,7 +1960,7 @@ pub const DataPlane = struct {
         var outcome: ChunkOutcome = .done;
         {
             const lock = self.lockLayout(io, ino);
-            defer lock.unlock(io);
+            defer lock.release(io);
             const rec = (try self.layoutRecord(ino)) orelse return .done;
             defer gpa.free(rec.value);
             const prev = layout.XattrLayout.decode(rec.value, self.geo) catch return error.InputOutput;
@@ -2542,7 +2582,7 @@ test "stats JSON names every plane instrument" {
     var w: Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"kvmap_sweep_spawn_refusals\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":" }) |k| {
+    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"kvmap_sweep_spawn_refusals\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":", "\"kvmap_head_put_unlocked\":" }) |k| {
         try testing.expect(std.mem.indexOf(u8, s, k) != null);
     }
 }

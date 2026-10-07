@@ -39,6 +39,8 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
+    // @anchor:meta_guard_import
+    // @anchor:meta_routing_import
     pub const conveyor = @import("meta/conveyor.zig");
     pub const device_loader = if (builtin.os.tag == .linux) @import("meta/device_loader.zig") else struct {};
     pub const backend = if (builtin.os.tag == .linux) @import("meta/backend.zig") else struct {};
@@ -95,6 +97,7 @@ pub const cli = @import("cli/cli.zig");
 
 // ---- the data plane (charter §6) ----
 pub const data = struct {
+    // @anchor:data_kvmap_import
     pub const layout = @import("data/layout.zig");
     pub const staging = @import("data/staging.zig");
     pub const pack = @import("data/pack.zig");
@@ -131,6 +134,9 @@ pub const data = struct {
     pub const plane = if (builtin.os.tag == .linux) @import("data/plane.zig") else struct {};
 };
 
+// ---- observability surface: the .stats inode + CLI families (charter §10) ----
+// @anchor:stats_import
+
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
 
@@ -155,6 +161,10 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:data_kvmap_test
+    // @anchor:meta_guard_test
+    // @anchor:meta_routing_test
+    // @anchor:stats_test
     _ = data.layout;
     _ = data.staging;
     _ = data.pack;

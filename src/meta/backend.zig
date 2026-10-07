@@ -212,6 +212,9 @@ pub const FormatOptions = struct {
     set: geometry.SetIdentity,
     root_uid: u32 = 0,
     root_gid: u32 = 0,
+    /// Tree 0's format-time records (`format.FormatOptions.control_records`:
+    /// the `set_config` record on the set's member 0).
+    control_records: []const record.RecordRef = &.{},
 };
 
 pub const FormatError = error{ DeviceRefused, Io, OutOfMemory, Corrupt, VolumeTooSmall, InvalidNodeSize, InvalidJournalOverride, CannotStat, NotADeviceOrFile, Unexpected };
@@ -234,6 +237,7 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
         .set = opts.set,
         .root_uid = opts.root_uid,
         .root_gid = opts.root_gid,
+        .control_records = opts.control_records,
     }, &diag) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.VolumeTooSmall => error.VolumeTooSmall,

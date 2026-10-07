@@ -400,12 +400,13 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
     }
     // format; a second format without --force refuses naming the flag.
     {
-        const r = try rig.squeezefs(&.{ "format", "--single-writer", rig.meta_uri, "sqdata:///dev/null-not-used" });
+        const r = try rig.squeezefs(&.{ "format", "--single-writer", rig.meta_uri });
         defer rig.freeRun(r);
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
         try testing.expect(std.mem.indexOf(u8, r.stdout, "formatted sqmeta://") != null);
-        try testing.expect(std.mem.indexOf(u8, r.stdout, "data volumes accepted, NOT formatted") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "set config generation 1") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "no data volumes") != null);
     }
     {
         const r = try rig.squeezefs(&.{ "format", rig.meta_uri });
@@ -414,7 +415,8 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
         try testing.expect(std.mem.indexOf(u8, r.stderr, "already formatted") != null);
         try testing.expect(std.mem.indexOf(u8, r.stderr, "--force") != null);
     }
-    // status before any mount: not mounted, next_ino 2.
+    // status before any mount: not mounted, next_ino 2, the record read
+    // offline from the control tree.
     {
         const r = try rig.squeezefs(&.{ "status", rig.meta_uri });
         defer rig.freeRun(r);
@@ -422,6 +424,8 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
         try testing.expect(std.mem.indexOf(u8, r.stdout, "format v4 (one-member forest)") != null);
         try testing.expect(std.mem.indexOf(u8, r.stdout, "next_ino 2,") != null);
         try testing.expect(std.mem.indexOf(u8, r.stdout, "not mounted") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "set config generation 1; block 4194304 B; chunk 4194304 B") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "data volumes 0") != null);
     }
     // The small tree + tarball on ext4.
     {
@@ -730,4 +734,166 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     // Nothing of ours survives: no squeezefs process holds the volume.
     try testing.expect(!@import("status.zig").writerGuardHeld(rig.img));
+}
+
+/// A data volume of three 4 MiB(+4 KiB) chunks: two reserved, one usable.
+const data_volume_len: u64 = 3 * ((4 << 20) + 4096) + 4096;
+
+test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache path → both data superblocks written and read back → status lists both tags → a re-format refuses on the meta AND on a data volume → a mount with no key refuses naming every source → with the key it mounts, logs the set config and the key id, serves, unmounts → renumbered or blank data devices refuse the mount by name" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    {
+        const f = try Io.Dir.cwd().createFile(io, rig.img, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, volume_len);
+    }
+    var d0: [128]u8 = undefined;
+    var d1: [128]u8 = undefined;
+    var key_path: [128]u8 = undefined;
+    var cache_path: [128]u8 = undefined;
+    const d0p = try std.fmt.bufPrint(&d0, "{s}/d0.img", .{rig.work});
+    const d1p = try std.fmt.bufPrint(&d1, "{s}/d1.img", .{rig.work});
+    const kp = try std.fmt.bufPrint(&key_path, "{s}/set.key", .{rig.work});
+    const cp = try std.fmt.bufPrint(&cache_path, "{s}/cache", .{rig.work});
+    for ([_][]const u8{ d0p, d1p }) |dp| {
+        const f = try Io.Dir.cwd().createFile(io, dp, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, data_volume_len);
+    }
+    // The key file: 0600, ≥ 32 B.
+    {
+        const out = try rig.shOk(rig.work, "umask 077; head -c 48 /dev/urandom | base64 > set.key; chmod 600 set.key; wc -c < set.key");
+        defer gpa.free(out);
+    }
+    var data_uri: [320]u8 = undefined;
+    const du = try std.fmt.bufPrint(&data_uri, "sqdata://{s},{s}", .{ d0p, d1p });
+    var cache_flag: [160]u8 = undefined;
+    const cf = try std.fmt.bufPrint(&cache_flag, "{s}", .{cp});
+    // The set format.
+    {
+        const r = try rig.squeezefs(&.{ "format", "--compress", "lz4", "--encrypt", "aes-256-gcm", "--encrypt-key", kp, "--disk-cache-paths", cf, rig.meta_uri, du });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "compression lz4; encryption aes-256-gcm; key hkdf-sha256/aead-kw/v2 id ") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "data volumes 2 (VOLUME_LIFECYCLE") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "chunk 4198400 B") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, " 1 blocks (4 MiB)") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "disk cache paths 1:") != null);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "vol-"));
+    }
+    // Both data files carry the identity at sector 0 and the tail.
+    for ([_][]const u8{ d0p, d1p }) |dp| {
+        var buf: [8]u8 = undefined;
+        const f = try Io.Dir.cwd().openFile(io, dp, .{});
+        defer f.close(io);
+        try testing.expectEqual(@as(usize, 8), try f.readPositionalAll(io, &buf, 0));
+        try testing.expectEqualStrings("SQZDATLV", &buf);
+        try testing.expectEqual(@as(usize, 8), try f.readPositionalAll(io, &buf, data_volume_len - 4096));
+        try testing.expectEqualStrings("SQZDATLV", &buf);
+    }
+    // status lists both with their tags.
+    {
+        const r = try rig.squeezefs(&.{ "status", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "data volumes 2") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, d0p) != null and std.mem.indexOf(u8, r.stdout, d1p) != null);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "vol-"));
+    }
+    // A re-format refuses: the meta volume first; with the meta forced, a data volume.
+    {
+        const r = try rig.squeezefs(&.{ "format", rig.meta_uri, du });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "already formatted") != null);
+    }
+    {
+        var data0_uri: [160]u8 = undefined;
+        const du0 = try std.fmt.bufPrint(&data0_uri, "sqdata://{s}", .{d0p});
+        // A second meta file so only the data gate is in the way.
+        var m2: [128]u8 = undefined;
+        const m2p = try std.fmt.bufPrint(&m2, "{s}/vol2.img", .{rig.work});
+        {
+            const f = try Io.Dir.cwd().createFile(io, m2p, .{ .truncate = true });
+            defer f.close(io);
+            try f.setLength(io, volume_len);
+        }
+        var m2u: [160]u8 = undefined;
+        const m2uri = try std.fmt.bufPrint(&m2u, "sqmeta://{s}", .{m2p});
+        const r = try rig.squeezefs(&.{ "format", m2uri, du0 });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "already a SqueezeFS data volume (vol-") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "--force") != null);
+        // The refused format wrote nothing: the second meta file is still Blank.
+        const st = try rig.squeezefs(&.{ "status", m2uri });
+        defer rig.freeRun(st);
+        try testing.expect(std.mem.indexOf(u8, st.stdout, "not formatted") != null);
+    }
+    // A mount with no key source refuses naming all three sources.
+    {
+        const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "no encryption key") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "SQUEEZEFS_ENCRYPT_KEY_FILE") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "/etc/squeezefs/keys/") != null);
+        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    }
+    // A wrong key refuses by id.
+    {
+        const out = try rig.shOk(rig.work, "umask 077; head -c 48 /dev/urandom | base64 > wrong.key; chmod 600 wrong.key");
+        defer gpa.free(out);
+        var wk: [128]u8 = undefined;
+        const wkp = try std.fmt.bufPrint(&wk, "{s}/wrong.key", .{rig.work});
+        try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", wkp);
+        const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "key id differs") != null);
+    }
+    // With the key: mount, the set config and the key id in the log, a write, umount.
+    try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", kp);
+    try rig.spawnMount(&.{});
+    const ready_at = try rig.awaitReady(0);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[0..ready_at], "encryption key verified (hkdf-sha256/aead-kw/v2, id ") != null);
+        try testing.expect(std.mem.indexOf(u8, text[0..ready_at], "set config generation 1") != null);
+        try testing.expect(std.mem.indexOf(u8, text[0..ready_at], "non-dumpable") != null);
+    }
+    {
+        const out = try rig.shOk(rig.mp, "echo hello > f && test \"$(cat f)\" = hello && echo write-ok");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "write-ok") != null);
+    }
+    try rig.umount();
+    const term = try rig.waitChild();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    // A renumbered device: swap the two data files; the mount refuses
+    // naming the tag it found and the tag the set names.
+    {
+        const out = try rig.shOk(rig.work, "mv d0.img swap.img && mv d1.img d0.img && mv swap.img d1.img");
+        defer gpa.free(out);
+        const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "the device was renumbered or belongs to another set") != null);
+        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    }
+    // A missing data device is not a formatted data volume: refused by name.
+    {
+        const out = try rig.shOk(rig.work, "mv d1.img d0.img && truncate -s 13M d1.img");
+        defer gpa.free(out);
+        const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "is not a formatted data volume") != null);
+    }
+    std.debug.print("\nsmoke: set format ok (2 data volumes, lz4 + aes-256-gcm, key gate, renumbered/blank refusals)\n", .{});
 }

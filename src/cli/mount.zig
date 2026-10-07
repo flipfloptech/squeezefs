@@ -6,7 +6,13 @@
 //! Bring-up (the root task on the `main` lane):
 //!   resolve the budget (pure) → open the backend (the D0 ladder's layer A:
 //!   the flock; a FAILED/refusal class is loud and names its errno through
-//!   the ONE table) → start the budget sampler → `KvFs(KvBackend)` + the
+//!   the ONE table) → the set config (`set_config` in tree 0: present,
+//!   decodable, the stamp's set; every data volume's device read and
+//!   checked against its record — the §5.4 URI-disagreement refusals; an
+//!   encrypted set resolves and verifies its key here — a wrong key file
+//!   refuses the mount instead of failing every read; the data plane
+//!   itself is not yet wired into the filesystem) → start the budget
+//!   sampler → `KvFs(KvBackend)` + the
 //!   handler tables (watchdog registry, op guards, open table) + the ring
 //!   `Binding` → the FUSE fd: root opens `/dev/fuse` inside the session's
 //!   `mount(2)`; anyone else receives it from `fusermount3` (`fusermount.zig`)
@@ -46,6 +52,10 @@ const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
 const mount_options = @import("../fuse/mount_options.zig");
 const mem_budget = @import("../mem/budget.zig");
+const key = @import("../meta/key.zig");
+const set_config = @import("../data/set_config.zig");
+const transform = @import("../data/transform.zig");
+const data_superblock = @import("../data/data_superblock.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const errors = @import("../core/errors.zig");
@@ -237,6 +247,11 @@ fn mountMain(ctx: *Ctx) u8 {
     var be_open = true;
     defer if (be_open) be.close();
 
+    // 1b. The set config: the one control record, the stamp's set, the key
+    //     gate on an encrypted set.
+    var cfg = loadSetConfig(ctx, be) orelse return cli.exit_failed;
+    defer cfg.deinit(gpa);
+
     // 2. The budget sampler (the registry already holds the fiber stacks;
     //    the arena joins at the session).
     _ = mem_budget.authority.spawnSampler(ctx.budget_host, mem_budget.sampler_period_ns) catch |e| return ctx.failed("cannot start the memory-budget sampler ({s})", .{@errorName(e)});
@@ -337,6 +352,82 @@ fn mountMain(ctx: *Ctx) u8 {
         return cli.exit_failed;
     }
     return cli.exit_ok;
+}
+
+/// Read + decode `set_config` from tree 0 (the record a format writes;
+/// its absence or refusal is a mount refusal by name), discover the data
+/// volumes (the record names the stamp's set; every non-retired record's
+/// device reads back as itself — order-independent, every disagreement
+/// refused by name), and on an encrypted set resolve the key through the
+/// ONE resolution order (`SQUEEZEFS_ENCRYPT_KEY_FILE` → the key dir;
+/// `mount` grows `--encrypt-key` with the data plane) and verify its id.
+/// Logs the summary at ready; null = refused (reported).
+fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
+    const gpa = ctx.p.gpa;
+    const value = be.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch |e| {
+        _ = ctx.failed("cannot read the set_config record of {s}: {s}", .{ ctx.path, @errorName(e) });
+        return null;
+    } orelse {
+        _ = ctx.failed("{s} carries no set_config record in its control tree — not member 0 of its set, or formatted before the record existed; reformat", .{ctx.path});
+        return null;
+    };
+    defer gpa.free(value);
+    var diag: set_config.Refusal = undefined;
+    var cfg = set_config.decode(gpa, value, &diag) catch {
+        var buf: [512]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        diag.write(&w) catch {};
+        _ = ctx.failed("{s}: {s}", .{ ctx.path, w.buffered() });
+        return null;
+    };
+    {
+        // Every data device read once (O_DIRECT, both superblock copies)
+        // and released: the data plane's own opens come with its wiring.
+        const obs = gpa.alloc(set_config.Observation, cfg.data.len) catch {
+            _ = ctx.failed("out of memory (data volume discovery)", .{});
+            cfg.deinit(gpa);
+            return null;
+        };
+        defer gpa.free(obs);
+        for (cfg.data, obs) |d, *o| {
+            if (d.state == .retired) {
+                o.* = .blank;
+                continue;
+            }
+            const opened = data_superblock.linux_dev.open(gpa, d.uri);
+            o.* = data_superblock.observation(if (opened) |op| op.classified else |e| e);
+        }
+        var ddiag: set_config.DiscoveryRefusal = undefined;
+        set_config.discover(&cfg, be.mounted.membership_stamp.set_uuid, obs, &ddiag) catch {
+            var buf: [1024]u8 = undefined;
+            var w: Io.Writer = .fixed(&buf);
+            ddiag.write(&w) catch {};
+            _ = ctx.failed("data volume discovery: {s}", .{w.buffered()});
+            cfg.deinit(gpa);
+            return null;
+        };
+    }
+    if (cfg.encryption != .none) {
+        var path_buf: [128]u8 = undefined;
+        var served: []const u8 = "";
+        var derived = transform.linux_keys.resolveVolumeKey(ctx.p.env, null, &cfg.kdf_salt, cfg.key_id, &path_buf, &served) catch |e| {
+            var buf: [512]u8 = undefined;
+            var w: Io.Writer = .fixed(&buf);
+            transform.writeKeyFileRefusal(&w, e, if (served.len != 0) served else transform.defaultKeyPath(&path_buf, cfg.key_id)) catch {};
+            _ = ctx.failed("encrypted set: {s}", .{w.buffered()});
+            cfg.deinit(gpa);
+            return null;
+        };
+        // The gate is the point of this rung: the material and the KEK
+        // leave no trace until the data plane holds a crypto state.
+        derived.zeroize();
+        log.info("mount: encryption key verified ({s}, id {x}, from {s})", .{ transform.KEY_WRAP_SCHEME_NAME, &cfg.key_id, served });
+    }
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    cfg.writeSummary(&out.writer) catch {};
+    log.info("mount: set config\n{s}", .{std.mem.trimEnd(u8, out.written(), "\n")});
+    return cfg;
 }
 
 fn openReason(e: backend.OpenError) []const u8 {

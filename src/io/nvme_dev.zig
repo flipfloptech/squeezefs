@@ -16,9 +16,14 @@
 //! queue is the ONE `sync.BoundedMpmc`, errors are the ONE table
 //! (`core/errors.zig`).
 //!
-//! Not here: discard/trim lives in the reclaim module (`block_reclaim`:
-//! `fallocate(PUNCH_HOLE)` on files, `BLKDISCARD` on block devices, plain
-//! syscalls) — never a device-layer concern.
+//! Discard/trim POLICY (elision, the queue, pacing) lives in the reclaim
+//! module (`data/reclaim.zig`); the device offers only the COMMAND
+//! (`discardRange`): `IORING_OP_FALLOCATE(PUNCH_HOLE | KEEP_SIZE)` on a
+//! regular file, `IORING_OP_URING_CMD(BLOCK_URING_CMD_DISCARD)` on a block
+//! device (the NVMe DSM Deallocate; no payload, not write-bandwidth-
+//! accounted) — through the SAME write lane, fence-gated like every other
+//! write-class command, never a classical ioctl on a product path. The
+//! substrate is classified ONCE at open (`reclaimOp`), never per batch.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,6 +38,7 @@ const counters = @import("../core/counters.zig");
 const log = @import("../core/log.zig");
 const clock = @import("../core/clock.zig");
 const thread_name = @import("../core/thread_name.zig");
+const reclaim = @import("../data/reclaim.zig");
 
 pub const Refusal = nd.Refusal;
 pub const Terminal = nd.Terminal;
@@ -268,7 +274,7 @@ pub fn acquireBlockBuf() Terminal!Buf {
 // Request cells and their completion.
 // ---------------------------------------------------------------------------
 
-const Op = enum(u8) { read, write, fsync };
+const Op = enum(u8) { read, write, fsync, discard };
 
 /// How the worker answered: a kernel result, or a synthetic class.
 const Outcome = union(enum) {
@@ -290,7 +296,8 @@ const Outcome = union(enum) {
 const Cell = struct {
     op: Op = .read,
     offset: u64 = 0,
-    /// What the SQE names.
+    /// What the SQE names (a discard names no memory: `dma_len` is its
+    /// byte length).
     dma_ptr: [*]u8 = undefined,
     dma_len: usize = 0,
     /// Buffer the WORKER owns until the CQE: the read bounce slot, or the
@@ -821,7 +828,7 @@ fn pumpOne(w: *Worker, idx: u32) bool {
             c.submitted_ns = clock.monotonicNs();
             stats.write_pipeline_dev_queue_ns.record(c.submitted_ns -| c.enq_ns.load(.monotonic));
         },
-        .fsync => {},
+        .fsync, .discard => {},
     }
 
     // Slow-read seam: a linked TIMEOUT (ETIME counts as success so the link
@@ -867,6 +874,21 @@ fn pumpOne(w: *Worker, idx: u32) bool {
         // the DUR-2 barrier (a plain fsync is representable, no caller
         // wants one).
         .fsync => sqe.prep_fsync(w.sqeFd(), linux.IORING_FSYNC_DATASYNC),
+        .discard => switch (dev.substrate) {
+            // A regular file: the host FS returns the range's space.
+            .file_punch => sqe.prep_fallocate(w.sqeFd(), linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE, c.offset, c.dma_len),
+            // A block device: `BLOCK_URING_CMD_DISCARD` — `cmd_op` rides
+            // `off`, the range `addr`/`addr3` (block/ioctl.c
+            // `blkdev_uring_cmd`); `len`, `rw_flags`, `ioprio` must be 0.
+            .bdev_discard => {
+                sqe.prep_rw(.URING_CMD, w.sqeFd(), 0, 0, 0);
+                sqe.off = BLOCK_URING_CMD_DISCARD;
+                sqe.addr = c.offset;
+                sqe.addr3 = c.dma_len;
+            },
+            // `discardRange` refused the class before the cell existed.
+            .skip => unreachable,
+        },
     }
     w.markFixed(sqe);
     sqe.user_data = idx;
@@ -922,12 +944,16 @@ fn completeOne(w: *Worker, idx: u32, res: i32) void {
             c.buf = .empty;
             lane.complete(idx, .{ .io = res });
         },
-        .fsync => {
+        .fsync, .discard => {
             lane.wm.noteCompleted();
             lane.complete(idx, .{ .io = res });
         },
     }
 }
+
+/// `_IO(0x12, 0)` (uapi `linux/blkdev.h`, io_uring discard since 6.12): the
+/// block device's uring command for a DSM Deallocate of `[addr, addr + addr3)`.
+pub const BLOCK_URING_CMD_DISCARD: u64 = linux.IOCTL.IO(0x12, 0);
 
 // ---------------------------------------------------------------------------
 // Device probing (spec §3).
@@ -985,6 +1011,16 @@ pub fn probeWriteCache(path: [:0]const u8) nd.WriteCacheClass {
     return .unknown;
 }
 
+/// The reclaim substrate, classified ONCE at open from `st_mode` (a regular
+/// file punches, a block device discards, anything else is never written
+/// to zero): the reclaim module reads it through `Device.reclaimOp` (Q5 —
+/// no `stat` per batch, no re-open per group).
+pub fn probeSubstrate(path: [:0]const u8) reclaim.Substrate {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &st)) != .SUCCESS) return .skip;
+    return reclaim.classifySubstrate(st.mode);
+}
+
 // ---------------------------------------------------------------------------
 // The device.
 // ---------------------------------------------------------------------------
@@ -1028,6 +1064,8 @@ pub const Device = struct {
     fence: Fence = .{},
     seams: Seams = .{},
     write_cache: nd.WriteCacheClass,
+    /// `probeSubstrate` at open: the discard command's shape.
+    substrate: reclaim.Substrate,
     closed: bool = false,
 
     /// `open_checked`: `probeDirectIo` FIRST (loud refusal), spawn lane 0,
@@ -1043,6 +1081,7 @@ pub const Device = struct {
             .gpa = gpa,
             .path = owned,
             .write_cache = probeWriteCache(path),
+            .substrate = probeSubstrate(path),
         };
         dev.lanes[0] = try spawnArmedLane(gpa, dev);
         dev.lane_count.store(1, .release);
@@ -1476,6 +1515,58 @@ pub const Device = struct {
         }
     }
 
+    // ---- discard (the reclaim module's command) ----
+
+    /// The substrate class `probeSubstrate` found at open.
+    pub fn reclaimOp(self: *const Device) reclaim.Substrate {
+        return self.substrate;
+    }
+
+    /// ONE discard command over `[offset, offset + len)`: the punch or the
+    /// DSM Deallocate per the substrate (a `.skip` substrate refuses
+    /// `NotSupported` — never a zeroing write). Write-class: fence-gated,
+    /// on the block-offset write lane, counted on its watermark (a barrier
+    /// drains it like any write), its CQE through `classifyDmaOutcome`.
+    /// The device's logical-block alignment of the range is the caller's
+    /// (blocks are whole multiples of it).
+    pub fn discardRange(self: *Device, offset: u64, len: u64) DeviceError!void {
+        if (self.substrate == .skip) return error.NotSupported;
+        try self.fenceGate();
+        if (len == 0) return;
+        const lane = self.writeLanePick(offset);
+        const idx = lane.acquireCell() orelse {
+            stats.uring_queue_full.inc();
+            return error.QueueFull;
+        };
+        const c = &lane.cells[idx];
+        c.op = .discard;
+        c.offset = offset;
+        c.dma_len = @intCast(len);
+        c.enq_ns.store(clock.monotonicNs(), .monotonic);
+        lane.wm.noteSubmitted();
+        if (!lane.submit(idx)) {
+            lane.wm.noteCompleted();
+            lane.freeCell(idx);
+            stats.uring_queue_full.inc();
+            return error.QueueFull;
+        }
+        stats.device_lock_waiters.add(1);
+        defer stats.device_lock_waiters.sub(1);
+        const outcome = lane.wait(idx);
+        defer lane.freeCell(idx);
+        const res = switch (outcome) {
+            .shutdown => return error.WorkerShutdown,
+            .sq_full => return error.SubmissionQueueOverflow,
+            .ring_failed => return error.RingFailed,
+            .io => |res| res,
+        };
+        if (res < 0) {
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
+            self.classifyDmaOutcome(e);
+            return nd.errnoToError(e);
+        }
+    }
+
     /// Snapshot EVERY lane's `submitted` (SeqCst) FIRST, then wait each
     /// lane's `completed` up to its snapshot. WHY: a device flush covers
     /// only commands the device completed before processing it, and an
@@ -1565,6 +1656,36 @@ test "test_write_block_to_offset: a 4 MiB aligned write lands byte-exact at 4 Mi
     defer testing.allocator.free(back);
     try tf.readAt(back, 4 * derive.MiB);
     try expectPattern(back, 4 * derive.MiB);
+}
+
+test "discardRange on a regular file is a PUNCH through the write lane: the range reads zeros, neighbours survive, the file keeps its length; the substrate is classified once at open" {
+    var tf: TestFile = .{};
+    try tf.create(16 * derive.MiB);
+    defer tf.destroy();
+    const dev = try Device.open(testing.allocator, tf.path);
+    defer dev.deinit();
+    try testing.expectEqual(reclaim.Substrate.file_punch, dev.reclaimOp());
+    const payload = try testing.allocator.alignedAlloc(u8, .fromByteUnits(nd.dma_align), 3 * 4096);
+    defer testing.allocator.free(payload);
+    fillPattern(payload, 4096);
+    try dev.writeBlock(4096, payload);
+    // Punch the middle 4 KiB (one block of a 4 KiB-block volume).
+    try dev.discardRange(8192, 4096);
+    try dev.flush(); // the barrier drains the discard like any write
+    var back: [3 * 4096]u8 = undefined;
+    try tf.readAt(&back, 4096);
+    try expectPattern(back[0..4096], 4096);
+    try testing.expectEqualSlices(u8, &@as([4096]u8, @splat(0)), back[4096 .. 2 * 4096]);
+    try expectPattern(back[2 * 4096 ..], 4096 + 2 * 4096);
+    const st = try tf.file.stat(testing.io);
+    try testing.expectEqual(@as(u64, 16 * derive.MiB), st.size);
+    // A zero-length discard is a no-op; the reclaim binding carries the class.
+    try dev.discardRange(8192, 0);
+    const target = reclaim.device_binding.target(dev);
+    try testing.expectEqual(reclaim.Substrate.file_punch, target.substrate);
+    try target.issue(target.ctx, 4096, 4096);
+    try tf.readAt(back[0..4096], 4096);
+    try testing.expectEqualSlices(u8, &@as([4096]u8, @splat(0)), back[0..4096]);
 }
 
 test "test_read_block_from_offset: write then read_block round-trips 4 MiB exactly; get_obj counts it" {

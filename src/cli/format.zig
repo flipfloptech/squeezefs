@@ -1,24 +1,30 @@
-//! `squeezefs format` (charter §8; §5.1 the v4 image; `docs/porting/
-//! kv_alloc_superblock.md` §2.2–§2.4): the preflight over the device, then
-//! `meta/backend.formatVolume`. Linux only.
+//! `squeezefs format` (charter §8; §5.1 the v4 image; §6.5 the transform
+//! declared at format; `docs/porting/kv_alloc_superblock.md` §2.2–§2.4;
+//! `docs/porting/data_transform_config.md` §5.6 f): the set format. Linux
+//! only.
 //!
-//! Rung 3 formats ONE metadata volume as a v4 one-member forest (decision
-//! 0003 Q2): `--single-writer` names the class the image already is; the
-//! symmetric plane (the appender directory, `SYMMETRIC_PLANE`) is rung 6's
-//! and lands on a live volume, so the plain form produces the same image
-//! today and says so. `sqdata://` volumes are accepted through the ONE URI
-//! parser and NAMED in the summary, not formatted and not yet recorded:
-//! the volume-set configuration that records them is rung 4's with the
-//! data plane (there is no `format_config` xattr to smuggle them into —
-//! decision 0002 row 46). A metadata set of more than one member is rung
-//! 5's (`W = 2^16` stamps) and refused here.
+//! One metadata volume as a v4 one-member forest (decision 0003 Q2;
+//! `--single-writer` names the class the image already is; the symmetric
+//! plane is rung 6's and lands on a live volume) plus ZERO OR MORE data
+//! volumes, each given its identity (`data/data_superblock.zig`), and the
+//! set's ONE `set_config` control record written by the format transaction
+//! into tree 0 of the metadata volume (`data/set_config.zig`): block size,
+//! chunk, the transform, the key reference, every data volume with its
+//! `vol_tag`, the cache paths. A metadata set of more than one member is
+//! rung 5's (`W = 2^16` stamps) and refused here; a set with no data
+//! volume is legal at this rung (the data plane is not yet wired into the
+//! filesystem) and records an empty list.
 //!
-//! The preflight (§2.4), with no side effect before its verdict: a live
-//! writer (layer A's flock held) refuses even with `--force`; a Blank
-//! sector 0 formats; anything else — a v4 volume, a pre-v4 one, a torn or
-//! foreign superblock — refuses naming `--force`, which reformats it. The
-//! device is read O_DIRECT through the io pool like every metadata byte
-//! (charter §5.1: a buffered read of a shared LUN returned a stale page).
+//! The order, with NO destructive step before every verdict: parse → key
+//! material + salt + key id (an encrypted set) → the io pool → the
+//! metadata preflight (a live writer refuses even with `--force`; Blank
+//! formats; anything else needs `--force`) → every data device read and
+//! classified (Blank formats; anything else needs `--force`; too small
+//! refuses) → identities minted (set, volume uuid, per-device `vol_tag` +
+//! `device_uuid`) → every DATA superblock written (device-before-record: a
+//! crash here leaves an unlisted formatted device, never a listed blank
+//! one) → the metadata volume formatted with the record → the summary.
+//! Every device byte is O_DIRECT (charter §5.1).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,7 +40,11 @@ const geometry = @import("../meta/geometry.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const derive = @import("../core/derive.zig");
+const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
+const transform = @import("../data/transform.zig");
+const set_config = @import("../data/set_config.zig");
+const data_superblock = @import("../data/data_superblock.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/format is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -64,6 +74,32 @@ pub fn forceGate(prior: Prior, force: bool, w: *Io.Writer) Io.Writer.Error!bool 
     }
 }
 
+/// What a data device read as, for its force gate.
+pub const DataPrior = union(enum) {
+    blank,
+    formatted: data_superblock.DataSuperblock,
+    /// The classifier's refusal (a foreign signature, a torn superblock).
+    refused: []const u8,
+};
+
+/// The data-device force gate, pure: Blank formats; a squeezefs data
+/// volume or anything else needs `--force`.
+pub fn dataForceGate(path: []const u8, prior: DataPrior, force: bool, w: *Io.Writer) Io.Writer.Error!bool {
+    switch (prior) {
+        .blank => return true,
+        .formatted => |sb| {
+            if (force) return true;
+            try w.print("data volume {s} is already a SqueezeFS data volume (vol-{x:0>16}); refusing to destroy it. Pass --force to reformat.", .{ path, sb.vol_tag });
+            return false;
+        },
+        .refused => |reason| {
+            if (force) return true;
+            try w.print("data volume {s} carries prior on-disk state ({s}); refusing to destroy it. Pass --force to reformat.", .{ path, reason });
+            return false;
+        },
+    }
+}
+
 /// The invoking owner for the root directory: `SUDO_UID:SUDO_GID` under
 /// sudo (the operator, not root), else the effective ids.
 pub fn invokingOwner(env: *const std.process.Environ.Map) struct { uid: u32, gid: u32 } {
@@ -78,6 +114,13 @@ fn parseId(raw: ?[]const u8) ?u32 {
     return std.fmt.parseInt(u32, t, 10) catch null;
 }
 
+/// One data device after its preflight.
+const DataDevice = struct {
+    path: []const u8,
+    volume_len: u64,
+    next_generation: u64,
+};
+
 pub fn run(p: cli.Process, f: args.Format) u8 {
     var members: [uri.MAX_MEMBERS][]const u8 = undefined;
     var udiag: uri.Refusal = undefined;
@@ -91,15 +134,78 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     }
     const path = meta.first();
 
-    // The io pool: registration (O_DIRECT) + the preflight read + the
-    // image, all through one pool.
+    // Every data path, flattened across the `sqdata://` words.
+    var data_paths: [set_config.MAX_DATA_VOLUMES][]const u8 = undefined;
+    var n_data: usize = 0;
+    for (f.data_uris) |word| {
+        var buf: [uri.MAX_MEMBERS][]const u8 = undefined;
+        const parsed = uri.parse(.data, word, &buf, &udiag) catch {
+            p.stderr.print("squeezefs format: {f}\n", .{udiag}) catch {};
+            return cli.exit_usage;
+        };
+        for (parsed.paths) |dp| {
+            if (n_data == data_paths.len) {
+                p.stderr.print("squeezefs format: more than {d} data volumes\n", .{data_paths.len}) catch {};
+                return cli.exit_failed;
+            }
+            for (data_paths[0..n_data]) |prev| if (std.mem.eql(u8, prev, dp)) {
+                p.stderr.print("squeezefs format: data volume {s} is named twice\n", .{dp}) catch {};
+                return cli.exit_failed;
+            };
+            if (std.mem.eql(u8, dp, path)) {
+                p.stderr.print("squeezefs format: {s} is named as both the metadata volume and a data volume\n", .{dp}) catch {};
+                return cli.exit_failed;
+            }
+            data_paths[n_data] = dp;
+            n_data += 1;
+        }
+    }
+
+    // The transform and its geometry (the chunk grows by the headroom on a
+    // transformed set; the law is a tautology of the derivation, checked
+    // anyway so a future derivation drift refuses at format, not at mount).
+    const tcfg: transform.VolumeTransform = .{ .compression = f.compression, .encryption = f.encryption, .block_size = f.block_size };
+    const chunk = transform.chunkSizeFor(tcfg);
+    transform.geometryCheck(tcfg, chunk) catch {
+        var gb: [256]u8 = undefined;
+        var gw: Io.Writer = .fixed(&gb);
+        transform.writeGeometryRefusal(&gw, tcfg, chunk) catch {};
+        p.stderr.print("squeezefs format: {s}\n", .{gw.buffered()}) catch {};
+        return cli.exit_failed;
+    };
+
+    // Key material, salt and key id BEFORE any destructive step. Only the
+    // salt and the id are recorded; the material is zeroized here.
+    var key_ref: ?set_config.KeyRef = null;
+    if (f.encryption != .none) {
+        var salt: [transform.KDF_SALT_LEN]u8 = undefined;
+        p.io.randomSecure(&salt) catch {
+            p.stderr.writeAll("squeezefs format: getrandom failed (the KDF salt); refusing to format with a weaker salt\n") catch {};
+            return cli.exit_failed;
+        };
+        var material_buf: [transform.MAX_KEY_FILE_BYTES + 1]u8 = undefined;
+        defer std.crypto.secureZero(u8, &material_buf);
+        const key_path = f.encrypt_key.?;
+        const material = (if (std.mem.eql(u8, key_path, "-")) transform.linux_keys.readKeyStdin(&material_buf) else transform.linux_keys.readKeyFile(key_path, &material_buf)) catch |e| {
+            var kb: [512]u8 = undefined;
+            var kw: Io.Writer = .fixed(&kb);
+            transform.writeKeyFileRefusal(&kw, e, key_path) catch {};
+            p.stderr.print("squeezefs format: {s}\n", .{kw.buffered()}) catch {};
+            return cli.exit_failed;
+        };
+        var derived = transform.deriveVolumeKey(material, &salt);
+        defer derived.zeroize();
+        key_ref = .{ .kdf_salt = salt, .key_id = derived.key_id };
+    }
+
+    // The io pool: registration (O_DIRECT) + the preflight read + the image.
     const pool = uring_fs.Pool.init(p.gpa, uring_fs.Config.resolve(p.env, derive.facts())) catch |e| {
         p.stderr.print("squeezefs format: io pool init failed ({s})\n", .{@errorName(e)}) catch {};
         return cli.exit_failed;
     };
     defer pool.deinit();
 
-    // Preflight.
+    // The metadata preflight.
     if (status.writerGuardHeld(path)) {
         p.stderr.print("squeezefs format: cannot format {s}: a live daemon holds its single-writer guard (umount it first; --force does not override a live mount)\n", .{path}) catch {};
         return cli.exit_failed;
@@ -119,8 +225,47 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         }
     }
 
-    // Identities: per-volume uuid, the set's (uuid, hash seed) — three
-    // independent draws from the OS entropy source.
+    // Every data device: read, classified, gated, sized.
+    var devices: [set_config.MAX_DATA_VOLUMES]DataDevice = undefined;
+    for (data_paths[0..n_data], 0..) |dp, i| {
+        var dreason: [512]u8 = undefined;
+        var dprior: DataPrior = undefined;
+        var opened: ?data_superblock.linux_dev.Opened = null;
+        if (data_superblock.linux_dev.open(p.gpa, dp)) |o| {
+            opened = o;
+            dprior = switch (o.classified.format) {
+                .blank => .blank,
+                .v1 => |sb| .{ .formatted = sb },
+            };
+        } else |e| switch (e) {
+            error.DeviceRefused, error.Io, error.OutOfMemory, error.ReadbackMismatch, error.Unexpected => {
+                p.stderr.print("squeezefs format: cannot read data volume {s}: {s} (a regular file or block device that opens O_DIRECT is required)\n", .{ dp, @errorName(e) }) catch {};
+                return cli.exit_failed;
+            },
+            else => dprior = .{ .refused = std.fmt.bufPrint(&dreason, "{s}", .{@errorName(e)}) catch "" },
+        }
+        var gate_buf: [1024]u8 = undefined;
+        var gw: Io.Writer = .fixed(&gate_buf);
+        const go = dataForceGate(dp, dprior, f.force, &gw) catch false;
+        if (!go) {
+            p.stderr.print("squeezefs format: {s}\n", .{gw.buffered()}) catch {};
+            return cli.exit_failed;
+        }
+        // A refused superblock (a foreign signature under --force) still
+        // needs the device's length; a fresh generation starts at 1.
+        const volume_len = if (opened) |o| o.volume_len else device_loader.volumeLength(dp) catch {
+            p.stderr.print("squeezefs format: cannot size data volume {s}\n", .{dp}) catch {};
+            return cli.exit_failed;
+        };
+        if (transform.capacityBlocks(volume_len, chunk) < 1) {
+            p.stderr.print("squeezefs format: data volume {s} ({d} B) holds fewer than 3 chunks of {d} B (two are reserved; at least one usable block is required) — grow it or pass a smaller --block-size\n", .{ dp, volume_len, chunk }) catch {};
+            return cli.exit_failed;
+        }
+        devices[i] = .{ .path = dp, .volume_len = volume_len, .next_generation = if (opened) |o| o.next_generation else 1 };
+    }
+
+    // Identities: per-volume uuid, the set's (uuid, hash seed), a tag and a
+    // device uuid per data volume — every one an independent draw.
     var vol_uuid: [16]u8 = undefined;
     p.io.randomSecure(&vol_uuid) catch {
         p.stderr.writeAll("squeezefs format: getrandom failed\n") catch {};
@@ -131,16 +276,77 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         return cli.exit_failed;
     };
     const owner = invokingOwner(p.env);
+    var records: [set_config.MAX_DATA_VOLUMES]set_config.DataVolume = undefined;
+    const now_s = clock.realtimeCoarseS();
+    for (devices[0..n_data], 0..) |d, i| {
+        var tag: u64 = undefined;
+        var device_uuid: [16]u8 = undefined;
+        p.io.randomSecure(std.mem.asBytes(&tag)) catch {
+            p.stderr.writeAll("squeezefs format: getrandom failed\n") catch {};
+            return cli.exit_failed;
+        };
+        p.io.randomSecure(&device_uuid) catch {
+            p.stderr.writeAll("squeezefs format: getrandom failed\n") catch {};
+            return cli.exit_failed;
+        };
+        for (records[0..i]) |prev| if (prev.vol_tag == tag) {
+            // 2^-64 per pair; still never two volumes under one tag.
+            p.stderr.writeAll("squeezefs format: getrandom produced a repeated vol_tag; re-run\n") catch {};
+            return cli.exit_failed;
+        };
+        records[i] = .{ .vol_tag = tag, .state = .active, .device_uuid = device_uuid, .added_ts = now_s, .capacity_blocks = transform.capacityBlocks(d.volume_len, chunk), .volume_len = d.volume_len, .uri = d.path };
+    }
 
+    // The record (its cap is the per-volume record-value cap).
+    var cache_paths: [args.MAX_CACHE_PATHS][]const u8 = undefined;
+    var n_paths: usize = 0;
+    var it = args.cachePaths(f.disk_cache_paths);
+    while (it.next()) |cp| {
+        cache_paths[n_paths] = cp;
+        n_paths += 1;
+    }
+    var cfg = set_config.birth(p.gpa, set.set_uuid, tcfg, key_ref, records[0..n_data], cache_paths[0..n_paths]) catch {
+        p.stderr.writeAll("squeezefs format: out of memory\n") catch {};
+        return cli.exit_failed;
+    };
+    defer cfg.deinit(p.gpa);
+    const node_size = f.node_size orelse superblock.default_node_size;
+    const record_bytes = set_config.encode(p.gpa, &cfg, @intCast(geometry.recordValueCap(node_size))) catch |e| {
+        p.stderr.print("squeezefs format: the set_config record cannot be written: {s} (the per-volume record cap at node {d} B is {d} B)\n", .{ @errorName(e), node_size, geometry.recordValueCap(node_size) }) catch {};
+        return cli.exit_failed;
+    };
+    defer p.gpa.free(record_bytes);
+
+    // Destructive steps, device-before-record: every data superblock first.
+    for (devices[0..n_data], records[0..n_data]) |d, r| {
+        const sb: data_superblock.DataSuperblock = .{
+            .block_size = tcfg.block_size,
+            .chunk_size = chunk,
+            .compression = tcfg.compression,
+            .encryption = tcfg.encryption,
+            .volume_len = d.volume_len,
+            .vol_tag = r.vol_tag,
+            .set_uuid = set.set_uuid,
+            .device_uuid = r.device_uuid,
+            .features_incompat = 0,
+        };
+        data_superblock.linux_dev.format(p.gpa, d.path, sb, d.next_generation) catch |e| {
+            p.stderr.print("squeezefs format: data volume {s}: {s}\n", .{ d.path, @errorName(e) }) catch {};
+            return cli.exit_failed;
+        };
+    }
+
+    // The metadata volume, with the record in tree 0.
     backend.formatVolume(p.gpa, path, .{
         .env = p.env,
         .pool = pool,
-        .node_size = f.node_size orelse superblock.default_node_size,
+        .node_size = node_size,
         .journal_len_override = f.journal_len,
         .uuid = vol_uuid,
         .set = set,
         .root_uid = owner.uid,
         .root_gid = owner.gid,
+        .control_records = &.{.{ .key = set_config.CONTROL_KEY, .seq = 0, .kind = .put, .value = record_bytes }},
     }) catch |e| {
         p.stderr.print("squeezefs format: {s}: {s}\n", .{ path, formatErrorText(e) }) catch {};
         return cli.exit_failed;
@@ -152,15 +358,13 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         f.meta_uri,
         if (f.single_writer) "--single-writer: the single-writer class" else "the symmetric plane is stamped on a live volume at rung 6; today's image is the single-writer class",
         vlen,
-        f.node_size orelse superblock.default_node_size,
+        node_size,
         if (f.journal_len != null) "explicit" else "derived clamp(volume/64, 8 MiB, 32 MiB)",
         owner.uid,
         owner.gid,
     }) catch {};
-    if (f.data_uris.len > 0) {
-        p.stdout.print("  data volumes accepted, NOT formatted or recorded ({d} URI(s)): the data plane and the volume-set configuration that records them land with rung 4\n", .{f.data_uris.len}) catch {};
-        for (f.data_uris) |d| p.stdout.print("    {s}\n", .{d}) catch {};
-    }
+    cfg.writeSummary(p.stdout) catch {};
+    if (n_data == 0) p.stdout.writeAll("  (no data volumes: the set_config record lists none; `squeezefs volume add-data` adds them at rung 8)\n") catch {};
     p.stdout.flush() catch {};
     return cli.exit_ok;
 }
@@ -200,6 +404,21 @@ test "the force gate: Blank formats; formatted/legacy/refused need --force and s
     try testing.expect(try forceGate(.formatted, true, &w));
     try testing.expect(try forceGate(.{ .legacy = 2 }, true, &w));
     try testing.expect(try forceGate(.{ .refused = "x" }, true, &w));
+}
+
+test "the data force gate: Blank formats; a squeezefs data volume names its tag and --force; a foreign signature names the reason and --force" {
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try testing.expect(try dataForceGate("/dev/d", .blank, false, &w));
+    var sb: data_superblock.DataSuperblock = undefined;
+    sb.vol_tag = 0xabcd;
+    try testing.expect(!try dataForceGate("/dev/d", .{ .formatted = sb }, false, &w));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "vol-000000000000abcd") != null and std.mem.indexOf(u8, w.buffered(), "--force") != null);
+    w = .fixed(&buf);
+    try testing.expect(!try dataForceGate("/dev/d", .{ .refused = "InvalidMagic" }, false, &w));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "InvalidMagic") != null);
+    try testing.expect(try dataForceGate("/dev/d", .{ .formatted = sb }, true, &w));
+    try testing.expect(try dataForceGate("/dev/d", .{ .refused = "x" }, true, &w));
 }
 
 test "the invoking owner is SUDO_UID:SUDO_GID when set, else the effective ids" {

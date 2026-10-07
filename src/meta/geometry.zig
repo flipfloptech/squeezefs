@@ -7,7 +7,8 @@
 //! `uuid`, `set_uuid` and `hash_seed`, all inputs here).
 //!
 //! Format v4 builds ONE class of volume: the one-member forest — the
-//! control tree (kind 8, empty) and the native slot tree, no appender
+//! control tree (kind 8: the set's control records, `set_config` on member
+//! 0) and the native slot tree, no appender
 //! region (the `SYMMETRIC_PLANE` capability bit absent). Rung 6's format of
 //! the plane adds the appender directory and appender-0 page to this plan;
 //! it changes no byte of any tree (decision 0003 Q2).
@@ -180,8 +181,10 @@ pub fn nodeSeqBase(uuid: [16]u8) u64 {
 
 /// What a tree's records are at format time.
 pub const TreeRecords = enum {
-    /// Tree 0 (`TREE_CONTROL = 8`): no records — still one real empty leaf.
-    control_empty,
+    /// Tree 0 (`TREE_CONTROL = 8`): the format-time control records — the
+    /// `set_config` record on the set's member 0 (charter §8; rung 4),
+    /// nothing on any other member — still one real leaf when empty.
+    control,
     /// The native slot tree: every record of the description (kinds 1, 2,
     /// 3), memcmp-sorted — one mixed-kind tree.
     native,
@@ -191,7 +194,7 @@ pub const TreeSpec = struct { records: TreeRecords };
 
 /// The two trees of the one-member forest, in write order (the control
 /// tree first: its root is the ledger's first).
-pub const forest_trees = [_]TreeSpec{ .{ .records = .control_empty }, .{ .records = .native } };
+pub const forest_trees = [_]TreeSpec{ .{ .records = .control }, .{ .records = .native } };
 
 /// The bootstrap ledger record is `seq 1` ⇒ slot `1 % 32 = 1`, offset
 /// `root_ledger.start + 4096` — NOT slot 0.
@@ -403,7 +406,7 @@ test "node_seq_base = uuid[0..8] LE with the top bit clear; W = 2^16" {
     try testing.expectEqual(@as(u32, 65536), routing_width);
 }
 
-test "build plan: the one-member forest's 9 steps — zero the fixed region, tree 0 (empty) then the native slot tree, the bitmap, the ledger record in slot 1, barrier, superblock, barrier" {
+test "build plan: the one-member forest's 9 steps — zero the fixed region, tree 0 (the control records) then the native slot tree, the bitmap, the ledger record in slot 1, barrier, superblock, barrier" {
     const sb = try plan(64 * MiB, 65536, MiB, test_uuid, test_set, null);
     const bp = buildPlan(sb);
     const s = bp.slice();
@@ -411,7 +414,7 @@ test "build plan: the one-member forest's 9 steps — zero the fixed region, tre
     try testing.expect(s[0] == .register_device);
     try testing.expectEqual(@as(u64, 0), s[1].zero_range.offset);
     try testing.expectEqual(sb.heap.start, s[1].zero_range.len);
-    try testing.expectEqual(TreeSpec{ .records = .control_empty }, s[2].tree_image);
+    try testing.expectEqual(TreeSpec{ .records = .control }, s[2].tree_image);
     try testing.expectEqual(TreeSpec{ .records = .native }, s[3].tree_image);
     try testing.expectEqual(sb.alloc_bitmap.start, s[4].write_bitmap_pages.base);
     try testing.expectEqual(@as(u64, 1), s[4].write_bitmap_pages.generation);

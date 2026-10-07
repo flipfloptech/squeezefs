@@ -7,8 +7,9 @@
 //! touches a device or randomness (`uuid` and the set identity are inputs).
 //!
 //! Every volume is a one-member forest (decision 0003 Q2): the control tree
-//! (kind 8, empty) and the native slot tree holding the description's
-//! records under their kind-carrying keys. The symmetric PLANE (appender
+//! (kind 8: the caller's format-time control records — the `set_config`
+//! record on the set's member 0, empty elsewhere) and the native slot tree
+//! holding the description's records under their kind-carrying keys. The symmetric PLANE (appender
 //! directory, appender pages, `SYMMETRIC_PLANE` bit) is rung 6's and lands
 //! on a live volume; format writes none of it.
 //!
@@ -64,6 +65,10 @@ pub const FormatOptions = struct {
     /// its generation so DUR-5's newest-valid-wins never picks the stale
     /// copy over the fresh primary.
     sb_generation: u64 = 1,
+    /// Tree 0's format-time records, key-sorted (the `set_config` record on
+    /// the set's member 0 — `data/set_config.zig`; charter §8); empty on
+    /// every other member. Seq 0 like every format-time record.
+    control_records: []const rec.RecordRef = &.{},
 };
 
 /// One device write; `barrier_after` is an `fdatasync` once it landed.
@@ -152,15 +157,18 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
         .zero_range => |z| try pushZero(a, &steps, zeros, z.offset, z.len),
         .tree_image => |t| {
             const id: ledger.RootId = switch (t.records) {
-                .control_empty => .control,
+                .control => .control,
                 .native => .native_slot,
             };
-            const records: []const rec.Record = switch (t.records) {
-                .control_empty => &.{},
-                .native => try desc.nativeRecords(a),
+            const refs: []const rec.RecordRef = switch (t.records) {
+                .control => opts.control_records,
+                .native => blk: {
+                    const records = try desc.nativeRecords(a);
+                    const out = try a.alloc(rec.RecordRef, records.len);
+                    for (records, out) |*r, *o| o.* = r.ref();
+                    break :blk out;
+                },
             };
-            const refs = try a.alloc(rec.RecordRef, records.len);
-            for (records, refs) |*r, *o| o.* = r.ref();
             const first_image = images.items.len;
             const root = try writer.writeTree(id.headerTreeId(), refs);
             for (images.items[first_image..]) |*w| try steps.append(a, .{ .offset = w.node_addr, .bytes = w.image, .barrier_after = false });
@@ -352,6 +360,43 @@ test "the one-member forest plan: features 0, the control tree (empty) then the 
     try testing.expectEqual(@as(u32, 1000), iv.uid);
     try testing.expectEqual(@as(u32, 1001), iv.gid);
     try testing.expectEqual(builder.S_IFDIR | 0o755, iv.mode);
+}
+
+test "the control tree carries the caller's format-time records: a set_config-shaped record lands in tree 0 as a seq-0 Put the mount-side lookup path finds; a member with none still has one real empty leaf" {
+    const gpa = testing.allocator;
+    const len = 64 * MiB;
+    var value: [300]u8 = undefined;
+    for (&value, 0..) |*b, i| b.* = @truncate(i);
+    var opts = testOpts();
+    opts.control_records = &.{.{ .key = "set_config", .seq = 0, .kind = .put, .value = &value }};
+    var plan = try planFormat(gpa, len, opts, null);
+    defer plan.deinit();
+    const image = try gpa.alloc(u8, len);
+    defer gpa.free(image);
+    @memset(image, 0);
+    plan.apply(image);
+    try expectMounts(gpa, image, len, 2);
+    const layout = try node.NodeLayout.new(65536, null);
+    var control = try node.verifyNodeExtent(gpa, image[@intCast(plan.tree_roots[0].node_addr)..][0..65536], layout, plan.tree_roots[0].node_addr, 0, null);
+    defer control.deinit(gpa);
+    try testing.expectEqual(key.TREE_CONTROL, control.header.tree_id);
+    var view = try control.bsetAt(gpa, 0);
+    defer view.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), view.len());
+    try testing.expectEqualStrings("set_config", view.record(0).key);
+    try testing.expectEqualSlices(u8, &value, view.record(0).value);
+    try testing.expectEqual(@as(u64, 0), view.record(0).seq);
+    // The native tree is unchanged by the control record (ino 1 alone).
+    var native = try node.verifyNodeExtent(gpa, image[@intCast(plan.tree_roots[1].node_addr)..][0..65536], layout, plan.tree_roots[1].node_addr, 0, null);
+    defer native.deinit(gpa);
+    var nv = try native.bsetAt(gpa, 0);
+    defer nv.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), nv.len());
+    // Without control records the control leaf is header-only (4096 B).
+    var bare = try planFormat(gpa, len, testOpts(), null);
+    defer bare.deinit();
+    try testing.expectEqual(@as(usize, 4096), bare.steps[2].bytes.len);
+    try testing.expect(plan.steps[2].bytes.len > 4096);
 }
 
 test "determinism: one description + uuid + set identity ⇒ byte-identical images; a different uuid moves every node seq and the superblock; the hash_seed is the set identity's, never derived from a uuid" {

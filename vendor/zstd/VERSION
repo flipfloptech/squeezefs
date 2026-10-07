@@ -1,0 +1,6 @@
+zstd 1.5.7 (https://github.com/facebook/zstd/releases/tag/v1.5.7)
+zstd.c: build/single_file_libs/create_single_file_library.sh (combine.py -r lib -x legacy/zstd_legacy.h zstd-in.c), unmodified
+zstd.h: lib/zstd.h, unmodified
+sha256 zstd.c 208e110a1f052d007242d4eef6ed20a03ab1dc6e13eb2c4ff8d158112120ba8e
+sha256 zstd.h 9b4bc8245565c98ccfc61c07749928b57e7c0f6fddb0530c4f6aa1971893d88b
+Used for COMPRESSION only (ZSTD_compress2, level 3, content size pledged); decompression is std.compress.zstd (decision 0002 row 118).

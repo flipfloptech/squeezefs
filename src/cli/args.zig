@@ -12,6 +12,8 @@
 const std = @import("std");
 const knobs = @import("../core/knobs.zig");
 const meta_geometry = @import("../meta/geometry.zig");
+const transform = @import("../data/transform.zig");
+const set_config = @import("../data/set_config.zig");
 const uri = @import("uri.zig");
 
 /// `--meta-journal-mb`: the ring override in MiB. Floor 1 MiB: the plan's
@@ -39,6 +41,20 @@ pub const Format = struct {
     /// Bytes; null = the derived clamp.
     journal_len: ?u64 = null,
     force: bool = false,
+    /// `--block-size BYTES`: the data block, a power of two in
+    /// [`transform.MIN_BLOCK_SIZE`, `transform.MAX_BLOCK_SIZE`]; the
+    /// charter's 4 MiB when absent.
+    block_size: u32 = transform.DEFAULT_BLOCK_SIZE,
+    /// `--compress none|lz4|zstd` (charter §6.5).
+    compression: transform.Compression = .none,
+    /// `--encrypt none|aes-256-gcm|chacha20-poly1305`; requires
+    /// `--encrypt-key`.
+    encryption: transform.Encryption = .none,
+    /// `--encrypt-key PATH|-`: the operator key file (stdin as `-`).
+    encrypt_key: ?[]const u8 = null,
+    /// `--disk-cache-paths a,b`: absolute staging/cache roots recorded in
+    /// the set config (none = cache-less).
+    disk_cache_paths: []const u8 = "",
 };
 
 pub const Mount = struct {
@@ -82,6 +98,15 @@ pub const Refusal = union(enum) {
     supervise_without_daemon,
     log_file_without_daemon,
     daemon_without_log_file,
+    /// `--block-size` outside the power-of-two window.
+    bad_block_size: u64,
+    bad_compression: []const u8,
+    bad_encryption: []const u8,
+    /// `--encrypt` names an algorithm but no `--encrypt-key` was given.
+    encrypt_without_key,
+    /// `--encrypt-key` on a plaintext set.
+    key_without_encrypt,
+    bad_cache_path: []const u8,
 
     pub fn format(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -97,6 +122,12 @@ pub const Refusal = union(enum) {
             .supervise_without_daemon => try w.writeAll("mount: --supervise requires --daemon (the supervisor is the daemon's parent process)"),
             .log_file_without_daemon => try w.writeAll("mount: --log-file requires --daemon (a foreground mount logs to stderr)"),
             .daemon_without_log_file => try w.writeAll("mount: --daemon requires --log-file PATH (a detached daemon must log somewhere; the invoking shell's streams are released at ready)"),
+            .bad_block_size => |b| try w.print("format: --block-size {d} is not a power of two in [{d}, {d}]", .{ b, transform.MIN_BLOCK_SIZE, transform.MAX_BLOCK_SIZE }),
+            .bad_compression => |c| try w.print("format: --compress '{s}' is not one of none|lz4|zstd", .{c}),
+            .bad_encryption => |e| try w.print("format: --encrypt '{s}' is not one of none|aes-256-gcm|chacha20-poly1305", .{e}),
+            .encrypt_without_key => try w.writeAll("format: --encrypt names an algorithm but no key was given — pass --encrypt-key <path|-> (≥ 32 bytes of key material, mode 0600)"),
+            .key_without_encrypt => try w.writeAll("format: --encrypt-key was given for a plaintext set — pass --encrypt aes-256-gcm|chacha20-poly1305 or drop the key"),
+            .bad_cache_path => |p| try w.print("format: --disk-cache-paths member '{s}' is not an absolute path outside the system roots (/, /home, /etc, /usr, /var, /boot, /root), or repeats", .{p}),
         }
     }
 };
@@ -107,7 +138,7 @@ pub const Error = error{Refused};
 pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     const all =
         \\usage: squeezefs <verb> [flags] …
-        \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--force] sqmeta://<path> [sqdata://<path>…]
+        \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]
         \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] sqmeta://<path> <mountpoint>
         \\  squeezefs umount <mountpoint>
         \\  squeezefs status sqmeta://<path>
@@ -116,7 +147,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     ;
     const v = verb orelse return all;
     return switch (v) {
-        .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--force] sqmeta://<path> [sqdata://<path>…]\n",
+        .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]\n",
         .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] sqmeta://<path> <mountpoint>\n",
         .umount => "usage: squeezefs umount <mountpoint>\n",
         .status => "usage: squeezefs status sqmeta://<path>\n",
@@ -261,7 +292,53 @@ fn parseFormat(words: []const []const u8, diag: *Refusal) Error!Verb {
             out.node_size = nk.bytes;
         } else if (std.mem.eql(u8, f.name, "--meta-journal-mb")) {
             out.journal_len = @as(u64, try parseIntFlag(&c, f, u32, JOURNAL_MB_MIN, JOURNAL_MB_MAX)) << 20;
+        } else if (std.mem.eql(u8, f.name, "--block-size")) {
+            const b = try parseIntFlag(&c, f, u64, transform.MIN_BLOCK_SIZE, transform.MAX_BLOCK_SIZE);
+            if (!transform.blockSizeValid(b)) {
+                diag.* = .{ .bad_block_size = b };
+                return error.Refused;
+            }
+            out.block_size = @intCast(b);
+        } else if (std.mem.eql(u8, f.name, "--compress")) {
+            const v = try c.value(f);
+            out.compression = transform.Compression.parse(v) orelse {
+                diag.* = .{ .bad_compression = v };
+                return error.Refused;
+            };
+        } else if (std.mem.eql(u8, f.name, "--encrypt")) {
+            const v = try c.value(f);
+            out.encryption = transform.Encryption.parse(v) orelse {
+                diag.* = .{ .bad_encryption = v };
+                return error.Refused;
+            };
+        } else if (std.mem.eql(u8, f.name, "--encrypt-key")) {
+            out.encrypt_key = try c.value(f);
+        } else if (std.mem.eql(u8, f.name, "--disk-cache-paths")) {
+            out.disk_cache_paths = try c.value(f);
         } else return c.unknown(f);
+    }
+    if (out.encryption != .none and out.encrypt_key == null) {
+        diag.* = .encrypt_without_key;
+        return error.Refused;
+    }
+    if (out.encryption == .none and out.encrypt_key != null) {
+        diag.* = .key_without_encrypt;
+        return error.Refused;
+    }
+    var seen: [MAX_CACHE_PATHS][]const u8 = undefined;
+    var n_seen: usize = 0;
+    var it = cachePaths(out.disk_cache_paths);
+    while (it.next()) |path| {
+        if (!set_config.cachePathAdmissible(path) or n_seen == seen.len) {
+            diag.* = .{ .bad_cache_path = path };
+            return error.Refused;
+        }
+        for (seen[0..n_seen]) |q| if (std.mem.eql(u8, q, path)) {
+            diag.* = .{ .bad_cache_path = path };
+            return error.Refused;
+        };
+        seen[n_seen] = path;
+        n_seen += 1;
     }
     // Positionals: exactly one sqmeta://; the sqdata:// words are the TAIL
     // of argv (one spelling: `… sqmeta://m sqdata://a sqdata://b`), so the
@@ -295,6 +372,24 @@ fn parseFormat(words: []const []const u8, diag: *Refusal) Error!Verb {
     out.data_uris = try dataTail(words, diag);
     return .{ .format = out };
 }
+
+/// `--disk-cache-paths a,b` as an iterator over its members (empty = none).
+pub fn cachePaths(raw: []const u8) CachePathIterator {
+    return .{ .inner = std.mem.splitScalar(u8, raw, ','), .empty = raw.len == 0 };
+}
+
+pub const CachePathIterator = struct {
+    inner: std.mem.SplitIterator(u8, .scalar),
+    empty: bool,
+
+    pub fn next(self: *CachePathIterator) ?[]const u8 {
+        if (self.empty) return null;
+        return self.inner.next();
+    }
+};
+
+/// `set_config.MAX_CACHE_PATHS`: the grammar's own bound on one argv word.
+pub const MAX_CACHE_PATHS: usize = set_config.MAX_CACHE_PATHS;
 
 /// The `sqdata://` words as the tail of argv: from the first one on, every
 /// word must be a valid data URI (a flag or another positional after it is
@@ -466,6 +561,48 @@ test "format refusals: a sixth node size, an out-of-range journal, junk integers
     try testing.expect(r == .bad_uri);
     r = try refusal(av(&.{ "format", "--full", "sqmeta:///x" }));
     try testing.expect(r == .unknown_flag);
+}
+
+test "format: the data-plane flags — block size (power of two in the window), compress, encrypt + key (both or neither), cache paths (absolute, no system root, no repeat)" {
+    var d: Refusal = undefined;
+    var buf: [512]u8 = undefined;
+    const v = try parse(av(&.{ "format", "--block-size", "1048576", "--compress=zstd", "--encrypt", "chacha20-poly1305", "--encrypt-key", "/etc/squeezefs/keys/x.key", "--disk-cache-paths", "/build/c1,/build/c2", "sqmeta:///m", "sqdata:///d" }), &d);
+    try testing.expectEqual(@as(u32, 1 << 20), v.format.block_size);
+    try testing.expectEqual(transform.Compression.zstd, v.format.compression);
+    try testing.expectEqual(transform.Encryption.chacha20poly1305, v.format.encryption);
+    try testing.expectEqualStrings("/etc/squeezefs/keys/x.key", v.format.encrypt_key.?);
+    var it = cachePaths(v.format.disk_cache_paths);
+    try testing.expectEqualStrings("/build/c1", it.next().?);
+    try testing.expectEqualStrings("/build/c2", it.next().?);
+    try testing.expect(it.next() == null);
+    const plain = try parse(av(&.{ "format", "sqmeta:///m" }), &d);
+    try testing.expectEqual(transform.DEFAULT_BLOCK_SIZE, plain.format.block_size);
+    try testing.expect(plain.format.compression == .none and plain.format.encryption == .none and plain.format.encrypt_key == null);
+    var none = cachePaths(plain.format.disk_cache_paths);
+    try testing.expect(none.next() == null);
+    const stdin_key = try parse(av(&.{ "format", "--encrypt", "aes-256-gcm", "--encrypt-key", "-", "sqmeta:///m" }), &d);
+    try testing.expectEqualStrings("-", stdin_key.format.encrypt_key.?);
+    var r = try refusal(av(&.{ "format", "--block-size", "3145728", "sqmeta:///m" }));
+    try testing.expect(r == .bad_block_size);
+    try testing.expect(std.mem.indexOf(u8, text(&buf, r), "power of two") != null);
+    r = try refusal(av(&.{ "format", "--block-size", "2048", "sqmeta:///m" }));
+    try testing.expect(r == .bad_int);
+    r = try refusal(av(&.{ "format", "--compress", "gzip", "sqmeta:///m" }));
+    try testing.expect(r == .bad_compression);
+    r = try refusal(av(&.{ "format", "--encrypt", "aes256gcm", "sqmeta:///m" }));
+    try testing.expect(r == .bad_encryption);
+    r = try refusal(av(&.{ "format", "--encrypt", "aes-256-gcm", "sqmeta:///m" }));
+    try testing.expect(r == .encrypt_without_key);
+    try testing.expect(std.mem.indexOf(u8, text(&buf, r), "--encrypt-key") != null);
+    r = try refusal(av(&.{ "format", "--encrypt-key", "/k", "sqmeta:///m" }));
+    try testing.expect(r == .key_without_encrypt);
+    r = try refusal(av(&.{ "format", "--disk-cache-paths", "/build/c,/home", "sqmeta:///m" }));
+    try testing.expect(r == .bad_cache_path);
+    try testing.expectEqualStrings("/home", r.bad_cache_path);
+    r = try refusal(av(&.{ "format", "--disk-cache-paths", "/build/c,/build/c", "sqmeta:///m" }));
+    try testing.expect(r == .bad_cache_path);
+    r = try refusal(av(&.{ "format", "--disk-cache-paths", "rel", "sqmeta:///m" }));
+    try testing.expect(r == .bad_cache_path);
 }
 
 test "mount: -o glued or spaced, --daemon/--supervise/--log-file, two positionals in order" {

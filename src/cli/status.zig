@@ -1,9 +1,11 @@
 //! `squeezefs status sqmeta://<path>` (charter §8): the superblock, the
-//! newest ledger record and a one-line summary, read O_DIRECT through the
-//! io pool without the writer guard (a read-only snapshot beside a live
-//! daemon is legal: both superblock copies and every ledger slot are
-//! whole-sector, checksummed units). Also the preflight classifier
-//! `format` shares. Linux only.
+//! newest ledger record, the set config and a one-line summary, read
+//! O_DIRECT through the io pool without the writer guard (a read-only
+//! snapshot beside a live daemon is legal: both superblock copies and
+//! every ledger slot are whole-sector, checksummed units; the control
+//! tree is read at the newest CHECKPOINT — a verb's record committed since
+//! and not yet checkpointed is in the journal, which a status never
+//! replays). Also the preflight classifier `format` shares. Linux only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,7 +16,13 @@ const args = @import("args.zig");
 const uri = @import("uri.zig");
 const superblock = @import("../meta/superblock.zig");
 const ledger = @import("../meta/ledger.zig");
+const node = @import("../meta/node.zig");
+const node_cache = @import("../meta/node_cache.zig");
+const node_seq = @import("../meta/node_seq.zig");
+const tree = @import("../meta/tree.zig");
+const key = @import("../meta/key.zig");
 const device_loader = @import("../meta/device_loader.zig");
+const set_config = @import("../data/set_config.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const align_probe = @import("../io/align_probe.zig");
 const derive = @import("../core/derive.zig");
@@ -92,8 +100,57 @@ fn writeUuid(w: *Io.Writer, u: [16]u8) Io.Writer.Error!void {
     try w.print("{x}-{x}-{x}-{x}-{x}", .{ u[0..4], u[4..6], u[6..8], u[8..10], u[10..16] });
 }
 
+/// A read-only status needs a handful of nodes: the control tree's root
+/// and the leaf holding the one record. The budget is the floor the cache
+/// shards derive from (a budget below one node is one shard).
+const status_cache_budget_bytes: u64 = 16 << 20;
+
+/// What the control tree holds under `set_config` at the newest checkpoint.
+pub const SetConfigRead = union(enum) {
+    /// No record (a volume formatted before the record existed, or not
+    /// member 0 of its set).
+    absent,
+    config: set_config.Config,
+    /// The record is present but refused by the codec (the text).
+    refused: []const u8,
+};
+
+/// Open the control tree offline over the node cache and look the record
+/// up. `reason_buf` carries a refusal's text.
+pub fn readSetConfig(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, sb: superblock.Superblock, rec: *const ledger.LedgerRecord, reason_buf: []u8) ClassifyError!SetConfigRead {
+    const mode = uring_fs.registerMetaDevice(gpa, env, path) catch return error.DeviceRefused;
+    var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = sb.root_ledger.start, .bitmap_base = sb.alloc_bitmap.start };
+    const layout = node.NodeLayout.new(sb.node_size, null) catch return error.Unexpected;
+    const cache = try node_cache.NodeCache.init(gpa, io, .{ .layout = layout, .heap_base = sb.heap.start, .budget_bytes = status_cache_budget_bytes }, dev.loader());
+    defer cache.deinit();
+    cache.setDurableTail(rec.journal_tail_seq);
+    var seq = node_seq.NodeSeqHandle.shared(rec.node_seq_watermark);
+    const t = tree.KvTree.openFromLedger(gpa, cache, rec, .control, &seq) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Io => error.Io,
+        else => error.Unexpected,
+    };
+    defer t.destroy();
+    const value = (t.lookup(gpa, set_config.CONTROL_KEY) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Io => error.Io,
+        else => error.Unexpected,
+    }) orelse return .absent;
+    defer gpa.free(value);
+    var diag: set_config.Refusal = undefined;
+    const cfg = set_config.decode(gpa, value, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            var w: Io.Writer = .fixed(reason_buf);
+            diag.write(&w) catch {};
+            return .{ .refused = w.buffered() };
+        },
+    };
+    return .{ .config = cfg };
+}
+
 /// The report (public so the smoke can read it from a buffer).
-pub fn writeReport(w: *Io.Writer, meta_uri: []const u8, snap: Snapshot, rec: ?ledger.LedgerRecord, mounted: bool) Io.Writer.Error!void {
+pub fn writeReport(w: *Io.Writer, meta_uri: []const u8, snap: Snapshot, rec: ?ledger.LedgerRecord, cfg: ?SetConfigRead, mounted: bool) Io.Writer.Error!void {
     switch (snap.prior) {
         .blank => return w.print("{s}: not formatted (zeroed superblock) — run `squeezefs format` first\n", .{meta_uri}),
         .legacy => |v| return w.print("{s}: a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required\n", .{ meta_uri, v }),
@@ -112,6 +169,11 @@ pub fn writeReport(w: *Io.Writer, meta_uri: []const u8, snap: Snapshot, rec: ?le
         try w.print("  ledger     seq {d} (slot {d}), journal tail {d}, next_ino {d}, bitmap generation {d}, node_seq watermark {d}, roots:", .{ r.seq, r.slotIndex(), r.journal_tail_seq, r.next_ino, r.alloc_bitmap_generation, r.node_seq_watermark });
         for (r.tree_roots) |t| try w.print(" {t}@{d}/{d}", .{ t.id, t.node_addr, t.node_seq });
         try w.print("; member {d} of {d}, set epoch {d}\n", .{ r.membership_stamp.member_position, r.membership_stamp.member_count, r.membership_stamp.set_epoch });
+        if (cfg) |c| switch (c) {
+            .absent => try w.writeAll("  set config NONE in the control tree — this volume is not member 0 of its set, or predates the set_config record (reformat)\n"),
+            .refused => |reason| try w.print("  set config REFUSED: {s}\n", .{reason}),
+            .config => |*conf| try conf.writeSummary(w),
+        };
         try w.print("summary: v4, {d} MiB, checkpoint seq {d}, {d} inode(s) minted, {s}\n", .{ sb.volume_len >> 20, r.seq, r.next_ino -| 2, if (mounted) "MOUNTED by a live daemon (writer guard held)" else "not mounted" });
     } else {
         try w.writeAll("  ledger     NO valid record in any of the 32 slots — corruption (a v4 superblock always has one)\n");
@@ -143,13 +205,25 @@ pub fn run(p: cli.Process, s: args.Status) u8 {
     };
     var rec: ?ledger.LedgerRecord = null;
     defer if (rec) |*r| r.deinit(p.gpa);
+    var cfg: ?SetConfigRead = null;
+    defer if (cfg) |*c| switch (c.*) {
+        .config => |*conf| conf.deinit(p.gpa),
+        else => {},
+    };
+    var cfg_reason: [512]u8 = undefined;
     if (snap.sb) |sb| {
         rec = newestLedger(p.gpa, p.env, pool, path, sb) catch |e| {
             p.stderr.print("squeezefs status: cannot read the ledger of {s}: {s}\n", .{ path, @errorName(e) }) catch {};
             return cli.exit_failed;
         };
+        if (rec) |*r| {
+            cfg = readSetConfig(p.gpa, p.io, p.env, pool, path, sb, r, &cfg_reason) catch |e| {
+                p.stderr.print("squeezefs status: cannot read the control tree of {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+                return cli.exit_failed;
+            };
+        }
     }
-    writeReport(p.stdout, s.meta_uri, snap, rec, writerGuardHeld(path)) catch return cli.exit_failed;
+    writeReport(p.stdout, s.meta_uri, snap, rec, cfg, writerGuardHeld(path)) catch return cli.exit_failed;
     p.stdout.flush() catch {};
     return if (snap.prior == .formatted) cli.exit_ok else cli.exit_failed;
 }
@@ -160,16 +234,29 @@ pub fn run(p: cli.Process, s: args.Status) u8 {
 
 const testing = std.testing;
 
-test "the report: a blank volume is one line; a v4 volume prints the superblock, the ledger and a summary naming the mount state" {
+test "the report: a blank volume is one line; a v4 volume prints the superblock, the ledger, the set config (present, absent or refused) and a summary naming the mount state" {
     var out: Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .blank, .sb = null, .slot = .primary, .volume_len = 1 << 20 }, null, false);
+    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .blank, .sb = null, .slot = .primary, .volume_len = 1 << 20 }, null, null, false);
     try testing.expect(std.mem.indexOf(u8, out.written(), "not formatted") != null);
     out.clearRetainingCapacity();
     const sb = superblock.testFixture();
     var roots = [_]ledger.TreeRoot{ .{ .id = .control, .node_addr = sb.heap.start, .node_seq = 7 }, .{ .id = .native_slot, .node_addr = sb.heap.start + sb.node_size, .node_seq = 8 } };
     const rec = ledger.bootstrapRecord(&roots, 42, 9, ledger.MembershipStamp.oneMember(sb.set_uuid));
-    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, true);
+    const vols = [_]set_config.DataVolume{.{ .vol_tag = 0xfeed, .state = .active, .device_uuid = @splat(1), .added_ts = 0, .capacity_blocks = 10, .volume_len = 1 << 30, .uri = "/dev/d0" }};
+    var conf = try set_config.birth(testing.allocator, sb.set_uuid, .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols, &.{});
+    defer conf.deinit(testing.allocator);
+    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .{ .config = conf }, true);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "vol-000000000000feed active /dev/d0") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "compression lz4") != null);
+    out.clearRetainingCapacity();
+    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .absent, false);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "set config NONE") != null);
+    out.clearRetainingCapacity();
+    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .{ .refused = "bad magic" }, false);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "set config REFUSED: bad magic") != null);
+    out.clearRetainingCapacity();
+    try writeReport(&out.writer, "sqmeta:///x", .{ .prior = .formatted, .sb = sb, .slot = .primary, .volume_len = sb.volume_len }, rec, .{ .config = conf }, true);
     const text = out.written();
     try testing.expect(std.mem.indexOf(u8, text, "format v4 (one-member forest)") != null);
     try testing.expect(std.mem.indexOf(u8, text, "next_ino 42") != null);

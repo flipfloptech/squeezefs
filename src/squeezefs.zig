@@ -95,9 +95,18 @@ pub const cli = @import("cli/cli.zig");
 
 // ---- the data plane (charter §6) ----
 pub const data = struct {
-    // @anchor:data_layouts_import
-    // @anchor:data_alloc_import
-    // @anchor:data_transform_import
+    pub const layout = @import("data/layout.zig");
+    pub const staging = @import("data/staging.zig");
+    pub const pack = @import("data/pack.zig");
+    pub const router = @import("data/router.zig");
+    pub const block_alloc = @import("data/block_alloc.zig");
+    pub const incarnation_model = @import("data/incarnation_model.zig");
+    pub const block_refs = @import("data/block_refs.zig");
+    pub const reclaim = @import("data/reclaim.zig");
+    pub const enospc = @import("data/enospc.zig");
+    pub const transform = @import("data/transform.zig");
+    pub const set_config = @import("data/set_config.zig");
+    pub const data_superblock = @import("data/data_superblock.zig");
     // @anchor:data_write_import
     // @anchor:data_read_import
 };
@@ -126,9 +135,18 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:data_layouts_test
-    // @anchor:data_alloc_test
-    // @anchor:data_transform_test
+    _ = data.layout;
+    _ = data.staging;
+    _ = data.pack;
+    _ = data.router;
+    _ = data.block_alloc;
+    _ = data.incarnation_model;
+    _ = data.block_refs;
+    _ = data.reclaim;
+    _ = data.enospc;
+    _ = data.transform;
+    _ = data.set_config;
+    _ = data.data_superblock;
     // @anchor:data_write_test
     // @anchor:data_read_test
     _ = exec;

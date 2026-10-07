@@ -197,6 +197,12 @@ pub fn Mpsc(comptime T: type, comptime capacity: usize) type {
         len: usize = 0,
         /// Live `Sender` handles.
         senders: u32 = 0,
+        /// A `Sender` has been minted. The reference's `channel()` hands out
+        /// its first sender at creation, so `senders == 0` there always means
+        /// "the last one went away"; here `init` has no handle yet, and a
+        /// receiver scheduled ahead of the first `sender()` must park on the
+        /// not-yet-connected channel rather than read it as closed-and-drained.
+        connected: bool = false,
         rx_alive: bool = true,
         /// Receiver-side `close`: sends refuse, drained receives still serve.
         closed: bool = false,
@@ -251,7 +257,14 @@ pub fn Mpsc(comptime T: type, comptime capacity: usize) type {
             self.interior.lockUncancelable(io);
             defer self.interior.unlock(io);
             self.senders += 1;
+            self.connected = true;
             return .{ .chan = self };
+        }
+
+        /// Every sender is gone: closed-and-drained once empty. Never true
+        /// before the first `sender()` (see `connected`).
+        fn sendersGoneLocked(self: *const Self) bool {
+            return self.connected and self.senders == 0;
         }
 
         pub fn trySend(self: *Self, io: Io, value: T) TrySendError!void {
@@ -306,7 +319,7 @@ pub fn Mpsc(comptime T: type, comptime capacity: usize) type {
                 self.tx.wakeFront(io);
                 return v;
             }
-            return if (self.senders == 0 or self.closed) error.Disconnected else error.Empty;
+            return if (self.sendersGoneLocked() or self.closed) error.Disconnected else error.Empty;
         }
 
         /// Receive; `null` = closed AND drained. Parks ticked.
@@ -332,7 +345,7 @@ pub fn Mpsc(comptime T: type, comptime capacity: usize) type {
                         self.tx.wakeFront(io);
                         return v;
                     }
-                    if (self.senders == 0 or self.closed) {
+                    if (self.sendersGoneLocked() or self.closed) {
                         if (w.linked) self.rx.unlink(&w);
                         return null;
                     }
@@ -691,6 +704,37 @@ fn mpscLastSenderAndCancel(io: Io) !void {
 
 test "mpsc: the last sender's departure wakes a parked receiver; a cancelled parked send unregisters" {
     try sync_testing.underBoth(mpscLastSenderAndCancel);
+}
+
+/// A receiver scheduled before the first `Sender` is minted (a consumer task
+/// popped ahead of its producer) must park on a not-yet-connected channel,
+/// not read it as closed-and-drained: that misread ended the consumer at
+/// once and left the producer parked on capacity forever.
+fn mpscRecvBeforeFirstSender(io: Io) !void {
+    var ch: Mpsc(u32, 1) = .init;
+    try testing.expectError(error.Empty, ch.tryRecv(io));
+    const Rx = struct {
+        first: ?u32 = undefined,
+        second: ?u32 = undefined,
+        fn run(io_: Io, c: *Mpsc(u32, 1), out: *@This()) void {
+            out.first = c.recvUncancelable(io_);
+            out.second = c.recvUncancelable(io_);
+        }
+    };
+    var rx: Rx = .{};
+    const t = try std.Thread.spawn(.{}, Rx.run, .{ io, &ch, &rx });
+    while (!ch.receiverParked(io)) try std.Thread.yield();
+    const tx = ch.sender(io);
+    try tx.trySend(io, 7);
+    tx.deinit(io);
+    t.join();
+    try testing.expectEqual(@as(?u32, 7), rx.first);
+    try testing.expectEqual(@as(?u32, null), rx.second);
+    try testing.expectError(error.Disconnected, ch.tryRecv(io));
+}
+
+test "mpsc: a receiver ahead of the first sender parks on the unconnected channel; the first send wakes it; the last deinit closes it" {
+    try sync_testing.underBoth(mpscRecvBeforeFirstSender);
 }
 
 fn mpscNoLostSend(io: Io) !void {

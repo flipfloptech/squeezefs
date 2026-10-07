@@ -13,6 +13,9 @@
 //! profile — `build_options`, imported by `main` alone: the library never
 //! depends on the commit string, so a HEAD move invalidates only the exe).
 //!
+//! The one C dependency is the vendored zstd amalgamation (`vendor/zstd`),
+//! compiled into the library module and linked with libc.
+//!
 //! Steps:
 //!   zig build              — build the `squeezefs` binary for the host target.
 //!   zig build test         — unit tests (portable modules run everywhere;
@@ -48,6 +51,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // ---- vendored zstd (vendor/zstd/VERSION; decision 0002 row 118):
+    //      the single-file amalgamation compiled into the library for
+    //      COMPRESSION only (std's zstd is decompress-only); the header
+    //      translated into the `zstd_c` module `data/transform.zig`
+    //      imports. `ZSTD_STATIC_LINKING_ONLY` for the static-context API
+    //      (`ZSTD_initStaticCCtx`: a compressor that mallocs nothing per
+    //      op, charter §12). Portable: the dev box runs the codec tests too. ----
+    const zstd_c = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/zstd/zstd.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zstd_c.defineCMacro("ZSTD_STATIC_LINKING_ONLY", "1");
+    zstd_c.addIncludePath(b.path("vendor/zstd"));
+    squeezefs_mod.addImport("zstd_c", zstd_c.createModule());
+    squeezefs_mod.addCSourceFile(.{ .file = b.path("vendor/zstd/zstd.c"), .flags = &.{ "-DZSTD_STATIC_LINKING_ONLY", "-std=c99" } });
+    squeezefs_mod.link_libc = true;
 
     // ---- the one CLI binary (charter §8) ----
     const exe = b.addExecutable(.{

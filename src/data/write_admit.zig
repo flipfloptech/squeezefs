@@ -307,15 +307,16 @@ pub const Outcome = struct {
 
 pub const Error = error{ NoSpaceLeft, InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, QueueFull, WouldBlock, ReadOnlyFileSystem, FileTooBig };
 
-/// The data volumes' allocators as a picker (round-robin over the active
-/// volumes with supply; the router's health-weighted table binds here in
-/// wave 4).
+/// The data volumes' allocators as a picker: STRIPE-UNIT placement
+/// (`router.stripeUnitChoice`) over the active volumes with supply — a
+/// file's consecutive blocks share one volume for a whole unit so the
+/// block-map merge emits runs; a volume whose fresh supply latched leaves
+/// the eligible set (the unit's choice re-derives over the survivors).
 pub const Picker = struct {
     vols: *const seams.Volumes,
     /// The overlay's and W1's shape: the stored image IS the payload, so
     /// their destinations are passthrough volumes only.
     passthrough_only: bool = false,
-    rr: Atomic(u64) = .init(0),
 
     pub fn picker(self: *Picker) enospc.Picker {
         return .{ .ctx = self, .pick = &pick };
@@ -325,20 +326,21 @@ pub const Picker = struct {
         return v.active and (!self.passthrough_only or v.passthrough);
     }
 
-    fn pick(ctx: ?*anyopaque) ?*block_alloc.BlockAllocator {
+    fn pick(ctx: ?*anyopaque, place: enospc.Place) ?*block_alloc.BlockAllocator {
         const self: *Picker = @ptrCast(@alignCast(ctx.?));
-        const n = self.vols.count;
-        if (n == 0) return null;
-        const start = self.rr.fetchAdd(1, .monotonic);
+        var with_supply: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+        var n: u32 = 0;
         var fallback: ?*block_alloc.BlockAllocator = null;
-        var i: u64 = 0;
-        while (i < n) : (i += 1) {
-            const v = self.vols.byOrdinal(@intCast((start + i) % n)).?;
+        for (self.vols.rows[0..self.vols.count]) |*r| {
+            const v = &r.*.?;
             if (!self.eligible(v)) continue;
             if (fallback == null) fallback = v.alloc;
-            if (!v.alloc.freshSupplyLatched()) return v.alloc;
+            if (v.alloc.freshSupplyLatched()) continue;
+            with_supply[n] = v.alloc;
+            n += 1;
         }
-        return fallback;
+        if (n == 0) return fallback;
+        return with_supply[router.stripeUnitChoice(place.ino, place.block, n)];
     }
 };
 

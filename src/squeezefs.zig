@@ -97,7 +97,7 @@ pub const cli = @import("cli/cli.zig");
 
 // ---- the data plane (charter §6) ----
 pub const data = struct {
-    // @anchor:data_kvmap_import
+    pub const kvmap = @import("data/kvmap.zig");
     pub const layout = @import("data/layout.zig");
     pub const staging = @import("data/staging.zig");
     pub const pack = @import("data/pack.zig");
@@ -161,7 +161,7 @@ test {
     _ = counters;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:data_kvmap_test
+    _ = data.kvmap;
     _ = meta.guard;
     // @anchor:meta_routing_test
     // @anchor:stats_test

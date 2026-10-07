@@ -193,6 +193,11 @@ const Rig = struct {
     /// The SET: the meta volume, two sparse data volumes, the format with
     /// or without the cache path (staging + the NVMe tier ON / OFF).
     fn formatSet(self: *Rig, cache: bool) !void {
+        return self.formatSetWith(cache, &.{});
+    }
+
+    /// `formatSet` with extra format flags (`--block-size`).
+    fn formatSetWith(self: *Rig, cache: bool, extra: []const []const u8) !void {
         try self.createMetaVolume();
         for ([_][]const u8{ self.d0, self.d1 }) |dp| {
             const f = try Io.Dir.cwd().createFile(self.io, dp, .{ .truncate = true });
@@ -200,10 +205,23 @@ const Rig = struct {
             try f.setLength(self.io, data_len);
         }
         if (cache) _ = linux.mkdir(self.cache.ptr, 0o700);
-        const r = if (cache)
-            try self.squeezefs(&.{ "format", "--disk-cache-paths", self.cache, self.meta_uri, self.data_uri })
-        else
-            try self.squeezefs(&.{ "format", self.meta_uri, self.data_uri });
+        var argv: [12][]const u8 = undefined;
+        var n: usize = 0;
+        argv[n] = "format";
+        n += 1;
+        for (extra) |a| {
+            argv[n] = a;
+            n += 1;
+        }
+        if (cache) {
+            argv[n] = "--disk-cache-paths";
+            argv[n + 1] = self.cache;
+            n += 2;
+        }
+        argv[n] = self.meta_uri;
+        argv[n + 1] = self.data_uri;
+        n += 2;
+        const r = try self.squeezefs(argv[0..n]);
         defer self.freeRun(r);
         if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
         try testing.expect(r.term.success());
@@ -1328,7 +1346,10 @@ const must_stay_zero = [_][]const u8{
     "\"held_store_failures\":",
     "\"transport_zc_direct_leg_recheck_withdrawn\":",
     "\"fuse_write_no_data_volume_refused\":",
-    "\"fuse_write_beyond_inline_map_refused\":",
+    "\"fuse_write_u32_index_refused\":",
+    "\"kvmap_resolve_failures\":",
+    "\"kvmap_owner_mismatch\":",
+    "\"kvmap_sweep_spawn_refusals\":",
     "\"writeback_errors_latched\":",
     "\"fsync_promote_failures\":",
 };
@@ -1942,5 +1963,279 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         try testing.expectEqual(@as(u64, 0), refCensus(report).blocks);
         try testing.expect(std.mem.indexOf(u8, report, "not mounted") != null);
         std.debug.print("smoke[kill]: {s}", .{report[std.mem.lastIndexOf(u8, report, "summary:").?..]});
+    }
+}
+
+// ---- the block-map tree ----
+
+/// The tree-mapped file: 1 MiB blocks (`--block-size 1048576`) put the
+/// inline map's cap (1,364 entries at the 256 KiB node) at 1,364 MiB, so a
+/// 1.5 GiB file crosses with ≤ 2 GiB of real disk; the image is written
+/// six times over (the expected byte at `x` is `image[x mod 256 MiB]`).
+const kvmap_block: u64 = 1 << 20;
+const kvmap_file_mib: u64 = 6 * image_mib;
+const kvmap_inline_cap_mib: u64 = 1364;
+/// The shrink: 100 MiB keeps 100 blocks; 1,436 past the cut are swept.
+const kvmap_keep_mib: u64 = 100;
+/// Random 4 KiB overwrites on the tree-mapped file (the W1 patch class).
+const kvmap_overwrites: usize = 24;
+
+/// `dd` the image `reps` times, appending (1 MiB writes, every size claim
+/// block-aligned); `|| true`: the crash arm's dd dies with the daemon.
+fn kvmapWriteScript(gpa: std.mem.Allocator, from_mib: u64, reps: u64, tolerate: bool) ![]u8 {
+    var script: std.Io.Writer.Allocating = .init(gpa);
+    errdefer script.deinit();
+    const w = &script.writer;
+    try w.writeAll("W=\"$1\"\n");
+    var pos = from_mib;
+    const end = reps * image_mib;
+    while (pos < end) {
+        const n = @min(image_mib - pos % image_mib, end - pos);
+        try w.print("dd if=\"$W/image\" of=big bs=1M skip={d} seek={d} count={d} conv=notrunc status=none{s}\n", .{ pos % image_mib, pos, n, if (tolerate) " || true" else "" });
+        pos += n;
+    }
+    if (!tolerate) try w.writeAll("sync big\necho kvmap-write-ok\n");
+    return script.toOwnedSlice();
+}
+
+/// `big` is the image repeated: its sha equals the concatenation's (a
+/// stream, never a second 1.5 GiB on disk).
+const kvmap_sha_script =
+    \\W="$1"
+    \\test "$(stat -c %s big)" = 1610612736
+    \\sha256sum big | cut -d' ' -f1 > "$W/big.sha"
+    \\cat "$W/image" "$W/image" "$W/image" "$W/image" "$W/image" "$W/image" | sha256sum | cut -d' ' -f1 > "$W/expect.sha"
+    \\cmp "$W/big.sha" "$W/expect.sha"
+    \\echo kvmap-sha-ok
+;
+
+/// `n` page-aligned 4 KiB overwrites at random offsets of the 1.5 GiB
+/// tree-mapped file from random image pages, each read back and compared.
+fn kvmapOverwriteScript(gpa: std.mem.Allocator, n: usize, seed: u64) ![]u8 {
+    var script: std.Io.Writer.Allocating = .init(gpa);
+    errdefer script.deinit();
+    const w = &script.writer;
+    try w.writeAll("W=\"$1\"\n");
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    for (0..n) |_| {
+        const src_page = rnd.uintLessThan(u64, (image_mib << 20) / 4096);
+        const dst_page = rnd.uintLessThan(u64, (kvmap_file_mib << 20) / 4096);
+        try w.print("dd if=\"$W/image\" of=big bs=4096 count=1 skip={d} seek={d} conv=notrunc status=none\n", .{ src_page, dst_page });
+        try w.print("dd if=big of=\"$W/got\" bs=4096 count=1 skip={d} status=none\n", .{dst_page});
+        try w.print("dd if=\"$W/image\" of=\"$W/want\" bs=4096 count=1 skip={d} status=none\n", .{src_page});
+        try w.writeAll("cmp \"$W/got\" \"$W/want\"\n");
+    }
+    try w.writeAll("sync big\necho kvmap-overwrite-ok\n");
+    return script.toOwnedSlice();
+}
+
+/// After the shrink: the kept 100 MiB is exactly what the file served there
+/// before the cut (the overwrite stage already touched that span).
+const kvmap_truncate_script =
+    \\W="$1"
+    \\head -c 104857600 big | sha256sum | cut -d' ' -f1 > "$W/expect.sha"
+    \\truncate -s 100M big
+    \\test "$(stat -c %s big)" = 104857600
+    \\sync big
+    \\sha256sum big | cut -d' ' -f1 > "$W/big.sha"
+    \\cmp "$W/big.sha" "$W/expect.sha"
+    \\echo kvmap-truncate-ok
+;
+
+/// The crash census: every 1 MiB block inside the claimed size is the
+/// image's block at `off mod 256 MiB` or a hole; anything else is TORN.
+fn periodicCensus(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8, image: Io.File) !Census {
+    const f = try dir.openFile(io, name, .{});
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    if (size > kvmap_file_mib << 20) {
+        std.debug.print("\n--- {s}: {d} B claimed after the crash, past the write ---\n", .{ name, size });
+        return error.SizeBeyondWritten;
+    }
+    const piece: usize = @intCast(kvmap_block);
+    const got = try gpa.alloc(u8, piece);
+    defer gpa.free(got);
+    const want = try gpa.alloc(u8, piece);
+    defer gpa.free(want);
+    var out: Census = .{ .size = size, .exact = 0, .holes = 0 };
+    var off: u64 = 0;
+    while (off < size) : (off += piece) {
+        const n: usize = @intCast(@min(piece, size - off));
+        if (try f.readPositionalAll(io, got[0..n], off) != n) return error.ShortRead;
+        if (try image.readPositionalAll(io, want[0..n], off % (image_mib << 20)) != n) return error.ShortRead;
+        if (std.mem.eql(u8, got[0..n], want[0..n])) {
+            out.exact += 1;
+        } else if (std.mem.allEqual(u8, got[0..n], 0)) {
+            out.holes += 1;
+        } else {
+            std.debug.print("\n--- {s}: block at {d} is neither the image nor a hole ---\n", .{ name, off });
+            return error.TornFile;
+        }
+    }
+    return out;
+}
+
+test "smoke: THE BLOCK-MAP TREE — a 1.5 GiB file at 1 MiB blocks crosses the inline cap: kill -9 mid-crossing (the test seam) → remount → records staged, head not flipped, C11 reports the residue → the rewrite re-crosses (the ratchet resumes, residue reconciled) → sha round trip across a remount → 4 KiB overwrites → truncate to 100 MiB (the sweep frees every block past the cut) → rm (the corpse sweep) → df baseline → C8/C11 clean" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetWith(false, &.{ "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}) });
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    const image = try Io.Dir.cwd().openFile(io, rig.image, .{});
+    defer image.close(io);
+
+    // 1. The crash arm: the daemon kills itself after the first committed
+    //    record chunk of the crossing, before the flip.
+    try rig.env.put("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", "1");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const baseline = try rig.usedKib();
+    {
+        // Tolerant: the daemon dies under this script (its dd's fail ENOTCONN).
+        const script = try kvmapWriteScript(gpa, 0, 6, true);
+        defer gpa.free(script);
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", script, "smoke", rig.work }, .cwd = .{ .path = rig.mp }, .environ_map = &rig.env });
+        defer rig.freeRun(r);
+    }
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "BLOCK_MAP_TREE stamped") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "TEST SEAM SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER") != null);
+    }
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    try rig.env.put("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", "0");
+
+    // 2. Remount: the head is still the inline map (every durable block
+    //    exact or a hole), the staged records are C11 residue (report-only).
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    var ready = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..ready];
+        try testing.expect(std.mem.count(u8, seg, " 0 drift row(s)") == 2);
+        const c11 = seg[(std.mem.indexOf(u8, seg, "C11 at mount: ") orelse return error.NoC11Line)..];
+        try testing.expectEqual(@as(u64, 0), numberAfter(c11, "C11 at mount: ") orelse 1);
+        try testing.expect((numberAfter(c11, "with records, ") orelse 0) >= 1);
+        std.debug.print("\nsmoke[kvmap]: after the mid-crossing kill: {s}\n", .{c11[0..@min(c11.len, std.mem.indexOfScalar(u8, c11, '\n') orelse c11.len)]});
+    }
+    {
+        var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
+        defer dir.close(io);
+        const c = try periodicCensus(gpa, io, dir, "big", image);
+        try testing.expect(c.size >= kvmap_inline_cap_mib << 20);
+        std.debug.print("smoke[kvmap]: big claims {d} MiB after the kill: {d} blocks exact, {d} holes, 0 torn\n", .{ c.size >> 20, c.exact, c.holes });
+    }
+    // 3. The rewrite from 0: the inline map refills, the crossing re-runs
+    //    over the residue and flips; the sha round-trips.
+    {
+        const script = try kvmapWriteScript(gpa, 0, 6, false);
+        defer gpa.free(script);
+        const t0 = clock.monotonicNs();
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "kvmap-write-ok") != null);
+        std.debug.print("smoke[kvmap]: 1.5 GiB rewrite + fsync: {d} MB/s\n", .{(kvmap_file_mib << 20) * 1000 / @max(clock.monotonicNs() - t0, 1)});
+    }
+    {
+        const out = try rig.onMount(kvmap_sha_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "kvmap-sha-ok") != null);
+    }
+    {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try testing.expectEqual(@as(u64, 1), numberAfter(tail, "\"kvmap_crossings\":") orelse 0);
+        try testing.expectEqual(@as(u64, 1), numberAfter(tail, "\"map_migrate_resumed\":") orelse 0);
+        try testing.expect((numberAfter(tail, "\"kvmap_window_saves\":") orelse 0) > 0);
+        try testing.expect((numberAfter(tail, "\"meta_kv_block_map_run_puts\":") orelse 0) > 0);
+        std.debug.print("smoke[kvmap]: crossing {d} (resumed {d}), {d} window saves, {d} record puts ({d} runs), {d} deletes, range records {d}, window fills {d} / hits {d}\n", .{ numberAfter(tail, "\"kvmap_crossings\":") orelse 0, numberAfter(tail, "\"map_migrate_resumed\":") orelse 0, numberAfter(tail, "\"kvmap_window_saves\":") orelse 0, numberAfter(tail, "\"meta_kv_block_map_puts\":") orelse 0, numberAfter(tail, "\"meta_kv_block_map_run_puts\":") orelse 0, numberAfter(tail, "\"meta_kv_block_map_deletes\":") orelse 0, numberAfter(tail, "\"meta_kv_block_map_range_records\":") orelse 0, numberAfter(tail, "\"block_map_window_fills\":") orelse 0, numberAfter(tail, "\"block_map_window_hits\":") orelse 0 });
+    }
+    // 4. Remount cold: the tree-mapped file reads back exact; C11 clean.
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    ready = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..ready];
+        try testing.expect(std.mem.count(u8, seg, " 0 drift row(s)") == 2);
+        const c11 = seg[(std.mem.indexOf(u8, seg, "C11 at mount: ") orelse return error.NoC11Line)..];
+        try testing.expectEqual(@as(u64, 1), numberAfter(c11, "C11 at mount: ") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(c11, "with records, ") orelse 1);
+        try testing.expect(std.mem.indexOf(u8, c11, ", 0 empty head(s), 0 run-foreign shadow(s)") != null);
+    }
+    {
+        const t0 = clock.monotonicNs();
+        const out = try rig.onMount(kvmap_sha_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "kvmap-sha-ok") != null);
+        std.debug.print("smoke[kvmap]: cold read of the tree-mapped 1.5 GiB: {d} MB/s\n", .{(kvmap_file_mib << 20) * 1000 / @max(clock.monotonicNs() - t0, 1)});
+    }
+    // 5. 4 KiB overwrites on the tree-mapped file.
+    {
+        const script = try kvmapOverwriteScript(gpa, kvmap_overwrites, overwrite_seed);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "kvmap-overwrite-ok") != null);
+    }
+    // 6. The shrink: size-flip-first, the sweep frees every block past the cut.
+    var terminal_before: u64 = 0;
+    {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        terminal_before = numberAfter(tail, "\"terminal_frees\":") orelse 0;
+    }
+    {
+        const out = try rig.onMount(kvmap_truncate_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "kvmap-truncate-ok") != null);
+    }
+    {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try expectLedgersClosed(tail);
+        const freed = (numberAfter(tail, "\"terminal_frees\":") orelse 0) - terminal_before;
+        try testing.expect(freed >= kvmap_file_mib - kvmap_keep_mib);
+        try testing.expect((numberAfter(tail, "\"fuse_kvmap_sweeps_kicked\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(tail, "\"map_sweep_chunks\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(tail, "\"map_sweep_records\":") orelse 0) >= 1);
+        std.debug.print("smoke[kvmap]: truncate 1536 → 100 MiB: {d} terminal frees (≥ {d} blocks past the cut), {d} sweep chunk tx(s), {d} record ops\n", .{ freed, kvmap_file_mib - kvmap_keep_mib, numberAfter(tail, "\"map_sweep_chunks\":") orelse 0, numberAfter(tail, "\"map_sweep_records\":") orelse 0 });
+    }
+    try rig.awaitUsedKib(baseline + (kvmap_keep_mib << 10));
+    // 7. rm: the corpse sweep destroys the inode; df returns to the baseline.
+    {
+        const out = try rig.onMount("rm -f big && echo rm-ok");
+        defer gpa.free(out);
+    }
+    try rig.awaitUsedKib(baseline);
+    {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try expectLedgersClosed(tail);
+        try testing.expectEqual(@as(u64, 1), numberAfter(tail, "\"kvmap_corpses_destroyed\":") orelse 0);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    {
+        const report = try rig.statusReport();
+        defer gpa.free(report);
+        try testing.expectEqual(@as(u64, 0), refCensus(report).blocks);
+        std.debug.print("smoke[kvmap]: {s}", .{report[std.mem.lastIndexOf(u8, report, "summary:").?..]});
     }
 }

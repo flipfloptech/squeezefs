@@ -521,7 +521,9 @@ pub const Layout = struct {
 
     /// The references this layout NAMES: `(block_index, mapping)` — the
     /// durable copy / tenant at index 0, every inline-map entry at its
-    /// block. A kvmap head names nothing here (its references are tree 7's).
+    /// block. A kvmap head's references are named ELSEWHERE (its kind-7
+    /// records, `data/kvmap.zig`), never by nobody: the diff over this
+    /// iterator is not the flip's arm (`PublishArm.flip_to_kvmap`).
     pub const NamedIterator = struct {
         layout: *const Layout,
         chunk: u64,
@@ -1301,11 +1303,37 @@ pub fn validTransition(from: ?Kind, to: Kind) bool {
     };
 }
 
+/// The map's own law inside the striped kind: a tree-mapped head is STICKY
+/// (charter §5.6) — a shrinking map never collapses back to an inline map
+/// (the collapse would need its own sweep and buys nothing: the head is
+/// ~45 B either way).
+pub fn validMapTransition(from: ?Layout, to: Layout) bool {
+    const f = from orelse return true;
+    return !(f.isKvmap() and to.kind == .striped and to.flags & F_MAP_INLINE != 0);
+}
+
 pub const PublishError = Allocator.Error || LayoutError || error{
-    /// `validTransition(prev, new)` is false.
+    /// `validTransition(prev, new)` is false, or a tree-mapped head would
+    /// regress to an inline map.
     InvalidTransition,
     /// A newly named block has no completed DMA behind it.
     ProofMissing,
+};
+
+/// How the publish treats the references the previous layout named.
+pub const PublishArm = union(enum) {
+    /// The named-reference diff: `+ref` for every block the new layout
+    /// names and the old did not (each needs its proof), `−ref` for every
+    /// one the old named and the new does not.
+    diff,
+    /// THE FLIP to the block-map tree: the inline map's `moved` entries
+    /// became kind-7 records in the same train, and a reference's identity
+    /// `(vol_tag, block_idx, owner, index)` is independent of where the MAP
+    /// lives — so NOTHING is released and nothing is added here (a kvmap
+    /// head "names nothing" to the diff, which would otherwise stage a
+    /// `−ref` for every block of the file). The publishing window's own
+    /// `±ref` are the caller's, staged beside this into the same tx.
+    flip_to_kvmap: struct { moved: usize },
 };
 
 pub const Publish = struct {
@@ -1321,6 +1349,7 @@ pub const Publish = struct {
     /// The completed DMAs behind every block the new layout names and the
     /// old one did not.
     proofs: []const DmaProof,
+    arm: PublishArm = .diff,
 };
 
 /// Stage the layout record (`Put` of `XattrValue{"layout", encoded}`) and
@@ -1331,6 +1360,16 @@ pub const Publish = struct {
 pub fn publishLayout(t: *tx.KvTx, p: Publish, refs: RefsSeam, geo: Geometry) PublishError!void {
     try p.layout.validate(geo);
     if (!validTransition(if (p.prev) |pl| pl.kind else null, p.layout.kind)) return error.InvalidTransition;
+    if (!validMapTransition(p.prev, p.layout)) return error.InvalidTransition;
+    switch (p.arm) {
+        .diff => {},
+        .flip_to_kvmap => |f| {
+            // The flip is exactly inline-striped → kvmap over the moved map.
+            const prev = p.prev orelse return error.InvalidTransition;
+            if (prev.kind != .striped or prev.flags & F_MAP_INLINE == 0 or !p.layout.isKvmap()) return error.InvalidTransition;
+            assert(prev.entries.len == f.moved);
+        },
+    }
     // Every reference the new layout names and the old did not needs a
     // proof; every one the old named and the new does not is released.
     var it = p.layout.named(geo.chunk);
@@ -1357,13 +1396,13 @@ pub fn publishLayout(t: *tx.KvTx, p: Publish, refs: RefsSeam, geo: Geometry) Pub
         if (namesRef(p.prev, e, geo.chunk)) continue;
         try refs.stage_add(refs.ctx, t, refOf(p.ino, e, geo.chunk));
     }
-    if (p.prev) |prev| {
+    if (p.arm == .diff) if (p.prev) |prev| {
         var old = prev.named(geo.chunk);
         while (old.next()) |e| {
             if (namesRef(p.layout, e, geo.chunk)) continue;
             try refs.stage_release(refs.ctx, t, refOf(p.ino, e, geo.chunk));
         }
-    }
+    };
     switch (p.layout.kind) {
         .inline_ => stats.layout_inline_writes.inc(),
         .staged => stats.layout_staged_writes.inc(),
@@ -1960,6 +1999,60 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
         try testing.expectError(error.Corrupt, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = null, .layout = bad, .proofs = &.{} }, refs.seam(), tgeo));
         try testing.expectEqual(staged_before, t.staged.items.len);
     }
+}
+
+test "the flip to the block-map tree releases NOTHING (the diff arm would release every moved entry — the port hazard); a kvmap head never regresses to an inline map; a kvmap → kvmap head Put stages no ref op; the flip arm refuses any other shape" {
+    const gpa = testing.allocator;
+    var refs: TestRefs = .{};
+    defer refs.deinit();
+    const chunk = tgeo.chunk;
+    const entries = try sortedEntries(gpa, &.{
+        .{ .block = 0, .mapping = Mapping.wholeBlock(0x11, 7 * chunk, 1) },
+        .{ .block = 1, .mapping = Mapping.wholeBlock(0x22, 2 * chunk, 1) },
+        .{ .block = 2, .mapping = Mapping.wholeBlock(0x11, 8 * chunk, 2) },
+    });
+    defer gpa.free(entries);
+    const inline_map = Layout.stripedInline(3 * chunk, entries);
+    const head = Layout.stripedKvmap(3 * chunk, null, 1);
+    // The diff arm WOULD release all three (the hazard, pinned so the law stays visible).
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = inline_map, .layout = head, .proofs = &.{} }, refs.seam(), tgeo);
+        try testing.expectEqual(@as(usize, 3), refs.releases.items.len);
+        refs.releases.clearRetainingCapacity();
+    }
+    // The flip arm stages the head Put alone.
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = inline_map, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 3 } } }, refs.seam(), tgeo);
+        try testing.expectEqual(@as(usize, 0), refs.releases.items.len);
+        try testing.expectEqual(@as(usize, 0), refs.adds.items.len);
+        try testing.expectEqual(@as(usize, 1), t.staged.items.len);
+        try testing.expect((try XattrLayout.decode(t.staged.items[0].value, tgeo)).isKvmap());
+    }
+    // Sticky: kvmap → inline refuses; kvmap → kvmap (size, cursor) is a head Put with no ref op.
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = head, .layout = inline_map, .proofs = &.{} }, refs.seam(), tgeo));
+        try publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = head, .layout = Layout.stripedKvmap(1 * chunk, 1, 1), .proofs = &.{} }, refs.seam(), tgeo);
+        try testing.expectEqual(@as(usize, 0), refs.releases.items.len + refs.adds.items.len);
+        try testing.expectEqual(@as(usize, 1), t.staged.items.len);
+    }
+    // The flip arm on any other shape refuses.
+    {
+        var t = tx.KvTx.init(gpa, @src());
+        defer t.deinit();
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = null, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 0 } } }, refs.seam(), tgeo));
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = head, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 0 } } }, refs.seam(), tgeo));
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = inline_map, .layout = Layout.stripedInline(3 * chunk, entries), .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 3 } } }, refs.seam(), tgeo));
+    }
+    try testing.expect(validMapTransition(null, head));
+    try testing.expect(validMapTransition(inline_map, head));
+    try testing.expect(!validMapTransition(head, inline_map));
+    try testing.expect(validMapTransition(head, Layout.stripedKvmap(0, 0, 1)));
 }
 
 test "the meta stripe is 4096-way, spreads consecutive inos, and a guard releases its PARKING lock (a second acquirer is refused while held, admitted after)" {

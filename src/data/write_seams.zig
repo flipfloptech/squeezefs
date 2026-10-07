@@ -149,8 +149,9 @@ pub const FileKind = enum(u8) { inline_, staged, packed_, striped };
 pub const FileView = struct {
     kind: FileKind,
     size: u64,
-    /// The block map is resident (an indirect/kvmap head declines the
-    /// in-place arms).
+    /// The block map resolves through the authority's `lookup` (the inline
+    /// record or the block-map tree alike); false only for a view the
+    /// authority could not read, which declines the in-place arms.
     map_resident: bool,
 };
 

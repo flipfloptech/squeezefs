@@ -744,7 +744,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         }
         defer snap.release(&table.pool);
         // UNLOCKED device phase: transform → allocate (unstable) → DMA → publish.
-        const pm = enospc.allocatePlacedMint(deps.picker, io, deps.valve, null, false) catch |e| switch (e) {
+        const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = ino, .block = block }, io, deps.valve, null, false) catch |e| switch (e) {
             error.StorageFull => {
                 // KD-1.7: the ENOSPC early-close frees parked supply; a
                 // release lets the next pass land, else the block stays
@@ -1131,7 +1131,7 @@ const UploadWorld = struct {
         gpa.destroy(self);
     }
 
-    fn pickA(ctx: ?*anyopaque) ?*block_alloc.BlockAllocator {
+    fn pickA(ctx: ?*anyopaque, _: enospc.Place) ?*block_alloc.BlockAllocator {
         return @ptrCast(@alignCast(ctx.?));
     }
 

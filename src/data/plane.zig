@@ -32,12 +32,23 @@
 //! close and kv_fs. Never held across a terminal block free (RES-1): every
 //! displaced binding is freed by the caller after its transaction landed.
 //!
+//! The block-map tree (charter §5.6; `data/kvmap.zig`): a merge that would
+//! push the inline map past the record cap runs the CROSSING under the
+//! per-ino layout lock — the ratchet (`BLOCK_MAP_TREE` stamped and
+//! barriered before any record), the A1 residue diff, chunked record txs,
+//! the FLIP as the last tx (the head Put with the typed arm that releases no
+//! moved reference, plus the window's own `±ref`). A tree-mapped head's
+//! merges ship ONLY their window (`kvmap.stageWindow`), reads resolve
+//! through the window store, a shrink is size-flip-first with the cursor-
+//! resumed sweep (synchronous below `chunk × 64` removed blocks, a meta-
+//! lane job above; an unlinked corpse is destroyed by the terminal chunk),
+//! and open sweeps are adopted at mount.
+//!
 //! What this wave does NOT do (recorded in `docs/evidence/rung-04-data-
-//! plane.md`): the block-map tree crossing (a striped file past the inline
-//! map's record cap is refused `EFBIG`, counted); a RAM layout cache (the
-//! map authority reads the KV record — latch-free through the node cache,
-//! one decode per probe); the writeback spill of parked blocks into the
-//! ring; per-lane transform contexts (one serialized `Transform`).
+//! plane.md`): a RAM layout cache (the map authority reads the KV record —
+//! latch-free through the node cache, one decode per probe); the writeback
+//! spill of parked blocks into the ring; per-lane transform contexts (one
+//! serialized `Transform`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -65,10 +76,13 @@ const record = @import("../meta/record.zig");
 const tree = @import("../meta/tree.zig");
 const tx_mod = @import("../meta/tx.zig");
 const dlm = @import("../meta/dlm.zig");
+const jc = @import("../meta/journal_core.zig");
+const inos = @import("../meta/inos.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const fsv = @import("../fuse/transport/filesystem_vtable.zig");
 const transport_slot = @import("../fuse/transport/slot.zig");
 const layout = @import("layout.zig");
+const kvmap = @import("kvmap.zig");
 const staging = @import("staging.zig");
 const pack = @import("pack.zig");
 const router = @import("router.zig");
@@ -144,9 +158,13 @@ pub const stats = struct {
     pub var layout_map_merges: counters.ShardedCounter = .{};
     pub var layout_map_merge_blocks: counters.ShardedCounter = .{};
     pub var layout_map_merge_failures: counters.ShardedCounter = .{};
-    /// `layout_kvmap_crossing_refused`: a striped map past the inline cap —
-    /// the block-map tree crossing is owed; EFBIG, never a torn map.
-    pub var layout_kvmap_crossing_refused: counters.ShardedCounter = .{};
+    /// `kvmap_resolve_failures`: a tree-mapped binding the read side could
+    /// not resolve (a store error, an undecodable record) — answered as a
+    /// miss to the caller, never a fabricated hole without this wire.
+    pub var kvmap_resolve_failures: counters.Tripwire = .init("kvmap_resolve_failures");
+    /// `kvmap_sweep_spawn_refusals`: a background sweep the executor could
+    /// not spawn (it resumes at the next mount from its durable cursor).
+    pub var kvmap_sweep_spawn_refusals: counters.ShardedCounter = .{};
     /// The promotion dispatch at dismount / pressure / fsync.
     pub var promotions_run: counters.ShardedCounter = .{};
     pub var promotions_stale: counters.ShardedCounter = .{};
@@ -179,10 +197,10 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_kvmap_crossing_refused", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"data_unresolved_volume\":{d}}}", .{counters.tripwireCount("data_unresolved_volume")});
+    try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures") });
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +345,18 @@ pub const DataPlane = struct {
     file_id_seq: Atomic(u64),
     refs_store: block_refs.RefStore,
     scope: u64,
+    /// The block-map tree: record ops per crossing / sweep tx (the one
+    /// lever), the read side's window store, the sweep jobs in flight (the
+    /// submission dedup) and their group, the stop latch `close` sets.
+    kvmap_chunk: u32,
+    windows: kvmap.WindowCache,
+    sweeps_lock: jc.SpinLock = .{},
+    sweeps: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    sweep_group: Io.Group = .init,
+    sweeps_stop: Atomic(bool) = .init(false),
+    meta_rr: Atomic(u64) = .init(0),
+    /// `SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER` (0 = inert).
+    crossing_kill_after: u32,
 
     // ---- open / close ----
 
@@ -362,9 +392,15 @@ pub const DataPlane = struct {
             .refs_store = block_refs.RefStore.from(KvBackend, be),
             // Rung 4: one meta volume, the native slot — scope 0.
             .scope = pack.packScopeKey(0, 0),
+            .kvmap_chunk = kvmap.chunkFromEnv(opts.env),
+            .windows = undefined,
+            .crossing_kill_after = knobs.intKnob("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", u32, opts.env),
         };
         self.shape = try ShapeTable.init(gpa);
         errdefer self.shape.deinit(gpa);
+        self.windows = try kvmap.WindowCache.init(gpa, kvmap.windowBudgetBytes(opts.budget_bytes), cfg.chunk_size);
+        errdefer self.windows.deinit();
+        budget.authority.register(self.windows.component());
         self.rt = try router.Router.init(gpa, cfg.chunk_size);
         errdefer self.rt.deinit();
 
@@ -452,9 +488,16 @@ pub const DataPlane = struct {
             const v = r.?;
             self.rt.updateCensus(v.vol_tag, v.alloc.usedBlocks() * cfg.block_size) catch {};
         }
-        // The C8 oracle at mount (the A/B lever): the derived walk vs the ledger.
-        if (block_refs.verifyAtMount(opts.env)) self.verifyRefsAtMount();
-        log.info("data plane: {d} data volume(s), block {d} B, chunk {d} B, inline_max {d} B, inline map cap {d} entries, transform {s}/{s}, staging {s}, NVMe tier {s}, direct-store face pending the session", .{ opened, cfg.block_size, cfg.chunk_size, inline_max, self.inlineMapCap(), @tagName(cfg.compression), cfg.encryption.name(), if (self.stage != null) "ON" else "off", if (nvme.enabled) "ON" else "off" });
+        // The C8 oracle at mount (the A/B lever): the derived walk vs the
+        // ledger; the C11 record walk (report-only) rides the same lever.
+        if (block_refs.verifyAtMount(opts.env)) {
+            self.verifyRefsAtMount();
+            self.verifyBlockMapsAtMount();
+        }
+        // Open sweeps (a shrink or an unlink the previous daemon left mid-
+        // sweep) regenerate their jobs from the durable cursor.
+        self.adoptSweeps();
+        log.info("data plane: {d} data volume(s), block {d} B, chunk {d} B, inline_max {d} B, inline map cap {d} entries, map chunk {d} ops, sweep threshold {d} blocks, transform {s}/{s}, staging {s}, NVMe tier {s}, direct-store face pending the session", .{ opened, cfg.block_size, cfg.chunk_size, inline_max, self.inlineMapCap(), self.kvmap_chunk, kvmap.sweepThresholdBlocks(self.kvmap_chunk), @tagName(cfg.compression), cfg.encryption.name(), if (self.stage != null) "ON" else "off", if (nvme.enabled) "ON" else "off" });
         return self;
     }
 
@@ -649,6 +692,10 @@ pub const DataPlane = struct {
     /// the backend's final checkpoint.
     pub fn close(self: *DataPlane) void {
         const io = self.io;
+        // Background sweeps stop at their next chunk boundary (the cursor
+        // is durable; the next mount adopts what is left).
+        self.sweeps_stop.store(true, .release);
+        self.sweep_group.await(io) catch {};
         self.tasks.wait(io) catch {};
         self.wp.quiesce(io);
         if (self.stage) |*st| {
@@ -672,6 +719,8 @@ pub const DataPlane = struct {
         self.closeVolumes(self.vols.count);
         self.reclaimer.deinit();
         self.rt.deinit();
+        self.windows.deinit();
+        self.sweeps.deinit(self.gpa);
         self.shape.deinit(self.gpa);
         self.gpa.destroy(self);
     }
@@ -1338,7 +1387,36 @@ pub const DataPlane = struct {
         defer self.gpa.free(rec.value);
         const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
         if (l.kind != .striped) return null;
-        return l.lookup(self.chunk, block);
+        if (!l.isKvmap()) return l.lookup(self.chunk, block);
+        return self.kvmapLookup(ino, l, block);
+    }
+
+    /// The tree-mapped resolve ladder: an index at or above a live sweep
+    /// cursor is a HOLE (shadowed residue); then the window store's span
+    /// verdict (a filled span's miss is a definitive hole); then the tree —
+    /// ONE range page filled into the store. An unresolvable record is loud
+    /// (`kvmap_resolve_failures`), never a fabricated hole.
+    fn kvmapLookup(self: *DataPlane, ino: u64, head: layout.Layout, block: u32) ?Mapping {
+        if (head.kvmapHead().?.sweep) |k| if (block >= k) return null;
+        if (self.windows.probe(ino, block)) |p| return switch (p) {
+            .hole => null,
+            .mapping => |m| m,
+        };
+        var recs: std.ArrayList(kvmap.Rec) = .empty;
+        defer recs.deinit(self.gpa);
+        kvmap.rangeCovering(self.mapStore(), self.gpa, ino, block, kvmap.WINDOW_FILL_RECORDS, self.chunk, &recs) catch |e| {
+            stats.kvmap_resolve_failures.fire("a tree-mapped binding could not be resolved");
+            log.err("ino {d} block {d}: the block-map tree could not be read ({s})", .{ ino, block, @errorName(e) });
+            return null;
+        };
+        var keyed_from: usize = 0;
+        var found: ?Mapping = null;
+        for (recs.items) |r| {
+            if (r.index >= block) keyed_from += 1;
+            if (r.covers(block)) found = r.bindingAt(block, self.chunk);
+        }
+        self.windows.fill(ino, block, recs.items, keyed_from < kvmap.WINDOW_FILL_RECORDS) catch {};
+        return found;
     }
 
     fn mapView(ctx: *anyopaque, ino: u64) ?seams.FileView {
@@ -1347,12 +1425,30 @@ pub const DataPlane = struct {
         const rec = (self.layoutRecord(ino) catch return null) orelse return .{ .kind = .inline_, .size = size, .map_resident = true };
         defer self.gpa.free(rec.value);
         const l = layout.XattrLayout.decode(rec.value, self.geo) catch return null;
+        // A tree-mapped head resolves through `kvmapLookup` as the inline
+        // map does through the record: the map is resident either way.
         return .{ .kind = switch (l.kind) {
             .inline_ => .inline_,
             .staged => .staged,
             .packed_ => .packed_,
             .striped => .striped,
-        }, .size = size, .map_resident = !l.isKvmap() };
+        }, .size = size, .map_resident = true };
+    }
+
+    fn mapStore(self: *DataPlane) kvmap.Store {
+        return kvmap.Store.from(KvBackend, self.backend);
+    }
+
+    /// Blocks a size spans (the map's index space is `offset / block_size`).
+    fn blocksOf(self: *const DataPlane, size: u64) u64 {
+        return (size + self.block_size - 1) / self.block_size;
+    }
+
+    fn mapKvErr(e: kvmap.Error) seams.MergeError {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io, error.Corrupt => error.Transient,
+        };
     }
 
     fn mapFencing(_: *anyopaque, _: u64) u64 {
@@ -1417,7 +1513,8 @@ pub const DataPlane = struct {
             coll_seq = r.coll_seq;
             // A binding for a file that is no longer striped belongs to a
             // dead generation (a truncate to zero re-classed it): discard.
-            if (prev.?.kind != .striped or prev.?.isKvmap()) return error.NotFound;
+            if (prev.?.kind != .striped) return error.NotFound;
+            if (prev.?.isKvmap()) return self.kvmapMerge(req, prev.?, coll_seq);
         } else {
             // The inode must still exist: a destroyed ino takes no map.
             if ((self.inodeSize(req.ino) catch return error.Transient) == null) return error.NotFound;
@@ -1430,11 +1527,7 @@ pub const DataPlane = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Transient,
         };
-        if (merged.items.len > self.inlineMapCap()) {
-            stats.layout_kvmap_crossing_refused.inc();
-            log.err("ino {d}: the inline block map would hold {d} entries (cap {d}) — the block-map tree crossing is owed; the publish is refused", .{ req.ino, merged.items.len, self.inlineMapCap() });
-            return error.Transient;
-        }
+        if (merged.items.len > self.inlineMapCap()) return self.crossing(req, prev.?, coll_seq, merged.items, &out);
         const size = @max(if (prev) |p| p.size else 0, req.min_size);
         const new = layout.Layout.stripedInline(size, merged.items);
         const t = self.backend.begin(@src()) catch return error.OutOfMemory;
@@ -1460,6 +1553,517 @@ pub const DataPlane = struct {
         stats.layout_map_merge_blocks.add(req.inserts.len);
         self.shape.publish(req.ino, size, self.passthrough);
         return out;
+    }
+
+    // ---- the block-map tree: the crossing, the window merge, the sweep ----
+
+    /// THE CROSSING (charter §5.6; block_map_tree.md §2) under the held
+    /// layout lock: (1) the ratchet — `BLOCK_MAP_TREE` stamped and barriered
+    /// before any record; (2) the A1 residue diff of the tree against the
+    /// desired map (`merged`, the window folded in); (3) the ops in chunks
+    /// of `kvmap_chunk` per tx; (4) the FLIP as the LAST tx: the head Put
+    /// through the typed arm (the moved entries keep their references —
+    /// the named-ref diff would release every block of the file) plus the
+    /// window's own `±ref`. Every mid-train crash leaves records staged and
+    /// the head not flipped: invisible after remount, reconciled by the
+    /// next crossing's diff. The crossing counts, logs ONE INFO line.
+    fn crossing(self: *DataPlane, req: seams.MergeRequest, prev: layout.Layout, coll_seq: u8, merged: []const layout.MapEntryWire, out: *seams.MergeOutcome) seams.MergeError!seams.MergeOutcome {
+        const gpa = self.gpa;
+        const ino = req.ino;
+        self.backend.stampBlockMapTree() catch |e| {
+            log.err("ino {d}: the BLOCK_MAP_TREE stamp failed ({s}) — the crossing is refused; the write keeps its custody and retries", .{ ino, @errorName(e) });
+            return error.Transient;
+        };
+        var plan = kvmap.planCrossing(self.mapStore(), gpa, ino, merged, self.chunk) catch |e| return mapKvErr(e);
+        defer plan.deinit(gpa);
+        if (plan.preexisting != 0) kvmap.stats.map_migrate_resumed.inc();
+        const size = @max(prev.size, req.min_size);
+        const head = layout.Layout.stripedKvmap(size, null, kvmap.FIRST_MAP_GEN);
+        // The kill seam separates the flip from the records so the pre-flip
+        // state is reachable on a small map too.
+        const flip_alone = self.crossing_kill_after != 0;
+        var pos: usize = 0;
+        var chunks: u32 = 0;
+        var flipped = false;
+        while (!flipped) {
+            const n = @min(self.kvmap_chunk, plan.ops.len - pos);
+            const last_records = pos + n == plan.ops.len;
+            const flip_here = last_records and (!flip_alone or n == 0);
+            const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+            for (plan.ops[pos .. pos + n]) |op| kvmap.stageOp(t, ino, op) catch |e| {
+                self.backend.abandon(t);
+                return mapKvErr(e);
+            };
+            if (flip_here) {
+                layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = head, .proofs = req.proofs, .arm = .{ .flip_to_kvmap = .{ .moved = prev.entries.len } } }, self.refsSeam(), self.geo) catch |e| {
+                    self.backend.abandon(t);
+                    stats.layout_map_merge_failures.inc();
+                    log.err("ino {d}: the block-map-tree flip failed to stage ({s})", .{ ino, @errorName(e) });
+                    return switch (e) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => error.Transient,
+                    };
+                };
+                self.stageWindowRefs(t, ino, prev, req.inserts) catch {
+                    self.backend.abandon(t);
+                    return error.OutOfMemory;
+                };
+            }
+            self.backend.commit(t) catch |e| {
+                stats.layout_map_merge_failures.inc();
+                log.err("ino {d}: a block-map-tree crossing tx failed to commit ({s}) — the records so far are invisible residue the next crossing reconciles", .{ ino, @errorName(e) });
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
+                    else => error.Transient,
+                };
+            };
+            pos += n;
+            kvmap.stats.map_migrate_records.add(n);
+            if (flip_here) {
+                flipped = true;
+            } else {
+                chunks += 1;
+                if (flip_alone and (chunks == self.crossing_kill_after or last_records)) {
+                    log.err("TEST SEAM SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER: ino {d}: {d} record chunk(s) committed, head NOT flipped — SIGKILL", .{ ino, chunks });
+                    _ = linux.kill(linux.getpid(), .KILL);
+                }
+            }
+        }
+        kvmap.stats.kvmap_crossings.inc();
+        stats.layout_map_merges.inc();
+        stats.layout_map_merge_blocks.add(req.inserts.len);
+        self.windows.invalidate(ino);
+        self.shape.publish(ino, size, self.passthrough);
+        log.info("ino {d}: block-map-tree crossing — {d} inline entries → {d} records ({d} ops over {d} tx), {d} preexisting record(s) reconciled; head flipped at size {d}, gen {d}", .{ ino, merged.len, plan.records, plan.ops.len, chunks + 1, plan.preexisting, size, kvmap.FIRST_MAP_GEN });
+        return out.*;
+    }
+
+    /// The publishing window's own reference moves at the flip: `+ref` for
+    /// an insert the inline map did not name at that block, `−ref` for the
+    /// binding it displaced there.
+    fn stageWindowRefs(self: *DataPlane, t: *tx_mod.KvTx, ino: u64, prev: layout.Layout, inserts: []const seams.MapInsert) Allocator.Error!void {
+        for (inserts) |ins| {
+            const old = prev.lookup(self.chunk, ins.block);
+            if (old) |o| {
+                if (o.sameRef(ins.binding, self.chunk)) continue;
+                try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = o.vol_tag, .block_idx = o.blockIdx(self.chunk), .owner_ino = ino, .block_index = ins.block })});
+            }
+            try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = ins.binding.vol_tag, .block_idx = ins.binding.blockIdx(self.chunk), .owner_ino = ino, .block_index = ins.block })});
+        }
+    }
+
+    /// A merge on a tree-mapped head ships ONLY its window (block_map_tree.md
+    /// §3.1): every insert's DMA proof checked, the inserts sorted, the
+    /// extend barrier when the size floor passes a live sweep cursor, then
+    /// ONE tx = `kvmap.stageWindow` (the records + the window's `±ref`) and
+    /// the head Put only when size or cursor moved. Tree reads are O(window).
+    fn kvmapMerge(self: *DataPlane, req: seams.MergeRequest, prev: layout.Layout, coll_seq: u8) seams.MergeError!seams.MergeOutcome {
+        const gpa = self.gpa;
+        const ino = req.ino;
+        for (req.inserts) |ins| {
+            var covered = false;
+            for (req.proofs) |p| {
+                if (p.covers(ins.binding, self.chunk)) covered = true;
+            }
+            if (!covered) {
+                stats.layout_map_merge_failures.inc();
+                log.err("ino {d} block {d}: a block-map publish without a completed DMA behind its binding — refused", .{ ino, ins.block });
+                return error.Transient;
+            }
+        }
+        const inserts = try gpa.dupe(seams.MapInsert, req.inserts);
+        defer gpa.free(inserts);
+        const n_unique = sortInsertsLastWins(inserts);
+        const window = inserts[0..n_unique];
+        const head = prev.kvmapHead().?;
+        const size = @max(prev.size, req.min_size);
+        const floor_blocks = self.blocksOf(size);
+        var cursor: ?u32 = head.sweep;
+        var barrier_frees: std.ArrayList(Mapping) = .empty;
+        defer barrier_frees.deinit(gpa);
+        if (cursor) |k| if (floor_blocks > k) {
+            cursor = try self.barrierSweep(ino, k, floor_blocks, &barrier_frees);
+        };
+        if (cursor) |k| for (window) |ins| if (ins.block >= k) {
+            stats.layout_map_merge_failures.inc();
+            log.err("ino {d} block {d}: a binding at or above the live sweep cursor {d} — a cursor-invariant break upstream; refused", .{ ino, ins.block, k });
+            return error.Transient;
+        };
+        const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+        var out: seams.MergeOutcome = .{};
+        kvmap.stageWindow(self.mapStore(), gpa, t, ino, window, self.chunk, &out) catch |e| {
+            self.backend.abandon(t);
+            stats.layout_map_merge_failures.inc();
+            log.err("ino {d}: the window put of {d} binding(s) failed ({s}) — the upload keeps its custody and retries", .{ ino, window.len, @errorName(e) });
+            return mapKvErr(e);
+        };
+        if (size != prev.size or !std.meta.eql(cursor, head.sweep)) {
+            layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(size, cursor, head.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| {
+                self.backend.abandon(t);
+                stats.layout_map_merge_failures.inc();
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Transient,
+                };
+            };
+        }
+        self.backend.commit(t) catch |e| {
+            stats.layout_map_merge_failures.inc();
+            log.err("ino {d}: the block-map commit of {d} binding(s) failed ({s})", .{ ino, window.len, @errorName(e) });
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
+                else => error.Transient,
+            };
+        };
+        stats.layout_map_merges.inc();
+        stats.layout_map_merge_blocks.add(window.len);
+        kvmap.stats.kvmap_window_saves.inc();
+        self.windows.invalidate(ino);
+        self.shape.publish(ino, size, self.passthrough);
+        // The barrier's frees: the caller holds its (3.5) stripe across this
+        // merge, so they run on the meta pool after it returns (RES-1).
+        if (barrier_frees.items.len != 0) self.deferFrees(barrier_frees.toOwnedSlice(gpa) catch return out);
+        return out;
+    }
+
+    /// Sort inserts by block; among duplicates of one block the LATER one
+    /// in the caller's order wins (the epoch feeds its shadows oldest
+    /// first). Returns the unique length.
+    fn sortInsertsLastWins(inserts: []seams.MapInsert) usize {
+        // Insertion sort: stable, and the windows are ≤ 64 entries.
+        var i: usize = 1;
+        while (i < inserts.len) : (i += 1) {
+            const v = inserts[i];
+            var j = i;
+            while (j > 0 and inserts[j - 1].block > v.block) : (j -= 1) inserts[j] = inserts[j - 1];
+            inserts[j] = v;
+        }
+        var n: usize = 0;
+        for (inserts, 0..) |ins, k| {
+            if (k + 1 < inserts.len and inserts[k + 1].block == ins.block) continue;
+            inserts[n] = ins;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// THE EXTEND BARRIER (block_map_tree.md §4.3): a size floor past the
+    /// live cursor `k` would make the residue in `[k, floor)` servable the
+    /// instant it commits, so it is swept first — chunked txs, each with the
+    /// cursor advance (a crash re-runs record-true). Returns the cursor the
+    /// merge's head carries: `floor` (or null when the whole residue went).
+    fn barrierSweep(self: *DataPlane, ino: u64, k: u32, floor: u64, frees: *std.ArrayList(Mapping)) seams.MergeError!?u32 {
+        const gpa = self.gpa;
+        const end: u32 = @intCast(@min(floor, std.math.maxInt(u32)));
+        var start = k;
+        while (true) {
+            var page = kvmap.planSweepPage(self.mapStore(), gpa, ino, start, end, self.kvmap_chunk, self.chunk) catch |e| return mapKvErr(e);
+            defer page.deinit(gpa);
+            const next: ?u32 = page.next_cursor;
+            if (page.isEmpty() and next == null) break;
+            const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+            kvmap.stageSweepPage(t, ino, &page, self.chunk) catch |e| {
+                self.backend.abandon(t);
+                return mapKvErr(e);
+            };
+            const rec = (self.layoutRecord(ino) catch return error.Transient) orelse {
+                self.backend.abandon(t);
+                return error.NotFound;
+            };
+            defer gpa.free(rec.value);
+            const prev = layout.XattrLayout.decode(rec.value, self.geo) catch {
+                self.backend.abandon(t);
+                return error.Transient;
+            };
+            const cursor_after: u32 = next orelse end;
+            layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = rec.coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(prev.size, cursor_after, prev.kvmapHead().?.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch {
+                self.backend.abandon(t);
+                return error.Transient;
+            };
+            self.backend.commit(t) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.VolumeFailed, error.VolumeClosed => error.WriterGuardFenced,
+                else => error.Transient,
+            };
+            kvmap.stats.map_sweep_chunks.inc();
+            self.windows.invalidate(ino);
+            for (page.freed.items) |f| try frees.append(gpa, f.binding);
+            if (next == null) break;
+            start = next.?;
+        }
+        return end;
+    }
+
+    fn deferFrees(self: *DataPlane, bindings: []Mapping) void {
+        self.tasks.spawn(self.io, deferredFreeTask, .{ self, bindings }) catch {
+            // Never leaked: the frees run here (the one RES-1 exception the
+            // executor's refusal forces).
+            self.freeBindings(self.io, bindings);
+            self.gpa.free(bindings);
+        };
+    }
+
+    fn deferredFreeTask(self: *DataPlane, bindings: []Mapping) Io.Cancelable!void {
+        self.freeBindings(self.io, bindings);
+        self.gpa.free(bindings);
+    }
+
+    // ---- the sweep (block_map_tree.md §4): the data face + the job ----
+
+    /// The SIZE-FLIP-FIRST shrink of a tree-mapped file, staged into the
+    /// caller's tx: ONE head Put `{size, sweep = min(existing, K)}`, K =
+    /// ceil(size / block) — nothing else (a 1 PiB truncate is one record);
+    /// the records at or above the cursor are residue the sweep drains
+    /// (`drainKvmapSweep` after the commit). Returns the cursor planted.
+    pub fn stageKvmapShrink(self: *DataPlane, t: *tx_mod.KvTx, ino: u64, prev: layout.Layout, coll_seq: u8, new_size: u64) Error!u32 {
+        const head = prev.kvmapHead() orelse return error.InvalidArgument;
+        const k: u32 = @intCast(@min(self.blocksOf(new_size), std.math.maxInt(u32) - 1));
+        const cursor = if (head.sweep) |c| @min(c, k) else k;
+        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(new_size, cursor, head.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InputOutput,
+        };
+        kvmap.stats.map_sweep_jobs.inc();
+        return cursor;
+    }
+
+    /// The CORPSE mark of an unlinked tree-mapped file: the head Put `{size
+    /// 0, sweep 0}` into the caller's tx; the inode record stays (nlink 0,
+    /// unreachable) until the sweep's terminal chunk destroys it with its
+    /// xattrs.
+    pub fn stageKvmapCorpse(self: *DataPlane, t: *tx_mod.KvTx, ino: u64, prev: layout.Layout, coll_seq: u8) Error!void {
+        _ = try self.stageKvmapShrink(t, ino, prev, coll_seq, 0);
+    }
+
+    /// After a shrink's or a corpse mark's tx landed: drain the residue —
+    /// synchronously (the caller's op) when at most `chunk × 64` blocks
+    /// were removed, on a meta lane above it.
+    pub fn drainKvmapSweep(self: *DataPlane, ino: u64, removed_blocks: u64) void {
+        if (removed_blocks <= kvmap.sweepThresholdBlocks(self.kvmap_chunk)) {
+            self.sweepJob(ino, false);
+        } else {
+            self.spawnSweep(ino);
+        }
+    }
+
+    fn spawnSweep(self: *DataPlane, ino: u64) void {
+        const lanes = self.sqz.metaLanes();
+        const lane = if (lanes.len == 0) self.sqz.homeLane(null, null) else lanes[@intCast(self.meta_rr.fetchAdd(1, .monotonic) % lanes.len)];
+        self.sqz.spawnGroupOn(lane, &self.sweep_group, sweepFiber, .{ self, ino }) catch |e| {
+            stats.kvmap_sweep_spawn_refusals.inc();
+            log.err("ino {d}: the block-map sweep could not be spawned ({s}) — it resumes from its durable cursor at the next mount", .{ ino, @errorName(e) });
+        };
+    }
+
+    fn sweepFiber(self: *DataPlane, ino: u64) void {
+        self.sweepJob(ino, true);
+    }
+
+    fn registerSweep(self: *DataPlane, ino: u64) bool {
+        self.sweeps_lock.lock();
+        defer self.sweeps_lock.unlock();
+        const gop = self.sweeps.getOrPut(self.gpa, ino) catch return false;
+        return !gop.found_existing;
+    }
+
+    fn unregisterSweep(self: *DataPlane, ino: u64) void {
+        self.sweeps_lock.lock();
+        defer self.sweeps_lock.unlock();
+        _ = self.sweeps.remove(ino);
+    }
+
+    /// The cursor-resumed sweep: one chunk tx per pass until the terminal
+    /// chunk clears the cursor (or destroys the corpse). Deduped per ino
+    /// (a second submission is safe — every chunk re-reads the cursor —
+    /// but pointless). `throttled` = the manners law between chunks:
+    /// foreground device-byte movement since the last chunk yields one
+    /// tick; idle runs full width. The stop latch ends it at a chunk
+    /// boundary; the next mount adopts the cursor.
+    fn sweepJob(self: *DataPlane, ino: u64, throttled: bool) void {
+        if (!self.registerSweep(ino)) return;
+        defer self.unregisterSweep(ino);
+        var fg = foregroundBytes(null);
+        while (!self.sweeps_stop.load(.acquire)) {
+            const outcome = self.sweepChunk(ino) catch |e| {
+                log.err("ino {d}: a block-map sweep chunk failed ({s}) — the sweep resumes from its durable cursor at the next kick or mount", .{ ino, @errorName(e) });
+                return;
+            };
+            if (outcome == .done) return;
+            if (throttled) {
+                const now_fg = foregroundBytes(null);
+                if (now_fg != fg) {
+                    fg = now_fg;
+                    self.io.sleep(.{ .nanoseconds = reclaim.MANNERS_TICK_MS * std.time.ns_per_ms }, .awake) catch {};
+                }
+            }
+        }
+    }
+
+    const ChunkOutcome = enum { more, done };
+
+    /// ONE sweep chunk under the layout lock: re-read the head (the plan IS
+    /// the durable cursor), `start = max(cursor, ceil(head.size / block))`
+    /// — the HEAD's size, the record the cursor lives in and every merge
+    /// raises, so a write that grew the file back never has its minted
+    /// records deleted and a corpse (head size 0) sweeps whole — one page
+    /// by the index budget, ONE tx = the Deletes / shortened Puts + their
+    /// `−ref` + the cursor advance (the terminal chunk clears the cursor,
+    /// or destroys the corpse: inode + xattrs). The freed blocks go to the
+    /// reclaimer AFTER the lock drops (RES-1).
+    fn sweepChunk(self: *DataPlane, ino: u64) Error!ChunkOutcome {
+        const io = self.io;
+        const gpa = self.gpa;
+        var frees: std.ArrayList(Mapping) = .empty;
+        defer frees.deinit(gpa);
+        var outcome: ChunkOutcome = .done;
+        {
+            const lock = self.lockLayout(io, ino);
+            defer lock.unlock(io);
+            const rec = (try self.layoutRecord(ino)) orelse return .done;
+            defer gpa.free(rec.value);
+            const prev = layout.XattrLayout.decode(rec.value, self.geo) catch return error.InputOutput;
+            const head = prev.kvmapHead() orelse return .done;
+            const k = head.sweep orelse return .done;
+            const inode = try self.inodeRecord(ino);
+            const nlink: u32 = if (inode) |v| v.nlink else 0;
+            const start: u32 = @intCast(@min(@max(@as(u64, k), self.blocksOf(prev.size)), std.math.maxInt(u32)));
+            var page = kvmap.planSweepPage(self.mapStore(), gpa, ino, start, std.math.maxInt(u32), self.kvmap_chunk, self.chunk) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InputOutput,
+            };
+            defer page.deinit(gpa);
+            const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+            kvmap.stageSweepPage(t, ino, &page, self.chunk) catch |e| {
+                self.backend.abandon(t);
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InputOutput,
+                };
+            };
+            const gen = head.gen orelse kvmap.FIRST_MAP_GEN;
+            if (page.next_cursor) |next| {
+                if (next != k) self.publishHead(t, ino, rec.coll_seq, prev, layout.Layout.stripedKvmap(prev.size, next, gen)) catch |e| {
+                    self.backend.abandon(t);
+                    return e;
+                };
+                outcome = .more;
+            } else if (nlink == 0 and inode != null) {
+                self.stageDestroyCorpse(t, ino) catch |e| {
+                    self.backend.abandon(t);
+                    return e;
+                };
+            } else {
+                self.publishHead(t, ino, rec.coll_seq, prev, layout.Layout.stripedKvmap(prev.size, null, gen)) catch |e| {
+                    self.backend.abandon(t);
+                    return e;
+                };
+            }
+            self.backend.commit(t) catch |e| return backend_mod.KvBackend.coreError(e);
+            kvmap.stats.map_sweep_chunks.inc();
+            if (outcome == .done and nlink == 0 and inode != null) kvmap.stats.kvmap_corpses_destroyed.inc();
+            self.windows.invalidate(ino);
+            try frees.ensureTotalCapacity(gpa, page.freed.items.len);
+            for (page.freed.items) |f| frees.appendAssumeCapacity(f.binding);
+        }
+        self.freeBindings(io, frees.items);
+        return outcome;
+    }
+
+    fn publishHead(self: *DataPlane, t: *tx_mod.KvTx, ino: u64, coll_seq: u8, prev: layout.Layout, new: layout.Layout) Error!void {
+        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InputOutput,
+        };
+    }
+
+    /// The corpse's destroy: the inode record and every xattr of the ino
+    /// (the head among them) in the caller's tx.
+    fn stageDestroyCorpse(self: *DataPlane, t: *tx_mod.KvTx, ino: u64) Error!void {
+        const gpa = self.gpa;
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        const start = key.xattrKey(ino, 0, 0);
+        const end = key.xattrKey(ino, key.HASH56_MAX, std.math.maxInt(u8));
+        self.backend.range(gpa, key.TREE_XATTRS, &start, &end, 1024, &kvs) catch |e| return backend_mod.KvBackend.coreError(e);
+        const xkeys = try gpa.alloc([]const u8, kvs.items.len);
+        defer gpa.free(xkeys);
+        for (kvs.items, 0..) |kv, i| xkeys[i] = kv.key;
+        try inos.stageDestroy(t, ino, xkeys);
+    }
+
+    fn inodeRecord(self: *DataPlane, ino: u64) Error!?record.InodeValue {
+        const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return backend_mod.KvBackend.coreError(e)) orelse return null;
+        defer self.gpa.free(bytes);
+        return record.InodeValue.decode(bytes) catch return error.InputOutput;
+    }
+
+    /// Mount adoption: every tree-mapped head with a live cursor regenerates
+    /// its job (the plan is the durable cursor; a corpse's job ends in its
+    /// destroy).
+    fn adoptSweeps(self: *DataPlane) void {
+        const Adopt = struct {
+            plane: *DataPlane,
+            n: u64 = 0,
+            fn visit(ctx: *@This(), ino: u64, l: layout.Layout) Error!void {
+                const head = l.kvmapHead() orelse return;
+                if (head.sweep == null) return;
+                ctx.n += 1;
+                kvmap.stats.map_sweep_resumed.inc();
+                ctx.plane.spawnSweep(ino);
+            }
+        };
+        var a: Adopt = .{ .plane = self };
+        self.forEachLayout(*Adopt, &a, Adopt.visit) catch |e| {
+            log.err("block-map sweep adoption at mount failed ({s}) — open sweeps resume at the next mount", .{@errorName(e)});
+            return;
+        };
+        if (a.n != 0) log.info("block-map sweeps adopted at mount: {d} head(s) with a live cursor resumed", .{a.n});
+    }
+
+    /// fsck C11 (report-only, block_map_tree.md §5.3) at mount under the
+    /// verify lever: (a) orphan records — an owner with no tree-mapped head
+    /// (must stay 0); (b) a tree-mapped head with a size and no records; (c)
+    /// a point on a foreign volume inside a run's span. Nothing is repaired.
+    fn verifyBlockMapsAtMount(self: *DataPlane) void {
+        const gpa = self.gpa;
+        const Walk = struct {
+            plane: *DataPlane,
+            heads: std.AutoHashMapUnmanaged(u64, void) = .empty,
+            empty_heads: u64 = 0,
+            foreign: u64 = 0,
+            fn visit(ctx: *@This(), ino: u64, l: layout.Layout) Error!void {
+                if (!l.isKvmap()) return;
+                try ctx.heads.put(ctx.plane.gpa, ino, {});
+                const rep = kvmap.verifyBlockMap(ctx.plane.mapStore(), ctx.plane.gpa, ino, ctx.plane.chunk) catch return error.InputOutput;
+                if (rep.records == 0 and l.size > 0) ctx.empty_heads += 1;
+                ctx.foreign += rep.run_foreign_shadows;
+            }
+        };
+        var w: Walk = .{ .plane = self };
+        defer w.heads.deinit(gpa);
+        self.forEachLayout(*Walk, &w, Walk.visit) catch |e| {
+            log.err("C11 at mount: the head walk failed ({s})", .{@errorName(e)});
+            return;
+        };
+        var orphans: u64 = 0;
+        var owners: u64 = 0;
+        var from: u64 = 0;
+        while (kvmap.nextOwner(self.mapStore(), gpa, from) catch null) |owner| {
+            owners += 1;
+            if (!w.heads.contains(owner)) {
+                const rep = kvmap.verifyBlockMap(self.mapStore(), gpa, owner, self.chunk) catch break;
+                orphans += rep.records;
+                log.err("C11: ino {d} owns {d} block-map record(s) but no tree-mapped head (crossing residue or a lost head) — report-only", .{ owner, rep.records });
+            }
+            if (owner == std.math.maxInt(u64)) break;
+            from = owner + 1;
+        }
+        kvmap.stats.fsck_map_orphan_records.set(orphans);
+        kvmap.stats.fsck_map_empty_heads.set(w.empty_heads);
+        kvmap.stats.fsck_map_run_foreign_shadows.set(w.foreign);
+        log.info("C11 at mount: {d} tree-mapped head(s), {d} owner(s) with records, {d} orphan record(s), {d} empty head(s), {d} run-foreign shadow(s)", .{ w.heads.count(), owners, orphans, w.empty_heads, w.foreign });
     }
 
     // ---- the read path's seams ----
@@ -1759,11 +2363,39 @@ pub const DataPlane = struct {
         return false;
     }
 
-    /// Every layout record in the xattr tree → its owner's bindings. The
-    /// walk covers the NATIVE slot tree (local inos below the guest
-    /// namespace base): a one-member forest owns no guest slot, and a
-    /// range whose bounds route to two trees is refused by the backend.
+    /// Every layout record in the xattr tree → its owner's bindings: the
+    /// inline map's entries, or — for a tree-mapped head — every record of
+    /// the ino's block map expanded (the derived recovery walk owns a tree-
+    /// mapped ino's blocks).
     fn derivedWalk(self: *DataPlane, owners: *std.ArrayList(block_refs.OwnerBindings)) Error!void {
+        const Derive = struct {
+            plane: *DataPlane,
+            owners: *std.ArrayList(block_refs.OwnerBindings),
+            fn visit(ctx: *@This(), ino: u64, l: layout.Layout) Error!void {
+                const gpa = ctx.plane.gpa;
+                var binds: std.ArrayList(block_refs.Binding) = .empty;
+                errdefer binds.deinit(gpa);
+                if (l.isKvmap()) {
+                    kvmap.deriveBindings(ctx.plane.mapStore(), gpa, ino, ctx.plane.chunk, &binds) catch |e| return switch (e) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => error.InputOutput,
+                    };
+                } else {
+                    var it = l.named(ctx.plane.chunk);
+                    while (it.next()) |e| try binds.append(gpa, .{ .block_index = e.block, .vol_tag = e.mapping.vol_tag, .block_idx = e.mapping.blockIdx(ctx.plane.chunk) });
+                }
+                try ctx.owners.append(gpa, .{ .ino = ino, .bindings = try binds.toOwnedSlice(gpa) });
+            }
+        };
+        var d: Derive = .{ .plane = self, .owners = owners };
+        try self.forEachLayout(*Derive, &d, Derive.visit);
+    }
+
+    /// Every layout record in the xattr tree, in ino order. The walk covers
+    /// the NATIVE slot tree (local inos below the guest namespace base): a
+    /// one-member forest owns no guest slot, and a range whose bounds route
+    /// to two trees is refused by the backend.
+    fn forEachLayout(self: *DataPlane, comptime Ctx: type, ctx: Ctx, comptime visit: fn (Ctx, u64, layout.Layout) Error!void) Error!void {
         const gpa = self.gpa;
         var cursor = key.KeyBuf.fromSlice(&key.xattrKey(0, 0, 0));
         const end = key.xattrKey(key.GUEST_NS_BASE - 1, key.HASH56_MAX, std.math.maxInt(u8));
@@ -1780,11 +2412,7 @@ pub const DataPlane = struct {
                 const xv = record.XattrValue.decode(kv.value) catch continue;
                 if (!std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) continue;
                 const l = layout.Layout.decode(xv.value, self.geo) catch continue;
-                const ino = std.mem.readInt(u64, kv.key[0..8], .big);
-                var binds: std.ArrayList(block_refs.Binding) = .empty;
-                var it = l.named(self.chunk);
-                while (it.next()) |e| try binds.append(gpa, .{ .block_index = e.block, .vol_tag = e.mapping.vol_tag, .block_idx = e.mapping.blockIdx(self.chunk) });
-                try owners.append(gpa, .{ .ino = ino, .bindings = try binds.toOwnedSlice(gpa) });
+                try visit(ctx, std.mem.readInt(u64, kv.key[0..8], .big), l);
             }
             if (kvs.items.len < block_refs.SCAN_PAGE) return;
             const last = kvs.items[kvs.items.len - 1].key;
@@ -1815,6 +2443,8 @@ pub const DataPlane = struct {
         try warm_ladder.writeStatsJson(w);
         try w.writeAll(",\"layout\":");
         try layout.writeStatsJson(w);
+        try w.writeAll(",\"kvmap\":");
+        try kvmap.writeStatsJson(w);
         try w.writeAll(",\"staging\":");
         try staging.writeStatsJson(w);
         try w.writeAll(",\"staging_backing_phase_ns\":");
@@ -1911,7 +2541,7 @@ test "stats JSON names every plane instrument" {
     var w: Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"layout_kvmap_crossing_refused\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":" }) |k| {
+    inline for (.{ "\"data_volumes\":", "\"layout_map_merges\":", "\"kvmap_sweep_spawn_refusals\":", "\"held_stores\":", "\"hold_gate_admits\":", "\"prefetch_fibers\":", "\"bindings_freed\":", "\"data_unresolved_volume\":" }) |k| {
         try testing.expect(std.mem.indexOf(u8, s, k) != null);
     }
 }

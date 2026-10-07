@@ -263,11 +263,15 @@ pub fn allocateBlockGraceBounded(alloc: *BlockAllocator, io: Io, valve: ?Valve, 
     }
 }
 
-/// The placement table's pick (`data/placement.zig` owns the table; the
-/// router hands its `pick` here).
+/// What a placement is FOR: the file and the block index, so the picker can
+/// keep a file's stripe unit on one volume (`router.stripeUnitChoice`).
+pub const Place = struct { ino: u64, block: u32 };
+
+/// The placement pick (`write_admit.Picker` binds the volumes' allocators
+/// behind it).
 pub const Picker = struct {
     ctx: ?*anyopaque,
-    pick: *const fn (?*anyopaque) ?*BlockAllocator,
+    pick: *const fn (?*anyopaque, Place) ?*BlockAllocator,
 };
 
 /// §11 item 13: closes the mount's open rewrite epochs and frees their
@@ -287,19 +291,19 @@ pub const PlacedMint = struct { alloc: *BlockAllocator, minted: Minted };
 /// volume; a `StorageFull` runs the pressure-supply hook and retries the
 /// mint ONCE with a fresh pick. The `under_guard` form (a caller holding a
 /// level-3.5 stripe or a 4a guard) skips the hook — the lock law.
-pub fn allocatePlacedMint(picker: Picker, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!PlacedMint {
-    const first = picker.pick(picker.ctx) orelse return error.NoHealthyBackends;
+pub fn allocatePlacedMint(picker: Picker, place: Place, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!PlacedMint {
+    const first = picker.pick(picker.ctx, place) orelse return error.NoHealthyBackends;
     const err = if (allocateBlockGraceBounded(first, io, valve, false, null)) |m| return .{ .alloc = first, .minted = m } else |e| e;
     if (err != error.StorageFull) return err;
     if (!under_guard) {
         if (hook) |h| _ = h.run(h.ctx);
     }
-    const second = picker.pick(picker.ctx) orelse return error.NoHealthyBackends;
+    const second = picker.pick(picker.ctx, place) orelse return error.NoHealthyBackends;
     return .{ .alloc = second, .minted = try allocateBlockGraceBounded(second, io, valve, false, null) };
 }
 
-pub fn allocatePlaced(picker: Picker, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!Minted {
-    return (try allocatePlacedMint(picker, io, valve, hook, under_guard)).minted;
+pub fn allocatePlaced(picker: Picker, place: Place, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!Minted {
+    return (try allocatePlacedMint(picker, place, io, valve, hook, under_guard)).minted;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +512,7 @@ test "allocatePlaced: pick + mint; StorageFull runs the pressure hook (not under
         var hook_runs: u32 = 0;
         var first: ?*BlockAllocator = null;
         var second: ?*BlockAllocator = null;
-        fn pick(_: ?*anyopaque) ?*BlockAllocator {
+        fn pick(_: ?*anyopaque, _: Place) ?*BlockAllocator {
             picks += 1;
             return if (picks == 1) first else second;
         }
@@ -519,17 +523,17 @@ test "allocatePlaced: pick + mint; StorageFull runs the pressure hook (not under
     };
     P.first = full;
     P.second = open;
-    const m = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, io, null, .{ .ctx = null, .run = &P.hook }, false);
+    const m = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, .{ .ctx = null, .run = &P.hook }, false);
     try testing.expectEqual(@as(u64, 0), m.idx);
     try testing.expectEqual(@as(u64, 1), open.usedBlocks()); // the retry landed on the fresh pick
     try testing.expectEqual(@as(u32, 2), P.picks);
     try testing.expectEqual(@as(u32, 1), P.hook_runs);
     P.picks = 0;
-    _ = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, io, null, .{ .ctx = null, .run = &P.hook }, true);
+    _ = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, .{ .ctx = null, .run = &P.hook }, true);
     try testing.expectEqual(@as(u32, 1), P.hook_runs); // under a guard the hook never runs
     P.first = null;
     P.picks = 0;
-    try testing.expectError(error.NoHealthyBackends, allocatePlaced(.{ .ctx = null, .pick = &P.pick }, io, null, null, false));
+    try testing.expectError(error.NoHealthyBackends, allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, null, false));
 }
 
 test "stats JSON" {

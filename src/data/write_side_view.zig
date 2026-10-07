@@ -26,6 +26,7 @@ const cov = @import("write_coverage.zig");
 const seams = @import("write_seams.zig");
 const accumulate = @import("accumulate.zig");
 const device_overlay = @import("device_overlay.zig");
+const enospc = @import("enospc.zig");
 const epoch_mod = @import("write_epoch.zig");
 
 pub const Binding = seams.Binding;
@@ -258,7 +259,7 @@ const ViewWorld = struct {
         gpa.destroy(self);
     }
 
-    fn pickA(ctx: ?*anyopaque) ?*block_alloc.BlockAllocator {
+    fn pickA(ctx: ?*anyopaque, _: enospc.Place) ?*block_alloc.BlockAllocator {
         return @ptrCast(@alignCast(ctx.?));
     }
 };

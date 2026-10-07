@@ -169,10 +169,16 @@ pub fn killSuidgidMode(mode: u32) u32 {
 /// on a set with NO data volumes answered EFBIG — the set's honest
 /// capacity, not a stopgap (a set with volumes never refuses here).
 pub var fuse_write_no_data_volume_refused: counters.ShardedCounter = .{};
-/// `fuse_write_beyond_inline_map_refused`: a striped write whose end lies
-/// past the inline block map's record cap — the block-map tree crossing
-/// (charter §5.6) is owed; EFBIG, never a torn map.
-pub var fuse_write_beyond_inline_map_refused: counters.ShardedCounter = .{};
+/// `fuse_write_u32_index_refused`: a WRITE or a SETATTR size whose end lies
+/// past `block × u32::MAX` — block indices are u32 across the striped
+/// layout (map keys, refs, the pipeline), `u32::MAX` itself is the reserved
+/// MAP_BLOB sentinel, so the file ceiling is 16 PiB at 4 MiB blocks and
+/// the refusal is EFBIG at admission with zero map-plane side effects (the
+/// codec's refusal of the reserved index stays structurally unreachable).
+pub var fuse_write_u32_index_refused: counters.ShardedCounter = .{};
+/// `fuse_kvmap_sweeps_kicked`: shrinks and unlinks of tree-mapped files
+/// that planted a sweep cursor (size-flip-first) and kicked the drain.
+pub var fuse_kvmap_sweeps_kicked: counters.ShardedCounter = .{};
 /// The write routing per layout arm.
 pub var fuse_write_inline: counters.ShardedCounter = .{};
 pub var fuse_write_staged: counters.ShardedCounter = .{};
@@ -228,7 +234,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "inlineMapCap", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "releaseStaged", "stagedLease", "readMappingImage" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "releaseStaged", "stagedLease", "readMappingImage", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -292,6 +298,10 @@ pub const AfterCommit = struct {
     bindings: [MAX_BINDINGS_PER_INO]layout.MapEntry = undefined,
     n: usize = 0,
     staged: ?struct { key: staging.StagingKey, generation: ?u64 } = null,
+    /// A tree-mapped shrink or corpse mark landed: the sweep drains
+    /// `removed` blocks (synchronously under the threshold, else on the
+    /// meta pool).
+    kvmap_sweep: ?struct { ino: u64, removed: u64 } = null,
 
     fn push(self: *AfterCommit, block: u32, m: Mapping) void {
         if (self.n < self.bindings.len) {
@@ -667,13 +677,24 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
         }
 
-        /// After the transaction landed: the ring release, the frees.
+        /// After the transaction landed: the ring release, the frees, the
+        /// tree-mapped sweep's drain.
         fn afterCommit(self: *Self, after: *const AfterCommit) void {
             if (after.staged) |s| self.data.releaseStaged(s.key, s.generation);
+            if (after.kvmap_sweep) |sw| {
+                fuse_kvmap_sweeps_kicked.inc();
+                self.data.drainKvmapSweep(sw.ino, sw.removed);
+            }
             if (after.n == 0) return;
             var maps: [MAX_BINDINGS_PER_INO]Mapping = undefined;
             for (after.slice(), 0..) |e, i| maps[i] = e.mapping;
             self.data.freeBindings(self.io, maps[0..after.n]);
+        }
+
+        /// `min(i64::MAX, block × u32::MAX)`: the striped file ceiling
+        /// (`fuse_write_u32_index_refused`'s doc).
+        fn maxFileSize(self: *const Self) u64 {
+            return @min(@as(u64, std.math.maxInt(i64)), self.block_size * @as(u64, std.math.maxInt(u32)));
         }
 
         /// KILLPRIV_V2 fold for a tx that is rewriting `v`: the mode strip
@@ -708,6 +729,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const old_size = stored.size;
             if (!self.data.hasVolumes() and size > self.inline_max) {
                 fuse_write_no_data_volume_refused.inc();
+                return error.FileTooBig;
+            }
+            if (size > self.maxFileSize()) {
+                fuse_write_u32_index_refused.inc();
                 return error.FileTooBig;
             }
             const rec = try self.readLayout(ino);
@@ -764,8 +789,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 },
                 .striped => {
                     const r = rec.?;
-                    if (r.layout.isKvmap()) return error.FileTooBig;
                     if (size >= old_size) return;
+                    if (r.layout.isKvmap()) {
+                        // SIZE-FLIP-FIRST (charter §5.6): one head Put
+                        // {size, cursor}; the records past the cut are
+                        // residue the sweep drains after this commit —
+                        // never materialized here, whatever the size.
+                        _ = try self.data.stageKvmapShrink(t, ino, r.layout, r.coll_seq, size);
+                        after.kvmap_sweep = .{ .ino = ino, .removed = (old_size - size + self.block_size - 1) / self.block_size };
+                        fuse_truncate_striped_clips.inc();
+                        return;
+                    }
                     // Blocks at or past the new end leave the map (their
                     // `−ref` rides this tx); the kept partial block is
                     // zero-completed AFTER the commit through the write
@@ -975,6 +1009,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     const start = key.xattrKey(ino, 0, 0);
                     const end = key.xattrKey(ino, key.HASH56_MAX, std.math.maxInt(u8));
                     self.store.range(gpa, key.TREE_XATTRS, &start, &end, 1024, &p.kvs) catch |e| return storeErr(e);
+                    var tree_mapped = false;
                     for (p.kvs.items) |kv| {
                         const xv = record.XattrValue.decode(kv.value) catch continue;
                         if (!std.mem.eql(u8, xv.name, LAYOUT_XATTR)) continue;
@@ -983,9 +1018,21 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                             continue;
                         };
                         self.settleCustody(ino, l.kind);
+                        if (l.isKvmap()) {
+                            // A tree-mapped corpse: its own tx marks it
+                            // (head {size 0, sweep 0}); the sweep's terminal
+                            // chunk destroys the inode and its xattrs.
+                            try self.markKvmapCorpse(c, ino, l, kv.key[kv.key.len - 1], v.size);
+                            tree_mapped = true;
+                            break;
+                        }
                         if (l.kind == .staged) p.after.staged = .{ .key = stagingKeyOf(ino, l), .generation = null };
                         var it = l.named(self.geo.chunk);
                         while (it.next()) |e| p.after.push(e.block, e.mapping);
+                    }
+                    if (tree_mapped) {
+                        tree.deinitKeyValues(gpa, &p.kvs);
+                        continue;
                     }
                     p.bytes = inos.destroyEntryBytes(p.kvs.items.len) + @as(u64, p.after.n) * block_refs.REF_RECORD_JOURNAL_BYTES;
                     try payloads.ensureUnusedCapacity(gpa, 1);
@@ -1018,6 +1065,26 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 fuse_reclaim_destroys.add(destroyed);
                 fuse_reclaim_drains.inc();
             }
+        }
+
+        /// The corpse mark of an unlinked tree-mapped file (block_map_tree.md
+        /// §4.3 "unlink corpse"): ONE tx with the head Put {size 0, sweep 0},
+        /// judged off the durable head alone; the inode record stays (nlink
+        /// 0, unreachable) until the sweep destroys it. Idempotent: a mount
+        /// sweep that meets an already-marked corpse only re-kicks the drain.
+        fn markKvmapCorpse(self: *Self, c: *Ctx, ino: u64, l: Layout, coll_seq: u8, size: u64) Error!void {
+            const head = l.kvmapHead().?;
+            if (!(head.sweep == 0 and l.size == 0)) {
+                const t = try self.store.begin(@src());
+                errdefer self.store.abandon(t);
+                try self.data.stageKvmapCorpse(t, ino, l, coll_seq);
+                try self.commit(c, t);
+            }
+            _ = self.pending.retire(ino);
+            var after: AfterCommit = .{};
+            after.kvmap_sweep = .{ .ino = ino, .removed = (size + self.block_size - 1) / self.block_size };
+            self.afterCommit(&after);
+            fuse_reclaim_destroys.inc();
         }
 
         pub fn getattr(self: *Self, c: *Ctx, a: filesystem.GetattrArgs) Error!filesystem.Attr {
@@ -1383,7 +1450,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const rec = try self.readLayout(local);
             defer self.freeLayout(rec);
             const kind = kindOf(rec);
-            if (rec) |r| if (r.layout.isKvmap()) return error.FileTooBig;
             if (!self.data.hasVolumes()) {
                 if (end > self.inline_max) {
                     fuse_write_no_data_volume_refused.inc();
@@ -1468,9 +1534,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// published — block I/O before the type flip), then the data
         /// plane's admission per piece, then the inode's size claim.
         fn writeStriped(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64) Error!filesystem.Written {
-            const bs = self.block_size;
-            if ((end - 1) / bs >= self.data.inlineMapCap()) {
-                fuse_write_beyond_inline_map_refused.inc();
+            if (end > self.maxFileSize()) {
+                fuse_write_u32_index_refused.inc();
                 return error.FileTooBig;
             }
             const probe = try self.readInode(local);
@@ -1821,9 +1886,6 @@ pub const NoData = struct {
     pub fn geometry(_: *const NoData) layout.Geometry {
         return .default;
     }
-    pub fn inlineMapCap(_: *const NoData) u32 {
-        return 0;
-    }
     pub fn refsSeam(_: *NoData) layout.RefsSeam {
         return .{ .ctx = @ptrCast(@constCast(&none_ctx)), .stage_add = &noRef, .stage_release = &noRef };
     }
@@ -1864,6 +1926,13 @@ pub const NoData = struct {
     pub fn readMappingImage(_: *NoData, _: Mapping, _: []u8) Error![]const u8 {
         return error.NotSupported;
     }
+    pub fn stageKvmapShrink(_: *NoData, _: *tx.KvTx, _: u64, _: Layout, _: u8, _: u64) Error!u32 {
+        unreachable; // no tree-mapped head exists on a volume-less set
+    }
+    pub fn stageKvmapCorpse(_: *NoData, _: *tx.KvTx, _: u64, _: Layout, _: u8) Error!void {
+        unreachable;
+    }
+    pub fn drainKvmapSweep(_: *NoData, _: u64, _: u64) void {}
 };
 
 // ---------------------------------------------------------------------------

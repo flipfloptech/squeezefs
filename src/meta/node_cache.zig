@@ -163,6 +163,9 @@ pub const stats = struct {
     pub var meta_kv_revalidate_stale_serves: counters.ShardedCounter = .{};
     pub var meta_kv_revalidate_nodes_dropped: counters.ShardedCounter = .{};
     pub var meta_kv_reader_load_retries: counters.ShardedCounter = .{};
+    /// Block-map (kind-7) leaves demand-paged off the device — the cold map
+    /// amplification is `leaf_reads × node_size`; each enters on probation.
+    pub var meta_kv_block_map_leaf_reads: counters.ShardedCounter = .{};
 };
 
 /// An armed reader mount tried to mutate a node.
@@ -1731,7 +1734,8 @@ pub const NodeCache = struct {
             buf.release();
             return null;
         }
-        const block_map_leaf = loaded.header.level == 0 and loaded.header.tree_id == key.TREE_BLOCK_MAP;
+        const block_map_leaf = loaded.header.level == 0 and try leafCarriesBlockMap(gpa, &loaded);
+        if (block_map_leaf) stats.meta_kv_block_map_leaf_reads.inc();
         const n = try CachedNode.fromLoaded(self, loaded, buf, false);
         errdefer n.release();
         if (slot) |s| n.stampForestSlot(s);
@@ -1743,6 +1747,43 @@ pub const NodeCache = struct {
         try self.publishStamped(n, snap.epoch);
         stats.meta_kv_node_cache_misses.inc();
         return n;
+    }
+
+    /// Does a demand-loaded LEAF carry block-map (kind-7) records — the
+    /// probation verdict (charter §5.6 "Tree-7 leaves enter the node cache
+    /// on probation")? On a forest every slot-tree node carries header tree
+    /// id 0, so the header's KEY BOUNDS classify in O(1): a leaf whose min
+    /// or max key is a block-map key carries one; a leaf bounded by two keys
+    /// of ONE ino with no kind-7 end carries none (an ino's kinds sort 01 <
+    /// 02 < 03 < 07, so its map records would be its max); a leaf spanning
+    /// inos is scanned for the first kind-7 key off the loaded image.
+    fn leafCarriesBlockMap(gpa: Allocator, loaded: *const node.LoadedNode) Allocator.Error!bool {
+        if (loaded.header.tree_id == key.TREE_BLOCK_MAP) return true;
+        const min = loaded.header.min_key;
+        const max = loaded.header.max_key;
+        if (isBlockMapKey(min) or isBlockMapKey(max)) return true;
+        if (inoMajorIno(min)) |a| if (inoMajorIno(max)) |b| if (a == b) return false;
+        var i: usize = 0;
+        while (i < loaded.bsetCount()) : (i += 1) {
+            var view = try loaded.bsetAt(gpa, i);
+            defer view.deinit(gpa);
+            var j: usize = 0;
+            while (j < view.len()) : (j += 1) {
+                if (isBlockMapKey(view.record(j).key)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn isBlockMapKey(k: []const u8) bool {
+        return k.len == key.BLOCK_MAP_KEY_LEN and k[0] <= 0x01 and k[key.INO_MAJOR_KIND_OFF] == key.TREE_BLOCK_MAP;
+    }
+
+    /// The ino of an ino-major key (a refs key starts with 0x06, a
+    /// separator with 0xFF; an ino below 2^57 starts with 0x00 or 0x01).
+    fn inoMajorIno(k: []const u8) ?u64 {
+        if (k.len <= key.INO_MAJOR_KIND_OFF or k[0] > 0x01) return null;
+        return std.mem.readInt(u64, k[0..8], .big);
     }
 
     /// `tryGet` or `load`, erroring on a retired address — for callers that
@@ -2789,6 +2830,55 @@ test "single-flight collapses racing cold loads: 32 racers, exactly one device r
     try testing.expectEqual(@as(u64, 1), vol.ram.reads.load(.monotonic));
     try testing.expectEqual(misses0 + 1, stats.meta_kv_node_cache_misses.load());
     try testing.expectEqual(hits0 + 31, stats.meta_kv_node_cache_hits.load());
+}
+
+test "probation on a FOREST leaf (header tree id 0): a leaf bounded by kind-7 keys enters the clock with its ref bit CLEAR and counts a leaf read; a leaf bounded by two keys of one ino with no kind-7 end keeps its second chance; a leaf spanning inos is scanned and a kind-7 record inside puts it on probation" {
+    var vol = try Vol.init(4, 8);
+    defer vol.deinit();
+    vol.arm();
+    const gpa = testing.allocator;
+    const point = [_]u8{ 1, 1 } ++ @as([16]u8, @splat(0));
+    // Extent 0: a pure map leaf of ino 5 (keys 5‖07‖0 .. 5‖07‖9).
+    var map_recs = [_]Record{
+        try Record.put(gpa, &(try key.blockMapKey(5, 0)), 1, &point),
+        try Record.put(gpa, &(try key.blockMapKey(5, 9)), 2, &point),
+    };
+    defer rec.deinitRecords(gpa, &map_recs);
+    try vol.writeNode(0, 1, 0, &(try key.blockMapKey(5, 0)), &(try key.blockMapKey(5, 9)), &map_recs);
+    // Extent 1: ino 7's inode and xattr keys only.
+    var ino_recs = [_]Record{try Record.put(gpa, &key.inodeKey(7), 3, &iv(7).encode())};
+    defer rec.deinitRecords(gpa, &ino_recs);
+    try vol.writeNode(1, 2, 0, &key.inodeKey(7), &key.xattrKey(7, 1, 0), &ino_recs);
+    // Extent 2: spans ino 11's inode .. ino 13's inode with 11's map record inside.
+    var mixed = [_]Record{
+        try Record.put(gpa, &key.inodeKey(11), 4, &iv(11).encode()),
+        try Record.put(gpa, &(try key.blockMapKey(11, 3)), 5, &point),
+        try Record.put(gpa, &key.inodeKey(13), 6, &iv(13).encode()),
+    };
+    defer rec.deinitRecords(gpa, &mixed);
+    try vol.writeNode(2, 3, 0, &key.inodeKey(11), &key.inodeKey(13), &mixed);
+    // Extent 3: spans ino 21's inode .. ino 23's inode with no map record.
+    var plain = [_]Record{
+        try Record.put(gpa, &key.inodeKey(21), 7, &iv(21).encode()),
+        try Record.put(gpa, &key.inodeKey(23), 8, &iv(23).encode()),
+    };
+    defer rec.deinitRecords(gpa, &plain);
+    try vol.writeNode(3, 4, 0, &key.inodeKey(21), &key.inodeKey(23), &plain);
+    const reads0 = stats.meta_kv_block_map_leaf_reads.load();
+    const n0 = (try vol.cache.load(Vol.addrOf(0))).?;
+    defer n0.release();
+    try testing.expect(!n0.ref_bit.load(.monotonic));
+    try testing.expectEqual(reads0 + 1, stats.meta_kv_block_map_leaf_reads.load());
+    const n1 = (try vol.cache.load(Vol.addrOf(1))).?;
+    defer n1.release();
+    try testing.expect(n1.ref_bit.load(.monotonic));
+    const n2 = (try vol.cache.load(Vol.addrOf(2))).?;
+    defer n2.release();
+    try testing.expect(!n2.ref_bit.load(.monotonic));
+    const n3 = (try vol.cache.load(Vol.addrOf(3))).?;
+    defer n3.release();
+    try testing.expect(n3.ref_bit.load(.monotonic));
+    try testing.expectEqual(reads0 + 2, stats.meta_kv_block_map_leaf_reads.load());
 }
 
 test "reads proceed while a writer holds the node lock: the snapshot path takes no lock" {

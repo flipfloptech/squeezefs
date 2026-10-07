@@ -856,7 +856,7 @@ pub const Overlay = struct {
     /// owner, the slot vehicle needs the direct leg, the OVERWRITE capture
     /// in ONE (3.5) section with the install (§5.1).
     fn installRecord(self: *Overlay, io: Io, req: StoreRequest) StoreError!?*Record {
-        const pm = enospc.allocatePlacedMint(self.deps.picker, io, self.deps.valve, self.deps.pressure_hook, true) catch |e| switch (e) {
+        const pm = enospc.allocatePlacedMint(self.deps.picker, .{ .ino = req.ino, .block = req.block }, io, self.deps.valve, self.deps.pressure_hook, true) catch |e| switch (e) {
             error.StorageFull => {
                 stats.overlay_enospc_declines.inc();
                 return null;
@@ -1411,7 +1411,7 @@ const TestWorld = struct {
         return w;
     }
 
-    fn pickA(ctx: ?*anyopaque) ?*block_alloc.BlockAllocator {
+    fn pickA(ctx: ?*anyopaque, _: enospc.Place) ?*block_alloc.BlockAllocator {
         return @ptrCast(@alignCast(ctx.?));
     }
 

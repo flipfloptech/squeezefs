@@ -281,6 +281,12 @@ pub const KvBackend = struct {
     pool_owned: bool,
     volume_len: u64,
     sb: superblock.Superblock,
+    /// The DUR-5 generation the next superblock write carries (one past the
+    /// newest valid image at open).
+    sb_generation: u64,
+    /// The capability stampers serialize here (a mount-time class: one
+    /// writer per bit, never on a hot path).
+    sb_lock: Io.Mutex = .init,
     /// The mounted record (its stamp rides every checkpoint record).
     mounted: ledger.LedgerRecord,
     dev: device_loader.DeviceLoader,
@@ -374,11 +380,12 @@ pub const KvBackend = struct {
             log.err("{s}: unknown incompat feature bits {x} — this binary cannot mount it (reformat required)", .{ path, sb.unknownIncompat() });
             return error.UnsupportedFormat;
         }
-        if (sb.features_incompat != 0) {
-            // The four capability bits each name a mechanism of a later
-            // rung (the symmetric plane, layout deltas, the block-map tree,
-            // the volume lifecycle); this rung mounts the one-member forest.
-            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat });
+        if (sb.features_incompat & ~superblock.block_map_tree != 0) {
+            // Of the four capability bits only the block-map tree is
+            // implemented at this rung (the symmetric plane, layout deltas
+            // and the volume lifecycle are later rungs'); this rung mounts
+            // the one-member forest.
+            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat & ~superblock.block_map_tree });
             return error.UnsupportedFormat;
         }
         dev.ledger_base = sb.root_ledger.start;
@@ -436,6 +443,7 @@ pub const KvBackend = struct {
             .pool_owned = opts.pool == null,
             .volume_len = volume_len,
             .sb = sb,
+            .sb_generation = superblock.nextSuperblockGeneration(sector0, backup),
             .mounted = mounted,
             .dev = dev,
             .layout = layout,
@@ -1051,6 +1059,30 @@ pub const KvBackend = struct {
         return be.sb.hash_seed;
     }
 
+    /// The block-map tree's self-arming ratchet (charter §5.6; finding 43):
+    /// stamp `BLOCK_MAP_TREE` at the FIRST crossing — both superblock copies
+    /// at the next generation, each barriered — BEFORE any kind-7 record can
+    /// become durable, so an older binary refuses the volume loud instead of
+    /// reading a map it cannot resolve. Idempotent; an untouched volume
+    /// stays byte-identical. A failed stamp refuses the crossing (the write
+    /// keeps its custody and retries) — never a silent degrade.
+    pub fn stampBlockMapTree(be: *KvBackend) Error!void {
+        if (be.sb.blockMapTreeStamped()) return;
+        be.sb_lock.lockUncancelable(be.io);
+        defer be.sb_lock.unlock(be.io);
+        if (be.sb.blockMapTreeStamped()) return;
+        var sb = be.sb;
+        _ = sb.stampBit(superblock.block_map_tree);
+        const plan = superblock.planWrite(sb, be.sb_generation, null) catch return error.Corrupt;
+        for (plan.slice()) |step| {
+            be.pool.writeAt(be.path, step.offset, plan.bytes()) catch return error.Io;
+            if (step.barrier_after) be.dev.barrier() catch return error.Io;
+        }
+        be.sb = sb;
+        be.sb_generation += 1;
+        log.info("meta volume {s}: BLOCK_MAP_TREE stamped at generation {d} (the first block-map-tree crossing; barriered before any map record)", .{ be.path, plan.generation });
+    }
+
     pub fn nodeSize(be: *const KvBackend) usize {
         return be.sb.node_size;
     }
@@ -1271,6 +1303,31 @@ fn dentryPresent(be: *KvBackend, name: []const u8) !bool {
     const r = tx.dentryChainRange(1, key.dentryNameHash54(name, be.hashSeed()));
     try be.range(testing.allocator, key.TREE_DENTRIES, &r.start, &r.end, 8, &kvs);
     return kvs.items.len != 0;
+}
+
+test "the block-map-tree ratchet: a fresh format carries no bit; the first stamp writes both copies at the next generation and is idempotent; the bit survives close → reopen and the mount accepts it (every other capability bit still refuses)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "kvmap-ratchet", null);
+    defer v.destroy();
+    var gen: u64 = 0;
+    {
+        const be = try v.open();
+        try testing.expect(!be.sb.blockMapTreeStamped());
+        gen = be.sb_generation;
+        try be.stampBlockMapTree();
+        try testing.expect(be.sb.blockMapTreeStamped());
+        try testing.expectEqual(gen + 1, be.sb_generation);
+        try be.stampBlockMapTree();
+        try testing.expectEqual(gen + 1, be.sb_generation);
+        be.close();
+    }
+    {
+        const be = try v.open();
+        try testing.expect(be.sb.blockMapTreeStamped());
+        try testing.expectEqual(superblock.block_map_tree, be.sb.features_incompat);
+        try testing.expectEqual(gen + 1, be.sb_generation);
+        be.close();
+    }
 }
 
 test "format (device path) → open → N creates (singles + a group of 8) → lookup each → checkpointNow → close → reopen: every record present, a clean unmount; the mount is the one-member forest" {

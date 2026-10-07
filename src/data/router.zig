@@ -38,6 +38,8 @@ const log = @import("../core/log.zig");
 const key = @import("../meta/key.zig");
 const inos = @import("../meta/inos.zig");
 const ledger = @import("../meta/ledger.zig");
+const record = @import("../meta/record.zig");
+const dlm = @import("../meta/dlm.zig");
 const arc_swap = @import("../sync/arc_swap.zig");
 const jc = @import("../meta/journal_core.zig");
 
@@ -350,6 +352,42 @@ pub const Placement = struct {
         return a.value.eligible_count == eligible_now;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Stripe-unit placement (block_map_tree.md §8 Q8, option A).
+// ---------------------------------------------------------------------------
+
+/// A striped file's blocks are placed in STRIPE UNITS: `stripeUnitBlocks`
+/// consecutive block indices of one file land on ONE volume (the unit's
+/// index rotates the choice), so a sequential stream's inserts are offset-
+/// consecutive on one volume under the allocator's "lowest clear run at/
+/// above the frontier" carve and the merge emits RUN records straight from
+/// its window — no post-hoc canonicalizer, no whole-map pass. Per-block
+/// round-robin can never form a run on a set of ≥ 2 volumes.
+///
+/// `clamp(RUN_LEN_MAX / eligible, 16, 256)`: the ceiling keeps one unit at
+/// 1/16 of a run's span, so the longest run a stream can emit stays far
+/// inside the floor probe's bound while every volume still sees a share of
+/// a stream shorter than 16 units; the floor of 16 blocks (64 MiB at 4 MiB)
+/// keeps one stream's device parallelism across `eligible` volumes — the
+/// prefetch pipeline's K = 4 offset lanes already parallelize ACROSS blocks,
+/// so per-unit spread costs the read side nothing it had.
+pub const STRIPE_UNIT_MIN_BLOCKS: u32 = 16;
+pub const STRIPE_UNIT_MAX_BLOCKS: u32 = 256;
+
+pub fn stripeUnitBlocks(eligible_volumes: u32) u32 {
+    const share = record.RUN_LEN_MAX / @max(eligible_volumes, 1);
+    return std.math.clamp(share, STRIPE_UNIT_MIN_BLOCKS, STRIPE_UNIT_MAX_BLOCKS);
+}
+
+/// The unit's volume among `eligible` (a dense ordinal into the caller's
+/// eligible list): the file's hash spreads files, the unit index rotates
+/// a file's units round-robin over the set.
+pub fn stripeUnitChoice(ino: u64, block: u32, eligible_volumes: u32) u32 {
+    assert(eligible_volumes != 0);
+    const unit: u64 = block / stripeUnitBlocks(eligible_volumes);
+    return @intCast((dlm.splitmix64(ino) +% unit) % eligible_volumes);
+}
 
 // ---------------------------------------------------------------------------
 // §5.3 Metadata volume health, the mint volume, the mint rotor.
@@ -805,6 +843,30 @@ test "the router: registration publishes the table LAST; picks are table-only; a
     try writeStatsJson(&w);
     try testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"backend_placement_picks\":"));
     try testing.expect(std.mem.endsWith(u8, w.buffered(), "}"));
+}
+
+test "stripe-unit tie: clamp(RUN_LEN_MAX / eligible, 16, 256) — 256 up to 16 volumes, 64 at 64, the 16-block floor from 256 volumes on; a file's consecutive blocks share one volume for a whole unit and the units rotate over the set; two files spread" {
+    try testing.expectEqual(@as(u32, 256), stripeUnitBlocks(1));
+    try testing.expectEqual(@as(u32, 256), stripeUnitBlocks(2));
+    try testing.expectEqual(@as(u32, 256), stripeUnitBlocks(16));
+    try testing.expectEqual(@as(u32, 128), stripeUnitBlocks(32));
+    try testing.expectEqual(@as(u32, 64), stripeUnitBlocks(64));
+    try testing.expectEqual(@as(u32, 16), stripeUnitBlocks(256));
+    try testing.expectEqual(@as(u32, 16), stripeUnitBlocks(1000));
+    try testing.expectEqual(@as(u32, 256), stripeUnitBlocks(0));
+    // Every block of unit 0 of ino 7 on one volume; unit 1 on the next.
+    const n: u32 = 2;
+    const k = stripeUnitBlocks(n);
+    const first = stripeUnitChoice(7, 0, n);
+    var b: u32 = 0;
+    while (b < k) : (b += 1) try testing.expectEqual(first, stripeUnitChoice(7, b, n));
+    try testing.expectEqual((first + 1) % n, stripeUnitChoice(7, k, n));
+    try testing.expectEqual(first, stripeUnitChoice(7, 2 * k, n));
+    // Over 64 files, both volumes take unit 0 of some.
+    var seen: [2]u32 = @splat(0);
+    var ino: u64 = 2;
+    while (ino < 66) : (ino += 1) seen[stripeUnitChoice(ino, 0, n)] += 1;
+    try testing.expect(seen[0] > 0 and seen[1] > 0);
 }
 
 test "mint ties: W = 2^16; MINT_SPREAD = STAMP_MAX_CURSORS / 4 = 64; volume health = free/total × 1000 (0 disabled); pick_mint_volume keeps the 9/10 band and round-robins it; the rotor rotates over the first 64 hosted slots and the ino round-trips through the lane arithmetic" {

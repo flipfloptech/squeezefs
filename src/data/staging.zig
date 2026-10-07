@@ -1201,8 +1201,15 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
     /// `capacity` — NEVER shrink (a mapper past the new end would SIGBUS,
     /// FIND-VS-A) — and map it shared read/write.
     pub fn openSegment(root_fd: linux.fd_t, name: [:0]const u8, capacity: u64) Error!MappedSegment {
+        return openSegmentIn(root_fd, SEGMENT_DIR, name, capacity);
+    }
+
+    /// `openSegment` under another segment dir of the same root (the NVMe
+    /// read cache's `cache_segment/` shares the staging root's identity,
+    /// modes and never-shrink law).
+    pub fn openSegmentIn(root_fd: linux.fd_t, segment_dir: [:0]const u8, name: [:0]const u8, capacity: u64) Error!MappedSegment {
         assert(derive.isAligned(capacity, RECORD_ALIGN));
-        const dir = linux.openat(root_fd, SEGMENT_DIR, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        const dir = linux.openat(root_fd, segment_dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
         if (linux.errno(dir) != .SUCCESS) return error.OpenFailed;
         defer _ = linux.close(@intCast(dir));
         const rc = linux.openat(@intCast(dir), name, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .CLOEXEC = true }, FILE_MODE);

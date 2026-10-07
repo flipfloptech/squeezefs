@@ -107,8 +107,27 @@ pub const data = struct {
     pub const transform = @import("data/transform.zig");
     pub const set_config = @import("data/set_config.zig");
     pub const data_superblock = @import("data/data_superblock.zig");
-    // @anchor:data_write_import
-    // @anchor:data_read_import
+    pub const write_admit = @import("data/write_admit.zig");
+    pub const write_side_view = @import("data/write_side_view.zig");
+    pub const device_overlay = @import("data/device_overlay.zig");
+    pub const patch_w1 = @import("data/patch_w1.zig");
+    pub const accumulate = @import("data/accumulate.zig");
+    pub const extent_overlay = @import("data/extent_overlay.zig");
+    pub const write_pipeline = @import("data/write_pipeline.zig");
+    pub const writeback = @import("data/writeback.zig");
+    pub const fsync = @import("data/fsync.zig");
+    pub const read_size_class = @import("data/read_size_class.zig");
+    pub const read_fill_pool = @import("data/read_fill_pool.zig");
+    pub const hot_tier = @import("data/hot_tier.zig");
+    pub const read_lru = @import("data/read_lru.zig");
+    pub const read_hold = @import("data/read_hold.zig");
+    pub const nvme_read_cache = @import("data/nvme_read_cache.zig");
+    pub const purge = @import("data/purge.zig");
+    pub const single_flight_fill = @import("data/single_flight_fill.zig");
+    pub const admission = @import("data/admission.zig");
+    pub const prefetch = @import("data/prefetch.zig");
+    pub const read_path = @import("data/read_path.zig");
+    pub const warm_ladder = @import("data/warm_ladder.zig");
 };
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
@@ -147,8 +166,27 @@ test {
     _ = data.transform;
     _ = data.set_config;
     _ = data.data_superblock;
-    // @anchor:data_write_test
-    // @anchor:data_read_test
+    _ = data.write_admit;
+    _ = data.write_side_view;
+    _ = data.device_overlay;
+    _ = data.patch_w1;
+    _ = data.accumulate;
+    _ = data.extent_overlay;
+    _ = data.write_pipeline;
+    _ = data.writeback;
+    _ = data.fsync;
+    _ = data.read_size_class;
+    _ = data.read_fill_pool;
+    _ = data.hot_tier;
+    _ = data.read_lru;
+    _ = data.read_hold;
+    _ = data.nvme_read_cache;
+    _ = data.purge;
+    _ = data.single_flight_fill;
+    _ = data.admission;
+    _ = data.prefetch;
+    _ = data.read_path;
+    _ = data.warm_ladder;
     _ = exec;
     _ = fuse.abi;
     _ = fuse.codec;

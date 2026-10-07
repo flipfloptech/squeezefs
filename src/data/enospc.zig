@@ -279,19 +279,27 @@ pub const PressureSupplyHook = struct {
 
 pub const PlacedError = AllocError || error{NoHealthyBackends};
 
+/// A placed mint WITH the allocator that minted it (the write path binds
+/// the destination to its volume).
+pub const PlacedMint = struct { alloc: *BlockAllocator, minted: Minted };
+
 /// `allocate_placed_block`: pick + the grace-bounded mint on the ONE picked
 /// volume; a `StorageFull` runs the pressure-supply hook and retries the
 /// mint ONCE with a fresh pick. The `under_guard` form (a caller holding a
 /// level-3.5 stripe or a 4a guard) skips the hook — the lock law.
-pub fn allocatePlaced(picker: Picker, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!Minted {
+pub fn allocatePlacedMint(picker: Picker, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!PlacedMint {
     const first = picker.pick(picker.ctx) orelse return error.NoHealthyBackends;
-    const err = if (allocateBlockGraceBounded(first, io, valve, false, null)) |m| return m else |e| e;
+    const err = if (allocateBlockGraceBounded(first, io, valve, false, null)) |m| return .{ .alloc = first, .minted = m } else |e| e;
     if (err != error.StorageFull) return err;
     if (!under_guard) {
         if (hook) |h| _ = h.run(h.ctx);
     }
     const second = picker.pick(picker.ctx) orelse return error.NoHealthyBackends;
-    return allocateBlockGraceBounded(second, io, valve, false, null);
+    return .{ .alloc = second, .minted = try allocateBlockGraceBounded(second, io, valve, false, null) };
+}
+
+pub fn allocatePlaced(picker: Picker, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!Minted {
+    return (try allocatePlacedMint(picker, io, valve, hook, under_guard)).minted;
 }
 
 // ---------------------------------------------------------------------------

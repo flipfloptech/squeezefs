@@ -1,0 +1,350 @@
+//! The ONE Linux end-to-end of the write path over a real `nvme_dev.Device`
+//! on a `/build/tmp` file (O_DIRECT, the io_uring write lanes, the DUR-2
+//! barrier): the device seam is the product binding, the block-map
+//! authority and the frees ledger are the RAM fakes (the KV layout publish
+//! binds in wave 4). Rows: a 4 MiB sequential write (write-through: 1 copy
+//! + 1 DMA counted); 4 KiB random overwrites on a published block (W1
+//! engaged, `patch_edge_rmw_reads == 0`, zero device reads); out-of-order
+//! O_DIRECT-style pieces (the coverage union completes, one upload, no seed
+//! read); a partial tail (staging absorbs the spill; the flush unit DMAs
+//! straight off the ring); fsync phases summing exactly; a torn DMA (the
+//! device's injected EIO) never joining coverage.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const linux = std.os.linux;
+const assert = std.debug.assert;
+
+const counters = @import("../core/counters.zig");
+const derive = @import("../core/derive.zig");
+const log = @import("../core/log.zig");
+const nvme_dev = @import("../io/nvme_dev.zig");
+const layout = @import("layout.zig");
+const staging = @import("staging.zig");
+const block_alloc = @import("block_alloc.zig");
+const seams = @import("write_seams.zig");
+const write_admit = @import("write_admit.zig");
+const accumulate = @import("accumulate.zig");
+const patch_w1 = @import("patch_w1.zig");
+const device_overlay = @import("device_overlay.zig");
+const extent = @import("extent_overlay.zig");
+const writeback = @import("writeback.zig");
+const fsync_mod = @import("fsync.zig");
+const pipeline = @import("write_pipeline.zig");
+const wt = @import("write_testing.zig");
+
+comptime {
+    assert(builtin.is_test and builtin.os.tag == .linux);
+}
+
+const testing = std.testing;
+const BS: u64 = 4 * derive.MiB;
+const PAGE: u32 = seams.PAGE;
+const VOL: u64 = 0xE2E;
+
+/// The product binding of the device seam over ONE `nvme_dev.Device`.
+const NvmeSeam = struct {
+    dev: *nvme_dev.Device,
+
+    fn seam(self: *NvmeSeam) seams.DeviceSeam {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable: seams.DeviceSeam.VTable = .{ .write = &write, .write_fixed = null, .read = &read, .flush = &flush };
+
+    fn mapErr(e: nvme_dev.DeviceError) seams.DmaError {
+        return switch (e) {
+            error.NoSpaceLeft => error.NoSpaceLeft,
+            error.QueueFull, error.LaneQueueFull => error.QueueFull,
+            error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
+            error.VolumeFailed => error.VolumeFailed,
+            error.WriterGuardFenced, error.ReservationConflict, error.DismountRefused => error.WriterGuardFenced,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InputOutput,
+        };
+    }
+
+    fn write(ctx: *anyopaque, _: u64, offset: u64, data: []const u8) seams.DmaError!void {
+        const self: *NvmeSeam = @ptrCast(@alignCast(ctx));
+        self.dev.writeBlock(offset, data) catch |e| return mapErr(e);
+    }
+
+    fn read(ctx: *anyopaque, _: u64, offset: u64, out: []u8) seams.ReadError!void {
+        const self: *NvmeSeam = @ptrCast(@alignCast(ctx));
+        const buf = self.dev.readBlock(offset, out.len) catch |e| return switch (e) {
+            error.ShortRead => error.ShortRead,
+            error.QueueFull, error.LaneQueueFull => error.QueueFull,
+            error.WorkerShutdown, error.WorkerClosed, error.LaneStopped => error.WorkerShutdown,
+            error.VolumeFailed => error.VolumeFailed,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InputOutput,
+        };
+        defer buf.release();
+        @memcpy(out, buf.bytes()[0..out.len]);
+    }
+
+    fn flush(ctx: *anyopaque, _: u64) seams.DmaError!void {
+        const self: *NvmeSeam = @ptrCast(@alignCast(ctx));
+        self.dev.flush() catch |e| return mapErr(e);
+    }
+};
+
+const E2E = struct {
+    path_buf: [96]u8 = undefined,
+    path: [:0]const u8 = "",
+    file: std.Io.File = undefined,
+    dev: *nvme_dev.Device = undefined,
+    nseam: NvmeSeam = undefined,
+    alloc: *block_alloc.BlockAllocator = undefined,
+    vols: seams.Volumes = .{},
+    map: wt.RamMap = undefined,
+    frees: wt.RamFrees = undefined,
+    stripes: layout.MetaStripes = .{},
+    wp: *write_admit.WritePath = undefined,
+
+    var seq: std.atomic.Value(u32) = .init(0);
+
+    fn init(self: *E2E, gpa: Allocator, overlay_on: bool) !void {
+        const dir: []const u8 = blk: {
+            std.Io.Dir.accessAbsolute(testing.io, "/build/tmp", .{}) catch {
+                std.Io.Dir.accessAbsolute(testing.io, "/build", .{}) catch break :blk "/tmp";
+                break :blk "/build";
+            };
+            break :blk "/build/tmp";
+        };
+        self.path = try std.mem.printSentinel(&self.path_buf, "{s}/sqz-write-e2e-{d}-{d}.img", .{ dir, linux.getpid(), seq.fetchAdd(1, .monotonic) }, 0);
+        self.file = try std.Io.Dir.createFileAbsolute(testing.io, self.path, .{ .read = true, .truncate = true });
+        const capacity = 64 * derive.MiB;
+        try self.file.setLength(testing.io, capacity);
+        self.dev = try nvme_dev.Device.open(gpa, self.path);
+        self.nseam = .{ .dev = self.dev };
+        self.alloc = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = VOL, .vol = 0, .block_size = BS, .capacity_bytes = capacity });
+        self.vols = .{};
+        self.vols.add(.{ .vol_tag = VOL, .ordinal = 0, .alloc = self.alloc, .passthrough = true, .write_cache_volatile = true });
+        self.map = wt.RamMap.init(gpa);
+        self.map.chunk = BS;
+        self.frees = wt.RamFrees.init(gpa, &self.vols);
+        self.stripes = .{};
+        const cfg: write_admit.Config = .{
+            .block_size = BS,
+            .patch_max = patch_w1.patchMaxDerived(BS),
+            .overlay = .{ .block_size = BS, .patch_max = patch_w1.patchMaxDerived(BS), .enabled = overlay_on },
+            .rewrite_shadow = true,
+            .fold_max_extents = extent.foldMaxExtentsDerived(BS),
+            .fold_max_bytes = extent.foldMaxBytesDerived(BS),
+            .parked_cap = 8,
+            .depth_override = .sync_inline,
+            .fsync = .{},
+        };
+        self.wp = try write_admit.WritePath.init(gpa, cfg, .{ .io = testing.io, .vols = &self.vols, .device = self.nseam.seam(), .map = self.map.seam(), .free = self.frees.seam(), .stripes = &self.stripes, .budget_bytes = 1 * derive.GiB });
+    }
+
+    fn deinit(self: *E2E) void {
+        self.wp.deinit(testing.io);
+        self.frees.deinit();
+        self.map.deinit();
+        self.alloc.deinit();
+        self.dev.deinit();
+        self.file.close(testing.io);
+        std.Io.Dir.deleteFileAbsolute(testing.io, self.path) catch {};
+    }
+
+    fn striped(size: u64) seams.FileView {
+        return .{ .kind = .striped, .size = size, .map_resident = true };
+    }
+
+    /// The page-cache view after O_DIRECT writes (the completion invalidated it).
+    fn readAt(self: *E2E, buf: []u8, offset: u64) !void {
+        const n = try self.file.readPositionalAll(testing.io, buf, offset);
+        try testing.expectEqual(buf.len, n);
+    }
+};
+
+fn fillPattern(buf: []u8, seed: u64) void {
+    for (buf, 0..) |*b, i| b.* = @truncate(((seed + i) *% 2654435761) >> 24);
+}
+
+fn expectPattern(buf: []const u8, seed: u64) !void {
+    for (buf, 0..) |b, i| {
+        const want: u8 = @truncate(((seed + i) *% 2654435761) >> 24);
+        if (b != want) return error.TestExpectedEqual;
+    }
+}
+
+test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1 DMA; 4 KiB random overwrites patch in place (W1: patch_writes == ops, zero reads, patch_edge_rmw_reads == 0); out-of-order pieces complete the union with one upload; a partial tail spills to staging and the flush unit DMAs straight off the ring; fsync phases sum exactly; a torn DMA never joins coverage" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var e: E2E = .{};
+    e.init(gpa, false) catch |err| switch (err) {
+        error.DirectIoUnsupported, error.DirectOpenRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e.deinit();
+    const payload = try gpa.alignedAlloc(u8, .fromByteUnits(PAGE), BS);
+    defer gpa.free(payload);
+    const got = try gpa.alloc(u8, BS);
+    defer gpa.free(got);
+    const fence0 = counters.tripwireCount("overlay_fence_drops");
+    const unpub0 = counters.tripwireCount("overlay_unpublished_at_fsync");
+
+    // Row 1: 4 MiB sequential as the kernel's four 1 MiB pieces, in order.
+    try e.map.create(1, .striped, 0);
+    fillPattern(payload, 1);
+    const copies0 = accumulate.stats.nt_copy_bytes.load();
+    const wt0 = accumulate.stats.write_through_blocks.load();
+    const puts0 = nvme_dev.stats.put_obj.load();
+    var piece: u64 = 0;
+    while (piece < 4) : (piece += 1) {
+        const o = try e.wp.write(io, .{ .ino = 1, .offset = piece * derive.MiB, .payload = .{ .bytes = payload[piece * derive.MiB .. (piece + 1) * derive.MiB] }, .class = .entire_op, .file = E2E.striped(piece * derive.MiB) });
+        try testing.expectEqual(derive.MiB, o.written);
+    }
+    try testing.expectEqual(copies0 + BS, accumulate.stats.nt_copy_bytes.load()); // ONE userspace copy
+    try testing.expectEqual(wt0 + 1, accumulate.stats.write_through_blocks.load());
+    try testing.expectEqual(puts0 + 1, nvme_dev.stats.put_obj.load()); // ONE DMA
+    const b1 = e.map.seam().lookup(1, 0).?;
+    try e.readAt(got, b1.offset);
+    try expectPattern(got, 1);
+
+    // Row 2: 4 KiB random overwrites on the published block ride W1.
+    const patches0 = patch_w1.stats.patch_writes.load();
+    const gets0 = nvme_dev.stats.get_obj.load();
+    var page: [PAGE]u8 align(4096) = undefined;
+    const offsets = [_]u64{ 37, 3, 900, 512, 1023, 64, 37 };
+    for (offsets, 0..) |pg, i| {
+        fillPattern(&page, 1000 + i);
+        const o = try e.wp.write(io, .{ .ino = 1, .offset = pg * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = E2E.striped(BS) });
+        try testing.expectEqual(@as(u32, 1), o.count(.patch));
+    }
+    try testing.expectEqual(patches0 + offsets.len, patch_w1.stats.patch_writes.load());
+    try testing.expectEqual(gets0, nvme_dev.stats.get_obj.load()); // zero device reads
+    try testing.expectEqual(@as(u64, 0), counters.tripwireCount("patch_edge_rmw_reads"));
+    try testing.expect(e.map.seam().lookup(1, 0).?.eql(b1)); // in place: the binding did not move
+    try e.readAt(got, b1.offset);
+    try expectPattern(got[37 * PAGE .. 38 * PAGE], 1000 + 6); // the last write to page 37 won
+    try expectPattern(got[3 * PAGE .. 4 * PAGE], 1001);
+    try expectPattern(got[38 * PAGE .. 39 * PAGE], 1 + 38 * PAGE); // a neighbour untouched
+
+    // Row 3: out-of-order O_DIRECT-style pieces (end first, middle last) — one upload, no seed read.
+    try e.map.create(2, .striped, 0);
+    fillPattern(payload, 2);
+    const reads_before = nvme_dev.stats.get_obj.load();
+    const wt1 = accumulate.stats.write_through_blocks.load();
+    _ = try e.wp.write(io, .{ .ino = 2, .offset = 3 * derive.MiB, .payload = .{ .bytes = payload[3 * derive.MiB ..] }, .class = .entire_op, .file = E2E.striped(0) });
+    _ = try e.wp.write(io, .{ .ino = 2, .offset = 0, .payload = .{ .bytes = payload[0..derive.MiB] }, .class = .entire_op, .file = E2E.striped(BS) });
+    const o3 = try e.wp.write(io, .{ .ino = 2, .offset = derive.MiB, .payload = .{ .bytes = payload[derive.MiB .. 3 * derive.MiB] }, .class = .entire_op, .file = E2E.striped(BS) });
+    try testing.expectEqual(@as(u32, 1), o3.count(.write_through));
+    try testing.expectEqual(wt1 + 1, accumulate.stats.write_through_blocks.load());
+    try testing.expectEqual(reads_before, nvme_dev.stats.get_obj.load());
+    try e.readAt(got, e.map.seam().lookup(2, 0).?.offset);
+    try expectPattern(got, 2);
+
+    // Row 4: a partial tail parks; the spill stages it (no DMA); the flush unit DMAs straight off the ring.
+    try e.map.create(3, .striped, 0);
+    const tail_len: usize = 1_000_000;
+    fillPattern(payload[0..tail_len], 3);
+    const o4 = try e.wp.write(io, .{ .ino = 3, .offset = 0, .payload = .{ .bytes = payload[0..tail_len] }, .class = .entire_op, .file = E2E.striped(0) });
+    try testing.expectEqual(@as(u32, 1), o4.count(.extent) + o4.count(.accumulate_park)); // < a quarter block: W2 parks it compactly
+    try testing.expect(e.wp.table.has(3, 0));
+    const image = try gpa.alignedAlloc(u8, .fromByteUnits(PAGE), 16 * BS);
+    defer gpa.free(image);
+    @memset(image, 0);
+    var seg = try staging.Segment.init(gpa, image, .none);
+    defer seg.deinit();
+    var pool = staging.Pool.init(gpa, 8 * BS, .none);
+    defer pool.deinit();
+    var worker = try writeback.Worker.init(gpa, 4);
+    defer worker.deinit();
+    const wb_deps: writeback.Deps = .{ .device = e.nseam.seam(), .map = e.map.seam(), .free = e.frees.seam(), .purge = .none, .vols = &e.vols, .picker = e.wp.picker.picker(), .locks = &e.wp.locks, .stripes = &e.stripes, .pool = &pool, .seg = &seg };
+    const puts_spill0 = nvme_dev.stats.put_obj.load();
+    try writeback.spillParkedBlock(&e.wp.table, wb_deps, io, &worker, 3, 0);
+    try testing.expect(!e.wp.table.has(3, 0));
+    try testing.expectEqual(puts_spill0, nvme_dev.stats.put_obj.load()); // the spill is no DMA
+    try testing.expectEqual(@as(u32, 1), worker.drainOnce(io, wb_deps));
+    try testing.expectEqual(puts_spill0 + 1, nvme_dev.stats.put_obj.load()); // ONE DMA off the ring
+    const b3 = e.map.seam().lookup(3, 0).?;
+    try e.readAt(got, b3.offset);
+    try expectPattern(got[0..tail_len], 3);
+    try testing.expect(std.mem.allEqual(u8, got[tail_len..], 0)); // the zero-completed complement
+    try testing.expectEqual(@as(u64, 0), pool.currentBytes());
+
+    // Row 5: fsync of a file with a parked partial block — the phases sum exactly, the barrier is one data flush.
+    try e.map.create(4, .striped, 0);
+    _ = try e.wp.write(io, .{ .ino = 4, .offset = 0, .payload = .{ .bytes = payload[0..tail_len] }, .class = .entire_op, .file = E2E.striped(0) });
+    const syncs0 = nvme_dev.stats.data_device_syncs.load();
+    var prof = fsync_mod.Prof.start();
+    try fsync_mod.fsync(e.wp.fsyncCtx(), io, 4, &prof);
+    prof.finish();
+    var sum: u64 = 0;
+    for (prof.legs) |l| sum += l;
+    try testing.expectEqual(prof.total(), sum);
+    try testing.expectEqual(syncs0 + 1, nvme_dev.stats.data_device_syncs.load());
+    try testing.expect(!e.wp.table.has(4, 0));
+    try testing.expect(e.map.seam().lookup(4, 0) != null);
+
+    // Row 6: a torn DMA (injected EIO) on a W1 patch: EIO for that write, the block re-stabilized, bytes intact.
+    e.dev.setFailNextWritesErrno(1, .IO);
+    fillPattern(&page, 7777);
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.InputOutput, e.wp.write(io, .{ .ino = 1, .offset = 5 * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = E2E.striped(BS) }));
+    try log.testing.expectAllFired();
+    try testing.expect(block_alloc.Incarnation.isStable(e.alloc.incarnationWord(e.alloc.idxOf(b1.offset))));
+    try e.readAt(got, b1.offset);
+    try expectPattern(got[5 * PAGE .. 6 * PAGE], 1 + 5 * PAGE);
+    try testing.expectEqual(fence0, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
+}
+
+test "e2e(nvme_dev): the overlay arm — four 1 MiB page-aligned pieces of a fresh block ride the overlay with ZERO userspace copies and four DMAs; the drain publishes once; an aligned 1 MiB overwrite of the published block installs an overwrite record, seeds the gaps RANGED and feeds the epoch" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var e: E2E = .{};
+    e.init(gpa, true) catch |err| switch (err) {
+        error.DirectIoUnsupported, error.DirectOpenRefused => return error.SkipZigTest,
+        else => return err,
+    };
+    defer e.deinit();
+    const payload = try gpa.alignedAlloc(u8, .fromByteUnits(PAGE), BS);
+    defer gpa.free(payload);
+    const got = try gpa.alloc(u8, BS);
+    defer gpa.free(got);
+    const fence0 = counters.tripwireCount("overlay_fence_drops");
+    try e.map.create(1, .striped, 0);
+    fillPattern(payload, 11);
+    const copies0 = accumulate.stats.nt_copy_bytes.load();
+    const puts0 = nvme_dev.stats.put_obj.load();
+    const stores0 = device_overlay.stats.overlay_store_bytes.load();
+    var piece: u64 = 0;
+    while (piece < 4) : (piece += 1) {
+        const o = try e.wp.write(io, .{ .ino = 1, .offset = piece * derive.MiB, .payload = .{ .bytes = payload[piece * derive.MiB .. (piece + 1) * derive.MiB] }, .class = .entire_op, .file = E2E.striped(piece * derive.MiB) });
+        try testing.expectEqual(@as(u32, 1), o.count(.overlay));
+    }
+    e.wp.quiesce(io);
+    try testing.expectEqual(copies0, accumulate.stats.nt_copy_bytes.load()); // zero daemon copies
+    try testing.expectEqual(puts0 + 4, nvme_dev.stats.put_obj.load());
+    try testing.expectEqual(stores0 + BS, device_overlay.stats.overlay_store_bytes.load());
+    try testing.expect(!e.wp.overlay.anyOpenFast());
+    const b1 = e.map.seam().lookup(1, 0).?;
+    try e.readAt(got, b1.offset);
+    try expectPattern(got, 11);
+    // The overwrite: one aligned 1 MiB piece into the mapped block.
+    fillPattern(payload[0..derive.MiB], 12);
+    const ranged0 = device_overlay.stats.overlay_gap_seed_ranged_bytes.load();
+    const feeds0 = device_overlay.stats.overlay_epoch_feeds.load();
+    const o = try e.wp.write(io, .{ .ino = 1, .offset = derive.MiB, .payload = .{ .bytes = payload[0..derive.MiB] }, .class = .shared, .file = E2E.striped(BS) });
+    try testing.expectEqual(@as(u32, 1), o.count(.overlay));
+    try testing.expect(e.wp.overlay.hasCustody(1, 0));
+    // Release-class drain: seeds the 3 MiB of gaps ranged, feeds the epoch; the close publishes.
+    e.wp.flushIno(io, 1);
+    try testing.expectEqual(ranged0 + 3 * derive.MiB, device_overlay.stats.overlay_gap_seed_ranged_bytes.load());
+    try testing.expectEqual(feeds0 + 1, device_overlay.stats.overlay_epoch_feeds.load());
+    const b2 = e.map.seam().lookup(1, 0).?;
+    try testing.expect(!b2.eql(b1)); // a fresh destination, never in place
+    try e.readAt(got, b2.offset);
+    try expectPattern(got[0..derive.MiB], 11);
+    try expectPattern(got[derive.MiB .. 2 * derive.MiB], 12);
+    try expectPattern(got[2 * derive.MiB ..], 11 + 2 * derive.MiB);
+    try testing.expectEqual(@as(usize, 1), e.frees.freed.items.len); // the displaced A key freed after the save
+    try testing.expectEqual(fence0, counters.tripwireCount("overlay_fence_drops"));
+}

@@ -1471,6 +1471,54 @@ pub const Device = struct {
         }
     }
 
+    /// The caller-dest read (rung 4's ranged window and whole-block fill
+    /// into the read fill pool / the registered reply window): exactly
+    /// `dest.len` bytes at `offset` DMA'd into `dest` — a 4 KiB-aligned
+    /// pointer, length and offset (the O_DIRECT grain; refused otherwise).
+    /// No bounce, no pool buffer (`Buf.Kind.none`): the caller's slice is
+    /// the keep-alive, parked for the whole op. Counted in `get_obj`.
+    pub fn readInto(self: *Device, offset: u64, dest: []u8) DeviceError!void {
+        if (dest.len == 0) return;
+        if (!nd.isDmaAligned(dest) or !derive.isAligned(offset, nd.dma_align)) return error.UnalignedDirectWrite;
+        const lane = self.readLanePick();
+        const idx = lane.acquireCell() orelse {
+            stats.uring_queue_full.inc();
+            return error.QueueFull;
+        };
+        const c = &lane.cells[idx];
+        c.op = .read;
+        c.offset = offset;
+        c.dma_ptr = dest.ptr;
+        c.dma_len = dest.len;
+        c.buf = .empty;
+        c.enq_ns.store(clock.monotonicNs(), .monotonic);
+        if (!lane.submit(idx)) {
+            lane.freeCell(idx);
+            stats.uring_queue_full.inc();
+            return error.QueueFull;
+        }
+        const outcome = lane.wait(idx);
+        defer lane.freeCell(idx);
+        const res = switch (outcome) {
+            .shutdown => return error.WorkerShutdown,
+            .sq_full => return error.SubmissionQueueOverflow,
+            .ring_failed => return error.RingFailed,
+            .io => |res| res,
+        };
+        if (res < 0) {
+            const e: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
+            self.classifyDmaOutcome(e);
+            return nd.errnoToError(e);
+        }
+        switch (nd.finishRead(@intCast(res), dest.len)) {
+            .full => stats.get_obj.inc(),
+            .short => |got| {
+                log.debug("short read: kernel returned {d} of {d} bytes at offset {d} on {s}", .{ got, dest.len, offset, self.path });
+                return error.ShortRead;
+            },
+        }
+    }
+
     // ---- flush / barrier (spec §4) ----
 
     /// The DUR-2 barrier: drain every write lane's watermark, then ONE

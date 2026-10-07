@@ -2198,7 +2198,8 @@ pub const DataPlane = struct {
                 return want;
             },
             .settle => {
-                if (self.wp.overlay.registry.get(.{ .ino = ino, .block = b })) |rec| _ = self.wp.overlay.settleWriteArm(self.io, rec, false);
+                // The serialized settle: under (3), on the write arm's ladder.
+                self.wp.overlay.drainBlock(self.io, &self.wp.locks, ino, b, false, self.wp.closeSeams());
                 return null;
             },
             .none => return null,

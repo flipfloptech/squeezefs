@@ -608,15 +608,20 @@ pub const WritePath = struct {
         };
     }
 
-    /// Under (3), THIS order (every exit drops the guard).
+    /// Under (3), THIS order (every exit drops the guard). The ladder
+    /// RESTARTS from A when the one-authority screen (C) meets a record it
+    /// cannot settle in one attempt: the guard is dropped, the record
+    /// settled on the write arm's own ladder, the guard re-taken — never a
+    /// backoff park under (3).
     fn admitPiece(self: *WritePath, io: Io, req: Request, file: seams.FileView, pc: Piece, bytes: *?[]const u8, try_patch: bool, overlay_shape: bool, stream_adjacent: bool) Error!Arm {
         const bs = self.cfg.block_size;
         var hint: enum { none, overlay_drain, upload, fold } = .none;
         var upload_permit: ?pipeline.Permit = null;
         var prof = pipeline.Prof.start();
-        const arm: Arm = blk: {
+        const arm: Arm = blk: while (true) {
             const g = self.locks.acquire(io, req.ino, pc.block, .write_checkout);
-            defer g.release(io);
+            var held = true;
+            defer if (held) g.release(io);
             prof.mark(.lock_wait);
             // A. W1.
             if (try_patch) {
@@ -641,7 +646,14 @@ pub const WritePath = struct {
             }
             // C. The one-authority screen: a record on the block settles first.
             if (self.overlay.anyOpenFast()) {
-                if (self.overlay.registry.get(.{ .ino = req.ino, .block = pc.block })) |rec| _ = self.overlay.settleWriteArm(io, rec, false);
+                if (self.overlay.registry.get(.{ .ino = req.ino, .block = pc.block })) |rec| {
+                    if (self.overlay.settleOnceLocked(io, rec, false) == .transient) {
+                        held = false;
+                        g.release(io);
+                        _ = self.overlay.settleWriteArm(io, &self.locks, req.ino, pc.block, false);
+                        continue;
+                    }
+                }
             }
             // D. Live existing-bytes re-derivation under the guard, from the
             //    write-side authority (module doc: the arm gate).
@@ -1167,6 +1179,57 @@ test "the save window: while an epoch's ONE save is in flight the block stays bo
     try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
     try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
     try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
+}
+
+test "the one-authority screen never parks under (3): a write meeting an overlay record whose settle keeps failing drops the block guard for the settle's ladder (a sibling takes the guard mid-ladder) and restarts its ladder once the record landed — the write acks, the record published" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(70, .striped, 0);
+    // An open record with half the block covered (the gap seed is the leg
+    // that will keep failing).
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&half, 7);
+    const o1 = try w.wp.write(io, .{ .ino = 70, .offset = 0, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(0) });
+    try testing.expectEqual(@as(u32, 1), o1.count(.overlay));
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    const r0 = device_overlay.stats.overlay_settle_retries.load();
+    const pub0 = device_overlay.stats.overlay_publishes.load();
+    // A page-misaligned piece: overlay-ineligible, patch-ineligible — it
+    // reaches the one-authority screen and must settle the record first.
+    const Writer = struct {
+        fn run(world: *World, io_: Io, out: *?Outcome) void {
+            var small: [PAGE + 12]u8 = undefined;
+            fill(&small, 9);
+            out.* = world.wp.write(io_, .{ .ino = 70, .offset = wt.BS / 2 + 100, .payload = .{ .bytes = &small }, .class = .entire_op, .file = World.striped(wt.BS / 2) }) catch null;
+        }
+    };
+    var outcome: ?Outcome = null;
+    const t = try std.Thread.spawn(.{}, Writer.run, .{ w, io, &outcome });
+    var deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (device_overlay.stats.overlay_settle_retries.load() < r0 + 1) {
+        if (clock.monotonicNs() > deadline) break;
+        try std.Thread.yield();
+    }
+    var guard: ?seams.BlockLocks.Guard = null;
+    deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (guard == null and clock.monotonicNs() < deadline) {
+        guard = w.wp.locks.tryAcquire(io, 70, 0);
+        if (guard == null) try std.Thread.yield();
+    }
+    const taken = guard != null;
+    w.f.dev.setFailWrites(0, error.InputOutput);
+    if (guard) |g| g.release(io);
+    t.join();
+    try testing.expect(taken);
+    const o2 = outcome orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, PAGE + 12), o2.written);
+    try testing.expectEqual(pub0 + 1, device_overlay.stats.overlay_publishes.load());
+    const b = w.f.map.seam().lookup(70, 0) orelse return error.TestUnexpectedResult;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    try testing.expectEqualSlices(u8, &half, got[0 .. wt.BS / 2]);
+    try testing.expectEqual(@as(u32, 0), w.wp.overlay.registry.open_count.load(.monotonic));
 }
 
 test "writeStatsJson aggregates every family under its module key" {

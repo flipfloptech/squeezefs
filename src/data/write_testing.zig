@@ -45,6 +45,12 @@ pub const FakeDevice = struct {
     /// Injection: fail the next write (after `torn_grains` grains landed).
     fail_next: ?seams.DmaError = null,
     torn_grains: usize = 0,
+    /// Injection: a device that keeps failing — every write answers
+    /// `fail_writes_err` while `fail_writes > 0` (decremented per write;
+    /// `maxInt` = until cleared). Set and cleared through `setFailWrites`
+    /// (the lock: a test clears it from another thread).
+    fail_writes: u32 = 0,
+    fail_writes_err: seams.DmaError = error.InputOutput,
     fail_next_read: ?seams.ReadError = null,
     fail_next_flush: ?seams.DmaError = null,
     hook: ?Hook = null,
@@ -94,12 +100,24 @@ pub const FakeDevice = struct {
         }
     }
 
+    /// The persistent-failure injection (see `fail_writes`).
+    pub fn setFailWrites(self: *FakeDevice, n: u32, e: seams.DmaError) void {
+        self.lock.lockUncancelable(std.testing.io);
+        defer self.lock.unlock(std.testing.io);
+        self.fail_writes = n;
+        self.fail_writes_err = e;
+    }
+
     fn writeInner(self: *FakeDevice, vol: u64, off: u64, data: []const u8, fixed: bool) seams.DmaError!void {
         self.lock.lockUncancelable(std.testing.io);
-        const injected = self.fail_next;
+        var injected = self.fail_next;
         const torn = self.torn_grains;
         self.fail_next = null;
         self.torn_grains = 0;
+        if (injected == null and self.fail_writes != 0) {
+            if (self.fail_writes != std.math.maxInt(u32)) self.fail_writes -= 1;
+            injected = self.fail_writes_err;
+        }
         self.trace.append(self.gpa, if (fixed) .write_fixed else .write) catch return error.OutOfMemory;
         if (injected) |e| {
             // A torn DMA: the first `torn` grains land, then the error.

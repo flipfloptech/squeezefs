@@ -225,6 +225,39 @@ reads its last intact image.
   looped smoke bounds every op class's slowest bucket at `<=1s` on all 48 passes (the real tail of
   the storm's writes is the conveyor window, ≤ 256 ms). The notify test pins both halves: an idle
   waiter past a tick counts nothing; a dropped wake is rescued and counts exactly one.
+- **CLOSED (2026-10-07) — the RELEASE wedge on the block-map-tree smoke stage** (five `release`
+  ops of one ino in flight ≥ 10–30 s, `lock_ticked_reregisters` climbing, `invariant_tripwires`
+  0, nothing else in flight). Reproduced in the venue with the daemon log: `overlay ino 2 block
+  355: settle transient, attempt 1, 2, 4 … 128` preceding every watchdog line, and `dmesg`
+  `I/O error, dev vdc … op WRITE` in the same seconds — the venue's `/build` volume image on the
+  macOS host had hit a FULL host disk (the container volume is never discarded; the three agents'
+  smoke runs grew its backing file past the host's free space), so the daemon's data-volume DMAs
+  answered EIO. The daemon's defect behind the picture: the overlay write-arm settle retried the
+  transient (`seedGaps`'s device write) forever with its backoff SLEEPING UNDER the (3) block
+  guard, and every RELEASE's `drainForIno` queued on that guard — a park under the block guard,
+  with no holder the watchdog could name (the settler is a detached task, not an op). FIX (0002
+  row 208; `device_overlay.zig` module doc): one (3) acquisition per settle attempt, the ladder's
+  sleep with the guard dropped and the record FROZEN never-lossy between attempts; the
+  guard-holding venues (the store's steal, the write ladder's one-authority screen) make ONE
+  attempt and the screen drops its guard for the ladder and restarts from A; the read side's
+  `.settle` venue goes through `drainBlock` (it had called the settle with no guard at all);
+  `VolumeFailed`/`WriterGuardFenced` from the seed read/write or the flush is the FENCE (W5,
+  `overlay_fence_drops`), not a transient. RED FIRST: `device_overlay.zig` — a device that keeps
+  failing the gap seed lets a sibling take the guard mid-ladder (fails on the old code with the
+  sibling never getting the guard while the settler barks under it), the fence-immediate legs;
+  `write_admit.zig` — the one-authority screen's guard drop + restart. OWED: a device that never
+  recovers leaves its settlers retrying with the guard dropped (named by the watchdog) until the
+  fail-stop lattice's device escalation lands; the venue's volume now mounts `discard` and the
+  smoke loop trims between passes.
+- **CLOSED (2026-10-07) — the read-path single-flight cohort flake** (`expected 1, found 2`
+  device fetches, 6 in 120 runs under load, both `Io`s): a reader whose tier probes missed was
+  preempted in the probe→enter window while the sibling's whole flight ran to completion (filled,
+  deposited, published, closed — the hold entry consumed by the cohort's credits), then claimed a
+  FRESH flight for a block the hot tier already held and fetched it again. FIX: the primary
+  re-probes the tiers after claiming its flight (`read_fill_reprobe_hits`; a pool-backed hit
+  carries to the cohort like a fill, an LRU hit dissolves the flight to the elected waiter). RED
+  FIRST: the `before_flight` seam holds a reader in the window while a sibling's read completes
+  — `expected 1, found 2` on the old code, deterministic; 150/150 loop passes after.
 - **Per-ino inline layout record** is the map authority (read latch-free through the node cache,
   one decode per probe); a RAM layout cache is owed with the kvmap crossing.
 - `status`'s reference census walks the ledger (one page per 512 refs); fsck C8 offline is rung 8.

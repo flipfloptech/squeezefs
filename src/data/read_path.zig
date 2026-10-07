@@ -129,6 +129,9 @@ pub const stats = struct {
     // Serve ladder.
     pub var cache_hits: counters.ShardedCounter = .{};
     pub var cache_misses: counters.ShardedCounter = .{};
+    /// A primary that found its block resident after claiming the flight
+    /// (the probe→enter window): served, never a second fetch.
+    pub var read_fill_reprobe_hits: counters.ShardedCounter = .{};
     pub var read_lane_serves: counters.ShardedCounter = .{};
     pub var read_lane_serve_bytes: counters.ShardedCounter = .{};
     pub var hold_serve_admissions: counters.ShardedCounter = .{};
@@ -174,9 +177,10 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"cache_hits\":{d},\"cache_misses\":{d},\"read_lane_serves\":{d},\"read_lane_serve_bytes\":{d},\"hold_serve_admissions\":{d},\"read_odirect_requests\":{d},\"read_odirect_tier_serves\":{d},\"read_device_true_reads\":{d},\"direct_device_true\":{d},\"ranged_reads\":{d},\"ranged_read_bytes\":{d},\"ranged_read_unaligned_bounces\":{d},\"ranged_read_rebinds\":{d},\"stale_binding_rebinds\":{d},\"stale_binding_escalations\":{d},\"staged_identity_retries\":{d},\"read_settle_lost_serialized\":{d},\"read_dest_overruns\":{d},\"mem_budget_dehydrate_paused\":{d},", .{
+    try w.print("{{\"cache_hits\":{d},\"cache_misses\":{d},\"read_fill_reprobe_hits\":{d},\"read_lane_serves\":{d},\"read_lane_serve_bytes\":{d},\"hold_serve_admissions\":{d},\"read_odirect_requests\":{d},\"read_odirect_tier_serves\":{d},\"read_device_true_reads\":{d},\"direct_device_true\":{d},\"ranged_reads\":{d},\"ranged_read_bytes\":{d},\"ranged_read_unaligned_bounces\":{d},\"ranged_read_rebinds\":{d},\"stale_binding_rebinds\":{d},\"stale_binding_escalations\":{d},\"staged_identity_retries\":{d},\"read_settle_lost_serialized\":{d},\"read_dest_overruns\":{d},\"mem_budget_dehydrate_paused\":{d},", .{
         stats.cache_hits.load(),
         stats.cache_misses.load(),
+        stats.read_fill_reprobe_hits.load(),
         stats.read_lane_serves.load(),
         stats.read_lane_serve_bytes.load(),
         stats.hold_serve_admissions.load(),
@@ -528,6 +532,10 @@ pub const Seams = struct {
     /// A hook run after a fill's DMA and before its binding recheck.
     after_dma: ?*const fn (ctx: ?*anyopaque, key: BlockKey) void = null,
     after_dma_ctx: ?*anyopaque = null,
+    /// A hook run after every tier probe missed and before the flight is
+    /// entered — the probe→enter window a whole sibling flight can fit in.
+    before_flight: ?*const fn (ctx: ?*anyopaque, key: BlockKey) void = null,
+    before_flight_ctx: ?*anyopaque = null,
 };
 
 pub const ReadPath = struct {
@@ -1279,8 +1287,46 @@ pub const ReadPath = struct {
     }
 
     /// §4 `get_cached_or_fetch_block`: the tier probes (no RAM re-promote
-    /// of an NVMe hit), then the result-carrying single-flight fill.
+    /// of an NVMe hit), then the result-carrying single-flight fill. The
+    /// PRIMARY re-probes after claiming its flight: a whole sibling flight
+    /// fits in the probe→enter window (probe miss → preempted → the
+    /// sibling fills, deposits, publishes, closes → this caller claims a
+    /// fresh flight for a block the hot tier already holds), and without
+    /// the re-probe that was a second device fetch of a resident block
+    /// (the cohort test's one-in-forty under load).
     fn getCachedOrFetch(self: *ReadPath, io: Io, key: BlockKey, class: FillClass) Error!Block {
+        if (self.probeTiers(key)) |hit| return hit;
+        if (self.seams.before_flight) |f| f(self.seams.before_flight_ctx, key);
+        switch (self.flights.enter(io, key)) {
+            .result => |r| {
+                const slot = r.slot orelse return self.fetchBlockDeviceTrue(key);
+                const valid = r.serve_valid and (r.verdict_word == null or self.still(key, r.verdict_word.?));
+                return .{ .where = .pool, .slot = slot, .len = r.len, .serve_valid = valid };
+            },
+            .table_full => return self.fetchBlockDeviceTrue(key),
+            .primary => |g| {
+                if (self.probeTiers(key)) |hit| {
+                    stats.read_fill_reprobe_hits.inc();
+                    // A pool-backed hit carries to the cohort like a fill's
+                    // result; an LRU hit (its own slab) dissolves the flight
+                    // — the elected front waiter re-probes and hits it too.
+                    if (hit.where == .pool) {
+                        g.publish(io, .{ .slot = hit.slot, .len = hit.len, .serve_valid = true, .verdict_word = null });
+                        g.release(io);
+                    } else {
+                        g.fail(io);
+                    }
+                    return hit;
+                }
+                return self.fillAsPrimary(io, g, key, class);
+            },
+        }
+    }
+
+    /// The tier probes in ladder order: hot (no promote) → read LRU →
+    /// the read-lane hold → the NVMe tier (bounced into a serve slot). A
+    /// hit carries one reference for the caller.
+    fn probeTiers(self: *ReadPath, key: BlockKey) ?Block {
         if (self.hot.getNoPromote(key)) |hit| {
             stats.cache_hits.inc();
             hot_tier.stats.hot_block_hits.inc();
@@ -1311,15 +1357,7 @@ pub const ReadPath = struct {
                 _ = self.pool.unpin(slot);
             }
         }
-        switch (self.flights.enter(io, key)) {
-            .result => |r| {
-                const slot = r.slot orelse return self.fetchBlockDeviceTrue(key);
-                const valid = r.serve_valid and (r.verdict_word == null or self.still(key, r.verdict_word.?));
-                return .{ .where = .pool, .slot = slot, .len = r.len, .serve_valid = valid };
-            },
-            .table_full => return self.fetchBlockDeviceTrue(key),
-            .primary => |g| return self.fillAsPrimary(io, g, key, class),
-        }
+        return null;
     }
 
     /// The primary's fill: validated before/during/after, deposited by
@@ -1922,6 +1960,51 @@ fn cohortBody(io: Io) !void {
 
 test "single-flight cohort through the read path: 8 concurrent readers of one cold block ⇒ exactly 1 device fetch" {
     try sync_testing.underBoth(cohortBody);
+}
+
+// The cohort test's one-in-forty under load, pinned: a reader whose tier
+// probes missed is held in the probe→enter window while a sibling's whole
+// flight runs to completion (filled, deposited, published, closed); the
+// reader then claims a FRESH flight for a block the hot tier already holds.
+fn reprobeBody(io: Io) !void {
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    f.size = Fixture.bs;
+    f.bind(0, 4);
+    const Gap = struct {
+        var fx: *Fixture = undefined;
+        var io_: Io = undefined;
+        var armed: bool = true;
+        fn sibling(fx_: *Fixture, io__: Io) void {
+            const buf = alignedBuf(testing.allocator, 1 << 20) catch unreachable;
+            defer testing.allocator.free(buf);
+            _ = fx_.rp.read(io__, 7, 0, 1 << 20, .{ .buf = buf }, .{}) catch unreachable;
+        }
+        fn run(_: ?*anyopaque, _: BlockKey) void {
+            if (!armed) return;
+            armed = false;
+            const t = std.Thread.spawn(.{}, sibling, .{ fx, io_ }) catch unreachable;
+            t.join();
+        }
+    };
+    Gap.fx = f;
+    Gap.io_ = io;
+    Gap.armed = true;
+    f.rp.seams.before_flight = &Gap.run;
+    defer f.rp.seams.before_flight = null;
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    const reprobe0 = stats.read_fill_reprobe_hits.load();
+    const n = try f.rp.read(io, 7, 0, 1 << 20, .{ .buf = buf }, .{});
+    try testing.expectEqual(@as(usize, 1 << 20), n);
+    try Fixture.expected(4 * Fixture.bs, buf);
+    try testing.expectEqual(@as(u64, 1), f.device_reads.load(.monotonic));
+    try testing.expectEqual(reprobe0 + 1, stats.read_fill_reprobe_hits.load());
+    try testing.expectEqual(@as(usize, 0), f.rp.flights.openCount(io));
+}
+
+test "the probe→enter window: a reader that claims the flight after a sibling's flight closed finds the block resident and never fetches it a second time" {
+    try sync_testing.underBoth(reprobeBody);
 }
 
 test "direct_device_true: an O_DIRECT read is device-true (no tier serve, no publish, every request a ranged window, counted); a buffered read on the same mount rides the tiers" {

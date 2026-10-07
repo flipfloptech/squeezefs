@@ -31,10 +31,19 @@
 //! The settle (`FREEZE → COMPLETE → SEED GAPS → FLUSH → PUBLISH → META SYNC
 //! → deferred frees`) is the fsync sequence; the write arm's form retries
 //! transients forever on the ONE ladder (`write_retry.zig`), fence
-//! immediate. Must-stay-0: `overlay_fence_drops`, `overlay_unpublished_at_
-//! fsync`, `overlay_ack_early_lost`; tripwires `overlay_teardown_
-//! nonterminal`, `overlay_install_race_under_guard`, `overlay_store_
-//! superseded_under_guard`, `overlay_state_word_corrupt` (Q15).
+//! immediate — on EVERY leg: a `VolumeFailed`/`WriterGuardFenced` from the
+//! seed read, the seed write or the flush is the fence, never a transient.
+//! Each attempt is one (3) acquisition: a transient leaves the record
+//! FROZEN never-lossy and the ladder's backoff runs with the block guard
+//! DROPPED (charter §2: no park under the block guard). Before that a
+//! settler sleeping under (3) on a device that kept answering EIO convoyed
+//! every RELEASE of the ino and every write to the block behind it (the
+//! 2026-10-07 wedge: five releases parked on one block's guard, `lock_
+//! ticked_reregisters` climbing, no holder the watchdog could name).
+//! Must-stay-0: `overlay_fence_drops`, `overlay_unpublished_at_fsync`,
+//! `overlay_ack_early_lost`; tripwires `overlay_teardown_nonterminal`,
+//! `overlay_install_race_under_guard`, `overlay_store_superseded_under_
+//! guard`, `overlay_state_word_corrupt` (Q15).
 
 const std = @import("std");
 const Io = std.Io;
@@ -665,8 +674,10 @@ pub const Overlay = struct {
         const key: Key = .{ .ino = req.ino, .block = req.block };
         const existing = self.registry.get(key);
         if (existing) |r| if (r.core.stateNow() != .open) {
-            // Steal the detached publisher's work under OUR guard, then decline.
-            _ = self.settleWriteArm(io, r, false);
+            // Steal the detached publisher's work under OUR guard (one
+            // attempt: a transient leaves it FROZEN for the one-authority
+            // screen's guard-dropping ladder), then decline.
+            _ = self.settleOnceLocked(io, r, false);
             return .declined;
         };
         // 1. Length floor: below it the piece declines unless it joins an
@@ -705,7 +716,7 @@ pub const Overlay = struct {
         const ticket = rec.core.beginStore(first_page, pages) catch {
             stats.overlay_claim_conflicts.inc();
             if (permit) |p| if (self.deps.governor) |g| g.complete(io, p, rec.ordinal, 0);
-            _ = self.settleWriteArm(io, rec, false);
+            _ = self.settleOnceLocked(io, rec, false);
             return .declined;
         };
         stats.overlay_inflight_bytes.add(len);
@@ -954,25 +965,76 @@ pub const Overlay = struct {
         }
     }
 
+    /// ONE write-arm attempt under the CALLER's (3) — the venues that hold
+    /// the block guard for their own ladder (the store's steal and claim
+    /// conflict, the write admission's one-authority screen). Fence
+    /// immediate. `.transient` leaves the record FROZEN never-lossy: the
+    /// caller drops its guard and takes `settleWriteArm`, never the ladder
+    /// under its own lock.
+    pub const AttemptVerdict = union(enum) {
+        /// Terminal: the close-owed hint.
+        settled: bool,
+        transient,
+        fenced,
+    };
+
+    pub fn settleOnceLocked(self: *Overlay, io: Io, rec: *Record, barrier: bool) AttemptVerdict {
+        const out = self.settleLocked(io, rec, barrier) catch |e| switch (e) {
+            error.WriterGuardFenced => return .fenced,
+            error.Transient, error.OutOfMemory => {
+                stats.overlay_settle_retries.inc();
+                return .transient;
+            },
+        };
+        return .{ .settled = switch (out) {
+            .fed => |f| f.coverage_complete,
+            .published, .superseded, .already_terminal => false,
+        } };
+    }
+
     /// The write arm's form: retry transients forever on the ladder, fence
-    /// immediate. Called under (3). Returns the close-owed hint.
-    pub fn settleWriteArm(self: *Overlay, io: Io, rec: *Record, barrier: bool) bool {
+    /// immediate; ONE (3) acquisition per attempt — the backoff runs with
+    /// the guard dropped (module doc), the record re-looked-up under the
+    /// next acquisition (a sibling settler may have landed or torn it
+    /// down). Returns the close-owed hint.
+    pub fn settleWriteArm(self: *Overlay, io: Io, locks: *seams.BlockLocks, ino: u64, block: u32, barrier: bool) bool {
         var ladder = SETTLE_LADDER;
         while (true) {
-            const out = self.settleLocked(io, rec, barrier) catch |e| switch (e) {
-                error.WriterGuardFenced => return false,
-                error.Transient, error.OutOfMemory => {
-                    stats.overlay_settle_retries.inc();
-                    const step = ladder.next();
-                    if (ladder.shouldBark()) log.warn("overlay ino {d} block {d}: settle transient, attempt {d}", .{ rec.key.ino, rec.key.block, ladder.attempts() });
-                    io.sleep(.{ .nanoseconds = @intCast(step.backoff_ns) }, .awake) catch {};
-                    continue;
-                },
+            const step: retry.Ladder.Step = blk: {
+                const g = locks.acquire(io, ino, block, .settle);
+                defer g.release(io);
+                const rec = self.registry.get(.{ .ino = ino, .block = block }) orelse return false;
+                switch (self.settleOnceLocked(io, rec, barrier)) {
+                    .settled => |hint| return hint,
+                    .fenced => return false,
+                    .transient => {
+                        const s = ladder.next();
+                        if (ladder.shouldBark()) log.warn("overlay ino {d} block {d}: settle transient, attempt {d}", .{ ino, block, ladder.attempts() });
+                        break :blk s;
+                    },
+                }
             };
-            return switch (out) {
-                .fed => |f| f.coverage_complete,
-                .published, .superseded, .already_terminal => false,
-            };
+            io.sleep(.{ .nanoseconds = @intCast(step.backoff_ns) }, .awake) catch {};
+        }
+    }
+
+    /// The fence class of a device leg (the seed read/write, the flush):
+    /// W5 — publish nothing, free nothing (successor recovery owns the
+    /// dest), the record torn down FenceDropped, the must-stay-0 fired.
+    /// Every other device error is a transient the ladder retries.
+    const DeviceLegError = seams.ReadError || seams.DmaError;
+
+    fn deviceLegFailed(self: *Overlay, rec: *Record, e: DeviceLegError, leg: []const u8) SettleError {
+        switch (e) {
+            error.WriterGuardFenced, error.VolumeFailed => {
+                stats.overlay_fence_drops.fire("an overlay settle's device leg met the fence");
+                log.err("overlay ino {d} block {d}: the settle's {s} met the fence ({s}) — publishing nothing, freeing nothing", .{ rec.key.ino, rec.key.block, leg, @errorName(e) });
+                _ = rec.core.fenceDrop();
+                self.teardown(rec);
+                return error.WriterGuardFenced;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Transient,
         }
     }
 
@@ -1017,9 +1079,9 @@ pub const Overlay = struct {
                 return .superseded;
             }
         }
-        if (gaps.len != 0) try self.seedGaps(rec, gaps);
+        if (gaps.len != 0) self.seedGaps(rec, gaps) catch |e| return self.deviceLegFailed(rec, e, "gap seed");
         // FLUSH (fsync class only).
-        if (barrier) self.deps.device.flush(rec.dest.vol_tag) catch return error.Transient;
+        if (barrier) self.deps.device.flush(rec.dest.vol_tag) catch |e| return self.deviceLegFailed(rec, e, "flush");
         // PUBLISH.
         rec.alloc.publishBlock(rec.dest_idx);
         const new_key = rec.dest;
@@ -1100,8 +1162,9 @@ pub const Overlay = struct {
 
     /// Each gap: ONE pooled buffer from the old binding (ranged per gap when
     /// the lever is on and Σ gaps < the block window — else the whole old
-    /// image once) or zeros (fresh), written at `dest + gap.start`.
-    fn seedGaps(self: *Overlay, rec: *Record, gaps: []const cov.Run) SettleError!void {
+    /// image once) or zeros (fresh), written at `dest + gap.start`. A device
+    /// error passes through in its class (the caller's fence test).
+    fn seedGaps(self: *Overlay, rec: *Record, gaps: []const cov.Run) DeviceLegError!void {
         const bs: u64 = rec.core.block_len;
         var total: u64 = 0;
         for (gaps) |g| total += g.len();
@@ -1112,7 +1175,7 @@ pub const Overlay = struct {
         if (old != null and !ranged) {
             const w = self.gpa.alignedAlloc(u8, .fromByteUnits(OVERLAY_PAGE), @intCast(bs)) catch return error.OutOfMemory;
             whole = w;
-            self.deps.device.read(old.?.vol_tag, old.?.offset, w) catch return error.Transient;
+            try self.deps.device.read(old.?.vol_tag, old.?.offset, w);
             stats.overlay_gap_seed_read_bytes.add(bs);
         }
         for (gaps) |g| {
@@ -1121,7 +1184,7 @@ pub const Overlay = struct {
             defer self.gpa.free(buf);
             if (old) |o| {
                 if (ranged) {
-                    self.deps.device.read(o.vol_tag, o.offset + g.start, buf) catch return error.Transient;
+                    try self.deps.device.read(o.vol_tag, o.offset + g.start, buf);
                     stats.overlay_gap_seed_ranged_bytes.add(n);
                 } else {
                     @memcpy(buf, whole.?[g.start..g.end]);
@@ -1130,7 +1193,7 @@ pub const Overlay = struct {
             } else {
                 @memset(buf, 0);
             }
-            _ = self.deps.device.write(rec.dest.vol_tag, rec.dest.offset + g.start, buf) catch return error.Transient;
+            _ = try self.deps.device.write(rec.dest.vol_tag, rec.dest.offset + g.start, buf);
             stats.overlay_gap_seeds.inc();
             stats.overlay_gap_seed_bytes.add(n);
         }
@@ -1156,15 +1219,10 @@ pub const Overlay = struct {
     }
 
     /// The guard-dropping caller's drain of one block (the detached
-    /// publisher): acquire (3) → settle (write arm) → drop → the close hint
-    /// acted on. `barrier` = the fsync class.
+    /// publisher): the write-arm settle (one (3) acquisition per attempt)
+    /// → the close hint acted on. `barrier` = the fsync class.
     pub fn drainBlock(self: *Overlay, io: Io, locks: *seams.BlockLocks, ino: u64, block: u32, barrier: bool, cs: epoch_mod.Epochs.CloseSeams) void {
-        const hint = blk: {
-            const g = locks.acquire(io, ino, block, .settle);
-            defer g.release(io);
-            const rec = self.registry.get(.{ .ino = ino, .block = block }) orelse break :blk false;
-            break :blk self.settleWriteArm(io, rec, barrier);
-        };
+        const hint = self.settleWriteArm(io, locks, ino, block, barrier);
         // The epoch-close venue law: never under the block guard.
         if (hint) _ = self.deps.epochs.close(io, ino, cs);
     }
@@ -1187,17 +1245,20 @@ pub const Overlay = struct {
         const bl = self.registry.blocksOf(ino, &blocks);
         for (bl) |b| {
             if (b >= keep_below) {
-                const g = locks.acquire(io, ino, b, .overlay_prune);
-                defer g.release(io);
-                const rec = self.registry.get(.{ .ino = ino, .block = b }) orelse continue;
-                if (rec.core.stateNow() == .frozen) {
-                    _ = self.settleWriteArm(io, rec, barrier);
-                } else {
+                const frozen = blk: {
+                    const g = locks.acquire(io, ino, b, .overlay_prune);
+                    defer g.release(io);
+                    const rec = self.registry.get(.{ .ino = ino, .block = b }) orelse break :blk false;
+                    if (rec.core.stateNow() == .frozen) break :blk true;
                     self.awaitInflight(io, rec);
                     stats.overlay_supersessions.inc();
                     _ = rec.core.supersede();
                     self.teardown(rec);
-                }
+                    break :blk false;
+                };
+                // A Frozen record is still drained, never stranded — on
+                // the guard-dropping ladder like every settle.
+                if (frozen) _ = self.settleWriteArm(io, locks, ino, b, barrier);
             } else {
                 self.drainBlock(io, locks, ino, b, barrier, cs);
             }
@@ -1719,6 +1780,128 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     w.ov.drainBlock(io, &w.locks, 64, 0, false, w.cs());
     try testing.expectEqual(orph0 + 1, stats.writeback_orphan_discards_overlay.load());
     try testing.expectEqual(used3 - 1, w.f.alloc_a.usedBlocks());
+}
+
+// The 2026-10-07 release wedge, deterministically: a settler whose gap
+// seed keeps failing (the venue's device answered EIO on every write)
+// must back off with the block guard DROPPED, so a sibling (the next
+// RELEASE's drain, a write to the block) takes the guard between
+// attempts instead of parking behind a sleeper nobody can name.
+test "the settle's backoff never parks under (3): a device that keeps failing the gap seed leaves the record FROZEN never-lossy and the settler sleeps with the guard dropped — a sibling takes the guard mid-ladder, a store's steal is ONE attempt; when the device returns the settle lands once with the gap zero-seeded" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{ .shadow = false });
+    defer w.deinit(testing.allocator);
+    var p: [wt.BS / 2]u8 align(4096) = undefined;
+    pattern(&p, 0x5A);
+    try w.f.map.create(90, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 90, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    const r0 = stats.overlay_settle_retries.load();
+    const pub0 = stats.overlay_publishes.load();
+    const seeds0 = stats.overlay_gap_seeds.load();
+    const Drainer = struct {
+        fn run(world: *TestWorld, io_: Io) void {
+            world.ov.drainBlock(io_, &world.locks, 90, 0, false, world.cs());
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Drainer.run, .{ w, io });
+    // The settler has failed at least once and is on its ladder.
+    var deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+    while (stats.overlay_settle_retries.load() < r0 + 1) {
+        if (clock.monotonicNs() > deadline) break;
+        try std.Thread.yield();
+    }
+    // The sibling takes the guard between attempts (bounded by the
+    // ladder's 50 ms cap, generously); a settler sleeping under (3) never
+    // lets it through.
+    var guard: ?seams.BlockLocks.Guard = null;
+    deadline = clock.monotonicNs() + 3 * std.time.ns_per_s;
+    while (guard == null and clock.monotonicNs() < deadline) {
+        guard = w.locks.tryAcquire(io, 90, 0);
+        if (guard == null) try std.Thread.yield();
+    }
+    const taken = guard != null;
+    var frozen_under_guard = false;
+    var steal_declined = false;
+    var retries_at_steal: u64 = 0;
+    if (guard) |g| {
+        const rec = w.ov.registry.get(.{ .ino = 90, .block = 0 });
+        frozen_under_guard = rec != null and rec.?.core.stateNow() == .frozen;
+        // Under OUR guard: a store meeting the frozen record steals ONE
+        // attempt and declines — never the ladder under the caller's lock.
+        const r1 = stats.overlay_settle_retries.load();
+        const o = try w.ov.store(io, .{ .ino = 90, .block = 0, .rel = wt.BS / 2, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(0), .overwrite = false });
+        steal_declined = o == .declined;
+        retries_at_steal = stats.overlay_settle_retries.load() - r1;
+        // The device returns; the settler's next attempt lands.
+        w.f.dev.setFailWrites(0, error.InputOutput);
+        g.release(io);
+    } else {
+        w.f.dev.setFailWrites(0, error.InputOutput);
+    }
+    t.join();
+    try testing.expect(taken);
+    try testing.expect(frozen_under_guard);
+    try testing.expect(steal_declined);
+    try testing.expectEqual(@as(u64, 1), retries_at_steal);
+    try testing.expectEqual(pub0 + 1, stats.overlay_publishes.load());
+    try testing.expectEqual(seeds0 + 1, stats.overlay_gap_seeds.load());
+    const b = w.f.map.seam().lookup(90, 0) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    try testing.expectEqualSlices(u8, &p, got[0 .. wt.BS / 2]);
+    try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0));
+}
+
+test "fence immediate on every settle leg: a gap seed or a flush answering VolumeFailed/WriterGuardFenced tears the record down FenceDropped at once — no retry, nothing published, the dest not freed, the must-stay-0 fired" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{ .shadow = false });
+    defer w.deinit(testing.allocator);
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    pattern(&half, 0x3C);
+    var whole: [wt.BS]u8 align(4096) = undefined;
+    pattern(&whole, 0x3D);
+    // The gap seed meets the fence.
+    try w.f.map.create(91, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 91, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.dev.fail_next = error.VolumeFailed;
+    var fence0 = counters.tripwireCount("overlay_fence_drops");
+    var retries0 = stats.overlay_settle_retries.load();
+    var used0 = w.f.alloc_a.usedBlocks();
+    stats.overlay_fence_drops.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(2);
+    w.ov.drainBlock(io, &w.locks, 91, 0, false, w.cs());
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(retries0, stats.overlay_settle_retries.load());
+    try testing.expect(w.f.map.seam().lookup(91, 0) == null);
+    try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
+    // The fsync-class flush meets the fence.
+    try w.f.map.create(92, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 92, .block = 0, .rel = 0, .vehicle = .{ .bytes = &whole }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.dev.fail_next_flush = error.WriterGuardFenced;
+    fence0 = counters.tripwireCount("overlay_fence_drops");
+    retries0 = stats.overlay_settle_retries.load();
+    used0 = w.f.alloc_a.usedBlocks();
+    stats.overlay_fence_drops.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(2);
+    w.ov.drainBlock(io, &w.locks, 92, 0, true, w.cs());
+    try log.testing.expectAllFired();
+    try testing.expectEqual(fence0 + 1, counters.tripwireCount("overlay_fence_drops"));
+    try testing.expectEqual(retries0, stats.overlay_settle_retries.load());
+    try testing.expect(w.f.map.seam().lookup(92, 0) == null);
+    try testing.expectEqual(used0, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
+    // A plain EIO on the same legs stays a transient the ladder retries (the never-lossy class).
+    try w.f.map.create(93, .striped, 0);
+    _ = try w.ov.store(io, .{ .ino = 93, .block = 0, .rel = 0, .vehicle = .{ .bytes = &half }, .file = TestWorld.striped(0), .overwrite = false });
+    w.f.dev.fail_next = error.InputOutput;
+    retries0 = stats.overlay_settle_retries.load();
+    w.ov.drainBlock(io, &w.locks, 93, 0, false, w.cs());
+    try testing.expectEqual(retries0 + 1, stats.overlay_settle_retries.load());
+    try testing.expect(w.f.map.seam().lookup(93, 0) != null);
 }
 
 test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable by the census (refcount 1, never named by the map), the old image intact; the fed-but-unsaved epoch ≡ OW-1; a swap durable with frees not run leaves a tracked A key the census free-lists; OW-7 durably written ≠ durably named" {

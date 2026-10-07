@@ -150,13 +150,54 @@ pub const HoldHint = struct {
     class: zc.PayloadClass,
 };
 
+/// A bridge-completion hook: runs ON THE WORKER THREAD at the bridge's CQE
+/// (ok = the DMA landed its full length), sync and non-blocking. For the
+/// direct device leg it is the post-DMA incarnation + binding RECHECK: a
+/// `false` on a landed leg WITHDRAWS the prefilled reply (the slot takes
+/// the ordinary ladder, never unvalidated device bytes in an app's pages).
+/// For an fd-source serve it releases the served view's pin. `token` is
+/// the filesystem's own facts (no allocation per op on the worker).
+pub const CompletionHook = struct {
+    ctx: ?*anyopaque,
+    token: [6]u64 = @splat(0),
+    call: *const fn (ctx: ?*anyopaque, token: *const [6]u64, ok: bool) bool,
+
+    pub fn run(self: CompletionHook, ok: bool) bool {
+        return self.call(self.ctx, &self.token, ok);
+    }
+};
+
 /// The direct device leg of a paged READ (charter §4 "Buffer-mode
 /// lattice"): the worker bridges `READ_FIXED(fd @ off → slot)` straight
 /// into the app's pages and commits header-only `payload_sz = len`.
 /// Eligibility is the filesystem's (cold ∧ passthrough ∧ 4 KiB-aligned ∧
 /// single block ∧ device resolvable); `len` is the FULL reply length (a
 /// short leg is a refusal — the bounce leg then serves the whole body).
-pub const DirectLeg = struct { fd: linux.fd_t, off: u64, len: u32 };
+/// `hook` is the post-DMA recheck (charter §6.3: every fill is validated
+/// AFTER the bytes are in hand) — a leg without one is never armed.
+pub const DirectLeg = struct { fd: linux.fd_t, off: u64, len: u32, hook: ?CompletionHook = null };
+
+/// A probe's fd-source answer (`SQUEEZEFS_READ_ZC_SERVE`): the served
+/// bytes sit on the fill pool's MAP_SHARED memfd slab at `(fd, off)`; the
+/// worker bridges `READ_FIXED(fd → slot)` with zero daemon passes. `body`
+/// is the SAME bytes as a VA view — the keepalive and the restage source
+/// when the bridge comes back short; `done` releases the view's pin at the
+/// CQE (after any restage copy).
+pub const FdSource = struct {
+    unique: u64,
+    fd: linux.fd_t,
+    off: u64,
+    body: []const u8,
+    done: ?CompletionHook = null,
+};
+
+/// What `probe_read` answers: a reply served INTO the window, or an
+/// fd-source the transport bridges on a zero-copy dest slot (elsewhere the
+/// worker copies `body` into the window and runs `done` at once).
+pub const ProbeReply = union(enum) {
+    reply: codec.Reply,
+    fd_source: FdSource,
+};
 
 pub const Filesystem = struct {
     ctx: *anyopaque,
@@ -175,8 +216,10 @@ pub const Filesystem = struct {
         /// delivery CQE: SYNC, try-only, non-blocking (a contended lock is
         /// a decline, never a spin; never a device touch; never an
         /// allocation). Serve into `window` and return the reply, or null to
-        /// decline (the request then takes arm (c)).
-        probe_read: *const fn (ctx: *anyopaque, req: Request, window: []u8) ?codec.Reply,
+        /// decline (the request then takes arm (c)). On a zero-copy
+        /// session a warm hit on the memfd fill pool may answer an
+        /// `fd_source` instead (zero daemon passes).
+        probe_read: *const fn (ctx: *anyopaque, req: Request, window: []u8) ?ProbeReply,
         /// FORGET / BATCH_FORGET nlookup hand-off, on the worker or sideband
         /// thread before the auto-commit: cheap and non-blocking. The
         /// lifecycle layer owns the open-count law (`open_count_stranded`:
@@ -204,7 +247,7 @@ pub const Filesystem = struct {
     pub fn dispatch(self: Filesystem, req: Request, handle: Handle, lease: ?slot.PayloadLease) void {
         self.vtable.dispatch(self.ctx, req, handle, lease);
     }
-    pub fn probeRead(self: Filesystem, req: Request, window: []u8) ?codec.Reply {
+    pub fn probeRead(self: Filesystem, req: Request, window: []u8) ?ProbeReply {
         return self.vtable.probe_read(self.ctx, req, window);
     }
     pub fn forget(self: Filesystem, ino: u64, nlookup: u64) void {
@@ -452,7 +495,7 @@ const EchoFsImpl = struct {
         return n;
     }
 
-    fn fsProbeRead(ctx: *anyopaque, req: Request, window: []u8) ?codec.Reply {
+    fn fsProbeRead(ctx: *anyopaque, req: Request, window: []u8) ?ProbeReply {
         const self = of(ctx);
         if (self.probe_declines) return null;
         const ino = req.nodeid();
@@ -468,7 +511,7 @@ const EchoFsImpl = struct {
         const in = req.op.read;
         const n = self.readInto(ino, in.offset, in.size, window) orelse return null;
         _ = self.probes_served.fetchAdd(1, .monotonic);
-        return codec.replyData(req.unique(), window[0..n]);
+        return .{ .reply = codec.replyData(req.unique(), window[0..n]) };
     }
 
     /// A WRITE whose payload is HELD in the zc slot (W1 eligible): the
@@ -755,7 +798,7 @@ test "EchoFs: lookup/getattr/read on the fixed tree answer exactly once each; a 
     try testing.expectEqualSlices(u8, "world\n", rec.last_body);
     try testing.expectEqual(@as([*]const u8, &window), rec.last_body.ptr);
     // The probe (arm a).
-    const served = f.probeRead(requestOf(.{ .read = .{ .fh = 3, .offset = 4096, .size = 16, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 } }, 12, EchoFs.ino_big), &window).?;
+    const served = f.probeRead(requestOf(.{ .read = .{ .fh = 3, .offset = 4096, .size = 16, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 } }, 12, EchoFs.ino_big), &window).?.reply;
     try testing.expectEqual(@as(usize, 16), served.body.len);
     try testing.expectEqual(EchoFs.bigByte(4096), served.body[0]);
     try testing.expectEqual(EchoFs.bigByte(4111), served.body[15]);

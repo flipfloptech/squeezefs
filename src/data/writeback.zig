@@ -237,8 +237,8 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
         stats.durable_upload_bytes_writeback.add(proof.len);
         var displaced: seams.MergeOutcome = .{};
         {
-            const sg = deps.stripes.acquire(unit.ino);
-            defer sg.release();
+            const sg = deps.stripes.acquire(io, unit.ino);
+            defer sg.release(io);
             while (true) {
                 displaced = deps.map.merge(.{ .ino = unit.ino, .inserts = &.{.{ .block = unit.block, .binding = new_key }}, .min_size = unit.min_size, .proofs = &.{proof}, .fencing = deps.map.currentFencing(unit.ino) }) catch |e| switch (e) {
                     error.FencingTokenExpired => {
@@ -497,7 +497,7 @@ pub fn promoteStaged(pd: PromoteDeps, io: Io, key: staging.StagingKey, size: u64
                 lease.release();
                 var t = tx.KvTx.init(d.pool.gpa, @src());
                 defer t.deinit();
-                return switch (pk.commit(prepared, ctx, &t)) {
+                return switch (pk.commit(io, prepared, ctx, &t)) {
                     .committed => .packed_,
                     .stale => .stale,
                     .failed => .failed,
@@ -632,10 +632,7 @@ test "never-lossy dispositions: a superseded unit is a contractual no-op (newest
     const g3 = try staging.stageWrite(&w.pool, &w.seg, blockKey(3, 0), &data, 1);
     var unit_c: Unit = .{ .ino = 3, .block = 0, .key = blockKey(3, 0), .owner_generation = g3.generation, .min_size = wt.BS, .old_binding = null };
     const used = w.f.alloc_a.usedBlocks();
-    block_alloc.stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
     try testing.expectEqual(Disposition.orphan_discarded, flushOne(w.deps(), io, &unit_c));
-    try log.testing.expectAllFired();
     try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
     try testing.expect(w.seg.residentGeneration(blockKey(3, 0)) == null);
     // Transient: requeue, bytes stay staged, the next pass lands.
@@ -643,10 +640,7 @@ test "never-lossy dispositions: a superseded unit is a contractual no-op (newest
     const g4 = try staging.stageWrite(&w.pool, &w.seg, blockKey(4, 0), &data, 1);
     var unit_d: Unit = .{ .ino = 4, .block = 0, .key = blockKey(4, 0), .owner_generation = g4.generation, .min_size = wt.BS, .old_binding = null };
     w.f.map.fail_next_merge = error.Transient;
-    block_alloc.stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
     try testing.expectEqual(Disposition.retry, flushOne(w.deps(), io, &unit_d));
-    try log.testing.expectAllFired();
     try testing.expect(w.seg.residentGeneration(blockKey(4, 0)) != null);
     try testing.expectEqual(Disposition.flushed, flushOne(w.deps(), io, &unit_d));
     // Fence + poisoned custody: a verified no-op, the bytes stay staged for the remount.
@@ -696,10 +690,7 @@ test "writeback_requeue_on_full_queue_never_goes_sticky: a full queue flushes sy
     var k: u32 = 0;
     while (k < 3) : (k += 1) {
         w.f.map.fail_next_merge = error.Transient;
-        block_alloc.stats.unpublished_mint_abandons.resetLogBudgetForTest();
-        log.testing.expectErrorLogs(1);
         _ = w.worker.runUnit(io, w.deps(), &u);
-        try log.testing.expectAllFired();
         _ = w.worker.queue.tryPop();
         _ = w.worker.depth.fetchSub(1, .monotonic);
     }

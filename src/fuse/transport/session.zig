@@ -645,6 +645,8 @@ pub const Session = struct {
     verdicts: probes.Verdicts = .{ .kmbuf = .absent, .zc = .absent },
     retention: probes.Verdict = .absent,
     time_limits: probes.Verdict = .absent,
+    /// `SQUEEZEFS_READ_ZC_SERVE` ∧ zero-copy: what INIT told the filesystem.
+    read_zc_serve: bool = false,
     /// The zc bounce slab (one per session) and its budget component.
     slab: ?worker.Slab = null,
     slab_component: mem_budget.Component = undefined,
@@ -731,6 +733,29 @@ pub const Session = struct {
     pub fn releaseLease(self: *Session, l: PayloadLease) void {
         _ = self;
         l.release();
+    }
+
+    /// The HELD WRITE payload's direct store (charter §4 "paged WRITE
+    /// payloads are HELD in the slot … so the handler can `WRITE_FIXED(device
+    /// ← slot)`"): bridge `src`'s slot straight into `fd @ off` on the ring
+    /// that registered it, parking the caller's fiber until the CQE. The
+    /// data plane's device seam calls this through `heldStoreFace`.
+    pub fn storeHeld(self: *Session, src: slot.HeldSource, fd: linux.fd_t, off: u64, io: Io) slot.ExtractError!void {
+        if (src.qid >= self.plan.nqueues or src.buf_index >= self.plan.depth) return error.SlotNotHeld;
+        if (!self.shared.isActive()) return error.SessionClosed;
+        const g = self.groups[self.qid_group[src.qid]];
+        return g.storeFromForeign(g.gentOf(self.qid_member[src.qid], src.buf_index), fd, off, src.len, io);
+    }
+
+    /// Whether `storeHeld` can land anything: a zero-copy session (a held
+    /// payload exists only there).
+    pub fn heldStoreArmed(self: *const Session) bool {
+        return self.mode == .zero_copy;
+    }
+
+    /// The fd-source serve lever as INIT resolved it.
+    pub fn readZcServe(self: *const Session) bool {
+        return self.read_zc_serve;
     }
 
     /// The group owning a live slot that still names `ref.commit_id` (the
@@ -911,6 +936,7 @@ pub const Session = struct {
         self.time_limits = probes.timeLimitsVerdict(init_in.folded());
         time_limits_gauge.set(@intFromBool(self.init_reply.timeLimits()));
         const read_zc_serve = knobs.boolKnob("SQUEEZEFS_READ_ZC_SERVE", env) and self.mode == .zero_copy;
+        self.read_zc_serve = read_zc_serve;
 
         // 5. Write the reply classically (the kernel refuses REGISTER until
         //    `fch->initialized`), then the RETENTION probe: after the reply,
@@ -1308,6 +1334,11 @@ pub const Session = struct {
         try field(w, "transport_zc_fd_body_fallbacks", worker.zc_fd_body_fallbacks.load());
         try field(w, "transport_zc_direct_legs", worker.zc_direct_legs.load());
         try field(w, "transport_zc_direct_leg_fallbacks", worker.zc_direct_leg_fallbacks.load());
+        try field(w, "transport_zc_direct_leg_recheck_withdrawn", worker.zc_direct_leg_recheck_withdrawn.load());
+        try field(w, "transport_zc_write_directs", worker.zc_write_directs.load());
+        try field(w, "transport_zc_write_direct_bytes", worker.zc_write_direct_bytes.load());
+        try field(w, "transport_zc_write_direct_failures", worker.zc_write_direct_failures.load());
+        try field(w, "transport_zc_fd_source_copies", worker.zc_fd_source_copies.load());
         try field(w, "transport_zc_fallbacks", worker.zc_fallbacks.load());
         try field(w, "transport_zc_readdir_latch", worker.zc_readdir_latch.load());
         try field(w, "transport_zc_bridges", worker.zc_bridges.load());

@@ -53,6 +53,7 @@ const linux = std.os.linux;
 const assert = std.debug.assert;
 const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
+const transport_slot = @import("../transport/slot.zig");
 const seam = @import("transport_seam.zig");
 const filesystem = @import("filesystem.zig");
 const op_guard = @import("op_guard.zig");
@@ -237,7 +238,7 @@ pub fn Dispatcher(comptime Transport: type) type {
             };
             ctx.stage(.handler_entry);
             var out: codec.OutBuf = undefined;
-            const outcome = self.run(req, meta, &ctx, &out);
+            const outcome = self.run(req, meta, &ctx, &out, lease);
             // The payload lease ends BEFORE the commit: the transport's gate
             // would otherwise park the reply until it did.
             self.releaseLease(lease);
@@ -320,7 +321,25 @@ pub fn Dispatcher(comptime Transport: type) type {
             }
         }
 
-        fn run(self: *Self, req: codec.Request, meta: Meta, c: *Ctx, out: *codec.OutBuf) Error!codec.Reply {
+        /// The held zero-copy payload's portable face (null: the bytes are
+        /// in `data`, or this transport has no held leases). `ctx` points
+        /// INTO the caller's lease, which outlives the filesystem's write
+        /// (the lease is released after the reply) — never into a copy.
+        fn heldPayload(lease: *const ?Transport.PayloadLease) ?filesystem.HeldPayload {
+            if (Transport.PayloadLease != transport_slot.PayloadLease) return null;
+            if (lease.* == null) return null;
+            const l: *const Transport.PayloadLease = &lease.*.?;
+            if (!l.held) return null;
+            const Thunk = struct {
+                fn extract(ctx: ?*anyopaque, io: Io) anyerror![]const u8 {
+                    const lp: *const transport_slot.PayloadLease = @ptrCast(@alignCast(ctx.?));
+                    return lp.bytes(io);
+                }
+            };
+            return .{ .src = l.heldSource().?, .class = l.class, .ctx = @ptrCast(@constCast(l)), .extract = &Thunk.extract };
+        }
+
+        fn run(self: *Self, req: codec.Request, meta: Meta, c: *Ctx, out: *codec.OutBuf, lease: ?Transport.PayloadLease) Error!codec.Reply {
             const fs = self.fs;
             const u = meta.unique;
             const ino = meta.nodeid;
@@ -402,11 +421,13 @@ pub fn Dispatcher(comptime Transport: type) type {
                     const end = try op_guard.validateRange(w.in.offset, w.in.size, MAX_FILE_SIZE);
                     var adm = op_guard.admitWrite(self.guards, self.io, self.probe, self.shared_enabled, ino, w.in.offset, end);
                     defer adm.release(self.io);
-                    // Rung 3: inline is the only layout — EntireOp, held
-                    // across the commit (the data IS the metadata record).
-                    _ = adm.finalize(.entire_op);
+                    // The classifier's verdict over the data plane's RAM
+                    // snapshot (a resident striped write within the size
+                    // floor is Shared; everything else is exclusive).
+                    const candidate: op_guard.Class = if (adm.shared_snapshot) |snap| op_guard.classify(snap.classifyInput(end)) else .entire_op;
+                    const class = adm.finalize(candidate);
                     c.stage(.write_locked);
-                    const wr = try fs.vtable.write(fs.impl, c, .{ .ino = ino, .fh = w.in.fh, .offset = w.in.offset, .data = w.data, .write_flags = w.in.write_flags, .flags = w.in.flags });
+                    const wr = try fs.vtable.write(fs.impl, c, .{ .ino = ino, .fh = w.in.fh, .offset = w.in.offset, .data = w.data, .held = heldPayload(&lease), .class = class, .write_flags = w.in.write_flags, .flags = w.in.flags });
                     self.opens.markDirty(ino);
                     return codec.replyWrite(out, u, wr.size);
                 },
@@ -897,4 +918,49 @@ test "opcodeOf maps every request arm to its opcode" {
     try testing.expectEqual(abi.Opcode.rename2, opcodeOf(.{ .rename2 = .{ .newdir = 0, .flags = 0, .name = "", .newname = "" } }));
     try testing.expectEqual(abi.Opcode.destroy, opcodeOf(.destroy));
     try testing.expectEqual(abi.Opcode.fromInt(52), opcodeOf(.{ .unsupported = abi.Opcode.fromInt(52) }));
+}
+
+/// A transport with the REAL slot lease type (the Loopback's shape with the
+/// held face): `heldPayload` must hand the filesystem a `ctx` that points
+/// into the dispatcher's lease, never into a copy that dies with the frame.
+const HeldLoopback = struct {
+    pub const SlotRef = Loopback.SlotRef;
+    pub const PayloadLease = transport_slot.PayloadLease;
+    pub fn replyWindow(_: *HeldLoopback, _: SlotRef) []u8 {
+        return &.{};
+    }
+    pub fn submitReply(_: *HeldLoopback, _: SlotRef, _: codec.Reply) void {}
+    pub fn failEnt(_: *HeldLoopback, _: SlotRef, _: u64, _: linux.E) void {}
+    pub fn releaseLease(_: *HeldLoopback, _: PayloadLease) void {}
+};
+
+test "heldPayload points INTO the caller's lease and its extract reaches the slot's face (a held write that no arm stores direct materializes through it)" {
+    const Face = struct {
+        var hits: u32 = 0;
+        var last_gent: u32 = 0;
+        const bytes = "held payload bytes";
+        fn extract(_: ?*anyopaque, gent: u32, _: Io) transport_slot.ExtractError![]const u8 {
+            hits += 1;
+            last_gent = gent;
+            return bytes;
+        }
+        fn wake(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    var state: transport_slot.LeaseState = .{};
+    var lease: ?transport_slot.PayloadLease = transport_slot.PayloadLease.acquireHeld(&state, .{ .ctx = null, .wake = &Face.wake }, 4096, .page_cache, 2, 5, 7, .{ .ctx = null, .extract = &Face.extract });
+    const held = Dispatcher(HeldLoopback).heldPayload(&lease).?;
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(&lease.?)), held.ctx.?);
+    try testing.expectEqual(@as(u16, 2), held.src.qid);
+    try testing.expectEqual(@as(u16, 5), held.src.buf_index);
+    try testing.expectEqual(@as(u32, 4096), held.src.len);
+    try testing.expectEqualStrings(Face.bytes, try held.extract(held.ctx, testing.io));
+    try testing.expectEqual(@as(u32, 1), Face.hits);
+    try testing.expectEqual(@as(u32, 7), Face.last_gent);
+    lease.?.release();
+    // A lease in hand (not held) has no held face.
+    var plain: ?transport_slot.PayloadLease = transport_slot.PayloadLease.acquire(&state, "in hand", .{ .ctx = null, .wake = &Face.wake });
+    try testing.expect(Dispatcher(HeldLoopback).heldPayload(&plain) == null);
+    plain.?.release();
 }

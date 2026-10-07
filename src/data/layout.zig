@@ -30,6 +30,7 @@
 //! `RefsSeam` (`data/block_refs.zig` binds it).
 
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -40,7 +41,7 @@ const log = @import("../core/log.zig");
 const key = @import("../meta/key.zig");
 const record = @import("../meta/record.zig");
 const tx = @import("../meta/tx.zig");
-const jc = @import("../meta/journal_core.zig");
+const sync_mutex = @import("../sync/mutex.zig");
 
 // ---------------------------------------------------------------------------
 // Geometry: the two grains every mapping law is written in.
@@ -1182,20 +1183,26 @@ pub fn inlineMaxFromEnv(env: *const std.process.Environ.Map, facts: derive.Facts
 // Lock level 3.5: the per-ino block-map meta stripe.
 // ---------------------------------------------------------------------------
 
-/// 4096-way: a RAM-only read→merge→save hold (microseconds), never a commit
-/// park and never held across a terminal block free (RES-1) — so one stripe
-/// per 4096 inos keeps a collision to one short section in 4096 at full
-/// handler parallelism, the same load factor the 4a stripes use.
+/// 4096-way: the read→merge→save hold of a block-map publish, never held
+/// across a terminal block free (RES-1) — so one stripe per 4096 inos keeps
+/// a collision to one short section in 4096 at full handler parallelism,
+/// the same load factor the 4a stripes use.
 pub const INODE_META_STRIPES: usize = 4096;
 
+/// A PARKING mutex, not a spin: the bound `MapSeam.merge` commits the
+/// layout transaction through the conveyor INSIDE the section (the
+/// read→stage→commit must be one atomic step against a sibling publish),
+/// and a commit parks the fiber. A spinning fiber on the holder's own lane
+/// would never let the holder resume (the lane runs one fiber at a time)
+/// — a deterministic hang at the first same-stripe collision.
 pub const MetaStripes = struct {
-    locks: [INODE_META_STRIPES]jc.SpinLock = @splat(.{}),
+    locks: [INODE_META_STRIPES]sync_mutex.Mutex = @splat(.init),
 
     pub const Guard = struct {
-        lock: *jc.SpinLock,
+        lock: *sync_mutex.Mutex,
 
-        pub fn release(self: Guard) void {
-            self.lock.unlock();
+        pub fn release(self: Guard, io: Io) void {
+            self.lock.unlock(io);
         }
     };
 
@@ -1204,9 +1211,9 @@ pub const MetaStripes = struct {
         return @intCast((ino *% 0x9E3779B97F4A7C15) >> (64 - 12));
     }
 
-    pub fn acquire(self: *MetaStripes, ino: u64) Guard {
+    pub fn acquire(self: *MetaStripes, io: Io, ino: u64) Guard {
         const l = &self.locks[stripeOf(ino)];
-        l.lock();
+        l.lockUncancelable(io);
         return .{ .lock = l };
     }
 };
@@ -1955,8 +1962,9 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
     }
 }
 
-test "the meta stripe is 4096-way, spreads consecutive inos, and a guard releases its lock" {
+test "the meta stripe is 4096-way, spreads consecutive inos, and a guard releases its PARKING lock (a second acquirer is refused while held, admitted after)" {
     try testing.expectEqual(@as(usize, 4096), INODE_META_STRIPES);
+    const io = testing.io;
     const stripes = try testing.allocator.create(MetaStripes);
     defer testing.allocator.destroy(stripes);
     stripes.* = .{};
@@ -1969,10 +1977,11 @@ test "the meta stripe is 4096-way, spreads consecutive inos, and a guard release
     }
     // Fibonacci hashing: 256 consecutive inos hit ≥ 240 distinct stripes.
     try testing.expect(distinct >= 240);
-    const g = stripes.acquire(7);
-    try testing.expect(stripes.locks[MetaStripes.stripeOf(7)].locked.load(.monotonic));
-    g.release();
-    try testing.expect(!stripes.locks[MetaStripes.stripeOf(7)].locked.load(.monotonic));
+    const g = stripes.acquire(io, 7);
+    try testing.expect(!stripes.locks[MetaStripes.stripeOf(7)].tryLock(io));
+    g.release(io);
+    try testing.expect(stripes.locks[MetaStripes.stripeOf(7)].tryLock(io));
+    stripes.locks[MetaStripes.stripeOf(7)].unlock(io);
 }
 
 test "stats JSON names every instrument" {

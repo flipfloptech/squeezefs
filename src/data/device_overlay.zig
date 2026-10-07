@@ -893,8 +893,8 @@ pub const Overlay = struct {
             // ONE (3.5) section: capture the old binding ∧ re-check the
             // epoch ∧ install — a capture outside the section races the
             // epoch's feed (hazard 1).
-            const g = self.deps.stripes.acquire(req.ino);
-            defer g.release();
+            const g = self.deps.stripes.acquire(io, req.ino);
+            defer g.release(io);
             const old = self.deps.map.lookup(req.ino, req.block) orelse {
                 fill.fsck_guard.?.deinit();
                 mint.abandon();
@@ -1633,10 +1633,9 @@ test "the slot vehicle: WRITE_FIXED(device ← slot) lands the held bytes with z
     w.ov.deps.device = w.f.dev.seam();
     try w.f.map.create(49, .striped, 0);
     const used = w.f.alloc_a.usedBlocks();
-    block_alloc.stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1); // the abandon's tripwire is the design working
+    const abandons0 = block_alloc.stats.unpublished_mint_abandons.load();
     try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 49, .block = 0, .rel = 0, .vehicle = .{ .slot = sv }, .file = TestWorld.striped(0), .overwrite = false }));
-    try log.testing.expectAllFired();
+    try testing.expectEqual(abandons0 + 1, block_alloc.stats.unpublished_mint_abandons.load()); // the mint went back: the design working
     try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
 }
 
@@ -1693,10 +1692,7 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     _ = try w.f.alloc_a.freeBlock(w.f.alloc_a.idxOf(a2.offset));
     const used = w.f.alloc_a.usedBlocks();
     const dead0 = stats.overlay_superseded_dead_old_binding.load();
-    block_alloc.stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
     w.ov.drainBlock(io, &w.locks, 62, 0, false, w.cs());
-    try log.testing.expectAllFired();
     try testing.expectEqual(dead0 + 1, stats.overlay_superseded_dead_old_binding.load());
     try testing.expectEqual(used - 1, w.f.alloc_a.usedBlocks()); // the dest went back (unpublished_mint_abandons is the design working)
     // Fence: must-stay-0 fires, nothing published, nothing freed, the dest NOT freed (successor recovery owns it).
@@ -1720,10 +1716,7 @@ test "the settle's never-lossy and fence arms: a transient leaves the record FRO
     w.f.map.remove(64);
     const used3 = w.f.alloc_a.usedBlocks();
     const orph0 = stats.writeback_orphan_discards_overlay.load();
-    block_alloc.stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
     w.ov.drainBlock(io, &w.locks, 64, 0, false, w.cs());
-    try log.testing.expectAllFired();
     try testing.expectEqual(orph0 + 1, stats.writeback_orphan_discards_overlay.load());
     try testing.expectEqual(used3 - 1, w.f.alloc_a.usedBlocks());
 }

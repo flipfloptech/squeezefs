@@ -37,8 +37,14 @@ pub const Ctx = filesystem.Ctx;
 pub const Dispatcher = lifecycle.Dispatcher;
 pub const LoopbackDispatcher = lifecycle.Dispatcher(transport_seam.Loopback);
 
-/// The first mount's filesystem over the Linux KV backend.
-pub const BackendFs = if (builtin.os.tag == .linux) kv_fs.KvFs(@import("../meta/backend.zig").KvBackend) else struct {};
+/// The product filesystem: the Linux KV backend + the data plane.
+pub const BackendFs = if (builtin.os.tag == .linux) kv_fs.KvFs(@import("../meta/backend.zig").KvBackend, @import("../data/plane.zig").DataPlane) else struct {};
+/// The data plane's queue-thread arms (the probe, the direct leg, the W1
+/// hold gate), bound into `ring.Binding` by the mount; null = rung 3's
+/// declines (the loopback tests, a plane-less binding).
+pub const DataArms = if (builtin.os.tag == .linux) struct {
+    plane: *@import("../data/plane.zig").DataPlane,
+} else struct {};
 /// The device-path end-to-end suite (Linux).
 pub const backend_e2e = if (builtin.os.tag == .linux) @import("handler/backend_e2e.zig") else struct {};
 
@@ -76,9 +82,15 @@ pub const ring = struct {
     pub const Binding = struct {
         transport: Transport = .{},
         d: RingDispatcher = undefined,
+        arms: ?DataArms = null,
 
         pub fn bind(self: *Binding, opts: lifecycle.Options) void {
             self.d = RingDispatcher.init(&self.transport, opts);
+        }
+
+        /// The data plane's arms (after `bind`, before the session arms).
+        pub fn bindData(self: *Binding, arms: DataArms) void {
+            self.arms = arms;
         }
 
         pub fn filesystem(self: *Binding) fsv.Filesystem {
@@ -115,28 +127,35 @@ pub const ring = struct {
             of(ctx).d.dispatch(req.op, .{ .unique = req.header.unique, .nodeid = req.header.nodeid, .uid = req.header.uid, .gid = req.header.gid, .pid = req.header.pid }, h, lease);
         }
 
-        /// The READ dispatch law's arm (a): rung 4's try-only warm ladder.
-        /// Rung 3 has no resident tier to serve from, so every READ takes
-        /// arm (c) — the lane homed on the queue's CPU.
-        fn fsProbeRead(_: *anyopaque, _: fsv.Request, _: []u8) ?codec.Reply {
-            return null;
+        /// The READ dispatch law's arm (a): the data plane's try-only warm
+        /// ladder (per-inode try-lock → the write side → hot tier → hold →
+        /// NVMe read cache), on the queue thread; without a plane every
+        /// READ takes arm (c) — the lane homed on the queue's CPU.
+        fn fsProbeRead(ctx: *anyopaque, req: fsv.Request, window: []u8) ?fsv.ProbeReply {
+            if (builtin.os.tag != .linux) return null;
+            const arms = of(ctx).arms orelse return null;
+            return arms.plane.ladder.probeRead(req, window);
         }
 
         fn fsForget(ctx: *anyopaque, ino: u64, nlookup: u64) void {
             of(ctx).d.forget(ino, nlookup);
         }
 
-        /// The W1 hold gate: rung 3's inline layout has no striped block
-        /// to patch in place, so no WRITE is held — every zc payload is
-        /// extracted at delivery. Rung 4's data plane publishes the
-        /// per-inode snapshot this predicate reads.
-        fn fsWriteHoldEligible(_: *anyopaque, _: fsv.HoldHint) bool {
-            return false;
+        /// The W1 hold gate: the plane's pure predicate over the hint and
+        /// its published per-inode shape (`patch_w1`'s request-shape half
+        /// plus striped ∧ passthrough ∧ non-extending); no plane ⇒ nothing
+        /// is held and every zc payload is extracted at delivery.
+        fn fsWriteHoldEligible(ctx: *anyopaque, hint: fsv.HoldHint) bool {
+            if (builtin.os.tag != .linux) return false;
+            const arms = of(ctx).arms orelse return false;
+            return arms.plane.writeHoldEligible(hint);
         }
 
-        /// The direct device leg: no data volumes in rung 3.
-        fn fsDirectLeg(_: *anyopaque, _: fsv.Request) ?fsv.DirectLeg {
-            return null;
+        /// The direct device leg with its post-DMA recheck hook.
+        fn fsDirectLeg(ctx: *anyopaque, req: fsv.Request) ?fsv.DirectLeg {
+            if (builtin.os.tag != .linux) return null;
+            const arms = of(ctx).arms orelse return null;
+            return arms.plane.ladder.directLegFor(req);
         }
     };
 };
@@ -199,7 +218,8 @@ const RecordingTx = struct {
 test "ring binding: the session's vtable reaches the lifecycle — init negotiates, a dispatch answers through the handle exactly once, the probe declines, forget hands off, destroy sweeps" {
     var store = try kv_fs.MemStore.init(testing.allocator);
     defer store.deinit();
-    var fs = try kv_fs.MemFs.mount(testing.allocator, testing.io, &store, .{ .dlm_stripes = 64 });
+    var nodata: kv_fs.NoData = .{};
+    var fs = try kv_fs.MemFs.mount(testing.allocator, testing.io, &store, &nodata, .{ .dlm_stripes = 64 });
     defer fs.unmount();
     var reg = try watchdog.Registry.init(testing.allocator, 1);
     defer reg.deinit();

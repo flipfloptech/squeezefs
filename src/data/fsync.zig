@@ -328,7 +328,7 @@ fn flushParked(ctx: Ctx, io: Io, ino: u64, retried: bool) Error!void {
     var parked_after: u32 = 0;
     for (bl) |b| {
         switch (accumulate.flushParkedBlock(ctx.table, ctx.upload, io, ino, b)) {
-            .published, .discarded, .superseded => {},
+            .published, .discarded, .superseded, .joined => {},
             .fence_drop => return error.WriterGuardFenced,
             .stay_parked => parked_after += 1,
         }

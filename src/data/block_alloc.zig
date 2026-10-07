@@ -379,8 +379,13 @@ pub const stats = struct {
     pub var block_claim_anomalies: counters.Tripwire = .init("block_claim_anomalies");
     pub var block_key_incarnation_exhausted: counters.Tripwire = .init("block_key_incarnation_exhausted");
     pub var block_live_free_refusals: counters.Tripwire = .init("block_live_free_refusals");
-    pub var unpublished_mint_abandons: counters.Tripwire = .init("unpublished_mint_abandons");
     pub var alloc_trim_window_parks: counters.Tripwire = .init("alloc_trim_window_parks");
+    /// An unpublished mint returned by its rollback owner: a failed DMA, a
+    /// publish refused, or a write-through SUPERSEDED by a newer write
+    /// landing during its DMA (latest-wins — a healthy storm's outcome, so
+    /// an event count and never a tripwire; `≡ write_pipeline_supersessions
+    /// + write_pipeline_discards` on a healthy device is the smoke's law).
+    pub var unpublished_mint_abandons: counters.ShardedCounter = .{};
     // Per-op counters.
     pub var alloc_from_freelist: counters.ShardedCounter = .{};
     pub var alloc_fresh_mints: counters.ShardedCounter = .{};
@@ -403,10 +408,10 @@ pub var fresh_supply_latched: Atomic(usize) = .init(0);
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered" }) |name| {
+    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "unpublished_mint_abandons", "alloc_trim_window_parks" }) |name| {
+    inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "alloc_trim_window_parks" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, counters.tripwireCount(name) });
     }
     try w.print("\"alloc_fresh_supply_exhausted\":[{d},{d}]}}", .{ stats.alloc_fresh_supply_exhausted_latched.load(), stats.alloc_fresh_supply_exhausted_candidates.load() });
@@ -1138,10 +1143,11 @@ pub const BlockAllocator = struct {
     /// Law 9 / Q13: an UNPUBLISHED mint returns to the allocator only
     /// through its rollback owner, synchronously — the grant window when
     /// the window minted it, else a terminal free (`unpublished_mint_
-    /// abandons` counts the event: nonzero after a failed DMA is the design
-    /// working; growth under a healthy device is a leak upstream).
+    /// abandons` counts the event: a failed DMA, a refused publish or a
+    /// superseded write-through are the design working; growth past
+    /// `supersessions + discards` under a healthy device is a leak upstream).
     pub fn abandonUnpublished(self: *BlockAllocator, idx: u64) void {
-        stats.unpublished_mint_abandons.fire("unpublished mint abandoned");
+        stats.unpublished_mint_abandons.inc();
         if (self.forensics) |*t| t.record(idx, .abandon);
         if (self.grant_source) |g| {
             if (g.vtable.giveBack(g.ctx, idx)) {
@@ -1746,12 +1752,9 @@ test "guards: the in-flight guard is visibility only; the mint guard's abandon r
     inflight.deinit();
     try testing.expect(!a.inflightContains(m.idx));
     try testing.expectEqual(State.allocated, a.stateOf(m.idx)); // dropping visibility freed nothing
-    const before = counters.tripwireCount("unpublished_mint_abandons");
-    stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
+    const before = stats.unpublished_mint_abandons.load();
     mint.abandon();
-    try log.testing.expectAllFired();
-    try testing.expectEqual(before + 1, counters.tripwireCount("unpublished_mint_abandons"));
+    try testing.expectEqual(before + 1, stats.unpublished_mint_abandons.load());
     try testing.expectEqual(State.free, a.stateOf(m.idx));
     mint.abandon(); // idempotent
     const m2 = try a.allocateBlock();
@@ -1898,10 +1901,7 @@ test "seams: a grant window is the ONE mint source when armed; a finish-free sin
     try testing.expectError(error.StorageFull, a.allocateBlock());
     try testing.expectEqual(@as(u32, 1), w.exhausted);
     var g = MintedBlockGuard.init(a, m9);
-    stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
     g.abandon();
-    try log.testing.expectAllFired();
     try testing.expectEqual(@as(u64, 1), w.given_back);
     try testing.expectEqual(State.virgin, a.stateOf(9)); // back in the window: unminted
     try testing.expectError(error.NotFree, a.allocateSpecificBlock(12)); // Q9: no runtime gap fill on an armed allocator

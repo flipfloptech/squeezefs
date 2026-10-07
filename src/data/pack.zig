@@ -637,31 +637,31 @@ pub const Packer = struct {
     /// it landed inside an RMW's stage→commit window and freed the sole
     /// copy); the displaced block freed AFTER the guard (RES-1). A failed
     /// save leaves the refs retracted with the tx and abandons the slot.
-    pub fn commit(self: *Packer, prepared: Prepared, c: CommitCtx, t: *tx.KvTx) CommitOutcome {
-        const guard = c.stripes.acquire(c.ino);
+    pub fn commit(self: *Packer, io: Io, prepared: Prepared, c: CommitCtx, t: *tx.KvTx) CommitOutcome {
+        const guard = c.stripes.acquire(io, c.ino);
         const sk = staging.StagingKey.init(c.file_id, c.ino);
         const cur = c.lookup.current(c.lookup.ctx, c.ino);
         const bound = if (cur) |l| l.kind == .staged and std.mem.eql(u8, &l.file_id, &c.file_id) else false;
         if (!bound or c.seg.residentGeneration(sk) != c.generation) {
-            guard.release();
+            guard.release(io);
             self.releaseLandedSite(prepared.tenant);
             return .stale;
         }
         const prev = cur.?;
         const new = layout.Layout.packedTenant(@max(prev.size, prepared.image_len), c.file_id, prepared.mapping);
         layout.publishLayout(t, .{ .ino = c.ino, .hash_seed = c.hash_seed, .coll_seq = c.coll_seq, .prev = prev, .layout = new, .proofs = &.{prepared.proof} }, c.refs, c.geo) catch {
-            guard.release();
+            guard.release(io);
             self.releaseLandedSite(prepared.tenant);
             return .failed;
         };
         c.commit.commit(c.commit.ctx, t) catch {
-            guard.release();
+            guard.release(io);
             self.releaseLandedSite(prepared.tenant);
             return .failed;
         };
         _ = staging.releaseStaged(c.pool, c.seg, sk, c.generation);
         const displaced = prev.durableCopy();
-        guard.release();
+        guard.release(io);
         if (displaced) |d| self.releaseTenantRef(d);
         _ = prepared.tenant.pack.inflight.fetchSub(1, .acq_rel);
         _ = prepared.tenant.pack.committed.fetchAdd(1, .acq_rel);
@@ -1248,7 +1248,7 @@ const Fixture = struct {
         const prepared = (try self.packer.prepare(io, k, lease.bytes(), 1)) orelse return error.ArmStopped;
         var t = tx.KvTx.init(self.world.gpa, @src());
         defer t.deinit();
-        return self.packer.commit(prepared, self.ctx(ino, seed, generation), &t);
+        return self.packer.commit(io, prepared, self.ctx(ino, seed, generation), &t);
     }
 };
 
@@ -1323,7 +1323,7 @@ test "commit re-checks the identity under the stripe: a re-stage (new generation
     const abandoned0 = stats.pack_slots_abandoned.load();
     var t = tx.KvTx.init(gpa, @src());
     defer t.deinit();
-    try testing.expectEqual(CommitOutcome.stale, f.packer.commit(prepared, f.ctx(20, 1, g1), &t));
+    try testing.expectEqual(CommitOutcome.stale, f.packer.commit(io, prepared, f.ctx(20, 1, g1), &t));
     try testing.expectEqual(abandoned0 + 1, stats.pack_slots_abandoned.load());
     try testing.expectEqual(layout.Kind.staged, World.current(&f.world, 20).?.kind);
     try testing.expectEqual(@as(u32, 0), f.world.durableRefcount(0x11, 0));
@@ -1336,7 +1336,7 @@ test "commit re-checks the identity under the stripe: a re-stage (new generation
     lease2.release();
     var t2 = tx.KvTx.init(gpa, @src());
     defer t2.deinit();
-    try testing.expectEqual(CommitOutcome.stale, f.packer.commit(prepared2, f.ctx(20, 9, g2), &t2));
+    try testing.expectEqual(CommitOutcome.stale, f.packer.commit(io, prepared2, f.ctx(20, 9, g2), &t2));
     // A failed KV commit: refs retracted (nothing durable), slot abandoned, the layout unchanged, the ring entry kept.
     const lease3 = f.seg.get(staging.StagingKey.init(Fixture.fid(1), 20)).?;
     const prepared3 = (try f.packer.prepare(io, k, lease3.bytes(), 1)).?;
@@ -1344,7 +1344,7 @@ test "commit re-checks the identity under the stripe: a re-stage (new generation
     f.world.commit_fail_next = true;
     var t3 = tx.KvTx.init(gpa, @src());
     defer t3.deinit();
-    try testing.expectEqual(CommitOutcome.failed, f.packer.commit(prepared3, f.ctx(20, 1, g2), &t3));
+    try testing.expectEqual(CommitOutcome.failed, f.packer.commit(io, prepared3, f.ctx(20, 1, g2), &t3));
     try testing.expectEqual(@as(u32, 0), f.world.durableRefcount(0x11, 0));
     try testing.expectEqual(layout.Kind.staged, World.current(&f.world, 20).?.kind);
     try testing.expect(f.seg.get(staging.StagingKey.init(Fixture.fid(1), 20)) != null);

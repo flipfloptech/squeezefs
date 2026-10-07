@@ -402,6 +402,24 @@ pub const Stats = struct {
             self.pass_panics.load(),
         });
     }
+
+    /// `meta_txpass_phase_ns` + `lock_phase_ns.leaf_lock_hold`: the
+    /// residence histograms (a stalled commit names its leg here).
+    pub fn writePhasesJson(self: *const Stats, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll("{\"meta_tx_queue_wait\":");
+        try self.tx_queue_wait.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_pass_admission\":");
+        try self.pass_admission.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_pass_leaf_locks\":");
+        try self.pass_leaf_locks.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_pass_total\":");
+        try self.pass_total.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_window_total\":");
+        try self.window_total.snapshot().writeJson(w);
+        try w.writeAll(",\"leaf_lock_hold\":");
+        try self.leaf_lock_hold.snapshot().writeJson(w);
+        try w.writeAll("}");
+    }
 };
 
 // ---------------------------------------------------------------------------

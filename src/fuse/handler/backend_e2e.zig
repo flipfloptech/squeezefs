@@ -27,7 +27,7 @@ comptime {
 }
 
 const testing = std.testing;
-const BackendFs = kv_fs.KvFs(backend.KvBackend);
+const BackendFs = kv_fs.KvFs(backend.KvBackend, kv_fs.NoData);
 const Loopback = seam.Loopback;
 const LoopDispatcher = lifecycle.Dispatcher(Loopback);
 
@@ -58,6 +58,7 @@ fn unlinkPath(path: []const u8) void {
 const Mount = struct {
     sqz: *exec.SqzIo,
     be: *backend.KvBackend,
+    nodata: kv_fs.NoData = .{},
     fs: BackendFs,
     lb: Loopback,
     reg: watchdog.Registry,
@@ -74,7 +75,8 @@ const Mount = struct {
         const io = self.sqz.io();
         self.be = try backend.KvBackend.open(gpa, io, path, .{ .env = env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
         errdefer self.be.close();
-        self.fs = try BackendFs.mount(gpa, io, self.be, .{ .dlm_stripes = 64 });
+        self.nodata = .{};
+        self.fs = try BackendFs.mount(gpa, io, self.be, &self.nodata, .{ .dlm_stripes = 64 });
         errdefer self.fs.unmount();
         self.lb = try Loopback.init(gpa, 1, 8192);
         errdefer self.lb.deinit();

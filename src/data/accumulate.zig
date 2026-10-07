@@ -38,6 +38,7 @@ const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const jc = @import("../meta/journal_core.zig");
 const budget = @import("../mem/budget.zig");
+const sync_notify = @import("../sync/notify.zig");
 const layout = @import("layout.zig");
 const block_alloc = @import("block_alloc.zig");
 const enospc = @import("enospc.zig");
@@ -50,6 +51,10 @@ const extent = @import("extent_overlay.zig");
 pub const Binding = seams.Binding;
 pub const CoverageUnion = cov.CoverageUnion;
 pub const PAGE: u32 = seams.PAGE;
+/// The join's bark bound: an upload is one bounded DMA plus one
+/// transaction; 30 s is the overlay settle's own bound (`SETTLE_BARK_NS`)
+/// — loud, never a hang.
+pub const UPLOAD_JOIN_BARK_NS: u64 = 30 * std.time.ns_per_s;
 
 // ---------------------------------------------------------------------------
 // Derivations (every constant with its WHY).
@@ -95,6 +100,9 @@ pub const stats = struct {
     pub var write_through_blocks: counters.ShardedCounter = .{};
     pub var write_through_bytes: counters.ShardedCounter = .{};
     pub var write_through_fallbacks: counters.ShardedCounter = .{};
+    /// A flush waited the bark bound on another task's upload (must-stay-0:
+    /// an upload is a bounded DMA + one transaction).
+    pub var upload_join_overlong: counters.Tripwire = .init("upload_join_overlong");
     /// THE one userspace copy's bytes.
     pub var nt_copy_bytes: counters.ShardedCounter = .{};
     pub var active_block_cow_copies: counters.ShardedCounter = .{};
@@ -122,7 +130,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
-    inline for (.{ "coverage_complete_buffer_not_content_valid", "complete_union_with_extra_runs", "zero_complete_on_deferred_seed", "active_block_table_full" }, 0..) |name, i| {
+    inline for (.{ "coverage_complete_buffer_not_content_valid", "complete_union_with_extra_runs", "zero_complete_on_deferred_seed", "active_block_table_full", "upload_join_overlong" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, counters.tripwireCount(name) });
     }
@@ -345,6 +353,11 @@ pub const Table = struct {
     index: std.AutoHashMapUnmanaged(Key, *Entry) = .empty,
     lock: jc.SpinLock = .{},
     count: Atomic(u32) = .init(0),
+    /// Notified whenever an upload task ends (publish, discard, supersede,
+    /// a transient): the JOIN of a second flush of the same block (an
+    /// fsync or a RELEASE racing the write-through) waits here instead of
+    /// minting a second block for one image.
+    upload_settled: sync_notify.Notify = .init,
 
     pub fn init(gpa: Allocator, block_size: u32, cap_buffers: u64) Allocator.Error!Table {
         const cap: usize = @intCast(cap_buffers);
@@ -666,21 +679,59 @@ pub const Disposition = pipeline.Disposition;
 /// (admit_wait/detach_lag already marked).
 pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32, prof: *pipeline.Prof) Disposition {
     const bs: u64 = table.block_size;
+    // ONE upload per entry at a time: a second flush of the same block (an
+    // fsync or a RELEASE racing the write-through, two RELEASEs of one
+    // file) JOINS the in-flight one — register-then-recheck on the table's
+    // settle notify — instead of minting a second block for the same image
+    // and abandoning it at the publish (`unpublished_mint_abandons`).
+    var joined = false;
+    // `upload_inflight` is cleared on EVERY exit that leaves the entry
+    // parked, and the settle is notified on every exit.
+    var retired_by_us = false;
+    defer {
+        if (!retired_by_us) {
+            const g = deps.locks.acquire(io, ino, block, .pipeline_upload);
+            if (table.get(ino, block)) |e| e.upload_inflight = false;
+            g.release(io);
+        }
+        table.upload_settled.notifyWaiters(io);
+    }
     while (true) {
         // The snapshot + the epoch stamp under (3).
         var snap: Snapshot = undefined;
         var old_binding: ?Binding = null;
         var app_end: u32 = 0;
         {
-            const g = deps.locks.acquire(io, ino, block, .pipeline_upload);
-            defer g.release(io);
-            prof.mark(.lock_wait);
-            const e = table.get(ino, block) orelse return .discarded;
-            if (e.repr != .full or !e.content_valid or e.seed == .deferred) return .stay_parked;
-            e.upload_inflight = true;
-            snap = table.snapshot(e);
-            old_binding = e.old_binding;
-            app_end = e.app_end;
+            var settle = table.upload_settled.notified();
+            _ = settle.enable(io);
+            var inflight_elsewhere = false;
+            {
+                const g = deps.locks.acquire(io, ino, block, .pipeline_upload);
+                defer g.release(io);
+                prof.mark(.lock_wait);
+                const e = table.get(ino, block) orelse {
+                    settle.cancel(io);
+                    return if (joined) .joined else .discarded;
+                };
+                if (e.upload_inflight) {
+                    inflight_elsewhere = true;
+                } else {
+                    settle.cancel(io);
+                    if (e.repr != .full or !e.content_valid or e.seed == .deferred) return .stay_parked;
+                    e.upload_inflight = true;
+                    snap = table.snapshot(e);
+                    old_binding = e.old_binding;
+                    app_end = e.app_end;
+                }
+            }
+            if (inflight_elsewhere) {
+                joined = true;
+                if (settle.waitUntilUncancelable(io, clock.monotonicNs() + UPLOAD_JOIN_BARK_NS) == .deadline) {
+                    stats.upload_join_overlong.fire("a flush waited 30 s on another task's upload of the same block");
+                    log.err("ino {d} block {d}: an upload has been in flight for 30 s while a second flush waits on it", .{ ino, block });
+                }
+                continue;
+            }
         }
         defer snap.release(&table.pool);
         // UNLOCKED device phase: transform → allocate (unstable) → DMA → publish.
@@ -691,7 +742,8 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 // parked (the admission's terminal law refuses NEW custody).
                 if (deps.epochs.closeAllForSpace(io, .{ .map = deps.map, .free = deps.free, .purge = deps.purge })) {
                     epoch_mod.stats.rewrite_shadow_fallbacks.inc();
-                    continue;
+                    clearInflight(table, deps, io, ino, block);
+                    continue; // re-drive: the re-check above would otherwise join OUR OWN flag
                 }
                 stats.write_through_fallbacks.inc();
                 return .stay_parked;
@@ -775,8 +827,8 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 }
             }
             if (!fed) {
-                const sg = deps.stripes.acquire(ino);
-                defer sg.release();
+                const sg = deps.stripes.acquire(io, ino);
+                defer sg.release(io);
                 while (true) {
                     displaced = deps.map.merge(.{ .ino = ino, .inserts = &.{.{ .block = block, .binding = new_key }}, .min_size = min_size, .proofs = &.{proof}, .fencing = deps.map.currentFencing(ino) }) catch |err| switch (err) {
                         error.FencingTokenExpired => continue,
@@ -789,6 +841,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                             fsck_guard.deinit();
                             mint.abandon();
                             table.retire(e);
+                            retired_by_us = true;
                             return .discarded;
                         },
                         error.Transient, error.OutOfMemory => {
@@ -813,6 +866,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             // can race the retire (the 2026-08-04 crash).
             for (displaced.slice()) |d| deps.purge.purge(d);
             table.retire(e);
+            retired_by_us = true;
             prof.mark(.inval_tail);
         }
         stats.write_through_blocks.inc();
@@ -824,6 +878,13 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         if (fed_hint) _ = deps.epochs.close(io, ino, .park, .{ .map = deps.map, .free = deps.free, .purge = deps.purge });
         return .published;
     }
+}
+
+/// The in-flight flag cleared under (3) for a re-drive of the same task.
+fn clearInflight(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) void {
+    const g = deps.locks.acquire(io, ino, block, .pipeline_upload);
+    defer g.release(io);
+    if (table.get(ino, block)) |e| e.upload_inflight = false;
 }
 
 /// The synchronous flush of a PARTIAL parked block (an fsync's DUR-1
@@ -1126,8 +1187,7 @@ test "stale_inflight_upload_never_publishes_and_newest_bytes_win: a write landin
     w.f.dev.hook = .{ .ctx = &dummy, .call = &Racer.hook };
     const sup0 = pipeline.stats.write_pipeline_supersessions.load();
     const used0 = w.f.alloc_a.usedBlocks();
-    block_alloc.stats.unpublished_mint_abandons.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1); // the superseded mint's abandon
+    const abandons0 = block_alloc.stats.unpublished_mint_abandons.load();
     var prof = pipeline.Prof.start();
     // The hook fires on EVERY DMA: disarm it after the first.
     const Once = struct {
@@ -1141,8 +1201,8 @@ test "stale_inflight_upload_never_publishes_and_newest_bytes_win: a write landin
     w.f.dev.hook = .{ .ctx = &dummy, .call = &Once.hook };
     const d = uploadParkedBlock(&w.table, w.deps(), io, 6, 0, &prof);
     prof.finish();
-    try log.testing.expectAllFired();
     try testing.expectEqual(Disposition.published, d);
+    try testing.expectEqual(abandons0 + 1, block_alloc.stats.unpublished_mint_abandons.load()); // the superseded mint went back
     try testing.expectEqual(sup0 + 1, pipeline.stats.write_pipeline_supersessions.load());
     try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len); // the stale pass published nothing
     try testing.expectEqual(used0 + 1, w.f.alloc_a.usedBlocks()); // the orphan offset returned; one block owned
@@ -1229,4 +1289,56 @@ test "flushParkedBlock (DUR-1 escalation): a partial fresh block zero-completes 
     w.f.dev.peek(wt.VOL_A, nb.offset, &got);
     try testing.expect(std.mem.allEqual(u8, got[0 .. wt.BS / 2], 0x44));
     try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0xAA));
+}
+
+test "two flushes of one parked block (a RELEASE racing an fsync): the second JOINS the in-flight upload — one mint, one merge, no abandoned mint; the joiner answers `joined`" {
+    const io = testing.io;
+    const w = try UploadWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(12, .striped, 0);
+    const e = w.table.checkout(12, 0, false, null).?;
+    var data: [wt.BS]u8 = @splat(0x55);
+    _ = try w.table.recordWrite(e, 0, &data);
+    // The first upload's DMA parks on the hook until the joiner is waiting.
+    const Gate = struct {
+        var hold: std.atomic.Value(bool) = .init(true);
+        var in_dma: std.atomic.Value(bool) = .init(false);
+        fn hook(_: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+            in_dma.store(true, .release);
+            while (hold.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    var dummy: u8 = 0;
+    w.f.dev.hook = .{ .ctx = &dummy, .call = &Gate.hook };
+    const Uploader = struct {
+        fn run(io_: Io, table: *Table, deps: UploadDeps, out: *Disposition) void {
+            out.* = uploadWith(table, deps, io_, 12, 0);
+        }
+    };
+    const used0 = w.f.alloc_a.usedBlocks();
+    const abandons0 = block_alloc.stats.unpublished_mint_abandons.load();
+    const joins0 = pipeline.stats.write_pipeline_joins.load();
+    var first: Disposition = .stay_parked;
+    const th = try std.Thread.spawn(.{}, Uploader.run, .{ io, &w.table, w.deps(), &first });
+    while (!Gate.in_dma.load(.acquire)) try std.Thread.yield();
+    // The joiner: flushParkedBlock on the same block while the DMA is held.
+    const Joiner = struct {
+        fn run(io_: Io, table: *Table, deps: UploadDeps, out: *Disposition) void {
+            out.* = flushParkedBlock(table, deps, io_, 12, 0);
+        }
+    };
+    var second: Disposition = .stay_parked;
+    const tj = try std.Thread.spawn(.{}, Joiner.run, .{ io, &w.table, w.deps(), &second });
+    while (w.table.upload_settled.waiters(io) == 0) try std.Thread.yield();
+    Gate.hold.store(false, .release);
+    th.join();
+    tj.join();
+    w.f.dev.hook = null;
+    try testing.expectEqual(Disposition.published, first);
+    try testing.expectEqual(Disposition.joined, second);
+    try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len);
+    try testing.expectEqual(used0 + 1, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(abandons0, block_alloc.stats.unpublished_mint_abandons.load());
+    try testing.expectEqual(joins0 + 1, pipeline.stats.write_pipeline_joins.load());
+    try testing.expect(!w.table.has(12, 0));
 }

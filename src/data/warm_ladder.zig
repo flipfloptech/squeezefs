@@ -26,8 +26,14 @@
 //!
 //! The zc legs: `directLeg` computes the PURE eligibility of the direct
 //! device leg (cold ∧ passthrough ∧ 4 KiB-aligned ∧ single block ∧ not
-//! device-true ∧ resolvable) and `fdSource` is the fill-pool bounce (the
-//! handler's `replyFdBody(memfd, off)` from the MAP_SHARED slab).
+//! device-true ∧ resolvable) and arms it with the post-DMA RECHECK hook the
+//! transport runs at the bridge CQE (incarnation still ∧ binding still —
+//! charter §6.3's validation AFTER the bytes are in hand; a failed recheck
+//! withdraws the prefilled reply); `probeRead` answers a hot-tier / hold
+//! hit that lies on the memfd fill pool as an `fd_source` (the pin released
+//! by the CQE hook) when the session serves zc; the hold-serve ceremony
+//! (`holdServeAdmission`) is DEFERRED to a lane through `ceremony` — the
+//! queue thread never publishes into the mmap tier.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -66,10 +72,16 @@ pub const stats = struct {
     pub var fast_dispatch_serve_cache: counters.ShardedCounter = .{};
     /// Direct legs the predicate admitted (the transport bridges them).
     pub var direct_leg_offers: counters.ShardedCounter = .{};
+    /// Direct legs whose post-DMA recheck failed (the reply withdrawn).
+    pub var direct_leg_recheck_failures: counters.ShardedCounter = .{};
+    /// Probe serves answered as an fd-source (zero daemon passes).
+    pub var fast_dispatch_fd_source_serves: counters.ShardedCounter = .{};
+    /// Hold-serve ceremonies handed to a lane from the probe path.
+    pub var fast_dispatch_hold_ceremonies: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"fast_dispatch_serves\":{d},\"fast_dispatch_demotes\":{d},\"fast_dispatch_demote_pre_screen\":{d},\"fast_dispatch_demote_contended\":{d},\"fast_dispatch_demote_write_side\":{d},\"fast_dispatch_demote_miss\":{d},\"fast_dispatch_eof\":{d},\"ipc_hold_probe_serves\":{d},\"ipc_hold_probe_misses\":{d},\"fast_dispatch_serve_inline\":{d},\"fast_dispatch_serve_staged\":{d},\"fast_dispatch_serve_hot\":{d},\"fast_dispatch_serve_hold\":{d},\"fast_dispatch_serve_cache\":{d},\"direct_leg_offers\":{d}}}", .{
+    try w.print("{{\"fast_dispatch_serves\":{d},\"fast_dispatch_demotes\":{d},\"fast_dispatch_demote_pre_screen\":{d},\"fast_dispatch_demote_contended\":{d},\"fast_dispatch_demote_write_side\":{d},\"fast_dispatch_demote_miss\":{d},\"fast_dispatch_eof\":{d},\"ipc_hold_probe_serves\":{d},\"ipc_hold_probe_misses\":{d},\"fast_dispatch_serve_inline\":{d},\"fast_dispatch_serve_staged\":{d},\"fast_dispatch_serve_hot\":{d},\"fast_dispatch_serve_hold\":{d},\"fast_dispatch_serve_cache\":{d},\"direct_leg_offers\":{d}", .{
         stats.fast_dispatch_serves.load(),
         stats.fast_dispatch_demotes.load(),
         stats.fast_dispatch_demote_pre_screen.load(),
@@ -86,6 +98,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.fast_dispatch_serve_cache.load(),
         stats.direct_leg_offers.load(),
     });
+    try w.print(",\"direct_leg_recheck_failures\":{d},\"fast_dispatch_fd_source_serves\":{d},\"fast_dispatch_hold_ceremonies\":{d}}}", .{ stats.direct_leg_recheck_failures.load(), stats.fast_dispatch_fd_source_serves.load(), stats.fast_dispatch_hold_ceremonies.load() });
 }
 
 /// Why the ladder declined (the handler owns the request from here).
@@ -100,10 +113,14 @@ pub const Demote = enum(u8) {
 pub const Arm = enum(u8) { inline_, staged, hot, hold, cache };
 
 pub const Verdict = union(enum) {
-    served: struct { n: usize, arm: Arm },
+    served: struct { n: usize, arm: Arm, view: ?[]const u8 = null, pinned: ?Pinned = null },
     eof,
     demote: Demote,
 };
+
+/// The pinned fill-pool view behind an fd-source serve (released by the
+/// bridge-completion hook).
+pub const Pinned = union(enum) { hot: hot_tier.Hit, hold: @import("read_hold.zig").Served };
 
 /// The pure eligibility of the direct device leg: cold is the CALLER's
 /// premise (the probe declined first).
@@ -117,12 +134,22 @@ pub const WarmLadder = struct {
     rp: *read_path.ReadPath,
     guards: *op_guard.Table,
     io: Io,
-    /// The direct device leg is OFFERED only once the transport can run the
-    /// post-DMA incarnation + binding recheck at its bridge completion (the
-    /// reference validated after its synchronous fetch; `filesystem_vtable`
-    /// has no completion hook yet). Until then the leg declines — never
-    /// unvalidated device bytes in an app's pages.
+    /// The direct device leg is OFFERED only with the recheck hook the
+    /// transport runs at the bridge completion (`fsv.DirectLeg.hook`); the
+    /// mount arms it on a zero-copy session.
     direct_leg_armed: bool = false,
+    /// The probe answers memfd-pool views as `fd_source` (a zero-copy
+    /// session with `SQUEEZEFS_READ_ZC_SERVE`); off = the copy arm.
+    fd_source_armed: bool = false,
+    /// The deferred hold-serve ceremony: the mount spawns
+    /// `ReadPath.holdCeremony` on a lane; null = the ceremony waits for the
+    /// next lane-side serve.
+    ceremony: ?Ceremony = null,
+
+    pub const Ceremony = struct {
+        ctx: ?*anyopaque,
+        spawn: *const fn (ctx: ?*anyopaque, key: BlockKey, class: read_path.FillClass) void,
+    };
 
     /// The probe: serve `[offset, offset + size)` of `ino` INTO `window`.
     pub fn probe(self: *WarmLadder, ino: u64, offset: u64, size: u32, odirect: bool, window: []u8) Verdict {
@@ -169,7 +196,16 @@ pub const WarmLadder = struct {
         if (odirect) read_path.stats.read_odirect_requests.inc();
         // 5. The ring feed: silent consumption advances the consume edge.
         rp.ringReadLaneTouch(ino, offset, v.n, info.size);
-        return .{ .served = .{ .n = v.n, .arm = v.arm } };
+        return .{ .served = .{ .n = v.n, .arm = v.arm, .view = v.view, .pinned = v.pinned } };
+    }
+
+    /// Release the pin an fd-source serve took (the CQE hook's body; also
+    /// the probe's own exit when the transport cannot bridge).
+    pub fn unpinServed(self: *WarmLadder, pinned: Pinned) void {
+        switch (pinned) {
+            .hot => |hit| self.rp.hot.unpin(hit),
+            .hold => |sv| self.rp.hold.unpin(sv),
+        }
     }
 
     fn demote(_: *WarmLadder, why: Demote) Verdict {
@@ -183,7 +219,14 @@ pub const WarmLadder = struct {
         return .{ .demote = why };
     }
 
-    const Served = struct { n: usize, arm: Arm };
+    const Served = struct {
+        n: usize,
+        arm: Arm,
+        /// A view on the fill pool the probe may answer as an fd-source
+        /// instead of copying (the copy into `out` was NOT made).
+        view: ?[]const u8 = null,
+        pinned: ?Pinned = null,
+    };
 
     /// Rungs 3–4 by layout; null = Miss.
     fn serve(self: *WarmLadder, ino: u64, info: read_path.FileInfo, offset: u64, out: []u8, odirect: bool) ?Served {
@@ -224,24 +267,34 @@ pub const WarmLadder = struct {
                 const key = rp.meta.binding(rp.meta.ctx, ino, b) orelse return null;
                 const k = BlockKey.fromMapping(key);
                 if (rp.hot.getServing(k, out.len)) |hit| {
-                    defer rp.hot.unpin(hit);
-                    @memcpy(out, rp.pool.bytes(hit.slot)[@intCast(rel_s)..@intCast(rel_e)]);
+                    const view = rp.pool.bytes(hit.slot)[@intCast(rel_s)..@intCast(rel_e)];
                     hot_tier.stats.hot_block_hits.inc();
                     read_path.stats.cache_hits.inc();
                     if (rp.cfg.read_lane) rp.hold.credit(k, out.len);
                     if (odirect) read_path.stats.read_odirect_tier_serves.inc();
+                    if (self.fd_source_armed and rp.fdSource(view) != null) return .{ .n = out.len, .arm = .hot, .view = view, .pinned = .{ .hot = hit } };
+                    defer rp.hot.unpin(hit);
+                    @memcpy(out, view);
                     return .{ .n = out.len, .arm = .hot };
                 }
                 if (rp.cfg.read_lane) {
                     if (rp.hold.serve(k, 0)) |sv| {
-                        defer rp.hold.unpin(sv);
-                        @memcpy(out, rp.pool.bytes(sv.slot)[@intCast(rel_s)..@intCast(rel_e)]);
+                        const view = rp.pool.bytes(sv.slot)[@intCast(rel_s)..@intCast(rel_e)];
                         read_path.stats.cache_hits.inc();
                         read_path.stats.read_lane_serves.inc();
                         read_path.stats.read_lane_serve_bytes.add(out.len);
                         stats.ipc_hold_probe_serves.inc();
                         rp.hold.credit(k, out.len);
                         if (odirect) read_path.stats.read_odirect_tier_serves.inc();
+                        // The ceremony (the deposit's tier admission) runs on a
+                        // lane — never a publish from the queue thread.
+                        if (sv.ledger_visible) if (self.ceremony) |c| {
+                            stats.fast_dispatch_hold_ceremonies.inc();
+                            c.spawn(c.ctx, k, if (odirect) .demand else .demand_stream);
+                        };
+                        if (self.fd_source_armed and rp.fdSource(view) != null) return .{ .n = out.len, .arm = .hold, .view = view, .pinned = .{ .hold = sv } };
+                        defer rp.hold.unpin(sv);
+                        @memcpy(out, view);
                         return .{ .n = out.len, .arm = .hold };
                     }
                     stats.ipc_hold_probe_misses.inc();
@@ -273,8 +326,34 @@ pub const WarmLadder = struct {
         const k = BlockKey.fromMapping(m);
         if (rp.hot.contains(k) or rp.hold.contains(k) or rp.nvme.has(k) or rp.flights.inFlight(self.io, k)) return null;
         const fd = rp.vols.device_fd(rp.vols.ctx, k.vol_tag) orelse return null;
+        // The incarnation snapshot BEFORE the DMA; the hook re-reads it and
+        // the binding AFTER (a dead-lifetime key never DMAs at all).
+        const before = rp.incarnationSnapshot(k) orelse return null;
         stats.direct_leg_offers.inc();
-        return .{ .fd = fd, .off = k.offset + (offset - b * rp.cfg.block_size), .len = size };
+        return .{ .fd = fd, .off = k.offset + (offset - b * rp.cfg.block_size), .len = size, .hook = .{ .ctx = self, .token = .{ ino, b, k.vol_tag, k.offset, before, 0 }, .call = &directLegRecheck } };
+    }
+
+    /// The post-DMA recheck (worker thread, at the CQE): `incarnation still
+    /// (the pre-DMA snapshot) ∧ the CURRENT map still binds (ino, block) →
+    /// key` — the read path's (a) ∧ (b), linearized at this recheck.
+    fn directLegRecheck(ctx: ?*anyopaque, token: *const [6]u64, ok: bool) bool {
+        const self: *WarmLadder = @ptrCast(@alignCast(ctx.?));
+        if (!ok) return false;
+        const k = BlockKey.init(token[2], token[3]);
+        const rp = self.rp;
+        const valid = rp.incarnationStill(k, token[4]) and (if (rp.meta.binding(rp.meta.ctx, token[0], token[1])) |cur| BlockKey.fromMapping(cur).eql(k) else false);
+        if (!valid) stats.direct_leg_recheck_failures.inc();
+        return valid;
+    }
+
+    /// The fd-source CQE hook: release the view's pin.
+    fn fdSourceDone(ctx: ?*anyopaque, token: *const [6]u64, _: bool) bool {
+        const self: *WarmLadder = @ptrCast(@alignCast(ctx.?));
+        switch (token[0]) {
+            0 => self.rp.hot.unpin(.{ .slot = @intCast(token[1]), .len = @intCast(token[2]) }),
+            else => self.rp.hold.unpin(.{ .slot = @intCast(token[1]), .len = @intCast(token[2]), .ledger_visible = token[3] != 0 }),
+        }
+        return true;
     }
 
     /// The fill-pool bounce for the handler: `(memfd, off)` of a served
@@ -286,16 +365,35 @@ pub const WarmLadder = struct {
 
     // ---- the `Filesystem.VTable` arms (the lifecycle layer wires them) ----
 
-    /// `probe_read(ctx, req, window)`.
-    pub fn probeRead(self: *WarmLadder, req: fsv.Request, window: []u8) ?codec.Reply {
+    /// `probe_read(ctx, req, window)`: a served window, an fd-source for a
+    /// pinned pool view (the hook releases the pin at the CQE), EOF, or a
+    /// decline.
+    pub fn probeRead(self: *WarmLadder, req: fsv.Request, window: []u8) ?fsv.ProbeReply {
         const in = switch (req.op) {
             .read => |r| r,
             else => return null,
         };
         const o_direct: u32 = @bitCast(linux.O{ .DIRECT = true });
         return switch (self.probe(req.nodeid(), in.offset, in.size, in.flags & o_direct != 0, window)) {
-            .served => |s| codec.replyData(req.unique(), window[0..s.n]),
-            .eof => codec.replyData(req.unique(), &.{}),
+            .served => |s| blk: {
+                if (s.view) |view| {
+                    const pinned = s.pinned.?;
+                    const src = self.rp.fdSource(view) orelse {
+                        // Not on the slab after all: the copy arm.
+                        @memcpy(window[0..s.n], view);
+                        self.unpinServed(pinned);
+                        break :blk .{ .reply = codec.replyData(req.unique(), window[0..s.n]) };
+                    };
+                    stats.fast_dispatch_fd_source_serves.inc();
+                    const token: [6]u64 = switch (pinned) {
+                        .hot => |hit| .{ 0, hit.slot, hit.len, 0, 0, 0 },
+                        .hold => |sv| .{ 1, sv.slot, sv.len, @intFromBool(sv.ledger_visible), 0, 0 },
+                    };
+                    break :blk .{ .fd_source = .{ .unique = req.unique(), .fd = src.fd, .off = src.off, .body = view, .done = .{ .ctx = self, .token = token, .call = &fdSourceDone } } };
+                }
+                break :blk .{ .reply = codec.replyData(req.unique(), window[0..s.n]) };
+            },
+            .eof => .{ .reply = codec.replyData(req.unique(), &.{}) },
             .demote => null,
         };
     }

@@ -405,7 +405,7 @@ pub fn volumePopulation(store: RefStore, gpa: Allocator, vol_tag: u64, idxs: *st
             total += 1;
         }
         if (page.items.len < SCAN_PAGE) break;
-        cursor = key.keySuccessor(page.items[page.items.len - 1].key);
+        cursor = key.sameKindSuccessor(page.items[page.items.len - 1].key) orelse break;
     }
     if (total == 0) {
         log.info("data volume tag {x}: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator", .{vol_tag});
@@ -765,7 +765,7 @@ fn volumePopulationQuiet(store: RefStore, gpa: Allocator, vol_tag: u64, idxs: *s
             total += 1;
         }
         if (page.items.len < SCAN_PAGE) break;
-        cursor = key.keySuccessor(page.items[page.items.len - 1].key);
+        cursor = key.sameKindSuccessor(page.items[page.items.len - 1].key) orelse break;
     }
     return total;
 }
@@ -941,6 +941,11 @@ const RamStore = struct {
 
     pub fn range(self: *RamStore, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) StoreError!void {
         assert(kind == key.TREE_BLOCK_REFS);
+        // The backend ROUTES both bounds: a bound that does not decode as
+        // the kind (a `keySuccessor` one byte long) is refused there, so
+        // this double refuses it too.
+        _ = key.checkSlotTreeKey(kind, start) catch return error.Io;
+        _ = key.checkSlotTreeKey(kind, end) catch return error.Io;
         var i = self.find(start).idx;
         var n: usize = 0;
         while (i < self.rows.items.len and n < max) : (i += 1) {
@@ -1052,6 +1057,23 @@ test "refcount(block) is ONE range probe over the (vol_tag, block_idx) prefix; a
     try ram.put(&key.blockRefKey(0x10, 50, 1, 0), &.{ 9, 0, 0, 0 });
     try testing.expectError(error.Corrupt, refcount(store, gpa, 0x10, 50));
     try testing.expectError(error.Corrupt, volumePopulation(store, gpa, 0x10, &idxs));
+}
+
+test "the population scan resumes past SCAN_PAGE records with a cursor the store ROUTES (the same-kind successor): every record counted once" {
+    const gpa = testing.allocator;
+    var ram = RamStore.init(gpa);
+    defer ram.deinit();
+    const store = ram.store();
+    // SCAN_PAGE + 7 references over two owners, 3 blocks apiece pattern.
+    const n: u64 = SCAN_PAGE + 7;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        try ram.put(&key.blockRefKey(0x10, i % 300, 100 + i / 300, @intCast(i)), &(record.BlockRefValue{ .map_blob = false, .shared = false }).encode());
+    }
+    var idxs: std.ArrayList(u64) = .empty;
+    defer idxs.deinit(gpa);
+    try testing.expectEqual(@as(?usize, @intCast(n)), try volumePopulation(store, gpa, 0x10, &idxs));
+    try testing.expectEqual(@as(usize, @intCast(n)), idxs.items.len);
 }
 
 test "the deferred-op accumulator: notes drain in order into a whole-map save only; a failed promotion retracts its own ops" {

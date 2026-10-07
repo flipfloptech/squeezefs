@@ -242,6 +242,12 @@ pub const LastWriteEnd = struct {
     pub fn note(self: *LastWriteEnd, ino: u64, offset: u64, len: u64) u64 {
         return self.words[@intCast(dlm.splitmix64(ino) & self.mask)].swap(offset + len, .monotonic);
     }
+
+    /// The word as it stands (the W1 hold gate's adjacency read on the
+    /// queue thread — one relaxed load, no swap).
+    pub fn peek(self: *const LastWriteEnd, ino: u64) u64 {
+        return self.words[@intCast(dlm.splitmix64(ino) & self.mask)].load(.monotonic);
+    }
 };
 
 // ---------------------------------------------------------------------------

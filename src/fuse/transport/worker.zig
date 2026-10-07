@@ -231,6 +231,18 @@ pub var zc_fd_body_fallbacks: counters.ShardedCounter = .{};
 /// legs that failed or came short and fell through to the ordinary ladder.
 pub var zc_direct_legs: counters.ShardedCounter = .{};
 pub var zc_direct_leg_fallbacks: counters.ShardedCounter = .{};
+/// `transport_zc_direct_leg_recheck_withdrawn`: a landed leg whose post-DMA
+/// recheck failed — the prefilled reply withdrawn, the ladder re-served.
+pub var zc_direct_leg_recheck_withdrawn: counters.ShardedCounter = .{};
+/// `transport_zc_write_directs` / `_bytes` / `_failures`: held WRITE
+/// payloads landed by `WRITE_FIXED(slot → device)` — the sole-owner patch
+/// class with zero daemon passes — and the bridges that came back short.
+pub var zc_write_directs: counters.ShardedCounter = .{};
+pub var zc_write_direct_bytes: counters.ShardedCounter = .{};
+pub var zc_write_direct_failures: counters.ShardedCounter = .{};
+/// `transport_zc_fd_source_copies`: a probe's fd-source answer served by
+/// the copy arm (a non-zc session, a fused frame).
+pub var zc_fd_source_copies: counters.ShardedCounter = .{};
 /// `transport_zc_fallbacks` (≈ 0): a bounce bridge failed and the reply
 /// degraded to the kmbuf attachment or header-only EIO.
 pub var zc_fallbacks: counters.ShardedCounter = .{};
@@ -511,6 +523,9 @@ const Pend = struct {
     /// Readdir-class slot while the latch is unresolved: a -EFAULT here is
     /// the probe's "copyable" verdict, not a failure.
     readdir_probe: bool = false,
+    /// The filesystem's completion hook (the direct leg's post-DMA recheck,
+    /// an fd-source serve's pin release), run at the CQE.
+    hook: ?fsv.CompletionHook = null,
 
     const Kind = enum(u8) {
         /// `READ_FIXED(slab @ bounce_off → slot)`; the commit cell is parked.
@@ -523,6 +538,10 @@ const Pend = struct {
         write_extract,
         /// `WRITE_FIXED(slot → slab)` on a handler's `extract`; the cell answers.
         lazy_extract,
+        /// `WRITE_FIXED(slot → device fd @ off)` on a handler's `storeHeld`:
+        /// the sole-owner patch class lands straight from the app's pages;
+        /// the store cell answers.
+        direct_store,
     };
 };
 
@@ -538,6 +557,16 @@ const ExtractCell = struct {
     res: i32 = 0,
     /// Memoized for the current request: a second `extract` pays no bridge.
     done_len: u32 = 0,
+};
+
+/// A handler's direct-store request cell (per gent): the destination the
+/// handler named, the fiber's park, the worker's verdict at the CQE.
+const StoreCell = struct {
+    event: Io.Event = .unset,
+    res: i32 = 0,
+    fd: linux.fd_t = -1,
+    off: u64 = 0,
+    len: u32 = 0,
 };
 
 /// A fused READ frame (arm (b)): the request re-polled through the
@@ -580,8 +609,14 @@ pub const Group = struct {
     fused: zc.FusedQueue,
     frames: []FusedFrame,
     extract_cells: []ExtractCell,
-    /// Handler → worker inboxes: lazy extractions and releases (gents).
+    store_cells: []StoreCell,
+    /// Per gent: the hook a probe's fd-source serve attached for the bridge
+    /// `commitReadyZc` pushes.
+    hooks: []?fsv.CompletionHook,
+    /// Handler → worker inboxes: lazy extractions, direct stores and
+    /// releases (gents).
     extract_inbox: mpmc.BoundedMpmc(u32),
+    store_inbox: mpmc.BoundedMpmc(u32),
     release_inbox: mpmc.BoundedMpmc(u32),
     last_scan_ns: u64 = 0,
     affinity: ?placement.CpuSet,
@@ -636,7 +671,10 @@ pub const Group = struct {
             .fused = undefined,
             .frames = &.{},
             .extract_cells = &.{},
+            .store_cells = &.{},
+            .hooks = &.{},
             .extract_inbox = undefined,
+            .store_inbox = undefined,
             .release_inbox = undefined,
             .affinity = affinity,
         };
@@ -713,6 +751,14 @@ pub const Group = struct {
         @memset(self.extract_cells, .{});
         self.extract_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
         errdefer self.extract_inbox.deinit(gpa);
+        self.store_cells = try gpa.alloc(StoreCell, gents);
+        errdefer gpa.free(self.store_cells);
+        @memset(self.store_cells, .{});
+        self.hooks = try gpa.alloc(?fsv.CompletionHook, gents);
+        errdefer gpa.free(self.hooks);
+        @memset(self.hooks, null);
+        self.store_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
+        errdefer self.store_inbox.deinit(gpa);
         self.release_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
         return self;
     }
@@ -723,6 +769,9 @@ pub const Group = struct {
         assert(self.thread == null);
         if (self.started.load(.acquire) == 1) self.ring.deinit();
         self.release_inbox.deinit(self.gpa);
+        self.store_inbox.deinit(self.gpa);
+        self.gpa.free(self.hooks);
+        self.gpa.free(self.store_cells);
         self.extract_inbox.deinit(self.gpa);
         self.gpa.free(self.extract_cells);
         self.gpa.free(self.frames);
@@ -1161,7 +1210,10 @@ pub const Group = struct {
         if (pend.readdir_probe and pend.kind == .reply_bounce) self.shared.latchReaddir(if (ok) .paged else if (efault) .copyable else .unresolved);
         switch (pend.kind) {
             .reply_bounce, .reply_fd => {
-                const msg = self.parkedMsg(gent) orelse return;
+                const msg = self.parkedMsg(gent) orelse {
+                    if (pend.hook) |h| _ = h.run(ok);
+                    return;
+                };
                 if (ok) {
                     self.commitPrefilled(gent, msg.header.unique, pend.len);
                     if (pend.kind == .reply_fd) {
@@ -1169,12 +1221,16 @@ pub const Group = struct {
                         zc_serve_bytes.add(pend.len);
                     } else zc_bounce_bytes.add(pend.len);
                     self.resumeParked(gent);
+                    if (pend.hook) |h| _ = h.run(true);
                     return;
                 }
                 if (pend.kind == .reply_fd) {
-                    // Restage the keepalive body through the bounce.
+                    // Restage the keepalive body through the bounce (the
+                    // view is pinned until the hook runs, AFTER the copy).
                     zc_fd_body_fallbacks.inc();
-                    if (self.bridgeBounce(gent, msg.body, false)) return;
+                    const restaged = self.bridgeBounce(gent, msg.body, false);
+                    if (pend.hook) |h| _ = h.run(false);
+                    if (restaged) return;
                 }
                 if (pend.readdir_probe and efault) {
                     // The kernel never registered the slot: the body goes to
@@ -1191,17 +1247,24 @@ pub const Group = struct {
                 self.failEnt(gent, .IO);
             },
             .direct_leg => {
-                if (m.slots.ent(e).owing() == null) return;
-                if (ok) {
+                if (m.slots.ent(e).owing() == null) {
+                    if (pend.hook) |h| _ = h.run(ok);
+                    return;
+                }
+                // THE LAW: the post-DMA recheck (incarnation + binding) runs
+                // AFTER the bytes landed; a failed recheck WITHDRAWS the
+                // prefilled reply — the ordinary ladder re-serves the whole
+                // body (its bounce overwrites whatever landed), never
+                // unvalidated device bytes in the app's pages.
+                const validated = if (pend.hook) |h| h.run(ok) else true;
+                if (ok and validated) {
                     zc_direct_legs.inc();
                     zc_serve_bytes.add(pend.len);
                     const unique = std.mem.readInt(u64, self.headerOf(gent).in_out[8..16], .little);
                     self.commitPrefilled(gent, unique, pend.len);
                     return;
                 }
-                // Short or failed: the ordinary ladder serves the whole body
-                // (its bounce overwrites whatever landed).
-                zc_direct_leg_fallbacks.inc();
+                if (ok) zc_direct_leg_recheck_withdrawn.inc() else zc_direct_leg_fallbacks.inc();
                 self.redeliver(gent);
             },
             .write_extract => {
@@ -1221,6 +1284,17 @@ pub const Group = struct {
                     slot.zc_write_extract_bytes.add(pend.len);
                     slot.zc_write_lazy_extractions.inc();
                     cell.done_len = pend.len;
+                }
+                cell.res = res;
+                cell.event.set(self.shared.io);
+            },
+            .direct_store => {
+                const cell = &self.store_cells[gent];
+                if (ok) {
+                    zc_write_directs.inc();
+                    zc_write_direct_bytes.add(pend.len);
+                } else {
+                    zc_write_direct_failures.inc();
                 }
                 cell.res = res;
                 cell.event.set(self.shared.io);
@@ -1264,6 +1338,48 @@ pub const Group = struct {
 
     fn heldFace(self: *Group) slot.HeldFace {
         return .{ .ctx = self, .extract = extractFromForeign };
+    }
+
+    /// The direct store of a HELD WRITE payload (`WRITE_FIXED(slot → fd @
+    /// off)`, the sole-owner patch class): any thread. Posts the gent,
+    /// wakes the worker, parks on the store cell's event; the verdict is
+    /// the bridge CQE's (a short or failed DMA is the caller's EIO — the
+    /// bytes still sit in the slot for its fallback `extract`).
+    pub fn storeFromForeign(self: *Group, gent: u32, fd: linux.fd_t, off: u64, len: u32, io: Io) slot.ExtractError!void {
+        if (!self.shared.isActive()) return error.SessionClosed;
+        const cell = &self.store_cells[gent];
+        cell.event.reset();
+        cell.res = 0;
+        cell.fd = fd;
+        cell.off = off;
+        cell.len = len;
+        if (!self.store_inbox.tryPush(gent)) return error.BridgeFailed;
+        if (self.ring.wake()) slot.wake_writes.inc() else slot.wakes_elided.inc();
+        cell.event.wait(io) catch return error.SessionClosed;
+        if (cell.res >= 0 and @as(u32, @intCast(cell.res)) == len) return;
+        return error.BridgeFailed;
+    }
+
+    /// Pump the direct stores: `WRITE_FIXED(slot → device)` for a held slot
+    /// still owing (the pages stay registered until the commit); refusals
+    /// answer the cell now.
+    fn pumpStores(self: *Group) void {
+        while (self.store_inbox.tryPop()) |gent| {
+            const m = self.memberOf(gent);
+            const e = self.entIdxOf(gent);
+            const ent = m.slots.ent(e);
+            const cell = &self.store_cells[gent];
+            const live = ent.owing() != null or ent.state == .retained;
+            if (!ent.held or !live or cell.len == 0 or cell.len > self.held_len[gent]) {
+                cell.res = -@as(i32, @intCast(@backingInt(linux.E.NOENT)));
+                cell.event.set(self.shared.io);
+                continue;
+            }
+            if (!self.pushBridge(gent, .{ .kind = .direct_store, .len = cell.len }, cell.fd, cell.off, false)) {
+                cell.res = -@as(i32, @intCast(@backingInt(linux.E.BUSY)));
+                cell.event.set(self.shared.io);
+            }
+        }
     }
 
     /// A RELEASE from the handler (`Session.releaseRetained`): any thread.
@@ -1405,10 +1521,15 @@ pub const Group = struct {
                         return;
                     }
                     const probe = self.readdirProbe(gent);
+                    const hook = self.hooks[gent];
+                    self.hooks[gent] = null;
                     const pushed = if (msg.kind == .fd_body)
-                        self.pushBridge(gent, .{ .kind = .reply_fd, .len = @intCast(r.body.len), .readdir_probe = probe }, msg.fd, msg.fd_off, true)
+                        self.pushBridge(gent, .{ .kind = .reply_fd, .len = @intCast(r.body.len), .readdir_probe = probe, .hook = hook }, msg.fd, msg.fd_off, true)
                     else
                         self.bridgeBounce(gent, r.body, probe);
+                    if (!pushed) {
+                        if (hook) |h| _ = h.run(false);
+                    }
                     if (pushed) {
                         // The commit FOLLOWS the bridge CQE: the slot stays
                         // owed (and refuses a second reply) until then.
@@ -1519,7 +1640,18 @@ pub const Group = struct {
         fused_polls.inc();
         f.polls += 1;
         const win = self.window(gent);
-        if (self.shared.fs.probeRead(f.req, win)) |reply| {
+        if (self.shared.fs.probeRead(f.req, win)) |pr| {
+            const reply: codec.Reply = switch (pr) {
+                .reply => |r| r,
+                .fd_source => |fs| blk: {
+                    // The fused frame serves through the window: the copy arm.
+                    const n = @min(fs.body.len, win.len);
+                    @memcpy(win[0..n], fs.body[0..n]);
+                    zc_fd_source_copies.inc();
+                    if (fs.done) |h| _ = h.run(true);
+                    break :blk codec.replyData(fs.unique, win[0..n]);
+                },
+            };
             self.commitRead(gent, f.req, f.in, reply);
             return;
         }
@@ -1551,6 +1683,7 @@ pub const Group = struct {
                 self.handleCommitCell(gent);
             }
             self.pumpExtracts();
+            self.pumpStores();
             self.pumpReleases();
             // 5. Mid-pass reap of finished bridges, then ONE fused frame.
             if (self.deadlines.outstanding > 0 and !self.fused.isEmpty()) {
@@ -1960,6 +2093,28 @@ pub const Group = struct {
         self.pushCommit(gent, cid);
     }
 
+    /// A probe's fd-source serve: on a zero-copy dest slot the fd→slot
+    /// bridge with the pin-release hook at its CQE (zero daemon passes);
+    /// anywhere else the body is copied into the window and the hook runs
+    /// at once (the copy arm, counted by the filesystem's ledger).
+    fn commitReadFdSource(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in, fs: fsv.FdSource) void {
+        const m = self.memberOf(gent);
+        const e = self.entIdxOf(gent);
+        const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = e, .commit_id = m.slots.ent(e).owing().?.commit_id };
+        if (self.shared.zeroCopy() and m.slots.ent(e).dir == .dest and fs.body.len > 0) {
+            self.hooks[gent] = fs.done;
+            self.local_msgs[gent] = commit_queue.Msg.fdBody(sref, codec.replyData(fs.unique, fs.body), fs.fd, fs.off);
+            self.commitReadyZc(gent, &self.local_msgs[gent], .local);
+            return;
+        }
+        const win = self.window(gent);
+        const n = @min(fs.body.len, win.len);
+        @memcpy(win[0..n], fs.body[0..n]);
+        zc_fd_source_copies.inc();
+        if (fs.done) |h| _ = h.run(true);
+        self.commitRead(gent, req, in, codec.replyData(fs.unique, win[0..n]));
+    }
+
     /// THE READ DISPATCH LAW at the delivery CQE: (a) the filesystem's
     /// try-only warm ladder serves inline; (b) a zc session fuses a READ at
     /// or under the ceiling onto the worker's run-queue (lever default OFF;
@@ -1970,14 +2125,18 @@ pub const Group = struct {
     fn dispatchRead(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in, sref: slot.SlotRef) void {
         ring_reads.inc();
         const win = self.window(gent);
-        if (self.shared.fs.probeRead(req, win)) |reply| {
+        if (self.shared.fs.probeRead(req, win)) |pr| {
             fast_dispatch_serves.inc();
-            self.commitRead(gent, req, in, reply);
+            switch (pr) {
+                .reply => |reply| self.commitRead(gent, req, in, reply),
+                .fd_source => |fs| self.commitReadFdSource(gent, req, in, fs),
+            }
             return;
         }
         if (self.shared.zeroCopy() and self.memberOf(gent).slots.ent(self.entIdxOf(gent)).dir == .dest) {
             if (self.shared.fs.directLeg(req)) |leg| {
-                if (leg.len > 0 and leg.len <= self.payload_len and self.pushBridge(gent, .{ .kind = .direct_leg, .len = leg.len }, leg.fd, leg.off, true)) {
+                // A leg without its recheck hook is never bridged (THE LAW).
+                if (leg.hook != null and leg.len > 0 and leg.len <= self.payload_len and self.pushBridge(gent, .{ .kind = .direct_leg, .len = leg.len, .hook = leg.hook }, leg.fd, leg.off, true)) {
                     fast_dispatch_demotes.inc();
                     return;
                 }
@@ -2021,10 +2180,19 @@ pub const Group = struct {
                 self.extract_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));
                 self.extract_cells[g].event.set(self.shared.io);
             }
+            if (pend.kind == .direct_store) {
+                self.store_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));
+                self.store_cells[g].event.set(self.shared.io);
+            }
+            if (pend.hook) |h| _ = h.run(false);
         };
         while (self.extract_inbox.tryPop()) |g| {
             self.extract_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));
             self.extract_cells[g].event.set(self.shared.io);
+        }
+        while (self.store_inbox.tryPop()) |g| {
+            self.store_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));
+            self.store_cells[g].event.set(self.shared.io);
         }
         while (self.release_inbox.tryPop()) |_| {}
         // 2. Final messages: every published cell still queued joins the

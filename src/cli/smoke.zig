@@ -1,10 +1,22 @@
 //! THE SMOKE (charter §11 "pjdfstest is the release gate" — this is its
-//! rung-3 stand-in; `zig build smoke`, part of `zig build gate`): the
+//! rung-3/4 stand-in; `zig build smoke`, part of `zig build gate`): the
 //! built `squeezefs` binary as a child process, a 256 MiB file volume on
 //! the venue's ext4, a real POSIX mount at `/build/tmp/mnt-<pid>`, the
 //! shell's own tools against it, `kill -9` mid-`tar -x`, remounts, the
 //! `status` summary, and the must-stay-0 gauges read through the SIGUSR1
 //! stats dump (the `.stats` inode's stand-in until rung 5).
+//!
+//! Rung 4 adds the data plane (charter §6, §13): a SET of two sparse
+//! 2 GiB data volumes, with and without a cache path (staging + the NVMe
+//! tier ON / OFF), files of any size through `dd`/`cp`/`truncate`,
+//! random 4 KiB overwrites against a mirrored image, 1000 packed 64 KiB
+//! files and their census after the dismount promotion, an 8-way `cp`
+//! storm with every ledger closed, `rm` back to the `df` baseline, and
+//! the kill matrix (`kill -9` at three points of a 200 MiB `dd` and
+//! mid-storm): every file whose `fsync` returned is byte-exact, no file
+//! is torn beyond its last durable publish (every 1 MiB piece inside the
+//! claimed size is exact or a hole), the C8 oracle and the C2 reconcile
+//! report zero drift on the remount.
 //!
 //! The binary is `./squeezefs` in the test's cwd: `build.zig`'s `smoke`
 //! step runs the library's `smoke:` tests with the emitted-bin directory as
@@ -44,7 +56,8 @@ const ready_wait_ns: u64 = 60 * std.time.ns_per_s;
 /// and the lane's trailing barrier are sub-second; the drain's lease
 /// budget 100 ms; the residency backstop 30 s only when something is owed).
 const exit_wait_ns: u64 = 60 * std.time.ns_per_s;
-/// The inline bound: a file of `inline_max + 1` bytes must be refused.
+/// The inline bound on a set WITHOUT data volumes: a file of
+/// `inline_max + 1` bytes has nowhere to go and is refused (EFBIG).
 const inline_max: usize = 4096;
 /// The kill-matrix tree: enough entries that a `tar -x` is mid-flight
 /// when the daemon dies (a few hundred creates per second through the
@@ -64,6 +77,13 @@ const Rig = struct {
     meta_uri: []u8,
     mp: [:0]u8,
     log_path: [:0]u8,
+    /// The data set (rung 4): two sparse volumes, the cache path, the
+    /// random image every stage draws from.
+    d0: [:0]u8,
+    d1: [:0]u8,
+    cache: [:0]u8,
+    data_uri: []u8,
+    image: [:0]u8,
     log_file: ?Io.File = null,
     child: ?std.process.Child = null,
     child_pid: linux.pid_t = 0,
@@ -85,6 +105,11 @@ const Rig = struct {
             .meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///build/tmp/smoke-{d}/vol.img", .{pid}),
             .mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/mnt-{d}", .{pid}, 0),
             .log_path = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/daemon.log", .{pid}, 0),
+            .d0 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/d0.img", .{pid}, 0),
+            .d1 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/d1.img", .{pid}, 0),
+            .cache = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/cache", .{pid}, 0),
+            .data_uri = try std.fmt.allocPrint(gpa, "sqdata:///build/tmp/smoke-{d}/d0.img,/build/tmp/smoke-{d}/d1.img", .{ pid, pid }),
+            .image = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/image", .{pid}, 0),
             .env = std.process.Environ.Map.init(gpa),
         };
         try self.env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -95,6 +120,24 @@ const Rig = struct {
         // so the test adopts its orphans and reaps them itself.
         _ = linux.prctl(@backingInt(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0);
         return self;
+    }
+
+    /// The daemon's error / warning / tripwire lines (a passing run prints
+    /// nothing; a failing one names its cause here, since the log dies
+    /// with the work dir).
+    fn printDaemonAlerts(self: *Rig) void {
+        const text = self.readLog() catch return;
+        defer self.gpa.free(text);
+        var it = std.mem.splitScalar(u8, text, '\n');
+        var n: usize = 0;
+        while (it.next()) |line| {
+            if (std.mem.startsWith(u8, line, "error(") or std.mem.startsWith(u8, line, "warn(") or std.mem.indexOf(u8, line, "TRIPWIRE") != null) {
+                if (n == 0) std.debug.print("\n--- daemon alerts ---\n", .{});
+                std.debug.print("{s}\n", .{line[0..@min(line.len, 400)]});
+                n += 1;
+                if (n == 40) break;
+            }
+        }
     }
 
     /// Reap every orphan adopted as the subreaper (bounded wait).
@@ -116,6 +159,7 @@ const Rig = struct {
             _ = linux.kill(self.child_pid, .KILL);
             _ = c.wait(self.io) catch {};
         }
+        self.printDaemonAlerts();
         // Never leave a mount behind.
         _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
         if (self.log_file) |f| f.close(self.io);
@@ -129,7 +173,130 @@ const Rig = struct {
         self.gpa.free(self.meta_uri);
         self.gpa.free(self.mp);
         self.gpa.free(self.log_path);
+        self.gpa.free(self.d0);
+        self.gpa.free(self.d1);
+        self.gpa.free(self.cache);
+        self.gpa.free(self.data_uri);
+        self.gpa.free(self.image);
         self.gpa.destroy(self);
+    }
+
+    /// The meta volume file, sparse.
+    fn createMetaVolume(self: *Rig) !void {
+        const f = try Io.Dir.cwd().createFile(self.io, self.img, .{ .truncate = true });
+        defer f.close(self.io);
+        try f.setLength(self.io, volume_len);
+    }
+
+    /// The SET: the meta volume, two sparse data volumes, the format with
+    /// or without the cache path (staging + the NVMe tier ON / OFF).
+    fn formatSet(self: *Rig, cache: bool) !void {
+        try self.createMetaVolume();
+        for ([_][]const u8{ self.d0, self.d1 }) |dp| {
+            const f = try Io.Dir.cwd().createFile(self.io, dp, .{ .truncate = true });
+            defer f.close(self.io);
+            try f.setLength(self.io, data_len);
+        }
+        if (cache) _ = linux.mkdir(self.cache.ptr, 0o700);
+        const r = if (cache)
+            try self.squeezefs(&.{ "format", "--disk-cache-paths", self.cache, self.meta_uri, self.data_uri })
+        else
+            try self.squeezefs(&.{ "format", self.meta_uri, self.data_uri });
+        defer self.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "data volumes 2") != null);
+    }
+
+    /// The random image on ext4 (`image_mib` MiB of urandom) every stage
+    /// slices; plus a mirror the overwrite stage mutates in step.
+    fn createImage(self: *Rig) !void {
+        var script: std.Io.Writer.Allocating = .init(self.gpa);
+        defer script.deinit();
+        try script.writer.print("head -c {d}M /dev/urandom > image && test \"$(stat -c %s image)\" = {d}", .{ image_mib, image_mib << 20 });
+        const out = try self.shOk(self.work, script.written());
+        self.gpa.free(out);
+    }
+
+    /// SIGUSR1 → every stats family lands in the log; the tail from the
+    /// mark (owned by the caller).
+    fn statsTail(self: *Rig) ![]u8 {
+        const mark = try self.logLen();
+        _ = linux.kill(self.child_pid, .USR1);
+        _ = try self.awaitLog("stats daemon: ", mark, 10 * std.time.ns_per_s);
+        const text = try self.readLog();
+        defer self.gpa.free(text);
+        return self.gpa.dupe(u8, text[mark..]);
+    }
+
+    /// The stats of a QUIESCENT mount: polled (bounded) until the reclaim
+    /// ledger has drained (`terminal ≡ queued + elided`, an empty queue)
+    /// and the write pipeline holds nothing — the frees a truncate or an
+    /// overwrite displaced are asynchronous (the reclaimer's park bound is
+    /// 1 s). The last tail is returned either way; the checks judge it.
+    fn quiescentStatsTail(self: *Rig) ![]u8 {
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        while (true) {
+            const tail = try self.statsTail();
+            const queued = numberAfter(tail, "\"block_free_reclaim_queued\":") orelse 0;
+            const elided = numberAfter(tail, "\"block_free_reclaim_elided\":") orelse 0;
+            const terminal = numberAfter(tail, "\"terminal_frees\":") orelse 0;
+            const queue_bytes = numberAfter(tail, "\"block_free_reclaim_queue_bytes\":") orelse 0;
+            const inflight = numberAfter(tail, "\"write_pipeline_inflight_bytes\":") orelse 0;
+            if ((terminal == queued + elided and queue_bytes == 0 and inflight == 0) or clock.monotonicNs() >= deadline) return tail;
+            self.gpa.free(tail);
+            sleepMs(100);
+        }
+    }
+
+    /// A `sh -e` script with `$1 = work dir` run with the mount as cwd;
+    /// stdout on success, both streams printed on failure.
+    fn onMount(self: *Rig, script: []const u8) ![]u8 {
+        const r = try std.process.run(self.gpa, self.io, .{ .argv = &.{ "sh", "-e", "-c", script, "smoke", self.work }, .cwd = .{ .path = self.mp }, .environ_map = &self.env });
+        defer self.gpa.free(r.stderr);
+        if (!r.term.success()) {
+            std.debug.print("\n--- mount script failed ({f}) ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, script, r.stdout, r.stderr });
+            self.gpa.free(r.stdout);
+            return error.ScriptFailed;
+        }
+        return r.stdout;
+    }
+
+    /// `df -kP` on the mount: the used KiB the daemon reports (statfs).
+    fn usedKib(self: *Rig) !u64 {
+        const out = try self.onMount("df -kP . | tail -1 | awk '{print $3}'");
+        defer self.gpa.free(out);
+        return std.fmt.parseInt(u64, std.mem.trim(u8, out, " \n"), 10) catch error.DfUnparsed;
+    }
+
+    /// Bounded poll until `df` returns to `baseline` (the reclaimer's
+    /// park bound is 1 s; the terminal frees of a `rm` drain within it).
+    fn awaitUsedKib(self: *Rig, baseline: u64) !void {
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            if (try self.usedKib() == baseline) return;
+            sleepMs(50);
+        }
+        std.debug.print("\n--- df did not return to the baseline: {d} KiB used vs {d} ---\n", .{ try self.usedKib(), baseline });
+        const tail = try self.statsTail();
+        defer self.gpa.free(tail);
+        inline for (.{ "fuse_reclaim_destroys", "fuse_reclaim_drains", "fuse_reclaim_blocks_freed", "bindings_freed", "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_reclaim_skipped", "block_free_reclaim_queue_bytes", "meta_kv_block_refs_released", "meta_kv_block_refs_staged", "block_live_free_refusals", "block_double_frees" }) |k| {
+            std.debug.print("    {s} = {d}\n", .{ k, numberAfter(tail, "\"" ++ k ++ "\":") orelse 0 });
+        }
+        if (std.mem.indexOf(u8, tail, "\"volumes\":[")) |i| std.debug.print("    {s}\n", .{tail[i..@min(tail.len, i + 600)]});
+        return error.SpaceNotReclaimed;
+    }
+
+    /// The `status` report (owned).
+    fn statusReport(self: *Rig) ![]u8 {
+        const r = try self.squeezefs(&.{ "status", self.meta_uri });
+        defer self.gpa.free(r.stderr);
+        if (!r.term.success()) {
+            std.debug.print("\nstatus: {s}\n", .{r.stderr});
+            self.gpa.free(r.stdout);
+            return error.StatusFailed;
+        }
+        return r.stdout;
     }
 
     /// Run the binary with `args`, collecting its output.
@@ -484,7 +651,7 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
         try testing.expect(std.mem.indexOf(u8, tail, "\"transport_park_tick_commit_rescues\":0,") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "\"transport_park_tick_cqe_rescues\":0,") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "\"exec_lane_tick_rescues\":0,") != null);
-        try testing.expect((numberAfter(tail, "\"fuse_write_beyond_inline_refused\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(tail, "\"fuse_write_no_data_volume_refused\":") orelse 0) >= 1);
         try testing.expect(std.mem.indexOf(u8, tail, "\"volume_failed\":false") != null);
         const reqs = numberAfter(tail, "\"transport_ring_requests\":") orelse 0;
         const enters = numberAfter(tail, "\"transport_enters\":") orelse 0;
@@ -802,7 +969,10 @@ test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache 
         try testing.expect(r.term.success());
         try testing.expect(std.mem.indexOf(u8, r.stdout, "data volumes 2") != null);
         try testing.expect(std.mem.indexOf(u8, r.stdout, d0p) != null and std.mem.indexOf(u8, r.stdout, d1p) != null);
-        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "vol-"));
+        // Two volume rows and, since rung 4, their two reference-census rows.
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, " active "));
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "  refs       vol-"));
+        try testing.expectEqual(@as(usize, 4), std.mem.count(u8, r.stdout, "vol-"));
     }
     // A re-format refuses: the meta volume first; with the meta forced, a data volume.
     {
@@ -896,4 +1066,764 @@ test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache 
         try testing.expect(std.mem.indexOf(u8, r.stderr, "is not a formatted data volume") != null);
     }
     std.debug.print("\nsmoke: set format ok (2 data volumes, lz4 + aes-256-gcm, key gate, renumbered/blank refusals)\n", .{});
+}
+
+// ---------------------------------------------------------------------------
+// Rung 4: the data plane bound to the mount (charter §6, §13 rung 4).
+// ---------------------------------------------------------------------------
+
+/// A data volume: 2 GiB sparse on the venue's ext4 = 510 usable 4 MiB
+/// blocks past the superblock chunk; two of them hold the pass's peak
+/// (200 MiB `dd` + 100 MiB copy + 8 × 50 MiB storm ≈ 175 blocks) and, on
+/// the set WITHOUT a cache path, 100 one-block 64 KiB files.
+const data_len: u64 = 2 << 30;
+/// The random image on ext4 every stage slices (`image_mib` ≥ 200 for the
+/// `dd`, 100 for the copy, 8 × 50 MiB at 25 MiB strides = 225, 1000 × 64 KiB
+/// = 62.5).
+const image_mib: u64 = 256;
+const big_mib: u64 = 200;
+const copy_mib: u64 = 100;
+const storm_files: usize = 8;
+const storm_mib: u64 = 50;
+/// The storm's sources are overlapping slices of the image, one per file.
+const storm_stride_mib: u64 = 25;
+/// The packed candidates on the staging set: 64 KiB (> inline_max, ≪ the
+/// 2 MiB max slot) × 1000 = 62.5 MiB.
+const small_files_staged: usize = 1000;
+/// Without a cache path a 64 KiB file is one striped block: 100 of them
+/// = 400 MiB of the set's 4080 MiB.
+const small_files_striped: usize = 100;
+const small_len: u64 = 64 << 10;
+/// The pack census bound (the task's): ceil(1000 × 64 KiB / 2 MiB) = 32
+/// blocks, plus one open pack per data volume that the DISMOUNT seal may
+/// close short.
+const pack_census_bound: u64 = (small_files_staged * small_len + (2 << 20) - 1) / (2 << 20) + 2;
+/// 4 KiB overwrites against the mirrored image: page-aligned (the W1
+/// patch class on a striped file) and at arbitrary byte offsets (the
+/// overlay / RMW classes).
+const overwrites_aligned: usize = 64;
+const overwrites_unaligned: usize = 16;
+/// The kill points of the mid-`dd` matrix: the MiB the inode claims when
+/// SIGKILL is sent. The staged phase ends at one block (4 MiB), so every
+/// point is deep in the striped write pipeline.
+const kill_points_mib = [_]u64{ 50, 100, 150 };
+/// The files the strict ack law covers: `fsync` returned before the kill.
+const acked_mib: u64 = 8;
+/// The storm kill fires once this many bytes are claimed across the eight
+/// files: a quarter of the storm in flight.
+const storm_kill_mib: u64 = 100;
+/// The census grain: a FUSE page. Every page inside a file's claimed size
+/// is exact or a hole (the write pipeline publishes whole blocks after
+/// their DMA; the size claim lands after the pieces ack; a crash leaves
+/// holes, never garbage).
+const census_grain: usize = 4096;
+
+/// Stage A: the 200 MiB `dd`, fsync, the sha round trip against the image.
+const stage_dd_script =
+    \\W="$1"
+    \\s=$(date +%s%N)
+    \\dd if="$W/image" of=big bs=1M count=200 status=none
+    \\sync big
+    \\e=$(date +%s%N)
+    \\echo "dd_ns=$((e - s))"
+    \\test "$(stat -c %s big)" = 209715200
+    \\head -c 209715200 "$W/image" > "$W/expect"
+    \\sha256sum big | cut -d' ' -f1 > "$W/big.sha"
+    \\sha256sum "$W/expect" | cut -d' ' -f1 > "$W/expect.sha"
+    \\cmp "$W/big.sha" "$W/expect.sha"
+    \\echo stage-dd-ok
+;
+
+/// Stage B: `cp` 100 MiB + `cmp`, an O_DIRECT read pass (the daemon's
+/// READ path; the page cache bypassed).
+const stage_cp_script =
+    \\W="$1"
+    \\head -c 104857600 "$W/image" > "$W/hundred"
+    \\s=$(date +%s%N)
+    \\cp "$W/hundred" big100
+    \\sync big100
+    \\e=$(date +%s%N)
+    \\echo "cp_ns=$((e - s))"
+    \\cmp big100 "$W/hundred"
+    \\s=$(date +%s%N)
+    \\dd if=big100 of=/dev/null bs=1M iflag=direct status=none
+    \\e=$(date +%s%N)
+    \\echo "read_ns=$((e - s))"
+    \\dd if=big100 of=/dev/null bs=1M iflag=direct status=none
+    \\s=$(date +%s%N)
+    \\dd if=big100 of=/dev/null bs=1M iflag=direct status=none
+    \\e=$(date +%s%N)
+    \\echo "reread_ns=$((e - s))"
+    \\echo stage-cp-ok
+;
+
+/// Stage C: shrink to 150 MiB, grow to 220 MiB — mirrored on the image.
+const stage_truncate_script =
+    \\W="$1"
+    \\truncate -s 150M big
+    \\truncate -s 150M "$W/expect"
+    \\test "$(stat -c %s big)" = 157286400
+    \\truncate -s 220M big
+    \\truncate -s 220M "$W/expect"
+    \\test "$(stat -c %s big)" = 230686720
+    \\sync big
+    \\cmp big "$W/expect"
+    \\echo stage-truncate-ok
+;
+
+/// Stage F: eight parallel `cp` of 50 MiB each, every file fsync'd, then
+/// compared.
+const stage_storm_script =
+    \\W="$1"
+    \\i=0
+    \\while [ $i -lt 8 ]; do
+    \\  dd if="$W/image" of="$W/s$i" bs=1M skip=$((i * 25)) count=50 status=none
+    \\  i=$((i + 1))
+    \\done
+    \\s=$(date +%s%N)
+    \\i=0
+    \\while [ $i -lt 8 ]; do
+    \\  ( cp "$W/s$i" storm$i && sync storm$i ) &
+    \\  i=$((i + 1))
+    \\done
+    \\wait
+    \\e=$(date +%s%N)
+    \\echo "storm_ns=$((e - s))"
+    \\i=0
+    \\while [ $i -lt 8 ]; do
+    \\  cmp storm$i "$W/s$i"
+    \\  i=$((i + 1))
+    \\done
+    \\echo stage-storm-ok
+;
+
+/// Stage D's script: `n_aligned` page-aligned and `n_unaligned` arbitrary
+/// 4 KiB overwrites of `big` (220 MiB after stage C), each mirrored on
+/// the image copy with the same source page; deterministic offsets.
+fn overwriteScript(gpa: std.mem.Allocator, n_aligned: usize, n_unaligned: usize) ![]u8 {
+    var script: std.Io.Writer.Allocating = .init(gpa);
+    errdefer script.deinit();
+    const w = &script.writer;
+    try w.writeAll("W=\"$1\"\n");
+    // A fixed seed: the pass is reproducible from the log.
+    var prng = std.Random.DefaultPrng.init(0x5151_4a4a_0404_2026);
+    const rnd = prng.random();
+    const file_len: u64 = 220 << 20;
+    const pages = file_len / 4096;
+    for (0..n_aligned + n_unaligned) |i| {
+        const src_page = rnd.uintLessThan(u64, (image_mib << 20) / 4096);
+        if (i < n_aligned) {
+            const dst_page = rnd.uintLessThan(u64, pages);
+            for ([_][]const u8{ "big", "\"$W/expect\"" }) |dst| {
+                try w.print("dd if=\"$W/image\" of={s} bs=4096 count=1 skip={d} seek={d} conv=notrunc status=none\n", .{ dst, src_page, dst_page });
+            }
+        } else {
+            const dst_off = rnd.uintLessThan(u64, file_len - 4096);
+            for ([_][]const u8{ "big", "\"$W/expect\"" }) |dst| {
+                try w.print("dd if=\"$W/image\" of={s} bs=4096 count=1 skip={d} seek={d} oflag=seek_bytes conv=notrunc status=none\n", .{ dst, src_page, dst_off });
+            }
+        }
+    }
+    try w.writeAll(
+        \\sync big
+        \\cmp big "$W/expect"
+        \\sha256sum big | cut -d' ' -f1
+        \\echo stage-overwrite-ok
+        \\
+    );
+    return script.toOwnedSlice();
+}
+
+/// Stage E's script: `n` files of 64 KiB, each a distinct slice of the image.
+fn smallFilesScript(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    return std.fmt.allocPrint(gpa,
+        \\W="$1"
+        \\mkdir -p p
+        \\s=$(date +%s%N)
+        \\i=0
+        \\while [ $i -lt {d} ]; do
+        \\  dd if="$W/image" of=p/f$i bs=65536 count=1 skip=$i status=none
+        \\  i=$((i + 1))
+        \\done
+        \\sync p/f0 p/f{d}
+        \\e=$(date +%s%N)
+        \\echo "small_ns=$((e - s))"
+        \\echo stage-small-ok
+        \\
+    , .{ n, n - 1 });
+}
+
+/// The small files after the remount: their concatenation is the image prefix.
+fn smallFilesVerifyScript(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    return std.fmt.allocPrint(gpa,
+        \\W="$1"
+        \\i=0
+        \\while [ $i -lt {d} ]; do
+        \\  cat p/f$i
+        \\  i=$((i + 1))
+        \\done | sha256sum | cut -d' ' -f1 > "$W/small.sha"
+        \\head -c {d} "$W/image" | sha256sum | cut -d' ' -f1 > "$W/small-expect.sha"
+        \\cmp "$W/small.sha" "$W/small-expect.sha"
+        \\rm -r p
+        \\echo small-verify-ok
+        \\
+    , .{ n, n * small_len });
+}
+
+/// MB/s from a byte count and a `date +%s%N` difference parsed from `key=`.
+fn mbPerS(out: []const u8, key: []const u8, bytes: u64) u64 {
+    const ns = numberAfter(out, key) orelse return 0;
+    if (ns == 0) return 0;
+    return bytes * 1000 / ns;
+}
+
+/// The must-stay-0 gauges of a data-plane mount, read from one stats tail.
+const must_stay_zero = [_][]const u8{
+    "\"transport_requests_abandoned\":",
+    "\"open_count_stranded\":",
+    "\"transport_park_tick_commit_rescues\":",
+    "\"transport_park_tick_cqe_rescues\":",
+    "\"exec_lane_tick_rescues\":",
+    "\"invariant_tripwires\":",
+    "\"patch_edge_rmw_reads\":",
+    "\"overlay_fence_drops\":",
+    "\"data_unresolved_volume\":",
+    "\"block_double_frees\":",
+    "\"meta_kv_block_refs_drift\":",
+    "\"pack_pin_refcount_drift\":",
+    "\"staged_payload_lost_reads\":",
+    "\"write_shared_class_violation\":",
+    "\"read_dest_overruns\":",
+    "\"layout_map_merge_failures\":",
+    "\"promotions_failed\":",
+    "\"held_store_failures\":",
+    "\"transport_zc_direct_leg_recheck_withdrawn\":",
+    "\"fuse_write_no_data_volume_refused\":",
+    "\"fuse_write_beyond_inline_map_refused\":",
+    "\"writeback_errors_latched\":",
+    "\"fsync_promote_failures\":",
+};
+
+fn expectMustStayZero(tail: []const u8) !void {
+    var bad = false;
+    for (must_stay_zero) |k| {
+        const v = numberAfter(tail, k) orelse {
+            std.debug.print("\n--- gauge missing from the stats dump: {s} ---\n", .{k});
+            bad = true;
+            continue;
+        };
+        if (v != 0) {
+            std.debug.print("\n--- must-stay-0 gauge {s} = {d} ---\n", .{ k, v });
+            bad = true;
+        }
+    }
+    try testing.expect(!bad);
+    try testing.expect(std.mem.indexOf(u8, tail, "\"volume_failed\":false") != null);
+}
+
+/// The ledgers that close on a quiescent mount: the admission ledger ≡
+/// the transport's WRITE payload bytes (every user byte admitted ONCE);
+/// the read copy ledger ≡ the read path's user bytes; the reclaim ledger
+/// `queued + elided ≡ terminal frees`.
+fn expectLedgersClosed(tail: []const u8) !void {
+    const admit = (numberAfter(tail, "\"admit_write_overlay_bytes\":") orelse 0) + (numberAfter(tail, "\"admit_write_inplace_bytes\":") orelse 0) + (numberAfter(tail, "\"admit_write_accumulate_bytes\":") orelse 0) + (numberAfter(tail, "\"admit_write_inline_bytes\":") orelse 0);
+    // + the truncate's own zero-complete of a kept partial block.
+    const transport_write = (numberAfter(tail, "\"transport_zc_write_extract_bytes\":") orelse 0) + (numberAfter(tail, "\"transport_zc_write_direct_bytes\":") orelse 0) + (numberAfter(tail, "\"fuse_truncate_zero_tail_bytes\":") orelse 0);
+    if (admit != transport_write) std.debug.print("\n--- admission ledger {d} ≠ transport WRITE payload bytes + zero tails {d} ---\n", .{ admit, transport_write });
+    try testing.expectEqual(transport_write, admit);
+    const user = numberAfter(tail, "\"read_user_bytes\":") orelse 0;
+    const copies = (numberAfter(tail, "\"read_copy_dest_bytes\":") orelse 0) + (numberAfter(tail, "\"read_copy_bounce_bytes\":") orelse 0) + (numberAfter(tail, "\"read_dest_dma_bytes\":") orelse 0) + (numberAfter(tail, "\"read_zc_serve_bytes\":") orelse 0) + (numberAfter(tail, "\"read_zc_pool_serve_bytes\":") orelse 0);
+    if (user != copies) std.debug.print("\n--- read copy ledger {d} ≠ read user bytes {d} ---\n", .{ copies, user });
+    try testing.expectEqual(user, copies);
+    // Every abandoned mint is a superseded write-through or an orphan's
+    // discard on a healthy device (a failed DMA would be its own alert).
+    const abandons = numberAfter(tail, "\"unpublished_mint_abandons\":") orelse 0;
+    const legit = (numberAfter(tail, "\"write_pipeline_supersessions\":") orelse 0) + (numberAfter(tail, "\"write_pipeline_discards\":") orelse 0);
+    // (a flush that finds its entry already gone discards BEFORE minting.)
+    if (abandons > legit) std.debug.print("\n--- mint abandons {d} > supersessions + discards {d} ---\n", .{ abandons, legit });
+    try testing.expect(abandons <= legit);
+    const queued = numberAfter(tail, "\"block_free_reclaim_queued\":") orelse 0;
+    const elided = numberAfter(tail, "\"block_free_reclaim_elided\":") orelse 0;
+    const terminal = numberAfter(tail, "\"terminal_frees\":") orelse 0;
+    if (terminal != queued + elided) std.debug.print("\n--- reclaim ledger: terminal {d} ≠ queued {d} + elided {d} ---\n", .{ terminal, queued, elided });
+    try testing.expectEqual(queued + elided, terminal);
+}
+
+/// The ratios the evidence note records.
+fn printRates(label: []const u8, tail: []const u8) void {
+    const reqs = numberAfter(tail, "\"transport_ring_requests\":") orelse 0;
+    const enters = numberAfter(tail, "\"transport_enters\":") orelse 0;
+    const ops = numberAfter(tail, "\"fuse_ops\":") orelse 0;
+    const copies = numberAfter(tail, "\"transport_zc_bounce_copies\":") orelse 0;
+    const user_r = numberAfter(tail, "\"read_user_bytes\":") orelse 0;
+    const dest = numberAfter(tail, "\"read_copy_dest_bytes\":") orelse 0;
+    const dma = numberAfter(tail, "\"read_dest_dma_bytes\":") orelse 0;
+    const zc = numberAfter(tail, "\"transport_zc_serve_bytes\":") orelse 0;
+    const legs = numberAfter(tail, "\"transport_zc_direct_legs\":") orelse 0;
+    const fd_src = numberAfter(tail, "\"fast_dispatch_fd_source_serves\":") orelse 0;
+    const probe_serves = numberAfter(tail, "\"fast_dispatch_serves\":") orelse 0;
+    const hot_hits = numberAfter(tail, "\"hot_block_hits\":") orelse 0;
+    const held = numberAfter(tail, "\"held_stores\":") orelse 0;
+    const admits = numberAfter(tail, "\"hold_gate_admits\":") orelse 0;
+    const patches = numberAfter(tail, "\"patch_writes\":") orelse 0;
+    const nt = numberAfter(tail, "\"nt_copy_bytes\":") orelse 0;
+    const wt = numberAfter(tail, "\"write_through_bytes\":") orelse 0;
+    const own = numberAfter(tail, "\"own_block_dmas\":") orelse 0;
+    const merges = numberAfter(tail, "\"layout_map_merges\":") orelse 0;
+    const abandons = numberAfter(tail, "\"unpublished_mint_abandons\":") orelse 0;
+    const supersessions = numberAfter(tail, "\"write_pipeline_supersessions\":") orelse 0;
+    const joins = numberAfter(tail, "\"write_pipeline_joins\":") orelse 0;
+    const lock_ticks = numberAfter(tail, "\"lock_ticked_reregisters\":") orelse 0;
+    const chan_ticks = numberAfter(tail, "\"channel_ticked_reregisters\":") orelse 0;
+    const full_stalls = numberAfter(tail, "\"meta_kv_journal_full_stalls\":") orelse 0;
+    const park_cycles = numberAfter(tail, "\"meta_kv_checkpoint_park_cycles\":") orelse 0;
+    const cv_ticks = numberAfter(tail, "\"meta_conveyor_park_tick_rescues\":") orelse 0;
+    const checkpoints = numberAfter(tail, "\"meta_kv_checkpoints\":") orelse 0;
+    const meta_seg = tail[(std.mem.indexOf(u8, tail, "stats meta: ") orelse 0)..];
+    const dev_seg = tail[(std.mem.indexOf(u8, tail, "\"nvme_dev\":") orelse 0)..];
+    const dev_write_seg = dev_seg[(std.mem.indexOf(u8, dev_seg, "\"write_pipeline_phase_ns\":") orelse 0)..];
+    const exec_seg = tail[(std.mem.indexOf(u8, tail, "stats exec: ") orelse 0)..];
+    const wp_seg = tail[(std.mem.indexOf(u8, tail, "\"write_pipeline_phase_ns\":") orelse 0)..];
+    std.debug.print("smoke[{s}]: waits: overlay teardown waits {d} (ack-early stores {d}, retries {d}, overlong {d}), bridge cancels {d}, direct-store failures {d}, staged identity retries {d}, settle lost {d}, hold ceremonies {d}, prefetch fibers {d}, pipeline admission waits {d}, parked gate waits {d}\n", .{ label, numberAfter(tail, "\"overlay_teardown_waits\":") orelse 0, numberAfter(tail, "\"overlay_ack_early_stores\":") orelse 0, numberAfter(tail, "\"overlay_ack_early_retries\":") orelse 0, numberAfter(tail, "\"overlay_teardown_wait_overlong\":") orelse 0, numberAfter(tail, "\"transport_zc_bridge_cancels\":") orelse 0, numberAfter(tail, "\"transport_zc_write_direct_failures\":") orelse 0, numberAfter(tail, "\"staged_identity_retries\":") orelse 0, numberAfter(tail, "\"read_settle_lost_serialized\":") orelse 0, numberAfter(tail, "\"hold_ceremony_fibers\":") orelse 0, numberAfter(tail, "\"prefetch_fibers\":") orelse 0, numberAfter(tail, "\"write_pipeline_admission_waits\":") orelse 0, numberAfter(tail, "\"parked_gate_waits\":") orelse 0 });
+    std.debug.print("smoke[{s}]: write pipeline legs' slowest buckets: admit_wait {s}, detach_lag {s}, lock_wait {s}, dma {s}, publish {s}, total {s}\n", .{ label, histMaxBucket(wp_seg, "\"admit_wait\":"), histMaxBucket(wp_seg, "\"detach_lag\":"), histMaxBucket(wp_seg, "\"lock_wait\":"), histMaxBucket(wp_seg, "\"dma\":"), histMaxBucket(wp_seg, "\"publish\":"), histMaxBucket(wp_seg, "\"total\":") });
+    std.debug.print("smoke[{s}]: device legs' slowest buckets: read fill queue {s} / service {s}, write queue {s} / service {s}; read serve total {s}; the longest fiber poll {s}\n", .{ label, histMaxBucket(dev_seg, "\"dev_queue\":"), histMaxBucket(dev_seg, "\"dev_service\":"), histMaxBucket(dev_write_seg, "\"dev_queue\":"), histMaxBucket(dev_write_seg, "\"dev_service\":"), histMaxBucket(tail, "\"read_serve_phase_ns\":{\"total\":"), histMaxBucket(exec_seg, "\"exec_poll_ns\":") });
+    std.debug.print("smoke[{s}]: fsync legs' slowest buckets: data_flush {s}, data_barrier {s}, meta_barrier {s}; conveyor tx queue wait {s}, pass {s}, window {s}; the checkpoint's device barrier {s}; staging backing msync {s}, punch+madvise {s}\n", .{ label, histMaxBucket(tail, "\"data_flush\":"), histMaxBucket(tail, "\"data_barrier\":"), histMaxBucket(tail, "\"meta_barrier\":"), histMaxBucket(meta_seg, "\"meta_tx_queue_wait\":"), histMaxBucket(meta_seg, "\"meta_pass_total\":"), histMaxBucket(meta_seg, "\"meta_window_total\":"), histMaxBucket(meta_seg, "\"meta_barrier\":"), histMaxBucket(tail, "\"backing_sync\":"), histMaxBucket(tail, "\"backing_reclaim\":") });
+    std.debug.print("smoke[{s}]: {d} fuse ops, {d} ring requests, {d} enters ({d}.{d:0>2}/request), {d} bounce copies; READ user {d} B: dest memcpy {d} B, dest DMA {d} B, zc serve {d} B ({d} direct legs, {d} fd-source serves, {d} probe serves, {d} hot-tier hits); WRITE: {d} held stores / {d} hold admits / {d} W1 patches, NT copy {d} B of {d} B write-through, {d} own-block DMAs, {d} map merges, {d} mint abandons ({d} supersessions, {d} joins); ticked parks lock {d} / channel {d}; journal full stalls {d}, park-kicked checkpoint cycles {d} of {d}, conveyor tick rescues {d}\n", .{ label, ops, reqs, enters, enters / @max(reqs, 1), (enters * 100 / @max(reqs, 1)) % 100, copies, user_r, dest, dma, zc, legs, fd_src, probe_serves, hot_hits, held, admits, patches, nt, wt, own, merges, abandons, supersessions, joins, lock_ticks, chan_ticks, full_stalls, park_cycles, checkpoints, cv_ticks });
+}
+
+/// The highest non-empty bucket of a latency histogram in the stats dump
+/// (`"<key>":{"buckets":{"<=1us":n,...}`): the stall's order of magnitude.
+fn histMaxBucket(text: []const u8, key: []const u8) []const u8 {
+    const i = std.mem.indexOf(u8, text, key) orelse return "absent";
+    const b = std.mem.indexOfPos(u8, text, i, "\"buckets\":{") orelse return "absent";
+    const end = std.mem.indexOfScalarPos(u8, text, b, '}') orelse return "absent";
+    var best: []const u8 = "none";
+    var it = std.mem.splitScalar(u8, text[b + "\"buckets\":{".len .. end], ',');
+    while (it.next()) |pair| {
+        const colon = std.mem.indexOfScalar(u8, pair, ':') orelse continue;
+        const count = std.fmt.parseInt(u64, pair[colon + 1 ..], 10) catch continue;
+        if (count != 0) best = std.mem.trim(u8, pair[0..colon], "\"");
+    }
+    return best;
+}
+
+/// The pack census from `status`: the blocks referenced on both volumes.
+const RefCensus = struct { references: u64, blocks: u64 };
+
+fn refCensus(report: []const u8) RefCensus {
+    var out: RefCensus = .{ .references = 0, .blocks = 0 };
+    var it = std.mem.splitScalar(u8, report, '\n');
+    while (it.next()) |line| {
+        const i = std.mem.indexOf(u8, line, "  refs       vol-") orelse continue;
+        out.references += numberAfter(line[i..], ": ") orelse 0;
+        out.blocks += numberAfter(line[i..], "over ") orelse 0;
+    }
+    return out;
+}
+
+/// THE DATA-PLANE PASS on a fresh set (with or without a cache path).
+fn dataPlanePass(rig: *Rig, cache: bool) !void {
+    const gpa = rig.gpa;
+    const io = rig.io;
+    const label: []const u8 = if (cache) "cache" else "no-cache";
+    try rig.formatSet(cache);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    const ready_at = try rig.awaitReady(0);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[0..ready_at];
+        try testing.expect(std.mem.indexOf(u8, seg, "data plane: 2 data volume(s)") != null);
+        if (cache) {
+            try testing.expect(std.mem.indexOf(u8, seg, "staging ON, NVMe tier ON") != null);
+            try testing.expect(std.mem.indexOf(u8, seg, "held-slot direct store ON, direct device leg ON, fd-source probe serve ON") != null);
+        } else {
+            try testing.expect(std.mem.indexOf(u8, seg, "the set declares NO cache paths — staging and the NVMe read tier are OFF") != null);
+        }
+    }
+    const baseline = try rig.usedKib();
+    // A: dd 200 MiB → fsync → sha round trip.
+    {
+        const out = try rig.onMount(stage_dd_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-dd-ok") != null);
+        std.debug.print("\nsmoke[{s}]: dd 200 MiB + fsync: {d} MB/s\n", .{ label, mbPerS(out, "dd_ns=", big_mib << 20) });
+    }
+    // B: cp 100 MiB + cmp; an O_DIRECT read pass.
+    {
+        const out = try rig.onMount(stage_cp_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-cp-ok") != null);
+        std.debug.print("smoke[{s}]: cp 100 MiB + fsync: {d} MB/s; O_DIRECT read back: {d} MB/s cold, {d} MB/s on the third pass\n", .{ label, mbPerS(out, "cp_ns=", copy_mib << 20), mbPerS(out, "read_ns=", copy_mib << 20), mbPerS(out, "reread_ns=", copy_mib << 20) });
+    }
+    // C: truncate shrink / grow against the mirror.
+    {
+        const out = try rig.onMount(stage_truncate_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-truncate-ok") != null);
+    }
+    // D: random 4 KiB overwrites against the mirror.
+    {
+        const script = try overwriteScript(gpa, overwrites_aligned, overwrites_unaligned);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-overwrite-ok") != null);
+        std.debug.print("smoke[{s}]: truncate 200→150→220 MiB and {d}+{d} 4 KiB overwrites: image-exact, sha {s}\n", .{ label, overwrites_aligned, overwrites_unaligned, std.mem.trim(u8, out[0..@min(out.len, 64)], " \n") });
+    }
+    // E: the small files (packed candidates on the staging set).
+    const small_n: usize = if (cache) small_files_staged else small_files_striped;
+    {
+        const script = try smallFilesScript(gpa, small_n);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-small-ok") != null);
+        std.debug.print("smoke[{s}]: {d} × 64 KiB files: {d} MB/s\n", .{ label, small_n, mbPerS(out, "small_ns=", small_n * small_len) });
+    }
+    // F: the storm.
+    {
+        const out = try rig.onMount(stage_storm_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-storm-ok") != null);
+        std.debug.print("smoke[{s}]: 8 × 50 MiB cp storm + fsync each: {d} MB/s aggregate\n", .{ label, mbPerS(out, "storm_ns=", storm_files * (storm_mib << 20)) });
+    }
+    // The gauges and ledgers after the storm.
+    {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try expectLedgersClosed(tail);
+        printRates(label, tail);
+        const striped = numberAfter(tail, "\"fuse_write_striped\":") orelse 0;
+        const staged = numberAfter(tail, "\"fuse_write_staged\":") orelse 0;
+        const promotions = numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0;
+        const clips = numberAfter(tail, "\"fuse_truncate_striped_clips\":") orelse 0;
+        try testing.expect(striped > 0 and promotions >= 1 + 1 + storm_files and clips == 1);
+        if (cache) {
+            try testing.expect(staged >= small_files_staged);
+            try testing.expect((numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
+            try testing.expect((numberAfter(tail, "\"transport_zc_direct_legs\":") orelse 0) > 0);
+        } else {
+            try testing.expectEqual(@as(u64, 0), staged);
+        }
+        try testing.expect((numberAfter(tail, "\"patch_writes\":") orelse 0) > 0);
+    }
+    // G: rm the big files → df back to the baseline (+ the striped small
+    // files on the set without staging).
+    {
+        const out = try rig.onMount("rm -f big big100 storm0 storm1 storm2 storm3 storm4 storm5 storm6 storm7 && echo rm-ok");
+        defer gpa.free(out);
+    }
+    const small_kib: u64 = if (cache) 0 else small_n * (4 << 10);
+    try rig.awaitUsedKib(baseline + small_kib);
+    // umount: the dismount promotion; the census through `status`.
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    var census: RefCensus = undefined;
+    {
+        const report = try rig.statusReport();
+        defer gpa.free(report);
+        census = refCensus(report);
+        try testing.expect(census.references >= small_n);
+        if (cache) {
+            try testing.expect(census.blocks <= pack_census_bound);
+            try testing.expect(census.blocks >= 1);
+        } else {
+            try testing.expectEqual(@as(u64, small_n), census.blocks);
+        }
+        std.debug.print("smoke[{s}]: after dismount: {d} references over {d} blocks for {d} × 64 KiB files (bound {d})\n", .{ label, census.references, census.blocks, small_n, if (cache) pack_census_bound else small_n });
+    }
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[ready_at..];
+        try testing.expect(std.mem.indexOf(u8, seg, "clean unmount") != null);
+        if (cache) try testing.expect((numberAfter(seg, "dismount promotion: ") orelse 0) >= small_files_staged);
+    }
+    // Remount: the small files intact (packed reads), rm → the baseline,
+    // the reclaim ledger closed, a clean unmount.
+    const mark2 = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark2);
+    {
+        const script = try smallFilesVerifyScript(gpa, small_n);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "small-verify-ok") != null);
+    }
+    try rig.awaitUsedKib(baseline);
+    {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try expectLedgersClosed(tail);
+        const terminal = numberAfter(tail, "\"terminal_frees\":") orelse 0;
+        const destroys = numberAfter(tail, "\"fuse_reclaim_destroys\":") orelse 0;
+        try testing.expect(destroys >= small_n and terminal >= census.blocks);
+        // Every small file was read once after the remount: a packed
+        // tenant is one ranged window read (or the direct device leg).
+        // Every small file was read once after the remount: the read
+        // path's user bytes plus the zc legs' DMA bytes cover them (a
+        // packed tenant's block is filled once and serves its siblings
+        // from the hot tier; a striped one is one ranged read).
+        const read_user = numberAfter(tail, "\"read_user_bytes\":") orelse 0;
+        const zc_serve = numberAfter(tail, "\"transport_zc_serve_bytes\":") orelse 0;
+        try testing.expect(read_user + zc_serve >= small_n * small_len);
+        const ranged = numberAfter(tail, "\"ranged_reads\":") orelse 0;
+        const hot = numberAfter(tail, "\"hot_block_hits\":") orelse 0;
+        const fills = numberAfter(tail, "\"read_fill_dma_bytes\":") orelse 0;
+        std.debug.print("smoke[{s}]: rm all → df at the baseline ({d} KiB used); {d} destroys, {d} terminal frees; the {d} small files read back: {d} ranged reads, {d} hot-tier hits, {d} B filled\n", .{ label, baseline, destroys, terminal, small_n, ranged, hot, fills });
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    {
+        const report = try rig.statusReport();
+        defer gpa.free(report);
+        const c = refCensus(report);
+        try testing.expectEqual(@as(u64, 0), c.blocks);
+        std.debug.print("smoke[{s}]: {s}", .{ label, report[std.mem.lastIndexOf(u8, report, "summary:").?..] });
+    }
+}
+
+test "smoke: the data plane WITH a cache path — dd 200 MiB sha round trip, cp 100 MiB + cmp, truncate, 4 KiB overwrites, 1000 packed 64 KiB files and their census, the 8-way storm with every ledger closed, rm → df baseline" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, io);
+    defer rig.deinit();
+    try dataPlanePass(rig, true);
+}
+
+test "smoke: the data plane WITHOUT a cache path — staging and the NVMe tier OFF, every write beyond inline striped; the same pass with 100 one-block files" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, io);
+    defer rig.deinit();
+    try dataPlanePass(rig, false);
+}
+
+// ---- the kill matrix ----
+
+/// The page census of a file against its image slice after a crash.
+const Census = struct { size: u64, exact: u64, holes: u64 };
+
+/// Every `census_grain` page inside the claimed size is byte-exact against
+/// the image at `src_off + page` or all zeros; anything else is TORN.
+fn pageCensus(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8, image: Io.File, src_off: u64, written_cap: u64) !Census {
+    const f = try dir.openFile(io, name, .{});
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    if (size > written_cap) {
+        std.debug.print("\n--- {s}: {d} B claimed, {d} B written ---\n", .{ name, size, written_cap });
+        return error.SizeBeyondWritten;
+    }
+    const piece: usize = 1 << 20;
+    const got = try gpa.alloc(u8, piece);
+    defer gpa.free(got);
+    const want = try gpa.alloc(u8, piece);
+    defer gpa.free(want);
+    var out: Census = .{ .size = size, .exact = 0, .holes = 0 };
+    var off: u64 = 0;
+    while (off < size) : (off += piece) {
+        const n: usize = @intCast(@min(piece, size - off));
+        if (try f.readPositionalAll(io, got[0..n], off) != n) return error.ShortRead;
+        if (try image.readPositionalAll(io, want[0..n], src_off + off) != n) return error.ShortRead;
+        var p: usize = 0;
+        while (p < n) : (p += census_grain) {
+            const e = @min(p + census_grain, n);
+            if (std.mem.eql(u8, got[p..e], want[p..e])) {
+                out.exact += 1;
+            } else if (std.mem.allEqual(u8, got[p..e], 0)) {
+                out.holes += 1;
+            } else {
+                std.debug.print("\n--- {s}: page at {d} is neither the image nor a hole ---\n", .{ name, off + p });
+                return error.TornFile;
+            }
+        }
+    }
+    return out;
+}
+
+fn fileSize(path: [:0]const u8) u64 {
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, 0, .{ .SIZE = true }, &st)) != .SUCCESS) return 0;
+    return st.size;
+}
+
+/// What a remount after a kill reports.
+const Recovery = struct { replayed: u64, torn: u64, ring_records: u64, ring_torn: u64 };
+
+/// Remount with the C8 oracle armed; the journal replay, the ring
+/// recovery, zero drift (C8) and nothing leaked or lost (C2) on both
+/// volumes.
+fn remountAfterKill(rig: *Rig) !Recovery {
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    const ready = try rig.awaitReady(mark);
+    const text = try rig.readLog();
+    defer rig.gpa.free(text);
+    const seg = text[mark..ready];
+    try testing.expect(std.mem.indexOf(u8, seg, ", clean unmount") == null);
+    if (std.mem.count(u8, seg, " 0 drift row(s)") != 2 or std.mem.count(u8, seg, ": 0 leaked block(s) freed, 0 lost block(s)") != 2) {
+        std.debug.print("\n--- the oracles after the kill ---\n{s}\n", .{seg});
+        return error.DriftAfterKill;
+    }
+    const torn_at = std.mem.indexOf(u8, seg, "content records, ") orelse return error.NoReplayLine;
+    return .{
+        .replayed = numberAfter(seg, "replayed ") orelse 0,
+        .torn = numberAfter(seg[torn_at..], "content records, ") orelse 0,
+        .ring_records = numberAfter(seg, "recovered ") orelse 0,
+        .ring_torn = if (std.mem.indexOf(u8, seg, "record(s) (")) |i| (numberAfter(seg[i..], "), ") orelse 0) else 0,
+    };
+}
+
+test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and mid 8-way cp storm → remount → every fsync'd file byte-exact, every page of an in-flight file exact or a hole, C8 zero drift, C2 nothing leaked or lost, rm → df baseline → status" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.createImage();
+    // The C8 oracle at every mount of this test (the A/B lever).
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+    const image = try Io.Dir.cwd().openFile(io, rig.image, .{});
+    defer image.close(io);
+    const storm_sources = try rig.shOk(rig.work, "i=0; while [ $i -lt 8 ]; do dd if=image of=s$i bs=1M skip=$((i * 25)) count=50 status=none; i=$((i + 1)); done; echo ok");
+    gpa.free(storm_sources);
+
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const baseline = try rig.usedKib();
+    var acked: usize = 0;
+    var pb: [256:0]u8 = undefined;
+    // Three mid-dd kills.
+    for (kill_points_mib, 0..) |point, k| {
+        // The acked file: 8 MiB from the image at a distinct offset, fsync returned.
+        {
+            var script: std.Io.Writer.Allocating = .init(gpa);
+            defer script.deinit();
+            try script.writer.print("dd if=\"$1/image\" of=acked{d} bs=1M skip={d} count={d} conv=fsync status=none && echo acked-ok", .{ k, 8 * k, acked_mib });
+            const out = try rig.onMount(script.written());
+            defer gpa.free(out);
+            try testing.expect(std.mem.indexOf(u8, out, "acked-ok") != null);
+            acked += 1;
+        }
+        const inflight = try std.fmt.bufPrintSentinel(&pb, "{s}/inflight{d}", .{ rig.mp, k }, 0);
+        var dd_script: [512]u8 = undefined;
+        const dd_cmd = try std.fmt.bufPrint(&dd_script, "dd if={s} of={s} bs=1M count={d} status=none", .{ rig.image, inflight, big_mib });
+        var dd = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", dd_cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        var claimed: u64 = 0;
+        {
+            const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+            while (clock.monotonicNs() < deadline) {
+                claimed = fileSize(inflight);
+                if (claimed >= point << 20) break;
+                sleepMs(1);
+            }
+        }
+        try testing.expect(claimed >= point << 20);
+        _ = linux.kill(rig.child_pid, .KILL);
+        try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+        try testing.expect(!(try dd.wait(io)).success());
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+        const rec = try remountAfterKill(rig);
+        // Every acked file byte-exact; the in-flight file exact or holes.
+        var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
+        defer dir.close(io);
+        for (0..acked) |a| {
+            var nb: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "acked{d}", .{a});
+            const c = try pageCensus(gpa, io, dir, name, image, (8 * a) << 20, acked_mib << 20);
+            try testing.expectEqual(acked_mib << 20, c.size);
+            try testing.expectEqual(@as(u64, 0), c.holes);
+        }
+        var nb: [32]u8 = undefined;
+        const in_name = try std.fmt.bufPrint(&nb, "inflight{d}", .{k});
+        // The claim grew between the last poll and the kill: the law is
+        // `observed ≤ size ≤ bytes dd could have written`.
+        const c = try pageCensus(gpa, io, dir, in_name, image, 0, big_mib << 20);
+        try testing.expect(c.size >= claimed);
+        std.debug.print("\nsmoke[kill]: dd killed at {d} MiB claimed (point {d} MiB): replayed {d} entries ({d} torn dropped), ring {d} record(s) ({d} torn); inflight{d} claims {d} MiB: {d} pages exact, {d} holes, 0 torn; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, point, rec.replayed, rec.torn, rec.ring_records, rec.ring_torn, k, c.size >> 20, c.exact, c.holes, acked });
+        {
+            const out = try rig.onMount("rm -f inflight* && echo ok");
+            defer gpa.free(out);
+        }
+    }
+    // The storm kill.
+    {
+        var storm_cmd: [1024]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&storm_cmd, "i=0; while [ $i -lt 8 ]; do cp {s}/s$i {s}/storm$i & i=$((i + 1)); done; wait", .{ rig.work, rig.mp });
+        var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        var claimed: u64 = 0;
+        {
+            const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+            while (clock.monotonicNs() < deadline) {
+                claimed = 0;
+                for (0..storm_files) |i| {
+                    const p = try std.fmt.bufPrintSentinel(&pb, "{s}/storm{d}", .{ rig.mp, i }, 0);
+                    claimed += fileSize(p);
+                }
+                if (claimed >= storm_kill_mib << 20) break;
+                sleepMs(1);
+            }
+        }
+        try testing.expect(claimed >= storm_kill_mib << 20);
+        _ = linux.kill(rig.child_pid, .KILL);
+        try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+        _ = try storm.wait(io);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+        const rec = try remountAfterKill(rig);
+        var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
+        defer dir.close(io);
+        var present: usize = 0;
+        var exact: u64 = 0;
+        var holes: u64 = 0;
+        var sizes: u64 = 0;
+        for (0..storm_files) |i| {
+            var nb: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "storm{d}", .{i});
+            const c = pageCensus(gpa, io, dir, name, image, (i * storm_stride_mib) << 20, storm_mib << 20) catch |e| switch (e) {
+                error.FileNotFound => continue,
+                else => return e,
+            };
+            present += 1;
+            exact += c.exact;
+            holes += c.holes;
+            sizes += c.size;
+        }
+        for (0..acked) |a| {
+            var nb: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "acked{d}", .{a});
+            const c = try pageCensus(gpa, io, dir, name, image, (8 * a) << 20, acked_mib << 20);
+            try testing.expectEqual(acked_mib << 20, c.size);
+            try testing.expectEqual(@as(u64, 0), c.holes);
+        }
+        std.debug.print("smoke[kill]: storm killed at {d} MiB claimed: replayed {d} entries ({d} torn dropped), ring {d} record(s) ({d} torn); {d} of 8 files present claiming {d} MiB: {d} pages exact, {d} holes, 0 torn; {d} acked file(s) byte-exact; C8 0 drift, C2 0/0\n", .{ claimed >> 20, rec.replayed, rec.torn, rec.ring_records, rec.ring_torn, present, sizes >> 20, exact, holes, acked });
+    }
+    // rm everything → the baseline; the gauges; a clean cycle; status.
+    {
+        const out = try rig.onMount("rm -f acked* storm* inflight* && echo ok");
+        defer gpa.free(out);
+    }
+    try rig.awaitUsedKib(baseline);
+    {
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try expectLedgersClosed(tail);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    {
+        const report = try rig.statusReport();
+        defer gpa.free(report);
+        try testing.expectEqual(@as(u64, 0), refCensus(report).blocks);
+        try testing.expect(std.mem.indexOf(u8, report, "not mounted") != null);
+        std.debug.print("smoke[kill]: {s}", .{report[std.mem.lastIndexOf(u8, report, "summary:").?..]});
+    }
 }

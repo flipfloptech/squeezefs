@@ -28,6 +28,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const checksum = @import("../core/checksum.zig");
+const clock = @import("../core/clock.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
@@ -69,6 +70,11 @@ pub const stats = struct {
     /// payload (another client's live custody, or a crash discarded it).
     /// 0 on any client of a cleanly unmounted set (gate G-PK2).
     pub var staged_payload_lost_reads: counters.ShardedCounter = .{};
+    /// `staging_backing_phase_ns`: the wall of the ring's backing syscalls
+    /// (`msync` on a put, `fallocate(PUNCH_HOLE)` + `madvise` on a release)
+    /// — they run on the caller's lane thread, so their tail IS a lane stall.
+    pub var backing_sync_ns: counters.ShardedLatencyHistogram = .{};
+    pub var backing_reclaim_ns: counters.ShardedLatencyHistogram = .{};
     /// `dismount_promoted_files` / `dismount_promoted_bytes` /
     /// `dismount_promote_failures`: the clean-unmount promotion pass.
     pub var dismount_promoted_files: counters.ShardedCounter = .{};
@@ -95,6 +101,14 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.dismount_promote_failures.load(),
         stats.fsync_promoted_files.load(),
     });
+}
+
+pub fn writePhasesJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("{\"backing_sync\":");
+    try stats.backing_sync_ns.snapshot().writeJson(w);
+    try w.writeAll(",\"backing_reclaim\":");
+    try stats.backing_reclaim_ns.snapshot().writeJson(w);
+    try w.writeAll("}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,7 +1162,9 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
 
         fn sync(ctx: ?*anyopaque, off: u64, len: u64) void {
             const self: *MappedSegment = @ptrCast(@alignCast(ctx.?));
+            const t0 = clock.monotonicNs();
             _ = linux.msync(self.map.ptr + @as(usize, @intCast(off)), @intCast(len), linux.MSF.ASYNC);
+            stats.backing_sync_ns.record(clock.monotonicNs() - t0);
         }
 
         /// Punch the hole (the host reclaims the blocks) and drop the pages
@@ -1156,8 +1172,10 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
         /// tombstoned record is never adopted — so their errnos are ignored.
         fn reclaim(ctx: ?*anyopaque, off: u64, len: u64) void {
             const self: *MappedSegment = @ptrCast(@alignCast(ctx.?));
+            const t0 = clock.monotonicNs();
             _ = linux.fallocate(self.fd, linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE, @intCast(off), @intCast(len));
             _ = linux.madvise(self.map.ptr + @as(usize, @intCast(off)), @intCast(len), linux.MADV.DONTNEED);
+            stats.backing_reclaim_ns.record(clock.monotonicNs() - t0);
         }
 
         pub fn backing(self: *MappedSegment) Backing {

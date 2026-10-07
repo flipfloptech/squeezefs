@@ -10,15 +10,19 @@
 //!   decodable, the stamp's set; every data volume's device read and
 //!   checked against its record — the §5.4 URI-disagreement refusals; an
 //!   encrypted set resolves and verifies its key here — a wrong key file
-//!   refuses the mount instead of failing every read; the data plane
-//!   itself is not yet wired into the filesystem) → start the budget
-//!   sampler → `KvFs(KvBackend)` + the
-//!   handler tables (watchdog registry, op guards, open table) + the ring
-//!   `Binding` → the FUSE fd: root opens `/dev/fuse` inside the session's
-//!   `mount(2)`; anyone else receives it from `fusermount3` (`fusermount.zig`)
-//!   → `Session.mount` (INIT, geometry, `enable_uring`, workers, the arm
-//!   barrier) → the watchdog loop and the reclaim cadence on `spawnMeta` →
-//!   `ready` (logged; written to the supervisor pipe under `--daemon`).
+//!   refuses the mount instead of failing every read) → start the budget
+//!   sampler → the handler tables (watchdog registry, op guards, open
+//!   table) → the DATA PLANE (`data/plane.zig`: devices, allocators seeded
+//!   from the ledger, the router, the reclaimer, staging + the NVMe tier
+//!   under the cache paths, the transform keyed from the verified key, the
+//!   write and read paths) → `KvFs(KvBackend, DataPlane)` + the ring
+//!   `Binding` with the plane's queue-thread arms → the FUSE fd: root opens
+//!   `/dev/fuse` inside the session's `mount(2)`; anyone else receives it
+//!   from `fusermount3` (`fusermount.zig`) → `Session.mount` (INIT,
+//!   geometry, `enable_uring`, workers, the arm barrier) → the plane's zc
+//!   legs armed from the session's buffer mode → the watchdog loop and the
+//!   reclaim cadence on `spawnMeta` → `ready` (logged; written to the
+//!   supervisor pipe under `--daemon`).
 //!
 //! Serve: the main task parks on the daemon's eventfd through its lane ring
 //! (`SqzIo.readable`): a signal (`daemon.Signals`) or the session's
@@ -29,9 +33,12 @@
 //!
 //! Teardown: `Session.close` (drains synthesize every owed reply, the
 //! unmount, the workers join) → the watchdog and the cadence cancelled →
-//! `Session.deinit` → the filesystem → `KvBackend.close` (the final
-//! checkpoint: an empty replay window for the next mount) → the sampler →
-//! exit 0; a volume that latched FAILED exits 1 naming the reason.
+//! `Session.deinit` → the filesystem's dismount sweep → `DataPlane.close`
+//! (the dismount pass: staged files promote, packs seal DISMOUNT, the
+//! reclaimer drains, the devices close — charter §8 `umount`) →
+//! `KvBackend.close` (the final checkpoint: an empty replay window for the
+//! next mount) → the sampler → exit 0; a volume that latched FAILED exits
+//! 1 naming the reason.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -45,6 +52,8 @@ const fusermount = @import("fusermount.zig");
 const exec = @import("../exec/exec.zig");
 const exec_stats = @import("../exec/stats.zig");
 const backend = @import("../meta/backend.zig");
+const checkpoint = @import("../meta/checkpoint.zig");
+const journal_lane = @import("../meta/journal_lane.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const handler = @import("../fuse/handler.zig");
@@ -56,6 +65,9 @@ const key = @import("../meta/key.zig");
 const set_config = @import("../data/set_config.zig");
 const transform = @import("../data/transform.zig");
 const data_superblock = @import("../data/data_superblock.zig");
+const plane_mod = @import("../data/plane.zig");
+const slot = @import("../fuse/transport/slot.zig");
+const sync_tick = @import("../sync/tick.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const errors = @import("../core/errors.zig");
@@ -81,11 +93,6 @@ const filesystem = handler.filesystem;
 /// one entry, and the tick is the slowest periodic cadence the daemon
 /// already runs.
 pub const RECLAIM_CADENCE_NS: u64 = watchdog.TICK_NS;
-/// The INIT `max_write` desire's block term before any data volume exists
-/// (charter §6.1 "Striped: 4 MiB blocks (configurable CHUNK_SIZE)"): the
-/// default chunk, so the transport geometry a rung-4 mount negotiates is
-/// the one measured today.
-pub const DEFAULT_BLOCK_SIZE: u64 = 4 * derive.MiB;
 
 /// The verb's state, pinned in `run`'s frame for the root task.
 const Ctx = struct {
@@ -100,6 +107,9 @@ const Ctx = struct {
     /// The raw `-o` string (the fusermount3 path forwards it).
     reporter: ?daemon.Reporter,
     session_ended: std.atomic.Value(bool) = .init(false),
+    /// The verified volume key of an encrypted set (zeroized once the plane
+    /// holds its crypto state).
+    derived_key: ?transform.DerivedKey = null,
 
     /// Report a bring-up failure: the log, stderr (foreground) or the
     /// supervisor pipe (daemon); exit 1.
@@ -255,21 +265,29 @@ fn mountMain(ctx: *Ctx) u8 {
     // 2. The budget sampler (the registry already holds the fiber stacks;
     //    the arena joins at the session).
     _ = mem_budget.authority.spawnSampler(ctx.budget_host, mem_budget.sampler_period_ns) catch |e| return ctx.failed("cannot start the memory-budget sampler ({s})", .{@errorName(e)});
-    defer mem_budget.authority.stopSampler(ctx.p.io);
+    var sampler_live = true;
+    defer if (sampler_live) mem_budget.authority.stopSampler(ctx.p.io);
 
-    // 3. The filesystem and the handler layer.
-    var fs = BackendFs.mount(gpa, io, be, .{
-        .ttls = ctx.opts.ttls,
-        .page_size = facts.page_size,
-        .dlm_stripes = dlm.resolveWidth(env, facts, fuse_geometry.Q_DEPTH_DESIRED),
-    }) catch return ctx.failed("out of memory mounting the filesystem", .{});
-    defer fs.unmount();
+    // 3. The handler tables, the data plane, the filesystem, the binding.
     var registry = watchdog.Registry.init(gpa, watchdog.derivedShards(facts.possible_cpus)) catch return ctx.failed("out of memory (watchdog registry)", .{});
     defer registry.deinit();
     var guards = op_guard.Table.init(gpa, op_guard.INODE_GUARD_STRIPES) catch return ctx.failed("out of memory (op guards)", .{});
     defer guards.deinit();
     var opens = open_table.OpenTable.init(gpa, open_table.derivedCapacity(facts.possible_cpus, fuse_geometry.Q_DEPTH_DESIRED)) catch return ctx.failed("out of memory (open table)", .{});
     defer opens.deinit();
+    const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .derived_key = ctx.derived_key, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
+    if (ctx.derived_key) |*k| k.zeroize();
+    var plane_open = true;
+    defer if (plane_open) plane.close();
+    var fs = BackendFs.mount(gpa, io, be, plane, .{
+        .ttls = ctx.opts.ttls,
+        .page_size = facts.page_size,
+        .dlm_stripes = dlm.resolveWidth(env, facts, fuse_geometry.Q_DEPTH_DESIRED),
+    }) catch return ctx.failed("out of memory mounting the filesystem", .{});
+    defer fs.unmount();
+    // The corpse sweep (kv_fs module doc): what a crashed daemon's forgets
+    // left at nlink 0 is destroyed before any request is served.
+    _ = fs.sweepCorpsesAtMount() catch |e| return ctx.failed("the corpse sweep at mount failed ({t})", .{e});
     op_trace.arm(env);
     var binding: handler.ring.Binding = .{};
     binding.bind(.{
@@ -278,8 +296,10 @@ fn mountMain(ctx: *Ctx) u8 {
         .registry = &registry,
         .guards = &guards,
         .opens = &opens,
+        .probe = plane.probe(),
         .shared_enabled = op_guard.sharedEnabled(env),
     });
+    binding.bindData(.{ .plane = plane });
 
     // 4. The FUSE fd (root: inside the session; else fusermount3) and the
     //    session's ordered bring-up.
@@ -295,7 +315,7 @@ fn mountMain(ctx: *Ctx) u8 {
     }
     const session = Session.mount(gpa, ctx.sqz, binding.filesystem(), ctx.mountpoint, env, facts, .{
         .opts = ctx.opts,
-        .block_size = DEFAULT_BLOCK_SIZE,
+        .block_size = cfg.block_size,
         .mem_budget_bytes = ctx.budget_bytes,
         .budget = &mem_budget.authority,
         .fuse_fd = fuse_fd,
@@ -310,6 +330,10 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     var session_live = true;
     defer if (session_live) session.deinit();
+    // The zc legs: the held-slot direct store on a zero-copy session, the
+    // direct device leg, the fd-source probe serve.
+    var held_store: HeldStore = .{ .session = session };
+    plane.armSession(if (session.heldStoreArmed()) held_store.face() else null, session.mode == .zero_copy, session.readZcServe());
 
     // 5. The watchdog loop and the reclaim cadence on the meta pool.
     var wd = watchdog.Watchdog.init(&registry);
@@ -329,7 +353,7 @@ fn mountMain(ctx: *Ctx) u8 {
     }
 
     // 7. Serve until a stop latches or the session ends.
-    serve(ctx, session, be);
+    serve(ctx, session, be, plane);
 
     // 8. Teardown in order.
     session.close();
@@ -343,8 +367,14 @@ fn mountMain(ctx: *Ctx) u8 {
     log.info("teardown: session closed; open_count_stranded={d} transport_requests_abandoned={d} tick_rescues={d}/{d}", .{ stranded, abandoned, transport.worker.park_tick_commit_rescues.load(), transport.worker.park_tick_cqe_rescues.load() });
     session_live = false;
     session.deinit();
-    // The backend's final checkpoint next; the `defer`s unwind the
-    // filesystem, the tables and the sampler after it.
+    // The sampler stops BEFORE the plane's components (its gauges) go; the
+    // dismount pass BEFORE the backend's final checkpoint (its promotions
+    // are layout transactions); the `defer`s unwind the filesystem and the
+    // tables after it.
+    sampler_live = false;
+    mem_budget.authority.stopSampler(ctx.p.io);
+    plane_open = false;
+    plane.close();
     be_open = false;
     be.close();
     if (failed) {
@@ -410,7 +440,7 @@ fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
     if (cfg.encryption != .none) {
         var path_buf: [128]u8 = undefined;
         var served: []const u8 = "";
-        var derived = transform.linux_keys.resolveVolumeKey(ctx.p.env, null, &cfg.kdf_salt, cfg.key_id, &path_buf, &served) catch |e| {
+        const derived = transform.linux_keys.resolveVolumeKey(ctx.p.env, null, &cfg.kdf_salt, cfg.key_id, &path_buf, &served) catch |e| {
             var buf: [512]u8 = undefined;
             var w: Io.Writer = .fixed(&buf);
             transform.writeKeyFileRefusal(&w, e, if (served.len != 0) served else transform.defaultKeyPath(&path_buf, cfg.key_id)) catch {};
@@ -418,9 +448,9 @@ fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
             cfg.deinit(gpa);
             return null;
         };
-        // The gate is the point of this rung: the material and the KEK
-        // leave no trace until the data plane holds a crypto state.
-        derived.zeroize();
+        // The KEK and key id travel to the data plane's crypto state (which
+        // copies them); the caller zeroizes this copy right after.
+        ctx.derived_key = derived;
         log.info("mount: encryption key verified ({s}, id {x}, from {s})", .{ transform.KEY_WRAP_SCHEME_NAME, &cfg.key_id, served });
     }
     var out: Io.Writer.Allocating = .init(gpa);
@@ -470,7 +500,21 @@ const ReclaimCadence = struct {
     }
 };
 
-fn serve(ctx: *Ctx, session: *Session, be: *backend.KvBackend) void {
+/// The plane's `write_fixed` face: the session's `storeHeld`.
+const HeldStore = struct {
+    session: *Session,
+
+    fn face(self: *HeldStore) plane_mod.HeldStoreFace {
+        return .{ .ctx = self, .store = &store };
+    }
+
+    fn store(ctx: *anyopaque, src: slot.HeldSource, fd: linux.fd_t, off: u64, io: Io) slot.ExtractError!void {
+        const self: *HeldStore = @ptrCast(@alignCast(ctx));
+        return self.session.storeHeld(src, fd, off, io);
+    }
+};
+
+fn serve(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane_mod.DataPlane) void {
     const efd = daemon.Signals.eventfd();
     while (true) {
         _ = ctx.sqz.readable(efd) catch |e| {
@@ -479,7 +523,7 @@ fn serve(ctx: *Ctx, session: *Session, be: *backend.KvBackend) void {
         };
         daemon.Signals.drain();
         const bits = daemon.Signals.take();
-        if (bits & daemon.SIG_STATS != 0) dumpStats(ctx, session, be);
+        if (bits & daemon.SIG_STATS != 0) dumpStats(ctx, session, be, plane);
         if (bits & daemon.SIG_STOP != 0) {
             log.info("stop requested (SIGTERM/SIGINT): unmounting {s}", .{ctx.mountpoint});
             return;
@@ -494,36 +538,80 @@ fn serve(ctx: *Ctx, session: *Session, be: *backend.KvBackend) void {
 
 /// Every stats family, one log line each (the `.stats` inode's rung-5 JSON,
 /// delivered through the log on SIGUSR1).
-fn dumpStats(ctx: *Ctx, session: *Session, be: *backend.KvBackend) void {
-    var buf: [3072]u8 = undefined;
+fn dumpStats(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane_mod.DataPlane) void {
+    // The transport family is ~6 KiB with the zc legs' keys; a truncated
+    // line would hide the must-stay-0 gauges the smoke reads.
+    var buf: [16384]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     session.writeStatsJson(&w) catch {};
     log.info("stats transport: {s}", .{w.buffered()});
+    {
+        // Every data family under one object (the largest line: a 64 KiB
+        // buffer; a truncated dump names itself).
+        var dbuf: [65536]u8 = undefined;
+        var dw: Io.Writer = .fixed(&dbuf);
+        plane.writeFamiliesJson(&dw) catch {};
+        log.info("stats data: {s}", .{dw.buffered()});
+    }
+    {
+        // The metadata plane: the conveyor, the checkpoint's park-driven
+        // cycles, the journal lane — the family that names a commit stall.
+        w = .fixed(&buf);
+        w.writeAll("{\"conveyor\":") catch {};
+        be.conveyorStats().writeJson(&w) catch {};
+        w.writeAll(",\"conveyor_phases\":") catch {};
+        be.conveyorStats().writePhasesJson(&w) catch {};
+        w.writeAll(",\"meta_barrier\":") catch {};
+        checkpoint.stats.meta_barrier.snapshot().writeJson(&w) catch {};
+        w.print(",\"checkpoint\":{{\"meta_kv_checkpoints\":{d},\"meta_kv_ledger_writes\":{d},\"meta_device_syncs\":{d},\"meta_kv_checkpoint_park_cycles\":{d},\"meta_kv_maintenance_items\":{d},\"pending_free_stalled_cycles\":{d}}},\"journal_lane\":", .{
+            checkpoint.stats.meta_kv_checkpoints.load(),
+            checkpoint.stats.meta_kv_ledger_writes.load(),
+            checkpoint.stats.meta_device_syncs.load(),
+            checkpoint.stats.meta_kv_checkpoint_park_cycles.load(),
+            checkpoint.stats.meta_kv_maintenance_items.load(),
+            checkpoint.stats.pending_free_stalled_cycles.load(),
+        }) catch {};
+        journal_lane.writeStatsJson(&w) catch {};
+        w.writeAll("}") catch {};
+        log.info("stats meta: {s}", .{w.buffered()});
+    }
     w = .fixed(&buf);
     ctx.sqz.writeStatsJson(&w) catch {};
     log.info("stats exec: {s}", .{w.buffered()});
     w = .fixed(&buf);
     mem_budget.authority.writeStatsJson(&w) catch {};
     log.info("stats mem_budget: {s}", .{w.buffered()});
-    log.info("stats daemon: {{\"open_count_stranded\":{d},\"invariant_tripwires\":{d},\"fuse_ops\":{d},\"fuse_op_watchdog_overdue\":{d},\"fuse_ops_inflight\":{d},\"fuse_write_beyond_inline_refused\":{d},\"fuse_reclaim_destroys\":{d},\"fuse_reclaim_drains\":{d},\"exec_lane_tick_rescues\":{d},\"transport_park_tick_commit_rescues\":{d},\"transport_park_tick_cqe_rescues\":{d},\"volume_failed\":{}}}", .{
+    log.info("stats daemon: {{\"open_count_stranded\":{d},\"invariant_tripwires\":{d},\"fuse_ops\":{d},\"fuse_op_watchdog_overdue\":{d},\"fuse_ops_inflight\":{d},\"fuse_write_no_data_volume_refused\":{d},\"fuse_write_beyond_inline_map_refused\":{d},\"fuse_write_inline\":{d},\"fuse_write_staged\":{d},\"fuse_write_striped\":{d},\"fuse_write_promotions_to_striped\":{d},\"fuse_truncate_packed_clips\":{d},\"fuse_truncate_striped_clips\":{d},\"fuse_truncate_restages\":{d},\"fuse_truncate_zero_tail_bytes\":{d},\"fuse_reclaim_destroys\":{d},\"fuse_corpse_sweep_destroyed\":{d},\"fuse_reclaim_drains\":{d},\"fuse_reclaim_blocks_freed\":{d},\"exec_lane_tick_rescues\":{d},\"transport_park_tick_commit_rescues\":{d},\"transport_park_tick_cqe_rescues\":{d},\"lock_ticked_reregisters\":{d},\"channel_ticked_reregisters\":{d},\"volume_failed\":{}}}", .{
         counters.tripwireCount("open_count_stranded"),
         counters.invariantTripwires(),
         handler.lifecycle.fuse_ops.load(),
         watchdog.fuse_op_watchdog_overdue.load(),
         watchdog.fuse_ops_inflight.load(),
-        handler.kv_fs.fuse_write_beyond_inline_refused.load(),
+        handler.kv_fs.fuse_write_no_data_volume_refused.load(),
+        handler.kv_fs.fuse_write_beyond_inline_map_refused.load(),
+        handler.kv_fs.fuse_write_inline.load(),
+        handler.kv_fs.fuse_write_staged.load(),
+        handler.kv_fs.fuse_write_striped.load(),
+        handler.kv_fs.fuse_write_promotions_to_striped.load(),
+        handler.kv_fs.fuse_truncate_packed_clips.load(),
+        handler.kv_fs.fuse_truncate_striped_clips.load(),
+        handler.kv_fs.fuse_truncate_restages.load(),
+        handler.kv_fs.fuse_truncate_zero_tail_bytes.load(),
         handler.kv_fs.fuse_reclaim_destroys.load(),
+        handler.kv_fs.fuse_corpse_sweep_destroyed.load(),
         handler.kv_fs.fuse_reclaim_drains.load(),
+        handler.kv_fs.fuse_reclaim_blocks_freed.load(),
         exec_stats.lane_tick_rescues.load(),
         transport.worker.park_tick_commit_rescues.load(),
         transport.worker.park_tick_cqe_rescues.load(),
+        sync_tick.lock_ticked_reregisters.load(),
+        sync_tick.channel_ticked_reregisters.load(),
         be.isFailed(),
     });
 }
 
 const testing = std.testing;
 
-test "the reclaim cadence is one watchdog tick; the default block term is the 4 MiB chunk" {
+test "the reclaim cadence is one watchdog tick" {
     try testing.expectEqual(watchdog.TICK_NS, RECLAIM_CADENCE_NS);
-    try testing.expectEqual(@as(u64, 4 << 20), DEFAULT_BLOCK_SIZE);
 }

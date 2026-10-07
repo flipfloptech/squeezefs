@@ -1066,6 +1066,11 @@ pub const Device = struct {
     write_cache: nd.WriteCacheClass,
     /// `probeSubstrate` at open: the discard command's shape.
     substrate: reclaim.Substrate,
+    /// The daemon-lifetime O_DIRECT fd the zero-copy legs name on a FOREIGN
+    /// ring (`READ_FIXED(device → slot)`, `WRITE_FIXED(device ← slot)` on
+    /// the FUSE queue ring that registered the slot): a lane's own fd is
+    /// that lane's (fixed file 0 on its ring) and never leaves it.
+    direct_fd: linux.fd_t,
     closed: bool = false,
 
     /// `open_checked`: `probeDirectIo` FIRST (loud refusal), spawn lane 0,
@@ -1077,16 +1082,26 @@ pub const Device = struct {
         errdefer gpa.destroy(dev);
         const owned = try gpa.dupeSentinel(u8, path, 0);
         errdefer gpa.free(owned);
+        const direct_raw = linux.open(path, .{ .ACCMODE = .RDWR, .DIRECT = true, .CLOEXEC = true }, 0);
+        if (linux.errno(direct_raw) != .SUCCESS) return error.DirectOpenRefused;
+        const direct_fd: linux.fd_t = @intCast(direct_raw);
+        errdefer _ = linux.close(direct_fd);
         dev.* = .{
             .gpa = gpa,
             .path = owned,
             .write_cache = probeWriteCache(path),
             .substrate = probeSubstrate(path),
+            .direct_fd = direct_fd,
         };
         dev.lanes[0] = try spawnArmedLane(gpa, dev);
         dev.lane_count.store(1, .release);
         log.info("data volume {s}: write cache {s}", .{ path, dev.write_cache.name() });
         return dev;
+    }
+
+    /// The fd of the zero-copy legs (module field doc). Valid until `deinit`.
+    pub fn directFd(self: *const Device) linux.fd_t {
+        return self.direct_fd;
     }
 
     /// Stop every lane (idempotent): close queues → wake → join. Callers
@@ -1102,6 +1117,7 @@ pub const Device = struct {
         self.close();
         const n = self.lane_count.load(.acquire);
         for (self.lanes[0..n]) |l| l.?.deinit(self.gpa);
+        _ = linux.close(self.direct_fd);
         self.gpa.free(self.path);
         self.gpa.destroy(self);
     }

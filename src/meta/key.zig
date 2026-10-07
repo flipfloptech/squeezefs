@@ -738,6 +738,29 @@ pub fn keySuccessor(key: []const u8) KeyBuf {
     return k;
 }
 
+/// The smallest key of the SAME slot-tree kind and length strictly greater
+/// than `key` — a range scan's resume cursor. `keySuccessor` is one byte
+/// longer and so Malformed for every slot-tree kind (the backend refuses
+/// to route it); this one increments the key as a fixed-width big-endian
+/// integer with the kind byte held fixed (the trailing fields first, the
+/// carry into the ino / the volume tag). Null when the kind's space is
+/// exhausted (every variable byte was 0xFF).
+pub fn sameKindSuccessor(key: []const u8) ?KeyBuf {
+    var k = KeyBuf.fromSlice(key);
+    const kind_off: usize = if (key.len > 0 and key[0] == TREE_BLOCK_REFS) 0 else INO_MAJOR_KIND_OFF;
+    var i: usize = key.len;
+    while (i > 0) {
+        i -= 1;
+        if (i == kind_off) continue;
+        if (k.buf[i] != 0xFF) {
+            k.buf[i] += 1;
+            return k;
+        }
+        k.buf[i] = 0;
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // §1.6 Seeded name hashes — the per-volume `hash_seed` keys them so names
 // cannot be chosen off-line to collide.
@@ -1184,6 +1207,26 @@ test "KEY_SPACE_MAX is 32 × 0xFF and sorts above every leaf key; key successor 
     try testing.expectEqualSlices(u8, &(inodeKey(5) ++ [_]u8{0}), s.slice());
     try testing.expect(order(&inodeKey(5), s.slice()) == .lt);
     try testing.expect(order(s.slice(), &inodeKey(6)) == .lt);
+}
+
+test "sameKindSuccessor: the next key of the kind — inode ino+1; xattr coll_seq+1 with the carry into hash56 then ino; ref block_index+1 with the carry into the owner; every result decodes as its kind; the kind's last key has none" {
+    const ik = sameKindSuccessor(&inodeKey(5)).?;
+    try testing.expectEqualSlices(u8, &inodeKey(6), ik.slice());
+    try testing.expectEqual(TREE_INODES, try slotTreeKeyKind(ik.slice()));
+    const xk = sameKindSuccessor(&xattrKey(7, 9, 3)).?;
+    try testing.expectEqualSlices(u8, &xattrKey(7, 9, 4), xk.slice());
+    const xc = sameKindSuccessor(&xattrKey(7, 9, 0xFF)).?;
+    try testing.expectEqualSlices(u8, &xattrKey(7, 10, 0), xc.slice());
+    const xi = sameKindSuccessor(&xattrKey(7, HASH56_MAX, 0xFF)).?;
+    try testing.expectEqualSlices(u8, &xattrKey(8, 0, 0), xi.slice());
+    try testing.expectEqual(TREE_XATTRS, try slotTreeKeyKind(xi.slice()));
+    const rk = sameKindSuccessor(&blockRefKey(0x10, 4, 20, 3)).?;
+    try testing.expectEqualSlices(u8, &blockRefKey(0x10, 4, 20, 4), rk.slice());
+    const rc = sameKindSuccessor(&blockRefKey(0x10, 4, 20, std.math.maxInt(u32))).?;
+    try testing.expectEqualSlices(u8, &blockRefKey(0x10, 4, 21, 0), rc.slice());
+    try testing.expectEqual(TREE_BLOCK_REFS, try slotTreeKeyKind(rc.slice()));
+    try testing.expect(sameKindSuccessor(&inodeKey(std.math.maxInt(u64))) == null);
+    try testing.expect(sameKindSuccessor(&blockRefKey(std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u32))) == null);
 }
 
 test "interior journal key is slot u32 BE ‖ separator; split refuses len ≤ 4" {

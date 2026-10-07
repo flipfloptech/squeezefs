@@ -33,8 +33,11 @@ const std = @import("std");
 const Io = std.Io;
 const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
+const slot = @import("../transport/slot.zig");
+const zc = @import("../transport/zc.zig");
 const errors = @import("../../core/errors.zig");
 const economy = @import("../../meta/economy.zig");
+const op_guard = @import("op_guard.zig");
 const op_trace = @import("op_trace.zig");
 const watchdog = @import("watchdog.zig");
 
@@ -166,7 +169,21 @@ pub const RenameArgs = struct { parent: u64, name: []const u8, newparent: u64, n
 pub const LinkArgs = struct { ino: u64, newparent: u64, newname: []const u8 };
 pub const OpenArgs = struct { ino: u64, flags: u32, open_flags: u32 };
 pub const ReadArgs = struct { ino: u64, fh: u64, offset: u64, size: u32, flags: u32 };
-pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8, write_flags: u32, flags: u32 };
+/// `data` is the payload in hand (empty when `held`); `held` is a
+/// zero-copy payload still sitting in the registered slot (the handler
+/// consumes it by its source coordinates — `WRITE_FIXED(device ← slot)` —
+/// or extracts it lazily, exactly once, before the lease ends); `class` is
+/// the level-1 admission's verdict (charter §6.2 shared-mode admission).
+pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8, held: ?HeldPayload = null, class: op_guard.Class = .entire_op, write_flags: u32, flags: u32 };
+
+/// A HELD zero-copy WRITE payload (portable face of `slot.PayloadLease`):
+/// the slot source for a direct device store and the memoized extraction.
+pub const HeldPayload = struct {
+    src: slot.HeldSource,
+    class: zc.PayloadClass,
+    ctx: ?*anyopaque,
+    extract: *const fn (ctx: ?*anyopaque, io: Io) anyerror![]const u8,
+};
 pub const FlushArgs = struct { ino: u64, fh: u64, lock_owner: u64 };
 pub const ReleaseArgs = struct { ino: u64, fh: u64, flags: u32, lock_owner: u64, flush: bool };
 pub const FsyncArgs = struct { ino: u64, fh: u64, datasync: bool };

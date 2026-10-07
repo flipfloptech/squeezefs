@@ -43,11 +43,13 @@
 //! copy; the closure `dest + bounce + dest_dma + zc_serve + zc_pool_serve ≈
 //! user bytes` and `warm_serve ≡ hot + hold + cache` are asserted in tests.
 //!
-//! `WriteSide` is the one-line import swap: when the write path's
-//! `write_side_view.zig` lands, `pub const WriteSide = @import(
-//! "write_side_view.zig").WriteSideView;` replaces the vtable declared
-//! here (the write agent builds it to this SAME shape); the RAM double
-//! below is test-only.
+//! `WriteSide` is the read seam over the write side. The write path's
+//! `write_side_view.Composite` answers ONE block window (`serve` →
+//! served / partial / redirect / settle / none); `data/plane.zig` binds it
+//! to this vtable (`staged_block` composes a partial's gaps from the base
+//! the write side named, follows a redirect to the shadow, runs the
+//! serialized settle) — the import swap is that adapter (decision 0002).
+//! The RAM double below is test-only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -326,9 +328,8 @@ pub const OverlayVerdict = union(enum) {
 
 pub const ExtentCoverage = enum { none, partial, full };
 
-/// The write side's view the read path consults FIRST. The write agent's
-/// `write_side_view.zig` builds `WriteSideView` to this shape (the one-line
-/// import swap in the module doc).
+/// The write side's view the read path consults FIRST; the data plane
+/// adapts `write_side_view.Composite` to it (module doc).
 pub const WriteSide = struct {
     ctx: *anyopaque,
     /// The accumulation buffer's coverage-aware snapshot and any open
@@ -550,6 +551,8 @@ pub const ReadPath = struct {
     pipelines: PipelineTable,
     settle: Settle,
     seams: Seams = .{},
+    /// The speculative-fill issuer (null = plans are bookkept, never run).
+    issuer: ?Issuer = null,
 
     const PipelineTable = struct {
         /// 64 files in flight per read path: the stream-lane population a
@@ -735,6 +738,16 @@ pub const ReadPath = struct {
     fn still(self: *ReadPath, key: BlockKey, before: u64) bool {
         const a = self.allocatorOf(key) orelse return true;
         return a.fillIncarnationStill(key.blockIdx(self.cfg.block_size), before);
+    }
+
+    /// The warm ladder's direct-leg pair: the pre-DMA snapshot (null =
+    /// unstable: never DMA) and the post-DMA `still`.
+    pub fn incarnationSnapshot(self: *ReadPath, key: BlockKey) ?u64 {
+        return self.fillIncarnation(key);
+    }
+
+    pub fn incarnationStill(self: *ReadPath, key: BlockKey, before: u64) bool {
+        return self.still(key, before);
     }
 
     const StillCtx = struct { rp: *ReadPath, key: BlockKey, before: u64 };
@@ -1199,8 +1212,8 @@ pub const ReadPath = struct {
         var attempt: u32 = 0;
         while (attempt < SETTLE_ATTEMPTS) : (attempt += 1) {
             if (attempt > 0) io.sleep(.fromMilliseconds(@as(i64, 1) << @intCast(@min(attempt - 1, 3))), .awake) catch {};
-            const guard = self.settle.acquire(ino);
-            defer guard.release();
+            const guard = self.settle.acquire(io, ino);
+            defer guard.release(io);
             const k = self.currentBinding(ino, b) orelse return null;
             const fetched = try self.fetchBlockDeviceTrue(k);
             if (fetched.serve_valid and self.bindingIs(ino, b, k)) return fetched;
@@ -1452,24 +1465,48 @@ pub const ReadPath = struct {
     }
 
     /// Speculative fills are issued through the `Issuer` the mount installs
-    /// (a lane fiber); without one the pipeline's plan is bookkept and
-    /// settled as wasted — the demand path is never blocked by speculation.
-    fn envIssuePrefetch(_: *anyopaque, _: u8, _: u32, _: u64) bool {
-        return false;
+    /// (a lane fiber around `warm`); without one the pipeline's plan is
+    /// bookkept and settled as wasted — the demand path is never blocked by
+    /// speculation.
+    fn envIssuePrefetch(ctx: *anyopaque, _: u8, _: u32, block: u64) bool {
+        const c: *EnvCtx = @ptrCast(@alignCast(ctx));
+        const is = c.rp.issuer orelse return false;
+        return is.issue(is.ctx, c.ino, block, .prefetch);
     }
 
-    fn envIssueLane(_: *anyopaque, _: u8, _: u32, _: u64) bool {
-        return false;
+    fn envIssueLane(ctx: *anyopaque, _: u8, _: u32, block: u64) bool {
+        const c: *EnvCtx = @ptrCast(@alignCast(ctx));
+        const is = c.rp.issuer orelse return false;
+        return is.issue(is.ctx, c.ino, block, .demand_stream);
     }
 
     /// The non-serving warmer the prefetch/lane tasks run: a fill whose
     /// result is dropped (legal — a warmer serves no one).
     pub fn warm(self: *ReadPath, io: Io, ino: u64, block: u64, class: FillClass) void {
         const key = self.currentBinding(ino, block) orelse return;
-        if (self.envResident(@ptrCast(@constCast(&EnvCtx{ .rp = self, .ino = ino })), block)) return;
+        var env_ctx: EnvCtx = .{ .rp = self, .ino = ino };
+        if (envResident(@ptrCast(&env_ctx), block)) return;
         const blk = self.getCachedOrFetch(io, key, class) catch return;
         blk.release(self);
     }
+
+    /// The hold-serve ceremony DEFERRED from the warm ladder's probe (the
+    /// queue thread may not publish — a 4 MiB memcpy into the mmap tier can
+    /// fault): re-serve the hold entry on the lane and run the admission iff
+    /// the deposit is still ledger-visible.
+    pub fn holdCeremony(self: *ReadPath, key: BlockKey, class: FillClass) void {
+        const sv = self.hold.serve(key, 0) orelse return;
+        defer self.hold.unpin(sv);
+        if (!sv.ledger_visible) return;
+        self.holdServeAdmission(key, sv.slot, sv.len, class, clock.monotonicNs());
+    }
+};
+
+/// The speculative-fill issuer the mount installs: spawn `warm(ino, block,
+/// class)` on a handler lane; false = refused (the pipeline rolls back).
+pub const Issuer = struct {
+    ctx: ?*anyopaque,
+    issue: *const fn (ctx: ?*anyopaque, ino: u64, block: u64, class: FillClass) bool,
 };
 
 // ---------------------------------------------------------------------------

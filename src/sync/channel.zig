@@ -6,8 +6,10 @@
 //! exist by construction: a receiver re-checks state and registers its
 //! waiter under the SAME lock a sender mutates state under, and the sender
 //! delivers the wake token under that lock. Every unbounded park is ticked
-//! (`tick.zig`, `channel_ticked_reregisters`). The mpsc send side's capacity
-//! waiters are FIFO-woken and re-contend (bounded barging).
+//! (`tick.zig`; a tick whose re-check finds the condition satisfied with no
+//! token delivered counts `channel_ticked_reregisters` — a rescued lost
+//! wake). The mpsc send side's capacity waiters are FIFO-woken and
+//! re-contend (bounded barging).
 //!
 //! Zig has no drop glue, so the reference's handle lifetimes are explicit
 //! calls: `closeSender` / `closeReceiver` (oneshot, watch) and counted
@@ -25,6 +27,13 @@ pub const Waiter = struct {
     prev: ?*Waiter = null,
     linked: bool = false,
     state: std.atomic.Value(u32) = .init(0),
+    /// The last park ended on the tick (the re-check that finds the
+    /// condition satisfied then counts a rescued lost wake).
+    ticked: bool = false,
+
+    fn rescued(w: *const Waiter) void {
+        tick.noteChannelRescue(w.ticked, &w.state);
+    }
 };
 
 /// An intrusive FIFO shared by the three channels.
@@ -63,11 +72,8 @@ const Queue = struct {
 /// Park `w` (its word already reset to 0 under the lock) for one tick; the
 /// caller unregisters under the lock on `error.Canceled`.
 fn parkOnce(io: Io, w: *Waiter, comptime cancelable: bool) Io.Cancelable!void {
-    if (cancelable) {
-        _ = try tick.park(io, &w.state, &tick.channel_ticked_reregisters);
-    } else {
-        _ = tick.parkUncancelable(io, &w.state, &tick.channel_ticked_reregisters);
-    }
+    const outcome = if (cancelable) try tick.park(io, &w.state, null) else tick.parkUncancelable(io, &w.state, null);
+    w.ticked = outcome == .ticked;
 }
 
 // ===========================================================================
@@ -158,11 +164,13 @@ pub fn Oneshot(comptime T: type) type {
                     self.interior.lockUncancelable(io);
                     defer self.interior.unlock(io);
                     if (self.value) |v| {
+                        w.rescued();
                         self.value = null;
                         if (w.linked) self.rx.unlink(&w);
                         return v;
                     }
                     if (self.closed) {
+                        w.rescued();
                         if (w.linked) self.rx.unlink(&w);
                         return error.SenderGone;
                     }
@@ -283,12 +291,14 @@ pub fn Mpsc(comptime T: type, comptime capacity: usize) type {
                     self.interior.lockUncancelable(io);
                     defer self.interior.unlock(io);
                     if (self.closed or !self.rx_alive) {
+                        w.rescued();
                         if (w.linked) self.tx.unlink(&w);
                         return error.Closed;
                     }
                     // Fresh: room AND nobody queued (FIFO courtesy); queued:
                     // room (the re-contend barges).
                     if (self.len < capacity and (w.linked or self.tx.head == null)) {
+                        w.rescued();
                         if (w.linked) self.tx.unlink(&w);
                         self.pushLocked(value);
                         self.rx.wakeFront(io);
@@ -340,12 +350,14 @@ pub fn Mpsc(comptime T: type, comptime capacity: usize) type {
                     self.interior.lockUncancelable(io);
                     defer self.interior.unlock(io);
                     if (self.len > 0) {
+                        w.rescued();
                         if (w.linked) self.rx.unlink(&w);
                         const v = self.popLocked();
                         self.tx.wakeFront(io);
                         return v;
                     }
                     if (self.sendersGoneLocked() or self.closed) {
+                        w.rescued();
                         if (w.linked) self.rx.unlink(&w);
                         return null;
                     }
@@ -513,11 +525,13 @@ pub fn Watch(comptime T: type) type {
                         s.interior.lockUncancelable(io);
                         defer s.interior.unlock(io);
                         if (s.version > r.seen) {
+                            w.rescued();
                             r.seen = s.version;
                             if (w.linked) s.waiters.unlink(&w);
                             return;
                         }
                         if (!s.tx_alive) {
+                            w.rescued();
                             if (w.linked) s.waiters.unlink(&w);
                             return error.SenderGone;
                         }

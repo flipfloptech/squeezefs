@@ -722,6 +722,19 @@ section (`supersede_shadow_bindings :16555`, `rewrite_shadow_superseded`) — th
 2026-08-04 C2Lost/C2Leaked/C3 resurrection fix. Deferred-free law (`:382-385`): a
 parked A key is freed only after a durable save no longer references it.
 
+The save's VISIBILITY (settled 2026-10-07 against the reference, 0002 rows 178–179):
+in the reference the close's `remove` of the epoch and its save both run inside the
+ino's meta-lock hold (`:16743-16749`), and the W1/overlay predicates and every base
+read serialize behind that same lock, so the epoch's bindings never go out of sight
+while a save is unlanded and the base an overwrite is seeded from IS the shadow (the
+cache's dirty layout). The port holds no ino-wide lock across the save, so it keeps
+the law explicitly: the saving epoch stays visible (`Epochs.closing`) until its save
+landed or dropped; a record landing meanwhile opens the next epoch over the closing
+shadow; closes of one ino serialize in epoch order; `Epochs.baseBinding` (the newest
+shadow else the map) is the base at every use. Taking the epoch out of sight before
+the merge, or basing on the durable map under a shadow, loses an acked overwrite
+(`write_epoch_model.CloseVisibilityModel`).
+
 ### 5.5 Transformed volumes (`crypto_compress.rs`)
 
 Scratch pool `worst_case_scratch_len(bs).next_multiple_of(4096)` ≈ `block + 128 KiB`

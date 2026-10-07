@@ -18,7 +18,9 @@
 //!   meta-slot-migration wedge, ~50 % of a preflight suite parked).
 //!   `notify_model.zig` proves both the late epoch read and the
 //!   recheck-before-enable idiom fail.
-//! * Parks are ticked (`tick.zig`, `channel_ticked_reregisters`).
+//! * Parks are ticked (`tick.zig`); a tick whose re-check finds the waiter
+//!   satisfied with no token delivered counts `channel_ticked_reregisters`
+//!   (a rescued lost wake); an idle waiter's ticks count nothing.
 //!
 //! The waiter node is the `Notified` value itself and lives on the caller's
 //! frame: it must not move between `enable` and `wait`/`cancel`. One
@@ -104,15 +106,18 @@ pub const Notify = struct {
         /// never reported as a timeout.
         pub fn waitUntilUncancelable(n: *Notified, io: Io, deadline_ns: u64) WaitOutcome {
             const s = n.notify;
+            var ticked = false;
             while (true) {
                 {
                     s.interior.lockUncancelable(io);
                     defer s.interior.unlock(io);
                     if (n.registered and s.epoch > n.registered_epoch) {
+                        tick.noteChannelRescue(ticked, &n.state);
                         if (n.linked) s.unlinkLocked(n);
                         return .notified;
                     }
                     if (s.permit) {
+                        tick.noteChannelRescue(ticked, &n.state);
                         s.permit = false;
                         if (n.linked) s.unlinkLocked(n);
                         return .notified;
@@ -124,24 +129,27 @@ pub const Notify = struct {
                     if (!n.linked) s.linkLocked(n);
                     n.state.store(0, .monotonic);
                 }
-                _ = tick.parkUntilUncancelable(io, &n.state, deadline_ns, &tick.channel_ticked_reregisters);
+                ticked = tick.parkUntilUncancelable(io, &n.state, deadline_ns, null) == .ticked;
             }
         }
 
         fn waitInner(n: *Notified, io: Io, comptime cancelable: bool) Io.Cancelable!void {
             const s = n.notify;
+            var ticked = false;
             while (true) {
                 {
                     s.interior.lockUncancelable(io);
                     defer s.interior.unlock(io);
                     // A notifyWaiters since registration completes this waiter.
                     if (n.registered and s.epoch > n.registered_epoch) {
+                        tick.noteChannelRescue(ticked, &n.state);
                         if (n.linked) s.unlinkLocked(n);
                         return;
                     }
                     // A stored permit serves the front-most claimant — or a
                     // fresh arrival when nobody is registered (send-then-wait).
                     if (s.permit) {
+                        tick.noteChannelRescue(ticked, &n.state);
                         s.permit = false;
                         if (n.linked) s.unlinkLocked(n);
                         return;
@@ -153,14 +161,14 @@ pub const Notify = struct {
                     n.state.store(0, .monotonic);
                 }
                 if (cancelable) {
-                    _ = tick.park(io, &n.state, &tick.channel_ticked_reregisters) catch |err| switch (err) {
+                    ticked = (tick.park(io, &n.state, null) catch |err| switch (err) {
                         error.Canceled => {
                             n.cancel(io);
                             return err;
                         },
-                    };
+                    }) == .ticked;
                 } else {
-                    _ = tick.parkUncancelable(io, &n.state, &tick.channel_ticked_reregisters);
+                    ticked = tick.parkUncancelable(io, &n.state, null) == .ticked;
                 }
             }
         }
@@ -192,6 +200,17 @@ pub const Notify = struct {
             self.unlinkLocked(w);
             tick.wake(io, &w.state);
         }
+    }
+
+    /// Test seam: a `notifyWaiters` whose wake tokens are DROPPED — the
+    /// lost-wake shape the tick absorbs and `channel_ticked_reregisters`
+    /// counts (the waiters stay parked until their tick's re-check).
+    pub fn notifyWaitersDroppingWakeForTest(self: *Notify, io: Io) void {
+        assert(@import("builtin").is_test);
+        self.interior.lockUncancelable(io);
+        defer self.interior.unlock(io);
+        self.epoch += 1;
+        while (self.head) |w| self.unlinkLocked(w);
     }
 
     /// Registered waiters (the deterministic park observable).
@@ -419,4 +438,33 @@ fn waitUntilBody(io: Io) !void {
 
 test "waitUntil: a passed deadline unregisters and keeps a later permit; a stored permit or epoch wins over the deadline; a cross-thread notify ends a far-deadline wait" {
     try sync_testing.underBoth(waitUntilBody);
+}
+
+test "the tick accounting: an idle waiter parked past a tick and then notified counts NOTHING (the reclaimer's idle shape — the phantom 'lost wakes'); a notify whose wake was lost is rescued by the tick and counts exactly one channel_ticked_reregisters" {
+    const io = testing.io;
+    var n: Notify = .init;
+    const Parked = struct {
+        fn run(io_: Io, nt: *Notify) void {
+            var w = nt.notified();
+            w.waitUncancelable(io_);
+        }
+    };
+    const before = tick.channel_ticked_reregisters.load();
+    // 1. Idle past one tick, then a real notify: no rescue.
+    const t1 = try std.Thread.spawn(.{}, Parked.run, .{ io, &n });
+    while (n.waiters(io) == 0) try std.Thread.yield();
+    io.sleep(.fromNanoseconds(@intCast(tick.tick_ns + tick.tick_ns / 4)), .awake) catch unreachable;
+    n.notifyWaiters(io);
+    t1.join();
+    try testing.expectEqual(before, tick.channel_ticked_reregisters.load());
+    // 2. The epoch bumps but the token never lands: the waiter's tick
+    //    finds it satisfied with no token — one rescue, counted.
+    const t2 = try std.Thread.spawn(.{}, Parked.run, .{ io, &n });
+    while (n.waiters(io) == 0) try std.Thread.yield();
+    const t0 = clock.monotonicNs();
+    n.notifyWaitersDroppingWakeForTest(io);
+    t2.join();
+    try testing.expect(clock.monotonicNs() - t0 >= tick.tick_ns - tick.tick_ns / 10);
+    try testing.expectEqual(before + 1, tick.channel_ticked_reregisters.load());
+    try testing.expectEqual(@as(u32, 0), n.waiters(io));
 }

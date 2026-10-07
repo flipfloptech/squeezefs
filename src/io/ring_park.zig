@@ -325,6 +325,14 @@ pub fn Parked(comptime F: type) type {
             return .event;
         }
 
+        /// CQEs landed and not yet reaped (a wake that DID arrive after a
+        /// park's timeout sits here: the owner's tick-rescue accounting
+        /// tells a lost write from the ordinary timeout-then-wake race).
+        pub fn cqReady(self: *Self) u32 {
+            if (self.dead) return 0;
+            return F.cqReady(&self.ring);
+        }
+
         /// Fold one reaped CQE: true ⇒ it was the wake READ (consumed here; the
         /// owner skips it), false ⇒ it is the owner's.
         pub fn consumeWake(self: *Self, cqe: Cqe) bool {
@@ -399,6 +407,10 @@ const StdFace = struct {
 
     pub fn copyCqes(ring: *IoUring, cqes: []Cqe, wait_nr: u32) !u32 {
         return ring.copy_cqes(cqes, wait_nr);
+    }
+
+    pub fn cqReady(ring: *IoUring) u32 {
+        return ring.cq_ready();
     }
 
     pub fn registerFiles(ring: *IoUring, fds: []const linux.fd_t) bool {

@@ -130,6 +130,7 @@ reads its last intact image.
 | `incarnation_model.FillModel` ×6 laws (2 reuse cycles) | 106 | both fence weakenings per law; a load/store acquire resurrects a freed block; a load/store release releases twice |
 | `staging.GenerationAbaModel` | 4 | recycled generations: a stale release frees the re-staged sole copy |
 | `pack.PinModel` / `pack.SealModel` | 9 / 4 | the nonzero check removed: the pin arithmetic; a load-then-store seal releases the pin twice |
+| `write_epoch_model.CloseVisibilityModel` (the save vs a writer on its block; the follow-up commit) | 22 | `unbind_before_save` (the epoch out of sight before its merge): the writer patches/bases on the A key the save displaces; `base_from_map` (the base from the durable map under a shadow): the park's complement misses the bytes only B held |
 
 ## Gate totals
 
@@ -138,6 +139,18 @@ reads its last intact image.
   `/build/tmp` carries no `smoke-*`/`mnt-*`, no `squeezefs` process lives.
 - macOS (`zig build gate`): unit **1 129 pass, 15 skip** (Linux-only modules and every `smoke:`
   test), rails 3/3, fmt clean.
+
+### The follow-up commit (the lost overwrite + the phantom stall)
+
+- Linux venue (`timeout 3000 scripts/venue zig build gate`): unit **1 356 pass, 9 skip**, rails 3/3,
+  smoke **24 pass, 1 skip** (the looped stage test skips without its knob), fmt clean; both
+  data-plane passes report `ticked parks lock 0 / channel 0`, no daemon alert.
+- The looped acceptance (`SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS=24 … smoke -Dtest-filter=LOOPED`,
+  one mount): **24/24 overwrite passes image-exact** (380–530 ms each), drift 0, untracked frees
+  0, channel ticks 0, watchdog overdue 0; **24/24 storm passes** (1.3–2.1 s, 274–604 MB/s
+  aggregate), every ledger closed, every op class's slowest bucket ≤ 1 s,
+  `rewrite_shadow_close_waits = 179`.
+- macOS (`zig build gate`): unit **1 138 pass, 15 skip**, rails 3/3, fmt clean.
 
 ## Deviations (this commit) and owed items
 
@@ -157,28 +170,61 @@ reads its last intact image.
 - **The NVMe tier publish** is a memcpy into the tier (Q10's `WRITE_FIXED` from the fill pool owed).
 - **The fd-source probe serve** never engaged in the smoke's passes (above); a buffered re-read
   storm with the hot tier primed is the row to add.
-- **OPEN DEFECT — a lost 4 KiB overwrite on the staging set (1 run in ~12)**: the overwrite stage's
-  `cmp` against the mirror differed once (byte 6 995 829 of `big`, block 1) with two tripwires in the
-  same run: `rewrite_shadow_displaced_drift` ("the save displaced a binding the epoch never parked")
-  and `block_untracked_free_refusals` ("begin_free of block 2: no RAM refcount" — a double release
-  upstream, nothing freed). The signature is a rewrite-epoch close whose merge displaced a binding
-  another arm had published for the same block meanwhile, so the epoch's shadow (built before that
-  arm's bytes) won and freed the other arm's block twice. Only the staging set (RELEASE's `flushIno`
-  feeding the epoch per `dd` close, interleaved with W1 patches and extent parks on `big`) has shown
-  it; the no-cache set never has. The smoke's overwrite stage is the repro; the two tripwires are
-  already must-stay-0 through `invariant_tripwires`. Not root-caused in this commit — the next wave's
-  first red test. Related latent bound: `write_epoch.closeEpoch` publishes at most
-  `MergeOutcome.max_displaced` (64) shadowed blocks per save and silently drops the rest (`break`);
-  an epoch over more blocks needs a chunked save or a refusal.
-- **A 5 s stall under the staging storm**, seen in most cache-path runs: five or six ops (WRITEs at
-  `meta_backend_start`, a RELEASE at `handler_entry`, an fsync at `write_admitted`, READs at
-  `read_routed`) parked 5.3 s with `channel_ticked_reregisters = 3` and every phase histogram
-  bounded (conveyor queue wait ≤ 8 ms, pass ≤ 8 ms, window ≤ 256 ms, the journal's device barrier
-  ≤ 128 ms, device service ≤ 64 ms, the longest fiber poll ≤ 512 ms, staging `msync`/`fallocate`
-  ≤ 2 ms, write-pipeline detach lag ≤ 2 ms; journal full stalls 0). The wait is on a channel-class
-  primitive outside every measured leg; the `stats meta:` family (conveyor + phases + barrier +
-  journal lane), the ticked-park counters in `stats daemon:` and the smoke's slowest-bucket lines
-  were added to corner it; not yet attributed.
+- **CLOSED (2026-10-07, the follow-up commit) — the lost 4 KiB overwrite on the staging set** (was: 1
+  run in ~12 of the overwrite stage, byte 6 995 829 of `big` in block 1, with `rewrite_shadow_
+  displaced_drift` and `block_untracked_free_refusals` in the same run). ROOT CAUSE, two faces of
+  one flaw — the base of an overwrite was read from the DURABLE map, not the write-side authority:
+  (1) `admitPiece` D captured `live_binding = map.lookup` into the entry's `old_binding` while the
+  rewrite epoch already shadowed the block with B (fed by the previous `dd`'s RELEASE flush, not yet
+  saved — RELEASE takes no inode op guard, so the next `dd`'s WRITE runs concurrently); the park's
+  complement was later seeded from A (the bytes only B held — the previous overwrite — were lost),
+  its upload fed a fresh epoch parking A (already freed by the first save), and that epoch's save
+  displaced B unparked (the drift) and freed A twice (the untracked refusal). (2) `Epochs.close`
+  took the epoch OUT of the table before its merge landed, so during the save `bindsBlock` read
+  false: W1 patched the A key the save was about to displace (the patch vanished under the swap)
+  and the overlay captured A as its old binding (dead at its settle ⇒ superseded ⇒ the acked bytes
+  dropped). FIX (`write_epoch.zig` module doc — the save's visibility law; 0002 rows 178–179): the
+  saving epoch stays visible (`Epochs.closing`) until its save landed or dropped; a record landing
+  during the save opens the next epoch over the CLOSING shadow (its displaced key is B, parked as
+  the map's — a transient save folds it back as the fresh epoch's own orphan mint); closes of one
+  ino serialize in epoch order (`close_settled`, `rewrite_shadow_close_waits`); `Epochs.baseBinding`
+  (the newest shadow, open or saving, else the map) is THE base at every use — the checkout (D),
+  both seed reads, the read seam's partial gaps — and the feed hands `record` the LIVE map key
+  (`record` prefers its shadows). The arm gate is written into the predicate list (`write_admit.zig`
+  module doc). Also closed on the way: `record` caps an epoch at `MergeOutcome.max_displaced`
+  blocks (the 65th answers `.not_shadowed` — the per-block durable publish — instead of being
+  dropped from the save); the unused `CloseMode.try_`/`.busy` arm is deleted. RED FIRST: two tests
+  in `write_admit.zig` reproduce both faces deterministically over the RAM seams (the dd-per-
+  overwrite shape; a W1 + overlay write inside the save window through `RamMap.before_merge`) —
+  both fail with either mechanism weakened; `write_epoch.zig` pins the serialized closes (a second
+  close parks on the running save; the saves land B then C; A and B freed once each) and the
+  transient fold; `write_epoch_model.CloseVisibilityModel` holds and BOTH weakenings fail
+  (`unbind_before_save`: the pre-fix table removal; `base_from_map`: the pre-fix `old_binding`).
+  ACCEPTANCE: the looped single-stage smoke (`SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS=24`): **24/24
+  overwrite passes image-exact** (distinct source pages per pass), drift 0, untracked frees 0, and
+  24/24 storm passes with every ledger closed and `rewrite_shadow_close_waits = 179` (the
+  serialization engaging).
+- **CLOSED — the "5 s stall under the staging storm" was a phantom**: two observability defects,
+  no parked op. Attributed by a stack dump at every channel tick in the venue (46 ticks over two
+  gate runs, ALL from `reclaim.zig parkWake` — the reclaimer worker's idle park on its wake notify,
+  2 s apart, with no work queued) and by the shape of every watchdog report (always exactly
+  `5326–5331 ms`, never a second observation at ~10 s): (1) the watchdog judged an op's age as
+  `now − coarse stamp`, and the stamp is the PREVIOUS tick's time for any op claimed since, so
+  every op in flight when a tick landed read as one tick (+ the tick's ~326 ms jitter) old and the
+  floor is one tick — eight healthy 300 ms storm writes "parked 5.3 s at `meta_backend_start`".
+  FIX: the age is judged by its LOWER bound, `now − (the first refresh after the claim)`
+  (`Registry.ageLowerBound`, `REFRESH_HISTORY` = 16 stamps); an op is named within two ticks of
+  truly crossing; the tie test replays the eight writes under a 326 ms-late tick. (2)
+  `channel_ticked_reregisters` counted every tick elapsed, so a long-lived worker idling on an
+  unbounded notify wait grew it on a healthy daemon. FIX (`tick.zig` module doc; 0002 row 180): a
+  channel-class park counts a RESCUE only — a tick whose re-check under the primitive's lock finds
+  the condition satisfied with no wake token delivered (notify, oneshot/mpsc/watch, single-flight,
+  semaphore, the read fill cohort); the lock counters keep their contract. Both are must-stay-0 in
+  the smoke now (`lock_ticked_reregisters`, `channel_ticked_reregisters`, `fuse_op_watchdog_
+  overdue`), the per-class `fuse_op_latency_ns` histograms are in the dump (`stats ops:`), and the
+  looped smoke bounds every op class's slowest bucket at `<=1s` on all 48 passes (the real tail of
+  the storm's writes is the conveyor window, ≤ 256 ms). The notify test pins both halves: an idle
+  waiter past a tick counts nothing; a dropped wake is rescued and counts exactly one.
 - **Per-ino inline layout record** is the map authority (read latch-free through the node cache,
   one decode per probe); a RAM layout cache is owed with the kvmap crossing.
 - `status`'s reference census walks the ledger (one page per 512 refs); fsck C8 offline is rung 8.

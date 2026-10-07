@@ -44,10 +44,16 @@
 //! its own class in the same window is waiting on something, not working —
 //! a slow substrate raises every class's tail together and the threshold
 //! follows it instead of flooding the log, while a wedge (whose victims
-//! never complete and so never move the histogram) is named within one
-//! tick of crossing. WHY the 5 s floor: the start stamp is the coarse
-//! clock, refreshed once per tick, so an age is overstated by up to one
-//! tick — below one tick the error would exceed the threshold itself.
+//! never complete and so never move the histogram) is named within two
+//! ticks of crossing. WHY the 5 s floor: the start stamp is the coarse
+//! clock, refreshed once per tick, so a claim's time is known only to
+//! within one tick — below one tick the error would exceed the threshold
+//! itself. WHY the age is a LOWER bound (`REFRESH_HISTORY`): judged as
+//! `now − stamp`, every op in flight at a tick that had been claimed since
+//! the previous one read as exactly one tick (+ the tick's jitter) old and
+//! the floor is one tick, so a 300 ms-old write was reported 5.3 s overdue
+//! (the 2026-10-07 phantom stall); the op is judged by the least time it
+//! can have been in flight — `now − (the refresh after its claim)`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -68,6 +74,15 @@ const timer_heap = @import("../../exec/timer_heap.zig");
 pub const TICK_NS: u64 = 5 * std.time.ns_per_s;
 /// The threshold floor = one tick (module doc).
 pub const THRESHOLD_FLOOR_NS: u64 = TICK_NS;
+/// Coarse refresh stamps kept so an op's age can be judged by its LOWER
+/// bound (`Registry.ageLowerBound`): an op claimed under stamp S_j was
+/// claimed before the next refresh S_{j+1}, so it has been in flight at
+/// least `now − S_{j+1}`. Judging `now − S_j` instead reported EVERY op in
+/// flight at a tick that had started since the previous one as "one tick
+/// (+ jitter) overdue" — the 2026-10-07 phantom 5.3 s stall of 5–8 healthy
+/// ops. 16 stamps = 80 s of history; an older op's bound is `now − oldest`
+/// (conservative: never overstated).
+pub const REFRESH_HISTORY: usize = 16;
 /// The tail factor over the class's p99 (module doc).
 pub const TAIL_FACTOR: u64 = 4;
 /// Slots per shard: 2 × the transport's desired queue depth — headroom for
@@ -172,13 +187,18 @@ pub const Registry = struct {
     /// on the per-op path — the whole point of retiring `timeout()`'s
     /// timer-wheel + vdso tax, 2.75 % of daemon cycles).
     coarse_now_ns: std.atomic.Value(u64),
+    /// The refresh stamps, a ring (`REFRESH_HISTORY`); the watchdog's own.
+    refresh_hist: [REFRESH_HISTORY]u64 = @splat(0),
+    refreshes: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, shards: u32) std.mem.Allocator.Error!Registry {
         assert(shards > 0);
         const slots = try gpa.alloc(OpSlot, @as(usize, shards) * SLOTS_PER_SHARD);
         @memset(slots, .{});
         fuse_op_registry_slots.set(slots.len);
-        return .{ .gpa = gpa, .shards = shards, .slots = slots, .coarse_now_ns = .init(clock.monotonicNs()) };
+        var self: Registry = .{ .gpa = gpa, .shards = shards, .slots = slots, .coarse_now_ns = .init(0) };
+        self.refreshCoarse(clock.monotonicNs());
+        return self;
     }
 
     pub fn deinit(self: *Registry) void {
@@ -228,7 +248,24 @@ pub const Registry = struct {
     }
 
     pub fn refreshCoarse(self: *Registry, now_ns: u64) void {
+        self.refresh_hist[self.refreshes % REFRESH_HISTORY] = now_ns;
+        self.refreshes += 1;
         self.coarse_now_ns.store(now_ns, .monotonic);
+    }
+
+    /// The LEAST time an op claimed under the coarse stamp `start_ns` has
+    /// been in flight at `now_ns`: `now − (the first refresh after start)`
+    /// (`REFRESH_HISTORY`); 0 for an op claimed under the current stamp.
+    pub fn ageLowerBound(self: *const Registry, now_ns: u64, start_ns: u64) u64 {
+        const n = @min(self.refreshes, REFRESH_HISTORY);
+        // The smallest kept stamp after the claim's — for a claim older than
+        // the history, the oldest kept (at or after the true one: never an
+        // overstated age).
+        var next: ?u64 = null;
+        for (self.refresh_hist[0..n]) |s| {
+            if (s > start_ns and (next == null or s < next.?)) next = s;
+        }
+        return now_ns -| (next orelse return 0);
     }
 
     pub fn inFlight(self: *const Registry) u32 {
@@ -251,12 +288,14 @@ pub const Registry = struct {
             if (s.state.load(.acquire) == 0) continue;
             report.in_flight += 1;
             const op = abi.Opcode.fromInt(s.opcode);
-            const age = now_ns -| s.start_ns;
+            // The age is judged by its LOWER bound (`REFRESH_HISTORY`): an
+            // op claimed since the previous tick is never overdue yet.
+            const age = self.ageLowerBound(now_ns, s.start_ns);
             const thr = thresholds[@backingInt(op_trace.OpClass.of(op))];
             if (age < thr) continue;
             report.overdue += 1;
             fuse_op_watchdog_overdue.inc();
-            log.err("FUSE op watchdog: {s} (ino {d}, unique {d}) in flight for {d} ms (> {d} ms), parked past station [{s}] — op is NOT cancelled (D1.b: no ETIMEDOUT synthesis; a dropped committer is the ring-wedge vector)", .{ op.name(), s.ino, s.unique, age / std.time.ns_per_ms, thr / std.time.ns_per_ms, op_trace.Stage.nameOf(s.station.load(.monotonic)) });
+            log.err("FUSE op watchdog: {s} (ino {d}, unique {d}) in flight for at least {d} ms (> {d} ms), parked past station [{s}] — op is NOT cancelled (D1.b: no ETIMEDOUT synthesis; a dropped committer is the ring-wedge vector)", .{ op.name(), s.ino, s.unique, age / std.time.ns_per_ms, thr / std.time.ns_per_ms, op_trace.Stage.nameOf(s.station.load(.monotonic)) });
         }
         fuse_ops_inflight.set(report.in_flight);
         if (report.overdue > 0) logWedgeCensus(report);
@@ -440,21 +479,62 @@ test "watchdog tick: an op past its class threshold is reported with op/ino/age/
     try testing.expectEqual(@as(u64, 4), wd.ticks.load(.monotonic));
 }
 
-test "the watchdog never cancels: a slot that stays claimed across many ticks is reported every time and its state word is never touched" {
+test "the watchdog never cancels: a slot that stays claimed across many ticks is reported every time once its age's lower bound crosses, and its state word is never touched" {
     var reg = try Registry.init(testing.allocator, 1);
     defer reg.deinit();
     var wd = Watchdog.init(&reg);
     const t0: u64 = 50 * std.time.ns_per_s;
     reg.refreshCoarse(t0);
     const s = reg.claim(.fsync, 5, 55).?;
-    var i: u64 = 0;
-    while (i < 5) : (i += 1) {
+    // The first tick after the claim knows only that the op is younger
+    // than one tick: nothing reported.
+    const r0 = wd.tickOnce(t0 + 6 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u32, 0), r0.overdue);
+    var i: u64 = 1;
+    while (i < 6) : (i += 1) {
         log.testing.expectErrorLogs(2);
         _ = wd.tickOnce(t0 + (6 + 5 * i) * std.time.ns_per_s);
         try log.testing.expectAllFired();
         try testing.expectEqual(@as(u32, 1), s.state.load(.acquire));
     }
     reg.release(s);
+}
+
+test "the age lower bound: an op claimed since the previous tick is never overdue at this tick however the tick jittered (the phantom 5.3 s stall); it is reported at the next one with ≥ one tick; a claim older than the history is bounded by the oldest stamp, never overstated" {
+    var reg = try Registry.init(testing.allocator, 1);
+    defer reg.deinit();
+    var wd = Watchdog.init(&reg);
+    const t0: u64 = 100 * std.time.ns_per_s;
+    reg.refreshCoarse(t0);
+    // Eight storm writes claimed 300 ms before the next tick, which lands
+    // 326 ms late: judged `now − stamp` they would all read 5326 ms old.
+    var held: [8]*OpSlot = undefined;
+    for (&held, 0..) |*h, i| h.* = reg.claim(.write, @intCast(i), @intCast(i)).?;
+    const t1 = t0 + TICK_NS + 326 * std.time.ns_per_ms;
+    const r1 = wd.tickOnce(t1);
+    try testing.expectEqual(@as(u32, 8), r1.in_flight);
+    try testing.expectEqual(@as(u32, 0), r1.overdue);
+    try testing.expectEqual(@as(u64, 0), reg.ageLowerBound(t1, t0));
+    // Still in flight one tick later: at least 5 s old now — reported.
+    const t2 = t1 + TICK_NS;
+    try testing.expectEqual(TICK_NS, reg.ageLowerBound(t2, t0));
+    log.testing.expectErrorLogs(9);
+    const r2 = wd.tickOnce(t2);
+    try log.testing.expectAllFired();
+    try testing.expectEqual(@as(u32, 8), r2.overdue);
+    for (held) |h| reg.release(h);
+    // A claim under the current stamp has a lower bound of 0.
+    try testing.expectEqual(@as(u64, 0), reg.ageLowerBound(t2 + 1, t2));
+    // Older than the whole history: bounded by the oldest kept stamp.
+    var t = t2;
+    var k: usize = 0;
+    while (k < REFRESH_HISTORY + 2) : (k += 1) {
+        t += TICK_NS;
+        reg.refreshCoarse(t);
+    }
+    const oldest = t - (REFRESH_HISTORY - 1) * TICK_NS;
+    try testing.expectEqual(t - oldest, reg.ageLowerBound(t, t0));
+    try testing.expect(reg.ageLowerBound(t, t0) < t - t0);
 }
 
 test "the watchdog loop runs on an Io and stops at the next tick" {

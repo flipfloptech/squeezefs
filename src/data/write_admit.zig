@@ -9,6 +9,17 @@
 //! merge → K write-through → L park. Every exit drops the guard; exactly one
 //! arm acks every piece.
 //!
+//! The rewrite-epoch arm gate (2026-10-07): a block a rewrite epoch BINDS —
+//! open, or with its ONE save in flight (`Epochs.bindsBlock`) — is neither
+//! W1-eligible (A would patch the A key the save is about to displace; the
+//! patch vanishes under the swap) nor overlay-eligible (B would capture that
+//! A key as its old binding and find it dead at the settle); it takes the
+//! accumulation arms, whose base (D) is the write-side authority's key —
+//! the epoch's newest shadow, else the map (`Epochs.baseBinding`) — so the
+//! park's complement is seeded from the bytes B holds and its upload FEEDS
+//! the epoch, displacing exactly that key. A base snapshotted from the
+//! durable map under an open epoch lost the bytes only the shadow held.
+//!
 //! The write splitter makes pieces single-block: the kernel's writeback
 //! grid straddles 4 MiB boundaries once a chunk end leaves the 1 MiB grid,
 //! so PIECES are judged, never the whole write (§4.4ci). The ENOSPC
@@ -630,8 +641,9 @@ pub const WritePath = struct {
             if (self.overlay.anyOpenFast()) {
                 if (self.overlay.registry.get(.{ .ino = req.ino, .block = pc.block })) |rec| _ = self.overlay.settleWriteArm(io, rec, false);
             }
-            // D. Live existing-bytes re-derivation under the guard.
-            const live_binding = self.map.lookup(req.ino, pc.block);
+            // D. Live existing-bytes re-derivation under the guard, from the
+            //    write-side authority (module doc: the arm gate).
+            const live_binding = self.epochs.baseBinding(self.map, req.ino, pc.block);
             const b_start = @as(u64, pc.block) * bs;
             const live_size = if (self.map.view(req.ino)) |v| v.size else file.size;
             const has_existing = live_binding != null or @min(live_size, b_start + bs) > b_start;
@@ -682,7 +694,7 @@ pub const WritePath = struct {
             // J. The merge — THE one userspace copy.
             const verdict = self.table.recordWrite(e, pc.rel, data) catch |err| switch (err) {
                 error.NeedsSeed => blk3: {
-                    const old = e.old_binding orelse {
+                    const old = self.epochs.baseBinding(self.map, req.ino, pc.block) orelse {
                         e.seed = .fresh;
                         self.table.zeroComplete(e);
                         break :blk3 self.table.recordWrite(e, pc.rel, data) catch return error.WouldBlock;
@@ -765,7 +777,7 @@ pub const WritePath = struct {
         _ = self.overlay.drainForIno(io, &self.locks, ino, std.math.maxInt(u64), false, self.closeSeams());
         var blocks: [64]u32 = undefined;
         for (self.table.blocksOf(ino, &blocks)) |b| _ = accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, ino, b);
-        _ = self.epochs.close(io, ino, .park, self.closeSeams());
+        _ = self.epochs.close(io, ino, self.closeSeams());
     }
 };
 
@@ -1048,6 +1060,111 @@ test "fsync through the write path: a parked block, an open overlay and a shadow
     try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0xAA));
     try testing.expect(w.f.dev.flushes.items.len >= 1);
     try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
+}
+
+test "the lost overwrite (2026-10-07, the smoke's dd-per-overwrite shape): a write landing on a block the OPEN epoch shadows takes the accumulation arm with the epoch's B as its base, never the map's stale A; after the save, the next flush seeds from B and its save displaces exactly what it parked — every acked byte readable, drift 0, nothing freed twice" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    // A two-block striped file: block 1's size floor exceeds one block, so
+    // a feed over it never auto-closes the epoch (the smoke's `big`).
+    _ = try w.f.publishBlock(50, 0, 0xAA);
+    const a1 = try w.f.publishBlock(50, 1, 0xBB);
+    const file = World.striped(2 * wt.BS);
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
+    // dd #N: an unaligned 4 KiB overwrite of block 1 (W1-ineligible ⇒ W2 park).
+    var p: [PAGE]u8 = @splat(0x11);
+    const o1 = try w.wp.write(io, .{ .ino = 50, .offset = wt.BS + 3 * PAGE + 100, .payload = .{ .bytes = &p }, .class = .shared, .file = file });
+    try testing.expectEqual(@as(u32, 1), o1.count(.extent));
+    // RELEASE #N, first half: the parked block flushes and FEEDS the epoch
+    // (shadow B over block 1, A1 parked); the ONE save has not run yet.
+    try testing.expectEqual(accumulate.Disposition.published, accumulate.flushParkedBlock(&w.wp.table, w.wp.uploadDeps(), io, 50, 1));
+    try testing.expect(w.wp.epochs.bindsBlock(50, 1));
+    const b = w.wp.epochs.shadowOf(50, 1).?;
+    try testing.expect(w.f.map.seam().lookup(50, 1).?.eql(a1));
+    // dd #N+1's WRITE lands meanwhile: an aligned page of block 1. W1 and
+    // the overlay decline (the epoch binds the block); the park's base is B.
+    var q: [PAGE]u8 align(4096) = @splat(0x22);
+    const o2 = try w.wp.write(io, .{ .ino = 50, .offset = wt.BS + 8 * PAGE, .payload = .{ .bytes = &q }, .class = .shared, .file = file });
+    try testing.expectEqual(@as(u32, 0), o2.count(.patch));
+    try testing.expectEqual(@as(u32, 0), o2.count(.overlay));
+    try testing.expect(w.wp.table.get(50, 1).?.old_binding.?.eql(b));
+    // A read of the parked block's gaps composes over B, not A1.
+    var gap: [PAGE]u8 = undefined;
+    const served = w.wp.writeSideView().serve(io, .{ .ino = 50, .block = 1, .rel = 3 * PAGE, .out = &gap });
+    try testing.expect(served == .partial and served.partial.base.?.eql(b));
+    // RELEASE #N, second half: the save lands (map → B, A1 freed once).
+    try testing.expect(w.wp.epochs.close(io, 50, w.wp.closeSeams()) == .swapped);
+    try testing.expect(w.f.map.seam().lookup(50, 1).?.eql(b));
+    // RELEASE #N+1: the flush seeds from B, feeds, and the save displaces B.
+    w.wp.flushIno(io, 50);
+    const final = w.f.map.seam().lookup(50, 1).?;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(final.vol_tag, final.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[3 * PAGE + 100 .. 4 * PAGE + 100], 0x11)); // dd #N's bytes
+    try testing.expect(std.mem.allEqual(u8, got[8 * PAGE .. 9 * PAGE], 0x22)); // dd #N+1's bytes
+    try testing.expect(std.mem.allEqual(u8, got[0 .. 3 * PAGE], 0xBB));
+    try testing.expect(std.mem.allEqual(u8, got[9 * PAGE ..], 0xBB));
+    try testing.expectEqual(@as(usize, 2), w.f.frees.freed.items.len);
+    try testing.expect(w.f.frees.freed.items[0].eql(a1));
+    try testing.expect(w.f.frees.freed.items[1].eql(b));
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
+    try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());
+    try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks()); // the file's two blocks, nothing leaked
+}
+
+test "the save window: while an epoch's ONE save is in flight the block stays bound — a racing W1 patch declines (it would land in the key the save displaces), the overlay declines, the park bases on B; the save displaces only what it parked" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    _ = try w.f.publishBlock(51, 0, 0xAA);
+    const a1 = try w.f.publishBlock(51, 1, 0xBB);
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
+    // Shadow block 1 with a minted B: A1's image with page 3 rewritten.
+    var img: [wt.BS]u8 = @splat(0xBB);
+    @memset(img[3 * PAGE .. 4 * PAGE], 0x11);
+    const m = try w.f.alloc_a.allocateBlock();
+    const proof = try w.f.dev.seam().write(wt.VOL_A, m.offset, &img);
+    w.f.alloc_a.publishBlock(m.idx);
+    const b = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+    _ = try w.wp.epochs.record(51, 1, a1, b, proof, 2 * wt.BS, block_alloc.InflightAllocGuard.register(w.f.alloc_a, m.idx), true);
+    // The racing WRITE runs inside the save's window: an aligned page (the
+    // W1 shape) and a half-block aligned piece (the overlay shape).
+    const Racer = struct {
+        var wp: *WritePath = undefined;
+        var page_arms: Outcome = undefined;
+        var half_arms: Outcome = undefined;
+        var page: [PAGE]u8 align(4096) = @splat(0x22);
+        var half: [wt.BS / 2]u8 align(4096) = @splat(0x33);
+        fn hook(_: *anyopaque, _: *wt.RamMap) void {
+            page_arms = wp.write(testing.io, .{ .ino = 51, .offset = wt.BS + 8 * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = World.striped(2 * wt.BS) }) catch unreachable;
+            half_arms = wp.write(testing.io, .{ .ino = 51, .offset = wt.BS, .payload = .{ .bytes = &half }, .class = .shared, .file = World.striped(2 * wt.BS) }) catch unreachable;
+        }
+    };
+    Racer.wp = w.wp;
+    var dummy: u8 = 0;
+    w.f.map.before_merge = .{ .ctx = &dummy, .call = &Racer.hook };
+    try testing.expect(w.wp.epochs.close(io, 51, w.wp.closeSeams()) == .swapped);
+    try testing.expectEqual(@as(u32, 0), Racer.page_arms.count(.patch));
+    try testing.expectEqual(@as(u32, 0), Racer.half_arms.count(.overlay));
+    try testing.expect(w.f.map.seam().lookup(51, 1).?.eql(b));
+    try testing.expect(w.wp.table.get(51, 1).?.old_binding.?.eql(b));
+    w.wp.flushIno(io, 51);
+    const final = w.f.map.seam().lookup(51, 1).?;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(final.vol_tag, final.offset, &got);
+    try testing.expect(std.mem.allEqual(u8, got[0 .. wt.BS / 2], 0x33));
+    try testing.expect(std.mem.allEqual(u8, got[8 * PAGE .. 9 * PAGE], 0x22));
+    try testing.expect(std.mem.allEqual(u8, got[9 * PAGE ..], 0xBB));
+    try testing.expectEqual(@as(usize, 2), w.f.frees.freed.items.len);
+    try testing.expect(w.f.frees.freed.items[0].eql(a1));
+    try testing.expect(w.f.frees.freed.items[1].eql(b));
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
+    try testing.expectEqual(@as(u64, 2), w.f.alloc_a.usedBlocks() + w.f.alloc_b.usedBlocks());
 }
 
 test "writeStatsJson aggregates every family under its module key" {

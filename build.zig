@@ -132,13 +132,17 @@ pub fn build(b: *std.Build) void {
     //      test as `./squeezefs` in the cwd (the emitted-bin directory, so
     //      the smoke drives the binary of THIS build and the step depends
     //      on it); in the unit run above they find no binary and skip ----
+    // `-Dtest-filter` narrows the smoke too (one stage's test, looped).
     const smoke_tests = b.addTest(.{
         .name = "squeezefs-smoke",
         .root_module = squeezefs_mod,
-        .filters = &.{"smoke:"},
+        .filters = if (test_filters.len != 0) test_filters else &.{"smoke:"},
     });
     const run_smoke_tests = b.addRunArtifact(smoke_tests);
     run_smoke_tests.setCwd(exe.getEmittedBinDirectory());
+    // The smoke drives a real mount on the venue's kernel: its outcome is
+    // not a function of the build inputs, so every gate run re-runs it.
+    run_smoke_tests.has_side_effects = true;
     const smoke_step = b.step("smoke", "Run the smoke (format/mount/umount/status against a real mount)");
     smoke_step.dependOn(&run_smoke_tests.step);
 

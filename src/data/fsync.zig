@@ -308,7 +308,7 @@ pub fn fsync(ctx: Ctx, io: Io, ino: u64, prof: *Prof) Error!void {
     _ = ctx.touched.clearObserved(ino, observed);
     prof.mark(.data_barrier);
     // META PUBLISH: the rewrite epoch's ONE save.
-    switch (ctx.epochs.close(io, ino, .park, ctx.close_seams)) {
+    switch (ctx.epochs.close(io, ino, ctx.close_seams)) {
         .fence_dropped => return error.WriterGuardFenced,
         .transient => return error.InputOutput,
         else => {},
@@ -343,7 +343,7 @@ fn flushParked(ctx: Ctx, io: Io, ino: u64, retried: bool) Error!void {
     for (planBarriers(TouchedTable.ALL_BIT, ctx.vols, &vb)) |ord| {
         if (ctx.vols.byOrdinal(ord)) |v| ctx.device.flush(v.vol_tag) catch {};
     }
-    _ = ctx.epochs.close(io, ino, .park, ctx.close_seams);
+    _ = ctx.epochs.close(io, ino, ctx.close_seams);
     _ = ctx.epochs.closeAllForSpace(io, ctx.close_seams);
     return flushParked(ctx, io, ino, true);
 }

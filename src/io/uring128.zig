@@ -723,6 +723,10 @@ pub const ParkFace = struct {
         return ring.copyCqes(cqes, wait_nr);
     }
 
+    pub fn cqReady(ring: *Ring128) u32 {
+        return ring.cqReady();
+    }
+
     pub fn registerFiles(ring: *Ring128, fds: []const linux.fd_t) bool {
         ring.registerFiles(fds) catch return false;
         return true;

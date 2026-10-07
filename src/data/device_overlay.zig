@@ -1166,7 +1166,7 @@ pub const Overlay = struct {
             break :blk self.settleWriteArm(io, rec, barrier);
         };
         // The epoch-close venue law: never under the block guard.
-        if (hint) _ = self.deps.epochs.close(io, ino, .park, cs);
+        if (hint) _ = self.deps.epochs.close(io, ino, cs);
     }
 
     pub fn spawnDrain(self: *Overlay, io: Io, locks: *seams.BlockLocks, ino: u64, block: u32, cs: epoch_mod.Epochs.CloseSeams) void {
@@ -1542,7 +1542,7 @@ test "live_mapped_overwrite_rides_the_overlay_end_to_end: the install captures t
     try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
     try testing.expect(w.f.map.seam().lookup(42, 0).?.eql(a));
     // The close: ONE save, then the A key is freed.
-    try testing.expect(w.epochs.close(io, 42, .park, w.cs()) == .swapped);
+    try testing.expect(w.epochs.close(io, 42, w.cs()) == .swapped);
     try testing.expectEqual(@as(usize, 1), w.f.map.merges.items.len);
     try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
     try testing.expect(w.f.frees.freed.items[0].eql(a));
@@ -1579,7 +1579,7 @@ test "ineligible_shapes_decline_and_stay_byte_exact: sub-cap declines unless joi
     const sb0 = stats.overlay_ineligible_shadow_bound.load();
     try testing.expectEqual(StoreOutcome.declined, try w.ov.store(io, .{ .ino = 44, .block = 0, .rel = 0, .vehicle = .{ .bytes = &big }, .file = TestWorld.striped(wt.BS), .overwrite = true }));
     try testing.expectEqual(sb0 + 1, stats.overlay_ineligible_shadow_bound.load());
-    _ = w.epochs.close(io, 44, .park, w.cs());
+    _ = w.epochs.close(io, 44, w.cs());
     // The overwrite lever off.
     const w2 = try TestWorld.init(testing.allocator, .{ .overwrite = false });
     defer w2.deinit(testing.allocator);
@@ -1745,7 +1745,7 @@ test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable 
     try testing.expect(w.epochs.bindsBlock(70, 0));
     try testing.expect(w.f.alloc_a.inflightContains(dest_idx)); // the guard travelled record → epoch
     // OW-5: swap durable, frees not run — the save landed, A still allocated until the free runs (the census free-lists a tracked key the map no longer names).
-    const closed = w.epochs.close(io, 70, .park, w.cs());
+    const closed = w.epochs.close(io, 70, w.cs());
     try testing.expect(closed == .swapped);
     try testing.expect(!w.f.map.seam().lookup(70, 0).?.eql(a));
     try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
@@ -1758,7 +1758,7 @@ test "crash windows OW-1..OW-8 as RAM cases: an unpublished dest is reclaimable 
     try testing.expect(w.f.map.seam().lookup(71, 0).?.eql(a2));
     try testing.expectEqual(@as(?u64, null), w.f.alloc_a.fillIncarnation(rec2.dest_idx)); // unstable = unpublished
     w.ov.drainBlock(io, &w.locks, 71, 0, false, w.cs());
-    _ = w.epochs.close(io, 71, .park, w.cs());
+    _ = w.epochs.close(io, 71, w.cs());
 }
 
 test "ack_early_write_returns_before_store_cqe; fsync_awaits_acked_inflight_store; read_waits_for_acked_inflight_store (the future law); the payload is released exactly once" {

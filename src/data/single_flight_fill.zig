@@ -230,8 +230,9 @@ pub fn FlightTable(comptime max_flights: usize) type {
                 return .{ .primary = .{ .table = self, .idx = i } };
             };
             while (true) {
-                _ = tick.parkUncancelable(io, &w.word, &tick.channel_ticked_reregisters);
+                const ticked = tick.parkUncancelable(io, &w.word, null) == .ticked;
                 self.interior.lockUncancelable(io);
+                if (w.outcome != .pending) tick.noteChannelRescue(ticked, &w.word);
                 w.word.store(0, .monotonic);
                 const outcome = w.outcome;
                 self.interior.unlock(io);

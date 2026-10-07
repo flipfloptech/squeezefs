@@ -8,8 +8,9 @@
 //! not barge past queued waiters (FIFO courtesy); a QUEUED waiter's
 //! re-contend does (the dead-front tick rail). `tryAcquire`'s contract IS
 //! the barge (tokio parity: it takes free permits regardless of the queue).
-//! Parks are ticked (`tick.zig`, `channel_ticked_reregisters`); waiter
-//! nodes live on the acquirer's frame.
+//! Parks are ticked (`tick.zig`; a tick that finds the permits there with no
+//! token delivered counts `channel_ticked_reregisters`); waiter nodes live
+//! on the acquirer's frame.
 
 const std = @import("std");
 const Io = std.Io;
@@ -109,20 +110,17 @@ pub const Semaphore = struct {
             self.pushLocked(&w);
         }
         while (true) {
-            if (cancelable) {
-                _ = tick.park(io, &w.state, &tick.channel_ticked_reregisters) catch |err| switch (err) {
-                    error.Canceled => {
-                        self.unregister(io, &w);
-                        return err;
-                    },
-                };
-            } else {
-                _ = tick.parkUncancelable(io, &w.state, &tick.channel_ticked_reregisters);
-            }
+            const outcome = if (cancelable) (tick.park(io, &w.state, null) catch |err| switch (err) {
+                error.Canceled => {
+                    self.unregister(io, &w);
+                    return err;
+                },
+            }) else tick.parkUncancelable(io, &w.state, null);
             self.interior.lockUncancelable(io);
             defer self.interior.unlock(io);
-            w.state.store(0, .monotonic);
             // Queued: re-contend regardless of position (the dead-front rail).
+            if (self.permits >= n) tick.noteChannelRescue(outcome == .ticked, &w.state);
+            w.state.store(0, .monotonic);
             if (self.permits >= n) {
                 self.permits -= n;
                 self.unlinkLocked(&w);

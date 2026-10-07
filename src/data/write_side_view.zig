@@ -134,11 +134,14 @@ pub const Composite = struct {
         const self: *Composite = @ptrCast(@alignCast(ctx.?));
         const end: u32 = req.rel + @as(u32, @intCast(req.out.len));
         // 1. The accumulation buffer's coverage-aware snapshot (the short
-        //    shared section under the block lock).
+        //    shared section under the block lock). A partial's gaps come
+        //    from the write-side authority's base: the epoch's newest
+        //    shadow (open or saving) outranks the binding the checkout saw.
         if (self.table.has(req.ino, req.block)) {
             const g = self.locks.acquire(io, req.ino, req.block, .read);
             defer g.release(io);
             if (self.table.get(req.ino, req.block)) |e| {
+                const base = self.epochs.shadowOf(req.ino, req.block) orelse e.old_binding;
                 switch (e.repr) {
                     .full => {
                         const snap = self.table.snapshot(e);
@@ -149,7 +152,7 @@ pub const Composite = struct {
                             return .{ .served = .accumulation };
                         }
                         stats.write_side_partials.inc();
-                        return .{ .partial = .{ .covered = clip(&snap.coverage, req.rel, end), .base = e.old_binding } };
+                        return .{ .partial = .{ .covered = clip(&snap.coverage, req.rel, end), .base = base } };
                     },
                     .extent => |*x| {
                         x.coveredRead(req.rel, req.out);
@@ -158,7 +161,7 @@ pub const Composite = struct {
                             return .{ .served = .extent };
                         }
                         stats.write_side_partials.inc();
-                        return .{ .partial = .{ .covered = clip(&e.coverage, req.rel, end), .base = e.old_binding } };
+                        return .{ .partial = .{ .covered = clip(&e.coverage, req.rel, end), .base = base } };
                     },
                 }
             }
@@ -321,7 +324,7 @@ test "precedence: an open overlay record serves (composed over the old binding) 
     try testing.expect(!o.redirect.eql(a));
     try testing.expect(v.shadowBinding(3, 0).?.eql(o.redirect));
     try testing.expect(v.hasCustody(3, 0));
-    _ = w.epochs.close(io, 3, .park, cs);
+    _ = w.epochs.close(io, 3, cs);
     try testing.expectEqual(Outcome.none, v.serve(io, .{ .ino = 3, .block = 0, .rel = 0, .out = &out }));
     try testing.expect(!v.hasCustody(3, 0));
     try testing.expect(stats.write_side_redirects.load() >= 1);

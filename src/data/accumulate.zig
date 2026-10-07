@@ -19,6 +19,17 @@
 //! protocol, no model owed. `write_epoch` is PROCESS-GLOBALLY unique (one
 //! Relaxed `fetch_add`): global uniqueness closes the retire → re-park ABA.
 //!
+//! The base of an overwrite — the key its complement is seeded from and
+//! the key its feed displaces — is read from the WRITE-SIDE AUTHORITY at
+//! the moment it is used, under (3): the rewrite epoch's newest shadow
+//! (open or saving) else the durable map (`Epochs.baseBinding`). The
+//! checkout's `old_binding` is that authority's answer at birth, kept for
+//! the read seam; the flush re-derives it (an epoch may have saved
+//! meanwhile — the same key, now the map's) and the feed hands the live
+//! map key to `record`, which prefers its shadows. A base snapshotted from
+//! the durable map while the epoch shadowed the block was the 2026-10-07
+//! lost overwrite (`write_epoch.zig` module doc).
+//!
 //! Transformed volumes use a worst-case scratch (`block + 128 KiB`, the
 //! `transform.scratchLen` envelope — deliberately not the block pool, whose
 //! exactly-block buffers cannot hold expanded compressor output) through the
@@ -699,7 +710,6 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
     while (true) {
         // The snapshot + the epoch stamp under (3).
         var snap: Snapshot = undefined;
-        var old_binding: ?Binding = null;
         var app_end: u32 = 0;
         {
             var settle = table.upload_settled.notified();
@@ -720,7 +730,6 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                     if (e.repr != .full or !e.content_valid or e.seed == .deferred) return .stay_parked;
                     e.upload_inflight = true;
                     snap = table.snapshot(e);
-                    old_binding = e.old_binding;
                     app_end = e.app_end;
                 }
             }
@@ -811,8 +820,13 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             }
             const min_size = @as(u64, block) * bs + app_end;
             const striped = if (deps.map.view(ino)) |v| v.kind == .striped else false;
-            if (old_binding != null and striped) {
-                const v = deps.epochs.record(ino, block, old_binding, new_key, proof, min_size, fsck_guard, true) catch {
+            // An OVERWRITE displaces the write-side authority's key: the
+            // live map's, or an epoch's shadow (`record` prefers its own
+            // and the saving epoch's) — never the checkout's snapshot.
+            const live = deps.map.lookup(ino, block);
+            const overwrite = live != null or deps.epochs.bindsBlock(ino, block);
+            if (overwrite and striped) {
+                const v = deps.epochs.record(ino, block, live, new_key, proof, min_size, fsck_guard, true) catch {
                     mint.abandon();
                     return .stay_parked;
                 };
@@ -875,7 +889,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         // hint OUTSIDE the guard.
         for (displaced.slice()) |d| _ = deps.free.free(io, d);
         prof.mark(.displaced_free);
-        if (fed_hint) _ = deps.epochs.close(io, ino, .park, .{ .map = deps.map, .free = deps.free, .purge = deps.purge });
+        if (fed_hint) _ = deps.epochs.close(io, ino, .{ .map = deps.map, .free = deps.free, .purge = deps.purge });
         return .published;
     }
 }
@@ -901,8 +915,10 @@ pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block
             if (table.escalate(e) == null) return .stay_parked;
         }
         if (!e.content_valid) {
-            if (e.seed == .deferred and e.old_binding != null) {
-                const old = e.old_binding.?;
+            // The complement's base is the write-side authority's key NOW
+            // (module doc): an epoch's newest shadow, else the map's.
+            const base: ?Binding = if (e.seed == .deferred) deps.epochs.baseBinding(deps.map, ino, block) else null;
+            if (base) |old| {
                 const img = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return .stay_parked;
                 defer table.gpa.free(img);
                 deps.device.read(old.vol_tag, old.offset, img) catch return .stay_parked;
@@ -1242,7 +1258,7 @@ test "the overwrite write-through FEEDS the rewrite epoch (no per-block merge); 
     try testing.expectEqual(fb0 + 1, epoch_mod.stats.rewrite_shadow_fallbacks.load());
     try testing.expect(w.f.map.seam().lookup(8, 1).?.eql(a3)); // fed, not yet saved (half the file shadowed)
     try testing.expect(w.epochs.bindsBlock(8, 1));
-    try testing.expect(w.epochs.close(io, 8, .park, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none }) == .swapped);
+    try testing.expect(w.epochs.close(io, 8, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none }) == .swapped);
     try testing.expect(!w.f.map.seam().lookup(8, 1).?.eql(a3));
     // Fence on a fresh block's merge: fence_drop, nothing published, the mint not freed (W5).
     try w.f.map.create(9, .striped, 0);
@@ -1284,7 +1300,7 @@ test "flushParkedBlock (DUR-1 escalation): a partial fresh block zero-completes 
     try testing.expectEqual(Disposition.published, flushParkedBlock(&w.table, w.deps(), io, 11, 0));
     try testing.expectEqual(@as(u64, 1), w.f.dev.reads);
     try testing.expectEqual(@as(u64, wt.BS), w.f.dev.read_bytes);
-    _ = w.epochs.close(io, 11, .park, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none });
+    _ = w.epochs.close(io, 11, .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none });
     const nb = w.f.map.seam().lookup(11, 0).?;
     w.f.dev.peek(wt.VOL_A, nb.offset, &got);
     try testing.expect(std.mem.allEqual(u8, got[0 .. wt.BS / 2], 0x44));

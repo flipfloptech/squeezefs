@@ -195,6 +195,14 @@ pub const RamFile = struct {
 
 pub const MergeLog = struct { ino: u64, blocks: u8, min_size: u64, fencing: u64, displaced: u8 };
 
+/// Runs ONCE before the next merge takes the map lock — the window
+/// between a save's start and its landing, where a racing arm's write runs
+/// (it may itself look the map up or merge: the hook is disarmed first).
+pub const MergeHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, map: *RamMap) void,
+};
+
 pub const RamMap = struct {
     gpa: Allocator,
     chunk: u64 = BS,
@@ -207,6 +215,7 @@ pub const RamMap = struct {
     refs_released: u64 = 0,
     /// Order of merges against the device trace (an fsync's DUR-1 pin).
     on_merge: ?*const fn (*RamMap) void = null,
+    before_merge: ?MergeHook = null,
 
     pub fn init(gpa: Allocator) RamMap {
         return .{ .gpa = gpa };
@@ -264,6 +273,10 @@ pub const RamMap = struct {
 
     fn merge(ctx: *anyopaque, req: seams.MergeRequest) seams.MergeError!seams.MergeOutcome {
         const self: *RamMap = @ptrCast(@alignCast(ctx));
+        if (self.before_merge) |h| {
+            self.before_merge = null;
+            h.call(h.ctx, self);
+        }
         self.lock.lockUncancelable(std.testing.io);
         defer self.lock.unlock(std.testing.io);
         if (self.fail_next_merge) |e| {

@@ -19,9 +19,12 @@
 //!      ONLY while the lane owes a completion (an armed SQE whose CQE has not
 //!      landed — "wake chains lose exactly one wake under load", charter
 //!      §4); the loop-bottom enter flushes every SQE the pass prepared (the
-//!      31 → 9 enters-per-create law). A tick that finds inbox work is a
-//!      counted rescue (`exec_lane_tick_rescues` ≈ 0) and disarms the
-//!      coalescer so the lost write cannot silence later producers.
+//!      31 → 9 enters-per-create law). A timeout that finds inbox work
+//!      disarms the coalescer so a lost write cannot silence later
+//!      producers; it is a counted RESCUE (`exec_lane_tick_rescues`, must
+//!      stay 0) only when the park ran the full tick and no wake CQE sits
+//!      in the CQ — a message landing right after a timer deadline's
+//!      timeout is the ordinary race, not a lost write.
 //!
 //! A lane may carry ONE `Resident` (the journal lane's stage B): a protocol
 //! whose ring ops are tagged below the fiber space and routed to it at
@@ -654,8 +657,16 @@ pub const Lane = struct {
             self.ring.coalescer.disarm();
             if (self.inbox.tryPop()) |m| {
                 self.handleMsg(m);
-                stats.lane_tick_rescues.inc();
-                _ = self.tick_rescues.fetchAdd(1, .monotonic);
+                // A RESCUE only when nothing could have woken us: the park
+                // ran the full tick (not a timer's or the backstop's
+                // deadline) and no wake CQE sits in the CQ. A message
+                // landing between a short deadline's timeout and this pop
+                // is the ordinary race, not a lost write (the 2026-10-07
+                // phantom `exec_lane_tick_rescues = 1` under the storm).
+                if (tick == tick_ns and self.ring.cqReady() == 0) {
+                    stats.lane_tick_rescues.inc();
+                    _ = self.tick_rescues.fetchAdd(1, .monotonic);
+                }
             }
         }
     }
@@ -932,6 +943,48 @@ test "SQUEEZEFS_TEST_EXEC_DROP_WAKE: a dropped eventfd write is healed by the pa
     p.waitDone();
     try testing.expect(clock.monotonicNs() - t1 < tick_ns / 2);
     waitQuiescent(l);
+}
+
+test "a timer deadline's timeout that finds a fresh inbox message is NOT a rescue: 1 ms timer parks under a foreign spawn storm count 0 tick rescues (the phantom exec_lane_tick_rescues under the smoke's storm)" {
+    const l = try testLane(.meta, 64, false);
+    defer l.deinit();
+    const Timed = struct {
+        /// A fiber keeping a 1 ms timer armed on the lane for ~300 ms: every
+        /// park's bound is the timer, never the full tick.
+        fn ticker(context: *const anyopaque) void {
+            const c = ctxOf(context);
+            const f = currentFiber().?;
+            const until = clock.monotonicNs() + 300 * std.time.ns_per_ms;
+            while (clock.monotonicNs() < until) {
+                c.lane.timers.arm(f, clock.monotonicNs() + std.time.ns_per_ms);
+                f.park();
+                _ = c.lane.timers.cancel(f);
+            }
+            c.probe.finish();
+        }
+        fn noop(context: *const anyopaque) void {
+            _ = ctxOf(context).probe.hits.fetchAdd(1, .monotonic);
+        }
+        fn producer(lane: *Lane, grp: *Io.Group, probe: *Probe, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                _ = spawnTest(lane, grp, noop, .{ .probe = probe, .lane = lane }) catch {};
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+    var gt = membersGroup(1);
+    var pt: Probe = .{};
+    _ = try spawnTest(l, &gt, Timed.ticker, .{ .probe = &pt, .lane = l });
+    var gp = membersGroup(1 << 20);
+    var pp: Probe = .{};
+    var stop: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, Timed.producer, .{ l, &gp, &pp, &stop });
+    pt.waitDone();
+    stop.store(true, .release);
+    t.join();
+    waitQuiescent(l);
+    try testing.expect(pp.hits.load(.monotonic) > 100);
+    try testing.expectEqual(@as(u64, 0), l.tick_rescues.load(.monotonic));
 }
 
 test "poll budget 1 (the fuse_ur posture): one fiber per pass, every fiber still completes" {

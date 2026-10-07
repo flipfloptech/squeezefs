@@ -15,8 +15,9 @@
 //! (a refusal, `error.FlightTableFull`, when every slot is leading — the
 //! caller's retry class); waiter nodes live on the cohort's frames and
 //! receive their copy of the value under the interior mutex, so a slot is
-//! free the instant its leader publishes. Parks are ticked
-//! (`channel_ticked_reregisters`).
+//! free the instant its leader publishes. Parks are ticked (a tick that
+//! finds the value published with no token delivered counts
+//! `channel_ticked_reregisters`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -72,13 +73,15 @@ pub fn SingleFlight(comptime K: type, comptime V: type, comptime max_flights: us
             };
             if (!w.linked) return self.lead(io, slot, ctx, compute);
             while (true) {
-                _ = tick.park(io, &w.state, &tick.channel_ticked_reregisters) catch |err| switch (err) {
+                const outcome = tick.park(io, &w.state, null) catch |err| switch (err) {
                     error.Canceled => {
                         self.leave(io, slot, &w);
                         return err;
                     },
                 };
                 self.interior.lockUncancelable(io);
+                const ticked = outcome == .ticked;
+                if (w.result != null or w.elected) tick.noteChannelRescue(ticked, &w.state);
                 w.state.store(0, .monotonic);
                 if (w.result) |v| {
                     self.interior.unlock(io);

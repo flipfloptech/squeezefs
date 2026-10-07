@@ -11,8 +11,19 @@
 //! unrepresentable. The counters are 0 on a healthy daemon; growth is a
 //! lost wake absorbed, loudly.
 //!
-//! The tick is unreachable by healthy waits (metadata holds are never
+//! The tick is unreachable by healthy LOCK waits (metadata holds are never
 //! device-I/O-length) and cheap enough that a lost wake costs one beat.
+//!
+//! Two counters, two contracts. A lock's tick IS the signal: the waiter
+//! re-contends and `lock_ticked_reregisters` counts it (a hold past a tick
+//! is a defect). A channel-class waiter (notify, channels, single-flight,
+//! semaphore) may legitimately park for minutes — a worker idle on its wake
+//! notify — so its tick alone says nothing; `channel_ticked_reregisters`
+//! counts a RESCUE: a tick whose re-check under the primitive's lock finds
+//! the condition already satisfied with no wake token delivered — the wake
+//! was lost in the chain and the tick absorbed it. The pre-2026-10-07 count-
+//! at-the-tick made the reclaimer's idle park read as "lost wakes" (3 per
+//! smoke run, the phantom behind the "5 s stall").
 
 const std = @import("std");
 const Io = std.Io;
@@ -27,10 +38,16 @@ pub const tick_ns: u64 = 2 * std.time.ns_per_s;
 /// a tick (the reference's `TICK_RECOVERIES`).
 pub var lock_ticked_reregisters: counters.ShardedCounter = .{};
 
-/// `channel_ticked_reregisters`: every other primitive's ticked park
-/// (notify, semaphore, single-flight, once-cell, channels — the reference's
-/// `TICKED_WAIT_RECOVERIES`).
+/// `channel_ticked_reregisters`: a channel-class park's tick that RESCUED a
+/// lost wake (module doc; the reference's `TICKED_WAIT_RECOVERIES`). Must
+/// stay 0 on a healthy daemon.
 pub var channel_ticked_reregisters: counters.ShardedCounter = .{};
+
+/// A channel-class waiter's re-check after a `.ticked` park: the condition
+/// is satisfied and `word` still holds no token ⇒ the wake was lost.
+pub fn noteChannelRescue(ticked: bool, word: *const std.atomic.Value(u32)) void {
+    if (ticked and word.load(.monotonic) == 0) channel_ticked_reregisters.inc();
+}
 
 pub const Outcome = enum {
     /// The word left 0: a wake token was delivered.
@@ -43,18 +60,20 @@ pub const Outcome = enum {
 
 /// Park while `word` reads 0, for at most one tick. Spurious returns
 /// (EINTR, a futex refresh) re-park for the remainder; only a wait that
-/// reaches the deadline counts against `counter`. The futex compare is what
-/// closes the window between the caller's registration and the sleep: a
-/// token stored before the sleep makes the wait return at once.
-pub fn park(io: Io, word: *std.atomic.Value(u32), counter: *counters.ShardedCounter) Io.Cancelable!Outcome {
+/// reaches the tick counts against `counter` (the lock contract; a
+/// channel-class waiter passes null and counts its rescue on the re-check).
+/// The futex compare is what closes the window between the caller's
+/// registration and the sleep: a token stored before the sleep makes the
+/// wait return at once.
+pub fn park(io: Io, word: *std.atomic.Value(u32), counter: ?*counters.ShardedCounter) Io.Cancelable!Outcome {
     return parkUntil(io, word, std.math.maxInt(u64), counter);
 }
 
 /// `park` bounded by the caller's own monotonic deadline as well: returns
 /// `.deadline` when `deadline_ns` passes before a token or the tick (the
 /// cadence task's `timeout_at(next_tick, notified())`). The tick stays the
-/// liveness backstop underneath and still counts.
-pub fn parkUntil(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter: *counters.ShardedCounter) Io.Cancelable!Outcome {
+/// liveness backstop underneath.
+pub fn parkUntil(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter: ?*counters.ShardedCounter) Io.Cancelable!Outcome {
     const tick_deadline = clock.monotonicNs() + tick_ns;
     const until = @min(tick_deadline, deadline_ns);
     while (true) {
@@ -64,7 +83,7 @@ pub fn parkUntil(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter
         const now = clock.monotonicNs();
         if (now >= until) {
             if (deadline_ns <= tick_deadline) return .deadline;
-            counter.inc();
+            if (counter) |c| c.inc();
             return .ticked;
         }
         try futex.ioWaitTimeout(io, word, 0, until - now);
@@ -72,7 +91,7 @@ pub fn parkUntil(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter
 }
 
 /// `parkUntil` without a cancellation point (see `parkUncancelable`).
-pub fn parkUntilUncancelable(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter: *counters.ShardedCounter) Outcome {
+pub fn parkUntilUncancelable(io: Io, word: *std.atomic.Value(u32), deadline_ns: u64, counter: ?*counters.ShardedCounter) Outcome {
     const old = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(old);
     return parkUntil(io, word, deadline_ns, counter) catch |err| switch (err) {
@@ -83,7 +102,7 @@ pub fn parkUntilUncancelable(io: Io, word: *std.atomic.Value(u32), deadline_ns: 
 /// `park` without a cancellation point (committers are never cancelled —
 /// charter §9). The vtable has no timed uncancelable wait, so the timed wait
 /// runs under blocked cancel protection, which is the documented idiom.
-pub fn parkUncancelable(io: Io, word: *std.atomic.Value(u32), counter: *counters.ShardedCounter) Outcome {
+pub fn parkUncancelable(io: Io, word: *std.atomic.Value(u32), counter: ?*counters.ShardedCounter) Outcome {
     const old = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(old);
     return park(io, word, counter) catch |err| switch (err) {

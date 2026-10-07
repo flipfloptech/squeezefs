@@ -581,6 +581,9 @@ fn dumpStats(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane
     w = .fixed(&buf);
     mem_budget.authority.writeStatsJson(&w) catch {};
     log.info("stats mem_budget: {s}", .{w.buffered()});
+    w = .fixed(&buf);
+    op_trace.writeLatencyJson(&w) catch {};
+    log.info("stats ops: {s}", .{w.buffered()});
     log.info("stats daemon: {{\"open_count_stranded\":{d},\"invariant_tripwires\":{d},\"fuse_ops\":{d},\"fuse_op_watchdog_overdue\":{d},\"fuse_ops_inflight\":{d},\"fuse_write_no_data_volume_refused\":{d},\"fuse_write_beyond_inline_map_refused\":{d},\"fuse_write_inline\":{d},\"fuse_write_staged\":{d},\"fuse_write_striped\":{d},\"fuse_write_promotions_to_striped\":{d},\"fuse_truncate_packed_clips\":{d},\"fuse_truncate_striped_clips\":{d},\"fuse_truncate_restages\":{d},\"fuse_truncate_zero_tail_bytes\":{d},\"fuse_reclaim_destroys\":{d},\"fuse_corpse_sweep_destroyed\":{d},\"fuse_reclaim_drains\":{d},\"fuse_reclaim_blocks_freed\":{d},\"exec_lane_tick_rescues\":{d},\"transport_park_tick_commit_rescues\":{d},\"transport_park_tick_cqe_rescues\":{d},\"lock_ticked_reregisters\":{d},\"channel_ticked_reregisters\":{d},\"volume_failed\":{}}}", .{
         counters.tripwireCount("open_count_stranded"),
         counters.invariantTripwires(),

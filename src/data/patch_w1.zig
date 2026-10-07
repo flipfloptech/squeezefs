@@ -146,7 +146,9 @@ pub const SoleOwnerVerdict = enum { sole, shared, foreign_custody, non_holder };
 
 pub const CustodyProbe = struct {
     ctx: ?*anyopaque,
-    /// A RAM buffer, a staged entry or a staged extent record for the key
+    /// A RAM buffer, a staged entry or a staged extent record for the key,
+    /// or a rewrite epoch binding the block — open OR with its save in
+    /// flight: the key the patch would land in is the one the save displaces
     /// (lock-free probes — never the blocking-pool hop).
     ram_custody: *const fn (ctx: ?*anyopaque, ino: u64, block: u32) bool,
     /// An overlay record open on the block (KD-B4-4: same guard, no new fence).

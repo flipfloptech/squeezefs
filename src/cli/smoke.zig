@@ -39,6 +39,8 @@ const linux = std.os.linux;
 const Io = std.Io;
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
+const counters = @import("../core/counters.zig");
+const handler = @import("../fuse/handler.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/smoke is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -252,7 +254,19 @@ const Rig = struct {
     /// A `sh -e` script with `$1 = work dir` run with the mount as cwd;
     /// stdout on success, both streams printed on failure.
     fn onMount(self: *Rig, script: []const u8) ![]u8 {
-        const r = try std.process.run(self.gpa, self.io, .{ .argv = &.{ "sh", "-e", "-c", script, "smoke", self.work }, .cwd = .{ .path = self.mp }, .environ_map = &self.env });
+        return self.onMountArgv(script, &.{ "sh", "-e", "-c", script, "smoke", self.work });
+    }
+
+    /// `onMount` under `timeout -s KILL <secs>`: a hung pass fails instead
+    /// of hanging the suite (the looped repro's per-pass bound).
+    fn onMountTimed(self: *Rig, script: []const u8, secs: u32) ![]u8 {
+        var buf: [16]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "{d}", .{secs});
+        return self.onMountArgv(script, &.{ "timeout", "-s", "KILL", s, "sh", "-e", "-c", script, "smoke", self.work });
+    }
+
+    fn onMountArgv(self: *Rig, script: []const u8, argv: []const []const u8) ![]u8 {
+        const r = try std.process.run(self.gpa, self.io, .{ .argv = argv, .cwd = .{ .path = self.mp }, .environ_map = &self.env });
         defer self.gpa.free(r.stderr);
         if (!r.term.success()) {
             std.debug.print("\n--- mount script failed ({f}) ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, script, r.stdout, r.stderr });
@@ -1103,6 +1117,16 @@ const pack_census_bound: u64 = (small_files_staged * small_len + (2 << 20) - 1) 
 /// overlay / RMW classes).
 const overwrites_aligned: usize = 64;
 const overwrites_unaligned: usize = 16;
+/// The overwrite stage's fixed seed (a pass is reproducible from the log).
+const overwrite_seed: u64 = 0x5151_4a4a_0404_2026;
+/// The looped single-stage repro's knob (`knobs.zig`, harness class).
+const smoke_loops_knob = "SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS";
+/// One looped pass's wall bound: the overwrite stage runs ~5 s, the storm
+/// ~15 s on the venue; a pass past this is a hang, killed and failed.
+const stage_loop_timeout_s: u32 = 300;
+/// No op of any class may take longer than this on the looped passes (the
+/// phantom "5 s stall" was a watchdog artifact; the real tail is ≤ 256 ms).
+const op_latency_bound = "<=1s";
 /// The kill points of the mid-`dd` matrix: the MiB the inode claims when
 /// SIGKILL is sent. The staged phase ends at one block (4 MiB), so every
 /// point is deep in the striped write pipeline.
@@ -1199,14 +1223,16 @@ const stage_storm_script =
 
 /// Stage D's script: `n_aligned` page-aligned and `n_unaligned` arbitrary
 /// 4 KiB overwrites of `big` (220 MiB after stage C), each mirrored on
-/// the image copy with the same source page; deterministic offsets.
-fn overwriteScript(gpa: std.mem.Allocator, n_aligned: usize, n_unaligned: usize) ![]u8 {
+/// the image copy with the same source page; deterministic offsets from
+/// `seed` (the pass is reproducible from the log; a looped pass takes a
+/// distinct seed so a lost write cannot hide behind the previous pass's
+/// identical bytes).
+fn overwriteScript(gpa: std.mem.Allocator, n_aligned: usize, n_unaligned: usize, seed: u64) ![]u8 {
     var script: std.Io.Writer.Allocating = .init(gpa);
     errdefer script.deinit();
     const w = &script.writer;
     try w.writeAll("W=\"$1\"\n");
-    // A fixed seed: the pass is reproducible from the log.
-    var prng = std.Random.DefaultPrng.init(0x5151_4a4a_0404_2026);
+    var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
     const file_len: u64 = 220 << 20;
     const pages = file_len / 4096;
@@ -1284,6 +1310,9 @@ const must_stay_zero = [_][]const u8{
     "\"transport_park_tick_commit_rescues\":",
     "\"transport_park_tick_cqe_rescues\":",
     "\"exec_lane_tick_rescues\":",
+    "\"lock_ticked_reregisters\":",
+    "\"channel_ticked_reregisters\":",
+    "\"fuse_op_watchdog_overdue\":",
     "\"invariant_tripwires\":",
     "\"patch_edge_rmw_reads\":",
     "\"overlay_fence_drops\":",
@@ -1391,6 +1420,30 @@ fn printRates(label: []const u8, tail: []const u8) void {
     std.debug.print("smoke[{s}]: {d} fuse ops, {d} ring requests, {d} enters ({d}.{d:0>2}/request), {d} bounce copies; READ user {d} B: dest memcpy {d} B, dest DMA {d} B, zc serve {d} B ({d} direct legs, {d} fd-source serves, {d} probe serves, {d} hot-tier hits); WRITE: {d} held stores / {d} hold admits / {d} W1 patches, NT copy {d} B of {d} B write-through, {d} own-block DMAs, {d} map merges, {d} mint abandons ({d} supersessions, {d} joins); ticked parks lock {d} / channel {d}; journal full stalls {d}, park-kicked checkpoint cycles {d} of {d}, conveyor tick rescues {d}\n", .{ label, ops, reqs, enters, enters / @max(reqs, 1), (enters * 100 / @max(reqs, 1)) % 100, copies, user_r, dest, dma, zc, legs, fd_src, probe_serves, hot_hits, held, admits, patches, nt, wt, own, merges, abandons, supersessions, joins, lock_ticks, chan_ticks, full_stalls, park_cycles, checkpoints, cv_ticks });
 }
 
+/// Every op class's slowest latency bucket (`stats ops:`) is at or under
+/// `bound` (a bucket label: the histogram's log2 grid); the offending class
+/// is printed.
+fn expectOpLatencyWithin(tail: []const u8, bound: []const u8) !void {
+    const seg = tail[(std.mem.indexOf(u8, tail, "\"fuse_op_latency_ns\":{") orelse return error.OpLatencyMissing)..];
+    const bound_rank = bucketRank(bound) orelse return error.UnknownBucket;
+    var bad = false;
+    inline for (@typeInfo(handler.op_trace.OpClass).@"enum".field_names) |name| {
+        const slowest = histMaxBucket(seg, "\"" ++ name ++ "\":");
+        if (bucketRank(slowest)) |rank| if (rank > bound_rank) {
+            std.debug.print("\n--- op class {s}: slowest bucket {s} past the {s} bound ---\n", .{ name, slowest, bound });
+            bad = true;
+        };
+    }
+    try testing.expect(!bad);
+}
+
+/// A histogram bucket label's rank (`counters.bucket_labels` order); null
+/// for `none`/`absent`.
+fn bucketRank(label: []const u8) ?usize {
+    for (counters.bucket_labels, 0..) |l, i| if (std.mem.eql(u8, l, label)) return i;
+    return null;
+}
+
 /// The highest non-empty bucket of a latency histogram in the stats dump
 /// (`"<key>":{"buckets":{"<=1us":n,...}`): the stall's order of magnitude.
 fn histMaxBucket(text: []const u8, key: []const u8) []const u8 {
@@ -1465,7 +1518,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     }
     // D: random 4 KiB overwrites against the mirror.
     {
-        const script = try overwriteScript(gpa, overwrites_aligned, overwrites_unaligned);
+        const script = try overwriteScript(gpa, overwrites_aligned, overwrites_unaligned, overwrite_seed);
         defer gpa.free(script);
         const out = try rig.onMount(script);
         defer gpa.free(out);
@@ -1603,6 +1656,70 @@ test "smoke: the data plane WITHOUT a cache path — staging and the NVMe tier O
     const rig = try Rig.init(testing.allocator, io);
     defer rig.deinit();
     try dataPlanePass(rig, false);
+}
+
+// The looped single-stage repro (`SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS=N`):
+// the cache-path set, `big` laid down and shaped once, then N passes of
+// the 4 KiB overwrite stage (distinct source pages each pass, `cmp`
+// against the mirror) and N passes of the 8-way storm, every pass under
+// a wall bound and followed by the quiescent must-stay-0 census (the
+// drift and double-free tripwires through `invariant_tripwires`, the
+// ticked channel parks, the watchdog's overdue observations). The
+// 2026-10-07 lost overwrite showed in ~1 run of 12 of the single pass.
+test "smoke: the cache-path overwrite and storm stages LOOPED — 0 lost overwrites, 0 drift, 0 ticked channel parks, 0 watchdog reports over every pass" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var env = try testing.environ.createMap(gpa);
+    defer env.deinit();
+    const raw = env.get(smoke_loops_knob) orelse return error.SkipZigTest;
+    const loops = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t"), 10) catch return error.SkipZigTest;
+    if (loops == 0) return error.SkipZigTest;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const out = try rig.onMountTimed(stage_dd_script, stage_loop_timeout_s);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-dd-ok") != null);
+    }
+    {
+        const out = try rig.onMountTimed(stage_truncate_script, stage_loop_timeout_s);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-truncate-ok") != null);
+    }
+    var pass: u32 = 0;
+    while (pass < loops) : (pass += 1) {
+        const script = try overwriteScript(gpa, overwrites_aligned, overwrites_unaligned, overwrite_seed +% pass);
+        defer gpa.free(script);
+        const t0 = clock.monotonicNs();
+        const out = try rig.onMountTimed(script, stage_loop_timeout_s);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-overwrite-ok") != null);
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try expectOpLatencyWithin(tail, op_latency_bound);
+        std.debug.print("smoke[loop]: overwrite pass {d}/{d}: image-exact in {d} ms; drift {d}, untracked frees {d}, channel ticks {d}, watchdog overdue {d}\n", .{ pass + 1, loops, (clock.monotonicNs() - t0) / std.time.ns_per_ms, numberAfter(tail, "\"rewrite_shadow_displaced_drift\":") orelse 0, numberAfter(tail, "\"block_untracked_free_refusals\":") orelse 0, numberAfter(tail, "\"channel_ticked_reregisters\":") orelse 0, numberAfter(tail, "\"fuse_op_watchdog_overdue\":") orelse 0 });
+    }
+    pass = 0;
+    while (pass < loops) : (pass += 1) {
+        const t0 = clock.monotonicNs();
+        const out = try rig.onMountTimed(stage_storm_script, stage_loop_timeout_s);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "stage-storm-ok") != null);
+        const tail = try rig.quiescentStatsTail();
+        defer gpa.free(tail);
+        try expectMustStayZero(tail);
+        try expectLedgersClosed(tail);
+        try expectOpLatencyWithin(tail, op_latency_bound);
+        std.debug.print("smoke[loop]: storm pass {d}/{d}: {d} MB/s aggregate in {d} ms; channel ticks {d}, watchdog overdue {d}, joins {d}, close waits {d}\n", .{ pass + 1, loops, mbPerS(out, "storm_ns=", storm_files * (storm_mib << 20)), (clock.monotonicNs() - t0) / std.time.ns_per_ms, numberAfter(tail, "\"channel_ticked_reregisters\":") orelse 0, numberAfter(tail, "\"fuse_op_watchdog_overdue\":") orelse 0, numberAfter(tail, "\"write_pipeline_joins\":") orelse 0, numberAfter(tail, "\"rewrite_shadow_close_waits\":") orelse 0 });
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
 // ---- the kill matrix ----

@@ -212,6 +212,19 @@ pub fn latencyHistogram(class: OpClass) *counters.ShardedLatencyHistogram {
     return &fuse_op_latency_ns[@backingInt(class)];
 }
 
+/// `{"fuse_op_latency_ns":{"<class>":{histogram},…}}` — the per-class
+/// always-on latencies in the stats dump (the smoke bounds the slowest
+/// bucket of every class).
+pub fn writeLatencyJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("{\"fuse_op_latency_ns\":{");
+    inline for (@typeInfo(OpClass).@"enum".field_names, 0..) |name, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("\"{s}\":", .{name});
+        try fuse_op_latency_ns[i].snapshot().writeJson(w);
+    }
+    try w.writeAll("}}");
+}
+
 /// One op's trace, on the handler's frame.
 pub const OpTrace = struct {
     unique: u64,

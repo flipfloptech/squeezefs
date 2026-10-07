@@ -306,9 +306,18 @@ const LaneStats = struct {
 
 pub const TestSeams = struct {
     /// While > 0 each admitted window is failed synthetically (no SQE is
-    /// issued, its bytes never land, outcome `InputOutput`) — the torn-run
-    /// shape of the reference's `arm_torn_write(keep = 0)`.
+    /// issued, its bytes never land, outcome `fail_errno`'s class —
+    /// `InputOutput` when unset) — the torn-run shape of the reference's
+    /// `arm_torn_write(keep = 0)`; with `.BADE` it is the fence on an
+    /// ENTRY-WRITE CQE (the O_DIRECT conflict site).
     fail_windows: std.atomic.Value(u32) = .init(0),
+    /// The errno the two injections above and below carry (`@backingInt`
+    /// of a `linux.E`; 0 = EIO).
+    fail_errno: std.atomic.Value(u32) = .init(0),
+    /// While > 0 each barrier the lane starts is failed synthetically with
+    /// `fail_errno`'s class before any FSYNC SQE is issued (the fence on a
+    /// BARRIER CQE, `uring_fs::arm_barrier_error(EBADE)`'s shape).
+    fail_barriers: std.atomic.Value(u32) = .init(0),
     /// 1 ⇒ the stage-B fiber publishes `held = 1` and holds the lane thread
     /// at the top of its next poll (BEFORE its scan), so a test can publish
     /// N messages between two polls deterministically.
@@ -321,6 +330,13 @@ pub const TestSeams = struct {
 };
 
 pub var test_seams: TestSeams = .{};
+
+/// The injected failure's class (`fail_errno` through the ONE table).
+fn injectedError() Error {
+    const raw = test_seams.fail_errno.load(.acquire);
+    if (raw == 0) return error.InputOutput;
+    return errors.fromErrno(@fromBackingInt(@intCast(@as(u16, @intCast(raw)))));
+}
 
 // ---------------------------------------------------------------------------
 // Hooks the conveyor installs: all run ON the lane thread (the stage-B
@@ -961,7 +977,7 @@ pub const JournalLane = struct {
         const c = &self.cells[idx];
         if (c.kind == .window and test_seams.fail_windows.load(.acquire) != 0) {
             _ = test_seams.fail_windows.fetchSub(1, .acq_rel);
-            c.first_err = error.InputOutput;
+            c.first_err = injectedError();
             self.markLanded(c, clock.monotonicNs());
             return;
         }
@@ -1236,6 +1252,10 @@ pub const JournalLane = struct {
                     f(self.hooks.ctx, SeqSpan.stamped(c.seq_base, c.window.len), c.window);
                     stats.rollbacks.inc();
                 }
+                // The fence rung FIRST: a reservation conflict on an
+                // entry-write CQE latches FAILED at once; the generic
+                // 3-count below is then a no-op on a latched volume.
+                if (self.latch.classifyFence(e, "an entry-write CQE") == .latched) stats.volumes_failed.inc();
                 self.noteJournalFailure();
                 // The reserved range is a PERMANENT hole (same-page successors
                 // of a dead chain are undiscoverable): checkpoint past it.
@@ -1343,6 +1363,10 @@ pub const JournalLane = struct {
             },
         }
         if (w.ring_dead) return self.barrierDone(error.RingFailed, clock.monotonicNs());
+        if (test_seams.fail_barriers.load(.acquire) != 0) {
+            _ = test_seams.fail_barriers.fetchSub(1, .acq_rel);
+            return self.barrierDone(injectedError(), clock.monotonicNs());
+        }
         if (self.lane.ring.prepFdatasync(self.sqeFd(), self.fixed_file, ud_barrier) == null) self.barrierDone(error.SubmissionQueueOverflow, clock.monotonicNs());
     }
 
@@ -1363,6 +1387,9 @@ pub const JournalLane = struct {
             log.warn("journal lane {d}: barrier failed: {s}", .{ self.index, @errorName(e) });
             stats.barrier_failures.inc();
             LaneStats.bump(&self.stats.barrier_failures);
+            // The fence rung first (charter §5.7: a reservation-conflict
+            // errno at ANY barrier latches FAILED), then the 3-count.
+            if (self.latch.classifyFence(e, "a durability barrier") == .latched) stats.volumes_failed.inc();
             if (self.latch.noteFailure(.barrier)) stats.volumes_failed.inc();
         }
         if (kind == .strict_group) {

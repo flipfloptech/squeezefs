@@ -52,6 +52,7 @@ const fusermount = @import("fusermount.zig");
 const exec = @import("../exec/exec.zig");
 const exec_stats = @import("../exec/stats.zig");
 const backend = @import("../meta/backend.zig");
+const guard = @import("../meta/guard.zig");
 const checkpoint = @import("../meta/checkpoint.zig");
 const journal_lane = @import("../meta/journal_lane.zig");
 const node_cache = @import("../meta/node_cache.zig");
@@ -462,7 +463,8 @@ fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
 
 fn openReason(e: backend.OpenError) []const u8 {
     return switch (e) {
-        error.Busy => "another writer holds the single-writer guard (flock)",
+        error.Busy => "another writer holds the single-writer guard (the flock, or a live writer claim — see the log)",
+        error.InvalidIdentity => "SQUEEZEFS_HOSTNQN / SQUEEZEFS_HOSTID must be configured as a pair or not at all",
         error.NotFormatted => "not formatted (zeroed superblock) — run `squeezefs format` first",
         error.LegacyFormat => "a pre-v4 squeezefs format, which this binary does not mount — reformat required",
         error.UnsupportedFormat => "unknown or later-rung capability bits — reformat or a later binary",
@@ -574,6 +576,19 @@ fn dumpStats(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane
         journal_lane.writeStatsJson(&w) catch {};
         w.writeAll("}") catch {};
         log.info("stats meta: {s}", .{w.buffered()});
+    }
+    {
+        // The D0 guard: the process-wide families and this volume's mode,
+        // claim words and PR gauges.
+        w = .fixed(&buf);
+        w.writeAll("{\"guard\":") catch {};
+        guard.writeStatsJson(&w) catch {};
+        if (be.guard) |g| {
+            w.writeAll(",\"volume\":") catch {};
+            g.writeStatsJson(&w) catch {};
+        }
+        w.writeAll("}") catch {};
+        log.info("stats guard: {s}", .{w.buffered()});
     }
     w = .fixed(&buf);
     ctx.sqz.writeStatsJson(&w) catch {};

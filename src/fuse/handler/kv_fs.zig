@@ -99,6 +99,7 @@ const tx = @import("../../meta/tx.zig");
 const tree = @import("../../meta/tree.zig");
 const dlm = @import("../../meta/dlm.zig");
 const economy = @import("../../meta/economy.zig");
+const guard_claim = @import("../../meta/guard/claim.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
 const layout = @import("../../data/layout.zig");
@@ -391,8 +392,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (name.len > NAME_MAX) return error.NameTooLong;
         }
 
+        /// The reserved-xattr screen: the layout, the symlink target and
+        /// the guard's control records on ino 1 (`writer_claim`) are never
+        /// listed, read, set or removed through FUSE.
         fn isReservedXattr(name: []const u8) bool {
-            return std.mem.eql(u8, name, LAYOUT_XATTR) or std.mem.eql(u8, name, economy.SYMLINK_XATTR);
+            return std.mem.eql(u8, name, LAYOUT_XATTR) or std.mem.eql(u8, name, economy.SYMLINK_XATTR) or guard_claim.isGuardXattr(name);
         }
 
         /// The inode as stored, FOLDED through the pending refinements;

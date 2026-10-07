@@ -40,6 +40,7 @@ const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
 const log = @import("../core/log.zig");
 const jc = @import("journal_core.zig");
+const guard = @import("guard.zig");
 
 pub const CoreGeometry = jc.CoreGeometry;
 pub const Reservation = jc.Reservation;
@@ -1061,12 +1062,58 @@ pub fn noteReplay(recovery: *const JournalRecovery, clean_unmount: bool) void {
 /// success path resets `journal_failures` right before the strict-mode
 /// barrier — a barrier failing three times in a row would never latch on a
 /// shared counter.
+///
+/// The third rung is the FENCE (charter §5.7, §1.8; `guard_claims.md`
+/// §1.6): a reservation-conflict errno (`error.ReservationConflict`, EBADE
+/// = the block layer's `BLK_STS_RESV_CONFLICT`) at ANY entry-write CQE or
+/// barrier means another writer holds the device's persistent reservation
+/// and this holder's writes are refused at the device — FAILED at once, no
+/// count. Under O_DIRECT the conflict lands on the entry write's CQE as
+/// readily as on the barrier, so both sites classify (`noteFence`).
 pub const FailureLatch = struct {
     journal_failures: std.atomic.Value(u32) = .init(0),
     barrier_failures: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
+    /// The typed cause: FAILED by the fence (vs the generic rungs).
+    fenced: std.atomic.Value(bool) = .init(false),
 
     pub const Class = enum { journal_write, barrier };
+
+    /// Why a volume is FAILED (the stats face and the teardown log).
+    pub const Verdict = enum { healthy, failed, fenced };
+
+    /// The fence rung: FAILED at once; true iff THIS call latched (the one
+    /// guard log line and `writer_guard_fenced` are paid here). `site`
+    /// names the CQE class for the log.
+    pub fn noteFence(self: *FailureLatch, site: []const u8) bool {
+        // Release pairs with `verdict`'s acquire: a reader that sees FAILED
+        // sees the cause.
+        self.fenced.store(true, .release);
+        if (self.failed.swap(true, .acq_rel)) return false;
+        guard.stats.fenced.inc();
+        guard.stats.volume_fenced.add(1);
+        log.err("journal: reservation-conflict errno at {s} — this holder's writes are fenced at the device (usurped or paused-then-preempted); latching the volume FAILED at once; mutations answer EIO until remount (single-writer guard)", .{site});
+        return true;
+    }
+
+    pub const FenceVerdict = enum { not_fence, latched, already };
+
+    /// The ONE classifier of a write/barrier outcome for the fence rung:
+    /// the conflict latches here (`latched` iff by THIS call); the caller
+    /// then runs its generic rung as before.
+    pub fn classifyFence(self: *FailureLatch, e: anyerror, site: []const u8) FenceVerdict {
+        if (e != error.ReservationConflict) return .not_fence;
+        return if (self.noteFence(site)) .latched else .already;
+    }
+
+    pub fn isFenced(self: *const FailureLatch) bool {
+        return self.fenced.load(.acquire);
+    }
+
+    pub fn verdict(self: *const FailureLatch) Verdict {
+        if (!self.isFailed()) return .healthy;
+        return if (self.isFenced()) .fenced else .failed;
+    }
 
     fn counter(self: *FailureLatch, class: Class) *std.atomic.Value(u32) {
         return switch (class) {
@@ -2057,6 +2104,31 @@ test "failure latch: three consecutive journal failures latch once; a success re
     try testing.expect(wedge.isFailed());
     try testing.expect(!wedge.failStop());
     try testing.expectError(error.VolumeFailed, wedge.admitMutation());
+    try testing.expectEqual(FailureLatch.Verdict.failed, wedge.verdict());
+    try testing.expectEqual(FailureLatch.Verdict.healthy, @as(FailureLatch, .{}).verdict());
+}
+
+test "the fence rung: ONE reservation conflict at any site latches FAILED at once (no 3-count), typed fenced, counted on writer_guard_fenced and the volume_fenced gauge; every other errno is not the fence; a second conflict logs nothing" {
+    var latch: FailureLatch = .{};
+    const fenced0 = guard.stats.fenced.load();
+    const gauge0 = guard.stats.volume_fenced.load();
+    try testing.expectEqual(FailureLatch.FenceVerdict.not_fence, latch.classifyFence(error.InputOutput, "entry write"));
+    try testing.expect(!latch.isFailed());
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(FailureLatch.FenceVerdict.latched, latch.classifyFence(error.ReservationConflict, "entry write"));
+    try log.testing.expectAllFired();
+    try testing.expect(latch.isFailed());
+    try testing.expect(latch.isFenced());
+    try testing.expectEqual(FailureLatch.Verdict.fenced, latch.verdict());
+    try testing.expectError(error.VolumeFailed, latch.admitMutation());
+    try testing.expectEqual(fenced0 + 1, guard.stats.fenced.load());
+    try testing.expectEqual(gauge0 + 1, guard.stats.volume_fenced.load());
+    // Already latched: classified, not re-logged, not re-counted.
+    try testing.expectEqual(FailureLatch.FenceVerdict.already, latch.classifyFence(error.ReservationConflict, "barrier"));
+    try testing.expect(!latch.noteFence("barrier"));
+    try testing.expectEqual(fenced0 + 1, guard.stats.fenced.load());
+    // The generic rung on a fenced volume adds nothing new.
+    try testing.expect(!latch.noteFailure(.barrier));
 }
 
 test "power-cut harness: unsynced writes revert in reverse order; synced writes survive" {

@@ -332,6 +332,14 @@ pub const SqzIo = struct {
         return @fieldParentPtr("threaded", t);
     }
 
+    /// The executor behind an `Io` handle this instance issued (a module
+    /// holding only the `Io` — the backend — reaches `spawnMeta` /
+    /// `runBlocking` through it). Asserts the handle is ours.
+    pub fn fromIo(io_handle: Io) *SqzIo {
+        assert(io_handle.vtable == &vtable);
+        return ownerOf(io_handle.userdata);
+    }
+
     pub fn fuseLanes(self: *SqzIo) []*Lane {
         return self.lanes[0..self.fuse_count];
     }

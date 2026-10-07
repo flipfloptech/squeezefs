@@ -67,6 +67,26 @@ pub const Stats = struct {
 
 pub var stats: Stats = .{};
 
+/// Test seams (`SQUEEZEFS_TEST_*` class): the next N barriers through this
+/// module fail synthetically with `fail_errno`'s class before the pool
+/// sees them — the checkpointer's fence site (`syncDevice`) on a plain
+/// file.
+pub const TestSeams = struct {
+    fail_barriers: std.atomic.Value(u32) = .init(0),
+    /// `@backingInt` of a `linux.E`; 0 = EIO.
+    fail_errno: std.atomic.Value(u32) = .init(0),
+};
+
+pub var test_seams: TestSeams = .{};
+
+fn takeInjectedBarrierFailure() ?uring_fs.Error {
+    if (test_seams.fail_barriers.load(.acquire) == 0) return null;
+    _ = test_seams.fail_barriers.fetchSub(1, .acq_rel);
+    const raw = test_seams.fail_errno.load(.acquire);
+    if (raw == 0) return error.InputOutput;
+    return uring_fs.fromErrno(@fromBackingInt(@intCast(@as(u16, @intCast(raw)))));
+}
+
 /// The binding: the io pool, the device path, its registered posture.
 pub const DeviceLoader = struct {
     gpa: Allocator,
@@ -76,6 +96,14 @@ pub const DeviceLoader = struct {
     /// Region bases the sinks add (`ledger.slotOffset`, `PageWrite.offset`).
     ledger_base: u64,
     bitmap_base: u64,
+    /// The volume's FAILED latch once the lane exists: every device error
+    /// through this binding — a sink write, a node append or image, the
+    /// checkpointer's barrier — is classified for the FENCE rung here, the
+    /// ONE funnel of the checkpoint side (charter §5.7: a reservation
+    /// conflict at ANY barrier latches FAILED; the node/ledger/bitmap
+    /// writes are fence sites too, DMT:173). Null before the lane spawns
+    /// (the mount's reads) and in offline tools.
+    latch: ?*journal.FailureLatch = null,
 
     pub fn loader(self: *DeviceLoader) node_cache.NodeLoader {
         return .{ .ctx = self, .readExtent = readExtent, .appendBset = appendBset, .writeImage = writeImage };
@@ -96,6 +124,7 @@ pub const DeviceLoader = struct {
     fn ioFailed(self: *const DeviceLoader, what: []const u8, offset: u64, len: usize, e: uring_fs.Error) LoaderError {
         stats.io_errors.inc();
         log.err("metadata device {s}: {s} at offset {d} ({d} B) failed: {s} ({s})", .{ self.path, what, offset, len, @errorName(e), @tagName(uring_fs.classOf(e)) });
+        if (self.latch) |l| _ = l.classifyFence(e, what);
         return error.Io;
     }
 
@@ -136,6 +165,7 @@ pub const DeviceLoader = struct {
     // ---- the checkpoint sinks ----
 
     pub fn barrier(self: *DeviceLoader) error{Io}!void {
+        if (takeInjectedBarrierFailure()) |e| return self.ioFailed("fdatasync", 0, 0, e);
         self.pool.fdatasync(self.path) catch |e| return self.ioFailed("fdatasync", 0, 0, e);
         stats.barriers.inc();
     }

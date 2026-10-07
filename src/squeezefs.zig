@@ -39,7 +39,7 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
-    // @anchor:meta_guard_import
+    pub const guard = @import("meta/guard.zig");
     // @anchor:meta_routing_import
     pub const conveyor = @import("meta/conveyor.zig");
     pub const device_loader = if (builtin.os.tag == .linux) @import("meta/device_loader.zig") else struct {};
@@ -162,7 +162,7 @@ test {
     _ = thread_name;
     _ = model.explorer;
     // @anchor:data_kvmap_test
-    // @anchor:meta_guard_test
+    _ = meta.guard;
     // @anchor:meta_routing_test
     // @anchor:stats_test
     _ = data.layout;

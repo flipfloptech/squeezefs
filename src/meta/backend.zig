@@ -9,8 +9,9 @@
 //!
 //! 1. The D0 single-writer guard's layer A: `flock(LOCK_EX | LOCK_NB)` on a
 //!    DEDICATED daemon-lifetime fd (never a cache-owned one) — `EWOULDBLOCK`
-//!    refuses `Busy` loud before a byte is read. Layers B1/B2 (PR, the
-//!    writer claim) are later rungs.
+//!    refuses `Busy` loud before a byte is read, naming the claim holder
+//!    the probe reads. Layers B1/B2 (PR, the writer claim) are the GATE of
+//!    step 10 (`guard/gate.zig`).
 //! 2. The device: registered O_DIRECT (`uring_fs.registerMetaDevice`), the
 //!    io pool, the volume length.
 //! 3. Both superblock copies (DUR-5: a primary that classifies is
@@ -31,10 +32,16 @@
 //!    head's sector pad when a torn window left it mid-sector.
 //! 9. The journal lane (`sqz-jrnl<N>`: an `exec.Lane` whose ring is the
 //!    volume's journal ring) → the checkpointer bound to the device sinks →
-//!    the bring-up residue covered → the conveyor → the conveyor's PASS
-//!    FIBER on the journal lane (charter §5.2: both stages on ONE OS thread
-//!    per writable volume; decision 0002 row 6) → the checkpoint task's
-//!    thread.
+//!    the bring-up residue covered (the ring-recovery preflight: a parked
+//!    claim would have no drain source yet) → the conveyor → the conveyor's
+//!    PASS FIBER on the journal lane (charter §5.2: both stages on ONE OS
+//!    thread per writable volume; decision 0002 row 6).
+//! 10. THE GATE (charter §5.7 ordering law): the replayed `writer_claim`
+//!    classified → B1 arbitrated → our claim committed through the conveyor
+//!    and BARRIERED → the residue covered once more (the claim tx never sits
+//!    committed-but-uncovered) → the checkpoint task's thread → the
+//!    heartbeat. A refusal releases the PR and closes the flock fd before
+//!    returning. FUSE arms later, in `mount`.
 //!
 //! The backend's `io` must be `SqzIo`'s (asserted at `open`): the pass is a
 //! lane fiber and every wait it takes — the ring-admission park on the
@@ -97,6 +104,7 @@ const conveyor = @import("conveyor.zig");
 const format = @import("format.zig");
 const geometry = @import("geometry.zig");
 const device_loader = @import("device_loader.zig");
+const guard = @import("guard.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("backend is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -110,8 +118,12 @@ pub const Error = conveyor.Error;
 /// Why a mount refused (loud, typed; each name maps onto the ONE errno
 /// table through `openCoreError`).
 pub const OpenError = error{
-    /// Layer A: another writer holds the flock.
+    /// Layer A: another writer holds the flock; layer B2: a live (or, on a
+    /// non-PR substrate, a stale) foreign writer claim.
     Busy,
+    /// `SQUEEZEFS_HOSTNQN`/`SQUEEZEFS_HOSTID` configured one without the
+    /// other (pair-or-neither).
+    InvalidIdentity,
     /// Blank superblock: `squeezefs format` first.
     NotFormatted,
     /// A pre-v4 volume: reformat required.
@@ -138,6 +150,7 @@ pub fn openCoreError(e: OpenError) errors.Error {
         error.NotFormatted, error.LegacyFormat, error.UnsupportedFormat => error.UnsupportedVolume,
         error.DeviceRefused => error.DirectOpenRefused,
         error.Corrupt, error.Io, error.LaneSpawnFailed, error.ThreadSpawnFailed => error.InputOutput,
+        error.InvalidIdentity => error.InvalidArgument,
         error.OutOfMemory => error.OutOfMemory,
     };
 }
@@ -198,6 +211,8 @@ pub const OpenOptions = struct {
     /// Error logs the LANE thread is expected to emit in a test (the log
     /// seam is thread-local; `journal_lane.Options.test_error_logs`).
     test_error_logs: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    /// The D0 gate's mode, host identity and seams (`guard/gate.zig`).
+    guard: guard.gate.Options = .{},
 };
 
 pub const FormatOptions = struct {
@@ -303,6 +318,9 @@ pub const KvBackend = struct {
     replay: ReplayStats,
     /// The threshold drain's round-robin position over `trees` (task-owned).
     maintenance_cursor: usize = 0,
+    /// Layers B1/B2 (the claim, the PR posture, the heartbeat); null only
+    /// until the gate ran.
+    guard: ?*guard.gate.Guard = null,
     closed: bool = false,
 
     // ---- open ----
@@ -311,8 +329,10 @@ pub const KvBackend = struct {
         // The pass is a lane fiber: its waits must park the fiber (module doc).
         std.debug.assert(io.vtable == &exec.SqzIo.vtable);
         const t0 = clock.monotonicNs();
-        // 1. Layer A.
-        const guard_fd = try acquireWriterFlock(path);
+        // 1. Layer A (a test seam skips it: the "another host" simulation,
+        // where the claim alone must refuse).
+        const skip_flock = if (builtin.is_test) opts.guard.test_skip_flock else false;
+        const guard_fd = if (skip_flock) openGuardFd(path) catch return error.DeviceRefused else acquireWriterFlock(gpa, io, path, opts) catch |e| return e;
         errdefer _ = linux.close(guard_fd);
         // 2. The device.
         const mode = uring_fs.registerMetaDevice(gpa, opts.env, path) catch return error.DeviceRefused;
@@ -519,6 +539,8 @@ pub const KvBackend = struct {
             else => return error.LaneSpawnFailed,
         };
         errdefer be.lane.deinit();
+        // Every checkpoint-side device error now classifies for the fence.
+        be.dev.latch = &be.lane.latch;
         be.smo_journal = .{ .gpa = gpa, .layout = ring_layout, .geo = geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook } };
         be.smo_journal.retire_seq.store(mounted.seq + 1, .release);
         be.smo_ctx = smo.SmoContext.withJournal(&be.alloc, &be.smo_journal);
@@ -552,8 +574,10 @@ pub const KvBackend = struct {
         be.task = checkpoint_cycle.CheckpointTask.init(&be.cp, io);
         be.task.serial = &be.smo_lock;
         be.cache.installCheckpointKick(be.task.hook());
-        // The bring-up cover: the volume serves with an empty replay window
-        // and zero reclaimable residue (the D1.b wedge-crumb class).
+        // The ring-recovery preflight (the reference's `preclaim_ring_
+        // recovery`): the whole ring reclaimable before the claim tx is
+        // admitted — the checkpoint task does not exist yet, so a parked
+        // claim would have no drain source.
         be.cp.coverBringUpResidue() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
@@ -583,10 +607,30 @@ pub const KvBackend = struct {
         errdefer be.cv.deinit();
         try be.startPass();
         errdefer be.stopPass();
+
+        // 10. The gate: the claim committed through `be.cv` (the pass fiber
+        // is live) and barriered through the lane; then the cover once more
+        // so the claim tx never sits committed-but-uncovered; then the
+        // checkpoint thread; then the heartbeat. A gate refusal unwinds the
+        // `errdefer`s above and closes the flock fd LAST.
+        be.guard = try guard.gate.Guard.gate(gpa, io, be, opts.guard);
+        errdefer {
+            be.guard.?.deinit();
+            be.guard = null;
+        }
+        be.smo_lock.lockUncancelable(io);
+        const covered = be.cp.coverBringUpResidue();
+        be.smo_lock.unlock(io);
+        covered catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return error.Io,
+            else => return error.Corrupt,
+        };
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
+        try be.guard.?.startHeartbeat();
         be.replay.replay_ns = clock.monotonicNs() - t0;
         stats.mounts.inc();
-        log.info("meta volume {s}: mounted — ledger seq {d}, tail {d}, replayed {d} entries ({d} content records, {d} torn dropped{s}), next_ino {d}, {d} trees, {d}/{d} extents free, {s} cadence", .{ be.path, mounted.seq, mounted.journal_tail_seq, be.replay.entries, be.replay.content_records, be.replay.dropped_torn, if (clean_unmount) ", clean unmount" else "", be.ino.snapshot(), be.trees.len, be.alloc.freeExtents(), total_extents, if (flush_ms == 0) "strict" else "coalesced" });
+        log.info("meta volume {s}: mounted — ledger seq {d}, tail {d}, replayed {d} entries ({d} content records, {d} torn dropped{s}), next_ino {d}, {d} trees, {d}/{d} extents free, {s} cadence, guard {s}", .{ be.path, mounted.seq, mounted.journal_tail_seq, be.replay.entries, be.replay.content_records, be.replay.dropped_torn, if (clean_unmount) ", clean unmount" else "", be.ino.snapshot(), be.trees.len, be.alloc.freeExtents(), total_extents, if (flush_ms == 0) "strict" else "coalesced", be.guard.?.modeName() });
         return be;
     }
 
@@ -643,10 +687,9 @@ pub const KvBackend = struct {
         if (f.state.wake()) f.lane.enqueue(f);
     }
 
-    /// Layer A of the D0 guard: `flock(LOCK_EX | LOCK_NB)` on a dedicated
-    /// fd opened for the mount's life (a pool-cached fd would drop the lock
-    /// at LRU eviction).
-    fn acquireWriterFlock(path: []const u8) OpenError!linux.fd_t {
+    /// The dedicated guard fd (the flock's home for the mount's life; a
+    /// pool-cached fd would drop the lock at LRU eviction).
+    fn openGuardFd(path: []const u8) error{DeviceRefused}!linux.fd_t {
         var zbuf: [linux.PATH_MAX]u8 = undefined;
         const z = align_probe.pathZ(&zbuf, path) catch return error.DeviceRefused;
         const rc = linux.open(z, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
@@ -654,14 +697,39 @@ pub const KvBackend = struct {
             log.err("meta volume {s}: cannot open for the writer guard ({t})", .{ path, linux.errno(rc) });
             return error.DeviceRefused;
         }
-        const fd: linux.fd_t = @intCast(rc);
+        return @intCast(rc);
+    }
+
+    /// Layer A of the D0 guard: `flock(LOCK_EX | LOCK_NB)` on the dedicated
+    /// fd. `EWOULDBLOCK` refuses at once, naming the on-volume claim holder
+    /// when the probe can read one (B:17770-17774).
+    fn acquireWriterFlock(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions) OpenError!linux.fd_t {
+        const fd = try openGuardFd(path);
         errdefer _ = linux.close(fd);
         const op: i32 = std.posix.LOCK.EX | std.posix.LOCK.NB;
         switch (linux.errno(linux.flock(fd, op))) {
             .SUCCESS => return fd,
             .AGAIN => {
                 stats.guard_busy_refusals.inc();
-                log.err("meta volume {s}: another writer holds the single-writer guard (flock) — refusing the mount (EBUSY)", .{path});
+                var buf: [512]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
+                // Best-effort: the holder's claim through the probe (a
+                // refusal path — a pool of its own when the mount owns none).
+                const probe_pool: ?*uring_fs.Pool = opts.pool orelse (uring_fs.Pool.init(gpa, uring_fs.Config.resolve(opts.env, derive.Facts.probe())) catch null);
+                defer if (opts.pool == null) if (probe_pool) |p| p.deinit();
+                if (probe_pool) |pool| {
+                    if (guard.gate.probeClaim(gpa, io, opts.env, pool, path)) |raw| {
+                        defer if (raw) |r| gpa.free(r);
+                        if (raw) |r| {
+                            if (guard.claim.Claim.decode(r)) |c| {
+                                w.writeAll(" (claim: ") catch {};
+                                c.writeSummary(&w, clock.realtimeCoarseNs()) catch {};
+                                w.writeAll(")") catch {};
+                            } else |_| w.writeAll(" (unparseable claim value)") catch {};
+                        }
+                    } else |_| {}
+                }
+                log.err("meta volume {s}: another squeezefs process holds the writer lock{s} — concurrent mounts of one metadata volume are refused (single-writer guard, EBUSY)", .{ path, w.buffered() });
                 return error.Busy;
             },
             else => |e| {
@@ -1025,6 +1093,13 @@ pub const KvBackend = struct {
         const gpa = be.gpa;
         if (!be.closed) {
             be.closed = true;
+            // The guard FIRST (charter §5.7 clean unmount): the heartbeat
+            // stopped, the claim deleted exactly once while the write gate
+            // is open; the final checkpoint below makes the deletion durable.
+            if (be.guard) |g| {
+                g.stopHeartbeat();
+                g.deleteClaim();
+            }
             be.cv.close();
             // Nothing queued, no leader, no window in flight: the registry
             // holds no user reservation past this point.
@@ -1043,8 +1118,15 @@ pub const KvBackend = struct {
             // durable.
             be.lane.shutdown();
             be.dev.barrier() catch {};
+            // The reservation released after the final barrier; the flock
+            // fd closed last of all (below).
+            if (be.guard) |g| g.releasePr();
             stats.clean_unmounts.inc();
-            log.info("meta volume {s}: clean unmount (checkpoint seq {d}, tail {d}, head {d})", .{ be.path, be.cp.checkpointSeq(), be.cp.lastLedgerTail(), be.core.headPos() });
+            log.info("meta volume {s}: clean unmount (checkpoint seq {d}, tail {d}, head {d}, {s})", .{ be.path, be.cp.checkpointSeq(), be.cp.lastLedgerTail(), be.core.headPos(), @tagName(be.lane.latch.verdict()) });
+        }
+        if (be.guard) |g| {
+            g.deinit();
+            be.guard = null;
         }
         be.cv.deinit();
         be.lane.deinit();
@@ -1229,7 +1311,7 @@ test "format (device path) → open → N creates (singles + a group of 8) → l
         const cs = be.conveyorStats();
         try testing.expectEqual(cs.lane_handoffs.load(), be.laneSnapshot().lane_writes);
         try testing.expectEqual(cs.leader_passes.load(), cs.group_size.total());
-        try testing.expectEqual(@as(u64, 24), cs.acks.load());
+        try testing.expectEqual(24 + guard.gate.OPEN_COMMITS, cs.acks.load());
         try testing.expectEqual(@as(u64, 0), cs.refusals.load());
         try testing.expectEqual(@as(u64, 0), cs.windows_inflight.load());
         try testing.expectEqual(@as(u64, 0), cs.queued.load());
@@ -1287,11 +1369,12 @@ test "strict vs coalesced: a strict ack follows one barrier per group; a coalesc
     {
         const be = try c.open();
         defer be.close();
+        // The gate's claim barrier is the one coalesced barrier so far.
         _ = try commitCreate(be, "a");
         try testing.expectEqual(@as(u64, 0), be.laneSnapshot().barriers_strict);
-        try testing.expectEqual(@as(u64, 0), be.laneSnapshot().barriers_coalesced);
+        try testing.expectEqual(guard.gate.OPEN_BARRIERS, be.laneSnapshot().barriers_coalesced);
         try be.fsync();
-        try testing.expectEqual(@as(u64, 1), be.laneSnapshot().barriers_coalesced);
+        try testing.expectEqual(guard.gate.OPEN_BARRIERS + 1, be.laneSnapshot().barriers_coalesced);
     }
 }
 
@@ -1320,7 +1403,7 @@ test "DUR-3 on the lane's barriers: a cadence cycle's record (no immediate barri
     // the ring reclamation, the allocator's coverage clock and the cache's
     // elision tail all move on.
     try be.fsync();
-    try testing.expectEqual(@as(u64, 1), be.laneSnapshot().barriers_coalesced);
+    try testing.expectEqual(guard.gate.OPEN_BARRIERS + 1, be.laneSnapshot().barriers_coalesced);
     try testing.expectEqual(syncs0, checkpoint.stats.meta_device_syncs.load());
     try testing.expectEqual(tail, be.core.reusableUpto());
     try testing.expectEqual(tail, be.cache.durableTail());
@@ -1579,7 +1662,7 @@ test "4-thread commit storm with concurrent checkpoints, then reopen: every ack 
         for (handles) |h| h.join();
         for (acked) |lane_acks| for (lane_acks) |ino| try testing.expect(try present(be, ino));
         const cs = be.conveyorStats();
-        try testing.expectEqual(@as(u64, threads * per_thread), cs.acks.load());
+        try testing.expectEqual(threads * per_thread + guard.gate.OPEN_COMMITS, cs.acks.load());
         try testing.expectEqual(@as(u64, 0), cs.refusals.load());
         try testing.expectEqual(cs.drained_txs.load(), cs.acks.load() + cs.refusals.load());
         try testing.expectEqual(cs.leader_passes.load(), cs.group_size.total());
@@ -1627,7 +1710,7 @@ test "ONE thread per volume: the pass runs on sqz-jrnl<N>; a 4-thread storm of s
     const cs = be.conveyorStats();
     const snap = be.laneSnapshot();
     const total: u64 = threads * per_thread;
-    try testing.expectEqual(total, cs.acks.load());
+    try testing.expectEqual(total + guard.gate.OPEN_COMMITS, cs.acks.load());
     try testing.expectEqual(@as(u64, 0), cs.refusals.load());
     // lane_writes ≡ passes ≡ handoffs: every pass handed off exactly one window.
     try testing.expectEqual(cs.leader_passes.load(), cs.lane_handoffs.load());
@@ -1701,7 +1784,7 @@ test "the admission park on the device: the smallest ring fills under a serial c
     // Every park resumed on the barrier's own wake, never the backstop tick.
     try testing.expectEqual(@as(u64, 0), cs.park_tick_rescues.load());
     try testing.expect(checkpoint.stats.meta_kv_checkpoint_park_cycles.load() > park_cycles0);
-    try testing.expectEqual(acked.items.len, cs.acks.load());
+    try testing.expectEqual(acked.items.len + guard.gate.OPEN_COMMITS, cs.acks.load());
     try testing.expectEqual(@as(u64, 0), cs.refusals.load());
     try testing.expect(!be.isFailed());
     std.debug.print("\nadmission park: {d} serial commits on a {d}-page ring (grain {d}) — {d} stalls, {d} park-kicked cycles\n", .{ acked.items.len, be.geo.pages, be.geo.grain, cs.full_stalls.load(), checkpoint.stats.meta_kv_checkpoint_park_cycles.load() - park_cycles0 });

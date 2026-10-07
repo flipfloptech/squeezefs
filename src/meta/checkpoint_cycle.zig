@@ -539,7 +539,13 @@ pub const Checkpointer = struct {
 
     /// The checkpointer's own device barrier through the sink: a DUR-3
     /// ticket around it; a failure counts toward the FAILED lattice (three
-    /// in a row latch) and covers nothing.
+    /// in a row latch) and covers nothing. The FENCE rung (a
+    /// reservation-conflict errno at ANY barrier latches FAILED at once,
+    /// charter §5.7) is classified by the device sink's typed outcome
+    /// BEFORE it narrows to `IoError` (`device_loader.DeviceLoader.latch`,
+    /// the one funnel of every checkpoint-side write and barrier); a
+    /// fenced latch reads FAILED here already, so the generic count below
+    /// never undoes it.
     pub fn syncDevice(self: *Checkpointer) IoError!void {
         ckpt.stats.meta_device_syncs.inc();
         const started_at = self.barrierStarted();

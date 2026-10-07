@@ -24,6 +24,7 @@ const linux = std.os.linux;
 const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
 const slot = @import("slot.zig");
+const zc = @import("zc.zig");
 const geometry = @import("../geometry.zig");
 const errors = @import("../../core/errors.zig");
 const counters = @import("../../core/counters.zig");
@@ -57,6 +58,10 @@ pub const Tx = struct {
     submit_fd_body: *const fn (ctx: *anyopaque, h: Handle, r: codec.Reply, fd: linux.fd_t, off: u64) void,
     submit_prefilled: *const fn (ctx: *anyopaque, h: Handle, n: u32) void,
     fail: *const fn (ctx: *anyopaque, h: Handle, errno: linux.E) void,
+    /// The RETAIN commit (zero-copy retention): the reply lands, the request
+    /// ends, the slot's pages stay registered until `release_retained`.
+    submit_retain: *const fn (ctx: *anyopaque, h: Handle, r: codec.Reply) void,
+    release_retained: *const fn (ctx: *anyopaque, h: Handle) void,
 };
 
 /// The reply obligation by value.
@@ -89,6 +94,23 @@ pub const Handle = struct {
         self.tx.fail(self.tx.ctx, self, errno);
     }
 
+    /// The ACK-early reply (zero-copy retention, charter §3 "Payload
+    /// retention"): the reply lands and write(2) returns NOW while the held
+    /// WRITE's pages stay registered for a `WRITE_FIXED(device ← slot)` the
+    /// handler finishes afterwards, then `releaseRetained`. Legal only for a
+    /// `.page_cache` lease (the stability law: a `.direct_gup` payload must be
+    /// extracted first); the worker refuses the rest and commits plain.
+    pub fn replyRetain(self: Handle, r: codec.Reply) void {
+        self.tx.submit_retain(self.tx.ctx, self, r);
+    }
+
+    /// Ends a retention: `RELEASE_PAYLOAD` for this slot. Never before the
+    /// `replyRetain` it pairs with (the worker orders a racing release after
+    /// the RETAIN commit in the same batch).
+    pub fn releaseRetained(self: Handle) void {
+        self.tx.release_retained(self.tx.ctx, self);
+    }
+
     /// A typed error through the ONE errno table (`core/errors.zig`).
     pub fn failWith(self: Handle, err: errors.Error) void {
         self.fail(errors.toErrno(err));
@@ -104,7 +126,37 @@ pub const InitCaps = struct {
     /// The executor handle handlers may park on (`std.Io` futex ops park
     /// the fiber, never the lane thread).
     io: std.Io,
+    /// The lattice rung this session runs (decided ONCE from the probes).
+    buffer_mode: geometry.BufferMode = .user_ents,
+    /// `SQUEEZEFS_READ_ZC_SERVE` ∧ a zero-copy session: build the fill pool
+    /// as ONE MAP_SHARED memfd slab and reply warm serves with `replyFdBody`
+    /// (the fd-source leg, zero daemon passes).
+    read_zc_serve: bool = false,
+    /// Payload retention negotiated: `replyRetain` is available.
+    retention: bool = false,
 };
+
+/// The W1 hold gate's input: the WRITE's shape and class, decided ON THE
+/// WORKER THREAD at delivery. The gate is a pure predicate over this and
+/// the filesystem's published per-inode snapshot — never a cache lookup, a
+/// lock or an await (0002 ledger: the reference probed its metadata cache
+/// on the queue worker). The transport already proved `zc.w1Shape` and
+/// `holdCandidate`; the filesystem adds what only it knows (non-extending,
+/// striped, undecorated whole-block map, passthrough).
+pub const HoldHint = struct {
+    ino: u64,
+    offset: u64,
+    len: u32,
+    class: zc.PayloadClass,
+};
+
+/// The direct device leg of a paged READ (charter §4 "Buffer-mode
+/// lattice"): the worker bridges `READ_FIXED(fd @ off → slot)` straight
+/// into the app's pages and commits header-only `payload_sz = len`.
+/// Eligibility is the filesystem's (cold ∧ passthrough ∧ 4 KiB-aligned ∧
+/// single block ∧ device resolvable); `len` is the FULL reply length (a
+/// short leg is a refusal — the bounce leg then serves the whole body).
+pub const DirectLeg = struct { fd: linux.fd_t, off: u64, len: u32 };
 
 pub const Filesystem = struct {
     ctx: *anyopaque,
@@ -130,6 +182,17 @@ pub const Filesystem = struct {
         /// lifecycle layer owns the open-count law (`open_count_stranded`:
         /// a final FORGET with open handles = a lost RELEASE) behind it.
         forget: *const fn (ctx: *anyopaque, ino: u64, nlookup: u64) void,
+        /// The W1 hold gate (zero-copy), ON THE WORKER THREAD at a paged
+        /// WRITE's delivery: a PURE predicate over the hint and a published
+        /// snapshot (no lookup, no lock, no await). True ⇒ the payload is
+        /// HELD in the slot (`PayloadLease.held`); false ⇒ extracted at
+        /// delivery. The transport proved the shape already.
+        write_hold_eligible: *const fn (ctx: *anyopaque, hint: HoldHint) bool,
+        /// The direct device leg of a paged READ, ON THE WORKER THREAD after
+        /// `probe_read` declined: `{fd, off, len}` when the whole reply can
+        /// DMA from a device fd into the app's pages, else null (the bounce
+        /// leg or the lane).
+        direct_leg: *const fn (ctx: *anyopaque, req: Request) ?DirectLeg,
     };
 
     pub fn init(self: Filesystem, caps: InitCaps) void {
@@ -146,6 +209,12 @@ pub const Filesystem = struct {
     }
     pub fn forget(self: Filesystem, ino: u64, nlookup: u64) void {
         self.vtable.forget(self.ctx, ino, nlookup);
+    }
+    pub fn writeHoldEligible(self: Filesystem, hint: HoldHint) bool {
+        return self.vtable.write_hold_eligible(self.ctx, hint);
+    }
+    pub fn directLeg(self: Filesystem, req: Request) ?DirectLeg {
+        return self.vtable.direct_leg(self.ctx, req);
     }
 };
 
@@ -175,9 +244,22 @@ const EchoFsImpl = struct {
 
     /// Every READ declines the probe (arm (a)) and takes the lane (arm (c)).
     probe_declines: bool = false,
+    /// The probe declines the FIRST poll of each READ and serves the next:
+    /// the fused frame's re-poll (arm (b)) is what serves it.
+    probe_declines_first: bool = false,
     /// A WRITE handler replies BEFORE releasing its lease and waits until
     /// the worker parked the commit (the gate's Parked arm, observable).
     hold_lease_across_reply: bool = false,
+    /// The W1 gate says yes for `/scratch` (a test filesystem that declares
+    /// eligibility; the transport proved the shape already).
+    hold_eligible: bool = false,
+    /// A held `.page_cache` WRITE is answered ACK-early (`replyRetain`),
+    /// extracted after `retain_gate` opens, then released.
+    retain_writes: bool = false,
+    /// With `retain_writes`: ask to retain even a `.direct_gup` payload
+    /// (AFTER extracting it — the snapshot-first law keeps the bytes safe)
+    /// so the worker's class refusal is observable.
+    retain_ignore_class: bool = false,
     io: ?std.Io = null,
     caps: ?InitCaps = null,
     inited: counters.Gauge = .{},
@@ -186,17 +268,40 @@ const EchoFsImpl = struct {
     /// fibers through the `Io` futex, never the lane thread.
     park_gate: std.Io.Event = .unset,
     parked_readers: std.atomic.Value(u32) = .init(0),
+    /// A retaining WRITE handler waits here between its ACK-early reply and
+    /// its extraction + release.
+    retain_gate: std.Io.Event = .unset,
     /// nlookup ledger: entry replies +1, FORGET −n.
     lookups: [8]std.atomic.Value(u64) = @splat(.init(0)),
     forgets: std.atomic.Value(u64) = .init(0),
     forget_nlookup: std.atomic.Value(u64) = .init(0),
     dispatches: std.atomic.Value(u64) = .init(0),
     probes_served: std.atomic.Value(u64) = .init(0),
+    probes_declined: std.atomic.Value(u64) = .init(0),
+    /// Daemon copy passes over READ bodies (`readInto`): the side-by-side
+    /// "daemon copies per READ" instrument.
+    read_copies: std.atomic.Value(u64) = .init(0),
+    fd_body_replies: std.atomic.Value(u64) = .init(0),
     writes_seen: std.atomic.Value(u64) = .init(0),
     write_bytes: std.atomic.Value(u64) = .init(0),
+    held_writes: std.atomic.Value(u64) = .init(0),
+    lazy_extracts: std.atomic.Value(u64) = .init(0),
+    retained_replies: std.atomic.Value(u64) = .init(0),
+    release_calls: std.atomic.Value(u64) = .init(0),
+    extract_failures: std.atomic.Value(u64) = .init(0),
+    /// The stability class of the last WRITE (0 page_cache, 1 direct_gup).
+    last_write_class: std.atomic.Value(u8) = .init(0),
     lease_waits_parked: std.atomic.Value(u64) = .init(0),
     scratch: [scratch_cap]u8 = @splat(0),
     scratch_len: std.atomic.Value(u64) = .init(0),
+    /// `/scratch`'s mtime (seconds), honoured by SETATTR: the TIME_LIMITS
+    /// clamp is observable here.
+    scratch_mtime: std.atomic.Value(i64) = .init(1_700_000_000),
+    /// The fill pool (`SQUEEZEFS_READ_ZC_SERVE` on a zc session): ONE
+    /// MAP_SHARED memfd slab holding `/big`, so a READ replies `fd_body`;
+    /// the mapping stays for the body views.
+    pool_fd: linux.fd_t = -1,
+    pool_map: []u8 = &.{},
 
     pub const vtable: Filesystem.VTable = .{
         .init = fsInit,
@@ -204,6 +309,8 @@ const EchoFsImpl = struct {
         .dispatch = fsDispatch,
         .probe_read = fsProbeRead,
         .forget = fsForget,
+        .write_hold_eligible = fsWriteHoldEligible,
+        .direct_leg = fsDirectLeg,
     };
 
     pub fn filesystem(self: *Self) Filesystem {
@@ -219,10 +326,51 @@ const EchoFsImpl = struct {
         self.caps = caps;
         self.io = caps.io;
         self.inited.add(1);
+        if (caps.read_zc_serve and builtin.os.tag == .linux) self.buildPool();
+    }
+
+    /// The fill-pool slab: `memfd_create` + `ftruncate(big_len)` + a
+    /// MAP_SHARED fill of the pattern; the fd is the fd-source leg's.
+    fn buildPool(self: *Self) void {
+        const rc = linux.memfd_create("sqz-echo-fill-pool", linux.MFD.CLOEXEC);
+        if (linux.errno(rc) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(rc);
+        if (linux.errno(linux.ftruncate(fd, big_len)) != .SUCCESS) {
+            _ = linux.close(fd);
+            return;
+        }
+        const map = linux.mmap(null, big_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+        if (linux.errno(map) != .SUCCESS) {
+            _ = linux.close(fd);
+            return;
+        }
+        const bytes: [*]u8 = @ptrFromInt(map);
+        for (bytes[0..big_len], 0..) |*b, i| b.* = bigByte(i);
+        self.pool_map = bytes[0..big_len];
+        self.pool_fd = fd;
     }
 
     fn fsDestroy(ctx: *anyopaque) void {
         of(ctx).destroyed.add(1);
+    }
+
+    /// After the session is gone (no handler can still view the pool).
+    pub fn deinit(self: *Self) void {
+        if (self.pool_fd >= 0) {
+            _ = linux.munmap(@alignCast(self.pool_map.ptr), self.pool_map.len);
+            _ = linux.close(self.pool_fd);
+            self.pool_fd = -1;
+            self.pool_map = &.{};
+        }
+    }
+
+    fn fsWriteHoldEligible(ctx: *anyopaque, hint: HoldHint) bool {
+        const self = of(ctx);
+        return self.hold_eligible and hint.ino == ino_scratch;
+    }
+
+    fn fsDirectLeg(_: *anyopaque, _: Request) ?DirectLeg {
+        return null;
     }
 
     fn fsForget(ctx: *anyopaque, ino: u64, nlookup: u64) void {
@@ -254,12 +402,13 @@ const EchoFsImpl = struct {
         const is_dir = ino == ino_root;
         const len = if (is_dir) 0 else (self.fileLen(ino) orelse return null);
         const mode: u32 = if (is_dir) 0o40755 else if (ino == ino_scratch) 0o100644 else 0o100444;
+        const mtime: i64 = if (ino == ino_scratch) self.scratch_mtime.load(.acquire) else 1_700_000_000;
         return .{
             .ino = ino,
             .size = len,
             .blocks = (len + 511) / 512,
             .atime = 1_700_000_000,
-            .mtime = 1_700_000_000,
+            .mtime = @bitCast(mtime),
             .ctime = 1_700_000_000,
             .atimensec = 0,
             .mtimensec = 0,
@@ -285,11 +434,13 @@ const EchoFsImpl = struct {
         return .{ .nodeid = ino, .entry_ttl_ns = std.time.ns_per_s, .attr_ttl_ns = std.time.ns_per_s, .attr = attr };
     }
 
-    /// The bytes of `ino` at `[off, off + size)` served into `dst`.
-    fn readInto(self: *const Self, ino: u64, off: u64, size: u32, dst: []u8) ?usize {
+    /// The bytes of `ino` at `[off, off + size)` served into `dst`: one
+    /// daemon copy pass.
+    fn readInto(self: *Self, ino: u64, off: u64, size: u32, dst: []u8) ?usize {
         const len = self.fileLen(ino) orelse return null;
         if (off >= len) return 0;
         const n: usize = @intCast(@min(@as(u64, size), @min(len - off, dst.len)));
+        if (n > 0) _ = self.read_copies.fetchAdd(1, .monotonic);
         switch (ino) {
             ino_hello, ino_park => @memcpy(dst[0..n], hello_text[@intCast(off)..][0..n]),
             ino_big => for (dst[0..n], 0..) |*b, i| {
@@ -307,10 +458,66 @@ const EchoFsImpl = struct {
         const ino = req.nodeid();
         // `/park` always declines: its handler parks on the lane.
         if (ino == ino_park) return null;
+        // `/big` on an fd-source session is the lane's `replyFdBody`.
+        if (ino == ino_big and self.pool_fd >= 0) return null;
+        if (self.probe_declines_first) {
+            // Odd polls decline, even polls serve: the fused re-poll serves.
+            const k = self.probes_declined.fetchAdd(1, .monotonic);
+            if (k % 2 == 0) return null;
+        }
         const in = req.op.read;
         const n = self.readInto(ino, in.offset, in.size, window) orelse return null;
         _ = self.probes_served.fetchAdd(1, .monotonic);
         return codec.replyData(req.unique(), window[0..n]);
+    }
+
+    /// A WRITE whose payload is HELD in the zc slot (W1 eligible): the
+    /// retain arm (ACK-early, extract after the gate, release) or the lazy
+    /// extraction arm. The lease is released before any reply.
+    fn heldWrite(self: *Self, h: Handle, u: u64, w: codec.Write, l: slot.PayloadLease, out: *codec.OutBuf) void {
+        _ = self.held_writes.fetchAdd(1, .monotonic);
+        const io = self.io.?;
+        const dst = self.scratch[@intCast(w.in.offset)..][0..w.in.size];
+        const end = w.in.offset + w.in.size;
+        if (self.retain_writes and (l.class == .page_cache or self.retain_ignore_class)) {
+            if (l.class == .direct_gup) {
+                // The snapshot-first law: a GUP payload is owned before any ACK.
+                _ = l.extract(io, dst) catch {
+                    _ = self.extract_failures.fetchAdd(1, .monotonic);
+                    l.release();
+                    return h.fail(.IO);
+                };
+                _ = self.lazy_extracts.fetchAdd(1, .monotonic);
+                _ = self.scratch_len.fetchMax(end, .acq_rel);
+                _ = self.write_bytes.fetchAdd(w.in.size, .monotonic);
+            }
+            l.release();
+            h.replyRetain(codec.replyWrite(out, u, w.in.size));
+            _ = self.retained_replies.fetchAdd(1, .monotonic);
+            self.retain_gate.wait(io) catch {};
+            if (l.class == .page_cache) {
+                // The pages stay registered under retention: extract after the ACK.
+                _ = l.extract(io, dst) catch {
+                    _ = self.extract_failures.fetchAdd(1, .monotonic);
+                };
+                _ = self.lazy_extracts.fetchAdd(1, .monotonic);
+                _ = self.scratch_len.fetchMax(end, .acq_rel);
+                _ = self.write_bytes.fetchAdd(w.in.size, .monotonic);
+            }
+            h.releaseRetained();
+            _ = self.release_calls.fetchAdd(1, .monotonic);
+            return;
+        }
+        _ = l.extract(io, dst) catch {
+            _ = self.extract_failures.fetchAdd(1, .monotonic);
+            l.release();
+            return h.fail(.IO);
+        };
+        _ = self.lazy_extracts.fetchAdd(1, .monotonic);
+        l.release();
+        _ = self.scratch_len.fetchMax(end, .acq_rel);
+        _ = self.write_bytes.fetchAdd(w.in.size, .monotonic);
+        h.reply(codec.replyWrite(out, u, w.in.size));
     }
 
     fn fsDispatch(ctx: *anyopaque, req: Request, h: Handle, lease: ?slot.PayloadLease) void {
@@ -342,6 +549,14 @@ const EchoFsImpl = struct {
                     self.park_gate.wait(self.io.?) catch {};
                     _ = self.parked_readers.fetchSub(1, .monotonic);
                 }
+                // The fd-source leg: `/big` from the fill pool, zero copies;
+                // the body view into the pool mapping is the keepalive and
+                // the restage fallback.
+                if (ino == ino_big and self.pool_fd >= 0 and h.slot == .ring) {
+                    const n: usize = @intCast(@min(@as(u64, in.size), big_len -| in.offset));
+                    _ = self.fd_body_replies.fetchAdd(1, .monotonic);
+                    return h.replyFdBody(codec.replyData(u, self.pool_map[@intCast(in.offset)..][0..n]), self.pool_fd, in.offset);
+                }
                 // Serve into the window when there is one (the ring);
                 // static bytes on the classical venue.
                 if (h.window.len > 0) {
@@ -356,10 +571,18 @@ const EchoFsImpl = struct {
             .write => |w| {
                 _ = self.writes_seen.fetchAdd(1, .monotonic);
                 const l = lease orelse return h.fail(.INVAL);
-                defer l.release();
-                if (ino != ino_scratch) return h.fail(.ROFS);
+                self.last_write_class.store(@backingInt(l.class), .release);
+                if (ino != ino_scratch) {
+                    l.release();
+                    return h.fail(.ROFS);
+                }
                 const end = w.in.offset + w.in.size;
-                if (end > scratch_cap) return h.fail(.FBIG);
+                if (end > scratch_cap) {
+                    l.release();
+                    return h.fail(.FBIG);
+                }
+                if (l.held) return self.heldWrite(h, u, w, l, &out);
+                defer l.release();
                 @memcpy(self.scratch[@intCast(w.in.offset)..][0..w.in.size], w.data);
                 _ = self.scratch_len.fetchMax(end, .acq_rel);
                 _ = self.write_bytes.fetchAdd(w.in.size, .monotonic);
@@ -404,7 +627,10 @@ const EchoFsImpl = struct {
             },
             .statfs => h.reply(codec.replyStatfs(&out, u, .{ .blocks = 1024, .bfree = 512, .bavail = 512, .files = 8, .ffree = 2, .bsize = 4096, .namelen = 255, .frsize = 4096 })),
             .access => h.reply(codec.replyOk(u)),
-            .setattr => {
+            .setattr => |sa| {
+                // `/scratch` honours an explicit mtime: what the VFS clamped
+                // to our advertised TIME_LIMITS range arrives here.
+                if (ino == ino_scratch and sa.valid & abi.FATTR_MTIME != 0) self.scratch_mtime.store(@bitCast(sa.mtime), .release);
                 const attr = self.attrOf(ino) orelse return h.fail(.NOENT);
                 h.reply(codec.replyAttr(&out, u, .{ .attr_ttl_ns = std.time.ns_per_s, .attr = attr }));
             },
@@ -417,6 +643,11 @@ const EchoFsImpl = struct {
     /// Release every parked `/park` reader.
     pub fn releaseParked(self: *Self) void {
         self.park_gate.set(self.io.?);
+    }
+
+    /// Let every retaining WRITE handler extract and release.
+    pub fn openRetainGate(self: *Self) void {
+        self.retain_gate.set(self.io.?);
     }
 };
 
@@ -431,6 +662,8 @@ const RecordingTx = struct {
     fails: u32 = 0,
     prefilled: u32 = 0,
     fd_bodies: u32 = 0,
+    retains: u32 = 0,
+    releases: u32 = 0,
     last_errno: linux.E = .SUCCESS,
     last_len: u32 = 0,
     last_body: []const u8 = &.{},
@@ -455,8 +688,17 @@ const RecordingTx = struct {
         self.fails += 1;
         self.last_errno = errno;
     }
+    fn submitRetain(ctx: *anyopaque, _: Handle, r: codec.Reply) void {
+        const self: *RecordingTx = @ptrCast(@alignCast(ctx));
+        self.retains += 1;
+        self.last_len = r.header.len;
+    }
+    fn releaseRetained(ctx: *anyopaque, _: Handle) void {
+        const self: *RecordingTx = @ptrCast(@alignCast(ctx));
+        self.releases += 1;
+    }
     fn tx(self: *RecordingTx) Tx {
-        return .{ .ctx = self, .submit = submit, .submit_fd_body = submitFdBody, .submit_prefilled = submitPrefilled, .fail = fail };
+        return .{ .ctx = self, .submit = submit, .submit_fd_body = submitFdBody, .submit_prefilled = submitPrefilled, .fail = fail, .submit_retain = submitRetain, .release_retained = releaseRetained };
     }
 };
 
@@ -471,11 +713,15 @@ test "the handle routes each reply kind through the Tx face; failWith maps a typ
     h.reply(codec.replyOk(8));
     h.replyPrefilled(77);
     h.replyFdBody(codec.replyData(8, "x"), 3, 0);
+    h.replyRetain(codec.replyOk(8));
+    h.releaseRetained();
     h.fail(.NOENT);
     h.failWith(error.QueueFull);
     try testing.expectEqual(@as(u32, 1), rec.replies);
     try testing.expectEqual(@as(u32, 1), rec.prefilled);
     try testing.expectEqual(@as(u32, 1), rec.fd_bodies);
+    try testing.expectEqual(@as(u32, 1), rec.retains);
+    try testing.expectEqual(@as(u32, 1), rec.releases);
     try testing.expectEqual(@as(u32, 2), rec.fails);
     try testing.expectEqual(linux.E.AGAIN, rec.last_errno);
     h.failWith(error.RingFailed);
@@ -545,4 +791,55 @@ test "EchoFs: a WRITE to scratch consumes the lease exactly once and lands the b
     fs.filesystem().dispatch(requestOf(.{ .write = .{ .in = win, .data = data } }, 22, EchoFs.ino_hello), .{ .tx = &t, .slot = .classical, .unique = 22, .window = &.{} }, lease2);
     try testing.expectEqual(linux.E.ROFS, rec.last_errno);
     try testing.expect(!state.leased());
+}
+
+test "EchoFs: the hold gate is a pure predicate (scratch only, and only when declared); the direct leg is null; a HELD write is extracted lazily through its face and lands; SETATTR stores an explicit mtime" {
+    var fs: EchoFs = .{};
+    fs.io = testing.io;
+    const f = fs.filesystem();
+    const hint: HoldHint = .{ .ino = EchoFs.ino_scratch, .offset = 0, .len = 4096, .class = .page_cache };
+    try testing.expect(!f.writeHoldEligible(hint));
+    fs.hold_eligible = true;
+    try testing.expect(f.writeHoldEligible(hint));
+    try testing.expect(!f.writeHoldEligible(.{ .ino = EchoFs.ino_hello, .offset = 0, .len = 4096, .class = .page_cache }));
+    try testing.expect(f.directLeg(requestOf(.{ .read = .{ .fh = 3, .offset = 0, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 } }, 1, EchoFs.ino_big)) == null);
+    // A held write: the face answers the slot bytes; the handler extracts
+    // lazily, releases, replies once.
+    const Face = struct {
+        calls: u32 = 0,
+        bytes: [4096]u8 = @splat(0x5C),
+        fn extract(ctx: ?*anyopaque, _: u32, _: std.Io) slot.ExtractError![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            return &self.bytes;
+        }
+    };
+    var face: Face = .{};
+    var rec: RecordingTx = .{};
+    const t = rec.tx();
+    var state: slot.LeaseState = .{};
+    const NoWake = struct {
+        fn wake(_: ?*anyopaque) bool {
+            return false;
+        }
+    };
+    const waker: slot.Waker = .{ .ctx = null, .wake = NoWake.wake };
+    const win: abi.fuse_write_in = .{ .fh = 5, .offset = 4096, .size = 4096, .write_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
+    const held = slot.PayloadLease.acquireHeld(&state, waker, 4096, .page_cache, 0, 1, 1, .{ .ctx = &face, .extract = Face.extract });
+    f.dispatch(requestOf(.{ .write = .{ .in = win, .data = &.{} } }, 30, EchoFs.ino_scratch), .{ .tx = &t, .slot = .{ .ring = .{ .qid = 0, .ent_idx = 1, .commit_id = 30 } }, .unique = 30, .window = &.{} }, held);
+    try testing.expectEqual(@as(u32, 1), rec.replies);
+    try testing.expectEqual(@as(u32, 1), face.calls);
+    try testing.expect(!state.leased());
+    try testing.expectEqual(@as(u64, 1), fs.held_writes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), fs.lazy_extracts.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0x5C), fs.scratch[4096]);
+    try testing.expectEqual(@as(u64, 8192), fs.scratch_len.load(.acquire));
+    // SETATTR with FATTR_MTIME lands in the attr; without it nothing moves.
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_MTIME;
+    sa.mtime = 1_800_000_000;
+    f.dispatch(requestOf(.{ .setattr = sa }, 32, EchoFs.ino_scratch), .{ .tx = &t, .slot = .classical, .unique = 32, .window = &.{} }, null);
+    try testing.expectEqual(@as(i64, 1_800_000_000), fs.scratch_mtime.load(.acquire));
+    try testing.expectEqual(@as(u64, 1_800_000_000), fs.attrOf(EchoFs.ino_scratch).?.mtime);
+    try testing.expectEqual(@as(u64, 1_700_000_000), fs.attrOf(EchoFs.ino_hello).?.mtime);
 }

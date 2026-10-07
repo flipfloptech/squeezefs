@@ -57,6 +57,14 @@ pub const Kind = enum(u8) {
     prefilled,
     /// `fail_ent`: a header-only `-errno`.
     fail,
+    /// Like `reply`, committed with `FUSE_URING_COMMIT_RETAIN`: the request
+    /// ends (write(2) returns) while the slot's pages stay registered until
+    /// a `release` — the ACK-early accelerator. Refused at the worker (and
+    /// committed plain) unless the slot holds a `.page_cache` WRITE on a
+    /// retention-armed queue.
+    reply_retain,
+    /// `RELEASE_PAYLOAD` for a retained slot; not a reply.
+    release,
 };
 
 pub const Msg = struct {
@@ -92,6 +100,16 @@ pub const Msg = struct {
 
     pub fn fail(s: slot.SlotRef, unique: u64, errno: linux.E) Msg {
         return .{ .kind = .fail, .slot = s, .header = codec.errorHeader(unique, errno), .errno = errno };
+    }
+
+    pub fn replyRetain(s: slot.SlotRef, r: codec.Reply) Msg {
+        var m = reply(s, r);
+        m.kind = .reply_retain;
+        return m;
+    }
+
+    pub fn releaseMsg(s: slot.SlotRef) Msg {
+        return .{ .kind = .release, .slot = s, .header = codec.okHeader(0, 0) };
     }
 
     /// The reply the worker applies (the out view points into the cell).
@@ -285,4 +303,12 @@ test "fd-body and prefilled messages carry their legs; a fail message carries it
     const f = Msg.fail(s, 44, .NOTCONN);
     try testing.expectEqual(@as(u32, 16), f.header.len);
     try testing.expectEqual(linux.E.NOTCONN, f.errno);
+    var out: codec.OutBuf = undefined;
+    const rt = Msg.replyRetain(s, codec.replyWrite(&out, 44, 4096));
+    try testing.expectEqual(Kind.reply_retain, rt.kind);
+    try testing.expectEqual(@as(u8, 8), rt.out_len);
+    try testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, rt.out[0..4], .little));
+    const rel = Msg.releaseMsg(s);
+    try testing.expectEqual(Kind.release, rel.kind);
+    try testing.expectEqual(@as(u64, 44), rel.slot.commit_id);
 }

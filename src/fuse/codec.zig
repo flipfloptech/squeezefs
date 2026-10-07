@@ -147,6 +147,10 @@ pub const Delivery = struct {
     op_in: []const u8,
     /// `in_args[1..]` in order.
     payload: []const u8,
+    /// Bytes of a WRITE body that sit in a zero-copy slot instead of
+    /// `payload` (the kernel announced them; nothing was copied): the parse
+    /// admits `in.size == held_len` with an empty `data` view.
+    held_len: usize = 0,
 
     pub const ClassicalError = error{ ShortRead, ShortHeader, Overdeclared };
 
@@ -178,9 +182,10 @@ pub const Delivery = struct {
     /// `in_out` and `op_in` are the ent's two 128-byte regions; `payload` the
     /// delivered bytes (`min(ring_ent_in_out.payload_sz, ent payload len)`);
     /// `payload_len` the authoritative body length when it rides elsewhere
-    /// (a held zero-copy slot presents an empty placeholder), else
-    /// `payload.len`. The op_in region past `in_args[0].size` holds stale
-    /// bytes from earlier deliveries and is never exposed.
+    /// (a held zero-copy slot presents an empty placeholder: the difference
+    /// is `held_len`), else `payload.len`. The op_in region past
+    /// `in_args[0].size` holds stale bytes from earlier deliveries and is
+    /// never exposed.
     pub fn fromRing(in_out: *const [abi.FUSE_URING_IN_OUT_HEADER_SZ]u8, op_in: *const [abi.FUSE_URING_OP_IN_OUT_SZ]u8, payload: []const u8, payload_len: usize) RingError!Delivery {
         const header = abi.decodePrefix(abi.fuse_in_header, in_out).?;
         switch (validatedBody(header.len, op_in.len, payload_len, op_in.len + payload_len)) {
@@ -194,7 +199,7 @@ pub const Delivery = struct {
                 return error.Overdeclared;
             },
         }
-        return .{ .header = header, .op_in = op_in[0..inSizeOf(header.op())], .payload = payload };
+        return .{ .header = header, .op_in = op_in[0..inSizeOf(header.op())], .payload = payload, .held_len = payload_len -| payload.len };
     }
 
     fn inSizeOf(op: abi.Opcode) usize {
@@ -244,7 +249,9 @@ pub const Open = struct {
 pub const Write = struct {
     in: abi.fuse_write_in,
     /// Exactly `in.size` bytes: on the ring a zero-copy view of the leased
-    /// payload buffer.
+    /// payload buffer — EMPTY for a HELD zero-copy payload (`in.size > 0`,
+    /// the bytes sit in the slot: `PayloadLease.held`, `heldSource` /
+    /// `extract`).
     data: []const u8,
 };
 pub const Fsync = struct { fh: u64, datasync: bool };
@@ -399,7 +406,9 @@ fn parseInner(d: Delivery) ParseError!Request {
         .readdirplus => .{ .readdirplus = try opIn(abi.fuse_read_in, d) },
         .write => blk: {
             const in = try opIn(abi.fuse_write_in, d);
-            break :blk .{ .write = .{ .in = in, .data = try takeBytes(p, in.size) } };
+            // A held zero-copy body: the bytes sit in the slot; the view is empty.
+            const data: []const u8 = if (d.held_len != 0 and p.len == 0 and in.size == d.held_len) &.{} else try takeBytes(p, in.size);
+            break :blk .{ .write = .{ .in = in, .data = data } };
         },
         .statfs => .statfs,
         .release => .{ .release = try opIn(abi.fuse_release_in, d) },
@@ -1122,9 +1131,20 @@ test "ring delivery: the triple maps straight onto the Delivery — a name-only 
     try testing.expectEqual(@as(usize, 4096), rw.write.data.len);
     try testing.expectEqual(@as([*]const u8, &payload), rw.write.data.ptr);
     try testing.expect(rw.write.in.write_flags & abi.FUSE_WRITE_KILL_SUIDGID != 0);
-    // A held zero-copy slot: empty placeholder, authoritative length from the slot.
+    // A held zero-copy slot: empty placeholder, authoritative length from
+    // the slot; the parse admits it with an empty data view of size 4096.
     const dh = try Delivery.fromRing(&in_out, &op_in, &.{}, 4096);
     try testing.expectEqual(@as(usize, 0), dh.payload.len);
+    try testing.expectEqual(@as(usize, 4096), dh.held_len);
+    const rh = try parse(dh);
+    try testing.expectEqual(@as(u32, 4096), rh.write.in.size);
+    try testing.expectEqual(@as(usize, 0), rh.write.data.len);
+    // A placeholder whose length disagrees with the struct is still a short payload.
+    in_out[0..HEADER_LEN].* = abi.encode(testHeader(.write, 11, 1, 40 + 2048));
+    var op_short = op_in;
+    op_short[0..40].* = abi.encode(abi.fuse_write_in{ .fh = 3, .offset = 0, .size = 4096, .write_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 });
+    try testing.expectError(error.ShortPayload, parse(try Delivery.fromRing(&in_out, &op_short, &.{}, 2048)));
+    in_out[0..HEADER_LEN].* = abi.encode(testHeader(.write, 11, 1, 40 + 4096));
     // Overdeclared against op_in + payload refuses.
     in_out[0..HEADER_LEN].* = abi.encode(testHeader(.write, 11, 1, 40 + 8192));
     try testing.expectError(error.Overdeclared, Delivery.fromRing(&in_out, &op_in, payload[0..4096], 4096));

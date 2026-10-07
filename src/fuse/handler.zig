@@ -91,6 +91,8 @@ pub const ring = struct {
             .dispatch = fsDispatch,
             .probe_read = fsProbeRead,
             .forget = fsForget,
+            .write_hold_eligible = fsWriteHoldEligible,
+            .direct_leg = fsDirectLeg,
         };
 
         fn of(ctx: *anyopaque) *Binding {
@@ -122,6 +124,19 @@ pub const ring = struct {
 
         fn fsForget(ctx: *anyopaque, ino: u64, nlookup: u64) void {
             of(ctx).d.forget(ino, nlookup);
+        }
+
+        /// The W1 hold gate: rung 3's inline layout has no striped block
+        /// to patch in place, so no WRITE is held — every zc payload is
+        /// extracted at delivery. Rung 4's data plane publishes the
+        /// per-inode snapshot this predicate reads.
+        fn fsWriteHoldEligible(_: *anyopaque, _: fsv.HoldHint) bool {
+            return false;
+        }
+
+        /// The direct device leg: no data volumes in rung 3.
+        fn fsDirectLeg(_: *anyopaque, _: fsv.Request) ?fsv.DirectLeg {
+            return null;
         }
     };
 };
@@ -171,8 +186,13 @@ const RecordingTx = struct {
         self.fails += 1;
         self.last_errno = errno;
     }
+    fn submitRetain(ctx: *anyopaque, _: fsv.Handle, _: codec.Reply) void {
+        const self: *RecordingTx = @ptrCast(@alignCast(ctx));
+        self.replies += 1;
+    }
+    fn releaseRetained(_: *anyopaque, _: fsv.Handle) void {}
     fn tx(self: *RecordingTx) fsv.Tx {
-        return .{ .ctx = self, .submit = submit, .submit_fd_body = submitFdBody, .submit_prefilled = submitPrefilled, .fail = fail };
+        return .{ .ctx = self, .submit = submit, .submit_fd_body = submitFdBody, .submit_prefilled = submitPrefilled, .fail = fail, .submit_retain = submitRetain, .release_retained = releaseRetained };
     }
 };
 

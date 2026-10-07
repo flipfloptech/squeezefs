@@ -16,8 +16,11 @@ pub const slot = @import("transport/slot.zig");
 pub const slot_model = @import("transport/slot_model.zig");
 pub const commit_queue = @import("transport/commit_queue.zig");
 pub const filesystem_vtable = @import("transport/filesystem_vtable.zig");
+pub const zc = @import("transport/zc.zig");
+pub const probes = @import("transport/probes.zig");
 
 // ---- Linux only ----
+pub const kmbuf = if (is_linux) @import("transport/kmbuf.zig") else struct {};
 pub const worker = if (is_linux) @import("transport/worker.zig") else struct {};
 pub const session = if (is_linux) @import("transport/session.zig") else struct {};
 
@@ -33,7 +36,10 @@ test {
     _ = slot_model;
     _ = commit_queue;
     _ = filesystem_vtable;
+    _ = zc;
+    _ = probes;
     if (is_linux) {
+        _ = kmbuf;
         _ = worker;
         _ = session;
     }

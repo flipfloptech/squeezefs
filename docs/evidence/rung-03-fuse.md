@@ -100,6 +100,86 @@ ring requests, 548,000 enters (2.76 per request), wake writes 186,906 / elided 1
 ticks 0, rescues 0/0**, parked ≡ unparked, leases 0, nothing abandoned/overflowed; the single-client
 e2e 3.30 enters per op. Dev-box rows, scoping only (charter §11).
 
+## Buffer modes (the final wave of rung 3; venue 7.2.6-sqz, root, CapEff with CAP_SYS_ADMIN, 8 vCPU aarch64, debug)
+
+**Verdicts observed** (`src/fuse/transport/probes.zig`, every ladder a pure machine over injected
+syscall results + a Linux driver on a scratch SQE128 ring; gauges `transport_probe_*`):
+
+| Probe | Mechanism | Venue verdict |
+|---|---|---|
+| kmbuf opcode pair | register(`buf_size = page`, 8 entries, bgid 7) → 0 ∧ repeat → EEXIST ∧ mmap at `0x88000000 \| (7 << 16)` succeeds; pairs 38/39 then 37/38 | **Present, 38/39** (`kmbuf_ops=38/39`) |
+| zero-copy surface | kmbuf present ∧ `CapEff` bit 21 (`/proc/self/status`, never `euid`) ∧ a sparse table of `depth + 1` slots registers | **Present** |
+| payload retention | `RELEASE_PAYLOAD(commit_id = u64::MAX, qid 0)` on the plain fuse fd AFTER the INIT reply, BEFORE any REGISTER; ENOTCONN/ENOENT ⇒ present | **Present** (`-ENOTCONN`) |
+| `FUSE_TIME_LIMITS` | init flag bit 62 offered | **Present**; echoed with `time_min/max = ∓9 223 372 036 s` |
+
+Lattice (`resolveBufferMode`, a pure table): `auto` ⇒ **ZeroCopy** on the venue (width 1, retention
+armed, no user arena, `transport_kmbuf_pinned_bytes` = queues × next_pow2(depth) × payload); `bufring`
+⇒ BufRing (no arena; every delivery's payload read at the kernel address through the CQE bid —
+`transport_kmbuf_attached_deliveries > 0`); `user` ⇒ UserEnts; an explicit `zc` with the cap forced
+absent (`SQUEEZEFS_TEST_FUSE_CAP_SYS_ADMIN_ABSENT`) **fails the mount loud** naming the zero-copy probe
+(`error.BufferModeRefused`), `auto` on the same seam settles on BufRing. The probe is the only degrade
+point; no downgrade path exists (a post-probe refusal in `kmbuf.Kmbuf.setup` or a REGISTER EINVAL fails
+the mount).
+
+**What runs under each mode** (`worker.zig`): UserEnts the two-iovec REGISTER into the arena; BufRing
+the headers as fixed buffer 0 + the kernel-managed ring at bgid 0 (`io_uring_buf_reg` 40 B, pow2
+entries, the region mmap) with the attachment law (`zc.Attachment`: flagged CQE re-points, unflagged
+keeps, out-of-range bid = `transport_kmbuf_attachment_breach` and shutdown); ZeroCopy + the sparse
+table (headers at index `depth`, REGISTER with `init.queue_depth`), paged READ bodies through the slot
+by the direct device leg (`Filesystem.direct_leg`, EchoFs null), the fd-source leg
+(`replyFdBody(pool fd, off)` → `READ_FIXED(fd → slot)`) or the bounce leg (ONE MAP_SHARED memfd slab
+for every queue, a non-sheddable budget component), paged WRITE payloads HELD when `zc.w1Shape ∧
+holdCandidate ∧ Filesystem.write_hold_eligible` (a pure predicate; `PayloadLease.held/heldSource/
+extract`) else extracted at delivery by `WRITE_FIXED(slot → slab)`; the slot direction law
+(`transport_zc_direction_refusals`); bridges tagged `bridge`, deadline-bounded (30 s constant,
+`SQUEEZEFS_TEST_ZC_BRIDGE_DEADLINE_MS` seam), ONE AsyncCancel, the four-arm cancel-CQE ladder, the
+commit FOLLOWING the bridge CQE (the slot stays owed); retention as `COMMIT_RETAIN` on a held
+`.page_cache` WRITE (`replyRetain`), `RELEASE_PAYLOAD` later (`releaseRetained`, ordered after the
+pass's commits, a racing release parked behind its RETAIN commit), the stability class stamped at
+delivery (`O_DIRECT ∧ !FUSE_WRITE_CACHE ⇒ .direct_gup`, refused the retain and counted); the fused poll
+(`SQUEEZEFS_FUSE_READ_FUSION`, default OFF): a bounded run-queue of READ frames re-polled through the
+filesystem's try-only ladder once per pass, ≤ 4 polls then the lane.
+
+**Live contracts pinned** (session e2e, real mounts, nothing left behind): fd-source READ of `/big`:
+`zc_serve_bytes ≡ user bytes` (1 048 576), daemon copies **0**, every reply rode the slot; with
+`SQUEEZEFS_READ_ZC_SERVE=0` the bounce leg serves with exactly one copy per READ and no worker memcpy;
+a W1-eligible aligned WRITE is HELD and extracted lazily by the handler (1 hold, 1 lazy extraction), an
+unaligned one extracted at delivery, a filesystem that never declares eligibility extracts at delivery;
+a stalled bridge (`SQUEEZEFS_TEST_ZC_BRIDGE_STALL`: a writer-less pipe as the source) is cancelled at
+the deadline (312–315 ms at a 300 ms seam), `transport_zc_bridge_cancels == 1`, lost/orphans 0, the
+reader gets EIO (header-only commit — THE LAW) and the next READ serves; retention: write(2) returned
+while the slot was `Retained` (ACK-early observed: `retain_commits = 1`, `releases = 0`, `retained_
+outstanding = 1`), the handler extracted AFTER the ACK from the still-registered slot, released,
+`retain_commits − releases ≡ 0`; an O_DIRECT write classified `.direct_gup` had its retain refused
+(`transport_zc_retain_refused_class`) and committed plain with the bytes snapshotted first; teardown
+with a retained slot drained kernel-side and `mount | grep fuse` is empty afterwards; TIME_LIMITS:
+`utimensat` far past the range read back as ±9 223 372 036 s at the daemon AND at `stat`; fused poll:
+16 READs whose probe declined once were all served by the re-poll (fusions 16, late demotions 0),
+inert on BufRing; the 10 s storm now runs under ZeroCopy: 171 661 ring requests, 3.27 enters/request,
+backstop ticks 0, rescues 0/0, parked ≡ unparked, nothing abandoned.
+
+**Side by side** (64 × 16 KiB preads of `/big`, one client, debug build — scoping only):
+
+| mode | ring requests | enters | enters/request | daemon READ copies | zc_serve bytes |
+|---|---|---|---|---|---|
+| UserEnts | 64 | 64 | 1.00 | 64 (1.00/READ) | 0 |
+| BufRing | 64 | 64 | 1.00 | 64 (1.00/READ) | 0 |
+| ZeroCopy (fd-source) | 64 | 255 | 3.98 | **0** | 1 048 576 |
+
+The zc leg's win is the copy and the kernel's GUP (not visible from userspace), not syscalls: a bridged
+reply costs the bridge's own round trip (push → enter → CQE → commit) on top of the delivery's; the
+reference's fused lane paid the same (bridge hops 35–47 µs). `transport_kernel_max_background` reads
+126 = the negotiated word through fusectl (mounted on the venue during this wave); the kernel exposes
+no per-queue background counters (patch 0026 changes the locking, not the uapi), so only
+`max_background` is published.
+
+**Found and fixed on the way:** the first run of the retention test left a D-state process: a lazily
+detached mount whose connection the ring queues' devs keep alive never aborts when the daemon's fd
+closes, so a FLUSH on an fd open across the detach waited forever — `unmountDetached` now writes
+fusectl's `abort`; its first version stat'ed our own mountpoint for the minor (a GETATTR to ourselves,
+blocking forever before the INIT reply on the refused-mode path) — the minor comes from
+`/proc/self/mountinfo` (0002 row 137).
+
 ## Models (explorer, default limits; `slot_model.zig`)
 
 | Model | States (holds) | Weakening | Fails |
@@ -137,11 +217,15 @@ The executor's six models are in `rung-03-executor.md`.
 
 ## Deviations (this rung) and owed items
 
-- Buffer-mode lattice: **UserEnts only** (`session.buffer_mode`); kmbuf (`BufRing`), zero-copy and
-  payload retention are the next wave behind their probes (`fuse_kmbuf_zc.md`). Consequences today:
-  no fused poll (arm (b) of the READ law is inert, `SQUEEZEFS_FUSE_READ_FUSION` accepted and logged),
-  `submit_reply_fd_body` falls back to a body copy (`transport_fd_body_fallbacks`), `submit_reply_
-  prefilled` is the classical EIO on the sideband.
+- Buffer-mode lattice: landed (section above). Owed inside it: the direct device leg and the held
+  slot's `WRITE_FIXED(device ← slot)` consumer are rung 4's (`Filesystem.direct_leg` returns null and
+  `write_hold_eligible` false in the lifecycle binding; EchoFs exercises the hold/extract/retain arms);
+  the fused poll runs the filesystem's SYNC try-only probe path per frame (the worker is a dedicated
+  SQE128 thread, not an `exec.Lane`; a fiber-polling fused lane is the lane/ring-face cutover); the
+  `FUSE_RING_ENT_F_ZC_PAYLOAD` bit-read waits for its kernel patch (the readdir class is probed by its
+  first bridge meanwhile); the zc bounce slab is `queues × depth × payload` of populated memfd memory
+  beside the kmbuf regions — its budget derivation is the data plane's call once the fill pool exists.
+  The reference's `fuse3_zc_write_directs`, `overlay_*` and `read_zc_pool_serve_*` rows are rung 4's.
 - Layouts: **inline only** (`inline_max = page`; a write past it is EFBIG, counted) — rung 4's
   staged/packed/striped layouts, the data volumes and the layout record as an `extern struct` (row 2)
   lift it; `format` names its `sqdata://` URIs and formats none.

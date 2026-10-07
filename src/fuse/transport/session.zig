@@ -35,6 +35,9 @@ const codec = @import("../codec.zig");
 const geometry = @import("../geometry.zig");
 const mount_options = @import("../mount_options.zig");
 const slot = @import("slot.zig");
+const zc = @import("zc.zig");
+const probes = @import("probes.zig");
+const kmbuf = @import("kmbuf.zig");
 const commit_queue = @import("commit_queue.zig");
 const fsv = @import("filesystem_vtable.zig");
 const worker = @import("worker.zig");
@@ -74,9 +77,11 @@ pub const DRAIN_WAIT_NS: u64 = 10 * worker.DRAIN_LEASE_BUDGET_NS;
 /// two seconds is the lock plane's tick (`sync/tick.zig`) — past it the
 /// mount is detached lazily and the warn names it.
 pub const UMOUNT_RETRY_NS: u64 = tick_law.tick_ns;
-/// The buffer-mode lattice rung this session runs: `UserEnts` (stock);
-/// kmbuf and zero-copy land behind their probes.
-pub const buffer_mode: geometry.BufferMode = .user_ents;
+/// The fusectl tree: `max_background` per connection is the per-queue
+/// background accounting's only userspace-readable fact (the kernel
+/// exposes no per-queue counters; patch 0026 changes the LOCKING, not the
+/// uapi).
+pub const fusectl_connections = "/sys/fs/fuse/connections";
 /// A sideband cell holds a name-carrying notify frame (header + struct +
 /// `FUSE_NAME_MAX` + NUL = 1065 B) or a reply head (16 + 144 B); rounded
 /// to the KiB so a PRUNE frame carries up to 250 inos.
@@ -134,6 +139,19 @@ pub var arena_bytes: counters.Gauge = .{};
 /// `transport_umount_busy_retries`: plain `umount2` attempts that met EBUSY
 /// inside the retry window.
 pub var umount_busy_retries: counters.ShardedCounter = .{};
+/// `transport_zc_bounce_bytes`: the zc bounce slab (the budget's
+/// non-sheddable `transport_zc_bounce` component reads it).
+pub var zc_bounce_slab_bytes: counters.Gauge = .{};
+/// `transport_time_limits`: 1 when FUSE_TIME_LIMITS was echoed with our
+/// i64-ns whole-second range.
+pub var time_limits_gauge: counters.Gauge = .{};
+/// `transport_kernel_max_background`: fusectl's `max_background` for this
+/// connection (0 when fusectl is not mounted) — the per-queue background
+/// budget is `this / nr_queues` kernel-side.
+pub var kernel_max_background: counters.Gauge = .{};
+/// `transport_releases_requested`: `releaseRetained` calls that reached a
+/// worker (the economy check admitted them).
+pub var releases_requested: counters.ShardedCounter = .{};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -152,6 +170,10 @@ pub const MountError = error{
     ThreadSpawnFailed,
     ArmBarrierFailed,
     EveryEntRetired,
+    /// An explicit `SQUEEZEFS_FUSE_BUFFER_MODE` the probes refused (named
+    /// in the log) — the only degrade point is the probe; never a downgrade.
+    BufferModeRefused,
+    SlabFailed,
 };
 
 /// A caller's callback with its context (the daemon's hooks).
@@ -618,6 +640,15 @@ pub const Session = struct {
     sideband: Sideband = undefined,
     have_sideband: bool = false,
     arena_component: mem_budget.Component = undefined,
+    /// The lattice rung and the verdicts it was decided from.
+    mode: geometry.BufferMode = .user_ents,
+    verdicts: probes.Verdicts = .{ .kmbuf = .absent, .zc = .absent },
+    retention: probes.Verdict = .absent,
+    time_limits: probes.Verdict = .absent,
+    /// The zc bounce slab (one per session) and its budget component.
+    slab: ?worker.Slab = null,
+    slab_component: mem_budget.Component = undefined,
+    kmbuf_component: mem_budget.Component = undefined,
     ready: std.atomic.Value(bool) = .init(false),
     destroyed: std.atomic.Value(bool) = .init(false),
     closed: bool = false,
@@ -675,26 +706,53 @@ pub const Session = struct {
         }
     }
 
+    /// The RETAIN commit (zero-copy retention); a plain reply classically
+    /// and on a session without retention (the worker counts the refusal).
+    pub fn submitReplyRetain(self: *Session, s: SlotRef, r: codec.Reply) void {
+        switch (s) {
+            .classical => self.sideband.replyBlocking(r),
+            .ring => |ref| self.ringSubmit(ref, commit_queue.Msg.replyRetain(ref, r)),
+        }
+    }
+
+    /// `RELEASE_PAYLOAD` for a retained slot: rides the worker's release
+    /// inbox (never a commit cell — the retain reply may still hold it), the
+    /// worker orders it after the pass's commits.
+    pub fn releaseRetained(self: *Session, s: SlotRef) void {
+        const ref = switch (s) {
+            .classical => return,
+            .ring => |r| r,
+        };
+        const g = self.groupOf(ref) orelse return;
+        releases_requested.inc();
+        g.requestRelease(g.gentOf(self.qid_member[ref.qid], ref.ent_idx));
+    }
+
     pub fn releaseLease(self: *Session, l: PayloadLease) void {
         _ = self;
         l.release();
     }
 
-    fn ringSubmit(self: *Session, ref: slot.SlotRef, msg: commit_queue.Msg) void {
+    /// The group owning a live slot that still names `ref.commit_id` (the
+    /// economy check; the worker's slot table is the authority).
+    fn groupOf(self: *Session, ref: slot.SlotRef) ?*worker.Group {
         if (ref.qid >= self.plan.nqueues or ref.ent_idx >= self.plan.depth) {
             replies_dropped_no_slot.inc();
-            return;
+            return null;
         }
         const g = self.groups[self.qid_group[ref.qid]];
         const ms = self.qid_member[ref.qid];
         const ent = g.members[ms].slots.ent(ref.ent_idx);
-        // The economy check: a slot that no longer owes this commit id takes
-        // no cell; the worker's `admitCommit` is the authority.
         if (!self.shared.isActive() or ent.owed_commit_id.load(.acquire) != ref.commit_id) {
             replies_dropped_no_slot.inc();
-            return;
+            return null;
         }
-        _ = g.cells.submit(g.gentOf(ms, ref.ent_idx), msg);
+        return g;
+    }
+
+    fn ringSubmit(self: *Session, ref: slot.SlotRef, msg: commit_queue.Msg) void {
+        const g = self.groupOf(ref) orelse return;
+        _ = g.cells.submit(g.gentOf(self.qid_member[ref.qid], ref.ent_idx), msg);
     }
 
     // ---- the Tx face handlers reply through ----
@@ -714,6 +772,14 @@ pub const Session = struct {
     fn txFail(ctx: *anyopaque, h: fsv.Handle, errno: linux.E) void {
         const self: *Session = @ptrCast(@alignCast(ctx));
         self.failEnt(h.slot, h.unique, errno);
+    }
+    fn txSubmitRetain(ctx: *anyopaque, h: fsv.Handle, r: codec.Reply) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        self.submitReplyRetain(h.slot, r);
+    }
+    fn txReleaseRetained(ctx: *anyopaque, h: fsv.Handle) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        self.releaseRetained(h.slot);
     }
 
     // ---- notify (the sideband carries them) ----
@@ -761,7 +827,7 @@ pub const Session = struct {
         errdefer gpa.free(self.mountpoint);
         self.source = try gpa.dupeSentinel(u8, cfg.opts.fsName(), 0);
         errdefer gpa.free(self.source);
-        self.tx = .{ .ctx = self, .submit = txSubmit, .submit_fd_body = txSubmitFdBody, .submit_prefilled = txSubmitPrefilled, .fail = txFail };
+        self.tx = .{ .ctx = self, .submit = txSubmit, .submit_fd_body = txSubmitFdBody, .submit_prefilled = txSubmitPrefilled, .fail = txFail, .submit_retain = txSubmitRetain, .release_retained = txReleaseRetained };
         self.unmounter = cfg.unmounter;
         self.on_shutdown = cfg.on_shutdown;
 
@@ -816,12 +882,15 @@ pub const Session = struct {
         };
         self.init_unique = delivery.header.unique;
 
-        // 2. Geometry BEFORE the reply is serialized; the drain-group plan.
+        // 2. Geometry BEFORE the reply is serialized; then the PROBES and
+        //    the lattice decision (the drain-group width follows the mode:
+        //    1 under kmbuf/zc), then the drain-group plan.
         self.plan = geometry.plan(geometry.resolveInputs(facts, env, cfg.block_size, cfg.mem_budget_bytes, max_pages_limit, cfg.opts.max_background, cfg.opts.congestion_threshold));
         self.topo = placement.Topology.probe(self.io);
         const qid_is_cpu = self.plan.nqueues == facts.possible_cpus;
+        try self.resolveMode(env, init_in.folded());
         const topology: geometry.Topology = .{ .ctx = &self.topo, .node_of = nodeOfCpu };
-        self.drain_groups = try geometry.drainGroupPlan(gpa, self.plan.nqueues, qid_is_cpu, topology, geometry.forcedWidth(buffer_mode, geometry.drainGroupWidthOverride(env)));
+        self.drain_groups = try geometry.drainGroupPlan(gpa, self.plan.nqueues, qid_is_cpu, topology, geometry.forcedWidth(self.mode, geometry.drainGroupWidthOverride(env)));
         errdefer self.drain_groups.deinit(gpa);
 
         // 3. `fuse.enable_uring=Y` BEFORE the reply lands: since 7.2.4 the
@@ -839,11 +908,14 @@ pub const Session = struct {
         };
         geometry.gauges.publish(self.plan, init_in.max_readahead);
         geometry.gauges.publishDrainGroups(&self.drain_groups);
-        fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io });
-        errdefer self.destroyOnce();
+        self.time_limits = probes.timeLimitsVerdict(init_in.folded());
+        time_limits_gauge.set(@intFromBool(self.init_reply.timeLimits()));
+        const read_zc_serve = knobs.boolKnob("SQUEEZEFS_READ_ZC_SERVE", env) and self.mode == .zero_copy;
 
         // 5. Write the reply classically (the kernel refuses REGISTER until
-        //    `fch->initialized`).
+        //    `fch->initialized`), then the RETENTION probe: after the reply,
+        //    before any REGISTER (its verdict composes the REGISTER flags),
+        //    only on a zero-copy session.
         {
             var out: codec.OutBuf = undefined;
             const r = codec.replyInit(&out, self.init_unique, self.init_reply);
@@ -852,10 +924,26 @@ pub const Session = struct {
             @memcpy(frame[codec.OUT_HEADER_LEN..], r.out);
             try self.sideband.writeOnce(&frame);
         }
-        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth() });
+        if (self.mode == .zero_copy) self.retention = probes.driver.probeRetention(self.fuse_fd);
+        probes.publish(self.verdicts, self.retention, self.time_limits, probes.driver.capSysAdmin(self.io, env), self.mode);
+        fs.init(.{ .negotiated = self.init_reply.negotiated, .minor = self.init_reply.minor(), .plan = self.plan, .io = self.io, .buffer_mode = self.mode, .read_zc_serve = read_zc_serve, .retention = self.retention == .present });
+        errdefer self.destroyOnce();
+        log.info("transport: INIT 7.{d} → 7.{d}: flags 0x{x} (over_io_uring={}, time_limits={}), max_write {d}, max_pages {d}, max_background {d}, queues {d} × depth {d}, payload {d} B, {d} drain group(s) (width {d}), buffer mode {t} (kmbuf {?d}, retention {t})", .{ init_in.minor, self.init_reply.minor(), self.init_reply.negotiated, self.init_reply.has(abi.FUSE_OVER_IO_URING), self.init_reply.timeLimits(), self.plan.max_write, self.plan.max_pages, self.plan.max_background, self.plan.nqueues, self.plan.depth, self.plan.payload_sz, self.drain_groups.count(), self.drain_groups.maxWidth(), self.mode, if (self.verdicts.kmbuf.opcodes()) |p| p.register else null, self.retention });
 
-        // 6. The workers: one per drain group, the arena as ONE budget
-        //    component, the arm barrier counting submissions.
+        // 6. The zc bounce slab (ONE memfd for every queue; a non-sheddable
+        //    budget component), then the workers: one per drain group, the
+        //    arena as ONE budget component, the arm barrier counting
+        //    submissions.
+        if (self.mode == .zero_copy) {
+            self.slab = worker.Slab.init(self.plan.nqueues, self.plan.depth, self.plan.payload_sz) catch return error.SlabFailed;
+            zc_bounce_slab_bytes.set(self.slab.?.bytes());
+            self.slab_component = mem_budget.Component.init("transport_zc_bounce", self.slab.?.bytes(), 0, .{ .gauge = &zc_bounce_slab_bytes }, null);
+            if (cfg.budget) |b| b.register(self.slab_component);
+        }
+        errdefer if (self.slab) |*s| {
+            s.deinit();
+            zc_bounce_slab_bytes.set(0);
+        };
         const read_fusion_lever = knobs.boolKnob("SQUEEZEFS_FUSE_READ_FUSION", env);
         self.shared = .{
             .fuse_fd = self.fuse_fd,
@@ -866,17 +954,26 @@ pub const Session = struct {
             .tx = &self.tx,
             .nqueues = self.plan.nqueues,
             .qid_is_cpu = qid_is_cpu,
-            // Arm (b) exists only on a zero-copy session (the fused lane is
-            // the zc mode's); on the lattice's stock rung the lever is inert.
-            .read_fusion_on = read_fusion_lever and buffer_mode == .zero_copy,
+            // Arm (b) exists only on a zero-copy session; on the lattice's
+            // other rungs the lever is inert.
+            .read_fusion_on = read_fusion_lever and self.mode == .zero_copy,
             .sqpoll = knobs.boolKnob("SQUEEZEFS_FUSE_SQPOLL", env),
             .node_of = nodeOfCpu,
             .node_ctx = &self.topo,
+            .mode = self.mode,
+            .kmbuf_opcodes = self.verdicts.kmbuf.opcodes(),
+            .retention = self.retention == .present,
+            .page = facts.page_size,
+            .block_size = cfg.block_size,
+            .io = self.io,
+            .slab = if (self.slab) |*s| s else null,
             .test_error_logs = cfg.test_error_logs,
         };
-        if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {s} session (the fused lane is the zero-copy mode's)", .{@tagName(buffer_mode)});
+        if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {t} session (the fused poll is the zero-copy mode's)", .{self.mode});
         if (self.shared.sqpoll) log.info("transport: SQUEEZEFS_FUSE_SQPOLL=1 — the kernel submission poller (measured not recommended: the A/B control arm)", .{});
         self.shared.register_refuse_remaining.store(knobs.intKnob("SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", u32, env), .monotonic);
+        self.armBridgeSeams(env);
+        errdefer self.closeStallPipe();
 
         const ngroups = self.drain_groups.count();
         self.groups = try gpa.alloc(*worker.Group, ngroups);
@@ -904,9 +1001,15 @@ pub const Session = struct {
             total_arena += self.groups[gi].arenaBytes();
         }
         arena_bytes.set(total_arena);
-        // Non-sheddable: the kernel writes into these pages at delivery.
+        // Non-sheddable: the kernel writes into these pages at delivery
+        // (the arena on UserEnts; the kmbuf regions on the other rungs).
         self.arena_component = mem_budget.Component.init("transport_payload_arena", total_arena, 0, .{ .gauge = &arena_bytes }, null);
         if (cfg.budget) |b| b.register(self.arena_component);
+        if (self.mode != .user_ents) {
+            const pinned: u64 = @as(u64, self.plan.nqueues) * zc.ringEntriesFor(self.plan.depth) * derive.alignUp(self.plan.payload_sz, facts.page_size);
+            self.kmbuf_component = mem_budget.Component.init("transport_kmbuf_region", pinned, 0, .{ .gauge = &kmbuf.pinned_bytes }, null);
+            if (cfg.budget) |b| b.register(self.kmbuf_component);
+        }
 
         var started: usize = 0;
         errdefer {
@@ -934,8 +1037,66 @@ pub const Session = struct {
         try self.sideband.start();
         self.ready.store(true, .release);
         sessions_active.add(1);
-        log.info("transport: FUSE-over-io_uring transport armed at {s}: {d} queue(s) × {d} ent(s) over {d} worker(s)", .{ self.mountpoint, self.plan.nqueues, self.plan.depth, ngroups });
+        self.publishKernelMaxBackground();
+        log.info("transport: FUSE-over-io_uring transport armed at {s}: {d} queue(s) × {d} ent(s) over {d} worker(s), {t}", .{ self.mountpoint, self.plan.nqueues, self.plan.depth, ngroups, self.mode });
         return self;
+    }
+
+    /// The probes and the lattice decision (ONCE per mount): kmbuf by the
+    /// opcode ladder on a scratch ring, zc by `CapEff` + the sparse table,
+    /// the lever from the registry; an explicit rung the probes refuse fails
+    /// the mount loud naming the probe (the only degrade point is the probe).
+    fn resolveMode(self: *Session, env: *const std.process.Environ.Map, offered: u64) MountError!void {
+        const page: u32 = @intCast(self.facts.page_size);
+        const kmbuf_v = probes.driver.probeKmbuf(page);
+        const cap = probes.driver.capSysAdmin(self.io, env);
+        // The ring exists only when the kernel offered FUSE_OVER_IO_URING;
+        // the sparse table is the zc slot shape (depth + the headers slot).
+        const ring_offered = offered & abi.FUSE_OVER_IO_URING != 0;
+        const sparse_ok = ring_offered and probes.driver.probeSparse(self.plan.depth + 1);
+        self.verdicts = .{ .kmbuf = kmbuf_v, .zc = probes.zcVerdict(kmbuf_v, cap, sparse_ok) };
+        const lever = probes.leverFromKnob(knobs.enumKnob("SQUEEZEFS_FUSE_BUFFER_MODE", env));
+        self.mode = probes.resolveBufferMode(self.verdicts, lever) catch |e| {
+            log.err("transport: SQUEEZEFS_FUSE_BUFFER_MODE={t} refused by the {s} probe (kmbuf {t}, CAP_SYS_ADMIN {}, sparse table {}) — the mount fails: the probe is the only degrade point (charter §3)", .{ lever, switch (e) {
+                error.KmbufAbsent => "kmbuf",
+                error.ZeroCopyAbsent => "zero-copy",
+            }, self.verdicts.kmbuf, cap, sparse_ok });
+            return error.BufferModeRefused;
+        };
+        if (lever != .auto) log.info("transport: SQUEEZEFS_FUSE_BUFFER_MODE={t} — the A/B pin (auto would take {t})", .{ lever, probes.resolveBufferMode(self.verdicts, .auto) catch unreachable });
+    }
+
+    /// `SQUEEZEFS_TEST_ZC_BRIDGE_STALL` / `_DEADLINE_MS`: a pipe with no
+    /// writer stands in for the bridge source, and a short deadline.
+    fn armBridgeSeams(self: *Session, env: *const std.process.Environ.Map) void {
+        const stall = knobs.intKnob("SQUEEZEFS_TEST_ZC_BRIDGE_STALL", u32, env);
+        const deadline_ms = knobs.intKnob("SQUEEZEFS_TEST_ZC_BRIDGE_DEADLINE_MS", u64, env);
+        if (deadline_ms != 0) self.shared.bridge_deadline_ns = deadline_ms * std.time.ns_per_ms;
+        if (stall == 0) return;
+        var fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
+        self.shared.stall_pipe = fds;
+        self.shared.bridge_stall_remaining.store(stall, .monotonic);
+        log.warn("transport: SQUEEZEFS_TEST_ZC_BRIDGE_STALL={d} — the next {d} reply bridge(s) read a writer-less pipe (deadline {d} ms)", .{ stall, stall, self.shared.bridge_deadline_ns / std.time.ns_per_ms });
+    }
+
+    fn closeStallPipe(self: *Session) void {
+        for (&self.shared.stall_pipe) |*fd| if (fd.* >= 0) {
+            _ = linux.close(fd.*);
+            fd.* = -1;
+        };
+    }
+
+    /// fusectl's `max_background` for this connection (the mountpoint's
+    /// device minor names it); 0 when fusectl is not mounted.
+    fn publishKernelMaxBackground(self: *Session) void {
+        const minor = self.connectionMinor() orelse return;
+        var path: [96]u8 = undefined;
+        const p = std.fmt.bufPrint(&path, "{s}/{d}/max_background", .{ fusectl_connections, minor }) catch return;
+        var buf: [32]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(self.io, p, &buf) catch return;
+        const v = std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch return;
+        kernel_max_background.set(v);
     }
 
     pub fn isReady(self: *const Session) bool {
@@ -1047,9 +1208,38 @@ pub const Session = struct {
             self.mounted.store(false, .release);
             return;
         }
+        const minor = self.connectionMinor();
         const rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
         if (linux.errno(rc) != .SUCCESS) log.err("transport: umount2({s}, MNT_DETACH) failed ({t}) — a mount is left behind", .{ self.mountpoint, linux.errno(rc) });
         self.mounted.store(false, .release);
+        // A detached superblock lives on behind any open fd, and the uring
+        // queues hold the connection's devs, so closing our fd never aborts
+        // it: a later FLUSH on that fd would wait forever. fusectl's abort
+        // ends it (when fusectl is mounted; the supervisor's last rung).
+        if (minor) |m| self.abortConnection(m);
+    }
+
+    /// The mountpoint's device minor = the fusectl connection id, read from
+    /// `/proc/self/mountinfo` — NEVER a stat of the mountpoint: that is a
+    /// GETATTR to ourselves, which blocks forever on a connection whose INIT
+    /// reply was never written (the refused-mode path) and is a request to
+    /// our own mount on every other.
+    fn connectionMinor(self: *Session) ?u32 {
+        var buf: [64 * 1024]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(self.io, "/proc/self/mountinfo", &buf) catch return null;
+        return mountinfoMinor(text, self.mountpoint);
+    }
+
+    /// `/sys/fs/fuse/connections/<minor>/abort` ← 1 (a control write through
+    /// the raw syscalls, like `enable_uring`; a missing fusectl is quiet).
+    fn abortConnection(self: *Session, minor: u32) void {
+        var path: [96]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&path, "{s}/{d}/abort", .{ fusectl_connections, minor }, 0) catch return;
+        const fd_rc = linux.open(p.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(fd_rc) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+        if (linux.errno(linux.write(fd, "1", 1)) == .SUCCESS) log.warn("transport: aborted fuse connection {d} through fusectl after the lazy detach of {s}", .{ minor, self.mountpoint });
     }
 
     fn closeFd(self: *Session) void {
@@ -1063,6 +1253,12 @@ pub const Session = struct {
         self.close();
         self.handler_group.await(self.io) catch {};
         for (self.groups) |g| g.deinit();
+        if (self.slab) |*s| {
+            s.deinit();
+            self.slab = null;
+            zc_bounce_slab_bytes.set(0);
+        }
+        self.closeStallPipe();
         self.gpa.free(self.groups);
         self.gpa.free(self.qid_group);
         self.gpa.free(self.qid_member);
@@ -1091,6 +1287,51 @@ pub const Session = struct {
         try field(w, "transport_drain_groups", g.drain_groups.load());
         try field(w, "transport_drain_group_width", g.drain_group_width.load());
         try field(w, "transport_arena_bytes", arena_bytes.load());
+        try field(w, "transport_buffer_mode", probes.mode_gauge.load());
+        try field(w, "transport_probe_kmbuf", probes.kmbuf_gauge.load());
+        try field(w, "transport_probe_zc", probes.zc_gauge.load());
+        try field(w, "transport_probe_retention", probes.retention_gauge.load());
+        try field(w, "transport_probe_time_limits", probes.time_limits_gauge.load());
+        try field(w, "transport_probe_cap_sys_admin", probes.cap_gauge.load());
+        try field(w, "transport_time_limits", time_limits_gauge.load());
+        try field(w, "transport_kernel_max_background", kernel_max_background.load());
+        try field(w, "transport_kmbuf_pinned_bytes", kmbuf.pinned_bytes.load());
+        try field(w, "transport_kmbuf_register_retries", kmbuf.register_retries.load());
+        try field(w, "transport_kmbuf_attached_deliveries", worker.kmbuf_attached_deliveries.load());
+        try field(w, "transport_kmbuf_attachment_breach", worker.kmbuf_attachment_breach.load());
+        try field(w, "transport_zc_bounce_bytes", zc_bounce_slab_bytes.load());
+        try field(w, "transport_zc_replies", worker.zc_replies.load());
+        try field(w, "transport_zc_serve_bytes", worker.zc_serve_bytes.load());
+        try field(w, "transport_zc_bounce_bytes_bridged", worker.zc_bounce_bytes.load());
+        try field(w, "transport_zc_bounce_copies", worker.zc_bounce_copies.load());
+        try field(w, "transport_zc_fd_body_replies", worker.zc_fd_body_replies.load());
+        try field(w, "transport_zc_fd_body_fallbacks", worker.zc_fd_body_fallbacks.load());
+        try field(w, "transport_zc_direct_legs", worker.zc_direct_legs.load());
+        try field(w, "transport_zc_direct_leg_fallbacks", worker.zc_direct_leg_fallbacks.load());
+        try field(w, "transport_zc_fallbacks", worker.zc_fallbacks.load());
+        try field(w, "transport_zc_readdir_latch", worker.zc_readdir_latch.load());
+        try field(w, "transport_zc_bridges", worker.zc_bridges.load());
+        try field(w, "transport_zc_bridge_pends", worker.zc_bridge_pends.load());
+        try field(w, "transport_zc_bridge_cancels", worker.bridge_cancels.load());
+        try field(w, "transport_zc_bridge_lost", worker.bridge_lost.load());
+        try field(w, "transport_zc_bridge_orphans", worker.bridge_orphans.load());
+        try field(w, "transport_zc_bridge_restamps", worker.bridge_restamps.load());
+        try field(w, "transport_zc_scan_max_age_ms", worker.scan_max_age_ms.load());
+        try field(w, "transport_zc_direction_refusals", slot.zc_direction_refusals.load());
+        try field(w, "transport_zc_write_holds", slot.zc_write_holds.load());
+        try field(w, "transport_zc_write_extractions", slot.zc_write_extractions.load());
+        try field(w, "transport_zc_write_extract_bytes", slot.zc_write_extract_bytes.load());
+        try field(w, "transport_zc_write_lazy_extractions", slot.zc_write_lazy_extractions.load());
+        try field(w, "transport_zc_retain_commits", slot.retain_commits.load());
+        try field(w, "transport_zc_releases", slot.releases.load());
+        try field(w, "transport_zc_retained_outstanding", slot.retained_outstanding.load());
+        try field(w, "transport_zc_release_failures", slot.release_failures.load());
+        try field(w, "transport_zc_retain_refused", slot.retain_refused.load());
+        try field(w, "transport_zc_retain_refused_class", slot.retain_refused_class.load());
+        try field(w, "transport_zc_release_inert", worker.zc_release_inert.load());
+        try field(w, "transport_releases_requested", releases_requested.load());
+        try field(w, "transport_fused_read_late_demotions", worker.fused_read_late_demotions.load());
+        try field(w, "transport_fused_polls", worker.fused_polls.load());
         try field(w, "transport_sessions_active", sessions_active.load());
         try field(w, "transport_queues_registered", self.queuesRegistered());
         try field(w, "transport_owed", self.owedCount());
@@ -1179,6 +1420,27 @@ pub fn ensureKernelUringEnabled(io: Io) void {
     if (linux.errno(rc) != .SUCCESS) log.warn("transport: writing Y to {s} failed ({t})", .{ enable_uring_path, linux.errno(rc) });
 }
 
+/// The device MINOR of the mount at `mountpoint` from a `mountinfo` text
+/// (fields: `id parent major:minor root MOUNTPOINT …`; a mountpoint with
+/// spaces is octal-escaped there, which our paths never are). The LAST
+/// matching line wins (a later mount over the same path shadows).
+pub fn mountinfoMinor(text: []const u8, mountpoint: []const u8) ?u32 {
+    var found: ?u32 = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = it.next() orelse continue;
+        _ = it.next() orelse continue;
+        const majmin = it.next() orelse continue;
+        _ = it.next() orelse continue;
+        const mp = it.next() orelse continue;
+        if (!std.mem.eql(u8, mp, mountpoint)) continue;
+        const colon = std.mem.indexOfScalar(u8, majmin, ':') orelse continue;
+        found = std.fmt.parseInt(u32, majmin[colon + 1 ..], 10) catch continue;
+    }
+    return found;
+}
+
 /// The parameter's current verdict (null when unreadable: no FUSE module
 /// or a kernel without the ring).
 pub fn readEnableUring(io: Io) ?bool {
@@ -1243,6 +1505,7 @@ const Rig = struct {
         _ = linux.umount2(self.path.ptr, linux.MNT.DETACH);
         _ = linux.rmdir(self.path.ptr);
         self.io_exec.deinit();
+        self.fs.deinit();
         self.gpa.destroy(self.fs);
         self.env.deinit();
         self.gpa.free(self.path);
@@ -1340,9 +1603,55 @@ const Snapshot = struct {
     oversize: u64,
     tag_unknown: u64,
     on_leased: u64,
+    bridge_cancels: u64,
+    bridge_lost: u64,
+    bridge_orphans: u64,
+    release_failures: u64,
+    retain_refused: u64,
+    breach: u64,
+    attached: u64,
+    zc_replies: u64,
+    zc_serve_bytes: u64,
+    zc_bounce_bytes: u64,
+    zc_bounce_copies: u64,
+    fd_body_replies: u64,
+    fd_body_fallbacks: u64,
+    holds: u64,
+    extractions: u64,
+    lazy: u64,
+    retain_commits: u64,
+    releases: u64,
+    retain_refused_class: u64,
+    direction_refusals: u64,
+    direct_legs: u64,
+    bridges: u64,
+    late_demotions: u64,
 
     fn take() Snapshot {
         return .{
+            .bridge_cancels = worker.bridge_cancels.load(),
+            .bridge_lost = worker.bridge_lost.load(),
+            .bridge_orphans = worker.bridge_orphans.load(),
+            .release_failures = slot.release_failures.load(),
+            .retain_refused = slot.retain_refused.load(),
+            .breach = worker.kmbuf_attachment_breach.load(),
+            .attached = worker.kmbuf_attached_deliveries.load(),
+            .zc_replies = worker.zc_replies.load(),
+            .zc_serve_bytes = worker.zc_serve_bytes.load(),
+            .zc_bounce_bytes = worker.zc_bounce_bytes.load(),
+            .zc_bounce_copies = worker.zc_bounce_copies.load(),
+            .fd_body_replies = worker.zc_fd_body_replies.load(),
+            .fd_body_fallbacks = worker.zc_fd_body_fallbacks.load(),
+            .holds = slot.zc_write_holds.load(),
+            .extractions = slot.zc_write_extractions.load(),
+            .lazy = slot.zc_write_lazy_extractions.load(),
+            .retain_commits = slot.retain_commits.load(),
+            .releases = slot.releases.load(),
+            .retain_refused_class = slot.retain_refused_class.load(),
+            .direction_refusals = slot.zc_direction_refusals.load(),
+            .direct_legs = worker.zc_direct_legs.load(),
+            .bridges = worker.zc_bridges.load(),
+            .late_demotions = worker.fused_read_late_demotions.load(),
             .requests = worker.ring_requests.load(),
             .reads = worker.ring_reads.load(),
             .serves = worker.fast_dispatch_serves.load(),
@@ -1379,7 +1688,41 @@ fn expectLaws(a: Snapshot, b: Snapshot) !void {
     try testing.expectEqual(a.oversize, b.oversize);
     try testing.expectEqual(a.tag_unknown, b.tag_unknown);
     try testing.expectEqual(a.on_leased, b.on_leased);
+    try testing.expectEqual(a.bridge_lost, b.bridge_lost);
+    try testing.expectEqual(a.bridge_orphans, b.bridge_orphans);
+    try testing.expectEqual(a.release_failures, b.release_failures);
+    try testing.expectEqual(a.retain_refused, b.retain_refused);
+    try testing.expectEqual(a.breach, b.breach);
     try testing.expectEqual(b.reads - a.reads, (b.serves - a.serves) + (b.fusions - a.fusions) + (b.demotes - a.demotes));
+    // The bridge pool is empty at quiesce.
+    try testing.expectEqual(@as(u64, 0), worker.zc_bridge_pends.load());
+}
+
+/// The lattice rung under test, as the env pair the rig passes.
+fn modeEnv(mode: []const u8) [2][]const u8 {
+    return .{ "SQUEEZEFS_FUSE_BUFFER_MODE", mode };
+}
+
+fn preadAt(fd: linux.fd_t, buf: []u8, off: u64) !usize {
+    const got = linux.pread(fd, buf.ptr, buf.len, @intCast(off));
+    if (linux.errno(got) != .SUCCESS) return error.ReadFailed;
+    return got;
+}
+
+fn openPath(path: [*:0]const u8, flags: linux.O) !linux.fd_t {
+    const rc = linux.open(path, flags, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    return @intCast(rc);
+}
+
+/// Wait (bounded, yielding) until `pred` holds.
+fn waitUntil(ctx: anytype, comptime pred: fn (@TypeOf(ctx)) bool, budget_ns: u64) bool {
+    const deadline = clock.monotonicNs() + budget_ns;
+    while (!pred(ctx)) {
+        if (clock.monotonicNs() >= deadline) return false;
+        std.Thread.yield() catch {};
+    }
+    return true;
 }
 
 test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, enable_uring reads Y, every queue armed, stat/open/read from a helper thread arrive over the RING (the sideband saw no request), replies byte-exact, the geometry the kernel accepted equals the plan" {
@@ -1654,6 +1997,403 @@ test "e2e: notify frames ride the sideband — INVAL_INODE on a held inode succe
     try testing.expectEqual(@as(u64, 3), (notify_sent.load() + notify_enoent.load() + notify_failed.load()) - (sent + enoent + failed));
     try testing.expect(notify_sent.load() - sent >= 1);
     try testing.expect(notify_enoent.load() - enoent >= 1);
+}
+
+test "e2e lattice: every probe verdict on this kernel (kmbuf present with its pair, zc present with CapEff, retention present, TIME_LIMITS present); auto mounts ZeroCopy with width 1, retention armed, no user arena; the gauges publish" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, 20, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    const pair = s.verdicts.kmbuf.opcodes() orelse return error.KmbufAbsentOnTheVenue;
+    std.debug.print("\nlattice: kmbuf {d}/{d}, zc {t}, retention {t}, time_limits {t} ⇒ {t}\n", .{ pair.register, pair.unregister, s.verdicts.zc, s.retention, s.time_limits, s.mode });
+    try testing.expect((pair.register == 38 and pair.unregister == 39) or (pair.register == 37 and pair.unregister == 38));
+    try testing.expectEqual(probes.Verdict.present, s.verdicts.zc);
+    try testing.expectEqual(probes.Verdict.present, s.retention);
+    try testing.expectEqual(probes.Verdict.present, s.time_limits);
+    try testing.expect(s.init_reply.timeLimits());
+    try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+    try testing.expectEqual(@as(usize, 1), s.drain_groups.maxWidth());
+    try testing.expect(s.shared.retention);
+    try testing.expectEqual(@as(u64, 0), arena_bytes.load());
+    try testing.expect(kmbuf.pinned_bytes.load() >= @as(u64, s.plan.nqueues) * zc.ringEntriesFor(s.plan.depth) * s.plan.payload_sz);
+    try testing.expectEqual(@as(u64, 2), probes.mode_gauge.load());
+    try testing.expectEqual(@as(u64, pair.register), probes.kmbuf_gauge.load());
+    try testing.expectEqual(@as(u64, 1), probes.zc_gauge.load());
+    try testing.expectEqual(@as(u64, 1), probes.retention_gauge.load());
+    try testing.expectEqual(@as(u64, 1), probes.time_limits_gauge.load());
+    try testing.expectEqual(@as(u64, 1), time_limits_gauge.load());
+    try testing.expect(s.slab != null);
+    try testing.expectEqual(s.slab.?.bytes(), zc_bounce_slab_bytes.load());
+    try testing.expect(rig.fs.caps.?.buffer_mode == .zero_copy and rig.fs.caps.?.read_zc_serve and rig.fs.caps.?.retention);
+    std.debug.print("lattice: kernel max_background (fusectl) {d}, negotiated {d}\n", .{ kernel_max_background.load(), s.plan.max_background });
+}
+
+test "e2e lattice: an explicit `bufring` mounts BufRing (no arena, every payload read at the kernel address through the CQE bid); `user` mounts UserEnts (an arena, no attachments); both serve byte-exact and close the laws" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    for ([_][]const u8{ "bufring", "user" }, 0..) |mode, i| {
+        const rig = try Rig.init(testing.allocator, 21 + @as(u32, @intCast(i)), &.{modeEnv(mode)});
+        defer rig.deinit();
+        const before = Snapshot.take();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        const want: geometry.BufferMode = if (std.mem.eql(u8, mode, "bufring")) .buf_ring else .user_ents;
+        try testing.expectEqual(want, s.mode);
+        try testing.expect(s.slab == null);
+        var pb: [256]u8 = undefined;
+        try testing.expectEqual(@as(u64, EchoFs.big_len), try statSize(rig.child(&pb, "big")));
+        const big = try testing.allocator.alloc(u8, EchoFs.big_len);
+        defer testing.allocator.free(big);
+        try testing.expectEqual(EchoFs.big_len, try readWhole(rig.child(&pb, "big"), big));
+        for (big, 0..) |b, j| if (b != EchoFs.bigByte(j)) return error.BigPatternMismatch;
+        const data = "bufring bytes";
+        try testing.expectEqual(data.len, try writeWhole(rig.child(&pb, "scratch"), data));
+        try testing.expectEqualSlices(u8, data, rig.fs.scratch[0..data.len]);
+        const after = Snapshot.take();
+        try expectLaws(before, after);
+        if (want == .buf_ring) {
+            try testing.expectEqual(@as(u64, 0), arena_bytes.load());
+            try testing.expect(after.attached - before.attached > 0);
+            try testing.expectEqual(@as(usize, 1), s.drain_groups.maxWidth());
+        } else {
+            try testing.expect(arena_bytes.load() > 0);
+            try testing.expectEqual(before.attached, after.attached);
+        }
+        try testing.expectEqual(before.bridges, after.bridges);
+    }
+}
+
+test "e2e lattice: an explicit `zc` on a venue without CAP_SYS_ADMIN (the seam) fails the mount LOUD naming the probe; `auto` on the same seam settles on BufRing — the probe is the only degrade point" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    {
+        const rig = try Rig.init(testing.allocator, 23, &.{ modeEnv("zc"), .{ "SQUEEZEFS_TEST_FUSE_CAP_SYS_ADMIN_ABSENT", "1" } });
+        defer rig.deinit();
+        log.testing.expectErrorLogs(1);
+        try testing.expectError(error.BufferModeRefused, rig.mountIt(.{ .mem_budget_bytes = 0 }));
+        try log.testing.expectAllFired();
+    }
+    {
+        const rig = try Rig.init(testing.allocator, 24, &.{.{ "SQUEEZEFS_TEST_FUSE_CAP_SYS_ADMIN_ABSENT", "1" }});
+        defer rig.deinit();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.buf_ring, s.mode);
+        try testing.expectEqual(probes.Verdict.absent, s.verdicts.zc);
+        try testing.expectEqual(@as(u64, 0), probes.cap_gauge.load());
+    }
+}
+
+test "e2e zc READ: /big moves through the fd-source leg from the fill pool (zc_serve_bytes ≡ user bytes, daemon copies 0, every reply rode the slot); with SQUEEZEFS_READ_ZC_SERVE=0 the bounce leg serves with ONE copy per READ" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    for ([_][]const u8{ "1", "0" }, 0..) |serve, i| {
+        const rig = try Rig.init(testing.allocator, 25 + @as(u32, @intCast(i)), &.{.{ "SQUEEZEFS_READ_ZC_SERVE", serve }});
+        defer rig.deinit();
+        const before = Snapshot.take();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+        const on = serve[0] == '1';
+        try testing.expectEqual(on, rig.fs.pool_fd >= 0);
+        var pb: [256]u8 = undefined;
+        const fd = try openPath(rig.child(&pb, "big"), .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        var buf: [64 * 1024]u8 = undefined;
+        var user_bytes: u64 = 0;
+        var reads: u64 = 0;
+        var off: u64 = 0;
+        while (off < EchoFs.big_len) : (off += buf.len) {
+            const n = try preadAt(fd, &buf, off);
+            for (buf[0..n], 0..) |b, j| if (b != EchoFs.bigByte(@intCast(off + j))) return error.BigPatternMismatch;
+            user_bytes += n;
+            reads += 1;
+        }
+        // EOF: a zero-length paged reply is header-only, never a zero-length READ_FIXED.
+        try testing.expectEqual(@as(usize, 0), try preadAt(fd, &buf, EchoFs.big_len));
+        const after = Snapshot.take();
+        try expectLaws(before, after);
+        try testing.expectEqual(@as(u64, EchoFs.big_len), user_bytes);
+        try testing.expectEqual(reads, after.zc_replies - before.zc_replies);
+        if (on) {
+            try testing.expectEqual(user_bytes, after.zc_serve_bytes - before.zc_serve_bytes);
+            try testing.expectEqual(reads, after.fd_body_replies - before.fd_body_replies);
+            try testing.expectEqual(@as(u64, 0), rig.fs.read_copies.load(.monotonic));
+            try testing.expectEqual(before.zc_bounce_bytes, after.zc_bounce_bytes);
+        } else {
+            try testing.expectEqual(user_bytes, after.zc_bounce_bytes - before.zc_bounce_bytes);
+            try testing.expectEqual(reads, rig.fs.read_copies.load(.monotonic));
+            try testing.expectEqual(before.zc_serve_bytes, after.zc_serve_bytes);
+            // Served in place into the bounce window: no worker memcpy.
+            try testing.expectEqual(before.zc_bounce_copies, after.zc_bounce_copies);
+        }
+        try testing.expectEqual(before.fd_body_fallbacks, after.fd_body_fallbacks);
+        try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
+        std.debug.print("\nzc read (READ_ZC_SERVE={s}): {d} reads, {d} user bytes, zc_serve {d}, bounce {d}, daemon copies {d}, enters {d}\n", .{ serve, reads, user_bytes, after.zc_serve_bytes - before.zc_serve_bytes, after.zc_bounce_bytes - before.zc_bounce_bytes, rig.fs.read_copies.load(.monotonic), after.enters - before.enters });
+    }
+}
+
+test "e2e zc WRITE: a W1-eligible aligned write is HELD in the slot and extracted lazily by the handler (one bridge, bytes land); an unaligned write is extracted at delivery; a session whose filesystem never declares eligibility extracts every paged write at delivery" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, 27, &.{});
+    defer rig.deinit();
+    rig.fs.hold_eligible = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+    const before = Snapshot.take();
+    var pb: [256]u8 = undefined;
+    const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    // Aligned 4 KiB at offset 4096: the W1 shape ⇒ HELD ⇒ lazy extraction.
+    var page: [4096]u8 = undefined;
+    for (&page, 0..) |*b, i| b.* = @truncate(i * 3 + 1);
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 4096));
+    try testing.expectEqual(@as(u64, 1), rig.fs.held_writes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), rig.fs.lazy_extracts.load(.monotonic));
+    try testing.expectEqualSlices(u8, &page, rig.fs.scratch[4096..8192]);
+    const mid = Snapshot.take();
+    try testing.expectEqual(@as(u64, 1), mid.holds - before.holds);
+    try testing.expectEqual(@as(u64, 1), mid.lazy - before.lazy);
+    try testing.expectEqual(@as(u64, 1), mid.extractions - before.extractions);
+    // Unaligned: not a hold candidate ⇒ extracted at delivery.
+    const tail = "unaligned tail";
+    try testing.expectEqual(@as(usize, tail.len), linux.pwrite(fd, tail, tail.len, 8192 + 7));
+    try testing.expectEqualSlices(u8, tail, rig.fs.scratch[8192 + 7 ..][0..tail.len]);
+    const after = Snapshot.take();
+    try expectLaws(before, after);
+    try testing.expectEqual(@as(u64, 1), after.holds - before.holds);
+    try testing.expectEqual(@as(u64, 2), after.extractions - before.extractions);
+    try testing.expectEqual(@as(u64, 1), after.lazy - before.lazy);
+    try testing.expectEqual(@as(u64, 2), rig.fs.writes_seen.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), slot.leases_outstanding.load());
+    try testing.expectEqual(@as(u8, @backingInt(zc.PayloadClass.page_cache)), rig.fs.last_write_class.load(.acquire));
+    // A filesystem that never declares eligibility: the same aligned write is extracted at delivery.
+    rig.fs.hold_eligible = false;
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 12288));
+    try testing.expectEqualSlices(u8, &page, rig.fs.scratch[12288..16384]);
+    const last = Snapshot.take();
+    try testing.expectEqual(after.holds, last.holds);
+    try testing.expectEqual(@as(u64, 1), last.extractions - after.extractions);
+}
+
+test "e2e zc bridges: a bridge that never completes (the stall seam) is cancelled at the deadline — bridge_cancels == 1, the slot still commits header-only -EIO (THE LAW: the reader gets EIO), lost/orphans stay 0, the session serves on" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, 28, &.{ .{ "SQUEEZEFS_TEST_ZC_BRIDGE_STALL", "1" }, .{ "SQUEEZEFS_TEST_ZC_BRIDGE_DEADLINE_MS", "300" } });
+    defer rig.deinit();
+    // The tripwire's log line and the deadline scan's line.
+    rig.fs.probe_declines = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0, .test_error_logs = 2 });
+    try testing.expectEqual(geometry.BufferMode.zero_copy, s.mode);
+    try testing.expectEqual(300 * std.time.ns_per_ms, s.shared.bridge_deadline_ns);
+    const before = Snapshot.take();
+    var pb: [256]u8 = undefined;
+    const fd = try openPath(rig.child(&pb, "hello"), .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    defer _ = linux.close(fd);
+    var buf: [64]u8 = undefined;
+    const t0 = clock.monotonicNs();
+    // The first paged READ's bridge reads the writer-less pipe: it never
+    // completes; the deadline cancels it; the reader sees EIO.
+    try testing.expectError(error.ReadFailed, preadAt(fd, &buf, 0));
+    const waited = clock.monotonicNs() - t0;
+    try testing.expect(waited >= 300 * std.time.ns_per_ms);
+    const mid = Snapshot.take();
+    try testing.expectEqual(@as(u64, 1), mid.bridge_cancels - before.bridge_cancels);
+    try testing.expectEqual(before.bridge_lost, mid.bridge_lost);
+    try testing.expectEqual(before.bridge_orphans, mid.bridge_orphans);
+    try testing.expectEqual(before.abandoned, mid.abandoned);
+    // The seam is spent: the next READ serves normally.
+    const n = try preadAt(fd, &buf, 0);
+    try testing.expectEqualSlices(u8, EchoFs.hello_text, buf[0..n]);
+    const after = Snapshot.take();
+    try expectLaws(before, after);
+    try testing.expectEqual(@as(u64, 1), after.bridge_cancels - before.bridge_cancels);
+    std.debug.print("\nbridge stall: cancelled after {d} ms (deadline 300), reader EIO, then served\n", .{waited / std.time.ns_per_ms});
+}
+
+test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns while the slot is Retained (ACK-early observed), the handler extracts AFTER the ACK, releases, the slot is Replied (retain_commits − releases ≡ 0); an O_DIRECT write is `.direct_gup` and its retain is REFUSED (committed plain, counted); teardown with a retained slot drains kernel-side and leaves no mount" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, 29, &.{});
+    defer rig.deinit();
+    rig.fs.hold_eligible = true;
+    rig.fs.retain_writes = true;
+    rig.fs.retain_ignore_class = true;
+    // The worker's class-refusal warn is a warn; the stale-reply refusals of
+    // the releases after a refused retain are warns too.
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    try testing.expect(s.shared.retention);
+    const before = Snapshot.take();
+    var pb: [256]u8 = undefined;
+    // Both fds are closed BEFORE the session (step 4): an open fd across a
+    // lazy detach keeps the superblock alive, and its FLUSH would wait on a
+    // connection whose devs the ring queues still hold.
+    const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    var page: [4096]u8 = undefined;
+    for (&page, 0..) |*b, i| b.* = @truncate(i * 5 + 2);
+    // 1. ACK-early: write(2) returns before the handler extracted or released.
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 0));
+    const acked = Snapshot.take();
+    try testing.expectEqual(@as(u64, 1), acked.retain_commits - before.retain_commits);
+    try testing.expectEqual(before.releases, acked.releases);
+    try testing.expectEqual(@as(u64, 1), slot.retained_outstanding.load());
+    try testing.expectEqual(@as(u64, 1), rig.fs.retained_replies.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.release_calls.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.lazy_extracts.load(.monotonic));
+    // The slot: retained (owes no reply), its pages still registered.
+    try testing.expectEqual(@as(u32, 0), s.owedCount());
+    var retained_slots: u32 = 0;
+    for (s.groups) |g| for (g.members) |*m| for (m.slots.ents) |*e| if (e.state == .retained) {
+        retained_slots += 1;
+    };
+    try testing.expectEqual(@as(u32, 1), retained_slots);
+    // 2. Open the gate: the handler extracts from the still-registered slot
+    //    (the bytes land AFTER the ACK), then releases.
+    rig.fs.openRetainGate();
+    const Released = struct {
+        fn done(r: *Rig) bool {
+            return r.fs.release_calls.load(.monotonic) >= 1 and slot.retained_outstanding.load() == 0;
+        }
+    };
+    try testing.expect(waitUntil(rig, Released.done, 5 * std.time.ns_per_s));
+    try testing.expectEqualSlices(u8, &page, rig.fs.scratch[0..4096]);
+    try testing.expectEqual(@as(u64, 1), rig.fs.lazy_extracts.load(.monotonic));
+    const released = Snapshot.take();
+    try testing.expectEqual(@as(u64, 1), released.releases - before.releases);
+    try testing.expectEqual(released.retain_commits - before.retain_commits, released.releases - before.releases);
+    try testing.expectEqual(before.release_failures, released.release_failures);
+    try testing.expectEqual(before.retain_refused, released.retain_refused);
+    // The released slot is Replied and serves again.
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 4096));
+    try testing.expect(waitUntil(rig, struct {
+        fn done(r: *Rig) bool {
+            return r.fs.release_calls.load(.monotonic) >= 2 and slot.retained_outstanding.load() == 0;
+        }
+    }.done, 5 * std.time.ns_per_s));
+    try testing.expectEqualSlices(u8, &page, rig.fs.scratch[4096..8192]);
+    // 3. O_DIRECT: `.direct_gup` — the handler snapshots first and the
+    //    worker refuses the retain, committing plain.
+    const dfd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true, .DIRECT = true });
+    const aligned = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 4096);
+    defer testing.allocator.free(aligned);
+    for (aligned, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    const refused_before = slot.retain_refused_class.load();
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(dfd, aligned.ptr, aligned.len, 8192));
+    try testing.expectEqual(@as(u8, @backingInt(zc.PayloadClass.direct_gup)), rig.fs.last_write_class.load(.acquire));
+    try testing.expectEqual(refused_before + 1, slot.retain_refused_class.load());
+    try testing.expectEqualSlices(u8, aligned, rig.fs.scratch[8192..12288]);
+    try testing.expect(waitUntil(rig, struct {
+        fn done(r: *Rig) bool {
+            return r.fs.release_calls.load(.monotonic) >= 3;
+        }
+    }.done, 5 * std.time.ns_per_s));
+    const after = Snapshot.take();
+    try expectLaws(before, after);
+    try testing.expectEqual(@as(u64, 2), after.retain_commits - before.retain_commits);
+    try testing.expectEqual(@as(u64, 2), after.releases - before.releases);
+    try testing.expectEqual(@as(u64, 0), slot.retained_outstanding.load());
+    // 4. Teardown with a RETAINED slot: close the gate first so the next
+    //    retain parks; close the session; the kernel drains the retained
+    //    ent; the handler's late extract fails and its release is dropped.
+    rig.fs.retain_gate = .unset;
+    try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 12288));
+    try testing.expectEqual(@as(u64, 1), slot.retained_outstanding.load());
+    _ = linux.close(dfd);
+    _ = linux.close(fd);
+    s.close();
+    try testing.expect(!s.isMounted());
+    rig.fs.openRetainGate();
+    s.deinit();
+    rig.session = null;
+    try testing.expectEqual(@as(u64, 1), rig.fs.extract_failures.load(.monotonic));
+    try testing.expectEqual(after.abandoned, slot.requests_abandoned.load());
+    // The retained slot was the kernel's: our ledger closes at teardown.
+    slot.retained_outstanding.set(0);
+}
+
+test "e2e TIME_LIMITS: a utimensat with a time outside our advertised range is clamped by the VFS to the bound before it reaches the daemon" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, 30, &.{});
+    defer rig.deinit();
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    try testing.expect(s.init_reply.timeLimits());
+    var pb: [256]u8 = undefined;
+    const path = rig.child(&pb, "scratch");
+    // Far past our ceiling: the VFS clamps to s_time_max = our TIME_LIMITS_MAX_SEC.
+    const times = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = std.math.maxInt(i64) / 2, .nsec = 0 } };
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, path, &times, 0)));
+    try testing.expectEqual(abi.TIME_LIMITS_MAX_SEC, rig.fs.scratch_mtime.load(.acquire));
+    var st: linux.Statx = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, path, 0, linux.STATX.BASIC_STATS, &st)));
+    try testing.expectEqual(abi.TIME_LIMITS_MAX_SEC, st.mtime.sec);
+    // And the floor.
+    const low = [2]linux.timespec{ linux.UTIME.OMIT, .{ .sec = std.math.minInt(i64) / 2, .nsec = 0 } };
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, path, &low, 0)));
+    try testing.expectEqual(abi.TIME_LIMITS_MIN_SEC, rig.fs.scratch_mtime.load(.acquire));
+}
+
+test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zc session — a probe that declines its first poll is served by the fused re-poll (fusions > 0, late demotions 0); the partition law holds; on BufRing the lever is inert (demotions)" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    for ([_][]const u8{ "auto", "bufring" }, 0..) |mode, i| {
+        const rig = try Rig.init(testing.allocator, 31 + @as(u32, @intCast(i)), &.{ modeEnv(mode), .{ "SQUEEZEFS_FUSE_READ_FUSION", "1" } });
+        defer rig.deinit();
+        rig.fs.probe_declines_first = true;
+        const before = Snapshot.take();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        var pb: [256]u8 = undefined;
+        var small: [64]u8 = undefined;
+        var k: u32 = 0;
+        while (k < 8) : (k += 1) {
+            const n = try readWhole(rig.child(&pb, "hello"), &small);
+            try testing.expectEqualSlices(u8, EchoFs.hello_text, small[0..n]);
+        }
+        const after = Snapshot.take();
+        try expectLaws(before, after);
+        if (s.mode == .zero_copy) {
+            try testing.expect(s.shared.read_fusion_on);
+            try testing.expect(after.fusions - before.fusions >= 8);
+            try testing.expectEqual(before.late_demotions, after.late_demotions);
+            try testing.expect(worker.fused_polls.load() >= 8);
+        } else {
+            try testing.expect(!s.shared.read_fusion_on);
+            try testing.expectEqual(before.fusions, after.fusions);
+        }
+        std.debug.print("\nfused ({s}): reads {d}, serves {d}, fusions {d}, demotes {d}, late demotions {d}\n", .{ mode, after.reads - before.reads, after.serves - before.serves, after.fusions - before.fusions, after.demotes - before.demotes, after.late_demotions - before.late_demotions });
+    }
+}
+
+test "e2e measured (scoping): enters per request and daemon copies per READ under UserEnts, BufRing and ZeroCopy side by side — 64 × 16 KiB preads of /big" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    std.debug.print("\n| mode | reads | ring requests | enters | enters/request | daemon READ copies | copies/READ | zc_serve bytes |\n|---|---|---|---|---|---|---|---|\n", .{});
+    for ([_][]const u8{ "user", "bufring", "zc" }, 0..) |mode, i| {
+        const rig = try Rig.init(testing.allocator, 33 + @as(u32, @intCast(i)), &.{modeEnv(mode)});
+        defer rig.deinit();
+        const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+        var pb: [256]u8 = undefined;
+        const fd = try openPath(rig.child(&pb, "big"), .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+        defer _ = linux.close(fd);
+        var buf: [16 * 1024]u8 = undefined;
+        const before = Snapshot.take();
+        var k: u64 = 0;
+        while (k < 64) : (k += 1) {
+            const n = try preadAt(fd, &buf, k * buf.len);
+            try testing.expectEqual(buf.len, n);
+        }
+        const settle = clock.monotonicNs() + 2 * std.time.ns_per_s;
+        while (s.owedCount() > 0 and clock.monotonicNs() < settle) std.Thread.yield() catch {};
+        const after = Snapshot.take();
+        try expectLaws(before, after);
+        const reqs = after.requests - before.requests;
+        const en = after.enters - before.enters;
+        const copies = rig.fs.read_copies.load(.monotonic);
+        std.debug.print("| {t} | 64 | {d} | {d} | {d}.{d:0>2} | {d} | {d}.{d:0>2} | {d} |\n", .{ s.mode, reqs, en, en / @max(reqs, 1), (en * 100 / @max(reqs, 1)) % 100, copies, copies / 64, (copies * 100 / 64) % 100, after.zc_serve_bytes - before.zc_serve_bytes });
+    }
+}
+
+test "mountinfo: the connection minor is the mountpoint's major:minor field, the last match wins, a foreign path or a malformed line is null" {
+    const text =
+        "22 1 0:21 / /proc rw,relatime - proc proc rw\n" ++
+        "138 22 0:37 / /build/tmp/mnt-7-1 rw,nosuid,nodev,relatime - fuse echo rw,user_id=0,group_id=0\n" ++
+        "short line\n" ++
+        "140 22 0:39 / /build/tmp/mnt-7-1 rw,relatime - fuse echo rw\n" ++
+        "141 22 x:y / /build/tmp/mnt-7-2 rw,relatime - fuse echo rw\n";
+    try testing.expectEqual(@as(?u32, 39), mountinfoMinor(text, "/build/tmp/mnt-7-1"));
+    try testing.expectEqual(@as(?u32, 21), mountinfoMinor(text, "/proc"));
+    try testing.expectEqual(@as(?u32, null), mountinfoMinor(text, "/build/tmp/mnt-7-2"));
+    try testing.expectEqual(@as(?u32, null), mountinfoMinor(text, "/nope"));
+    try testing.expectEqual(@as(?u32, null), mountinfoMinor("", "/proc"));
 }
 
 test "sideband sizing: cells one per possible straggler plus the notify floor; ring entries cover the READs, a write per cell and the cancel" {

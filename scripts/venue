@@ -8,6 +8,7 @@
 #   scripts/venue test [filter]   # shorthand: zig build test [-- filter]
 #   scripts/venue up              # (re)create the container
 #   scripts/venue status          # kernel, zig, fuse/uring facts
+#   scripts/venue trim            # return deleted blocks to the Mac (run after big tests)
 #
 # Zig caches live on the `squeezefs-zig-cache` volume (/build) — never on the
 # virtiofs mount, where the cache's rename/lock traffic is slow.
@@ -67,6 +68,12 @@ run_in() {
 
 case "${1:-}" in
   up) up ;;
+  trim)
+    # Return deleted blocks to the Mac: the container disk is a sparse image
+    # that only shrinks when the guest issues discards. Run after big-file
+    # tests; also clears stale test images under /build/tmp.
+    run_in 'rm -rf /build/tmp/mnt-* /build/tmp/*.img /build/tmp/*.log 2>/dev/null; sync; fstrim -v /build; df -h /build | tail -1'
+    ;;
   status)
     run_in 'uname -r; zig version; echo "install prefix: zig-out-linux/"; echo "fuse.enable_uring=$(cat /sys/module/fuse/parameters/enable_uring)"; echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"; nproc; free -g | sed -n 2p'
     ;;

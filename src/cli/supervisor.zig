@@ -10,10 +10,12 @@
 //! portable and tested; `run` is the Linux loop over it.
 //!
 //! Constants with their reasons:
-//! - `PROBE_INTERVAL_NS` 5 s: the probe is a `stat` of the mount root (the
-//!   `.stats` inode's stand-in until rung 5); the kernel's attr TTL is 1 s
-//!   (charter §4), so every probe REACHES the daemon as a GETATTR — a probe
-//!   faster than the TTL would measure the kernel's cache, not the daemon.
+//! - `PROBE_INTERVAL_NS` 5 s: the probe is a `stat` of `<mountpoint>/.stats`
+//!   (the charter's control inode: a LOOKUP-only entry with TTL 0, so every
+//!   probe REACHES the daemon as a LOOKUP and renders a payload — a root
+//!   `stat` under the 1 s attr TTL would measure the kernel's dentry cache,
+//!   not the daemon; `stats_cli.md` §7 Q19); 5 s is one daemon watchdog
+//!   tick, the slowest periodic cadence the daemon already runs.
 //! - `UNRESPONSIVE_NS` 30 s: six missed probes = six ticks of the daemon's
 //!   own 5 s watchdog, long enough that a cold-device checkpoint or a
 //!   ring-admission park never trips it (both are bounded in seconds, and
@@ -105,14 +107,17 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     /// parked in the kernel on the mount).
     const Probe = struct {
         gpa: std.mem.Allocator,
-        path: [:0]const u8,
+        path: [:0]u8,
         done: completion.Completion(bool) = .{},
         /// Two parties; the one that drops it to 0 frees.
         refs: std.atomic.Value(u32) = .init(2),
 
         fn release(self: *Probe) void {
             // acq_rel: the freeing side sees the other side's last write.
-            if (self.refs.fetchSub(1, .acq_rel) == 1) self.gpa.destroy(self);
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
+                self.gpa.free(self.path);
+                self.gpa.destroy(self);
+            }
         }
 
         fn main(self: *Probe) void {
@@ -123,9 +128,14 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    /// `stat(mountpoint)` within `timeout_ns`; false on a timeout or an error.
-    pub fn probe(gpa: std.mem.Allocator, path: [:0]const u8, timeout_ns: u64) bool {
-        const p = gpa.create(Probe) catch return false;
+    /// `stat(<mountpoint>/.stats)` within `timeout_ns`; false on a timeout
+    /// or an error.
+    pub fn probe(gpa: std.mem.Allocator, mountpoint: [:0]const u8, timeout_ns: u64) bool {
+        const path = std.fmt.allocPrintSentinel(gpa, "{s}/.stats", .{mountpoint}, 0) catch return false;
+        const p = gpa.create(Probe) catch {
+            gpa.free(path);
+            return false;
+        };
         p.* = .{ .gpa = gpa, .path = path };
         const t = std.Thread.spawn(.{}, Probe.main, .{p}) catch {
             gpa.destroy(p);

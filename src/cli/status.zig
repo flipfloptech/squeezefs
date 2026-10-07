@@ -1,5 +1,6 @@
-//! `squeezefs status sqmeta://<path>` (charter §8): the superblock, the
-//! newest ledger record, the set config and a one-line summary, read
+//! `squeezefs status sqmeta://<path>|<mountpoint>` (charter §8): the
+//! superblock, the newest ledger record, the set config, the client
+//! registrations and a one-line summary, read
 //! O_DIRECT through the io pool without the writer guard (a read-only
 //! snapshot beside a live daemon is legal: both superblock copies and
 //! every ledger slot are whole-sector, checksummed units; the control
@@ -7,8 +8,10 @@
 //! and not yet checkpointed is in the journal, which a status never
 //! replays), and the data volumes' REFERENCE CENSUS out of the native slot
 //! tree (records and distinct blocks per volume — the pack census the
-//! smoke reads, the C8 oracle's durable half). Also the preflight
-//! classifier `format` shares. Linux only.
+//! smoke reads, the C8 oracle's durable half). A mountpoint target resolves
+//! through the live mount's `.config` (`stats_cli.md` §7 Q8: the META path,
+//! never a cache directory) and adds the `.stats` headline. Also the
+//! preflight classifier `format` shares. Linux only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,6 +32,9 @@ const set_config = @import("../data/set_config.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const align_probe = @import("../io/align_probe.zig");
 const derive = @import("../core/derive.zig");
+const target_mod = @import("target.zig");
+const guard = @import("../meta/guard.zig");
+const json_scan = @import("../core/json_scan.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/status is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -234,15 +240,43 @@ pub fn writeReport(w: *Io.Writer, meta_uri: []const u8, snap: Snapshot, rec: ?le
     }
 }
 
+/// The `.stats` headline of a live mount: `fuse_ops`, `invariant_
+/// tripwires`, `volume_failed`, the live inode population — read by key
+/// name off the control inode (one LOOKUP + READ; the daemon renders).
+pub fn writeMountHeadline(w: *Io.Writer, gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) Io.Writer.Error!void {
+    const path = std.fmt.allocPrint(gpa, "{s}/.stats", .{mountpoint}) catch return;
+    defer gpa.free(path);
+    const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 << 20)) catch {
+        try w.print("  live       {s}/.stats unreadable\n", .{mountpoint});
+        return;
+    };
+    defer gpa.free(text);
+    try w.print("  live       {s}: fuse_ops {d}, in flight {d}, invariant_tripwires {d}, volume_failed {}, live inodes {d}, stats payload {d} B\n", .{
+        mountpoint,
+        json_scan.number(text, "fuse_ops") orelse 0,
+        json_scan.number(text, "fuse_ops_inflight") orelse 0,
+        json_scan.number(text, "invariant_tripwires") orelse 0,
+        json_scan.boolean(text, "volume_failed") orelse false,
+        json_scan.number(text, "live_inodes") orelse 0,
+        text.len,
+    });
+}
+
 pub fn run(p: cli.Process, s: args.Status) u8 {
+    var resolved = target_mod.resolve(p.gpa, p.io, s.target) catch |e| {
+        target_mod.writeRefusal(p.stderr, "status", s.target, e) catch {};
+        return cli.exit_failed;
+    };
+    defer resolved.deinit(p.gpa);
+    const meta_uri = resolved.meta_uri;
     var members: [uri.MAX_MEMBERS][]const u8 = undefined;
     var udiag: uri.Refusal = undefined;
-    const meta = uri.parse(.meta, s.meta_uri, &members, &udiag) catch {
+    const meta = uri.parse(.meta, meta_uri, &members, &udiag) catch {
         p.stderr.print("squeezefs status: {f}\n", .{udiag}) catch {};
         return cli.exit_usage;
     };
     if (meta.paths.len != 1) {
-        p.stderr.print("squeezefs status: {s} names {d} metadata volumes; this rung reports ONE\n", .{ s.meta_uri, meta.paths.len }) catch {};
+        p.stderr.print("squeezefs status: {s} names {d} metadata volumes; this rung reports ONE\n", .{ meta_uri, meta.paths.len }) catch {};
         return cli.exit_failed;
     }
     const path = meta.first();
@@ -284,7 +318,20 @@ pub fn run(p: cli.Process, s: args.Status) u8 {
             }
         }
     }
-    writeReport(p.stdout, s.meta_uri, snap, rec, cfg, census.items, writerGuardHeld(path)) catch return cli.exit_failed;
+    writeReport(p.stdout, meta_uri, snap, rec, cfg, census.items, writerGuardHeld(path)) catch return cli.exit_failed;
+    if (snap.prior == .formatted) {
+        // The registrations (the claim holder under the ONE staleness law).
+        if (guard.gate.clients(p.gpa, p.io, p.env, pool, path, null)) |rows| {
+            defer p.gpa.free(rows);
+            if (rows.len == 0) {
+                p.stdout.writeAll("  clients    none registered\n") catch {};
+            } else for (rows) |r| {
+                p.stdout.writeAll("  clients    ") catch {};
+                r.writeText(p.stdout, path) catch {};
+            }
+        } else |e| p.stdout.print("  clients    unreadable ({s})\n", .{@errorName(e)}) catch {};
+        if (resolved.via_mount) writeMountHeadline(p.stdout, p.gpa, p.io, s.target) catch {};
+    }
     p.stdout.flush() catch {};
     return if (snap.prior == .formatted) cli.exit_ok else cli.exit_failed;
 }

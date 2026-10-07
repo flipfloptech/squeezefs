@@ -1,6 +1,8 @@
 //! The one CLI binary's verbs (charter §8): `format`, `mount` (`--daemon
-//! --supervise --log-file`), `umount`, `status`, `--version`. `src/main.zig`
-//! runs the knob gate first (charter §1.6) and then hands argv to `run`.
+//! --supervise --log-file`), `umount`, `status`, `clients`, `df`, `bench`,
+//! `clone`, `tune`, `config`, `staging`, `claim clear`, `--version`.
+//! `src/main.zig` runs the knob gate first (charter §1.6) and then hands
+//! argv to `run`.
 //!
 //! Portable here: the grammar (`args.zig`), the ONE URI parser (`uri.zig`),
 //! the log sink (`log_sink.zig`) and the supervisor's pure state machine
@@ -23,12 +25,32 @@ pub const fusermount = if (is_linux) @import("fusermount.zig") else struct {};
 pub const daemon = if (is_linux) @import("daemon.zig") else struct {};
 pub const mount = if (is_linux) @import("mount.zig") else struct {};
 pub const smoke = if (is_linux) @import("smoke.zig") else struct {};
+pub const target = if (is_linux) @import("target.zig") else struct {};
+pub const offline = if (is_linux) @import("offline.zig") else struct {};
+pub const clients = if (is_linux) @import("clients.zig") else struct {};
+pub const claim = if (is_linux) @import("claim.zig") else struct {};
+pub const df = if (is_linux) @import("df.zig") else struct {};
+pub const clone = if (is_linux) @import("clone.zig") else struct {};
+pub const config_verb = if (is_linux) @import("config_verb.zig") else struct {};
+pub const staging_verb = if (is_linux) @import("staging_verb.zig") else struct {};
+/// Portable planning + a Linux engine (its own gate inside).
+pub const tune = @import("tune.zig");
+pub const bench = @import("bench.zig");
+pub const bench_smoke = if (is_linux) @import("bench_smoke.zig") else struct {};
 
 /// Exit codes (charter §8; `sysexits`-free, three outcomes): 0 success,
 /// 1 a refused or failed verb (the reason on stderr), 2 a usage error.
 pub const exit_ok: u8 = 0;
 pub const exit_failed: u8 = 1;
 pub const exit_usage: u8 = 2;
+
+/// The build identity (charter §11): train, commit, profile — what
+/// `.stats` and `bench` rows print.
+pub const Build = struct {
+    train: []const u8 = "",
+    commit: []const u8 = "",
+    profile: []const u8 = "",
+};
 
 /// What a verb needs from the process.
 pub const Process = struct {
@@ -39,6 +61,7 @@ pub const Process = struct {
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     version: *const fn (*std.Io.Writer) std.Io.Writer.Error!void,
+    build: Build = .{},
 };
 
 /// Parse and dispatch; returns the exit code. A usage refusal prints the
@@ -62,6 +85,14 @@ pub fn run(p: Process) u8 {
         .mount => |m| return if (is_linux) mount.run(p, m) else linuxOnly(p, "mount"),
         .umount => |u| return if (is_linux) umount.run(p, u) else linuxOnly(p, "umount"),
         .status => |s| return if (is_linux) status.run(p, s) else linuxOnly(p, "status"),
+        .clients => |c| return if (is_linux) clients.run(p, c) else linuxOnly(p, "clients"),
+        .df => |d| return if (is_linux) df.run(p, d) else linuxOnly(p, "df"),
+        .bench => |b| return bench.run(p, b),
+        .clone => |c| return if (is_linux) clone.run(p, c) else linuxOnly(p, "clone"),
+        .tune => |t| return tune.run(p, t),
+        .config => |c| return if (is_linux) config_verb.run(p, c) else linuxOnly(p, "config"),
+        .staging => |s| return if (is_linux) staging_verb.run(p, s) else linuxOnly(p, "staging"),
+        .claim_clear => |c| return if (is_linux) claim.run(p, c) else linuxOnly(p, "claim clear"),
     }
 }
 
@@ -83,6 +114,8 @@ test {
     _ = uri;
     _ = log_sink;
     _ = supervisor;
+    _ = tune;
+    _ = bench;
     if (is_linux) {
         _ = format;
         _ = status;
@@ -91,6 +124,15 @@ test {
         _ = daemon;
         _ = mount;
         _ = smoke;
+        _ = target;
+        _ = offline;
+        _ = clients;
+        _ = claim;
+        _ = df;
+        _ = clone;
+        _ = config_verb;
+        _ = staging_verb;
+        _ = bench_smoke;
     }
 }
 

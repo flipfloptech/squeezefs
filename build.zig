@@ -24,8 +24,11 @@
 //!   zig build smoke        — THE SMOKE: the built binary as a child process
 //!                            against a real mount (the Linux venue; skips
 //!                            loudly elsewhere).
+//!   zig build bench-smoke  — `squeezefs bench --smoke` against a mount the
+//!                            step creates (one iteration of every workload).
 //!   zig build fmt          — `zig fmt --check` over the tree.
-//!   zig build gate         — fmt + test + rails + smoke: the per-commit gate.
+//!   zig build gate         — fmt + test + rails + smoke + bench-smoke: the
+//!                            per-commit gate.
 //!   zig build dist         — the dist profile artifact + split debug info.
 const std = @import("std");
 
@@ -146,6 +149,23 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke", "Run the smoke (format/mount/umount/status against a real mount)");
     smoke_step.dependOn(&run_smoke_tests.step);
 
+    // ---- the bench smoke (charter §11: one iteration of every workload
+    //      per commit): `squeezefs bench --smoke` against a mount the smoke
+    //      creates, driven like the smoke above; skips loudly off the venue ----
+    const bench_smoke_tests = b.addTest(.{
+        .name = "squeezefs-bench-smoke",
+        .root_module = squeezefs_mod,
+        .filters = &.{"bench gate:"},
+    });
+    const run_bench_smoke = b.addRunArtifact(bench_smoke_tests);
+    run_bench_smoke.setCwd(exe.getEmittedBinDirectory());
+    run_bench_smoke.has_side_effects = true;
+    // After the smoke: the two drive real mounts on one venue and must
+    // never share it (the build graph runs independent steps in parallel).
+    run_bench_smoke.step.dependOn(&run_smoke_tests.step);
+    const bench_smoke_step = b.step("bench-smoke", "Run `squeezefs bench --smoke` against a mount the step creates (one iteration of every workload)");
+    bench_smoke_step.dependOn(&run_bench_smoke.step);
+
     // ---- fmt check ----
     const fmt_step = b.step("fmt", "Check formatting (zig fmt --check)");
     const fmt = b.addFmt(.{
@@ -155,11 +175,12 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 
     // ---- the per-commit gate ----
-    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke (the per-commit gate)");
+    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke (the per-commit gate)");
     gate_step.dependOn(fmt_step);
     gate_step.dependOn(test_step);
     gate_step.dependOn(rails_step);
     gate_step.dependOn(smoke_step);
+    gate_step.dependOn(bench_smoke_step);
 
     // ---- dist: split debug info with a debuglink ----
     // objcopy --only-keep-debug squeezefs squeezefs.debug

@@ -27,9 +27,9 @@
 //! Serve: the main task parks on the daemon's eventfd through its lane ring
 //! (`SqzIo.readable`): a signal (`daemon.Signals`) or the session's
 //! `on_shutdown` hook (DESTROY from an external `umount`, a disconnect, a
-//! failed queue) wakes it. SIGUSR1 dumps every stats family to the log —
-//! the `.stats` inode's stand-in until rung 5. Stop latches; nothing is
-//! aborted from outside.
+//! failed queue) wakes it. SIGUSR1 logs every `.stats` family through the
+//! ONE aggregator (`stats/stats.zig`), one line per family. Stop latches;
+//! nothing is aborted from outside.
 //!
 //! Teardown: `Session.close` (drains synthesize every owed reply, the
 //! unmount, the workers join) → the watchdog and the cadence cancelled →
@@ -44,17 +44,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
+const Allocator = std.mem.Allocator;
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const uri = @import("uri.zig");
 const daemon = @import("daemon.zig");
 const fusermount = @import("fusermount.zig");
 const exec = @import("../exec/exec.zig");
-const exec_stats = @import("../exec/stats.zig");
 const backend = @import("../meta/backend.zig");
 const guard = @import("../meta/guard.zig");
-const checkpoint = @import("../meta/checkpoint.zig");
-const journal_lane = @import("../meta/journal_lane.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const handler = @import("../fuse/handler.zig");
@@ -68,8 +66,8 @@ const transform = @import("../data/transform.zig");
 const data_superblock = @import("../data/data_superblock.zig");
 const plane_mod = @import("../data/plane.zig");
 const slot = @import("../fuse/transport/slot.zig");
-const sync_tick = @import("../sync/tick.zig");
 const counters = @import("../core/counters.zig");
+const stats = @import("../stats/stats.zig");
 const derive = @import("../core/derive.zig");
 const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
@@ -103,6 +101,9 @@ const Ctx = struct {
     budget_bytes: u64,
     budget_host: mem_budget.Host,
     path: []const u8,
+    /// The raw URIs as the operator spelled them (`.config`, `.stats`).
+    meta_uri: []const u8,
+    data_uri: []const u8,
     mountpoint: [:0]const u8,
     opts: mount_options.MountOptions,
     /// The raw `-o` string (the fusermount3 path forwards it).
@@ -235,6 +236,8 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .budget_bytes = budget_bytes,
         .budget_host = host,
         .path = meta.first(),
+        .meta_uri = m.meta_uri,
+        .data_uri = "",
         .mountpoint = mountpoint,
         .opts = opts,
         .reporter = reporter,
@@ -262,6 +265,9 @@ fn mountMain(ctx: *Ctx) u8 {
     //     gate on an encrypted set.
     var cfg = loadSetConfig(ctx, be) orelse return cli.exit_failed;
     defer cfg.deinit(gpa);
+    const data_uri = dataUriOf(gpa, &cfg) catch return ctx.failed("out of memory (data uri)", .{});
+    defer gpa.free(data_uri);
+    ctx.data_uri = data_uri;
 
     // 2. The budget sampler (the registry already holds the fiber stacks;
     //    the arena joins at the session).
@@ -284,8 +290,29 @@ fn mountMain(ctx: *Ctx) u8 {
         .ttls = ctx.opts.ttls,
         .page_size = facts.page_size,
         .dlm_stripes = dlm.resolveWidth(env, facts, fuse_geometry.Q_DEPTH_DESIRED),
+        .uid = ctx.opts.uid,
+        .gid = ctx.opts.gid,
     }) catch return ctx.failed("out of memory mounting the filesystem", .{});
     defer fs.unmount();
+    // The `.stats`/`.config`/`.trace` renderer: every family's source the
+    // daemon owns (the session joins once it is up); the op-trace ring
+    // armed from its row with the derived geometry.
+    var vs: VirtualSource = .{
+        .renderer = stats.Renderer.init(gpa, .{
+            .build = .{ .train = ctx.p.build.train, .commit = ctx.p.build.commit, .profile = ctx.p.build.profile },
+            .mount = .{ .uid = ctx.opts.uid, .gid = ctx.opts.gid, .mountpoint = ctx.mountpoint, .sqmeta_uri = ctx.meta_uri, .sqdata_uri = ctx.data_uri, .read_only = ctx.opts.read_only, .writeback = ctx.opts.write_back, .direct_device_true = ctx.opts.direct_device_true },
+            .env = env,
+            .plane = plane,
+            .sqz = ctx.sqz,
+            .backend = be,
+            .io = io,
+        }),
+        .cfg = &cfg,
+    };
+    defer vs.renderer.deinit();
+    fs.bindVirtual(vs.face());
+    op_trace.armTrace(gpa, env, facts.possible_cpus, ctx.budget_bytes) catch return ctx.failed("out of memory (op-trace ring)", .{});
+    defer op_trace.disarmTrace();
     // The corpse sweep (kv_fs module doc): what a crashed daemon's forgets
     // left at nlink 0 is destroyed before any request is served.
     _ = fs.sweepCorpsesAtMount() catch |e| return ctx.failed("the corpse sweep at mount failed ({t})", .{e});
@@ -331,6 +358,7 @@ fn mountMain(ctx: *Ctx) u8 {
     };
     var session_live = true;
     defer if (session_live) session.deinit();
+    vs.renderer.sources.session = session;
     // The zc legs: the held-slot direct store on a zero-copy session, the
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
@@ -354,7 +382,7 @@ fn mountMain(ctx: *Ctx) u8 {
     }
 
     // 7. Serve until a stop latches or the session ends.
-    serve(ctx, session, be, plane);
+    serve(ctx, session, &vs);
 
     // 8. Teardown in order.
     session.close();
@@ -367,6 +395,7 @@ fn mountMain(ctx: *Ctx) u8 {
     const abandoned = transport.slot.requests_abandoned.load();
     log.info("teardown: session closed; open_count_stranded={d} transport_requests_abandoned={d} tick_rescues={d}/{d}", .{ stranded, abandoned, transport.worker.park_tick_commit_rescues.load(), transport.worker.park_tick_cqe_rescues.load() });
     session_live = false;
+    vs.renderer.sources.session = null;
     session.deinit();
     // The sampler stops BEFORE the plane's components (its gauges) go; the
     // dismount pass BEFORE the backend's final checkpoint (its promotions
@@ -461,6 +490,21 @@ fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
     return cfg;
 }
 
+/// `sqdata://a,b` over the set's non-retired data volumes (the exact
+/// string the CLI verbs accept; empty for a meta-only set).
+fn dataUriOf(gpa: Allocator, cfg: *const set_config.Config) Allocator.Error![]u8 {
+    var out: Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var first = true;
+    for (cfg.data) |d| {
+        if (d.state == .retired) continue;
+        out.writer.writeAll(if (first) "sqdata://" else ",") catch return error.OutOfMemory;
+        out.writer.writeAll(d.uri) catch return error.OutOfMemory;
+        first = false;
+    }
+    return out.toOwnedSlice();
+}
+
 fn openReason(e: backend.OpenError) []const u8 {
     return switch (e) {
         error.Busy => "another writer holds the single-writer guard (the flock, or a live writer claim — see the log)",
@@ -516,7 +560,7 @@ const HeldStore = struct {
     }
 };
 
-fn serve(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane_mod.DataPlane) void {
+fn serve(ctx: *Ctx, session: *Session, vs: *VirtualSource) void {
     const efd = daemon.Signals.eventfd();
     while (true) {
         _ = ctx.sqz.readable(efd) catch |e| {
@@ -525,7 +569,7 @@ fn serve(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane_mod
         };
         daemon.Signals.drain();
         const bits = daemon.Signals.take();
-        if (bits & daemon.SIG_STATS != 0) dumpStats(ctx, session, be, plane);
+        if (bits & daemon.SIG_STATS != 0) dumpStats(vs);
         if (bits & daemon.SIG_STOP != 0) {
             log.info("stop requested (SIGTERM/SIGINT): unmounting {s}", .{ctx.mountpoint});
             return;
@@ -538,96 +582,51 @@ fn serve(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane_mod
     }
 }
 
-/// Every stats family, one log line each (the `.stats` inode's rung-5 JSON,
-/// delivered through the log on SIGUSR1).
-fn dumpStats(ctx: *Ctx, session: *Session, be: *backend.KvBackend, plane: *plane_mod.DataPlane) void {
-    // The transport family is ~6 KiB with the zc legs' keys; a truncated
-    // line would hide the must-stay-0 gauges the smoke reads.
-    var buf: [16384]u8 = undefined;
-    var w: Io.Writer = .fixed(&buf);
-    session.writeStatsJson(&w) catch {};
-    log.info("stats transport: {s}", .{w.buffered()});
-    {
-        // Every data family under one object (the largest line: a 64 KiB
-        // buffer; a truncated dump names itself).
-        var dbuf: [65536]u8 = undefined;
-        var dw: Io.Writer = .fixed(&dbuf);
-        plane.writeFamiliesJson(&dw) catch {};
-        log.info("stats data: {s}", .{dw.buffered()});
-    }
-    {
-        // The metadata plane: the conveyor, the checkpoint's park-driven
-        // cycles, the journal lane — the family that names a commit stall.
-        w = .fixed(&buf);
-        w.writeAll("{\"conveyor\":") catch {};
-        be.conveyorStats().writeJson(&w) catch {};
-        w.writeAll(",\"conveyor_phases\":") catch {};
-        be.conveyorStats().writePhasesJson(&w) catch {};
-        w.writeAll(",\"meta_barrier\":") catch {};
-        checkpoint.stats.meta_barrier.snapshot().writeJson(&w) catch {};
-        w.print(",\"checkpoint\":{{\"meta_kv_checkpoints\":{d},\"meta_kv_ledger_writes\":{d},\"meta_device_syncs\":{d},\"meta_kv_checkpoint_park_cycles\":{d},\"meta_kv_maintenance_items\":{d},\"pending_free_stalled_cycles\":{d}}},\"journal_lane\":", .{
-            checkpoint.stats.meta_kv_checkpoints.load(),
-            checkpoint.stats.meta_kv_ledger_writes.load(),
-            checkpoint.stats.meta_device_syncs.load(),
-            checkpoint.stats.meta_kv_checkpoint_park_cycles.load(),
-            checkpoint.stats.meta_kv_maintenance_items.load(),
-            checkpoint.stats.pending_free_stalled_cycles.load(),
-        }) catch {};
-        journal_lane.writeStatsJson(&w) catch {};
-        w.writeAll("}") catch {};
-        log.info("stats meta: {s}", .{w.buffered()});
-    }
-    {
-        // The D0 guard: the process-wide families and this volume's mode,
-        // claim words and PR gauges.
-        w = .fixed(&buf);
-        w.writeAll("{\"guard\":") catch {};
-        guard.writeStatsJson(&w) catch {};
-        if (be.guard) |g| {
-            w.writeAll(",\"volume\":") catch {};
-            g.writeStatsJson(&w) catch {};
-        }
-        w.writeAll("}") catch {};
-        log.info("stats guard: {s}", .{w.buffered()});
-    }
-    w = .fixed(&buf);
-    ctx.sqz.writeStatsJson(&w) catch {};
-    log.info("stats exec: {s}", .{w.buffered()});
-    w = .fixed(&buf);
-    mem_budget.authority.writeStatsJson(&w) catch {};
-    log.info("stats mem_budget: {s}", .{w.buffered()});
-    w = .fixed(&buf);
-    op_trace.writeLatencyJson(&w) catch {};
-    log.info("stats ops: {s}", .{w.buffered()});
-    log.info("stats daemon: {{\"open_count_stranded\":{d},\"invariant_tripwires\":{d},\"fuse_ops\":{d},\"fuse_op_watchdog_overdue\":{d},\"fuse_ops_inflight\":{d},\"fuse_write_no_data_volume_refused\":{d},\"fuse_write_u32_index_refused\":{d},\"fuse_kvmap_sweeps_kicked\":{d},\"fuse_write_inline\":{d},\"fuse_write_staged\":{d},\"fuse_write_striped\":{d},\"fuse_write_promotions_to_striped\":{d},\"fuse_truncate_packed_clips\":{d},\"fuse_truncate_striped_clips\":{d},\"fuse_truncate_restages\":{d},\"fuse_truncate_zero_tail_bytes\":{d},\"fuse_reclaim_destroys\":{d},\"fuse_corpse_sweep_destroyed\":{d},\"fuse_reclaim_drains\":{d},\"fuse_reclaim_blocks_freed\":{d},\"exec_lane_tick_rescues\":{d},\"transport_park_tick_commit_rescues\":{d},\"transport_park_tick_cqe_rescues\":{d},\"lock_ticked_reregisters\":{d},\"channel_ticked_reregisters\":{d},\"volume_failed\":{}}}", .{
-        counters.tripwireCount("open_count_stranded"),
-        counters.invariantTripwires(),
-        handler.lifecycle.fuse_ops.load(),
-        watchdog.fuse_op_watchdog_overdue.load(),
-        watchdog.fuse_ops_inflight.load(),
-        handler.kv_fs.fuse_write_no_data_volume_refused.load(),
-        handler.kv_fs.fuse_write_u32_index_refused.load(),
-        handler.kv_fs.fuse_kvmap_sweeps_kicked.load(),
-        handler.kv_fs.fuse_write_inline.load(),
-        handler.kv_fs.fuse_write_staged.load(),
-        handler.kv_fs.fuse_write_striped.load(),
-        handler.kv_fs.fuse_write_promotions_to_striped.load(),
-        handler.kv_fs.fuse_truncate_packed_clips.load(),
-        handler.kv_fs.fuse_truncate_striped_clips.load(),
-        handler.kv_fs.fuse_truncate_restages.load(),
-        handler.kv_fs.fuse_truncate_zero_tail_bytes.load(),
-        handler.kv_fs.fuse_reclaim_destroys.load(),
-        handler.kv_fs.fuse_corpse_sweep_destroyed.load(),
-        handler.kv_fs.fuse_reclaim_drains.load(),
-        handler.kv_fs.fuse_reclaim_blocks_freed.load(),
-        exec_stats.lane_tick_rescues.load(),
-        transport.worker.park_tick_commit_rescues.load(),
-        transport.worker.park_tick_cqe_rescues.load(),
-        sync_tick.lock_ticked_reregisters.load(),
-        sync_tick.channel_ticked_reregisters.load(),
-        be.isFailed(),
-    });
+/// SIGUSR1: every `.stats` family through the ONE aggregator, one log
+/// line per family (`stats <name>: {…}`; the daemon line last).
+fn dumpStats(vs: *VirtualSource) void {
+    stats.logFamilies(&vs.renderer.sources, vs.renderer.gpa);
 }
+
+/// The `.stats`/`.config`/`.trace` renderer bound into the filesystem
+/// (`kv_fs.VirtualFace`): ONE `stats.Renderer` over the daemon's sources,
+/// the set config for `.config`, the op-trace drain for `.trace`.
+const VirtualSource = struct {
+    renderer: stats.Renderer,
+    cfg: *const set_config.Config,
+
+    fn build(ctx: *anyopaque, class: handler.virtual_inodes.Class, gpa: Allocator) Allocator.Error!handler.virtual_inodes.Owned {
+        const self: *VirtualSource = @ptrCast(@alignCast(ctx));
+        switch (class) {
+            .stats => {
+                const p = try self.renderer.render();
+                return .{ .buf = p.buf, .len = p.len };
+            },
+            .config => {
+                const p = try self.renderer.renderConfig(writeSet, self);
+                return .{ .buf = p.buf, .len = p.len };
+            },
+            .trace => {
+                var out: Io.Writer.Allocating = .init(gpa);
+                errdefer out.deinit();
+                op_trace.writeTraceJson(gpa, &out.writer) catch return error.OutOfMemory;
+                const buf = out.writer.buffer;
+                const len = out.writer.end;
+                out.writer.buffer = &.{};
+                return .{ .buf = buf, .len = len };
+            },
+        }
+    }
+
+    fn writeSet(ctx: *anyopaque, w: *Io.Writer) Io.Writer.Error!void {
+        const self: *VirtualSource = @ptrCast(@alignCast(ctx));
+        try self.cfg.writeJson(w);
+    }
+
+    fn face(self: *VirtualSource) handler.kv_fs.VirtualFace {
+        return .{ .ctx = self, .build = build };
+    }
+};
 
 const testing = std.testing;
 

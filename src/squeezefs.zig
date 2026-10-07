@@ -30,6 +30,7 @@ pub const knobs = @import("core/knobs.zig");
 pub const log = @import("core/log.zig");
 pub const errors = @import("core/errors.zig");
 pub const counters = @import("core/counters.zig");
+pub const json_scan = @import("core/json_scan.zig");
 pub const thread_name = @import("core/thread_name.zig");
 
 // ---- model checking: the exhaustive interleaving explorer (portable) ----
@@ -135,7 +136,7 @@ pub const data = struct {
 };
 
 // ---- observability surface: the .stats inode + CLI families (charter §10) ----
-// @anchor:stats_import
+pub const stats = @import("stats/stats.zig");
 
 // ---- memory (portable logic; the cgroup/proc readers are Linux-only inside) ----
 pub const mem_budget = @import("mem/budget.zig");
@@ -159,12 +160,13 @@ test {
     _ = log;
     _ = errors;
     _ = counters;
+    _ = json_scan;
     _ = thread_name;
     _ = model.explorer;
     _ = data.kvmap;
     _ = meta.guard;
     // @anchor:meta_routing_test
-    // @anchor:stats_test
+    _ = stats;
     _ = data.layout;
     _ = data.staging;
     _ = data.pack;

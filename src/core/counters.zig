@@ -315,6 +315,104 @@ pub fn forEachTripwireSite(ctx: anytype, comptime visit: fn (@TypeOf(ctx), site:
 }
 
 // ---------------------------------------------------------------------------
+// The generated stats writer (charter §10; `docs/porting/stats_cli.md` §1.4
+// and §7 Q1/Q4): a counter DECLARED is a counter EXPORTED. The `.stats`
+// aggregator walks a module's (or a `stats` namespace's) `pub var`
+// declarations and emits every instrument by type, so no family is ever a
+// hand-maintained list that drifts from its declarations.
+// ---------------------------------------------------------------------------
+
+/// An instrument the generated writer emits: one of the four primitives, a
+/// 1-D array of them (one JSON array), or a struct whose fields are all
+/// instruments (a phase group — one JSON object).
+pub fn isInstrument(comptime T: type) bool {
+    if (T == ShardedCounter or T == Gauge or T == Tripwire or T == ShardedLatencyHistogram) return true;
+    switch (@typeInfo(T)) {
+        .array => |a| return isInstrument(a.child),
+        .@"struct" => |s| {
+            if (s.field_types.len == 0) return false;
+            inline for (s.field_types) |F| if (!isInstrument(F)) return false;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// One instrument as a JSON value: counts and gauges as numbers, a tripwire
+/// as its count keyed by its SITE (the must-stay-0 census reads site names),
+/// a histogram in the ONE histogram shape, arrays and phase groups recursed.
+fn writeInstrumentValue(comptime T: type, ptr: *const T, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    if (T == ShardedCounter or T == Gauge or T == Tripwire) return w.print("{d}", .{ptr.load()});
+    if (T == ShardedLatencyHistogram) return ptr.snapshot().writeJson(w);
+    switch (@typeInfo(T)) {
+        .array => |a| {
+            try w.writeByte('[');
+            for (ptr, 0..) |*e, i| {
+                if (i != 0) try w.writeByte(',');
+                try writeInstrumentValue(a.child, e, w);
+            }
+            try w.writeByte(']');
+        },
+        .@"struct" => try writeFieldsJson(ptr, w),
+        else => comptime unreachable,
+    }
+}
+
+/// `"name":value` — a tripwire takes its site as the key.
+fn writeInstrumentEntry(comptime T: type, name: []const u8, ptr: *const T, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const k = if (T == Tripwire) ptr.site else name;
+    try w.print("\"{s}\":", .{k});
+    try writeInstrumentValue(T, ptr, w);
+}
+
+/// `{…}` over every instrument FIELD of a struct instance (`pub var stats:
+/// Stats = .{}` modules; phase groups).
+pub fn writeFieldsJson(ptr: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const S = @TypeOf(ptr.*);
+    try w.writeByte('{');
+    var first = true;
+    const info = @typeInfo(S).@"struct";
+    inline for (info.field_names, info.field_types) |name, F| {
+        if (comptime isInstrument(F)) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try writeInstrumentEntry(F, name, &@field(ptr.*, name), w);
+        }
+    }
+    try w.writeByte('}');
+}
+
+/// `{…}` over every instrument `pub var` DECLARATION of a namespace (a
+/// `pub const stats = struct { pub var … }` block or a whole module); the
+/// non-instrument declarations (functions, types, seams) are skipped.
+pub fn writeNamespaceJson(comptime Ns: type, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeByte('{');
+    var first = true;
+    inline for (@typeInfo(Ns).@"struct".decl_names) |name| {
+        const T = @TypeOf(@field(Ns, name));
+        if (comptime isInstrument(T)) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try writeInstrumentEntry(T, name, &@field(Ns, name), w);
+        }
+    }
+    try w.writeByte('}');
+}
+
+/// The instrument declarations of a namespace, by name (the inverse rail's
+/// in-process census and the tests' "declared ⇒ exported" check).
+pub fn instrumentNames(comptime Ns: type) []const []const u8 {
+    comptime {
+        @setEvalBranchQuota(20_000);
+        var names: []const []const u8 = &.{};
+        for (@typeInfo(Ns).@"struct".decl_names) |name| {
+            if (isInstrument(@TypeOf(@field(Ns, name)))) names = names ++ &[_][]const u8{name};
+        }
+        return names;
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -385,6 +483,51 @@ test "tripwire: one fire increments the total and the site by exactly 1, logs lo
     S.tw.fire("again");
     try testing.expectEqual(@as(u64, 2), S.tw.load());
     try log.testing.expectAllFired();
+}
+
+const GeneratedFixture = struct {
+    pub var hits: ShardedCounter = .{};
+    pub var level: Gauge = .{};
+    pub var never: Tripwire = .init("counters_generated_fixture_site");
+    pub var wall: ShardedLatencyHistogram = .{};
+    pub var by_site: [2]ShardedCounter = @splat(.{});
+    pub var phases: struct { a: ShardedLatencyHistogram = .{}, total: ShardedLatencyHistogram = .{} } = .{};
+    /// Not instruments: skipped by the generated writer.
+    pub var seam: u32 = 7;
+    pub const label = "x";
+    pub fn helper() void {}
+};
+
+test "generated writer: every instrument declaration is exported by type and name (a tripwire by its site), non-instruments are skipped, the order is the declaration order" {
+    GeneratedFixture.hits.add(3);
+    GeneratedFixture.level.set(9);
+    GeneratedFixture.by_site[1].inc();
+    GeneratedFixture.phases.total.record(1500);
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeNamespaceJson(GeneratedFixture, &w);
+    const out = w.buffered();
+    try testing.expect(std.mem.startsWith(u8, out, "{\"hits\":3,\"level\":9,\"counters_generated_fixture_site\":0,\"wall\":{\"buckets\":{"));
+    try testing.expect(std.mem.indexOf(u8, out, "\"by_site\":[0,1]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"phases\":{\"a\":{\"buckets\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"total\":{\"buckets\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "seam") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "label") == null);
+    try testing.expect(std.mem.endsWith(u8, out, "}}"));
+    const names = comptime instrumentNames(GeneratedFixture);
+    try testing.expectEqual(@as(usize, 6), names.len);
+    try testing.expectEqualStrings("hits", names[0]);
+    try testing.expectEqualStrings("phases", names[5]);
+    // A struct instance's fields take the same path.
+    const Inst = struct { reads: ShardedCounter = .{}, errors: ShardedCounter = .{}, note: u8 = 0 };
+    var inst: Inst = .{};
+    inst.errors.add(2);
+    var w2: std.Io.Writer = .fixed(&buf);
+    try writeFieldsJson(&inst, &w2);
+    try testing.expectEqualStrings("{\"reads\":0,\"errors\":2}", w2.buffered());
+    try testing.expect(!isInstrument(u64));
+    try testing.expect(!isInstrument(struct { a: u8 }));
+    try testing.expect(isInstrument([3]Gauge));
 }
 
 test "tripwire: an instance embedded in a dying struct leaves nothing dangling; the site sums its instances" {

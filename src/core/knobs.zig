@@ -93,9 +93,6 @@ pub const MIB_MAX: i128 = BYTES_MAX >> 20;
 /// THE REGISTRY. Grouped by subsystem; rows land with the module that reads
 /// them (the inverse-census rail refuses a row nothing reads).
 pub const registry = [_]Knob{
-    // (`SQUEEZEFS_STATS_KEY_CENSUS` lands with the `.stats` inode in rung 5 —
-    // a row nothing reads is dead code.)
-
     // ---- R5 memory budget ----
     .{ .key = "SQUEEZEFS_MEM_BUDGET_MB", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "R5 memory budget, MiB (absolute > cgroup memory.max × 0.8 > 70 % RAM)." },
     .{ .key = "SQUEEZEFS_TRANSPORT_MEM_MAX", .kind = .{ .int = .{ .lo = 1, .hi = MIB_MAX } }, .default = "derived", .class = .derived_override, .doc = "Transport payload-buffer cap, MiB (absolute > pct > derived budget/8)." },
@@ -234,6 +231,10 @@ pub const registry = [_]Knob{
     // ---- the D0 single-writer guard: the per-mount NVMe host identity (read by meta/guard/pr.zig) ----
     .{ .key = "SQUEEZEFS_HOSTNQN", .kind = .str, .default = "-", .class = .config, .doc = "The NVMe host NQN this daemon's fabric associations present and whose registrations the PR primitive judges as its own; PAIR-OR-NEITHER with SQUEEZEFS_HOSTID (exactly one configured refuses the mount: a hostnqn under the host's default hostid is how registrants alias on the device). Absent = /etc/nvme/hostnqn, read-only — never minted or written by a mount (quirk Q7). `-o hostnqn=` wins over the env." },
     .{ .key = "SQUEEZEFS_HOSTID", .kind = .str, .default = "-", .class = .config, .doc = "The NVMe host identifier (uuid) paired with SQUEEZEFS_HOSTNQN; pair-or-neither. Absent = /etc/nvme/hostid, read-only. Re-read every heartbeat: a change under a live PR mount fail-stops the volume (writer_guard_identity_mismatch). `-o hostid=` wins over the env." },
+
+    // ---- the observability surface (read by stats/stats.zig, fuse/handler/op_trace.zig) ----
+    .{ .key = "SQUEEZEFS_STATS_KEY_CENSUS", .kind = .bool, .default = "0", .class = .switch_, .doc = "The `.stats` key census (VAL-7a): the stores' live key sets (read LRU keys, NVMe read-cache block keys, staged file ids, active writes by inode, the pack's open blocks) in the payload. Read LIVE on every `.stats` build — the ONE knob read after mount, because a build is cold and a live flip is exactly how an operator uses it; off, the keys are present and empty so a consumer can always key on them, and every *_count gauge exports regardless." },
+    .{ .key = "SQUEEZEFS_OP_TRACE", .kind = .bool, .default = "0", .class = .switch_, .doc = "The sampled per-op trace ring (charter §10 `op_trace`): armed at mount, ONE ring per counter stripe with the derived geometry (rings = stripes; ring capacity = prev_pow2(max(budget/1024, rings × 1024 × 24) / rings / 24); divisor = the smallest N such that one second of the machine's op ceiling at the longest chain fits the pool), sampled by a deterministic per-op-id multiply so a traced op's chain is complete. `cat <mountpoint>/.trace` DRAINS it (`stat .trace` drains too — use `cat`); off, the hot path is one relaxed load and nothing is allocated." },
 };
 
 pub fn lookup(key: []const u8) ?*const Knob {

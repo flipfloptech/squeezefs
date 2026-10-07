@@ -53,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
         .stdout = stdout,
         .stderr = stderr,
         .version = writeVersion,
+        .build = .{ .train = build_options.train, .commit = build_options.git_commit, .profile = build_options.profile },
     });
     try stdout.flush();
     try stderr.flush();

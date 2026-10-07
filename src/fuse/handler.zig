@@ -31,6 +31,7 @@ pub const open_table = @import("handler/open_table.zig");
 pub const watchdog = @import("handler/watchdog.zig");
 pub const transport_seam = @import("handler/transport_seam.zig");
 pub const kv_fs = @import("handler/kv_fs.zig");
+pub const virtual_inodes = @import("handler/virtual_inodes.zig");
 
 pub const Filesystem = filesystem.Filesystem;
 pub const Ctx = filesystem.Ctx;
@@ -173,6 +174,7 @@ test {
     _ = watchdog;
     _ = transport_seam;
     _ = kv_fs;
+    _ = virtual_inodes;
     if (builtin.os.tag == .linux) _ = backend_e2e;
 }
 

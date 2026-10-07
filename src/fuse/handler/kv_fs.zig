@@ -100,6 +100,7 @@ const tree = @import("../../meta/tree.zig");
 const dlm = @import("../../meta/dlm.zig");
 const economy = @import("../../meta/economy.zig");
 const guard_claim = @import("../../meta/guard/claim.zig");
+const virtual_inodes = @import("virtual_inodes.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
 const layout = @import("../../data/layout.zig");
@@ -217,6 +218,22 @@ pub var dentry_without_inode: counters.Tripwire = .init("fuse_dentry_without_ino
 /// A stored layout record this binary cannot decode (must stay 0: the
 /// codec is total over the encoder's forms).
 pub var layout_record_corrupt: counters.Tripwire = .init("fuse_layout_record_corrupt");
+/// `fuse_reserved_xattr_refusals`: the allowlist's engagement — a set/get/
+/// remove of a name outside `user.*` (minus `user.squeezefs.`), `security.*`,
+/// `trusted.*` (a counter, not a tripwire: a probing tenant is not a
+/// cannot-happen).
+pub var fuse_reserved_xattr_refusals: counters.ShardedCounter = .{};
+/// `fuse_virtual_lookups`: `.stats`/`.config`/`.trace` generations minted.
+pub var fuse_virtual_lookups: counters.ShardedCounter = .{};
+
+/// The `.stats`/`.config`/`.trace` renderer the daemon binds (`stats/
+/// stats.zig`): `build` renders one class's payload into bytes the
+/// generation owns. Unbound (the loopback tests, a plane-less mount), the
+/// three names are ordinary negative lookups.
+pub const VirtualFace = struct {
+    ctx: *anyopaque,
+    build: *const fn (ctx: *anyopaque, class: virtual_inodes.Class, gpa: Allocator) Allocator.Error!virtual_inodes.Owned,
+};
 
 // ---------------------------------------------------------------------------
 // The store contract and the data face.
@@ -246,6 +263,9 @@ pub const Options = struct {
     page_size: u32 = 4096,
     /// The 4a stripe width (`dlm.resolveWidth` at the daemon).
     dlm_stripes: usize = dlm.dlm_stripes_shipped,
+    /// The mount identity: the owner of the virtual control inodes.
+    uid: u32 = 0,
+    gid: u32 = 0,
 };
 
 /// A held 4a set travelling with a transaction.
@@ -342,6 +362,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// From the INIT reply.
         minor: u32 = abi.FUSE_KERNEL_MINOR_VERSION,
         killpriv_v2: bool = false,
+        /// The mount identity (the virtual inodes' owner).
+        uid: u32,
+        gid: u32,
+        /// The virtual control inodes (`virtual_inodes.zig`) and the
+        /// renderer behind them.
+        virtuals: virtual_inodes.Registry,
+        virtual: ?VirtualFace = null,
+        /// Committed corpse destroys on this volume: the subtrahend of the
+        /// LIVE inode population `statfs.ffree` reports (POSIX-1: never the
+        /// monotone watermark, which made `IUsed` rise forever).
+        destroys: inos.DestroyTally = .{},
 
         /// Bind the store and the data face (the daemon's mount; `init` is
         /// the FUSE op).
@@ -358,6 +389,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .blksize = opts.page_size,
                 .pending = try economy.PendingTimes.init(gpa),
                 .locks = undefined,
+                .uid = opts.uid,
+                .gid = opts.gid,
+                .virtuals = virtual_inodes.Registry.init(gpa),
             };
             errdefer self.pending.deinit();
             self.locks = try dlm.Manager.init(gpa, opts.dlm_stripes);
@@ -367,11 +401,125 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn unmount(self: *Self) void {
+            self.virtuals.deinit();
             self.reclaim.deinit(self.gpa);
             self.parents.deinit(self.gpa);
             self.locks.deinit();
             self.pending.deinit();
             self.* = undefined;
+        }
+
+        /// Bind the `.stats`/`.config`/`.trace` renderer (after `mount`,
+        /// before the session arms).
+        pub fn bindVirtual(self: *Self, face: VirtualFace) void {
+            self.virtual = face;
+        }
+
+        // ---- the virtual control inodes (virtual_inodes.zig) ----
+
+        /// The frozen attributes of a generation: a regular 0400 file owned
+        /// by the mount identity, `size` the served bytes, `blocks` in
+        /// 512 B units, times = now.
+        fn virtualAttr(self: *Self, ino: u64, size: u64) abi.fuse_attr {
+            const stamp: i64 = @bitCast(now());
+            const v: InodeValue = .{ .mode = S.IFREG | virtual_inodes.VIRTUAL_INODE_MODE, .uid = self.uid, .gid = self.gid, .nlink = 1, .size = size, .atime = @bitCast(stamp), .mtime = @bitCast(stamp), .ctime = @bitCast(stamp) };
+            var a = codec.attrFromInode(ino, v, self.blksize);
+            a.blocks = virtual_inodes.blocksOf(size);
+            return a;
+        }
+
+        /// `lookup(1, ".stats"|".config"|".trace")`: render ONCE, mint a
+        /// generation, reply with BOTH TTLs 0 (every walk revalidates — a
+        /// fresh generation per consumer, a prompt FORGET).
+        fn lookupVirtual(self: *Self, c: *Ctx, class: virtual_inodes.Class) Error!filesystem.Entry {
+            const face = self.virtual orelse return error.FileNotFound;
+            c.stage(.meta_backend_start);
+            defer c.stage(.meta_backend_done);
+            const payload = try face.build(face.ctx, class, self.gpa);
+            errdefer self.gpa.free(payload.buf);
+            const ino = try self.virtuals.mint(class, payload);
+            fuse_virtual_lookups.inc();
+            return .{ .nodeid = ino, .entry_ttl_ns = 0, .attr_ttl_ns = 0, .attr = self.virtualAttr(ino, payload.len) };
+        }
+
+        fn virtualGetattr(self: *Self, ino: u64) Error!filesystem.Attr {
+            const size = self.virtuals.size(ino) orelse return error.StaleHandle;
+            return .{ .attr_ttl_ns = 0, .attr = self.virtualAttr(ino, size) };
+        }
+
+        /// A name a user may create, remove, rename or link at `parent`: the
+        /// root's three virtual names are refused EPERM (they are served by
+        /// lookup alone and a real dentry would be shadowed forever).
+        fn checkMutableName(parent_global: u64, name: []const u8) Error!void {
+            try checkName(name);
+            if (parent_global == inos.ROOT_INO and virtual_inodes.classOfName(name) != null) return error.PermissionDenied;
+        }
+
+        // ---- clone (charter §8 `clone`; stats_cli.md §4.1) ----
+
+        pub const CloneOutcome = struct {
+            /// The dest's GLOBAL ino (a NEW inode).
+            dest_ino: u64,
+            /// Bindings now referenced by both owners with the SHARED bit.
+            blocks_shared: u64,
+            /// Inline bytes copied (an inline source has no blocks).
+            inline_bytes: u64,
+        };
+
+        pub const CloneError = Error || error{ StagedSource, TreeMappedSource, NotAFile };
+
+        /// INSTANT CoW at the refs level: a NEW dest inode, the source's
+        /// layout record copied, and ONE transaction staging a durable
+        /// SHARED `+ref` per binding for BOTH owners (a remount reads
+        /// refcount 2 for a shared block instead of re-deriving it from a
+        /// tree walk; W1's sole-owner patch class refuses both files until
+        /// a CoW rewrite). Nothing is DMA'd: a packed tenant shares its
+        /// window, an inline source copies its bytes. A STAGED source
+        /// refuses (its acked payload lives in the mount's isolated staging
+        /// — a clone would mint a zero-filled twin), as does a tree-mapped
+        /// one (the block-map tree's clone is owed). Offline only: the
+        /// verb holds the writer guard, so no RAM pin round is needed.
+        pub fn cloneFile(self: *Self, c: *Ctx, src_global: u64, dest_parent: u64, dest_name: []const u8) CloneError!CloneOutcome {
+            const src = try localOf(src_global);
+            const sv = try self.readInode(src);
+            if (sv.mode & S.IFMT != S.IFREG) return error.NotAFile;
+            const rec = try self.readLayout(src);
+            defer self.freeLayout(rec);
+            const kind = kindOf(rec);
+            if (kind == .staged) return error.StagedSource;
+            if (rec) |r| if (r.layout.isKvmap()) return error.TreeMappedSource;
+            const entry = try self.createChild(c, dest_parent, dest_name, .{ .mode = (sv.mode & 0o7777) | S.IFREG });
+            const dest = try localOf(entry.nodeid);
+            const t = try self.beginExclusive(dest, @src());
+            errdefer self.store.abandon(t);
+            var dv = try self.readInode(dest);
+            var shared: u64 = 0;
+            var inline_bytes: u64 = 0;
+            if (rec) |r| {
+                const enc = try r.layout.encodeAlloc(self.gpa);
+                defer self.gpa.free(enc);
+                const k = try self.xattrKeyFor(dest, LAYOUT_XATTR);
+                if (k.existing) |e| self.gpa.free(e);
+                try self.stageXattrPut(t, &k.k, LAYOUT_XATTR, enc);
+                if (kind == .inline_) inline_bytes = r.layout.data.len;
+                var it = r.layout.named(self.geo.chunk);
+                while (it.next()) |e| {
+                    const base: block_refs.Reference = .{ .vol_tag = e.mapping.vol_tag, .block_idx = e.mapping.blockIdx(self.geo.chunk), .owner_ino = src, .block_index = e.block };
+                    var dref = base;
+                    dref.owner_ino = dest;
+                    try block_refs.stageOps(t, &.{ block_refs.takenShared(base), block_refs.takenShared(dref) });
+                    shared += 1;
+                }
+            }
+            dv.size = sv.size;
+            const stamp = now();
+            dv.mtime = stamp;
+            dv.ctime = stamp;
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(dest), &dv.encode());
+            try self.commit(c, t);
+            _ = self.pending.retire(dest);
+            self.data.noteShape(dest, sv.size, kind);
+            return .{ .dest_ino = entry.nodeid, .blocks_shared = shared, .inline_bytes = inline_bytes };
         }
 
         // ---- helpers ----
@@ -402,11 +550,35 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (name.len > NAME_MAX) return error.NameTooLong;
         }
 
-        /// The reserved-xattr screen: the layout, the symlink target and
-        /// the guard's control records on ino 1 (`writer_claim`) are never
-        /// listed, read, set or removed through FUSE.
+        /// The reserved-xattr screen is an ALLOWLIST (`stats_cli.md` §1.7):
+        /// `user.*` minus the `user.squeezefs.` family, `security.*` and
+        /// `trusted.*` pass; everything else — the layout record, the
+        /// symlink target, the guard's control records on ino 1
+        /// (`writer_claim`, `client:*`), `job:*`, "and anything added
+        /// later" — is never listed, read, set or removed through FUSE. WHY
+        /// an allowlist: a denylist left `system.symlink` (the VFS performs
+        /// NO permission check for `system.*`), the layout (a decodable
+        /// foreign value redirects reads to another file's blocks) and the
+        /// claim writable from an unprivileged shell. The guard's own
+        /// predicate stays the authority for its names.
+        pub fn xattrNameAllowed(name: []const u8) bool {
+            if (guard_claim.isGuardXattr(name)) return false;
+            if (std.mem.startsWith(u8, name, "user.")) return !std.mem.startsWith(u8, name, "user.squeezefs.");
+            return std.mem.startsWith(u8, name, "security.") or std.mem.startsWith(u8, name, "trusted.");
+        }
+
         fn isReservedXattr(name: []const u8) bool {
-            return std.mem.eql(u8, name, LAYOUT_XATTR) or std.mem.eql(u8, name, economy.SYMLINK_XATTR) or guard_claim.isGuardXattr(name);
+            return !xattrNameAllowed(name);
+        }
+
+        /// POSIX ACL names are not supported (EOPNOTSUPP, like a filesystem
+        /// mounted without `acl`); a reserved name is a counted refusal.
+        fn screenXattr(name: []const u8, comptime refusal: Error) Error!void {
+            if (std.mem.startsWith(u8, name, "system.posix_acl_")) return error.NotSupported;
+            if (isReservedXattr(name)) {
+                fuse_reserved_xattr_refusals.inc();
+                return refusal;
+            }
         }
 
         /// The inode as stored, FOLDED through the pending refinements;
@@ -856,6 +1028,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         pub fn lookup(self: *Self, c: *Ctx, a: filesystem.LookupArgs) Error!filesystem.Entry {
             try checkName(a.name);
+            if (a.parent == inos.ROOT_INO) if (virtual_inodes.classOfName(a.name)) |class| {
+                if (self.virtual != null) return self.lookupVirtual(c, class);
+            };
             if (std.mem.eql(u8, a.name, ".")) {
                 const v = try self.readDir(try localOf(a.parent));
                 return self.entryOf(a.parent, v);
@@ -882,6 +1057,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         pub fn forget(self: *Self, c: *Ctx, a: filesystem.ForgetArgs) void {
             if (!a.evicted) return;
+            if (virtual_inodes.isVirtualIno(a.ino)) return self.virtuals.forget(a.ino);
             self.forgetParent(a.ino);
             const local = localOf(a.ino) catch return;
             self.data.forgetShape(local);
@@ -1063,6 +1239,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     fuse_reclaim_blocks_freed.add(@intCast(p.after.n));
                 }
                 fuse_reclaim_destroys.add(destroyed);
+                self.destroys.noteCommitted(destroyed);
                 fuse_reclaim_drains.inc();
             }
         }
@@ -1085,9 +1262,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             after.kvmap_sweep = .{ .ino = ino, .removed = (size + self.block_size - 1) / self.block_size };
             self.afterCommit(&after);
             fuse_reclaim_destroys.inc();
+            self.destroys.noteCommitted(1);
         }
 
         pub fn getattr(self: *Self, c: *Ctx, a: filesystem.GetattrArgs) Error!filesystem.Attr {
+            if (virtual_inodes.isVirtualIno(a.ino)) return self.virtualGetattr(a.ino);
             c.stage(.meta_backend_start);
             const v = try self.readInode(try localOf(a.ino));
             c.stage(.meta_backend_done);
@@ -1095,6 +1274,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn setattr(self: *Self, c: *Ctx, a: filesystem.SetattrArgs) Error!filesystem.Attr {
+            // Every mutation of a virtual inode refuses (EACCES, the
+            // reference's class for a setattr on a control file).
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.AccessDenied;
             const local = try localOf(a.ino);
             var after: AfterCommit = .{};
             var old_size: u64 = 0;
@@ -1159,7 +1341,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         const NewChild = struct { mode: u32, rdev: u32 = 0, target: ?[]const u8 = null };
 
         fn createChild(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, child: NewChild) Error!filesystem.Entry {
-            try checkName(name);
+            try checkMutableName(parent_global, name);
             const is_dir = economy.isDirMode(child.mode);
             const parent = try localOf(parent_global);
             var plan: economy.GuardPlan = .{};
@@ -1217,7 +1399,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// unlink/rmdir: find (no guards) → lock the full set → revalidate
         /// → stage → commit.
         fn removeChild(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, want_dir: bool) Error!void {
-            try checkName(name);
+            try checkMutableName(parent_global, name);
             const parent = try localOf(parent_global);
             const probe = (try self.findDentry(parent, name)) orelse return error.FileNotFound;
             if (want_dir and !probe.isDir()) return error.NotDir;
@@ -1253,8 +1435,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn rename(self: *Self, c: *Ctx, a: filesystem.RenameArgs) Error!void {
-            try checkName(a.name);
-            try checkName(a.newname);
+            try checkMutableName(a.parent, a.name);
+            try checkMutableName(a.newparent, a.newname);
             const flags: economy.RenameFlags = .{ .noreplace = a.flags & RENAME_NOREPLACE != 0, .exchange = a.flags & RENAME_EXCHANGE != 0 };
             const whiteout = a.flags & RENAME_WHITEOUT != 0;
             if (a.flags & ~@as(u32, RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0) return error.InvalidArgument;
@@ -1347,7 +1529,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn link(self: *Self, c: *Ctx, a: filesystem.LinkArgs) Error!filesystem.Entry {
-            try checkName(a.newname);
+            try checkMutableName(a.newparent, a.newname);
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.PermissionDenied;
             const parent = try localOf(a.newparent);
             const child = try localOf(a.ino);
             var plan: economy.GuardPlan = .{};
@@ -1378,6 +1561,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn open(self: *Self, c: *Ctx, a: filesystem.OpenArgs) Error!filesystem.Opened {
+            if (virtual_inodes.isVirtualIno(a.ino)) {
+                // The generation IS the pin: fh = the generation ino, one
+                // reference until RELEASE. FOPEN_DIRECT_IO: the kernel
+                // trusts the read replies (short read = EOF) instead of
+                // a cached i_size; a write-intent open is EACCES (0400).
+                if (a.flags & @as(u32, @bitCast(linux.O{ .ACCMODE = .WRONLY })) != 0 or a.flags & @as(u32, @bitCast(linux.O{ .ACCMODE = .RDWR })) != 0) return error.AccessDenied;
+                if (!self.virtuals.pin(a.ino)) return error.StaleHandle;
+                return .{ .fh = a.ino, .open_flags = abi.FOPEN_DIRECT_IO };
+            }
             const local = try localOf(a.ino);
             const v = try self.readInode(local);
             if (economy.isDirMode(v.mode)) return error.IsDir;
@@ -1407,6 +1599,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn read(self: *Self, c: *Ctx, a: filesystem.ReadArgs) Error!filesystem.Data {
+            if (virtual_inodes.isVirtualIno(a.ino)) {
+                // The slice of the frozen generation (empty past EOF).
+                const n = @min(@as(usize, a.size), c.window.len);
+                return .{ .len = self.virtuals.read(a.ino, a.offset, c.window[0..n]) orelse return error.StaleHandle };
+            }
             const local = try localOf(a.ino);
             c.stage(.meta_backend_start);
             const v = try self.readInode(local);
@@ -1620,6 +1817,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// RELEASE: the write-back class drains (charter §6.2 "flush at
         /// release").
         pub fn release(self: *Self, _: *Ctx, a: filesystem.ReleaseArgs) Error!void {
+            if (virtual_inodes.isVirtualIno(a.ino)) return self.virtuals.unpin(a.ino);
             const local = localOf(a.ino) catch return;
             if (self.data.hasVolumes()) self.data.releaseIno(self.io, local);
         }
@@ -1671,6 +1869,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn listDir(self: *Self, c: *Ctx, a: filesystem.ReaddirArgs, plus: bool) Error!filesystem.Data {
             const dir = try localOf(a.ino);
             const dv = try self.readDir(dir);
+            // The virtual control inodes are LOOKUP-ONLY: never listed; their
+            // reserved cookies (never emitted) resume as the end of the stream.
+            if (virtual_inodes.isReservedCookie(a.offset)) return .{ .len = 0 };
             const pos = key.decodeReaddirCookie(a.offset) catch return error.InvalidArgument;
             var plain = codec.DirentWriter.init(c.window, a.size);
             var rich = codec.DirentPlusWriter.init(c.window, a.size);
@@ -1754,9 +1955,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// `df`: the data volumes' allocators when the set has them (the
-        /// charter's rule), else the metadata heap.
+        /// charter's rule), else the metadata heap; `ffree` from the LIVE
+        /// inode population (minted − destroyed, + the root), published as
+        /// `live_inodes`.
         pub fn statfs(self: *Self, _: *Ctx, _: filesystem.StatfsArgs) Error!filesystem.Statfs {
-            const used_inos = self.store.nextIno() -| inos.LOCAL_INO_BASE;
+            const used_inos = inos.publishLiveInodes(&.{inos.liveInodes(self.store.nextIno(), &.{}, self.destroys.load())});
             var total: u64 = 0;
             var free: u64 = 0;
             if (self.data.statfs()) |sp| {
@@ -1781,7 +1984,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         pub fn setxattr(self: *Self, c: *Ctx, a: filesystem.SetxattrArgs) Error!void {
             try checkName(a.name);
-            if (isReservedXattr(a.name)) return error.NotSupported;
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.PermissionDenied;
+            try screenXattr(a.name, error.PermissionDenied);
             if (a.value.len > record.xattrValueCap(self.store.nodeSize())) return error.ValueTooLarge;
             const local = try localOf(a.ino);
             const t = try self.beginExclusive(local, @src());
@@ -1800,7 +2004,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         pub fn getxattr(self: *Self, c: *Ctx, a: filesystem.GetxattrArgs) Error!filesystem.Xattr {
             try checkName(a.name);
-            if (isReservedXattr(a.name)) return error.NoAttribute;
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.NoAttribute;
+            try screenXattr(a.name, error.NoAttribute);
             const value = (try self.xattrValue(try localOf(a.ino), a.name)) orelse return error.NoAttribute;
             defer self.gpa.free(value);
             if (a.size == 0) return .{ .size = @intCast(value.len) };
@@ -1810,6 +2015,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn listxattr(self: *Self, c: *Ctx, a: filesystem.ListxattrArgs) Error!filesystem.Xattr {
+            if (virtual_inodes.isVirtualIno(a.ino)) return if (a.size == 0) .{ .size = 0 } else .{ .data = 0 };
             const local = try localOf(a.ino);
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
@@ -1837,7 +2043,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         pub fn removexattr(self: *Self, c: *Ctx, a: filesystem.RemovexattrArgs) Error!void {
             try checkName(a.name);
-            if (isReservedXattr(a.name)) return error.NoAttribute;
+            if (virtual_inodes.isVirtualIno(a.ino)) return error.PermissionDenied;
+            try screenXattr(a.name, error.PermissionDenied);
             const local = try localOf(a.ino);
             const t = try self.beginExclusive(local, @src());
             errdefer self.store.abandon(t);
@@ -2543,10 +2750,22 @@ test "POSIX: xattrs — set/get/list/remove, the size probe, ERANGE, CREATE/REPL
     try testing.expect(std.mem.indexOf(u8, list.body, "user.b\x00") != null);
     try testing.expect(std.mem.indexOf(u8, list.body, "layout") == null);
     try testing.expectEqual(linux.E.RANGE, h.call(.{ .listxattr = .{ .size = 5 } }, f).errno().?);
-    // Reserved names: never readable, never settable, never removable as user data.
-    try testing.expectEqual(linux.E.OPNOTSUPP, h.call(.{ .setxattr = .{ .name = "layout", .value = "x", .flags = 0 } }, f).errno().?);
+    // Reserved names (the allowlist's complement): EPERM on set/remove,
+    // ENODATA on get, each counted; POSIX ACLs EOPNOTSUPP.
+    const refused0 = fuse_reserved_xattr_refusals.load();
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = "layout", .value = "x", .flags = 0 } }, f).errno().?);
     try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = "layout", .size = 0 } }, f).errno().?);
-    try testing.expectEqual(linux.E.NODATA, h.call(.{ .removexattr = .{ .name = "system.symlink" } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .removexattr = .{ .name = "system.symlink" } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = "job:enroll", .value = "x", .flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = "user.squeezefs.stripes", .value = "4", .flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = "client:abc", .size = 0 } }, f).errno().?);
+    try testing.expectEqual(refused0 + 6, fuse_reserved_xattr_refusals.load());
+    try testing.expectEqual(linux.E.OPNOTSUPP, h.call(.{ .setxattr = .{ .name = "system.posix_acl_access", .value = "x", .flags = 0 } }, f).errno().?);
+    // The admitted families beside `user.*`.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .setxattr = .{ .name = "trusted.x", .value = "t", .flags = 0 } }, f).errno());
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .setxattr = .{ .name = "security.capability", .value = "c", .flags = 0 } }, f).errno());
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .removexattr = .{ .name = "trusted.x" } }, f).errno());
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .removexattr = .{ .name = "security.capability" } }, f).errno());
     // E2BIG past the record cap; removal; a second removal is ENODATA.
     const huge: [70000]u8 = @splat('v');
     try testing.expectEqual(linux.E.@"2BIG", h.call(.{ .setxattr = .{ .name = "user.big", .value = &huge, .flags = 0 } }, f).errno().?);
@@ -2555,6 +2774,206 @@ test "POSIX: xattrs — set/get/list/remove, the size probe, ERANGE, CREATE/REPL
     try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = "user.a", .size = 0 } }, f).errno().?);
     // The data record is untouched by the xattr traffic.
     try testing.expectEqualStrings("data", h.read(f, 0, 64).body);
+}
+
+test "the xattr allowlist: user.* yes (minus user.squeezefs.*), security.* and trusted.* yes; layout / system.symlink / job:* / client:* / writer_claim / the format record no" {
+    try testing.expect(MemFs.xattrNameAllowed("user.x"));
+    try testing.expect(MemFs.xattrNameAllowed("user.mime_type"));
+    try testing.expect(!MemFs.xattrNameAllowed("user.squeezefs.x"));
+    try testing.expect(!MemFs.xattrNameAllowed("user.squeezefs.il0"));
+    try testing.expect(MemFs.xattrNameAllowed("security.capability"));
+    try testing.expect(MemFs.xattrNameAllowed("trusted.x"));
+    try testing.expect(!MemFs.xattrNameAllowed("layout"));
+    try testing.expect(!MemFs.xattrNameAllowed("system.symlink"));
+    try testing.expect(!MemFs.xattrNameAllowed("job:x"));
+    try testing.expect(!MemFs.xattrNameAllowed("client:x"));
+    try testing.expect(!MemFs.xattrNameAllowed("writer_claim"));
+    try testing.expect(!MemFs.xattrNameAllowed("format_config"));
+    try testing.expect(!MemFs.xattrNameAllowed("system.posix_acl_access"));
+    try testing.expect(!MemFs.xattrNameAllowed(""));
+}
+
+/// A test renderer: a fixed payload per class, counting builds.
+const FakeVirtual = struct {
+    builds: u32 = 0,
+
+    fn build(ctx: *anyopaque, class: virtual_inodes.Class, gpa: Allocator) Allocator.Error!virtual_inodes.Owned {
+        const self: *FakeVirtual = @ptrCast(@alignCast(ctx));
+        self.builds += 1;
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        errdefer out.deinit();
+        out.writer.print("{{\"class\":\"{s}\",\"build\":{d}}}\n", .{ @tagName(class), self.builds }) catch return error.OutOfMemory;
+        const buf = out.writer.buffer;
+        const len = out.writer.end;
+        out.writer.buffer = &.{};
+        return .{ .buf = buf, .len = len };
+    }
+
+    fn face(self: *FakeVirtual) VirtualFace {
+        return .{ .ctx = self, .build = build };
+    }
+};
+
+test ".stats/.config/.trace: lookup-only generation inos (never listed, both TTLs 0, mode 0400 + mount uid/gid, size exact, blocks = ceil(size/512)); two lookups mint two frozen generations; open pins, reads slice, release + forget retire; a retired generation is ESTALE; unbound they are negative" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    // Unbound: a plain negative lookup (the loopback has no renderer).
+    try testing.expectEqual(@as(u64, 0), (try h.entry(h.lookup(1, ".stats"))).nodeid);
+    var fake: FakeVirtual = .{};
+    h.fs.bindVirtual(fake.face());
+    h.fs.uid = 1234;
+    h.fs.gid = 5678;
+    const e1 = try h.entry(h.lookup(1, ".stats"));
+    try testing.expect(virtual_inodes.isVirtualIno(e1.nodeid));
+    try testing.expectEqual(virtual_inodes.Class.stats, virtual_inodes.classOf(e1.nodeid));
+    try testing.expectEqual(@as(u64, 0), e1.entry_valid);
+    try testing.expectEqual(@as(u32, 0), e1.entry_valid_nsec);
+    try testing.expectEqual(@as(u64, 0), e1.attr_valid);
+    try testing.expectEqual(@as(u32, S.IFREG | 0o400), e1.attr.mode);
+    try testing.expectEqual(@as(u32, 1234), e1.attr.uid);
+    try testing.expectEqual(@as(u32, 5678), e1.attr.gid);
+    try testing.expectEqual(@as(u32, 1), e1.attr.nlink);
+    const payload1 = "{\"class\":\"stats\",\"build\":1}\n";
+    try testing.expectEqual(@as(u64, payload1.len), e1.attr.size);
+    try testing.expectEqual(@as(u64, 1), e1.attr.blocks);
+    try testing.expectEqual(@as(u32, 1), fake.builds);
+    // A second lookup mints a DISTINCT generation; the first stays frozen.
+    const e2 = try h.entry(h.lookup(1, ".config"));
+    try testing.expect(e2.nodeid != e1.nodeid);
+    try testing.expectEqual(virtual_inodes.Class.config, virtual_inodes.classOf(e2.nodeid));
+    const a1 = try h.getattr(e1.nodeid);
+    try testing.expectEqual(@as(u64, payload1.len), a1.size);
+    // OPEN: DIRECT_IO, fh = the generation; READ slices the snapshot.
+    const o = h.call(.{ .open = .{ .flags = 0, .open_flags = 0 } }, e1.nodeid);
+    const oo = abi.decodeExact(abi.fuse_open_out, o.outBytes()) orelse return error.TestBadReply;
+    try testing.expectEqual(e1.nodeid, oo.fh);
+    try testing.expect(oo.open_flags & abi.FOPEN_DIRECT_IO != 0);
+    try testing.expectEqualStrings(payload1, h.read(e1.nodeid, 0, 4096).body);
+    try testing.expectEqualStrings("build\":1}\n", h.read(e1.nodeid, payload1.len - 10, 4096).body);
+    try testing.expectEqual(@as(usize, 0), h.read(e1.nodeid, payload1.len, 4096).body.len);
+    // A write-intent open is refused by the mode; every mutation refuses.
+    try testing.expectEqual(linux.E.ACCES, h.call(.{ .open = .{ .flags = @bitCast(linux.O{ .ACCMODE = .WRONLY }), .open_flags = 0 } }, e1.nodeid).errno().?);
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_SIZE;
+    try testing.expectEqual(linux.E.ACCES, h.setattr(e1.nodeid, sa).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = "user.x", .value = "v", .flags = 0 } }, e1.nodeid).errno().?);
+    try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = "user.x", .size = 0 } }, e1.nodeid).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .unlink = .{ .name = ".stats" } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .mkdir = .{ .name = ".trace", .mode = 0o755, .umask = 0 } }, 1).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .rename = .{ .newdir = 1, .flags = 0, .name = ".config", .newname = "x" } }, 1).errno().?);
+    // Never listed by readdir; the reserved cookies resume as the end.
+    var buf: [512]u8 = undefined;
+    const names = try h.readdirNames(1, 0, &buf);
+    try testing.expect(std.mem.indexOf(u8, names, ".stats") == null and std.mem.indexOf(u8, names, ".config") == null);
+    try testing.expectEqual(@as(usize, 0), (try h.readdirNames(1, virtual_inodes.READDIR_STATS_COOKIE, &buf)).len);
+    // RELEASE drops the fh pin; FORGET the kernel's; the ring still holds it.
+    h.release(e1.nodeid);
+    h.forget(e1.nodeid, 1);
+    try testing.expectEqual(@as(u64, payload1.len), (try h.getattr(e1.nodeid)).size);
+    // Past the ring cap the first generation retires: ESTALE.
+    var i: usize = 0;
+    while (i < virtual_inodes.REGISTRY_CAP) : (i += 1) {
+        const e = try h.entry(h.lookup(1, ".trace"));
+        h.forget(e.nodeid, 1);
+    }
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, e1.nodeid).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.call(.{ .open = .{ .flags = 0, .open_flags = 0 } }, e1.nodeid).errno().?);
+    try testing.expectEqual(linux.E.STALE, h.read(e1.nodeid, 0, 16).errno().?);
+    // `.stats` in a subdirectory is an ordinary name.
+    const d = try h.mkdir(1, "d");
+    const sub = try h.create(d, ".stats", 0o644);
+    try testing.expect(!virtual_inodes.isVirtualIno(sub));
+    h.release(sub);
+}
+
+test "clone: an inline source copies its bytes into a NEW inode; a striped source's dest carries an identical map and every binding a SHARED +ref on BOTH owners (refcount 2) with nothing copied; a staged source and a directory refuse" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    var tr = op_trace.OpTrace.begin(1, .other);
+    defer tr.finish();
+    var win: [64]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 1000, .gid = 1000, .pid = 7, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    // Inline.
+    const f = try h.create(1, "f", 0o640);
+    _ = h.write(f, 0, "hello clone", 0);
+    h.release(f);
+    const out = try h.fs.cloneFile(&c, f, 1, "f.clone");
+    try testing.expect(out.dest_ino != f);
+    try testing.expectEqual(@as(u64, 0), out.blocks_shared);
+    try testing.expectEqual(@as(u64, 11), out.inline_bytes);
+    try testing.expectEqualStrings("hello clone", h.read(out.dest_ino, 0, 64).body);
+    const da = try h.getattr(out.dest_ino);
+    try testing.expectEqual(@as(u64, 11), da.size);
+    try testing.expectEqual(@as(u32, S.IFREG | 0o640), da.mode);
+    // The dest is independent: a write to it leaves the source alone.
+    _ = h.write(out.dest_ino, 0, "HELLO", 0);
+    try testing.expectEqualStrings("hello clone", h.read(f, 0, 64).body);
+    // Striped: a hand-laid two-block map on a fresh inode (the volume-less
+    // data face never writes one; the refs plane is the store's).
+    const g = try h.create(1, "g", 0o644);
+    h.release(g);
+    const gl = try MemFs.localOf(g);
+    const chunk = layout.DEFAULT_CHUNK;
+    const entries = [_]layout.MapEntryWire{
+        (layout.MapEntry{ .block = 0, .mapping = Mapping.wholeBlock(0x10, 3 * chunk, 1) }).encode(),
+        (layout.MapEntry{ .block = 1, .mapping = Mapping.wholeBlock(0x10, 9 * chunk, 1) }).encode(),
+    };
+    {
+        const t = try h.store.begin(@src());
+        const enc = try Layout.stripedInline(2 * chunk, &entries).encodeAlloc(testing.allocator);
+        defer testing.allocator.free(enc);
+        const k = try h.fs.xattrKeyFor(gl, LAYOUT_XATTR);
+        try h.fs.stageXattrPut(t, &k.k, LAYOUT_XATTR, enc);
+        var gv = try h.fs.readInode(gl);
+        gv.size = 2 * chunk;
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(gl), &gv.encode());
+        try block_refs.stageOps(t, &.{ block_refs.taken(.{ .vol_tag = 0x10, .block_idx = 3, .owner_ino = gl, .block_index = 0 }), block_refs.taken(.{ .vol_tag = 0x10, .block_idx = 9, .owner_ino = gl, .block_index = 1 }) });
+        try h.store.commit(t);
+    }
+    const refs_before = h.store.countKind(key.TREE_BLOCK_REFS);
+    const sout = try h.fs.cloneFile(&c, g, 1, "g.clone");
+    try testing.expectEqual(@as(u64, 2), sout.blocks_shared);
+    try testing.expectEqual(@as(u64, 0), sout.inline_bytes);
+    const dl = try MemFs.localOf(sout.dest_ino);
+    try testing.expectEqual(@as(u64, 2 * chunk), (try h.getattr(sout.dest_ino)).size);
+    // The maps are identical.
+    const src_rec = (try h.fs.readLayout(gl)).?;
+    defer testing.allocator.free(src_rec.value);
+    const dst_rec = (try h.fs.readLayout(dl)).?;
+    defer testing.allocator.free(dst_rec.value);
+    try testing.expectEqualSlices(u8, src_rec.value, dst_rec.value);
+    // refcount 1 → 2 per block, every record SHARED.
+    try testing.expectEqual(refs_before + 2, h.store.countKind(key.TREE_BLOCK_REFS));
+    for ([_]u64{ 3, 9 }) |blk| {
+        for ([_]u64{ gl, dl }) |owner| {
+            const idx: u32 = if (blk == 3) 0 else 1;
+            const rk = key.blockRefKey(0x10, blk, owner, idx);
+            const v = (try h.store.lookup(testing.allocator, key.TREE_BLOCK_REFS, &rk)).?;
+            defer testing.allocator.free(v);
+            try testing.expect((try record.BlockRefValue.decode(v)).shared);
+        }
+    }
+    // Refusals: a directory, a staged source.
+    const d = try h.mkdir(1, "d");
+    try testing.expectError(error.NotAFile, h.fs.cloneFile(&c, d, 1, "d.clone"));
+    const st = try h.create(1, "s", 0o644);
+    h.release(st);
+    const sl = try MemFs.localOf(st);
+    {
+        const t = try h.store.begin(@src());
+        const enc = try Layout.staged(100, layout.zero_file_id, null).encodeAlloc(testing.allocator);
+        defer testing.allocator.free(enc);
+        const k = try h.fs.xattrKeyFor(sl, LAYOUT_XATTR);
+        try h.fs.stageXattrPut(t, &k.k, LAYOUT_XATTR, enc);
+        try h.store.commit(t);
+    }
+    try testing.expectError(error.StagedSource, h.fs.cloneFile(&c, st, 1, "s.clone"));
+    try testing.expectEqual(@as(u64, 0), (try h.entry(h.lookup(1, "s.clone"))).nodeid);
+    // A clone onto an existing name is EEXIST; onto a virtual name EPERM.
+    try testing.expectError(error.PathAlreadyExists, h.fs.cloneFile(&c, f, 1, "f.clone"));
+    try testing.expectError(error.PermissionDenied, h.fs.cloneFile(&c, f, 1, ".stats"));
 }
 
 test "POSIX: fsync reaches the store's barrier; statfs reports the heap in pages, NAME_MAX and the ino space; opendir refuses a file; open refuses a directory" {

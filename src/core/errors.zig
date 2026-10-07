@@ -81,6 +81,13 @@ pub const Terminal = error{
     /// An operation this filesystem does not implement (ENOSYS: the kernel
     /// latches `fc->no_<op>` and stops asking).
     NotImplemented,
+    /// A handle to a RETIRED `.stats`/`.config`/`.trace` generation (ESTALE:
+    /// the zero entry TTL mints fresh on the next walk).
+    StaleHandle,
+    /// The operation is forbidden on this object whatever the mode bits
+    /// (EPERM: a reserved xattr, a virtual inode's mutation) — distinct
+    /// from `AccessDenied` (EACCES: the mode bits said no).
+    PermissionDenied,
     /// An errno outside the table (logged with its number; replies EIO).
     Unexpected,
 };
@@ -164,6 +171,10 @@ const table = [_]Row{
     .{ .e = .RANGE, .err = error.BufferTooSmall },
     .{ .e = .NODATA, .err = error.NoAttribute },
     .{ .e = .NOSYS, .err = error.NotImplemented },
+    .{ .e = .STALE, .err = error.StaleHandle },
+    // PERM also decodes to AccessDenied above (the first row wins on the
+    // way in); on the way out PermissionDenied is the one EPERM reply.
+    .{ .e = .PERM, .err = error.PermissionDenied },
 };
 
 /// Kernel → error. An errno outside the table is `Unexpected`, logged once
@@ -197,13 +208,29 @@ pub fn toErrno(err: Error) linux.E {
 const testing = std.testing;
 
 test "every table row round-trips; aliases map to the first row's errno" {
-    for (table) |row| try testing.expectEqual(row.err, fromErrno(row.e));
+    for (table) |row| {
+        // Every error encodes to its row's errno; an aliased errno decodes
+        // to its FIRST row's error (PERM → AccessDenied, MFILE/NFILE →
+        // TooManyOpenFiles).
+        // Encode: the error's first row (an alias row's error may encode to
+        // its own first errno, which decodes back to the same error).
+        const back = toErrno(row.err);
+        if (back != row.e) try testing.expectEqual(row.err, fromErrno(back));
+        // Decode: the errno's first row (PERM's first row is AccessDenied;
+        // PermissionDenied is the reply-only spelling of EPERM).
+        const decoded = fromErrno(row.e);
+        if (decoded != row.err) try testing.expect(row.e == .PERM or toErrno(decoded) == row.e);
+    }
     try testing.expectEqual(linux.E.IO, toErrno(error.InputOutput));
     try testing.expectEqual(linux.E.NOSPC, toErrno(error.NoSpaceLeft));
     try testing.expectEqual(linux.E.BADE, toErrno(error.ReservationConflict));
     // ACCES and PERM both decode to AccessDenied; the reply is ACCES (the first row).
     try testing.expectEqual(error.AccessDenied, fromErrno(.PERM));
     try testing.expectEqual(linux.E.ACCES, toErrno(error.AccessDenied));
+    // PermissionDenied is the EPERM reply; StaleHandle the ESTALE one.
+    try testing.expectEqual(linux.E.PERM, toErrno(error.PermissionDenied));
+    try testing.expectEqual(linux.E.STALE, toErrno(error.StaleHandle));
+    try testing.expectEqual(error.StaleHandle, fromErrno(.STALE));
     try testing.expectEqual(error.InputOutput, fromCqeRes(-@as(i32, @backingInt(linux.E.IO))));
 }
 

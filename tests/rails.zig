@@ -208,6 +208,133 @@ test "inverse census: every registered non-retired knob is read by PRODUCT code 
     }
 }
 
+// ---------------------------------------------------------------------------
+// The stats inverse rail (charter §10; `docs/porting/stats_cli.md` §1.4):
+// every module that DECLARES an instrument (`counters.ShardedCounter`,
+// `Gauge`, `Tripwire`, `ShardedLatencyHistogram` as the type of a `pub var`
+// or a struct field, outside test blocks) must be reachable from the
+// `.stats` tree — a `stats.sources` row (its own family) or a
+// `stats.covered` row (a module whose writer composes it). A declared
+// instrument nothing exports is dead observability and goes red.
+// ---------------------------------------------------------------------------
+
+const stats = squeezefs.stats;
+
+const instrument_types = [_][]const u8{ "ShardedCounter", "Gauge", "Tripwire", "ShardedLatencyHistogram" };
+
+/// The primitives' own module and the aggregator's test fixtures are not
+/// product declarations.
+const instrument_exempt = [_][]const u8{"src/core/counters.zig"};
+
+/// Does the file declare an instrument in product scope? A declaration is
+/// `: counters . <Type>` — the type position of a `pub var` or a field;
+/// a pointer (`*counters.Gauge`) or a call (`counters.Gauge.load`) is not.
+fn declaresInstrument(text: [:0]const u8) bool {
+    var tok = std.zig.Tokenizer.init(text);
+    var depth: usize = 0;
+    var test_depth: ?usize = null;
+    var pending_test = false;
+    // The last three significant tokens: `:` `counters` `.` `<Type>`.
+    var prev: [3]std.zig.Token.Tag = .{ .invalid, .invalid, .invalid };
+    var prev_text: [3][]const u8 = .{ "", "", "" };
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) break;
+        switch (t.tag) {
+            .keyword_test => pending_test = true,
+            .l_brace => {
+                depth += 1;
+                if (pending_test) {
+                    test_depth = depth;
+                    pending_test = false;
+                }
+            },
+            .r_brace => {
+                if (test_depth) |d| if (d == depth) {
+                    test_depth = null;
+                };
+                depth -|= 1;
+            },
+            .identifier => {
+                const word = text[t.loc.start..t.loc.end];
+                if (test_depth == null and prev[0] == .colon and prev[1] == .identifier and std.mem.eql(u8, prev_text[1], "counters") and prev[2] == .period) {
+                    for (instrument_types) |ty| if (std.mem.eql(u8, word, ty)) return true;
+                }
+            },
+            else => {},
+        }
+        prev[0] = prev[1];
+        prev[1] = prev[2];
+        prev[2] = t.tag;
+        prev_text[0] = prev_text[1];
+        prev_text[1] = prev_text[2];
+        prev_text[2] = text[t.loc.start..t.loc.end];
+    }
+    return false;
+}
+
+fn isExemptInstrumentFile(path: []const u8) bool {
+    for (instrument_exempt) |e| if (std.mem.eql(u8, e, path)) return true;
+    return false;
+}
+
+fn statsPathKnown(path: []const u8) bool {
+    for (stats.sources) |s| if (std.mem.eql(u8, s.path, path)) return true;
+    for (stats.covered) |c| if (std.mem.eql(u8, c.path, path)) return true;
+    return false;
+}
+
+test "stats inverse census: every module declaring an instrument is a stats source or covered by one; every source and covered path exists" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    const cwd = std.Io.Dir.cwd();
+    {
+        var d = try cwd.openDir(io, "src", .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, "src", &files);
+    }
+    try std.testing.expect(files.items.len >= min_files);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var declaring: usize = 0;
+    for (files.items) |path| {
+        if (isExemptInstrumentFile(path)) continue;
+        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        defer gpa.free(text);
+        if (!declaresInstrument(text)) continue;
+        declaring += 1;
+        if (!statsPathKnown(path)) try violations.writer.print("  {s}: declares an instrument but no stats family exports it (add a `stats.sources` row, or a `stats.covered` row naming the writer that composes it)\n", .{path});
+    }
+    // The census must have found the known population (a broken scanner
+    // passes vacuously otherwise).
+    try std.testing.expect(declaring >= stats.sources.len);
+    for (stats.sources) |s| {
+        cwd.access(io, s.path, .{}) catch try violations.writer.print("  stats.sources names {s}, which does not exist\n", .{s.path});
+    }
+    for (stats.covered) |c| {
+        cwd.access(io, c.path, .{}) catch try violations.writer.print("  stats.covered names {s}, which does not exist\n", .{c.path});
+    }
+    if (violations.written().len != 0) {
+        std.debug.print("stats inverse census violation(s):\n{s}", .{violations.written()});
+        return error.InstrumentNotExported;
+    }
+}
+
+test "the instrument scanner: a pub var or a field typed counters.<Type> counts; a pointer, a call, a test-block declaration and a plain identifier do not" {
+    try std.testing.expect(declaresInstrument("pub var hits: counters.ShardedCounter = .{};"));
+    try std.testing.expect(declaresInstrument("const S = struct { depth: counters.Gauge = .{} };"));
+    try std.testing.expect(declaresInstrument("pub var tw: counters.Tripwire = .init(\"x\");"));
+    try std.testing.expect(!declaresInstrument("fn f(g: *counters.Gauge) void { g.set(1); }"));
+    try std.testing.expect(!declaresInstrument("const n = counters.tripwireCount(\"x\");"));
+    try std.testing.expect(!declaresInstrument("test \"t\" { var g: counters.Gauge = .{}; _ = &g; }"));
+    try std.testing.expect(!declaresInstrument("const counters = @import(\"counters.zig\"); pub var x: u64 = 0;"));
+}
+
 test "the scan is a tokenizer's: a '\"' char literal and an escaped quote do not desync it; a test-block literal is not product scope" {
     const gpa = std.testing.allocator;
     const fixture: [:0]const u8 =

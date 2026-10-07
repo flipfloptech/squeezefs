@@ -254,6 +254,32 @@ pub const Config = struct {
         return false;
     }
 
+    /// The JSON twin of `writeSummary` (`.config`, `config show --json`,
+    /// `df --json`): `{set_uuid, config_generation, block_size, chunk_size,
+    /// capacity_bytes, compression, encryption, key_id?, inline_max, data[{
+    /// vol_tag, state, device_uuid, uri, capacity_blocks, volume_len}],
+    /// cache_paths[]}` — exactly the registered volumes, snake_case
+    /// (`stats_cli.md` §1.5, §7 Q18).
+    pub fn writeJson(self: *const Config, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll("{\"set_uuid\":\"");
+        try writeUuid(w, self.set_uuid);
+        try w.print("\",\"config_generation\":{d},\"block_size\":{d},\"chunk_size\":{d},\"capacity_bytes\":{d},\"compression\":\"{s}\",\"encryption\":\"{s}\"", .{ self.config_generation, self.block_size, self.chunk_size, self.capacity, @tagName(self.compression), self.encryption.name() });
+        if (self.encryption != .none) try w.print(",\"key_id\":\"{x}\"", .{&self.key_id});
+        try w.print(",\"inline_max\":{d},\"lifecycle_diverged\":{},\"data\":[", .{ self.inline_max, self.lifecycleDiverged() });
+        for (self.data, 0..) |d, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.print("{{\"vol_tag\":\"vol-{x:0>16}\",\"state\":\"{s}\",\"device_uuid\":\"", .{ d.vol_tag, d.state.name() });
+            try writeUuid(w, d.device_uuid);
+            try w.print("\",\"uri\":\"{s}\",\"capacity_blocks\":{d},\"volume_len\":{d}}}", .{ d.uri, d.capacity_blocks, d.volume_len });
+        }
+        try w.writeAll("],\"cache_paths\":[");
+        for (self.cache_paths, 0..) |p, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.print("\"{s}\"", .{p});
+        }
+        try w.writeAll("]}");
+    }
+
     /// The human summary (`status`, `format`).
     pub fn writeSummary(self: *const Config, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("  set config generation {d}; block {d} B; chunk {d} B; capacity {d} B ({d} MiB); compression {s}; encryption {s}", .{ self.config_generation, self.block_size, self.chunk_size, self.capacity, self.capacity >> 20, @tagName(self.compression), self.encryption.name() });
@@ -930,6 +956,31 @@ test "the head is 128 B and the record fixed part 64 B at the spec's offsets; bi
     try testing.expect(std.mem.indexOf(u8, out.written(), "aes-256-gcm") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "/etc/squeezefs/keys/0102030405060708.key") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "disk cache paths 2: /build/cache/a /build/cache/b") != null);
+}
+
+test "writeJson names exactly the registered volumes with their tags, states, device uuids and uris, the cache paths, and the key id only on an encrypted set" {
+    const vols = [_]DataVolume{
+        .{ .vol_tag = 0xfeed, .state = .active, .device_uuid = @splat(1), .added_ts = 0, .capacity_blocks = 10, .volume_len = 1 << 30, .uri = "/dev/d0" },
+        .{ .vol_tag = 0xbeef, .state = .active, .device_uuid = @splat(2), .added_ts = 0, .capacity_blocks = 20, .volume_len = 2 << 30, .uri = "/dev/d1" },
+    };
+    var cfg = try birth(std.testing.allocator, @splat(7), .{ .compression = .lz4, .block_size = 1 << 20 }, null, &vols, &.{ "/build/c1", "/build/c2" });
+    defer cfg.deinit(std.testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try cfg.writeJson(&out.writer);
+    const text = out.written();
+    try std.testing.expect(std.mem.startsWith(u8, text, "{\"set_uuid\":\"07070707-0707-0707-0707-070707070707\",\"config_generation\":1,\"block_size\":1048576,"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"compression\":\"lz4\",\"encryption\":\"none\",\"inline_max\":0,\"lifecycle_diverged\":true,\"data\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "{\"vol_tag\":\"vol-000000000000feed\",\"state\":\"active\",\"device_uuid\":\"01010101-0101-0101-0101-010101010101\",\"uri\":\"/dev/d0\",\"capacity_blocks\":10,\"volume_len\":1073741824}") != null);
+    // `birth` stamps every member active; a later transition shows by name.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"vol_tag\":\"vol-000000000000beef\",\"state\":\"active\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "\"cache_paths\":[\"/build/c1\",\"/build/c2\"]}"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "key_id") == null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\"vol_tag\""));
+    cfg.data[1].state = .draining;
+    out.clearRetainingCapacity();
+    try cfg.writeJson(&out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"vol_tag\":\"vol-000000000000beef\",\"state\":\"draining\"") != null);
 }
 
 test "decode refuses by class in order and names each; the record cap refuses at encode; a lying count never allocates past the bytes present" {

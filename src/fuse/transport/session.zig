@@ -54,6 +54,7 @@ const tick_law = @import("../../sync/tick.zig");
 const exec = @import("../../exec/exec.zig");
 const placement = @import("../../exec/placement.zig");
 const mem_budget = @import("../../mem/budget.zig");
+const read_divert = @import("../../meta/sym/tokens/read_divert.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("fuse/transport/session is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -823,6 +824,22 @@ pub const Session = struct {
     /// counted `transport_notify_failed`.
     pub fn notifyPrune(self: *Session, nodeids: []const u64) error{QueueFull}!void {
         return self.sideband.notify(codec.notifyPrune, .{nodeids});
+    }
+
+    /// The token plane's kernel-invalidation face (a recalled object's
+    /// `INVAL_INODE` + `PRUNE` ride the sideband like every notify).
+    pub fn tokenNotifySeam(self: *Session) read_divert.NotifySeam {
+        return .{ .ctx = self, .invalInode = &notifyInvalInodeFn, .prune = &notifyPruneFn };
+    }
+
+    fn notifyInvalInodeFn(ctx: *anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        return self.notifyInvalInode(ino, off, len);
+    }
+
+    fn notifyPruneFn(ctx: *anyopaque, nodeids: []const u64) error{QueueFull}!void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        return self.notifyPrune(nodeids);
     }
 
     // ---- bring-up ----

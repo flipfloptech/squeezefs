@@ -42,7 +42,7 @@ pub const model = struct {
 pub const meta = struct {
     pub const sym = @import("meta/sym.zig");
     // @anchor:sym_slots_import
-    // @anchor:sym_tokens_import
+    pub const sym_tokens = @import("meta/sym/tokens.zig");
     // @anchor:sym_membership_import
     pub const guard = @import("meta/guard.zig");
     pub const routing = @import("meta/routing.zig");
@@ -175,7 +175,7 @@ test {
     _ = model.explorer;
     _ = meta.sym;
     // @anchor:sym_slots_test
-    // @anchor:sym_tokens_test
+    _ = meta.sym_tokens;
     // @anchor:sym_membership_test
     _ = data.sym_planes;
     _ = wire;

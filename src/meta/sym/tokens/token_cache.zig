@@ -1,0 +1,1101 @@
+//! The READER side of GPFS-strict read tokens (charter §5.5; `docs/
+//! porting/sym_tokens_intents_striping.md` §1.1 `TokenEntry`, §1.3 G/R/A/L,
+//! §1.6 the cache, the serve gate, the budget, §1.7 the ack conditions,
+//! §1.10 the re-point): one `Reader` per (volume, holder) — the cache keyed
+//! by object (a `lookup` is one hash probe, a `readdir` page one binary
+//! search on the cookie-ordered set; an entry is immutable once installed:
+//! a serve that began before the recall serves the records it holds,
+//! linearizable at its start), the paged fetch under the holder's budget,
+//! the install-under-generation law (the recall bumps the generation
+//! BEFORE it removes the entry; the install checks `gen == gen0` UNDER the
+//! cache lock), single-flight per object, the R5 component
+//! `dlm_token_records_bytes` with voluntary releases and the authority's
+//! shed, and the ACK CONDITIONS: a recall is acked only after a STEP on
+//! the reader's layout cache, the OBSERVED drain of every in-flight serve
+//! that may hold a pre-step binding (the per-thread `ServeStamp` Dekker —
+//! `serve_stamp_model.zig`), and the scoped block-key census purge where
+//! a DIRTY local layout entry is KEPT (the writer's acked bytes).
+//! PORTABLE: the wire is a `Link`, the data plane a `RecallSink`.
+//!
+//! The recall is a PUSH (decision 0002 row 257): the holder's frame
+//! arrives on this reader's listener; when the ack conditions already
+//! hold the push's reply IS the ack, else the frame is handed to the
+//! drain lane, which acks with `RecallAck` once the last serve landed.
+//! The "fresh channel" law of the long-poll design becomes the posture
+//! word `channel_ok`: a holder whose last round (grant or push) failed
+//! serves NOTHING from this reader until a round completes (fail-closed).
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const counters = @import("../../../core/counters.zig");
+const errors = @import("../../../core/errors.zig");
+const log = @import("../../../core/log.zig");
+const clock = @import("../../../core/clock.zig");
+const sync = @import("../../../sync/sync.zig");
+const verbs = @import("../../../wire/verbs.zig");
+const codec = @import("../../../wire/codec.zig");
+const frame = @import("../../../wire/frame.zig");
+const record = @import("../../record.zig");
+const mem_budget = @import("../../../mem/budget.zig");
+const table = @import("token_table.zig");
+
+const assert = std.debug.assert;
+const ns_per_ms: u64 = std.time.ns_per_ms;
+
+pub const Object = table.Object;
+pub const ClientId = table.ClientId;
+
+// ---------------------------------------------------------------------------
+// Constants — value and WHY.
+// ---------------------------------------------------------------------------
+
+/// `records_budget_bytes = max(mem_budget / 256, CONTROL_CAP)`: 64 MiB at
+/// 16 GiB ≈ 1.6 M dentries or ≈ 1 000 full `layout` values — a reader's
+/// live interest set; the floor is the physical minimum under which one
+/// grant page could be resident.
+pub fn recordsBudgetBytes(mem_budget_bytes: u64) u64 {
+    return @max(mem_budget_bytes / 256, @as(u64, frame.CONTROL_CAP));
+}
+/// 64 generation slots = `u64::BITS`, the poison mask's width — a
+/// representation bound; ≥ 64 s at one step per second per volume.
+pub const SERVE_GEN_SLOTS: usize = 64;
+/// The drain's ticked backstop: a lost wake costs one tick, never a wedge;
+/// 10 ms is the reference's and sits two orders under the recall deadline.
+pub const DRAIN_TICK_NS: u64 = 10 * ns_per_ms;
+
+comptime {
+    assert(recordsBudgetBytes(16 << 30) == 64 << 20);
+    assert(recordsBudgetBytes(0) == 1 << 20);
+}
+
+// ---------------------------------------------------------------------------
+// Instruments — the reader-side `dlm_token_*` family and the serve ledger.
+// ---------------------------------------------------------------------------
+
+pub const stats = struct {
+    /// Grants fetched (1 RPC per object first touch or after a recall).
+    pub var dlm_token_grants: counters.ShardedCounter = .{};
+    /// Live entries (gauge).
+    pub var dlm_token_cached: counters.Gauge = .{};
+    /// Serves answered from the cache: 0 RPCs, 0 device reads.
+    pub var dlm_token_hits: counters.ShardedCounter = .{};
+    pub var dlm_token_recalls_received: counters.ShardedCounter = .{};
+    pub var dlm_token_recalls_acked: counters.ShardedCounter = .{};
+    /// Acks the drain lane carried (a serve was in flight at the push).
+    pub var dlm_token_recall_acks_deferred: counters.ShardedCounter = .{};
+    pub var dlm_token_reader_releases: counters.ShardedCounter = .{};
+    /// The R5 component `dlm_token_records_bytes` (gauge).
+    pub var dlm_token_cached_bytes: counters.Gauge = .{};
+    /// Entries the authority's shed dropped WITHOUT a release (one needless
+    /// recall per shed object, never a wrong answer).
+    pub var dlm_token_sheds: counters.ShardedCounter = .{};
+    /// ONE entry over the whole records budget: refused loud.
+    pub var dlm_token_oversize_refusals: counters.ShardedCounter = .{};
+    /// Serves refused by the gate (lease past T_self, channel not ok).
+    pub var dlm_token_serve_refusals: counters.ShardedCounter = .{};
+    /// Rounds completed on a holder's channel (grants + pushes).
+    pub var dlm_token_channel_rounds: counters.ShardedCounter = .{};
+    /// A fetch that spanned a recall retried.
+    pub var dlm_token_fetch_retries: counters.ShardedCounter = .{};
+    /// A single-flight loser re-read the winner's entry.
+    pub var dlm_token_fetch_cohort_waits: counters.ShardedCounter = .{};
+    /// Posture: 1 iff EVERY plane's channel is ok.
+    pub var dlm_token_channel_ok: counters.Gauge = .{};
+    pub var dlm_token_holder_repoints: counters.ShardedCounter = .{};
+    pub var dlm_token_grant_rtt_ns: counters.ShardedLatencyHistogram = .{};
+    /// Block keys purged by the scoped purge; scoped purges; whole-census
+    /// fallbacks (no entry held — shed or never granted).
+    pub var dlm_token_recall_purged_keys: counters.ShardedCounter = .{};
+    pub var dlm_token_recall_scoped_purges: counters.ShardedCounter = .{};
+    pub var dlm_token_recall_census_purges: counters.ShardedCounter = .{};
+    /// A DIRTY local layout entry KEPT across a recall (the writer's acked
+    /// bytes; 0 on a `-o ro` reader).
+    pub var dlm_token_recall_dirty_kept: counters.ShardedCounter = .{};
+    /// A held (3.7) stripe skipped the discard (every clean entry is
+    /// already pre-step).
+    pub var dlm_token_recall_discard_skipped: counters.ShardedCounter = .{};
+    /// The serve ledger: serves in flight (gauge), a serve that observed a
+    /// step between its generation load and its stamp (counted one slot
+    /// early — conservative), a slot re-stamped while occupied (poisoned;
+    /// must-stay-0), drain wakes.
+    pub var reader_serves_inflight: counters.Gauge = .{};
+    pub var reader_serve_step_races: counters.ShardedCounter = .{};
+    pub var reader_serve_slot_overruns: counters.Tripwire = .init("reader_serve_slot_overruns");
+    pub var reader_drain_wakes: counters.ShardedCounter = .{};
+};
+
+// ---------------------------------------------------------------------------
+// ServeStamp — the per-thread serve ledger and the observed drain.
+// ---------------------------------------------------------------------------
+
+/// Per-thread serve stamps over 64 generation slots. `begin` at a read
+/// serve's START (before it resolves any binding): `fetchAdd(1, seq_cst)`
+/// on `shard[thread].slot[gen % 64]`, then a `seq_cst` re-read of the
+/// generation — the Dekker re-read: a step between the load and the
+/// increment is observed and the serve counted one slot early
+/// (conservative). `end`: `fetchSub` + a wake when a drain waits.
+/// `drainBelow(gen)`: `drain_wait_gen` stored seq_cst BEFORE the slot loads
+/// ⇒ no lost wake by construction. Shards never share a line; a thread's
+/// shard is `counters.stripeIndex()` (`next_pow2(cpus) ∈ [1, 64]`).
+pub const ServeStamps = struct {
+    const Shard = struct {
+        slots: [SERVE_GEN_SLOTS]std.atomic.Value(u32) align(std.atomic.cache_line) = @splat(.init(0)),
+    };
+
+    gen: std.atomic.Value(u64) = .init(1),
+    shards: [counters.max_stripes]Shard = @splat(.{}),
+    /// Slots re-stamped while occupied: the drain includes them until they
+    /// empty (the reference's poison mask).
+    poison: std.atomic.Value(u64) = .init(0),
+    /// The generation a drain waits below (0 = none): stored seq_cst
+    /// BEFORE the drain's slot loads.
+    drain_wait_gen: std.atomic.Value(u64) = .init(0),
+    drain_wake: sync.Notify = .init,
+
+    pub const Stamp = struct { shard: usize, slot: usize };
+
+    /// A read serve begins: the stamp, then the Dekker re-read.
+    pub fn begin(self: *ServeStamps) Stamp {
+        const g = self.gen.load(.seq_cst);
+        const shard = counters.stripeIndex();
+        const slot: usize = @intCast(g % SERVE_GEN_SLOTS);
+        _ = self.shards[shard].slots[slot].fetchAdd(1, .seq_cst);
+        stats.reader_serves_inflight.add(1);
+        if (self.gen.load(.seq_cst) != g) stats.reader_serve_step_races.inc();
+        return .{ .shard = shard, .slot = slot };
+    }
+
+    /// The serve landed: wake the drain if this completion may have
+    /// emptied a slot it waits on.
+    pub fn end(self: *ServeStamps, io: Io, s: Stamp) void {
+        _ = self.shards[s.shard].slots[s.slot].fetchSub(1, .seq_cst);
+        stats.reader_serves_inflight.sub(1);
+        if (self.drain_wait_gen.load(.seq_cst) != 0) {
+            stats.reader_drain_wakes.inc();
+            self.drain_wake.notifyWaiters(io);
+        }
+    }
+
+    /// A STEP on the reader's layout cache: every entry stamped before it
+    /// is pre-step; serves from here on stamp the new slot. A new slot
+    /// still occupied (a serve from 64 generations ago) is POISONED.
+    pub fn step(self: *ServeStamps) u64 {
+        const g = self.gen.fetchAdd(1, .seq_cst) + 1;
+        const slot: usize = @intCast(g % SERVE_GEN_SLOTS);
+        if (self.slotTotal(slot) != 0) {
+            _ = self.poison.fetchOr(@as(u64, 1) << @intCast(slot), .seq_cst);
+            stats.reader_serve_slot_overruns.fire("a serve generation slot was re-stamped while a serve 64 steps old still occupied it");
+        }
+        return g;
+    }
+
+    pub fn generation(self: *const ServeStamps) u64 {
+        return self.gen.load(.seq_cst);
+    }
+
+    fn slotTotal(self: *const ServeStamps, slot: usize) u64 {
+        var n: u64 = 0;
+        for (&self.shards) |*sh| n += sh.slots[slot].load(.seq_cst);
+        return n;
+    }
+
+    /// Serves in flight stamped BELOW `gen` (every slot but the current
+    /// one, plus the poisoned ones).
+    pub fn inflightBelow(self: *ServeStamps, gen: u64) u64 {
+        const cur: usize = @intCast(gen % SERVE_GEN_SLOTS);
+        var n: u64 = 0;
+        var poison = self.poison.load(.seq_cst);
+        for (0..SERVE_GEN_SLOTS) |slot| {
+            const t = self.slotTotal(slot);
+            if (slot != cur) {
+                n += t;
+            } else if (poison & (@as(u64, 1) << @intCast(slot)) != 0) {
+                n += t;
+            }
+            if (t == 0 and poison & (@as(u64, 1) << @intCast(slot)) != 0) {
+                poison &= ~(@as(u64, 1) << @intCast(slot));
+                _ = self.poison.fetchAnd(~(@as(u64, 1) << @intCast(slot)), .seq_cst);
+            }
+        }
+        return n;
+    }
+
+    /// The OBSERVED drain: park (register-then-check on `drain_wake`, the
+    /// 10 ms ticked backstop) until no serve below `gen` is in flight.
+    pub fn drainBelow(self: *ServeStamps, io: Io, gen: u64) void {
+        self.drain_wait_gen.store(gen, .seq_cst);
+        defer self.drain_wait_gen.store(0, .seq_cst);
+        while (true) {
+            var n = self.drain_wake.notified();
+            const pre = n.enable(io);
+            if (self.inflightBelow(gen) == 0) {
+                n.cancel(io);
+                return;
+            }
+            if (pre) {
+                n.cancel(io);
+                continue;
+            }
+            _ = n.waitUntilUncancelable(io, clock.monotonicNs() + DRAIN_TICK_NS);
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Seams.
+// ---------------------------------------------------------------------------
+
+/// The dialed session to the holder: ONE call, the typed reply.
+pub const Link = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, req: verbs.Request) errors.Error!verbs.Reply,
+};
+
+/// The data-plane half of the ack (spec §1.7 steps 2–3), decided under the
+/// ino's (3.7) stripe in its NON-PARKING form.
+pub const DiscardVerdict = union(enum) {
+    /// The clean entry is gone and its block keys purged through the ONE
+    /// purge helper: how many.
+    discarded: u32,
+    /// The entry IS a pending write (an inline write's `data_key` is the
+    /// ONLY copy of the acked bytes until the fsync's save): kept.
+    dirty_kept,
+    /// The stripe is held: skipped — safe, the step made every clean entry
+    /// pre-step already.
+    held_skipped,
+    /// No entry held for the object (shed, never granted, an off-record
+    /// kvmap head): the whole census is purged ONCE per call.
+    no_entry,
+};
+
+pub const RecallSink = struct {
+    ctx: *anyopaque,
+    discardLayout: *const fn (ctx: *anyopaque, object: Object) DiscardVerdict,
+    purgeCensus: *const fn (ctx: *anyopaque) void,
+    /// The FUSE-layer hook: the recalled object's kernel view is invalidated
+    /// (`FUSE_NOTIFY_INVAL_INODE` + `PRUNE` through the session).
+    noteRecalled: *const fn (ctx: *anyopaque, object: Object) void,
+
+    /// A reader with no data plane bound (the contracts): nothing to purge.
+    pub const none: RecallSink = .{ .ctx = @ptrFromInt(1), .discardLayout = &noDiscard, .purgeCensus = &noPurge, .noteRecalled = &noNote };
+
+    fn noDiscard(_: *anyopaque, _: Object) DiscardVerdict {
+        return .no_entry;
+    }
+    fn noPurge(_: *anyopaque) void {}
+    fn noNote(_: *anyopaque, _: Object) void {}
+};
+
+/// The reader's own membership lease (`T_self`): a reader that cannot be
+/// recalled serves NOTHING.
+pub const SelfLease = struct {
+    ctx: ?*anyopaque,
+    live: *const fn (ctx: ?*anyopaque, now_ns: u64) bool,
+
+    pub const always: SelfLease = .{ .ctx = null, .live = &alwaysLive };
+    fn alwaysLive(_: ?*anyopaque, _: u64) bool {
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The entry.
+// ---------------------------------------------------------------------------
+
+pub const Xattr = struct { name: []const u8, value: []const u8 };
+pub const DirRecord = struct { cookie: u64, child_ino: u64, file_type: u8, name: []const u8 };
+
+pub const State = enum { live, revoked };
+
+/// Immutable once installed; pinned by every serve that holds it.
+pub const Entry = struct {
+    arena: std.heap.ArenaAllocator,
+    object: Object,
+    attrs: record.InodeValue,
+    /// Sorted by name (the holder pages them in name order).
+    xattrs: []Xattr,
+    xattrs_complete: bool,
+    /// Cookie order; null when the fetch did not ask for dentries.
+    dir: ?[]DirRecord,
+    /// `128 + Σ xattr bytes + Σ (24 + name) per dentry`.
+    bytes: u64,
+    state: State = .live,
+    /// The second-chance bit of `evictToBudget`.
+    used: bool = false,
+    pins: u32 = 0,
+
+    pub fn xattr(self: *const Entry, name: []const u8) ?[]const u8 {
+        for (self.xattrs) |x| if (std.mem.eql(u8, x.name, name)) return x.value;
+        return null;
+    }
+
+    /// One hash-free probe over the cookie order would need an index; the
+    /// dentry sets a page carries are bounded by the budget, so a name
+    /// lookup is a linear scan here and a cookie page a binary search.
+    pub fn lookupName(self: *const Entry, name: []const u8) ?DirRecord {
+        const d = self.dir orelse return null;
+        for (d) |r| if (std.mem.eql(u8, r.name, name)) return r;
+        return null;
+    }
+
+    /// The records STRICTLY after `cookie` (0 = start).
+    pub fn pageAfter(self: *const Entry, cookie: u64) []const DirRecord {
+        const d = self.dir orelse return &.{};
+        var lo: usize = 0;
+        var hi: usize = d.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (d[mid].cookie <= cookie) lo = mid + 1 else hi = mid;
+        }
+        return d[lo..];
+    }
+
+    /// The arena AND the struct (the arena's child allocator created it).
+    fn destroy(self: *Entry) void {
+        var arena = self.arena;
+        const gpa = arena.child_allocator;
+        arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// A pinned serve: the entry (or `gone`), released by the caller.
+pub const Serve = struct {
+    entry: ?*Entry,
+    cache: *Cache,
+
+    pub fn gone(self: Serve) bool {
+        return self.entry == null;
+    }
+
+    pub fn release(self: Serve, io: Io) void {
+        const e = self.entry orelse return;
+        self.cache.unpin(io, e);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The cache.
+// ---------------------------------------------------------------------------
+
+pub const Cache = struct {
+    gpa: Allocator,
+    lock: sync.Mutex = .init,
+    entries: std.AutoHashMapUnmanaged(Object, *Entry) = .empty,
+    /// Per-recall increments, never merged (the monotone-word lesson).
+    revoke_gens: std.AutoHashMapUnmanaged(Object, u64) = .empty,
+    bytes: u64 = 0,
+    budget_bytes: u64,
+    /// The whole-budget census for every plane in the process rides the
+    /// module gauge; this instance's share is `bytes`.
+    gone_markers: u64 = 0,
+
+    pub fn init(gpa: Allocator, budget_bytes: u64) Cache {
+        return .{ .gpa = gpa, .budget_bytes = budget_bytes };
+    }
+
+    pub fn deinit(self: *Cache) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| e.*.destroy();
+        self.entries.deinit(self.gpa);
+        self.revoke_gens.deinit(self.gpa);
+    }
+
+    pub fn revokeGen(self: *Cache, io: Io, object: Object) u64 {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        return self.revoke_gens.get(object) orelse 0;
+    }
+
+    /// A hit: LIVE and carrying the dentries when asked; pinned.
+    pub fn probe(self: *Cache, io: Io, object: Object, wants_dentries: bool) ?*Entry {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        const e = self.entries.get(object) orelse return null;
+        if (e.state != .live or (wants_dentries and e.dir == null)) return null;
+        e.pins += 1;
+        e.used = true;
+        return e;
+    }
+
+    pub fn unpin(self: *Cache, io: Io, e: *Entry) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        e.pins -= 1;
+        if (e.pins == 0 and e.state == .revoked) e.destroy();
+    }
+
+    pub const InstallOutcome = union(enum) {
+        /// The entry now served (pinned): `e`, or the richer entry it did
+        /// not displace.
+        installed: *Entry,
+        recalled_mid_fetch,
+        oversize,
+    };
+
+    /// Install under `gen0`, DECIDED UNDER THE CACHE LOCK: a bump the check
+    /// sees aborts the install (the fetch read pre-commit pages); a bump
+    /// after the check finds the installed entry. A dentry-bearing entry is
+    /// never displaced by a bare one. Room is made by `evictToBudget`
+    /// first (the caller's voluntary releases). `e` is consumed: pinned
+    /// on `installed`, destroyed otherwise.
+    pub fn install(self: *Cache, io: Io, e: *Entry, gen0: u64) InstallOutcome {
+        if (e.bytes > self.budget_bytes) {
+            stats.dlm_token_oversize_refusals.inc();
+            log.err("tokens: ONE entry (object {d}, {d} B) exceeds the whole records budget ({d} B) — refused; the directory is too large for this reader's budget", .{ e.object, e.bytes, self.budget_bytes });
+            e.destroy();
+            return .oversize;
+        }
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        if ((self.revoke_gens.get(e.object) orelse 0) != gen0) {
+            e.destroy();
+            return .recalled_mid_fetch;
+        }
+        if (self.entries.get(e.object)) |old| {
+            if (old.dir != null and e.dir == null) {
+                // Keep the richer entry; the caller serves it.
+                e.destroy();
+                old.pins += 1;
+                old.used = true;
+                return .{ .installed = old };
+            }
+            self.removeLocked(old);
+        }
+        self.entries.put(self.gpa, e.object, e) catch {
+            e.destroy();
+            return .oversize;
+        };
+        self.bytes += e.bytes;
+        stats.dlm_token_cached_bytes.add(e.bytes);
+        stats.dlm_token_cached.add(1);
+        e.pins += 1;
+        return .{ .installed = e };
+    }
+
+    fn removeLocked(self: *Cache, e: *Entry) void {
+        _ = self.entries.remove(e.object);
+        self.bytes -= e.bytes;
+        stats.dlm_token_cached_bytes.sub(e.bytes);
+        stats.dlm_token_cached.sub(1);
+        e.state = .revoked;
+        if (e.pins == 0) e.destroy();
+    }
+
+    /// The recall's first half, per object: `revoke_gens[o] += 1` FIRST,
+    /// then the entry leaves (REVOKED, bytes credited). Answers how many
+    /// entries were held.
+    pub fn revoke(self: *Cache, io: Io, objects: []align(1) const Object) Allocator.Error!u32 {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        var held: u32 = 0;
+        for (objects) |o| {
+            const gop = try self.revoke_gens.getOrPut(self.gpa, o);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+            if (self.entries.get(o)) |e| {
+                self.removeLocked(e);
+                held += 1;
+            }
+        }
+        return held;
+    }
+
+    /// Voluntary room: second-chance `used` bit, then any; the retired
+    /// objects go to `out` for the caller's drain + purge + `Release`.
+    pub fn evictToBudget(self: *Cache, io: Io, need: u64, out: *std.ArrayList(Object)) Allocator.Error!void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        var pass: u8 = 0;
+        while (pass < 2 and self.bytes + need > self.budget_bytes) : (pass += 1) {
+            var victims: std.ArrayListUnmanaged(*Entry) = .empty;
+            defer victims.deinit(self.gpa);
+            var it = self.entries.valueIterator();
+            while (it.next()) |ep| {
+                const e = ep.*;
+                if (pass == 0 and e.used) {
+                    e.used = false;
+                    continue;
+                }
+                try victims.append(self.gpa, e);
+            }
+            for (victims.items) |e| {
+                if (self.bytes + need <= self.budget_bytes) break;
+                try out.append(self.gpa, e.object);
+                self.removeLocked(e);
+            }
+        }
+    }
+
+    /// The authority's shed: every entry dropped WITHOUT a release.
+    pub fn shedAll(self: *Cache, io: Io) u32 {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        var n: u32 = 0;
+        var victims: std.ArrayListUnmanaged(*Entry) = .empty;
+        defer victims.deinit(self.gpa);
+        var it = self.entries.valueIterator();
+        while (it.next()) |ep| victims.append(self.gpa, ep.*) catch break;
+        for (victims.items) |e| {
+            self.removeLocked(e);
+            n += 1;
+        }
+        stats.dlm_token_sheds.add(n);
+        return n;
+    }
+
+    pub fn count(self: *Cache, io: Io) usize {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        return self.entries.count();
+    }
+
+    pub fn bytesHeld(self: *Cache, io: Io) u64 {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        return self.bytes;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The reader plane.
+// ---------------------------------------------------------------------------
+
+pub const Error = error{
+    /// The reader's own lease is past `T_self`, or the holder's channel is
+    /// not ok: the serve is refused (retryable) — the bounded-staleness
+    /// projection is never served in its place.
+    TokenChannelStale,
+    MembershipPending,
+    /// The holder answered `NotHolder{holder}` (the caller re-resolves once).
+    StaleHolderView,
+    /// The holder answered `HolderDead{holder}`.
+    HolderUnreachable,
+    /// A grant paged past the records budget (loud).
+    Oversize,
+    /// The wire failed (a poisoned session, a refused frame).
+    Wire,
+    OutOfMemory,
+};
+
+pub fn coreError(e: Error) errors.Error {
+    return switch (e) {
+        error.TokenChannelStale => error.TokenChannelStale,
+        error.MembershipPending => error.MembershipPending,
+        error.StaleHolderView => error.StaleHolderView,
+        error.HolderUnreachable => error.HolderUnreachable,
+        error.Oversize => error.ValueTooLarge,
+        error.Wire => error.ConnectionLost,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+pub const Wants = struct { dentries: bool = false, records: bool = true };
+
+/// A frame handed to the drain lane: the ack travels once the serves
+/// below `gen` landed and the census is purged.
+const Deferred = struct {
+    frame_id: u64,
+    holder_volume: u16,
+    objects: []Object,
+    gen: u64,
+};
+
+pub const Reader = struct {
+    gpa: Allocator,
+    io: Io,
+    /// This member's identity word (the `client_id` of every call).
+    client_id: ClientId,
+    /// The holder's volume ordinal (the frame's `volume`).
+    volume: u16,
+    link: Link,
+    sink: RecallSink,
+    lease: SelfLease,
+    cache: Cache,
+    stamps: ServeStamps = .{},
+    /// The channel posture: false after a failed round until one
+    /// completes (fail-closed).
+    channel_ok: std.atomic.Value(bool) = .init(true),
+    /// Bumped by every re-point; a session dialed under an older
+    /// generation drops before its next call (the binding's business).
+    endpoint_gen: std.atomic.Value(u64) = .init(1),
+    /// Single-flight per object.
+    fetch_lock: sync.Mutex = .init,
+    fetching: std.AutoHashMapUnmanaged(Object, void) = .empty,
+    fetch_done: sync.Notify = .init,
+    /// The drain lane's queue.
+    deferred_lock: sync.Mutex = .init,
+    deferred: std.ArrayListUnmanaged(Deferred) = .empty,
+    deferred_wake: sync.Notify = .init,
+    /// The last holder redirect the wire named (`NotHolder` / `HolderDead`).
+    last_redirect_holder: std.atomic.Value(u32) = .init(0),
+
+    pub fn init(gpa: Allocator, io: Io, client_id: ClientId, volume: u16, link: Link, sink: RecallSink, lease: SelfLease, budget_bytes: u64) Reader {
+        return .{ .gpa = gpa, .io = io, .client_id = client_id, .volume = volume, .link = link, .sink = sink, .lease = lease, .cache = Cache.init(gpa, budget_bytes) };
+    }
+
+    pub fn deinit(self: *Reader) void {
+        self.cache.deinit();
+        self.fetching.deinit(self.gpa);
+        for (self.deferred.items) |d| self.gpa.free(d.objects);
+        self.deferred.deinit(self.gpa);
+    }
+
+    /// The R5 component: floor 0, weight 1, the shed drops everything.
+    pub fn budgetComponent(self: *Reader) mem_budget.Component {
+        return mem_budget.Component.init("dlm_token_records_bytes", 0, 1, .{ .gauge = &stats.dlm_token_cached_bytes }, .{ .ctx = self, .call = &shedFn });
+    }
+
+    fn shedFn(ctx: *anyopaque, _: u64) void {
+        const self: *Reader = @ptrCast(@alignCast(ctx));
+        _ = self.cache.shedAll(self.io);
+    }
+
+    // ---- the serve ----
+
+    /// `serve(object, wants)`: the gate, the hit, else the single-flight
+    /// fetch; `Serve.entry == null` = gone at its holder.
+    pub fn serve(self: *Reader, io: Io, object: Object, wants: Wants) Error!Serve {
+        if (!self.lease.live(self.lease.ctx, clock.monotonicNs())) {
+            stats.dlm_token_serve_refusals.inc();
+            _ = self.cache.shedAll(io);
+            return error.MembershipPending;
+        }
+        if (!self.channel_ok.load(.acquire)) {
+            stats.dlm_token_serve_refusals.inc();
+            return error.TokenChannelStale;
+        }
+        while (true) {
+            if (self.cache.probe(io, object, wants.dentries)) |e| {
+                stats.dlm_token_hits.inc();
+                return .{ .entry = e, .cache = &self.cache };
+            }
+            // Single-flight: the loser registers on `fetch_done` BEFORE it
+            // re-checks the winner (the register-then-check law).
+            var n = self.fetch_done.notified();
+            const pre = n.enable(io);
+            const winner = blk: {
+                self.fetch_lock.lockUncancelable(io);
+                defer self.fetch_lock.unlock(io);
+                const gop = self.fetching.getOrPut(self.gpa, object) catch return error.OutOfMemory;
+                break :blk !gop.found_existing;
+            };
+            if (!winner) {
+                stats.dlm_token_fetch_cohort_waits.inc();
+                if (!pre) n.waitUncancelable(io) else n.cancel(io);
+                continue;
+            }
+            n.cancel(io);
+            defer {
+                self.fetch_lock.lockUncancelable(io);
+                _ = self.fetching.remove(object);
+                self.fetch_lock.unlock(io);
+                self.fetch_done.notifyWaiters(io);
+            }
+            while (true) {
+                switch (try self.fetchOnce(io, object, wants)) {
+                    .installed => |e| return .{ .entry = e, .cache = &self.cache },
+                    .gone => return .{ .entry = null, .cache = &self.cache },
+                    .recalled_mid_fetch => {
+                        stats.dlm_token_fetch_retries.inc();
+                        continue;
+                    },
+                }
+            }
+        }
+    }
+
+    const FetchOutcome = union(enum) { installed: *Entry, gone, recalled_mid_fetch };
+
+    /// G1–G4: `gen0`, the page loop (xattr pages first by `xattr_after`, an
+    /// empty incomplete page refused never spun on, then dentry pages by
+    /// cookie until complete), the install under `gen0`.
+    fn fetchOnce(self: *Reader, io: Io, object: Object, wants: Wants) Error!FetchOutcome {
+        const gen0 = self.cache.revokeGen(io, object);
+        const t0 = clock.monotonicNs();
+        const e = self.gpa.create(Entry) catch return error.OutOfMemory;
+        e.* = .{ .arena = std.heap.ArenaAllocator.init(self.gpa), .object = object, .attrs = .{}, .xattrs = &.{}, .xattrs_complete = false, .dir = null, .bytes = table.TOKEN_ENTRY_BYTES };
+        var consumed = false;
+        defer if (!consumed) e.destroy();
+        const arena = e.arena.allocator();
+        var xattrs: std.ArrayList(Xattr) = .empty;
+        var dir: std.ArrayList(DirRecord) = .empty;
+        var xattr_after: []const u8 = "";
+        var records_done = false;
+        var dir_after: u64 = 0;
+        var dir_done = !wants.dentries;
+        var first = true;
+        while (!(records_done and dir_done)) {
+            var want_bits: u8 = 0;
+            if (!records_done) want_bits |= verbs.WANT_RECORDS;
+            if (wants.dentries) want_bits |= verbs.WANT_DENTRIES;
+            const rep = self.link.call(self.link.ctx, .{ .token_grant = .{ .head = .{ .volume = self.volume, .wants = want_bits, .mode = 0, .xattr_after_len = @intCast(xattr_after.len), .client_id = self.client_id, .object = object, .after = dir_after }, .bytes = xattr_after } }) catch |err| {
+                self.noteRoundFailed();
+                return switch (err) {
+                    error.StaleHolderView => error.StaleHolderView,
+                    error.HolderUnreachable => error.HolderUnreachable,
+                    error.MembershipPending, error.Deferred => error.MembershipPending,
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Wire,
+                };
+            };
+            const page = rep.token_grant;
+            switch (@as(verbs.GrantPageKind, @fromBackingInt(page.head.kind))) {
+                .granted => {},
+                .not_holder => {
+                    self.last_redirect_holder.store(page.head.holder, .release);
+                    return error.StaleHolderView;
+                },
+                .holder_dead => {
+                    self.last_redirect_holder.store(page.head.holder, .release);
+                    return error.HolderUnreachable;
+                },
+                .gone => {
+                    self.noteRound();
+                    return .gone;
+                },
+            }
+            self.noteRound();
+            stats.dlm_token_grants.inc();
+            if (first) {
+                e.attrs = record.InodeValue.decode(&std.mem.toBytes(page.head.attrs)) catch return error.Wire;
+                first = false;
+            }
+            var carried: usize = 0;
+            var xs = page.xattrs();
+            while (xs.next()) |x| {
+                const name = arena.dupe(u8, x.name) catch return error.OutOfMemory;
+                const value = arena.dupe(u8, x.value) catch return error.OutOfMemory;
+                xattrs.append(arena, .{ .name = name, .value = value }) catch return error.OutOfMemory;
+                e.bytes += name.len + value.len;
+                xattr_after = name;
+                carried += 1;
+            }
+            var ds = page.dir();
+            while (ds.next()) |d| {
+                const name = arena.dupe(u8, d.name) catch return error.OutOfMemory;
+                dir.append(arena, .{ .cookie = d.head.cookie, .child_ino = d.head.child_ino, .file_type = d.head.file_type, .name = name }) catch return error.OutOfMemory;
+                e.bytes += table.DIR_RECORD_BYTES + name.len;
+                dir_after = d.head.cookie;
+                carried += 1;
+            }
+            records_done = page.head.flags & verbs.PAGE_XATTRS_COMPLETE != 0;
+            if (page.head.flags & verbs.PAGE_HAS_DIR != 0) dir_done = page.head.flags & verbs.PAGE_DIR_COMPLETE != 0;
+            if (e.bytes > self.cache.budget_bytes) {
+                stats.dlm_token_oversize_refusals.inc();
+                return error.Oversize;
+            }
+            // An EMPTY incomplete page: never spun on.
+            if (carried == 0 and !(records_done and dir_done)) return error.Wire;
+        }
+        stats.dlm_token_grant_rtt_ns.record(clock.monotonicNs() -| t0);
+        e.xattrs = xattrs.items;
+        e.xattrs_complete = true;
+        if (wants.dentries) e.dir = dir.items;
+        // Room by voluntary releases, drained + purged THEN released.
+        var retired: std.ArrayList(Object) = .empty;
+        defer retired.deinit(self.gpa);
+        self.cache.evictToBudget(io, e.bytes, &retired) catch return error.OutOfMemory;
+        if (retired.items.len != 0) self.releaseRetired(io, retired.items);
+        consumed = true;
+        return switch (self.cache.install(io, e, gen0)) {
+            .installed => |served| .{ .installed = served },
+            .recalled_mid_fetch => .recalled_mid_fetch,
+            .oversize => error.Oversize,
+        };
+    }
+
+    fn noteRound(self: *Reader) void {
+        stats.dlm_token_channel_rounds.inc();
+        self.channel_ok.store(true, .release);
+    }
+
+    fn noteRoundFailed(self: *Reader) void {
+        self.channel_ok.store(false, .release);
+    }
+
+    pub fn channelOk(self: *const Reader) bool {
+        return self.channel_ok.load(.acquire);
+    }
+
+    // ---- the recall (push) ----
+
+    pub const RecallVerdict = enum { acked, deferred };
+
+    /// The pushed frame: per object the generation bump THEN the removal;
+    /// then the ack conditions — a step, the drain, the scoped purge. When
+    /// no serve below the step is in flight the reply is the ack; else the
+    /// frame goes to the drain lane.
+    pub fn handleRecall(self: *Reader, io: Io, frame_id: u64, objects: []align(1) const Object) Allocator.Error!RecallVerdict {
+        _ = try self.cache.revoke(io, objects);
+        stats.dlm_token_recalls_received.add(@intCast(objects.len));
+        self.noteRound();
+        const gen = self.stamps.step();
+        if (self.stamps.inflightBelow(gen) == 0) {
+            self.purge(objects);
+            stats.dlm_token_recalls_acked.add(@intCast(objects.len));
+            return .acked;
+        }
+        const owned = try self.gpa.alloc(Object, objects.len);
+        for (owned, objects) |*o, src| o.* = src;
+        {
+            self.deferred_lock.lockUncancelable(io);
+            defer self.deferred_lock.unlock(io);
+            try self.deferred.append(self.gpa, .{ .frame_id = frame_id, .holder_volume = self.volume, .objects = owned, .gen = gen });
+        }
+        self.deferred_wake.notifyWaiters(io);
+        return .deferred;
+    }
+
+    /// The drain lane's work: every deferred frame drained, purged, acked.
+    /// Answers the frames acked.
+    pub fn pumpDeferred(self: *Reader, io: Io) u32 {
+        var acked: u32 = 0;
+        while (true) {
+            const d = blk: {
+                self.deferred_lock.lockUncancelable(io);
+                defer self.deferred_lock.unlock(io);
+                if (self.deferred.items.len == 0) break :blk null;
+                break :blk self.deferred.orderedRemove(0);
+            } orelse return acked;
+            defer self.gpa.free(d.objects);
+            self.stamps.drainBelow(io, d.gen);
+            self.purge(d.objects);
+            _ = self.link.call(self.link.ctx, .{ .token_recall_ack = .{ .volume = d.holder_volume, .reserved = 0, .reserved2 = 0, .client_id = self.client_id, .frame_id = d.frame_id } }) catch {
+                self.noteRoundFailed();
+                continue;
+            };
+            stats.dlm_token_recalls_acked.add(@intCast(d.objects.len));
+            stats.dlm_token_recall_acks_deferred.inc();
+            acked += 1;
+        }
+    }
+
+    /// Frames waiting on the drain lane.
+    pub fn deferredCount(self: *Reader, io: Io) usize {
+        self.deferred_lock.lockUncancelable(io);
+        defer self.deferred_lock.unlock(io);
+        return self.deferred.items.len;
+    }
+
+    /// The scoped purge (spec §1.7 step 2): per recalled object the clean
+    /// layout entry discarded with its keys, DIRTY kept, a held stripe
+    /// skipped; an object with no entry falls back to the whole census ONCE
+    /// per call.
+    fn purge(self: *Reader, objects: []align(1) const Object) void {
+        var census_done = false;
+        for (objects) |o| {
+            self.sink.noteRecalled(self.sink.ctx, o);
+            switch (self.sink.discardLayout(self.sink.ctx, o)) {
+                .discarded => |n| {
+                    stats.dlm_token_recall_purged_keys.add(n);
+                    stats.dlm_token_recall_scoped_purges.inc();
+                },
+                .dirty_kept => stats.dlm_token_recall_dirty_kept.inc(),
+                .held_skipped => stats.dlm_token_recall_discard_skipped.inc(),
+                .no_entry => if (!census_done) {
+                    census_done = true;
+                    stats.dlm_token_recall_census_purges.inc();
+                    self.sink.purgeCensus(self.sink.ctx);
+                },
+            }
+        }
+    }
+
+    // ---- release, stop, re-point ----
+
+    /// Voluntary: drained + purged first, then `Release` (best effort — a
+    /// lost release costs the holder one needless recall).
+    fn releaseRetired(self: *Reader, io: Io, objects: []const Object) void {
+        const gen = self.stamps.step();
+        self.stamps.drainBelow(io, gen);
+        self.purge(objects);
+        var off: usize = 0;
+        while (off < objects.len) {
+            const n = @min(objects.len - off, std.math.maxInt(u16));
+            _ = self.link.call(self.link.ctx, .{ .token_release = .{ .head = .{ .volume = self.volume, .n = @intCast(n), .reserved = 0, .client_id = self.client_id }, .items = objects[off .. off + n] } }) catch {};
+            off += n;
+        }
+        stats.dlm_token_reader_releases.add(@intCast(objects.len));
+    }
+
+    /// Release ONE object the caller is done with (a test's voluntary
+    /// release; the eviction path is `evictToBudget`'s).
+    pub fn release(self: *Reader, io: Io, object: Object) void {
+        const objs = [_]Object{object};
+        _ = self.cache.revoke(io, &objs) catch return;
+        self.releaseRetired(io, &objs);
+    }
+
+    /// The clean leave: every held token released when the channel is ok.
+    pub fn stop(self: *Reader, io: Io) void {
+        var held: std.ArrayList(Object) = .empty;
+        defer held.deinit(self.gpa);
+        {
+            self.cache.lock.lockUncancelable(io);
+            defer self.cache.lock.unlock(io);
+            var it = self.cache.entries.keyIterator();
+            while (it.next()) |k| held.append(self.gpa, k.*) catch break;
+        }
+        if (held.items.len == 0 or !self.channel_ok.load(.acquire)) return;
+        _ = self.cache.revoke(io, held.items) catch return;
+        self.releaseRetired(io, held.items);
+    }
+
+    /// A holder that MOVED its listener: the link re-pointed in place, the
+    /// endpoint generation bumped, every cached token dropped with its purge
+    /// ("a holder that moved may have re-granted"), the channel fail-closed
+    /// until a round completes — the first round is the probe on the new
+    /// session (`ping`), so a resolve after the move parks on no dial.
+    pub fn repoint(self: *Reader, io: Io, link: Link) void {
+        self.link = link;
+        _ = self.endpoint_gen.fetchAdd(1, .acq_rel);
+        var held: std.ArrayList(Object) = .empty;
+        defer held.deinit(self.gpa);
+        {
+            self.cache.lock.lockUncancelable(io);
+            defer self.cache.lock.unlock(io);
+            var it = self.cache.entries.keyIterator();
+            while (it.next()) |k| held.append(self.gpa, k.*) catch break;
+        }
+        _ = self.cache.revoke(io, held.items) catch {};
+        const gen = self.stamps.step();
+        self.stamps.drainBelow(io, gen);
+        self.purge(held.items);
+        self.channel_ok.store(false, .release);
+        stats.dlm_token_holder_repoints.inc();
+        if (self.link.call(self.link.ctx, .{ .ping = .{} })) |_| self.noteRound() else |_| self.noteRoundFailed();
+    }
+
+    pub fn endpointGen(self: *const Reader) u64 {
+        return self.endpoint_gen.load(.acquire);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests: the pure laws (the protocol contracts ride `tokens.zig`).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "ServeStamps: a serve in flight below the step is counted; its end wakes the drain; a serve that begins after the step is not below it" {
+    const io = testing.io;
+    var st: ServeStamps = .{};
+    const s = st.begin();
+    const g = st.step();
+    try testing.expectEqual(@as(u64, 1), st.inflightBelow(g));
+    const s2 = st.begin();
+    try testing.expectEqual(@as(u64, 1), st.inflightBelow(g));
+    st.end(io, s);
+    try testing.expectEqual(@as(u64, 0), st.inflightBelow(g));
+    st.drainBelow(io, g);
+    st.end(io, s2);
+    try testing.expectEqual(@as(u64, 0), stats.reader_serve_slot_overruns.load());
+}
+
+test "ServeStamps: a serve 64 steps old poisons its re-stamped slot and the drain still counts it" {
+    const io = testing.io;
+    var st: ServeStamps = .{};
+    const s = st.begin();
+    var g: u64 = 0;
+    const before = stats.reader_serve_slot_overruns.load();
+    stats.reader_serve_slot_overruns.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    for (0..SERVE_GEN_SLOTS) |_| g = st.step();
+    try log.testing.expectAllFired();
+    try testing.expectEqual(before + 1, stats.reader_serve_slot_overruns.load());
+    try testing.expectEqual(@as(u64, 1), st.inflightBelow(g));
+    st.end(io, s);
+    try testing.expectEqual(@as(u64, 0), st.inflightBelow(g));
+    try testing.expectEqual(@as(u64, 0), st.poison.load(.seq_cst));
+}
+
+test "the cache: install under gen0 is refused by a bump the check sees and found by a bump after it; a dentry-bearing entry is never displaced by a bare one; pins keep a revoked entry alive until the last release" {
+    const io = testing.io;
+    var c = Cache.init(testing.allocator, 1 << 20);
+    defer c.deinit();
+    const mk = struct {
+        fn mk(gpa: Allocator, object: Object, with_dir: bool) !*Entry {
+            const e = try gpa.create(Entry);
+            e.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .object = object, .attrs = .{ .mode = 0o100644 }, .xattrs = &.{}, .xattrs_complete = true, .dir = if (with_dir) &.{} else null, .bytes = table.TOKEN_ENTRY_BYTES };
+            return e;
+        }
+    }.mk;
+    const gpa = testing.allocator;
+    // A bump the check sees: aborted.
+    const gen0 = c.revokeGen(io, 7);
+    _ = try c.revoke(io, &.{7});
+    const e1 = try mk(gpa, 7, false);
+    try testing.expect(c.install(io, e1, gen0) == .recalled_mid_fetch);
+    // Installed under the current generation; a later bump finds it.
+    const gen1 = c.revokeGen(io, 7);
+    const e2 = try mk(gpa, 7, true);
+    try testing.expectEqual(e2, c.install(io, e2, gen1).installed);
+    try testing.expectEqual(@as(usize, 1), c.count(io));
+    try testing.expect(c.probe(io, 7, true) != null);
+    c.unpin(io, e2);
+    // A bare entry never displaces the dentry-bearing one: the richer one
+    // is served (pinned) in its place.
+    const e3 = try mk(gpa, 7, false);
+    try testing.expectEqual(e2, c.install(io, e3, gen1).installed);
+    c.unpin(io, e2);
+    try testing.expect(c.probe(io, 7, true) != null);
+    // Revoked while pinned (twice): alive until the last unpin.
+    c.unpin(io, e2);
+    try testing.expectEqual(@as(u32, 1), try c.revoke(io, &.{7}));
+    try testing.expectEqual(@as(usize, 0), c.count(io));
+    try testing.expectEqual(State.revoked, e2.state);
+    c.unpin(io, e2);
+}
+
+test "the budget: ONE oversize entry is refused loud; eviction gives the used bit a second chance; the shed drops everything" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var c = Cache.init(gpa, 3 * table.TOKEN_ENTRY_BYTES);
+    defer c.deinit();
+    const mk = struct {
+        fn mk(a: Allocator, object: Object, bytes: u64) !*Entry {
+            const e = try a.create(Entry);
+            e.* = .{ .arena = std.heap.ArenaAllocator.init(a), .object = object, .attrs = .{}, .xattrs = &.{}, .xattrs_complete = true, .dir = null, .bytes = bytes };
+            return e;
+        }
+    }.mk;
+    const big = try mk(gpa, 1, 4 * table.TOKEN_ENTRY_BYTES);
+    log.testing.expectErrorLogs(1);
+    try testing.expect(c.install(io, big, 0) == .oversize);
+    try log.testing.expectAllFired();
+    var es: [3]*Entry = undefined;
+    for (&es, 1..) |*e, i| {
+        e.* = try mk(gpa, @intCast(i), table.TOKEN_ENTRY_BYTES);
+        try testing.expectEqual(e.*, c.install(io, e.*, 0).installed);
+        c.unpin(io, e.*);
+    }
+    // Object 2 was used (probed): the first pass clears its bit and takes
+    // another; it survives.
+    _ = c.probe(io, 2, false).?;
+    c.unpin(io, es[1]);
+    var out: std.ArrayList(Object) = .empty;
+    defer out.deinit(gpa);
+    try c.evictToBudget(io, table.TOKEN_ENTRY_BYTES, &out);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expect(out.items[0] != 2);
+    try testing.expectEqual(@as(usize, 2), c.count(io));
+    const before = stats.dlm_token_sheds.load();
+    try testing.expectEqual(@as(u32, 2), c.shedAll(io));
+    try testing.expectEqual(before + 2, stats.dlm_token_sheds.load());
+    try testing.expectEqual(@as(u64, 0), c.bytesHeld(io));
+}
+
+test "Entry: pageAfter is the strict cookie successor; lookupName finds by full name" {
+    const recs = [_]DirRecord{ .{ .cookie = 10, .child_ino = 1, .file_type = 8, .name = "a" }, .{ .cookie = 20, .child_ino = 2, .file_type = 8, .name = "b" }, .{ .cookie = 30, .child_ino = 3, .file_type = 4, .name = "c" } };
+    var d = recs;
+    var e: Entry = .{ .arena = std.heap.ArenaAllocator.init(testing.allocator), .object = 1, .attrs = .{}, .xattrs = &.{}, .xattrs_complete = true, .dir = &d, .bytes = 0 };
+    defer e.arena.deinit();
+    try testing.expectEqual(@as(usize, 3), e.pageAfter(0).len);
+    try testing.expectEqual(@as(usize, 2), e.pageAfter(10).len);
+    try testing.expectEqual(@as(usize, 1), e.pageAfter(25).len);
+    try testing.expectEqual(@as(usize, 0), e.pageAfter(30).len);
+    try testing.expectEqual(@as(u64, 2), e.lookupName("b").?.child_ino);
+    try testing.expectEqual(@as(?DirRecord, null), e.lookupName("zz"));
+}

@@ -390,8 +390,11 @@ pub fn tokenGrant(req: verbs.TokenGrantReq) Verdict {
     return if (req.head.object == 0) reject(.object_zero) else .ok;
 }
 
+/// A pushed recall frame names local key inos ≥ 1 (the codec bounded its
+/// count at the batch cap).
 pub fn tokenRecall(req: verbs.TokenRecallReq) Verdict {
-    return if (req.wait_ms > T_OWNER_MS) reject(.wait_past_t_owner) else .ok;
+    for (req.items) |o| if (o == 0) return reject(.object_zero);
+    return .ok;
 }
 
 pub fn tokenRelease(req: verbs.TokenReleaseReq) Verdict {
@@ -657,9 +660,9 @@ test "membership: member ids, the renewal's window declarations" {
 
 test "tokens, steps, guards, the record ship" {
     try expectRejected(.object_zero, tokenGrant(.{ .head = .{ .volume = 0, .wants = 0, .mode = 0, .xattr_after_len = 0, .client_id = 1, .object = 0, .after = 0 }, .bytes = "" }));
-    try expectRejected(.wait_past_t_owner, tokenRecall(.{ .volume = 0, .reserved = 0, .wait_ms = T_OWNER_MS + 1, .client_id = 1 }));
-    try testing.expect(tokenRecall(.{ .volume = 0, .reserved = 0, .wait_ms = T_OWNER_MS, .client_id = 1 }).isOk());
     const objs = [_]u64{ 1, 0 };
+    try expectRejected(.object_zero, tokenRecall(.{ .head = .{ .volume = 0, .reserved = 0, .n = 2, .frame_id = 1, .holder = 7 }, .items = &objs }));
+    try testing.expect(tokenRecall(.{ .head = .{ .volume = 0, .reserved = 0, .n = 1, .frame_id = 1, .holder = 7 }, .items = objs[0..1] }).isOk());
     try expectRejected(.object_zero, tokenRelease(.{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .client_id = 1 }, .items = &objs }));
     try expectRejected(.object_zero, custodyGrant(.{ .volume = 0, .concurrent_write = 0, .reserved = 0, .wait_ms = 0, .client_id = 1, .object = 0, .span_start = 0, .span_len = 0, .lease_epoch = 0, .reserved2 = 0 }));
     const insert: verbs.XvStepWire = .{ .kind = 2, .parent_update = 1, .name_len = 1, .flags = 0, .ft_bits = 0o100000, .a = 5, .b = 6, .c = 0, .w0 = 0, .w1 = 0, .w2 = 0, .w3 = 0 };

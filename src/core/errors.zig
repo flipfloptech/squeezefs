@@ -57,6 +57,10 @@ pub const Retryable = error{
     /// now: "the heap is not full, the appender is out of grant" (charter
     /// §5.5 — EAGAIN-class, never ENOSPC).
     GrantExhausted,
+    /// A token reader's channel to the holder is not ok (a failed round,
+    /// a re-point in progress): the serve is refused, never answered from
+    /// the bounded-staleness projection (decision 0002 row 261).
+    TokenChannelStale,
 };
 
 /// The device, the kernel or the lane answered, and the answer is final
@@ -179,6 +183,9 @@ pub const Refusal = error{
     /// The membership owner does not know the member's lease: self-fence
     /// (purge), then re-join fresh — never a retry (ESTALE).
     UnknownLease,
+    /// A quiescent `-o ro` reader saw a writer appear: every metadata op
+    /// answers ESTALE until the remount joins as a token reader.
+    ReaderFailStopped,
 };
 
 pub const Error = Retryable || Terminal || Refusal;
@@ -187,8 +194,8 @@ pub const Class = enum { retryable, terminal, refusal };
 
 pub fn classOf(err: Error) Class {
     return switch (err) {
-        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted => .retryable,
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.CrossVolume, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease => .refusal,
+        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => .retryable,
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.CrossVolume, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease, error.ReaderFailStopped => .refusal,
         else => .terminal,
     };
 }
@@ -254,13 +261,14 @@ pub fn toErrno(err: Error) linux.E {
     return switch (err) {
         // Backpressure and the wire's typed retryable classes: retry, never
         // "bad argument" (charter §5.5).
-        error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted => .AGAIN,
+        error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => .AGAIN,
         // Refusals: the caller's shape or the device's admissibility; a
         // wire word the screen refused; a foreign vocabulary.
         error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused => .INVAL,
         error.DismountRefused => .ROFS,
-        // A lease the owner does not know: the handle is stale.
-        error.UnknownLease => .STALE,
+        // A lease the owner does not know: the handle is stale; so is every
+        // handle of a fail-stopped quiescent reader.
+        error.UnknownLease, error.ReaderFailStopped => .STALE,
         // A peer that refused our storage-trust proof.
         error.HandshakeRefused => .ACCES,
         // The fence, a dead lane, a lost op, a short transfer, a poisoned
@@ -355,6 +363,10 @@ test "the cluster wire's classes: every typed retryable is EAGAIN; a screen refu
     try testing.expectEqual(linux.E.INVAL, toErrno(error.WireSchemaRefused));
     try testing.expectEqual(linux.E.INVAL, toErrno(error.WireMalformed));
     try testing.expectEqual(linux.E.STALE, toErrno(error.UnknownLease));
+    try testing.expectEqual(linux.E.STALE, toErrno(error.ReaderFailStopped));
+    try testing.expectEqual(Class.refusal, classOf(error.ReaderFailStopped));
+    try testing.expectEqual(Class.retryable, classOf(error.TokenChannelStale));
+    try testing.expectEqual(linux.E.AGAIN, toErrno(error.TokenChannelStale));
     try testing.expectEqual(linux.E.ACCES, toErrno(error.HandshakeRefused));
     try testing.expectEqual(Class.terminal, classOf(error.MacInvalid));
     try testing.expectEqual(linux.E.IO, toErrno(error.MacInvalid));

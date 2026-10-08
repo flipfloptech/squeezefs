@@ -86,6 +86,7 @@ const knobs = @import("../core/knobs.zig");
 const sync = @import("../sync/sync.zig");
 const conveyor_core = @import("conveyor_core.zig");
 const tx = @import("tx.zig");
+const token_table = @import("sym/tokens/token_table.zig");
 const tree = @import("tree.zig");
 const node = @import("node.zig");
 const node_cache = @import("node_cache.zig");
@@ -375,6 +376,9 @@ pub const Stats = struct {
     tx_queue_wait: counters.ShardedLatencyHistogram = .{},
     pass_admission: counters.ShardedLatencyHistogram = .{},
     pass_leaf_locks: counters.ShardedLatencyHistogram = .{},
+    /// `pass_token_recall`: A1½ — the holder's recall of the batch's
+    /// token union, before ring admission (so `pass_total` decomposes).
+    pass_token_recall: counters.ShardedLatencyHistogram = .{},
     pass_total: counters.ShardedLatencyHistogram = .{},
     window_total: counters.ShardedLatencyHistogram = .{},
     /// `lock_phase_ns.leaf_lock_hold`: first acquire → every guard dropped
@@ -416,6 +420,8 @@ pub const Stats = struct {
         try self.pass_admission.snapshot().writeJson(w);
         try w.writeAll(",\"meta_pass_leaf_locks\":");
         try self.pass_leaf_locks.snapshot().writeJson(w);
+        try w.writeAll(",\"meta_pass_token_recall\":");
+        try self.pass_token_recall.snapshot().writeJson(w);
         try w.writeAll(",\"meta_pass_total\":");
         try self.pass_total.snapshot().writeJson(w);
         try w.writeAll(",\"meta_window_total\":");
@@ -483,6 +489,9 @@ pub const Window = struct {
     entries: u64,
     bytes: u64,
     t_handoff_ns: u64,
+    /// The token union the pass took in flight at A1½ (arena-owned);
+    /// settled at the terminal outcome.
+    token_union: []const u64 = &.{},
 
     pub fn span(self: *const Window) SeqSpan {
         return SeqSpan.stamped(self.seq_base, self.res.len);
@@ -516,6 +525,22 @@ pub const Window = struct {
 pub const CommitTee = struct {
     ctx: *anyopaque,
     note: *const fn (ctx: *anyopaque, recs: []const tx.Rec) void,
+};
+
+/// THE TOKEN HOOK (charter §5.5 "the holder's conveyor pass recalls the
+/// union of its batch's objects' tokens ONCE, under the batch's 4a
+/// guards, BEFORE ring admission"; `sym/tokens/token_table.zig`): A1½ —
+/// after the liveness flags, before `admitUserBudget` and any node lock
+/// (a recall's round trip is never held under a region-growth Dekker or a
+/// leaf lock). `recall` takes the union in flight and returns on every
+/// ack or the reader's lease expiry; `settle` runs at the window's
+/// TERMINAL outcome for both arms (fan-out AND rollback), so an object
+/// leaves the flight with its LAST user. Unarmed = one acquire load per
+/// pass (the null probe).
+pub const TokenHook = struct {
+    ctx: *anyopaque,
+    recall: *const fn (ctx: *anyopaque, objects: []const u64) Allocator.Error!void,
+    settle: *const fn (ctx: *anyopaque, objects: []const u64) void,
 };
 
 /// The pass's venue: `wake` is called by the committer that won the
@@ -616,6 +641,10 @@ pub const Conveyor = struct {
     /// window's terminal outcome. The engine keeps the tee alive until it
     /// has disarmed and the lane has no window in flight.
     tee: std.atomic.Value(?*const CommitTee) = .init(null),
+    /// The armed token hook (null = no holder plane): one acquire load
+    /// per pass. The plane keeps the hook alive until it disarmed and no
+    /// window is in flight.
+    tokens: std.atomic.Value(?*const TokenHook) = .init(null),
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -682,6 +711,15 @@ pub const Conveyor = struct {
 
     pub fn disarmTee(self: *Conveyor) void {
         self.tee.store(null, .release);
+    }
+
+    /// Arm the token hook (release pairs with the pass's acquire load).
+    pub fn armTokens(self: *Conveyor, hook: *const TokenHook) void {
+        self.tokens.store(hook, .release);
+    }
+
+    pub fn disarmTokens(self: *Conveyor) void {
+        self.tokens.store(null, .release);
     }
 
     // ---- committers ----
@@ -1071,6 +1109,30 @@ pub const Conveyor = struct {
             self.failBatch(members.items, if (self.deps.latch.isFailed()) error.VolumeFailed else error.VolumeClosed);
             return;
         }
+        // A1½: the token recall — the union of the batch's objects (every
+        // record of every non-`token_quiet` member) taken in flight ONCE,
+        // under the members' 4a guards, BEFORE ring admission and any node
+        // lock; the pass proceeds on every ack or the reader's lease
+        // expiry. The union settles at the window's terminal outcome; a
+        // batch that dies before its window exists settles here.
+        var token_union: []const u64 = &.{};
+        const tokens = self.tokens.load(.acquire);
+        var union_settled = tokens == null;
+        defer if (!union_settled) tokens.?.settle(tokens.?.ctx, token_union);
+        if (tokens) |hook| {
+            var u: token_table.ObjectUnion = .{};
+            for (members.items) |*m| u.addMember(arena, &m.q) catch {
+                self.failBatch(members.items, error.OutOfMemory);
+                return;
+            };
+            token_union = u.finish();
+            const t_recall = clock.monotonicNs();
+            hook.recall(hook.ctx, token_union) catch {
+                self.failBatch(members.items, error.OutOfMemory);
+                return;
+            };
+            self.stats.pass_token_recall.record(clock.monotonicNs() -| t_recall);
+        }
         // A2.
         var err: Error = error.Corrupt;
         const t_adm = clock.monotonicNs();
@@ -1214,6 +1276,14 @@ pub const Conveyor = struct {
                 return;
             };
             @memset(failed, null);
+            w.token_union = wa.dupe(u64, token_union) catch {
+                self.unlockAll(r.lock_set);
+                r.releaseRefs();
+                w.arena.deinit();
+                gpa.destroy(w);
+                self.failBatch(members.items, error.OutOfMemory);
+                return;
+            };
             // A8: ONE contiguous reservation inside the window.
             const reg = self.deps.reg.reserveRegistered(self.deps.core, admission.?) catch {
                 // The core transferred the claim before the registry's
@@ -1259,6 +1329,8 @@ pub const Conveyor = struct {
             w.undo = undo;
             break w;
         };
+        // From here every exit finishes the window: the union is its.
+        union_settled = true;
         self.stats.pass_leaf_locks.record(clock.monotonicNs() -| t_locks);
 
         // A12: the survivors' entries, ONE submission, outside every lock.
@@ -1480,6 +1552,10 @@ pub const Conveyor = struct {
     /// the ack; the window dies.
     pub fn finishWindow(self: *Conveyor, w: *Window, result: Error!void) void {
         self.untrack(w);
+        // The token union leaves the flight with this window — both arms
+        // (fan-out and rollback): parked grants wake to the post-commit
+        // (or rolled-back) records.
+        if (w.token_union.len != 0) if (self.tokens.load(.acquire)) |hook| hook.settle(hook.ctx, w.token_union);
         self.stats.window_total.record(clock.monotonicNs() -| w.t_handoff_ns);
         // The tee sees every member that reached SUCCESS, before the
         // window's arena (the members' key copies) goes.
@@ -2194,6 +2270,75 @@ test "a group of 8 is ONE pass with 8 acks in journal order; every record presen
     defer rec.deinit();
     try testing.expectEqual(@as(usize, 8), rec.entries.len);
     for (rec.entries[1..], 1..) |e, i| try testing.expect(e.seq > rec.entries[i - 1].seq);
+}
+
+test "A1½: an armed token hook sees the batch's union (sorted, deduped, token_quiet skipped) ONCE before the lane's submit; the settle runs at the terminal outcome on the fan-out arm AND the rollback arm; unarmed, nothing is called" {
+    const h = try Harness.create(.{}, null, false);
+    defer h.destroy();
+    const Hook = struct {
+        recalls: u32 = 0,
+        settles: u32 = 0,
+        last_union: [8]u64 = @splat(0),
+        last_len: usize = 0,
+        /// The lane's handoff count at the recall: the recall precedes it.
+        handoffs_at_recall: u64 = 0,
+        cv: *Conveyor,
+        fn recall(ctx: *anyopaque, objects: []const u64) Allocator.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.recalls += 1;
+            self.handoffs_at_recall = self.cv.stats.lane_handoffs.load();
+            self.last_len = objects.len;
+            for (objects, 0..) |o, i| if (i < 8) {
+                self.last_union[i] = o;
+            };
+        }
+        fn settle(ctx: *anyopaque, objects: []const u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.settles += 1;
+            std.debug.assert(objects.len == self.last_len);
+        }
+    };
+    // Unarmed: the baseline commit calls nothing.
+    var hook: Hook = .{ .cv = h.cv };
+    _ = try h.commitCreate("unarmed");
+    try testing.expectEqual(@as(u32, 0), hook.recalls);
+    const th: TokenHook = .{ .ctx = &hook, .recall = &Hook.recall, .settle = &Hook.settle };
+    h.cv.armTokens(&th);
+    defer h.cv.disarmTokens();
+    // A group of 3: two creates under the root (the parent 1 and each
+    // child) and ONE token_quiet control write that recalls nothing.
+    var txs: [3]*tx.KvTx = undefined;
+    for (&txs, 0..) |*t, i| {
+        t.* = try h.gpa.create(tx.KvTx);
+        t.*.* = tx.KvTx.init(h.gpa, @src());
+        if (i < 2) {
+            var nb: [8]u8 = undefined;
+            _ = try h.stageCreate(t.*, try std.fmt.bufPrint(&nb, "c{d}", .{i}));
+        } else {
+            try t.*.stagePut(key.TREE_XATTRS, &key.xattrKey(1, 77, 0), "\x05claimX");
+            t.*.token_quiet = true;
+        }
+    }
+    defer for (txs) |t| h.gpa.destroy(t);
+    const handoffs_before = h.cv.stats.lane_handoffs.load();
+    var results: [3]Outcome = undefined;
+    h.cv.commitGroup(&txs, &results);
+    for (results) |r| try r;
+    try testing.expectEqual(@as(u32, 1), hook.recalls);
+    try testing.expectEqual(@as(u32, 1), hook.settles);
+    try testing.expectEqual(handoffs_before, hook.handoffs_at_recall);
+    try testing.expectEqual(handoffs_before + 1, h.cv.stats.lane_handoffs.load());
+    // The union: the root (both creates' dentries + Δtimes) and the two
+    // children, ascending, each once.
+    try testing.expectEqual(@as(usize, 3), hook.last_len);
+    try testing.expectEqual(@as(u64, 1), hook.last_union[0]);
+    try testing.expect(hook.last_union[1] < hook.last_union[2]);
+    // The rollback arm: a failed window settles its union too.
+    h.lane.fail_next = 1;
+    try testing.expectError(error.JournalWriteFailed, h.commitCreate("victim"));
+    try testing.expectEqual(@as(u32, 2), hook.recalls);
+    try testing.expectEqual(@as(u32, 2), hook.settles);
+    try testing.expectEqual(@as(u64, 2), h.cv.stats.pass_token_recall.snapshot().count);
 }
 
 test "the tx cap bounds the group size and the byte cap splits an over-cap group; every member commits exactly once" {

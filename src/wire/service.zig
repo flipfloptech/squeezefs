@@ -240,7 +240,8 @@ test "the service law: unknown verb, foreign schema, malformed payload, an unreg
     try testing.expectEqual(Status.not_manager, svc.serve(callHeader(.join_appender), jb.written(), null, 1, &reply, &scratch).status);
     var payload3: [64]u8 = undefined;
     var tb: codec.Builder = .init(&payload3);
-    try verbs.encodeRequest(.{ .token_recall = .{ .volume = 0, .reserved = 0, .wait_ms = 0, .client_id = 1 } }, &tb);
+    const recalled = [_]u64{9};
+    try verbs.encodeRequest(.{ .token_recall = .{ .head = .{ .volume = 0, .reserved = 0, .n = 1, .frame_id = 1, .holder = 1 }, .items = &recalled } }, &tb);
     try testing.expectEqual(Status.not_holder, svc.serve(callHeader(.token_recall), tb.written(), null, 1, &reply, &scratch).status);
     try testing.expectEqual(Status.unknown_verb, svc.serve(callHeader(.challenge), req_bytes, null, 1, &reply, &scratch).status);
     try testing.expectEqual(@as(u32, 0), echo.served);

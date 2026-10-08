@@ -23,6 +23,7 @@ pub const extent_grant = @import("sym/extent_grant.zig");
 pub const manager = @import("sym/manager.zig");
 pub const join = @import("sym/join.zig");
 pub const bind = if (builtin.os.tag == .linux) @import("sym/bind.zig") else struct {};
+pub const tokens = @import("sym/tokens.zig");
 
 /// Process-wide appender instruments (the per-volume words — `appenders_
 /// live`, `appenders_capacity`, `manager_lease`, the ring bytes — ride the
@@ -57,6 +58,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try counters.writeNamespaceJson(manager.stats, w);
     try w.writeAll(",\"join\":");
     try counters.writeNamespaceJson(join.stats, w);
+    try w.writeAll(",\"tokens\":");
+    try tokens.writeStatsJson(w);
     try w.writeByte('}');
 }
 
@@ -69,4 +72,5 @@ test {
     _ = manager;
     _ = join;
     if (builtin.os.tag == .linux) _ = bind;
+    _ = tokens;
 }

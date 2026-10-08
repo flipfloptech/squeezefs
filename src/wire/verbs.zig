@@ -1065,11 +1065,49 @@ pub const GrantPage = struct {
     }
 };
 
-pub const TokenRecallReq = extern struct { volume: u16, reserved: u16, wait_ms: u32, client_id: u64 };
+/// The recall is a PUSH (decision 0002 row 257): the holder dials the
+/// reader's listener and hands it ONE frame per pass — `holder` is the
+/// pushing member's identity word, `frame_id` the holder's per-client
+/// monotone frame number the ack names.
+pub const RecallFrameHead = extern struct {
+    volume: u16,
+    reserved: u16,
+    n: u32,
+    frame_id: u64,
+    holder: u64,
 
-pub const RecallFrameHead = extern struct { frame_id: u64, n: u32, reserved: u32 };
-/// `frame_id 0 ∧ n 0` = "the park elapsed, nothing to recall".
+    pub fn check(self: RecallFrameHead) bool {
+        return self.n != 0 and self.n <= RECALL_BATCH_MAX;
+    }
+};
 pub const RecallFrame = HeadWithArray(RecallFrameHead, u64, "n", OBJECTS_MAX);
+pub const TokenRecallReq = RecallFrame;
+
+/// A frame carries at most `CONTROL_CAP / 2 / 32` = 16 384 objects: half
+/// the control cap over a 32 B per-object allowance (the reference's
+/// `batch_max`, derived from the frame cap alone — decision 0002 row 258).
+pub const RECALL_BATCH_MAX: u32 = (1 << 20) / 2 / 32;
+
+pub const RecallVerdictKind = enum(u8) {
+    /// The ack conditions already held (no serve in flight on the recalled
+    /// inos): the push's reply IS the ack.
+    acked = 0,
+    /// A serve is in flight: the reader's drain lane acks with
+    /// `token_recall_ack` once it landed and the census is purged.
+    deferred = 1,
+};
+
+pub const RecallVerdict = extern struct {
+    kind: u8,
+    reserved: [7]u8,
+
+    pub const acked: RecallVerdict = .{ .kind = 0, .reserved = @splat(0) };
+    pub const deferred: RecallVerdict = .{ .kind = 1, .reserved = @splat(0) };
+
+    pub fn check(self: RecallVerdict) bool {
+        return self.kind <= 1;
+    }
+};
 
 pub const TokenRecallAckReq = extern struct { volume: u16, reserved: u16, reserved2: u32, client_id: u64, frame_id: u64 };
 
@@ -1545,7 +1583,7 @@ pub fn RepType(comptime v: Verb) type {
         .record_ship => RecordShipReply,
         .free_blocks => FreeVerdicts,
         .token_grant => GrantPage,
-        .token_recall => RecallFrame,
+        .token_recall => RecallVerdict,
         .token_recall_ack => Ack,
         .token_release => Released,
         .custody_grant => CustodyReply,
@@ -1809,10 +1847,14 @@ test "token payloads: the grant ask, a page with xattrs and a dentry page, recal
     try testing.expectEqual(@as(u64, 55), d0.head.child_ino);
     try testing.expectEqual(@as(?DirEntry, null), ds.next());
     _ = try roundTrip(GrantPage, .{ .head = .{ .kind = 1, .flags = 0, .reserved = 0, .n_xattrs = 0, .n_dir = 0, .holder = 9, .attrs = attrs, .reserved2 = @splat(0) }, .xattrs_bytes = "", .dir_bytes = "" });
-    _ = try roundTrip(TokenRecallReq, .{ .volume = 0, .reserved = 0, .wait_ms = 5000, .client_id = 77 });
     const objs = [_]u64{ 1000, 1001 };
-    _ = try roundTrip(RecallFrame, .{ .head = .{ .frame_id = 3, .n = 2, .reserved = 0 }, .items = &objs });
-    _ = try roundTrip(RecallFrame, .{ .head = .{ .frame_id = 0, .n = 0, .reserved = 0 }, .items = &.{} });
+    _ = try roundTrip(RecallFrame, .{ .head = .{ .volume = 0, .reserved = 0, .n = 2, .frame_id = 3, .holder = 77 }, .items = &objs });
+    // A frame naming no object or more than the batch cap does not decode.
+    var fb: [64]u8 = undefined;
+    var fbb: Builder = .init(&fb);
+    try codec.encodePayload(RecallFrame, .{ .head = .{ .volume = 0, .reserved = 0, .n = 0, .frame_id = 1, .holder = 1 }, .items = &.{} }, &fbb);
+    try testing.expectError(error.Malformed, codec.decodePayload(RecallFrame, fbb.written()));
+    _ = try roundTrip(RecallVerdict, RecallVerdict.deferred);
     _ = try roundTrip(TokenRecallAckReq, .{ .volume = 0, .reserved = 0, .reserved2 = 0, .client_id = 77, .frame_id = 3 });
     _ = try roundTrip(TokenReleaseReq, .{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .client_id = 77 }, .items = &objs });
     _ = try roundTrip(Released, .{ .count = 2, .reserved = 0 });

@@ -127,6 +127,9 @@ pub const MountOptions = struct {
     max_background: ?u16 = null,
     congestion_threshold: ?u16 = null,
     ttls: Ttls = .{},
+    /// The classes an explicit `-o *_timeout=` set (one bit per
+    /// `TtlClass`): a token reader (`-o ro` under tokens) refuses any.
+    explicit_ttls: u4 = 0,
     /// `-o writeback` / `writeback_cache`: advertise `FUSE_WRITEBACK_CACHE`
     /// (refused on a read-only mount by the session).
     write_back: bool = false,
@@ -136,6 +139,14 @@ pub const MountOptions = struct {
     stripe_dirs: bool = false,
     /// `-o nonempty`: mount over a non-empty directory.
     nonempty: bool = false,
+
+    /// The first class an explicit `-o *_timeout=` set, if any.
+    pub fn explicitTtl(self: MountOptions) ?TtlClass {
+        inline for (@typeInfo(TtlClass).@"enum".field_names, 0..) |_, i| {
+            if (self.explicit_ttls & (@as(u4, 1) << @intCast(i)) != 0) return @fromBackingInt(@intCast(i));
+        }
+        return null;
+    }
 
     pub fn fsName(self: MountOptions) []const u8 {
         return self.fs_name orelse DEFAULT_FSNAME;
@@ -283,6 +294,12 @@ const ttl_options = [_]TtlOption{
     .{ .name = "negative_timeout", .class = .negative },
 };
 
+/// The `-o` option name of a TTL class (the refusal names it).
+pub fn ttlOptionName(class: TtlClass) []const u8 {
+    inline for (ttl_options) |t| if (t.class == class) return t.name;
+    unreachable;
+}
+
 /// Parse a libfuse-style `-o` string (`a,b=c,…`; empty items ignored) INTO
 /// `opts` (so the env-seeded TTLs are the base the string overrides). The
 /// first refusal stops the parse and names the option; the caller fails the
@@ -317,6 +334,7 @@ fn parseOne(opts: *MountOptions, name: []const u8, value: ?[]const u8) Outcome {
             const v = value orelse return refuse(name, "", .missing_value);
             const ns = parseSecondsNs(v) orelse return refuse(name, v, .seconds);
             opts.ttls.set(t.class, ns);
+            opts.explicit_ttls |= @as(u4, 1) << @intCast(@backingInt(t.class));
             return .ok;
         }
     }
@@ -410,6 +428,10 @@ test "TTL options reach the four classes through the ONE parser; junk refuses th
     try testing.expectEqual(@as(u64, 30_000_000_000), o.ttls.entryTtlFor(true));
     try testing.expectEqual(@as(u64, 2_000_000_000), o.ttls.entryTtlFor(false));
     try testing.expectEqual(@as(u64, 250_000_000), o.ttls.get(.attr));
+    try testing.expectEqual(@as(u4, 0b1111), o.explicit_ttls);
+    try testing.expectEqual(TtlClass.attr, o.explicitTtl().?);
+    try testing.expectEqualStrings("dir_entry_timeout", ttlOptionName(.dir_entry));
+    try testing.expectEqual(@as(?TtlClass, null), (MountOptions{}).explicitTtl());
     var buf: [256]u8 = undefined;
     var bad: MountOptions = .{};
     try testing.expectEqualStrings("-o attr_timeout='5s' is invalid: expected seconds as a canonical decimal with at most 9 fraction digits (e.g. 1, 0.5, 2.250); no unit suffix, sign or exponent", try fmtDiag(&buf, parseOptionString(&bad, "attr_timeout=5s")));

@@ -112,6 +112,7 @@ const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
 const route_table = @import("../../meta/routing/route_table.zig");
 const slot_gate = @import("../../meta/routing/slot_gate.zig");
+const read_divert = @import("../../meta/sym/tokens/read_divert.zig");
 const layout = @import("../../data/layout.zig");
 const staging = @import("../../data/staging.zig");
 const block_refs = @import("../../data/block_refs.zig");
@@ -382,6 +383,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// renderer behind them.
         virtuals: virtual_inodes.Registry,
         virtual: ?VirtualFace = null,
+        /// The read divert (charter §5.5): every foreign-slot read of the
+        /// five read verbs goes through the token client; null = a flat
+        /// mount (two probes, read locally). Bound by the daemon after
+        /// `mount`, BELOW the level-1 op guard and before any (3) guard.
+        divert: ?*read_divert.Divert = null,
         /// Committed corpse destroys on this volume: the subtrahend of the
         /// LIVE inode population `statfs.ffree` reports (POSIX-1: never the
         /// monotone watermark, which made `IUsed` rise forever).
@@ -426,6 +432,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// before the session arms).
         pub fn bindVirtual(self: *Self, face: VirtualFace) void {
             self.virtual = face;
+        }
+
+        /// Bind the token read divert (after `mount`, before the session
+        /// arms).
+        pub fn bindDivert(self: *Self, d: *read_divert.Divert) void {
+            self.divert = d;
+        }
+
+        /// `tokenServe(object, wants)`: null = read locally; else the pinned
+        /// token entry (released by the caller) or `gone`.
+        fn tokenServe(self: *Self, object: u64, wants: read_divert.cache.Wants) Error!?read_divert.cache.Serve {
+            const d = self.divert orelse return null;
+            return d.serve(self.io, object, wants) catch |e| return read_divert.coreError(e);
         }
 
         // ---- the virtual control inodes (virtual_inodes.zig) ----
@@ -602,6 +621,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The inode as stored, FOLDED through the pending refinements;
         /// null when absent.
         fn readInodeOpt(self: *Self, ino: u64) Error!?InodeValue {
+            if (try self.tokenServe(ino, .{})) |served| {
+                // A foreign object: the holder's folded record (its pending
+                // times are the holder's business).
+                defer served.release(self.io);
+                const e = served.entry orelse return null;
+                return e.attrs;
+            }
             const bytes = (self.store.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return storeErr(e)) orelse return null;
             defer self.gpa.free(bytes);
             var v = InodeValue.decode(bytes) catch return error.InputOutput;
@@ -652,10 +678,28 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn findDentry(self: *Self, parent: u64, name: []const u8) Error!?Found {
+            if (try self.tokenServe(parent, .{ .dentries = true })) |served| {
+                defer served.release(self.io);
+                const e = served.entry orelse return null;
+                const rec = e.lookupName(name) orelse return null;
+                return try foundFromToken(parent, rec);
+            }
             var buf: ChainBuf = .{};
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             return self.scanChain(parent, name, &buf, &kvs);
+        }
+
+        /// A token's dentry record as a `Found`: the cookie IS the key's
+        /// `(hash54, coll_seq)` suffix.
+        fn foundFromToken(parent: u64, rec: read_divert.cache.DirRecord) Error!Found {
+            const pos = key.decodeReaddirCookie(rec.cookie) catch return error.InputOutput;
+            const entry = switch (pos) {
+                .after_entry => |e| e,
+                else => return error.InputOutput,
+            };
+            const dpos: economy.DentryPos = .{ .key = key.dentryKey(parent, entry.hash54, entry.coll_seq), .child_ino = rec.child_ino, .file_type = rec.file_type };
+            return .{ .pos = dpos, .local = try localOf(rec.child_ino), .global = rec.child_ino };
         }
 
         /// Whether a directory holds any entry.
@@ -696,6 +740,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The xattr value by name (owned), null when absent.
         fn xattrValue(self: *Self, ino: u64, name: []const u8) Error!?[]u8 {
+            if (try self.tokenServe(ino, .{})) |served| {
+                defer served.release(self.io);
+                const e = served.entry orelse return null;
+                const v = e.xattr(name) orelse return null;
+                return try self.gpa.dupe(u8, v);
+            }
             var occ: [256]u8 = undefined;
             var n: usize = 0;
             const hit = (try self.findXattr(ino, name, &occ, &n)) orelse return null;
@@ -1978,13 +2028,36 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 const pv = (try self.readInodeOpt(try localOf(p))) orelse dv;
                 if (!(try self.emit(&plain, &rich, plus, p, key.READDIR_OFFSET_DOTDOT, pv, "..", true))) return .{ .len = self.written(&plain, &rich, plus) };
             }
+            c.stage(.meta_backend_start);
+            defer c.stage(.meta_backend_done);
+            // A foreign directory: the page is the token's cookie-ordered set
+            // strictly after the resume cookie (one binary search).
+            if (try self.tokenServe(dir, .{ .dentries = true })) |served| {
+                defer served.release(self.io);
+                const e = served.entry orelse return error.FileNotFound;
+                const after: u64 = switch (pos) {
+                    .after_entry => a.offset,
+                    else => 0,
+                };
+                for (e.pageAfter(after)) |rec| {
+                    const child_local = localOf(rec.child_ino) catch {
+                        dentry_without_inode.fire("readdir found a dentry naming a foreign-slot ino");
+                        continue;
+                    };
+                    const cv = (try self.readInodeOpt(child_local)) orelse {
+                        dentry_without_inode.fire("readdir found a dentry whose inode record is absent");
+                        continue;
+                    };
+                    if (plus and economy.isDirMode(cv.mode)) self.rememberParent(rec.child_ino, a.ino);
+                    if (!(try self.emit(&plain, &rich, plus, rec.child_ino, rec.cookie, cv, rec.name, false))) break;
+                }
+                return .{ .len = self.written(&plain, &rich, plus) };
+            }
             var cursor: ?[key.DENTRY_KEY_LEN]u8 = switch (pos) {
                 .after_entry => |e| nextDentryKey(dir, e.hash54, e.coll_seq),
                 else => key.dentryKey(dir, 0, 0),
             };
             const end = key.dentryKey(dir, key.HASH54_MAX, std.math.maxInt(u8));
-            c.stage(.meta_backend_start);
-            defer c.stage(.meta_backend_done);
             scan: while (cursor) |start| {
                 var kvs: std.ArrayList(tree.KeyValue) = .empty;
                 defer tree.deinitKeyValues(self.gpa, &kvs);
@@ -2112,6 +2185,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn listxattr(self: *Self, c: *Ctx, a: filesystem.ListxattrArgs) Error!filesystem.Xattr {
             if (virtual_inodes.isVirtualIno(a.ino)) return if (a.size == 0) .{ .size = 0 } else .{ .data = 0 };
             const local = try localOf(a.ino);
+            if (try self.tokenServe(local, .{})) |served| {
+                defer served.release(self.io);
+                const e = served.entry orelse return error.FileNotFound;
+                var total: usize = 0;
+                for (e.xattrs) |x| if (!isReservedXattr(x.name)) {
+                    total += x.name.len + 1;
+                };
+                if (a.size == 0) return .{ .size = @intCast(total) };
+                if (total > a.size or total > c.window.len) return error.BufferTooSmall;
+                var off: usize = 0;
+                for (e.xattrs) |x| if (!isReservedXattr(x.name)) {
+                    @memcpy(c.window[off..][0..x.name.len], x.name);
+                    c.window[off + x.name.len] = 0;
+                    off += x.name.len + 1;
+                };
+                return .{ .data = off };
+            }
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             const start = key.xattrKey(local, 0, 0);

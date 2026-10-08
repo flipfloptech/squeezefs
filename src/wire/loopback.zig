@@ -221,7 +221,7 @@ const FamilyEcho = struct {
                 break :blk .{ .ok = .{ .census = .{ .head = .{ .n = 1, .has_next = 0, .reserved = @splat(0), .next = 0 }, .rows_bytes = b.written() } } };
             },
             .token_grant => .{ .ok = .{ .token_grant = .{ .head = .{ .kind = 0, .flags = verbs.PAGE_XATTRS_COMPLETE, .reserved = 0, .n_xattrs = 0, .n_dir = 0, .holder = 0, .attrs = attrs, .reserved2 = @splat(0) }, .xattrs_bytes = "", .dir_bytes = "" } } },
-            .token_recall => .{ .ok = .{ .token_recall = .{ .head = .{ .frame_id = 0, .n = 0, .reserved = 0 }, .items = &.{} } } },
+            .token_recall => .{ .ok = .{ .token_recall = .acked } },
             .token_recall_ack => .{ .ok = .{ .token_recall_ack = .fresh } },
             .token_release => |r| .{ .ok = .{ .token_release = .{ .count = @intCast(r.items.len), .reserved = 0 } } },
             .custody_grant => .{ .ok = .{ .custody_grant = .{ .head = .{ .kind = 1, .reserved = @splat(0), .status = 3, .grant_epoch = 0, .page_len = 0, .reserved2 = 0 }, .page_bytes = "" } } },
@@ -320,7 +320,9 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     // Tokens.
     const tg = try c.call(.{ .token_grant = .{ .head = .{ .volume = 0, .wants = verbs.WANT_RECORDS, .mode = 0, .xattr_after_len = 0, .client_id = 1, .object = 9, .after = 0 }, .bytes = "" } });
     try testing.expectEqual(@as(u8, 0), tg.token_grant.head.kind);
-    _ = try c.call(.{ .token_recall = .{ .volume = 0, .reserved = 0, .wait_ms = 10, .client_id = 1 } });
+    const recalled = [_]u64{9};
+    const rv = try c.call(.{ .token_recall = .{ .head = .{ .volume = 0, .reserved = 0, .n = 1, .frame_id = 1, .holder = 1 }, .items = &recalled } });
+    try testing.expectEqual(@as(u8, 0), rv.token_recall.kind);
     _ = try c.call(.{ .token_recall_ack = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .client_id = 1, .frame_id = 0 } });
     const objs = [_]u64{ 9, 10 };
     const tr = try c.call(.{ .token_release = .{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .client_id = 1 }, .items = &objs } });

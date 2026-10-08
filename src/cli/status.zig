@@ -291,6 +291,14 @@ pub fn writeMountHeadline(w: *Io.Writer, gpa: std.mem.Allocator, io: Io, mountpo
         json_scan.number(text, "live_inodes") orelse 0,
         text.len,
     });
+    // The holder's `df` rule (charter §5.5): used = the bitmap population
+    // minus this writer's own unconsumed grant window; absent on a
+    // `--single-writer` mount (both gauges read 0) and so not printed.
+    const population = json_scan.number(text, "data_alloc_bitmap_population") orelse 0;
+    if (population != 0) {
+        const window = json_scan.number(text, "block_grant_window_remaining") orelse 0;
+        try w.print("  alloc      bitmap population {d} block(s), own grant window {d} ⇒ df used {d} block(s)\n", .{ population, window, population -| window });
+    }
 }
 
 pub fn run(p: cli.Process, s: args.Status) u8 {

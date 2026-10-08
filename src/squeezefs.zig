@@ -103,7 +103,7 @@ pub const cli = @import("cli/cli.zig");
 
 // ---- the data plane (charter §6) ----
 pub const data = struct {
-    // @anchor:sym_planes_import
+    pub const sym_planes = @import("data/sym_planes.zig");
     pub const kvmap = @import("data/kvmap.zig");
     pub const layout = @import("data/layout.zig");
     pub const staging = @import("data/staging.zig");
@@ -177,7 +177,7 @@ test {
     // @anchor:sym_slots_test
     // @anchor:sym_tokens_test
     // @anchor:sym_membership_test
-    // @anchor:sym_planes_test
+    _ = data.sym_planes;
     _ = wire;
     _ = data.kvmap;
     _ = meta.guard;

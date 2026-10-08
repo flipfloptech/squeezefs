@@ -915,10 +915,14 @@ pub const DataPlane = struct {
         try self.backend.fsync();
     }
 
-    /// `df` (charter §6): used = the bitmap population minus the writer's
-    /// own unconsumed window — the free list, the virgin tail and the
-    /// blocks inside open trim windows are all supply, never a deficit.
-    /// Block 0 (the superblock chunk) is outside the capacity shown.
+    /// `df` (charter §5.5 "a holder's `df` used count is its bitmap
+    /// population minus its own unconsumed window"): on a grant-armed
+    /// allocator `reachableFreeBlocks` is the CLEAR population of the
+    /// holder's bitmap plus this writer's own window (a joiner reads the
+    /// population the last grant reply carried, 0002 row 241); unarmed it
+    /// is the free list, the virgin tail and the blocks inside open trim
+    /// windows — all supply, never a deficit. Block 0 (the superblock
+    /// chunk) is outside the capacity shown.
     pub fn statfs(self: *DataPlane) ?Space {
         if (self.vols.count == 0) return null;
         var total: u64 = 0;

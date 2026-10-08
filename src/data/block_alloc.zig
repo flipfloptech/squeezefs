@@ -211,6 +211,15 @@ pub const State = enum(u8) {
 
 pub const FLAG_ELIDED_DEBT: u8 = 1 << 0;
 pub const FLAG_SHARED: u8 = 1 << 1;
+/// Rung 6 (§4.4): the block belongs to a dead-epoch quarantine cohort. The
+/// epoch itself rides the `stamp` word while the cell is `State.quarantined`
+/// (the stamp is dead there: nothing minted the block under this holder);
+/// a LIVE owner's block carries the flag alone and only gates its future
+/// free (`custody.BlockQuarantine` keeps that cohort's epoch).
+pub const FLAG_QUARANTINED: u8 = 1 << 2;
+/// A `finishFree` the quarantine deferred: its publish is OWED to the
+/// cohort's release.
+pub const FLAG_QUARANTINE_OWED: u8 = 1 << 3;
 
 pub const Cell = struct {
     /// `gen << 1 | stable` (module doc).
@@ -317,8 +326,13 @@ pub const GrantSource = struct {
 };
 
 /// §11 item 6: the holder's view for the supply arithmetic — `df`'s used
-/// count is the bitmap population minus the holder's own unconsumed window.
-pub const HolderView = struct { bitmap_blocks: u64, population: u64, window_remaining: u64 };
+/// count is the bitmap population minus the holder's own unconsumed window;
+/// the free supply is the CLEAR population plus that window; `frontier` =
+/// the highest set bit + 1 (the holder's virgin tail starts there — the
+/// elision watermark on a holder reads it, `sym_data_planes.md` §4.3 item 2).
+/// A JOINER's view is the holder's last word (`population`, `blocks`) with
+/// its own window.
+pub const HolderView = struct { bitmap_blocks: u64, population: u64, window_remaining: u64, frontier: u64 };
 
 /// §11 items 4, 6: the allocation lease.
 pub const AllocationLease = struct {
@@ -396,6 +410,11 @@ pub const stats = struct {
     pub var block_untracked_free_adjudicated: counters.ShardedCounter = .{};
     pub var shared_release_failures: counters.ShardedCounter = .{};
     pub var meta_kv_block_refs_recovered: counters.ShardedCounter = .{};
+    /// Rung 6 (§3.6, §4.4): blocks admitted to a dead-epoch cohort, cohort
+    /// releases, and `finishFree`s the cohort deferred (owed at release).
+    pub var dlm_quarantined_offsets: counters.ShardedCounter = .{};
+    pub var dlm_quarantine_releases: counters.ShardedCounter = .{};
+    pub var block_quarantine_deferred_frees: counters.ShardedCounter = .{};
     /// Levels.
     pub var alloc_fresh_supply_exhausted_latched: counters.Gauge = .{};
     pub var alloc_fresh_supply_exhausted_candidates: counters.Gauge = .{};
@@ -408,7 +427,7 @@ pub var fresh_supply_latched: Atomic(usize) = .init(0);
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons" }) |name| {
+    inline for (.{ "alloc_from_freelist", "alloc_fresh_mints", "del_obj", "block_pin_stale_keys", "block_key_incarnation_unknown", "unpublished_offsets_recovered", "block_untracked_free_adjudicated", "shared_release_failures", "meta_kv_block_refs_recovered", "unpublished_mint_abandons", "dlm_quarantined_offsets", "dlm_quarantine_releases", "block_quarantine_deferred_frees" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "block_double_frees", "block_untracked_free_refusals", "block_claim_anomalies", "block_key_incarnation_exhausted", "block_live_free_refusals", "alloc_trim_window_parks" }) |name| {
@@ -627,7 +646,9 @@ pub const BlockAllocator = struct {
         return self.bits[@intCast(idx / 64)].fetchAnd(~bitMask(idx), .acq_rel) & bitMask(idx) != 0;
     }
 
-    fn bitIsSet(self: *const BlockAllocator, idx: u64) bool {
+    /// SET = not reallocatable now (allocated, granted, in limbo or inside
+    /// a trim window); a census face for the holder's ladders.
+    pub fn bitIsSet(self: *const BlockAllocator, idx: u64) bool {
         return self.bits[@intCast(idx / 64)].load(.acquire) & bitMask(idx) != 0;
     }
 
@@ -814,9 +835,12 @@ pub const BlockAllocator = struct {
     }
 
     /// The defrag mover's mint: the lowest free idx below `below`, never a
-    /// fresh mint (BA:L2531-2551).
+    /// fresh mint (BA:L2531-2551). On a grant-armed allocator a clear bit is
+    /// the HOLDER's supply, reallocated only through a carve (charter §5.5):
+    /// nothing to pick locally.
     pub fn allocateBlockBelow(self: *BlockAllocator, below: u64) AllocError!?u64 {
         try self.planeGate(.mint);
+        if (self.grant_source != null) return null;
         const bound = @min(below, self.highest.load(.acquire));
         var from: u64 = 0;
         while (self.lowestClear(from, bound)) |idx| {
@@ -832,11 +856,12 @@ pub const BlockAllocator = struct {
         return null;
     }
 
-    /// Ascending convergence: the lowest free idx ≥ `min`, else fresh.
+    /// Ascending convergence: the lowest free idx ≥ `min`, else fresh. Armed:
+    /// the window is the ONE mint source (a clear bit is the holder's).
     pub fn allocateBlockAtOrAbove(self: *BlockAllocator, min: u64) AllocError!Minted {
         try self.planeGate(.mint);
         const highest = self.highest.load(.acquire);
-        var from = min;
+        var from = if (self.grant_source != null) highest else min;
         while (self.lowestClear(from, highest)) |idx| {
             if (!self.winEntitlement()) break;
             if (self.tryTakeBit(idx)) {
@@ -1093,12 +1118,14 @@ pub const BlockAllocator = struct {
         return .terminal;
     }
 
-    /// `finish_free`: quarantine gate (rung 6) → grace defer (rung 6) →
-    /// the free list. The block is reallocatable only NOW.
+    /// `finish_free`: quarantine gate (§4.4: the publish is OWED to the
+    /// cohort's release — "a quarantine never force-drains") → grace defer
+    /// → the free list. The block is reallocatable only NOW.
     pub fn finishFree(self: *BlockAllocator, idx: u64) void {
         const c = self.cell(idx);
-        if (self.quarantine_count.load(.acquire) != 0 and c.getState() == .quarantined) {
-            log.warn("block allocator vol {d}: finish_free of block {d} deferred — quarantined under a dead epoch", .{ self.cfg.vol, idx });
+        if (self.quarantine_count.load(.acquire) != 0 and c.flags.load(.acquire) & FLAG_QUARANTINED != 0) {
+            _ = c.flags.fetchOr(FLAG_QUARANTINE_OWED, .acq_rel);
+            stats.block_quarantine_deferred_frees.inc();
             return;
         }
         if (self.grace) |g| if (g.vtable.defer_(g.ctx, idx, self.cfg.block_size)) {
@@ -1109,10 +1136,12 @@ pub const BlockAllocator = struct {
         stats.del_obj.inc();
     }
 
-    /// `publish_free_list`: holder sink (journal the CLEAR delta; `false` ⇒
-    /// double free) → the forensics tape → clear the bit → credit the budget
-    /// (bit BEFORE budget, the invariant every release path keeps). A bit
-    /// already clear ⇒ ERROR "DOUBLE FREE" + `block_double_frees`.
+    /// `publish_free_list`: holder sink (the bit CLEARED and its kind-5 CLEAR
+    /// delta queued in ONE critical section under the holder's ordering
+    /// lock — the bitmap IS the free list, 0002 row 237; `false` ⇒ double
+    /// free) → the forensics tape → clear the bit (unarmed) → credit the
+    /// budget (bit BEFORE budget, the invariant every release path keeps). A
+    /// bit already clear ⇒ ERROR "DOUBLE FREE" + `block_double_frees`.
     fn publishFreeList(self: *BlockAllocator, idx: u64, site: Site) void {
         const c = self.cell(idx);
         if (self.finish_free_sink) |s| {
@@ -1121,16 +1150,24 @@ pub const BlockAllocator = struct {
                 log.err("block allocator vol {d}: DOUBLE FREE of block {d} (the holder's bit was already clear)", .{ self.cfg.vol, idx });
                 return;
             }
+            if (self.forensics) |*t| t.record(idx, site);
+        } else {
+            if (self.forensics) |*t| t.record(idx, site);
+            if (!self.clearBit(idx)) {
+                stats.block_double_frees.fire("free-list bit already clear");
+                log.err("block allocator vol {d}: DOUBLE FREE of block {d} (already on the free list)", .{ self.cfg.vol, idx });
+                return;
+            }
         }
-        if (self.forensics) |*t| t.record(idx, site);
-        if (!self.clearBit(idx)) {
-            stats.block_double_frees.fire("free-list bit already clear");
-            log.err("block allocator vol {d}: DOUBLE FREE of block {d} (already on the free list)", .{ self.cfg.vol, idx });
-            return;
+        if (idx < self.highest.load(.acquire)) {
+            c.setState(.free);
+            self.creditFree();
+            _ = self.hint.fetchMin(idx, .monotonic);
+        } else {
+            // A never-minted block (a quarantined grant released): a clear
+            // bit at/above the cursor is VIRGIN, never a free-list entry.
+            c.setState(.virgin);
         }
-        c.setState(.free);
-        self.creditFree();
-        _ = self.hint.fetchMin(idx, .monotonic);
     }
 
     /// `free_block`: gate + `beginFree` + `finishFree` with nothing between.
@@ -1266,10 +1303,15 @@ pub const BlockAllocator = struct {
     }
 
     /// `(cap − min(cursor, cap)) × block`. On a grant-armed allocator the
-    /// virgin tail is the HOLDER's supply, not this writer's: 0 (its own
-    /// supply is its window, `freeSupplyBlocks`).
+    /// virgin tail is the HOLDER's: this process holding the lease reads
+    /// `blocks − frontier` (the bitmap's highest set bit + 1 — the elision
+    /// watermark's input, `sym_data_planes.md` §4.3 item 2); a joiner reads
+    /// 0 (its own supply is its window, `freeSupplyBlocks`).
     pub fn virginBytes(self: *const BlockAllocator) u64 {
-        if (self.grant_source != null) return 0;
+        if (self.grant_source != null) {
+            if (self.lease) |l| if (l.vtable.holderView(l.ctx)) |v| return (v.bitmap_blocks -| v.frontier) * self.cfg.block_size;
+            return 0;
+        }
         const cursor = @min(self.highest.load(.acquire), self.capacity_blocks);
         return (self.capacity_blocks - cursor) * self.cfg.block_size;
     }
@@ -1278,11 +1320,20 @@ pub const BlockAllocator = struct {
         return self.virginBytes() / self.cfg.block_size;
     }
 
-    /// `virgin + free_list_len` (+ the holder's window).
+    /// `virgin + free_list_len` unarmed. Armed: the window's remainder plus
+    /// the CLEAR population of the holder's bitmap (`blocks − population`,
+    /// the holder's own or the last word a grant reply carried — the flat
+    /// inputs "read 0 on an armed allocator at a full cursor" and the
+    /// free-grace valve would read them as a permanent trough).
     pub fn freeSupplyBlocks(self: *const BlockAllocator) u64 {
-        var n = self.virginBlocks() + self.freeBlocksCount();
-        if (self.grant_source) |g| n += g.vtable.remaining(g.ctx);
-        return n;
+        if (self.grant_source) |g| {
+            var n = g.vtable.remaining(g.ctx);
+            if (self.lease) |l| if (l.vtable.holderView(l.ctx)) |v| {
+                n += v.bitmap_blocks -| v.population;
+            };
+            return n;
+        }
+        return self.virginBlocks() + self.freeBlocksCount();
     }
 
     /// `virgin + free-listed + inside trim windows`: a window is pending
@@ -1333,6 +1384,160 @@ pub const BlockAllocator = struct {
             w.* = v;
         }
         return .{ .highest = highest, .set_words = out, .free = self.freeBlocksCount() };
+    }
+
+    // ---- rung 6: the holder's faces over the ONE bitmap (0002 row 237) ----
+
+    /// The bit words themselves: the allocation holder's page images are
+    /// serialized from them (508 words per `KVDA` page) — there is no second
+    /// bitmap and no drain between two.
+    pub fn bitmapWords(self: *const BlockAllocator) []const Atomic(u64) {
+        return self.bits;
+    }
+
+    /// A carve's SET of one block, called under the holder's ordering lock:
+    /// the bit 0→1; a free-listed block leaves the list (budget debited, its
+    /// elided debt cancelled — a reused block owes no discard) and reads
+    /// `virgin` until a mint claims it. `false` ⇒ already set (not carvable).
+    pub fn holderTakeBit(self: *BlockAllocator, idx: u64) bool {
+        if (!self.tryTakeBit(idx)) return false;
+        const c = self.cell(idx);
+        if (c.getState() == .free) {
+            self.debitFree();
+            self.cancelElidedDebt(idx);
+        }
+        c.setState(.virgin);
+        return true;
+    }
+
+    /// The finish-free sink's bit half, under the holder's ordering lock:
+    /// the bit 1→0 ONLY — `publishFreeList` does the state and the budget
+    /// after the sink returns. `false` ⇒ already clear (a double free).
+    pub fn holderClearBitRaw(self: *BlockAllocator, idx: u64) bool {
+        return self.clearBit(idx);
+    }
+
+    /// A `ReturnBlocks` / adopt-release CLEAR of a block never minted here:
+    /// the bit 1→0 plus the bookkeeping — free below the cursor (the local
+    /// list sees it), virgin at/above. `false` ⇒ already clear.
+    pub fn holderReturnBit(self: *BlockAllocator, idx: u64) bool {
+        if (!self.clearBit(idx)) return false;
+        const c = self.cell(idx);
+        if (idx < self.highest.load(.acquire)) {
+            c.setState(.free);
+            self.creditFree();
+            _ = self.hint.fetchMin(idx, .monotonic);
+        } else c.setState(.virgin);
+        return true;
+    }
+
+    /// The lowest clear run of length ≤ `want` starting at or above `from`
+    /// (the carve's scan: all-ones words skipped, the run truncated at
+    /// `want` or the first set bit); null when no clear bit remains.
+    pub fn lowestClearRun(self: *const BlockAllocator, from: u64, want: u64) ?struct { start: u64, len: u64 } {
+        const start = self.lowestClear(from, self.capacity_blocks) orelse return null;
+        var end = start + 1;
+        while (end < self.capacity_blocks and end - start < want and !self.bitIsSet(end)) : (end += 1) {}
+        return .{ .start = start, .len = end - start };
+    }
+
+    /// The highest set bit + 1 (0 when none): the holder's virgin floor.
+    pub fn highestSetPlusOne(self: *const BlockAllocator) u64 {
+        var w: usize = self.bits.len;
+        while (w > 0) {
+            w -= 1;
+            const v = self.bits[w].load(.acquire);
+            if (v != 0) return @as(u64, w) * 64 + (64 - @clz(v));
+        }
+        return 0;
+    }
+
+    /// The popcount of the bitmap (O(words); the census oracle and the
+    /// once-per-cycle population drift check — never the funnel).
+    pub fn bitPopulation(self: *const BlockAllocator) u64 {
+        var n: u64 = 0;
+        for (self.bits) |*w| n += @popCount(w.load(.acquire));
+        return n;
+    }
+
+    // ---- rung 6: the dead-epoch quarantine (§4.4; 0002 row 245) ----
+
+    /// Admit a block to the cohort `dead_epoch`: a free-listed block leaves
+    /// the free list (bit taken, budget debited), a never-minted granted
+    /// block keeps its set bit; both read `quarantined` with the epoch in
+    /// the dead stamp word and OWE a publish to the release. A block in
+    /// limbo or with a live owner carries the flag alone — its future
+    /// `finishFree` defers. Idempotent: `false` ⇒ already admitted.
+    pub fn quarantineBlock(self: *BlockAllocator, idx: u64, dead_epoch: u64) bool {
+        assert(idx < self.capacity_blocks);
+        const c = self.cell(idx);
+        if (c.flags.fetchOr(FLAG_QUARANTINED, .acq_rel) & FLAG_QUARANTINED != 0) return false;
+        _ = self.quarantine_count.fetchAdd(1, .acq_rel);
+        stats.dlm_quarantined_offsets.inc();
+        switch (c.getState()) {
+            .free => {
+                const took = self.tryTakeBit(idx);
+                assert(took);
+                self.debitFree();
+                self.cancelElidedDebt(idx);
+                c.stamp.store(dead_epoch, .release);
+                c.setState(.quarantined);
+                _ = c.flags.fetchOr(FLAG_QUARANTINE_OWED, .acq_rel);
+            },
+            .virgin => {
+                _ = self.tryTakeBit(idx);
+                c.stamp.store(dead_epoch, .release);
+                c.setState(.quarantined);
+                _ = c.flags.fetchOr(FLAG_QUARANTINE_OWED, .acq_rel);
+            },
+            .allocated, .limbo, .trim_windowed, .quarantined => {},
+        }
+        return true;
+    }
+
+    pub fn isQuarantined(self: *BlockAllocator, idx: u64) bool {
+        return self.cell(idx).flags.load(.acquire) & FLAG_QUARANTINED != 0;
+    }
+
+    /// Release the cohort `dead_epoch`: every `quarantined` cell carrying the
+    /// epoch (a bitmap/state scan, never a hash walk) and every flagged
+    /// cell in `live` (the live-owner admissions the caller kept) leave
+    /// the quarantine; a cell that OWES a publish moves to `limbo` and its
+    /// index goes to `out` — the caller runs `finishFree` on each (grace
+    /// ring → sink → the bit clears). Returns the count written.
+    pub fn releaseQuarantine(self: *BlockAllocator, dead_epoch: u64, live: []const u64, out: []u64) usize {
+        var n: usize = 0;
+        if (self.quarantine_count.load(.acquire) == 0) return 0;
+        var idx: u64 = 0;
+        while (idx < self.capacity_blocks) : (idx += 1) {
+            const c = self.cell(idx);
+            if (c.getState() != .quarantined or c.stamp.load(.acquire) != dead_epoch) continue;
+            n = self.releaseQuarantinedCell(idx, out, n);
+        }
+        for (live) |l| if (l < self.capacity_blocks and self.isQuarantined(l)) {
+            n = self.releaseQuarantinedCell(l, out, n);
+        };
+        stats.dlm_quarantine_releases.inc();
+        return n;
+    }
+
+    fn releaseQuarantinedCell(self: *BlockAllocator, idx: u64, out: []u64, n: usize) usize {
+        const c = self.cell(idx);
+        const owed = c.flags.load(.acquire) & FLAG_QUARANTINE_OWED != 0;
+        // A full `out` leaves the cell IN the cohort (flag and epoch kept)
+        // for the caller's next pass — never a lost bit.
+        if (owed and n >= out.len) return n;
+        const prev = c.flags.fetchAnd(~(FLAG_QUARANTINED | FLAG_QUARANTINE_OWED), .acq_rel);
+        if (prev & FLAG_QUARANTINED == 0) return n;
+        _ = self.quarantine_count.fetchSub(1, .acq_rel);
+        if (prev & FLAG_QUARANTINE_OWED == 0) return n;
+        if (c.getState() == .quarantined) {
+            c.stamp.store(STAMP_NONE, .release);
+            Incarnation.retire(&c.incarnation);
+        }
+        c.setState(.limbo);
+        out[n] = idx;
+        return n + 1;
     }
 
     /// Sorted free indices below the cursor (a census face).
@@ -1963,6 +2168,104 @@ test "concurrent claimers never share a block and the budget stays exact (budget
     try testing.expectEqual(@as(u64, 0), a.freeBlocksCount());
     try testing.expectEqual(@as(u64, 192), a.highestBlockIndex());
     try testing.expectEqual(@as(u64, 192), a.usedBlocks());
+}
+
+test "rung 6 holder faces: a carve's take leaves the free list and cancels debt, the return re-lists below the cursor, the run scan and the frontier read the ONE bitmap" {
+    const a = try testAlloc(128);
+    defer a.deinit();
+    var i: u64 = 0;
+    while (i < 10) : (i += 1) _ = try a.allocateBlock();
+    _ = try a.beginFree(3);
+    a.recordElidedDebt(3);
+    a.finishFree(3);
+    _ = try a.freeBlock(7);
+    try testing.expectEqual(@as(u64, 2), a.freeBlocksCount());
+    try testing.expectEqual(@as(u64, 4096), a.elidedDebtBytes());
+    // The lowest clear run at/above the frontier is the virgin tail; below
+    // it the holes 3 and 7 are single-block runs.
+    try testing.expectEqual(@as(u64, 10), a.highestSetPlusOne());
+    const tail = a.lowestClearRun(10, 64).?;
+    try testing.expectEqual(@as(u64, 10), tail.start);
+    try testing.expectEqual(@as(u64, 64), tail.len);
+    const hole = a.lowestClearRun(0, 64).?;
+    try testing.expectEqual(@as(u64, 3), hole.start);
+    try testing.expectEqual(@as(u64, 1), hole.len);
+    try testing.expect(a.holderTakeBit(3));
+    try testing.expect(!a.holderTakeBit(3));
+    try testing.expectEqual(@as(u64, 1), a.freeBlocksCount());
+    try testing.expectEqual(@as(u64, 0), a.elidedDebtBytes());
+    try testing.expectEqual(State.virgin, a.stateOf(3));
+    try testing.expect(a.holderTakeBit(40));
+    try testing.expectEqual(@as(u64, 41), a.highestSetPlusOne());
+    try testing.expectEqual(@as(u64, 10), a.bitPopulation());
+    // Returns: below the cursor the block is free-listed again; above it
+    // the bit is simply clear (virgin).
+    try testing.expect(a.holderReturnBit(3));
+    try testing.expect(!a.holderReturnBit(3));
+    try testing.expectEqual(State.free, a.stateOf(3));
+    try testing.expectEqual(@as(u64, 2), a.freeBlocksCount());
+    try testing.expect(a.holderReturnBit(40));
+    try testing.expectEqual(State.virgin, a.stateOf(40));
+    try testing.expectEqual(@as(u64, 2), a.freeBlocksCount());
+    try testing.expectEqual(@as(usize, 2), a.bitmapWords().len);
+    // The raw clear is the bit alone.
+    try testing.expect(a.holderClearBitRaw(9));
+    try testing.expect(!a.holderClearBitRaw(9));
+}
+
+test "rung 6 quarantine: a free block leaves the list under the epoch, a live block's finish defers, the cohort release hands the owed publishes back and nothing else" {
+    const a = try testAlloc(16);
+    defer a.deinit();
+    var i: u64 = 0;
+    while (i < 6) : (i += 1) _ = try a.allocateBlock();
+    _ = try a.freeBlock(1);
+    const admitted0 = stats.dlm_quarantined_offsets.load();
+    try testing.expect(a.quarantineBlock(1, 7)); // free ⇒ out of the list
+    try testing.expect(!a.quarantineBlock(1, 7)); // idempotent
+    try testing.expect(a.quarantineBlock(9, 7)); // never minted (a revoked grant's block)
+    try testing.expect(a.quarantineBlock(4, 7)); // a live owner's block: flag only
+    try testing.expectEqual(admitted0 + 3, stats.dlm_quarantined_offsets.load());
+    try testing.expectEqual(@as(u64, 0), a.freeBlocksCount());
+    try testing.expectEqual(State.quarantined, a.stateOf(1));
+    try testing.expectEqual(State.quarantined, a.stateOf(9));
+    try testing.expectEqual(State.allocated, a.stateOf(4));
+    try testing.expect(a.isQuarantined(4));
+    // A fresh mint never lands on a quarantined block (its bit is set).
+    try testing.expectEqual(@as(u64, 6), (try a.allocateBlock()).idx);
+    // The live block's terminal free defers its publish.
+    const deferred0 = stats.block_quarantine_deferred_frees.load();
+    try testing.expectEqual(BeginFree.terminal, try a.freeBlock(4));
+    try testing.expectEqual(deferred0 + 1, stats.block_quarantine_deferred_frees.load());
+    try testing.expectEqual(State.limbo, a.stateOf(4));
+    try testing.expectEqual(@as(u64, 0), a.freeBlocksCount());
+    // Another epoch's release touches nothing of this cohort.
+    var out: [8]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), a.releaseQuarantine(8, &.{}, &out));
+    try testing.expect(a.isQuarantined(1));
+    // The cohort release: 1 and 9 (the epoch in the stamp) plus the live
+    // admission the caller names; every one owed a publish.
+    const n = a.releaseQuarantine(7, &.{4}, &out);
+    try testing.expectEqual(@as(usize, 3), n);
+    std.mem.sort(u64, out[0..n], {}, std.sort.asc(u64));
+    try testing.expectEqualSlices(u64, &.{ 1, 4, 9 }, out[0..n]);
+    for (out[0..n]) |idx| {
+        try testing.expectEqual(State.limbo, a.stateOf(idx));
+        try testing.expect(!a.isQuarantined(idx));
+        a.finishFree(idx);
+    }
+    try testing.expectEqual(@as(u64, 0), a.quarantine_count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 2), a.freeBlocksCount()); // 1 and 4 below the cursor; 9 is virgin again
+    try testing.expectEqual(State.virgin, a.stateOf(9));
+    try testing.expectEqual(@as(u64, 1), (try a.allocateBlock()).idx);
+    // A bounded `out` leaves the remainder in the cohort for the next pass.
+    _ = try a.freeBlock(2);
+    try testing.expect(a.quarantineBlock(2, 11));
+    try testing.expect(a.quarantineBlock(12, 11));
+    var one: [1]u64 = undefined;
+    try testing.expectEqual(@as(usize, 1), a.releaseQuarantine(11, &.{}, &one));
+    try testing.expectEqual(@as(u64, 1), a.quarantine_count.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), a.releaseQuarantine(11, &.{}, &one));
+    try testing.expectEqual(@as(u64, 0), a.quarantine_count.load(.monotonic));
 }
 
 test "stats JSON names every family" {

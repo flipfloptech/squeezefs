@@ -69,6 +69,7 @@ const node_snapshot = @import("../meta/node_snapshot.zig");
 const node_state_core = @import("../meta/node_state_core.zig");
 const guard = @import("../meta/guard.zig");
 const sym = @import("../meta/sym.zig");
+const sym_planes = @import("../data/sym_planes.zig");
 const lifecycle = @import("../fuse/handler/lifecycle.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const open_table = @import("../fuse/handler/open_table.zig");
@@ -227,6 +228,7 @@ pub const sources = [_]Source{
     .{ .path = "src/meta/guard.zig", .family = "meta" },
     .{ .path = "src/meta/routing/stats.zig", .family = "meta" },
     .{ .path = "src/meta/sym.zig", .family = "meta" },
+    .{ .path = "src/data/sym_planes.zig", .family = "data" },
     .{ .path = "src/fuse/handler/lifecycle.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/op_guard.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/open_table.zig", .family = "fuse" },
@@ -300,6 +302,14 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/routing/migrate.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/meta_set.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/sym/manager.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/data/sym_planes/alloc_lease.zig", .by = "src/data/sym_planes.zig" },
+    .{ .path = "src/data/sym_planes/data_bitmap.zig", .by = "src/data/sym_planes.zig" },
+    .{ .path = "src/data/sym_planes/block_grant.zig", .by = "src/data/sym_planes.zig" },
+    .{ .path = "src/data/sym_planes/free_grace.zig", .by = "src/data/sym_planes.zig" },
+    .{ .path = "src/data/sym_planes/free_ship.zig", .by = "src/data/sym_planes.zig" },
+    .{ .path = "src/data/sym_planes/shared_index.zig", .by = "src/data/sym_planes.zig" },
+    .{ .path = "src/data/sym_planes/clone_protocol.zig", .by = "src/data/sym_planes.zig" },
+    .{ .path = "src/data/sym_planes/custody.zig", .by = "src/data/sym_planes.zig" },
     .{ .path = "src/meta/sym/join.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/bind.zig", .by = "src/meta/sym.zig" },
 };
@@ -412,6 +422,8 @@ fn writeData(src: *Sources, w: *Writer) Error!void {
     try counters.writeNamespaceJson(transform.stats, w);
     try w.writeAll(",\"write_seams\":");
     try counters.writeNamespaceJson(write_seams.stats, w);
+    try w.writeAll(",\"sym_planes\":");
+    try sym_planes.writeStatsJson(w);
     try w.writeAll(",\"census\":");
     if (src.keyCensusArmed()) {
         if (src.key_census) |kc| {

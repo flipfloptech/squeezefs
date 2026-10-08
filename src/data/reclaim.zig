@@ -313,6 +313,20 @@ pub const ForegroundSignal = struct {
     read: *const fn (?*anyopaque) u64,
 };
 
+/// Rung 6 (`sym_data_planes.md` §4.1; `DAR §11.7`): the terminal ladder's
+/// step 1 on a grant-armed NON-holder — the free's DURABLE effect already
+/// rode the displacing publish; the ACCOUNTING ladder whose durable home
+/// is the holder's ledger SHIPS to the allocation holder. `ship` hands
+/// the block to the shipper (`false` ⇒ no target reachable: leak-safe,
+/// counted by the shipper); `authorityActive` is the holder's own
+/// executor running the ladder locally with its accounting authority
+/// (never ambiently active).
+pub const FreeTarget = struct {
+    ctx: *anyopaque,
+    ship: *const fn (*anyopaque, vol_tag: u64, idx: u64) bool,
+    authorityActive: *const fn (*anyopaque) bool,
+};
+
 // ---------------------------------------------------------------------------
 // Stats (spec §7).
 // ---------------------------------------------------------------------------
@@ -421,6 +435,9 @@ pub const Entry = struct {
 const VolRow = struct {
     alloc: *BlockAllocator,
     target: Target,
+    /// Rung 6: the allocation holder the frees ship to (null = this mount
+    /// decides locally — the single-writer class and the holder itself).
+    free_target: ?FreeTarget = null,
     queued: Atomic(u64) = .init(0),
     /// This volume ever elided a free: the debt drainer's target set.
     debt_target: Atomic(bool) = .init(false),
@@ -531,6 +548,11 @@ pub const Reclaimer = struct {
         self.fence_probe = p;
     }
 
+    /// Rung 6: install (or clear) the free target of a data volume.
+    pub fn setFreeTarget(self: *Reclaimer, vol: u16, t: ?FreeTarget) void {
+        self.vols[vol].?.free_target = t;
+    }
+
     pub fn setTierPurge(self: *Reclaimer, p: TierPurge) void {
         self.tier_purge = p;
     }
@@ -567,6 +589,12 @@ pub const Reclaimer = struct {
             stats.block_key_incarnation_refusals.fire("terminal free of a block under a stale lifetime stamp");
             return .refused;
         }
+        // Step 1 (rung 6): a non-holder SHIPS the accounting ladder to the
+        // holder — "the pre-branch shape was a silent local leak". The
+        // holder's own executor (authority active) runs the ladder here.
+        if (row.free_target) |t| if (!t.authorityActive(t.ctx)) {
+            return if (t.ship(t.ctx, alloc.volTag(), idx)) .nonterminal else .refused;
+        };
         // Step 5: `begin_free` (the SHARED gate and the untracked gate
         // live inside it).
         const verdict = alloc.beginFree(idx) catch return .refused;

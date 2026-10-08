@@ -141,7 +141,16 @@ pub fn shapeEligible(s: Shape) bool {
 
 /// Rung 6's durable half of predicate 4 on an armed set (`sole_owner_
 /// verdict`): asked BEFORE the word is retired so a non-resident leaf read
-/// never sits inside the unstable window. Absent ⇒ sole.
+/// never sits inside the unstable window. Absent ⇒ sole. The verdict ORDER
+/// is the posture source's (`sym_planes/custody.zig` `soleOwnerVerdict`,
+/// bound through `PostureSource.soleOwnerFn`): `non_holder` (a JOINED
+/// appender holding no allocation lease for the block's data volume — the
+/// patch would retire a lifetime that plane accounts) BEFORE
+/// `foreign_custody` (the file's custody is held from its SLOT HOLDER,
+/// whose tree this mount cannot read) BEFORE the durable probe (`count ==
+/// 1 ∧ !shared` ⇒ `sole`; anything else, or a probe that cannot read —
+/// the leak-safe direction — ⇒ `shared`). `tryPatch` declines each as its
+/// own counted bucket and runs the RAM pair only on `sole`.
 pub const SoleOwnerVerdict = enum { sole, shared, foreign_custody, non_holder };
 
 pub const CustodyProbe = struct {

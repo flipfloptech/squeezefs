@@ -38,6 +38,7 @@
 > u64 BE`, value `{op u8, holder_term u64}` — a distinct kind, never a length-discriminated arm of kind 4.
 >
 > **v4 WILL write (rung 6; decided now so the reference's layout is not re-imported):**
+> - Appender page — **superseded 2026-10-08 by `sym_appenders_manager.md` §2.2 as landed in `src/meta/sym/appender_page.zig`**: the slot entry carries `slot_tree_extents u32` (a COUNT, 35 B entries ⇒ `SLOT_PAGE_BUDGET = (4088 − 296) / 35 = 108`, the charter's number), the identity's `writer_id` is the port's u64, `recovered_by_term` is kept, the fixed part is 296 B. The line below is the earlier sketch, kept for the record:
 > - Appender page (4096 B, A/B over FOUR slots per charter §5.5): `magic "KVAP" u32 @0 ‖ layout_version
 >   u16 = 1 @4 ‖ reserved u16 = 0 @6 ‖ appender_id u32 @8 ‖ generation u64 @16 ‖ identity {node_token u64,
 >   mount_slot u32, writer_id u32} @24 ‖ term u64 @40 ‖ state u8 {Free 0, Live 1, Recovering 2, Recovered 3}

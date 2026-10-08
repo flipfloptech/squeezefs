@@ -16,8 +16,10 @@
 //!    io pool, the volume length.
 //! 3. Both superblock copies (DUR-5: a primary that classifies is
 //!    authoritative; the tail copy serves only when sector 0 errors) →
-//!    format v4 with no capability bit (each of the four names a later
-//!    rung's mechanism).
+//!    format v4 with at most the block-map-tree and symmetric-plane bits
+//!    (layout deltas and the volume lifecycle name later rungs'
+//!    mechanisms); `SQUEEZEFS_SYMMETRIC_META=0` on a stamped volume
+//!    refuses the writable open ("once armed, stays armed").
 //! 4. The newest valid ledger slot (none on a v4 volume is corruption).
 //! 5. The ring replayed from the record's tail (`replayScanImage`: nothing
 //!    inside the window fails loud; torn entries drop and count —
@@ -39,9 +41,12 @@
 //! 10. THE GATE (charter §5.7 ordering law): the replayed `writer_claim`
 //!    classified → B1 arbitrated → our claim committed through the conveyor
 //!    and BARRIERED → the residue covered once more (the claim tx never sits
-//!    committed-but-uncovered) → the checkpoint task's thread → the
-//!    heartbeat. A refusal releases the PR and closes the flock fd before
-//!    returning. FUSE arms later, in `mount`.
+//!    committed-but-uncovered) → on a symmetric volume the appender set
+//!    (`sym/bind.zig`: the directory census, region 0's page Live with
+//!    `is_manager` — the D0 winner IS the manager, charter §5.7 — and the
+//!    manager lease held) → the checkpoint task's thread → the heartbeat.
+//!    A refusal releases the PR and closes the flock fd before returning.
+//!    FUSE arms later, in `mount`.
 //!
 //! The backend's `io` must be `SqzIo`'s (asserted at `open`): the pass is a
 //! lane fiber and every wait it takes — the ring-admission park on the
@@ -108,6 +113,7 @@ const guard = @import("guard.zig");
 const routing = @import("routing.zig");
 const slot_state = routing.slot_state;
 const stamp_cell = routing.stamp_cell;
+const sym = @import("sym.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("backend is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -221,6 +227,8 @@ pub const OpenOptions = struct {
 pub const FormatOptions = struct {
     env: *const std.process.Environ.Map,
     pool: ?*uring_fs.Pool = null,
+    /// The symmetric plane by default; `--single-writer` is the opt-out.
+    class: geometry.Class = .symmetric,
     node_size: u64 = superblock.default_node_size,
     journal_len_override: ?u64 = null,
     /// Per-volume identity (the CLI mints it from `Io.randomSecure`).
@@ -255,6 +263,7 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
     var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = 0, .bitmap_base = 0 };
     var diag: geometry.PlanRefusal = undefined;
     var plan = format.planFormat(gpa, volume_len, .{
+        .class = opts.class,
         .node_size = opts.node_size,
         .journal_len_override = opts.journal_len_override,
         .uuid = opts.uuid,
@@ -274,7 +283,7 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
     };
     defer plan.deinit();
     try dev.writeSteps(plan.steps);
-    log.info("formatted {s}: format v4, member {d} of {d}, {d} B, node {d} B, journal {d} B, {d} extents", .{ path, opts.member_position, opts.member_count, volume_len, opts.node_size, plan.superblock.journal.len, plan.superblock.totalExtents() });
+    log.info("formatted {s}: format v4 ({s}), member {d} of {d}, {d} B, node {d} B, journal {d} B, {d} extents", .{ path, @tagName(opts.class), opts.member_position, opts.member_count, volume_len, opts.node_size, plan.superblock.journal.len, plan.superblock.totalExtents() });
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +362,13 @@ pub const KvBackend = struct {
     /// Layers B1/B2 (the claim, the PR posture, the heartbeat); null only
     /// until the gate ran.
     guard: ?*guard.gate.Guard = null,
+    /// The D0 ladder's measured duration at this open (the failover
+    /// bound's ladder term, charter §5.5 "Extent grants").
+    gate_ns: u64 = 0,
+    /// The symmetric plane's appender set (region 0 = this mount's ring
+    /// with `is_manager`, the in-process regions, the manager); null on a
+    /// single-writer volume.
+    sym: ?*sym.bind.AppenderSet = null,
     closed: bool = false,
 
     // ---- open ----
@@ -406,12 +422,15 @@ pub const KvBackend = struct {
             log.err("{s}: unknown incompat feature bits {x} — this binary cannot mount it (reformat required)", .{ path, sb.unknownIncompat() });
             return error.UnsupportedFormat;
         }
-        if (sb.features_incompat & ~superblock.block_map_tree != 0) {
-            // Of the four capability bits only the block-map tree is
-            // implemented at this rung (the symmetric plane, layout deltas
-            // and the volume lifecycle are later rungs'); this rung mounts
-            // the one-member forest.
-            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat & ~superblock.block_map_tree });
+        if (sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) != 0) {
+            // Of the four capability bits the block-map tree and the
+            // symmetric plane are implemented (layout deltas and the volume
+            // lifecycle are later rungs').
+            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) });
+            return error.UnsupportedFormat;
+        }
+        if (sb.symmetricPlaneStamped() and !knobs.boolKnob("SQUEEZEFS_SYMMETRIC_META", opts.env)) {
+            log.err("{s}: SQUEEZEFS_SYMMETRIC_META=0 but the superblock carries SYMMETRIC_PLANE — once armed, stays armed; the writable open is refused (`-o ro` is the read posture, never a knob value)", .{path});
             return error.UnsupportedFormat;
         }
         dev.ledger_base = sb.root_ledger.start;
@@ -427,7 +446,8 @@ pub const KvBackend = struct {
         errdefer mounted.deinit(gpa);
 
         // 5. The ring: one read, the chain walk from the tail.
-        const ring_layout = journal.RingLayout.fromExtent(.{ .start = sb.journal.start, .len = sb.journal.len });
+        const ring_ext = geometry.fixedRingExtent(sb);
+        const ring_layout = journal.RingLayout.fromExtent(.{ .start = ring_ext.start, .len = ring_ext.len });
         const geo = journal.productionGeometry(ring_layout.pages, mode.grain());
         const ring_img = try dev.readRange(gpa, ring_layout.base, @intCast(ring_layout.ringBytes()));
         defer gpa.free(ring_img);
@@ -620,7 +640,7 @@ pub const KvBackend = struct {
             .barrier = be.dev.barrierSink(),
             .ledger = .{ .ctx = be, .writeSlot = ledgerSlotHook },
             .pages = be.dev.pageSink(),
-            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook },
+            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .appenderPages = if (sb.symmetricPlaneStamped()) appenderPagesHook else null },
             .smo = be.ckpt_seam.seam(),
             .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
         });
@@ -669,11 +689,13 @@ pub const KvBackend = struct {
         // so the claim tx never sits committed-but-uncovered; then the
         // checkpoint thread; then the heartbeat. A gate refusal unwinds the
         // `errdefer`s above and closes the flock fd LAST.
+        const t_gate = clock.monotonicNs();
         be.guard = try guard.gate.Guard.gate(gpa, io, be, opts.guard);
         errdefer {
             be.guard.?.deinit();
             be.guard = null;
         }
+        be.gate_ns = clock.monotonicNs() - t_gate;
         be.smo_lock.lockUncancelable(io);
         const covered = be.cp.coverBringUpResidue();
         be.smo_lock.unlock(io);
@@ -682,6 +704,25 @@ pub const KvBackend = struct {
             error.Io => return error.Io,
             else => return error.Corrupt,
         };
+        // The symmetric plane: the D0 winner IS the manager (charter §5.7)
+        // — region 0 goes Live with `is_manager` under this identity, the
+        // directory census runs, the lease is held; one barriered cycle
+        // makes the join durable.
+        if (sb.symmetricPlaneStamped()) {
+            be.sym = try sym.bind.AppenderSet.open(be);
+            errdefer {
+                be.sym.?.deinit();
+                be.sym = null;
+            }
+            be.smo_lock.lockUncancelable(io);
+            const joined = be.cp.checkpointNow();
+            be.smo_lock.unlock(io);
+            joined catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Io => return error.Io,
+                else => return error.Corrupt,
+            };
+        }
         be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
         try be.guard.?.startHeartbeat();
         be.replay.replay_ns = clock.monotonicNs() - t0;
@@ -866,6 +907,14 @@ pub const KvBackend = struct {
     fn publishGuestRootsHook(ctx: *anyopaque) checkpoint_cycle.CycleError!void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         return be.publishGuestRoots();
+    }
+
+    /// `checkpoint_cycle.RecordSource.appenderPages`: every region's page
+    /// after the ledger record (`sym/bind.zig`).
+    fn appenderPagesHook(ctx: *anyopaque, rec: *const ledger.LedgerRecord, cache_clean: bool) checkpoint_cycle.IoError!void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const set = be.sym orelse return;
+        return set.onCheckpoint(rec, cache_clean);
     }
 
     /// The threshold drain's source: the trees' queues, round-robin from
@@ -1056,18 +1105,19 @@ pub const KvBackend = struct {
         const control = be.trees.find(.control) orelse return error.Corrupt;
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(gpa, &kvs);
-        control.range(gpa, slot_state.SCAN_START, slot_state.SCAN_END, std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
+        const scan = slot_state.scanRange();
+        control.range(gpa, scan.start.slice(), scan.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
             else => error.Corrupt,
         };
         for (kvs.items) |kv| {
             const slot = slot_state.slotOfKey(kv.key) orelse continue;
-            const v = slot_state.Value.decode(kv.value) catch {
-                log.err("meta volume {s}: tree 0 record {s} does not decode as a slot_state value", .{ be.path, kv.key });
+            const v = slot_state.decode(kv.value) catch {
+                log.err("meta volume {s}: tree 0's slot_state record of slot {d} does not decode", .{ be.path, slot });
                 return error.Corrupt;
             };
-            const root: tree.RootPtr = .{ .addr = v.rootAddr(), .seq = v.rootSeq() };
+            const root: tree.RootPtr = .{ .addr = v.root.addr, .seq = v.root.seq };
             const t = KvTree.open(gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, root, &be.seq) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Io => return error.Io,
@@ -1077,7 +1127,7 @@ pub const KvBackend = struct {
             be.seq.raiseTo(root.seq);
             try be.trees.add(t);
             try be.guest_published.put(gpa, slot, root);
-            try be.guest_cursor_floors.put(gpa, slot, v.cursor());
+            try be.guest_cursor_floors.put(gpa, slot, v.cursor);
         }
         // Slots the window names without a tree.
         var mentioned = std.AutoHashMapUnmanaged(u16, void).empty;
@@ -1236,10 +1286,10 @@ pub const KvBackend = struct {
     /// teardown). The one-record shape of the SMO's own commit.
     fn writeSlotStateEntry(be: *KvBackend, slot: u16, root: ?tree.RootPtr) Error!u64 {
         const control = be.trees.find(.control) orelse return error.Corrupt;
-        var kbuf: [slot_state.KEY_MAX_LEN]u8 = undefined;
-        const k = slot_state.keyOf(&kbuf, slot);
+        const ck = slot_state.keyOf(slot);
+        const k = ck.slice();
         const cursor = be.stamp.cursorSnapshot(slot) orelse inos.LOCAL_INO_BASE;
-        const value: []const u8 = if (root) |r| &slot_state.Value.init(r.addr, r.seq, cursor).encode() else &.{};
+        const value: []const u8 = if (root) |r| &slot_state.encode(slot_state.unleased(r.addr, r.seq, cursor)) else &.{};
         const kind: record.RecordKind = if (root != null) .put else .delete;
         var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(key.TREE_CONTROL, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
         const len = journal.entryLenFor(&frames) catch return error.Corrupt;
@@ -1457,6 +1507,10 @@ pub const KvBackend = struct {
             // holds no user reservation past this point.
             be.cv.quiesce();
             be.stopPass();
+            // The in-process regions leave BEFORE the final tick (their
+            // control entries ride ring 0 and the tick covers them), each
+            // drained at a fixpoint cycle first.
+            if (be.sym) |set| set.leaveAll();
             // The task's final tick BEFORE the lane goes: its SMO entries are
             // structural writes on the lane. The tick asserts the registry
             // quiet (`checkpoint_final_tick_open_reservations`) — the
@@ -1479,6 +1533,10 @@ pub const KvBackend = struct {
         if (be.guard) |g| {
             g.deinit();
             be.guard = null;
+        }
+        if (be.sym) |set| {
+            set.deinit();
+            be.sym = null;
         }
         be.cv.deinit();
         be.lane.deinit();
@@ -1647,7 +1705,7 @@ test "the block-map-tree ratchet: a fresh format carries no bit; the first stamp
     {
         const be = try v.open();
         try testing.expect(be.sb.blockMapTreeStamped());
-        try testing.expectEqual(superblock.block_map_tree, be.sb.features_incompat);
+        try testing.expectEqual(superblock.block_map_tree | superblock.symmetric_plane, be.sb.features_incompat);
         try testing.expectEqual(gen + 1, be.sb_generation);
         be.close();
     }
@@ -1667,7 +1725,8 @@ test "format (device path) → open → N creates (singles + a group of 8) → l
         try testing.expectEqual(@as(usize, 2), be.trees.load().len);
         try testing.expect(be.treeOf(.control) != null);
         try testing.expect(be.treeOf(.native) != null);
-        try testing.expectEqual(@as(u64, 0), be.sb.features_incompat);
+        // The default format is the symmetric class (charter §5.5).
+        try testing.expectEqual(superblock.symmetric_plane, be.sb.features_incompat);
         try testing.expectEqualSlices(u8, &test_set.set_uuid, &be.mounted.membership_stamp.set_uuid);
         try testing.expectEqual(test_set.hash_seed, be.hashSeed());
         try testing.expectEqual(@as(?u16, 0), be.mounted.membership_stamp.native_slot);
@@ -2142,9 +2201,10 @@ test "threshold writeback on a mounted volume: commits that push one leaf over t
 
 test "the admission park on the device: the smallest ring fills under a serial create stream (every commit a grain-padded window), the pass parks holding no node lock, the park kick runs a barriered cycle, every commit lands" {
     const gpa = testing.allocator;
-    // The smallest admissible ring (256 KiB + one max entry): its user
-    // slice is ~128 KiB, a few hundred padded commits.
-    const v = try TestVol.createWithRing(gpa, "park", "600000", journal.RING_OVERRIDE_FLOOR);
+    // The smallest admissible ring (256 KiB + one max entry behind appender
+    // 0's four page slots): its user slice is ~128 KiB, a few hundred
+    // padded commits.
+    const v = try TestVol.createWithRing(gpa, "park", "600000", journal.RING_OVERRIDE_FLOOR + geometry.appender0_reserved_bytes);
     defer v.destroy();
     const be = try v.open();
     defer be.close();

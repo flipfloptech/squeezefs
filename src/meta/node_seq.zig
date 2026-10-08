@@ -104,10 +104,10 @@ pub fn screenIncarnationBase(volume_base: u64, word: u64, diag: ?*ScreenRefusal)
 // The tree-0 incarnation counter record.
 // ---------------------------------------------------------------------------
 
-/// The ONE tree-0 key of the incarnation counter: how many joiner
-/// incarnations this volume has minted (volume-local — every volume of a
-/// set has its own base and its own counter).
-pub const NODE_SEQ_INCARNATIONS_KEY = "node_seq_incarnations";
+/// The tree-0 incarnation counter's VALUE: how many joiner incarnations
+/// this volume has minted (volume-local — every volume of a set has its
+/// own base and its own counter). Its binary key is `sym/control_records
+/// .nodeSeqIncarnationsKey` (one key convention for tree 0).
 pub const NODE_SEQ_INCARNATIONS_VERSION: u8 = 1;
 /// `version u8 ‖ minted u64 LE`.
 pub const NODE_SEQ_INCARNATIONS_LEN: usize = 1 + 8;
@@ -276,7 +276,6 @@ test "the incarnation record round-trips and refuses other shapes" {
     try testing.expectError(error.Corrupt, decodeIncarnations(&.{ 2, 0, 0, 0, 0, 0, 0, 0, 0 }));
     try testing.expectError(error.Corrupt, decodeIncarnations(&.{ 1, 0, 0 }));
     try testing.expectError(error.Corrupt, decodeIncarnations(&.{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
-    try testing.expectEqualStrings("node_seq_incarnations", NODE_SEQ_INCARNATIONS_KEY);
 }
 
 test "the joiner's screen admits exactly B + o·2^K for 1 ≤ o ≤ ORDINAL_MAX" {

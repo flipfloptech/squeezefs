@@ -53,6 +53,10 @@ pub const Retryable = error{
     /// The node asked holds no manager lease for the volume named (a
     /// failover moved it): re-resolve the manager and re-dial.
     NotManager,
+    /// The appender's extent grant is empty and its manager cannot refill
+    /// now: "the heap is not full, the appender is out of grant" (charter
+    /// §5.5 — EAGAIN-class, never ENOSPC).
+    GrantExhausted,
 };
 
 /// The device, the kernel or the lane answered, and the answer is final
@@ -183,7 +187,7 @@ pub const Class = enum { retryable, terminal, refusal };
 
 pub fn classOf(err: Error) Class {
     return switch (err) {
-        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager => .retryable,
+        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted => .retryable,
         error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.CrossVolume, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease => .refusal,
         else => .terminal,
     };
@@ -250,7 +254,7 @@ pub fn toErrno(err: Error) linux.E {
     return switch (err) {
         // Backpressure and the wire's typed retryable classes: retry, never
         // "bad argument" (charter §5.5).
-        error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager => .AGAIN,
+        error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted => .AGAIN,
         // Refusals: the caller's shape or the device's admissibility; a
         // wire word the screen refused; a foreign vocabulary.
         error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused => .INVAL,
@@ -341,7 +345,7 @@ test "classes: backpressure is retryable and replies EAGAIN, never EINVAL; refus
 }
 
 test "the cluster wire's classes: every typed retryable is EAGAIN; a screen refusal and a foreign schema are EINVAL; an unknown lease is ESTALE; a poisoned session EIO" {
-    const retryable = [_]Error{ error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager };
+    const retryable = [_]Error{ error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted };
     for (retryable) |e| {
         try testing.expectEqual(Class.retryable, classOf(e));
         try testing.expectEqual(linux.E.AGAIN, toErrno(e));

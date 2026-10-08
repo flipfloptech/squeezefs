@@ -40,7 +40,7 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
-    // @anchor:sym_appender_import
+    pub const sym = @import("meta/sym.zig");
     // @anchor:sym_slots_import
     // @anchor:sym_tokens_import
     // @anchor:sym_membership_import
@@ -173,7 +173,7 @@ test {
     _ = json_scan;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:sym_appender_test
+    _ = meta.sym;
     // @anchor:sym_slots_test
     // @anchor:sym_tokens_test
     // @anchor:sym_membership_test

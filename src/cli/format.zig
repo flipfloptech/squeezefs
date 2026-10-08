@@ -6,9 +6,10 @@
 //! ONE OR MORE metadata volumes as a v4 set (decision 0003 Q2; charter
 //! §5.4: member `p` of `n` stamps the stride run `{p, n, ceil((W − p)/n)}`
 //! — the identity distribution, one run per member; member 0 hosts slot
-//! 0's native keyspace and the `set_config` record; `--single-writer`
-//! names the class the image already is; the symmetric plane is rung 6's
-//! and lands on a live volume) plus ZERO OR MORE data volumes, each given
+//! 0's native keyspace and the `set_config` record; the SYMMETRIC plane is
+//! stamped by default — the appender directory and appender 0's page —
+//! and `--single-writer` is the flat opt-out, charter §5.5) plus ZERO OR
+//! MORE data volumes, each given
 //! its identity (`data/data_superblock.zig`), and the set's ONE
 //! `set_config` control record written by the format transaction into
 //! tree 0 of member 0 (`data/set_config.zig`): block size, chunk, the
@@ -353,6 +354,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         backend.formatVolume(p.gpa, mp, .{
             .env = p.env,
             .pool = pool,
+            .class = if (f.single_writer) .single_writer else .symmetric,
             .node_size = node_size,
             .journal_len_override = f.journal_len,
             .uuid = vol_uuids[i],
@@ -374,7 +376,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     p.stdout.print("formatted {s}: SqueezeFS format v4, {d}-member set ({s}), member 0 {d} B, node {d} B, journal {s}, root owner {d}:{d}\n", .{
         f.meta_uri,
         meta.paths.len,
-        if (f.single_writer) "--single-writer: the single-writer class" else "the symmetric plane is stamped on a live volume at rung 6; today's image is the single-writer class",
+        if (f.single_writer) "--single-writer: the flat class, no appender region" else "the symmetric plane: SYMMETRIC_PLANE stamped, the appender directory and appender 0's page written",
         vlen,
         node_size,
         if (f.journal_len != null) "explicit" else "derived clamp(volume/64, 8 MiB, 32 MiB)",
@@ -392,7 +394,7 @@ fn formatErrorText(e: backend.FormatError) []const u8 {
         error.DeviceRefused => "the device refused registration (O_DIRECT posture) or does not exist",
         error.VolumeTooSmall => "the volume is too small for format v4 (see the log for the geometry)",
         error.InvalidNodeSize => "invalid node size",
-        error.InvalidJournalOverride => "invalid --meta-journal-mb (below the 384 KiB floor or not a 4 KiB multiple)",
+        error.InvalidJournalOverride => "invalid --meta-journal-mb (below the floor — 384 KiB, plus 16 KiB for appender 0's page slots on the symmetric class — or not a 4 KiB multiple)",
         error.CannotStat, error.NotADeviceOrFile => "not a regular file or block device",
         error.Io => "device I/O failed",
         error.OutOfMemory => "out of memory",

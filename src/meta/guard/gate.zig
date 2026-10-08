@@ -625,7 +625,8 @@ pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, p
     defer gpa.free(ledger_img);
     var mounted = (try ledger.newestValid(gpa, ledger_img)) orelse return error.Corrupt;
     defer mounted.deinit(gpa);
-    const ring_layout = journal.RingLayout.fromExtent(.{ .start = sb.journal.start, .len = sb.journal.len });
+    const ring_ext = geometry.fixedRingExtent(sb);
+    const ring_layout = journal.RingLayout.fromExtent(.{ .start = ring_ext.start, .len = ring_ext.len });
     const geo = journal.productionGeometry(ring_layout.pages, mode.grain());
     const ring_img = try dev.readRange(gpa, ring_layout.base, @intCast(ring_layout.ringBytes()));
     defer gpa.free(ring_img);

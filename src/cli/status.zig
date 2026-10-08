@@ -145,11 +145,12 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
         defer control.destroy();
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(gpa, &kvs);
-        control.range(gpa, slot_state.SCAN_START, slot_state.SCAN_END, std.math.maxInt(usize), &kvs) catch |e| return mapTreeOpen(e);
+        const scan = slot_state.scanRange();
+        control.range(gpa, scan.start.slice(), scan.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return mapTreeOpen(e);
         for (kvs.items) |kv| {
             const slot = slot_state.slotOfKey(kv.key) orelse continue;
-            const v = slot_state.Value.decode(kv.value) catch return error.Unexpected;
-            try trees.append(gpa, tree.KvTree.open(gpa, cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = v.rootAddr(), .seq = v.rootSeq() }, &seq) catch |e| return mapTreeOpen(e));
+            const v = slot_state.decode(kv.value) catch return error.Unexpected;
+            try trees.append(gpa, tree.KvTree.open(gpa, cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = v.root.addr, .seq = v.root.seq }, &seq) catch |e| return mapTreeOpen(e));
         }
     }
     for (cfg.data) |d| {

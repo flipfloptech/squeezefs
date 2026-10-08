@@ -9,17 +9,20 @@
 //! Every volume is a one-member forest (decision 0003 Q2): the control tree
 //! (kind 8: the caller's format-time control records — the `set_config`
 //! record on the set's member 0, empty elsewhere) and the native slot tree
-//! holding the description's records under their kind-carrying keys. The symmetric PLANE (appender
-//! directory, appender pages, `SYMMETRIC_PLANE` bit) is rung 6's and lands
-//! on a live volume; format writes none of it.
+//! holding the description's records under their kind-carrying keys. The
+//! SYMMETRIC class (the default, charter §5.5) also stamps `SYMMETRIC_PLANE`
+//! and writes the appender directory's first link (heap extent 0, zeroed,
+//! its `KVAD` header FIRST) and appender 0's `Free` page at the fixed ring's
+//! slot 1; `--single-writer` is the flat opt-out with no appender region.
 //!
 //! The order is `geometry.buildPlan`'s: zero `[0, heap.start)` (quick-format
 //! hygiene — the heap is NOT wiped; dead frames fail the uuid-namespaced seq
-//! chain) → every tree root as a REAL leaf (an empty tree is still one
-//! header-only node) → every bitmap page at generation 1 → the bootstrap
-//! ledger record (seq 1 ⇒ slot 1) → barrier → the superblock's tail copy,
-//! barrier, sector 0, barrier. Sector 0 is zeroed first and rewritten LAST,
-//! so no crash prefix is mountable (it reads Blank).
+//! chain) → [the directory link + appender 0's page] → every tree root as a
+//! REAL leaf (an empty tree is still one header-only node) → every bitmap
+//! page at generation 1 → the bootstrap ledger record (seq 1 ⇒ slot 1) →
+//! barrier → the superblock's tail copy, barrier, sector 0, barrier. Sector
+//! 0 is zeroed first and rewritten LAST, so no crash prefix is mountable
+//! (it reads Blank).
 
 const std = @import("std");
 const key = @import("key.zig");
@@ -33,6 +36,8 @@ const superblock = @import("superblock.zig");
 const geometry = @import("geometry.zig");
 const ledger = @import("ledger.zig");
 const builder = @import("builder.zig");
+const appender_page = @import("sym/appender_page.zig");
+const appender_dir = @import("sym/appender_dir.zig");
 
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -45,6 +50,8 @@ pub const zero_chunk: usize = 1 << 20;
 /// The format options plus the identities the CLI mints (random in
 /// production; fixed for deterministic images).
 pub const FormatOptions = struct {
+    /// The symmetric plane by default; `--single-writer` is the opt-out.
+    class: geometry.Class = .symmetric,
     node_size: u64 = superblock.default_node_size,
     /// `--meta-journal-mb` in bytes; null = the clamp.
     journal_len_override: ?u64 = null,
@@ -94,6 +101,8 @@ pub const FormatPlan = struct {
     next_ino: u64,
     /// Btree nodes written (both trees, all levels) — one heap extent each.
     nodes_written: u64,
+    /// `nodes_written` plus the directory link on the symmetric class.
+    extents_allocated: u64,
     node_seq_watermark: u64,
     /// `[control, native_slot]` in write order.
     tree_roots: []ledger.TreeRoot,
@@ -137,7 +146,7 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const sb = try geometry.plan(volume_len, opts.node_size, opts.journal_len_override, opts.uuid, opts.set, diag);
+    const sb = try geometry.plan(volume_len, opts.node_size, opts.journal_len_override, opts.uuid, opts.set, opts.class, diag);
     const build_plan = geometry.buildPlan(sb);
 
     // The allocator over the planned heap; the layout (frames stamped
@@ -146,6 +155,14 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
     const total = sb.totalExtents();
     var alloc = try alloc_ext.ExtentAllocator.format(gpa, total, alloc_core.compactionReserveExtents(total), alloc_ext.builder_pending_cap);
     defer alloc.deinit();
+    // The directory link is heap extent 0, claimed BEFORE any tree so the
+    // trees pack behind it.
+    var dir_extents: u64 = 0;
+    if (sb.symmetricPlaneStamped()) {
+        const e = alloc.claimInternal() catch return error.VolumeTooSmall;
+        assert(e == 0 and sb.appender_dir.start == sb.heap.start);
+        dir_extents = 1;
+    }
     const layout = try node.NodeLayout.new(@intCast(opts.node_size), null);
     var images: std.ArrayList(node.WrittenNode) = .empty;
     defer images.deinit(a);
@@ -212,9 +229,24 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
             const image = try a.dupe(u8, &plan.image);
             for (plan.slice()) |w| try steps.append(a, .{ .offset = w.offset, .bytes = image, .barrier_after = w.barrier_after });
         },
+        .write_dir_header => |d| {
+            // The whole link zeroed (a stale pair image there would be a
+            // phantom appender), then the header page first.
+            try pushZero(a, &steps, zeros, d.extent.start, d.extent.len);
+            const hdr = try a.create([appender_dir.PAGE_LEN]u8);
+            appender_dir.formatHeader(opts.node_size, hdr);
+            try steps.append(a, .{ .offset = d.extent.start, .bytes = hdr, .barrier_after = false });
+        },
+        .write_appender0_page => |p| {
+            const img = try a.create([appender_page.PAGE_LEN]u8);
+            const free = appender_page.Page.free(0, 1, appender_page.SegmentTable.one(.{ .start = sb.journal.start, .len = sb.journal.len }));
+            assert(appender_page.pageSlotFor(free.generation) == 1 and p.ring.start == sb.journal.start + geometry.appender0_reserved_bytes);
+            free.encode(img) catch unreachable;
+            try steps.append(a, .{ .offset = p.offset, .bytes = img, .barrier_after = false });
+        },
     };
 
-    assert(alloc.freeExtents() == total - writer.nodesWritten());
+    assert(alloc.freeExtents() == total - writer.nodesWritten() - dir_extents);
     return .{
         .arena = arena,
         .steps = try steps.toOwnedSlice(a),
@@ -222,6 +254,7 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
         .ledger_seq = geometry.bootstrap_ledger_seq,
         .next_ino = desc.nextIno(),
         .nodes_written = writer.nodesWritten(),
+        .extents_allocated = writer.nodesWritten() + dir_extents,
         .node_seq_watermark = writer.nodeSeqWatermark(),
         .tree_roots = try roots.toOwnedSlice(a),
     };
@@ -260,6 +293,10 @@ const test_uuid: [16]u8 = "kv-backend-test!".*;
 const test_set: geometry.SetIdentity = .{ .set_uuid = "set-uuid-fixture".*, .hash_seed = 0x5EED_CAFE_F00D_D00D };
 
 fn testOpts() FormatOptions {
+    return .{ .class = .single_writer, .node_size = 65536, .journal_len_override = MiB, .uuid = test_uuid, .set = test_set };
+}
+
+fn symOpts() FormatOptions {
     return .{ .node_size = 65536, .journal_len_override = MiB, .uuid = test_uuid, .set = test_set };
 }
 
@@ -268,9 +305,8 @@ fn expectMounts(gpa: Allocator, image: []const u8, volume_len: u64, extents_allo
     const fmt = try superblock.classifyVolumeImages(image[0..4096], image[@intCast(superblock.backupOffsetFor(volume_len).?)..][0..4096], volume_len, null);
     try testing.expectEqual(superblock.SuperblockSlot.primary, fmt.slot);
     const sb = fmt.format.v4;
-    try testing.expectEqual(@as(u64, 0), sb.features_incompat);
-    try testing.expect(!sb.symmetricPlaneStamped());
-    try testing.expect(sb.appender_dir.isNone());
+    try testing.expectEqual(sb.symmetricPlaneStamped(), !sb.appender_dir.isNone());
+    try testing.expectEqual(sb.features_incompat & ~superblock.symmetric_plane, 0);
     const layout = try node.NodeLayout.new(sb.node_size, null);
     var record = (try ledger.newestValid(gpa, image[@intCast(sb.root_ledger.start)..][0..@intCast(sb.root_ledger.len)])) orelse return error.TestUnexpectedResult;
     defer record.deinit(gpa);
@@ -292,8 +328,51 @@ fn expectMounts(gpa: Allocator, image: []const u8, volume_len: u64, extents_allo
     try testing.expectEqual(@as(u64, 1), loaded.resumeGeneration());
     try testing.expectEqual(sb.totalExtents() - extents_allocated, loaded.freeExtents());
     for (record.tree_roots) |root| try testing.expect(loaded.isAllocated((root.node_addr - sb.heap.start) / sb.node_size));
-    // The journal ring is all zero: nothing to replay.
-    try testing.expect(std.mem.allEqual(u8, image[@intCast(sb.journal.start)..][0..@intCast(sb.journal.len)], 0));
+    // The ring proper is all zero: nothing to replay.
+    const ring = geometry.fixedRingExtent(sb);
+    try testing.expect(std.mem.allEqual(u8, image[@intCast(ring.start)..][0..@intCast(ring.len)], 0));
+}
+
+test "the default format is the symmetric class: the bit stamped, the directory link at heap extent 0 zeroed with its KVAD header first, appender 0's Free page at the fixed ring's slot 1 naming the ring proper, the other three slots zero, the trees packed behind the link; mounts" {
+    const gpa = testing.allocator;
+    const len = 64 * MiB;
+    var plan = try planFormat(gpa, len, symOpts(), null);
+    defer plan.deinit();
+    const sb = plan.superblock;
+    try testing.expect(sb.symmetricPlaneStamped());
+    try testing.expectEqual(ExtentRef{ .start = sb.heap.start, .len = 65536 }, sb.appender_dir);
+    try testing.expectEqual(@as(u64, 3), plan.extents_allocated);
+    try testing.expectEqual(@as(u64, 2), plan.nodes_written);
+    // The trees sit behind the directory link.
+    try testing.expectEqual(sb.heap.start + 65536, plan.tree_roots[0].node_addr);
+    try testing.expectEqual(sb.heap.start + 2 * 65536, plan.tree_roots[1].node_addr);
+    const image = try gpa.alloc(u8, len);
+    defer gpa.free(image);
+    @memset(image, 0xA5);
+    plan.apply(image);
+    // The link: header first, every pair zero.
+    const hdr = try appender_dir.Header.decode(image[@intCast(sb.heap.start)..][0..4096]);
+    try testing.expectEqual(@as(u32, 7), hdr.pairs);
+    try testing.expect(!hdr.hasNext() and hdr.chain_index == 0);
+    try testing.expect(std.mem.allEqual(u8, image[@intCast(sb.heap.start + 4096)..][0 .. 65536 - 4096], 0));
+    // Appender 0's four slots: slot 1 the Free page, the rest zero.
+    const offs = appender_page.appender0PageOffsets(sb.journal.start);
+    const p0 = try appender_page.decode(image[@intCast(offs[1])..][0..4096]);
+    try testing.expect(p0.state == .free and p0.appender_id == 0 and p0.generation == 1 and p0.identity.eql(.none));
+    try testing.expectEqual(@as(u8, 1), p0.segments.len);
+    try testing.expectEqual(appender_page.Extent{ .start = sb.journal.start, .len = sb.journal.len }, p0.segments.items[0]);
+    for ([_]usize{ 0, 2, 3 }) |i| try testing.expect(std.mem.allEqual(u8, image[@intCast(offs[i])..][0..4096], 0));
+    try testing.expectEqual(@as(?appender_page.Page, null), try appender_page.newestValid(.{ image[@intCast(offs[0])..][0..4096], null, null, null }));
+    try testing.expectEqual(@as(u64, 1), (try appender_page.newestValid(.{ image[@intCast(offs[0])..][0..4096], image[@intCast(offs[1])..][0..4096], image[@intCast(offs[2])..][0..4096], image[@intCast(offs[3])..][0..4096] })).?.generation);
+    // A fresh buffer: the image mounts, the bitmap claims dir + 2 nodes.
+    @memset(image, 0);
+    plan.apply(image);
+    try expectMounts(gpa, image, len, 3);
+    // Determinism holds for the class too, and the two classes differ only
+    // by the plane (same set identity, same stamp).
+    const again = try formatImage(gpa, len, symOpts());
+    defer gpa.free(again);
+    try testing.expectEqualSlices(u8, image, again);
 }
 
 test "the one-member forest plan: features 0, the control tree (empty) then the native slot tree as real leaves at base+1..2 stamped (0,0), bitmap slot A gen 1, ledger seq 1 in slot 1 with the stamp, SB tail copy then sector 0, 3 barriers; mounts" {

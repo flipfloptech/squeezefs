@@ -190,14 +190,43 @@ pub fn journalExtent(volume_len: u64, override: ?u64) Error!ExtentRef {
     return .{ .start = JOURNAL_START, .len = len };
 }
 
-/// Where the ring's pages live: `pages` × 4 KiB at byte `base` of the device
-/// (ONE segment on the shipped ring). A trailing partial page is unusable.
+/// A ring may span up to this many whole heap extents (charter §5.5 "ring
+/// segment table ≤ 8": one 256 KiB segment = 64 pages, eight = the 2 MiB
+/// largest growth step before the appender page's bytes bind).
+pub const RING_SEGMENTS_MAX: u8 = 8;
+
+/// One segment of a ring: `pages` consecutive device pages from `start`.
+pub const RingSegment = struct { start: u64, pages: u64 };
+
+/// Where the ring's pages live: `pages` × 4 KiB, either ONE run at byte
+/// `base` of the device (the fixed ring; `n_segments == 0`) or a SEGMENT
+/// TABLE of whole heap extents in ring order (a joiner's ring, charter
+/// §5.5) — logical page `i` maps to the segment that holds it. Positions
+/// are a byte space over the pages in table order, so a head continues on
+/// any table (replace-when-drained keeps the position). A trailing partial
+/// page of any segment is unusable.
 pub const RingLayout = struct {
     base: u64,
     pages: u64,
+    segments: [RING_SEGMENTS_MAX]RingSegment = @splat(.{ .start = 0, .pages = 0 }),
+    /// 0 = the one implicit segment at `base`.
+    n_segments: u8 = 0,
 
     pub fn fromExtent(ext: ExtentRef) RingLayout {
         return .{ .base = ext.start, .pages = ext.len / PAGE_LEN };
+    }
+
+    /// A segmented ring: every extent a non-empty whole-page run, ≤ 8.
+    pub fn fromSegments(exts: []const ExtentRef) error{ TooManySegments, EmptySegment }!RingLayout {
+        if (exts.len == 0 or exts.len > RING_SEGMENTS_MAX) return error.TooManySegments;
+        var l: RingLayout = .{ .base = exts[0].start, .pages = 0, .n_segments = @intCast(exts.len) };
+        for (exts, 0..) |e, i| {
+            const pages = e.len / PAGE_LEN;
+            if (pages == 0) return error.EmptySegment;
+            l.segments[i] = .{ .start = e.start, .pages = pages };
+            l.pages += pages;
+        }
+        return l;
     }
 
     pub fn ringBytes(self: RingLayout) u64 {
@@ -206,7 +235,13 @@ pub const RingLayout = struct {
 
     pub fn pageOffset(self: RingLayout, page: u64) u64 {
         std.debug.assert(page < self.pages);
-        return self.base + page * PAGE_LEN;
+        if (self.n_segments == 0) return self.base + page * PAGE_LEN;
+        var p = page;
+        for (self.segments[0..self.n_segments]) |s| {
+            if (p < s.pages) return s.start + p * PAGE_LEN;
+            p -= s.pages;
+        }
+        unreachable;
     }
 
     /// Device offset of logical position `pos`: `page_off + 24 + pos % 4072`
@@ -1364,6 +1399,28 @@ test "ring sizing: clamp(volume/64, 8 MiB, 32 MiB) rounded to pages; the overrid
     try testing.expectError(error.RingOverrideInvalid, journalLenOverride(393216 - 4096));
     try testing.expectError(error.RingOverrideInvalid, journalLenOverride(393216 + 1));
     try testing.expectEqual(@as(u64, 393216), (try journalExtent(derive.GiB, 393216)).len);
+}
+
+test "a segmented ring maps logical pages through its segment table in order; positions continue across the segment boundary; the one-segment form is the fixed ring's; ≤ 8 non-empty segments" {
+    const one = RingLayout.fromExtent(.{ .start = 135_168, .len = 1 << 20 });
+    try testing.expectEqual(@as(u64, 256), one.pages);
+    try testing.expectEqual(@as(u64, 135_168 + 7 * 4096), one.pageOffset(7));
+    const seg = try RingLayout.fromSegments(&.{ .{ .start = 0x400000, .len = 65_536 }, .{ .start = 0xC00000, .len = 131_072 }, .{ .start = 0x800000, .len = 65_536 } });
+    try testing.expectEqual(@as(u64, 16 + 32 + 16), seg.pages);
+    try testing.expectEqual(@as(u64, 0x400000), seg.base);
+    try testing.expectEqual(@as(u64, 0x400000 + 15 * 4096), seg.pageOffset(15));
+    try testing.expectEqual(@as(u64, 0xC00000), seg.pageOffset(16));
+    try testing.expectEqual(@as(u64, 0xC00000 + 31 * 4096), seg.pageOffset(47));
+    try testing.expectEqual(@as(u64, 0x800000), seg.pageOffset(48));
+    try testing.expectEqual(@as(u64, 0x800000 + 15 * 4096), seg.pageOffset(63));
+    // A position inside the second segment's first page.
+    const geo = productionGeometry(seg.pages, 1);
+    try testing.expectEqual(@as(u64, 0xC00000 + PAGE_HDR_LEN + 10), seg.physicalOffsetOf(geo, 16 * PAGE_DATA_LEN + 10));
+    try testing.expectError(error.TooManySegments, RingLayout.fromSegments(&.{}));
+    var nine: [9]ExtentRef = undefined;
+    for (&nine, 0..) |*e, i| e.* = .{ .start = (i + 1) * 65_536, .len = 65_536 };
+    try testing.expectError(error.TooManySegments, RingLayout.fromSegments(&nine));
+    try testing.expectError(error.EmptySegment, RingLayout.fromSegments(&.{.{ .start = 0x400000, .len = 100 }}));
 }
 
 test "checkpoint reserve formula: 8 MiB→256 KiB, 16 MiB→256 KiB, 32 MiB→512 KiB, 64 MiB→1 MiB" {

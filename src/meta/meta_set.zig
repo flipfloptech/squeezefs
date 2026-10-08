@@ -680,6 +680,10 @@ pub const MetaSet = struct {
                 try w.writeAll(",\"guard\":");
                 try g.writeStatsJson(w);
             }
+            if (be.sym) |set| {
+                try w.writeAll(",\"sym\":");
+                try set.writeStatsJson(w);
+            }
             try w.writeByte('}');
         }
         try w.writeAll("]}");

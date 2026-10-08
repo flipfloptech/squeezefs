@@ -133,6 +133,12 @@ pub const RecordSource = struct {
     /// is stale (one checkpoint-class control entry each), after the
     /// flush pass and before the tail rule (C4b).
     publishGuestRoots: *const fn (ctx: *anyopaque) CycleError!void,
+    /// The symmetric plane's appender pages (charter §5.5: the page IS the
+    /// appender's ledger record — one write per checkpoint), after the
+    /// ledger record landed and its bookkeeping moved; `cache_clean` is
+    /// the cycle's fixpoint (no dirty node, no dying floor) — the region
+    /// tail law's input. Null on a single-writer volume.
+    appenderPages: ?*const fn (ctx: *anyopaque, record: *const ledger.LedgerRecord, cache_clean: bool) IoError!void = null,
 };
 
 pub const FlushFailure = enum { none, io, corrupt, out_of_memory };
@@ -875,6 +881,9 @@ pub const Checkpointer = struct {
         // completion — none of them can have flushed it.
         try self.reclaim.push(tail, self.barrierPushEpoch());
         ckpt.stats.meta_kv_checkpoints.inc();
+        // C11: the appender pages (the record is authoritative; a page that
+        // fails to land is one cycle stale and the next cycle rewrites it).
+        if (self.deps.record.appenderPages) |f| try f(self.deps.record.ctx, &record, dirty_floor_min == node_cache.no_floor and dying == node_cache.no_floor);
         const t_ledger = clock.monotonicNs();
 
         // ---- C12: make THIS record durable now and judge progress.

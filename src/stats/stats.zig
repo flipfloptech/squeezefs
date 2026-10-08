@@ -68,6 +68,7 @@ const node = @import("../meta/node.zig");
 const node_snapshot = @import("../meta/node_snapshot.zig");
 const node_state_core = @import("../meta/node_state_core.zig");
 const guard = @import("../meta/guard.zig");
+const sym = @import("../meta/sym.zig");
 const lifecycle = @import("../fuse/handler/lifecycle.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const open_table = @import("../fuse/handler/open_table.zig");
@@ -225,6 +226,7 @@ pub const sources = [_]Source{
     .{ .path = "src/meta/conveyor.zig", .family = "meta" },
     .{ .path = "src/meta/guard.zig", .family = "meta" },
     .{ .path = "src/meta/routing/stats.zig", .family = "meta" },
+    .{ .path = "src/meta/sym.zig", .family = "meta" },
     .{ .path = "src/fuse/handler/lifecycle.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/op_guard.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/open_table.zig", .family = "fuse" },
@@ -297,6 +299,9 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/routing/stamp_cell.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/routing/migrate.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/meta_set.zig", .by = "src/meta/routing/stats.zig" },
+    .{ .path = "src/meta/sym/manager.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/join.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/bind.zig", .by = "src/meta/sym.zig" },
 };
 
 comptime {
@@ -458,6 +463,8 @@ fn writeMeta(src: *Sources, w: *Writer) Error!void {
     if (is_linux) try counters.writeFieldsJson(&device_loader.stats, w) else try w.writeAll("{}");
     try w.writeAll(",\"guard\":");
     try guard.writeStatsJson(w);
+    try w.writeAll(",\"sym\":");
+    try sym.writeStatsJson(w);
     inline for (.{
         .{ "node_cache", node_cache.stats },       .{ "tree", tree.stats },            .{ "smo", smo.stats },
         .{ "leaf_merge", leaf_merge.stats },       .{ "alloc_ext", alloc_ext },        .{ "journal", journal },
@@ -851,7 +858,7 @@ test "every instrument declared in a generated namespace is a key of the documen
     const p = try r.render();
     defer p.deinit(testing.allocator);
     const text = p.bytes();
-    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats }) |Ns| {
+    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats }) |Ns| {
         inline for (comptime counters.instrumentNames(Ns)) |name| {
             const T = @TypeOf(@field(Ns, name));
             const k = if (T == counters.Tripwire) @field(Ns, name).site else name;

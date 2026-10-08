@@ -60,8 +60,10 @@ pub fn isGuardXattr(name: []const u8) bool {
 
 pub const MAGIC: [4]u8 = "WCLM".*;
 pub const VERSION: u8 = 1;
-/// `kind` 0 = the writer claim; rung 6 adds the client row on the same shape.
+/// `kind` 0 = the writer claim; 1 = a membership row on the same shape
+/// (`sym/membership/shard.zig`, decision 0003 §E).
 pub const KIND_WRITER: u8 = 0;
+pub const KIND_MEMBER: u8 = 1;
 
 /// The on-disk form (little-endian throughout; `reserved*` read as 0).
 pub const WriterClaimV1 = extern struct {

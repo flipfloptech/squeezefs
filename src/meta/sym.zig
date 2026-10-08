@@ -28,6 +28,7 @@ pub const join = @import("sym/join.zig");
 pub const slots = @import("sym/slots.zig");
 pub const bind = if (builtin.os.tag == .linux) @import("sym/bind.zig") else struct {};
 pub const tokens = @import("sym/tokens.zig");
+pub const membership = @import("sym/membership.zig");
 
 /// Process-wide appender instruments (the per-volume words — `appenders_
 /// live`, `appenders_capacity`, `manager_lease`, the ring bytes — ride the
@@ -66,6 +67,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try slots.writeStatsJson(w);
     try w.writeAll(",\"tokens\":");
     try tokens.writeStatsJson(w);
+    try w.writeAll(",\"membership\":");
+    try membership.writeStatsJson(w);
     try w.writeByte('}');
 }
 
@@ -80,4 +83,5 @@ test {
     _ = slots;
     if (builtin.os.tag == .linux) _ = bind;
     _ = tokens;
+    _ = membership;
 }

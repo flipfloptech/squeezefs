@@ -29,6 +29,7 @@ pub const target = if (is_linux) @import("target.zig") else struct {};
 pub const offline = if (is_linux) @import("offline.zig") else struct {};
 pub const clients = if (is_linux) @import("clients.zig") else struct {};
 pub const claim = if (is_linux) @import("claim.zig") else struct {};
+pub const appenders = if (is_linux) @import("appenders.zig") else struct {};
 pub const df = if (is_linux) @import("df.zig") else struct {};
 pub const clone = if (is_linux) @import("clone.zig") else struct {};
 pub const config_verb = if (is_linux) @import("config_verb.zig") else struct {};
@@ -94,6 +95,8 @@ pub fn run(p: Process) u8 {
         .config => |c| return if (is_linux) config_verb.run(p, c) else linuxOnly(p, "config"),
         .staging => |s| return if (is_linux) staging_verb.run(p, s) else linuxOnly(p, "staging"),
         .claim_clear => |c| return if (is_linux) claim.run(p, c) else linuxOnly(p, "claim clear"),
+        .appenders => |a| return if (is_linux) appenders.run(p, a) else linuxOnly(p, "appenders"),
+        .appender_clear => |a| return if (is_linux) appenders.runClear(p, a) else linuxOnly(p, "appender clear"),
         .volume => |v| return if (is_linux) volume.run(p, v) else linuxOnly(p, "volume"),
     }
 }
@@ -130,6 +133,7 @@ test {
         _ = offline;
         _ = clients;
         _ = claim;
+        _ = appenders;
         _ = df;
         _ = clone;
         _ = config_verb;

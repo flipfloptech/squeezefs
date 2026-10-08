@@ -43,6 +43,10 @@ pub const Namespace = struct {
     wire_host_id_override: ?[16]u8 = null,
     /// An injected transport failure on the next command (a dead node).
     fail_next: ?errors.Error = null,
+    /// A vendor registrant cap: a register that would make the table
+    /// larger answers `CAP_STATUS` (a command-specific status, the learn
+    /// rule's class) — the emulated capped array (spec §8 D:1047).
+    registrant_cap: ?usize = null,
     generation: u32 = 0,
     preempts: u32 = 0,
     unregisters: u32 = 0,
@@ -146,6 +150,7 @@ pub const Namespace = struct {
                         },
                     }
                 }
+                if (self.registrant_cap) |cap| if (self.registered.items.len >= cap) return CAP_STATUS;
                 try self.registered.append(self.gpa, .{ .host_id = host_id, .key = nrkey });
                 self.generation += 1;
                 return nvme.STATUS_SUCCESS;
@@ -276,6 +281,10 @@ pub const Namespace = struct {
 
 /// The synthetic foreign host of `seedHolder`.
 pub const foreign_host: [16]u8 = "FOREIGN-HOST-ID!".*;
+
+/// The capped array's answer: SCT 1 (command-specific), SC 0x80 — a
+/// learnable class, never the conflict, never transient.
+pub const CAP_STATUS: nvme.Status = 0x180;
 
 /// One host's association with the shared namespace: its wire host id is
 /// what FID 0x81 answers and what every registration carries.

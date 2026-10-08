@@ -407,7 +407,9 @@ pub const LeaseTable = struct {
         defer self.lock.unlock();
         const v = self.view(slot);
         if (v.state != .releasing) return;
-        self.storeWord(slot, .leased, v.holder, false, v.rotor);
+        // A recovery's abort keeps the dead mark: `Releasing{dead} →
+        // Leased{dead}`, a first touch refused in either state.
+        self.storeWord(slot, .leased, v.holder, v.dead, v.rotor);
     }
 
     // ---- T5: the release landed ----

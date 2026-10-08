@@ -50,13 +50,16 @@ pub const Tag = enum(u8) {
     dead_member = 8,
     recovered = 9,
     node_seq_incarnations = 10,
+    /// A membership row (`WriterClaimV1.kind = 1`) on the HOME volume's
+    /// tree 0 (decision 0003 §E): keyed by the member's stable identity.
+    member = 11,
 
     /// The id bytes behind the two-byte prefix.
     pub fn idLen(self: Tag) usize {
         return switch (self) {
             .slot_state, .slot_tails, .custody_quarantine => 2,
             .extent_grant => 4,
-            .appender_hint, .dead_member => 12,
+            .appender_hint, .dead_member, .member => 12,
             .recovered => 14,
             .alloc_lease => 8,
             .dir_rename, .node_seq_incarnations => 0,
@@ -159,6 +162,13 @@ pub fn deadMemberKey(id: StableIdentity) ControlKey {
     return k;
 }
 
+pub fn memberKey(id: StableIdentity) ControlKey {
+    var k = ControlKey.prefix(.member);
+    k.putBe(u64, id.node_token);
+    k.putBe(u32, id.mount_slot);
+    return k;
+}
+
 pub fn recoveredKey(id: StableIdentity, vol: u16) ControlKey {
     var k = ControlKey.prefix(.recovered);
     k.putBe(u64, id.node_token);
@@ -211,7 +221,7 @@ pub fn appenderOfKey(k: []const u8) ?u32 {
 pub fn identityOfKey(k: []const u8) ?StableIdentity {
     const tag = tagOfKey(k) orelse return null;
     return switch (tag) {
-        .appender_hint, .dead_member, .recovered => .{ .node_token = idBe(u64, k, 0), .mount_slot = idBe(u32, k, 8) },
+        .appender_hint, .dead_member, .recovered, .member => .{ .node_token = idBe(u64, k, 0), .mount_slot = idBe(u32, k, 8) },
         else => null,
     };
 }

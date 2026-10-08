@@ -116,6 +116,19 @@ pub const ClaimClear = struct {
     meta_uri: []const u8,
 };
 
+/// `squeezefs appenders [--json] sqmeta://<path>`.
+pub const Appenders = struct {
+    meta_uri: []const u8,
+    json: bool = false,
+};
+
+/// `squeezefs appender clear sqmeta://<path> <id>` (ids ≥ 1; 0 refuses at
+/// the verb — a dead manager's region is the D0 successor's).
+pub const AppenderClear = struct {
+    meta_uri: []const u8,
+    appender_id: u32,
+};
+
 /// `--take-slots k | s1,s2,…` (`add-meta`): a count or an explicit list.
 pub const TakeSlots = union(enum) {
     count: u32,
@@ -180,6 +193,8 @@ pub const Verb = union(enum) {
     config: Config,
     staging: Staging,
     claim_clear: ClaimClear,
+    appenders: Appenders,
+    appender_clear: AppenderClear,
     volume: Volume,
 };
 
@@ -269,6 +284,8 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs staging list [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs staging promote sqmeta://<path>
         \\  squeezefs claim clear sqmeta://<path>
+        \\  squeezefs appenders [--json] sqmeta://<path>
+        \\  squeezefs appender clear sqmeta://<path> <id>
         \\  squeezefs volume list sqmeta://<path>[,…]
         \\  squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>
         \\  squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>
@@ -291,6 +308,8 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]\n",
         .staging => "usage: squeezefs staging list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs staging promote sqmeta://<path>\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
+        .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
+        .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>\n",
         .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n",
         .bench => "usage: squeezefs bench [-w] [-r] [--stat] [--del] [-t THREADS] [-n FILES] [-s SIZE] [-b BLOCK] [--rand] [--direct] [--time SECS] [-i ITERATIONS] [--abba] [--json] [--smoke] <mountpoint>\n",
         .version, .help => all,
@@ -419,6 +438,8 @@ pub fn parse(argv: []const []const u8, diag: *Refusal) Error!Verb {
     if (std.mem.eql(u8, verb, "config")) return parseConfig(words, diag);
     if (std.mem.eql(u8, verb, "staging")) return parseStaging(words, diag);
     if (std.mem.eql(u8, verb, "claim")) return parseClaim(words, diag);
+    if (std.mem.eql(u8, verb, "appenders")) return parseAppenders(words, diag);
+    if (std.mem.eql(u8, verb, "appender")) return parseAppenderClear(words, diag);
     if (std.mem.eql(u8, verb, "volume")) return parseVolume(words, diag);
     if (std.mem.eql(u8, verb, "bench")) return parseBench(words, diag);
     diag.* = .{ .unknown_verb = verb };
@@ -606,6 +627,52 @@ fn parseClaim(words: []const []const u8, diag: *Refusal) Error!Verb {
     const target = try exactlyOne(&c, "the sqmeta:// volume");
     try checkUri(.meta, target, diag);
     return .{ .claim_clear = .{ .meta_uri = target } };
+}
+
+fn parseAppenders(words: []const []const u8, diag: *Refusal) Error!Verb {
+    var c: Cursor = .{ .verb = "appenders", .words = words, .diag = diag };
+    var json = false;
+    while (try c.step()) |f| {
+        if (std.mem.eql(u8, f.name, "--json")) {
+            json = true;
+        } else return c.unknown(f);
+    }
+    const target = try exactlyOne(&c, "the sqmeta:// volume");
+    try checkUri(.meta, target, diag);
+    return .{ .appenders = .{ .meta_uri = target, .json = json } };
+}
+
+fn parseAppenderClear(words: []const []const u8, diag: *Refusal) Error!Verb {
+    const sub = try subverb("appender", words, diag);
+    if (!std.mem.eql(u8, sub, "clear")) {
+        diag.* = .{ .unknown_subverb = .{ .verb = "appender", .word = sub } };
+        return error.Refused;
+    }
+    var c: Cursor = .{ .verb = "appender clear", .words = words[1..], .diag = diag };
+    while (try c.step()) |f| return c.unknown(f);
+    const pos = c.pos();
+    if (pos.len < 2) {
+        diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = if (pos.len == 0) "the sqmeta:// volume" else "the appender id" } };
+        return error.Refused;
+    }
+    if (pos.len > 2) {
+        diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[2] } };
+        return error.Refused;
+    }
+    try checkUri(.meta, pos[0], diag);
+    // The id through the ONE integer parser (the verb's word as its name).
+    const id: u32 = switch (knobs.parseIntIn(u32, "appender id", pos[1], 0, std.math.maxInt(u32))) {
+        .value => |v| v,
+        .absent => {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the appender id" } };
+            return error.Refused;
+        },
+        .invalid => |d| {
+            diag.* = .{ .bad_int = d };
+            return error.Refused;
+        },
+    };
+    return .{ .appender_clear = .{ .meta_uri = pos[0], .appender_id = id } };
 }
 
 fn parseVolume(words: []const []const u8, diag: *Refusal) Error!Verb {
@@ -1255,11 +1322,25 @@ test "bench: every flag; sizes accept k/m/g/t and refuse garbage and 0; the bare
     try testing.expect((try refusal(av(&.{"bench"}))) == .missing_positional);
 }
 
+test "appenders [--json] TARGET and appender clear TARGET ID: the URI checked, the id through the one integer parser, sub-verbs refused by name" {
+    var d: Refusal = undefined;
+    const a = try parse(av(&.{ "appenders", "--json", "sqmeta:///dev/m" }), &d);
+    try testing.expect(a.appenders.json);
+    try testing.expectEqualStrings("sqmeta:///dev/m", a.appenders.meta_uri);
+    try testing.expect((try refusal(av(&.{ "appenders", "/mnt" }))) == .bad_uri);
+    const c = try parse(av(&.{ "appender", "clear", "sqmeta:///dev/m", "3" }), &d);
+    try testing.expectEqual(@as(u32, 3), c.appender_clear.appender_id);
+    try testing.expect((try refusal(av(&.{ "appender", "clear", "sqmeta:///dev/m" }))) == .missing_positional);
+    try testing.expect((try refusal(av(&.{ "appender", "clear", "sqmeta:///dev/m", "x" }))) == .bad_int);
+    try testing.expect((try refusal(av(&.{ "appender", "clear", "sqmeta:///dev/m", "1", "2" }))) == .extra_positional);
+    try testing.expect((try refusal(av(&.{ "appender", "show", "sqmeta:///dev/m", "1" }))) == .unknown_subverb);
+}
+
 test "usage names every verb" {
     try testing.expect(std.mem.indexOf(u8, usage(null), "squeezefs format") != null);
     inline for (@typeInfo(std.meta.Tag(Verb)).@"enum".field_names) |name| {
         if (!std.mem.eql(u8, name, "version") and !std.mem.eql(u8, name, "help")) {
-            const word = comptime if (std.mem.eql(u8, name, "claim_clear")) "squeezefs claim clear" else "squeezefs " ++ name;
+            const word = comptime if (std.mem.eql(u8, name, "claim_clear")) "squeezefs claim clear" else if (std.mem.eql(u8, name, "appender_clear")) "squeezefs appender clear" else "squeezefs " ++ name;
             try testing.expect(std.mem.indexOf(u8, usage(null), word) != null);
         }
     }

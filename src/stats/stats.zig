@@ -322,6 +322,12 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/sym/tokens/token_cache.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/read_divert.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/ro_mount.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/membership/shard.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/membership/death_ledger.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/membership/recovery.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/membership/park_reclaim.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/membership/fencing.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/membership/join_ladder.zig", .by = "src/meta/sym.zig" },
 };
 
 comptime {

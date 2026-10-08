@@ -123,9 +123,16 @@ pub const RecordSource = struct {
     /// Every tree shares ONE mint, so any handle's snapshot is the volume's
     /// watermark (captured AFTER the flush loop, whose SMOs mint).
     node_seq: *const node_seq.NodeSeqHandle,
-    /// The mounted record's stamp, restated on every record (every volume
-    /// is a stamped set member).
-    membership_stamp: ledger.MembershipStamp,
+    /// The stamp image this record carries (every volume is a stamped set
+    /// member): the stored membership with the LIVE guest-cursor cells
+    /// folded in (charter §5.4; `routing/stamp_cell.zig`). The slices the
+    /// stamp borrows stay valid until the source's next call — both record
+    /// sites run under the volume's SMO lock, one at a time.
+    membershipStamp: *const fn (ctx: *anyopaque) ledger.MembershipStamp,
+    /// Publish every guest slot tree's root whose durable copy in tree 0
+    /// is stale (one checkpoint-class control entry each), after the
+    /// flush pass and before the tail rule (C4b).
+    publishGuestRoots: *const fn (ctx: *anyopaque) CycleError!void,
 };
 
 pub const FlushFailure = enum { none, io, corrupt, out_of_memory };
@@ -798,6 +805,14 @@ pub const Checkpointer = struct {
                 .failed => return failureError(r.failure),
             }
         }
+        // ---- C4b: the roots the ledger does NOT name (guest slot trees,
+        // charter §5.5 "a guest slot tree's root lives in tree 0") are
+        // published into the control tree as checkpoint-class journal
+        // entries AFTER the flush pass (whose SMOs are the only root
+        // movers; the task serializes them) and BEFORE the tail rule, so
+        // the entries sit inside the window the record names and tree 0's
+        // dirty leaf floor clamps the tail under them.
+        try self.deps.record.publishGuestRoots(self.deps.record.ctx);
         const t_flushed = clock.monotonicNs();
 
         // ---- C5: the heap-full posture; the pass's units.
@@ -844,7 +859,7 @@ pub const Checkpointer = struct {
             .next_ino = self.deps.record.next_ino.snapshot(),
             .alloc_bitmap_generation = ckpt_seq,
             .node_seq_watermark = self.deps.record.node_seq.load(),
-            .membership_stamp = self.deps.record.membership_stamp,
+            .membership_stamp = self.deps.record.membershipStamp(self.deps.record.ctx),
         };
         self.writeLedgerRecord(record) catch |e| {
             // The covering record never landed: the previous record stays
@@ -1016,7 +1031,7 @@ pub const Checkpointer = struct {
             .next_ino = self.deps.record.next_ino.snapshot(),
             .alloc_bitmap_generation = ckpt_seq,
             .node_seq_watermark = self.deps.record.node_seq.load(),
-            .membership_stamp = self.deps.record.membership_stamp,
+            .membership_stamp = self.deps.record.membershipStamp(self.deps.record.ctx),
         };
         try self.writeLedgerRecord(last.restatement(ckpt_seq));
         self.retire_seq.store(ckpt_seq + 1, .release);
@@ -1360,7 +1375,7 @@ const TestVol = struct {
             .barrier = .{ .ctx = v, .barrier = barrierFn },
             .ledger = .{ .ctx = v, .writeSlot = writeSlotFn },
             .pages = .{ .ctx = v, .writePage = writePageFn },
-            .record = .{ .ctx = v, .treeRoots = treeRootsFn, .next_ino = &v.ino, .node_seq = &v.seq_handle, .membership_stamp = test_stamp },
+            .record = .{ .ctx = v, .treeRoots = treeRootsFn, .next_ino = &v.ino, .node_seq = &v.seq_handle, .membershipStamp = stampFn, .publishGuestRoots = noGuestRootsFn },
             .smo = SmoSeam.none,
             .maintenance = MaintenanceSource.ofQueue(&v.maintenance),
         });
@@ -1404,6 +1419,12 @@ const TestVol = struct {
         const v: *TestVol = @ptrCast(@alignCast(ctx));
         try out.appendSlice(gpa, &v.roots);
     }
+
+    fn stampFn(_: *anyopaque) ledger.MembershipStamp {
+        return test_stamp;
+    }
+
+    fn noGuestRootsFn(_: *anyopaque) CycleError!void {}
 
     fn addrOf(ext: u64) u64 {
         return ext * NODE_SIZE;

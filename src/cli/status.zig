@@ -6,9 +6,9 @@
 //! every ledger slot are whole-sector, checksummed units; the control
 //! tree is read at the newest CHECKPOINT — a verb's record committed since
 //! and not yet checkpointed is in the journal, which a status never
-//! replays), and the data volumes' REFERENCE CENSUS out of the native slot
-//! tree (records and distinct blocks per volume — the pack census the
-//! smoke reads, the C8 oracle's durable half). A mountpoint target resolves
+//! replays), and the data volumes' REFERENCE CENSUS out of every slot
+//! tree of the member's forest (records and distinct blocks per volume —
+//! the pack census the smoke reads, the C8 oracle's durable half). A mountpoint target resolves
 //! through the live mount's `.config` (`stats_cli.md` §7 Q8: the META path,
 //! never a cache directory) and adds the `.stats` headline. Also the
 //! preflight classifier `format` shares. Linux only.
@@ -27,6 +27,7 @@ const node_cache = @import("../meta/node_cache.zig");
 const node_seq = @import("../meta/node_seq.zig");
 const tree = @import("../meta/tree.zig");
 const key = @import("../meta/key.zig");
+const slot_state = @import("../meta/routing/slot_state.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const set_config = @import("../data/set_config.zig");
 const uring_fs = @import("../io/uring_fs.zig");
@@ -118,8 +119,11 @@ const status_cache_budget_bytes: u64 = 16 << 20;
 pub const VolCensus = struct { vol_tag: u64, references: u64, blocks: u64 };
 
 /// The reference records of every data volume `cfg` names, read offline
-/// from the native slot tree: records and DISTINCT block indices (the
-/// refs key sorts by block, so the distinct count is one pass).
+/// from EVERY slot tree of this member's forest (the native tree the
+/// ledger names on slot 0's host, every guest tree tree 0's `slot_state`
+/// records name): records and DISTINCT block indices (a block's refs
+/// sort together within one tree; across trees the distinct count is a
+/// sorted merge of each tree's blocks).
 pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, sb: superblock.Superblock, rec: *const ledger.LedgerRecord, cfg: *const set_config.Config, out: *std.ArrayList(VolCensus)) ClassifyError!void {
     const mode = uring_fs.registerMetaDevice(gpa, env, path) catch return error.DeviceRefused;
     var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = sb.root_ledger.start, .bitmap_base = sb.alloc_bitmap.start };
@@ -128,39 +132,65 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
     defer cache.deinit();
     cache.setDurableTail(rec.journal_tail_seq);
     var seq = node_seq.NodeSeqHandle.shared(rec.node_seq_watermark);
-    const t = tree.KvTree.openFromLedger(gpa, cache, rec, .native_slot, &seq) catch |e| return switch (e) {
+    var trees: std.ArrayList(*tree.KvTree) = .empty;
+    defer {
+        for (trees.items) |t| t.destroy();
+        trees.deinit(gpa);
+    }
+    if (rec.root(.native_slot) != null) {
+        try trees.append(gpa, tree.KvTree.openFromLedger(gpa, cache, rec, .native_slot, &seq) catch |e| return mapTreeOpen(e));
+    }
+    {
+        const control = tree.KvTree.openFromLedger(gpa, cache, rec, .control, &seq) catch |e| return mapTreeOpen(e);
+        defer control.destroy();
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        control.range(gpa, slot_state.SCAN_START, slot_state.SCAN_END, std.math.maxInt(usize), &kvs) catch |e| return mapTreeOpen(e);
+        for (kvs.items) |kv| {
+            const slot = slot_state.slotOfKey(kv.key) orelse continue;
+            const v = slot_state.Value.decode(kv.value) catch return error.Unexpected;
+            try trees.append(gpa, tree.KvTree.open(gpa, cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = v.rootAddr(), .seq = v.rootSeq() }, &seq) catch |e| return mapTreeOpen(e));
+        }
+    }
+    for (cfg.data) |d| {
+        var census: VolCensus = .{ .vol_tag = d.vol_tag, .references = 0, .blocks = 0 };
+        const range = key.volumeRange(d.vol_tag);
+        var blocks: std.ArrayList(u64) = .empty;
+        defer blocks.deinit(gpa);
+        for (trees.items) |t| {
+            var cursor = range.lo;
+            while (true) {
+                var kvs: std.ArrayList(tree.KeyValue) = .empty;
+                defer tree.deinitKeyValues(gpa, &kvs);
+                t.range(gpa, cursor.slice(), range.hi.slice(), 512, &kvs) catch |e| return mapTreeOpen(e);
+                var n: usize = 0;
+                for (kvs.items) |kv| {
+                    if (!key.lessThan(kv.key, range.hi.slice())) break;
+                    const k = key.BlockRefKey.decode(kv.key) catch return error.Unexpected;
+                    census.references += 1;
+                    try blocks.append(gpa, k.blockIdx());
+                    n += 1;
+                }
+                if (n < 512 or kvs.items.len == 0) break;
+                cursor = key.sameKindSuccessor(kvs.items[kvs.items.len - 1].key) orelse break;
+            }
+        }
+        std.mem.sort(u64, blocks.items, {}, std.sort.asc(u64));
+        var last_block: ?u64 = null;
+        for (blocks.items) |b| {
+            if (last_block == null or last_block.? != b) census.blocks += 1;
+            last_block = b;
+        }
+        try out.append(gpa, census);
+    }
+}
+
+fn mapTreeOpen(e: anyerror) ClassifyError {
+    return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.Io => error.Io,
         else => error.Unexpected,
     };
-    defer t.destroy();
-    for (cfg.data) |d| {
-        var census: VolCensus = .{ .vol_tag = d.vol_tag, .references = 0, .blocks = 0 };
-        const range = key.volumeRange(d.vol_tag);
-        var cursor = range.lo;
-        var last_block: ?u64 = null;
-        while (true) {
-            var kvs: std.ArrayList(tree.KeyValue) = .empty;
-            defer tree.deinitKeyValues(gpa, &kvs);
-            t.range(gpa, cursor.slice(), range.hi.slice(), 512, &kvs) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.Io => error.Io,
-                else => error.Unexpected,
-            };
-            var n: usize = 0;
-            for (kvs.items) |kv| {
-                if (!key.lessThan(kv.key, range.hi.slice())) break;
-                const k = key.BlockRefKey.decode(kv.key) catch return error.Unexpected;
-                census.references += 1;
-                if (last_block == null or last_block.? != k.blockIdx()) census.blocks += 1;
-                last_block = k.blockIdx();
-                n += 1;
-            }
-            if (n < 512 or kvs.items.len == 0) break;
-            cursor = key.sameKindSuccessor(kvs.items[kvs.items.len - 1].key) orelse break;
-        }
-        try out.append(gpa, census);
-    }
 }
 
 /// What the control tree holds under `set_config` at the newest checkpoint.

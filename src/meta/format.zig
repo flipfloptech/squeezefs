@@ -56,6 +56,11 @@ pub const FormatOptions = struct {
     /// This member's place in the set (`plan_meta_slot_set(n).stamps[pos]`).
     member_position: u16 = 0,
     member_count: u16 = 1,
+    /// An explicit stamp instead of the fresh member's derivation: the
+    /// `add-meta` joiner's HOSTLESS transient stamp (its claim lands after
+    /// the copy, per the write-0-before-claim order). Borrows the caller's
+    /// runs for the plan's life.
+    stamp_override: ?ledger.MembershipStamp = null,
     /// The root directory's owner: the invoking user (`SUDO_UID:SUDO_GID`
     /// under sudo); the builder default is 0:0.
     root_uid: u32 = 0,
@@ -162,7 +167,11 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
             };
             const refs: []const rec.RecordRef = switch (t.records) {
                 .control => opts.control_records,
-                .native => blk: {
+                // The native keyspace belongs to slot 0's host (member 0,
+                // `ledger.nativeSlotOf`): every other member's native tree
+                // is born EMPTY — it holds the volume's own control records
+                // (the writer claim at local ino 1) and never a `/`.
+                .native => if (opts.member_position != 0) &.{} else blk: {
                     const records = try desc.nativeRecords(a);
                     const out = try a.alloc(rec.RecordRef, records.len);
                     for (records, out) |*r, *o| o.* = r.ref();
@@ -185,7 +194,7 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
         },
         .write_ledger_record => |l| {
             const run = try a.create([1]ledger.SlotRun);
-            const stamp = ledger.MembershipStamp.member(opts.set.set_uuid, opts.member_position, opts.member_count, run);
+            const stamp = opts.stamp_override orelse ledger.MembershipStamp.member(opts.set.set_uuid, opts.member_position, opts.member_count, run);
             const record = ledger.bootstrapRecord(roots.items, desc.nextIno(), writer.nodeSeqWatermark(), stamp);
             assert(record.seq == l.seq and record.journal_tail_seq == l.journal_tail_seq and record.alloc_bitmap_generation == l.alloc_bitmap_generation);
             assert(ledger.slotOffset(sb.root_ledger.start, record.slotIndex()) == l.offset);
@@ -430,7 +439,8 @@ test "determinism: one description + uuid + set identity ⇒ byte-identical imag
     defer record.deinit(gpa);
     try testing.expectEqual(@as(u16, 2), record.membership_stamp.member_position);
     try testing.expectEqual(@as(u16, 4), record.membership_stamp.member_count);
-    try testing.expectEqual(@as(?u16, 2), record.membership_stamp.native_slot);
+    // A member not hosting slot 0 is guest-only: no native keyspace.
+    try testing.expectEqual(@as(?u16, null), record.membership_stamp.native_slot);
     try testing.expectEqual(ledger.SlotRun{ .start = 2, .stride = 4, .count = 16_384 }, record.membership_stamp.slots_hosted.runs[0]);
 }
 

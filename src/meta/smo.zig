@@ -1193,14 +1193,16 @@ pub fn checkpointFlushNode(t: *KvTree, ctx: *SmoContext, addr: u64) Error!void {
 /// cutting is never starved by the ones before it re-walking.
 pub const CheckpointSeam = struct {
     ctx: *SmoContext,
-    trees: []const *KvTree,
+    /// The volume's live tree set (a flush may meet a tree minted or
+    /// migrated in since the mount).
+    trees: *const tree.TreeTable,
 
     pub fn seam(self: *CheckpointSeam) checkpoint_cycle.SmoSeam {
         return .{ .ctx = self, .maintain = maintain, .mergeUnderfull = mergeUnderfull };
     }
 
     fn treeOf(self: *const CheckpointSeam, n: *const CachedNode) ?*KvTree {
-        for (self.trees) |t| if (t.owns(n)) return t;
+        for (self.trees.load()) |t| if (t.owns(n)) return t;
         return null;
     }
 
@@ -1226,7 +1228,7 @@ pub const CheckpointSeam = struct {
     fn mergeUnderfull(ctx: *anyopaque, deadline_ns: u64) checkpoint_cycle.SweepReport {
         const self: *CheckpointSeam = @ptrCast(@alignCast(ctx));
         var report: checkpoint_cycle.SweepReport = .{};
-        for (self.trees) |t| {
+        for (self.trees.load()) |t| {
             // A loud class (corruption / allocation) ends the sweep with the
             // lap incomplete; the cursor stands where it parked.
             const s = leaf_merge.mergeUnderfull(t, self.ctx, true, deadline_ns) catch {
@@ -1285,6 +1287,9 @@ pub const TestVolume = struct {
     journal: *SmoJournal,
     ctx: SmoContext,
     trees: std.ArrayList(*KvTree) = .empty,
+    /// The live-set view the conveyor and the checkpoint seam route
+    /// through (kept in step with `trees` by `createTree`).
+    table: *tree.TreeTable,
 
     pub fn init(gpa: Allocator, cfg: Config) !TestVolume {
         const layout = try node.NodeLayout.new(cfg.node_size, null);
@@ -1321,6 +1326,9 @@ pub const TestVolume = struct {
         const j = try gpa.create(SmoJournal);
         errdefer gpa.destroy(j);
         j.* = .{ .gpa = gpa, .layout = .{ .base = 0, .pages = cfg.ring_pages }, .geo = geo, .core = core, .reg = reg, .image = ring_image };
+        const table = try gpa.create(tree.TreeTable);
+        errdefer gpa.destroy(table);
+        table.* = try tree.TreeTable.init(gpa, &.{});
         return .{
             .gpa = gpa,
             .cfg = cfg,
@@ -1334,10 +1342,13 @@ pub const TestVolume = struct {
             .reg = reg,
             .journal = j,
             .ctx = if (cfg.journaled) SmoContext.withJournal(alloc, j) else SmoContext.init(alloc),
+            .table = table,
         };
     }
 
     pub fn deinit(self: *TestVolume) void {
+        self.table.deinit();
+        self.gpa.destroy(self.table);
         for (self.trees.items) |t| t.destroy();
         self.trees.deinit(self.gpa);
         self.cache.deinit();
@@ -1358,6 +1369,7 @@ pub const TestVolume = struct {
         const t = try KvTree.create(self.gpa, self.cache, self.alloc, identity, self.seq);
         errdefer t.destroy();
         try self.trees.append(self.gpa, t);
+        try self.table.add(t);
         return t;
     }
 
@@ -2477,7 +2489,7 @@ test "CheckpointSeam: the checkpoint's CacheFlusher appends in place, hands a fu
     var vol = try TestVolume.init(gpa, .{ .journaled = true });
     defer vol.deinit();
     const t = try vol.createTree(.native);
-    var seam_ctx: CheckpointSeam = .{ .ctx = &vol.ctx, .trees = vol.trees.items };
+    var seam_ctx: CheckpointSeam = .{ .ctx = &vol.ctx, .trees = vol.table };
     var flusher: checkpoint_cycle.CacheFlusher = .{ .cache = vol.cache, .smo = seam_ctx.seam() };
     const sink = flusher.sink();
     var buf: [64]u8 = undefined;
@@ -2509,7 +2521,9 @@ test "CheckpointSeam: the checkpoint's CacheFlusher appends in place, hands a fu
     try testing.expect(!vol.ctx.keep_exempt);
     for (0..80) |i| try expectLookup(t, &ikey(i), tree.testValue(i * 11 + spins, 40, &buf));
     // A node of a tree the seam does not hold is declined.
-    var foreign: CheckpointSeam = .{ .ctx = &vol.ctx, .trees = &.{} };
+    var empty_table = try tree.TreeTable.init(gpa, &.{});
+    defer empty_table.deinit();
+    var foreign: CheckpointSeam = .{ .ctx = &vol.ctx, .trees = &empty_table };
     const nl = try t.resolveLeaf(&ikey(0));
     defer nl.release();
     try testing.expectEqual(checkpoint_cycle.SmoOutcome.declined, foreign.seam().maintain(&foreign, nl, .{ .keep_exempt = false, .forced_retirement = true }));

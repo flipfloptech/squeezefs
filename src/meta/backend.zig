@@ -105,6 +105,9 @@ const format = @import("format.zig");
 const geometry = @import("geometry.zig");
 const device_loader = @import("device_loader.zig");
 const guard = @import("guard.zig");
+const routing = @import("routing.zig");
+const slot_state = routing.slot_state;
+const stamp_cell = routing.stamp_cell;
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("backend is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -227,6 +230,12 @@ pub const FormatOptions = struct {
     set: geometry.SetIdentity,
     root_uid: u32 = 0,
     root_gid: u32 = 0,
+    /// This member's place in the set (`format.FormatOptions`): position 0
+    /// hosts slot 0's native keyspace and the `set_config` record.
+    member_position: u16 = 0,
+    member_count: u16 = 1,
+    /// `format.FormatOptions.stamp_override` (the `add-meta` joiner).
+    stamp_override: ?ledger.MembershipStamp = null,
     /// Tree 0's format-time records (`format.FormatOptions.control_records`:
     /// the `set_config` record on the set's member 0).
     control_records: []const record.RecordRef = &.{},
@@ -252,6 +261,9 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
         .set = opts.set,
         .root_uid = opts.root_uid,
         .root_gid = opts.root_gid,
+        .member_position = opts.member_position,
+        .member_count = opts.member_count,
+        .stamp_override = opts.stamp_override,
         .control_records = opts.control_records,
     }, &diag) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -262,7 +274,7 @@ pub fn formatVolume(gpa: Allocator, path: []const u8, opts: FormatOptions) Forma
     };
     defer plan.deinit();
     try dev.writeSteps(plan.steps);
-    log.info("formatted {s}: format v4 one-member forest, {d} B, node {d} B, journal {d} B, {d} extents", .{ path, volume_len, opts.node_size, plan.superblock.journal.len, plan.superblock.totalExtents() });
+    log.info("formatted {s}: format v4, member {d} of {d}, {d} B, node {d} B, journal {d} B, {d} extents", .{ path, opts.member_position, opts.member_count, volume_len, opts.node_size, plan.superblock.journal.len, plan.superblock.totalExtents() });
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +306,21 @@ pub const KvBackend = struct {
     cache: *node_cache.NodeCache,
     alloc: alloc_ext.ExtentAllocator,
     seq: node_seq.NodeSeqHandle,
-    trees: []*KvTree,
+    /// The live tree set: the control tree, the native slot tree (member 0)
+    /// and every guest slot tree opened from tree 0's `slot_state` records
+    /// or minted on first touch (charter §5.5 "slot trees are minted
+    /// lazily"); writers serialize on `trees_lock`.
+    trees: tree.TreeTable,
+    trees_lock: Io.Mutex = .init,
+    /// The runtime membership stamp with its guest-cursor cells (what every
+    /// ledger record carries; the flip's stamp writes mutate it).
+    stamp: *stamp_cell.StampCell,
+    /// The durable `slot_state` copy of every guest root (seeded from tree
+    /// 0 at open; a root the tree moved past is republished at the next
+    /// cycle's C1b).
+    guest_published: std.AutoHashMapUnmanaged(u16, tree.RootPtr) = .empty,
+    /// The cursor floors tree 0's `slot_state` records carried at open.
+    guest_cursor_floors: std.AutoHashMapUnmanaged(u16, u64) = .empty,
     ring_layout: journal.RingLayout,
     geo: jc.CoreGeometry,
     core: jc.JournalCore,
@@ -450,7 +476,8 @@ pub const KvBackend = struct {
             .cache = undefined,
             .alloc = alloc,
             .seq = node_seq.NodeSeqHandle.shared(@max(mounted.seq, mounted.node_seq_watermark)),
-            .trees = &.{},
+            .trees = undefined,
+            .stamp = undefined,
             .ring_layout = ring_layout,
             .geo = geo,
             .core = jc.JournalCore.init(geo, recovery.head_pos, mounted.journal_tail_seq),
@@ -476,8 +503,12 @@ pub const KvBackend = struct {
             for (trees.items) |t| t.destroy();
             trees.deinit(gpa);
         }
-        // The one-member forest: the control tree and the native slot tree,
-        // both named by the ledger (a guest slot tree's root is tree 0's).
+        // The ledger-rooted trees: the control tree and (on slot 0's host)
+        // the native slot tree. A guest slot tree's root is a tree-0
+        // `slot_state` record, so the control records are replayed FIRST,
+        // then the guest trees open (or are minted for slots the window
+        // names without a published root), then the window replays again
+        // through the complete routing — idempotent by the per-key LWW gate.
         for (be.mounted.tree_roots) |r| {
             const t = KvTree.openFromLedger(gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -488,12 +519,20 @@ pub const KvBackend = struct {
             be.seq.raiseTo(r.node_seq);
             try trees.append(gpa, t);
         }
-        be.trees = try trees.toOwnedSlice(gpa);
+        be.trees = try tree.TreeTable.init(gpa, trees.items);
+        trees.deinit(gpa);
+        trees = .empty;
         errdefer {
-            for (be.trees) |t| t.destroy();
-            gpa.free(be.trees);
+            for (be.trees.load()) |t| t.destroy();
+            be.trees.deinit();
         }
-        _ = tree.replayEntries(gpa, be.trees, recovery.entries) catch |e| switch (e) {
+        _ = tree.replayEntries(gpa, be.trees.load(), recovery.entries) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return error.Io,
+            else => return error.Corrupt,
+        };
+        try be.openGuestTrees(recovery.entries);
+        _ = tree.replayEntries(gpa, be.trees.load(), recovery.entries) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
             else => return error.Corrupt,
@@ -508,14 +547,10 @@ pub const KvBackend = struct {
         }
         be.replay.content_records = content_records;
         {
-            var roots_buf: [8]u64 = undefined;
-            var n: usize = 0;
-            for (be.trees) |t| {
-                if (n == roots_buf.len) break;
-                roots_buf[n] = be.cache.addrExtent(t.rootPtr().addr);
-                n += 1;
-            }
-            _ = try be.alloc.parkReplayedFrees(roots_buf[0..n]);
+            var roots_buf: std.ArrayList(u64) = .empty;
+            defer roots_buf.deinit(gpa);
+            for (be.trees.load()) |t| try roots_buf.append(gpa, be.cache.addrExtent(t.rootPtr().addr));
+            _ = try be.alloc.parkReplayedFrees(roots_buf.items);
         }
         var fold: inos.RecoveryFold = .{ .native_slot = mounted.membership_stamp.native_slot };
         defer fold.deinit(gpa);
@@ -524,6 +559,19 @@ pub const KvBackend = struct {
             error.Corrupt => return error.Corrupt,
         };
         be.ino.installFloor(fold.nextIno(mounted.next_ino));
+        // The stamp with its cells: every stamped cursor, then every guest
+        // slot the window mentions (its replay maximum + 1), then every
+        // published slot_state cursor — all FLOORS, max wins.
+        be.stamp = try stamp_cell.StampCell.init(gpa, mounted.membership_stamp);
+        errdefer be.stamp.deinit();
+        {
+            var it = fold.guest_max.iterator();
+            while (it.next()) |e| try be.stamp.installFloor(e.key_ptr.*, fold.guestCursor(e.key_ptr.*, mounted.membership_stamp.cursorFor(e.key_ptr.*) orelse 0));
+            var pit = be.guest_published.iterator();
+            while (pit.next()) |e| {
+                if (be.guest_cursor_floors.get(e.key_ptr.*)) |floor| try be.stamp.installFloor(e.key_ptr.*, floor);
+            }
+        }
 
         // 8. The registry at the recovered head; the sector-pad alignment of
         // a head a torn window left mid-sector.
@@ -552,7 +600,7 @@ pub const KvBackend = struct {
         be.smo_journal = .{ .gpa = gpa, .layout = ring_layout, .geo = geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook } };
         be.smo_journal.retire_seq.store(mounted.seq + 1, .release);
         be.smo_ctx = smo.SmoContext.withJournal(&be.alloc, &be.smo_journal);
-        be.ckpt_seam = .{ .ctx = &be.smo_ctx, .trees = be.trees };
+        be.ckpt_seam = .{ .ctx = &be.smo_ctx, .trees = &be.trees };
         be.flusher = .{ .cache = be.cache, .smo = be.ckpt_seam.seam() };
         const flush_ms = checkpoint.flushIntervalMsFromEnv(opts.env);
         be.cp = checkpoint_cycle.Checkpointer.init(gpa, .{
@@ -572,7 +620,7 @@ pub const KvBackend = struct {
             .barrier = be.dev.barrierSink(),
             .ledger = .{ .ctx = be, .writeSlot = ledgerSlotHook },
             .pages = be.dev.pageSink(),
-            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membership_stamp = be.mounted.membership_stamp },
+            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook },
             .smo = be.ckpt_seam.seam(),
             .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
         });
@@ -596,7 +644,7 @@ pub const KvBackend = struct {
             .io = io,
             .gpa = gpa,
             .volume = be.path,
-            .trees = be.trees,
+            .trees = &be.trees,
             .cache = be.cache,
             .alloc = &be.alloc,
             .core = &be.core,
@@ -638,7 +686,7 @@ pub const KvBackend = struct {
         try be.guard.?.startHeartbeat();
         be.replay.replay_ns = clock.monotonicNs() - t0;
         stats.mounts.inc();
-        log.info("meta volume {s}: mounted — ledger seq {d}, tail {d}, replayed {d} entries ({d} content records, {d} torn dropped{s}), next_ino {d}, {d} trees, {d}/{d} extents free, {s} cadence, guard {s}", .{ be.path, mounted.seq, mounted.journal_tail_seq, be.replay.entries, be.replay.content_records, be.replay.dropped_torn, if (clean_unmount) ", clean unmount" else "", be.ino.snapshot(), be.trees.len, be.alloc.freeExtents(), total_extents, if (flush_ms == 0) "strict" else "coalesced", be.guard.?.modeName() });
+        log.info("meta volume {s}: mounted — ledger seq {d}, tail {d}, replayed {d} entries ({d} content records, {d} torn dropped{s}), next_ino {d}, {d} trees, {d}/{d} extents free, {s} cadence, guard {s}", .{ be.path, mounted.seq, mounted.journal_tail_seq, be.replay.entries, be.replay.content_records, be.replay.dropped_torn, if (clean_unmount) ", clean unmount" else "", be.ino.snapshot(), be.trees.load().len, be.alloc.freeExtents(), total_extents, if (flush_ms == 0) "strict" else "coalesced", be.guard.?.modeName() });
         return be;
     }
 
@@ -805,7 +853,19 @@ pub const KvBackend = struct {
 
     fn treeRootsFn(ctx: *anyopaque, gpa: Allocator, out: *std.ArrayList(ledger.TreeRoot)) Allocator.Error!void {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        for (be.trees) |t| if (t.ledgerRoot()) |r| try out.append(gpa, r);
+        for (be.trees.load()) |t| if (t.ledgerRoot()) |r| try out.append(gpa, r);
+    }
+
+    /// `checkpoint_cycle.RecordSource.membershipStamp`: the stored
+    /// membership with the live cursor cells folded in.
+    fn stampForLedger(ctx: *anyopaque) ledger.MembershipStamp {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        return be.stamp.forLedger();
+    }
+
+    fn publishGuestRootsHook(ctx: *anyopaque) checkpoint_cycle.CycleError!void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        return be.publishGuestRoots();
     }
 
     /// The threshold drain's source: the trees' queues, round-robin from
@@ -813,17 +873,18 @@ pub const KvBackend = struct {
     /// another's items (every queue is lock-free; the task is the one popper).
     fn popMaintenance(ctx: *anyopaque) ?u64 {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        const n = be.trees.len;
+        const trees = be.trees.load();
+        const n = trees.len;
         for (0..n) |_| {
             be.maintenance_cursor = (be.maintenance_cursor + 1) % n;
-            if (be.trees[be.maintenance_cursor].popMaintenance()) |addr| return addr;
+            if (trees[be.maintenance_cursor].popMaintenance()) |addr| return addr;
         }
         return null;
     }
 
     fn maintenancePending(ctx: *anyopaque) bool {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        for (be.trees) |t| if (t.maintenancePending()) return true;
+        for (be.trees.load()) |t| if (t.maintenancePending()) return true;
         return false;
     }
 
@@ -833,7 +894,7 @@ pub const KvBackend = struct {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
         const n = be.cache.tryGet(addr) orelse return;
         defer n.release();
-        for (be.trees) |t| {
+        for (be.trees.load()) |t| {
             if (t.owns(n)) {
                 t.enqueueMaintenance(addr);
                 return;
@@ -976,6 +1037,266 @@ pub const KvBackend = struct {
         return true;
     }
 
+    // ---- guest slot trees (charter §5.5: roots in tree 0, minted lazily) ----
+
+    /// The forest slot of routing slot `slot` on this volume: the native
+    /// tree iff the stamp names it native, else the guest tree `slot + 1`.
+    fn forestSlotOf(be: *const KvBackend, slot: u16) key.ForestSlot {
+        if (be.stamp.native_slot) |ns| if (ns == slot) return key.NATIVE_FOREST_SLOT;
+        return key.guestForestSlot(slot);
+    }
+
+    /// Open every guest tree tree 0 names (the replayed control records are
+    /// in RAM), then mint an EMPTY tree for every guest slot the replay
+    /// window mentions without a published root (a tree created in the
+    /// crashed daemon's last window: its records are in the ring, its root
+    /// never reached tree 0 — the recreated empty tree replays identically).
+    fn openGuestTrees(be: *KvBackend, entries: []const journal.ReplayedEntry) OpenError!void {
+        const gpa = be.gpa;
+        const control = be.trees.find(.control) orelse return error.Corrupt;
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        control.range(gpa, slot_state.SCAN_START, slot_state.SCAN_END, std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        for (kvs.items) |kv| {
+            const slot = slot_state.slotOfKey(kv.key) orelse continue;
+            const v = slot_state.Value.decode(kv.value) catch {
+                log.err("meta volume {s}: tree 0 record {s} does not decode as a slot_state value", .{ be.path, kv.key });
+                return error.Corrupt;
+            };
+            const root: tree.RootPtr = .{ .addr = v.rootAddr(), .seq = v.rootSeq() };
+            const t = KvTree.open(gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, root, &be.seq) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Io => return error.Io,
+                else => return error.Corrupt,
+            };
+            errdefer t.destroy();
+            be.seq.raiseTo(root.seq);
+            try be.trees.add(t);
+            try be.guest_published.put(gpa, slot, root);
+            try be.guest_cursor_floors.put(gpa, slot, v.cursor());
+        }
+        // Slots the window names without a tree.
+        var mentioned = std.AutoHashMapUnmanaged(u16, void).empty;
+        defer mentioned.deinit(gpa);
+        for (entries) |e| {
+            var it = e.records();
+            while (it.next()) |f| {
+                const t = journal.untag(f.tag);
+                if (t.level > 0 or !key.isSlotTreeKind(t.tree_id)) continue;
+                const fs = key.checkSlotTreeKey(t.tree_id, f.key) catch continue;
+                if (fs == key.NATIVE_FOREST_SLOT) continue;
+                try mentioned.put(gpa, routing.route_table.slotOfForestSlot(fs), {});
+            }
+        }
+        var it = mentioned.keyIterator();
+        while (it.next()) |slot| {
+            if (be.trees.find(.{ .slot = key.guestForestSlot(slot.*) }) != null) continue;
+            _ = try be.mintGuestTree(slot.*);
+        }
+    }
+
+    /// The tree of routing slot `slot` on this volume, if it exists.
+    pub fn slotTree(be: *KvBackend, slot: u16) ?*KvTree {
+        return be.trees.find(.{ .slot = be.forestSlotOf(slot) });
+    }
+
+    /// The tree of routing slot `slot`, minted on first touch: an empty
+    /// root in a fresh extent (its image written now, barriered and named
+    /// in tree 0 by the next checkpoint's C1b; a crash before that recreates
+    /// it from the window). Serialized on `trees_lock`; a concurrent first
+    /// toucher finds the winner's tree.
+    pub fn mintGuestTree(be: *KvBackend, slot: u16) OpenError!*KvTree {
+        const identity: tree.TreeIdentity = .{ .slot = key.guestForestSlot(slot) };
+        if (be.trees.find(identity)) |t| return t;
+        be.trees_lock.lockUncancelable(be.io);
+        defer be.trees_lock.unlock(be.io);
+        if (be.trees.find(identity)) |t| return t;
+        const t = KvTree.create(be.gpa, be.cache, &be.alloc, identity, &be.seq) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return error.Io,
+            error.NoSpace => {
+                log.err("meta volume {s}: no heap extent for slot {d}'s first tree (heap full)", .{ be.path, slot });
+                return error.Io;
+            },
+            else => return error.Corrupt,
+        };
+        errdefer t.destroy();
+        try be.trees.add(t);
+        routing.stats.stats.routing_guest_trees_minted.inc();
+        return t;
+    }
+
+    /// A guest tree built elsewhere (the migration engine's bulk copy)
+    /// joins the live set; its root is published at the next C1b (or the
+    /// engine's explicit `checkpointNow`).
+    pub fn adoptTree(be: *KvBackend, t: *KvTree) Allocator.Error!void {
+        be.trees_lock.lockUncancelable(be.io);
+        defer be.trees_lock.unlock(be.io);
+        try be.trees.add(t);
+    }
+
+    /// Drop a guest tree (the flip's source teardown, a re-run's residue
+    /// wipe): the tree leaves the live set, its `slot_state` record is
+    /// deleted through a checkpoint-class entry, and every node's extent
+    /// enters pending-free gated on that entry's position — O(nodes), the
+    /// SMO pending-free protocol (charter §5.3), never a record-at-a-time
+    /// delete.
+    pub fn dropTree(be: *KvBackend, slot: u16) Error!void {
+        const identity: tree.TreeIdentity = .{ .slot = key.guestForestSlot(slot) };
+        be.trees_lock.lockUncancelable(be.io);
+        defer be.trees_lock.unlock(be.io);
+        const t = be.trees.find(identity) orelse return;
+        var extents: std.ArrayList(u64) = .empty;
+        defer extents.deinit(be.gpa);
+        try be.collectTreeExtents(t, &extents);
+        try be.trees.remove(t);
+        const gate = try be.writeSlotStateEntry(slot, null);
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        for (extents.items) |ext| be.smo_ctx.freePending(ext, gate, true) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Corrupt,
+        };
+        _ = be.guest_published.remove(slot);
+    }
+
+    /// Every node of `t` (the root, every interior, every leaf) as heap
+    /// extents, through the tree's own latch-free snapshots.
+    fn collectTreeExtents(be: *KvBackend, t: *KvTree, out: *std.ArrayList(u64)) Error!void {
+        const gpa = be.gpa;
+        var stack: std.ArrayList(u64) = .empty;
+        defer stack.deinit(gpa);
+        try stack.append(gpa, t.rootPtr().addr);
+        while (stack.pop()) |addr| {
+            try out.append(gpa, be.cache.addrExtent(addr));
+            const n = be.cache.get(addr) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+                else => error.Corrupt,
+            };
+            defer n.release();
+            if (n.level == 0) continue;
+            const snap = n.snapshotLoad();
+            defer snap.release();
+            var pos = key.KeyBuf.fromSlice("");
+            while (true) {
+                var live = (snap.value.nextLive(gpa, pos.slice(), null) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Corrupt,
+                }) orelse break;
+                defer live.deinit();
+                const iv = key.InteriorValue.decode(live.value) catch return error.Corrupt;
+                try stack.append(gpa, iv.childAddr());
+                if (!key.lessThan(live.key, &tree.KEY_SPACE_MAX)) break;
+                pos = key.keySuccessor(live.key);
+            }
+        }
+    }
+
+    /// Publish every guest root whose durable copy is stale (C1b).
+    fn publishGuestRoots(be: *KvBackend) checkpoint_cycle.CycleError!void {
+        for (be.trees.load()) |t| {
+            const fs = t.forest_slot orelse continue;
+            if (t.identity.rootId() != null) continue;
+            const slot = routing.route_table.slotOfForestSlot(fs);
+            const root = t.rootPtr();
+            if (be.guest_published.get(slot)) |p| if (p.addr == root.addr and p.seq == root.seq) continue;
+            _ = be.writeSlotStateEntry(slot, root) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.VolumeFailed => error.VolumeFailed,
+                error.Io, error.JournalWriteFailed => error.Io,
+                else => error.Corrupt,
+            };
+            try be.guest_published.put(be.gpa, slot, root);
+        }
+    }
+
+    const StampCtx = struct {
+        j: *smo.SmoJournal,
+        adm: jc.Admission,
+        registered: ?jc.InflightRegistry.Registered = null,
+
+        fn stamp(ctx: *anyopaque) Allocator.Error!tree.Stamp {
+            const self: *StampCtx = @ptrCast(@alignCast(ctx));
+            const r = try self.j.reserve(self.adm);
+            self.registered = r;
+            return .{ .seq = r.seq_base, .entry_start = r.res.start };
+        }
+    };
+
+    /// ONE checkpoint-class control entry: `Put(slot_state:{s}, root)`
+    /// (or its `Delete` when `root` is null), admitted from the reserve
+    /// (never behind user commits), reserved INSIDE the control leaf's lock
+    /// window, applied, written through the lane and answered when it
+    /// landed. Returns the entry's position (the pending-free gate of a
+    /// teardown). The one-record shape of the SMO's own commit.
+    fn writeSlotStateEntry(be: *KvBackend, slot: u16, root: ?tree.RootPtr) Error!u64 {
+        const control = be.trees.find(.control) orelse return error.Corrupt;
+        var kbuf: [slot_state.KEY_MAX_LEN]u8 = undefined;
+        const k = slot_state.keyOf(&kbuf, slot);
+        const cursor = be.stamp.cursorSnapshot(slot) orelse inos.LOCAL_INO_BASE;
+        const value: []const u8 = if (root) |r| &slot_state.Value.init(r.addr, r.seq, cursor).encode() else &.{};
+        const kind: record.RecordKind = if (root != null) .put else .delete;
+        var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(key.TREE_CONTROL, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
+        const len = journal.entryLenFor(&frames) catch return error.Corrupt;
+        const adm = be.core.tryAdmit(len, .checkpoint) orelse return error.ConveyorFull;
+        var st: StampCtx = .{ .j = &be.smo_journal, .adm = adm };
+        var attempt: u32 = 0;
+        while (attempt < node.RETRY_BUDGET) : (attempt += 1) {
+            const leaf = control.resolveLeaf(k) catch |e| {
+                be.core.release(adm);
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.Io => error.Io,
+                    else => error.Corrupt,
+                };
+            };
+            defer leaf.release();
+            const outcome = control.applyAtSeqClass(leaf, k, kind, value, .{ .reserve = .{ .ctx = &st, .stamp = StampCtx.stamp } }, true) catch |e| {
+                be.core.release(adm);
+                return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.Io => error.Io,
+                    else => error.Corrupt,
+                };
+            };
+            switch (outcome) {
+                .applied => {
+                    const r = st.registered.?;
+                    frames[0].seq = r.seq_base;
+                    be.smo_journal.commitEntry(r.res, &frames) catch return error.JournalWriteFailed;
+                    return r.res.start;
+                },
+                .stale => continue,
+            }
+        }
+        be.core.release(adm);
+        log.err("meta volume {s}: the slot_state entry for slot {d} exhausted its lock-revalidate budget (SMO protocol bug)", .{ be.path, slot });
+        return error.Corrupt;
+    }
+
+    /// Mint a local ino in routing slot `slot`: the native watermark on
+    /// the native slot, the slot's cursor cell otherwise. The slot's tree
+    /// is minted on first touch so the record's commit routes.
+    pub fn allocateInoInSlot(be: *KvBackend, slot: u16) OpenError!u64 {
+        if (be.stamp.native_slot) |ns| if (ns == slot) return be.ino.allocate();
+        if (be.slotTree(slot) == null) _ = try be.mintGuestTree(slot);
+        const cell = try be.stamp.cursorFor(slot);
+        return cell.allocate();
+    }
+
+    pub fn setEpoch(be: *const KvBackend) u64 {
+        return be.stamp.set_epoch;
+    }
+
+    pub fn setUuid(be: *const KvBackend) [16]u8 {
+        return be.stamp.set_uuid;
+    }
+
     // ---- the API ----
 
     /// A fresh transaction (`site` = the committer's `@src()`); `commit`
@@ -1003,13 +1324,12 @@ pub const KvBackend = struct {
     }
 
     pub fn treeOf(be: *KvBackend, identity: tree.TreeIdentity) ?*KvTree {
-        for (be.trees) |t| if (t.identity.eql(identity)) return t;
-        return null;
+        return be.trees.find(identity);
     }
 
     /// The tree a `(kind, key)` routes to (`tree.route`, the ONE law).
     fn treeForKey(be: *KvBackend, kind: u8, k: []const u8) ?*KvTree {
-        return tree.routeContent(be.trees, kind, k);
+        return tree.routeContent(be.trees.load(), kind, k);
     }
 
     /// Point lookup through the tree (latch-free); an owned copy.
@@ -1163,8 +1483,11 @@ pub const KvBackend = struct {
         be.cv.deinit();
         be.lane.deinit();
         be.cp.deinit();
-        for (be.trees) |t| t.destroy();
-        gpa.free(be.trees);
+        for (be.trees.load()) |t| t.destroy();
+        be.trees.deinit();
+        be.stamp.deinit();
+        be.guest_published.deinit(gpa);
+        be.guest_cursor_floors.deinit(gpa);
         be.cache.deinit();
         be.alloc.deinit();
         be.reg.deinit();
@@ -1341,7 +1664,7 @@ test "format (device path) → open → N creates (singles + a group of 8) → l
         try testing.expectEqual(@as(u64, 0), be.replayStats().entries);
         // The forest shape: the control tree and the native slot tree,
         // features 0, the stamp the format wrote.
-        try testing.expectEqual(@as(usize, 2), be.trees.len);
+        try testing.expectEqual(@as(usize, 2), be.trees.load().len);
         try testing.expect(be.treeOf(.control) != null);
         try testing.expect(be.treeOf(.native) != null);
         try testing.expectEqual(@as(u64, 0), be.sb.features_incompat);
@@ -1814,7 +2137,7 @@ test "threshold writeback on a mounted volume: commits that push one leaf over t
     try testing.expect(device_loader.stats.appends.load() > appends0);
     try testing.expectEqual(checkpoints0, checkpoint.stats.meta_kv_checkpoints.load());
     try testing.expectEqual(queue_full0, tree.stats.meta_kv_maintenance_queue_full.load());
-    for (be.trees) |t| try testing.expect(!t.maintenancePending());
+    for (be.trees.load()) |t| try testing.expect(!t.maintenancePending());
 }
 
 test "the admission park on the device: the smallest ring fills under a serial create stream (every commit a grain-padded window), the pass parks holding no node lock, the park kick runs a barriered cycle, every commit lands" {

@@ -84,7 +84,7 @@ const lock_order = @import("../sync/lock_order.zig");
 const taskset = @import("../sync/taskset.zig");
 const nvme_dev = @import("../io/nvme_dev.zig");
 const uring_fs = @import("../io/uring_fs.zig");
-const backend_mod = @import("../meta/backend.zig");
+const meta_set = @import("../meta/meta_set.zig");
 const key = @import("../meta/key.zig");
 const record = @import("../meta/record.zig");
 const tree = @import("../meta/tree.zig");
@@ -128,7 +128,9 @@ comptime {
     if (builtin.os.tag != .linux) @compileError("data/plane is Linux only (the devices); gate the import on builtin.os.tag");
 }
 
-pub const KvBackend = backend_mod.KvBackend;
+/// The metadata store the plane binds to: the SET facade (charter §5.4 —
+/// one or more members behind one store face; every record routes by key).
+pub const KvBackend = meta_set.MetaSet;
 pub const Mapping = layout.Mapping;
 pub const Error = errors.Error;
 pub const BlockKey = read_size_class.BlockKey;
@@ -616,8 +618,7 @@ pub const DataPlane = struct {
             return error.StagingRefused;
         };
         errdefer _ = linux.close(root_fd);
-        const stamp = self.backend.mounted.membership_stamp;
-        const ours: staging.Marker = .{ .set_uuid = stamp.set_uuid, .set_epoch = stamp.set_epoch, .node_token = 0, .mount_slot = 0 };
+        const ours: staging.Marker = .{ .set_uuid = self.backend.setUuid(), .set_epoch = self.backend.setEpoch(), .node_token = 0, .mount_slot = 0 };
         const found = staging.Ring.readMarker(self.backend.pool, root) catch null;
         switch (staging.bindVerdict(found, ours, false)) {
             .absent, .match, .upgrade => {},
@@ -1394,7 +1395,7 @@ pub const DataPlane = struct {
         const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.hash_seed);
         const start = key.xattrKey(ino, h, 0);
         const end = key.xattrKey(ino, h, std.math.maxInt(u8));
-        self.backend.range(self.gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return backend_mod.KvBackend.coreError(e);
+        self.backend.range(self.gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return KvBackend.coreError(e);
         for (kvs.items) |kv| {
             const xv = record.XattrValue.decode(kv.value) catch return error.InputOutput;
             if (std.mem.eql(u8, xv.name, layout.LAYOUT_XATTR_NAME)) {
@@ -1405,7 +1406,7 @@ pub const DataPlane = struct {
     }
 
     fn inodeSize(self: *DataPlane, ino: u64) Error!?u64 {
-        const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return backend_mod.KvBackend.coreError(e)) orelse return null;
+        const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return KvBackend.coreError(e)) orelse return null;
         defer self.gpa.free(bytes);
         const v = record.InodeValue.decode(bytes) catch return error.InputOutput;
         return v.size;
@@ -2000,7 +2001,7 @@ pub const DataPlane = struct {
                     return e;
                 };
             }
-            self.backend.commit(t) catch |e| return backend_mod.KvBackend.coreError(e);
+            self.backend.commit(t) catch |e| return KvBackend.coreError(e);
             kvmap.stats.map_sweep_chunks.inc();
             if (outcome == .done and nlink == 0 and inode != null) kvmap.stats.kvmap_corpses_destroyed.inc();
             self.windows.invalidate(ino);
@@ -2026,7 +2027,7 @@ pub const DataPlane = struct {
         defer tree.deinitKeyValues(gpa, &kvs);
         const start = key.xattrKey(ino, 0, 0);
         const end = key.xattrKey(ino, key.HASH56_MAX, std.math.maxInt(u8));
-        self.backend.range(gpa, key.TREE_XATTRS, &start, &end, 1024, &kvs) catch |e| return backend_mod.KvBackend.coreError(e);
+        self.backend.range(gpa, key.TREE_XATTRS, &start, &end, 1024, &kvs) catch |e| return KvBackend.coreError(e);
         const xkeys = try gpa.alloc([]const u8, kvs.items.len);
         defer gpa.free(xkeys);
         for (kvs.items, 0..) |kv, i| xkeys[i] = kv.key;
@@ -2034,7 +2035,7 @@ pub const DataPlane = struct {
     }
 
     fn inodeRecord(self: *DataPlane, ino: u64) Error!?record.InodeValue {
-        const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return backend_mod.KvBackend.coreError(e)) orelse return null;
+        const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return KvBackend.coreError(e)) orelse return null;
         defer self.gpa.free(bytes);
         return record.InodeValue.decode(bytes) catch return error.InputOutput;
     }
@@ -2432,18 +2433,17 @@ pub const DataPlane = struct {
         try self.forEachLayout(*Derive, &d, Derive.visit);
     }
 
-    /// Every layout record in the xattr tree, in ino order. The walk covers
-    /// the NATIVE slot tree (local inos below the guest namespace base): a
-    /// one-member forest owns no guest slot, and a range whose bounds route
-    /// to two trees is refused by the backend.
+    /// Every layout record of the set, in key-ino order: the store merges
+    /// every slot tree of every member for a range spanning slots (the
+    /// native keyspace first, then the guest keyspaces slot by slot).
     fn forEachLayout(self: *DataPlane, comptime Ctx: type, ctx: Ctx, comptime visit: fn (Ctx, u64, layout.Layout) Error!void) Error!void {
         const gpa = self.gpa;
         var cursor = key.KeyBuf.fromSlice(&key.xattrKey(0, 0, 0));
-        const end = key.xattrKey(key.GUEST_NS_BASE - 1, key.HASH56_MAX, std.math.maxInt(u8));
+        const end = key.xattrKey(std.math.maxInt(u64), key.HASH56_MAX, std.math.maxInt(u8));
         while (true) {
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(gpa, &kvs);
-            self.backend.range(gpa, key.TREE_XATTRS, cursor.slice(), &end, block_refs.SCAN_PAGE, &kvs) catch |e| return backend_mod.KvBackend.coreError(e);
+            self.backend.range(gpa, key.TREE_XATTRS, cursor.slice(), &end, block_refs.SCAN_PAGE, &kvs) catch |e| return KvBackend.coreError(e);
             if (kvs.items.len == 0) return;
             // The slot tree interleaves every ino-major kind: only the
             // xattr records are decoded; the cursor resumes at the next
@@ -2464,7 +2464,7 @@ pub const DataPlane = struct {
             } else if (last_kind == key.TREE_XATTRS) {
                 cursor = key.sameKindSuccessor(last) orelse return;
             } else {
-                if (last_ino >= key.GUEST_NS_BASE - 1) return;
+                if (last_ino == std.math.maxInt(u64)) return;
                 cursor = key.KeyBuf.fromSlice(&key.xattrKey(last_ino + 1, 0, 0));
             }
         }

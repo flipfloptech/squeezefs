@@ -217,11 +217,27 @@ pub const SlotCursor = struct { slot: u16, next_local_ino: u64 };
 
 /// Member `position` of `count` hosts the stride run `{start: position,
 /// stride: count, count: ceil((W − position) / count)}` (charter §5.4 "one
-/// arithmetic-progression run per volume").
+/// arithmetic-progression run per volume"). A singleton run is spelled
+/// with stride 1 — ONE encoding per set (the stride of a one-slot run is
+/// unobservable, and two spellings of one set would break the structural
+/// equality discovery compares).
 pub fn memberRun(position: u16, count: u16) SlotRun {
     std.debug.assert(count >= 1 and position < count);
     const w: u32 = key.FOREST_SLOT_MAX;
-    return .{ .start = position, .stride = count, .count = (w - position + count - 1) / count };
+    const n: u32 = (w - position + count - 1) / count;
+    return .{ .start = position, .stride = if (n == 1) 1 else count, .count = n };
+}
+
+/// The native keyspace law of a v4 set (decision 0002 ledger, the
+/// routing row): the native keyspace `[0, 2^40)` belongs to the member
+/// hosting slot 0 — the root pin (`ino 1 → slot 0`, charter §5.4), so `/`
+/// and every slot-0 record live un-namespaced on ONE member and every
+/// other hosted slot of every member is a guest keyspace. A record's home
+/// is then a pure function of its key (`key_ino >> 40`: 0 = slot 0's
+/// host, `f` = slot `f − 1`'s host) with no per-volume table on the read
+/// path, and no two members can hold one native local.
+pub fn nativeSlotOf(hosts_slot_zero: bool) ?u16 {
+    return if (hosts_slot_zero) 0 else null;
 }
 
 const one_member_runs = [_]SlotRun{memberRun(0, 1)};
@@ -244,8 +260,8 @@ pub const MembershipStamp = struct {
     slot_cursors: []const SlotCursor,
 
     /// A fresh set's member `position` of `count`: epoch 1, its stride run,
-    /// native slot = its position, no cursors. `run` is the caller's storage
-    /// for the one run.
+    /// the native keyspace on the member hosting slot 0 (`nativeSlotOf`),
+    /// no cursors. `run` is the caller's storage for the one run.
     pub fn member(set_uuid: [16]u8, position: u16, count: u16, run: *[1]SlotRun) MembershipStamp {
         run[0] = memberRun(position, count);
         return .{
@@ -254,7 +270,7 @@ pub const MembershipStamp = struct {
             .member_position = position,
             .member_count = count,
             .slots_hosted = .{ .runs = run },
-            .native_slot = position,
+            .native_slot = nativeSlotOf(position == 0),
             .slot_cursors = &.{},
         };
     }
@@ -799,14 +815,20 @@ test "the stamp is ONE fixed layout: a member of 4 with runs and cursors; a nati
         defer got.deinit(testing.allocator);
         try testing.expectEqual(@as(?u16, null), got.membership_stamp.native_slot);
     }
-    // The member constructor: position 1 of 4 hosts {1, 4, 16384}; the
-    // last member of 3 hosts 21845; one member hosts every slot natively.
+    // The member constructor: position 1 of 4 hosts {1, 4, 16384} as a
+    // GUEST-only member (the native keyspace is slot 0's host's); the last
+    // member of 3 hosts 21845; one member hosts every slot natively; a
+    // singleton run (position ≥ W − count) is spelled with stride 1.
     var run: [1]SlotRun = undefined;
     const m = MembershipStamp.member(test_set_uuid, 1, 4, &run);
     try testing.expectEqual(SlotRun{ .start = 1, .stride = 4, .count = 16384 }, m.slots_hosted.runs[0]);
-    try testing.expectEqual(@as(?u16, 1), m.native_slot);
+    try testing.expectEqual(@as(?u16, null), m.native_slot);
     try testing.expectEqual(@as(u64, 1), m.set_epoch);
+    var run0: [1]SlotRun = undefined;
+    try testing.expectEqual(@as(?u16, 0), MembershipStamp.member(test_set_uuid, 0, 4, &run0).native_slot);
     try testing.expectEqual(@as(u32, 21845), memberRun(2, 3).count);
+    try testing.expectEqual(SlotRun{ .start = 0, .stride = 65535, .count = 2 }, memberRun(0, 65535));
+    try testing.expectEqual(SlotRun{ .start = 65534, .stride = 1, .count = 1 }, memberRun(65534, 65535));
     const one = MembershipStamp.oneMember(test_set_uuid);
     try testing.expectEqual(SlotRun{ .start = 0, .stride = 1, .count = 65536 }, one.slots_hosted.runs[0]);
     try testing.expectEqual(@as(usize, 65536), one.slots_hosted.len());

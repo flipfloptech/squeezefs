@@ -51,7 +51,7 @@ const uri = @import("uri.zig");
 const daemon = @import("daemon.zig");
 const fusermount = @import("fusermount.zig");
 const exec = @import("../exec/exec.zig");
-const backend = @import("../meta/backend.zig");
+const meta_set = @import("../meta/meta_set.zig");
 const guard = @import("../meta/guard.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
@@ -100,7 +100,8 @@ const Ctx = struct {
     facts: derive.Facts,
     budget_bytes: u64,
     budget_host: mem_budget.Host,
-    path: []const u8,
+    /// The member paths as spelled (canonical order is discovery's).
+    paths: []const []const u8,
     /// The raw URIs as the operator spelled them (`.config`, `.stats`).
     meta_uri: []const u8,
     data_uri: []const u8,
@@ -146,17 +147,14 @@ const UnmountCtx = struct {
 };
 
 pub fn run(p: cli.Process, m: args.Mount) u8 {
-    // The URI: one member at this rung.
+    // The URI: every member of the set, in any order (discovery orders
+    // them by their stamps).
     var members: [uri.MAX_MEMBERS][]const u8 = undefined;
     var udiag: uri.Refusal = undefined;
     const meta = uri.parse(.meta, m.meta_uri, &members, &udiag) catch {
         p.stderr.print("squeezefs mount: {f}\n", .{udiag}) catch {};
         return cli.exit_usage;
     };
-    if (meta.paths.len != 1) {
-        p.stderr.print("squeezefs mount: {s} names {d} metadata volumes; this rung mounts ONE (a metadata set is rung 5's)\n", .{ m.meta_uri, meta.paths.len }) catch {};
-        return cli.exit_failed;
-    }
     // The mountpoint: an existing directory.
     var mp_buf: [linux.PATH_MAX:0]u8 = undefined;
     const mountpoint = std.fmt.bufPrintSentinel(&mp_buf, "{s}", .{m.mountpoint}, 0) catch {
@@ -235,7 +233,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .facts = facts,
         .budget_bytes = budget_bytes,
         .budget_host = host,
-        .path = meta.first(),
+        .paths = meta.paths,
         .meta_uri = m.meta_uri,
         .data_uri = "",
         .mountpoint = mountpoint,
@@ -252,12 +250,14 @@ fn mountMain(ctx: *Ctx) u8 {
     const io = ctx.sqz.io();
     const facts = ctx.facts;
 
-    // 1. The backend: layer A, the ladder, the lane, the checkpoint task.
-    const be = backend.KvBackend.open(gpa, io, ctx.path, .{
+    // 1. The set: discovery, then every member's ladder, lane and
+    //    checkpoint task in canonical order.
+    const be = meta_set.MetaSet.open(gpa, io, ctx.paths, .{
         .env = env,
         .cache_budget_bytes = node_cache.nodeCacheBudgetFromEnv(env, ctx.budget_bytes),
         .cpus = facts.possible_cpus,
-    }) catch |e| return ctx.failed("cannot open metadata volume {s}: {s} ({t}, {s})", .{ ctx.path, openReason(e), backend.openErrno(e), @tagName(errors.classOf(backend.openCoreError(e))) });
+        .read_only = ctx.opts.read_only,
+    }) catch |e| return ctx.failed("cannot open metadata set {s}: {s} ({t}, {s})", .{ ctx.meta_uri, openReason(e), meta_set.openErrno(e), @tagName(errors.classOf(meta_set.openCoreError(e))) });
     var be_open = true;
     defer if (be_open) be.close();
 
@@ -375,7 +375,7 @@ fn mountMain(ctx: *Ctx) u8 {
     };
 
     // 6. Ready.
-    log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms)", .{ ctx.path, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ctx.opts.ttls.attr_ns / std.time.ns_per_ms, ctx.opts.ttls.entry_ns / std.time.ns_per_ms, ctx.opts.ttls.dir_entry_ns / std.time.ns_per_ms, ctx.opts.ttls.negative_ns / std.time.ns_per_ms });
+    log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms)", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ctx.opts.ttls.attr_ns / std.time.ns_per_ms, ctx.opts.ttls.entry_ns / std.time.ns_per_ms, ctx.opts.ttls.dir_entry_ns / std.time.ns_per_ms, ctx.opts.ttls.negative_ns / std.time.ns_per_ms });
     if (ctx.reporter) |*r| {
         r.ready();
         r.close();
@@ -408,7 +408,7 @@ fn mountMain(ctx: *Ctx) u8 {
     be_open = false;
     be.close();
     if (failed) {
-        log.err("the volume {s} latched FAILED during this mount (EIO until remount) — exiting 1", .{ctx.path});
+        log.err("a member of {s} latched FAILED during this mount (EIO until remount) — exiting 1", .{ctx.meta_uri});
         return cli.exit_failed;
     }
     return cli.exit_ok;
@@ -422,13 +422,13 @@ fn mountMain(ctx: *Ctx) u8 {
 /// ONE resolution order (`SQUEEZEFS_ENCRYPT_KEY_FILE` → the key dir;
 /// `mount` grows `--encrypt-key` with the data plane) and verify its id.
 /// Logs the summary at ready; null = refused (reported).
-fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
+fn loadSetConfig(ctx: *Ctx, be: *meta_set.MetaSet) ?set_config.Config {
     const gpa = ctx.p.gpa;
     const value = be.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch |e| {
-        _ = ctx.failed("cannot read the set_config record of {s}: {s}", .{ ctx.path, @errorName(e) });
+        _ = ctx.failed("cannot read the set_config record of {s}: {s}", .{ ctx.meta_uri, @errorName(e) });
         return null;
     } orelse {
-        _ = ctx.failed("{s} carries no set_config record in its control tree — not member 0 of its set, or formatted before the record existed; reformat", .{ctx.path});
+        _ = ctx.failed("{s}: member 0 carries no set_config record in its control tree — formatted before the record existed; reformat", .{ctx.meta_uri});
         return null;
     };
     defer gpa.free(value);
@@ -437,7 +437,7 @@ fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
         var buf: [512]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         diag.write(&w) catch {};
-        _ = ctx.failed("{s}: {s}", .{ ctx.path, w.buffered() });
+        _ = ctx.failed("{s}: {s}", .{ ctx.meta_uri, w.buffered() });
         return null;
     };
     {
@@ -458,7 +458,7 @@ fn loadSetConfig(ctx: *Ctx, be: *backend.KvBackend) ?set_config.Config {
             o.* = data_superblock.observation(if (opened) |op| op.classified else |e| e);
         }
         var ddiag: set_config.DiscoveryRefusal = undefined;
-        set_config.discover(&cfg, be.mounted.membership_stamp.set_uuid, obs, &ddiag) catch {
+        set_config.discover(&cfg, be.setUuid(), obs, &ddiag) catch {
             var buf: [1024]u8 = undefined;
             var w: Io.Writer = .fixed(&buf);
             ddiag.write(&w) catch {};
@@ -505,8 +505,9 @@ fn dataUriOf(gpa: Allocator, cfg: *const set_config.Config) Allocator.Error![]u8
     return out.toOwnedSlice();
 }
 
-fn openReason(e: backend.OpenError) []const u8 {
+fn openReason(e: meta_set.OpenError) []const u8 {
     return switch (e) {
+        error.SetRefused => "the members do not form one set (see the log: the discovery refusal names the volumes)",
         error.Busy => "another writer holds the single-writer guard (the flock, or a live writer claim — see the log)",
         error.InvalidIdentity => "SQUEEZEFS_HOSTNQN / SQUEEZEFS_HOSTID must be configured as a pair or not at all",
         error.NotFormatted => "not formatted (zeroed superblock) — run `squeezefs format` first",

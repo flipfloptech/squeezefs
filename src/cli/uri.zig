@@ -29,6 +29,11 @@ pub const Scheme = enum {
 /// the fixed parse buffer small and names the limit in the refusal.
 pub const MAX_MEMBERS: usize = 64;
 
+comptime {
+    // The set facade sizes its per-mint scratch from the same bound.
+    std.debug.assert(MAX_MEMBERS == @import("../meta/routing/route_table.zig").MAX_VOLUMES);
+}
+
 pub const Refusal = union(enum) {
     wrong_scheme: struct { want: Scheme, got: []const u8 },
     empty_path: Scheme,

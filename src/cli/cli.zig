@@ -33,6 +33,7 @@ pub const df = if (is_linux) @import("df.zig") else struct {};
 pub const clone = if (is_linux) @import("clone.zig") else struct {};
 pub const config_verb = if (is_linux) @import("config_verb.zig") else struct {};
 pub const staging_verb = if (is_linux) @import("staging_verb.zig") else struct {};
+pub const volume = if (is_linux) @import("volume.zig") else struct {};
 /// Portable planning + a Linux engine (its own gate inside).
 pub const tune = @import("tune.zig");
 pub const bench = @import("bench.zig");
@@ -93,6 +94,7 @@ pub fn run(p: Process) u8 {
         .config => |c| return if (is_linux) config_verb.run(p, c) else linuxOnly(p, "config"),
         .staging => |s| return if (is_linux) staging_verb.run(p, s) else linuxOnly(p, "staging"),
         .claim_clear => |c| return if (is_linux) claim.run(p, c) else linuxOnly(p, "claim clear"),
+        .volume => |v| return if (is_linux) volume.run(p, v) else linuxOnly(p, "volume"),
     }
 }
 
@@ -132,6 +134,7 @@ test {
         _ = clone;
         _ = config_verb;
         _ = staging_verb;
+        _ = volume;
         _ = bench_smoke;
     }
 }

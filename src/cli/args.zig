@@ -116,6 +116,25 @@ pub const ClaimClear = struct {
     meta_uri: []const u8,
 };
 
+/// `--take-slots k | s1,s2,…` (`add-meta`): a count or an explicit list.
+pub const TakeSlots = union(enum) {
+    count: u32,
+    /// The raw comma list; the verb parses each member as a slot id.
+    list: []const u8,
+};
+
+/// `volume {list, add-meta, remove-meta, repair-set, migrate-meta-slot}`
+/// (charter §8; `docs/porting/dynamic_routing.md` §3, §4): every verb takes
+/// the set's `sqmeta://` URI (`add-meta`/`remove-meta` name the device
+/// too); the online engine's verb takes the slot and the target member.
+pub const Volume = union(enum) {
+    list: struct { meta_uri: []const u8 },
+    add_meta: struct { meta_uri: []const u8, device: []const u8, take: TakeSlots },
+    remove_meta: struct { meta_uri: []const u8, victim: []const u8 },
+    repair_set: struct { meta_uri: []const u8 },
+    migrate_meta_slot: struct { meta_uri: []const u8, slot: u16, target: u16 },
+};
+
 /// `bench` (stats_cli.md §3): the shape vocabulary `threads × files × size
 /// @ block`; null = auto-derived from the mount's geometry; the bare
 /// invocation (no phase flag) runs the saturation suite.
@@ -161,6 +180,7 @@ pub const Verb = union(enum) {
     config: Config,
     staging: Staging,
     claim_clear: ClaimClear,
+    volume: Volume,
 };
 
 pub const Refusal = union(enum) {
@@ -196,6 +216,8 @@ pub const Refusal = union(enum) {
     /// `bench`: a size word that is not `<int>[k|m|g|t]`.
     bad_size: struct { flag: []const u8, word: []const u8 },
     bench_suite_with_shape: []const u8,
+    /// `--take-slots` neither a count nor a comma list of slot ids.
+    bad_take_slots: []const u8,
 
     pub fn format(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -223,6 +245,7 @@ pub const Refusal = union(enum) {
             .unknown_subverb => |u| try w.print("{s}: '{s}' is not a sub-verb", .{ u.verb, u.word }),
             .bad_size => |b| try w.print("bench: {s} '{s}' is not a size (<integer>[k|m|g|t], ≥ 1)", .{ b.flag, b.word }),
             .bench_suite_with_shape => |f| try w.print("bench: '{s}' needs a phase flag (-w/-r/--stat/--del) — the bare invocation runs the fixed saturation suite", .{f}),
+            .bad_take_slots => |t| try w.print("volume add-meta: --take-slots '{s}' is neither a count (≥ 1) nor a comma list of slot ids (each < 65536)", .{t}),
         }
     }
 };
@@ -246,6 +269,11 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs staging list [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs staging promote sqmeta://<path>
         \\  squeezefs claim clear sqmeta://<path>
+        \\  squeezefs volume list sqmeta://<path>[,…]
+        \\  squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>
+        \\  squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>
+        \\  squeezefs volume repair-set sqmeta://<path>[,…]
+        \\  squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>
         \\  squeezefs bench [-w] [-r] [--stat] [--del] [-t N] [-n N] [-s SIZE] [-b SIZE] [--rand] [--direct] [--time S] [-i N] [--abba] [--json] [--smoke] <mountpoint>
         \\  squeezefs --version
         \\
@@ -263,6 +291,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]\n",
         .staging => "usage: squeezefs staging list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs staging promote sqmeta://<path>\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
+        .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n",
         .bench => "usage: squeezefs bench [-w] [-r] [--stat] [--del] [-t THREADS] [-n FILES] [-s SIZE] [-b BLOCK] [--rand] [--direct] [--time SECS] [-i ITERATIONS] [--abba] [--json] [--smoke] <mountpoint>\n",
         .version, .help => all,
     };
@@ -390,6 +419,7 @@ pub fn parse(argv: []const []const u8, diag: *Refusal) Error!Verb {
     if (std.mem.eql(u8, verb, "config")) return parseConfig(words, diag);
     if (std.mem.eql(u8, verb, "staging")) return parseStaging(words, diag);
     if (std.mem.eql(u8, verb, "claim")) return parseClaim(words, diag);
+    if (std.mem.eql(u8, verb, "volume")) return parseVolume(words, diag);
     if (std.mem.eql(u8, verb, "bench")) return parseBench(words, diag);
     diag.* = .{ .unknown_verb = verb };
     return error.Refused;
@@ -576,6 +606,130 @@ fn parseClaim(words: []const []const u8, diag: *Refusal) Error!Verb {
     const target = try exactlyOne(&c, "the sqmeta:// volume");
     try checkUri(.meta, target, diag);
     return .{ .claim_clear = .{ .meta_uri = target } };
+}
+
+fn parseVolume(words: []const []const u8, diag: *Refusal) Error!Verb {
+    const sub = try subverb("volume", words, diag);
+    const rest = words[1..];
+    if (std.mem.eql(u8, sub, "list") or std.mem.eql(u8, sub, "repair-set")) {
+        const is_list = std.mem.eql(u8, sub, "list");
+        var c: Cursor = .{ .verb = if (is_list) "volume list" else "volume repair-set", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const target = try exactlyOne(&c, "the sqmeta:// set");
+        try checkUri(.meta, target, diag);
+        return .{ .volume = if (is_list) .{ .list = .{ .meta_uri = target } } else .{ .repair_set = .{ .meta_uri = target } } };
+    }
+    if (std.mem.eql(u8, sub, "add-meta")) {
+        var c: Cursor = .{ .verb = "volume add-meta", .words = rest, .diag = diag };
+        var take: ?TakeSlots = null;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--take-slots")) {
+                const raw = try c.value(f);
+                take = parseTakeSlots(raw) orelse {
+                    diag.* = .{ .bad_take_slots = raw };
+                    return error.Refused;
+                };
+            } else return c.unknown(f);
+        }
+        const pos = c.pos();
+        if (pos.len < 1) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the sqmeta:// set" } };
+            return error.Refused;
+        }
+        try checkUri(.meta, pos[0], diag);
+        if (pos.len < 2) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the device to add (an absolute path)" } };
+            return error.Refused;
+        }
+        if (pos.len > 2) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[2] } };
+            return error.Refused;
+        }
+        if (pos[1].len == 0 or pos[1][0] != '/') {
+            diag.* = .{ .bad_target = pos[1] };
+            return error.Refused;
+        }
+        return .{ .volume = .{ .add_meta = .{ .meta_uri = pos[0], .device = pos[1], .take = take orelse {
+            diag.* = .{ .missing_value = .{ .verb = c.verb, .flag = "--take-slots" } };
+            return error.Refused;
+        } } } };
+    }
+    if (std.mem.eql(u8, sub, "remove-meta")) {
+        var c: Cursor = .{ .verb = "volume remove-meta", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const pos = c.pos();
+        if (pos.len < 1) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the sqmeta:// set" } };
+            return error.Refused;
+        }
+        try checkUri(.meta, pos[0], diag);
+        if (pos.len < 2) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the victim device (an absolute path)" } };
+            return error.Refused;
+        }
+        if (pos.len > 2) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[2] } };
+            return error.Refused;
+        }
+        if (pos[1].len == 0 or pos[1][0] != '/') {
+            diag.* = .{ .bad_target = pos[1] };
+            return error.Refused;
+        }
+        return .{ .volume = .{ .remove_meta = .{ .meta_uri = pos[0], .victim = pos[1] } } };
+    }
+    if (std.mem.eql(u8, sub, "migrate-meta-slot")) {
+        var c: Cursor = .{ .verb = "volume migrate-meta-slot", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const pos = c.pos();
+        if (pos.len < 1) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the sqmeta:// set" } };
+            return error.Refused;
+        }
+        try checkUri(.meta, pos[0], diag);
+        if (pos.len < 2) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the slot (0..65535)" } };
+            return error.Refused;
+        }
+        if (pos.len < 3) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the target member index" } };
+            return error.Refused;
+        }
+        if (pos.len > 3) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[3] } };
+            return error.Refused;
+        }
+        const slot = try parseIntWord(diag, "slot", pos[1], 0, std.math.maxInt(u16));
+        const target = try parseIntWord(diag, "target member index", pos[2], 0, uri.MAX_MEMBERS - 1);
+        return .{ .volume = .{ .migrate_meta_slot = .{ .meta_uri = pos[0], .slot = @intCast(slot), .target = @intCast(target) } } };
+    }
+    diag.* = .{ .unknown_subverb = .{ .verb = "volume", .word = sub } };
+    return error.Refused;
+}
+
+/// A positional integer through the ONE parser.
+fn parseIntWord(diag: *Refusal, what: []const u8, word: []const u8, lo: u32, hi: u32) Error!u32 {
+    return switch (knobs.parseIntIn(u32, what, word, lo, hi)) {
+        .value => |v| v,
+        .absent => blk: {
+            diag.* = .{ .missing_positional = .{ .verb = "volume", .what = what } };
+            break :blk error.Refused;
+        },
+        .invalid => |d| blk: {
+            diag.* = .{ .bad_int = d };
+            break :blk error.Refused;
+        },
+    };
+}
+
+/// `K` (≥ 1) or `s1,s2,…` (each a slot id < 65536; a list of one is a list).
+pub fn parseTakeSlots(raw: []const u8) ?TakeSlots {
+    if (raw.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, raw, ',') == null) {
+        if (std.fmt.parseInt(u32, raw, 10)) |k| return if (k >= 1) .{ .count = k } else null else |_| return null;
+    }
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |m| _ = std.fmt.parseInt(u16, m, 10) catch return null;
+    return .{ .list = raw };
 }
 
 /// `<integer>[k|m|g|t]` (powers of 1024), ≥ 1.

@@ -110,6 +110,8 @@ const guard_claim = @import("../../meta/guard/claim.zig");
 const virtual_inodes = @import("virtual_inodes.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
+const route_table = @import("../../meta/routing/route_table.zig");
+const slot_gate = @import("../../meta/routing/slot_gate.zig");
 const layout = @import("../../data/layout.zig");
 const staging = @import("../../data/staging.zig");
 const block_refs = @import("../../data/block_refs.zig");
@@ -248,7 +250,7 @@ pub const VirtualFace = struct {
 
 pub fn assertStore(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "allocateIno", "nextIno", "hashSeed", "nodeSize", "space", "isFailed" }) |name| {
+        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "allocateIno", "allocatedInos", "newPass", "gateEnter", "hashSeed", "nodeSize", "space", "isFailed" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Store: lacks `" ++ name ++ "`");
         }
     }
@@ -275,15 +277,19 @@ pub const Options = struct {
     gid: u32 = 0,
 };
 
-/// A held 4a set travelling with a transaction.
+/// A held 4a set travelling with a transaction, and the cutover-gate
+/// entries the op took BEFORE it (charter §5.4: parked ops hold nothing);
+/// both drop at the terminal outcome.
 const HeldGuards = struct {
     gpa: Allocator,
     io: Io,
     set: dlm.GuardSet,
+    pass: slot_gate.Pass,
 
     fn releaseFn(ctx: *anyopaque) void {
         const self: *HeldGuards = @ptrCast(@alignCast(ctx));
         self.set.release(self.io);
+        self.pass.exit(self.io);
         self.gpa.destroy(self);
     }
 
@@ -498,7 +504,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const entry = try self.createChild(c, dest_parent, dest_name, .{ .mode = (sv.mode & 0o7777) | S.IFREG });
             const dest = try localOf(entry.nodeid);
             const t = try self.beginExclusive(dest, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             var dv = try self.readInode(dest);
             var shared: u64 = 0;
             var inline_bytes: u64 = 0;
@@ -523,6 +530,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             dv.mtime = stamp;
             dv.ctime = stamp;
             try t.stagePut(key.TREE_INODES, &key.inodeKey(dest), &dv.encode());
+            t_owned = false;
             try self.commit(c, t);
             _ = self.pending.retire(dest);
             self.data.noteShape(dest, sv.size, kind);
@@ -539,17 +547,20 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return Store.coreError(e);
         }
 
+        /// A key ino → its global (`route_table.globalOfEffective`).
         fn globalOf(local: u64) u64 {
-            return inos.makeGlobalIno(local, 0, inos.ROUTING_WIDTH);
+            return route_table.globalOfEffective(local);
         }
 
-        /// A kernel nodeid → this volume's local ino. A nodeid routing to a
-        /// slot this single volume does not hold (garbage, or another set's
-        /// ino) is ENOENT — never an alias of a real local record.
+        /// A kernel nodeid → the KEY ino its records live under (charter
+        /// §5.4; `route_table.effectiveIno`: slot 0 the native keyspace,
+        /// every other slot its guest keyspace — a pure law, so the key
+        /// stays valid across a slot flip; the store resolves the member).
+        /// A nodeid outside the mint's space (garbage, another set's ino)
+        /// is ENOENT — never an alias of a real record.
         pub fn localOf(global: u64) Error!u64 {
-            const r = inos.routeIno(global, inos.ROUTING_WIDTH);
-            if (r.slot != 0) return error.FileNotFound;
-            return r.local;
+            if (!route_table.isRoutable(global)) return error.FileNotFound;
+            return route_table.effectiveIno(global);
         }
 
         fn checkName(name: []const u8) Error!void {
@@ -707,10 +718,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try t.stagePut(key.TREE_XATTRS, k, enc);
         }
 
+        /// The cutover gate for every slot the plan names, THEN the 4a set
+        /// (charter §2 lock order: a parked op holds no guard).
         fn lockPlan(self: *Self, plan: *const economy.GuardPlan) Error!*HeldGuards {
             const held = try self.gpa.create(HeldGuards);
             errdefer self.gpa.destroy(held);
-            held.* = .{ .gpa = self.gpa, .io = self.io, .set = undefined };
+            held.* = .{ .gpa = self.gpa, .io = self.io, .set = undefined, .pass = self.store.newPass() };
+            var effs: [dlm.max_requests]u64 = undefined;
+            for (plan.inodes(), 0..) |r, i| effs[i] = r.ino;
+            self.store.gateEnter(&held.pass, effs[0..plan.inodes().len]);
+            errdefer held.pass.exit(self.io);
             held.set = self.locks.lockManyUncancelable(self.io, plan.inodes(), plan.dentries()) catch return error.InvalidArgument;
             return held;
         }
@@ -1122,8 +1139,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var trace = op_trace.OpTrace.begin(0, .other);
             defer trace.finish();
             var ctx: Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            // The whole ino-major space: the store merges every slot tree
+            // of every member in key order (native locals first, then the
+            // guest keyspaces slot by slot).
             var cursor = key.KeyBuf.fromSlice(&key.inodeKey(0));
-            const end = key.inodeKey(key.GUEST_NS_BASE - 1);
+            const end = key.inodeKey(std.math.maxInt(u64));
             var batch: [RECLAIM_BATCH]u64 = undefined;
             var n: usize = 0;
             var destroyed: u64 = 0;
@@ -1149,7 +1169,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
                 if (kvs.items.len < SWEEP_PAGE) break;
                 const last_ino = std.mem.readInt(u64, kvs.items[kvs.items.len - 1].key[0..8], .big);
-                if (last_ino >= key.GUEST_NS_BASE - 1) break;
+                if (last_ino == std.math.maxInt(u64)) break;
                 cursor = key.KeyBuf.fromSlice(&key.inodeKey(last_ino + 1));
             }
             if (n > 0) {
@@ -1231,7 +1251,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             defer gpa.free(ranges);
             for (ranges) |rg| {
                 const t = try self.store.begin(@src());
-                errdefer self.store.abandon(t);
+                var t_owned = true;
+                errdefer if (t_owned) self.store.abandon(t);
+                // Every corpse's part is complete on its own member.
+                t.cross = .independent;
                 var destroyed: u64 = 0;
                 for (plans.items[rg.start..rg.end]) |*p| {
                     var xkeys: [1024][]const u8 = undefined;
@@ -1243,6 +1266,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     _ = self.pending.retire(p.ino);
                     destroyed += 1;
                 }
+                t_owned = false;
                 try self.commit(c, t);
                 for (plans.items[rg.start..rg.end]) |*p| {
                     self.afterCommit(&p.after);
@@ -1271,8 +1295,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 defer self.freeLayout(fresh);
                 if (fresh) |cur| if (cur.layout.isKvmap() and !(cur.layout.kvmapHead().?.sweep == 0 and cur.layout.size == 0)) {
                     const t = try self.store.begin(@src());
-                    errdefer self.store.abandon(t);
+                    var t_owned = true;
+                    errdefer if (t_owned) self.store.abandon(t);
                     try self.data.stageKvmapCorpse(t, ino, cur.layout, cur.coll_seq);
+                    t_owned = false;
                     try self.commit(c, t);
                 };
             }
@@ -1315,7 +1341,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 layout_lock = self.data.lockLayout(self.io, local);
             }
             const t = try self.beginExclusive(local, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             const stored = try self.readInode(local);
             if (a.attr.size) |sz| {
                 old_size = stored.size;
@@ -1326,6 +1353,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (req.mode) |m| req.mode = (stored.mode & S.IFMT) | (m & ~@as(u32, S.IFMT));
             var out = try economy.stageSetattr(t, &self.pending, local, stored, req, now());
             if (out.verdict == .absorbed) {
+                t_owned = false;
                 self.store.abandon(t);
                 if (layout_lock) |g| g.release(self.io);
                 layout_lock = null;
@@ -1339,6 +1367,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &v.encode());
                 }
             }
+            t_owned = false;
             try self.commit(c, t);
             if (layout_lock) |g| g.release(self.io);
             layout_lock = null;
@@ -1378,14 +1407,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             plan.dentry_len = 1;
             const held = try self.lockPlan(&plan);
             const t = try self.beginWith(held, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             const pv = try self.readDir(parent);
             var chain: ChainBuf = .{};
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             if (try self.scanChain(parent, name, &chain, &kvs) != null) return error.PathAlreadyExists;
-            const local = self.store.allocateIno();
+            const local = self.store.allocateIno(parent, &held.pass, false) catch |e| return storeErr(e);
             const global = globalOf(local);
+            // The child may live on another member (mint spread): its inode
+            // lands first, the dentry second.
+            t.cross = .{ .child_first = local };
             const stamp = now();
             const out = if (child.target) |target|
                 economy.stageSymlink(t, .{ .hash_seed = self.store.hashSeed(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice() }) catch |e| return switch (e) {
@@ -1399,6 +1432,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     error.DentryChainOverflow => error.NoSpaceLeft,
                     error.OutOfMemory => error.OutOfMemory,
                 };
+            t_owned = false;
             try self.commit(c, t);
             if (is_dir) self.rememberParent(global, parent_global);
             if (child.mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
@@ -1440,7 +1474,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             plan.dentry_len = 1;
             const held = try self.lockPlan(&plan);
             const t = try self.beginWith(held, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             // Revalidate under the guards: the same name still names the same child.
             const found = (try self.findDentry(parent, name)) orelse return error.FileNotFound;
             if (found.global != probe.global) return error.FileNotFound;
@@ -1449,6 +1484,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const pv: ?InodeValue = if (shared) null else try self.readDir(parent);
             const req: economy.Unlink = .{ .now = now(), .parent = parent, .name = name, .pos = found.pos, .child = found.local, .child_value = cv, .is_dir = want_dir, .parent_value = pv };
             _ = if (want_dir) try economy.stageRmdir(t, req) else try economy.stageUnlink(t, req);
+            // The name goes first, the child's nlink second (a crash leaves
+            // a stale nlink, never a name without a record).
+            t.cross = .{ .parent_first = found.local };
+            t_owned = false;
             try self.commit(c, t);
             if (want_dir) self.forgetParent(found.global);
         }
@@ -1490,7 +1529,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             plan.dentry_len = 2;
             const held = try self.lockPlan(&plan);
             const t = try self.beginWith(held, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             // Phase 2: revalidate and read under the guards.
             var old_chain: ChainBuf = .{};
             var old_kvs: std.ArrayList(tree.KeyValue) = .empty;
@@ -1515,9 +1555,16 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const dest_has_entries = if (new) |n| (n.isDir() and try self.dirHasEntries(n.local)) else false;
             var wo: ?economy.Whiteout = null;
             if (whiteout) {
-                const l = self.store.allocateIno();
+                // On the old parent's member: the op stays on two members
+                // at most (the dentries' and the moved inode's).
+                const l = self.store.allocateIno(old_parent, &held.pass, true) catch |e| return storeErr(e);
                 wo = .{ .local = l, .global = globalOf(l) };
             }
+            // Both parents' dentries first, the moved inode's Δctime
+            // second; two parents on different members have no order the
+            // facade can offer and answer EXDEV (the symmetric plane's
+            // cross-owner intents are rung 6's).
+            t.cross = .{ .parent_first = old.local };
             _ = economy.stageRename(t, .{
                 .hash_seed = self.store.hashSeed(),
                 .now = now(),
@@ -1546,6 +1593,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.DentryChainOverflow => error.NoSpaceLeft,
                 error.OutOfMemory => error.OutOfMemory,
             };
+            t_owned = false;
             try self.commit(c, t);
             if (old.isDir()) self.rememberParent(old.global, a.newparent);
             if (new) |n| {
@@ -1568,7 +1616,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             plan.dentry_len = 1;
             const held = try self.lockPlan(&plan);
             const t = try self.beginWith(held, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             const pv = try self.readDir(parent);
             const cv = try self.readInode(child);
             if (economy.isDirMode(cv.mode)) return error.AccessDenied;
@@ -1582,6 +1631,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.DentryChainOverflow => error.NoSpaceLeft,
                 error.OutOfMemory => error.OutOfMemory,
             };
+            t.cross = .{ .child_first = child };
+            t_owned = false;
             try self.commit(c, t);
             _ = self.pending.retire(child);
             return self.entryOf(a.ino, out.child);
@@ -1611,7 +1662,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
                 errdefer if (layout_lock) |g| g.release(self.io);
                 const t = try self.beginExclusive(local, @src());
-                errdefer self.store.abandon(t);
+                var t_owned = true;
+                errdefer if (t_owned) self.store.abandon(t);
                 var stored = try self.readInode(local);
                 try self.stageTruncate(c, t, local, stored, 0, &after);
                 stored.size = 0;
@@ -1620,6 +1672,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 stored.ctime = stamp;
                 if (a.open_flags & abi.FUSE_OPEN_KILL_SUIDGID != 0) try self.killpriv(t, local, &stored);
                 try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &stored.encode());
+                t_owned = false;
                 try self.commit(c, t);
                 layout_lock.?.release(self.io);
                 layout_lock = null;
@@ -1700,7 +1753,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn writeInline(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64) Error!filesystem.Written {
             const data = try self.payloadBytes(a);
             const t = try self.beginExclusive(local, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
             if (v.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             // The new image: the old bytes zero-extended to max(old, end), the write overlaid.
@@ -1714,6 +1768,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const size = @max(v.size, end);
             try self.publish(t, local, rec, Layout.inlineData(size, buf), &.{});
             try self.stageInodePostlude(t, local, &v, size, a.write_flags);
+            t_owned = false;
             try self.commit(c, t);
             _ = self.pending.retire(local);
             self.data.noteShape(local, size, .inline_);
@@ -1742,10 +1797,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var after: AfterCommit = .{};
             if (!keep_identity) noteDisplaced(local, rec, &after);
             const t = try self.beginExclusive(local, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
             try self.publish(t, local, rec, Layout.staged(size, file_id, null), &.{});
             try self.stageInodePostlude(t, local, &v, size, a.write_flags);
+            t_owned = false;
             self.commit(c, t) catch |e| {
                 self.data.releaseStaged(k, generation);
                 return e;
@@ -1792,10 +1849,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // The postlude: SIZE NEVER LEADS DATA — the claim lands after the
             // pieces were acked by their arms.
             const t = try self.beginExclusive(local, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
             const size = @max(v.size, outcome.size_claim);
             try self.stageInodePostlude(t, local, &v, size, a.write_flags);
+            t_owned = false;
             try self.commit(c, t);
             _ = self.pending.retire(local);
             self.data.noteShape(local, size, .striped);
@@ -1822,9 +1881,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             errdefer if (ob) |o| self.data.abandonOwnBlock(o);
             noteDisplaced(local, rec, &after);
             const t = try self.beginExclusive(local, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             const proofs: []const layout.DmaProof = if (ob) |o| &.{o.proof} else &.{};
             try self.publish(t, local, rec, Layout.stripedInline(size, entries[0..n_entries]), proofs);
+            t_owned = false;
             try self.commit(c, t);
             self.afterCommit(&after);
             fuse_write_promotions_to_striped.inc();
@@ -1991,7 +2052,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// inode population (minted − destroyed, + the root), published as
         /// `live_inodes`.
         pub fn statfs(self: *Self, _: *Ctx, _: filesystem.StatfsArgs) Error!filesystem.Statfs {
-            const used_inos = inos.publishLiveInodes(&.{inos.liveInodes(self.store.nextIno(), &.{}, self.destroys.load())});
+            const used_inos = inos.publishLiveInodes(&.{self.store.allocatedInos() -| self.destroys.load()});
             var total: u64 = 0;
             var free: u64 = 0;
             if (self.data.statfs()) |sp| {
@@ -2021,7 +2082,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (a.value.len > record.xattrValueCap(self.store.nodeSize())) return error.ValueTooLarge;
             const local = try localOf(a.ino);
             const t = try self.beginExclusive(local, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
             const k = try self.xattrKeyFor(local, a.name);
             if (k.existing) |e| self.gpa.free(e);
@@ -2030,6 +2092,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try self.stageXattrPut(t, &k.k, a.name, a.value);
             v.ctime = now();
             try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &v.encode());
+            t_owned = false;
             try self.commit(c, t);
             _ = self.pending.retire(local);
         }
@@ -2079,7 +2142,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try screenXattr(a.name, error.PermissionDenied);
             const local = try localOf(a.ino);
             const t = try self.beginExclusive(local, @src());
-            errdefer self.store.abandon(t);
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
             var occ: [256]u8 = undefined;
             var n: usize = 0;
@@ -2088,6 +2152,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try t.stageDelete(key.TREE_XATTRS, &hit.k);
             v.ctime = now();
             try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &v.encode());
+            t_owned = false;
             try self.commit(c, t);
             _ = self.pending.retire(local);
         }
@@ -2219,11 +2284,15 @@ pub const MemStore = struct {
     node_size_: usize = 65536,
     commits: u64 = 0,
     fsyncs: u64 = 0,
+    /// The cutover gate every op passes (never closed here: the one-store
+    /// set has no migration).
+    gates: slot_gate.SlotGates,
 
     const Row = struct { kind: u8, k: []u8, v: []u8 };
 
     pub fn init(gpa: Allocator) Allocator.Error!MemStore {
-        var self: MemStore = .{ .gpa = gpa };
+        var self: MemStore = .{ .gpa = gpa, .gates = try slot_gate.SlotGates.init(gpa) };
+        errdefer self.gates.deinit();
         // The root directory, as `format` writes it.
         const root: InodeValue = .{ .mode = S.IFDIR | 0o755, .nlink = 2, .atime = 1, .mtime = 1, .ctime = 1 };
         try self.upsert(key.TREE_INODES, &key.inodeKey(inos.ROOT_INO), &root.encode());
@@ -2236,6 +2305,7 @@ pub const MemStore = struct {
             self.gpa.free(r.v);
         }
         self.entries.deinit(self.gpa);
+        self.gates.deinit();
     }
 
     pub fn coreError(e: StoreError) errors.Error {
@@ -2346,7 +2416,9 @@ pub const MemStore = struct {
         self.fsyncs += 1;
     }
 
-    pub fn allocateIno(self: *MemStore) u64 {
+    /// One store, one keyspace: the parent and the gate are the set
+    /// facade's concerns; every mint is slot 0's.
+    pub fn allocateIno(self: *MemStore, _: u64, _: *slot_gate.Pass, _: bool) StoreError!u64 {
         self.lock.lock();
         defer self.lock.unlock();
         const i = self.next_ino;
@@ -2354,9 +2426,18 @@ pub const MemStore = struct {
         return i;
     }
 
-    pub fn nextIno(self: *const MemStore) u64 {
-        return self.next_ino;
+    pub fn allocatedInos(self: *MemStore) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.next_ino - inos.LOCAL_INO_BASE;
     }
+
+    pub fn newPass(self: *MemStore) slot_gate.Pass {
+        return slot_gate.Pass.init(&self.gates);
+    }
+
+    /// No slot ever migrates out of the one store: nothing to enter.
+    pub fn gateEnter(_: *MemStore, _: *slot_gate.Pass, _: []const u64) void {}
 
     pub fn hashSeed(self: *const MemStore) u64 {
         return self.seed;

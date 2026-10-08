@@ -367,14 +367,15 @@ pub const WarmLadder = struct {
 
     /// `probe_read(ctx, req, window)`: a served window, an fd-source for a
     /// pinned pool view (the hook releases the pin at the CQE), EOF, or a
-    /// decline.
-    pub fn probeRead(self: *WarmLadder, req: fsv.Request, window: []u8) ?fsv.ProbeReply {
+    /// decline. `ino` is the request's KEY ino (the binding routes the
+    /// kernel nodeid; the plane's tables never see a nodeid).
+    pub fn probeRead(self: *WarmLadder, ino: u64, req: fsv.Request, window: []u8) ?fsv.ProbeReply {
         const in = switch (req.op) {
             .read => |r| r,
             else => return null,
         };
         const o_direct: u32 = @bitCast(linux.O{ .DIRECT = true });
-        return switch (self.probe(req.nodeid(), in.offset, in.size, in.flags & o_direct != 0, window)) {
+        return switch (self.probe(ino, in.offset, in.size, in.flags & o_direct != 0, window)) {
             .served => |s| blk: {
                 if (s.view) |view| {
                     const pinned = s.pinned.?;
@@ -398,14 +399,14 @@ pub const WarmLadder = struct {
         };
     }
 
-    /// `direct_leg(ctx, req)`.
-    pub fn directLegFor(self: *WarmLadder, req: fsv.Request) ?fsv.DirectLeg {
+    /// `direct_leg(ctx, req)` for the request's KEY ino `ino`.
+    pub fn directLegFor(self: *WarmLadder, ino: u64, req: fsv.Request) ?fsv.DirectLeg {
         const in = switch (req.op) {
             .read => |r| r,
             else => return null,
         };
         const o_direct: u32 = @bitCast(linux.O{ .DIRECT = true });
-        return self.directLeg(req.nodeid(), in.offset, in.size, in.flags & o_direct != 0);
+        return self.directLeg(ino, in.offset, in.size, in.flags & o_direct != 0);
     }
 };
 

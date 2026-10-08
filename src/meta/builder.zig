@@ -575,6 +575,152 @@ pub const TreeWriter = struct {
 };
 
 // ---------------------------------------------------------------------------
+// §3.3 StreamWriter — the same packing over a record STREAM (the online
+// slot-tree copy, charter §5.4: a slot IS a tree, so bulk copy = build the
+// target tree bottom-up from the source's leaf snapshots; images go to the
+// device as they fill, never held whole in RAM).
+// ---------------------------------------------------------------------------
+
+/// Where a built image goes: the migration engine binds the target
+/// volume's node loader (one synchronous device write per node).
+pub const ImageSink = struct {
+    ctx: *anyopaque,
+    write: *const fn (ctx: *anyopaque, addr: u64, image: []const u8) anyerror!void,
+};
+
+/// A node-seq mint: the target volume's shared handle (a private counter
+/// would collide with the SMOs minting beside the copy).
+pub const SeqMint = struct {
+    ctx: *anyopaque,
+    mint: *const fn (ctx: *anyopaque) anyerror!u64,
+};
+
+pub const StreamError = WriteError || error{ SinkFailed, SeqMintFailed };
+
+/// Leaves are emitted as the ¾ budget fills (`chunkByEncodedLen`'s law, one
+/// record at a time); `finish` closes the last leaf at `KEY_SPACE_MAX` and
+/// packs the interior levels from the leaves' separators (one `KeyBuf`
+/// per leaf in RAM — the only state that grows with the tree). Keys must
+/// arrive ascending. The result is byte-for-byte the tree `TreeWriter.
+/// writeTree` would pack from the same records (the tie test).
+pub const StreamWriter = struct {
+    gpa: Allocator,
+    layout: NodeLayout,
+    heap_base: u64,
+    alloc: *const alloc_ext.ExtentAllocator,
+    tree_id: u8,
+    sink: ImageSink,
+    seq: SeqMint,
+    budget: usize,
+    /// The open leaf's records (owned copies).
+    pending: std.ArrayList(Record) = .empty,
+    pending_bytes: usize = 0,
+    /// The leaf's min key: `""` for the first, `successor(prev.max)` after.
+    min_key: key.KeyBuf = .{},
+    leaves: std.ArrayList(LevelNode) = .empty,
+    records_written: u64 = 0,
+    nodes_written: u64 = 0,
+    /// The highest node seq minted (the target's watermark input).
+    seq_high: u64 = 0,
+    last_key: ?key.KeyBuf = null,
+
+    pub fn init(gpa: Allocator, layout: NodeLayout, heap_base: u64, alloc: *const alloc_ext.ExtentAllocator, tree_id: u8, sink: ImageSink, seq: SeqMint) StreamWriter {
+        return .{ .gpa = gpa, .layout = layout, .heap_base = heap_base, .alloc = alloc, .tree_id = tree_id, .sink = sink, .seq = seq, .budget = usableBudgetOf(layout) };
+    }
+
+    pub fn deinit(self: *StreamWriter) void {
+        freeRecords(self.gpa, &self.pending);
+        self.leaves.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// One record (seq 0, a `Put`): queued into the open leaf; a leaf that
+    /// would overflow the budget is written first.
+    pub fn append(self: *StreamWriter, k: []const u8, value: []const u8) StreamError!void {
+        if (self.last_key) |lk| assert(key.lessThan(lk.slice(), k));
+        self.last_key = key.KeyBuf.fromSlice(k);
+        const r = try Record.put(self.gpa, k, 0, value);
+        errdefer {
+            var tmp = r;
+            tmp.deinit(self.gpa);
+        }
+        const len = r.ref().encodedLen();
+        if (self.pending_bytes + len > self.budget and self.pending.items.len > 0) try self.flushLeaf(false);
+        try self.pending.append(self.gpa, r);
+        self.pending_bytes += len;
+    }
+
+    fn flushLeaf(self: *StreamWriter, last: bool) StreamError!void {
+        const max_key: key.KeyBuf = if (last) key.KeyBuf.fromSlice(&key.KEY_SPACE_MAX) else key.KeyBuf.fromSlice(self.pending.items[self.pending.items.len - 1].key);
+        const refs = try self.gpa.alloc(RecordRef, self.pending.items.len);
+        defer self.gpa.free(refs);
+        for (self.pending.items, refs) |*r, *o| o.* = r.ref();
+        const n = try self.writeNode(0, self.min_key.slice(), max_key.slice(), refs);
+        try self.leaves.append(self.gpa, n);
+        self.records_written += refs.len;
+        freeRecords(self.gpa, &self.pending);
+        self.pending = .empty;
+        self.pending_bytes = 0;
+        self.min_key = key.keySuccessor(max_key.slice());
+    }
+
+    fn writeNode(self: *StreamWriter, level: u8, min_key: []const u8, max_key: []const u8, records: []const RecordRef) StreamError!LevelNode {
+        const extent = try self.alloc.claimInternal();
+        errdefer self.alloc.releaseUnpublished(extent);
+        const addr = self.heap_base + extent * self.layout.node_size;
+        const node_seq = self.seq.mint(self.seq.ctx) catch return error.SeqMintFailed;
+        self.seq_high = @max(self.seq_high, node_seq);
+        var written = try node.writeNode(self.gpa, self.layout, .{
+            .node_addr = addr,
+            .node_seq = node_seq,
+            .tree_id = self.tree_id,
+            .level = level,
+            .min_key = min_key,
+            .max_key = max_key,
+        }, records, 0, null);
+        defer written.deinit(self.gpa);
+        self.sink.write(self.sink.ctx, addr, written.image) catch return error.SinkFailed;
+        self.nodes_written += 1;
+        return .{ .addr = addr, .seq = node_seq, .max_key = key.KeyBuf.fromSlice(max_key) };
+    }
+
+    /// Close the tree: the last leaf (an empty stream still writes one
+    /// empty root leaf spanning the key space), then the interior levels
+    /// until one root remains.
+    pub fn finish(self: *StreamWriter) StreamError!Root {
+        try self.flushLeaf(true);
+        var level: u8 = 0;
+        var nodes = self.leaves;
+        self.leaves = .empty;
+        defer nodes.deinit(self.gpa);
+        while (nodes.items.len > 1) {
+            level = std.math.add(u8, level, 1) catch return error.TreeTooDeep;
+            var seps: std.ArrayList(Record) = .empty;
+            defer freeRecords(self.gpa, &seps);
+            for (nodes.items) |n| try seps.append(self.gpa, try Record.put(self.gpa, n.max_key.slice(), 0, &key.encodeInteriorValue(n.addr, n.seq)));
+            const refs = try self.gpa.alloc(RecordRef, seps.items.len);
+            defer self.gpa.free(refs);
+            for (seps.items, refs) |*s, *o| o.* = s.ref();
+            var chunks: std.ArrayList([]const RecordRef) = .empty;
+            defer chunks.deinit(self.gpa);
+            try chunkByEncodedLen(self.gpa, refs, self.budget, &chunks);
+            var next: std.ArrayList(LevelNode) = .empty;
+            errdefer next.deinit(self.gpa);
+            var min_key: key.KeyBuf = .{};
+            for (chunks.items, 0..) |chunk, i| {
+                const max_key: key.KeyBuf = if (i + 1 == chunks.items.len) key.KeyBuf.fromSlice(&key.KEY_SPACE_MAX) else key.KeyBuf.fromSlice(chunk[chunk.len - 1].key);
+                try next.append(self.gpa, try self.writeNode(level, min_key.slice(), max_key.slice(), chunk));
+                min_key = key.keySuccessor(max_key.slice());
+            }
+            nodes.deinit(self.gpa);
+            nodes = next;
+        }
+        const root = nodes.items[0];
+        return .{ .addr = root.addr, .seq = root.seq };
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -852,4 +998,109 @@ test "digest walks: kind-then-key chained hash excludes writer_claim/writer_term
     try testing.expectEqual(ab.sum, ba.sum);
     try testing.expectEqual(@as(u64, 2), ab.count);
     try testing.expect(ab.sum != digestKindSet(&.{a}).sum);
+}
+
+test "StreamWriter packs the same leaf partition, levels and record population as TreeWriter from the same ascending records; an empty stream is one empty root leaf" {
+    const gpa = testing.allocator;
+    const layout = try NodeLayout.new(65536, null);
+    var b = try ImageBuilder.init(gpa, test_cfg);
+    defer b.deinit();
+    var name_buf: [32]u8 = undefined;
+    const d = try b.addDir(ROOT_INO, "d", 0o755, 0, 0);
+    for (0..2500) |i| _ = try b.addFile(d, try std.fmt.bufPrint(&name_buf, "f{d}", .{i}), 0o644, 0, 0, i);
+    const records = try b.nativeRecords(gpa);
+    defer freeOwned(gpa, records);
+    const refs = try refsOf(gpa, records);
+    defer gpa.free(refs);
+    // The whole-tree writer.
+    var alloc_a = try alloc_ext.ExtentAllocator.format(gpa, 4096, 0, 64);
+    defer alloc_a.deinit();
+    var images: std.ArrayList(node.WrittenNode) = .empty;
+    defer {
+        for (images.items) |*w| w.deinit(gpa);
+        images.deinit(gpa);
+    }
+    var tw = TreeWriter.init(gpa, layout, 0, &alloc_a, 100, &images);
+    const root_a = try tw.writeTree(key.KIND_INTERIOR, refs);
+    // The stream writer into a RAM sink.
+    const Sink = struct {
+        gpa: Allocator,
+        nodes: std.ArrayList(node.WrittenNode) = .empty,
+        next_seq: u64 = 100,
+        fn write(ctx: *anyopaque, addr: u64, image: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const copy = try self.gpa.dupe(u8, image);
+            const h = try node.decodeHeaderPage(copy[0..node.NODE_PAGE], null);
+            try self.nodes.append(self.gpa, .{ .node_addr = addr, .node_seq = h.node_seq, .record_count = 0, .journal_seq_horizon = 0, .image = copy });
+        }
+        fn mint(ctx: *anyopaque) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.next_seq += 1;
+            return self.next_seq;
+        }
+    };
+    var sink: Sink = .{ .gpa = gpa };
+    defer {
+        for (sink.nodes.items) |*w| w.deinit(gpa);
+        sink.nodes.deinit(gpa);
+    }
+    var alloc_b = try alloc_ext.ExtentAllocator.format(gpa, 4096, 0, 64);
+    defer alloc_b.deinit();
+    var sw = StreamWriter.init(gpa, layout, 0, &alloc_b, key.KIND_INTERIOR, .{ .ctx = &sink, .write = Sink.write }, .{ .ctx = &sink, .mint = Sink.mint });
+    defer sw.deinit();
+    for (refs) |r| try sw.append(r.key, r.value);
+    const root_b = try sw.finish();
+    try testing.expectEqual(@as(u64, refs.len), sw.records_written);
+    try testing.expectEqual(images.items.len, sink.nodes.items.len);
+    try testing.expectEqual(tw.nodesWritten(), sw.nodes_written);
+    try testing.expect(images.items.len > 5);
+    // Node by node in write order: the same level, bounds and record keys
+    // (node seqs and addresses are each writer's own).
+    for (images.items, sink.nodes.items) |*a, *s| {
+        const ha = a.header();
+        const hs = s.header();
+        try testing.expectEqual(ha.level, hs.level);
+        try testing.expectEqualSlices(u8, ha.min_key, hs.min_key);
+        try testing.expectEqualSlices(u8, ha.max_key, hs.max_key);
+        if (ha.level == 0) {
+            // The images are the written prefix; a load reads the extent.
+            const pa = try gpa.alloc(u8, layout.node_size);
+            defer gpa.free(pa);
+            @memset(pa, 0);
+            @memcpy(pa[0..a.image.len], a.image);
+            const ps = try gpa.alloc(u8, layout.node_size);
+            defer gpa.free(ps);
+            @memset(ps, 0);
+            @memcpy(ps[0..s.image.len], s.image);
+            var na = try node.verifyNodeExtent(gpa, pa, layout, a.node_addr, 0, null);
+            defer na.deinit(gpa);
+            var ns = try node.verifyNodeExtent(gpa, ps, layout, s.node_addr, 0, null);
+            defer ns.deinit(gpa);
+            var ba = try na.bsetAt(gpa, 0);
+            defer ba.deinit(gpa);
+            var bs = try ns.bsetAt(gpa, 0);
+            defer bs.deinit(gpa);
+            try testing.expectEqual(ba.len(), bs.len());
+            for (0..ba.len()) |i| try testing.expectEqualSlices(u8, ba.record(i).key, bs.record(i).key);
+        }
+    }
+    const ra = images.items[images.items.len - 1].header();
+    const rb = sink.nodes.items[sink.nodes.items.len - 1].header();
+    try testing.expectEqual(ra.level, rb.level);
+    try testing.expectEqual(root_a.addr, images.items[images.items.len - 1].node_addr);
+    try testing.expectEqual(root_b.addr, sink.nodes.items[sink.nodes.items.len - 1].node_addr);
+    // An empty stream: one empty leaf spanning the key space is the root.
+    var empty_sink: Sink = .{ .gpa = gpa };
+    defer {
+        for (empty_sink.nodes.items) |*w| w.deinit(gpa);
+        empty_sink.nodes.deinit(gpa);
+    }
+    var ew = StreamWriter.init(gpa, layout, 0, &alloc_b, key.KIND_INTERIOR, .{ .ctx = &empty_sink, .write = Sink.write }, .{ .ctx = &empty_sink, .mint = Sink.mint });
+    defer ew.deinit();
+    _ = try ew.finish();
+    try testing.expectEqual(@as(usize, 1), empty_sink.nodes.items.len);
+    const eh = empty_sink.nodes.items[0].header();
+    try testing.expectEqual(@as(u8, 0), eh.level);
+    try testing.expectEqualSlices(u8, "", eh.min_key);
+    try testing.expectEqualSlices(u8, &key.KEY_SPACE_MAX, eh.max_key);
 }

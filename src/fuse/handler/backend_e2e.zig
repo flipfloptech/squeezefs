@@ -10,6 +10,7 @@ const linux = std.os.linux;
 const abi = @import("../abi.zig");
 const codec = @import("../codec.zig");
 const backend = @import("../../meta/backend.zig");
+const meta_set = @import("../../meta/meta_set.zig");
 const exec = @import("../../exec/exec.zig");
 const geometry = @import("../../meta/geometry.zig");
 const align_probe = @import("../../io/align_probe.zig");
@@ -27,7 +28,7 @@ comptime {
 }
 
 const testing = std.testing;
-const BackendFs = kv_fs.KvFs(backend.KvBackend, kv_fs.NoData);
+const BackendFs = kv_fs.KvFs(meta_set.MetaSet, kv_fs.NoData);
 const Loopback = seam.Loopback;
 const LoopDispatcher = lifecycle.Dispatcher(Loopback);
 
@@ -57,7 +58,7 @@ fn unlinkPath(path: []const u8) void {
 /// mount owns a test executor instance.
 const Mount = struct {
     sqz: *exec.SqzIo,
-    be: *backend.KvBackend,
+    be: *meta_set.MetaSet,
     nodata: kv_fs.NoData = .{},
     fs: BackendFs,
     lb: Loopback,
@@ -73,7 +74,7 @@ const Mount = struct {
         self.sqz = try exec.SqzIo.testInstance();
         errdefer self.sqz.deinit();
         const io = self.sqz.io();
-        self.be = try backend.KvBackend.open(gpa, io, path, .{ .env = env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
+        self.be = try meta_set.MetaSet.open(gpa, io, &.{path}, .{ .env = env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
         errdefer self.be.close();
         self.nodata = .{};
         self.fs = try BackendFs.mount(gpa, io, self.be, &self.nodata, .{ .dlm_stripes = 64 });
@@ -187,7 +188,7 @@ test "first mount e2e: format → mount → create/write/read/mkdir/readdir/rena
         var m: Mount = undefined;
         try m.open(gpa, &env, path);
         defer m.close();
-        try testing.expect(m.be.replayStats().clean_unmount);
+        try testing.expect(m.be.volumes[0].replayStats().clean_unmount);
         try testing.expectEqual(d_ino, (try Mount.entry(m.call(.{ .lookup = .{ .name = "dir" } }, 1))).nodeid);
         try testing.expectEqual(f_ino, (try Mount.entry(m.call(.{ .lookup = .{ .name = "moved.txt" } }, d_ino))).nodeid);
         const rin: abi.fuse_read_in = .{ .fh = 1, .offset = 7, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };

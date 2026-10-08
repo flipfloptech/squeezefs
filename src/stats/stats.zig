@@ -45,6 +45,8 @@ const block_alloc = @import("../data/block_alloc.zig");
 const reclaim = @import("../data/reclaim.zig");
 const write_pipeline = @import("../data/write_pipeline.zig");
 const backend = if (is_linux) @import("../meta/backend.zig") else struct {};
+const meta_set = if (is_linux) @import("../meta/meta_set.zig") else struct {};
+const routing_stats = @import("../meta/routing/stats.zig");
 const journal_lane = if (is_linux) @import("../meta/journal_lane.zig") else struct {};
 const device_loader = if (is_linux) @import("../meta/device_loader.zig") else struct {};
 const checkpoint = @import("../meta/checkpoint.zig");
@@ -142,7 +144,8 @@ pub const Sources = struct {
     session: if (is_linux) ?*session.Session else ?*void = null,
     plane: if (is_linux) ?*plane_mod.DataPlane else ?*void = null,
     sqz: if (is_linux) ?*sqz_io.SqzIo else ?*void = null,
-    backend: if (is_linux) ?*backend.KvBackend else ?*void = null,
+    /// The metadata set (every member's per-volume families ride it).
+    backend: if (is_linux) ?*meta_set.MetaSet else ?*void = null,
     key_census: ?KeyCensus = null,
     /// The CPU ledger (+ its allocator) and an `Io` for the `/proc/self/
     /// task` walk; absent ⇒ zeros (every family stays present).
@@ -219,6 +222,7 @@ pub const sources = [_]Source{
     .{ .path = "src/meta/node_state_core.zig", .family = "meta" },
     .{ .path = "src/meta/conveyor.zig", .family = "meta" },
     .{ .path = "src/meta/guard.zig", .family = "meta" },
+    .{ .path = "src/meta/routing/stats.zig", .family = "meta" },
     .{ .path = "src/fuse/handler/lifecycle.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/op_guard.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/open_table.zig", .family = "fuse" },
@@ -284,6 +288,12 @@ pub const covered = [_]Covered{
     .{ .path = "src/io/nvme_dev.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/exec/lane.zig", .by = "src/exec/stats.zig" },
     .{ .path = "src/fuse/transport/filesystem_vtable.zig", .by = "src/fuse/transport/session.zig" },
+    .{ .path = "src/meta/routing/slot_gate.zig", .by = "src/meta/routing/stats.zig" },
+    .{ .path = "src/meta/routing/migration_tee.zig", .by = "src/meta/routing/stats.zig" },
+    .{ .path = "src/meta/routing/discovery.zig", .by = "src/meta/routing/stats.zig" },
+    .{ .path = "src/meta/routing/stamp_cell.zig", .by = "src/meta/routing/stats.zig" },
+    .{ .path = "src/meta/routing/migrate.zig", .by = "src/meta/routing/stats.zig" },
+    .{ .path = "src/meta/meta_set.zig", .by = "src/meta/routing/stats.zig" },
 };
 
 comptime {
@@ -413,9 +423,12 @@ fn writeEmptyCensus(w: *Writer) Error!void {
 }
 
 fn writeMeta(src: *Sources, w: *Writer) Error!void {
+    // Member 0's conveyor/checkpointer under the historical keys (the
+    // name-keyed readers find them first); every member under `set`.
     try w.writeAll("{\"conveyor\":");
     if (is_linux) {
-        if (src.backend) |be| {
+        if (src.backend) |set| {
+            const be = set.volumes[0];
             try be.conveyorStats().writeJson(w);
             try w.writeAll(",\"conveyor_phases\":");
             try be.conveyorStats().writePhasesJson(w);
@@ -426,8 +439,12 @@ fn writeMeta(src: *Sources, w: *Writer) Error!void {
             // `reusable_upto`, `dirty_nodes`): the instrument fields alone.
             try w.writeAll(",\"checkpointer\":");
             try counters.writeFieldsJson(&be.cp, w);
-        } else try w.writeAll("{},\"conveyor_phases\":{},\"backend\":{},\"checkpointer\":{}");
-    } else try w.writeAll("{},\"conveyor_phases\":{},\"backend\":{},\"checkpointer\":{}");
+            try w.writeAll(",\"set\":");
+            try set.writeStatsJson(w);
+        } else try w.writeAll("{},\"conveyor_phases\":{},\"backend\":{},\"checkpointer\":{},\"set\":{}");
+    } else try w.writeAll("{},\"conveyor_phases\":{},\"backend\":{},\"checkpointer\":{},\"set\":{}");
+    try w.writeAll(",\"routing\":");
+    try routing_stats.writeStatsJson(w);
     try w.writeAll(",\"meta_barrier\":");
     try checkpoint.stats.meta_barrier.snapshot().writeJson(w);
     try w.writeAll(",\"checkpoint\":");

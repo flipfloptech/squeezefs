@@ -836,6 +836,101 @@ pub const KvTree = struct {
 };
 
 // ---------------------------------------------------------------------------
+// The volume's live tree set.
+// ---------------------------------------------------------------------------
+
+/// The mounted trees of one volume as an immutable, atomically published
+/// list (charter §5.5 "slot trees are minted lazily"; §5.4 a slot migrates
+/// in or out of a live volume): readers — the conveyor pass's routing,
+/// every lookup, the checkpoint seam — `load` one pointer and walk the
+/// slice; a writer (the mount, a first mint, a flip's add or drop) builds a
+/// new list and stores it. Nothing a reader may hold is ever freed before
+/// the table goes: superseded lists and dropped trees are RETIRED and
+/// released with the table (a few per mount — one per tree change), so no
+/// reader needs a grace protocol. Writers are serialized by the caller
+/// (the volume's tree-set lock).
+pub const TreeTable = struct {
+    gpa: Allocator,
+    current: std.atomic.Value(*const List),
+    retired_lists: std.ArrayList(*const List) = .empty,
+    retired_trees: std.ArrayList(*KvTree) = .empty,
+
+    pub const List = struct { trees: []const *KvTree };
+
+    pub fn init(gpa: Allocator, initial: []const *KvTree) Allocator.Error!TreeTable {
+        return .{ .gpa = gpa, .current = .init(try makeList(gpa, initial)) };
+    }
+
+    fn makeList(gpa: Allocator, trees: []const *KvTree) Allocator.Error!*const List {
+        const l = try gpa.create(List);
+        errdefer gpa.destroy(l);
+        l.* = .{ .trees = try gpa.dupe(*KvTree, trees) };
+        return l;
+    }
+
+    fn freeList(gpa: Allocator, l: *const List) void {
+        gpa.free(l.trees);
+        gpa.destroy(l);
+    }
+
+    /// Frees the lists and destroys every DROPPED tree; the current trees
+    /// are the caller's to destroy (`load` them first).
+    pub fn deinit(self: *TreeTable) void {
+        freeList(self.gpa, self.current.load(.monotonic));
+        for (self.retired_lists.items) |l| freeList(self.gpa, l);
+        self.retired_lists.deinit(self.gpa);
+        for (self.retired_trees.items) |t| t.destroy();
+        self.retired_trees.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// The live trees (acquire pairs with the writer's release store).
+    pub fn load(self: *const TreeTable) []const *KvTree {
+        return self.current.load(.acquire).trees;
+    }
+
+    pub fn find(self: *const TreeTable, identity: TreeIdentity) ?*KvTree {
+        for (self.load()) |t| if (t.identity.eql(identity)) return t;
+        return null;
+    }
+
+    fn publish(self: *TreeTable, next: []const *KvTree) Allocator.Error!void {
+        const l = try makeList(self.gpa, next);
+        errdefer freeList(self.gpa, l);
+        try self.retired_lists.ensureUnusedCapacity(self.gpa, 1);
+        const old = self.current.swap(l, .acq_rel);
+        self.retired_lists.appendAssumeCapacity(old);
+    }
+
+    /// Add a tree (its identity must be new).
+    pub fn add(self: *TreeTable, t: *KvTree) Allocator.Error!void {
+        assert(self.find(t.identity) == null);
+        const cur = self.load();
+        const next = try self.gpa.alloc(*KvTree, cur.len + 1);
+        defer self.gpa.free(next);
+        @memcpy(next[0..cur.len], cur);
+        next[cur.len] = t;
+        try self.publish(next);
+    }
+
+    /// Drop a tree: it leaves the list now and is destroyed with the table.
+    pub fn remove(self: *TreeTable, t: *KvTree) Allocator.Error!void {
+        const cur = self.load();
+        try self.retired_trees.ensureUnusedCapacity(self.gpa, 1);
+        const next = try self.gpa.alloc(*KvTree, cur.len);
+        defer self.gpa.free(next);
+        var n: usize = 0;
+        for (cur) |c| if (c != t) {
+            next[n] = c;
+            n += 1;
+        };
+        assert(n + 1 == cur.len);
+        try self.publish(next[0..n]);
+        self.retired_trees.appendAssumeCapacity(t);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // The two-phase replay driver over a volume's mounted trees.
 // ---------------------------------------------------------------------------
 

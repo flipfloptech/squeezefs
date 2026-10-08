@@ -226,6 +226,9 @@ pub const Error = error{
     Corrupt,
     /// The lock-revalidate budget exhausted (an SMO protocol bug).
     RetryBudgetExhausted,
+    /// The records span two metadata members with no ordered commit (the
+    /// set facade's EXDEV; a one-member conveyor never produces it).
+    CrossVolume,
 };
 
 pub const ErrorClass = errors.Class;
@@ -245,6 +248,7 @@ pub fn coreError(e: Error) errors.Error {
         error.OutOfMemory => error.OutOfMemory,
         error.VolumeFailed => error.VolumeFailed,
         error.HoleCheckpointFailed => error.HoleCheckpointFailed,
+        error.CrossVolume => error.CrossVolume,
         error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,
     };
 }
@@ -503,6 +507,17 @@ pub const Window = struct {
     }
 };
 
+/// The delta tee a slot migration arms on the volume (charter §5.4
+/// "delta tee in the conveyor pass"): `note` sees the records of every
+/// tx that reached its terminal SUCCESS — the lane IS the key tee, so one
+/// armed-tee load per window captures every migrating-slot key at zero
+/// cost when no migration runs (`routing/migration_tee.zig` is the one
+/// binding; the hook keeps the conveyor independent of it).
+pub const CommitTee = struct {
+    ctx: *anyopaque,
+    note: *const fn (ctx: *anyopaque, recs: []const tx.Rec) void,
+};
+
 /// The pass's venue: `wake` is called by the committer that won the
 /// election and must make `runScheduledPass` run — on the journal lane's
 /// pass fiber (the backend), inline on the caller (the portable contracts).
@@ -549,7 +564,10 @@ pub const Deps = struct {
     gpa: Allocator,
     /// The volume's name in log lines.
     volume: []const u8,
-    trees: []const *KvTree,
+    /// The volume's LIVE tree set (a slot tree may be minted or migrated
+    /// in or out during the mount; every pass routes through the current
+    /// list).
+    trees: *const tree.TreeTable,
     cache: *NodeCache,
     alloc: *const alloc_ext.ExtentAllocator,
     core: *jc.JournalCore,
@@ -594,6 +612,10 @@ pub const Conveyor = struct {
     /// The thread the last pass ran on (`std.Thread.getCurrentId`): the
     /// venue witness — ≡ the journal lane's tid on a mounted volume.
     pass_thread: std.atomic.Value(u64) = .init(0),
+    /// The armed delta tee (null = no migration): one acquire load per
+    /// window's terminal outcome. The engine keeps the tee alive until it
+    /// has disarmed and the lane has no window in flight.
+    tee: std.atomic.Value(?*const CommitTee) = .init(null),
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -650,6 +672,16 @@ pub const Conveyor = struct {
     /// `fsync`: the trailing coalesced barrier.
     pub fn barrier(self: *Conveyor) Error!void {
         return self.deps.lane.barrier(self.deps.lane.ctx);
+    }
+
+    /// Arm the delta tee (release pairs with the window's acquire load):
+    /// every tx acked from here on is noted.
+    pub fn armTee(self: *Conveyor, tee: *const CommitTee) void {
+        self.tee.store(tee, .release);
+    }
+
+    pub fn disarmTee(self: *Conveyor) void {
+        self.tee.store(null, .release);
     }
 
     // ---- committers ----
@@ -804,11 +836,11 @@ pub const Conveyor = struct {
     /// Resolve a record's tree by `tree.route` (the ONE routing law); a
     /// record no mounted tree takes is the batch's `Corrupt`.
     fn treeFor(self: *const Conveyor, tree_id: u8, k: []const u8) ?*KvTree {
-        return tree.routeContent(self.deps.trees, tree_id, k);
+        return tree.routeContent(self.deps.trees.load(), tree_id, k);
     }
 
     fn treeOf(self: *const Conveyor, n: *const CachedNode) ?*KvTree {
-        for (self.deps.trees) |t| if (t.owns(n)) return t;
+        for (self.deps.trees.load()) |t| if (t.owns(n)) return t;
         return null;
     }
 
@@ -1449,6 +1481,13 @@ pub const Conveyor = struct {
     pub fn finishWindow(self: *Conveyor, w: *Window, result: Error!void) void {
         self.untrack(w);
         self.stats.window_total.record(clock.monotonicNs() -| w.t_handoff_ns);
+        // The tee sees every member that reached SUCCESS, before the
+        // window's arena (the members' key copies) goes.
+        if (self.tee.load(.acquire)) |tee| {
+            if (result) |_| {
+                for (w.members, w.failed) |*m, f| if (f == null) tee.note(tee.ctx, m.q.recs);
+            } else |_| {}
+        }
         for (w.members, w.failed) |*m, f| {
             const outcome: Outcome = if (f) |e| e else result;
             self.answer(m, outcome);
@@ -1942,7 +1981,7 @@ const Harness = struct {
             .io = testing.io,
             .gpa = cv_gpa,
             .volume = "ram-vol",
-            .trees = h.vol.trees.items,
+            .trees = h.vol.table,
             .cache = h.vol.cache,
             .alloc = h.vol.alloc,
             .core = h.vol.core,

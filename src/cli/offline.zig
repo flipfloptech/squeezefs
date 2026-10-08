@@ -16,7 +16,7 @@ const Allocator = std.mem.Allocator;
 const cli = @import("cli.zig");
 const uri = @import("uri.zig");
 const exec = @import("../exec/exec.zig");
-const backend = @import("../meta/backend.zig");
+const meta_set = @import("../meta/meta_set.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const key = @import("../meta/key.zig");
@@ -47,8 +47,9 @@ pub const Set = struct {
     gpa: Allocator,
     io: Io,
     env: *const std.process.Environ.Map,
-    path: []const u8,
-    be: *backend.KvBackend,
+    /// The member paths as spelled.
+    paths: []const []const u8,
+    be: *meta_set.MetaSet,
     cfg: *set_config.Config,
     /// Present when the verb asked for the data plane.
     plane: ?*plane_mod.DataPlane,
@@ -78,6 +79,7 @@ pub const Body = struct {
 const Ctx = struct {
     p: cli.Process,
     meta_uri: []const u8,
+    paths: []const []const u8,
     opts: Options,
     body: Body,
     sqz: *SqzIo,
@@ -103,10 +105,6 @@ pub fn withSet(p: cli.Process, meta_uri: []const u8, opts: Options, body: Body) 
         p.stderr.print("squeezefs {s}: {f}\n", .{ opts.verb, udiag }) catch {};
         return cli.exit_usage;
     };
-    if (meta.paths.len != 1) {
-        p.stderr.print("squeezefs {s}: {s} names {d} metadata volumes; this rung opens ONE\n", .{ opts.verb, meta_uri, meta.paths.len }) catch {};
-        return cli.exit_failed;
-    }
     const facts = derive.facts();
     const budget_bytes = mem_budget.authority.resolveBudgetNow(.{ .io = p.io, .env = p.env, .facts = facts });
     const sqz = SqzIo.init(p.gpa, .{ .env = p.env, .facts = facts, .budget_bytes = budget_bytes, .budget = &mem_budget.authority, .meta_lanes = 1 }) catch |e| {
@@ -114,7 +112,7 @@ pub fn withSet(p: cli.Process, meta_uri: []const u8, opts: Options, body: Body) 
         return cli.exit_failed;
     };
     defer sqz.deinit();
-    var ctx: Ctx = .{ .p = p, .meta_uri = meta.first(), .opts = opts, .body = body, .sqz = sqz, .facts = facts, .budget_bytes = budget_bytes };
+    var ctx: Ctx = .{ .p = p, .meta_uri = meta_uri, .paths = meta.paths, .opts = opts, .body = body, .sqz = sqz, .facts = facts, .budget_bytes = budget_bytes };
     return sqz.run(main, .{&ctx}) catch |e| ctx.failed("the root task could not start ({s})", .{@errorName(e)});
 }
 
@@ -122,12 +120,12 @@ fn main(ctx: *Ctx) u8 {
     const p = ctx.p;
     const gpa = p.gpa;
     const io = ctx.sqz.io();
-    const be = backend.KvBackend.open(gpa, io, ctx.meta_uri, .{ .env = p.env, .cache_budget_bytes = node_cache.nodeCacheBudgetFromEnv(p.env, ctx.budget_bytes), .cpus = ctx.facts.possible_cpus }) catch |e| {
-        if (e == error.Busy) return ctx.failed("refused: metadata volume '{s}' is live-mounted (the writer guard is held) — the single-writer guard forbids offline mutations under a live write mount; run the verb on the mountpoint or unmount first", .{ctx.meta_uri});
-        return ctx.failed("cannot open metadata volume {s}: {s} ({t}, {s})", .{ ctx.meta_uri, @errorName(e), backend.openErrno(e), @tagName(errors.classOf(backend.openCoreError(e))) });
+    const be = meta_set.MetaSet.open(gpa, io, ctx.paths, .{ .env = p.env, .cache_budget_bytes = node_cache.nodeCacheBudgetFromEnv(p.env, ctx.budget_bytes), .cpus = ctx.facts.possible_cpus }) catch |e| {
+        if (e == error.Busy) return ctx.failed("refused: metadata set '{s}' is live-mounted (the writer guard is held) — the single-writer guard forbids offline mutations under a live write mount; run the verb on the mountpoint or unmount first", .{ctx.meta_uri});
+        return ctx.failed("cannot open metadata set {s}: {s} ({t}, {s})", .{ ctx.meta_uri, @errorName(e), meta_set.openErrno(e), @tagName(errors.classOf(meta_set.openCoreError(e))) });
     };
     defer be.close();
-    const value = (be.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch |e| return ctx.failed("cannot read the set_config record of {s}: {s}", .{ ctx.meta_uri, @errorName(e) })) orelse return ctx.failed("{s} carries no set_config record in its control tree — not member 0 of its set; reformat", .{ctx.meta_uri});
+    const value = (be.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch |e| return ctx.failed("cannot read the set_config record of {s}: {s}", .{ ctx.meta_uri, @errorName(e) })) orelse return ctx.failed("{s}: member 0 carries no set_config record in its control tree; reformat", .{ctx.meta_uri});
     defer gpa.free(value);
     var diag: set_config.Refusal = undefined;
     var cfg = set_config.decode(gpa, value, &diag) catch {
@@ -137,7 +135,7 @@ fn main(ctx: *Ctx) u8 {
         return ctx.failed("{s}: {s}", .{ ctx.meta_uri, w.buffered() });
     };
     defer cfg.deinit(gpa);
-    var set: Set = .{ .gpa = gpa, .io = io, .env = p.env, .path = ctx.meta_uri, .be = be, .cfg = &cfg, .plane = null, .fs = null, .uid = std.os.linux.geteuid(), .gid = std.os.linux.getegid() };
+    var set: Set = .{ .gpa = gpa, .io = io, .env = p.env, .paths = ctx.paths, .be = be, .cfg = &cfg, .plane = null, .fs = null, .uid = std.os.linux.geteuid(), .gid = std.os.linux.getegid() };
     if (!ctx.opts.with_plane) return ctx.body.run(ctx.body.ctx, &set);
 
     // The data plane as `mount` opens it: discovery, the key, the plane,
@@ -154,7 +152,7 @@ fn main(ctx: *Ctx) u8 {
             o.* = data_superblock.observation(if (opened) |op| op.classified else |e| e);
         }
         var ddiag: set_config.DiscoveryRefusal = undefined;
-        set_config.discover(&cfg, be.mounted.membership_stamp.set_uuid, obs, &ddiag) catch {
+        set_config.discover(&cfg, be.setUuid(), obs, &ddiag) catch {
             var buf: [1024]u8 = undefined;
             var w: Io.Writer = .fixed(&buf);
             ddiag.write(&w) catch {};

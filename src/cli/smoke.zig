@@ -77,6 +77,10 @@ const Rig = struct {
     work: [:0]u8,
     img: [:0]u8,
     meta_uri: []u8,
+    /// A second metadata member and the two-member set URI (the routing
+    /// stage).
+    img2: [:0]u8,
+    set_uri: []u8,
     mp: [:0]u8,
     log_path: [:0]u8,
     /// The data set (rung 4): two sparse volumes, the cache path, the
@@ -105,6 +109,8 @@ const Rig = struct {
             .work = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}", .{pid}, 0),
             .img = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/vol.img", .{pid}, 0),
             .meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///build/tmp/smoke-{d}/vol.img", .{pid}),
+            .img2 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/vol2.img", .{pid}, 0),
+            .set_uri = try std.fmt.allocPrint(gpa, "sqmeta:///build/tmp/smoke-{d}/vol.img,/build/tmp/smoke-{d}/vol2.img", .{ pid, pid }),
             .mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/mnt-{d}", .{pid}, 0),
             .log_path = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/daemon.log", .{pid}, 0),
             .d0 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/d0.img", .{pid}, 0),
@@ -173,6 +179,8 @@ const Rig = struct {
         self.gpa.free(self.work);
         self.gpa.free(self.img);
         self.gpa.free(self.meta_uri);
+        self.gpa.free(self.img2);
+        self.gpa.free(self.set_uri);
         self.gpa.free(self.mp);
         self.gpa.free(self.log_path);
         self.gpa.free(self.d0);
@@ -363,6 +371,10 @@ const Rig = struct {
 
     /// Spawn the foreground mount with its stderr appended to the log file.
     fn spawnMount(self: *Rig, extra: []const []const u8) !void {
+        return self.spawnMountOf(self.meta_uri, extra);
+    }
+
+    fn spawnMountOf(self: *Rig, meta_uri: []const u8, extra: []const []const u8) !void {
         std.debug.assert(self.child == null);
         if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
         var argv: [16][]const u8 = undefined;
@@ -375,7 +387,7 @@ const Rig = struct {
             argv[n] = a;
             n += 1;
         }
-        argv[n] = self.meta_uri;
+        argv[n] = meta_uri;
         n += 1;
         argv[n] = self.mp;
         n += 1;
@@ -730,6 +742,133 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
         try testing.expect(std.mem.indexOf(u8, r.stdout, "not mounted") != null);
         std.debug.print("smoke: {s}", .{r.stdout[std.mem.lastIndexOf(u8, r.stdout, "summary:").?..]});
     }
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic routing (charter §5.4): a two-member set through the binary.
+// ---------------------------------------------------------------------------
+
+/// Files the routing stage creates over several directories: enough that
+/// every rotor slot of both members takes mints (2 × 64 slots) many times
+/// over, small enough to stay far under the gate's data budget.
+const routing_dirs: usize = 8;
+const routing_files_per_dir: usize = 250;
+
+fn routingTreeScript(gpa: std.mem.Allocator) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    errdefer w.deinit();
+    try w.writer.print("for d in $(seq 0 {d}); do mkdir -p r$d; for i in $(seq 1 {d}); do echo \"$d-$i\" > r$d/f$i; done; done; find . -path ./.stats -prune -o -type f -print | wc -l", .{ routing_dirs - 1, routing_files_per_dir });
+    return w.toOwnedSlice();
+}
+
+const routing_verify_script =
+    \\n=$(find . -path ./.stats -prune -o -type f -print | wc -l); echo "files=$n"
+    \\for d in $(seq 0 7); do for i in 1 125 250; do v=$(cat r$d/f$i); [ "$v" = "$d-$i" ] || { echo "MISMATCH r$d/f$i=[$v] ino=$(stat -c %i r$d/f$i)"; exit 1; }; done; done
+    \\echo routing-verify-ok
+;
+
+test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,b → mount → 2000 files over 8 dirs spread over both members (routing_* gauges) → remount in the other URI order, every file present → volume list → remove-meta offline → mount with one member, every file present" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    for ([_][:0]const u8{ rig.img, rig.img2 }) |p| {
+        const f = try Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, volume_len);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "format", rig.set_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "2-member set") != null);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "volume", "list", rig.set_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nvolume list: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "position 0/2") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "position 1/2") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "the native keyspace") != null);
+    }
+    // Mount the set, build the tree, read the gauges.
+    try rig.spawnMountOf(rig.set_uri, &.{});
+    _ = try rig.awaitReady(0);
+    {
+        const script = try routingTreeScript(gpa);
+        defer gpa.free(script);
+        const out = try rig.onMountTimed(script, 600);
+        defer gpa.free(out);
+        try testing.expectEqual(routing_dirs * routing_files_per_dir, try std.fmt.parseInt(usize, std.mem.trim(u8, out, " \n"), 10));
+    }
+    {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        try testing.expectEqual(@as(?u64, 2), numberAfter(tail, "\"routing_volumes\":"));
+        try testing.expectEqual(@as(?u64, 65536), numberAfter(tail, "\"routing_width\":"));
+        // Both members' rotors took mints: ≥ 64 guest trees on each
+        // (member 0: 63 guests + the native slot; member 1: 64 guests).
+        try testing.expect((numberAfter(tail, "\"routing_guest_trees_minted\":") orelse 0) >= 2 * 63);
+        try testing.expect((numberAfter(tail, "\"routing_mint_volume_picks\":") orelse 0) > 0);
+        try testing.expect((numberAfter(tail, "\"routing_split_commits\":") orelse 0) > 0);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"routing_same_epoch_dual_claim\":0") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"volume_failed\":false") != null);
+        std.debug.print("\nsmoke: two-member set: guest trees {d}, cross-member mints {d}, split commits {d}, gate parks {d}\n", .{ numberAfter(tail, "\"routing_guest_trees_minted\":") orelse 0, numberAfter(tail, "\"routing_mint_volume_picks\":") orelse 0, numberAfter(tail, "\"routing_split_commits\":") orelse 0, numberAfter(tail, "\"routing_gate_parks\":") orelse 0 });
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // Remount in the OTHER URI order: discovery orders by the stamps.
+    const reversed = try std.fmt.allocPrint(gpa, "sqmeta://{s},{s}", .{ rig.img2, rig.img });
+    defer gpa.free(reversed);
+    const mark = try rig.logLen();
+    try rig.spawnMountOf(reversed, &.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMount(routing_verify_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "files=2000") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "routing-verify-ok") != null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // remove-meta (offline): member 1 retires, its slots move onto
+    // member 0; the tombstone refuses discovery; one member serves all.
+    {
+        const r = try rig.squeezefs(&.{ "volume", "remove-meta", rig.set_uri, rig.img2 });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nremove-meta: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "retired at epoch 2") != null);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "volume", "list", rig.set_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "RETIRED") != null);
+    }
+    const mark3 = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark3);
+    {
+        const out = try rig.onMount(routing_verify_script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "files=2000") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "routing-verify-ok") != null);
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"routing_volumes\":"));
+    }
+    // The dataset goes; the mount ends clean.
+    {
+        const out = try rig.onMount("rm -rf r0 r1 r2 r3 r4 r5 r6 r7; echo gone");
+        defer gpa.free(out);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 

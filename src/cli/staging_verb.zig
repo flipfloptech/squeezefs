@@ -82,7 +82,7 @@ fn segmentBytes(root: []const u8) u64 {
 
 /// One root's row: the marker, the segment, the recovery scan (a mapped
 /// segment adopts into a private index that is freed at once).
-fn inspectRoot(gpa: std.mem.Allocator, pool: *uring_fs.Pool, root: []const u8, set_uuid: [16]u8) RootRow {
+pub fn inspectRoot(gpa: std.mem.Allocator, pool: *uring_fs.Pool, root: []const u8, set_uuid: [16]u8) RootRow {
     var row: RootRow = .{ .path = root, .binding = .none, .mount_slot = 0, .set_epoch = 0, .segment_bytes = segmentBytes(root), .live_units = 0, .live_bytes = 0, .torn = 0 };
     const marker = staging.Ring.readMarker(pool, root) catch {
         row.binding = .unreadable;
@@ -189,7 +189,7 @@ const PromoteBody = struct {
         const files = staging.stats.dismount_promoted_files.load() - files0;
         const bytes = staging.stats.dismount_promoted_bytes.load() - bytes0;
         const failed = staging.stats.dismount_promote_failures.load() - failed0;
-        self.p.stdout.print("staging promote {s}: {d} staged file(s) found, {d} promoted ({d} B), {d} failed\n", .{ set.path, live, files, bytes, failed }) catch {};
+        self.p.stdout.print("staging promote {s}: {d} staged file(s) found, {d} promoted ({d} B), {d} failed\n", .{ set.paths[0], live, files, bytes, failed }) catch {};
         self.p.stdout.flush() catch {};
         return if (failed != 0) cli.exit_failed else cli.exit_ok;
     }

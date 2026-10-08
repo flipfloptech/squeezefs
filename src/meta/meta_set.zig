@@ -1,0 +1,953 @@
+//! The metadata SET facade (Linux; charter §5.4; `docs/porting/
+//! dynamic_routing.md` §2, §8 "set_backend"): N `KvBackend`s — one per
+//! member volume, each with its own D0 gate, journal lane and checkpoint
+//! task — behind ONE store face the filesystem (`fuse/handler/kv_fs.zig`)
+//! and the data plane bind to. Discovery (`routing/discovery.zig`) orders
+//! the members canonically and builds the slot → volume table; every op
+//! routes by the ONE key law (`route_table.slotOfKey`: the key's slot →
+//! its host → the host's tree for the slot), mints spread over the healthy
+//! volumes' rotors (`router.pickMintVolume`, `MintRotor`), and the cutover
+//! gate parks an op whose slot is mid-flip BEFORE its 4a guards.
+//!
+//! Cross-volume transactions (one op's records on two members): a tx
+//! names its ORDER (`tx.CrossVolume`) and the facade commits two ordered
+//! entries — create/link put the child's inode FIRST (a crash leaves an
+//! unreferenced inode, fsck C9), unlink/rename put the parent's dentries
+//! first (a crash leaves a stale nlink, fsck C10), a destroy batch's
+//! members are independent. A tx with no legal order (a rename whose two
+//! parents live on different volumes, a third volume in play) is refused
+//! `EXDEV`-class and counted: the symmetric plane's cross-owner INTENTS
+//! (charter §5.5) are rung 6's — stated, never faked.
+//!
+//! The one-member set is the one-volume mount: the same facade, one
+//! backend, slot 0 native and 63 rotor slots as guest trees on it.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const linux = std.os.linux;
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+
+const counters = @import("../core/counters.zig");
+const errors = @import("../core/errors.zig");
+const log = @import("../core/log.zig");
+const derive = @import("../core/derive.zig");
+const uring_fs = @import("../io/uring_fs.zig");
+const key = @import("key.zig");
+const tree = @import("tree.zig");
+const tx = @import("tx.zig");
+const ledger = @import("ledger.zig");
+const inos = @import("inos.zig");
+const conveyor = @import("conveyor.zig");
+const checkpoint_cycle = @import("checkpoint_cycle.zig");
+const backend = @import("backend.zig");
+const guard = @import("guard.zig");
+const routing = @import("routing.zig");
+const router = @import("../data/router.zig");
+
+const route_table = routing.route_table;
+const discovery = routing.discovery;
+const slot_gate = routing.slot_gate;
+const rstats = routing.stats.stats;
+
+comptime {
+    if (builtin.os.tag != .linux) @compileError("meta_set is Linux only (charter §1.2); gate the import on builtin.os.tag");
+}
+
+pub const KvBackend = backend.KvBackend;
+pub const KvTx = tx.KvTx;
+pub const Error = backend.Error;
+pub const Outcome = conveyor.Outcome;
+
+/// `backend.OpenError` plus the set's own refusal (discovery, logged by
+/// name before this is returned).
+pub const OpenError = backend.OpenError || error{SetRefused};
+
+pub fn openCoreError(e: OpenError) errors.Error {
+    return switch (e) {
+        error.SetRefused => error.UnsupportedVolume,
+        else => |be_err| backend.openCoreError(be_err),
+    };
+}
+
+pub fn openErrno(e: OpenError) linux.E {
+    return errors.toErrno(openCoreError(e));
+}
+
+pub const OpenOptions = struct {
+    env: *const std.process.Environ.Map,
+    /// The process's io pool; one is created (and owned) when null.
+    pool: ?*uring_fs.Pool = null,
+    /// The node-cache budget PER VOLUME (charter §5.3).
+    cache_budget_bytes: u64 = @import("node_cache.zig").DEFAULT_CACHE_BUDGET_BYTES,
+    cpus: u32 = 0,
+    test_error_logs: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    guard: guard.gate.Options = .{},
+    /// A `-o ro` open only RESOLVES dual claims (never converges them).
+    read_only: bool = false,
+};
+
+pub const MetaSet = struct {
+    gpa: Allocator,
+    io: Io,
+    env: *const std.process.Environ.Map,
+    /// Canonical order (member position ascending).
+    volumes: []*KvBackend,
+    pool: *uring_fs.Pool,
+    pool_owned: bool,
+    route: route_table.Published,
+    gates: slot_gate.SlotGates,
+    /// Per volume: the mint set (its first ≤ 64 hosted slots) and rotor.
+    rotors: []router.MintRotor,
+    mint_rr: std.atomic.Value(u64) = .init(0),
+    set_uuid: [16]u8,
+    hash_seed: u64,
+    node_size: u32,
+    /// One slot migration at a time per set (the coordinator's
+    /// one-flip-per-slot law, made structural).
+    migration_lock: Io.Mutex = .init,
+    /// The delta tee (created at the first migration, reused after: a
+    /// window that loaded the hook pointer may still be noting keys after
+    /// a disarm, so the tee lives as long as the set).
+    tee: ?*routing.migration_tee.MigrationTee = null,
+    tee_hook: conveyor.CommitTee = undefined,
+    closed: bool = false,
+
+    // ---- open / close ----
+
+    /// Discover the set named by `paths` (any order), open every member
+    /// in canonical order (each through its D0 ladder; a failure releases
+    /// every prior guard), converge the dual claims a torn flip left,
+    /// publish the table.
+    pub fn open(gpa: Allocator, io: Io, paths: []const []const u8, opts: OpenOptions) OpenError!*MetaSet {
+        if (paths.len == 0 or paths.len > route_table.MAX_VOLUMES) return error.SetRefused;
+        const pool = opts.pool orelse (uring_fs.Pool.init(gpa, uring_fs.Config.resolve(opts.env, derive.Facts.probe())) catch return error.DeviceRefused);
+        errdefer if (opts.pool == null) pool.deinit();
+
+        // Discovery, no mount: every member's superblock + newest record.
+        const owned = try gpa.alloc(discovery.linux_dev.Owned, paths.len);
+        defer gpa.free(owned);
+        var observed: usize = 0;
+        defer for (owned[0..observed]) |*o| o.deinit(gpa);
+        const obs = try gpa.alloc(discovery.Observation, paths.len);
+        defer gpa.free(obs);
+        for (paths, 0..) |p, i| {
+            owned[i] = discovery.linux_dev.observe(gpa, opts.env, pool, p) catch |e| return switch (e) {
+                error.NotFormatted => {
+                    log.err("Metadata volume {s} is not formatted (zeroed superblock) — run `squeezefs format` first", .{p});
+                    return error.NotFormatted;
+                },
+                error.LegacyFormat => {
+                    log.err("Metadata volume {s} is a pre-v4 squeezefs format — reformat required", .{p});
+                    return error.LegacyFormat;
+                },
+                error.DeviceRefused => error.DeviceRefused,
+                error.Corrupt => error.Corrupt,
+                error.Io => error.Io,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+            observed += 1;
+            obs[i] = owned[i].obs;
+        }
+        var ddiag: discovery.Refusal = undefined;
+        var disc = discovery.discover(gpa, obs, &ddiag) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Refused => {
+                var buf: [2048]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
+                ddiag.write(&w) catch {};
+                log.err("metadata set discovery refused: {s}", .{w.buffered()});
+                return error.SetRefused;
+            },
+        };
+        defer disc.deinit();
+
+        const self = try gpa.create(MetaSet);
+        errdefer gpa.destroy(self);
+        const volumes = try gpa.alloc(*KvBackend, paths.len);
+        errdefer gpa.free(volumes);
+        var opened: usize = 0;
+        errdefer for (volumes[0..opened]) |be| be.close();
+        for (disc.order, 0..) |oi, vi| {
+            volumes[vi] = try KvBackend.open(gpa, io, paths[oi], .{
+                .env = opts.env,
+                .pool = pool,
+                .index = @intCast(vi),
+                .cache_budget_bytes = opts.cache_budget_bytes,
+                .cpus = opts.cpus,
+                .test_error_logs = opts.test_error_logs,
+                .guard = opts.guard,
+            });
+            opened += 1;
+        }
+        const rotors = try gpa.alloc(router.MintRotor, paths.len);
+        errdefer gpa.free(rotors);
+        const initial = disc.table();
+        for (rotors, 0..) |*r, v| {
+            var buf: [router.MINT_SPREAD]u16 = undefined;
+            r.* = router.MintRotor.init(initial.hostedAscending(@intCast(v), &buf));
+        }
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .env = opts.env,
+            .volumes = volumes,
+            .pool = pool,
+            .pool_owned = opts.pool == null,
+            .route = try route_table.Published.init(gpa, initial),
+            .gates = undefined,
+            .rotors = rotors,
+            .set_uuid = disc.set_uuid,
+            .hash_seed = disc.hash_seed,
+            .node_size = disc.node_size,
+        };
+        errdefer self.route.deinit();
+        self.gates = try slot_gate.SlotGates.init(gpa);
+        errdefer self.gates.deinit();
+        if (!opts.read_only) try self.convergeDualClaims(disc.dual_claims);
+        log.info("metadata set {x:0>2}{x:0>2}{x:0>2}{x:0>2}…: {d} member(s) mounted in canonical order, epoch {d}, {d} dual claim(s) converged, native keyspace on member {d}", .{ disc.set_uuid[0], disc.set_uuid[1], disc.set_uuid[2], disc.set_uuid[3], paths.len, disc.set_epoch, disc.dual_claims.len, disc.native_volume });
+        return self;
+    }
+
+    /// §7 Q1: a slot two stamps claim (a flip crashed after write 1) is
+    /// hosted by the higher epoch; the loser's stale claim is released NOW
+    /// — the idempotent redo of flip write 2 at the winner's epoch (stamp
+    /// `−s`, cursor dropped, a checkpoint) and the loser's tree dropped —
+    /// so no later, unrelated flip can resurrect it.
+    fn convergeDualClaims(self: *MetaSet, duals: []const discovery.DualClaim) OpenError!void {
+        for (duals) |d| {
+            const loser = self.volumes[d.loser];
+            loser.stamp.releaseSlot(d.slot) catch return error.OutOfMemory;
+            loser.stamp.removeCursor(d.slot);
+            loser.stamp.setEpoch(@max(loser.stamp.set_epoch, d.winner_epoch));
+            loser.dropTree(d.slot) catch |e| return mapOpenFailure(e);
+            loser.checkpointNow() catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.VolumeFailed, error.Io => error.Io,
+                error.Corrupt => error.Corrupt,
+            };
+            rstats.routing_dual_claims_converged.inc();
+            log.warn("metadata set: slot {d} was claimed by member {d} (epoch {d}) and member {d} (epoch {d}) — a flip torn after its claim write; the stale claim on member {d} is released and its copy dropped (routing_dual_claims_converged)", .{ d.slot, d.winner, d.winner_epoch, d.loser, d.loser_epoch, d.loser });
+        }
+    }
+
+    fn mapOpenFailure(e: Error) OpenError {
+        return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.VolumeFailed, error.Io, error.JournalWriteFailed => error.Io,
+            else => error.Corrupt,
+        };
+    }
+
+    /// Close every member in canonical order (each a clean dismount).
+    pub fn close(self: *MetaSet) void {
+        const gpa = self.gpa;
+        if (!self.closed) {
+            self.closed = true;
+            for (self.volumes) |be| be.close();
+        }
+        if (self.tee) |t| t.deinit();
+        self.gates.deinit();
+        self.route.deinit();
+        gpa.free(self.rotors);
+        gpa.free(self.volumes);
+        if (self.pool_owned) self.pool.deinit();
+        gpa.destroy(self);
+    }
+
+    pub fn volumeCount(self: *const MetaSet) usize {
+        return self.volumes.len;
+    }
+
+    // ---- routing ----
+
+    /// The key ino of a global ino (`route_table.effectiveIno`: a pure law).
+    pub fn effectiveIno(_: *const MetaSet, global: u64) u64 {
+        return route_table.effectiveIno(global);
+    }
+
+    pub fn globalIno(_: *const MetaSet, eff: u64) u64 {
+        return route_table.globalOfEffective(eff);
+    }
+
+    /// The member hosting routing slot `slot` now.
+    pub fn volumeOfSlot(self: *MetaSet, slot: u16) *KvBackend {
+        return self.volumes[self.route.volumeOf(slot)];
+    }
+
+    pub fn volumeIndexOfSlot(self: *MetaSet, slot: u16) route_table.VolumeIndex {
+        return self.route.volumeOf(slot);
+    }
+
+    /// The member and routing slot a slot-tree key lives on.
+    fn homeOfKey(self: *MetaSet, kind: u8, k: []const u8) Error!struct { be: *KvBackend, slot: u16 } {
+        if (kind == key.TREE_CONTROL) return .{ .be = self.volumes[0], .slot = 0 };
+        const slot = route_table.slotOfKey(k) catch return error.Corrupt;
+        return .{ .be = self.volumeOfSlot(slot), .slot = slot };
+    }
+
+    /// The tree a key lives in, null when its slot has no tree yet (a
+    /// virgin slot: every read of it is absent).
+    fn treeOfKey(self: *MetaSet, kind: u8, k: []const u8) Error!?*tree.KvTree {
+        const h = try self.homeOfKey(kind, k);
+        if (kind == key.TREE_CONTROL) return h.be.treeOf(.control) orelse error.Corrupt;
+        return h.be.slotTree(h.slot);
+    }
+
+    // ---- the store face ----
+
+    pub const StoreError = Error;
+
+    pub fn coreError(e: Error) errors.Error {
+        return backend.KvBackend.coreError(e);
+    }
+
+    pub fn begin(self: *MetaSet, site: tx.Site) Allocator.Error!*KvTx {
+        const t = try self.gpa.create(KvTx);
+        t.* = KvTx.init(self.gpa, site);
+        return t;
+    }
+
+    pub fn abandon(self: *MetaSet, t: *KvTx) void {
+        t.deinit();
+        self.gpa.destroy(t);
+    }
+
+    /// Point lookup through the key's home tree (latch-free); an owned copy.
+    pub fn lookup(self: *MetaSet, gpa: Allocator, kind: u8, k: []const u8) Error!?[]u8 {
+        const t = (try self.treeOfKey(kind, k)) orelse return null;
+        return t.lookup(gpa, k) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+    }
+
+    /// Range scan over `[start, end]` of one kind. Bounds of an ino-major
+    /// kind inside one slot read its tree; bounds spanning slots (the
+    /// corpse sweep, the layout census) and EVERY refs range (a ref key
+    /// leads with the volume and the block — its owner, the routing
+    /// component, varies freely inside any block or volume range, so the
+    /// bounds' slots say nothing about the keys between them) merge every
+    /// slot tree of every member in key order, `max` smallest first — so a
+    /// caller resuming at `successor(last)` pages through the whole set.
+    pub fn range(self: *MetaSet, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        if (max == 0 or key.lessThan(end, start)) return;
+        if (kind == key.TREE_CONTROL) {
+            const t = self.volumes[0].treeOf(.control) orelse return error.Corrupt;
+            return rangeIn(t, gpa, start, end, max, out);
+        }
+        if (kind != key.TREE_BLOCK_REFS) {
+            const s0 = route_table.slotOfKey(start) catch null;
+            const s1 = route_table.slotOfKey(end) catch null;
+            if (s0 != null and s1 != null and s0.? == s1.?) {
+                const t = self.volumeOfSlot(s0.?).slotTree(s0.?) orelse return;
+                return rangeIn(t, gpa, start, end, max, out);
+            }
+        }
+        var merged: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &merged);
+        const native_volume = self.route.volumeOf(0);
+        for (self.volumes, 0..) |be, v| {
+            for (be.trees.load()) |t| {
+                if (t.identity == .control) continue;
+                // A member's forest-slot-0 tree holds the SET's native
+                // keyspace only on slot 0's host; elsewhere it is the
+                // volume's own control home (its writer claim at local
+                // ino 1), never set content.
+                if (t.forest_slot == key.NATIVE_FOREST_SLOT and v != native_volume) continue;
+                try rangeIn(t, gpa, start, end, max, &merged);
+            }
+        }
+        std.mem.sort(tree.KeyValue, merged.items, {}, struct {
+            fn lt(_: void, a: tree.KeyValue, b: tree.KeyValue) bool {
+                return key.lessThan(a.key, b.key);
+            }
+        }.lt);
+        const n = @min(max, merged.items.len);
+        try out.ensureUnusedCapacity(gpa, n);
+        for (merged.items[0..n]) |kv| out.appendAssumeCapacity(kv);
+        // The moved entries are the caller's now.
+        for (merged.items[n..]) |kv| {
+            gpa.free(kv.key);
+            gpa.free(kv.value);
+        }
+        merged.items.len = 0;
+    }
+
+    fn rangeIn(t: *tree.KvTree, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        t.range(gpa, start, end, max, out) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+    }
+
+    /// Commit `t`: one member's conveyor when every record lives there;
+    /// two ordered entries by the tx's declared cross-volume order; EXDEV
+    /// otherwise (module doc).
+    pub fn commit(self: *MetaSet, t: *KvTx) Error!void {
+        var home: ?route_table.VolumeIndex = null;
+        var split = false;
+        for (t.staged.items) |s| {
+            const h = self.homeOfKey(s.tree_id, s.key) catch |e| {
+                self.abandon(t);
+                return e;
+            };
+            // A record of a slot with no tree yet (a Delete of a never-
+            // minted slot; a Put by a caller that minted elsewhere): the
+            // tree is minted here so the conveyor's routing finds it.
+            if (s.tree_id != key.TREE_CONTROL and h.be.slotTree(h.slot) == null) _ = h.be.mintGuestTree(h.slot) catch {
+                self.abandon(t);
+                return error.Io;
+            };
+            const v = self.route.volumeOf(h.slot);
+            if (home) |hv| {
+                if (hv != v) split = true;
+            } else home = v;
+        }
+        const hv = home orelse {
+            // An empty tx: nothing to route; the conveyor's own refusal.
+            return self.volumes[0].commit(t);
+        };
+        if (!split) return self.volumes[hv].commit(t);
+        return self.commitSplit(t);
+    }
+
+    /// Group the staged records by member and commit the groups in the
+    /// declared order; the guards ride the LAST entry.
+    fn commitSplit(self: *MetaSet, t: *KvTx) Error!void {
+        const gpa = self.gpa;
+        defer self.abandon(t);
+        const V = self.volumes.len;
+        const groups = try gpa.alloc(?*KvTx, V);
+        defer gpa.free(groups);
+        @memset(groups, null);
+        var made: usize = 0;
+        errdefer for (groups) |g| if (g) |gt| self.abandon(gt);
+        for (t.staged.items) |s| {
+            const h = try self.homeOfKey(s.tree_id, s.key);
+            const v = self.route.volumeOf(h.slot);
+            const g = groups[v] orelse blk: {
+                const nt = try self.begin(t.site);
+                nt.class = t.class;
+                nt.token_quiet = t.token_quiet;
+                groups[v] = nt;
+                made += 1;
+                break :blk nt;
+            };
+            switch (s.kind) {
+                .put => try g.stagePut(s.tree_id, s.key, s.value),
+                .delete => try g.stageDelete(s.tree_id, s.key),
+                .delta => try g.stageDeltaRaw(s.tree_id, s.key, s.value),
+            }
+        }
+        // The order: the child's member first or last by the hint; an
+        // independent batch in canonical order; no hint ⇒ refuse.
+        var order: [2]route_table.VolumeIndex = undefined;
+        switch (t.cross) {
+            .refuse => {
+                rstats.routing_cross_volume_refused.inc();
+                return error.CrossVolume;
+            },
+            .independent => {
+                // Every member's part is complete on its own: canonical
+                // order, the guards on the last, the first failure reported
+                // (the rest abandoned by the errdefer).
+                var remaining = made;
+                for (groups, 0..) |g, v| {
+                    const gt = g orelse continue;
+                    groups[v] = null;
+                    remaining -= 1;
+                    if (remaining == 0) {
+                        gt.guards = t.guards;
+                        t.guards = .none;
+                    } else gt.guards = .none;
+                    try self.volumes[v].commit(gt);
+                }
+                rstats.routing_split_commits.inc();
+                return;
+            },
+            .child_first, .parent_first => |child| {
+                if (made != 2) {
+                    rstats.routing_cross_volume_refused.inc();
+                    return error.CrossVolume;
+                }
+                const cv = self.route.volumeOfEffective(child);
+                if (groups[cv] == null) {
+                    rstats.routing_cross_volume_refused.inc();
+                    return error.CrossVolume;
+                }
+                var other: route_table.VolumeIndex = 0;
+                for (groups, 0..) |g, v| if (g != null and v != cv) {
+                    other = @intCast(v);
+                };
+                order = if (t.cross == .child_first) .{ cv, other } else .{ other, cv };
+            },
+        }
+        const first = groups[order[0]].?;
+        groups[order[0]] = null;
+        first.guards = .none;
+        const second = groups[order[1]].?;
+        groups[order[1]] = null;
+        second.guards = t.guards;
+        t.guards = .none;
+        self.volumes[order[0]].commit(first) catch |e| {
+            self.abandon(second);
+            return e;
+        };
+        self.volumes[order[1]].commit(second) catch |e| {
+            rstats.routing_split_partial.inc();
+            log.err("metadata set: a two-member transaction landed its first entry on member {d} but the second was refused on member {d} ({s}) — a half-applied op (fsck C9/C10 class)", .{ order[0], order[1], @errorName(e) });
+            return e;
+        };
+        rstats.routing_split_commits.inc();
+    }
+
+    /// `fsync`: every member's trailing barrier.
+    pub fn fsync(self: *MetaSet) Error!void {
+        for (self.volumes) |be| try be.fsync();
+    }
+
+    /// One full cycle with an immediate barrier on every member.
+    pub fn checkpointNow(self: *MetaSet) checkpoint_cycle.CycleError!void {
+        for (self.volumes) |be| try be.checkpointNow();
+    }
+
+    pub fn hashSeed(self: *const MetaSet) u64 {
+        return self.hash_seed;
+    }
+
+    pub fn nodeSize(self: *const MetaSet) usize {
+        return self.node_size;
+    }
+
+    pub fn setUuid(self: *const MetaSet) [16]u8 {
+        return self.set_uuid;
+    }
+
+    /// `max` over the members (the staging generation's epoch).
+    pub fn setEpoch(self: *const MetaSet) u64 {
+        var e: u64 = 0;
+        for (self.volumes) |be| e = @max(e, be.setEpoch());
+        return e;
+    }
+
+    pub const Space = backend.KvBackend.Space;
+
+    /// Σ over the members' heaps.
+    pub fn space(self: *const MetaSet) Space {
+        var s: Space = .{ .total_bytes = 0, .free_bytes = 0 };
+        for (self.volumes) |be| {
+            const v = be.space();
+            s.total_bytes += v.total_bytes;
+            s.free_bytes += v.free_bytes;
+        }
+        return s;
+    }
+
+    pub fn isFailed(self: *const MetaSet) bool {
+        for (self.volumes) |be| if (be.isFailed()) return true;
+        return false;
+    }
+
+    pub fn stampBlockMapTree(self: *MetaSet) Error!void {
+        for (self.volumes) |be| try be.stampBlockMapTree();
+    }
+
+    /// The native watermark of slot 0's host (the statfs face of a
+    /// one-member set; `allocatedInos` is the set-wide figure).
+    pub fn nextIno(self: *const MetaSet) u64 {
+        return self.volumes[0].nextIno();
+    }
+
+    /// Σ over every allocation cursor's progression (`inos.liveInodes`
+    /// before the destroys): the live-population input of `statfs`.
+    pub fn allocatedInos(self: *MetaSet) u64 {
+        var n: u64 = 0;
+        for (self.volumes) |be| {
+            const guests = be.stamp.cursorSnapshots(self.gpa) catch &.{};
+            defer if (guests.len != 0) self.gpa.free(guests);
+            n +|= inos.liveInodes(be.nextIno(), guests, 0);
+        }
+        return n;
+    }
+
+    // ---- mints ----
+
+    /// The health vector the mint pick reads: `min(1000, free/total ×
+    /// 1000)` from each member's allocator (a RAM word, never a probe);
+    /// a FAILED member is disabled.
+    fn healths(self: *MetaSet, out: []?u32) []?u32 {
+        for (self.volumes, 0..) |be, i| {
+            const sp = be.space();
+            const ns = be.nodeSize();
+            out[i] = if (be.isFailed()) null else router.volumeHealth(sp.free_bytes / ns, sp.total_bytes / ns, true);
+        }
+        return out[0..self.volumes.len];
+    }
+
+    /// Mint a child of `parent_eff` (charter §5.4 "Mint spread": round-
+    /// robin over the healthy members, then the member's rotor): pick
+    /// FIRST, ENTER the picked slot's gate on the op's `pass` (a flip of it
+    /// then drains this op too), then mint into it. `prefer_parent` keeps
+    /// the mint on the parent's member (a rename's whiteout: the op stays
+    /// on two members at most). Returns the child's EFFECTIVE (key) ino;
+    /// `globalIno` inverts it.
+    pub fn allocateIno(self: *MetaSet, parent_eff: u64, pass: *slot_gate.Pass, prefer_parent: bool) Error!u64 {
+        const parent_v = self.route.volumeOfEffective(parent_eff);
+        var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
+        const v: route_table.VolumeIndex = if (prefer_parent or self.volumes.len == 1) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
+        if (v != parent_v) rstats.routing_mint_volume_picks.inc();
+        const slot = self.rotors[v].pickSlot();
+        pass.enter(slot, self.io);
+        // The slot's host as published NOW (a flip may have moved it since
+        // the rotor was built; the gate entry above ordered us against it).
+        const be = self.volumeOfSlot(slot);
+        const local = be.allocateInoInSlot(slot) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Io,
+        };
+        return route_table.effectiveIno(inos.makeGlobalIno(local, slot, inos.ROUTING_WIDTH));
+    }
+
+    // ---- the gate ----
+
+    /// Enter the gate for every slot of `effs` (key inos) before the op's
+    /// 4a guards (`slot_gate.Pass`).
+    pub fn gateEnter(self: *MetaSet, pass: *slot_gate.Pass, effs: []const u64) void {
+        for (effs) |e| pass.enter(route_table.slotOfEffective(e), self.io);
+    }
+
+    pub fn newPass(self: *MetaSet) slot_gate.Pass {
+        return slot_gate.Pass.init(&self.gates);
+    }
+
+    // ---- the engine's faces ----
+
+    /// The set's delta tee, reset for `slot` (one migration at a time).
+    pub fn teeFor(self: *MetaSet, slot: u16, cap: usize) Allocator.Error!*routing.migration_tee.MigrationTee {
+        if (self.tee) |t| {
+            if (t.cap == cap) {
+                t.reset(slot);
+                return t;
+            }
+            t.deinit();
+            self.tee = null;
+        }
+        const t = try routing.migration_tee.MigrationTee.init(self.gpa, slot, cap);
+        self.tee = t;
+        self.tee_hook = .{ .ctx = t, .note = teeNote };
+        return t;
+    }
+
+    fn teeNote(ctx: *anyopaque, recs: []const tx.Rec) void {
+        const t: *routing.migration_tee.MigrationTee = @ptrCast(@alignCast(ctx));
+        t.noteCommitted(recs);
+    }
+
+    /// The published table (caller releases the snapshot).
+    pub fn table(self: *MetaSet) route_table.Published.Snapshot {
+        return self.route.load();
+    }
+
+    /// Re-home slot `slot` to member `volume` in the RAM table (the flip's
+    /// swap; the gate protocol guarantees no admitted mutation straddles
+    /// it) and rebuild both rotors.
+    pub fn publishSlot(self: *MetaSet, slot: u16, volume: route_table.VolumeIndex) Allocator.Error!void {
+        const snap = self.route.load();
+        defer snap.release();
+        const from = snap.value.volumeOf(slot);
+        const next = snap.value.withSlot(slot, volume);
+        try self.route.publish(self.gpa, next);
+        var buf: [router.MINT_SPREAD]u16 = undefined;
+        self.rotors[from] = router.MintRotor.init(next.hostedAscending(from, &buf));
+        self.rotors[volume] = router.MintRotor.init(next.hostedAscending(volume, &buf));
+    }
+
+    // ---- stats ----
+
+    /// The set-level words + every member's per-volume families.
+    pub fn writeStatsJson(self: *MetaSet, w: *Io.Writer) Io.Writer.Error!void {
+        try w.print("{{\"routing_volumes\":{d},\"routing_width\":{d},\"routing_set_epoch\":{d},\"routing_closed_slot\":{?d},\"volumes\":[", .{ self.volumes.len, route_table.W, self.setEpoch(), self.gates.closedSlot() });
+        for (self.volumes, 0..) |be, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.print("{{\"index\":{d},\"epoch\":{d},\"hosted_slots\":{d},\"trees\":{d},\"native\":{},\"failed\":{},\"conveyor\":", .{ i, be.setEpoch(), be.stamp.hostedCount(), be.trees.load().len, be.stamp.native_slot != null, be.isFailed() });
+            try be.conveyorStats().writeJson(w);
+            try w.writeAll(",\"checkpointer\":");
+            try counters.writeFieldsJson(&be.cp, w);
+            if (be.guard) |g| {
+                try w.writeAll(",\"guard\":");
+                try g.writeStatsJson(w);
+            }
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests (Linux; regular files under /build/tmp, O_DIRECT): the two-member
+// set end to end — format, discovery in either URI order, mints spread
+// over both members, the cross-member commit orders, remount.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const exec = @import("../exec/exec.zig");
+const economy = @import("economy.zig");
+const record = @import("record.zig");
+const geometry = @import("geometry.zig");
+const align_probe = @import("../io/align_probe.zig");
+
+pub const test_dir = "/build/tmp";
+const test_volume_len: u64 = 64 << 20;
+const test_set_identity: geometry.SetIdentity = .{ .set_uuid = "meta-set-fixture".*, .hash_seed = 0x5E7_5EED_0000_0001 };
+
+/// A formatted N-member set on regular files (the harness every routing
+/// e2e shares; `pub` for the engine's and the verbs' tests).
+pub const TestSet = struct {
+    gpa: Allocator,
+    env: std.process.Environ.Map,
+    sqz: *exec.SqzIo,
+    paths: [8][]u8 = undefined,
+    n: usize,
+
+    pub fn create(gpa: Allocator, name: []const u8, members: u16) !*TestSet {
+        const self = try gpa.create(TestSet);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .env = std.process.Environ.Map.init(gpa), .sqz = undefined, .n = members };
+        errdefer self.env.deinit();
+        self.sqz = try exec.SqzIo.testInstance();
+        errdefer self.sqz.deinit();
+        var zbuf: [linux.PATH_MAX]u8 = undefined;
+        _ = linux.mkdirat(linux.AT.FDCWD, try align_probe.pathZ(&zbuf, test_dir), 0o755);
+        for (0..members) |i| {
+            self.paths[i] = try std.fmt.allocPrint(gpa, "{s}/sqz-set-{d}-{s}-{d}.img", .{ test_dir, linux.getpid(), name, i });
+            try truncateFile(self.paths[i], test_volume_len);
+            var uuid: [16]u8 = "meta-set-vol-000".*;
+            uuid[15] = @intCast('0' + i);
+            try backend.formatVolume(gpa, self.paths[i], .{
+                .env = &self.env,
+                .node_size = 65536,
+                .journal_len_override = 1 << 20,
+                .uuid = uuid,
+                .set = test_set_identity,
+                .member_position = @intCast(i),
+                .member_count = members,
+            });
+        }
+        return self;
+    }
+
+    pub fn destroy(self: *TestSet) void {
+        for (self.paths[0..self.n]) |p| {
+            var zbuf: [linux.PATH_MAX]u8 = undefined;
+            if (align_probe.pathZ(&zbuf, p)) |z| {
+                _ = linux.unlink(z);
+            } else |_| {}
+            self.gpa.free(p);
+        }
+        self.sqz.deinit();
+        self.env.deinit();
+        self.gpa.destroy(self);
+    }
+
+    pub fn io(self: *TestSet) Io {
+        return self.sqz.io();
+    }
+
+    pub fn pathList(self: *TestSet) []const []const u8 {
+        return @ptrCast(self.paths[0..self.n]);
+    }
+
+    pub fn open(self: *TestSet) !*MetaSet {
+        return MetaSet.open(self.gpa, self.io(), self.pathList(), .{ .env = &self.env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
+    }
+
+    /// Open with the URI reversed (order independence).
+    pub fn openReversed(self: *TestSet) !*MetaSet {
+        var rev: [8][]const u8 = undefined;
+        for (0..self.n) |i| rev[i] = self.paths[self.n - 1 - i];
+        return MetaSet.open(self.gpa, self.io(), rev[0..self.n], .{ .env = &self.env, .cache_budget_bytes = 64 << 20, .cpus = 4 });
+    }
+};
+
+fn truncateFile(path: []const u8, len: u64) !void {
+    var zbuf: [linux.PATH_MAX]u8 = undefined;
+    const z = try align_probe.pathZ(&zbuf, path);
+    const rc = linux.open(z, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true, .TRUNC = true }, 0o644);
+    if (linux.errno(rc) != .SUCCESS) return error.CannotCreateDevice;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    if (linux.errno(linux.ftruncate(fd, @intCast(len))) != .SUCCESS) return error.CannotSizeDevice;
+}
+
+/// One create under `parent_global` through the facade: the mint, the
+/// records, the (possibly cross-member) commit. Returns the GLOBAL ino.
+pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
+    const parent = set.effectiveIno(parent_global);
+    const pv_bytes = (try set.lookup(set.gpa, key.TREE_INODES, &key.inodeKey(parent))) orelse return error.ParentMissing;
+    defer set.gpa.free(pv_bytes);
+    const pv = try record.InodeValue.decode(pv_bytes);
+    const t = try set.begin(@src());
+    var pass = set.newPass();
+    defer pass.exit(set.io);
+    const child = set.allocateIno(parent, &pass, false) catch |e| {
+        set.abandon(t);
+        return e;
+    };
+    const global = set.globalIno(child);
+    _ = economy.stageCreate(t, .{ .hash_seed = set.hashSeed(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global }) catch |e| {
+        set.abandon(t);
+        return e;
+    };
+    t.cross = .{ .child_first = child };
+    try set.commit(t);
+    return global;
+}
+
+pub fn present(set: *MetaSet, global: u64) !bool {
+    const got = try set.lookup(testing.allocator, key.TREE_INODES, &key.inodeKey(set.effectiveIno(global)));
+    defer if (got) |g| testing.allocator.free(g);
+    return got != null;
+}
+
+test "a two-member set: format → open (either URI order) → 200 creates spread over both members' rotors (cross-member child-first commits) → remount: every record present on its home, the stamps carry the cursors, the sweep-style cross-tree range sees everything" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "two", 2);
+    defer s.destroy();
+    var acked: [200]u64 = undefined;
+    {
+        const set = try s.open();
+        try testing.expectEqual(@as(usize, 2), set.volumeCount());
+        try testing.expectEqual(@as(?u16, 0), set.volumes[0].stamp.native_slot);
+        try testing.expectEqual(@as(?u16, null), set.volumes[1].stamp.native_slot);
+        var nb: [16]u8 = undefined;
+        for (&acked, 0..) |*a, i| a.* = try createFile(set, inos.ROOT_INO, try std.fmt.bufPrint(&nb, "f{d}", .{i}));
+        var on: [2]u32 = @splat(0);
+        for (acked, 0..) |g, i| {
+            if (!try present(set, g)) {
+                std.debug.print("acked[{d}] global {d} (slot {d}, member {d}) is absent\n", .{ i, g, route_table.slotOf(g), set.volumeIndexOfSlot(route_table.slotOf(g)) });
+                return error.TestUnexpectedResult;
+            }
+            on[set.volumeIndexOfSlot(route_table.slotOf(g))] += 1;
+        }
+        // Both members minted (the 9/10 band of two equal volumes is both).
+        try testing.expect(on[0] > 50 and on[1] > 50);
+        try testing.expect(rstats.routing_split_commits.load() > 0);
+        try testing.expect(rstats.routing_guest_trees_minted.load() >= 64);
+        // A cross-tree range (the corpse sweep's shape) over the whole
+        // ino-major space sees every inode record on both members.
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        const start = key.inodeKey(0);
+        const end = key.inodeKey(std.math.maxInt(u64));
+        try set.range(gpa, key.TREE_INODES, &start, &end, 10_000, &kvs);
+        var inode_records: usize = 0;
+        for (kvs.items) |kv| if (kv.key.len == key.INODE_KEY_LEN and kv.key[key.INO_MAJOR_KIND_OFF] == key.TREE_INODES) {
+            inode_records += 1;
+        };
+        try testing.expectEqual(@as(usize, 201), inode_records);
+        // Strictly ascending: one copy of every key, the members' own
+        // control homes (their claims at local ino 1) excluded.
+        for (kvs.items[1..], 1..) |kv, i| try testing.expect(key.lessThan(kvs.items[i - 1].key, kv.key));
+        try set.checkpointNow();
+        set.close();
+    }
+    {
+        const set = try s.openReversed();
+        defer set.close();
+        for (acked, 0..) |g, i| if (!try present(set, g)) {
+            std.debug.print("after the remount acked[{d}] global {d} (slot {d}, member {d}) is absent\n", .{ i, g, route_table.slotOf(g), set.volumeIndexOfSlot(route_table.slotOf(g)) });
+            return error.TestUnexpectedResult;
+        };
+        // The cursors travelled through the stamp: a new mint never
+        // collides with an acked ino.
+        const fresh = try createFile(set, inos.ROOT_INO, "fresh");
+        for (acked) |g| try testing.expect(g != fresh);
+        try testing.expect(try present(set, fresh));
+        try testing.expectEqual(@as(u64, 201), set.allocatedInos());
+    }
+}
+
+test "a refs range always merges every slot tree: one volume's references owned by inos in three slots on two members come back together, in key order, through the volume range and through one block's range" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "refs", 2);
+    defer s.destroy();
+    const set = try s.open();
+    defer set.close();
+    const vol: u64 = 0xBEEF;
+    // Owners in slot 0 (member 0, native), slot 1 (member 1) and slot 2
+    // (member 0, guest): a `+ref` each on blocks 7 and 9.
+    const owners = [_]u64{ 2, route_table.effectiveIno(inos.makeGlobalIno(2, 1, inos.ROUTING_WIDTH)), route_table.effectiveIno(inos.makeGlobalIno(2, 2, inos.ROUTING_WIDTH)) };
+    for (owners, 0..) |o, i| {
+        const t = try set.begin(@src());
+        try t.stagePut(key.TREE_BLOCK_REFS, &key.blockRefKey(vol, 7, o, 0), "r");
+        try t.stagePut(key.TREE_BLOCK_REFS, &key.blockRefKey(vol, 9, o, @intCast(i)), "r");
+        try set.commit(t);
+    }
+    var kvs: std.ArrayList(tree.KeyValue) = .empty;
+    defer tree.deinitKeyValues(gpa, &kvs);
+    const vr = key.volumeRange(vol);
+    try set.range(gpa, key.TREE_BLOCK_REFS, vr.lo.slice(), vr.hi.slice(), 100, &kvs);
+    try testing.expectEqual(@as(usize, 6), kvs.items.len);
+    for (kvs.items[1..], 1..) |kv, i| try testing.expect(key.lessThan(kvs.items[i - 1].key, kv.key));
+    tree.deinitKeyValues(gpa, &kvs);
+    kvs = .empty;
+    const br = key.blockRange(vol, 7);
+    try set.range(gpa, key.TREE_BLOCK_REFS, br.lo.slice(), br.hi.slice(), 100, &kvs);
+    try testing.expectEqual(@as(usize, 3), kvs.items.len);
+    for (kvs.items, owners) |kv, o| try testing.expectEqual(o, (try key.BlockRefKey.decode(kv.key)).ownerIno());
+}
+
+test "cross-member orders: a tx with no declared order spanning two members is EXDEV (counted); a parent-first tx commits the parent's member first; a three-member spread refuses" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "cross", 3);
+    defer s.destroy();
+    const set = try s.open();
+    defer set.close();
+    // Records on members 0 and 1 with no order (`commit` consumes the tx
+    // on every outcome).
+    {
+        const t = try set.begin(@src());
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(2, 0, inos.ROUTING_WIDTH))), "a");
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(2, 1, inos.ROUTING_WIDTH))), "b");
+        const r0 = rstats.routing_cross_volume_refused.load();
+        try testing.expectError(error.CrossVolume, set.commit(t));
+        try testing.expectEqual(r0 + 1, rstats.routing_cross_volume_refused.load());
+    }
+    // Parent-first: the dentry on member 0, the child's delta on member 1.
+    {
+        const child = route_table.effectiveIno(inos.makeGlobalIno(5, 1, inos.ROUTING_WIDTH));
+        const t = try set.begin(@src());
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(child), &(record.InodeValue{ .mode = 0o100644, .nlink = 1 }).encode());
+        try t.stagePut(key.TREE_DENTRIES, &key.dentryKey(1, 77, 0), "d");
+        t.cross = .{ .parent_first = child };
+        try set.commit(t);
+        const dv = (try set.lookup(gpa, key.TREE_DENTRIES, &key.dentryKey(1, 77, 0))).?;
+        defer gpa.free(dv);
+        const got = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(child))).?;
+        defer gpa.free(got);
+    }
+    // Three members in one tx: no order can hold it.
+    {
+        const t = try set.begin(@src());
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(9, 0, inos.ROUTING_WIDTH))), "a");
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(9, 1, inos.ROUTING_WIDTH))), "b");
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(9, 2, inos.ROUTING_WIDTH))), "c");
+        t.cross = .{ .child_first = route_table.effectiveIno(inos.makeGlobalIno(9, 1, inos.ROUTING_WIDTH)) };
+        try testing.expectError(error.CrossVolume, set.commit(t));
+    }
+    // An independent batch lands every member's part.
+    {
+        const t = try set.begin(@src());
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 0, inos.ROUTING_WIDTH))), "a");
+        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 2, inos.ROUTING_WIDTH))), "c");
+        t.cross = .independent;
+        try set.commit(t);
+        const a = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 0, inos.ROUTING_WIDTH))))).?;
+        defer gpa.free(a);
+        const c = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 2, inos.ROUTING_WIDTH))))).?;
+        defer gpa.free(c);
+    }
+}

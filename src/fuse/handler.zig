@@ -39,7 +39,7 @@ pub const Dispatcher = lifecycle.Dispatcher;
 pub const LoopbackDispatcher = lifecycle.Dispatcher(transport_seam.Loopback);
 
 /// The product filesystem: the Linux KV backend + the data plane.
-pub const BackendFs = if (builtin.os.tag == .linux) kv_fs.KvFs(@import("../meta/backend.zig").KvBackend, @import("../data/plane.zig").DataPlane) else struct {};
+pub const BackendFs = if (builtin.os.tag == .linux) kv_fs.KvFs(@import("../meta/meta_set.zig").MetaSet, @import("../data/plane.zig").DataPlane) else struct {};
 /// The data plane's queue-thread arms (the probe, the direct leg, the W1
 /// hold gate), bound into `ring.Binding` by the mount; null = rung 3's
 /// declines (the loopback tests, a plane-less binding).
@@ -128,6 +128,22 @@ pub const ring = struct {
             of(ctx).d.dispatch(req.op, .{ .unique = req.header.unique, .nodeid = req.header.nodeid, .uid = req.header.uid, .gid = req.header.gid, .pid = req.header.pid }, h, lease);
         }
 
+        /// The kernel nodeid of a request → the KEY ino the plane's tables
+        /// (`noteShape`, the layout and inode records, the write side) are
+        /// keyed by: the same routing law `KvFs.localOf` applies on the
+        /// lanes (charter §5.4), applied here on the queue thread so a
+        /// nodeid never reaches the plane. A nodeid and a different file's
+        /// key ino CAN coincide (global 3 = slot 1's first mint; key 3 =
+        /// slot 0's second), so an untranslated probe serves the wrong
+        /// file's bytes. Null for a nodeid outside the mint's space (the
+        /// virtual control inodes, nodeid 0): the arm declines and the lane
+        /// answers it.
+        fn keyIno(nodeid: u64) ?u64 {
+            const route_table = @import("../meta/routing/route_table.zig");
+            if (!route_table.isRoutable(nodeid)) return null;
+            return route_table.effectiveIno(nodeid);
+        }
+
         /// The READ dispatch law's arm (a): the data plane's try-only warm
         /// ladder (per-inode try-lock → the write side → hot tier → hold →
         /// NVMe read cache), on the queue thread; without a plane every
@@ -135,7 +151,7 @@ pub const ring = struct {
         fn fsProbeRead(ctx: *anyopaque, req: fsv.Request, window: []u8) ?fsv.ProbeReply {
             if (builtin.os.tag != .linux) return null;
             const arms = of(ctx).arms orelse return null;
-            return arms.plane.ladder.probeRead(req, window);
+            return arms.plane.ladder.probeRead(keyIno(req.nodeid()) orelse return null, req, window);
         }
 
         fn fsForget(ctx: *anyopaque, ino: u64, nlookup: u64) void {
@@ -149,14 +165,16 @@ pub const ring = struct {
         fn fsWriteHoldEligible(ctx: *anyopaque, hint: fsv.HoldHint) bool {
             if (builtin.os.tag != .linux) return false;
             const arms = of(ctx).arms orelse return false;
-            return arms.plane.writeHoldEligible(hint);
+            var routed = hint;
+            routed.ino = keyIno(hint.ino) orelse return false;
+            return arms.plane.writeHoldEligible(routed);
         }
 
         /// The direct device leg with its post-DMA recheck hook.
         fn fsDirectLeg(ctx: *anyopaque, req: fsv.Request) ?fsv.DirectLeg {
             if (builtin.os.tag != .linux) return null;
             const arms = of(ctx).arms orelse return null;
-            return arms.plane.ladder.directLegFor(req);
+            return arms.plane.ladder.directLegFor(keyIno(req.nodeid()) orelse return null, req);
         }
     };
 };
@@ -216,6 +234,25 @@ const RecordingTx = struct {
         return .{ .ctx = self, .submit = submit, .submit_fd_body = submitFdBody, .submit_prefilled = submitPrefilled, .fail = fail, .submit_retain = submitRetain, .release_retained = releaseRetained };
     }
 };
+
+test "ring binding: the queue-thread arms route the kernel nodeid with the lanes' law — the probe/hold/leg ino IS `KvFs.localOf`; the smoke's collision pair (nodeid 3 = slot 1's first mint, key 3 = slot 0's second) resolves to two different files" {
+    const nodeid_slot1_first: u64 = 3;
+    const nodeid_slot0_second: u64 = 65_538;
+    try testing.expectEqual(try kv_fs.MemFs.localOf(nodeid_slot1_first), ring.Binding.keyIno(nodeid_slot1_first).?);
+    try testing.expectEqual(try kv_fs.MemFs.localOf(nodeid_slot0_second), ring.Binding.keyIno(nodeid_slot0_second).?);
+    // Untranslated, nodeid 3 names the key of slot 0's second file.
+    try testing.expectEqual(@as(u64, 3), ring.Binding.keyIno(nodeid_slot0_second).?);
+    try testing.expect(ring.Binding.keyIno(nodeid_slot1_first).? != nodeid_slot1_first);
+    try testing.expectEqual(@as(u64, 1), ring.Binding.keyIno(1).?);
+    // Outside the mint's space — a virtual control ino (`bench` reads
+    // `.stats` under the probe), nodeid 0 — the arm declines and the lane
+    // answers ENOENT; neither reaches the law.
+    const virtual = virtual_inodes.GEN_INO_FIRST;
+    try testing.expect(virtual_inodes.isVirtualIno(virtual));
+    try testing.expectEqual(@as(?u64, null), ring.Binding.keyIno(virtual));
+    try testing.expectEqual(@as(?u64, null), ring.Binding.keyIno(0));
+    try testing.expectError(error.FileNotFound, kv_fs.MemFs.localOf(virtual));
+}
 
 test "ring binding: the session's vtable reaches the lifecycle — init negotiates, a dispatch answers through the handle exactly once, the probe declines, forget hands off, destroy sweeps" {
     var store = try kv_fs.MemStore.init(testing.allocator);

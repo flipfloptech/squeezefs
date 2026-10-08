@@ -3,17 +3,18 @@
 //! `docs/porting/data_transform_config.md` §5.6 f): the set format. Linux
 //! only.
 //!
-//! One metadata volume as a v4 one-member forest (decision 0003 Q2;
-//! `--single-writer` names the class the image already is; the symmetric
-//! plane is rung 6's and lands on a live volume) plus ZERO OR MORE data
-//! volumes, each given its identity (`data/data_superblock.zig`), and the
-//! set's ONE `set_config` control record written by the format transaction
-//! into tree 0 of the metadata volume (`data/set_config.zig`): block size,
-//! chunk, the transform, the key reference, every data volume with its
-//! `vol_tag`, the cache paths. A metadata set of more than one member is
-//! rung 5's (`W = 2^16` stamps) and refused here; a set with no data
-//! volume is legal at this rung (the data plane is not yet wired into the
-//! filesystem) and records an empty list.
+//! ONE OR MORE metadata volumes as a v4 set (decision 0003 Q2; charter
+//! §5.4: member `p` of `n` stamps the stride run `{p, n, ceil((W − p)/n)}`
+//! — the identity distribution, one run per member; member 0 hosts slot
+//! 0's native keyspace and the `set_config` record; `--single-writer`
+//! names the class the image already is; the symmetric plane is rung 6's
+//! and lands on a live volume) plus ZERO OR MORE data volumes, each given
+//! its identity (`data/data_superblock.zig`), and the set's ONE
+//! `set_config` control record written by the format transaction into
+//! tree 0 of member 0 (`data/set_config.zig`): block size, chunk, the
+//! transform, the key reference, every data volume with its `vol_tag`,
+//! the cache paths. A set with no data volume is legal and records an
+//! empty list.
 //!
 //! The order, with NO destructive step before every verdict: parse → key
 //! material + salt + key id (an encrypted set) → the io pool → the
@@ -128,10 +129,10 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         p.stderr.print("squeezefs format: {f}\n", .{udiag}) catch {};
         return cli.exit_usage;
     };
-    if (meta.paths.len != 1) {
-        p.stderr.print("squeezefs format: {s} names {d} metadata volumes; this rung formats ONE (a metadata set is rung 5's)\n", .{ f.meta_uri, meta.paths.len }) catch {};
+    for (meta.paths, 0..) |mp, i| for (meta.paths[0..i]) |prev| if (std.mem.eql(u8, prev, mp)) {
+        p.stderr.print("squeezefs format: metadata volume {s} is named twice\n", .{mp}) catch {};
         return cli.exit_failed;
-    }
+    };
     const path = meta.first();
 
     // Every data path, flattened across the `sqdata://` words.
@@ -152,10 +153,10 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
                 p.stderr.print("squeezefs format: data volume {s} is named twice\n", .{dp}) catch {};
                 return cli.exit_failed;
             };
-            if (std.mem.eql(u8, dp, path)) {
-                p.stderr.print("squeezefs format: {s} is named as both the metadata volume and a data volume\n", .{dp}) catch {};
+            for (meta.paths) |mp| if (std.mem.eql(u8, dp, mp)) {
+                p.stderr.print("squeezefs format: {s} is named as both a metadata volume and a data volume\n", .{dp}) catch {};
                 return cli.exit_failed;
-            }
+            };
             data_paths[n_data] = dp;
             n_data += 1;
         }
@@ -205,22 +206,22 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
     };
     defer pool.deinit();
 
-    // The metadata preflight.
-    if (status.writerGuardHeld(path)) {
-        p.stderr.print("squeezefs format: cannot format {s}: a live daemon holds its single-writer guard (umount it first; --force does not override a live mount)\n", .{path}) catch {};
-        return cli.exit_failed;
-    }
-    var reason_buf: [512]u8 = undefined;
-    const prior = status.classify(p.gpa, p.env, pool, path, &reason_buf) catch |e| {
-        p.stderr.print("squeezefs format: cannot read {s}: {s}\n", .{ path, @errorName(e) }) catch {};
-        return cli.exit_failed;
-    };
-    {
+    // The metadata preflight, every member.
+    for (meta.paths) |mp| {
+        if (status.writerGuardHeld(mp)) {
+            p.stderr.print("squeezefs format: cannot format {s}: a live daemon holds its single-writer guard (umount it first; --force does not override a live mount)\n", .{mp}) catch {};
+            return cli.exit_failed;
+        }
+        var reason_buf: [512]u8 = undefined;
+        const prior = status.classify(p.gpa, p.env, pool, mp, &reason_buf) catch |e| {
+            p.stderr.print("squeezefs format: cannot read {s}: {s}\n", .{ mp, @errorName(e) }) catch {};
+            return cli.exit_failed;
+        };
         var gate_buf: [1024]u8 = undefined;
         var gw: Io.Writer = .fixed(&gate_buf);
         const go = forceGate(prior.prior, f.force, &gw) catch false;
         if (!go) {
-            p.stderr.print("squeezefs format: {s}\n", .{gw.buffered()}) catch {};
+            p.stderr.print("squeezefs format: {s}: {s}\n", .{ mp, gw.buffered() }) catch {};
             return cli.exit_failed;
         }
     }
@@ -264,10 +265,11 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         devices[i] = .{ .path = dp, .volume_len = volume_len, .next_generation = if (opened) |o| o.next_generation else 1 };
     }
 
-    // Identities: per-volume uuid, the set's (uuid, hash seed), a tag and a
-    // device uuid per data volume — every one an independent draw.
-    var vol_uuid: [16]u8 = undefined;
-    p.io.randomSecure(&vol_uuid) catch {
+    // Identities: a uuid per metadata volume, the set's (uuid, hash seed),
+    // a tag and a device uuid per data volume — every one an independent
+    // draw.
+    var vol_uuids: [uri.MAX_MEMBERS][16]u8 = undefined;
+    for (vol_uuids[0..meta.paths.len]) |*u| p.io.randomSecure(u) catch {
         p.stderr.writeAll("squeezefs format: getrandom failed\n") catch {};
         return cli.exit_failed;
     };
@@ -336,26 +338,32 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         };
     }
 
-    // The metadata volume, with the record in tree 0.
-    backend.formatVolume(p.gpa, path, .{
-        .env = p.env,
-        .pool = pool,
-        .node_size = node_size,
-        .journal_len_override = f.journal_len,
-        .uuid = vol_uuid,
-        .set = set,
-        .root_uid = owner.uid,
-        .root_gid = owner.gid,
-        .control_records = &.{.{ .key = set_config.CONTROL_KEY, .seq = 0, .kind = .put, .value = record_bytes }},
-    }) catch |e| {
-        p.stderr.print("squeezefs format: {s}: {s}\n", .{ path, formatErrorText(e) }) catch {};
-        return cli.exit_failed;
-    };
+    // The metadata members, member 0 (slot 0's host) with the record in
+    // tree 0, every member its stride run.
+    for (meta.paths, 0..) |mp, i| {
+        backend.formatVolume(p.gpa, mp, .{
+            .env = p.env,
+            .pool = pool,
+            .node_size = node_size,
+            .journal_len_override = f.journal_len,
+            .uuid = vol_uuids[i],
+            .set = set,
+            .root_uid = owner.uid,
+            .root_gid = owner.gid,
+            .member_position = @intCast(i),
+            .member_count = @intCast(meta.paths.len),
+            .control_records = if (i == 0) &.{.{ .key = set_config.CONTROL_KEY, .seq = 0, .kind = .put, .value = record_bytes }} else &.{},
+        }) catch |e| {
+            p.stderr.print("squeezefs format: {s}: {s}\n", .{ mp, formatErrorText(e) }) catch {};
+            return cli.exit_failed;
+        };
+    }
 
     // The summary.
     const vlen = device_loader.volumeLength(path) catch 0;
-    p.stdout.print("formatted {s}: SqueezeFS format v4, one-member forest ({s}), {d} B, node {d} B, journal {s}, root owner {d}:{d}\n", .{
+    p.stdout.print("formatted {s}: SqueezeFS format v4, {d}-member set ({s}), member 0 {d} B, node {d} B, journal {s}, root owner {d}:{d}\n", .{
         f.meta_uri,
+        meta.paths.len,
         if (f.single_writer) "--single-writer: the single-writer class" else "the symmetric plane is stamped on a live volume at rung 6; today's image is the single-writer class",
         vlen,
         node_size,

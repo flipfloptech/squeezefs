@@ -6,8 +6,11 @@
 //! the members canonically and builds the slot → volume table; every op
 //! routes by the ONE key law (`route_table.slotOfKey`: the key's slot →
 //! its host → the host's tree for the slot), mints spread over the healthy
-//! volumes' rotors (`router.pickMintVolume`, `MintRotor`), and the cutover
-//! gate parks an op whose slot is mid-flip BEFORE its 4a guards.
+//! volumes' rotors (`router.pickMintVolume`, `MintRotor`) and, on an armed
+//! volume, the slot plane's mint decision (parent affinity under the
+//! ceiling, else the rotor tree with the most headroom); the commit DOOR
+//! (`sym/slots/door.zig`, the host's conveyor step 0) parks a commit whose
+//! slot is mid-flip or mid-handover and refuses one another appender leases.
 //!
 //! Cross-volume transactions (one op's records on two members): a tx
 //! names its ORDER (`tx.CrossVolume`) and the facade commits two ordered
@@ -43,11 +46,11 @@ const checkpoint_cycle = @import("checkpoint_cycle.zig");
 const backend = @import("backend.zig");
 const guard = @import("guard.zig");
 const routing = @import("routing.zig");
+const routing_slots = @import("sym.zig").slots;
 const router = @import("../data/router.zig");
 
 const route_table = routing.route_table;
 const discovery = routing.discovery;
-const slot_gate = routing.slot_gate;
 const rstats = routing.stats.stats;
 
 comptime {
@@ -96,10 +99,11 @@ pub const MetaSet = struct {
     pool: *uring_fs.Pool,
     pool_owned: bool,
     route: route_table.Published,
-    gates: slot_gate.SlotGates,
     /// Per volume: the mint set (its first ≤ 64 hosted slots) and rotor.
     rotors: []router.MintRotor,
     mint_rr: std.atomic.Value(u64) = .init(0),
+    /// The slot decision's tie-break cursor (apart from the member pick's).
+    slot_rr: std.atomic.Value(u64) = .init(0),
     set_uuid: [16]u8,
     hash_seed: u64,
     node_size: u32,
@@ -195,15 +199,12 @@ pub const MetaSet = struct {
             .pool = pool,
             .pool_owned = opts.pool == null,
             .route = try route_table.Published.init(gpa, initial),
-            .gates = undefined,
             .rotors = rotors,
             .set_uuid = disc.set_uuid,
             .hash_seed = disc.hash_seed,
             .node_size = disc.node_size,
         };
         errdefer self.route.deinit();
-        self.gates = try slot_gate.SlotGates.init(gpa);
-        errdefer self.gates.deinit();
         if (!opts.read_only) try self.convergeDualClaims(disc.dual_claims);
         log.info("metadata set {x:0>2}{x:0>2}{x:0>2}{x:0>2}…: {d} member(s) mounted in canonical order, epoch {d}, {d} dual claim(s) converged, native keyspace on member {d}", .{ disc.set_uuid[0], disc.set_uuid[1], disc.set_uuid[2], disc.set_uuid[3], paths.len, disc.set_epoch, disc.dual_claims.len, disc.native_volume });
         return self;
@@ -247,7 +248,6 @@ pub const MetaSet = struct {
             for (self.volumes) |be| be.close();
         }
         if (self.tee) |t| t.deinit();
-        self.gates.deinit();
         self.route.deinit();
         gpa.free(self.rotors);
         gpa.free(self.volumes);
@@ -588,21 +588,23 @@ pub const MetaSet = struct {
     }
 
     /// Mint a child of `parent_eff` (charter §5.4 "Mint spread": round-
-    /// robin over the healthy members, then the member's rotor): pick
-    /// FIRST, ENTER the picked slot's gate on the op's `pass` (a flip of it
-    /// then drains this op too), then mint into it. `prefer_parent` keeps
-    /// the mint on the parent's member (a rename's whiteout: the op stays
-    /// on two members at most). Returns the child's EFFECTIVE (key) ino;
-    /// `globalIno` inverts it.
-    pub fn allocateIno(self: *MetaSet, parent_eff: u64, pass: *slot_gate.Pass, prefer_parent: bool) Error!u64 {
+    /// robin over the healthy members; charter §5.5 "Slot acquisition and
+    /// minting": on an armed member the plane's decision — `gather`, the
+    /// parent's slot under the affinity ceiling, else the rotor tree with
+    /// the most headroom, an overflow rotor past the cap — else the
+    /// member's rotor). `prefer_parent` keeps the mint on the parent's
+    /// member (a rename's whiteout: the op stays on two members at most).
+    /// The child's slot takes its door token at the commit (the record
+    /// names it). Returns the child's EFFECTIVE (key) ino; `globalIno`
+    /// inverts it.
+    pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool) Error!u64 {
         const parent_v = self.route.volumeOfEffective(parent_eff);
         var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
         const v: route_table.VolumeIndex = if (prefer_parent or self.volumes.len == 1) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
-        const slot = self.rotors[v].pickSlot();
-        pass.enter(slot, self.io);
-        // The slot's host as published NOW (a flip may have moved it since
-        // the rotor was built; the gate entry above ordered us against it).
+        const parent_slot = route_table.slotOfEffective(parent_eff);
+        const rr = self.slot_rr.fetchAdd(1, .monotonic);
+        const slot = self.volumes[v].slots.mintSlot(parent_slot, v == parent_v, gather, rr) orelse self.rotors[v].pickSlot();
         const be = self.volumeOfSlot(slot);
         const local = be.allocateInoInSlot(slot) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
@@ -611,16 +613,17 @@ pub const MetaSet = struct {
         return route_table.effectiveIno(inos.makeGlobalIno(local, slot, inos.ROUTING_WIDTH));
     }
 
-    // ---- the gate ----
-
-    /// Enter the gate for every slot of `effs` (key inos) before the op's
-    /// 4a guards (`slot_gate.Pass`).
-    pub fn gateEnter(self: *MetaSet, pass: *slot_gate.Pass, effs: []const u64) void {
-        for (effs) |e| pass.enter(route_table.slotOfEffective(e), self.io);
+    /// The filesystem's directory-parent memo for the handover's subtree
+    /// credit (charter §5.5 "`ops_h` counts the holder's namespace ops on
+    /// the slot's SUBTREE"): bound on every member's plane.
+    pub fn bindParentMemo(self: *MetaSet, memo: routing_slots.handover.ParentMemo) void {
+        for (self.volumes) |be| be.slots.bindMemo(memo);
     }
 
-    pub fn newPass(self: *MetaSet) slot_gate.Pass {
-        return slot_gate.Pass.init(&self.gates);
+    /// The one closed cutover slot across the members, if any.
+    fn closedSlot(self: *MetaSet) ?u16 {
+        for (self.volumes) |be| if (be.slots.door.closedSlot()) |s| return s;
+        return null;
     }
 
     // ---- the engine's faces ----
@@ -669,7 +672,7 @@ pub const MetaSet = struct {
 
     /// The set-level words + every member's per-volume families.
     pub fn writeStatsJson(self: *MetaSet, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("{{\"routing_volumes\":{d},\"routing_width\":{d},\"routing_set_epoch\":{d},\"routing_closed_slot\":{?d},\"volumes\":[", .{ self.volumes.len, route_table.W, self.setEpoch(), self.gates.closedSlot() });
+        try w.print("{{\"routing_volumes\":{d},\"routing_width\":{d},\"routing_set_epoch\":{d},\"routing_closed_slot\":{?d},\"volumes\":[", .{ self.volumes.len, route_table.W, self.setEpoch(), self.closedSlot() });
         for (self.volumes, 0..) |be, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"index\":{d},\"epoch\":{d},\"hosted_slots\":{d},\"trees\":{d},\"native\":{},\"failed\":{},\"conveyor\":", .{ i, be.setEpoch(), be.stamp.hostedCount(), be.trees.load().len, be.stamp.native_slot != null, be.isFailed() });
@@ -794,9 +797,7 @@ pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
     defer set.gpa.free(pv_bytes);
     const pv = try record.InodeValue.decode(pv_bytes);
     const t = try set.begin(@src());
-    var pass = set.newPass();
-    defer pass.exit(set.io);
-    const child = set.allocateIno(parent, &pass, false) catch |e| {
+    const child = set.allocateIno(parent, false, false) catch |e| {
         set.abandon(t);
         return e;
     };

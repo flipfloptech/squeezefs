@@ -111,7 +111,8 @@ const virtual_inodes = @import("virtual_inodes.zig");
 const inos = @import("../../meta/inos.zig");
 const jc = @import("../../meta/journal_core.zig");
 const route_table = @import("../../meta/routing/route_table.zig");
-const slot_gate = @import("../../meta/routing/slot_gate.zig");
+const sym_handover = @import("../../meta/sym/slots/handover.zig");
+const sym_acquire = @import("../../meta/sym/slots/acquire.zig");
 const read_divert = @import("../../meta/sym/tokens/read_divert.zig");
 const layout = @import("../../data/layout.zig");
 const staging = @import("../../data/staging.zig");
@@ -251,7 +252,7 @@ pub const VirtualFace = struct {
 
 pub fn assertStore(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "allocateIno", "allocatedInos", "newPass", "gateEnter", "hashSeed", "nodeSize", "space", "isFailed" }) |name| {
+        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "allocateIno", "allocatedInos", "hashSeed", "nodeSize", "space", "isFailed" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Store: lacks `" ++ name ++ "`");
         }
     }
@@ -278,19 +279,17 @@ pub const Options = struct {
     gid: u32 = 0,
 };
 
-/// A held 4a set travelling with a transaction, and the cutover-gate
-/// entries the op took BEFORE it (charter §5.4: parked ops hold nothing);
-/// both drop at the terminal outcome.
+/// A held 4a set travelling with a transaction; it drops at the terminal
+/// outcome (the commit door's per-slot tokens ride the queue entry beside
+/// it — charter §5.5, taken at the conveyor's step 0).
 const HeldGuards = struct {
     gpa: Allocator,
     io: Io,
     set: dlm.GuardSet,
-    pass: slot_gate.Pass,
 
     fn releaseFn(ctx: *anyopaque) void {
         const self: *HeldGuards = @ptrCast(@alignCast(ctx));
         self.set.release(self.io);
-        self.pass.exit(self.io);
         self.gpa.destroy(self);
     }
 
@@ -600,8 +599,20 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// predicate stays the authority for its names.
         pub fn xattrNameAllowed(name: []const u8) bool {
             if (guard_claim.isGuardXattr(name)) return false;
+            // `user.squeezefs.gather` is the ONE user-settable name of the
+            // reserved family (charter §5.5 "`setfattr -n
+            // user.squeezefs.gather -v 1 <dir>`"), admitted BY NAME.
+            if (std.mem.eql(u8, name, sym_acquire.GATHER_XATTR)) return true;
             if (std.mem.startsWith(u8, name, "user.")) return !std.mem.startsWith(u8, name, "user.squeezefs.");
             return std.mem.startsWith(u8, name, "security.") or std.mem.startsWith(u8, name, "trusted.");
+        }
+
+        /// The directory's `user.squeezefs.gather` opt-in: its children
+        /// mint into the directory's slot (read-mostly directories).
+        fn gatherOptIn(self: *Self, parent: u64) Error!bool {
+            const v = (try self.xattrValue(parent, sym_acquire.GATHER_XATTR)) orelse return false;
+            defer self.gpa.free(v);
+            return sym_acquire.gatherOptIn(v);
         }
 
         fn isReservedXattr(name: []const u8) bool {
@@ -768,16 +779,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try t.stagePut(key.TREE_XATTRS, k, enc);
         }
 
-        /// The cutover gate for every slot the plan names, THEN the 4a set
-        /// (charter §2 lock order: a parked op holds no guard).
+        /// The op's canonical 4a set (charter §2 lock order: one multi-key
+        /// acquisition per op, taken holding no other 4a guard; the commit
+        /// door comes after it, at the commit).
         fn lockPlan(self: *Self, plan: *const economy.GuardPlan) Error!*HeldGuards {
             const held = try self.gpa.create(HeldGuards);
             errdefer self.gpa.destroy(held);
-            held.* = .{ .gpa = self.gpa, .io = self.io, .set = undefined, .pass = self.store.newPass() };
-            var effs: [dlm.max_requests]u64 = undefined;
-            for (plan.inodes(), 0..) |r, i| effs[i] = r.ino;
-            self.store.gateEnter(&held.pass, effs[0..plan.inodes().len]);
-            errdefer held.pass.exit(self.io);
+            held.* = .{ .gpa = self.gpa, .io = self.io, .set = undefined };
             held.set = self.locks.lockManyUncancelable(self.io, plan.inodes(), plan.dentries()) catch return error.InvalidArgument;
             return held;
         }
@@ -809,6 +817,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // at the terminal outcome, on its thread).
             lock_order.handedOff(.object);
             self.store.commit(t) catch |e| return storeErr(e);
+        }
+
+        fn parentMemoSeam(ctx: *anyopaque, dir: u64) ?u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.parentOf(dir);
         }
 
         fn rememberParent(self: *Self, dir: u64, parent: u64) void {
@@ -1094,6 +1107,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn init(self: *Self, _: *Ctx, a: filesystem.InitArgs) Error!void {
             self.minor = a.minor;
             self.killpriv_v2 = a.has(abi.FUSE_HANDLE_KILLPRIV_V2);
+            // The directory-parent memo feeds the handover's subtree credit.
+            if (@hasDecl(Store, "bindParentMemo")) self.store.bindParentMemo(.{ .ctx = self, .parentOf = parentMemoSeam });
             fuse_killpriv_negotiated.set(@intFromBool(self.killpriv_v2));
             log.info("kv_fs: FUSE 7.{d}; KILLPRIV_V2 {s}; inline_max {d} B; block {d} B; data volumes {s}; staging {s}", .{ self.minor, if (self.killpriv_v2) "negotiated" else "absent", self.inline_max, self.block_size, if (self.data.hasVolumes()) "yes" else "NONE (inline only)", if (self.data.stagingOn()) "on" else "off" });
         }
@@ -1464,7 +1479,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             if (try self.scanChain(parent, name, &chain, &kvs) != null) return error.PathAlreadyExists;
-            const local = self.store.allocateIno(parent, &held.pass, false) catch |e| return storeErr(e);
+            const local = self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
             const global = globalOf(local);
             // The child may live on another member (mint spread): its inode
             // lands first, the dentry second.
@@ -1607,7 +1622,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (whiteout) {
                 // On the old parent's member: the op stays on two members
                 // at most (the dentries' and the moved inode's).
-                const l = self.store.allocateIno(old_parent, &held.pass, true) catch |e| return storeErr(e);
+                const l = self.store.allocateIno(old_parent, true, false) catch |e| return storeErr(e);
                 wo = .{ .local = l, .global = globalOf(l) };
             }
             // Both parents' dentries first, the moved inode's Δctime
@@ -2374,15 +2389,11 @@ pub const MemStore = struct {
     node_size_: usize = 65536,
     commits: u64 = 0,
     fsyncs: u64 = 0,
-    /// The cutover gate every op passes (never closed here: the one-store
-    /// set has no migration).
-    gates: slot_gate.SlotGates,
 
     const Row = struct { kind: u8, k: []u8, v: []u8 };
 
     pub fn init(gpa: Allocator) Allocator.Error!MemStore {
-        var self: MemStore = .{ .gpa = gpa, .gates = try slot_gate.SlotGates.init(gpa) };
-        errdefer self.gates.deinit();
+        var self: MemStore = .{ .gpa = gpa };
         // The root directory, as `format` writes it.
         const root: InodeValue = .{ .mode = S.IFDIR | 0o755, .nlink = 2, .atime = 1, .mtime = 1, .ctime = 1 };
         try self.upsert(key.TREE_INODES, &key.inodeKey(inos.ROOT_INO), &root.encode());
@@ -2395,7 +2406,6 @@ pub const MemStore = struct {
             self.gpa.free(r.v);
         }
         self.entries.deinit(self.gpa);
-        self.gates.deinit();
     }
 
     pub fn coreError(e: StoreError) errors.Error {
@@ -2506,9 +2516,9 @@ pub const MemStore = struct {
         self.fsyncs += 1;
     }
 
-    /// One store, one keyspace: the parent and the gate are the set
-    /// facade's concerns; every mint is slot 0's.
-    pub fn allocateIno(self: *MemStore, _: u64, _: *slot_gate.Pass, _: bool) StoreError!u64 {
+    /// One store, one keyspace: the parent and the mint decision are the
+    /// set facade's concerns; every mint is slot 0's.
+    pub fn allocateIno(self: *MemStore, _: u64, _: bool, _: bool) StoreError!u64 {
         self.lock.lock();
         defer self.lock.unlock();
         const i = self.next_ino;
@@ -2521,13 +2531,6 @@ pub const MemStore = struct {
         defer self.lock.unlock();
         return self.next_ino - inos.LOCAL_INO_BASE;
     }
-
-    pub fn newPass(self: *MemStore) slot_gate.Pass {
-        return slot_gate.Pass.init(&self.gates);
-    }
-
-    /// No slot ever migrates out of the one store: nothing to enter.
-    pub fn gateEnter(_: *MemStore, _: *slot_gate.Pass, _: []const u64) void {}
 
     pub fn hashSeed(self: *const MemStore) u64 {
         return self.seed;
@@ -3045,6 +3048,8 @@ test "the xattr allowlist: user.* yes (minus user.squeezefs.*), security.* and t
     try testing.expect(MemFs.xattrNameAllowed("user.mime_type"));
     try testing.expect(!MemFs.xattrNameAllowed("user.squeezefs.x"));
     try testing.expect(!MemFs.xattrNameAllowed("user.squeezefs.il0"));
+    // The ONE user-settable name of the reserved family.
+    try testing.expect(MemFs.xattrNameAllowed("user.squeezefs.gather"));
     try testing.expect(MemFs.xattrNameAllowed("security.capability"));
     try testing.expect(MemFs.xattrNameAllowed("trusted.x"));
     try testing.expect(!MemFs.xattrNameAllowed("layout"));

@@ -54,22 +54,25 @@ pub const stats = struct {
     /// `backend_fill_spread`: `max − min` fill over the eligible rows, ppm
     /// (G-VL-8: ≤ 100,000 after a rebalance).
     pub var backend_fill_spread: counters.Gauge = .{};
-    /// `slot_rotor`: rotor slots in the mint set of the volume last spread.
-    pub var slot_rotor: counters.Gauge = .{};
-    /// `rotor_mints`: inos minted through a rotor.
-    pub var rotor_mints: counters.ShardedCounter = .{};
+    /// `placement_rotor_slots`: rotor slots in the mint set of the volume
+    /// last spread (the placement rotor — the fallback of a volume whose
+    /// slot-lease plane is unarmed; `slot_rotor` is the plane's `M`).
+    pub var placement_rotor_slots: counters.Gauge = .{};
+    /// `placement_rotor_mints`: inos minted through the placement rotor
+    /// (the plane's decision counts `rotor_mints` / `affinity_mints`).
+    pub var placement_rotor_mints: counters.ShardedCounter = .{};
     /// `mint_volume_picks`: `pick_mint_volume` decisions.
     pub var mint_volume_picks: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"backend_placement_picks\":{d},\"placement_table_refreshes\":{d},\"placement_no_healthy_refusals\":{d},\"backend_fill_spread\":{d},\"slot_rotor\":{d},\"rotor_mints\":{d},\"mint_volume_picks\":{d}}}", .{
+    try w.print("{{\"backend_placement_picks\":{d},\"placement_table_refreshes\":{d},\"placement_no_healthy_refusals\":{d},\"backend_fill_spread\":{d},\"placement_rotor_slots\":{d},\"placement_rotor_mints\":{d},\"mint_volume_picks\":{d}}}", .{
         stats.backend_placement_picks.load(),
         stats.placement_table_refreshes.load(),
         stats.placement_no_healthy_refusals.load(),
         stats.backend_fill_spread.load(),
-        stats.slot_rotor.load(),
-        stats.rotor_mints.load(),
+        stats.placement_rotor_slots.load(),
+        stats.placement_rotor_mints.load(),
         stats.mint_volume_picks.load(),
     });
 }
@@ -454,7 +457,7 @@ pub const MintRotor = struct {
             r.mints[i] = s;
         }
         r.len = @intCast(n);
-        stats.slot_rotor.set(n);
+        stats.placement_rotor_slots.set(n);
         return r;
     }
 
@@ -466,7 +469,7 @@ pub const MintRotor = struct {
     pub fn pickSlot(self: *MintRotor) u16 {
         if (self.len == 0) return 0;
         const k = self.rr.fetchAdd(1, .monotonic) % self.len;
-        stats.rotor_mints.inc();
+        stats.placement_rotor_mints.inc();
         return self.mints[@intCast(k)];
     }
 };
@@ -895,14 +898,14 @@ test "mint ties: W = 2^16; MINT_SPREAD = STAMP_MAX_CURSORS / 4 = 64; volume heal
     for (&hosted, 0..) |*s, i| s.* = @intCast(i * 3 + 1);
     var rotor = MintRotor.init(&hosted);
     try testing.expectEqual(@as(usize, 64), rotor.mintSet().len);
-    try testing.expectEqual(@as(u64, 64), stats.slot_rotor.load());
+    try testing.expectEqual(@as(u64, 64), stats.placement_rotor_slots.load());
     try testing.expectEqual(@as(u16, 1), rotor.mintSet()[0]);
     try testing.expectEqual(@as(u16, 190), rotor.mintSet()[63]);
-    const m0 = stats.rotor_mints.load();
+    const m0 = stats.placement_rotor_mints.load();
     var hits: [200]u32 = @splat(0);
     for (0..128) |_| hits[rotor.pickSlot()] += 1;
     for (rotor.mintSet()) |s| try testing.expectEqual(@as(u32, 2), hits[s]);
-    try testing.expectEqual(m0 + 128, stats.rotor_mints.load());
+    try testing.expectEqual(m0 + 128, stats.placement_rotor_mints.load());
     var small = MintRotor.init(&.{ 5, 9 });
     try testing.expectEqual(@as(u16, 5), small.pickSlot());
     try testing.expectEqual(@as(u16, 9), small.pickSlot());

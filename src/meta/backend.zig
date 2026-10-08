@@ -114,6 +114,7 @@ const routing = @import("routing.zig");
 const slot_state = routing.slot_state;
 const stamp_cell = routing.stamp_cell;
 const sym = @import("sym.zig");
+const slots_plane = @import("sym/slots/plane.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("backend is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -369,6 +370,9 @@ pub const KvBackend = struct {
     /// with `is_manager`, the in-process regions, the manager); null on a
     /// single-writer volume.
     sym: ?*sym.bind.AppenderSet = null,
+    /// The slot-lease plane: the commit door from the first commit (its
+    /// cutover state serves every volume), armed by the appender set.
+    slots: *slots_plane.Plane,
     closed: bool = false,
 
     // ---- open ----
@@ -498,6 +502,7 @@ pub const KvBackend = struct {
             .seq = node_seq.NodeSeqHandle.shared(@max(mounted.seq, mounted.node_seq_watermark)),
             .trees = undefined,
             .stamp = undefined,
+            .slots = undefined,
             .ring_layout = ring_layout,
             .geo = geo,
             .core = jc.JournalCore.init(geo, recovery.head_pos, mounted.journal_tail_seq),
@@ -552,6 +557,10 @@ pub const KvBackend = struct {
             else => return error.Corrupt,
         };
         try be.openGuestTrees(recovery.entries);
+        errdefer {
+            be.guest_published.deinit(gpa);
+            be.guest_cursor_floors.deinit(gpa);
+        }
         _ = tree.replayEntries(gpa, be.trees.load(), recovery.entries) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Io => return error.Io,
@@ -587,9 +596,12 @@ pub const KvBackend = struct {
         {
             var it = fold.guest_max.iterator();
             while (it.next()) |e| try be.stamp.installFloor(e.key_ptr.*, fold.guestCursor(e.key_ptr.*, mounted.membership_stamp.cursorFor(e.key_ptr.*) orelse 0));
-            var pit = be.guest_published.iterator();
-            while (pit.next()) |e| {
-                if (be.guest_cursor_floors.get(e.key_ptr.*)) |floor| try be.stamp.installFloor(e.key_ptr.*, floor);
+            var fit = be.guest_cursor_floors.iterator();
+            while (fit.next()) |e| {
+                // The native slot's lease cursor floors the native
+                // watermark (the lease carries the cursor; the ledger
+                // stamp's `next_ino` is the older of the two homes).
+                if (mounted.membership_stamp.native_slot == e.key_ptr.*) be.ino.installFloor(e.value_ptr.*) else try be.stamp.installFloor(e.key_ptr.*, e.value_ptr.*);
             }
         }
 
@@ -600,8 +612,11 @@ pub const KvBackend = struct {
         be.reg.recoverSeqOffset(journal.seqOffsetOfWindow(recovery.entries));
         try be.alignRingHead();
 
-        // 9. The lane, the checkpointer, the bring-up cover, the conveyor,
-        // the task thread.
+        // 9. The slot plane (the door from the first commit; the cycle's
+        // publication hooks read it), the lane, the checkpointer, the
+        // bring-up cover, the conveyor, the task thread.
+        be.slots = try slots_plane.Plane.init(gpa, io, be, opts.env);
+        errdefer be.slots.deinit();
         be.lane = journal_lane.JournalLane.spawn(gpa, opts.env, .{
             .path = be.path,
             .index = opts.index,
@@ -679,6 +694,7 @@ pub const KvBackend = struct {
             .smo_journal = &be.smo_journal,
             .caps = conveyor.resolveCaps(opts.env, cpus, geo),
             .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
+            .door = be.slots.doorSeam(),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -901,7 +917,13 @@ pub const KvBackend = struct {
     /// membership with the live cursor cells folded in.
     fn stampForLedger(ctx: *anyopaque) ledger.MembershipStamp {
         const be: *KvBackend = @ptrCast(@alignCast(ctx));
-        return be.stamp.forLedger();
+        var st = be.stamp.forLedger();
+        // Under the symmetric plane the ledger stamp carries NO per-slot
+        // cursors (spec §2.5, §9 Q6: a FLAT budget as the home of an
+        // unbounded population fail-stopped a manager at 281 leases); the
+        // cursor's homes are the page entry and tree 0.
+        if (be.sb.symmetricPlaneStamped()) st.slot_cursors = &.{};
+        return st;
     }
 
     fn publishGuestRootsHook(ctx: *anyopaque) checkpoint_cycle.CycleError!void {
@@ -1111,23 +1133,43 @@ pub const KvBackend = struct {
             error.Io => error.Io,
             else => error.Corrupt,
         };
-        for (kvs.items) |kv| {
-            const slot = slot_state.slotOfKey(kv.key) orelse continue;
-            const v = slot_state.decode(kv.value) catch {
-                log.err("meta volume {s}: tree 0's slot_state record of slot {d} does not decode", .{ be.path, slot });
+        // Appender 0's page: the lessee's home of every slot it names —
+        // at least as new as tree 0's grant-time word (the two-homes law);
+        // a Live entry at tree 0's generation under another lessee is C14.
+        const page0 = try be.readAppender0Page();
+        var roots: std.ArrayList(slot_state.GuestRoot) = .empty;
+        defer roots.deinit(gpa);
+        slot_state.foldGuestRoots(gpa, kvs.items, page0, &roots) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Corrupt => {
+                log.err("meta volume {s}: a tree-0 slot_state record does not decode", .{be.path});
                 return error.Corrupt;
-            };
-            const root: tree.RootPtr = .{ .addr = v.root.addr, .seq = v.root.seq };
-            const t = KvTree.open(gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, root, &be.seq) catch |e| switch (e) {
+            },
+            error.Conflict => {
+                log.err("meta volume {s}: a slot is Live on appender 0's page at tree 0's generation under another lessee — refusing the mount (C14; `squeezefs appender clear`)", .{be.path});
+                return error.Corrupt;
+            },
+        };
+        for (roots.items) |r| {
+            try be.guest_cursor_floors.put(gpa, r.slot, r.cursor);
+            // The native slot's lease names the ledger's own native root
+            // (KD-SYM-2): the tree is already open under its native
+            // identity; a second KvTree over the same nodes would hold a
+            // root pointer no SMO of the native tree ever moves.
+            if (be.mounted.membership_stamp.native_slot == r.slot) continue;
+            // A granted, never-minted slot owns no extent yet.
+            if (r.root.addr == 0) continue;
+            const root: tree.RootPtr = .{ .addr = r.root.addr, .seq = r.root.seq };
+            const t = KvTree.open(gpa, be.cache, .{ .slot = key.guestForestSlot(r.slot) }, root, &be.seq) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Io => return error.Io,
                 else => return error.Corrupt,
             };
             errdefer t.destroy();
+            t.seedNodeCount(r.extents);
             be.seq.raiseTo(root.seq);
             try be.trees.add(t);
-            try be.guest_published.put(gpa, slot, root);
-            try be.guest_cursor_floors.put(gpa, slot, v.cursor);
+            try be.guest_published.put(gpa, r.slot, root);
         }
         // Slots the window names without a tree.
         var mentioned = std.AutoHashMapUnmanaged(u16, void).empty;
@@ -1147,6 +1189,26 @@ pub const KvBackend = struct {
             if (be.trees.find(.{ .slot = key.guestForestSlot(slot.*) }) != null) continue;
             _ = try be.mintGuestTree(slot.*);
         }
+    }
+
+    /// Appender 0's newest valid page (null on a flat volume or a blank
+    /// rotation): read at open BEFORE the symmetric plane binds, for the
+    /// slot roots it names.
+    fn readAppender0Page(be: *KvBackend) OpenError!?sym.appender_page.Page {
+        if (!be.sb.symmetricPlaneStamped()) return null;
+        const offs = sym.appender_page.appender0PageOffsets(be.sb.journal.start);
+        var bufs: [4][sym.appender_page.PAGE_LEN]u8 = undefined;
+        var imgs: [4]?[]const u8 = .{ null, null, null, null };
+        for (offs, 0..) |off, i| {
+            const img = be.dev.readRange(be.gpa, off, sym.appender_page.PAGE_LEN) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+            };
+            defer be.gpa.free(img);
+            @memcpy(&bufs[i], img[0..sym.appender_page.PAGE_LEN]);
+            imgs[i] = &bufs[i];
+        }
+        return sym.appender_page.newestValid(imgs) catch return error.UnsupportedFormat;
     }
 
     /// The tree of routing slot `slot` on this volume, if it exists.
@@ -1247,12 +1309,59 @@ pub const KvBackend = struct {
         }
     }
 
-    /// Publish every guest root whose durable copy is stale (C1b).
+    /// Every leaf of `t` with its flushed tail offset (the `slot_tails` a
+    /// release records): resident leaves off RAM, evicted ones loaded once.
+    pub fn collectLeafTails(be: *KvBackend, t: *KvTree, out: *std.ArrayList(sym.control_records.TailEntry)) Error!void {
+        const gpa = be.gpa;
+        var stack: std.ArrayList(u64) = .empty;
+        defer stack.deinit(gpa);
+        try stack.append(gpa, t.rootPtr().addr);
+        while (stack.pop()) |addr| {
+            const n = be.cache.get(addr) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+                else => error.Corrupt,
+            };
+            defer n.release();
+            if (n.level == 0) {
+                n.lock.lockSharedUncancelable(be.io);
+                const tail: u32 = @intCast(@min(n.dirty.tailOffset(), std.math.maxInt(u32)));
+                n.lock.unlockShared(be.io);
+                try out.append(gpa, .{ .leaf_addr = addr, .tail = tail });
+                continue;
+            }
+            const snap = n.snapshotLoad();
+            defer snap.release();
+            var pos = key.KeyBuf.fromSlice("");
+            while (true) {
+                var live = (snap.value.nextLive(gpa, pos.slice(), null) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Corrupt,
+                }) orelse break;
+                defer live.deinit();
+                const iv = key.InteriorValue.decode(live.value) catch return error.Corrupt;
+                try stack.append(gpa, iv.childAddr());
+                if (!key.lessThan(live.key, &tree.KEY_SPACE_MAX)) break;
+                pos = key.keySuccessor(live.key);
+            }
+        }
+    }
+
+    /// Publish every guest root whose durable copy is stale (C1b). Under
+    /// an armed slot plane the leased slots are the plane's (the page
+    /// homes, the overflow law — `slots/plane.zig` `publishBeforeTail`);
+    /// the UNLEASED trees stay the manager's structural custody here.
     fn publishGuestRoots(be: *KvBackend) checkpoint_cycle.CycleError!void {
+        if (be.slots.armed) be.slots.publishBeforeTail() catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Corrupt => error.Corrupt,
+            else => error.Io,
+        };
         for (be.trees.load()) |t| {
             const fs = t.forest_slot orelse continue;
             if (t.identity.rootId() != null) continue;
             const slot = routing.route_table.slotOfForestSlot(fs);
+            if (be.slots.armed and be.slots.table.view(slot).state != .unleased) continue;
             const root = t.rootPtr();
             if (be.guest_published.get(slot)) |p| if (p.addr == root.addr and p.seq == root.seq) continue;
             _ = be.writeSlotStateEntry(slot, root) catch |e| return switch (e) {
@@ -1285,12 +1394,22 @@ pub const KvBackend = struct {
     /// landed. Returns the entry's position (the pending-free gate of a
     /// teardown). The one-record shape of the SMO's own commit.
     fn writeSlotStateEntry(be: *KvBackend, slot: u16, root: ?tree.RootPtr) Error!u64 {
+        const cursor = be.stamp.cursorSnapshot(slot) orelse inos.LOCAL_INO_BASE;
+        // An unleased tree keeps the generation tree 0 already names (a
+        // republish never resets `g` under a live lease history).
+        var st = slot_state.unleased(if (root) |r| r.addr else 0, if (root) |r| r.seq else 0, cursor);
+        st.g = be.slots.table.gOf(slot);
+        return be.writeSlotStateRecord(slot, if (root != null) st else null);
+    }
+
+    /// The lease plane's form: the record verbatim (`Leased`/`Unleased` at
+    /// the plane's words) or its `Delete`.
+    pub fn writeSlotStateRecord(be: *KvBackend, slot: u16, state: ?slot_state.SlotState) Error!u64 {
         const control = be.trees.find(.control) orelse return error.Corrupt;
         const ck = slot_state.keyOf(slot);
         const k = ck.slice();
-        const cursor = be.stamp.cursorSnapshot(slot) orelse inos.LOCAL_INO_BASE;
-        const value: []const u8 = if (root) |r| &slot_state.encode(slot_state.unleased(r.addr, r.seq, cursor)) else &.{};
-        const kind: record.RecordKind = if (root != null) .put else .delete;
+        const value: []const u8 = if (state) |st| &slot_state.encode(st) else &.{};
+        const kind: record.RecordKind = if (state != null) .put else .delete;
         var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(key.TREE_CONTROL, 0), .key = k, .kind = @fromBackingInt(@intCast(@backingInt(kind))), .seq = 0, .value = value }};
         const len = journal.entryLenFor(&frames) catch return error.Corrupt;
         const adm = be.core.tryAdmit(len, .checkpoint) orelse return error.ConveyorFull;
@@ -1507,6 +1626,9 @@ pub const KvBackend = struct {
             // holds no user reservation past this point.
             be.cv.quiesce();
             be.stopPass();
+            // The slot cadence's flight joined while the task and the lane
+            // still serve its cycles.
+            be.slots.quiesce();
             // The in-process regions leave BEFORE the final tick (their
             // control entries ride ring 0 and the tick covers them), each
             // drained at a fixpoint cycle first.
@@ -1539,6 +1661,7 @@ pub const KvBackend = struct {
             be.sym = null;
         }
         be.cv.deinit();
+        be.slots.deinit();
         be.lane.deinit();
         be.cp.deinit();
         for (be.trees.load()) |t| t.destroy();
@@ -2165,6 +2288,11 @@ test "ONE thread per volume: the pass runs on sqz-jrnl<N>; a 4-thread storm of s
     std.debug.print("\nmeasurement: {d} single-record commits in {d} passes/windows: io_uring_enter {d} ({d}.{d:0>2} per commit, {d}.{d:0>2} per window), fiber parks {d} ({d}.{d:0>2} per window), tick rescues {d}, barriers {d}\n", .{ total, snap.lane_writes, snap.enters, snap.enters / total, (snap.enters * 100 / total) % 100, snap.enters / snap.lane_writes, (snap.enters * 100 / snap.lane_writes) % 100, snap.parks, snap.parks / snap.lane_writes, (snap.parks * 100 / snap.lane_writes) % 100, snap.tick_rescues, snap.barriers_coalesced + snap.barriers_strict });
 }
 
+fn anyMaintenancePending(be: *KvBackend) bool {
+    for (be.trees.load()) |t| if (t.maintenancePending()) return true;
+    return false;
+}
+
 test "threshold writeback on a mounted volume: commits that push one leaf over the writeback threshold are drained by the checkpoint task — the bset page is appended before any cadence cycle, the tree's queue empties, queue_full stays 0" {
     const gpa = testing.allocator;
     // A 600 s flush interval: no cadence tick and no lane barrier fires on
@@ -2187,8 +2315,10 @@ test "threshold writeback on a mounted volume: commits that push one leaf over t
         try be.commit(t);
     }
     // The task drains on its own thread; the bound is a failure, not a wait.
+    // Every tree's queue (the arm's lease grants load the control tree's
+    // leaf too), not the native one alone.
     const started = clock.monotonicNs();
-    while (native.maintenancePending() or checkpoint.stats.meta_kv_maintenance_items.load() == items0) {
+    while (anyMaintenancePending(be) or native.maintenancePending() or checkpoint.stats.meta_kv_maintenance_items.load() == items0) {
         if (clock.monotonicNs() - started > 10 * std.time.ns_per_s) return error.ThresholdDrainNeverRan;
         std.Thread.yield() catch {};
     }

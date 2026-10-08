@@ -243,7 +243,7 @@ pub fn migrateSlot(set: *MetaSet, slot: u16, target: VolumeIndex, opts: Options)
     src.cv.armTee(&set.tee_hook);
     defer src.cv.disarmTee();
     var gate_closed = false;
-    defer if (gate_closed) set.gates.reopen(io);
+    defer if (gate_closed) src.slots.door.reopenCutover(slot);
 
     var consecutive_overflows: u32 = 0;
     var retries: u32 = 0;
@@ -274,15 +274,15 @@ pub fn migrateSlot(set: *MetaSet, slot: u16, target: VolumeIndex, opts: Options)
 
             // ---- phase B: the cutover window ----
             var prof = routing_stats.Prof.start();
-            set.gates.close(slot);
+            src.slots.door.closeForCutover(slot);
             gate_closed = true;
             if (opts.hold) |h| h.park(.gate_closed, io);
             const deadline = clock.monotonicNs() + opts.cutover_deadline_ns;
-            const drained = set.gates.waitDrained(slot, io, deadline);
+            const drained = src.slots.door.drain(slot, deadline);
             prof.mark(.drain);
             if (drained == .deadline) {
                 prof.finish();
-                try retryWindow(set, &report, &retries, opts, &gate_closed, "the slot's admitted ops did not drain inside the deadline");
+                try retryWindow(set, src, &report, &retries, opts, &gate_closed, "the slot's admitted ops did not drain inside the deadline");
                 continue;
             }
             // The final delta through B's conveyor (this task holds no leaf
@@ -290,14 +290,14 @@ pub fn migrateSlot(set: *MetaSet, slot: u16, target: VolumeIndex, opts: Options)
             const final = tee.drainRound(&keys) catch return error.OutOfMemory;
             if (final.overflowed) {
                 prof.finish();
-                try retryWindow(set, &report, &retries, opts, &gate_closed, "the side log overflowed inside the window");
+                try retryWindow(set, src, &report, &retries, opts, &gate_closed, "the side log overflowed inside the window");
                 continue;
             }
             try applyDelta(set, src, dst, slot, final.keys, &report);
             prof.mark(.final_delta);
             if (tee.pendingLen() != 0 or tee.hasOverflowed() or clock.monotonicNs() > deadline) {
                 prof.finish();
-                try retryWindow(set, &report, &retries, opts, &gate_closed, "late commits landed after the final delta");
+                try retryWindow(set, src, &report, &retries, opts, &gate_closed, "late commits landed after the final delta");
                 continue;
             }
             // Past this point the window never aborts.
@@ -331,9 +331,11 @@ pub fn migrateSlot(set: *MetaSet, slot: u16, target: VolumeIndex, opts: Options)
                 prof.finish();
                 return error.CrashSeam;
             }
-            // The RAM swap, then the parked ops re-route through it.
+            // The RAM swap, then the parked ops re-route through it (a
+            // parker on the source resumes `SlotMoved`: EAGAIN, the op's
+            // retry routes to the target).
             set.publishSlot(slot, target) catch return error.OutOfMemory;
-            set.gates.reopen(io);
+            src.slots.door.reopenCutover(slot);
             gate_closed = false;
             prof.mark(.swap);
             report.cutover_ns = prof.total();
@@ -344,6 +346,7 @@ pub fn migrateSlot(set: *MetaSet, slot: u16, target: VolumeIndex, opts: Options)
 
     // ---- phase C: post-flip ----
     src.cv.disarmTee();
+    src.slots.slotLeft(slot);
     src.dropTree(slot) catch |e| return mapBackend(e);
     rstats.migrate_slots_completed.inc();
     var buf: [256]u8 = undefined;
@@ -355,8 +358,9 @@ pub fn migrateSlot(set: *MetaSet, slot: u16, target: VolumeIndex, opts: Options)
 
 /// A missed window: reopen the gate (parked ops proceed on the OLD map —
 /// the tee catches their records), count, and give up at the budget.
-fn retryWindow(set: *MetaSet, report: *Report, retries: *u32, opts: Options, gate_closed: *bool, why: []const u8) Error!void {
-    set.gates.reopen(set.io);
+fn retryWindow(set: *MetaSet, src: *KvBackend, report: *Report, retries: *u32, opts: Options, gate_closed: *bool, why: []const u8) Error!void {
+    _ = set;
+    src.slots.door.reopenCutover(report.slot);
     gate_closed.* = false;
     retries.* += 1;
     report.cutover_retries += 1;
@@ -471,6 +475,9 @@ fn applyDelta(set: *MetaSet, src: *KvBackend, dst: *KvBackend, slot: u16, keys: 
     var i: usize = 0;
     while (i < keys.len) {
         const t = dst.begin(@src()) catch return error.OutOfMemory;
+        // The engine's copy: the slot is closed at the source, the target's
+        // tree unpublished — no door tokens (the exclusion is the engine's).
+        t.door_bypass = true;
         var bytes: u64 = 0;
         var puts: u64 = 0;
         var staged: usize = 0;
@@ -600,11 +607,9 @@ test "migrate a loaded slot WHILE a writer storm hits it: every acked create pre
                     const name = std.fmt.bufPrint(&name_buf, "storm{d}", .{i}) catch unreachable;
                     const g = meta_set.createFile(self.set, inos.ROOT_INO, name) catch continue;
                     self.acked.append(self.gpa, g) catch {};
-                    // A mutation on the migrating slot through the gate.
+                    // A mutation on the migrating slot through the door.
                     const victim = self.victims[i % self.victims.len];
                     const eff = self.set.effectiveIno(victim);
-                    var pass = self.set.newPass();
-                    self.set.gateEnter(&pass, &.{eff});
                     const t = self.set.begin(@src()) catch continue;
                     var vb: [8]u8 = undefined;
                     std.mem.writeInt(u64, &vb, i, .little);
@@ -612,11 +617,9 @@ test "migrate a loaded slot WHILE a writer storm hits it: every acked create pre
                     const xv = (record.XattrValue{ .name = "user.storm", .value = &vb }).encodeInto(&xb) catch unreachable;
                     t.stagePut(key.TREE_XATTRS, &key.xattrKey(eff, key.xattrNameHash56("user.storm", self.set.hashSeed()), 0), xv) catch {
                         self.set.abandon(t);
-                        pass.exit(self.set.io);
                         continue;
                     };
                     if (self.set.commit(t)) |_| self.xattr_puts += 1 else |_| {}
-                    pass.exit(self.set.io);
                 }
             }
         };
@@ -741,7 +744,7 @@ test "preflight refusals: slot 0 is pinned; a target past the set; and the crash
             // In-process the RAM map is untouched by a torn flip; the gate
             // reopened; every record still served.
             try testing.expectEqual(@as(VolumeIndex, 0), set.volumeIndexOfSlot(sl));
-            try testing.expectEqual(@as(?u16, null), set.gates.closedSlot());
+            try testing.expectEqual(@as(?u16, null), set.volumes[0].slots.door.closedSlot());
             for (acked.items) |g| try testing.expect(try meta_set.present(set, g));
         }
         const d0 = rstats.routing_dual_claims_converged.load();

@@ -369,6 +369,12 @@ pub const KvTree = struct {
     /// durable form is exclusively the next ledger record, so until one
     /// lands the checkpoint tail must not pass this position.
     root_floor: std.atomic.Value(u64),
+    /// The tree's node (= extent) census — the affinity ceiling's input
+    /// (charter §5.5 `slot_tree_extents`): 1 at create; a split or root
+    /// grow +1, a merge or root collapse −1 (a compaction moves nothing);
+    /// an opened tree is seeded from the lease's durable word (0 = unknown
+    /// until seeded; the ceiling reads it as the floor).
+    nodes: std.atomic.Value(u64) = .init(0),
 
     /// Format a fresh, empty tree: claim one extent (`.internal` — tree
     /// roots are format/checkpoint internals), write an empty leaf root
@@ -377,6 +383,20 @@ pub const KvTree = struct {
         const extent = try alloc.claimInternal();
         errdefer alloc.releaseUnpublished(extent);
         const addr = cache.extentAddr(extent);
+        // A root is the one node no interior Put names, so a crash before
+        // its first durable home replays nothing that raises the mint: the
+        // re-created tree would re-mint the SAME seq into the SAME recycled
+        // extent and the dead incarnation's frames there would verify as
+        // its own (node.zig's incarnation check compares for equality).
+        // The residue ceiling floors the mint above every stamp the extent
+        // still carries (§2.6; a foreign-space stamp is ignored by the
+        // handle's own law).
+        {
+            const residue = try snapshot.SharedBuf.createExtent(gpa, cache.cfg.layout.node_size);
+            defer residue.release();
+            try cache.loader.readExtent(cache.loader.ctx, addr, residue.data);
+            seq.raiseTo(node.residueSeqCeiling(residue.data));
+        }
         const ns = try seq.mint();
         var w = try node.writeNode(gpa, cache.cfg.layout, .{
             .node_addr = addr,
@@ -392,7 +412,9 @@ pub const KvTree = struct {
         defer root_node.release();
         if (identity.forestSlot()) |slot| root_node.stampForestSlot(slot);
         try cache.publish(root_node);
-        return init(gpa, cache, identity, .{ .addr = addr, .seq = ns }, seq, 0);
+        const t = try init(gpa, cache, identity, .{ .addr = addr, .seq = ns }, seq, 0);
+        t.nodes.store(1, .release);
+        return t;
     }
 
     /// Re-attach to an existing tree from its root pointer (the mount path:
@@ -469,6 +491,30 @@ pub const KvTree = struct {
         const id = self.identity.rootId() orelse return null;
         const r = self.rootPtr();
         return .{ .id = id, .node_addr = r.addr, .node_seq = r.seq };
+    }
+
+    /// The node census (0 = not yet seeded on an opened tree).
+    pub fn nodeCount(self: *const KvTree) u64 {
+        return self.nodes.load(.acquire);
+    }
+
+    /// Seed an opened tree's census from the lease's durable word (a
+    /// fetch_max: a live count never regresses to a stale word).
+    pub fn seedNodeCount(self: *KvTree, n: u64) void {
+        _ = self.nodes.fetchMax(n, .acq_rel);
+    }
+
+    pub fn noteNodes(self: *KvTree, delta: i64) void {
+        if (delta >= 0) {
+            _ = self.nodes.fetchAdd(@intCast(delta), .acq_rel);
+        } else {
+            // Saturating at 0: an unseeded opened tree may merge first.
+            var cur = self.nodes.load(.acquire);
+            while (true) {
+                const next = cur -| @as(u64, @intCast(-delta));
+                if (self.nodes.cmpxchgWeak(cur, next, .acq_rel, .acquire)) |seen| cur = seen else break;
+            }
+        }
     }
 
     pub fn rootFloor(self: *const KvTree) u64 {
@@ -1404,6 +1450,34 @@ test "open verifies the root pointer: a stale ledger node_seq or a foreign tree 
     try testing.expectEqual(@as(?ledger.TreeRoot, null), guest.ledgerRoot());
     var two: [2]ledger.TreeRoot = undefined;
     try testing.expectEqual(@as(usize, 1), roots(&.{ t, guest }, &two).len);
+}
+
+test "create floors the root's seq above the extent's residue: a tree re-created after a crash into the recycled extent of a never-named root resurrects none of the dead incarnation's frames" {
+    const gpa = testing.allocator;
+    var vol = try smo.TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    // Incarnation 1: a first-touch root, records appended into its extent,
+    // nothing naming the root durably (no interior Put, no ledger root).
+    const dead = try vol.createTree(.{ .slot = key.guestForestSlot(3) });
+    var buf: [64]u8 = undefined;
+    try dead.insert(&ikey(1), testValue(1, 24, &buf));
+    try dead.insert(&ikey(2), testValue(2, 24, &buf));
+    try vol.flushDirty(dead);
+    const dead_root = dead.rootPtr();
+    // The crash: the allocation and the mint were never durable — the
+    // next incarnation reseeds the handle at the same watermark and sees
+    // the extent free again.
+    var fresh = try vol.freshCache();
+    defer fresh.deinit();
+    var alloc = try alloc_ext.ExtentAllocator.format(gpa, vol.cfg.extents, vol.cfg.reserve, vol.cfg.pending_cap);
+    defer alloc.deinit();
+    var seq = node_seq.NodeSeqHandle.shared(0);
+    const reborn = try KvTree.create(gpa, fresh, &alloc, .{ .slot = key.guestForestSlot(5) }, &seq);
+    defer reborn.destroy();
+    try testing.expectEqual(dead_root.addr, reborn.rootPtr().addr);
+    try testing.expect(reborn.rootPtr().seq > dead_root.seq);
+    try testing.expectEqual(@as(?[]u8, null), try reborn.lookup(gpa, &ikey(1)));
+    try testing.expectEqual(@as(?[]u8, null), try reborn.lookup(gpa, &ikey(2)));
 }
 
 test "the routing law: slot-tree kinds route by the key's slot (the key must decode as the tagged kind), control by kind 8, interior by header id — slot trees through the slot ‖ separator key; alloc deltas and unmounted slots route nowhere" {

@@ -817,7 +817,16 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
         try testing.expect((numberAfter(tail, "\"routing_split_commits\":") orelse 0) > 0);
         try testing.expect(std.mem.indexOf(u8, tail, "\"routing_same_epoch_dual_claim\":0") != null);
         try testing.expect(std.mem.indexOf(u8, tail, "\"volume_failed\":false") != null);
-        std.debug.print("\nsmoke: two-member set: guest trees {d}, cross-member mints {d}, split commits {d}, gate parks {d}\n", .{ numberAfter(tail, "\"routing_guest_trees_minted\":") orelse 0, numberAfter(tail, "\"routing_mint_volume_picks\":") orelse 0, numberAfter(tail, "\"routing_split_commits\":") orelse 0, numberAfter(tail, "\"routing_gate_parks\":") orelse 0 });
+        // The slot leases (charter §5.5): each member's manager leases its
+        // rotor (+ the native slot on member 0); every mint went through the
+        // plane's decision (the closure `affinity + rotor + gather ≡ mints`);
+        // nothing was refused at the door on a solo-writer set; the
+        // conflict tripwire rides `invariant_tripwires` above.
+        std.debug.print("\nsmoke: two-member set: guest trees {d}, cross-member mints {d}, split commits {d}, gate parks {d}, slot leases held {d}, rotor mints {d}, affinity mints {d}, gather mints {d}, door refusals {d}\n", .{ numberAfter(tail, "\"routing_guest_trees_minted\":") orelse 0, numberAfter(tail, "\"routing_mint_volume_picks\":") orelse 0, numberAfter(tail, "\"routing_split_commits\":") orelse 0, numberAfter(tail, "\"routing_gate_parks\":") orelse 0, numberAfter(tail, "\"slot_leases_held\":") orelse 0, numberAfter(tail, "\"rotor_mints\":") orelse 0, numberAfter(tail, "\"affinity_mints\":") orelse 0, numberAfter(tail, "\"dir_gather_mints\":") orelse 0, numberAfter(tail, "\"slot_door_refusals\":") orelse 0 });
+        try testing.expect((numberAfter(tail, "\"slot_leases_held\":") orelse 0) >= 2 * 64 + 1);
+        const mints = (numberAfter(tail, "\"rotor_mints\":") orelse 0) + (numberAfter(tail, "\"affinity_mints\":") orelse 0) + (numberAfter(tail, "\"dir_gather_mints\":") orelse 0);
+        try testing.expect(mints >= routing_dirs * routing_files_per_dir);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"slot_door_refusals\":"));
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

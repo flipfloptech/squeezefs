@@ -83,6 +83,40 @@ pub const GuardSet = struct {
     }
 };
 
+/// The commit door's tokens (charter §5.5 "every commit takes a token per
+/// slot before queueing (held to terminal outcome)"): one per distinct
+/// slot of the entry, inline (`MAX_DOOR_SLOTS`, no allocation), co-owned by
+/// the queue entry beside the guards and returned at the terminal outcome
+/// AFTER them (the reference's fan-out order). Opaque like `GuardSet`: the
+/// door (`sym/slots/door.zig`) hands out `ctx` and the release.
+pub const DoorTokens = struct {
+    ctx: ?*anyopaque = null,
+    release_fn: ?*const fn (*anyopaque, *DoorTokens) void = null,
+    slots: [MAX_DOOR_SLOTS]u16 = undefined,
+    len: u8 = 0,
+
+    /// A namespace op names ≤ 6 slots (rename's two parents, two inodes
+    /// and a whiteout mint, plus a mint); the reclaim's destroy batch
+    /// (`kv_fs.RECLAIM_BATCH` = 64 corpses, each in its own slot) is the
+    /// widest entry the door sees — 64 × 2 B inline, still no allocation.
+    pub const MAX_DOOR_SLOTS: usize = 64;
+    pub const none: DoorTokens = .{};
+
+    pub fn isHeld(self: DoorTokens) bool {
+        return self.ctx != null;
+    }
+
+    /// Return the tokens. Idempotent (the terminal outcome, whichever path).
+    pub fn release(self: *DoorTokens) void {
+        const ctx = self.ctx orelse return;
+        const f = self.release_fn.?;
+        self.ctx = null;
+        self.release_fn = null;
+        f(ctx, self);
+        self.len = 0;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // KvTx — staging.
 // ---------------------------------------------------------------------------
@@ -122,6 +156,10 @@ pub const KvTx = struct {
     site: Site,
     /// The cross-member commit order (one member: ignored).
     cross: CrossVolume = .refuse,
+    /// A structural commit whose exclusion is the engine's — the migration
+    /// engine's delta copy into the target (the slot is CLOSED at the
+    /// source, the target's tree unpublished) — takes no door tokens.
+    door_bypass: bool = false,
     /// The ring class the entry admits in: every user op is `.user`; the
     /// rollback's compensation records and the structural plane's control
     /// entries ride the checkpoint class (they never park behind user
@@ -349,10 +387,16 @@ pub const QueuedTx = struct {
     /// at the terminal outcome BEFORE the ack (a committer re-entering on
     /// the same key never self-waits on its own tx).
     guards: GuardSet,
+    /// The commit door's tokens, taken BEFORE the enqueue and returned at
+    /// the terminal outcome after the guards.
+    door: DoorTokens = .none,
+    door_bypass: bool = false,
 
-    /// The terminal outcome: drop the guards, free the records.
+    /// The terminal outcome: drop the guards, the door tokens, free the
+    /// records.
     pub fn deinit(self: *QueuedTx) void {
         self.guards.release();
+        self.door.release();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -425,6 +469,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
     const class = tx.class;
     const token_quiet = tx.token_quiet;
     const site = tx.site;
+    const door_bypass = tx.door_bypass;
     tx.* = undefined;
     errdefer {
         guards.release();
@@ -459,6 +504,7 @@ pub fn buildQueuedTx(tx: *KvTx, node_size: usize, diag: ?*BuildRefusal) BuildErr
         .token_quiet = token_quiet,
         .site = site,
         .guards = guards,
+        .door_bypass = door_bypass,
     };
 }
 

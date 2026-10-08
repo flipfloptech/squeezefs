@@ -295,7 +295,6 @@ pub const covered = [_]Covered{
     .{ .path = "src/io/nvme_dev.zig", .by = "src/data/plane.zig" },
     .{ .path = "src/exec/lane.zig", .by = "src/exec/stats.zig" },
     .{ .path = "src/fuse/transport/filesystem_vtable.zig", .by = "src/fuse/transport/session.zig" },
-    .{ .path = "src/meta/routing/slot_gate.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/routing/migration_tee.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/routing/discovery.zig", .by = "src/meta/routing/stats.zig" },
     .{ .path = "src/meta/routing/stamp_cell.zig", .by = "src/meta/routing/stats.zig" },
@@ -312,6 +311,13 @@ pub const covered = [_]Covered{
     .{ .path = "src/data/sym_planes/custody.zig", .by = "src/data/sym_planes.zig" },
     .{ .path = "src/meta/sym/join.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/bind.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/door.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/acquire.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/handover.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/page_budget.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/resolve.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/plane.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/token_table.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/token_cache.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/read_divert.zig", .by = "src/meta/sym.zig" },
@@ -874,7 +880,7 @@ test "every instrument declared in a generated namespace is a key of the documen
     const p = try r.render();
     defer p.deinit(testing.allocator);
     const text = p.bytes();
-    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats }) |Ns| {
+    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.slots.stats, sym.slots.door.stats, sym.slots.acquire.stats, sym.slots.handover.stats, sym.slots.page_budget.stats, sym.slots.resolve.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats }) |Ns| {
         inline for (comptime counters.instrumentNames(Ns)) |name| {
             const T = @TypeOf(@field(Ns, name));
             const k = if (T == counters.Tripwire) @field(Ns, name).site else name;

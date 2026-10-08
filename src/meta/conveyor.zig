@@ -230,6 +230,12 @@ pub const Error = error{
     /// The records span two metadata members with no ordered commit (the
     /// set facade's EXDEV; a one-member conveyor never produces it).
     CrossVolume,
+    /// The commit door refused: another appender leases a slot the entry
+    /// names ("ship to the holder" — EAGAIN), or the slot left this volume.
+    SlotBusy,
+    /// The door's first touch was deferred (ring 0's window, the
+    /// structural door's moving tail): EAGAIN, nothing written.
+    Deferred,
 };
 
 pub const ErrorClass = errors.Class;
@@ -250,6 +256,8 @@ pub fn coreError(e: Error) errors.Error {
         error.VolumeFailed => error.VolumeFailed,
         error.HoleCheckpointFailed => error.HoleCheckpointFailed,
         error.CrossVolume => error.CrossVolume,
+        error.SlotBusy => error.SlotMoved,
+        error.Deferred => error.Deferred,
         error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,
     };
 }
@@ -527,6 +535,24 @@ pub const CommitTee = struct {
     note: *const fn (ctx: *anyopaque, recs: []const tx.Rec) void,
 };
 
+pub const DoorError = error{ SlotBusy, SlotMoved, Deferred, Io, Corrupt, OutOfMemory };
+
+/// THE COMMIT DOOR (charter §5.5; `sym/slots/door.zig`): a token per
+/// distinct slot the entry's records name, taken BEFORE the enqueue
+/// (step 0 of the commit — before any ring admission or node lock) and
+/// held in `QueuedTx.door` to the terminal outcome. The seam parks a
+/// committer on its own slot's handover, refuses a foreign lease, and
+/// acquires an unleased slot first-touch. Null = no door (a volume
+/// without the plane; the portable contracts).
+pub const DoorSeam = struct {
+    ctx: *anyopaque,
+    enter: *const fn (ctx: *anyopaque, recs: []const tx.Rec, out: *tx.DoorTokens) DoorError!void,
+    /// A12: the member's records are stamped into the window ending at
+    /// `pos` — the slot RECORD FRONTIER the handover's cover loop waits on
+    /// (one store per slot per member, never per record).
+    frontier: *const fn (ctx: *anyopaque, tokens: *const tx.DoorTokens, pos: u64) void,
+};
+
 /// THE TOKEN HOOK (charter §5.5 "the holder's conveyor pass recalls the
 /// union of its batch's objects' tokens ONCE, under the batch's 4a
 /// guards, BEFORE ring admission"; `sym/tokens/token_table.zig`): A1½ —
@@ -612,6 +638,8 @@ pub const Deps = struct {
     caps: Caps,
     /// `PARK_ESCALATION_NS`: the park escalation threshold.
     park_escalation_ns: u64,
+    /// The commit door (null = none).
+    door: ?DoorSeam = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -820,7 +848,20 @@ pub const Conveyor = struct {
             t.deinit();
             return error.VolumeFailed;
         };
-        const q = tx.buildQueuedTx(t, self.deps.cache.cfg.layout.node_size, null) catch |e| return mapBuildError(e);
+        var q = tx.buildQueuedTx(t, self.deps.cache.cfg.layout.node_size, null) catch |e| return mapBuildError(e);
+        // Step 0: the commit door — tokens per slot BEFORE the enqueue,
+        // held to the terminal outcome (a refusal releases the guards
+        // with the entry).
+        if (!q.door_bypass) if (self.deps.door) |d| d.enter(d.ctx, q.recs, &q.door) catch |e| {
+            q.deinit();
+            return switch (e) {
+                error.SlotBusy, error.SlotMoved => error.SlotBusy,
+                error.Deferred => error.Deferred,
+                error.Io => error.Io,
+                error.Corrupt => error.Corrupt,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
         return .{ .q = q, .done = done, .enqueued_ns = clock.monotonicNs() };
     }
 
@@ -1353,6 +1394,7 @@ pub const Conveyor = struct {
             };
             survivors += 1;
             bytes += m.q.len;
+            if (self.deps.door) |d| d.frontier(d.ctx, &m.q.door, pos_cursor);
         }
         window.entries = survivors;
         window.bytes = bytes;

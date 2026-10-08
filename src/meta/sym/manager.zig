@@ -482,6 +482,11 @@ pub const Manager = struct {
     /// The directory's Live count as of the last join (the grant cap
     /// divides by it; `appenders_known`).
     appenders_known: u64 = 1,
+    /// The slot-lease plane's verbs (`sym/slots/acquire.zig` `Verbs`),
+    /// bound at the arm: the slot verbs' handlers recover it from the
+    /// manager the table dispatches on. Opaque here so the manager never
+    /// imports the plane it serves.
+    slot_plane: ?*anyopaque = null,
 
     pub fn init(gpa: Allocator, io: std.Io, vol: Volume) Manager {
         return .{ .gpa = gpa, .io = io, .vol = vol };
@@ -1932,6 +1937,7 @@ test "grants: the manager never grants itself; want is screened against the heap
     try tv.ram_held.append(gpa, held);
     var held_run = [_]GrantRun{.{ .start = held, .len = 1 }};
     const refusals_before = stats.manager_verb_refusals.load();
+    stats.manager_verb_refusals.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
     try testing.expectError(error.Refused, m.returnExtents(.{ .appender_id = 1, .runs = &held_run }));
     try log.testing.expectAllFired();

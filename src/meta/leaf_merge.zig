@@ -666,6 +666,7 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
     smo.requeueIfOverThreshold(t, parent);
     stats.meta_kv_node_merges.inc();
     out.merges += 1;
+    t.noteNodes(-1);
     if (left.level > 0) {
         stats.meta_kv_interior_merges.inc();
         out.interior_merges += 1;
@@ -754,6 +755,7 @@ pub fn smoRootCollapse(t: *KvTree, ctx: *SmoContext, root: *CachedNode, out: *Ma
     try ctx.freePending(old_extent, gate, forced_retirement);
     stats.meta_kv_root_collapses.inc();
     out.root_collapses += 1;
+    t.noteNodes(-1);
     return true;
 }
 

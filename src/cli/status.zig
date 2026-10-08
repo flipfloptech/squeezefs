@@ -28,6 +28,7 @@ const node_seq = @import("../meta/node_seq.zig");
 const tree = @import("../meta/tree.zig");
 const key = @import("../meta/key.zig");
 const slot_state = @import("../meta/routing/slot_state.zig");
+const appender_page = @import("../meta/sym/appender_page.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const set_config = @import("../data/set_config.zig");
 const uring_fs = @import("../io/uring_fs.zig");
@@ -118,6 +119,24 @@ const status_cache_budget_bytes: u64 = 16 << 20;
 /// One data volume's durable reference population at the newest checkpoint.
 pub const VolCensus = struct { vol_tag: u64, references: u64, blocks: u64 };
 
+/// Appender 0's newest valid page on a symmetric volume (null on a flat one).
+fn readAppender0Page(gpa: std.mem.Allocator, dev: *device_loader.DeviceLoader, sb: superblock.Superblock) ClassifyError!?appender_page.Page {
+    if (!sb.symmetricPlaneStamped()) return null;
+    const offs = appender_page.appender0PageOffsets(sb.journal.start);
+    var bufs: [4][appender_page.PAGE_LEN]u8 = undefined;
+    var imgs: [4]?[]const u8 = .{ null, null, null, null };
+    for (offs, 0..) |off, i| {
+        const img = dev.readRange(gpa, off, appender_page.PAGE_LEN) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+        };
+        defer gpa.free(img);
+        @memcpy(&bufs[i], img[0..appender_page.PAGE_LEN]);
+        imgs[i] = &bufs[i];
+    }
+    return appender_page.newestValid(imgs) catch return error.Unexpected;
+}
+
 /// The reference records of every data volume `cfg` names, read offline
 /// from EVERY slot tree of this member's forest (the native tree the
 /// ledger names on slot 0's host, every guest tree tree 0's `slot_state`
@@ -147,10 +166,19 @@ pub fn readRefCensus(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
         defer tree.deinitKeyValues(gpa, &kvs);
         const scan = slot_state.scanRange();
         control.range(gpa, scan.start.slice(), scan.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return mapTreeOpen(e);
-        for (kvs.items) |kv| {
-            const slot = slot_state.slotOfKey(kv.key) orelse continue;
-            const v = slot_state.decode(kv.value) catch return error.Unexpected;
-            try trees.append(gpa, tree.KvTree.open(gpa, cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = v.root.addr, .seq = v.root.seq }, &seq) catch |e| return mapTreeOpen(e));
+        // Appender 0's page is the lessee's live home of the slots it
+        // names (the two-homes law): its roots override tree 0's grant-
+        // time words.
+        const page0 = try readAppender0Page(gpa, &dev, sb);
+        var roots: std.ArrayList(slot_state.GuestRoot) = .empty;
+        defer roots.deinit(gpa);
+        slot_state.foldGuestRoots(gpa, kvs.items, page0, &roots) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Corrupt, error.Conflict => error.Unexpected,
+        };
+        for (roots.items) |r| {
+            if (r.root.addr == 0) continue;
+            try trees.append(gpa, tree.KvTree.open(gpa, cache, .{ .slot = key.guestForestSlot(r.slot) }, .{ .addr = r.root.addr, .seq = r.root.seq }, &seq) catch |e| return mapTreeOpen(e));
         }
     }
     for (cfg.data) |d| {

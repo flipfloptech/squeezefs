@@ -7,9 +7,12 @@
 //! the region — ring segments, seq words, the page plan, the tail law
 //! (`region`), extent grants and the RAM pool (`extent_grant`), the manager
 //! with its verbs, screens and the structural door (`manager`), the join
-//! ladder of a later RW mount (`join`). Portable throughout; the device
-//! binding — the backend's regions, the manager over the volume, the
-//! checkpoint's page writes, the in-process join door — is `bind` (Linux).
+//! ladder of a later RW mount (`join`); part B1's slot leases — the dense
+//! lease table, the ONE commit door, acquisition and minting, handover,
+//! the page-budget law, slot → holder resolution (`slots`). Portable
+//! throughout; the device binding — the backend's regions, the manager
+//! over the volume, the checkpoint's page writes, the in-process join
+//! door — is `bind` (Linux), the slot plane's `slots/plane.zig` (Linux).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -22,6 +25,7 @@ pub const region = @import("sym/region.zig");
 pub const extent_grant = @import("sym/extent_grant.zig");
 pub const manager = @import("sym/manager.zig");
 pub const join = @import("sym/join.zig");
+pub const slots = @import("sym/slots.zig");
 pub const bind = if (builtin.os.tag == .linux) @import("sym/bind.zig") else struct {};
 pub const tokens = @import("sym/tokens.zig");
 
@@ -58,6 +62,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try counters.writeNamespaceJson(manager.stats, w);
     try w.writeAll(",\"join\":");
     try counters.writeNamespaceJson(join.stats, w);
+    try w.writeAll(",\"slots\":");
+    try slots.writeStatsJson(w);
     try w.writeAll(",\"tokens\":");
     try tokens.writeStatsJson(w);
     try w.writeByte('}');
@@ -71,6 +77,7 @@ test {
     _ = extent_grant;
     _ = manager;
     _ = join;
+    _ = slots;
     if (builtin.os.tag == .linux) _ = bind;
     _ = tokens;
 }

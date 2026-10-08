@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const counters = @import("../../core/counters.zig");
+const clock = @import("../../core/clock.zig");
 const log = @import("../../core/log.zig");
 const knobs = @import("../../core/knobs.zig");
 const derive = @import("../../core/derive.zig");
@@ -51,6 +52,8 @@ const manager = @import("manager.zig");
 const grant = @import("extent_grant.zig");
 const join = @import("join.zig");
 const cr = @import("control_records.zig");
+const slots = @import("slots.zig");
+const slots_plane = @import("slots/plane.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("sym/bind is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -58,7 +61,7 @@ comptime {
 
 const KvBackend = backend.KvBackend;
 
-pub const Error = error{ Io, Corrupt, OutOfMemory, Capacity, Rejected, Deferred, GrantExhausted, RingFull, LaneSpawnFailed };
+pub const Error = error{ Io, Corrupt, OutOfMemory, Capacity, Rejected, Deferred, GrantExhausted, RingFull, LaneSpawnFailed, SlotBusy };
 
 /// One region this mount holds.
 pub const Region = struct {
@@ -106,6 +109,8 @@ pub const AppenderSet = struct {
     budget_remaining: u64 = 0,
     /// A page-aligned zero buffer for the carve's zeroing (one per set).
     zeros: []align(4096) u8,
+    /// The manager's verb table the wire binds: the slot verbs served here.
+    handlers: manager.HandlerTable = .{},
 
     const ZERO_BUF: usize = 1 << 20;
 
@@ -127,6 +132,15 @@ pub const AppenderSet = struct {
         errdefer self.manager.deinit();
         try self.census();
         try self.joinRegion0();
+        // The slot-lease plane: region 0 is ours; the arm leases the native
+        // slot and the rotor, binds the slot verbs into the table.
+        be.slots.setOwn(&.{journal.FIXED_RING_APPENDER});
+        be.slots.arm(self) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io, error.Deferred => error.Io,
+            error.Refused, error.Corrupt => error.Corrupt,
+        };
+        slots.acquire.Verbs.bindHandlers(&self.handlers);
         sym.stats.symmetric_meta.add(1);
         sym.stats.appenders_live.add(1);
         return self;
@@ -225,7 +239,10 @@ pub const AppenderSet = struct {
         words.ckpt_seq = be.mounted.seq;
         words.seq_offset = be.reg.seqOffset();
         words.grants = .{};
-        words.n_slots = 0;
+        // The prior image's slot entries RIDE the join: the page is the
+        // lessee's home until the slot plane's arm settles every entry
+        // against tree 0 (rows 5/6, C14) and the first cycle's plan
+        // rewrites them — never zero homes at any instant.
         const r = try self.gpa.create(Region);
         errdefer self.gpa.destroy(r);
         r.* = .{
@@ -255,7 +272,7 @@ pub const AppenderSet = struct {
     }
 
     /// The page plan executed: every slot the law names, then one barrier.
-    fn writePages(self: *AppenderSet, r: *Region, from_cycle: bool) error{ Io, Corrupt, OutOfMemory }!void {
+    pub fn writePages(self: *AppenderSet, r: *Region, from_cycle: bool) error{ Io, Corrupt, OutOfMemory }!void {
         var plan = r.core.planPageWrite() catch return error.Corrupt;
         for (plan.slice()) |w| {
             self.be.pool.writeAt(self.be.path, w.offset, &w.image) catch return error.Io;
@@ -298,8 +315,14 @@ pub const AppenderSet = struct {
                 r.grant.unclaimedRuns(self.gpa, &runs) catch return error.Io;
                 r.core.page.grants = grant.pageRunsOf(runs.items);
             }
+            // The ONE page writer's plan: the leased slots ranked by what
+            // each loses if dropped, publish-before-drop into tree 0.
+            self.be.slots.planPage(r) catch return error.Io;
             self.writePages(r, true) catch return error.Io;
+            self.be.slots.pageLanded(r);
         }
+        // The cadence: its own flight after the tick, never inline.
+        self.be.slots.kickCadence();
     }
 
     // ---- the in-process join door (the N-daemon harness shape) ----
@@ -346,11 +369,20 @@ pub const AppenderSet = struct {
         be.smo_lock.lockUncancelable(be.io);
         defer be.smo_lock.unlock(be.io);
         try self.regions.append(self.gpa, r);
+        self.publishOwnIds();
         sym.stats.appenders_live.add(1);
         // The joined page is the manager's write; the region's own first
         // page write lands at the next cycle under the directory-first law
         // (its `dir_named` starts at 0: both slots again).
         return r;
+    }
+
+    /// The region ids this process holds, for the door's "ours".
+    fn publishOwnIds(self: *AppenderSet) void {
+        var ids: [8]u32 = undefined;
+        const n = @min(self.regions.items.len, ids.len);
+        for (self.regions.items[0..n], 0..) |r, i| ids[i] = r.appenderId();
+        self.be.slots.setOwn(ids[0..n]);
     }
 
     /// `SQUEEZEFS_SYM_RING_KB`: explicit wins verbatim inside the volume's
@@ -395,6 +427,10 @@ pub const AppenderSet = struct {
     /// ring (tail = head), the pool's unclaimed runs return with the page
     /// (Free, both directory slots), the ring's bits clear.
     pub fn leaveInProcess(self: *AppenderSet, r: *Region) Error!void {
+        // Every held slot released to nobody first (the page names them
+        // Releasing, tree 0 Unleased, the page drops them): a leave while
+        // anything is leased is Deferred by the manager.
+        self.be.slots.releaseAllForLeave(r.appenderId());
         self.be.checkpointNow() catch return error.Io;
         if (r.core.page.ledger_tail_seq != r.core.core.headPos()) {
             // A second fixpoint cycle: the first wrote the page, this one
@@ -408,6 +444,7 @@ pub const AppenderSet = struct {
             _ = self.regions.orderedRemove(i);
             break;
         };
+        self.publishOwnIds();
         self.be.smo_lock.unlock(self.be.io);
         var d: Door = .{ .set = self };
         var jr: join.JoinedRegion = .{ .core = r.core, .grant = r.grant, .seq = r.seq, .identity = r.identity, .already = false };
@@ -476,6 +513,18 @@ pub const AppenderSet = struct {
     pub fn appendPut(self: *AppenderSet, r: *Region, tree_id: u8, k: []const u8, value: []const u8) Error!void {
         const be = self.be;
         std.debug.assert(r.appenderId() != journal.FIXED_RING_APPENDER);
+        // The door: a token on the record's slot BEFORE the append, held
+        // to the entry's landing (the region's "terminal outcome").
+        var tokens: @import("../tx.zig").DoorTokens = .none;
+        const recs = [_]@import("../tx.zig").Rec{.{ .tree_id = tree_id, .key = k, .kind = .put, .value = value }};
+        be.slots.enterFor(r.appenderId(), &recs, &tokens) catch |e| return switch (e) {
+            error.SlotBusy, error.SlotMoved => error.SlotBusy,
+            error.Deferred => error.Deferred,
+            error.Io => error.Io,
+            error.Corrupt => error.Corrupt,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        defer tokens.release();
         const t = tree.routeContent(be.trees.load(), tree_id, k) orelse return error.Corrupt;
         var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(tree_id, 0), .key = k, .kind = .put, .seq = 0, .value = value }};
         const len = journal.entryLenFor(&frames) catch return error.Corrupt;
@@ -505,6 +554,7 @@ pub const AppenderSet = struct {
                     const reg = st.registered.?;
                     frames[0].seq = reg.seq_base;
                     r.smo_journal.commitEntry(reg.res, &frames) catch return error.Io;
+                    be.slots.noteRegionFrontier(&tokens, reg.res.start + reg.res.len);
                     r.entries += 1;
                     sym.stats.appender_region_entries.inc();
                     sym.stats.appender_region_floors.inc();
@@ -745,12 +795,17 @@ pub const AppenderSet = struct {
         return false;
     }
 
-    /// Ring 0's window names no record of the slots iff it is EMPTY
-    /// (`reusable_upto == head`): the per-slot record frontiers are the
-    /// slot-lease wave's; until then the door cycles to the fixpoint.
-    fn windowClearFn(ctx: *anyopaque, _: []const u16) bool {
+    /// Ring 0's window names no record of the slots: every named slot's
+    /// record frontier is at or under `reusable_upto`.
+    fn windowClearFn(ctx: *anyopaque, named: []const u16) bool {
         const be = self_(ctx).be;
-        return be.core.reusableUpto() >= be.core.headPos();
+        var buf: [slots.door.MAX_SLOTS * 2]u16 = undefined;
+        var i: usize = 0;
+        while (i < named.len) : (i += buf.len) {
+            const chunk = named[i..@min(named.len, i + buf.len)];
+            if (be.slots.table.frontiersAbove(chunk, be.core.reusableUpto(), &buf).len != 0) return false;
+        }
+        return true;
     }
 
     fn cycleFn(ctx: *anyopaque) error{ Io, Corrupt }!u64 {
@@ -775,7 +830,9 @@ pub const AppenderSet = struct {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"appender_id\":{d},\"term\":{d},\"ring_bytes\":{d},\"ring_segments\":{d},\"seq_offset\":{d},\"grant_unclaimed\":{d},\"grant_held\":{d},\"grant_granted\":{d},\"grant_returned\":{d},\"entries\":{d}}}", .{ r.appenderId(), r.core.page.term, r.core.ringBytes(), r.core.table.len, r.core.reg.seqOffset(), r.grant.unclaimedCount(), r.grant.held(), r.grant.granted, r.grant.returned, r.entries });
         }
-        try w.writeAll("]}");
+        try w.writeAll("],\"slots\":");
+        try self.be.slots.writeStatsJson(w);
+        try w.writeByte('}');
     }
 };
 
@@ -932,9 +989,11 @@ test "symmetric default: format → mount A (the manager: region 0 Live with is_
             try t.stagePut(key.TREE_INODES, k, &value);
             try be.commit(t);
         }
-        // Region 1 appends into ITS ring: slot 5's records.
+        // Region 1 appends into ITS ring: slot 500's records (its first
+        // touch leases the slot through the door — slot 5 is region 0's
+        // rotor and would refuse SlotBusy).
         for (0..6) |i| {
-            const k = try putInodeInSlot(be, 5, 100 + i);
+            const k = try putInodeInSlot(be, 500, 100 + i);
             try keys.append(gpa, k);
             try set.appendPut(r1, key.TREE_INODES, k, &value);
         }
@@ -1011,7 +1070,7 @@ test "kill -9 with two regions live (the image copied mid-life): the remount rec
             try t.stagePut(key.TREE_INODES, k, &value);
             try be.commit(t);
         }
-        const k1 = try putInodeInSlot(be, 9, 500);
+        const k1 = try putInodeInSlot(be, 900, 500);
         defer gpa.free(k1);
         try set.appendPut(r1, key.TREE_INODES, k1, &value);
         try be.fsync();
@@ -1057,4 +1116,353 @@ test "SQUEEZEFS_SYMMETRIC_META=0 on a stamped volume refuses the writable open (
     log.testing.expectErrorLogs(1);
     try testing.expectError(error.UnsupportedFormat, v.open());
     try log.testing.expectAllFired();
+}
+
+test "handover in one process: region 0 holds slot 3 and writes it; region 1 hammers the slot — each refusal is a foreign touch on the window — until region 0 OFFERS (dominated), region 1's next touch ACCEPTS (flush-then-transfer: page Releasing, tree 0 Unleased, page drop, then the grant at g + 1), region 1 writes; nothing acked is lost, both homes agree, conflicts stay 0; a remount sees everything" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "handover", .symmetric);
+    defer v.destroy();
+    try v.env.put("SQUEEZEFS_SYM_T_IDLE_MS", "1000");
+    const iv: record.InodeValue = .{ .mode = 0o100644, .nlink = 1 };
+    const value = iv.encode();
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| gpa.free(k);
+        keys.deinit(gpa);
+    }
+    const handovers0 = slots.handover.stats.slot_handovers.load();
+    const offers0 = slots.handover.stats.slot_offers.load();
+    const conflicts0 = slots.acquire.stats.slot_lease_conflicts.load();
+    const refusals0 = slots.door.stats.slot_door_refusals.load();
+    {
+        const be = try v.open();
+        defer be.close();
+        const set = be.sym.?;
+        const plane = be.slots;
+        try testing.expect(plane.armed);
+        try testing.expect(plane.table.view(3).leasedBy(0) and plane.table.view(3).rotor);
+        try testing.expect(plane.table.view(0).leasedBy(0));
+        // Region 0's records in slot 3.
+        for (0..6) |i| {
+            const t = try be.begin(@src());
+            const k = try putInodeInSlot(be, 3, 10 + i);
+            try keys.append(gpa, k);
+            try t.stagePut(key.TREE_INODES, k, &value);
+            try be.commit(t);
+        }
+        const g_before = plane.table.gOf(3);
+        const r1 = try set.joinInProcess(join.HARNESS_MOUNT_SLOT_BASE + 2);
+        // Region 1 hammers slot 3: refused SlotBusy while region 0 holds it
+        // (the window counts each touch), then the offer, then the accept.
+        var touches: u32 = 0;
+        const k1 = try putInodeInSlot(be, 3, 900);
+        try keys.append(gpa, k1);
+        while (touches < 2000) : (touches += 1) {
+            if (set.appendPut(r1, key.TREE_INODES, k1, &value)) |_| break else |e| switch (e) {
+                error.SlotBusy, error.Deferred => {},
+                else => return e,
+            }
+        }
+        try testing.expect(touches < 2000);
+        try testing.expect(touches >= slots.handover.N_FLOOR_MIN);
+        try testing.expectEqual(handovers0 + 1, slots.handover.stats.slot_handovers.load());
+        try testing.expect(slots.handover.stats.slot_offers.load() > offers0);
+        try testing.expect(slots.door.stats.slot_door_refusals.load() > refusals0);
+        // Region 1 holds slot 3 at g + 1; tree 0 agrees; region 0's page no
+        // longer names it, region 1's does.
+        const view = plane.table.view(3);
+        try testing.expect(view.leasedBy(1));
+        try testing.expectEqual(g_before + 1, view.g);
+        const raw3 = (try be.lookup(gpa, key.TREE_CONTROL, cr.slotStateKey(3).slice())).?;
+        defer gpa.free(raw3);
+        const rec = cr.SlotStateWire.decode(raw3) catch unreachable;
+        try testing.expect(rec.variant == .leased and rec.appender_id == 1 and rec.g == g_before + 1);
+        try be.checkpointNow();
+        for (set.region0().core.page.slotEntries()) |e| try testing.expect(e.slot != 3);
+        var named = false;
+        for (r1.core.page.slotEntries()) |e| named = named or (e.slot == 3 and e.state == .live);
+        try testing.expect(named);
+        // Nothing acked is lost: region 0's six and region 1's one.
+        for (keys.items) |k| {
+            const got = try be.lookup(gpa, key.TREE_INODES, k);
+            defer if (got) |g| gpa.free(g);
+            try testing.expect(got != null);
+        }
+        // The phases are exact-sum.
+        const total = slots.handover.stats.slot_handover_phase_ns[@backingInt(slots.handover.Phase.total)].snapshot();
+        for (slots.handover.stats.slot_handover_phase_ns[0..slots.handover.Phase.legs]) |*h| try testing.expectEqual(total.count, h.snapshot().count);
+        try testing.expectEqual(conflicts0, slots.acquire.stats.slot_lease_conflicts.load());
+        // Region 0 writing slot 3 now is refused: the slot is region 1's.
+        const t = try be.begin(@src());
+        const k_again = try putInodeInSlot(be, 3, 901);
+        defer gpa.free(k_again);
+        try t.stagePut(key.TREE_INODES, k_again, &value);
+        try testing.expectError(error.SlotBusy, be.commit(t));
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        for (keys.items) |k| {
+            const got = try be.lookup(gpa, key.TREE_INODES, k);
+            defer if (got) |g| gpa.free(g);
+            try testing.expect(got != null);
+        }
+        // The leave released slot 3; the remount's arm re-leases it to
+        // region 0 (rotor) at a higher generation.
+        try testing.expect(be.slots.table.view(3).leasedBy(0));
+        try testing.expect(be.slots.table.gOf(3) >= 2);
+        try testing.expectEqual(conflicts0, slots.acquire.stats.slot_lease_conflicts.load());
+    }
+}
+
+test "the handover's kill matrix: a death after the page named the slot Releasing (row 5) and a death after tree 0 went Unleased (row 6) each remount to exactly ONE holder with both homes agreeing; the acked records survive; no conflict" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "hand-kill", .symmetric);
+    defer v.destroy();
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    const iv: record.InodeValue = .{ .mode = 0o100644, .nlink = 1 };
+    const value = iv.encode();
+    const conflicts0 = slots.acquire.stats.slot_lease_conflicts.load();
+    for ([_]slots.handover.Hold{ .after_page, .after_tree0 }) |hold| {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (keys.items) |k| gpa.free(k);
+            keys.deinit(gpa);
+        }
+        {
+            const be = try v.open();
+            defer be.close();
+            const plane = be.slots;
+            for (0..4) |i| {
+                const t = try be.begin(@src());
+                const k = try putInodeInSlot(be, 4, 20 + i);
+                try keys.append(gpa, k);
+                try t.stagePut(key.TREE_INODES, k, &value);
+                try be.commit(t);
+            }
+            try be.checkpointNow();
+            // The release of slot 4 to nobody, the image copied at the seam
+            // (row 5 PARKS after the page so a cadence cycle in between still
+            // names the slot Releasing; row 6 dies after tree 0).
+            if (hold == .after_page) {
+                plane.seam.hold = .park_after_page;
+                const Runner = struct {
+                    fn run(pl: *slots_plane.Plane, be_: *KvBackend, out: *anyerror!void) void {
+                        pl.verbs.handover_lock.lockUncancelable(be_.io);
+                        defer pl.verbs.handover_lock.unlock(be_.io);
+                        _ = slots.handover.transfer(be_.gpa, &pl.door, pl.table, pl.steps(), be_.io, 0, 4) catch |e| {
+                            out.* = e;
+                            return;
+                        };
+                        out.* = {};
+                    }
+                };
+                var out: anyerror!void = {};
+                const th = try std.Thread.spawn(.{}, Runner.run, .{ plane, be, &out });
+                plane.seam.reached.waitUncancelable(be.io);
+                try be.fsync();
+                try snapshotImage(v.path(), dst);
+                plane.seam.hold = .off;
+                plane.seam.release.set(be.io);
+                th.join();
+                try out;
+                try testing.expectEqual(slots.lease_table.State.unleased, plane.table.view(4).state);
+            } else {
+                plane.seam.hold = hold;
+                plane.verbs.handover_lock.lockUncancelable(be.io);
+                const r = slots.handover.transfer(gpa, &plane.door, plane.table, plane.steps(), be.io, 0, 4);
+                plane.verbs.handover_lock.unlock(be.io);
+                try testing.expectError(error.HeldAtSeam, r);
+                plane.seam.hold = .off;
+                try be.fsync();
+                try snapshotImage(v.path(), dst);
+                try testing.expectEqual(slots.lease_table.State.unleased, plane.table.view(4).state);
+            }
+        }
+        const copy = try v.openAt(dst, 1);
+        defer copy.close();
+        // Both homes agree after the remount: row 5's release COMPLETED
+        // from the page's words, row 6's tree 0 won — the slot is Unleased
+        // in tree 0, the table says so, and no page names it Live.
+        const vw = copy.slots.table.view(4);
+        try testing.expectEqual(slots.lease_table.State.unleased, vw.state);
+        const raw4 = (try copy.lookup(gpa, key.TREE_CONTROL, cr.slotStateKey(4).slice())).?;
+        defer gpa.free(raw4);
+        const rec = cr.SlotStateWire.decode(raw4) catch unreachable;
+        try testing.expect(rec.variant == .unleased and rec.g == vw.g);
+        try copy.checkpointNow();
+        for (copy.sym.?.region0().core.page.slotEntries()) |e| try testing.expect(e.slot != 4);
+        // A first touch re-leases it at g + 1 with the released cursor as
+        // its floor.
+        const t = try copy.begin(@src());
+        const k_new = try putInodeInSlot(copy, 4, 77);
+        defer gpa.free(k_new);
+        try t.stagePut(key.TREE_INODES, k_new, &value);
+        try copy.commit(t);
+        try testing.expect(copy.slots.table.view(4).leasedBy(0));
+        try testing.expectEqual(rec.g + 1, copy.slots.table.gOf(4));
+        for (keys.items) |k| {
+            const got = try copy.lookup(gpa, key.TREE_INODES, k);
+            defer if (got) |g| gpa.free(g);
+            try testing.expect(got != null);
+        }
+        try testing.expectEqual(conflicts0, slots.acquire.stats.slot_lease_conflicts.load());
+        unlinkPath(dst);
+    }
+}
+
+test "the page-budget overflow law: region 0 leasing 109 slots names 108 on its page and publishes the overflow root into tree 0 (publish-before-drop, counted); a remount opens every tree from the home that names it" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "overflow", .symmetric);
+    defer v.destroy();
+    // A 1 s window: the first touches fall idle within the test's wait.
+    try v.env.put("SQUEEZEFS_SYM_T_IDLE_MS", "1000");
+    const iv: record.InodeValue = .{ .mode = 0o100644, .nlink = 1 };
+    const value = iv.encode();
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| gpa.free(k);
+        keys.deinit(gpa);
+    }
+    const demoted0 = slots.page_budget.stats.meta_kv_forest_page_publications_demoted.load();
+    {
+        const be = try v.open();
+        defer be.close();
+        const plane = be.slots;
+        // 65 leases at the arm (native + 64 rotor); 44 more by first touch
+        // — one record each so every slot owns a tree.
+        var slot: u16 = 1000;
+        while (slot < 1044) : (slot += 1) {
+            const t = try be.begin(@src());
+            const k = try putInodeInSlot(be, slot, 7);
+            try keys.append(gpa, k);
+            try t.stagePut(key.TREE_INODES, k, &value);
+            try be.commit(t);
+        }
+        try testing.expectEqual(@as(u64, 109), plane.table.leasedCount());
+        const lru0 = slots.acquire.stats.slot_lru_releases.load();
+        try be.checkpointNow();
+        try testing.expectEqual(@as(usize, 108), be.sym.?.region0().core.page.slotEntries().len);
+        try testing.expect(slots.page_budget.stats.meta_kv_forest_page_publications_demoted.load() > demoted0);
+        // Every slot the page does not name is tree-0 homed at its LIVE
+        // root — Leased, or already Unleased by the cadence's LRU release
+        // (a region past the budget sheds an idle non-rotor slot).
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(gpa);
+        try plane.table.heldBy(0, &held);
+        var slot_i: u16 = 1000;
+        while (slot_i < 1044) : (slot_i += 1) {
+            var named = false;
+            for (be.sym.?.region0().core.page.slotEntries()) |e| named = named or e.slot == slot_i;
+            if (named) continue;
+            const raw_off = (try be.lookup(gpa, key.TREE_CONTROL, cr.slotStateKey(slot_i).slice())).?;
+            defer gpa.free(raw_off);
+            const rec = cr.SlotStateWire.decode(raw_off) catch unreachable;
+            const root = be.slotTree(slot_i).?.rootPtr();
+            try testing.expect(rec.root.addr == root.addr and rec.root.seq == root.seq);
+        }
+        // The cadence's LRU arm brings the region back to the budget (the
+        // counter moves when the whole transfer landed, page drop included).
+        const started = clock.monotonicNs();
+        while (slots.acquire.stats.slot_lru_releases.load() == lru0) {
+            if (clock.monotonicNs() - started > 10 * std.time.ns_per_s) return error.LruReleaseNeverRan;
+            std.Thread.yield() catch {};
+        }
+        try testing.expectEqual(@as(u64, page.SLOT_PAGE_BUDGET), plane.table.leasedCount());
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        for (keys.items) |k| {
+            const got = try be.lookup(gpa, key.TREE_INODES, k);
+            defer if (got) |g| gpa.free(g);
+            try testing.expect(got != null);
+        }
+        try testing.expectEqual(@as(u64, page.SLOT_PAGE_BUDGET), be.slots.table.leasedCount());
+    }
+}
+
+test "cursors travel as floors: a death after a page-named slot's mints were checkpointed (the page refreshed before barrier #1) remounts with the cursor above every minted ino — never a re-mint" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "cursor", .symmetric);
+    defer v.destroy();
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    const iv: record.InodeValue = .{ .mode = 0o100644, .nlink = 1 };
+    const value = iv.encode();
+    var highest: u64 = 0;
+    {
+        const be = try v.open();
+        defer be.close();
+        // One cycle names slot 3 on the page; then mints + records + a
+        // cycle whose pre-barrier refresh carries the cursor.
+        try be.checkpointNow();
+        for (0..5) |_| {
+            const local = try be.allocateInoInSlot(3);
+            highest = @max(highest, local);
+            const t = try be.begin(@src());
+            try t.stagePut(key.TREE_INODES, &key.inodeKey(key.guestLocalIno(3, local)), &value);
+            try be.commit(t);
+        }
+        const writes0 = slots.page_budget.stats.meta_kv_cursor_page_writes.load();
+        try be.checkpointNow();
+        try testing.expect(slots.page_budget.stats.meta_kv_cursor_page_writes.load() > writes0);
+        try be.fsync();
+        try snapshotImage(v.path(), dst);
+    }
+    const copy = try v.openAt(dst, 1);
+    defer copy.close();
+    try testing.expect(try copy.allocateInoInSlot(3) > highest);
+    try testing.expect(copy.stamp.cursorSnapshot(3).? > highest);
+    // The ledger stamp carries no cursors under the plane (the page and
+    // tree 0 are the homes).
+    try testing.expectEqual(@as(usize, 0), copy.mounted.membership_stamp.slot_cursors.len);
+}
+
+test "kill -9 after cycles moved a page-homed slot's root: records committed before the cycles, between them (the pre-barrier refresh names the moved root) and after the last cycle (the window) all survive the remount" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "page-home-kill", .symmetric);
+    defer v.destroy();
+    var dst_buf: [160]u8 = undefined;
+    const dst = try std.fmt.bufPrint(&dst_buf, "{s}.cut", .{v.path()});
+    defer unlinkPath(dst);
+    const iv: record.InodeValue = .{ .mode = 0o100644, .nlink = 1 };
+    const value = iv.encode();
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| gpa.free(k);
+        keys.deinit(gpa);
+    }
+    {
+        const be = try v.open();
+        defer be.close();
+        // Enough records per round that the slot's leaf splits (64 KiB
+        // nodes, ≈ 100 B records): the root moves between the page writes.
+        var local: u64 = 10;
+        for (0..4) |round| {
+            for (0..700) |_| {
+                const t = try be.begin(@src());
+                const k = try putInodeInSlot(be, 3, local);
+                local += 1;
+                try keys.append(gpa, k);
+                try t.stagePut(key.TREE_INODES, k, &value);
+                try be.commit(t);
+            }
+            if (round < 3) try be.checkpointNow();
+        }
+        try be.fsync();
+        try snapshotImage(v.path(), dst);
+    }
+    const copy = try v.openAt(dst, 1);
+    defer copy.close();
+    var missing: usize = 0;
+    for (keys.items) |k| {
+        const got = try copy.lookup(gpa, key.TREE_INODES, k);
+        defer if (got) |g| gpa.free(g);
+        if (got == null) missing += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), missing);
 }

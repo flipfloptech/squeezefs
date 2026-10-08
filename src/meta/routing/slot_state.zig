@@ -11,6 +11,10 @@
 
 const std = @import("std");
 const cr = @import("../sym/control_records.zig");
+const page = @import("../sym/appender_page.zig");
+const lease_table = @import("../sym/slots/lease_table.zig");
+const tree = @import("../tree.zig");
+const journal = @import("../journal.zig");
 
 pub const SlotState = cr.SlotState;
 pub const Root = cr.Root;
@@ -46,6 +50,41 @@ pub fn encode(s: SlotState) [cr.SlotStateWire.LEN]u8 {
 
 pub const decode = cr.SlotStateWire.decode;
 
+/// A guest slot's root as an OFFLINE reader (status/df/fsck, a mount's
+/// open) must see it: tree 0's word overridden by appender 0's page entry
+/// when the page is the live home (`lease_table.settleEntry`: a `Live` or
+/// `Releasing` entry at the record's generation under the manager — the
+/// two-homes law; a conflict is C14's). A slot leased but never minted has
+/// no root yet (`root.addr == 0`).
+pub const GuestRoot = struct { slot: u16, root: Root, cursor: u64, extents: u64 };
+
+pub const FoldError = error{ Corrupt, Conflict, OutOfMemory };
+
+/// Fold tree 0's `slot_state` records (`kvs`, the scan range's) with the
+/// page's entries into `out` — every record, a never-minted slot with
+/// `root.addr == 0` (its cursor is still a floor).
+pub fn foldGuestRoots(gpa: std.mem.Allocator, kvs: []const tree.KeyValue, page0: ?page.Page, out: *std.ArrayList(GuestRoot)) FoldError!void {
+    for (kvs) |kv| {
+        const slot = slotOfKey(kv.key) orelse continue;
+        const v = decode(kv.value) catch return error.Corrupt;
+        var root = v.root;
+        var cursor = v.cursor;
+        var extents: u64 = v.slot_tree_extents;
+        if (page0) |p0| for (p0.slotEntries()) |e| if (e.slot == slot) {
+            switch (lease_table.settleEntry(v, e, journal.FIXED_RING_APPENDER)) {
+                .adopt, .complete_release => |a| if (a.words.root.seq >= root.seq) {
+                    root = a.words.root;
+                    cursor = @max(cursor, a.words.cursor);
+                    extents = a.words.extents;
+                },
+                .conflict => return error.Conflict,
+                .drop_entry, .stale_entry => {},
+            }
+        };
+        try out.append(gpa, .{ .slot = slot, .root = root, .cursor = cursor, .extents = extents });
+    }
+}
+
 const testing = std.testing;
 const key = @import("../key.zig");
 
@@ -64,4 +103,31 @@ test "the routing face: keys in slot index order inside the scan range; the publ
     try testing.expectEqual(v, got);
     try testing.expect(got.variant == .unleased and got.appender_id == 0);
     try testing.expectError(error.Corrupt, decode(encode(v)[0..27]));
+}
+
+test "the offline fold: tree 0's root stands alone; a Live page entry at the record's g under the manager overrides it when newer; a leased-never-minted slot folds with root 0; a Live entry under another lessee is the conflict" {
+    const gpa = testing.allocator;
+    const leased: cr.SlotState = .{ .variant = .leased, .appender_id = 0, .g = 2, .root = .{ .addr = 4096, .seq = 1 }, .cursor = 5 };
+    const virgin: cr.SlotState = .{ .variant = .leased, .appender_id = 0, .g = 1, .root = .{ .addr = 0, .seq = 0 }, .cursor = 2 };
+    const kvs = [_]tree.KeyValue{ .{ .key = @constCast(keyOf(3).slice()), .value = @constCast(&leased.encode()) }, .{ .key = @constCast(keyOf(4).slice()), .value = @constCast(&virgin.encode()) } };
+    var p0 = page.Page.free(0, 1, page.SegmentTable.one(.{ .start = 0, .len = 4096 }));
+    try p0.setSlots(&.{.{ .slot = 3, .state = .live, .g = 2, .slot_tree_extents = 7, .root_addr = 8192, .root_seq = 9, .cursor = 50 }});
+    var out: std.ArrayList(GuestRoot) = .empty;
+    defer out.deinit(gpa);
+    try foldGuestRoots(gpa, &kvs, null, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    try testing.expectEqual(@as(u64, 4096), out.items[0].root.addr);
+    try testing.expectEqual(@as(u64, 0), out.items[1].root.addr);
+    try testing.expectEqual(@as(u64, 2), out.items[1].cursor);
+    out.clearRetainingCapacity();
+    try foldGuestRoots(gpa, &kvs, p0, &out);
+    try testing.expectEqual(@as(u64, 8192), out.items[0].root.addr);
+    try testing.expectEqual(@as(u64, 50), out.items[0].cursor);
+    try testing.expectEqual(@as(u64, 7), out.items[0].extents);
+    try p0.setSlots(&.{.{ .slot = 3, .state = .live, .g = 2, .slot_tree_extents = 7, .root_addr = 8192, .root_seq = 9, .cursor = 50 }});
+    var other = leased;
+    other.appender_id = 5;
+    const kvs2 = [_]tree.KeyValue{.{ .key = @constCast(keyOf(3).slice()), .value = @constCast(&other.encode()) }};
+    out.clearRetainingCapacity();
+    try testing.expectError(error.Conflict, foldGuestRoots(gpa, &kvs2, p0, &out));
 }

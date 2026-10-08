@@ -1037,9 +1037,11 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
     } else {
         stats.meta_kv_node_splits.inc();
         out.splits += 1;
+        t.noteNodes(@as(i64, @intCast(build.successors.items.len)) - 1);
         if (build.new_root != null) {
             stats.meta_kv_root_grows.inc();
             out.root_grows += 1;
+            t.noteNodes(1);
         }
     }
     build.releaseRefs();

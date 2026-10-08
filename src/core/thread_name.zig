@@ -61,6 +61,8 @@ pub const classes = [_]Class{
     .{ .prefix = "sqz-nvme", .class = "sqz-nvme" },
     .{ .prefix = "sqz-zcrx", .class = "sqz-zcrx" },
     .{ .prefix = "sqz-timer", .class = "sqz-timer" },
+    .{ .prefix = "sqz-wire-acc", .class = "sqz-wire-acc" },
+    .{ .prefix = "sqz-wire-conn", .class = "sqz-wire-conn" },
 };
 pub const other = "other";
 

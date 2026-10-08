@@ -111,3 +111,14 @@ its red test first and a row in 0002's ledger.
 | SQE128 | Zig 0.17's `std.os.linux.IoUring` indexes SQEs at a 64 B stride; the FUSE uring command needs the 80 B command area at offset 48. A first-party SQE128/CQE32 binding `src/io/uring128.zig` carries the `ParkedRing` park/wake/dead protocol for the transport workers; the sideband/INIT ring stays a plain `ParkedRing` | charter §12 "io_uring through Zig's own liburing-equivalent bindings (SQE128/CQE32 …)" |
 
 Charter §9 amended accordingly (lane names; the timer/fd-watch bullet).
+
+## E. Rung-6 design calls (2026-10-08, from `docs/porting/sym_*.md`)
+
+| Call | Decision | Why |
+|---|---|---|
+| Membership rows | Member/client rows are `WriterClaimV1`-shaped records (`kind = 1`) in tree 0 of the home volume; the rendezvous rides the manager's claim; the appender page keeps the charter's `SLOT_PAGE_BUDGET = 108` — no `claim_set` fold into the page | charter §5.5 names 108 at the fixed part's natural widths; a page carrying membership would shrink it |
+| Wire thread classes | `sqz-wire-acc` (the accept thread) and `sqz-wire-conn` (thread-per-connection) join the §9 naming contract (charter amended) | charter §9 thread-per-connection for wires; `daemon_cpu_ns_by_class` needs a class |
+| Wire authentication | Rung 6: HMAC-SHA256 trailer over the `job:enroll` storage-trust secret with a server nonce + session key (the reference's ladder); mTLS on the cluster wire is rung 8 (Zig 0.17 std has a TLS client only; a server needs vendoring) | charter §8 names TCP/TLS for remote workers; the storage-trust ladder already binds identity to the volume |
+| Cross-volume stopgap | Rung 5's `KvTx.cross` / `commitSplit` / EXDEV refusal are retired by the intents | charter §5.5 cross-owner intents |
+| Grant sizing | The writer MEASURES its own block rate and names `want`; `G`'s EWMA term is live (the reference never fed it — every grant was the floor 64) | charter §5.5 `G = clamp(2 × ewma_blocks/s × T_renewal, 64, cap/(2 × writers))` |
+| Un-share witness | A share intent registered before `MarkShared` step 1 and retired at `ShareBlock`'s ack gives `Held{1}` the witness the charter calls owed; `UnshareBlock` lands guarded on it | charter §5.5 "the un-share protocol needs a share-in-flight witness — owed" |

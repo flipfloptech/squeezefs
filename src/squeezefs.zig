@@ -40,6 +40,10 @@ pub const model = struct {
 
 // ---- the metadata plane: MetaLV (portable codecs + cores; device I/O via io/) ----
 pub const meta = struct {
+    // @anchor:sym_appender_import
+    // @anchor:sym_slots_import
+    // @anchor:sym_tokens_import
+    // @anchor:sym_membership_import
     pub const guard = @import("meta/guard.zig");
     pub const routing = @import("meta/routing.zig");
     pub const meta_set = if (builtin.os.tag == .linux) @import("meta/meta_set.zig") else struct {};
@@ -99,6 +103,7 @@ pub const cli = @import("cli/cli.zig");
 
 // ---- the data plane (charter §6) ----
 pub const data = struct {
+    // @anchor:sym_planes_import
     pub const kvmap = @import("data/kvmap.zig");
     pub const layout = @import("data/layout.zig");
     pub const staging = @import("data/staging.zig");
@@ -137,6 +142,9 @@ pub const data = struct {
     pub const plane_locks_model = @import("data/plane_locks_model.zig");
 };
 
+// ---- the cluster wire (charter §5.5 verbs; §9 thread-per-connection) ----
+// @anchor:wire_import
+
 // ---- observability surface: the .stats inode + CLI families (charter §10) ----
 pub const stats = @import("stats/stats.zig");
 
@@ -165,6 +173,12 @@ test {
     _ = json_scan;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:sym_appender_test
+    // @anchor:sym_slots_test
+    // @anchor:sym_tokens_test
+    // @anchor:sym_membership_test
+    // @anchor:sym_planes_test
+    // @anchor:wire_test
     _ = data.kvmap;
     _ = meta.guard;
     _ = meta.routing;

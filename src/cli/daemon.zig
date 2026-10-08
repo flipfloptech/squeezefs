@@ -29,6 +29,17 @@
 //! eventfd (both async-signal-safe); the main task waits on that eventfd
 //! through its lane ring (`SqzIo.readable`) and acts in its own context.
 //! SIGPIPE is ignored (a relay pipe closed early must not kill a mount).
+//!
+//! The latch is what makes SIGTERM/SIGINT ORDERLY: `mount.zig` runs
+//! `Session.close`, whose drains RELEASE every retained zero-copy slot
+//! while the connection is live (a retained ent the kernel reclaims at its
+//! own teardown pins the exiting process in D state). The exits that run
+//! NO teardown are the supervisor's escalation (`supervisor.zig`: dump →
+//! SIGABRT → SIGKILL — SIGABRT's default action dumps core and terminates,
+//! no handler, no drain) and any external `kill -9`: there the kernel's
+//! own drain of the retained ents is the only recourse, and the supervisor
+//! finishes by writing the connection's fusectl `abort` iff `waiting > 0`
+//! so no caller stays blocked behind the dead daemon.
 
 const std = @import("std");
 const builtin = @import("builtin");

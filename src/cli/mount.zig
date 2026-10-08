@@ -31,14 +31,24 @@
 //! ONE aggregator (`stats/stats.zig`), one line per family. Stop latches;
 //! nothing is aborted from outside.
 //!
-//! Teardown: `Session.close` (drains synthesize every owed reply, the
+//! Teardown: `Session.close` (the drains RELEASE every retained zc slot
+//! while the connection is live and synthesize every owed reply, then the
 //! unmount, the workers join) → the watchdog and the cadence cancelled →
 //! `Session.deinit` → the filesystem's dismount sweep → `DataPlane.close`
 //! (the dismount pass: staged files promote, packs seal DISMOUNT, the
 //! reclaimer drains, the devices close — charter §8 `umount`) →
 //! `KvBackend.close` (the final checkpoint: an empty replay window for the
 //! next mount) → the sampler → exit 0; a volume that latched FAILED exits
-//! 1 naming the reason.
+//! 1 naming the reason — AFTER the same `Session.close`, so its slots are
+//! released too.
+//!
+//! Every exit of `mountMain` runs that order: the stop latch (SIGTERM /
+//! SIGINT), the session's own end (the `on_shutdown` hook), a failed spawn
+//! after the session armed (`defer session.deinit()`), and the FAILED
+//! verdict. What no daemon code can cover: an EXTERNAL `umount(8)` (a
+//! type-`fuse` mount gets no DESTROY — the kernel aborts the connection
+//! and reclaims any retained ent itself, `transport_retained_kernel_drained`)
+//! and the signals that run no teardown (`daemon.zig`).
 
 const std = @import("std");
 const builtin = @import("builtin");

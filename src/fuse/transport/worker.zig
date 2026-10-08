@@ -44,6 +44,19 @@
 //! DELIVERS a request on it, and it routes requests to the ring only once
 //! `is_ring_ready()` observes EVERY queue armed.
 //!
+//! TEARDOWN RELEASES EVERY RETAINED SLOT WHILE THE CONNECTION IS LIVE: a
+//! retained ent (`replyRetain`, the ACK-early arm) the kernel reclaims at
+//! its own teardown is logged `fuse-uring: … teardown with retained zc
+//! payloads` and its still-registered fixed buffer pins the io_uring exit —
+//! the exiting process sits in D state until the container is recreated.
+//! So the drain RELEASEs every `retained` slot and reaps the verdicts
+//! BEFORE it publishes `drained` (the session's `umount2` waits for it).
+//! What the daemon cannot cover: an exit that runs no teardown (SIGKILL,
+//! SIGABRT) and an EXTERNAL `umount(8)` of a type-`fuse` mount — the kernel
+//! sends no DESTROY there (`fc->destroy` is fuseblk/virtiofs only) and
+//! aborts the connection outright, so a retained slot at that instant is
+//! the kernel's drain's (counted `transport_retained_kernel_drained`).
+//!
 //! Why a dedicated thread and not an `exec.Lane`: `Lane` owns std's 64 B
 //! `ParkedRing`; the FUSE uring command needs the 80 B command area of an
 //! SQE128 ring (`io/uring128.zig`). The fused handler poll therefore runs
@@ -106,6 +119,12 @@ pub const DRAIN_LEASE_BUDGET_NS: u64 = 100 * std.time.ns_per_ms;
 /// parks on the worker's own ring, never a sleep-poll (Q14).
 pub const RESIDENCY_NS: u64 = 30 * std.time.ns_per_s;
 pub const RESIDENCY_PARK_NS: u64 = 10 * std.time.ns_per_ms;
+/// How long the drain waits for its RELEASE CQEs: the kernel answers a
+/// RELEASE_PAYLOAD inline in the submitting enter (`fuse_uring_cmd` returns
+/// the verdict, never -EIOCBQUEUED), so the wait is one enter and the bound
+/// only guards a dead ring; a lapse is loud (the slot is then the kernel's
+/// and its reclaim pins the exit).
+pub const TEARDOWN_RELEASE_BOUND_NS: u64 = 2 * std.time.ns_per_s;
 /// Read fusion ceiling: `max(payload / 8, 4096)` — two wakes and two
 /// schedules ≈ 5–10 µs ≈ 50–100 KiB at ~10 GB/s of merge copy (128 KiB at
 /// a 1 MiB payload).
@@ -270,6 +289,21 @@ pub var scan_max_age_ms: counters.Gauge = .{};
 /// `transport_zc_release_inert`: a release for a slot that was not retained
 /// (the retain was refused and committed plain, or a teardown race).
 pub var zc_release_inert: counters.ShardedCounter = .{};
+/// `transport_retained_released_at_teardown`: retained slots the drain
+/// RELEASEd itself — the RELEASE CQE answered 0 while the connection was
+/// still live. The kernel's own reclaim of a retained ent (`fuse-uring: …
+/// teardown with retained zc payloads`) pins the exiting process; an
+/// orderly exit never leaves one.
+pub var retained_released_at_teardown: counters.ShardedCounter = .{};
+/// `transport_retained_kernel_drained`: retained slots the drain found on
+/// a connection already gone, or whose RELEASE met one (`-ENOTCONN`: an
+/// external `umount(8)`, a sysfs abort or a lazy detach beat the drain) —
+/// the kernel's drain owns them. Non-zero only on a disconnect not ours.
+pub var retained_kernel_drained: counters.ShardedCounter = .{};
+/// `transport_zc_releases_inflight`: RELEASE SQEs pushed whose CQE is not
+/// yet reaped — the RELEASE ledger's closure term (`releases − verdicts`),
+/// 0 at quiesce.
+pub var releases_inflight: counters.Gauge = .{};
 
 fn noteCommitBatch(n: u32) void {
     if (n == 0) return;
@@ -618,6 +652,9 @@ pub const Group = struct {
     extract_inbox: mpmc.BoundedMpmc(u32),
     store_inbox: mpmc.BoundedMpmc(u32),
     release_inbox: mpmc.BoundedMpmc(u32),
+    /// Per gent: the in-flight RELEASE was the drain's, not a handler's —
+    /// one RELEASE per retention, so one flag.
+    release_teardown: []bool,
     last_scan_ns: u64 = 0,
     affinity: ?placement.CpuSet,
     thread: ?std.Thread = null,
@@ -635,6 +672,9 @@ pub const Group = struct {
     cq_overflow_seen: u32 = 0,
     disconnected: bool = false,
     protocol_rejected: bool = false,
+    /// This group's RELEASE SQEs pushed and not yet answered (the drain
+    /// waits for 0 before the session may unmount).
+    releases_pending: u32 = 0,
 
     pub const InitError = std.mem.Allocator.Error || error{ArenaMapFailed};
     pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed };
@@ -676,6 +716,7 @@ pub const Group = struct {
             .extract_inbox = undefined,
             .store_inbox = undefined,
             .release_inbox = undefined,
+            .release_teardown = &.{},
             .affinity = affinity,
         };
         const members = try gpa.alloc(Member, qids.len);
@@ -760,6 +801,9 @@ pub const Group = struct {
         self.store_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
         errdefer self.store_inbox.deinit(gpa);
         self.release_inbox = try mpmc.BoundedMpmc(u32).init(gpa, gents);
+        errdefer self.release_inbox.deinit(gpa);
+        self.release_teardown = try gpa.alloc(bool, gents);
+        @memset(self.release_teardown, false);
         return self;
     }
 
@@ -768,6 +812,7 @@ pub const Group = struct {
     pub fn deinit(self: *Group) void {
         assert(self.thread == null);
         if (self.started.load(.acquire) == 1) self.ring.deinit();
+        self.gpa.free(self.release_teardown);
         self.release_inbox.deinit(self.gpa);
         self.store_inbox.deinit(self.gpa);
         self.gpa.free(self.hooks);
@@ -1067,15 +1112,32 @@ pub const Group = struct {
         m.slots.onCommitSubmittedRetained(e);
         ring_replies.inc();
         self.commits_pushed += 1;
-        if (m.slots.ent(e).release_pending) self.pushRelease(gent, commit_id);
+        if (m.slots.ent(e).release_pending) self.pushRelease(gent, commit_id, .handler);
     }
 
-    fn pushRelease(self: *Group, gent: u32, commit_id: u64) void {
+    const ReleaseOrigin = enum { handler, teardown };
+
+    fn pushRelease(self: *Group, gent: u32, commit_id: u64, origin: ReleaseOrigin) void {
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
         const sqe = self.takeSqe() orelse return;
         prepRelease(sqe, m.qid, commit_id, gent);
         m.slots.onReleaseSubmitted(e);
+        self.release_teardown[gent] = origin == .teardown;
+        self.releases_pending += 1;
+        releases_inflight.add(1);
+    }
+
+    /// RELEASE every retained slot of this group — the drain's half of the
+    /// retention law: a retained ent the kernel reclaims itself pins the
+    /// exiting process. Idempotent: a released slot is `replied`.
+    fn releaseRetainedAll(self: *Group) void {
+        for (self.members, 0..) |*m, ms| {
+            for (m.slots.ents, 0..) |*ent, e| switch (ent.state) {
+                .retained => |cid| self.pushRelease(self.gentOf(@intCast(ms), @intCast(e)), cid, .teardown),
+                else => {},
+            };
+        }
     }
 
     /// `fail_ent`: the header-only `-errno` for an owing slot; nothing
@@ -1419,11 +1481,32 @@ pub const Group = struct {
             const e = self.entIdxOf(gent);
             const ent = m.slots.ent(e);
             switch (ent.state) {
-                .retained => |cid| self.pushRelease(gent, cid),
+                .retained => |cid| self.pushRelease(gent, cid, .handler),
                 .delivered, .parked => ent.release_pending = true,
                 else => zc_release_inert.inc(),
             }
         }
+    }
+
+    /// A RELEASE CQE: 0 is the kernel's acceptance; a disconnect errno
+    /// means the connection died first and the kernel's drain owns the
+    /// slot (counted, never the tripwire); anything else is the
+    /// must-stay-0 failure (ENOENT a double release, EBUSY a live commit).
+    fn handleReleaseCqe(self: *Group, gent: u32, res: i32) void {
+        self.releases_pending -|= 1;
+        releases_inflight.sub(1);
+        if (res == 0) {
+            if (self.release_teardown[gent]) retained_released_at_teardown.inc();
+            return;
+        }
+        cqe_errors.inc();
+        const e: linux.E = @fromBackingInt(@as(u16, @intCast(-res)));
+        if (isDisconnect(e)) {
+            retained_kernel_drained.inc();
+            self.disconnected = true;
+            return;
+        }
+        self.releaseFailure(gent, e);
     }
 
     // ---- the commit path ----
@@ -1841,13 +1924,7 @@ pub const Group = struct {
         switch (tag.kind) {
             .bridge => return self.handleBridgeCqe(tag.gent, cqe.res),
             .cancel => return self.handleCancelCqe(tag.gent, cqe.res),
-            .release => {
-                if (cqe.res != 0) {
-                    cqe_errors.inc();
-                    self.releaseFailure(tag.gent, cqe.err());
-                }
-                return;
-            },
+            .release => return self.handleReleaseCqe(tag.gent, cqe.res),
             .register, .commit => {},
         }
         if (cqe.res < 0) return self.handleCqeError(tag, cqe.err());
@@ -2194,15 +2271,16 @@ pub const Group = struct {
             self.store_cells[g].res = -@as(i32, @intCast(@backingInt(linux.E.NOTCONN)));
             self.store_cells[g].event.set(self.shared.io);
         }
+        // A handler's release still queued is subsumed by step 3.
         while (self.release_inbox.tryPop()) |_| {}
         // 2. Final messages: every published cell still queued joins the
         //    parked ones; a leased ent gets the whole-group bounded wait.
         while (self.cells.pop()) |gent| self.handleCommitCell(gent);
         self.awaitLeases();
-        // 4–5. Parked and still leased ⇒ header-only EIO (never the payload,
+        // 3–4. Parked and still leased ⇒ header-only EIO (never the payload,
         //    never counted as an unpark); a bridge-parked cell ⇒ its body
         //    never reached the pages: header-only EIO; every other owing
-        //    slot ⇒ fail_ent. Retained slots are the kernel's.
+        //    slot ⇒ fail_ent.
         for (self.members, 0..) |*m, ms| {
             for (m.parked, 0..) |p, e| {
                 const ent_idx: u16 = @intCast(e);
@@ -2228,8 +2306,20 @@ pub const Group = struct {
                 if (m.slots.ent(ent_idx).owing() != null) self.failEnt(gent, .IO);
             }
         }
-        // 6–7. One flush for the whole drain; the session may unmount now.
+        // 5. RELEASE every retained slot while the connection is live — after
+        //    every commit of this drain (a RETAIN an unparked cell just pushed
+        //    precedes its RELEASE in SQ order). A retained ent the kernel
+        //    reclaims at its own teardown pins the exiting process
+        //    (`fuse-uring: … teardown with retained zc payloads`); after a
+        //    disconnect the kernel's drain already owns them (counted).
+        if (!self.disconnected) self.releaseRetainedAll() else self.countKernelDrained();
+        // 6. One flush for the whole drain, then the RELEASE verdicts: the
+        //    kernel answers them inside that enter, so the reap is immediate
+        //    and the session may unmount only once every RELEASE is reaped
+        //    (a RELEASE after `umount2` meets a stopped queue).
         self.flushNonBlocking();
+        self.awaitReleases();
+        // 7. The session may unmount now.
         self.drained.store(1, .release);
         futex.wakeAll(&self.drained);
         // 8. Residency.
@@ -2237,6 +2327,33 @@ pub const Group = struct {
         // Anything still owed when residency lapsed is the honest tripwire.
         for (self.members) |*m| {
             for (m.slots.ents, 0..) |*ent, e| if (ent.owing() != null) m.slots.abandon(@intCast(e));
+        }
+    }
+
+    /// The drain found the connection already gone: every retained slot is
+    /// the kernel's drain's (its RELEASE would answer -ENOTCONN).
+    fn countKernelDrained(self: *Group) void {
+        for (self.members) |*m| {
+            for (m.slots.ents) |*ent| if (ent.state == .retained) retained_kernel_drained.inc();
+        }
+    }
+
+    /// Reap this group's teardown RELEASE CQEs (`releases_pending` → 0):
+    /// inline with the flush in practice; bounded parks on the ring guard a
+    /// dead ring, and a lapse is loud (the slot is then the kernel's).
+    fn awaitReleases(self: *Group) void {
+        const deadline = clock.monotonicNs() + TEARDOWN_RELEASE_BOUND_NS;
+        while (self.releases_pending > 0 and !self.disconnected and !self.ring.isDead()) {
+            self.reapQuiet();
+            if (self.releases_pending == 0) return;
+            const now = clock.monotonicNs();
+            if (now >= deadline) {
+                log.warn("transport: group {d}: {d} teardown RELEASE(s) unanswered after {d} ms — the kernel reclaims those slots at its teardown", .{ self.index, self.releases_pending, TEARDOWN_RELEASE_BOUND_NS / std.time.ns_per_ms });
+                return;
+            }
+            _ = self.ring.armWake();
+            _ = self.park(@min(RESIDENCY_PARK_NS, deadline - now));
+            _ = self.ring.service();
         }
     }
 
@@ -2263,8 +2380,9 @@ pub const Group = struct {
     }
 
     /// Reap during the drain: wakes consumed, deliveries answered ENOTCONN
-    /// header-only, errors noted for the disconnect verdict, bridge/cancel/
-    /// release CQEs dropped (their pends are gone).
+    /// header-only, RELEASE verdicts accounted, a refused RETAIN re-committed
+    /// plain (the request is still live kernel-side), errors noted for the
+    /// disconnect verdict, bridge/cancel CQEs dropped (their pends are gone).
     fn reapQuiet(self: *Group) void {
         var cqes: [64]uring128.Cqe32 = undefined;
         while (true) {
@@ -2281,9 +2399,21 @@ pub const Group = struct {
                 if (uring128.Tag.isReserved(cqe.user_data)) continue;
                 const tag = decodeTag(cqe.user_data) orelse continue;
                 if (tag.gent >= self.headers.depth) continue;
+                if (tag.kind == .release) {
+                    self.handleReleaseCqe(tag.gent, cqe.res);
+                    continue;
+                }
                 if (cqe.res < 0) {
                     cqe_errors.inc();
-                    if (isDisconnect(cqe.err())) self.disconnected = true;
+                    const e = cqe.err();
+                    if (isDisconnect(e)) {
+                        self.disconnected = true;
+                    } else if (tag.kind == .commit and e == .INVAL and self.memberOf(tag.gent).slots.ent(self.entIdxOf(tag.gent)).state == .retained) {
+                        const m = self.memberOf(tag.gent);
+                        const ent_idx = self.entIdxOf(tag.gent);
+                        m.slots.onRetainRefused(ent_idx, clock.monotonicNs());
+                        self.pushCommit(tag.gent, m.slots.ent(ent_idx).owing().?.commit_id);
+                    }
                     continue;
                 }
                 if (tag.kind != .register and tag.kind != .commit) continue;

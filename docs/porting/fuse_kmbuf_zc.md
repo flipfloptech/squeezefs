@@ -523,7 +523,16 @@ must stay 0 — the submit site mirrors the kernel checks) (`fuse_over_uring.rs:
 a transient `EAGAIN/EINTR` on a RETAIN commit re-commits WITH retain after
 `retract_zc_retain_commit` (the kernel never parked it) (`:6798-6831`). A retained slot
 owes NO reply: `owing()`/`any_owing()` exclude it, `fail_ent` is a no-op on it, teardown
-synthesizes nothing (`:736-759, 8841-8853`).
+synthesizes nothing (`:736-759, 8841-8853`) — but it DOES owe a RELEASE, which the
+reference leaves to the kernel's reclaim. NOT carried (decision 0002 row 263): the Zig
+drain pushes `RELEASE_PAYLOAD` for every `retained` slot after every commit of the drain
+(a RETAIN an unparked cell pushed precedes its RELEASE in SQ order), reaps the verdicts — the
+kernel answers inline in the submitting enter — and only then publishes `drained` for the
+session's `umount2`. The kernel's `pr_warn` ("teardown with retained zc payloads") is the
+line an orderly teardown must never add: on 7.2.6-sqz the reclaimed ent's fixed buffer
+pinned the exiting process in D state. Counted `transport_retained_released_at_teardown`;
+a drain that finds the connection already gone (a `-ENOTCONN` verdict, or `disconnected`
+before the pass) counts `transport_retained_kernel_drained` — never the release tripwire.
 
 Arming a RETAIN: the handler calls `zc_commit_retain(slot)` strictly before replying —
 `retention ∧ zc_armed()` required, sets `retain_next[qid × depth + ent]`
@@ -579,7 +588,7 @@ What each mode changes:
 | Reply, paged body | `apply_reply` copy into arena | copy into kmbuf buffer | prefilled (direct leg) / `READ_FIXED(memfd\|pool fd → slot)` bridge, commit parked until CQE |
 | Reply, header/other | `apply_reply` | same | same (kmbuf attachment) |
 | Commit | plain | plain | plain, or RETAIN on armed page-cache writes |
-| Teardown | drains synthesize errors for owed slots | + munmap regions; pins die with the ring fd | + bounce unmapped; retained ents drain kernel-side (`-ECONNABORTED` on the parked cmd); pends die with the worker |
+| Teardown | drains synthesize errors for owed slots | + munmap regions; pins die with the ring fd | + bounce unmapped; retained ents RELEASEd by the drain before the unmount (§5.3; the reference left them to the kernel's reclaim — 0002 row 263); pends die with the worker |
 | Gauges | `fuse3_kmbuf_negotiated 0`, `fuse3_zc_negotiated 0` | `kmbuf 1` | `kmbuf 1`, `zc 1`, `retention 0/1` |
 
 `uses_kmbuf()` = BufRing | ZeroCopy (`kmbuf.rs:755-758`). Gauges are set after the arm

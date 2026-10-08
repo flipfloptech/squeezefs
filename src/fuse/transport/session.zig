@@ -1181,10 +1181,15 @@ pub const Session = struct {
 
     // ---- teardown ----
 
-    /// Phase 1: shutdown → the workers' drains synthesize an error for every
-    /// owed slot (the blocked callers return, so the mount is not busy) →
-    /// `umount2` → the disconnect ends the workers' residency and the
-    /// sideband → join → the filesystem's `destroy` → close the fd.
+    /// Phase 1: shutdown → the workers' drains RELEASE every retained slot
+    /// (reaping the verdicts: a RELEASE after the unmount meets a stopped
+    /// queue, and a retained ent the kernel reclaims pins the exit) and
+    /// synthesize an error for every owed slot (the blocked callers return,
+    /// so the mount is not busy) → `umount2` → the disconnect ends the
+    /// workers' residency and the sideband → join → the filesystem's
+    /// `destroy` → close the fd. The one orderly path the drain cannot
+    /// cover is an EXTERNAL `umount(8)`: a type-`fuse` mount gets no
+    /// DESTROY, the kernel aborts the connection first.
     pub fn close(self: *Session) void {
         if (self.closed) return;
         self.closed = true;
@@ -1377,6 +1382,9 @@ pub const Session = struct {
         try field(w, "transport_zc_retain_refused", slot.retain_refused.load());
         try field(w, "transport_zc_retain_refused_class", slot.retain_refused_class.load());
         try field(w, "transport_zc_release_inert", worker.zc_release_inert.load());
+        try field(w, "transport_zc_releases_inflight", worker.releases_inflight.load());
+        try field(w, "transport_retained_released_at_teardown", worker.retained_released_at_teardown.load());
+        try field(w, "transport_retained_kernel_drained", worker.retained_kernel_drained.load());
         try field(w, "transport_releases_requested", releases_requested.load());
         try field(w, "transport_fused_read_late_demotions", worker.fused_read_late_demotions.load());
         try field(w, "transport_fused_polls", worker.fused_polls.load());
@@ -1772,6 +1780,84 @@ fn waitUntil(ctx: anytype, comptime pred: fn (@TypeOf(ctx)) bool, budget_ns: u64
     }
     return true;
 }
+
+/// The kernel's ratelimited warn when its teardown reclaims a retained zc
+/// ent the daemon never RELEASEd (patch 0024): the one line an orderly
+/// teardown must never add.
+const retained_warn_needle = "teardown with retained zc payloads";
+
+/// A mark on the kernel log ring (`syslog(2)` READ_ALL; root): how many
+/// lines carry `needle` and the LAST such line verbatim — two marks are
+/// equal iff no new line appeared, even if the ring evicted old ones.
+const KernelLogMark = struct {
+    count: usize,
+    last: [256]u8 = undefined,
+    last_len: usize = 0,
+
+    const SYSLOG_ACTION_READ_ALL = 3;
+    const SYSLOG_ACTION_SIZE_BUFFER = 10;
+
+    fn take(gpa: std.mem.Allocator, needle: []const u8) !KernelLogMark {
+        const size_rc = linux.syscall3(.syslog, SYSLOG_ACTION_SIZE_BUFFER, 0, 0);
+        if (linux.errno(size_rc) != .SUCCESS) return error.SyslogFailed;
+        const buf = try gpa.alloc(u8, size_rc);
+        defer gpa.free(buf);
+        const n_rc = linux.syscall3(.syslog, SYSLOG_ACTION_READ_ALL, @intFromPtr(buf.ptr), buf.len);
+        if (linux.errno(n_rc) != .SUCCESS) return error.SyslogFailed;
+        var mark: KernelLogMark = .{ .count = 0 };
+        var lines = std.mem.splitScalar(u8, buf[0..n_rc], '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, needle) == null) continue;
+            mark.count += 1;
+            mark.last_len = @min(line.len, mark.last.len);
+            @memcpy(mark.last[0..mark.last_len], line[0..mark.last_len]);
+        }
+        return mark;
+    }
+
+    fn lastLine(self: *const KernelLogMark) []const u8 {
+        return self.last[0..self.last_len];
+    }
+
+    fn sameAs(self: *const KernelLogMark, other: *const KernelLogMark) bool {
+        return self.count == other.count and std.mem.eql(u8, self.lastLine(), other.lastLine());
+    }
+};
+
+/// A teardown bound for a test: a thread that reports LOUDLY (the retained
+/// ledger, the owed count, the elapsed time) when `close` has not returned
+/// within `bound_ns` and then ends the process — a teardown pinned
+/// kernel-side (D-state workers) is otherwise a silent multi-hour hang
+/// the gate's `timeout` cannot explain. `stop` before the bound is the
+/// normal path and the thread exits quietly.
+const TeardownWatchdog = struct {
+    done: futex.Word = .init(0),
+    thread: std.Thread = undefined,
+    bound_ns: u64,
+    what: []const u8,
+
+    fn start(self: *TeardownWatchdog) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *TeardownWatchdog) void {
+        const t0 = clock.monotonicNs();
+        while (self.done.load(.acquire) == 0) {
+            const now = clock.monotonicNs();
+            if (now - t0 >= self.bound_ns) {
+                std.debug.print("\n=== teardown watchdog: {s} did not return within {d} ms (retained_outstanding {d}, releases_inflight {d}, released_at_teardown {d}, kernel_drained {d}) — the kernel pinned the teardown; exiting the test process ===\n", .{ self.what, self.bound_ns / std.time.ns_per_ms, slot.retained_outstanding.load(), worker.releases_inflight.load(), worker.retained_released_at_teardown.load(), worker.retained_kernel_drained.load() });
+                std.process.exit(3);
+            }
+            _ = futex.waitTimeout(&self.done, 0, self.bound_ns - (now - t0));
+        }
+    }
+
+    fn stop(self: *TeardownWatchdog) void {
+        self.done.store(1, .release);
+        futex.wakeAll(&self.done);
+        self.thread.join();
+    }
+};
 
 test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, enable_uring reads Y, every queue armed, stat/open/read from a helper thread arrive over the RING (the sideband saw no request), replies byte-exact, the geometry the kernel accepted equals the plan" {
     if (!venueAvailable()) return error.SkipZigTest;
@@ -2252,7 +2338,7 @@ test "e2e zc bridges: a bridge that never completes (the stall seam) is cancelle
     std.debug.print("\nbridge stall: cancelled after {d} ms (deadline 300), reader EIO, then served\n", .{waited / std.time.ns_per_ms});
 }
 
-test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns while the slot is Retained (ACK-early observed), the handler extracts AFTER the ACK, releases, the slot is Replied (retain_commits − releases ≡ 0); an O_DIRECT write is `.direct_gup` and its retain is REFUSED (committed plain, counted); teardown with a retained slot drains kernel-side and leaves no mount" {
+test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns while the slot is Retained (ACK-early observed), the handler extracts AFTER the ACK, releases, the slot is Replied (retain_commits − releases ≡ 0); an O_DIRECT write is `.direct_gup` and its retain is REFUSED (committed plain, counted); teardown with a retained slot RELEASEs it before the unmount and leaves no mount" {
     if (!venueAvailable()) return error.SkipZigTest;
     const rig = try Rig.init(testing.allocator, 29, &.{});
     defer rig.deinit();
@@ -2262,6 +2348,9 @@ test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns
     // The worker's class-refusal warn is a warn; the stale-reply refusals of
     // the releases after a refused retain are warns too.
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    // A failed expectation while a handler parks on the gate must not hang
+    // `rig.deinit`'s handler-group await.
+    defer rig.fs.openRetainGate();
     try testing.expect(s.shared.retention);
     const before = Snapshot.take();
     var pb: [256]u8 = undefined;
@@ -2333,13 +2422,15 @@ test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns
     try testing.expectEqual(@as(u64, 2), after.releases - before.releases);
     try testing.expectEqual(@as(u64, 0), slot.retained_outstanding.load());
     // 4. Teardown with a RETAINED slot: close the gate first so the next
-    //    retain parks; close the session; the kernel drains the retained
-    //    ent; the handler's late extract fails and its release is dropped.
+    //    retain parks; close the session; the drain RELEASEs the retained
+    //    ent itself (the ledger closes by the release, never by fiat); the
+    //    handler's late extract fails and its release is dropped.
     rig.fs.retain_gate = .unset;
     try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, 12288));
     try testing.expectEqual(@as(u64, 1), slot.retained_outstanding.load());
     _ = linux.close(dfd);
     _ = linux.close(fd);
+    const released_before = worker.retained_released_at_teardown.load();
     s.close();
     try testing.expect(!s.isMounted());
     rig.fs.openRetainGate();
@@ -2347,8 +2438,76 @@ test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns
     rig.session = null;
     try testing.expectEqual(@as(u64, 1), rig.fs.extract_failures.load(.monotonic));
     try testing.expectEqual(after.abandoned, slot.requests_abandoned.load());
-    // The retained slot was the kernel's: our ledger closes at teardown.
-    slot.retained_outstanding.set(0);
+    try testing.expectEqual(released_before + 1, worker.retained_released_at_teardown.load());
+    try testing.expectEqual(@as(u64, 0), slot.retained_outstanding.load());
+    try testing.expectEqual(@as(u64, 3), slot.releases.load() - before.releases);
+}
+
+test "e2e retention teardown: N slots RETAINED at close — the orderly teardown RELEASEs every one while the connection is live (released_at_teardown == N, retained_outstanding == 0, release_failures unchanged, the kernel logs no `retained zc payloads` line), close returns in under 2 s, nothing is abandoned" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, 40, &.{});
+    defer rig.deinit();
+    rig.fs.hold_eligible = true;
+    rig.fs.retain_writes = true;
+    const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
+    // On EVERY exit the parked handlers are let go before `rig.deinit`
+    // awaits the handler group — a failed expectation above the explicit
+    // open must not turn into a hang.
+    defer rig.fs.openRetainGate();
+    try testing.expect(s.shared.retention);
+    // Three retained slots on one queue leave one ent free at depth 4 (the
+    // FLUSH at close(fd) needs it).
+    const n_retained: u64 = 3;
+    try testing.expect(s.plan.depth > n_retained);
+    const before = Snapshot.take();
+    const released_before = worker.retained_released_at_teardown.load();
+    const kernel_drained_before = worker.retained_kernel_drained.load();
+    const kmsg_before = try KernelLogMark.take(testing.allocator, retained_warn_needle);
+    var pb: [256]u8 = undefined;
+    const fd = try openPath(rig.child(&pb, "scratch"), .{ .ACCMODE = .WRONLY, .CLOEXEC = true });
+    var page: [4096]u8 = undefined;
+    for (&page, 0..) |*b, i| b.* = @truncate(i * 3 + 1);
+    // Each write(2) returns on its RETAIN commit; the handlers park on the
+    // closed gate, so the N slots stay Retained into the teardown.
+    var k: u64 = 0;
+    while (k < n_retained) : (k += 1) try testing.expectEqual(@as(usize, 4096), linux.pwrite(fd, &page, page.len, @intCast(k * 4096)));
+    try testing.expectEqual(n_retained, slot.retained_outstanding.load());
+    try testing.expectEqual(n_retained, rig.fs.retained_replies.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), rig.fs.release_calls.load(.monotonic));
+    _ = linux.close(fd);
+    // FUSE_RELEASE follows close(2) asynchronously: let it land so the only
+    // slots the teardown meets are the retained ones.
+    try testing.expect(waitUntil(s, struct {
+        fn done(sess: *Session) bool {
+            return sess.owedCount() == 0;
+        }
+    }.done, 5 * std.time.ns_per_s));
+    var wd: TeardownWatchdog = .{ .bound_ns = 20 * std.time.ns_per_s, .what = "Session.close with retained slots" };
+    try wd.start();
+    const t0 = clock.monotonicNs();
+    s.close();
+    const close_ns = clock.monotonicNs() - t0;
+    wd.stop();
+    try testing.expect(!s.isMounted());
+    // The parked handlers finish: their late extract fails on the closed
+    // session and their release is dropped (teardown owned the slots).
+    rig.fs.openRetainGate();
+    s.deinit();
+    rig.session = null;
+    const kmsg_after = try KernelLogMark.take(testing.allocator, retained_warn_needle);
+    std.debug.print("\nretention teardown: close {d} ms; released_at_teardown +{d}, kernel_drained +{d}; kernel log '{s}' lines {d} → {d}\n", .{ close_ns / std.time.ns_per_ms, worker.retained_released_at_teardown.load() - released_before, worker.retained_kernel_drained.load() - kernel_drained_before, retained_warn_needle, kmsg_before.count, kmsg_after.count });
+    // The law: every retained slot RELEASEd by us, none left to the kernel.
+    try testing.expect(kmsg_after.sameAs(&kmsg_before));
+    try testing.expect(close_ns < 2 * std.time.ns_per_s);
+    try testing.expectEqual(n_retained, worker.retained_released_at_teardown.load() - released_before);
+    try testing.expectEqual(kernel_drained_before, worker.retained_kernel_drained.load());
+    try testing.expectEqual(@as(u64, 0), slot.retained_outstanding.load());
+    try testing.expectEqual(@as(u64, 0), worker.releases_inflight.load());
+    try testing.expectEqual(n_retained, rig.fs.extract_failures.load(.monotonic));
+    const after = Snapshot.take();
+    try expectLaws(before, after);
+    try testing.expectEqual(n_retained, after.retain_commits - before.retain_commits);
+    try testing.expectEqual(n_retained, after.releases - before.releases);
 }
 
 test "e2e TIME_LIMITS: a utimensat with a time outside our advertised range is clamped by the VFS to the bound before it reaches the daemon" {

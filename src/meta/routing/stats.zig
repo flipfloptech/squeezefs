@@ -55,16 +55,10 @@ pub const stats = struct {
     pub var routing_mint_volume_picks: counters.ShardedCounter = .{};
     /// `routing_guest_trees_minted`: slot trees created on first touch.
     pub var routing_guest_trees_minted: counters.ShardedCounter = .{};
-    /// `routing_split_commits`: transactions whose records lived on two
-    /// volumes and committed as two ordered entries; `_partial`: the second
-    /// entry refused after the first landed (a bounded fsck class, never a
-    /// silent one).
-    pub var routing_split_commits: counters.ShardedCounter = .{};
-    pub var routing_split_partial: counters.ShardedCounter = .{};
-    /// `routing_cross_volume_refused`: a transaction spanning volumes with
-    /// no legal split order answered EXDEV (rename across two parents'
-    /// volumes — the symmetric plane's cross-owner intents are rung 6's).
-    pub var routing_cross_volume_refused: counters.ShardedCounter = .{};
+    /// `routing_split_refused`: a transaction spanning two members reached
+    /// the set facade — a committer defect (the cross-owner intents are the
+    /// law, decision 0003 §E); refused EIO, nothing written. Must stay 0.
+    pub var routing_split_refused: counters.Tripwire = .init("routing_split_refused");
     /// The engine: completed flips (flip + teardown), aborts (3 consecutive
     /// overflows / 16 missed windows), records copied (bulk + delta puts),
     /// teed keys applied, side-log overflows (each ⇒ a fresh snapshot pass),
@@ -83,13 +77,14 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "routing_gate_parks", "routing_dual_claims_converged", "routing_mint_volume_picks", "routing_guest_trees_minted", "routing_split_commits", "routing_split_partial", "routing_cross_volume_refused", "migrate_slots_completed", "migrate_slots_aborted", "migrate_records_copied", "migrate_delta_keys", "migrate_delta_overflows", "migrate_cutover_retries", "staging_rebind_barriers" }) |name| {
+    inline for (.{ "routing_gate_parks", "routing_dual_claims_converged", "routing_mint_volume_picks", "routing_guest_trees_minted", "migrate_slots_completed", "migrate_slots_aborted", "migrate_records_copied", "migrate_delta_keys", "migrate_delta_overflows", "migrate_cutover_retries", "staging_rebind_barriers" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "routing_gate_armed", "routing_stamp_runs_max", "routing_stamp_cursors_max" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"routing_same_epoch_dual_claim\":{d},", .{counters.tripwireCount("routing_same_epoch_dual_claim")});
+    try w.print("\"routing_split_refused\":{d},", .{counters.tripwireCount("routing_split_refused")});
     try w.writeAll("\"migrate_cutover_phase_ns\":{");
     inline for (@typeInfo(Phase).@"enum".field_names, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');

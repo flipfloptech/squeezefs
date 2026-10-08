@@ -12,15 +12,13 @@
 //! (`sym/slots/door.zig`, the host's conveyor step 0) parks a commit whose
 //! slot is mid-flip or mid-handover and refuses one another appender leases.
 //!
-//! Cross-volume transactions (one op's records on two members): a tx
-//! names its ORDER (`tx.CrossVolume`) and the facade commits two ordered
-//! entries — create/link put the child's inode FIRST (a crash leaves an
-//! unreferenced inode, fsck C9), unlink/rename put the parent's dentries
-//! first (a crash leaves a stale nlink, fsck C10), a destroy batch's
-//! members are independent. A tx with no legal order (a rename whose two
-//! parents live on different volumes, a third volume in play) is refused
-//! `EXDEV`-class and counted: the symmetric plane's cross-owner INTENTS
-//! (charter §5.5) are rung 6's — stated, never faked.
+//! A transaction's records live on ONE member: an op whose objects span
+//! two members (or two holders) is a cross-owner INTENT (charter §5.5;
+//! `sym/xv/ops.zig`) — step 0 + the intent record in the initiator's ring,
+//! one single-member entry per step, the retirement — never a split commit
+//! here (the rung-5 two-entry split is retired: decision 0003 §E). A tx
+//! that reaches the facade spanning two members is a committer defect:
+//! refused `EIO`, counted on the tripwire, nothing written.
 //!
 //! The one-member set is the one-volume mount: the same facade, one
 //! backend, slot 0 native and 63 rotor slots as guest trees on it.
@@ -47,6 +45,8 @@ const backend = @import("backend.zig");
 const guard = @import("guard.zig");
 const routing = @import("routing.zig");
 const routing_slots = @import("sym.zig").slots;
+const xv = @import("sym.zig").xv;
+const dlm = @import("dlm.zig");
 const router = @import("../data/router.zig");
 
 const route_table = routing.route_table;
@@ -383,12 +383,11 @@ pub const MetaSet = struct {
         };
     }
 
-    /// Commit `t`: one member's conveyor when every record lives there;
-    /// two ordered entries by the tx's declared cross-volume order; EXDEV
-    /// otherwise (module doc).
+    /// Commit `t`: the one member every record lives on; a tx spanning
+    /// two members is a committer defect (module doc) — refused, nothing
+    /// written, the tripwire fired.
     pub fn commit(self: *MetaSet, t: *KvTx) Error!void {
         var home: ?route_table.VolumeIndex = null;
-        var split = false;
         for (t.staged.items) |s| {
             const h = self.homeOfKey(s.tree_id, s.key) catch |e| {
                 self.abandon(t);
@@ -403,105 +402,18 @@ pub const MetaSet = struct {
             };
             const v = self.route.volumeOf(h.slot);
             if (home) |hv| {
-                if (hv != v) split = true;
+                if (hv != v) {
+                    rstats.routing_split_refused.fire("a transaction spanning two members reached the facade: the cross-owner intents are the law");
+                    self.abandon(t);
+                    return error.Corrupt;
+                }
             } else home = v;
         }
         const hv = home orelse {
             // An empty tx: nothing to route; the conveyor's own refusal.
             return self.volumes[0].commit(t);
         };
-        if (!split) return self.volumes[hv].commit(t);
-        return self.commitSplit(t);
-    }
-
-    /// Group the staged records by member and commit the groups in the
-    /// declared order; the guards ride the LAST entry.
-    fn commitSplit(self: *MetaSet, t: *KvTx) Error!void {
-        const gpa = self.gpa;
-        defer self.abandon(t);
-        const V = self.volumes.len;
-        const groups = try gpa.alloc(?*KvTx, V);
-        defer gpa.free(groups);
-        @memset(groups, null);
-        var made: usize = 0;
-        errdefer for (groups) |g| if (g) |gt| self.abandon(gt);
-        for (t.staged.items) |s| {
-            const h = try self.homeOfKey(s.tree_id, s.key);
-            const v = self.route.volumeOf(h.slot);
-            const g = groups[v] orelse blk: {
-                const nt = try self.begin(t.site);
-                nt.class = t.class;
-                nt.token_quiet = t.token_quiet;
-                groups[v] = nt;
-                made += 1;
-                break :blk nt;
-            };
-            switch (s.kind) {
-                .put => try g.stagePut(s.tree_id, s.key, s.value),
-                .delete => try g.stageDelete(s.tree_id, s.key),
-                .delta => try g.stageDeltaRaw(s.tree_id, s.key, s.value),
-            }
-        }
-        // The order: the child's member first or last by the hint; an
-        // independent batch in canonical order; no hint ⇒ refuse.
-        var order: [2]route_table.VolumeIndex = undefined;
-        switch (t.cross) {
-            .refuse => {
-                rstats.routing_cross_volume_refused.inc();
-                return error.CrossVolume;
-            },
-            .independent => {
-                // Every member's part is complete on its own: canonical
-                // order, the guards on the last, the first failure reported
-                // (the rest abandoned by the errdefer).
-                var remaining = made;
-                for (groups, 0..) |g, v| {
-                    const gt = g orelse continue;
-                    groups[v] = null;
-                    remaining -= 1;
-                    if (remaining == 0) {
-                        gt.guards = t.guards;
-                        t.guards = .none;
-                    } else gt.guards = .none;
-                    try self.volumes[v].commit(gt);
-                }
-                rstats.routing_split_commits.inc();
-                return;
-            },
-            .child_first, .parent_first => |child| {
-                if (made != 2) {
-                    rstats.routing_cross_volume_refused.inc();
-                    return error.CrossVolume;
-                }
-                const cv = self.route.volumeOfEffective(child);
-                if (groups[cv] == null) {
-                    rstats.routing_cross_volume_refused.inc();
-                    return error.CrossVolume;
-                }
-                var other: route_table.VolumeIndex = 0;
-                for (groups, 0..) |g, v| if (g != null and v != cv) {
-                    other = @intCast(v);
-                };
-                order = if (t.cross == .child_first) .{ cv, other } else .{ other, cv };
-            },
-        }
-        const first = groups[order[0]].?;
-        groups[order[0]] = null;
-        first.guards = .none;
-        const second = groups[order[1]].?;
-        groups[order[1]] = null;
-        second.guards = t.guards;
-        t.guards = .none;
-        self.volumes[order[0]].commit(first) catch |e| {
-            self.abandon(second);
-            return e;
-        };
-        self.volumes[order[1]].commit(second) catch |e| {
-            rstats.routing_split_partial.inc();
-            log.err("metadata set: a two-member transaction landed its first entry on member {d} but the second was refused on member {d} ({s}) — a half-applied op (fsck C9/C10 class)", .{ order[0], order[1], @errorName(e) });
-            return e;
-        };
-        rstats.routing_split_commits.inc();
+        return self.volumes[hv].commit(t);
     }
 
     /// `fsync`: every member's trailing barrier.
@@ -696,7 +608,7 @@ pub const MetaSet = struct {
 // ---------------------------------------------------------------------------
 // Tests (Linux; regular files under /build/tmp, O_DIRECT): the two-member
 // set end to end — format, discovery in either URI order, mints spread
-// over both members, the cross-member commit orders, remount.
+// over both members, the cross-member creates as intents, remount.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -789,24 +701,36 @@ fn truncateFile(path: []const u8, len: u64) !void {
     if (linux.errno(linux.ftruncate(fd, @intCast(len))) != .SUCCESS) return error.CannotSizeDevice;
 }
 
-/// One create under `parent_global` through the facade: the mint, the
-/// records, the (possibly cross-member) commit. Returns the GLOBAL ino.
+/// One create under `parent_global` through the facade: the mint, then
+/// either the one-member entry or — when the child's rotor lives on
+/// another member — the cross-owner INTENT over a plane bound to the set
+/// (the product's `kv_fs` arm). Returns the GLOBAL ino.
 pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
     const parent = set.effectiveIno(parent_global);
     const pv_bytes = (try set.lookup(set.gpa, key.TREE_INODES, &key.inodeKey(parent))) orelse return error.ParentMissing;
     defer set.gpa.free(pv_bytes);
     const pv = try record.InodeValue.decode(pv_bytes);
-    const t = try set.begin(@src());
-    const child = set.allocateIno(parent, false, false) catch |e| {
-        set.abandon(t);
-        return e;
-    };
+    const child = try set.allocateIno(parent, false, false);
     const global = set.globalIno(child);
+    const parent_slot = route_table.slotOfEffective(parent);
+    if (set.volumeIndexOfSlot(parent_slot) != set.volumeIndexOfSlot(route_table.slotOf(global))) {
+        var locks = try dlm.Manager.init(set.gpa, 64);
+        defer locks.deinit();
+        const bound = try xv.set_bind.Bound.create(set.gpa, set.io, set, &locks, set.env);
+        defer bound.destroy(set.gpa);
+        const plan = xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .now = 1000 });
+        const scope = bound.plane.mintScope();
+        var held = try bound.plane.acquirePlanGuards(&plan, scope, false);
+        defer held.release(set.gpa);
+        const done = try bound.plane.execute(&plan, scope, 1000);
+        if (done.refused) |e| return e;
+        return global;
+    }
+    const t = try set.begin(@src());
     _ = economy.stageCreate(t, .{ .hash_seed = set.hashSeed(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global }) catch |e| {
         set.abandon(t);
         return e;
     };
-    t.cross = .{ .child_first = child };
     try set.commit(t);
     return global;
 }
@@ -817,7 +741,7 @@ pub fn present(set: *MetaSet, global: u64) !bool {
     return got != null;
 }
 
-test "a two-member set: format → open (either URI order) → 200 creates spread over both members' rotors (cross-member child-first commits) → remount: every record present on its home, the stamps carry the cursors, the sweep-style cross-tree range sees everything" {
+test "a two-member set: format → open (either URI order) → 200 creates spread over both members' rotors (the cross-member creates as intents) → remount: every record present on its home, the stamps carry the cursors, the sweep-style cross-tree range sees everything" {
     const gpa = testing.allocator;
     const s = try TestSet.create(gpa, "two", 2);
     defer s.destroy();
@@ -839,7 +763,8 @@ test "a two-member set: format → open (either URI order) → 200 creates sprea
         }
         // Both members minted (the 9/10 band of two equal volumes is both).
         try testing.expect(on[0] > 50 and on[1] > 50);
-        try testing.expect(rstats.routing_split_commits.load() > 0);
+        try testing.expect(xv.intent.stats.xv_cross_owner_intents_minted.load() > 0);
+        try testing.expectEqual(xv.intent.stats.xv_cross_owner_intents_minted.load(), xv.intent.stats.xv_cross_owner_intents_retired.load() + xv.intent.stats.xv_cross_owner_intents_open.load());
         try testing.expect(rstats.routing_guest_trees_minted.load() >= 64);
         // A cross-tree range (the corpse sweep's shape) over the whole
         // ino-major space sees every inode record on both members.
@@ -905,54 +830,30 @@ test "a refs range always merges every slot tree: one volume's references owned 
     for (kvs.items, owners) |kv, o| try testing.expectEqual(o, (try key.BlockRefKey.decode(kv.key)).ownerIno());
 }
 
-test "cross-member orders: a tx with no declared order spanning two members is EXDEV (counted); a parent-first tx commits the parent's member first; a three-member spread refuses" {
+test "a tx spanning two members never reaches a member: refused EIO on the tripwire, nothing written; a one-member tx of a guest slot lands" {
     const gpa = testing.allocator;
     const s = try TestSet.create(gpa, "cross", 3);
     defer s.destroy();
     const set = try s.open();
     defer set.close();
-    // Records on members 0 and 1 with no order (`commit` consumes the tx
-    // on every outcome).
     {
         const t = try set.begin(@src());
         try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(2, 0, inos.ROUTING_WIDTH))), "a");
         try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(2, 1, inos.ROUTING_WIDTH))), "b");
-        const r0 = rstats.routing_cross_volume_refused.load();
-        try testing.expectError(error.CrossVolume, set.commit(t));
-        try testing.expectEqual(r0 + 1, rstats.routing_cross_volume_refused.load());
+        const r0 = rstats.routing_split_refused.load();
+        rstats.routing_split_refused.resetLogBudgetForTest();
+        log.testing.expectErrorLogs(1);
+        try testing.expectError(error.Corrupt, set.commit(t));
+        try log.testing.expectAllFired();
+        try testing.expectEqual(r0 + 1, rstats.routing_split_refused.load());
+        try testing.expect((try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(2, 1, inos.ROUTING_WIDTH))))) == null);
     }
-    // Parent-first: the dentry on member 0, the child's delta on member 1.
     {
         const child = route_table.effectiveIno(inos.makeGlobalIno(5, 1, inos.ROUTING_WIDTH));
         const t = try set.begin(@src());
         try t.stagePut(key.TREE_INODES, &key.inodeKey(child), &(record.InodeValue{ .mode = 0o100644, .nlink = 1 }).encode());
-        try t.stagePut(key.TREE_DENTRIES, &key.dentryKey(1, 77, 0), "d");
-        t.cross = .{ .parent_first = child };
         try set.commit(t);
-        const dv = (try set.lookup(gpa, key.TREE_DENTRIES, &key.dentryKey(1, 77, 0))).?;
-        defer gpa.free(dv);
         const got = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(child))).?;
         defer gpa.free(got);
-    }
-    // Three members in one tx: no order can hold it.
-    {
-        const t = try set.begin(@src());
-        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(9, 0, inos.ROUTING_WIDTH))), "a");
-        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(9, 1, inos.ROUTING_WIDTH))), "b");
-        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(9, 2, inos.ROUTING_WIDTH))), "c");
-        t.cross = .{ .child_first = route_table.effectiveIno(inos.makeGlobalIno(9, 1, inos.ROUTING_WIDTH)) };
-        try testing.expectError(error.CrossVolume, set.commit(t));
-    }
-    // An independent batch lands every member's part.
-    {
-        const t = try set.begin(@src());
-        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 0, inos.ROUTING_WIDTH))), "a");
-        try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 2, inos.ROUTING_WIDTH))), "c");
-        t.cross = .independent;
-        try set.commit(t);
-        const a = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 0, inos.ROUTING_WIDTH))))).?;
-        defer gpa.free(a);
-        const c = (try set.lookup(gpa, key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(inos.makeGlobalIno(11, 2, inos.ROUTING_WIDTH))))).?;
-        defer gpa.free(c);
     }
 }

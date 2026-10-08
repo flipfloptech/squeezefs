@@ -105,6 +105,9 @@ pub const Terminal = error{
     DirectoryNotEmpty,
     /// `link` at the hard-link ceiling (EMLINK).
     TooManyLinks,
+    /// A directory chain deeper than any legal tree (ELOOP): the
+    /// `dir_rename` ancestry walk met a cycle that already exists.
+    TooManySymlinks,
     /// The caller's buffer cannot hold the value (ERANGE: `getxattr`/`listxattr`).
     BufferTooSmall,
     /// No such extended attribute (ENODATA; Linux's ENOATTR).
@@ -162,11 +165,6 @@ pub const Refusal = error{
     /// A record value or journal entry above its cap (E2BIG, `setxattr(2)`'s
     /// "exceeds a filesystem-specific limit").
     ValueTooLarge,
-    /// One op's records live on two metadata members with no ordered
-    /// commit the facade can offer (a rename across two parents' members;
-    /// EXDEV — the application's copy-and-unlink fallback; the symmetric
-    /// plane's cross-owner intents are rung 6's).
-    CrossVolume,
     /// A cluster-wire word names what durable state cannot — the verb's
     /// SCREEN refused it before any effect (`STATUS_REJECTED`; EINVAL: a
     /// peer bug, never retried).
@@ -195,7 +193,7 @@ pub const Class = enum { retryable, terminal, refusal };
 pub fn classOf(err: Error) Class {
     return switch (err) {
         error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager, error.GrantExhausted, error.TokenChannelStale => .retryable,
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.CrossVolume, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease, error.ReaderFailStopped => .refusal,
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease, error.ReaderFailStopped => .refusal,
         else => .terminal,
     };
 }
@@ -232,11 +230,11 @@ const table = [_]Row{
     .{ .e = .@"2BIG", .err = error.ValueTooLarge },
     .{ .e = .NOTEMPTY, .err = error.DirectoryNotEmpty },
     .{ .e = .MLINK, .err = error.TooManyLinks },
+    .{ .e = .LOOP, .err = error.TooManySymlinks },
     .{ .e = .RANGE, .err = error.BufferTooSmall },
     .{ .e = .NODATA, .err = error.NoAttribute },
     .{ .e = .NOSYS, .err = error.NotImplemented },
     .{ .e = .STALE, .err = error.StaleHandle },
-    .{ .e = .XDEV, .err = error.CrossVolume },
     // PERM also decodes to AccessDenied above (the first row wins on the
     // way in); on the way out PermissionDenied is the one EPERM reply.
     .{ .e = .PERM, .err = error.PermissionDenied },
@@ -304,8 +302,8 @@ test "every table row round-trips; aliases map to the first row's errno" {
     try testing.expectEqual(linux.E.PERM, toErrno(error.PermissionDenied));
     try testing.expectEqual(linux.E.STALE, toErrno(error.StaleHandle));
     try testing.expectEqual(error.StaleHandle, fromErrno(.STALE));
-    try testing.expectEqual(linux.E.XDEV, toErrno(error.CrossVolume));
-    try testing.expectEqual(Class.refusal, classOf(error.CrossVolume));
+    try testing.expectEqual(linux.E.LOOP, toErrno(error.TooManySymlinks));
+    try testing.expectEqual(Class.terminal, classOf(error.TooManySymlinks));
     try testing.expectEqual(error.InputOutput, fromCqeRes(-@as(i32, @backingInt(linux.E.IO))));
 }
 

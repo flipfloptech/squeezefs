@@ -227,9 +227,6 @@ pub const Error = error{
     Corrupt,
     /// The lock-revalidate budget exhausted (an SMO protocol bug).
     RetryBudgetExhausted,
-    /// The records span two metadata members with no ordered commit (the
-    /// set facade's EXDEV; a one-member conveyor never produces it).
-    CrossVolume,
     /// The commit door refused: another appender leases a slot the entry
     /// names ("ship to the holder" — EAGAIN), or the slot left this volume.
     SlotBusy,
@@ -255,7 +252,6 @@ pub fn coreError(e: Error) errors.Error {
         error.OutOfMemory => error.OutOfMemory,
         error.VolumeFailed => error.VolumeFailed,
         error.HoleCheckpointFailed => error.HoleCheckpointFailed,
-        error.CrossVolume => error.CrossVolume,
         error.SlotBusy => error.SlotMoved,
         error.Deferred => error.Deferred,
         error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,

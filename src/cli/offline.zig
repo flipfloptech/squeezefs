@@ -19,6 +19,7 @@ const exec = @import("../exec/exec.zig");
 const meta_set = @import("../meta/meta_set.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
+const sym_xv = @import("../meta/sym/xv.zig");
 const key = @import("../meta/key.zig");
 const handler = @import("../fuse/handler.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
@@ -180,6 +181,9 @@ fn main(ctx: *Ctx) u8 {
     defer if (set.plane) |pl| pl.close();
     var fs = BackendFs.mount(gpa, io, be, plane, .{ .page_size = ctx.facts.page_size, .dlm_stripes = dlm.resolveWidth(p.env, ctx.facts, fuse_geometry.Q_DEPTH_DESIRED), .uid = set.uid, .gid = set.gid }) catch return ctx.failed("out of memory mounting the filesystem", .{});
     defer fs.unmount();
+    const xv_bound = sym_xv.set_bind.Bound.create(gpa, io, be, &fs.locks, p.env) catch return ctx.failed("out of memory (cross-owner plane)", .{});
+    defer xv_bound.destroy(gpa);
+    _ = fs.bindXv(&xv_bound.plane) catch |e| return ctx.failed("the cross-owner roll-forward failed ({t})", .{e});
     _ = fs.sweepCorpsesAtMount() catch |e| return ctx.failed("the corpse sweep failed ({t})", .{e});
     set.fs = &fs;
     return ctx.body.run(ctx.body.ctx, &set);

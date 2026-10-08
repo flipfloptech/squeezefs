@@ -136,26 +136,10 @@ pub const Staged = struct {
 /// decompose into NAMED committers (`meta_kv_commit_sites`).
 pub const Site = std.builtin.SourceLocation;
 
-/// How a transaction whose records live on TWO metadata members commits
-/// (`meta/meta_set.zig`): the child's member first (create, link: a crash
-/// leaves an unreferenced inode — fsck C9), the parent's member first
-/// (unlink, rename: a crash leaves a stale nlink — fsck C10), every
-/// member's part on its own (a destroy batch), or refused EXDEV (the
-/// default: an op that declared no order never splits silently).
-pub const CrossVolume = union(enum) {
-    refuse,
-    independent,
-    /// The child's EFFECTIVE (key) ino.
-    child_first: u64,
-    parent_first: u64,
-};
-
 pub const KvTx = struct {
     arena: std.heap.ArenaAllocator,
     staged: std.ArrayList(Staged) = .empty,
     site: Site,
-    /// The cross-member commit order (one member: ignored).
-    cross: CrossVolume = .refuse,
     /// A structural commit whose exclusion is the engine's — the migration
     /// engine's delta copy into the target (the slot is CLOSED at the
     /// source, the target's tree unpublished) — takes no door tokens.

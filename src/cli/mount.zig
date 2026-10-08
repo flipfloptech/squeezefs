@@ -55,6 +55,7 @@ const meta_set = @import("../meta/meta_set.zig");
 const guard = @import("../meta/guard.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
+const sym_xv = @import("../meta/sym/xv.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
@@ -313,6 +314,13 @@ fn mountMain(ctx: *Ctx) u8 {
     fs.bindVirtual(vs.face());
     op_trace.armTrace(gpa, env, facts.possible_cpus, ctx.budget_bytes) catch return ctx.failed("out of memory (op-trace ring)", .{});
     defer op_trace.disarmTrace();
+    // The cross-owner plane (charter §5.5): an op spanning two members or
+    // two holders is ONE intent; the open intents roll forward here,
+    // before any request is served.
+    const xv_bound = sym_xv.set_bind.Bound.create(gpa, io, be, &fs.locks, env) catch return ctx.failed("out of memory (cross-owner plane)", .{});
+    defer xv_bound.destroy(gpa);
+    const rolled = fs.bindXv(&xv_bound.plane) catch |e| return ctx.failed("the cross-owner roll-forward at mount failed ({t})", .{e});
+    if (rolled != 0) log.info("mount: {d} open cross-owner intent(s) rolled forward before serving", .{rolled});
     // The corpse sweep (kv_fs module doc): what a crashed daemon's forgets
     // left at nlink 0 is destroyed before any request is served.
     _ = fs.sweepCorpsesAtMount() catch |e| return ctx.failed("the corpse sweep at mount failed ({t})", .{e});
@@ -543,6 +551,9 @@ const ReclaimCadence = struct {
             defer trace.finish();
             var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
             self.fs.reclaimDrain(&ctx) catch |e| log.err("reclaim cadence: drain failed: {t}", .{e});
+            // The cross-owner cadence rides the same meta fiber: the expiry
+            // sweep, the roll-forward of abandoned intents, the gauges.
+            self.fs.xvCadenceTick();
         }
     }
 };

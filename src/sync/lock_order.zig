@@ -64,12 +64,14 @@ pub const Level = enum(u8) {
 pub var lock_order_inversions: counters.Tripwire = .init("lock_order_inversions");
 /// `lock_order_ledger_overflows`: an acquire the ledger could not record
 /// (more than `max_held` tracked locks held by one thread; must stay 0 —
-/// the deepest legal hold is a level-1 pair + (3) + (3.5) + (3.7) + a
-/// canonical 4a set of `2 × dlm.max_requests`).
+/// the deepest legal hold is a level-1 pair + (3) + (3.5) + (3.7) + the
+/// WIDE canonical 4a set of `2 × dlm.wide_requests` the striped `rmdir`
+/// takes).
 pub var lock_order_ledger_overflows: counters.Tripwire = .init("lock_order_ledger_overflows");
 
-/// The ledger depth: the deepest legal hold above, with headroom.
-pub const max_held: usize = 64;
+/// The ledger depth: the deepest legal hold above (`2 × 136 + 5`), with
+/// headroom to the next power of two.
+pub const max_held: usize = 512;
 
 const Held = struct { level: Level, ctx: usize };
 

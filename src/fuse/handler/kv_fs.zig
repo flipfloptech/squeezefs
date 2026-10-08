@@ -114,6 +114,7 @@ const route_table = @import("../../meta/routing/route_table.zig");
 const sym_handover = @import("../../meta/sym/slots/handover.zig");
 const sym_acquire = @import("../../meta/sym/slots/acquire.zig");
 const read_divert = @import("../../meta/sym/tokens/read_divert.zig");
+const sym_xv = @import("../../meta/sym/xv.zig");
 const layout = @import("../../data/layout.zig");
 const staging = @import("../../data/staging.zig");
 const block_refs = @import("../../data/block_refs.zig");
@@ -387,6 +388,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// mount (two probes, read locally). Bound by the daemon after
         /// `mount`, BELOW the level-1 op guard and before any (3) guard.
         divert: ?*read_divert.Divert = null,
+        /// The cross-owner plane (charter §5.5): an op whose objects span
+        /// two members or two holders is ONE intent through it; null = a
+        /// one-member mount (every op is the single entry). Bound by the
+        /// daemon after `mount`.
+        xv: ?*XvPlane = null,
+        /// The set-wide `dir_rename` lease's taker (every directory-source
+        /// rename across holders takes it); null = a flat mount.
+        dir_rename: ?*sym_xv.dir_rename.Taker = null,
         /// Committed corpse destroys on this volume: the subtrahend of the
         /// LIVE inode population `statfs.ffree` reports (POSIX-1: never the
         /// monotone watermark, which made `IUsed` rise forever).
@@ -437,6 +446,85 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// arms).
         pub fn bindDivert(self: *Self, d: *read_divert.Divert) void {
             self.divert = d;
+        }
+
+        pub const XvPlane = sym_xv.ops.Plane(Store);
+
+        /// Bind the cross-owner plane (after `mount`, before the session
+        /// arms); the roll-forward of open intents runs here, before any
+        /// request is served.
+        pub fn bindXv(self: *Self, p: *XvPlane) Error!u32 {
+            self.xv = p;
+            p.witness = .{ .ctx = self, .readInode = &xvWitnessRead };
+            return p.recoverOpen(now()) catch |e| return xvErr(e);
+        }
+
+        /// The cadence tick the daemon's meta fiber drives: the expiry
+        /// sweep, the roll-forward of abandoned intents, the gauges.
+        pub fn xvCadenceTick(self: *Self) void {
+            const p = self.xv orelse return;
+            _ = p.cadenceTick(clock.monotonicNs()) catch |e| log.warn("cross-owner cadence: a roll-forward pass failed ({t}); the next tick retries", .{e});
+        }
+
+        fn xvWitnessRead(ctx: *anyopaque, global: u64) errors.Error!?InodeValue {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.readInodeOpt(localOf(global) catch return null);
+        }
+
+        fn xvErr(e: sym_xv.ops.Error) Error {
+            return sym_xv.ops.coreError(e);
+        }
+
+        /// Do these GLOBAL inos live on two members or two holders?
+        fn spansHomes(self: *Self, globals: []const u64) bool {
+            const p = self.xv orelse return false;
+            return p.spans(globals);
+        }
+
+        /// Does another appender lease `global`'s slot (the record ship's
+        /// resolver: a flat mount never says yes)?
+        fn foreignSlot(self: *Self, global: u64) bool {
+            const p = self.xv orelse return false;
+            return !p.isLocal(global);
+        }
+
+        /// ONE shipped record verb to the file's holder.
+        fn shipRecord(self: *Self, global: u64, call: sym_xv.record_ship.Call) Error!sym_xv.record_ship.Reply {
+            const p = self.xv.?;
+            return (sym_xv.record_ship.ship(p.resolver, p.volume, global, call, 0) catch |e| return sym_xv.record_ship.coreError(e)) orelse error.SlotMoved;
+        }
+
+        /// Run `plan` as ONE intent under its travelling guards; a live
+        /// refusal answers the refused step's errno.
+        fn runPlan(self: *Self, c: *Ctx, plan: *const sym_xv.steps.Plan) Error!sym_xv.ops.Done {
+            const p = self.xv.?;
+            c.stage(.meta_backend_start);
+            defer c.stage(.meta_backend_done);
+            const scope = p.mintScope();
+            var held = p.acquirePlanGuards(plan, scope, false) catch |e| return xvErr(e);
+            defer held.release(self.gpa);
+            const done = p.execute(plan, scope, now()) catch |e| return xvErr(e);
+            if (done.refused) |e| return e;
+            return done;
+        }
+
+        /// A locally dispatched op whose commit door answered `SlotBusy`
+        /// (the slot read ours at the plan, another appender held it at the
+        /// door) is re-dispatched ONCE through the cross-owner arm.
+        fn redispatches(self: *Self, e: Error) bool {
+            if (e != error.SlotMoved or self.xv == null) return false;
+            sym_xv.ops.stats.xv_cross_owner_op_slot_moved_redispatches.inc();
+            return true;
+        }
+
+        /// Whether `found` (a directory) holds any entry, at its holder.
+        fn dirHasEntriesAt(self: *Self, found: Found) Error!bool {
+            if (try self.tokenServe(found.local, .{ .dentries = true })) |served| {
+                defer served.release(self.io);
+                const e = served.entry orelse return false;
+                return (e.dir orelse return false).len != 0;
+            }
+            return self.dirHasEntries(found.local);
         }
 
         /// `tokenServe(object, wants)`: null = read locally; else the pinned
@@ -1315,32 +1403,42 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const ranges = try inos.packDestroyEntries(gpa, payloads.items);
             defer gpa.free(ranges);
             for (ranges) |rg| {
-                const t = try self.store.begin(@src());
-                var t_owned = true;
-                errdefer if (t_owned) self.store.abandon(t);
-                // Every corpse's part is complete on its own member.
-                t.cross = .independent;
-                var destroyed: u64 = 0;
-                for (plans.items[rg.start..rg.end]) |*p| {
-                    var xkeys: [1024][]const u8 = undefined;
-                    for (p.kvs.items, 0..) |kv, i| xkeys[i] = kv.key;
-                    try inos.stageDestroy(t, p.ino, xkeys[0..p.kvs.items.len]);
-                    for (p.after.slice()) |e| {
-                        try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = e.mapping.vol_tag, .block_idx = e.mapping.blockIdx(self.geo.chunk), .owner_ino = p.ino, .block_index = e.block })});
-                    }
-                    _ = self.pending.retire(p.ino);
-                    destroyed += 1;
+                // Every corpse's part is complete on its own member: a
+                // range is cut where the member changes (one entry per run).
+                var start = rg.start;
+                while (start < rg.end) {
+                    var end = start + 1;
+                    while (end < rg.end and !self.spansHomes(&.{ globalOf(plans.items[start].ino), globalOf(plans.items[end].ino) })) end += 1;
+                    try self.destroyRun(c, plans.items[start..end]);
+                    start = end;
                 }
-                t_owned = false;
-                try self.commit(c, t);
-                for (plans.items[rg.start..rg.end]) |*p| {
-                    self.afterCommit(&p.after);
-                    fuse_reclaim_blocks_freed.add(@intCast(p.after.n));
-                }
-                fuse_reclaim_destroys.add(destroyed);
-                self.destroys.noteCommitted(destroyed);
-                fuse_reclaim_drains.inc();
             }
+        }
+
+        fn destroyRun(self: *Self, c: *Ctx, run: []Corpse) Error!void {
+            const t = try self.store.begin(@src());
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
+            var destroyed: u64 = 0;
+            for (run) |*p| {
+                var xkeys: [1024][]const u8 = undefined;
+                for (p.kvs.items, 0..) |kv, i| xkeys[i] = kv.key;
+                try inos.stageDestroy(t, p.ino, xkeys[0..p.kvs.items.len]);
+                for (p.after.slice()) |e| {
+                    try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = e.mapping.vol_tag, .block_idx = e.mapping.blockIdx(self.geo.chunk), .owner_ino = p.ino, .block_index = e.block })});
+                }
+                _ = self.pending.retire(p.ino);
+                destroyed += 1;
+            }
+            t_owned = false;
+            try self.commit(c, t);
+            for (run) |*p| {
+                self.afterCommit(&p.after);
+                fuse_reclaim_blocks_freed.add(@intCast(p.after.n));
+            }
+            fuse_reclaim_destroys.add(destroyed);
+            self.destroys.noteCommitted(destroyed);
+            fuse_reclaim_drains.inc();
         }
 
         /// The corpse mark of an unlinked tree-mapped file (block_map_tree.md
@@ -1388,6 +1486,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // reference's class for a setattr on a control file).
             if (virtual_inodes.isVirtualIno(a.ino)) return error.AccessDenied;
             const local = try localOf(a.ino);
+            if (self.foreignSlot(a.ino)) {
+                // A foreign-slot file: ONE shipped verb to its holder
+                // (charter §5.5 "Record-level mutations of a foreign-slot
+                // file"); the reply is the holder's folded record.
+                const req = a.attr.toEconomy();
+                const rep = try self.shipRecord(a.ino, .{ .setattr = .{ .mode = req.mode, .uid = req.uid, .gid = req.gid, .size = req.size, .atime = req.atime, .mtime = req.mtime, .ctime = req.ctime } });
+                return self.attrReply(a.ino, rep.inode orelse return error.FileNotFound);
+            }
             var after: AfterCommit = .{};
             var old_size: u64 = 0;
             var kind: layout.Kind = .inline_;
@@ -1465,6 +1571,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try checkMutableName(parent_global, name);
             const is_dir = economy.isDirMode(child.mode);
             const parent = try localOf(parent_global);
+            // The mint first: the child's home decides the arm (a foreign
+            // parent or a rotor on another member ⇒ ONE intent).
+            const local = self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
+            const global = globalOf(local);
+            if (self.spansHomes(&.{ parent_global, global })) return self.xvCreate(c, parent_global, name, child, local, global);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (is_dir) .exclusive else .shared };
             plan.inode_len = 1;
@@ -1479,11 +1590,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             if (try self.scanChain(parent, name, &chain, &kvs) != null) return error.PathAlreadyExists;
-            const local = self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
-            const global = globalOf(local);
-            // The child may live on another member (mint spread): its inode
-            // lands first, the dentry second.
-            t.cross = .{ .child_first = local };
             const stamp = now();
             const out = if (child.target) |target|
                 economy.stageSymlink(t, .{ .hash_seed = self.store.hashSeed(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice() }) catch |e| return switch (e) {
@@ -1498,10 +1604,48 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     error.OutOfMemory => error.OutOfMemory,
                 };
             t_owned = false;
-            try self.commit(c, t);
+            self.commit(c, t) catch |e| {
+                if (self.redispatches(e)) return self.xvCreate(c, parent_global, name, child, local, global);
+                return e;
+            };
             if (is_dir) self.rememberParent(global, parent_global);
             if (child.mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
             return self.entryOf(global, out.child);
+        }
+
+        /// The cross-owner create: the EEXIST probe through the divert, the
+        /// plan `[CreateInode @ the creator's rotor, InsertDentry @ the
+        /// parent's holder]` as ONE intent. A symlink's target rides its
+        /// own entry on the child's slot BEFORE the intent (a crash between
+        /// leaves an xattr no inode owns: fsck's orphan-xattr class, never a
+        /// symlink without its target).
+        fn xvCreate(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, child: NewChild, local: u64, global: u64) Error!filesystem.Entry {
+            const parent = try localOf(parent_global);
+            const pv = try self.readDir(parent);
+            if (try self.findDentry(parent, name) != null) return error.PathAlreadyExists;
+            var mode = child.mode;
+            var gid = c.gid;
+            if (pv.mode & S.ISGID != 0) {
+                gid = pv.gid;
+                if (economy.isDirMode(mode)) mode |= S.ISGID;
+            }
+            var size: u64 = 0;
+            if (child.target) |target| {
+                if (target.len > economy.SYMLINK_TARGET_MAX) return error.NameTooLong;
+                size = target.len;
+                const t = try self.store.begin(@src());
+                var t_owned = true;
+                errdefer if (t_owned) self.store.abandon(t);
+                try self.stageXattrPut(t, &key.xattrKey(local, key.xattrNameHash56(economy.SYMLINK_XATTR, self.store.hashSeed()), 0), economy.SYMLINK_XATTR, target);
+                t.token_quiet = true;
+                t_owned = false;
+                try self.commit(c, t);
+            }
+            const plan = sym_xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = c.uid, .gid = gid, .rdev = child.rdev, .size = size, .now = now() });
+            const done = try self.runPlan(c, &plan);
+            if (economy.isDirMode(mode)) self.rememberParent(global, parent_global);
+            if (mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
+            return self.entryOf(global, done.inode(0) orelse return error.InputOutput);
         }
 
         pub fn symlink(self: *Self, c: *Ctx, a: filesystem.SymlinkArgs) Error!filesystem.Entry {
@@ -1530,6 +1674,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const probe = (try self.findDentry(parent, name)) orelse return error.FileNotFound;
             if (want_dir and !probe.isDir()) return error.NotDir;
             if (!want_dir and probe.isDir()) return error.IsDir;
+            if (self.spansHomes(&.{ parent_global, probe.global })) return self.xvRemove(c, parent_global, name, probe, want_dir);
             var plan: economy.GuardPlan = .{};
             const shared = economy.unlinkParentShared(want_dir, parent, probe.local);
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (shared) .shared else .exclusive };
@@ -1549,11 +1694,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const pv: ?InodeValue = if (shared) null else try self.readDir(parent);
             const req: economy.Unlink = .{ .now = now(), .parent = parent, .name = name, .pos = found.pos, .child = found.local, .child_value = cv, .is_dir = want_dir, .parent_value = pv };
             _ = if (want_dir) try economy.stageRmdir(t, req) else try economy.stageUnlink(t, req);
-            // The name goes first, the child's nlink second (a crash leaves
-            // a stale nlink, never a name without a record).
-            t.cross = .{ .parent_first = found.local };
             t_owned = false;
-            try self.commit(c, t);
+            self.commit(c, t) catch |e| {
+                if (self.redispatches(e)) return self.xvRemove(c, parent_global, name, found, want_dir);
+                return e;
+            };
+            if (want_dir) self.forgetParent(found.global);
+        }
+
+        /// The cross-owner unlink/rmdir: the name FIRST, the count second
+        /// (its witness at the child's holder); a child with NO record is
+        /// the dangling arm (the name goes alone, loud).
+        fn xvRemove(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, found: Found, want_dir: bool) Error!void {
+            const cv = try self.readInodeOpt(found.local);
+            if (cv == null) sym_xv.ops.stats.xv_cross_owner_dangling_names.fire("a name whose child has no record at its holder");
+            if (want_dir and try self.dirHasEntriesAt(found)) return error.DirectoryNotEmpty;
+            const plan = sym_xv.steps.planUnlink(.{ .parent = parent_global, .name = name, .child = found.global, .child_value = cv, .is_dir = want_dir, .now = now() });
+            _ = try self.runPlan(c, &plan);
             if (want_dir) self.forgetParent(found.global);
         }
 
@@ -1578,6 +1735,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const old0 = (try self.findDentry(old_parent, a.name)) orelse return error.FileNotFound;
             const new0 = try self.findDentry(new_parent, a.newname);
             if (flags.exchange and new0 == null) return error.FileNotFound;
+            {
+                var homes: [4]u64 = .{ a.parent, a.newparent, old0.global, 0 };
+                var n: usize = 3;
+                if (new0) |d| {
+                    homes[3] = d.global;
+                    n = 4;
+                }
+                if (self.spansHomes(homes[0..n])) return self.xvRename(c, a, flags, whiteout, old0, new0);
+            }
             // The conservative set: both parents exclusive (≥ what the
             // staged records require), both inodes, both names.
             var plan: economy.GuardPlan = .{};
@@ -1625,11 +1791,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 const l = self.store.allocateIno(old_parent, true, false) catch |e| return storeErr(e);
                 wo = .{ .local = l, .global = globalOf(l) };
             }
-            // Both parents' dentries first, the moved inode's Δctime
-            // second; two parents on different members have no order the
-            // facade can offer and answer EXDEV (the symmetric plane's
-            // cross-owner intents are rung 6's).
-            t.cross = .{ .parent_first = old.local };
             _ = economy.stageRename(t, .{
                 .hash_seed = self.store.hashSeed(),
                 .now = now(),
@@ -1659,7 +1820,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.OutOfMemory => error.OutOfMemory,
             };
             t_owned = false;
-            try self.commit(c, t);
+            self.commit(c, t) catch |e| {
+                if (self.redispatches(e)) return self.xvRename(c, a, flags, whiteout, old, new);
+                return e;
+            };
             if (old.isDir()) self.rememberParent(old.global, a.newparent);
             if (new) |n| {
                 if (flags.exchange) {
@@ -1668,11 +1832,123 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
         }
 
+        /// The cross-owner rename: a directory source takes the set-wide
+        /// `dir_rename` lease OUTERMOST and walks the destination's
+        /// ancestry on exact data; the destination's witness at ITS holder;
+        /// the ENOTEMPTY probe before any step; ONE intent.
+        fn xvRename(self: *Self, c: *Ctx, a: filesystem.RenameArgs, flags: economy.RenameFlags, whiteout: bool, old0: Found, new0: ?Found) Error!void {
+            var lease: ?sym_xv.dir_rename.Taker.Held = null;
+            defer if (lease) |*l| l.release();
+            if (old0.isDir()) {
+                if (self.dir_rename) |taker| {
+                    lease = taker.take(clock.monotonicNs() + sym_xv.dir_rename.TAKE_WAIT_NS) catch |e| return switch (e) {
+                        error.Deferred => error.Deferred,
+                        error.HolderUnreachable => error.HolderUnreachable,
+                        else => error.InputOutput,
+                    };
+                }
+                if (a.parent != a.newparent) sym_xv.dir_rename.refuseRenameIntoOwnSubtree(self.ancestry(), old0.global, a.newparent) catch |e| return sym_xv.dir_rename.walkError(e);
+            }
+            const cv = (try self.readInodeOpt(old0.local)) orelse return error.FileNotFound;
+            if (new0) |n| {
+                if (!flags.exchange) {
+                    if (old0.isDir() and !n.isDir()) return error.NotDir;
+                    if (!old0.isDir() and n.isDir()) return error.IsDir;
+                    if (flags.noreplace) return error.PathAlreadyExists;
+                    if (n.isDir() and try self.dirHasEntriesAt(n)) return error.DirectoryNotEmpty;
+                }
+            }
+            const stamp = now();
+            if (flags.exchange) {
+                const n = new0.?;
+                const nv = (try self.readInodeOpt(n.local)) orelse return error.FileNotFound;
+                const plan = sym_xv.steps.planExchange(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .a = old0.global, .a_mode = cv.mode, .b = n.global, .b_mode = nv.mode, .now = stamp });
+                _ = try self.runPlan(c, &plan);
+                if (old0.isDir()) self.rememberParent(old0.global, a.newparent);
+                if (n.isDir()) self.rememberParent(n.global, a.parent);
+                return;
+            }
+            var dest: ?struct { ino: u64, value: InodeValue } = null;
+            if (new0) |n| dest = .{ .ino = n.global, .value = (try self.readInodeOpt(n.local)) orelse return error.FileNotFound };
+            var wo: ?u64 = null;
+            if (whiteout) {
+                const l = self.store.allocateIno(try localOf(a.parent), true, false) catch |e| return storeErr(e);
+                wo = globalOf(l);
+            }
+            const plan = sym_xv.steps.planRename(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .child = old0.global, .child_mode = cv.mode, .dest = if (dest) |d| .{ .ino = d.ino, .value = d.value } else null, .whiteout = wo, .now = stamp });
+            _ = try self.runPlan(c, &plan);
+            if (old0.isDir()) self.rememberParent(old0.global, a.newparent);
+            if (new0) |n| if (n.isDir()) self.forgetParent(n.global);
+        }
+
+        /// The ancestry walk's seams over this filesystem: the `..` memo
+        /// for the parent, the parent's dentry set (through the divert) for
+        /// the name, the exact lookup at the parent's holder.
+        fn ancestry(self: *Self) sym_xv.dir_rename.Ancestry {
+            return .{ .ctx = self, .linkOf = &ancestryLinkOf, .scanParent = &ancestryScan, .lookupExact = &ancestryExact, .stripeOwner = &ancestryStripe };
+        }
+
+        fn ancestryLinkOf(_: *anyopaque, _: u64, _: *[255]u8) ?sym_xv.dir_rename.ParentLink {
+            // The memo keeps the parent, not the name: every hop takes the
+            // scan belt (counted) — a directory rename across holders is rare.
+            return null;
+        }
+
+        fn ancestryScan(ctx: *anyopaque, dir: u64, name_buf: *[255]u8) ?sym_xv.dir_rename.ParentLink {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const parent = self.parentOf(dir) orelse return null;
+            const plocal = localOf(parent) catch return null;
+            var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena_state.deinit();
+            var recs: std.ArrayList(sym_xv.stripe.DirRec) = .empty;
+            var after: u64 = 0;
+            while (true) {
+                recs.clearRetainingCapacity();
+                const more = self.dirPage(arena_state.allocator(), plocal, after, 512, &recs) catch return null;
+                for (recs.items) |r| {
+                    if (r.child == dir) {
+                        @memcpy(name_buf[0..r.name.len], r.name);
+                        return .{ .parent = parent, .name = name_buf[0..r.name.len] };
+                    }
+                    after = r.cookie;
+                }
+                if (!more or recs.items.len == 0) return null;
+            }
+        }
+
+        fn ancestryExact(ctx: *anyopaque, parent: u64, name: []const u8) errors.Error!?u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const f = (try self.findDentry(try localOf(parent), name)) orelse return null;
+            return f.global;
+        }
+
+        fn ancestryStripe(_: *anyopaque, _: u64) ?u64 {
+            return null;
+        }
+
+        /// A directory's dentry page at its holder (the divert's dentry set
+        /// for a foreign one; the store's range for ours).
+        fn dirPage(self: *Self, arena: Allocator, dir_local: u64, after: u64, max: usize, out: *std.ArrayList(sym_xv.stripe.DirRec)) Error!bool {
+            if (try self.tokenServe(dir_local, .{ .dentries = true })) |served| {
+                defer served.release(self.io);
+                const e = served.entry orelse return false;
+                const page = e.pageAfter(after);
+                const n = @min(page.len, max);
+                for (page[0..n]) |r| try out.append(arena, .{ .cookie = r.cookie, .child = r.child_ino, .file_type = r.file_type, .name = try arena.dupe(u8, r.name) });
+                return page.len > max;
+            }
+            return sym_xv.stripe.pageFromStore(Store, self.store, arena, globalOf(dir_local), after, max, out) catch |e| switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InputOutput,
+            };
+        }
+
         pub fn link(self: *Self, c: *Ctx, a: filesystem.LinkArgs) Error!filesystem.Entry {
             try checkMutableName(a.newparent, a.newname);
             if (virtual_inodes.isVirtualIno(a.ino)) return error.PermissionDenied;
             const parent = try localOf(a.newparent);
             const child = try localOf(a.ino);
+            if (self.spansHomes(&.{ a.newparent, a.ino })) return self.xvLink(c, a);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = .exclusive };
             plan.inode_reqs[1] = .{ .ino = child, .mode = .exclusive };
@@ -1696,11 +1972,28 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.DentryChainOverflow => error.NoSpaceLeft,
                 error.OutOfMemory => error.OutOfMemory,
             };
-            t.cross = .{ .child_first = child };
             t_owned = false;
-            try self.commit(c, t);
+            self.commit(c, t) catch |e| {
+                if (self.redispatches(e)) return self.xvLink(c, a);
+                return e;
+            };
             _ = self.pending.retire(child);
             return self.entryOf(a.ino, out.child);
+        }
+
+        /// The cross-owner link: the count FIRST (its witness at the file's
+        /// holder; EMLINK before any step), the insert second.
+        fn xvLink(self: *Self, c: *Ctx, a: filesystem.LinkArgs) Error!filesystem.Entry {
+            const parent = try localOf(a.newparent);
+            const child = try localOf(a.ino);
+            _ = try self.readDir(parent);
+            const cv = try self.readInode(child);
+            if (economy.isDirMode(cv.mode)) return error.AccessDenied;
+            if (try self.findDentry(parent, a.newname) != null) return error.PathAlreadyExists;
+            const plan = sym_xv.steps.planLink(.{ .parent = a.newparent, .name = a.newname, .ino = a.ino, .child_value = cv, .now = now() }) catch return error.TooManyLinks;
+            const done = try self.runPlan(c, &plan);
+            _ = self.pending.retire(child);
+            return self.entryOf(a.ino, done.inode(0) orelse cv);
         }
 
         pub fn open(self: *Self, c: *Ctx, a: filesystem.OpenArgs) Error!filesystem.Opened {
@@ -2055,6 +2348,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     else => 0,
                 };
                 for (e.pageAfter(after)) |rec| {
+                    // The striping markers (NUL-led) never show (the ONE pager).
+                    if (sym_xv.stripe.isMarkerName(rec.name)) continue;
                     const child_local = localOf(rec.child_ino) catch {
                         dentry_without_inode.fire("readdir found a dentry naming a foreign-slot ino");
                         continue;
@@ -2086,6 +2381,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     last_coll = dk.collSeq();
                     const dent = record.DentryValue.decode(kv.value) catch return error.InputOutput;
                     const cookie = key.encodeReaddirCookie(last_hash, last_coll);
+                    if (sym_xv.stripe.isMarkerName(dent.name)) continue;
                     const child_local = localOf(dent.child_ino) catch {
                         dentry_without_inode.fire("readdir found a dentry naming a foreign-slot ino");
                         continue;
@@ -2169,6 +2465,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try screenXattr(a.name, error.PermissionDenied);
             if (a.value.len > record.xattrValueCap(self.store.nodeSize())) return error.ValueTooLarge;
             const local = try localOf(a.ino);
+            if (self.foreignSlot(a.ino)) {
+                const present = (try self.xattrValue(local, a.name)) != null;
+                if (a.flags & XATTR_CREATE != 0 and present) return error.PathAlreadyExists;
+                if (a.flags & XATTR_REPLACE != 0 and !present) return error.NoAttribute;
+                _ = try self.shipRecord(a.ino, .{ .setxattr = .{ .name = a.name, .value = a.value } });
+                return;
+            }
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
@@ -2188,6 +2491,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn getxattr(self: *Self, c: *Ctx, a: filesystem.GetxattrArgs) Error!filesystem.Xattr {
             try checkName(a.name);
             if (virtual_inodes.isVirtualIno(a.ino)) return error.NoAttribute;
+            // `user.squeezefs.stripes` is a COMMAND, never a stored value: a
+            // read answers the striping width in force on a directory.
+            if (std.mem.eql(u8, a.name, sym_xv.stripe.COMMAND_XATTR)) {
+                const p = self.xv orelse return error.NoAttribute;
+                if (!economy.isDirMode((try self.readInode(try localOf(a.ino))).mode)) return error.NoAttribute;
+                var buf: [4]u8 = undefined;
+                const digits = std.fmt.bufPrint(&buf, "{d}\n", .{p.stripe_k}) catch unreachable;
+                if (a.size == 0) return .{ .size = @intCast(digits.len) };
+                if (digits.len > a.size or digits.len > c.window.len) return error.BufferTooSmall;
+                @memcpy(c.window[0..digits.len], digits);
+                return .{ .data = digits.len };
+            }
             try screenXattr(a.name, error.NoAttribute);
             const value = (try self.xattrValue(try localOf(a.ino), a.name)) orelse return error.NoAttribute;
             defer self.gpa.free(value);
@@ -2246,6 +2561,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (virtual_inodes.isVirtualIno(a.ino)) return error.PermissionDenied;
             try screenXattr(a.name, error.PermissionDenied);
             const local = try localOf(a.ino);
+            if (self.foreignSlot(a.ino)) {
+                const rep = try self.shipRecord(a.ino, .{ .removexattr = .{ .name = a.name } });
+                if (rep.inode == null) return error.NoAttribute;
+                return;
+            }
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);

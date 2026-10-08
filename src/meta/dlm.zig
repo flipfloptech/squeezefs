@@ -150,6 +150,13 @@ pub const DentryReq = struct { parent: u64, name: []const u8, mode: Mode };
 /// plane's cross-owner plans and bounds the stack frame a plan needs.
 pub const max_requests = 16;
 
+/// The WIDE plan the symmetric plane's one-intent striped `rmdir` takes
+/// (charter §5.5 "Directory striping"; `sym_tokens_intents_striping.md`
+/// §4.7): `I{parent}` + `I{D}` + K `I{D_i}` + K + 3 `D{}` at K = 64 ⇒
+/// `2 × MINT_SPREAD + 8 = 136` — the same bound as the intent's steps. Only
+/// `lockManyWide` builds a set this wide; every ordinary op keeps the 16.
+pub const wide_requests = 2 * 64 + 8;
+
 pub const PlanError = error{PlanTooLarge};
 
 /// One held 4a object lock, movable by value (an op's set travels into its
@@ -169,26 +176,43 @@ pub const Guard = struct {
 };
 
 /// An op's whole guard set: canonical order (`I` ascending, then `D`
-/// ascending), one guard per distinct stripe.
-pub const GuardSet = struct {
-    guards: [2 * max_requests]Guard = undefined,
-    len: usize = 0,
+/// ascending), one guard per distinct stripe; `cap` requests per class.
+pub fn GuardSetOf(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
 
-    pub fn slice(self: *const GuardSet) []const Guard {
-        return self.guards[0..self.len];
-    }
+        guards: [2 * cap]Guard = undefined,
+        len: usize = 0,
 
-    pub fn release(self: *GuardSet, io: Io) void {
-        for (self.slice()) |g| g.release(io);
-        self.len = 0;
-    }
+        pub fn slice(self: *const Self) []const Guard {
+            return self.guards[0..self.len];
+        }
 
-    fn push(self: *GuardSet, g: Guard) void {
-        assert(self.len < self.guards.len);
-        self.guards[self.len] = g;
-        self.len += 1;
-    }
-};
+        pub fn release(self: *Self, io: Io) void {
+            for (self.slice()) |g| g.release(io);
+            self.len = 0;
+        }
+
+        /// Does the set hold `lock` in a mode at least `mode`?
+        pub fn holds(self: *const Self, lock: *const rwlock.RwLock, mode: Mode) bool {
+            for (self.slice()) |g| {
+                if (g.lock != lock) continue;
+                if (mode == .shared or g.mode == .exclusive) return true;
+            }
+            return false;
+        }
+
+        fn push(self: *Self, g: Guard) void {
+            assert(self.len < self.guards.len);
+            self.guards[self.len] = g;
+            self.len += 1;
+        }
+    };
+}
+
+pub const GuardSet = GuardSetOf(max_requests);
+/// The striped `rmdir`'s set (`wide_requests`).
+pub const WideGuardSet = GuardSetOf(wide_requests);
 
 const Census = struct {
     collisions: *counters.ShardedCounter,
@@ -269,35 +293,40 @@ const LockClass = struct {
 /// strongest mode survives and the FIRST object of a shared stripe is the
 /// stripe's census identity — an in-group collision is one acquire, never a
 /// self-collision).
-const Plan = struct {
-    const Entry = struct { stripe: usize, key: u64, mode: Mode };
+fn PlanOf(comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        const Entry = struct { stripe: usize, key: u64, mode: Mode };
 
-    entries: [max_requests]Entry = undefined,
-    len: usize = 0,
+        entries: [cap]Entry = undefined,
+        len: usize = 0,
 
-    fn add(self: *Plan, stripe: usize, key: u64, mode: Mode) PlanError!void {
-        if (self.len == max_requests) return error.PlanTooLarge;
-        self.entries[self.len] = .{ .stripe = stripe, .key = key, .mode = mode };
-        self.len += 1;
-    }
-
-    fn lessThan(_: void, a: Entry, b: Entry) bool {
-        if (a.stripe != b.stripe) return a.stripe < b.stripe;
-        return a.mode == .exclusive and b.mode == .shared;
-    }
-
-    fn canonical(self: *Plan) []const Entry {
-        std.mem.sort(Entry, self.entries[0..self.len], {}, lessThan);
-        var out: usize = 0;
-        for (self.entries[0..self.len]) |e| {
-            if (out > 0 and self.entries[out - 1].stripe == e.stripe) continue;
-            self.entries[out] = e;
-            out += 1;
+        fn add(self: *Self, stripe: usize, key: u64, mode: Mode) PlanError!void {
+            if (self.len == cap) return error.PlanTooLarge;
+            self.entries[self.len] = .{ .stripe = stripe, .key = key, .mode = mode };
+            self.len += 1;
         }
-        self.len = out;
-        return self.entries[0..out];
-    }
-};
+
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            if (a.stripe != b.stripe) return a.stripe < b.stripe;
+            return a.mode == .exclusive and b.mode == .shared;
+        }
+
+        fn canonical(self: *Self) []const Entry {
+            std.mem.sort(Entry, self.entries[0..self.len], {}, lessThan);
+            var out: usize = 0;
+            for (self.entries[0..self.len]) |e| {
+                if (out > 0 and self.entries[out - 1].stripe == e.stripe) continue;
+                self.entries[out] = e;
+                out += 1;
+            }
+            self.len = out;
+            return self.entries[0..out];
+        }
+    };
+}
+
+const Plan = PlanOf(max_requests);
 
 pub const Manager = struct {
     gpa: std.mem.Allocator,
@@ -355,8 +384,25 @@ pub const Manager = struct {
     /// The NON-PARKING form: the same canonical plan with the try fast path
     /// at every stripe; `null` — nothing held — at the first contended one.
     pub fn tryLockMany(self: *Manager, io: Io, inodes: []const InodeReq, dentries: []const DentryReq) PlanError!?GuardSet {
-        var set: GuardSet = .{};
-        var iplan = try self.inodePlan(inodes);
+        return self.tryLockManyOf(max_requests, io, inodes, dentries);
+    }
+
+    /// The WIDE canonical acquisition (`wide_requests`): the striped
+    /// `rmdir`'s one set per volume.
+    pub fn lockManyWide(self: *Manager, io: Io, inodes: []const InodeReq, dentries: []const DentryReq) PlanError!WideGuardSet {
+        return self.lockManyOf(wide_requests, io, inodes, dentries, false) catch |err| switch (err) {
+            error.Canceled => unreachable,
+            error.PlanTooLarge => |e| return e,
+        };
+    }
+
+    pub fn tryLockManyWide(self: *Manager, io: Io, inodes: []const InodeReq, dentries: []const DentryReq) PlanError!?WideGuardSet {
+        return self.tryLockManyOf(wide_requests, io, inodes, dentries);
+    }
+
+    fn tryLockManyOf(self: *Manager, comptime cap: usize, io: Io, inodes: []const InodeReq, dentries: []const DentryReq) PlanError!?GuardSetOf(cap) {
+        var set: GuardSetOf(cap) = .{};
+        var iplan = try self.inodePlanOf(cap, inodes);
         for (iplan.canonical()) |e| {
             const g = self.inode.tryLockStripe(io, e.stripe, e.key, e.mode, e.mode == .exclusive) orelse {
                 set.release(io);
@@ -364,7 +410,7 @@ pub const Manager = struct {
             };
             set.push(g);
         }
-        var dplan = try self.dentryPlan(dentries);
+        var dplan = try self.dentryPlanOf(cap, dentries);
         for (dplan.canonical()) |e| {
             const g = self.dentry.tryLockStripe(io, e.stripe, e.key, e.mode, false) orelse {
                 set.release(io);
@@ -373,6 +419,16 @@ pub const Manager = struct {
             set.push(g);
         }
         return set;
+    }
+
+    /// Does `set` (taken in THIS table) cover every request — each
+    /// request's stripe held in a mode at least the one asked? The
+    /// coverage law of a served cross-owner step under a travelling scope
+    /// (`sym/xv/guards.zig`): by `(class, stripe)`, never by key.
+    pub fn covers(self: *const Manager, comptime cap: usize, set: *const GuardSetOf(cap), inodes: []const InodeReq, dentries: []const DentryReq) bool {
+        for (inodes) |r| if (!set.holds(&self.inode.locks[self.inodeStripe(r.ino)], r.mode)) return false;
+        for (dentries) |r| if (!set.holds(&self.dentry.locks[self.dentryStripe(r.parent, r.name)], r.mode)) return false;
+        return true;
     }
 
     /// One `I{ino}` lock (the exclusive form is hold-timed).
@@ -387,27 +443,31 @@ pub const Manager = struct {
     }
 
     fn lockManyInner(self: *Manager, io: Io, inodes: []const InodeReq, dentries: []const DentryReq, comptime cancelable: bool) (PlanError || Io.Cancelable)!GuardSet {
-        var set: GuardSet = .{};
+        return self.lockManyOf(max_requests, io, inodes, dentries, cancelable);
+    }
+
+    fn lockManyOf(self: *Manager, comptime cap: usize, io: Io, inodes: []const InodeReq, dentries: []const DentryReq, comptime cancelable: bool) (PlanError || Io.Cancelable)!GuardSetOf(cap) {
+        var set: GuardSetOf(cap) = .{};
         errdefer set.release(io);
-        var iplan = try self.inodePlan(inodes);
+        var iplan = try self.inodePlanOf(cap, inodes);
         for (iplan.canonical()) |e| {
             set.push(try self.inode.lockStripe(io, e.stripe, e.key, e.mode, e.mode == .exclusive, cancelable));
         }
-        var dplan = try self.dentryPlan(dentries);
+        var dplan = try self.dentryPlanOf(cap, dentries);
         for (dplan.canonical()) |e| {
             set.push(try self.dentry.lockStripe(io, e.stripe, e.key, e.mode, false, cancelable));
         }
         return set;
     }
 
-    fn inodePlan(self: *const Manager, inodes: []const InodeReq) PlanError!Plan {
-        var plan: Plan = .{};
+    fn inodePlanOf(self: *const Manager, comptime cap: usize, inodes: []const InodeReq) PlanError!PlanOf(cap) {
+        var plan: PlanOf(cap) = .{};
         for (inodes) |r| try plan.add(self.inodeStripe(r.ino), keyWord(r.ino, 0), r.mode);
         return plan;
     }
 
-    fn dentryPlan(self: *const Manager, dentries: []const DentryReq) PlanError!Plan {
-        var plan: Plan = .{};
+    fn dentryPlanOf(self: *const Manager, comptime cap: usize, dentries: []const DentryReq) PlanError!PlanOf(cap) {
+        var plan: PlanOf(cap) = .{};
         for (dentries) |r| {
             const key = dentryKey(r.parent, r.name);
             try plan.add(self.dentryStripe(r.parent, r.name), keyWord(key, 0), r.mode);
@@ -468,6 +528,29 @@ test "dlm_stripes_knob_is_explicit_over_derived_and_rounds_up_to_pow2" {
     try testing.expectEqual(@as(usize, 16_384), resolveWidth(&env, facts, 32));
     try env.put("SQUEEZEFS_DLM_STRIPES", "1000");
     try testing.expectEqual(@as(usize, 1024), resolveWidth(&env, facts, 32));
+}
+
+test "the wide set takes 136 requests per class in one canonical acquisition (the striped rmdir's shape) and `covers` judges by (class, stripe) with the mode floor; an ordinary plan past 16 refuses" {
+    var m = try Manager.init(testing.allocator, 4096);
+    defer m.deinit();
+    var inodes: [wide_requests]InodeReq = undefined;
+    var dents: [wide_requests]DentryReq = undefined;
+    for (&inodes, 0..) |*r, i| r.* = .{ .ino = 1000 + i, .mode = .exclusive };
+    for (&dents, 0..) |*r, i| r.* = .{ .parent = 7, .name = &[_]u8{ 'n', @intCast(i & 0xFF), @intCast(i >> 8) }, .mode = .exclusive };
+    try testing.expectError(error.PlanTooLarge, m.lockMany(testing.io, &inodes, &.{}));
+    var wide = try m.lockManyWide(testing.io, &inodes, &dents);
+    try testing.expect(wide.len <= 2 * wide_requests and wide.len > 0);
+    try testing.expect(m.covers(wide_requests, &wide, inodes[0..3], dents[0..3]));
+    try testing.expect(m.covers(wide_requests, &wide, &.{.{ .ino = 1000, .mode = .shared }}, &.{}));
+    // A contended stripe: the try form answers null and holds nothing.
+    try testing.expectEqual(@as(?WideGuardSet, null), try m.tryLockManyWide(testing.io, inodes[0..1], &.{}));
+    wide.release(testing.io);
+    var set = (try m.tryLockMany(testing.io, inodes[0..2], dents[0..1])).?;
+    // A key outside the set is not covered; a shared ask over an
+    // exclusive hold is.
+    try testing.expect(!m.covers(max_requests, &set, &.{.{ .ino = 999_999, .mode = .shared }}, &.{}));
+    try testing.expect(m.covers(max_requests, &set, &.{.{ .ino = 1001, .mode = .shared }}, dents[0..1]));
+    set.release(testing.io);
 }
 
 test "a fresh manager is built at the requested width and publishes the stripes gauges" {

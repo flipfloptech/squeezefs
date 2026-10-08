@@ -170,6 +170,11 @@ pub const Cursor = struct {
     }
 };
 
+/// `n` rounded up to a multiple of `align_to` (the tail-padding law).
+pub fn padTo(n: usize, align_to: usize) usize {
+    return n + (align_to - n % align_to) % align_to;
+}
+
 /// The writer into a caller-owned buffer (the session's send buffer, sized
 /// at the frame class cap): every put is bounds-checked; nothing is
 /// allocated per frame (charter §12).
@@ -204,7 +209,7 @@ pub const Builder = struct {
     }
 
     pub fn putPadding(self: *Builder, consumed: usize, align_to: usize) BuildError!void {
-        const pad = (align_to - consumed % align_to) % align_to;
+        const pad = padTo(consumed, align_to) - consumed;
         if (self.buf.len - self.pos < pad) return error.Overflow;
         @memset(self.buf[self.pos..][0..pad], 0);
         self.pos += pad;

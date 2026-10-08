@@ -86,6 +86,7 @@ const lock_order = @import("../sync/lock_order.zig");
 const uring_fs = if (is_linux) @import("../io/uring_fs.zig") else struct {};
 const nvme_derive = @import("../io/nvme_derive.zig");
 const mem_budget = @import("../mem/budget.zig");
+const wire_stats = @import("../wire/stats.zig");
 
 pub const Error = Writer.Error;
 
@@ -186,6 +187,7 @@ pub const families = [_]Family{
     .{ .name = "ops", .write = writeOps },
     .{ .name = "op_trace", .write = writeOpTrace },
     .{ .name = "cpu", .write = writeCpu },
+    .{ .name = "wire", .write = writeWire },
     .{ .name = "stats", .write = writeSelf },
     .{ .name = "daemon", .write = writeDaemon },
 };
@@ -240,6 +242,7 @@ pub const sources = [_]Source{
     .{ .path = "src/io/uring_fs.zig", .family = "io" },
     .{ .path = "src/io/nvme_derive.zig", .family = "io" },
     .{ .path = "src/mem/budget.zig", .family = "mem_budget" },
+    .{ .path = "src/wire/stats.zig", .family = "wire" },
     .{ .path = "src/stats/stats.zig", .family = "stats" },
 };
 
@@ -536,6 +539,11 @@ fn writeCpu(src: *Sources, w: *Writer) Error!void {
     const io = src.io orelse return zero.writeJson(w);
     const sample = cpu_class.sample(ledger_ptr, gpa, io, "/proc") catch zero;
     try sample.writeJson(w);
+}
+
+/// The cluster wire's `cluster_wire_*` family (`wire/stats.zig`).
+fn writeWire(_: *Sources, w: *Writer) Error!void {
+    try wire_stats.writeStatsJson(w);
 }
 
 fn writeSelf(_: *Sources, w: *Writer) Error!void {

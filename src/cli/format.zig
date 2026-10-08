@@ -45,6 +45,7 @@ const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const transform = @import("../data/transform.zig");
 const set_config = @import("../data/set_config.zig");
+const wire_auth = @import("../wire/auth.zig");
 const data_superblock = @import("../data/data_superblock.zig");
 
 comptime {
@@ -318,6 +319,14 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         return cli.exit_failed;
     };
     defer p.gpa.free(record_bytes);
+    // The storage-trust secret (charter §8 `job:enroll`): minted ONCE at
+    // format from the secure source; whoever can read it is inside the
+    // trust domain, so every cluster-wire peer proves possession of it.
+    const enroll_secret = wire_auth.mintSecret(p.io) catch |e| {
+        p.stderr.print("squeezefs format: the job:enroll secret cannot be minted: {s}\n", .{@errorName(e)}) catch {};
+        return cli.exit_failed;
+    };
+    const enroll_bytes = wire_auth.encodeEnroll(enroll_secret);
 
     // Destructive steps, device-before-record: every data superblock first.
     for (devices[0..n_data], records[0..n_data]) |d, r| {
@@ -352,7 +361,8 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
             .root_gid = owner.gid,
             .member_position = @intCast(i),
             .member_count = @intCast(meta.paths.len),
-            .control_records = if (i == 0) &.{.{ .key = set_config.CONTROL_KEY, .seq = 0, .kind = .put, .value = record_bytes }} else &.{},
+            // Tree 0's format-time records, key-sorted: `job:enroll` < `set_config`.
+            .control_records = if (i == 0) &.{ .{ .key = wire_auth.ENROLL_KEY, .seq = 0, .kind = .put, .value = &enroll_bytes }, .{ .key = set_config.CONTROL_KEY, .seq = 0, .kind = .put, .value = record_bytes } } else &.{},
         }) catch |e| {
             p.stderr.print("squeezefs format: {s}: {s}\n", .{ mp, formatErrorText(e) }) catch {};
             return cli.exit_failed;

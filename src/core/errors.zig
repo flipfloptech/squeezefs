@@ -30,6 +30,29 @@ pub const Retryable = error{
     LaneQueueFull,
     Interrupted,
     WouldBlock,
+    /// The cluster wire's typed retryable classes (charter §5.5: "surface
+    /// as EAGAIN, never EIO/EINVAL"; `wire/frame.zig` `RefusalClass`).
+    /// "Not now": the durable state is healthy, nothing was written.
+    Deferred,
+    /// The commit door refused a slot ANOTHER appender leases: re-resolve.
+    SlotMoved,
+    /// A served guard refused a key whose slot the server no longer leases.
+    StaleHolderView,
+    /// The object's holder has no published endpoint yet (or is dead until
+    /// recovery re-leases its slots).
+    HolderUnreachable,
+    /// The token holder's membership screen refused this member inside a
+    /// failover's re-assertion window.
+    MembershipPending,
+    /// The peer's listener closed before its challenge and the bounded
+    /// dial retry ran out (its connection cap, or a shutdown).
+    ListenerRefused,
+    /// The owner's era moved under the caller; the SAME request is
+    /// admissible on the retry.
+    StaleOwnerEra,
+    /// The node asked holds no manager lease for the volume named (a
+    /// failover moved it): re-resolve the manager and re-dial.
+    NotManager,
 };
 
 /// The device, the kernel or the lane answered, and the answer is final
@@ -90,6 +113,15 @@ pub const Terminal = error{
     PermissionDenied,
     /// An errno outside the table (logged with its number; replies EIO).
     Unexpected,
+    /// A cluster-wire frame's HMAC did not verify: a SESSION error (the
+    /// session is poisoned), never a skipped frame.
+    MacInvalid,
+    /// The cluster-wire session's transport failed (EOF, reset, a poisoned
+    /// mux): every call parked on it fails; the caller re-dials.
+    ConnectionLost,
+    /// The peer's storage-trust gate refused our proof (we do not hold the
+    /// set's `job:enroll` secret, or its schema is not ours).
+    HandshakeRefused,
 };
 
 /// A caller bug or an inadmissible device/volume state: never retried.
@@ -127,6 +159,22 @@ pub const Refusal = error{
     /// EXDEV — the application's copy-and-unlink fallback; the symmetric
     /// plane's cross-owner intents are rung 6's).
     CrossVolume,
+    /// A cluster-wire word names what durable state cannot — the verb's
+    /// SCREEN refused it before any effect (`STATUS_REJECTED`; EINVAL: a
+    /// peer bug, never retried).
+    Rejected,
+    /// An unknown wire schema, framing version or verb (charter §1.7:
+    /// "unknown wire schema refuses" — never interpreted).
+    WireSchemaRefused,
+    /// A wire payload that did not decode (length, shape, reserved bytes).
+    WireMalformed,
+    /// A `refused` reply whose payload carried no typed class and no
+    /// errno this table knows (the fallback spelling; a decoded
+    /// `WireError` maps through the ONE table instead).
+    WireRefused,
+    /// The membership owner does not know the member's lease: self-fence
+    /// (purge), then re-join fresh — never a retry (ESTALE).
+    UnknownLease,
 };
 
 pub const Error = Retryable || Terminal || Refusal;
@@ -135,8 +183,8 @@ pub const Class = enum { retryable, terminal, refusal };
 
 pub fn classOf(err: Error) Class {
     return switch (err) {
-        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock => .retryable,
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.CrossVolume => .refusal,
+        error.QueueFull, error.LaneQueueFull, error.Interrupted, error.WouldBlock, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager => .retryable,
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.WriterGuardFenced, error.DismountRefused, error.DirectIoUnsupported, error.VolumeFailed, error.LaneStopped, error.Busy, error.UnsupportedVolume, error.MalformedKey, error.ValueTooLarge, error.CrossVolume, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused, error.UnknownLease => .refusal,
         else => .terminal,
     };
 }
@@ -200,13 +248,20 @@ pub fn fromCqeRes(res: i32) Error {
 pub fn toErrno(err: Error) linux.E {
     for (table) |row| if (row.err == err) return row.e;
     return switch (err) {
-        // Backpressure: retry, never "bad argument".
-        error.QueueFull, error.LaneQueueFull => .AGAIN,
-        // Refusals: the caller's shape or the device's admissibility.
-        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey => .INVAL,
+        // Backpressure and the wire's typed retryable classes: retry, never
+        // "bad argument" (charter §5.5).
+        error.QueueFull, error.LaneQueueFull, error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager => .AGAIN,
+        // Refusals: the caller's shape or the device's admissibility; a
+        // wire word the screen refused; a foreign vocabulary.
+        error.UnalignedDirectWrite, error.GrainNotAdmissible, error.NotADeviceOrFile, error.DirectOpenRefused, error.CannotStat, error.ReadSizeExceedsPool, error.DirectIoUnsupported, error.UnsupportedVolume, error.MalformedKey, error.Rejected, error.WireSchemaRefused, error.WireMalformed, error.WireRefused => .INVAL,
         error.DismountRefused => .ROFS,
-        // The fence, a dead lane, a lost op, a short transfer: EIO.
-        error.WriterGuardFenced, error.VolumeFailed, error.LaneStopped, error.RingFailed, error.WorkerClosed, error.WorkerShutdown, error.ShortWrite, error.ShortRead, error.SubmissionQueueOverflow, error.HoleCheckpointFailed, error.Unexpected => .IO,
+        // A lease the owner does not know: the handle is stale.
+        error.UnknownLease => .STALE,
+        // A peer that refused our storage-trust proof.
+        error.HandshakeRefused => .ACCES,
+        // The fence, a dead lane, a lost op, a short transfer, a poisoned
+        // wire session: EIO.
+        error.WriterGuardFenced, error.VolumeFailed, error.LaneStopped, error.RingFailed, error.WorkerClosed, error.WorkerShutdown, error.ShortWrite, error.ShortRead, error.SubmissionQueueOverflow, error.HoleCheckpointFailed, error.Unexpected, error.MacInvalid, error.ConnectionLost => .IO,
         else => unreachable, // every table row returned above
     };
 }
@@ -283,6 +338,23 @@ test "classes: backpressure is retryable and replies EAGAIN, never EINVAL; refus
     try testing.expectEqual(linux.E.NOSYS, toErrno(error.NotImplemented));
     try testing.expectEqual(error.NotImplemented, fromErrno(.NOSYS));
     try testing.expectEqual(Class.terminal, classOf(error.NoAttribute));
+}
+
+test "the cluster wire's classes: every typed retryable is EAGAIN; a screen refusal and a foreign schema are EINVAL; an unknown lease is ESTALE; a poisoned session EIO" {
+    const retryable = [_]Error{ error.Deferred, error.SlotMoved, error.StaleHolderView, error.HolderUnreachable, error.MembershipPending, error.ListenerRefused, error.StaleOwnerEra, error.NotManager };
+    for (retryable) |e| {
+        try testing.expectEqual(Class.retryable, classOf(e));
+        try testing.expectEqual(linux.E.AGAIN, toErrno(e));
+    }
+    try testing.expectEqual(Class.refusal, classOf(error.Rejected));
+    try testing.expectEqual(linux.E.INVAL, toErrno(error.Rejected));
+    try testing.expectEqual(linux.E.INVAL, toErrno(error.WireSchemaRefused));
+    try testing.expectEqual(linux.E.INVAL, toErrno(error.WireMalformed));
+    try testing.expectEqual(linux.E.STALE, toErrno(error.UnknownLease));
+    try testing.expectEqual(linux.E.ACCES, toErrno(error.HandshakeRefused));
+    try testing.expectEqual(Class.terminal, classOf(error.MacInvalid));
+    try testing.expectEqual(linux.E.IO, toErrno(error.MacInvalid));
+    try testing.expectEqual(linux.E.IO, toErrno(error.ConnectionLost));
 }
 
 test "toErrno is total: every member of the set has an errno" {

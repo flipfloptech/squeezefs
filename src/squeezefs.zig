@@ -143,7 +143,7 @@ pub const data = struct {
 };
 
 // ---- the cluster wire (charter §5.5 verbs; §9 thread-per-connection) ----
-// @anchor:wire_import
+pub const wire = @import("wire/wire.zig");
 
 // ---- observability surface: the .stats inode + CLI families (charter §10) ----
 pub const stats = @import("stats/stats.zig");
@@ -178,7 +178,7 @@ test {
     // @anchor:sym_tokens_test
     // @anchor:sym_membership_test
     // @anchor:sym_planes_test
-    // @anchor:wire_test
+    _ = wire;
     _ = data.kvmap;
     _ = meta.guard;
     _ = meta.routing;

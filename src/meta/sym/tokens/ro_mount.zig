@@ -111,12 +111,14 @@ pub fn tokenReaderTtls(opts: *const mount_options.MountOptions) error{ExplicitTt
 // ---------------------------------------------------------------------------
 
 /// The lease the membership owner granted this reader: `deadline =
-/// granted_at + T_owner`; renewed by every `Renew`'s grant.
+/// granted_at + T_owner` at the GRANT's `T_owner` (the owner's clocks —
+/// the test seam's 3 s as much as the shipped 45 s); renewed by every
+/// `Renew`'s grant.
 pub const MemberLease = struct {
     deadline_ns: std.atomic.Value(u64) = .init(0),
 
-    pub fn renew(self: *MemberLease, granted_at_ns: u64) void {
-        self.deadline_ns.store(granted_at_ns + table.T_OWNER_NS, .release);
+    pub fn renew(self: *MemberLease, granted_at_ns: u64, t_owner_ns: u64) void {
+        self.deadline_ns.store(granted_at_ns + t_owner_ns, .release);
     }
 
     pub fn live(self: *const MemberLease, now_ns: u64) bool {
@@ -507,7 +509,7 @@ test "the quiescent reader: a writer by either face fail-stops ONCE; every op an
 test "the member lease: T_owner from the grant; the owner's table answers live/expired and a member it does not list is EXPIRED" {
     var ml: MemberLease = .{};
     try testing.expect(!ml.live(0));
-    ml.renew(1000);
+    ml.renew(1000, table.T_OWNER_NS);
     try testing.expect(ml.live(1000 + table.T_OWNER_NS - 1));
     try testing.expect(!ml.live(1000 + table.T_OWNER_NS));
     try testing.expectEqual(table.T_OWNER_NS, ml.remainingNs(1000));

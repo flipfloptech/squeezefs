@@ -32,7 +32,6 @@ const appender_page = @import("../meta/sym/appender_page.zig");
 const device_loader = @import("../meta/device_loader.zig");
 const set_config = @import("../data/set_config.zig");
 const uring_fs = @import("../io/uring_fs.zig");
-const align_probe = @import("../io/align_probe.zig");
 const derive = @import("../core/derive.zig");
 const target_mod = @import("target.zig");
 const guard = @import("../meta/guard.zig");
@@ -84,18 +83,10 @@ pub fn classify(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, poo
     };
 }
 
-/// Is a writer's layer-A guard held on `path` right now? A shared,
-/// non-blocking `flock` probe that is released at once: it conflicts with
-/// the daemon's exclusive lock and nothing else.
+/// Is a writer's layer-A guard held on `path` right now? Read off
+/// `/proc/locks`: the probe takes no lock of its own.
 pub fn writerGuardHeld(path: []const u8) bool {
-    var zbuf: [linux.PATH_MAX]u8 = undefined;
-    const z = align_probe.pathZ(&zbuf, path) catch return false;
-    const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
-    const op: i32 = std.posix.LOCK.SH | std.posix.LOCK.NB;
-    return linux.errno(linux.flock(fd, op)) == .AGAIN;
+    return guard.proc.writerFlockHeld(path);
 }
 
 /// The newest valid ledger record of a v4 volume (caller frees).

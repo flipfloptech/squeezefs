@@ -230,8 +230,12 @@ pub const OpenOptions = struct {
 /// The mount's posture (charter §5.7): the D0 ladder's winner is the
 /// MANAGER of the volume (the flock, the claim, the fixed ledger, tree 0);
 /// a later RW mount of a symmetric set is JOINED (no flock, the region
-/// over the wire, the page as its ledger).
-pub const Posture = enum { manager, joined };
+/// over the wire, the page as its ledger); a `-o ro` mount of a symmetric
+/// set is a READER (charter §5.5 "`-o ro` mounts are member-readers +
+/// token clients … with NO live writer … the QUIESCENT reader of the
+/// checkpointed projection"): the device read-only, no flock, no claim,
+/// no ring, every tree a projection at the newest checkpoint.
+pub const Posture = enum { manager, joined, reader };
 
 /// `openJoined`'s inputs beyond `OpenOptions`.
 pub const JoinOptions = struct {
@@ -1060,6 +1064,168 @@ pub const KvBackend = struct {
         stats.mounts.inc();
         log.info("meta volume {s}: mounted JOINED as appender {d} — projection seq {d} (tail {d}), ring {d} B at head {d}, {d} tree(s), {d} grant extent(s) free, {s} cadence", .{ be.path, standing.appender_id, mounted.seq, mounted.journal_tail_seq, be.ring_layout.ringBytes(), be.core.headPos(), be.trees.load().len, be.alloc.freeExtents(), if (flush_ms == 0) "strict" else "coalesced" });
         return be;
+    }
+
+    /// The READER open (charter §5.5 "`-o ro` mounts are member-readers +
+    /// token clients"; `tokens/ro_mount.zig`): the device read-only with
+    /// no flock and no claim ("a reader claims nothing"), the newest
+    /// checkpoint's record, the control tree and every slot tree at the
+    /// roots that record and tree 0 name — a PROJECTION: no ring, no lane,
+    /// no conveyor, no checkpointer; every mutation entry answers
+    /// `PartitionRefused` (EROFS). What the reader serves off these trees
+    /// is the quiescent posture's business (`sym/reader_plane.zig`); under
+    /// a live writer every object is read under a token instead.
+    pub fn openReader(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions) OpenError!*KvBackend {
+        const t0 = clock.monotonicNs();
+        const guard_fd = openReaderFd(path) catch return error.DeviceRefused;
+        errdefer _ = linux.close(guard_fd);
+        const mode = uring_fs.registerMetaDevice(gpa, opts.env, path) catch return error.DeviceRefused;
+        const pool = opts.pool orelse (uring_fs.Pool.init(gpa, uring_fs.Config.resolve(opts.env, derive.Facts.probe())) catch return error.DeviceRefused);
+        errdefer if (opts.pool == null) pool.deinit();
+        const volume_len = device_loader.volumeLength(path) catch return error.DeviceRefused;
+        const be = try gpa.create(KvBackend);
+        errdefer gpa.destroy(be);
+        const owned_path = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned_path);
+        var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = owned_path, .mode = mode, .ledger_base = 0, .bitmap_base = 0 };
+        const classified = try readSuperblock(gpa, &dev, path, opts.env, volume_len);
+        const sb = classified.sb;
+        if (!sb.symmetricPlaneStamped()) {
+            log.err("meta volume {s}: a `-o ro` reader of a `--single-writer` volume has no token plane to read under — mount it writable or format the set symmetric", .{path});
+            return error.UnsupportedFormat;
+        }
+        var mounted = try readNewestLedger(gpa, &dev, path, sb);
+        var mounted_in_be = false;
+        errdefer if (!mounted_in_be) mounted.deinit(gpa);
+        const layout = node.NodeLayout.new(sb.node_size, null) catch return error.Corrupt;
+        be.* = .{
+            .gpa = gpa,
+            .io = io,
+            .env = opts.env,
+            .path = owned_path,
+            .index = opts.index,
+            .guard_fd = guard_fd,
+            .pool = pool,
+            .pool_owned = opts.pool == null,
+            .volume_len = volume_len,
+            .sb = sb,
+            .sb_generation = classified.next_generation,
+            .mounted = mounted,
+            .dev = dev,
+            .layout = layout,
+            .cache = undefined,
+            .alloc = undefined,
+            .seq = node_seq.NodeSeqHandle.shared(@max(mounted.seq, mounted.node_seq_watermark)),
+            .trees = undefined,
+            .stamp = undefined,
+            .slots = undefined,
+            .ring_layout = undefined,
+            .geo = undefined,
+            .core = undefined,
+            .reg = undefined,
+            .lane = undefined,
+            .smo_journal = undefined,
+            .smo_ctx = undefined,
+            .ckpt_seam = undefined,
+            .flusher = undefined,
+            .cp = undefined,
+            .task = undefined,
+            .cv = undefined,
+            .ino = inos.InoWatermark.init(mounted.next_ino),
+            .replay = .{ .entries = 0, .dropped_torn = 0, .content_records = 0, .clean_unmount = true, .replay_ns = 0 },
+            .posture = .reader,
+        };
+        mounted_in_be = true;
+        errdefer be.mounted.deinit(gpa);
+        be.dev.path = be.path;
+        be.cache_budget_bytes = opts.cache_budget_bytes;
+        be.cache = try node_cache.NodeCache.init(gpa, io, .{ .layout = layout, .heap_base = sb.heap.start, .budget_bytes = opts.cache_budget_bytes }, be.dev.loader());
+        errdefer be.cache.deinit();
+        be.cache.setDurableTail(mounted.journal_tail_seq);
+        be.trees = try tree.TreeTable.init(gpa, &.{});
+        errdefer {
+            for (be.trees.load()) |t| t.destroy();
+            be.trees.deinit();
+        }
+        be.stamp = try stamp_cell.StampCell.init(gpa, mounted.membership_stamp);
+        errdefer be.stamp.deinit();
+        errdefer {
+            be.guest_published.deinit(gpa);
+            be.guest_cursor_floors.deinit(gpa);
+        }
+        try be.openProjectionTrees();
+        be.replay.replay_ns = clock.monotonicNs() - t0;
+        stats.mounts.inc();
+        log.info("meta volume {s}: mounted as a READER — the checkpointed projection at seq {d} (tail {d}), {d} tree(s); no flock, no claim, no ring", .{ be.path, mounted.seq, mounted.journal_tail_seq, be.trees.load().len });
+        return be;
+    }
+
+    /// Every tree of the checkpoint `be.mounted` names: the ledger's own
+    /// roots (the control tree, the native slot tree) and every guest slot
+    /// tree tree 0's `slot_state` records root (page 0's lessee entries
+    /// folded in — the two-homes law).
+    fn openProjectionTrees(be: *KvBackend) OpenError!void {
+        const gpa = be.gpa;
+        for (be.mounted.tree_roots) |r| {
+            const t = KvTree.openFromLedger(gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Io => return error.Io,
+                else => return error.Corrupt,
+            };
+            errdefer t.destroy();
+            be.seq.raiseTo(r.node_seq);
+            try be.trees.add(t);
+        }
+        try be.openGuestTrees(&.{});
+    }
+
+    /// Re-point the projection at the newest checkpoint on the device (the
+    /// quiescent reader adopting the writers' last checkpoint after they
+    /// left): every cached node dropped (a leaf appended to in place keeps
+    /// its address), the old trees RETIRED from the table (destroyed with
+    /// it, never under a reader mid-walk), the record's trees opened in
+    /// their place — a concurrent reader sees the old list or the new.
+    /// Answers whether the record moved.
+    pub fn adoptNewestCheckpoint(be: *KvBackend) OpenError!bool {
+        std.debug.assert(be.posture == .reader);
+        var fresh = try readNewestLedger(be.gpa, &be.dev, be.path, be.sb);
+        if (fresh.seq <= be.mounted.seq) {
+            fresh.deinit(be.gpa);
+            return false;
+        }
+        be.trees_lock.lockUncancelable(be.io);
+        defer be.trees_lock.unlock(be.io);
+        be.mounted.deinit(be.gpa);
+        be.mounted = fresh;
+        be.cache.setDurableTail(fresh.journal_tail_seq);
+        _ = be.cache.discardAllNodes();
+        const old = be.trees.load();
+        var i: usize = old.len;
+        while (i > 0) {
+            i -= 1;
+            try be.trees.remove(old[i]);
+        }
+        be.guest_published.clearRetainingCapacity();
+        be.guest_cursor_floors.clearRetainingCapacity();
+        try be.openProjectionTrees();
+        return true;
+    }
+
+    pub fn isReader(be: *const KvBackend) bool {
+        return be.posture == .reader;
+    }
+
+    /// The reader's device fd: read-only, no lock of any kind ("a reader
+    /// claims nothing") — held for the mount's life like the guard fd.
+    fn openReaderFd(path: []const u8) error{DeviceRefused}!linux.fd_t {
+        var zbuf: [linux.PATH_MAX]u8 = undefined;
+        const z = align_probe.pathZ(&zbuf, path) catch return error.DeviceRefused;
+        const rc = linux.open(z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) {
+            log.err("meta volume {s}: cannot open for reading ({t})", .{ path, linux.errno(rc) });
+            return error.DeviceRefused;
+        }
+        return @intCast(rc);
     }
 
     /// The joined posture's `RecordSource.appenderPages`: the page IS the
@@ -1897,10 +2063,22 @@ pub const KvBackend = struct {
 
     pub fn commit(be: *KvBackend, t: *KvTx) Error!void {
         defer be.gpa.destroy(t);
+        if (be.posture == .reader) {
+            t.deinit();
+            return error.PartitionRefused;
+        }
         return be.cv.commit(t);
     }
 
     pub fn commitGroup(be: *KvBackend, txs: []const *KvTx, results: []Outcome) void {
+        if (be.posture == .reader) {
+            for (txs, results) |t, *r| {
+                t.deinit();
+                be.gpa.destroy(t);
+                r.* = error.PartitionRefused;
+            }
+            return;
+        }
         be.cv.commitGroup(txs, results);
         for (txs) |t| be.gpa.destroy(t);
     }
@@ -1939,11 +2117,13 @@ pub const KvBackend = struct {
     /// `fsync`: the trailing coalesced barrier (every acked entry durable on
     /// return).
     pub fn fsync(be: *KvBackend) Error!void {
+        if (be.posture == .reader) return;
         return be.cv.barrier();
     }
 
     /// One full cycle with an immediate barrier.
     pub fn checkpointNow(be: *KvBackend) checkpoint_cycle.CycleError!void {
+        std.debug.assert(be.posture != .reader);
         be.smo_lock.lockUncancelable(be.io);
         defer be.smo_lock.unlock(be.io);
         return be.cp.checkpointNow();
@@ -1994,6 +2174,9 @@ pub const KvBackend = struct {
     pub const Space = struct { total_bytes: u64, free_bytes: u64 };
 
     pub fn space(be: *const KvBackend) Space {
+        // A reader holds no allocator: the heap is full to it (it mints
+        // nothing), the total its own.
+        if (be.posture == .reader) return .{ .total_bytes = be.sb.heap.len, .free_bytes = 0 };
         return .{ .total_bytes = be.sb.heap.len, .free_bytes = be.alloc.freeExtents() * be.sb.node_size };
     }
 
@@ -2007,6 +2190,7 @@ pub const KvBackend = struct {
     }
 
     pub fn isFailed(be: *const KvBackend) bool {
+        if (be.posture == .reader) return false;
         return be.lane.latch.isFailed();
     }
 
@@ -2025,6 +2209,21 @@ pub const KvBackend = struct {
     /// The clean dismount (module doc). Idempotent; frees the backend.
     pub fn close(be: *KvBackend) void {
         const gpa = be.gpa;
+        if (be.posture == .reader) {
+            // A reader wrote nothing: the projection goes.
+            for (be.trees.load()) |t| t.destroy();
+            be.trees.deinit();
+            be.stamp.deinit();
+            be.guest_published.deinit(gpa);
+            be.guest_cursor_floors.deinit(gpa);
+            be.cache.deinit();
+            be.mounted.deinit(gpa);
+            if (be.pool_owned) be.pool.deinit();
+            _ = linux.close(be.guard_fd);
+            gpa.free(be.path);
+            gpa.destroy(be);
+            return;
+        }
         if (!be.closed) {
             be.closed = true;
             // The guard FIRST (charter §5.7 clean unmount): the heartbeat

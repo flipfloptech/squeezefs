@@ -1258,6 +1258,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.forgetParent(a.ino);
             const local = localOf(a.ino) catch return;
             self.data.forgetShape(local);
+            // A reader destroys nothing: a corpse is its holder's.
+            if (@hasDecl(Store, "isReader") and self.store.isReader()) return;
             // A FOREIGN ino's corpse is its holder's to destroy (at the
             // holder's own forget, under its door): a reader's forget
             // drops its cached view alone — never a destroy on a slot

@@ -157,6 +157,8 @@ pub const Sources = struct {
     backend: if (is_linux) ?*meta_set.MetaSet else ?*void = null,
     /// The cluster wire plane (the listener, the shard or the member).
     wire: if (is_linux) ?*sym.wire_plane.WirePlane else ?*void = null,
+    /// A `-o ro` reader's plane (the token client or the quiescent reader).
+    reader: if (is_linux) ?*sym.reader_plane.ReaderPlane else ?*void = null,
     key_census: ?KeyCensus = null,
     /// The CPU ledger (+ its allocator) and an `Io` for the `/proc/self/
     /// task` walk; absent ⇒ zeros (every family stays present).
@@ -320,6 +322,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/sym/join.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/bind.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/wire_plane.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/reader_plane.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/door.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/acquire.zig", .by = "src/meta/sym.zig" },
@@ -486,16 +489,23 @@ fn writeMeta(src: *Sources, w: *Writer) Error!void {
     if (is_linux) {
         if (src.backend) |set| {
             const be = set.volumes[0];
-            try be.conveyorStats().writeJson(w);
-            try w.writeAll(",\"conveyor_phases\":");
-            try be.conveyorStats().writePhasesJson(w);
-            try w.writeAll(",\"backend\":");
-            try counters.writeFieldsJson(&backend.stats, w);
-            // The checkpointer's per-instance gauges (`meta_kv_checkpoint_
-            // {term,late_max,barrier,trigger,projected}_ms`, the units,
-            // `reusable_upto`, `dirty_nodes`): the instrument fields alone.
-            try w.writeAll(",\"checkpointer\":");
-            try counters.writeFieldsJson(&be.cp, w);
+            // A reader runs no conveyor and no checkpointer.
+            if (be.isReader()) {
+                try w.writeAll("{},\"conveyor_phases\":{},\"backend\":");
+                try counters.writeFieldsJson(&backend.stats, w);
+                try w.writeAll(",\"checkpointer\":{}");
+            } else {
+                try be.conveyorStats().writeJson(w);
+                try w.writeAll(",\"conveyor_phases\":");
+                try be.conveyorStats().writePhasesJson(w);
+                try w.writeAll(",\"backend\":");
+                try counters.writeFieldsJson(&backend.stats, w);
+                // The checkpointer's per-instance gauges (`meta_kv_checkpoint_
+                // {term,late_max,barrier,trigger,projected}_ms`, the units,
+                // `reusable_upto`, `dirty_nodes`): the instrument fields alone.
+                try w.writeAll(",\"checkpointer\":");
+                try counters.writeFieldsJson(&be.cp, w);
+            }
             try w.writeAll(",\"set\":");
             try set.writeStatsJson(w);
         } else try w.writeAll("{},\"conveyor_phases\":{},\"backend\":{},\"checkpointer\":{},\"set\":{}");
@@ -516,7 +526,7 @@ fn writeMeta(src: *Sources, w: *Writer) Error!void {
     try sym.writeStatsJson(w);
     try w.writeAll(",\"wire_plane\":");
     if (is_linux) {
-        if (src.wire) |wp| try wp.writeStatsJson(w) else try w.writeAll("{}");
+        if (src.wire) |wp| try wp.writeStatsJson(w) else if (src.reader) |rp| try rp.writeStatsJson(w) else try w.writeAll("{}");
     } else try w.writeAll("{}");
     inline for (.{
         .{ "node_cache", node_cache.stats },       .{ "tree", tree.stats },            .{ "smo", smo.stats },

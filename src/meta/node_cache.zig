@@ -2115,6 +2115,34 @@ pub const NodeCache = struct {
         return dropped;
     }
 
+    /// Every mapped node discarded (the control tree's included): a
+    /// READER adopting a newer checkpoint whole — its nodes are a
+    /// projection nothing here dirtied, and the writers appended to leaves
+    /// in place under unchanged addresses, so a cached image would serve
+    /// the older checkpoint's words. Answers the mappings dropped.
+    pub fn discardAllNodes(self: *NodeCache) u64 {
+        var victims: std.ArrayListUnmanaged(*CachedNode) = .empty;
+        defer victims.deinit(self.gpa);
+        const Collect = struct {
+            list: *std.ArrayListUnmanaged(*CachedNode),
+            fn visit(c: @This(), n: *CachedNode) void {
+                c.list.append(n.cache.gpa, n.retain()) catch n.release();
+            }
+        };
+        self.forEachNode(Collect{ .list = &victims }, Collect.visit);
+        var dropped: u64 = 0;
+        for (victims.items) |n| {
+            defer n.release();
+            _ = n.state.supersede() catch {};
+            if (self.mapRemoveIf(n.addr, n) catch false) {
+                self.cached_bytes.sub(self.cfg.layout.node_size);
+                _ = self.mapped.fetchSub(1, .monotonic);
+                dropped += 1;
+            }
+        }
+        return dropped;
+    }
+
     /// Does any mapped node of `slot` carry un-durable RAM records? The
     /// recovery cycles until none does.
     pub fn slotHasDirty(self: *NodeCache, slot: ForestSlot) bool {

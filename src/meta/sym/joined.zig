@@ -367,8 +367,8 @@ pub const JoinedSet = struct {
         // `--join` names a listener the record may not yet carry: the
         // poll starts at the mounted record, so a later record (a
         // successor manager's first checkpoint) is what re-points.
-        self.manager_resolver = .{ .js = self, .poll = ro_mount.EpochPoll.init(gpa, .{ .ctx = self, .readSlot = &ManagerResolver.readSlot, .readAll = &ManagerResolver.readAll }, be.mounted.seq) };
-        self.link.resolver = .{ .ctx = &self.manager_resolver, .resolve = &ManagerResolver.resolve };
+        self.manager_resolver = ManagerResolver.init(be, &self.link);
+        self.link.resolver = self.manager_resolver.face();
         self.granted_bits = std.DynamicBitSetUnmanaged.initEmpty(gpa, be.sb.totalExtents()) catch return error.OutOfMemory;
         errdefer self.granted_bits.deinit(gpa);
         self.wire = .{ .gpa = gpa, .link = self.link.link(), .volume = be.index, .identity = wire_identity, .pages = .{ .ctx = self, .read = &readPageFn } };
@@ -747,44 +747,55 @@ pub const JoinedSet = struct {
 /// successor). The poll starts at the mounted checkpoint, so a `--join`
 /// listener is honoured until the record first moves past it.
 pub const ManagerResolver = struct {
-    js: *JoinedSet,
+    be: *KvBackend,
+    link: *SharedLink,
     poll: ro_mount.EpochPoll,
     repoints: std.atomic.Value(u64) = .init(0),
 
+    /// Over `be`'s device, polling from its mounted checkpoint; installed
+    /// on `link` by the caller (`link.resolver = resolver.face()`).
+    pub fn init(be: *KvBackend, link: *SharedLink) ManagerResolver {
+        return .{ .be = be, .link = link, .poll = ro_mount.EpochPoll.init(be.gpa, .{ .ctx = be, .readSlot = &readSlot, .readAll = &readAll }, be.mounted.seq) };
+    }
+
+    pub fn face(self: *ManagerResolver) EndpointResolver {
+        return .{ .ctx = self, .resolve = &resolve };
+    }
+
     fn resolve(ctx: *anyopaque) ?endpoint.EndpointWire {
         const self: *ManagerResolver = @ptrCast(@alignCast(ctx));
-        const js = self.js;
-        const current = js.link.ep;
+        const be = self.be;
+        const current = self.link.ep;
         const out = self.poll.poll() catch return current;
         var rec = out.newest orelse return current;
-        defer rec.deinit(js.gpa);
-        const bytes = (js.be.lookupControlAtRecord(js.gpa, &rec, cr.endpointKey(0).slice()) catch return current) orelse return current;
-        defer js.gpa.free(bytes);
+        defer rec.deinit(be.gpa);
+        const bytes = (be.lookupControlAtRecord(be.gpa, &rec, cr.endpointKey(0).slice()) catch return current) orelse return current;
+        defer be.gpa.free(bytes);
         const ep = decodeEndpoint(bytes) catch return current;
         if (!ep.eql(current)) {
             _ = self.repoints.fetchAdd(1, .monotonic);
-            log.info("meta volume {s}: the manager's listener moved to {f} (checkpoint seq {d}) — the manager link re-points", .{ js.be.path, ep, rec.seq });
+            log.info("meta volume {s}: the manager's listener moved to {f} (checkpoint seq {d}) — the manager link re-points", .{ be.path, ep, rec.seq });
         }
         return ep;
     }
 
-    fn readSlot(ctx: *anyopaque, slot: u64, out: *[ro_mount.SLOT_LEN]u8) ro_mount.IoError!void {
-        const js: *JoinedSet = @ptrCast(@alignCast(ctx));
-        const img = js.be.dev.readRange(js.gpa, js.be.sb.root_ledger.start + slot * ro_mount.SLOT_LEN, ro_mount.SLOT_LEN) catch |e| return switch (e) {
+    pub fn readSlot(ctx: *anyopaque, slot: u64, out: *[ro_mount.SLOT_LEN]u8) ro_mount.IoError!void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const img = be.dev.readRange(be.gpa, be.sb.root_ledger.start + slot * ro_mount.SLOT_LEN, ro_mount.SLOT_LEN) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
         };
-        defer js.gpa.free(img);
+        defer be.gpa.free(img);
         @memcpy(out, img[0..ro_mount.SLOT_LEN]);
     }
 
-    fn readAll(ctx: *anyopaque, out: []u8) ro_mount.IoError!void {
-        const js: *JoinedSet = @ptrCast(@alignCast(ctx));
-        const img = js.be.dev.readRange(js.gpa, js.be.sb.root_ledger.start, out.len) catch |e| return switch (e) {
+    pub fn readAll(ctx: *anyopaque, out: []u8) ro_mount.IoError!void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const img = be.dev.readRange(be.gpa, be.sb.root_ledger.start, out.len) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Io => error.Io,
         };
-        defer js.gpa.free(img);
+        defer be.gpa.free(img);
         @memcpy(out, img[0..out.len]);
     }
 };
@@ -793,7 +804,7 @@ pub const ManagerResolver = struct {
 // Tree 0's projection: the secret and the endpoint before any wire.
 // ---------------------------------------------------------------------------
 
-fn readControl(gpa: Allocator, be: *KvBackend, k: []const u8, comptime T: type, comptime decode: anytype) OpenError!?T {
+pub fn readControl(gpa: Allocator, be: *KvBackend, k: []const u8, comptime T: type, comptime decode: anytype) OpenError!?T {
     const bytes = (be.lookup(gpa, key.TREE_CONTROL, k) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.Io,
@@ -819,7 +830,7 @@ fn readAppender0(gpa: Allocator, be: *KvBackend) OpenError!?page.Page {
     return page.newestValid(imgs) catch return error.Corrupt;
 }
 
-fn decodeEndpoint(bytes: []const u8) !endpoint.EndpointWire {
+pub fn decodeEndpoint(bytes: []const u8) !endpoint.EndpointWire {
     const e = try cr.EndpointRecordWire.decode(bytes);
     return .{ .family = e.family, .reserved = 0, .port = e.port, .addr = e.addr };
 }
@@ -828,7 +839,7 @@ fn decodeEndpoint(bytes: []const u8) !endpoint.EndpointWire {
 /// published it in its ring-0 window and the next cycle lands it: the
 /// joiner re-reads the newest ledger record and re-opens the control tree
 /// at its root, bounded (the joiner never replays ring 0).
-fn awaitManagerEndpoint(gpa: Allocator, be: *KvBackend) OpenError!endpoint.EndpointWire {
+pub fn awaitManagerEndpoint(gpa: Allocator, be: *KvBackend) OpenError!endpoint.EndpointWire {
     const deadline = clock.monotonicNs() + ENDPOINT_POLL_MAX_MS * std.time.ns_per_ms;
     while (true) {
         if (try readControl(gpa, be, cr.endpointKey(0).slice(), endpoint.EndpointWire, decodeEndpoint)) |ep| return ep;
@@ -839,12 +850,22 @@ fn awaitManagerEndpoint(gpa: Allocator, be: *KvBackend) OpenError!endpoint.Endpo
         stats.joined_endpoint_polls.inc();
         log.debug("meta volume {s}: no endpoint:0 record at checkpoint seq {d} (tail {d}) — polling the projection", .{ be.path, be.mounted.seq, be.mounted.journal_tail_seq });
         be.io.sleep(.fromMilliseconds(ENDPOINT_POLL_STEP_MS), .awake) catch {};
-        be.reopenControlProjection() catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            else => error.Corrupt,
-        };
+        // A joiner re-opens the control projection (nothing of its own
+        // exists yet); a reader adopts the newest checkpoint whole.
+        if (be.posture == .reader) {
+            _ = be.adoptNewestCheckpoint() catch |e| return mapReopen(e);
+        } else {
+            be.reopenControlProjection() catch |e| return mapReopen(e);
+        }
     }
+}
+
+fn mapReopen(e: backend.OpenError) OpenError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Io => error.Io,
+        else => error.Corrupt,
+    };
 }
 
 // ---------------------------------------------------------------------------

@@ -790,21 +790,7 @@ pub const WirePlane = struct {
 
     fn foreignLayoutFn(ctx: *anyopaque, gpa: Allocator, ino: u64) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.Verdict {
         const self: *WirePlane = @ptrCast(@alignCast(ctx));
-        const served = (self.divert.serve(self.io, ino, .{ .records = true }) catch |e| return tokens.divert.coreError(e)) orelse return .local;
-        defer served.release(self.io);
-        const e = served.entry orelse return .gone;
-        var layout_rec: ?[]u8 = null;
-        for (e.xattrs) |x| if (std.mem.eql(u8, x.name, @import("../../data/layout.zig").LAYOUT_XATTR_NAME)) {
-            // The record's wire shape is the xattr VALUE record (name +
-            // value) the store holds: re-encoded for the layout decoder.
-            const v = record.XattrValue{ .name = x.name, .value = x.value };
-            layout_rec = v.encodeAlloc(gpa) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.InputOutput,
-            };
-            break;
-        };
-        return .{ .foreign = .{ .size = e.attrs.size, .layout = layout_rec } };
+        return foreignLayoutOf(&self.divert, self.io, gpa, ino);
     }
 
     /// The §5.9 recovery driver over the `vol`-th managed volume (null on
@@ -1064,7 +1050,7 @@ pub const RecallSink = struct {
         self.notify = seam;
     }
 
-    fn sink(self: *RecallSink) tokens.cache.RecallSink {
+    pub fn sink(self: *RecallSink) tokens.cache.RecallSink {
         return .{ .ctx = self, .discardLayout = &discardLayout, .purgeCensus = &purgeCensus, .noteRecalled = &noteRecalled };
     }
 
@@ -1298,12 +1284,16 @@ const PeerLinks = struct {
         return std.mem.bytesToValue(endpoint.EndpointWire, ep.bytes[0..@sizeOf(endpoint.EndpointWire)]);
     }
 
-    /// The listener of the member whose token client id is `client`.
+    /// The listener of the member whose token client id is `client`: the
+    /// owner's roster on the manager; on a joiner the manager's listener
+    /// for the manager's own id, the owner's CENSUS over the wire for any
+    /// other member (a reader of this holder's slots declared its
+    /// listener at its join; the push of its recall needs it).
     fn clientEndpoint(self: *PeerLinks, client: tokens.table.ClientId) ?endpoint.EndpointWire {
         const be0 = self.plane.set.volumes[0];
         if (be0.joined) |js| {
             if (client == clientIdOf(shard.writerMemberId(js.manager_identity))) return js.managerEndpoint();
-            return null;
+            return self.clientEndpointByCensus(js, client);
         }
         const m = self.plane.mgr orelse return null;
         for (m.owner.members.items) |ms| if (clientIdOf(ms.id) == client) {
@@ -1311,6 +1301,23 @@ const PeerLinks = struct {
             return ms.endpoint;
         };
         return null;
+    }
+
+    fn clientEndpointByCensus(self: *PeerLinks, js: *joined.JoinedSet, client: tokens.table.ClientId) ?endpoint.EndpointWire {
+        _ = self;
+        var cursor: u64 = 0;
+        while (true) {
+            const rep = js.link.call(.{ .census = .{ .cursor = cursor, .limit = verbs.CENSUS_PAGE_MAX, .reserved = 0 } }) catch return null;
+            const pg = rep.census;
+            var rows = pg.rows();
+            while (rows.next()) |row| {
+                if (clientIdOf(row.head.id) != client) continue;
+                if (row.head.endpoint.isNone()) return null;
+                return row.head.endpoint;
+            }
+            if (pg.head.has_next == 0) return null;
+            cursor = pg.head.next;
+        }
     }
 
     pub fn linkForHolder(self: *PeerLinks, holder: u32) ?tokens.cache.Link {
@@ -1354,6 +1361,28 @@ const PeerLinks = struct {
         return self.linkForHolder(holder);
     }
 };
+
+/// A foreign file's layout record off its holder's token through `divert`
+/// (the data plane's `ForeignLayout` face on every posture): `.local` for
+/// a slot this mount reads itself, `.gone` for an object its holder no
+/// longer has, else the size and the layout xattr record.
+pub fn foreignLayoutOf(divert: *tokens.Divert, io: Io, gpa: Allocator, ino: u64) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.Verdict {
+    const served = (divert.serve(io, ino, .{ .records = true }) catch |e| return tokens.divert.coreError(e)) orelse return .local;
+    defer served.release(io);
+    const e = served.entry orelse return .gone;
+    var layout_rec: ?[]u8 = null;
+    for (e.xattrs) |x| if (std.mem.eql(u8, x.name, @import("../../data/layout.zig").LAYOUT_XATTR_NAME)) {
+        // The record's wire shape is the xattr VALUE record (name +
+        // value) the store holds: re-encoded for the layout decoder.
+        const v = record.XattrValue{ .name = x.name, .value = x.value };
+        layout_rec = v.encodeAlloc(gpa) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InputOutput,
+        };
+        break;
+    };
+    return .{ .foreign = .{ .size = e.attrs.size, .layout = layout_rec } };
+}
 
 /// The token service's resolver over the set: a slot this process leases
 /// (every slot of a volume it manages whose lease is its own) is local;

@@ -386,7 +386,7 @@ const TwoMembers = struct {
             self.b_to_a[i] = try self.hub.connect(i + 1, 0);
             self.peers.conns[i] = &self.a_to_b[i];
             self.resolvers[i] = .{ .conn_to_a = &self.b_to_a[i] };
-            self.member_leases[i].renew(now);
+            self.member_leases[i].renew(now, table.T_OWNER_NS);
             try self.leases.grant(@intCast(i + 1), now);
             self.diverts[i] = divert.Divert.init(gpa, io, self.resolvers[i].resolver(), @intCast(i + 1), 0, self.sinks[i].sink(), self.member_leases[i].selfLease(), cache.recordsBudgetBytes(0));
             self.reader_svcs[i] = .{ .io = io, .divert = &self.diverts[i] };
@@ -845,7 +845,7 @@ test "the serve gate: a reader past T_self serves NOTHING from its cache; a hold
     try testing.expectError(error.MembershipPending, b.serve(io, objectOf(3), .{}));
     try testing.expectEqual(refusals0 + 1, cache.stats.dlm_token_serve_refusals.load());
     try testing.expectEqual(@as(usize, 0), plane.cache.count(io));
-    f.member_leases[0].renew(clock.monotonicNs());
+    f.member_leases[0].renew(clock.monotonicNs(), table.T_OWNER_NS);
     s = (try b.serve(io, objectOf(3), .{})).?;
     s.release(io);
     // The re-point onto a session that dies at its first frame: every token

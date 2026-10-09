@@ -110,6 +110,49 @@ pub fn localIdentity() claim.Identity {
     };
 }
 
+/// `/proc/locks` is a table of every lock on the host; a flock line reads
+/// `N: FLOCK  ADVISORY  WRITE pid MAJ:MIN:INO start end`. The table of a
+/// busy host is a few hundred lines; 1 MiB holds thousands.
+const PROC_LOCKS_CAP: usize = 1 << 20;
+
+/// Is an exclusive `flock` (the D0 guard's layer A) held on `path` by any
+/// process of this host — read off `/proc/locks`, so the probe takes NO
+/// lock of its own (a `-o ro` reader "claims nothing", and a transient
+/// `LOCK_SH` would refuse a writer's `LOCK_EX | LOCK_NB` racing it).
+/// Unreadable procfs reads as "no lock" (the claim face judges then).
+pub fn writerFlockHeld(path: []const u8) bool {
+    var zbuf: [linux.PATH_MAX]u8 = undefined;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return false;
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .INO = true }, &st)) != .SUCCESS) return false;
+    var buf: [PROC_LOCKS_CAP]u8 = undefined;
+    const text = readSmall("/proc/locks", &buf) orelse return false;
+    return flockHeldIn(text, st.dev_major, st.dev_minor, st.ino);
+}
+
+/// The `/proc/locks` scan: an exclusive FLOCK line whose `MAJ:MIN:INO`
+/// (hex major and minor, decimal inode) names the file.
+pub fn flockHeldIn(text: []const u8, dev_major: u32, dev_minor: u32, ino: u64) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        _ = it.next() orelse continue;
+        const kind = it.next() orelse continue;
+        if (!std.mem.eql(u8, kind, "FLOCK")) continue;
+        _ = it.next() orelse continue;
+        const mode = it.next() orelse continue;
+        if (!std.mem.eql(u8, mode, "WRITE")) continue;
+        _ = it.next() orelse continue;
+        const where = it.next() orelse continue;
+        var parts = std.mem.splitScalar(u8, where, ':');
+        const maj = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
+        const min = std.fmt.parseInt(u32, parts.next() orelse continue, 16) catch continue;
+        const node = std.fmt.parseInt(u64, parts.next() orelse continue, 10) catch continue;
+        if (maj == dev_major and min == dev_minor and node == ino) return true;
+    }
+    return false;
+}
+
 /// `/etc/nvme/hostnqn` + `/etc/nvme/hostid`, trimmed; absent reads empty.
 /// Never written (quirk Q7).
 pub const EtcNvme = struct {
@@ -172,6 +215,37 @@ test "start ticks: field 22 after the last ')' (a comm with spaces and parenthes
     _ = try child.wait(testing.io);
     try testing.expect(startTicksOf(pid) == null);
     try testing.expect(probe.provablyDead(pid, 1));
+}
+
+test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) is the writer's guard; a shared flock, a POSIX lock or another inode is not; our own exclusive flock on a scratch file is seen without taking a second lock" {
+    const table =
+        \\1: FLOCK  ADVISORY  WRITE 4242 fd:01:131074 0 EOF
+        \\2: FLOCK  ADVISORY  READ  4243 fd:01:131075 0 EOF
+        \\3: POSIX  ADVISORY  WRITE 4244 fd:01:131076 0 EOF
+        \\4: FLOCK  ADVISORY  WRITE 4245 00:1f:9 0 EOF
+        \\
+    ;
+    try testing.expect(flockHeldIn(table, 0xfd, 1, 131074));
+    try testing.expect(!flockHeldIn(table, 0xfd, 1, 131075));
+    try testing.expect(!flockHeldIn(table, 0xfd, 1, 131076));
+    try testing.expect(flockHeldIn(table, 0, 0x1f, 9));
+    try testing.expect(!flockHeldIn(table, 0xfd, 2, 131074));
+    try testing.expect(!flockHeldIn("garbage\n\n: : :\n", 1, 1, 1));
+    // A real file: no lock, then our exclusive flock, then released.
+    const path = "/build/tmp/proc-flock-probe";
+    _ = linux.mkdir("/build/tmp", 0o755);
+    const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: linux.fd_t = @intCast(rc);
+    defer {
+        _ = linux.close(fd);
+        _ = linux.unlink(path);
+    }
+    try testing.expect(!writerFlockHeld(path));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB)));
+    try testing.expect(writerFlockHeld(path));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(fd, std.posix.LOCK.UN)));
+    try testing.expect(!writerFlockHeld(path));
 }
 
 test "/etc/nvme reads as empty when absent, never written" {

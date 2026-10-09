@@ -2099,6 +2099,151 @@ test "smoke: THE KILL ROWS (c) — `appender clear` refuses a live-mounted set; 
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const script = try matrixCreateScript(gpa);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("500\n", out);
+        const mk = try rig.onMount("mkdir a-tree && for i in 0 1 2 3; do printf 'a%s\\n' $i > a-tree/f$i; done; echo ok");
+        gpa.free(mk);
+    }
+    // C: `-o ro` of the LIVE set — a reader, never a claim.
+    const c = try Peer.init(rig, "c");
+    defer c.deinit();
+    try c.spawn(&.{ "-o", "ro" });
+    _ = try c.awaitReady();
+    {
+        const text = try c.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted as a READER") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "`-o ro` of a LIVE set — a member-reader of the home shard") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "TTLs attr 0 ms entry 0 ms dir_entry 0 ms negative 0 ms") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "writer claim committed") == null);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "appenders", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        // A reader holds no region: the directory still lists A and B alone.
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "2 appender page(s)") != null);
+    }
+    // C reads B's 2,000 files and A's tree under tokens.
+    {
+        const out = try c.onMount("ls b0 b1 b2 b3 | grep -c '^f'; cat b1/f7; cat a-tree/f2; ls a-tree | wc -l; echo x > b0/new 2>&1 || echo refused");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("2000\nb1-f7\na2\n4\nrefused\n", out);
+        const tc = try c.stats();
+        defer gpa.free(tc);
+        try testing.expect(std.mem.indexOf(u8, tc, "\"mount_posture\":\"reader\"") != null);
+        try testing.expect(std.mem.indexOf(u8, tc, "\"reader_arm\":\"tokens\"") != null);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tc, "\"reader_staleness_bound_ms\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tc, "\"dlm_token_local_reads\":"));
+        try testing.expect((numberAfter(tc, "\"dlm_token_grants\":") orelse 0) >= 2000);
+        try testing.expectEqual(@as(?u64, 2), numberAfter(tc, "\"dlm_token_reader_holder_planes\":"));
+        std.debug.print("\nsmoke: -o ro: C read B's 2,000 files and A's tree under tokens — grants {d}, hits {d}, local reads 0, holder planes 2, staleness bound 0 ms\n", .{ numberAfter(tc, "\"dlm_token_grants\":") orelse 0, numberAfter(tc, "\"dlm_token_hits\":") orelse 0 });
+    }
+    // B writes: the holder's recall reaches C's listener; C's next read
+    // is the fresh content (no TTL, no poll — the recall is the proof).
+    {
+        const w = try b.onMount("printf 'fresh\\n' > b1/f7");
+        gpa.free(w);
+        const out = try c.onMount("cat b1/f7");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("fresh\n", out);
+        const tc = try c.stats();
+        defer gpa.free(tc);
+        try testing.expect((numberAfter(tc, "\"dlm_token_recalls_received\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tc, "\"dlm_token_recall_timeouts_live\":"));
+    }
+    // The writers leave cleanly: C's lease lapses, no writer face stands,
+    // C becomes the quiescent reader of their last checkpoint.
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (true) {
+            const tc = try c.stats();
+            defer gpa.free(tc);
+            if (std.mem.indexOf(u8, tc, "\"reader_arm\":\"quiescent\"") != null) break;
+            if (clock.monotonicNs() >= deadline) return error.ReaderNeverQuiescent;
+            sleepMs(200);
+        }
+        const out = try c.onMount("cat b1/f7; ls b3 | wc -l; cat a-tree/f2");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("fresh\n500\na2\n", out);
+        const tc = try c.stats();
+        defer gpa.free(tc);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tc, "\"reader_quiescent_transitions\":"));
+        try testing.expect((numberAfter(tc, "\"dlm_token_local_reads\":") orelse 0) >= 1);
+        std.debug.print("smoke: -o ro: A and B left — C became the quiescent reader of their last checkpoint; every read local and fresh\n", .{});
+    }
+    // A mounts again: the quiescent reader's poll sees the writer and
+    // fail-stops — every op ESTALE, `.stats` still readable.
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (true) {
+            const tc = try c.stats();
+            defer gpa.free(tc);
+            if (std.mem.indexOf(u8, tc, "\"reader_fail_stopped\":true") != null) break;
+            if (clock.monotonicNs() >= deadline) return error.ReaderNeverFailStopped;
+            sleepMs(100);
+        }
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", "ls b3 2>&1; cat a-tree/f2 2>&1" }, .cwd = .{ .path = c.mp }, .environ_map = &rig.env });
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.stdout, "Stale file handle"));
+        const text = try c.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "a writer appeared (ledger_advance) under the quiescent reader — every metadata op now answers ESTALE") != null);
+        std.debug.print("smoke: -o ro: A mounted again — C fail-stopped (ESTALE on ls and cat; .stats readable)\n", .{});
+    }
+    // Remount C: a token reader of the live set again.
+    try c.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try c.waitExit());
+    const mark_c = try c.logLen();
+    try c.spawn(&.{ "-o", "ro" });
+    _ = try c.awaitLog("ready: ", mark_c, ready_wait_ns);
+    {
+        const out = try c.onMount("cat b1/f7; cat a-tree/f2");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("fresh\na2\n", out);
+        const tc = try c.stats();
+        defer gpa.free(tc);
+        try testing.expect(std.mem.indexOf(u8, tc, "\"reader_arm\":\"tokens\"") != null);
+        try expectMustStayZero(tc);
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"membership_members\":"));
+    }
+    try c.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try c.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: kill -9 mid-tar -x → remount replays the window → every file present is whole or empty, none acked is lost, nothing torn after the crash; a clean cycle after it" {
     const io = testing.io;
     if (!venueAvailable(io)) return error.SkipZigTest;

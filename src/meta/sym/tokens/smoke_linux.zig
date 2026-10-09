@@ -312,7 +312,7 @@ test "SMOKE: one real volume, two holder planes on its conveyor's A1½, one -o r
     try testing.expectEqual(@as(u64, 0), ttls.attr_ns);
     try testing.expectEqual(ro.ReaderArm.tokens, ro.armFor(true));
     var my_lease: ro.MemberLease = .{};
-    my_lease.renew(now);
+    my_lease.renew(now, table.T_OWNER_NS);
     var res: RoResolver = .{ .to_a = &r_to_a, .to_b = &r_to_b };
     var reader = divert.Divert.init(gpa, io, .{ .ctx = &res, .homeOf = &RoResolver.homeOf, .refresh = &RoResolver.refresh, .dial = &RoResolver.dial }, 7, 0, cache.RecallSink.none, my_lease.selfLease(), cache.recordsBudgetBytes(0));
     defer reader.deinit();

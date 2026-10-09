@@ -183,7 +183,12 @@ pub const MetaSet = struct {
         // winner is the manager of every volume it opens; a loser whose
         // volume carries the symmetric plane JOINS the live manager — of
         // every volume, through the same door (a set is never half-joined).
-        var posture: backend.Posture = .manager;
+        // A `-o ro` mount of a symmetric set is the READER of every volume
+        // (charter §5.5: a member-reader + token client, or the quiescent
+        // reader of the projection — never a writer claim); of a
+        // `--single-writer` set it is the writer door with the FUSE layer
+        // read-only (the single-writer class has no token plane).
+        var posture: backend.Posture = if (opts.read_only and owned[disc.order[0]].symmetric) .reader else .manager;
         for (disc.order, 0..) |oi, vi| {
             const be_opts: backend.OpenOptions = .{
                 .env = opts.env,
@@ -204,6 +209,7 @@ pub const MetaSet = struct {
                     break :blk try KvBackend.openJoined(gpa, io, paths[oi], be_opts, opts.join.?);
                 },
                 .joined => try KvBackend.openJoined(gpa, io, paths[oi], be_opts, opts.join.?),
+                .reader => try KvBackend.openReader(gpa, io, paths[oi], be_opts),
             };
             opened += 1;
         }
@@ -282,6 +288,11 @@ pub const MetaSet = struct {
 
     pub fn volumeCount(self: *const MetaSet) usize {
         return self.volumes.len;
+    }
+
+    /// A `-o ro` reader of a symmetric set: nothing here is ever written.
+    pub fn isReader(self: *const MetaSet) bool {
+        return self.posture == .reader;
     }
 
     // ---- routing ----
@@ -448,6 +459,7 @@ pub const MetaSet = struct {
 
     /// One full cycle with an immediate barrier on every member.
     pub fn checkpointNow(self: *MetaSet) checkpoint_cycle.CycleError!void {
+        if (self.posture == .reader) return;
         for (self.volumes) |be| try be.checkpointNow();
     }
 
@@ -539,6 +551,7 @@ pub const MetaSet = struct {
         var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
         const v: route_table.VolumeIndex = if (prefer_parent or self.volumes.len == 1) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
         if (v != parent_v) rstats.routing_mint_volume_picks.inc();
+        if (self.posture == .reader) return error.PartitionRefused;
         const parent_slot = route_table.slotOfEffective(parent_eff);
         const rr = self.slot_rr.fetchAdd(1, .monotonic);
         const slot = self.volumes[v].slots.mintSlot(parent_slot, v == parent_v, gather, rr) orelse self.rotors[v].pickSlot();
@@ -554,11 +567,13 @@ pub const MetaSet = struct {
     /// credit (charter §5.5 "`ops_h` counts the holder's namespace ops on
     /// the slot's SUBTREE"): bound on every member's plane.
     pub fn bindParentMemo(self: *MetaSet, memo: routing_slots.handover.ParentMemo) void {
+        if (self.posture == .reader) return;
         for (self.volumes) |be| be.slots.bindMemo(memo);
     }
 
     /// The one closed cutover slot across the members, if any.
     fn closedSlot(self: *MetaSet) ?u16 {
+        if (self.posture == .reader) return null;
         for (self.volumes) |be| if (be.slots.door.closedSlot()) |s| return s;
         return null;
     }
@@ -613,6 +628,12 @@ pub const MetaSet = struct {
         for (self.volumes, 0..) |be, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"index\":{d},\"epoch\":{d},\"hosted_slots\":{d},\"trees\":{d},\"native\":{},\"failed\":{},\"conveyor\":", .{ i, be.setEpoch(), be.stamp.hostedCount(), be.trees.load().len, be.stamp.native_slot != null, be.isFailed() });
+            if (be.isReader()) {
+                // A reader runs no conveyor and no checkpointer: the
+                // projection's checkpoint words stand in.
+                try w.print("null,\"checkpointer\":null,\"projection_seq\":{d},\"sym\":{{\"manager_lease\":\"reader\"}}}}", .{be.mounted.seq});
+                continue;
+            }
             try be.conveyorStats().writeJson(w);
             try w.writeAll(",\"checkpointer\":");
             try counters.writeFieldsJson(&be.cp, w);

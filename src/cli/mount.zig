@@ -78,6 +78,8 @@ const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const sym_xv = @import("../meta/sym/xv.zig");
 const sym_wire = @import("../meta/sym/wire_plane.zig");
+const sym_reader = @import("../meta/sym/reader_plane.zig");
+const ro_mount = @import("../meta/sym/tokens/ro_mount.zig");
 const wire_endpoint = @import("../wire/endpoint.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
@@ -292,6 +294,11 @@ fn mountMain(ctx: *Ctx) u8 {
     }) catch |e| return ctx.failed("cannot open metadata set {s}: {s} ({t}, {s})", .{ ctx.meta_uri, openReason(e), meta_set.openErrno(e), @tagName(errors.classOf(meta_set.openCoreError(e))) });
     var be_open = true;
     defer if (be_open) be.close();
+    // A READER of a symmetric set (charter §5.5): every kernel TTL derives
+    // to 0 — a cache may hold an entry exactly as long as the holder's
+    // recall proves it; an explicit `-o *_timeout` refuses naming the law.
+    const reader = be.isReader();
+    if (reader) ctx.opts.ttls = ro_mount.tokenReaderTtls(&ctx.opts) catch return ctx.failed("{s}: a `-o ro` reader's TTLs derive to 0 (see the log)", .{ctx.meta_uri});
 
     // 1b. The set config: the one control record, the stamp's set, the key
     //     gate on an encrypted set.
@@ -347,17 +354,32 @@ fn mountMain(ctx: *Ctx) u8 {
     defer op_trace.disarmTrace();
     // The cross-owner plane (charter §5.5): an op spanning two members or
     // two holders is ONE intent; the open intents roll forward here,
-    // before any request is served.
-    const xv_bound = sym_xv.set_bind.Bound.create(gpa, io, be, &fs.locks, env) catch return ctx.failed("out of memory (cross-owner plane)", .{});
-    defer xv_bound.destroy(gpa);
-    const rolled = fs.bindXv(&xv_bound.plane) catch |e| return ctx.failed("the cross-owner roll-forward at mount failed ({t})", .{e});
-    if (rolled != 0) log.info("mount: {d} open cross-owner intent(s) rolled forward before serving", .{rolled});
+    // before any request is served. A reader has no intents.
+    const xv_bound: ?*sym_xv.set_bind.Bound = if (reader) null else sym_xv.set_bind.Bound.create(gpa, io, be, &fs.locks, env) catch return ctx.failed("out of memory (cross-owner plane)", .{});
+    defer if (xv_bound) |xb| xb.destroy(gpa);
+    if (xv_bound) |xb| {
+        const rolled = fs.bindXv(&xb.plane) catch |e| return ctx.failed("the cross-owner roll-forward at mount failed ({t})", .{e});
+        if (rolled != 0) log.info("mount: {d} open cross-owner intent(s) rolled forward before serving", .{rolled});
+    }
+    // The READER's plane (charter §5.5 "`-o ro` mounts are member-readers
+    // + token clients … with NO live writer … the QUIESCENT reader"): the
+    // divert over every slot as foreign, or the projection with the
+    // fail-stop poll; the FUSE layer wraps the filesystem with the gate.
+    const rplane: ?*sym_reader.ReaderPlane = if (reader) sym_reader.ReaderPlane.start(gpa, io, be, env, facts.cpus, ctx.budget_bytes, ctx.mountpoint) catch |e| return ctx.failed("the reader plane could not arm: {s}", .{sym_reader.startReason(e)}) else null;
+    var rplane_live = true;
+    defer if (rplane_live) if (rplane) |rp| rp.stop();
+    if (rplane) |rp| {
+        fs.bindDivert(&rp.divert);
+        plane.bindForeignLayout(rp.foreignLayout());
+        vs.renderer.sources.reader = rp;
+        vs.renderer.sources.mount.wire_endpoint = rp.endpointText();
+    }
     // The cluster wire (charter §5.5, §5.7): this process won the D0
     // ladder of every volume it opened, so it is their MANAGER — ONE
     // listener serving the manager, membership, ledger, token and
     // cross-owner families, the endpoint published for the joiners. A
-    // `--single-writer` set arms no wire.
-    const wire = sym_wire.WirePlane.start(gpa, io, be, env, facts.cpus, ctx.budget_bytes, &xv_bound.plane, ctx.opts.read_only) catch |e| return ctx.failed("the cluster wire could not arm: {s}", .{sym_wire.startReason(e)});
+    // `--single-writer` set arms no wire; a reader's plane is above.
+    const wire: ?*sym_wire.WirePlane = if (xv_bound) |xb| sym_wire.WirePlane.start(gpa, io, be, env, facts.cpus, ctx.budget_bytes, &xb.plane, ctx.opts.read_only) catch |e| return ctx.failed("the cluster wire could not arm: {s}", .{sym_wire.startReason(e)}) else null;
     var wire_live = true;
     defer if (wire_live) if (wire) |wp| wp.stop();
     if (wire) |wp| {
@@ -368,7 +390,7 @@ fn mountMain(ctx: *Ctx) u8 {
         fs.bindDivert(&wp.divert);
         // The cross-owner plane's step sessions: a foreign holder's steps
         // ship over the wire plane's dialled links.
-        xv_bound.bindDialer(wp.peers.xvDialer());
+        xv_bound.?.bindDialer(wp.peers.xvDialer());
         // A foreign file's layout record comes off its holder's token.
         plane.bindForeignLayout(wp.foreignLayout());
         // The data planes' arms: the manager holds the allocation lease
@@ -377,12 +399,15 @@ fn mountMain(ctx: *Ctx) u8 {
         wp.bindDataPlanes(plane) catch |e| return ctx.failed("the data planes could not arm over the wire ({s}) — see the log", .{@errorName(e)});
     }
     // The corpse sweep (kv_fs module doc): what a crashed daemon's forgets
-    // left at nlink 0 is destroyed before any request is served.
-    _ = fs.sweepCorpsesAtMount() catch |e| return ctx.failed("the corpse sweep at mount failed ({t})", .{e});
+    // left at nlink 0 is destroyed before any request is served — a
+    // writer's duty; a reader destroys nothing.
+    if (!reader) _ = fs.sweepCorpsesAtMount() catch |e| return ctx.failed("the corpse sweep at mount failed ({t})", .{e});
     op_trace.arm(env);
+    var reader_gate: handler.reader_gate.ReaderGate = .{ .inner = filesystem.Filesystem.of(BackendFs, &fs), .gate = undefined };
+    if (rplane) |rp| reader_gate.gate = rp.gate();
     var binding: handler.ring.Binding = .{};
     binding.bind(.{
-        .fs = filesystem.Filesystem.of(BackendFs, &fs),
+        .fs = if (rplane != null) reader_gate.filesystem() else filesystem.Filesystem.of(BackendFs, &fs),
         .io = io,
         .registry = &registry,
         .guards = &guards,
@@ -429,6 +454,7 @@ fn mountMain(ctx: *Ctx) u8 {
         wp.sink.bindSession(seam);
         wp.record_svc.sink.kernel = .{ .ctx = seam.ctx, .invalInode = seam.invalInode, .prune = seam.prune };
     }
+    if (rplane) |rp| rp.sink.bindSession(session.tokenNotifySeam());
     // The zc legs: the held-slot direct store on a zero-copy session, the
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
@@ -466,10 +492,16 @@ fn mountMain(ctx: *Ctx) u8 {
     // at `plane.close` reads layouts; nothing may reach a stopped plane).
     if (wire) |wp| {
         plane.bindForeignLayout(null);
-        xv_bound.bindDialer(null);
+        xv_bound.?.bindDialer(null);
         wp.stop();
     }
     wire_live = false;
+    if (rplane) |rp| {
+        plane.bindForeignLayout(null);
+        rp.stop();
+    }
+    rplane_live = false;
+    vs.renderer.sources.reader = null;
     vs.renderer.sources.mount.wire_endpoint = "";
     vs.renderer.sources.wire = null;
     const failed = be.isFailed();

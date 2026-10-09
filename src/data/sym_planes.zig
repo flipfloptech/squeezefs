@@ -20,6 +20,7 @@
 //! writer's own unconsumed window.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const counters = @import("../core/counters.zig");
 
 pub const records = @import("sym_planes/records.zig");
@@ -32,6 +33,10 @@ pub const shared_index = @import("sym_planes/shared_index.zig");
 pub const clone_protocol = @import("sym_planes/clone_protocol.zig");
 pub const custody = @import("sym_planes/custody.zig");
 pub const wire_bind = @import("sym_planes/wire_bind.zig");
+/// The device-path arms over a mounted plane (Linux: the wire sessions).
+pub const plane_arm = if (builtin.os.tag == .linux) @import("sym_planes/plane_arm.zig") else struct {
+    pub const stats = struct {};
+};
 
 /// The `.stats` family: every module's instruments under its name (the
 /// generated writer — a counter declared is a counter exported).
@@ -46,6 +51,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         .{ "shared_index", shared_index.stats },
         .{ "clone_protocol", clone_protocol.stats },
         .{ "custody", custody.stats },
+        .{ "plane_arm", plane_arm.stats },
     }, 0..) |m, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":", .{m[0]});
@@ -74,6 +80,7 @@ test {
     _ = clone_protocol;
     _ = custody;
     _ = wire_bind;
+    _ = plane_arm;
 }
 
 test "the stats family names every module's instruments by the registry names" {

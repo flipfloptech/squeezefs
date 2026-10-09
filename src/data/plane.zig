@@ -377,6 +377,32 @@ pub const DataPlane = struct {
     meta_rr: Atomic(u64) = .init(0),
     /// `SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER` (0 = inert).
     crossing_kill_after: u32,
+    /// The token divert's layout face (bound by the daemon once the wire
+    /// plane is up; null = a flat mount: every slot local).
+    foreign_layout: ?ForeignLayout = null,
+
+    /// A foreign-slot layout record through the holder's token.
+    pub const ForeignLayout = struct {
+        ctx: *anyopaque,
+        lookup: *const fn (ctx: *anyopaque, gpa: Allocator, ino: u64) Error!Verdict,
+
+        pub const Verdict = union(enum) {
+            /// This mount's slot: read the store.
+            local,
+            /// Gone at its holder.
+            gone,
+            /// The token page: the inode's size and the carried `layout`
+            /// xattr's value when one is held (owned by `gpa`).
+            foreign: struct { size: u64, layout: ?[]u8 },
+        };
+    };
+
+    /// Bind (or, with null, unbind BEFORE the seam's owner goes) the
+    /// foreign-layout face; the dismount pass at `close` reads layouts
+    /// through it when bound.
+    pub fn bindForeignLayout(self: *DataPlane, f: ?ForeignLayout) void {
+        self.foreign_layout = f;
+    }
 
     // ---- open / close ----
 
@@ -1391,9 +1417,20 @@ pub const DataPlane = struct {
 
     /// The layout record of `ino`: the xattr chain at the layout name's
     /// hash, the record named `layout` (owned bytes) and its chain slot.
+    /// A FOREIGN slot's record comes under its holder's token (charter
+    /// §5.5: tokens are the ONLY foreign-read method; the grant carries
+    /// the carried xattrs, `layout` among them), never off this mount's
+    /// projection.
     const LayoutRecord = struct { value: []u8, coll_seq: u8 };
 
     pub fn layoutRecord(self: *DataPlane, ino: u64) Error!?LayoutRecord {
+        if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
+            .local => {},
+            .gone => return null,
+            // A token page's chain slot is the holder's; a foreign record
+            // is read, never republished from here (the publish ships).
+            .foreign => |x| return if (x.layout) |v| .{ .value = v, .coll_seq = 0 } else null,
+        };
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(self.gpa, &kvs);
         const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.hash_seed);
@@ -1410,6 +1447,14 @@ pub const DataPlane = struct {
     }
 
     fn inodeSize(self: *DataPlane, ino: u64) Error!?u64 {
+        if (self.foreign_layout) |f| switch (try f.lookup(f.ctx, self.gpa, ino)) {
+            .local => {},
+            .gone => return null,
+            .foreign => |x| {
+                if (x.layout) |v| self.gpa.free(v);
+                return x.size;
+            },
+        };
         const bytes = (self.backend.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return KvBackend.coreError(e)) orelse return null;
         defer self.gpa.free(bytes);
         const v = record.InodeValue.decode(bytes) catch return error.InputOutput;

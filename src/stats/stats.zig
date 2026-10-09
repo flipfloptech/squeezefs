@@ -155,6 +155,8 @@ pub const Sources = struct {
     sqz: if (is_linux) ?*sqz_io.SqzIo else ?*void = null,
     /// The metadata set (every member's per-volume families ride it).
     backend: if (is_linux) ?*meta_set.MetaSet else ?*void = null,
+    /// The cluster wire plane (the listener, the shard or the member).
+    wire: if (is_linux) ?*sym.wire_plane.WirePlane else ?*void = null,
     key_census: ?KeyCensus = null,
     /// The CPU ledger (+ its allocator) and an `Io` for the `/proc/self/
     /// task` walk; absent ⇒ zeros (every family stays present).
@@ -343,6 +345,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/sym/membership/fencing.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/membership/join_ladder.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/membership/volume_bind.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/data/sym_planes/plane_arm.zig", .by = "src/data/sym_planes.zig" },
 };
 
 comptime {
@@ -510,6 +513,10 @@ fn writeMeta(src: *Sources, w: *Writer) Error!void {
     try guard.writeStatsJson(w);
     try w.writeAll(",\"sym\":");
     try sym.writeStatsJson(w);
+    try w.writeAll(",\"wire_plane\":");
+    if (is_linux) {
+        if (src.wire) |wp| try wp.writeStatsJson(w) else try w.writeAll("{}");
+    } else try w.writeAll("{}");
     inline for (.{
         .{ "node_cache", node_cache.stats },       .{ "tree", tree.stats },            .{ "smo", smo.stats },
         .{ "leaf_merge", leaf_merge.stats },       .{ "alloc_ext", alloc_ext },        .{ "journal", journal },

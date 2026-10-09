@@ -34,6 +34,16 @@ every host. Linux-only modules (`src/io/*`, anything touching io_uring, /proc, /
 cgroups) compile their tests only on Linux — gate them in `src/squeezefs.zig` with
 `builtin.os.tag == .linux`, never with a stub.
 
+## Test data and disk
+
+`/build` (ext4 on the cache volume inside the VM) is where the gate's smoke runs: real block
+semantics, sparse files, fast. An external capacity disk is mounted at `/build/ext` when
+`SQZ_EXT_DIR` (default `/Volumes/512GB/sqz-tmp`) exists at `scripts/venue up`: HFS+ over USB
+through virtiofs — **no sparse files** (`truncate -s 8G` costs 8 GB), ~40 MB/s writes, reads
+served from the Mac's cache, so use it for capacity-class experiments by hand (large volumes,
+many files, io500/ior later), never for crash-consistency rows. `SQUEEZEFS_TEST_DATA_DIR`
+moves the smoke's data volumes + cache dir there. Run `scripts/venue trim` after big runs.
+
 ## Gate (per commit)
 
 `zig build gate` = `zig fmt --check` + unit tests + the static rails (`tests/rails.zig`:

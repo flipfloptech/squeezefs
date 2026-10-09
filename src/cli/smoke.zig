@@ -41,6 +41,7 @@ const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
+const knobs = @import("../core/knobs.zig");
 const json_scan = @import("../core/json_scan.zig");
 const handler = @import("../fuse/handler.zig");
 const status_verb = @import("status.zig");
@@ -118,6 +119,13 @@ const Rig = struct {
         errdefer gpa.destroy(self);
         const pid = linux.getpid();
         _ = linux.mkdir("/build/tmp", 0o755);
+        // The byte-heavy artifacts (data volumes, the cache dir) may live on a
+        // capacity-class disk; everything that needs the guest's real block
+        // semantics (the metadata volume, mountpoints, logs) stays on /build.
+        var proc_env = try std.testing.environ.createMap(gpa);
+        defer proc_env.deinit();
+        const data_dir: []const u8 = try gpa.dupe(u8, knobs.present(proc_env.get(data_dir_knob)) orelse "/build/tmp");
+        defer gpa.free(data_dir);
         var cwd_buf: [linux.PATH_MAX]u8 = undefined;
         const n = Io.Dir.cwd().realPath(io, &cwd_buf) catch return error.NoCwd;
         self.* = .{
@@ -131,15 +139,19 @@ const Rig = struct {
             .set_uri = try std.fmt.allocPrint(gpa, "sqmeta:///build/tmp/smoke-{d}/vol.img,/build/tmp/smoke-{d}/vol2.img", .{ pid, pid }),
             .mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/mnt-{d}", .{pid}, 0),
             .log_path = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/daemon.log", .{pid}, 0),
-            .d0 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/d0.img", .{pid}, 0),
-            .d1 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/d1.img", .{pid}, 0),
-            .cache = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/cache", .{pid}, 0),
-            .data_uri = try std.fmt.allocPrint(gpa, "sqdata:///build/tmp/smoke-{d}/d0.img,/build/tmp/smoke-{d}/d1.img", .{ pid, pid }),
+            .d0 = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}/d0.img", .{ data_dir, pid }, 0),
+            .d1 = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}/d1.img", .{ data_dir, pid }, 0),
+            .cache = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}/cache", .{ data_dir, pid }, 0),
+            .data_uri = try std.fmt.allocPrint(gpa, "sqdata://{s}/smoke-{d}/d0.img,{s}/smoke-{d}/d1.img", .{ data_dir, pid, data_dir, pid }),
             .image = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/smoke-{d}/image", .{pid}, 0),
             .env = std.process.Environ.Map.init(gpa),
         };
         try self.env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
         _ = linux.mkdir(self.work.ptr, 0o755);
+        // The data dir's per-run folder (equals `work` unless the seam moved it).
+        const data_work = try std.fmt.allocPrintSentinel(gpa, "{s}/smoke-{d}", .{ data_dir, pid }, 0);
+        defer gpa.free(data_work);
+        _ = linux.mkdir(data_work.ptr, 0o755);
         _ = linux.mkdir(self.mp.ptr, 0o755);
         // The supervisor outlives the invoking process by design and is
         // reaped by init; the venue's init (`sleep infinity`) reaps nothing,
@@ -2683,6 +2695,7 @@ const overwrites_unaligned: usize = 16;
 const overwrite_seed: u64 = 0x5151_4a4a_0404_2026;
 /// The looped single-stage repro's knob (`knobs.zig`, harness class).
 const smoke_loops_knob = "SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS";
+const data_dir_knob = "SQUEEZEFS_TEST_DATA_DIR";
 /// One looped pass's wall bound: the overwrite stage runs ~5 s, the storm
 /// ~15 s on the venue; a pass past this is a hang, killed and failed.
 const stage_loop_timeout_s: u32 = 300;

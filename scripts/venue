@@ -21,6 +21,10 @@ REF=${SQZ_REFERENCE:-"$HOME/Source/squeezefs"}
 CACHE_VOL=${SQZ_VENUE_CACHE_VOLUME:-squeezefs-zig-cache}
 CPUS=${SQZ_VENUE_CPUS:-8}
 MEM=${SQZ_VENUE_MEM:-16G}
+# Optional extra test-data disk (e.g. an external volume), mounted at /build/ext.
+# HFS+/exFAT volumes have NO sparse files: a `truncate -s 8G` costs 8 GB and the
+# bus's time there; keep /build (ext4 on the cache volume) for the fast smoke.
+EXT_DIR=${SQZ_EXT_DIR:-/Volumes/512GB/sqz-tmp}
 
 # ZIG_GLOBAL_CACHE_DIR is honoured by the compiler; --cache-dir is the build flag.
 # The install prefix is per venue: the repo (and so zig-out/) is shared with
@@ -41,8 +45,11 @@ up() {
   # CAP_SYS_ADMIN: the FUSE transport tests mount(2)/umount2 real EchoFs
   # mounts (rung 3) and write fuse.enable_uring; without it mount(2) is EPERM
   # and every e2e test skips its venue.
+  local ext_mount=()
+  if [ -d "$EXT_DIR" ]; then ext_mount=(--mount "type=virtiofs,source=$EXT_DIR,target=/build/ext"); fi
   container run -d --name "$NAME" -c "$CPUS" -m "$MEM" \
     --cap-add CAP_IPC_LOCK --cap-add CAP_SYS_ADMIN --ulimit memlock=-1:-1 \
+    "${ext_mount[@]}" \
     --mount "type=virtiofs,source=$REPO,target=$REPO" \
     --mount "type=virtiofs,source=$REF,target=$REF,readonly" \
     -v "$CACHE_VOL:/build" \

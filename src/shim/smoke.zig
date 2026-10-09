@@ -542,6 +542,10 @@ const CRows = struct {
                     return error.ServedRowFailed;
                 }
             } else {
+                // The baseline's own verdict is named (a kernel-served aio
+                // write that answers EIO on the plain mount is the daemon's
+                // row, not the shim's — 0002 row 351).
+                std.debug.print("\nshim smoke: {s} on {s} without the shim: {f}; {s}\n", .{ p.file, dir, base.term, if (std.mem.indexOf(u8, base.stderr, "FAIL")) |i| std.mem.trim(u8, base.stderr[i..@min(base.stderr.len, i + 80)], "\n") else "ok" });
                 // The law: the shim's passthrough is the baseline, byte for byte.
                 const same = std.meta.eql(base.term, pre.term) and std.mem.eql(u8, base.stdout, pre.stdout);
                 if (!same) {

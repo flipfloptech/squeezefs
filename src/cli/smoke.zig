@@ -112,6 +112,9 @@ const Rig = struct {
     log_file: ?Io.File = null,
     child: ?std.process.Child = null,
     child_pid: linux.pid_t = 0,
+    /// The test sent `kill -9` to the current child (the kill rows): a
+    /// SIGKILL death is then OURS; any other SIGKILL is a stray runner's.
+    killed: bool = false,
     env: std.process.Environ.Map,
 
     fn init(gpa: std.mem.Allocator, io: Io) !*Rig {
@@ -439,10 +442,24 @@ const Rig = struct {
         n += 1;
         self.child = try std.process.spawn(self.io, .{ .argv = argv[0..n], .environ_map = &self.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
         self.child_pid = self.child.?.id.?;
+        self.killed = false;
+        try writePidFile(self.io, self.work, "daemon", self.child_pid);
     }
 
     fn readLog(self: *Rig) ![]u8 {
         return Io.Dir.cwd().readFileAlloc(self.io, self.log_path, self.gpa, .limited(16 << 20));
+    }
+
+    /// The daemon the test expects alive IS alive — else its death is
+    /// judged: a SIGKILL the test never sent is a stray runner's sweep
+    /// (`pkill -9 -x squeezefs` from a concurrent gate), which SKIPS the
+    /// test loud rather than failing a contract nobody tested; any other
+    /// exit is the daemon's own and fails.
+    fn expectAlive(self: *Rig, waiting_for: []const u8) !void {
+        const c = self.child orelse return;
+        if (alive(c.id.?)) return;
+        const term = try self.waitChild();
+        return judgeDeath("A", term, self.killed, waiting_for, self.readLog() catch null, self.gpa);
     }
 
     /// Bounded poll for a substring in the log (counted from `from`).
@@ -452,16 +469,22 @@ const Rig = struct {
             const text = try self.readLog();
             defer self.gpa.free(text);
             if (text.len > from) if (std.mem.indexOf(u8, text[from..], needle)) |i| return from + i + needle.len;
-            if (self.child) |*c| if (!alive(c.id.?)) {
-                std.debug.print("\n--- the daemon exited while waiting for '{s}' ---\n{s}\n", .{ needle, text });
-                return error.DaemonExited;
-            };
+            try self.expectAlive(needle);
             if (clock.monotonicNs() >= deadline) {
                 std.debug.print("\n--- timed out waiting for '{s}' ---\n{s}\n", .{ needle, text });
                 return error.Timeout;
             }
             sleepMs(20);
         }
+    }
+
+    /// `kill -9` of the rig's daemon (the kill rows): the term is OURS, the
+    /// dead connection detached (a type-fuse mount gets no DESTROY).
+    fn kill(self: *Rig) !void {
+        self.killed = true;
+        _ = linux.kill(self.child_pid, .KILL);
+        try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try self.waitChild());
+        _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
     }
 
     fn awaitReady(self: *Rig, from: usize) !usize {
@@ -511,6 +534,34 @@ fn alive(pid: linux.pid_t) bool {
 fn sleepMs(ms: u64) void {
     const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
     _ = linux.nanosleep(&ts, null);
+}
+
+/// The per-test pid file beside the daemon's log (`<work>/<name>.pid`):
+/// the tag that tells THIS test's daemons from another runner's on a
+/// shared venue (a `pkill -9 -x squeezefs` sweep is read against it).
+fn writePidFile(io: Io, work: []const u8, name: []const u8, pid: linux.pid_t) !void {
+    var path_buf: [192]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.pid", .{ work, name });
+    var text: [16]u8 = undefined;
+    const f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, try std.fmt.bufPrint(&text, "{d}\n", .{pid}));
+}
+
+/// A daemon the test expected alive died: a SIGKILL the test never sent
+/// is a STRAY runner's sweep (a concurrent gate's `pkill -9 -x squeezefs`
+/// or `umount -l /build/tmp/mnt-*`) — the test SKIPS loud, naming it,
+/// rather than failing a contract the venue never exercised; any other
+/// term is the daemon's own death and fails. `log_text` (owned) is
+/// printed and freed.
+fn judgeDeath(name: []const u8, term: std.process.Child.Term, killed_by_us: bool, waiting_for: []const u8, log_text: ?[]u8, gpa: std.mem.Allocator) !void {
+    defer if (log_text) |t| gpa.free(t);
+    if (term == .signal and term.signal == .KILL and !killed_by_us) {
+        std.debug.print("\n--- EXTERNAL KILL: daemon {s} died of a SIGKILL this test never sent while waiting for '{s}' — a concurrent runner swept the venue (`pkill -9 -x squeezefs` / `umount -l`); the row is SKIPPED, not failed ---\n", .{ name, waiting_for });
+        return error.SkipZigTest;
+    }
+    std.debug.print("\n--- daemon {s} exited ({f}) while waiting for '{s}' ---\n{s}\n", .{ name, term, waiting_for, log_text orelse "" });
+    return error.DaemonExited;
 }
 
 /// Root, `/dev/fuse`, `CAP_SYS_ADMIN`, the binary beside us.
@@ -1311,6 +1362,8 @@ const Peer = struct {
     log_file: ?Io.File = null,
     child: ?std.process.Child = null,
     pid: linux.pid_t = 0,
+    /// The test sent `kill -9` to the current child (`Rig.killed`'s law).
+    killed: bool = false,
 
     fn init(rig: *Rig, name: []const u8) !*Peer {
         const gpa = rig.gpa;
@@ -1384,10 +1437,20 @@ const Peer = struct {
         n += 1;
         self.child = try std.process.spawn(rig.io, .{ .argv = argv[0..n], .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
         self.pid = self.child.?.id.?;
+        self.killed = false;
+        var tag_buf: [32]u8 = undefined;
+        try writePidFile(rig.io, rig.work, try std.fmt.bufPrint(&tag_buf, "daemon-{s}", .{self.name}), self.pid);
     }
 
     fn readLog(self: *Peer) ![]u8 {
         return Io.Dir.cwd().readFileAlloc(self.rig.io, self.log_path, self.rig.gpa, .limited(16 << 20));
+    }
+
+    /// `Rig.expectAlive`'s law for the peer.
+    fn expectAlive(self: *Peer, waiting_for: []const u8) !void {
+        if (self.child == null or alive(self.pid)) return;
+        const term = try self.waitExit();
+        return judgeDeath(self.name, term, self.killed, waiting_for, self.readLog() catch null, self.rig.gpa);
     }
 
     fn awaitLog(self: *Peer, needle: []const u8, from: usize, deadline_ns: u64) !usize {
@@ -1396,10 +1459,7 @@ const Peer = struct {
             const text = try self.readLog();
             defer self.rig.gpa.free(text);
             if (text.len > from) if (std.mem.indexOf(u8, text[from..], needle)) |i| return from + i + needle.len;
-            if (self.child != null and !alive(self.pid)) {
-                std.debug.print("\n--- daemon {s} exited while waiting for '{s}' ---\n{s}\n", .{ self.name, needle, text });
-                return error.DaemonExited;
-            }
+            try self.expectAlive(needle);
             if (clock.monotonicNs() >= deadline) {
                 std.debug.print("\n--- daemon {s}: timed out waiting for '{s}' ---\n{s}\n", .{ self.name, needle, text });
                 return error.Timeout;
@@ -1470,10 +1530,23 @@ const Peer = struct {
     /// `kill -9`: the daemon dies mid-flight, its dead connection is
     /// detached (a type-fuse mount gets no DESTROY).
     fn kill(self: *Peer) !void {
+        self.killed = true;
         _ = linux.kill(self.pid, .KILL);
         try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try self.waitExit());
         _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
         try testing.expectEqual(@as(usize, 0), try fuseMountsOf(self.rig.gpa, self.rig.io, self.mp));
+    }
+
+    /// SIGUSR1 → every stats family in the LOG; the tail from the mark
+    /// (owned): the stats of a daemon whose `.stats` path is behind a
+    /// foreign root (a parked joiner).
+    fn statsDump(self: *Peer) ![]u8 {
+        const mark = try self.logLen();
+        _ = linux.kill(self.pid, .USR1);
+        _ = try self.awaitLog("stats daemon: ", mark, 10 * std.time.ns_per_s);
+        const text = try self.readLog();
+        defer self.rig.gpa.free(text);
+        return self.rig.gpa.dupe(u8, text[mark..]);
     }
 
     /// The daemon's log length (a mark for `awaitLog`).
@@ -1767,6 +1840,7 @@ const kill_row_wait_ns: u64 = 60 * std.time.ns_per_s;
 fn awaitStats(host: anytype, pairs: []const struct { key: []const u8, want: u64 }, deadline_ns: u64) ![]u8 {
     const deadline = clock.monotonicNs() + deadline_ns;
     while (true) {
+        try host.expectAlive(if (pairs.len > 0) pairs[0].key else ".stats");
         const tail = (try host.statsTry()) orelse {
             if (clock.monotonicNs() >= deadline) return error.StatsUnreadable;
             sleepMs(200);
@@ -1790,6 +1864,89 @@ fn killRowTarSource(rig: *Rig) !void {
     try script.writer.print("rm -rf tree tree.tar && mkdir tree && i=0; while [ $i -lt {d} ]; do printf 't%s\\n' $i > tree/t$i; i=$((i + 1)); done; tar -cf tree.tar tree && echo ok", .{kill_row_tree_files});
     const out = try rig.shOk(rig.work, script.written());
     rig.gpa.free(out);
+}
+
+/// The files `tar -x` reported it could NOT open or write (`tar: tree/tN:
+/// Cannot open: …`, `… Cannot write: …`) — the UNACKED set: their create
+/// or write never returned to tar. Every other `tree/` entry tar touched
+/// was acked (a later `Cannot change mode`/`utime`/`close` is an op after
+/// the data's ack). Owned names.
+fn tarUnackedNames(gpa: std.mem.Allocator, tar_err: []const u8) !std.ArrayList([]const u8) {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |n| gpa.free(n);
+        out.deinit(gpa);
+    }
+    var it = std.mem.splitScalar(u8, tar_err, '\n');
+    while (it.next()) |line| {
+        const prefix = "tar: tree/";
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const rest = line[prefix.len..];
+        const colon = std.mem.indexOf(u8, rest, ": Cannot ") orelse continue;
+        const verb = rest[colon + ": Cannot ".len ..];
+        if (!std.mem.startsWith(u8, verb, "open") and !std.mem.startsWith(u8, verb, "write")) continue;
+        try out.append(gpa, try gpa.dupe(u8, rest[0..colon]));
+    }
+    return out;
+}
+
+fn freeNames(gpa: std.mem.Allocator, names: *std.ArrayList([]const u8)) void {
+    for (names.items) |n| gpa.free(n);
+    names.deinit(gpa);
+}
+
+fn namesContain(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// The charter's contract (§1.10 "zero acked loss") over the `tar -x` tree
+/// under `dir` on `host`: every file of the `kill_row_tree_files` tar was
+/// ACKED on — its open and write returned — is present and WHOLE (its
+/// body names it: `t17` holds `t17`); a file tar reported unacked may be
+/// absent, EMPTY (its create landed, its write never did) or whole (the
+/// write landed, the reply did not) — never torn otherwise. Answers the
+/// count of whole files.
+fn expectTreeAcked(host: anytype, dir: []const u8, unacked: []const []const u8) !usize {
+    const gpa = testing.allocator;
+    var script: std.Io.Writer.Allocating = .init(gpa);
+    defer script.deinit();
+    try script.writer.print("for f in {s}/*; do printf '%s\\t%s\\n' \"$(basename $f)\" \"$(cat $f)\"; done", .{dir});
+    const out = try host.onMount(script.written());
+    defer gpa.free(out);
+    var present: std.ArrayList([]const u8) = .empty;
+    defer present.deinit(gpa);
+    var whole: usize = 0;
+    var empty_unacked: usize = 0;
+    var bad: usize = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return error.Unparsed;
+        const name = line[0..tab];
+        const body = line[tab + 1 ..];
+        try present.append(gpa, name);
+        if (std.mem.eql(u8, body, name)) {
+            whole += 1;
+        } else if (body.len == 0 and namesContain(unacked, name)) {
+            empty_unacked += 1;
+        } else {
+            std.debug.print("\n--- {s}/{s}: body '{s}' ({s} by tar) — a torn or lost acked write ---\n", .{ dir, name, body, if (namesContain(unacked, name)) "unacked" else "ACKED" });
+            bad += 1;
+        }
+    }
+    // Every acked name is present (tar walks every entry; a name it did
+    // not report unacked was acked).
+    var name_buf: [16]u8 = undefined;
+    for (0..kill_row_tree_files) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "t{d}", .{i});
+        if (namesContain(present.items, name) or namesContain(unacked, name)) continue;
+        std.debug.print("\n--- {s}/{s}: ACKED by tar, absent on the mount — an acked create lost ---\n", .{ dir, name });
+        bad += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+    std.debug.print("smoke: kill rows (a): {s}: {d} whole, {d} empty unacked, {d} unacked by tar\n", .{ dir, whole, empty_unacked, unacked.len });
+    return whole;
 }
 
 /// Every file under `dir` on `host`'s mount is whole (its body names it:
@@ -1831,7 +1988,13 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
     const tar_path = try std.fmt.bufPrint(&tar_path_buf, "{s}/tree.tar", .{rig.work});
     var dest_buf: [160]u8 = undefined;
     const dest = try std.fmt.bufPrint(&dest_buf, "{s}/a-dir", .{b.mp});
-    var tar = try std.process.spawn(io, .{ .argv = &.{ "tar", "-xf", tar_path, "-C", dest }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    // tar's stderr IS the ack ledger: the files it could not open or write
+    // when B died are the unacked ones (read after the wait).
+    var tar_err_buf: [192]u8 = undefined;
+    const tar_err_path = try std.fmt.bufPrint(&tar_err_buf, "{s}/tar.err", .{rig.work});
+    const tar_err_file = try Io.Dir.cwd().createFile(io, tar_err_path, .{ .truncate = true });
+    defer tar_err_file.close(io);
+    var tar = try std.process.spawn(io, .{ .argv = &.{ "tar", "-xf", tar_path, "-C", dest }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .{ .file = tar_err_file } });
     var seen: usize = 0;
     {
         const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
@@ -1849,8 +2012,16 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
     }
     try testing.expect(seen >= kill_row_kill_after);
     try b.kill();
-    _ = try tar.wait(io);
-    std.debug.print("\nsmoke: kill rows (a): kill -9 B with {d} of {d} files visible\n", .{ seen, kill_row_tree_files });
+    const tar_term = try tar.wait(io);
+    const tar_err = try Io.Dir.cwd().readFileAlloc(io, tar_err_path, gpa, .limited(1 << 20));
+    defer gpa.free(tar_err);
+    var unacked = try tarUnackedNames(gpa, tar_err);
+    defer freeNames(gpa, &unacked);
+    // tar met the dead transport (exit 2, every later entry refused): a
+    // tar that finished clean never saw the kill.
+    try testing.expect(tar_term != .exited or tar_term.exited != 0);
+    try testing.expect(unacked.items.len > 0);
+    std.debug.print("\nsmoke: kill rows (a): kill -9 B with {d} of {d} files visible; tar {f}, {d} entries unacked\n", .{ seen, kill_row_tree_files, tar_term, unacked.items.len });
     // A: eviction at T_owner → the death recorded → acted → the region
     // recovered → released at the next tick.
     const t_kill = clock.monotonicNs();
@@ -1862,6 +2033,9 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
     try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_acted\":"));
     try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
     try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"appender_recovery_rollbacks\":"));
+    // No image B wrote is unreached (the census judges by content: a
+    // refill granted after B's last page write is returned unnamed, never
+    // an orphan).
     try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dead_appender_orphans\":"));
     try expectMustStayZero(ta);
     {
@@ -1873,10 +2047,10 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
         const row = std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,") orelse return error.PageMissing;
         try testing.expect(std.mem.indexOf(u8, r.stdout[row..], "\"state\":\"free\"") != null);
     }
-    // Every file B acked is whole on A (C8/C6: the body names the file).
-    const whole_a = try expectTreeWhole(rig, "a-dir/tree");
-    try testing.expect(whole_a >= seen);
-    std.debug.print("smoke: kill rows (a): A recovered B's region {d} ms after the kill — evictions 1, dead_members recorded 1 / acted 1, appender_recoveries 1, rollbacks 0, orphans 0, page free; {d} files whole on A (≥ the {d} seen)\n", .{ recovered_ms, whole_a, seen });
+    // Every file tar was acked on is whole on A (C8/C6: the body names the
+    // file); the unacked tail may be absent or empty, never torn.
+    const whole_a = try expectTreeAcked(rig, "a-dir/tree", unacked.items);
+    std.debug.print("smoke: kill rows (a): A recovered B's region {d} ms after the kill — evictions 1, dead_members recorded 1 / acted 1, appender_recoveries 1, rollbacks 0, orphans 0, unwritten grant returned {d}, page free; {d} files whole on A ({d} seen at the kill)\n", .{ recovered_ms, numberAfter(ta, "\"dead_appender_unwritten_returned\":") orelse 0, whole_a, seen });
     // The same-node successor: B again under the same node name.
     const mark_b = try b.logLen();
     try b.spawn(&.{});
@@ -1886,7 +2060,7 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
         defer gpa.free(text);
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "mounted JOINED as appender 1"));
     }
-    const whole_b = try expectTreeWhole(b, "a-dir/tree");
+    const whole_b = try expectTreeAcked(b, "a-dir/tree", unacked.items);
     try testing.expectEqual(whole_a, whole_b);
     // B's FIRST cross-owner op after the recovery: a mkdir under A's root.
     {
@@ -1948,10 +2122,22 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
         const mk = try b.onMount("mkdir storm");
         gpa.free(mk);
     }
+    // The storm runs WITH `storm` AS ITS CWD: every path it walks is B's
+    // own object. A path through A's ROOT (`storm/sN` from the mount
+    // root) revalidates the `storm` dentry against the root's holder
+    // every `dir_entry` TTL (1 s) — a foreign read that, uncached while A
+    // is dead, is the charter's typed EAGAIN, not the row's contract (the
+    // row pins B's OWN writes held at the gate; the finding is recorded
+    // in the evidence note). The storm's stderr names a refused op and
+    // its errno (read on failure).
     var storm_script: std.Io.Writer.Allocating = .init(gpa);
     defer storm_script.deinit();
-    try storm_script.writer.print("cd \"$1\" && i=0; while [ $i -lt {d} ]; do printf 's%s\\n' $i > storm/s$i || exit 1; i=$((i + 1)); done", .{kill_row_storm_files});
-    var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", storm_script.written(), "storm", b.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    try storm_script.writer.print("cd \"$1/storm\" && i=0; while [ $i -lt {d} ]; do printf 's%s\\n' $i > s$i || {{ echo \"storm: s$i refused (rc $?)\" >&2; exit 1; }}; i=$((i + 1)); done", .{kill_row_storm_files});
+    var storm_err_buf: [192]u8 = undefined;
+    const storm_err_path = try std.fmt.bufPrint(&storm_err_buf, "{s}/storm.err", .{rig.work});
+    const storm_err_file = try Io.Dir.cwd().createFile(io, storm_err_path, .{ .truncate = true });
+    defer storm_err_file.close(io);
+    var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", storm_script.written(), "storm", b.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .{ .file = storm_err_file } });
     var seen: usize = 0;
     {
         const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
@@ -1966,23 +2152,35 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
         }
     }
     try testing.expect(seen >= kill_row_kill_after);
-    _ = linux.kill(rig.child_pid, .KILL);
-    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
-    _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
+    // B's pool before the kill: sized by its measured SMO rate (charter
+    // §5.5), so the storm's claims through `T_self` never exhaust it
+    // while the manager cannot refill.
+    const tb_pre = try b.stats();
+    defer gpa.free(tb_pre);
+    try rig.kill();
     const t_kill = clock.monotonicNs();
-    std.debug.print("\nsmoke: kill rows (b): kill -9 A with {d} storm files visible on B\n", .{seen});
+    std.debug.print("\nsmoke: kill rows (b): kill -9 A with {d} storm files visible on B (B's pool: smo_ewma {d} milli/s, refills {d}, refill kicks {d}; B's tokens: grants {d}, hits {d}, cached {d}, recalls received {d})\n", .{ seen, numberAfter(tb_pre, "\"extent_grant_smo_ewma_milli_per_s\":") orelse 0, numberAfter(tb_pre, "\"extent_grant_refills\":") orelse 0, numberAfter(tb_pre, "\"extent_grant_refill_kicks\":") orelse 0, numberAfter(tb_pre, "\"dlm_token_grants\":") orelse 0, numberAfter(tb_pre, "\"dlm_token_hits\":") orelse 0, numberAfter(tb_pre, "\"dlm_token_cached\":") orelse 0, numberAfter(tb_pre, "\"dlm_token_recalls_received\":") orelse 0 });
     // B parks at T_self: the daemon's own word in its log (its `.stats`
     // is behind the kernel's revalidation of the root — a foreign object
     // whose holder is dead — until the successor stands), the storm's
-    // acks held, the storm child alive.
+    // acks held, the storm child alive — no op of the storm was answered
+    // `GrantExhausted` (EAGAIN) in the window before the park.
     const b_mark = try b.logLen();
     _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
     const parked_ms = (clock.monotonicNs() - t_kill) / std.time.ns_per_ms;
-    try testing.expect(alive(storm.id.?));
     {
         const text = try b.readLog();
         defer gpa.free(text);
         try testing.expect(std.mem.indexOf(u8, text[b_mark..], "POISONED") == null);
+        if (!alive(storm.id.?)) {
+            const term = try storm.wait(io);
+            const storm_err = try Io.Dir.cwd().readFileAlloc(io, storm_err_path, gpa, .limited(1 << 16));
+            defer gpa.free(storm_err);
+            const tb_now = try b.statsDump();
+            defer gpa.free(tb_now);
+            std.debug.print("\n--- the storm child exited ({f}) before B's park: an op was refused while the manager was unreachable ---\n{s}\nB: manager_dependency_stalls {d}, enospc refusals {d}, heap promised {d}; tokens: grants {d}, hits {d}, cached {d}, sheds {d}, recalls received {d}, serve refusals {d}, reprobes {d}, repoints {d}, channel_ok {d}\n{s}\n", .{ term, storm_err, numberAfter(tb_now, "\"manager_dependency_stalls\":") orelse 0, numberAfter(tb_now, "\"meta_kv_enospc_refusals\":") orelse 0, numberAfter(tb_now, "\"meta_kv_heap_promised\":") orelse 0, numberAfter(tb_now, "\"dlm_token_grants\":") orelse 0, numberAfter(tb_now, "\"dlm_token_hits\":") orelse 0, numberAfter(tb_now, "\"dlm_token_cached\":") orelse 0, numberAfter(tb_now, "\"dlm_token_sheds\":") orelse 0, numberAfter(tb_now, "\"dlm_token_recalls_received\":") orelse 0, numberAfter(tb_now, "\"dlm_token_serve_refusals\":") orelse 0, numberAfter(tb_now, "\"dlm_token_reader_channel_reprobes\":") orelse 0, numberAfter(tb_now, "\"dlm_token_holder_repoints\":") orelse 0, numberAfter(tb_now, "\"dlm_token_channel_ok\":") orelse 0, text[b_mark..] });
+            return error.StormRefusedBeforePark;
+        }
     }
     std.debug.print("smoke: kill rows (b): B PARKED {d} ms after the kill (acks held); the storm child is alive, waiting\n", .{parked_ms});
     // Remount A: the D0 ladder's same-host dead-pid proof; A wins volume
@@ -2043,6 +2241,9 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
         defer gpa.free(tb);
         try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"invariant_tripwires\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"appender_park_expiries\":"));
+        // The storm never met `GrantExhausted`: the pool held through the
+        // manager's absence (must-stay-0 at the sized grant).
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"manager_dependency_stalls\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"transport_requests_abandoned\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"open_count_stranded\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"joined_wire_words_rejected\":"));
@@ -3311,6 +3512,113 @@ test "smoke: the data plane WITHOUT a cache path — staging and the NVMe tier O
     const rig = try Rig.init(testing.allocator, io);
     defer rig.deinit();
     try dataPlanePass(rig, false);
+}
+
+/// Kernel aio (the raw `io_setup`/`io_submit`/`io_getevents` syscalls — no
+/// shim, no libaio) against `path` on a mount: `n` PWRITEs of one 4 KiB
+/// page each in ONE `io_submit` (offsets `0, 4 KiB, …`: a fresh file's
+/// inline → striped promotion under concurrent writes), every event's
+/// `res` the page, then `n` PREADs in one submit and a byte-exact
+/// read-back of every page. `oflags` extra open flags (`O_DIRECT` is the
+/// kernel's GUP/direct path through `fuse_direct_io`).
+fn kernelAioPass(path: [:0]const u8, n: usize, o_direct: bool) !void {
+    const aio = @import("../shim/aio.zig");
+    const page: usize = 4096;
+    var ctx: aio.io_context_t = 0;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(.io_setup, 32, @intFromPtr(&ctx))));
+    defer _ = linux.syscall1(.io_destroy, ctx);
+    var flags: linux.O = .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true };
+    if (o_direct) flags.DIRECT = true;
+    const rc = linux.open(path.ptr, flags, 0o644);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    const gpa = testing.allocator;
+    const wbuf = try gpa.alignedAlloc(u8, .fromByteUnits(page), n * page);
+    defer gpa.free(wbuf);
+    const rbuf = try gpa.alignedAlloc(u8, .fromByteUnits(page), n * page);
+    defer gpa.free(rbuf);
+    for (0..n) |i| @memset(wbuf[i * page ..][0..page], @as(u8, @intCast('a' + i)));
+    @memset(rbuf, 0);
+    const cbs = try gpa.alloc(aio.Iocb, n);
+    defer gpa.free(cbs);
+    const ptrs = try gpa.alloc(*aio.Iocb, n);
+    defer gpa.free(ptrs);
+    const evs = try gpa.alloc(aio.IoEvent, n);
+    defer gpa.free(evs);
+    for ([_]u16{ aio.IOCB_CMD_PWRITE, aio.IOCB_CMD_PREAD }) |op| {
+        for (cbs, 0..) |*cb, i| {
+            const buf = if (op == aio.IOCB_CMD_PWRITE) wbuf else rbuf;
+            cb.* = .{ .data = 100 + i, .key = 0, .aio_rw_flags = 0, .aio_lio_opcode = op, .aio_reqprio = 0, .aio_fildes = fd, .buf = @intFromPtr(buf.ptr + i * page), .nbytes = page, .offset = @intCast(i * page), .__pad3 = 0, .flags = 0, .resfd = 0 };
+            ptrs[i] = cb;
+        }
+        const submitted = linux.syscall3(.io_submit, ctx, n, @intFromPtr(ptrs.ptr));
+        try testing.expectEqual(n, submitted);
+        var got: usize = 0;
+        while (got < n) {
+            const ts: linux.timespec = .{ .sec = 30, .nsec = 0 };
+            const r = linux.syscall5(.io_getevents, ctx, 1, n - got, @intFromPtr(evs.ptr + got), @intFromPtr(&ts));
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(r));
+            try testing.expect(r > 0);
+            got += r;
+        }
+        for (evs) |ev| {
+            try testing.expect(ev.data >= 100 and ev.data < 100 + n);
+            if (ev.res != page) std.debug.print("\n--- kernel aio {s} on {s}: iocb {d} res {d} ({t}) ---\n", .{ if (op == aio.IOCB_CMD_PWRITE) "PWRITE" else "PREAD", path, ev.data - 100, ev.res, linux.errno(@as(usize, @bitCast(ev.res))) });
+            try testing.expectEqual(@as(i64, page), ev.res);
+        }
+    }
+    try testing.expectEqualSlices(u8, wbuf, rbuf);
+}
+
+/// The kernel-aio pass on a set WITH or WITHOUT a cache path: a fresh
+/// file, the same file again (`O_TRUNC` over an existing striped file), a
+/// fresh file under `O_DIRECT`; then the whole bytes read back through
+/// `cat | sha256sum` against the expected image.
+fn kernelAioStage(rig: *Rig, cache: bool) !void {
+    try rig.formatSet(cache);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const n: usize = 8;
+    var path_buf: [192]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/aio.bin", .{rig.mp}, 0);
+    try kernelAioPass(path, n, false);
+    try kernelAioPass(path, n, false);
+    var dpath_buf: [192]u8 = undefined;
+    const dpath = try std.fmt.bufPrintSentinel(&dpath_buf, "{s}/aio-direct.bin", .{rig.mp}, 0);
+    try kernelAioPass(dpath, n, true);
+    // From another process, through the kernel's read path: both files
+    // hash to the image the pass wrote (page i filled with 'a' + i).
+    var image: [8 * 4096]u8 = undefined;
+    for (0..n) |i| @memset(image[i * 4096 ..][0..4096], @as(u8, @intCast('a' + i)));
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&image, &digest, .{});
+    var want_buf: [160]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "{x}  aio.bin\n{x}  aio-direct.bin\n", .{ digest, digest });
+    const out = try rig.onMount("sha256sum aio.bin aio-direct.bin");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(want, out);
+    const tail = try rig.stats();
+    defer testing.allocator.free(tail);
+    try expectMustStayZero(tail);
+    std.debug.print("\nsmoke: kernel aio on the plain mount ({s} cache path): 3 passes × {d} PWRITE + {d} PREAD byte-exact (fresh, O_TRUNC over striped, O_DIRECT); write routing inline {d} / staged {d} / striped {d}, promotions {d}, held-slot stores {d}, extractions {d}\n", .{ if (cache) "with a" else "no", n, n, numberAfter(tail, "\"fuse_write_inline\":") orelse 0, numberAfter(tail, "\"fuse_write_staged\":") orelse 0, numberAfter(tail, "\"fuse_write_striped\":") orelse 0, numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0, numberAfter(tail, "\"held_stores\":") orelse 0, numberAfter(tail, "\"transport_zc_write_extractions\":") orelse 0 });
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PWRITEs into a fresh file (the inline → striped promotion under concurrent writes), again over the existing file, under O_DIRECT; every io_getevents res the page, byte-exact read-back — on a set WITHOUT a cache path (every write beyond inline striped) and WITH one" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    {
+        const rig = try Rig.init(testing.allocator, io);
+        defer rig.deinit();
+        try kernelAioStage(rig, false);
+    }
+    {
+        const rig = try Rig.init(testing.allocator, io);
+        defer rig.deinit();
+        try kernelAioStage(rig, true);
+    }
 }
 
 // The looped single-stage repro (`SQUEEZEFS_TEST_SMOKE_STAGE_LOOPS=N`):

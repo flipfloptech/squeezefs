@@ -1,0 +1,749 @@
+//! The JOINED appender's symmetric plane (Linux; charter §5.7 "a later RW
+//! mount JOINS it (`JoinAppender` over the wire presenting its own `(node,
+//! mount_slot)` identity)"; §5.5 "Appenders", "Extent grants", "The
+//! record-seq space is monotone across rings", PARK-AND-RECLAIM;
+//! `docs/porting/sym_wire_membership_recovery.md` §5.2 the joined door;
+//! `sym_appenders_manager.md` §2.5 what a checkpoint writes into the
+//! page, §3.1 the joiner's side): what a second `squeezefs mount` of a
+//! symmetric set holds beside its `KvBackend` — the counterpart of
+//! `bind.AppenderSet` for a mount that did NOT win the D0 ladder.
+//!
+//! The joined door, in order (the spec's step table): no flock (the claim
+//! IS the join: the manager's `JoinAppender` + the member row); the
+//! manager's endpoint and the set's `job:enroll` secret read off tree 0's
+//! checkpointed projection BEFORE any wire is held; ONE dialled session to
+//! the manager (`SharedLink`: a thread-safe link any thread calls, a
+//! `redial` any failed verb sets); `JoinAppender` → the region (ring
+//! segments, the seq continuation, the node-seq incarnation) from the
+//! REPLY's words — the RAM grant from the reply's grant word, never the
+//! page read; `AcquireSlots(M)` → the rotor; the extent-grant POOL as a
+//! grant MIRROR allocator (every extent of the volume claimed except the
+//! granted runs: SMOs and mints draw from it, retired images recycle into
+//! it on the joiner's OWN tail, the refill at 50 % and the surplus return
+//! at the quiet cadence ride the cycle); the checkpoint writes the PAGE
+//! as its ledger record (`checkpoint_cycle.Deps.ledger = null`) under the
+//! directory-first law — roots, cursors, `ckpt_seq`, `ledger_tail_seq`,
+//! the pool's largest runs; never the fixed ledger, the bitmap, tree 0 or
+//! page 0. A clean `umount` releases every lease over the wire (words +
+//! leaf tails), writes the page naming no slot, drains the ring at a
+//! fixpoint cycle and leaves (`LeaveAppender` → the page Free).
+//!
+//! `writers_known` for `M` is the directory census at the join (Live pages
+//! + this one): the joiner sees no manager RAM word.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+
+const counters = @import("../../core/counters.zig");
+const clock = @import("../../core/clock.zig");
+const log = @import("../../core/log.zig");
+const knobs = @import("../../core/knobs.zig");
+const errors = @import("../../core/errors.zig");
+const checksum = @import("../../core/checksum.zig");
+const backend = @import("../backend.zig");
+const key = @import("../key.zig");
+const ledger = @import("../ledger.zig");
+const node_seq = @import("../node_seq.zig");
+const checkpoint_cycle = @import("../checkpoint_cycle.zig");
+const claim = @import("../guard/claim.zig");
+const proc = @import("../guard/proc.zig");
+const sym = @import("../sym.zig");
+const page = @import("appender_page.zig");
+const dir = @import("appender_dir.zig");
+const region = @import("region.zig");
+const grant = @import("extent_grant.zig");
+const join = @import("join.zig");
+const manager = @import("manager.zig");
+const cr = @import("control_records.zig");
+const slots = @import("slots.zig");
+const join_ladder = @import("membership/join_ladder.zig");
+const shard = @import("membership/shard.zig");
+const park = @import("membership/park_reclaim.zig");
+const wire_auth = @import("../../wire/auth.zig");
+const dialer = @import("../../wire/dialer.zig");
+const endpoint = @import("../../wire/endpoint.zig");
+const verbs = @import("../../wire/verbs.zig");
+
+comptime {
+    if (builtin.os.tag != .linux) @compileError("sym/joined is Linux only (charter §1.2); gate the import on builtin.os.tag");
+}
+
+const KvBackend = backend.KvBackend;
+
+pub const stats = struct {
+    /// Volumes this process holds as a JOINED appender.
+    pub var joined_volumes: counters.Gauge = .{};
+    /// The pool's words (closure `granted ≡ held + unclaimed + returned`
+    /// read off the mirror; the identity is asserted at every refill).
+    pub var extent_grant_refills: counters.ShardedCounter = .{};
+    pub var extent_grant_returns: counters.ShardedCounter = .{};
+    pub var extent_grant_closure_violations: counters.Tripwire = .init("extent_grant_closure_violations");
+    /// The manager's endpoint was not yet published when the joiner read
+    /// tree 0: one bounded re-read of the projection per poll.
+    pub var joined_endpoint_polls: counters.ShardedCounter = .{};
+    /// Leases released over the wire at the clean leave.
+    pub var joined_leave_releases: counters.ShardedCounter = .{};
+};
+
+/// `mount_slot` of a joiner (charter §5.7 "a remount at another mount
+/// point is a same-node successor": the slot derives from the mount
+/// point): bit 31 set so it never collides with a manager's slot — the
+/// manager's is its lane index (< 65,536) — then the mount point's hash.
+pub const JOINER_MOUNT_SLOT_BIT: u32 = 1 << 31;
+
+pub fn joinerMountSlot(mountpoint: []const u8) u32 {
+    return JOINER_MOUNT_SLOT_BIT | (@as(u32, @truncate(checksum.xxh3(mountpoint))) & (JOINER_MOUNT_SLOT_BIT - 1));
+}
+
+/// How long a joiner polls the projection for the manager's endpoint
+/// record: three checkpoint cadences (the record is a ring-0 control
+/// entry the manager's next cycle lands; the joiner has no ring replay).
+pub const ENDPOINT_POLL_MAX_MS: u64 = 3 * @import("../checkpoint.zig").CHECKPOINT_MAX_AGE_MS;
+pub const ENDPOINT_POLL_STEP_MS: u64 = 100;
+
+/// The grant mirror's compaction reserve: one split's two images — the
+/// joiner's SMO floor under the smallest pool (8 + M); the manager's
+/// refill is the pool's liveness, so the heap law's 2 % reserve (sized to
+/// a whole heap) would starve a 12-extent pool.
+pub const MIRROR_RESERVE_EXTENTS: u64 = 2;
+
+/// A wire reply's widest frame (the dialer's cap).
+pub const REPLY_CAP: usize = 1 << 16;
+
+pub const OpenError = error{
+    /// No manager endpoint published on tree 0 within the poll bound (and
+    /// none given): the D0 winner has not armed its wire yet, or died.
+    ManagerUnreachable,
+    /// The manager named the volume count as the lever.
+    Capacity,
+    /// A `Joined` word failed the screen, or the wire schema refused.
+    Rejected,
+    /// This mount slot's previous incarnation is Live and unrecovered:
+    /// its ring is the recovery driver's before a rejoin may replay it.
+    PredecessorLive,
+    Io,
+    Corrupt,
+    OutOfMemory,
+};
+
+// ---------------------------------------------------------------------------
+// The shared link: one dialled session, any thread.
+// ---------------------------------------------------------------------------
+
+/// A thread-safe `Link` over ONE dialled session to a peer: the reply
+/// lands in the calling thread's own buffer (valid until that thread's
+/// next call — the `TcpLink` contract per thread), the mux multiplexes the
+/// calls, a poisoned mux is replaced under the lock and retired (never
+/// freed under a caller still reading its cell).
+pub const SharedLink = struct {
+    gpa: Allocator,
+    io: Io,
+    ep: endpoint.EndpointWire,
+    secret: wire_auth.Secret,
+    identity: verbs.WireIdentity,
+    lock: Io.Mutex = .init,
+    mux: ?*dialer.Mux = null,
+    retired: std.ArrayList(*dialer.Mux) = .empty,
+
+    threadlocal var reply_buf: [REPLY_CAP]u8 = undefined;
+
+    pub fn init(gpa: Allocator, io: Io, ep: endpoint.EndpointWire, secret: wire_auth.Secret, identity: verbs.WireIdentity) SharedLink {
+        return .{ .gpa = gpa, .io = io, .ep = ep, .secret = secret, .identity = identity };
+    }
+
+    pub fn deinit(self: *SharedLink) void {
+        if (self.mux) |m| m.close();
+        self.mux = null;
+        for (self.retired.items) |m| m.close();
+        self.retired.deinit(self.gpa);
+    }
+
+    /// Re-point at a moved listener: the next call dials `ep`.
+    pub fn repoint(self: *SharedLink, ep: endpoint.EndpointWire) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.ep = ep;
+        if (self.mux) |m| {
+            self.retired.append(self.gpa, m) catch m.close();
+            self.mux = null;
+        }
+    }
+
+    fn ensure(self: *SharedLink) errors.Error!*dialer.Mux {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        if (self.mux) |m| {
+            if (!m.isPoisoned()) return m;
+            self.retired.append(self.gpa, m) catch m.close();
+            self.mux = null;
+            @import("../../wire/stats.zig").cluster_wire_reconnects.inc();
+        }
+        const peer_id = self.identity.peerId();
+        const m = try dialer.connect(self.gpa, self.io, self.ep, &self.secret, &peer_id);
+        self.mux = m;
+        return m;
+    }
+
+    pub fn call(self: *SharedLink, req: verbs.Request) errors.Error!verbs.Reply {
+        const m = try self.ensure();
+        return m.callTyped(req, &reply_buf);
+    }
+
+    pub fn callFn(ctx: *anyopaque, req: verbs.Request) errors.Error!verbs.Reply {
+        const self: *SharedLink = @ptrCast(@alignCast(ctx));
+        return self.call(req);
+    }
+
+    pub fn link(self: *SharedLink) shard.Link {
+        return .{ .ctx = self, .call = &callFn };
+    }
+
+    pub fn tokenLink(self: *SharedLink) sym.tokens.cache.Link {
+        return .{ .ctx = self, .call = &callFn };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The joined set.
+// ---------------------------------------------------------------------------
+
+/// What the backend reads off the join to stand its ring and allocator up.
+pub const Standing = struct {
+    appender_id: u32,
+    ring_layout: @import("../journal.zig").RingLayout,
+    geo: @import("../journal_core.zig").CoreGeometry,
+    head_pos: u64,
+    tail_pos: u64,
+    seq_offset: u64,
+    ckpt_seq: u64,
+    seq: node_seq.NodeSeqHandle,
+    /// The pool as granted, extent indices.
+    granted: []const @import("../alloc_ext.zig").ExtentAllocator.GrantedRun,
+};
+
+pub const JoinedSet = struct {
+    gpa: Allocator,
+    be: *KvBackend,
+    identity: page.Identity,
+    wire_identity: verbs.WireIdentity,
+    /// The manager's identity as appender 0's page carried it at the join
+    /// (its member id, its token client id).
+    manager_identity: verbs.WireIdentity,
+    /// The mount point (the member row's `mount`).
+    mountpoint: []u8,
+    secret: wire_auth.Secret,
+    manager_ep: endpoint.EndpointWire,
+    link: SharedLink,
+    wire: join_ladder.ManagerWire,
+    joiner: join_ladder.Joiner,
+    /// Live pages on the directory at the join (other appenders) + 1.
+    writers_known: u64,
+    /// The mint-slot count the arm granted (`M`).
+    m: u64 = 0,
+    /// Extent indices granted since the join (every run absorbed) and
+    /// returned to the manager — the closure's two census words; `held`
+    /// and `unclaimed` are read off the mirror.
+    granted: u64 = 0,
+    returned: u64 = 0,
+    granted_bits: std.DynamicBitSetUnmanaged,
+    pool_lock: Io.Mutex = .init,
+    /// The last page write's words (for `.stats`).
+    tail_written: u64 = 0,
+    entries: u64 = 0,
+    left: bool = false,
+    /// The park-and-reclaim gate (charter §5.5 "A manager's death is its
+    /// home shard's outage"): the conveyor's pre-admission gate; the
+    /// member's `T_self` action parks it, the reclaim releases it,
+    /// `T_park_max` expires it. Armed here with the env-derived clocks; the
+    /// membership grant's `T_owner` refines `t_park_max_ms`.
+    park_gate: park.ParkGate,
+
+    /// The joined door (module doc): the census, the endpoint and the
+    /// secret off the projection, the dial, `JoinAppender`. The region's
+    /// words are read through `standing()`; the slots through
+    /// `acquireRotor`. Nothing of the backend's ring exists yet.
+    pub fn open(be: *KvBackend, mountpoint: []const u8, explicit_ep: ?endpoint.EndpointWire) OpenError!*JoinedSet {
+        const gpa = be.gpa;
+        const self = try gpa.create(JoinedSet);
+        errdefer gpa.destroy(self);
+        const local = proc.localIdentity();
+        const mount_slot = joinerMountSlot(mountpoint);
+        const identity = join.identityFor(local, mount_slot);
+        const wire_identity: verbs.WireIdentity = .{ .node_token = identity.node_token, .writer_id = identity.writer_id, .mount_slot = identity.mount_slot, .reserved = 0 };
+        // 1. The census: `writers_known`, a Live page under THIS mount slot
+        // (a predecessor's unrecovered ring), the manager's identity off
+        // appender 0's page.
+        var writers_known: u64 = 1;
+        var own_live: ?page.Page = null;
+        try self.census(be, identity, &writers_known, &own_live);
+        if (own_live) |p| {
+            log.err("meta volume {s}: appender {d} (term {d}) is LIVE on the directory under this mount point's identity — a previous incarnation's ring is unrecovered; the recovery ladder recovers it before a rejoin may replay it", .{ be.path, p.appender_id, p.term });
+            return error.PredecessorLive;
+        }
+        const page0 = (try readAppender0(gpa, be)) orelse {
+            log.err("meta volume {s}: appender 0's page is blank — no manager has ever mounted this volume; the D0 ladder is the first writer's", .{be.path});
+            return error.ManagerUnreachable;
+        };
+        if (page0.state != .live) {
+            log.err("meta volume {s}: appender 0's page is {s} — no live manager to join; the D0 ladder is this mount's", .{ be.path, @tagName(page0.state) });
+            return error.ManagerUnreachable;
+        }
+        // 2. The secret and the manager's endpoint off tree 0's projection.
+        const secret = (try readControl(gpa, be, wire_auth.ENROLL_KEY, wire_auth.Secret, wire_auth.decodeEnroll)) orelse {
+            log.err("meta volume {s}: tree 0 carries no decodable job:enroll record — formatted before the cluster wire existed; reformat", .{be.path});
+            return error.Corrupt;
+        };
+        const ep = explicit_ep orelse try awaitManagerEndpoint(gpa, be);
+        const owned_mp = try gpa.dupe(u8, mountpoint);
+        errdefer gpa.free(owned_mp);
+        self.* = .{
+            .gpa = gpa,
+            .be = be,
+            .identity = identity,
+            .wire_identity = wire_identity,
+            .manager_identity = .{ .node_token = page0.identity.node_token, .writer_id = page0.identity.writer_id, .mount_slot = page0.identity.mount_slot, .reserved = 0 },
+            .mountpoint = owned_mp,
+            .secret = secret,
+            .manager_ep = ep,
+            .link = SharedLink.init(gpa, be.io, ep, secret, wire_identity),
+            .wire = undefined,
+            .joiner = undefined,
+            .writers_known = writers_known,
+            .granted_bits = .{},
+            .park_gate = park.ParkGate.arm(be.io, be.stamp.member_position, park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(shard.tOwnerMsFromEnv(be.env)))),
+        };
+        errdefer self.link.deinit();
+        self.granted_bits = std.DynamicBitSetUnmanaged.initEmpty(gpa, be.sb.totalExtents()) catch return error.OutOfMemory;
+        errdefer self.granted_bits.deinit(gpa);
+        self.wire = .{ .gpa = gpa, .link = self.link.link(), .volume = be.index, .identity = wire_identity, .pages = .{ .ctx = self, .read = &readPageFn } };
+        self.joiner = join_ladder.Joiner.init(gpa, &self.wire);
+        errdefer self.joiner.deinit();
+        // 3. Rung 5: the region over the wire.
+        self.joiner.joinRegion(.{
+            .identity = identity,
+            .ring_want_bytes = try ringAsk(be),
+            .home_volume = be.stamp.member_position,
+            .volume_base = node_seq.nodeSeqBase(be.sb.uuid),
+            .grain = be.dev.mode.grain(),
+            .ring0_head = be.mounted.journal_tail_seq,
+        }) catch |e| return switch (e) {
+            error.Capacity => blk: {
+                log.err("meta volume {s}: JoinAppender refused for capacity — the lever is the metadata volume COUNT", .{be.path});
+                break :blk error.Capacity;
+            },
+            error.Rejected => error.Rejected,
+            error.Deferred, error.Io => error.Io,
+            error.Corrupt => error.Corrupt,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        const jr = &self.joiner.region.?;
+        for (jr.grant.unclaimed.items) |e| {
+            self.granted_bits.set(@intCast(e));
+            self.granted += 1;
+        }
+        stats.joined_volumes.add(1);
+        sym.stats.appenders_live.add(1);
+        log.info("meta volume {s}: JOINED as appender {d} (term {d}, node 0x{x}, mount slot 0x{x}) at {f}: ring {d} B in {d} segment(s), head {d}, grant {d} extent(s), incarnation base {x}; {d} writer(s) known", .{ be.path, jr.appenderId(), jr.core.page.term, identity.node_token, identity.mount_slot, ep, jr.core.ringBytes(), jr.core.table.len, jr.core.core.headPos(), self.granted, jr.seq.load(), writers_known });
+        return self;
+    }
+
+    pub fn deinit(self: *JoinedSet) void {
+        self.joiner.deinit();
+        self.link.deinit();
+        self.granted_bits.deinit(self.gpa);
+        self.gpa.free(self.mountpoint);
+        stats.joined_volumes.sub(1);
+        sym.stats.appenders_live.sub(1);
+        self.gpa.destroy(self);
+    }
+
+    pub fn appenderId(self: *const JoinedSet) u32 {
+        return self.joiner.region.?.appenderId();
+    }
+
+    pub fn core(self: *JoinedSet) *region.RegionCore {
+        return &self.joiner.region.?.core;
+    }
+
+    /// The region's words the backend stands its ring and allocator on.
+    pub fn standing(self: *JoinedSet) Allocator.Error!Standing {
+        const jr = &self.joiner.region.?;
+        var runs: std.ArrayList(grant.GrantRun) = .empty;
+        defer runs.deinit(self.gpa);
+        try jr.grant.unclaimedRuns(self.gpa, &runs);
+        const granted = try self.gpa.alloc(@import("../alloc_ext.zig").ExtentAllocator.GrantedRun, runs.items.len);
+        for (runs.items, granted) |r, *g| g.* = .{ .start = r.start, .len = r.len };
+        return .{
+            .appender_id = jr.appenderId(),
+            .ring_layout = jr.core.ring_layout,
+            .geo = jr.core.geo,
+            .head_pos = jr.core.core.headPos(),
+            .tail_pos = jr.core.page.ledger_tail_seq,
+            .seq_offset = jr.core.page.seq_offset,
+            .ckpt_seq = jr.core.page.ckpt_seq,
+            .seq = jr.seq,
+            .granted = granted,
+        };
+    }
+
+    /// Rung 6: `M` rotor slots over the wire (the grants are the plane's
+    /// to install; owned by the caller).
+    pub fn acquireRotor(self: *JoinedSet) errors.Error![]const join_ladder.ManagerWire.SlotGrant {
+        self.m = slots.acquire.resolveMintSlots(knobs.optIntKnob("SQUEEZEFS_SYM_MINT_SLOTS", u64, self.be.env), self.writers_known);
+        _ = try self.joiner.acquireRotor(@intCast(@min(self.m, std.math.maxInt(u16))));
+        return self.joiner.leased.items;
+    }
+
+    // ---- the census ----
+
+    fn census(self: *JoinedSet, be: *KvBackend, identity: page.Identity, writers_known: *u64, own_live: *?page.Page) OpenError!void {
+        _ = self;
+        var links: std.ArrayList(dir.Link) = .empty;
+        defer links.deinit(be.gpa);
+        var reader_ctx: DevicePages = .{ .be = be };
+        const reader: dir.PageReader = .{ .ctx = &reader_ctx, .read = &DevicePages.read };
+        dir.walkChain(be.gpa, reader, .{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, be.sb.node_size, .{ .start = be.sb.heap.start, .len = be.sb.heap.len }, be.sb.totalExtents(), &links) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            error.Corrupt => blk: {
+                log.err("meta volume {s}: the appender directory chain does not verify — refusing the join", .{be.path});
+                break :blk error.Corrupt;
+            },
+        };
+        for (links.items) |l| {
+            var pair: u32 = 0;
+            while (pair < l.header.pairs) : (pair += 1) {
+                const imgs = dir.readPair(reader, l, pair) catch return error.Io;
+                if (imgs.foreign) return error.Corrupt;
+                const p = imgs.newest() orelse continue;
+                if (p.state != .live) continue;
+                writers_known.* += 1;
+                if (p.identity.sameMount(identity)) own_live.* = p;
+            }
+        }
+        // Appender 0 (the manager) is Live by definition of a joined open;
+        // the directory holds appenders ≥ 1, so it is counted here.
+        writers_known.* += 1;
+    }
+
+    const DevicePages = struct {
+        be: *KvBackend,
+
+        fn read(ctx: *anyopaque, offset: u64, out: *[page.PAGE_LEN]u8) error{Io}!void {
+            const self: *DevicePages = @ptrCast(@alignCast(ctx));
+            const img = self.be.dev.readRange(self.be.gpa, offset, page.PAGE_LEN) catch return error.Io;
+            defer self.be.gpa.free(img);
+            @memcpy(out, img[0..page.PAGE_LEN]);
+        }
+    };
+
+    fn readPageFn(ctx: *anyopaque, offset: u64, out: *[page.PAGE_LEN]u8) error{Io}!void {
+        const self: *JoinedSet = @ptrCast(@alignCast(ctx));
+        var pages: DevicePages = .{ .be = self.be };
+        return DevicePages.read(&pages, offset, out);
+    }
+
+    /// `SQUEEZEFS_SYM_RING_KB`: explicit wins inside the volume's ceiling
+    /// and refuses above it; absent = 0 = the manager derives.
+    fn ringAsk(be: *KvBackend) OpenError!u64 {
+        const kib = knobs.optIntKnob("SQUEEZEFS_SYM_RING_KB", u64, be.env) orelse return 0;
+        return region.ringBytesExplicit(kib, be.sb.volume_len) catch {
+            log.err("meta volume {s}: SQUEEZEFS_SYM_RING_KB={d} is above this volume's ring ceiling of {d} bytes — refusing the join", .{ be.path, kib, region.ringCeiling(be.sb.volume_len) });
+            return error.Rejected;
+        };
+    }
+
+    // ---- the pool: the grant mirror's census, the refill, the return ----
+
+    /// The pool's unclaimed runs as extent indices (granted ∧ free in the
+    /// mirror), coalesced ascending.
+    pub fn unclaimedRuns(self: *JoinedSet, out: *std.ArrayList(grant.GrantRun)) Allocator.Error!void {
+        var it = self.granted_bits.iterator(.{});
+        while (it.next()) |idx| {
+            if (self.be.alloc.isAllocated(idx)) continue;
+            if (out.items.len > 0 and out.items[out.items.len - 1].end() == idx) {
+                out.items[out.items.len - 1].len += 1;
+            } else try out.append(self.gpa, .{ .start = idx, .len = 1 });
+        }
+    }
+
+    fn unclaimedCount(self: *JoinedSet) u64 {
+        var n: u64 = 0;
+        var it = self.granted_bits.iterator(.{});
+        while (it.next()) |idx| {
+            if (!self.be.alloc.isAllocated(idx)) n += 1;
+        }
+        return n;
+    }
+
+    /// `held + unclaimed + returned ≡ granted` over the mirror: held = the
+    /// granted extents the mirror shows claimed (images, pending frees).
+    fn checkClosure(self: *JoinedSet) void {
+        const unclaimed = self.unclaimedCount();
+        const held = self.granted_bits.count() - unclaimed;
+        if (held + unclaimed + self.returned != self.granted) stats.extent_grant_closure_violations.fire("the joiner's grant pool lost or gained an extent outside a grant or a return");
+    }
+
+    /// The pool's target: the explicit knob, else `8 + M` (the join's
+    /// cost class) — the joiner names its ask; the manager caps it by the
+    /// heap share.
+    fn poolTarget(self: *JoinedSet) u64 {
+        return grant.resolveGrantExtents(knobs.optIntKnob("SQUEEZEFS_SYM_GRANT_EXTENTS", u64, self.be.env), grant.joinedPoolFloor(self.m));
+    }
+
+    /// At the cadence (the checkpoint's page write): refill when the
+    /// unclaimed headroom halves; return the surplus above twice the
+    /// target (a pool that outgrew its target after a storm of frees).
+    pub fn poolCadence(self: *JoinedSet) void {
+        self.pool_lock.lockUncancelable(self.be.io);
+        defer self.pool_lock.unlock(self.be.io);
+        const target = self.poolTarget();
+        const unclaimed = self.unclaimedCount();
+        if (grant.joinedRefillDue(unclaimed -| self.be.cache.heapPromised(), target)) {
+            var runs: std.ArrayList(grant.GrantRun) = .empty;
+            defer runs.deinit(self.gpa);
+            const want: u32 = @intCast(@min(target, grant.GRANT_EXTENTS_MAX));
+            self.wire.extentGrant(self.appenderId(), want, &runs) catch |e| {
+                log.debug("meta volume {s}: ExtentGrant({d}) did not land this cadence ({s}); the pool holds {d} unclaimed", .{ self.be.path, want, @errorName(e), unclaimed });
+                return;
+            };
+            for (runs.items) |r| {
+                var e = r.start;
+                while (e < r.end()) : (e += 1) {
+                    if (self.granted_bits.isSet(@intCast(e))) continue;
+                    self.granted_bits.set(@intCast(e));
+                    self.granted += 1;
+                }
+                self.be.alloc.absorbGranted(.{ .start = r.start, .len = r.len });
+            }
+            stats.extent_grant_refills.inc();
+            self.checkClosure();
+            return;
+        }
+        if (unclaimed > 2 * target) {
+            var surplus: std.ArrayList(u64) = .empty;
+            defer surplus.deinit(self.gpa);
+            while (self.unclaimedCount() > target) {
+                const e = self.be.alloc.withdrawGranted() orelse break;
+                surplus.append(self.gpa, e) catch break;
+            }
+            if (surplus.items.len == 0) return;
+            var wire_runs: std.ArrayList(verbs.GrantRunWire) = .empty;
+            defer wire_runs.deinit(self.gpa);
+            std.mem.sort(u64, surplus.items, {}, std.sort.asc(u64));
+            for (surplus.items) |e| {
+                if (wire_runs.items.len > 0 and wire_runs.items[wire_runs.items.len - 1].start + wire_runs.items[wire_runs.items.len - 1].len == e) {
+                    wire_runs.items[wire_runs.items.len - 1].len += 1;
+                } else wire_runs.append(self.gpa, .{ .start = e, .len = 1, .reserved = 0 }) catch break;
+            }
+            _ = self.wire.returnExtents(self.appenderId(), wire_runs.items) catch {
+                // The return did not land: the extents go back to the pool.
+                for (surplus.items) |e| self.be.alloc.absorbGranted(.{ .start = e, .len = 1 });
+                return;
+            };
+            for (surplus.items) |e| self.granted_bits.unset(@intCast(e));
+            self.returned += surplus.items.len;
+            stats.extent_grant_returns.inc();
+            sym.stats.extent_grant_recycled.add(surplus.items.len);
+            self.checkClosure();
+        }
+    }
+
+    // ---- the page ----
+
+    /// The page plan executed: the shadow registry carries the backend's
+    /// seq offset, every slot the directory-first law names, one barrier
+    /// unless the cycle's own covers it.
+    pub fn writePages(self: *JoinedSet, from_cycle: bool) error{ Io, Corrupt, OutOfMemory }!void {
+        const r = self.core();
+        r.reg.recoverSeqOffset(self.be.reg.seqOffset());
+        var plan = r.planPageWrite() catch return error.Corrupt;
+        for (plan.slice()) |w| {
+            self.be.pool.writeAt(self.be.path, w.offset, &w.image) catch return error.Io;
+            sym.stats.appender_page_writes.inc();
+        }
+        if (!from_cycle) self.be.dev.barrier() catch return error.Io;
+        r.pageWritten(&plan);
+    }
+
+    /// `RecordSource.appenderPages` on a joiner — the record's ONE durable
+    /// home (spec §2.5): the ring's head and tail, the cycle's seq, the
+    /// pool's largest runs, the slot plane's ranked entries; then the pool
+    /// cadence and the slot cadence's flight.
+    pub fn onCheckpoint(self: *JoinedSet, rec: *const ledger.LedgerRecord) checkpoint_cycle.IoError!void {
+        const r = self.core();
+        r.page.head_hint = self.be.core.headPos();
+        r.page.ledger_tail_seq = rec.journal_tail_seq;
+        r.page.ckpt_seq = rec.seq;
+        var runs: std.ArrayList(grant.GrantRun) = .empty;
+        defer runs.deinit(self.gpa);
+        self.unclaimedRuns(&runs) catch return error.Io;
+        r.page.grants = grant.pageRunsOf(runs.items);
+        self.be.slots.planPage(self.appenderId(), r) catch return error.Io;
+        self.writePages(true) catch return error.Io;
+        self.tail_written = rec.journal_tail_seq;
+        self.be.slots.pageLanded(r);
+        self.poolCadence();
+        self.be.slots.kickCadence();
+    }
+
+    // ---- the slot verbs over the wire ----
+
+    pub const Touch = join_ladder.Joiner.Touch;
+
+    /// A first touch of `slot` (the door's seam): granted ⇒ the plane
+    /// installs the words; busy ⇒ the holder's word for the resolver.
+    pub fn acquireSlot(self: *JoinedSet, slot: u16) errors.Error!join_ladder.ManagerWire.AcquireReply {
+        return self.wire.acquireSlot(self.appenderId(), slot);
+    }
+
+    pub fn acquireSlots(self: *JoinedSet, want: u16) errors.Error!join_ladder.ManagerWire.AcquireReply {
+        return self.wire.acquireSlots(self.appenderId(), want);
+    }
+
+    pub fn releaseSlot(self: *JoinedSet, slot: u16, g: u32, words: slots.lease_table.SlotWords, tails: []const cr.TailEntry) errors.Error!bool {
+        var wire_tails: std.ArrayList(verbs.LeafTailWire) = .empty;
+        defer wire_tails.deinit(self.gpa);
+        for (tails) |t| try wire_tails.append(self.gpa, .{ .leaf_addr = t.leaf_addr, .tail = t.tail, .reserved = 0 });
+        return self.wire.releaseSlot(self.appenderId(), slot, g, words, wire_tails.items);
+    }
+
+    /// The page-budget overflow's publication (charter §5.5): the live
+    /// words into tree 0 through the manager.
+    pub fn publishRoots(self: *JoinedSet, roots: []const verbs.SlotRootWire) errors.Error!manager.RootsPublished {
+        return self.wire.publishRoots(self.appenderId(), roots);
+    }
+
+    pub fn resolveEndpoint(self: *JoinedSet, appender_id: u32) errors.Error!?endpoint.EndpointWire {
+        return self.wire.resolveEndpoint(appender_id);
+    }
+
+    pub fn publishEndpoint(self: *JoinedSet, ep: endpoint.EndpointWire) errors.Error!bool {
+        return self.wire.publishEndpoint(self.appenderId(), ep, 0);
+    }
+
+    // ---- the leave ----
+
+    /// The clean leave (the manager's screen: no slot named, nothing
+    /// leased, the ring drained): every lease released by the plane first,
+    /// the page naming no slot + barrier, the fixpoint cycles, then
+    /// `LeaveAppender` with the pool's unclaimed runs — the page goes Free
+    /// under the manager's pen.
+    pub fn leave(self: *JoinedSet) void {
+        if (self.left) return;
+        self.left = true;
+        const be = self.be;
+        be.slots.releaseAllForLeave(self.appenderId());
+        // Every release's cycles landed the roots; the page without the
+        // slots, barriered, before the manager screens it.
+        self.core().page.setSlots(&.{}) catch {};
+        self.writePages(false) catch |e| {
+            log.err("meta volume {s}: the leave's page write failed ({s}) — the page stays Live for the next open's recovery", .{ be.path, @errorName(e) });
+            return;
+        };
+        be.checkpointNow() catch {};
+        if (self.core().page.ledger_tail_seq != be.core.headPos()) be.checkpointNow() catch {};
+        // The pool's word for the leave: the mirror's unclaimed runs.
+        var runs: std.ArrayList(grant.GrantRun) = .empty;
+        defer runs.deinit(self.gpa);
+        self.unclaimedRuns(&runs) catch {};
+        var jr = &self.joiner.region.?;
+        jr.grant.deinit();
+        jr.grant = grant.RegionGrant.init(self.gpa);
+        _ = jr.grant.absorb(runs.items) catch {};
+        const left = self.joiner.leave() catch |e| {
+            log.err("meta volume {s}: appender {d} could not leave cleanly ({s}) — its page stays Live for the next open's recovery", .{ be.path, self.appenderId(), @errorName(e) });
+            return;
+        };
+        log.info("meta volume {s}: appender {d} left ({s}); {d} extent(s) returned with the page", .{ be.path, self.appenderId(), if (left.already) "already" else "page Free", runs.items.len });
+    }
+
+    /// The per-volume words of the `.stats` family on a joiner.
+    pub fn writeStatsJson(self: *JoinedSet, w: *Io.Writer) Io.Writer.Error!void {
+        const r = self.core();
+        const unclaimed = self.unclaimedCount();
+        try w.print("{{\"manager_lease\":\"joined\",\"appenders_live\":1,\"appenders_known\":{d},\"appenders_capacity\":0,\"appender_ring_budget_remaining_bytes\":0,\"appender_live_pages_at_mount\":0,\"appender_unrecovered\":0,\"manager_endpoint\":\"{f}\",\"regions\":[{{\"appender_id\":{d},\"term\":{d},\"ring_bytes\":{d},\"ring_segments\":{d},\"seq_offset\":{d},\"grant_unclaimed\":{d},\"grant_held\":{d},\"grant_granted\":{d},\"grant_returned\":{d},\"entries\":{d}}}],\"slots\":", .{ self.writers_known, self.manager_ep, self.appenderId(), r.page.term, r.ringBytes(), r.table.len, self.be.reg.seqOffset(), unclaimed, self.granted_bits.count() - unclaimed, self.granted, self.returned, self.entries });
+        try self.be.slots.writeStatsJson(w);
+        try w.writeByte('}');
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tree 0's projection: the secret and the endpoint before any wire.
+// ---------------------------------------------------------------------------
+
+fn readControl(gpa: Allocator, be: *KvBackend, k: []const u8, comptime T: type, comptime decode: anytype) OpenError!?T {
+    const bytes = (be.lookup(gpa, key.TREE_CONTROL, k) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Io,
+    }) orelse return null;
+    defer gpa.free(bytes);
+    return decode(bytes) catch return error.Corrupt;
+}
+
+/// Appender 0's newest valid page (the manager's identity, its state).
+fn readAppender0(gpa: Allocator, be: *KvBackend) OpenError!?page.Page {
+    const offs = page.appender0PageOffsets(be.sb.journal.start);
+    var bufs: [4][page.PAGE_LEN]u8 = undefined;
+    var imgs: [4]?[]const u8 = .{ null, null, null, null };
+    for (offs, 0..) |off, i| {
+        const img = be.dev.readRange(gpa, off, page.PAGE_LEN) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+        };
+        defer gpa.free(img);
+        @memcpy(&bufs[i], img[0..page.PAGE_LEN]);
+        imgs[i] = &bufs[i];
+    }
+    return page.newestValid(imgs) catch return error.Corrupt;
+}
+
+fn decodeEndpoint(bytes: []const u8) !endpoint.EndpointWire {
+    const e = try cr.EndpointRecordWire.decode(bytes);
+    return .{ .family = e.family, .reserved = 0, .port = e.port, .addr = e.addr };
+}
+
+/// The manager's `endpoint:{0}` record off tree 0; absent ⇒ the manager
+/// published it in its ring-0 window and the next cycle lands it: the
+/// joiner re-reads the newest ledger record and re-opens the control tree
+/// at its root, bounded (the joiner never replays ring 0).
+fn awaitManagerEndpoint(gpa: Allocator, be: *KvBackend) OpenError!endpoint.EndpointWire {
+    const deadline = clock.monotonicNs() + ENDPOINT_POLL_MAX_MS * std.time.ns_per_ms;
+    while (true) {
+        if (try readControl(gpa, be, cr.endpointKey(0).slice(), endpoint.EndpointWire, decodeEndpoint)) |ep| return ep;
+        if (clock.monotonicNs() >= deadline) {
+            log.err("meta volume {s}: no manager endpoint published on tree 0 within {d} ms — the D0 winner has not armed its wire (or `--join <endpoint>` names it)", .{ be.path, ENDPOINT_POLL_MAX_MS });
+            return error.ManagerUnreachable;
+        }
+        stats.joined_endpoint_polls.inc();
+        log.debug("meta volume {s}: no endpoint:0 record at checkpoint seq {d} (tail {d}) — polling the projection", .{ be.path, be.mounted.seq, be.mounted.journal_tail_seq });
+        be.io.sleep(.fromMilliseconds(ENDPOINT_POLL_STEP_MS), .awake) catch {};
+        be.reopenControlProjection() catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the pure parts.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "a joiner's mount slot derives from the mount point with bit 31 set: never a manager's lane index, distinct across mount points, stable" {
+    const a = joinerMountSlot("/mnt-b");
+    const b = joinerMountSlot("/mnt-c");
+    try testing.expect(a & JOINER_MOUNT_SLOT_BIT != 0 and b & JOINER_MOUNT_SLOT_BIT != 0);
+    try testing.expect(a != b);
+    try testing.expectEqual(a, joinerMountSlot("/mnt-b"));
+    try testing.expect(a >= 65_536 and b >= 65_536);
+}
+
+test "the endpoint poll bound is three checkpoint cadences" {
+    try testing.expectEqual(@as(u64, 3_000), ENDPOINT_POLL_MAX_MS);
+    try testing.expect(ENDPOINT_POLL_STEP_MS < @import("../checkpoint.zig").CHECKPOINT_MAX_AGE_MS);
+}

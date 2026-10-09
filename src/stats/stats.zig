@@ -345,6 +345,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/sym/membership/fencing.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/membership/join_ladder.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/membership/volume_bind.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/joined.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/data/sym_planes/plane_arm.zig", .by = "src/data/sym_planes.zig" },
 };
 

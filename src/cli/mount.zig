@@ -78,6 +78,7 @@ const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const sym_xv = @import("../meta/sym/xv.zig");
 const sym_wire = @import("../meta/sym/wire_plane.zig");
+const wire_endpoint = @import("../wire/endpoint.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
@@ -130,6 +131,8 @@ const Ctx = struct {
     data_uri: []const u8,
     mountpoint: [:0]const u8,
     opts: mount_options.MountOptions,
+    /// `--join host:port` as spelled (the manager's listener).
+    join: ?[]const u8,
     /// The raw `-o` string (the fusermount3 path forwards it).
     reporter: ?daemon.Reporter,
     session_ended: std.atomic.Value(bool) = .init(false),
@@ -261,6 +264,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .data_uri = "",
         .mountpoint = mountpoint,
         .opts = opts,
+        .join = m.join,
         .reporter = reporter,
     };
     return sqz.run(mountMain, .{&ctx}) catch |e| ctx.failed("the root task could not start ({s})", .{@errorName(e)});
@@ -274,12 +278,17 @@ fn mountMain(ctx: *Ctx) u8 {
     const facts = ctx.facts;
 
     // 1. The set: discovery, then every member's ladder, lane and
-    //    checkpoint task in canonical order.
+    //    checkpoint task in canonical order — or, when volume 0's D0
+    //    ladder is held by a live manager of a symmetric set, the JOIN
+    //    door (charter §5.7): this process becomes an equal writer over
+    //    the cluster wire.
+    const join_ep: ?wire_endpoint.EndpointWire = if (ctx.join) |text| wire_endpoint.parseEndpoint(text) catch return ctx.failed("--join {s}: not an addr:port / [v6]:port literal", .{text}) else null;
     const be = meta_set.MetaSet.open(gpa, io, ctx.paths, .{
         .env = env,
         .cache_budget_bytes = node_cache.nodeCacheBudgetFromEnv(env, ctx.budget_bytes),
         .cpus = facts.possible_cpus,
         .read_only = ctx.opts.read_only,
+        .join = .{ .mountpoint = ctx.mountpoint, .endpoint = join_ep },
     }) catch |e| return ctx.failed("cannot open metadata set {s}: {s} ({t}, {s})", .{ ctx.meta_uri, openReason(e), meta_set.openErrno(e), @tagName(errors.classOf(meta_set.openCoreError(e))) });
     var be_open = true;
     defer if (be_open) be.close();
@@ -353,9 +362,19 @@ fn mountMain(ctx: *Ctx) u8 {
     defer if (wire_live) if (wire) |wp| wp.stop();
     if (wire) |wp| {
         vs.renderer.sources.mount.wire_endpoint = wp.endpointText();
+        vs.renderer.sources.wire = wp;
         // The read divert: a foreign slot's records come under a token or
         // answer the typed EAGAIN, never off this mount's cache.
         fs.bindDivert(&wp.divert);
+        // The cross-owner plane's step sessions: a foreign holder's steps
+        // ship over the wire plane's dialled links.
+        xv_bound.bindDialer(wp.peers.xvDialer());
+        // A foreign file's layout record comes off its holder's token.
+        plane.bindForeignLayout(wp.foreignLayout());
+        // The data planes' arms: the manager holds the allocation lease
+        // and serves the grants; a joiner mints from pulled grants and
+        // ships its terminal frees.
+        wp.bindDataPlanes(plane) catch |e| return ctx.failed("the data planes could not arm over the wire ({s}) — see the log", .{@errorName(e)});
     }
     // The corpse sweep (kv_fs module doc): what a crashed daemon's forgets
     // left at nlink 0 is destroyed before any request is served.
@@ -403,8 +422,13 @@ fn mountMain(ctx: *Ctx) u8 {
     var session_live = true;
     defer if (session_live) session.deinit();
     vs.renderer.sources.session = session;
-    // A recalled token's kernel view rides the session's notify seam.
-    if (wire) |wp| wp.sink.bindSession(session.tokenNotifySeam());
+    // A recalled token's kernel view rides the session's notify seam; so
+    // does a served record verb's (the holder's own kernel view).
+    if (wire) |wp| {
+        const seam = session.tokenNotifySeam();
+        wp.sink.bindSession(seam);
+        wp.record_svc.sink.kernel = .{ .ctx = seam.ctx, .invalInode = seam.invalInode, .prune = seam.prune };
+    }
     // The zc legs: the held-slot direct store on a zero-copy session, the
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
@@ -437,10 +461,17 @@ fn mountMain(ctx: *Ctx) u8 {
     reclaim.requestStop();
     reclaim_fut.cancel(io);
     // The wire BEFORE the planes and the backend it serves over: every
-    // connection severed, the token hook disarmed on every pass.
-    if (wire) |wp| wp.stop();
+    // connection severed, the token hook disarmed on every pass — and
+    // every seam the planes hold INTO it unbound first (the dismount pass
+    // at `plane.close` reads layouts; nothing may reach a stopped plane).
+    if (wire) |wp| {
+        plane.bindForeignLayout(null);
+        xv_bound.bindDialer(null);
+        wp.stop();
+    }
     wire_live = false;
     vs.renderer.sources.mount.wire_endpoint = "";
+    vs.renderer.sources.wire = null;
     const failed = be.isFailed();
     const stranded = counters.tripwireCount("open_count_stranded");
     const abandoned = transport.slot.requests_abandoned.load();

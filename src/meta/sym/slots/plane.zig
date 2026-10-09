@@ -35,8 +35,13 @@ const jc = @import("../../journal_core.zig");
 const cr = @import("../control_records.zig");
 const page = @import("../appender_page.zig");
 const bind = @import("../bind.zig");
+const joined = @import("../joined.zig");
+const region_mod = @import("../region.zig");
+const shard_mod = @import("../membership/shard.zig");
+const join_ladder_mod = @import("../membership/join_ladder.zig");
 const manager = @import("../manager.zig");
 const slots = @import("../slots.zig");
+const verbs_wire = @import("../../../wire/verbs.zig");
 const lt = slots.lease_table;
 const door_mod = slots.door;
 const acquire = slots.acquire;
@@ -66,9 +71,22 @@ pub const Plane = struct {
     judge: handover.Judge,
     cache: resolve.SlotHolderCache,
     seam: handover.Seam = .{},
-    /// The manager's verbs, valid once armed.
+    /// The manager's verbs, valid once armed by an appender set.
     verbs: acquire.Verbs = undefined,
     set: ?*bind.AppenderSet = null,
+    /// The joined posture (charter §5.7): the lessee's verbs go over the
+    /// wire to the manager; `set` is null.
+    joined: ?*joined.JoinedSet = null,
+    /// The committing appender of this volume's own ring: 0 on the
+    /// manager, the joined region's id on a joiner.
+    me: AppenderId = journal.FIXED_RING_APPENDER,
+    /// `M` and `A_max` in force (the manager's `verbs` carry theirs; a
+    /// joiner has no verbs object).
+    m: u64 = 0,
+    a_max: u64 = 0,
+    /// One handover at a time per volume on a joiner (the manager's verbs
+    /// carry their own lock).
+    handover_lock: Io.Mutex = .init,
     armed: bool = false,
     /// The process-wide `slot_leases_held` gauge counts this plane's leases
     /// once the arm folded them in (the arm's own grants are in the fold).
@@ -270,7 +288,8 @@ pub const Plane = struct {
     // ---- the conveyor's step 0 ----
 
     fn doorEnterFn(ctx: *anyopaque, recs: []const tx.Rec, out: *tx.DoorTokens) conveyor.DoorError!void {
-        return self_(ctx).enterFor(journal.FIXED_RING_APPENDER, recs, out);
+        const self = self_(ctx);
+        return self.enterFor(self.me, recs, out);
     }
 
     /// The door for one entry's records committed by region `me`: the
@@ -335,8 +354,9 @@ pub const Plane = struct {
     }
 
     fn memoLeasesHere(ctx: *anyopaque, slot: u16) bool {
-        const v = self_(ctx).table.view(slot);
-        return v.leasedBy(journal.FIXED_RING_APPENDER) and v.state != .releasing;
+        const self = self_(ctx);
+        const v = self.table.view(slot);
+        return v.leasedBy(self.me) and v.state != .releasing;
     }
 
     fn memoOnThisVolume(ctx: *anyopaque, ino: u64) bool {
@@ -392,11 +412,17 @@ pub const Plane = struct {
             .raiseRing0SeqFloor = raiseRing0SeqFloorFn,
             .install = installFn,
             .released = releasedFn,
+            .foreignGranted = foreignGrantedFn,
             .transfer = transferFn,
             .parkForRoom = null,
         }, m, a_max);
+        self.m = m;
+        self.a_max = a_max;
         set.manager.slot_plane = &self.verbs;
         self.door.first_touch = .{ .ctx = self, .acquire = firstTouchFn };
+        // The appender → endpoint table (`PublishEndpoint`'s home) behind
+        // the holder cache: a wire lessee's listener resolves from it.
+        self.cache.endpoint_source = .{ .ctx = self, .lookup = &managerEndpointFn, .learn = false };
         // 1. Tree 0's population.
         var kvs: std.ArrayList(manager.KeyValue) = .empty;
         defer {
@@ -406,17 +432,7 @@ pub const Plane = struct {
             }
             kvs.deinit(gpa);
         }
-        const r = cr.rangeOf(.slot_state);
-        set.manager.vol.vt.range(set.manager.vol.ctx, gpa, r.start.slice(), r.end.slice(), &kvs) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-        };
-        for (kvs.items) |kv| {
-            const slot = cr.slotOfKey(kv.key) orelse continue;
-            const s = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
-            try self.table.load(slot, s);
-            if (s.variant == .leased) try self.cache.learn(slot, .{ .appender_id = s.appender_id, .g = s.g });
-        }
+        try self.loadTree0Population(&kvs);
         // 2. Region 0's page settled against tree 0 (the backend adopted
         // the live entries' roots at open; here rows 5/6 and the stale
         // drops take their durable effect).
@@ -519,6 +535,136 @@ pub const Plane = struct {
         };
     }
 
+    /// Tree 0's `slot_state` population into the table (the manager's
+    /// live truth; a joiner's checkpointed projection — fresher words
+    /// arrive through the wire's replies and redirects, learnt into the
+    /// holder cache).
+    fn loadTree0Population(self: *Plane, kvs: *std.ArrayList(manager.KeyValue)) ArmError!void {
+        const gpa = self.gpa;
+        const r = cr.rangeOf(.slot_state);
+        var raw: std.ArrayList(tree.KeyValue) = .empty;
+        defer raw.deinit(gpa);
+        self.be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &raw) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        errdefer tree.deinitKeyValues(gpa, &raw);
+        for (raw.items) |kv| try kvs.append(gpa, .{ .key = kv.key, .value = kv.value });
+        raw.items.len = 0;
+        for (kvs.items) |kv| {
+            const slot = cr.slotOfKey(kv.key) orelse continue;
+            const s = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
+            try self.table.load(slot, s);
+            if (s.variant == .leased) try self.cache.learn(slot, .{ .appender_id = s.appender_id, .g = s.g });
+        }
+    }
+
+    /// The JOINED arm (charter §5.7; spec §5.2 rung 6): tree 0's
+    /// projection into the table (every slot the manager and the other
+    /// appenders lease is theirs for every door decision), the manager's
+    /// endpoint for its slots, the rotor grants over the wire installed
+    /// as OURS (the trees at the words' roots), the door's first touch
+    /// bound to the wire, `N_floor` seeded, armed. Never a tree-0 write.
+    pub fn armJoined(self: *Plane, j: *joined.JoinedSet, manager_ep: resolve.Endpoint) ArmError!void {
+        const be = self.be;
+        const gpa = self.gpa;
+        self.joined = j;
+        self.me = j.appenderId();
+        self.setOwn(&.{self.me});
+        self.m = j.m;
+        self.a_max = acquire.resolveAffinityCeiling(self.affinity_mib, self.usedLeafBytes(), be.sb.node_size, be.sb.heap.len) catch |e| {
+            log.err("meta volume {s}: SQUEEZEFS_SYM_AFFINITY_MAX_MB is {s} (node {d} B, heap {d} B) — refusing the mount", .{ be.path, @errorName(e), be.sb.node_size, be.sb.heap.len });
+            return error.Refused;
+        };
+        acquire.stats.slot_rotor.set(self.m);
+        acquire.stats.affinity_a_max_bytes.set(self.a_max);
+        self.door.first_touch = .{ .ctx = self, .acquire = firstTouchFn };
+        var kvs: std.ArrayList(manager.KeyValue) = .empty;
+        defer {
+            for (kvs.items) |kv| {
+                gpa.free(kv.key);
+                gpa.free(kv.value);
+            }
+            kvs.deinit(gpa);
+        }
+        try self.loadTree0Population(&kvs);
+        // The manager's slots resolve to its listener (the native slot
+        // among them: `/`'s dentries are read under its tokens); any other
+        // appender's through `ResolveEndpoint` at the manager.
+        self.cache.setEndpoint(journal.FIXED_RING_APPENDER, manager_ep) catch return error.OutOfMemory;
+        self.cache.endpoint_source = .{ .ctx = self, .lookup = &wireEndpointFn, .learn = true };
+        self.armed = true;
+        self.door.armed = true;
+        // The rotor grants (rung 6): installed as ours, rotor-marked.
+        const grants = j.acquireRotor() catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Deferred, error.MembershipPending => error.Deferred,
+            error.Rejected, error.Busy, error.NotManager, error.SlotMoved => error.Refused,
+            else => error.Io,
+        };
+        for (grants) |g| {
+            try self.installWireGrant(g.slot, g.g, g.words);
+            self.table.setRotor(g.slot, true);
+        }
+        self.judge.seed(COLD_BARRIER_NS, COLD_SHIP_NS);
+        slots.stats.slot_leases_held.add(self.table.heldCount(self.me));
+        self.gauge_counted = true;
+        // The frame plane: a joiner holds no device fence of its own (the
+        // manager's WERO is the set's); its stamps are the table's words
+        // for its leases from here on.
+        self.frames.setFenced(false);
+        self.frames.noteArmed();
+        log.info("meta volume {s}: slot leases armed (JOINED, appender {d}) — M {d}, A_max {d} B, {d} rotor slot(s) held, {d} lease(s) known on tree 0, T_idle {d} ms, N_floor {d}", .{ be.path, self.me, self.m, self.a_max, grants.len, self.table.leasedCount(), self.t_idle_ns / std.time.ns_per_ms, self.judge.nFloorNow() });
+    }
+
+    /// The renewal carriage's receiving end on a joiner (charter §5.5
+    /// "Handover … the holder OFFERS slot `s` to requester `q`"): an offer
+    /// for a slot this mount touched is accepted with `AcquireSlot` over
+    /// the wire; a release notice drops the learnt view.
+    pub fn carriageSink(self: *Plane) shard_mod.CarriageSink {
+        return .{ .ctx = self, .offered = &carriageOffered, .released = &carriageReleased };
+    }
+
+    fn carriageOffered(ctx: ?*anyopaque, slot: u16, _: u32) void {
+        const self: *Plane = @ptrCast(@alignCast(ctx.?));
+        const j = self.joined orelse return;
+        self.firstTouchWire(j, slot) catch return;
+        join_ladder_mod.stats.joined_wire_offers_accepted.inc();
+    }
+
+    fn carriageReleased(ctx: ?*anyopaque, slot: u16) void {
+        const self: *Plane = @ptrCast(@alignCast(ctx.?));
+        self.cache.forget(slot);
+        const v = self.table.view(slot);
+        if (v.state != .unleased and v.holder != self.me) self.table.evict(slot);
+    }
+
+    fn managerEndpointFn(ctx: *anyopaque, id: AppenderId) ?resolve.Endpoint {
+        const self = self_(ctx);
+        const set = self.set orelse return null;
+        const rep = set.manager.resolveEndpoint(.{ .appender_id = id }) catch return null;
+        return rep.endpoint;
+    }
+
+    fn wireEndpointFn(ctx: *anyopaque, id: AppenderId) ?resolve.Endpoint {
+        const self = self_(ctx);
+        const j = self.joined orelse return null;
+        const wire_ep = (j.resolveEndpoint(id) catch return null) orelse return null;
+        var ep: resolve.Endpoint = .{};
+        const bytes = std.mem.asBytes(&wire_ep);
+        @memcpy(ep.bytes[0..bytes.len], bytes);
+        ep.len = @intCast(bytes.len);
+        return ep;
+    }
+
+    /// A lease the wire granted THIS region: the table word (tree 0 names
+    /// it from this reply on), the words installed as a fresh grant.
+    fn installWireGrant(self: *Plane, slot: u16, g: u32, words: lt.SlotWords) ArmError!void {
+        try self.table.load(slot, .{ .variant = .leased, .appender_id = self.me, .g = g, .root = words.root, .cursor = words.cursor, .slot_tree_extents = words.extents, .seq_floor = words.seq_floor });
+        self.install(slot, self.me, g, words, true) catch |e| return mapVerb(e);
+    }
+
     /// `used_leaf_bytes`: Σ of every slot tree's node census × node_size.
     fn usedLeafBytes(self: *Plane) u64 {
         var n: u64 = 0;
@@ -600,6 +746,36 @@ pub const Plane = struct {
         self.judge.window.forget(slot);
         self.table.resetHolderOps(slot);
         if (self.gauge_counted) slots.stats.slot_leases_held.sub(1);
+        // The manager maintains every UNLEASED tree (charter §5.5): a tree
+        // a wire lessee returned opens here at the released root — its
+        // reads are local from now on (the divert's `local` verdict).
+        if (self.joined == null) self.adoptUnleasedTree(slot);
+    }
+
+    fn adoptUnleasedTree(self: *Plane, slot: u16) void {
+        const be = self.be;
+        if (be.stamp.native_slot == slot or !be.stamp.hosts(slot)) return;
+        const words = self.table.wordsOf(slot);
+        if (be.slotTree(slot) != null) be.forgetTree(slot);
+        if (words.root.addr == 0) return;
+        const opened = tree.KvTree.open(self.gpa, be.cache, .{ .slot = key.guestForestSlot(slot) }, .{ .addr = words.root.addr, .seq = words.root.seq }, &be.seq) catch |e| {
+            log.err("meta volume {s}: the tree of released slot {d} could not open at its recorded root 0x{x} ({s}) — its records serve only after a remount", .{ be.path, slot, words.root.addr, @errorName(e) });
+            return;
+        };
+        be.adoptTree(opened) catch {
+            opened.destroy();
+            return;
+        };
+        opened.seedNodeCount(words.extents);
+        be.stamp.installFloor(slot, words.cursor) catch {};
+    }
+
+    /// A wire appender took `slot`: the unleased tree this process kept
+    /// is the grantee's now — out of the cache (its reads go under the
+    /// grantee's tokens; its writes refuse at the door).
+    fn foreignGrantedFn(ctx: *anyopaque, slot: u16) void {
+        const self = self_(ctx);
+        self.be.forgetTree(slot);
     }
 
     fn transferFn(ctx: *anyopaque, slot: u16, holder: AppenderId, _: AppenderId) acquire.Error!void {
@@ -620,6 +796,7 @@ pub const Plane = struct {
 
     fn firstTouchFn(ctx: *anyopaque, slot: u16, requester: AppenderId) door_mod.Error!void {
         const self = self_(ctx);
+        if (self.joined) |j| return self.firstTouchWire(j, slot);
         const out = self.verbs.acquireSlot(self.gpa, requester, slot, .park) catch |e| return switch (e) {
             error.Deferred => error.Deferred,
             error.Busy, error.RotorAtCap, error.Refused, error.Rejected => error.SlotBusy,
@@ -630,6 +807,37 @@ pub const Plane = struct {
         switch (out) {
             .granted => |g| if (g.grants.len != 0) self.gpa.free(g.grants),
             .refused => return error.SlotBusy,
+        }
+    }
+
+    /// A joiner's first touch: `AcquireSlot` over the wire. Granted ⇒
+    /// the words installed as ours (the door's re-read admits); busy ⇒
+    /// the holder's word LOADED into the table (the view the door's
+    /// re-read refuses on, the resolver's "ship to the holder").
+    fn firstTouchWire(self: *Plane, j: *joined.JoinedSet, slot: u16) door_mod.Error!void {
+        const out = j.acquireSlot(slot) catch |e| return switch (e) {
+            error.Deferred, error.MembershipPending => error.Deferred,
+            error.OutOfMemory => error.OutOfMemory,
+            error.Rejected, error.Busy, error.NotManager => error.SlotBusy,
+            else => error.Io,
+        };
+        switch (out) {
+            .granted => |g| {
+                defer self.gpa.free(g.grants);
+                for (g.grants) |grant| {
+                    self.installWireGrant(grant.slot, grant.g, grant.words) catch |e| return switch (e) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        error.Io => error.Io,
+                        error.Deferred => error.Deferred,
+                        error.Refused, error.Corrupt => error.Corrupt,
+                    };
+                }
+            },
+            .refused => |r| {
+                try self.table.load(slot, .{ .variant = .leased, .appender_id = r.holder, .g = r.g, .root = .{ .addr = 0, .seq = 0 }, .cursor = inos.LOCAL_INO_BASE });
+                try self.cache.learn(slot, .{ .appender_id = r.holder, .g = r.g });
+                return error.SlotBusy;
+            },
         }
     }
 
@@ -663,7 +871,7 @@ pub const Plane = struct {
     /// region's own core's for an in-process region.
     fn lesseeReusableUpto(self: *Plane, slot: u16) u64 {
         const holder = self.table.view(slot).holder;
-        if (holder == journal.FIXED_RING_APPENDER) return self.be.core.reusableUpto();
+        if (holder == self.me) return self.be.core.reusableUpto();
         const r = self.regionOf(holder) orelse return self.be.core.reusableUpto();
         return r.core.core.reusableUpto();
     }
@@ -721,31 +929,61 @@ pub const Plane = struct {
     fn pageReleasingFn(ctx: *anyopaque, slot: u16, g: u32, words: lt.SlotWords) handover.Error!void {
         const self = self_(ctx);
         const holder = self.table.view(slot).holder;
+        if (self.joined) |j| {
+            if (holder != self.me) return error.Corrupt;
+            return self.writeRegionPage(self.me, j.core(), slot, g, words);
+        }
         const r = self.regionOf(holder) orelse return error.Corrupt;
-        try self.writeRegionPage(r, slot, g, words);
+        try self.writeRegionPage(r.appenderId(), &r.core, slot, g, words);
     }
 
-    /// The page with `releasing` naming `slot` first (rank 0), the rest by
-    /// the plan; publish-before-drop into tree 0; one barrier.
-    fn writeRegionPage(self: *Plane, r: *bind.Region, releasing: ?u16, g: u32, words: lt.SlotWords) handover.Error!void {
-        var held = try self.heldOf(r.appenderId(), releasing, g, words);
-        defer held.deinit(self.gpa);
-        var plan = page_budget.plan(self.gpa, held.items, page.SLOT_PAGE_BUDGET) catch return error.OutOfMemory;
-        defer plan.deinit(self.gpa);
-        for (plan.demote) |s| try self.publishTree0(s);
-        r.core.page.setSlots(plan.entries) catch return error.Corrupt;
-        const set = self.set orelse return error.Corrupt;
-        set.writePages(r, false) catch |e| return switch (e) {
+    /// The page write of the region whose core this is: the manager's
+    /// set for its regions, the joined set for its one.
+    fn writeRegionCorePages(self: *Plane, appender_id: AppenderId, from_cycle: bool) handover.Error!void {
+        const res = if (self.joined) |j| j.writePages(from_cycle) else blk: {
+            const set = self.set orelse return error.Corrupt;
+            const r = self.regionOf(appender_id) orelse return error.Corrupt;
+            break :blk set.writePages(r, from_cycle);
+        };
+        res catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Corrupt,
             error.Io => error.Io,
         };
+    }
+
+    /// The page with `releasing` naming `slot` first (rank 0), the rest by
+    /// the plan; publish-before-drop into tree 0; one barrier.
+    fn writeRegionPage(self: *Plane, appender_id: AppenderId, core: *region_mod.RegionCore, releasing: ?u16, g: u32, words: lt.SlotWords) handover.Error!void {
+        var held = try self.heldOf(appender_id, releasing, g, words);
+        defer held.deinit(self.gpa);
+        var plan = page_budget.plan(self.gpa, held.items, page.SLOT_PAGE_BUDGET) catch return error.OutOfMemory;
+        defer plan.deinit(self.gpa);
+        for (plan.demote) |s| try self.publishTree0(s);
+        core.page.setSlots(plan.entries) catch return error.Corrupt;
+        try self.writeRegionCorePages(appender_id, false);
         for (plan.entries) |e| try self.setPublicationH(e.slot, .{ .root = .{ .addr = e.root_addr, .seq = e.root_seq }, .cursor = e.cursor, .home = .page });
     }
 
     fn releaseDurablyFn(ctx: *anyopaque, slot: u16, g: u32, words: lt.SlotWords, tails: []const cr.TailEntry) handover.Error!void {
         const self = self_(ctx);
         const holder = self.table.view(slot).holder;
+        if (self.joined) |j| {
+            // The wire's `ReleaseSlot`: tree 0 `Unleased` under the
+            // manager's pen; the table follows the reply.
+            _ = j.releaseSlot(slot, g, words, tails) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Deferred, error.MembershipPending, error.Busy => error.HandoverDeferred,
+                error.Rejected, error.NotManager => error.Corrupt,
+                else => error.Io,
+            };
+            _ = self.table.release(slot, holder, g, words, clock.monotonicNs()) catch return error.OutOfMemory;
+            releasedFn(self, slot);
+            // The tree is the manager's now: its nodes leave this cache
+            // (a successor rewrites them; nothing here frees an extent).
+            self.be.forgetTree(slot);
+            return;
+        }
         _ = self.verbs.releaseSlot(self.gpa, .{ .appender_id = holder, .slot = slot, .g = g, .words = words, .tails = tails }) catch |e| return switch (e) {
             error.Io => error.Io,
             error.OutOfMemory => error.OutOfMemory,
@@ -760,11 +998,17 @@ pub const Plane = struct {
         _ = self.publications.remove(slot);
         self.pub_lock.unlock();
         // The page without the slot: every region's page that named it.
+        if (self.joined) |j| {
+            var named = false;
+            for (j.core().page.slotEntries()) |e| named = named or e.slot == slot;
+            if (named) try self.writeRegionPage(self.me, j.core(), null, 0, .{});
+            return;
+        }
         const set = self.set orelse return;
         for (set.regions.items) |r| {
             var named = false;
             for (r.core.page.slotEntries()) |e| named = named or e.slot == slot;
-            if (named) try self.writeRegionPage(r, null, 0, .{});
+            if (named) try self.writeRegionPage(r.appenderId(), &r.core, null, 0, .{});
         }
     }
 
@@ -822,12 +1066,23 @@ pub const Plane = struct {
         const v = self.table.view(slot);
         if (v.state == .unleased or v.state == .migrating) return;
         const w = self.liveWords(slot);
-        const st: cr.SlotState = .{ .variant = if (v.state == .releasing and v.dead) .releasing else .leased, .appender_id = v.holder, .g = v.g, .root = w.root, .cursor = w.cursor, .slot_tree_extents = w.extents, .seq_floor = w.seq_floor };
-        _ = self.be.writeSlotStateRecord(slot, st) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Corrupt => error.Corrupt,
-            else => error.Io,
-        };
+        if (self.joined) |j| {
+            // A joiner never writes tree 0: `PublishRoots` to the manager.
+            const roots = [_]verbs_wire.SlotRootWire{.{ .root = .{ .addr = w.root.addr, .seq = w.root.seq }, .cursor = w.cursor, .slot_tree_extents = w.extents, .g = v.g, .slot = slot, .reserved = @splat(0) }};
+            _ = j.publishRoots(&roots) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Deferred, error.MembershipPending => error.HandoverDeferred,
+                error.Rejected, error.NotManager => error.Corrupt,
+                else => error.Io,
+            };
+        } else {
+            const st: cr.SlotState = .{ .variant = if (v.state == .releasing and v.dead) .releasing else .leased, .appender_id = v.holder, .g = v.g, .root = w.root, .cursor = w.cursor, .slot_tree_extents = w.extents, .seq_floor = w.seq_floor };
+            _ = self.be.writeSlotStateRecord(slot, st) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Corrupt => error.Corrupt,
+                else => error.Io,
+            };
+        }
         page_budget.stats.meta_kv_forest_page_publications_demoted.inc();
         page_budget.stats.slot_roots_published_overflow.inc();
         try self.setPublicationH(slot, .{ .root = w.root, .cursor = w.cursor, .home = .tree0, .tree0_root = w.root });
@@ -844,51 +1099,50 @@ pub const Plane = struct {
     /// An unarmed plane publishes nothing (the backend's rung-5 law stands).
     pub fn publishBeforeTail(self: *Plane) handover.Error!void {
         if (!self.armed) return;
+        if (self.joined) |j| return self.publishRegionBeforeTail(self.me, j.core());
         const set = self.set orelse return;
-        for (set.regions.items) |r| {
-            var held = try self.heldOf(r.appenderId(), null, 0, .{});
-            defer held.deinit(self.gpa);
-            const named = r.core.page.slotEntries();
-            var will_name = self.gpa.alloc(u16, named.len) catch return error.OutOfMemory;
-            defer self.gpa.free(will_name);
-            for (named, 0..) |e, i| will_name[i] = e.slot;
-            // Every unnamed root THIS cycle (never a bounded subset: a root
-            // left for the next cycle is a root the tail may pass).
-            const pubs = self.gpa.alloc(u16, held.items.len) catch return error.OutOfMemory;
-            defer self.gpa.free(pubs);
-            for (page_budget.tree0Publications(held.items, will_name, pubs)) |s| try self.publishTree0(s);
-            // The pre-barrier refresh of the already-named slots.
-            if (page_budget.cursorRefresh(self.gpa, r.core.page.slotEntries(), held.items) catch return error.OutOfMemory) |refreshed| {
-                defer self.gpa.free(refreshed);
-                r.core.page.setSlots(refreshed) catch return error.Corrupt;
-                set.writePages(r, true) catch |e| return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.Corrupt => error.Corrupt,
-                    error.Io => error.Io,
-                };
-                for (refreshed) |e| try self.setPublicationH(e.slot, .{ .root = .{ .addr = e.root_addr, .seq = e.root_seq }, .cursor = e.cursor, .home = .page });
-            }
+        for (set.regions.items) |r| try self.publishRegionBeforeTail(r.appenderId(), &r.core);
+    }
+
+    fn publishRegionBeforeTail(self: *Plane, appender_id: AppenderId, core: *region_mod.RegionCore) handover.Error!void {
+        var held = try self.heldOf(appender_id, null, 0, .{});
+        defer held.deinit(self.gpa);
+        const named = core.page.slotEntries();
+        var will_name = self.gpa.alloc(u16, named.len) catch return error.OutOfMemory;
+        defer self.gpa.free(will_name);
+        for (named, 0..) |e, i| will_name[i] = e.slot;
+        // Every unnamed root THIS cycle (never a bounded subset: a root
+        // left for the next cycle is a root the tail may pass).
+        const pubs = self.gpa.alloc(u16, held.items.len) catch return error.OutOfMemory;
+        defer self.gpa.free(pubs);
+        for (page_budget.tree0Publications(held.items, will_name, pubs)) |s| try self.publishTree0(s);
+        // The pre-barrier refresh of the already-named slots.
+        if (page_budget.cursorRefresh(self.gpa, core.page.slotEntries(), held.items) catch return error.OutOfMemory) |refreshed| {
+            defer self.gpa.free(refreshed);
+            core.page.setSlots(refreshed) catch return error.Corrupt;
+            try self.writeRegionCorePages(appender_id, true);
+            for (refreshed) |e| try self.setPublicationH(e.slot, .{ .root = .{ .addr = e.root_addr, .seq = e.root_seq }, .cursor = e.cursor, .home = .page });
         }
     }
 
-    /// C11: the full page plan for region `r` (the entries set on
-    /// `r.core.page`; the caller writes the page). Publish-before-drop
-    /// into tree 0 runs here for the cut.
-    pub fn planPage(self: *Plane, r: *bind.Region) handover.Error!void {
+    /// C11: the full page plan for the region `appender_id` whose core
+    /// this is (the entries set on its page; the caller writes the page).
+    /// Publish-before-drop into tree 0 runs here for the cut.
+    pub fn planPage(self: *Plane, appender_id: AppenderId, core: *region_mod.RegionCore) handover.Error!void {
         if (!self.armed) return;
-        var held = try self.heldOf(r.appenderId(), null, 0, .{});
+        var held = try self.heldOf(appender_id, null, 0, .{});
         defer held.deinit(self.gpa);
         var plan = page_budget.plan(self.gpa, held.items, page.SLOT_PAGE_BUDGET) catch return error.OutOfMemory;
         defer plan.deinit(self.gpa);
         for (plan.demote) |s| try self.publishTree0(s);
-        r.core.page.setSlots(plan.entries) catch return error.Corrupt;
+        core.page.setSlots(plan.entries) catch return error.Corrupt;
     }
 
     /// The page landed (C11): every named slot is page-homed at the words
     /// the image carried.
-    pub fn pageLanded(self: *Plane, r: *bind.Region) void {
+    pub fn pageLanded(self: *Plane, core: *region_mod.RegionCore) void {
         if (!self.armed) return;
-        for (r.core.page.slotEntries()) |e| self.setPublication(e.slot, .{ .root = .{ .addr = e.root_addr, .seq = e.root_seq }, .cursor = e.cursor, .home = .page }) catch {};
+        for (core.page.slotEntries()) |e| self.setPublication(e.slot, .{ .root = .{ .addr = e.root_addr, .seq = e.root_seq }, .cursor = e.cursor, .home = .page }) catch {};
     }
 
     // ---- the mint policy (the set's `allocateIno`) ----
@@ -905,7 +1159,7 @@ pub const Plane = struct {
         var n: usize = 0;
         var held: std.ArrayList(u16) = .empty;
         defer held.deinit(self.gpa);
-        self.table.heldBy(journal.FIXED_RING_APPENDER, &held) catch return null;
+        self.table.heldBy(self.me, &held) catch return null;
         for (held.items) |s| {
             const v = self.table.view(s);
             if (!v.rotor or v.state == .releasing or n == rotor.len) continue;
@@ -915,36 +1169,54 @@ pub const Plane = struct {
         const pv = self.table.view(parent_slot);
         // `A_max(t)` is DYNAMIC: the live leaf census at every decision
         // (the static knob, when set, is the whole law).
-        const a_max = if (self.affinity_mib) |_| self.verbs.a_max else acquire.affinityCeiling(self.usedLeafBytes(), be.sb.node_size);
+        const a_max = if (self.affinity_mib) |_| self.a_max else acquire.affinityCeiling(self.usedLeafBytes(), be.sb.node_size);
         const in: acquire.MintInputs = .{
             .parent_slot = parent_slot,
-            .parent_leased_non_native = parent_on_this_volume and !native and pv.leasedBy(journal.FIXED_RING_APPENDER) and pv.state != .releasing,
+            .parent_leased_non_native = parent_on_this_volume and !native and pv.leasedBy(self.me) and pv.state != .releasing,
             .parent_tree_bytes = self.treeBytes(parent_slot),
             .a_max = a_max,
             .node_size = be.sb.node_size,
             .rotor = rotor[0..n],
-            .rotor_cap = acquire.rotorCap(self.verbs.m),
+            .rotor_cap = acquire.rotorCap(self.m),
             .rr = rr,
         };
         const c = acquire.mintChoice(in);
         acquire.countChoice(c, in.parent_leased_non_native);
         return switch (c) {
-            .overflow => blk: {
-                // One more rotor slot (PARK admission), else the smallest.
-                const out = self.verbs.acquireSlots(self.gpa, .{ .appender_id = journal.FIXED_RING_APPENDER, .want = 1, .admit = .park }) catch break :blk smallestOf(rotor[0..n]);
-                switch (out) {
-                    .granted => |g| {
-                        defer if (g.grants.len != 0) self.gpa.free(g.grants);
-                        if (g.grants.len == 0) break :blk smallestOf(rotor[0..n]);
-                        acquire.stats.affinity_ceiling_overflows.inc();
-                        break :blk g.grants[0].slot;
-                    },
-                    .refused => break :blk smallestOf(rotor[0..n]),
-                }
-            },
+            .overflow => self.overflowRotor(rotor[0..n]),
             .none => null,
             else => c.slot(),
         };
+    }
+
+    /// One more rotor slot (PARK admission in-process; `AcquireSlots(1)`
+    /// over the wire on a joiner), else the smallest.
+    fn overflowRotor(self: *Plane, rotor: []const acquire.RotorTree) ?u16 {
+        if (self.joined) |j| {
+            const out = j.acquireSlots(1) catch return smallestOf(rotor);
+            switch (out) {
+                .granted => |g| {
+                    defer self.gpa.free(g.grants);
+                    if (g.grants.len == 0) return smallestOf(rotor);
+                    const grant = g.grants[0];
+                    self.installWireGrant(grant.slot, grant.g, grant.words) catch return smallestOf(rotor);
+                    self.table.setRotor(grant.slot, true);
+                    acquire.stats.affinity_ceiling_overflows.inc();
+                    return grant.slot;
+                },
+                .refused => return smallestOf(rotor),
+            }
+        }
+        const out = self.verbs.acquireSlots(self.gpa, .{ .appender_id = journal.FIXED_RING_APPENDER, .want = 1, .admit = .park }) catch return smallestOf(rotor);
+        switch (out) {
+            .granted => |g| {
+                defer if (g.grants.len != 0) self.gpa.free(g.grants);
+                if (g.grants.len == 0) return smallestOf(rotor);
+                acquire.stats.affinity_ceiling_overflows.inc();
+                return g.grants[0].slot;
+            },
+            .refused => return smallestOf(rotor),
+        }
     }
 
     fn smallestOf(rotor: []const acquire.RotorTree) ?u16 {
@@ -990,12 +1262,31 @@ pub const Plane = struct {
         var lapsed: [16]lt.LapsedOffer = undefined;
         const n_lapsed = self.table.expireOffers(now, &lapsed);
         handover.stats.slot_offers_expired.add(n_lapsed);
-        const set = self.set orelse return;
-        const m = acquire.resolveMintSlots(knobs.optIntKnob("SQUEEZEFS_SYM_MINT_SLOTS", u64, be.env), set.manager.appenders_known);
-        self.verbs.setM(m);
-        self.verbs.setCeiling(acquire.resolveAffinityCeiling(self.affinity_mib, self.usedLeafBytes(), be.sb.node_size, be.sb.heap.len) catch self.verbs.a_max);
-        for (set.regions.items) |r| {
-            const id = r.appenderId();
+        const writers_known: u64 = if (self.set) |set| set.manager.appenders_known else if (self.joined) |j| j.writers_known else return;
+        const m = acquire.resolveMintSlots(knobs.optIntKnob("SQUEEZEFS_SYM_MINT_SLOTS", u64, be.env), writers_known);
+        const a_max = acquire.resolveAffinityCeiling(self.affinity_mib, self.usedLeafBytes(), be.sb.node_size, be.sb.heap.len) catch self.a_max;
+        self.m = m;
+        self.a_max = a_max;
+        if (self.set != null) {
+            self.verbs.setM(m);
+            self.verbs.setCeiling(a_max);
+        } else {
+            acquire.stats.slot_rotor.set(m);
+            acquire.stats.affinity_a_max_bytes.set(a_max);
+        }
+        var ids_buf: [8]AppenderId = undefined;
+        var n_ids: usize = 0;
+        if (self.set) |set| {
+            for (set.regions.items) |r| {
+                if (n_ids == ids_buf.len) break;
+                ids_buf[n_ids] = r.appenderId();
+                n_ids += 1;
+            }
+        } else {
+            ids_buf[0] = self.me;
+            n_ids = 1;
+        }
+        for (ids_buf[0..n_ids]) |id| {
             var held_slots: std.ArrayList(u16) = .empty;
             defer held_slots.deinit(gpa);
             self.table.heldBy(id, &held_slots) catch return;
@@ -1018,10 +1309,15 @@ pub const Plane = struct {
         self.publishGauges();
     }
 
+    fn handoverLock(self: *Plane) *Io.Mutex {
+        return if (self.set != null) &self.verbs.handover_lock else &self.handover_lock;
+    }
+
     /// The handover's own sequence to nobody; `Busy`/deferred = not this tick.
     fn releaseForCadence(self: *Plane, holder: AppenderId, slot: u16) bool {
-        self.verbs.handover_lock.lockUncancelable(self.io);
-        defer self.verbs.handover_lock.unlock(self.io);
+        const lock = self.handoverLock();
+        lock.lockUncancelable(self.io);
+        defer lock.unlock(self.io);
         _ = handover.transfer(self.gpa, &self.door, self.table, self.steps(), self.io, holder, slot) catch |e| {
             log.info("slot leases: the cadence's release of slot {d} (appender {d}) did not land this tick ({s})", .{ slot, holder, @errorName(e) });
             return false;
@@ -1042,7 +1338,7 @@ pub const Plane = struct {
         const gpa = self.gpa;
         var held: std.ArrayList(u16) = .empty;
         defer held.deinit(gpa);
-        self.table.heldBy(journal.FIXED_RING_APPENDER, &held) catch return;
+        self.table.heldBy(self.me, &held) catch return;
         const inos_ = gpa.alloc(u64, held.items.len) catch return;
         defer gpa.free(inos_);
         const bytes = gpa.alloc(u64, held.items.len) catch return;
@@ -1062,6 +1358,6 @@ pub const Plane = struct {
         // An unarmed plane (a flat volume) reads 0 throughout — `n_floor`
         // included, whose derivation has a floor of 2 the operator must
         // not mistake for an engaged handover rule.
-        try w.print("{{\"armed\":{},\"leases_held\":{d},\"rotor_m\":{d},\"a_max_bytes\":{d},\"n_floor\":{d},\"closed_slot\":{?d}}}", .{ self.armed, self.table.leasedCount(), if (self.armed) self.verbs.m else 0, if (self.armed) self.verbs.a_max else 0, if (self.armed) self.judge.nFloorNow() else 0, self.door.closedSlot() });
+        try w.print("{{\"armed\":{},\"leases_held\":{d},\"own_leases\":{d},\"rotor_m\":{d},\"a_max_bytes\":{d},\"n_floor\":{d},\"closed_slot\":{?d}}}", .{ self.armed, self.table.leasedCount(), if (self.armed) self.table.heldCount(self.me) else 0, if (self.armed) self.m else 0, if (self.armed) self.a_max else 0, if (self.armed) self.judge.nFloorNow() else 0, self.door.closedSlot() });
     }
 };

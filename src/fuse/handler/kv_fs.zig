@@ -948,6 +948,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The layout record of `ino` (owned; the layout borrows it), null
         /// when never written.
         pub fn readLayout(self: *Self, ino: u64) Error!?LayoutRec {
+            if (try self.tokenServe(ino, .{})) |served| {
+                // A foreign object: the holder's carried `layout` xattr (the
+                // read divert's law — never this mount's projection, whose
+                // stale or absent record would read as an inline file of
+                // zeros). The record's collision seq is the holder's key;
+                // a reader never re-keys a foreign layout.
+                defer served.release(self.io);
+                const e = served.entry orelse return null;
+                const v = e.xattr(LAYOUT_XATTR) orelse return null;
+                const value = try self.gpa.dupe(u8, v);
+                errdefer self.gpa.free(value);
+                const l = Layout.decode(value, self.geo) catch {
+                    layout_record_corrupt.fire("a carried layout record failed the total codec");
+                    return error.InputOutput;
+                };
+                return .{ .value = value, .coll_seq = 0, .layout = l };
+            }
             var occ: [256]u8 = undefined;
             var n: usize = 0;
             const hit = (try self.findXattr(ino, LAYOUT_XATTR, &occ, &n)) orelse return null;
@@ -1241,6 +1258,11 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.forgetParent(a.ino);
             const local = localOf(a.ino) catch return;
             self.data.forgetShape(local);
+            // A FOREIGN ino's corpse is its holder's to destroy (at the
+            // holder's own forget, under its door): a reader's forget
+            // drops its cached view alone — never a destroy on a slot
+            // another appender leases (`SlotMoved`).
+            if (self.divert) |d| if (d.isForeign(local)) return;
             const v = (self.readInodeOpt(local) catch return) orelse return;
             if (v.nlink != 0) return;
             self.gatherCorpse(c, local);

@@ -115,6 +115,8 @@ const slot_state = routing.slot_state;
 const stamp_cell = routing.stamp_cell;
 const sym = @import("sym.zig");
 const slots_plane = @import("sym/slots/plane.zig");
+const manager = @import("sym/manager.zig");
+const endpoint = @import("../wire/endpoint.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("backend is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -223,6 +225,21 @@ pub const OpenOptions = struct {
     test_error_logs: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     /// The D0 gate's mode, host identity and seams (`guard/gate.zig`).
     guard: guard.gate.Options = .{},
+};
+
+/// The mount's posture (charter §5.7): the D0 ladder's winner is the
+/// MANAGER of the volume (the flock, the claim, the fixed ledger, tree 0);
+/// a later RW mount of a symmetric set is JOINED (no flock, the region
+/// over the wire, the page as its ledger).
+pub const Posture = enum { manager, joined };
+
+/// `openJoined`'s inputs beyond `OpenOptions`.
+pub const JoinOptions = struct {
+    /// The mount point: the joiner's `mount_slot` derives from it.
+    mountpoint: []const u8,
+    /// `--join <endpoint>`: the manager's listener when the durable
+    /// `endpoint:{0}` record is not to be trusted (or not yet written).
+    endpoint: ?endpoint.EndpointWire = null,
 };
 
 pub const FormatOptions = struct {
@@ -368,8 +385,15 @@ pub const KvBackend = struct {
     gate_ns: u64 = 0,
     /// The symmetric plane's appender set (region 0 = this mount's ring
     /// with `is_manager`, the in-process regions, the manager); null on a
-    /// single-writer volume.
+    /// single-writer volume and on a joiner.
     sym: ?*sym.bind.AppenderSet = null,
+    /// The JOINED posture's plane (`openJoined`): the region over the
+    /// wire, the grant pool, the manager's session; null otherwise.
+    joined: ?*sym.joined.JoinedSet = null,
+    posture: Posture = .manager,
+    /// The cache budget this open was given (a joiner re-creates its
+    /// cache while it polls the projection).
+    cache_budget_bytes: u64 = node_cache.DEFAULT_CACHE_BUDGET_BYTES,
     /// The slot-lease plane: the commit door from the first commit (its
     /// cutover state serves every volume), armed by the appender set.
     slots: *slots_plane.Plane,
@@ -398,55 +422,11 @@ pub const KvBackend = struct {
         var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = owned_path, .mode = mode, .ledger_base = 0, .bitmap_base = 0 };
 
         // 3. The superblock, both copies.
-        const sector0 = try dev.readRange(gpa, 0, superblock.sector_len);
-        defer gpa.free(sector0);
-        const backup: ?[]u8 = if (superblock.backupOffsetFor(volume_len)) |off| try dev.readRange(gpa, off, superblock.sector_len) else null;
-        defer if (backup) |b| gpa.free(b);
-        var sb_diag: superblock.Refusal = undefined;
-        const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &sb_diag) catch {
-            var buf: [512]u8 = undefined;
-            var w: std.Io.Writer = .fixed(&buf);
-            sb_diag.write(&w) catch {};
-            log.err("meta volume {s}: superblock refused: {s}", .{ path, w.buffered() });
-            return error.Corrupt;
-        };
-        const sb = switch (classified.format) {
-            .blank => {
-                log.err("{s} is not formatted (zeroed superblock) — run `squeezefs format` first", .{path});
-                return error.NotFormatted;
-            },
-            .legacy => |v| {
-                log.err("{s} is a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required", .{ path, v });
-                return error.LegacyFormat;
-            },
-            .v4 => |s| s,
-        };
-        if (classified.slot == .backup) log.err("{s}: sector 0 is unreadable — mounting from the redundant superblock copy; investigate the device", .{path});
-        if (sb.unknownIncompat() != 0) {
-            log.err("{s}: unknown incompat feature bits {x} — this binary cannot mount it (reformat required)", .{ path, sb.unknownIncompat() });
-            return error.UnsupportedFormat;
-        }
-        if (sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) != 0) {
-            // Of the four capability bits the block-map tree and the
-            // symmetric plane are implemented (layout deltas and the volume
-            // lifecycle are later rungs').
-            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) });
-            return error.UnsupportedFormat;
-        }
-        if (sb.symmetricPlaneStamped() and !knobs.boolKnob("SQUEEZEFS_SYMMETRIC_META", opts.env)) {
-            log.err("{s}: SQUEEZEFS_SYMMETRIC_META=0 but the superblock carries SYMMETRIC_PLANE — once armed, stays armed; the writable open is refused (`-o ro` is the read posture, never a knob value)", .{path});
-            return error.UnsupportedFormat;
-        }
-        dev.ledger_base = sb.root_ledger.start;
-        dev.bitmap_base = sb.alloc_bitmap.start;
+        const classified = try readSuperblock(gpa, &dev, path, opts.env, volume_len);
+        const sb = classified.sb;
 
         // 4. The ledger.
-        const ledger_img = try dev.readRange(gpa, sb.root_ledger.start, @intCast(sb.root_ledger.len));
-        defer gpa.free(ledger_img);
-        var mounted = (try ledger.newestValid(gpa, ledger_img)) orelse {
-            log.err("{s}: no valid root-ledger record in any of the 32 slots — the volume carries a v4 superblock, so this is corruption, not a fresh format", .{path});
-            return error.Corrupt;
-        };
+        var mounted = try readNewestLedger(gpa, &dev, path, sb);
         errdefer mounted.deinit(gpa);
 
         // 5. The ring: one read, the chain walk from the tail.
@@ -493,7 +473,7 @@ pub const KvBackend = struct {
             .pool_owned = opts.pool == null,
             .volume_len = volume_len,
             .sb = sb,
-            .sb_generation = superblock.nextSuperblockGeneration(sector0, backup),
+            .sb_generation = classified.next_generation,
             .mounted = mounted,
             .dev = dev,
             .layout = layout,
@@ -749,6 +729,404 @@ pub const KvBackend = struct {
 
     fn ckptMain(be: *KvBackend) void {
         be.task.runUntilStopped();
+    }
+
+    const ClassifiedSuperblock = struct { sb: superblock.Superblock, next_generation: u64 };
+
+    /// Step 3 of both opens: both copies read and classified (DUR-5), the
+    /// format and capability gates, the "once armed, stays armed" knob
+    /// gate; the loader's bases set.
+    fn readSuperblock(gpa: Allocator, dev: *device_loader.DeviceLoader, path: []const u8, env: *const std.process.Environ.Map, volume_len: u64) OpenError!ClassifiedSuperblock {
+        const sector0 = try dev.readRange(gpa, 0, superblock.sector_len);
+        defer gpa.free(sector0);
+        const backup: ?[]u8 = if (superblock.backupOffsetFor(volume_len)) |off| try dev.readRange(gpa, off, superblock.sector_len) else null;
+        defer if (backup) |b| gpa.free(b);
+        var sb_diag: superblock.Refusal = undefined;
+        const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &sb_diag) catch {
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            sb_diag.write(&w) catch {};
+            log.err("meta volume {s}: superblock refused: {s}", .{ path, w.buffered() });
+            return error.Corrupt;
+        };
+        const sb = switch (classified.format) {
+            .blank => {
+                log.err("{s} is not formatted (zeroed superblock) — run `squeezefs format` first", .{path});
+                return error.NotFormatted;
+            },
+            .legacy => |v| {
+                log.err("{s} is a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required", .{ path, v });
+                return error.LegacyFormat;
+            },
+            .v4 => |s| s,
+        };
+        if (classified.slot == .backup) log.err("{s}: sector 0 is unreadable — mounting from the redundant superblock copy; investigate the device", .{path});
+        if (sb.unknownIncompat() != 0) {
+            log.err("{s}: unknown incompat feature bits {x} — this binary cannot mount it (reformat required)", .{ path, sb.unknownIncompat() });
+            return error.UnsupportedFormat;
+        }
+        if (sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) != 0) {
+            // Of the four capability bits the block-map tree and the
+            // symmetric plane are implemented (layout deltas and the volume
+            // lifecycle are later rungs').
+            log.err("{s}: capability bits {x} name mechanisms this rung does not implement — refusing the mount", .{ path, sb.features_incompat & ~(superblock.block_map_tree | superblock.symmetric_plane) });
+            return error.UnsupportedFormat;
+        }
+        if (sb.symmetricPlaneStamped() and !knobs.boolKnob("SQUEEZEFS_SYMMETRIC_META", env)) {
+            log.err("{s}: SQUEEZEFS_SYMMETRIC_META=0 but the superblock carries SYMMETRIC_PLANE — once armed, stays armed; the writable open is refused (`-o ro` is the read posture, never a knob value)", .{path});
+            return error.UnsupportedFormat;
+        }
+        dev.ledger_base = sb.root_ledger.start;
+        dev.bitmap_base = sb.alloc_bitmap.start;
+        return .{ .sb = sb, .next_generation = superblock.nextSuperblockGeneration(sector0, backup) };
+    }
+
+    /// Step 4 of both opens: the newest valid ledger record (none on a v4
+    /// volume is corruption). Owned by the caller.
+    fn readNewestLedger(gpa: Allocator, dev: *device_loader.DeviceLoader, path: []const u8, sb: superblock.Superblock) OpenError!ledger.LedgerRecord {
+        const ledger_img = try dev.readRange(gpa, sb.root_ledger.start, @intCast(sb.root_ledger.len));
+        defer gpa.free(ledger_img);
+        return (try ledger.newestValid(gpa, ledger_img)) orelse {
+            log.err("{s}: no valid root-ledger record in any of the 32 slots — the volume carries a v4 superblock, so this is corruption, not a fresh format", .{path});
+            return error.Corrupt;
+        };
+    }
+
+    /// The JOINED open (charter §5.7 "a later RW mount JOINS it"; the spec's
+    /// joined door, `docs/porting/sym_wire_membership_recovery.md` §5.2) —
+    /// the posture of a `squeezefs mount` of a symmetric set whose D0
+    /// ladder another process won:
+    ///
+    /// 1. NO flock (the claim IS the join), no superblock repair, no
+    ///    writer claim: the device registered O_DIRECT read-write.
+    /// 2. The superblock (it must carry the symmetric plane: a
+    ///    `--single-writer` volume has no join door) and the newest ledger
+    ///    record — the checkpointed PROJECTION. Ring 0 is NOT replayed: a
+    ///    replay would dirty tree 0's nodes in THIS cache and the joiner's
+    ///    flush pass would append them over the manager's leaves.
+    /// 3. The cache; the control tree opened READ-ONLY at the record's
+    ///    root (every control write is a wire verb; `set_config`, the
+    ///    secret and the manager's endpoint are read here). The manager's
+    ///    native tree is NOT opened: slot 0's objects (`/` among them) are
+    ///    read under tokens through the divert, never off a projection.
+    /// 4. `sym/joined.zig`: the directory census, the dial, `JoinAppender`
+    ///    → the region: THIS backend's ring is the region's segments, its
+    ///    seq space the join reply's continuation + offset, its node seqs
+    ///    the minted incarnation, its allocator the GRANT MIRROR.
+    /// 5. The lane over the region's ring, the structural writer, the
+    ///    checkpointer in the PAGE-AS-LEDGER posture (no ledger slot, no
+    ///    bitmap page: the page carries roots, cursors, `ckpt_seq`,
+    ///    `ledger_tail_seq`, the pool's largest runs), the conveyor with
+    ///    the region's appender id, grant-fed (`GrantExhausted`, never
+    ///    ENOSPC), the park gate before admission.
+    /// 6. The slot plane armed JOINED: tree 0's projection as the lease
+    ///    view, `M` rotor slots over the wire, the door's first touch over
+    ///    the wire.
+    /// 7. The first page write under this identity (both directory slots:
+    ///    the directory-first law), the checkpoint thread.
+    ///
+    /// Membership (the heartbeat, the park gate's clocks, the endpoint
+    /// publication) is the wire plane's: it needs this mount's own
+    /// listener. `close` releases every lease, leaves the region and frees
+    /// the page under the manager's pen.
+    pub fn openJoined(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions, jopts: JoinOptions) OpenError!*KvBackend {
+        std.debug.assert(io.vtable == &exec.SqzIo.vtable);
+        const t0 = clock.monotonicNs();
+        // 1. The device fd without the flock (held for the mount's life, the
+        // same dedicated-fd rule: never a pool fd).
+        const guard_fd = openGuardFd(path) catch return error.DeviceRefused;
+        errdefer _ = linux.close(guard_fd);
+        const mode = uring_fs.registerMetaDevice(gpa, opts.env, path) catch return error.DeviceRefused;
+        const pool = opts.pool orelse (uring_fs.Pool.init(gpa, uring_fs.Config.resolve(opts.env, derive.Facts.probe())) catch return error.DeviceRefused);
+        errdefer if (opts.pool == null) pool.deinit();
+        const volume_len = device_loader.volumeLength(path) catch return error.DeviceRefused;
+        const be = try gpa.create(KvBackend);
+        errdefer gpa.destroy(be);
+        const owned_path = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned_path);
+        var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = owned_path, .mode = mode, .ledger_base = 0, .bitmap_base = 0 };
+
+        // 2. The superblock and the projection's record.
+        const classified = try readSuperblock(gpa, &dev, path, opts.env, volume_len);
+        const sb = classified.sb;
+        if (!sb.symmetricPlaneStamped()) {
+            log.err("meta volume {s}: another writer holds it and the volume is `--single-writer` (no symmetric plane) — there is no join door; EBUSY", .{path});
+            return error.Busy;
+        }
+        var mounted = try readNewestLedger(gpa, &dev, path, sb);
+        var mounted_in_be = false;
+        errdefer if (!mounted_in_be) mounted.deinit(gpa);
+        const ring_ext = geometry.fixedRingExtent(sb);
+        const ring0_layout = journal.RingLayout.fromExtent(.{ .start = ring_ext.start, .len = ring_ext.len });
+        const ring0_geo = journal.productionGeometry(ring0_layout.pages, mode.grain());
+
+        // 3. The cache and the control tree (read-only). The ring words are
+        // provisional until the join answers (ring 0's geometry: nothing is
+        // written before step 5 replaces them).
+        const layout = node.NodeLayout.new(sb.node_size, null) catch return error.Corrupt;
+        be.* = .{
+            .gpa = gpa,
+            .io = io,
+            .env = opts.env,
+            .path = owned_path,
+            .index = opts.index,
+            .guard_fd = guard_fd,
+            .pool = pool,
+            .pool_owned = opts.pool == null,
+            .volume_len = volume_len,
+            .sb = sb,
+            .sb_generation = classified.next_generation,
+            .mounted = mounted,
+            .dev = dev,
+            .layout = layout,
+            .cache = undefined,
+            .alloc = undefined,
+            .seq = node_seq.NodeSeqHandle.shared(@max(mounted.seq, mounted.node_seq_watermark)),
+            .trees = undefined,
+            .stamp = undefined,
+            .slots = undefined,
+            .ring_layout = ring0_layout,
+            .geo = ring0_geo,
+            .core = jc.JournalCore.init(ring0_geo, mounted.journal_tail_seq, mounted.journal_tail_seq),
+            .reg = undefined,
+            .lane = undefined,
+            .smo_journal = undefined,
+            .smo_ctx = undefined,
+            .ckpt_seam = undefined,
+            .flusher = undefined,
+            .cp = undefined,
+            .task = undefined,
+            .cv = undefined,
+            .ino = inos.InoWatermark.init(mounted.next_ino),
+            .replay = .{ .entries = 0, .dropped_torn = 0, .content_records = 0, .clean_unmount = true, .replay_ns = 0 },
+            .posture = .joined,
+        };
+        mounted_in_be = true;
+        errdefer be.mounted.deinit(gpa);
+        be.dev.path = be.path;
+        be.cache_budget_bytes = opts.cache_budget_bytes;
+        be.cache = try node_cache.NodeCache.init(gpa, io, .{ .layout = layout, .heap_base = sb.heap.start, .budget_bytes = opts.cache_budget_bytes }, be.dev.loader());
+        errdefer be.cache.deinit();
+        be.cache.setDurableTail(mounted.journal_tail_seq);
+        be.trees = try tree.TreeTable.init(gpa, &.{});
+        errdefer {
+            for (be.trees.load()) |t| t.destroy();
+            be.trees.deinit();
+        }
+        try be.openControlProjection();
+        // The stamp: the ledger's (the hosting map); the cursor cells of
+        // the slots this mount leases are floored by the grants' words.
+        be.stamp = try stamp_cell.StampCell.init(gpa, mounted.membership_stamp);
+        errdefer be.stamp.deinit();
+        errdefer {
+            be.guest_published.deinit(gpa);
+            be.guest_cursor_floors.deinit(gpa);
+        }
+
+        // 4. The join: the census, the dial, the region (sym/joined.zig).
+        // The projection may be re-read (and the cache re-created) while
+        // the manager's endpoint is awaited, so the slot plane — whose
+        // frame seam lives in the cache — arms after it.
+        const js = sym.joined.JoinedSet.open(be, jopts.mountpoint, jopts.endpoint) catch |e| return switch (e) {
+            error.ManagerUnreachable, error.PredecessorLive, error.Capacity => error.Busy,
+            error.Rejected, error.Corrupt => error.Corrupt,
+            error.Io => error.Io,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        be.joined = js;
+        errdefer {
+            js.deinit();
+            be.joined = null;
+        }
+        be.slots = try slots_plane.Plane.init(gpa, io, be, opts.env);
+        errdefer be.slots.deinit();
+        const standing = try js.standing();
+        defer gpa.free(standing.granted);
+        // The ring IS the region's: its layout, geometry, head and tail,
+        // the seq offset, the incarnation's node seqs.
+        be.ring_layout = standing.ring_layout;
+        be.geo = standing.geo;
+        be.core = jc.JournalCore.init(standing.geo, standing.head_pos, standing.tail_pos);
+        be.seq = standing.seq;
+        be.reg = try jc.InflightRegistry.init(gpa, standing.head_pos, conveyor.queueCapacity(standing.geo.pages));
+        errdefer be.reg.deinit();
+        be.reg.recoverSeqOffset(standing.seq_offset);
+        // The grant mirror: every extent claimed but the granted runs.
+        be.alloc = alloc_ext.ExtentAllocator.grantMirror(gpa, sb.totalExtents(), sym.joined.MIRROR_RESERVE_EXTENTS, alloc_ext.pending_free_cap, standing.granted) catch return error.OutOfMemory;
+        errdefer be.alloc.deinit();
+
+        // 5. The lane over the region's ring, the structural writer, the
+        // checkpointer (page-as-ledger), the conveyor (grant-fed).
+        be.lane = journal_lane.JournalLane.spawn(gpa, opts.env, .{
+            .path = be.path,
+            .index = opts.index,
+            .core = &be.core,
+            .registry = &be.reg,
+            .ring_stats = &be.ring_stats,
+            .hooks = .{ .ctx = be, .rollback = laneRollbackHook, .checkpoint_past = laneCheckpointPastHook, .barrier_started = laneBarrierStartedHook, .barrier_landed = laneBarrierLandedHook },
+            .test_error_logs = opts.test_error_logs,
+        }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.LaneSpawnFailed,
+        };
+        errdefer be.lane.deinit();
+        be.dev.latch = &be.lane.latch;
+        be.smo_journal = .{ .gpa = gpa, .layout = be.ring_layout, .geo = be.geo, .core = &be.core, .reg = &be.reg, .image = &.{}, .barrier_hook = be.dev.barrierSink(), .latch = &be.lane.latch, .device = .{ .ctx = be, .write = smoWriteHook, .completed = smoCompletedHook }, .appender_id = standing.appender_id };
+        be.smo_journal.retire_seq.store(standing.ckpt_seq + 1, .release);
+        be.smo_ctx = smo.SmoContext.withJournal(&be.alloc, &be.smo_journal);
+        be.smo_ctx.grant_fed = true;
+        be.ckpt_seam = .{ .ctx = &be.smo_ctx, .trees = &be.trees };
+        be.flusher = .{ .cache = be.cache, .smo = be.ckpt_seam.seam() };
+        const flush_ms = checkpoint.flushIntervalMsFromEnv(opts.env);
+        be.cp = checkpoint_cycle.Checkpointer.init(gpa, .{
+            .volume = be.path,
+            .max_age_ms = checkpoint.maxAgeMsFromEnv(opts.env),
+            .flush_interval_ms = flush_ms,
+            .max_dirty_nodes = checkpoint.maxDirtyNodesFromEnv(opts.env, opts.cache_budget_bytes, sb.node_size),
+            .forest = true,
+            .checkpoint_seq = standing.ckpt_seq,
+            .last_ledger_tail = standing.tail_pos,
+        }, .{
+            .core = &be.core,
+            .inflight = &be.reg,
+            .cache = be.cache,
+            .alloc = &be.alloc,
+            .latch = &be.lane.latch,
+            .flush = be.flusher.sink(),
+            .barrier = be.dev.barrierSink(),
+            .ledger = null,
+            .pages = null,
+            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .appenderPages = joinedPagesHook },
+            .smo = be.ckpt_seam.seam(),
+            .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
+        });
+        errdefer be.cp.deinit();
+        be.smo_ctx.space_retry = be.cp.spaceRetryHold();
+        be.cp.space_wake = .{ .notify = &be.space_notify, .io = io };
+        be.task = checkpoint_cycle.CheckpointTask.init(&be.cp, io);
+        be.task.serial = &be.smo_lock;
+        be.cache.installCheckpointKick(be.task.hook());
+        const cpus: u32 = if (opts.cpus != 0) opts.cpus else derive.Facts.probe().cpus;
+        be.cv = try conveyor.Conveyor.init(gpa, .{
+            .io = io,
+            .gpa = gpa,
+            .volume = be.path,
+            .trees = &be.trees,
+            .cache = be.cache,
+            .alloc = &be.alloc,
+            .core = &be.core,
+            .reg = &be.reg,
+            .ring_layout = be.ring_layout,
+            .geo = be.geo,
+            .appender_id = standing.appender_id,
+            .latch = &be.lane.latch,
+            .lane = .{ .ctx = be, .submit = laneSubmit, .barrier = laneBarrier },
+            .pass = .{ .ctx = be, .wake = wakePass },
+            .checkpoint = .{ .ctx = be, .kickPark = kickPark, .kickThreshold = kickThreshold, .checkpointNow = checkpointNowHook, .checkpointPast = checkpointPastHook, .space = &be.space_notify, .posture = &be.cp.posture, .space_retry = be.cp.spaceRetryHold() },
+            .smo_journal = &be.smo_journal,
+            .caps = conveyor.resolveCaps(opts.env, cpus, be.geo),
+            .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
+            .door = be.slots.doorSeam(),
+            .grant_fed = true,
+            .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
+        });
+        errdefer be.cv.deinit();
+        try be.startPass();
+        errdefer be.stopPass();
+
+        // 6. The slot plane armed JOINED (rung 6 over the wire).
+        var mgr_ep: manager.Endpoint = .{};
+        const ep_bytes = std.mem.asBytes(&js.manager_ep);
+        @memcpy(mgr_ep.bytes[0..ep_bytes.len], ep_bytes);
+        mgr_ep.len = @intCast(ep_bytes.len);
+        be.slots.armJoined(js, mgr_ep) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io, error.Deferred => error.Io,
+            error.Refused, error.Corrupt => error.Corrupt,
+        };
+        // 7. The first cycle: the page under this identity with the rotor
+        // (both directory slots), the thread, the cadence.
+        be.smo_lock.lockUncancelable(io);
+        const first = be.cp.checkpointNow();
+        be.smo_lock.unlock(io);
+        first catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return error.Io,
+            else => return error.Corrupt,
+        };
+        be.ckpt_thread = std.Thread.spawn(.{}, ckptMain, .{be}) catch return error.ThreadSpawnFailed;
+        be.replay.replay_ns = clock.monotonicNs() - t0;
+        stats.mounts.inc();
+        log.info("meta volume {s}: mounted JOINED as appender {d} — projection seq {d} (tail {d}), ring {d} B at head {d}, {d} tree(s), {d} grant extent(s) free, {s} cadence", .{ be.path, standing.appender_id, mounted.seq, mounted.journal_tail_seq, be.ring_layout.ringBytes(), be.core.headPos(), be.trees.load().len, be.alloc.freeExtents(), if (flush_ms == 0) "strict" else "coalesced" });
+        return be;
+    }
+
+    /// The joined posture's `RecordSource.appenderPages`: the page IS the
+    /// record (`sym/joined.zig`).
+    fn joinedPagesHook(ctx: *anyopaque, rec: *const ledger.LedgerRecord, _: bool) checkpoint_cycle.IoError!void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        return be.joined.?.onCheckpoint(rec);
+    }
+
+    fn joinedPreAdmission(ctx: *anyopaque) error{Expired}!void {
+        const gate: *sym.membership.park_reclaim.ParkGate = @ptrCast(@alignCast(ctx));
+        return gate.preAdmission();
+    }
+
+    /// Open the control tree at the mounted record's root (the joiner's
+    /// read-only projection of tree 0); the manager's native tree is left
+    /// closed (module doc of `openJoined`).
+    fn openControlProjection(be: *KvBackend) OpenError!void {
+        for (be.mounted.tree_roots) |r| {
+            if (r.id != .control) continue;
+            const t = KvTree.openFromLedger(be.gpa, be.cache, &be.mounted, r.id, &be.seq) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Io => return error.Io,
+                else => return error.Corrupt,
+            };
+            errdefer t.destroy();
+            try be.trees.add(t);
+            return;
+        }
+        log.err("meta volume {s}: the ledger record names no control tree — refusing the join", .{be.path});
+        return error.Corrupt;
+    }
+
+    /// A joiner's re-read of the projection (before any ring of its own
+    /// exists): the newest ledger record replaces the mounted one and the
+    /// control tree re-opens at its root — the manager's latest
+    /// checkpoint, for a control record its window still held.
+    pub fn reopenControlProjection(be: *KvBackend) OpenError!void {
+        std.debug.assert(be.posture == .joined and be.joined == null);
+        var fresh = try readNewestLedger(be.gpa, &be.dev, be.path, be.sb);
+        if (fresh.seq == be.mounted.seq) {
+            fresh.deinit(be.gpa);
+            return;
+        }
+        // The old tree AND its cached nodes go (a leaf the manager appended
+        // to in place keeps its address: the cache would serve the stale
+        // image); nothing else holds a node at this point of the open. The
+        // record moves into `be.mounted` (the caller's unwind owns it).
+        for (be.trees.load()) |t| t.destroy();
+        be.trees.deinit();
+        be.cache.deinit();
+        be.mounted.deinit(be.gpa);
+        be.mounted = fresh;
+        be.trees = try tree.TreeTable.init(be.gpa, &.{});
+        be.cache = try node_cache.NodeCache.init(be.gpa, be.io, .{ .layout = be.layout, .heap_base = be.sb.heap.start, .budget_bytes = be.cache_budget_bytes }, be.dev.loader());
+        be.cache.setDurableTail(fresh.journal_tail_seq);
+        try be.openControlProjection();
+    }
+
+    /// A slot tree that is no longer this mount's (a released lease on a
+    /// joiner): out of the live set (retired with the table) — its extents
+    /// are the manager's custody now, nothing here frees them.
+    pub fn forgetTree(be: *KvBackend, slot: u16) void {
+        be.trees_lock.lockUncancelable(be.io);
+        defer be.trees_lock.unlock(be.io);
+        const t = be.trees.find(.{ .slot = key.guestForestSlot(slot) }) orelse return;
+        be.trees.remove(t) catch return;
+        _ = be.guest_published.remove(slot);
     }
 
     // ---- the pass fiber (stage A on the journal lane) ----
@@ -1639,6 +2017,10 @@ pub const KvBackend = struct {
             // control entries ride ring 0 and the tick covers them), each
             // drained at a fixpoint cycle first.
             if (be.sym) |set| set.leaveAll();
+            // A joiner: every lease released over the wire, the page naming
+            // no slot, the ring drained, `LeaveAppender` (the page Free) —
+            // while the task and the lane still serve the cycles it needs.
+            if (be.joined) |js| js.leave();
             // The task's final tick BEFORE the lane goes: its SMO entries are
             // structural writes on the lane. The tick asserts the registry
             // quiet (`checkpoint_final_tick_open_reservations`) — the
@@ -1665,6 +2047,10 @@ pub const KvBackend = struct {
         if (be.sym) |set| {
             set.deinit();
             be.sym = null;
+        }
+        if (be.joined) |js| {
+            js.deinit();
+            be.joined = null;
         }
         be.cv.deinit();
         be.slots.deinit();

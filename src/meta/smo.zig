@@ -262,6 +262,10 @@ pub const SmoContext = struct {
     /// own SMO; every other checkpoint-class admission keeps.
     keep_exempt: bool = false,
     last_refusal: Refusal = .none,
+    /// The allocator is a JOINED appender's grant mirror: an exhausted
+    /// claim is the manager dependency (`GrantExhausted`, EAGAIN-class,
+    /// refilled over the wire), never the heap's `NoSpace`.
+    grant_fed: bool = false,
 
     pub fn init(alloc: *const alloc_ext.ExtentAllocator) SmoContext {
         return .{ .alloc = alloc };
@@ -1218,7 +1222,7 @@ pub const CheckpointSeam = struct {
         smoReplace(t, self.ctx, n, &out, opts.forced_retirement) catch |e| return switch (e) {
             error.JournalReserveExhausted => .journal_reserve_exhausted,
             error.PendingFreeFull => .pending_free_full,
-            error.NoSpace => .no_space,
+            error.NoSpace => if (self.ctx.grant_fed) .grant_exhausted else .no_space,
             error.OutOfMemory => .{ .failed = .out_of_memory },
             // The device's classes: the cycle aborts and the tick retries.
             error.Io, error.BarrierFailed => .{ .failed = .io },

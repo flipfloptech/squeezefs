@@ -273,6 +273,41 @@ pub const ExtentAllocator = struct {
         return self;
     }
 
+    /// A JOINED appender's allocator (charter §5.5 "allocates only from
+    /// its own grants"): the volume's whole extent index space with EVERY
+    /// extent claimed except the granted runs — the grant pool IS the free
+    /// set, so `claimInternal` draws from it and a retired image's
+    /// pending-free (gated on the joiner's OWN ring tail) recycles into it.
+    /// No page is dirty: the joiner's bitmap pages have no device home —
+    /// the manager's `extent_grant:{a}` record and the alloc/free deltas in
+    /// the joiner's ring are the two durable homes a recovery replays.
+    pub fn grantMirror(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize, granted: []const GrantedRun) !ExtentAllocator {
+        var self = try initEmpty(gpa, total, reserve, pending_cap);
+        errdefer self.deinit();
+        var extent: u64 = 0;
+        while (extent < total) : (extent += 1) self.core.markAllocated(extent);
+        for (granted) |r| self.absorbGranted(r);
+        return self;
+    }
+
+    /// One granted run of extent INDICES (the manager's `GrantRun` is a
+    /// device extent; the mirror speaks indices).
+    pub const GrantedRun = struct { start: u64, len: u64 };
+
+    /// A grant landed (the join's word, a refill): its extents become the
+    /// pool's free set. Mount/cadence-time, under the caller's lock.
+    pub fn absorbGranted(self: *ExtentAllocator, r: GrantedRun) void {
+        var i: u64 = 0;
+        while (i < r.len) : (i += 1) self.core.release(r.start + i);
+    }
+
+    /// A surplus extent leaving the pool (returned to the manager): claimed
+    /// out of the free set so no later SMO can draw it. Null = no free
+    /// extent to withdraw.
+    pub fn withdrawGranted(self: *const ExtentAllocator) ?u64 {
+        return self.core.claim(.internal) catch null;
+    }
+
     fn initEmpty(gpa: std.mem.Allocator, total: u64, reserve: u64, pending_cap: usize) !ExtentAllocator {
         const pages = bitmapPagesFor(total);
         var core = try ExtCore.init(gpa, total, reserve, pending_cap);

@@ -335,6 +335,8 @@ pub const linux_dev = if (builtin.os.tag == .linux) struct {
     pub const Owned = struct {
         obs: Observation,
         record: ?ledger.LedgerRecord,
+        /// The superblock carries `SYMMETRIC_PLANE` (the join door exists).
+        symmetric: bool,
 
         pub fn deinit(self: *Owned, gpa: Allocator) void {
             if (self.record) |*r| r.deinit(gpa);
@@ -375,6 +377,7 @@ pub const linux_dev = if (builtin.os.tag == .linux) struct {
                 .ledger_seq = if (record) |r| r.seq else 0,
             },
             .record = record,
+            .symmetric = sb.symmetricPlaneStamped(),
         };
     }
 } else struct {};

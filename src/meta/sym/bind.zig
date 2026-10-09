@@ -317,9 +317,9 @@ pub const AppenderSet = struct {
             }
             // The ONE page writer's plan: the leased slots ranked by what
             // each loses if dropped, publish-before-drop into tree 0.
-            self.be.slots.planPage(r) catch return error.Io;
+            self.be.slots.planPage(r.appenderId(), &r.core) catch return error.Io;
             self.writePages(r, true) catch return error.Io;
-            self.be.slots.pageLanded(r);
+            self.be.slots.pageLanded(&r.core);
         }
         // The cadence: its own flight after the tick, never inline.
         self.be.slots.kickCadence();

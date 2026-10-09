@@ -66,6 +66,10 @@ pub const Mount = struct {
     daemon: bool = false,
     supervise: bool = false,
     log_file: ?[]const u8 = null,
+    /// `--join host:port`: the live manager's listener when the durable
+    /// `endpoint:` record is not to be trusted (a manager that moved its
+    /// listener before its checkpoint landed).
+    join: ?[]const u8 = null,
 };
 
 pub const Umount = struct {
@@ -272,7 +276,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     const all =
         \\usage: squeezefs <verb> [flags] …
         \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]
-        \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] sqmeta://<path> <mountpoint>
+        \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] sqmeta://<path> <mountpoint>
         \\  squeezefs umount <mountpoint>
         \\  squeezefs status sqmeta://<path>|<mountpoint>
         \\  squeezefs clients [--json] sqmeta://<path>|<mountpoint>
@@ -298,7 +302,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     const v = verb orelse return all;
     return switch (v) {
         .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]\n",
-        .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] sqmeta://<path> <mountpoint>\n",
+        .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] sqmeta://<path> <mountpoint>\n",
         .umount => "usage: squeezefs umount <mountpoint>\n",
         .status => "usage: squeezefs status sqmeta://<path>|<mountpoint>\n",
         .clients => "usage: squeezefs clients [--json] sqmeta://<path>|<mountpoint>\n",
@@ -1035,6 +1039,8 @@ fn parseMount(words: []const []const u8, diag: *Refusal) Error!Verb {
             out.supervise = true;
         } else if (std.mem.eql(u8, f.name, "--log-file")) {
             out.log_file = try c.value(f);
+        } else if (std.mem.eql(u8, f.name, "--join")) {
+            out.join = try c.value(f);
         } else return c.unknown(f);
     }
     const pos = c.pos();

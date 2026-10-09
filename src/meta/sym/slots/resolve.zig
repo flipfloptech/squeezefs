@@ -58,6 +58,19 @@ pub const Liveness = struct {
     isDead: *const fn (ctx: *anyopaque, appender_id: AppenderId) bool,
 };
 
+/// The appender → endpoint table's authority behind the cache's map: the
+/// manager's RAM table (`PublishEndpoint`'s home) in the manager's
+/// process, `ResolveEndpoint` over the wire on a joiner. Consulted on a
+/// map miss, the answer learnt.
+pub const EndpointSource = struct {
+    ctx: *anyopaque,
+    lookup: *const fn (ctx: *anyopaque, id: AppenderId) ?Endpoint,
+    /// Learn the answer into the map (a wire source); false = the source
+    /// is a RAM table consulted on every miss (a moved listener's new row
+    /// is seen at once).
+    learn: bool,
+};
+
 pub const SlotHolderCache = struct {
     gpa: Allocator,
     table: *lt.LeaseTable,
@@ -65,6 +78,7 @@ pub const SlotHolderCache = struct {
     own: *const fn (ctx: *anyopaque, id: AppenderId) bool,
     own_ctx: *anyopaque,
     endpoints: std.AutoHashMapUnmanaged(AppenderId, Endpoint) = .empty,
+    endpoint_source: ?EndpointSource = null,
     /// A view learnt from a redirect or a reply ahead of tree 0 (a grant
     /// reaches the ledger only at the next cycle); a LOWER `g` than the
     /// table's is a stale view and ignored.
@@ -123,9 +137,17 @@ pub const SlotHolderCache = struct {
     }
 
     pub fn endpointOf(self: *SlotHolderCache, id: AppenderId) ?Endpoint {
-        self.lock.lock();
-        defer self.lock.unlock();
-        return self.endpoints.get(id);
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.endpoints.get(id)) |ep| return ep;
+        }
+        // A miss: the table's authority, learnt (never under the spin
+        // lock — the wire source blocks).
+        const src = self.endpoint_source orelse return null;
+        const ep = src.lookup(src.ctx, id) orelse return null;
+        if (src.learn) self.setEndpoint(id, ep) catch {};
+        return ep;
     }
 
     /// `step_home` (spec §6.2): the LEASE TABLE decides (a declared

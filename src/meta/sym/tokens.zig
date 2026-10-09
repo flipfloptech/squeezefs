@@ -670,7 +670,9 @@ test "an unacked recall completes at the reader's lease expiry (expired_with_lea
     // B1 is unreachable and its lease is 20 ms from expiry: the pass waits
     // for nobody past that; B2 acks inline.
     f.peers.unreachable_[0] = true;
-    try f.leases.grant(1, clock.monotonicNs() - table.T_OWNER_NS + 20 * std.time.ns_per_ms);
+    // Saturating: a venue booted under `T_OWNER` ago has a monotonic clock
+    // below it (the fixture's grant time is then the epoch + 20 ms).
+    try f.leases.grant(1, (clock.monotonicNs() -| table.T_OWNER_NS) + 20 * std.time.ns_per_ms);
     const live0 = table.stats.dlm_token_recall_timeouts_live.load();
     const t0 = clock.monotonicNs();
     const sum = try f.commit(&.{objectOf(3)}, &bumpMtime);

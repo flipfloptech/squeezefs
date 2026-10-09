@@ -406,8 +406,16 @@ pub const Deps = struct {
     latch: *journal.FailureLatch,
     flush: FlushSink,
     barrier: BarrierSink,
-    ledger: LedgerSink,
-    pages: PageSink,
+    /// The fixed ledger's slot writer; null = the PAGE-AS-LEDGER posture
+    /// of a JOINED appender (charter §5.5 "the page IS the appender's
+    /// ledger record"): the record's durable home is `record.appenderPages`
+    /// alone, which must then be bound.
+    ledger: ?LedgerSink,
+    /// The allocator bitmap's page writer; null = a joiner, whose
+    /// allocator is a grant mirror with no bitmap home (its dirty set is
+    /// discharged each cycle without a write: the deltas in its ring and
+    /// the manager's grant record are the homes).
+    pages: ?PageSink,
     record: RecordSource,
     smo: SmoSeam,
     maintenance: MaintenanceSource,
@@ -486,6 +494,8 @@ pub const Checkpointer = struct {
     reserve_deferred_addr: ?u64 = null,
 
     pub fn init(gpa: Allocator, cfg: Config, deps: Deps) Checkpointer {
+        // The record needs ONE durable home: the ledger slot or the page.
+        std.debug.assert(deps.ledger != null or deps.record.appenderPages != null);
         const now = clock.monotonicNs();
         return .{
             .gpa = gpa,
@@ -867,12 +877,24 @@ pub const Checkpointer = struct {
             .node_seq_watermark = self.deps.record.node_seq.load(),
             .membership_stamp = self.deps.record.membershipStamp(self.deps.record.ctx),
         };
-        self.writeLedgerRecord(record) catch |e| {
-            // The covering record never landed: the previous record stays
-            // authoritative and the dying floors are still uncovered.
-            self.deps.cache.restoreDyingFloors(dying);
-            return e;
-        };
+        const cache_clean = dirty_floor_min == node_cache.no_floor and dying == node_cache.no_floor;
+        if (self.deps.ledger != null) {
+            self.writeLedgerRecord(record) catch |e| {
+                // The covering record never landed: the previous record stays
+                // authoritative and the dying floors are still uncovered.
+                self.deps.cache.restoreDyingFloors(dying);
+                return e;
+            };
+        } else {
+            // Page-as-ledger: the page write IS the record's landing, so
+            // its failure is the record's (the previous page stays
+            // authoritative; the next cycle rewrites it).
+            const f = self.deps.record.appenderPages.?;
+            f(self.deps.record.ctx, &record, cache_clean) catch |e| {
+                self.deps.cache.restoreDyingFloors(dying);
+                return e;
+            };
+        }
         // ---- C10.
         self.checkpoint_seq.store(ckpt_seq, .release);
         self.last_ledger_tail.store(tail, .release);
@@ -883,7 +905,7 @@ pub const Checkpointer = struct {
         ckpt.stats.meta_kv_checkpoints.inc();
         // C11: the appender pages (the record is authoritative; a page that
         // fails to land is one cycle stale and the next cycle rewrites it).
-        if (self.deps.record.appenderPages) |f| try f(self.deps.record.ctx, &record, dirty_floor_min == node_cache.no_floor and dying == node_cache.no_floor);
+        if (self.deps.ledger != null) if (self.deps.record.appenderPages) |f| try f(self.deps.record.ctx, &record, cache_clean);
         const t_ledger = clock.monotonicNs();
 
         // ---- C12: make THIS record durable now and judge progress.
@@ -914,8 +936,13 @@ pub const Checkpointer = struct {
         var set = try self.deps.alloc.beginDirtyPageWrite(generation);
         defer set.deinit();
         if (set.writes.len == 0) return;
+        const pages = self.deps.pages orelse {
+            // A grant mirror: the dirty set is discharged, nothing lands.
+            set.commit(self.deps.alloc);
+            return;
+        };
         for (set.writes) |*w| {
-            self.deps.pages.writePage(self.deps.pages.ctx, w.offset, &w.image) catch |e| {
+            pages.writePage(pages.ctx, w.offset, &w.image) catch |e| {
                 // Law 1: the snapshot is this write's only copy — re-dirty.
                 set.abort(self.deps.alloc);
                 return e;
@@ -929,7 +956,8 @@ pub const Checkpointer = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt, error.ChecksumMismatch => error.Corrupt,
         };
-        try self.deps.ledger.writeSlot(self.deps.ledger.ctx, record.slotIndex(), &image);
+        const l = self.deps.ledger.?;
+        try l.writeSlot(l.ctx, record.slotIndex(), &image);
         ckpt.stats.meta_kv_ledger_writes.inc();
     }
 

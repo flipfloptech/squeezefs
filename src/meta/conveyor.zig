@@ -233,6 +233,10 @@ pub const Error = error{
     /// The door's first touch was deferred (ring 0's window, the
     /// structural door's moving tail): EAGAIN, nothing written.
     Deferred,
+    /// A JOINED appender's grant pool could not back the member's
+    /// projected SMO: the manager dependency (EAGAIN; the cadence's refill
+    /// owns the retry), never ENOSPC (charter §5.5 "Extent grants").
+    GrantExhausted,
 };
 
 pub const ErrorClass = errors.Class;
@@ -254,6 +258,7 @@ pub fn coreError(e: Error) errors.Error {
         error.HoleCheckpointFailed => error.HoleCheckpointFailed,
         error.SlotBusy => error.SlotMoved,
         error.Deferred => error.Deferred,
+        error.GrantExhausted => error.GrantExhausted,
         error.JournalWriteFailed, error.Io, error.Corrupt, error.RetryBudgetExhausted => error.InputOutput,
     };
 }
@@ -636,6 +641,19 @@ pub const Deps = struct {
     park_escalation_ns: u64,
     /// The commit door (null = none).
     door: ?DoorSeam = null,
+    /// A JOINED appender's posture: the allocator is its grant mirror, so
+    /// a heap refusal is `GrantExhausted` (EAGAIN) — never ENOSPC.
+    grant_fed: bool = false,
+    /// The park-and-reclaim gate consulted BEFORE ring admission (null =
+    /// the manager, whose home shard is itself): a parked joiner's
+    /// committers wait here holding nothing; an expired park fails them.
+    pre_admission: ?PreAdmission = null,
+};
+
+/// The pre-admission gate's seam (`park_reclaim.ParkGate.preAdmission`).
+pub const PreAdmission = struct {
+    ctx: *anyopaque,
+    wait: *const fn (ctx: *anyopaque) error{Expired}!void,
 };
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1035,13 @@ pub const Conveyor = struct {
     fn admitUserBudget(self: *Conveyor, len: u64, err: *Error) ?jc.Admission {
         const io = self.deps.io;
         const core = self.deps.core;
+        // The park gate first (charter §5.5 PARK-AND-RECLAIM: "acks held
+        // at a pre-admission gate"): a parked joiner admits nothing until
+        // the reclaim lands; an expired park is the terminal poison.
+        if (self.deps.pre_admission) |g| g.wait(g.ctx) catch {
+            err.* = error.VolumeFailed;
+            return null;
+        };
         if (core.tryAdmit(len, .user)) |a| return a;
         // ONE stall per park entry, however many wakes and ticks it spans.
         self.stats.full_stalls.inc();
@@ -1263,7 +1288,7 @@ pub const Conveyor = struct {
                             const rf = refused.items[i];
                             const e = heap_law.finalizeRefusal(self.deps.checkpoint.posture, self.deps.volume, rf.why, self.deps.cache.heapPromised());
                             var m = members.orderedRemove(rf.member);
-                            self.answer(&m, e);
+                            self.answer(&m, if (self.deps.grant_fed) error.GrantExhausted else e);
                         }
                         if (members.items.len == 0) return;
                     },
@@ -2020,6 +2045,9 @@ test "the error table is the ONE table: every member maps onto a core member wit
     }
     try testing.expectEqual(std.os.linux.E.NOSPC, errnoOf(error.NoSpace));
     try testing.expectEqual(ErrorClass.terminal, classOf(error.NoSpace));
+    // A joiner's exhausted grant is the manager dependency: retryable.
+    try testing.expectEqual(std.os.linux.E.AGAIN, errnoOf(error.GrantExhausted));
+    try testing.expectEqual(ErrorClass.retryable, classOf(error.GrantExhausted));
     try testing.expectEqual(std.os.linux.E.IO, errnoOf(error.VolumeFailed));
     try testing.expectEqual(ErrorClass.refusal, classOf(error.VolumeFailed));
     try testing.expectEqual(ErrorClass.retryable, classOf(error.ConveyorFull));

@@ -88,6 +88,10 @@ pub const OpenOptions = struct {
     guard: guard.gate.Options = .{},
     /// A `-o ro` open only RESOLVES dual claims (never converges them).
     read_only: bool = false,
+    /// The join door's inputs (the mount point, an explicit manager
+    /// endpoint); null = a D0 loser is refused `Busy` (the in-process
+    /// harnesses, which never join).
+    join: ?backend.JoinOptions = null,
 };
 
 pub const MetaSet = struct {
@@ -115,6 +119,9 @@ pub const MetaSet = struct {
     /// a disarm, so the tee lives as long as the set).
     tee: ?*routing.migration_tee.MigrationTee = null,
     tee_hook: conveyor.CommitTee = undefined,
+    /// Every member's posture (one per set: the manager of them all, or
+    /// joined to their manager).
+    posture: backend.Posture = .manager,
     closed: bool = false,
 
     // ---- open / close ----
@@ -172,8 +179,13 @@ pub const MetaSet = struct {
         errdefer gpa.free(volumes);
         var opened: usize = 0;
         errdefer for (volumes[0..opened]) |be| be.close();
+        // The posture (charter §5.7): volume 0's D0 ladder decides. Its
+        // winner is the manager of every volume it opens; a loser whose
+        // volume carries the symmetric plane JOINS the live manager — of
+        // every volume, through the same door (a set is never half-joined).
+        var posture: backend.Posture = .manager;
         for (disc.order, 0..) |oi, vi| {
-            volumes[vi] = try KvBackend.open(gpa, io, paths[oi], .{
+            const be_opts: backend.OpenOptions = .{
                 .env = opts.env,
                 .pool = pool,
                 .index = @intCast(vi),
@@ -181,7 +193,18 @@ pub const MetaSet = struct {
                 .cpus = opts.cpus,
                 .test_error_logs = opts.test_error_logs,
                 .guard = opts.guard,
-            });
+            };
+            volumes[vi] = switch (posture) {
+                .manager => KvBackend.open(gpa, io, paths[oi], be_opts) catch |e| blk: {
+                    if (e != error.Busy or vi != 0 or opts.read_only or !owned[oi].symmetric or opts.join == null) return e;
+                    // The D0 loser of a symmetric set: the join door.
+                    posture = .joined;
+                    rstats.routing_joined_opens.inc();
+                    log.info("metadata set: volume 0's writer lock is held by a live manager — joining the set as an equal writer over the cluster wire", .{});
+                    break :blk try KvBackend.openJoined(gpa, io, paths[oi], be_opts, opts.join.?);
+                },
+                .joined => try KvBackend.openJoined(gpa, io, paths[oi], be_opts, opts.join.?),
+            };
             opened += 1;
         }
         const rotors = try gpa.alloc(router.MintRotor, paths.len);
@@ -203,10 +226,12 @@ pub const MetaSet = struct {
             .set_uuid = disc.set_uuid,
             .hash_seed = disc.hash_seed,
             .node_size = disc.node_size,
+            .posture = posture,
         };
         errdefer self.route.deinit();
-        if (!opts.read_only) try self.convergeDualClaims(disc.dual_claims);
-        log.info("metadata set {x:0>2}{x:0>2}{x:0>2}{x:0>2}…: {d} member(s) mounted in canonical order, epoch {d}, {d} dual claim(s) converged, native keyspace on member {d}", .{ disc.set_uuid[0], disc.set_uuid[1], disc.set_uuid[2], disc.set_uuid[3], paths.len, disc.set_epoch, disc.dual_claims.len, disc.native_volume });
+        // A joiner converges nothing: the stamps are the manager's.
+        if (!opts.read_only and posture == .manager) try self.convergeDualClaims(disc.dual_claims);
+        log.info("metadata set {x:0>2}{x:0>2}{x:0>2}{x:0>2}…: {d} member(s) mounted in canonical order as {s}, epoch {d}, {d} dual claim(s) converged, native keyspace on member {d}", .{ disc.set_uuid[0], disc.set_uuid[1], disc.set_uuid[2], disc.set_uuid[3], paths.len, @tagName(posture), disc.set_epoch, if (posture == .manager) disc.dual_claims.len else 0, disc.native_volume });
         return self;
     }
 
@@ -584,7 +609,7 @@ pub const MetaSet = struct {
 
     /// The set-level words + every member's per-volume families.
     pub fn writeStatsJson(self: *MetaSet, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("{{\"routing_volumes\":{d},\"routing_width\":{d},\"routing_set_epoch\":{d},\"routing_closed_slot\":{?d},\"volumes\":[", .{ self.volumes.len, route_table.W, self.setEpoch(), self.closedSlot() });
+        try w.print("{{\"routing_volumes\":{d},\"routing_width\":{d},\"routing_set_epoch\":{d},\"routing_closed_slot\":{?d},\"mount_posture\":\"{s}\",\"volumes\":[", .{ self.volumes.len, route_table.W, self.setEpoch(), self.closedSlot(), @tagName(self.posture) });
         for (self.volumes, 0..) |be, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"index\":{d},\"epoch\":{d},\"hosted_slots\":{d},\"trees\":{d},\"native\":{},\"failed\":{},\"conveyor\":", .{ i, be.setEpoch(), be.stamp.hostedCount(), be.trees.load().len, be.stamp.native_slot != null, be.isFailed() });
@@ -596,7 +621,7 @@ pub const MetaSet = struct {
                 try g.writeStatsJson(w);
             }
             try w.writeAll(",\"sym\":");
-            if (be.sym) |set| try set.writeStatsJson(w) else try backend.KvBackend.writeSoloSymStatsJson(be, w);
+            if (be.sym) |set| try set.writeStatsJson(w) else if (be.joined) |js| try js.writeStatsJson(w) else try backend.KvBackend.writeSoloSymStatsJson(be, w);
             try w.writeByte('}');
         }
         try w.writeAll("]}");

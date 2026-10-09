@@ -55,6 +55,9 @@ pub const stats = struct {
     pub var routing_mint_volume_picks: counters.ShardedCounter = .{};
     /// `routing_guest_trees_minted`: slot trees created on first touch.
     pub var routing_guest_trees_minted: counters.ShardedCounter = .{};
+    /// `routing_joined_opens`: sets opened through the join door (volume
+    /// 0's D0 ladder lost to a live manager; charter §5.7).
+    pub var routing_joined_opens: counters.ShardedCounter = .{};
     /// `routing_split_refused`: a transaction spanning two members reached
     /// the set facade — a committer defect (the cross-owner intents are the
     /// law, decision 0003 §E); refused EIO, nothing written. Must stay 0.
@@ -77,7 +80,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "routing_gate_parks", "routing_dual_claims_converged", "routing_mint_volume_picks", "routing_guest_trees_minted", "migrate_slots_completed", "migrate_slots_aborted", "migrate_records_copied", "migrate_delta_keys", "migrate_delta_overflows", "migrate_cutover_retries", "staging_rebind_barriers" }) |name| {
+    inline for (.{ "routing_gate_parks", "routing_dual_claims_converged", "routing_mint_volume_picks", "routing_guest_trees_minted", "routing_joined_opens", "migrate_slots_completed", "migrate_slots_aborted", "migrate_records_copied", "migrate_delta_keys", "migrate_delta_overflows", "migrate_cutover_retries", "staging_rebind_barriers" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "routing_gate_armed", "routing_stamp_runs_max", "routing_stamp_cursors_max" }) |name| {

@@ -27,6 +27,7 @@ pub const manager = @import("sym/manager.zig");
 pub const join = @import("sym/join.zig");
 pub const slots = @import("sym/slots.zig");
 pub const bind = if (builtin.os.tag == .linux) @import("sym/bind.zig") else struct {};
+pub const joined = if (builtin.os.tag == .linux) @import("sym/joined.zig") else struct {};
 pub const wire_plane = if (builtin.os.tag == .linux) @import("sym/wire_plane.zig") else struct {};
 pub const tokens = @import("sym/tokens.zig");
 pub const membership = @import("sym/membership.zig");
@@ -75,6 +76,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try xv.writeStatsJson(w);
     try w.writeAll(",\"wire\":");
     if (builtin.os.tag == .linux) try counters.writeNamespaceJson(wire_plane.stats, w) else try w.writeAll("{}");
+    try w.writeAll(",\"joined\":");
+    if (builtin.os.tag == .linux) try counters.writeNamespaceJson(joined.stats, w) else try w.writeAll("{}");
     try w.writeByte('}');
 }
 

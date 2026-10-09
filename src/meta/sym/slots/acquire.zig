@@ -363,6 +363,11 @@ pub const Seams = struct {
     install: *const fn (ctx: *anyopaque, slot: u16, holder: AppenderId, g: u32, words: SlotWords, fresh: bool) Error!void,
     /// After a release landed: the slot's tree is the manager's.
     released: *const fn (ctx: *anyopaque, slot: u16) void,
+    /// A grant to a WIRE appender landed: the slot's tree (an unleased
+    /// tree this process maintained) is the grantee's — out of this
+    /// process's cache, read under its tokens from here on. Null = the
+    /// RAM harnesses.
+    foreignGranted: ?*const fn (ctx: *anyopaque, slot: u16) void = null,
     /// The in-process accept: the holder's flush-then-transfer to `to`
     /// (handover.zig's `Transfer` run by the plane); answers once tree 0
     /// names the slot `Unleased`.
@@ -561,11 +566,14 @@ pub const Verbs = struct {
         try self.control(recs.items);
         stats.slot_grants.add(grants.len);
         // The install: this process's regions adopt now; a wire grantee's
-        // install is its own (the reply carries the words).
+        // install is its own (the reply carries the words) and the tree
+        // leaves THIS process's custody (`foreignGranted`).
         if (self.seams.ownsRegion(self.seams.ctx, req.appender_id)) {
             for (grants) |g| self.seams.install(self.seams.ctx, g.slot, req.appender_id, g.g, g.words, true) catch |e| {
                 log.err("slot leases: the install of slot {d} after its grant to appender {d} failed ({s}) — tree 0 names the lease; the next open re-adopts it", .{ g.slot, req.appender_id, @errorName(e) });
             };
+        } else if (self.seams.foreignGranted) |f| {
+            for (grants) |g| f(self.seams.ctx, g.slot);
         }
         const t1 = clock.monotonicNs();
         self.mgr.ledger.record(t1, 0, t1 - t0, 0);

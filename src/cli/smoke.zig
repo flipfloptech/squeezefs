@@ -1268,6 +1268,402 @@ fn numberAfter(text: []const u8, key: []const u8) ?u64 {
     return std.fmt.parseInt(u64, text[i + key.len .. j], 10) catch null;
 }
 
+/// A SECOND daemon of the rig's set at its own mount point with its own
+/// log (the two-daemon matrix: A is the rig's child, B a `Peer`).
+const Peer = struct {
+    rig: *Rig,
+    name: []const u8,
+    mp: [:0]u8,
+    log_path: [:0]u8,
+    log_file: ?Io.File = null,
+    child: ?std.process.Child = null,
+    pid: linux.pid_t = 0,
+
+    fn init(rig: *Rig, name: []const u8) !*Peer {
+        const gpa = rig.gpa;
+        const self = try gpa.create(Peer);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .rig = rig,
+            .name = name,
+            .mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/mnt-{d}-{s}", .{ linux.getpid(), name }, 0),
+            .log_path = try std.fmt.allocPrintSentinel(gpa, "{s}/daemon-{s}.log", .{ rig.work, name }, 0),
+        };
+        _ = linux.mkdir(self.mp.ptr, 0o755);
+        return self;
+    }
+
+    fn deinit(self: *Peer) void {
+        const gpa = self.rig.gpa;
+        if (self.child) |*c| {
+            _ = linux.kill(self.pid, .KILL);
+            _ = c.wait(self.rig.io) catch {};
+        }
+        self.printAlerts();
+        _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
+        if (self.log_file) |f| f.close(self.rig.io);
+        _ = linux.rmdir(self.mp.ptr);
+        gpa.free(self.mp);
+        gpa.free(self.log_path);
+        gpa.destroy(self);
+    }
+
+    fn printAlerts(self: *Peer) void {
+        const text = self.readLog() catch return;
+        defer self.rig.gpa.free(text);
+        var it = std.mem.splitScalar(u8, text, '\n');
+        var n: usize = 0;
+        while (it.next()) |line| {
+            if (std.mem.startsWith(u8, line, "error(") or std.mem.startsWith(u8, line, "warn(") or std.mem.indexOf(u8, line, "TRIPWIRE") != null) {
+                if (n == 0) std.debug.print("\n--- daemon {s} alerts ---\n", .{self.name});
+                std.debug.print("{s}\n", .{line[0..@min(line.len, 400)]});
+                n += 1;
+                if (n == 40) break;
+            }
+        }
+    }
+
+    fn spawn(self: *Peer, extra: []const []const u8) !void {
+        std.debug.assert(self.child == null);
+        const rig = self.rig;
+        if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(rig.io, self.log_path, .{ .truncate = false });
+        var argv: [16][]const u8 = undefined;
+        var n: usize = 0;
+        argv[n] = rig.bin;
+        n += 1;
+        argv[n] = "mount";
+        n += 1;
+        for (extra) |a| {
+            argv[n] = a;
+            n += 1;
+        }
+        argv[n] = rig.meta_uri;
+        n += 1;
+        argv[n] = self.mp;
+        n += 1;
+        self.child = try std.process.spawn(rig.io, .{ .argv = argv[0..n], .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
+        self.pid = self.child.?.id.?;
+    }
+
+    fn readLog(self: *Peer) ![]u8 {
+        return Io.Dir.cwd().readFileAlloc(self.rig.io, self.log_path, self.rig.gpa, .limited(16 << 20));
+    }
+
+    fn awaitLog(self: *Peer, needle: []const u8, from: usize, deadline_ns: u64) !usize {
+        const deadline = clock.monotonicNs() + deadline_ns;
+        while (true) {
+            const text = try self.readLog();
+            defer self.rig.gpa.free(text);
+            if (text.len > from) if (std.mem.indexOf(u8, text[from..], needle)) |i| return from + i + needle.len;
+            if (self.child != null and !alive(self.pid)) {
+                std.debug.print("\n--- daemon {s} exited while waiting for '{s}' ---\n{s}\n", .{ self.name, needle, text });
+                return error.DaemonExited;
+            }
+            if (clock.monotonicNs() >= deadline) {
+                std.debug.print("\n--- daemon {s}: timed out waiting for '{s}' ---\n{s}\n", .{ self.name, needle, text });
+                return error.Timeout;
+            }
+            sleepMs(20);
+        }
+    }
+
+    fn awaitReady(self: *Peer) !usize {
+        return self.awaitLog("ready: ", 0, ready_wait_ns);
+    }
+
+    /// The mount's `.stats` (the whole JSON; the SIGUSR1 dump's lines are
+    /// capped at the log sink's `LINE_MAX`).
+    fn stats(self: *Peer) ![]u8 {
+        return self.onMount("cat .stats");
+    }
+
+    /// A `sh -e` script with the peer's mount as cwd.
+    fn onMount(self: *Peer, script: []const u8) ![]u8 {
+        const rig = self.rig;
+        const r = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "sh", "-e", "-c", script, "smoke", rig.work }, .cwd = .{ .path = self.mp }, .environ_map = &rig.env });
+        defer rig.gpa.free(r.stderr);
+        if (!r.term.success()) {
+            std.debug.print("\n--- {s}: mount script failed ({f}) ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ self.name, r.term, script, r.stdout, r.stderr });
+            rig.gpa.free(r.stdout);
+            return error.ScriptFailed;
+        }
+        return r.stdout;
+    }
+
+    fn umount(self: *Peer) !void {
+        const r = try self.rig.squeezefs(&.{ "umount", self.mp });
+        defer self.rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\numount {s}: {s}\n", .{ self.name, r.stderr });
+        try testing.expect(r.term.success());
+    }
+
+    fn waitExit(self: *Peer) !std.process.Child.Term {
+        var c = self.child.?;
+        self.child = null;
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (alive(self.pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        if (alive(self.pid)) {
+            std.debug.print("\n--- daemon {s} did not exit within {d} s; killing ---\n", .{ self.name, exit_wait_ns / std.time.ns_per_s });
+            _ = linux.kill(self.pid, .KILL);
+        }
+        return c.wait(self.rig.io);
+    }
+};
+
+/// The two-daemon matrix's file count per directory: 4 × 500 = the 2,000
+/// creates the evidence note's row names.
+const matrix_dirs: usize = 4;
+const matrix_files_per_dir: usize = 500;
+/// The matrix's `dd` on B: 200 MiB over the set's 4 MiB data blocks (the
+/// format default the rig's set declares) = 50 blocks, every one a grant.
+const matrix_dd_blocks: u64 = 50;
+const matrix_block_kib: u64 = 4096;
+
+fn matrixCreateScript(gpa: std.mem.Allocator) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try w.writer.print("for d in $(seq 0 {d}); do mkdir b$d; done; for d in $(seq 0 {d}); do for i in $(seq 0 {d}); do printf 'b%s-f%s\\n' $d $i > b$d/f$i; done; done; ls b0 | wc -l", .{ matrix_dirs - 1, matrix_dirs - 1, matrix_files_per_dir - 1 });
+    return w.toOwnedSlice();
+}
+
+test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SECOND PROCESS joined over TCP (no flock, the region over the wire, the page as its ledger) → `appenders`/`clients` show both → B creates 2,000 files in its own directories (0 lease conflicts, rotor mints) → A reads B's files under tokens (grants; the second read is served from the cache; a write on B recalls and A's third read is fresh) → `tar -x` on B into a directory A owns (cross-owner intents, 0 stuck, closure) → `chmod` from A on B's file (the record ship; B's stat sees it) → a 200 MiB `dd` on B (every block a ranged grant pulled from A; `df` per the rule on both; the sha round trip from A; `rm` ships the frees to A) → closure + invariant tripwires 0 on both → umount B (page Free, the member row gone) → umount A" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // The manager's endpoint lands in tree 0 at its first checkpoint; the
+    // joiner polls the projection for it (bounded) — nothing to wait for.
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "joining the set as an equal writer") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "slot leases armed (JOINED") != null);
+    }
+    {
+        const tail = try b.stats();
+        defer gpa.free(tail);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"mount_posture\":\"joined\"") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"wire_posture\":\"joined\"") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"manager_lease\":\"joined\"") != null);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"member_epoch\":"));
+    }
+    // `appenders`: pages 0 (A, mgr) and 1 (B) Live; `clients`: A's claim
+    // and B's member row (B's pid, live).
+    {
+        const r = try rig.squeezefs(&.{ "appenders", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nappenders: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "2 appender page(s)") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "mgr") != null);
+        std.debug.print("\nsmoke: matrix: appenders with A and B:\n{s}", .{r.stdout});
+    }
+    {
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        while (true) {
+            const r = try rig.squeezefs(&.{ "clients", rig.meta_uri });
+            defer rig.freeRun(r);
+            try testing.expect(r.term.success());
+            if (std.mem.indexOf(u8, r.stdout, "member ") != null and std.mem.indexOf(u8, r.stdout, "writer ") != null) {
+                std.debug.print("smoke: matrix: clients:\n{s}", .{r.stdout});
+                break;
+            }
+            if (clock.monotonicNs() >= deadline) {
+                std.debug.print("\n--- clients never listed B's member row ---\n{s}\n", .{r.stdout});
+                return error.MembersNotListed;
+            }
+            sleepMs(200);
+        }
+    }
+    // B creates 2,000 files in its own directories: the mkdirs under `/`
+    // (A's slot) are cross-owner intents; the files mint into B's rotor.
+    {
+        const script = try matrixCreateScript(gpa);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("500\n", out);
+        const tail = try b.stats();
+        defer gpa.free(tail);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"slot_lease_conflicts\":"));
+        try testing.expect((numberAfter(tail, "\"rotor_mints\":") orelse 0) > 0);
+        try testing.expect((numberAfter(tail, "\"xv_cross_owner_intents_minted\":") orelse 0) >= matrix_dirs);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"xv_cross_owner_intents_stuck\":"));
+        std.debug.print("smoke: matrix: B created {d} files — rotor_mints {d}, intents minted {d}, slot_grants {d}, extent refills {d}\n", .{ matrix_dirs * matrix_files_per_dir, numberAfter(tail, "\"rotor_mints\":") orelse 0, numberAfter(tail, "\"xv_cross_owner_intents_minted\":") orelse 0, numberAfter(tail, "\"slot_grants\":") orelse 0, numberAfter(tail, "\"extent_grant_refills\":") orelse 0 });
+    }
+    // A reads B's files under tokens: the first `cat` dials B and takes
+    // a grant; the second is served from A's cache (no new grant on B); a
+    // write on B recalls A's token and A's third read is fresh.
+    {
+        const first = try rig.onMount("cat b1/f7; ls b0 | wc -l");
+        defer gpa.free(first);
+        try testing.expectEqualStrings("b1-f7\n500\n", first);
+        const tail_b1 = try b.stats();
+        defer gpa.free(tail_b1);
+        const grants1 = numberAfter(tail_b1, "\"dlm_token_grants\":") orelse 0;
+        try testing.expect(grants1 > 0);
+        const second = try rig.onMount("cat b1/f7");
+        defer gpa.free(second);
+        try testing.expectEqualStrings("b1-f7\n", second);
+        const tail_b2 = try b.stats();
+        defer gpa.free(tail_b2);
+        try testing.expectEqual(grants1, numberAfter(tail_b2, "\"dlm_token_grants\":") orelse 0);
+        const w = try b.onMount("printf 'fresh\\n' > b1/f7");
+        gpa.free(w);
+        const third = try rig.onMount("cat b1/f7");
+        defer gpa.free(third);
+        try testing.expectEqualStrings("fresh\n", third);
+        const tail_b3 = try b.stats();
+        defer gpa.free(tail_b3);
+        try testing.expect((numberAfter(tail_b3, "\"dlm_token_recalls\":") orelse 0) > 0);
+        std.debug.print("smoke: matrix: A's token reads of B's files — grants on B {d}, recalls {d}, A's holder resolves {d}\n", .{ grants1, numberAfter(tail_b3, "\"dlm_token_recalls\":") orelse 0, blk: {
+            const ta = try rig.onMount("cat .stats");
+            defer gpa.free(ta);
+            break :blk numberAfter(ta, "\"dlm_token_reader_holder_resolves\":") orelse 0;
+        } });
+    }
+    // `tar -x` on B into a directory A owns: every create is a cross-owner
+    // intent (the dentry ships to A); none stuck; closure.
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+        const tar_src = try rig.shOk(rig.work, "rm -rf tree && mkdir -p tree && for i in $(seq 0 199); do printf 't%s\\n' $i > tree/t$i; done && tar -cf tree.tar tree && echo ok");
+        gpa.free(tar_src);
+        const out = try b.onMount("cd a-dir && tar -xf \"$1/tree.tar\" && ls tree | wc -l");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("200\n", out);
+        const seen = try rig.onMount("ls a-dir/tree | wc -l; cat a-dir/tree/t5");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("200\nt5\n", seen);
+        const tail = try b.stats();
+        defer gpa.free(tail);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"xv_cross_owner_intents_stuck\":"));
+        const minted = numberAfter(tail, "\"xv_cross_owner_intents_minted\":") orelse 0;
+        const retired = numberAfter(tail, "\"xv_cross_owner_intents_retired\":") orelse 0;
+        const open = numberAfter(tail, "\"xv_cross_owner_intents_open\":") orelse 0;
+        try testing.expectEqual(minted, retired + open);
+        std.debug.print("smoke: matrix: tar -x on B into A's dir — intents minted {d}, retired {d}, open {d}, steps shipped {d}\n", .{ minted, retired, open, numberAfter(tail, "\"xv_cross_owner_steps_shipped\":") orelse 0 });
+    }
+    // `chmod` from A on B's file: ONE shipped record verb to B; B's own
+    // kernel view is invalidated, its `stat` sees the mode.
+    {
+        const ch = try rig.onMount("chmod 600 b2/f3");
+        gpa.free(ch);
+        const mode = try b.onMount("stat -c %a b2/f3");
+        defer gpa.free(mode);
+        try testing.expectEqualStrings("600\n", mode);
+        const tail = try rig.onMount("cat .stats");
+        defer gpa.free(tail);
+        try testing.expect((numberAfter(tail, "\"record_ships\":") orelse 0) >= 1);
+    }
+    // The 200 MiB `dd` on B: every block minted from a ranged grant PULLED
+    // from A (the allocation-lease holder — B's own cursor never moves);
+    // `df` per the rule on both (B: the holder's word minus B's window = the
+    // file; A: every carved grant counts as used at the holder); the sha
+    // round trip read from A (the layout off B's token, including the
+    // boundary-crossing reads the handler lane serves); `rm` on B ships the
+    // terminal frees to A and both `df`s return.
+    {
+        const out = try b.onMount("mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count=200 status=none && sync b-data/big && sha256sum b-data/big | cut -d' ' -f1 && df -k . | tail -1 | awk '{print $3}'");
+        defer gpa.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        const sha_b = lines.next() orelse return error.ShaMissing;
+        const used_b = try std.fmt.parseInt(u64, lines.next() orelse return error.DfMissing, 10);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        const topups = numberAfter(tb, "\"block_grant_topups\":") orelse 0;
+        try testing.expect(topups >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"block_grant_topup_refused\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"block_grant_topup_unreachable\":"));
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        const grants = numberAfter(ta, "\"block_grants\":") orelse 0;
+        const granted_blocks = numberAfter(ta, "\"block_grant_blocks\":") orelse 0;
+        try testing.expect(grants >= 1 and granted_blocks >= matrix_dd_blocks);
+        const from_a = try rig.onMount("sha256sum b-data/big | cut -d' ' -f1; df -k . | tail -1 | awk '{print $3}'");
+        defer gpa.free(from_a);
+        var a_lines = std.mem.splitScalar(u8, from_a, '\n');
+        const sha_a = a_lines.next() orelse return error.ShaMissing;
+        const used_a = try std.fmt.parseInt(u64, a_lines.next() orelse return error.DfMissing, 10);
+        try testing.expectEqualStrings(sha_b, sha_a);
+        // `df` per the rule (block 4 MiB = 4096 KiB): B sees exactly its
+        // file; A sees every granted block.
+        try testing.expectEqual(matrix_dd_blocks * matrix_block_kib, used_b);
+        try testing.expectEqual(granted_blocks * matrix_block_kib, used_a);
+        const rm = try b.onMount("rm b-data/big");
+        gpa.free(rm);
+        // The forget → the terminal frees → the shipper's batch at the
+        // cadence → A's executor frees them: A's `df` returns the file.
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        var used_a_after: u64 = used_a;
+        while (clock.monotonicNs() < deadline) {
+            const df = try rig.onMount("df -k . | tail -1 | awk '{print $3}'");
+            defer gpa.free(df);
+            used_a_after = try std.fmt.parseInt(u64, std.mem.trimEnd(u8, df, "\n"), 10);
+            if (used_a_after == used_a - matrix_dd_blocks * matrix_block_kib) break;
+            sleepMs(200);
+        }
+        try testing.expectEqual(used_a - matrix_dd_blocks * matrix_block_kib, used_a_after);
+        const tb2 = try b.stats();
+        defer gpa.free(tb2);
+        const ta2 = try rig.onMount("cat .stats");
+        defer gpa.free(ta2);
+        try testing.expectEqual(@as(?u64, matrix_dd_blocks), numberAfter(tb2, "\"free_ship_freed\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb2, "\"free_ship_refused\":"));
+        try testing.expectEqual(@as(?u64, matrix_dd_blocks), numberAfter(ta2, "\"free_served_blocks\":"));
+        const df_b = try b.onMount("df -k . | tail -1 | awk '{print $3}'");
+        defer gpa.free(df_b);
+        std.debug.print("smoke: matrix: 200 MiB dd on B — {d} grant(s) / {d} blocks pulled from A in {d} top-up(s); sha from A equal; df used B {d} KiB, A {d} KiB; after rm on B: {d} frees shipped and freed at A, df A {d} KiB, B {s} KiB\n", .{ grants, granted_blocks, topups, used_b, used_a, numberAfter(tb2, "\"free_shipped_blocks\":") orelse 0, used_a_after, std.mem.trimEnd(u8, df_b, "\n") });
+    }
+    // Closure on both daemons.
+    {
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"manager_verb_refusals\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"membership_members\":"));
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try expectMustStayZero(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"joined_wire_words_rejected\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"appender_park_expiries\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"extent_grant_closure_violations\":"));
+        std.debug.print("smoke: matrix: closure — A: manager_verbs {d}, token grants {d}, xv steps served {d}; B: wire verbs {d}, renewals {d}, grant refills {d}\n", .{ numberAfter(ta, "\"manager_verbs\":") orelse 0, numberAfter(ta, "\"dlm_token_grants\":") orelse 0, numberAfter(ta, "\"xv_cross_owner_steps_served\":") orelse 0, numberAfter(tb, "\"joined_wire_verbs\":") orelse 0, numberAfter(tb, "\"member_renewals\":") orelse 0, numberAfter(tb, "\"extent_grant_refills\":") orelse 0 });
+    }
+    // umount B: the clean leave — every lease released over the wire,
+    // page 1 Free, the member row gone; every file B wrote stays visible
+    // from A (its slots are the manager's now).
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, b.mp));
+    {
+        const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,\"node\":\"0000000000000000\",\"mount_slot\":0,\"writer_id\":\"0000000000000000\",\"state\":\"free\"") != null);
+        const after = try rig.onMount("ls b3 | wc -l; cat b1/f7; stat -c %a b2/f3");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("500\nfresh\n600\n", after);
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"membership_members\":"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: kill -9 mid-tar -x → remount replays the window → every file present is whole or empty, none acked is lost, nothing torn after the crash; a clean cycle after it" {
     const io = testing.io;
     if (!venueAvailable(io)) return error.SkipZigTest;

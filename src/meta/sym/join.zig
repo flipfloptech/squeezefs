@@ -269,6 +269,7 @@ test "the ladder: join → screened reply → region core + RAM grant from the r
     const rejected_before = stats.joined_wire_words_rejected.load();
     const rejoins_before = stats.joined_rejoins.load();
     d.forge_base = tv.g.volume_base;
+    stats.joined_wire_words_rejected.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
     try testing.expectError(error.Rejected, join(gpa, d.door(), .{ .identity = testIdentity(HARNESS_MOUNT_SLOT_BASE + 1), .volume_base = tv.g.volume_base, .grain = 4096, .ring0_head = tv.ring0_head }));
     try log.testing.expectAllFired();

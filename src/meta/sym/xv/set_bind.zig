@@ -28,19 +28,31 @@ comptime {
 pub const MetaSet = meta_set.MetaSet;
 pub const SetPlane = ops.Plane(MetaSet);
 
+/// The wire plane's dialled sessions per HOLDER appender id (the step
+/// ships' links); null = no session can be bound (no endpoint).
+pub const Dialer = struct {
+    ctx: *anyopaque,
+    linkFor: *const fn (ctx: *anyopaque, holder: u32) ?ops.Link,
+};
+
 /// The plane over a set: owns the resolver's state.
 pub const Bound = struct {
     set: *MetaSet,
     plane: SetPlane,
+    /// Bound by the wire plane once its listener is up: a foreign holder
+    /// resolves to a dialled session; before that (and on a flat set) a
+    /// foreign holder is `unreachable_` — the typed EAGAIN.
+    dialer: ?Dialer = null,
 
     pub fn create(gpa: Allocator, io: Io, set: *MetaSet, locks: *dlm.Manager, env: *const std.process.Environ.Map) Allocator.Error!*Bound {
         const self = try gpa.create(Bound);
         errdefer gpa.destroy(self);
         self.set = set;
+        self.dialer = null;
         const be0 = set.volumes[0];
-        const own_id: u32 = if (be0.sym) |s| s.identity.mount_slot else 0;
-        const term: u64 = if (be0.sym) |s| s.manager.term else set.setEpoch();
-        self.plane = try SetPlane.init(gpa, io, set, locks, own_id, 0, term, .{ .ctx = self, .homeOf = &homeOf, .refresh = &homeOf, .localSlots = &localSlots }, ops.Seams.fromEnv(env), record.xattrValueCap(set.nodeSize()));
+        const own_id: u32 = if (be0.sym) |s| s.identity.mount_slot else if (be0.joined) |j| j.appenderId() else 0;
+        const term: u64 = if (be0.sym) |s| s.manager.term else if (be0.joined) |j| j.core().page.term else set.setEpoch();
+        self.plane = try SetPlane.init(gpa, io, set, locks, own_id, 0, term, .{ .ctx = self, .homeOf = &homeOf, .refresh = &refresh, .localSlots = &localSlots }, ops.Seams.fromEnv(env), record.xattrValueCap(set.nodeSize()));
         self.plane.stripe_k = stripe.resolveK(env);
         return self;
     }
@@ -50,16 +62,46 @@ pub const Bound = struct {
         gpa.destroy(self);
     }
 
+    /// The wire plane's sessions (after its listener is up).
+    /// Bind (or, with null, unbind BEFORE the wire plane goes) the step
+    /// sessions' dialler.
+    pub fn bindDialer(self: *Bound, d: ?Dialer) void {
+        self.dialer = d;
+    }
+
     fn homeOf(ctx: *anyopaque, slot: u16) ops.Home {
         const self: *Bound = @ptrCast(@alignCast(ctx));
         const v = self.set.volumeIndexOfSlot(slot);
         const be = self.set.volumes[v];
         if (!be.slots.armed) return .{ .local = .{ .volume = v } };
-        return switch (be.slots.cache.stepHome(slot)) {
-            .local => .{ .local = .{ .volume = v } },
-            .foreign => |f| .{ .unreachable_ = .{ .holder = f.holder } },
-            .unreachable_ => |u| .{ .unreachable_ = .{ .holder = u.holder } },
+        const holder: u32 = switch (be.slots.cache.stepHome(slot)) {
+            .local => {
+                // A joiner's unleased slot is the manager's (it maintains
+                // every unleased tree): its step ships there.
+                if (be.joined != null and !be.slots.table.view(slot).leasedBy(be.slots.me)) return self.foreign(0);
+                return .{ .local = .{ .volume = v } };
+            },
+            .foreign => |f| f.holder,
+            .unreachable_ => |u| u.holder,
         };
+        return self.foreign(holder);
+    }
+
+    fn foreign(self: *Bound, holder: u32) ops.Home {
+        const d = self.dialer orelse return .{ .unreachable_ = .{ .holder = holder } };
+        const link = d.linkFor(d.ctx, holder) orelse return .{ .unreachable_ = .{ .holder = holder } };
+        return .{ .foreign = .{ .holder = holder, .link = link } };
+    }
+
+    /// After a `SlotMoved`: a joiner asks the manager (`ResolveSlot`), the
+    /// manager re-reads its own table.
+    fn refresh(ctx: *anyopaque, slot: u16) ops.Home {
+        const self: *Bound = @ptrCast(@alignCast(ctx));
+        const be = self.set.volumeOfSlot(slot);
+        if (be.joined) |js| {
+            _ = be.slots.cache.resolveViaManager(.{ .ctx = &js.link, .call = &@import("../joined.zig").SharedLink.callFn }, be.index, slot) catch {};
+        }
+        return homeOf(ctx, slot);
     }
 
     fn localSlots(ctx: *anyopaque, out: []u16) []u16 {

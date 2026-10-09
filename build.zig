@@ -175,12 +175,94 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 
     // ---- the per-commit gate ----
-    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke (the per-commit gate)");
+    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + sdk-smoke (the per-commit gate)");
     gate_step.dependOn(fmt_step);
     gate_step.dependOn(test_step);
     gate_step.dependOn(rails_step);
     gate_step.dependOn(smoke_step);
     gate_step.dependOn(bench_smoke_step);
+
+    // ---- @anchor:sdk_build — the native SDK: libsqueezefs_sdk.{a,so} + the
+    //      header + the C smoke (charter §7, §12; il_sdk §10.2–10.3) ----
+    //
+    // The export fns live in `src/sdk/abi.zig` INSIDE the library tree (they
+    // import `ipc/client`, `ipc/wire`, `ipc/layout`, `core/errors` by
+    // relative path), so the artifact's root module is a second instance of
+    // the library tree (`sdk_core`: libc, NO zstd — the SDK must export only
+    // `sqz_*`) reached through a one-line generated root that forces their
+    // analysis: an `export fn` is emitted only from a file the root reaches,
+    // which is also why the daemon binary never carries them.
+    const sdk_step = b.step("sdk", "Build and install libsqueezefs_sdk.a, libsqueezefs_sdk.so and include/squeezefs_sdk.h (Linux)");
+    const sdk_smoke_step = b.step("sdk-smoke", "Compile tests/sdk/c_smoke.c against the header, link the static SDK and run it against the in-process stub host (Linux)");
+    if (target.result.os.tag == .linux) {
+        const sdk_core = b.createModule(.{
+            .root_source_file = b.path("src/squeezefs.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        sdk_core.link_libc = true;
+        const sdk_root = b.addWriteFiles().add("sdk_root.zig", "comptime {\n    _ = @import(\"squeezefs\").sdk.abi;\n}\n");
+        const sdk_mod = b.createModule(.{
+            .root_source_file = sdk_root,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "squeezefs", .module = sdk_core }},
+        });
+        sdk_mod.link_libc = true;
+        const sdk_static = b.addLibrary(.{ .name = "squeezefs_sdk", .linkage = .static, .root_module = sdk_mod });
+        // A static library does not bundle compiler-rt by default (only an
+        // exe or a dynamic library does): a gcc/clang consumer would miss
+        // the `__zig_*`/compiler-rt symbols the Zig code references.
+        sdk_static.bundle_compiler_rt = true;
+        // `.version` gives the default SONAME `libsqueezefs_sdk.so.1`.
+        const sdk_shared = b.addLibrary(.{ .name = "squeezefs_sdk", .linkage = .dynamic, .root_module = sdk_mod, .version = .{ .major = 1, .minor = 0, .patch = 0 } });
+        sdk_shared.installHeader(b.path("include/squeezefs_sdk.h"), "squeezefs_sdk.h");
+        sdk_step.dependOn(&b.addInstallArtifact(sdk_static, .{}).step);
+        sdk_step.dependOn(&b.addInstallArtifact(sdk_shared, .{}).step);
+
+        // The C smoke: a Zig driver (the stub host out of the library) + the
+        // C body compiled natively against the header, linked with the .a.
+        const sdk_smoke = b.addExecutable(.{
+            .name = "sdk-c-smoke",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/sdk/c_smoke_main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "squeezefs", .module = squeezefs_mod }},
+            }),
+        });
+        sdk_smoke.root_module.addCSourceFile(.{ .file = b.path("tests/sdk/c_smoke.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        sdk_smoke.root_module.addIncludePath(b.path("include"));
+        sdk_smoke.root_module.linkLibrary(sdk_static);
+        sdk_smoke.root_module.link_libc = true;
+        const run_sdk_smoke = b.addRunArtifact(sdk_smoke);
+        // Drives sockets, memfds and threads: its outcome is not a function
+        // of the build inputs alone.
+        run_sdk_smoke.has_side_effects = true;
+        sdk_smoke_step.dependOn(&run_sdk_smoke.step);
+        // The same program against the .so (SONAME resolution + the runtime
+        // unload pin inside a shared object).
+        const sdk_smoke_shared = b.addExecutable(.{
+            .name = "sdk-c-smoke-shared",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/sdk/c_smoke_main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "squeezefs", .module = squeezefs_mod }},
+            }),
+        });
+        sdk_smoke_shared.root_module.addCSourceFile(.{ .file = b.path("tests/sdk/c_smoke.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        sdk_smoke_shared.root_module.addIncludePath(b.path("include"));
+        sdk_smoke_shared.root_module.linkLibrary(sdk_shared);
+        sdk_smoke_shared.root_module.link_libc = true;
+        const run_sdk_smoke_shared = b.addRunArtifact(sdk_smoke_shared);
+        run_sdk_smoke_shared.has_side_effects = true;
+        sdk_smoke_step.dependOn(&run_sdk_smoke_shared.step);
+        gate_step.dependOn(sdk_smoke_step);
+    } else {
+        sdk_step.dependOn(&b.addFail("the SDK is Linux-only (charter §1.2): build it on the venue").step);
+        sdk_smoke_step.dependOn(&b.addFail("the SDK's C smoke is Linux-only (charter §1.2): run it on the venue").step);
+    }
 
     // ---- dist: split debug info with a debuglink ----
     // objcopy --only-keep-debug squeezefs squeezefs.debug

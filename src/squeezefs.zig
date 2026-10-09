@@ -153,6 +153,9 @@ pub const ipc = struct {
 // ---- the client bypass's two clients: the LD_PRELOAD shim and the SDK (charter §7) ----
 // @anchor:shim_import
 // @anchor:sdk_import
+// The SDK root gates its Linux half itself, so the lease law, the buddy
+// allocator, the model and the version words run on every host.
+pub const sdk = @import("sdk/sdk.zig");
 
 // ---- the cluster wire (charter §5.5 verbs; §9 thread-per-connection) ----
 pub const wire = @import("wire/wire.zig");
@@ -189,6 +192,7 @@ test {
     // @anchor:ipc_host_test
     // @anchor:shim_test
     // @anchor:sdk_test
+    _ = sdk;
     if (builtin.os.tag == .linux) _ = ipc.client;
     _ = meta.sym;
     _ = meta.sym_slots;

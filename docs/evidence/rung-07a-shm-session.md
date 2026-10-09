@@ -168,3 +168,141 @@ exists for, and the model's final check distinguishes the two.
 `zig build gate` green on macOS (portable cores, models, wire, sizing, the pure rendezvous, the
 kv_fs face) and on the venue (the Linux half: the futex face, the memfd, the sockets, the ladder end
 to end).
+
+## Wave B3 — the native SDK: `libsqueezefs_sdk`, the second client kind
+
+Spec: `docs/porting/il_sdk.md` (§1 the surface, §2 the lease law, §3 the second kind, §4 the window,
+§5 durability, §10 Zig notes); decision 0003 §F "The SDK"; decision 0002 rows 330–336 (the better
+designs taken: ONE error convention, the two-part ABI word, one session per handle, base+offset
+addressing with an explicit `-ENOMEM`, no silent POSIX fallback, the directory credential, records
+outside the arena). Modules: `src/sdk/{sdk, version, buffer_lease, buffer_lease_model, session,
+abi}.zig`; `include/squeezefs_sdk.h`; `tests/sdk/{c_smoke.c, c_smoke_main.zig}`; the header census in
+`tests/rails.zig`; `build.zig` steps `sdk` and `sdk-smoke` (the latter in the gate on Linux); one knob
+row (`SQUEEZEFS_TEST_SDK_IL0_BLOB`, a test seam). Additive to `ipc/client.zig`: `submitArena` /
+`kickDoorbell` / `waitTicket` / `ticketResult` / `releaseTicket` / `geometry` / `arena` (arena-native
+tickets, no slab copy), `pub CtlLock`, `pub StubHost` with a byte store and the BIND durability echo.
+
+### What landed
+
+- **The surface** (`abi.zig`, 28 `export fn sqz_*`, `callconv(.c)`, nothing else exported — pinned by
+  `nm -D` on the venue): `sqz_version/abi`; `sqz_last_error/last_error_text/strerror`;
+  `sqz_session_open/close` + the granted geometry (`arena_bytes/slots/max_op_bytes`);
+  `sqz_open/close/fsync/fstat/fsize/fd/durability`; `sqz_buf_alloc/free/addr/len`;
+  `sqz_pread/pwrite/preadv/pwritev` (positional only, base + offset, in place); `sqz_submit/poll/wait`.
+  ONE convention: every fallible call returns a negative errno and never writes `errno(3)`;
+  constructors return NULL with the cause thread-local. The records are `extern struct`s with
+  comptime pins (`sqz_sqe_t` 48 B, `user_data` at 40; `sqz_cqe_t` 16; `sqz_iovec_t` 24;
+  `sqz_session_opts_t` 24; `sqz_open_opts_t` 8; `sqz_stat_t` 96 — statx-derived, so no arch-specific
+  `struct stat`) and the header `_Static_assert`s the same numbers.
+- **The buffer-lease law** (`buffer_lease.zig`): ONE packed word `{state u8 | inflight u24}`;
+  `submit` (CAS +1, FREED/POISONED refuse), `complete` (CAS −1 while APP_OWNED; a POISONED record
+  keeps its count), `free` (FREED ⇒ `-EINVAL`; POISONED ⇒ FREED + quarantine; APP_OWNED ⇒ one
+  strong CAS `{app_owned,0} → {freed,0}`, any inflight ⇒ `-EBUSY` with the word unchanged — never
+  deferred), `poison` (SUBMITTED ⇒ POISONED). The buddy allocator at the 4 KiB granule over the whole
+  arena (natural alignment ⇒ every buffer 4 KiB-aligned whatever its size; a non-pow2 arena is seeded
+  as its binary decomposition and merges only inside the arena); the record pool outside the arena,
+  one record per granule; the census `allocs ≡ frees + live + poisoned_live` and the quarantine that
+  only grows. Property test: 3000 random alloc/free rounds on 64-, 96-, 3- and 1000-granule arenas —
+  aligned, inside, non-overlapping, free bytes exact, coalesced back to the seed.
+- **The second kind** (`session.zig`): `sqz_session_open` opens the mount root
+  `O_RDONLY|O_DIRECTORY|O_CLOEXEC` as the HELLO credential (the kind-SDK screen admits a directory),
+  `fstatfs` (`FUSE_SUPER_MAGIC`) + `fgetxattr(user.squeezefs.il0)` (the seam reads a file instead, so
+  the tests and the C smoke run against the in-process stub host), the coarse `ipc_abi` pre-check,
+  then `client.Session.establish(kind = .sdk, sdk_abi = WIRE part, arena/slot request)`; the arena is
+  bound at establish so `sqz_buf_alloc` precedes any `sqz_open`. Files: the real `open(2)` with
+  `O_CLOEXEC` forced, `O_APPEND/O_PATH/O_TMPFILE` refused up front, `O_SYNC/O_DSYNC` ⇒ class SYNC,
+  BIND with the durability word, a grant below the request is `-EPROTO` (strengthen-only), `flags/
+  rights` ⇒ `-EINVAL`, `mount` ⇒ `-EXDEV`; `sqz_fsync` is `fsync(2)` in every class. Sync ops stage
+  ≤ 64 flights per doorbell over `submitArena` (descriptor flag `F_ARENA_NATIVE`, `arena_off =
+  buf.off + buf_off + cursor`), reap in offset order with POSIX prefix semantics; the batch API keeps
+  one op record per SQE and one flight per slot (the ticket IS the slot), folds chunked ops into ONE
+  CQE, drains a ready ring first, parks on the completion doorbell with `k = clamp(pending/4, 2,
+  pending)` in 50 ms slices re-checking the heartbeat ladder and the op deadline; `sqz_submit` returns
+  the prefix under slot exhaustion, `-EINVAL` on the first bad SQE with nothing submitted.
+- **Poison** = `-ENOTCONN` for every later call: the heartbeat watch (≈ 1 s), the op deadline (the
+  last rung), a generation bump, the impossible ring push, and the fork child (`pthread_atfork`,
+  AS-safe: `poisonChild` + the lock-free `poisonAll`). Once: every SUBMITTED buffer → POISONED, every
+  live batch op → a `-EIO` CQE on the ready ring with its unfinished flights abandoned (slots never
+  recycled), every file's inflight count dropped so `sqz_close` works; `sqz_session_close` refuses
+  `-EBUSY` only while files are open or buffers are SUBMITTED. The unload pin (`pinSelf`:
+  `dladdr` + `dlopen(RTLD_NOLOAD|RTLD_NODELETE)`) runs at the first open — an atfork handler can never
+  be unregistered.
+- **The window** (`version.zig`): `sqz_abi() = wire << 16 | sdk`; HELLO carries the wire part alone;
+  the daemon's `{cur, cur−1}` set is judged by `rendezvous.admitHello`; the refusal texts name both
+  values ("sdk abi outside the daemon's window (app 1, daemon accepts 2..3)", "ipc abi mismatch (sdk
+  1, daemon 2)") once per `(mount device, reason)` on stderr with the `squeezefs-sdk:` prefix and every
+  time in the thread-local last error. The SDK never reads a commit: a `-dirty` daemon admits it while
+  it refuses a clean shim (row G).
+- **The header + the C smoke**: `squeezefs_sdk.h` hand-written (0.17's `-femit-h` emits nothing);
+  the rails census parses `export fn sqz_*(…) callconv(.c) R` out of `abi.zig` and `R sqz_*(…);` out of
+  the header, maps every Zig type to its C spelling through ONE table and requires equal arity and
+  types both ways (plus "nothing but `sqz_*` is exported"; the parsers have their own red test).
+  `tests/sdk/c_smoke.c` (C11, `-Wall -Wextra -Werror`) calls every symbol against the in-process stub
+  host hosted by `c_smoke_main.zig`: NULL handles, a bad `struct_size`, the geometry request granted
+  (32 MiB over a 16 MiB default), a buffer before any open, the durability classes and `O_APPEND`,
+  a `pwrite/pread` round trip byte-exact in place, base + offset, `-EINVAL` past the buffer, `fsync/
+  fstat/fsize`, 8 tickets under one doorbell with `-EBUSY` on every free while SUBMITTED, a chunked
+  op into one CQE, free after the CQE / `-EINVAL` on the double free / `-EINVAL` on a batch naming a
+  freed buffer, `preadv/pwritev`, `-EBADF` on the wrong direction, the close order; then the death
+  scenario: kill → the op in flight `-EIO`, every later call `-ENOTCONN`, the poisoned buffer still
+  readable and freed into the quarantine, close succeeds. Linked twice: against `libsqueezefs_sdk.a`
+  (`bundle_compiler_rt`) and against `libsqueezefs_sdk.so.1` (SONAME verified with `readelf -d`).
+
+### Models and the weakening that fails
+
+| Model | Holds (states) | Weakening | Fails |
+|---|---|---|---|
+| `buffer_lease_model.Lease` — submitter (CAS +1 → publish, or the undo on a poisoned session), daemon (completes, or never after a poison), reaper (CAS −1), freer (one free at any time), poisoner (flag, then the lease) over ONE packed word | holds | the freer's one CAS split into `load; if inflight == 0: store(FREED)` | InvariantViolated: the submitter's CAS lands between the two and publishes a range the freer then recycles — a FREED range under daemon custody |
+
+### End to end on the venue (in-process stub host, no daemon, no mount)
+
+- Kind SDK admitted with a directory credential; a 2× arena request granted and 1000 slots clamped
+  to the ring; a buffer before any file; a 3-page + 17 B round trip byte-exact against the stub's
+  store; base + offset windows; `-EINVAL` past the buffer and for a negative offset; SYNC granted,
+  value 2 refused, `O_APPEND` refused; `-EBADF` on a read-only handle's write; `sqz_session_close`
+  `-EBUSY` until the files close; the census identity holds; `sdk_descriptor_rejects` 0.
+- **64 MiB**: the whole default arena as ONE buffer, written and read back through 64 flights of the
+  1 MiB window under one doorbell each, byte-exact (xxh3 of the buffer == xxh3 of the stub's 64 MiB
+  store); every slot FREE after; a three-window vector folds with the prefix law at the store's end.
+- **The batch API**: 8 tickets, one doorbell, `-EBUSY` ×8 while SUBMITTED, every `user_data` back,
+  bytes in the store; 70 one-page SQEs over 64 slots ⇒ a 64-SQE prefix; a 70-page op ⇒ 18 flights,
+  ONE CQE.
+- **Death**: a frozen + severed stub poisons the parked `sqz_wait` in ≥ 1 s and ≪ 5 s with the op's
+  `-EIO` CQE, cause `heartbeat`; the buffer POISONED, its free quarantines 1 granule; every later call
+  `-ENOTCONN`; one abandoned slot. A frozen stub with a live socket poisons a sync op at the 300 ms
+  seam deadline (`-EIO`, cause `deadline`).
+- **The window**: a `-dirty` daemon admits the SDK and refuses a clean shim; `sdk_abi = 2` against
+  `{1}` is refused `version` with min = max = 1; the `ipc_abi` mismatch text names both values,
+  prints once per mount and is in the last error every time; a missing blob is `-ENODATA`; a file
+  as the mount path is `-ENOTDIR`.
+- **Fork**: the child finds the session poisoned (cause `fork`), the SUBMITTED buffer POISONED, data
+  calls `-ENOTCONN`; the parent's lease is untouched and its session serves on.
+- Not in this wave: the real-mount run (`-o interception`) — the host wave's armed mount was not up
+  when this landed; the SDK's path to it is the same `fstatfs` + `fgetxattr` the shim takes, exercised
+  here through the seam. The product daemon's barrier-before-DONE for a SYNC binding and the
+  kind-SDK admission of `O_SYNC` fds at BIND are daemon-side (the host wave); the stub echoes the
+  durability word and the SDK enforces the grant ≥ request law on its side.
+
+### Scoping numbers (venue; not performance claims)
+
+In-process stub host (serves by `memcpy` into/out of a flat store — the daemon's data plane is not in
+the loop), `--release=safe`, 8 vCPUs, one app thread:
+
+| Row | Number |
+|---|---|
+| 64 MiB `sqz_pwrite` (64 flights of the 1 MiB window, one doorbell) | ≈ 7.3 ms/op (≈ 8.8 GB/s) |
+| 64 MiB `sqz_pread`, in place | ≈ 4.6–5.3 ms/op (≈ 12–14 GB/s) |
+| 4 KiB sync `sqz_pread` RTT (claim → publish → doorbell → spin → consume) | ≈ 1.7 µs (≈ 580 k ops/s) |
+| batch depth 32, 100 k 4 KiB reads (`sqz_submit` + `sqz_wait`) | ≈ 49 ms = ≈ 2.0 M ops/s, 0 park eras (the stub completes inside the spin) |
+
+These bound the SDK's own overhead (lease CAS, slot claim, descriptor publish, fold) — nothing here
+is an il row (charter engagement law: `ipc_ops_*` deltas on a real daemon), and nothing is claimed
+before G-S2's counted A-B-B-A against `_raw`/the shim.
+
+### Gates
+
+`zig build gate` green on macOS for the portable half (the lease law, the buddy allocator, the model
+and its weakening, the version words, the header census rail; the SDK steps refuse with their reason
+off Linux); `scripts/venue zig build gate` green on the venue — unit (the SDK's 7 e2e tests against
+the stub host), rails (7/7 incl. the header census), smoke, bench-smoke, and `sdk-smoke` (the C
+program against the `.a` and against the `.so.1`).

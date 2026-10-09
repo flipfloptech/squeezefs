@@ -367,3 +367,242 @@ test "the scan is a tokenizer's: a '\"' char literal and an escaped quote do not
     try scanFile(gpa, "tests/fixture.zig", fixture, &hits2);
     for (hits2.items) |h| try std.testing.expect(!h.product);
 }
+
+// ---------------------------------------------------------------------------
+// The SDK header census (charter §12 "the SDK exports a C ABI"; il_sdk §10.2):
+// 0.17's `-femit-h` emits nothing, so `include/squeezefs_sdk.h` is written by
+// hand and pinned here — every `export fn sqz_*` in `src/sdk/abi.zig` has a
+// prototype in the header with the same arity and the same types (parsed on
+// both sides, the Zig type mapped to its C spelling through ONE table), every
+// header prototype has its export, and nothing but `sqz_*` is exported.
+// ---------------------------------------------------------------------------
+
+const abi_path = "src/sdk/abi.zig";
+const header_path = "include/squeezefs_sdk.h";
+
+/// The ONE Zig → C spelling table (canonical C: one space before `*`).
+const c_types = [_]struct { zig: []const u8, c: []const u8 }{
+    .{ .zig = "?*SqzSession", .c = "sqz_session_t *" },
+    .{ .zig = "?*SqzFile", .c = "sqz_file_t *" },
+    .{ .zig = "?*SqzBuf", .c = "sqz_buf_t *" },
+    .{ .zig = "?[*:0]const u8", .c = "const char *" },
+    .{ .zig = "[*:0]const u8", .c = "const char *" },
+    .{ .zig = "?*const session.SessionOpts", .c = "const sqz_session_opts_t *" },
+    .{ .zig = "?*const session.OpenOpts", .c = "const sqz_open_opts_t *" },
+    .{ .zig = "?*session.Stat", .c = "sqz_stat_t *" },
+    .{ .zig = "?[*]const session.IoVec", .c = "const sqz_iovec_t *" },
+    .{ .zig = "?[*]const session.Sqe", .c = "const sqz_sqe_t *" },
+    .{ .zig = "?[*]session.Cqe", .c = "sqz_cqe_t *" },
+    .{ .zig = "?*const linux.timespec", .c = "const struct timespec *" },
+    .{ .zig = "?*anyopaque", .c = "void *" },
+    .{ .zig = "c_int", .c = "int" },
+    .{ .zig = "c_uint", .c = "unsigned" },
+    .{ .zig = "u32", .c = "uint32_t" },
+    .{ .zig = "u64", .c = "uint64_t" },
+    .{ .zig = "i64", .c = "int64_t" },
+    .{ .zig = "usize", .c = "size_t" },
+    .{ .zig = "isize", .c = "ssize_t" },
+    .{ .zig = "void", .c = "void" },
+};
+
+fn cSpelling(zig_type: []const u8) ?[]const u8 {
+    for (c_types) |t| if (std.mem.eql(u8, t.zig, zig_type)) return t.c;
+    return null;
+}
+
+const Proto = struct {
+    name: []const u8,
+    ret: []const u8,
+    /// Canonical C spellings.
+    params: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *Proto, gpa: std.mem.Allocator) void {
+        for (self.params.items) |p| gpa.free(p);
+        self.params.deinit(gpa);
+        gpa.free(self.name);
+        gpa.free(self.ret);
+    }
+};
+
+fn freeProtos(gpa: std.mem.Allocator, list: *std.ArrayList(Proto)) void {
+    for (list.items) |*p| p.deinit(gpa);
+    list.deinit(gpa);
+}
+
+/// Canonical C type text: whitespace collapsed, exactly one space before
+/// each `*`, no trailing parameter name.
+fn canonicalC(gpa: std.mem.Allocator, raw: []const u8, strip_name: bool) ![]const u8 {
+    var s = std.mem.trim(u8, raw, " \t\r\n");
+    if (strip_name) {
+        // The parameter name is the trailing identifier when the type has
+        // anything before it (`void` alone has none).
+        var end = s.len;
+        while (end > 0 and (std.ascii.isAlphanumeric(s[end - 1]) or s[end - 1] == '_')) end -= 1;
+        if (end > 0 and end < s.len) s = std.mem.trim(u8, s[0..end], " \t");
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == ' ' or c == '\t') {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(gpa, ' ');
+        } else if (c == '*') {
+            if (out.items.len > 0 and out.items[out.items.len - 1] != ' ') try out.append(gpa, ' ');
+            try out.append(gpa, '*');
+        } else try out.append(gpa, c);
+    }
+    while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') _ = out.pop();
+    return out.toOwnedSlice(gpa);
+}
+
+/// `export fn sqz_x(a: T, b: U) callconv(.c) R {` → a Proto in C spellings;
+/// a Zig type outside the table fails loud (the table is the contract).
+fn parseAbiExports(gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(Proto), violations: *std.Io.Writer) !void {
+    var rest = text;
+    var at_start = true;
+    while (true) {
+        // Line-anchored: the module doc mentions `export fn sqz_*` in prose.
+        const at = if (at_start and std.mem.startsWith(u8, rest, "export fn ")) 0 else (std.mem.indexOf(u8, rest, "\nexport fn ") orelse break) + 1;
+        at_start = false;
+        rest = rest[at + "export fn ".len ..];
+        const open = std.mem.indexOfScalar(u8, rest, '(') orelse break;
+        const name = rest[0..open];
+        if (!std.mem.startsWith(u8, name, "sqz_")) try violations.print("  {s}: export fn {s} is not an sqz_ symbol\n", .{ abi_path, name });
+        const close = std.mem.indexOfScalar(u8, rest, ')') orelse break;
+        const params_raw = rest[open + 1 .. close];
+        const cc = std.mem.indexOf(u8, rest[close..], "callconv(.c) ") orelse break;
+        const ret_start = close + cc + "callconv(.c) ".len;
+        const ret_end = std.mem.indexOf(u8, rest[ret_start..], " {") orelse break;
+        var proto: Proto = .{ .name = try gpa.dupe(u8, name), .ret = undefined };
+        const ret_zig = std.mem.trim(u8, rest[ret_start .. ret_start + ret_end], " ");
+        proto.ret = try gpa.dupe(u8, cSpelling(ret_zig) orelse blk: {
+            try violations.print("  {s}: {s} returns a Zig type the table does not spell: {s}\n", .{ abi_path, name, ret_zig });
+            break :blk "?";
+        });
+        if (std.mem.trim(u8, params_raw, " ").len != 0) {
+            var it = std.mem.splitScalar(u8, params_raw, ',');
+            while (it.next()) |param| {
+                const colon = std.mem.indexOfScalar(u8, param, ':') orelse continue;
+                const zig_type = std.mem.trim(u8, param[colon + 1 ..], " ");
+                const c = cSpelling(zig_type) orelse blk: {
+                    try violations.print("  {s}: {s} takes a Zig type the table does not spell: {s}\n", .{ abi_path, name, zig_type });
+                    break :blk "?";
+                };
+                try proto.params.append(gpa, try gpa.dupe(u8, c));
+            }
+        }
+        try out.append(gpa, proto);
+        rest = rest[ret_start + ret_end ..];
+    }
+}
+
+/// `R sqz_x(T a, U b);` on one line → a Proto in canonical C.
+fn parseHeaderProtos(gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(Proto)) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.endsWith(u8, t, ");")) continue;
+        if (std.mem.startsWith(u8, t, "_Static_assert") or std.mem.startsWith(u8, t, "#")) continue;
+        // The name is the identifier right before the first `(` (the return
+        // type may itself be an `sqz_*_t`).
+        const open = std.mem.indexOfScalar(u8, t, '(') orelse continue;
+        var name_at = open;
+        while (name_at > 0 and (std.ascii.isAlphanumeric(t[name_at - 1]) or t[name_at - 1] == '_')) name_at -= 1;
+        if (!std.mem.startsWith(u8, t[name_at..open], "sqz_")) continue;
+        const close = std.mem.lastIndexOfScalar(u8, t, ')') orelse continue;
+        var proto: Proto = .{ .name = try gpa.dupe(u8, t[name_at..open]), .ret = undefined };
+        proto.ret = try canonicalC(gpa, t[0..name_at], false);
+        const params_raw = t[open + 1 .. close];
+        if (!std.mem.eql(u8, std.mem.trim(u8, params_raw, " "), "void")) {
+            var it = std.mem.splitScalar(u8, params_raw, ',');
+            while (it.next()) |param| try proto.params.append(gpa, try canonicalC(gpa, param, true));
+        }
+        try out.append(gpa, proto);
+    }
+}
+
+fn sameProto(a: Proto, b: Proto) bool {
+    if (!std.mem.eql(u8, a.ret, b.ret) or a.params.items.len != b.params.items.len) return false;
+    for (a.params.items, b.params.items) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+test "sdk header census: every export fn sqz_* in abi.zig has a prototype in squeezefs_sdk.h with the same arity and types, every prototype has its export, and nothing but sqz_* is exported" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const abi_text = try cwd.readFileAlloc(io, abi_path, gpa, .limited(1 << 20));
+    defer gpa.free(abi_text);
+    const header_text = try cwd.readFileAlloc(io, header_path, gpa, .limited(1 << 20));
+    defer gpa.free(header_text);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var exports: std.ArrayList(Proto) = .empty;
+    defer freeProtos(gpa, &exports);
+    try parseAbiExports(gpa, abi_text, &exports, &violations.writer);
+    var protos: std.ArrayList(Proto) = .empty;
+    defer freeProtos(gpa, &protos);
+    try parseHeaderProtos(gpa, header_text, &protos);
+    // The census must have found the surface (a broken parser passes vacuously).
+    try std.testing.expect(exports.items.len >= 20);
+    try std.testing.expect(protos.items.len >= 20);
+    for (exports.items) |e| {
+        var found = false;
+        for (protos.items) |p| {
+            if (!std.mem.eql(u8, e.name, p.name)) continue;
+            found = true;
+            if (!sameProto(e, p)) {
+                try violations.writer.print("  {s}: {s} differs from the header: zig (", .{ abi_path, e.name });
+                for (e.params.items, 0..) |x, i| try violations.writer.print("{s}{s}", .{ if (i == 0) "" else ", ", x });
+                try violations.writer.print(") -> {s}; header (", .{e.ret});
+                for (p.params.items, 0..) |x, i| try violations.writer.print("{s}{s}", .{ if (i == 0) "" else ", ", x });
+                try violations.writer.print(") -> {s}\n", .{p.ret});
+            }
+        }
+        if (!found) try violations.writer.print("  {s}: export fn {s} has no prototype in {s}\n", .{ abi_path, e.name, header_path });
+    }
+    for (protos.items) |p| {
+        var found = false;
+        for (exports.items) |e| found = found or std.mem.eql(u8, e.name, p.name);
+        if (!found) try violations.writer.print("  {s}: prototype {s} has no export fn in {s}\n", .{ header_path, p.name, abi_path });
+    }
+    if (violations.written().len != 0) {
+        std.debug.print("sdk header census violation(s):\n{s}", .{violations.written()});
+        return error.HeaderCensusViolation;
+    }
+}
+
+test "the header census parsers: a Zig export and a C prototype of the same shape agree; a wrong arity, a wrong type and a non-sqz export are each caught" {
+    const gpa = std.testing.allocator;
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var exports: std.ArrayList(Proto) = .empty;
+    defer freeProtos(gpa, &exports);
+    try parseAbiExports(gpa,
+        \\export fn sqz_demo(f: ?*SqzFile, iov: ?[*]const session.IoVec, n: c_uint, off: i64) callconv(.c) isize {
+        \\export fn sqz_none() callconv(.c) [*:0]const u8 {
+        \\export fn bad_name(x: c_int) callconv(.c) c_int {
+    , &exports, &violations.writer);
+    try std.testing.expectEqual(@as(usize, 3), exports.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, violations.written(), "bad_name is not an sqz_ symbol") != null);
+    try std.testing.expectEqualStrings("ssize_t", exports.items[0].ret);
+    try std.testing.expectEqual(@as(usize, 4), exports.items[0].params.items.len);
+    try std.testing.expectEqualStrings("const sqz_iovec_t *", exports.items[0].params.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), exports.items[1].params.items.len);
+    var protos: std.ArrayList(Proto) = .empty;
+    defer freeProtos(gpa, &protos);
+    try parseHeaderProtos(gpa,
+        \\ssize_t sqz_demo(sqz_file_t *f, const sqz_iovec_t   *iov, unsigned n, int64_t off);
+        \\const char *sqz_none(void);
+        \\ssize_t sqz_short(sqz_file_t *f);
+        \\int sqz_demo_wrong(sqz_file_t *f, const sqz_iovec_t *iov, unsigned n, int64_t off);
+        \\_Static_assert(sizeof(sqz_cqe_t) == 16, "cqe");
+    , &protos);
+    try std.testing.expectEqual(@as(usize, 4), protos.items.len);
+    try std.testing.expect(sameProto(exports.items[0], protos.items[0]));
+    try std.testing.expect(sameProto(exports.items[1], protos.items[1]));
+    try std.testing.expectEqualStrings("const char *", protos.items[1].ret);
+    try std.testing.expect(!sameProto(exports.items[0], protos.items[2]));
+    try std.testing.expect(!sameProto(exports.items[0], protos.items[3]));
+}

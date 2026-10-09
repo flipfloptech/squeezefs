@@ -135,16 +135,17 @@ pub const WaitEntry = struct {
 };
 
 /// A futex mutex (Drepper's three-state) for the ctl socket: BIND/UNBIND
-/// round trips from many app threads serialize here; never an `Io`.
-const CtlLock = struct {
+/// round trips from many app threads serialize here; never an `Io`. `pub`:
+/// the SDK's batch bookkeeping takes the same lock shape.
+pub const CtlLock = struct {
     word: futex.Word = .init(0),
 
-    fn lock(self: *CtlLock) void {
+    pub fn lock(self: *CtlLock) void {
         if (self.word.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
         while (self.word.swap(2, .acquire) != 0) futex.wait(&self.word, 2);
     }
 
-    fn unlock(self: *CtlLock) void {
+    pub fn unlock(self: *CtlLock) void {
         if (self.word.swap(0, .release) == 2) futex.wakeOne(&self.word);
     }
 };
@@ -692,6 +693,75 @@ pub const Session = struct {
     }
 
     // ---------------------------------------------------------------------
+    // Arena-native tickets (the SDK's leased buffers, `il_sdk.md` §2.5):
+    // the descriptor names an APP-CHOSEN arena window — no slab copy in
+    // either direction; the daemon validates `arena_off + len` against its
+    // own geometry exactly as it does a slab window. NO doorbell here: a
+    // batch rings once through `kickDoorbell`.
+    // ---------------------------------------------------------------------
+
+    /// Claim + publish + ring push of an arena-native op (`len ≤
+    /// max_op_bytes`, the window inside the arena — the caller's lease law
+    /// guarantees both). Null = no slot / poisoned; a ring-push failure
+    /// poisons the session (the impossible observation) and answers null.
+    pub fn submitArena(self: *Session, op: layout.Op, binding: u64, offset: u64, len: u32, arena_off: u64, flags: u32) ?Ticket {
+        if (self.poisoned()) return null;
+        const c = self.claimSlot() orelse return null;
+        const slot = &self.m.slots()[c.index];
+        slot_core.publishDescriptor(slot, .{ .op = op, .flags = flags, .binding = binding, .offset = offset, .len = len, .arena_off = arena_off });
+        slot_core.stampIngress(slot, clock.monotonicNs());
+        slot_core.publishSubmitted(slot);
+        if (!self.ring.push(c.index)) {
+            _ = self.il_ring_full_impossible.fetchAdd(1, .monotonic);
+            self.poison();
+            return null;
+        }
+        return .{ .slot = c.index, .generation = c.generation };
+    }
+
+    /// The ONE doorbell of a batch (SeqCst bump, wake iff the daemon parks).
+    pub fn kickDoorbell(self: *Session) void {
+        self.ringDoorbell();
+    }
+
+    pub const TicketWait = enum { done, abandoned };
+
+    /// The one-op wait on a ticket: the adaptive spin, then the 50 ms park
+    /// slices re-checking poison, the heartbeat ladder and the deadline.
+    /// `abandoned` leaves the slot as it is — never recycled — and the
+    /// session poisoned.
+    pub fn waitTicket(self: *Session, t: Ticket) TicketWait {
+        return switch (self.waitDone(t.slot, t.generation)) {
+            .done => .done,
+            .abandoned => .abandoned,
+        };
+    }
+
+    /// The result of a DONE ticket (bytes or `-errno` verbatim) WITHOUT
+    /// releasing its slot — a chunked op folds its flights first and
+    /// releases them together (`releaseTicket`). Null = in flight.
+    pub fn ticketResult(self: *Session, t: Ticket) ?i64 {
+        const slot = &self.m.slots()[t.slot];
+        if (!slot_core.isDoneFor(slot, t.generation)) return null;
+        return slot_core.result(slot);
+    }
+
+    /// DONE → FREE for a ticket whose result was read by `ticketResult`.
+    pub fn releaseTicket(self: *Session, t: Ticket) void {
+        slot_core.release(&self.m.slots()[t.slot]);
+    }
+
+    /// The session's granted geometry.
+    pub fn geometry(self: *const Session) layout.Geometry {
+        return self.layout.geometry;
+    }
+
+    /// The arena (the SDK's buddy allocator covers all of it).
+    pub fn arena(self: *Session) []u8 {
+        return self.m.arena();
+    }
+
+    // ---------------------------------------------------------------------
     // The completion-doorbell park (register → snapshot → re-scan).
     // ---------------------------------------------------------------------
 
@@ -744,17 +814,20 @@ pub const Session = struct {
 const testing = std.testing;
 const ipc = @import("ipc.zig");
 
-/// The in-process daemon stub: one abstract listener, one accepted session,
-/// a service thread running the drain → serve → complete → park loop with
-/// the heartbeat stamped every pass. READ fills the window with
-/// `offset + i` bytes; WRITE answers the byte sum; a 0-byte READ is the
-/// liveness ping.
 fn sleepNs(ns: u64) void {
     const ts: linux.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
     _ = linux.nanosleep(&ts, null);
 }
 
-const StubHost = struct {
+/// The in-process daemon stub: one abstract listener, one accepted session,
+/// a service thread running the drain → serve → complete → park loop with
+/// the heartbeat stamped every pass. READ fills the window with
+/// `offset + i` bytes — or, with `store` set, the bytes a WRITE of the same
+/// binding left at that offset (a byte-exact round trip for the SDK's
+/// arena-native ops); WRITE answers the byte sum (or stores); a 0-byte READ
+/// is the liveness ping. BIND echoes the requested durability word. `pub`
+/// for the SDK's own tests and its C smoke (no daemon needed).
+pub const StubHost = struct {
     const Self = @This();
 
     name_buf: [rendezvous.SOCKET_NAME_MAX]u8 = undefined,
@@ -774,6 +847,10 @@ const StubHost = struct {
     stop: Atomic(bool) = .init(false),
     /// Randomised serve delay (ns) for the timing stress.
     jitter_ns: u64 = 0,
+    /// A flat file image: WRITE stores into it, READ serves from it (a
+    /// read past its end is short; a write past it is `-EFBIG`). Null =
+    /// the pattern/ack arms.
+    store: ?[]u8 = null,
     // ---- outcomes ----
     accepted: ?rl.Accepted = null,
     refused: ?RefuseClass = null,
@@ -784,7 +861,7 @@ const StubHost = struct {
     /// The last BIND's rights (the per-op EBADF arm reads them).
     rights: Rights = .{ .read = true, .write = true },
 
-    fn init(self: *Self, policy: rendezvous.Policy, mount_dev: ?u64) !void {
+    pub fn init(self: *Self, policy: rendezvous.Policy, mount_dev: ?u64) !void {
         self.* = .{ .policy = policy, .nonces = rendezvous.NonceState.init(&rl.fillNonce, clock.monotonicNs()), .mount_dev = mount_dev };
         var prng = std.Random.DefaultPrng.init(clock.monotonicNs());
         const name = rendezvous.socketName(&self.name_buf, @intCast(linux.getpid()), prng.random().int(u32));
@@ -792,13 +869,13 @@ const StubHost = struct {
         self.listener = try rl.listenAbstract(name, sizing.listenBacklog(64));
     }
 
-    fn blob(self: *Self, commit: []const u8) !wire.Il0Blob {
+    pub fn blob(self: *Self, commit: []const u8) !wire.Il0Blob {
         return rendezvous.buildBlob(.{ .build_commit = commit, .socket_name = self.name_buf[0..self.name_len] }, &self.nonces.current);
     }
 
     /// Wait (bounded) for a connection so a client that fails before it
     /// connects leaves a joinable stub, never a hung test.
-    fn awaitConnection(self: *Self) !void {
+    pub fn awaitConnection(self: *Self) !void {
         var pfd = [_]linux.pollfd{.{ .fd = self.listener, .events = linux.POLL.IN, .revents = 0 }};
         const rc = linux.poll(&pfd, 1, 5000);
         if (linux.errno(rc) != .SUCCESS or rc == 0) return error.NoClient;
@@ -806,7 +883,7 @@ const StubHost = struct {
 
     /// Accept ONE connection and run its HELLO; on admission, serve on a
     /// thread until stopped.
-    fn acceptOne(self: *Self) !void {
+    pub fn acceptOne(self: *Self) !void {
         try self.awaitConnection();
         self.ctl = try rl.accept(self.listener);
         const t0 = clock.monotonicNs();
@@ -822,7 +899,7 @@ const StubHost = struct {
         }
     }
 
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         self.stop.store(true, .release);
         if (self.thread) |t| t.join();
         if (self.accepted) |a| shm.unmap(a.mapped);
@@ -880,12 +957,24 @@ const StubHost = struct {
             switch (d.op) {
                 @backingInt(layout.Op.read) => if (!self.rights.read) {
                     result = -@as(i64, @backingInt(linux.E.BADF));
+                } else if (self.store) |st| {
+                    const start: usize = @intCast(@min(d.offset, st.len));
+                    const n: usize = @min(window.len, st.len - start);
+                    @memcpy(window[0..n], st[start..][0..n]);
+                    result = @intCast(n);
                 } else {
                     for (window, 0..) |*b, i| b.* = @truncate(d.offset + i);
                     result = @intCast(d.len);
                 },
                 @backingInt(layout.Op.write) => if (!self.rights.write) {
                     result = -@as(i64, @backingInt(linux.E.BADF));
+                } else if (self.store) |st| {
+                    if (d.offset + d.len > st.len) {
+                        result = -@as(i64, @backingInt(linux.E.FBIG));
+                    } else {
+                        @memcpy(st[@intCast(d.offset)..][0..window.len], window);
+                        result = @intCast(d.len);
+                    }
                 } else {
                     var sum: u64 = 0;
                     for (window) |b| sum += b;
@@ -927,11 +1016,14 @@ const StubHost = struct {
         switch (wire.tagOf(frame) catch return) {
             .bind => {
                 const f = fd orelse return;
+                const req = wire.decodeFixed(wire.Bind, frame) catch return;
                 const screened = rendezvous.screenFd(rl.fdFacts(f), self.mount_dev, false);
                 switch (screened) {
                     .ok => |ok| {
                         self.rights = ok.rights;
-                        const reply: wire.BindOk = .{ .rights = ok.rights, .binding_id = self.next_binding, .ino = ok.ino };
+                        // The durability word travels back as granted (the
+                        // product daemon's barrier-before-DONE is the host's).
+                        const reply: wire.BindOk = .{ .rights = ok.rights, .binding_id = self.next_binding, .ino = ok.ino, .durability_granted = req.durability };
                         self.next_binding += 1;
                         _ = self.binds.fetchAdd(1, .monotonic);
                         rl.sendCtl(self.ctl, wire.frameBytes(&reply), null) catch {};

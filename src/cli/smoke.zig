@@ -1959,20 +1959,20 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
     _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
     const t_kill = clock.monotonicNs();
     std.debug.print("\nsmoke: kill rows (b): kill -9 A with {d} storm files visible on B\n", .{seen});
-    // B parks at T_self: acks held, the park counted, no expiry.
-    const parked = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 1 }}, kill_row_wait_ns);
-    defer gpa.free(parked);
+    // B parks at T_self: the daemon's own word in its log (its `.stats`
+    // is behind the kernel's revalidation of the root — a foreign object
+    // whose holder is dead — until the successor stands), the storm's
+    // acks held, the storm child alive.
+    const b_mark = try b.logLen();
+    _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
     const parked_ms = (clock.monotonicNs() - t_kill) / std.time.ns_per_ms;
-    try testing.expectEqual(@as(?u64, 1), numberAfter(parked, "\"appender_parked\":"));
-    try testing.expectEqual(@as(?u64, 0), numberAfter(parked, "\"appender_park_expiries\":"));
-    try testing.expectEqual(@as(?u64, 1), numberAfter(parked, "\"membership_self_fences\":"));
     try testing.expect(alive(storm.id.?));
     {
         const text = try b.readLog();
         defer gpa.free(text);
-        try testing.expect(std.mem.indexOf(u8, text, "appender park: T_self reached with the home volume 0's manager unreachable — parked") != null);
+        try testing.expect(std.mem.indexOf(u8, text[b_mark..], "POISONED") == null);
     }
-    std.debug.print("smoke: kill rows (b): B PARKED {d} ms after the kill (acks held; park expiries 0); the storm child is alive, waiting\n", .{parked_ms});
+    std.debug.print("smoke: kill rows (b): B PARKED {d} ms after the kill (acks held); the storm child is alive, waiting\n", .{parked_ms});
     // Remount A: the D0 ladder's same-host dead-pid proof; A wins volume
     // 0 again as the manager at term 2 with the grace window open.
     const mark = try rig.logLen();
@@ -1986,10 +1986,12 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
         try testing.expect(std.mem.indexOf(u8, seg, "membership owner term 2 (T_owner 3000 ms, grace open)") != null);
         try testing.expect(std.mem.indexOf(u8, seg, "no grant plane armed") == null);
     }
-    // B's reclaim lands: the park released, the storm completes.
+    // B's reclaim lands: the park released (the park and the fence
+    // counted once each, no expiry), the storm completes.
     const reclaimed = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 0 }}, kill_row_wait_ns);
     defer gpa.free(reclaimed);
     try testing.expectEqual(@as(?u64, 0), numberAfter(reclaimed, "\"appender_park_expiries\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(reclaimed, "\"membership_self_fences\":"));
     try testing.expectEqual(@as(?u64, 1), numberAfter(reclaimed, "\"manager_repoints\":"));
     try testing.expect((numberAfter(reclaimed, "\"dlm_token_holder_repoints\":") orelse 0) >= 1);
     {
@@ -2074,9 +2076,7 @@ test "smoke: THE KILL ROWS (c) — `appender clear` refuses a live-mounted set; 
     // parked with its page Live — unrecovered, no manager to record it.
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
-    const parked = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 1 }}, kill_row_wait_ns);
-    defer gpa.free(parked);
-    try testing.expectEqual(@as(?u64, 1), numberAfter(parked, "\"appender_parked\":"));
+    _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
     try b.kill();
     {
         const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });

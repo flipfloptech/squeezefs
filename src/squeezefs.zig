@@ -143,6 +143,13 @@ pub const data = struct {
     pub const plane_locks_model = @import("data/plane_locks_model.zig");
 };
 
+// ---- the client bypass: the shm session, the daemon host, the shim + SDK client (charter §7) ----
+pub const ipc = struct {
+    // @anchor:ipc_session_import
+    // @anchor:ipc_host_import
+    // @anchor:ipc_client_import
+};
+
 // ---- the cluster wire (charter §5.5 verbs; §9 thread-per-connection) ----
 pub const wire = @import("wire/wire.zig");
 
@@ -174,6 +181,9 @@ test {
     _ = json_scan;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:ipc_session_test
+    // @anchor:ipc_host_test
+    // @anchor:ipc_client_test
     _ = meta.sym;
     _ = meta.sym_slots;
     _ = meta.sym_tokens;

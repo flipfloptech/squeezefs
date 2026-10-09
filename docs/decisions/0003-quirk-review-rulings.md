@@ -122,3 +122,16 @@ Charter §9 amended accordingly (lane names; the timer/fd-watch bullet).
 | Cross-volume stopgap | Rung 5's `KvTx.cross` / `commitSplit` / EXDEV refusal are retired by the intents | charter §5.5 cross-owner intents |
 | Grant sizing | The writer MEASURES its own block rate and names `want`; `G`'s EWMA term is live (the reference never fed it — every grant was the floor 64) | charter §5.5 `G = clamp(2 × ewma_blocks/s × T_renewal, 64, cap/(2 × writers))` |
 | Un-share witness | A share intent registered before `MarkShared` step 1 and retired at `ShareBlock`'s ack gives `Held{1}` the witness the charter calls owed; `UnshareBlock` lands guarded on it | charter §5.5 "the un-share protocol needs a share-in-flight witness — owed" |
+
+## F. Rung-7 design calls (2026-10-09, from `docs/porting/il_*.md`)
+
+| Call | Decision | Why |
+|---|---|---|
+| Header `heartbeat` | IMPLEMENTED as the charter describes: the daemon's service pass stamps it (coarse ns) at least every tick; the shim/SDK read it for death detection with the 1 s escalation → socket probe → poison ladder. The reference never wrote it (the shim poisoned on a 30 s deadline) | charter §7 names it; a dead daemon must be detected by the client in O(1 s), not 30 s |
+| Submit-side doorbell | `fetch_add(seq_cst)` + the SeqCst fence — the program the model checks IS the program that ships | the reference's loom model checked a stronger program than its code |
+| Shim `-z nodelete` | Set at link time via an explicit `zig build-lib … -z nodelete` Run step in `build.zig` (0.17's `Compile` has no knob); verified by reading `DT_FLAGS_1` in a test | charter §12 |
+| Shim syscalls | Raw `std.os.linux.*` only inside the shim (never `std.posix`, which would resolve to the shim's own exports); local declarations for `fstatfs`/`FUSE_SUPER_MAGIC`/`RTLD_NEXT`/`CMSG_*` | the interposition law |
+| No-panic law | Interposer bodies total by construction + a `panic` handler that poisons every session and passthroughs the in-flight call before aborting the LIBRARY's own machinery (never the host process when avoidable) | charter §12 "no panics escape" |
+| The SDK | Built from the charter and `design-sdk.md` (the reference shipped only the design): a second client kind on the same wire, positional-only ops on arena-backed 4 KiB-aligned buffers, the buffer-lease law, `{cur, cur−1}` ABI window, strengthen-only durability; a hand-written `squeezefs_sdk.h` pinned by a rails census + a C program compiled in the gate | charter §7, §12 |
+| ONE client library | `src/ipc/client.zig` is the session client (HELLO, map, ring/slot/doorbell client, park, heartbeat watch, teardown) consumed by both the shim and the SDK; the shim adds interposition + the fd table + the offset mirror; the SDK adds buffer leases | charter §7 "the same wire as a second client kind" |
+| Shared-process futex face | `sync/futex.zig` gains a public cross-process face (`waitShared/wakeShared` without `FUTEX_PRIVATE`) + `waitMany` over `futex_waitv` for the service thread's park on every session's doorbell | the shm words live in a MAP_SHARED memfd |

@@ -246,6 +246,9 @@ pub const stats = struct {
     /// A SET delta the ring could not hold at a carve — cannot happen: the
     /// carve drains before it carves.
     pub var data_alloc_bitmap_set_dropped: counters.Tripwire = .init("data_alloc_bitmap_set_dropped");
+    /// Deltas a holder with no journal sink (the RAM posture) did not
+    /// queue — the KVDA page sink is the next wave's (0002 row 292).
+    pub var data_alloc_bitmap_deltas_unjournaled: counters.ShardedCounter = .{};
     /// Population scans the allocation funnel performed (0 by contract).
     pub var population_scans: counters.ShardedCounter = .{};
     /// Levels.
@@ -373,8 +376,15 @@ pub const DataBitmap = struct {
 
     /// Queue a delta under the held lock; a SET that does not fit is the
     /// tripwire (the carve drained first), a CLEAR that does not fit is
-    /// dropped leak-safe.
+    /// dropped leak-safe. With NO journal bound (this wave's RAM holder,
+    /// decision 0002 row 292) the delta has no consumer: the RAM word is
+    /// the truth and nothing is queued — a ring nothing drains is not a
+    /// defect when it fills.
     fn queueLocked(self: *DataBitmap, d: RunDelta) void {
+        if (self.journal == null) {
+            stats.data_alloc_bitmap_deltas_unjournaled.inc();
+            return;
+        }
         if (self.ring.push(d)) {
             stats.data_alloc_bitmap_queued.set(self.ring.len);
             return;
@@ -1188,12 +1198,23 @@ test "the single drainer: a refused entry leaves the deltas queued in order (def
     try testing.expectEqual(DataBitmap.DrainOutcome.no_journal, bm.drain());
 }
 
-test "a full ring drops a CLEAR leak-safe and counts it; a SET never meets a full ring at a carve (the tripwire belt)" {
+test "a full ring drops a CLEAR leak-safe and counts it; a SET never meets a full ring at a carve (the tripwire belt); with no journal bound nothing is queued" {
     const a = try testAlloc(64);
     defer a.deinit();
     const bm = try DataBitmap.init(testing.allocator, a, .{ .vol_tag = 0xDA7A, .term = 1, .blocks = 64, .ring_capacity = 1 });
     defer bm.deinit();
+    // No journal: the deltas have no consumer and never fill the ring.
+    const unjournaled0 = stats.data_alloc_bitmap_deltas_unjournaled.load();
     _ = bm.carveRun(0, 2).?;
+    _ = bm.carveRun(8, 2).?;
+    try testing.expectEqual(@as(usize, 0), bm.queuedDeltas());
+    try testing.expectEqual(unjournaled0 + 2, stats.data_alloc_bitmap_deltas_unjournaled.load());
+    try testing.expectEqual(@as(u32, 2), bm.clearRun(8, 2));
+    // A journal bound: the ring is the sink's queue and its capacity binds.
+    var j: RamJournal = .{ .gpa = testing.allocator };
+    defer j.deinit();
+    bm.journal = j.sink();
+    _ = bm.carveRun(16, 2).?;
     const dropped0 = stats.data_alloc_bitmap_deltas_dropped.load();
     try testing.expectEqual(@as(u32, 1), bm.clearRun(0, 1));
     try testing.expectEqual(dropped0 + 1, stats.data_alloc_bitmap_deltas_dropped.load());

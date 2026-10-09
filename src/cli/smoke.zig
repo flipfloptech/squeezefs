@@ -320,6 +320,12 @@ const Rig = struct {
         return r.stdout;
     }
 
+    /// The mount's `.stats` by its absolute path (`Peer.stats`'s law).
+    fn stats(self: *Rig) ![]u8 {
+        var script: [160]u8 = undefined;
+        return self.shOk(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+    }
+
     /// `df -kP` on the mount: the used KiB the daemon reports (statfs).
     fn usedKib(self: *Rig) !u64 {
         const out = try self.onMount("df -kP . | tail -1 | awk '{print $3}'");
@@ -1385,9 +1391,13 @@ const Peer = struct {
     }
 
     /// The mount's `.stats` (the whole JSON; the SIGUSR1 dump's lines are
-    /// capped at the log sink's `LINE_MAX`).
+    /// capped at the log sink's `LINE_MAX`), read by its ABSOLUTE path: a
+    /// `chdir` into the mount is a `getattr` of the root — a foreign
+    /// object on a joiner, EAGAIN while its holder is dead — and the stats
+    /// of a parked daemon are exactly what the kill rows read.
     fn stats(self: *Peer) ![]u8 {
-        return self.onMount("cat .stats");
+        var script: [160]u8 = undefined;
+        return self.rig.shOk(self.rig.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
     }
 
     /// A `sh -e` script with the peer's mount as cwd.
@@ -1717,12 +1727,12 @@ const kill_row_storm_files: usize = 2000;
 const kill_row_wait_ns: u64 = 60 * std.time.ns_per_s;
 
 /// Poll a mount's `.stats` (`host` is a `*Rig` or a `*Peer`: both read it
-/// through `onMount`) until every `(key, want)` holds or the deadline
+/// through `stats`) until every `(key, want)` holds or the deadline
 /// passes; the last tail either way (owned by the caller).
 fn awaitStats(host: anytype, pairs: []const struct { key: []const u8, want: u64 }, deadline_ns: u64) ![]u8 {
     const deadline = clock.monotonicNs() + deadline_ns;
     while (true) {
-        const tail = try host.onMount("cat .stats");
+        const tail = try host.stats();
         var ok = true;
         for (pairs) |p| ok = ok and (numberAfter(tail, p.key) orelse std.math.maxInt(u64)) == p.want;
         if (ok or clock.monotonicNs() >= deadline) {

@@ -326,6 +326,16 @@ const Rig = struct {
         return self.shOk(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
     }
 
+    /// `stats` that answers null instead of failing (the poll's read).
+    fn statsTry(self: *Rig) !?[]u8 {
+        var script: [160]u8 = undefined;
+        const r = try self.sh(self.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+        defer self.gpa.free(r.stderr);
+        if (r.term.success()) return r.stdout;
+        self.gpa.free(r.stdout);
+        return null;
+    }
+
     /// `df -kP` on the mount: the used KiB the daemon reports (statfs).
     fn usedKib(self: *Rig) !u64 {
         const out = try self.onMount("df -kP . | tail -1 | awk '{print $3}'");
@@ -1400,6 +1410,19 @@ const Peer = struct {
         return self.rig.shOk(self.rig.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
     }
 
+    /// `stats` that answers null instead of failing: the root's attributes
+    /// are its holder's, and a parked joiner's holder is dead — the path
+    /// walk to `.stats` answers EAGAIN until the kernel's cached root
+    /// attributes serve it (the poll's read).
+    fn statsTry(self: *Peer) !?[]u8 {
+        var script: [160]u8 = undefined;
+        const r = try self.rig.sh(self.rig.work, try std.fmt.bufPrint(&script, "cat {s}/.stats", .{self.mp}));
+        defer self.rig.gpa.free(r.stderr);
+        if (r.term.success()) return r.stdout;
+        self.rig.gpa.free(r.stdout);
+        return null;
+    }
+
     /// A `sh -e` script with the peer's mount as cwd.
     fn onMount(self: *Peer, script: []const u8) ![]u8 {
         const rig = self.rig;
@@ -1732,7 +1755,11 @@ const kill_row_wait_ns: u64 = 60 * std.time.ns_per_s;
 fn awaitStats(host: anytype, pairs: []const struct { key: []const u8, want: u64 }, deadline_ns: u64) ![]u8 {
     const deadline = clock.monotonicNs() + deadline_ns;
     while (true) {
-        const tail = try host.stats();
+        const tail = (try host.statsTry()) orelse {
+            if (clock.monotonicNs() >= deadline) return error.StatsUnreadable;
+            sleepMs(200);
+            continue;
+        };
         var ok = true;
         for (pairs) |p| ok = ok and (numberAfter(tail, p.key) orelse std.math.maxInt(u64)) == p.want;
         if (ok or clock.monotonicNs() >= deadline) {
@@ -2189,11 +2216,14 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     {
+        // The reader's root is its holder's until the lease lapses: the
+        // walk to `.stats` may answer EAGAIN in between (the tolerant read).
         const deadline = clock.monotonicNs() + kill_row_wait_ns;
         while (true) {
-            const tc = try c.stats();
-            defer gpa.free(tc);
-            if (std.mem.indexOf(u8, tc, "\"reader_arm\":\"quiescent\"") != null) break;
+            if (try c.statsTry()) |tc| {
+                defer gpa.free(tc);
+                if (std.mem.indexOf(u8, tc, "\"reader_arm\":\"quiescent\"") != null) break;
+            }
             if (clock.monotonicNs() >= deadline) return error.ReaderNeverQuiescent;
             sleepMs(200);
         }

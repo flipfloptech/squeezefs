@@ -143,6 +143,14 @@ pub const data = struct {
     pub const plane_locks_model = @import("data/plane_locks_model.zig");
 };
 
+// ---- operations: fsck/scrub, the job fabric + lifecycle + defrag, nvmet targets, the zcrx lane (charter §8) ----
+pub const ops = struct {
+    // @anchor:ops_fsck_import
+    // @anchor:ops_jobs_import
+    // @anchor:ops_nvmet_import
+    // @anchor:ops_zcrx_import
+};
+
 // ---- the client bypass: the shm session, the daemon host, the shim + SDK client (charter §7) ----
 pub const ipc = struct {
     pub const session = @import("ipc/ipc.zig");
@@ -188,6 +196,10 @@ test {
     _ = json_scan;
     _ = thread_name;
     _ = model.explorer;
+    // @anchor:ops_fsck_test
+    // @anchor:ops_jobs_test
+    // @anchor:ops_nvmet_test
+    // @anchor:ops_zcrx_test
     _ = ipc.session;
     if (builtin.os.tag == .linux) _ = ipc.host;
     if (builtin.os.tag == .linux) _ = shim;

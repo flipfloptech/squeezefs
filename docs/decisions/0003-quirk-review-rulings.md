@@ -135,3 +135,15 @@ Charter §9 amended accordingly (lane names; the timer/fd-watch bullet).
 | The SDK | Built from the charter and `design-sdk.md` (the reference shipped only the design): a second client kind on the same wire, positional-only ops on arena-backed 4 KiB-aligned buffers, the buffer-lease law, `{cur, cur−1}` ABI window, strengthen-only durability; a hand-written `squeezefs_sdk.h` pinned by a rails census + a C program compiled in the gate | charter §7, §12 |
 | ONE client library | `src/ipc/client.zig` is the session client (HELLO, map, ring/slot/doorbell client, park, heartbeat watch, teardown) consumed by both the shim and the SDK; the shim adds interposition + the fd table + the offset mirror; the SDK adds buffer leases | charter §7 "the same wire as a second client kind" |
 | Shared-process futex face | `sync/futex.zig` gains a public cross-process face (`waitShared/wakeShared` without `FUTEX_PRIVATE`) + `waitMany` over `futex_waitv` for the service thread's park on every session's doorbell | the shm words live in a MAP_SHARED memfd |
+
+## G. Rung-8 design calls (2026-10-09, from `docs/porting/ops_*.md`)
+
+| Call | Decision | Why |
+|---|---|---|
+| fsck shape | ONE tagged finding union (no string classes), the census over lessee shards only (the retired owner plane is not overlaid on the forest), the fleet shard wire = the job fabric's verb block (no second wire inside fsck), the epoch side map = the allocator's per-cell word | 0002; charter §8 zero-FP ladder |
+| kvmap sweep | NOT a fabric job type: it stays the plane's cursor-resumed fiber (a write-path tail per charter §5.6) | the charter names it under the block-map tree, not maintenance |
+| `job:` records | Tree-0 control records (tags 13/14, v4 `extern struct`s) — never JSON xattrs; the job verbs ride the ONE listener as block `0x06xx`; the enrollment is `wire/auth.zig`'s ladder | charter §8 "durable `job:` records"; 0002 |
+| `enable-symmetric` | Stamps the capability bit + lays the appender region on a `--single-writer` set (already a one-member forest) | the port's format v4 |
+| nvmet driving | configfs and `/dev/nvme-fabrics` written DIRECTLY (no `nvme-cli`/`modprobe`/`losetup` shell-outs; nvmet serves regular files without loop devices); the share ledger is a v4 `extern struct` file written by atomic rename through `uring_fs`; identity default derived from the machine id, `/etc/nvme/*` read-only; discovery by the `instance=` read-back + the namespace uuid via uevent, never a sleep-poll | charter §8; 0002 |
+| zcrx | Cores (codecs + fuzz, parser, span ledger model, sizing ties, governor, steering over a mock, probe verdicts) + the real userspace association against the venue's nvmet-tcp over loopback with `RECV` into granted chunks; the ifq registration + NIC steering + live `RECV_ZC` = hardware-owed with a loud probe and an `Absent` posture here; the 24 B header scratch per the charter (not the reference's 128 B); NO per-op read timeout (0002 row 34 stands) | charter §6.3; §1.4 |
+| `Ring128` CQ | gains an explicit `cq_entries` + `CLAMP` variant (the lane's derived CQ exceeds its SQ) | — |

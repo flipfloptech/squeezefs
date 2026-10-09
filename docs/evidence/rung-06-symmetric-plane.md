@@ -289,3 +289,56 @@ uncached, 7 m 53 s): 18/18 steps; unit 1,827 pass / 19 skipped, rails 5/5, smoke
 1,923 in all; `dmesg | grep -c retained` 0 → 0; no `squeezefs` process and no fuse mount left;
 `scripts/venue trim` after. macOS (`zig build gate`, uncached, 6 m 17 s): 18/18 steps, unit 1,540
 pass / 16 skipped (the Linux-only modules skip), rails 5/5.
+
+## Landed after this note (2026-10-09): the kill rows' flake disposition
+
+Three agents reported `THE KILL ROWS (a)/(b)` flaking under a loaded venue (3 of 4 full-gate runs,
+1 of 3 standalone) with three symptoms — "a torn tree file", `dead_appender_orphans` 72, "the storm
+child exited 1 before B's park". The hunt (`scripts/venue`, every daemon log kept per run, every
+failure classified by its first divergent log line; 0002 rows 352–355):
+
+**The runs.** Quiet venue, HEAD 1a171ba: 12 standalone (6 × (a), 6 × (b)) → 2 failures: (a) run 1
+`TORN a-dir/tree/t200` with 200 files seen; (b) run 10 `expect(alive(storm))` after the kill. Under a
+concurrent `zig build` (the compile of a `-Dtest-filter=meta.` unit run): 12 → 1 failure, (a) run 15
+`TORN t203`, the same class. By hand (the row's steps as a shell script with tar's stderr kept): the
+"torn" file was ALWAYS the entry tar reported `Cannot open` or `Cannot write` on when B died (t200
+"Cannot change mode" — whole, 5 B; t201 "Cannot open: Software caused connection abort" — present,
+size 0) — an unacked create whose record landed with its write never issued, exactly the module
+doc's "complete or empty" class; the 72 orphans appeared in the runs whose B had taken its ONE refill
+(`extent_grant_refills` 1, `extent_grants` 2 at A) AFTER its last page write (runs with the page
+rewritten after the refill returned the same 72 as unclaimed and counted 0 orphans); the storm's
+exit was an `open()` answered EAGAIN. No run was an external kill; none was acked loss.
+
+| Symptom | Cause | Fix (red first) |
+|---|---|---|
+| "a torn tree file" | the row asserted every `tar -x` file WHOLE; a file whose open or write never returned to tar may legally be absent or EMPTY (§1.10 speaks of acked bytes) | tar's stderr is the ack ledger (`tarUnackedNames`): every acked file present and whole, an unacked one absent/empty/whole, never torn; tar's exit 2 and a non-empty unacked set are asserted (a tar that finished clean never met the kill) — row 354 |
+| `dead_appender_orphans` 72 | the census read the PAGE's unclaimed word (written before the refill at the same cadence) and judged everything else of the record no root reaches an orphan IMAGE: a refill the dead joiner never drew on was counted 72 times and read as 72 images | the census judges by CONTENT (`node.residueStampedBy`): a residue the dead appender stamped is an orphan (`dead_appender_orphans`, C13), an extent it never wrote is `dead_appender_unwritten_returned`; both returned, both still floor the node-seq handle. Red: `recovery`'s RAM fixture (108 unwritten, 109 stamped beyond the page's word), `volume_bind`'s dead region (one blank claim, one stamped image) — row 352 |
+| "the storm child exited 1 before B's park" (1) | the joiner's pool target was the join floor `8 + M` — the charter's `2 × ewma_smo_rate × failover_bound_s` term was never measured (`smo_ewma_milli_per_s` 0 on every region) and the refill ran on the checkpoint clock alone: the rotor's 64 first images left 8 extents of headroom until the next cadence | the joiner folds its SMO rate off the mirror's monotone claim count per checkpoint (`ExtCore.claimsTotal`, `extent_grant.smoRateFold`), its target is `joinedPoolTarget(joinedGrantDerived(ewma, bound), promised, 8 + M, MAX)` (the heap-share cap the manager's: `Rejected` ⇒ re-ask `0` = the cap), the ask the top-up, and the refill is PROACTIVE — the mirror's low-water hook (`alloc_ext.installLowWater`) kicks a pool cadence on its own flight when a claim crosses `joinedRefillMark` (`extent_grant_refill_kicks`); `manager_dependency_stalls` (a grant-fed conveyor's `GrantExhausted`) is the must-stay-0 row (b) asserts on B — row 353 |
+| "the storm child exited 1 before B's park" (2) — the EAGAIN itself (`handler: lookup on ino 1 answered EAGAIN: HolderUnreachable`, then `TokenChannelStale`; `tokens: object 1 missed the cache (entry live, dentries false, wanted dentries true)`) | the storm walked `storm/sN` from the MOUNT ROOT, so the kernel revalidated the `storm` dentry against A's root every `dir_entry` TTL (1 s); B's cached token on the root was BARE (the serve after the mkdir's recall was the root's GETATTR, attrs only — a dentry-bearing entry is never displaced by a bare one, but a bare one is only upgraded by a dentry miss), the first revalidation inside A's outage missed, the fetch failed and CLOSED the channel, and the serve gate checked `channel_ok` BEFORE the cache — every later read of A's objects, cached or not, refused; the in-op re-probe dropped the cache besides | a cached token serves whatever the channel's posture (the recall is a push on the reader's listener; the holder proceeds only on the reader's lease expiry, the gate applied first); `channel_ok` gates fetches; the re-probe (`Reader.redial`) keeps the cache unless its round completes (a live holder — dropped as at a move). Red: `tokens` "a CACHED token serves while the holder is unreachable" — row 355. The row's storm now runs with `storm` as its cwd (every path it walks is B's own object): the row pins B's OWN writes held at the gate. FINDING, not fixed: a path component in a foreign directory is revalidated against its holder; an UNCACHED dentry set during the holder's outage is the charter's typed EAGAIN to `open()` (the kernel's 1 s `dir_entry` TTL bounds how long a cached component outlives it) — the namespace under a dead manager's directories is EAGAIN-dark to joiners until the successor stands and the planes re-point |
+
+**Harness.** Every daemon carries a per-test pid file beside its log (`<work>/daemon.pid`,
+`daemon-b.pid`) and a `killed` word; a SIGKILL the test never sent is judged an EXTERNAL KILL
+(`judgeDeath`) and the row `SkipZigTest`s loud, naming it. `awaitStats`/`awaitLog` check the daemon
+is alive on every poll. The storm's stderr is kept and printed with B's words when it dies early;
+row (b) prints B's pool and token census at the kill. The handler logs a retryable (EAGAIN) answer at
+debug level with its op, ino and error name.
+
+**After the fixes.** Quiet venue: 12/12 (6 × (a), 6 × (b)); under a concurrent `zig build test
+-Dtest-filter=meta.` loop: (a) 10/10, (b) 10/10 (the `storm`-cwd row; before it, with the token fix
+alone, (b) failed 4 of 12 under load — every one the bare root token's dentry miss above; before any
+fix, 1 of 6 quiet and 1 of 6 under load). Row (a) now reports `tar exited with code 2, 790–799 entries
+unacked`, `orphans 0, unwritten grant returned 83–99`; row (b) `refills 1, refill kicks 1` before the
+kill and the park `413–721 ms` after it.
+
+**Gate totals.** Linux venue (`scripts/venue zig build gate` under `timeout 3600`, uncached, 537 s):
+35/35 steps; unit 1,994 pass / 23 skipped, rails 7/7 + the shim census, smoke 50 pass / 2 skipped
+(the `KERNEL AIO` row added), bench-smoke 32/32, shim-smoke 32/32, sdk-smoke — 2,116 / 2,141 in all;
+no `squeezefs` process and no fuse mount left; `scripts/venue trim` after (24.1 GiB returned). macOS
+(`zig build gate`): 19/19 steps, unit 1,634 pass / 19 skipped, rails 7/7.
+
+**Also seen, not this delivery's.** B's mount failed 3 of 11 by-hand runs with `kmbuf ring … refused
+ENOMEM` after five retries (`RingSetupFailed`) on a venue whose page cache held 11 GB — the 32 × 1 MiB
+kmbuf buffers are high-order kernel allocations and the buddy lists were down to a few hundred
+order-8 blocks; on the failed mount's teardown B SEGFAULTED in `mem/budget.zig` `samplerMain → current`
+(the sampler ticking a source freed by the aborted arm). The joiner logs the manager's writer lock at
+ERROR level on every join ("another squeezefs process holds the writer lock") before joining normally.

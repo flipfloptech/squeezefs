@@ -278,9 +278,16 @@ to end).
   status) — the harness found the shim's `io_*` through `RTLD_DEFAULT` (`lane=shim-or-libaio
   libaio=absent`: the venue has no libaio; the raw-syscall arm served it).
 - Row 2 (a SqueezeFS mount WITHOUT `-o interception`): the same battery, pure passthrough,
-  `ipc_sessions_total 0`, the shim silent (ENODATA ⇒ the negative cache). Finding: the kernel's own
-  aio PWRITE on the plain mount completes `-EIO` with and without the shim (0002 row 351; the host
-  wave's).
+  `ipc_sessions_total 0`, the shim silent (ENODATA ⇒ the negative cache). Finding (at 22d4912): the
+  kernel's own aio PWRITE on the plain mount completed `-EIO` with and without the shim (0002 row
+  351) — SETTLED by the host wave's `plane.ownBlock` proof fix below (the inline → striped
+  promotion refused every sub-block image; the libaio harness's 8 concurrent 4 KiB PWRITEs into a
+  fresh file were its kernel-path repro, never a transport or GUP class: writes of that size are
+  extracted, none held). Re-verified 2026-10-09 at 1a171ba with a raw-syscall program on the plain
+  mount (one 4 KiB PWRITE buffered and `O_DIRECT`; the harness's 8 + 8 twice; with and without a
+  cache path — every `res` 4096, byte-exact read-back, `fuse_write_promotions_to_striped` 2 on the
+  no-cache set) and pinned by the smoke's `KERNEL AIO` row; rows 1–2 now print the baseline's own
+  verdict (`aio.bin … without the shim: exited with code 0; ok`).
 - Rows 4a–4c (the armed mount: the `-dirty` pairing refusal counted once per mount, the engagement
   law over `ipc_ops_{read,write}`, the C bail-outs served, kill -9 mid-op ⇒ the passthrough result)
   are written and **PENDING**: on this tree the daemon answers `-o interception: not a squeezefs

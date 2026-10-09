@@ -15,7 +15,14 @@
 //!   table) → the DATA PLANE (`data/plane.zig`: devices, allocators seeded
 //!   from the ledger, the router, the reclaimer, staging + the NVMe tier
 //!   under the cache paths, the transform keyed from the verified key, the
-//!   write and read paths) → `KvFs(KvBackend, DataPlane)` + the ring
+//!   write and read paths) → `KvFs(KvBackend, DataPlane)` → the cross-
+//!   owner plane (open intents rolled forward) → THE CLUSTER WIRE
+//!   (`meta/sym/wire_plane.zig`, a symmetric set only: this process won
+//!   the D0 ladder of every volume it opened and is their MANAGER — ONE
+//!   listener on `SQUEEZEFS_MW_BIND` serving the manager, membership,
+//!   death-ledger, token and cross-owner families; the endpoint published
+//!   into the RAM table and the durable `endpoint:` record; the owner
+//!   shard armed; the read divert bound into the filesystem) → the ring
 //!   `Binding` with the plane's queue-thread arms → the FUSE fd: root opens
 //!   `/dev/fuse` inside the session's `mount(2)`; anyone else receives it
 //!   from `fusermount3` (`fusermount.zig`) → `Session.mount` (INIT,
@@ -34,6 +41,8 @@
 //! Teardown: `Session.close` (the drains RELEASE every retained zc slot
 //! while the connection is live and synthesize every owed reply, then the
 //! unmount, the workers join) → the watchdog and the cadence cancelled →
+//! the cluster wire stopped (every connection severed, the token hook
+//! disarmed on every pass — before the backend it serves over) →
 //! `Session.deinit` → the filesystem's dismount sweep → `DataPlane.close`
 //! (the dismount pass: staged files promote, packs seal DISMOUNT, the
 //! reclaimer drains, the devices close — charter §8 `umount`) →
@@ -43,12 +52,14 @@
 //! released too.
 //!
 //! Every exit of `mountMain` runs that order: the stop latch (SIGTERM /
-//! SIGINT), the session's own end (the `on_shutdown` hook), a failed spawn
-//! after the session armed (`defer session.deinit()`), and the FAILED
-//! verdict. What no daemon code can cover: an EXTERNAL `umount(8)` (a
-//! type-`fuse` mount gets no DESTROY — the kernel aborts the connection
-//! and reclaims any retained ent itself, `transport_retained_kernel_drained`)
-//! and the signals that run no teardown (`daemon.zig`).
+//! SIGINT — what `squeezefs umount` sends, having found this daemon's pid
+//! in the mount's `.stats`), the session's own end (the `on_shutdown`
+//! hook), a failed spawn after the session armed (`defer
+//! session.deinit()`), and the FAILED verdict. What no daemon code can
+//! cover: an EXTERNAL `umount(8)` (a type-`fuse` mount gets no DESTROY —
+//! the kernel aborts the connection and reclaims any retained ent itself,
+//! `transport_retained_kernel_drained`) and the signals that run no
+//! teardown (`daemon.zig`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -66,6 +77,7 @@ const guard = @import("../meta/guard.zig");
 const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const sym_xv = @import("../meta/sym/xv.zig");
+const sym_wire = @import("../meta/sym/wire_plane.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
 const fuse_geometry = @import("../fuse/geometry.zig");
@@ -311,7 +323,7 @@ fn mountMain(ctx: *Ctx) u8 {
     var vs: VirtualSource = .{
         .renderer = stats.Renderer.init(gpa, .{
             .build = .{ .train = ctx.p.build.train, .commit = ctx.p.build.commit, .profile = ctx.p.build.profile },
-            .mount = .{ .uid = ctx.opts.uid, .gid = ctx.opts.gid, .mountpoint = ctx.mountpoint, .sqmeta_uri = ctx.meta_uri, .sqdata_uri = ctx.data_uri, .read_only = ctx.opts.read_only, .writeback = ctx.opts.write_back, .direct_device_true = ctx.opts.direct_device_true },
+            .mount = .{ .uid = ctx.opts.uid, .gid = ctx.opts.gid, .pid = @intCast(linux.getpid()), .mountpoint = ctx.mountpoint, .sqmeta_uri = ctx.meta_uri, .sqdata_uri = ctx.data_uri, .read_only = ctx.opts.read_only, .writeback = ctx.opts.write_back, .direct_device_true = ctx.opts.direct_device_true },
             .env = env,
             .plane = plane,
             .sqz = ctx.sqz,
@@ -331,6 +343,20 @@ fn mountMain(ctx: *Ctx) u8 {
     defer xv_bound.destroy(gpa);
     const rolled = fs.bindXv(&xv_bound.plane) catch |e| return ctx.failed("the cross-owner roll-forward at mount failed ({t})", .{e});
     if (rolled != 0) log.info("mount: {d} open cross-owner intent(s) rolled forward before serving", .{rolled});
+    // The cluster wire (charter §5.5, §5.7): this process won the D0
+    // ladder of every volume it opened, so it is their MANAGER — ONE
+    // listener serving the manager, membership, ledger, token and
+    // cross-owner families, the endpoint published for the joiners. A
+    // `--single-writer` set arms no wire.
+    const wire = sym_wire.WirePlane.start(gpa, io, be, env, facts.cpus, ctx.budget_bytes, &xv_bound.plane, ctx.opts.read_only) catch |e| return ctx.failed("the cluster wire could not arm: {s}", .{sym_wire.startReason(e)});
+    var wire_live = true;
+    defer if (wire_live) if (wire) |wp| wp.stop();
+    if (wire) |wp| {
+        vs.renderer.sources.mount.wire_endpoint = wp.endpointText();
+        // The read divert: a foreign slot's records come under a token or
+        // answer the typed EAGAIN, never off this mount's cache.
+        fs.bindDivert(&wp.divert);
+    }
     // The corpse sweep (kv_fs module doc): what a crashed daemon's forgets
     // left at nlink 0 is destroyed before any request is served.
     _ = fs.sweepCorpsesAtMount() catch |e| return ctx.failed("the corpse sweep at mount failed ({t})", .{e});
@@ -377,6 +403,8 @@ fn mountMain(ctx: *Ctx) u8 {
     var session_live = true;
     defer if (session_live) session.deinit();
     vs.renderer.sources.session = session;
+    // A recalled token's kernel view rides the session's notify seam.
+    if (wire) |wp| wp.sink.bindSession(session.tokenNotifySeam());
     // The zc legs: the held-slot direct store on a zero-copy session, the
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
@@ -385,7 +413,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // 5. The watchdog loop and the reclaim cadence on the meta pool.
     var wd = watchdog.Watchdog.init(&registry);
     var wd_fut = ctx.sqz.spawnMeta(watchdogMain, .{ &wd, io }) catch return ctx.failed("cannot spawn the watchdog", .{});
-    var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io };
+    var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io, .wire = wire };
     var reclaim_fut = ctx.sqz.spawnMeta(ReclaimCadence.run, .{&reclaim}) catch {
         wd.requestStop();
         wd_fut.cancel(io);
@@ -408,6 +436,11 @@ fn mountMain(ctx: *Ctx) u8 {
     wd_fut.cancel(io);
     reclaim.requestStop();
     reclaim_fut.cancel(io);
+    // The wire BEFORE the planes and the backend it serves over: every
+    // connection severed, the token hook disarmed on every pass.
+    if (wire) |wp| wp.stop();
+    wire_live = false;
+    vs.renderer.sources.mount.wire_endpoint = "";
     const failed = be.isFailed();
     const stranded = counters.tripwireCount("open_count_stranded");
     const abandoned = transport.slot.requests_abandoned.load();
@@ -547,6 +580,9 @@ fn watchdogMain(wd: *watchdog.Watchdog, io: Io) void {
 const ReclaimCadence = struct {
     fs: *BackendFs,
     io: Io,
+    /// The cluster wire's cadence (eviction, grace reap, the ledger poll)
+    /// rides the same fiber; null on a `--single-writer` set.
+    wire: ?*sym_wire.WirePlane,
     stop: std.atomic.Value(bool) = .init(false),
 
     fn requestStop(self: *ReclaimCadence) void {
@@ -564,6 +600,7 @@ const ReclaimCadence = struct {
             // The cross-owner cadence rides the same meta fiber: the expiry
             // sweep, the roll-forward of abandoned intents, the gauges.
             self.fs.xvCadenceTick();
+            if (self.wire) |wp| wp.tick();
         }
     }
 };

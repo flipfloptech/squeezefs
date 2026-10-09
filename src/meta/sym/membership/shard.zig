@@ -180,13 +180,28 @@ pub const MemberRow = struct {
         };
     }
 
+    /// The same-host pid proof of a member: null for another host's row
+    /// (unknowable here), else whether the pid is alive. A row carries no
+    /// incarnation word when the join head had none (`start_ticks` 0):
+    /// the proof is then the pid's existence, never a ticks mismatch.
+    pub fn pidAlive(self: MemberRow, local: claim.Identity, probe: claim.PidProbe) ?bool {
+        const same_host = local.bootIdReadable() and std.mem.eql(u8, &self.boot_id, &local.boot_id);
+        if (!same_host) return null;
+        if (self.pid == 0) return false;
+        if (self.start_ticks == 0) return probe.startTicksOf(probe.ctx, self.pid) != null;
+        return !probe.provablyDead(self.pid, self.start_ticks);
+    }
+
     /// The `clients` row of a member (the writer-claim classifier's law,
-    /// quirk Q-R3: one classifier).
+    /// quirk Q-R3: one classifier): a same-host member proven dead by its
+    /// pid is `dead`; else `live` iff the owner lists it live, `stale`
+    /// otherwise (offline, another host's member reads `stale`).
     pub fn registration(self: MemberRow, local: claim.Identity, now_ns: i64, probe: claim.PidProbe, live_in_ram: bool) claim.Registration {
         const c: claim.Claim = .{ .writer_id = self.writer_id, .ts_ns = self.ts_ns, .pid = self.pid, .start_ticks = self.start_ticks, .boot_id = self.boot_id, .hostname_hash = self.hostname_hash, .heartbeat_seq = self.epoch, .term = self.term };
         var r = claim.Registration.fromClaim(c, local, now_ns, probe);
         r.kind = .member;
-        if (r.state != .dead) r.state = if (live_in_ram) .live else .stale;
+        const dead = if (self.pidAlive(local, probe)) |alive| !alive and self.pid != local.pid else false;
+        r.state = if (dead) .dead else if (live_in_ram) .live else .stale;
         return r;
     }
 };

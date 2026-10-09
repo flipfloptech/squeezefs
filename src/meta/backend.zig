@@ -931,6 +931,12 @@ pub const KvBackend = struct {
         return be.publishGuestRoots();
     }
 
+    /// The per-volume `sym` words of a volume with no appender set (the
+    /// `--single-writer` class): zeros and `solo` (`sym/bind.zig`).
+    pub fn writeSoloSymStatsJson(be: *KvBackend, w: *Io.Writer) Io.Writer.Error!void {
+        return sym.bind.AppenderSet.writeSoloStatsJson(be, w);
+    }
+
     /// `checkpoint_cycle.RecordSource.appenderPages`: every region's page
     /// after the ledger record (`sym/bind.zig`).
     fn appenderPagesHook(ctx: *anyopaque, rec: *const ledger.LedgerRecord, cache_clean: bool) checkpoint_cycle.IoError!void {

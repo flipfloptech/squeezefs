@@ -120,12 +120,18 @@ pub const Build = struct {
 pub const Mount = struct {
     uid: u32 = 0,
     gid: u32 = 0,
+    /// The daemon's pid: what `squeezefs umount` signals so the daemon's
+    /// own orderly teardown runs the unmount (charter §4 "Teardown").
+    pid: u32 = 0,
     mountpoint: []const u8 = "",
     sqmeta_uri: []const u8 = "",
     sqdata_uri: []const u8 = "",
     read_only: bool = false,
     writeback: bool = false,
     direct_device_true: bool = false,
+    /// The cluster wire's advertised endpoint (`host:port`); empty on a
+    /// mount with no listener (a `--single-writer` class).
+    wire_endpoint: []const u8 = "",
 };
 
 /// The key census (VAL-7a): the stores' live key sets, written only when
@@ -311,6 +317,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/data/sym_planes/custody.zig", .by = "src/data/sym_planes.zig" },
     .{ .path = "src/meta/sym/join.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/bind.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/wire_plane.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/door.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/acquire.zig", .by = "src/meta/sym.zig" },
@@ -399,12 +406,14 @@ fn writeBuild(src: *Sources, w: *Writer) Error!void {
 /// (charter §1.6: a row's posture travels in the row's own snapshot).
 fn writeMount(src: *Sources, w: *Writer) Error!void {
     const m = src.mount;
-    try w.print("{{\"uid\":{d},\"gid\":{d},\"mountpoint\":", .{ m.uid, m.gid });
+    try w.print("{{\"uid\":{d},\"gid\":{d},\"pid\":{d},\"mountpoint\":", .{ m.uid, m.gid, m.pid });
     try writeJsonString(w, m.mountpoint);
     try w.writeAll(",\"sqmeta_uri\":");
     try writeJsonString(w, m.sqmeta_uri);
     try w.writeAll(",\"sqdata_uri\":");
     try writeJsonString(w, m.sqdata_uri);
+    try w.writeAll(",\"wire_endpoint\":");
+    try writeJsonString(w, m.wire_endpoint);
     try w.print(",\"read_only\":{},\"writeback\":{},\"direct_device_true\":{},\"ab_levers\":{{", .{ m.read_only, m.writeback, m.direct_device_true });
     var first = true;
     if (src.env) |env| {
@@ -863,7 +872,7 @@ fn scanJson(gpa: Allocator, text: []const u8, keys: *std.ArrayList([]const u8)) 
 }
 
 test "render: the document parses, names every family in the schema's order with daemon last, ends with ONE newline, and the size is exactly the served bytes" {
-    var r = Renderer.init(testing.allocator, .{ .build = .{ .train = "0.1.0", .commit = "abc", .profile = "gate" }, .mount = .{ .uid = 7, .mountpoint = "/mnt/x" } });
+    var r = Renderer.init(testing.allocator, .{ .build = .{ .train = "0.1.0", .commit = "abc", .profile = "gate" }, .mount = .{ .uid = 7, .pid = 4242, .mountpoint = "/mnt/x", .wire_endpoint = "10.0.0.7:39123" } });
     defer r.deinit();
     const p = try r.render();
     defer p.deinit(testing.allocator);
@@ -878,6 +887,10 @@ test "render: the document parses, names every family in the schema's order with
     try testing.expectEqualStrings("daemon", keys.items[keys.items.len - 1]);
     try testing.expect(std.mem.indexOf(u8, text, "\"build\":{\"train\":\"0.1.0\",\"commit\":\"abc\",\"profile\":\"gate\"}") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"mountpoint\":\"/mnt/x\"") != null);
+    // The daemon's pid and the wire endpoint ride the mount family: what
+    // `umount` signals and what a joiner dials.
+    try testing.expect(std.mem.indexOf(u8, text, "\"pid\":4242,\"mountpoint\":") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"wire_endpoint\":\"10.0.0.7:39123\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"invariant_tripwires\":") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"lock_ticked_reregisters\":") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"fuse_op_watchdog_overdue\":") != null);

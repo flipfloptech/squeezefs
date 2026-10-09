@@ -40,7 +40,25 @@ const Io = std.Io;
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
 const counters = @import("../core/counters.zig");
+const derive = @import("../core/derive.zig");
+const json_scan = @import("../core/json_scan.zig");
 const handler = @import("../fuse/handler.zig");
+const status_verb = @import("status.zig");
+const uring_fs = @import("../io/uring_fs.zig");
+const superblock = @import("../meta/superblock.zig");
+const ledger = @import("../meta/ledger.zig");
+const device_loader = @import("../meta/device_loader.zig");
+const node_seq = @import("../meta/node_seq.zig");
+const proc = @import("../meta/guard/proc.zig");
+const cr = @import("../meta/sym/control_records.zig");
+const appender_page = @import("../meta/sym/appender_page.zig");
+const membership = @import("../meta/sym/membership.zig");
+const shard = membership.shard;
+const join_ladder = membership.join_ladder;
+const wire_verbs = @import("../wire/verbs.zig");
+const wire_auth = @import("../wire/auth.zig");
+const wire_endpoint = @import("../wire/endpoint.zig");
+const dialer = @import("../wire/dialer.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/smoke is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -704,8 +722,30 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
         const ops = numberAfter(tail, "\"fuse_ops\":") orelse 0;
         try testing.expect(reqs > 0 and ops > 0);
         std.debug.print("smoke: POSIX pass: {d} fuse ops, {d} ring requests, {d} enters ({d}.{d:0>2} per request), wake writes {d} / elided {d}\n", .{ ops, reqs, enters, enters / @max(reqs, 1), (enters * 100 / @max(reqs, 1)) % 100, wakes, elided });
+        // THE DEFAULT FLIP's other half (charter §5.5): this stage mounted
+        // the `--single-writer` opt-out, so every symmetric family — the
+        // process-wide `meta.sym` (appenders, manager, join, slots,
+        // tokens, membership, xv), the per-volume `sym` words and the
+        // data planes' `sym_planes` — reads 0 / `solo` after a full POSIX
+        // pass; the mount's own posture names no wire endpoint.
+        const meta_line = tail[(std.mem.indexOf(u8, tail, "stats meta: ") orelse return error.MetaFamilyMissing)..];
+        var sym_seen: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, meta_line, pos, "\"sym\":")) |at| {
+            const obj = objectAfter(meta_line[at..], "\"sym\":") orelse return error.SymFamilyMalformed;
+            try expectSoloPosture(if (sym_seen == 0) "meta.sym" else "meta.set.volumes[].sym", obj);
+            sym_seen += 1;
+            pos = at + "\"sym\":".len;
+        }
+        try testing.expectEqual(@as(usize, 2), sym_seen);
+        const data_line = tail[(std.mem.indexOf(u8, tail, "stats data: ") orelse return error.DataFamilyMissing)..];
+        try expectSoloPosture("data.sym_planes", objectAfter(data_line, "\"sym_planes\":") orelse return error.SymPlanesFamilyMissing);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"wire_endpoint\":\"\"") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"manager_lease\":\"solo\"") != null);
     }
-    // umount → the daemon exits 0 → remount → intact → status.
+    // umount → the verb SIGNALS the daemon (charter §4 "Teardown": an
+    // external unmount sends no DESTROY) → the daemon's own orderly close
+    // runs the detach and exits 0 → remount → intact → status.
     try rig.umount();
     const term1 = try rig.waitChild();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term1);
@@ -713,6 +753,8 @@ test "smoke: format → mount → the POSIX pass through the shell → umount �
     {
         const text = try rig.readLog();
         defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[ready_at..], "stop requested (SIGTERM/SIGINT): unmounting") != null);
+        try testing.expect(std.mem.indexOf(u8, text[ready_at..], "the FUSE session ended") == null);
         try testing.expect(std.mem.indexOf(u8, text[ready_at..], "clean unmount") != null);
         try testing.expect(std.mem.indexOf(u8, text[ready_at..], "open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0") != null);
     }
@@ -884,6 +926,332 @@ test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+}
+
+// ---------------------------------------------------------------------------
+// The N-daemon posture, the manager half (charter §5.5, §5.7): the daemon
+// as the manager of its set on the cluster wire, joined by another
+// process over real TCP.
+// ---------------------------------------------------------------------------
+
+/// `T_owner` the daemon runs the membership shard at in this stage (the
+/// test seam): long enough for a joiner's beats to be idle between
+/// (`T_self = T_owner − 2·skew − D_purge` stays positive at the 1,100 ms
+/// landing ceiling), short enough that a dropped joiner is evicted within
+/// two reclaim cadences.
+const smoke_t_owner_ms: u64 = 3000;
+
+/// The offline reader a joiner process uses before it holds any wire: the
+/// superblock, the newest ledger record, the control records at that
+/// checkpoint, the appender pages (`PageReader`).
+const OfflineVolume = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    env: *const std.process.Environ.Map,
+    pool: *uring_fs.Pool,
+    path: []const u8,
+    sb: superblock.Superblock,
+    rec: ledger.LedgerRecord,
+    dev: device_loader.DeviceLoader,
+
+    fn open(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, path: []const u8) !OfflineVolume {
+        const pool = try uring_fs.Pool.init(gpa, uring_fs.Config.resolve(env, derive.facts()));
+        errdefer pool.deinit();
+        var reason: [512]u8 = undefined;
+        const snap = try status_verb.classify(gpa, env, pool, path, &reason);
+        const sb = snap.sb orelse return error.NotFormatted;
+        const rec = (try status_verb.newestLedger(gpa, env, pool, path, sb)) orelse return error.NoLedger;
+        const mode = uring_fs.registerMetaDevice(gpa, env, path) catch return error.DeviceRefused;
+        return .{ .gpa = gpa, .io = io, .env = env, .pool = pool, .path = path, .sb = sb, .rec = rec, .dev = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = sb.root_ledger.start, .bitmap_base = sb.alloc_bitmap.start } };
+    }
+
+    fn deinit(self: *OfflineVolume) void {
+        self.rec.deinit(self.gpa);
+        self.pool.deinit();
+    }
+
+    /// Re-read the newest checkpoint (a record committed since the open).
+    fn refresh(self: *OfflineVolume) !void {
+        const rec = (try status_verb.newestLedger(self.gpa, self.env, self.pool, self.path, self.sb)) orelse return error.NoLedger;
+        self.rec.deinit(self.gpa);
+        self.rec = rec;
+    }
+
+    fn control(self: *OfflineVolume, k: []const u8) !?[]u8 {
+        return status_verb.readControlRecord(self.gpa, self.io, self.env, self.pool, self.path, self.sb, &self.rec, k);
+    }
+
+    /// Bounded poll for a control record the daemon commits + checkpoints
+    /// (CHECKPOINT_MAX_AGE 1 s; the cadence's own flight).
+    fn awaitControl(self: *OfflineVolume, k: []const u8) ![]u8 {
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        while (true) {
+            try self.refresh();
+            if (try self.control(k)) |v| return v;
+            if (clock.monotonicNs() >= deadline) return error.ControlRecordNotCheckpointed;
+            sleepMs(100);
+        }
+    }
+
+    fn pages(self: *OfflineVolume) join_ladder.PageReader {
+        return .{ .ctx = self, .read = &readPage };
+    }
+
+    fn readPage(ctx: *anyopaque, offset: u64, out: *[appender_page.PAGE_LEN]u8) error{Io}!void {
+        const self: *OfflineVolume = @ptrCast(@alignCast(ctx));
+        const img = self.dev.readRange(self.gpa, offset, appender_page.PAGE_LEN) catch return error.Io;
+        defer self.gpa.free(img);
+        @memcpy(out, img[0..appender_page.PAGE_LEN]);
+    }
+};
+
+const SmokePoison = struct {
+    fired: std.atomic.Value(u32) = .init(0),
+    fn poison(ctx: ?*anyopaque, _: []const u8) void {
+        const self: *SmokePoison = @ptrCast(@alignCast(ctx.?));
+        _ = self.fired.fetchAdd(1, .monotonic);
+    }
+    fn sink(self: *SmokePoison) membership.park_reclaim.PoisonSink {
+        return .{ .ctx = self, .poison = &poison };
+    }
+};
+
+/// A member's renewal thread: `T_self` at the stage's `T_owner` is 797 ms
+/// (`3000 − 2·skew − D_purge`), the renew cadence 265 ms — the ticks must
+/// never wait on the stage's own stats reads (a SIGUSR1 dump + the log
+/// read can outlast `T_self`), so they run on their own thread at a tenth
+/// of `T_self`. Any verdict but idle/renewed is recorded as bad.
+const Beater = struct {
+    member: *shard.Member,
+    stop: std.atomic.Value(bool) = .init(false),
+    bad: std.atomic.Value(u8) = .init(0),
+    renewed: std.atomic.Value(u32) = .init(0),
+
+    const TICK_MS: u64 = 80;
+
+    fn run(self: *Beater) void {
+        while (!self.stop.load(.acquire)) {
+            const t = clock.monotonicNs();
+            switch (self.member.tick(t / std.time.ns_per_ms, t)) {
+                .idle => {},
+                .renewed => _ = self.renewed.fetchAdd(1, .monotonic),
+                else => self.bad.store(1, .release),
+            }
+            sleepMs(TICK_MS);
+        }
+    }
+};
+
+fn smokeJoinerIdentity(n: u32) wire_verbs.WireIdentity {
+    return .{ .node_token = 0x5A0E_0000 + n, .writer_id = 0x7000 + n, .mount_slot = 0x5000 + n, .reserved = 0 };
+}
+
+test "smoke: THE N-DAEMON POSTURE, the manager half — format (the symmetric default; meta + 2 data, cache path) → mount A: the listener is up, .stats names the pid and the wire endpoint, the durable endpoint:{0} record agrees → a second PROCESS dials A over TCP with the secret read off the device: JoinAppender, M rotor slots, a first touch, SlotBusy on A's native slot, a membership join → `appenders` lists its region Live and `clients` lists the member → a joiner that DIES is evicted at T_owner and its death recorded in the ledger → the live joiner releases, leaves (region Free) → `umount` signals A and A's own close detaches" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    const ready_at = try rig.awaitReady(0);
+
+    // The mount's posture: the pid umount signals, the endpoint a joiner
+    // dials, both in the `mount` family; the manager lease held.
+    var ep_text_buf: [64]u8 = undefined;
+    var ep_text: []const u8 = "";
+    {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        try testing.expectEqual(@as(?u64, @intCast(rig.child_pid)), numberAfter(tail, "\"pid\":"));
+        const ep = json_scan.string(tail, "wire_endpoint") orelse return error.NoWireEndpoint;
+        try testing.expect(std.mem.startsWith(u8, ep, "127.0.0.1:"));
+        @memcpy(ep_text_buf[0..ep.len], ep);
+        ep_text = ep_text_buf[0..ep.len];
+        try testing.expect(std.mem.indexOf(u8, tail, "\"manager_lease\":\"held\"") != null);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"wire_listener_up\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"membership_shards\":"));
+    }
+    // The joiner's device-side discovery: the secret and the manager's
+    // endpoint off tree 0 at the newest checkpoint.
+    var vol = try OfflineVolume.open(gpa, io, &rig.env, rig.img);
+    defer vol.deinit();
+    const secret = blk: {
+        const bytes = (try vol.awaitControl(wire_auth.ENROLL_KEY));
+        defer gpa.free(bytes);
+        break :blk try wire_auth.decodeEnroll(bytes);
+    };
+    const advertised = blk: {
+        const bytes = try vol.awaitControl(cr.endpointKey(0).slice());
+        defer gpa.free(bytes);
+        const e = try cr.EndpointRecordWire.decode(bytes);
+        var w: wire_endpoint.EndpointWire = .{ .family = e.family, .reserved = 0, .port = e.port, .addr = e.addr };
+        var buf: [64]u8 = undefined;
+        var fw: std.Io.Writer = .fixed(&buf);
+        try w.format(&fw);
+        try testing.expectEqualStrings(ep_text, fw.buffered());
+        break :blk w;
+    };
+
+    // Joiner B: another process on this host dials A.
+    var client_b = dialer.Client.init(gpa, io, advertised, secret, smokeJoinerIdentity(1));
+    defer client_b.deinit();
+    var link_b: join_ladder.TcpLink = .{ .client = &client_b };
+    var wire_b: join_ladder.ManagerWire = .{ .gpa = gpa, .link = link_b.link(), .volume = 0, .identity = smokeJoinerIdentity(1), .pages = vol.pages() };
+    var b = join_ladder.Joiner.init(gpa, &wire_b);
+    defer b.deinit();
+    const ident_b: appender_page.Identity = .{ .node_token = smokeJoinerIdentity(1).node_token, .mount_slot = smokeJoinerIdentity(1).mount_slot, .writer_id = smokeJoinerIdentity(1).writer_id };
+    try b.joinRegion(.{ .identity = ident_b, .volume_base = node_seq.nodeSeqBase(vol.sb.uuid), .grain = vol.dev.mode.grain(), .ring0_head = vol.rec.journal_tail_seq });
+    try testing.expectEqual(@as(u32, 1), b.appenderId());
+    const rotor = try b.acquireRotor(4);
+    try testing.expectEqual(@as(usize, 4), rotor);
+    try testing.expect((try b.firstTouch(60_000)) == .granted);
+    const busy = try b.firstTouch(0);
+    try testing.expect(busy == .busy and busy.busy.holder == 0);
+    var poison: SmokePoison = .{};
+    var gate_b = membership.park_reclaim.ParkGate.arm(io, 0, membership.park_reclaim.tParkMaxMs(46_500, membership.park_reclaim.graceMs(smoke_t_owner_ms)));
+    var member_b: shard.Member = .{ .gpa = gpa, .id = shard.writerMemberId(smokeJoinerIdentity(1)), .role = .writer, .link = link_b.link(), .pid = @intCast(linux.getpid()), .boot = proc.localIdentity().boot_id, .endpoint = .none, .pr_key = 0, .mount = "/mnt-b", .gate = &gate_b, .poison = poison.sink(), .carriage = b.carriageSink() };
+    const now_ms = clock.monotonicNs() / std.time.ns_per_ms;
+    try testing.expectEqual(shard.Member.JoinOutcome.granted, member_b.join(now_ms, null));
+    // B's beats start NOW: `T_self` (797 ms) runs from the join's send
+    // instant, and the stage's own device reads below outlast it.
+    var beater: Beater = .{ .member = &member_b };
+    const beater_thread = try std.Thread.spawn(.{}, Beater.run, .{&beater});
+    var beater_live = true;
+    defer if (beater_live) {
+        beater.stop.store(true, .release);
+        beater_thread.join();
+    };
+
+    // Joiner C: joins the same way, then DIES (its connection dropped
+    // without a leave): the shard evicts it at T_owner, the ledger records
+    // its death.
+    {
+        var client_c = dialer.Client.init(gpa, io, advertised, secret, smokeJoinerIdentity(2));
+        defer client_c.deinit();
+        var link_c: join_ladder.TcpLink = .{ .client = &client_c };
+        var wire_c: join_ladder.ManagerWire = .{ .gpa = gpa, .link = link_c.link(), .volume = 0, .identity = smokeJoinerIdentity(2), .pages = vol.pages() };
+        var c = join_ladder.Joiner.init(gpa, &wire_c);
+        defer c.deinit();
+        const ident_c: appender_page.Identity = .{ .node_token = smokeJoinerIdentity(2).node_token, .mount_slot = smokeJoinerIdentity(2).mount_slot, .writer_id = smokeJoinerIdentity(2).writer_id };
+        try c.joinRegion(.{ .identity = ident_c, .volume_base = node_seq.nodeSeqBase(vol.sb.uuid), .grain = vol.dev.mode.grain(), .ring0_head = vol.rec.journal_tail_seq });
+        try testing.expectEqual(@as(u32, 2), c.appenderId());
+        try testing.expectEqual(@as(usize, 2), try c.acquireRotor(2));
+        var gate_c = membership.park_reclaim.ParkGate.arm(io, 0, membership.park_reclaim.tParkMaxMs(46_500, membership.park_reclaim.graceMs(smoke_t_owner_ms)));
+        var member_c: shard.Member = .{ .gpa = gpa, .id = shard.writerMemberId(smokeJoinerIdentity(2)), .role = .writer, .link = link_c.link(), .pid = 1, .boot = @splat(0), .endpoint = .none, .pr_key = 0, .gate = &gate_c, .poison = poison.sink(), .mount = "/mnt-c", .carriage = c.carriageSink() };
+        try testing.expectEqual(shard.Member.JoinOutcome.granted, member_c.join(clock.monotonicNs() / std.time.ns_per_ms, null));
+    }
+    // `appenders`: regions 0 (A, the manager), 1 (B) and 2 (C) Live;
+    // `clients`: A's writer claim live + the two member rows (this
+    // process's pid for B — live; pid 1 for C — another incarnation).
+    {
+        const r = try rig.squeezefs(&.{ "appenders", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nappenders: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "3 appender page(s)") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "mgr") != null);
+        std.debug.print("\nsmoke: N-daemon: appenders after two joins:\n{s}", .{r.stdout});
+    }
+    {
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        while (true) {
+            const r = try rig.squeezefs(&.{ "clients", rig.meta_uri });
+            defer rig.freeRun(r);
+            try testing.expect(r.term.success());
+            const members = std.mem.count(u8, r.stdout, "member ");
+            if (members >= 2) {
+                try testing.expect(std.mem.indexOf(u8, r.stdout, "writer ") != null);
+                std.debug.print("smoke: N-daemon: clients with two members:\n{s}", .{r.stdout});
+                break;
+            }
+            if (clock.monotonicNs() >= deadline) {
+                std.debug.print("\n--- clients never listed the member rows ---\n{s}\n", .{r.stdout});
+                return error.MembersNotListed;
+            }
+            sleepMs(200);
+        }
+    }
+    // B beats across several T_owner (idle between beats, renewed at the
+    // cadence, on its own thread); C is evicted at T_owner by the daemon's
+    // reclaim cadence, and the ledger's writer records its death on
+    // volume 0 — B is never touched.
+    {
+        const deadline = clock.monotonicNs() + (smoke_t_owner_ms * 4 + 20_000) * std.time.ns_per_ms;
+        var evicted = false;
+        while (clock.monotonicNs() < deadline) {
+            const tail = try rig.statsTail();
+            defer gpa.free(tail);
+            if ((numberAfter(tail, "\"membership_evictions\":") orelse 0) >= 1) {
+                evicted = true;
+                try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"membership_members\":"));
+                break;
+            }
+            sleepMs(500);
+        }
+        try testing.expect(evicted);
+        const dead = try vol.awaitControl(cr.deadMemberKey(.{ .node_token = smokeJoinerIdentity(2).node_token, .mount_slot = smokeJoinerIdentity(2).mount_slot }).slice());
+        defer gpa.free(dead);
+        const d = try cr.DeadMemberWire.decode(dead);
+        try testing.expect(!d.early);
+        try testing.expect(d.epoch != 0);
+        try testing.expectEqual(@as(u32, 0), poison.fired.load(.monotonic));
+    }
+    beater.stop.store(true, .release);
+    beater_thread.join();
+    beater_live = false;
+    try testing.expectEqual(@as(u8, 0), beater.bad.load(.acquire));
+    try testing.expect(beater.renewed.load(.monotonic) >= 2);
+    // B's clean leave: every lease released with words flooring tree 0's
+    // record, the membership leave, the region leave → page 1 Free.
+    try member_b.leave();
+    for (b.leased.items) |l| {
+        const rec_bytes = try vol.awaitControl(cr.slotStateKey(l.slot).slice());
+        defer gpa.free(rec_bytes);
+        const rec = try cr.SlotStateWire.decode(rec_bytes);
+        try testing.expect(!try wire_b.releaseSlot(b.appenderId(), l.slot, l.g, .{ .root = rec.root, .cursor = rec.cursor + 1, .extents = rec.slot_tree_extents, .seq_floor = rec.seq_floor + 1 }, &.{}));
+    }
+    b.leased.items.len = 0;
+    try testing.expect(!(try b.leave()).already);
+    {
+        const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        std.debug.print("smoke: N-daemon: appenders after B's leave: {s}\n", .{r.stdout});
+        // A Free page attests no identity (the leave clears it; the id and
+        // term stay for the next joiner's continuation).
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,\"node\":\"0000000000000000\",\"mount_slot\":0,\"writer_id\":\"0000000000000000\",\"state\":\"free\"") != null);
+        // C's region stays Live: its recovery over the real backend is the
+        // recovery driver's device binding (owed; the evidence note).
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "\"appender_id\":2,\"node\":\"000000005a0e0002\",\"mount_slot\":20482,\"writer_id\":\"0000000000007002\",\"state\":\"live\"") != null);
+    }
+    {
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"membership_members\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"membership_evictions\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"manager_verb_refusals\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"joined_wire_words_rejected\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"slot_lease_conflicts\":"));
+        try testing.expect((numberAfter(tail, "\"manager_verbs\":") orelse 0) >= 12);
+        try testing.expect((numberAfter(tail, "\"membership_joins\":") orelse 0) >= 2);
+        try testing.expect((numberAfter(tail, "\"membership_renewals\":") orelse 0) >= 1);
+        try expectMustStayZero(tail);
+        std.debug.print("smoke: N-daemon manager half: manager verbs {d}, membership joins {d}, renewals {d}, evictions {d}, wire verbs (joiner side) {d}, listener connections {d}\n", .{ numberAfter(tail, "\"manager_verbs\":") orelse 0, numberAfter(tail, "\"membership_joins\":") orelse 0, numberAfter(tail, "\"membership_renewals\":") orelse 0, numberAfter(tail, "\"membership_evictions\":") orelse 0, join_ladder.stats.joined_wire_verbs.load(), numberAfter(tail, "\"wire_listener_connections\":") orelse 0 });
+    }
+    // umount signals A; A's orderly close detaches and exits 0.
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[ready_at..], "stop requested (SIGTERM/SIGINT): unmounting") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "cluster wire: listening at 127.0.0.1:") != null);
+    }
 }
 
 fn numberAfter(text: []const u8, key: []const u8) ?u64 {
@@ -1506,6 +1874,83 @@ const must_stay_zero = [_][]const u8{
     "\"writeback_errors_latched\":",
     "\"fsync_promote_failures\":",
 };
+
+/// The JSON object that follows `key` in `text` (brace-balanced, strings
+/// skipped), or null.
+fn objectAfter(text: []const u8, key: []const u8) ?[]const u8 {
+    const at = (std.mem.indexOf(u8, text, key) orelse return null) + key.len;
+    if (at >= text.len or text[at] != '{') return null;
+    var depth: usize = 0;
+    var in_str = false;
+    var i = at;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_str) {
+            if (c == '\\') i += 1 else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{', '[' => depth += 1,
+            '}', ']' => {
+                depth -= 1;
+                if (depth == 0) return text[at .. i + 1];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The words a symmetric gauge may read on a `--single-writer` mount.
+const solo_words = [_][]const u8{ "solo", "off", "none", "vacant", "" };
+
+/// Charter §5.5 "Every one reads 0/`solo` on a `--single-writer`
+/// mount": every `"key":value` pair of `family` (recursively) is a number
+/// reading 0, a boolean reading false, or a string from `solo_words`;
+/// the first offender is named.
+fn expectSoloPosture(family_name: []const u8, family: []const u8) !void {
+    var bad: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, family, i, '"')) |q| {
+        const end = std.mem.indexOfScalarPos(u8, family, q + 1, '"') orelse break;
+        const k = family[q + 1 .. end];
+        i = end + 1;
+        if (i >= family.len or family[i] != ':') continue;
+        const v = std.mem.trimStart(u8, family[i + 1 ..], " ");
+        if (v.len == 0) break;
+        switch (v[0]) {
+            '{', '[' => {},
+            '"' => {
+                const se = std.mem.indexOfScalarPos(u8, v, 1, '"') orelse break;
+                const s = v[1..se];
+                var ok = false;
+                for (solo_words) |w| ok = ok or std.mem.eql(u8, w, s);
+                if (!ok) {
+                    std.debug.print("\n--- {s}: {s} = \"{s}\" on a --single-writer mount (expected a solo word) ---\n", .{ family_name, k, s });
+                    bad += 1;
+                }
+                i += 1 + se + 1;
+            },
+            't' => {
+                std.debug.print("\n--- {s}: {s} = true on a --single-writer mount ---\n", .{ family_name, k });
+                bad += 1;
+            },
+            'f', 'n' => {},
+            else => {
+                var e: usize = 0;
+                while (e < v.len and (std.ascii.isDigit(v[e]) or v[e] == '-' or v[e] == '.')) : (e += 1) {}
+                const n = v[0..e];
+                if (n.len == 0) continue;
+                if (!std.mem.allEqual(u8, n, '0') and !std.mem.eql(u8, n, "0.0")) {
+                    std.debug.print("\n--- {s}: {s} = {s} on a --single-writer mount (expected 0) ---\n", .{ family_name, k, n });
+                    bad += 1;
+                }
+            },
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
 
 fn expectMustStayZero(tail: []const u8) !void {
     var bad = false;

@@ -232,9 +232,11 @@ pub const SetConfigRead = union(enum) {
     refused: []const u8,
 };
 
-/// Open the control tree offline over the node cache and look the record
-/// up. `reason_buf` carries a refusal's text.
-pub fn readSetConfig(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, sb: superblock.Superblock, rec: *const ledger.LedgerRecord, reason_buf: []u8) ClassifyError!SetConfigRead {
+/// ONE control record of tree 0 at the newest checkpoint, read offline
+/// over the node cache (caller frees): what `status` reads `set_config`
+/// through, and what a joiner reads the `job:enroll` secret and the
+/// manager's `endpoint:` record through BEFORE it holds any wire.
+pub fn readControlRecord(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, sb: superblock.Superblock, rec: *const ledger.LedgerRecord, k: []const u8) ClassifyError!?[]u8 {
     const mode = uring_fs.registerMetaDevice(gpa, env, path) catch return error.DeviceRefused;
     var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = sb.root_ledger.start, .bitmap_base = sb.alloc_bitmap.start };
     const layout = node.NodeLayout.new(sb.node_size, null) catch return error.Unexpected;
@@ -248,11 +250,33 @@ pub fn readSetConfig(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
         else => error.Unexpected,
     };
     defer t.destroy();
-    const value = (t.lookup(gpa, set_config.CONTROL_KEY) catch |e| return switch (e) {
+    return t.lookup(gpa, k) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.Io => error.Io,
         else => error.Unexpected,
-    }) orelse return .absent;
+    };
+}
+
+/// Every control record of tree 0 inside `[start, end]` at the newest
+/// checkpoint, read offline (caller frees each key and value): the
+/// `member:` rows `clients` lists, the `dead_member:` records.
+pub fn readControlRange(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, sb: superblock.Superblock, rec: *const ledger.LedgerRecord, start: []const u8, end: []const u8, out: *std.ArrayList(tree.KeyValue)) ClassifyError!void {
+    const mode = uring_fs.registerMetaDevice(gpa, env, path) catch return error.DeviceRefused;
+    var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = sb.root_ledger.start, .bitmap_base = sb.alloc_bitmap.start };
+    const layout = node.NodeLayout.new(sb.node_size, null) catch return error.Unexpected;
+    const cache = try node_cache.NodeCache.init(gpa, io, .{ .layout = layout, .heap_base = sb.heap.start, .budget_bytes = status_cache_budget_bytes }, dev.loader());
+    defer cache.deinit();
+    cache.setDurableTail(rec.journal_tail_seq);
+    var seq = node_seq.NodeSeqHandle.shared(rec.node_seq_watermark);
+    const t = tree.KvTree.openFromLedger(gpa, cache, rec, .control, &seq) catch |e| return mapTreeOpen(e);
+    defer t.destroy();
+    t.range(gpa, start, end, std.math.maxInt(usize), out) catch |e| return mapTreeOpen(e);
+}
+
+/// Open the control tree offline over the node cache and look the record
+/// up. `reason_buf` carries a refusal's text.
+pub fn readSetConfig(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8, sb: superblock.Superblock, rec: *const ledger.LedgerRecord, reason_buf: []u8) ClassifyError!SetConfigRead {
+    const value = (try readControlRecord(gpa, io, env, pool, path, sb, rec, set_config.CONTROL_KEY)) orelse return .absent;
     defer gpa.free(value);
     var diag: set_config.Refusal = undefined;
     const cfg = set_config.decode(gpa, value, &diag) catch |e| switch (e) {
@@ -310,8 +334,9 @@ pub fn writeMountHeadline(w: *Io.Writer, gpa: std.mem.Allocator, io: Io, mountpo
         return;
     };
     defer gpa.free(text);
-    try w.print("  live       {s}: fuse_ops {d}, in flight {d}, invariant_tripwires {d}, volume_failed {}, live inodes {d}, stats payload {d} B\n", .{
+    try w.print("  live       {s}: daemon pid {d}, fuse_ops {d}, in flight {d}, invariant_tripwires {d}, volume_failed {}, live inodes {d}, stats payload {d} B\n", .{
         mountpoint,
+        json_scan.number(text, "pid") orelse 0,
         json_scan.number(text, "fuse_ops") orelse 0,
         json_scan.number(text, "fuse_ops_inflight") orelse 0,
         json_scan.number(text, "invariant_tripwires") orelse 0,

@@ -975,6 +975,9 @@ pub const Plane = struct {
 
     /// The per-volume words of the `.stats` family.
     pub fn writeStatsJson(self: *Plane, w: *Io.Writer) Io.Writer.Error!void {
-        try w.print("{{\"armed\":{},\"leases_held\":{d},\"rotor_m\":{d},\"a_max_bytes\":{d},\"n_floor\":{d},\"closed_slot\":{?d}}}", .{ self.armed, self.table.leasedCount(), if (self.armed) self.verbs.m else 0, if (self.armed) self.verbs.a_max else 0, self.judge.nFloorNow(), self.door.closedSlot() });
+        // An unarmed plane (a flat volume) reads 0 throughout — `n_floor`
+        // included, whose derivation has a floor of 2 the operator must
+        // not mistake for an engaged handover rule.
+        try w.print("{{\"armed\":{},\"leases_held\":{d},\"rotor_m\":{d},\"a_max_bytes\":{d},\"n_floor\":{d},\"closed_slot\":{?d}}}", .{ self.armed, self.table.leasedCount(), if (self.armed) self.verbs.m else 0, if (self.armed) self.verbs.a_max else 0, if (self.armed) self.judge.nFloorNow() else 0, self.door.closedSlot() });
     }
 };

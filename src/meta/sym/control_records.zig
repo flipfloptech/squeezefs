@@ -53,12 +53,18 @@ pub const Tag = enum(u8) {
     /// A membership row (`WriterClaimV1.kind = 1`) on the HOME volume's
     /// tree 0 (decision 0003 §E): keyed by the member's stable identity.
     member = 11,
+    /// A writer's published listener endpoint (charter §5.5 "endpoints
+    /// published into each writer's claim-set entry"): keyed by appender
+    /// id, written by the manager at its arm and by `PublishEndpoint`;
+    /// what a joiner reads off the device to find volume 0's manager
+    /// BEFORE it holds any wire.
+    endpoint = 12,
 
     /// The id bytes behind the two-byte prefix.
     pub fn idLen(self: Tag) usize {
         return switch (self) {
             .slot_state, .slot_tails, .custody_quarantine => 2,
-            .extent_grant => 4,
+            .extent_grant, .endpoint => 4,
             .appender_hint, .dead_member, .member => 12,
             .recovered => 14,
             .alloc_lease => 8,
@@ -213,9 +219,18 @@ pub fn slotOfKey(k: []const u8) ?u16 {
     };
 }
 
+pub fn endpointKey(appender_id: u32) ControlKey {
+    var k = ControlKey.prefix(.endpoint);
+    k.putBe(u32, appender_id);
+    return k;
+}
+
 pub fn appenderOfKey(k: []const u8) ?u32 {
     const tag = tagOfKey(k) orelse return null;
-    return if (tag == .extent_grant) idBe(u32, k, 0) else null;
+    return switch (tag) {
+        .extent_grant, .endpoint => idBe(u32, k, 0),
+        else => null,
+    };
 }
 
 pub fn identityOfKey(k: []const u8) ?StableIdentity {
@@ -1030,6 +1045,63 @@ pub const RecoveredWire = extern struct {
 };
 
 // ---------------------------------------------------------------------------
+// endpoint: a writer's published listener (family, port, address) and its
+// registrant key — the durable half of the manager's endpoint table.
+// ---------------------------------------------------------------------------
+
+pub const Endpoint = struct {
+    /// `wire/endpoint.zig`'s families: 4 / 6 (never none — a writer with
+    /// no listener publishes nothing).
+    family: u8,
+    port: u16,
+    addr: [16]u8,
+    pr_key: u64,
+};
+
+pub const EndpointRecordWire = extern struct {
+    version_le: [2]u8,
+    family: u8,
+    reserved: u8,
+    port_le: [2]u8,
+    reserved2_le: [2]u8,
+    addr: [16]u8,
+    pr_key_le: [8]u8,
+
+    pub const VERSION: u16 = 1;
+    pub const LEN: usize = 32;
+    pub const FAMILY_IP4: u8 = 4;
+    pub const FAMILY_IP6: u8 = 6;
+
+    pub fn init(e: Endpoint) EndpointRecordWire {
+        var w: EndpointRecordWire = undefined;
+        wr(u16, &w.version_le, VERSION);
+        w.family = e.family;
+        w.reserved = 0;
+        wr(u16, &w.port_le, e.port);
+        wr(u16, &w.reserved2_le, 0);
+        w.addr = e.addr;
+        wr(u64, &w.pr_key_le, e.pr_key);
+        return w;
+    }
+
+    pub fn encode(self: EndpointRecordWire) [LEN]u8 {
+        return std.mem.toBytes(self);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Endpoint {
+        const w = try exact(EndpointRecordWire, bytes);
+        if (rd(u16, &w.version_le) != VERSION or w.reserved != 0 or rd(u16, &w.reserved2_le) != 0) return error.Corrupt;
+        switch (w.family) {
+            FAMILY_IP4 => if (!std.mem.allEqual(u8, w.addr[4..], 0)) return error.Corrupt,
+            FAMILY_IP6 => {},
+            else => return error.Corrupt,
+        }
+        if (rd(u16, &w.port_le) == 0) return error.Corrupt;
+        return .{ .family = w.family, .port = rd(u16, &w.port_le), .addr = w.addr, .pr_key = rd(u64, &w.pr_key_le) };
+    }
+};
+
+// ---------------------------------------------------------------------------
 // node_seq_incarnations: the value codec is `node_seq.zig`'s (9 B, total);
 // the key is this module's binary one.
 // ---------------------------------------------------------------------------
@@ -1048,6 +1120,7 @@ comptime {
     assert(@sizeOf(AllocLeaseHead) == AllocLeaseHead.LEN and @sizeOf(BitmapRefWire) == BitmapRefWire.LEN);
     assert(@sizeOf(DeadMemberWire) == DeadMemberWire.LEN);
     assert(@sizeOf(RecoveredWire) == RecoveredWire.LEN);
+    assert(@sizeOf(EndpointRecordWire) == EndpointRecordWire.LEN);
     // Every control key sorts below the ASCII-keyed records of tree 0.
     assert(key.TREE_CONTROL < 'a');
     _ = checksum;
@@ -1267,6 +1340,37 @@ test "the volume-0 records: custody_quarantine, dir_rename, alloc_lease (+ bitma
     try testing.expectEqual(@as(u64, 5), try decodeNodeSeqIncarnations(&encodeNodeSeqIncarnations(5)));
 }
 
+test "endpoint: a v4 and a v6 listener round-trip at 32 B keyed by appender id; none, a stray v4 tail, port 0 and a reserved word refuse" {
+    var v4: Endpoint = .{ .family = EndpointRecordWire.FAMILY_IP4, .port = 39123, .addr = @splat(0), .pr_key = 0xC0FFEE };
+    @memcpy(v4.addr[0..4], &[_]u8{ 10, 0, 0, 7 });
+    const enc = EndpointRecordWire.init(v4).encode();
+    try testing.expectEqual(EndpointRecordWire.LEN, enc.len);
+    try testing.expectEqual(v4, try EndpointRecordWire.decode(&enc));
+    var v6: Endpoint = .{ .family = EndpointRecordWire.FAMILY_IP6, .port = 1, .addr = @splat(0), .pr_key = 0 };
+    v6.addr[0] = 0xfe;
+    v6.addr[1] = 0x80;
+    v6.addr[15] = 1;
+    try testing.expectEqual(v6, try EndpointRecordWire.decode(&EndpointRecordWire.init(v6).encode()));
+    var bad = enc;
+    bad[2] = 0;
+    try testing.expectError(error.Corrupt, EndpointRecordWire.decode(&bad));
+    bad = enc;
+    bad[12] = 1;
+    try testing.expectError(error.Corrupt, EndpointRecordWire.decode(&bad));
+    bad = enc;
+    bad[4] = 0;
+    bad[5] = 0;
+    try testing.expectError(error.Corrupt, EndpointRecordWire.decode(&bad));
+    bad = enc;
+    bad[6] = 1;
+    try testing.expectError(error.Corrupt, EndpointRecordWire.decode(&bad));
+    try testing.expectError(error.Corrupt, EndpointRecordWire.decode(enc[0..31]));
+    try testing.expectEqual(@as(usize, 6), endpointKey(1).len);
+    try testing.expectEqual(@as(?u32, 0x0A0B0C0D), appenderOfKey(endpointKey(0x0A0B0C0D).slice()));
+    try testing.expectEqual(@as(?Tag, .endpoint), tagOfKey(endpointKey(1).slice()));
+    try testing.expect(!std.mem.eql(u8, endpointKey(1).slice(), extentGrantKey(1).slice()));
+}
+
 fn checkDecodersTotal(bytes: []const u8) !void {
     _ = tagOfKey(bytes);
     _ = slotOfKey(bytes);
@@ -1293,6 +1397,7 @@ fn checkDecodersTotal(bytes: []const u8) !void {
     _ = decodeAllocLease(bytes) catch {};
     if (DeadMemberWire.decode(bytes)) |d| try testing.expectEqualSlices(u8, bytes, &DeadMemberWire.init(d).encode()) else |_| {}
     if (RecoveredWire.decode(bytes)) |r| try testing.expectEqualSlices(u8, bytes, &RecoveredWire.init(r).encode()) else |_| {}
+    if (EndpointRecordWire.decode(bytes)) |e| try testing.expectEqualSlices(u8, bytes, &EndpointRecordWire.init(e).encode()) else |_| {}
     _ = decodeNodeSeqIncarnations(bytes) catch {};
 }
 

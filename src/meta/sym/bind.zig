@@ -821,6 +821,16 @@ pub const AppenderSet = struct {
         self_(ctx).be.task.kick(.ring_park);
     }
 
+    /// The per-volume words of a `--single-writer` volume (no appender
+    /// set): every gauge 0 and the lease word `solo` — charter §5.5
+    /// "Every one reads 0/`solo` on a `--single-writer` mount" — so an
+    /// operator keys on the same names on both classes.
+    pub fn writeSoloStatsJson(be: *KvBackend, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll("{\"manager_lease\":\"solo\",\"appenders_live\":0,\"appenders_known\":0,\"appenders_capacity\":0,\"appender_ring_budget_remaining_bytes\":0,\"appender_live_pages_at_mount\":0,\"appender_unrecovered\":0,\"regions\":[],\"slots\":");
+        try be.slots.writeStatsJson(w);
+        try w.writeByte('}');
+    }
+
     /// The per-volume words of the `.stats` family.
     pub fn writeStatsJson(self: *AppenderSet, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("{\"manager_lease\":\"");
@@ -1106,6 +1116,14 @@ test "the single-writer class still mounts: no appender set, no lease, a flat ri
     try testing.expect(!be.sb.symmetricPlaneStamped());
     try testing.expect(be.sym == null);
     try testing.expectEqual(be.sb.journal.start, be.ring_layout.base);
+}
+
+test "THE DEFAULT FLIP: SQUEEZEFS_SYMMETRIC_META defaults 1 (an empty environment reads the writer door OPEN) and `format` stamps the symmetric class unless --single-writer opts out" {
+    try testing.expectEqualStrings("1", knobs.row("SQUEEZEFS_SYMMETRIC_META").default);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expect(knobs.boolKnob("SQUEEZEFS_SYMMETRIC_META", &env));
+    try testing.expectEqual(geometry.Class.symmetric, (backend.FormatOptions{ .env = &env, .uuid = @splat(0), .set = test_set }).class);
 }
 
 test "SQUEEZEFS_SYMMETRIC_META=0 on a stamped volume refuses the writable open (once armed, stays armed)" {

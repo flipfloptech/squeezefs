@@ -595,10 +595,8 @@ pub const MetaSet = struct {
                 try w.writeAll(",\"guard\":");
                 try g.writeStatsJson(w);
             }
-            if (be.sym) |set| {
-                try w.writeAll(",\"sym\":");
-                try set.writeStatsJson(w);
-            }
+            try w.writeAll(",\"sym\":");
+            if (be.sym) |set| try set.writeStatsJson(w) else try backend.KvBackend.writeSoloSymStatsJson(be, w);
             try w.writeByte('}');
         }
         try w.writeAll("]}");
@@ -613,6 +611,7 @@ pub const MetaSet = struct {
 
 const testing = std.testing;
 const exec = @import("../exec/exec.zig");
+const wire_auth = @import("../wire/auth.zig");
 const economy = @import("economy.zig");
 const record = @import("record.zig");
 const geometry = @import("geometry.zig");
@@ -631,6 +630,10 @@ pub const TestSet = struct {
     paths: [8][]u8 = undefined,
     n: usize,
 
+    /// The set's `job:enroll` secret (what `format` mints; member 0's
+    /// control tree carries it, so the cluster wire can arm over a test set).
+    pub const secret: wire_auth.Secret = @splat(0x5C);
+
     pub fn create(gpa: Allocator, name: []const u8, members: u16) !*TestSet {
         const self = try gpa.create(TestSet);
         errdefer gpa.destroy(self);
@@ -645,6 +648,7 @@ pub const TestSet = struct {
             try truncateFile(self.paths[i], test_volume_len);
             var uuid: [16]u8 = "meta-set-vol-000".*;
             uuid[15] = @intCast('0' + i);
+            const enroll = wire_auth.encodeEnroll(secret);
             try backend.formatVolume(gpa, self.paths[i], .{
                 .env = &self.env,
                 .node_size = 65536,
@@ -653,6 +657,7 @@ pub const TestSet = struct {
                 .set = test_set_identity,
                 .member_position = @intCast(i),
                 .member_count = members,
+                .control_records = if (i == 0) &.{.{ .key = wire_auth.ENROLL_KEY, .seq = 0, .kind = .put, .value = &enroll }} else &.{},
             });
         }
         return self;

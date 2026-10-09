@@ -216,11 +216,38 @@ fn answerOf(status: manager.Status, reason: manager.Reason) service.Answer {
     };
 }
 
+/// The verbs the manager's wire face serves (the region verbs + the slot
+/// verbs); every one carries the volume ordinal it is addressed to.
+pub const manager_verbs = [_]verbs.Verb{ .join_appender, .leave_appender, .extent_grant, .return_extents, .grow_ring, .publish_roots, .publish_endpoint, .resolve_endpoint, .acquire_slots, .acquire_slot, .offer_slot, .release_slot, .resolve_slot };
+
+/// The volume ordinal a manager-family request is addressed to (null for
+/// any other family).
+pub fn requestVolume(payload: verbs.Request) ?u16 {
+    return switch (payload) {
+        .join_appender => |r| r.volume,
+        .leave_appender => |r| r.head.volume,
+        .extent_grant => |r| r.volume,
+        .return_extents => |r| r.head.volume,
+        .grow_ring => |r| r.volume,
+        .publish_roots => |r| r.head.volume,
+        .publish_endpoint => |r| r.volume,
+        .resolve_endpoint => |r| r.volume,
+        .acquire_slots => |r| r.volume,
+        .acquire_slot => |r| r.volume,
+        .offer_slot => |r| r.volume,
+        .release_slot => |r| r.head.volume,
+        .resolve_slot => |r| r.volume,
+        else => null,
+    };
+}
+
 pub const ManagerHandlers = struct {
     mgr: *manager.Manager,
     /// The plane's table (the slot verbs' executors).
     table: *const manager.HandlerTable,
     set_width: u16,
+    /// The volume ordinal this face serves (`ManagerSet`'s dispatch key).
+    volume: u16 = 0,
 
     pub fn register(self: *ManagerHandlers, svc: *service.Service) void {
         svc.register(.join_appender, .{ .ctx = self, .serve = &serveJoin });
@@ -234,6 +261,23 @@ pub const ManagerHandlers = struct {
         inline for (.{ .acquire_slots, .acquire_slot, .offer_slot, .release_slot, .resolve_slot }) |v| {
             svc.register(v, .{ .ctx = self, .serve = &serveTable });
         }
+    }
+
+    /// One request of the manager family served by THIS face (the set
+    /// dispatcher's arm).
+    pub fn dispatch(self: *ManagerHandlers, req: *const service.Request, scratch: []u8) service.Answer {
+        return switch (req.verb) {
+            .join_appender => serveJoin(self, req, scratch),
+            .leave_appender => serveLeave(self, req, scratch),
+            .extent_grant => serveExtentGrant(self, req, scratch),
+            .return_extents => serveReturnExtents(self, req, scratch),
+            .grow_ring => serveGrowRing(self, req, scratch),
+            .publish_roots => servePublishRoots(self, req, scratch),
+            .publish_endpoint => servePublishEndpoint(self, req, scratch),
+            .resolve_endpoint => serveResolveEndpoint(self, req, scratch),
+            .acquire_slots, .acquire_slot, .offer_slot, .release_slot, .resolve_slot => serveTable(self, req, scratch),
+            else => .{ .status = .{ .status = .schema } },
+        };
     }
 
     fn self_(ctx: *anyopaque) *ManagerHandlers {
@@ -394,6 +438,34 @@ pub const ManagerHandlers = struct {
         @memcpy(copy, reply.payload);
         const typed = verbs.decodeReply(req.verb, copy) catch return service.Answer.refused(error.Unexpected, "the plane's reply did not decode");
         return .{ .ok = typed };
+    }
+};
+
+/// Every volume this daemon manages behind ONE listener (spec §5.2 "a
+/// node manages the volumes it won; dispatch by the frame's volume"):
+/// the manager family's verbs route to the face whose volume the request
+/// names; a volume this daemon does not manage answers `not_manager`.
+pub const ManagerSet = struct {
+    faces: []ManagerHandlers,
+
+    pub fn register(self: *ManagerSet, svc: *service.Service) void {
+        for (manager_verbs) |v| svc.register(v, .{ .ctx = self, .serve = &serveAny });
+    }
+
+    pub fn unregister(_: *ManagerSet, svc: *service.Service) void {
+        for (manager_verbs) |v| svc.unregister(v);
+    }
+
+    pub fn faceOf(self: *ManagerSet, volume: u16) ?*ManagerHandlers {
+        for (self.faces) |*f| if (f.volume == volume) return f;
+        return null;
+    }
+
+    fn serveAny(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
+        const self: *ManagerSet = @ptrCast(@alignCast(ctx));
+        const volume = requestVolume(req.payload) orelse return .{ .status = .{ .status = .schema } };
+        const face = self.faceOf(volume) orelse return .{ .status = .{ .status = .not_manager } };
+        return face.dispatch(req, scratch);
     }
 };
 
@@ -1174,8 +1246,9 @@ test "the flush-ceiling audit: a leaf inside the ceiling passes; past it with no
     try testing.expect(std.mem.endsWith(u8, w.buffered(), "{\"term_ns\":69000000,\"excused_ns\":0,\"overruns\":0,\"extensions\":0}]"));
 }
 
-/// A `dialer.Client` as the joiner's link (real TCP on the venue).
-const TcpLink = struct {
+/// A `dialer.Client` as the joiner's link (real TCP on the venue): the
+/// reply decoded out of the link's own frame-sized scratch.
+pub const TcpLink = struct {
     client: *dialer.Client,
     out: [frame_cap]u8 = undefined,
 
@@ -1186,7 +1259,7 @@ const TcpLink = struct {
         return self.client.callTyped(req, &self.out);
     }
 
-    fn link(self: *TcpLink) shard.Link {
+    pub fn link(self: *TcpLink) shard.Link {
         return .{ .ctx = self, .call = &call };
     }
 };

@@ -150,6 +150,10 @@ pub const ipc = struct {
     pub const client = if (builtin.os.tag == .linux) @import("ipc/client.zig") else struct {};
 };
 
+// ---- the client bypass's two clients: the LD_PRELOAD shim and the SDK (charter §7) ----
+// @anchor:shim_import
+// @anchor:sdk_import
+
 // ---- the cluster wire (charter §5.5 verbs; §9 thread-per-connection) ----
 pub const wire = @import("wire/wire.zig");
 
@@ -183,6 +187,8 @@ test {
     _ = model.explorer;
     _ = ipc.session;
     // @anchor:ipc_host_test
+    // @anchor:shim_test
+    // @anchor:sdk_test
     if (builtin.os.tag == .linux) _ = ipc.client;
     _ = meta.sym;
     _ = meta.sym_slots;

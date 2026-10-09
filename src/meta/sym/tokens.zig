@@ -863,14 +863,25 @@ test "the serve gate: a reader past T_self serves NOTHING from its cache; a hold
     try testing.expectEqual(repoints0 + 1, cache.stats.dlm_token_holder_repoints.load());
     try testing.expectEqual(@as(usize, 0), plane.cache.count(io));
     try testing.expect(!plane.channelOk());
-    try testing.expectError(error.TokenChannelStale, b.serve(io, objectOf(3), .{}));
+    // The plane itself serves nothing while the channel is closed; the
+    // divert's serve re-points it ONCE inside the same op through the
+    // resolver's dial (the fixture's live session), the probe round
+    // re-opens the channel and the serve lands on a fresh grant.
+    try testing.expectError(error.TokenChannelStale, plane.serve(io, objectOf(3), .{}));
+    const reprobes0 = divert.stats.dlm_token_reader_channel_reprobes.load();
+    s = (try b.serve(io, objectOf(3), .{})).?;
+    try testing.expectEqual(@as(u64, 100), s.entry.?.attrs.mtime);
+    s.release(io);
+    try testing.expectEqual(reprobes0 + 1, divert.stats.dlm_token_reader_channel_reprobes.load());
+    try testing.expect(plane.channelOk());
+    try testing.expectEqual(gen0 + 2, plane.endpointGen());
     // The holder's moved listener: the re-point's probe round completes and
-    // the channel re-opens; the next serve is a fresh grant.
+    // the channel stays open; the next serve is a cache hit of the grant.
     var fresh = try f.hub.connect(1, 0);
     defer fresh.deinit();
     plane.repoint(io, linkOf(&fresh));
     try testing.expect(plane.channelOk());
-    try testing.expectEqual(gen0 + 2, plane.endpointGen());
+    try testing.expectEqual(gen0 + 3, plane.endpointGen());
     s = (try b.serve(io, objectOf(3), .{})).?;
     try testing.expectEqual(@as(u64, 100), s.entry.?.attrs.mtime);
     s.release(io);

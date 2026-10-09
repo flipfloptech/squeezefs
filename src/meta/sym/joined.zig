@@ -59,6 +59,7 @@ const manager = @import("manager.zig");
 const cr = @import("control_records.zig");
 const slots = @import("slots.zig");
 const join_ladder = @import("membership/join_ladder.zig");
+const ro_mount = @import("tokens/ro_mount.zig");
 const shard = @import("membership/shard.zig");
 const park = @import("membership/park_reclaim.zig");
 const wire_auth = @import("../../wire/auth.zig");
@@ -114,8 +115,18 @@ pub const ENDPOINT_POLL_STEP_MS: u64 = 100;
 /// a whole heap) would starve a 12-extent pool.
 pub const MIRROR_RESERVE_EXTENTS: u64 = 2;
 
-/// A wire reply's widest frame (the dialer's cap).
-pub const REPLY_CAP: usize = 1 << 16;
+/// A wire reply's widest payload: the control frame's cap — a token grant
+/// page is budgeted at HALF of it (`token_table.GRANT_PAGE_BUDGET`: the
+/// dentries of one page of a wide directory), and a reply wider than the
+/// caller's buffer is `ValueTooLarge` at the mux, which the reader plane
+/// took for a dead channel (a 4,000-entry directory read from a peer
+/// answered EIO, then EAGAIN for ever at the 64 KiB cap). Per thread,
+/// touched only by threads that call (the TLS pages stay virtual).
+pub const REPLY_CAP: usize = @import("../../wire/frame.zig").CONTROL_CAP;
+
+comptime {
+    std.debug.assert(REPLY_CAP >= 2 * sym.tokens.table.GRANT_PAGE_BUDGET);
+}
 
 pub const OpenError = error{
     /// No manager endpoint published on tree 0 within the poll bound (and
@@ -270,8 +281,10 @@ pub const JoinedSet = struct {
     /// The mount point (the member row's `mount`).
     mountpoint: []u8,
     secret: wire_auth.Secret,
-    manager_ep: endpoint.EndpointWire,
     link: SharedLink,
+    /// The manager link's re-resolution off the device (the S5 epoch
+    /// poll + the `endpoint:{0}` record at the newest checkpoint).
+    manager_resolver: ManagerResolver,
     wire: join_ladder.ManagerWire,
     joiner: join_ladder.Joiner,
     /// Live pages on the directory at the join (other appenders) + 1.
@@ -342,8 +355,8 @@ pub const JoinedSet = struct {
             .manager_identity = .{ .node_token = page0.identity.node_token, .writer_id = page0.identity.writer_id, .mount_slot = page0.identity.mount_slot, .reserved = 0 },
             .mountpoint = owned_mp,
             .secret = secret,
-            .manager_ep = ep,
             .link = SharedLink.init(gpa, be.io, ep, secret, wire_identity),
+            .manager_resolver = undefined,
             .wire = undefined,
             .joiner = undefined,
             .writers_known = writers_known,
@@ -351,6 +364,11 @@ pub const JoinedSet = struct {
             .park_gate = park.ParkGate.arm(be.io, be.stamp.member_position, park.tParkMaxMs(grant.failoverBoundMs(0, 0), park.graceMs(shard.tOwnerMsFromEnv(be.env)))),
         };
         errdefer self.link.deinit();
+        // `--join` names a listener the record may not yet carry: the
+        // poll starts at the mounted record, so a later record (a
+        // successor manager's first checkpoint) is what re-points.
+        self.manager_resolver = .{ .js = self, .poll = ro_mount.EpochPoll.init(gpa, .{ .ctx = self, .readSlot = &ManagerResolver.readSlot, .readAll = &ManagerResolver.readAll }, be.mounted.seq) };
+        self.link.resolver = .{ .ctx = &self.manager_resolver, .resolve = &ManagerResolver.resolve };
         self.granted_bits = std.DynamicBitSetUnmanaged.initEmpty(gpa, be.sb.totalExtents()) catch return error.OutOfMemory;
         errdefer self.granted_bits.deinit(gpa);
         self.wire = .{ .gpa = gpa, .link = self.link.link(), .volume = be.index, .identity = wire_identity, .pages = .{ .ctx = self, .read = &readPageFn } };
@@ -430,6 +448,12 @@ pub const JoinedSet = struct {
         self.m = slots.acquire.resolveMintSlots(knobs.optIntKnob("SQUEEZEFS_SYM_MINT_SLOTS", u64, self.be.env), self.writers_known);
         _ = try self.joiner.acquireRotor(@intCast(@min(self.m, std.math.maxInt(u16))));
         return self.joiner.leased.items;
+    }
+
+    /// The manager's listener as this mount reaches it NOW (the link's
+    /// current endpoint; a re-resolution moves it).
+    pub fn managerEndpoint(self: *JoinedSet) endpoint.EndpointWire {
+        return self.link.endpointNow();
     }
 
     // ---- the census ----
@@ -700,9 +724,68 @@ pub const JoinedSet = struct {
     pub fn writeStatsJson(self: *JoinedSet, w: *Io.Writer) Io.Writer.Error!void {
         const r = self.core();
         const unclaimed = self.unclaimedCount();
-        try w.print("{{\"manager_lease\":\"joined\",\"appenders_live\":1,\"appenders_known\":{d},\"appenders_capacity\":0,\"appender_ring_budget_remaining_bytes\":0,\"appender_live_pages_at_mount\":0,\"appender_unrecovered\":0,\"manager_endpoint\":\"{f}\",\"regions\":[{{\"appender_id\":{d},\"term\":{d},\"ring_bytes\":{d},\"ring_segments\":{d},\"seq_offset\":{d},\"grant_unclaimed\":{d},\"grant_held\":{d},\"grant_granted\":{d},\"grant_returned\":{d},\"entries\":{d}}}],\"slots\":", .{ self.writers_known, self.manager_ep, self.appenderId(), r.page.term, r.ringBytes(), r.table.len, self.be.reg.seqOffset(), unclaimed, self.granted_bits.count() - unclaimed, self.granted, self.returned, self.entries });
+        try w.print("{{\"manager_lease\":\"joined\",\"appenders_live\":1,\"appenders_known\":{d},\"appenders_capacity\":0,\"appender_ring_budget_remaining_bytes\":0,\"appender_live_pages_at_mount\":0,\"appender_unrecovered\":0,\"manager_endpoint\":\"{f}\",\"manager_repoints\":{d},\"regions\":[{{\"appender_id\":{d},\"term\":{d},\"ring_bytes\":{d},\"ring_segments\":{d},\"seq_offset\":{d},\"grant_unclaimed\":{d},\"grant_held\":{d},\"grant_granted\":{d},\"grant_returned\":{d},\"entries\":{d}}}],\"slots\":", .{ self.writers_known, self.managerEndpoint(), self.manager_resolver.repoints.load(.monotonic), self.appenderId(), r.page.term, r.ringBytes(), r.table.len, self.be.reg.seqOffset(), unclaimed, self.granted_bits.count() - unclaimed, self.granted, self.returned, self.entries });
         try self.be.slots.writeStatsJson(w);
         try w.writeByte('}');
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The manager link's resolver: the S5 epoch poll as the control plane.
+// ---------------------------------------------------------------------------
+
+/// Before every (re)dial of the manager link (charter §5.5 "Readers'
+/// planes FOLLOW a holder that moved its listener (re-resolve off durable
+/// state, re-point in place)"; "The S5 epoch-poll of the fixed ledger
+/// survives as the CONTROL plane only"): ONE predicted-slot read of the
+/// fixed ledger; a record newer than the last adopted names a checkpoint
+/// this mount has not seen — a successor manager's first (its
+/// `endpoint:{0}` lands in it) — so `endpoint:{0}` is re-read at that
+/// root through a transient cache. A dead manager's port stays the answer
+/// until a successor checkpoints: the dial refuses at once and the
+/// member's beat decides (`T_self` → PARK, the reclaim beat → the
+/// successor). The poll starts at the mounted checkpoint, so a `--join`
+/// listener is honoured until the record first moves past it.
+pub const ManagerResolver = struct {
+    js: *JoinedSet,
+    poll: ro_mount.EpochPoll,
+    repoints: std.atomic.Value(u64) = .init(0),
+
+    fn resolve(ctx: *anyopaque) ?endpoint.EndpointWire {
+        const self: *ManagerResolver = @ptrCast(@alignCast(ctx));
+        const js = self.js;
+        const current = js.link.ep;
+        const out = self.poll.poll() catch return current;
+        var rec = out.newest orelse return current;
+        defer rec.deinit(js.gpa);
+        const bytes = (js.be.lookupControlAtRecord(js.gpa, &rec, cr.endpointKey(0).slice()) catch return current) orelse return current;
+        defer js.gpa.free(bytes);
+        const ep = decodeEndpoint(bytes) catch return current;
+        if (!ep.eql(current)) {
+            _ = self.repoints.fetchAdd(1, .monotonic);
+            log.info("meta volume {s}: the manager's listener moved to {f} (checkpoint seq {d}) — the manager link re-points", .{ js.be.path, ep, rec.seq });
+        }
+        return ep;
+    }
+
+    fn readSlot(ctx: *anyopaque, slot: u64, out: *[ro_mount.SLOT_LEN]u8) ro_mount.IoError!void {
+        const js: *JoinedSet = @ptrCast(@alignCast(ctx));
+        const img = js.be.dev.readRange(js.gpa, js.be.sb.root_ledger.start + slot * ro_mount.SLOT_LEN, ro_mount.SLOT_LEN) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+        };
+        defer js.gpa.free(img);
+        @memcpy(out, img[0..ro_mount.SLOT_LEN]);
+    }
+
+    fn readAll(ctx: *anyopaque, out: []u8) ro_mount.IoError!void {
+        const js: *JoinedSet = @ptrCast(@alignCast(ctx));
+        const img = js.be.dev.readRange(js.gpa, js.be.sb.root_ledger.start, out.len) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+        };
+        defer js.gpa.free(img);
+        @memcpy(out, img[0..out.len]);
     }
 };
 

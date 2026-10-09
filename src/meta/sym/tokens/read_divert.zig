@@ -54,6 +54,9 @@ pub const stats = struct {
     pub var dlm_token_reader_holder_resolves: counters.ShardedCounter = .{};
     /// A `NotHolder` redirect followed ONCE inside the same op.
     pub var dlm_token_reader_redirects_followed: counters.ShardedCounter = .{};
+    /// A fail-closed channel re-pointed and re-probed ONCE inside the
+    /// same op (the serve then retries on a fresh grant).
+    pub var dlm_token_reader_channel_reprobes: counters.ShardedCounter = .{};
     /// Serves answered locally because the slot is this mount's (or
     /// unleased on the manager): the writer's "reads locally" verdict.
     pub var dlm_token_local_reads: counters.ShardedCounter = .{};
@@ -198,6 +201,7 @@ pub const Divert = struct {
         const slot = route_table.slotOfEffective(object);
         var home = self.resolver.homeOf(self.resolver.ctx, slot);
         var followed = false;
+        var reprobed = false;
         while (true) {
             switch (home) {
                 .local => {
@@ -216,6 +220,18 @@ pub const Divert = struct {
                             followed = true;
                             stats.dlm_token_reader_redirects_followed.inc();
                             home = self.resolver.refresh(self.resolver.ctx, slot, plane.last_redirect_holder.load(.acquire));
+                            continue;
+                        },
+                        error.TokenChannelStale => {
+                            // A failed round closed the channel: the plane
+                            // re-points ONCE inside the same op — the link
+                            // re-resolved and re-dialled, every token
+                            // dropped, the probe round the re-open — and
+                            // the serve retries on a fresh grant; a probe
+                            // that fails leaves the typed EAGAIN.
+                            if (reprobed or !self.repoint(io, f.identity, f.holder)) return e;
+                            reprobed = true;
+                            stats.dlm_token_reader_channel_reprobes.inc();
                             continue;
                         },
                         else => return e,

@@ -103,6 +103,11 @@ pub const AppenderSet = struct {
     /// Live pages of OTHER appenders found at open: unrecovered (their
     /// rings are the recovery wave's; their slots are refused).
     unrecovered: std.ArrayList(u32) = .empty,
+    /// Appender 0's identity as its page carried it when THIS open read
+    /// it — the predecessor manager the D0 ladder was won over (null: a
+    /// blank page, the first manager ever). The allocation leases'
+    /// same-node succession proves THIS identity dead and no other.
+    page0_at_open: ?page.Identity = null,
     /// The directory's Live count at open.
     live_at_open: u64 = 0,
     /// The ring-budget remainder as of the last census.
@@ -223,6 +228,9 @@ pub const AppenderSet = struct {
             return error.UnsupportedFormat;
         };
         var words: page.Page = prior orelse page.Page.free(0, 0, page.SegmentTable.one(.{ .start = be.sb.journal.start, .len = be.sb.journal.len }));
+        if (prior) |p| if (p.state == .live) {
+            self.page0_at_open = p.identity;
+        };
         if (prior) |p| if (p.state == .live and !p.identity.sameMount(self.identity)) {
             log.info("meta volume {s}: appender 0's page is Live under node 0x{x} mount slot {d} (term {d}) — the D0 ladder was won over its holder; the manager role passes with the page", .{ be.path, p.identity.node_token, p.identity.mount_slot, p.term });
         };

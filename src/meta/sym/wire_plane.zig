@@ -137,6 +137,10 @@ pub fn startReason(e: StartError) []const u8 {
     };
 }
 
+/// The manager's appender id — the holder every joiner's divert keys the
+/// manager's token plane by (`LocalResolver.homeOf`: identity = holder).
+const MANAGER_HOLDER: u32 = @import("../journal.zig").FIXED_RING_APPENDER;
+
 /// The longest `host:port` text (`[v6]:port` at full width).
 pub const ENDPOINT_TEXT_MAX: usize = 64;
 
@@ -199,6 +203,7 @@ const DeathFanout = struct {
 /// gate's clocks from the grant, the endpoint published to the manager's
 /// RAM table, the self-lease the divert reads.
 const JoinedHalf = struct {
+    plane: *WirePlane,
     js: *joined.JoinedSet,
     member: shard.Member,
     poison: Poison,
@@ -232,6 +237,19 @@ const JoinedHalf = struct {
             if (v == .fenced) {
                 // Terminal: the poison latched the volumes FAILED.
                 return;
+            }
+            // A reclaim admitted by a SUCCESSOR manager: its grant table
+            // is fresh, so every token this mount holds from holder 0 is
+            // unproven — the plane re-points (every token dropped, the
+            // channel fail-closed until a round completes) before the held
+            // acks drain into writes the successor never recalled.
+            if (v == .rejoined) {
+                _ = self.plane.divert.repoint(self.plane.io, MANAGER_HOLDER, MANAGER_HOLDER);
+                // The successor's RAM endpoint table is fresh: this
+                // listener is published again under the same appender id
+                // (what the successor's divert and step sessions dial).
+                _ = self.plane.publishToManager();
+                log.info("cluster wire: the home shard's successor at {f} admitted the reclaim (epoch {d}) — the manager's token plane re-pointed, this listener re-published", .{ self.js.managerEndpoint(), self.member.epoch });
             }
             _ = self.js.park_gate.expireIfDue(clock.monotonicNs(), self.poison.sink());
             // A plain OS thread of the daemon's own: the kernel's sleep,
@@ -421,7 +439,7 @@ pub const WirePlane = struct {
         if (self.mgr) |m| {
             log.info("cluster wire: manager of {d} volume(s) listening at {s}; membership owner term {d} (T_owner {d} ms, grace {s})", .{ m.faces.len, self.endpointText(), m.owner.term, t_owner_ms, if (m.owner.grace != null) "open" else "closed" });
         } else {
-            log.info("cluster wire: JOINED mount listening at {s} (appender {d} of {d} volume(s)); member of the home shard at {f}, renew every {d} ms, T_self {d} ms", .{ self.endpointText(), be0.joined.?.appenderId(), set.volumes.len, be0.joined.?.manager_ep, self.joined.?.member.clocks.?.renew_ms, self.joined.?.member.clocks.?.t_self_ms });
+            log.info("cluster wire: JOINED mount listening at {s} (appender {d} of {d} volume(s)); member of the home shard at {f}, renew every {d} ms, T_self {d} ms", .{ self.endpointText(), be0.joined.?.appenderId(), set.volumes.len, be0.joined.?.managerEndpoint(), self.joined.?.member.clocks.?.renew_ms, self.joined.?.member.clocks.?.t_self_ms });
         }
         return self;
     }
@@ -515,6 +533,7 @@ pub const WirePlane = struct {
         errdefer gpa.destroy(j);
         const local = @import("../guard/proc.zig").localIdentity();
         j.* = .{
+            .plane = self,
             .js = js,
             .member = undefined,
             .poison = .{ .set = self.set },
@@ -542,14 +561,7 @@ pub const WirePlane = struct {
     /// gate's clocks from the grant, the heartbeat thread.
     fn startJoinedHalfPost(self: *WirePlane) StartError!void {
         const j = self.joined.?;
-        for (self.set.volumes) |be| {
-            const js = be.joined orelse continue;
-            _ = js.publishEndpoint(self.advertised) catch |e| {
-                log.err("cluster wire: PublishEndpoint to the manager failed ({s})", .{@errorName(e)});
-                return error.Io;
-            };
-            stats.wire_endpoint_publications.inc();
-        }
+        if (!self.publishToManager()) return error.Io;
         j.member.endpoint = self.advertised;
         const now = nowMs();
         switch (j.member.join(now, null)) {
@@ -571,6 +583,22 @@ pub const WirePlane = struct {
         // `T_park_max = failover_bound + grace` at the grant's `T_owner`.
         j.js.park_gate.t_park_max_ms = membership.park_reclaim.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), clocks.grace_ms);
         j.beat = std.Thread.spawn(.{}, JoinedHalf.run, .{j}) catch return error.OutOfMemory;
+    }
+
+    /// A joiner's listener into the manager's RAM endpoint table (every
+    /// joined volume's); false when any publication failed (logged).
+    fn publishToManager(self: *WirePlane) bool {
+        var ok = true;
+        for (self.set.volumes) |be| {
+            const js = be.joined orelse continue;
+            _ = js.publishEndpoint(self.advertised) catch |e| {
+                log.err("cluster wire: PublishEndpoint to the manager failed ({s})", .{@errorName(e)});
+                ok = false;
+                continue;
+            };
+            stats.wire_endpoint_publications.inc();
+        }
+        return ok;
     }
 
     fn stopHalf(self: *WirePlane) void {
@@ -643,9 +671,22 @@ pub const WirePlane = struct {
             defer gpa.free(terms);
             const control = m.ledger_store.store().control;
             const screen: alloc_lease.Screen = .{ .ctx = dp, .dataVolumeBlocks = &dataVolumeBlocksFn, .set_width = @intCast(self.set.volumes.len), .heaps = &.{} };
+            // The same-node succession (charter §5.5 "a dead holder
+            // succeeded only after `dead_member:` AND `recovered:`"; the
+            // D0 ladder's word): a lease the PREDECESSOR MANAGER of this
+            // mount point holds — the identity page 0 carried when this
+            // open read it, proven dead by the ladder this open won — is
+            // taken over at `term + 1`: its death recorded EARLY, its
+            // pages' window the fixed ring this open already replayed, the
+            // granted ranges re-learnt from the live writers' declarations.
+            const sym0 = self.set.volumes[0].sym.?;
+            const me = self.writerIdentity();
+            const me_page: join_ladder.Identity = .{ .node_token = me.node_token, .mount_slot = me.mount_slot, .writer_id = me.writer_id };
+            var proof: join_ladder.SameNodeProof = .{ .page0_at_open = sym0.page0_at_open orelse me_page, .me = me_page };
+            const recover: alloc_lease.Recover = .{ .ctx = null, .recover = &predecessorBitmapRecovered };
             for (dp.vols.rows[0..n], 0..) |row, i| {
                 const r = row.?;
-                switch (alloc_lease.acquire(control, gpa, screen, true, .{ .vol_tag = r.vol_tag, .identity = self.writerIdentity(), .home_vol = 0, .appender_id = 0, .blocks = r.alloc.capacityBlocks() })) {
+                switch (alloc_lease.acquireAndHold(control, gpa, screen, true, .{ .vol_tag = r.vol_tag, .identity = me, .home_vol = 0, .appender_id = 0, .blocks = r.alloc.capacityBlocks() }, proof.d0Proof(), recover, @intCast(clock.realtimeCoarseNs()))) {
                     .granted => |g| {
                         terms[i] = g.term;
                         if (g.refs.n != 0) log.info("data planes: the allocation lease of vol {x} at term {d} names {d} predecessor bitmap page ref(s); the bitmap re-learns the granted ranges from the live writers' declarations (no KVDA page is read in this wave)", .{ r.vol_tag, g.term, g.refs.n });
@@ -662,6 +703,10 @@ pub const WirePlane = struct {
                         log.err("data planes: the allocation lease acquire of vol {x} was REJECTED ({t})", .{ r.vol_tag, why });
                         return error.Io;
                     },
+                    .attempts_exhausted => {
+                        log.err("data planes: the allocation lease of vol {x} could not be taken over from this mount's predecessor in {d} attempts", .{ r.vol_tag, alloc_lease.SAME_NODE_TAKEOVER_ATTEMPTS });
+                        return error.Io;
+                    },
                     .not_manager, .io_error => return error.Io,
                 }
             }
@@ -672,6 +717,14 @@ pub const WirePlane = struct {
         }
         const js = self.set.volumes[0].joined.?;
         self.writer_plane = try plane_arm.WriterPlane.create(gpa, self.io, dp, js.link.tokenLink(), self.identity);
+    }
+
+    /// `alloc_lease.Recover` for the predecessor manager's bitmap: its
+    /// ring IS the fixed ring this open replayed at the mount, and the
+    /// holder's bitmap is RAM in this wave (0002 row 292) — nothing to
+    /// fold; the live writers' declarations re-learn the granted ranges.
+    fn predecessorBitmapRecovered(_: ?*anyopaque, _: sym_records.WriterIdentity, _: u16, _: u64) bool {
+        return true;
     }
 
     fn writerIdentity(self: *const WirePlane) sym_records.WriterIdentity {
@@ -1235,7 +1288,7 @@ const PeerLinks = struct {
         const be0 = self.plane.set.volumes[0];
         if (be0.joined) |js| {
             if (holder == js.appenderId()) return null;
-            if (holder == 0) return js.manager_ep;
+            if (holder == 0) return js.managerEndpoint();
             return js.resolveEndpoint(holder) catch null;
         }
         const s = be0.sym orelse return null;
@@ -1249,7 +1302,7 @@ const PeerLinks = struct {
     fn clientEndpoint(self: *PeerLinks, client: tokens.table.ClientId) ?endpoint.EndpointWire {
         const be0 = self.plane.set.volumes[0];
         if (be0.joined) |js| {
-            if (client == clientIdOf(shard.writerMemberId(js.manager_identity))) return js.manager_ep;
+            if (client == clientIdOf(shard.writerMemberId(js.manager_identity))) return js.managerEndpoint();
             return null;
         }
         const m = self.plane.mgr orelse return null;

@@ -1036,7 +1036,8 @@ pub const KvBackend = struct {
 
         // 6. The slot plane armed JOINED (rung 6 over the wire).
         var mgr_ep: manager.Endpoint = .{};
-        const ep_bytes = std.mem.asBytes(&js.manager_ep);
+        const manager_ep_now = js.managerEndpoint();
+        const ep_bytes = std.mem.asBytes(&manager_ep_now);
         @memcpy(mgr_ep.bytes[0..ep_bytes.len], ep_bytes);
         mgr_ep.len = @intCast(ep_bytes.len);
         be.slots.armJoined(js, mgr_ep) catch |e| return switch (e) {
@@ -1117,6 +1118,34 @@ pub const KvBackend = struct {
         be.cache.setDurableTail(fresh.journal_tail_seq);
         try be.openControlProjection();
     }
+
+    /// A control record read OFF THE DEVICE at the checkpoint `rec` names,
+    /// through a transient cache (never this mount's: a leaf the manager
+    /// appends to in place keeps its address, so the cached image would
+    /// serve the stale words) — a joiner's re-resolution of its manager's
+    /// listener (charter §5.5 "re-resolve off durable state").
+    pub fn lookupControlAtRecord(be: *KvBackend, gpa: Allocator, rec: *const ledger.LedgerRecord, k: []const u8) OpenError!?[]u8 {
+        const cache = try node_cache.NodeCache.init(gpa, be.io, .{ .layout = be.layout, .heap_base = be.sb.heap.start, .budget_bytes = TRANSIENT_CONTROL_CACHE_BYTES }, be.dev.loader());
+        defer cache.deinit();
+        cache.setDurableTail(rec.journal_tail_seq);
+        var seq = node_seq.NodeSeqHandle.shared(rec.node_seq_watermark);
+        const t = KvTree.openFromLedger(gpa, cache, rec, .control, &seq) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        defer t.destroy();
+        return t.lookup(gpa, k) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+    }
+
+    /// A one-record read needs the control tree's root and one leaf: the
+    /// floor the cache's shards derive from (a budget below one node is
+    /// one shard).
+    pub const TRANSIENT_CONTROL_CACHE_BYTES: u64 = 16 << 20;
 
     /// A slot tree that is no longer this mount's (a released lease on a
     /// joiner): out of the live set (retired with the table) — its extents

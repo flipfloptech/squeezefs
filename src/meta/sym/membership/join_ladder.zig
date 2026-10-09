@@ -789,12 +789,15 @@ pub const SameNodeProof = struct {
     }
 
     /// Dead iff the holder is this node's predecessor MANAGER — the exact
-    /// `(node, mount_slot)` page 0 carried at the open. Another same-node
-    /// holder is a joined appender of this host; a foreign node's is live.
+    /// `(node, mount_slot)` page 0 carried at the open (a prior
+    /// incarnation of THIS mount point included: the D0 ladder this open
+    /// won proved it dead; the incarnations differ by `writer_id`). Our
+    /// own incarnation is never a predecessor; another same-node holder
+    /// is a joined appender of this host; a foreign node's is live.
     pub fn provesDead(ctx: ?*anyopaque, holder: records.WriterIdentity) bool {
         const self: *SameNodeProof = @ptrCast(@alignCast(ctx.?));
         if (holder.node_token != self.me.node_token) return false;
-        if (holder.sameMount(.{ .node_token = self.me.node_token, .mount_slot = self.me.mount_slot, .writer_id = 0 })) return false;
+        if (holder.eql(.{ .node_token = self.me.node_token, .mount_slot = self.me.mount_slot, .writer_id = self.me.writer_id })) return false;
         const dead = self.page0_at_open.node_token == holder.node_token and self.page0_at_open.mount_slot == holder.mount_slot;
         if (dead) stats.same_node_successions.inc();
         return dead;
@@ -1181,6 +1184,13 @@ test "the same-node successor rule: the D0 flock proves dead exactly the predece
     try testing.expect(!d0.provesDead(d0.ctx, .{ .node_token = 0xAA, .mount_slot = 5, .writer_id = 0x5 }));
     try testing.expect(!d0.provesDead(d0.ctx, .{ .node_token = 0xBB, .mount_slot = 1, .writer_id = 0x1 }));
     try testing.expect(!d0.provesDead(d0.ctx, .{ .node_token = 0xAA, .mount_slot = 2, .writer_id = 0x2 }));
+    // The D0 successor at the predecessor's OWN mount point (the restart
+    // of a manager at the same mount): the dead incarnation is proven
+    // dead, this one is not.
+    var same: SameNodeProof = .{ .page0_at_open = .{ .node_token = 0xAA, .mount_slot = 0, .writer_id = 0x1 }, .me = .{ .node_token = 0xAA, .mount_slot = 0, .writer_id = 0x2 } };
+    const d1 = same.d0Proof();
+    try testing.expect(d1.provesDead(d1.ctx, .{ .node_token = 0xAA, .mount_slot = 0, .writer_id = 0x1 }));
+    try testing.expect(!d1.provesDead(d1.ctx, .{ .node_token = 0xAA, .mount_slot = 0, .writer_id = 0x2 }));
 }
 
 test "the flush-ceiling audit: a leaf inside the ceiling passes; past it with no hold overruns (the tripwire); a recovery hold's overlap is excused up to the recovery bound and counted as a recovery extension; a service hold is capped at ONE ceiling so a longer stall still overruns; the tape keeps the last 64 cycles oldest-first" {

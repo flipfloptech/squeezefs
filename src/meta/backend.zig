@@ -225,6 +225,13 @@ pub const OpenOptions = struct {
     test_error_logs: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     /// The D0 gate's mode, host identity and seams (`guard/gate.zig`).
     guard: guard.gate.Options = .{},
+    /// A held writer lock is the JOIN DOOR's signal, not a refusal: the
+    /// caller (`meta_set`) opens volume 0 of a symmetric set with a join
+    /// posture at hand and will `openJoined` on `Busy`, so the flock's
+    /// `EWOULDBLOCK` logs at info naming the manager. False keeps the loud
+    /// refusal (a `--single-writer` volume, a member past 0, a reader, the
+    /// in-process harnesses).
+    join_door: bool = false,
 };
 
 /// The mount's posture (charter §5.7): the D0 ladder's winner is the
@@ -1389,8 +1396,10 @@ pub const KvBackend = struct {
     }
 
     /// Layer A of the D0 guard: `flock(LOCK_EX | LOCK_NB)` on the dedicated
-    /// fd. `EWOULDBLOCK` refuses at once, naming the on-volume claim holder
-    /// when the probe can read one (B:17770-17774).
+    /// fd. `EWOULDBLOCK` answers `Busy` at once, naming the on-volume claim
+    /// holder when the probe can read one (B:17770-17774): a loud refusal,
+    /// or — under `opts.join_door` — the normal signal that a live manager
+    /// holds the volume and this mount joins it (info, never an error).
     fn acquireWriterFlock(gpa: Allocator, io: Io, path: []const u8, opts: OpenOptions) OpenError!linux.fd_t {
         const fd = try openGuardFd(path);
         errdefer _ = linux.close(fd);
@@ -1398,7 +1407,7 @@ pub const KvBackend = struct {
         switch (linux.errno(linux.flock(fd, op))) {
             .SUCCESS => return fd,
             .AGAIN => {
-                stats.guard_busy_refusals.inc();
+                if (!opts.join_door) stats.guard_busy_refusals.inc();
                 var buf: [512]u8 = undefined;
                 var w: Io.Writer = .fixed(&buf);
                 // Best-effort: the holder's claim through the probe (a
@@ -1417,7 +1426,11 @@ pub const KvBackend = struct {
                         }
                     } else |_| {}
                 }
-                log.err("meta volume {s}: another squeezefs process holds the writer lock{s} — concurrent mounts of one metadata volume are refused (single-writer guard, EBUSY)", .{ path, w.buffered() });
+                if (opts.join_door) {
+                    log.info("meta volume {s}: volume 0 is held by the manager{s}; joining as appender over the wire", .{ path, w.buffered() });
+                } else {
+                    log.err("meta volume {s}: another squeezefs process holds the writer lock{s} — concurrent mounts of one metadata volume are refused (single-writer guard, EBUSY)", .{ path, w.buffered() });
+                }
                 return error.Busy;
             },
             else => |e| {
@@ -2533,6 +2546,25 @@ test "the single-writer guard: a second open of a held volume refuses Busy loud;
     be.close();
     const again = try v.open();
     again.close();
+}
+
+test "the join door: a held writer lock on volume 0 of a symmetric set is the manager's — Busy with ZERO error logs (an info line names the holder; the join follows), not counted as a refusal; without the door the same lock refuses loud" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "join-door", null);
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    try testing.expect(be.sb.symmetricPlaneStamped());
+    const refusals_before = stats.guard_busy_refusals.load();
+    // The runner fails the test on any error log: none is expected here.
+    log.testing.expectErrorLogs(0);
+    try testing.expectError(error.Busy, KvBackend.open(gpa, v.io(), v.path(), .{ .env = &v.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .join_door = true }));
+    try testing.expectEqual(refusals_before, stats.guard_busy_refusals.load());
+    // The refusal class keeps its error and its counter.
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Busy, v.open());
+    try log.testing.expectAllFired();
+    try testing.expectEqual(refusals_before + 1, stats.guard_busy_refusals.load());
 }
 
 test "strict vs coalesced: a strict ack follows one barrier per group; a coalesced ack precedes the barrier and fsync is the trailing one" {

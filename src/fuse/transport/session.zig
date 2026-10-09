@@ -174,7 +174,27 @@ pub const MountError = error{
     /// An explicit `SQUEEZEFS_FUSE_BUFFER_MODE` the probes refused (named
     /// in the log) — the only degrade point is the probe; never a downgrade.
     BufferModeRefused,
+    /// The kmbuf ring's contiguous-page registration answered ENOMEM after
+    /// every retry (`kmbuf.Error`): the probe decided the mode, so the law
+    /// is fail loud, never degrade; `Config.refusal` carries the order.
+    KmbufRingEnomem,
     SlabFailed,
+};
+
+/// The operator-facing detail of a typed refusal: `MountError` names the
+/// class, this names the numbers the error alone cannot carry. Written by
+/// `mount` into `Config.refusal` before the error returns.
+pub const Refusal = union(enum) {
+    none,
+    /// `KmbufRingEnomem`: each ring buffer is `2^order` contiguous pages.
+    kmbuf_ring_enomem: struct { order: u8 },
+
+    pub fn format(self: Refusal, w: *Io.Writer) Io.Writer.Error!void {
+        switch (self) {
+            .none => try w.writeAll("no refusal detail"),
+            .kmbuf_ring_enomem => |r| try w.print("kmbuf ring registration ENOMEM (order-{d} contiguous pages); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user", .{r.order}),
+        }
+    }
 };
 
 /// A caller's callback with its context (the daemon's hooks).
@@ -213,6 +233,9 @@ pub const Config = struct {
     /// from the kernel (an external umount), a disconnect, a failed queue,
     /// or `close` — so the daemon's main task can begin its teardown.
     on_shutdown: ?Hook = null,
+    /// Written with a typed refusal's detail before `mount` returns its
+    /// error (the daemon's refusal line names it).
+    refusal: ?*Refusal = null,
     /// Error logs each worker/sideband thread expects in a test.
     test_error_logs: usize = 0,
 };
@@ -1015,6 +1038,7 @@ pub const Session = struct {
         if (read_fusion_lever and !self.shared.read_fusion_on) log.info("transport: SQUEEZEFS_FUSE_READ_FUSION=1 accepted; inert on a {t} session (the fused poll is the zero-copy mode's)", .{self.mode});
         if (self.shared.sqpoll) log.info("transport: SQUEEZEFS_FUSE_SQPOLL=1 — the kernel submission poller (measured not recommended: the A/B control arm)", .{});
         self.shared.register_refuse_remaining.store(knobs.intKnob("SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", u32, env), .monotonic);
+        self.shared.test_kmbuf_enomem = knobs.boolKnob("SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", env);
         self.armBridgeSeams(env);
         errdefer self.closeStallPipe();
 
@@ -1065,6 +1089,10 @@ pub const Session = struct {
                 return switch (e) {
                     error.RingSetupFailed => error.RingSetupFailed,
                     error.ThreadSpawnFailed => error.ThreadSpawnFailed,
+                    error.KmbufRingEnomem => {
+                        if (cfg.refusal) |r| r.* = .{ .kmbuf_ring_enomem = .{ .order = kmbuf.pageOrder(self.plan.payload_sz, facts.page_size) } };
+                        return error.KmbufRingEnomem;
+                    },
                 };
             };
             started += 1;
@@ -2212,6 +2240,31 @@ test "e2e lattice: an explicit `zc` on a venue without CAP_SYS_ADMIN (the seam) 
         try testing.expectEqual(probes.Verdict.absent, s.verdicts.zc);
         try testing.expectEqual(@as(u64, 0), probes.cap_gauge.load());
     }
+}
+
+test "e2e lattice: the kmbuf ring answering ENOMEM after every retry (the seam) fails the mount with the TYPED KmbufRingEnomem refusal whose detail names the page order and the remedy; nothing stays pinned or mounted" {
+    if (!venueAvailable()) return error.SkipZigTest;
+    if (probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return error.SkipZigTest;
+    const rig = try Rig.init(testing.allocator, 25, &.{.{ "SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", "1" }});
+    defer rig.deinit();
+    const pinned_before = kmbuf.pinned_bytes.load();
+    const retries_before = kmbuf.register_retries.load();
+    var refusal: Refusal = .none;
+    // The worker thread logs kmbuf's one refusal line; this thread logs the
+    // session's "group failed to start".
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.KmbufRingEnomem, rig.mountIt(.{ .mem_budget_bytes = 0, .refusal = &refusal, .test_error_logs = 1 }));
+    try log.testing.expectAllFired();
+    try testing.expect(refusal == .kmbuf_ring_enomem);
+    var buf: [256]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "{f}", .{refusal});
+    try testing.expect(std.mem.startsWith(u8, text, "kmbuf ring registration ENOMEM (order-"));
+    try testing.expect(std.mem.endsWith(u8, text, " contiguous pages); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user"));
+    try testing.expectEqual(retries_before + kmbuf.REGISTER_RETRIES, kmbuf.register_retries.load());
+    try testing.expectEqual(pinned_before, kmbuf.pinned_bytes.load());
+    var mi_buf: [64 * 1024]u8 = undefined;
+    const mountinfo = try Io.Dir.cwd().readFile(testing.io, "/proc/self/mountinfo", &mi_buf);
+    try testing.expectEqual(@as(?u32, null), mountinfoMinor(mountinfo, rig.path));
 }
 
 test "e2e zc READ: /big moves through the fd-source leg from the fill pool (zc_serve_bytes ≡ user bytes, daemon copies 0, every reply rode the slot); with SQUEEZEFS_READ_ZC_SERVE=0 the bounce leg serves with ONE copy per READ" {

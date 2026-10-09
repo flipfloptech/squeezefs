@@ -10,12 +10,12 @@
 //!   decodable, the stamp's set; every data volume's device read and
 //!   checked against its record — the §5.4 URI-disagreement refusals; an
 //!   encrypted set resolves and verifies its key here — a wrong key file
-//!   refuses the mount instead of failing every read) → start the budget
-//!   sampler → the handler tables (watchdog registry, op guards, open
-//!   table) → the DATA PLANE (`data/plane.zig`: devices, allocators seeded
-//!   from the ledger, the router, the reclaimer, staging + the NVMe tier
-//!   under the cache paths, the transform keyed from the verified key, the
-//!   write and read paths) → `KvFs(KvBackend, DataPlane)` → the cross-
+//!   refuses the mount instead of failing every read) → the handler
+//!   tables (watchdog registry, op guards, open table) → the DATA PLANE
+//!   (`data/plane.zig`: devices, allocators seeded from the ledger, the
+//!   router, the reclaimer, staging + the NVMe tier under the cache paths,
+//!   the transform keyed from the verified key, the write and read paths)
+//!   → `KvFs(KvBackend, DataPlane)` → the cross-
 //!   owner plane (open intents rolled forward) → THE CLUSTER WIRE
 //!   (`meta/sym/wire_plane.zig`, a symmetric set only: this process won
 //!   the D0 ladder of every volume it opened and is their MANAGER — ONE
@@ -27,9 +27,13 @@
 //!   `/dev/fuse` inside the session's `mount(2)`; anyone else receives it
 //!   from `fusermount3` (`fusermount.zig`) → `Session.mount` (INIT,
 //!   geometry, `enable_uring`, workers, the arm barrier) → the plane's zc
-//!   legs armed from the session's buffer mode → the watchdog loop and the
-//!   reclaim cadence on `spawnMeta` → `ready` (logged; written to the
-//!   supervisor pipe under `--daemon`).
+//!   legs armed from the session's buffer mode → the interception host →
+//!   THE BUDGET SAMPLER, last: it reads every registered source without a
+//!   lock, so it starts once the last registrant exists and is stopped and
+//!   JOINED first on every exit (its `defer` sits below every
+//!   registrant's) → the watchdog loop and the reclaim cadence on
+//!   `spawnMeta` → `ready` (logged; written to the supervisor pipe under
+//!   `--daemon`).
 //!
 //! Serve: the main task parks on the daemon's eventfd through its lane ring
 //! (`SqzIo.readable`): a signal (`daemon.Signals`) or the session's
@@ -38,18 +42,18 @@
 //! ONE aggregator (`stats/stats.zig`), one line per family. Stop latches;
 //! nothing is aborted from outside.
 //!
-//! Teardown: `Session.close` (the drains RELEASE every retained zc slot
-//! while the connection is live and synthesize every owed reply, then the
-//! unmount, the workers join) → the watchdog and the cadence cancelled →
-//! the cluster wire stopped (every connection severed, the token hook
+//! Teardown: the sampler stopped and joined (every source still live) →
+//! `Session.close` (the drains RELEASE every retained zc slot while the
+//! connection is live and synthesize every owed reply, then the unmount,
+//! the workers join) → the watchdog and the cadence cancelled → the
+//! cluster wire stopped (every connection severed, the token hook
 //! disarmed on every pass — before the backend it serves over) →
 //! `Session.deinit` → the filesystem's dismount sweep → `DataPlane.close`
 //! (the dismount pass: staged files promote, packs seal DISMOUNT, the
 //! reclaimer drains, the devices close — charter §8 `umount`) →
 //! `KvBackend.close` (the final checkpoint: an empty replay window for the
-//! next mount) → the sampler → exit 0; a volume that latched FAILED exits
-//! 1 naming the reason — AFTER the same `Session.close`, so its slots are
-//! released too.
+//! next mount) → exit 0; a volume that latched FAILED exits 1 naming the
+//! reason — AFTER the same `Session.close`, so its slots are released too.
 //!
 //! Every exit of `mountMain` runs that order: the stop latch (SIGTERM /
 //! SIGINT — what `squeezefs umount` sends, having found this daemon's pid
@@ -316,13 +320,7 @@ fn mountMain(ctx: *Ctx) u8 {
     defer gpa.free(data_uri);
     ctx.data_uri = data_uri;
 
-    // 2. The budget sampler (the registry already holds the fiber stacks;
-    //    the arena joins at the session).
-    _ = mem_budget.authority.spawnSampler(ctx.budget_host, mem_budget.sampler_period_ns) catch |e| return ctx.failed("cannot start the memory-budget sampler ({s})", .{@errorName(e)});
-    var sampler_live = true;
-    defer if (sampler_live) mem_budget.authority.stopSampler(ctx.p.io);
-
-    // 3. The handler tables, the data plane, the filesystem, the binding.
+    // 2. The handler tables, the data plane, the filesystem, the binding.
     var registry = watchdog.Registry.init(gpa, watchdog.derivedShards(facts.possible_cpus)) catch return ctx.failed("out of memory (watchdog registry)", .{});
     defer registry.deinit();
     var guards = op_guard.Table.init(gpa, op_guard.INODE_GUARD_STRIPES) catch return ctx.failed("out of memory (op guards)", .{});
@@ -425,7 +423,7 @@ fn mountMain(ctx: *Ctx) u8 {
     });
     binding.bindData(.{ .plane = plane });
 
-    // 4. The FUSE fd (root: inside the session; else fusermount3) and the
+    // 3. The FUSE fd (root: inside the session; else fusermount3) and the
     //    session's ordered bring-up.
     var unmount_ctx: UnmountCtx = .{ .io = io };
     var fuse_fd: ?linux.fd_t = null;
@@ -437,6 +435,7 @@ fn mountMain(ctx: *Ctx) u8 {
         fuse_fd = fusermount.mount(gpa, io, env, ctx.mountpoint, ow.buffered()) catch |e| return ctx.failed("fusermount3 could not mount {s} ({s})", .{ ctx.mountpoint, @errorName(e) });
         unmounter = .{ .ctx = &unmount_ctx, .call = UnmountCtx.call };
     }
+    var session_refusal: transport.session.Refusal = .none;
     const session = Session.mount(gpa, ctx.sqz, binding.filesystem(), ctx.mountpoint, env, facts, .{
         .opts = ctx.opts,
         .block_size = cfg.block_size,
@@ -445,11 +444,15 @@ fn mountMain(ctx: *Ctx) u8 {
         .fuse_fd = fuse_fd,
         .unmounter = unmounter,
         .on_shutdown = .{ .ctx = ctx, .call = onSessionShutdown },
+        .refusal = &session_refusal,
     }) catch |e| {
         if (fuse_fd) |fd| {
             _ = fusermount.unmount(io, ctx.mountpoint);
             _ = linux.close(fd);
         }
+        // The typed refusal with an operator remedy names it on the
+        // refusal line itself (the `--daemon` invoker sees only this).
+        if (e == error.KmbufRingEnomem) return ctx.failed("the FUSE session could not arm at {s}: {f}", .{ ctx.mountpoint, session_refusal });
         return ctx.failed("the FUSE session could not arm at {s} ({s}) — see the log", .{ ctx.mountpoint, @errorName(e) });
     };
     var session_live = true;
@@ -467,7 +470,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
     plane.armSession(if (session.heldStoreArmed()) held_store.face() else null, session.mode == .zero_copy, session.readZcServe());
-    // 4b. `-o interception`: the client bypass's session host (charter §7)
+    // 3b. `-o interception`: the client bypass's session host (charter §7)
     //     — the listeners, the admission, the service threads on demand,
     //     the direct-drive lanes — then the `il0` xattr the shim/SDK read.
     //     The mount's device is resolved BEFORE the host arms (decision
@@ -507,6 +510,19 @@ fn mountMain(ctx: *Ctx) u8 {
         h.deinit();
     };
 
+    // 4. The budget sampler — AFTER the last mount-time registrant (the
+    //    fiber stacks, the node caches, the plane's tiers and pools, the
+    //    session's arena, the host's arenas) and so, this `defer` sitting
+    //    below every registrant's, stopped and JOINED before any of them
+    //    is freed on every exit of this function; the serve-path teardown
+    //    below stops it first for the same reason. The thread reads every
+    //    source without a lock: a source freed under it kills the daemon
+    //    in `samplerMain → current` (the kmbuf ENOMEM bring-up of the R5
+    //    crash row died there with the plane already closed).
+    _ = mem_budget.authority.spawnSampler(ctx.budget_host, mem_budget.sampler_period_ns) catch |e| return ctx.failed("cannot start the memory-budget sampler ({s})", .{@errorName(e)});
+    var sampler_live = true;
+    defer if (sampler_live) mem_budget.authority.stopSampler(ctx.p.io);
+
     // 5. The watchdog loop and the reclaim cadence on the meta pool.
     var wd = watchdog.Watchdog.init(&registry);
     var wd_fut = ctx.sqz.spawnMeta(watchdogMain, .{ &wd, io }) catch return ctx.failed("cannot spawn the watchdog", .{});
@@ -527,9 +543,13 @@ fn mountMain(ctx: *Ctx) u8 {
     // 7. Serve until a stop latches or the session ends.
     serve(ctx, session, &vs);
 
-    // 8. Teardown in order: the interception host first (every session
-    //    poisoned, its threads joined, the listeners closed, the xattr
-    //    unarmed) while the session its handoffs ride is still live.
+    // 8. Teardown in order: the budget sampler first (stopped and joined
+    //    while every source it reads is still live — step 4's law), then
+    //    the interception host (every session poisoned, its threads
+    //    joined, the listeners closed, the xattr unarmed) while the session
+    //    its handoffs ride is still live.
+    sampler_live = false;
+    mem_budget.authority.stopSampler(ctx.p.io);
     if (host) |h| {
         h.disarm();
         h.deinit();
@@ -565,12 +585,9 @@ fn mountMain(ctx: *Ctx) u8 {
     session_live = false;
     vs.renderer.sources.session = null;
     session.deinit();
-    // The sampler stops BEFORE the plane's components (its gauges) go; the
-    // dismount pass BEFORE the backend's final checkpoint (its promotions
-    // are layout transactions); the `defer`s unwind the filesystem and the
-    // tables after it.
-    sampler_live = false;
-    mem_budget.authority.stopSampler(ctx.p.io);
+    // The dismount pass BEFORE the backend's final checkpoint (its
+    // promotions are layout transactions); the `defer`s unwind the
+    // filesystem and the tables after it.
     plane_open = false;
     plane.close();
     be_open = false;

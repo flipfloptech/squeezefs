@@ -498,6 +498,9 @@ pub const Shared = struct {
     /// `SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE`: the next N REGISTER pushes are
     /// answered as refused without reaching the kernel.
     register_refuse_remaining: std.atomic.Value(u32) = .init(0),
+    /// `SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM`: every kmbuf ring registration
+    /// answers ENOMEM without reaching the kernel.
+    test_kmbuf_enomem: bool = false,
     /// `SQUEEZEFS_TEST_ZC_BRIDGE_STALL`: the next N reply bridges read a
     /// pipe with no writer (`stall_pipe[0]`) and never complete.
     bridge_stall_remaining: std.atomic.Value(u32) = .init(0),
@@ -658,7 +661,8 @@ pub const Group = struct {
     last_scan_ns: u64 = 0,
     affinity: ?placement.CpuSet,
     thread: ?std.Thread = null,
-    /// 0 starting, 1 armed, 2 failed.
+    /// 0 starting, 1 armed, 2 failed, 3 failed with the typed kmbuf
+    /// ENOMEM refusal (`StartError.KmbufRingEnomem`).
     started: futex.Word = .init(0),
     /// 1 once the drain flushed its synthesized commits (the session's
     /// `umount2` waits for it so no blocked caller still holds the mount).
@@ -677,7 +681,11 @@ pub const Group = struct {
     releases_pending: u32 = 0,
 
     pub const InitError = std.mem.Allocator.Error || error{ArenaMapFailed};
-    pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed };
+    /// `KmbufRingEnomem`: the kmbuf ring's contiguous-page allocation
+    /// refused after every retry (`kmbuf.Error`), typed so the daemon's
+    /// refusal can name the remedy.
+    pub const StartError = error{ ThreadSpawnFailed, RingSetupFailed, KmbufRingEnomem };
+    const RingError = error{ RingSetupFailed, KmbufRingEnomem };
 
     /// Allocate the group's tables and buffers (startup; nothing per op).
     pub fn init(gpa: std.mem.Allocator, shared: *Shared, index: u16, qids: []const u16, affinity: ?placement.CpuSet) InitError!*Group {
@@ -921,10 +929,13 @@ pub const Group = struct {
         assert(self.thread == null);
         self.thread = std.Thread.spawn(.{}, threadMain, .{self}) catch return error.ThreadSpawnFailed;
         while (self.started.load(.acquire) == 0) futex.wait(&self.started, 0);
-        if (self.started.load(.acquire) == 2) {
-            self.thread.?.join();
-            self.thread = null;
-            return error.RingSetupFailed;
+        switch (self.started.load(.acquire)) {
+            1 => {},
+            else => |failed| {
+                self.thread.?.join();
+                self.thread = null;
+                return if (failed == 3) error.KmbufRingEnomem else error.RingSetupFailed;
+            },
         }
     }
 
@@ -946,9 +957,9 @@ pub const Group = struct {
         _ = thread_name.nameCurrentThread(&self.name_buf, std.fmt.bufPrint(&base, "sqz-fuse-ur{d}", .{self.members[0].qid}) catch unreachable);
         if (builtin.is_test) log.testing.expectErrorLogs(self.shared.test_error_logs);
         self.applyAffinity();
-        self.initRing() catch {
+        self.initRing() catch |e| {
             _ = self.shared.barrier.complete(.failed);
-            self.started.store(2, .release);
+            self.started.store(if (e == error.KmbufRingEnomem) 3 else 2, .release);
             futex.wakeAll(&self.started);
             return;
         };
@@ -981,7 +992,7 @@ pub const Group = struct {
         linux.IORING_SETUP_SQPOLL,
     };
 
-    fn initRing(self: *Group) error{RingSetupFailed}!void {
+    fn initRing(self: *Group) RingError!void {
         const entries: u16 = @intCast(geometry.sqEntries(@intCast(self.members.len), self.depth));
         const ladder: []const u32 = if (self.shared.sqpoll) &sqpoll_ladder else &uring128.taskrun_ladder_flags;
         self.ring = uring128.ParkedRing128.initProbing(self.gpa, entries, ladder, &self.ring_rung) catch return error.RingSetupFailed;
@@ -993,8 +1004,10 @@ pub const Group = struct {
             return error.RingSetupFailed;
         };
         if (self.shared.usesKmbuf()) {
-            // Post-probe: a refusal here fails the mount loud (charter §3).
-            self.kmb = kmbuf.Kmbuf.setup(&self.ring.ring, self.shared.io, &self.headers, self.shared.kmbuf_opcodes.?, self.shared.zeroCopy(), self.shared.plan.payload_sz, self.shared.page) catch |e| {
+            // Post-probe: a refusal here fails the mount loud (charter §3);
+            // the ENOMEM class keeps its type (kmbuf logged the remedy).
+            self.kmb = kmbuf.Kmbuf.setup(&self.ring.ring, self.shared.io, &self.headers, self.shared.kmbuf_opcodes.?, self.shared.zeroCopy(), self.shared.plan.payload_sz, self.shared.page, self.shared.test_kmbuf_enomem) catch |e| {
+                if (e == error.KmbufRingEnomem) return error.KmbufRingEnomem;
                 log.err("transport: group {d}: the {t} buffer setup refused ({s}) after the probe confirmed it — the mount fails", .{ self.index, self.shared.mode, @errorName(e) });
                 return error.RingSetupFailed;
             };

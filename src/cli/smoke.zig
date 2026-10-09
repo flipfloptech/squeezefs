@@ -44,6 +44,7 @@ const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const json_scan = @import("../core/json_scan.zig");
 const handler = @import("../fuse/handler.zig");
+const transport = @import("../fuse/transport.zig");
 const status_verb = @import("status.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const superblock = @import("../meta/superblock.zig");
@@ -2690,6 +2691,47 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     // Nothing of ours survives: no squeezefs process holds the volume.
     try testing.expect(!@import("status.zig").writerGuardHeld(rig.img));
+}
+
+test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming the page order and the remedy, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    // The registration is reached only where the probe confirmed kmbuf.
+    if (transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    // The sampler's stop runs one tick over every registered source: a
+    // teardown that frees a source before stopping the sampler dies on the
+    // read (`samplerMain → current` over the freed plane: a fault or a
+    // safety panic) instead of racing the 1 Hz tick.
+    try rig.env.put("SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP", "1");
+    // 1. The refusal: the plane is open (its tiers and pools registered)
+    //    when the session's first worker meets ENOMEM after the retry
+    //    ladder; the exit is a clean 1 and the stderr line is the remedy.
+    {
+        try rig.env.put("SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", "1");
+        const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (r.term != .exited) std.debug.print("\n--- the refused mount died ({f}) instead of exiting ---\n{s}\n", .{ r.term, r.stderr });
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "squeezefs mount: the FUSE session could not arm at ") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, ": kmbuf ring registration ENOMEM (order-") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, " contiguous pages); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user") != null);
+        // The retry ladder ran its bounded course before the refusal.
+        try testing.expectEqual(@as(usize, transport.kmbuf.REGISTER_RETRIES), std.mem.count(u8, r.stderr, "refused ENOMEM — retry "));
+        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+        try testing.expect(!status_verb.writerGuardHeld(rig.img));
+    }
+    // 2. The same sampler seam over a clean cycle: the stop's tick reads
+    //    live sources on the serve-path teardown too; exit 0.
+    try rig.env.put("SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", "0");
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
 /// A data volume of three 4 MiB(+4 KiB) chunks: two reserved, one usable.

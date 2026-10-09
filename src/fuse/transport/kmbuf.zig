@@ -21,6 +21,7 @@ const uring128 = @import("../../io/uring128.zig");
 const abi = @import("../abi.zig");
 const zc = @import("zc.zig");
 const counters = @import("../../core/counters.zig");
+const errors = @import("../../core/errors.zig");
 const log = @import("../../core/log.zig");
 
 comptime {
@@ -47,7 +48,21 @@ pub var pinned_bytes: counters.Gauge = .{};
 /// `transport_kmbuf_register_retries`: ENOMEM retries taken.
 pub var register_retries: counters.ShardedCounter = .{};
 
-pub const Error = error{ HeadersMapFailed, BufferTableFailed, KmbufRegisterFailed, RegionMapFailed };
+/// `KmbufRingEnomem` is the typed refusal of a ring registration the
+/// kernel answers ENOMEM after every retry: each buffer is `2^order`
+/// physically contiguous pages, which a fragmented page cache may not
+/// hold even with ample free memory. The probe decided the mode, so the
+/// law is fail loud, never degrade (charter §3); the remedy is the
+/// operator's (retry, or pin `SQUEEZEFS_FUSE_BUFFER_MODE=user`).
+pub const Error = error{ HeadersMapFailed, BufferTableFailed, KmbufRegisterFailed, KmbufRingEnomem, RegionMapFailed };
+
+/// The page order of one kmbuf buffer: `log2(ceil(payload / page))`
+/// (1 MiB payloads on 4 KiB pages are order 8 — the allocation the
+/// fragmented-cache ENOMEM names).
+pub fn pageOrder(payload_sz: u32, page: usize) u8 {
+    const pages = std.mem.alignForward(usize, payload_sz, page) / page;
+    return @intCast(std.math.log2_int_ceil(usize, @max(pages, 1)));
+}
 
 /// The 288 B ent headers, back to back, page-granular (what the kernel
 /// addresses at `fixed_buf_id × 288` under kmbuf; what the two REGISTER
@@ -96,8 +111,10 @@ pub const Kmbuf = struct {
 
     /// Setup order (porting spec §14.2): the fixed-buffer table (sparse
     /// `depth` slots under zc, the headers at `headersIndex`) → the kmbuf
-    /// ring (ENOMEM retry through `io`) → the region mmap.
-    pub fn setup(ring: *uring128.Ring128, io: Io, headers: *Headers, opcodes: abi.KmbufRegisterOpcodes, zero_copy: bool, payload_sz: u32, page: usize) Error!Kmbuf {
+    /// ring (ENOMEM retry through `io`; `test_enomem` is the
+    /// `SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM` seam: every attempt answers
+    /// ENOMEM without reaching the kernel) → the region mmap.
+    pub fn setup(ring: *uring128.Ring128, io: Io, headers: *Headers, opcodes: abi.KmbufRegisterOpcodes, zero_copy: bool, payload_sz: u32, page: usize, test_enomem: bool) Error!Kmbuf {
         const depth = headers.depth;
         const buf_size: u32 = @intCast(std.mem.alignForward(usize, payload_sz, page));
         const headers_index = zc.headersIndex(zero_copy, depth);
@@ -115,7 +132,8 @@ pub const Kmbuf = struct {
         var attempt: u8 = 0;
         var wait_ns = REGISTER_RETRY_BASE_NS;
         while (true) {
-            ring.registerBufRing(opcodes.register, reg) catch |e| {
+            const registered: errors.Error!void = if (test_enomem) error.OutOfMemory else ring.registerBufRing(opcodes.register, reg);
+            registered catch |e| {
                 if (e == error.OutOfMemory and attempt < REGISTER_RETRIES) {
                     attempt += 1;
                     register_retries.inc();
@@ -124,7 +142,11 @@ pub const Kmbuf = struct {
                     wait_ns = @min(wait_ns * 2, REGISTER_RETRY_MAX_NS);
                     continue;
                 }
-                log.err("transport: kmbuf ring registration refused ({s}): opcode {d}, bgid 0, buf_size {d}, entries {d}{s}", .{ @errorName(e), opcodes.register, buf_size, ring_entries, if (e == error.OutOfMemory) " — RLIMIT_MEMLOCK binds the process's CUMULATIVE pins (raise it or grant CAP_IPC_LOCK)" else "" });
+                if (e == error.OutOfMemory) {
+                    log.err("transport: kmbuf ring registration ENOMEM (order-{d} contiguous pages: {d} buffers × {d} B at bgid 0, opcode {d}) after {d} retries — the probe-decided buffer mode fails loud, never degrades (charter §3); retry, or SQUEEZEFS_FUSE_BUFFER_MODE=user (RLIMIT_MEMLOCK binds the process's CUMULATIVE pins: raise it or grant CAP_IPC_LOCK)", .{ pageOrder(payload_sz, page), ring_entries, buf_size, opcodes.register, attempt });
+                    return error.KmbufRingEnomem;
+                }
+                log.err("transport: kmbuf ring registration refused ({s}): opcode {d}, bgid 0, buf_size {d}, entries {d}", .{ @errorName(e), opcodes.register, buf_size, ring_entries });
                 return error.KmbufRegisterFailed;
             };
             break;
@@ -190,7 +212,7 @@ test "kmbuf setup on this kernel: the headers register at index 0 (BufRing) or d
         var h = try Headers.init(6, page);
         defer h.deinit();
         const before = pinned_bytes.load();
-        var k = try Kmbuf.setup(&ring, testing.io, &h, pair, zero_copy, 1 << 20, page);
+        var k = try Kmbuf.setup(&ring, testing.io, &h, pair, zero_copy, 1 << 20, page, false);
         try testing.expectEqual(@as(u32, 8), k.ring_entries);
         try testing.expectEqual(@as(u32, 1 << 20), k.buf_size);
         try testing.expectEqual(@as(u16, if (zero_copy) 6 else 0), k.headers_index);
@@ -206,4 +228,31 @@ test "kmbuf setup on this kernel: the headers register at index 0 (BufRing) or d
         k.teardown(&ring);
         try testing.expectEqual(before, pinned_bytes.load());
     }
+}
+
+test "pageOrder: 1 MiB on 4 KiB pages is order 8; a sub-page payload is order 0; a 64 KiB page halves the order" {
+    try testing.expectEqual(@as(u8, 8), pageOrder(1 << 20, 4096));
+    try testing.expectEqual(@as(u8, 0), pageOrder(4096, 4096));
+    try testing.expectEqual(@as(u8, 0), pageOrder(100, 4096));
+    try testing.expectEqual(@as(u8, 1), pageOrder(4097, 4096));
+    try testing.expectEqual(@as(u8, 4), pageOrder(1 << 20, 65536));
+}
+
+test "the ENOMEM seam: every attempt answers ENOMEM — the bounded ladder retries REGISTER_RETRIES times, the refusal is the typed KmbufRingEnomem naming the remedy, nothing is pinned, the table is released" {
+    const page: u32 = @intCast(std.heap.pageSize());
+    const verdict = probes.driver.probeKmbuf(page);
+    const pair = verdict.opcodes() orelse return error.SkipZigTest;
+    var ring = try uring128.Ring128.init(16, 0);
+    defer ring.deinit();
+    var h = try Headers.init(6, page);
+    defer h.deinit();
+    const before = pinned_bytes.load();
+    const retries_before = register_retries.load();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.KmbufRingEnomem, Kmbuf.setup(&ring, testing.io, &h, pair, true, 1 << 20, page, true));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(retries_before + REGISTER_RETRIES, register_retries.load());
+    try testing.expectEqual(before, pinned_bytes.load());
+    // The fixed-buffer table was released: a fresh sparse table registers.
+    try ring.registerBuffersSparse(1);
 }

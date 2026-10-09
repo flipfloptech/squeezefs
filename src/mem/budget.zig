@@ -785,16 +785,23 @@ pub const MemBudget = struct {
     /// authority). Returns whether THIS call spawned it. The tick runs on its
     /// own thread, never on a request worker: it does procfs reads plus every
     /// gauge call, precisely when the daemon is under memory pressure.
+    ///
+    /// The thread reads every registered source without a lock, so the
+    /// owner of a source must `stopSampler` (stop + JOIN) before freeing it;
+    /// the daemon spawns the sampler after its last mount-time registrant
+    /// and stops it first on every exit (`cli/mount.zig`).
     pub fn spawnSampler(self: *MemBudget, host: Host, period_ns: u64) std.Thread.SpawnError!bool {
         if (self.sampler_started.swap(true, .acq_rel)) return false;
-        self.sampler_thread = std.Thread.spawn(.{}, samplerMain, .{ self, host, period_ns }) catch |err| {
+        const tick_on_stop = knobs.boolKnob("SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP", host.env);
+        self.sampler_thread = std.Thread.spawn(.{}, samplerMain, .{ self, host, period_ns, tick_on_stop }) catch |err| {
             self.sampler_started.store(false, .release);
             return err;
         };
         return true;
     }
 
-    /// Stop and join the sampler (umount). Wakes the timed wait immediately.
+    /// Stop and join the sampler (umount). Wakes the timed wait immediately;
+    /// returns once the thread has exited, so no source is read after this.
     pub fn stopSampler(self: *MemBudget, io: std.Io) void {
         self.sampler_stop.set(io);
         if (self.sampler_thread) |t| {
@@ -803,7 +810,7 @@ pub const MemBudget = struct {
         }
     }
 
-    fn samplerMain(self: *MemBudget, host: Host, period_ns: u64) void {
+    fn samplerMain(self: *MemBudget, host: Host, period_ns: u64, tick_on_stop: bool) void {
         var name_buf: thread_name.CommBuf = undefined;
         _ = thread_name.nameCurrentThread(&name_buf, sampler_thread_name);
         const period: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(period_ns)), .clock = .awake } };
@@ -813,6 +820,10 @@ pub const MemBudget = struct {
             // bursts, ticks never overlap — the level ladder, the backstop
             // run and the shed pass are single-tick state machines).
             if (self.sampler_stop.waitTimeout(host.io, period)) |_| {
+                // The seam's final tick: every source read at the stop, so
+                // a teardown that freed one before stopping the sampler is
+                // caught on the dangling read instead of by timing.
+                if (tick_on_stop) self.tick(host);
                 return;
             } else |err| switch (err) {
                 error.Timeout => {},
@@ -1653,4 +1664,49 @@ test "sampler thread: idempotent spawn, ticks on its period, stops" {
     b.stopSampler(testing.io);
     try testing.expectEqual(1 * MiB, b.budgetBytes());
     try testing.expect(@backingInt(b.level()) <= 2);
+}
+
+/// A source that counts its reads (the seam's tick-at-stop contract).
+const CountingSource = struct {
+    reads: std.atomic.Value(u64) = .init(0),
+
+    fn current(ctx: *anyopaque) u64 {
+        const self: *CountingSource = @ptrCast(@alignCast(ctx));
+        _ = self.reads.fetchAdd(1, .monotonic);
+        return 0;
+    }
+};
+
+test "sampler thread: SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP reads every source exactly once more at the stop, after join nothing reads; absent, the stop reads nothing" {
+    const gpa = testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    // A budget no test process's RSS reaches: the tick stays Green, so the
+    // sum pass is the only read (Red's shed pass would read again).
+    try env.put("SQUEEZEFS_MEM_BUDGET_MB", "1048576");
+    // A period no test outlives: the only tick is the stop's.
+    const never: u64 = 3600 * std.time.ns_per_s;
+    {
+        var src: CountingSource = .{};
+        var b: MemBudget = .{};
+        b.register(Component.init("counting", 0, 0, .{ .func = .{ .ctx = &src, .call = CountingSource.current } }, null));
+        const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB) };
+        try testing.expect(try b.spawnSampler(host, never));
+        b.stopSampler(testing.io);
+        try testing.expectEqual(@as(u64, 0), src.reads.load(.monotonic));
+    }
+    try env.put("SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP", "1");
+    {
+        var src: CountingSource = .{};
+        var b: MemBudget = .{};
+        b.register(Component.init("counting", 0, 0, .{ .func = .{ .ctx = &src, .call = CountingSource.current } }, null));
+        const host = Host{ .io = testing.io, .env = &env, .facts = derive.Facts.synthetic(2, GiB) };
+        try testing.expect(try b.spawnSampler(host, never));
+        b.stopSampler(testing.io);
+        // The stop's tick ran (the budget published) and read the source once
+        // (one sum pass; Green sheds nothing); the join means no later read.
+        try testing.expectEqual(1048576 * MiB, b.budgetBytes());
+        try testing.expectEqual(Level.green, b.level());
+        try testing.expectEqual(@as(u64, 1), src.reads.load(.monotonic));
+    }
 }

@@ -190,6 +190,10 @@ pub const MetaSet = struct {
         // read-only (the single-writer class has no token plane).
         var posture: backend.Posture = if (opts.read_only and owned[disc.order[0]].symmetric) .reader else .manager;
         for (disc.order, 0..) |oi, vi| {
+            // The join door stands at volume 0 of a symmetric set opened
+            // with a join posture: its held flock is a normal join, not a
+            // refusal, and the open logs it so.
+            const join_door = vi == 0 and !opts.read_only and owned[oi].symmetric and opts.join != null;
             const be_opts: backend.OpenOptions = .{
                 .env = opts.env,
                 .pool = pool,
@@ -198,10 +202,11 @@ pub const MetaSet = struct {
                 .cpus = opts.cpus,
                 .test_error_logs = opts.test_error_logs,
                 .guard = opts.guard,
+                .join_door = join_door,
             };
             volumes[vi] = switch (posture) {
                 .manager => KvBackend.open(gpa, io, paths[oi], be_opts) catch |e| blk: {
-                    if (e != error.Busy or vi != 0 or opts.read_only or !owned[oi].symmetric or opts.join == null) return e;
+                    if (e != error.Busy or !join_door) return e;
                     // The D0 loser of a symmetric set: the join door.
                     posture = .joined;
                     rstats.routing_joined_opens.inc();

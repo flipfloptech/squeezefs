@@ -692,6 +692,15 @@ pub const Manager = struct {
         return self.readFourSlots(appender_id, slots);
     }
 
+    /// `write_foreign_page` (the recovery's `Recovering` / `Recovered`
+    /// writes): ANOTHER appender's page into both of its directory slots,
+    /// one barrier — the directory-first law for a page whose ring-side
+    /// slots this mount never writes.
+    pub fn writeForeignPage(self: *Manager, p: *page.Page) VerbError!void {
+        const slots = (try self.dirSlotsOf(p.appender_id)) orelse return error.Rejected;
+        return self.writeBothDirSlots(p, slots);
+    }
+
     /// Write `p` into BOTH directory slots (generations +1, +2), one
     /// barrier — the join's and the leave's law.
     fn writeBothDirSlots(self: *Manager, p: *page.Page, dir_slots: [2]u64) VerbError!void {

@@ -684,6 +684,9 @@ pub const Verbs = struct {
         // rung; here the entry carries what fits and drops the rest loud.
         const n_recs: usize = if (tails_enc.len > value_cap) 1 else 2;
         try self.control(recs[0..n_recs]);
+        // The frame screen's rule 2 reads the tails the entry just made
+        // durable (the RAM index follows the durable word).
+        if (n_recs == 2) try self.table.recordTails(req.slot, req.g, req.tails);
         self.seams.raiseRing0SeqFloor(self.seams.ctx, next.seq_floor);
         switch (try self.table.release(req.slot, req.appender_id, req.g, .{ .root = next.root, .cursor = next.cursor, .extents = next.slot_tree_extents, .seq_floor = next.seq_floor }, clock.monotonicNs())) {
             .released => {},

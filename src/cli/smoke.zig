@@ -1224,15 +1224,22 @@ test "smoke: THE N-DAEMON POSTURE, the manager half — format (the symmetric de
         // A Free page attests no identity (the leave clears it; the id and
         // term stay for the next joiner's continuation).
         try testing.expect(std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,\"node\":\"0000000000000000\",\"mount_slot\":0,\"writer_id\":\"0000000000000000\",\"state\":\"free\"") != null);
-        // C's region stays Live: its recovery over the real backend is the
-        // recovery driver's device binding (owed; the evidence note).
-        try testing.expect(std.mem.indexOf(u8, r.stdout, "\"appender_id\":2,\"node\":\"000000005a0e0002\",\"mount_slot\":20482,\"writer_id\":\"0000000000007002\",\"state\":\"live\"") != null);
+        // C's region was RECOVERED by A's ledger poll (the §5.9 driver over
+        // the real backend): its page is Recovered — or already Free, the
+        // poll's next tick having released a region no lease names.
+        const c_recovered = std.mem.indexOf(u8, r.stdout, "\"appender_id\":2,\"node\":\"000000005a0e0002\",\"mount_slot\":20482,\"writer_id\":\"0000000000007002\",\"state\":\"recovered\"") != null;
+        const c_released = std.mem.indexOf(u8, r.stdout, "\"appender_id\":2,\"node\":\"000000005a0e0002\",\"mount_slot\":20482,\"writer_id\":\"0000000000007002\",\"state\":\"free\"") != null;
+        try testing.expect(c_recovered or c_released);
     }
     {
         const tail = try rig.statsTail();
         defer gpa.free(tail);
         try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"membership_members\":"));
         try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"membership_evictions\":"));
+        // The closure `dead_members_acted ≡ recorded × regions held`: one
+        // death, one region on the one volume A manages.
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"dead_members_acted\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"appender_recoveries\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"manager_verb_refusals\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"joined_wire_words_rejected\":"));
         try testing.expectEqual(@as(?u64, 0), numberAfter(tail, "\"slot_lease_conflicts\":"));

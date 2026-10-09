@@ -600,17 +600,17 @@ pub fn testSmoBuildPause(t: *const KvTree, level: u8, is_root: bool, is_merge: b
 // ---------------------------------------------------------------------------
 
 /// Read `n`'s extent fresh from the device and verify it under
-/// `durable_tail` — the fold's on-disk source. The buffer outlives the
-/// loaded view (the caller releases both).
+/// `durable_tail` and `slot`'s frame screen — the fold's on-disk source.
+/// The buffer outlives the loaded view (the caller releases both).
 pub const Source = struct {
     buf: *snapshot.SharedBuf,
     loaded: node.LoadedNode,
 
-    pub fn load(cache: *NodeCache, addr: u64, durable_tail: u64) node_cache.LoadError!Source {
+    pub fn load(cache: *NodeCache, addr: u64, durable_tail: u64, slot: ?node_cache.ForestSlot) node_cache.LoadError!Source {
         const buf = try snapshot.SharedBuf.createExtent(cache.gpa, cache.cfg.layout.node_size);
         errdefer buf.release();
         try cache.loader.readExtent(cache.loader.ctx, addr, buf.data);
-        const loaded = try node.verifyNodeExtentScreened(cache.gpa, buf.data, cache.cfg.layout, addr, durable_tail, null, null);
+        const loaded = try node.verifyNodeExtentScreened(cache.gpa, buf.data, cache.cfg.layout, addr, durable_tail, cache.screenFor(slot, addr), null);
         return .{ .buf = buf, .loaded = loaded };
     }
 
@@ -800,13 +800,13 @@ const Build = struct {
     }
 };
 
-/// Write one successor image at `addr` and load it back as an unpublished
-/// node.
-pub fn writeSuccessor(cache: *NodeCache, params: node.NodeWriteParams, records: []const RecordRef, horizon: u64, pinned: bool) Error!*CachedNode {
-    var w = try node.writeNode(cache.gpa, cache.cfg.layout, params, records, horizon, null);
+/// Write one successor image at `addr` — its base frame stamped for
+/// `slot` — and load it back as an unpublished node of the slot.
+pub fn writeSuccessor(cache: *NodeCache, params: node.NodeWriteParams, records: []const RecordRef, horizon: u64, pinned: bool, slot: ?node_cache.ForestSlot) Error!*CachedNode {
+    var w = try node.writeNode(cache.gpa, cache.layoutFor(slot), params, records, horizon, null);
     defer w.deinit(cache.gpa);
     try cache.loader.writeImage(cache.loader.ctx, params.node_addr, w.image);
-    return tree.loadFresh(cache, params.node_addr, pinned);
+    return tree.loadFresh(cache, params.node_addr, pinned, slot);
 }
 
 /// The §4.6 three-step node replacement (module doc). `n` is FROZEN (its
@@ -827,7 +827,7 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
     const is_root = t.isRoot(n);
 
     // ---- P1: build successors from the frozen snapshot, no locks.
-    var src = try Source.load(cache, n.addr, durable_tail);
+    var src = try Source.load(cache, n.addr, durable_tail, t.forest_slot);
     defer src.deinit(gpa);
     const extra = try foldSourceExtra(cache, n, &src.loaded);
     defer {
@@ -875,7 +875,7 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
                 .level = n.level,
                 .min_key = min_key.slice(),
                 .max_key = max_key,
-            }, all_refs[off .. off + part.len], folded.horizon, pinned);
+            }, all_refs[off .. off + part.len], folded.horizon, pinned, t.forest_slot);
             errdefer succ.release();
             try build.successors.append(gpa, succ);
             off += part.len;
@@ -913,7 +913,7 @@ pub fn smoReplace(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *Maintenanc
             .level = n.level + 1,
             .min_key = n.min_key,
             .max_key = n.max_key,
-        }, sep_refs, folded.horizon, true);
+        }, sep_refs, folded.horizon, true, t.forest_slot);
     }
     ctx.images_written += build.successors.items.len + @intFromBool(build.new_root != null);
 
@@ -1708,7 +1708,7 @@ test "writeback_appends_then_compacts_then_splits: threshold appends never move 
     for (200..400) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
     const b = try vol.drain(t);
     try testing.expect(a.appends >= 1 and b.appends >= 1);
-    var src = try Source.load(vol.cache, t.rootPtr().addr, 0);
+    var src = try Source.load(vol.cache, t.rootPtr().addr, 0, t.forest_slot);
     defer src.deinit(gpa);
     try testing.expect(src.loaded.bsetCount() >= 2);
     try testing.expectEqual(root0, t.rootPtr());

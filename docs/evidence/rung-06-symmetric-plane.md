@@ -106,24 +106,15 @@ arms nothing on a reader; a malformed bind refuses by name.
   ship with B's kernel view invalidated, the `-o ro` C reader within `reader_staleness_bound_ms`,
   `kill -9 B` mid-`tar` → recovery → successor remount, `kill -9 A` → B PARKS-AND-RECLAIMS → a
   new manager) were NOT run. What ran is the manager half above.
-- **The recovery driver over the real backend.** `recovery.Driver` has only the RAM `Volume`
-  seam; the ledger poll runs in the daemon with NO volume hooks (it drains parked death records
-  and retires expired ones; `dead_members_acted` stays 0). A dead joiner's region stays `Live`
-  (the smoke shows C's) until the 25-function device `Volume` (the dead ring's window read,
-  the structural-class replay under stamps, the writer-legal root install, leaf tails, orphan
-  images) is bound.
-- **The frame screen through the loaders — BOTH halves together.** Every product frame is still
-  written with the layout's `(0, 0)` stamp (`node_cache.freezeLocked` takes the cache's one
-  `NodeLayout`), and `node_cache.loadLeader` / `buildNode` / `smo.Source.load` call
-  `verifyNodeExtentScreened(…, null, …)`. The load path DOES carry the slot
-  (`KvTree.loadForSlot(addr, forest_slot)` → `loadLeader(addr, slot)`), so the screen half is a
-  `FrameScreenSeam` on the cache the slot plane installs at its arm (`ScreenSource.screenFor(slot,
-  recorded_tail)` with a RAM index of tree 0's `slot_tails`); the stamp half is a per-slot
-  `layout.stamped(FrameStamps.stampFor(slot))` at every freeze (the flusher's and the SMO's).
-  They must land in ONE change under the priming law (`fencing.FrameStamps.prime` at the first
-  frame writer): a screen armed over `(0, 0)` frames is inert until the first release records a
-  tail, after which rule 2 would end a leased leaf's log at the stale stamp — the acked-writes loss
-  class the law exists for. Deliberately not half-done here.
+- ~~**The recovery driver over the real backend.**~~ **Landed 2026-10-08** (see "Landed after
+  this note" below): `membership/volume_bind.zig` binds the 27-function `Volume` seam to a
+  `KvBackend`; `wire_plane` installs one binding per managed volume as the ledger poll's hooks
+  and the set-level roll-forward.
+- ~~**The frame screen through the loaders — BOTH halves together.**~~ **Landed 2026-10-08**
+  under the priming law (below): `node_cache.FrameSeam` ← `fencing.FramePlane`, installed at
+  `slots/plane.Plane.init` — BEFORE the claim gate's ring-recovery preflight — every loader
+  (`loadLeader`, `buildNode`/`loadFresh`, `smo.Source.load`, `KvTree.open`, the backend's tree
+  walks) screens by slot and every frame writer (`appendFrozen`, `writeSuccessor`) stamps by slot.
 - **The planes' device-path arms** (`LeaseArm`/`GrantSource`/`Shipper` into `data/plane.zig`,
   the Checkpointer's `PageWriteSet` for KVDA pages, the journal-lane drainer fiber, the free-ship
   and grace binding): the data plane still allocates from its ledger-seeded allocators; the token
@@ -138,9 +129,59 @@ arms nothing on a reader; a malformed bind refuses by name.
   `setfattr -n user.squeezefs.stripes` flip), the foreign-slot LAYOUT publish at the data
   plane's publish site, `SupplyStripeInos` over the wire, a foreign holder's wire session in
   `set_bind` (resolves `unreachable_` = EAGAIN).
-- **`appender clear` end to end** on a dead joiner's region (the verb exists; its smoke leg needs
-  the recovery driver's device binding).
+- **`appender clear` end to end** on a dead joiner's region: the verb's two durable effects (the
+  page `Recovering{term 0}`, the EARLY record) are exactly the states the real-backend kill matrix
+  recovers (rows `page_recovering` and the early row below); the SMOKE leg over the built binary
+  (`appender clear` → the next mount's poll) waits on the joined daemon's `mount B`.
 - From earlier waves, unchanged: the paged-resident dentry set, the in-place join of a
-  fail-stopped quiescent reader, `slot_tails` past the inline cap, the dead recoverer's stashed
-  interior records, the un-share protocol; mTLS, the nvmet PR legs and fsck C13–C17 as full checks
-  are rung 8's.
+  fail-stopped quiescent reader, `slot_tails` past the inline cap (a spilled set screens by the
+  lease alone), the dead recoverer's stashed interior records, the un-share protocol; the data
+  namespaces' registrants in the death preempt (the data planes' device arm); mTLS, the nvmet PR
+  legs and fsck C13–C17 as full checks are rung 8's.
+
+## Landed after this note (2026-10-08): the frame screen with its stamps, and recovery over the real backend
+
+**The frame plane** (`fencing.FramePlane`, `node_cache.FrameSeam`; charter §5.5 "Fencing";
+0002 rows 284–285). ONE source for both halves — the lease table: a frame on a slot-tree node
+carries `(lessee, g)` for a live lease and the manager's structural `(0, g)` on an unleased slot
+or a `Releasing{dead}` one mid-recovery; a slot-tree load screens with the slot's `(g, lessee)`,
+the recorded tail of the leaf (tree 0's `slot_tails`, indexed in the table — loaded at the prime,
+replaced at every release and at the recovery's tree-0 step) and the Recovering suspension. The
+**priming law**: `Plane.init` (step 9 of the mount ladder, before `coverBringUpResidue`) loads
+tree 0's population into the table, computes the manager's overrides (a re-adopted `Leased{0, g}`
+at `g`, an `Unleased` native slot at the arm's `g + 1`) and installs the seam; the arm retires the
+overrides. A stamp asked unprimed is the `appender_unstamped_frame` tripwire. Pinned:
+
+| Test (`volume_bind.zig`, Linux; `fencing.zig`, portable) | Observed on the venue |
+|---|---|
+| the one-writer forest | slot 3's leaves: every frame `(0, g₃)`, tree 0 and the table agreeing on `g₃`; the native leaf: `format`'s `(0, 0)` base then `(0, g)` — monotone; the remount screens nothing |
+| THE PRIMING LAW, red then green | the kill image opened with `fencing.test_unprimed_first_writer`: the tripwire fires, the preflight writes `(0, 0)` over slot 3's `(0, 1)`; the NEXT mount ends the log there by rule 3 (4 acked records of the window gone, `foreign_frames_screened` +1) — the loss class found twice; the same image opened primed keeps all 8 and screens nothing |
+| two regions | B's handover frames `(1, g + 1)` behind A's `(0, g)`; A's loader over B's current frames (the slot's nodes discarded, reloaded) screens nothing; after B's release recorded the tail a zombie `(1, g + 1)` frame at the leaf's tail is screened by rule 2 — the zombie's record never served, every earlier one present |
+| the frame plane (portable) | overrides until the arm, `(holder, g)` / `(0, g)` by lease state, the suspension nulls rule 4, the tail index per leaf, a later release replaces the slot's set |
+
+**Recovery over the real backend** (`membership/volume_bind.zig`). The driver's `Volume` seam
+bound to a `KvBackend`: the dead page over the cached directory chain (four slots, newest-valid),
+`writeForeignPage` for `Recovering`/`Recovered`, the ring as ONE logical image over its segment
+table scanned by `journal.replayScanImage` ≥ `ledger_tail_seq` (every record a window record by
+handle), tree 0 through the control tree, `discardSlotNodes` + the writer-legal install at ring
+0's head (the root node's seq verified against the pointer), the two-phase replay floored at ring
+0's head (the frames the flush writes stamped `(0, g)` off the dead mark), the data-bitmap fold
+onto the dead holder's pages through its refs, `checkpointNow` cycles until no node of the slot is
+dirty (`COVER_CYCLES_MAX`), the tails of every leaf (non-resident ones loaded and counted; resident
+only under a device fence), the extents census, the returns through the manager's own verb (RAM
+bits released), the orphan census flooring the node-seq handle, the RAM custody quarantine, the
+released region's ring back to the heap AFTER its page went Free. `wire_plane` binds one
+`VolumeBinding` per managed volume as the projection's hooks and `xv.ops.Plane.rollForwardRecovered`
+as its roll-forward, so the manager's ledger poll (the reclaim cadence's tick) recovers a dead
+member whose region is on its volumes. Pinned (the venue, debug, file-backed 64 MiB volume):
+
+| Test | Observed |
+|---|---|
+| a dead in-process region recovered by the manager's poll | region 1 (slot 700, 24 records, one unpublished grant claim) killed Live; the copy mounted: `unrecovered = [1]`, a tick before the record acts on nothing; the record + one tick: `appender_recoveries` +1, `dead_members_acted` +1, the page `Recovered{n_slots 0, head_hint = ledger_tail_seq, recovered_by_term = the manager's}`, all 24 records readable, tree 0 `Unleased{root = the tree's, cursor ≥ 1024, g}` + `slot_tails` (the table's index agrees), the orphan returned (`dead_appender_orphans` +1, its bit clear), the grant record's remaining extents all allocated images, `recovered:{1, 0}` standing, the bound gauge = `recoveryBoundMs(512 KiB, 64 KiB)` and the run inside it; the next tick replays nothing and releases the region (page `Free`, term kept, ring to the heap); a remount: nothing unrecovered, every record durable |
+| every crash window (13 steps) | each step's failure rolls back (`appender_recovery_rollbacks` +1), the page `Live` before step 2, `Recovering` through the returns, `Recovered` after; the re-run converges with every record readable and the slot `Unleased`; the early record (the `flush` row) quarantines slot 700's custody durably and in RAM; a third poll replays nothing and frees the page |
+| the data-bitmap deltas | a dead holder's `alloc_lease:` homed here with pages in its grant; one SET run of three blocks in its ring; the fold writes one page; the pages read back with exactly those bits set; the region stays `Recovered` while the lease names the holder |
+
+Not in this delivery: the smoke's `kill -9 B` row (a second daemon's region recovered by A's
+poll) and the `appender clear` smoke leg wait on the joined daemon; the data namespaces' preempt
+rides the data planes' device arm; a `Volume` over a JOINED backend is the joined wave's (a joiner
+recovers nothing: the ledger is the manager's).

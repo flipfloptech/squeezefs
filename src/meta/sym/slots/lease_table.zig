@@ -150,6 +150,22 @@ pub const Cold = struct {
     handover_at_ns: u64 = 0,
 };
 
+/// One leaf's recorded log tail for generation `g` (tree 0's `slot_tails`
+/// as the frame screen's rule 2 reads it): a frame of `g` (or older) at or
+/// past `tail` is a stale lessee's.
+pub const RecordedTail = struct { g: u32, tail: u32 };
+
+/// One slot's recorded set: the generation the release recorded and
+/// every leaf's tail.
+const SlotTailSet = struct {
+    g: u32,
+    by_leaf: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+
+    fn deinit(self: *SlotTailSet, gpa: Allocator) void {
+        self.by_leaf.deinit(gpa);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Outcomes.
 // ---------------------------------------------------------------------------
@@ -181,6 +197,10 @@ pub const LeaseTable = struct {
     /// The manager's lease seq: +1 per release — `last_written`'s clock.
     lease_seq: u64 = 0,
     leased_count: std.atomic.Value(u64) = .init(0),
+    /// The RAM index of tree 0's `slot_tails` (per slot: the release's
+    /// generation and every leaf's tail; a release REPLACES the set): the
+    /// frame screen's rule 2 input, read on the load miss path.
+    tails: std.AutoHashMapUnmanaged(u16, SlotTailSet) = .empty,
 
     pub fn init(gpa: Allocator) Allocator.Error!*LeaseTable {
         const self = try gpa.create(LeaseTable);
@@ -196,8 +216,49 @@ pub const LeaseTable = struct {
         while (it.next()) |l| l.deinit(self.gpa);
         self.held.deinit(self.gpa);
         self.cold.deinit(self.gpa);
+        var tt = self.tails.valueIterator();
+        while (tt.next()) |t| t.deinit(self.gpa);
+        self.tails.deinit(self.gpa);
         self.gpa.free(self.cells);
         self.gpa.destroy(self);
+    }
+
+    // ---- the recorded tails (rule 2's input) ----
+
+    /// A release (or a recovery, or the arm's load of tree 0) recorded the
+    /// tails of `slot`'s leaves for generation `g`: the slot's previous
+    /// set is REPLACED (the newer release supersedes; a leaf absent from
+    /// the new set was compacted away and its old tail is moot). The new
+    /// set is built outside the lock and swapped in.
+    pub fn recordTails(self: *LeaseTable, slot: u16, g: u32, tails: []const cr.TailEntry) Allocator.Error!void {
+        var fresh: SlotTailSet = .{ .g = g };
+        errdefer fresh.deinit(self.gpa);
+        try fresh.by_leaf.ensureTotalCapacity(self.gpa, @intCast(tails.len));
+        for (tails) |t| fresh.by_leaf.putAssumeCapacity(t.leaf_addr, t.tail);
+        self.lock.lock();
+        // Growth of the per-slot map is the one allocation under the lock
+        // (a release-time control act; the hot cells never touch it).
+        self.tails.ensureUnusedCapacity(self.gpa, 1) catch |e| {
+            self.lock.unlock();
+            return e;
+        };
+        const prev = self.tails.fetchRemove(slot);
+        self.tails.putAssumeCapacity(slot, fresh);
+        self.lock.unlock();
+        if (prev) |p| {
+            var old = p.value;
+            old.deinit(self.gpa);
+        }
+    }
+
+    /// The recorded tail of `slot`'s leaf at `leaf_addr` (null = no
+    /// release ever recorded one for this leaf).
+    pub fn recordedTail(self: *LeaseTable, slot: u16, leaf_addr: u64) ?RecordedTail {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const set = self.tails.getPtr(slot) orelse return null;
+        const tail = set.by_leaf.get(leaf_addr) orelse return null;
+        return .{ .g = set.g, .tail = tail };
     }
 
     // ---- the latch-free reads ----

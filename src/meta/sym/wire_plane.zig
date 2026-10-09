@@ -73,6 +73,7 @@ const membership = @import("membership.zig");
 const shard = membership.shard;
 const death_ledger = membership.death_ledger;
 const join_ladder = membership.join_ladder;
+const volume_bind = membership.volume_bind;
 const tokens = @import("tokens.zig");
 const xv = @import("xv.zig");
 const dir_rename = xv.dir_rename;
@@ -161,6 +162,9 @@ pub const WirePlane = struct {
     ledger: death_ledger.Ledger,
     ledger_handlers: death_ledger.LedgerHandlers,
     projection: death_ledger.Projection,
+    bindings: []*volume_bind.VolumeBinding,
+    hooks: []death_ledger.VolumeHook,
+    roll_forward: volume_bind.RollForwardBinding,
     source: SetRecordSource,
     holder: tokens.table.Holder,
     oracle: OwnerOracle,
@@ -226,6 +230,9 @@ pub const WirePlane = struct {
             .ledger = undefined,
             .ledger_handlers = undefined,
             .projection = undefined,
+            .bindings = &.{},
+            .hooks = &.{},
+            .roll_forward = .{ .plane = xv_plane },
             .source = .{ .set = set },
             .holder = undefined,
             .oracle = .{ .plane = self },
@@ -266,7 +273,21 @@ pub const WirePlane = struct {
         self.owner.bindDeathSink(self.ledger.deathSink());
         self.owner_svc = .{ .owner = &self.owner, .now = &nowMsFn };
         self.ledger_handlers = .{ .ledger = &self.ledger, .census = &self.owner, .now = &nowMsFn, .is_vol0_manager = &isVol0ManagerFn, .now_ctx = self };
-        self.projection = .{ .ledger = &self.ledger, .volumes = &.{}, .vol_tags = &.{} };
+        const bindings = try gpa.alloc(*volume_bind.VolumeBinding, n_faces);
+        errdefer gpa.free(bindings);
+        const hooks = try gpa.alloc(death_ledger.VolumeHook, n_faces);
+        errdefer gpa.free(hooks);
+        var n_bound: usize = 0;
+        errdefer for (bindings[0..n_bound]) |b| b.destroy();
+        for (set.volumes) |be| {
+            if (be.sym == null) continue;
+            bindings[n_bound] = try volume_bind.VolumeBinding.create(gpa, be, &self.ledger, &self.owner, clocks.skew_max_ms);
+            hooks[n_bound] = bindings[n_bound].hook();
+            n_bound += 1;
+        }
+        self.bindings = bindings;
+        self.hooks = hooks;
+        self.projection = .{ .ledger = &self.ledger, .volumes = hooks[0..n_bound], .vol_tags = &.{}, .roll_forward = self.roll_forward.seam() };
         // The token holder over this daemon's trees.
         self.holder = tokens.table.Holder.init(gpa, io, identity.writer_id, self.oracle.oracle(), TOKEN_OBJECTS_CAP, listener.deriveMaxConnections(raw_cpus, listener.raiseNofile())) catch return error.OutOfMemory;
         errdefer self.holder.deinit();
@@ -312,6 +333,9 @@ pub const WirePlane = struct {
         stats.wire_listener_connections.set(0);
         self.divert.deinit();
         self.holder.deinit();
+        for (self.bindings) |b| b.destroy();
+        self.gpa.free(self.bindings);
+        self.gpa.free(self.hooks);
         self.ledger.deinit();
         self.owner.deinit();
         self.gpa.free(self.faces.ptr[0..self.set.volumes.len]);
@@ -320,6 +344,14 @@ pub const WirePlane = struct {
 
     pub fn endpointText(self: *const WirePlane) []const u8 {
         return self.endpoint_buf[0..self.endpoint_len];
+    }
+
+    pub fn recoveryBinding(self: *WirePlane, vol: usize) ?*volume_bind.VolumeBinding {
+        return if (vol < self.bindings.len) self.bindings[vol] else null;
+    }
+
+    pub fn deathLedger(self: *WirePlane) ?*death_ledger.Ledger {
+        return &self.ledger;
     }
 
     /// The cadence (the reclaim fiber's tick): the shard's eviction at

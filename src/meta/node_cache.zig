@@ -276,6 +276,25 @@ pub const LeaseGate = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// The frame seam (charter §5.5 "Fencing"): BOTH halves of the detection-
+// grade frame screen from ONE source the slot plane installs at its prime
+// — the screen a slot-tree load applies (rules 1–4 over the slot's lease
+// generation, lessee, recorded tail and the Recovering suspension) and the
+// stamp `(appender_id, g)` every frame a slot-tree node writes carries.
+// Absent (a flat volume, the contracts): every load is rule 3 alone and
+// every frame the structural `(0, 0)`.
+// ---------------------------------------------------------------------------
+
+pub const FrameSeam = struct {
+    ctx: *anyopaque,
+    /// The screen for a leaf of `slot` at `addr` (null = no lease plane
+    /// for the slot: rule 3 alone).
+    screenFor: *const fn (ctx: *anyopaque, slot: ForestSlot, addr: u64) ?node.FrameScreen,
+    /// The stamp the next frame on a node of `slot` carries.
+    stampFor: *const fn (ctx: *anyopaque, slot: ForestSlot) node.FrameStamp,
+};
+
 /// A callback with context (the checkpoint kick the budget shed drives).
 pub const Hook = struct {
     ctx: *anyopaque,
@@ -1410,6 +1429,9 @@ pub const NodeCache = struct {
     /// and the mutation gates.
     env: epoch_core.NodeEnv,
     lease: LeaseGate = .unarmed,
+    /// The frame screen's and stamp's ONE source (installed at the slot
+    /// plane's prime, BEFORE the first frame writer of the open).
+    frames: ?FrameSeam = null,
     /// The min `dirty_floor` of every node whose mapping LEFT this cache
     /// since the checkpoint task last drained it: a floor that dies with
     /// its mapping would otherwise let the ledger tail sail past un-covered
@@ -1493,6 +1515,29 @@ pub const NodeCache = struct {
 
     pub fn installLeaseGate(self: *NodeCache, gate: LeaseGate) void {
         self.lease = gate;
+    }
+
+    /// The frame seam: once, at the slot plane's prime — every frame
+    /// writer and every slot-tree load of the open read it from here on.
+    pub fn installFrameSeam(self: *NodeCache, seam: FrameSeam) void {
+        self.frames = seam;
+    }
+
+    /// The layout a frame on a node of `slot` is written with: the
+    /// volume's, stamped by the seam for a slot-tree node; the structural
+    /// `(0, 0)` for the control tree and on a volume with no plane.
+    pub fn layoutFor(self: *const NodeCache, slot: ?ForestSlot) NodeLayout {
+        const s = slot orelse return self.cfg.layout;
+        const f = self.frames orelse return self.cfg.layout;
+        return self.cfg.layout.stamped(f.stampFor(f.ctx, s));
+    }
+
+    /// The screen a load of `slot`'s node at `addr` applies (null = rule 3
+    /// alone).
+    pub fn screenFor(self: *const NodeCache, slot: ?ForestSlot, addr: u64) ?node.FrameScreen {
+        const s = slot orelse return null;
+        const f = self.frames orelse return null;
+        return f.screenFor(f.ctx, s, addr);
     }
 
     pub fn installCheckpointKick(self: *NodeCache, hook: Hook) void {
@@ -1712,7 +1757,7 @@ pub const NodeCache = struct {
             errdefer buf.release();
             stats.meta_kv_node_cache_loads.inc();
             try self.loader.readExtent(self.loader.ctx, addr, buf.data);
-            loaded = node.verifyNodeExtentScreened(gpa, buf.data, layout, addr, snap.tail, null, null) catch |e| {
+            loaded = node.verifyNodeExtentScreened(gpa, buf.data, layout, addr, snap.tail, self.screenFor(slot, addr), null) catch |e| {
                 // A reader's whole-extent read can race the writer's
                 // single `write_at` append and see a torn frame followed
                 // by a complete one; bounded re-reads close the window.
@@ -1807,12 +1852,15 @@ pub const NodeCache = struct {
     }
 
     /// Verify a full extent image the caller holds (an SMO successor's
-    /// freshly written image, a test's hand-built node) and build the node
-    /// for it — NOT published; `publish` maps it. Consumes `buf`.
-    pub fn buildNode(self: *NodeCache, addr: u64, buf: *SharedBuf, pinned: bool) LoadError!*CachedNode {
+    /// freshly written image, a test's hand-built node) under `slot`'s
+    /// screen and build the node for it — stamped with the slot, NOT
+    /// published; `publish` maps it. Consumes `buf`.
+    pub fn buildNode(self: *NodeCache, addr: u64, buf: *SharedBuf, pinned: bool, slot: ?ForestSlot) LoadError!*CachedNode {
         errdefer buf.release();
-        const loaded = try node.verifyNodeExtentScreened(self.gpa, buf.data, self.cfg.layout, addr, self.env.epoch.tail(), null, null);
-        return CachedNode.fromLoaded(self, loaded, buf, pinned);
+        const loaded = try node.verifyNodeExtentScreened(self.gpa, buf.data, self.cfg.layout, addr, self.env.epoch.tail(), self.screenFor(slot, addr), null);
+        const n = try CachedNode.fromLoaded(self, loaded, buf, pinned);
+        if (slot) |s| n.stampForestSlot(s);
+        return n;
     }
 
     // ---- publish / retire / evict ----
@@ -1926,7 +1974,10 @@ pub const NodeCache = struct {
     /// (RAM only); the device write runs with no lock held.
     pub fn appendFrozen(self: *NodeCache, n: *CachedNode) AppendError!bool {
         const gpa = self.gpa;
-        const layout = self.cfg.layout;
+        // The frame's stamp is the slot's `(lessee, g)` at THIS write (a
+        // per-write copy of the layout: the lease may have moved since
+        // the freeze).
+        const layout = self.layoutFor(n.forestSlot());
         const io = self.io;
         var plan: node.AppendFrame = undefined;
         var tail: usize = 0;
@@ -2016,6 +2067,58 @@ pub const NodeCache = struct {
             }
         }
         return out;
+    }
+
+    // ---- the recovery's cache barrier (charter §5.5 "Death and recovery") ----
+
+    /// Drop every mapping of `slot`'s nodes, DIRTY ONES INCLUDED — the
+    /// recovery's cache barrier before a root install (a stale image would
+    /// fold the dead window onto a base missing the lessee's flushed
+    /// bsets; a wire lessee appends into node IMAGES under an unchanged
+    /// root pointer) and its rollback's discard (the records a failed
+    /// replay folded are the dead ring's, kept by its `Recovering` page
+    /// and folded again by the re-run). No dying floor is noted: the
+    /// dropped records never rode ring 0. Answers the mappings dropped.
+    pub fn discardSlotNodes(self: *NodeCache, slot: ForestSlot) u64 {
+        var victims: std.ArrayListUnmanaged(*CachedNode) = .empty;
+        defer victims.deinit(self.gpa);
+        const Collect = struct {
+            list: *std.ArrayListUnmanaged(*CachedNode),
+            slot: ForestSlot,
+            fn visit(c: @This(), n: *CachedNode) void {
+                if (n.forestSlot() != c.slot) return;
+                c.list.append(n.cache.gpa, n.retain()) catch n.release();
+            }
+        };
+        self.forEachNode(Collect{ .list = &victims, .slot = slot }, Collect.visit);
+        var dropped: u64 = 0;
+        for (victims.items) |n| {
+            defer n.release();
+            // Superseded: a holder's later apply fails revalidation and
+            // re-resolves through the installed root.
+            _ = n.state.supersede() catch {};
+            if (self.mapRemoveIf(n.addr, n) catch false) {
+                self.cached_bytes.sub(self.cfg.layout.node_size);
+                _ = self.mapped.fetchSub(1, .monotonic);
+                dropped += 1;
+            }
+        }
+        return dropped;
+    }
+
+    /// Does any mapped node of `slot` carry un-durable RAM records? The
+    /// recovery cycles until none does.
+    pub fn slotHasDirty(self: *NodeCache, slot: ForestSlot) bool {
+        const Probe = struct {
+            slot: ForestSlot,
+            dirty: *bool,
+            fn visit(p: @This(), n: *CachedNode) void {
+                if (n.forestSlot() == p.slot and n.dirtyFloor() != no_floor) p.dirty.* = true;
+            }
+        };
+        var dirty = false;
+        self.forEachNode(Probe{ .slot = slot, .dirty = &dirty }, Probe.visit);
+        return dirty;
     }
 
     // ---- the memory budget component ----
@@ -3238,7 +3341,7 @@ test "publish over a NON-CLEAN mapping is loud and folds its floor into the dyin
     // from the device image and published over the stale mapping).
     const img = try SharedBuf.createExtent(testing.allocator, NODE_SIZE);
     @memcpy(img.data, vol.ram.bytes[0..NODE_SIZE]);
-    const second = try vol.cache.buildNode(Vol.addrOf(0), img, false);
+    const second = try vol.cache.buildNode(Vol.addrOf(0), img, false, null);
     defer second.release();
     log.testing.expectErrorLogs(1);
     try vol.cache.publish(second);
@@ -3254,7 +3357,7 @@ test "publish over a NON-CLEAN mapping is loud and folds its floor into the dyin
     // Publishing over a CLEAN mapping is quiet.
     const img2 = try SharedBuf.createExtent(testing.allocator, NODE_SIZE);
     @memcpy(img2.data, vol.ram.bytes[0..NODE_SIZE]);
-    const third = try vol.cache.buildNode(Vol.addrOf(0), img2, false);
+    const third = try vol.cache.buildNode(Vol.addrOf(0), img2, false, null);
     defer third.release();
     try vol.cache.publish(third);
     try testing.expect(second.state.isSuperseded());

@@ -1291,7 +1291,7 @@ pub const KvBackend = struct {
         try stack.append(gpa, t.rootPtr().addr);
         while (stack.pop()) |addr| {
             try out.append(gpa, be.cache.addrExtent(addr));
-            const n = be.cache.get(addr) catch |e| return switch (e) {
+            const n = t.getNode(addr) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
                 else => error.Corrupt,
@@ -1323,7 +1323,7 @@ pub const KvBackend = struct {
         defer stack.deinit(gpa);
         try stack.append(gpa, t.rootPtr().addr);
         while (stack.pop()) |addr| {
-            const n = be.cache.get(addr) catch |e| return switch (e) {
+            const n = t.getNode(addr) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Io => error.Io,
                 else => error.Corrupt,

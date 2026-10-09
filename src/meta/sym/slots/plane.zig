@@ -43,6 +43,7 @@ const acquire = slots.acquire;
 const handover = slots.handover;
 const page_budget = slots.page_budget;
 const resolve = slots.resolve;
+const fencing = @import("../membership/fencing.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("sym/slots/plane is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -87,8 +88,14 @@ pub const Plane = struct {
     /// The region ids this process holds (the own seam reads it latch-free).
     own_ids: [8]std.atomic.Value(u32) = @splat(.init(0)),
     own_n: std.atomic.Value(u8) = .init(1),
+    /// The frame screen's and stamp's ONE source over the table, PRIMED
+    /// here — before the open's first frame writer (the ring-recovery
+    /// preflight inside the claim gate) — and installed into the cache.
+    frames: fencing.FramePlane,
 
-    pub fn init(gpa: Allocator, io: Io, be: *KvBackend, env: *const std.process.Environ.Map) Allocator.Error!*Plane {
+    pub const InitError = error{ OutOfMemory, Io, Corrupt };
+
+    pub fn init(gpa: Allocator, io: Io, be: *KvBackend, env: *const std.process.Environ.Map) InitError!*Plane {
         const self = try gpa.create(Plane);
         errdefer gpa.destroy(self);
         const table = try lt.LeaseTable.init(gpa);
@@ -106,11 +113,83 @@ pub const Plane = struct {
             .t_idle_ns = t_idle_ns,
             .cooldown_ns = cooldown_ns,
             .affinity_mib = knobs.optIntKnob("SQUEEZEFS_SYM_AFFINITY_MAX_MB", u64, env),
+            .frames = fencing.FramePlane.init(gpa, table, be.stamp.native_slot),
         };
+        errdefer self.frames.deinit();
         self.seam.hold = std.meta.stringToEnum(handover.Hold, knobs.enumKnob("SQUEEZEFS_TEST_HANDOVER_HOLD", env)) orelse .off;
         self.door = .{ .table = table, .io = io, .armed = false, .hosted = .{ .ctx = self, .hosts = hostsFn }, .foreign_touch = .{ .ctx = self, .note = foreignTouchFn }, .t_idle_ns = t_idle_ns };
         self.cache = resolve.SlotHolderCache.init(gpa, table, self, ownsFn);
+        // The priming law (charter §5.5 "Every writer's open primes its
+        // frame stamps at its FIRST frame writer"): on a symmetric volume
+        // the seam is in the cache before the preflight can flush a frame.
+        if (be.sb.symmetricPlaneStamped()) try self.primeFrames();
         return self;
+    }
+
+    /// `prime_frame_stamps`: tree 0's `slot_state` population into the
+    /// table and its `slot_tails` into the recorded-tail index, the
+    /// manager's stamp overrides (a re-adopted `Leased{0, g}` stamps `g`,
+    /// an `Unleased` native slot the arm's `g + 1`), the seam installed.
+    /// The test seam `fencing.test_unprimed_first_writer` reproduces the
+    /// reference's loss class by leaving the writer unprimed until the arm.
+    fn primeFrames(self: *Plane) InitError!void {
+        const be = self.be;
+        const gpa = self.gpa;
+        const control = be.trees.find(.control) orelse return error.Corrupt;
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        const states = cr.rangeOf(.slot_state);
+        control.range(gpa, states.start.slice(), states.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(gpa);
+        var native_unleased: [1]u16 = undefined;
+        var n_native: usize = 0;
+        for (kvs.items) |kv| {
+            const slot = cr.slotOfKey(kv.key) orelse continue;
+            const s = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
+            try self.table.load(slot, s);
+            if (s.variant != .unleased and s.appender_id == journal.FIXED_RING_APPENDER) try held.append(gpa, slot);
+            if (s.variant == .unleased and be.stamp.native_slot == slot) {
+                native_unleased[0] = slot;
+                n_native = 1;
+            }
+        }
+        // A native slot tree 0 never recorded is the arm's first grant at
+        // g + 1 over the table's 0 — the same word.
+        if (n_native == 0) if (be.stamp.native_slot) |ns| {
+            if (self.table.view(ns).state == .unleased) {
+                native_unleased[0] = ns;
+                n_native = 1;
+            }
+        };
+        tree.deinitKeyValues(gpa, &kvs);
+        kvs = .empty;
+        const tails = cr.rangeOf(.slot_tails);
+        control.range(gpa, tails.start.slice(), tails.end.slice(), std.math.maxInt(usize), &kvs) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io => error.Io,
+            else => error.Corrupt,
+        };
+        var entries: std.ArrayList(cr.TailEntry) = .empty;
+        defer entries.deinit(gpa);
+        for (kvs.items) |kv| {
+            const slot = cr.slotOfKey(kv.key) orelse continue;
+            const d = cr.decodeSlotTails(kv.value) catch return error.Corrupt;
+            // A spilled set is the leave's/recovery's rung (`slot_tails`
+            // past the inline cap stays owed); its leaves screen by the
+            // lease alone.
+            if (d.spilled) continue;
+            entries.clearRetainingCapacity();
+            var i: usize = 0;
+            while (i < d.count) : (i += 1) try entries.append(gpa, d.tailEntryAt(i));
+            try self.table.recordTails(slot, d.g, entries.items);
+        }
+        if (!fencing.test_unprimed_first_writer.load(.acquire)) try self.frames.prime(held.items, native_unleased[0..n_native]);
+        be.cache.installFrameSeam(self.frames.seam());
     }
 
     /// Before the backend's task and lane go: the cadence's flight joined
@@ -126,6 +205,7 @@ pub const Plane = struct {
         self.cache.deinit();
         self.judge.deinit();
         self.publications.deinit(self.gpa);
+        self.frames.deinit();
         self.table.deinit();
         self.gpa.destroy(self);
     }
@@ -422,6 +502,10 @@ pub const Plane = struct {
         self.judge.seed(COLD_BARRIER_NS, COLD_SHIP_NS);
         slots.stats.slot_leases_held.add(self.table.leasedCount());
         self.gauge_counted = true;
+        // The frame plane: the device fence decides rule 1/4's class; the
+        // prime's overrides retire now that the table holds every lease.
+        self.frames.setFenced(if (be.guard) |g| g.prClient() != null else false);
+        self.frames.noteArmed();
         log.info("meta volume {s}: slot leases armed — M {d}, A_max {d} B, {d} leases held, T_idle {d} ms, N_floor {d}", .{ be.path, m, a_max, self.table.leasedCount(), self.t_idle_ns / std.time.ns_per_ms, self.judge.nFloorNow() });
     }
 

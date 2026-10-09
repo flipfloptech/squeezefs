@@ -776,6 +776,20 @@ pub fn Plane(comptime Store: type) type {
             stats.xv_recovered.inc();
         }
 
+        /// A dead appender's recovery landed (charter §5.5 "Death and
+        /// recovery … roll forward open intents"): the recovered slots are
+        /// local homes now, so every home is scanned as a cadence pass —
+        /// an intent the dead appender left open is adopted and completed.
+        pub fn rollForwardRecovered(self: *Self, now: u64) Error!u32 {
+            const slots_buf = self.gpa.alloc(u16, route_table.W) catch return error.OutOfMemory;
+            defer self.gpa.free(slots_buf);
+            const slots_ = self.resolver.localSlots(self.resolver.ctx, slots_buf);
+            var recovered: u32 = 0;
+            for (slots_) |s| recovered += try self.recoverHome(intent.homeIno(s), now, .cadence);
+            self.register.publish(now);
+            return recovered;
+        }
+
         /// The cadence tick: the expiry sweep; a roll-forward pass only
         /// while the register holds an abandoned intent; the gauges.
         pub fn cadenceTick(self: *Self, now: u64) Error!u32 {

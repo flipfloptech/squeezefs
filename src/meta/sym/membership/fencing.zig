@@ -20,12 +20,16 @@
 //!
 //! The frame screen's four rules are the loader's (`bset.FrameScreen`,
 //! `node.verifyNodeExtentScreened`); this module supplies its INPUTS: the
-//! slot's current `(g, lessee)` from the lease table, and the Recovering
-//! SUSPENSION — `appender_current = null` for a dead lessee's slots from
-//! the recovery's step 2 to its step 8 (rule 4 inert, rules 1–3 armed).
+//! slot's current `(g, lessee)` from the lease table, the recorded tail
+//! of the leaf (tree 0's `slot_tails` as the table indexes them) and the
+//! Recovering SUSPENSION — `appender_current = null` for a dead lessee's
+//! slots from the recovery's step 2 to its step 8 (rule 4 inert, rules
+//! 1–3 armed) — and the STAMP every frame carries, `(lessee, g)` off the
+//! same table. `FramePlane` is the node cache's ONE seam for both halves
+//! (`node_cache.FrameSeam`), installed by the slot plane at its PRIME.
 //! The `(0, 0)` PRIMING law: every writer's open primes its frame stamps
 //! at its FIRST frame writer (the claim gate's ring-recovery preflight
-//! too); a stamp asked of a leased slot before the prime is the tripwire
+//! too); a stamp asked before the prime is the tripwire
 //! `appender_unstamped_frame` (a `(0, 0)` frame on a leased leaf ENDS THE
 //! LOG at the next load — an acked-writes loss class found twice).
 //! Co-located mounts sharing one registrant are their own guarantee row:
@@ -39,6 +43,9 @@ const log = @import("../../../core/log.zig");
 const pr = @import("../../guard/pr.zig");
 const nvme = @import("../../guard/nvme_cmd.zig");
 const bset = @import("../../bset.zig");
+const key = @import("../../key.zig");
+const node_cache = @import("../../node_cache.zig");
+const route_table = @import("../../routing/route_table.zig");
 const lease_table = @import("../slots/lease_table.zig");
 
 pub const FrameScreen = bset.FrameScreen;
@@ -352,17 +359,119 @@ pub const FrameStamps = struct {
         _ = self.stamps.remove(slot);
     }
 
-    /// The stamp a frame on `slot`'s leaf carries. A stamp asked of a slot
-    /// this writer leases before the prime (or without a learned `g`) is
-    /// the `(0, 0)` tripwire — the frame is written unstamped exactly as
-    /// the reference's bug did, counted and loud, never a panic.
+    /// The stamp a frame on `slot`'s leaf carries: a stamp asked BEFORE
+    /// the prime is the `(0, 0)` tripwire — the frame is written unstamped
+    /// exactly as the reference's bug did, counted and loud, never a
+    /// panic; after it, the learned `g` (the prime's words, a grant), else
+    /// the table's `g` for a slot this writer leases, else — the manager's
+    /// STRUCTURAL class — `(0, g)` on an unleased slot (the maintaining
+    /// manager's frames beside the former lessee's) and on a dead lessee's
+    /// slot mid-recovery (the recoverer's frames are the recovery's own);
+    /// a slot another appender leases is never ours to stamp.
     pub fn stampFor(self: *const FrameStamps, slot: u16, table: *const LeaseTable) FrameStamp {
+        if (!self.primed) {
+            stats.appender_unstamped_frame.fire("a frame asked for its stamp before the writer's prime (a (0, 0) frame on a leased leaf ends the log at the next load)");
+            return .{};
+        }
         if (self.stamps.get(slot)) |g| return .{ .appender_id = self.me, .g = g };
         const v = table.view(slot);
-        if (v.leasedBy(self.me) or !self.primed) {
-            stats.appender_unstamped_frame.fire("a frame on a leased slot's leaf asked for its stamp before the writer's prime (the (0, 0) frame ends the log at the next load)");
-        }
+        if (v.leasedBy(self.me) and !v.dead) return .{ .appender_id = self.me, .g = v.g };
+        if (self.me == lease_table.MANAGER and (v.state == .unleased or v.state == .migrating or v.dead)) return .{ .appender_id = lease_table.MANAGER, .g = v.g };
         return .{};
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The frame plane: the node cache's ONE source for both halves.
+// ---------------------------------------------------------------------------
+
+/// Test seam: the slot plane's prime SKIPPED at `init` (the writer stays
+/// unprimed until its arm) — the reference's twice-found loss class, held
+/// open so the red test pins what the priming law prevents. One acquire
+/// load per open when unarmed.
+pub var test_unprimed_first_writer: std.atomic.Value(bool) = .init(false);
+
+/// The node cache's `FrameSeam` over the lease table (installed at the
+/// slot plane's prime, BEFORE the open's first frame writer): the screen
+/// for a slot-tree load — the slot's `(g, lessee)`, the recorded tail of
+/// the leaf (tree 0's `slot_tails` as the table indexes them), the
+/// Recovering suspension — and the stamp a frame carries: an in-process
+/// region's lease stamps `(holder, g)`; everything else (the manager's own
+/// leases, the unleased trees, a dead lessee's mid-recovery) is the
+/// manager's `FrameStamps` — whose prime overrides carry the arm's words
+/// until the arm lands and the table alone rules.
+pub const FramePlane = struct {
+    gpa: Allocator,
+    table: *LeaseTable,
+    /// The routing slot the native forest slot names on this volume.
+    native_slot: ?u16,
+    screen: ScreenSource,
+    stamps: FrameStamps,
+
+    pub fn init(gpa: Allocator, table: *LeaseTable, native_slot: ?u16) FramePlane {
+        return .{ .gpa = gpa, .table = table, .native_slot = native_slot, .screen = .{ .gpa = gpa, .table = table, .pr_fenced = false }, .stamps = FrameStamps.init(gpa, lease_table.MANAGER) };
+    }
+
+    pub fn deinit(self: *FramePlane) void {
+        self.screen.deinit();
+        self.stamps.deinit();
+    }
+
+    /// The device fence in force (rule 1/4's class): known at the gate,
+    /// after the prime.
+    pub fn setFenced(self: *FramePlane, fenced: bool) void {
+        self.screen.pr_fenced = fenced;
+    }
+
+    /// `prime_frame_stamps` (§4.5): tree 0's population is in the table
+    /// (the caller's load); `held` = the slots it leases to the manager,
+    /// `native` = the arm's own slots unleased in tree 0 (stamped `g + 1`).
+    pub fn prime(self: *FramePlane, held: []const u16, native: []const u16) Allocator.Error!void {
+        try self.stamps.prime(self.table, held, native);
+    }
+
+    pub fn primed(self: *const FramePlane) bool {
+        return self.stamps.primed;
+    }
+
+    /// The arm landed: every lease the prime anticipated is the table's
+    /// — the overrides retire (a stale override would outlive a handover);
+    /// a writer the seam left unprimed is primed late here (the arm loaded
+    /// the population).
+    pub fn noteArmed(self: *FramePlane) void {
+        self.stamps.stamps.clearRetainingCapacity();
+        self.stamps.primed = true;
+    }
+
+    pub fn seam(self: *FramePlane) node_cache.FrameSeam {
+        return .{ .ctx = self, .screenFor = &screenForFn, .stampFor = &stampForFn };
+    }
+
+    /// The routing slot of a forest slot on this volume.
+    pub fn routingSlotOf(self: *const FramePlane, fs: key.ForestSlot) u16 {
+        if (fs == key.NATIVE_FOREST_SLOT) return self.native_slot orelse 0;
+        return route_table.slotOfForestSlot(fs);
+    }
+
+    pub fn screenForSlot(self: *FramePlane, slot: u16, leaf_addr: u64) FrameScreen {
+        const t = self.table.recordedTail(slot, leaf_addr);
+        return self.screen.screenFor(slot, if (t) |r| .{ .g = r.g, .tail = r.tail } else null);
+    }
+
+    pub fn stampForSlot(self: *const FramePlane, slot: u16) FrameStamp {
+        const v = self.table.view(slot);
+        if (self.stamps.primed and v.state != .unleased and v.state != .migrating and !v.dead and v.holder != lease_table.MANAGER) return .{ .appender_id = v.holder, .g = v.g };
+        return self.stamps.stampFor(slot, self.table);
+    }
+
+    fn screenForFn(ctx: *anyopaque, fs: key.ForestSlot, addr: u64) ?FrameScreen {
+        const self: *FramePlane = @ptrCast(@alignCast(ctx));
+        return self.screenForSlot(self.routingSlotOf(fs), addr);
+    }
+
+    fn stampForFn(ctx: *anyopaque, fs: key.ForestSlot) FrameStamp {
+        const self: *FramePlane = @ptrCast(@alignCast(ctx));
+        return self.stampForSlot(self.routingSlotOf(fs));
     }
 };
 
@@ -589,4 +698,91 @@ test "the priming law: a stamp asked of an own leased slot before the prime is t
     try testing.expectEqual(FrameStamp{ .appender_id = 1, .g = 5 }, fs.stampFor(12, t));
     fs.forget(12);
     try testing.expectEqual(FrameStamp{}, fs.stampFor(12, t));
+    // A primed writer's lease the table names without a learned word
+    // stamps the table's g; the MANAGER's structural class stamps (0, g)
+    // on an unleased slot and on a dead lessee's slot mid-recovery.
+    _ = try t.acquire(20, 1, false);
+    try testing.expectEqual(FrameStamp{ .appender_id = 1, .g = 1 }, fs.stampFor(20, t));
+    var mgr = FrameStamps.init(gpa, lease_table.MANAGER);
+    defer mgr.deinit();
+    try mgr.prime(t, &.{}, &.{});
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 0 }, mgr.stampFor(30, t));
+    _ = try t.acquire(30, 5, false);
+    try testing.expectEqual(FrameStamp{}, mgr.stampFor(30, t));
+    _ = t.beginRelease(30, 5, true);
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 1 }, mgr.stampFor(30, t));
+}
+
+test "the frame plane: BOTH halves from the table — an in-process region's lease stamps (holder, g), the manager's own and the unleased trees (0, g), a dead lessee's slot (0, g); the prime's overrides (a re-adopted lease at g, the native slot at g + 1) stand until the arm; the screen reads the lessee, the recorded tail of the leaf and the Recovering suspension; a stamp asked unprimed is the (0, 0) tripwire" {
+    const gpa = testing.allocator;
+    const t = try LeaseTable.init(gpa);
+    defer t.deinit();
+    // Tree 0's population: slot 3 leased to the manager at g 2, slot 7 to
+    // appender 1 at g 4, the native slot 0 released at g 1 with a tail.
+    try t.load(3, .{ .variant = .leased, .appender_id = 0, .g = 2, .page_addr = 4096, .root = .{ .addr = 0x10000, .seq = 1 }, .cursor = 10, .slot_tree_extents = 1 });
+    try t.load(7, .{ .variant = .leased, .appender_id = 1, .g = 4, .page_addr = 8192, .root = .{ .addr = 0x20000, .seq = 1 }, .cursor = 10, .slot_tree_extents = 1 });
+    try t.load(0, .{ .variant = .unleased, .g = 1, .root = .{ .addr = 0x30000, .seq = 1 }, .cursor = 10, .slot_tree_extents = 1 });
+    try t.recordTails(0, 1, &.{.{ .leaf_addr = 0x30000, .tail = 12288 }});
+    var fp = FramePlane.init(gpa, t, 0);
+    defer fp.deinit();
+    const seam = fp.seam();
+    // Unprimed: the tripwire, the structural (0, 0).
+    const tw0 = stats.appender_unstamped_frame.load();
+    stats.appender_unstamped_frame.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(FrameStamp{}, seam.stampFor(seam.ctx, key.guestForestSlot(3)));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(tw0 + 1, stats.appender_unstamped_frame.load());
+    // The prime: the manager's held slots at g, the native slot at g + 1.
+    try fp.prime(&.{3}, &.{0});
+    try testing.expect(fp.primed());
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 2 }, seam.stampFor(seam.ctx, key.guestForestSlot(3)));
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 2 }, seam.stampFor(seam.ctx, key.NATIVE_FOREST_SLOT));
+    // An in-process region's lease: (holder, g) off the table.
+    try testing.expectEqual(FrameStamp{ .appender_id = 1, .g = 4 }, seam.stampFor(seam.ctx, key.guestForestSlot(7)));
+    // An unleased slot nobody recorded: the manager's (0, 0) at g 0.
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 0 }, seam.stampFor(seam.ctx, key.guestForestSlot(9)));
+    // The arm lands the native lease at g + 1 (the override's word) and
+    // retires the overrides: the table alone rules.
+    _ = try t.acquire(0, 0, false);
+    fp.noteArmed();
+    try testing.expectEqual(@as(usize, 0), fp.stamps.stamps.count());
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 2 }, seam.stampFor(seam.ctx, key.NATIVE_FOREST_SLOT));
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 2 }, seam.stampFor(seam.ctx, key.guestForestSlot(3)));
+    // A handover of slot 3 to appender 1 at g 3: the frames follow the lease.
+    _ = t.beginRelease(3, 0, false);
+    _ = try t.release(3, 0, 2, .{}, 0);
+    _ = try t.acquire(3, 1, false);
+    try testing.expectEqual(FrameStamp{ .appender_id = 1, .g = 3 }, seam.stampFor(seam.ctx, key.guestForestSlot(3)));
+    // A dead lessee mid-recovery: the recoverer's structural (0, g).
+    _ = t.beginRelease(7, 1, true);
+    try testing.expectEqual(FrameStamp{ .appender_id = 0, .g = 4 }, seam.stampFor(seam.ctx, key.guestForestSlot(7)));
+    // The screen: slot 7's lessee is 1 at g 4 (rule 4 armed); suspended
+    // while its page is Recovering; the native leaf's recorded tail at g
+    // 1 rides into rule 2; a leaf never recorded has none.
+    var s = seam.screenFor(seam.ctx, key.guestForestSlot(7), 0x20000).?;
+    try testing.expectEqual(@as(?u32, 1), s.appender_current);
+    try testing.expectEqual(@as(u32, 4), s.g_current);
+    try testing.expect(s.recorded_tail == null);
+    try fp.screen.suspendLessee(1);
+    s = seam.screenFor(seam.ctx, key.guestForestSlot(7), 0x20000).?;
+    try testing.expectEqual(@as(?u32, null), s.appender_current);
+    fp.screen.resumeLessee(1);
+    s = seam.screenFor(seam.ctx, key.NATIVE_FOREST_SLOT, 0x30000).?;
+    try testing.expectEqual(@as(u32, 2), s.g_current);
+    try testing.expectEqual(@as(?u32, 0), s.appender_current);
+    try testing.expectEqual(@as(u32, 1), s.recorded_tail.?.g);
+    try testing.expectEqual(@as(u32, 12288), s.recorded_tail.?.tail);
+    // A stale lessee's (x, 1) frame at/past the tail is rule 2; the
+    // manager's (0, 2) past it is current.
+    try testing.expectEqual(@as(?u8, 2), s.foreignRule(.{ .appender_id = 9, .g = 1 }, 12288, 1));
+    try testing.expectEqual(@as(?u8, null), s.foreignRule(.{ .appender_id = 0, .g = 2 }, 12288, 1));
+    try testing.expect(seam.screenFor(seam.ctx, key.NATIVE_FOREST_SLOT, 0x40000).?.recorded_tail == null);
+    // A later release re-records the slot's set: the old leaf's entry goes.
+    try t.recordTails(0, 2, &.{.{ .leaf_addr = 0x50000, .tail = 4096 }});
+    try testing.expect(t.recordedTail(0, 0x30000) == null);
+    try testing.expectEqual(@as(u32, 2), t.recordedTail(0, 0x50000).?.g);
+    // The fence class rides through.
+    fp.setFenced(true);
+    try testing.expect(seam.screenFor(seam.ctx, key.guestForestSlot(7), 0x20000).?.pr_fenced);
 }

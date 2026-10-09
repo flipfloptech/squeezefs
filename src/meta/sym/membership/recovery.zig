@@ -185,6 +185,10 @@ pub const Volume = struct {
         grantRecord: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, out: *std.ArrayList(GrantRun)) Error!void,
         /// ONE control entry, admitted DRAIN-AND-RETRY under the SMO hold.
         controlEntry: *const fn (ctx: *anyopaque, recs: []const manager.ControlRecord) Error!void,
+        /// Step 7 landed `Unleased` for the slot: the volume's own mirrors
+        /// of the published root and cursor follow (the C1b publisher must
+        /// not rewrite the record with older words).
+        noteUnleased: *const fn (ctx: *anyopaque, slot: u16, state: cr.SlotState) Error!void,
         table: *const fn (ctx: *anyopaque) *LeaseTable,
         /// The slot tree's RAM state (null = this mount holds no tree).
         treeState: *const fn (ctx: *anyopaque, slot: u16) ?TreeState,
@@ -210,6 +214,9 @@ pub const Volume = struct {
         /// The image extents the trees reach (the grant minus them).
         treeImages: *const fn (ctx: *anyopaque, gpa: Allocator, slots: []const u16, out: *std.ArrayList(u64)) Error!void,
         returnExtents: *const fn (ctx: *anyopaque, extents: []const u64) Error!void,
+        /// A released region's ring segments back to the heap (RAM bits
+        /// + `free` deltas), AFTER its page went Free.
+        freeRing: *const fn (ctx: *anyopaque, segments: []const page.Extent) Error!void,
         /// Orphans: extents the grant claims that no root reaches, after
         /// flooring the node-seq handle above every stamp they carry.
         orphanImages: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, grant: []const GrantRun, reached: []const u64, out: *std.ArrayList(u64)) Error!void,
@@ -330,7 +337,13 @@ pub const Driver = struct {
             var freed = page.Page.free(p.appender_id, p.generation + 1, .{});
             freed.identity = p.identity;
             freed.term = p.term;
+            freed.head_hint = p.head_hint;
+            freed.ledger_tail_seq = p.head_hint;
             self.vol.vt.writePage(self.vol.ctx, &freed) catch return n;
+            // Only THEN the ring's extents return to the heap (no durable
+            // page names them any more) — the leave's pages-barrier-
+            // release order; a crash between leaves C13's orphan class.
+            self.vol.vt.freeRing(self.vol.ctx, p.segments.slice()) catch |e| log.warn("recovery: appender {d}'s ring could not return to the heap ({s}) — fsck C13 reclaims", .{ p.appender_id, @errorName(e) });
             n += 1;
         }
         return n;
@@ -388,11 +401,28 @@ pub const Driver = struct {
         defer grant.deinit(gpa);
         try self.vol.vt.grantRecord(self.vol.ctx, gpa, p.appender_id, &grant);
         try self.screenWindow(window.items, leased.items, grant.items);
+        // The RAM table follows tree 0 for the dead id's slots: a re-run
+        // past its tree-0 step finds slots the rollback left `Leased{dead}`
+        // in RAM that tree 0 already holds `Unleased` (absorbed above) —
+        // the RAM word is reconciled here, never left refusing first
+        // touches until the next mount's arm.
+        const table = self.vol.vt.table(self.vol.ctx);
+        {
+            var held_ram: std.ArrayList(u16) = .empty;
+            defer held_ram.deinit(gpa);
+            try table.heldBy(p.appender_id, &held_ram);
+            for (held_ram.items) |slot| {
+                var still = false;
+                for (leased.items) |l| still = still or l == slot;
+                if (still) continue;
+                const st = (try self.vol.vt.slotState(self.vol.ctx, slot)) orelse continue;
+                if (st.variant == .unleased) try table.load(slot, st);
+            }
+        }
         phase(.read, t_read);
         try self.fail(.read_ring);
         // ---- 4. the RAM table marks the dead slots; the plans ----
         const t_replay = clock.monotonicNs();
-        const table = self.vol.vt.table(self.vol.ctx);
         var plans: std.ArrayList(SlotPlan) = .empty;
         defer plans.deinit(gpa);
         for (leased.items) |slot| {
@@ -497,6 +527,9 @@ pub const Driver = struct {
                 n += 1;
             }
             try self.vol.vt.controlEntry(self.vol.ctx, recs[0..n]);
+            try self.vol.vt.noteUnleased(self.vol.ctx, pl.slot, state);
+            // The frame screen's rule 2 reads the tails just made durable.
+            try table.recordTails(pl.slot, pl.g, tails);
         }
         // The grant record minus the trees' images.
         var remaining: std.ArrayList(GrantRun) = .empty;
@@ -868,6 +901,8 @@ const RamVolume = struct {
     trees: std.AutoHashMapUnmanaged(u16, Tree) = .empty,
     grant_bits: std.AutoHashMapUnmanaged(u64, void) = .empty,
     returned: std.ArrayList(u64) = .empty,
+    /// Ring bytes a region release returned to the heap.
+    rings_freed: u64 = 0,
     /// The data deltas folded (by handle: a re-fold is idempotent).
     data_deltas: std.AutoHashMapUnmanaged(u64, void) = .empty,
     cycles: u32 = 0,
@@ -1039,6 +1074,7 @@ const RamVolume = struct {
         };
         self.control_entries += 1;
     }
+    fn noteUnleasedFn(_: *anyopaque, _: u16, _: cr.SlotState) Error!void {}
     fn tableFn(ctx: *anyopaque) *LeaseTable {
         return self_(ctx).table;
     }
@@ -1134,6 +1170,10 @@ const RamVolume = struct {
             self.returned.append(self.gpa, e) catch return error.OutOfMemory;
         }
     }
+    fn freeRingFn(ctx: *anyopaque, segments: []const page.Extent) Error!void {
+        const self = self_(ctx);
+        for (segments) |s| self.rings_freed += s.len;
+    }
     fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, _: u32, grant: []const GrantRun, reached: []const u64, out: *std.ArrayList(u64)) Error!void {
         const self = self_(ctx);
         // An orphan: still granted, still allocated, reached by no root,
@@ -1168,7 +1208,7 @@ const RamVolume = struct {
         self_(ctx).handover_notifies += 1;
     }
 
-    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .treeImages = &treeImagesFn, .returnExtents = &returnExtentsFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .notifyHandoverDone = &notifyFn };
+    const vtable: Volume.VTable = .{ .vol = &volFn, .readPage = &readPageFn, .writePage = &writePageFn, .readRing = &readRingFn, .slotState = &slotStateFn, .leasedTo = &leasedToFn, .grantRecord = &grantRecordFn, .controlEntry = &controlEntryFn, .noteUnleased = &noteUnleasedFn, .table = &tableFn, .treeState = &treeStateFn, .installRoot = &installRootFn, .restoreTree = &restoreTreeFn, .replay = &replayFn, .replayDataDeltas = &replayDataFn, .cycleUntilClean = &cycleFn, .flushedRoot = &flushedRootFn, .leafTails = &leafTailsFn, .treeImages = &treeImagesFn, .returnExtents = &returnExtentsFn, .freeRing = &freeRingFn, .orphanImages = &orphanImagesFn, .raiseSeqFloor = &raiseFloorFn, .ring0Head = &ring0HeadFn, .writerTerm = &writerTermFn, .quarantineCustody = &quarantineFn, .notifyHandoverDone = &notifyFn };
 
     fn volume(self: *RamVolume) Volume {
         return .{ .ctx = self, .vt = &vtable };
@@ -1198,10 +1238,10 @@ const Fixture = struct {
         f.ledger.recordDeath(DEAD, .{ .epoch = 9, .ts_realtime_ns = 1_000 * std.time.ns_per_ms, .pr_key = 0, .early = early });
         f.screen = .{ .gpa = gpa, .table = f.rv.table, .pr_fenced = false };
         f.stamps = fencing.FrameStamps.init(gpa, 0);
-        // The recoverer (the manager, appender 0) stamps the dead slots at their g.
+        // The recoverer (the manager, appender 0) stamps the dead slots at
+        // their g off the table's `Releasing{dead}` mark — the structural
+        // class — with nothing learned.
         try f.stamps.prime(f.rv.table, &.{}, &.{});
-        try f.stamps.learn(10, 3);
-        try f.stamps.learn(11, 2);
         f.driver = .{ .gpa = gpa, .vol = f.rv.volume(), .mount = .{ .identity = ME, .meta_pr = null, .screen = &f.screen, .stamps = &f.stamps, .ledger = &f.ledger, .skew_max_ms = 22 } };
         return f;
     }
@@ -1324,14 +1364,9 @@ test "every crash window: a recovery that fails right after each step's durable 
             },
             else => {},
         }
-        // The re-run converges.
+        // The re-run converges (an absorbed slot's RAM word follows tree 0
+        // inside the run — nothing is reconciled by hand).
         f.driver.seams.fail_at = null;
-        if (step == .tree0) {
-            // Absorbed slots: the RAM table is reconciled from tree 0 by the
-            // arm's load (the plane's refresh) before the poll re-runs.
-            try f.rv.table.load(10, f.rv.slotStateOf(10).?);
-            try f.rv.table.load(11, f.rv.slotStateOf(11).?);
-        }
         const outcome = f.driver.recoverDead(f.death());
         switch (step) {
             .recovered_record => {
@@ -1350,6 +1385,8 @@ test "every crash window: a recovery that fails right after each step's durable 
                 try testing.expectEqual(Outcome.acted, outcome);
                 try testing.expectEqual(page.State.recovered, f.rv.pages.get(2).?.state);
                 try testing.expect(try f.ledger.isRecovered(DEAD, 1));
+                // The absorbed slots' RAM words followed tree 0.
+                for ([_]u16{ 10, 11 }) |s| try testing.expectEqual(lt.State.unleased, f.rv.table.view(s).state);
             },
             else => {
                 try testing.expectEqual(Outcome.acted, outcome);
@@ -1437,6 +1474,9 @@ test "a release of recovered regions frees a Recovered page no lease names (iden
     const p = f.rv.pages.get(2).?;
     try testing.expectEqual(page.State.free, p.state);
     try testing.expectEqual(@as(u64, 4), p.term);
+    // The ring went back to the heap AFTER the page: 512 KiB.
+    try testing.expectEqual(@as(u64, 512 << 10), f.rv.rings_freed);
+    try testing.expectEqual(@as(u8, 0), p.segments.len);
     try testing.expect(p.identity.sameMount(.{ .node_token = DEAD.node_token, .mount_slot = DEAD.mount_slot }));
     try testing.expect(!hook.regionPending(hook.ctx, DEAD));
     try testing.expectEqual(death_ledger.RecoverOutcome.skipped, hook.recoverDead(hook.ctx, f.death()));

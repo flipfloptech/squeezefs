@@ -189,16 +189,16 @@ pub fn maintenanceQueueCapacity(budget_nodes: u64) usize {
 }
 
 /// Read `addr`'s extent through the loader and build an UNPUBLISHED node
-/// for it — an SMO successor's load-back (verifies the fresh image and
-/// builds its snapshot zero-copy), a tree's first root. `cache.publish`
-/// maps it; the caller releases its reference.
-pub fn loadFresh(cache: *NodeCache, addr: u64, pinned: bool) node_cache.LoadError!*CachedNode {
+/// for it — an SMO successor's load-back (verifies the fresh image under
+/// `slot`'s screen and builds its snapshot zero-copy), a tree's first
+/// root. `cache.publish` maps it; the caller releases its reference.
+pub fn loadFresh(cache: *NodeCache, addr: u64, pinned: bool, slot: ?ForestSlot) node_cache.LoadError!*CachedNode {
     const buf = try snapshot.SharedBuf.createExtent(cache.gpa, cache.cfg.layout.node_size);
     cache.loader.readExtent(cache.loader.ctx, addr, buf.data) catch |e| {
         buf.release();
         return e;
     };
-    return cache.buildNode(addr, buf, pinned);
+    return cache.buildNode(addr, buf, pinned, slot);
 }
 
 /// Vyukov's bounded MPMC ring over `u64` addresses: commit threads push
@@ -408,9 +408,8 @@ pub const KvTree = struct {
         }, &.{}, 0, null);
         defer w.deinit(gpa);
         try cache.loader.writeImage(cache.loader.ctx, addr, w.image);
-        const root_node = try loadFresh(cache, addr, true);
+        const root_node = try loadFresh(cache, addr, true, identity.forestSlot());
         defer root_node.release();
-        if (identity.forestSlot()) |slot| root_node.stampForestSlot(slot);
         try cache.publish(root_node);
         const t = try init(gpa, cache, identity, .{ .addr = addr, .seq = ns }, seq, 0);
         t.nodes.store(1, .release);
@@ -418,11 +417,12 @@ pub const KvTree = struct {
     }
 
     /// Re-attach to an existing tree from its root pointer (the mount path:
-    /// superblock → ledger → roots). Verifies the root node's incarnation
-    /// and header id against the pointer (a torn or stale ledger word never
-    /// installs an unverified root), stamps it with the slot and pins it.
+    /// superblock → ledger → roots; a lease's install). The root loads
+    /// under the slot's frame screen; its incarnation and header id are
+    /// verified against the pointer (a torn or stale ledger word never
+    /// installs an unverified root), it is stamped with the slot and pinned.
     pub fn open(gpa: Allocator, cache: *NodeCache, identity: TreeIdentity, root: RootPtr, seq: *NodeSeqHandle) Error!*KvTree {
-        const n = try cache.get(root.addr);
+        const n = (if (cache.tryGet(root.addr)) |hit| hit else try cache.loadForSlot(root.addr, identity.forestSlot())) orelse return error.RetiredExtent;
         defer n.release();
         if (n.node_seq != root.seq) {
             log.err("root pointer stale: ledger says node_seq {d}, extent 0x{x} holds {d}", .{ root.seq, root.addr, n.node_seq });
@@ -561,9 +561,17 @@ pub const KvTree = struct {
 
     /// Root level: 0 = a single-leaf tree, 1 = one interior level, …
     pub fn rootLevel(self: *KvTree) Error!u8 {
-        const n = try self.cache.get(self.rootPtr().addr);
+        const n = try self.getNode(self.rootPtr().addr);
         defer n.release();
         return n.level;
+    }
+
+    /// `cache.get` for a node of THIS tree: a miss loads under the tree's
+    /// slot (the frame screen's input) — the walks a tree's owner runs
+    /// over its own nodes (the tails census, the extent census) resolve
+    /// through current state, so a retired address is an error.
+    pub fn getNode(self: *KvTree, addr: u64) node_cache.ChildError!*CachedNode {
+        return (try self.fetch(addr)) orelse error.RetiredExtent;
     }
 
     // ---- maintenance queue ----

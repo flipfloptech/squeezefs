@@ -530,9 +530,9 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
     defer fl.release();
     var fr = (try smo.freezeForSmo(cache, right)) orelse return null;
     defer fr.release();
-    var src_l = try smo.Source.load(cache, left.addr, durable_tail);
+    var src_l = try smo.Source.load(cache, left.addr, durable_tail, t.forest_slot);
     defer src_l.deinit(gpa);
-    var src_r = try smo.Source.load(cache, right.addr, durable_tail);
+    var src_r = try smo.Source.load(cache, right.addr, durable_tail, t.forest_slot);
     defer src_r.deinit(gpa);
     const extra_l = try smo.foldSourceExtra(cache, left, &src_l.loaded);
     defer {
@@ -571,7 +571,7 @@ pub fn smoMerge(t: *KvTree, ctx: *SmoContext, parent: *CachedNode, left: *Cached
         .level = left.level,
         .min_key = left.min_key,
         .max_key = right.max_key,
-    }, all_refs, folded.horizon, left.level > 0);
+    }, all_refs, folded.horizon, left.level > 0, t.forest_slot);
     errdefer successor.release();
     // The successor is one fresh image — the flush pass's image class.
     ctx.images_written += 1;

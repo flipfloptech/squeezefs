@@ -114,7 +114,7 @@ pub const HolderHandlers = struct {
         svc.register(.free_blocks, .{ .ctx = self, .serve = &serveFrees });
     }
 
-    fn serveGrant(ctx: *anyopaque, req: *const service.Request, scratch: []u8) Answer {
+    pub fn serveGrant(ctx: *anyopaque, req: *const service.Request, scratch: []u8) Answer {
         const self: *HolderHandlers = @ptrCast(@alignCast(ctx));
         const r = req.payload.block_grant;
         if (r.vol_tag != self.vol_tag) return Answer.refused(error.Busy, "this mount does not hold the lease of that volume");
@@ -125,15 +125,15 @@ pub const HolderHandlers = struct {
                 if (scratch.len < need) return Answer.refused(error.Unexpected, "reply scratch too small for the grant runs");
                 const tail: []align(1) verbs.GrantRunWire = @ptrCast(scratch[0..need]);
                 for (g.grants.slice(), 0..) |run, i| tail[i] = .{ .start = run.start, .len = run.len, .reserved = 0 };
-                return .{ .ok = .{ .block_grant = .{ .head = .{ .kind = @backingInt(verbs.BlocksGrantedKind.granted), .already = @intFromBool(g.already), .n = g.grants.n, .reserved = 0 }, .items = tail } } };
+                return .{ .ok = .{ .block_grant = .{ .head = .{ .kind = @backingInt(verbs.BlocksGrantedKind.granted), .already = @intFromBool(g.already), .n = g.grants.n, .reserved = 0, .blocks = g.word.blocks, .population = g.word.population, .frontier = g.word.frontier }, .items = tail } } };
             },
-            .full => return .{ .ok = .{ .block_grant = .{ .head = .{ .kind = @backingInt(verbs.BlocksGrantedKind.full), .already = 0, .n = 0, .reserved = 0 }, .items = &.{} } } },
+            .full => |word| return .{ .ok = .{ .block_grant = .{ .head = .{ .kind = @backingInt(verbs.BlocksGrantedKind.full), .already = 0, .n = 0, .reserved = 0, .blocks = word.blocks, .population = word.population, .frontier = word.frontier }, .items = &.{} } } },
             .deferred => return Answer.deferred("the holder's ring-0 user window is full for the beat"),
             .busy => return Answer.refused(error.Busy, "this mount does not hold the lease"),
         }
     }
 
-    fn serveReturn(ctx: *anyopaque, req: *const service.Request, _: []u8) Answer {
+    pub fn serveReturn(ctx: *anyopaque, req: *const service.Request, _: []u8) Answer {
         const self: *HolderHandlers = @ptrCast(@alignCast(ctx));
         const r = req.payload.return_blocks;
         if (r.vol_tag != self.vol_tag) return Answer.refused(error.Busy, "this mount does not hold the lease of that volume");
@@ -145,7 +145,7 @@ pub const HolderHandlers = struct {
         };
     }
 
-    fn serveFrees(ctx: *anyopaque, req: *const service.Request, scratch: []u8) Answer {
+    pub fn serveFrees(ctx: *anyopaque, req: *const service.Request, scratch: []u8) Answer {
         const self: *HolderHandlers = @ptrCast(@alignCast(ctx));
         const r = req.payload.free_blocks;
         if (r.head.vol_tag != self.vol_tag) return Answer.refused(error.Busy, "this mount does not hold the lease of that volume");

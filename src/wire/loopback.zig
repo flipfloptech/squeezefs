@@ -201,7 +201,7 @@ const FamilyEcho = struct {
             .mark_shared => .{ .ok = .{ .mark_shared = .{ .kind = 0, .already = 0, .reserved = @splat(0) } } },
             .share_block => .{ .ok = .{ .share_block = .{ .inserted = 1, .already = 0 } } },
             .release_shared => .{ .ok = .{ .release_shared = .{ .kind = 1, .reserved = @splat(0), .remaining = 1 } } },
-            .block_grant => .{ .ok = .{ .block_grant = .{ .head = .{ .kind = 1, .already = 0, .n = 0, .reserved = 0 }, .items = &.{} } } },
+            .block_grant => .{ .ok = .{ .block_grant = .{ .head = .{ .kind = 1, .already = 0, .n = 0, .reserved = 0, .blocks = 0, .population = 0, .frontier = 0 }, .items = &.{} } } },
             .return_blocks => .{ .ok = .{ .return_blocks = .{ .present = 1, .reserved = @splat(0), .cleared = 64 } } },
             .alloc_lease_acquire => .{ .ok = .{ .alloc_lease_acquire = .{ .head = .{ .already = 0, .reserved = 0, .n_bitmap = 0, .reserved2 = 0, .term = 1, .predecessor_blocks = 0 }, .items = &.{} } } },
             .alloc_lease_bitmap => .{ .ok = .{ .alloc_lease_bitmap = .fresh } },

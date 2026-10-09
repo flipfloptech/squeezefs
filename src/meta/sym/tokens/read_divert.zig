@@ -186,6 +186,12 @@ pub const Divert = struct {
         return true;
     }
 
+    /// Is the object's slot another appender's (a token's business), by
+    /// the resolver's word alone — no plane, no dial, no serve.
+    pub fn isForeign(self: *Divert, object: Object) bool {
+        return self.resolver.homeOf(self.resolver.ctx, route_table.slotOfEffective(object)) != .local;
+    }
+
     /// `tokenServe(object, wants)`: null = read locally; else the served
     /// entry (`Serve.gone()` = gone at its holder).
     pub fn serve(self: *Divert, io: Io, object: Object, wants: cache.Wants) Error!?cache.Serve {

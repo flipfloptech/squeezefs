@@ -43,7 +43,8 @@ pub const InodeValueWire = record.InodeValueWire;
 /// reference's sixth bump, kept so a same-numbered foreign peer is told
 /// "schema 6 ≠ 6-of-another-codec" by the framing version instead.
 pub const CLUSTER_WIRE_SCHEMA: u32 = 6;
-pub const MANAGER_SCHEMA: u32 = 1;
+/// 2: `BlocksGranted` carries the holder's word (blocks, population, frontier).
+pub const MANAGER_SCHEMA: u32 = 2;
 /// The cross-owner / record-ship block (the reference's meta-ship 3).
 pub const META_SHIP_SCHEMA: u32 = 3;
 pub const TOKEN_SCHEMA: u32 = 1;
@@ -607,14 +608,23 @@ pub const BlockGrantReq = extern struct {
 
 pub const BlocksGrantedKind = enum(u8) { granted = 0, full = 1 };
 
+/// The holder's word rides EVERY reply (`granted` and `full`): a joiner's
+/// `df` is the population minus its own window, its elision watermark the
+/// frontier (`sym_data_planes.md` §4.3; 0002 row 241).
 pub const BlocksGrantedHead = extern struct {
     kind: u8,
     already: u8,
     n: u16,
     reserved: u32,
+    /// The volume's bitmap blocks.
+    blocks: u64,
+    /// SET bits (allocated + granted).
+    population: u64,
+    /// The highest set bit + 1.
+    frontier: u64,
 
     pub fn check(self: BlocksGrantedHead) bool {
-        return self.kind <= 1 and self.already <= 1 and (self.kind == 0 or self.n == 0);
+        return self.kind <= 1 and self.already <= 1 and (self.kind == 0 or self.n == 0) and self.population <= self.blocks and self.frontier <= self.blocks;
     }
 };
 pub const BlocksGranted = HeadWithArray(BlocksGrantedHead, GrantRunWire, "n", std.math.maxInt(u16));
@@ -1761,7 +1771,7 @@ test "manager payloads round-trip canonically: region, slots, rename, clone, all
     _ = try roundTrip(ReleaseSharedReq, .{ .volume = 0, .present = 1, .reserved = 0, .reserved2 = 0, .vol_tag = 11, .block_idx = 12, .owner = refs[0] });
     _ = try roundTrip(SharedReleased, .{ .kind = 1, .reserved = @splat(0), .remaining = 1 });
     _ = try roundTrip(BlockGrantReq, .{ .volume = 0, .reserved = 0, .want = 0, .writer = sample_identity, .vol_tag = 11, .held_unconsumed = 3 });
-    _ = try roundTrip(BlocksGranted, .{ .head = .{ .kind = 0, .already = 0, .n = 1, .reserved = 0 }, .items = &grant });
+    _ = try roundTrip(BlocksGranted, .{ .head = .{ .kind = 0, .already = 0, .n = 1, .reserved = 0, .blocks = 1 << 20, .population = 18, .frontier = 18 }, .items = &grant });
     _ = try roundTrip(ReturnBlocksReq, .{ .volume = 0, .reserved = 0, .len = 64, .writer = sample_identity, .vol_tag = 11, .start = 1000 });
     _ = try roundTrip(BlocksReturned, .{ .present = 1, .reserved = @splat(0), .cleared = 64 });
     _ = try roundTrip(AllocLeaseAcquireReq, .{ .volume = 0, .home_vol = 1, .appender_id = 7, .identity = sample_identity, .vol_tag = 11, .blocks = 1 << 20 });

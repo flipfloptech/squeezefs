@@ -243,34 +243,49 @@ pub const TcpLink = struct {
 
     const vtable: Link.VTable = .{ .readExact = readExact, .writeAll = writeAll, .shutdown = shutdown, .close = close };
 
+    /// The socket's reads and writes are the kernel's own calls (the wire
+    /// is the TCP stack's by design, charter §1.2 — never an `Io`
+    /// operation: a lane fiber dials a holder lazily from a handler lane
+    /// and the mount's root task dials the manager, and an `Io` read
+    /// there is the forbidden blocking class; the bound is a `poll(2)`
+    /// before each read, since an `Io` timeout would be a `Batch`).
     fn readExact(ctx: *anyopaque, buf: []u8, timeout_ms: ?u32) FrameError!void {
         const self: *TcpLink = @ptrCast(@alignCast(ctx));
+        const fd = self.stream.socket.handle;
         var filled: usize = 0;
         while (filled < buf.len) {
-            var data = [_][]u8{buf[filled..]};
-            const op: Io.Operation = .{ .net_read = .{ .socket_handle = self.stream.socket.handle, .data = &data } };
-            const result = if (timeout_ms) |ms|
-                self.io.operateTimeout(op, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } }) catch |e| switch (e) {
-                    error.Timeout => return error.Timeout,
-                    else => return error.TransportFailed,
-                }
-            else
-                self.io.operate(op) catch return error.TransportFailed;
-            const rr = result.net_read catch return error.TransportFailed;
-            if (rr.data_len == 0) return error.Eof;
-            filled += rr.data_len;
+            if (timeout_ms) |ms| {
+                var pfd = [_]std.os.linux.pollfd{.{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
+                const n = std.os.linux.poll(&pfd, 1, @intCast(ms));
+                if (std.os.linux.errno(n) != .SUCCESS) return error.TransportFailed;
+                if (n == 0) return error.Timeout;
+            }
+            const rc = std.os.linux.recvfrom(fd, buf[filled..].ptr, buf.len - filled, 0, null, null);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.TransportFailed,
+            }
+            if (rc == 0) return error.Eof;
+            filled += @intCast(rc);
         }
     }
 
     fn writeAll(ctx: *anyopaque, bytes: []const u8) FrameError!void {
         const self: *TcpLink = @ptrCast(@alignCast(ctx));
+        const fd = self.stream.socket.handle;
         var sent: usize = 0;
         while (sent < bytes.len) {
-            const data = [_][]const u8{bytes[sent..]};
-            const result = self.io.operate(.{ .net_write = .{ .socket_handle = self.stream.socket.handle, .data = &data } }) catch return error.TransportFailed;
-            const n = result.net_write catch return error.TransportFailed;
-            if (n == 0) return error.TransportFailed;
-            sent += n;
+            // NOSIGNAL: a peer that closed answers EPIPE here, never a
+            // signal to the daemon.
+            const rc = std.os.linux.sendto(fd, bytes[sent..].ptr, bytes.len - sent, std.os.linux.MSG.NOSIGNAL, null, 0);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.TransportFailed,
+            }
+            if (rc == 0) return error.TransportFailed;
+            sent += @intCast(rc);
         }
     }
 

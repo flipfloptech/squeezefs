@@ -121,6 +121,7 @@ const block_refs = @import("../../data/block_refs.zig");
 const pack = @import("../../data/pack.zig");
 const write_admit = @import("../../data/write_admit.zig");
 const seams = @import("../../data/write_seams.zig");
+const ipc_wire = @import("../../ipc/wire.zig");
 
 const Ctx = filesystem.Ctx;
 const Error = filesystem.Error;
@@ -237,6 +238,17 @@ pub var layout_record_corrupt: counters.Tripwire = .init("fuse_layout_record_cor
 pub var fuse_reserved_xattr_refusals: counters.ShardedCounter = .{};
 /// `fuse_virtual_lookups`: `.stats`/`.config`/`.trace` generations minted.
 pub var fuse_virtual_lookups: counters.ShardedCounter = .{};
+
+/// The `user.squeezefs.il0` rendezvous blob an ARMED session host
+/// synthesizes (charter §7; `ipc/rendezvous.zig`): GETXATTR of the name
+/// answers the 312 B blob (`size == 0` ⇒ the length, a short buffer ⇒
+/// ERANGE); unbound (`-o interception` absent) the name stays the reserved
+/// family's ENODATA — the cheap negative probe. Never on-disk bytes; the
+/// screen already refuses SET (EPERM) and LIST filters the family.
+pub const Il0Face = struct {
+    ctx: *anyopaque,
+    synthesize: *const fn (ctx: *anyopaque, out: *[ipc_wire.BLOB_LEN]u8) void,
+};
 
 /// The `.stats`/`.config`/`.trace` renderer the daemon binds (`stats/
 /// stats.zig`): `build` renders one class's payload into bytes the
@@ -383,6 +395,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// renderer behind them.
         virtuals: virtual_inodes.Registry,
         virtual: ?VirtualFace = null,
+        /// The armed session host's `il0` synthesizer; null = not armed.
+        il0: ?Il0Face = null,
         /// The read divert (charter §5.5): every foreign-slot read of the
         /// five read verbs goes through the token client; null = a flat
         /// mount (two probes, read locally). Bound by the daemon after
@@ -446,6 +460,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// arms).
         pub fn bindDivert(self: *Self, d: *read_divert.Divert) void {
             self.divert = d;
+        }
+
+        /// Arm the `il0` rendezvous blob (an interception mount's session
+        /// host; after `mount`, before the session arms).
+        pub fn bindIl0(self: *Self, face: Il0Face) void {
+            self.il0 = face;
         }
 
         pub const XvPlane = sym_xv.ops.Plane(Store);
@@ -2527,6 +2547,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 @memcpy(c.window[0..digits.len], digits);
                 return .{ .data = digits.len };
             }
+            // `user.squeezefs.il0` is SYNTHESIZED by an armed session host,
+            // never stored: the daemon's rendezvous blob (charter §7). The
+            // read rides the already-authorized kernel path (read access ⇒
+            // may read it). Unarmed, the reserved-family screen's ENODATA.
+            if (std.mem.eql(u8, a.name, ipc_wire.IL0_XATTR)) {
+                const face = self.il0 orelse return error.NoAttribute;
+                var blob: [ipc_wire.BLOB_LEN]u8 = undefined;
+                face.synthesize(face.ctx, &blob);
+                if (a.size == 0) return .{ .size = @intCast(blob.len) };
+                if (blob.len > a.size or blob.len > c.window.len) return error.BufferTooSmall;
+                @memcpy(c.window[0..blob.len], &blob);
+                return .{ .data = blob.len };
+            }
             try screenXattr(a.name, error.NoAttribute);
             const value = (try self.xattrValue(try localOf(a.ino), a.name)) orelse return error.NoAttribute;
             defer self.gpa.free(value);
@@ -3385,6 +3418,45 @@ test "POSIX: xattrs — set/get/list/remove, the size probe, ERANGE, CREATE/REPL
     try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = "user.a", .size = 0 } }, f).errno().?);
     // The data record is untouched by the xattr traffic.
     try testing.expectEqualStrings("data", h.read(f, 0, 64).body);
+}
+
+const Il0Stub = struct {
+    calls: u32 = 0,
+    fn synthesize(ctx: *anyopaque, out: *[ipc_wire.BLOB_LEN]u8) void {
+        const self: *Il0Stub = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        @memset(out, 0);
+        @memcpy(out[0..8], "SQZIL0\x00\x00");
+        out[8] = 1;
+    }
+};
+
+test "the il0 rendezvous xattr: ENODATA until the session host arms it; armed, GETXATTR answers the 312 B blob (size probe, ERANGE, the bytes), LISTXATTR filters it, SETXATTR/REMOVEXATTR refuse EPERM, and it is never stored" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    h.release(f);
+    try testing.expectEqual(linux.E.NODATA, h.call(.{ .getxattr = .{ .name = ipc_wire.IL0_XATTR, .size = 0 } }, f).errno().?);
+    var stub: Il0Stub = .{};
+    h.fs.bindIl0(.{ .ctx = &stub, .synthesize = &Il0Stub.synthesize });
+    const probe = h.call(.{ .getxattr = .{ .name = ipc_wire.IL0_XATTR, .size = 0 } }, f);
+    try testing.expectEqual(@as(u32, ipc_wire.BLOB_LEN), (abi.decodeExact(abi.fuse_getxattr_out, probe.outBytes()) orelse return error.TestBadReply).size);
+    try testing.expectEqual(linux.E.RANGE, h.call(.{ .getxattr = .{ .name = ipc_wire.IL0_XATTR, .size = 100 } }, f).errno().?);
+    const got = h.call(.{ .getxattr = .{ .name = ipc_wire.IL0_XATTR, .size = 4096 } }, f);
+    try testing.expectEqual(@as(usize, ipc_wire.BLOB_LEN), got.body.len);
+    try testing.expectEqualStrings("SQZIL0\x00\x00", got.body[0..8]);
+    try testing.expectEqual(@as(u32, 3), stub.calls);
+    // The directory's root answers it too (the shim reads it off any fd of the mount).
+    try testing.expectEqual(@as(usize, ipc_wire.BLOB_LEN), h.call(.{ .getxattr = .{ .name = ipc_wire.IL0_XATTR, .size = 4096 } }, 1).body.len);
+    // Filtered from the list; EPERM on set/remove; nothing stored.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .setxattr = .{ .name = "user.a", .value = "alpha", .flags = 0 } }, f).errno());
+    const list = h.call(.{ .listxattr = .{ .size = 256 } }, f);
+    try testing.expect(std.mem.indexOf(u8, list.body, "il0") == null);
+    try testing.expect(std.mem.indexOf(u8, list.body, "user.a\x00") != null);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .setxattr = .{ .name = ipc_wire.IL0_XATTR, .value = "x", .flags = 0 } }, f).errno().?);
+    try testing.expectEqual(linux.E.PERM, h.call(.{ .removexattr = .{ .name = ipc_wire.IL0_XATTR } }, f).errno().?);
+    try testing.expectEqual(@as(?[]u8, null), try h.fs.xattrValue(try MemFs.localOf(f), ipc_wire.IL0_XATTR));
 }
 
 test "the xattr allowlist: user.* yes (minus user.squeezefs.*), security.* and trusted.* yes; layout / system.symlink / job:* / client:* / writer_claim / the format record no" {

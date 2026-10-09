@@ -115,6 +115,21 @@ pub const registry = [_]Knob{
     .{ .key = "SQUEEZEFS_IPC_MEM_PCT", .kind = .{ .int = .{ .lo = 1, .hi = 100 } }, .default = "derived", .class = .derived_override, .doc = "ipc_session_arenas admission cap as a percentage of the R5 budget." },
     .{ .key = "SQUEEZEFS_IPC_ARENA_MB", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 20 } }, .default = "derived", .class = .derived_override, .doc = "Per-session IPC payload arena, MiB (derived max(64 MiB, align_down(ipc cap / session population target, 4 MiB)))." },
 
+    // ---- the client bypass: the shm session (read by ipc/{sizing,doorbell,shm,rendezvous,client}.zig) ----
+    .{ .key = "SQUEEZEFS_IPC_SERVICE_THREADS", .kind = .{ .int = .{ .lo = 1, .hi = 64 } }, .default = "derived", .class = .derived_override, .doc = "IL service threads = direct-drive shards (ONE function sizes both halves, charter §7), verbatim; derived clamp(ceil(3 × cpus / 8), 2, 64) — the counted W8→W24 width sweep (W12 +10.4 % best at 32 cpus; W24 the one regression past 1.0× the core budget). Spawned on session admission, never parked spares." },
+    .{ .key = "SQUEEZEFS_IPC_MAX_OP_BYTES", .kind = .{ .int = .{ .lo = 4096, .hi = 1 << 30 } }, .default = "derived", .class = .derived_override, .doc = "The per-op payload ceiling of an IL session, bytes, verbatim (page multiple); derived = the transport's max_write desire (max(block_size, 1 MiB)) so both lanes share ONE per-op ceiling and the hybrid lane gate's rail is the same number." },
+    .{ .key = "SQUEEZEFS_IPC_SOCKET_DIR", .kind = .str, .default = "-", .class = .config, .doc = "The IL rendezvous's filesystem-path socket directory (`none` disables the path rung; the abstract AF_UNIX listener always binds). Absent: /run/squeezefs for euid 0, else $XDG_RUNTIME_DIR/squeezefs, else /tmp/squeezefs-il-<uid>. A group- or world-writable directory, or one another uid owns, REFUSES the path rung loudly and the mount degrades to abstract-only — never fails." },
+    .{ .key = "SQUEEZEFS_TEST_IPC_ALLOW_DIRTY", .kind = .bool, .default = "0", .class = .test_seam, .doc = "Test seam: admit a degenerate build identity (`unknown`, `-dirty`, empty) on EITHER side of the IL HELLO (the same-commit law otherwise refuses it as Version); counted in ipc_binds_dev_override and announced once. Default-inert: a dev box's dirty tree is the only legitimate use." },
+    .{ .key = "SQUEEZEFS_IPC_SPIN_US", .kind = .{ .int = .{ .lo = 0, .hi = 10_000 } }, .default = "derived", .class = .ab_lever, .doc = "IL service thread spin-before-park window, µs, STATIC and verbatim (governor off); absent = the adaptive governor (100 µs in the churn regime, 0 otherwise). A/B lever: 0 is the 2026-07-26 never-spin control arm (every nonzero ambient window stole runnable CPU from the sync lane: −4 % at 20 µs, −22 % at 100 µs with 8 threads); the governor is the shipped arm." },
+    .{ .key = "SQUEEZEFS_IPC_SPIN_ADAPTIVE", .kind = .bool, .default = "1", .class = .ab_lever, .doc = "The IL service thread's adaptive spin governor (engages the measured 100 µs window only in the churn regime: ≥ 2 sessions on the lane, a seeded park EWMA ≤ 200 µs, busy under 100 − lanes/cores %). A/B lever: 1 is the shipped arm (+6.7 % median at 32×8); 0 is the window-0 control arm." },
+    .{ .key = "SQUEEZEFS_IPC_CQE_WAKE_LATCH", .kind = .bool, .default = "1", .class = .ab_lever, .doc = "The completion doorbell's mark-valued collapse latch: a park era pays ≤ 1 FUTEX_WAKE (the k-th mark-passed completion; later ones collapse). A/B lever: 1 is the shipped arm (wake share ≤ 0.25 at 32×8); 0 is the wake-per-mark-passed-completion control arm." },
+    .{ .key = "SQUEEZEFS_IPC_ARENA_THP", .kind = .bool, .default = "1", .class = .ab_lever, .doc = "Transparent huge pages over the IL session's memfd (both sides map PMD-aligned; the daemon's deferred prep runs MADV_HUGEPAGE + MADV_POPULATE_WRITE + MADV_COLLAPSE, which works whatever shmem_enabled says; the client advises only). A/B lever: 1 is the shipped arm; 0 disables both halves (the 4 KiB-page control arm)." },
+    .{ .key = "SQUEEZEFS_IL_SESSIONS", .kind = .{ .int = .{ .lo = 1, .hi = 16 } }, .default = "derived", .class = .derived_override, .doc = "IL sessions per (process, mount), verbatim; derived clamp(ceil(cpus/4), 2, 16) — the drain-thread saturation slope of the 2026-07-19 service sweep (the 2026-07-28 defaults mismatch: shim 4 vs daemon 8 threads left svc4..7 idle; 8 by hand recovered +44 %); floor 2 = the single-dequeue-thread plateau, ceiling 16 = the shim's static session table (32) over two bound mounts." },
+    .{ .key = "SQUEEZEFS_IL_SPINS", .kind = .{ .int = .{ .lo = 0, .hi = 1 << 20 } }, .default = "derived", .class = .ab_lever, .doc = "The IL client's spin iterations before parking on a slot, PINNED verbatim for both regimes; derived = adaptive: 4096, or 256 once the session's last op parked (a parked op means daemon-side async work — the full window is CPU theft: 336 k → 605 k IOPS at 64 threads, 256 the measured best floor). A/B lever: the adaptive pair is the shipped arm; 0 parks at once, 4096 is the fixed pre-campaign arm." },
+    .{ .key = "SQUEEZEFS_TEST_IL_OP_TIMEOUT_MS", .kind = .{ .int = .{ .lo = 0, .hi = MS_MAX } }, .default = "0", .class = .test_seam, .doc = "Test seam: the IL client's per-op deadline in ms instead of the 30 s constant (0 = the constant), so the deadline-poison rung of the death ladder is reachable inside a test's budget." },
+    .{ .key = "SQUEEZEFS_IL_KERNEL_LANE_MIN", .kind = .{ .int = .{ .lo = 0, .hi = BYTES_MAX } }, .default = "derived", .class = .derived_override, .doc = "The hybrid lane gate: an op strictly larger than this many bytes routes to kernel FUSE for throughput, verbatim (0 = off, every op rings); derived clamp(round_down(memBW × 2.3 µs / 2 copies, 4 KiB), slab, max_op) from a once-per-process memcpy probe (≈ 140–164 KiB on 125–147 GB/s field clients). Published as lane_gate_threshold_bytes." },
+    .{ .key = "SQUEEZEFS_TEST_IL_MAX_RUN_SLOTS", .kind = .{ .int = .{ .lo = 0, .hi = 65_536 } }, .default = "0", .class = .test_seam, .doc = "Test seam: cap a large op's contiguous slot run at N slots (0 = uncapped), so the fragmented-run / smaller-flight paths are exercised deterministically." },
+
     // ---- 4a metadata object locks (read by meta/dlm.zig) ----
     .{ .key = "SQUEEZEFS_DLM_STRIPES", .kind = .{ .int = .{ .lo = 1, .hi = 1 << 24 } }, .default = "derived", .class = .ab_lever, .doc = "D-3: the stripe population of the 4a DlmLockManager inode + dentry classes (shipped floor 4096). Explicit wins verbatim (rounded UP to a power of two — the index is a mask); derived = next_pow2(max(4096, 16 × possible_cpus × q_depth)) so a false-sharing wait — which on the 4a tables costs a whole commit — hits at most one acquire in 16 at full ring occupancy. A/B lever: 4096 is the shipped-4a control arm, 1 the everything-serializes crucible. Engagement: dlm_{inode,dentry}_stripes; conviction: dlm_*_stripe_collisions vs dlm_*_key_waits." },
 
@@ -286,7 +301,16 @@ pub fn lookup(key: []const u8) ?*const Knob {
 /// The row of a key known at compile time: an unregistered key is a compile
 /// error, so a reader cannot exist without its row.
 pub fn row(comptime key: []const u8) *const Knob {
-    return comptime lookup(key) orelse @compileError(key ++ " is not a registry row (src/core/knobs.zig)");
+    return comptime lookupComptime(key) orelse @compileError(key ++ " is not a registry row (src/core/knobs.zig)");
+}
+
+/// `lookup` for comptime callers: one key comparison per row, each a byte
+/// loop — the default 1000 branches ran out once the registry passed ~100
+/// rows.
+fn lookupComptime(comptime key: []const u8) ?*const Knob {
+    @setEvalBranchQuota(registry.len * 200);
+    for (&registry) |*k| if (std.mem.eql(u8, k.key, key)) return k;
+    return null;
 }
 
 /// Is this name in our namespace? (`SQUEEZEFS_` or `SQZ_` prefix.)

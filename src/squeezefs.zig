@@ -145,9 +145,9 @@ pub const data = struct {
 
 // ---- the client bypass: the shm session, the daemon host, the shim + SDK client (charter §7) ----
 pub const ipc = struct {
-    // @anchor:ipc_session_import
+    pub const session = @import("ipc/ipc.zig");
     // @anchor:ipc_host_import
-    // @anchor:ipc_client_import
+    pub const client = if (builtin.os.tag == .linux) @import("ipc/client.zig") else struct {};
 };
 
 // ---- the cluster wire (charter §5.5 verbs; §9 thread-per-connection) ----
@@ -181,9 +181,9 @@ test {
     _ = json_scan;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:ipc_session_test
+    _ = ipc.session;
     // @anchor:ipc_host_test
-    // @anchor:ipc_client_test
+    if (builtin.os.tag == .linux) _ = ipc.client;
     _ = meta.sym;
     _ = meta.sym_slots;
     _ = meta.sym_tokens;

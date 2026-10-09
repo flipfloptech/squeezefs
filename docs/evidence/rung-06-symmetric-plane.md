@@ -1,4 +1,4 @@
-# Rung 6 — the symmetric metadata plane (waves A–E): the forest, appenders and the manager, slot leases, tokens, cross-owner intents and striping, the data planes, membership and recovery, the join ladder, the N-daemon posture (the manager half, then the JOINED backend and the two-daemon matrix), the default flip
+# Rung 6 — the symmetric metadata plane (waves A–F): the forest, appenders and the manager, slot leases, tokens, cross-owner intents and striping, the data planes, membership and recovery, the join ladder, the N-daemon posture (the manager half, then the JOINED backend and the two-daemon matrix), the default flip, the kill rows and the `-o ro` reader (the close)
 
 Charter §5.5 in full, §5.7 (the D0 winner IS the manager; a later RW mount JOINS), §4 (teardown),
 §8 (`clients`, `appenders`, `appender clear`, `umount`), §13 rung 6's order, §1.10. Decision 0002
@@ -24,6 +24,8 @@ N-daemon numbers, the deviations and the owed list the next rung inherits.
 | N-daemon posture (this wave: the MANAGER half) | `mount` arms the cluster wire: ONE listener on `SQUEEZEFS_MW_BIND` serving the manager set (dispatch by the request's volume), the membership shard, the death ledger's verbs, the token holder (its A1½ hook armed on every volume's pass), the cross-owner step service and the `dir_rename` lease; the endpoint published into the RAM table AND the durable `endpoint:{0}` record; the owner shard armed at the manager's term with the predecessor's roster; the cadence runs eviction + grace reap + the ledger poll; the read divert bound into the filesystem with the session's notify seam; `umount` signals the daemon; `clients` lists the durable member rows offline | `meta/sym/wire_plane.zig`, `cli/{mount,umount,clients,status}.zig` |
 | record-level ship | `setattr/setxattr/removexattr/publish_layout` as ONE verb each, served under the holder's door, the holder's caches + kernel view invalidated | `xv/record_ship.zig` |
 | default flip | `format` stamps `SYMMETRIC_PLANE` by default, `--single-writer` the flat opt-out; `SQUEEZEFS_SYMMETRIC_META` defaults 1, `=0` on a stamped volume refuses the writable open; EVERY symmetric family reads 0/`solo` on a `--single-writer` mount (the smoke walks `meta.sym`, the per-volume `sym` words and `data.sym_planes` after a full POSIX pass) | `sym/bind.zig`, `cli/smoke.zig` |
+| the kill rows (wave F) | `kill -9 B` mid-`tar` → eviction → recovery → the same-node successor's first op; `kill -9 A` → B PARKS-AND-RECLAIMS into the D0 successor's grace window (the manager link re-resolved off the epoch poll, the allocation leases taken over); `appender clear` end to end — as smoke stages | `cli/smoke.zig` "THE KILL ROWS", `sym/joined.zig` `ManagerResolver`, `sym/wire_plane.zig` `PeerLinks` |
+| `-o ro` of a live set (wave F) | the READER posture: the projection backend (no flock, no claim, no ring), the reader plane (a member-reader + token client with every slot foreign; the quiescent reader with the epoch poll's `ESTALE` fail-stop), the FUSE gate | `backend.openReader`, `sym/reader_plane.zig`, `fuse/handler/reader_gate.zig` |
 
 ## Models (explorer, default limits; every weakening proven to fail)
 
@@ -68,6 +70,8 @@ arms nothing on a reader; a malformed bind refuses by name.
 
 ## Gate totals
 
+The rung's closing totals are in the wave-F section at the end; the manager-half wave's were:
+
 - Linux venue (`scripts/venue zig build gate`, uncached): 18/18 steps; unit 1,812 pass / 14
   skipped, rails 5/5, smoke 38 pass / 1 skipped (the new N-daemon stage ≈ 25 s; the solo-posture
   walk rides the `--single-writer` stage), bench-smoke 28/28 — 1,883 / 1,898 in all;
@@ -90,58 +94,38 @@ arms nothing on a reader; a malformed bind refuses by name.
 
 ## Not done — the owed list the next rung inherits (each stated where it stops)
 
-- ~~**The JOINED backend (the N-daemon posture's joiner half).**~~ **Landed 2026-10-08** (see
-  "Landed after this note — the joined backend" below): `KvBackend.openJoined`, the two-daemon
-  matrix over real TCP; the kill rows' recovery half pinned by hand, the successor's cross-owner
-  ops and the `-o ro` reader still owed (stated there). The paragraph that follows is the pre-wave
-  statement, kept as the record of what the gap was. A second `squeezefs mount` of a
-  symmetric set WAS refused by layer A (the flock). The spec's joined door
-  (`sym_wire_membership_recovery.md` §5.2 — no flock, the fixed ring replayed as a projection, no
-  claim, `JoinAppender` + `AcquireSlots` over the wire BEFORE `open_inner`, the JOINED checkpoint
-  cycle: its slot trees' flushes into its grant, its page as its ledger, its tail, extent
-  refills/returns over the wire, never the ledger/bitmap/tree 0/page 0) is a `KvBackend` posture
-  this wave did not build: `core/reg/lane/smo_journal` over the region's ring, an extent
-  allocator fed by `RegionGrant`, the trees opened at the acquire reply's words, the token divert
-  dialling the holders, the xv plane's wire sessions, the data plane's grants pulled from the
-  lease holder. Every component it composes exists and is tested over the wire in-process; the
-  composition is the next wave's. Consequently the N-daemon MATRIX rows that need two FUSE
-  mounts (B's 2,000 creates under its own slots, A's token reads of them, the cross-owner
-  `tar -x`, the hot-dir handover/striping engagement, the 200 MiB `dd` on B's grants, the record
-  ship with B's kernel view invalidated, the `-o ro` C reader within `reader_staleness_bound_ms`,
-  `kill -9 B` mid-`tar` → recovery → successor remount, `kill -9 A` → B PARKS-AND-RECLAIMS → a
-  new manager) were NOT run. What ran is the manager half above.
-- ~~**The recovery driver over the real backend.**~~ **Landed 2026-10-08** (see "Landed after
-  this note" below): `membership/volume_bind.zig` binds the 27-function `Volume` seam to a
-  `KvBackend`; `wire_plane` installs one binding per managed volume as the ledger poll's hooks
-  and the set-level roll-forward.
-- ~~**The frame screen through the loaders — BOTH halves together.**~~ **Landed 2026-10-08**
-  under the priming law (below): `node_cache.FrameSeam` ← `fencing.FramePlane`, installed at
-  `slots/plane.Plane.init` — BEFORE the claim gate's ring-recovery preflight — every loader
-  (`loadLeader`, `buildNode`/`loadFresh`, `smo.Source.load`, `KvTree.open`, the backend's tree
-  walks) screens by slot and every frame writer (`appendFrozen`, `writeSuccessor`) stamps by slot.
-- **The planes' device-path arms** (`LeaseArm`/`GrantSource`/`Shipper` into `data/plane.zig`,
-  the Checkpointer's `PageWriteSet` for KVDA pages, the journal-lane drainer fiber, the free-ship
-  and grace binding): the data plane still allocates from its ledger-seeded allocators; the token
-  reader's `discardLayout`/`purgeCensus` answer `no_entry` (no foreign layout entry is ever held
-  until the divert can dial).
-- **The token divert's dialler** (a holder's reader plane needs the slot → endpoint resolution
-  through the published `endpoint:` records and a session per holder), the holder's `Pusher`
-  over real links (today `unreachable_`: a recall completes at the reader's lease expiry), the
-  `bindDivert` of a foreign-slot read therefore answers the typed EAGAIN (never a stale local
-  read) on the manager.
+The rung is CLOSED (wave F, 2026-10-09; the section "Landed after this note (2026-10-09, wave F)"
+at the end). What remains, each stated where it stops:
+
+- **The shared-dir handover/striping matrix row**: the holder-decided handover under `N_floor`
+  and the K = 64 striping engage on a hot directory two writers share; the cores and the
+  `.stats` words exist (`slots/handover.zig`, `xv/striping`), the two-daemon row that drives a
+  shared directory past `N_floor` and asserts the offer, the move and the stripe flip was not
+  written.
 - **kv_fs over a FLIPPED directory** (lookup/create/readdir through the stripe map, the explicit
-  `setfattr -n user.squeezefs.stripes` flip), the foreign-slot LAYOUT publish at the data
-  plane's publish site, `SupplyStripeInos` over the wire, a foreign holder's wire session in
-  `set_bind` (resolves `unreachable_` = EAGAIN).
-- **`appender clear` end to end** on a dead joiner's region: the verb's two durable effects (the
-  page `Recovering{term 0}`, the EARLY record) are exactly the states the real-backend kill matrix
-  recovers (rows `page_recovering` and the early row below); the SMOKE leg over the built binary
-  (`appender clear` → the next mount's poll) waits on the joined daemon's `mount B`.
-- From earlier waves, unchanged: the paged-resident dentry set, the in-place join of a
-  fail-stopped quiescent reader, `slot_tails` past the inline cap (a spilled set screens by the
-  lease alone), the dead recoverer's stashed interior records, the un-share protocol; the data
-  namespaces' registrants in the death preempt (the data planes' device arm); mTLS, the nvmet PR
-  legs and fsck C13–C17 as full checks are rung 8's.
+  `setfattr -n user.squeezefs.stripes` flip): the stripe map and its verbs exist; the handler's
+  routing through it is not bound (`setfattr`/`getfattr` are also absent from the venue image).
+- **The foreign-slot LAYOUT publish riding `record_ship`** at the data plane's publish site, and
+  **`SupplyStripeInos` over the wire**: the verbs exist and are served; the publish site still
+  publishes locally and the striped-create's ino supply is in-process.
+- **The KVDA page sink** (0002 row 292): the holder's bitmap is RAM; a holder's death re-learns
+  the granted ranges from the live writers' declared windows and the refs (the manager's D0
+  successor takes the leases over with no page fold — the wave-F row).
+- **mTLS on the cluster wire** — rung 8.
+- **fsck C13–C17 as full checks** — rung 8 (C13's orphan class is the recovery's return; C14 is
+  the mount-path refusal; C15 is the mount-path recovery; C16/C17 report nothing yet).
+- **The nvmet PR legs** (the preempt on a PR substrate, the registrant cap learner against a
+  real target) — rung 8.
+- **A joiner's `.stats` under a dead manager**: the kernel revalidates the root's attributes
+  before the virtual lookup, and the root is the manager's object — on a parked joiner the walk
+  answers EAGAIN until the successor admits the reclaim (the smoke observes the park through the
+  daemon's log). The `-o ro` fail-stop gate exempts `getattr(1)` for exactly this reason; the
+  parked joiner wants the same exemption served off its token cache's last root entry (a stale
+  root attribute under a dead holder can mislead no reader), owed.
+- From earlier waves, unchanged: the paged-resident dentry set, `slot_tails` past the inline cap
+  (a spilled set screens by the lease alone), the dead recoverer's stashed interior records, the
+  un-share protocol; the in-place join of a fail-stopped quiescent reader (the reader fail-stops
+  and the remount joins: the cheaper stopgap the spec names).
 
 ## Landed after this note (2026-10-08, wave E): the JOINED backend — a second mount as an equal writer over the wire; the two-daemon matrix
 
@@ -202,14 +186,7 @@ as the manager, B = a SECOND `squeezefs mount` process JOINED over TCP loopback;
 
 The stage runs inside two minutes; the whole smoke suite passes with it (the totals below).
 
-**The kill rows, by hand** (the same binary, a bash harness over the venue; four runs):
-
-| Row | Observed |
-|---|---|
-| `kill -9 B` mid-`tar -x` (≈ 205 of 1,000 files landed) | A evicts at `T_owner` (3 s): `membership_evictions` 1 → `dead_members_recorded` 1 → the ledger poll acts `dead_members_acted` 1 ≡ recorded × regions held (1) → `appender_recoveries` 1, `appender_recovery_rollbacks` 0, `dead_appender_orphans` 0, `invariant_tripwires` 0; the page `recovered` at 4 s, `free` at the next tick (`recovered_regions_released` 1); A lists every file B acked (205 — the one mid-create included, whole) and reads them |
-| remount B at the same mount point (the same-node successor) | B joins again as appender 1; lists the 205 and reads `t5` |
-| the successor's first cross-owner op (`mkdir` under A's root), A's `rm -rf` of the recovered tree | NOT clean: before the death fan-out the old B's tokens at A stood under the successor's identical client id and every recall waited the TTL (`dlm_token_recall_timeouts_live` fired; B2's `mkdir` parked 15+ s); with the fan-out B2's `mkdir` answers EAGAIN and A's `rm -rf` of the recovered tree still parks (an `unlink` past `meta_backend_start`); one run of four panicked in `bset.buildBset` under the recovery's `cycleUntilClean` (the two-phase replay's flush of the recovered slot — the recovery agent's seam). Stated below as owed |
-| `kill -9 A`, C `-o ro`, `appender clear` | not run (below) |
+**The kill rows, by hand** (wave E, four runs): A evicted B at `T_owner` and recovered its region, but the same-node successor's first cross-owner `mkdir` answered EAGAIN / parked 15 s, A's `rm -rf` of the recovered tree parked past `meta_backend_start`, and one run of four aborted the manager in `bset.buildBset` under the recovery's `cycleUntilClean`. Both defects are root-caused and fixed in wave F below; the rows are smoke stages now.
 
 **Gate totals (this wave).** Linux venue (`scripts/venue zig build gate` under `timeout 3600`,
 uncached, 473 s): 18/18 steps; unit 1,822 pass / 15 skipped, rails 5/5, smoke 39 pass / 1 skipped
@@ -219,26 +196,7 @@ retained` flat (0 → 0 on the freshly started venue); no `squeezefs` process an
 (the Linux-only modules skip). The rails' inverse census carries `joined.zig` and `plane_arm.zig`
 under their families.
 
-**Owed from this wave** (each stated where it stops):
-
-- **The same-node successor's cross-owner ops over recovered slots** (above): the successor's
-  `mkdir` under A's root answers EAGAIN and A's own `unlink` in the recovered tree parks; the
-  slot → holder resolution for inos minted in the dead B's rotor (recovered `Unleased`, then
-  partly re-leased to the successor at the same appender id) needs the re-resolve the spec's
-  "a writer re-resolves ONCE inside the same op" names on the UNLINK/MKDIR arms, and the
-  `buildBset` panic under `cycleUntilClean` needs its red repro.
-- **`kill -9 A` → B PARKS-AND-RECLAIMS → remount A → B redials**: the park gate, the member's
-  poison and the redial exist and are pinned in-process (`wire_plane` e2e, `park_reclaim`); the
-  two-daemon row was not run.
-- **`mount -o ro` (C)**: a read-only mount of a LIVE set is still refused by layer A — the
-  reader posture (no flock, a projection, the token reader over every slot, the epoch poll
-  within `reader_staleness_bound_ms`) is a `KvBackend` posture this wave did not build.
-- **The hot-dir handover/striping engagement row**, **kv_fs over a FLIPPED directory**, the
-  foreign-slot LAYOUT publish riding `record_ship`, `SupplyStripeInos` over the wire: not run /
-  not bound (the cores and the verbs exist).
-- **The KVDA page sink** (0002 row 292): the holder's bitmap is RAM; a holder's death re-learns
-  the granted ranges from the live writers' declarations and the refs.
-- **`appender clear` end to end**: waits on the kill rows' harness.
+**Owed from wave E** — every item below landed in wave F (the close, further down) except where the close's own owed list says otherwise.
 
 ## Landed after this note (2026-10-08): the frame screen with its stamps, and recovery over the real backend
 
@@ -286,3 +244,48 @@ Not in this delivery: the smoke's `kill -9 B` row (a second daemon's region reco
 poll) and the `appender clear` smoke leg wait on the joined daemon; the data namespaces' preempt
 rides the data planes' device arm; a `Volume` over a JOINED backend is the joined wave's (a joiner
 recovers nothing: the ledger is the manager's).
+
+## Landed after this note (2026-10-09, wave F — the close): the kill rows as smoke stages, the two defects, the `-o ro` reader of a live set
+
+**The two defects the by-hand kill rows exposed** (0002 rows 296–299, 293–295, 297–298):
+
+| Defect | Cause | Fix (red test first) |
+|---|---|---|
+| the manager's abort in `bset.buildBset` under the recovery's `cycleUntilClean` (1 run of 4) | `volume_bind.readRingFn` / `replayFn` mapped every non-`put` frame of the dead ring to `delete` (the driver's `Kind` had no `delta`): an inode DELTA — every `write`'s size, every `setattr` — replayed as a TOMBSTONE carrying the delta's bytes; the flush's record encoder asserts `kind != delete ∨ value.len == 0` → the abort (the stack's "unreachable" was `std.debug.assert`'s panic, the ERT pointing at `buildBset`); had the assert not fired, the recovered inode would have been deleted — a silent loss class | `recovery.Kind.delta` as a content kind; `tree.kindOf` (pub, 1:1, asserted against the journal's enum at comptime) in both the mount replay and the recovery; a tombstone with a value is refused typed at the ONE apply choke point (`tree.Error.InvalidRecord`) so a mislabelled replay fails the recovery LOUD (`appender_recovery_rollbacks` +1, the page stays `Recovering`) instead of aborting the daemon; the frame encoder's `RecordsNotAscending`/`EmptyBset` at the freeze is a tripwire (`kv_freeze_order_refusals`) + `Corrupt`, never `unreachable`. Red: `volume_bind`'s dead region now carries a delta (`size = 4096`) and a tombstone in its window — the old mapping fails the recovery (typed), the fix folds the delta (`InodeValue.size == 4096`) and drops the tombstoned key |
+| the same-node successor's first cross-owner `mkdir` EAGAIN / parked, A's `rm -rf` of the recovered tree parked past `meta_backend_start` | `wire_plane.PeerLinks` bound ONE `SharedLink` per token client id and per holder appender id and never re-resolved it; the death fan-out swept the dead member's grants but left its sessions; the successor (the same client id and appender id — `(node, mount_slot)` — at a NEW ephemeral port) was pushed to the dead incarnation's port: every recall `unreachable_` until the lease TTL (`dlm_token_recall_timeouts_live` fired, the `unlink` parked 25 s), every xv step to holder 1 EAGAIN | every peer link carries an `EndpointResolver` consulted before every (re)dial — the owner's roster by client id, the RAM endpoint table / `ResolveEndpoint` by holder — and `DeathFanout.noteDeath` retires the dead member's sessions at once (`peer_links_invalidated`; `peer_links_repointed` on a move). Red: `wire_plane` "THE SAME-NODE SUCCESSOR IS REACHED" — a member at a dead port, its eviction, the successor under the same ids at the plane's own listener: both links' next call lands. A second cause in the same row: the recovery released the slot in the lease TABLE but the holder cache's LEARNT view (primed off tree 0 at the arm: "leased by appender 1") outlived the release — every read of a recovered slot `unreachable_` on a mount that armed with the dead lease in tree 0 (the `appender clear` leg's next mount); `noteUnleasedFn` drops the view (red in `volume_bind`: `stepHome(DEAD_SLOT)` `unreachable_{1}` before, `.local` after) |
+
+**The kill rows as smoke stages** (`cli/smoke.zig` "THE KILL ROWS (a)/(b)/(c)"; A = the rig's manager, B a second process under its own UTS hostname `sqz-nodeb` — another node to the identity law, so a remount under the same name is the same-node successor and `appender clear` judges its page foreign residue; the venue as above, `T_owner` 3 s by the seam):
+
+| Row | Observed |
+|---|---|
+| (a) `kill -9 B` mid-`tar -x` of 1,000 files into A's directory (201–203 visible) | A: `membership_evictions` 1 → `dead_members_recorded` 1 → `dead_members_acted` 1 (≡ recorded × 1 region) → `appender_recoveries` 1, `appender_recovery_rollbacks` 0, `dead_appender_orphans` 0, every must-stay-0 gauge 0; the page `recovered → free` (`recovered_regions_released` 1) **8.5–8.7 s after the kill** (`T_owner` 3 s + the 5 s reclaim cadence); 202–204 files whole on A (≥ the count seen at the kill; every body names its file) |
+| remount B under the same node (the same-node successor) | `mounted JOINED as appender 1` a second time; B lists and reads the same 202–204 files whole |
+| the successor's FIRST cross-owner `mkdir` under A's root | **5–8 ms**; `xv_cross_owner_intents_minted` 1, retired 1, stuck 0 |
+| A's `rm -rf` of the recovered tree | **76–87 ms** for 202–204 unlinks; `dlm_token_recalls` 206–208 at A, acked at B 205–207, `dlm_token_recall_timeouts_live` 0, `invariant_tripwires` 0 on both |
+| (b) `kill -9 A` (the manager) mid-storm on B (202–213 of 2,000 creates visible) | B **PARKS 413–644 ms after the kill** (`T_self` 798 ms from the kill's last renewal; the daemon's own log line — its `.stats` is behind the kernel's revalidation of the root, a foreign object whose holder is dead, until the successor stands: a finding, below), the storm child alive with its acks held at the pre-admission gate; after the reclaim `membership_self_fences` 1, `appender_park_expiries` 0 |
+| remount A | the D0 ladder's same-host dead-pid proof: `appender 0 Live as the manager (term 2`, `membership owner term 2 … grace open`; the allocation leases TAKEN OVER from the dead incarnation (`alloc_lease_same_node_takeovers` 2, `alloc_lease_successions` 2, the EARLY records retired by the grant: `dead_members_recorded` 2, `appender_recoveries` 0 — B's region is never recovered) |
+| B's reclaim | the manager link re-points at A's new port off the epoch poll's newest checkpoint (`manager_repoints` 1, `the manager's listener moved to`), the reclaim admitted in the grace window (`admitted the reclaim`), the token plane re-pointed (`dlm_token_holder_repoints` 2), this listener re-published; the held writes drain: **the storm's 2,000 files whole on B AND on A** (read under tokens from B's listener dialled afresh); `appender_park_expiries` 0, `invariant_tripwires` 0, `joined_wire_words_rejected` 0, `membership_members` 1 at A. (B's held write outlives the 5 s op watchdog by design — the park holds acks up to `T_park_max`; the stage names the must-stay-0s one by one) |
+| (c) `appender clear <uri> 1` with A and B live | refused: `live-mounted` |
+| A's clean umount (B parks at `T_self`), `kill -9 B` parked (its page Live, unrecovered, no manager to record it) → `appender clear <uri> 1` | `appender 1 cleared (was live)`: the four writes — the page `Recovering{term 0}` (the next `appenders` row), the writer bring-up, the EARLY record on volume 0, the leave |
+| `appender clear <uri> 0` | refused (`refusing — the page is this node's OWN residue`: appender 0's page is the smoke host's manager; the `appender_zero` refusal is the fourth gate behind it) |
+| the next `mount` | its ledger poll acts on the EARLY record: `appender_recoveries` 1, `dead_members_acted` 1, rollbacks 0, `slot_custody_quarantines_installed` 64 (the EARLY record quarantines the recovered slots' custody); `appenders` shows the page `free`; B's 8 files whole from A |
+
+**The `-o ro` reader of a LIVE set** (`backend.KvBackend.openReader`, `meta/sym/reader_plane.zig`, `fuse/handler/reader_gate.zig`; 0002 rows 294–295): a `-o ro` mount of a symmetric set is a third `KvBackend` posture — the device read-only, no flock, no claim ("a reader claims nothing"), no ring, no lane, no conveyor, no checkpointer; every tree a PROJECTION at the newest checkpoint (the ledger's roots + tree 0's `slot_state` roots), every mutation entry `PartitionRefused` (EROFS). The writer faces at the mount decide the arm: an exclusive writer `flock` on the device (read off `/proc/locks` — no lock of the reader's own) or a heartbeat-fresh writer claim ⇒ TOKENS: a member of the home shard as a READER (a random 16 B id, no region, no park gate), the manager link off `endpoint:{0}` (the same epoch-poll resolver as a joiner's), ONE listener for the pushed recalls, and the divert with EVERY slot foreign (tree 0's lessee, or the manager for an unleased slot) — every TTL derives to 0 (`tokenReaderTtls`; an explicit `-o *_timeout` refuses), `reader_staleness_bound_ms` 0. No writer ⇒ QUIESCENT: the projection served exactly, the S5 epoch poll + the flock face every checkpoint landing ceiling (1.1 s) on the reader's beat; a writer seen fail-stops the mount ONCE — `ReaderGate` wraps the filesystem's vtable so every op answers `ReaderFailStopped` (ESTALE), `getattr(1)`, the virtual lookups and the virtual inodes excepted (`.stats` reads WHY). A token reader whose lease lapses re-evaluates the faces at its beat: no writer ⇒ the quiescent posture (every volume adopts the writers' last checkpoint RCU-style — the old trees retired, never freed under a reader), a writer ⇒ a rejoin with the planes re-pointed, every serve the typed EAGAIN meanwhile. A joiner's holder resolves a reader's listener for its recall push through the owner's CENSUS over the wire (row 294). The smoke row (`THE -o ro READER OF A LIVE SET`):
+
+| Row | Observed |
+|---|---|
+| `mount -o ro` C beside A (manager) and B (joined) | `mounted as a READER — the checkpointed projection`, `a member-reader of the home shard … every object read under a token`, `TTLs attr 0 ms entry 0 ms dir_entry 0 ms negative 0 ms`; no `writer claim committed`; `appenders` still lists A and B alone (a reader holds no region); `mount_posture = reader`, `reader_arm = tokens` |
+| C reads B's 2,000 files and A's tree | `dlm_token_grants` 2,016, hits 111, **`dlm_token_local_reads` 0**, `dlm_token_reader_holder_planes` 2 (A and B), `reader_staleness_bound_ms` 0; a write on C answers `Read-only file system` |
+| B writes `b1/f7` | C's next read is the fresh content (`dlm_token_recalls_received` ≥ 1 at C, `recall_timeouts_live` 0): the recall — not a TTL, not a poll — is the proof |
+| A and B leave | C's lease lapses, no face stands: `reader_arm = quiescent` (`reader_quiescent_transitions` 1), every read local and fresh off the writers' last checkpoint (`fresh`, 500, `a2`) |
+| A mounts again | C's poll sees the ledger advance: `a writer appeared (ledger_advance) under the quiescent reader — every metadata op now answers ESTALE`; `ls` and `cat` on C answer `Stale file handle`, `.stats` reads (`reader_fail_stopped: true`) |
+| remount C | `reader_arm = tokens` again; `fresh`/`a2` read under tokens; every must-stay-0 gauge 0 on A and C, `membership_members` 1 at A |
+
+**Also in this wave**: a fail-closed token channel (a failed round) is re-probed ONCE inside the same op by the divert (row 293 — before it, one transient failure left every read of that holder EAGAIN for ever); the wire reply buffer holds a full grant page (`frame.CONTROL_CAP`, asserted ≥ 2 × `GRANT_PAGE_BUDGET`; a 4,000-entry directory read from a peer answered EIO at the 64 KiB cap — row 299); the manager's D0 successor takes its predecessor's allocation leases over (`acquireAndHold` with page 0's identity at the open as the proof, incarnations told apart by `writer_id` — row 298); a holder bitmap with no journal sink queues no deltas (the ring filled after 192 carves once the successor armed its grant plane — the RAM posture of row 292 made explicit); `status`'s guard probe reads `/proc/locks` like the reader's.
+
+**Gate totals (the close).** Linux venue (`scripts/venue zig build gate` under `timeout 3600`,
+uncached, 7 m 53 s): 18/18 steps; unit 1,827 pass / 19 skipped, rails 5/5, smoke 43 pass / 1 skipped
+(the three kill-row stages ≈ 90 s together, the `-o ro` row ≈ 40 s), bench-smoke 28/28 — 1,903 /
+1,923 in all; `dmesg | grep -c retained` 0 → 0; no `squeezefs` process and no fuse mount left;
+`scripts/venue trim` after. macOS (`zig build gate`, uncached, 6 m 17 s): 18/18 steps, unit 1,540
+pass / 16 skipped (the Linux-only modules skip), rails 5/5.

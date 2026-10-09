@@ -1,0 +1,652 @@
+//! THE SHIM SMOKE (venue, root, Linux): `libsqueezefs_il.so` beside
+//! `./squeezefs` in the cwd (build.zig stages both), driven as a foreign
+//! process would see it — `LD_PRELOAD` on `dd`/`sha256sum`/`cat`/`cp`/
+//! `truncate`/`tar`, a C program over `pread`/`pwrite`/`lseek`/`fstat`/
+//! `dup`/`mmap`/`fork`, and a libaio harness (local ABI mirrors, `dlopen`
+//! of libaio through the global scope so a preloaded shim's interposers
+//! win; the shim's own raw-syscall arm serves it where libaio is absent).
+//!
+//! Rows:
+//!   1. the plain-file passthrough battery on ext4: byte parity + exit
+//!      codes, the shim silent (zero session attempts);
+//!   2. a SqueezeFS mount WITHOUT `-o interception` under LD_PRELOAD: pure
+//!      passthrough (ENODATA ⇒ the negative cache), the daemon's
+//!      `ipc_sessions_total` 0;
+//!   3. the C program and the aio harness on the plain mount (passthrough
+//!      parity, every bail-out path exercised without a session);
+//!   4. with `-o interception` when the daemon accepts it: the engagement
+//!      law (`ipc_sessions_total ≥ 1`, `ipc_ops_*` deltas account for the
+//!      dd/sha256sum ops), the C program's bail-outs, the aio harness
+//!      served, the pairing refusal of a `-dirty` build (counted, one
+//!      line), the kill of the daemon mid-op ⇒ the app's call returns the
+//!      passthrough result. A mount that refuses the option marks these
+//!      rows PENDING on the host wave, loudly, and the test passes on
+//!      rows 1–3.
+//!
+//! Venue IOPS are scoping only (the 1,017,548 warm / 622,112 device-true
+//! rows are the reference-hardware bar).
+
+const std = @import("std");
+const builtin = @import("builtin");
+const linux = std.os.linux;
+const Io = std.Io;
+
+const clock = @import("../core/clock.zig");
+const log = @import("../core/log.zig");
+
+comptime {
+    if (builtin.os.tag != .linux) @compileError("shim/smoke is Linux only");
+}
+
+const testing = std.testing;
+
+const SO_NAME = "libsqueezefs_il.so";
+const volume_len: u64 = 256 << 20;
+const data_len: u64 = 2 << 30;
+const ready_wait_ns: u64 = 60 * std.time.ns_per_s;
+const exit_wait_ns: u64 = 60 * std.time.ns_per_s;
+
+fn sleepMs(ms: u64) void {
+    const ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    _ = linux.nanosleep(&ts, null);
+}
+
+fn alive(pid: linux.pid_t) bool {
+    var buf: [64]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/stat", .{pid}, 0) catch return false;
+    const rc = linux.open(p, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var text: [512]u8 = undefined;
+    const n = linux.read(fd, &text, text.len);
+    if (linux.errno(n) != .SUCCESS or n == 0) return false;
+    // "pid (comm) STATE ..." — a zombie is not alive.
+    const close_paren = std.mem.lastIndexOfScalar(u8, text[0..n], ')') orelse return false;
+    return close_paren + 2 < n and text[close_paren + 2] != 'Z';
+}
+
+fn venueAvailable(io: Io) bool {
+    if (linux.getuid() != 0) return false;
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "squeezefs", 0, .{ .TYPE = true }, &st)) != .SUCCESS) return false;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, SO_NAME, 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
+        log.warn("shim smoke: no ./{s} in the cwd — run through `zig build shim-smoke`. Skipping.", .{SO_NAME});
+        return false;
+    }
+    const rc = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    _ = linux.close(@intCast(rc));
+    _ = io;
+    return true;
+}
+
+const Rig = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    bin: [:0]u8,
+    so: [:0]u8,
+    work: [:0]u8,
+    img: [:0]u8,
+    d0: [:0]u8,
+    d1: [:0]u8,
+    meta_uri: []u8,
+    data_uri: []u8,
+    mp: [:0]u8,
+    log_path: [:0]u8,
+    log_file: ?Io.File = null,
+    child: ?std.process.Child = null,
+    child_pid: linux.pid_t = 0,
+    env: std.process.Environ.Map,
+    /// The environment of LD_PRELOAD'd processes.
+    preload_env: std.process.Environ.Map,
+    zig_exe: ?[]u8 = null,
+
+    fn init(gpa: std.mem.Allocator, io: Io) !*Rig {
+        const self = try gpa.create(Rig);
+        errdefer gpa.destroy(self);
+        const pid = linux.getpid();
+        _ = linux.mkdir("/build/tmp", 0o755);
+        var cwd_buf: [linux.PATH_MAX]u8 = undefined;
+        const n = Io.Dir.cwd().realPath(io, &cwd_buf) catch return error.NoCwd;
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .bin = try std.fmt.allocPrintSentinel(gpa, "{s}/squeezefs", .{cwd_buf[0..n]}, 0),
+            .so = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ cwd_buf[0..n], SO_NAME }, 0),
+            .work = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/shim-{d}", .{pid}, 0),
+            .img = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/shim-{d}/vol.img", .{pid}, 0),
+            .d0 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/shim-{d}/d0.img", .{pid}, 0),
+            .d1 = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/shim-{d}/d1.img", .{pid}, 0),
+            .meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///build/tmp/shim-{d}/vol.img", .{pid}),
+            .data_uri = try std.fmt.allocPrint(gpa, "sqdata:///build/tmp/shim-{d}/d0.img,/build/tmp/shim-{d}/d1.img", .{ pid, pid }),
+            .mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/shim-mnt-{d}", .{pid}, 0),
+            .log_path = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/shim-{d}/daemon.log", .{pid}, 0),
+            .env = std.process.Environ.Map.init(gpa),
+            .preload_env = std.process.Environ.Map.init(gpa),
+        };
+        const path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/zig";
+        try self.env.put("PATH", path);
+        // A dev tree's identity is `-dirty` on both ends: the seam admits
+        // it (the pre-check and the daemon's screen both read it).
+        try self.env.put("SQUEEZEFS_TEST_IPC_ALLOW_DIRTY", "1");
+        try self.preload_env.put("PATH", path);
+        try self.preload_env.put("LD_PRELOAD", self.so);
+        try self.preload_env.put("SQUEEZEFS_TEST_IPC_ALLOW_DIRTY", "1");
+        _ = linux.mkdir(self.work.ptr, 0o755);
+        _ = linux.mkdir(self.mp.ptr, 0o755);
+        // `zig cc` needs its caches: the venue's global cache when the test
+        // inherited it, a scratch one under the work dir otherwise.
+        var proc_env = try std.testing.environ.createMap(gpa);
+        defer proc_env.deinit();
+        const cache = try std.fmt.allocPrint(gpa, "{s}/zig-cache", .{self.work});
+        defer gpa.free(cache);
+        try self.env.put("ZIG_GLOBAL_CACHE_DIR", proc_env.get("ZIG_GLOBAL_CACHE_DIR") orelse cache);
+        try self.env.put("ZIG_LOCAL_CACHE_DIR", cache);
+        try self.env.put("HOME", "/root");
+        // The C rows need a compiler: `zig cc` from PATH.
+        if (self.sh(self.work, "command -v zig")) |r| {
+            defer self.gpa.free(r.stderr);
+            if (r.term.success() and std.mem.trim(u8, r.stdout, " \n").len != 0) {
+                self.zig_exe = try gpa.dupe(u8, std.mem.trim(u8, r.stdout, " \n"));
+            }
+            self.gpa.free(r.stdout);
+        } else |_| {}
+        return self;
+    }
+
+    fn deinit(self: *Rig) void {
+        if (self.child) |*c| {
+            _ = linux.kill(self.child_pid, .KILL);
+            _ = c.wait(self.io) catch {};
+        }
+        _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
+        if (self.log_file) |f| f.close(self.io);
+        _ = linux.rmdir(self.mp.ptr);
+        Io.Dir.cwd().deleteTree(self.io, self.work) catch {};
+        self.env.deinit();
+        self.preload_env.deinit();
+        if (self.zig_exe) |z| self.gpa.free(z);
+        self.gpa.free(self.bin);
+        self.gpa.free(self.so);
+        self.gpa.free(self.work);
+        self.gpa.free(self.img);
+        self.gpa.free(self.d0);
+        self.gpa.free(self.d1);
+        self.gpa.free(self.meta_uri);
+        self.gpa.free(self.data_uri);
+        self.gpa.free(self.mp);
+        self.gpa.free(self.log_path);
+        self.gpa.destroy(self);
+    }
+
+    fn squeezefs(self: *Rig, args: []const []const u8) !std.process.RunResult {
+        var argv: [16][]const u8 = undefined;
+        argv[0] = self.bin;
+        for (args, 0..) |a, i| argv[i + 1] = a;
+        return std.process.run(self.gpa, self.io, .{ .argv = argv[0 .. args.len + 1], .environ_map = &self.env });
+    }
+
+    fn freeRun(self: *Rig, r: std.process.RunResult) void {
+        self.gpa.free(r.stdout);
+        self.gpa.free(r.stderr);
+    }
+
+    fn sh(self: *Rig, cwd: []const u8, script: []const u8) !std.process.RunResult {
+        return std.process.run(self.gpa, self.io, .{ .argv = &.{ "sh", "-e", "-c", script }, .cwd = .{ .path = cwd }, .environ_map = &self.env });
+    }
+
+    /// A shell script under LD_PRELOAD; both streams returned.
+    fn preload(self: *Rig, cwd: []const u8, script: []const u8) !std.process.RunResult {
+        return std.process.run(self.gpa, self.io, .{ .argv = &.{ "sh", "-e", "-c", script }, .cwd = .{ .path = cwd }, .environ_map = &self.preload_env });
+    }
+
+    fn preloadOk(self: *Rig, cwd: []const u8, script: []const u8) !std.process.RunResult {
+        const r = try self.preload(cwd, script);
+        if (!r.term.success()) {
+            std.debug.print("\n--- preload script failed ({f}) ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, script, r.stdout, r.stderr });
+            self.freeRun(r);
+            return error.ScriptFailed;
+        }
+        return r;
+    }
+
+    fn formatSet(self: *Rig) !void {
+        for ([_][:0]u8{ self.img, self.d0, self.d1 }, 0..) |p, i| {
+            const f = try Io.Dir.cwd().createFile(self.io, p, .{ .truncate = true });
+            defer f.close(self.io);
+            try f.setLength(self.io, if (i == 0) volume_len else data_len);
+        }
+        const r = try self.squeezefs(&.{ "format", self.meta_uri, self.data_uri });
+        defer self.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+
+    /// Spawn the foreground mount; false = the daemon refused the options
+    /// (its stderr is in the log).
+    fn mount(self: *Rig, extra: []const []const u8) !bool {
+        std.debug.assert(self.child == null);
+        if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
+        const from = try self.logLen();
+        var argv: [16][]const u8 = undefined;
+        var n: usize = 0;
+        argv[n] = self.bin;
+        n += 1;
+        argv[n] = "mount";
+        n += 1;
+        for (extra) |a| {
+            argv[n] = a;
+            n += 1;
+        }
+        argv[n] = self.meta_uri;
+        n += 1;
+        argv[n] = self.mp;
+        n += 1;
+        self.child = try std.process.spawn(self.io, .{ .argv = argv[0..n], .environ_map = &self.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
+        self.child_pid = self.child.?.id.?;
+        const deadline = clock.monotonicNs() + ready_wait_ns;
+        while (true) {
+            const text = try self.readLog();
+            defer self.gpa.free(text);
+            if (text.len > from and std.mem.indexOf(u8, text[from..], "ready: ") != null) return true;
+            if (!alive(self.child_pid)) {
+                var c = self.child.?;
+                self.child = null;
+                _ = c.wait(self.io) catch {};
+                return false;
+            }
+            if (clock.monotonicNs() >= deadline) return error.Timeout;
+            sleepMs(20);
+        }
+    }
+
+    fn umount(self: *Rig) !void {
+        const r = try self.squeezefs(&.{ "umount", self.mp });
+        defer self.freeRun(r);
+        if (!r.term.success()) std.debug.print("\numount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        var c = self.child.?;
+        self.child = null;
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (alive(self.child_pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        if (alive(self.child_pid)) _ = linux.kill(self.child_pid, .KILL);
+        _ = try c.wait(self.io);
+    }
+
+    fn kill9(self: *Rig) void {
+        if (self.child) |*c| {
+            _ = linux.kill(self.child_pid, .KILL);
+            _ = c.wait(self.io) catch {};
+            self.child = null;
+        }
+        _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
+    }
+
+    fn readLog(self: *Rig) ![]u8 {
+        return Io.Dir.cwd().readFileAlloc(self.io, self.log_path, self.gpa, .limited(16 << 20));
+    }
+
+    fn logLen(self: *Rig) !usize {
+        const text = try self.readLog();
+        defer self.gpa.free(text);
+        return text.len;
+    }
+
+    /// SIGUSR1 → the stats families in the log; the tail from the mark.
+    fn statsTail(self: *Rig) ![]u8 {
+        const mark = try self.logLen();
+        _ = linux.kill(self.child_pid, .USR1);
+        const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            const text = try self.readLog();
+            if (text.len > mark and std.mem.indexOf(u8, text[mark..], "stats daemon: ") != null) return text;
+            self.gpa.free(text);
+            sleepMs(20);
+        }
+        return error.Timeout;
+    }
+
+    /// Compile a C source with `zig cc`; the binary path (owned) or null
+    /// when no compiler is available.
+    fn cc(self: *Rig, name: []const u8, source: []const u8) !?[]u8 {
+        const zig = self.zig_exe orelse return null;
+        const src_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}.c", .{ self.work, name });
+        defer self.gpa.free(src_path);
+        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = src_path, .data = source });
+        const bin_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.work, name });
+        errdefer self.gpa.free(bin_path);
+        const r = try std.process.run(self.gpa, self.io, .{ .argv = &.{ zig, "cc", "-O1", "-o", bin_path, src_path }, .environ_map = &self.env });
+        defer self.freeRun(r);
+        if (!r.term.success()) {
+            std.debug.print("\n--- zig cc {s} failed ---\n{s}\n", .{ name, r.stderr });
+            return error.CompileFailed;
+        }
+        return bin_path;
+    }
+};
+
+fn numberAfter(text: []const u8, key: []const u8) ?u64 {
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    var j = i + key.len;
+    while (j < text.len and (text[j] == ' ' or text[j] == ':')) j += 1;
+    var k = j;
+    while (k < text.len and text[k] >= '0' and text[k] <= '9') k += 1;
+    if (k == j) return null;
+    return std.fmt.parseInt(u64, text[j..k], 10) catch null;
+}
+
+/// The byte-parity battery: dd 64 MiB → sha256sum, cat, cp, truncate, tar,
+/// all under LD_PRELOAD; prints the sha of the file and of a cp of it.
+const battery_script =
+    \\dd if=/dev/urandom of=f bs=1M count=64 status=none
+    \\a=$(sha256sum f | cut -d' ' -f1)
+    \\cp f g
+    \\cat g > h
+    \\b=$(sha256sum h | cut -d' ' -f1)
+    \\test "$a" = "$b"
+    \\truncate -s 3M h
+    \\test "$(stat -c %s h)" = 3145728
+    \\head -c 3M f | cmp - h
+    \\tar cf t.tar f
+    \\tar xf t.tar -O f | cmp - f
+    \\dd if=f of=/dev/null bs=4k status=none
+    \\echo "sha $a"
+;
+
+/// The C program: positional + offsetful I/O, lseek, fstat, dup, mmap
+/// (the per-inode unbind), fork (the child's passthrough), exec (CLOEXEC
+/// drops the session); byte parity asserted at every step; exit 0.
+const c_program =
+    \\#define _GNU_SOURCE
+    \\#include <errno.h>
+    \\#include <fcntl.h>
+    \\#include <stdio.h>
+    \\#include <stdlib.h>
+    \\#include <string.h>
+    \\#include <sys/mman.h>
+    \\#include <sys/stat.h>
+    \\#include <sys/uio.h>
+    \\#include <sys/wait.h>
+    \\#include <unistd.h>
+    \\#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d %s (errno %d)\n", __FILE__, __LINE__, #c, errno); return 2; } } while (0)
+    \\int main(int argc, char **argv) {
+    \\    if (argc < 2) return 3;
+    \\    char buf[65536], out[65536];
+    \\    for (int i = 0; i < 65536; i++) buf[i] = (char)(i * 31 + 7);
+    \\    int fd = open(argv[1], O_RDWR | O_CREAT | O_TRUNC, 0644);
+    \\    CHECK(fd >= 0);
+    \\    CHECK(pwrite(fd, buf, 65536, 0) == 65536);
+    \\    CHECK(pwrite(fd, buf, 4096, 1 << 20) == 4096);
+    \\    CHECK(pread(fd, out, 65536, 0) == 65536 && memcmp(buf, out, 65536) == 0);
+    \\    CHECK(lseek(fd, 0, SEEK_SET) == 0);
+    \\    CHECK(write(fd, buf, 1000) == 1000);
+    \\    CHECK(write(fd, buf + 1000, 1000) == 1000);
+    \\    CHECK(lseek(fd, 0, SEEK_CUR) == 2000);
+    \\    CHECK(lseek(fd, 500, SEEK_SET) == 500);
+    \\    CHECK(read(fd, out, 1500) == 1500 && memcmp(buf + 500, out, 1500) == 0);
+    \\    CHECK(lseek(fd, -1, SEEK_SET) == -1 && errno == EINVAL);
+    \\    struct stat st; CHECK(fstat(fd, &st) == 0 && st.st_size == (1 << 20) + 4096);
+    \\    CHECK(lseek(fd, 0, SEEK_END) == (1 << 20) + 4096);
+    \\    struct iovec iov[2] = { { buf, 100 }, { buf + 100, 200 } };
+    \\    CHECK(pwritev(fd, iov, 2, 8192) == 300);
+    \\    CHECK(pread(fd, out, 300, 8192) == 300 && memcmp(buf, out, 300) == 0);
+    \\    int d = dup(fd); CHECK(d >= 0);
+    \\    CHECK(lseek(d, 0, SEEK_SET) == 0);
+    \\    CHECK(read(fd, out, 10) == 10);
+    \\    CHECK(lseek(d, 0, SEEK_CUR) == 10);
+    \\    CHECK(close(fd) == 0);
+    \\    CHECK(pread(d, out, 4096, 1 << 20) == 4096 && memcmp(buf, out, 4096) == 0);
+    \\    char *m = mmap(NULL, 65536, PROT_READ, MAP_SHARED, d, 0);
+    \\    CHECK(m != MAP_FAILED && memcmp(m, buf, 65536) == 0);
+    \\    CHECK(pwrite(d, buf, 16, 0) == 16);
+    \\    munmap(m, 65536);
+    \\    pid_t pid = fork(); CHECK(pid >= 0);
+    \\    if (pid == 0) {
+    \\        char c[4096];
+    \\        if (pread(d, c, 4096, 0) != 4096 || memcmp(c, buf, 4096) != 0) _exit(4);
+    \\        if (pwrite(d, buf, 4096, 2 << 20) != 4096) _exit(5);
+    \\        execl("/bin/true", "true", (char *)0);
+    \\        _exit(6);
+    \\    }
+    \\    int status = 0; CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    \\    CHECK(pread(d, out, 4096, 2 << 20) == 4096 && memcmp(buf, out, 4096) == 0);
+    \\    CHECK(fcntl(d, F_GETFL) >= 0);
+    \\    struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1 };
+    \\    CHECK(fcntl(d, F_SETLK, &fl) == 0);
+    \\    CHECK(pwrite(d, buf, 8, 4096) == 8);
+    \\    CHECK(close(d) == 0);
+    \\    CHECK(close(d) == -1 && errno == EBADF);
+    \\    puts("C_OK");
+    \\    return 0;
+    \\}
+;
+
+/// The libaio lifecycle harness: local ABI mirrors; the symbols resolved
+/// through the GLOBAL scope (`dlopen(libaio, RTLD_GLOBAL)` when present,
+/// else the shim's own exports / the raw syscalls); `io_setup` BEFORE the
+/// file (the field crash ordering) and after; 8 PWRITEs in one `io_submit`,
+/// a drain, 8 PREADs, byte parity, cookie identity; `events == submits`.
+const aio_harness =
+    \\#define _GNU_SOURCE
+    \\#include <dlfcn.h>
+    \\#include <errno.h>
+    \\#include <fcntl.h>
+    \\#include <stdint.h>
+    \\#include <stdio.h>
+    \\#include <stdlib.h>
+    \\#include <string.h>
+    \\#include <sys/syscall.h>
+    \\#include <time.h>
+    \\#include <unistd.h>
+    \\typedef void *io_context_t;
+    \\struct iocb { uint64_t data; uint32_t key; uint32_t aio_rw_flags; uint16_t aio_lio_opcode; uint16_t aio_reqprio; int32_t aio_fildes; uint64_t buf; uint64_t nbytes; int64_t offset; int64_t pad3; uint32_t flags; uint32_t resfd; };
+    \\struct io_event { uint64_t data; uint64_t obj; int64_t res; int64_t res2; };
+    \\typedef int (*setup_t)(int, io_context_t *);
+    \\typedef int (*destroy_t)(io_context_t);
+    \\typedef int (*submit_t)(io_context_t, long, struct iocb **);
+    \\typedef int (*getevents_t)(io_context_t, long, long, struct io_event *, struct timespec *);
+    \\static setup_t p_setup; static destroy_t p_destroy; static submit_t p_submit; static getevents_t p_getevents;
+    \\static int raw_setup(int n, io_context_t *c) { return (int)syscall(SYS_io_setup, n, c) < 0 ? -errno : 0; }
+    \\static int raw_destroy(io_context_t c) { return syscall(SYS_io_destroy, c) < 0 ? -errno : 0; }
+    \\static int raw_submit(io_context_t c, long n, struct iocb **ios) { long r = syscall(SYS_io_submit, c, n, ios); return r < 0 ? -errno : (int)r; }
+    \\static int raw_getevents(io_context_t c, long mn, long n, struct io_event *e, struct timespec *t) { long r = syscall(SYS_io_getevents, c, mn, n, e, t); return r < 0 ? -errno : (int)r; }
+    \\#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %d %s (errno %d)\n", __LINE__, #c, errno); return 2; } } while (0)
+    \\static int run(const char *path, int setup_first) {
+    \\    io_context_t ctx = 0;
+    \\    int fd = -1;
+    \\    if (setup_first) CHECK(p_setup(32, &ctx) == 0);
+    \\    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644); CHECK(fd >= 0);
+    \\    if (!setup_first) CHECK(p_setup(32, &ctx) == 0);
+    \\    static char wbuf[8][4096], rbuf[8][4096];
+    \\    struct iocb ios[8], *ptrs[8];
+    \\    for (int i = 0; i < 8; i++) {
+    \\        memset(wbuf[i], 'a' + i, 4096);
+    \\        memset(&ios[i], 0, sizeof ios[i]);
+    \\        ios[i].data = 100 + i; ios[i].aio_lio_opcode = 1; ios[i].aio_fildes = fd;
+    \\        ios[i].buf = (uint64_t)(uintptr_t)wbuf[i]; ios[i].nbytes = 4096; ios[i].offset = (int64_t)i * 4096;
+    \\        ptrs[i] = &ios[i];
+    \\    }
+    \\    CHECK(p_submit(ctx, 8, ptrs) == 8);
+    \\    struct io_event ev[8]; int got = 0;
+    \\    while (got < 8) { struct timespec ts = { 5, 0 }; int r = p_getevents(ctx, 1, 8 - got, ev + got, &ts); CHECK(r > 0); got += r; }
+    \\    for (int i = 0; i < 8; i++) { int k = (int)(ev[i].data - 100); CHECK(k >= 0 && k < 8); CHECK(ev[i].obj == (uint64_t)(uintptr_t)&ios[k]); if (ev[i].res != 4096) { fprintf(stderr, "FAIL write res=%lld\n", (long long)ev[i].res); return 2; } }
+    \\    for (int i = 0; i < 8; i++) { ios[i].aio_lio_opcode = 0; ios[i].buf = (uint64_t)(uintptr_t)rbuf[i]; ios[i].data = 200 + i; }
+    \\    CHECK(p_submit(ctx, 8, ptrs) == 8);
+    \\    got = 0;
+    \\    while (got < 8) { struct timespec ts = { 5, 0 }; int r = p_getevents(ctx, 2, 8 - got, ev + got, &ts); CHECK(r > 0); got += r; }
+    \\    for (int i = 0; i < 8; i++) CHECK(memcmp(wbuf[i], rbuf[i], 4096) == 0);
+    \\    CHECK(p_destroy(ctx) == 0);
+    \\    CHECK(close(fd) == 0);
+    \\    return 0;
+    \\}
+    \\int main(int argc, char **argv) {
+    \\    if (argc < 2) return 3;
+    \\    void *h = dlopen("libaio.so.1", RTLD_NOW | RTLD_GLOBAL);
+    \\    p_setup = (setup_t)dlsym(RTLD_DEFAULT, "io_setup"); p_destroy = (destroy_t)dlsym(RTLD_DEFAULT, "io_destroy");
+    \\    p_submit = (submit_t)dlsym(RTLD_DEFAULT, "io_submit"); p_getevents = (getevents_t)dlsym(RTLD_DEFAULT, "io_getevents");
+    \\    const char *lane = "shim-or-libaio";
+    \\    if (!p_setup || !p_destroy || !p_submit || !p_getevents) { p_setup = raw_setup; p_destroy = raw_destroy; p_submit = raw_submit; p_getevents = raw_getevents; lane = "raw-syscalls"; }
+    \\    int r = run(argv[1], 1); if (r) return r;
+    \\    r = run(argv[1], 0); if (r) return r;
+    \\    printf("AIO_OK\n");
+    \\    fprintf(stderr, "aio lane=%s libaio=%s\n", lane, h ? "present" : "absent");
+    \\    return 0;
+    \\}
+;
+
+const CRows = struct {
+    c_bin: ?[]u8 = null,
+    aio_bin: ?[]u8 = null,
+
+    fn build(rig: *Rig) !CRows {
+        var self: CRows = .{};
+        self.c_bin = try rig.cc("shim_c_program", c_program);
+        self.aio_bin = try rig.cc("shim_aio_harness", aio_harness);
+        return self;
+    }
+
+    fn deinit(self: *CRows, gpa: std.mem.Allocator) void {
+        if (self.c_bin) |b| gpa.free(b);
+        if (self.aio_bin) |b| gpa.free(b);
+    }
+
+    /// Run both programs against `dir/<name>` twice — WITHOUT the shim
+    /// (the baseline) and under LD_PRELOAD — and hold the bail-out law: a
+    /// passthrough run is indistinguishable from the baseline (same stdout,
+    /// same exit status). On an armed mount (`served`) the preload run must
+    /// succeed outright: the ring serves what kernel FUSE may refuse (its
+    /// own aio write answers EIO on this daemon). Returns the preload
+    /// runs' combined output (owned).
+    fn run(self: *CRows, rig: *Rig, dir: []const u8, served: bool) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(rig.gpa);
+        errdefer out.deinit();
+        const progs = [_]struct { bin: ?[]u8, file: []const u8, marker: []const u8 }{
+            .{ .bin = self.c_bin, .file = "cprog.bin", .marker = "C_OK" },
+            .{ .bin = self.aio_bin, .file = "aio.bin", .marker = "AIO_OK" },
+        };
+        for (progs) |p| {
+            const b = p.bin orelse continue;
+            const script = try std.fmt.allocPrint(rig.gpa, "{s} {s}/{s}", .{ b, dir, p.file });
+            defer rig.gpa.free(script);
+            const base = try rig.sh(dir, script);
+            defer rig.freeRun(base);
+            const pre = try rig.preload(dir, script);
+            defer rig.freeRun(pre);
+            if (served) {
+                if (!pre.term.success() or std.mem.indexOf(u8, pre.stdout, p.marker) == null) {
+                    std.debug.print("\n--- {s} under the shim on the armed mount failed ({f}) ---\n{s}\n{s}\n", .{ p.file, pre.term, pre.stdout, pre.stderr });
+                    return error.ServedRowFailed;
+                }
+            } else {
+                // The law: the shim's passthrough is the baseline, byte for byte.
+                const same = std.meta.eql(base.term, pre.term) and std.mem.eql(u8, base.stdout, pre.stdout);
+                if (!same) {
+                    std.debug.print("\n--- {s}: the shim's passthrough differs from the baseline ---\nbaseline ({f}): {s}\n{s}\npreload ({f}): {s}\n{s}\n", .{ p.file, base.term, base.stdout, base.stderr, pre.term, pre.stdout, pre.stderr });
+                    return error.PassthroughDiffers;
+                }
+                // The shim prints nothing on a passthrough.
+                try testing.expect(std.mem.indexOf(u8, pre.stderr, "squeezefs-il") == null);
+            }
+            try out.writer.writeAll(pre.stdout);
+            try out.writer.writeAll(pre.stderr);
+        }
+        return out.toOwnedSlice();
+    }
+};
+
+test "shim smoke: the LD_PRELOAD battery — plain-file parity with the shim silent; a SqueezeFS mount without -o interception stays pure passthrough (ipc_sessions_total 0); the C program and the libaio harness; then the engagement rows on an interception mount (dd/sha through the ring, the C program's bail-outs, aio served, the -dirty pairing refusal counted, kill -9 mid-op ⇒ the passthrough result) or PENDING when the daemon refuses the option" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var crows = try CRows.build(rig);
+    defer crows.deinit(gpa);
+    if (rig.zig_exe == null) std.debug.print("\nshim smoke: no `zig` in PATH — the C program and the aio harness rows are skipped\n", .{});
+
+    // ---- row 1: the plain-file battery on ext4 ----
+    {
+        const r = try rig.preloadOk(rig.work, battery_script);
+        defer rig.freeRun(r);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "sha ") != null);
+        // The shim is silent on a foreign filesystem: no session attempt,
+        // no line.
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "squeezefs-il") == null);
+        const c = try crows.run(rig, rig.work, false);
+        defer gpa.free(c);
+        std.debug.print("\nshim smoke row 1 (ext4 passthrough): ok; {s}\n", .{if (std.mem.indexOf(u8, c, "aio lane=")) |i| std.mem.trim(u8, c[i..@min(c.len, i + 48)], "\n") else "aio n/a"});
+    }
+
+    // ---- row 2: a SqueezeFS mount WITHOUT interception ----
+    try rig.formatSet();
+    try testing.expect(try rig.mount(&.{}));
+    {
+        const r = try rig.preloadOk(rig.mp, battery_script);
+        defer rig.freeRun(r);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "squeezefs-il") == null);
+        const c = try crows.run(rig, rig.mp, false);
+        defer gpa.free(c);
+        const tail = try rig.statsTail();
+        defer gpa.free(tail);
+        const sessions = numberAfter(tail, "\"ipc_sessions_total\":") orelse 0;
+        try testing.expectEqual(@as(u64, 0), sessions);
+        std.debug.print("shim smoke row 2 (plain mount passthrough): ok, ipc_sessions_total 0\n", .{});
+    }
+    try rig.umount();
+
+    // ---- rows 4+: the interception mount ----
+    const armed = try rig.mount(&.{ "-o", "interception" });
+    if (!armed) {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        std.debug.print("shim smoke rows 4+ PENDING: the daemon refused `-o interception` (the host wave lands it): {s}\n", .{if (std.mem.lastIndexOf(u8, text, "interception")) |i| std.mem.trim(u8, text[i -| 80..@min(text.len, i + 80)], "\n") else "(no diagnostic)"});
+        return;
+    }
+    defer rig.kill9();
+    // 4a: the pairing refusal of a mismatched identity — a preload process
+    // WITHOUT the dirty seam refuses a `-dirty` daemon loud, once per
+    // mount, and stays kernel-served (parity holds).
+    {
+        var strict = try rig.preload_env.clone(gpa);
+        defer strict.deinit();
+        _ = strict.swapRemove("SQUEEZEFS_TEST_IPC_ALLOW_DIRTY");
+        const r = try std.process.run(gpa, io, .{ .argv = &.{ "sh", "-e", "-c", "dd if=/dev/urandom of=strict bs=1M count=4 status=none; sha256sum strict > strict.sum; sha256sum -c strict.sum" }, .cwd = .{ .path = rig.mp }, .environ_map = &strict });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const refused = std.mem.indexOf(u8, r.stderr, "dev build identity") != null;
+        std.debug.print("shim smoke row 4a (pairing): {s}\n", .{if (refused) "a -dirty identity refused once, kernel-served" else "clean identity (the refusal row needs a dirty tree)"});
+        if (refused) try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stderr, "squeezefs-il:"));
+    }
+    // 4b: the engagement law — dd 64 MiB + sha256sum + cat/cp through the
+    // shim; the daemon's ipc_* family accounts for the ops.
+    {
+        const before = try rig.statsTail();
+        defer gpa.free(before);
+        const sessions0 = numberAfter(before, "\"ipc_sessions_total\":") orelse 0;
+        const r = try rig.preloadOk(rig.mp, battery_script);
+        defer rig.freeRun(r);
+        const c = try crows.run(rig, rig.mp, true);
+        defer gpa.free(c);
+        const after = try rig.statsTail();
+        defer gpa.free(after);
+        const sessions1 = numberAfter(after, "\"ipc_sessions_total\":") orelse 0;
+        try testing.expect(sessions1 > sessions0);
+        // Every ipc op counter the daemon exports (`ipc_ops_*`): the sum
+        // must be at least the dd's 64 writes + sha256sum's reads.
+        const ops_total = (numberAfter(after, "\"ipc_ops_read\":") orelse 0) + (numberAfter(after, "\"ipc_ops_write\":") orelse 0) - (numberAfter(before, "\"ipc_ops_read\":") orelse 0) - (numberAfter(before, "\"ipc_ops_write\":") orelse 0);
+        std.debug.print("shim smoke row 4b (engagement): sessions +{d}, ipc_ops_* sum {d}; stderr: {s}\n", .{ sessions1 - sessions0, ops_total, std.mem.trim(u8, r.stderr, "\n") });
+        try testing.expect(ops_total >= 64);
+    }
+    // 4c: kill -9 the daemon under a preloaded reader ⇒ the app's call
+    // returns the passthrough result (the kernel's answer for a dead
+    // FUSE mount is an error, never a hang or a crash of the app).
+    {
+        const script = try std.fmt.allocPrint(gpa, "(dd if=f of=/dev/null bs=1M status=none; echo \"dd rc=$?\") & sleep 0.2; kill -9 {d}; wait; echo KILL_ROW_DONE", .{rig.child_pid});
+        defer gpa.free(script);
+        const r = try rig.preload(rig.mp, script);
+        defer rig.freeRun(r);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "KILL_ROW_DONE") != null);
+        std.debug.print("shim smoke row 4c (kill -9 mid-op): {s}\n", .{std.mem.trim(u8, r.stdout, "\n")});
+    }
+}

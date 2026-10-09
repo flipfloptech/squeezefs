@@ -169,6 +169,133 @@ exists for, and the model's final check distinguishes the two.
 kv_fs face) and on the venue (the Linux half: the futex face, the memfd, the sockets, the ladder end
 to end).
 
+## Wave B2 — the LD_PRELOAD shim: `libsqueezefs_il.so`
+
+### What landed (`src/shim/`, `src/shim_so.zig`, `tests/shim_census.zig`; spec `docs/porting/il_shim.md`)
+
+- **The artifact**: `zig build shim` runs an explicit `zig build-lib -dynamic -lc -z nodelete
+  -fsoname=libsqueezefs_il.so -O ReleaseSafe` (0.17's `Step.Compile` has neither knob) with the
+  daemon's `build_options` as the identity; installed to `lib/`. The census (`tests/shim_census.zig`,
+  a rails step on Linux) parses the ELF: `SONAME libsqueezefs_il.so`, `DT_FLAGS_1 = NOW|NODELETE`,
+  `libc.so.6` the only `DT_NEEDED`, and the defined dynamic symbols EQUAL the ONE table — the 59 of
+  the spec + `openat2` + `signalfd4` + `squeezefs_il_bind` (62), nothing of Zig's or the client
+  library's. 2.0 MB on aarch64 (ReleaseSafe with debug info).
+- **`interpose.zig`**: the comptime `table` (name, libaio default version, API flag) generates the
+  exports (`@export` only when the root carries the build identity: the daemon's test binary links
+  the same bodies in linked mode and interposes nothing of itself), the real-symbol cache
+  (`dlsym(RTLD_NEXT)`, `dlvsym` for `io_*`, a missing symbol cached as missing), and one wrapper per
+  symbol obeying resolve-eagerly/call-lazily: no body ever calls a real function. Synthesized
+  answers where libc has no symbol: raw syscalls (`lseek`, `close_range`, `sendfile`,
+  `copy_file_range`, `splice`, `openat2`, `signalfd4`, the creators, and `io_*` — libaio's functions
+  are the kernel's). Variadics: true C-variadic exports on x86_64 (`@cVaStart`; `mode` read only
+  under `O_CREAT|O_TMPFILE`, the `fcntl` arg only for commands that take one); on aarch64 the LLVM
+  `VaList` is disabled by std ("miscompilations"), so the fixed-register AAPCS64 form reads the same
+  register under the same predicates (0002 row 341).
+- **`fd_table.zig`**: two-level slots (4096 × 1024) naming cells by index; cells in lazily mapped
+  chunks, recycled through a tagged-index Treiber free list (0002 row 344); a lookup pins (acquire
+  refusing 0) and re-validates the slot; `onClose`/`onDup`/`onCloseRange` (O(1) segment skips)/
+  `unbindIno` (per-cell flush + per-last-ref drop)/`forkFlushAll` (epoch bump, one flush per cell
+  armed under the previous epoch under a 1024-spin `tryLock`)/`clearAllInChild`; the offset mirror
+  with the authority predicate and the Dekker pair (`publish` = SeqCst store + SeqCst load of the
+  arm; `disarmIfCurrent` = SeqCst swap + SeqCst load, once, never for a stale or never-armed cell);
+  the lane gate's sticky `kernel_latch`; `DevCache` (1024 × 4-way, `dev + 1`, a deadline per entry,
+  the S1 backoff 60 s → 15 min) and `MappedInoSet` (8192 fingerprints, never evicts, overflow poisons
+  classification).
+- **`classify.zig`**: the 8-step ladder over injectable probes; the 32-slot registry keyed
+  `(st_dev, shard)` with `shard = fd % clamp(ceil(cpus/4), 2, 16)`; `Session.establish` with the
+  three rungs; the refusal code table (1–8, `0x1000|errno`, `0x2000|errno`, `0x4000|class`,
+  `0x8000|class`), the once set (128 pairs; past capacity it stops remembering, never printing), the
+  permanent-vs-backoff cache verdict per code; `Reason` (21 bail-out rows) counted process-wide
+  and on the session's stats page (`preload_passthrough_ops[24]`, `preload_bind_refused[10]` —
+  additive layout fields at offsets 48 and 240); `release` sends the Unbind through
+  `Session.tryUnbind` and defers on a busy ctl lock (0002 row 350).
+- **`ops.zig`**: positional (shape rows → pin → rights → gate → ring → outcome map; `real_poisoned`
+  demotes + releases), offsetful (the latch, the gate trigger under the lock, mirror vs raw
+  `SEEK_CUR` start, `publish` or write-through, `Errno` moves neither offset, the disarm-once on a
+  fallthrough), vector (total-bytes gate, segment by segment, partial counts, the short-and-dying
+  park of `f_pos`), `lseek` (SET/CUR arithmetic exactly `vfs_setpos`; END/DATA/HOLE re-seed and keep
+  the arm), the `f_pos`-consumer demotes, `close`/`dup`/`close_range`/the creator sweep/`fcntl`
+  (locks, `O_APPEND`, an `O_DIRECT` toggle)/`mmap` (the per-inode unbind; `MAP_SHARED` poisons the
+  inode)/`posix_spawn` (the fork flush).
+- **`aio.zig`**: the userspace ABI mirrors (64 B iocb, 32 B event, pinned), a 256-slot context
+  registry with collision retro-neutralization, the mixed-batch core generic over the two lanes
+  (kernel runs flush before each ring op; a partial run ends the prefix; a ring refusal reroutes at
+  its position; a first-op kernel errno propagates), the reap (ring first into the caller's array,
+  the kernel lane non-blocking while ring ops are pending, the batch-mark park in the deep regime, 4
+  sweeps then k = 1 in the sparse one, 1 ms / 5 ms bounds), `io_cancel` → `-EINPROGRESS` for a ring
+  op, destroy abandons; the knobs `SQUEEZEFS_IL_REAP_PARK_MAX` (24), `_REAP_QUANTUM_US` (50),
+  `_SPARSE_BATCH_MARKS` (on) read once per process.
+- **`lifecycle.zig`**: ctor-free lazy state (uninit → initializing → ready | failed) built by the
+  `open` family / `squeezefs_il_bind`; the thread-local guard; `pthread_atfork(prepare, null, child)`
+  registered once at the first state build (PREPARE = the epoch bump + flush; CHILD = flag-poison +
+  `close(2)` of every ctl copy, every slot cleared, the registry emptied so the child establishes its
+  own sessions); `shimPanic` (poison all, one raw line, abort); linked-mode detection by
+  `AT_SECURE` + `dl_iterate_phdr` (0002 row 348). Async-signal posture: no table operation takes a
+  lock; the per-description offset lock is held only across a serve window; an `open` from a
+  handler over a non-interposed frame pays the control plane (as the reference did).
+- **Knobs**: three A/B-lever rows for the reap; the shim reads `SQUEEZEFS_IL_SESSIONS`, `_SPINS`,
+  `_KERNEL_LANE_MIN`, `SQUEEZEFS_IPC_ARENA_THP`, the test seams, through the client library.
+
+### Models and the weakening that fails each (`shim/fd_table_model.zig`)
+
+| Model | Holds | Weakening | Fails |
+|---|---|---|---|
+| `MirrorDekker` — op `store offset → fence → load armed` vs demote `swap armed → fence → load offset`, a per-thread store buffer | yes | the op side's fence removed (the Release-store shape: the offset stays buffered while the arm is loaded) | FinalViolated: the final offset reaches neither consumer |
+| `RefcountDrop` — two closers of dup siblings + a pinning reader on one cell | yes | the acquire's zero refusal removed (plain `fetch_add`) | InvariantViolated: a dead cell resurrects / `last` reported twice |
+| `ForkEpochBind` — a bind racing the fork PREPARE's epoch bump | yes | the snapshot taken at BIND time instead of before the `open` | FinalViolated: a description the child shares is under an authoritative parent mirror |
+
+### End to end (Linux, in-process linked mode against the client library's `StubHost`; `shim/e2e.zig`)
+
+- The ladder (FUSE magic + the blob injected, `fstat`/`F_GETFL`/`lseek` real) establishes one
+  session per shard and binds; positional reads are byte-exact against the host's pattern, writes
+  acked; `served == ring ops`; the shape rows and the wrong direction are uncounted real calls; the
+  lane gate's over-threshold op is counted on both ledgers.
+- Offsetful ops ride the mirror (kernel `f_pos` still 0 after two writes), `SEEK_CUR`/`SEEK_SET` are
+  arithmetic, `-1` is EINVAL, `SEEK_END` re-seeds and keeps the arm, a dup shares the mirror, the
+  LAST close sends exactly one Unbind (observed on the host).
+- Vector ops serve segment by segment with one `f_pos` advance; `RWF_NOWAIT` demotes (the kernel
+  catches up) and takes the real call; a raw-closed number reused by `socket()` is swept;
+  `close_range` sweeps and `CLOSE_RANGE_CLOEXEC` does not.
+- `F_SETLK` and `F_SETFL+O_APPEND` unbind after flushing; `F_SETFL` without a class change keeps the
+  binding; `MAP_SHARED` unbinds both fds of the inode and poisons it (the next open is a counted
+  `mapped_inode` passthrough); `MAP_PRIVATE` unbinds without poisoning; the fork flush bumps the
+  epoch, writes the mirror through, demotes; the child clear drops every slot.
+- The daemon dying mid-op (frozen + severed): the op returns `.real` inside the heartbeat ladder
+  (≪ 5 s), the session is poisoned, the fd released with no ctl traffic, the real call answers, a
+  later open on the mount is a silent `poisoned` passthrough.
+- libaio: 8 iocbs in one `io_submit` (6 ring, 2 kernel-class to `/dev/null` through the raw
+  syscall lane) accepted in order; `io_getevents` merges them with exact cookies and `obj`
+  identity; 2 reads back pattern-exact; `io_cancel` of a ring op answers `-EINPROGRESS` (or the
+  real call once reaped); `served == 8`.
+- The table/interpose unit rows: the linked-mode wrappers pass a plain file's I/O through byte-exact
+  (`pread64`/`pwrite64`/`lseek`/`read`/`dup`/`close`, EBADF verbatim) and open no session.
+
+### The shim smoke (venue; `zig build shim-smoke`, after the bench smoke; `shim/smoke.zig`)
+
+- Row 1 (ext4 under `LD_PRELOAD`): dd 64 MiB → sha256sum, cp, cat, truncate, tar byte parity, exit
+  codes; the shim silent; the C program (`pread`/`pwrite`/`lseek`/`fstat`/`pwritev`/`dup`/`mmap`/
+  `fork`+`exec`/`F_SETLK`) and the aio harness identical WITH and WITHOUT the shim (stdout + exit
+  status) — the harness found the shim's `io_*` through `RTLD_DEFAULT` (`lane=shim-or-libaio
+  libaio=absent`: the venue has no libaio; the raw-syscall arm served it).
+- Row 2 (a SqueezeFS mount WITHOUT `-o interception`): the same battery, pure passthrough,
+  `ipc_sessions_total 0`, the shim silent (ENODATA ⇒ the negative cache). Finding: the kernel's own
+  aio PWRITE on the plain mount completes `-EIO` with and without the shim (0002 row 351; the host
+  wave's).
+- Rows 4a–4c (the armed mount: the `-dirty` pairing refusal counted once per mount, the engagement
+  law over `ipc_ops_{read,write}`, the C bail-outs served, kill -9 mid-op ⇒ the passthrough result)
+  are written and **PENDING**: on this tree the daemon answers `-o interception: not a squeezefs
+  mount option` (the host wave lands it); the smoke prints the pending line and passes on rows 1–3.
+  The venue's IOPS, when the armed rows run, are scoping only — the 1,017,548 warm / 622,112
+  device-true rows remain the reference-hardware bar.
+
+### Gates
+
+Linux (clean worktree at HEAD + this wave): `zig build test -Dtest-filter=shim.` 66 pass / 1 skip
+(the smoke's skip off its staged cwd), `rails` 5/5 + the census, `shim-smoke` rows 1–2 green with
+rows 4+ pending. macOS: the shim module is Linux-only (`squeezefs.zig` gates it) and the gate stays
+green. Two runs were `terminated with signal KILL` while another agent's gate ran its `pkill
+squeezefs` cleanup on the shared container (the test binaries are `squeezefs-*`); re-runs passed.
+
 ## Wave B3 — the native SDK: `libsqueezefs_sdk`, the second client kind
 
 Spec: `docs/porting/il_sdk.md` (§1 the surface, §2 the lease law, §3 the second kind, §4 the window,

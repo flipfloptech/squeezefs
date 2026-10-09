@@ -140,8 +140,12 @@ pub const WaitEntry = struct {
 pub const CtlLock = struct {
     word: futex.Word = .init(0),
 
+    pub fn tryLock(self: *CtlLock) bool {
+        return self.word.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+    }
+
     pub fn lock(self: *CtlLock) void {
-        if (self.word.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
+        if (self.tryLock()) return;
         while (self.word.swap(2, .acquire) != 0) futex.wait(&self.word, 2);
     }
 
@@ -358,6 +362,19 @@ pub const Session = struct {
         defer self.ctl_lock.unlock();
         const req: wire.Unbind = .{ .binding_id = id };
         rl.sendCtl(self.ctl, wire.frameBytes(&req), null) catch {};
+    }
+
+    /// `unbind` that never blocks: false = the ctl lock is held by another
+    /// thread (the shim's `close` is async-signal-safe by POSIX, so it
+    /// defers the unbind instead of parking on a lock the interrupted
+    /// thread may hold). A poisoned session answers true (nothing to send).
+    pub fn tryUnbind(self: *Session, id: u64) bool {
+        if (self.poisoned()) return true;
+        if (!self.ctl_lock.tryLock()) return false;
+        defer self.ctl_lock.unlock();
+        const req: wire.Unbind = .{ .binding_id = id };
+        rl.sendCtl(self.ctl, wire.frameBytes(&req), null) catch {};
+        return true;
     }
 
     // ---------------------------------------------------------------------
@@ -857,6 +874,8 @@ pub const StubHost = struct {
     ctl: linux.fd_t = -1,
     served: Atomic(u64) = .init(0),
     binds: Atomic(u64) = .init(0),
+    /// UNBIND frames received (the shim's refcount law: one per binding).
+    unbinds: Atomic(u64) = .init(0),
     next_binding: u64 = 1,
     /// The last BIND's rights (the per-op EBADF arm reads them).
     rights: Rights = .{ .read = true, .write = true },
@@ -1034,6 +1053,7 @@ pub const StubHost = struct {
                     },
                 }
             },
+            .unbind => _ = self.unbinds.fetchAdd(1, .monotonic),
             else => {},
         }
     }

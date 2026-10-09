@@ -396,6 +396,13 @@ comptime {
 
 /// CLIENT-written, display-only daemon-side: summed verbatim into the stats
 /// export at teardown, never a control input.
+/// The shim's bail-out attribution rows (spec §4; `shim/classify.zig`
+/// `Reason` indexes the array) and the daemon BIND refusal classes (index =
+/// `wire.RefuseClass` value, 0 = unknown): the client's side of the
+/// engagement ledger (decision 0002 ledger S5), display-only like the page.
+pub const PRELOAD_REASONS: usize = 24;
+pub const PRELOAD_REFUSE_CLASSES: usize = 10;
+
 pub const ClientStatsPage = extern struct {
     lane_gate_kernel_routes: Atomic(u64) = .init(0),
     lane_gate_kernel_bytes: Atomic(u64) = .init(0),
@@ -403,7 +410,9 @@ pub const ClientStatsPage = extern struct {
     il_submit_harvested: Atomic(u64) = .init(0),
     il_park_eras: Atomic(u64) = .init(0),
     il_slot_reroutes: Atomic(u64) = .init(0),
-    _reserved: [PAGE_BYTES - 48]u8 = @splat(0),
+    preload_passthrough_ops: [PRELOAD_REASONS]Atomic(u64) = @splat(.init(0)),
+    preload_bind_refused: [PRELOAD_REFUSE_CLASSES]Atomic(u64) = @splat(.init(0)),
+    _reserved: [PAGE_BYTES - 48 - 8 * (PRELOAD_REASONS + PRELOAD_REFUSE_CLASSES)]u8 = @splat(0),
 };
 
 comptime {
@@ -414,6 +423,8 @@ comptime {
     assert(@offsetOf(ClientStatsPage, "il_submit_harvested") == 24);
     assert(@offsetOf(ClientStatsPage, "il_park_eras") == 32);
     assert(@offsetOf(ClientStatsPage, "il_slot_reroutes") == 40);
+    assert(@offsetOf(ClientStatsPage, "preload_passthrough_ops") == 48);
+    assert(@offsetOf(ClientStatsPage, "preload_bind_refused") == 48 + 8 * PRELOAD_REASONS);
 }
 
 // ---------------------------------------------------------------------------

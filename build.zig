@@ -30,6 +30,8 @@
 //!   zig build gate         — fmt + test + rails + smoke + bench-smoke: the
 //!                            per-commit gate.
 //!   zig build dist         — the dist profile artifact + split debug info.
+//!   zig build shim         — libsqueezefs_il.so (the LD_PRELOAD shim) into lib/ (Linux).
+//!   zig build shim-smoke   — the LD_PRELOAD battery against a mount (Linux, root).
 const std = @import("std");
 
 const Profile = enum { gate, dist };
@@ -102,6 +104,41 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
+    // ---- the LD_PRELOAD shim `libsqueezefs_il.so` (charter §12; decision
+    //      0003 §F): an explicit `zig build-lib` because `Step.Compile` has
+    //      no `-z nodelete` (pthread_atfork handlers can never be
+    //      unregistered, so `dlclose` must be a no-op) and no `-fsoname`
+    //      (by-path links must record a clean DT_NEEDED). ReleaseSafe
+    //      whatever the profile: a shim bug trips the panic handler loud
+    //      instead of becoming UB inside a host process. Linux targets
+    //      only; `zig build shim` installs it to lib/. The build identity
+    //      rides the same `build_options` as the daemon (same-folder
+    //      pairing, charter §11). ----
+    const shim_step = b.step("shim", "Build and install libsqueezefs_il.so (Linux targets)");
+    const shim_dir: ?std.Build.LazyPath = if (target.result.os.tag == .linux) blk: {
+        const build_lib = b.addSystemCommand(&.{ b.graph.zig_exe, "build-lib", "-dynamic", "-lc", "-z", "nodelete", "-fsoname=libsqueezefs_il.so", "--name", "squeezefs_il", "-O", "ReleaseSafe" });
+        build_lib.addArgs(&.{ "-target", target.query.zigTriple(b.allocator) catch @panic("OOM"), "-mcpu", target.query.serializeCpuAlloc(b.allocator) catch @panic("OOM") });
+        build_lib.addArg("--cache-dir");
+        build_lib.addDirectoryArg(.cache_root);
+        build_lib.addArg("--global-cache-dir");
+        build_lib.addDirectoryArg(.{ .relative = .{ .base = .global_cache } });
+        build_lib.addArgs(&.{ "--dep", "build_options" });
+        build_lib.addPrefixedFileArg("-Mroot=", b.path("src/shim_so.zig"));
+        build_lib.addPrefixedFileArg("-Mbuild_options=", build_options.getOutput());
+        const so = build_lib.addPrefixedOutputFileArg("-femit-bin=", "libsqueezefs_il.so");
+        // The compiler's own cache makes the re-run cheap; the step cannot
+        // enumerate the shim's transitive sources as inputs.
+        build_lib.has_side_effects = true;
+        shim_step.dependOn(&b.addInstallLibFile(so, "libsqueezefs_il.so").step);
+        b.getInstallStep().dependOn(shim_step);
+        // The census and the shim smoke find the artifacts in their cwd: a
+        // staged directory holding the .so beside the binary under test.
+        const staged = b.addWriteFiles();
+        _ = staged.addCopyFile(so, "libsqueezefs_il.so");
+        _ = staged.addCopyFile(exe.getEmittedBin(), "squeezefs");
+        break :blk staged.getDirectory();
+    } else null;
+
     // ---- unit tests over the library module ----
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose names contain this text (repeatable)") orelse &.{};
     const unit_tests = b.addTest(.{
@@ -130,6 +167,26 @@ pub fn build(b: *std.Build) void {
     run_rails_tests.setCwd(b.path("."));
     const rails_step = b.step("rails", "Run static-rail convention tests");
     rails_step.dependOn(&run_rails_tests.step);
+
+    // ---- the shim's binary census (Linux): SONAME, DT_FLAGS_1 NODELETE and
+    //      the exported symbol set == the ONE table, read off the .so's
+    //      dynamic section (readelf-free) ----
+    if (shim_dir) |dir| {
+        const census_tests = b.addTest(.{
+            .name = "squeezefs-shim-census",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/shim_census.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "squeezefs", .module = squeezefs_mod },
+                },
+            }),
+        });
+        const run_census = b.addRunArtifact(census_tests);
+        run_census.setCwd(dir);
+        rails_step.dependOn(&run_census.step);
+    }
 
     // ---- the smoke: the library's `smoke:` tests with the binary under
     //      test as `./squeezefs` in the cwd (the emitted-bin directory, so
@@ -166,6 +223,23 @@ pub fn build(b: *std.Build) void {
     const bench_smoke_step = b.step("bench-smoke", "Run `squeezefs bench --smoke` against a mount the step creates (one iteration of every workload)");
     bench_smoke_step.dependOn(&run_bench_smoke.step);
 
+    // ---- the shim smoke (Linux): the LD_PRELOAD battery with the staged
+    //      .so beside the binary under test; after the bench smoke (one
+    //      mount on the venue at a time) ----
+    const shim_smoke_step = b.step("shim-smoke", "Run the LD_PRELOAD shim battery against a mount the step creates");
+    if (shim_dir) |dir| {
+        const shim_smoke_tests = b.addTest(.{
+            .name = "squeezefs-shim-smoke",
+            .root_module = squeezefs_mod,
+            .filters = &.{"shim smoke:"},
+        });
+        const run_shim_smoke = b.addRunArtifact(shim_smoke_tests);
+        run_shim_smoke.setCwd(dir);
+        run_shim_smoke.has_side_effects = true;
+        run_shim_smoke.step.dependOn(&run_bench_smoke.step);
+        shim_smoke_step.dependOn(&run_shim_smoke.step);
+    }
+
     // ---- fmt check ----
     const fmt_step = b.step("fmt", "Check formatting (zig fmt --check)");
     const fmt = b.addFmt(.{
@@ -181,6 +255,7 @@ pub fn build(b: *std.Build) void {
     gate_step.dependOn(rails_step);
     gate_step.dependOn(smoke_step);
     gate_step.dependOn(bench_smoke_step);
+    gate_step.dependOn(shim_smoke_step);
 
     // ---- @anchor:sdk_build — the native SDK: libsqueezefs_sdk.{a,so} + the
     //      header + the C smoke (charter §7, §12; il_sdk §10.2–10.3) ----

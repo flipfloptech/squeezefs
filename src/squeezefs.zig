@@ -151,7 +151,7 @@ pub const ipc = struct {
 };
 
 // ---- the client bypass's two clients: the LD_PRELOAD shim and the SDK (charter §7) ----
-// @anchor:shim_import
+pub const shim = if (builtin.os.tag == .linux) @import("shim/shim.zig") else struct {};
 // @anchor:sdk_import
 // The SDK root gates its Linux half itself, so the lease law, the buddy
 // allocator, the model and the version words run on every host.
@@ -190,7 +190,7 @@ test {
     _ = model.explorer;
     _ = ipc.session;
     // @anchor:ipc_host_test
-    // @anchor:shim_test
+    if (builtin.os.tag == .linux) _ = shim;
     // @anchor:sdk_test
     _ = sdk;
     if (builtin.os.tag == .linux) _ = ipc.client;

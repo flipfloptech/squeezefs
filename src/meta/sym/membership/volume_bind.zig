@@ -870,11 +870,14 @@ pub const VolumeBinding = struct {
         if (recs.items.len != 0) try controlEntryFn(ctx, recs.items);
     }
 
-    /// The orphans (fsck C13 for a dead appender): every extent of the
-    /// remaining grant still allocated that no root reaches and no
-    /// `alloc_lease:` names as a bitmap page, after flooring the node-seq
-    /// handle above every stamp it carries (one extent read each).
-    fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, _: u32, remaining: []const GrantRun, reached: []const u64, out: *std.ArrayList(u64)) Error!void {
+    /// The census of the remaining grant (fsck C13 for a dead appender):
+    /// every extent still allocated that no root reaches and no
+    /// `alloc_lease:` names as a bitmap page, read once — the node-seq
+    /// handle floored above every stamp it carries — and judged by
+    /// content: a residue the dead appender stamped is an orphan IMAGE;
+    /// anything else it never wrote (a refill after its last page write, a
+    /// RAM claim, a run past the page's four) is unclaimed.
+    fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, appender_id: u32, remaining: []const GrantRun, reached: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void {
         const self = self_(ctx);
         const be = self.be;
         var bitmap_extents: std.ArrayList(u64) = .empty;
@@ -894,7 +897,7 @@ pub const VolumeBinding = struct {
                 };
                 defer gpa.free(img);
                 be.seq.raiseTo(node.residueSeqCeiling(img));
-                try out.append(gpa, e);
+                try (if (node.residueStampedBy(img, appender_id)) orphans else unwritten).append(gpa, e);
             }
         }
     }
@@ -1341,14 +1344,19 @@ const DEAD_SLOT: u16 = 700;
 
 const Killed = struct {
     identity: WriterIdentity,
-    /// An extent of region 1's grant claimed by no root (the C13 orphan).
+    /// An extent of region 1's grant holding an image it stamped that no
+    /// root reaches (the C13 orphan image).
     orphan: u64,
+    /// An extent of region 1's grant it claimed but never wrote (the page
+    /// names it neither: unclaimed by content).
+    unwritten: u64,
     ring_bytes: u64,
 };
 
-/// Phase 1: region 1 joins in-process, appends `n` records into slot 700
-/// and claims one grant extent it never publishes, then DIES (the image
-/// copied at `kill` with its page Live).
+/// Phase 1: region 1 joins in-process, appends `n` records into slot 700,
+/// claims two grant extents it never publishes — one it writes a stamped
+/// image into, one it leaves blank — then DIES (the image copied at `kill`
+/// with its page Live).
 fn killWithDeadRegion(s: *meta_set.TestSet, kill: []const u8, keys: *std.ArrayList([]const u8), n: usize) !Killed {
     const gpa = testing.allocator;
     const set = try s.open();
@@ -1362,7 +1370,19 @@ fn killWithDeadRegion(s: *meta_set.TestSet, kill: []const u8, keys: *std.ArrayLi
         try aset.appendPut(r1, key.TREE_INODES, k, &iv_value);
     }
     const orphan = try r1.grant.claim();
-    // A cycle: the page names the leases and the pool minus the claim.
+    const unwritten = try r1.grant.claim();
+    // The orphan's image: a fresh leaf image stamped by region 1 (a root
+    // swap's output whose publish never landed), written whole.
+    {
+        const ok = try slotKey(be, DEAD_SLOT, 999);
+        defer gpa.free(ok);
+        const ref = record.RecordRef{ .key = ok, .seq = 1 << 40, .kind = .put, .value = &iv_value };
+        var w = try node.writeNode(gpa, be.layout.stamped(.{ .appender_id = r1.appenderId(), .g = 1 }), .{ .node_addr = be.cache.extentAddr(orphan), .node_seq = 1 << 40, .tree_id = key.TREE_INODES, .level = 0, .min_key = ok, .max_key = ok }, &.{ref}, 1 << 40, null);
+        defer w.deinit(gpa);
+        try be.pool.writeAt(be.path, w.node_addr, w.image);
+        try be.dev.barrier();
+    }
+    // A cycle: the page names the leases and the pool minus the claims.
     try be.checkpointNow();
     for (n..n + 4) |i| {
         const k = try slotKey(be, DEAD_SLOT, 1000 + i);
@@ -1377,7 +1397,7 @@ fn killWithDeadRegion(s: *meta_set.TestSet, kill: []const u8, keys: *std.ArrayLi
     try aset.appendRecord(r1, key.TREE_INODES, keys.items[1], .delete, &.{});
     try be.fsync();
     try snapshotImage(s.paths[0], kill);
-    return .{ .identity = .{ .node_token = r1.identity.node_token, .mount_slot = r1.identity.mount_slot, .writer_id = r1.identity.writer_id }, .orphan = orphan, .ring_bytes = r1.core.ringBytes() };
+    return .{ .identity = .{ .node_token = r1.identity.node_token, .mount_slot = r1.identity.mount_slot, .writer_id = r1.identity.writer_id }, .orphan = orphan, .unwritten = unwritten, .ring_bytes = r1.core.ringBytes() };
 }
 
 /// The dead window's inode delta: `size = 4096`.
@@ -1444,6 +1464,7 @@ test "linux: a dead in-process region recovered over the real backend by the man
     const recoveries0 = recovery.stats.appender_recoveries.load();
     const acted0 = death_ledger.stats.dead_members_acted.load();
     const orphans0 = recovery.stats.dead_appender_orphans.load();
+    const unwritten0 = recovery.stats.dead_appender_unwritten_returned.load();
     const released0 = death_ledger.stats.recovered_regions_released.load();
     const scan0 = recovery.stats.recovery_full_tail_scan_bytes.load();
     {
@@ -1495,10 +1516,13 @@ test "linux: a dead in-process region recovered over the real backend by the man
         try testing.expect(be.slots.table.recordedTail(DEAD_SLOT, tails.tailEntryAt(0).leaf_addr) != null);
         // Non-PR: every leaf scanned (the resident ones cost nothing).
         try testing.expect(recovery.stats.recovery_full_tail_scan_bytes.load() >= scan0);
-        // The orphan returned (C13), the unclaimed grant returned: the
-        // grant record names the trees' images alone.
+        // The census by content: the stamped image is the one orphan (C13),
+        // the blank claim is unclaimed — both returned; the grant record
+        // names the trees' images alone.
         try testing.expectEqual(orphans0 + 1, recovery.stats.dead_appender_orphans.load());
+        try testing.expectEqual(unwritten0 + 1, recovery.stats.dead_appender_unwritten_returned.load());
         try testing.expect(!be.alloc.isAllocated(dead.orphan));
+        try testing.expect(!be.alloc.isAllocated(dead.unwritten));
         const graw = try be.lookup(gpa, key.TREE_CONTROL, cr.extentGrantKey(1).slice());
         defer if (graw) |g| gpa.free(g);
         if (graw) |g| {

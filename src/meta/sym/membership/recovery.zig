@@ -86,7 +86,13 @@ pub const stats = struct {
     pub var appender_recovery_absorbed: counters.ShardedCounter = .{};
     /// Page entries tree 0 no longer leases to the appender: dropped.
     pub var slot_lease_stale_entries: counters.ShardedCounter = .{};
+    /// Images the dead appender wrote that no root reaches (fsck C13 for a
+    /// dead appender), returned to the heap.
     pub var dead_appender_orphans: counters.ShardedCounter = .{};
+    /// Extents of the dead grant its page never named as unclaimed and it
+    /// never wrote (a refill after its last page write, a RAM claim, a run
+    /// past the page's cap), returned to the heap — never orphan images.
+    pub var dead_appender_unwritten_returned: counters.ShardedCounter = .{};
     pub var appender_clear_runs: counters.ShardedCounter = .{};
     pub var slot_custody_quarantines_installed: counters.ShardedCounter = .{};
     /// The window's three violation classes (must-stay-0).
@@ -231,9 +237,14 @@ pub const Volume = struct {
         /// A released region's ring segments back to the heap (RAM bits
         /// + `free` deltas), AFTER its page went Free.
         freeRing: *const fn (ctx: *anyopaque, segments: []const page.Extent) Error!void,
-        /// Orphans: extents the grant claims that no root reaches, after
-        /// flooring the node-seq handle above every stamp they carry.
-        orphanImages: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, grant: []const GrantRun, reached: []const u64, out: *std.ArrayList(u64)) Error!void,
+        /// The census of the grant's remainder no root reaches (every
+        /// extent read once, the node-seq handle floored above every stamp
+        /// it carries), judged by CONTENT: `orphans` = the extents carrying
+        /// an image `appender_id` wrote (fsck C13 for a dead appender);
+        /// `unwritten` = the rest — extents the appender never drew on (a
+        /// grant after its last page write, a RAM claim, a run past the
+        /// page's cap). Both are the caller's to return.
+        orphanImages: *const fn (ctx: *anyopaque, gpa: Allocator, appender_id: u32, grant: []const GrantRun, reached: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void,
         raiseSeqFloor: *const fn (ctx: *anyopaque, seq_floor: u64) void,
         ring0Head: *const fn (ctx: *anyopaque) u64,
         writerTerm: *const fn (ctx: *anyopaque) u64,
@@ -584,12 +595,26 @@ pub const Driver = struct {
         defer unclaimed.deinit(gpa);
         try self.unclaimedOf(&p, window.items, &unclaimed);
         self.vol.vt.returnExtents(self.vol.ctx, unclaimed.items) catch |e| log.warn("recovery: {d} unclaimed extent(s) of appender {d} could not be returned ({s}) — the region release retries, fsck C13 reclaims", .{ unclaimed.items.len, p.appender_id, @errorName(e) });
+        // The page's word is the appender's attestation of its unclaimed
+        // pool AT ITS LAST WRITE; the record is the manager's attestation
+        // of the whole grant. What the record holds beyond the page and the
+        // trees is judged by content, never by the page's lag: an image the
+        // dead appender wrote is an orphan (C13); an extent it never drew
+        // on — a refill granted after that page write, a RAM claim never
+        // written, a run past the page's four — is unclaimed and goes back
+        // unnamed (0002 row 352).
         var orphans: std.ArrayList(u64) = .empty;
         defer orphans.deinit(gpa);
-        try self.vol.vt.orphanImages(self.vol.ctx, gpa, p.appender_id, remaining.items, reached.items, &orphans);
+        var unwritten: std.ArrayList(u64) = .empty;
+        defer unwritten.deinit(gpa);
+        try self.vol.vt.orphanImages(self.vol.ctx, gpa, p.appender_id, remaining.items, reached.items, &orphans, &unwritten);
         if (orphans.items.len != 0) {
             stats.dead_appender_orphans.add(orphans.items.len);
             try self.vol.vt.returnExtents(self.vol.ctx, orphans.items);
+        }
+        if (unwritten.items.len != 0) {
+            stats.dead_appender_unwritten_returned.add(unwritten.items.len);
+            try self.vol.vt.returnExtents(self.vol.ctx, unwritten.items);
         }
         try self.fail(.returns);
         // ---- 8. page Recovered ----
@@ -914,6 +939,8 @@ const RamVolume = struct {
     table: *LeaseTable,
     trees: std.AutoHashMapUnmanaged(u16, Tree) = .empty,
     grant_bits: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Extents whose residue carries a frame the dead appender stamped.
+    stamped: std.AutoHashMapUnmanaged(u64, void) = .empty,
     returned: std.ArrayList(u64) = .empty,
     /// Ring bytes a region release returned to the heap.
     rings_freed: u64 = 0,
@@ -964,6 +991,7 @@ const RamVolume = struct {
         while (ti.next()) |t| t.deinit(self.gpa);
         self.trees.deinit(self.gpa);
         self.grant_bits.deinit(self.gpa);
+        self.stamped.deinit(self.gpa);
         self.returned.deinit(self.gpa);
         self.quarantined.deinit(self.gpa);
         self.data_deltas.deinit(self.gpa);
@@ -991,8 +1019,11 @@ const RamVolume = struct {
 
     /// The fixture: appender 2 Live under `dead`, leasing slots 10 and 11
     /// (tree 0 `Leased`, the page naming slot 10 at a NEWER root), a grant
-    /// of extents 100..108 of which 100..102 are its tree images, the ring
-    /// window with content for both slots, one interior record, one alloc.
+    /// RECORD of extents 100..110 of which 100..102 are its tree images and
+    /// 103..107 the page's unclaimed word — 108..109 were granted AFTER the
+    /// page's last write (the refill the page never named): 108 unwritten,
+    /// 109 carrying a superseded image the appender stamped; the ring window
+    /// with content for both slots, one interior record, one alloc.
     fn seedDeadAppender(self: *RamVolume, dead: WriterIdentity) !void {
         var p = page.Page.free(2, 3, page.SegmentTable.one(.{ .start = 1 << 20, .len = 512 << 10 }));
         p.state = .live;
@@ -1012,10 +1043,11 @@ const RamVolume = struct {
         try self.table.load(10, s10);
         try self.table.load(11, s11);
         var gbuf: [256]u8 = undefined;
-        const g = try cr.encodeExtentGrant(&.{.{ .start = 100, .len = 8 }}, &gbuf);
+        const g = try cr.encodeExtentGrant(&.{.{ .start = 100, .len = 10 }}, &gbuf);
         try self.put0(cr.extentGrantKey(2).slice(), g);
         var e: u64 = 100;
-        while (e < 108) : (e += 1) try self.grant_bits.put(self.gpa, e, {});
+        while (e < 110) : (e += 1) try self.grant_bits.put(self.gpa, e, {});
+        try self.stamped.put(self.gpa, 109, {});
         // The trees as the recoverer's cache holds them (stale: the manager's grant-time roots).
         var t10: Tree = .{ .root = .{ .addr = 0x8000, .seq = 500 }, .floor = 0 };
         try t10.images.appendSlice(self.gpa, &.{ 100, 101 });
@@ -1188,10 +1220,11 @@ const RamVolume = struct {
         const self = self_(ctx);
         for (segments) |s| self.rings_freed += s.len;
     }
-    fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, _: u32, grant: []const GrantRun, reached: []const u64, out: *std.ArrayList(u64)) Error!void {
+    fn orphanImagesFn(ctx: *anyopaque, gpa: Allocator, _: u32, grant: []const GrantRun, reached: []const u64, orphans: *std.ArrayList(u64), unwritten: *std.ArrayList(u64)) Error!void {
         const self = self_(ctx);
-        // An orphan: still granted, still allocated, reached by no root,
-        // and not an extent the window claimed (104 is claimed: kept).
+        // The census: still granted, still allocated, reached by no root,
+        // and not an extent the window claimed (104 is claimed: kept);
+        // judged by content — a stamped residue is an orphan image.
         for (grant) |run| {
             var e = run.start;
             while (e < run.end()) : (e += 1) {
@@ -1200,7 +1233,8 @@ const RamVolume = struct {
                 if (hit or !self.grant_bits.contains(e)) continue;
                 var claimed = false;
                 for (self.window.items) |w| claimed = claimed or (w.kind == .alloc and w.extent == e);
-                if (!claimed) out.append(gpa, e) catch return error.OutOfMemory;
+                if (claimed) continue;
+                (if (self.stamped.contains(e)) orphans else unwritten).append(gpa, e) catch return error.OutOfMemory;
             }
         }
     }
@@ -1303,12 +1337,15 @@ const Fixture = struct {
         try testing.expect(try self.ledger.isRecovered(DEAD, 1));
         try testing.expect(!self.screen.isRecovering(2));
         try testing.expect(self.rv.seq_floor_raised >= 4990);
-        // The grant record minus the trees' images (100..102) = 103..107; the
-        // unclaimed page runs minus the window's alloc (104) returned: 103, 105..107.
+        // The grant record minus the trees' images (100..102) = 103..109; the
+        // unclaimed page runs minus the window's alloc (104) returned (103,
+        // 105..107), then the record's remainder beyond the page by content:
+        // 108 (never written) returned unnamed, 109 (the appender's stamped
+        // residue) returned as the one orphan image.
         const g = cr.decodeExtentGrant(self.rv.get0(cr.extentGrantKey(2).slice()).?) catch unreachable;
-        try testing.expectEqual(@as(u64, 5), g.totalExtents());
+        try testing.expectEqual(@as(u64, 7), g.totalExtents());
         std.mem.sort(u64, self.rv.returned.items, {}, std.sort.asc(u64));
-        try testing.expectEqualSlices(u64, &.{ 103, 105, 106, 107 }, self.rv.returned.items);
+        try testing.expectEqualSlices(u64, &.{ 103, 105, 106, 107, 108, 109 }, self.rv.returned.items);
         try testing.expectEqual(@as(u32, 1), self.rv.data_deltas.count());
     }
 };
@@ -1319,9 +1356,15 @@ test "the §5.9 procedure end to end over RAM images: preempt (no device: the ta
     defer f.deinit();
     const recoveries0 = stats.appender_recoveries.load();
     const scan0 = stats.recovery_full_tail_scan_bytes.load();
+    const orphans0 = stats.dead_appender_orphans.load();
+    const unwritten0 = stats.dead_appender_unwritten_returned.load();
     try testing.expectEqual(Outcome.acted, f.driver.recoverDead(f.death()));
     try testing.expectEqual(recoveries0 + 1, stats.appender_recoveries.load());
     try f.expectConverged();
+    // The record's remainder beyond the page's word, by content: the one
+    // stamped residue is the orphan image; the refill never drawn on is not.
+    try testing.expectEqual(orphans0 + 1, stats.dead_appender_orphans.load());
+    try testing.expectEqual(unwritten0 + 1, stats.dead_appender_unwritten_returned.load());
     // Non-PR: every leaf scanned (3 images × 64 KiB).
     try testing.expectEqual(scan0 + 3 * 65_536, stats.recovery_full_tail_scan_bytes.load());
     // The page went Live → Recovering → Recovered: two writes.

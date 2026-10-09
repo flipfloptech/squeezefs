@@ -777,6 +777,24 @@ pub fn residueSeqCeiling(buf: []const u8) u64 {
     return ceiling;
 }
 
+/// Whether the RESIDUE of one extent carries an image `appender_id`
+/// wrote: any 4 KiB slot past the header whose frame verifies (magic,
+/// checksum over `[0..32)`) and whose fencing stamp names the appender —
+/// whatever incarnation, whatever generation. An extent the appender
+/// claimed but never wrote (a RAM claim, a grant it never drew on) answers
+/// false: it is not an orphan IMAGE. The header page carries no stamp.
+pub fn residueStampedBy(buf: []const u8, appender_id: u32) bool {
+    var pos: usize = NODE_PAGE;
+    while (pos + FRAME_LEN <= buf.len) : (pos += NODE_PAGE) {
+        const hdr = buf[pos..][0..FRAME_LEN];
+        if (std.mem.readInt(u32, hdr[0..4], .little) != bset.BSET_FRAME_MAGIC) continue;
+        const checked = bset.BSET_FRAME_CHECKSUM_OFF;
+        if (std.mem.readInt(u64, hdr[checked..][0..8], .little) != checksum.xxh3(hdr[0..checked])) continue;
+        if (std.mem.readInt(u32, hdr[24..28], .little) == appender_id) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // §5 COMPACT / SPLIT / MERGE — fresh images from folded sources.
 // ---------------------------------------------------------------------------
@@ -1835,6 +1853,32 @@ test "residue ceiling: the header's seq and every verifying frame stamp at any 4
     try testing.expectEqual(@as(u64, 77), residueSeqCeiling(vol.bytes));
     vol.bytes[10 * NODE_PAGE + 9] ^= 1;
     try testing.expectEqual(@as(u64, 40), residueSeqCeiling(vol.bytes));
+}
+
+test "residue stamped by: an unwritten extent and a header-only image answer false for every appender; a verifying frame stamped by the appender anywhere in the extent answers true, a broken checksum or another appender's stamp does not" {
+    const gpa = testing.allocator;
+    const l = defaultLayout();
+    var vol = try Volume.init(gpa, DEFAULT_NODE_SIZE);
+    defer vol.deinit(gpa);
+    try testing.expect(!residueStampedBy(vol.bytes, 1));
+    try testing.expect(!residueStampedBy(vol.bytes[0..100], 1));
+    // The manager's structural image: header + a (0, 0)-stamped base frame.
+    var r = [_]Record{try putIno(gpa, 1, 1)};
+    defer rec.deinitRecords(gpa, &r);
+    var rbuf: [1]RecordRef = undefined;
+    var hdr = try vol.writeNodeAt(gpa, l, wp(0, 40, "", "\xff"), refsOf(&r, &rbuf), 1);
+    defer hdr.deinit(gpa);
+    try testing.expect(residueStampedBy(vol.bytes, 0));
+    try testing.expect(!residueStampedBy(vol.bytes, 1));
+    // A dead lessee's frame deep in the extent (a superseded image's
+    // residue): named whatever its incarnation; a broken checksum is not.
+    const f = try stampedFrame(gpa, DEFAULT_NODE_SIZE, 90, .{ .appender_id = 1, .g = 7 }, 2, 2);
+    defer gpa.free(f);
+    vol.write(20 * NODE_PAGE, f);
+    try testing.expect(residueStampedBy(vol.bytes, 1));
+    try testing.expect(!residueStampedBy(vol.bytes, 2));
+    vol.bytes[20 * NODE_PAGE + 9] ^= 1;
+    try testing.expect(!residueStampedBy(vol.bytes, 1));
 }
 
 test "compact folds into a fresh extent, old untouched: in-place refused; durable_tail 6 elides the seq-5 tombstone, seq 8 survives; horizon 9" {

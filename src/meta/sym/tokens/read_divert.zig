@@ -189,6 +189,15 @@ pub const Divert = struct {
         return true;
     }
 
+    /// A fail-closed channel re-probed inside the serve that needs a
+    /// fetch: re-dialled through the resolver, the probe round deciding
+    /// (`cache.Reader.redial`). Returns whether the channel re-opened.
+    fn reprobe(self: *Divert, io: Io, identity: ClientId, holder: u32) bool {
+        const r = self.planeOf(io, identity) orelse return false;
+        const link = self.resolver.dial(self.resolver.ctx, identity, holder) orelse return false;
+        return r.redial(io, link);
+    }
+
     /// Is the object's slot another appender's (a token's business), by
     /// the resolver's word alone — no plane, no dial, no serve.
     pub fn isForeign(self: *Divert, object: Object) bool {
@@ -223,15 +232,17 @@ pub const Divert = struct {
                             continue;
                         },
                         error.TokenChannelStale => {
-                            // A failed round closed the channel: the plane
-                            // re-points ONCE inside the same op — the link
-                            // re-resolved and re-dialled, every token
-                            // dropped, the probe round the re-open — and
-                            // the serve retries on a fresh grant; a probe
-                            // that fails leaves the typed EAGAIN.
-                            if (reprobed or !self.repoint(io, f.identity, f.holder)) return e;
+                            // A failed round closed the channel and this
+                            // serve needs a fetch (a hit was served above
+                            // it): the plane re-probes ONCE inside the same
+                            // op — the link re-resolved and re-dialled, the
+                            // probe round deciding — and the serve retries
+                            // on a fresh grant; a probe that fails leaves
+                            // the typed EAGAIN and the cache intact.
+                            if (reprobed) return e;
                             reprobed = true;
                             stats.dlm_token_reader_channel_reprobes.inc();
+                            if (!self.reprobe(io, f.identity, f.holder)) return e;
                             continue;
                         },
                         else => return e,

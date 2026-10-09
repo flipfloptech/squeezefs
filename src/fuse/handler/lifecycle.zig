@@ -252,7 +252,11 @@ pub fn Dispatcher(comptime Transport: type) type {
                 }
             } else |err| {
                 // The error IS the reply: header-only `-errno` through the
-                // ONE table, by the transport's one non-reply exit.
+                // ONE table, by the transport's one non-reply exit. A
+                // retryable answer (EAGAIN to the app) names its cause at
+                // debug level: the class the symmetric plane hands out while
+                // a holder is unreachable, otherwise invisible in a log.
+                if (errors.classOf(err) == .retryable) log.debug("handler: {t} on ino {d} (unique {d}) answered EAGAIN: {s}", .{ op, meta.nodeid, meta.unique, @errorName(err) });
                 ob.fail(errors.toErrno(err));
             }
             ctx.stage(.reply_commit);

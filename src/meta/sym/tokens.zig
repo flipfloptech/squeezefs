@@ -889,6 +889,71 @@ test "the serve gate: a reader past T_self serves NOTHING from its cache; a hold
     plane.repoint(io, linkOf(&f.b_to_a[0]));
 }
 
+test "a CACHED token serves while the holder is unreachable: a round that fails closes the channel for FETCHES only — the cached object still hits (0 RPCs), an uncached one is the typed EAGAIN, the in-op re-probe whose dial dies keeps the cache; a re-probe that completes drops it (a live holder we lost a round with)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    const b = f.reader(0);
+    // Object 3 cached under a token.
+    var s = (try b.serve(io, objectOf(3), .{})).?;
+    try testing.expectEqual(@as(u64, 100), s.entry.?.attrs.mtime);
+    s.release(io);
+    const plane = b.planeOf(io, A_ID).?;
+    // The holder goes dark: the plane's link is a session that dies at
+    // its first frame — the fetch of an UNCACHED object fails the round
+    // and closes the channel.
+    var dead = try f.hub.connect(1, 0);
+    defer dead.deinit();
+    dead.tamper_next = true;
+    plane.link = linkOf(&dead);
+    @import("../../wire/stats.zig").cluster_wire_mac_failures.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.Wire, b.serve(io, objectOf(4), .{}));
+    try log.testing.expectAllFired();
+    try testing.expect(!plane.channelOk());
+    // The cached token still serves — a hit, no round attempted.
+    const hits0 = cache.stats.dlm_token_hits.load();
+    const rounds0 = cache.stats.dlm_token_channel_rounds.load();
+    s = try plane.serve(io, objectOf(3), .{});
+    try testing.expectEqual(@as(u64, 100), s.entry.?.attrs.mtime);
+    s.release(io);
+    try testing.expectEqual(hits0 + 1, cache.stats.dlm_token_hits.load());
+    try testing.expectEqual(rounds0, cache.stats.dlm_token_channel_rounds.load());
+    try testing.expectEqual(@as(usize, 1), plane.cache.count(io));
+    // An uncached object on the closed channel: the plane's typed EAGAIN.
+    try testing.expectError(error.TokenChannelStale, plane.serve(io, objectOf(2), .{}));
+    // The divert's in-op re-probe re-dials through the resolver: a probe
+    // round that dies on the re-dialled link (a second session tampered
+    // at its first frame) leaves the cache intact.
+    var dead2 = try f.hub.connect(1, 0);
+    defer dead2.deinit();
+    dead2.tamper_next = true;
+    f.resolvers[0].conn_to_a = &dead2;
+    const reprobes0 = divert.stats.dlm_token_reader_channel_reprobes.load();
+    @import("../../wire/stats.zig").cluster_wire_mac_failures.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.TokenChannelStale, b.serve(io, objectOf(2), .{}));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(reprobes0 + 1, divert.stats.dlm_token_reader_channel_reprobes.load());
+    try testing.expectEqual(@as(usize, 1), plane.cache.count(io));
+    s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    // Back onto the fixture's live session for the re-dial.
+    f.resolvers[0].conn_to_a = &f.b_to_a[0];
+    // A re-probe whose round completes: the holder is live — the cache
+    // dropped (it may have re-granted), the channel open, the fetch lands.
+    s = (try b.serve(io, objectOf(2), .{})).?;
+    s.release(io);
+    try testing.expect(plane.channelOk());
+    try testing.expectEqual(reprobes0 + 2, divert.stats.dlm_token_reader_channel_reprobes.load());
+    // Object 3's old token was dropped by the re-probe; the serve is a fresh grant.
+    const grants0 = cache.stats.dlm_token_grants.load();
+    s = (try b.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    try testing.expectEqual(grants0 + 1, cache.stats.dlm_token_grants.load());
+}
+
 test "the seams read their registry rows once (default-inert); the conveyor binding recalls through the plane's pusher and settles the same union" {
     const gpa = testing.allocator;
     const io = testing.io;

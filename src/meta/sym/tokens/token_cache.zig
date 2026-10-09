@@ -426,6 +426,14 @@ pub const Cache = struct {
         if (e.pins == 0 and e.state == .revoked) e.destroy();
     }
 
+    /// The resident entry's words for a miss's diagnostic (null = none).
+    pub fn describe(self: *Cache, io: Io, object: Object) ?struct { state: State, has_dir: bool } {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        const e = self.entries.get(object) orelse return null;
+        return .{ .state = e.state, .has_dir = e.dir != null };
+    }
+
     pub const InstallOutcome = union(enum) {
         /// The entry now served (pinned): `e`, or the richer entry it did
         /// not displace.
@@ -662,6 +670,20 @@ pub const Reader = struct {
             _ = self.cache.shedAll(io);
             return error.MembershipPending;
         }
+        // A cached token serves whatever the channel's posture (charter
+        // §5.5: "0 RPCs and 0 device reads while cached"): the recall is a
+        // PUSH on this reader's own listener, not a round on this channel,
+        // and a holder that cannot reach this reader proceeds only on its
+        // membership lease's expiry — the gate above. The fail-closed
+        // channel gates FETCHES: a holder whose last round failed grants
+        // nothing new until a round completes (0002 row 355).
+        if (self.cache.probe(io, object, wants.dentries)) |e| {
+            stats.dlm_token_hits.inc();
+            return .{ .entry = e, .cache = &self.cache };
+        }
+        // A miss that finds a resident entry names what it lacked (the
+        // fetch path, never the hit's).
+        if (self.cache.describe(io, object)) |d| log.debug("tokens: object {d} missed the cache (entry {t}, dentries {}, wanted dentries {}, channel ok {})", .{ object, d.state, d.has_dir, wants.dentries, self.channel_ok.load(.acquire) });
         if (!self.channel_ok.load(.acquire)) {
             stats.dlm_token_serve_refusals.inc();
             return error.TokenChannelStale;
@@ -966,6 +988,38 @@ pub const Reader = struct {
         self.channel_ok.store(false, .release);
         stats.dlm_token_holder_repoints.inc();
         if (self.link.call(self.link.ctx, .{ .ping = .{} })) |_| self.noteRound() else |_| self.noteRoundFailed();
+    }
+
+    /// The in-op RE-PROBE of a fail-closed channel (the divert's, ONCE per
+    /// serve that needs a fetch): the link re-dialled through the
+    /// resolver, the probe round the `ping`. A round that completes proves
+    /// a LIVE holder this reader lost a round with — it may have
+    /// re-granted (or restarted on a fixed port), so every cached token is
+    /// dropped as at a move and the channel re-opens; a round that fails
+    /// proves nothing moved: the cache stays (its tokens serve hits until
+    /// the membership gate) and the channel stays closed. Returns whether
+    /// the channel re-opened.
+    pub fn redial(self: *Reader, io: Io, link: Link) bool {
+        self.link = link;
+        _ = self.endpoint_gen.fetchAdd(1, .acq_rel);
+        if (self.link.call(self.link.ctx, .{ .ping = .{} })) |_| {} else |_| {
+            self.noteRoundFailed();
+            return false;
+        }
+        var held: std.ArrayList(Object) = .empty;
+        defer held.deinit(self.gpa);
+        {
+            self.cache.lock.lockUncancelable(io);
+            defer self.cache.lock.unlock(io);
+            var it = self.cache.entries.keyIterator();
+            while (it.next()) |k| held.append(self.gpa, k.*) catch break;
+        }
+        _ = self.cache.revoke(io, held.items) catch {};
+        const gen = self.stamps.step();
+        self.stamps.drainBelow(io, gen);
+        self.purge(held.items);
+        self.noteRound();
+        return true;
     }
 
     pub fn endpointGen(self: *const Reader) u64 {

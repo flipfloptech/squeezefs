@@ -136,7 +136,21 @@ pub fn recoveryBoundMs(ring_bytes: u64, node_size: u64) u64 {
 // The volume seam.
 // ---------------------------------------------------------------------------
 
-pub const Kind = enum(u8) { put, delete, alloc, data_delta };
+/// The window's record classes: the three slot-tree kinds (a `delta` is
+/// content exactly like a `put` — it folds into the key's newest base at
+/// replay), the ring's extent claims, the data-bitmap deltas.
+pub const Kind = enum(u8) {
+    put,
+    delta,
+    delete,
+    alloc,
+    data_delta,
+
+    /// A slot-tree record (level 0: content; > 0: structural).
+    pub fn isTreeRecord(self: Kind) bool {
+        return self == .put or self == .delta or self == .delete;
+    }
+};
 
 /// One record of the dead ring's window as the driver judges it.
 pub const WindowRecord = struct {
@@ -441,7 +455,7 @@ pub const Driver = struct {
             for (plans.items) |pl| named = named or pl.slot == e.slot;
             if (!named) stats.slot_lease_stale_entries.inc();
         }
-        for (window.items) |r| if (r.level == 0 and (r.kind == .put or r.kind == .delete)) {
+        for (window.items) |r| if (r.level == 0 and r.kind.isTreeRecord()) {
             for (plans.items) |*pl| if (pl.slot == r.slot) {
                 pl.window_max_ino = @max(pl.window_max_ino, r.local_ino);
             };
@@ -607,7 +621,7 @@ pub const Driver = struct {
         var absorbed: [ABSORBED_MAX]u16 = undefined;
         var n_absorbed: usize = 0;
         for (window) |r| switch (r.kind) {
-            .put, .delete => {
+            .put, .delta, .delete => {
                 var held = false;
                 for (leased) |s| held = held or s == r.slot;
                 if (!held) {
@@ -649,7 +663,7 @@ pub const Driver = struct {
         var ordered: std.ArrayList(WindowRecord) = .empty;
         defer ordered.deinit(gpa);
         for (window) |r| {
-            if (r.kind != .put and r.kind != .delete) continue;
+            if (!r.kind.isTreeRecord()) continue;
             var ours = false;
             for (slots) |s| ours = ours or s == r.slot;
             if (ours) try ordered.append(gpa, r);

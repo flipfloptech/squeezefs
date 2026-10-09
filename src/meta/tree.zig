@@ -96,6 +96,10 @@ pub const Error = node_cache.ChildError || rec.FoldError || error{
     PartitionRefused,
     /// A value above the per-volume cap `min(64 KiB, node_size/4) + 256`.
     ValueTooLarge,
+    /// A tombstone carrying a value: the one record shape the frame
+    /// encoder asserts against — refused at the apply, never discovered at
+    /// the flush (a replay that mislabels a frame's kind fails typed).
+    InvalidRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -700,6 +704,7 @@ pub const KvTree = struct {
     /// THE lock-window primitive (module doc). Never performs I/O and
     /// never touches an interior lock on the live path.
     pub fn applyAtSeqClass(self: *KvTree, leaf: *CachedNode, k: []const u8, kind: RecordKind, value: []const u8, plan: SeqPlan, structural: bool) Error!ApplyOutcome {
+        if (kind == .delete and value.len != 0) return error.InvalidRecord;
         const io = self.cache.io;
         const d = leaf.lockWrite(io);
         if (leaf.state.isSuperseded() or key.lessThan(k, leaf.min_key) or key.lessThan(leaf.max_key, k)) {
@@ -1039,8 +1044,19 @@ pub fn routeContent(trees: []const *KvTree, tree_id: u8, k: []const u8) ?*KvTree
     return r.tree;
 }
 
-fn kindOf(k: journal.RecordKind) RecordKind {
+/// A journal frame's kind as the record kind — the two enums share one
+/// encoding (`put = 1, delta = 2, delete = 3`), asserted at comptime: a
+/// replay that folded `delta` into `delete` turned every inode update of
+/// the window into a tombstone (the recovery's `buildBset` abort).
+pub fn kindOf(k: journal.RecordKind) RecordKind {
     return @fromBackingInt(@intCast(@backingInt(k)));
+}
+
+comptime {
+    const info = @typeInfo(journal.RecordKind).@"enum";
+    for (info.field_names, info.field_values) |name, value| {
+        std.debug.assert(std.mem.eql(u8, @tagName(kindOf(@fromBackingInt(@intCast(value)))), name));
+    }
 }
 
 /// Mount replay, two-phase (charter §5.3): phase 1 applies every interior
@@ -1543,4 +1559,20 @@ test "replay LWW gate: a replayed record at-or-below the node's newest seq for i
     // A replayed interior record on a single-leaf tree is unroutable: dropped, never loud.
     try testing.expect(!try t.applyReplayedInterior(&KEY_SPACE_MAX, 1, newest + 200, .put, &key.encodeInteriorValue(0, 1), newest + 200));
     try testing.expectError(error.InvalidKey, t.applyReplayedInterior("", 1, 1, .put, &.{}, 1));
+    // A tombstone carrying a value (a frame kind mislabelled by a replay)
+    // is refused typed at the apply — the frame encoder never sees it.
+    try testing.expectError(error.InvalidRecord, t.applyReplayed(&ikey(5), newest + 300, .delete, testValue(5, 24, &buf), newest + 300));
+    try expectLookup(t, &ikey(5), testValue(555, 24, &buf));
+    // A delta replays as a delta: folded into the key's newest base.
+    try t.applyReplayed(&ikey(6), newest + 301, .put, &(rec.InodeValue{ .mode = 0o100644, .nlink = 1 }).encode(), newest + 301);
+    try t.applyReplayed(&ikey(6), newest + 302, .delta, (rec.InodeDelta{ .mask = rec.DELTA_SIZE, .fields = .{ .size = 77 } }).encode().slice(), newest + 302);
+    const folded = (try t.lookup(testing.allocator, &ikey(6))).?;
+    defer testing.allocator.free(folded);
+    try testing.expectEqual(@as(u64, 77), (try rec.InodeValue.decode(folded)).size);
+}
+
+test "a journal frame's kind maps 1:1 onto the record kind (put, delta, delete)" {
+    try testing.expectEqual(RecordKind.put, kindOf(.put));
+    try testing.expectEqual(RecordKind.delta, kindOf(.delta));
+    try testing.expectEqual(RecordKind.delete, kindOf(.delete));
 }

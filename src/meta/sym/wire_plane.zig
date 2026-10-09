@@ -187,6 +187,7 @@ const DeathFanout = struct {
     fn noteDeath(ctx: ?*anyopaque, dead: shard.DeadMember) void {
         const self: *DeathFanout = @ptrCast(@alignCast(ctx.?));
         self.plane.holder.noteMemberDeparted(self.plane.io, clientIdOf(dead.id));
+        self.plane.peers.forgetMember(clientIdOf(dead.id));
         self.ledger.noteDeath(self.ledger.ctx, dead);
     }
 };
@@ -1150,25 +1151,43 @@ pub fn clientIdOf(id: shard.MemberId) tokens.table.ClientId {
 /// holder 0 is the manager's listener) and by token CLIENT id (the
 /// holder's recall push — the member's declared endpoint on the manager;
 /// the manager's listener on a joiner). A peer with no endpoint is
-/// `unreachable_`.
+/// `unreachable_`. Every link re-resolves its peer's endpoint off the same
+/// state before each (re)dial (`joined.EndpointResolver`), and the death
+/// fan-out retires a dead member's session at once: a same-node successor
+/// — the same appender id and client id at a new ephemeral port — is
+/// reached at its first contact, never at the dead incarnation's port.
 const PeerLinks = struct {
     plane: *WirePlane,
     lock: Io.Mutex = .init,
-    by_holder: std.AutoHashMapUnmanaged(u32, *joined.SharedLink) = .empty,
-    by_client: std.AutoHashMapUnmanaged(tokens.table.ClientId, *joined.SharedLink) = .empty,
+    by_holder: std.AutoHashMapUnmanaged(u32, *Peer) = .empty,
+    by_client: std.AutoHashMapUnmanaged(tokens.table.ClientId, *Peer) = .empty,
+
+    /// One peer's link with the key its endpoint is re-resolved by.
+    const Peer = struct {
+        links: *PeerLinks,
+        key: union(enum) { holder: u32, client: tokens.table.ClientId },
+        link: joined.SharedLink,
+
+        fn resolveFn(ctx: *anyopaque) ?endpoint.EndpointWire {
+            const self: *Peer = @ptrCast(@alignCast(ctx));
+            return switch (self.key) {
+                .holder => |h| self.links.holderEndpoint(h),
+                .client => |c| self.links.clientEndpoint(c),
+            };
+        }
+
+        fn destroy(self: *Peer) void {
+            self.link.deinit();
+            self.links.plane.gpa.destroy(self);
+        }
+    };
 
     fn deinit(self: *PeerLinks) void {
         var it = self.by_holder.valueIterator();
-        while (it.next()) |l| {
-            l.*.deinit();
-            self.plane.gpa.destroy(l.*);
-        }
+        while (it.next()) |p| p.*.destroy();
         self.by_holder.deinit(self.plane.gpa);
         var ic = self.by_client.valueIterator();
-        while (ic.next()) |l| {
-            l.*.deinit();
-            self.plane.gpa.destroy(l.*);
-        }
+        while (ic.next()) |p| p.*.destroy();
         self.by_client.deinit(self.plane.gpa);
     }
 
@@ -1184,10 +1203,31 @@ const PeerLinks = struct {
         return readEnrollSecret(self.plane.gpa, be0) catch @splat(0);
     }
 
-    fn create(self: *PeerLinks, ep: endpoint.EndpointWire) ?*joined.SharedLink {
-        const l = self.plane.gpa.create(joined.SharedLink) catch return null;
-        l.* = joined.SharedLink.init(self.plane.gpa, self.plane.io, ep, self.secret(), self.plane.identity);
-        return l;
+    fn create(self: *PeerLinks, k: @FieldType(Peer, "key"), ep: endpoint.EndpointWire) ?*Peer {
+        const p = self.plane.gpa.create(Peer) catch return null;
+        p.* = .{ .links = self, .key = k, .link = joined.SharedLink.init(self.plane.gpa, self.plane.io, ep, self.secret(), self.plane.identity) };
+        p.link.resolver = .{ .ctx = p, .resolve = &Peer.resolveFn };
+        return p;
+    }
+
+    /// The death fan-out: the evicted member's session (its token client
+    /// link, and every holder link at the same listener — one listener
+    /// per daemon serves both roles) retired now; the next contact
+    /// re-resolves and dials the successor's port.
+    fn forgetMember(self: *PeerLinks, client: tokens.table.ClientId) void {
+        self.lock.lockUncancelable(self.plane.io);
+        defer self.lock.unlock(self.plane.io);
+        const p = self.by_client.get(client) orelse return;
+        const ep = p.link.endpointNow();
+        p.link.invalidate();
+        joined.stats.peer_links_invalidated.inc();
+        var it = self.by_holder.valueIterator();
+        while (it.next()) |h| {
+            if (h.*.link.endpointNow().eql(ep)) {
+                h.*.link.invalidate();
+                joined.stats.peer_links_invalidated.inc();
+            }
+        }
     }
 
     /// The endpoint of `holder`'s listener.
@@ -1223,30 +1263,28 @@ const PeerLinks = struct {
     pub fn linkForHolder(self: *PeerLinks, holder: u32) ?tokens.cache.Link {
         self.lock.lockUncancelable(self.plane.io);
         defer self.lock.unlock(self.plane.io);
-        if (self.by_holder.get(holder)) |l| return l.tokenLink();
+        if (self.by_holder.get(holder)) |p| return p.link.tokenLink();
         const ep = self.holderEndpoint(holder) orelse return null;
-        const l = self.create(ep) orelse return null;
-        self.by_holder.put(self.plane.gpa, holder, l) catch {
-            l.deinit();
-            self.plane.gpa.destroy(l);
+        const p = self.create(.{ .holder = holder }, ep) orelse return null;
+        self.by_holder.put(self.plane.gpa, holder, p) catch {
+            p.destroy();
             return null;
         };
-        return l.tokenLink();
+        return p.link.tokenLink();
     }
 
     fn linkForClient(ctx: *anyopaque, client: tokens.table.ClientId) ?tokens.cache.Link {
         const self: *PeerLinks = @ptrCast(@alignCast(ctx));
         self.lock.lockUncancelable(self.plane.io);
         defer self.lock.unlock(self.plane.io);
-        if (self.by_client.get(client)) |l| return l.tokenLink();
+        if (self.by_client.get(client)) |p| return p.link.tokenLink();
         const ep = self.clientEndpoint(client) orelse return null;
-        const l = self.create(ep) orelse return null;
-        self.by_client.put(self.plane.gpa, client, l) catch {
-            l.deinit();
-            self.plane.gpa.destroy(l);
+        const p = self.create(.{ .client = client }, ep) orelse return null;
+        self.by_client.put(self.plane.gpa, client, p) catch {
+            p.destroy();
             return null;
         };
-        return l.tokenLink();
+        return p.link.tokenLink();
     }
 
     fn peers(self: *PeerLinks) tokens.divert.Peers {
@@ -1490,6 +1528,74 @@ test "linux: MW_BIND=off refuses a writable mount at rung 3 and arms nothing on 
     try testing.expect((try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, true)) == null);
     try s.env.put("SQUEEZEFS_MW_BIND", "not-an-endpoint");
     try testing.expectError(error.MalformedBind, WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false));
+}
+
+/// A listener nobody serves: the dead incarnation's port (the dial is
+/// refused at once — ECONNREFUSED is `HolderUnreachable`, never a wait).
+fn deadEndpoint() endpoint.EndpointWire {
+    var e: endpoint.EndpointWire = .none;
+    e.family = endpoint.FAMILY_IP4;
+    e.port = 1;
+    e.addr[0..4].* = .{ 127, 0, 0, 1 };
+    return e;
+}
+
+test "linux: THE SAME-NODE SUCCESSOR IS REACHED — a member joins at a dead incarnation's port and the plane's links to it (by token client id and by holder appender id) dial that port; its eviction retires the sessions through the death fan-out; the successor joins under the SAME member id and appender id at a new port and the next call on either link re-resolves off the roster / the RAM endpoint table and lands — never a frame into the dead port, never the lease TTL" {
+    const gpa = testing.allocator;
+    const s = try meta_set.TestSet.create(gpa, "wire-succ", 1);
+    defer s.destroy();
+    try s.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    const set = try s.open();
+    defer set.close();
+    var locks = try dlm.Manager.init(gpa, 64);
+    defer locks.deinit();
+    const bound = try xv.set_bind.Bound.create(gpa, s.io(), set, &locks, &s.env);
+    defer bound.destroy(gpa);
+    const plane = (try WirePlane.start(gpa, s.io(), set, &s.env, 4, 1 << 30, &bound.plane, false)).?;
+    defer plane.stop();
+    const be0 = set.volumes[0];
+    const m = plane.mgr.?;
+    // The region under the successor-shared identity (an in-process
+    // joiner: the page is what `PublishEndpoint` binds the endpoint to).
+    const r1 = try be0.sym.?.joinInProcess(0x5002);
+    const ident = r1.identity;
+    const wire_ident: verbs.WireIdentity = .{ .node_token = ident.node_token, .writer_id = ident.writer_id, .mount_slot = ident.mount_slot, .reserved = 0 };
+    const id = shard.writerMemberId(wire_ident);
+    const client = clientIdOf(id);
+    const now = clock.monotonicNs() / std.time.ns_per_ms;
+    // The first incarnation: a member at the dead port, appender 1's
+    // endpoint published as the same port.
+    try testing.expect(m.owner.join(.{ .id = id, .role = .writer, .endpoint = deadEndpoint(), .pid = 4242, .boot = @splat(1), .prior_epoch = null, .pr_key = 0, .mount = "/mnt-b", .row = null }, now) == .granted);
+    var dead_ep: manager.Endpoint = .{};
+    const dead_bytes = std.mem.asBytes(&deadEndpoint());
+    @memcpy(dead_ep.bytes[0..dead_bytes.len], dead_bytes);
+    dead_ep.len = @intCast(dead_bytes.len);
+    _ = try be0.sym.?.manager.publishEndpoint(.{ .identity = ident, .appender_id = r1.appenderId(), .endpoint = dead_ep, .pr_key = 0 });
+    const by_client = PeerLinks.linkForClient(&plane.peers, client).?;
+    const by_holder = plane.peers.linkForHolder(r1.appenderId()).?;
+    try testing.expectError(error.HolderUnreachable, by_client.call(by_client.ctx, .{ .ping = .{} }));
+    try testing.expectError(error.HolderUnreachable, by_holder.call(by_holder.ctx, .{ .ping = .{} }));
+    try testing.expectEqual(@as(usize, 2), plane.peers.count());
+    // The eviction at T_owner: the fan-out retires both sessions.
+    const invalidated0 = joined.stats.peer_links_invalidated.load();
+    try testing.expectEqual(@as(u32, 1), m.owner.expireDue(now + m.owner.clocks.t_owner_ms + 1));
+    try testing.expectEqual(invalidated0 + 2, joined.stats.peer_links_invalidated.load());
+    // The successor: the same member id and appender id, the plane's own
+    // listener as its port (a listener that answers).
+    try testing.expect(m.owner.join(.{ .id = id, .role = .writer, .endpoint = plane.advertised, .pid = 4243, .boot = @splat(1), .prior_epoch = null, .pr_key = 0, .mount = "/mnt-b", .row = null }, now + m.owner.clocks.t_owner_ms + 2) == .granted);
+    var live_ep: manager.Endpoint = .{};
+    const live_bytes = std.mem.asBytes(&plane.advertised);
+    @memcpy(live_ep.bytes[0..live_bytes.len], live_bytes);
+    live_ep.len = @intCast(live_bytes.len);
+    _ = try be0.sym.?.manager.publishEndpoint(.{ .identity = ident, .appender_id = r1.appenderId(), .endpoint = live_ep, .pr_key = 0 });
+    // The SAME links (one session per peer) re-resolve and land.
+    const repointed0 = joined.stats.peer_links_repointed.load();
+    _ = try by_client.call(by_client.ctx, .{ .ping = .{} });
+    _ = try by_holder.call(by_holder.ctx, .{ .ping = .{} });
+    try testing.expectEqual(repointed0 + 2, joined.stats.peer_links_repointed.load());
+    try testing.expectEqual(@as(usize, 2), plane.peers.count());
+    try testing.expect(plane.peers.by_client.get(client).?.link.endpointNow().eql(plane.advertised));
+    try testing.expect(plane.peers.by_holder.get(r1.appenderId()).?.link.endpointNow().eql(plane.advertised));
 }
 
 test "client ids: one per member id, stable, distinct across two members" {

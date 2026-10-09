@@ -511,12 +511,18 @@ pub const AppenderSet = struct {
     /// the region's offset), the node floored at ring 0's head, the entry
     /// written through the region's lane, answered when it landed.
     pub fn appendPut(self: *AppenderSet, r: *Region, tree_id: u8, k: []const u8, value: []const u8) Error!void {
+        return self.appendRecord(r, tree_id, k, .put, value);
+    }
+
+    /// `appendPut` for any record kind (a `delta` folds into the key's
+    /// newest base; a `delete` carries no value).
+    pub fn appendRecord(self: *AppenderSet, r: *Region, tree_id: u8, k: []const u8, kind: record.RecordKind, value: []const u8) Error!void {
         const be = self.be;
         std.debug.assert(r.appenderId() != journal.FIXED_RING_APPENDER);
         // The door: a token on the record's slot BEFORE the append, held
         // to the entry's landing (the region's "terminal outcome").
         var tokens: @import("../tx.zig").DoorTokens = .none;
-        const recs = [_]@import("../tx.zig").Rec{.{ .tree_id = tree_id, .key = k, .kind = .put, .value = value }};
+        const recs = [_]@import("../tx.zig").Rec{.{ .tree_id = tree_id, .key = k, .kind = kind, .value = value }};
         be.slots.enterFor(r.appenderId(), &recs, &tokens) catch |e| return switch (e) {
             error.SlotBusy, error.SlotMoved => error.SlotBusy,
             error.Deferred => error.Deferred,
@@ -526,7 +532,7 @@ pub const AppenderSet = struct {
         };
         defer tokens.release();
         const t = tree.routeContent(be.trees.load(), tree_id, k) orelse return error.Corrupt;
-        var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(tree_id, 0), .key = k, .kind = .put, .seq = 0, .value = value }};
+        var frames = [_]journal.RecordFrame{.{ .tag = key.tagFor(tree_id, 0), .key = k, .kind = @import("../tx.zig").journalKindOf(kind), .seq = 0, .value = value }};
         const len = journal.entryLenFor(&frames) catch return error.Corrupt;
         const adm = r.core.core.tryAdmit(len, .user) orelse return error.RingFull;
         var st: StampCtx = .{ .j = &r.smo_journal, .adm = adm, .floor = be.core.headPos() };
@@ -541,7 +547,7 @@ pub const AppenderSet = struct {
                 };
             };
             defer leaf.release();
-            const outcome = t.applyAtSeqClass(leaf, k, .put, value, .{ .reserve = .{ .ctx = &st, .stamp = StampCtx.stamp } }, false) catch |e| {
+            const outcome = t.applyAtSeqClass(leaf, k, kind, value, .{ .reserve = .{ .ctx = &st, .stamp = StampCtx.stamp } }, false) catch |e| {
                 r.core.core.release(adm);
                 return switch (e) {
                     error.OutOfMemory => error.OutOfMemory,

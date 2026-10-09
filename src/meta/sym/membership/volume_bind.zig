@@ -337,7 +337,7 @@ pub const VolumeBinding = struct {
                     const split = key.splitInteriorJournalKey(f.key) catch return error.Corrupt;
                     const slot = routingSlot(split.slot, native);
                     try self.noteWindowSlot(slot);
-                    try out.append(gpa, .{ .slot = slot, .level = tag.level, .seq = f.seq, .kind = if (f.kind == .put) .put else .delete, .handle = handle });
+                    try out.append(gpa, .{ .slot = slot, .level = tag.level, .seq = f.seq, .kind = windowKindOf(f.kind), .handle = handle });
                     continue;
                 }
                 if (tag.tree_id == alloc_ext.tree_alloc_reserved) {
@@ -358,11 +358,22 @@ pub const VolumeBinding = struct {
                 const local: u64 = if (key.splitGuestLocal(key_ino)) |g| g.local else key_ino;
                 const slot = routingSlot(fs, native);
                 try self.noteWindowSlot(slot);
-                try out.append(gpa, .{ .slot = slot, .level = 0, .seq = f.seq, .kind = if (f.kind == .put) .put else .delete, .local_ino = local, .handle = handle });
+                try out.append(gpa, .{ .slot = slot, .level = 0, .seq = f.seq, .kind = windowKindOf(f.kind), .local_ino = local, .handle = handle });
             }
         }
         const seq_offset = @max(p.seq_offset, journal.seqOffsetOfWindow(rec.entries));
         return .{ .head = rec.head_pos, .seq_frontier = rec.head_pos +| seq_offset, .seq_offset = seq_offset };
+    }
+
+    /// A frame's kind as the driver's: 1:1 over the three slot-tree kinds
+    /// (a `delta` replays as a delta — folded into the key's newest base —
+    /// never as a tombstone).
+    fn windowKindOf(k: journal.RecordKind) recovery.Kind {
+        return switch (k) {
+            .put => .put,
+            .delta => .delta,
+            .delete => .delete,
+        };
     }
 
     fn routingSlot(fs: key.ForestSlot, native: ?u16) u16 {
@@ -558,7 +569,7 @@ pub const VolumeBinding = struct {
         std.debug.assert(stamp.appender_id == lt.MANAGER);
         const t = self.be.slotTree(rec.slot) orelse return error.Corrupt;
         const ref = self.refs.items[@intCast(rec.handle)];
-        const kind: tree.RecordKind = if (ref.frame.kind == .put) .put else .delete;
+        const kind = tree.kindOf(ref.frame.kind);
         if (rec.level > 0) {
             const split = key.splitInteriorJournalKey(ref.frame.key) catch return error.Corrupt;
             if (kind == .put) {
@@ -1353,9 +1364,31 @@ fn killWithDeadRegion(s: *meta_set.TestSet, kill: []const u8, keys: *std.ArrayLi
         try keys.append(gpa, k);
         try aset.appendPut(r1, key.TREE_INODES, k, &iv_value);
     }
+    // The window carries every slot-tree kind a live workload writes: an
+    // inode DELTA on the first flushed inode (a `write`'s size) and a
+    // tombstone on the second (an `unlink`) — the two kinds a replay that
+    // knows only `put`/`delete` mislabels.
+    try aset.appendRecord(r1, key.TREE_INODES, keys.items[0], .delta, dead_delta.encode().slice());
+    try aset.appendRecord(r1, key.TREE_INODES, keys.items[1], .delete, &.{});
     try be.fsync();
     try snapshotImage(s.paths[0], kill);
     return .{ .identity = .{ .node_token = r1.identity.node_token, .mount_slot = r1.identity.mount_slot, .writer_id = r1.identity.writer_id }, .orphan = orphan, .ring_bytes = r1.core.ringBytes() };
+}
+
+/// The dead window's inode delta: `size = 4096`.
+const dead_delta: record.InodeDelta = .{ .mask = record.DELTA_SIZE, .fields = .{ .size = 4096 } };
+
+/// The dead region's records as recovered: every put stands, the delta
+/// folded into its inode (the size), the tombstoned key gone.
+fn expectDeadWindowRecovered(set: *meta_set.MetaSet, keys: []const []const u8) !void {
+    const gpa = testing.allocator;
+    try expectAllPresent(set, keys[2..]);
+    const first = (try set.lookup(gpa, key.TREE_INODES, keys[0])) orelse return error.DeltaBaseLost;
+    defer gpa.free(first);
+    try testing.expectEqual(@as(u64, 4096), (try record.InodeValue.decode(first)).size);
+    const second = try set.lookup(gpa, key.TREE_INODES, keys[1]);
+    defer if (second) |v| gpa.free(v);
+    try testing.expect(second == null);
 }
 
 const Live = struct {
@@ -1430,7 +1463,7 @@ test "linux: a dead in-process region recovered over the real backend by the man
         try testing.expectEqual(aset.manager.term, p1.recovered_by_term);
         try testing.expect(p1.ledger_tail_seq > 0 and p1.head_hint == p1.ledger_tail_seq);
         // Every acked record of the dead region through the slot's tree.
-        try expectAllPresent(live.set, keys.items);
+        try expectDeadWindowRecovered(live.set, keys.items);
         // Tree 0: Unleased at the dead lease's g with the flushed root; the
         // tails recorded; the RAM table agrees; the recorded tails index.
         const raw = (try be.lookup(gpa, key.TREE_CONTROL, cr.slotStateKey(DEAD_SLOT).slice())).?;
@@ -1477,13 +1510,13 @@ test "linux: a dead in-process region recovered over the real backend by the man
         const p1b = (try aset.manager.readPageOf(1)).?;
         try testing.expectEqual(page.State.free, p1b.state);
         try testing.expectEqual(p1.term, p1b.term);
-        try expectAllPresent(live.set, keys.items);
+        try expectDeadWindowRecovered(live.set, keys.items);
     }
     // The remount: nothing unrecovered, every record durable.
     const set = try openCopy(s, kill);
     defer set.close();
     try testing.expectEqual(@as(usize, 0), set.volumes[0].sym.?.unrecovered.items.len);
-    try expectAllPresent(set, keys.items);
+    try expectDeadWindowRecovered(set, keys.items);
     try testing.expectEqual(lt.State.unleased, set.volumes[0].slots.table.view(DEAD_SLOT).state);
 }
 
@@ -1523,7 +1556,7 @@ test "linux: every crash window of the §5.9 procedure over the real backend —
         if (p.state == .recovering) try testing.expect(live.set.volumes[0].slots.table.view(DEAD_SLOT).state != .unleased or step == .tree0 or step == .table_release or step == .returns);
         live.binding().driver.seams.fail_at = null;
         live.plane.tick();
-        try expectAllPresent(live.set, keys.items);
+        try expectDeadWindowRecovered(live.set, keys.items);
         const after = (try aset.manager.readPageOf(1)).?;
         try testing.expect(after.state == .recovered or after.state == .free);
         try testing.expectEqual(lt.State.unleased, live.set.volumes[0].slots.table.view(DEAD_SLOT).state);

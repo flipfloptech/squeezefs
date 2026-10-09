@@ -414,10 +414,15 @@ fn frameOf(r: Rec) journal.RecordFrame {
     return .{
         .tag = journal.tagFor(r.tree_id, 0),
         .key = r.key,
-        .kind = @fromBackingInt(@intCast(@backingInt(r.kind))),
+        .kind = journalKindOf(r.kind),
         .seq = r.seq,
         .value = r.value,
     };
+}
+
+/// A record kind as the journal frame's (one encoding, asserted below).
+pub fn journalKindOf(k: RecordKind) journal.RecordKind {
+    return @fromBackingInt(@intCast(@backingInt(k)));
 }
 
 comptime {

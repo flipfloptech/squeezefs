@@ -85,6 +85,11 @@ pub const stats = struct {
     pub var joined_endpoint_polls: counters.ShardedCounter = .{};
     /// Leases released over the wire at the clean leave.
     pub var joined_leave_releases: counters.ShardedCounter = .{};
+    /// A peer link re-pointed at a listener that moved (a same-node
+    /// successor's new port under the old identity included).
+    pub var peer_links_repointed: counters.ShardedCounter = .{};
+    /// Peer links retired at a member's eviction (the death fan-out).
+    pub var peer_links_invalidated: counters.ShardedCounter = .{};
 };
 
 /// `mount_slot` of a joiner (charter §5.7 "a remount at another mount
@@ -132,17 +137,34 @@ pub const OpenError = error{
 // The shared link: one dialled session, any thread.
 // ---------------------------------------------------------------------------
 
+/// The peer's CURRENT listener off authoritative state (the manager's RAM
+/// endpoint table, the owner's roster, `ResolveEndpoint` on a joiner),
+/// consulted before every (re)dial — charter §5.5 "Readers' planes FOLLOW
+/// a holder that moved its listener (re-resolve off durable state,
+/// re-point in place)": a same-node successor under the same identity
+/// publishes a new ephemeral port under the old appender id and client
+/// id, and a link that kept dialling the dead incarnation's port answered
+/// `unreachable_` for every recall and step until the lease TTL. Null =
+/// no listener is known: unreachable, never a dial of a stale one.
+pub const EndpointResolver = struct {
+    ctx: *anyopaque,
+    resolve: *const fn (ctx: *anyopaque) ?endpoint.EndpointWire,
+};
+
 /// A thread-safe `Link` over ONE dialled session to a peer: the reply
 /// lands in the calling thread's own buffer (valid until that thread's
 /// next call — the `TcpLink` contract per thread), the mux multiplexes the
 /// calls, a poisoned mux is replaced under the lock and retired (never
-/// freed under a caller still reading its cell).
+/// freed under a caller still reading its cell). A link with a resolver
+/// re-resolves the endpoint before every dial; one without dials its
+/// fixed endpoint (the joiner's manager link).
 pub const SharedLink = struct {
     gpa: Allocator,
     io: Io,
     ep: endpoint.EndpointWire,
     secret: wire_auth.Secret,
     identity: verbs.WireIdentity,
+    resolver: ?EndpointResolver = null,
     lock: Io.Mutex = .init,
     mux: ?*dialer.Mux = null,
     retired: std.ArrayList(*dialer.Mux) = .empty,
@@ -160,15 +182,22 @@ pub const SharedLink = struct {
         self.retired.deinit(self.gpa);
     }
 
-    /// Re-point at a moved listener: the next call dials `ep`.
-    pub fn repoint(self: *SharedLink, ep: endpoint.EndpointWire) void {
+    /// The peer's listener is gone (the owner evicted the member): the
+    /// session is retired NOW, the next call re-resolves and dials afresh
+    /// — never a frame into a dead incarnation's socket.
+    pub fn invalidate(self: *SharedLink) void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        self.ep = ep;
-        if (self.mux) |m| {
-            self.retired.append(self.gpa, m) catch m.close();
-            self.mux = null;
-        }
+        const m = self.mux orelse return;
+        self.retired.append(self.gpa, m) catch m.close();
+        self.mux = null;
+    }
+
+    /// The endpoint the next dial takes (the current one; for tests).
+    pub fn endpointNow(self: *SharedLink) endpoint.EndpointWire {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return self.ep;
     }
 
     fn ensure(self: *SharedLink) errors.Error!*dialer.Mux {
@@ -179,6 +208,13 @@ pub const SharedLink = struct {
             self.retired.append(self.gpa, m) catch m.close();
             self.mux = null;
             @import("../../wire/stats.zig").cluster_wire_reconnects.inc();
+        }
+        if (self.resolver) |r| {
+            const ep = r.resolve(r.ctx) orelse return error.HolderUnreachable;
+            if (!ep.eql(self.ep)) {
+                stats.peer_links_repointed.inc();
+                self.ep = ep;
+            }
         }
         const peer_id = self.identity.peerId();
         const m = try dialer.connect(self.gpa, self.io, self.ep, &self.secret, &peer_id);

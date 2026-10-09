@@ -175,6 +175,9 @@ pub var partition_refusals: counters.Tripwire = .init("meta_kv_node_partition_re
 pub var leaf_lease_refusals: counters.Tripwire = .init("meta_kv_leaf_lease_refusals");
 /// FREEZING latched with no frozen delta — a third unknown window (RES-22).
 pub var freeze_latched_recovered: counters.Tripwire = .init("kv_freeze_latched_recovered");
+/// The frame encoder refused a frozen overlay (not `(key, seq)` ascending,
+/// or empty): a writer defect surfaced typed at the freeze.
+pub var freeze_order_refusals: counters.Tripwire = .init("kv_freeze_order_refusals");
 /// A revalidation drop pass met un-durable RAM records: revalidation was
 /// armed on a mount that writes.
 pub var revalidate_dirty_skips: counters.Tripwire = .init("meta_kv_revalidate_dirty_skips");
@@ -1227,8 +1230,14 @@ pub const CachedNode = struct {
             error.ValueTooLarge => return error.ValueTooLarge,
             error.BsetTooLarge => return error.Corrupt,
             error.OutOfMemory => return error.OutOfMemory,
-            // Non-empty and strictly ascending by the overlay's order.
-            error.EmptyBset, error.RecordsNotAscending => unreachable,
+            // The overlay is sorted `(key, seq)` by every insert and
+            // non-empty by the check above: either refusal is a writer
+            // defect — the node stays dirty and freezable, the cycle fails
+            // typed (never a panic on the checkpoint or recovery path).
+            error.EmptyBset, error.RecordsNotAscending => {
+                freeze_order_refusals.fire("the frame encoder refused a frozen overlay (empty or not (key, seq) ascending)");
+                return error.Corrupt;
+            },
         };
         const frame_len = frame.len;
         const frame_hdr = node.FRAME_LEN;

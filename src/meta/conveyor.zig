@@ -364,6 +364,11 @@ pub const Stats = struct {
     /// `meta_conveyor_park_tick_rescues`: parks the 10 ms backstop tick
     /// ended with room already there — a wake nobody sent (≈ 0 healthy).
     park_tick_rescues: counters.ShardedCounter = .{},
+    /// `manager_dependency_stalls` (charter §5.5): a grant-fed conveyor's
+    /// heap refusal answered `GrantExhausted` — the appender out of grant
+    /// with its manager unable to refill. Must stay 0 at the sized grant
+    /// (the pool holds a failover's worth of images at the measured rate).
+    manager_dependency_stalls: counters.ShardedCounter = .{},
     /// RAM ≠ replay: a roll-out, rollback or compensation that could not
     /// complete (allocation, resolution, a lock budget) left RAM holding
     /// what the ring never will (or the reverse). Each fires once per
@@ -399,7 +404,7 @@ pub const Stats = struct {
         for (GroupSizeHistogram.labels, 0..) |l, i| {
             try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", l, self.group_size.load(i) });
         }
-        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d}}}", .{
+        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d}}}", .{
             self.group_bytes.load(),
             self.leader_passes.load(),
             self.group_commits.load(),
@@ -414,6 +419,7 @@ pub const Stats = struct {
             self.refusals.load(),
             self.full_stalls.load(),
             self.park_tick_rescues.load(),
+            self.manager_dependency_stalls.load(),
             self.rollbacks.load(),
             self.compensations.load(),
             self.pass_panics.load(),
@@ -1288,6 +1294,7 @@ pub const Conveyor = struct {
                             const rf = refused.items[i];
                             const e = heap_law.finalizeRefusal(self.deps.checkpoint.posture, self.deps.volume, rf.why, self.deps.cache.heapPromised());
                             var m = members.orderedRemove(rf.member);
+                            if (self.deps.grant_fed) self.stats.manager_dependency_stalls.inc();
                             self.answer(&m, if (self.deps.grant_fed) error.GrantExhausted else e);
                         }
                         if (members.items.len == 0) return;

@@ -958,6 +958,8 @@ pub const KvBackend = struct {
         // The grant mirror: every extent claimed but the granted runs.
         be.alloc = alloc_ext.ExtentAllocator.grantMirror(gpa, sb.totalExtents(), sym.joined.MIRROR_RESERVE_EXTENTS, alloc_ext.pending_free_cap, standing.granted) catch return error.OutOfMemory;
         errdefer be.alloc.deinit();
+        // The pool's proactive refill rides the mirror's low-water mark.
+        js.armPoolRefill();
 
         // 5. The lane over the region's ring, the structural writer, the
         // checkpointer (page-as-ledger), the conveyor (grant-fed).

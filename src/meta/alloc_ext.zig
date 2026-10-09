@@ -262,6 +262,10 @@ pub const ExtentAllocator = struct {
     /// Replayed in-window frees `load` deferred until `parkReplayedFrees`
     /// knows the mounted roots. Mount-time only (single-threaded).
     replayed_parks: std.ArrayList(ReplayedPark),
+    /// A grant mirror's refill mark and hook (`installLowWater`); 0 and
+    /// null on the manager's own allocator.
+    low_water: std.atomic.Value(u64) = .init(0),
+    on_low: ?LowWaterHook = null,
 
     /// All-free, EVERY page dirty (the first checkpoint persists the whole
     /// bitmap).
@@ -459,6 +463,11 @@ pub const ExtentAllocator = struct {
         return self.core.reserve;
     }
 
+    /// Claims won since init (monotone).
+    pub fn claimsTotal(self: *const ExtentAllocator) u64 {
+        return self.core.claimsTotal();
+    }
+
     pub fn freeExtents(self: *const ExtentAllocator) u64 {
         return self.core.freeExtents();
     }
@@ -519,7 +528,36 @@ pub const ExtentAllocator = struct {
             },
         };
         self.markDirty(extent);
+        if (self.core.freeExtents() <= self.low_water.load(.acquire)) if (self.on_low) |h| h.run(h.ctx);
         return extent;
+    }
+
+    /// The pool's low-water hook (a grant mirror): called on the claiming
+    /// thread after a claim that leaves `freeExtents() ≤ low_water` — the
+    /// joiner's proactive refill, kicked by the POOL's state rather than
+    /// the checkpoint clock (a storm right after the join drains the
+    /// floor's SMO headroom inside one cadence). Never blocks: the hook
+    /// spawns. Installed once at the arm (single-threaded); the mark moves
+    /// with the target at every cadence.
+    pub const LowWaterHook = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque) void,
+    };
+
+    pub fn installLowWater(self: *ExtentAllocator, hook: LowWaterHook, low_water: u64) void {
+        self.on_low = hook;
+        self.low_water.store(low_water, .release);
+    }
+
+    pub fn setLowWater(self: *ExtentAllocator, low_water: u64) void {
+        self.low_water.store(low_water, .release);
+    }
+
+    /// The hook's owner is going away (no claim runs concurrently: the
+    /// lane and the task are stopped first).
+    pub fn uninstallLowWater(self: *ExtentAllocator) void {
+        self.on_low = null;
+        self.low_water.store(0, .release);
     }
 
     pub fn freePending(self: *const ExtentAllocator, extent: u64, gate_seq: u64) error{PendingFreeFull}!void {

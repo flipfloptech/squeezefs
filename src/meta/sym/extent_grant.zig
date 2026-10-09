@@ -15,6 +15,7 @@ const explorer = @import("../../model/explorer.zig");
 const lease_clock = @import("../guard/lease_clock.zig");
 const cr = @import("control_records.zig");
 const page = @import("appender_page.zig");
+const region = @import("region.zig");
 const derive = @import("../../core/derive.zig");
 
 const assert = std.debug.assert;
@@ -92,6 +93,31 @@ pub fn joinedPoolFloor(mint_slots: u64) u64 {
 /// `clamp(max(derived + promised, pool_floor), promised, cap)`.
 pub fn joinedPoolTarget(derived: u64, promised: u64, pool_floor: u64, cap: u64) u64 {
     return derive.clamp(@max(derived +| promised, pool_floor), promised, cap);
+}
+
+/// A WIRE joiner's derived size — the charter's `2 × ewma_smo_rate ×
+/// failover_bound_s` without the heap-share cap, which is the MANAGER's to
+/// apply (it answers an ask past it `Rejected`; the joiner then asks `0` =
+/// the cap). Clamped to `[FLOOR, GRANT_EXTENTS_MAX]`.
+pub fn joinedGrantDerived(ewma_smo_milli_per_s: u64, failover_bound_ms: u64) u64 {
+    const want = (GRANT_RATE_HEADROOM *| ewma_smo_milli_per_s) *| failover_bound_ms / 1_000_000;
+    return derive.clamp(want, GRANT_EXTENTS_FLOOR, GRANT_EXTENTS_MAX);
+}
+
+/// The SMO rate's per-cycle fold (milli-SMO/s): `images` claimed over
+/// `elapsed_ns` → `region.ewmaFold` (`7/8 · ewma + 1/8 · rate`, the
+/// spec's §5.1 fold); a zero-length cycle folds nothing.
+pub fn smoRateFold(ewma_milli_per_s: u64, images: u64, elapsed_ns: u64) u64 {
+    if (elapsed_ns == 0) return ewma_milli_per_s;
+    return region.ewmaFold(ewma_milli_per_s, (images *| 1000 *| std.time.ns_per_s) / elapsed_ns);
+}
+
+/// The pool's refill mark as the mirror's free count: `joinedRefillDue`
+/// turns true once `unclaimed − promised < target / 2`, i.e. at
+/// `unclaimed ≤ target / 2 + promised − 1`; the mark is the first count
+/// that is due (0 when nothing can be).
+pub fn joinedRefillMark(target: u64, promised: u64) u64 {
+    return (target / REFILL_FRACTION_DIVISOR +| promised) -| 1;
 }
 
 /// In-process: `unclaimed × 2 ≤ refill_reference` (the unclaimed count at
@@ -554,6 +580,26 @@ test "grant size derivation: floor 8, the heap-share cap, the 2× headroom; the 
     try testing.expectEqual(@as(u64, 60), joinedPoolTarget(1, 60, 24, 50)); // promised floors even above the cap
     try testing.expect(refillDue(4, 8) and !refillDue(5, 8) and refillDue(0, 0));
     try testing.expect(joinedRefillDue(3, 8) and !joinedRefillDue(4, 8));
+}
+
+test "a wire joiner's derived size, its SMO-rate fold and its refill mark: the smoke's storm (≈ 20 images/s) at the 46.5 s bound asks ≈ 1,860 (the manager's heap share caps it); ewma 0 is the floor; the fold is 7/8 + 1/8 of images/elapsed; a zero-length cycle folds nothing; the max is the ceiling; the mark is the first free count `joinedRefillDue` judges due" {
+    try testing.expectEqual(GRANT_EXTENTS_FLOOR, joinedGrantDerived(0, 46_500));
+    try testing.expectEqual(@as(u64, 1860), joinedGrantDerived(20_000, 46_500));
+    try testing.expectEqual(GRANT_EXTENTS_MAX, joinedGrantDerived(1 << 40, 46_500));
+    // 64 first images in one second = 64,000 milli-SMO/s, folded 1/8 in.
+    try testing.expectEqual(@as(u64, 8_000), smoRateFold(0, 64, std.time.ns_per_s));
+    // 7/8 · 20,000 + 1/8 · 4,000 (4 images in a second).
+    try testing.expectEqual(@as(u64, 18_000), smoRateFold(20_000, 4, std.time.ns_per_s));
+    try testing.expectEqual(@as(u64, 20_000), smoRateFold(20_000, 7, 0));
+    // The floor-sized pool (72) the storm drained in the kill row: with
+    // the measured rate the target is the law's, not the join's floor.
+    try testing.expect(joinedPoolTarget(joinedGrantDerived(8_000, 46_500), 0, joinedPoolFloor(64), GRANT_EXTENTS_MAX) > 72);
+    // The mark: target 72, nothing promised ⇒ due at 35 free, not at 36.
+    try testing.expectEqual(@as(u64, 35), joinedRefillMark(72, 0));
+    try testing.expect(joinedRefillDue(35, 72) and !joinedRefillDue(36, 72));
+    try testing.expectEqual(@as(u64, 45), joinedRefillMark(72, 10));
+    try testing.expect(joinedRefillDue(45 - 10, 72) and !joinedRefillDue(46 - 10, 72));
+    try testing.expectEqual(@as(u64, 0), joinedRefillMark(1, 0));
 }
 
 test "the return law's screens: a run past the volume or overflowing is rejected at the first offender; coalesce is bounded by the frame; the intersection by the record" {

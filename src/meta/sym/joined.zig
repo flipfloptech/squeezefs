@@ -42,6 +42,8 @@ const log = @import("../../core/log.zig");
 const knobs = @import("../../core/knobs.zig");
 const errors = @import("../../core/errors.zig");
 const checksum = @import("../../core/checksum.zig");
+const sync = @import("../../sync/sync.zig");
+const alloc_ext = @import("../alloc_ext.zig");
 const backend = @import("../backend.zig");
 const key = @import("../key.zig");
 const ledger = @import("../ledger.zig");
@@ -81,6 +83,14 @@ pub const stats = struct {
     pub var extent_grant_refills: counters.ShardedCounter = .{};
     pub var extent_grant_returns: counters.ShardedCounter = .{};
     pub var extent_grant_closure_violations: counters.Tripwire = .init("extent_grant_closure_violations");
+    /// The measured SMO rate the pool target derives from (milli-images/s).
+    pub var extent_grant_smo_ewma_milli_per_s: counters.Gauge = .{};
+    /// Asks the manager answered `Rejected` as past its heap-share cap —
+    /// re-asked as the cap itself.
+    pub var extent_grant_asks_capped: counters.ShardedCounter = .{};
+    /// Pool cadences the mirror's low-water hook kicked (the proactive
+    /// refill ahead of the checkpoint clock).
+    pub var extent_grant_refill_kicks: counters.ShardedCounter = .{};
     /// The manager's endpoint was not yet published when the joiner read
     /// tree 0: one bounded re-read of the projection per poll.
     pub var joined_endpoint_polls: counters.ShardedCounter = .{};
@@ -298,6 +308,22 @@ pub const JoinedSet = struct {
     returned: u64 = 0,
     granted_bits: std.DynamicBitSetUnmanaged,
     pool_lock: Io.Mutex = .init,
+    /// The measured SMO rate (milli-images/s; charter §5.5 "a WIRE joiner
+    /// measures its own SMO rate and names its size"), folded per cadence
+    /// off the mirror's claims (0 until the first cadence: the floor).
+    smo_ewma_milli_per_s: u64 = 0,
+    /// The fold's marks: the mirror's claim count and the clock at the
+    /// last cadence; surplus withdrawals are claims that are not images.
+    rate_mark_claims: u64 = 0,
+    rate_mark_ns: u64 = 0,
+    rate_withdrawn: u64 = 0,
+    /// The proactive refill's flight: the mirror's low-water hook kicks
+    /// ONE pool cadence when a claim crosses the refill mark (the pool's
+    /// state, not the checkpoint clock, decides).
+    refill: sync.TaskSet = .init,
+    refill_busy: std.atomic.Value(bool) = .init(false),
+    /// The mirror carries the hook (`armPoolRefill`): uninstalled at deinit.
+    pool_armed: bool = false,
     /// The last page write's words (for `.stats`).
     tail_written: u64 = 0,
     entries: u64 = 0,
@@ -404,6 +430,8 @@ pub const JoinedSet = struct {
     }
 
     pub fn deinit(self: *JoinedSet) void {
+        self.refill.cancel(self.be.io);
+        if (self.pool_armed) self.be.alloc.uninstallLowWater();
         self.joiner.deinit();
         self.link.deinit();
         self.granted_bits.deinit(self.gpa);
@@ -546,28 +574,91 @@ pub const JoinedSet = struct {
         if (held + unclaimed + self.returned != self.granted) stats.extent_grant_closure_violations.fire("the joiner's grant pool lost or gained an extent outside a grant or a return");
     }
 
-    /// The pool's target: the explicit knob, else `8 + M` (the join's
-    /// cost class) — the joiner names its ask; the manager caps it by the
-    /// heap share.
+    /// The pool's target (charter §5.5 "Extent grants"): the explicit
+    /// knob, else `clamp(max(2 × ewma_smo_rate × failover_bound_s +
+    /// promised, 8 + M), promised, GRANT_EXTENTS_MAX)` — the joiner
+    /// measures its own rate and names its size; the heap-share cap is
+    /// the manager's (an ask past it is `Rejected`; the joiner then asks
+    /// the cap). A storm's joiner holds a failover's worth of images, so a
+    /// manager outage shorter than the bound never answers the app
+    /// `GrantExhausted` (0002 row 353).
     fn poolTarget(self: *JoinedSet) u64 {
-        return grant.resolveGrantExtents(knobs.optIntKnob("SQUEEZEFS_SYM_GRANT_EXTENTS", u64, self.be.env), grant.joinedPoolFloor(self.m));
+        const bound = grant.failoverBoundMs(self.be.gate_ns / std.time.ns_per_ms, self.be.replayStats().replay_ns / std.time.ns_per_ms);
+        const derived = grant.joinedGrantDerived(self.smo_ewma_milli_per_s, bound);
+        return grant.resolveGrantExtents(knobs.optIntKnob("SQUEEZEFS_SYM_GRANT_EXTENTS", u64, self.be.env), grant.joinedPoolTarget(derived, self.be.cache.heapPromised(), grant.joinedPoolFloor(self.m), grant.GRANT_EXTENTS_MAX));
     }
 
-    /// At the cadence (the checkpoint's page write): refill when the
-    /// unclaimed headroom halves; return the surplus above twice the
-    /// target (a pool that outgrew its target after a storm of frees).
+    /// The SMO-rate fold at the cadence: the mirror's claims since the
+    /// last mark, less the surplus withdrawals (claims that are returns,
+    /// not images), over the elapsed time.
+    fn foldSmoRate(self: *JoinedSet) void {
+        self.pool_lock.lockUncancelable(self.be.io);
+        defer self.pool_lock.unlock(self.be.io);
+        const now = clock.monotonicNs();
+        const claims = self.be.alloc.claimsTotal() -| self.rate_withdrawn;
+        if (self.rate_mark_ns != 0) {
+            self.smo_ewma_milli_per_s = grant.smoRateFold(self.smo_ewma_milli_per_s, claims -| self.rate_mark_claims, now -| self.rate_mark_ns);
+            stats.extent_grant_smo_ewma_milli_per_s.set(self.smo_ewma_milli_per_s);
+        }
+        self.rate_mark_claims = claims;
+        self.rate_mark_ns = now;
+    }
+
+    /// The mirror's low-water hook (`alloc_ext.LowWaterHook`), armed by the
+    /// backend once the mirror stands: a claim that crosses the refill
+    /// mark kicks the pool cadence at once on its own flight — the
+    /// PROACTIVE refill the spec names (§5.2), driven by the pool's state
+    /// rather than the checkpoint clock (a storm right after the join
+    /// drains the floor's SMO headroom inside one cadence; a manager
+    /// death in that window would otherwise answer the app `GrantExhausted`).
+    pub fn armPoolRefill(self: *JoinedSet) void {
+        self.be.alloc.installLowWater(.{ .ctx = self, .run = &lowWaterRun }, grant.joinedRefillMark(self.poolTarget(), self.be.cache.heapPromised()));
+        self.pool_armed = true;
+    }
+
+    fn lowWaterRun(ctx: *anyopaque) void {
+        const self: *JoinedSet = @ptrCast(@alignCast(ctx));
+        if (self.left or self.refill_busy.swap(true, .acq_rel)) return;
+        self.refill.spawn(self.be.io, refillRun, .{self}) catch self.refill_busy.store(false, .release);
+    }
+
+    fn refillRun(self: *JoinedSet) Io.Cancelable!void {
+        defer self.refill_busy.store(false, .release);
+        stats.extent_grant_refill_kicks.inc();
+        self.poolCadence();
+    }
+
+    /// At the cadence (the checkpoint's page write) and on the low-water
+    /// kick: refill when the unclaimed headroom halves — the top-up to
+    /// the target (the wire carries no page word, so the joiner names the
+    /// difference); return the surplus above twice the target (a pool
+    /// that outgrew its target after a storm of frees); the mirror's mark
+    /// follows the target.
     pub fn poolCadence(self: *JoinedSet) void {
         self.pool_lock.lockUncancelable(self.be.io);
         defer self.pool_lock.unlock(self.be.io);
         const target = self.poolTarget();
         const unclaimed = self.unclaimedCount();
+        self.be.alloc.setLowWater(grant.joinedRefillMark(target, self.be.cache.heapPromised()));
         if (grant.joinedRefillDue(unclaimed -| self.be.cache.heapPromised(), target)) {
             var runs: std.ArrayList(grant.GrantRun) = .empty;
             defer runs.deinit(self.gpa);
-            const want: u32 = @intCast(@min(target, grant.GRANT_EXTENTS_MAX));
-            self.wire.extentGrant(self.appenderId(), want, &runs) catch |e| {
-                log.debug("meta volume {s}: ExtentGrant({d}) did not land this cadence ({s}); the pool holds {d} unclaimed", .{ self.be.path, want, @errorName(e), unclaimed });
-                return;
+            var want: u32 = @intCast(@min(target -| unclaimed, grant.GRANT_EXTENTS_MAX));
+            if (want == 0) return;
+            self.wire.extentGrant(self.appenderId(), want, &runs) catch |e| switch (e) {
+                error.Rejected => {
+                    // Past the manager's heap-share cap: the cap itself (0).
+                    stats.extent_grant_asks_capped.inc();
+                    want = 0;
+                    self.wire.extentGrant(self.appenderId(), 0, &runs) catch |e2| {
+                        log.debug("meta volume {s}: ExtentGrant(cap) did not land this cadence ({s}); the pool holds {d} unclaimed of a target of {d}", .{ self.be.path, @errorName(e2), unclaimed, target });
+                        return;
+                    };
+                },
+                else => {
+                    log.debug("meta volume {s}: ExtentGrant({d}) did not land this cadence ({s}); the pool holds {d} unclaimed of a target of {d}", .{ self.be.path, want, @errorName(e), unclaimed, target });
+                    return;
+                },
             };
             for (runs.items) |r| {
                 var e = r.start;
@@ -589,6 +680,8 @@ pub const JoinedSet = struct {
                 const e = self.be.alloc.withdrawGranted() orelse break;
                 surplus.append(self.gpa, e) catch break;
             }
+            // Withdrawals are claims on the mirror, not images.
+            self.rate_withdrawn += surplus.items.len;
             if (surplus.items.len == 0) return;
             var wire_runs: std.ArrayList(verbs.GrantRunWire) = .empty;
             defer wire_runs.deinit(self.gpa);
@@ -645,6 +738,9 @@ pub const JoinedSet = struct {
         self.writePages(true) catch return error.Io;
         self.tail_written = rec.journal_tail_seq;
         self.be.slots.pageLanded(r);
+        // The rate folds on the checkpoint clock alone (a kicked cadence
+        // would sample a fraction of a cycle).
+        self.foldSmoRate();
         self.poolCadence();
         self.be.slots.kickCadence();
     }
@@ -695,6 +791,8 @@ pub const JoinedSet = struct {
         if (self.left) return;
         self.left = true;
         const be = self.be;
+        // No refill lands under the leave (the pool's word is read below).
+        self.refill.cancel(be.io);
         be.slots.releaseAllForLeave(self.appenderId());
         // Every release's cycles landed the roots; the page without the
         // slots, barriered, before the manager screens it.

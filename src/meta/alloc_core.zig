@@ -148,6 +148,8 @@ const SpinLock = struct {
 const State = struct {
     free_budget: Atomic(u64) align(std.atomic.cache_line),
     hint: Atomic(u64),
+    /// Claims won since init (monotone): the SMO-rate measurement's term.
+    claims: Atomic(u64),
     /// Non-decreasing-gate debug guard (one serialized producer).
     last_retire_seq: Atomic(u64),
     pending_head: Atomic(u64) align(std.atomic.cache_line),
@@ -187,6 +189,7 @@ pub const ExtCore = struct {
         st.* = .{
             .free_budget = .init(total),
             .hint = .init(0),
+            .claims = .init(0),
             .last_retire_seq = .init(0),
             .pending_head = .init(0),
             .pending_tail = .init(0),
@@ -210,6 +213,11 @@ pub const ExtCore = struct {
     /// Claimable extents (excludes allocated and pending-free).
     pub fn freeExtents(self: *const ExtCore) u64 {
         return self.st.free_budget.load(.acquire);
+    }
+
+    /// Claims won since init (monotone; a release never lowers it).
+    pub fn claimsTotal(self: *const ExtCore) u64 {
+        return self.st.claims.load(.monotonic);
     }
 
     fn fifoCount(self: *const ExtCore) u64 {
@@ -265,6 +273,9 @@ pub const ExtCore = struct {
                 const idx = if (start + k < self.total) start + k else start + k - self.total;
                 if (self.tryTakeBit(idx)) {
                     self.st.hint.store(idx + 1, .monotonic);
+                    // The same line the budget CAS already wrote; a claim is
+                    // an SMO-rate event, never a per-op hot path.
+                    _ = self.st.claims.fetchAdd(1, .monotonic);
                     return idx;
                 }
             }

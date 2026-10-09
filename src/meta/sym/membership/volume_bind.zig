@@ -438,12 +438,17 @@ pub const VolumeBinding = struct {
 
     /// Step 7 landed `Unleased`: the published-root mirror and the slot's
     /// cursor cell follow the record (C1b would otherwise republish the
-    /// grant-time words over it).
+    /// grant-time words over it), and the holder cache's LEARNT view of
+    /// the slot drops — the arm learnt "leased by the dead appender" off
+    /// tree 0, and a view that outlived the release answered
+    /// `unreachable_` (EAGAIN) for every read of the recovered slot while
+    /// the table said unleased (the manager maintains it: local).
     fn noteUnleasedFn(ctx: *anyopaque, slot: u16, state: cr.SlotState) Error!void {
         const self = self_(ctx);
         const be = self.be;
         try be.guest_published.put(self.gpa, slot, .{ .addr = state.root.addr, .seq = state.root.seq });
         if (be.stamp.native_slot != slot) be.stamp.installFloor(slot, state.cursor) catch return error.OutOfMemory;
+        be.slots.cache.forget(slot);
     }
 
     fn tableFn(ctx: *anyopaque) *lt.LeaseTable {
@@ -1448,6 +1453,9 @@ test "linux: a dead in-process region recovered over the real backend by the man
         const aset = be.sym.?;
         try testing.expect(aset.isUnrecovered(1));
         try testing.expectEqual(page.State.live, (try aset.manager.readPageOf(1)).?.state);
+        // This mount learnt the dead lease off tree 0 at its arm: the slot
+        // resolves to the dead appender, which has no listener.
+        try testing.expectEqual(@as(u32, 1), be.slots.cache.stepHome(DEAD_SLOT).unreachable_.holder);
         // Before the record: the poll acts on nothing.
         live.plane.tick();
         try testing.expectEqual(recoveries0, recovery.stats.appender_recoveries.load());
@@ -1457,6 +1465,9 @@ test "linux: a dead in-process region recovered over the real backend by the man
         const took_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
         try testing.expectEqual(recoveries0 + 1, recovery.stats.appender_recoveries.load());
         try testing.expectEqual(acted0 + 1, death_ledger.stats.dead_members_acted.load());
+        // The recovered slot is the manager's to maintain: the learnt view
+        // dropped with the release, every read of it local.
+        try testing.expect(be.slots.cache.stepHome(DEAD_SLOT) == .local);
         const p1 = (try aset.manager.readPageOf(1)).?;
         try testing.expectEqual(page.State.recovered, p1.state);
         try testing.expectEqual(@as(u16, 0), p1.n_slots);

@@ -1269,10 +1269,15 @@ fn numberAfter(text: []const u8, key: []const u8) ?u64 {
 }
 
 /// A SECOND daemon of the rig's set at its own mount point with its own
-/// log (the two-daemon matrix: A is the rig's child, B a `Peer`).
+/// log (the two-daemon matrix: A is the rig's child, B a `Peer`). With a
+/// `node` name the daemon runs in its own UTS namespace under that
+/// hostname: ANOTHER NODE to the identity law (its node token derives from
+/// the hostname), so `appender clear` judges its page foreign residue and
+/// a remount under the same name is the same-node successor.
 const Peer = struct {
     rig: *Rig,
     name: []const u8,
+    node: ?[]const u8 = null,
     mp: [:0]u8,
     log_path: [:0]u8,
     log_file: ?Io.File = null,
@@ -1327,8 +1332,16 @@ const Peer = struct {
         std.debug.assert(self.child == null);
         const rig = self.rig;
         if (self.log_file == null) self.log_file = try Io.Dir.cwd().createFile(rig.io, self.log_path, .{ .truncate = false });
-        var argv: [16][]const u8 = undefined;
+        var argv: [24][]const u8 = undefined;
         var n: usize = 0;
+        if (self.node) |node| {
+            // `unshare` and `sh` both exec in place: the child's pid IS the
+            // daemon's (the kill and the wait address it directly).
+            for ([_][]const u8{ "unshare", "-u", "sh", "-c", "hostname \"$0\" && exec \"$@\"", node }) |a| {
+                argv[n] = a;
+                n += 1;
+            }
+        }
         argv[n] = rig.bin;
         n += 1;
         argv[n] = "mount";
@@ -1407,6 +1420,22 @@ const Peer = struct {
             _ = linux.kill(self.pid, .KILL);
         }
         return c.wait(self.rig.io);
+    }
+
+    /// `kill -9`: the daemon dies mid-flight, its dead connection is
+    /// detached (a type-fuse mount gets no DESTROY).
+    fn kill(self: *Peer) !void {
+        _ = linux.kill(self.pid, .KILL);
+        try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try self.waitExit());
+        _ = linux.umount2(self.mp.ptr, linux.MNT.DETACH);
+        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(self.rig.gpa, self.rig.io, self.mp));
+    }
+
+    /// The daemon's log length (a mark for `awaitLog`).
+    fn logLen(self: *Peer) !usize {
+        const text = try self.readLog();
+        defer self.rig.gpa.free(text);
+        return text.len;
     }
 };
 
@@ -1659,6 +1688,412 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         const ta = try rig.onMount("cat .stats");
         defer gpa.free(ta);
         try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"membership_members\":"));
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+// ---------------------------------------------------------------------------
+// THE KILL ROWS (charter §5.5 "Death and recovery", "PARK-AND-RECLAIM",
+// §8 `appender clear`): two daemons over real TCP, `kill -9` of either.
+// ---------------------------------------------------------------------------
+
+/// The kill rows' peer node name: B runs under its own UTS hostname (a
+/// distinct node token), so a dead B's page is foreign residue to the
+/// smoke's host (`appender clear` attests it) and a remount of B under the
+/// same name is the same-node successor.
+const kill_peer_node = "sqz-nodeb";
+/// The kill rows' tree: enough entries that a `tar -x` over the wire is
+/// mid-flight at the kill; each `t%d\n`, so a body names its file.
+const kill_row_tree_files: usize = 1000;
+/// Files visible on B before the kill: creates, cross-owner steps and
+/// writes all in flight.
+const kill_row_kill_after: usize = 200;
+/// The storm on B for the manager's death: creates in B's own slots.
+const kill_row_storm_files: usize = 2000;
+/// How long a daemon's recovery / park / reclaim is given to show in
+/// `.stats`: `T_owner` (3 s) + the reclaim cadence (5 s) + the recovery
+/// bound (≈ 1.1 s) + the next tick, with headroom for a debug venue.
+const kill_row_wait_ns: u64 = 60 * std.time.ns_per_s;
+
+/// Poll a mount's `.stats` (`host` is a `*Rig` or a `*Peer`: both read it
+/// through `onMount`) until every `(key, want)` holds or the deadline
+/// passes; the last tail either way (owned by the caller).
+fn awaitStats(host: anytype, pairs: []const struct { key: []const u8, want: u64 }, deadline_ns: u64) ![]u8 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const tail = try host.onMount("cat .stats");
+        var ok = true;
+        for (pairs) |p| ok = ok and (numberAfter(tail, p.key) orelse std.math.maxInt(u64)) == p.want;
+        if (ok or clock.monotonicNs() >= deadline) {
+            if (!ok) std.debug.print("\n--- stats never reached the wanted words ---\n", .{});
+            return tail;
+        }
+        testing.allocator.free(tail);
+        sleepMs(200);
+    }
+}
+
+/// The tar source of the kill rows under the rig's work dir.
+fn killRowTarSource(rig: *Rig) !void {
+    var script: std.Io.Writer.Allocating = .init(rig.gpa);
+    defer script.deinit();
+    try script.writer.print("rm -rf tree tree.tar && mkdir tree && i=0; while [ $i -lt {d} ]; do printf 't%s\\n' $i > tree/t$i; i=$((i + 1)); done; tar -cf tree.tar tree && echo ok", .{kill_row_tree_files});
+    const out = try rig.shOk(rig.work, script.written());
+    rig.gpa.free(out);
+}
+
+/// Every file under `dir` on `host`'s mount is whole (its body names it:
+/// `t17` holds `t17`) — answers the count.
+fn expectTreeWhole(host: anytype, dir: []const u8) !usize {
+    var script: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer script.deinit();
+    try script.writer.print("n=0; for f in {s}/*; do b=$(basename $f); test \"$(cat $f)\" = \"$b\" || {{ echo \"TORN $f\"; exit 1; }}; n=$((n + 1)); done; echo $n", .{dir});
+    const out = try host.onMount(script.written());
+    defer testing.allocator.free(out);
+    return std.fmt.parseInt(usize, std.mem.trimEnd(u8, out, "\n"), 10);
+}
+
+test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒ A evicts B at T_owner, records the death, recovers its region (dead_members_acted ≡ recorded × regions held, rollbacks 0, the page recovered → free), every file B acked is whole on A → remount B under the same node (the same-node successor) sees them → B's FIRST cross-owner mkdir succeeds → A's `rm -rf` of the recovered tree completes; recall timeouts 0, tripwires 0 on both" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    try killRowTarSource(rig);
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+    }
+    // `tar -x` on B into A's directory, in a child; B dies once enough
+    // files are visible on its own mount.
+    var tar_path_buf: [160]u8 = undefined;
+    const tar_path = try std.fmt.bufPrint(&tar_path_buf, "{s}/tree.tar", .{rig.work});
+    var dest_buf: [160]u8 = undefined;
+    const dest = try std.fmt.bufPrint(&dest_buf, "{s}/a-dir", .{b.mp});
+    var tar = try std.process.spawn(io, .{ .argv = &.{ "tar", "-xf", tar_path, "-C", dest }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    var seen: usize = 0;
+    {
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        var tree_buf: [160]u8 = undefined;
+        const tree_path = try std.fmt.bufPrint(&tree_buf, "{s}/a-dir/tree", .{b.mp});
+        while (clock.monotonicNs() < deadline) {
+            if (Io.Dir.cwd().openDir(io, tree_path, .{ .iterate = true })) |d| {
+                var dir = d;
+                defer dir.close(io);
+                seen = try countFiles(gpa, io, dir);
+                if (seen >= kill_row_kill_after) break;
+            } else |_| {}
+            sleepMs(5);
+        }
+    }
+    try testing.expect(seen >= kill_row_kill_after);
+    try b.kill();
+    _ = try tar.wait(io);
+    std.debug.print("\nsmoke: kill rows (a): kill -9 B with {d} of {d} files visible\n", .{ seen, kill_row_tree_files });
+    // A: eviction at T_owner → the death recorded → acted → the region
+    // recovered → released at the next tick.
+    const t_kill = clock.monotonicNs();
+    const ta = try awaitStats(rig, &.{ .{ .key = "\"appender_recoveries\":", .want = 1 }, .{ .key = "\"recovered_regions_released\":", .want = 1 } }, kill_row_wait_ns);
+    defer gpa.free(ta);
+    const recovered_ms = (clock.monotonicNs() - t_kill) / std.time.ns_per_ms;
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"membership_evictions\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_recorded\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_acted\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"appender_recoveries\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"appender_recovery_rollbacks\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dead_appender_orphans\":"));
+    try expectMustStayZero(ta);
+    {
+        const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        // A released region keeps the dead identity and term on its Free
+        // page (unlike a clean leave's cleared identity).
+        const row = std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,") orelse return error.PageMissing;
+        try testing.expect(std.mem.indexOf(u8, r.stdout[row..], "\"state\":\"free\"") != null);
+    }
+    // Every file B acked is whole on A (C8/C6: the body names the file).
+    const whole_a = try expectTreeWhole(rig, "a-dir/tree");
+    try testing.expect(whole_a >= seen);
+    std.debug.print("smoke: kill rows (a): A recovered B's region {d} ms after the kill — evictions 1, dead_members recorded 1 / acted 1, appender_recoveries 1, rollbacks 0, orphans 0, page free; {d} files whole on A (≥ the {d} seen)\n", .{ recovered_ms, whole_a, seen });
+    // The same-node successor: B again under the same node name.
+    const mark_b = try b.logLen();
+    try b.spawn(&.{});
+    _ = try b.awaitLog("ready: ", mark_b, ready_wait_ns);
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "mounted JOINED as appender 1"));
+    }
+    const whole_b = try expectTreeWhole(b, "a-dir/tree");
+    try testing.expectEqual(whole_a, whole_b);
+    // B's FIRST cross-owner op after the recovery: a mkdir under A's root.
+    {
+        const t0 = clock.monotonicNs();
+        const out = try b.onMount("timeout -s KILL 20 mkdir b2-dir && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+        const mkdir_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"xv_cross_owner_intents_minted\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"xv_cross_owner_intents_retired\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"xv_cross_owner_intents_stuck\":"));
+        std.debug.print("smoke: kill rows (a): the successor's first cross-owner mkdir landed in {d} ms (intents minted 1, retired 1)\n", .{mkdir_ms});
+    }
+    // A's `rm -rf` of the recovered tree: every unlink recalls the
+    // successor's tokens and completes.
+    {
+        const t0 = clock.monotonicNs();
+        const out = try rig.onMount("timeout -s KILL 60 rm -rf a-dir/tree && ls a-dir | wc -l");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("0\n", out);
+        const rm_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        const ta2 = try rig.onMount("cat .stats");
+        defer gpa.free(ta2);
+        try expectMustStayZero(ta2);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta2, "\"dlm_token_recall_timeouts_live\":"));
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try expectMustStayZero(tb);
+        std.debug.print("smoke: kill rows (a): A's rm -rf of the recovered tree ({d} files) completed in {d} ms — recalls {d}, acked at B {d}, timeouts 0, tripwires 0 on both\n", .{ whole_a, rm_ms, numberAfter(ta2, "\"dlm_token_recalls\":") orelse 0, numberAfter(tb, "\"dlm_token_recalls_acked\":") orelse 0 });
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B PARKS-AND-RECLAIMS at T_self (acks held at the pre-admission gate, park expiries 0) → remount A (the D0 ladder: the same-host dead-pid proof, A wins volume 0 again at term 2, the grace window open, the allocation leases taken over from the dead incarnation) → B's reclaim lands in the grace window, its manager link re-points, the held writes drain and every storm file is whole on both" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    // The storm on B in a child: creates into B's own directory, every
+    // body naming its file; the script's exit is the storm's verdict.
+    {
+        const mk = try b.onMount("mkdir storm");
+        gpa.free(mk);
+    }
+    var storm_script: std.Io.Writer.Allocating = .init(gpa);
+    defer storm_script.deinit();
+    try storm_script.writer.print("cd \"$1\" && i=0; while [ $i -lt {d} ]; do printf 's%s\\n' $i > storm/s$i || exit 1; i=$((i + 1)); done", .{kill_row_storm_files});
+    var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", storm_script.written(), "storm", b.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    var seen: usize = 0;
+    {
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        var storm_buf: [160]u8 = undefined;
+        const storm_path = try std.fmt.bufPrint(&storm_buf, "{s}/storm", .{b.mp});
+        while (clock.monotonicNs() < deadline) {
+            var dir = try Io.Dir.cwd().openDir(io, storm_path, .{ .iterate = true });
+            defer dir.close(io);
+            seen = try countFiles(gpa, io, dir);
+            if (seen >= kill_row_kill_after) break;
+            sleepMs(5);
+        }
+    }
+    try testing.expect(seen >= kill_row_kill_after);
+    _ = linux.kill(rig.child_pid, .KILL);
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    _ = linux.umount2(rig.mp.ptr, linux.MNT.DETACH);
+    const t_kill = clock.monotonicNs();
+    std.debug.print("\nsmoke: kill rows (b): kill -9 A with {d} storm files visible on B\n", .{seen});
+    // B parks at T_self: acks held, the park counted, no expiry.
+    const parked = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 1 }}, kill_row_wait_ns);
+    defer gpa.free(parked);
+    const parked_ms = (clock.monotonicNs() - t_kill) / std.time.ns_per_ms;
+    try testing.expectEqual(@as(?u64, 1), numberAfter(parked, "\"appender_parked\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(parked, "\"appender_park_expiries\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(parked, "\"membership_self_fences\":"));
+    try testing.expect(alive(storm.id.?));
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "appender park: T_self reached with the home volume 0's manager unreachable — parked") != null);
+    }
+    std.debug.print("smoke: kill rows (b): B PARKED {d} ms after the kill (acks held; park expiries 0); the storm child is alive, waiting\n", .{parked_ms});
+    // Remount A: the D0 ladder's same-host dead-pid proof; A wins volume
+    // 0 again as the manager at term 2 with the grace window open.
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        try testing.expect(std.mem.indexOf(u8, seg, "appender 0 Live as the manager (term 2") != null);
+        try testing.expect(std.mem.indexOf(u8, seg, "membership owner term 2 (T_owner 3000 ms, grace open)") != null);
+        try testing.expect(std.mem.indexOf(u8, seg, "no grant plane armed") == null);
+    }
+    // B's reclaim lands: the park released, the storm completes.
+    const reclaimed = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 0 }}, kill_row_wait_ns);
+    defer gpa.free(reclaimed);
+    try testing.expectEqual(@as(?u64, 0), numberAfter(reclaimed, "\"appender_park_expiries\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(reclaimed, "\"manager_repoints\":"));
+    try testing.expect((numberAfter(reclaimed, "\"dlm_token_holder_repoints\":") orelse 0) >= 1);
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "the manager's listener moved to") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "admitted the reclaim") != null);
+    }
+    const storm_term = try storm.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, storm_term);
+    // Every storm file whole on B (its own slots) AND on A (under tokens
+    // from B — A's reader plane dialled B's listener afresh).
+    const whole_b = try expectTreeWhole(b, "storm");
+    try testing.expectEqual(kill_row_storm_files, whole_b);
+    {
+        const out = try rig.onMount("ls storm | wc -l; cat storm/s7");
+        defer gpa.free(out);
+        var want_buf: [32]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "{d}\ns7\n", .{kill_row_storm_files}), out);
+    }
+    {
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"membership_members\":"));
+        // The dead incarnation's allocation leases were taken over, one
+        // per data volume: its death recorded EARLY by each takeover (the
+        // same key; retired by the grant), B's region never recovered.
+        try testing.expectEqual(@as(?u64, 2), numberAfter(ta, "\"alloc_lease_same_node_takeovers\":"));
+        try testing.expectEqual(@as(?u64, 2), numberAfter(ta, "\"alloc_lease_successions\":"));
+        try testing.expectEqual(@as(?u64, 2), numberAfter(ta, "\"dead_members_recorded\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"appender_recoveries\":"));
+        // B's held write outlived the op watchdog's 5 s by design (the
+        // park holds acks up to `T_park_max`): the must-stay-0s that
+        // matter here are named one by one.
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"invariant_tripwires\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"appender_park_expiries\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"transport_requests_abandoned\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"open_count_stranded\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"joined_wire_words_rejected\":"));
+        try testing.expect(std.mem.indexOf(u8, tb, "\"volume_failed\":false") != null);
+        std.debug.print("smoke: kill rows (b): A remounted as the manager at term 2 (grace open), B's reclaim landed (manager repoints 1, token plane repoints {d}, reconnects {d}), the storm's {d} files whole on both; park expiries 0, tripwires 0 on both\n", .{ numberAfter(tb, "\"dlm_token_holder_repoints\":") orelse 0, numberAfter(tb, "\"cluster_wire_reconnects\":") orelse 0, whole_b });
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+test "smoke: THE KILL ROWS (c) — `appender clear` refuses a live-mounted set; after A's clean umount parks B and B is killed unrecovered, `appender clear <uri> 1` performs the operator path (the page Recovering{0}, the writer bring-up, the EARLY record, the leave) and `appenders` shows `recovering`; `appender clear <uri> 0` refuses; the next mount's poll recovers the region and `appenders` shows `free`" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const out = try b.onMount("mkdir bdir && for i in 0 1 2 3 4 5 6 7; do printf 'b%s\\n' $i > bdir/f$i; done; ls bdir | wc -l");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("8\n", out);
+    }
+    // Live-mounted: refused.
+    {
+        const r = try rig.squeezefs(&.{ "appender", "clear", rig.meta_uri, "1" });
+        defer rig.freeRun(r);
+        try testing.expect(!r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "live-mounted") != null);
+    }
+    // A leaves cleanly (its claim deleted); B parks at T_self; B dies
+    // parked with its page Live — unrecovered, no manager to record it.
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const parked = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 1 }}, kill_row_wait_ns);
+    defer gpa.free(parked);
+    try testing.expectEqual(@as(?u64, 1), numberAfter(parked, "\"appender_parked\":"));
+    try b.kill();
+    {
+        const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "\"state\":\"live\"") != null);
+    }
+    // The operator path: the four writes.
+    {
+        const r = try rig.squeezefs(&.{ "appender", "clear", rig.meta_uri, "1" });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nappender clear: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "appender 1 cleared (was live)") != null);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const row = std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,") orelse return error.PageMissing;
+        try testing.expect(std.mem.indexOf(u8, r.stdout[row..], "\"state\":\"recovering\"") != null);
+        std.debug.print("\nsmoke: kill rows (c): appender clear 1 → the page Recovering{{0}} + the EARLY record:\n{s}", .{r.stdout});
+    }
+    // Appender 0's page is the manager's: refused.
+    {
+        const r = try rig.squeezefs(&.{ "appender", "clear", rig.meta_uri, "0" });
+        defer rig.freeRun(r);
+        try testing.expect(!r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "refusing") != null);
+    }
+    // The next mount's poll recovers the attested region: recovered, then
+    // free; every file B acked is whole.
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    const ta = try awaitStats(rig, &.{ .{ .key = "\"appender_recoveries\":", .want = 1 }, .{ .key = "\"recovered_regions_released\":", .want = 1 } }, kill_row_wait_ns);
+    defer gpa.free(ta);
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dead_members_acted\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"appender_recovery_rollbacks\":"));
+    try testing.expect((numberAfter(ta, "\"slot_custody_quarantines_installed\":") orelse 0) >= 1);
+    try expectMustStayZero(ta);
+    {
+        const r = try rig.squeezefs(&.{ "appenders", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const row = std.mem.indexOf(u8, r.stdout, "\"appender_id\":1,") orelse return error.PageMissing;
+        try testing.expect(std.mem.indexOf(u8, r.stdout[row..], "\"state\":\"free\"") != null);
+    }
+    {
+        const out = try rig.onMount("ls bdir | wc -l; cat bdir/f3");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("8\nb3\n", out);
+        std.debug.print("smoke: kill rows (c): the next mount recovered the attested region (acted 1, rollbacks 0, custody quarantined {d}), the page free, B's 8 files whole\n", .{numberAfter(ta, "\"slot_custody_quarantines_installed\":") orelse 0});
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());

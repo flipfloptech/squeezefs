@@ -883,7 +883,16 @@ pub const DataPlane = struct {
         stats.own_block_dmas.inc();
         stats.own_block_dma_bytes.add(image.len);
         self.wp.touched.stampOrdinal(ino, v.ordinal);
-        return .{ .mapping = Mapping.wholeBlock(tag, minted.offset, minted.stamp), .proof = .{ .vol_tag = tag, .offset = minted.offset, .len = layout.ceilGrain(stored.len), .completed_ns = clock.monotonicNs() }, .alloc = v.alloc, .idx = minted.idx };
+        // The proof covers the SLOT the mapping names (`DmaProof` doc;
+        // `publishLayout` checks `covers` over `slotLen` = the whole block
+        // for a whole-block mapping). A sub-block image (an inline file
+        // promoting at its first write past `inline_max`) lands only its
+        // grain-padded bytes; the tail of a fresh mint is unnamed — every
+        // read and every existing-bytes seed is bounded by the layout's
+        // `size` — so the slot IS what the DMA proved. A grain-length proof
+        // here refused every such promotion with ProofMissing (EIO on the
+        // second write of a small file on a set without a cache path).
+        return .{ .mapping = Mapping.wholeBlock(tag, minted.offset, minted.stamp), .proof = .{ .vol_tag = tag, .offset = minted.offset, .len = self.block_size, .completed_ns = clock.monotonicNs() }, .alloc = v.alloc, .idx = minted.idx };
     }
 
     /// The publish failed: the never-published mint returns.

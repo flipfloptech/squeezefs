@@ -139,6 +139,9 @@ pub const MountOptions = struct {
     stripe_dirs: bool = false,
     /// `-o nonempty`: mount over a non-empty directory.
     nonempty: bool = false,
+    /// `-o interception`: arm the client bypass's session host (charter §7)
+    /// — and FORCE kernel write-through (`resolveInterceptionPosture`).
+    interception: bool = false,
 
     /// The first class an explicit `-o *_timeout=` set, if any.
     pub fn explicitTtl(self: MountOptions) ?TtlClass {
@@ -284,7 +287,26 @@ const flags = [_]Flag{
     .{ .name = "direct_device_true", .field = "direct_device_true" },
     .{ .name = "stripe_dirs", .field = "stripe_dirs" },
     .{ .name = "nonempty", .field = "nonempty" },
+    .{ .name = "interception", .field = "interception" },
 };
+
+/// KD-11 (charter §7 "Interception mounts force kernel write-through"):
+/// the kernel's writeback cache acks a buffered `write(2)` once the page is
+/// DIRTIED — before the daemon sees a FUSE WRITE — so a ring read (direct
+/// to the daemon by construction) would miss it; write-through restores the
+/// invariant that daemon state holds every acked write from any transport,
+/// closed STRUCTURALLY, not by invalidation heuristics. An explicit `-o
+/// writeback` beside `-o interception` is a conflict the mount REFUSES
+/// (`error.WritebackConflictsInterception`), never a silent override; the
+/// cost (buffered kernel-path small writes lose dirty-page batching) is an
+/// A/B line on the residual unintercepted-writer mix.
+pub const PostureError = error{WritebackConflictsInterception};
+
+/// The write-back posture the INIT reply advertises.
+pub fn resolveInterceptionPosture(interception: bool, explicit_writeback: bool) PostureError!bool {
+    if (interception and explicit_writeback) return error.WritebackConflictsInterception;
+    return !interception and explicit_writeback;
+}
 
 const TtlOption = struct { name: []const u8, class: TtlClass };
 const ttl_options = [_]TtlOption{
@@ -472,11 +494,20 @@ test "flags and names: ro/rw/nosuid/nodev/noexec/noatime/nodiratime/dirsync/sync
     try testing.expectEqualStrings("-o ro='1' is invalid: takes no value", try fmtDiag(&buf, parseOptionString(&o, "ro=1")));
     try testing.expectEqualStrings("-o fsname: requires =<value>", try fmtDiag(&buf, parseOptionString(&o, "fsname=")));
     try testing.expectEqualStrings("-o subtype: requires =<value>", try fmtDiag(&buf, parseOptionString(&o, "subtype")));
-    try testing.expectEqualStrings("-o interception: not a squeezefs mount option", try fmtDiag(&buf, parseOptionString(&o, "interception")));
+    try testing.expectEqualStrings("-o intercept: not a squeezefs mount option", try fmtDiag(&buf, parseOptionString(&o, "intercept")));
+    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "interception"));
+    try testing.expect(o.interception);
     try testing.expectEqualStrings("-o max_write='1048576' is invalid: not a squeezefs mount option", try fmtDiag(&buf, parseOptionString(&o, "max_write=1048576")));
     try testing.expect(parseOptionString(&o, "async_read") == .invalid);
     // default_permissions is the shipped posture and cannot be turned off by the string.
     try testing.expect(o.default_permissions);
+}
+
+test "KD-11: interception forces write-through; an explicit writeback beside it refuses; writeback alone advertises; neither is the shipped write-through" {
+    try testing.expect(!(try resolveInterceptionPosture(false, false)));
+    try testing.expect(try resolveInterceptionPosture(false, true));
+    try testing.expect(!(try resolveInterceptionPosture(true, false)));
+    try testing.expectError(error.WritebackConflictsInterception, resolveInterceptionPosture(true, true));
 }
 
 test "fusermount3 string: fsname and subtype are independent; subtype rides without fsname (default source `squeezefs`); no subtype emits none; daemon options never reach it" {
@@ -487,10 +518,10 @@ test "fusermount3 string: fsname and subtype are independent; subtype rides with
     try testing.expectEqualStrings("fsname=squeezefs,subtype=squeezefs,default_permissions", w.buffered());
 
     w = .fixed(&buf);
-    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "fsname=/dev/sdb,allow_other,ro,nosuid,nodev,noexec,noatime,nodiratime,dirsync,sync,max_read=65536,max_background=256,congestion_threshold=192,attr_timeout=5,entry_timeout=5,dir_entry_timeout=5,negative_timeout=0,direct_device_true,stripe_dirs,writeback"));
+    try testing.expectEqual(Outcome.ok, parseOptionString(&o, "fsname=/dev/sdb,allow_other,ro,nosuid,nodev,noexec,noatime,nodiratime,dirsync,sync,max_read=65536,max_background=256,congestion_threshold=192,attr_timeout=5,entry_timeout=5,dir_entry_timeout=5,negative_timeout=0,direct_device_true,stripe_dirs,writeback,interception"));
     try o.writeFusermountOptions(&w);
     try testing.expectEqualStrings("fsname=/dev/sdb,subtype=squeezefs,allow_other,default_permissions,max_read=65536,ro,nosuid,nodev,noexec,noatime,nodiratime,dirsync,sync", w.buffered());
-    for ([_][]const u8{ "max_background", "congestion_threshold", "timeout", "direct_device_true", "stripe_dirs", "writeback" }) |forbidden| {
+    for ([_][]const u8{ "max_background", "congestion_threshold", "timeout", "direct_device_true", "stripe_dirs", "writeback", "interception" }) |forbidden| {
         try testing.expect(std.mem.indexOf(u8, w.buffered(), forbidden) == null);
     }
 

@@ -90,6 +90,7 @@ const nvme_derive = @import("../io/nvme_derive.zig");
 const mem_budget = @import("../mem/budget.zig");
 const wire_stats = @import("../wire/stats.zig");
 const ipc = @import("../ipc/ipc.zig");
+const ipc_host_stats = @import("../ipc/host/stats.zig");
 
 pub const Error = Writer.Error;
 
@@ -130,6 +131,8 @@ pub const Mount = struct {
     read_only: bool = false,
     writeback: bool = false,
     direct_device_true: bool = false,
+    /// `-o interception`: the client bypass's session host is armed.
+    interception: bool = false,
     /// The cluster wire's advertised endpoint (`host:port`); empty on a
     /// mount with no listener (a `--single-writer` class).
     wire_endpoint: []const u8 = "",
@@ -202,6 +205,7 @@ pub const families = [_]Family{
     .{ .name = "cpu", .write = writeCpu },
     .{ .name = "wire", .write = writeWire },
     .{ .name = "ipc", .write = writeIpc },
+    .{ .name = "ipc_host", .write = writeIpcHost },
     .{ .name = "stats", .write = writeSelf },
     .{ .name = "daemon", .write = writeDaemon },
 };
@@ -260,6 +264,7 @@ pub const sources = [_]Source{
     .{ .path = "src/mem/budget.zig", .family = "mem_budget" },
     .{ .path = "src/wire/stats.zig", .family = "wire" },
     .{ .path = "src/ipc/ipc.zig", .family = "ipc" },
+    .{ .path = "src/ipc/host/stats.zig", .family = "ipc_host" },
     .{ .path = "src/stats/stats.zig", .family = "stats" },
 };
 
@@ -425,7 +430,7 @@ fn writeMount(src: *Sources, w: *Writer) Error!void {
     try writeJsonString(w, m.sqdata_uri);
     try w.writeAll(",\"wire_endpoint\":");
     try writeJsonString(w, m.wire_endpoint);
-    try w.print(",\"read_only\":{},\"writeback\":{},\"direct_device_true\":{},\"ab_levers\":{{", .{ m.read_only, m.writeback, m.direct_device_true });
+    try w.print(",\"read_only\":{},\"writeback\":{},\"direct_device_true\":{},\"interception\":{},\"ab_levers\":{{", .{ m.read_only, m.writeback, m.direct_device_true, m.interception });
     var first = true;
     if (src.env) |env| {
         for (knobs.registry) |k| {
@@ -622,6 +627,13 @@ fn writeWire(_: *Sources, w: *Writer) Error!void {
 /// The IL session's `ipc_*` family (`ipc/ipc.zig`).
 fn writeIpc(_: *Sources, w: *Writer) Error!void {
     try ipc.writeStatsJson(w);
+}
+
+/// The daemon host's `ipc_*` family (`ipc/host/stats.zig`): sessions, THE
+/// engagement proof, the fast path, the drain, severance, the dd lanes,
+/// coherence, the closures.
+fn writeIpcHost(_: *Sources, w: *Writer) Error!void {
+    try ipc_host_stats.writeStatsJson(w);
 }
 
 fn writeSelf(_: *Sources, w: *Writer) Error!void {

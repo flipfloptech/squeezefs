@@ -94,6 +94,8 @@ const plane_mod = @import("../data/plane.zig");
 const slot = @import("../fuse/transport/slot.zig");
 const counters = @import("../core/counters.zig");
 const stats = @import("../stats/stats.zig");
+const ipc_host = @import("../ipc/host.zig");
+const ipc_rl = @import("../ipc/rendezvous_linux.zig");
 const derive = @import("../core/derive.zig");
 const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
@@ -212,6 +214,12 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
             p.stderr.print("squeezefs mount: {f}\n", .{d}) catch {};
             return cli.exit_usage;
         },
+    };
+    // KD-11: an interception mount forces kernel write-through; an explicit
+    // writeback beside it is a conflict refused by name.
+    opts.write_back = mount_options.resolveInterceptionPosture(opts.interception, opts.write_back) catch {
+        p.stderr.writeAll("squeezefs mount: mount option conflict: -o interception forces kernel write-through and cannot be combined with -o writeback; drop one of the two options\n") catch {};
+        return cli.exit_usage;
     };
 
     // `--daemon`: the log file first (its refusal reaches the terminal),
@@ -339,7 +347,7 @@ fn mountMain(ctx: *Ctx) u8 {
     var vs: VirtualSource = .{
         .renderer = stats.Renderer.init(gpa, .{
             .build = .{ .train = ctx.p.build.train, .commit = ctx.p.build.commit, .profile = ctx.p.build.profile },
-            .mount = .{ .uid = ctx.opts.uid, .gid = ctx.opts.gid, .pid = @intCast(linux.getpid()), .mountpoint = ctx.mountpoint, .sqmeta_uri = ctx.meta_uri, .sqdata_uri = ctx.data_uri, .read_only = ctx.opts.read_only, .writeback = ctx.opts.write_back, .direct_device_true = ctx.opts.direct_device_true },
+            .mount = .{ .uid = ctx.opts.uid, .gid = ctx.opts.gid, .pid = @intCast(linux.getpid()), .mountpoint = ctx.mountpoint, .sqmeta_uri = ctx.meta_uri, .sqdata_uri = ctx.data_uri, .read_only = ctx.opts.read_only, .writeback = ctx.opts.write_back, .direct_device_true = ctx.opts.direct_device_true, .interception = ctx.opts.interception },
             .env = env,
             .plane = plane,
             .sqz = ctx.sqz,
@@ -459,6 +467,45 @@ fn mountMain(ctx: *Ctx) u8 {
     // direct device leg, the fd-source probe serve.
     var held_store: HeldStore = .{ .session = session };
     plane.armSession(if (session.heldStoreArmed()) held_store.face() else null, session.mode == .zero_copy, session.readZcServe());
+    // 4b. `-o interception`: the client bypass's session host (charter §7)
+    //     — the listeners, the admission, the service threads on demand,
+    //     the direct-drive lanes — then the `il0` xattr the shim/SDK read.
+    //     The mount's device is resolved BEFORE the host arms (decision
+    //     0002 row 309) through the kernel's own view of the root.
+    var host: ?*ipc_host.IpcHost = null;
+    if (ctx.opts.interception and !reader) {
+        const mount_dev = mountDevice(ctx.mountpoint) orelse return ctx.failed("the mount's device could not be resolved for the interception host", .{});
+        host = ipc_host.IpcHost.arm(.{
+            .gpa = gpa,
+            .io = io,
+            .sqz = ctx.sqz,
+            .env = env,
+            .facts = facts,
+            .budget_bytes = ctx.budget_bytes,
+            .plane = plane,
+            .fs = filesystem.Filesystem.of(BackendFs, &fs),
+            .il0_bind = &bindIl0Thunk,
+            .il0_ctx = &fs,
+            .guards = &guards,
+            .probe = plane.probe(),
+            .shared_enabled = op_guard.sharedEnabled(env),
+            .opens = &opens,
+            .notify = .{ .ctx = session, .call = &invalThunk },
+            .our_commit = ctx.p.build.commit,
+            .mount_dev = mount_dev,
+            .mount_uid = ctx.opts.uid,
+            .block_size = cfg.block_size,
+            .max_file_size = handler.lifecycle.MAX_FILE_SIZE,
+            .topo = &session.topo,
+        }) catch |e| return ctx.failed("the interception host could not arm ({s}) — see the log", .{@errorName(e)});
+    } else if (ctx.opts.interception) {
+        log.warn("mount: -o interception on a `-o ro` reader arms no session host (a reader serves no ring)", .{});
+    }
+    var host_live = true;
+    defer if (host_live) if (host) |h| {
+        h.disarm();
+        h.deinit();
+    };
 
     // 5. The watchdog loop and the reclaim cadence on the meta pool.
     var wd = watchdog.Watchdog.init(&registry);
@@ -480,7 +527,14 @@ fn mountMain(ctx: *Ctx) u8 {
     // 7. Serve until a stop latches or the session ends.
     serve(ctx, session, &vs);
 
-    // 8. Teardown in order.
+    // 8. Teardown in order: the interception host first (every session
+    //    poisoned, its threads joined, the listeners closed, the xattr
+    //    unarmed) while the session its handoffs ride is still live.
+    if (host) |h| {
+        h.disarm();
+        h.deinit();
+    }
+    host_live = false;
     session.close();
     wd.requestStop();
     wd_fut.cancel(io);
@@ -667,6 +721,28 @@ const ReclaimCadence = struct {
         }
     }
 };
+
+/// The `il0` face binder the host calls at arm and unarm.
+fn bindIl0Thunk(ctx: *anyopaque, face: ?handler.kv_fs.Il0Face) void {
+    const fs: *BackendFs = @ptrCast(@alignCast(ctx));
+    fs.bindIl0(face);
+}
+
+/// The KD-11 invalidator's hook: `FUSE_NOTIFY_INVAL_INODE` on the sideband.
+fn invalThunk(ctx: ?*anyopaque, ino: u64, off: i64, len: i64) error{QueueFull}!void {
+    const session: *Session = @ptrCast(@alignCast(ctx.?));
+    return session.notifyInvalInode(ino, off, len);
+}
+
+/// The mounted root's `st_dev` (the fd screen's mount authority): an
+/// `O_PATH` open of the mountpoint served by our own lanes.
+fn mountDevice(mountpoint: [:0]const u8) ?u64 {
+    const rc = linux.openat(linux.AT.FDCWD, mountpoint.ptr, .{ .ACCMODE = .RDONLY, .PATH = true, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    return ipc_rl.deviceOf(fd);
+}
 
 /// The plane's `write_fixed` face: the session's `storeHeld`.
 const HeldStore = struct {

@@ -532,8 +532,12 @@ pub const Session = struct {
         if (r >= 0) {
             const n: usize = @intCast(r);
             if (dst) |d| {
-                const window = self.m.slotWindow(index) catch unreachable;
-                @memcpy(d[0..@min(n, d.len)], window[0..@min(n, d.len)]);
+                // The op's window starts at the base slot's slab and spans
+                // the RUN (a multi-slot flight is `len > slab`); the daemon
+                // validated `result ≤ len` against the same arena bounds.
+                const take = @min(n, d.len);
+                const window = self.m.arenaWindow(@as(u64, index) * self.layout.slab, take) catch unreachable;
+                @memcpy(d[0..take], window);
             }
             slot_core.release(slot);
             return .{ .served = n };

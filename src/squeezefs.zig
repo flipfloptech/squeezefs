@@ -146,7 +146,7 @@ pub const data = struct {
 // ---- the client bypass: the shm session, the daemon host, the shim + SDK client (charter §7) ----
 pub const ipc = struct {
     pub const session = @import("ipc/ipc.zig");
-    // @anchor:ipc_host_import
+    pub const host = if (builtin.os.tag == .linux) @import("ipc/host.zig") else struct {};
     pub const client = if (builtin.os.tag == .linux) @import("ipc/client.zig") else struct {};
 };
 
@@ -189,7 +189,7 @@ test {
     _ = thread_name;
     _ = model.explorer;
     _ = ipc.session;
-    // @anchor:ipc_host_test
+    if (builtin.os.tag == .linux) _ = ipc.host;
     if (builtin.os.tag == .linux) _ = shim;
     // @anchor:sdk_test
     _ = sdk;

@@ -52,6 +52,7 @@ const derive = @import("../core/derive.zig");
 const dlm = @import("../meta/dlm.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const taskset = @import("../sync/taskset.zig");
+const lock_order = @import("../sync/lock_order.zig");
 const budget = @import("../mem/budget.zig");
 const layout = @import("layout.zig");
 const staging = @import("staging.zig");
@@ -265,17 +266,58 @@ pub const LastWriteEnd = struct {
 // The write path.
 // ---------------------------------------------------------------------------
 
-/// The owned payload (the handler's lease by value): bytes in hand, or a
+/// What an adoption hands the merge (charter §7 "placed sever … the first
+/// merge ADOPTS"): the assembly's cell — the registry's share now the
+/// caller's — and the LANDED runs the entry records as coverage.
+pub const Adoption = struct {
+    cell: *accumulate.Pool.Cell,
+    n_runs: usize,
+};
+
+/// The placed-sever registry's face on the write path (the il host binds
+/// it; `ipc/host/placed.zig` is the registry). Null = no registry: a
+/// placed payload merges by copy like a pooled one.
+pub const PlacedSeam = struct {
+    pub const max_runs = cov.CoverageUnion.max_runs;
+
+    ctx: *anyopaque,
+    /// Entry-absent, under (3): the assembly of `(ino, block)` whose region
+    /// at `rel` IS `ptr` (the pointer proof), sealed for adoption; its
+    /// landed runs into `runs`. Null = no adoption (the copy path).
+    take: *const fn (ctx: *anyopaque, ino: u64, block: u32, rel: u32, ptr: [*]const u8, runs: *[cov.CoverageUnion.max_runs]cov.Run) ?Adoption,
+    /// Did this payload's assembly get adopted (its bytes are already the
+    /// entry's coverage — the merge is a no-op ack)?
+    adopted: *const fn (ctx: *anyopaque, ino: u64, block: u32, token: u64) bool,
+};
+
+/// A placed-sever payload: bytes already living in a shared assembly's
+/// cell (`cell.data[rel..][0..len]`), the token naming its assembly life.
+pub const PlacedPayload = struct {
+    cell: *accumulate.Pool.Cell,
+    rel: u32,
+    len: u32,
+    token: u64,
+    seam: PlacedSeam,
+
+    pub fn bytes(self: PlacedPayload) []const u8 {
+        return self.cell.data[self.rel .. self.rel + self.len];
+    }
+};
+
+/// The owned payload (the handler's lease by value): bytes in hand, a
 /// HELD zero-copy slot (W1/overlay direct-leg candidates; every other
-/// shape materializes once).
+/// shape materializes once), or a PLACED sever (bytes in an assembly the
+/// merge adopts or copies from).
 pub const Payload = union(enum) {
     bytes: []const u8,
     slot: device_overlay.SlotVehicle,
+    placed: PlacedPayload,
 
     pub fn len(self: Payload) u64 {
         return switch (self) {
             .bytes => |b| b.len,
             .slot => |s| s.src.len,
+            .placed => |p| p.len,
         };
     }
 };
@@ -486,8 +528,106 @@ pub const WritePath = struct {
         self.touched.stampOrdinal(ino, ordinal);
     }
 
-    fn patchDeps(self: *WritePath) patch_w1.Deps {
+    pub fn patchDeps(self: *WritePath) patch_w1.Deps {
         return .{ .device = self.device, .map = self.map, .vols = self.vols, .purge = self.purge, .custody = .{ .ctx = self, .ram_custody = &ramCustody, .overlay_open = &overlayOpen }, .touched = .{ .ctx = self, .stamp = &touchedStamp } };
+    }
+
+    // ---- the il host's faces (charter §7) ----
+
+    /// Placed-sever eligibility (`il_daemon.md` §3.2, the six screens plus
+    /// the port's arm screen), cheapest first: a page-multiple block; `rel`
+    /// and `len` page-aligned inside one block; `len` above the W1 cap (a
+    /// raised cap widens patch and narrows placement together) AND at
+    /// least the accumulation class (below a quarter block the W2 extent
+    /// park is the cheaper legal arm and copies anyway); the EFBIG mirror;
+    /// a resident striped layout; no live RAM entry, overlay record or
+    /// epoch binding for the block (an entry-present block never adopts);
+    /// and the device overlay NOT eligible for the shape (it would take the
+    /// piece with zero copies first — a placement there is never adopted).
+    pub fn placedSeverEligible(self: *WritePath, ino: u64, offset: u64, len: u64, max_file_size: u64) bool {
+        const bs = self.cfg.block_size;
+        if (bs % PAGE != 0 or len == 0) return false;
+        const rel = offset % bs;
+        if (rel % PAGE != 0 or len % PAGE != 0 or rel + len > bs) return false;
+        if (len <= self.cfg.patch_max or extent.isSmall(len, bs)) return false;
+        if (offset + len > max_file_size) return false;
+        const file = self.map.view(ino) orelse return false;
+        if (file.kind != .striped or !file.map_resident) return false;
+        const block: u32 = @intCast(offset / bs);
+        if (self.table.has(ino, block) or self.overlay.hasCustody(ino, block) or self.epochs.bindsBlock(ino, block)) return false;
+        return !self.overlay.shapeEligible(len, self.any_passthrough);
+    }
+
+    /// Why the direct-drive write gate declined (each its own counter).
+    pub const DirectDecline = enum { shape, block_lock, custody };
+
+    /// A W1-shaped write begun on the direct-drive lane: the held (3)
+    /// guard and the fence-passed patch; the lane DMAs ONE SQE at
+    /// `begun.dest` and calls `finishDirectWrite` at the CQE.
+    pub const DirectBegun = struct {
+        guard: seams.BlockLocks.Guard,
+        begun: patch_w1.Begun,
+        len: u64,
+    };
+
+    pub const DirectVerdict = union(enum) {
+        begun: DirectBegun,
+        declined: DirectDecline,
+    };
+
+    /// The il direct-drive write gate (`il_daemon.md` §4.5): the lock-free
+    /// shape half (`patch_w1.shapeEligible` with the per-ino word READ, not
+    /// swapped — a declined candidate must not disturb adjacency), then ONE
+    /// `BlockLocks.tryAcquire` — never a blocking acquire on the service
+    /// thread — then the state half under the held guard (`beginPatch`:
+    /// custody, the authoritative map, the sole-owner verdict, the fence
+    /// pair). On `.begun` the guard is HELD across the SQE (level 3 only;
+    /// nothing is acquired under it) and the per-ino word is COMMITTED
+    /// (`last_write_end`): the coverage bookkeeping for this shape.
+    pub fn beginDirectWrite(self: *WritePath, io: Io, ino: u64, offset: u64, len: u64) PatchError!DirectVerdict {
+        const bs = self.cfg.block_size;
+        const file = self.map.view(ino) orelse return .{ .declined = .shape };
+        if (file.kind != .striped or !file.map_resident) return .{ .declined = .shape };
+        const prev_end = self.last_write_end.peek(ino);
+        if (!patch_w1.shapeEligible(.{ .offset = offset, .len = len, .block_size = bs, .existing_size = file.size, .stream_adjacent = prev_end != 0 and prev_end == offset, .patch_max = self.cfg.patch_max })) return .{ .declined = .shape };
+        const block: u32 = @intCast(offset / bs);
+        const rel: u32 = @intCast(offset % bs);
+        const guard = self.locks.tryAcquire(io, ino, block) orelse return .{ .declined = .block_lock };
+        const begun = (patch_w1.beginPatch(self.patchDeps(), ino, block, rel) catch |e| {
+            guard.release(io);
+            return e;
+        }) orelse {
+            guard.release(io);
+            return .{ .declined = .custody };
+        };
+        _ = self.last_write_end.note(ino, offset, len);
+        // The in-flight SQE owns the guard from here: its release runs at
+        // the CQE on whichever thread reaps (the owner's inline reap or the
+        // shard's reaper), so the acquiring context's ledger entry leaves
+        // now — a stale (3) would read every later op guard on this thread
+        // as an inversion.
+        lock_order.handedOff(.block);
+        return .{ .begun = .{ .guard = guard, .begun = begun, .len = len } };
+    }
+
+    pub const PatchError = patch_w1.PatchError;
+
+    /// A begun direct write the lane could not submit (no slab entry, a
+    /// full SQ, an unknown volume): re-stabilize the word under a new
+    /// generation (content unchanged, so no purge), hand the guard back;
+    /// the caller takes the sever → handoff path.
+    pub fn abortDirectWrite(self: *WritePath, io: Io, d: DirectBegun) void {
+        if (self.vols.byTag(d.begun.vol_tag)) |vol| vol.alloc.publishBlock(d.begun.idx);
+        d.guard.release(io);
+    }
+
+    /// The CQE postlude: `finishPatch` (re-stabilize, purge, the touched
+    /// stamp, the ledger — or the EIO law), then the guard drops.
+    pub fn finishDirectWrite(self: *WritePath, io: Io, d: DirectBegun, dma: seams.DmaError!void) PatchError!void {
+        defer d.guard.release(io);
+        try patch_w1.finishPatch(self.patchDeps(), d.begun, d.len, dma);
+        stats.admit_write_inplace_bytes.add(d.len);
+        stats.writes_admitted.inc();
     }
 
     fn ramCustody(ctx: ?*anyopaque, ino: u64, block: u32) bool {
@@ -584,6 +724,7 @@ pub const WritePath = struct {
         // HERE once.
         var bytes: ?[]const u8 = switch (req.payload) {
             .bytes => |b| b,
+            .placed => |p| p.bytes(),
             .slot => null,
         };
         const single = pieces.len == 1;
@@ -604,6 +745,7 @@ pub const WritePath = struct {
     fn materialize(_: *WritePath, io: Io, p: Payload) ![]const u8 {
         return switch (p) {
             .bytes => |b| b,
+            .placed => |pl| pl.bytes(),
             .slot => |s| (s.extract orelse return error.SlotNotHeld)(s.ctx, io),
         };
     }
@@ -693,11 +835,39 @@ pub const WritePath = struct {
                 stats.admit_write_accumulate_bytes.add(pc.len);
                 break :blk .extent;
             }
-            // G. Accumulation checkout (an extent entry escalates first).
-            var e = existing orelse self.table.checkout(req.ino, pc.block, has_existing, live_binding) orelse {
-                // The pool is at its cap: backpressure (EAGAIN-class), never a lost byte.
-                stats.parked_gate_waits.inc();
-                return error.WouldBlock;
+            // G. Accumulation checkout (an extent entry escalates first). A
+            //    PLACED payload whose assembly the first merge already
+            //    adopted is a no-op ack (its landed bytes ARE that entry's
+            //    coverage); entry-absent, a pointer-proven assembly is
+            //    adopted as the backing with its landed runs recorded —
+            //    a full union at adoption IS the write-through trigger.
+            var e = existing orelse blk_g: {
+                if (req.payload == .placed) {
+                    const p = req.payload.placed;
+                    if (p.seam.adopted(p.seam.ctx, req.ino, pc.block, p.token)) {
+                        stats.admit_write_accumulate_bytes.add(pc.len);
+                        break :blk .accumulate_park;
+                    }
+                    var runs: [cov.CoverageUnion.max_runs]cov.Run = undefined;
+                    if (p.seam.take(p.seam.ctx, req.ino, pc.block, pc.rel, data.ptr, &runs)) |ad| {
+                        const adopted = self.table.checkoutAdopting(req.ino, pc.block, has_existing, live_binding, ad.cell, runs[0..ad.n_runs]) orelse {
+                            self.table.pool.release(ad.cell);
+                            stats.parked_gate_waits.inc();
+                            return error.WouldBlock;
+                        };
+                        stats.admit_write_accumulate_bytes.add(pc.len);
+                        if (adopted.coverage.isFull(@intCast(bs))) {
+                            hint = .upload;
+                            break :blk .write_through;
+                        }
+                        break :blk .accumulate_park;
+                    }
+                }
+                break :blk_g self.table.checkout(req.ino, pc.block, has_existing, live_binding) orelse {
+                    // The pool is at its cap: backpressure (EAGAIN-class), never a lost byte.
+                    stats.parked_gate_waits.inc();
+                    return error.WouldBlock;
+                };
             };
             if (e.repr == .extent) {
                 if (self.table.escalate(e) == null) return error.WouldBlock;

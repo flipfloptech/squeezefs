@@ -3,7 +3,8 @@
 //! rendezvous and the daemon's fd screen, the heartbeat, the sizing
 //! derivations, and the `ipc_*` observability family. `client.zig` (THE ONE
 //! client library both the shim and the SDK consume) hangs off
-//! `squeezefs.ipc.client`; the daemon host is the next wave's.
+//! `squeezefs.ipc.client`; the daemon host (`host.zig`: admission, the
+//! service threads, the direct-drive lanes) off `squeezefs.ipc.host`.
 //!
 //! Portable here: the layout, the cores, the models, the wire, the sizing,
 //! the pure rendezvous verdicts. Linux only (gated, never stubbed): the
@@ -120,6 +121,13 @@ test {
     _ = rendezvous;
     if (builtin.os.tag == .linux) _ = shm;
     if (builtin.os.tag == .linux) _ = rendezvous_linux;
+    // The daemon host's PURE cores run on every host; its root (`host.zig`:
+    // listeners, service threads, rings) is Linux only via `squeezefs.ipc.host`.
+    _ = @import("host/stats.zig");
+    _ = @import("host/severed_pool.zig");
+    _ = @import("host/placed.zig");
+    _ = @import("host/placed_claims_model.zig");
+    _ = @import("host/inval.zig");
 }
 
 const testing = std.testing;

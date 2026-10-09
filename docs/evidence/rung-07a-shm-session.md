@@ -433,3 +433,174 @@ and its weakening, the version words, the header census rail; the SDK steps refu
 off Linux); `scripts/venue zig build gate` green on the venue — unit (the SDK's 7 e2e tests against
 the stub host), rails (7/7 incl. the header census), smoke, bench-smoke, and `sdk-smoke` (the C
 program against the `.a` and against the `.so.1`).
+
+## Wave B1 — the daemon host: session admission, the service threads with the sync read fast path, sever-at-dequeue and placed sever, the direct-drive lanes
+
+Spec: `docs/porting/il_daemon.md` (§1 the service-thread model, §2 the sync read fast path, §3
+writes, §4 the direct-drive lane, §5 lease/heartbeat/reap/shed/poison/teardown, §6–§8
+knobs/gauges/constants/tests/quirks). Charter §7 (the daemon's duties, KD-11, the engagement law),
+§4 (handler lanes for the demotes), §6.2–§6.3, §9, §10. Decision 0003 §F; decision 0002 rows
+312–319. Modules: `src/ipc/host.zig` + `src/ipc/host/{stats, session, service, direct,
+severed_pool, placed, placed_claims_model, inval, e2e_linux}.zig`; the `ipc_host` stats family;
+6 knob rows (`SQUEEZEFS_IPC_DD_SHARDS`, `_INVAL_WINDOW_MS`, `_DD_COOP_TASKRUN`, `_DD_LANE_FLUSH`,
+`_DD_INLINE_REAP`, `SQUEEZEFS_IL_DIRECT_WRITE`); `-o interception` in `fuse/mount_options.zig`
+and `cli/mount.zig`; the `.placed` payload vehicle through `data/{write_admit, accumulate,
+patch_w1}.zig` and `fuse/handler/{filesystem, kv_fs}.zig`.
+
+### What landed
+
+- **The host** (`host.zig`): `IpcHost.arm` builds the two listeners (the abstract name and the
+  path under the socket-dir ladder), the nonce rotation behind the `il0` blob (`kv_fs.bindIl0`,
+  unarmed at teardown), the admission over wave A's `admitHello` with the budget `budget/8`, the
+  per-uid session count, the balance-first owner pick over the NUMA partition
+  (`layout.pickOwner`/`nodePartition`), the sealed memfd + `SessionOk`; spawn-on-admission of the
+  service threads up to `clamp(3 × cpus/8, 2, 64)` (`sqz-ipc-svc<N>`), the `sqz-ipc-ctl` poller
+  (BIND/UNBIND/EOF/malformed ⇒ poison) with the idle reap on its tick, the R5 shed hook (a bound
+  session is never shed; an unbound one is), and the teardown ORDER: every live session poisoned
+  and torn down → service threads kicked and joined → dd reapers drained → listeners
+  `shutdown(2)`+joined+closed → poller → the xattr unarmed. A session is destroyed by its LAST
+  share (`SessionMap`): the registry's, the poller's, the taker's at disarm/reap/shed — the e2e
+  now asserts the daemon's own allocator audit prints nothing at a graceful exit (the first
+  version leaked the taker's share for a session live at disarm: 728 B + the 64 KiB bindings
+  table per session; red through the daemon log, then fixed).
+- **KD-11**: `-o interception` arms the host AND forces kernel write-through
+  (`resolveInterceptionPosture`: `interception` + an explicit `writeback` is a usage error; the
+  FUSE INIT reply drops writeback-cache); every shipped ring write runs the invalidator ladder
+  (`host/inval.zig`: ONE striped per-ino word `{hwm: u48, last_fire_s: u16}` — bind and the first
+  write of a window notify the whole inode, a growing write inside the window notifies attrs
+  only, a non-growing one is suppressed; row 316).
+- **The service thread** (`service.zig`): one session per thread for life; the dequeue loop is the
+  spec's — epoch-cached owned set → budgeted round-robin → `tryBeginServe` → the in-flight gate
+  (`slots`, VAL-5c) → the ONE `snapshot` → validate (binding live, direction, len ≤ max op,
+  arena window) → dispatch → sweep-end flush; the completion order ledger → result → DONE+WAITER
+  wake → doorbell; the park ladder over `doorbell.ServicePark` (spin governor, snapshot-BEFORE-
+  rescan, `futex_waitv` on all owned doorbells, 5 ms bound, the heartbeat stamped per pass);
+  every reject through the ONE errno table into the descriptor's result, each a counted, logged
+  tripwire. The SYNC READ FAST PATH: `WarmLadder.probe` into the arena window under the
+  try-locked shared guard (ONE copy); a miss/lock/policy demote drops the guard FIRST and hands a
+  handler frame to the home lane, which completes through the same order; the copy ledger
+  `ipc_read_{arena_copy, arena_dma, demote}_bytes`. WRITES: sever-at-dequeue — the arena bytes
+  move into a `SeveredPool` slab (`slots = clamp(arena_cap / max_op, 1, 65536)`, derived; a miss
+  allocates aligned, a put recycles; the bound frees past the free list) so the client's slot is
+  released at completion while the data path owns its own pages; placed sever — a whole-block
+  stream chunk claims pages in a shared `Assembly` keyed `(ino, block)` (the page-claim bitmap +
+  the landed bitmap); the first merge ADOPTS the backing with the landed runs as coverage
+  (`accumulate.checkoutAdopting`, pointer-proof: a foreign pointer never adopts) and seals new
+  claims out; a chunk the seal beat falls back to the plain sever; the cohort reaps at the last
+  drop. `WritePath.write` takes the `.severed` / `.placed` payload vehicles.
+- **The direct-drive lane** (`direct.zig`): shards = the ONE width function; per shard a
+  512-entry ring with `COOP_TASKRUN` (two issuers — the owning service thread and the reaper —
+  so `SINGLE_ISSUER|DEFER_TASKRUN`, the FUSE rings' posture, is out), lane-scoped flush (the
+  owner enters ONLY its own shard), reaper/drain fusion (the owner's inline reap under the
+  try-locked CQ gate; the reaper's 100 ms `EXT_ARG` wait), the MEM-7c leak law (`leakInflight`:
+  shares stay out, guards released, clients `-EIO`, counted; row 315). The W1-shaped write serves
+  INLINE: `patch_w1` eligibility → `beginDirectWrite` (the sole-owner try-lock on the block
+  stripe) → the fence pair → ONE SQE straight from the arena → the postlude on the CQE
+  (`finishDirectWrite`, the inval ladder, the completion order). libaio arrives decomposed: the
+  shim submits one ring op per iocb, the daemon serves each as an ordinary op and knows no
+  batch; `io_getevents` is the client's fold of the per-slot DONE states (the events-array
+  order law lives there).
+- **Stats**: the `ipc_host` family (sessions live/refused/reaped/closed/poisoned, owners and
+  service threads, arena bytes, binds/unbinds, ops and bytes by direction, fast-path serves and
+  the three demote classes, handoffs, the copy ledger, drain/flush/ingress histograms, parks and
+  wakes, descriptor rejects, severs and the pool, placed severs/adoptions/refusals/reaps, the dd
+  rows — inline serves, fallbacks by reason, lane flushes, inline/reaper reaps, stalls, leaked
+  in-flight — the inval rows) with three closures (`reads`: fast-path serves + read handoffs ≡
+  read ops; `writes`: dd inline serves + write handoffs ≡ write ops; `dd`: inline serves +
+  fallbacks ≡ dd submits attempted).
+
+### Models and the weakening that fails each (`host/placed_claims_model.zig`)
+
+| Model | Invariant | Weakening that fails |
+|---|---|---|
+| The placed-claims Dekker (writer in window ↔ seal + adopt; store buffers explicit) | an adoption never lands over a writer inside its window; a claim after the seal never lands | drop the claimer's fence (`no_claimer_fence`), drop the adopter's fence (`no_adopter_fence`), or check the seal before publishing the claim (`seal_check_before_publish`) — each `InvariantViolated` |
+
+### Unit tests (portable where pure; the rest Linux)
+
+The dequeue loop over a RAM session with a stub client (a session-less owner parks on its private
+word, admission wakes it, reads and writes complete in the order, every slot returns); the five
+validation rejects each a counted tripwire through the ONE table; the three poison reasons stop the
+drain with the generation bump while an honest full window never poisons; the park ladder's
+lost-wake freedom (20 k ops with randomised gaps over a parking owner, none stranded); the pool's
+slot law, hit/miss ledger and bound; the placed registry (shared assembly, overlapping claims fall
+back, the cap, adoption with landed runs, the Dekker refusal, the reap at zero); the inval ladder's
+four verdicts and the second wrap; the bindings table and the in-flight ledger; the dd lane's
+inline W1 serve against a scratch device (one SQE, the lane flush, the inline reap, the bytes at
+the mapping, the word re-stabilized); the reap tick, the width tie, the kill-priv class; the stats
+family's render and closures.
+
+### End to end on the venue (`host/e2e_linux.zig`; `smoke:`-tagged, `zig build smoke`)
+
+A real `squeezefs mount -o interception` (256 MiB meta + two 2 GiB sparse data images under
+`/build/tmp`) and wave A's `client.zig` IN-PROCESS over the real `il0` xattr:
+
+- a session established over the rendezvous, a bind on a real fd (`rights.read and .write`); the
+  mount's own flags read `interception: true`, writeback off;
+- 4 MiB through the ring as 4 flights of 1 MiB → 4 severs, read back byte-exact through the
+  KERNEL path; one 4 MiB `pwrite` of block 1 → `ipc_placed_severs ≥ 4`, `ipc_placed_adoptions
+  == 1`, no refusals or fallbacks, byte-exact through the kernel;
+- an aligned cold 512 KiB read (the dest lease: `read_dest_dma_bytes` grows, never published),
+  an unaligned cold read (the whole-block walk fills the hot tier) — two demotes — then the warm
+  aligned read: `ipc_fast_path_serves + 1`, `ipc_read_arena_copy_bytes + 512 KiB`;
+- a W1-shaped 4 KiB overwrite: `ipc_dd_inline_serves + 1`, `patch_edge_rmw_reads` unchanged,
+  byte-exact through the kernel;
+- 8 no-wait 32 KiB tickets (one ring op per iocb) reaped in offset order, every result its length;
+- the fd screen through the real session: a read-only binding's write is `-EBADF` (the one
+  descriptor-reject tripwire of the run), `O_PATH`, a directory and `O_APPEND` refuse as `flags`,
+  a memfd as `mount`;
+- kernel `fsync` after the ring writes; `ipc_sessions_poisoned == 0`, `ipc_inval_notifies ≥ 1`;
+- `umount` with the LIVE session: the daemon exits 0, no mount is left, the client sees the
+  generation bump (`poisoned()`, a `pread` falls through), the log reads "torn down: host
+  shutdown", exactly one tripwire line, and NO allocator leak line.
+- Death: `kill -9` the daemon under a bound session ⇒ the client poisons inside the ladder
+  (< 5 s bound, ≈ 1 s observed), far inside the 20 s seam deadline; the mount is detached.
+
+### What the first armed mount surfaced (fixed here, red-first)
+
+- **The inline → striped promotion refused every sub-block image** (`plane.ownBlock`): the
+  own-block proof was minted over the image's grain (`ceilGrain(stored.len)`) while
+  `publishLayout` checks `covers` over the mapping's SLOT (the whole block for a whole-block
+  mapping; the `DmaProof` doc's own law) — so on a set without a cache path (staging off) the
+  SECOND write of any small file answered `ProofMissing` → EIO, on the kernel path too
+  (`dd bs=4k count=1; dd bs=4k seek=1` ⇒ "Input/output error", reproduced at `dev` HEAD in a
+  clean worktree). The proof now covers the slot (the tail of a fresh mint is unnamed: every
+  read and existing-bytes seed is bounded by the layout's `size`); the e2e's libaio-shaped row
+  (8 × 4 KiB writes into a fresh file, kernel path then ring) is the repro.
+- **The dd lane's guard crossed threads without the ledger knowing** (`write_admit.beginDirectWrite`):
+  the (3) block guard is try-acquired on the service thread and released at the CQE on
+  whichever thread reaps; the acquiring thread's lock-order ledger kept a stale (3), so its next
+  op-guard acquire fired `lock_order_inversions` — on the unit runner's main thread, against a
+  later unrelated test. `lock_order.handedOff(.block)` on `.begun` (the `GuardSet` precedent).
+- **The shim smoke's rows 4a–4c ran for the first time** (they were `PENDING` without an armed
+  mount): row 4a's once-rule is per process (`dd` and `sha256sum` each print the identity
+  refusal once); `statsTail` must return THIS dump (a `numberAfter` over the whole log re-read
+  the mount's first dump). With both corrected the battery engages: `sessions +14,
+  ipc_ops_* sum 47074` over dd 64 MiB + sha256sum + cat/cp/tar + the C program + the libaio
+  harness, and the kill -9 row's app call returns the passthrough result.
+
+### Scoping numbers (venue; not performance claims)
+
+The venue is a 9-vCPU aarch64 VM on the 7.2.6-sqz kernel with 15 GiB, data on two sparse ext4
+images — nothing here approaches the reference hardware's 1,017,548 / 622,112 IOPS rows, which
+remain the bar for G-S2's counted A-B-B-A on real devices. Observed on one e2e run (the
+`ipc_host` family before the umount): `ipc_ops_read 11` (1 fast-path serve, 10 miss demotes
+= 2 cold + 8 tickets), `ipc_ops_write 9` (8 severs of 1 MiB — 4 of them placed into one
+assembly adopted once, 3 slabs pooled = 3 MiB — + 1 dd inline serve of 4 KiB), `ipc_bytes_in
+8,392,704`, `ipc_bytes_out 1,835,108`, `ipc_read_arena_copy_bytes 524,288`,
+`ipc_read_demote_bytes 1,310,820`, `ipc_dd_shards 4`, `ipc_service_threads 1` (one session ⇒
+one lane spawned), `ipc_arena_bytes 67,260,416` (64 MiB + the 0x25000 header/slot/ring pages),
+drain pass mean ≈ 1.2 ms over 8 passes (a 4 MiB sever per pass), ingress mean ≈ 0.97 ms over 21
+ops, 8 wakes / 25 timed parks, `ipc_inval_notifies 2`, `attrs_only 8`, `suppressed 1`. Both e2e
+tests run in ≈ 34 s wall including format, mount and teardown.
+
+### Gates
+
+`zig build gate` green on macOS (1696 pass) for the portable cores (the pool, the placed
+registry and its model, the inval ladder, the stats family — referenced from `ipc/ipc.zig`'s
+test root; the host, service and dd modules compile on Linux only). On the venue: unit
+(1991 pass, 0 error logs), rails 7/7, the shim census, bench-smoke, shim-smoke (rows 1–4c
+above) and the smoke's interception rows green in every run. The smoke's cluster KILL ROWS
+(a)/(b) (rung 6's two-daemon kill rows) flaked in 3 of 4 full-gate runs AND in 1 of 3
+standalone `-Dtest-filter='KILL ROWS'` runs with the interception host unarmed (a torn tree
+file; `dead_appender_orphans` 72; the storm child exiting before B's park) — a timing row of
+that rung, outside this wave, recorded here so the next full run is read right.

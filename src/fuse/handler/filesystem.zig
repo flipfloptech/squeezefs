@@ -40,6 +40,7 @@ const economy = @import("../../meta/economy.zig");
 const op_guard = @import("op_guard.zig");
 const op_trace = @import("op_trace.zig");
 const watchdog = @import("watchdog.zig");
+const write_admit = @import("../../data/write_admit.zig");
 
 pub const Error = errors.Error;
 
@@ -172,9 +173,12 @@ pub const ReadArgs = struct { ino: u64, fh: u64, offset: u64, size: u32, flags: 
 /// `data` is the payload in hand (empty when `held`); `held` is a
 /// zero-copy payload still sitting in the registered slot (the handler
 /// consumes it by its source coordinates — `WRITE_FIXED(device ← slot)` —
-/// or extracts it lazily, exactly once, before the lease ends); `class` is
-/// the level-1 admission's verdict (charter §6.2 shared-mode admission).
-pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8, held: ?HeldPayload = null, class: op_guard.Class = .entire_op, write_flags: u32, flags: u32 };
+/// or extracts it lazily, exactly once, before the lease ends); `placed`
+/// is a ring write's placed sever (its bytes ARE `data`, already in a
+/// shared assembly the striped arm adopts or copies from — charter §7);
+/// `class` is the level-1 admission's verdict (charter §6.2 shared-mode
+/// admission).
+pub const WriteArgs = struct { ino: u64, fh: u64, offset: u64, data: []const u8, held: ?HeldPayload = null, placed: ?write_admit.PlacedPayload = null, class: op_guard.Class = .entire_op, write_flags: u32, flags: u32 };
 
 /// A HELD zero-copy WRITE payload (portable face of `slot.PayloadLease`):
 /// the slot source for a direct device store and the memoized extraction.

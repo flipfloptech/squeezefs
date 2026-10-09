@@ -463,8 +463,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// Arm the `il0` rendezvous blob (an interception mount's session
-        /// host; after `mount`, before the session arms).
-        pub fn bindIl0(self: *Self, face: Il0Face) void {
+        /// host, after the session is up) — or, with null, unarm it (the
+        /// host's teardown: GETXATTR answers ENODATA again).
+        pub fn bindIl0(self: *Self, face: ?Il0Face) void {
             self.il0 = face;
         }
 
@@ -2232,6 +2233,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (kindOf(rec) != .striped) old_size = try self.promoteToStriped(c, local, rec, probe.size);
             const payload: write_admit.Payload = if (a.held) |h|
                 (if (self.data.canStoreHeld()) write_admit.Payload{ .slot = .{ .src = h.src, .class = if (h.class == .direct_gup) .odirect else .page_cache, .commit_retain = false, .ctx = h.ctx, .extract = h.extract } } else .{ .bytes = try self.payloadBytes(a) })
+            else if (a.placed) |p|
+                // A ring write's placed sever: the striped arm adopts the
+                // assembly (or copies from it); every other arm reads `data`.
+                .{ .placed = p }
             else
                 .{ .bytes = a.data };
             c.stage(.write_admitted);

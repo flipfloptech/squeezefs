@@ -205,26 +205,45 @@ pub const Deps = struct {
 
 pub const PatchError = error{ InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, QueueFull, NoSpaceLeft };
 
-/// Arm A under (3): `true` ⇒ patched and acked; `false` ⇒ one bucket, fall
-/// through; an error fails THIS write (EIO), nothing acked/parked/lost, the
-/// word re-stabilized.
-pub fn tryPatch(deps: Deps, io: Io, req: Request) PatchError!bool {
-    _ = io;
+/// A patch whose fence pair passed: the destination the ONE DMA lands at
+/// and what the postlude re-stabilizes. Travels with the held (3) guard;
+/// the mapping cannot move while it is held, so the CQE side needs no
+/// revalidation ladder (the il direct-drive lane holds it across its SQE).
+pub const Begun = struct {
+    mapping: Binding,
+    vol_tag: u64,
+    /// The allocator word the fence retired (`publishBlock` re-stabilizes it).
+    idx: u64,
+    /// `mapping.offset + rel`: the device byte the DMA lands at.
+    dest: u64,
+    ordinal: u32,
+    ino: u64,
+    block: u32,
+    rel: u32,
+};
+
+/// The state half under (3), up to and including the fence pair: the
+/// custody probes, the authoritative map lookup, the durable sole-owner
+/// verdict, retire → SeqCst → re-check. Null ⇒ one bucket counted, the
+/// caller falls through (a failed re-check already re-stabilized the
+/// word). The caller then performs ONE DMA at `dest` and MUST call
+/// `finishPatch` on BOTH exits.
+pub fn beginPatch(deps: Deps, ino: u64, block: u32, rel: u32) PatchError!?Begun {
     const c = deps.custody;
-    if (c.range_shared) |rs| if (rs(c.ctx, req.ino, req.block)) return decline(.range_shared);
-    if (c.ram_custody(c.ctx, req.ino, req.block)) return decline(.overlay);
-    if (c.overlay_open(c.ctx, req.ino, req.block)) return decline(.device_overlay);
+    if (c.range_shared) |rs| if (rs(c.ctx, ino, block)) return declineNull(.range_shared);
+    if (c.ram_custody(c.ctx, ino, block)) return declineNull(.overlay);
+    if (c.overlay_open(c.ctx, ino, block)) return declineNull(.device_overlay);
     // Predicate 1: the mapping from the AUTHORITATIVE map under the held lock.
-    const m = deps.map.lookup(req.ino, req.block) orelse return decline(.unmapped);
-    const vol = deps.vols.byTag(m.vol_tag) orelse return decline(.unmapped);
-    if (!vol.passthrough) return decline(.transform);
-    if (!m.whole_block or m.damaged) return decline(.decorated);
+    const m = deps.map.lookup(ino, block) orelse return declineNull(.unmapped);
+    const vol = deps.vols.byTag(m.vol_tag) orelse return declineNull(.unmapped);
+    if (!vol.passthrough) return declineNull(.transform);
+    if (!m.whole_block or m.damaged) return declineNull(.decorated);
     // Predicate 4, durable half FIRST (before the word is retired).
-    if (c.sole_owner) |so| switch (so(c.ctx, req.ino, m)) {
+    if (c.sole_owner) |so| switch (so(c.ctx, ino, m)) {
         .sole => {},
-        .shared => return decline(.shared),
-        .foreign_custody => return decline(.foreign_custody),
-        .non_holder => return decline(.posture),
+        .shared => return declineNull(.shared),
+        .foreign_custody => return declineNull(.foreign_custody),
+        .non_holder => return declineNull(.posture),
     };
     const idx = vol.alloc.idxOf(m.offset);
     // The fence pair, patch side: retire → SeqCst → peek == 1 ∧ !SHARED.
@@ -232,21 +251,28 @@ pub fn tryPatch(deps: Deps, io: Io, req: Request) PatchError!bool {
     if (!sole) {
         // Re-stabilize under the NEW generation (content unchanged); CoW fallback.
         vol.alloc.publishBlock(idx);
-        return decline(.shared);
+        return declineNull(.shared);
     }
-    // ONE DMA at `offset + rel`, two vehicles one contract.
-    const dest = m.offset + req.rel;
-    const len = req.vehicle.len();
-    const result: seams.DmaError!seams.DmaProof = switch (req.vehicle) {
-        .slot => |src| deps.device.writeFixed(m.vol_tag, dest, src),
-        .bytes => |b| deps.device.write(m.vol_tag, dest, b),
-    };
-    // Both exits: publish (re-stabilize), purge the key from the four tiers.
-    vol.alloc.publishBlock(idx);
-    deps.purge.purge(m);
-    _ = result catch |e| {
+    return .{ .mapping = m, .vol_tag = m.vol_tag, .idx = idx, .dest = m.offset + rel, .ordinal = vol.ordinal, .ino = ino, .block = block, .rel = rel };
+}
+
+fn declineNull(b: Bucket) ?Begun {
+    _ = decline(b);
+    return null;
+}
+
+/// The postlude on BOTH exits of the DMA: publish (re-stabilize under the
+/// NEW generation), purge the key from the four read tiers, then — exact
+/// ⇒ the fsync touched stamp and the ledger; failed ⇒ `patch_dma_errors`,
+/// loud, the error for exactly this write (the block's old bytes intact
+/// outside the window).
+pub fn finishPatch(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void) PatchError!void {
+    const vol = deps.vols.byTag(b.vol_tag) orelse return error.VolumeFailed;
+    vol.alloc.publishBlock(b.idx);
+    deps.purge.purge(b.mapping);
+    dma catch |e| {
         stats.patch_dma_errors.inc();
-        log.err("W1 patch ino {d} block {d} rel {d}: DMA failed ({s}) — EIO for exactly this write; the block is re-stabilized with its old bytes intact outside the window", .{ req.ino, req.block, req.rel, @errorName(e) });
+        log.err("W1 patch ino {d} block {d} rel {d}: DMA failed ({s}) — EIO for exactly this write; the block is re-stabilized with its old bytes intact outside the window", .{ b.ino, b.block, b.rel, @errorName(e) });
         return switch (e) {
             error.InputOutput => error.InputOutput,
             error.NoSpaceLeft => error.NoSpaceLeft,
@@ -257,9 +283,23 @@ pub fn tryPatch(deps: Deps, io: Io, req: Request) PatchError!bool {
             error.OutOfMemory => error.OutOfMemory,
         };
     };
-    if (deps.touched) |t| t.stamp(t.ctx, req.ino, vol.ordinal);
+    if (deps.touched) |t| t.stamp(t.ctx, b.ino, b.ordinal);
     stats.patch_writes.inc();
     stats.patch_write_bytes.add(len);
+}
+
+/// Arm A under (3): `true` ⇒ patched and acked; `false` ⇒ one bucket, fall
+/// through; an error fails THIS write (EIO), nothing acked/parked/lost, the
+/// word re-stabilized. `beginPatch` → ONE DMA, two vehicles one contract →
+/// `finishPatch`.
+pub fn tryPatch(deps: Deps, io: Io, req: Request) PatchError!bool {
+    _ = io;
+    const b = (try beginPatch(deps, req.ino, req.block, req.rel)) orelse return false;
+    const result: seams.DmaError!void = switch (req.vehicle) {
+        .slot => |src| if (deps.device.writeFixed(b.vol_tag, b.dest, src)) |_| {} else |e| e,
+        .bytes => |bytes| if (deps.device.write(b.vol_tag, b.dest, bytes)) |_| {} else |e| e,
+    };
+    try finishPatch(deps, b, req.vehicle.len(), result);
     return true;
 }
 

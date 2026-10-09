@@ -128,6 +128,9 @@ pub const stats = struct {
     pub var parked_buffers: counters.Gauge = .{};
     pub var parked_pool_refusals: counters.ShardedCounter = .{};
     pub var durable_upload_bytes_escalation: counters.ShardedCounter = .{};
+    /// A merge whose bytes already lived in the entry's cell (a placed
+    /// payload of an adopted assembly — the pointer proof): the copy elided.
+    pub var placed_merge_elides: counters.ShardedCounter = .{};
     // Tripwires.
     pub var coverage_complete_buffer_not_content_valid: counters.Tripwire = .init("coverage_complete_buffer_not_content_valid");
     pub var complete_union_with_extra_runs: counters.Tripwire = .init("complete_union_with_extra_runs");
@@ -137,7 +140,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "durable_upload_bytes_escalation" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "durable_upload_bytes_escalation", "placed_merge_elides" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -423,17 +426,49 @@ pub const Table = struct {
     /// binding, else `fresh`). Null = the pool/table is at its cap (the
     /// caller stages the piece).
     pub fn checkout(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding) ?*Entry {
+        return self.checkoutWith(ino, block, has_existing_bytes, old_binding, null);
+    }
+
+    /// Arm G's ADOPTING checkout (charter §7 "placed sever … a shared
+    /// assembly the first merge ADOPTS"): the entry's backing is `adopt` —
+    /// a placed-sever assembly's cell whose share the caller hands over —
+    /// instead of a fresh pool cell. Adoption changes WHERE the backing
+    /// memory came from, never the coverage/seed law; the cell is non-
+    /// unique while placed payloads are out, so an in-place mutation copies
+    /// away (`uniqueOrCopy`). The caller holds (3) and saw no entry; an
+    /// entry present after all is a logic error (asserted). Null = the
+    /// entry table is full — the caller releases its share.
+    pub fn checkoutAdopting(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding, adopt: *Pool.Cell, landed: []const cov.Run) ?*Entry {
+        const e = self.checkoutWith(ino, block, has_existing_bytes, old_binding, adopt) orelse return null;
+        // The landed runs ARE coverage (the bytes are in the cell): at most
+        // `max_runs` of them (the registry refused the adoption otherwise),
+        // so the record cannot overflow.
+        for (landed) |r| {
+            _ = e.coverage.record(r.start, r.end, self.block_size) catch unreachable;
+            e.app_end = @max(e.app_end, r.end);
+        }
+        e.write_epoch = nextWriteEpoch();
+        if (e.coverage.isFull(self.block_size)) {
+            if (e.seed == .deferred) stats.overwrite_seed_skipped.inc();
+            e.seed = .seeded;
+            e.content_valid = true;
+        }
+        return e;
+    }
+
+    fn checkoutWith(self: *Table, ino: u64, block: u32, has_existing_bytes: bool, old_binding: ?Binding, adopt: ?*Pool.Cell) ?*Entry {
         self.lock.lock();
         defer self.lock.unlock();
         const key: Key = .{ .ino = ino, .block = block };
         if (self.index.get(key)) |e| {
+            assert(adopt == null);
             stats.write_block_revisits.inc();
             return e;
         }
-        const cell = self.pool.acquire() orelse return null;
+        const cell = adopt orelse (self.pool.acquire() orelse return null);
         const idx = self.free.pop() orelse {
             stats.active_block_table_full.fire("entry table full below the pool cap");
-            self.pool.release(cell);
+            if (adopt == null) self.pool.release(cell);
             return null;
         };
         const e = &self.entries[idx];
@@ -500,7 +535,12 @@ pub const Table = struct {
     /// userspace copy into the unique (or copied) cell; the write epoch
     /// advances. A full run table on a FRESH buffer zero-completes the
     /// complement and completes (the never-lossy, exact exit); on a
-    /// DEFERRED one the caller seeds first (`NeedsSeed`).
+    /// DEFERRED one the caller seeds first (`NeedsSeed`). A payload whose
+    /// bytes ARE the cell's region at `rel` (the pointer proof: a placed
+    /// sever into an assembly this entry adopted) is a coverage record
+    /// alone — no uniqueness copy, no memcpy (`placed_merge_elides`); the
+    /// bytes landed under the claim before the seal, and nothing mutates a
+    /// claimed region.
     pub fn recordWrite(self: *Table, e: *Entry, rel: u32, data: []const u8) RecordError!RecordVerdict {
         assert(e.repr == .full);
         const end: u32 = rel + @as(u32, @intCast(data.len));
@@ -513,10 +553,14 @@ pub const Table = struct {
                 break :blk cov.RecordVerdict{ .completed = true };
             },
         };
-        const cell = self.pool.uniqueOrCopy(e.repr.full, &e.coverage) orelse return error.PoolExhausted;
-        e.repr = .{ .full = cell };
-        @memcpy(cell.data[rel..end], data);
-        stats.nt_copy_bytes.add(data.len);
+        if (@intFromPtr(data.ptr) == @intFromPtr(e.repr.full.data.ptr) + rel) {
+            stats.placed_merge_elides.inc();
+        } else {
+            const cell = self.pool.uniqueOrCopy(e.repr.full, &e.coverage) orelse return error.PoolExhausted;
+            e.repr = .{ .full = cell };
+            @memcpy(cell.data[rel..end], data);
+            stats.nt_copy_bytes.add(data.len);
+        }
         if (v.out_of_order) stats.active_block_ooo_runs.inc();
         e.write_epoch = nextWriteEpoch();
         e.app_end = @max(e.app_end, end);

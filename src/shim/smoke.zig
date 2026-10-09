@@ -294,14 +294,17 @@ const Rig = struct {
     }
 
     /// SIGUSR1 → the stats families in the log; the tail from the mark.
+    /// SIGUSR1's stats dump: the log past the mark (THIS dump alone — a
+    /// `numberAfter` over the whole log would read the mount's first dump
+    /// every time).
     fn statsTail(self: *Rig) ![]u8 {
         const mark = try self.logLen();
         _ = linux.kill(self.child_pid, .USR1);
         const deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
         while (clock.monotonicNs() < deadline) {
             const text = try self.readLog();
-            if (text.len > mark and std.mem.indexOf(u8, text[mark..], "stats daemon: ") != null) return text;
-            self.gpa.free(text);
+            defer self.gpa.free(text);
+            if (text.len > mark and std.mem.indexOf(u8, text[mark..], "stats daemon: ") != null) return self.gpa.dupe(u8, text[mark..]);
             sleepMs(20);
         }
         return error.Timeout;
@@ -615,8 +618,11 @@ test "shim smoke: the LD_PRELOAD battery — plain-file parity with the shim sil
         defer rig.freeRun(r);
         try testing.expect(r.term.success());
         const refused = std.mem.indexOf(u8, r.stderr, "dev build identity") != null;
-        std.debug.print("shim smoke row 4a (pairing): {s}\n", .{if (refused) "a -dirty identity refused once, kernel-served" else "clean identity (the refusal row needs a dirty tree)"});
-        if (refused) try testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.stderr, "squeezefs-il:"));
+        std.debug.print("shim smoke row 4a (pairing): {s}\n", .{if (refused) "a -dirty identity refused once per process, kernel-served" else "clean identity (the refusal row needs a dirty tree)"});
+        // The once-rule is per (mount, reason) PER PROCESS (`once.first`):
+        // the script's dd and sha256sum each refuse once; every line the
+        // shim printed is that one refusal.
+        if (refused) try testing.expectEqual(std.mem.count(u8, r.stderr, "dev build identity"), std.mem.count(u8, r.stderr, "squeezefs-il:"));
     }
     // 4b: the engagement law — dd 64 MiB + sha256sum + cat/cp through the
     // shim; the daemon's ipc_* family accounts for the ops.

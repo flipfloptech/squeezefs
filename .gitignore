@@ -6,3 +6,4 @@ zig-out-linux/
 fuzz-corpus/
 .release-dry-run/
 .wt-*/
+__pycache__/

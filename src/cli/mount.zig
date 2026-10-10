@@ -598,10 +598,18 @@ fn mountMain(ctx: *Ctx) u8 {
     wd_fut.cancel(io);
     reclaim.requestStop();
     reclaim_fut.cancel(io);
+    // The dismount pass (charter §8 `umount`: "teardown promotes staged
+    // files first") with every arm it mints and frees through still LIVE:
+    // the grant plane is the allocator's mint source (a holder's own
+    // window, a joiner's pulled window) and the wire plane's teardown
+    // DISARMS it — a promotion minting after that met the carved window's
+    // SET bits at the frontier (the rung-8 dismount defect). No FUSE
+    // request is in flight (the session is closed); the wire still serves.
+    plane.dismount();
     // The wire BEFORE the planes and the backend it serves over: every
     // connection severed, the token hook disarmed on every pass — and
-    // every seam the planes hold INTO it unbound first (the dismount pass
-    // at `plane.close` reads layouts; nothing may reach a stopped plane).
+    // every seam the planes hold INTO it unbound first (nothing may reach
+    // a stopped plane).
     if (wire) |wp| {
         plane.bindForeignLayout(null);
         xv_bound.?.bindDialer(null);
@@ -623,8 +631,8 @@ fn mountMain(ctx: *Ctx) u8 {
     session_live = false;
     vs.renderer.sources.session = null;
     session.deinit();
-    // The dismount pass BEFORE the backend's final checkpoint (its
-    // promotions are layout transactions); the `defer`s unwind the
+    // The plane closes BEFORE the backend's final checkpoint (the dismount
+    // pass's promotions were layout transactions); the `defer`s unwind the
     // filesystem and the tables after it.
     plane_open = false;
     plane.close();

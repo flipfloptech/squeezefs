@@ -391,3 +391,36 @@ test "two writers in process: A holds the lease; B pulls grants, writes, its fre
     try testing.expect(alloc_lease.acquire(st, gpa, T.screen, true, .{ .vol_tag = T.VOL_TAG, .identity = T.B_ID, .home_vol = 0, .appender_id = 2, .blocks = T.BLOCKS }).granted.refs.eql(b_refs.items));
     try testing.expect(b_bitmap.populationDriftCheck());
 }
+
+test "the dismount defect's core: a mint after the grant plane is DISARMED meets the carved window's SET bit at the frontier ⇒ a typed PlaneRefused + the anomaly tripwire, never an assert, never StorageFull; the cursor stays; re-armed, the window mints again" {
+    const gpa = testing.allocator;
+    const f = try TwoWriters.init(gpa);
+    defer f.deinit();
+    // A (the holder) mints 15 striped blocks: ONE carve of the floor window
+    // SETS 64 bits at the frontier; the cursor stands at 15.
+    var a_blocks: [15]u64 = undefined;
+    try f.mintPublish(f.a_alloc, &f.a_arm, 15, &a_blocks);
+    try testing.expectEqual(@as(u64, 15), f.a_alloc.highestBlockIndex());
+    try testing.expect(f.a_alloc.bitIsSet(15));
+    try testing.expect(f.a_arm.window.remaining() >= block_grant.BLOCK_GRANT_FLOOR - 15);
+    // The grant plane is torn down (`HolderPlane.disarm`'s word) while the
+    // staged residents still wait for their dismount promotion.
+    const src = f.a_alloc.grant_source;
+    f.a_alloc.grant_source = null;
+    const pop0 = f.a_bitmap.populationNow();
+    const anomalies0 = counters.tripwireCount("block_claim_anomalies");
+    block_alloc.stats.block_claim_anomalies.resetLogBudgetForTest();
+    @import("../core/log.zig").testing.expectErrorLogs(1);
+    try testing.expectError(error.PlaneRefused, f.a_alloc.allocateBlock());
+    try @import("../core/log.zig").testing.expectAllFired();
+    try testing.expectEqual(anomalies0 + 1, counters.tripwireCount("block_claim_anomalies"));
+    // Retryable, never the terminal latch; the cursor did not walk over the
+    // window (a walk would mint past the holder's carve without a grant).
+    try testing.expect(!f.a_alloc.freshSupplyExhausted());
+    try testing.expectEqual(@as(u64, 15), f.a_alloc.highestBlockIndex());
+    try testing.expectEqual(pop0, f.a_bitmap.populationNow());
+    // Re-armed (the fix's order: the dismount pass runs BEFORE the plane
+    // disarms), the same window mints block 15.
+    f.a_alloc.grant_source = src;
+    try testing.expectEqual(@as(u64, 15), (try f.a_alloc.allocateBlock()).idx);
+}

@@ -257,8 +257,9 @@ pub const AllocError = error{
     StorageFull,
     /// A read-only mount refuses every ownership mutation.
     ReadOnly,
-    /// Rung 6: this mount does not hold the volume's allocation lease
-    /// (retryable; never latches `StorageFull`).
+    /// Rung 6: this mount does not hold the volume's allocation lease; rung
+    /// 8: its mint source is disarmed while a carved window holds the
+    /// frontier (retryable; never latches `StorageFull`).
     PlaneRefused,
     /// `allocateSpecificBlock` on a block that is not free.
     NotFree,
@@ -794,10 +795,21 @@ pub const BlockAllocator = struct {
         while (true) {
             if (cur >= self.capacity_blocks) return error.StorageFull;
             cur = self.highest.cmpxchgWeak(cur, cur + 1, .monotonic, .monotonic) orelse {
-                const took = self.tryTakeBit(cur);
-                assert(took); // virgin ⇒ clear
-                stats.alloc_fresh_mints.inc();
-                return cur;
+                if (self.tryTakeBit(cur)) {
+                    stats.alloc_fresh_mints.inc();
+                    return cur;
+                }
+                // Virgin ⇒ clear, so a SET bit at the cursor is a carved
+                // grant window whose source was disarmed under us (the
+                // dismount pass running after the grant plane's teardown,
+                // rung 8). Walking past it would mint beyond the holder's
+                // carve with no grant: the cursor is put back and the mint
+                // refuses RETRYABLE (never the StorageFull latch) — the
+                // caller's custody stays where it was (a staged resident
+                // stays staged), loud.
+                _ = self.highest.cmpxchgStrong(cur + 1, cur, .monotonic, .monotonic);
+                stats.block_claim_anomalies.fire("the fresh cursor met a SET bit (a carved window with its mint source disarmed; the mint refuses PlaneRefused)");
+                return error.PlaneRefused;
             };
         }
     }

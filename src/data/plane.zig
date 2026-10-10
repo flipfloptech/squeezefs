@@ -382,6 +382,8 @@ pub const DataPlane = struct {
     /// The token divert's layout face (bound by the daemon once the wire
     /// plane is up; null = a flat mount: every slot local).
     foreign_layout: ?ForeignLayout = null,
+    /// `dismount` ran (once; `close` runs it if nobody did).
+    dismounted: bool = false,
 
     /// A foreign-slot layout record through the holder's token.
     pub const ForeignLayout = struct {
@@ -400,7 +402,7 @@ pub const DataPlane = struct {
     };
 
     /// Bind (or, with null, unbind BEFORE the seam's owner goes) the
-    /// foreign-layout face; the dismount pass at `close` reads layouts
+    /// foreign-layout face; the dismount pass (`dismount`) reads layouts
     /// through it when bound.
     pub fn bindForeignLayout(self: *DataPlane, f: ?ForeignLayout) void {
         self.foreign_layout = f;
@@ -732,12 +734,19 @@ pub const DataPlane = struct {
         }
     }
 
-    /// The dismount pass (charter §8 `umount`): the pending promotions and
-    /// detached uploads drain; every staged file promotes; the open packs
-    /// seal DISMOUNT; the reclaimer drains and stops; the paths, the
-    /// devices and the allocators close — in that order, every step before
-    /// the backend's final checkpoint.
-    pub fn close(self: *DataPlane) void {
+    /// The dismount pass (charter §8 `umount`, §6.1 "the writing mount's
+    /// clean unmount"): the pending promotions and detached uploads drain;
+    /// every staged file promotes; the open packs seal DISMOUNT; the
+    /// reclaimer drains. It runs while every arm the promotion mints and
+    /// frees through is still LIVE — the grant plane (the allocator's mint
+    /// source), the wire's foreign-layout and free-ship legs — so `mount`
+    /// calls it BEFORE the wire plane stops; `close` runs it once if nobody
+    /// did (a bring-up failure's unwind). A promotion that fails leaves its
+    /// resident staged (never lost: the ring is durable, the next mount
+    /// adopts it) and the pass is loud about it.
+    pub fn dismount(self: *DataPlane) void {
+        if (self.dismounted) return;
+        self.dismounted = true;
         const io = self.io;
         // Background sweeps stop at their next chunk boundary (the cursor
         // is durable; the next mount adopts what is left).
@@ -750,10 +759,23 @@ pub const DataPlane = struct {
             const bytes0 = staging.stats.dismount_promoted_bytes.load();
             const failed0 = staging.stats.dismount_promote_failures.load();
             staging.promoteAllAtDismount(self.gpa, &st.seg, st.pool.hooks) catch |e| log.err("dismount promotion pass: {s}", .{@errorName(e)});
-            log.info("dismount promotion: {d} staged file(s) ({d} B) promoted, {d} failed", .{ staging.stats.dismount_promoted_files.load() - files0, staging.stats.dismount_promoted_bytes.load() - bytes0, staging.stats.dismount_promote_failures.load() - failed0 });
+            const failed = staging.stats.dismount_promote_failures.load() - failed0;
+            if (failed != 0) {
+                log.err("dismount promotion: {d} staged file(s) ({d} B) promoted, {d} FAILED — the failed residents stay in the staging ring (readable here, zeros elsewhere) until the next mount of this host promotes them", .{ staging.stats.dismount_promoted_files.load() - files0, staging.stats.dismount_promoted_bytes.load() - bytes0, failed });
+            } else {
+                log.info("dismount promotion: {d} staged file(s) ({d} B) promoted, 0 failed", .{ staging.stats.dismount_promoted_files.load() - files0, staging.stats.dismount_promoted_bytes.load() - bytes0 });
+            }
         }
         if (self.packer) |*p| p.sealAll();
         _ = self.reclaimer.drainSync(io);
+    }
+
+    /// Close after the dismount pass: the reclaimer stops; the paths, the
+    /// devices and the allocators close — every step before the backend's
+    /// final checkpoint.
+    pub fn close(self: *DataPlane) void {
+        const io = self.io;
+        self.dismount();
         self.reclaimer.closeAtDismount();
         self.reclaimer.stopAndJoin(io);
         self.lane_group.await(io) catch {};

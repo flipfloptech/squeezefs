@@ -4023,32 +4023,43 @@ test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed
     gpa.free(storm_sources);
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
-    // The fill, over two mounts: three 20 MiB striped files with fsync,
-    // then (after a remount) a tree of directories, 200 packed 64 KiB
-    // files and hard links. WHY two: a mount holding staged residents
-    // beside fresh striped blocks asserts in the dismount's pack promotion
-    // (`nextFreshBlock`'s virgin-bit law; 20 × 64 KiB + 3 × 20 MiB `dd
-    // conv=fsync` → `umount` reproduces it at HEAD) — a data-plane defect
-    // this row records, not fsck's object.
+    // The fill in ONE mount: 20 staged 64 KiB files FIRST, then three
+    // 20 MiB striped files with fsync (the holder's own grant window
+    // carves 64 bits at the frontier; the cursor stands at 15), then a
+    // tree of directories, 180 more packed 64 KiB files and hard links —
+    // and the clean umount promotes every staged resident through the
+    // LIVE grant plane. This exact shape (20 × 64 KiB + 3 × 20 MiB `dd
+    // conv=fsync` → `umount`) asserted at HEAD before rung 8's fix in
+    // `block_alloc.nextFreshBlock` (the dismount pass ran after the wire
+    // plane had disarmed the allocator's mint source, so the fresh cursor
+    // met the carved window's SET bit): the rung-8 dismount defect's
+    // Linux pin.
     {
-        const out = try rig.onMount("for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; sync; echo filled");
+        const out = try rig.onMount("mkdir -p d/e/f g && i=0; while [ $i -lt 20 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; while [ $i -lt 200 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; ln d/e/small1 g/link1; ln d/e/small2 g/link2; sync; echo filled");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
     }
-    try rig.expectAlive("the striped fill");
+    try rig.expectAlive("the staged + striped + packed fill and hard links");
+    const mark_dismount = try rig.logLen();
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
-    const mark_packed = try rig.logLen();
-    try rig.spawnMount(&.{});
-    _ = try rig.awaitReady(mark_packed);
     {
-        const out = try rig.onMount("mkdir -p d/e/f g && i=0; while [ $i -lt 200 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; ln d/e/small1 g/link1; ln d/e/small2 g/link2; sync; echo filled");
-        defer gpa.free(out);
-        try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
+        // Every staged resident promoted at the dismount, none failed, and
+        // the allocator's anomaly tripwire never fired.
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const tail = text[mark_dismount..];
+        const line_at = std.mem.indexOf(u8, tail, "dismount promotion: ") orelse {
+            std.debug.print("\n--- no dismount promotion line ---\n{s}\n", .{tail});
+            return error.NoDismountPromotionLine;
+        };
+        const line = tail[line_at..];
+        const promoted = numberAfter(line, "dismount promotion: ") orelse return error.NoDismountPromotionLine;
+        try testing.expect(promoted >= 1);
+        try testing.expect(std.mem.indexOf(u8, line[0..@min(line.len, 200)], ", 0 failed") != null);
+        try testing.expect(std.mem.indexOf(u8, tail, "block_claim_anomalies") == null);
+        std.debug.print("\nsmoke[fsck]: the dismount promoted {d} staged file(s) beside fresh striped blocks (the rung-8 defect's pin)\n", .{promoted});
     }
-    try rig.expectAlive("the packed fill and hard links");
-    try rig.umount();
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     // The clone (an offline verb: the same guarded open fsck takes) shares
     // big0's blocks — the refcount-2 shape C3/C8 must read as healthy.
     {

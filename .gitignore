@@ -5,3 +5,4 @@ zig-out-linux/
 .DS_Store
 fuzz-corpus/
 .release-dry-run/
+.wt-*/

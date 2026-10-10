@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# mkfs(8) helper for the external suites: `mkfs.fuse.squeezefs [-f] [--]
+# <device> [squeezefs format flags…]` formats a SET around the device — the
+# metadata volume is the device itself (a plain file, or a loop device over
+# one: xfstests' TEST_DEV/SCRATCH_DEV are loop devices so `_require_scratch`
+# sees a block device), two data volumes `d0.img`/`d1.img` and a `cache/`
+# staging root beside the metadata image (created sparse when absent:
+# SUITE_META_MIB / SUITE_DATA_GIB, defaults 1024 / 8) — with `squeezefs
+# format --single-writer --disk-cache-paths`. xfstests' `_scratch_mkfs`
+# runs `yes | mkfs -t fuse.squeezefs -- $SCRATCH_DEV` before every scratch
+# test: a reformat (`--force`) drops the previous life's staging ring.
+# Installed as /sbin/mkfs.fuse.squeezefs (and /sbin/mkfs.squeezefs).
+set -euo pipefail
+ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
+[ -f "$ENV_FILE" ] && source "$ENV_FILE"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/setpaths.sh"
+SQZ_BIN=${SQZ_BIN:-squeezefs}
+SUITE_META_MIB=${SUITE_META_MIB:-1024}
+SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
+
+die() { echo "mkfs.squeezefs: $*" >&2; exit 1; }
+
+dev="" extra=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--force|--) ;;                              # a reformat is the default here; `--` is mkfs(8)'s separator
+    -t) shift ;;                                   # `mkfs -t fuse.squeezefs` passes the type
+    -*) extra+=("$1") ;;                           # squeezefs format flags (--block-size …)
+    *) if [ -z "$dev" ]; then dev=$1; else extra+=("$1"); fi ;;
+  esac
+  shift
+done
+[ -n "$dev" ] || die "usage: mkfs.fuse.squeezefs [-f] [--] <device> [squeezefs format flags]"
+suite_set_of "$dev"
+mkdir -p "$SET_DIR/cache"; chmod 0700 "$SET_DIR/cache"
+case "$dev" in /dev/*) ;; *) [ -f "$dev" ] || truncate -s "${SUITE_META_MIB}M" "$dev" ;; esac
+for d in d0 d1; do [ -f "$SET_DIR/$d.img" ] || truncate -s "${SUITE_DATA_GIB}G" "$SET_DIR/$d.img"; done
+# A reformat must not inherit the previous life's staging ring.
+rm -rf "$SET_DIR/cache"/*
+exec "$SQZ_BIN" format --single-writer --force --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SET_DEV" "sqdata://$SET_DIR/d0.img,$SET_DIR/d1.img"

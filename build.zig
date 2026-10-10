@@ -27,8 +27,14 @@
 //!   zig build bench-smoke  — `squeezefs bench --smoke` against a mount the
 //!                            step creates (one iteration of every workload).
 //!   zig build fmt          — `zig fmt --check` over the tree.
-//!   zig build gate         — fmt + test + rails + smoke + bench-smoke: the
+//!   zig build gate         — fmt + test + rails + smoke + bench-smoke + the
+//!                            shim/nvmet/sdk smokes + suites-smoke: the
 //!                            per-commit gate.
+//!   zig build suites-smoke — the ~2-minute pjdfstest subset against a fresh
+//!                            mount (scripts/suites/pjdfstest.sh; Linux, root).
+//!   zig build gate-release — pjdfstest + LTP + fstests -g auto, three clean
+//!                            runs each under the adjudication ledgers
+//!                            (docs/gates/*-exceptions.md): the release gate.
 //!   zig build dist         — the dist profile artifact + split debug info.
 //!   zig build shim         — libsqueezefs_il.so (the LD_PRELOAD shim) into lib/ (Linux).
 //!   zig build shim-smoke   — the LD_PRELOAD battery against a mount (Linux, root).
@@ -181,8 +187,8 @@ pub fn build(b: *std.Build) void {
 
     // The gate steps are declared here so the steps below can hang off them;
     // their dependencies are wired where each piece lands.
-    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + sdk-smoke (the per-commit gate)");
-    const gate_release_step = b.step("gate-release", "gate + bench-compare against the committed baseline (run with -Drelease-gate=true: skips fail)");
+    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + sdk-smoke + suites-smoke (the per-commit gate)");
+    const gate_release_step = b.step("gate-release", "gate + bench-compare against the committed baseline + the external suites (pjdfstest, LTP, fstests -g auto; 3 clean runs each, adjudicated; Linux venue, root, hours) — run with -Drelease-gate=true: skips fail");
 
     // ---- static rails: source-scanning convention tests (charter §11) ----
     const rails_tests = b.addTest(.{
@@ -379,6 +385,36 @@ pub fn build(b: *std.Build) void {
     //      after the gate); run with `-Drelease-gate=true` so environment
     //      skips fail ----
     gate_release_step.dependOn(gate_step);
+
+    // ---- the external conformance suites (charter §11 "Gates"): the
+    //      harness is scripts/suites/*.sh on the Linux venue as root.
+    //      `suites-smoke` = the ~2-minute pjdfstest subset against a fresh
+    //      mount (one run; part of the gate); the release gate above also
+    //      runs the full pjdfstest + LTP (fs, syscalls) + fstests `-g auto`
+    //      with the 3-run discipline and the adjudication ledgers (hours;
+    //      never per commit). Both drive the binary THIS build emitted
+    //      (`--bin`), so a stale install can never be judged. ----
+    const suites_smoke_step = b.step("suites-smoke", "pjdfstest gate subset (~2 min) against a fresh mount (Linux venue, root)");
+    if (target.result.os.tag == .linux) {
+        const smoke = b.addSystemCommand(&.{ "bash", "scripts/suites/pjdfstest.sh", "--bin" });
+        smoke.addFileArg(exe.getEmittedBin());
+        smoke.setEnvironmentVariable("PJD_SMOKE", "1");
+        smoke.setEnvironmentVariable("SUITE_RUNS", "1");
+        smoke.has_side_effects = true;
+        // After the nvmet smoke: one mount on the venue at a time.
+        smoke.step.dependOn(&run_nvmet_smoke.step);
+        suites_smoke_step.dependOn(&smoke.step);
+        gate_step.dependOn(suites_smoke_step);
+        inline for (.{ "pjdfstest.sh", "ltp.sh", "fstests.sh" }) |script| {
+            const run = b.addSystemCommand(&.{ "bash", "scripts/suites/" ++ script, "--bin" });
+            run.addFileArg(exe.getEmittedBin());
+            run.has_side_effects = true;
+            gate_release_step.dependOn(&run.step);
+        }
+    } else {
+        suites_smoke_step.dependOn(&b.addFail("the external suites run only on the Linux venue (charter §1.2): scripts/venue zig build suites-smoke").step);
+        gate_release_step.dependOn(&b.addFail("the release gate's external suites run only on the Linux venue (charter §1.2): scripts/venue zig build gate-release").step);
+    }
 
     // ---- @anchor:sdk_build — the native SDK: libsqueezefs_sdk.{a,so} + the
     //      header + the C smoke (charter §7, §12; il_sdk §10.2–10.3) ----

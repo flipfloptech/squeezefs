@@ -1,0 +1,2 @@
+# xfstests tests excluded in the sqz-zig container venue (check -E), one per line:
+#   <test>  <why it is the venue's, never a filesystem semantic>

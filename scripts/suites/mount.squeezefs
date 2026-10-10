@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# mount(8) helper for the external suites: `mount -t fuse.squeezefs <dev> <dir>
+# -o <opts>` (xfstests' `_mount -t $FSTYP$FUSE_SUBTYP`) lands here through
+# util-linux's `/sbin/mount.fuse.squeezefs` symlink (installed by
+# scripts/suites/fstests.sh). Also answers as `/sbin/umount.fuse.squeezefs`
+# (util-linux's umount helper: `umount.<type> <dir> [-l] [-f] [-n] [-v]`),
+# so xfstests' `umount` runs the ORDERLY `squeezefs umount` (teardown
+# promotes staged files first, the final checkpoint lands) instead of the
+# bare umount2 that gives a type-fuse mount no DESTROY.
+#
+# <dev> is the set's metadata volume — a plain file or a loop device over
+# one (xfstests' TEST_DEV/SCRATCH_DEV: loop devices, so the suite's block-
+# device requirements hold); the data volumes are the format's config. The mount posture is the RELEASE posture
+# (`default_permissions,allow_other`) PLUS the caller's options: `ro`,
+# `noatime`, `nodiratime`, `sync`, `dirsync`, `nosuid`, `nodev`, `noexec`
+# and the daemon's own `-o` names pass through to `squeezefs mount`, which
+# refuses anything it does not know (charter §1.6: a junk option is a
+# loud refusal, never dropped). `remount` is refused here: the daemon has
+# no remount verb (a test that needs it reports its reason).
+set -euo pipefail
+
+ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
+[ -f "$ENV_FILE" ] && source "$ENV_FILE"
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/setpaths.sh"
+SQZ_BIN=${SQZ_BIN:-squeezefs}
+SUITE_MOUNT_OPTS=${SUITE_MOUNT_OPTS:-default_permissions,allow_other}
+
+die() { echo "$(basename "$0"): $*" >&2; exit 32; }
+
+if [[ "$(basename "$0")" == umount.* ]]; then
+  target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*) ;;                       # -l -f -n -v -r -i: the orderly umount is the one act
+      *) [ -z "$target" ] && target=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$target" ] || die "usage: umount.fuse.squeezefs <mountpoint>"
+  exec "$SQZ_BIN" umount "$target"
+fi
+
+dev="" dir="" opts=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) opts="${opts:+$opts,}$2"; shift ;;
+    -o*) opts="${opts:+$opts,}${1#-o}" ;;
+    -t) shift ;;                   # the type we are
+    -n|-s|-f|-v|-i|-r|-w) ;;      # util-linux helper flags: no table to write, verbose is the log
+    -N) shift ;;
+    -*) die "unknown flag $1" ;;
+    *) if [ -z "$dev" ]; then dev=$1; elif [ -z "$dir" ]; then dir=$1; else die "extra argument $1"; fi ;;
+  esac
+  shift
+done
+[ -n "$dev" ] && [ -n "$dir" ] || die "usage: mount.fuse.squeezefs <meta-volume-path> <mountpoint> [-o opts]"
+
+# Options: the release posture first, then the caller's (minus the mount
+# table words util-linux adds and the ones a FUSE daemon cannot honour).
+pass=()
+IFS=',' read -ra items <<< "$opts"
+for it in "${items[@]}"; do
+  case "$it" in
+    ""|rw|defaults|auto|noauto|user|nouser|owner|group|_netdev|nofail|loop) ;;
+    remount*) die "-o remount is not a squeezefs mount verb (the daemon has no remount; unmount and mount)" ;;
+    *) pass+=("$it") ;;
+  esac
+done
+# The mount table's source column IS the device string: xfstests finds the
+# mount by `findmnt -S $dev -t fuse.squeezefs` (`fsname` and `subtype` are
+# independent in the daemon's option parser).
+all="$SUITE_MOUNT_OPTS,fsname=$dev"
+for p in "${pass[@]}"; do all="$all,$p"; done
+
+suite_set_of "$dev"
+log="$SET_DIR/daemon-$(date +%Y%m%d-%H%M%S)-$$.log"
+# One line per mount in the set's own ledger, so a run's daemons are findable.
+echo "$(date +%s) mount $dir -o $all log $log" >> "$SET_DIR/mounts.log"
+exec "$SQZ_BIN" mount --daemon --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir"

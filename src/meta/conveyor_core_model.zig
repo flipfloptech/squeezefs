@@ -19,6 +19,9 @@
 //!   4 budget_conserved_across_committer_drop    — a dropped committer retracts its entry
 //!   5 guard_outlives_dropped_committer          — the queue entry does not co-own the guard
 //!   6 group_never_drains_partially              — `enqueueMany` takes the mutex per item
+//!   7 pass_fiber_wake_not_lost                   — the pass fiber parks without re-reading the
+//!                                                 leader latch (the winner's wake coalesced into
+//!                                                 the fiber's own mutex-park wake)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -40,6 +43,10 @@ const Weakening = enum {
     no_entry_coown,
     /// `enqueueMany` acquires the mutex once per item.
     group_per_item_lock,
+    /// The pass FIBER parks after a pass without re-reading the leader
+    /// latch: a winner's wake that landed while the fiber was SCHEDULED
+    /// (woken from its park on the queue mutex) was a no-op on the word.
+    park_without_leader_recheck,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -93,6 +100,10 @@ const Pass = struct {
     pc: Pc = .drain_lock,
     /// This task believes it holds leadership.
     leading: bool,
+    /// `.parkable`: a lock step that finds the mutex held PARKS the fiber
+    /// (the production `std.Io.Mutex`); the model's fiber word records it.
+    /// Set by `PassFiber`; the committer-run passes spin.
+    parked_on_mutex: bool = false,
     drained: u8 = 0,
     budget: u8 = 0,
     /// Terminal outcomes delivered (fan-outs of non-empty batches).
@@ -692,6 +703,147 @@ fn GroupAtomic(comptime weakening: Weakening) type {
 }
 
 // ---------------------------------------------------------------------------
+// 7. the pass fiber's wake is never lost
+// ---------------------------------------------------------------------------
+
+/// The production venue (`backend.passEntry`): ONE long-lived pass fiber,
+/// woken by the election winner through the task-state word (IDLE →
+/// SCHEDULED enqueues; RUNNING → NOTIFIED; SCHEDULED/NOTIFIED absorb), that
+/// parks on the queue mutex inside `unleadAndRecheck`'s `pending()` under
+/// contention. Two committers enqueue and elect; the fiber starts parked.
+///
+/// Weakening `.park_without_leader_recheck` (the 2026-10-10 wedge: 16
+/// committers parked, no pass, every thread asleep): the fiber releases
+/// leadership, parks on the mutex a committer holds; the committer's unlock
+/// wakes it (IDLE → SCHEDULED), the committer's `tryLead` wins and its wake
+/// is a no-op on SCHEDULED; the fiber resumes, re-checks, loses its own
+/// `tryLead` to the committer, exits the pass and PARKS — the latch is
+/// held, the entry queued, nobody runs. The fix: the fiber re-reads the
+/// leader latch before every park (a wake arriving between the read and
+/// the park finds it RUNNING and lands as NOTIFIED — law 1 — so the park
+/// returns at once).
+fn PassFiber(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const fiber = 0;
+        const items = [2][1]Item{ .{.{ .id = 1, .len = 1 }}, .{.{ .id = 2, .len = 1 }} };
+
+        const Word = enum(u8) { idle, scheduled, running, notified };
+        const Fpc = enum(u8) { parked, run_check, in_pass, before_park, park };
+
+        sh: Shared = .{},
+        word: Word = .idle,
+        fpc: Fpc = .parked,
+        pass: Pass = .{ .leading = false },
+        drained: u8 = 0,
+        c: [2]Committer = @splat(.start(weakening)),
+        woke: [2]bool = @splat(false),
+
+        pub fn init() Self {
+            return .{};
+        }
+
+        /// `f.state.wake()` + the enqueue: the ONE wake primitive every
+        /// producer uses (the election winner, the mutex's unlock).
+        fn wake(self: *Self) void {
+            self.word = switch (self.word) {
+                .idle => .scheduled,
+                .running => .notified,
+                .scheduled, .notified => self.word,
+            };
+        }
+
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                fiber => self.fpc == .parked and self.word == .idle and self.c[0].phase == .done and self.c[1].phase == .done,
+                else => self.c[t - 1].phase == .done,
+            };
+        }
+
+        fn stepFiber(self: *Self) void {
+            switch (self.word) {
+                .idle => return, // not runnable
+                .scheduled => {
+                    // The lane runs it: resume where it parked.
+                    self.word = .running;
+                    if (self.fpc == .parked) self.fpc = .run_check;
+                    return;
+                },
+                .running, .notified => {},
+            }
+            switch (self.fpc) {
+                .parked => unreachable,
+                .run_check => {
+                    // `runScheduledPass`: the pass iff the latch is set.
+                    if (self.sh.leader) {
+                        self.pass = .{ .leading = true };
+                        self.fpc = .in_pass;
+                    } else self.fpc = .before_park;
+                },
+                .in_pass => {
+                    // A lock step on a held mutex parks the fiber (the
+                    // unlocker wakes it); every other step is the pass's.
+                    const wants_lock = self.pass.pc == .drain_lock or self.pass.pc == .unlead_lock;
+                    if (wants_lock and self.sh.locked) {
+                        self.pass.parked_on_mutex = true;
+                        self.word = .idle;
+                        return;
+                    }
+                    self.pass.step(&self.sh, weakening);
+                    if (self.pass.pc == .done) {
+                        self.drained += self.pass.drained;
+                        self.fpc = .before_park;
+                    }
+                },
+                .before_park => {
+                    self.fpc = if (weakening != .park_without_leader_recheck and self.sh.leader) .run_check else .park;
+                },
+                .park => {
+                    // `f.park()`: NOTIFIED requeues (law 1), RUNNING parks.
+                    if (self.word == .notified) {
+                        self.word = .scheduled;
+                        self.fpc = .parked;
+                    } else {
+                        self.word = .idle;
+                        self.fpc = .parked;
+                    }
+                },
+            }
+        }
+
+        fn stepCommitter(self: *Self, i: usize) void {
+            const c = &self.c[i];
+            const was_locked = self.sh.locked;
+            c.step(&self.sh, &items[i], weakening, false);
+            // The mutex's unlock wakes the fiber parked on it.
+            if (was_locked and !self.sh.locked and self.pass.parked_on_mutex) {
+                self.pass.parked_on_mutex = false;
+                self.wake();
+            }
+            // The winner's ONE wake, right after its CAS.
+            if (c.elect.pc == .done and c.elect.won and !self.woke[i]) {
+                self.woke[i] = true;
+                self.wake();
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                fiber => self.stepFiber(),
+                else => self.stepCommitter(t - 1),
+            }
+        }
+        pub fn invariant(_: *const Self) !void {}
+        pub fn final(self: *const Self) !void {
+            if (self.sh.len != 0) return error.EntryLeftQueued;
+            if (self.drained != 2) return error.EntriesNotDrainedExactlyOnce;
+            if (self.sh.leader) return error.LeadershipNotReleased;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -726,9 +878,14 @@ test "conveyor_group_never_drains_partially: holds; a per-item lock hold fails" 
     try explorer.expectFails(GroupAtomic(.group_per_item_lock), .{}, error.InvariantViolated);
 }
 
+test "conveyor_pass_fiber_wake_not_lost: holds; a park without the leader re-read fails (the winner's wake coalesced into the mutex-park wake)" {
+    try explorer.expectHolds(PassFiber(.none), .{});
+    try explorer.expectFails(PassFiber(.park_without_leader_recheck), .{}, error.FinalViolated);
+}
+
 // The state counts the evidence note records.
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

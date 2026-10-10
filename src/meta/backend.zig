@@ -1371,6 +1371,13 @@ pub const KvBackend = struct {
     /// election wakes it. A wake that lands mid-pass parks the delivery
     /// word as NOTIFIED and the next park returns at once (law 1), so an
     /// election that fires while the pass is draining is never lost.
+    /// A wake that lands while the fiber is SCHEDULED is absorbed by the
+    /// word — and the fiber IS scheduled whenever it was parked on the
+    /// queue mutex inside `unleadAndRecheck` and the unlocker woke it; the
+    /// election that followed that unlock (its `tryLead` beat the fiber's
+    /// own re-election) must not be lost to a park: the leader latch is
+    /// re-read before every park (`conveyor_core_model.PassFiber` proves
+    /// the park without it loses the wake — the 2026-10-10 wedge).
     fn passEntry(context: *const anyopaque) void {
         const p: *const *KvBackend = @ptrCast(@alignCast(context));
         const be = p.*;
@@ -1379,6 +1386,7 @@ pub const KvBackend = struct {
             if (be.pass_stop.load(.acquire)) return;
             be.cv.runScheduledPass();
             if (be.pass_stop.load(.acquire)) return;
+            if (be.cv.leaderHeld()) continue;
             f.park();
         }
     }

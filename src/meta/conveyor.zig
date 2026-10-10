@@ -901,7 +901,18 @@ pub const Conveyor = struct {
     /// (the leader latch is set). A wake that finds no leader is spurious
     /// (the previous pass drained the entry before the wake landed).
     pub fn runScheduledPass(self: *Conveyor) void {
-        if (self.core.leader.load(.seq_cst)) self.pass();
+        if (self.leaderHeld()) self.pass();
+    }
+
+    /// The leader latch (seq_cst, the election's own order). The pass
+    /// VENUE re-reads it before every park: an election whose wake landed
+    /// while the venue's fiber was SCHEDULED (woken from its own park on
+    /// the queue mutex inside `unleadAndRecheck`) was a no-op on the
+    /// task-state word — the latch is the truth the word may have
+    /// coalesced away (`conveyor_core_model.PassFiber`; the 2026-10-10
+    /// wedge: 16 committers parked, no pass, every thread asleep).
+    pub fn leaderHeld(self: *const Conveyor) bool {
+        return self.core.leader.load(.seq_cst);
     }
 
     /// The thread the last pass ran on (0 before any).

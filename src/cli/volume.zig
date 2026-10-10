@@ -32,6 +32,11 @@ const meta_set = @import("../meta/meta_set.zig");
 const routing = @import("../meta/routing.zig");
 const set_config = @import("../data/set_config.zig");
 const key = @import("../meta/key.zig");
+// @anchor:ops_jobs_volume_cli — the data-volume lifecycle verbs (rung 8).
+const cli_offline = @import("offline.zig");
+const lifecycle = @import("../ops/lifecycle.zig");
+const lattice = lifecycle.lattice;
+const volume_ops = lifecycle.volume_ops;
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/volume is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -64,8 +69,83 @@ pub fn run(p: cli.Process, v: args.Volume) u8 {
         .remove_meta => |r| withExecutor(p, facts, budget_bytes, RemoveCtx{ .p = p, .opts = opts, .paths = meta.paths, .victim = r.victim }, RemoveCtx.run),
         .repair_set => withExecutor(p, facts, budget_bytes, RepairCtx{ .p = p, .opts = opts, .paths = meta.paths }, RepairCtx.run),
         .migrate_meta_slot => |m| withExecutor(p, facts, budget_bytes, MigrateCtx{ .p = p, .opts = opts, .paths = meta.paths, .slot = m.slot, .target = m.target }, MigrateCtx.run),
+        .add_data => |a| blk: {
+            var body: DataBody = .{ .p = p, .verb = .{ .add = .{ .device = a.device, .no_rebalance = a.no_rebalance } } };
+            break :blk cli_offline.withSet(p, meta_uri, .{ .with_plane = false, .verb = "volume add-data" }, .{ .ctx = &body, .run = DataBody.run });
+        },
+        .remove_data => |r| blk: {
+            var body: DataBody = .{ .p = p, .verb = .{ .remove = .{ .volume = r.volume } } };
+            break :blk cli_offline.withSet(p, meta_uri, .{ .with_plane = true, .verb = "volume remove-data" }, .{ .ctx = &body, .run = DataBody.run });
+        },
+        .undrain => |u| blk: {
+            var body: DataBody = .{ .p = p, .verb = .{ .undrain = .{ .volume = u.volume } } };
+            break :blk cli_offline.withSet(p, meta_uri, .{ .with_plane = false, .verb = "volume undrain" }, .{ .ctx = &body, .run = DataBody.run });
+        },
     };
 }
+
+/// The OFFLINE data-volume verbs over the writer-door set: the lattice's
+/// seven steps through `volume_ops.OfflineWorld`; the add's queued
+/// rebalance and the remove's queued evacuation ride the record's tx and
+/// are adopted by the next mount's fabric (the online drain).
+const DataBody = struct {
+    p: cli.Process,
+    verb: union(enum) {
+        add: struct { device: []const u8, no_rebalance: bool },
+        remove: struct { volume: []const u8 },
+        undrain: struct { volume: []const u8 },
+    },
+
+    fn fail(self: *DataBody, verb: []const u8, e: lattice.Error) u8 {
+        const why: []const u8 = switch (e) {
+            error.LiveWriter => "a live writer holds a member",
+            error.ConfigUndecodable => "the set_config record does not decode (reformat)",
+            error.DeviceRefused => "the device is refused: already a member of this set, unsized, unwritable, or a meta volume",
+            error.CapacityRefused => "the capacity preflight refused (every term printed above)",
+            error.IllegalTransition => "the transition is not in the lattice (only Active drains; only Draining undrains; Retired never comes back — ids are permanent)",
+            error.UnknownVolume => "no such data volume in the set",
+            error.Io => "a device or commit error (see the log)",
+            error.OutOfMemory => "out of memory",
+        };
+        self.p.stderr.print("squeezefs volume {s}: refused: {s}\n", .{ verb, why }) catch {};
+        self.p.stderr.flush() catch {};
+        return cli.exit_failed;
+    }
+
+    fn run(ctx: *anyopaque, set: *cli_offline.Set) u8 {
+        const self: *DataBody = @ptrCast(@alignCast(ctx));
+        const p = self.p;
+        var world: volume_ops.OfflineWorld = .{ .gpa = p.gpa, .io = set.io, .be = set.be, .plane = set.plane };
+        defer world.deinit();
+        switch (self.verb) {
+            .add => |a| {
+                const dev = volume_ops.probeDevice(p.gpa, set.io, a.device, set.be.setUuid(), set.cfg.chunk_size) catch |e| return self.fail("add-data", e);
+                const out = lattice.addData(p.gpa, world.world(), dev, !a.no_rebalance) catch |e| return self.fail("add-data", e);
+                p.stdout.print("added data volume ", .{}) catch {};
+                lattice.writeVolumeId(p.stdout, out.vol_tag) catch {};
+                p.stdout.print(" ({s}, {d} blocks) at config generation {d}", .{ a.device, dev.capacity_blocks, out.config_generation }) catch {};
+                if (out.rebalance_job != 0) p.stdout.print("; queued rebalance job-{x:0>16} at 25 % (the next mount's fabric runs it)", .{out.rebalance_job}) catch {};
+                p.stdout.writeAll("\n") catch {};
+            },
+            .remove => |r| {
+                const tag = (lifecycle.lattice.parseVolumeId(r.volume) orelse return self.fail("remove-data", error.UnknownVolume));
+                const plane = set.plane orelse return self.fail("remove-data", error.Io);
+                const pf = volume_ops.preflightDrain(p.gpa, plane, tag, 1) catch return self.fail("remove-data", error.Io);
+                pf.write(p.stdout) catch {};
+                p.stdout.writeAll("\n") catch {};
+                const job = lattice.removeData(p.gpa, world.world(), tag, pf, true) catch |e| return self.fail("remove-data", e);
+                p.stdout.print("{s} is Draining; queued evacuation job-{x:0>16} — the drain runs on the next mount's fabric (every block moved once via the ONE mover; the volume retires when its census is empty)\n", .{ r.volume, job }) catch {};
+            },
+            .undrain => |u| {
+                const tag = (lifecycle.lattice.parseVolumeId(u.volume) orelse return self.fail("undrain", error.UnknownVolume));
+                lattice.undrain(p.gpa, world.world(), tag) catch |e| return self.fail("undrain", e);
+                p.stdout.print("{s} is Active again; {d} evacuation job(s) cancelled durably\n", .{ u.volume, world.cancelled.items.len }) catch {};
+            },
+        }
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+};
 
 fn list(p: cli.Process, opts: offline.Options, paths: []const []const u8) u8 {
     p.stdout.print("metadata set ({d} member(s) listed):\n", .{paths.len}) catch {};

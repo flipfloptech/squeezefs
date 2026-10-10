@@ -235,6 +235,13 @@ const FamilyEcho = struct {
                 @memset(scratch[0..n], 1);
                 break :blk .{ .ok = .{ .free_blocks = .{ .head = .{ .n = @intCast(n), .reserved = @splat(0) }, .verdicts = scratch[0..n] } } };
             },
+            // @anchor:ops_jobs_loopback_echo — the job block's canned shapes.
+            .job_enroll => .{ .ok = .{ .job_enroll = .{ .heartbeat_ms = 10_000, .lease_ttl_ms = 30_000 } } },
+            .shard_assign => .{ .ok = .{ .shard_assign = .none } },
+            .heartbeat => .{ .ok = .{ .heartbeat = .{ .lease_ttl_ms = 30_000, .verdict = 0, .reserved = @splat(0) } } },
+            .result_submit => .{ .ok = .{ .result_submit = .of(.accepted) } },
+            .read_shard_result => .{ .ok = .{ .read_shard_result = .fresh } },
+            .shard_abandon => .{ .ok = .{ .shard_abandon = .fresh } },
             .ping, .challenge, .prove, .admitted, .refused => unreachable,
         };
     }
@@ -339,6 +346,14 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     const fv = try c.call(.{ .free_blocks = .{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .vol_tag = 11, .lease_epoch = 0 }, .items = &objs } });
     try testing.expectEqual(@as(usize, 2), fv.free_blocks.verdicts.len);
     // Ping is the service's own.
+    // @anchor:ops_jobs_loopback_calls — the job block's six verbs.
+    _ = try c.call(.{ .job_enroll = .{ .pr_key = 0, .caps = 0, .reserved = 0 } });
+    const sa = try c.call(.{ .shard_assign = .{ .caps = 0, .reserved = 0 } });
+    try testing.expect(sa.shard_assign.isNone());
+    _ = try c.call(.{ .heartbeat = .{ .job_id = 1, .shard = 1, .reserved = 0, .shard_fencing = 0 } });
+    _ = try c.call(.{ .result_submit = .{ .head = .{ .ref = .{ .job_id = 1, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .n = 0, .reserved = 0 }, .checksums = &.{} } });
+    _ = try c.call(.{ .read_shard_result = .{ .head = .{ .ref = .{ .job_id = 1, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .len = 0, .reserved = 0 }, .payload = "" } });
+    _ = try c.call(.{ .shard_abandon = .{ .ref = .{ .job_id = 1, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .reason = 1, .reserved = @splat(0) } });
     _ = try c.call(.{ .ping = .{} });
     // Every verb reached daemon 1 exactly once (ping is served before the table).
     var total: u32 = 0;

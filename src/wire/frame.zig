@@ -64,26 +64,35 @@ pub const HANDSHAKE_CAP: u32 = 8 << 10;
 /// record-level mutation (≤ the 64 KiB record cap + a layout publish), a
 /// 1024-row census page (≈ 120 B/row) — the FUSE `max_write` class, which
 /// is the largest thing a daemon moves in one op anywhere. Blocks never
-/// move on the wire; the 16 MiB bulk class is the job fabric's (rung 8)
-/// and lands with it.
+/// move on the wire.
 pub const CONTROL_CAP: u32 = 1 << 20;
-/// The largest payload any frame may carry (= the control cap today).
-pub const MAX_FRAME_PAYLOAD: u32 = CONTROL_CAP;
+/// The job fabric's BULK class (rung 8; `ops/jobs/frames.zig`): a
+/// 64-checksum shard proposal is ~1.6 KiB, a fleet read-shard REPORT can
+/// be MiBs (one finding row per suspect inode of a residue) — 16 MiB holds
+/// a 4-member fleet's share of a 2 M-inode census at ~32 B/row. Only the
+/// three job verbs that carry it read at this cap; the receive buffer
+/// still grows a chunk at a time (the lying-length law).
+pub const BULK_CAP: u32 = 16 << 20;
+/// The largest payload any frame may carry (the bulk class).
+pub const MAX_FRAME_PAYLOAD: u32 = BULK_CAP;
 
 pub const Class = enum(u8) {
     handshake,
     control,
+    bulk,
 
     pub fn cap(self: Class) u32 {
         return switch (self) {
             .handshake => HANDSHAKE_CAP,
             .control => CONTROL_CAP,
+            .bulk => BULK_CAP,
         };
     }
 };
 
 comptime {
     std.debug.assert(HANDSHAKE_CAP < CONTROL_CAP);
+    std.debug.assert(CONTROL_CAP < BULK_CAP);
     std.debug.assert(FRAME_CHUNK_BYTES <= CONTROL_CAP);
 }
 
@@ -506,11 +515,13 @@ test "header screen: magic, version, unknown flags, reserved, len over cap — e
     try testing.expectEqual(Header{ .flags = 0, .len = HANDSHAKE_CAP + 1, .verb = 0, .status = 0, .correlation = 0, .seq = 0, .schema = 6 }, decodeHeader(&bad, CONTROL_CAP).ok);
 }
 
-test "class caps are ordered and named; the chunk is inside the cap" {
+test "class caps are ordered and named; the chunk is inside the cap; the bulk class is the job fabric's 16 MiB" {
     try testing.expect(Class.handshake.cap() < Class.control.cap());
+    try testing.expect(Class.control.cap() < Class.bulk.cap());
     try testing.expectEqual(@as(u32, 8 << 10), Class.handshake.cap());
     try testing.expectEqual(@as(u32, 1 << 20), Class.control.cap());
-    try testing.expectEqual(MAX_FRAME_PAYLOAD, Class.control.cap());
+    try testing.expectEqual(@as(u32, 16 << 20), Class.bulk.cap());
+    try testing.expectEqual(MAX_FRAME_PAYLOAD, Class.bulk.cap());
 }
 
 test "a MACed frame round-trips; tamper, wrong key, reflection (dir flip), reorder (seq) and a stripped MAC are all refused" {

@@ -509,6 +509,11 @@ pub const MetaSet = struct {
         for (self.volumes) |be| try be.stampBlockMapTree();
     }
 
+    /// @anchor:ops_jobs_lifecycle_bit — bit 3 on EVERY member, barriered.
+    pub fn stampVolumeLifecycle(self: *MetaSet) Error!void {
+        for (self.volumes) |be| try be.stampVolumeLifecycle();
+    }
+
     /// The native watermark of slot 0's host (the statfs face of a
     /// one-member set; `allocatedInos` is the set-wide figure).
     pub fn nextIno(self: *const MetaSet) u64 {

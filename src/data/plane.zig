@@ -171,6 +171,8 @@ pub const stats = struct {
     pub var layout_map_merges: counters.ShardedCounter = .{};
     pub var layout_map_merge_blocks: counters.ShardedCounter = .{};
     pub var layout_map_merge_failures: counters.ShardedCounter = .{};
+    /// `layout_republishes`: the ONE mover's republish transactions.
+    pub var layout_republishes: counters.ShardedCounter = .{};
     /// `kvmap_resolve_failures`: a tree-mapped binding the read side could
     /// not resolve (a store error, an undecodable record) — answered as a
     /// miss to the caller, never a fabricated hole without this wire.
@@ -899,6 +901,75 @@ pub const DataPlane = struct {
     pub fn abandonOwnBlock(self: *DataPlane, ob: OwnBlock) void {
         _ = self;
         ob.alloc.abandonUnpublished(ob.idx);
+    }
+
+    // @anchor:ops_jobs_republish — the ONE mover's layout primitive (rung 8).
+
+    pub const RepublishError = error{ Superseded, InputOutput, OutOfMemory };
+
+    /// THE MOVER's republish (charter §8 "copy-then-republish via ONE mover
+    /// primitive"; `ops/lifecycle/mover.zig` step 8): under the (3.7)
+    /// layout lock read the record, require the entry at `block_index` to
+    /// name `expected` (same reference AND the same window — the decoration
+    /// `rel_off/len` is preserved verbatim), swap it for `new` and publish
+    /// in ONE tx whose named-reference diff stages `+dst −src` for this
+    /// owner. A mismatch (a foreground write replaced the mapping, a
+    /// truncate pruned it, a clone re-staged the tenant) is `Superseded` —
+    /// the contractual no-op. The expected-binding compare under the lock
+    /// is strictly stronger than a fencing token (an expected-mismatch IS
+    /// the supersession witness). The caller frees the displaced source
+    /// through `freeBindings` AFTER this returns (RES-1). A block-map-tree
+    /// (kvmap) head is republished through the window merge's own
+    /// transaction shape, which the sweep owns — refused `Superseded` here
+    /// so the mover defers and the census re-plans once the window has
+    /// folded (never a lost binding).
+    pub fn republishBinding(self: *DataPlane, io: Io, ino: u64, block_index: u32, expected: Mapping, new: Mapping, proof: layout.DmaProof) RepublishError!void {
+        const gpa = self.gpa;
+        const lock = self.lockLayout(io, ino);
+        defer lock.release(io);
+        const rec = (self.layoutRecord(ino) catch return error.InputOutput) orelse return error.Superseded;
+        defer gpa.free(rec.value);
+        const prev = layout.XattrLayout.decode(rec.value, self.geo) catch return error.InputOutput;
+        var entries: std.ArrayList(layout.MapEntryWire) = .empty;
+        defer entries.deinit(gpa);
+        const next: layout.Layout = switch (prev.kind) {
+            .packed_ => blk: {
+                if (block_index != 0) return error.Superseded;
+                const cur = prev.lookup(self.chunk, 0) orelse return error.Superseded;
+                if (!cur.sameRef(expected, self.chunk) or cur.rel_off != expected.rel_off or cur.len != expected.len) return error.Superseded;
+                break :blk layout.Layout.packedTenant(prev.size, prev.file_id, new);
+            },
+            .striped => blk: {
+                if (prev.isKvmap()) return error.Superseded;
+                var found = false;
+                for (prev.entries) |e| {
+                    if (e.block() != block_index) {
+                        try entries.append(gpa, e);
+                        continue;
+                    }
+                    const cur = Mapping.decode(e.mapping, self.chunk) catch return error.InputOutput;
+                    if (!cur.sameRef(expected, self.chunk) or cur.rel_off != expected.rel_off or cur.len != expected.len or cur.whole_block != expected.whole_block) return error.Superseded;
+                    try entries.append(gpa, (layout.MapEntry{ .block = block_index, .mapping = new }).encode());
+                    found = true;
+                }
+                if (!found) return error.Superseded;
+                break :blk layout.Layout.stripedInline(prev.size, entries.items);
+            },
+            .inline_, .staged => return error.Superseded,
+        };
+        const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = rec.coll_seq, .prev = prev, .layout = next, .proofs = &.{proof} }, self.refsSeam(), self.geo) catch |e| {
+            self.backend.abandon(t);
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InputOutput,
+            };
+        };
+        self.backend.commit(t) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InputOutput,
+        };
+        stats.layout_republishes.inc();
     }
 
     /// Terminal frees AFTER a landed transaction (RES-1): displaced and
@@ -2407,6 +2478,34 @@ pub const DataPlane = struct {
 
     pub fn probe(self: *DataPlane) op_guard.Probe {
         return .{ .ctx = self, .probe_fn = &probeFn };
+    }
+
+    // @anchor:ops_jobs_mover_faces — the ONE mover's probe + walk (rung 8).
+
+    /// The mover's quiescence probe (`ops_jobs_lifecycle.md` §1.4): a
+    /// referencer with LIVE write-side custody (a RAM buffer, an open
+    /// device-overlay record, parked extents, a staged entry) is not
+    /// quiescent — the task defers and re-plans.
+    pub fn moverQuiescent(self: *DataPlane, ino: u64, block_index: u32) bool {
+        return !self.wp.writeSideView().hasCustody(ino, block_index);
+    }
+
+    /// Every inline-map / packed-tenant binding of every live file (the
+    /// census walk the movers plan from). A block-map-tree head's
+    /// bindings are the sweep's (the mover republishes through the inline
+    /// map and the tenant slot only) and are not yielded.
+    pub fn forEachBinding(self: *DataPlane, comptime Ctx: type, ctx: Ctx, comptime visit: fn (Ctx, u64, u32, Mapping) Error!void) Error!void {
+        const Walk = struct {
+            plane: *DataPlane,
+            inner: Ctx,
+            fn layoutVisit(w: *@This(), ino: u64, l: layout.Layout) Error!void {
+                if (l.isKvmap()) return;
+                var it = l.named(w.plane.chunk);
+                while (it.next()) |e| try visit(w.inner, ino, e.block, e.mapping);
+            }
+        };
+        var w: Walk = .{ .plane = self, .inner = ctx };
+        try self.forEachLayout(*Walk, &w, Walk.layoutVisit);
     }
 
     fn probeFn(ctx: ?*anyopaque, ino: u64, offset: u64, end: u64) ?op_guard.SharedProbe {

@@ -136,9 +136,10 @@ pub const Framer = struct {
         return total;
     }
 
-    /// The cap a header's verb class allows before any payload is read.
+    /// The cap a header's verb class allows before any payload is read
+    /// (an unknown verb reads at the control cap and is refused after).
     pub fn capFor(verb_word: u16) u32 {
-        if (verbs.Verb.fromWire(verb_word)) |v| if (v.isHandshake()) return frame.HANDSHAKE_CAP;
+        if (verbs.Verb.fromWire(verb_word)) |v| return v.class().cap();
         return frame.CONTROL_CAP;
     }
 
@@ -478,6 +479,8 @@ test "two framers back to back: a call and its reply ride (dir, seq) and the MAC
     try testing.expectEqual(frame.HANDSHAKE_CAP, Framer.capFor(0xFFF1));
     try testing.expectEqual(frame.CONTROL_CAP, Framer.capFor(0x0500));
     try testing.expectEqual(frame.CONTROL_CAP, Framer.capFor(0x7777));
+    try testing.expectEqual(frame.BULK_CAP, Framer.capFor(0x0601));
+    try testing.expectEqual(frame.CONTROL_CAP, Framer.capFor(0x0602));
 }
 
 /// A `Link` over two in-memory byte queues (the session tests' pipe; the

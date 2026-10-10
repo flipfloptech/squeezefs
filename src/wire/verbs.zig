@@ -25,8 +25,11 @@
 
 const std = @import("std");
 const codec = @import("codec.zig");
+const frame = @import("frame.zig");
 const endpoint = @import("endpoint.zig");
 const record = @import("../meta/record.zig");
+// @anchor:ops_jobs_verbs — the job fabric's payloads (decision 0003 §G).
+const job_frames = @import("../ops/jobs/frames.zig");
 
 pub const Error = codec.Error;
 pub const Builder = codec.Builder;
@@ -48,6 +51,8 @@ pub const MANAGER_SCHEMA: u32 = 2;
 /// The cross-owner / record-ship block (the reference's meta-ship 3).
 pub const META_SHIP_SCHEMA: u32 = 3;
 pub const TOKEN_SCHEMA: u32 = 1;
+/// The job fabric's block (`ops/jobs/frames.zig`): ours, starts at 1.
+pub const JOB_SCHEMA: u32 = job_frames.JOB_SCHEMA;
 
 pub const Block = enum(u8) {
     wire,
@@ -55,6 +60,8 @@ pub const Block = enum(u8) {
     xv,
     token,
     manager,
+    /// `0x06xx`: the job fabric on the ONE listener (rung 8).
+    job,
 
     pub fn schema(self: Block) u32 {
         return switch (self) {
@@ -62,6 +69,7 @@ pub const Block = enum(u8) {
             .xv => META_SHIP_SCHEMA,
             .token => TOKEN_SCHEMA,
             .manager => MANAGER_SCHEMA,
+            .job => JOB_SCHEMA,
         };
     }
 };
@@ -116,6 +124,13 @@ pub const Verb = enum(u16) {
     resolve_endpoint = 0x05B2,
     publish_roots = 0x05B3,
     grow_ring = 0x05B4,
+    // ---- the job fabric 0x0600 (@anchor:ops_jobs_verb_numbers) ----
+    job_enroll = 0x0600,
+    shard_assign = 0x0601,
+    heartbeat = 0x0602,
+    result_submit = 0x0603,
+    read_shard_result = 0x0604,
+    shard_abandon = 0x0605,
     // ---- the handshake 0xFFF0 (MAC-less, the handshake class cap) ----
     challenge = 0xFFF0,
     prove = 0xFFF1,
@@ -136,12 +151,24 @@ pub const Verb = enum(u16) {
             0x03 => .xv,
             0x04 => .token,
             0x05 => .manager,
+            0x06 => .job,
             else => unreachable,
         };
     }
 
     pub fn schema(self: Verb) u32 {
         return self.block().schema();
+    }
+
+    /// The frame class (the payload cap read before any payload is): the
+    /// handshake, the control class, or the 16 MiB bulk class the job
+    /// fabric's descriptor / proposal / fleet report verbs ride.
+    pub fn class(self: Verb) frame.Class {
+        if (self.isHandshake()) return .handshake;
+        return switch (self) {
+            .shard_assign, .result_submit, .read_shard_result => .bulk,
+            else => .control,
+        };
     }
 
     pub fn isHandshake(self: Verb) bool {
@@ -1574,6 +1601,12 @@ pub fn ReqType(comptime v: Verb) type {
         .resolve_endpoint => ResolveEndpointReq,
         .publish_roots => PublishRootsReq,
         .grow_ring => GrowRingReq,
+        .job_enroll => job_frames.JobEnrollReq,
+        .shard_assign => job_frames.ShardAssignReq,
+        .heartbeat => job_frames.HeartbeatReq,
+        .result_submit => job_frames.ResultSubmitReq,
+        .read_shard_result => job_frames.ReadShardResultReq,
+        .shard_abandon => job_frames.ShardAbandonReq,
         .challenge => Challenge,
         .prove => Prove,
         .admitted => Admitted,
@@ -1617,6 +1650,11 @@ pub fn RepType(comptime v: Verb) type {
         .resolve_endpoint => EndpointReply,
         .publish_roots => RootsPublished,
         .grow_ring => RingGrown,
+        .job_enroll => job_frames.JobEnrolled,
+        .shard_assign => job_frames.ShardDescriptor,
+        .heartbeat => job_frames.HeartbeatAck,
+        .result_submit => job_frames.ResultAck,
+        .read_shard_result, .shard_abandon => Ack,
         // The handshake frames are not calls: no reply type.
         .challenge, .prove, .admitted, .refused => Empty,
     };
@@ -1681,6 +1719,15 @@ test "verb numbers: block-coded, unique, the handshake frames at 0xFFF0, every b
     }
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0508));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0200));
+    try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0606));
+    try testing.expectEqual(Block.job, Verb.job_enroll.block());
+    try testing.expectEqual(JOB_SCHEMA, Verb.result_submit.schema());
+    try testing.expectEqual(frame.Class.bulk, Verb.shard_assign.class());
+    try testing.expectEqual(frame.Class.bulk, Verb.result_submit.class());
+    try testing.expectEqual(frame.Class.bulk, Verb.read_shard_result.class());
+    try testing.expectEqual(frame.Class.control, Verb.heartbeat.class());
+    try testing.expectEqual(frame.Class.control, Verb.join_appender.class());
+    try testing.expectEqual(frame.Class.handshake, Verb.prove.class());
     try testing.expectEqual(Block.manager, Verb.join_appender.block());
     try testing.expectEqual(Block.membership, Verb.renew.block());
     try testing.expectEqual(Block.token, Verb.token_grant.block());

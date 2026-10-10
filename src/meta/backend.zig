@@ -2180,6 +2180,29 @@ pub const KvBackend = struct {
         log.info("meta volume {s}: BLOCK_MAP_TREE stamped at generation {d} (the first block-map-tree crossing; barriered before any map record)", .{ be.path, plan.generation });
     }
 
+    // @anchor:ops_jobs_lifecycle_bit — the lifecycle bit's stamp (rung 8).
+
+    /// Stamp `VOLUME_LIFECYCLE` (bit 3) at the first lifecycle commit — both
+    /// superblock copies, barriered — BEFORE the record tx (bit-before-
+    /// record: a crash after the bit and before the record leaves a set old
+    /// binaries refuse and this binary mounts unchanged). Idempotent.
+    pub fn stampVolumeLifecycle(be: *KvBackend) Error!void {
+        if (be.sb.features_incompat & superblock.volume_lifecycle != 0) return;
+        be.sb_lock.lockUncancelable(be.io);
+        defer be.sb_lock.unlock(be.io);
+        if (be.sb.features_incompat & superblock.volume_lifecycle != 0) return;
+        var sb = be.sb;
+        _ = sb.stampBit(superblock.volume_lifecycle);
+        const plan = superblock.planWrite(sb, be.sb_generation, null) catch return error.Corrupt;
+        for (plan.slice()) |step| {
+            be.pool.writeAt(be.path, step.offset, plan.bytes()) catch return error.Io;
+            if (step.barrier_after) be.dev.barrier() catch return error.Io;
+        }
+        be.sb = sb;
+        be.sb_generation += 1;
+        log.info("meta volume {s}: VOLUME_LIFECYCLE stamped at generation {d} (the first lifecycle commit; barriered before the record)", .{ be.path, plan.generation });
+    }
+
     pub fn nodeSize(be: *const KvBackend) usize {
         return be.sb.node_size;
     }

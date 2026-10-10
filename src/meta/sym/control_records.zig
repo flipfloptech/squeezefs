@@ -59,15 +59,23 @@ pub const Tag = enum(u8) {
     /// what a joiner reads off the device to find volume 0's manager
     /// BEFORE it holds any wire.
     endpoint = 12,
+    // @anchor:ops_jobs_tags — the job fabric's records (decision 0003 §G;
+    // `ops/jobs/records.zig` owns the values): on VOLUME 0 beside
+    // `set_config` and `job:enroll`, keyed so one prefix walk lists every
+    // job in id order.
+    /// `JobRecordV1`: keyed by `job_id u64`.
+    job = 13,
+    /// `JobShardV1`: keyed by `job_id u64 ‖ shard u32`.
+    job_shard = 14,
 
     /// The id bytes behind the two-byte prefix.
     pub fn idLen(self: Tag) usize {
         return switch (self) {
             .slot_state, .slot_tails, .custody_quarantine => 2,
             .extent_grant, .endpoint => 4,
-            .appender_hint, .dead_member, .member => 12,
+            .appender_hint, .dead_member, .member, .job_shard => 12,
             .recovered => 14,
-            .alloc_lease => 8,
+            .alloc_lease, .job => 8,
             .dir_rename, .node_seq_incarnations => 0,
         };
     }
@@ -249,6 +257,34 @@ pub fn volOfRecoveredKey(k: []const u8) ?u16 {
 pub fn volTagOfKey(k: []const u8) ?u64 {
     const tag = tagOfKey(k) orelse return null;
     return if (tag == .alloc_lease) idBe(u64, k, 0) else null;
+}
+
+// @anchor:ops_jobs_keys
+pub fn jobKey(job_id: u64) ControlKey {
+    var k = ControlKey.prefix(.job);
+    k.putBe(u64, job_id);
+    return k;
+}
+
+pub fn jobShardKey(job_id: u64, shard: u32) ControlKey {
+    var k = ControlKey.prefix(.job_shard);
+    k.putBe(u64, job_id);
+    k.putBe(u32, shard);
+    return k;
+}
+
+/// The job id of a `job` or `job_shard` key.
+pub fn jobIdOfKey(k: []const u8) ?u64 {
+    const tag = tagOfKey(k) orelse return null;
+    return switch (tag) {
+        .job, .job_shard => idBe(u64, k, 0),
+        else => null,
+    };
+}
+
+pub fn shardOfKey(k: []const u8) ?u32 {
+    const tag = tagOfKey(k) orelse return null;
+    return if (tag == .job_shard) idBe(u32, k, 8) else null;
 }
 
 // ---------------------------------------------------------------------------

@@ -150,6 +150,44 @@ pub const Volume = union(enum) {
     remove_meta: struct { meta_uri: []const u8, victim: []const u8 },
     repair_set: struct { meta_uri: []const u8 },
     migrate_meta_slot: struct { meta_uri: []const u8, slot: u16, target: u16 },
+    // @anchor:ops_jobs_volume_verbs — the data-volume lifecycle (rung 8).
+    add_data: struct { meta_uri: []const u8, device: []const u8, no_rebalance: bool },
+    remove_data: struct { meta_uri: []const u8, volume: []const u8 },
+    undrain: struct { meta_uri: []const u8, volume: []const u8 },
+};
+
+/// `job {list, status, pause, resume, cancel, throttle, worker,
+/// rotate-enroll}` (charter §8; `ops_jobs_lifecycle.md` §1.10): the
+/// durable-record probes take the `sqmeta://` set; the live controls the
+/// mountpoint's admin lane; `worker` dials a set's coordinator.
+pub const Job = union(enum) {
+    list: struct { target: []const u8, json: bool },
+    status: struct { target: []const u8, job_id: u64 },
+    pause: struct { target: []const u8, job_id: u64 },
+    @"resume": struct { target: []const u8, job_id: u64 },
+    cancel: struct { target: []const u8, job_id: u64 },
+    throttle: struct { target: []const u8, job_id: u64, pct: u8 },
+    worker: struct { meta_uri: []const u8 },
+    rotate_enroll: struct { meta_uri: []const u8 },
+};
+
+/// `defrag TARGET [--data] [--pack] [--volume ID] [--meta] [--fold]
+/// [--rebalance] [--report-only] [--throttle PCT] [--json]` (§3.3).
+pub const Defrag = struct {
+    target: []const u8,
+    data: bool = false,
+    pack: bool = false,
+    volume: ?u64 = null,
+    meta: bool = false,
+    fold: bool = false,
+    rebalance: bool = false,
+    report_only: bool = false,
+    throttle: u8 = 100,
+    json: bool = false,
+
+    pub fn anyArm(self: Defrag) bool {
+        return self.data or self.pack or self.meta or self.fold or self.rebalance or self.report_only;
+    }
 };
 
 /// `bench` (stats_cli.md §3): the shape vocabulary `threads × files × size
@@ -200,6 +238,8 @@ pub const Verb = union(enum) {
     appenders: Appenders,
     appender_clear: AppenderClear,
     volume: Volume,
+    job: Job,
+    defrag: Defrag,
 };
 
 pub const Refusal = union(enum) {
@@ -213,6 +253,9 @@ pub const Refusal = union(enum) {
     bad_uri: uri.Refusal,
     missing_positional: struct { verb: []const u8, what: []const u8 },
     extra_positional: struct { verb: []const u8, word: []const u8 },
+    /// Not `vol-<16 hex>` / `job-<16 hex>` (rung 8's verbs).
+    bad_volume_id: []const u8,
+    bad_job_id: []const u8,
     supervise_without_daemon,
     log_file_without_daemon,
     daemon_without_log_file,
@@ -265,6 +308,8 @@ pub const Refusal = union(enum) {
             .bad_size => |b| try w.print("bench: {s} '{s}' is not a size (<integer>[k|m|g|t], ≥ 1)", .{ b.flag, b.word }),
             .bench_suite_with_shape => |f| try w.print("bench: '{s}' needs a phase flag (-w/-r/--stat/--del) — the bare invocation runs the fixed saturation suite", .{f}),
             .bad_take_slots => |t| try w.print("volume add-meta: --take-slots '{s}' is neither a count (≥ 1) nor a comma list of slot ids (each < 65536)", .{t}),
+            .bad_volume_id => |v| try w.print("'{s}' is not a volume id (vol-<16 hex>)", .{v}),
+            .bad_job_id => |j| try w.print("'{s}' is not a job id (job-<16 hex>, never zero)", .{j}),
         }
     }
 };
@@ -295,6 +340,15 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>
         \\  squeezefs volume repair-set sqmeta://<path>[,…]
         \\  squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>
+        \\  squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…] <device>
+        \\  squeezefs volume remove-data sqmeta://<path>[,…] vol-<16 hex>
+        \\  squeezefs volume undrain sqmeta://<path>[,…] vol-<16 hex>
+        \\  squeezefs job list [--json] sqmeta://<path>|<mountpoint>
+        \\  squeezefs job status|pause|resume|cancel sqmeta://<path>|<mountpoint> job-<16 hex>
+        \\  squeezefs job throttle <mountpoint> job-<16 hex> <pct>
+        \\  squeezefs job worker sqmeta://<path>
+        \\  squeezefs job rotate-enroll sqmeta://<path>
+        \\  squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs bench [-w] [-r] [--stat] [--del] [-t N] [-n N] [-s SIZE] [-b SIZE] [--rand] [--direct] [--time S] [-i N] [--abba] [--json] [--smoke] <mountpoint>
         \\  squeezefs --version
         \\
@@ -314,7 +368,9 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
         .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>\n",
-        .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n",
+        .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n       squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…] <device>\n       squeezefs volume remove-data sqmeta://<path>[,…] vol-<16 hex>\n       squeezefs volume undrain sqmeta://<path>[,…] vol-<16 hex>\n",
+        .job => "usage: squeezefs job list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs job status|pause|resume|cancel sqmeta://<path>|<mountpoint> job-<16 hex>\n       squeezefs job throttle <mountpoint> job-<16 hex> <pct>\n       squeezefs job worker sqmeta://<path>\n       squeezefs job rotate-enroll sqmeta://<path>\n",
+        .defrag => "usage: squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>\n",
         .bench => "usage: squeezefs bench [-w] [-r] [--stat] [--del] [-t THREADS] [-n FILES] [-s SIZE] [-b BLOCK] [--rand] [--direct] [--time SECS] [-i ITERATIONS] [--abba] [--json] [--smoke] <mountpoint>\n",
         .version, .help => all,
     };
@@ -446,6 +502,8 @@ pub fn parse(argv: []const []const u8, diag: *Refusal) Error!Verb {
     if (std.mem.eql(u8, verb, "appender")) return parseAppenderClear(words, diag);
     if (std.mem.eql(u8, verb, "volume")) return parseVolume(words, diag);
     if (std.mem.eql(u8, verb, "bench")) return parseBench(words, diag);
+    if (std.mem.eql(u8, verb, "job")) return parseJob(words, diag);
+    if (std.mem.eql(u8, verb, "defrag")) return parseDefrag(words, diag);
     diag.* = .{ .unknown_verb = verb };
     return error.Refused;
 }
@@ -773,8 +831,159 @@ fn parseVolume(words: []const []const u8, diag: *Refusal) Error!Verb {
         const target = try parseIntWord(diag, "target member index", pos[2], 0, uri.MAX_MEMBERS - 1);
         return .{ .volume = .{ .migrate_meta_slot = .{ .meta_uri = pos[0], .slot = @intCast(slot), .target = @intCast(target) } } };
     }
+    // @anchor:ops_jobs_volume_parse
+    if (std.mem.eql(u8, sub, "add-data")) {
+        var c: Cursor = .{ .verb = "volume add-data", .words = rest, .diag = diag };
+        var no_rebalance = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--no-rebalance")) no_rebalance = true else return c.unknown(f);
+        }
+        const pos = try exactlyTwo(&c, "the sqmeta:// set", "the data device");
+        try checkUri(.meta, pos[0], diag);
+        return .{ .volume = .{ .add_data = .{ .meta_uri = pos[0], .device = pos[1], .no_rebalance = no_rebalance } } };
+    }
+    if (std.mem.eql(u8, sub, "remove-data") or std.mem.eql(u8, sub, "undrain")) {
+        const is_remove = std.mem.eql(u8, sub, "remove-data");
+        var c: Cursor = .{ .verb = if (is_remove) "volume remove-data" else "volume undrain", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const pos = try exactlyTwo(&c, "the sqmeta:// set", "the volume id (vol-<16 hex>)");
+        try checkUri(.meta, pos[0], diag);
+        if (!isVolumeIdWord(pos[1])) {
+            diag.* = .{ .bad_volume_id = pos[1] };
+            return error.Refused;
+        }
+        return .{ .volume = if (is_remove) .{ .remove_data = .{ .meta_uri = pos[0], .volume = pos[1] } } else .{ .undrain = .{ .meta_uri = pos[0], .volume = pos[1] } } };
+    }
     diag.* = .{ .unknown_subverb = .{ .verb = "volume", .word = sub } };
     return error.Refused;
+}
+
+/// `vol-` + 16 hex digits.
+pub fn isVolumeIdWord(w: []const u8) bool {
+    if (w.len != 20 or !std.mem.startsWith(u8, w, "vol-")) return false;
+    for (w[4..]) |c| _ = std.fmt.charToDigit(c, 16) catch return false;
+    return true;
+}
+
+/// `job-` + 16 hex digits, never 0.
+pub fn parseJobIdWord(w: []const u8) ?u64 {
+    if (w.len != 20 or !std.mem.startsWith(u8, w, "job-")) return null;
+    const v = std.fmt.parseInt(u64, w[4..], 16) catch return null;
+    return if (v == 0) null else v;
+}
+
+fn exactlyTwo(c: *Cursor, first: []const u8, second: []const u8) Error![2][]const u8 {
+    const pos = c.pos();
+    if (pos.len < 1) {
+        c.diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = first } };
+        return error.Refused;
+    }
+    if (pos.len < 2) {
+        c.diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = second } };
+        return error.Refused;
+    }
+    if (pos.len > 2) {
+        c.diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[2] } };
+        return error.Refused;
+    }
+    return .{ pos[0], pos[1] };
+}
+
+/// @anchor:ops_jobs_parse — `job *`.
+fn parseJob(words: []const []const u8, diag: *Refusal) Error!Verb {
+    const sub = try subverb("job", words, diag);
+    const rest = words[1..];
+    if (std.mem.eql(u8, sub, "list")) {
+        var c: Cursor = .{ .verb = "job list", .words = rest, .diag = diag };
+        var json = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--json")) json = true else return c.unknown(f);
+        }
+        const target = try exactlyOne(&c, target_what);
+        try checkTarget(target, diag);
+        return .{ .job = .{ .list = .{ .target = target, .json = json } } };
+    }
+    if (std.mem.eql(u8, sub, "worker") or std.mem.eql(u8, sub, "rotate-enroll")) {
+        const is_worker = std.mem.eql(u8, sub, "worker");
+        var c: Cursor = .{ .verb = if (is_worker) "job worker" else "job rotate-enroll", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const target = try exactlyOne(&c, "the sqmeta:// set");
+        try checkUri(.meta, target, diag);
+        return .{ .job = if (is_worker) .{ .worker = .{ .meta_uri = target } } else .{ .rotate_enroll = .{ .meta_uri = target } } };
+    }
+    const Kind = enum { status, pause, @"resume", cancel, throttle };
+    const kind = std.meta.stringToEnum(Kind, sub) orelse {
+        diag.* = .{ .unknown_subverb = .{ .verb = "job", .word = sub } };
+        return error.Refused;
+    };
+    var c: Cursor = .{ .verb = "job", .words = rest, .diag = diag };
+    while (try c.step()) |f| return c.unknown(f);
+    const pos = c.pos();
+    if (pos.len < 1) {
+        diag.* = .{ .missing_positional = .{ .verb = "job", .what = target_what } };
+        return error.Refused;
+    }
+    if (pos.len < 2) {
+        diag.* = .{ .missing_positional = .{ .verb = "job", .what = "the job id (job-<16 hex>)" } };
+        return error.Refused;
+    }
+    try checkTarget(pos[0], diag);
+    const id = parseJobIdWord(pos[1]) orelse {
+        diag.* = .{ .bad_job_id = pos[1] };
+        return error.Refused;
+    };
+    switch (kind) {
+        .throttle => {
+            if (pos.len < 3) {
+                diag.* = .{ .missing_positional = .{ .verb = "job throttle", .what = "the duty pct (1..100)" } };
+                return error.Refused;
+            }
+            if (pos.len > 3) {
+                diag.* = .{ .extra_positional = .{ .verb = "job throttle", .word = pos[3] } };
+                return error.Refused;
+            }
+            const pct = try parseIntWord(diag, "pct", pos[2], 1, 100);
+            return .{ .job = .{ .throttle = .{ .target = pos[0], .job_id = id, .pct = @intCast(pct) } } };
+        },
+        else => {
+            if (pos.len > 2) {
+                diag.* = .{ .extra_positional = .{ .verb = "job", .word = pos[2] } };
+                return error.Refused;
+            }
+            return .{ .job = switch (kind) {
+                .status => .{ .status = .{ .target = pos[0], .job_id = id } },
+                .pause => .{ .pause = .{ .target = pos[0], .job_id = id } },
+                .@"resume" => .{ .@"resume" = .{ .target = pos[0], .job_id = id } },
+                .cancel => .{ .cancel = .{ .target = pos[0], .job_id = id } },
+                .throttle => unreachable,
+            } };
+        },
+    }
+}
+
+/// `defrag` — the arms are flags; `--volume` names a `vol-<16 hex>`.
+fn parseDefrag(words: []const []const u8, diag: *Refusal) Error!Verb {
+    var c: Cursor = .{ .verb = "defrag", .words = words, .diag = diag };
+    var d: Defrag = .{ .target = "" };
+    while (try c.step()) |f| {
+        if (std.mem.eql(u8, f.name, "--data")) d.data = true else if (std.mem.eql(u8, f.name, "--pack")) d.pack = true else if (std.mem.eql(u8, f.name, "--meta")) d.meta = true else if (std.mem.eql(u8, f.name, "--fold")) d.fold = true else if (std.mem.eql(u8, f.name, "--rebalance")) d.rebalance = true else if (std.mem.eql(u8, f.name, "--report-only")) d.report_only = true else if (std.mem.eql(u8, f.name, "--json")) d.json = true else if (std.mem.eql(u8, f.name, "--throttle")) {
+            d.throttle = try parseIntFlag(&c, f, u8, 1, 100);
+        } else if (std.mem.eql(u8, f.name, "--volume")) {
+            const raw = try c.value(f);
+            if (!isVolumeIdWord(raw)) {
+                diag.* = .{ .bad_volume_id = raw };
+                return error.Refused;
+            }
+            d.volume = std.fmt.parseInt(u64, raw[4..], 16) catch unreachable;
+        } else return c.unknown(f);
+    }
+    d.target = try exactlyOne(&c, target_what);
+    try checkTarget(d.target, diag);
+    if (!d.anyArm()) {
+        diag.* = .{ .missing_positional = .{ .verb = "defrag", .what = "an arm: --data, --pack, --meta, --fold, --rebalance or --report-only" } };
+        return error.Refused;
+    }
+    return .{ .defrag = d };
 }
 
 /// A positional integer through the ONE parser.

@@ -35,6 +35,9 @@ pub const clone = if (is_linux) @import("clone.zig") else struct {};
 pub const config_verb = if (is_linux) @import("config_verb.zig") else struct {};
 pub const staging_verb = if (is_linux) @import("staging_verb.zig") else struct {};
 pub const volume = if (is_linux) @import("volume.zig") else struct {};
+// @anchor:ops_jobs_cli — the job fabric and defrag verbs (rung 8).
+pub const job = if (is_linux) @import("job.zig") else struct {};
+pub const defrag_verb = if (is_linux) @import("defrag.zig") else struct {};
 /// Portable planning + a Linux engine (its own gate inside).
 pub const tune = @import("tune.zig");
 pub const bench = @import("bench.zig");
@@ -98,6 +101,8 @@ pub fn run(p: Process) u8 {
         .appenders => |a| return if (is_linux) appenders.run(p, a) else linuxOnly(p, "appenders"),
         .appender_clear => |a| return if (is_linux) appenders.runClear(p, a) else linuxOnly(p, "appender clear"),
         .volume => |v| return if (is_linux) volume.run(p, v) else linuxOnly(p, "volume"),
+        .job => |j| return if (is_linux) job.run(p, j) else linuxOnly(p, "job"),
+        .defrag => |d| return if (is_linux) defrag_verb.run(p, d) else linuxOnly(p, "defrag"),
     }
 }
 
@@ -139,6 +144,8 @@ test {
         _ = config_verb;
         _ = staging_verb;
         _ = volume;
+        _ = job;
+        _ = defrag_verb;
         _ = bench_smoke;
     }
 }

@@ -91,6 +91,10 @@ const mem_budget = @import("../mem/budget.zig");
 const wire_stats = @import("../wire/stats.zig");
 const ipc = @import("../ipc/ipc.zig");
 const ipc_host_stats = @import("../ipc/host/stats.zig");
+// @anchor:ops_jobs_stats — the job fabric, the lifecycle/mover, defrag.
+const jobs_stats = @import("../ops/jobs/stats.zig");
+const lifecycle_stats = @import("../ops/lifecycle/stats.zig");
+const defrag_metrics = @import("../ops/defrag/metrics.zig");
 
 pub const Error = Writer.Error;
 
@@ -201,6 +205,7 @@ pub const families = [_]Family{
     .{ .name = "io", .write = writeIo },
     .{ .name = "mem_budget", .write = writeMemBudget },
     .{ .name = "ops", .write = writeOps },
+    .{ .name = "jobs", .write = writeJobs },
     .{ .name = "op_trace", .write = writeOpTrace },
     .{ .name = "cpu", .write = writeCpu },
     .{ .name = "wire", .write = writeWire },
@@ -266,6 +271,9 @@ pub const sources = [_]Source{
     .{ .path = "src/ipc/ipc.zig", .family = "ipc" },
     .{ .path = "src/ipc/host/stats.zig", .family = "ipc_host" },
     .{ .path = "src/stats/stats.zig", .family = "stats" },
+    .{ .path = "src/ops/jobs/stats.zig", .family = "jobs" },
+    .{ .path = "src/ops/lifecycle/stats.zig", .family = "jobs" },
+    .{ .path = "src/ops/defrag/metrics.zig", .family = "jobs" },
 };
 
 /// A counter-bearing module whose instruments another module's writer
@@ -606,6 +614,18 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
 
 fn writeOpTrace(_: *Sources, w: *Writer) Error!void {
     try op_trace.writeGaugesJson(w);
+}
+
+/// The `job_*` / `evacuate_*` / `volume_*` / `frag_*` / `pack_compaction_*`
+/// family: the fabric, the mover + lifecycle, the defrag axes (rung 8).
+fn writeJobs(_: *Sources, w: *Writer) Error!void {
+    try w.writeAll("{\"fabric\":");
+    try jobs_stats.writeStatsJson(w);
+    try w.writeAll(",\"lifecycle\":");
+    try lifecycle_stats.writeStatsJson(w);
+    try w.writeAll(",\"defrag\":");
+    try defrag_metrics.writeStatsJson(w);
+    try w.writeByte('}');
 }
 
 /// ONE sample per render: the per-thread classes BEFORE the process total

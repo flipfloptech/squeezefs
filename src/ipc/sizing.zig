@@ -57,6 +57,9 @@ pub const ipcSessionPopulationTarget = mem_sizing.ipcSessionPopulationTarget;
 pub const ipcSessionPopulationFloor = mem_sizing.ipcSessionPopulationFloor;
 pub const ipcAdmittedPopulation = mem_sizing.ipcAdmittedPopulation;
 pub const ipcPerUidSessionCap = mem_sizing.ipcPerUidSessionCap;
+/// `min(1024, arena / 64 KiB)`: an arena that yielded carries fewer slots
+/// of the shipped 64 KiB slab (the async per-op ceiling), never smaller ones.
+pub const ipcSlotsForArena = mem_sizing.ipcSlotsForArena;
 
 /// The host's face: `SQUEEZEFS_IPC_ARENA_MB` verbatim else the derived
 /// arena, the default geometry's overhead charged per session.
@@ -316,7 +319,13 @@ test "the HELLO ladder on a bounded budget admits the population floor: 9 cpus a
         const arena = resolveIpcArenaBytes(null, cap, shape.cpus, layout.DEFAULT_SESSION_OVERHEAD_BYTES);
         var geometry = layout.Geometry.default;
         geometry.arena_bytes = arena;
+        geometry.slots = ipcSlotsForArena(arena);
         geometry.max_op_bytes = @intCast(@min(layout.DEFAULT_MAX_OP_BYTES, arena));
+        // The per-op shape survives the yield: the slab is the shipped 64 KiB
+        // (or larger, as the charter's derivation grows it), a 32 KiB libaio
+        // iocb always rides one slot.
+        try testing.expect(geometry.slotSlab() >= mem_sizing.ipc_slab_floor_bytes);
+        try testing.expect(geometry.slots >= 64);
         var p: rendezvous.Policy = .{ .armed = true, .our_commit = "0123456789ab", .default_geometry = geometry, .arena_cap_bytes = cap, .per_uid_session_cap = ipcPerUidSessionCap(cap, arena) };
         const nonces = rendezvous.NonceState.init(&testNonceFill, 0);
         var h: wire.Hello = .{};
@@ -340,7 +349,11 @@ test "the HELLO ladder on a bounded budget admits the population floor: 9 cpus a
             }
         }
         try testing.expect(admitted >= ipcSessionPopulationFloor(shape.cpus));
-        try testing.expectEqual(ipcAdmittedPopulation(cap, arena + layout.DEFAULT_SESSION_OVERHEAD_BYTES), admitted);
+        // The derivation's census charges the DEFAULT layout's overhead; a
+        // session with fewer slots is lighter, so the census is conservative.
+        try testing.expect(admitted >= ipcAdmittedPopulation(cap, arena + layout.DEFAULT_SESSION_OVERHEAD_BYTES));
+        const footprint = (try layout.SessionLayout.compute(geometry)).total_bytes;
+        try testing.expectEqual(ipcAdmittedPopulation(cap, footprint), admitted);
     }
 }
 

@@ -188,6 +188,7 @@ pub const IpcHost = struct {
         const max_op = sizing.maxOpBytesFromEnv(d.env, d.block_size);
         var geometry = layout.Geometry.default;
         geometry.arena_bytes = arena_bytes;
+        geometry.slots = sizing.ipcSlotsForArena(arena_bytes);
         geometry.max_op_bytes = @intCast(@min(max_op, arena_bytes));
         const footprint = (layout.SessionLayout.compute(geometry) catch return error.OutOfMemory).total_bytes;
         const ctl_cap = sizing.ctlConnCap(arena_cap, footprint);
@@ -322,7 +323,7 @@ pub const IpcHost = struct {
         d.il0_bind(d.il0_ctx, .{ .ctx = self, .synthesize = &synthesizeFn });
         const population = sizing.ipcAdmittedPopulation(arena_cap, footprint);
         const population_floor = sizing.ipcSessionPopulationFloor(cpus);
-        log.info("ipc: interception armed — socket {s}{s}{s}; {d} service lane(s), {d} dd shard(s), arena {d} MiB × cap {d} MiB = {d} session(s) (population floor {d}), ctl cap {d}", .{ name, if (self.path != null) " + " else "", if (self.path) |p| p.path() else "", ceiling, dd_shards, arena_bytes >> 20, arena_cap >> 20, population, population_floor, ctl_cap });
+        log.info("ipc: interception armed — socket {s}{s}{s}; {d} service lane(s), {d} dd shard(s), arena {d} MiB ({d} slots × {d} KiB) × cap {d} MiB = {d} session(s) (population floor {d}), ctl cap {d}", .{ name, if (self.path != null) " + " else "", if (self.path) |p| p.path() else "", ceiling, dd_shards, arena_bytes >> 20, geometry.slots, geometry.slotSlab() >> 10, arena_cap >> 20, population, population_floor, ctl_cap });
         // The arena already yielded to the floor down to its 4 MiB grain:
         // only the budget can admit more sessions.
         if (population < population_floor) log.warn("ipc: the admission cap {d} MiB holds {d} session(s) of {d} MiB — under the population floor {d} (2 × {d} cpus): client processes past it are kernel-served; raise SQUEEZEFS_MEM_BUDGET_MB or SQUEEZEFS_IPC_MEM_PCT", .{ arena_cap >> 20, population, arena_bytes >> 20, population_floor, cpus });

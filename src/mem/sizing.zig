@@ -126,6 +126,24 @@ pub fn ipcAdmittedPopulation(arena_cap_bytes: u64, footprint_bytes: u64) u64 {
     return arena_cap_bytes / @max(footprint_bytes, 1);
 }
 
+/// The shipped slot slab: 64 MiB / 1024 slots. It is the ring's per-op
+/// ceiling for an async op (libaio's one-iocb-one-slot law routes a larger
+/// iocb to the kernel) and the hybrid lane gate's floor, so it holds when
+/// the arena yields: an arena under 64 MiB carries FEWER slots of this
+/// slab, not smaller slabs.
+pub const ipc_slab_floor_bytes: u64 = 64 * 1024;
+/// The default slot count (`layout.DEFAULT_SLOTS`; the ring is sized to it).
+pub const ipc_default_slots: u64 = 1024;
+
+/// Slots per session for an arena: `min(1024, arena / 64 KiB)` — the
+/// shipped 1024 at and above the shipped arena (a larger arena grows the
+/// slab, as the charter's derivation does), fewer slots of the shipped slab
+/// below it. The floor is the 4 MiB DMA grain's 64 slots = 2 × fio's QD32:
+/// per-session depth is what a bounded budget trades, never the per-op shape.
+pub fn ipcSlotsForArena(arena_bytes: u64) u32 {
+    return @intCast(@max(1, @min(ipc_default_slots, arena_bytes / ipc_slab_floor_bytes)));
+}
+
 /// Per-uid concurrent session cap = `clamp(cap / max(arena, 1), 64, 4096)`:
 /// the population the admission cap can actually hold. Floor 64 = the
 /// shipped posture (it refused half of a 131-session budget: 22.5 GiB over
@@ -326,6 +344,23 @@ test "the arena yields to the population floor on a bounded budget: the largest 
                 try testing.expectEqual(@as(u64, 0), got % ipc_arena_dma_align_bytes);
             }
         }
+    }
+}
+
+test "ipc slots for an arena = min(1024, arena / 64 KiB): the shipped 1024 at and above 64 MiB, fewer slots of the 64 KiB slab below it, 64 at the 4 MiB grain" {
+    try testing.expectEqual(@as(u64, 64 * 1024), ipc_slab_floor_bytes);
+    try testing.expectEqual(ipc_arena_floor_bytes / ipc_default_slots, ipc_slab_floor_bytes);
+    try testing.expectEqual(@as(u32, 1024), ipcSlotsForArena(64 * MiB));
+    try testing.expectEqual(@as(u32, 1024), ipcSlotsForArena(88 * MiB));
+    try testing.expectEqual(@as(u32, 1024), ipcSlotsForArena(176 * MiB));
+    try testing.expectEqual(@as(u32, 640), ipcSlotsForArena(40 * MiB));
+    try testing.expectEqual(@as(u32, 448), ipcSlotsForArena(28 * MiB));
+    try testing.expectEqual(@as(u32, 192), ipcSlotsForArena(12 * MiB));
+    try testing.expectEqual(@as(u32, 64), ipcSlotsForArena(4 * MiB));
+    try testing.expectEqual(@as(u32, 1), ipcSlotsForArena(1));
+    // The venue's shapes keep the shipped slab: arena / slots = 64 KiB.
+    for ([_]u64{ 4, 12, 28, 40, 64 }) |arena_mib| {
+        try testing.expectEqual(ipc_slab_floor_bytes, arena_mib * MiB / ipcSlotsForArena(arena_mib * MiB));
     }
 }
 

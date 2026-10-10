@@ -270,17 +270,20 @@ pub fn build(b: *std.Build) void {
         // (untracked paths: no step the library could cycle on).
         const record = b.addTest(.{ .name = "squeezefs-bench-baseline", .root_module = squeezefs_mod, .filters = &.{"bench baseline:"} });
         const run_record = gated(b.addRunArtifact(record), release_gate);
+        run_record.setEnvironmentVariable("SQUEEZEFS_TEST_BENCH_RIG", "1");
         run_record.has_side_effects = true;
         run_record.step.dependOn(b.getInstallStep());
         bench_baseline_step.dependOn(&run_record.step);
         const compare = b.addTest(.{ .name = "squeezefs-bench-compare", .root_module = squeezefs_mod, .filters = &.{"bench compare:"} });
         const run_compare = gated(b.addRunArtifact(compare), release_gate);
+        run_compare.setEnvironmentVariable("SQUEEZEFS_TEST_BENCH_RIG", "1");
         run_compare.has_side_effects = true;
         run_compare.step.dependOn(b.getInstallStep());
         bench_compare_step.dependOn(&run_compare.step);
         // In the release gate the judge runs AFTER the whole per-commit gate:
         // its numbers never share the venue with a smoke's mounts.
         const run_compare_after_gate = gated(b.addRunArtifact(compare), release_gate);
+        run_compare_after_gate.setEnvironmentVariable("SQUEEZEFS_TEST_BENCH_RIG", "1");
         run_compare_after_gate.has_side_effects = true;
         run_compare_after_gate.step.dependOn(gate_step);
         run_compare_after_gate.step.dependOn(b.getInstallStep());

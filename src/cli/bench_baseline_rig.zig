@@ -39,6 +39,9 @@ comptime {
 const testing = std.testing;
 
 const squeezefs_bin = bench_options.install_prefix ++ "/bin/squeezefs";
+/// The build steps arm the rig; the unit run (which sees the installed
+/// binary too) is not the rig's step.
+const rig_knob = "SQUEEZEFS_TEST_BENCH_RIG";
 
 /// The baseline shape (module doc).
 const threads: u32 = 2;
@@ -95,6 +98,7 @@ const Facts = struct {
 };
 
 fn venueMissing(io: Io) ?testkit.Why {
+    if (std.testing.environ.getPosix(rig_knob) == null) return .{ .class = .other_step, .detail = "the baseline rig runs under `zig build bench-baseline` / `bench-compare` (" ++ rig_knob ++ " unset)" };
     Io.Dir.cwd().access(io, squeezefs_bin, .{}) catch return .{ .class = .other_step, .detail = "the installed binary is absent (the bench-baseline / bench-compare steps install it)" };
     return testkit.venue.root() orelse testkit.venue.devFuse() orelse testkit.venue.capSysAdmin(io);
 }

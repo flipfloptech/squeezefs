@@ -112,8 +112,8 @@ mdtest's stonewall refuses a branching tree, F11); `renames.py` (rounds of
 untimed creates → timed rename+unlink, Δ`meta_kv_journal_entries` ÷ ops over
 the timed spans alone); `tar -x` of a 500 × 20 synthetic tree (1–4 KiB files)
 repeated for the span, N extractions in flight; `io500.sh` (one io500 run
-with the datadir on a mount, the ledgers around it). Shim rows use psync
-(F3). Provenance: fio 3.36 (Ubuntu 24.04), OpenMPI 4.1.6, IOR/mdtest
+with the datadir on a mount, the ledgers around it). Shim rows used psync
+on this first day (F3; libaio since `613b1c6`). Provenance: fio 3.36 (Ubuntu 24.04), OpenMPI 4.1.6, IOR/mdtest
 `io500-sc19-605-g5528b36` (= io500's pinned `5528b3619236d475`), io500
 `io500-sc26_v1` (34a596582715934d2f7695302a7c51e8f7e73d9a) with pfind
 27427343bb66f525b93d225d1f124cbed440d0b5, gcc 13.3, built into
@@ -339,6 +339,21 @@ internally to its own `io_setup` — the shim never sees the context and its
 (INVALID). Fix: interpose `io_queue_init` / `io_queue_release` (and treat any
 unknown context as a passthrough that is COUNTED). The shim rows here use
 psync (QD1 × N) and say so.
+Resolution: `613b1c6` — libaio binds its internal calls locally (Ubuntu's
+`-Bsymbolic-functions`; `objdump -R libaio.so.1` has no `io_*` relocation), so
+the shim now interposes libaio's queue face (`io_queue_init`/`release`/
+`run`/`wait`, 65 interpositions + the API) with libaio's own bodies over its
+wrappers; an unregistered context is a counted passthrough
+(`aio_unknown_ctx_op` per bound iocb → the daemon's
+`ipc_client_aio_unknown_ctx_ops`; `aio_unknown_ctx_call` per
+getevents/cancel). Tests: `interpose` "io_queue_init is libaio's body over the
+shim's io_setup…", `aio` "io_queue_run's body…", `e2e` "fio's shape — a
+context from libaio's io_queue_init rides the ring…". Verified with fio 3.36
+libaio QD32 × 4 rand-4k reads through the shim: file substrate
+`Δipc_ops_read 194,299 ≡ fio ops 194,299`, nvmet-loop `166,973 ≡ 166,973`,
+`ipc_client_aio_unknown_ctx_ops 0`, `engagement_shim` VALID. The shim rows run
+libaio again (`BRK_IOENGINE=psync` is the QD1 control); `docs/porting/il_shim.md`
+§6.9; 0002 row 443.
 
 F4. **IL admission cap vs. a bounded budget** (sizing law). The daemon admits
 IL sessions up to `budget/8` at a 64 MiB arena each; at `SQUEEZEFS_MEM_BUDGET_MB=2048`
@@ -347,6 +362,26 @@ exhausted (class 5)") and silently falls back to kernel FUSE — the engagement
 law caught it (72 % of ops through the ring). On the box: 32 processes ×
 2 sessions × 64 MiB = 4 GiB of arenas needs a ≥ 32 GiB budget, or the cap
 must derive from the population.
+Resolution: `613b1c6` — the charter's arena `max(64 MiB, align_down(cap /
+population_target, 4 MiB))` yields to a population floor of `2 × cpus`
+sessions (one client process per CPU at the shim's per-mount session floor):
+the largest 4 MiB-aligned arena at which the floor's sessions (arena + the
+layout's 148 KiB overhead each) fit the cap, never below the 4 MiB DMA grain
+(`mem/sizing.resolveIpcArenaBytes`, `ipcSessionPopulationFloor`,
+`ipcAdmittedPopulation`; the field shape is byte-identical). The arm line
+prints the census and warns under the floor; a client open the refusal's
+backoff window kernel-serves counts `establish_refused` (it read `not_ours`).
+Tests: `mem/sizing` "the arena yields to the population floor…" (2 GiB ⇒
+12 MiB arenas, 21 sessions; 6144 MiB ⇒ 40 MiB, 19), `ipc/sizing` "the HELLO
+ladder on a bounded budget admits the population floor…" (admitHello admits
+≥ 2 × cpus at every shape), `shim/classify` "…every open the backoff
+kernel-serves is the refusal's fallback". Venue: the arm line read `arena
+12 MiB × cap 256 MiB = 21 session(s) (population floor 18)` at 2048 MiB,
+`28 MiB × 512 MiB = 18` at 4096, `40 MiB × 768 MiB = 19` at 6144; at 6144 all
+four fio processes paired (`ipc_admission_refusals 0`). At 2048 the shared
+cgroup still reads Red (F5) and the R5 shed target refused 3 of 4 sessions
+(`ipc_shed_refusals 3`) — the budget authority's row, not the cap's.
+Decision 0003 §H; 0002 rows 442, 444.
 
 F5. **The budget authority reads the whole container** (sizing law). R5's
 `pressure = max(Σ gauges, rss_max, unreclaim_max)` with `unreclaim` = the
@@ -379,6 +414,14 @@ F8. **SafeAllocator leak at exit** (product, small): 144 B from
 `src/ops/nvmet/initiator.zig:875` (`sample`: `prev.live = cur.live` drops the
 previous controller list) on every mount over nvme namespaces once `.stats`
 has been rendered — one `error(` line per daemon lifetime on every nvmet row.
+Resolution: fixed by `9949e79` (landed the same morning, after the measured
+`ce0edf4`): the retained controller identities live on the process allocator,
+never a render's (`sampleWith`), with the red-first test "the process
+sampler's retained identities live on the process allocator: a sample through
+a per-render allocator leaves NOTHING live in it…" (two renders, controllers
+present). Verified at `613b1c6` on nvmet-loop (3 fabric controllers,
+`stats_builds 12`): the daemon log carries 0 `leaked`/`SafeAllocator` lines
+through the clean unmount.
 
 F9. **`rewrite_device_write_bytes` is not a second device write**
 (accounting). On a 22.28 GB overwrite row: `overlay_store_bytes` 22.17 GB +
@@ -386,6 +429,13 @@ F9. **`rewrite_device_write_bytes` is not a second device write**
 epoch counts the same overlay DMA it was fed. `src/cli/bench.zig`'s
 `device_write_keys` sums both and over-reports amplification (1.27 here);
 the harness reports it beside. bench.zig should follow.
+Resolution: `613b1c6` — `bench.StatsTerms.device_write_keys` is brk.py's
+`DEVICE_WRITE_ARMS` (`overlay_store_bytes, patch_write_bytes,
+own_block_dma_bytes, durable_upload_bytes_escalation,
+durable_upload_bytes_writeback`), `rewrite_device_write_bytes` is read beside;
+`device_write_req_keys` = `DEVICE_WRITE_REQS` (`patch_writes, own_block_dmas,
+put_obj`). The rail "bracket ledger pin…" (`tests/rails.zig`) holds the four
+lists equal to brk.py's and the two gauges beside in both.
 
 F10. **Reads on a zero-copy session never reach a handler lane**
 (accounting). An O_DIRECT READ the warm ladder cannot answer is served at the
@@ -395,6 +445,18 @@ nor do the data plane's `read_copy_*` arms. An engagement or copy ledger
 built on `fuse_ops` / `read_copy_*` alone (as bench.zig's) reads 0 for every
 read row; the harness uses `transport_ring_requests` and adds the transport's
 serve arms.
+Resolution: `613b1c6` — bench's read ledger is brk.py's `READ_COPY_ARMS`
+(11 terms: the plane's `read_copy_*`/`read_dest_dma_bytes`/`read_zc_serve_bytes`
+plus `transport_zc_serve_bytes` and `transport_zc_bounce_bytes_bridged`;
+`read_dest_lease_bytes` beside, F15), its engagement term is
+`transport_ring_requests` with `fuse_ops` printed as the handler-lane share
+and `transport_zc_direct_legs`/`transport_zc_serve_bytes` beside; the rail
+pins the list. The §6 owed rail landed with it: "stats name census: every
+name in brk.py's ALL_COUNTERS is a `.stats` key the product emits" (116 names
+against the source census of instrument declarations and the family writers'
+keys) — its first run caught `transport_wake_elided` (the key is
+`transport_wakes_elided`; it had read 0 under `absent_keys`) and the
+client-page-only `lane_gate_threshold_bytes`.
 
 F11. mdtest's `-W` stonewall "does only work with a branch factor ≤ 1": a
 many-dirs creates row cannot be time-boxed by the instrument; the harness
@@ -465,13 +527,8 @@ meta 517 µs of 1 343 µs on nvmet-loop over a file backend).
 ## 6. Owed
 
 - Red-first repros for F1 (conveyor wedge), F2 (EAGAIN to a blocking write),
-  F6 (journal lane tick rescues), F3 (shim `io_queue_init`), F8 (leak);
-  bench.zig's device-write arms (F9) and read engagement (F10) aligned with
-  `brk.py`'s.
-- `brk.py`'s ledger term list is a second registry of `.stats` names; a rail
-  that checks every name in `brk.ALL_COUNTERS` against the stats schema (the
-  way `tests/rails.zig` checks knobs) would turn a renamed counter into a red
-  gate instead of an `absent_keys` entry.
+  F6 (journal lane tick rescues). (F3, F4, F8, F9, F10 are resolved above:
+  `613b1c6`; the `brk.ALL_COUNTERS` rail landed with them.)
 - The harness runs the A/B over binaries and over the format posture; the
   lever over a `SQUEEZEFS_*` A/B knob (same binary, knob on/off) is the next
   lever to add.

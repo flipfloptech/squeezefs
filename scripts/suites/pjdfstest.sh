@@ -16,9 +16,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 PJD_REPO=${PJD_REPO:-https://github.com/pjd/pjdfstest}
 PJD_DIR="$SUITES_ROOT/pjdfstest"
-# The gate-time subset (`zig build suites-smoke`): one directory per
-# syscall family, ~2 minutes — the full suite is the release gate.
-PJD_SMOKE_TESTS="chmod chown link mkdir mkfifo mknod open rename rmdir symlink truncate unlink utimensat"
+# The gate-time subset (`zig build suites-smoke`): the handler families
+# that carry semantics of our own (modes, ownership, the rename matrix,
+# truncate, the unlink/open-count law, times) — 141 of the 238 files at the
+# measured 0.77 s/file ≈ 110 s + format/mount/fsck ≈ 2 minutes. link,
+# mkfifo, rmdir and symlink ride the full suite (the release gate).
+PJD_SMOKE_TESTS="chmod chown mkdir mknod open rename truncate unlink utimensat"
 
 pjd_build() {
   if [ ! -d "$PJD_DIR/.git" ]; then

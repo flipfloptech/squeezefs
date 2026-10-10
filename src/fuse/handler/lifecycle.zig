@@ -423,7 +423,7 @@ pub fn Dispatcher(comptime Transport: type) type {
                     // copy path's page_zeroing; under zero-copy the bytes
                     // are already the kernel's) — never for O_DIRECT.
                     var reply = codec.replyRead(u, c.window[0..d.len], r.size);
-                    if (r.flags & O_DIRECT == 0) reply.zero_pad = codec.readZeroTail(c.window, reply.body.len, r.size, std.heap.pageSize());
+                    if (r.flags & O_DIRECT == 0) reply.zero_pad = codec.readZeroTail(c.window, reply.body.len, r.size);
                     return reply;
                 },
                 .write => |w| {

@@ -750,17 +750,19 @@ pub fn replyRead(unique: u64, data: []const u8, size: u32) Reply {
 /// The kernel's `page_zeroing` for a paged READ (`fuse_do_readfolio`,
 /// `fuse_send_readpages`): a SHORT reply leaves every requested page the
 /// bytes did not fill ZERO — the classical copy clears each partial page
-/// before copying into it. Under zero-copy the daemon's bytes land in
-/// the installed pages with no kernel copy, so the daemon zero-completes
-/// `window[len .. end)` itself, `end` = the request's size rounded up to
-/// the page (the installed pages), bounded by the window. An O_DIRECT
-/// read has no page_zeroing (the kernel never zeroes a user buffer past
-/// the returned count): its callers skip this. Found by LTP fs gf18: a
-/// 1,959-byte inline file read into page 0 left [1959, 4096) as the
-/// page's old garbage, marked uptodate; a later 1-byte extend made the
-/// garbage readable in the new hole.
-pub fn readZeroTail(window: []u8, len: usize, size: u32, page: usize) u32 {
-    const end: usize = @intCast(@min(window.len, derive.alignUp(@min(size, window.len), page)));
+/// before copying into it, and every requested page past the reply. Under
+/// zero-copy the daemon's bytes land in the installed pages with no kernel
+/// copy, so the daemon zero-completes `window[len .. end)` itself, `end` =
+/// the request's size (a page-cache read asks whole pages; the installed
+/// buffer is EXACTLY `size` long — a direct-io read's user buffer may be
+/// shorter than its last page, and a DMA past it is EFAULT), bounded by
+/// the window. An O_DIRECT read has no page_zeroing (the kernel never
+/// zeroes a user buffer past the returned count): its callers skip this.
+/// Found by LTP fs gf18: a 1,959-byte inline file read into page 0 left
+/// [1959, 4096) as the page's old garbage, marked uptodate; a later 1-byte
+/// extend made the garbage readable in the new hole.
+pub fn readZeroTail(window: []u8, len: usize, size: u32) u32 {
+    const end: usize = @min(window.len, @as(usize, size));
     if (len < end) @memset(window[len..end], 0);
     return @intCast(@max(end, @min(len, window.len)));
 }
@@ -1506,23 +1508,23 @@ test "data replies are zero-copy views; READ truncates to size; the oversize rul
     try testing.expectEqual(@as(u32, 16), eio.header.len);
 }
 
-test "readZeroTail: a short paged READ zero-completes the requested pages past the served bytes (the copy path's page_zeroing), bounded by the window; a full reply and a reply past the request's last page touch nothing" {
+test "readZeroTail: a short paged READ zero-completes the request past the served bytes (the copy path's page_zeroing) — never past the request's size (the installed buffer's exact length), bounded by the window; a full reply touches nothing" {
     var win: [3 * 4096]u8 = @splat(0xAA);
     // 1,959 of 8,192 requested: [1959, 8192) zero, the third page untouched.
-    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 1959, 8192, 4096));
+    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 1959, 8192));
     try testing.expect(std.mem.allEqual(u8, win[0..1959], 0xAA));
     try testing.expect(std.mem.allEqual(u8, win[1959..8192], 0));
     try testing.expect(std.mem.allEqual(u8, win[8192..], 0xAA));
-    // An unaligned request size rounds up to its last page.
+    // An unaligned request (a direct-io user buffer): zero to ITS end, not the page's.
     win = @splat(0xAA);
-    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 100, 4097, 4096));
-    try testing.expect(std.mem.allEqual(u8, win[100..8192], 0));
-    try testing.expect(std.mem.allEqual(u8, win[8192..], 0xAA));
+    try testing.expectEqual(@as(u32, 4097), readZeroTail(&win, 100, 4097));
+    try testing.expect(std.mem.allEqual(u8, win[100..4097], 0));
+    try testing.expect(std.mem.allEqual(u8, win[4097..], 0xAA));
     // Full reply: nothing zeroed. A request wider than the window is bounded.
     win = @splat(0xAA);
-    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 8192, 8192, 4096));
+    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 8192, 8192));
     try testing.expect(std.mem.allEqual(u8, &win, 0xAA));
-    try testing.expectEqual(@as(u32, win.len), readZeroTail(&win, 12000, 1 << 20, 4096));
+    try testing.expectEqual(@as(u32, win.len), readZeroTail(&win, 12000, 1 << 20));
     try testing.expect(std.mem.allEqual(u8, win[0..12000], 0xAA));
     try testing.expect(std.mem.allEqual(u8, win[12000..], 0));
 }

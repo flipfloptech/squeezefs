@@ -2212,7 +2212,7 @@ pub const Group = struct {
         // A short serve (EOF inside the requested pages) takes the copy arm:
         // the fill-pool view has no zeros to bridge past its bytes.
         const served: usize = @min(fs.body.len, in.size);
-        const padded = in.flags & O_DIRECT == 0 and served < @min(derive.alignUp(in.size, std.heap.pageSize()), self.payload_len);
+        const padded = in.flags & O_DIRECT == 0 and served < @min(in.size, self.payload_len);
         if (self.shared.zeroCopy() and m.slots.ent(e).dir == .dest and fs.body.len > 0 and !padded) {
             self.hooks[gent] = fs.done;
             self.local_msgs[gent] = commit_queue.Msg.fdBody(sref, codec.replyData(fs.unique, fs.body), fs.fd, fs.off);
@@ -2233,7 +2233,7 @@ pub const Group = struct {
     /// path clears them again (idempotent). Never for an O_DIRECT read.
     fn zeroReadTail(self: *Group, gent: u32, in: abi.fuse_read_in, len: usize) u32 {
         if (in.flags & O_DIRECT != 0) return 0;
-        return codec.readZeroTail(self.window(gent), len, in.size, std.heap.pageSize());
+        return codec.readZeroTail(self.window(gent), len, in.size);
     }
 
     /// THE READ DISPATCH LAW at the delivery CQE: (a) the filesystem's

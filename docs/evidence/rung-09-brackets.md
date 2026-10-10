@@ -372,7 +372,8 @@ layout's 148 KiB overhead each) fit the cap, never below the 4 MiB DMA grain
 64 MiB carries fewer slots of the shipped 64 KiB slab (`ipcSlotsForArena`),
 so the async per-op ceiling and the lane gate's floor survive the yield (the
 first cut shrank the slab and the interception smoke's 32 KiB tickets no
-longer fit a slot). The arm line
+longer fit a slot: `79438de`; the client's multi-slot flight is capped at
+`max_op` whatever the slab: `cdbaecc`). The arm line
 prints the census and warns under the floor; a client open the refusal's
 backoff window kernel-serves counts `establish_refused` (it read `not_ours`).
 Tests: `mem/sizing` "the arena yields to the population floor…" (2 GiB ⇒

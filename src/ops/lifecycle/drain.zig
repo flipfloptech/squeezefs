@@ -147,7 +147,12 @@ pub const DrainBody = struct {
             std.debug.assert(moved + superseded + deferred + (plan.tasks.len - i - 1) == plan.distinct_blocks);
             if (f.taskDone(io, job, clock.monotonicNs() - t0) == .stop) return .progressed;
         }
-        return if (moved + superseded > 0) .progressed else .deferred;
+        // Progress is a MOVE. A pass of superseded tasks alone re-plans
+        // after the backoff like a deferred one: the census it planned from
+        // was stale (a writer moved the block, or a republish refused), and
+        // an immediate re-plan on a persistently refused block was a hot
+        // loop (17,240 passes in two minutes, rung 8).
+        return if (moved > 0) .progressed else .deferred;
     }
 };
 

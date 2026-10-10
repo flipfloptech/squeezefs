@@ -700,6 +700,14 @@ pub const Fabric = struct {
             return j.rec.state;
         };
         while (true) {
+            // The fabric's stop (the dismount): the claim releases at this
+            // pass boundary with the record non-terminal — the next
+            // adoption re-queues it and the body regenerates its plan
+            // (crash-resume's law). Without this a body that defers on
+            // every pass (a drain whose victim keeps a block the census
+            // never sees) kept the worker forever and the daemon could not
+            // be unmounted (rung 8).
+            if (self.stopping.load(.acquire)) return j.rec.state;
             if (j.cancel_intent.load(.acquire)) {
                 self.lock.lockUncancelable(io);
                 defer self.lock.unlock(io);
@@ -739,7 +747,7 @@ pub const Fabric = struct {
                 },
                 .progressed => {},
                 .deferred => {
-                    if (j.shouldStop()) continue;
+                    if (j.shouldStop() or self.stopping.load(.acquire)) continue;
                     const deadline = clock.monotonicNs() + REPLAN_BACKOFF_NS;
                     var n = j.ctl.wake.notified();
                     _ = n.waitUntilUncancelable(io, deadline);
@@ -1163,6 +1171,40 @@ test "intersecting-scope movers serialize (queued loud, once), disjoint scopes r
     r.fabric.releaseClaim(io, je);
     try testing.expectEqual(@as(?*JobCtl, null), r.fabric.claimNext(io, true));
     try testing.expect(Scope.intersects(.whole_set, .{ .volume = 1 }) and !Scope.intersects(.none, .whole_set) and !Scope.intersects(.{ .volume = 1 }, .{ .volume = 2 }));
+}
+
+/// A body that defers on every pass (a drain whose victim keeps one block
+/// the census never sees).
+const DeferBody = struct {
+    passes: Atomic(u32) = .init(0),
+    fn body(self: *DeferBody) Body {
+        return .{ .ctx = self, .pass = &pass };
+    }
+    fn pass(ctx: *anyopaque, _: Io, _: *Fabric, _: *JobCtl) PassError!PassOutcome {
+        const self: *DeferBody = @ptrCast(@alignCast(ctx));
+        _ = self.passes.fetchAdd(1, .acq_rel);
+        return .deferred;
+    }
+};
+
+test "a body that defers forever never wedges the fabric's stop: the worker leaves at the next re-plan park, the claim releases, the record stays non-terminal for the next adoption" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const r = try Rig.init(gpa, .{});
+    defer r.deinit(gpa);
+    var defer_body: DeferBody = .{};
+    r.fabric.registerBody(.evacuate_volume, defer_body.body());
+    const id = try r.fabric.submit(io, .{ .job_type = .evacuate_volume, .arg0 = 11 });
+    var t = try std.Thread.spawn(.{}, Rig.worker, .{ r, io });
+    // The body ran at least twice (the deferred park is REPLAN_BACKOFF).
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (defer_body.passes.load(.acquire) < 2 and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    try testing.expect(defer_body.passes.load(.acquire) >= 2);
+    r.fabric.stop(io);
+    t.join();
+    const j = r.fabric.find(id).?;
+    try testing.expect(!j.claimed.load(.acquire));
+    try testing.expect(!r.store.record(id).?.isTerminal());
 }
 
 test "the claim word: a release by a non-holder is a tripwire, never a wedge" {

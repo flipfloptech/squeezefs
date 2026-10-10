@@ -319,6 +319,41 @@ conveyor-handoff model check should be re-run for the weakening this shape
 exercises (an enqueue that observes "leader running" while the leader is on
 its way out). Until it is fixed no sustained write row is VALID.
 
+*Resolution* (ONE fix, two repros: `638e75f` from the external-suites agent
+— fstests generic/074, fsstress -p 20 — and `7b8ea4e` from this harness;
+decision 0002 row 451). Root cause: the handoff theorem hands a won
+election to "the winner's pass"; on the product venue that pass is ONE
+fiber and the handoff is one `TaskState.wake`, which the word ABSORBS when
+the fiber is already SCHEDULED (law 2). `pending()` — the pass's re-check
+after `leader.store(false)` — takes the queue mutex, and a committer
+holding that lock in its enqueue parks the pass fiber on it; the
+committer's unlock is a futex wake of the same word (IDLE → SCHEDULED), its
+CAS wins the released leadership, its `wakePass` is a no-op, and the fiber's
+poll loses `tryLead` to a live leader, returns and parks IDLE with the latch
+set and one entry queued. Every later committer loses the CAS and parks:
+`meta_conveyor_queued` = `meta_commit_parked`, no window in flight, no pass.
+Model: `conveyor_core_model.zig` model 7 `PassFiber` (the delivery word,
+the parkable mutex, the one wake); the weakening that fails is
+`.park_without_leader_recheck` — the venue parking as soon as `pass()`
+returns (the shipped `if (leader) pass()` + `f.park()`); this harness's
+equivalent model found the same schedule in 139 states and was dropped as a
+strict duplicate at the reconcile. Red test on the real venue (`7b8ea4e`):
+`backend.zig` "the venue delivers every election: a committer whose enqueue
+parked the retiring pass on the queue mutex is drained, never left with the
+leader latched and the pass fiber parked" — the committer held inside its
+lock hold and the leader between its release and its re-check through
+`conveyor_core.test_seams` (Io-parked, never a thread spin on the lane); it
+observed the wedge state (fiber IDLE ∧ latch set ∧ one entry queued) on the
+pre-fix venue and rescued it for teardown. Fix: `passEntry` re-reads the
+latch (`leaderHeld`) after every pass and runs again while it is set (no
+suspension point between the re-read and the park), and the venue park now
+rides the 2 s liveness tick — a tick that finds the latch set counts
+`meta_conveyor_park_tick_rescues` and runs the pass (the dropped-wake seam
+test "the venue's tick backstop" counts exactly one; `Fiber.timerFired`
+keeps a timer that popped beside the scheduling wake from reading as a
+tick). Before/after on `seq-write-1m-buffered` (nvmet-tcp, QD32 × 4): see
+the measured rows at the end of this section.
+
 F2. **EAGAIN on a blocking write(2)** (product). `seq-write-1m-direct`
 (libaio QD32 × 4) and `shim-seq-write-1m` on nvmet-tcp: fio aborts with
 `EAGAIN` (104–128 per leg; 4 per leg on the shim row). The daemon:
@@ -329,6 +364,28 @@ return EAGAIN (POSIX reserves it for O_NONBLOCK); the admission must park
 under the write-pipeline depth governor instead of refusing. All four legs of
 both rows INVALID by `instrument_ok`; the numbers that fio did produce before
 aborting are in the records, not in the table.
+
+*Resolution* (`2603169` red, `3e898b1` fix; decision 0002 row 453). Root cause: the accumulation arms (F extent checkout and
+escalation, G checkout/adopt, J merge and seed) answered `error.WouldBlock`
+at the parked-buffer cap (`parked_pool_refusals` ≡ `parked_gate_waits` ≡
+`answered EAGAIN` = 115/107 on the 512m/job re-run), and the handler's one
+errno table maps it to EAGAIN. The pool was full of COLD partials (250
+parked, 36 uploads at the end of a leg: an overwrite stream whose
+shadow-bound pieces take the accumulation arm and never complete their
+block), so a pure park would have wedged. Red tests (`write_admit.zig`): "the
+parked-buffer gate, cold set" and "the parked-buffer gate, hot set" (both
+answered `WouldBlock`). Fix: THE PARKED-BUFFER GATE — holding no lock,
+register on the table's settle notify, re-check for room; a set whose
+coldest parked block sat untouched ≥ `PARKED_COLD_NS` (the 2 s liveness
+tick) is drained by the writer itself (`parked_gate_cold_flushes`: one
+bounded upload, zero-completed or seeded from the write-side authority);
+otherwise wait for the next upload's settle, bounded by the moment the
+coldest turns cold. The op's watchdog station is `write_parked_pool`;
+`write_admit.Error` has no `WouldBlock` member and the handler has no EAGAIN
+arm for a write. Legitimately non-blocking callers: none on the write path —
+the IPC placed-sever registry's `PoolExhausted` is its own copy fallback, not
+an answer to the application. Before/after on `seq-write-1m-direct`
+(512m/job): see the measured rows at the end of this section.
 
 F3. **The shim does not intercept fio's libaio engine** (product).
 `LD_DEBUG=bindings` shows fio binding `io_submit@LIBAIO_0.1` /
@@ -409,6 +466,30 @@ must-stay-≈0). 6–186 per 60 s leg on every saturated write row
 row's umount-side flush 5), plus one `lock_ticked_reregisters`. The journal
 lane's 2 s backstop found work a wake should have delivered: a lost-wake
 class in the conveyor → journal-lane handoff, kin to F1.
+
+*Resolution* (`c9ae924` red, `9774031` fix; decision 0002 row 452). NOT a
+lost wake: the lane's backstop is 100 ms (not 2 s) and the shipped verdict
+counted every backstop-ended park as a rescue. On the 512m/job re-run the
+rescues track the journal windows that outlasted 100 ms one for one (leg 1:
+8 rescues, 8 windows ≥ 128 ms; leg 2: 46 rescues, 27 windows ≥ 128 ms and
+55 ≥ 64 ms; one checkpoint barrier ≥ 512 ms) — the venue's one shared virtio
+disk under 400 MB/s of data writes, the FSYNC and the 4 KiB journal write
+behind it. Every out-of-lane completer kicks (`completeAbandoned` →
+`smo_journal.device.completed`), and `meta_conveyor_park_tick_rescues`,
+`channel_ticked_reregisters` and `exec_lane_tick_rescues` stayed 0
+throughout. Red test (`journal_lane.zig`): "a slow device: a window whose
+runs are owed past the backstop costs backstop ticks and ZERO tick rescues"
+(a `delay_issue` seam holds the runs un-issued; the shipped verdict read
+"expected 0, found 1"); the companion "a lost kick" pins the rescue
+reachable (a completer that forgets to kick: exactly one). Fix: the verdict
+is the next poll's re-check (`sync/tick.zig`'s channel-class contract) —
+progress with no wake delivered is `journal_lane_park_tick_rescues`
+(must-stay-0), nothing moved is the new `journal_lane_park_backstop_ticks`
+(reported beside, outside the harness's rescue sum); `Fiber.timerFired()`
+keeps a timer that popped in the same lane pass as the scheduling CQE from
+reading as a tick (the same phantom class the lane's own
+`exec_lane_tick_rescues` had on 2026-10-07). Before/after: see the measured
+rows at the end of this section.
 
 F7. `transport_lease_overlong` 128–1412 per saturated write leg: FUSE_WRITE
 payload leases ≥ 1 s because 128 MiB are queued ahead of a ~400 MiB/s

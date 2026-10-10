@@ -755,6 +755,53 @@ pub const Packer = struct {
         return cur.eql(m);
     }
 
+    // ---- the compaction's faces (`defrag --pack`, charter §6.1) ----
+
+    /// A prepared window the COMPACTOR owns (no ring entry, no layout flip
+    /// of its own): the in-flight reservation becomes a committed slot
+    /// whose references are its referencers' records (`pack_compact`
+    /// raises one per referencer and republishes each). The pin arithmetic
+    /// the seal checks (`refcount ≡ committed + inflight + 1`) is kept by
+    /// `tenantRaised` / `tenantReleased` around every raise and release.
+    pub fn landWindow(_: *Packer, tenant: Tenant) void {
+        _ = tenant.pack.inflight.fetchSub(1, .acq_rel);
+        _ = tenant.pack.committed.fetchAdd(1, .acq_rel);
+    }
+
+    /// A referencer's reference raised on a landed window (the pin's +1 is
+    /// the caller's `incrementRefcount`).
+    pub fn tenantRaised(_: *Packer, pack: *OpenPack) void {
+        _ = pack.committed.fetchAdd(1, .acq_rel);
+    }
+
+    /// A referencer refused its republish: its reference leaves the window.
+    pub fn tenantReleased(_: *Packer, pack: *OpenPack) void {
+        _ = pack.committed.fetchSub(1, .acq_rel);
+    }
+
+    /// A landed window nobody took (every referencer refused): the slot's
+    /// own reference leaves — `committed − 1` and the pin released
+    /// (terminal when the pack sealed and every sibling left).
+    pub fn abandonLandedWindow(self: *Packer, tenant: Tenant) void {
+        _ = tenant.pack.committed.fetchSub(1, .acq_rel);
+        stats.pack_slots_abandoned.inc();
+        self.countRelease(self.alloc.release(self.alloc.ctx, tenant.pack.vol_tag, tenant.pack.base));
+    }
+
+    /// Every open pack's block and the room left in it (the compaction's
+    /// plan excludes the open packs and budgets the open room).
+    pub fn openBlocks(self: *Packer, gpa: Allocator, out: *std.ArrayList(Placed)) Allocator.Error!u64 {
+        var room: u64 = 0;
+        for (self.rows) |*r| {
+            if (!r.used) continue;
+            const p = r.pack.load(.acquire) orelse continue;
+            if (p.isSealed()) continue;
+            try out.append(gpa, .{ .vol_tag = p.vol_tag, .offset = p.base, .incarnation = p.incarnation });
+            room += self.chunk -| p.reservedBytes();
+        }
+        return room;
+    }
+
     // ---- gauges ----
 
     pub const OpenCensus = struct { blocks: u64, max_age_ms: u64, occupancy_permille_sum: u64 };

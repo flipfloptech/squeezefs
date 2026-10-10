@@ -666,49 +666,11 @@ pub const WirePlane = struct {
     pub fn bindDataPlanes(self: *WirePlane, dp: *DataPlane) BindDataError!void {
         const gpa = self.gpa;
         if (self.mgr) |m| {
-            const n = dp.vols.count;
+            const n = dp.vols.n();
             const terms = try gpa.alloc(u64, n);
             defer gpa.free(terms);
-            const control = m.ledger_store.store().control;
-            const screen: alloc_lease.Screen = .{ .ctx = dp, .dataVolumeBlocks = &dataVolumeBlocksFn, .set_width = @intCast(self.set.volumes.len), .heaps = &.{} };
-            // The same-node succession (charter §5.5 "a dead holder
-            // succeeded only after `dead_member:` AND `recovered:`"; the
-            // D0 ladder's word): a lease the PREDECESSOR MANAGER of this
-            // mount point holds — the identity page 0 carried when this
-            // open read it, proven dead by the ladder this open won — is
-            // taken over at `term + 1`: its death recorded EARLY, its
-            // pages' window the fixed ring this open already replayed, the
-            // granted ranges re-learnt from the live writers' declarations.
-            const sym0 = self.set.volumes[0].sym.?;
-            const me = self.writerIdentity();
-            const me_page: join_ladder.Identity = .{ .node_token = me.node_token, .mount_slot = me.mount_slot, .writer_id = me.writer_id };
-            var proof: join_ladder.SameNodeProof = .{ .page0_at_open = sym0.page0_at_open orelse me_page, .me = me_page };
-            const recover: alloc_lease.Recover = .{ .ctx = null, .recover = &predecessorBitmapRecovered };
             for (dp.vols.rows[0..n], 0..) |row, i| {
-                const r = row.?;
-                switch (alloc_lease.acquireAndHold(control, gpa, screen, true, .{ .vol_tag = r.vol_tag, .identity = me, .home_vol = 0, .appender_id = 0, .blocks = r.alloc.capacityBlocks() }, proof.d0Proof(), recover, @intCast(clock.realtimeCoarseNs()))) {
-                    .granted => |g| {
-                        terms[i] = g.term;
-                        if (g.refs.n != 0) log.info("data planes: the allocation lease of vol {x} at term {d} names {d} predecessor bitmap page ref(s); the bitmap re-learns the granted ranges from the live writers' declarations (no KVDA page is read in this wave)", .{ r.vol_tag, g.term, g.refs.n });
-                    },
-                    .busy => {
-                        log.warn("data planes: the allocation lease of vol {x} is held by a LIVE holder that is not this manager — no grant plane armed; grants answer Busy until it releases", .{r.vol_tag});
-                        return;
-                    },
-                    .deferred => {
-                        log.warn("data planes: the allocation lease of vol {x} names a dead holder not yet recovered — no grant plane armed; grants answer Busy until the recovery lands", .{r.vol_tag});
-                        return;
-                    },
-                    .rejected => |why| {
-                        log.err("data planes: the allocation lease acquire of vol {x} was REJECTED ({t})", .{ r.vol_tag, why });
-                        return error.Io;
-                    },
-                    .attempts_exhausted => {
-                        log.err("data planes: the allocation lease of vol {x} could not be taken over from this mount's predecessor in {d} attempts", .{ r.vol_tag, alloc_lease.SAME_NODE_TAKEOVER_ATTEMPTS });
-                        return error.Io;
-                    },
-                    .not_manager, .io_error => return error.Io,
-                }
+                terms[i] = (try self.acquireAllocLease(dp, row.?.vol_tag, row.?.alloc.capacityBlocks())) orelse return;
             }
             const hp = try plane_arm.HolderPlane.create(gpa, self.io, dp, .{ .ctx = self, .isMember = &isMemberFn }, terms, m.owner.members.items.len + 1);
             // Paired with the acquire loads in the grant verb handlers.
@@ -717,6 +679,65 @@ pub const WirePlane = struct {
         }
         const js = self.set.volumes[0].joined.?;
         self.writer_plane = try plane_arm.WriterPlane.create(gpa, self.io, dp, js.link.tokenLink(), self.identity);
+    }
+
+    /// The ONLINE `volume add-data` arm (charter §8): the volume the plane
+    /// just attached at `ordinal` gets its allocation lease on tree 0 and
+    /// its row in the holder's grant plane — the manager's act (a joiner
+    /// learns a new volume at its next mount; stated in the evidence).
+    pub fn armDataVolume(self: *WirePlane, dp: *DataPlane, ordinal: u16) BindDataError!void {
+        const m = self.mgr orelse return error.Io;
+        const hp = self.holder_plane.load(.acquire) orelse return error.Io;
+        const row = dp.vols.rows[ordinal].?;
+        const term = (try self.acquireAllocLease(dp, row.vol_tag, row.alloc.capacityBlocks())) orelse return error.Io;
+        try hp.armVolume(ordinal, term, m.owner.members.items.len + 1);
+        log.info("data planes: vol {x} armed online as ordinal {d} under the allocation lease at term {d}", .{ row.vol_tag, ordinal, term });
+    }
+
+    /// The allocation lease of ONE data volume on tree 0 (charter §5.5
+    /// "first-come at term 1; a dead holder succeeded only after
+    /// `dead_member:` AND `recovered:`"): the same-node succession takes a
+    /// lease the PREDECESSOR MANAGER of this mount point holds — the
+    /// identity page 0 carried when this open read it, proven dead by the
+    /// ladder this open won — over at `term + 1`: its death recorded EARLY,
+    /// its pages' window the fixed ring this open already replayed, the
+    /// granted ranges re-learnt from the live writers' declarations. Null
+    /// = `busy` / `deferred`: NO grant plane armed (logged); the grant verbs
+    /// answer `Busy` and the joiners' writes wait (EAGAIN) — never two mints
+    /// over one volume.
+    fn acquireAllocLease(self: *WirePlane, dp: *DataPlane, vol_tag: u64, blocks: u64) BindDataError!?u64 {
+        const gpa = self.gpa;
+        const m = self.mgr orelse return error.Io;
+        const control = m.ledger_store.store().control;
+        const screen: alloc_lease.Screen = .{ .ctx = dp, .dataVolumeBlocks = &dataVolumeBlocksFn, .set_width = @intCast(self.set.volumes.len), .heaps = &.{} };
+        const sym0 = self.set.volumes[0].sym.?;
+        const me = self.writerIdentity();
+        const me_page: join_ladder.Identity = .{ .node_token = me.node_token, .mount_slot = me.mount_slot, .writer_id = me.writer_id };
+        var proof: join_ladder.SameNodeProof = .{ .page0_at_open = sym0.page0_at_open orelse me_page, .me = me_page };
+        const recover: alloc_lease.Recover = .{ .ctx = null, .recover = &predecessorBitmapRecovered };
+        switch (alloc_lease.acquireAndHold(control, gpa, screen, true, .{ .vol_tag = vol_tag, .identity = me, .home_vol = 0, .appender_id = 0, .blocks = blocks }, proof.d0Proof(), recover, @intCast(clock.realtimeCoarseNs()))) {
+            .granted => |g| {
+                if (g.refs.n != 0) log.info("data planes: the allocation lease of vol {x} at term {d} names {d} predecessor bitmap page ref(s); the bitmap re-learns the granted ranges from the live writers' declarations (no KVDA page is read in this wave)", .{ vol_tag, g.term, g.refs.n });
+                return g.term;
+            },
+            .busy => {
+                log.warn("data planes: the allocation lease of vol {x} is held by a LIVE holder that is not this manager — no grant plane armed; grants answer Busy until it releases", .{vol_tag});
+                return null;
+            },
+            .deferred => {
+                log.warn("data planes: the allocation lease of vol {x} names a dead holder not yet recovered — no grant plane armed; grants answer Busy until the recovery lands", .{vol_tag});
+                return null;
+            },
+            .rejected => |why| {
+                log.err("data planes: the allocation lease acquire of vol {x} was REJECTED ({t})", .{ vol_tag, why });
+                return error.Io;
+            },
+            .attempts_exhausted => {
+                log.err("data planes: the allocation lease of vol {x} could not be taken over from this mount's predecessor in {d} attempts", .{ vol_tag, alloc_lease.SAME_NODE_TAKEOVER_ATTEMPTS });
+                return error.Io;
+            },
+            .not_manager, .io_error => return error.Io,
+        }
     }
 
     /// `alloc_lease.Recover` for the predecessor manager's bitmap: its
@@ -734,7 +755,7 @@ pub const WirePlane = struct {
     fn releaseAllocLeases(self: *WirePlane, hp: *plane_arm.HolderPlane) void {
         const m = self.mgr orelse return;
         const control = m.ledger_store.store().control;
-        for (hp.vols, 0..) |_, i| {
+        for (0..hp.armed()) |i| {
             const h = hp.held(i);
             switch (alloc_lease.release(control, self.gpa, h.vol_tag, self.writerIdentity(), h.term)) {
                 .released, .already => {},

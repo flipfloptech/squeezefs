@@ -199,7 +199,7 @@ pub const TouchedTable = struct {
 /// volatile; write-through namespaces skip (counted). Pure.
 pub fn planBarriers(bits: u64, vols: *const seams.Volumes, out: *[256]u32) []u32 {
     var n: usize = 0;
-    for (vols.rows[0..vols.count]) |*r| {
+    for (vols.rows[0..vols.n()]) |*r| {
         const v = r.*.?;
         const touched = bits & TouchedTable.ALL_BIT != 0 or (v.ordinal <= TouchedTable.MAX_ORDINAL and bits & (@as(u64, 1) << @intCast(v.ordinal)) != 0);
         if (!touched) continue;

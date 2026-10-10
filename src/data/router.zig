@@ -52,7 +52,9 @@ pub const stats = struct {
     /// healthy storage backends available for write".
     pub var placement_no_healthy_refusals: counters.ShardedCounter = .{};
     /// `backend_fill_spread`: `max − min` fill over the eligible rows, ppm
-    /// (G-VL-8: ≤ 100,000 after a rebalance).
+    /// (≤ 2 × `rebalance.REBALANCE_BAND_PPM` after a rebalance: every row
+    /// within 10 pp of the mean — the planner raises the under-filled rows
+    /// to the band's floor and never pushes a source below the mean).
     pub var backend_fill_spread: counters.Gauge = .{};
     /// `placement_rotor_slots`: rotor slots in the mint set of the volume
     /// last spread (the placement rotor — the fallback of a volume whose

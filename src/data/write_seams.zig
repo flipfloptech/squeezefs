@@ -101,41 +101,68 @@ pub const VolumeInfo = struct {
     /// The device acknowledges writes into a volatile cache: an fsync's
     /// data barrier must flush it (a write-through device skips).
     write_cache_volatile: bool,
-    /// `router.VolumeState.active` (a draining volume takes no new custody).
-    active: bool = true,
+    /// `router.VolumeState.active` (a draining volume takes no new custody);
+    /// flipped by the lifecycle verbs under live traffic (`setActive` /
+    /// `isActive` pair: release / acquire — the write path reads it before
+    /// taking custody on the volume).
+    active: std.atomic.Value(bool) = .init(true),
+
+    pub fn isActive(self: *const VolumeInfo) bool {
+        return self.active.load(.acquire);
+    }
 };
 
 /// The mount's data volumes, indexed by ordinal (≤ `router.MAX_VOLUMES`).
+/// Append-only and read lock-free by every hot path: `add` writes the row
+/// THEN publishes the count with a release store, so a reader whose
+/// acquire load (`n`) sees the count sees the row (the online `volume
+/// add-data` appends under live traffic; the pair is `add` / `n`).
 pub const Volumes = struct {
     rows: [router.MAX_VOLUMES]?VolumeInfo = @splat(null),
-    count: u32 = 0,
+    count: std.atomic.Value(u32) = .init(0),
 
     pub fn add(self: *Volumes, v: VolumeInfo) void {
-        assert(v.ordinal == self.count and self.count < router.MAX_VOLUMES);
-        self.rows[self.count] = v;
-        self.count += 1;
+        const cur = self.count.load(.monotonic);
+        assert(v.ordinal == cur and cur < router.MAX_VOLUMES);
+        self.rows[cur] = v;
+        self.count.store(cur + 1, .release);
+    }
+
+    /// The published row count (acquire: pairs with `add`'s release).
+    pub fn n(self: *const Volumes) u32 {
+        return self.count.load(.acquire);
+    }
+
+    /// The lifecycle flip (`Active` ⇔ custody admissible); false = no such
+    /// volume. Release: pairs with `isActive`'s acquire.
+    pub fn setActive(self: *Volumes, vol_tag: u64, active: bool) bool {
+        for (self.rows[0..self.n()]) |*r| if (r.*.?.vol_tag == vol_tag) {
+            r.*.?.active.store(active, .release);
+            return true;
+        };
+        return false;
     }
 
     pub fn byTag(self: *const Volumes, vol_tag: u64) ?*const VolumeInfo {
-        for (self.rows[0..self.count]) |*r| if (r.*.?.vol_tag == vol_tag) return &r.*.?;
+        for (self.rows[0..self.n()]) |*r| if (r.*.?.vol_tag == vol_tag) return &r.*.?;
         return null;
     }
 
     pub fn byOrdinal(self: *const Volumes, ordinal: u32) ?*const VolumeInfo {
-        if (ordinal >= self.count) return null;
+        if (ordinal >= self.n()) return null;
         return &self.rows[ordinal].?;
     }
 
     /// Every placement-eligible allocator (the ENOSPC census' candidates).
     pub fn candidates(self: *const Volumes, out: *[router.MAX_VOLUMES]*block_alloc.BlockAllocator) []*block_alloc.BlockAllocator {
-        var n: usize = 0;
-        for (self.rows[0..self.count]) |*r| {
-            if (r.*.?.active) {
-                out[n] = r.*.?.alloc;
-                n += 1;
+        var n_out: usize = 0;
+        for (self.rows[0..self.n()]) |*r| {
+            if (r.*.?.isActive()) {
+                out[n_out] = r.*.?.alloc;
+                n_out += 1;
             }
         }
-        return out[0..n];
+        return out[0..n_out];
     }
 };
 
@@ -406,7 +433,7 @@ test "volumes: ordinal and tag lookups; candidates are the active allocators" {
     defer b.deinit();
     var v: Volumes = .{};
     v.add(.{ .vol_tag = 0x11, .ordinal = 0, .alloc = a, .passthrough = true, .write_cache_volatile = true });
-    v.add(.{ .vol_tag = 0x22, .ordinal = 1, .alloc = b, .passthrough = false, .write_cache_volatile = false, .active = false });
+    v.add(.{ .vol_tag = 0x22, .ordinal = 1, .alloc = b, .passthrough = false, .write_cache_volatile = false, .active = .init(false) });
     try testing.expectEqual(@as(u32, 1), v.byTag(0x22).?.ordinal);
     try testing.expectEqual(a, v.byOrdinal(0).?.alloc);
     try testing.expect(v.byTag(0x33) == null);

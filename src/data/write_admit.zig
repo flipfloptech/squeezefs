@@ -365,7 +365,7 @@ pub const Picker = struct {
     }
 
     fn eligible(self: *const Picker, v: *const seams.VolumeInfo) bool {
-        return v.active and (!self.passthrough_only or v.passthrough);
+        return v.isActive() and (!self.passthrough_only or v.passthrough);
     }
 
     fn pick(ctx: ?*anyopaque, place: enospc.Place) ?*block_alloc.BlockAllocator {
@@ -373,7 +373,7 @@ pub const Picker = struct {
         var with_supply: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
         var n: u32 = 0;
         var fallback: ?*block_alloc.BlockAllocator = null;
-        for (self.vols.rows[0..self.vols.count]) |*r| {
+        for (self.vols.rows[0..self.vols.n()]) |*r| {
             const v = &r.*.?;
             if (!self.eligible(v)) continue;
             if (fallback == null) fallback = v.alloc;
@@ -435,7 +435,7 @@ pub const WritePath = struct {
         const self = try gpa.create(WritePath);
         errdefer gpa.destroy(self);
         var passthrough = false;
-        for (d.vols.rows[0..d.vols.count]) |*r| if (r.*.?.passthrough and r.*.?.active) {
+        for (d.vols.rows[0..d.vols.n()]) |*r| if (r.*.?.passthrough and r.*.?.isActive()) {
             passthrough = true;
         };
         self.* = .{
@@ -466,7 +466,7 @@ pub const WritePath = struct {
         errdefer self.epochs.deinit();
         self.locks = try seams.BlockLocks.init(gpa, seams.BLOCK_LOCK_STRIPES);
         errdefer self.locks.deinit(gpa);
-        self.governor = try pipeline.Governor.init(gpa, cfg.block_size, @max(d.vols.count, 1), cfg.depth_override, d.mem, pipeline.capBytes(d.budget_bytes));
+        self.governor = try pipeline.Governor.init(gpa, cfg.block_size, @max(d.vols.n(), 1), cfg.depth_override, d.mem, pipeline.capBytes(d.budget_bytes));
         errdefer self.governor.deinit();
         self.table = try accumulate.Table.init(gpa, @intCast(cfg.block_size), cfg.parked_cap);
         errdefer self.table.deinit();
@@ -673,7 +673,7 @@ pub const WritePath = struct {
             if (self.table.has(ino, b) or self.overlay.hasCustody(ino, b) or self.epochs.bindsBlock(ino, b)) continue;
             const m = self.map.lookup(ino, b) orelse return true;
             const v = self.vols.byTag(m.vol_tag) orelse return true;
-            if (!v.passthrough or !m.whole_block or !v.active) return true;
+            if (!v.passthrough or !m.whole_block or !v.isActive()) return true;
             const idx = v.alloc.idxOf(m.offset);
             if (v.alloc.refcount(idx) != 1 or v.alloc.isShared(idx)) return true;
         }

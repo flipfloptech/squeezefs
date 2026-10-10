@@ -168,17 +168,8 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         // Every routing slot is this open's (the writer door is exclusive;
         // a joined posture is the fabric's binding, not this harness's).
         var s: u32 = 0;
-        while (s < inos.ROUTING_WIDTH) : (s += 1) {
-            const slot: u16 = @intCast(s);
-            const v = be.volumeOfSlot(slot);
-            try b.scope.leased.put(gpa, slot, {});
-            const native = v.stamp.native_slot;
-            const cursor: ?u64 = if (native != null and native.? == slot) v.ino.snapshot() else v.stamp.cursorSnapshot(slot);
-            if (cursor) |c| {
-                try b.scope.watermarks.put(gpa, slot, c);
-                try b.scope.era_floor.put(gpa, slot, c);
-            }
-        }
+        while (s < inos.ROUTING_WIDTH) : (s += 1) try b.scope.leased.put(gpa, @intCast(s), {});
+        try refreshScope(b);
         // The data volumes.
         var vols: std.ArrayList(classes.Volume) = .empty;
         errdefer vols.deinit(gpa);
@@ -189,10 +180,10 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                 b.xform_scratch = try gpa.alloc(u8, @intCast(transform.scratchLen(@intCast(pl.block_size))));
                 b.xform_bind = .{ .plane = pl, .scratch = b.xform_scratch };
             }
-            for (pl.vols.rows[0..pl.vols.count]) |r| {
+            for (pl.vols.rows[0..pl.vols.n()]) |r| {
                 const row = r.?;
                 // Index 0 is the data superblock chunk the plane reserves forever.
-                try vols.append(gpa, .{ .vol_tag = row.vol_tag, .alloc = row.alloc, .bitmap = null, .passthrough = row.passthrough, .reserved_blocks = 1 });
+                try vols.append(gpa, .{ .vol_tag = row.vol_tag, .alloc = row.alloc, .bitmap = null, .passthrough = row.passthrough, .reserved_blocks = plane_mod.DataPlane.RESERVED_BLOCKS });
                 const cfg: transform.VolumeTransform = if (pl.xform) |*x| x.t.cfg else .{ .block_size = @intCast(pl.block_size) };
                 try xforms.append(gpa, .{ .vol_tag = row.vol_tag, .cfg = cfg, .face = if (b.xform_bind) |*xb| xb.face() else null });
             }
@@ -235,6 +226,29 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         const gpa = b.gpa;
         b.deinit();
         gpa.destroy(b);
+    }
+
+    /// The start watermarks AND the era floors = every slot's cursor NOW
+    /// (the native slot's mint word; a rotor slot's cursor cell): a record
+    /// at/past its slot's watermark is the next census's. Taken at `bind`
+    /// and AGAIN at every online pass — a mount-time binding's words are
+    /// stale by the first run (every file minted since read "the next
+    /// census's" and the derived walk saw none of their blocks: C2/C8
+    /// false positives on a healthy mount, found by the rung-8 live
+    /// `fsck --online`).
+    pub fn refreshScope(b: *Bound) Allocator.Error!void {
+        const gpa = b.gpa;
+        var s: u32 = 0;
+        while (s < inos.ROUTING_WIDTH) : (s += 1) {
+            const slot: u16 = @intCast(s);
+            const v = b.be.volumeOfSlot(slot);
+            const native = v.stamp.native_slot;
+            const cursor: ?u64 = if (native != null and native.? == slot) v.ino.snapshot() else v.stamp.cursorSnapshot(slot);
+            if (cursor) |c| {
+                try b.scope.watermarks.put(gpa, slot, c);
+                try b.scope.era_floor.put(gpa, slot, c);
+            }
+        }
     }
 
     /// The device read: the data volume's `readInto` (O_DIRECT grain).
@@ -449,13 +463,23 @@ pub const linux = if (builtin.os.tag == .linux) struct {
     /// its output — the CLI owns exit codes) and log at error through the
     /// report's tripwire. The last report is the admin dispatcher's read.
     pub const JobBody = struct {
-        bound: *Bound,
         gpa: Allocator,
-        scrub_: bool,
+        /// The bind's inputs: the binding is REBUILT when the plane's
+        /// volume population changed since (an online `volume add-data`;
+        /// a binding frozen at mount judged the new volume's blocks "unknown
+        /// volume" — C2 lost false positives after a live add, rung 8).
+        be: *meta_set.MetaSet,
+        plane: *plane_mod.DataPlane,
+        env: *const std.process.Environ.Map,
+        mem_budget: u64,
+        fs: ?*BackendFs,
+        staging_root: ?[]const u8,
+        bound: *Bound,
         last: ?finding.Report = null,
 
         pub fn deinit(self: *JobBody) void {
             if (self.last) |*r| r.deinit(self.gpa);
+            destroy(self.bound);
             self.* = undefined;
         }
 
@@ -463,13 +487,23 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             return .{ .ctx = self, .pass = &passFn };
         }
 
+        fn bindOptions(self: *const JobBody) BindOptions {
+            return .{ .env = self.env, .mode = .online, .mem_budget = self.mem_budget, .fs = self.fs, .staging_root = self.staging_root };
+        }
+
         fn passFn(ctx: *anyopaque, io: Io, f: *fabric.Fabric, job: *fabric.JobCtl) fabric.PassError!fabric.PassOutcome {
             const self: *JobBody = @ptrCast(@alignCast(ctx));
+            if (self.bound.vols.len != self.plane.vols.n()) {
+                const fresh = bind(self.gpa, io, self.be, self.plane, self.bindOptions()) catch return error.OutOfMemory;
+                destroy(self.bound);
+                self.bound = fresh;
+            }
             self.bound.host.io = io;
             self.bound.host.cancel = &job.cancel_intent;
             self.bound.host.pause = &job.pause_intent;
+            try refreshScope(self.bound);
             var pacer: FabricThrottle = .{ .t = job_seams.Throttle.forJob(f, job) };
-            const report = run(&self.bound.host, .{ .scrub = self.scrub_, .throttle = pacer.throttle() }, if (self.bound.verifier) |*v| v else null) catch |e| return switch (e) {
+            const report = run(&self.bound.host, .{ .scrub = job.rec.arg0 & fsck.JOB_ARG_SCRUB != 0, .scrub_only = job.rec.arg0 & fsck.JOB_ARG_SCRUB_ONLY != 0, .throttle = pacer.throttle() }, if (self.bound.verifier) |*v| v else null) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.Body,
             };

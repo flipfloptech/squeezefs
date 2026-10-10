@@ -242,7 +242,7 @@ pub const IpcHost = struct {
         // The direct-drive lanes (at arm, never on the data path).
         var fds: [router.MAX_VOLUMES]linux.fd_t = undefined;
         var n_fds: usize = 0;
-        for (d.plane.devs[0..d.plane.vols.count]) |maybe| {
+        for (d.plane.devs[0..d.plane.vols.n()]) |maybe| {
             fds[n_fds] = if (maybe) |dev| dev.directFd() else -1;
             n_fds += 1;
         }

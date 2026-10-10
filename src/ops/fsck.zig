@@ -52,6 +52,10 @@ pub const REPORT_SCHEMA: u32 = 1;
 /// The admin lane's bounded report view (`ipc/wire.zig` ADMIN_ARG_MAX is 60
 /// KiB; the durable report stays complete, FSCK:L1216).
 pub const ADMIN_WIRE_CAP: usize = 60 * 1024;
+/// The online job's `arg0` option bits (`JobType.fsck`; the CLI's
+/// `--scrub` / the `scrub` verb ride the record, never a string).
+pub const JOB_ARG_SCRUB: u64 = 1 << 0;
+pub const JOB_ARG_SCRUB_ONLY: u64 = 1 << 1;
 
 // ---------------------------------------------------------------------------
 // Observability (`ops_fsck.md` §6): the `fsck_*`, `scrub_*` and the repair

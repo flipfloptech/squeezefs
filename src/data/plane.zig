@@ -469,7 +469,15 @@ pub const DataPlane = struct {
         for (cfg.data) |d| {
             if (d.state == .retired) continue;
             if (opened == router.MAX_VOLUMES) break;
-            try self.openVolume(d, opts, &opened);
+            // The router mirrors the DURABLE lifecycle state (a volume left
+            // Draining by a killed drain must read Draining to the adopted
+            // evacuation, never Active).
+            try self.openVolume(d, opts.env, &opened, switch (d.state) {
+                .active => .active,
+                .draining => .draining,
+                .disabled => .disabled,
+                .retired => unreachable,
+            });
         }
         stats.data_volumes.set(opened);
 
@@ -477,14 +485,14 @@ pub const DataPlane = struct {
         //    probe and the foreground signal; the worker + the drainer.
         self.reclaimer = reclaim.Reclaimer.init(gpa, reclaim.Config.fromEnv(opts.env, opts.budget_bytes)) catch return error.OutOfMemory;
         errdefer self.reclaimer.deinit();
-        for (self.vols.rows[0..self.vols.count], 0..) |r, i| {
+        for (self.vols.rows[0..self.vols.n()], 0..) |r, i| {
             const v = r.?;
             self.reclaimer.registerTarget(@intCast(i), v.alloc, reclaim.device_binding.target(self.devs[i].?));
         }
         self.reclaimer.setTierPurge(.{ .ctx = self, .purge = &reclaimPurge });
         self.reclaimer.setFenceProbe(.{ .ctx = self, .poll = &fencePoll });
         self.reclaimer.setForegroundSignal(.{ .ctx = null, .read = &foregroundBytes });
-        for (self.vols.rows[0..self.vols.count]) |r| r.?.alloc.space_pending = self.reclaimer.spacePending();
+        for (self.vols.rows[0..self.vols.n()]) |r| r.?.alloc.space_pending = self.reclaimer.spacePending();
         self.reclaim_free = .{ .r = self.reclaimer, .vols = &self.vols };
         self.reclaimer.start(io) catch return error.ReclaimRefused;
         errdefer self.reclaimer.stopAndJoin(io);
@@ -543,7 +551,7 @@ pub const DataPlane = struct {
 
         // 8. The warm ladder (the probe arm); the zc legs arm with the session.
         self.ladder = .{ .rp = self.rp, .guards = opts.guards, .io = io, .ceremony = .{ .ctx = self, .spawn = &spawnCeremony } };
-        for (self.vols.rows[0..self.vols.count]) |r| {
+        for (self.vols.rows[0..self.vols.n()]) |r| {
             const v = r.?;
             self.rt.updateCensus(v.vol_tag, v.alloc.usedBlocks() * cfg.block_size) catch {};
         }
@@ -560,7 +568,53 @@ pub const DataPlane = struct {
         return self;
     }
 
-    fn openVolume(self: *DataPlane, d: set_config.DataVolume, opts: Options, opened: *u32) OpenError!void {
+    /// The ONLINE `volume add-data` arm (charter §8 "online data add"): the
+    /// device the lattice just formatted and recorded joins the live plane
+    /// — opened, its allocator seeded (empty), the reclaimer's target, the
+    /// router row DISABLED (no placement until the caller armed the grant
+    /// plane over it and the lattice published `Active`) — visible to every
+    /// lock-free reader through `Volumes.add`'s release store. Returns the
+    /// ordinal the grant plane arms.
+    pub fn attachVolume(self: *DataPlane, d: set_config.DataVolume) OpenError!u16 {
+        var opened = self.vols.n();
+        if (opened >= router.MAX_VOLUMES) return error.DeviceRefused;
+        const ordinal: u16 = @intCast(opened);
+        try self.openVolume(d, self.env, &opened, .disabled);
+        const v = self.vols.rows[ordinal].?;
+        self.reclaimer.registerTarget(ordinal, v.alloc, reclaim.device_binding.target(self.devs[ordinal].?));
+        v.alloc.space_pending = self.reclaimer.spacePending();
+        stats.data_volumes.set(opened);
+        return ordinal;
+    }
+
+    /// The router's fill census off every allocator (the fill term of the
+    /// placement weights, `backend_fill_spread`, the planners' rows): the
+    /// cadence tick's and every planner's call — the census at open alone
+    /// went stale with the first write of the mount.
+    pub fn refreshCensus(self: *DataPlane) Allocator.Error!void {
+        for (self.vols.rows[0..self.vols.n()]) |r| {
+            const v = r.?;
+            self.rt.updateCensus(v.vol_tag, v.alloc.usedBlocks() * self.block_size) catch {};
+        }
+        try self.rt.refreshPlacement();
+    }
+
+    /// Index 0 of every data volume is the data superblock chunk, allocated
+    /// forever at open (`recoverBlock(0)`); every "file blocks on the
+    /// volume" census subtracts it.
+    pub const RESERVED_BLOCKS: u64 = 1;
+
+    /// The lifecycle's ONE runtime flip (the lattice's `publishPlacement`):
+    /// the router's state (placement) and the volume row's custody flag
+    /// (the write path takes no new custody on a non-Active volume), then
+    /// the placement table re-derived.
+    pub fn setVolumeState(self: *DataPlane, vol_tag: u64, to: router.VolumeState) router.RouterError!void {
+        try self.rt.setState(vol_tag, to);
+        _ = self.vols.setActive(vol_tag, to == .active);
+        try self.rt.refreshPlacement();
+    }
+
+    fn openVolume(self: *DataPlane, d: set_config.DataVolume, env: *const std.process.Environ.Map, opened: *u32, rt_state: router.VolumeState) OpenError!void {
         var zb: [linux.PATH_MAX]u8 = undefined;
         if (d.uri.len >= zb.len) return error.DeviceRefused;
         @memcpy(zb[0..d.uri.len], d.uri);
@@ -590,7 +644,7 @@ pub const DataPlane = struct {
         // the tail copy's chunk lies PAST the capacity so it is never minted.
         const ordinal: u16 = @intCast(opened.*);
         const capacity_bytes = (d.capacity_blocks + 1) * self.chunk;
-        const alloc = block_alloc.BlockAllocator.init(self.gpa, block_alloc.BlockAllocator.configFromEnv(opts.env, d.vol_tag, ordinal, self.chunk, capacity_bytes, false)) catch return error.OutOfMemory;
+        const alloc = block_alloc.BlockAllocator.init(self.gpa, block_alloc.BlockAllocator.configFromEnv(env, d.vol_tag, ordinal, self.chunk, capacity_bytes, false)) catch return error.OutOfMemory;
         errdefer alloc.deinit();
         alloc.recoverBlock(0);
         // The durable ledger seeds the population (refcount = references).
@@ -602,13 +656,13 @@ pub const DataPlane = struct {
         };
         if (population != null) alloc.seedFromDurableRefs(idxs.items);
         budget.authority.register(alloc.budgetComponent());
-        self.rt.addVolume(.{ .id = .{ .tag = d.vol_tag }, .state = .active, .capacity_bytes = d.capacity_blocks * self.block_size, .used_bytes = alloc.usedBlocks() * self.block_size }) catch return error.OutOfMemory;
-        self.vols.add(.{ .vol_tag = d.vol_tag, .ordinal = ordinal, .alloc = alloc, .passthrough = self.passthrough, .write_cache_volatile = dev.writeCache() == .write_back or dev.writeCache() == .unknown, .active = d.state == .active });
+        self.rt.addVolume(.{ .id = .{ .tag = d.vol_tag }, .state = rt_state, .capacity_bytes = d.capacity_blocks * self.block_size, .used_bytes = alloc.usedBlocks() * self.block_size }) catch return error.OutOfMemory;
+        self.vols.add(.{ .vol_tag = d.vol_tag, .ordinal = ordinal, .alloc = alloc, .passthrough = self.passthrough, .write_cache_volatile = dev.writeCache() == .write_back or dev.writeCache() == .unknown, .active = .init(rt_state == .active) });
         self.devs[ordinal] = dev;
         // The zcrx lane for this device, judged by the probe ladder (loud
         // once, Absent on this host unless a steerable HDS NIC fronts an
         // nvme-tcp target); published to the funnel when present.
-        self.zcrx_bound[ordinal] = zcrx.arm.armVolume(self.gpa, self.io, opts.env, &self.zcrx_registry, d.uri, derive.facts(), budget.authority.level());
+        self.zcrx_bound[ordinal] = zcrx.arm.armVolume(self.gpa, self.io, env, &self.zcrx_registry, d.uri, derive.facts(), budget.authority.level());
         if (self.zcrx_bound[ordinal]) |b| self.zcrx_funnel.publish(ordinal, &b.lane);
         opened.* += 1;
         log.info("data volume {s}: vol-{x:0>16} bound as ordinal {d}: {d} usable blocks, {d} referenced ({d} ref records), {d} free", .{ d.uri, d.vol_tag, ordinal, d.capacity_blocks, alloc.usedBlocks() -| 1, population orelse 0, alloc.freeBlocksCount() + alloc.virginBlocks() });
@@ -733,7 +787,7 @@ pub const DataPlane = struct {
 
     fn openNvmeTier(self: *DataPlane, gpa: Allocator, cfg: *const set_config.Config, opts: Options) nvme_read_cache.Cache {
         var aggregate: u64 = 0;
-        for (self.vols.rows[0..self.vols.count]) |r| aggregate += r.?.alloc.capacityBlocks() * self.block_size;
+        for (self.vols.rows[0..self.vols.n()]) |r| aggregate += r.?.alloc.capacityBlocks() * self.block_size;
         const tier_budget = nvme_read_cache.budgetFromEnv(opts.env, aggregate);
         if (tier_budget == 0) return nvme_read_cache.Cache.initDisabled(gpa);
         const shards = nvme_read_cache.shardPlan(tier_budget, opts.facts.cpus, self.chunk);
@@ -805,8 +859,8 @@ pub const DataPlane = struct {
         if (self.packer) |*p| p.deinit();
         self.closeStaging();
         self.closeTransform();
-        for (self.devs[0..self.vols.count]) |d| if (d) |dev| dev.closeAtDismount();
-        self.closeVolumes(self.vols.count);
+        for (self.devs[0..self.vols.n()]) |d| if (d) |dev| dev.closeAtDismount();
+        self.closeVolumes(self.vols.n());
         self.zcrx_registry.deinit();
         self.reclaimer.deinit();
         self.rt.deinit();
@@ -827,7 +881,7 @@ pub const DataPlane = struct {
     // ---- the data face (kv_fs's duck-typed `Data`) ----
 
     pub fn hasVolumes(self: *const DataPlane) bool {
-        return self.vols.count != 0;
+        return self.vols.n() != 0;
     }
 
     pub fn stagingOn(self: *const DataPlane) bool {
@@ -978,13 +1032,45 @@ pub const DataPlane = struct {
         defer entries.deinit(gpa);
         const next: layout.Layout = switch (prev.kind) {
             .packed_ => blk: {
+                // The tenant IS the durable copy (a packed layout carries no
+                // inline map — `lookup` answers null there and read every
+                // pack move as Superseded: 5,110 stale-token no-ops over a
+                // 20-tenant drain before this, rung 8).
                 if (block_index != 0) return error.Superseded;
-                const cur = prev.lookup(self.chunk, 0) orelse return error.Superseded;
+                const cur = prev.durableCopy() orelse return error.Superseded;
                 if (!cur.sameRef(expected, self.chunk) or cur.rel_off != expected.rel_off or cur.len != expected.len) return error.Superseded;
                 break :blk layout.Layout.packedTenant(prev.size, prev.file_id, new);
             },
             .striped => blk: {
-                if (prev.isKvmap()) return error.Superseded;
+                if (prev.isKvmap()) {
+                    // The block-map tree: ONE window put of the one index
+                    // (`+dst −src` in the same tx, the window store's own
+                    // shape — a drain moves a kvmap-mapped file block by
+                    // block through it, rung 8). The sweep cursor's
+                    // invariant stands: an index at/above a live cursor is
+                    // the sweep's, not a mover's.
+                    const head = prev.kvmapHead().?;
+                    if (head.sweep) |k| if (block_index >= k) return error.Superseded;
+                    const cur = (kvmap.lookup(self.mapStore(), gpa, ino, block_index, self.chunk) catch return error.InputOutput) orelse return error.Superseded;
+                    if (!cur.sameRef(expected, self.chunk) or cur.rel_off != expected.rel_off or cur.len != expected.len or cur.whole_block != expected.whole_block) return error.Superseded;
+                    const t = self.backend.begin(@src()) catch return error.OutOfMemory;
+                    var out: seams.MergeOutcome = .{};
+                    const insert = [_]seams.MapInsert{.{ .block = block_index, .binding = new }};
+                    kvmap.stageWindow(self.mapStore(), gpa, t, ino, &insert, self.chunk, &out) catch |e| {
+                        self.backend.abandon(t);
+                        return switch (e) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            else => error.InputOutput,
+                        };
+                    };
+                    self.backend.commit(t) catch |e| return switch (e) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => error.InputOutput,
+                    };
+                    self.windows.invalidate(ino);
+                    stats.layout_republishes.inc();
+                    return;
+                }
                 var found = false;
                 for (prev.entries) |e| {
                     if (e.block() != block_index) {
@@ -1074,10 +1160,10 @@ pub const DataPlane = struct {
     /// windows — all supply, never a deficit. Block 0 (the superblock
     /// chunk) is outside the capacity shown.
     pub fn statfs(self: *DataPlane) ?Space {
-        if (self.vols.count == 0) return null;
+        if (self.vols.n() == 0) return null;
         var total: u64 = 0;
         var free: u64 = 0;
-        for (self.vols.rows[0..self.vols.count]) |r| {
+        for (self.vols.rows[0..self.vols.n()]) |r| {
             const a = r.?.alloc;
             const blocks = a.capacityBlocks() - 1;
             total += blocks * self.block_size;
@@ -1497,7 +1583,7 @@ pub const DataPlane = struct {
     // ---- the transform seams ----
 
     /// The stored image of `plain` (the plane's serialized transform).
-    fn transformWrite(self: *DataPlane, vol_tag: u64, plain: []const u8) Error![]const u8 {
+    pub fn transformWrite(self: *DataPlane, vol_tag: u64, plain: []const u8) Error![]const u8 {
         _ = vol_tag;
         const x = &(self.xform orelse return plain);
         x.lock.lockUncancelable(self.io);
@@ -2363,7 +2449,7 @@ pub const DataPlane = struct {
     fn fencePoll(ctx: ?*anyopaque) bool {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         if (self.backend.isFailed()) return true;
-        for (self.devs[0..self.vols.count]) |d| if (d) |dev| if (dev.fenced()) return true;
+        for (self.devs[0..self.vols.n()]) |d| if (d) |dev| if (dev.fenced()) return true;
         return false;
     }
 
@@ -2546,17 +2632,41 @@ pub const DataPlane = struct {
         return !self.wp.writeSideView().hasCustody(ino, block_index);
     }
 
-    /// Every inline-map / packed-tenant binding of every live file (the
-    /// census walk the movers plan from). A block-map-tree head's
-    /// bindings are the sweep's (the mover republishes through the inline
-    /// map and the tenant slot only) and are not yielded.
+    /// Every binding of every live file (the census walk the movers plan
+    /// from): the inline map's and the packed tenant's off the record, a
+    /// block-map-tree head's off its tree below the live sweep cursor (the
+    /// indices at/above it are the sweep's, never a mover's; `rangeFrom`
+    /// pages the tree in `kvmap_chunk`-record windows).
     pub fn forEachBinding(self: *DataPlane, comptime Ctx: type, ctx: Ctx, comptime visit: fn (Ctx, u64, u32, Mapping) Error!void) Error!void {
         const Walk = struct {
             plane: *DataPlane,
             inner: Ctx,
             fn layoutVisit(w: *@This(), ino: u64, l: layout.Layout) Error!void {
-                if (l.isKvmap()) return;
-                var it = l.named(w.plane.chunk);
+                const plane = w.plane;
+                if (l.isKvmap()) {
+                    const head = l.kvmapHead().?;
+                    const ceiling: u64 = head.sweep orelse key.BLOCK_INDEX_MAP_BLOB;
+                    var recs: std.ArrayList(kvmap.Rec) = .empty;
+                    defer recs.deinit(plane.gpa);
+                    var from: u64 = 0;
+                    while (from < ceiling) {
+                        recs.clearRetainingCapacity();
+                        kvmap.rangeFrom(plane.mapStore(), plane.gpa, ino, @intCast(from), plane.kvmap_chunk, plane.chunk, &recs) catch |e| return switch (e) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            else => error.InputOutput,
+                        };
+                        if (recs.items.len == 0) break;
+                        for (recs.items) |r| {
+                            var b: u32 = r.index;
+                            while (b < r.end() and b < ceiling) : (b += 1) try visit(w.inner, ino, b, r.bindingAt(b, plane.chunk));
+                        }
+                        const last = recs.items[recs.items.len - 1];
+                        if (last.end() <= from) break;
+                        from = last.end();
+                    }
+                    return;
+                }
+                var it = l.named(plane.chunk);
                 while (it.next()) |e| try visit(w.inner, ino, e.block, e.mapping);
             }
         };
@@ -2585,7 +2695,7 @@ pub const DataPlane = struct {
             return;
         };
         var rows: u64 = 0;
-        for (self.vols.rows[0..self.vols.count]) |r| {
+        for (self.vols.rows[0..self.vols.n()]) |r| {
             const v = r.?;
             var report = block_refs.verifyRefs(gpa, self.refs_store, v.vol_tag, owners.items, .{ .ctx = self, .isOpenPack = &isOpenPack, .isInflight = &isInflight }) catch |e| {
                 log.err("C8 at mount: vol-{x:0>16}: {s}", .{ v.vol_tag, @errorName(e) });
@@ -2606,7 +2716,7 @@ pub const DataPlane = struct {
     fn isOpenPack(ctx: ?*anyopaque, block_idx: u64) bool {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         const p = &(self.packer orelse return false);
-        for (self.vols.rows[0..self.vols.count]) |r| {
+        for (self.vols.rows[0..self.vols.n()]) |r| {
             if (p.openPack(.{ .vol_tag = r.?.vol_tag, .scope = self.scope })) |op| if (op.base / self.chunk == block_idx) return true;
         }
         return false;
@@ -2614,7 +2724,7 @@ pub const DataPlane = struct {
 
     fn isInflight(ctx: ?*anyopaque, block_idx: u64) bool {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
-        for (self.vols.rows[0..self.vols.count]) |r| if (r.?.alloc.inflightContains(block_idx)) return true;
+        for (self.vols.rows[0..self.vols.n()]) |r| if (r.?.alloc.inflightContains(block_idx)) return true;
         return false;
     }
 
@@ -2727,7 +2837,7 @@ pub const DataPlane = struct {
         try w.writeAll(",\"placement\":");
         try self.rt.writePlacementJson(w);
         try w.writeAll(",\"volumes\":[");
-        for (self.vols.rows[0..self.vols.count], 0..) |r, i| {
+        for (self.vols.rows[0..self.vols.n()], 0..) |r, i| {
             const v = r.?;
             if (i != 0) try w.writeAll(",");
             try w.print("{{\"vol_tag\":\"vol-{x:0>16}\",\"ordinal\":{d},\"used_blocks\":{d},\"free_blocks\":{d},\"virgin_blocks\":{d},\"capacity_blocks\":{d},\"fresh_supply_latched\":{}}}", .{ v.vol_tag, v.ordinal, v.alloc.usedBlocks() -| 1, v.alloc.freeBlocksCount(), v.alloc.virginBlocks(), v.alloc.capacityBlocks() - 1, v.alloc.freshSupplyLatched() });

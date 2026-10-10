@@ -39,6 +39,7 @@ const verbs = @import("../../wire/verbs.zig");
 const block_alloc = @import("../block_alloc.zig");
 const block_refs = @import("../block_refs.zig");
 const reclaim = @import("../reclaim.zig");
+const router = @import("../router.zig");
 const plane_mod = @import("../plane.zig");
 const data_bitmap = @import("data_bitmap.zig");
 const block_grant = @import("block_grant.zig");
@@ -145,7 +146,9 @@ pub const HolderPlane = struct {
     io: Io,
     plane: *DataPlane,
     dir: WriterDirectory,
+    /// `router.MAX_VOLUMES` rows, `n_vols` armed (module law above).
     vols: []Vol,
+    n_vols: usize,
 
     const Vol = struct {
         vol_tag: u64,
@@ -168,59 +171,72 @@ pub const HolderPlane = struct {
     /// Arm every data volume: the bitmap over the allocator at the
     /// volume's lease term (`terms[ordinal]`), the ledger, the executor,
     /// the holder's own window installed as the allocator's mint source.
+    /// The table is pre-sized at the router's bound: every `Vol` is pointed
+    /// to by the allocator's seams (lease, mint source, sinks), so a row
+    /// never moves — the online `volume add-data` arms the NEXT row in
+    /// place (`armVolume`).
     pub fn create(gpa: Allocator, io: Io, plane: *DataPlane, dir: WriterDirectory, terms: []const u64, writers_known: u64) Allocator.Error!*HolderPlane {
         const self = try gpa.create(HolderPlane);
         errdefer gpa.destroy(self);
-        const n = plane.vols.count;
+        const n = plane.vols.n();
         std.debug.assert(terms.len == n);
-        const vols = try gpa.alloc(Vol, n);
+        const vols = try gpa.alloc(Vol, router.MAX_VOLUMES);
         errdefer gpa.free(vols);
-        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .dir = dir, .vols = vols };
-        var armed: usize = 0;
-        errdefer for (vols[0..armed]) |*v| self.disarm(v);
-        for (plane.vols.rows[0..n], 0..) |row, i| {
-            const r = row.?;
-            const v = &vols[i];
-            v.* = .{
-                .vol_tag = r.vol_tag,
-                .ordinal = @intCast(r.ordinal),
-                .term = terms[i],
-                .alloc = r.alloc,
-                .bitmap = undefined,
-                .grants = undefined,
-                .frees = undefined,
-                .handlers = undefined,
-                .own_sink = undefined,
-                .own = .{ .capacity_blocks = r.alloc.capacityBlocks() },
-                .own_src = undefined,
-                .holder = self,
-            };
-            v.bitmap = try data_bitmap.DataBitmap.init(gpa, r.alloc, .{
-                .vol_tag = r.vol_tag,
-                .term = terms[i],
-                .blocks = r.alloc.capacityBlocks(),
-                .ring_capacity = data_bitmap.ringCapacity(block_grant.BLOCK_GRANT_FLOOR, @max(writers_known, 1), free_ship.FREE_BATCH_MAX),
-            });
-            errdefer v.bitmap.deinit();
-            v.grants = .{ .ledger = try block_grant.Ledger.init(gpa, LEDGER_CAPACITY), .bitmap = v.bitmap };
-            v.frees = .{ .alloc = r.alloc, .durable = .{ .ctx = v, .refcount = &durableRefcount }, .ladder = .{ .ctx = v, .free = &ladderFree } };
-            v.handlers = .{ .vol_tag = r.vol_tag, .grants = &v.grants, .frees = &v.frees, .writer_ctx = self, .writerId = &writerIdFn };
-            v.own_sink = .{ .holder = &v.grants, .writer = HOLDER_WRITER };
-            v.own.sink = v.own_sink.sink();
-            v.own_src = .{ .arm = &v.own };
-            // The holder's bits and frees: the bitmap's finish-free sink
-            // clears a carved bit; the shipped-free executor adjudicates
-            // the untracked class; the mint source is the own window.
-            r.alloc.finish_free_sink = v.bitmap.finishFreeSink();
-            r.alloc.untracked_gate = v.frees.untrackedGate();
-            r.alloc.grant_source = v.own_src.source();
-            r.alloc.lease = .{ .ctx = v, .vtable = &holder_lease_vtable };
-            plane.reclaimer.setFreeTarget(v.ordinal, v.frees.localTarget());
-            armed += 1;
-        }
-        stats.alloc_lease_held_volumes.set(@intCast(n));
+        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .dir = dir, .vols = vols, .n_vols = 0 };
+        errdefer for (vols[0..self.n_vols]) |*v| self.disarm(v);
+        for (terms, 0..) |term, i| try self.armVolume(@intCast(i), term, writers_known);
         log.info("data planes: the grant plane armed as the HOLDER of {d} data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)", .{n});
         return self;
+    }
+
+    /// Arm ONE volume (the plane's row at `ordinal`, already open): at
+    /// create for every volume, online for a volume `volume add-data` just
+    /// attached — the holder's bitmap, ledger, free executor and own window
+    /// over its allocator. The lease term is the caller's (acquired on tree
+    /// 0 before this arm).
+    pub fn armVolume(self: *HolderPlane, ordinal: u16, term: u64, writers_known: u64) Allocator.Error!void {
+        const gpa = self.gpa;
+        const plane = self.plane;
+        std.debug.assert(ordinal == self.n_vols and ordinal < router.MAX_VOLUMES);
+        const r = plane.vols.rows[ordinal].?;
+        const v = &self.vols[ordinal];
+        v.* = .{
+            .vol_tag = r.vol_tag,
+            .ordinal = ordinal,
+            .term = term,
+            .alloc = r.alloc,
+            .bitmap = undefined,
+            .grants = undefined,
+            .frees = undefined,
+            .handlers = undefined,
+            .own_sink = undefined,
+            .own = .{ .capacity_blocks = r.alloc.capacityBlocks() },
+            .own_src = undefined,
+            .holder = self,
+        };
+        v.bitmap = try data_bitmap.DataBitmap.init(gpa, r.alloc, .{
+            .vol_tag = r.vol_tag,
+            .term = term,
+            .blocks = r.alloc.capacityBlocks(),
+            .ring_capacity = data_bitmap.ringCapacity(block_grant.BLOCK_GRANT_FLOOR, @max(writers_known, 1), free_ship.FREE_BATCH_MAX),
+        });
+        errdefer v.bitmap.deinit();
+        v.grants = .{ .ledger = try block_grant.Ledger.init(gpa, LEDGER_CAPACITY), .bitmap = v.bitmap };
+        v.frees = .{ .alloc = r.alloc, .durable = .{ .ctx = v, .refcount = &durableRefcount }, .ladder = .{ .ctx = v, .free = &ladderFree } };
+        v.handlers = .{ .vol_tag = r.vol_tag, .grants = &v.grants, .frees = &v.frees, .writer_ctx = self, .writerId = &writerIdFn };
+        v.own_sink = .{ .holder = &v.grants, .writer = HOLDER_WRITER };
+        v.own.sink = v.own_sink.sink();
+        v.own_src = .{ .arm = &v.own };
+        // The holder's bits and frees: the bitmap's finish-free sink
+        // clears a carved bit; the shipped-free executor adjudicates
+        // the untracked class; the mint source is the own window.
+        r.alloc.finish_free_sink = v.bitmap.finishFreeSink();
+        r.alloc.untracked_gate = v.frees.untrackedGate();
+        r.alloc.grant_source = v.own_src.source();
+        r.alloc.lease = .{ .ctx = v, .vtable = &holder_lease_vtable };
+        plane.reclaimer.setFreeTarget(v.ordinal, v.frees.localTarget());
+        self.n_vols += 1;
+        stats.alloc_lease_held_volumes.set(@intCast(self.n_vols));
     }
 
     fn disarm(self: *HolderPlane, v: *Vol) void {
@@ -248,10 +264,15 @@ pub const HolderPlane = struct {
     const holder_lease_vtable: block_alloc.AllocationLease.VTable = .{ .holderView = &holderViewFn, .noteMountSeed = &noteMountSeedFn };
 
     pub fn destroy(self: *HolderPlane) void {
-        for (self.vols) |*v| self.disarm(v);
+        for (self.vols[0..self.n_vols]) |*v| self.disarm(v);
         stats.alloc_lease_held_volumes.set(0);
         self.gpa.free(self.vols);
         self.gpa.destroy(self);
+    }
+
+    /// Volumes armed (the release walks them).
+    pub fn armed(self: *const HolderPlane) usize {
+        return self.n_vols;
     }
 
     /// The per-volume words (`vol_tag`, lease term) for the release.
@@ -262,7 +283,7 @@ pub const HolderPlane = struct {
     }
 
     fn volOf(self: *HolderPlane, vol_tag: u64) ?*Vol {
-        for (self.vols) |*v| if (v.vol_tag == vol_tag) return v;
+        for (self.vols[0..self.n_vols]) |*v| if (v.vol_tag == vol_tag) return v;
         return null;
     }
 
@@ -309,7 +330,7 @@ pub const HolderPlane = struct {
     /// `df` per the rule: the population minus the own unconsumed window.
     pub fn writeStatsJson(self: *HolderPlane, w: *Io.Writer) Io.Writer.Error!void {
         try w.writeAll("[");
-        for (self.vols, 0..) |*v, i| {
+        for (self.vols[0..self.n_vols], 0..) |*v, i| {
             if (i != 0) try w.writeByte(',');
             const word = v.grants.word();
             try w.print("{{\"vol_tag\":\"{x:0>16}\",\"population\":{d},\"frontier\":{d},\"open_grants\":{d},\"writers\":{d},\"own_window_remaining\":{d},\"used_blocks\":{d}}}", .{ v.vol_tag, word.population, word.frontier, v.grants.ledger.openCount(), v.grants.writers(), v.own.window.remaining(), word.population -| v.own.window.remaining() });
@@ -351,7 +372,7 @@ pub const WriterPlane = struct {
     pub fn create(gpa: Allocator, io: Io, plane: *DataPlane, link: Link, identity: verbs.WireIdentity) Allocator.Error!*WriterPlane {
         const self = try gpa.create(WriterPlane);
         errdefer gpa.destroy(self);
-        const n = plane.vols.count;
+        const n = plane.vols.n();
         const vols = try gpa.alloc(Vol, n);
         errdefer gpa.free(vols);
         self.* = .{ .gpa = gpa, .io = io, .plane = plane, .link = link, .identity = identity, .vols = vols };

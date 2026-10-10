@@ -76,4 +76,21 @@ suite_set_of "$dev"
 log="$SET_DIR/daemon-$(date +%Y%m%d-%H%M%S)-$$.log"
 # One line per mount in the set's own ledger, so a run's daemons are findable.
 echo "$(date +%s) mount $dir -o $all log $log" >> "$SET_DIR/mounts.log"
-exec "$SQZ_BIN" mount --daemon --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir"
+# The zero-copy kmbuf ring needs order-8 contiguous pages per queue; a
+# fragmented venue (other agents' daemons, a hot page cache) answers
+# ENOMEM. Compact and retry, as `common.sh`'s `suite_mount` does — never a
+# weaker buffer mode to pass (charter §1.6/§1.8); a test's own mount
+# failing on the venue's memory is a venue casualty, never a semantic.
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  out=$("$SQZ_BIN" mount --daemon --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir" 2>&1) && { [ -n "$out" ] && echo "$out"; exit 0; }
+  rc=$?
+  if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
+    echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"
+    sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; sleep 2
+    continue
+  fi
+  echo "$out" >&2
+  exit "$rc"
+done

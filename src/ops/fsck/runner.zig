@@ -375,6 +375,13 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             var deaths: std.ArrayList(cr.StableIdentity) = .empty;
             for (self.be.volumes, 0..) |be, vi| {
                 const vol: u16 = @intCast(vi);
+                // The flat class (`--single-writer`): no SYMMETRIC_PLANE bit,
+                // no appender directory, appender 0's page slots never
+                // written (the journal ring begins at the extent's first
+                // page) and no tree-0 slot rows — C13–C15 have no domain on
+                // this volume. Reading the slots as pages would judge the
+                // ring's bytes as a torn page census (`Corrupt`).
+                if (!be.sb.symmetricPlaneStamped()) continue;
                 var rd: Reader = .{ .be = be };
                 const reader: dir.PageReader = .{ .ctx = &rd, .read = &Reader.read };
                 // Appender 0.
@@ -604,6 +611,23 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             self.pool.fdatasync(mname) catch return error.Io;
         }
     };
+
+    const testing = std.testing;
+
+    test "fsck --offline over a `--single-writer` (flat) set is CLEAN: no appender region and no tree-0 slot rows exist, so the forest census reads nothing (repro-port: the pjdfstest harness's first fsck of a fresh flat format answered `Corrupt`)" {
+        const gpa = testing.allocator;
+        const s = try meta_set.TestSet.createClass(gpa, "flat-fsck", 1, .single_writer);
+        defer s.destroy();
+        const be = try s.open();
+        defer be.close();
+        try testing.expect(!be.volumes[0].sb.symmetricPlaneStamped());
+        const bound = try bind(gpa, s.io(), be, null, .{ .env = &s.env, .mode = .offline, .mem_budget = 256 << 20 });
+        defer destroy(bound);
+        var report = try run(&bound.host, .{}, null);
+        defer report.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), report.findings.len);
+        try testing.expect(report.counters.inodes_scanned >= 1);
+    }
 } else struct {};
 
 test {

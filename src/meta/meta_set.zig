@@ -691,6 +691,12 @@ pub const TestSet = struct {
     pub const secret: wire_auth.Secret = @splat(0x5C);
 
     pub fn create(gpa: Allocator, name: []const u8, members: u16) !*TestSet {
+        return createClass(gpa, name, members, .symmetric);
+    }
+
+    /// `create` with the format class: `.single_writer` is the flat class
+    /// (`--single-writer`: no appender region, no SYMMETRIC_PLANE bit).
+    pub fn createClass(gpa: Allocator, name: []const u8, members: u16, class: geometry.Class) !*TestSet {
         const self = try gpa.create(TestSet);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .env = std.process.Environ.Map.init(gpa), .sqz = undefined, .n = members };
@@ -707,6 +713,7 @@ pub const TestSet = struct {
             const enroll = wire_auth.encodeEnroll(secret);
             try backend.formatVolume(gpa, self.paths[i], .{
                 .env = &self.env,
+                .class = class,
                 .node_size = 65536,
                 .journal_len_override = 1 << 20,
                 .uuid = uuid,

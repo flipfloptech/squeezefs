@@ -257,6 +257,12 @@ pub const Fiber = struct {
     /// `timer_heap.zig`'s indexed slot.
     timer_slot: u32,
     timer_deadline_ns: u64,
+    /// The last timer pop was THE wake that scheduled this fiber (lane
+    /// thread only; `Lane.expireTimers` writes it, `arm` clears it). A
+    /// due timer popped while the fiber was already scheduled by a CQE or a
+    /// message leaves it false — the fiber's deadline logic must not read a
+    /// wake that lost the race as a tick (the phantom tick-rescue class).
+    timer_won: bool,
     /// The lane's ready FIFO link (lane thread only).
     ready_next: ?*Fiber,
     /// `fdwatch.zig`: the fd this fiber awaits readability on, and whether a
@@ -296,6 +302,7 @@ pub const Fiber = struct {
             .futex_linked = false,
             .timer_slot = timer_heap.no_slot,
             .timer_deadline_ns = 0,
+            .timer_won = false,
             .ready_next = null,
             .watched_fd = -1,
             .watch_replaced = false,
@@ -327,6 +334,7 @@ pub const Fiber = struct {
         f.futex_linked = false;
         f.op_pending = false;
         f.timer_slot = timer_heap.no_slot;
+        f.timer_won = false;
         f.ready_next = null;
         f.watched_fd = -1;
         f.watch_replaced = false;
@@ -426,6 +434,14 @@ pub const Fiber = struct {
     /// fiber back here.
     pub fn park(f: *Fiber) void {
         f.switchToLane(.parked);
+    }
+
+    /// After a park armed with a timer: did that timer pop AND was its pop
+    /// the wake that scheduled us? Ask BEFORE cancelling the timer (a cancel
+    /// clears the slot too). False when another wake came first, even if
+    /// the deadline had passed by then.
+    pub fn timerFired(f: *const Fiber) bool {
+        return f.timer_slot == timer_heap.no_slot and f.timer_won;
     }
 
     /// `yield_now`: back to the tail of the lane's ready queue.

@@ -107,6 +107,7 @@ const heap_law = @import("heap_law.zig");
 const inos = @import("inos.zig");
 const tx = @import("tx.zig");
 const conveyor = @import("conveyor.zig");
+const conveyor_core = @import("conveyor_core.zig");
 const format = @import("format.zig");
 const geometry = @import("geometry.zig");
 const device_loader = @import("device_loader.zig");
@@ -1367,17 +1368,19 @@ pub const KvBackend = struct {
         be.pass_fiber = null;
     }
 
-    /// The pass fiber's loop: run the scheduled pass, park until the next
-    /// election wakes it. A wake that lands mid-pass parks the delivery
-    /// word as NOTIFIED and the next park returns at once (law 1), so an
-    /// election that fires while the pass is draining is never lost.
-    /// A wake that lands while the fiber is SCHEDULED is absorbed by the
-    /// word — and the fiber IS scheduled whenever it was parked on the
-    /// queue mutex inside `unleadAndRecheck` and the unlocker woke it; the
-    /// election that followed that unlock (its `tryLead` beat the fiber's
-    /// own re-election) must not be lost to a park: the leader latch is
-    /// re-read before every park (`conveyor_core_model.PassFiber` proves
-    /// the park without it loses the wake — the 2026-10-10 wedge).
+    /// The pass fiber's loop: run the scheduled pass, re-read the leader
+    /// latch, park until the next election wakes it. A wake that lands
+    /// mid-poll parks the delivery word as NOTIFIED and the next park
+    /// returns at once (law 1); the re-read (`leaderHeld`) catches the
+    /// election whose wake the word absorbed while the fiber was already
+    /// SCHEDULED — by the queue mutex's unlock when `pending()` parked on a
+    /// committer's lock hold (`conveyor_core.zig` module doc; the
+    /// 2026-10-10 wedge) — and no suspension point sits between it and the
+    /// park. The park rides the 2 s liveness tick (`sync/tick.zig`: every
+    /// unbounded wait does): a tick that finds the latch SET with no wake
+    /// delivered is a lost election wake of whatever class comes next —
+    /// absorbed here and counted in `meta_conveyor_park_tick_rescues` (must
+    /// stay ≈ 0), never a wedge.
     fn passEntry(context: *const anyopaque) void {
         const p: *const *KvBackend = @ptrCast(@alignCast(context));
         const be = p.*;
@@ -1387,7 +1390,11 @@ pub const KvBackend = struct {
             be.cv.runScheduledPass();
             if (be.pass_stop.load(.acquire)) return;
             if (be.cv.leaderHeld()) continue;
+            f.lane.timers.arm(f, clock.monotonicNs() + sync.tick.tick_ns);
             f.park();
+            const ticked = f.timerFired();
+            if (!ticked) _ = f.lane.timers.cancel(f);
+            if (ticked and be.cv.leaderHeld()) be.cv.noteVenueTickRescue();
         }
     }
 
@@ -3052,6 +3059,143 @@ test "the admission park on the device: the smallest ring fills under a serial c
     try testing.expectEqual(@as(u64, 0), cs.refusals.load());
     try testing.expect(!be.isFailed());
     std.debug.print("\nadmission park: {d} serial commits on a {d}-page ring (grain {d}) — {d} stalls, {d} park-kicked cycles\n", .{ acked.items.len, be.geo.pages, be.geo.grain, cs.full_stalls.load(), checkpoint.stats.meta_kv_checkpoint_park_cycles.load() - park_cycles0 });
+}
+
+/// Spin (yield, never sleep) until `cond` holds or the bound passes.
+fn spinUntil(ctx: anytype, comptime cond: fn (@TypeOf(ctx)) bool, bound_ns: u64) error{Timeout}!void {
+    const started = clock.monotonicNs();
+    while (!cond(ctx)) {
+        if (clock.monotonicNs() - started > bound_ns) return error.Timeout;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+}
+
+/// The pass fiber's delivery word as the venue sees it.
+fn passFiberIdle(be: *KvBackend) bool {
+    return be.pass_fiber.?.state.load() == .idle;
+}
+
+/// The pass fiber is parked ON THE QUEUE MUTEX: the word it contended reads
+/// `contended` (its `swap` before the futex wait) and its delivery word
+/// IDLE (the lane's `endPollPending` after the park).
+fn passFiberParkedOnQueueMutex(be: *KvBackend) bool {
+    return be.cv.core.mutex.state.load(.acquire) == .contended and passFiberIdle(be);
+}
+
+// The 2026-10-10 wedge, pinned on the real venue (rung 9 F1; model 7 in
+// `conveyor_core_model.zig`): the retiring pass fiber parks on the queue
+// mutex inside its `pending()` re-check while a committer holds the lock in
+// its enqueue; the committer's unlock schedules the fiber, its CAS wins the
+// released leadership, and its `wakePass` is absorbed by the already-
+// SCHEDULED word. Without the venue's leader re-read the fiber parks with
+// the latch set and one entry queued: the committer — and every later one —
+// parks forever (`meta_conveyor_queued` = `meta_commit_parked`, no window in
+// flight, every lane thread in `io_cqring_wait`).
+test "the venue delivers every election: a committer whose enqueue parked the retiring pass on the queue mutex is drained, never left with the leader latched and the pass fiber parked (the 2026-10-10 wedge)" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "venue-election", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    const cs = be.conveyorStats();
+    const io = v.io();
+    const bound = 10 * std.time.ns_per_s;
+    const seams = &conveyor_core.test_seams;
+    defer {
+        conveyor_core.TestSeams.release(io, &seams.hold_after_unlead);
+        conveyor_core.TestSeams.release(io, &seams.hold_in_enqueue);
+    }
+
+    // 1. The pass retires through the held window: one commit drains, the
+    //    pass stores `leader = false` and holds BEFORE its re-check.
+    conveyor_core.TestSeams.arm(&seams.hold_after_unlead, &seams.unlead_held);
+    _ = try commitCreate(be, "venue-1");
+    try spinUntil(seams, struct {
+        fn f(s: *conveyor_core.TestSeams) bool {
+            return s.unlead_held.load(.acquire) != 0;
+        }
+    }.f, bound);
+    try testing.expect(!be.cv.leaderHeld());
+
+    // 2. A committer takes the queue mutex in its enqueue and holds it.
+    conveyor_core.TestSeams.arm(&seams.hold_in_enqueue, &seams.enqueue_held);
+    const Committer = struct {
+        result: anyerror!u64 = error.NotRun,
+        /// release pairs with the test's acquire: `result` is written first.
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(b: *KvBackend, c: *@This()) void {
+            c.result = commitCreate(b, "venue-2");
+            c.done.store(true, .release);
+        }
+    };
+    var c: Committer = .{};
+    const committer = try std.Thread.spawn(.{}, Committer.run, .{ be, &c });
+    try spinUntil(seams, struct {
+        fn f(s: *conveyor_core.TestSeams) bool {
+            return s.enqueue_held.load(.acquire) != 0;
+        }
+    }.f, bound);
+
+    // 3. The pass resumes into `pending()` and PARKS on the held mutex.
+    conveyor_core.TestSeams.release(io, &seams.hold_after_unlead);
+    try spinUntil(be, passFiberParkedOnQueueMutex, bound);
+    try testing.expect(!be.cv.leaderHeld());
+
+    // 4. The committer pushes, unlocks (the futex wake schedules the pass
+    //    fiber), wins the released leadership and wakes the venue — a wake
+    //    the SCHEDULED word absorbs. The pass fiber's poll then re-checks:
+    //    one entry queued, `tryLead` lost to the committer.
+    conveyor_core.TestSeams.release(io, &seams.hold_in_enqueue);
+    const Watch = struct { be: *KvBackend, c: *const Committer };
+    const w: Watch = .{ .be = be, .c = &c };
+    spinUntil(w, struct {
+        fn f(x: Watch) bool {
+            if (x.c.done.load(.acquire)) return true;
+            // The wedge: parked IDLE with the latch set and the entry queued.
+            return passFiberIdle(x.be) and x.be.cv.leaderHeld() and x.be.cv.pending() == 1;
+        }
+    }.f, bound) catch |e| {
+        // Neither outcome within the bound: unwedge for teardown, then fail.
+        be.cv.deps.pass.wake(be.cv.deps.pass.ctx);
+        committer.join();
+        return e;
+    };
+    const wedged = !c.done.load(.acquire);
+    if (wedged) be.cv.deps.pass.wake(be.cv.deps.pass.ctx); // the test's own rescue, so teardown completes
+    committer.join();
+    try testing.expect(!wedged);
+    _ = try c.result;
+    try testing.expectEqual(@as(usize, 0), be.cv.pending());
+    // The re-read delivered the election; the venue's tick backstop never had to.
+    try testing.expectEqual(@as(u64, 0), cs.park_tick_rescues.load());
+}
+
+// The venue's park backstop: an election whose wake is DROPPED (the seam
+// stands in for any future lost-wake class) is found by the pass fiber's 2 s
+// liveness tick — the commit completes, `meta_conveyor_park_tick_rescues`
+// counts exactly the one rescue, and nothing wedges.
+test "the venue's tick backstop: a dropped election wake is absorbed by the pass fiber's liveness tick and counted as one park_tick_rescue; the commit completes" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "venue-backstop", "600000");
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    const cs = be.conveyorStats();
+    const rescues0 = cs.park_tick_rescues.load();
+    conveyor.test_seams.drop_pass_wakes.store(1, .release);
+    defer conveyor.test_seams.drop_pass_wakes.store(0, .release);
+    const t0 = clock.monotonicNs();
+    const ino = try commitCreate(be, "backstop-1");
+    const waited = clock.monotonicNs() - t0;
+    try testing.expectEqual(@as(u32, 0), conveyor.test_seams.drop_pass_wakes.load(.acquire));
+    try testing.expect(try present(be, ino));
+    try testing.expectEqual(rescues0 + 1, cs.park_tick_rescues.load());
+    // The rescue rode the liveness tick, not a faster path and not a wedge.
+    try testing.expect(waited >= sync.tick.tick_ns / 2 and waited < 4 * sync.tick.tick_ns);
+    // A later election with its wake delivered needs no rescue.
+    _ = try commitCreate(be, "backstop-2");
+    try testing.expectEqual(rescues0 + 1, cs.park_tick_rescues.load());
 }
 
 // ---------------------------------------------------------------------------

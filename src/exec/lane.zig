@@ -571,7 +571,10 @@ pub const Lane = struct {
         const now = clock.monotonicNs();
         while (self.timers.popDue(now)) |f| {
             stats.timer_fires.inc();
-            if (f.state.wake()) self.pushReady(f);
+            // The pop is a tick only when it is the wake that schedules the
+            // fiber; a CQE or message reaped earlier in this pass already did.
+            f.timer_won = f.state.wake();
+            if (f.timer_won) self.pushReady(f);
         }
     }
 

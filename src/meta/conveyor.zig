@@ -361,8 +361,12 @@ pub const Stats = struct {
     /// `meta_kv_journal_full_stalls`: ring-admission parks (one per park
     /// entry); steady growth ⇒ the checkpoint lags.
     full_stalls: counters.ShardedCounter = .{},
-    /// `meta_conveyor_park_tick_rescues`: parks the 10 ms backstop tick
-    /// ended with room already there — a wake nobody sent (≈ 0 healthy).
+    /// `meta_conveyor_park_tick_rescues`: a backstop tick that found the
+    /// work already there with no wake delivered — the admission park's
+    /// 10 ms tick finding ring room, or the pass VENUE's 2 s tick finding
+    /// the leader latch set (a lost election wake; `backend.zig`
+    /// `passEntry`). ≈ 0 healthy: every room-making barrier and every
+    /// election wakes its waiter itself.
     park_tick_rescues: counters.ShardedCounter = .{},
     /// `manager_dependency_stalls` (charter §5.5): a grant-fed conveyor's
     /// heap refusal answered `GrantExhausted` — the appender out of grant
@@ -460,6 +464,10 @@ pub const TestSeams = struct {
     /// publishes the hold.
     hold_at_park: std.atomic.Value(u32) = .init(0),
     park_held: std.atomic.Value(u32) = .init(0),
+    /// N ⇒ the next N election winners' wakes of the pass venue are DROPPED
+    /// (the lost-wake shape the venue's tick backstop must absorb and
+    /// `park_tick_rescues` must count).
+    drop_pass_wakes: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -894,7 +902,9 @@ pub const Conveyor = struct {
     /// the pass (ONE wake per election; the pass holds leadership until an
     /// empty drain releases it).
     fn leadIfElected(self: *Conveyor) void {
-        if (self.core.tryLead()) self.deps.pass.wake(self.deps.pass.ctx);
+        if (!self.core.tryLead()) return;
+        if (test_seams.drop_pass_wakes.load(.acquire) != 0 and test_seams.drop_pass_wakes.fetchSub(1, .acq_rel) != 0) return;
+        self.deps.pass.wake(self.deps.pass.ctx);
     }
 
     /// The pass venue's body: run the pass iff an election scheduled one
@@ -909,10 +919,19 @@ pub const Conveyor = struct {
     /// while the venue's fiber was SCHEDULED (woken from its own park on
     /// the queue mutex inside `unleadAndRecheck`) was a no-op on the
     /// task-state word — the latch is the truth the word may have
-    /// coalesced away (`conveyor_core_model.PassFiber`; the 2026-10-10
-    /// wedge: 16 committers parked, no pass, every thread asleep).
+    /// coalesced away (`conveyor_core_model.PassFiber`; `conveyor_core.zig`
+    /// module doc; the 2026-10-10 wedge: 16 committers parked, no pass,
+    /// every thread asleep — pinned on the real venue in `backend.zig`).
     pub fn leaderHeld(self: *const Conveyor) bool {
         return self.core.leader.load(.seq_cst);
+    }
+
+    /// The venue's park backstop found the leader latch set with no wake
+    /// delivered (`backend.zig` `passEntry`): a lost election wake, absorbed
+    /// by the tick and counted here — the same must-stay-≈0 tripwire as the
+    /// admission park's.
+    pub fn noteVenueTickRescue(self: *Conveyor) void {
+        self.stats.park_tick_rescues.inc();
     }
 
     /// The thread the last pass ran on (0 before any).

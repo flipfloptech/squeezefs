@@ -31,6 +31,17 @@
 //! wakeup; so is a non-seq_cst release (the store may sit in the store
 //! buffer past the recheck — Dekker's shape).
 //!
+//! The theorem hands a won election to "the winner's pass". On the product
+//! venue (`backend.zig`) that pass is ONE fiber and the handoff is one wake
+//! of its delivery word — a wake the word ABSORBS when the fiber is already
+//! SCHEDULED, which `pending()` makes possible: its mutex acquire parks the
+//! fiber when a committer holds the lock, and that committer's unlock is
+//! the wake that schedules it. So the venue owes a third step: after
+//! `pass()` returns it re-reads `leader` and runs again while it is set,
+//! with no suspension point between that read and its park (model 7 in
+//! `conveyor_core_model.zig`; the 2026-10-10 wedge was the venue parking
+//! on a stale "a racing enqueuer owns the drain").
+//!
 //! ## Groups
 //!
 //! `enqueueMany` pushes a whole set under ONE lock hold. Because the drain
@@ -47,6 +58,39 @@
 
 const std = @import("std");
 const counters = @import("../core/counters.zig");
+
+/// Test seams (one relaxed load each when unarmed; never a sleep): the two
+/// holds that pin the venue race of model 7 on real threads — a committer
+/// held INSIDE its enqueue's lock hold, and the leader held between its
+/// release and its re-check. Each publishes its hold through the paired
+/// `*_held` word. A hold parks through the `Io` (a lane fiber parks, so
+/// the lane keeps running stage B; a raw thread waits in the kernel) and
+/// `release` wakes it.
+pub const TestSeams = struct {
+    hold_in_enqueue: std.atomic.Value(u32) = .init(0),
+    enqueue_held: std.atomic.Value(u32) = .init(0),
+    hold_after_unlead: std.atomic.Value(u32) = .init(0),
+    unlead_held: std.atomic.Value(u32) = .init(0),
+
+    fn holdWhile(io: std.Io, hold: *const std.atomic.Value(u32), held: *std.atomic.Value(u32)) void {
+        while (hold.load(.acquire) != 0) {
+            held.store(1, .release);
+            io.futexWaitUncancelable(u32, &hold.raw, 1);
+        }
+    }
+
+    pub fn arm(hold: *std.atomic.Value(u32), held: *std.atomic.Value(u32)) void {
+        held.store(0, .release);
+        hold.store(1, .release);
+    }
+
+    pub fn release(io: std.Io, hold: *std.atomic.Value(u32)) void {
+        hold.store(0, .release);
+        io.futexWake(u32, &hold.raw, std.math.maxInt(u32));
+    }
+};
+
+pub var test_seams: TestSeams = .{};
 
 /// The queue + leadership word. `T` is the backend's queue entry ({staged
 /// records, shared guard set, completion channel} in production; small
@@ -111,6 +155,7 @@ pub fn ConveyorCore(comptime T: type) type {
             {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
+                TestSeams.holdWhile(self.io, &test_seams.hold_in_enqueue, &test_seams.enqueue_held);
                 if (self.slots.len - self.len < entries.len) return error.Full;
                 for (entries) |e| {
                     self.slots[(self.head + self.len) % self.slots.len] = e;
@@ -161,11 +206,14 @@ pub fn ConveyorCore(comptime T: type) type {
         /// Release leadership, THEN re-check the queue (the order IS the
         /// no-lost-wakeup theorem). `true` ⇒ the caller re-elected itself
         /// and must run another pass; `false` ⇒ it may exit (the queue is
-        /// empty, or a racing enqueuer's `tryLead` won and owns the drain).
+        /// empty, or a racing enqueuer's `tryLead` won and owns the drain —
+        /// a venue whose drain is a wake must re-read `leader` before it
+        /// parks; module doc).
         pub fn unleadAndRecheck(self: *Self) bool {
             // seq_cst store paired with `tryLead`'s seq_cst CAS; a release
             // store here is the store-buffer weakening the model fails.
             self.leader.store(false, .seq_cst);
+            TestSeams.holdWhile(self.io, &test_seams.hold_after_unlead, &test_seams.unlead_held);
             if (self.pending() == 0) return false;
             return self.tryLead();
         }

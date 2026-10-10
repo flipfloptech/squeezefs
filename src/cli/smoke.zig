@@ -4305,13 +4305,16 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
     try rig.createImage();
     try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
 
-    // 1. The fill: 20 packed 64 KiB files, three fsync'd 20 MiB striped
-    //    files, the 1.5 GiB block-map file; umount (the staged files
-    //    promote into packs), the offline clone (a shared block), remount.
+    // 1. The fill: 80 packed 64 KiB files (5 pack blocks at 1 MiB — enough
+    //    that after the drain spreads them over two volumes one volume
+    //    holds ≥ 3 victims: a LONE half-empty pack frees nothing and is
+    //    not a victim), three fsync'd 20 MiB striped files, the 1.5 GiB
+    //    block-map file; umount (the staged files promote into packs), the
+    //    offline clone (a shared block), remount.
     try rig.spawnMount(&.{});
     _ = try rig.awaitReady(0);
     {
-        const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 20 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; echo filled");
+        const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 80 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; echo filled");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
     }
@@ -4452,12 +4455,25 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
         }
     }
 
-    // 4. `defrag --pack` on a half-empty pack: 10 of the 20 packed files
-    //    unlinked, the compactor copies the live windows once; the kept
-    //    files stay byte-exact.
+    // 4. `defrag --pack` on half-empty packs: 3 of every 4 packed files
+    //    unlinked (every pack ≤ ¼ live), the compactor copies the live
+    //    windows once into fewer blocks; the kept files stay byte-exact.
     {
-        const out = try rig.onMount("i=0; while [ $i -lt 10 ]; do rm p/small$i; i=$((i + 1)); done; sync; echo rm-ok");
+        const out = try rig.onMount("i=0; while [ $i -lt 80 ]; do if [ $((i % 4)) -ne 0 ]; then rm p/small$i; fi; i=$((i + 1)); done; sync; echo rm-ok");
         defer gpa.free(out);
+        // The unlinked files are corpses until the reclaim cadence destroys
+        // them (≤ one watchdog tick, 5 s): the census names their tenants
+        // until then, so the compactor is given the destroyed shape.
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        var destroyed: u64 = 0;
+        while (clock.monotonicNs() < deadline) {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            destroyed = numberAfter(st, "\"fuse_reclaim_destroys\":") orelse 0;
+            if (destroyed >= 60) break;
+            sleepMs(250);
+        }
+        try testing.expect(destroyed >= 60);
     }
     {
         const r = try rig.squeezefs(&.{ "defrag", "--pack", rig.mp });
@@ -4473,7 +4489,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
         const compactions = numberAfter(st, "\"pack_compactions\":") orelse 0;
         std.debug.print("smoke[jobs]: defrag --pack: {d} pack compaction(s)\n", .{compactions});
         try testing.expect(compactions >= 1);
-        const out = try rig.onMount("i=10; while [ $i -lt 20 ]; do grep \"p/small$i\\$\" \"$1/before.sha\" | sha256sum -c --quiet - ; i=$((i + 1)); done; echo pack-exact");
+        const out = try rig.onMount("i=0; while [ $i -lt 80 ]; do grep \"p/small$i\\$\" \"$1/before.sha\" | sha256sum -c --quiet - ; i=$((i + 4)); done; echo pack-exact");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "pack-exact") != null);
     }
@@ -4541,7 +4557,7 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
     }
     // Every file byte-exact after two drains and a compaction.
     {
-        const out = try rig.onMount("sha256sum big big0 big1 big2 p/small1? | sort -k2 > \"$1/after.sha\"; grep -v 'p/small[0-9]$' \"$1/before.sha\" | sort -k2 | cmp - \"$1/after.sha\"; cmp big0 big0-clone; echo all-exact");
+        const out = try rig.onMount("sha256sum big big0 big1 big2 p/small* | sort -k2 > \"$1/after.sha\"; { grep ' big[0-2]*$' \"$1/before.sha\"; for i in $(seq 0 4 76); do grep \" p/small$i\\$\" \"$1/before.sha\"; done; } | sort -k2 | cmp - \"$1/after.sha\"; cmp big0 big0-clone; echo all-exact");
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "all-exact") != null);
     }

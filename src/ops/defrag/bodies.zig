@@ -148,9 +148,11 @@ pub const DefragPackBody = struct {
             error.ScopeIneligible => error.ScopeIneligible,
         };
         defer plan.deinit(self.gpa);
+        log.info("defrag --pack: {d} eligible volume(s) in scope, {d} binding(s) walked, {d} open pack(s) ({d} B room), max slot {d} B — {d} victim(s), the plan frees {d} block(s){s}", .{ scope.items.len, refs.len, open.len, vt.openRoomBytes(sctx), vt.packMaxSlot(sctx), plan.victims.len, plan.frees, if (plan.skipped_lone_victim) " (a lone victim skipped)" else "" });
         f.setRemaining(io, job, plan.victims.len);
         if (!plan.executes()) return .completed;
         var compacted: usize = 0;
+        var deferred: usize = 0;
         for (plan.victims) |v| {
             const t0 = clock.monotonicNs();
             switch (pack_compact.compactOne(vt.pack(sctx), self.gpa, v) catch |e| return switch (e) {
@@ -162,11 +164,17 @@ pub const DefragPackBody = struct {
                     stats.pack_compactions.inc();
                     stats.pack_compaction_bytes_reclaimed.add(chunk - v.live_bytes);
                 },
-                .deferred, .superseded => {},
+                .deferred => deferred += 1,
+                .superseded => {},
             }
             if (f.taskDone(io, job, clock.monotonicNs() - t0) == .stop) return .progressed;
         }
-        return if (compacted > 0) .progressed else .completed;
+        if (compacted > 0) return .progressed;
+        // Every victim deferred (a live referencer, an open pack, an
+        // unstable pin — the unlinks that made them victims still landing):
+        // re-plan after the backoff, bounded by DEFRAG_MAX_PASSES; a pass
+        // that compacts nothing and defers nothing is the end.
+        return if (deferred > 0) .deferred else .completed;
     }
 };
 

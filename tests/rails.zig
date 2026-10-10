@@ -20,6 +20,16 @@ const knobs = squeezefs.knobs;
 
 const roots = [_][]const u8{ "src", "tests" };
 
+/// Read a walked file; a file that vanished between the walk and the read
+/// (a concurrent agent's `zig fmt` or checkout in the shared tree) has
+/// nothing to scan and is skipped, never a rail failure.
+fn readWalked(gpa: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir, path: []const u8) !?[:0]u8 {
+    return cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
 /// A wrong root (or a cwd that is not the repo) must fail loud, not pass
 /// vacuously. Raised as the tree grows.
 const min_files = 8;
@@ -148,7 +158,7 @@ fn collectHits(gpa: std.mem.Allocator, io: std.Io) !struct { hits: std.ArrayList
     }
     var hits: std.ArrayList(Hit) = .empty;
     for (files.items) |path| {
-        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
         defer gpa.free(text);
         try scanFile(gpa, path, text, &hits);
     }
@@ -304,7 +314,7 @@ test "stats inverse census: every module declaring an instrument is a stats sour
     var declaring: usize = 0;
     for (files.items) |path| {
         if (isExemptInstrumentFile(path)) continue;
-        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
         defer gpa.free(text);
         if (!declaresInstrument(text)) continue;
         declaring += 1;
@@ -646,7 +656,7 @@ test "skip rail: no bare error.SkipZigTest outside the testkit" {
     defer violations.deinit();
     var kit_seen = false;
     for (files.items) |path| {
-        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
         defer gpa.free(text);
         const line = namesSkipZigTest(text) orelse continue;
         if (std.mem.eql(u8, path, testkit_path)) {
@@ -734,7 +744,7 @@ test "fuzz census: every public decoder has a fuzz test naming it; every fuzz te
     var decoders: usize = 0;
     var fuzz_tests: usize = 0;
     for (files.items) |path| {
-        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
         defer gpa.free(text);
         var c = try census.scan(gpa, text);
         defer c.deinit(gpa);
@@ -860,7 +870,7 @@ test "literal rail: every runtime literal in product code is derived, documented
     for (files.items) |path| {
         if (literals.isHarnessFile(path)) continue;
         scanned_files += 1;
-        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        const text = try readWalked(gpa, io, cwd, path) orelse continue;
         defer gpa.free(text);
         var v = try literals.scan(gpa, text);
         defer v.deinit(gpa);

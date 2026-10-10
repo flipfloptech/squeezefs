@@ -163,6 +163,11 @@ pub const stats = struct {
     /// `parked_gate_cold_flushes`: a writer at the cap flushed the coldest
     /// parked block (untouched ≥ `PARKED_COLD_NS`) to make its cell.
     pub var parked_gate_cold_flushes: counters.ShardedCounter = .{};
+    /// `parked_gate_wall_refusals`: writes answered ENOSPC after
+    /// `PARKED_GATE_WALL_NS` of plane-refused cold flushes with no capacity
+    /// returned (the plane is broken, not slow). Must stay 0 on a healthy
+    /// set.
+    pub var parked_gate_wall_refusals: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
 
     pub fn ledgerSum() u64 {
@@ -178,7 +183,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
@@ -356,11 +361,24 @@ pub const ParkHook = struct {
 /// that would complete it are not in flight (a hot block under a QD32
 /// stream sees its siblings within milliseconds). At the pool cap a cold
 /// block is flushed by the writer that needs its cell — one bounded upload
-/// — while a hot set is waited on (an upload in flight returns a cell at
-/// the device's pace). The tick is `sync/tick.zig`'s 2 s: the one liveness
-/// period every unbounded wait rides, so a write parked here is never
-/// quiet longer than any other park.
+/// — while a hot set with an upload in flight is waited on (that upload
+/// returns a cell at the device's pace); a set with NO upload in flight is
+/// flushed at once whatever its age, since nothing else can return a cell
+/// and the writer holds its inode guard meanwhile. The tick is
+/// `sync/tick.zig`'s 2 s: the one liveness period every unbounded wait
+/// rides, so a write parked here is never quiet longer than any other park.
 pub const PARKED_COLD_NS: u64 = sync_tick.tick_ns;
+
+/// How long the gate keeps retrying cold flushes the plane REFUSES (a
+/// terminal `StorageFull` after the valve drained, a failed DMA) with no
+/// capacity returned before the write answers ENOSPC: the allocation
+/// layer's own wall (`enospc.PRESSURE_PARK_WALL_FLOOR_MS`, 1 s — "past it
+/// the refusal stands, loud: the plane is broken, not slow"). The gate
+/// retries once per tick, so the second refused flush crosses it: a write
+/// occupies its inode guard for two ticks at most on a starving store,
+/// not the 30 s that queued a QD32 stream behind one parked writer past
+/// the harness's bound (rung 9, the direct row on the 512m aging store).
+pub const PARKED_GATE_WALL_NS: u64 = enospc.PRESSURE_PARK_WALL_FLOOR_MS * std.time.ns_per_ms;
 
 pub const Arm = enum(u8) { patch, overlay, extent, accumulate_park, write_through };
 
@@ -793,6 +811,7 @@ pub const WritePath = struct {
         var hint: enum { none, overlay_drain, upload, fold } = .none;
         var upload_permit: ?pipeline.Permit = null;
         var prof = pipeline.Prof.start();
+        var gate: GateWall = .{};
         const arm: Arm = blk: while (true) {
             const g = self.locks.acquire(io, req.ino, pc.block, .write_checkout);
             var held = true;
@@ -844,14 +863,14 @@ pub const WritePath = struct {
             const existing = self.table.get(req.ino, pc.block);
             if (small and !stream_adjacent and (existing == null or existing.?.repr == .extent)) {
                 const e = existing orelse self.table.checkoutExtent(req.ino, pc.block, has_existing, live_binding) orelse {
-                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                     continue;
                 };
                 e.repr.extent.merge(self.gpa, pc.rel, data) catch return error.OutOfMemory;
                 const v = e.coverage.record(pc.rel, pc.rel + pc.len, @intCast(bs)) catch {
                     // The run table is full on an extent entry: escalate (the slabs lay into a buffer).
                     if (self.table.escalate(e) == null) {
-                        self.parkAtPoolCap(io, g, &held, req, pc.block);
+                        try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                         continue;
                     }
                     extent.stats.extent_escalations.inc();
@@ -895,7 +914,7 @@ pub const WritePath = struct {
                     if (p.seam.take(p.seam.ctx, req.ino, pc.block, pc.rel, data.ptr, &runs)) |ad| {
                         const adopted = self.table.checkoutAdopting(req.ino, pc.block, has_existing, live_binding, ad.cell, runs[0..ad.n_runs]) orelse {
                             self.table.pool.release(ad.cell);
-                            self.parkAtPoolCap(io, g, &held, req, pc.block);
+                            try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                             continue;
                         };
                         stats.admit_write_accumulate_bytes.add(pc.len);
@@ -908,13 +927,13 @@ pub const WritePath = struct {
                 }
                 break :blk_g self.table.checkout(req.ino, pc.block, has_existing, live_binding) orelse {
                     // The pool is at its cap: the gate parks, never a lost byte.
-                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                     continue;
                 };
             };
             if (e.repr == .extent) {
                 if (self.table.escalate(e) == null) {
-                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                     continue;
                 }
                 extent.stats.extent_escalations.inc();
@@ -926,7 +945,7 @@ pub const WritePath = struct {
             // seed's complement) meets the same cap: the gate, then the ladder.
             const verdict = self.recordPiece(e, pc, data, req) catch |err| switch (err) {
                 error.PoolExhausted => {
-                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                     continue;
                 },
                 error.InputOutput, error.OutOfMemory => |x| return x,
@@ -990,12 +1009,20 @@ pub const WritePath = struct {
         };
     }
 
+    /// One write's standing at the gate across its ladder rounds: when its
+    /// first FAILED cold flush happened. The wall runs from there.
+    const GateWall = struct {
+        failed_since_ns: u64 = 0,
+    };
+
     /// An accumulation arm met the parked-buffer cap under (3): drop the
-    /// guard, run the gate, and let the caller restart the ladder.
-    fn parkAtPoolCap(self: *WritePath, io: Io, g: seams.BlockLocks.Guard, held: *bool, req: Request, block: u32) void {
+    /// guard, run the gate, and let the caller restart the ladder — or
+    /// answer ENOSPC once the plane has refused the gate's flushes for a
+    /// whole wall.
+    fn parkAtPoolCap(self: *WritePath, io: Io, g: seams.BlockLocks.Guard, held: *bool, req: Request, block: u32, gate: *GateWall) error{ NoSpaceLeft, WriterGuardFenced }!void {
         held.* = false;
         g.release(io);
-        self.awaitParkedCapacity(io, req, block);
+        return self.awaitParkedCapacity(io, req, block, gate);
     }
 
     /// THE PARKED-BUFFER GATE (the charter's backpressure law: park, never
@@ -1005,8 +1032,9 @@ pub const WritePath = struct {
     /// lost), then:
     ///   - room: go;
     ///   - the coldest parked block (not this one, not mid-upload) has sat
-    ///     untouched ≥ `PARKED_COLD_NS`: flush it — the writer pays for one
-    ///     bounded upload instead of waiting on pieces that are not coming
+    ///     untouched ≥ `PARKED_COLD_NS`, or NO upload is in flight to return
+    ///     a cell: flush it — the writer pays for one bounded upload instead
+    ///     of waiting on pieces that are not coming
     ///     (`parked_gate_cold_flushes`); a flush that leaves it parked (a
     ///     failed DMA, a full set) falls through to the wait so a dead
     ///     victim is never spun on;
@@ -1014,30 +1042,50 @@ pub const WritePath = struct {
     ///     block turns cold (so a wait never outlives the flush it defers
     ///     to) or one tick when nothing is parked at all.
     /// Each visit counts `parked_gate_waits`; the op watchdog sees the
-    /// station through `park_hook`.
-    fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32) void {
+    /// station through `park_hook`. A cold flush the PLANE refuses (no
+    /// fresh block to mint, a failed DMA) retires nothing and wakes nobody:
+    /// one try per tick, and once the refusals have spanned
+    /// `PARKED_GATE_WALL_NS` with no capacity returned the write answers
+    /// ENOSPC — the plane is broken, not slow (the allocation layer's own
+    /// wall, `parked_gate_wall_refusals`, one loud line). The venue's
+    /// aging store reached this with every mintable block held by open
+    /// rewrite-shadow epochs and reclaim debt while fill ratios read 50 %
+    /// and 17 % (rung 9, the bracket harness's seq-write-1m-buffered leg).
+    fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32, gate: *GateWall) error{ NoSpaceLeft, WriterGuardFenced }!void {
         stats.parked_gate_waits.inc();
         if (req.park_hook) |h| h.parked(h.ctx);
         var room = self.table.capacity.notified();
         _ = room.enable(io);
         if (self.table.hasRoom()) {
             room.cancel(io);
+            gate.failed_since_ns = 0;
             return;
         }
         var until = PARKED_COLD_NS;
         if (self.table.coldestParked(req.ino, block, clock.monotonicNs())) |v| {
-            if (v.age_ns >= PARKED_COLD_NS) {
+            if (v.age_ns >= PARKED_COLD_NS or !self.table.anyUploadInflight()) {
                 stats.parked_gate_cold_flushes.inc();
                 switch (accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, v.ino, v.block)) {
                     .published, .discarded, .joined => {
                         room.cancel(io);
+                        gate.failed_since_ns = 0;
                         return;
                     },
-                    // A dead victim (no fresh block, a failed DMA) retires
-                    // nothing and wakes nobody: a whole tick before the next
-                    // try (the 7.7 M-round spin of 2026-10-10 rode the
-                    // settle notify, which a failed upload fires too).
-                    .stay_parked, .fence_drop, .superseded => {},
+                    // The writer is fenced: nothing of this mount lands again.
+                    .fence_drop => {
+                        room.cancel(io);
+                        return error.WriterGuardFenced;
+                    },
+                    .stay_parked, .superseded => {
+                        const now = clock.monotonicNs();
+                        if (gate.failed_since_ns == 0) gate.failed_since_ns = now;
+                        if (now - gate.failed_since_ns >= PARKED_GATE_WALL_NS) {
+                            room.cancel(io);
+                            stats.parked_gate_wall_refusals.inc();
+                            log.err("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused by the plane for {d} ms (wall {d} ms; {d} parked, {d} B) — answering ENOSPC; the plane is broken, not slow", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, PARKED_GATE_WALL_NS / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
+                            return error.NoSpaceLeft;
+                        }
+                    },
                 }
             } else until = PARKED_COLD_NS - v.age_ns;
         }
@@ -1603,7 +1651,7 @@ fn parkHalf(w: *World, io: Io, ino: u64, block: u32, seed: u8) !void {
 // partials — 250 parked, 36 uploads). A blocking write on a regular file
 // may not answer EAGAIN: the gate parks, and a set that is COLD (nothing
 // in flight to return a cell) is drained by the writer itself.
-test "the parked-buffer gate, cold set: the write past the cap completes — the coldest parked block is flushed durably (never a lost byte), the piece parks, no EAGAIN" {
+test "the parked-buffer gate, cold set: the write past the cap completes at once — the coldest parked block is flushed durably (never a lost byte), the piece parks, no EAGAIN" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);
@@ -1619,11 +1667,9 @@ test "the parked-buffer gate, cold set: the write past the cap completes — the
     const waited = clock.monotonicNs() - t0;
     try testing.expect(stats.parked_gate_waits.load() > waits0);
     try testing.expectEqual(cold0 + 1, stats.parked_gate_cold_flushes.load());
-    // The gate waited for the coldest to turn cold (no upload was in
-    // flight to settle sooner), then flushed it: measured 2007–2011 ms on
-    // the venue. The lower bound is the contract (a hot block is never
-    // flushed); the upper one tolerates a loaded venue's second gate round.
-    try testing.expect(waited + std.time.ns_per_s / 2 >= PARKED_COLD_NS and waited < 5 * PARKED_COLD_NS);
+    // No upload was in flight to return a cell: the coldest block was
+    // flushed at once, never after a tick of waiting on nothing.
+    try testing.expect(waited < PARKED_COLD_NS / 2);
     // Block 0 is on the device: its half, then zeros; blocks 1..8 parked.
     const b0 = w.f.map.seam().lookup(1, 0) orelse return error.VictimNotPublished;
     var got: [wt.BS]u8 = undefined;
@@ -1685,6 +1731,30 @@ test "the parked-buffer gate, dead victim: three writers whose cold flushes fail
     try testing.expect(stats.parked_gate_cold_flushes.load() - cold0 >= 4);
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
     for ([_]u32{ 8, 9, 10 }) |b| try testing.expect(w.wp.table.has(1, b));
+}
+
+// The wall: a plane that refuses the gate's cold flushes for the whole wall
+// with no capacity returned answers the write ENOSPC, once and loud — the
+// plane is broken, not slow; RAM is not grown past the cap and nothing is
+// lost (the parked set stays).
+test "the parked-buffer gate, the wall: cold flushes the plane keeps refusing end in ONE loud ENOSPC after the wall; the parked set is intact" {
+    const io = testing.io;
+    // The product wall is already shorter than one tick: the second
+    // refused flush crosses it.
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const refusals0 = stats.parked_gate_wall_refusals.load();
+    for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    log.testing.expectErrorLogs(1);
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&half, 9);
+    try testing.expectError(error.NoSpaceLeft, w.wp.write(io, .{ .ino = 1, .offset = 8 * wt.BS, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(8 * wt.BS) }));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(refusals0 + 1, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    try testing.expect(!w.wp.table.has(1, 8));
+    w.f.dev.setFailWrites(0, error.InputOutput);
 }
 
 /// A device hook that holds every DMA until released (the window between a

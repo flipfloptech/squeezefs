@@ -688,6 +688,15 @@ pub const Table = struct {
         return self.pool.hasRoom();
     }
 
+    /// Some parked entry's upload is in flight: a cell will return without
+    /// a flush (the gate waits for it); none ⇒ only a flush can.
+    pub fn anyUploadInflight(self: *Table) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.entries) |*e| if (e.in_use and e.upload_inflight) return true;
+        return false;
+    }
+
     /// A gate victim's identity and how long it has sat untouched.
     pub const Coldest = struct { ino: u64, block: u32, age_ns: u64 };
 

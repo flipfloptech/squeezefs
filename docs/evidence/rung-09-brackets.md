@@ -380,11 +380,25 @@ coldest parked block sat untouched ≥ `PARKED_COLD_NS` (the 2 s liveness
 tick) is drained by the writer itself (`parked_gate_cold_flushes`: one
 bounded upload, zero-completed or seeded from the write-side authority);
 otherwise wait for the next upload's settle, bounded by the moment the
-coldest turns cold. The op's watchdog station is `write_parked_pool`;
+coldest turns cold — or at once when no upload is in flight (nothing else
+can return a cell; `34dedf3`). The gate wakes on the table's CAPACITY
+notify (an entry retired), never on an upload's exit (`5db4540`: a failed
+flush settles `upload_settled` too, and three writers at the cap riding it
+woke one another's failed flushes forever — 7.7 M, then 3.75 M gate rounds
+in four minutes on the harness's first legs); a flush the plane refuses
+(terminal `StorageFull`, a failed DMA) retires nothing and is retried once
+per tick, and once the refusals span the allocation layer's 1 s wall with
+no capacity returned the write answers ENOSPC, counted
+(`parked_gate_wall_refusals`, must stay 0 on a healthy set) and logged
+once — the plane is broken, not slow (`34dedf3`; the store state behind it
+is F17). The op's watchdog station is `write_parked_pool`;
 `write_admit.Error` has no `WouldBlock` member and the handler has no EAGAIN
 arm for a write. Legitimately non-blocking callers: none on the write path —
 the IPC placed-sever registry's `PoolExhausted` is its own copy fallback, not
-an answer to the application. Before/after on `seq-write-1m-direct`
+an answer to the application. Tests: "the parked-buffer gate, cold set" /
+"hot set" (red: `WouldBlock`), "dead victim" (three writers; red: 130 flush
+attempts in a few thousand yields), "the wall" (one error line, one
+refusal, the parked set intact). Before/after on `seq-write-1m-direct`
 (512m/job): see the measured rows at the end of this section.
 
 F3. **The shim does not intercept fio's libaio engine** (product).
@@ -582,6 +596,51 @@ F16. Metadata rows cost ≈ 1.01 journal entries per create and 5.21 per
 `tar` entry (create, write, the setattr pair, the parent's Δtime); the
 fsync phase ledger is dominated by the two device barriers (data 824 µs +
 meta 517 µs of 1 343 µs on nvmet-loop over a file backend).
+
+F17. **The aging store starves its own flushes** (product, data plane —
+surfaced by F2's gate; owner: the allocator/reclaim). On the harness's
+default 6 GiB × 2 set, every sustained overwrite row ends with the
+allocator refusing the WRITE-THROUGH and the gate's cold flushes
+`StorageFull` while the volumes read 50 %/18 % (buffered) and even
+25 %/8 % (direct, 512m/job) full: `alloc_valve_passes` 3.6–3.9 k per
+leg, `overlay_enospc_declines` 1.1–1.2 k, `write_through_fallbacks`
+580–650 — the reclaim returns supply at the device's pace
+(`block_free_elided_debt_bytes` 6.3 GB per leg, the debt drains at
+1 Hz) and the hot overlay writers mint every block the moment it lands
+(`alloc_fresh_mints` 6–7.7 k per leg succeed), so a block that COMPLETED
+in RAM cannot upload (`write_pipeline_stay_parked` ≡ the fallbacks) and
+sits parked; the pool fills with those, and the gate's victim flush loses
+the same race once per tick until its wall. The pre-fix binary showed the
+same store state as 100–128 EAGAIN per leg (F2); the gate shows it as
+57–96 `parked_gate_wall_refusals` (ENOSPC, one loud line each) per leg
+and, on the QD32 direct row, as `lock_ticked_reregisters` 1.75 k (the
+siblings queued on the inode guard behind each gate-parked writer for the
+two ticks the wall allows). `write_fresh_block_enospc_refusals` and
+`alloc_fresh_supply_exhausted` stay 0 throughout — the allocation layer
+never calls the set exhausted, it just refuses each attempt after the
+valve drained. The same row on a 24 GiB set (`--data-size 25769803776`,
+the fresh frontier never exhausted within a leg) is VALID: fio rc 0, 0
+EAGAIN, 0 wall refusals, `parked_pool_refusals` 0 (uploads land, the pool
+never fills). Owed: a supply wait for the completed block's upload (the
+grace-bounded form, or priority for a flush that frees RAM over a fresh
+overlay mint), and the reclaim's debt drain paced to the device, not 1 Hz.
+
+### Measured rows after the F1/F2/F6 fixes (binary `34dedf3`, nvmet-tcp, QD32 × 4)
+
+`seq-write-1m-buffered` (1g/job, 4 legs × 60 s): **0 wedges** (pre-fix:
+2 of 4 legs wedged on this row, 5 wedges in the day); 483–519 MiB/s;
+`meta_conveyor_park_tick_rescues` 0 / `journal_lane_park_tick_rescues` 0
+on every leg (pre-fix 9 and 18 on this row's valid legs);
+`journal_lane_park_backstop_ticks` 2–20 (the slow device, reported
+beside); `answered EAGAIN` 0; `lock_ticked_reregisters` 0;
+`parked_gate_waits` 109–131 ≡ `parked_gate_cold_flushes`, of which
+57–69 ended in `parked_gate_wall_refusals` (fio error 28 — F17's store).
+`seq-write-1m-direct` (512m/job, 2 legs): 0 wedges, 0 EAGAIN (pre-fix
+100–128 per leg), 0 rescues, 96 wall refusals per leg (F17), fio rc 3.
+`seq-write-1m-direct` (512m/job, **24 GiB set**, 2 legs): VALID — fio
+rc 0, 373 / 456 MiB/s, 0 EAGAIN, 0 wedges, 0 rescues, `parked_pool_refusals`
+0, `journal_lane_park_backstop_ticks` 119 / 141 (p99 0.9–2.0 s on the
+saturated substrate — F7's class, not a lost wake).
 
 ## 5. Gaps — what cannot be measured here and what the box run needs
 

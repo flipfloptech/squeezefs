@@ -76,7 +76,6 @@ const completion = @import("../sync/completion.zig");
 const futex = @import("../sync/futex.zig");
 const mpmc = @import("../sync/mpmc.zig");
 const exec_lane = @import("../exec/lane.zig");
-const timer_heap = @import("../exec/timer_heap.zig");
 const fiber_mod = @import("../exec/fiber.zig");
 const group_mod = @import("../exec/group.zig");
 const jc = @import("journal_core.zig");
@@ -1139,11 +1138,24 @@ pub const JournalLane = struct {
     /// when due → the exit edge → ONE fiber park (timed by the backstop
     /// while a completion is owed and by the flush due) → the park verdict.
     ///
+    /// The verdict of a park the BACKSTOP ended (`Fiber.timerFired`: the
+    /// timer's pop was the wake — a CQE or a kick reaped in the same lane
+    /// pass before the pop already scheduled the fiber and leaves it false)
+    /// is judged by the NEXT poll's re-check, the channel-class contract of
+    /// `sync/tick.zig`: progress found with no wake delivered is a RESCUE
+    /// (`journal_lane_park_tick_rescues`, must stay 0 — an out-of-lane
+    /// completer that forgot to `kick`); no progress is a `backstop_tick`
+    /// (the owed completion is still at the device — a 4 KiB journal write
+    /// or an FSYNC past 100 ms on a saturated substrate is slow, not lost).
+    /// The pre-fix count-at-the-tick read 6–186 "rescues" per saturated
+    /// write leg on the venue's one shared virtio disk (rung 9 F6).
     fn fiberMain(self: *JournalLane) void {
         const f = exec_lane.currentFiber().?;
         const w = &self.w;
+        var judge_tick = false;
         while (true) {
             holdIfArmed();
+            const before = w.progressKey();
             // Acquire pairs with `shutdown`'s release: every push ordered
             // before the seal is visible to this scan.
             const sealed = self.sealed.load(.acquire);
@@ -1153,6 +1165,18 @@ pub const JournalLane = struct {
             var now = clock.monotonicNs();
             if (w.barrier_landed) self.barrierDone(w.barrier_outcome, now);
             self.advanceDurability();
+            if (judge_tick) {
+                judge_tick = false;
+                if (!std.meta.eql(before, w.progressKey())) {
+                    stats.park_tick_rescues.inc();
+                    LaneStats.bump(&self.stats.tick_rescues);
+                } else {
+                    stats.park_backstop_ticks.inc();
+                    LaneStats.bump(&self.stats.backstop_ticks);
+                }
+            }
+            // After the verdict: the seam's deferred issue is the test's
+            // device coming back, not progress a wake owed.
             if (test_seams.delay_issue.load(.acquire) == 0) while (w.delayed_issue.pop()) |idx| self.issueWindow(idx);
             now = clock.monotonicNs();
             // The trailing barrier before exit: ONE, after the last ack, so
@@ -1164,14 +1188,12 @@ pub const JournalLane = struct {
             const tick = w.tickFor(now);
             if (tick) |t| self.lane.timers.arm(f, now + t);
             f.park();
-            const fired = tick != null and f.timer_slot == timer_heap.no_slot;
+            const fired = tick != null and f.timerFired();
             if (tick != null and !fired) _ = self.lane.timers.cancel(f);
             stats.parks.inc();
             LaneStats.bump(&self.stats.parks);
-            if (fired and !(w.needs_flush and clock.monotonicNs() >= w.flush_due_ns)) {
-                stats.park_tick_rescues.inc();
-                LaneStats.bump(&self.stats.tick_rescues);
-            }
+            // The flush-due deadline is a cadence, never a backstop.
+            judge_tick = fired and !(w.needs_flush and clock.monotonicNs() >= w.flush_due_ns);
         }
     }
 
@@ -1510,6 +1532,55 @@ const Worker = struct {
 
     fn owesWork(w: *const Worker) bool {
         return w.owesCompletion() or w.needs_flush or w.fsync_waiters.items.len != 0;
+    }
+
+    /// Everything a poll's scan + stage B can move: unequal keys across a
+    /// backstop-ended park mean the tick found work a wake should have
+    /// announced (`fiberMain`'s rescue verdict).
+    const ProgressKey = struct {
+        phase: Phase,
+        runs_in_flight: usize,
+        pending: usize,
+        group: usize,
+        barrier_in_flight: bool,
+        barrier_landed: bool,
+        fsync_waiters: usize,
+        ack_seq: u64,
+        barriers_done: u64,
+        disconnected: bool,
+    };
+
+    fn progressKey(w: *const Worker) ProgressKey {
+        return .{
+            .phase = w.phase,
+            .runs_in_flight = w.runs_in_flight,
+            .pending = w.pending.items.len,
+            .group = w.group.items.len,
+            .barrier_in_flight = w.barrier_in_flight != null,
+            .barrier_landed = w.barrier_landed,
+            .fsync_waiters = w.fsync_waiters.items.len,
+            .ack_seq = w.ack_seq,
+            .barriers_done = w.barriers_done,
+            .disconnected = w.disconnected,
+        };
+    }
+
+    /// A run, a window behind a group, a group, or a barrier is outstanding:
+    /// the park carries the backstop.
+    fn owesCompletion(w: *const Worker) bool {
+        return w.runs_in_flight != 0 or w.pending.items.len != 0 or w.group.items.len != 0 or w.barrier_in_flight != null;
+    }
+
+    /// The fiber park's tick: the backstop while a completion is owed, the
+    /// flush due when a coalesced barrier is pending, else none (the lane's
+    /// own park is bounded by its 2 s liveness tick alone).
+    fn tickFor(w: *const Worker, now: u64) ?u64 {
+        var tick: ?u64 = if (w.owesCompletion()) park_backstop_ns else null;
+        if (w.needs_flush and w.barrier_in_flight == null) {
+            const until = w.flush_due_ns -| now;
+            tick = if (tick) |t| @min(t, until) else until;
+        }
+        return tick;
     }
 
     fn claimSlot(w: *Worker, gpa: Allocator, r: Run) Error!u32 {

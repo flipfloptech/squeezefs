@@ -1,3 +1,4 @@
 # LTP tags skipped in the sqz-zig container venue (runltp -S), one per line:
 #   <tag>  <why it is the venue's: the control run that failed on ext4 too>
 # A row here is NEVER a filesystem semantic; the release box runs them.
+proc01  reads every /proc file; /proc/kmsg answers EPERM inside the container (fails on ext4 too — ltp-fs-run1.venue, 2026-10-10)

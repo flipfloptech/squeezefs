@@ -36,6 +36,9 @@ REPO="$(cd "$SUITES_DIR/../.." && pwd)"
 # defaults to the venue's install prefix.
 if [ "${1:-}" = --bin ]; then SQZ_BIN=$2; shift 2; fi
 SQZ_BIN=${SQZ_BIN:-$REPO/zig-out-linux/bin/squeezefs}
+# The harness's own variable, never the daemon's environment (the knob
+# parser warns about every unknown SQZ*-prefixed name it inherits).
+export -n SQZ_BIN
 # Clones and builds persist on the cache volume between runs; their build
 # artefacts are deleted when a suite's run is over (`suite_clean_build`).
 SUITES_ROOT=${SUITES_ROOT:-/build/suites}

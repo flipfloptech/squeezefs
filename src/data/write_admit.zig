@@ -1000,8 +1000,9 @@ pub const WritePath = struct {
 
     /// THE PARKED-BUFFER GATE (the charter's backpressure law: park, never
     /// refuse, never a lost byte), holding no lock. Register on the table's
-    /// settle notify, re-check for room (the notify law: a settle landing
-    /// between the check and the wait is never lost), then:
+    /// capacity notify (an entry retired), re-check for room (the notify
+    /// law: a retire landing between the check and the wait is never
+    /// lost), then:
     ///   - room: go;
     ///   - the coldest parked block (not this one, not mid-upload) has sat
     ///     untouched ≥ `PARKED_COLD_NS`: flush it — the writer pays for one
@@ -1009,7 +1010,7 @@ pub const WritePath = struct {
     ///     (`parked_gate_cold_flushes`); a flush that leaves it parked (a
     ///     failed DMA, a full set) falls through to the wait so a dead
     ///     victim is never spun on;
-    ///   - else wait for the next settle, bounded by the moment the coldest
+    ///   - else wait for the next retire, bounded by the moment the coldest
     ///     block turns cold (so a wait never outlives the flush it defers
     ///     to) or one tick when nothing is parked at all.
     /// Each visit counts `parked_gate_waits`; the op watchdog sees the
@@ -1017,28 +1018,30 @@ pub const WritePath = struct {
     fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32) void {
         stats.parked_gate_waits.inc();
         if (req.park_hook) |h| h.parked(h.ctx);
-        var settle = self.table.upload_settled.notified();
-        _ = settle.enable(io);
+        var room = self.table.capacity.notified();
+        _ = room.enable(io);
         if (self.table.hasRoom()) {
-            settle.cancel(io);
+            room.cancel(io);
             return;
         }
-        const now = clock.monotonicNs();
         var until = PARKED_COLD_NS;
-        if (self.table.coldestParked(req.ino, block, now)) |v| {
+        if (self.table.coldestParked(req.ino, block, clock.monotonicNs())) |v| {
             if (v.age_ns >= PARKED_COLD_NS) {
                 stats.parked_gate_cold_flushes.inc();
                 switch (accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, v.ino, v.block)) {
                     .published, .discarded, .joined => {
-                        settle.cancel(io);
+                        room.cancel(io);
                         return;
                     },
-                    // A dead victim: a whole tick before the next try.
+                    // A dead victim (no fresh block, a failed DMA) retires
+                    // nothing and wakes nobody: a whole tick before the next
+                    // try (the 7.7 M-round spin of 2026-10-10 rode the
+                    // settle notify, which a failed upload fires too).
                     .stay_parked, .fence_drop, .superseded => {},
                 }
             } else until = PARKED_COLD_NS - v.age_ns;
         }
-        _ = settle.waitUntilUncancelable(io, now + until);
+        _ = room.waitUntilUncancelable(io, clock.monotonicNs() + until);
     }
 
     fn spawnUpload(self: *WritePath, io: Io, ino: u64, block: u32, permit: ?pipeline.Permit, prof: pipeline.Prof) void {
@@ -1634,6 +1637,56 @@ test "the parked-buffer gate, cold set: the write past the cap completes — the
     try testing.expect(w.wp.table.has(1, 8));
 }
 
+// A dead victim: the coldest block's flush fails (no fresh block, a failed
+// DMA) — the gate waits a whole tick before trying again, woken only by a
+// RETIRE (capacity returned), never by an upload's exit: a failed upload
+// settles `upload_settled` too, and three writers at the cap riding that
+// notify woke one another's failed flushes forever (the bracket harness's
+// seq-write-1m-buffered leg: 7.7 M, then 3.75 M gate rounds in four
+// minutes on a set whose free blocks all sat in reclaim debt).
+test "the parked-buffer gate, dead victim: three writers whose cold flushes fail retry once per tick, never spin on one another; every write completes when the device heals" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const waits0 = stats.parked_gate_waits.load();
+    const cold0 = stats.parked_gate_cold_flushes.load();
+    const fallbacks0 = accumulate.stats.write_through_fallbacks.load();
+    for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    // Every DMA fails until the test heals the device.
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    const Writer = struct {
+        w: *World,
+        block: u32,
+        result: anyerror!void = error.NotRun,
+        fn run(self: *@This()) void {
+            self.result = parkHalf(self.w, testing.io, 1, self.block, 9);
+        }
+    };
+    var writers = [_]Writer{ .{ .w = w, .block = 8 }, .{ .w = w, .block = 9 }, .{ .w = w, .block = 10 } };
+    var threads: [3]std.Thread = undefined;
+    for (&threads, &writers) |*t, *wr| t.* = try std.Thread.spawn(.{}, Writer.run, .{wr});
+    // Every writer's first cold flush failed (the upload's fallback) and all
+    // three sit registered on the capacity notify.
+    while (accumulate.stats.write_through_fallbacks.load() < fallbacks0 + 3 or w.wp.table.capacity.waiters(io) < 3) std.Thread.yield() catch {};
+    const waits_at_park = stats.parked_gate_waits.load();
+    const fallbacks_at_park = accumulate.stats.write_through_fallbacks.load();
+    // They stay parked: thousands of yields later not one more flush was
+    // attempted (the settle-riding gate attempted 130 in the same span).
+    for (0..4096) |_| std.Thread.yield() catch {};
+    try testing.expectEqual(fallbacks_at_park, accumulate.stats.write_through_fallbacks.load());
+    try testing.expectEqual(waits_at_park, stats.parked_gate_waits.load());
+    w.f.dev.setFailWrites(0, error.InputOutput);
+    for (threads) |t| t.join();
+    for (writers) |wr| try wr.result;
+    // A round or two per writer after the heal (the tick, then a retire's
+    // wake), never thousands.
+    try testing.expect(stats.parked_gate_waits.load() - waits_at_park <= 9);
+    try testing.expect(stats.parked_gate_waits.load() - waits0 >= 6);
+    try testing.expect(stats.parked_gate_cold_flushes.load() - cold0 >= 4);
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    for ([_]u32{ 8, 9, 10 }) |b| try testing.expect(w.wp.table.has(1, b));
+}
+
 /// A device hook that holds every DMA until released (the window between a
 /// DMA and its CQE, stretched); the upload task's thread yields meanwhile.
 const HeldDma = struct {
@@ -1688,7 +1741,7 @@ test "the parked-buffer gate, hot set: a writer at the cap waits for the in-flig
     var writer: Writer = .{ .w = w };
     const t0 = clock.monotonicNs();
     const th = try std.Thread.spawn(.{}, Writer.run, .{&writer});
-    while (w.wp.table.upload_settled.waiters(io) == 0) std.Thread.yield() catch {};
+    while (w.wp.table.capacity.waiters(io) == 0) std.Thread.yield() catch {};
     // The DMA lands: the upload publishes, retires its entry (a cell
     // returns) and settles — the writer wakes and takes it.
     held.release();

@@ -380,6 +380,12 @@ pub const Table = struct {
     /// fsync or a RELEASE racing the write-through) waits here instead of
     /// minting a second block for one image.
     upload_settled: sync_notify.Notify = .init,
+    /// Notified when a parked entry RETIRES (a cell and an entry slot
+    /// returned): the parked-buffer gate's wake. Not `upload_settled` — an
+    /// upload that failed settles too, and three writers at the cap whose
+    /// cold flushes all fail would wake one another forever (the 3.75 M
+    /// gate rounds of 2026-10-10).
+    capacity: sync_notify.Notify = .init,
 
     pub fn init(gpa: Allocator, block_size: u32, cap_buffers: u64) Allocator.Error!Table {
         const cap: usize = @intCast(cap_buffers);
@@ -785,7 +791,9 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
     // parked, and the settle is notified on every exit.
     var retired_by_us = false;
     defer {
-        if (!retired_by_us) {
+        if (retired_by_us) {
+            table.capacity.notifyWaiters(io);
+        } else {
             const g = deps.locks.acquire(io, ino, block, .pipeline_upload);
             if (table.get(ino, block)) |e| e.upload_inflight = false;
             g.release(io);

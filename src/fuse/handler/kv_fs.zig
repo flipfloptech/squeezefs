@@ -3341,7 +3341,7 @@ const SettlingData = struct {
         return false;
     }
     /// The striped data write: recorded, every byte acked.
-    pub fn write(self: *SettlingData, _: Io, _: u64, offset: u64, payload: write_admit.Payload, _: op_guard.Class, view: seams.FileView) write_admit.Error!write_admit.Outcome {
+    pub fn write(self: *SettlingData, _: Io, _: u64, offset: u64, payload: write_admit.Payload, _: op_guard.Class, view: seams.FileView, _: ?write_admit.ParkHook) write_admit.Error!write_admit.Outcome {
         const n = payload.len();
         self.writes.append(testing.allocator, .{ .offset = offset, .len = n, .view_size = view.size }) catch return error.OutOfMemory;
         return .{ .written = n, .size_claim = offset + n, .pieces = 1 };

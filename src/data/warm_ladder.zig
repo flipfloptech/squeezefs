@@ -170,7 +170,10 @@ pub const WarmLadder = struct {
         }
         const want: usize = @intCast(@min(size, info.size - offset));
         const out = window[0..want];
-        const v = self.serve(ino, info, offset, out, odirect) orelse return self.demote(.miss);
+        const v = self.serve(ino, info, offset, out, odirect) catch |e| return self.demote(switch (e) {
+            error.Miss => .miss,
+            error.WriteSide => .write_side,
+        });
         stats.fast_dispatch_serves.inc();
         read_path.stats.read_copy_dest_bytes.add(v.n);
         read_path.stats.read_user_bytes.add(v.n);
@@ -228,8 +231,9 @@ pub const WarmLadder = struct {
         pinned: ?Pinned = null,
     };
 
-    /// Rungs 3–4 by layout; null = Miss.
-    fn serve(self: *WarmLadder, ino: u64, info: read_path.FileInfo, offset: u64, out: []u8, odirect: bool) ?Served {
+    /// Rungs 3–4 by layout; `Miss` = nothing resident, `WriteSide` = the
+    /// write side holds custody the probe may not wait for.
+    fn serve(self: *WarmLadder, ino: u64, info: read_path.FileInfo, offset: u64, out: []u8, odirect: bool) error{ Miss, WriteSide }!Served {
         const rp = self.rp;
         const bs = rp.cfg.block_size;
         switch (info.kind) {
@@ -244,27 +248,33 @@ pub const WarmLadder = struct {
                         read_path.stats.cache_hits.inc();
                         return .{ .n = n, .arm = .staged };
                     },
-                    else => return null,
+                    else => return error.Miss,
                 }
             },
             // A packed tenant is a device window: the lane's.
-            .packed_ => return null,
+            .packed_ => return error.Miss,
             .striped => {
                 const b = offset / bs;
                 const end = offset + out.len;
-                if ((end - 1) / bs != b) return null;
+                if ((end - 1) / bs != b) return error.Miss;
                 const rel_s = offset - b * bs;
                 const rel_e = end - b * bs;
                 const ws = rp.write_side;
-                if (ws.open_overlay(ws.ctx, ino, b)) return null;
-                if (ws.extent_runs(ws.ctx, ino, b, rel_s, rel_e, &.{}) != .none) return null;
-                // The staging ring's active block (the write side's custody).
-                if (ws.staged_block(ws.ctx, ino, b, rel_s, rel_e, out)) |n| {
-                    @memset(out[n..], 0);
-                    return .{ .n = out.len, .arm = .staged };
+                if (ws.open_overlay(ws.ctx, ino, b)) return error.Miss;
+                if (ws.extent_runs(ws.ctx, ino, b, rel_s, rel_e, &.{}) != .none) return error.Miss;
+                // The write side's custody station, TRY-ONLY: a held block
+                // lock or an overlay mid-store is a Demote (the lane asks
+                // again blocking) — never a park on the reap thread.
+                switch (ws.staged_block(ws.ctx, ino, b, rel_s, rel_e, out, true)) {
+                    .served => |n| {
+                        @memset(out[n..], 0);
+                        return .{ .n = out.len, .arm = .staged };
+                    },
+                    .busy => return error.WriteSide,
+                    .none => {},
                 }
-                if (rp.cfg.direct_device_true and odirect) return null;
-                const key = rp.meta.binding(rp.meta.ctx, ino, b) orelse return null;
+                if (rp.cfg.direct_device_true and odirect) return error.Miss;
+                const key = rp.meta.binding(rp.meta.ctx, ino, b) orelse return error.Miss;
                 const k = BlockKey.fromMapping(key);
                 if (rp.hot.getServing(k, out.len)) |hit| {
                     const view = rp.pool.bytes(hit.slot)[@intCast(rel_s)..@intCast(rel_e)];
@@ -306,7 +316,7 @@ pub const WarmLadder = struct {
                     if (odirect) read_path.stats.read_odirect_tier_serves.inc();
                     return .{ .n = out.len, .arm = .cache };
                 }
-                return null;
+                return error.Miss;
             },
         }
     }
@@ -424,6 +434,61 @@ test "direct-leg eligibility: passthrough ∧ !device_true ∧ 4 KiB-aligned ∧
     try testing.expect(!directLegEligible(false, false, 0, 4096, bs));
     try testing.expect(!directLegEligible(true, true, 0, 4096, bs));
     try testing.expect(!directLegEligible(true, false, 0, 0, bs));
+}
+
+test "the warm ladder asks the write side TRY-ONLY: a `busy` custody station is a write_side Demote at once (the lane asks again blocking), a served station answers from RAM, none falls to the tiers (repro-port: LTP rwtest03 — the queue worker parked in BlockLocks.acquire(read) under a write awaiting that worker's ring)" {
+    const F = read_path.TestFixture;
+    const f = try F.init(testing.allocator, .{});
+    defer f.deinit();
+    f.size = F.bs;
+    f.bind(0, 2);
+    var guards = try op_guard.Table.init(testing.allocator, 64);
+    defer guards.deinit();
+    var ladder: WarmLadder = .{ .rp = f.rp, .guards = &guards, .io = testing.io };
+    const window = try testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), 1 << 20);
+    defer testing.allocator.free(window);
+    const WS = struct {
+        var mode: read_path.StagedBlock = .none;
+        var try_only_seen: ?bool = null;
+        fn overlay(_: *anyopaque, _: u64, _: u64, _: u64, _: []u8) read_path.OverlayVerdict {
+            return .none;
+        }
+        fn runs(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []u8) read_path.ExtentCoverage {
+            return .none;
+        }
+        fn stagedBlock(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, dest: []u8, try_only: bool) read_path.StagedBlock {
+            try_only_seen = try_only;
+            if (mode == .served) @memset(dest[0..mode.served], 0x5A);
+            return mode;
+        }
+        fn stagedPayload(_: *anyopaque, _: u64, _: layout.FileId, _: u64, _: u64, _: []u8) read_path.StagedVerdict {
+            return .absent;
+        }
+        fn retained(_: *anyopaque, _: u64) bool {
+            return false;
+        }
+        fn openOverlay(_: *anyopaque, _: u64, _: u64) bool {
+            return false;
+        }
+    };
+    var dummy: u8 = 0;
+    f.rp.write_side = .{ .ctx = &dummy, .overlay_read = &WS.overlay, .extent_runs = &WS.runs, .staged_block = &WS.stagedBlock, .staged_payload = &WS.stagedPayload, .has_retained_extents = &WS.retained, .open_overlay = &WS.openOverlay };
+    const ws0 = stats.fast_dispatch_demote_write_side.load();
+    // Busy: the demote names the write side; the probe asked try-only.
+    WS.mode = .busy;
+    const t0 = clock.monotonicNs();
+    try testing.expectEqual(Verdict{ .demote = .write_side }, ladder.probe(7, 0, 4096, false, window));
+    try testing.expect(clock.monotonicNs() - t0 < 100 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(?bool, true), WS.try_only_seen);
+    try testing.expectEqual(ws0 + 1, stats.fast_dispatch_demote_write_side.load());
+    // Served: the station's bytes, the rest of the window zeros.
+    WS.mode = .{ .served = 100 };
+    try testing.expectEqual(Verdict{ .served = .{ .n = 4096, .arm = .staged } }, ladder.probe(7, 0, 4096, false, window));
+    try testing.expect(std.mem.allEqual(u8, window[0..100], 0x5A));
+    try testing.expect(std.mem.allEqual(u8, window[100..4096], 0));
+    // None: the tiers (cold ⇒ miss).
+    WS.mode = .none;
+    try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 0, 4096, false, window));
 }
 
 test "the warm ladder never blocks: a cold block demotes (miss), a held guard demotes (contended) without waiting, a tier-resident block serves byte-exact and EOF-clamped into the window, oversize and device-true O_DIRECT pre-screen; serves + demotes ≡ probes" {

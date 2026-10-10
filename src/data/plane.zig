@@ -2482,39 +2482,54 @@ pub const DataPlane = struct {
     /// the base binding the write side named (or zeros for a hole), a
     /// `redirect` reads the shadow key, a `settle` runs the serialized
     /// settle and falls to the map.
-    fn wsStagedBlock(ctx: *anyopaque, ino: u64, block: u64, rel_s: u64, rel_e: u64, dest: []u8) ?usize {
+    fn wsStagedBlock(ctx: *anyopaque, ino: u64, block: u64, rel_s: u64, rel_e: u64, dest: []u8, try_only: bool) read_path.StagedBlock {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        if (block > std.math.maxInt(u32)) return null;
+        if (block > std.math.maxInt(u32)) return .none;
         const b: u32 = @intCast(block);
         const view = self.wp.writeSideView();
-        if (!view.hasCustody(ino, b)) return null;
+        if (!view.hasCustody(ino, b)) return .none;
         const want: usize = @intCast(rel_e - rel_s);
         const out = dest[0..want];
         @memset(out, 0);
-        switch (view.serve(self.io, .{ .ino = ino, .block = b, .rel = @intCast(rel_s), .out = out })) {
-            .served => return want,
+        // A try-only probe (the uring worker) serves RAM alone: a gap fill,
+        // a shadow read or the settle is a device act — `busy`, the lane's.
+        switch (view.serve(self.io, .{ .ino = ino, .block = b, .rel = @intCast(rel_s), .out = out, .try_only = try_only })) {
+            .served => return .{ .served = want },
             .partial => |p| {
-                const base = p.base orelse return want;
+                const base = p.base orelse return .{ .served = want };
                 var runs: [cov.CoverageUnion.max_runs]cov.Run = undefined;
                 const covered = p.covered.coveredRunsIn(@intCast(rel_s), @intCast(rel_e), &runs);
+                if (try_only) {
+                    var whole = covered.len != 0;
+                    var c: u32 = @intCast(rel_s);
+                    for (covered) |r| {
+                        if (r.start > c) whole = false;
+                        c = r.end;
+                    }
+                    if (!whole or c < rel_e) return .busy;
+                    return .{ .served = want };
+                }
                 var cursor: u32 = @intCast(rel_s);
                 for (covered) |r| {
                     if (r.start > cursor) self.fillGap(base, cursor, out[cursor - @as(u32, @intCast(rel_s)) .. r.start - @as(u32, @intCast(rel_s))]);
                     cursor = r.end;
                 }
                 if (cursor < rel_e) self.fillGap(base, cursor, out[cursor - @as(u32, @intCast(rel_s)) ..]);
-                return want;
+                return .{ .served = want };
             },
             .redirect => |shadow| {
+                if (try_only) return .busy;
                 self.fillGap(shadow, @intCast(rel_s), out);
-                return want;
+                return .{ .served = want };
             },
             .settle => {
+                if (try_only) return .busy;
                 // The serialized settle: under (3), on the write arm's ladder.
                 self.wp.overlay.drainBlock(self.io, &self.wp.locks, ino, b, false, self.wp.closeSeams());
-                return null;
+                return .none;
             },
-            .none => return null,
+            .busy => return .busy,
+            .none => return .none,
         }
     }
 

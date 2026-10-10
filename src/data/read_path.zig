@@ -349,6 +349,11 @@ pub const ExtentCoverage = enum { none, partial, full };
 
 /// The write side's view the read path consults FIRST; the data plane
 /// adapts `write_side_view.Composite` to it (module doc).
+/// `WriteSide.staged_block`'s answer: `served` n bytes (the rest of the
+/// window is zeros), `none` = no write-side custody (the map's bytes
+/// stand), `busy` = a try-only probe met custody it would have waited for.
+pub const StagedBlock = union(enum) { served: usize, none, busy };
+
 pub const WriteSide = struct {
     ctx: *anyopaque,
     /// The accumulation buffer's coverage-aware snapshot and any open
@@ -360,9 +365,12 @@ pub const WriteSide = struct {
     /// coverage class, and the runs copied into `dest` (NEWER than every
     /// base: applied after the base bytes).
     extent_runs: *const fn (ctx: *anyopaque, ino: u64, block: u64, rel_s: u64, rel_e: u64, dest: []u8) ExtentCoverage,
-    /// The staging ring's active-block image (the write side's custody
-    /// station): `[rel_s, rel_e)` copied into `dest`, or null.
-    staged_block: *const fn (ctx: *anyopaque, ino: u64, block: u64, rel_s: u64, rel_e: u64, dest: []u8) ?usize,
+    /// The write side's block window (the write side's custody station):
+    /// `[rel_s, rel_e)` composed into `dest`. `try_only` is the uring
+    /// worker's warm-ladder probe: the write side answers `busy` instead
+    /// of parking on its block lock, awaiting an overlay's pages or
+    /// reading the device (charter §4 "the reap thread never blocks").
+    staged_block: *const fn (ctx: *anyopaque, ino: u64, block: u64, rel_s: u64, rel_e: u64, dest: []u8, try_only: bool) StagedBlock,
     /// This client's ring entry for a staged file (`resolveStagedRead`).
     staged_payload: *const fn (ctx: *anyopaque, ino: u64, file_id: layout.FileId, offset: u64, len: u64, dest: []u8) StagedVerdict,
     /// Retained extents on the ino (the warm ladder demotes).
@@ -389,8 +397,8 @@ pub const WriteSide = struct {
     fn noneExtent(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []u8) ExtentCoverage {
         return .none;
     }
-    fn noneStaged(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []u8) ?usize {
-        return null;
+    fn noneStaged(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, _: []u8, _: bool) StagedBlock {
+        return .none;
     }
     fn noneStagedPayload(_: *anyopaque, _: u64, _: layout.FileId, _: u64, _: u64, _: []u8) StagedVerdict {
         return .absent;
@@ -971,11 +979,15 @@ pub const ReadPath = struct {
         defer if (scratch_cov == .partial) {
             _ = self.write_side.extent_runs(self.write_side.ctx, ino, b, rel_s, rel_e, out);
         };
-        // (2) The staging ring's active block (the write side's custody station).
-        if (self.write_side.staged_block(self.write_side.ctx, ino, b, rel_s, rel_e, out)) |n| {
-            @memset(out[n..], 0);
-            stats.read_copy_dest_bytes.add(out.len);
-            return;
+        // (2) The write side's custody station (a lane: blocking, so `busy`
+        //     is never answered here).
+        switch (self.write_side.staged_block(self.write_side.ctx, ino, b, rel_s, rel_e, out, false)) {
+            .served => |n| {
+                @memset(out[n..], 0);
+                stats.read_copy_dest_bytes.add(out.len);
+                return;
+            },
+            .none, .busy => {},
         }
         // (3) Key resolve straight out of the live map.
         const key = self.currentBinding(ino, b);
@@ -2121,10 +2133,10 @@ test "the write side outranks every tier: an overlay serve returns its bytes; fu
                 else => return .none,
             }
         }
-        fn stagedBlock(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, dest: []u8) ?usize {
-            if (mode != .staged) return null;
+        fn stagedBlock(_: *anyopaque, _: u64, _: u64, _: u64, _: u64, dest: []u8, _: bool) StagedBlock {
+            if (mode != .staged) return .none;
             @memset(dest[0..100], 0x55);
-            return 100;
+            return .{ .served = 100 };
         }
         fn stagedPayload(_: *anyopaque, _: u64, _: layout.FileId, _: u64, _: u64, _: []u8) StagedVerdict {
             return .absent;

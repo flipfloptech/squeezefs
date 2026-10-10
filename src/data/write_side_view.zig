@@ -21,6 +21,7 @@ const Io = std.Io;
 const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
+const clock = @import("../core/clock.zig");
 const staging = @import("staging.zig");
 const cov = @import("write_coverage.zig");
 const seams = @import("write_seams.zig");
@@ -46,6 +47,10 @@ pub const Outcome = union(enum) {
     redirect: Binding,
     none,
     settle,
+    /// A try-only request met custody it would have had to WAIT for (a
+    /// held block lock, an overlay record mid-store): the probe demotes
+    /// to a handler lane, which asks again blocking.
+    busy,
 };
 
 pub const Request = struct {
@@ -54,6 +59,14 @@ pub const Request = struct {
     /// Byte offset within the block.
     rel: u32,
     out: []u8,
+    /// The FUSE queue worker's warm-ladder probe (charter §4 "the reap
+    /// thread never blocks on any arm"): never park on the block lock,
+    /// never await an overlay's pages — answer `busy` instead. A lane's
+    /// read passes false and waits like every other (3) taker. The lock
+    /// the probe would park on is held by a WRITE that may be awaiting a
+    /// CQE on THIS worker's ring (the held-slot direct store, the settle):
+    /// the park is a deadlock, not a wait (LTP rwtest03, rung 9).
+    try_only: bool = false,
 };
 
 pub const stats = struct {
@@ -61,10 +74,12 @@ pub const stats = struct {
     pub var write_side_partials: counters.ShardedCounter = .{};
     pub var write_side_redirects: counters.ShardedCounter = .{};
     pub var write_side_settles: counters.ShardedCounter = .{};
+    /// Try-only probes that met custody they would have waited for.
+    pub var write_side_busy: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"write_side_serves\":{d},\"write_side_partials\":{d},\"write_side_redirects\":{d},\"write_side_settles\":{d}}}", .{ stats.write_side_serves.load(), stats.write_side_partials.load(), stats.write_side_redirects.load(), stats.write_side_settles.load() });
+    try w.print("{{\"write_side_serves\":{d},\"write_side_partials\":{d},\"write_side_redirects\":{d},\"write_side_settles\":{d},\"write_side_busy\":{d}}}", .{ stats.write_side_serves.load(), stats.write_side_partials.load(), stats.write_side_redirects.load(), stats.write_side_settles.load(), stats.write_side_busy.load() });
 }
 
 pub const WriteSideView = struct {
@@ -139,7 +154,13 @@ pub const Composite = struct {
         //    from the write-side authority's base: the epoch's newest
         //    shadow (open or saving) outranks the binding the checkout saw.
         if (self.table.has(req.ino, req.block)) {
-            const g = self.locks.acquire(io, req.ino, req.block, .read);
+            const g = if (req.try_only)
+                (self.locks.tryAcquire(io, req.ino, req.block) orelse {
+                    stats.write_side_busy.inc();
+                    return .busy;
+                })
+            else
+                self.locks.acquire(io, req.ino, req.block, .read);
             defer g.release(io);
             if (self.table.get(req.ino, req.block)) |e| {
                 const base = self.epochs.shadowOf(req.ino, req.block) orelse e.old_binding;
@@ -167,7 +188,12 @@ pub const Composite = struct {
                 }
             }
         }
-        // 2. An open device-overlay record: snapshot (g, C, dest) + revalidate.
+        // 2. An open device-overlay record: snapshot (g, C, dest) + revalidate
+        //    (awaits in-flight pages and reads the device: a lane's act).
+        if (req.try_only and self.overlay.hasCustody(req.ino, req.block)) {
+            stats.write_side_busy.inc();
+            return .busy;
+        }
         switch (self.overlay.serve(io, req.ino, req.block, req.rel, req.out)) {
             .served => {
                 stats.write_side_serves.inc();
@@ -329,4 +355,36 @@ test "precedence: an open overlay record serves (composed over the old binding) 
     try testing.expectEqual(Outcome.none, v.serve(io, .{ .ino = 3, .block = 0, .rel = 0, .out = &out }));
     try testing.expect(!v.hasCustody(3, 0));
     try testing.expect(stats.write_side_redirects.load() >= 1);
+}
+
+test "try-only (the uring worker's warm-ladder probe): a held block lock answers `busy` at once — never a park on the reap thread; an open overlay record answers `busy` (its serve awaits pages and reads the device); a free lock serves as before (repro-port: LTP rwtest03 wedged a FUSE queue worker in BlockLocks.acquire(read) under a write that held the lock while awaiting that worker's ring)" {
+    const io = testing.io;
+    const w = try ViewWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    const v = w.comp.view();
+    var out: [wt.BS]u8 = undefined;
+    const e = w.table.checkout(1, 0, false, null).?;
+    var q: [wt.BS / 4]u8 = @splat(0x44);
+    _ = try w.table.recordWrite(e, wt.BS / 2, &q);
+    // The write side holds (3) for (1, 0): a blocking serve would park here.
+    const held = w.locks.acquire(io, 1, 0, .write_checkout);
+    const busy0 = stats.write_side_busy.load();
+    const t0 = clock.monotonicNs();
+    try testing.expectEqual(Outcome.busy, v.serve(io, .{ .ino = 1, .block = 0, .rel = 0, .out = &out, .try_only = true }));
+    try testing.expect(clock.monotonicNs() - t0 < 100 * std.time.ns_per_ms);
+    try testing.expectEqual(busy0 + 1, stats.write_side_busy.load());
+    held.release(io);
+    // Free again: the try-only probe serves exactly what the blocking serve does.
+    try testing.expectEqual(Outcome{ .served = .accumulation }, v.serve(io, .{ .ino = 1, .block = 0, .rel = 0, .out = &out, .try_only = true }));
+    try testing.expect(std.mem.allEqual(u8, out[wt.BS / 2 .. 3 * wt.BS / 4], 0x44));
+    w.table.retire(e);
+    // An open overlay record: busy for the probe, served for the lane.
+    _ = try w.f.publishBlock(3, 0, 0xAA);
+    var p: [wt.BS / 2]u8 align(4096) = @splat(0x55);
+    _ = try w.ov.store(io, .{ .ino = 3, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = .{ .kind = .striped, .size = wt.BS, .map_resident = true }, .overwrite = true });
+    try testing.expectEqual(Outcome.busy, v.serve(io, .{ .ino = 3, .block = 0, .rel = 0, .out = &out, .try_only = true }));
+    try testing.expectEqual(Outcome{ .served = .device_overlay }, v.serve(io, .{ .ino = 3, .block = 0, .rel = 0, .out = &out }));
+    const cs: epoch_mod.Epochs.CloseSeams = .{ .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none };
+    w.ov.drainBlock(io, &w.locks, 3, 0, false, cs);
+    _ = w.epochs.close(io, 3, cs);
 }

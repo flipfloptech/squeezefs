@@ -676,7 +676,7 @@ src/shim/fd_table.zig:557 | 27 | a percentage — OWED: derive it (charter §1.5
 src/shim/fd_table.zig:558 | 31 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/shim/fd_table.zig:623 | 8192 | OWED: derive it or document it on the line (charter §1.5)
 src/shim/interpose.zig:677 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/shim/lifecycle.zig:67 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/shim/lifecycle.zig:71 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/shim/sys.zig:131 | 0xff | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/shim/sys.zig:131 | 0xfff | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/shim/sys.zig:131 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason

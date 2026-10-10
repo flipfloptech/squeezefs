@@ -985,8 +985,20 @@ pub fn stageSetattr(t: *tx.KvTx, pending: *PendingTimes, ino: u64, stored: Inode
         v.size = s;
         ctime_updated = true;
     }
-    if (req.atime) |a| v.atime = a;
-    if (req.mtime) |m| v.mtime = m;
+    // utimensat(2): an explicit atime/mtime set IS a status change (POSIX
+    // "shall mark the last file status change timestamp for update");
+    // without the writeback cache the kernel sends no FATTR_CTIME on it
+    // (`iattr_to_fattr`: ctime rides only under `trust_local_cmtime`), so
+    // the auto-bump below is the ONLY author of that ctime. The absorber
+    // above already took the echo (mtime equal + ctime present).
+    if (req.atime) |a| {
+        v.atime = a;
+        ctime_updated = true;
+    }
+    if (req.mtime) |m| {
+        v.mtime = m;
+        ctime_updated = true;
+    }
     if (req.ctime) |c| {
         v.ctime = c;
     } else if (ctime_updated and laterThan(now, v.ctime)) {
@@ -1698,18 +1710,37 @@ test "absorber: never blanket suppression — a changed mtime, an explicit utime
     try testing.expectEqual(@as(u32, 8), o.value.gid);
     try testing.expectEqual(@as(u64, 99), o.value.ctime);
     // (d) times-only with mtime equal but NO ctime: not the echo's shape —
-    // it stages (the reference's fallthrough).
+    // a utimensat that restates the mtime; it stages ONE Put whose ctime
+    // is the status change (the reference's fallthrough left ctime alone,
+    // which `touch -d` on a mount exposed as an unmoved ctime).
     var t6 = newTx();
     defer t6.deinit();
     const n = try stageSetattr(&t6, &pending, 42, stored, .{ .mtime = stored.mtime }, t_now);
     try testing.expectEqual(SetattrVerdict.staged, n.verdict);
-    try testing.expectEqual(stored, n.value);
+    try testing.expectEqual(stored.mtime, n.value.mtime);
+    try testing.expectEqual(t_now, n.value.ctime);
     // atime present with the echo's times: an explicit utimes, stages.
     var t7 = newTx();
     defer t7.deinit();
     const at = try stageSetattr(&t7, &pending, 42, stored, .{ .atime = 1, .mtime = stored.mtime, .ctime = t_now }, t_now);
     try testing.expectEqual(SetattrVerdict.staged, at.verdict);
     try testing.expectEqual(a0, stats.meta_kv_times_echo_absorbed.load());
+    // (e) utimensat without a ctime on the wire (the non-writeback kernel's
+    // shape): exact atime/mtime, ctime auto-bumped MONOTONE to now; an
+    // atime-only set likewise; UTIME_NOW arrives as atime == mtime == now.
+    var t8 = newTx();
+    defer t8.deinit();
+    const ut = try stageSetattr(&t8, &pending, 42, stored, .{ .atime = 11, .mtime = 12 }, t_now);
+    try testing.expectEqual(SetattrVerdict.staged, ut.verdict);
+    try testing.expectEqual(@as(u64, 11), ut.value.atime);
+    try testing.expectEqual(@as(u64, 12), ut.value.mtime);
+    try testing.expectEqual(t_now, ut.value.ctime);
+    var t9 = newTx();
+    defer t9.deinit();
+    const ao = try stageSetattr(&t9, &pending, 42, stored, .{ .atime = 13 }, t_now);
+    try testing.expectEqual(@as(u64, 13), ao.value.atime);
+    try testing.expectEqual(stored.mtime, ao.value.mtime);
+    try testing.expectEqual(t_now, ao.value.ctime);
 }
 
 test "pending times: signed monotone max on park and fold (pre-epoch stamps never out-rank), the count gauge, retire, the 512 cap wake" {

@@ -3834,6 +3834,59 @@ test "the SETATTR echo is absorbed (zero commits) while real news commits; nlook
     try testing.expectEqual(stranded0, counters.tripwireCount("open_count_stranded"));
 }
 
+test "POSIX utimensat: an explicit atime/mtime set (no ctime on the wire — the kernel sends FATTR_CTIME only under the writeback cache) marks the status change: ctime advances to now, never stays at the backdated value; an atime-only set and the UTIME_NOW pair do too (repro-port: `touch -d` on the venue left ctime unmoved)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const f = try h.create(1, "f", 0o644);
+    h.release(f);
+    const created = try h.getattr(f);
+    // Backdate every stamp explicitly (an exact set is verbatim), so a
+    // later "now" is observable inside one coarse clock tick.
+    const past: u64 = 1_000_000;
+    var back = abi.zeroed(abi.fuse_setattr_in);
+    back.valid = abi.FATTR_ATIME | abi.FATTR_MTIME | abi.FATTR_CTIME;
+    back.atime = past;
+    back.mtime = past;
+    back.ctime = past;
+    const b = try h.attr(h.setattr(f, back));
+    try testing.expectEqual(past, b.ctime);
+    // utimensat(2) with two exact times: FATTR_ATIME | FATTR_MTIME, no ctime.
+    var ut = abi.zeroed(abi.fuse_setattr_in);
+    ut.valid = abi.FATTR_ATIME | abi.FATTR_MTIME;
+    ut.atime = past + 7;
+    ut.mtime = past + 9;
+    const u = try h.attr(h.setattr(f, ut));
+    try testing.expectEqual(past + 7, u.atime);
+    try testing.expectEqual(past + 9, u.mtime);
+    try testing.expect(u.ctime >= created.ctime);
+    try testing.expectEqual(u.ctime, (try h.getattr(f)).ctime);
+    // Backdate again; an atime-only set (`touch -a -d`) is a status change too.
+    _ = try h.attr(h.setattr(f, back));
+    var at = abi.zeroed(abi.fuse_setattr_in);
+    at.valid = abi.FATTR_ATIME;
+    at.atime = past + 3;
+    const a = try h.attr(h.setattr(f, at));
+    try testing.expectEqual(past + 3, a.atime);
+    try testing.expectEqual(past, a.mtime);
+    try testing.expect(a.ctime >= created.ctime);
+    // Backdate again; `touch` = ATIME_NOW | MTIME_NOW: all three move to now.
+    _ = try h.attr(h.setattr(f, back));
+    var nw = abi.zeroed(abi.fuse_setattr_in);
+    nw.valid = abi.FATTR_ATIME | abi.FATTR_MTIME | abi.FATTR_ATIME_NOW | abi.FATTR_MTIME_NOW;
+    const n = try h.attr(h.setattr(f, nw));
+    try testing.expect(n.atime >= created.ctime);
+    try testing.expect(n.mtime >= created.ctime);
+    try testing.expect(n.ctime >= created.ctime);
+    // An explicit ctime on the wire (the writeback flush's shape) is verbatim.
+    var ex = abi.zeroed(abi.fuse_setattr_in);
+    ex.valid = abi.FATTR_MTIME | abi.FATTR_CTIME;
+    ex.mtime = past + 20;
+    ex.ctime = past + 21;
+    const x = try h.attr(h.setattr(f, ex));
+    try testing.expectEqual(past + 21, x.ctime);
+}
+
 test "KILLPRIV_V2: a flagged write clears suid (and sgid only with group-exec) and drops security.capability in the write's commit; an unflagged write clears nothing; a flagged truncate and an O_TRUNC open fold the strip too" {
     var h: Harness = undefined;
     try h.init();

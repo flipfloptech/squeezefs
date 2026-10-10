@@ -865,14 +865,30 @@ pub const InitWants = struct {
 
 /// Echoed iff offered, unconditionally.
 const echo_if_offered: u64 = abi.FUSE_ASYNC_READ | abi.FUSE_FILE_OPS | abi.FUSE_ATOMIC_O_TRUNC | abi.FUSE_BIG_WRITES |
-    abi.FUSE_HAS_IOCTL_DIR | abi.FUSE_AUTO_INVAL_DATA | abi.FUSE_ASYNC_DIO | abi.FUSE_PARALLEL_DIROPS |
+    abi.FUSE_HAS_IOCTL_DIR | abi.FUSE_ASYNC_DIO | abi.FUSE_PARALLEL_DIROPS |
     abi.FUSE_MAX_PAGES | abi.FUSE_CACHE_SYMLINKS | abi.FUSE_DO_READDIRPLUS;
 
 /// Never in a reply (charter §4; fuse_abi_session.md §2.5): advisory locks
 /// stay kernel-local, splice is not a path, POSIX ACLs would probe every
 /// create, the rest are capabilities this daemon has not implemented.
+///
+/// AUTO_INVAL_DATA (decision 0002 row 446): the kernel's mtime heuristic
+/// — drop the inode's whole page cache whenever a GETATTR shows a changed
+/// mtime — RACES a local write in flight: `fuse_fill_write_pages` copies
+/// into an uptodate folio and unlocks it before the WRITE lands, the
+/// invalidation drops that folio, a neighbour's readahead re-fetches the
+/// range from the daemon BEFORE the write applied, and the stale page
+/// stays uptodate until the next mtime change (LTP fs iogen01/rwtest,
+/// two writers on one file: a read-after-write returned the previous
+/// lap's bytes; the daemon's O_DIRECT view was right). Local coherence is
+/// the page cache's own (every write copies through it); remote changes
+/// are invalidated EXPLICITLY by the token recall (`read_divert.
+/// KernelInvalidator`: inval (0, 0) + prune) — the only authority that
+/// knows a remote write happened. A size change still truncates and
+/// invalidates (EXPLICIT_INVAL_DATA stays off). The win on top: a read
+/// inside i_size no longer costs a GETATTR.
 pub const never_advertised: u64 = abi.FUSE_POSIX_LOCKS | abi.FUSE_FLOCK_LOCKS | abi.FUSE_SPLICE_WRITE | abi.FUSE_SPLICE_MOVE |
-    abi.FUSE_SPLICE_READ | abi.FUSE_POSIX_ACL | abi.FUSE_ABORT_ERROR | abi.FUSE_EXPLICIT_INVAL_DATA | abi.FUSE_MAP_ALIGNMENT |
+    abi.FUSE_SPLICE_READ | abi.FUSE_POSIX_ACL | abi.FUSE_ABORT_ERROR | abi.FUSE_EXPLICIT_INVAL_DATA | abi.FUSE_AUTO_INVAL_DATA | abi.FUSE_MAP_ALIGNMENT |
     abi.FUSE_SETXATTR_EXT | abi.FUSE_INIT_RESERVED | abi.FUSE_SECURITY_CTX | abi.FUSE_HAS_INODE_DAX | abi.FUSE_CREATE_SUPP_GROUP |
     abi.FUSE_HAS_EXPIRE_ONLY | abi.FUSE_DIRECT_IO_ALLOW_MMAP | abi.FUSE_PASSTHROUGH | abi.FUSE_NO_EXPORT_SUPPORT |
     abi.FUSE_HAS_RESEND | abi.FUSE_ALLOW_IDMAP | abi.FUSE_REQUEST_TIMEOUT;
@@ -1646,6 +1662,8 @@ test "INIT reply never advertises POSIX_LOCKS, FLOCK_LOCKS, SPLICE_*, POSIX_ACL 
     try testing.expect(!all.has(abi.FUSE_FLOCK_LOCKS));
     try testing.expect(!all.has(abi.FUSE_SPLICE_WRITE | abi.FUSE_SPLICE_MOVE | abi.FUSE_SPLICE_READ));
     try testing.expect(!all.has(abi.FUSE_POSIX_ACL));
+    try testing.expect(!all.has(abi.FUSE_AUTO_INVAL_DATA));
+    try testing.expect(!all.has(abi.FUSE_EXPLICIT_INVAL_DATA));
     try testing.expect(all.has(abi.FUSE_ASYNC_READ));
     try testing.expect(all.has(abi.FUSE_MAX_PAGES));
     try testing.expect(all.has(abi.FUSE_CACHE_SYMLINKS));

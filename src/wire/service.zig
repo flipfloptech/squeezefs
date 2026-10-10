@@ -97,9 +97,9 @@ pub const Service = struct {
         return switch (verb.block()) {
             .manager, .membership => .not_manager,
             .token, .xv => .not_holder,
-            // The coordinator is volume 0's manager: a job verb nothing
-            // registered says so.
-            .job => .not_manager,
+            // The coordinator is volume 0's manager: a job or admin verb
+            // nothing registered says so.
+            .job, .admin => .not_manager,
             .wire => .unknown_verb,
         };
     }

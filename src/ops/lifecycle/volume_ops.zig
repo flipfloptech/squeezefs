@@ -211,6 +211,7 @@ pub fn preflightDrain(gpa: Allocator, plane: *plane_mod.DataPlane, victim: u64, 
     var w: Walk = .{ .plane = plane };
     var plan = try census.censusFor(gpa, .{ .ctx = &w, .walk = &Walk.walk }, &.{victim}, plane.chunk);
     defer plan.deinit(gpa);
+    try plane.refreshCensus();
     const live = plane.rt.volumesLive();
     const rows = try gpa.alloc(preflight.SurvivorRow, live.len);
     defer gpa.free(rows);

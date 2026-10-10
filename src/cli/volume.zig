@@ -49,6 +49,24 @@ pub fn run(p: cli.Process, v: args.Volume) u8 {
     const meta_uri = switch (v) {
         inline else => |x| x.meta_uri,
     };
+    // The data-volume lifecycle on a LIVE mount: the daemon's admin lane
+    // (the lattice over the online world; the add's rebalance and the
+    // remove's evacuation run on the fabric at once).
+    if (args.targetIsMountpoint(meta_uri)) switch (v) {
+        .add_data => |a| {
+            var live: LiveData = .{ .p = p, .verb = .{ .add = .{ .device = a.device, .no_rebalance = a.no_rebalance } } };
+            return admin_lane.withLane(p, "volume add-data", meta_uri, .{ .ctx = &live, .run = LiveData.run });
+        },
+        .remove_data => |r| {
+            var live: LiveData = .{ .p = p, .verb = .{ .remove = .{ .volume = r.volume } } };
+            return admin_lane.withLane(p, "volume remove-data", meta_uri, .{ .ctx = &live, .run = LiveData.run });
+        },
+        .undrain => |u| {
+            var live: LiveData = .{ .p = p, .verb = .{ .undrain = .{ .volume = u.volume } } };
+            return admin_lane.withLane(p, "volume undrain", meta_uri, .{ .ctx = &live, .run = LiveData.run });
+        },
+        else => {},
+    };
     var members: [uri.MAX_MEMBERS][]const u8 = undefined;
     var udiag: uri.Refusal = undefined;
     const meta = uri.parse(.meta, meta_uri, &members, &udiag) catch {
@@ -83,6 +101,79 @@ pub fn run(p: cli.Process, v: args.Volume) u8 {
         },
     };
 }
+
+const admin_lane = @import("admin_lane.zig");
+
+/// The LIVE data-volume verbs through the admin lane: the daemon runs the
+/// lattice; the reply's verdict and words are what this prints.
+const LiveData = struct {
+    p: cli.Process,
+    verb: union(enum) {
+        add: struct { device: []const u8, no_rebalance: bool },
+        remove: struct { volume: []const u8 },
+        undrain: struct { volume: []const u8 },
+    },
+
+    fn run(ctx: *anyopaque, lane: *admin_lane.Lane) u8 {
+        const self: *LiveData = @ptrCast(@alignCast(ctx));
+        const p = self.p;
+        const c = lane.admin();
+        const verb: []const u8 = switch (self.verb) {
+            .add => "add-data",
+            .remove => "remove-data",
+            .undrain => "undrain",
+        };
+        const rep = switch (self.verb) {
+            .add => |a| blk: {
+                var abs: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                // The daemon opens the path: it must be absolute (the
+                // daemon's cwd is not ours).
+                const path = if (std.fs.path.isAbsolute(a.device)) a.device else blk2: {
+                    const n = std.Io.Dir.cwd().realPathFile(p.io, a.device, &abs) catch {
+                        p.stderr.print("squeezefs volume add-data: {s}: cannot resolve to an absolute path (the daemon opens it)\n", .{a.device}) catch {};
+                        return cli.exit_failed;
+                    };
+                    break :blk2 abs[0..n];
+                };
+                break :blk c.volume(.add_data, 0, path, a.no_rebalance);
+            },
+            .remove => |r| c.volume(.remove_data, lattice.parseVolumeId(r.volume) orelse return self.badId(verb, r.volume), "", false),
+            .undrain => |u| c.volume(.undrain, lattice.parseVolumeId(u.volume) orelse return self.badId(verb, u.volume), "", false),
+        } catch |e| {
+            p.stderr.print("squeezefs volume {s}: the call failed ({s}, {t})\n", .{ verb, @errorName(e), @import("../core/errors.zig").toErrno(e) }) catch {};
+            return cli.exit_failed;
+        };
+        if (rep.get() != .ok) {
+            p.stderr.print("squeezefs volume {s}: refused: {s}\n", .{ verb, admin_lane.verdictText(rep.get()) }) catch {};
+            if (rep.get() == .refused and rep.needed > rep.avail) p.stderr.print("  capacity: needed {d} B > avail {d} B (transient {d} B, headroom {d} B)\n", .{ rep.needed, rep.avail, rep.transient, rep.headroom }) catch {};
+            p.stderr.flush() catch {};
+            return cli.exit_failed;
+        }
+        switch (self.verb) {
+            .add => |a| {
+                p.stdout.print("added data volume ", .{}) catch {};
+                lattice.writeVolumeId(p.stdout, rep.vol_tag) catch {};
+                p.stdout.print(" ({s}, {d} blocks) at config generation {d}, live", .{ a.device, rep.capacity_blocks, rep.config_generation }) catch {};
+                if (rep.job_id != 0) p.stdout.print("; rebalance job-{x:0>16} running at 25 %", .{rep.job_id}) catch {};
+                p.stdout.writeAll("\n") catch {};
+            },
+            .remove => |r| {
+                p.stdout.print("preflight: needed {d} B, avail {d} B, transient {d} B, headroom {d} B\n{s} is Draining; evacuation job-{x:0>16} running (every block moved once via the ONE mover; the volume retires when its census is empty)\n", .{ rep.needed, rep.avail, rep.transient, rep.headroom, r.volume, rep.job_id }) catch {};
+            },
+            .undrain => |u| {
+                p.stdout.print("{s} is Active again; {d} evacuation job(s) cancelled\n", .{ u.volume, rep.cancelled }) catch {};
+            },
+        }
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+
+    fn badId(self: *LiveData, verb: []const u8, word: []const u8) u8 {
+        self.p.stderr.print("squeezefs volume {s}: {s} is not a vol-{{16 hex}} id\n", .{ verb, word }) catch {};
+        self.p.stderr.flush() catch {};
+        return cli.exit_usage;
+    }
+};
 
 /// The OFFLINE data-volume verbs over the writer-door set: the lattice's
 /// seven steps through `volume_ops.OfflineWorld`; the add's queued

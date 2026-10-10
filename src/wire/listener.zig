@@ -144,6 +144,21 @@ pub const Listener = struct {
     conns: []?*Conn,
     conns_lock: std.atomic.Value(bool) = .init(false),
     next_id: std.atomic.Value(u64) = .init(1),
+    /// An ADMITTED connection ended (EOF, idle, a framing failure, the stop
+    /// nudge): the job coordinator expires the session's shard leases now
+    /// and the last enrolled worker's departure releases the WERO. Bound
+    /// after `start` by the owner; read with acquire at each departure
+    /// (pairs with `bindDeparture`'s release store).
+    departure: std.atomic.Value(?*const Departure) = .init(null),
+
+    pub const Departure = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, session_id: u64) void,
+    };
+
+    pub fn bindDeparture(self: *Listener, d: ?*const Departure) void {
+        self.departure.store(d, .release);
+    }
 
     /// Bind and start accepting. `bind` is the ONE bind knob's posture.
     pub fn start(gpa: std.mem.Allocator, io: Io, bind: endpoint.Bind, svc: *service.Service, secret: auth.Secret, opts: Options) StartError!*Listener {
@@ -321,6 +336,7 @@ fn connMain(conn: *Conn) void {
         l.retire();
     }
     if (!handshake(conn)) return;
+    defer if (l.departure.load(.acquire)) |d| d.call(d.ctx, conn.id);
     while (!l.stopping.load(.acquire)) {
         const in = conn.sess.recvFrame(session.SESSION_IDLE_TIMEOUT_MS) catch |e| {
             switch (e) {

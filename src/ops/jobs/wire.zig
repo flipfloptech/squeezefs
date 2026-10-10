@@ -160,6 +160,15 @@ pub const Coordinator = struct {
         return null;
     }
 
+    /// The host registration key an enrolled worker declared (the PR
+    /// preempt's victim); null = not enrolled.
+    pub fn prKeyOf(self: *Coordinator, id: StableIdentity) ?u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const e = self.findWorkerLocked(id) orelse return null;
+        return e.pr_key;
+    }
+
     pub fn enrolledCount(self: *Coordinator) usize {
         self.lock.lock();
         defer self.lock.unlock();

@@ -19,6 +19,8 @@ pub const lease = @import("jobs/lease.zig");
 pub const seams = @import("jobs/seams.zig");
 pub const frames = @import("jobs/frames.zig");
 pub const wire = @import("jobs/wire.zig");
+pub const admin_frames = @import("jobs/admin_frames.zig");
+pub const admin = @import("jobs/admin.zig");
 pub const stats = @import("jobs/stats.zig");
 pub const models = @import("jobs/models.zig");
 pub const coordinator = if (builtin.os.tag == .linux) @import("jobs/coordinator.zig") else struct {};
@@ -38,6 +40,8 @@ test {
     _ = seams;
     _ = frames;
     _ = wire;
+    _ = admin_frames;
+    _ = admin;
     _ = stats;
     _ = models;
     if (builtin.os.tag == .linux) _ = coordinator;

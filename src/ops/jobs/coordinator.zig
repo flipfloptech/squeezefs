@@ -241,7 +241,7 @@ pub const AllocSink = struct {
     fn releaseFn(ctx: *anyopaque, epoch: u64, _: u32) void {
         const self: *AllocSink = @ptrCast(@alignCast(ctx));
         var out: [records.SHARD_DEST_MAX]u64 = undefined;
-        for (self.plane.vols.rows[0..self.plane.vols.count]) |*r| {
+        for (self.plane.vols.rows[0..self.plane.vols.n()]) |*r| {
             const a = r.*.?.alloc;
             _ = a.releaseQuarantine(epoch, &.{}, &out);
         }
@@ -307,9 +307,18 @@ pub const PlaneMover = struct {
         const a = self_(ctx).allocOf(vol_tag) orelse return null;
         return a.refcount(idx);
     }
+    /// A reference release THROUGH THE LADDER (the mover's law: the pin is
+    /// the last source reference iff every referencer published, and a
+    /// refused referencer's raised destination reference leaves the same
+    /// way) — `reclaimer.freeBlock` decrements and, at 0, runs the terminal
+    /// free; the allocator's bare `unpin` fires `block_live_free_refusals`
+    /// on a terminal release by design.
+    fn releaseThroughLadder(self: *PlaneMover, vol_tag: u64, idx: u64) void {
+        const v = self.plane.vols.byTag(vol_tag) orelse return;
+        _ = self.plane.reclaimer.freeBlock(self.io, @intCast(v.ordinal), idx, v.alloc.stampOf(idx));
+    }
     fn unpin(ctx: *anyopaque, vol_tag: u64, idx: u64) void {
-        const a = self_(ctx).allocOf(vol_tag) orelse return;
-        a.unpin(idx);
+        self_(ctx).releaseThroughLadder(vol_tag, idx);
     }
     fn readImage(ctx: *anyopaque, vol_tag: u64, idx: u64, out: []u8) mover.SeamError!usize {
         const self = self_(ctx);
@@ -381,8 +390,7 @@ pub const PlaneMover = struct {
         return a.incrementRefcount(idx);
     }
     fn releaseRef(ctx: *anyopaque, vol_tag: u64, idx: u64) void {
-        const a = self_(ctx).allocOf(vol_tag) orelse return;
-        a.unpin(idx);
+        self_(ctx).releaseThroughLadder(vol_tag, idx);
     }
     fn republish(ctx: *anyopaque, ino: u64, block_index: u32, expected: layout.Mapping, new: layout.Mapping) mover.RepublishError!void {
         const self = self_(ctx);
@@ -528,8 +536,10 @@ pub const PlaneWorld = struct {
             .retired => .retired,
             .disabled => .disabled,
         };
-        self.plane.rt.setState(vol_tag, to) catch return error.UnknownVolume;
-        self.plane.rt.refreshPlacement() catch return error.OutOfMemory;
+        self.plane.setVolumeState(vol_tag, to) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.UnknownVolume,
+        };
     }
     fn cancelEvac(ctx: *anyopaque, vol_tag: u64) lattice.Error!void {
         const self = self_(ctx);
@@ -558,7 +568,13 @@ pub const PlaneDrain = struct {
     mover_: PlaneMover,
     world_: PlaneWorld,
     workers: u64,
-    rate: *const fn () u64,
+    rate: WriteRate,
+
+    /// The preflight's foreground write-rate term (the node's estimator).
+    pub const WriteRate = struct {
+        ctx: *anyopaque,
+        bps: *const fn (ctx: *anyopaque) u64,
+    };
 
     pub fn seam(self: *PlaneDrain) drain_mod.DrainSeam {
         return .{ .ctx = self, .vtable = &vt };
@@ -584,12 +600,18 @@ pub const PlaneDrain = struct {
             .disabled => .disabled,
         };
     }
+    /// The victim's allocated blocks MINUS the one the plane reserves
+    /// forever (index 0, the data superblock chunk: `recoverBlock(0)` at
+    /// open) — the drain's convergence word is "no FILE block left";
+    /// counting the reserved chunk re-planned forever against a census
+    /// that can never name it (rung 8: 7,050 re-plans in 25 minutes).
     fn usedBlocks(ctx: *anyopaque, vol_tag: u64) u64 {
         const v = self_(ctx).plane.vols.byTag(vol_tag) orelse return 0;
-        return v.alloc.usedBlocks();
+        return v.alloc.usedBlocks() -| plane_mod.DataPlane.RESERVED_BLOCKS;
     }
     fn rows(ctx: *anyopaque, gpa: Allocator) Allocator.Error![]preflight.SurvivorRow {
         const self = self_(ctx);
+        try self.plane.refreshCensus();
         const live = self.plane.rt.volumesLive();
         const out = try gpa.alloc(preflight.SurvivorRow, live.len);
         for (live, out) |*v, *r| r.* = .{ .vol_tag = v.id.tag, .eligible = v.placementEligible(), .capacity_bytes = v.capacity_bytes, .used_bytes = v.used_bytes };
@@ -607,12 +629,408 @@ pub const PlaneDrain = struct {
         return self_(ctx).plane.chunk;
     }
     fn writeRate(ctx: *anyopaque) u64 {
-        return self_(ctx).rate();
+        const r = self_(ctx).rate;
+        return r.bps(r.ctx);
     }
     fn workersFn(ctx: *anyopaque) u64 {
         return self_(ctx).workers;
     }
 };
+
+// ---------------------------------------------------------------------------
+// The defrag seams over the plane: the data arms (D2/D1 through the ONE
+// mover) and the `--pack` compactor over the packer.
+// ---------------------------------------------------------------------------
+
+const defrag_bodies = @import("../defrag/bodies.zig");
+const defrag_plan = @import("../defrag/plan.zig");
+const pack_compact = @import("../defrag/pack_compact.zig");
+const pack = @import("../../data/pack.zig");
+
+/// `pack_compact.PackSeam` over the plane + its packer: a window the
+/// compactor prepared lands at once (`Packer.landWindow` — the slot is a
+/// committed tenant whose references are the referencers' records); the
+/// raises and releases keep the pack's committed count beside the
+/// allocator's refcount so the seal's pin arithmetic holds; the windows in
+/// flight are a bounded table (one per worker's current victim).
+pub const PlanePack = struct {
+    plane: *plane_mod.DataPlane,
+    io: Io,
+    mover_: *PlaneMover,
+    lock: jc.SpinLock = .{},
+    /// `(vol_tag, base)` → the open pack a prepared window landed in.
+    windows: [WINDOWS_MAX]?Window = @splat(null),
+
+    /// One window in flight per worker at the compactor's pipeline width
+    /// 1 (`throttle.MOVER_PIPELINE_WIDTH` bounds the movers; the compactor
+    /// is order-dependent), so the shipped worker ceiling (8) × the
+    /// pipeline width (4) bounds the table with room for the victims a
+    /// stopped pass left landed.
+    pub const WINDOWS_MAX: usize = 8 * 4 * 2;
+
+    const Window = struct { vol_tag: u64, base: u64, tenant: pack.Tenant };
+    const jc = @import("../../meta/journal_core.zig");
+
+    pub fn seam(self: *PlanePack) pack_compact.PackSeam {
+        return .{ .ctx = self, .vtable = &vt };
+    }
+
+    const vt: pack_compact.PackSeam.VTable = .{ .chunk = &chunk, .isOpenPack = &isOpenPack, .quiescent = &quiescent, .pin = &pin, .unpin = &unpin, .readWindow = &readWindow, .prepare = &prepare, .abandonWindow = &abandonWindow, .incrementRefcount = &incRef, .releaseRef = &releaseRef, .republish = &republish, .freeBinding = &freeBinding };
+
+    fn self_(ctx: *anyopaque) *PlanePack {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn chunk(ctx: *anyopaque) u64 {
+        return self_(ctx).plane.chunk;
+    }
+    fn isOpenPack(ctx: *anyopaque, vol_tag: u64, idx: u64) bool {
+        return PlaneMover.vt.isOpenPack(self_(ctx).mover_, vol_tag, idx);
+    }
+    fn quiescent(ctx: *anyopaque, ino: u64, block_index: u32) bool {
+        return self_(ctx).plane.moverQuiescent(ino, block_index);
+    }
+    fn pin(ctx: *anyopaque, vol_tag: u64, idx: u64) mover.PinVerdict {
+        return PlaneMover.vt.pin(self_(ctx).mover_, vol_tag, idx);
+    }
+    fn unpin(ctx: *anyopaque, vol_tag: u64, idx: u64) void {
+        PlaneMover.vt.unpin(self_(ctx).mover_, vol_tag, idx);
+    }
+    fn readWindow(ctx: *anyopaque, m: layout.Mapping, out: []u8) pack_compact.SeamError!usize {
+        const self = self_(ctx);
+        const bytes = self.plane.readMappingImage(m, out) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Io,
+        };
+        return bytes.len;
+    }
+    fn windowOf(self: *PlanePack, vol_tag: u64, base: u64) ?Window {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.windows) |w| if (w) |x| if (x.vol_tag == vol_tag and x.base == base) return x;
+        return null;
+    }
+    fn forget(self: *PlanePack, vol_tag: u64, base: u64) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.windows) |*w| if (w.*) |x| if (x.vol_tag == vol_tag and x.base == base) {
+            w.* = null;
+            return;
+        };
+    }
+    fn prepare(ctx: *anyopaque, image: []const u8) pack_compact.SeamError!pack_compact.Placed {
+        const self = self_(ctx);
+        const plane = self.plane;
+        const p = &(plane.packer orelse return error.Io);
+        const tag = (plane.rt.pickVolume() catch return error.OutOfMemory) orelse return error.StorageFull;
+        const stored = plane.transformWrite(tag, image) catch return error.Io;
+        const prepared = (p.prepare(self.io, .{ .vol_tag = tag, .scope = plane.scope }, stored, clock.monotonicNs()) catch |e| return switch (e) {
+            error.StorageFull => error.StorageFull,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Io,
+        }) orelse return error.StorageFull;
+        const t = prepared.tenant;
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            var slot: ?*?Window = null;
+            for (&self.windows) |*w| if (w.* == null) {
+                slot = w;
+                break;
+            };
+            const s = slot orelse {
+                self.lock.unlock();
+                p.abandonLandedWindow(t);
+                self.lock.lock();
+                return error.Io;
+            };
+            s.* = .{ .vol_tag = t.pack.vol_tag, .base = t.pack.base, .tenant = t };
+        }
+        p.landWindow(t);
+        return .{ .vol_tag = t.pack.vol_tag, .block_idx = t.pack.base / plane.chunk, .offset = t.pack.base, .incarnation = t.pack.incarnation, .rel_off = @intCast(t.off) };
+    }
+    fn abandonWindow(ctx: *anyopaque, placed: pack_compact.Placed) void {
+        const self = self_(ctx);
+        const p = &(self.plane.packer orelse return);
+        const w = self.windowOf(placed.vol_tag, placed.offset) orelse return;
+        self.forget(placed.vol_tag, placed.offset);
+        p.abandonLandedWindow(w.tenant);
+    }
+    fn incRef(ctx: *anyopaque, vol_tag: u64, idx: u64) bool {
+        const self = self_(ctx);
+        if (!PlaneMover.vt.incrementRefcount(self.mover_, vol_tag, idx)) return false;
+        if (self.plane.packer) |*p| if (self.windowOf(vol_tag, idx * self.plane.chunk)) |w| p.tenantRaised(w.tenant.pack);
+        return true;
+    }
+    fn releaseRef(ctx: *anyopaque, vol_tag: u64, idx: u64) void {
+        const self = self_(ctx);
+        if (self.plane.packer) |*p| if (self.windowOf(vol_tag, idx * self.plane.chunk)) |w| p.tenantReleased(w.tenant.pack);
+        PlaneMover.vt.releaseRef(self.mover_, vol_tag, idx);
+    }
+    fn republish(ctx: *anyopaque, ino: u64, block_index: u32, expected: layout.Mapping, new: layout.Mapping) mover.RepublishError!void {
+        return PlaneMover.vt.republish(self_(ctx).mover_, ino, block_index, expected, new);
+    }
+    fn freeBinding(ctx: *anyopaque, old: layout.Mapping) void {
+        PlaneMover.vt.freeBinding(self_(ctx).mover_, old);
+    }
+};
+
+/// `bodies.DataSeam` over the plane (the D2/D1 planner's rows and refs,
+/// the mover, the pack face, the lever, the open packs).
+pub const PlaneDefrag = struct {
+    plane: *plane_mod.DataPlane,
+    io: Io,
+    mover_: *PlaneMover,
+    pack_: PlanePack,
+
+    pub fn seam(self: *PlaneDefrag) defrag_bodies.DataSeam {
+        return .{ .ctx = self, .vtable = &vt };
+    }
+
+    const vt: defrag_bodies.DataSeam.VTable = .{ .rows = &rows, .refs = &refs, .mover = &moverFn, .pack = &packFn, .chunk = &chunk, .packingOn = &packingOn, .packMaxSlot = &packMaxSlot, .openPacks = &openPacks, .openRoomBytes = &openRoomBytes, .drainReclaim = &drainReclaim };
+
+    fn self_(ctx: *anyopaque) *PlaneDefrag {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn rows(ctx: *anyopaque, gpa: Allocator) Allocator.Error![]defrag_plan.VolumeRow {
+        const self = self_(ctx);
+        try self.plane.refreshCensus();
+        const live = self.plane.rt.volumesLive();
+        const out = try gpa.alloc(defrag_plan.VolumeRow, live.len);
+        for (live, out) |*v, *r| {
+            const a = self.plane.vols.byTag(v.id.tag);
+            r.* = .{ .vol_tag = v.id.tag, .eligible = v.placementEligible(), .frontier = if (a) |x| x.alloc.highestBlockIndex() else 0 };
+        }
+        return out;
+    }
+    fn refs(ctx: *anyopaque, gpa: Allocator) Allocator.Error![]census.Ref {
+        const self = self_(ctx);
+        var list: std.ArrayList(census.Ref) = .empty;
+        errdefer list.deinit(gpa);
+        const Collect = struct {
+            gpa: Allocator,
+            list: *std.ArrayList(census.Ref),
+            fn visit(c: *@This(), ino: u64, bi: u32, m: layout.Mapping) plane_mod.Error!void {
+                try c.list.append(c.gpa, .{ .ino = ino, .block_index = bi, .mapping = m });
+            }
+        };
+        var col: Collect = .{ .gpa = gpa, .list = &list };
+        self.plane.forEachBinding(*Collect, &col, Collect.visit) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            // A torn walk plans nothing this pass (the next pass re-plans).
+            else => blk: {
+                log.warn("defrag: the layout walk failed ({s}) — the pass plans nothing", .{@errorName(e)});
+                list.clearRetainingCapacity();
+                break :blk list.toOwnedSlice(gpa);
+            },
+        };
+        return list.toOwnedSlice(gpa);
+    }
+    fn moverFn(ctx: *anyopaque) mover.Seam {
+        return self_(ctx).mover_.seam();
+    }
+    fn packFn(ctx: *anyopaque) pack_compact.PackSeam {
+        return self_(ctx).pack_.seam();
+    }
+    fn chunk(ctx: *anyopaque) u64 {
+        return self_(ctx).plane.chunk;
+    }
+    fn packingOn(ctx: *anyopaque) bool {
+        const p = &(self_(ctx).plane.packer orelse return false);
+        return p.policy.enabled;
+    }
+    fn packMaxSlot(ctx: *anyopaque) u64 {
+        const self = self_(ctx);
+        const p = &(self.plane.packer orelse return self.plane.chunk / 2);
+        return p.policy.max_slot;
+    }
+    fn openPacks(ctx: *anyopaque, gpa: Allocator) Allocator.Error![]defrag_plan.BlockKey {
+        const self = self_(ctx);
+        const p = &(self.plane.packer orelse return try gpa.alloc(defrag_plan.BlockKey, 0));
+        var placed: std.ArrayList(pack.Placed) = .empty;
+        defer placed.deinit(gpa);
+        _ = try p.openBlocks(gpa, &placed);
+        const out = try gpa.alloc(defrag_plan.BlockKey, placed.items.len);
+        for (placed.items, out) |pl, *o| o.* = .{ .vol_tag = pl.vol_tag, .block_idx = pl.offset / self.plane.chunk };
+        return out;
+    }
+    fn openRoomBytes(ctx: *anyopaque) u64 {
+        const self = self_(ctx);
+        const p = &(self.plane.packer orelse return 0);
+        var placed: std.ArrayList(pack.Placed) = .empty;
+        defer placed.deinit(self.plane.gpa);
+        return p.openBlocks(self.plane.gpa, &placed) catch 0;
+    }
+    fn drainReclaim(ctx: *anyopaque) void {
+        const self = self_(ctx);
+        _ = self.plane.reclaimer.drainSync(self.io);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The admin lane's world over the ONLINE set (`admin.AdminWorld`): the
+// lattice through `PlaneWorld` with the plane attach + the grant-plane arm
+// between the record and the placement; the fsck job's last report.
+// ---------------------------------------------------------------------------
+
+const admin_mod = @import("admin.zig");
+const fsck_runner = @import("../fsck/runner.zig");
+
+/// The online add's seventh step needs the wire plane (the allocation
+/// lease + the holder's row for the new volume): a seam the mount binds.
+pub const DataArm = struct {
+    ctx: *anyopaque,
+    arm: *const fn (ctx: *anyopaque, plane: *plane_mod.DataPlane, ordinal: u16) error{Io}!void,
+};
+
+pub const PlaneAdmin = struct {
+    node: *Node,
+    world_: PlaneWorld,
+    arm: ?DataArm,
+    /// `volume add-data` online: the attach + the grant-plane arm run
+    /// between the record tx and the placement publish — `publishPlacement`
+    /// is the lattice's step 7, so the add binds its own publish hook.
+    pending_attach: ?set_config.DataVolume = null,
+
+    pub fn world(self: *PlaneAdmin) admin_mod.AdminWorld {
+        return .{ .ctx = self, .vtable = &vt };
+    }
+
+    const vt: admin_mod.AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .fsckReport = &fsckReport };
+
+    fn self_(ctx: *anyopaque) *PlaneAdmin {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// The seven steps over an ONLINE world whose `publishPlacement` for
+    /// the new volume first attaches it to the plane and arms the grant
+    /// plane over it (device → record → attach → arm → Active), then the
+    /// rebalance SUBMITTED through the fabric at the shipped 25 %.
+    fn addData(ctx: *anyopaque, gpa: Allocator, uri: []const u8, rebalance: bool) lattice.Error!admin_mod.VolumeOutcome {
+        const self = self_(ctx);
+        const node = self.node;
+        const plane = node.plane;
+        const dev = volume_ops.probeDevice(gpa, node.io, uri, node.store.be.setUuid(), @intCast(plane.chunk)) catch |e| return e;
+        var online: OnlineAdd = .{ .admin = self, .dev = dev, .cfg_after = null };
+        defer if (online.cfg_after) |*c| c.deinit(gpa);
+        const out = try lattice.addData(gpa, online.world(), dev, false);
+        var job_id: u64 = 0;
+        if (rebalance) {
+            job_id = node.fabric.submit(node.io, .{ .job_type = .rebalance, .throttle_pct = rebalance_mod.REBALANCE_DEFAULT_THROTTLE_PCT }) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => blk: {
+                    log.warn("admin lane: the add's rebalance could not be submitted ({s}) — `defrag --rebalance` queues it later", .{@errorName(e)});
+                    break :blk 0;
+                },
+            };
+        }
+        return .{ .vol_tag = out.vol_tag, .job_id = job_id, .config_generation = out.config_generation, .capacity_blocks = @intCast(@min(dev.capacity_blocks, std.math.maxInt(u32))) };
+    }
+
+    /// `lattice.World` for the online add: `PlaneWorld` with the attach +
+    /// arm folded into the placement publish of the NEW volume.
+    const OnlineAdd = struct {
+        admin: *PlaneAdmin,
+        dev: lattice.Device,
+        cfg_after: ?set_config.Config,
+
+        fn world(self: *OnlineAdd) lattice.World {
+            return .{ .ctx = self, .vtable = &ovt };
+        }
+        const ovt: lattice.World.VTable = .{ .gate = &gate, .loadConfig = &loadConfig, .stampLifecycleBit = &stamp, .formatDevice = &formatDevice, .commit = &commit, .publishPlacement = &publish, .cancelEvacuations = &cancelEvac, .now_s = &nowS, .random = &randomFn };
+        fn inner(ctx: *anyopaque) *PlaneWorld {
+            const self: *OnlineAdd = @ptrCast(@alignCast(ctx));
+            return &self.admin.world_;
+        }
+        fn gate(ctx: *anyopaque) lattice.Error!void {
+            return PlaneWorld.vt.gate(inner(ctx));
+        }
+        fn loadConfig(ctx: *anyopaque, gpa: Allocator) lattice.Error!set_config.Config {
+            return PlaneWorld.vt.loadConfig(inner(ctx), gpa);
+        }
+        fn stamp(ctx: *anyopaque) lattice.Error!void {
+            return PlaneWorld.vt.stampLifecycleBit(inner(ctx));
+        }
+        fn formatDevice(ctx: *anyopaque, dev: lattice.Device, vol_tag: u64) lattice.Error!void {
+            return PlaneWorld.vt.formatDevice(inner(ctx), dev, vol_tag);
+        }
+        /// The record lands; the config AFTER is kept for the attach.
+        fn commit(ctx: *anyopaque, cfg: *const set_config.Config, job: ?records.JobRecord) lattice.Error!void {
+            const self: *OnlineAdd = @ptrCast(@alignCast(ctx));
+            try PlaneWorld.vt.commit(inner(ctx), cfg, job);
+            const gpa = self.admin.node.plane.gpa;
+            self.cfg_after = cfg.clone(gpa) catch return error.OutOfMemory;
+        }
+        /// Step 7 for the NEW volume: attach to the plane (router row
+        /// DISABLED), arm the grant plane, THEN Active.
+        fn publish(ctx: *anyopaque, vol_tag: u64, state: set_config.State) lattice.Error!void {
+            const self: *OnlineAdd = @ptrCast(@alignCast(ctx));
+            const plane = self.admin.node.plane;
+            const cfg = self.cfg_after orelse return error.Io;
+            const d = cfg.find(vol_tag) orelse return error.UnknownVolume;
+            const ordinal = plane.attachVolume(d.*) catch |e| {
+                log.err("admin lane: vol {x} was recorded but could not be attached to the live plane ({s}) — it joins at the next mount", .{ vol_tag, @errorName(e) });
+                return error.Io;
+            };
+            if (self.admin.arm) |a| a.arm(a.ctx, plane, ordinal) catch {
+                log.err("admin lane: vol {x} attached but the grant plane could not arm over it — no placement on it until the next mount", .{vol_tag});
+                return error.Io;
+            };
+            return PlaneWorld.vt.publishPlacement(inner(ctx), vol_tag, state);
+        }
+        fn cancelEvac(ctx: *anyopaque, vol_tag: u64) lattice.Error!void {
+            return PlaneWorld.vt.cancelEvacuations(inner(ctx), vol_tag);
+        }
+        fn nowS(ctx: *anyopaque) u64 {
+            return PlaneWorld.vt.now_s(inner(ctx));
+        }
+        fn randomFn(ctx: *anyopaque) u64 {
+            return PlaneWorld.vt.random(inner(ctx));
+        }
+    };
+
+    /// `remove-data`: the preflight over the live plane at the ACTUAL
+    /// worker count, the `Draining` tx + placement, the evacuation
+    /// SUBMITTED (the fabric's claim runs it at once).
+    fn removeData(ctx: *anyopaque, gpa: Allocator, vol_tag: u64) lattice.Error!admin_mod.VolumeOutcome {
+        const self = self_(ctx);
+        const node = self.node;
+        const pf = volume_ops.preflightDrain(gpa, node.plane, vol_tag, node.opts.workers) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Io,
+        };
+        _ = try lattice.removeData(gpa, self.world_.world(), vol_tag, pf, false);
+        const job_id = node.fabric.submit(node.io, .{ .job_type = .evacuate_volume, .throttle_pct = 100, .arg0 = vol_tag }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => blk: {
+                log.err("admin lane: vol {x} is Draining but the evacuation could not be submitted ({s}) — `volume undrain` or retry", .{ vol_tag, @errorName(e) });
+                break :blk 0;
+            },
+        };
+        return .{ .vol_tag = vol_tag, .job_id = job_id, .preflight = pf };
+    }
+
+    fn undrain(ctx: *anyopaque, gpa: Allocator, vol_tag: u64) lattice.Error!admin_mod.VolumeOutcome {
+        const self = self_(ctx);
+        const before = self.node.fabric.liveNonTerminal(self.node.io);
+        try lattice.undrain(gpa, self.world_.world(), vol_tag);
+        const after = self.node.fabric.liveNonTerminal(self.node.io);
+        return .{ .vol_tag = vol_tag, .cancelled = @intCast(before -| after) };
+    }
+
+    fn fsckReport(ctx: *anyopaque, gpa: Allocator, job_id: u64) Allocator.Error!?[]u8 {
+        const self = self_(ctx);
+        const node = self.node;
+        const snap = node.fabric.snapshot(node.io, job_id) orelse return null;
+        if (snap.job_type != .fsck) return null;
+        const body = node.fsck_body orelse return null;
+        return body.lastReportJson(gpa);
+    }
+};
+
+const rebalance_mod = @import("rebalance.zig");
+const volume_ops = @import("../lifecycle/volume_ops.zig");
+const meta_set = @import("../../meta/meta_set.zig");
+const listener_mod = @import("../../wire/listener.zig");
 
 // ---------------------------------------------------------------------------
 // The mount's node: the fabric + the shard table + the wire side + the
@@ -624,14 +1042,36 @@ pub const Node = struct {
     io: Io,
     opts: Options,
     store: TreeStore,
+    plane: *plane_mod.DataPlane,
     fabric: Fabric,
     sink: AllocSink,
     table: lease_mod.ShardTable,
     coord: wire_mod.Coordinator,
     verify: PlaneVerify,
     workers: sync.TaskSet = .init,
-    component_registered: bool = false,
     block_size: u64,
+    /// The bodies over the plane (`bindBodies`), one each.
+    mover_: PlaneMover,
+    walk_: PlaneWalk,
+    world_: PlaneWorld,
+    drain_: PlaneDrain,
+    drain_body: drain_mod.DrainBody,
+    rebalance_body: drain_mod.RebalanceBody,
+    defrag_: PlaneDefrag,
+    data_body: defrag_bodies.DefragDataBody,
+    pack_body: defrag_bodies.DefragPackBody,
+    noop_body: fabric_mod.NoopBody = .{},
+    /// The fsck engine over the LIVE binding (null until `bindFsck`).
+    fsck_body: ?*fsck_runner.linux.JobBody = null,
+    /// The admin lane (registered beside the job block).
+    admin_: PlaneAdmin,
+    admin_svc: admin_mod.AdminService,
+    /// The foreground write-rate estimator the preflight reads.
+    rate: preflight.WriteRateEstimator = .{},
+    /// The listener's departure binding (its address is the listener's).
+    departure_: listener_mod.Listener.Departure = undefined,
+    sweeper: ?Io.Future(void) = null,
+    sweeper_stop: std.atomic.Value(bool) = .init(false),
 
     const PlaneVerify = struct {
         plane: *plane_mod.DataPlane,
@@ -657,6 +1097,10 @@ pub const Node = struct {
         /// allocator; offline verbs and tests start open.
         held: bool,
         random: *const fn () u64,
+        /// The online add's grant-plane arm (the wire plane's); null on a
+        /// mount with no wire (then `volume add-data` on the live mount
+        /// refuses `io` — the offline verb is the path).
+        data_arm: ?DataArm = null,
     };
 
     pub fn create(gpa: Allocator, io: Io, opts: Options, in: Init) Allocator.Error!*Node {
@@ -667,18 +1111,68 @@ pub const Node = struct {
             .io = io,
             .opts = opts,
             .store = .{ .be = in.backend },
+            .plane = in.plane,
             .fabric = undefined,
             .sink = .{ .plane = in.plane, .wero = in.wero },
             .table = undefined,
             .coord = undefined,
             .verify = .{ .plane = in.plane },
             .block_size = in.plane.chunk,
+            .mover_ = .{ .plane = in.plane, .io = io, .pre_publish_hold = opts.pre_publish_hold },
+            .walk_ = .{ .plane = in.plane },
+            .world_ = undefined,
+            .drain_ = undefined,
+            .drain_body = undefined,
+            .rebalance_body = undefined,
+            .defrag_ = undefined,
+            .data_body = undefined,
+            .pack_body = undefined,
+            .admin_ = undefined,
+            .admin_svc = undefined,
         };
         n.fabric = Fabric.init(gpa, n.store.store(), .{ .identity = in.identity, .pid = in.pid, .default_throttle_pct = opts.cpu_limit, .park_delay_ns = opts.park_delay_ns, .held = in.held, .random = in.random });
         n.table = lease_mod.ShardTable.init(seams.LEASE_TTL_MS, n.sink.sink(), null);
         n.coord = wire_mod.Coordinator.init(gpa, io, &n.fabric, &n.table, .{ .verify = n.verify.vr(), .channel = .plaintext, .configured_permille = opts.verify_permille, .wero = if (in.wero) |w| w.wero() else null });
         n.sink.coord = &n.coord;
+        // The bodies over the plane (every job type this daemon can run).
+        n.world_ = .{ .be = in.backend, .plane = in.plane, .fabric = &n.fabric, .io = io, .random = in.random };
+        n.drain_ = .{ .plane = in.plane, .io = io, .walk_ = n.walk_, .mover_ = n.mover_, .world_ = n.world_, .workers = opts.workers, .rate = .{ .ctx = n, .bps = &writeRateFn } };
+        n.drain_body = .{ .gpa = gpa, .seam = n.drain_.seam() };
+        n.rebalance_body = .{ .gpa = gpa, .seam = n.drain_.seam() };
+        n.defrag_ = .{ .plane = in.plane, .io = io, .mover_ = &n.mover_, .pack_ = .{ .plane = in.plane, .io = io, .mover_ = &n.mover_ } };
+        n.data_body = .{ .gpa = gpa, .seam = n.defrag_.seam() };
+        n.pack_body = .{ .gpa = gpa, .seam = n.defrag_.seam() };
+        n.fabric.registerBody(.noop, n.noop_body.body());
+        n.fabric.registerBody(.evacuate_volume, n.drain_body.body());
+        n.fabric.registerBody(.rebalance, n.rebalance_body.body());
+        n.fabric.registerBody(.defrag_data, n.data_body.body());
+        n.fabric.registerBody(.defrag_pack, n.pack_body.body());
+        n.admin_ = .{ .node = n, .world_ = n.world_, .arm = in.data_arm };
+        n.admin_svc = .{ .io = io, .fabric = &n.fabric, .world = n.admin_.world() };
         return n;
+    }
+
+    fn writeRateFn(ctx: *anyopaque) u64 {
+        const self: *Node = @ptrCast(@alignCast(ctx));
+        return self.rate.rateBps();
+    }
+
+    /// The foreground write admission sampled at the fabric's checkpoint
+    /// cadence (the preflight's headroom term): the cadence tick calls it.
+    pub fn sampleWriteRate(self: *Node, admitted_bytes: u64) void {
+        self.rate.sample(clock.monotonicNs(), admitted_bytes);
+    }
+
+    /// The fsck engine over the LIVE binding: the `JobType.fsck` body (one
+    /// pass = one online run; the admin lane reads its last report). The
+    /// filesystem's 4a manager is the ladder's exclusive lease.
+    pub fn bindFsck(self: *Node, be: *meta_set.MetaSet, fs: ?*fsck_runner.linux.BackendFs, env: *const std.process.Environ.Map, mem_budget: u64, staging_root: ?[]const u8) !void {
+        const b = try fsck_runner.linux.bind(self.gpa, self.io, be, self.plane, .{ .env = env, .mode = .online, .mem_budget = mem_budget, .fs = fs, .staging_root = staging_root });
+        errdefer fsck_runner.linux.destroy(b);
+        const body = try self.gpa.create(fsck_runner.linux.JobBody);
+        body.* = .{ .gpa = self.gpa, .be = be, .plane = self.plane, .env = env, .mem_budget = mem_budget, .fs = fs, .staging_root = staging_root, .bound = b };
+        self.fsck_body = body;
+        self.fabric.registerBody(.fsck, body.body());
     }
 
     /// The sheddable `job_copy_buffers` component: sized from the ACTUAL
@@ -692,18 +1186,46 @@ pub const Node = struct {
         self.fabric.shedTo(self.io, target);
     }
 
-    /// Adopt the durable records, register the job verbs on the manager's
-    /// service and spawn the local pool (claims nothing while held).
+    /// Adopt the durable records, register the job block AND the admin
+    /// lane on the manager's service, spawn the local pool (claims nothing
+    /// while held) and the lease sweeper.
+    /// The listener's departure hook → the coordinator's `sessionDeparted`.
+    pub fn departure(self: *Node) *const listener_mod.Listener.Departure {
+        self.departure_ = .{ .ctx = self, .call = &departed };
+        return &self.departure_;
+    }
+
+    fn departed(ctx: *anyopaque, session_id: u64) void {
+        const self: *Node = @ptrCast(@alignCast(ctx));
+        self.coord.sessionDeparted(session_id);
+    }
+
     pub fn start(self: *Node, svc: ?*@import("../../wire/service.zig").Service) !void {
-        _ = try self.fabric.adopt(self.io);
-        if (svc) |s| self.coord.register(s);
+        const adopted = try self.fabric.adopt(self.io);
+        if (svc) |s| {
+            self.coord.register(s);
+            self.admin_svc.register(s);
+        }
         var i: u32 = 0;
         while (i < self.opts.workers) : (i += 1) try self.workers.spawn(self.io, workerMain, .{self});
-        log.info("job fabric: {d} local worker(s), default throttle {d} %, verify {d} ‰ (plaintext pins 1000), fleet jobs {s}", .{ self.opts.workers, self.opts.cpu_limit, self.coord.permille(), if (self.opts.fleet_jobs) "on" else "off" });
+        self.sweeper = try self.io.concurrent(sweeperMain, .{self});
+        log.info("job fabric: {d} job(s) adopted; {d} local worker(s), default throttle {d} %, verify {d} ‰ (plaintext pins 1000), fleet jobs {s}; the admin lane {s}", .{ adopted, self.opts.workers, self.opts.cpu_limit, self.coord.permille(), if (self.opts.fleet_jobs) "on" else "off", if (svc != null) "on the listener" else "unserved (no wire)" });
     }
 
     fn workerMain(self: *Node) Io.Cancelable!void {
         self.fabric.serve(self.io, false);
+    }
+
+    /// The shard-lease sweeper at `max(TTL/4, 25 ms)` (`lease.zig`'s law):
+    /// expired remote shards requeue; a lost notify cannot strand it (the
+    /// park is bounded by the cadence itself).
+    fn sweeperMain(self: *Node) void {
+        const period_ns = lease_mod.sweepTickNs(self.table.ttl_ms);
+        while (!self.sweeper_stop.load(.acquire)) {
+            _ = self.coord.sweep(clock.monotonicNs());
+            var n = self.coord.fabric.pool_wake.notified();
+            _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + period_ns);
+        }
     }
 
     pub fn openAdmission(self: *Node) void {
@@ -719,12 +1241,25 @@ pub const Node = struct {
     }
 
     pub fn stop(self: *Node, svc: ?*@import("../../wire/service.zig").Service) void {
-        if (svc) |s| self.coord.unregister(s);
+        if (svc) |s| {
+            self.coord.unregister(s);
+            self.admin_svc.unregister(s);
+        }
+        self.sweeper_stop.store(true, .release);
         self.fabric.stop(self.io);
+        if (self.sweeper) |*f| {
+            f.cancel(self.io);
+            self.sweeper = null;
+        }
         self.workers.wait(self.io) catch {};
     }
 
     pub fn destroy(self: *Node) void {
+        if (self.fsck_body) |b| {
+            b.deinit();
+            self.gpa.destroy(b);
+        }
+        self.data_body.deinit();
         self.fabric.deinit();
         self.gpa.destroy(self);
     }

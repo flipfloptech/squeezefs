@@ -30,6 +30,7 @@ const endpoint = @import("endpoint.zig");
 const record = @import("../meta/record.zig");
 // @anchor:ops_jobs_verbs — the job fabric's payloads (decision 0003 §G).
 const job_frames = @import("../ops/jobs/frames.zig");
+const admin_frames = @import("../ops/jobs/admin_frames.zig");
 
 pub const Error = codec.Error;
 pub const Builder = codec.Builder;
@@ -53,6 +54,8 @@ pub const META_SHIP_SCHEMA: u32 = 3;
 pub const TOKEN_SCHEMA: u32 = 1;
 /// The job fabric's block (`ops/jobs/frames.zig`): ours, starts at 1.
 pub const JOB_SCHEMA: u32 = job_frames.JOB_SCHEMA;
+/// The admin lane's block (`ops/jobs/admin_frames.zig`): ours, starts at 1.
+pub const ADMIN_SCHEMA: u32 = admin_frames.ADMIN_SCHEMA;
 
 pub const Block = enum(u8) {
     wire,
@@ -62,6 +65,8 @@ pub const Block = enum(u8) {
     manager,
     /// `0x06xx`: the job fabric on the ONE listener (rung 8).
     job,
+    /// `0x07xx`: the operator's admin lane on the ONE listener (rung 8).
+    admin,
 
     pub fn schema(self: Block) u32 {
         return switch (self) {
@@ -70,6 +75,7 @@ pub const Block = enum(u8) {
             .token => TOKEN_SCHEMA,
             .manager => MANAGER_SCHEMA,
             .job => JOB_SCHEMA,
+            .admin => ADMIN_SCHEMA,
         };
     }
 };
@@ -131,6 +137,12 @@ pub const Verb = enum(u16) {
     result_submit = 0x0603,
     read_shard_result = 0x0604,
     shard_abandon = 0x0605,
+    // ---- the admin lane 0x0700 (@anchor:ops_admin_verb_numbers) ----
+    admin_job_list = 0x0700,
+    admin_job_control = 0x0701,
+    admin_job_submit = 0x0702,
+    admin_fsck_report = 0x0703,
+    admin_volume = 0x0704,
     // ---- the handshake 0xFFF0 (MAC-less, the handshake class cap) ----
     challenge = 0xFFF0,
     prove = 0xFFF1,
@@ -152,6 +164,7 @@ pub const Verb = enum(u16) {
             0x04 => .token,
             0x05 => .manager,
             0x06 => .job,
+            0x07 => .admin,
             else => unreachable,
         };
     }
@@ -1607,6 +1620,11 @@ pub fn ReqType(comptime v: Verb) type {
         .result_submit => job_frames.ResultSubmitReq,
         .read_shard_result => job_frames.ReadShardResultReq,
         .shard_abandon => job_frames.ShardAbandonReq,
+        .admin_job_list => admin_frames.AdminJobListReq,
+        .admin_job_control => admin_frames.AdminJobControlReq,
+        .admin_job_submit => admin_frames.AdminJobSubmitReq,
+        .admin_fsck_report => admin_frames.AdminFsckReportReq,
+        .admin_volume => admin_frames.AdminVolumeReq,
         .challenge => Challenge,
         .prove => Prove,
         .admitted => Admitted,
@@ -1655,6 +1673,11 @@ pub fn RepType(comptime v: Verb) type {
         .heartbeat => job_frames.HeartbeatAck,
         .result_submit => job_frames.ResultAck,
         .read_shard_result, .shard_abandon => Ack,
+        .admin_job_list => admin_frames.AdminJobList,
+        .admin_job_control => admin_frames.AdminVerdictAck,
+        .admin_job_submit => admin_frames.AdminJobSubmitted,
+        .admin_fsck_report => admin_frames.AdminFsckReport,
+        .admin_volume => admin_frames.AdminVolumeReply,
         // The handshake frames are not calls: no reply type.
         .challenge, .prove, .admitted, .refused => Empty,
     };
@@ -1720,6 +1743,10 @@ test "verb numbers: block-coded, unique, the handshake frames at 0xFFF0, every b
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0508));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0200));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0606));
+    try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0705));
+    try testing.expectEqual(Block.admin, Verb.admin_job_list.block());
+    try testing.expectEqual(ADMIN_SCHEMA, Verb.admin_volume.schema());
+    try testing.expectEqual(frame.Class.control, Verb.admin_job_list.class());
     try testing.expectEqual(Block.job, Verb.job_enroll.block());
     try testing.expectEqual(JOB_SCHEMA, Verb.result_submit.schema());
     try testing.expectEqual(frame.Class.bulk, Verb.shard_assign.class());

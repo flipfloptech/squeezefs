@@ -9,9 +9,13 @@
 //! the bounded JSON printed — nothing moves. The mutating arms on a set
 //! write a durable QUEUED job record (`defrag_data` / `defrag_pack` /
 //! `defrag_meta` / `rebalance`) in one tx that the next mount's fabric
-//! adopts and runs through the ONE mover; `--fold` is live-mount only
-//! (fold custody is the mount's) and a mountpoint target rides the admin
-//! lane this build does not serve yet — both refused by name.
+//! adopts and runs through the ONE mover. A MOUNTPOINT target SUBMITS the
+//! arms through the daemon's admin lane (`admin_lane.zig`): the fabric
+//! runs them at once; the daemon's bodies are D1/D2 (`--data`), the
+//! compactor (`--pack`) and the rebalance; `--meta` / `--fold` submit and
+//! fail typed (`body`) until their plane seams are bound (stated in the
+//! rung-8 evidence) — never a silent queue. `--report-only` is the
+//! offline measure (the set's gauges ride `.stats` on a live mount).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,8 +39,12 @@ comptime {
 
 pub fn run(p: cli.Process, d: args.Defrag) u8 {
     if (args.targetIsMountpoint(d.target)) {
-        p.stderr.writeAll("squeezefs defrag: refused: a mountpoint target rides the daemon's admin lane, which this build does not serve yet; run the arm on the sqmeta:// set (the next mount's fabric runs the queued job)\n") catch {};
-        return cli.exit_failed;
+        if (d.report_only) {
+            p.stderr.writeAll("squeezefs defrag --report-only: refused on a mountpoint: the live gauges ride the mount's .stats (`defrag_*`, `pack_*`); the measured report is the offline probe on the sqmeta:// set\n") catch {};
+            return cli.exit_failed;
+        }
+        var live: Live = .{ .p = p, .d = d };
+        return admin_lane.withLane(p, "defrag", d.target, .{ .ctx = &live, .run = Live.run });
     }
     if (d.fold) {
         p.stderr.writeAll("squeezefs defrag --fold: refused: fold custody is the mount's — the D3 arm runs on a live mount only\n") catch {};
@@ -45,6 +53,45 @@ pub fn run(p: cli.Process, d: args.Defrag) u8 {
     var body: Body = .{ .p = p, .d = d };
     return offline.withSet(p, d.target, .{ .with_plane = true, .verb = "defrag" }, .{ .ctx = &body, .run = Body.run });
 }
+
+const admin_lane = @import("admin_lane.zig");
+const errors = @import("../core/errors.zig");
+
+/// The live arms: one submission per arm through the lane; the fabric's
+/// verdict decides the exit.
+const Live = struct {
+    p: cli.Process,
+    d: args.Defrag,
+
+    fn run(ctx: *anyopaque, lane: *admin_lane.Lane) u8 {
+        const self: *Live = @ptrCast(@alignCast(ctx));
+        const p = self.p;
+        const d = self.d;
+        const types = [_]struct { on: bool, t: jobs.JobType }{ .{ .on = d.data, .t = .defrag_data }, .{ .on = d.pack, .t = .defrag_pack }, .{ .on = d.meta, .t = .defrag_meta }, .{ .on = d.fold, .t = .defrag_fold }, .{ .on = d.rebalance, .t = .rebalance } };
+        var n: usize = 0;
+        p.stdout.print("submitted at throttle {d} %:", .{d.throttle}) catch {};
+        for (types) |row| {
+            if (!row.on) continue;
+            const arg0: u64 = if (row.t == .rebalance or row.t == .defrag_meta or row.t == .defrag_fold) 0 else (d.volume orelse 0);
+            const sub = lane.admin().submit(.{ .job_type = row.t, .throttle_pct = d.throttle, .arg0 = arg0 }) catch |e| {
+                p.stdout.writeAll("\n") catch {};
+                p.stderr.print("squeezefs defrag: the submission of {s} failed ({s}, {t})\n", .{ row.t.name(), @errorName(e), errors.toErrno(e) }) catch {};
+                return cli.exit_failed;
+            };
+            if (sub.verdict != .ok) {
+                p.stdout.writeAll("\n") catch {};
+                p.stderr.print("squeezefs defrag: {s} refused: {s}\n", .{ row.t.name(), admin_lane.verdictText(sub.verdict) }) catch {};
+                p.stderr.flush() catch {};
+                return cli.exit_failed;
+            }
+            p.stdout.print(" {s}=job-{x:0>16}", .{ row.t.name(), sub.job_id }) catch {};
+            n += 1;
+        }
+        p.stdout.print(" ({d} job(s); `squeezefs job list {s}` follows them)\n", .{ n, d.target }) catch {};
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+};
 
 const Body = struct {
     p: cli.Process,
@@ -67,7 +114,7 @@ const Body = struct {
         const gpa = p.gpa;
         var d1: std.ArrayList(defrag.report.D1Volume) = .empty;
         defer d1.deinit(gpa);
-        for (plane.vols.rows[0..plane.vols.count]) |r| {
+        for (plane.vols.rows[0..plane.vols.n()]) |r| {
             const v = r.?;
             const m = defrag.metrics.measureD1(v.vol_tag, v.alloc.highestBlockIndex(), v.alloc, isFree);
             d1.append(gpa, .{ .vol_tag = v.vol_tag, .contiguity_permille = m.contiguityPermille(), .reclaimable_tail_permille = m.reclaimableTailPermille(), .total_free_blocks = m.total_free, .highest = m.highest }) catch return oom(p);
@@ -114,7 +161,7 @@ const Body = struct {
         }
         var scope: std.ArrayList(u64) = .empty;
         defer scope.deinit(gpa);
-        for (plane.vols.rows[0..plane.vols.count]) |r| scope.append(gpa, r.?.vol_tag) catch return oom(p);
+        for (plane.vols.rows[0..plane.vols.n()]) |r| scope.append(gpa, r.?.vol_tag) catch return oom(p);
         const policy = pack.Policy.fromEnv(set.env, plane.chunk);
         var pplan = defrag.plan.planPackCompaction(gpa, .{ .refs = refs.items, .scope = scope.items, .chunk = plane.chunk, .max_slot = policy.max_slot, .open = &.{}, .open_room_bytes = 0 }) catch return oom(p);
         defer pplan.deinit(gpa);

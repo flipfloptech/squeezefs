@@ -4199,6 +4199,416 @@ test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed
     }
 }
 
+// ---- the job fabric's Linux matrix (rung 8) ----
+
+/// The matrix's data volumes: 4 GiB SPARSE each (ext4 on /build charges
+/// only what is written — ≈ 1.8 GiB across the row), so the drain's
+/// capacity closed form (`headroom ≥ 1 GiB`, `transient = 64 × workers ×
+/// block`) admits a 1.5 GiB file's evacuation onto two survivors; at the
+/// smoke's 2 GiB volumes the law refuses by design.
+const matrix_vol_len: u64 = 4 << 30;
+
+/// One live job's state through `job status <mountpoint>` (null = not in
+/// the live table).
+fn liveJobState(rig: *Rig, job_id: []const u8) !?[]const u8 {
+    const r = try rig.squeezefs(&.{ "job", "status", rig.mp, job_id });
+    defer rig.freeRun(r);
+    if (!r.term.success()) return null;
+    // `job-…: <type> <state>, …`
+    const colon = std.mem.indexOf(u8, r.stdout, ": ") orelse return null;
+    var it = std.mem.tokenizeAny(u8, r.stdout[colon + 2 ..], " ,");
+    _ = it.next() orelse return null;
+    const state = it.next() orelse return null;
+    inline for (@typeInfo(jobs_records.JobState).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, state, name)) return name;
+    }
+    return null;
+}
+
+const jobs_records = @import("../ops/jobs/records.zig");
+const rebalance_band_ppm = @import("../ops/jobs/rebalance.zig").REBALANCE_BAND_PPM;
+
+/// Poll until the job is terminal (bounded); the final state.
+fn awaitJobTerminal(rig: *Rig, job_id: []const u8, bound_ns: u64) ![]const u8 {
+    const deadline = clock.monotonicNs() + bound_ns;
+    while (true) {
+        const st = (try liveJobState(rig, job_id)) orelse return error.JobVanished;
+        if (std.mem.eql(u8, st, "completed") or std.mem.eql(u8, st, "cancelled") or std.mem.eql(u8, st, "failed")) return st;
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- {s} still {s} after the bound ---\n", .{ job_id, st });
+            return error.JobNotTerminal;
+        }
+        sleepMs(200);
+    }
+}
+
+/// Poll until the job reads `want` (bounded).
+fn awaitJobState(rig: *Rig, job_id: []const u8, want: []const u8, bound_ns: u64) !void {
+    const deadline = clock.monotonicNs() + bound_ns;
+    while (clock.monotonicNs() < deadline) {
+        const st = (try liveJobState(rig, job_id)) orelse return error.JobVanished;
+        if (std.mem.eql(u8, st, want)) return;
+        sleepMs(50);
+    }
+    std.debug.print("\n--- {s} never read {s} ---\n", .{ job_id, want });
+    return error.JobStateNotReached;
+}
+
+/// The `job-{16 hex}` word out of a verb's stdout (the first one).
+fn jobIdIn(text: []const u8) ?[]const u8 {
+    const i = std.mem.indexOf(u8, text, "job-") orelse return null;
+    if (text.len < i + jobs_records.JOB_ID_TEXT_LEN) return null;
+    const word = text[i .. i + jobs_records.JOB_ID_TEXT_LEN];
+    return if (jobs_records.parseJobId(word) != null) word else null;
+}
+
+/// The `vol-{16 hex}` of the data volume whose record names `path`
+/// (`status`'s row), or null.
+fn volumeIdOfPath(rig: *Rig, path: []const u8) !?[]u8 {
+    const report = try rig.statusReport();
+    defer rig.gpa.free(report);
+    var lines = std.mem.splitScalar(u8, report, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, path) == null) continue;
+        const i = std.mem.indexOf(u8, line, "vol-") orelse continue;
+        if (line.len < i + 20) continue;
+        return try rig.gpa.dupe(u8, line[i .. i + 20]);
+    }
+    return null;
+}
+
+test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (packed, striped, a 1.5 GiB block-map file) → umount, clone, remount → `volume add-data <mp>` ONLINE (the new volume live, the rebalance on the fabric, `backend_fill_spread` ≤ 10 pp) → `volume remove-data <mp> d0` → `job pause/resume/throttle` live → the drain retires d0 (every block moved once; df within the window) → `undrain` refused after retire → `defrag --pack <mp>` on a half-empty pack → `remove-data d1` at 25 % → kill -9 mid-drain → remount adopts and completes it → `fsck --online` 0 findings → a second daemon enrolls as a REMOTE WORKER over TCP and runs a job → `fsck --offline` clean" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var bs_buf: [16]u8 = undefined;
+    // The matrix's volumes are wider than the smoke's (sparse; see
+    // `matrix_vol_len`): sized before the ONE format reads the device
+    // lengths into the superblocks.
+    try rig.createMetaVolume();
+    const d2 = try std.fmt.allocPrintSentinel(gpa, "{s}/d2.img", .{rig.work}, 0);
+    defer gpa.free(d2);
+    for ([_][:0]const u8{ rig.d0, rig.d1, d2 }) |dp| {
+        const f = try Io.Dir.cwd().createFile(io, dp, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, matrix_vol_len);
+    }
+    _ = linux.mkdir(rig.cache.ptr, 0o700);
+    {
+        const r = try rig.squeezefs(&.{ "format", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}), "--disk-cache-paths", rig.cache, rig.meta_uri, rig.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+
+    // 1. The fill: 20 packed 64 KiB files, three fsync'd 20 MiB striped
+    //    files, the 1.5 GiB block-map file; umount (the staged files
+    //    promote into packs), the offline clone (a shared block), remount.
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 20 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; echo filled");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
+    }
+    {
+        const script = try kvmapWriteScript(gpa, 0, kvmap_file_mib / image_mib, false);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "kvmap-write-ok") != null);
+    }
+    {
+        const out = try rig.onMount("sha256sum big big0 big1 big2 p/small* | sort -k2 > \"$1/before.sha\"; echo ok");
+        defer gpa.free(out);
+    }
+    try rig.expectAlive("the matrix fill");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const r = try rig.squeezefs(&.{ "clone", rig.meta_uri, "/big0", "/big0-clone" });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+    }
+    const v0 = (try volumeIdOfPath(rig, rig.d0)) orelse return error.NoVolumeId;
+    defer gpa.free(v0);
+    const v1 = (try volumeIdOfPath(rig, rig.d1)) orelse return error.NoVolumeId;
+    defer gpa.free(v1);
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    const used_before = try rig.usedKib();
+
+    // 2. ONLINE add-data: the device formatted + recorded + attached + armed
+    //    in one verb; the rebalance runs on the fabric; every volume ends
+    //    within 10 pp of the mean fill (the planner raises the under-filled
+    //    rows to the band's floor, `mean − 10 pp`, and never pushes a
+    //    source below the mean), so `backend_fill_spread` = max − min ≤
+    //    2 × the band once the cadence refreshed the census.
+    var rebalance_id_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    {
+        const r = try rig.squeezefs(&.{ "volume", "add-data", rig.mp, d2 });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nadd-data: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "live") != null);
+        const id = jobIdIn(r.stdout) orelse return error.NoRebalanceJob;
+        @memcpy(&rebalance_id_buf, id);
+    }
+    const rebalance_id: []const u8 = &rebalance_id_buf;
+    try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, rebalance_id, 600 * std.time.ns_per_s));
+    {
+        // The cadence refreshes the census every watchdog tick (5 s).
+        const deadline = clock.monotonicNs() + 20 * std.time.ns_per_s;
+        var spread: u64 = std.math.maxInt(u64);
+        while (clock.monotonicNs() < deadline) {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            spread = numberAfter(st, "\"backend_fill_spread\":") orelse spread;
+            if (spread <= 2 * rebalance_band_ppm) break;
+            sleepMs(500);
+        }
+        std.debug.print("\nsmoke[jobs]: add-data live; the rebalance completed; backend_fill_spread {d} ppm (every volume within the {d} ppm band of the mean)\n", .{ spread, rebalance_band_ppm });
+        try testing.expect(spread <= 2 * rebalance_band_ppm);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "job", "list", rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "rebalance") != null);
+    }
+    // A terminal job refuses a control by verdict (exit 1, named).
+    {
+        const r = try rig.squeezefs(&.{ "job", "throttle", rig.mp, rebalance_id, "50" });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "terminal") != null);
+    }
+
+    // 3. remove-data d0, throttled to 25 % live: pause (observable),
+    //    resume, throttle back to 100; the drain retires d0; undrain after
+    //    retire refuses.
+    var drain_id_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    {
+        const r = try rig.squeezefs(&.{ "volume", "remove-data", rig.mp, v0 });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nremove-data: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "Draining") != null);
+        const id = jobIdIn(r.stdout) orelse return error.NoDrainJob;
+        @memcpy(&drain_id_buf, id);
+    }
+    const drain_id: []const u8 = &drain_id_buf;
+    {
+        const t = try rig.squeezefs(&.{ "job", "throttle", rig.mp, drain_id, "25" });
+        defer rig.freeRun(t);
+        try testing.expect(t.term.success());
+        const r = try rig.squeezefs(&.{ "job", "pause", rig.mp, drain_id });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+    }
+    try awaitJobState(rig, drain_id, "paused", 30 * std.time.ns_per_s);
+    {
+        const r = try rig.squeezefs(&.{ "job", "resume", rig.mp, drain_id });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const t = try rig.squeezefs(&.{ "job", "throttle", rig.mp, drain_id, "100" });
+        defer rig.freeRun(t);
+        try testing.expect(t.term.success());
+    }
+    try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, drain_id, 900 * std.time.ns_per_s));
+    {
+        const r = try rig.squeezefs(&.{ "volume", "undrain", rig.mp, v0 });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "refused") != null);
+    }
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const moved = numberAfter(st, "\"evacuate_blocks_moved\":") orelse 0;
+        const retired = numberAfter(st, "\"volume_retired\":") orelse 0;
+        // `df`: the moved blocks are counted on their destinations; the
+        // window's slack is at most one grant floor per volume. Polled: the
+        // retire's terminal frees drain through the reclaimer after the job
+        // reads completed (its park bound is 1 s).
+        const slack_kib = 2 * 64 * (kvmap_block >> 10);
+        var used_after = try rig.usedKib();
+        const df_deadline = clock.monotonicNs() + 10 * std.time.ns_per_s;
+        while ((used_after + slack_kib < used_before or used_after > used_before + slack_kib) and clock.monotonicNs() < df_deadline) {
+            sleepMs(200);
+            used_after = try rig.usedKib();
+        }
+        std.debug.print("smoke[jobs]: drain of {s}: {d} block(s) moved, volume_retired {d}; df used {d} → {d} KiB (slack ≤ {d})\n", .{ v0, moved, retired, used_before, used_after, slack_kib });
+        try testing.expect(moved >= 1);
+        try testing.expectEqual(@as(u64, 1), retired);
+        if (used_after + slack_kib < used_before or used_after > used_before + slack_kib) {
+            if (std.mem.indexOf(u8, st, "\"block_grant_holder\":")) |i| std.debug.print("    {s}\n", .{st[i..@min(st.len, i + 700)]});
+            return error.DfBaselineBroken;
+        }
+    }
+
+    // 4. `defrag --pack` on a half-empty pack: 10 of the 20 packed files
+    //    unlinked, the compactor copies the live windows once; the kept
+    //    files stay byte-exact.
+    {
+        const out = try rig.onMount("i=0; while [ $i -lt 10 ]; do rm p/small$i; i=$((i + 1)); done; sync; echo rm-ok");
+        defer gpa.free(out);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "defrag", "--pack", rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndefrag --pack: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        const id = jobIdIn(r.stdout) orelse return error.NoPackJob;
+        try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, id, 300 * std.time.ns_per_s));
+    }
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const compactions = numberAfter(st, "\"pack_compactions\":") orelse 0;
+        std.debug.print("smoke[jobs]: defrag --pack: {d} pack compaction(s)\n", .{compactions});
+        try testing.expect(compactions >= 1);
+        const out = try rig.onMount("i=10; while [ $i -lt 20 ]; do grep \"p/small$i\\$\" \"$1/before.sha\" | sha256sum -c --quiet - ; i=$((i + 1)); done; echo pack-exact");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "pack-exact") != null);
+    }
+
+    // 5. remove-data d1 at 25 %, kill -9 mid-drain → remount: the adopted
+    //    job regenerates its plan and completes; d1 retires.
+    var drain2_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    {
+        const r = try rig.squeezefs(&.{ "volume", "remove-data", rig.mp, v1 });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nremove-data d1: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        @memcpy(&drain2_buf, jobIdIn(r.stdout) orelse return error.NoDrainJob);
+    }
+    const drain2: []const u8 = &drain2_buf;
+    {
+        const t = try rig.squeezefs(&.{ "job", "throttle", rig.mp, drain2, "25" });
+        defer rig.freeRun(t);
+        try testing.expect(t.term.success());
+    }
+    {
+        // Mid-drain: at least one task done, the job still running.
+        const deadline = clock.monotonicNs() + 120 * std.time.ns_per_s;
+        var mid = false;
+        while (clock.monotonicNs() < deadline) {
+            const r = try rig.squeezefs(&.{ "job", "status", rig.mp, drain2 });
+            defer rig.freeRun(r);
+            if (std.mem.indexOf(u8, r.stdout, " running, ")) |_| {
+                if (std.mem.indexOf(u8, r.stdout, ", 0/")) |_| {} else {
+                    mid = true;
+                    break;
+                }
+            }
+            sleepMs(100);
+        }
+        try testing.expect(mid);
+    }
+    rig.killed = true;
+    _ = linux.kill(rig.child_pid, .KILL);
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark..], "job(s) adopted") != null);
+    }
+    try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, drain2, 900 * std.time.ns_per_s));
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        std.debug.print("smoke[jobs]: kill -9 mid-drain → remount: {s} resumed from its regenerated plan and completed; volume_retired {d}\n", .{ drain2, numberAfter(st, "\"volume_retired\":") orelse 0 });
+        try testing.expectEqual(@as(u64, 1), numberAfter(st, "\"volume_retired\":") orelse 0);
+    }
+    // 6. `fsck --online` on the live mount: 0 findings.
+    {
+        var got = try fsckJsonTarget(rig, rig.mp, &.{"--online"});
+        defer got.report.deinit(gpa);
+        if (got.report.findings.len != 0) for (got.report.findings) |f| std.debug.print("  unexpected: {f}\n", .{f});
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expectEqual(@as(u8, 0), got.code);
+        std.debug.print("smoke[jobs]: fsck --online: {d} inode(s), {d} block(s), 0 findings\n", .{ got.report.counters.inodes_scanned, got.report.counters.blocks_checked });
+    }
+    // Every file byte-exact after two drains and a compaction.
+    {
+        const out = try rig.onMount("sha256sum big big0 big1 big2 p/small1? | sort -k2 > \"$1/after.sha\"; grep -v 'p/small[0-9]$' \"$1/before.sha\" | sort -k2 | cmp - \"$1/after.sha\"; cmp big0 big0-clone; echo all-exact");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "all-exact") != null);
+    }
+
+    // 7. A REMOTE WORKER: a second process enrolls over TCP (`job worker`),
+    //    pulls a wire-executable job the admin lane submits, completes it
+    //    remotely (`job_remote_workers` 1 while enrolled).
+    {
+        var worker = try std.process.spawn(io, .{ .argv = &.{ rig.bin, "job", "worker", rig.meta_uri }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = rig.log_file.? }, .stderr = .{ .file = rig.log_file.? } });
+        var enrolled = false;
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            const st = try rig.stats();
+            defer gpa.free(st);
+            if ((numberAfter(st, "\"job_remote_workers\":") orelse 0) == 1) {
+                enrolled = true;
+                break;
+            }
+            sleepMs(100);
+        }
+        try testing.expect(enrolled);
+        const r = try rig.squeezefs(&.{ "defrag", "--rebalance", rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const id = jobIdIn(r.stdout) orelse return error.NoRebalanceJob;
+        try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, id, 300 * std.time.ns_per_s));
+        _ = linux.kill(worker.id.?, .TERM);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try worker.wait(io));
+        const st = try rig.stats();
+        defer gpa.free(st);
+        std.debug.print("smoke[jobs]: the remote worker enrolled over TCP (job_remote_enrollments {d}); after its leave job_remote_workers {d}\n", .{ numberAfter(st, "\"job_remote_enrollments\":") orelse 0, numberAfter(st, "\"job_remote_workers\":") orelse 99 });
+        try testing.expect((numberAfter(st, "\"job_remote_enrollments\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"job_remote_workers\":") orelse 99);
+    }
+    try rig.expectAlive("the matrix");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the jobs matrix");
+}
+
+/// `fsckJson` over any target (the online arm's mountpoint).
+fn fsckJsonTarget(rig: *Rig, target: []const u8, extra: []const []const u8) !struct { report: json_scan_report.Report, code: u8 } {
+    var argv: [8][]const u8 = undefined;
+    var n: usize = 0;
+    argv[n] = "fsck";
+    n += 1;
+    argv[n] = "--json";
+    n += 1;
+    for (extra) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    argv[n] = target;
+    n += 1;
+    const r = try rig.squeezefs(argv[0..n]);
+    defer rig.freeRun(r);
+    const code: u8 = switch (r.term) {
+        .exited => |c| c,
+        else => 255,
+    };
+    const report = json_scan_report.Report.parse(rig.gpa, r.stdout) catch {
+        std.debug.print("\n--- fsck ({f}) printed no report ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+        return error.FsckNoReport;
+    };
+    return .{ .report = report, .code = code };
+}
+
 // ---- the block-map tree ----
 
 /// The tree-mapped file: 1 MiB blocks (`--block-size 1048576`) put the

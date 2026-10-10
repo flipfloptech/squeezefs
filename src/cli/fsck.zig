@@ -6,11 +6,13 @@
 //! (also a dry-run `--repair` with findings), `--repair --apply` under
 //! that same D0-guarded open with the quarantine dir on the first cache
 //! path (or `--quarantine-dir`). ONLINE (a mountpoint): the engine is
-//! `runner.linux.JobBody`, the fabric's `JobType.fsck` body a serving
-//! daemon registers; the CLI's submission rides the daemon's admin lane,
-//! which this build does not serve yet (the job fabric's verb block), so
-//! the arm is REFUSED by name here — never a silent no-op, never a fake
-//! success. `merge-reports` is portable (durable JSON in, one report out).
+//! `runner.linux.JobBody`, the fabric's `JobType.fsck` body the serving
+//! daemon registered over its live binding; the CLI SUBMITS through the
+//! daemon's admin lane (`admin_lane.zig`), waits for the job's terminal
+//! state (the fabric's typed enum, never a string — decision 0002 row
+//! 404), reads the bounded report back and prints it; `--repair` online
+//! is refused by name (repair is the offline, D0-guarded act). `merge-
+//! reports` is portable (durable JSON in, one report out).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -62,11 +64,7 @@ pub fn run(p: cli.Process, a: args.Fsck) u8 {
         p.stderr.writeAll("squeezefs fsck: Linux only (charter §1.2) — `fsck merge-reports` is the portable arm\n") catch {};
         return cli.exit_failed;
     }
-    if (!a.offline()) {
-        p.stderr.print("squeezefs {s}: refused: the ONLINE run is the fabric's `JobType.fsck` body on the serving daemon; its submission rides the daemon's admin lane, which this build does not serve yet — run `squeezefs {s} --offline sqmeta://…` on the unmounted set\n", .{ if (a.scrub_only) "scrub" else "fsck", if (a.scrub_only) "scrub" else "fsck" }) catch {};
-        p.stderr.flush() catch {};
-        return cli.exit_failed;
-    }
+    if (!a.offline()) return linux_arm.online(p, a);
     return linux_arm.offline(p, a);
 }
 
@@ -192,6 +190,82 @@ const linux_arm = if (is_linux) struct {
             return self.pct;
         }
     };
+
+    const admin_lane = @import("admin_lane.zig");
+    const clock = @import("../core/clock.zig");
+    const errors = @import("../core/errors.zig");
+
+    /// The online run's wait bound: the engine's settle (2 s default) plus
+    /// a scrub of the set at the duty cycle — an hour covers a 2 GiB venue
+    /// set a hundred times over and a 100 TiB set's first pass; past it the
+    /// job stays live and `job status` is the operator's view.
+    const ONLINE_WAIT_NS: u64 = 3600 * std.time.ns_per_s;
+
+    const Online = struct {
+        p: cli.Process,
+        a: args.Fsck,
+        verb: []const u8,
+
+        fn run(ctx: *anyopaque, lane: *admin_lane.Lane) u8 {
+            const self: *Online = @ptrCast(@alignCast(ctx));
+            const p = self.p;
+            const gpa = p.gpa;
+            var arg0: u64 = 0;
+            if (self.a.scrub) arg0 |= fsck.JOB_ARG_SCRUB;
+            if (self.a.scrub_only) arg0 |= fsck.JOB_ARG_SCRUB_ONLY;
+            const sub = lane.admin().submit(.{ .job_type = .fsck, .throttle_pct = self.a.throttle, .arg0 = arg0 }) catch |e| {
+                p.stderr.print("squeezefs {s}: the submission failed ({s}, {t})\n", .{ self.verb, @errorName(e), errors.toErrno(e) }) catch {};
+                return cli.exit_failed;
+            };
+            if (sub.verdict != .ok) {
+                p.stderr.print("squeezefs {s}: refused: {s}\n", .{ self.verb, admin_lane.verdictText(sub.verdict) }) catch {};
+                p.stderr.flush() catch {};
+                return cli.exit_failed;
+            }
+            p.stderr.print("squeezefs {s}: job-{x:0>16} submitted to the live mount; waiting for its terminal state\n", .{ self.verb, sub.job_id }) catch {};
+            p.stderr.flush() catch {};
+            const rec = admin_lane.waitTerminal(lane, sub.job_id, clock.monotonicNs() + ONLINE_WAIT_NS) catch |e| {
+                p.stderr.print("squeezefs {s}: the live table could not be read ({s}, {t})\n", .{ self.verb, @errorName(e), errors.toErrno(e) }) catch {};
+                return cli.exit_failed;
+            } orelse {
+                p.stderr.print("squeezefs {s}: job-{x:0>16} vanished from the live table\n", .{ self.verb, sub.job_id }) catch {};
+                return cli.exit_failed;
+            };
+            if (!rec.isTerminal()) {
+                p.stderr.print("squeezefs {s}: job-{x:0>16} is still {s} after the wait bound — `squeezefs job status <mountpoint> job-{x:0>16}` follows it\n", .{ self.verb, sub.job_id, @tagName(rec.state), sub.job_id }) catch {};
+                return cli.exit_failed;
+            }
+            if (rec.state != .completed) {
+                p.stderr.print("squeezefs {s}: job-{x:0>16} ended {s} (error class {s}) — see the daemon's log\n", .{ self.verb, sub.job_id, @tagName(rec.state), @tagName(rec.error_class) }) catch {};
+                return cli.exit_failed;
+            }
+            const json = (lane.admin().fsckReport(gpa, sub.job_id) catch |e| {
+                p.stderr.print("squeezefs {s}: the report could not be read ({s}, {t})\n", .{ self.verb, @errorName(e), errors.toErrno(e) }) catch {};
+                return cli.exit_failed;
+            }) orelse {
+                p.stderr.print("squeezefs {s}: job-{x:0>16} completed but carries no report\n", .{ self.verb, sub.job_id }) catch {};
+                return cli.exit_failed;
+            };
+            defer gpa.free(json);
+            var report = finding.Report.parse(gpa, json) catch |e| {
+                p.stderr.print("squeezefs {s}: the daemon's report does not parse ({s})\n", .{ self.verb, @errorName(e) }) catch {};
+                return cli.exit_failed;
+            };
+            defer report.deinit(gpa);
+            return emit(p, report, self.a.json);
+        }
+    };
+
+    fn online(p: cli.Process, a: args.Fsck) u8 {
+        const verb: []const u8 = if (a.scrub_only) "scrub" else "fsck";
+        if (a.repair) {
+            p.stderr.print("squeezefs {s}: refused: `--repair` is the OFFLINE act (verify-before-repair under the D0-guarded open) — run `squeezefs fsck --offline --repair [--apply] sqmeta://…` on the unmounted set; the online run detects and reports\n", .{verb}) catch {};
+            p.stderr.flush() catch {};
+            return cli.exit_failed;
+        }
+        var body: Online = .{ .p = p, .a = a, .verb = verb };
+        return admin_lane.withLane(p, verb, a.target, .{ .ctx = &body, .run = Online.run });
+    }
 
     fn offline(p: cli.Process, a: args.Fsck) u8 {
         var body: Body = .{ .p = p, .a = a, .verb = if (a.scrub_only) "scrub" else "fsck" };

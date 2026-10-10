@@ -242,6 +242,12 @@ const FamilyEcho = struct {
             .result_submit => .{ .ok = .{ .result_submit = .of(.accepted) } },
             .read_shard_result => .{ .ok = .{ .read_shard_result = .fresh } },
             .shard_abandon => .{ .ok = .{ .shard_abandon = .fresh } },
+            // @anchor:ops_admin_loopback_echo — the admin lane's canned shapes.
+            .admin_job_list => .{ .ok = .{ .admin_job_list = .{ .head = .{ .n = 0, .verdict = 0, .reserved = @splat(0) }, .rows = &.{} } } },
+            .admin_job_control => .{ .ok = .{ .admin_job_control = .of(.ok) } },
+            .admin_job_submit => .{ .ok = .{ .admin_job_submit = .{ .job_id = 1, .verdict = 0, .reserved = @splat(0) } } },
+            .admin_fsck_report => .{ .ok = .{ .admin_fsck_report = .{ .head = .{ .len = 0, .verdict = 0, .reserved = @splat(0) }, .json = "" } } },
+            .admin_volume => .{ .ok = .{ .admin_volume = .refusal(.ok) } },
             .ping, .challenge, .prove, .admitted, .refused => unreachable,
         };
     }
@@ -354,6 +360,13 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     _ = try c.call(.{ .result_submit = .{ .head = .{ .ref = .{ .job_id = 1, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .n = 0, .reserved = 0 }, .checksums = &.{} } });
     _ = try c.call(.{ .read_shard_result = .{ .head = .{ .ref = .{ .job_id = 1, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .len = 0, .reserved = 0 }, .payload = "" } });
     _ = try c.call(.{ .shard_abandon = .{ .ref = .{ .job_id = 1, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .reason = 1, .reserved = @splat(0) } });
+    // @anchor:ops_admin_loopback_calls — the admin lane's five verbs.
+    const al = try c.call(.{ .admin_job_list = .{ .reserved = 0 } });
+    try testing.expectEqual(@as(usize, 0), al.admin_job_list.rows.len);
+    _ = try c.call(.{ .admin_job_control = .{ .job_id = 1, .op = 0, .pct = 0, .reserved = @splat(0) } });
+    _ = try c.call(.{ .admin_job_submit = .{ .job_type = 1, .throttle_pct = 0, .paused = 0, .reserved = @splat(0), .arg0 = 1, .arg1 = 0 } });
+    _ = try c.call(.{ .admin_fsck_report = .{ .job_id = 1 } });
+    _ = try c.call(.{ .admin_volume = .{ .head = .{ .op = 2, .no_rebalance = 0, .reserved = @splat(0), .vol_tag = 7, .uri_len = 0, .reserved2 = 0 }, .uri = "" } });
     _ = try c.call(.{ .ping = .{} });
     // Every verb reached daemon 1 exactly once (ping is served before the table).
     var total: u32 = 0;

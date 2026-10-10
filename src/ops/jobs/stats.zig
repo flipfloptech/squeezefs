@@ -59,6 +59,14 @@ pub const stats = struct {
     pub var job_fleet_worker_shards: counters.ShardedCounter = .{};
     pub var job_fleet_worker_red_aborts: counters.ShardedCounter = .{};
 
+    // ---- the admin lane (`admin.zig`) ----
+    /// Admin verbs served (every verb of the `0x07xx` block).
+    pub var admin_verbs: counters.ShardedCounter = .{};
+    /// Admin verbs answered with a non-ok verdict.
+    pub var admin_refusals: counters.ShardedCounter = .{};
+    /// Jobs submitted through the lane.
+    pub var admin_submissions: counters.ShardedCounter = .{};
+
     // ---- tripwires (must-stay-0) ----
     /// A terminal state asked to change.
     pub var job_terminal_regressed: counters.Tripwire = .init("job_terminal_regressed");

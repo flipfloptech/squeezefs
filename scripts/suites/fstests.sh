@@ -119,6 +119,12 @@ fstests_fsck_set() {
   local which=$1 n=$2 rc=0
   local out="$RESULTS/fsck-$which-run$n.json"
   local dev; dev=$([ "$which" = test ] && echo "$TEST_LOOP" || echo "$SCRATCH_LOOP")
+  # The SCRATCH device is any test's to leave as it likes (`_require_scratch_nocheck`:
+  # generic/740 ends with a foreign mkfs on it); only a squeezefs volume is scrubbed.
+  if [ "$which" = scratch ]; then
+    local st; st=$("$SQZ_BIN" status "sqmeta://$dev" 2>/dev/null | grep -v '^info\|^debug' | head -1)
+    case "$st" in *"not formatted"*) suite_log "fsck $which (run $n): skipped — the last test left the scratch device $(echo "$st" | sed 's/.*not formatted/not formatted/' | cut -c1-120)"; return 0 ;; esac
+  fi
   "$SQZ_BIN" fsck --offline --scrub --json "sqmeta://$dev" > "$out" 2>"$out.err" || rc=$?
   if [ "$rc" = 0 ]; then suite_log "fsck --offline --scrub $which (run $n): 0 findings"; return 0; fi
   suite_log "fsck --offline --scrub $which (run $n): exit $rc — $out"; head -c 1500 "$out" >&2; echo >&2; grep -v '^info\|^debug' "$out.err" | head -10 >&2

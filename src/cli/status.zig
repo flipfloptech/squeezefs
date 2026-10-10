@@ -20,6 +20,7 @@ const Io = std.Io;
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const uri = @import("uri.zig");
+const foreign_signature = @import("../meta/foreign_signature.zig");
 const superblock = @import("../meta/superblock.zig");
 const ledger = @import("../meta/ledger.zig");
 const node = @import("../meta/node.zig");
@@ -48,6 +49,10 @@ pub const Prior = union(enum) {
     legacy: u32,
     /// The superblock refusal's text (in the caller's buffer).
     refused: []const u8,
+    /// Our magic reads zero but the first window carries another
+    /// filesystem's (or block layer's) signature (`meta/foreign_signature.zig`):
+    /// Blank to the mount, never to a bare `format`.
+    foreign: foreign_signature.Hit,
 };
 
 pub const Snapshot = struct {
@@ -72,15 +77,45 @@ pub fn classify(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, poo
     defer if (backup) |b| gpa.free(b);
     var diag: superblock.Refusal = undefined;
     const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &diag) catch {
+        // A refusal on our magic's bytes may be another filesystem's own
+        // magic at offset 0 (xfs, bfs, cramfs, …): name it rather than
+        // print the bytes.
+        if (try probeForeign(gpa, &dev, volume_len)) |hit| return .{ .prior = .{ .foreign = hit }, .sb = null, .slot = .primary, .volume_len = volume_len };
         var w: Io.Writer = .fixed(reason_buf);
         diag.write(&w) catch {};
         return .{ .prior = .{ .refused = w.buffered() }, .sb = null, .slot = .primary, .volume_len = volume_len };
     };
     return switch (classified.format) {
-        .blank => .{ .prior = .blank, .sb = null, .slot = classified.slot, .volume_len = volume_len },
+        .blank => blk: {
+            // Blank to OUR magic: the foreign probe decides whether a bare
+            // format may proceed (ext2/btrfs/jfs/… superblocks live past
+            // byte 8 and read as zero there).
+            if (try probeForeign(gpa, &dev, volume_len)) |hit| break :blk .{ .prior = .{ .foreign = hit }, .sb = null, .slot = classified.slot, .volume_len = volume_len };
+            break :blk .{ .prior = .blank, .sb = null, .slot = classified.slot, .volume_len = volume_len };
+        },
         .legacy => |v| .{ .prior = .{ .legacy = v }, .sb = null, .slot = classified.slot, .volume_len = volume_len },
         .v4 => |sb| .{ .prior = .formatted, .sb = sb, .slot = classified.slot, .volume_len = volume_len },
     };
+}
+
+/// The first window of the device (`foreign_signature.window_len`, rounded
+/// to the O_DIRECT grain, no longer than the device) through the loader.
+fn probeForeign(gpa: std.mem.Allocator, dev: *device_loader.DeviceLoader, volume_len: u64) error{ Io, OutOfMemory }!?foreign_signature.Hit {
+    const want: u64 = @min(foreign_signature.window_len, volume_len);
+    const len: usize = @intCast(want - want % superblock.sector_len);
+    if (len == 0) return null;
+    const window = try dev.readRange(gpa, 0, len);
+    defer gpa.free(window);
+    return foreign_signature.probe(window);
+}
+
+/// The data-device face of the same probe (`cli/format.zig`): the device
+/// is opened by the data classifier; the window is read here.
+pub fn probeForeignOnPath(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, pool: *uring_fs.Pool, path: []const u8) ClassifyError!?foreign_signature.Hit {
+    const volume_len = try device_loader.volumeLength(path);
+    const mode = uring_fs.registerMetaDevice(gpa, env, path) catch return error.DeviceRefused;
+    var dev: device_loader.DeviceLoader = .{ .gpa = gpa, .pool = pool, .path = path, .mode = mode, .ledger_base = 0, .bitmap_base = 0 };
+    return probeForeign(gpa, &dev, volume_len);
 }
 
 /// Is a writer's layer-A guard held on `path` right now? Read off
@@ -287,6 +322,7 @@ pub fn writeReport(w: *Io.Writer, meta_uri: []const u8, snap: Snapshot, rec: ?le
         .blank => return w.print("{s}: not formatted (zeroed superblock) — run `squeezefs format` first\n", .{meta_uri}),
         .legacy => |v| return w.print("{s}: a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required\n", .{ meta_uri, v }),
         .refused => |reason| return w.print("{s}: superblock refused: {s}\n", .{ meta_uri, reason }),
+        .foreign => |hit| return w.print("{s}: not formatted as SqueezeFS, but carries {f} — `squeezefs format` refuses it without --force\n", .{ meta_uri, hit }),
         .formatted => {},
     }
     const sb = snap.sb.?;

@@ -82,6 +82,7 @@ pub const meta = struct {
     pub const alloc_core = @import("meta/alloc_core.zig");
     pub const alloc_ext = @import("meta/alloc_ext.zig");
     pub const superblock = @import("meta/superblock.zig");
+    pub const foreign_signature = @import("meta/foreign_signature.zig");
     pub const geometry = @import("meta/geometry.zig");
     pub const node_seq = @import("meta/node_seq.zig");
     pub const node = @import("meta/node.zig");
@@ -309,6 +310,7 @@ test {
     _ = meta.alloc_core;
     _ = meta.alloc_ext;
     _ = meta.superblock;
+    _ = meta.foreign_signature;
     _ = meta.geometry;
     _ = meta.node_seq;
     _ = meta.node;

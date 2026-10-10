@@ -48,6 +48,7 @@ const transform = @import("../data/transform.zig");
 const set_config = @import("../data/set_config.zig");
 const wire_auth = @import("../wire/auth.zig");
 const data_superblock = @import("../data/data_superblock.zig");
+const foreign_signature = @import("../meta/foreign_signature.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/format is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -72,6 +73,11 @@ pub fn forceGate(prior: Prior, force: bool, w: *Io.Writer) Io.Writer.Error!bool 
         .refused => |reason| {
             if (force) return true;
             try w.print("Metadata volume carries prior on-disk state ({s}); refusing to destroy it. Pass --force to reformat.", .{reason});
+            return false;
+        },
+        .foreign => |hit| {
+            if (force) return true;
+            try w.print("Metadata volume carries {f}; refusing to destroy it. Pass --force to reformat.", .{hit});
             return false;
         },
     }
@@ -237,7 +243,9 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
         if (data_superblock.linux_dev.open(p.gpa, dp)) |o| {
             opened = o;
             dprior = switch (o.classified.format) {
-                .blank => .blank,
+                // Blank to our magic: the foreign probe has the last word
+                // (the same law as the metadata volume's).
+                .blank => if (status.probeForeignOnPath(p.gpa, p.env, pool, dp) catch null) |hit| .{ .refused = std.fmt.bufPrint(&dreason, "{f}", .{hit}) catch "" } else .blank,
                 .v1 => |sb| .{ .formatted = sb },
             };
         } else |e| switch (e) {
@@ -424,6 +432,16 @@ test "the force gate: Blank formats; formatted/legacy/refused need --force and s
     try testing.expect(try forceGate(.formatted, true, &w));
     try testing.expect(try forceGate(.{ .legacy = 2 }, true, &w));
     try testing.expect(try forceGate(.{ .refused = "x" }, true, &w));
+}
+
+test "the force gate names a FOREIGN filesystem signature and refuses without --force (fstests generic/740: a bare mkfs over ext2/bfs/cramfs); --force destroys it knowingly" {
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    const hit: foreign_signature.Hit = .{ .name = "ext2/3/4", .offset = 1080 };
+    try testing.expect(!try forceGate(.{ .foreign = hit }, false, &w));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "ext2/3/4 signature at offset 1080") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "--force") != null);
+    try testing.expect(try forceGate(.{ .foreign = hit }, true, &w));
 }
 
 test "the data force gate: Blank formats; a squeezefs data volume names its tag and --force; a foreign signature names the reason and --force" {

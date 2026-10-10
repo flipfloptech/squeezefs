@@ -1,2 +1,5 @@
 # xfstests tests excluded in the sqz-zig container venue (check -E), one per line:
 #   <test>  <why it is the venue's, never a filesystem semantic>
+generic/564  needs `ulimit -f` (RLIMIT_FSIZE) raised: "cannot modify limit: Operation not permitted" in the container
+generic/597  sets the fs.protected_symlinks sysctl: /proc/sys is read-only in the container
+generic/598  sets the fs.protected_regular sysctl: /proc/sys is read-only in the container

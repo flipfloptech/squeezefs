@@ -162,7 +162,7 @@ suite_mount() {
     "$SQZ_BIN" mount --daemon --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$tag]}" "$mnt" && break
     if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' "$log"; then
       suite_log "mount $tag: kmbuf ENOMEM (fragmented venue); compacting memory and retrying ($attempt/3)"
-      sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; sleep 2
+      sync; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2
       continue
     fi
     tail -40 "$log" >&2; suite_die "mount failed ($tag)"

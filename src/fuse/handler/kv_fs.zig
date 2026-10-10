@@ -1221,7 +1221,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const zeros = self.gpa.alloc(u8, @intCast(end - size)) catch return;
             defer self.gpa.free(zeros);
             @memset(zeros, 0);
-            _ = self.data.write(self.io, ino, size, .{ .bytes = zeros }, .entire_op, .{ .kind = .striped, .size = size, .map_resident = true }) catch |e| {
+            _ = self.data.write(self.io, ino, size, .{ .bytes = zeros }, .entire_op, .{ .kind = .striped, .size = size, .map_resident = true }, null) catch |e| {
                 log.err("kv_fs: ino {d}: the truncate's tail zero-complete failed ({s}) — bytes past the new end may read back after a grow", .{ ino, @errorName(e) });
                 return;
             };
@@ -2297,6 +2297,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return .{ .size = @intCast(data.len) };
         }
 
+        /// `write_admit.ParkHook.parked`: the op's station while the data
+        /// plane parks it at the parked-buffer cap.
+        fn stampParkedPool(ctx: *anyopaque) void {
+            const c: *Ctx = @ptrCast(@alignCast(ctx));
+            c.stage(.write_parked_pool);
+        }
+
         /// The striped arm: a non-striped file promotes first (its resident
         /// payload DMA'd to its own block, the striped layout naming it
         /// published — block I/O before the type flip), then the data
@@ -2322,7 +2329,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             else
                 .{ .bytes = a.data };
             c.stage(.write_admitted);
-            const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = old_size, .map_resident = true }) catch |e| return switch (e) {
+            const outcome = self.data.write(self.io, local, a.offset, payload, a.class, .{ .kind = .striped, .size = old_size, .map_resident = true }, .{ .ctx = c, .parked = &stampParkedPool }) catch |e| return switch (e) {
                 error.NoSpaceLeft => error.NoSpaceLeft,
                 error.InputOutput => error.InputOutput,
                 error.VolumeFailed => error.VolumeFailed,
@@ -2330,7 +2337,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 error.OutOfMemory => error.OutOfMemory,
                 error.WorkerShutdown => error.WorkerShutdown,
                 error.QueueFull => error.QueueFull,
-                error.WouldBlock => error.WouldBlock,
                 error.ReadOnlyFileSystem => error.ReadOnlyFileSystem,
                 error.FileTooBig => error.FileTooBig,
             };
@@ -2777,7 +2783,7 @@ pub const NoData = struct {
     pub fn canStoreHeld(_: *const NoData) bool {
         return false;
     }
-    pub fn write(_: *NoData, _: Io, _: u64, _: u64, _: write_admit.Payload, _: op_guard.Class, _: seams.FileView) write_admit.Error!write_admit.Outcome {
+    pub fn write(_: *NoData, _: Io, _: u64, _: u64, _: write_admit.Payload, _: op_guard.Class, _: seams.FileView, _: ?write_admit.ParkHook) write_admit.Error!write_admit.Outcome {
         unreachable; // gated by hasVolumes
     }
     pub fn read(_: *NoData, _: Io, _: u64, _: u64, _: []u8, _: bool, _: bool) Error!usize {

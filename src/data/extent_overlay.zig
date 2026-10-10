@@ -91,6 +91,9 @@ pub const stats = struct {
     pub var parked_extent_bytes: counters.Gauge = .{};
     pub var extent_parks: counters.ShardedCounter = .{};
     pub var extent_escalations: counters.ShardedCounter = .{};
+    /// An escalation due at the parked-buffer cap, left to the block's next
+    /// write or its flush (the extent stays parked; `write_admit`'s gate).
+    pub var extent_escalations_deferred: counters.ShardedCounter = .{};
     /// Legacy whole-image routes; designed routes keep it 0.
     pub var extent_implicit_escalations: counters.ShardedCounter = .{};
     pub var extent_record_absorbs: counters.ShardedCounter = .{};
@@ -111,7 +114,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"parked_extent_bytes\":{d},", .{stats.parked_extent_bytes.load()});
-    inline for (.{ "extent_parks", "extent_escalations", "extent_implicit_escalations", "extent_record_absorbs", "extent_spills", "extent_spill_bytes", "extent_records_recovered", "extent_records_stale_discarded", "extent_records_torn_discarded", "extent_records_future_refused", "extent_records_foreign_scope", "fold_passes", "fold_seed_reads", "fold_extents_folded" }) |name| {
+    inline for (.{ "extent_parks", "extent_escalations", "extent_escalations_deferred", "extent_implicit_escalations", "extent_record_absorbs", "extent_spills", "extent_spill_bytes", "extent_records_recovered", "extent_records_stale_discarded", "extent_records_torn_discarded", "extent_records_future_refused", "extent_records_foreign_scope", "fold_passes", "fold_seed_reads", "fold_extents_folded" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.writeAll("\"fold_fill\":");

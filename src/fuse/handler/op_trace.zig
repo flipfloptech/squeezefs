@@ -74,6 +74,9 @@ pub const Stage = enum(u8) {
     write_freed = 55,
     write_inval_done = 56,
     write_done = 57,
+    /// The accumulation gate's park at the parked-buffer cap (our own id:
+    /// the reference refused there; charter §6.2 parks, never refuses).
+    write_parked_pool = 58,
     // publish conveyor
     publish_enqueue = 64,
     publish_drained = 65,
@@ -533,6 +536,7 @@ test "stage table is total and unique: every id decodes to its name and back; th
     try testing.expectEqual(@as(u8, 32), @backingInt(Stage.dev_submit));
     try testing.expectEqual(@as(u8, 39), @backingInt(Stage.bridge_sent));
     try testing.expectEqual(@as(u8, 57), @backingInt(Stage.write_done));
+    try testing.expectEqual(@as(u8, 58), @backingInt(Stage.write_parked_pool));
     try testing.expectEqual(@as(u8, 76), @backingInt(Stage.publish_done));
     try testing.expectEqual(@as(u8, 98), @backingInt(Stage.meta_op_return));
     try testing.expectEqual(@as(u8, 131), @backingInt(Stage.dlm_guard_released));

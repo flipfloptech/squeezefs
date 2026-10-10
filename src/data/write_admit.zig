@@ -52,6 +52,7 @@ const derive = @import("../core/derive.zig");
 const dlm = @import("../meta/dlm.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const taskset = @import("../sync/taskset.zig");
+const sync_tick = @import("../sync/tick.zig");
 const lock_order = @import("../sync/lock_order.zig");
 const budget = @import("../mem/budget.zig");
 const layout = @import("layout.zig");
@@ -153,8 +154,15 @@ pub const stats = struct {
     pub var staging_sibling_probes: counters.ShardedCounter = .{};
     pub var restage_churn_removes: counters.ShardedCounter = .{};
     pub var restage_churn_bytes: counters.ShardedCounter = .{};
+    /// `parked_gate_waits`: visits to the parked-buffer gate at the pool
+    /// cap (each a wait for a settle or a cold flush, never a refusal).
     pub var parked_gate_waits: counters.ShardedCounter = .{};
+    /// `parked_gate_self_flushes`: the fold at the last moment (this
+    /// writer's own block escalated, seeded and uploaded).
     pub var parked_gate_self_flushes: counters.ShardedCounter = .{};
+    /// `parked_gate_cold_flushes`: a writer at the cap flushed the coldest
+    /// parked block (untouched ≥ `PARKED_COLD_NS`) to make its cell.
+    pub var parked_gate_cold_flushes: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
 
     pub fn ledgerSum() u64 {
@@ -170,7 +178,7 @@ pub fn noteInlineWrite(len: u64) void {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes" }) |name| {
+    inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
@@ -331,7 +339,28 @@ pub const Request = struct {
     /// The layout class from the caches (a miss ⇒ `null`: the prelude
     /// treats it as "no map resident").
     file: ?seams.FileView,
+    /// The op's watchdog station for the parked-pool gate (null: no op
+    /// behind this write — a truncate's zero fill, the tests).
+    park_hook: ?ParkHook = null,
 };
+
+/// The gate's station seam: `parked` runs once per gate visit, before the
+/// wait, on the writer's own fiber (the FUSE handler stamps
+/// `write_parked_pool` so the op watchdog names the park).
+pub const ParkHook = struct {
+    ctx: *anyopaque,
+    parked: *const fn (ctx: *anyopaque) void,
+};
+
+/// A parked block untouched for a whole liveness tick is COLD: the pieces
+/// that would complete it are not in flight (a hot block under a QD32
+/// stream sees its siblings within milliseconds). At the pool cap a cold
+/// block is flushed by the writer that needs its cell — one bounded upload
+/// — while a hot set is waited on (an upload in flight returns a cell at
+/// the device's pace). The tick is `sync/tick.zig`'s 2 s: the one liveness
+/// period every unbounded wait rides, so a write parked here is never
+/// quiet longer than any other park.
+pub const PARKED_COLD_NS: u64 = sync_tick.tick_ns;
 
 pub const Arm = enum(u8) { patch, overlay, extent, accumulate_park, write_through };
 
@@ -347,7 +376,7 @@ pub const Outcome = struct {
     }
 };
 
-pub const Error = error{ NoSpaceLeft, InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, QueueFull, WouldBlock, ReadOnlyFileSystem, FileTooBig };
+pub const Error = error{ NoSpaceLeft, InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, QueueFull, ReadOnlyFileSystem, FileTooBig };
 
 /// The data volumes' allocators as a picker: STRIPE-UNIT placement
 /// (`router.stripeUnitChoice`) over the active volumes with supply — a
@@ -752,9 +781,13 @@ pub const WritePath = struct {
 
     /// Under (3), THIS order (every exit drops the guard). The ladder
     /// RESTARTS from A when the one-authority screen (C) meets a record it
-    /// cannot settle in one attempt: the guard is dropped, the record
-    /// settled on the write arm's own ladder, the guard re-taken — never a
-    /// backoff park under (3).
+    /// cannot settle in one attempt (the guard is dropped, the record
+    /// settled on the write arm's own ladder, the guard re-taken) and when
+    /// an accumulation arm meets the parked-buffer cap (the guard is
+    /// dropped, the gate waits for a cell or makes one, the guard re-taken)
+    /// — never a backoff park under (3), never a refusal: a blocking
+    /// `write(2)` on a regular file may not answer EAGAIN (POSIX reserves
+    /// it for O_NONBLOCK; rung 9 F2 saw fio abort on 100–128 per leg).
     fn admitPiece(self: *WritePath, io: Io, req: Request, file: seams.FileView, pc: Piece, bytes: *?[]const u8, try_patch: bool, overlay_shape: bool, stream_adjacent: bool) Error!Arm {
         const bs = self.cfg.block_size;
         var hint: enum { none, overlay_drain, upload, fold } = .none;
@@ -810,11 +843,17 @@ pub const WritePath = struct {
             const small = extent.isSmall(pc.len, bs);
             const existing = self.table.get(req.ino, pc.block);
             if (small and !stream_adjacent and (existing == null or existing.?.repr == .extent)) {
-                const e = existing orelse self.table.checkoutExtent(req.ino, pc.block, has_existing, live_binding) orelse return error.WouldBlock;
+                const e = existing orelse self.table.checkoutExtent(req.ino, pc.block, has_existing, live_binding) orelse {
+                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    continue;
+                };
                 e.repr.extent.merge(self.gpa, pc.rel, data) catch return error.OutOfMemory;
                 const v = e.coverage.record(pc.rel, pc.rel + pc.len, @intCast(bs)) catch {
                     // The run table is full on an extent entry: escalate (the slabs lay into a buffer).
-                    if (self.table.escalate(e) == null) return error.WouldBlock;
+                    if (self.table.escalate(e) == null) {
+                        self.parkAtPoolCap(io, g, &held, req, pc.block);
+                        continue;
+                    }
                     extent.stats.extent_escalations.inc();
                     stats.admit_write_accumulate_bytes.add(pc.len);
                     break :blk .accumulate_park;
@@ -823,14 +862,18 @@ pub const WritePath = struct {
                 e.write_epoch = accumulate.nextWriteEpoch();
                 e.app_end = @max(e.app_end, pc.rel + pc.len);
                 extent.stats.extent_parks.inc();
+                // The piece is RECORDED either way; an escalation the pool
+                // cannot back now is DEFERRED (the extent stays parked; the
+                // block's next write or its flush escalates once a cell
+                // exists) — never a refusal, never a park under (3).
                 if (v.completed or extent.escalationDue(e.repr.extent.bytes, bs)) {
-                    if (self.table.escalate(e) == null) return error.WouldBlock;
-                    extent.stats.extent_escalations.inc();
+                    if (self.table.escalate(e) != null) extent.stats.extent_escalations.inc() else extent.stats.extent_escalations_deferred.inc();
                 } else if (e.repr.extent.count() >= self.cfg.fold_max_extents or e.repr.extent.bytes >= self.cfg.fold_max_bytes) {
                     // The fold at the last moment: escalate, seed once, upload.
-                    if (self.table.escalate(e) == null) return error.WouldBlock;
-                    extent.stats.extent_escalations.inc();
-                    hint = .fold;
+                    if (self.table.escalate(e) != null) {
+                        extent.stats.extent_escalations.inc();
+                        hint = .fold;
+                    } else extent.stats.extent_escalations_deferred.inc();
                 }
                 stats.admit_write_accumulate_bytes.add(pc.len);
                 break :blk .extent;
@@ -852,8 +895,8 @@ pub const WritePath = struct {
                     if (p.seam.take(p.seam.ctx, req.ino, pc.block, pc.rel, data.ptr, &runs)) |ad| {
                         const adopted = self.table.checkoutAdopting(req.ino, pc.block, has_existing, live_binding, ad.cell, runs[0..ad.n_runs]) orelse {
                             self.table.pool.release(ad.cell);
-                            stats.parked_gate_waits.inc();
-                            return error.WouldBlock;
+                            self.parkAtPoolCap(io, g, &held, req, pc.block);
+                            continue;
                         };
                         stats.admit_write_accumulate_bytes.add(pc.len);
                         if (adopted.coverage.isFull(@intCast(bs))) {
@@ -864,32 +907,29 @@ pub const WritePath = struct {
                     }
                 }
                 break :blk_g self.table.checkout(req.ino, pc.block, has_existing, live_binding) orelse {
-                    // The pool is at its cap: backpressure (EAGAIN-class), never a lost byte.
-                    stats.parked_gate_waits.inc();
-                    return error.WouldBlock;
+                    // The pool is at its cap: the gate parks, never a lost byte.
+                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    continue;
                 };
             };
             if (e.repr == .extent) {
-                if (self.table.escalate(e) == null) return error.WouldBlock;
+                if (self.table.escalate(e) == null) {
+                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    continue;
+                }
                 extent.stats.extent_escalations.inc();
             }
             // I. The staged sibling supersede is the writeback module's
             //    ring key; the RAM entry outranks a spilled copy.
             // J. The merge — THE one userspace copy.
-            const verdict = self.table.recordWrite(e, pc.rel, data) catch |err| switch (err) {
-                error.NeedsSeed => blk3: {
-                    const old = self.epochs.baseBinding(self.map, req.ino, pc.block) orelse {
-                        e.seed = .fresh;
-                        self.table.zeroComplete(e);
-                        break :blk3 self.table.recordWrite(e, pc.rel, data) catch return error.WouldBlock;
-                    };
-                    const img = self.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return error.OutOfMemory;
-                    defer self.gpa.free(img);
-                    self.device.read(old.vol_tag, old.offset, img) catch return error.InputOutput;
-                    self.table.fillComplementFrom(e, img) catch return error.WouldBlock;
-                    break :blk3 self.table.recordWrite(e, pc.rel, data) catch return error.WouldBlock;
+            // A merge that needs a fresh cell (a shared one copied away, the
+            // seed's complement) meets the same cap: the gate, then the ladder.
+            const verdict = self.recordPiece(e, pc, data, req) catch |err| switch (err) {
+                error.PoolExhausted => {
+                    self.parkAtPoolCap(io, g, &held, req, pc.block);
+                    continue;
                 },
-                error.PoolExhausted => return error.WouldBlock,
+                error.InputOutput, error.OutOfMemory => |x| return x,
             };
             e = self.table.get(req.ino, pc.block).?;
             stats.admit_write_accumulate_bytes.add(pc.len);
@@ -919,6 +959,86 @@ pub const WritePath = struct {
             },
         }
         return arm;
+    }
+
+    /// Arm J with its seed (D's base): the deferred complement comes from
+    /// the write-side authority's key, a fresh buffer zero-completes.
+    fn recordPiece(self: *WritePath, e: *accumulate.Entry, pc: Piece, data: []const u8, req: Request) error{ PoolExhausted, InputOutput, OutOfMemory }!accumulate.RecordVerdict {
+        return self.table.recordWrite(e, pc.rel, data) catch |err| switch (err) {
+            error.NeedsSeed => {
+                const old = self.epochs.baseBinding(self.map, req.ino, pc.block) orelse {
+                    e.seed = .fresh;
+                    self.table.zeroComplete(e);
+                    return self.table.recordWrite(e, pc.rel, data) catch |e2| switch (e2) {
+                        error.PoolExhausted => error.PoolExhausted,
+                        error.NeedsSeed => unreachable, // zero-completed above
+                    };
+                };
+                const img = self.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(self.cfg.block_size)) catch return error.OutOfMemory;
+                defer self.gpa.free(img);
+                self.device.read(old.vol_tag, old.offset, img) catch return error.InputOutput;
+                self.table.fillComplementFrom(e, img) catch |e2| switch (e2) {
+                    error.PoolExhausted => return error.PoolExhausted,
+                    error.NeedsSeed => unreachable, // the fill IS the seed
+                };
+                return self.table.recordWrite(e, pc.rel, data) catch |e2| switch (e2) {
+                    error.PoolExhausted => error.PoolExhausted,
+                    error.NeedsSeed => unreachable, // seeded above
+                };
+            },
+            error.PoolExhausted => error.PoolExhausted,
+        };
+    }
+
+    /// An accumulation arm met the parked-buffer cap under (3): drop the
+    /// guard, run the gate, and let the caller restart the ladder.
+    fn parkAtPoolCap(self: *WritePath, io: Io, g: seams.BlockLocks.Guard, held: *bool, req: Request, block: u32) void {
+        held.* = false;
+        g.release(io);
+        self.awaitParkedCapacity(io, req, block);
+    }
+
+    /// THE PARKED-BUFFER GATE (the charter's backpressure law: park, never
+    /// refuse, never a lost byte), holding no lock. Register on the table's
+    /// settle notify, re-check for room (the notify law: a settle landing
+    /// between the check and the wait is never lost), then:
+    ///   - room: go;
+    ///   - the coldest parked block (not this one, not mid-upload) has sat
+    ///     untouched ≥ `PARKED_COLD_NS`: flush it — the writer pays for one
+    ///     bounded upload instead of waiting on pieces that are not coming
+    ///     (`parked_gate_cold_flushes`); a flush that leaves it parked (a
+    ///     failed DMA, a full set) falls through to the wait so a dead
+    ///     victim is never spun on;
+    ///   - else wait for the next settle, bounded by the moment the coldest
+    ///     block turns cold (so a wait never outlives the flush it defers
+    ///     to) or one tick when nothing is parked at all.
+    /// Each visit counts `parked_gate_waits`; the op watchdog sees the
+    /// station through `park_hook`.
+    fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32) void {
+        stats.parked_gate_waits.inc();
+        if (req.park_hook) |h| h.parked(h.ctx);
+        var settle = self.table.upload_settled.notified();
+        _ = settle.enable(io);
+        if (self.table.hasRoom()) {
+            settle.cancel(io);
+            return;
+        }
+        const now = clock.monotonicNs();
+        var until = PARKED_COLD_NS;
+        if (self.table.coldestParked(req.ino, block, now)) |v| {
+            if (v.age_ns >= PARKED_COLD_NS) {
+                stats.parked_gate_cold_flushes.inc();
+                switch (accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, v.ino, v.block)) {
+                    .published, .discarded, .joined => {
+                        settle.cancel(io);
+                        return;
+                    },
+                    // A dead victim: a whole tick before the next try.
+                    .stay_parked, .fence_drop, .superseded => {},
+                }
+            } else until = PARKED_COLD_NS - v.age_ns;
+        }
+        _ = settle.waitUntilUncancelable(io, now + until);
     }
 
     fn spawnUpload(self: *WritePath, io: Io, ino: u64, block: u32, permit: ?pipeline.Permit, prof: pipeline.Prof) void {
@@ -1485,12 +1605,22 @@ test "the parked-buffer gate, cold set: the write past the cap completes — the
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);
     const waits0 = stats.parked_gate_waits.load();
+    const cold0 = stats.parked_gate_cold_flushes.load();
     // Eight parked partials fill the cap (ino 1, blocks 0..7); block 0 is
     // the coldest.
     for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    try testing.expect(!w.wp.table.hasRoom());
+    const t0 = clock.monotonicNs();
     try parkHalf(w, io, 1, 8, 9);
+    const waited = clock.monotonicNs() - t0;
     try testing.expect(stats.parked_gate_waits.load() > waits0);
+    try testing.expectEqual(cold0 + 1, stats.parked_gate_cold_flushes.load());
+    // The gate waited for the coldest to turn cold (no upload was in
+    // flight to settle sooner), then flushed it: measured 2007–2011 ms on
+    // the venue. The lower bound is the contract (a hot block is never
+    // flushed); the upper one tolerates a loaded venue's second gate round.
+    try testing.expect(waited + std.time.ns_per_s / 2 >= PARKED_COLD_NS and waited < 5 * PARKED_COLD_NS);
     // Block 0 is on the device: its half, then zeros; blocks 1..8 parked.
     const b0 = w.f.map.seam().lookup(1, 0) orelse return error.VictimNotPublished;
     var got: [wt.BS]u8 = undefined;
@@ -1535,6 +1665,7 @@ test "the parked-buffer gate, hot set: a writer at the cap waits for the in-flig
     var held: HeldDma = .{};
     w.f.dev.hook = held.hook();
     const waits0 = stats.parked_gate_waits.load();
+    const cold0 = stats.parked_gate_cold_flushes.load();
     // One block completes and its detached upload blocks in the DMA (ino 2).
     try w.f.map.create(2, .striped, 0);
     var half: [wt.BS / 2]u8 align(4096) = undefined;
@@ -1545,6 +1676,7 @@ test "the parked-buffer gate, hot set: a writer at the cap waits for the in-flig
     while (held.hits.load(.acquire) == 0) std.Thread.yield() catch {};
     // Seven parked partials take the other cells (ino 1, blocks 0..6).
     for (0..7) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    try testing.expect(!w.wp.table.hasRoom());
     // The eighth partial parks at the gate behind the upload.
     const Writer = struct {
         w: *World,
@@ -1554,14 +1686,18 @@ test "the parked-buffer gate, hot set: a writer at the cap waits for the in-flig
         }
     };
     var writer: Writer = .{ .w = w };
+    const t0 = clock.monotonicNs();
     const th = try std.Thread.spawn(.{}, Writer.run, .{&writer});
-    while (w.wp.table.upload_settled.waiters(io) == 0 and writer.result == error.NotRun) std.Thread.yield() catch {};
+    while (w.wp.table.upload_settled.waiters(io) == 0) std.Thread.yield() catch {};
     // The DMA lands: the upload publishes, retires its entry (a cell
     // returns) and settles — the writer wakes and takes it.
     held.release();
     th.join();
+    const waited = clock.monotonicNs() - t0;
     try writer.result;
+    try testing.expect(waited < PARKED_COLD_NS);
     try testing.expect(stats.parked_gate_waits.load() > waits0);
+    try testing.expectEqual(cold0, stats.parked_gate_cold_flushes.load());
     w.wp.quiesce(io);
     try testing.expect(w.f.map.seam().lookup(2, 0) != null);
     try testing.expect(w.wp.table.has(1, 7));

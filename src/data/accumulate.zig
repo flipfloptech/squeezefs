@@ -241,6 +241,14 @@ pub const Pool = struct {
         return self.live.load(.monotonic);
     }
 
+    /// A cell is available now (a free one, or room below the cap): the
+    /// gate's re-check — a hint, not a reservation (the acquire decides).
+    pub fn hasRoom(self: *Pool) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.free.items.len != 0 or self.live.load(.monotonic) < self.cap;
+    }
+
     /// `owned_mut`: unique ⇒ the same cell (acquire pairs with `release`'s
     /// acq_rel); shared ⇒ copy the covered runs into a fresh never-shared
     /// cell, drop our reference to the old one (`active_block_cow_copies`).
@@ -661,6 +669,39 @@ pub const Table = struct {
             }
         }
         return out[0..n];
+    }
+
+    /// The gate's re-check: an entry slot AND a cell are available now (a
+    /// hint; the checkout decides).
+    pub fn hasRoom(self: *Table) bool {
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.free.items.len == 0) return false;
+        }
+        return self.pool.hasRoom();
+    }
+
+    /// A gate victim's identity and how long it has sat untouched.
+    pub const Coldest = struct { ino: u64, block: u32, age_ns: u64 };
+
+    /// The least recently touched parked entry other than `(ino, block)`
+    /// and not mid-upload — a FULL one when the pool is out of cells (an
+    /// extent flush needs a cell to escalate into), any repr when only an
+    /// entry slot is wanted. Null: nothing flushable is parked.
+    pub fn coldestParked(self: *Table, ino: u64, block: u32, now_ns: u64) ?Coldest {
+        const need_cell = !self.pool.hasRoom();
+        self.lock.lock();
+        defer self.lock.unlock();
+        var best: ?*const Entry = null;
+        for (self.entries) |*e| {
+            if (!e.in_use or e.upload_inflight) continue;
+            if (e.key.ino == ino and e.key.block == block) continue;
+            if (need_cell and e.repr != .full) continue;
+            if (best == null or e.last_touch_ns < best.?.last_touch_ns) best = e;
+        }
+        const b = best orelse return null;
+        return .{ .ino = b.key.ino, .block = b.key.block, .age_ns = now_ns -| b.last_touch_ns };
     }
 
     /// Every parked key (the pressure pass).

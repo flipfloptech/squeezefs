@@ -950,8 +950,8 @@ pub const DataPlane = struct {
 
     /// THE striped write: the handler's level-1 admission passed through
     /// as `class`; `file` is the layout view the caller read.
-    pub fn write(self: *DataPlane, io: Io, ino: u64, offset: u64, payload: write_admit.Payload, class: op_guard.Class, file: seams.FileView) write_admit.Error!write_admit.Outcome {
-        return self.wp.write(io, .{ .ino = ino, .offset = offset, .payload = payload, .class = class, .file = file });
+    pub fn write(self: *DataPlane, io: Io, ino: u64, offset: u64, payload: write_admit.Payload, class: op_guard.Class, file: seams.FileView, park_hook: ?write_admit.ParkHook) write_admit.Error!write_admit.Outcome {
+        return self.wp.write(io, .{ .ino = ino, .offset = offset, .payload = payload, .class = class, .file = file, .park_hook = park_hook });
     }
 
     /// THE read of any layout kind into `dest` (the reply window;

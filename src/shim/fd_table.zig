@@ -563,13 +563,26 @@ pub const DevCache = struct {
     }
 
     pub fn contains(self: *const DevCache, dev: u64, now_ns: u64) bool {
+        return self.verdict(dev, now_ns) != null;
+    }
+
+    /// WHY the device is cached: a permanent never-ours verdict, or a
+    /// refused establish in its backoff window (the mount IS ours; its
+    /// opens are kernel-served by the refusal — the shim's ledger
+    /// attributes them `establish_refused`, never `not_ours`).
+    pub const Verdict = enum { permanent, backoff };
+
+    pub fn verdict(self: *const DevCache, dev: u64, now_ns: u64) ?Verdict {
         const key = dev + 1;
         var w: usize = 0;
         while (w < WAYS) : (w += 1) {
             const i = probe(dev, w);
-            if (self.keys[i].load(.acquire) == key) return now_ns < self.until[i].load(.acquire);
+            if (self.keys[i].load(.acquire) != key) continue;
+            const until = self.until[i].load(.acquire);
+            if (now_ns >= until) return null;
+            return if (until == PERMANENT) .permanent else .backoff;
         }
-        return false;
+        return null;
     }
 
     /// The way holding `dev` (or the one it will take): the device's own

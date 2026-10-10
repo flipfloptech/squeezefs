@@ -96,12 +96,22 @@ pub const Reason = enum(u8) {
     /// Bindings dropped in a fork child (its ops on them are kernel-served
     /// until it establishes its own sessions).
     fork_child = 20,
+    /// A libaio iocb on a BOUND fd submitted on a context the shim never
+    /// registered (past the context registry's capacity, or created by a
+    /// path no `io_*` interposition saw): the real libaio serves it. Per
+    /// iocb, on the binding's session page — the daemon folds it into
+    /// `ipc_client_aio_unknown_ctx_ops`, the engagement law's missing term.
+    aio_unknown_ctx_op = layout.PRELOAD_REASON_AIO_UNKNOWN_CTX_OP,
+    /// An `io_getevents`/`io_cancel` call on an unregistered context (per
+    /// call; no fd, so process-global only).
+    aio_unknown_ctx_call = layout.PRELOAD_REASON_AIO_UNKNOWN_CTX_OP + 1,
 
     pub const count = layout.PRELOAD_REASONS;
 };
 
 comptime {
-    std.debug.assert(@backingInt(Reason.fork_child) < Reason.count);
+    std.debug.assert(@backingInt(Reason.aio_unknown_ctx_call) < Reason.count);
+    std.debug.assert(@backingInt(Reason.aio_unknown_ctx_op) == 21);
 }
 
 /// Process-global attribution (the truth for a session-less passthrough);
@@ -526,11 +536,16 @@ pub fn classifyAndBind(st: *State, p: Probes, fd: sys.fd_t, epoch: u64) Verdict 
     if (fd < 0) return .passthrough;
     // 1. A stale entry on the number (a raw close + reuse).
     if (st.table.onClose(fd)) |d| st.release(d);
-    // 2. fstat; the negative cache.
+    // 2. fstat; the negative cache. A refused mount in its backoff window
+    //    is OURS: the open it kernel-serves is the refusal's fallback (the
+    //    client side of F4's count), not a foreign device.
     const stat = p.fstat(fd) orelse return .passthrough;
     const now = clock.monotonicNs();
-    if (st.dev_cache.contains(stat.dev, now)) {
-        note(.not_ours, null);
+    if (st.dev_cache.verdict(stat.dev, now)) |why| {
+        note(switch (why) {
+            .permanent => .not_ours,
+            .backoff => .establish_refused,
+        }, null);
         return .passthrough;
     }
     // 3. POSIX-7.
@@ -702,7 +717,7 @@ test "the ladder with injected answers: not FUSE ⇒ negative-cached (the second
     try testing.expectEqual(@as(u64, 1), delta(before, .mapped_inode));
 }
 
-test "a dead rendezvous (socket error) is a TRANSIENT refusal: one line, a backoff cache entry that expires, and the once set dedups the line per (mount, code)" {
+test "a dead rendezvous (socket error) is a TRANSIENT refusal: one line, a backoff cache entry that expires, and the once set dedups the line per (mount, code); every open the backoff kernel-serves is the refusal's fallback (establish_refused), never not_ours" {
     const st = try testing.allocator.create(State);
     defer testing.allocator.destroy(st);
     try initState(st, testing.allocator, testMap);
@@ -719,7 +734,18 @@ test "a dead rendezvous (socket error) is a TRANSIENT refusal: one line, a backo
     try testing.expectEqual(refused_before + 1, sessions_refused.load(.monotonic));
     const now = clock.monotonicNs();
     try testing.expect(st.dev_cache.contains(200, now));
+    try testing.expectEqual(fd_table.DevCache.Verdict.backoff, st.dev_cache.verdict(200, now).?);
     try testing.expect(!st.dev_cache.contains(200, now + REFUSAL_BACKOFF_FLOOR_NS + 1));
+    // The client side of the fallback count: the next opens inside the
+    // backoff window pay no control plane and are attributed to the
+    // refusal (one more establish_refused each, not_ours untouched).
+    const blob_calls = Fake.blob_calls;
+    try testing.expectEqual(Verdict.passthrough, classifyAndBind(st, Fake.probes, 8, 0));
+    try testing.expectEqual(Verdict.passthrough, classifyAndBind(st, Fake.probes, 9, 0));
+    try testing.expectEqual(@as(u64, 3), delta(before, .establish_refused));
+    try testing.expectEqual(@as(u64, 0), delta(before, .not_ours));
+    try testing.expectEqual(blob_calls, Fake.blob_calls);
+    try testing.expectEqual(refused_before + 1, sessions_refused.load(.monotonic));
     try testing.expect(!refusalPermanent(CODE_SOCKET | 111));
     try testing.expect(refusalPermanent(CODE_VERSION_SKEW));
     try testing.expect(refusalPermanent(CODE_REFUSED | @backingInt(wire.RefuseClass.disabled)));
@@ -735,6 +761,12 @@ test "a dead rendezvous (socket error) is a TRANSIENT refusal: one line, a backo
     Fake.blob = skew.bytes();
     try testing.expectEqual(Verdict.passthrough, classifyAndBind(st, Fake.probes, 7, 0));
     try testing.expect(st.dev_cache.contains(202, std.math.maxInt(u64) - 1));
+    try testing.expectEqual(fd_table.DevCache.Verdict.permanent, st.dev_cache.verdict(202, std.math.maxInt(u64) - 1).?);
+    // A permanent verdict's later opens are not ours.
+    const b2 = snapshot();
+    try testing.expectEqual(Verdict.passthrough, classifyAndBind(st, Fake.probes, 8, 0));
+    try testing.expectEqual(@as(u64, 1), delta(b2, .not_ours));
+    try testing.expectEqual(@as(u64, 0), delta(b2, .establish_refused));
 }
 
 test "classify_fd mirrors the daemon's screen rows: O_PATH, non-regular, O_APPEND/O_SYNC/O_DSYNC/O_TMPFILE, nlink 0 refuse; rights strictly from O_ACCMODE" {

@@ -184,7 +184,7 @@ pub const IpcHost = struct {
         errdefer gpa.destroy(self);
         const cpus = d.facts.cpus;
         const arena_cap = mem_sizing.ipcArenaCapFromEnv(d.env, d.budget_bytes);
-        const arena_bytes = mem_sizing.ipcArenaBytesFromEnv(d.env, arena_cap, cpus);
+        const arena_bytes = sizing.ipcArenaBytesFromEnv(d.env, arena_cap, cpus);
         const max_op = sizing.maxOpBytesFromEnv(d.env, d.block_size);
         var geometry = layout.Geometry.default;
         geometry.arena_bytes = arena_bytes;
@@ -320,7 +320,12 @@ pub const IpcHost = struct {
         if (self.path) |p| self.accept_threads[1] = std.Thread.spawn(.{}, acceptLoop, .{ self, p.fd, true }) catch return error.SpawnFailed;
         // The face: GETXATTR of `il0` answers from now on.
         d.il0_bind(d.il0_ctx, .{ .ctx = self, .synthesize = &synthesizeFn });
-        log.info("ipc: interception armed — socket {s}{s}{s}; {d} service lane(s), {d} dd shard(s), arena {d} MiB × cap {d} MiB, ctl cap {d}", .{ name, if (self.path != null) " + " else "", if (self.path) |p| p.path() else "", ceiling, dd_shards, arena_bytes >> 20, arena_cap >> 20, ctl_cap });
+        const population = sizing.ipcAdmittedPopulation(arena_cap, footprint);
+        const population_floor = sizing.ipcSessionPopulationFloor(cpus);
+        log.info("ipc: interception armed — socket {s}{s}{s}; {d} service lane(s), {d} dd shard(s), arena {d} MiB × cap {d} MiB = {d} session(s) (population floor {d}), ctl cap {d}", .{ name, if (self.path != null) " + " else "", if (self.path) |p| p.path() else "", ceiling, dd_shards, arena_bytes >> 20, arena_cap >> 20, population, population_floor, ctl_cap });
+        // The arena already yielded to the floor down to its 4 MiB grain:
+        // only the budget can admit more sessions.
+        if (population < population_floor) log.warn("ipc: the admission cap {d} MiB holds {d} session(s) of {d} MiB — under the population floor {d} (2 × {d} cpus): client processes past it are kernel-served; raise SQUEEZEFS_MEM_BUDGET_MB or SQUEEZEFS_IPC_MEM_PCT", .{ arena_cap >> 20, population, arena_bytes >> 20, population_floor, cpus });
         return self;
     }
 
@@ -863,6 +868,7 @@ pub const IpcHost = struct {
             const page = s.m.statsPage();
             hs.ipc_lane_gate_kernel_routes.add(page.lane_gate_kernel_routes.load(.monotonic));
             hs.ipc_lane_gate_kernel_bytes.add(page.lane_gate_kernel_bytes.load(.monotonic));
+            hs.ipc_client_aio_unknown_ctx_ops.add(page.preload_passthrough_ops[layout.PRELOAD_REASON_AIO_UNKNOWN_CTX_OP].load(.monotonic));
         }
         self.owners[s.owner].kick();
         _ = linux.shutdown(s.ctl, linux.SHUT.RDWR);

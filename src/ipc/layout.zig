@@ -212,6 +212,14 @@ pub const SessionLayout = struct {
         };
     }
 
+    /// The memfd's bytes BEFORE the arena (header + ring + slots + stats
+    /// page): a session's footprint is `arena + this`; the arena
+    /// derivation's population floor counts it (`mem/sizing.
+    /// resolveIpcArenaBytes`). Independent of the arena size.
+    pub fn overheadBytes(self: SessionLayout) u64 {
+        return self.arena_off;
+    }
+
     fn pageRound(v: u64) u64 {
         return derive.alignUp(v, PAGE_BYTES);
     }
@@ -222,6 +230,11 @@ pub const SessionLayout = struct {
         return std.math.mul(u64, a, b) catch error.Overflow;
     }
 };
+
+/// The default geometry's overhead (0x25000 = 148 KiB: the 1024-entry ring
+/// and 1024 slots between the header and the stats page), what the arena
+/// derivation charges per session beside the arena.
+pub const DEFAULT_SESSION_OVERHEAD_BYTES: u64 = (SessionLayout.compute(Geometry.default) catch unreachable).overheadBytes();
 
 // ---------------------------------------------------------------------------
 // The header page: three cache lines + the geometry copy.
@@ -403,6 +416,11 @@ comptime {
 /// engagement ledger (decision 0002 ledger S5), display-only like the page.
 pub const PRELOAD_REASONS: usize = 24;
 pub const PRELOAD_REFUSE_CLASSES: usize = 10;
+/// The one attribution row the daemon folds by index at session teardown
+/// (`ipc_client_aio_unknown_ctx_ops`): libaio iocbs on bound fds that a
+/// context the shim never registered carried to the real libaio. The
+/// shim's `Reason` enum pins its row to this value.
+pub const PRELOAD_REASON_AIO_UNKNOWN_CTX_OP: u8 = 21;
 
 pub const ClientStatsPage = extern struct {
     lane_gate_kernel_routes: Atomic(u64) = .init(0),

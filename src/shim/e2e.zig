@@ -21,6 +21,7 @@ const fd_table = @import("fd_table.zig");
 const classify = @import("classify.zig");
 const ops = @import("ops.zig");
 const aio = @import("aio.zig");
+const interpose = @import("interpose.zig");
 const lifecycle = @import("lifecycle.zig");
 const client = @import("../ipc/client.zig");
 const wire = @import("../ipc/wire.zig");
@@ -491,4 +492,85 @@ test "e2e: libaio over the ring — 8 iocbs in one io_submit (6 ring, 2 kernel-c
     try expectPattern(&rbuf[1], 512);
     // Every ring op accounted on the host.
     try testing.expectEqual(@as(u64, 8), rig.served());
+}
+
+/// The raw libaio lane the e2e tests stand in for the real symbols with.
+const RawAio = struct {
+    fn submit(ctx: aio.io_context_t, nr: c_long, ios: [*]const ?*aio.Iocb) callconv(.c) c_int {
+        return sys.aioResult(linux.syscall3(.io_submit, ctx, @bitCast(nr), @intFromPtr(ios)));
+    }
+    fn getevents(ctx: aio.io_context_t, min: c_long, nr: c_long, ev: [*]aio.IoEvent, ts: ?*linux.timespec) callconv(.c) c_int {
+        return sys.aioResult(linux.syscall5(.io_getevents, ctx, @bitCast(min), @bitCast(nr), @intFromPtr(ev), @intFromPtr(ts)));
+    }
+    const fns: aio.RealFns = .{ .io_submit = submit, .io_getevents = getevents };
+};
+
+fn mkWrite(fd: sys.fd_t, buf: []u8, offset: i64, cookie: u64) aio.Iocb {
+    return .{ .data = cookie, .key = 0, .aio_rw_flags = 0, .aio_lio_opcode = aio.IOCB_CMD_PWRITE, .aio_reqprio = 0, .aio_fildes = fd, .buf = @intFromPtr(buf.ptr), .nbytes = buf.len, .offset = offset, .__pad3 = 0, .flags = 0, .resfd = 0 };
+}
+
+test "e2e: fio's shape — a context from libaio's io_queue_init rides the ring (its iocbs on a bound fd are served, served == ops); a context the shim never registered is a COUNTED passthrough: per bound iocb at io_submit on the binding's stats page, per call at io_getevents/io_cancel" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const fd = try rig.openBound(sys.O.RDWR);
+    defer sys.close(fd);
+    const pin = rig.st.table.lookup(fd) orelse return error.NotBound;
+    const session = rig.st.sessionAt(pin.cell.binding.session);
+    _ = pin.unpin();
+    // The queue face: the context is registered by the shim's own io_setup.
+    var ctx: aio.io_context_t = 0;
+    try testing.expectEqual(@as(c_int, 0), interpose.wrappers.io_queue_init(16, &ctx));
+    try testing.expect(aio.registry.lookup(ctx) != null);
+    var bufs: [4][512]u8 = undefined;
+    var iocbs: [4]aio.Iocb = undefined;
+    var ptrs: [4]?*aio.Iocb = undefined;
+    for (&iocbs, 0..) |*io, i| {
+        @memset(&bufs[i], @truncate(i + 1));
+        io.* = mkWrite(fd, &bufs[i], @intCast(i * 512), 500 + i);
+        ptrs[i] = io;
+    }
+    switch (aio.submit(rig.st, ctx, 4, &ptrs, RawAio.fns)) {
+        .done => |n| try testing.expectEqual(@as(c_int, 4), n),
+        .real => return error.TestExpectedServed,
+    }
+    var events: [4]aio.IoEvent = undefined;
+    var got: usize = 0;
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    while (got < 4 and clock.monotonicNs() < deadline) {
+        var ts: linux.timespec = .{ .sec = 1, .nsec = 0 };
+        switch (aio.getevents(rig.st, ctx, 1, @intCast(4 - got), events[got..].ptr, &ts, RawAio.fns)) {
+            .done => |n| got += @intCast(@max(n, 0)),
+            .real => return error.TestExpectedServed,
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), got);
+    try testing.expectEqual(@as(u64, 4), rig.served());
+    try testing.expectEqual(@as(c_int, 0), interpose.wrappers.io_queue_release(ctx));
+    try testing.expect(aio.registry.lookup(ctx) == null);
+    // An unregistered context (the raw syscall, as a static libaio or a
+    // registry overflow would): the real call, counted.
+    var raw_ctx: aio.io_context_t = 0;
+    try testing.expectEqual(@as(c_int, 0), sys.aioResult(linux.syscall2(.io_setup, 16, @intFromPtr(&raw_ctx))));
+    defer _ = linux.syscall1(.io_destroy, raw_ctx);
+    try testing.expect(aio.registry.lookup(raw_ctx) == null);
+    const plain: sys.fd_t = @intCast(linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
+    defer sys.close(plain);
+    var unbound = mkWrite(plain, &bufs[3], 0, 900);
+    ptrs[3] = &unbound;
+    const op_before = classify.passthroughCount(.aio_unknown_ctx_op);
+    const call_before = classify.passthroughCount(.aio_unknown_ctx_call);
+    const page_before = session.statsPage().preload_passthrough_ops[@backingInt(classify.Reason.aio_unknown_ctx_op)].load(.monotonic);
+    try testing.expect(aio.submit(rig.st, raw_ctx, 4, &ptrs, RawAio.fns) == .real);
+    // Three iocbs on the bound fd count (on its session's page); the
+    // unbound one is not ours.
+    try testing.expectEqual(op_before + 3, classify.passthroughCount(.aio_unknown_ctx_op));
+    try testing.expectEqual(page_before + 3, session.statsPage().preload_passthrough_ops[@backingInt(classify.Reason.aio_unknown_ctx_op)].load(.monotonic));
+    try testing.expectEqual(call_before, classify.passthroughCount(.aio_unknown_ctx_call));
+    var ts0: linux.timespec = .{ .sec = 0, .nsec = 0 };
+    try testing.expect(aio.getevents(rig.st, raw_ctx, 0, 4, &events, &ts0, RawAio.fns) == .real);
+    try testing.expect(aio.cancel(raw_ctx, &iocbs[0]) == .real);
+    try testing.expectEqual(call_before + 2, classify.passthroughCount(.aio_unknown_ctx_call));
+    // Nothing of the passthrough reached the ring.
+    try testing.expectEqual(@as(u64, 4), rig.served());
 }

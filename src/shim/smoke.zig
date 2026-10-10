@@ -416,10 +416,13 @@ const c_program =
 ;
 
 /// The libaio lifecycle harness: local ABI mirrors; the symbols resolved
-/// through the GLOBAL scope (`dlopen(libaio, RTLD_GLOBAL)` when present,
-/// else the shim's own exports / the raw syscalls); `io_setup` BEFORE the
-/// file (the field crash ordering) and after; 8 PWRITEs in one `io_submit`,
-/// a drain, 8 PREADs, byte parity, cookie identity; `events == submits`.
+/// through the GLOBAL scope (`dlopen(libaio, RTLD_GLOBAL)` when present —
+/// Ubuntu 24.04's soname is `libaio.so.1t64` — else the shim's own
+/// exports / the raw syscalls); `io_setup` BEFORE the file (the field
+/// crash ordering) and after, then fio's shape (`io_queue_init` /
+/// `io_queue_release`, which libaio binds to its OWN `io_setup` internally)
+/// when the queue face resolves; 8 PWRITEs in one `io_submit`, a drain, 8
+/// PREADs, byte parity, cookie identity; `events == submits`.
 const aio_harness =
     \\#define _GNU_SOURCE
     \\#include <dlfcn.h>
@@ -440,17 +443,21 @@ const aio_harness =
     \\typedef int (*submit_t)(io_context_t, long, struct iocb **);
     \\typedef int (*getevents_t)(io_context_t, long, long, struct io_event *, struct timespec *);
     \\static setup_t p_setup; static destroy_t p_destroy; static submit_t p_submit; static getevents_t p_getevents;
+    \\static setup_t p_queue_init; static destroy_t p_queue_release;
     \\static int raw_setup(int n, io_context_t *c) { return (int)syscall(SYS_io_setup, n, c) < 0 ? -errno : 0; }
     \\static int raw_destroy(io_context_t c) { return syscall(SYS_io_destroy, c) < 0 ? -errno : 0; }
     \\static int raw_submit(io_context_t c, long n, struct iocb **ios) { long r = syscall(SYS_io_submit, c, n, ios); return r < 0 ? -errno : (int)r; }
     \\static int raw_getevents(io_context_t c, long mn, long n, struct io_event *e, struct timespec *t) { long r = syscall(SYS_io_getevents, c, mn, n, e, t); return r < 0 ? -errno : (int)r; }
     \\#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %d %s (errno %d)\n", __LINE__, #c, errno); return 2; } } while (0)
-    \\static int run(const char *path, int setup_first) {
+    \\/* mode 0: open then io_setup; 1: io_setup first; 2: fio's shape, io_queue_init/io_queue_release */
+    \\static int run(const char *path, int mode) {
     \\    io_context_t ctx = 0;
     \\    int fd = -1;
-    \\    if (setup_first) CHECK(p_setup(32, &ctx) == 0);
+    \\    setup_t setup = mode == 2 ? p_queue_init : p_setup;
+    \\    destroy_t destroy = mode == 2 ? p_queue_release : p_destroy;
+    \\    if (mode == 1) CHECK(setup(32, &ctx) == 0);
     \\    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644); CHECK(fd >= 0);
-    \\    if (!setup_first) CHECK(p_setup(32, &ctx) == 0);
+    \\    if (mode != 1) CHECK(setup(32, &ctx) == 0);
     \\    static char wbuf[8][4096], rbuf[8][4096];
     \\    struct iocb ios[8], *ptrs[8];
     \\    for (int i = 0; i < 8; i++) {
@@ -469,21 +476,25 @@ const aio_harness =
     \\    got = 0;
     \\    while (got < 8) { struct timespec ts = { 5, 0 }; int r = p_getevents(ctx, 2, 8 - got, ev + got, &ts); CHECK(r > 0); got += r; }
     \\    for (int i = 0; i < 8; i++) CHECK(memcmp(wbuf[i], rbuf[i], 4096) == 0);
-    \\    CHECK(p_destroy(ctx) == 0);
+    \\    CHECK(destroy(ctx) == 0);
     \\    CHECK(close(fd) == 0);
     \\    return 0;
     \\}
     \\int main(int argc, char **argv) {
     \\    if (argc < 2) return 3;
-    \\    void *h = dlopen("libaio.so.1", RTLD_NOW | RTLD_GLOBAL);
+    \\    void *h = dlopen("libaio.so.1t64", RTLD_NOW | RTLD_GLOBAL);
+    \\    if (!h) h = dlopen("libaio.so.1", RTLD_NOW | RTLD_GLOBAL);
     \\    p_setup = (setup_t)dlsym(RTLD_DEFAULT, "io_setup"); p_destroy = (destroy_t)dlsym(RTLD_DEFAULT, "io_destroy");
     \\    p_submit = (submit_t)dlsym(RTLD_DEFAULT, "io_submit"); p_getevents = (getevents_t)dlsym(RTLD_DEFAULT, "io_getevents");
+    \\    p_queue_init = (setup_t)dlsym(RTLD_DEFAULT, "io_queue_init"); p_queue_release = (destroy_t)dlsym(RTLD_DEFAULT, "io_queue_release");
     \\    const char *lane = "shim-or-libaio";
     \\    if (!p_setup || !p_destroy || !p_submit || !p_getevents) { p_setup = raw_setup; p_destroy = raw_destroy; p_submit = raw_submit; p_getevents = raw_getevents; lane = "raw-syscalls"; }
     \\    int r = run(argv[1], 1); if (r) return r;
     \\    r = run(argv[1], 0); if (r) return r;
+    \\    int queue_face = p_queue_init && p_queue_release;
+    \\    if (queue_face) { r = run(argv[1], 2); if (r) return r; }
     \\    printf("AIO_OK\n");
-    \\    fprintf(stderr, "aio lane=%s libaio=%s\n", lane, h ? "present" : "absent");
+    \\    fprintf(stderr, "aio lane=%s libaio=%s queue_face=%s\n", lane, h ? "present" : "absent", queue_face ? "run" : "absent");
     \\    return 0;
     \\}
 ;
@@ -572,7 +583,7 @@ test "shim smoke: the LD_PRELOAD battery — plain-file parity with the shim sil
         try testing.expect(std.mem.indexOf(u8, r.stderr, "squeezefs-il") == null);
         const c = try crows.run(rig, rig.work, false);
         defer gpa.free(c);
-        std.debug.print("\nshim smoke row 1 (ext4 passthrough): ok; {s}\n", .{if (std.mem.indexOf(u8, c, "aio lane=")) |i| std.mem.trim(u8, c[i..@min(c.len, i + 48)], "\n") else "aio n/a"});
+        std.debug.print("\nshim smoke row 1 (ext4 passthrough): ok; {s}\n", .{if (std.mem.indexOf(u8, c, "aio lane=")) |i| std.mem.trim(u8, c[i..@min(c.len, i + 72)], "\n") else "aio n/a"});
     }
 
     // ---- row 2: a SqueezeFS mount WITHOUT interception ----

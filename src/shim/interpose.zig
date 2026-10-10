@@ -44,44 +44,50 @@ pub const Symbol = struct {
 
 pub const table = [_]Symbol{
     // positional data
-    .{ .name = "pread" },                                          .{ .name = "pread64" },                                      .{ .name = "pwrite" },                                             .{ .name = "pwrite64" },
+    .{ .name = "pread" },                                                .{ .name = "pread64" },                                              .{ .name = "pwrite" },                                                     .{ .name = "pwrite64" },
     // offsetful data
-    .{ .name = "read" },                                           .{ .name = "write" },
+    .{ .name = "read" },                                                 .{ .name = "write" },
     // vector data
-                                           .{ .name = "readv" },                                              .{ .name = "writev" },
-    .{ .name = "preadv" },                                         .{ .name = "preadv64" },                                     .{ .name = "pwritev" },                                            .{ .name = "pwritev64" },
-    .{ .name = "preadv2" },                                        .{ .name = "preadv64v2" },                                   .{ .name = "pwritev2" },                                           .{ .name = "pwritev64v2" },
+                                                   .{ .name = "readv" },                                                      .{ .name = "writev" },
+    .{ .name = "preadv" },                                               .{ .name = "preadv64" },                                             .{ .name = "pwritev" },                                                    .{ .name = "pwritev64" },
+    .{ .name = "preadv2" },                                              .{ .name = "preadv64v2" },                                           .{ .name = "pwritev2" },                                                   .{ .name = "pwritev64v2" },
     // lseek
-    .{ .name = "lseek" },                                          .{ .name = "lseek64" },
+    .{ .name = "lseek" },                                                .{ .name = "lseek64" },
     // f_pos-consuming passthroughs
-                                         .{ .name = "sendfile" },                                           .{ .name = "sendfile64" },
-    .{ .name = "copy_file_range" },                                .{ .name = "splice" },
+                                                 .{ .name = "sendfile" },                                                   .{ .name = "sendfile64" },
+    .{ .name = "copy_file_range" },                                      .{ .name = "splice" },
     // spawn
-                                          .{ .name = "posix_spawn" },                                        .{ .name = "posix_spawnp" },
+                                                  .{ .name = "posix_spawn" },                                                .{ .name = "posix_spawnp" },
     // detection
-    .{ .name = "open" },                                           .{ .name = "open64" },                                       .{ .name = "openat" },                                             .{ .name = "openat64" },
-    .{ .name = "creat" },                                          .{ .name = "creat64" },                                      .{ .name = "openat2" },
+    .{ .name = "open" },                                                 .{ .name = "open64" },                                               .{ .name = "openat" },                                                     .{ .name = "openat64" },
+    .{ .name = "creat" },                                                .{ .name = "creat64" },                                              .{ .name = "openat2" },
     // lifecycle
-                                               .{ .name = "close" },
-    .{ .name = "close_range" },                                    .{ .name = "dup" },                                          .{ .name = "dup2" },                                               .{ .name = "dup3" },
-    .{ .name = "fcntl" },                                          .{ .name = "fcntl64" },
+                                                       .{ .name = "close" },
+    .{ .name = "close_range" },                                          .{ .name = "dup" },                                                  .{ .name = "dup2" },                                                       .{ .name = "dup3" },
+    .{ .name = "fcntl" },                                                .{ .name = "fcntl64" },
     // mmap
-                                         .{ .name = "mmap" },                                               .{ .name = "mmap64" },
+                                                 .{ .name = "mmap" },                                                       .{ .name = "mmap64" },
     // fd-creator hygiene
-    .{ .name = "socket" },                                         .{ .name = "eventfd" },                                      .{ .name = "epoll_create" },                                       .{ .name = "epoll_create1" },
-    .{ .name = "timerfd_create" },                                 .{ .name = "inotify_init" },                                 .{ .name = "inotify_init1" },                                      .{ .name = "memfd_create" },
-    .{ .name = "accept" },                                         .{ .name = "accept4" },                                      .{ .name = "signalfd" },                                           .{ .name = "signalfd4" },
-    .{ .name = "pipe" },                                           .{ .name = "pipe2" },                                        .{ .name = "socketpair" },
+    .{ .name = "socket" },                                               .{ .name = "eventfd" },                                              .{ .name = "epoll_create" },                                               .{ .name = "epoll_create1" },
+    .{ .name = "timerfd_create" },                                       .{ .name = "inotify_init" },                                         .{ .name = "inotify_init1" },                                              .{ .name = "memfd_create" },
+    .{ .name = "accept" },                                               .{ .name = "accept4" },                                              .{ .name = "signalfd" },                                                   .{ .name = "signalfd4" },
+    .{ .name = "pipe" },                                                 .{ .name = "pipe2" },                                                .{ .name = "socketpair" },
     // libaio
-                                            .{ .name = "io_setup", .version = aio.Versions.io_setup },
-    .{ .name = "io_destroy", .version = aio.Versions.io_destroy }, .{ .name = "io_submit", .version = aio.Versions.io_submit }, .{ .name = "io_getevents", .version = aio.Versions.io_getevents }, .{ .name = "io_pgetevents", .version = aio.Versions.io_pgetevents },
+                                                    .{ .name = "io_setup", .version = aio.Versions.io_setup },
+    .{ .name = "io_destroy", .version = aio.Versions.io_destroy },       .{ .name = "io_submit", .version = aio.Versions.io_submit },         .{ .name = "io_getevents", .version = aio.Versions.io_getevents },         .{ .name = "io_pgetevents", .version = aio.Versions.io_pgetevents },
     .{ .name = "io_cancel", .version = aio.Versions.io_cancel },
+    // libaio's queue face (composed from the rows above, never resolved)
+            .{ .name = "io_queue_init", .version = aio.Versions.io_queue_init }, .{ .name = "io_queue_release", .version = aio.Versions.io_queue_release }, .{ .name = "io_queue_run", .version = aio.Versions.io_queue_run },
+    .{ .name = "io_queue_wait", .version = aio.Versions.io_queue_wait },
     // the linked-mode API
-      .{ .name = "squeezefs_il_bind", .api = true },
+    .{ .name = "squeezefs_il_bind", .api = true },
 };
 
-/// The libc/libaio interpositions (the spec's 59 + `openat2` + `signalfd4`).
-pub const INTERPOSED: usize = 61;
+/// The libc/libaio interpositions: the spec's 59 + `openat2` + `signalfd4`
+/// + libaio's four-symbol queue face (`io_queue_init/release/run/wait`,
+/// which libaio binds to its OWN `io_setup`/`io_getevents` internally —
+/// fio's libaio engine created its context through it uncounted).
+pub const INTERPOSED: usize = 65;
 
 comptime {
     var n: usize = 0;
@@ -773,6 +779,35 @@ pub const wrappers = struct {
         return sys.aioResult(linux.syscall3(.io_cancel, ctx, @intFromPtr(iocb), @intFromPtr(result)));
     }
 
+    // ---- libaio's queue face: libaio's own bodies (io_queue_init.c,
+    //      io_queue_release.c, io_queue_run.c, io_queue_wait.c) over the
+    //      shim's wrappers above — NEVER the real symbols. libaio binds its
+    //      internal calls locally (Ubuntu links it `-Bsymbolic-functions`:
+    //      libaio.so.1 carries no `io_*` relocation), so the real
+    //      `io_queue_init` reaches libaio's own `io_setup` and creates a
+    //      context the registry never learns; every later `io_submit` on it
+    //      was an uncounted passthrough (fio's libaio engine, F3). ----
+
+    pub fn io_queue_init(maxevents: c_int, ctxp: ?*aio.io_context_t) callconv(.c) c_int {
+        const p = ctxp orelse return -@as(c_int, @backingInt(linux.E.INVAL));
+        if (maxevents <= 0) return -@as(c_int, @backingInt(linux.E.INVAL));
+        // The kernel refuses a non-zero *ctxp; libaio clears it first.
+        p.* = 0;
+        return io_setup(maxevents, p);
+    }
+
+    pub fn io_queue_release(ctx: aio.io_context_t) callconv(.c) c_int {
+        return io_destroy(ctx);
+    }
+
+    pub fn io_queue_run(ctx: aio.io_context_t) callconv(.c) c_int {
+        return aio.queueRun(ctx, io_getevents);
+    }
+
+    pub fn io_queue_wait(ctx: aio.io_context_t, timeout: ?*linux.timespec) callconv(.c) c_int {
+        return io_getevents(ctx, 0, 0, null, timeout);
+    }
+
     // ---- the linked-mode API ----
 
     /// Classify and bind an fd the app already holds (linked mode: an fd
@@ -803,7 +838,7 @@ comptime {
 
 const testing = std.testing;
 
-test "the table: 61 interpositions + the API, unique names, every row has a wrapper named exactly as the symbol; libaio rows carry their default versions" {
+test "the table: 65 interpositions + the API, unique names, every row has a wrapper named exactly as the symbol; libaio rows carry their default versions, the queue face included" {
     @setEvalBranchQuota(20_000);
     var n_api: usize = 0;
     inline for (table, 0..) |e, i| {
@@ -816,6 +851,35 @@ test "the table: 61 interpositions + the API, unique names, every row has a wrap
     try testing.expectEqual(INTERPOSED + 1, table.len);
     try testing.expectEqualStrings("LIBAIO_0.1", table[index("io_submit")].version.?);
     try testing.expectEqualStrings("LIBAIO_0.5", table[index("io_pgetevents")].version.?);
+    // libaio's queue face: the four symbols fio's engine and io_queue_run
+    // callers reach, at their exported default versions.
+    try testing.expectEqualStrings("LIBAIO_0.1", table[index("io_queue_init")].version.?);
+    try testing.expectEqualStrings("LIBAIO_0.1", table[index("io_queue_release")].version.?);
+    try testing.expectEqualStrings("LIBAIO_0.1", table[index("io_queue_run")].version.?);
+    try testing.expectEqualStrings("LIBAIO_0.4", table[index("io_queue_wait")].version.?);
+}
+
+test "io_queue_init is libaio's body over the shim's io_setup: maxevents ≤ 0 and a NULL ctxp answer −EINVAL before any syscall; a context it creates is in the registry (the ring will see its iocbs) and io_queue_release vacates it" {
+    var ctx: aio.io_context_t = 0xDEAD;
+    try testing.expectEqual(-@as(c_int, @backingInt(linux.E.INVAL)), wrappers.io_queue_init(0, &ctx));
+    try testing.expectEqual(-@as(c_int, @backingInt(linux.E.INVAL)), wrappers.io_queue_init(-1, &ctx));
+    try testing.expectEqual(-@as(c_int, @backingInt(linux.E.INVAL)), wrappers.io_queue_init(8, null));
+    try testing.expectEqual(@as(aio.io_context_t, 0xDEAD), ctx);
+    try testing.expectEqual(@as(c_int, 0), wrappers.io_queue_init(8, &ctx));
+    try testing.expect(ctx != 0 and ctx != 0xDEAD);
+    try testing.expect(aio.registry.lookup(ctx) != null);
+    // A fresh io_queue_init clears *ctxp before the syscall (the kernel
+    // refuses a non-zero value): a second context from the same variable.
+    var ctx2 = ctx;
+    try testing.expectEqual(@as(c_int, 0), wrappers.io_queue_init(8, &ctx2));
+    try testing.expect(ctx2 != ctx);
+    try testing.expectEqual(@as(c_int, 0), wrappers.io_queue_release(ctx2));
+    try testing.expect(aio.registry.lookup(ctx2) == null);
+    try testing.expectEqual(@as(c_int, 0), wrappers.io_queue_release(ctx));
+    try testing.expect(aio.registry.lookup(ctx) == null);
+    // io_queue_wait on a released context is the kernel's answer (−EINVAL).
+    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
+    try testing.expectEqual(-@as(c_int, @backingInt(linux.E.INVAL)), wrappers.io_queue_wait(ctx, &ts));
 }
 
 test "linked mode in the test binary: the real symbols resolve through RTLD_NEXT (libc's), the wrappers pass a plain file's I/O through byte-exact, and nothing of the test binary is interposed" {

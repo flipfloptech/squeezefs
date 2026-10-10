@@ -20,6 +20,16 @@
 //! at `io_setup`: one allocation per context life, decision 0002 ledger
 //! S9); the table is static so a data-path reference never dangles.
 //! Return convention is libaio's: 0-or-count, NEGATIVE errno.
+//!
+//! A context the registry does not know (past its capacity, or created by
+//! a path no interposition saw) is a COUNTED passthrough: `io_submit`
+//! attributes every iocb on a bound fd to its binding's session
+//! (`aio_unknown_ctx_op`), `io_getevents`/`io_cancel` count per call
+//! (`aio_unknown_ctx_call`) — the engagement law must never lose an op
+//! silently. libaio's queue face (`io_queue_init/release/run/wait`) is
+//! composed from the shim's own `io_*` wrappers (`queueRun` here), never
+//! the real symbols: libaio binds its internal calls locally, so the real
+//! `io_queue_init` would create a context the shim never learns.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -80,7 +90,9 @@ pub const IOCB_CMD_PREAD: u16 = 0;
 pub const IOCB_CMD_PWRITE: u16 = 1;
 pub const IOCB_FLAG_RESFD: u32 = 1;
 
-/// The libaio symbol versions (`dlvsym` targets; §6.1).
+/// The libaio symbol versions (`dlvsym` targets; §6.1). The queue face's
+/// rows are the exported defaults (`nm -D --with-symbol-versions`): the
+/// wrappers never resolve them, the versions document the ABI they stand in for.
 pub const Versions = struct {
     pub const io_setup = "LIBAIO_0.4";
     pub const io_destroy = "LIBAIO_0.4";
@@ -88,7 +100,15 @@ pub const Versions = struct {
     pub const io_getevents = "LIBAIO_0.4";
     pub const io_pgetevents = "LIBAIO_0.5";
     pub const io_cancel = "LIBAIO_0.4";
+    pub const io_queue_init = "LIBAIO_0.1";
+    pub const io_queue_release = "LIBAIO_0.1";
+    pub const io_queue_run = "LIBAIO_0.1";
+    pub const io_queue_wait = "LIBAIO_0.4";
 };
+
+/// libaio's `io_callback_t`: `io_queue_run` calls each event's `data` with
+/// `(ctx, iocb, res, res2)`.
+pub const IoCallback = *const fn (io_context_t, ?*Iocb, c_long, c_long) callconv(.c) void;
 
 // ---------------------------------------------------------------------------
 // Constants with WHY.
@@ -592,9 +612,25 @@ pub fn destroyPre(st: ?*State, id: io_context_t, fns: RealFns) void {
     registry.remove(id, &lanes);
 }
 
+/// The counted passthrough of an unregistered context's batch: every iocb
+/// on a BOUND fd is an op the ring never saw, attributed to its binding's
+/// session so the daemon's ledger reads it; unbound fds are not ours.
+fn noteUnknownCtxSubmit(st: *State, ios: [*]const ?*Iocb, nr: usize) void {
+    var i: usize = 0;
+    while (i < nr) : (i += 1) {
+        const iocb = ios[i] orelse continue;
+        const pin = st.table.lookup(iocb.aio_fildes) orelse continue;
+        defer if (pin.unpin()) |d| st.release(d);
+        classify_mod.note(.aio_unknown_ctx_op, st.sessionAt(pin.cell.binding.session));
+    }
+}
+
 pub fn submit(st: *State, id: io_context_t, nr: c_long, ios: ?[*]const ?*Iocb, fns: RealFns) ops.Verdict(c_int) {
     if (nr <= 0 or ios == null) return .real;
-    const c = registry.lookup(id) orelse return .real;
+    const c = registry.lookup(id) orelse {
+        noteUnknownCtxSubmit(st, ios.?, @intCast(nr));
+        return .real;
+    };
     var lanes: RealLanes = .{ .st = st, .fns = fns };
     return switch (submitBatch(c, id, ios.?, @intCast(nr), &lanes)) {
         .all_kernel => .real,
@@ -607,7 +643,10 @@ pub fn submit(st: *State, id: io_context_t, nr: c_long, ios: ?[*]const ?*Iocb, f
 /// shim's own waits — strictly more wakeful).
 pub fn getevents(st: *State, id: io_context_t, min_nr: c_long, nr: c_long, events: ?[*]IoEvent, timeout: ?*const linux.timespec, fns: RealFns) ops.Verdict(c_int) {
     if (nr <= 0 or events == null) return .real;
-    const c = registry.lookup(id) orelse return .real;
+    const c = registry.lookup(id) orelse {
+        classify_mod.note(.aio_unknown_ctx_call, null);
+        return .real;
+    };
     var lanes: RealLanes = .{ .st = st, .fns = fns };
     const timeout_ns: u64 = if (timeout) |t| timespecNs(t) else GETEVENTS_FOREVER_NS;
     const k = reapKnobs(st);
@@ -626,7 +665,10 @@ fn timespecNs(t: *const linux.timespec) u64 {
 /// `io_cancel`: a ring-pending iocb cannot be recalled ⇒ −EINPROGRESS;
 /// else the real call.
 pub fn cancel(id: io_context_t, iocb: ?*const Iocb) ops.Verdict(c_int) {
-    const c = registry.lookup(id) orelse return .real;
+    const c = registry.lookup(id) orelse {
+        classify_mod.note(.aio_unknown_ctx_call, null);
+        return .real;
+    };
     const target = @intFromPtr(iocb orelse return .real);
     c.lock.lock();
     defer c.lock.unlock();
@@ -634,6 +676,23 @@ pub fn cancel(id: io_context_t, iocb: ?*const Iocb) ops.Verdict(c_int) {
         if (l.used and l.iocb == target) return .{ .done = -@as(c_int, @backingInt(linux.E.INPROGRESS)) };
     }
     return .real;
+}
+
+/// libaio's `io_queue_run` (io_queue_run.c) over a getevents function of
+/// the interposer's signature: reap ONE event at a time with a zero
+/// timeout and call its `data` cookie as `io_callback_t(ctx, iocb, res,
+/// res2)`; the first answer that is not 1 is the result. A zero cookie is
+/// skipped (libaio would jump to address 0; a total body never does).
+pub fn queueRun(ctx: io_context_t, getevents_fn: anytype) c_int {
+    var zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+    while (true) {
+        var ev: IoEvent = undefined;
+        const r = getevents_fn(ctx, 0, 1, @as([*]IoEvent, @ptrCast(&ev)), &zero);
+        if (r != 1) return r;
+        if (ev.data == 0) continue;
+        const cb: IoCallback = @ptrFromInt(@as(usize, @intCast(ev.data)));
+        cb(ctx, @ptrFromInt(@as(usize, @intCast(ev.obj))), @intCast(ev.res), @intCast(ev.res2));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +953,53 @@ test "min 0 never blocks and returns whatever is ready; a zero timeout is one no
     try testing.expect(t.reg.register(testing.allocator, 0xC0FFEE, 4, &t.lanes));
     try testing.expectEqual(@as(usize, 1), t.reg.count());
     t.reg.remove(0xC0FFEE, &t.lanes);
+}
+
+/// A getevents lane for `queueRun`: hands out a fixed event list one per
+/// call (the last answer is the "nothing more" the loop ends on), and
+/// records what the callbacks saw.
+const RunLane = struct {
+    var events: [3]IoEvent = undefined;
+    var next: usize = 0;
+    var tail: c_int = 0;
+    var seen: [3]u64 = @splat(0);
+    var n_seen: usize = 0;
+
+    fn getevents(_: io_context_t, min_nr: c_long, nr: c_long, out: ?[*]IoEvent, ts: ?*linux.timespec) callconv(.c) c_int {
+        // libaio's shape: min 0, nr 1, a zero timeout.
+        if (min_nr != 0 or nr != 1 or ts == null or ts.?.sec != 0 or ts.?.nsec != 0) return -@as(c_int, @backingInt(linux.E.INVAL));
+        if (next >= events.len) return tail;
+        out.?[0] = events[next];
+        next += 1;
+        return 1;
+    }
+    fn callback(_: io_context_t, iocb: ?*Iocb, res: c_long, res2: c_long) callconv(.c) void {
+        seen[n_seen] = @intFromPtr(iocb) +% @as(u64, @bitCast(@as(i64, res))) +% @as(u64, @bitCast(@as(i64, res2)));
+        n_seen += 1;
+    }
+};
+
+test "io_queue_run's body: one event per zero-timeout reap, each cookie called as io_callback_t(ctx, iocb, res, res2), a zero cookie skipped, the first non-1 answer returned" {
+    const cb: u64 = @intFromPtr(&RunLane.callback);
+    RunLane.events = .{
+        .{ .data = cb, .obj = 0x1000, .res = 4096, .res2 = 0 },
+        .{ .data = 0, .obj = 0x2000, .res = 512, .res2 = 0 },
+        .{ .data = cb, .obj = 0x3000, .res = -5, .res2 = 7 },
+    };
+    RunLane.next = 0;
+    RunLane.tail = 0;
+    RunLane.n_seen = 0;
+    try testing.expectEqual(@as(c_int, 0), queueRun(0xC0FFEE, RunLane.getevents));
+    try testing.expectEqual(@as(usize, 2), RunLane.n_seen);
+    try testing.expectEqual(@as(u64, 0x1000 + 4096), RunLane.seen[0]);
+    try testing.expectEqual(@as(u64, 0x3000) -% 5 +% 7, RunLane.seen[1]);
+    // An errno from the reap is the result (libaio's `return ret`).
+    RunLane.next = 0;
+    RunLane.events[0].data = 0;
+    RunLane.events[1].data = 0;
+    RunLane.events[2].data = 0;
+    RunLane.tail = -@as(c_int, @backingInt(linux.E.INVAL));
+    try testing.expectEqual(-@as(c_int, @backingInt(linux.E.INVAL)), queueRun(0xC0FFEE, RunLane.getevents));
 }
 
 test "the registry refuses past its capacity and degrades to passthrough; sparse_park_k derives and gates; the knob rows read their defaults" {

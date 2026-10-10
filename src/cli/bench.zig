@@ -305,14 +305,26 @@ pub fn bucketUpperNs(i: usize) u64 {
 }
 
 /// The `.stats` terms a row reads (by key name) before and after a pass.
+/// The term lists are the bracket harness's (`scripts/bracket/brk.py`,
+/// checked against `/proc/diskstats`); `tests/rails.zig` pins them equal so
+/// the two ledgers cannot drift apart silently.
 pub const StatsTerms = struct {
+    /// Handler-lane ops. On a zero-copy session a READ the warm ladder
+    /// cannot answer is served at the delivery CQE by the direct device leg
+    /// and never reaches a lane: `transport_ring_requests` is the
+    /// engagement term, `fuse_ops` only its handler-lane share.
     fuse_ops: u64 = 0,
     transport_ring_requests: u64 = 0,
     transport_enters: u64 = 0,
-    /// Σ device write bytes over every write arm.
+    /// Σ device write bytes over every write arm (`device_write_keys`).
     device_write_bytes: u64 = 0,
+    /// The rewrite epoch's gauge over the SAME overlay DMA: beside the arms.
+    rewrite_device_write_bytes: u64 = 0,
+    /// Σ device write requests over `device_write_req_keys`.
     device_writes: u64 = 0,
     admission_bytes: u64 = 0,
+    /// Σ read copy bytes over `read_copy_keys` (≈ user bytes on a direct read row).
+    read_copy_bytes: u64 = 0,
     terminal_frees: u64 = 0,
     reclaim_queued: u64 = 0,
     reclaim_elided: u64 = 0,
@@ -323,14 +335,30 @@ pub const StatsTerms = struct {
     fast_dispatch_serves: u64 = 0,
     zc_write_direct_bytes: u64 = 0,
     zc_write_extract_bytes: u64 = 0,
+    /// Reads the direct device leg served at the delivery CQE, and their bytes.
+    zc_direct_legs: u64 = 0,
+    zc_serve_bytes: u64 = 0,
     invariant_tripwires: u64 = 0,
     direct_device_true: bool = false,
     present: bool = false,
 
-    /// The device-write byte arms (`stats_cli.md` §3.4): every path that
-    /// lands user bytes on a data device.
-    const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "rewrite_device_write_bytes", "durable_upload_bytes_escalation", "durable_upload_bytes_writeback" };
-    const admission_keys = [_][]const u8{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes" };
+    /// The device-write byte arms (`stats_cli.md` §3.4; brk.py
+    /// `DEVICE_WRITE_ARMS`): every path that lands user bytes on a data
+    /// device ONCE. `rewrite_device_write_bytes` counts the SAME overlay DMA
+    /// the rewrite epoch was fed (measured: overlay 22.17 GB + rewrite
+    /// 6.09 GB against diskstats 1.025 × user on a 22.28 GB row) and is
+    /// read BESIDE, never summed.
+    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "durable_upload_bytes_escalation", "durable_upload_bytes_writeback" };
+    /// The device-write REQUEST arms (brk.py `DEVICE_WRITE_REQS`): `put_obj`
+    /// is the block layer's put (an overlay store IS a put, never summed
+    /// twice); a W1 patch DMA and an own-block DMA bypass it.
+    pub const device_write_req_keys = [_][]const u8{ "patch_writes", "own_block_dmas", "put_obj" };
+    pub const admission_keys = [_][]const u8{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes" };
+    /// The read copy ledger (charter §6.3; brk.py `READ_COPY_ARMS`): the
+    /// plane's arms plus the transport's direct-leg and bridged serves.
+    /// `read_dest_lease_bytes` is the dest-lease mechanism's gauge over the
+    /// bytes `read_dest_dma_bytes` lands (1:1 measured) — beside, not summed.
+    pub const read_copy_keys = [_][]const u8{ "read_copy_dest_bytes", "read_copy_bounce_bytes", "read_dest_dma_bytes", "read_zc_serve_bytes", "read_copy_warm_serve_bytes", "read_copy_hot_serve_bytes", "read_copy_hold_serve_bytes", "read_copy_cache_serve_bytes", "read_copy_fill_slice_bytes", "transport_zc_serve_bytes", "transport_zc_bounce_bytes_bridged" };
 
     pub fn parse(text: []const u8) StatsTerms {
         var t: StatsTerms = .{ .present = true };
@@ -338,8 +366,10 @@ pub const StatsTerms = struct {
         t.transport_ring_requests = json_scan.number(text, "transport_ring_requests") orelse 0;
         t.transport_enters = json_scan.number(text, "transport_enters") orelse 0;
         for (device_write_keys) |k| t.device_write_bytes += json_scan.number(text, k) orelse 0;
-        t.device_writes = json_scan.number(text, "put_obj") orelse 0;
+        t.rewrite_device_write_bytes = json_scan.number(text, "rewrite_device_write_bytes") orelse 0;
+        for (device_write_req_keys) |k| t.device_writes += json_scan.number(text, k) orelse 0;
         for (admission_keys) |k| t.admission_bytes += json_scan.number(text, k) orelse 0;
+        for (read_copy_keys) |k| t.read_copy_bytes += json_scan.number(text, k) orelse 0;
         t.terminal_frees = json_scan.number(text, "terminal_frees") orelse 0;
         t.reclaim_queued = json_scan.number(text, "block_free_reclaim_queued") orelse 0;
         t.reclaim_elided = json_scan.number(text, "block_free_reclaim_elided") orelse 0;
@@ -350,6 +380,8 @@ pub const StatsTerms = struct {
         t.fast_dispatch_serves = json_scan.number(text, "transport_fast_dispatch_serves") orelse 0;
         t.zc_write_direct_bytes = json_scan.number(text, "transport_zc_write_direct_bytes") orelse 0;
         t.zc_write_extract_bytes = json_scan.number(text, "transport_zc_write_extract_bytes") orelse 0;
+        t.zc_direct_legs = json_scan.number(text, "transport_zc_direct_legs") orelse 0;
+        t.zc_serve_bytes = json_scan.number(text, "transport_zc_serve_bytes") orelse 0;
         t.invariant_tripwires = json_scan.number(text, "invariant_tripwires") orelse 0;
         t.direct_device_true = (json_scan.number(text, "direct_device_true") orelse 0) != 0;
         return t;
@@ -357,7 +389,7 @@ pub const StatsTerms = struct {
 
     pub fn delta(after: StatsTerms, before: StatsTerms) StatsTerms {
         var d: StatsTerms = .{ .present = after.present and before.present, .direct_device_true = after.direct_device_true };
-        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "device_writes", "admission_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "invariant_tripwires" }) |f| {
+        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "rewrite_device_write_bytes", "device_writes", "admission_bytes", "read_copy_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "zc_direct_legs", "zc_serve_bytes", "invariant_tripwires" }) |f| {
             @field(d, f) = @field(after, f) -| @field(before, f);
         }
         return d;
@@ -386,16 +418,33 @@ pub const Row = struct {
         return @intCast((@as(u128, self.ops) * std.time.ns_per_s) / self.elapsed_ns);
     }
 
-    /// `device bytes ÷ user bytes` in ppm (integer; no floats on a wire).
+    /// The ratio unit of the rows: parts per million (integer; no floats on
+    /// a wire), printed as `whole.milli` with three decimals.
+    pub const PPM: u64 = 1_000_000;
+    pub const PPM_PER_MILLI: u64 = PPM / 1000;
+
+    /// `ppm` as the two integers `whole.milli` prints.
+    pub fn ratioParts(ppm: u64) struct { whole: u64, milli: u64 } {
+        return .{ .whole = ppm / PPM, .milli = (ppm % PPM) / PPM_PER_MILLI };
+    }
+
+    /// `device bytes ÷ user bytes` in ppm.
     pub fn amplificationPpm(self: Row) u64 {
         if (self.bytes == 0) return 0;
-        return @intCast((@as(u128, self.stats.device_write_bytes) * 1_000_000) / self.bytes);
+        return @intCast((@as(u128, self.stats.device_write_bytes) * PPM) / self.bytes);
     }
 
     /// `wareq-sz`: the mean device write request in bytes.
     pub fn wareqSz(self: Row) u64 {
         if (self.stats.device_writes == 0) return 0;
         return self.stats.device_write_bytes / self.stats.device_writes;
+    }
+
+    /// The read copy ledger `Σ read copy arms ÷ user bytes` in ppm (≈ 1.0
+    /// on a direct read row; readahead moves more than asked on a buffered one).
+    pub fn readCopyPpm(self: Row) u64 {
+        if (self.bytes == 0) return 0;
+        return @intCast((@as(u128, self.stats.read_copy_bytes) * PPM) / self.bytes);
     }
 
     pub fn scopingOnly(self: Row) bool {
@@ -417,11 +466,12 @@ pub const Row = struct {
             quantileNs(self.lat, 990),             quantileNs(self.lat, 999),                      quantileNs(self.lat, 1000),
         });
         const s = self.stats;
-        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"wareq_sz\":{d},\"admission_bytes\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
-            s.present,                 self.bytes,               s.device_write_bytes,  s.device_writes,  self.amplificationPpm(), self.wareqSz(),
-            s.admission_bytes,         s.terminal_frees,         s.reclaim_queued,      s.reclaim_elided, s.discard_bytes,         s.fuse_ops,
-            s.transport_ring_requests, s.transport_enters,       s.held_stores,         s.patch_writes,   s.hot_block_hits,        s.fast_dispatch_serves,
-            s.zc_write_direct_bytes,   s.zc_write_extract_bytes, s.invariant_tripwires,
+        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
+            s.present,        self.bytes,            s.device_write_bytes,   s.rewrite_device_write_bytes, s.device_writes,          self.amplificationPpm(),
+            self.wareqSz(),   s.admission_bytes,     s.read_copy_bytes,      self.readCopyPpm(),           s.terminal_frees,         s.reclaim_queued,
+            s.reclaim_elided, s.discard_bytes,       s.fuse_ops,             s.transport_ring_requests,    s.transport_enters,       s.held_stores,
+            s.patch_writes,   s.hot_block_hits,      s.fast_dispatch_serves, s.zc_write_direct_bytes,      s.zc_write_extract_bytes, s.zc_direct_legs,
+            s.zc_serve_bytes, s.invariant_tripwires,
         });
     }
 
@@ -430,10 +480,13 @@ pub const Row = struct {
         try w.print("| {s:<22} | {s:<3} | {d:>8} MiB/s | {d:>9} IOPS | {d:>8}/{d:<8} | lat p50 {d} µs p99 {d} µs p999 {d} µs mean {d} µs |{s}\n", .{ self.passName(&nb), self.pass.arm, self.mibPerS(), self.iops(), self.ops, self.expected_ops, quantileNs(self.lat, 500) / std.time.ns_per_us, quantileNs(self.lat, 990) / std.time.ns_per_us, quantileNs(self.lat, 999) / std.time.ns_per_us, self.lat.meanNs() / std.time.ns_per_us, if (self.scopingOnly()) " scoping-only (<60 s)" else "" });
         if (self.boxed_out) try w.print("|   time box expired: {d} of {d} ops ({d}% coverage)\n", .{ self.ops, self.expected_ops, if (self.expected_ops == 0) 0 else self.ops * 100 / self.expected_ops });
         if (self.pass.phase == .write and self.stats.present) {
-            try w.print("|   device bytes ÷ user bytes {d}.{d:0>3} (device {d} B / user {d} B); wareq-sz {d} B vs block {d} B; reclaim terminal {d} = queued {d} + elided {d}, discarded {d} B; admission {d} B\n", .{ self.amplificationPpm() / 1_000_000, (self.amplificationPpm() % 1_000_000) / 1000, self.stats.device_write_bytes, self.bytes, self.wareqSz(), self.pass.block, self.stats.terminal_frees, self.stats.reclaim_queued, self.stats.reclaim_elided, self.stats.discard_bytes, self.stats.admission_bytes });
+            try w.print("|   device bytes ÷ user bytes {d}.{d:0>3} (device {d} B / user {d} B; rewrite epoch {d} B beside); wareq-sz {d} B vs block {d} B; reclaim terminal {d} = queued {d} + elided {d}, discarded {d} B; admission {d} B\n", .{ ratioParts(self.amplificationPpm()).whole, ratioParts(self.amplificationPpm()).milli, self.stats.device_write_bytes, self.bytes, self.stats.rewrite_device_write_bytes, self.wareqSz(), self.pass.block, self.stats.terminal_frees, self.stats.reclaim_queued, self.stats.reclaim_elided, self.stats.discard_bytes, self.stats.admission_bytes });
+        }
+        if (self.pass.phase == .read and self.stats.present) {
+            try w.print("|   read copy ledger Σ arms ÷ user bytes {d}.{d:0>3} (Σ {d} B / user {d} B); direct-leg serves {d} ({d} B)\n", .{ ratioParts(self.readCopyPpm()).whole, ratioParts(self.readCopyPpm()).milli, self.stats.read_copy_bytes, self.bytes, self.stats.zc_direct_legs, self.stats.zc_serve_bytes });
         }
         if (self.stats.present) {
-            try w.print("|   fuse_ops {d}, ring requests {d}, enters {d}; engagement held_stores {d} patch_writes {d} hot_block_hits {d} fast_dispatch {d} zc direct {d} B extract {d} B; invariant_tripwires +{d}\n", .{ self.stats.fuse_ops, self.stats.transport_ring_requests, self.stats.transport_enters, self.stats.held_stores, self.stats.patch_writes, self.stats.hot_block_hits, self.stats.fast_dispatch_serves, self.stats.zc_write_direct_bytes, self.stats.zc_write_extract_bytes, self.stats.invariant_tripwires });
+            try w.print("|   ring requests {d} (handler-lane fuse_ops {d}, direct-leg serves {d}), enters {d}; engagement held_stores {d} patch_writes {d} hot_block_hits {d} fast_dispatch {d} zc direct {d} B extract {d} B; invariant_tripwires +{d}\n", .{ self.stats.transport_ring_requests, self.stats.fuse_ops, self.stats.zc_direct_legs, self.stats.transport_enters, self.stats.held_stores, self.stats.patch_writes, self.stats.hot_block_hits, self.stats.fast_dispatch_serves, self.stats.zc_write_direct_bytes, self.stats.zc_write_extract_bytes, self.stats.invariant_tripwires });
         }
     }
 };
@@ -997,19 +1050,36 @@ test "rows: quantiles are the bucket's UPPER bound over exact counts; MiB/s and 
     try testing.expect(!stat_row.scopingOnly());
 }
 
-test "the stats delta reads the terms by key name across the families; absent keys read 0; the delta saturates" {
-    const before = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":10,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":100,\"patch_write_bytes\":50,\"put_obj\":3,\"admit_write_overlay_bytes\":100,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1}}");
-    const after = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":25,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":400,\"patch_write_bytes\":50,\"put_obj\":7,\"admit_write_overlay_bytes\":300,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1}}");
+test "the stats delta reads the terms by key name across the families; absent keys read 0; the delta saturates; the rewrite epoch's bytes ride beside the device arms, never in them; the read ledger sums the plane's and the transport's serve arms" {
+    const before = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":10,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":100,\"patch_write_bytes\":50,\"rewrite_device_write_bytes\":40,\"put_obj\":3,\"patch_writes\":1,\"own_block_dmas\":0,\"admit_write_overlay_bytes\":100,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1,\"read_dest_dma_bytes\":10,\"read_dest_lease_bytes\":10},\"transport\":{\"transport_zc_serve_bytes\":5,\"transport_zc_direct_legs\":1}}");
+    const after = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":25,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":400,\"patch_write_bytes\":50,\"rewrite_device_write_bytes\":140,\"put_obj\":7,\"patch_writes\":2,\"own_block_dmas\":1,\"admit_write_overlay_bytes\":300,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1,\"read_dest_dma_bytes\":30,\"read_dest_lease_bytes\":30},\"transport\":{\"transport_zc_serve_bytes\":25,\"transport_zc_direct_legs\":6}}");
     try testing.expectEqual(@as(u64, 150), before.device_write_bytes);
+    try testing.expectEqual(@as(u64, 40), before.rewrite_device_write_bytes);
+    try testing.expectEqual(@as(u64, 4), before.device_writes);
+    // The read ledger: dest DMA + the transport's direct-leg serve; the
+    // dest-lease gauge over the same bytes is not an arm.
+    try testing.expectEqual(@as(u64, 15), before.read_copy_bytes);
     const d = StatsTerms.delta(after, before);
     try testing.expect(d.present and d.direct_device_true);
     try testing.expectEqual(@as(u64, 15), d.fuse_ops);
     try testing.expectEqual(@as(u64, 300), d.device_write_bytes);
-    try testing.expectEqual(@as(u64, 4), d.device_writes);
+    try testing.expectEqual(@as(u64, 100), d.rewrite_device_write_bytes);
+    try testing.expectEqual(@as(u64, 6), d.device_writes);
     try testing.expectEqual(@as(u64, 200), d.admission_bytes);
+    try testing.expectEqual(@as(u64, 40), d.read_copy_bytes);
+    try testing.expectEqual(@as(u64, 5), d.zc_direct_legs);
+    try testing.expectEqual(@as(u64, 20), d.zc_serve_bytes);
     try testing.expectEqual(@as(u64, 0), d.terminal_frees);
     try testing.expectEqual(@as(u64, 0), StatsTerms.delta(before, after).fuse_ops);
     try testing.expect(!StatsTerms.delta(after, .{}).present);
+    // A direct read row's ledger closes on the user bytes; a row's amplification excludes the rewrite gauge.
+    const row: Row = .{ .pass = .{ .phase = .read, .block = 4096, .rand = true, .direct = true, .time_box_s = 0 }, .shape = .{ .threads = 1, .files = 1, .size = 1, .block = 4096 }, .iteration = 1, .ops = 10, .bytes = 40, .elapsed_ns = 1, .expected_ops = 10, .boxed_out = false, .lat = .{}, .stats = d };
+    try testing.expectEqual(Row.PPM, row.readCopyPpm());
+    try testing.expectEqual(@as(u64, 1), Row.ratioParts(1_025_000).whole);
+    try testing.expectEqual(@as(u64, 25), Row.ratioParts(1_025_000).milli);
+    const wrow: Row = .{ .pass = .{ .phase = .write, .block = 4096, .rand = false, .direct = true, .time_box_s = 0 }, .shape = row.shape, .iteration = 1, .ops = 10, .bytes = 300, .elapsed_ns = 1, .expected_ops = 10, .boxed_out = false, .lat = .{}, .stats = d };
+    try testing.expectEqual(Row.PPM, wrow.amplificationPpm());
+    try testing.expectEqual(@as(u64, 50), wrow.wareqSz());
 }
 
 test "the A-B-B-A bracket: the arm order, the direct lever per arm, the fold over byte-moving rows" {

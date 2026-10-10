@@ -29,7 +29,7 @@ const MiB = derive.MiB;
 /// dequeue-thread plateau; ceiling 16 = the shim's static session table
 /// (32) over two concurrently-bound mounts.
 pub fn ilSessionsDefault(cpus: u32) u32 {
-    return @intCast(derive.clamp(derive.ceilDiv(cpus, 4), 2, 16));
+    return @intCast(derive.clamp(derive.ceilDiv(cpus, 4), mem_sizing.il_sessions_per_mount_floor, 16));
 }
 
 /// `SQUEEZEFS_IL_SESSIONS` verbatim (1..=16) else derived.
@@ -49,10 +49,20 @@ pub fn ilSessionsFromEnv(env: *const std.process.Environ.Map, cpus: u32) u32 {
 pub const ipcArenaCap = mem_sizing.ipcArenaCap;
 pub const resolveIpcArenaCap = mem_sizing.resolveIpcArenaCap;
 /// `max(64 MiB, align_down(cap / population, 4 MiB))` (charter §7 "arena
-/// `max(64 MiB, cap/population)`").
+/// `max(64 MiB, cap/population)`") where the cap holds the population
+/// floor (`2 × cpus` sessions) at it; the arena yields to the floor on a
+/// bounded budget (decision 0003 §H).
 pub const resolveIpcArenaBytes = mem_sizing.resolveIpcArenaBytes;
 pub const ipcSessionPopulationTarget = mem_sizing.ipcSessionPopulationTarget;
+pub const ipcSessionPopulationFloor = mem_sizing.ipcSessionPopulationFloor;
+pub const ipcAdmittedPopulation = mem_sizing.ipcAdmittedPopulation;
 pub const ipcPerUidSessionCap = mem_sizing.ipcPerUidSessionCap;
+
+/// The host's face: `SQUEEZEFS_IPC_ARENA_MB` verbatim else the derived
+/// arena, the default geometry's overhead charged per session.
+pub fn ipcArenaBytesFromEnv(env: *const std.process.Environ.Map, arena_cap_bytes: u64, cpus: u32) u64 {
+    return mem_sizing.ipcArenaBytesFromEnv(env, arena_cap_bytes, cpus, layout.DEFAULT_SESSION_OVERHEAD_BYTES);
+}
 
 // ---------------------------------------------------------------------------
 // 4. The hybrid lane gate.
@@ -281,10 +291,61 @@ test "ctl bounds: conn cap = clamp(2 × cap/footprint, 32, 4096); backlog = clam
     try testing.expectEqual(@as(u32, 4096), listenBacklog(4096));
 }
 
-test "the arena family reached through sizing is mem/sizing's: cap budget/8, arena max(64 MiB, cap/population)" {
+test "the arena family reached through sizing is mem/sizing's: cap budget/8, arena max(64 MiB, cap/population); the overhead charged is the default layout's bytes before the arena" {
     const cap = ipcArenaCap(176 * derive.GiB);
     try testing.expectEqual(22 * derive.GiB, cap);
-    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, cap, 32));
+    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, cap, 32, layout.DEFAULT_SESSION_OVERHEAD_BYTES));
     try testing.expectEqual(@as(u64, 256), ipcSessionPopulationTarget(32));
     try testing.expectEqual(@as(u64, 256), ipcPerUidSessionCap(cap, 88 * MiB));
+    try testing.expectEqual(@as(u64, 0x25000), layout.DEFAULT_SESSION_OVERHEAD_BYTES);
+    const l = try layout.SessionLayout.compute(layout.Geometry.default);
+    try testing.expectEqual(l.arena_off, layout.DEFAULT_SESSION_OVERHEAD_BYTES);
+    try testing.expectEqual(l.total_bytes - l.arena_bytes, layout.DEFAULT_SESSION_OVERHEAD_BYTES);
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expectEqual(88 * MiB, ipcArenaBytesFromEnv(&env, cap, 32));
+    try testing.expectEqual(12 * MiB, ipcArenaBytesFromEnv(&env, ipcArenaCap(2 * derive.GiB), 9));
 }
+
+test "the HELLO ladder on a bounded budget admits the population floor: 9 cpus at a 2 GiB budget (the venue's measured shape — 3 sessions before) admit ≥ 2 × cpus sessions with the derived geometry; the field shape still admits ≥ 2 × 32" {
+    const rendezvous = @import("rendezvous.zig");
+    const wire = @import("wire.zig");
+    const Shape = struct { cpus: u32, budget: u64 };
+    for ([_]Shape{ .{ .cpus = 9, .budget = 2 * derive.GiB }, .{ .cpus = 9, .budget = 6144 * MiB }, .{ .cpus = 32, .budget = 176 * derive.GiB }, .{ .cpus = 2, .budget = 2 * derive.GiB + 820 * MiB } }) |shape| {
+        const cap = ipcArenaCap(shape.budget);
+        const arena = resolveIpcArenaBytes(null, cap, shape.cpus, layout.DEFAULT_SESSION_OVERHEAD_BYTES);
+        var geometry = layout.Geometry.default;
+        geometry.arena_bytes = arena;
+        geometry.max_op_bytes = @intCast(@min(layout.DEFAULT_MAX_OP_BYTES, arena));
+        var p: rendezvous.Policy = .{ .armed = true, .our_commit = "0123456789ab", .default_geometry = geometry, .arena_cap_bytes = cap, .per_uid_session_cap = ipcPerUidSessionCap(cap, arena) };
+        const nonces = rendezvous.NonceState.init(&testNonceFill, 0);
+        var h: wire.Hello = .{};
+        try wire.setField(&h.build_commit, "0123456789ab");
+        h.nonce = nonces.current;
+        const facts: rendezvous.FdFacts = .{ .flags = .{ .accmode = .rdwr }, .stat = .{ .kind = .regular, .dev = 77, .ino = 1234, .nlink = 1 } };
+        const peer: rendezvous.PeerCred = .{ .pid = 1, .uid = 1000, .gid = 1000 };
+        var admitted: u64 = 0;
+        while (admitted < 4096) {
+            switch (rendezvous.admitHello(p, &h, facts, 77, peer, &nonces)) {
+                .admit => |a| {
+                    try testing.expectEqual(arena, a.geometry.arena_bytes);
+                    p.arena_in_use_bytes += a.footprint_bytes;
+                    p.uid_sessions += 1;
+                    admitted += 1;
+                },
+                .refuse => |class| {
+                    try testing.expectEqual(wire.RefuseClass.budget, class);
+                    break;
+                },
+            }
+        }
+        try testing.expect(admitted >= ipcSessionPopulationFloor(shape.cpus));
+        try testing.expectEqual(ipcAdmittedPopulation(cap, arena + layout.DEFAULT_SESSION_OVERHEAD_BYTES), admitted);
+    }
+}
+
+fn testNonceFill(n: *rendezvous_mod.Nonce) void {
+    for (n, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+}
+
+const rendezvous_mod = @import("rendezvous.zig");

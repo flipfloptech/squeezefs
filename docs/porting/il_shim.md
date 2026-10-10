@@ -189,7 +189,7 @@ refcount decrement, unbind on last ref — never a bare pointer clear (`R:fd_tab
 The common empty case is one segment load + one slot load + branch. `signalfd4` is listed in
 the design table (`R:docs/design-preload-interception.md:151`) but not interposed.
 
-### 1.12 libaio: `io_setup`, `io_destroy`, `io_submit`, `io_getevents`, `io_pgetevents`, `io_cancel` — §6.
+### 1.12 libaio: `io_setup`, `io_destroy`, `io_submit`, `io_getevents`, `io_pgetevents`, `io_cancel` — §6; plus libaio's queue face `io_queue_init`, `io_queue_release`, `io_queue_run`, `io_queue_wait` (§6.9; the port's addition — the reference's 59 did not include it).
 
 ### 1.13 NOT interposed (kernel FUSE serves them; the fallback IS the design)
 
@@ -695,6 +695,31 @@ Device-true fio libaio jobs=16 qd=32 median **633,183 IOPS**, beating `-t 256` s
 1/16th the client threads (`R:docs/design-preload-interception.md:439, 569`). Reap park max 24 →
 2 → 24 history and the 1×qd8 75.5 k → 344.8 k IOPS sleep-vs-event-park decomposition
 (`R:interpose.rs:2701-2730, 2793-2805`).
+
+### 6.9 libaio's queue face (the port's addition; rung-9 finding F3)
+
+libaio binds its INTERNAL calls locally — Ubuntu links it `-Bsymbolic-functions`, and
+`objdump -R libaio.so.1` shows no `io_*` relocation — so `io_queue_init` reaches libaio's own
+`io_setup`, never the shim's: fio's libaio engine (`io_queue_init(iodepth, &ctx)`) created a
+context the registry never learned and every `io_submit` on it was an uncounted passthrough
+(`LD_DEBUG=bindings` showed `io_submit`/`io_getevents` bound to the shim while `ipc_ops_*`
+stayed 0). The port interposes the four symbols at their exported default versions
+(`io_queue_init@LIBAIO_0.1`, `io_queue_release@LIBAIO_0.1`, `io_queue_run@LIBAIO_0.1`,
+`io_queue_wait@LIBAIO_0.4`) with libaio's OWN bodies over the shim's wrappers — never the real
+symbols: `io_queue_init` = `maxevents ≤ 0 ⇒ −EINVAL; *ctxp = 0; io_setup`; `io_queue_release`
+= `io_destroy`; `io_queue_run` = `while io_getevents(ctx, 0, 1, &ev, &{0,0}) == 1:
+((io_callback_t)ev.data)(ctx, ev.obj, ev.res, ev.res2)` (a zero cookie is skipped — libaio
+would jump to 0); `io_queue_wait` = `io_getevents(ctx, 0, 0, NULL, timeout)`. The export
+table is 65 interpositions + the API.
+
+An unregistered context (past the 256-slot registry, or created by a path no interposition
+saw — a static libaio, a raw `io_setup`) is a COUNTED passthrough: `io_submit` attributes
+every iocb on a bound fd to its binding's session page (`aio_unknown_ctx_op`, row 21 —
+folded into the daemon's `ipc_client_aio_unknown_ctx_ops` at session teardown, the
+engagement law's missing term), `io_getevents`/`io_cancel` count per call
+(`aio_unknown_ctx_call`, row 22). Measured on the venue (fio 3.36 libaio QD32 × 4, rand 4 KiB
+reads, file and nvmet-loop substrates): `Δipc_ops_read 194,299 ≡ fio ops 194,299` and
+`166,973 ≡ 166,973`, `ipc_client_aio_unknown_ctx_ops 0`.
 
 ## 7. Linked mode (SDK Tier 1, `R:docs/design-sdk.md:95-108`)
 

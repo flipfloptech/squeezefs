@@ -14,8 +14,15 @@ const MiB = derive.MiB;
 const GiB = derive.GiB;
 
 /// Shipped per-session IPC arena, the derived default's floor
-/// (never-regress-below-shipped: every box ran 64 MiB sessions).
+/// (never-regress-below-shipped: every box ran 64 MiB sessions) — on a
+/// budget whose cap holds the population floor at it; a bounded budget's
+/// arena yields to the floor (`resolveIpcArenaBytes`).
 pub const ipc_arena_floor_bytes: u64 = 64 * MiB;
+/// The shim's/SDK's sessions per (process, mount) floor: the single-
+/// dequeue-thread plateau of the 2026-07-19 service sweep (`ipc/sizing.
+/// ilSessionsDefault`'s clamp floor). ONE constant: the population floor
+/// below is "one client process per CPU at this many sessions".
+pub const il_sessions_per_mount_floor: u64 = 2;
 /// Slot-slab DMA law: 1024 slots × the 4 KiB O_DIRECT LBA. An odd 2 MiB
 /// multiple makes the slab ≡ 2048 mod 4096, so EXACTLY half of all
 /// round-robin direct-drive reads bounce (measured −15.4 %, bounce rate
@@ -81,14 +88,42 @@ pub fn ipcSessionPopulationTarget(cpus: u32) u64 {
     return @max(128, @as(u64, cpus) * exa_canon_qd);
 }
 
+/// The session population the admission cap must hold WHATEVER the budget:
+/// one client process per CPU at the per-mount session floor — the box
+/// run's 32 processes × 2 sessions. A cap that holds fewer refuses the
+/// matched-inflight fleet at its first over-budget client (measured on the
+/// venue: a 2 GiB budget ⇒ cap 256 MiB ⇒ three 64 MiB sessions; fio's
+/// second process was refused "session budget exhausted (class 5)" and
+/// kernel-served, engagement 72 %, the row INVALID — decision 0003 §H).
+pub fn ipcSessionPopulationFloor(cpus: u32) u64 {
+    return il_sessions_per_mount_floor * @as(u64, @max(cpus, 1));
+}
+
 /// Per-session arena: `SQUEEZEFS_IPC_ARENA_MB` (verbatim MiB; the row's
-/// range starts at 1) else `max(64 MiB, align_down(cap /
-/// population_target(cpus), 4 MiB))` — so a full population of default
-/// arenas fills the admission cap exactly.
-pub fn resolveIpcArenaBytes(arena_mib: ?u64, arena_cap_bytes: u64, cpus: u32) u64 {
+/// range starts at 1) else the charter's `max(64 MiB, align_down(cap /
+/// population_target(cpus), 4 MiB))` — a full population of default arenas
+/// fills the admission cap exactly — which YIELDS to the population floor
+/// when the cap cannot hold `population_floor(cpus)` sessions of it: then
+/// the arena is the largest 4 MiB-aligned size at which the floor's
+/// sessions (arena + `session_overhead_bytes` each: the memfd's header,
+/// ring, slots and stats page before the arena) fit, never below one
+/// DMA-align grain (4 MiB = 1024 slots × the 4 KiB O_DIRECT LBA, the
+/// smallest arena whose every slot is a page).
+pub fn resolveIpcArenaBytes(arena_mib: ?u64, arena_cap_bytes: u64, cpus: u32, session_overhead_bytes: u64) u64 {
     if (arena_mib) |mib| return mib *| MiB;
     const derived = derive.alignDown(arena_cap_bytes / ipcSessionPopulationTarget(cpus), ipc_arena_dma_align_bytes);
-    return @max(ipc_arena_floor_bytes, derived);
+    const charter = @max(ipc_arena_floor_bytes, derived);
+    const floor = ipcSessionPopulationFloor(cpus);
+    if (ipcAdmittedPopulation(arena_cap_bytes, charter + session_overhead_bytes) >= floor) return charter;
+    const per_session = arena_cap_bytes / floor;
+    return @max(ipc_arena_dma_align_bytes, derive.alignDown(per_session -| session_overhead_bytes, ipc_arena_dma_align_bytes));
+}
+
+/// Sessions the admission cap holds at one session footprint
+/// (`cap / footprint`): the census the arm line prints and the population
+/// floor is judged on.
+pub fn ipcAdmittedPopulation(arena_cap_bytes: u64, footprint_bytes: u64) u64 {
+    return arena_cap_bytes / @max(footprint_bytes, 1);
 }
 
 /// Per-uid concurrent session cap = `clamp(cap / max(arena, 1), 64, 4096)`:
@@ -134,8 +169,8 @@ pub fn ipcArenaCapFromEnv(env: *const std.process.Environ.Map, budget: u64) u64 
     return resolveIpcArenaCap(budget, knobs.optIntKnob("SQUEEZEFS_IPC_MEM_MAX", u64, env), knobs.optIntKnob("SQUEEZEFS_IPC_MEM_PCT", u64, env));
 }
 
-pub fn ipcArenaBytesFromEnv(env: *const std.process.Environ.Map, arena_cap_bytes: u64, cpus: u32) u64 {
-    return resolveIpcArenaBytes(knobs.optIntKnob("SQUEEZEFS_IPC_ARENA_MB", u64, env), arena_cap_bytes, cpus);
+pub fn ipcArenaBytesFromEnv(env: *const std.process.Environ.Map, arena_cap_bytes: u64, cpus: u32, session_overhead_bytes: u64) u64 {
+    return resolveIpcArenaBytes(knobs.optIntKnob("SQUEEZEFS_IPC_ARENA_MB", u64, env), arena_cap_bytes, cpus, session_overhead_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,36 +241,101 @@ test "ipc_session_population_target = max(128, cpus × EXA_CANON_QD)" {
     try testing.expectEqual(@as(u64, 1536), ipcSessionPopulationTarget(192));
 }
 
-test "ipc arena default = max(64 MiB, align_down(cap / population_target(cpus), 4 MiB)); env verbatim" {
+/// The default session geometry's bytes before the arena (header + ring +
+/// slots + stats page = 0x25000; `ipc/layout.zig` pins the figure).
+const session_overhead: u64 = 0x25000;
+
+test "ipc arena default = max(64 MiB, align_down(cap / population_target(cpus), 4 MiB)) where the cap holds the population floor at it; env verbatim" {
     const cap = ipcArenaCap(field_budget);
-    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, cap, 32));
-    try testing.expectEqual(176 * MiB, resolveIpcArenaBytes(null, cap, 8));
-    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(null, ipcArenaCap(floor_budget), 2));
-    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(null, cap, 512));
-    try testing.expectEqual(128 * MiB, resolveIpcArenaBytes(null, 129 * 128 * MiB, 8));
-    try testing.expectEqual(128 * MiB, resolveIpcArenaBytes(null, 129 * 256 * MiB, 32));
+    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, cap, 32, session_overhead));
+    try testing.expectEqual(176 * MiB, resolveIpcArenaBytes(null, cap, 8, session_overhead));
+    // 512 cpus on the field budget: the charter's 64 MiB floor holds 351
+    // sessions, under the 1024-session population floor ⇒ 22 GiB / 1024 =
+    // 22 MiB per session, 20 MiB of arena after the overhead.
+    try testing.expectEqual(20 * MiB, resolveIpcArenaBytes(null, cap, 512, session_overhead));
+    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(null, cap, 128, session_overhead));
+    try testing.expectEqual(128 * MiB, resolveIpcArenaBytes(null, 129 * 128 * MiB, 8, session_overhead));
+    try testing.expectEqual(128 * MiB, resolveIpcArenaBytes(null, 129 * 256 * MiB, 32, session_overhead));
     // The bounce shape: cap/population = 90 MiB (an odd 2 MiB multiple) rounds down to 88 MiB.
-    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, 90 * 128 * MiB, 8));
-    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, 90 * 256 * MiB, 32));
+    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, 90 * 128 * MiB, 8, session_overhead));
+    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, 90 * 256 * MiB, 32, session_overhead));
     for ([_]u64{ 1, 300, 8192, 11_520, 22_528, 90 * 128, 129 * 128 }) |cap_mib| {
         for ([_]u32{ 1, 2, 8, 16, 32, 64, 192, 512 }) |cpus| {
-            try testing.expectEqual(@as(u64, 0), resolveIpcArenaBytes(null, cap_mib * MiB, cpus) % ipc_arena_dma_align_bytes);
+            try testing.expectEqual(@as(u64, 0), resolveIpcArenaBytes(null, cap_mib * MiB, cpus, session_overhead) % ipc_arena_dma_align_bytes);
         }
     }
-    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(64, 22 * GiB, 32));
-    try testing.expectEqual(80 * MiB, resolveIpcArenaBytes(80, 22 * GiB, 32));
-    try testing.expectEqual(90 * MiB, resolveIpcArenaBytes(90, 22 * GiB, 32));
+    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(64, 22 * GiB, 32, session_overhead));
+    try testing.expectEqual(80 * MiB, resolveIpcArenaBytes(80, 22 * GiB, 32, session_overhead));
+    try testing.expectEqual(90 * MiB, resolveIpcArenaBytes(90, 22 * GiB, 32, session_overhead));
+    // Explicit wins even where the derived arena would yield to the floor.
+    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(64, 256 * MiB, 9, session_overhead));
     // 0 never reaches here: the row's range starts at 1 and the gate refuses it.
     try testing.expectEqual(@as(i128, 1), knobs.row("SQUEEZEFS_IPC_ARENA_MB").kind.int.lo);
 }
 
+test "ipc_session_population_floor = 2 × cpus (one client process per CPU at the per-mount session floor)" {
+    try testing.expectEqual(@as(u64, 2), il_sessions_per_mount_floor);
+    try testing.expectEqual(@as(u64, 64), ipcSessionPopulationFloor(32));
+    try testing.expectEqual(@as(u64, 18), ipcSessionPopulationFloor(9));
+    try testing.expectEqual(@as(u64, 2), ipcSessionPopulationFloor(1));
+    try testing.expectEqual(@as(u64, 2), ipcSessionPopulationFloor(0));
+    var c: u32 = 1;
+    while (c <= 4096) : (c += 1) try testing.expectEqual(il_sessions_per_mount_floor * c, ipcSessionPopulationFloor(c));
+}
+
+test "the arena yields to the population floor on a bounded budget: the largest 4 MiB-aligned arena at which 2 × cpus sessions (arena + overhead each) fit the cap, never below the 4 MiB DMA grain; the charter's arena where the cap holds the floor" {
+    // The venue's measured shape: 9 cpus, SQUEEZEFS_MEM_BUDGET_MB=2048 ⇒
+    // cap 256 MiB; 64 MiB sessions ⇒ 3 admitted (F4). Now 12 MiB ⇒ 21.
+    const venue_cap = ipcArenaCap(2 * GiB);
+    try testing.expectEqual(256 * MiB, venue_cap);
+    const venue_arena = resolveIpcArenaBytes(null, venue_cap, 9, session_overhead);
+    try testing.expectEqual(12 * MiB, venue_arena);
+    try testing.expectEqual(@as(u64, 3), ipcAdmittedPopulation(venue_cap, 64 * MiB + session_overhead));
+    try testing.expectEqual(@as(u64, 21), ipcAdmittedPopulation(venue_cap, venue_arena + session_overhead));
+    try testing.expect(ipcAdmittedPopulation(venue_cap, venue_arena + session_overhead) >= ipcSessionPopulationFloor(9));
+    // The harness's default budget (6144 MiB): cap 768 MiB ⇒ 40 MiB arenas, 19 sessions ≥ 18.
+    const default_cap = ipcArenaCap(6144 * MiB);
+    const default_arena = resolveIpcArenaBytes(null, default_cap, 9, session_overhead);
+    try testing.expectEqual(40 * MiB, default_arena);
+    try testing.expect(ipcAdmittedPopulation(default_cap, default_arena + session_overhead) >= ipcSessionPopulationFloor(9));
+    // The floor shape (4 GiB RAM, 2 cpus): cap ≈ 358 MiB holds 5 × 64 MiB ≥ the floor's 4 ⇒ the charter's arena stands.
+    const floor_cap = ipcArenaCap(floor_budget);
+    try testing.expectEqual(64 * MiB, resolveIpcArenaBytes(null, floor_cap, 2, session_overhead));
+    try testing.expect(ipcAdmittedPopulation(floor_cap, 64 * MiB + session_overhead) >= ipcSessionPopulationFloor(2));
+    // The grain: a cap too small for the floor even at 4 MiB arenas stays at 4 MiB (loud at arm, never 0).
+    try testing.expectEqual(4 * MiB, resolveIpcArenaBytes(null, 8 * MiB, 64, session_overhead));
+    try testing.expectEqual(ipc_arena_dma_align_bytes, 4 * MiB);
+    // The field shape is untouched: 22 GiB / 88 MiB sessions = 255 ≥ 64.
+    const cap = ipcArenaCap(field_budget);
+    try testing.expectEqual(88 * MiB, resolveIpcArenaBytes(null, cap, 32, session_overhead));
+    try testing.expect(ipcAdmittedPopulation(cap, 88 * MiB + session_overhead) >= ipcSessionPopulationFloor(32));
+    // The law restated over a sweep: wherever the cap holds the floor at the
+    // charter's arena the answer IS the charter's; elsewhere the floor's
+    // sessions fit (or the grain binds) and the arena is 4 MiB-aligned.
+    for ([_]u64{ 8, 64, 256, 360, 768, 2048, 8192, 22_528 }) |cap_mib| {
+        for ([_]u32{ 1, 2, 9, 16, 32, 64, 192 }) |cpus| {
+            const c = cap_mib * MiB;
+            const got = resolveIpcArenaBytes(null, c, cpus, session_overhead);
+            const charter = @max(ipc_arena_floor_bytes, derive.alignDown(c / ipcSessionPopulationTarget(cpus), ipc_arena_dma_align_bytes));
+            const floor = ipcSessionPopulationFloor(cpus);
+            if (ipcAdmittedPopulation(c, charter + session_overhead) >= floor) {
+                try testing.expectEqual(charter, got);
+            } else {
+                try testing.expect(got < charter);
+                try testing.expect(got == ipc_arena_dma_align_bytes or ipcAdmittedPopulation(c, got + session_overhead) >= floor);
+                try testing.expectEqual(@as(u64, 0), got % ipc_arena_dma_align_bytes);
+            }
+        }
+    }
+}
+
 test "ipc per-uid session cap = clamp(cap / max(arena, 1), 64, 4096); monotone non-increasing in arena" {
     const cap = ipcArenaCap(field_budget);
-    try testing.expectEqual(@as(u64, 256), ipcPerUidSessionCap(cap, resolveIpcArenaBytes(null, cap, 32)));
-    try testing.expectEqual(@as(u64, 128), ipcPerUidSessionCap(cap, resolveIpcArenaBytes(null, cap, 8)));
-    try testing.expectEqual(@as(u64, 130), ipcPerUidSessionCap(90 * 128 * MiB, resolveIpcArenaBytes(null, 90 * 128 * MiB, 8)));
+    try testing.expectEqual(@as(u64, 256), ipcPerUidSessionCap(cap, resolveIpcArenaBytes(null, cap, 32, session_overhead)));
+    try testing.expectEqual(@as(u64, 128), ipcPerUidSessionCap(cap, resolveIpcArenaBytes(null, cap, 8, session_overhead)));
+    try testing.expectEqual(@as(u64, 130), ipcPerUidSessionCap(90 * 128 * MiB, resolveIpcArenaBytes(null, 90 * 128 * MiB, 8, session_overhead)));
     const floor_cap = ipcArenaCap(floor_budget);
-    try testing.expectEqual(@as(u64, 64), ipcPerUidSessionCap(floor_cap, resolveIpcArenaBytes(null, floor_cap, 2)));
+    try testing.expectEqual(@as(u64, 64), ipcPerUidSessionCap(floor_cap, resolveIpcArenaBytes(null, floor_cap, 2, session_overhead)));
     try testing.expectEqual(@as(u64, 4096), ipcPerUidSessionCap(std.math.maxInt(u64), 64 * MiB));
     try testing.expectEqual(@as(u64, 4096), ipcPerUidSessionCap(1024 * GiB, MiB));
     try testing.expectEqual(@as(u64, 4096), ipcPerUidSessionCap(100 * MiB, 0));
@@ -270,7 +370,7 @@ test "knob faces: transport/ipc caps and the ipc arena read their rows through t
     defer env.deinit();
     try testing.expectEqual(GiB, transportBufferCapFromEnv(&env, 8 * GiB));
     try testing.expectEqual(GiB, ipcArenaCapFromEnv(&env, 8 * GiB));
-    try testing.expectEqual(88 * MiB, ipcArenaBytesFromEnv(&env, 22 * GiB, 32));
+    try testing.expectEqual(88 * MiB, ipcArenaBytesFromEnv(&env, 22 * GiB, 32, session_overhead));
     try env.put("SQUEEZEFS_TRANSPORT_MEM_PCT", "50");
     try env.put("SQUEEZEFS_IPC_MEM_MAX", "2048");
     try env.put("SQUEEZEFS_IPC_MEM_PCT", "50");
@@ -279,5 +379,5 @@ test "knob faces: transport/ipc caps and the ipc arena read their rows through t
     try env.put("SQUEEZEFS_TRANSPORT_MEM_MAX", "2048");
     try testing.expectEqual(2 * GiB, transportBufferCapFromEnv(&env, 8 * GiB));
     try testing.expectEqual(2 * GiB, ipcArenaCapFromEnv(&env, 8 * GiB));
-    try testing.expectEqual(80 * MiB, ipcArenaBytesFromEnv(&env, 22 * GiB, 32));
+    try testing.expectEqual(80 * MiB, ipcArenaBytesFromEnv(&env, 22 * GiB, 32, session_overhead));
 }

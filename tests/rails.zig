@@ -933,3 +933,283 @@ test "the allowlist parser: a row, a comment, a blank, a malformed row and a rea
     try std.testing.expect(std.mem.indexOf(u8, v.written(), "not path:line") != null);
     try std.testing.expect(std.mem.indexOf(u8, v.written(), "needs a reason") != null);
 }
+
+// ---------------------------------------------------------------------------
+// The bracket ledger rails (charter §11 "Measurement law";
+// `docs/evidence/rung-09-brackets.md` §6): `scripts/bracket/brk.py` names
+// the `.stats` keys the harness's ledgers read — a second registry of
+// counter names — and `src/cli/bench.zig` carries the same term lists.
+// Two rails: (1) bench's lists EQUAL brk.py's, so the two ledgers cannot
+// drift apart silently; (2) every name in `brk.ALL_COUNTERS` is a key the
+// product's `.stats` can emit (an instrument declared in product scope, or
+// a key a hand-written family writer prints), so a renamed counter is a
+// red gate, not an `absent_keys` entry in a record.
+// ---------------------------------------------------------------------------
+
+const bench = squeezefs.cli.bench;
+const brk_path = "scripts/bracket/brk.py";
+
+/// The quoted names of the Python list `NAME = [ ... ]` in `text`
+/// (brackets never nest in brk.py's term lists; the names carry no escapes).
+fn pyListNames(gpa: std.mem.Allocator, text: []const u8, name: []const u8) ![][]const u8 {
+    var needle_buf: [128]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&needle_buf, "\n{s} = [", .{name});
+    const start = std.mem.indexOf(u8, text, needle) orelse return error.PyListNotFound;
+    const body_start = start + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, text, body_start, ']') orelse return error.PyListUnterminated;
+    return pyQuotedNames(gpa, text[body_start..end]);
+}
+
+fn pyQuotedNames(gpa: std.mem.Allocator, body: []const u8) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, body, i, '"')) |open| {
+        const close = std.mem.indexOfScalarPos(u8, body, open + 1, '"') orelse return error.PyStringUnterminated;
+        try out.append(gpa, body[open + 1 .. close]);
+        i = close + 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The list names `ALL_COUNTERS = (A + B + …)` sums, in order.
+fn pyAllCountersLists(gpa: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    const needle = "\nALL_COUNTERS = (";
+    const start = (std.mem.indexOf(u8, text, needle) orelse return error.PyListNotFound) + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, text, start, ')') orelse return error.PyListUnterminated;
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, text[start..end], "+ \n\t");
+    while (it.next()) |tok| try out.append(gpa, tok);
+    return out.toOwnedSlice(gpa);
+}
+
+fn expectSameNames(gpa: std.mem.Allocator, label: []const u8, ours: []const []const u8, theirs: []const []const u8, violations: *std.Io.Writer) !void {
+    _ = gpa;
+    for (ours) |o| {
+        var found = false;
+        for (theirs) |t| found = found or std.mem.eql(u8, o, t);
+        if (!found) try violations.print("  {s}: bench.zig names \"{s}\", brk.py does not\n", .{ label, o });
+    }
+    for (theirs) |t| {
+        var found = false;
+        for (ours) |o| found = found or std.mem.eql(u8, o, t);
+        if (!found) try violations.print("  {s}: brk.py names \"{s}\", bench.zig does not\n", .{ label, t });
+    }
+}
+
+test "bracket ledger pin: bench.zig's device-write, request, admission and read-copy term lists equal brk.py's (the harness's lists were checked against /proc/diskstats; bench follows them)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, brk_path, gpa, .limited(1 << 20));
+    defer gpa.free(text);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    const Pin = struct { label: []const u8, ours: []const []const u8 };
+    const pins = [_]Pin{
+        .{ .label = "DEVICE_WRITE_ARMS", .ours = &bench.StatsTerms.device_write_keys },
+        .{ .label = "DEVICE_WRITE_REQS", .ours = &bench.StatsTerms.device_write_req_keys },
+        .{ .label = "ADMISSION_ARMS", .ours = &bench.StatsTerms.admission_keys },
+        .{ .label = "READ_COPY_ARMS", .ours = &bench.StatsTerms.read_copy_keys },
+    };
+    for (pins) |p| {
+        const theirs = try pyListNames(gpa, text, p.label);
+        defer gpa.free(theirs);
+        try std.testing.expect(theirs.len >= 3);
+        try expectSameNames(gpa, p.label, p.ours, theirs, &violations.writer);
+    }
+    // The rewrite epoch's gauge and the dest-lease gauge are BESIDE in both.
+    const beside_w = try pyListNames(gpa, text, "DEVICE_WRITE_BESIDE");
+    defer gpa.free(beside_w);
+    const beside_r = try pyListNames(gpa, text, "READ_COPY_BESIDE");
+    defer gpa.free(beside_r);
+    var rewrite_beside = false;
+    for (beside_w) |n| rewrite_beside = rewrite_beside or std.mem.eql(u8, n, "rewrite_device_write_bytes");
+    var lease_beside = false;
+    for (beside_r) |n| lease_beside = lease_beside or std.mem.eql(u8, n, "read_dest_lease_bytes");
+    try std.testing.expect(rewrite_beside and lease_beside);
+    for (bench.StatsTerms.device_write_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "rewrite_device_write_bytes"));
+    for (bench.StatsTerms.read_copy_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "read_dest_lease_bytes"));
+    if (violations.written().len != 0) {
+        std.debug.print("bracket ledger pin violation(s):\n{s}", .{violations.written()});
+        return error.BracketLedgerDrift;
+    }
+}
+
+/// The `.stats` keys a product file can emit: every instrument declared in
+/// product scope (`name: counters.<Type>`), every tripwire site and every
+/// hand-written JSON key (a product-scope string literal equal to the name,
+/// or carrying `"name":` as a format string does). Test blocks are skipped.
+fn collectStatsKeys(gpa: std.mem.Allocator, text: [:0]const u8, keys: *std.StringHashMapUnmanaged(void)) !void {
+    var tok = std.zig.Tokenizer.init(text);
+    var depth: usize = 0;
+    var test_depth: ?usize = null;
+    var pending_test = false;
+    var prev: [3]std.zig.Token.Tag = .{ .invalid, .invalid, .invalid };
+    var prev_text: [3][]const u8 = .{ "", "", "" };
+    // The identifier before `: counters.<Type>` is the instrument's name.
+    var ident_before_colon: []const u8 = "";
+    // A string inside a builtin call (`@offsetOf(T, "field")`, `@field`,
+    // `@hasDecl`) names a Zig member, never a JSON key.
+    var paren_depth: usize = 0;
+    var builtin_paren: ?usize = null;
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) break;
+        const word = text[t.loc.start..t.loc.end];
+        switch (t.tag) {
+            .keyword_test => pending_test = true,
+            .l_brace => {
+                depth += 1;
+                if (pending_test) {
+                    test_depth = depth;
+                    pending_test = false;
+                }
+            },
+            .r_brace => {
+                if (test_depth) |d| if (d == depth) {
+                    test_depth = null;
+                };
+                depth -|= 1;
+            },
+            .l_paren => {
+                paren_depth += 1;
+                if (prev[2] == .builtin and builtin_paren == null) builtin_paren = paren_depth;
+            },
+            .r_paren => {
+                if (builtin_paren) |b| if (b == paren_depth) {
+                    builtin_paren = null;
+                };
+                paren_depth -|= 1;
+            },
+            .identifier => if (test_depth == null) {
+                if (prev[0] == .colon and prev[1] == .identifier and std.mem.eql(u8, prev_text[1], "counters") and prev[2] == .period) {
+                    for (instrument_types) |ty| if (std.mem.eql(u8, word, ty)) try putKey(gpa, keys, ident_before_colon);
+                }
+            },
+            .colon => if (prev[2] == .identifier) {
+                ident_before_colon = prev_text[2];
+            },
+            .string_literal => if (test_depth == null and builtin_paren == null) {
+                const lit = word[1 .. word.len - 1];
+                if (std.mem.indexOfScalar(u8, lit, '\\') == null) {
+                    if (lit.len != 0) try putKey(gpa, keys, lit);
+                } else {
+                    // A format string: every `\"key\":` inside it.
+                    var i: usize = 0;
+                    while (std.mem.indexOfPos(u8, lit, i, "\\\"")) |open| {
+                        const close = std.mem.indexOfPos(u8, lit, open + 2, "\\\"") orelse break;
+                        const key = lit[open + 2 .. close];
+                        i = close + 2;
+                        if (i < lit.len and lit[i] == ':' and key.len != 0) try putKey(gpa, keys, key);
+                    }
+                }
+            },
+            else => {},
+        }
+        prev[0] = prev[1];
+        prev[1] = prev[2];
+        prev[2] = t.tag;
+        prev_text[0] = prev_text[1];
+        prev_text[1] = prev_text[2];
+        prev_text[2] = word;
+    }
+}
+
+/// Owns one copy of each key (a repeat is not re-duplicated).
+fn putKey(gpa: std.mem.Allocator, keys: *std.StringHashMapUnmanaged(void), key: []const u8) !void {
+    const gop = try keys.getOrPut(gpa, key);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try gpa.dupe(u8, key);
+        gop.value_ptr.* = {};
+    }
+}
+
+fn freeKeys(gpa: std.mem.Allocator, keys: *std.StringHashMapUnmanaged(void)) void {
+    var it = keys.keyIterator();
+    while (it.next()) |k| gpa.free(k.*);
+    keys.deinit(gpa);
+}
+
+test "stats name census: every name in brk.py's ALL_COUNTERS is a `.stats` key the product emits (an instrument declared in product scope or a key a family writer prints) — a renamed counter is a red gate, not an absent_keys entry" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const text = try cwd.readFileAlloc(io, brk_path, gpa, .limited(1 << 20));
+    defer gpa.free(text);
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    {
+        var d = try cwd.openDir(io, "src", .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, "src", &files);
+    }
+    try std.testing.expect(files.items.len >= min_files);
+    var keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer freeKeys(gpa, &keys);
+    for (files.items) |path| {
+        const src = try readWalked(gpa, io, cwd, path) orelse continue;
+        defer gpa.free(src);
+        try collectStatsKeys(gpa, src, &keys);
+    }
+    // The census must have found the known population.
+    try std.testing.expect(keys.contains("fuse_ops") and keys.contains("transport_ring_requests") and keys.contains("ipc_ops_read"));
+    const lists = try pyAllCountersLists(gpa, text);
+    defer gpa.free(lists);
+    try std.testing.expect(lists.len >= 10);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var checked: usize = 0;
+    for (lists) |list| {
+        const names = try pyListNames(gpa, text, list);
+        defer gpa.free(names);
+        for (names) |n| {
+            checked += 1;
+            if (!keys.contains(n)) try violations.writer.print("  {s} ({s}): \"{s}\" is not a `.stats` key any product file emits\n", .{ brk_path, list, n });
+        }
+    }
+    try std.testing.expect(checked >= 100);
+    if (violations.written().len != 0) {
+        std.debug.print("stats name census: {d} brk.py names checked against {d} product keys:\n{s}", .{ checked, keys.count(), violations.written() });
+        return error.StatsNameUnknown;
+    }
+}
+
+test "the stats key scanner: a declared instrument, a tripwire site, a format-string key and a key list count; a test-block declaration and a doc sentence do not" {
+    const gpa = std.testing.allocator;
+    var keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer freeKeys(gpa, &keys);
+    try collectStatsKeys(gpa,
+        \\pub var hits: counters.ShardedCounter = .{};
+        \\const S = struct { depth: counters.Gauge = .{} };
+        \\pub var tw: counters.Tripwire = .init("open_count_stranded");
+        \\fn w(x: *Writer) !void { try x.print("{{\"fuse_ops\":{d},\"volume_failed\":{}}}", .{ 1, true }); }
+        \\const names = .{ "get_obj", "put_obj" };
+        \\comptime { assert(@offsetOf(Page, "page_field") == 0); }
+        \\test "t" { var g: counters.Gauge = .{}; _ = &g; _ = "in_a_test"; }
+    , &keys);
+    try std.testing.expect(keys.contains("hits"));
+    try std.testing.expect(keys.contains("depth"));
+    try std.testing.expect(keys.contains("open_count_stranded"));
+    try std.testing.expect(keys.contains("fuse_ops"));
+    try std.testing.expect(keys.contains("volume_failed"));
+    try std.testing.expect(keys.contains("get_obj") and keys.contains("put_obj"));
+    try std.testing.expect(!keys.contains("g"));
+    try std.testing.expect(!keys.contains("in_a_test"));
+    try std.testing.expect(!keys.contains("x") and !keys.contains("names"));
+    try std.testing.expect(!keys.contains("page_field"));
+    // The python list parsers.
+    const py = "\nFOO = [\"a\", \"b\",\n       \"c\"]\nBAR = [\"d\"]\nALL_COUNTERS = (FOO + BAR\n                + FOO)\n";
+    const foo = try pyListNames(gpa, py, "FOO");
+    defer gpa.free(foo);
+    try std.testing.expectEqual(@as(usize, 3), foo.len);
+    try std.testing.expectEqualStrings("c", foo[2]);
+    const lists = try pyAllCountersLists(gpa, py);
+    defer gpa.free(lists);
+    try std.testing.expectEqual(@as(usize, 3), lists.len);
+    try std.testing.expectEqualStrings("BAR", lists[1]);
+    try std.testing.expectError(error.PyListNotFound, pyListNames(gpa, py, "NOPE"));
+}

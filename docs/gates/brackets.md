@@ -37,10 +37,18 @@ record, and a hand-typed number is not a result.
    moved.
 7. **Engagement**: the mechanism under test must account for the row's ops —
    kernel-FUSE rows by `Δtransport_ring_requests ≥ ops` (direct) / `> 0`
-   (buffered); shim rows by `Δ(ipc_ops_read + ipc_ops_write) + lane-gate routes ≥ ops`
+   (buffered; `fuse_ops` is only the handler-lane share: a zero-copy
+   session's direct-leg reads are served at the delivery CQE and never reach a
+   lane); shim rows by `Δ(ipc_ops_read + ipc_ops_write) + lane-gate routes ≥ ops`
    (an op above the hybrid lane gate routes to kernel FUSE by design and is
-   judged on the kernel lane). A row that fails is **INVALID** and stays in the
-   record with its reason; it is never a number.
+   judged on the kernel lane). The shim rows run fio's **libaio** engine — the
+   box's instrument shape — through the shim's `io_queue_init` interposition
+   (the first scoping day ran them psync because libaio's queue face bypassed
+   the shim: rung-9 finding F3); the verdict's detail prints the daemon's
+   admission refusals (a refused client process is kernel-served for its
+   backoff window) and `ipc_client_aio_unknown_ctx_ops` (iocbs on a context
+   the shim never registered) so a deficit names its cause. A row that fails
+   is **INVALID** and stays in the record with its reason; it is never a number.
 8. **Noise floor first**: before any A ≠ B bracket, run the row with
    A = B = the candidate; the spread over the four legs is the venue's noise
    band for that row and is recorded with the row. A difference inside the

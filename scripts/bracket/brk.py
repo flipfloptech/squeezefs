@@ -89,18 +89,22 @@ MUST_STAY_0 = ["invariant_tripwires", "tripwire_sites_overflow", "meta_io_unalig
 IPC = ["ipc_ops_read", "ipc_ops_write", "ipc_bytes_in", "ipc_bytes_out", "ipc_sessions_total",
        "ipc_lane_gate_kernel_routes", "ipc_lane_gate_kernel_bytes", "ipc_fast_path_serves",
        "ipc_read_handoffs", "ipc_dd_inline_serves", "ipc_write_handoffs", "ipc_binds_dev_override",
-       "ipc_admission_refusals", "ipc_bind_refused_budget", "ipc_shed_refusals", "ipc_binds"]
+       "ipc_admission_refusals", "ipc_bind_refused_budget", "ipc_shed_refusals", "ipc_binds",
+       "ipc_client_aio_unknown_ctx_ops"]
 JOURNAL = ["meta_kv_journal_entries", "meta_kv_journal_pad_entries", "meta_kv_journal_bytes",
            "meta_conveyor_drained_txs", "meta_conveyor_acks", "journal_lane_barriers_strict",
            "journal_lane_barriers_coalesced"]
 FUSE = ["fuse_ops", "transport_ring_requests", "transport_ring_reads", "transport_enters", "transport_fast_dispatch_serves",
         "transport_fast_dispatch_demotes", "transport_zc_direct_legs", "transport_zc_write_directs", "transport_payload_leases",
-        "transport_wake_writes", "transport_wake_elided", "transport_lease_overlong",
+        "transport_wake_writes", "transport_wakes_elided", "transport_lease_overlong",
         "transport_requests_abandoned", "transport_cq_overflows"]
+# (The hybrid lane gate's threshold is the CLIENT's — derived per process from
+# its memBW probe onto the shim's stats page — and never a `.stats` key; the
+# shim rows judge it by the block size, §4 of `leg`.)
 MISC = ["put_obj", "held_stores", "patch_writes", "own_block_dmas", "overlay_stores", "hot_block_hits", "ranged_reads",
         "ranged_read_bytes", "read_lane_fetches", "read_lane_fetch_bytes", "prefetch_issued",
         "daemon_cpu_ns", "mem_budget_bytes", "mem_budget_level", "direct_device_true",
-        "lane_gate_threshold_bytes", "manager_verbs", "writer_guard_mode", "symmetric_meta"]
+        "manager_verbs", "writer_guard_mode", "symmetric_meta"]
 FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier",
                 "meta_publish", "meta_barrier", "extent_barrier"]
 
@@ -379,9 +383,9 @@ def leg(args):
                                  bs, d["transport_ring_requests"], ops, ipc_ops, d["ipc_lane_gate_kernel_routes"])))
         else:
             ok = ipc_ops + d["ipc_lane_gate_kernel_routes"] >= ops and after["ipc_sessions_total"] >= 1
-            verdicts.append(("engagement_shim", ok, "Δ(ipc_ops_read %d + ipc_ops_write %d) + gate routes %d vs instrument ops %d; sessions total %d, admission refusals Δ%d (budget %d); kernel-lane Δtransport_ring_requests %d" % (
+            verdicts.append(("engagement_shim", ok, "Δ(ipc_ops_read %d + ipc_ops_write %d) + gate routes %d vs instrument ops %d; sessions total %d, admission refusals Δ%d (budget %d; a refused client process is kernel-served for its backoff window); aio iocbs on unknown contexts Δ%d; kernel-lane Δtransport_ring_requests %d" % (
                 d["ipc_ops_read"], d["ipc_ops_write"], d["ipc_lane_gate_kernel_routes"], ops, after["ipc_sessions_total"],
-                d["ipc_admission_refusals"], d["ipc_bind_refused_budget"], d["transport_ring_requests"])))
+                d["ipc_admission_refusals"], d["ipc_bind_refused_budget"], d["ipc_client_aio_unknown_ctx_ops"], d["transport_ring_requests"])))
     elif kind.startswith("data") or kind == "fsync":
         direct = metrics.get("direct", 1)
         ring = d["transport_ring_requests"]
@@ -437,8 +441,7 @@ def leg(args):
             "posture": {"direct_device_true": after["direct_device_true"], "writer_guard_mode": after["writer_guard_mode"],
                         "symmetric_meta": after["symmetric_meta"], "mem_budget_bytes": after["mem_budget_bytes"],
                         "mem_budget_level": after["mem_budget_level"],
-                        "mem_budget_components_top": dict(sorted(after["mem_budget_components"].items(), key=lambda kv: -kv[1])[:8]),
-                        "lane_gate_threshold_bytes": after["lane_gate_threshold_bytes"]},
+                        "mem_budget_components_top": dict(sorted(after["mem_budget_components"].items(), key=lambda kv: -kv[1])[:8])},
             "absent_keys": d["absent_keys"],
         },
         "diskstats": ds,

@@ -45,6 +45,12 @@ pub const stats = struct {
     /// control input.
     pub var ipc_lane_gate_kernel_routes: counters.ShardedCounter = .{};
     pub var ipc_lane_gate_kernel_bytes: counters.ShardedCounter = .{};
+    /// The clients' libaio iocbs on BOUND fds that a context the shim never
+    /// registered carried to the real libaio (the shim's
+    /// `aio_unknown_ctx_op` row, folded at teardown like the lane-gate
+    /// words): the engagement law's missing term when an aio instrument's
+    /// ops never reach the ring. Must stay 0 under the interposed queue face.
+    pub var ipc_client_aio_unknown_ctx_ops: counters.ShardedCounter = .{};
 
     // ---- THE engagement proof ----
     pub var ipc_ops_read: counters.ShardedCounter = .{};

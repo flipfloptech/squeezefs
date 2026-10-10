@@ -6,11 +6,10 @@ FIO_RW=randwrite
 FIO_DIRECT=1
 FIO_BS=4k
 FIO_PREFIX=rand
-# psync: fio's libaio engine creates its context through libaio's own
-# io_queue_init, which never crosses the shim's PLT, so its io_submit passes
-# through to the kernel (ipc_ops_* stay 0: INVALID by the engagement law —
-# see docs/evidence/rung-09-brackets.md).
-FIO_IOENGINE=${FIO_IOENGINE:-psync}
+# libaio (the box's instrument shape): fio's engine creates its context through
+# libaio's io_queue_init, which the shim interposes (F3 in
+# docs/evidence/rung-09-brackets.md); ipc_client_aio_unknown_ctx_ops names any
+# iocb that still bypassed the ring. BRK_IOENGINE=psync is the QD1 × N control.
 FIO_HEADLINE=iops
 # shellcheck source=_fio.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_fio.sh"

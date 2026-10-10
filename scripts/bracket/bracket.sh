@@ -36,9 +36,10 @@
 #   --iodepth N            instrument queue depth (default 32)
 #   --meta-size B --data-size B --data-volumes N   the set's geometry
 #   --budget-mb N          SQUEEZEFS_MEM_BUDGET_MB for every leg (recorded; default 6144:
-#                          above the daemon's unreclaimable floor, and the IL admission
-#                          cap is budget/8 at 64 MiB per session — 2048 ran Red and admitted
-#                          only 3 shim sessions; both are INVALID verdicts, not numbers)
+#                          above the daemon's unreclaimable floor — 2048 ran Red on the venue's
+#                          shared cgroup, an INVALID verdict, not a number; the IL admission cap
+#                          is budget/8 and the per-session arena yields to a 2 × cpus session
+#                          floor, so the cap holds the fleet at any budget: 21 sessions at 2048)
 #   --scratch DIR          default /build/brk-<pid>
 #   --out DIR              default <repo>/bench/brackets
 #   --legs N               run only the first N legs of A B B A (scoping/debug only)

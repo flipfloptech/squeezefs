@@ -145,7 +145,7 @@ pub const data = struct {
 
 // ---- operations: fsck/scrub, the job fabric + lifecycle + defrag, nvmet targets, the zcrx lane (charter §8) ----
 pub const ops = struct {
-    // @anchor:ops_fsck_import
+    pub const fsck = @import("ops/fsck.zig");
     pub const jobs = @import("ops/jobs.zig");
     pub const lifecycle = @import("ops/lifecycle.zig");
     pub const defrag = @import("ops/defrag.zig");
@@ -198,7 +198,7 @@ test {
     _ = json_scan;
     _ = thread_name;
     _ = model.explorer;
-    // @anchor:ops_fsck_test
+    _ = ops.fsck;
     _ = ops.jobs;
     _ = ops.lifecycle;
     _ = ops.defrag;

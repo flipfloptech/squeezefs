@@ -220,6 +220,43 @@ pub const Bench = struct {
     }
 };
 
+// ---- @anchor:ops_fsck_args — `fsck` / `scrub` / `fsck merge-reports` (charter §8; `ops_fsck.md` §6) ----
+
+/// `fsck [--online|--offline] [--json] [--scrub] [--throttle PCT]
+/// [--shards k/N] [--repair [--apply] [--quarantine-dir DIR]] TARGET` and
+/// `scrub …` (= `--scrub-only`). The mode defaults by the target's kind: a
+/// `sqmeta://` URI is offline, a mountpoint online. Dry-run is the default
+/// under `--repair`; `--apply` executes.
+pub const Fsck = struct {
+    target: Target,
+    /// Explicit `--online` / `--offline`; null = by the target's kind.
+    mode: ?FsckMode = null,
+    json: bool = false,
+    scrub: bool = false,
+    /// The `scrub` verb: C7 alone.
+    scrub_only: bool = false,
+    /// 0 / 100 = unthrottled.
+    throttle: u8 = 0,
+    /// `--shards k/N` (offline only): the residue shard; validated here.
+    shards: ?FsckShard = null,
+    repair: bool = false,
+    apply: bool = false,
+    quarantine_dir: ?[]const u8 = null,
+
+    pub fn offline(self: Fsck) bool {
+        return if (self.mode) |m| m == .offline else !targetIsMountpoint(self.target);
+    }
+};
+
+pub const FsckMode = enum { online, offline };
+pub const FsckShard = struct { k: u32, n: u32 };
+
+/// `fsck merge-reports [--json] FILE…`: durable shard reports merged.
+pub const FsckMerge = struct {
+    files: []const []const u8,
+    json: bool = false,
+};
+
 pub const Verb = union(enum) {
     version,
     help,
@@ -238,6 +275,8 @@ pub const Verb = union(enum) {
     appenders: Appenders,
     appender_clear: AppenderClear,
     volume: Volume,
+    fsck: Fsck,
+    fsck_merge: FsckMerge,
     job: Job,
     defrag: Defrag,
 };
@@ -280,6 +319,10 @@ pub const Refusal = union(enum) {
     bench_suite_with_shape: []const u8,
     /// `--take-slots` neither a count nor a comma list of slot ids.
     bad_take_slots: []const u8,
+    /// fsck's argument lattice (`ops_fsck.md` §6): the offending shape.
+    fsck_lattice: []const u8,
+    /// `--shards` is not `k/N` with `0 ≤ k < N`.
+    bad_shards: []const u8,
 
     pub fn format(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -308,6 +351,8 @@ pub const Refusal = union(enum) {
             .bad_size => |b| try w.print("bench: {s} '{s}' is not a size (<integer>[k|m|g|t], ≥ 1)", .{ b.flag, b.word }),
             .bench_suite_with_shape => |f| try w.print("bench: '{s}' needs a phase flag (-w/-r/--stat/--del) — the bare invocation runs the fixed saturation suite", .{f}),
             .bad_take_slots => |t| try w.print("volume add-meta: --take-slots '{s}' is neither a count (≥ 1) nor a comma list of slot ids (each < 65536)", .{t}),
+            .fsck_lattice => |why| try w.print("fsck: {s}", .{why}),
+            .bad_shards => |t| try w.print("fsck: --shards '{s}' is not k/N with 0 ≤ k < N", .{t}),
             .bad_volume_id => |v| try w.print("'{s}' is not a volume id (vol-<16 hex>)", .{v}),
             .bad_job_id => |j| try w.print("'{s}' is not a job id (job-<16 hex>, never zero)", .{j}),
         }
@@ -340,6 +385,9 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>
         \\  squeezefs volume repair-set sqmeta://<path>[,…]
         \\  squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>
+        \\  squeezefs fsck [--online|--offline] [--json] [--scrub] [--throttle PCT] [--shards k/N] [--repair [--apply] [--quarantine-dir DIR]] sqmeta://<path>|<mountpoint>
+        \\  squeezefs scrub [--online|--offline] [--json] [--throttle PCT] sqmeta://<path>|<mountpoint>
+        \\  squeezefs fsck merge-reports [--json] <report.json>…
         \\  squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…] <device>
         \\  squeezefs volume remove-data sqmeta://<path>[,…] vol-<16 hex>
         \\  squeezefs volume undrain sqmeta://<path>[,…] vol-<16 hex>
@@ -368,6 +416,8 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
         .appender_clear => "usage: squeezefs appender clear sqmeta://<path> <id>\n",
+        .fsck => "usage: squeezefs fsck [--online|--offline] [--json] [--scrub] [--throttle PCT] [--shards k/N] [--repair [--apply] [--quarantine-dir DIR]] sqmeta://<path>|<mountpoint>\n       squeezefs scrub [--online|--offline] [--json] [--throttle PCT] sqmeta://<path>|<mountpoint>\n",
+        .fsck_merge => "usage: squeezefs fsck merge-reports [--json] <report.json>…\n",
         .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n       squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…] <device>\n       squeezefs volume remove-data sqmeta://<path>[,…] vol-<16 hex>\n       squeezefs volume undrain sqmeta://<path>[,…] vol-<16 hex>\n",
         .job => "usage: squeezefs job list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs job status|pause|resume|cancel sqmeta://<path>|<mountpoint> job-<16 hex>\n       squeezefs job throttle <mountpoint> job-<16 hex> <pct>\n       squeezefs job worker sqmeta://<path>\n       squeezefs job rotate-enroll sqmeta://<path>\n",
         .defrag => "usage: squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>\n",
@@ -501,6 +551,8 @@ pub fn parse(argv: []const []const u8, diag: *Refusal) Error!Verb {
     if (std.mem.eql(u8, verb, "appenders")) return parseAppenders(words, diag);
     if (std.mem.eql(u8, verb, "appender")) return parseAppenderClear(words, diag);
     if (std.mem.eql(u8, verb, "volume")) return parseVolume(words, diag);
+    if (std.mem.eql(u8, verb, "fsck")) return parseFsck(words, diag, false);
+    if (std.mem.eql(u8, verb, "scrub")) return parseFsck(words, diag, true);
     if (std.mem.eql(u8, verb, "bench")) return parseBench(words, diag);
     if (std.mem.eql(u8, verb, "job")) return parseJob(words, diag);
     if (std.mem.eql(u8, verb, "defrag")) return parseDefrag(words, diag);
@@ -735,6 +787,84 @@ fn parseAppenderClear(words: []const []const u8, diag: *Refusal) Error!Verb {
         },
     };
     return .{ .appender_clear = .{ .meta_uri = pos[0], .appender_id = id } };
+}
+
+/// @anchor:ops_fsck_parse — `fsck` / `scrub` / `fsck merge-reports`.
+fn parseFsck(words: []const []const u8, diag: *Refusal, scrub_only: bool) Error!Verb {
+    if (!scrub_only and words.len >= 1 and std.mem.eql(u8, words[0], "merge-reports")) {
+        // Flags first, then the files: the list is the argv tail itself (a
+        // `Verb` borrows argv and owns no heap).
+        var json = false;
+        var i: usize = 1;
+        while (i < words.len and words[i].len >= 2 and words[i][0] == '-') : (i += 1) {
+            if (std.mem.eql(u8, words[i], "--json")) {
+                json = true;
+            } else {
+                diag.* = .{ .unknown_flag = .{ .verb = "fsck merge-reports", .flag = words[i] } };
+                return error.Refused;
+            }
+        }
+        if (i == words.len) {
+            diag.* = .{ .missing_positional = .{ .verb = "fsck merge-reports", .what = "at least one report file" } };
+            return error.Refused;
+        }
+        return .{ .fsck_merge = .{ .files = words[i..], .json = json } };
+    }
+    var c: Cursor = .{ .verb = if (scrub_only) "scrub" else "fsck", .words = words, .diag = diag };
+    var out: Fsck = .{ .target = "", .scrub_only = scrub_only };
+    var shards_raw: ?[]const u8 = null;
+    while (try c.step()) |f| {
+        if (std.mem.eql(u8, f.name, "--online")) {
+            out.mode = .online;
+        } else if (std.mem.eql(u8, f.name, "--offline")) {
+            out.mode = .offline;
+        } else if (std.mem.eql(u8, f.name, "--json")) {
+            out.json = true;
+        } else if (std.mem.eql(u8, f.name, "--throttle")) {
+            out.throttle = try parseIntFlag(&c, f, u8, 0, 100);
+        } else if (!scrub_only and std.mem.eql(u8, f.name, "--scrub")) {
+            out.scrub = true;
+        } else if (!scrub_only and std.mem.eql(u8, f.name, "--shards")) {
+            shards_raw = try c.value(f);
+        } else if (!scrub_only and std.mem.eql(u8, f.name, "--repair")) {
+            out.repair = true;
+        } else if (!scrub_only and std.mem.eql(u8, f.name, "--apply")) {
+            out.apply = true;
+        } else if (!scrub_only and std.mem.eql(u8, f.name, "--quarantine-dir")) {
+            out.quarantine_dir = try c.value(f);
+        } else return c.unknown(f);
+    }
+    out.target = try exactlyOne(&c, target_what);
+    try checkTarget(out.target, diag);
+    if (shards_raw) |raw| {
+        out.shards = parseShards(raw) orelse {
+            diag.* = .{ .bad_shards = raw };
+            return error.Refused;
+        };
+    }
+    // The lattice (`ops_fsck.md` §6): every refusal names the fix.
+    const mountpoint = targetIsMountpoint(out.target);
+    if (out.mode == .offline and mountpoint) return lattice(diag, "--offline needs the sqmeta:// URI (a mountpoint names a live daemon)");
+    if (out.mode == .online and !mountpoint) return lattice(diag, "--online needs the mountpoint (a sqmeta:// URI is the offline set)");
+    if ((out.apply or out.quarantine_dir != null) and !out.repair) return lattice(diag, "--apply / --quarantine-dir need --repair");
+    if (out.shards != null and out.repair) return lattice(diag, "--repair is refused on a shard (merge the shard reports, then repair whole)");
+    if (out.shards != null and !out.offline()) return lattice(diag, "--shards is offline only (the online run is whole on the coordinator)");
+    if (out.quarantine_dir) |d| if (d.len == 0 or d[0] != '/') return lattice(diag, "--quarantine-dir must be an absolute path");
+    return .{ .fsck = out };
+}
+
+fn lattice(diag: *Refusal, why: []const u8) Error {
+    diag.* = .{ .fsck_lattice = why };
+    return error.Refused;
+}
+
+/// `k/N`, `0 ≤ k < N`, `N ≥ 1` (the ONE partition key's spelling).
+pub fn parseShards(raw: []const u8) ?FsckShard {
+    const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return null;
+    const k = std.fmt.parseInt(u32, raw[0..slash], 10) catch return null;
+    const n = std.fmt.parseInt(u32, raw[slash + 1 ..], 10) catch return null;
+    if (n == 0 or k >= n) return null;
+    return .{ .k = k, .n = n };
 }
 
 fn parseVolume(words: []const []const u8, diag: *Refusal) Error!Verb {
@@ -1555,7 +1685,7 @@ test "usage names every verb" {
     try testing.expect(std.mem.indexOf(u8, usage(null), "squeezefs format") != null);
     inline for (@typeInfo(std.meta.Tag(Verb)).@"enum".field_names) |name| {
         if (!std.mem.eql(u8, name, "version") and !std.mem.eql(u8, name, "help")) {
-            const word = comptime if (std.mem.eql(u8, name, "claim_clear")) "squeezefs claim clear" else if (std.mem.eql(u8, name, "appender_clear")) "squeezefs appender clear" else "squeezefs " ++ name;
+            const word = comptime if (std.mem.eql(u8, name, "claim_clear")) "squeezefs claim clear" else if (std.mem.eql(u8, name, "appender_clear")) "squeezefs appender clear" else if (std.mem.eql(u8, name, "fsck_merge")) "squeezefs fsck merge-reports" else "squeezefs " ++ name;
             try testing.expect(std.mem.indexOf(u8, usage(null), word) != null);
         }
     }

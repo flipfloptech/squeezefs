@@ -299,7 +299,10 @@ pub const Mapping = struct {
 
     /// The window law (the ONE check both the decoder and the read run).
     pub fn check(self: Mapping, chunk: u64) MappingError!void {
-        if (!derive.isAligned(self.offset, chunk)) return error.MappingRefused;
+        // A modulus, not the power-of-two helper: a transformed volume's
+        // chunk is `block + 4 KiB` (`transform.chunkSizeFor`), and the
+        // helper's assertion panicked the first striped publish there.
+        if (chunk == 0 or self.offset % chunk != 0) return error.MappingRefused;
         if (self.whole_block) {
             if (self.rel_off != 0 or self.len != 0) return error.MappingRefused;
             return;
@@ -1733,6 +1736,11 @@ test "mapping law ties: ceil(len) = pack slot — 1 → 4096, 4096 → 4096, 409
     try testing.expectEqual(@as(u64, 4096), ceilGrain(0));
     try testing.expectEqual(@as(u64, 4096), ceilGrain(4096));
     try testing.expectEqual(@as(u64, 8192), ceilGrain(4097));
+    // A transformed volume's chunk is not a power of two (block + 4 KiB):
+    // its mappings check by modulus, never by the power-of-two helper.
+    const xchunk: u64 = 4 * derive.MiB + 4096;
+    try Mapping.wholeBlock(0x77, 3 * xchunk, 0).check(xchunk);
+    try testing.expectError(error.MappingRefused, Mapping.wholeBlock(0x77, 3 * xchunk + 4096, 0).check(xchunk));
     const m = Mapping.tenant(0x77, 8 * derive.MiB, 0, 12288, 10_000);
     try testing.expectEqual(@as(u64, 2), m.blockIdx(tgeo.chunk));
     try testing.expectEqual(@as(u64, 12288), m.slotLen(tgeo.chunk));

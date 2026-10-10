@@ -35,6 +35,8 @@ pub const clone = if (is_linux) @import("clone.zig") else struct {};
 pub const config_verb = if (is_linux) @import("config_verb.zig") else struct {};
 pub const staging_verb = if (is_linux) @import("staging_verb.zig") else struct {};
 pub const volume = if (is_linux) @import("volume.zig") else struct {};
+/// Portable `merge-reports`; the offline/online harnesses are Linux inside.
+pub const fsck_verb = @import("fsck.zig");
 // @anchor:ops_jobs_cli — the job fabric and defrag verbs (rung 8).
 pub const job = if (is_linux) @import("job.zig") else struct {};
 pub const defrag_verb = if (is_linux) @import("defrag.zig") else struct {};
@@ -101,6 +103,8 @@ pub fn run(p: Process) u8 {
         .appenders => |a| return if (is_linux) appenders.run(p, a) else linuxOnly(p, "appenders"),
         .appender_clear => |a| return if (is_linux) appenders.runClear(p, a) else linuxOnly(p, "appender clear"),
         .volume => |v| return if (is_linux) volume.run(p, v) else linuxOnly(p, "volume"),
+        .fsck => |f| return fsck_verb.run(p, f),
+        .fsck_merge => |m| return fsck_verb.runMerge(p, m),
         .job => |j| return if (is_linux) job.run(p, j) else linuxOnly(p, "job"),
         .defrag => |d| return if (is_linux) defrag_verb.run(p, d) else linuxOnly(p, "defrag"),
     }
@@ -126,6 +130,7 @@ test {
     _ = supervisor;
     _ = tune;
     _ = bench;
+    _ = fsck_verb;
     if (is_linux) {
         _ = format;
         _ = status;

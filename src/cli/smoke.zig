@@ -15,8 +15,9 @@
 //! the kill matrix (`kill -9` at three points of a 200 MiB `dd` and
 //! mid-storm): every file whose `fsync` returned is byte-exact, no file
 //! is torn beyond its last durable publish (every 1 MiB piece inside the
-//! claimed size is exact or a hole), the C8 oracle and the C2 reconcile
-//! report zero drift on the remount.
+//! claimed size is exact or a hole), `squeezefs fsck --offline --scrub`
+//! (OUR oracle, C1–C17) is clean after every kill, and the mount-time C8
+//! oracle and the C2 reconcile report zero drift on the remount.
 //!
 //! The binary is `./squeezefs` in the test's cwd: `build.zig`'s `smoke`
 //! step runs the library's `smoke:` tests with the emitted-bin directory as
@@ -3778,21 +3779,25 @@ fn fileSize(path: [:0]const u8) u64 {
 /// What a remount after a kill reports.
 const Recovery = struct { replayed: u64, torn: u64, ring_records: u64, ring_torn: u64 };
 
-/// Remount with the C8 oracle armed; the journal replay, the ring
-/// recovery, zero drift (C8) and nothing leaked or lost (C2) on both
-/// volumes.
-fn remountAfterKill(rig: *Rig) !Recovery {
-    const mark = try rig.logLen();
-    try rig.spawnMount(&.{});
-    const ready = try rig.awaitReady(mark);
-    const text = try rig.readLog();
-    defer rig.gpa.free(text);
-    const seg = text[mark..ready];
-    try testing.expect(std.mem.indexOf(u8, seg, ", clean unmount") == null);
-    if (std.mem.count(u8, seg, " 0 drift row(s)") != 2 or std.mem.count(u8, seg, ": 0 leaked block(s) freed, 0 lost block(s)") != 2) {
-        std.debug.print("\n--- the oracles after the kill ---\n{s}\n", .{seg});
-        return error.DriftAfterKill;
+/// OUR oracle after a kill (charter §1.10 "fsck clean after every kill"):
+/// `squeezefs fsck --offline --scrub` over the unmounted set — the D0
+/// guarded open replays the ring, then C1–C17 and the scrub must report
+/// `findings: 0 (clean)` with exit 0.
+fn fsckClean(rig: *Rig, label: []const u8) !Recovery {
+    const r = try rig.squeezefs(&.{ "fsck", "--offline", "--scrub", rig.meta_uri });
+    defer rig.freeRun(r);
+    if (!r.term.success() or std.mem.indexOf(u8, r.stdout, "findings: 0 (clean)") == null) {
+        std.debug.print("\n--- fsck --offline after {s} ({f}) ---\n{s}\n--- stderr ---\n{s}\n", .{ label, r.term, r.stdout, r.stderr });
+        return error.FsckNotClean;
     }
+    std.debug.print("smoke[kill]: fsck --offline --scrub after {s}: {s}", .{ label, r.stdout[0 .. std.mem.indexOfScalar(u8, r.stdout, '\n') orelse r.stdout.len] });
+    std.debug.print(" → findings: 0 (clean)\n", .{});
+    // fsck's guarded open IS the post-kill recovery (the replay, the ring)
+    // and its close checkpoints: the recovery numbers are its log's.
+    return recoveryOf(r.stderr);
+}
+
+fn recoveryOf(seg: []const u8) !Recovery {
     const torn_at = std.mem.indexOf(u8, seg, "content records, ") orelse return error.NoReplayLine;
     return .{
         .replayed = numberAfter(seg, "replayed ") orelse 0,
@@ -3802,7 +3807,26 @@ fn remountAfterKill(rig: *Rig) !Recovery {
     };
 }
 
-test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and mid 8-way cp storm → remount → every fsync'd file byte-exact, every page of an in-flight file exact or a hole, C8 zero drift, C2 nothing leaked or lost, rm → df baseline → status" {
+/// Remount with the C8 oracle armed: zero drift (C8) and nothing leaked
+/// or lost (C2) on both volumes. `recovered` = the replay fsck's guarded
+/// open already performed (its close checkpointed, so THIS open is clean
+/// by design); null = this open replays and its numbers are read here.
+fn remountAfterKill(rig: *Rig, recovered: ?Recovery) !Recovery {
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    const ready = try rig.awaitReady(mark);
+    const text = try rig.readLog();
+    defer rig.gpa.free(text);
+    const seg = text[mark..ready];
+    if (recovered == null) try testing.expect(std.mem.indexOf(u8, seg, ", clean unmount") == null);
+    if (std.mem.count(u8, seg, " 0 drift row(s)") != 2 or std.mem.count(u8, seg, ": 0 leaked block(s) freed, 0 lost block(s)") != 2) {
+        std.debug.print("\n--- the oracles after the kill ---\n{s}\n", .{seg});
+        return error.DriftAfterKill;
+    }
+    return recovered orelse try recoveryOf(seg);
+}
+
+test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and mid 8-way cp storm → fsck --offline clean → remount → every fsync'd file byte-exact, every page of an in-flight file exact or a hole, C8 zero drift, C2 nothing leaked or lost, rm → df baseline → fsck clean → status" {
     const io = testing.io;
     if (!venueAvailable(io)) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -3852,7 +3876,8 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
         try testing.expect(!(try dd.wait(io)).success());
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
-        const rec = try remountAfterKill(rig);
+        const recovered = try fsckClean(rig, "the mid-dd kill");
+        const rec = try remountAfterKill(rig, recovered);
         // Every acked file byte-exact; the in-flight file exact or holes.
         var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
         defer dir.close(io);
@@ -3898,7 +3923,8 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
         try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
         _ = try storm.wait(io);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
-        const rec = try remountAfterKill(rig);
+        const recovered = try fsckClean(rig, "the storm kill");
+        const rec = try remountAfterKill(rig, recovered);
         var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{});
         defer dir.close(io);
         var present: usize = 0;
@@ -3941,12 +3967,224 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    _ = try fsckClean(rig, "the clean unmount");
     {
         const report = try rig.statusReport();
         defer gpa.free(report);
         try testing.expectEqual(@as(u64, 0), refCensus(report).blocks);
         try testing.expect(std.mem.indexOf(u8, report, "not mounted") != null);
         std.debug.print("smoke[kill]: {s}", .{report[std.mem.lastIndexOf(u8, report, "summary:").?..]});
+    }
+}
+
+// ---- fsck / scrub: OUR oracle over a real set (rung 8) ----
+
+/// `squeezefs fsck …` through the binary; the report's JSON, the exit code
+/// and both streams (printed on a surprise).
+fn fsckJson(rig: *Rig, extra: []const []const u8) !struct { report: json_scan_report.Report, code: u8 } {
+    var argv: [12][]const u8 = undefined;
+    var n: usize = 0;
+    argv[n] = "fsck";
+    n += 1;
+    argv[n] = "--offline";
+    n += 1;
+    argv[n] = "--json";
+    n += 1;
+    for (extra) |a| {
+        argv[n] = a;
+        n += 1;
+    }
+    argv[n] = rig.meta_uri;
+    n += 1;
+    const r = try rig.squeezefs(argv[0..n]);
+    defer rig.freeRun(r);
+    const code: u8 = switch (r.term) {
+        .exited => |c| c,
+        else => 255,
+    };
+    const report = json_scan_report.Report.parse(rig.gpa, r.stdout) catch {
+        std.debug.print("\n--- fsck ({f}) printed no report ---\n{s}\n--- stderr ---\n{s}\n", .{ r.term, r.stdout, r.stderr });
+        return error.FsckNoReport;
+    };
+    return .{ .report = report, .code = code };
+}
+
+const json_scan_report = @import("../ops/fsck/finding.zig");
+
+test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
+    const io = testing.io;
+    if (!venueAvailable(io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    try rig.createImage();
+    const storm_sources = try rig.shOk(rig.work, "i=0; while [ $i -lt 8 ]; do dd if=image of=s$i bs=1M skip=$((i * 25)) count=50 status=none; i=$((i + 1)); done; echo ok");
+    gpa.free(storm_sources);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // The fill, over two mounts: three 20 MiB striped files with fsync,
+    // then (after a remount) a tree of directories, 200 packed 64 KiB
+    // files and hard links. WHY two: a mount holding staged residents
+    // beside fresh striped blocks asserts in the dismount's pack promotion
+    // (`nextFreshBlock`'s virgin-bit law; 20 × 64 KiB + 3 × 20 MiB `dd
+    // conv=fsync` → `umount` reproduces it at HEAD) — a data-plane defect
+    // this row records, not fsck's object.
+    {
+        const out = try rig.onMount("for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; sync; echo filled");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
+    }
+    try rig.expectAlive("the striped fill");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const mark_packed = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_packed);
+    {
+        const out = try rig.onMount("mkdir -p d/e/f g && i=0; while [ $i -lt 200 ]; do dd if=\"$1/image\" of=d/e/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; ln d/e/small1 g/link1; ln d/e/small2 g/link2; sync; echo filled");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
+    }
+    try rig.expectAlive("the packed fill and hard links");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // The clone (an offline verb: the same guarded open fsck takes) shares
+    // big0's blocks — the refcount-2 shape C3/C8 must read as healthy.
+    {
+        const r = try rig.squeezefs(&.{ "clone", rig.meta_uri, "/big0", "/big0-clone" });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nclone: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    // 1. The healthy set: 0 findings, every block read (a plain set: the
+    // honesty gauge says readability-only — no frame to verify).
+    {
+        var got = try fsckJson(rig, &.{"--scrub"});
+        defer got.report.deinit(gpa);
+        if (got.report.findings.len != 0) for (got.report.findings) |f| std.debug.print("  unexpected: {f}\n", .{f});
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expectEqual(@as(u8, 0), got.code);
+        const c = got.report.counters;
+        std.debug.print("\nsmoke[fsck]: healthy: {d} inodes, {d} dentry refs, {d} blocks, {d} refcounts; scrub {d} blocks (readability-only {d}) in {d} ms\n", .{ c.inodes_scanned, c.dentry_refs_indexed, c.blocks_checked, c.refcounts_checked, c.scrub_blocks_scanned, c.scrub_readability_only, c.scan_ms });
+        // 4 directories + 200 packed files + 3 striped files + the clone,
+        // beside the root; 2 hard links add names, never inodes.
+        try testing.expect(c.inodes_scanned >= 208);
+        try testing.expect(c.dentry_refs_indexed >= 210);
+        // 3 × 20 MiB striped files = 15 blocks of 4 MiB + the packed blocks.
+        try testing.expect(c.blocks_checked >= 16);
+        try testing.expect(c.scrub_blocks_scanned >= 16);
+        try testing.expectEqual(c.scrub_blocks_scanned, c.scrub_readability_only);
+        try testing.expectEqual(@as(u64, 0), c.scrub_failures);
+    }
+    // 2. The storm kill → fsck clean → remount → clean umount.
+    const mark_storm = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_storm);
+    {
+        var storm_cmd: [1024]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&storm_cmd, "i=0; while [ $i -lt 8 ]; do cp {s}/s$i {s}/storm$i & i=$((i + 1)); done; wait", .{ rig.work, rig.mp });
+        var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        var pb: [256:0]u8 = undefined;
+        var claimed: u64 = 0;
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            claimed = 0;
+            for (0..storm_files) |i| {
+                const sp = try std.fmt.bufPrintSentinel(&pb, "{s}/storm{d}", .{ rig.mp, i }, 0);
+                claimed += fileSize(sp);
+            }
+            if (claimed >= storm_kill_mib << 20) break;
+            sleepMs(1);
+        }
+        try testing.expect(claimed >= storm_kill_mib << 20);
+        _ = linux.kill(rig.child_pid, .KILL);
+        try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+        _ = try storm.wait(io);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    }
+    _ = try fsckClean(rig, "the storm kill (fsck smoke)");
+    const mark_after_kill = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark_after_kill);
+    {
+        const out = try rig.onMount("rm -f storm* && echo ok");
+        defer gpa.free(out);
+    }
+    try rig.expectAlive("the storm residue removal");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the clean unmount (fsck smoke)");
+    // 3. The planted defects: the exact classes, the plan, the apply, clean.
+    // The planting run opens the set, binds the plane (the allocator seeded
+    // from the durable ledger), plants, then judges: it sees the ledger's
+    // drift. The reopened dry run sees every class the defect produces: a
+    // stale durable reference is the ledger's drift [C8] AND the refcount the
+    // next open seeds from it [C3]; a dropped dentry is [C9] alone.
+    const Planted = struct { arm: []const u8, classes: []const json_scan_report.Class, verb: []const u8 };
+    for ([_]Planted{
+        .{ .arm = "stray-ref", .classes = &.{ .c3, .c8 }, .verb = "release_stale_block_refs" },
+        .{ .arm = "orphan-inode", .classes = &.{.c9}, .verb = "destroy_unreferenced_inode" },
+    }) |pl| {
+        try rig.env.put("SQUEEZEFS_TEST_FSCK_INJECT", pl.arm);
+        var planted = try fsckJson(rig, &.{"--repair"});
+        defer planted.report.deinit(gpa);
+        _ = rig.env.swapRemove("SQUEEZEFS_TEST_FSCK_INJECT");
+        try testing.expectEqual(@as(u8, 1), planted.code);
+        try testing.expect(planted.report.findings.len >= 1);
+        try testing.expectEqual(pl.classes[pl.classes.len - 1], planted.report.findings[planted.report.findings.len - 1].class());
+        std.debug.print("smoke[fsck]: planted {s} → {f}\n", .{ pl.arm, planted.report.findings[planted.report.findings.len - 1] });
+        // The dry run planned the verb and mutated nothing: the finding
+        // stands, now with every class the reopened set derives from it.
+        var again = try fsckJson(rig, &.{});
+        defer again.report.deinit(gpa);
+        if (again.report.findings.len != pl.classes.len) for (again.report.findings) |f| std.debug.print("  {s}: {f}\n", .{ pl.arm, f });
+        try testing.expectEqual(pl.classes.len, again.report.findings.len);
+        for (pl.classes, again.report.findings) |want, f| try testing.expectEqual(want, f.class());
+        try testing.expectEqual(@as(u8, 1), again.code);
+        // The apply (every finding's verb), then clean.
+        {
+            const r = try rig.squeezefs(&.{ "fsck", "--offline", "--repair", "--apply", rig.meta_uri });
+            defer rig.freeRun(r);
+            var want_buf: [96]u8 = undefined;
+            const want = try std.fmt.bufPrint(&want_buf, "repair (--apply): 0 planned, {d} applied, 0 refused", .{pl.classes.len});
+            if (std.mem.indexOf(u8, r.stdout, want) == null or r.term != .exited) std.debug.print("\n--- apply ({f}) ---\n{s}\n{s}\n", .{ r.term, r.stdout, r.stderr });
+            try testing.expect(std.mem.indexOf(u8, r.stdout, want) != null);
+            try testing.expect(std.mem.indexOf(u8, r.stdout, pl.verb) != null);
+            try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        }
+        _ = try fsckClean(rig, pl.arm);
+    }
+    // 4. Two residue shards merge to the whole report.
+    {
+        var shard0 = try fsckJson(rig, &.{ "--shards", "0/2" });
+        defer shard0.report.deinit(gpa);
+        var shard1 = try fsckJson(rig, &.{ "--shards", "1/2" });
+        defer shard1.report.deinit(gpa);
+        var whole = try fsckJson(rig, &.{});
+        defer whole.report.deinit(gpa);
+        try testing.expectEqual(whole.report.counters.inodes_scanned, shard0.report.counters.inodes_scanned + shard1.report.counters.inodes_scanned);
+        try testing.expect(shard0.report.shard != null and shard1.report.shard != null);
+        for ([_]*json_scan_report.Report{ &shard0.report, &shard1.report }, [_][]const u8{ "shard0.json", "shard1.json" }) |rep, name| {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            try rep.writeJson(&out.writer);
+            var pbuf: [256]u8 = undefined;
+            const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ rig.work, name });
+            const f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+            defer f.close(io);
+            try f.writeStreamingAll(io, out.written());
+        }
+        var p0: [256]u8 = undefined;
+        var p1: [256]u8 = undefined;
+        const r = try rig.squeezefs(&.{ "fsck", "merge-reports", "--json", try std.fmt.bufPrint(&p0, "{s}/shard0.json", .{rig.work}), try std.fmt.bufPrint(&p1, "{s}/shard1.json", .{rig.work}) });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+        var merged = try json_scan_report.Report.parse(gpa, r.stdout);
+        defer merged.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), merged.findings.len);
+        try testing.expectEqual(whole.report.counters.inodes_scanned, merged.counters.inodes_scanned);
+        try testing.expect(merged.shard == null);
     }
 }
 

@@ -91,6 +91,8 @@ const mem_budget = @import("../mem/budget.zig");
 const wire_stats = @import("../wire/stats.zig");
 const ipc = @import("../ipc/ipc.zig");
 const ipc_host_stats = @import("../ipc/host/stats.zig");
+// @anchor:ops_fsck_stats — fsck C1–C17 + the scrub + the repair engine.
+const fsck_mod = @import("../ops/fsck.zig");
 // @anchor:ops_jobs_stats — the job fabric, the lifecycle/mover, defrag.
 const jobs_stats = @import("../ops/jobs/stats.zig");
 const lifecycle_stats = @import("../ops/lifecycle/stats.zig");
@@ -205,6 +207,7 @@ pub const families = [_]Family{
     .{ .name = "io", .write = writeIo },
     .{ .name = "mem_budget", .write = writeMemBudget },
     .{ .name = "ops", .write = writeOps },
+    .{ .name = "fsck", .write = writeFsck },
     .{ .name = "jobs", .write = writeJobs },
     .{ .name = "op_trace", .write = writeOpTrace },
     .{ .name = "cpu", .write = writeCpu },
@@ -258,6 +261,7 @@ pub const sources = [_]Source{
     .{ .path = "src/fuse/handler/virtual_inodes.zig", .family = "fuse" },
     .{ .path = "src/meta/checkpoint_cycle.zig", .family = "meta" },
     .{ .path = "src/fuse/handler/op_trace.zig", .family = "ops" },
+    .{ .path = "src/ops/fsck.zig", .family = "fsck" },
     .{ .path = "src/fuse/codec.zig", .family = "fuse" },
     .{ .path = "src/exec/stats.zig", .family = "exec" },
     .{ .path = "src/exec/placement.zig", .family = "exec" },
@@ -614,6 +618,11 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
 
 fn writeOpTrace(_: *Sources, w: *Writer) Error!void {
     try op_trace.writeGaugesJson(w);
+}
+
+/// The `fsck_*` / `scrub_*` / `fsck_repair_*` family (`ops/fsck.zig`).
+fn writeFsck(_: *Sources, w: *Writer) Error!void {
+    try fsck_mod.writeStatsJson(w);
 }
 
 /// The `job_*` / `evacuate_*` / `volume_*` / `frag_*` / `pack_compaction_*`

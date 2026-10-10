@@ -1,0 +1,281 @@
+//! `squeezefs fsck` / `squeezefs scrub` / `squeezefs fsck merge-reports`
+//! (charter §8; `ops_fsck.md` §6–§7). OFFLINE (a `sqmeta://` URI): the set
+//! opened through the writer door exactly as `clone` opens it (`offline.
+//! withSet`: the flock + the claim — a live mount refuses by name), the
+//! plane bound, the engine run, the report printed, exit 1 iff findings
+//! (also a dry-run `--repair` with findings), `--repair --apply` under
+//! that same D0-guarded open with the quarantine dir on the first cache
+//! path (or `--quarantine-dir`). ONLINE (a mountpoint): the engine is
+//! `runner.linux.JobBody`, the fabric's `JobType.fsck` body a serving
+//! daemon registers; the CLI's submission rides the daemon's admin lane,
+//! which this build does not serve yet (the job fabric's verb block), so
+//! the arm is REFUSED by name here — never a silent no-op, never a fake
+//! success. `merge-reports` is portable (durable JSON in, one report out).
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const cli = @import("cli.zig");
+const args = @import("args.zig");
+const fsck = @import("../ops/fsck.zig");
+const finding = fsck.finding;
+
+const is_linux = builtin.os.tag == .linux;
+
+/// `fsck merge-reports [--json] FILE…`.
+pub fn runMerge(p: cli.Process, m: args.FsckMerge) u8 {
+    const gpa = p.gpa;
+    var reports: std.ArrayList(finding.Report) = .empty;
+    defer {
+        for (reports.items) |*r| r.deinit(gpa);
+        reports.deinit(gpa);
+    }
+    for (m.files) |path| {
+        const text = Io.Dir.cwd().readFileAlloc(p.io, path, gpa, .limited(64 << 20)) catch |e| {
+            p.stderr.print("squeezefs fsck merge-reports: cannot read {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+            return cli.exit_failed;
+        };
+        defer gpa.free(text);
+        const r = finding.Report.parse(gpa, text) catch |e| {
+            p.stderr.print("squeezefs fsck merge-reports: {s} is not a schema-{d} fsck report ({s})\n", .{ path, fsck.REPORT_SCHEMA, @errorName(e) }) catch {};
+            return cli.exit_failed;
+        };
+        reports.append(gpa, r) catch return cli.exit_failed;
+    }
+    var merged = finding.merge(gpa, reports.items) catch return cli.exit_failed;
+    defer merged.deinit(gpa);
+    return emit(p, merged, m.json);
+}
+
+/// Print the report (JSON or text) and answer its exit verdict.
+fn emit(p: cli.Process, r: finding.Report, json: bool) u8 {
+    if (json) r.writeJson(p.stdout) catch return cli.exit_failed else r.writeText(p.stdout) catch return cli.exit_failed;
+    if (json) p.stdout.writeByte('\n') catch return cli.exit_failed;
+    p.stdout.flush() catch return cli.exit_failed;
+    return if (r.hasFindings()) cli.exit_failed else cli.exit_ok;
+}
+
+/// `fsck` / `scrub` over a target.
+pub fn run(p: cli.Process, a: args.Fsck) u8 {
+    if (!is_linux) {
+        p.stderr.writeAll("squeezefs fsck: Linux only (charter §1.2) — `fsck merge-reports` is the portable arm\n") catch {};
+        return cli.exit_failed;
+    }
+    if (!a.offline()) {
+        p.stderr.print("squeezefs {s}: refused: the ONLINE run is the fabric's `JobType.fsck` body on the serving daemon; its submission rides the daemon's admin lane, which this build does not serve yet — run `squeezefs {s} --offline sqmeta://…` on the unmounted set\n", .{ if (a.scrub_only) "scrub" else "fsck", if (a.scrub_only) "scrub" else "fsck" }) catch {};
+        p.stderr.flush() catch {};
+        return cli.exit_failed;
+    }
+    return linux_arm.offline(p, a);
+}
+
+const linux_arm = if (is_linux) struct {
+    const offline_set = @import("offline.zig");
+    const derive = @import("../core/derive.zig");
+    const mem_budget = @import("../mem/budget.zig");
+    const runner = fsck.runner;
+
+    const Body = struct {
+        p: cli.Process,
+        a: args.Fsck,
+        verb: []const u8,
+
+        fn failed(self: *Body, comptime fmt: []const u8, x: anytype) u8 {
+            self.p.stderr.print("squeezefs {s}: ", .{self.verb}) catch {};
+            self.p.stderr.print(fmt, x) catch {};
+            self.p.stderr.writeAll("\n") catch {};
+            self.p.stderr.flush() catch {};
+            return cli.exit_failed;
+        }
+
+        fn run(ctx: *anyopaque, set: *offline_set.Set) u8 {
+            const self: *Body = @ptrCast(@alignCast(ctx));
+            const p = self.p;
+            const gpa = p.gpa;
+            const a = self.a;
+            inject(p.env, set) catch |e| return self.failed("the injection seam failed ({s})", .{@errorName(e)});
+            const facts = derive.facts();
+            const budget_bytes = mem_budget.authority.resolveBudgetNow(.{ .io = set.io, .env = p.env, .facts = facts });
+            const staging_root: ?[]const u8 = if (set.cfg.cache_paths.len != 0) set.cfg.cache_paths[0] else null;
+            const bound = runner.linux.bind(gpa, set.io, set.be, set.plane, .{
+                .env = p.env,
+                .mode = .offline,
+                .mem_budget = budget_bytes,
+                .shard = if (a.shards) |s| .{ .k = s.k, .n = s.n } else null,
+                .staging_root = staging_root,
+            }) catch |e| return self.failed("cannot bind the set ({s})", .{@errorName(e)});
+            defer runner.linux.destroy(bound);
+            // The quarantine home: `--quarantine-dir`, else `<first cache
+            // path>/quarantine` — REQUIRED on a cache-less set when an
+            // action quarantines.
+            var sink: ?runner.linux.DirSink = null;
+            defer if (sink) |*s| s.deinit();
+            var ropts: ?fsck.classes.Quarantine.Sink = null;
+            if (a.repair and a.apply) {
+                var home_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const home: []const u8 = a.quarantine_dir orelse blk: {
+                    const root = staging_root orelse return self.failed("--apply needs a quarantine home: the set has no cache path — pass --quarantine-dir DIR", .{});
+                    break :blk std.fmt.bufPrint(&home_buf, "{s}/quarantine", .{root}) catch return self.failed("the quarantine path is too long", .{});
+                };
+                sink = runner.linux.DirSink.init(gpa, set.be.pool, home) catch return self.failed("out of memory", .{});
+                ropts = sink.?.sink();
+            }
+            const throttle: Throttle = .{ .pct = a.throttle };
+            var report = runner.run(&bound.host, .{
+                .scrub = a.scrub,
+                .scrub_only = a.scrub_only,
+                .throttle = throttle.face(),
+                .repair = if (a.repair) .{ .apply = a.apply, .quarantine = ropts } else null,
+            }, if (bound.verifier) |*v| v else null) catch |e| return self.failed("the run failed ({s}) — see the log", .{@errorName(e)});
+            defer report.deinit(gpa);
+            return emit(p, report, a.json);
+        }
+    };
+
+    const knobs = @import("../core/knobs.zig");
+    const key = @import("../meta/key.zig");
+    const record = @import("../meta/record.zig");
+    const tree = @import("../meta/tree.zig");
+    const economy = @import("../meta/economy.zig");
+    const block_refs = @import("../data/block_refs.zig");
+
+    /// `SQUEEZEFS_TEST_FSCK_INJECT`: ONE defect planted under the guarded
+    /// open before the census (the e2e's red row over a real set).
+    fn inject(env: *const std.process.Environ.Map, set: *offline_set.Set) !void {
+        const arm = knobs.enumKnob("SQUEEZEFS_TEST_FSCK_INJECT", env);
+        if (std.mem.eql(u8, arm, "off")) return;
+        const gpa = set.gpa;
+        const be = set.be;
+        if (std.mem.eql(u8, arm, "stray-ref")) {
+            // The first durable reference, re-stated at a block index no
+            // layout names: durable 2 vs derived 1 on that block.
+            var kvs: std.ArrayList(tree.KeyValue) = .empty;
+            defer tree.deinitKeyValues(gpa, &kvs);
+            const r = key.volumeRange(0);
+            const hi = key.volumeRange(std.math.maxInt(u64)).hi;
+            try be.range(gpa, key.TREE_BLOCK_REFS, r.lo.slice(), hi.slice(), 1, &kvs);
+            if (kvs.items.len == 0) return error.NothingToInject;
+            const k = try key.BlockRefKey.decode(kvs.items[0].key);
+            const t = try be.begin(@src());
+            errdefer be.abandon(t);
+            try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = k.volTag(), .block_idx = k.blockIdx(), .owner_ino = k.ownerIno(), .block_index = k.blockIndex() +| 1000 })});
+            try be.commit(t);
+            return;
+        }
+        // `orphan-inode`: the root's first regular-file dentry dropped,
+        // its record kept (the crashed cross-volume create's shape).
+        var kvs: std.ArrayList(tree.KeyValue) = .empty;
+        defer tree.deinitKeyValues(gpa, &kvs);
+        try be.range(gpa, key.TREE_DENTRIES, &key.dentryKey(1, 0, 0), &key.dentryKey(1, key.HASH54_MAX, std.math.maxInt(u8)), 4096, &kvs);
+        for (kvs.items) |kv| {
+            if (kv.key.len != key.DENTRY_KEY_LEN or kv.key[key.INO_MAJOR_KIND_OFF] != key.TREE_DENTRIES) continue;
+            const dv = record.DentryValue.decode(kv.value) catch continue;
+            if (dv.file_type != economy.ftByte(economy.S.IFREG)) continue;
+            const t = try be.begin(@src());
+            errdefer be.abandon(t);
+            try t.stageDelete(key.TREE_DENTRIES, kv.key);
+            try be.commit(t);
+            return;
+        }
+        return error.NothingToInject;
+    }
+
+    /// The CLI's fixed duty cycle (the fabric's live one binds online).
+    const Throttle = struct {
+        pct: u8,
+        fn face(self: *const Throttle) fsck.scrub.Throttle {
+            return .{ .ctx = @constCast(self), .pct = &pctFn };
+        }
+        fn pctFn(ctx: ?*anyopaque) u8 {
+            const self: *const Throttle = @ptrCast(@alignCast(ctx.?));
+            return self.pct;
+        }
+    };
+
+    fn offline(p: cli.Process, a: args.Fsck) u8 {
+        var body: Body = .{ .p = p, .a = a, .verb = if (a.scrub_only) "scrub" else "fsck" };
+        // `--repair --apply` is a WRITER: the same guarded open (the writer
+        // door), never a probe; a dry run opens the same way (the plane
+        // must be bound for the census) and mutates nothing.
+        return offline_set.withSet(p, a.target, .{ .with_plane = true, .verb = body.verb }, .{ .ctx = &body, .run = Body.run });
+    }
+} else struct {};
+
+// ---------------------------------------------------------------------------
+// Tests (portable): the grammar's lattice and the merge verb.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "the grammar: the mode defaults by target kind; the lattice refuses --apply without --repair, --repair on a shard, --shards online, --offline on a mountpoint, --online on a URI; scrub takes no repair flags" {
+    var d: args.Refusal = undefined;
+    const f = try args.parse(&.{ "squeezefs", "fsck", "sqmeta:///dev/m" }, &d);
+    try testing.expect(f.fsck.offline() and !f.fsck.scrub_only);
+    const m = try args.parse(&.{ "squeezefs", "fsck", "--json", "--scrub", "/mnt/x" }, &d);
+    try testing.expect(!m.fsck.offline() and m.fsck.json and m.fsck.scrub);
+    const sh = try args.parse(&.{ "squeezefs", "fsck", "--shards", "1/4", "sqmeta:///dev/m" }, &d);
+    try testing.expectEqual(args.FsckShard{ .k = 1, .n = 4 }, sh.fsck.shards.?);
+    const rep = try args.parse(&.{ "squeezefs", "fsck", "--repair", "--apply", "--quarantine-dir", "/q", "sqmeta:///dev/m" }, &d);
+    try testing.expect(rep.fsck.repair and rep.fsck.apply and std.mem.eql(u8, rep.fsck.quarantine_dir.?, "/q"));
+    const sc = try args.parse(&.{ "squeezefs", "scrub", "--throttle", "25", "sqmeta:///dev/m" }, &d);
+    try testing.expect(sc.fsck.scrub_only and sc.fsck.throttle == 25);
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--apply", "sqmeta:///dev/m" }, &d));
+    try testing.expect(d == .fsck_lattice);
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--repair", "--shards", "0/2", "sqmeta:///dev/m" }, &d));
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--shards", "0/2", "/mnt/x" }, &d));
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--offline", "/mnt/x" }, &d));
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--online", "sqmeta:///dev/m" }, &d));
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--shards", "2/2", "sqmeta:///dev/m" }, &d));
+    try testing.expect(d == .bad_shards);
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "scrub", "--repair", "sqmeta:///dev/m" }, &d));
+    try testing.expect(d == .unknown_flag);
+    const mg = try args.parse(&.{ "squeezefs", "fsck", "merge-reports", "--json", "a.json", "b.json" }, &d);
+    try testing.expectEqual(@as(usize, 2), mg.fsck_merge.files.len);
+    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "merge-reports" }, &d));
+}
+
+test "merge-reports: two shard files merge into one report with the exit verdict; a non-report file refuses" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const one = [_]finding.Finding{.{ .c9_unreferenced = .{ .ino = 70000, .blocks = 1 } }};
+    const two = [_]finding.Finding{ .{ .c9_unreferenced = .{ .ino = 70000, .blocks = 1 } }, .{ .c10_nlink_too_high = .{ .ino = 9, .nlink = 3, .names = 1 } } };
+    const ra: finding.Report = .{ .mode = .offline, .shard = .{ .k = 0, .n = 2 }, .findings = @constCast(&one), .counters = .{ .inodes_scanned = 4 } };
+    const rb: finding.Report = .{ .mode = .offline, .shard = .{ .k = 1, .n = 2 }, .findings = @constCast(&two), .counters = .{ .inodes_scanned = 5 } };
+    inline for (.{ ra, rb }, .{ "a.json", "b.json" }) |r, name| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try r.writeJson(&out.writer);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = out.written() });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "junk.json", .data = "{\"schema\":1}" });
+    const pa = try tmp.dir.realPathFileAlloc(io, "a.json", gpa);
+    defer gpa.free(pa);
+    const pb = try tmp.dir.realPathFileAlloc(io, "b.json", gpa);
+    defer gpa.free(pb);
+    const pj = try tmp.dir.realPathFileAlloc(io, "junk.json", gpa);
+    defer gpa.free(pj);
+    var stdout: std.Io.Writer.Allocating = .init(gpa);
+    defer stdout.deinit();
+    var stderr: std.Io.Writer.Allocating = .init(gpa);
+    defer stderr.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const V = struct {
+        fn write(w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.writeAll("t\n");
+        }
+    };
+    var p: cli.Process = .{ .gpa = gpa, .io = io, .env = &env, .argv = &.{ "squeezefs", "fsck", "merge-reports", "--json", pa, pb }, .stdout = &stdout.writer, .stderr = &stderr.writer, .version = V.write };
+    try testing.expectEqual(cli.exit_failed, cli.run(p));
+    var merged = try finding.Report.parse(gpa, stdout.written());
+    defer merged.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), merged.findings.len);
+    try testing.expectEqual(@as(u64, 9), merged.counters.inodes_scanned);
+    try testing.expect(merged.shard == null);
+    p.argv = &.{ "squeezefs", "fsck", "merge-reports", pj };
+    try testing.expectEqual(cli.exit_failed, cli.run(p));
+    try testing.expect(std.mem.indexOf(u8, stderr.written(), "is not a schema-1 fsck report") != null);
+}

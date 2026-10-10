@@ -6,3 +6,8 @@ generic/598  sets the fs.protected_regular sysctl: /proc/sys is read-only in the
 generic/563  cgroup-writeback accounting over a loop device created ON the scratch loop device: the helpers key a set by its backing FILE, a loop over a loop resolves to /dev (harness shape, not a semantic)
 generic/750  writes /proc/sys/vm/compact_memory in its loop: /proc/sys is read-only in the container
 generic/795  writes /proc/sys/vm/drop_caches in its loop: /proc/sys is read-only in the container
+generic/426  exportfs: open_by_handle_at(2) answers EPERM on EVERY handle in the container (CapEff lacks CAP_DAC_READ_SEARCH; the ext4 control fails the same way) — nothing to judge here; see the evidence note's export-handle stance
+generic/467  exportfs: as generic/426
+generic/477  exportfs: as generic/426
+generic/756  exportfs: as generic/426 (the 2026-10-10 "returned 1 incorrectly on an unlinked file" was errno 1 = EPERM, never a handle served)
+generic/777  exportfs: as generic/426

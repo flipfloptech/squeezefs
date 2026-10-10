@@ -182,10 +182,26 @@ pub const Ring128 = struct {
     /// `entries` is a power of two ≤ `max_entries` (the caller derived it:
     /// `next_pow2(width·depth + 8).max(16)`).
     pub fn init(entries: u16, flags: u32) errors.Error!Ring128 {
+        return setup(entries, @as(u32, entries) * 2, flags);
+    }
+
+    /// `init` with an EXPLICIT completion queue size and `IORING_SETUP_CLAMP`
+    /// (decision 0003 §G "`Ring128` CQ"): the zcrx lane's derived CQ
+    /// (`governor.cqEntriesFor`: `depth × per-command span completions +
+    /// sq`) exceeds `2 × sq` by an order of magnitude, and an ask past the
+    /// kernel's `IORING_MAX_CQ_ENTRIES` must clamp-then-round rather than
+    /// refuse (ops_zcrx §1.2). `cq_entries` is a power of two ≥ `entries`;
+    /// the kernel's echo (clamped) is what `cq.cqes.len` reports.
+    pub fn initWithCq(entries: u16, cq_entries: u32, flags: u32) errors.Error!Ring128 {
+        std.debug.assert(cq_entries >= entries and std.math.isPowerOfTwo(cq_entries));
+        return setup(entries, cq_entries, flags | linux.IORING_SETUP_CLAMP);
+    }
+
+    fn setup(entries: u16, cq_entries: u32, flags: u32) errors.Error!Ring128 {
         std.debug.assert(entries != 0 and std.math.isPowerOfTwo(entries) and entries <= max_entries);
         var p = std.mem.zeroes(linux.io_uring_params);
         p.flags = flags | linux.IORING_SETUP_SQE128 | linux.IORING_SETUP_CQE32 | linux.IORING_SETUP_CQSIZE;
-        p.cq_entries = @as(u32, entries) * 2;
+        p.cq_entries = cq_entries;
         const rc = linux.io_uring_setup(entries, &p);
         if (linux.errno(rc) != .SUCCESS) return errors.fromErrno(linux.errno(rc));
         const fd: linux.fd_t = @intCast(rc);
@@ -193,9 +209,12 @@ pub const Ring128 = struct {
         // One mmap carries both rings since 5.4; SQE128 is 5.19+, so a kernel
         // that accepted the flags has it — the check is the kernel's word.
         if (p.features & linux.IORING_FEAT_SINGLE_MMAP == 0) return error.NotSupported;
-        // Powers of two in, the same powers of two out: nothing was rounded.
+        // Powers of two in, the same powers of two out: nothing was rounded
+        // (under CLAMP an oversize CQ ask comes back as the kernel's ceiling,
+        // itself a power of two).
         std.debug.assert(p.sq_entries == entries);
-        std.debug.assert(p.cq_entries == @as(u32, entries) * 2);
+        std.debug.assert(p.cq_entries == cq_entries or (flags & linux.IORING_SETUP_CLAMP != 0 and p.cq_entries < cq_entries));
+        std.debug.assert(std.math.isPowerOfTwo(p.cq_entries));
 
         const ring_len = @max(
             p.sq_off.array + p.sq_entries * @sizeOf(u32),
@@ -622,6 +641,38 @@ pub fn prepUringCmd(sqe: *Sqe128, file: File, cmd_op: u32, cmd: *const [cmd_len]
     sqe.cmd = cmd.*;
 }
 
+/// One-shot `RECV` of up to `buf.len` bytes into `buf` (`msg_flags` in
+/// `rw_flags`): the zcrx lane's venue leg — a granted area chunk stands in
+/// for the provider pool (ops_zcrx §12.1.11).
+pub fn prepRecv(sqe: *Sqe128, file: File, buf: []u8, msg_flags: u32) void {
+    prepRw(sqe, .RECV, file, @intFromPtr(buf.ptr), @intCast(buf.len), 0);
+    sqe.rw_flags = msg_flags;
+}
+
+/// `SEND` of `buf` (`msg_flags` in `rw_flags`; `MSG_NOSIGNAL` is the lane's
+/// posture — a peer that closed must surface as a CQE, never a signal).
+pub fn prepSend(sqe: *Sqe128, file: File, buf: []const u8, msg_flags: u32) void {
+    prepRw(sqe, .SEND, file, @intFromPtr(buf.ptr), @intCast(buf.len), 0);
+    sqe.rw_flags = msg_flags;
+}
+
+/// Multishot `RECV_ZC` on `file` bound to the registered ifq `zcrx_id`
+/// (ops_zcrx §1.2: opcode 58, `ioprio = IORING_RECV_MULTISHOT`, the ifq
+/// index in the `splice_fd_in`/`file_index` union slot at +44, `len = 0`
+/// = unbounded). Payload lands in the area; the CQE's big word carries
+/// `(area_token_hi << 48) | byte offset` (`zcrxOff`).
+pub fn prepRecvZc(sqe: *Sqe128, file: File, zcrx_id: u32) void {
+    prepRw(sqe, .RECV_ZC, file, 0, 0, 0);
+    sqe.ioprio = linux.IORING_RECV_MULTISHOT;
+    sqe.splice_fd_in = @bitCast(zcrx_id);
+}
+
+/// The zcrx big word of a 32 B CQE: `struct io_uring_zcrx_cqe { __u64 off;
+/// __u64 __pad; }` at CQE offset 16 — `big_cqe[0]`.
+pub fn zcrxOff(cqe: *const Cqe32) u64 {
+    return cqe.big_cqe[0];
+}
+
 // ---------------------------------------------------------------------------
 // user_data tags.
 // ---------------------------------------------------------------------------
@@ -836,6 +887,44 @@ test "setup with SQE128|CQE32 succeeds; the CQ is twice the SQ; getSqe hands out
     try testing.expectEqual(@as(u16, 0x0020), std.mem.readInt(u16, r1[68..70], .little));
     try testing.expectEqualSlices(u8, &cmd, r1[cmd_offset..]);
     // Nothing was flushed: the ring tears down with two taken, unsubmitted slots.
+}
+
+test "initWithCq: an explicit CQ of 64 × the SQ is honoured; an ask past the kernel maximum clamps to it (CLAMP) instead of refusing; the lane's socket builders land opcode, ioprio and the ifq word byte-exact" {
+    var ring = try Ring128.initWithCq(16, 1024, 0);
+    defer ring.deinit();
+    try testing.expectEqual(@as(usize, 16), ring.sq.sqes.len);
+    try testing.expectEqual(@as(usize, 1024), ring.cq.cqes.len);
+    try testing.expect(ring.flags & linux.IORING_SETUP_CLAMP != 0);
+    // 2 × IORING_MAX_ENTRIES is the ceiling (io_uring.h:160-161); an ask of
+    // 4× it comes back clamped, a power of two.
+    var big = try Ring128.initWithCq(16, 4 * 2 * max_entries, 0);
+    defer big.deinit();
+    try testing.expectEqual(@as(usize, 2 * max_entries), big.cq.cqes.len);
+
+    const raw: [*]const u8 = @ptrCast(ring.sq.sqes.ptr);
+    var buf: [64]u8 = undefined;
+    const s0 = ring.getSqe().?;
+    prepRecv(s0, .{ .raw = 7 }, &buf, linux.MSG.NOSIGNAL);
+    try testing.expectEqual(@backingInt(linux.IORING_OP.RECV), raw[0]);
+    try testing.expectEqual(@as(i32, 7), std.mem.readInt(i32, raw[4..8], .little));
+    try testing.expectEqual(@as(u64, @intFromPtr(&buf)), std.mem.readInt(u64, raw[16..24], .little));
+    try testing.expectEqual(@as(u32, 64), std.mem.readInt(u32, raw[24..28], .little));
+    try testing.expectEqual(@as(u32, linux.MSG.NOSIGNAL), std.mem.readInt(u32, raw[28..32], .little));
+    const s1 = ring.getSqe().?;
+    prepRecvZc(s1, .{ .raw = 9 }, 0x1234_5678);
+    const r1 = raw[sqe_size .. 2 * sqe_size];
+    try testing.expectEqual(@backingInt(linux.IORING_OP.RECV_ZC), r1[0]);
+    try testing.expectEqual(@as(u16, linux.IORING_RECV_MULTISHOT), std.mem.readInt(u16, r1[2..4], .little));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, r1[24..28], .little));
+    try testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, r1[44..48], .little));
+    const s2 = ring.getSqe().?;
+    prepSend(s2, .{ .raw = 9 }, buf[0..24], linux.MSG.NOSIGNAL);
+    const r2 = raw[2 * sqe_size .. 3 * sqe_size];
+    try testing.expectEqual(@backingInt(linux.IORING_OP.SEND), r2[0]);
+    try testing.expectEqual(@as(u32, 24), std.mem.readInt(u32, r2[24..28], .little));
+    var cqe = std.mem.zeroes(Cqe32);
+    cqe.big_cqe[0] = (0xAB << 48) | 4096;
+    try testing.expectEqual(@as(u64, (0xAB << 48) | 4096), zcrxOff(&cqe));
 }
 
 test "1024 NOPs ride one enter and complete in order through 32 B CQEs whose extra words are zero" {

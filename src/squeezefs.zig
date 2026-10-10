@@ -151,7 +151,7 @@ pub const ops = struct {
     pub const defrag = @import("ops/defrag.zig");
     pub const nvmet = if (builtin.os.tag == .linux) @import("ops/nvmet.zig") else struct {};
     pub const keys = @import("ops/keys.zig");
-    // @anchor:ops_zcrx_import
+    pub const zcrx = @import("ops/zcrx.zig");
     // @anchor:ops_integrate_import
 };
 
@@ -206,7 +206,7 @@ test {
     _ = ops.defrag;
     if (builtin.os.tag == .linux) _ = ops.nvmet;
     _ = ops.keys;
-    // @anchor:ops_zcrx_test
+    _ = ops.zcrx;
     // @anchor:ops_integrate_test
     _ = ipc.session;
     if (builtin.os.tag == .linux) _ = ipc.host;

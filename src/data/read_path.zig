@@ -298,15 +298,29 @@ pub const Meta = struct {
 
 pub const DeviceError = errors.Error;
 
+/// What a device read's destination is: a pooled/bounce buffer of the
+/// read path, or the CALLER's registered destination (the dest-lease and
+/// raw full-block legs) — the zcrx lane counts the latter as its fused
+/// gather subset (charter §6.3).
+pub const DestShape = enum { pooled, registered };
+
+/// Who served a `read_range`: the device DMA (counted in the DMA byte
+/// instruments), or the zcrx lane's ONE gather (`zcrx_fill_bytes` is its
+/// provenance; `read_fill_dma_bytes`/`read_dest_dma_bytes` are NOT
+/// incremented — the extended closure: every served byte's provenance ∈
+/// {pooled DMA, zcrx area, dest DMA}).
+pub const Served = enum { dma, lane };
+
 /// The volume table: the incarnation word per block and ranged device
-/// reads. `read_range` DMAs `dest.len` bytes at `device_off` on `vol_tag`
-/// into `dest` (4 KiB-aligned pointer, length and offset); the device leg
-/// REFUSES a dead-lifetime key through the caller's snapshot (null ⇒ no
-/// DMA).
+/// reads. `read_range` fills `dest.len` bytes at `device_off` on `vol_tag`
+/// into `dest` (4 KiB-aligned pointer, length and offset) — by DMA, or by
+/// the zcrx lane sitting behind the seam in the data plane's volume
+/// binding, judged per call; the device leg REFUSES a dead-lifetime key
+/// through the caller's snapshot (null ⇒ no DMA).
 pub const Volumes = struct {
     ctx: *anyopaque,
     allocator_of: *const fn (ctx: *anyopaque, vol_tag: u64) ?*block_alloc.BlockAllocator,
-    read_range: *const fn (ctx: *anyopaque, vol_tag: u64, device_off: u64, dest: []u8) DeviceError!void,
+    read_range: *const fn (ctx: *anyopaque, vol_tag: u64, device_off: u64, dest: []u8, shape: DestShape) DeviceError!Served,
     /// The device fd for the zc direct leg (null = not resolvable).
     device_fd: *const fn (ctx: *anyopaque, vol_tag: u64) ?std.os.linux.fd_t,
 };
@@ -890,8 +904,7 @@ pub const ReadPath = struct {
         // The window into a bounce (≤ 64 KiB slab, else the fill pool), then the slice.
         const b = try self.acquireBounce(w.len);
         defer self.releaseBounce(b);
-        try self.vols.read_range(self.vols.ctx, w.vol_tag, w.device_off, b.bytes[0..@intCast(w.len)]);
-        stats.read_fill_dma_bytes.add(w.len);
+        if (try self.vols.read_range(self.vols.ctx, w.vol_tag, w.device_off, b.bytes[0..@intCast(w.len)], .pooled) == .dma) stats.read_fill_dma_bytes.add(w.len);
         if (!self.still(key, before)) return error.InputOutput;
         @memcpy(out[0..got], b.bytes[w.lo..w.hi]);
         @memset(out[got..], 0);
@@ -1056,8 +1069,7 @@ pub const ReadPath = struct {
         if (key != null and dest.registered and rel_s == 0 and slice_len == bs and self.cfg.passthrough and dest.aligned()) {
             const before = self.fillIncarnation(key.?);
             if (before != null) {
-                try self.vols.read_range(self.vols.ctx, key.?.vol_tag, key.?.offset, out);
-                stats.read_dest_dma_bytes.add(bs);
+                if (try self.vols.read_range(self.vols.ctx, key.?.vol_tag, key.?.offset, out, .registered) == .dma) stats.read_dest_dma_bytes.add(bs);
                 if (self.still(key.?, before.?) and self.bindingIs(ino, b, key.?)) {
                     if (!device_true and self.cfg.read_lane) self.hold.credit(key.?, bs);
                     return;
@@ -1131,16 +1143,14 @@ pub const ReadPath = struct {
             self.adm.governor.noteForeground(win.len(), clock.monotonicNs());
             if (win.bounced(req_len)) stats.ranged_read_unaligned_bounces.inc();
             if (direct) {
-                try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, out);
-                stats.read_dest_dma_bytes.add(win.len());
+                if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, out, .registered) == .dma) stats.read_dest_dma_bytes.add(win.len());
             }
             var bounce: ?Bounce = null;
             defer if (bounce) |bb| self.releaseBounce(bb);
             if (!direct) {
                 const bb = try self.acquireBounce(win.len());
                 bounce = bb;
-                try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, bb.bytes[0..@intCast(win.len())]);
-                stats.read_fill_dma_bytes.add(win.len());
+                if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, bb.bytes[0..@intCast(win.len())], .pooled) == .dma) stats.read_fill_dma_bytes.add(win.len());
             }
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, k);
             // Bytes in hand FIRST, then the two checks.
@@ -1268,8 +1278,7 @@ pub const ReadPath = struct {
             // The stored image into a second slot, decoded into the target.
             const img = try self.acquireBounce(d.chunk);
             defer self.releaseBounce(img);
-            try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, img.bytes[0..@intCast(d.chunk)]);
-            stats.read_fill_dma_bytes.add(d.chunk);
+            if (try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, img.bytes[0..@intCast(d.chunk)], .pooled) == .dma) stats.read_fill_dma_bytes.add(d.chunk);
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, key);
             pc.mark(&stats.read_fill_fetch_dma_ns);
             const view = d.decode(d.ctx, img.bytes[0..@intCast(d.chunk)], target) catch return error.InputOutput;
@@ -1277,8 +1286,7 @@ pub const ReadPath = struct {
             blk.len = @intCast(view.len);
             pc.mark(&stats.read_fill_decode_ns);
         } else {
-            try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, target[0..bs]);
-            stats.read_fill_dma_bytes.add(bs);
+            if (try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, target[0..bs], .pooled) == .dma) stats.read_fill_dma_bytes.add(bs);
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, key);
             pc.mark(&stats.read_fill_fetch_dma_ns);
             pc.mark(&stats.read_fill_decode_ns);
@@ -1656,7 +1664,7 @@ const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
         return if (tag == vol_tag) self.alloc else null;
     }
-    fn volRead(ctx: *anyopaque, tag: u64, device_off: u64, dest: []u8) DeviceError!void {
+    fn volRead(ctx: *anyopaque, tag: u64, device_off: u64, dest: []u8, _: DestShape) DeviceError!Served {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
         assert(tag == vol_tag);
         assert(derive.isAligned(device_off, 4096) and derive.isAligned(dest.len, 4096) and derive.isAligned(@intFromPtr(dest.ptr), 4096));
@@ -1667,6 +1675,7 @@ const Fixture = struct {
         _ = self.device_reads.fetchAdd(1, .monotonic);
         _ = self.device_read_bytes.fetchAdd(dest.len, .monotonic);
         @memcpy(dest, self.device[@intCast(device_off)..][0..dest.len]);
+        return .dma;
     }
     fn volFd(_: *anyopaque, _: u64) ?std.os.linux.fd_t {
         return null;
@@ -2259,9 +2268,10 @@ const DeviceFixture = if (builtin.os.tag == .linux) struct {
     }
     /// THE device binding: `nvme_dev.Device.readInto` — the ranged window
     /// and the whole-block fill land where the read path points.
-    fn volRead(ctx: *anyopaque, _: u64, device_off: u64, dest: []u8) DeviceError!void {
+    fn volRead(ctx: *anyopaque, _: u64, device_off: u64, dest: []u8, _: DestShape) DeviceError!Served {
         const self: *DeviceFixture = @ptrCast(@alignCast(ctx));
-        return self.dev.readInto(device_off, dest);
+        try self.dev.readInto(device_off, dest);
+        return .dma;
     }
     fn volFd(_: *anyopaque, _: u64) ?linux.fd_t {
         return null;

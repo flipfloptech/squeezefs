@@ -99,6 +99,7 @@ const lifecycle_stats = @import("../ops/lifecycle/stats.zig");
 const defrag_metrics = @import("../ops/defrag/metrics.zig");
 const nvmet_stats = @import("../ops/nvmet/stats.zig");
 const nvmet_initiator = if (is_linux) @import("../ops/nvmet/initiator.zig") else struct {};
+const zcrx_stats = @import("../ops/zcrx/stats.zig");
 
 pub const Error = Writer.Error;
 
@@ -212,6 +213,7 @@ pub const families = [_]Family{
     .{ .name = "fsck", .write = writeFsck },
     .{ .name = "jobs", .write = writeJobs },
     .{ .name = "nvmet", .write = writeNvmet },
+    .{ .name = "zcrx", .write = writeZcrx },
     .{ .name = "op_trace", .write = writeOpTrace },
     .{ .name = "cpu", .write = writeCpu },
     .{ .name = "wire", .write = writeWire },
@@ -282,6 +284,7 @@ pub const sources = [_]Source{
     .{ .path = "src/ops/lifecycle/stats.zig", .family = "jobs" },
     .{ .path = "src/ops/defrag/metrics.zig", .family = "jobs" },
     .{ .path = "src/ops/nvmet/stats.zig", .family = "nvmet" },
+    .{ .path = "src/ops/zcrx/stats.zig", .family = "zcrx" },
 };
 
 /// A counter-bearing module whose instruments another module's writer
@@ -626,6 +629,12 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
 fn writeNvmet(src: *Sources, w: *Writer) Error!void {
     if (is_linux) if (src.gpa) |gpa| nvmet_initiator.sampleFabric(gpa);
     try nvmet_stats.writeStatsJson(w);
+}
+
+/// The `zcrx_*` family (`ops/zcrx/stats.zig`): the lane's engagement,
+/// the three funnel outcomes, the must-stay-0 tripwires.
+fn writeZcrx(_: *Sources, w: *Writer) Error!void {
+    try zcrx_stats.writeStatsJson(w);
 }
 
 fn writeOpTrace(_: *Sources, w: *Writer) Error!void {

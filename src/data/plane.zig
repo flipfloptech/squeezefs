@@ -83,6 +83,8 @@ const sync_mutex = @import("../sync/mutex.zig");
 const lock_order = @import("../sync/lock_order.zig");
 const taskset = @import("../sync/taskset.zig");
 const nvme_dev = @import("../io/nvme_dev.zig");
+// @anchor:ops_zcrx_plane — the zcrx read lane sits behind `Volumes.read_range` (charter §6.3).
+const zcrx = @import("../ops/zcrx.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const meta_set = @import("../meta/meta_set.zig");
 const key = @import("../meta/key.zig");
@@ -347,6 +349,12 @@ pub const DataPlane = struct {
     passthrough: bool,
     vols: seams.Volumes = .{},
     devs: [router.MAX_VOLUMES]?*nvme_dev.Device = @splat(null),
+    /// The zcrx read lane (charter §6.3): the funnel the read path's volume
+    /// seam runs through, the per-volume sessions, the NIC registry.
+    zcrx_funnel: zcrx.funnel.Funnel = .{},
+    zcrx_decorated: zcrx.funnel.Decorated = undefined,
+    zcrx_bound: [router.MAX_VOLUMES]?*zcrx.arm.Bound = @splat(null),
+    zcrx_registry: zcrx.steering.Registry,
     rt: router.Router,
     reclaimer: *reclaim.Reclaimer,
     reclaim_free: seams.ReclaimFree,
@@ -445,6 +453,7 @@ pub const DataPlane = struct {
             .kvmap_chunk = kvmap.chunkFromEnv(opts.env),
             .windows = undefined,
             .crossing_kill_after = knobs.intKnob("SQUEEZEFS_TEST_KVMAP_CROSSING_KILL_AFTER", u32, opts.env),
+            .zcrx_registry = zcrx.steering.Registry.init(gpa),
         };
         self.shape = try ShapeTable.init(gpa);
         errdefer self.shape.deinit(gpa);
@@ -596,6 +605,11 @@ pub const DataPlane = struct {
         self.rt.addVolume(.{ .id = .{ .tag = d.vol_tag }, .state = .active, .capacity_bytes = d.capacity_blocks * self.block_size, .used_bytes = alloc.usedBlocks() * self.block_size }) catch return error.OutOfMemory;
         self.vols.add(.{ .vol_tag = d.vol_tag, .ordinal = ordinal, .alloc = alloc, .passthrough = self.passthrough, .write_cache_volatile = dev.writeCache() == .write_back or dev.writeCache() == .unknown, .active = d.state == .active });
         self.devs[ordinal] = dev;
+        // The zcrx lane for this device, judged by the probe ladder (loud
+        // once, Absent on this host unless a steerable HDS NIC fronts an
+        // nvme-tcp target); published to the funnel when present.
+        self.zcrx_bound[ordinal] = zcrx.arm.armVolume(self.gpa, self.io, opts.env, &self.zcrx_registry, d.uri, derive.facts(), budget.authority.level());
+        if (self.zcrx_bound[ordinal]) |b| self.zcrx_funnel.publish(ordinal, &b.lane);
         opened.* += 1;
         log.info("data volume {s}: vol-{x:0>16} bound as ordinal {d}: {d} usable blocks, {d} referenced ({d} ref records), {d} free", .{ d.uri, d.vol_tag, ordinal, d.capacity_blocks, alloc.usedBlocks() -| 1, population orelse 0, alloc.freeBlocksCount() + alloc.virginBlocks() });
     }
@@ -603,6 +617,13 @@ pub const DataPlane = struct {
     fn closeVolumes(self: *DataPlane, n: u32) void {
         var i: u32 = 0;
         while (i < n) : (i += 1) {
+            // The lane first: its session tears down (queues joined) before
+            // the kernel initiator's device closes.
+            _ = self.zcrx_funnel.retire(@intCast(i));
+            if (self.zcrx_bound[i]) |b| {
+                b.deinit();
+                self.zcrx_bound[i] = null;
+            }
             if (self.devs[i]) |dev| {
                 dev.deinit();
                 self.devs[i] = null;
@@ -786,6 +807,7 @@ pub const DataPlane = struct {
         self.closeTransform();
         for (self.devs[0..self.vols.count]) |d| if (d) |dev| dev.closeAtDismount();
         self.closeVolumes(self.vols.count);
+        self.zcrx_registry.deinit();
         self.reclaimer.deinit();
         self.rt.deinit();
         self.windows.deinit();
@@ -2289,8 +2311,17 @@ pub const DataPlane = struct {
         return n;
     }
 
+    /// The volume binding the read path reads through: the zcrx funnel
+    /// (the lane first, per call) over the device seam.
     fn readVolumes(self: *DataPlane) read_path.Volumes {
-        return .{ .ctx = self, .allocator_of = &volAllocatorOf, .read_range = &volReadRange, .device_fd = &volDeviceFd };
+        self.zcrx_decorated = .{ .inner = .{ .ctx = self, .allocator_of = &volAllocatorOf, .read_range = &volReadRange, .device_fd = &volDeviceFd }, .funnel = &self.zcrx_funnel, .ordinal_of = &volOrdinalOf };
+        return self.zcrx_decorated.volumes();
+    }
+
+    fn volOrdinalOf(ctx: *anyopaque, vol_tag: u64) ?u16 {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const v = self.vols.byTag(vol_tag) orelse return null;
+        return @intCast(v.ordinal);
     }
 
     fn volAllocatorOf(ctx: *anyopaque, vol_tag: u64) ?*block_alloc.BlockAllocator {
@@ -2299,9 +2330,12 @@ pub const DataPlane = struct {
         return v.alloc;
     }
 
-    fn volReadRange(ctx: *anyopaque, vol_tag: u64, device_off: u64, dest: []u8) read_path.DeviceError!void {
+    /// The device DMA leg of the read seam (`read_path.Volumes.read_range`);
+    /// the zcrx lane's gather, when armed, decides per call ahead of this.
+    fn volReadRange(ctx: *anyopaque, vol_tag: u64, device_off: u64, dest: []u8, _: read_path.DestShape) read_path.DeviceError!read_path.Served {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        return self.deviceRead(vol_tag, device_off, dest);
+        try self.deviceRead(vol_tag, device_off, dest);
+        return .dma;
     }
 
     fn volDeviceFd(ctx: *anyopaque, vol_tag: u64) ?linux.fd_t {

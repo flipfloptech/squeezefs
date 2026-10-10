@@ -149,18 +149,6 @@ pub fn Parked(comptime F: type) type {
         /// a debug line, only exhaustion is the error.
         pub fn initProbing(gpa: Allocator, entries: u16, ladder: []const u32, rung: *usize) InitError!Self {
             std.debug.assert(ladder.len != 0);
-            // Level-triggered counter; non-blocking so a READ racing a late
-            // write never blocks a plain read.
-            const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-            if (linux.errno(efd_rc) != .SUCCESS) {
-                log.err("ring_park: eventfd failed ({t})", .{linux.errno(efd_rc)});
-                return error.RingSetupFailed;
-            }
-            const efd: linux.fd_t = @intCast(efd_rc);
-            errdefer _ = linux.close(efd);
-            const wake_buf = try gpa.create(u64);
-            errdefer gpa.destroy(wake_buf);
-            wake_buf.* = 0;
             var last_err: anyerror = error.RingSetupFailed;
             const ring = for (ladder, 0..) |flags, i| {
                 if (F.setup(entries, flags)) |r| {
@@ -174,7 +162,27 @@ pub fn Parked(comptime F: type) type {
                 log.err("ring_park: io_uring_setup({d}) failed on every rung: {s} — the lane cannot start (charter §1.2: no classical fallback)", .{ entries, @errorName(last_err) });
                 return error.RingSetupFailed;
             };
-            return .{ .ring = ring, .event_fd = efd, .wake_buf = wake_buf, .gpa = gpa };
+            return initOver(gpa, ring);
+        }
+
+        /// The protocol over a ring the owner built itself (an explicit CQ
+        /// geometry — `Ring128.initWithCq` — or a probed opcode set the face's
+        /// `setup` does not express). On failure the ring is torn down here.
+        pub fn initOver(gpa: Allocator, ring: Ring) InitError!Self {
+            var r = ring;
+            errdefer F.deinit(&r);
+            // Level-triggered counter; non-blocking so a READ racing a late
+            // write never blocks a plain read.
+            const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+            if (linux.errno(efd_rc) != .SUCCESS) {
+                log.err("ring_park: eventfd failed ({t})", .{linux.errno(efd_rc)});
+                return error.RingSetupFailed;
+            }
+            const efd: linux.fd_t = @intCast(efd_rc);
+            errdefer _ = linux.close(efd);
+            const wake_buf = try gpa.create(u64);
+            wake_buf.* = 0;
+            return .{ .ring = r, .event_fd = efd, .wake_buf = wake_buf, .gpa = gpa };
         }
 
         /// Cancel the armed wake READ and reap its CQE, then tear down. The

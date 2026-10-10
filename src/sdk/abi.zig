@@ -39,7 +39,10 @@ pub const SqzBuf = opaque {};
 /// the data path allocates nothing per op).
 const gpa = std.heap.c_allocator;
 
-const VERSION_STRING = std.fmt.comptimePrint("squeezefs-sdk wire-abi {d} sdk-abi {d}", .{ version.WIRE_ABI, version.SDK_ABI });
+/// The release train (charter §11): the SDK's build root names it
+/// (`build.zig`'s generated root); the library instance under test reads `dev`.
+const train: []const u8 = if (@hasDecl(@import("root"), "squeezefs_sdk_train")) @import("root").squeezefs_sdk_train else "dev";
+const VERSION_STRING = std.fmt.comptimePrint("squeezefs-sdk {s} wire-abi {d} sdk-abi {d}", .{ train, version.WIRE_ABI, version.SDK_ABI });
 
 fn negInt(e: linux.E) c_int {
     return -@as(c_int, @backingInt(e));
@@ -389,7 +392,7 @@ test "NULL and stale handles are -EINVAL on every call that takes one, never a c
     var fresh: lease.Buf = .{};
     try testing.expectEqual(einval, sqz_buf_free(@ptrCast(&fresh)));
     try testing.expectEqual(@as(u32, 1 << 16 | 1), sqz_abi());
-    try testing.expectEqualStrings("squeezefs-sdk wire-abi 1 sdk-abi 1", std.mem.span(sqz_version()));
+    try testing.expectEqualStrings("squeezefs-sdk dev wire-abi 1 sdk-abi 1", std.mem.span(sqz_version()));
     try testing.expectEqualStrings("success", std.mem.span(sqz_strerror(0)));
     for ([_]linux.E{ .BUSY, .INVAL, .NOTCONN, .AGAIN, .NOMEM, .IO, .BADF, .XDEV, .PROTO, .PROTONOSUPPORT, .NODATA, .OPNOTSUPP, .ACCES, .CONNREFUSED, .NOSYS, .FBIG, .NOTDIR, .NOENT }) |e| {
         const t = std.mem.span(sqz_strerror(negInt(e)));

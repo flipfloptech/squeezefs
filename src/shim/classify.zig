@@ -504,9 +504,9 @@ fn printRefusal(dev: u64, e: client.EstablishError, code: ReasonCode, refusal: ?
         error.VersionSkew => if (blob.abi != wire.IPC_ABI) {
             line("mount dev {d}: abi mismatch (shim {d}, daemon {d}) — kernel-served", .{ dev, wire.IPC_ABI, blob.abi });
         } else if (wire.buildCommitDegenerate(blob.buildCommit()) or wire.buildCommitDegenerate(lifecycle.build_commit)) {
-            line("mount dev {d}: dev build identity (shim {s}, daemon {s}) — set SQUEEZEFS_TEST_IPC_ALLOW_DIRTY=1 on both ends; kernel-served", .{ dev, lifecycle.build_commit, blob.buildCommit() });
+            line("mount dev {d}: dev build identity ({s}, daemon {s}) — set SQUEEZEFS_TEST_IPC_ALLOW_DIRTY=1 on both ends; kernel-served", .{ dev, lifecycle.identity, blob.buildCommit() });
         } else {
-            line("mount dev {d}: build mismatch (shim {s}, daemon {s}) — kernel-served", .{ dev, lifecycle.build_commit, blob.buildCommit() });
+            line("mount dev {d}: build mismatch ({s}, daemon {s}) — kernel-served", .{ dev, lifecycle.identity, blob.buildCommit() });
         },
         error.Protocol => line("mount dev {d}: malformed ctl reply / session layout — kernel-served", .{dev}),
         error.PeerUntrusted => line("mount dev {d}: socket peer uid is neither root nor the mount owner — not sending the credential fd", .{dev}),

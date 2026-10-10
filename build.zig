@@ -396,12 +396,15 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         sdk_core.link_libc = true;
-        const sdk_root = b.addWriteFiles().add("sdk_root.zig", "comptime {\n    _ = @import(\"squeezefs\").sdk.abi;\n}\n");
+        // The root also names the train (`sqz_version` prints it; read
+        // through `@import("root")` so the library instance never imports
+        // the build identity).
+        const sdk_root = b.addWriteFiles().add("sdk_root.zig", "pub const squeezefs_sdk_train: []const u8 = @import(\"build_options\").train;\ncomptime {\n    _ = @import(\"squeezefs\").sdk.abi;\n}\n");
         const sdk_mod = b.createModule(.{
             .root_source_file = sdk_root,
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "squeezefs", .module = sdk_core }},
+            .imports = &.{ .{ .name = "squeezefs", .module = sdk_core }, .{ .name = "build_options", .module = build_options_mod } },
         });
         sdk_mod.link_libc = true;
         const sdk_static = b.addLibrary(.{ .name = "squeezefs_sdk", .linkage = .static, .root_module = sdk_mod });
@@ -491,10 +494,17 @@ fn gated(run: *std.Build.Step.Run, release_gate: bool) *std.Build.Step.Run {
     return run;
 }
 
-/// The release train. Bumped only as a release act across all first-party
-/// components (charter §11 "Versioning"). The git commit is the fine-grained
-/// identity; the daemon and shim refuse to pair across builds.
+/// The release train. Bumped only as a release act (`scripts/release.sh`)
+/// across all first-party components (charter §11 "Versioning"): this
+/// constant, `build.zig.zon`'s `.version` (checked equal below), the SDK's
+/// ABI words where the act says the ABI moved. The git commit is the
+/// fine-grained identity; the daemon and shim refuse to pair across builds.
 const train_version = "0.1.0";
+
+comptime {
+    const zon_version = @import("build.zig.zon").version;
+    if (!std.mem.eql(u8, zon_version, train_version)) @compileError("build.zig.zon .version (" ++ zon_version ++ ") and build.zig train_version (" ++ train_version ++ ") disagree — the release act bumps both");
+}
 
 /// `git describe`-style identity: short commit, `-dirty` when the tree has
 /// uncommitted changes, `unknown` outside a repository (a tarball build).

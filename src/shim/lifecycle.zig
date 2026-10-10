@@ -37,6 +37,10 @@ const fd_table = @import("fd_table.zig");
 /// non-degenerate test identity.
 pub const in_so: bool = @hasDecl(root, "squeezefs_il_build_commit");
 pub const build_commit: []const u8 = if (in_so) root.squeezefs_il_build_commit else "0123456789ab";
+pub const train: []const u8 = if (in_so) root.squeezefs_il_train else "dev";
+/// One static identity string (`squeezefs-il train <train> commit <commit>`):
+/// the pairing lines print it and the release act reads it off the .so.
+pub const identity: []const u8 = "squeezefs-il train " ++ train ++ " commit " ++ build_commit;
 
 // ---------------------------------------------------------------------------
 // The reentrancy guard.

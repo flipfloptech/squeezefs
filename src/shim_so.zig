@@ -13,6 +13,9 @@ const shim = @import("shim/shim.zig");
 /// Read by `shim/lifecycle.zig` through `@import("root")`; its presence is
 /// also what turns the exports on.
 pub const squeezefs_il_build_commit: []const u8 = @import("build_options").git_commit;
+/// The release train (charter §11): the shim names it beside the commit in
+/// its identity line, so `strings libsqueezefs_il.so` answers the release act.
+pub const squeezefs_il_train: []const u8 = @import("build_options").train;
 
 pub const panic = shim.panic;
 pub const std_options = shim.std_options;

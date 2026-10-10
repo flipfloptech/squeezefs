@@ -4,3 +4,4 @@ zig-out-linux/
 *.debug
 .DS_Store
 fuzz-corpus/
+.release-dry-run/

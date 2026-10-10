@@ -203,8 +203,41 @@ same commit. **The train is not bumped**: that is the owner's act.
 
 ## 7. The gates at the end of the rung
 
-Filled from the final runs (see the report below; the venue carried another
-agent's LTP run and brackets concurrently throughout).
+The venue carried another agent's LTP run, then its nvmet-loop scoping
+brackets, throughout (load 4–10, three live fabric controllers in sysfs,
+page-cache churn); every failure below is attributed to that sharing and
+re-ran green where it could be re-run.
+
+**macOS `zig build gate`** (the portable half; HEAD `a4d61dc` minus the
+rails' vanished-file tolerance, re-verified with `zig build fmt rails`):
+25/25 steps, **1997/2021 tests passed, 24 skipped** (unit 1876 pass + 24
+`no_linux`; rails 13/13; the smoke/bench/nvmet binaries' aggregator tests
+pass vacuously).
+
+**Linux `scripts/venue zig build gate`** (full run, `SQUEEZEFS_TEST_SKIP_LEDGER`
+set): unit **2295 pass, 40 skip, 1 fail** (2336) — the one failure is
+`stats.zig` "allocation law" with the concurrent agent's three fabric
+controllers in sysfs (§9); rails **13/13**; shim census 1/1; smoke 59 pass /
+2 skip / 2 fail in the gate run — daemon B's `kmbuf ring registration ENOMEM
+(order-8 contiguous pages)` under the other agent's page-cache churn (the
+known venue refusal) and a kill-row's `size >= claimed` under load — and
+**61 pass / 2 skip** on the immediate re-run of `smoke bench-smoke
+shim-smoke nvmet-smoke`; bench-smoke **40 pass**; shim-smoke pass;
+nvmet-smoke **49 pass / 2 fail** — both legs read the SHARED kernel nvmet
+configfs tree while the brackets agent's nvmet-loop ports were live (a
+non-harness port id on our listener; their subsystem in `foreign_live`);
+sdk-smoke ok (static + shared). Skip ledger of the Linux gate: other_step
+40 (the rigs in the unit run: fidelity 12, shim smoke 3, host e2e 2, guard
+smoke 1, the smoke rows 22), no_seam 3, no_kernel_feature 1
+(CONFIG_ETHTOOL_NETLINK), plus the kit's two probe rows. An earlier gate
+attempt was killed by its 65-minute `timeout` while the other agent's LTP
+run held the venue; another lost its rails to a `.zig` file that vanished
+mid-walk (the rails now skip a vanished file, `a4d61dc`).
+
+The literal rail's allowlist was rebased twice during the rung (`19` rows
+after the bench edit, `1` after the shim identity) with
+`scripts/rails-literal-rebase` — the line-keyed row is the brittleness the
+rail's law bought; the rebase never admits a literal.
 
 ## 8. Found and fixed along the way
 

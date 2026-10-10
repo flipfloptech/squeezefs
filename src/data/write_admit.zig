@@ -1465,6 +1465,108 @@ test "the one-authority screen never parks under (3): a write meeting an overlay
     try testing.expectEqual(@as(u32, 0), w.wp.overlay.registry.open_count.load(.monotonic));
 }
 
+/// Half a block (a park, never a write-through) for `(ino, block)`.
+fn parkHalf(w: *World, io: Io, ino: u64, block: u32, seed: u8) !void {
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&half, seed);
+    if (w.f.map.files.get(ino) == null) try w.f.map.create(ino, .striped, 0);
+    const o = try w.wp.write(io, .{ .ino = ino, .offset = @as(u64, block) * wt.BS, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(@as(u64, block) * wt.BS) });
+    try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
+}
+
+// Rung 9 F2: at the parked-buffer cap the accumulation checkout answered
+// WouldBlock, which the handler sent to a BLOCKING write(2) as EAGAIN (fio
+// aborted on 100–128 per 60 s leg; the venue's pool sat full of cold
+// partials — 250 parked, 36 uploads). A blocking write on a regular file
+// may not answer EAGAIN: the gate parks, and a set that is COLD (nothing
+// in flight to return a cell) is drained by the writer itself.
+test "the parked-buffer gate, cold set: the write past the cap completes — the coldest parked block is flushed durably (never a lost byte), the piece parks, no EAGAIN" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const waits0 = stats.parked_gate_waits.load();
+    // Eight parked partials fill the cap (ino 1, blocks 0..7); block 0 is
+    // the coldest.
+    for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    try parkHalf(w, io, 1, 8, 9);
+    try testing.expect(stats.parked_gate_waits.load() > waits0);
+    // Block 0 is on the device: its half, then zeros; blocks 1..8 parked.
+    const b0 = w.f.map.seam().lookup(1, 0) orelse return error.VictimNotPublished;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b0.vol_tag, b0.offset, &got);
+    var half: [wt.BS / 2]u8 = undefined;
+    fill(&half, 1);
+    try testing.expectEqualSlices(u8, &half, got[0 .. wt.BS / 2]);
+    try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0));
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    try testing.expect(!w.wp.table.has(1, 0));
+    try testing.expect(w.wp.table.has(1, 8));
+}
+
+/// A device hook that holds every DMA until released (the window between a
+/// DMA and its CQE, stretched); the upload task's thread yields meanwhile.
+const HeldDma = struct {
+    gate: std.atomic.Value(u32) = .init(0),
+    hits: std.atomic.Value(u32) = .init(0),
+
+    fn hook(self: *HeldDma) wt.Hook {
+        return .{ .ctx = self, .call = &call };
+    }
+
+    fn call(ctx: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
+        const self: *HeldDma = @ptrCast(@alignCast(ctx));
+        _ = self.hits.fetchAdd(1, .acq_rel);
+        while (self.gate.load(.acquire) == 0) std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    fn release(self: *HeldDma) void {
+        self.gate.store(1, .release);
+    }
+};
+
+// The hot set: an upload in flight holds a cell; the writer at the cap
+// waits for its settle (not a tick, not a cold flush) and proceeds when it
+// lands.
+test "the parked-buffer gate, hot set: a writer at the cap waits for the in-flight upload's settle and proceeds within the tick — no cold flush, no EAGAIN" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .adaptive, false);
+    defer w.deinit(testing.allocator);
+    var held: HeldDma = .{};
+    w.f.dev.hook = held.hook();
+    const waits0 = stats.parked_gate_waits.load();
+    // One block completes and its detached upload blocks in the DMA (ino 2).
+    try w.f.map.create(2, .striped, 0);
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&half, 0x20);
+    _ = try w.wp.write(io, .{ .ino = 2, .offset = 0, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(0) });
+    const o2 = try w.wp.write(io, .{ .ino = 2, .offset = wt.BS / 2, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(wt.BS / 2) });
+    try testing.expectEqual(@as(u32, 1), o2.count(.write_through));
+    while (held.hits.load(.acquire) == 0) std.Thread.yield() catch {};
+    // Seven parked partials take the other cells (ino 1, blocks 0..6).
+    for (0..7) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    // The eighth partial parks at the gate behind the upload.
+    const Writer = struct {
+        w: *World,
+        result: anyerror!void = error.NotRun,
+        fn run(self: *@This()) void {
+            self.result = parkHalf(self.w, testing.io, 1, 7, 8);
+        }
+    };
+    var writer: Writer = .{ .w = w };
+    const th = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    while (w.wp.table.upload_settled.waiters(io) == 0 and writer.result == error.NotRun) std.Thread.yield() catch {};
+    // The DMA lands: the upload publishes, retires its entry (a cell
+    // returns) and settles — the writer wakes and takes it.
+    held.release();
+    th.join();
+    try writer.result;
+    try testing.expect(stats.parked_gate_waits.load() > waits0);
+    w.wp.quiesce(io);
+    try testing.expect(w.f.map.seam().lookup(2, 0) != null);
+    try testing.expect(w.wp.table.has(1, 7));
+}
+
 test "writeStatsJson aggregates every family under its module key" {
     var buf: [65536]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);

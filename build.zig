@@ -32,6 +32,8 @@
 //!   zig build dist         — the dist profile artifact + split debug info.
 //!   zig build shim         — libsqueezefs_il.so (the LD_PRELOAD shim) into lib/ (Linux).
 //!   zig build shim-smoke   — the LD_PRELOAD battery against a mount (Linux, root).
+//!   zig build nvmet-smoke  — the nvmeof fidelity tier against the kernel nvmet
+//!                            target (Linux, root; part of the gate).
 const std = @import("std");
 
 const Profile = enum { gate, dist };
@@ -240,6 +242,24 @@ pub fn build(b: *std.Build) void {
         shim_smoke_step.dependOn(&run_shim_smoke.step);
     }
 
+    // ---- the nvmeof fidelity tier (charter §8, §11 release gate): the
+    //      `nvmet fidelity:` legs through the binary against the venue's
+    //      kernel nvmet target (loop + tcp), zero mocks; after the shim
+    //      smoke (one mount on the venue at a time); skips loudly off the
+    //      venue ----
+    const nvmet_smoke_tests = b.addTest(.{
+        .name = "squeezefs-nvmet-smoke",
+        .root_module = squeezefs_mod,
+        .filters = &.{"nvmet fidelity:"},
+    });
+    const run_nvmet_smoke = b.addRunArtifact(nvmet_smoke_tests);
+    run_nvmet_smoke.setCwd(exe.getEmittedBinDirectory());
+    run_nvmet_smoke.has_side_effects = true;
+    run_nvmet_smoke.step.dependOn(&run_bench_smoke.step);
+    if (shim_dir != null) run_nvmet_smoke.step.dependOn(shim_smoke_step);
+    const nvmet_smoke_step = b.step("nvmet-smoke", "Run the nvmeof fidelity tier (share/connect/format/mount/PR legs on the kernel nvmet target)");
+    nvmet_smoke_step.dependOn(&run_nvmet_smoke.step);
+
     // ---- fmt check ----
     const fmt_step = b.step("fmt", "Check formatting (zig fmt --check)");
     const fmt = b.addFmt(.{
@@ -256,6 +276,7 @@ pub fn build(b: *std.Build) void {
     gate_step.dependOn(smoke_step);
     gate_step.dependOn(bench_smoke_step);
     gate_step.dependOn(shim_smoke_step);
+    gate_step.dependOn(nvmet_smoke_step);
 
     // ---- @anchor:sdk_build — the native SDK: libsqueezefs_sdk.{a,so} + the
     //      header + the C smoke (charter §7, §12; il_sdk §10.2–10.3) ----

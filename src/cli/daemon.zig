@@ -168,6 +168,10 @@ pub const Options = struct {
     /// release the invoking shell's streams at `ready`.
     log_fd: linux.fd_t,
     policy: supervisor.Policy = .{},
+    /// Key material the invoking process stashed BEFORE the fork
+    /// (`ops/keys.zig`): C1 zeroizes its inherited copy right after C2
+    /// exists — only the daemon keeps it.
+    scrub: ?[]u8 = null,
 };
 
 /// Fork twice (module doc). Returns `parent` in the invoking process once
@@ -223,7 +227,9 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
         _ = linux.close(pipe_b[0]);
         return .{ .daemon = .{ .fd = pipe_b[1] } };
     }
-    // C1: relay B → A, then exit or supervise.
+    // C1: the inherited key material goes first (the daemon owns it now),
+    // then relay B → A, then exit or supervise.
+    if (opts.scrub) |bytes| std.crypto.secureZero(u8, bytes);
     _ = linux.close(pipe_b[1]);
     var relay: [4096]u8 = undefined;
     const report = readToEof(pipe_b[0], &relay);

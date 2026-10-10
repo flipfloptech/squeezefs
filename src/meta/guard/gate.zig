@@ -123,6 +123,11 @@ pub const Guard = struct {
     hb_stop: std.atomic.Value(u32) = .init(0),
     hb_fut: ?Io.Future(void) = null,
     clear_outcome: ?ClearOutcome = null,
+    /// `prepare` → `commit` carry: the replayed claim's raw bytes, the
+    /// evidence and the gate's clock.
+    found_raw: ?[]u8 = null,
+    evidence: claim.Evidence = .{ .reclaimable = .absent },
+    gate_now: i64 = 0,
 
     /// `writer_guard_mode` (§2.8).
     pub fn modeName(self: *const Guard) []const u8 {
@@ -157,12 +162,23 @@ pub const Guard = struct {
 
     // ---- the gate ----
 
-    /// Steps 4–5 of the ordering law (§2.2). Runs with the pass fiber live
-    /// and the checkpoint thread NOT yet spawned; the caller covers the
-    /// claim's residue and spawns it after. A refusal releases what the
-    /// gate took (PR, the char node) before returning — the flock is the
-    /// backend's `errdefer`, closed last.
-    pub fn gate(gpa: Allocator, io: Io, be: *KvBackend, opts: Options) backend.OpenError!*Guard {
+    /// Steps 4–5 of the ordering law (§2.2), in TWO phases so the B1
+    /// arbitration precedes EVERY device write of the open: `prepare`
+    /// reads the claim, classifies it, resolves the PR posture and
+    /// arbitrates (register ladder, acquire, preempt a stale holder) —
+    /// no write; the backend then runs its ring-recovery cover (the
+    /// reference's `preclaim_ring_recovery`) and `commit` lands the claim
+    /// tx and its barrier. WHY the split: a successor under a SECOND host
+    /// identity (the paused-then-preempted row of the fidelity tier) is
+    /// fenced at the device by the incumbent's Write Exclusive hold until
+    /// the preempt lands — a cover written before it answered `-EBADE`
+    /// and failed the open (measured on nvmet-loop); a same-identity
+    /// successor (the kill -9 remount) never saw it because nvmet judges
+    /// access by host id. Runs with the pass fiber live and the checkpoint
+    /// thread NOT yet spawned. A refusal releases what the gate took (PR,
+    /// the char node) before returning — the flock is the backend's
+    /// `errdefer`, closed last.
+    pub fn prepare(gpa: Allocator, io: Io, be: *KvBackend, opts: Options) backend.OpenError!*Guard {
         const identity: claim.Identity = if (builtin.is_test) (opts.test_identity orelse proc.localIdentity()) else proc.localIdentity();
         const probe: claim.PidProbe = if (builtin.is_test) (opts.test_pid_probe orelse proc.probe) else proc.probe;
         const g = try gpa.create(Guard);
@@ -188,22 +204,22 @@ pub const Guard = struct {
 
         // The replayed claim (the staleness evidence) and its key.
         const found = try g.readClaim(gpa);
-        defer if (found.raw) |r| gpa.free(r);
+        errdefer if (found.raw) |r| gpa.free(r);
         g.xkey = found.xkey;
-        const now = clock.realtimeCoarseNs();
-        const evidence = claim.classify(found.raw, identity, now, probe);
+        g.found_raw = found.raw;
+        g.gate_now = clock.realtimeCoarseNs();
+        g.evidence = claim.classify(found.raw, identity, g.gate_now, probe);
 
-        if (opts.mode == .claim_clear) {
-            g.clear_outcome = try g.clear(found.raw, evidence, now);
-            return g;
-        }
+        // `claim clear` decides at commit (its delete needs the cover too).
+        if (opts.mode == .claim_clear) return g;
 
         // B1 posture: a fake substrate in tests, else the char twin.
         try g.resolvePr(gpa, opts);
         errdefer g.releasePr();
 
         // The decision matrix (§2.4).
-        switch (evidence) {
+        const now = g.gate_now;
+        switch (g.evidence) {
             .fresh_foreign => |f| {
                 if (f.future) log.warn("meta volume {s}: the writer claim is stamped {d} s in the FUTURE — check this host's clock (and the holder's)", .{ be.path, @divFloor(f.claim.ts_ns - now, std.time.ns_per_s) });
                 return g.refuseClaim(.{ .fresh = f.claim }, now);
@@ -225,16 +241,37 @@ pub const Guard = struct {
 
         // B1 arbitration: register ladder, acquire, preempt a stale holder.
         if (g.prClient()) |c| {
-            try g.arbitrate(c, evidence);
+            try g.arbitrate(c, g.evidence);
             g.pr_active = true;
         }
+        return g;
+    }
 
-        // The claim: ONE tx through the conveyor, then the barrier.
+    /// The second phase: the claim tx through the conveyor and its
+    /// barrier (`claim clear`: the delete). The guard is the backend's
+    /// after this returns; a failure here is the caller's unwind.
+    pub fn commit(g: *Guard) backend.OpenError!void {
+        defer if (g.found_raw) |r| {
+            g.gpa.free(r);
+            g.found_raw = null;
+        };
+        if (g.mode == .claim_clear) {
+            g.clear_outcome = try g.clear(g.found_raw, g.evidence, g.gate_now);
+            return;
+        }
         try g.commitClaim();
         try g.barrier();
         guard.stats.claims_committed.inc();
         guard.stats.clients_registered.add(1);
-        log.info("meta volume {s}: writer claim committed and barriered (id {x:0>16}, pid {d}, mode {s}, pr key {x:0>16})", .{ be.path, identity.writerId(be.index), identity.pid, g.modeName(), claim.prKey(identity.writerId(be.index), identity.boot_id) });
+        log.info("meta volume {s}: writer claim committed and barriered (id {x:0>16}, pid {d}, mode {s}, pr key {x:0>16})", .{ g.be.path, g.identity.writerId(g.be.index), g.identity.pid, g.modeName(), claim.prKey(g.identity.writerId(g.be.index), g.identity.boot_id) });
+    }
+
+    /// Both phases back to back (the tests' door; the backend interleaves
+    /// its cover between them).
+    pub fn gate(gpa: Allocator, io: Io, be: *KvBackend, opts: Options) backend.OpenError!*Guard {
+        const g = try prepare(gpa, io, be, opts);
+        errdefer g.deinit();
+        try g.commit();
         return g;
     }
 
@@ -592,6 +629,7 @@ pub const Guard = struct {
     pub fn deinit(g: *Guard) void {
         g.stopHeartbeat();
         g.releasePr();
+        if (g.found_raw) |r| g.gpa.free(r);
         g.gpa.destroy(g);
     }
 };

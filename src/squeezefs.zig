@@ -149,7 +149,8 @@ pub const ops = struct {
     pub const jobs = @import("ops/jobs.zig");
     pub const lifecycle = @import("ops/lifecycle.zig");
     pub const defrag = @import("ops/defrag.zig");
-    // @anchor:ops_nvmet_import
+    pub const nvmet = if (builtin.os.tag == .linux) @import("ops/nvmet.zig") else struct {};
+    pub const keys = @import("ops/keys.zig");
     // @anchor:ops_zcrx_import
 };
 
@@ -202,7 +203,8 @@ test {
     _ = ops.jobs;
     _ = ops.lifecycle;
     _ = ops.defrag;
-    // @anchor:ops_nvmet_test
+    if (builtin.os.tag == .linux) _ = ops.nvmet;
+    _ = ops.keys;
     // @anchor:ops_zcrx_test
     _ = ipc.session;
     if (builtin.os.tag == .linux) _ = ipc.host;

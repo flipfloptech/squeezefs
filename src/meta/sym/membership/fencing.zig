@@ -39,6 +39,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const counters = @import("../../../core/counters.zig");
+const knobs = @import("../../../core/knobs.zig");
 const log = @import("../../../core/log.zig");
 const pr = @import("../../guard/pr.zig");
 const nvme = @import("../../guard/nvme_cmd.zig");
@@ -109,6 +110,12 @@ pub fn acquireWero(client: *pr.Client) pr.Error!void {
 fn noteReport(client: *const pr.Client) void {
     stats.pr_registrants_per_namespace.set(client.regctl);
     stats.pr_report_bytes.set(client.report_bytes);
+}
+
+/// `SQUEEZEFS_PR_REGISTRANT_CAP`: a DECLARED cap for a vendor array
+/// (charter §5.5); null = learn (unbounded on nvmet by construction).
+pub fn declaredRegistrantCap(env: *const std.process.Environ.Map) ?u16 {
+    return knobs.optIntKnob("SQUEEZEFS_PR_REGISTRANT_CAP", u16, env);
 }
 
 /// The cap gate (R:429-453): `cap_in_force = 0` is unbounded; else a

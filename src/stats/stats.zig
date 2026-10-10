@@ -97,6 +97,8 @@ const fsck_mod = @import("../ops/fsck.zig");
 const jobs_stats = @import("../ops/jobs/stats.zig");
 const lifecycle_stats = @import("../ops/lifecycle/stats.zig");
 const defrag_metrics = @import("../ops/defrag/metrics.zig");
+const nvmet_stats = @import("../ops/nvmet/stats.zig");
+const nvmet_initiator = if (is_linux) @import("../ops/nvmet/initiator.zig") else struct {};
 
 pub const Error = Writer.Error;
 
@@ -209,6 +211,7 @@ pub const families = [_]Family{
     .{ .name = "ops", .write = writeOps },
     .{ .name = "fsck", .write = writeFsck },
     .{ .name = "jobs", .write = writeJobs },
+    .{ .name = "nvmet", .write = writeNvmet },
     .{ .name = "op_trace", .write = writeOpTrace },
     .{ .name = "cpu", .write = writeCpu },
     .{ .name = "wire", .write = writeWire },
@@ -278,6 +281,7 @@ pub const sources = [_]Source{
     .{ .path = "src/ops/jobs/stats.zig", .family = "jobs" },
     .{ .path = "src/ops/lifecycle/stats.zig", .family = "jobs" },
     .{ .path = "src/ops/defrag/metrics.zig", .family = "jobs" },
+    .{ .path = "src/ops/nvmet/stats.zig", .family = "nvmet" },
 };
 
 /// A counter-bearing module whose instruments another module's writer
@@ -614,6 +618,14 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
         try op_trace.writePhaseClassesJson(w);
     }
     try w.writeByte('}');
+}
+
+/// The `nvmet_*` / `fabric_*` family; the fabric controllers are SAMPLED
+/// off `/sys/class/nvme` at every render (a cold path: the `.stats` build
+/// is the cadence, never an op).
+fn writeNvmet(src: *Sources, w: *Writer) Error!void {
+    if (is_linux) if (src.gpa) |gpa| nvmet_initiator.sampleFabric(gpa);
+    try nvmet_stats.writeStatsJson(w);
 }
 
 fn writeOpTrace(_: *Sources, w: *Writer) Error!void {

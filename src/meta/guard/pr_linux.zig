@@ -6,12 +6,19 @@
 //! and verified through `/sys/class/nvme-generic/<ng>/dev`, and every
 //! command goes through `IORING_OP_URING_CMD` with `NVME_URING_CMD_{IO,
 //! ADMIN}` on a dedicated `SQE128|CQE32` ring the guard owns for its life.
-//! Linux exposes NVMe passthru through uring_cmd only on the char node
+//! Linux exposes NVMe passthru through uring_cmd only on the char nodes
 //! (`nvme_ns_chr_uring_cmd`); the block node's uring_cmd is the block
-//! layer's own (`BLOCK_URING_CMD_DISCARD`).
+//! layer's own (`BLOCK_URING_CMD_DISCARD`). The NAMESPACE node answers
+//! `NVME_URING_CMD_IO` alone (`nvme_ns_uring_cmd`: anything else is
+//! `-ENOTTY`); ADMIN commands (Identify, Get Features FID 0x81) go to the
+//! CONTROLLER node `/dev/nvme<N>` (`nvme_dev_uring_cmd`) — measured on
+//! 7.2.6-sqz against nvmet-loop by the fidelity tier (the rung-5 design
+//! put both on the ns node; the reference's ioctl path hid the split
+//! because `nvme_ioctl` on a namespace accepts admin commands). So a
+//! `Device` holds both fds and routes by queue.
 //!
-//! The venue has no `/dev/ng*` (rung 8 brings nvmet-loop): the resolution
-//! is exercised on the plain-file arm here and skips LOUD otherwise.
+//! The real-device test runs where a `/dev/ng*` exists (the fidelity
+//! tier's substrate) and skips LOUD otherwise.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -42,10 +49,13 @@ pub const Resolved = union(enum) {
     device: *Device,
 };
 
-/// The char node + the ring: the `nvme_cmd.Namespace` face.
+/// The two char nodes + the ring: the `nvme_cmd.Namespace` face.
 pub const Device = struct {
     gpa: Allocator,
+    /// `/dev/ngXnY`: the I/O queue (reservation commands).
     fd: linux.fd_t,
+    /// `/dev/nvmeX`: the admin queue (Identify, Get Features).
+    ctrl_fd: linux.fd_t,
     ring: uring128.Ring128,
     nsid: u32,
     /// `/dev/ngXnY` (for the log).
@@ -63,13 +73,14 @@ pub const Device = struct {
     pub fn deinit(self: *Device) void {
         self.ring.deinit();
         _ = linux.close(self.fd);
+        _ = linux.close(self.ctrl_fd);
         self.gpa.destroy(self);
     }
 
     /// One passthru command: the 72 B `nvme_uring_cmd` at the head of the
-    /// SQE128 command area, `cmd_op` by queue, a submit-and-wait for its
-    /// CQE32. `res` ≥ 0 is the NVMe status, < 0 a transport `-errno`;
-    /// `big_cqe[0]` carries CDW0/CDW1.
+    /// SQE128 command area, `cmd_op` and the fd by queue, a submit-and-wait
+    /// for its CQE32. `res` ≥ 0 is the NVMe status, < 0 a transport
+    /// `-errno`; `big_cqe[0]` carries CDW0/CDW1.
     fn issueFn(ctx: *anyopaque, queue: nvme.Queue, cmd: *const nvme.UringCmd) errors.Error!nvme.Completion {
         const self: *Device = @ptrCast(@alignCast(ctx));
         const sqe = self.ring.getSqe() orelse return error.SubmissionQueueOverflow;
@@ -77,7 +88,11 @@ pub const Device = struct {
             .admin => nvme.NVME_URING_CMD_ADMIN,
             .io => nvme.NVME_URING_CMD_IO,
         };
-        uring128.prepUringCmd(sqe, .{ .raw = self.fd }, cmd_op, &cmd.toCmdArea());
+        const fd = switch (queue) {
+            .admin => self.ctrl_fd,
+            .io => self.fd,
+        };
+        uring128.prepUringCmd(sqe, .{ .raw = fd }, cmd_op, &cmd.toCmdArea());
         sqe.user_data = ud_cmd;
         _ = try self.ring.submitAndWait(1);
         var cqes: [1]uring128.Cqe32 = undefined;
@@ -131,10 +146,12 @@ pub fn charTwinName(block_name: []const u8, out: *[32]u8) ?[]const u8 {
     return out[0 .. 2 + rest.len];
 }
 
-/// `/sys/class/nvme-generic/<ng>/dev` → `major:minor` of the char node.
-fn sysfsCharDev(ng: []const u8) ?struct { major: u32, minor: u32 } {
+const DevNum = struct { major: u32, minor: u32 };
+
+/// `<class dir>/<name>/dev` → `major:minor` of a char node.
+fn sysfsClassDev(class: []const u8, name: []const u8) ?DevNum {
     var pb: [96]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&pb, "/sys/class/nvme-generic/{s}/dev", .{ng}, 0) catch return null;
+    const path = std.fmt.bufPrintSentinel(&pb, "/sys/class/{s}/{s}/dev", .{ class, name }, 0) catch return null;
     var buf: [32]u8 = undefined;
     const text = std.mem.trim(u8, proc.readSmall(path.ptr, &buf) orelse return null, " \t\r\n");
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
@@ -142,6 +159,35 @@ fn sysfsCharDev(ng: []const u8) ?struct { major: u32, minor: u32 } {
         .major = std.fmt.parseInt(u32, text[0..colon], 10) catch return null,
         .minor = std.fmt.parseInt(u32, text[colon + 1 ..], 10) catch return null,
     };
+}
+
+fn sysfsCharDev(ng: []const u8) ?DevNum {
+    return sysfsClassDev("nvme-generic", ng);
+}
+
+/// `ngXnY → nvmeX`: the controller's char node.
+pub fn controllerName(ng: []const u8, out: *[32]u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, ng, "ng")) return null;
+    const rest = ng[2..];
+    const n_at = std.mem.indexOfScalar(u8, rest, 'n') orelse return null;
+    if (n_at == 0 or 4 + n_at > out.len) return null;
+    @memcpy(out[0..4], "nvme");
+    @memcpy(out[4 .. 4 + n_at], rest[0..n_at]);
+    return out[0 .. 4 + n_at];
+}
+
+/// Open a char node and verify it is the device sysfs names (a stale
+/// `/dev` entry is another device's); null = refused (logged by the caller).
+fn openVerifiedChar(node: [:0]const u8, want: DevNum) ?linux.fd_t {
+    const rc = linux.open(node.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    var stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx)) != .SUCCESS or !linux.S.ISCHR(stx.mode) or stx.rdev_major != want.major or stx.rdev_minor != want.minor) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
 }
 
 /// Classify `path` and open its char twin. Never fails the mount: every
@@ -160,20 +206,25 @@ pub fn resolve(gpa: Allocator, path: []const u8) Resolved {
     };
     var node_z: [40]u8 = undefined;
     const node = std.fmt.bufPrintSentinel(&node_z, "/dev/{s}", .{ng}, 0) catch return .{ .none = .no_char_node };
-    const rc = linux.open(node.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) {
-        log.warn("meta volume {s}: cannot open {s} ({t}) — single-writer guard degrades to detection grade", .{ path, node, linux.errno(rc) });
+    const fd = openVerifiedChar(node, chr) orelse {
+        log.warn("meta volume {s}: cannot open {s} as the char node sysfs names ({d}:{d}) — single-writer guard degrades to detection grade", .{ path, node, chr.major, chr.minor });
         return .{ .none = .no_char_node };
-    }
-    const fd: linux.fd_t = @intCast(rc);
+    };
     errdefer _ = linux.close(fd);
-    // The node must be the char device sysfs named (a stale /dev entry is
-    // another device's).
-    var stx: linux.Statx = undefined;
-    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx)) != .SUCCESS or !linux.S.ISCHR(stx.mode) or stx.rdev_major != chr.major or stx.rdev_minor != chr.minor) {
-        log.warn("meta volume {s}: {s} is not the char node sysfs names ({d}:{d}) — single-writer guard degrades to detection grade", .{ path, node, chr.major, chr.minor });
+    // The controller node for the admin queue.
+    var cn_buf: [32]u8 = undefined;
+    const ctrl = controllerName(ng, &cn_buf) orelse return .{ .none = .no_char_node };
+    const ctrl_num = sysfsClassDev("nvme", ctrl) orelse {
+        log.warn("meta volume {s}: controller {s} has no /sys/class/nvme entry — single-writer guard degrades to detection grade", .{ path, ctrl });
         return .{ .none = .no_char_node };
-    }
+    };
+    var ctrl_z: [40]u8 = undefined;
+    const ctrl_node = std.fmt.bufPrintSentinel(&ctrl_z, "/dev/{s}", .{ctrl}, 0) catch return .{ .none = .no_char_node };
+    const ctrl_fd = openVerifiedChar(ctrl_node, ctrl_num) orelse {
+        log.warn("meta volume {s}: cannot open {s} as the controller node sysfs names ({d}:{d}) — the admin queue (Identify, FID 0x81) needs it; single-writer guard degrades to detection grade", .{ path, ctrl_node, ctrl_num.major, ctrl_num.minor });
+        return .{ .none = .no_char_node };
+    };
+    errdefer _ = linux.close(ctrl_fd);
     const ring = uring128.Ring128.init(ring_entries, 0) catch |e| {
         log.warn("meta volume {s}: the PR ring could not be set up ({s}) — single-writer guard degrades to detection grade", .{ path, @errorName(e) });
         return .{ .none = .probe_error };
@@ -183,7 +234,7 @@ pub fn resolve(gpa: Allocator, path: []const u8) Resolved {
         r.deinit();
         return .{ .none = .probe_error };
     };
-    dev.* = .{ .gpa = gpa, .fd = fd, .ring = ring, .nsid = nsid, .node = undefined, .node_len = ng.len };
+    dev.* = .{ .gpa = gpa, .fd = fd, .ctrl_fd = ctrl_fd, .ring = ring, .nsid = nsid, .node = undefined, .node_len = ng.len };
     @memcpy(dev.node[0..ng.len], ng);
     return .{ .device = dev };
 }
@@ -219,16 +270,19 @@ fn firstCharNode() ?[32]u8 {
 
 const testing = std.testing;
 
-test "the char twin derives by name; a regular file resolves to the single-kernel class (no PR); the real-device leg runs only where a /dev/ng* exists (skipped loud here)" {
+test "the char twin and the controller node derive by name; a regular file resolves to the single-kernel class (no PR); the real-device leg runs only where a /dev/ng* exists (skipped loud here)" {
     var out: [32]u8 = undefined;
     try testing.expectEqualStrings("ng0n1", charTwinName("nvme0n1", &out).?);
     try testing.expectEqualStrings("ng12n34", charTwinName("nvme12n34", &out).?);
     try testing.expect(charTwinName("sda", &out) == null);
     try testing.expect(charTwinName("loop0", &out) == null);
+    try testing.expectEqualStrings("nvme12", controllerName("ng12n34", &out).?);
+    try testing.expectEqualStrings("nvme0", controllerName("ng0n1", &out).?);
+    try testing.expect(controllerName("nvme0n1", &out) == null);
     try testing.expectEqual(Resolved{ .none = .not_nvme_namespace }, resolve(testing.allocator, "/proc/self/exe"));
     try testing.expectEqual(Resolved{ .none = .not_nvme_namespace }, resolve(testing.allocator, "/nonexistent/path"));
     if (!anyCharNodePresent()) {
-        log.warn("guard/pr_linux: no /dev/ng* on this venue — the real NVMe passthru leg is skipped (rung 8 brings nvmet-loop)", .{});
+        log.warn("guard/pr_linux: no /dev/ng* on this venue — the real NVMe passthru leg is skipped (the fidelity tier's substrate brings nvmet-loop)", .{});
         return error.SkipZigTest;
     }
     // A real namespace: Identify answers, RESCAP reads, the report decodes.

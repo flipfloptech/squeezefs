@@ -103,6 +103,7 @@ const ipc_rl = @import("../ipc/rendezvous_linux.zig");
 const derive = @import("../core/derive.zig");
 const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
+const keys = @import("../ops/keys.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/mount is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -147,6 +148,9 @@ const Ctx = struct {
     /// The verified volume key of an encrypted set (zeroized once the plane
     /// holds its crypto state).
     derived_key: ?transform.DerivedKey = null,
+    /// `--encrypt-key`'s material, read in the INVOKING process before any
+    /// fork (`ops/keys.zig`): consumed and zeroized by `loadSetConfig`.
+    stash: ?*keys.SecretBuf = null,
 
     /// Report a bring-up failure: the log, stderr (foreground) or the
     /// supervisor pipe (daemon); exit 1.
@@ -226,6 +230,31 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         return cli.exit_usage;
     };
 
+    // `--encrypt-key`: the material into a pinned stash BEFORE the fork
+    // (so `-` works for a daemonized mount and a bad key file fails on the
+    // caller's console); it crosses the forks in memory, never argv, never
+    // the pipe. The set's salt is not known yet — the derivation runs at
+    // the set-config gate off the stash.
+    var stash_storage: keys.SecretBuf = undefined;
+    var stash: ?*keys.SecretBuf = null;
+    if (m.encrypt_key) |flag_path| {
+        stash_storage = keys.linux_verbs.readStash(p.gpa, flag_path) catch |e| switch (e) {
+            error.OutOfMemory => {
+                p.stderr.writeAll("squeezefs mount: out of memory (key material)\n") catch {};
+                return cli.exit_failed;
+            },
+            else => |ke| {
+                var kb: [512]u8 = undefined;
+                var kw: Io.Writer = .fixed(&kb);
+                transform.writeKeyFileRefusal(&kw, ke, flag_path) catch {};
+                p.stderr.print("squeezefs mount: {s}\n", .{kw.buffered()}) catch {};
+                return cli.exit_failed;
+            },
+        };
+        stash = &stash_storage;
+    }
+    defer if (stash) |st| st.deinit();
+
     // `--daemon`: the log file first (its refusal reaches the terminal),
     // then the fork — before any thread exists.
     var reporter: ?daemon.Reporter = null;
@@ -237,9 +266,17 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         };
         const log_fd = daemon.openLogFile(lfz, p.stderr) catch return cli.exit_failed;
         p.stderr.flush() catch {};
-        switch (daemon.detach(p.gpa, p.io, .{ .supervise = m.supervise, .mountpoint = mountpoint, .log_fd = log_fd }, p.stderr)) {
+        switch (daemon.detach(p.gpa, p.io, .{ .supervise = m.supervise, .mountpoint = mountpoint, .log_fd = log_fd, .scrub = if (stash) |st| st.bytes else null }, p.stderr)) {
+            // The parent zeroizes its copy right after the fork returns
+            // (the `defer` above): the child owns the key material now.
             .parent => |code| return code,
-            .daemon => |r| reporter = r,
+            .daemon => |r| {
+                reporter = r;
+                // C2: re-harden (a forked child's dumpable flag may be
+                // cleared again by a later exec-less transition; the
+                // reference re-issues it on every call for the same reason).
+                if (stash != null) transform.linux_keys.hardenProcess();
+            },
         }
     }
     daemon.Signals.install() catch {
@@ -280,6 +317,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .opts = opts,
         .join = m.join,
         .reporter = reporter,
+        .stash = stash,
     };
     return sqz.run(mountMain, .{&ctx}) catch |e| ctx.failed("the root task could not start ({s})", .{@errorName(e)});
 }
@@ -652,10 +690,31 @@ fn loadSetConfig(ctx: *Ctx, be: *meta_set.MetaSet) ?set_config.Config {
             return null;
         };
     }
+    if (cfg.encryption == .none and ctx.stash != null) {
+        // The format's pairing law, mirrored: a key for a plaintext set
+        // encrypts nothing.
+        _ = ctx.failed("--encrypt-key was given but {s} is a PLAINTEXT set (encryption none) — nothing would be encrypted; re-run without the flag", .{ctx.meta_uri});
+        cfg.deinit(gpa);
+        return null;
+    }
     if (cfg.encryption != .none) {
         var path_buf: [128]u8 = undefined;
         var served: []const u8 = "";
-        const derived = transform.linux_keys.resolveVolumeKey(ctx.p.env, null, &cfg.kdf_salt, cfg.key_id, &path_buf, &served) catch |e| {
+        const derived = if (ctx.stash) |st| blk: {
+            // Rung 1 (`--encrypt-key`): the pre-fork stash, derived against
+            // the set's salt and verified; the stash is zeroized here —
+            // the derived copy below is the only key-bearing word left.
+            defer st.zeroize();
+            served = "--encrypt-key";
+            break :blk keys.linux_verbs.deriveFromStash(st, &cfg.kdf_salt, cfg.key_id) catch |e| {
+                var buf: [512]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
+                transform.writeKeyFileRefusal(&w, e, "--encrypt-key") catch {};
+                _ = ctx.failed("encrypted set: {s}", .{w.buffered()});
+                cfg.deinit(gpa);
+                return null;
+            };
+        } else transform.linux_keys.resolveVolumeKey(ctx.p.env, null, &cfg.kdf_salt, cfg.key_id, &path_buf, &served) catch |e| {
             var buf: [512]u8 = undefined;
             var w: Io.Writer = .fixed(&buf);
             transform.writeKeyFileRefusal(&w, e, if (served.len != 0) served else transform.defaultKeyPath(&path_buf, cfg.key_id)) catch {};

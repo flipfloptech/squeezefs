@@ -656,15 +656,6 @@ pub const KvBackend = struct {
         be.task = checkpoint_cycle.CheckpointTask.init(&be.cp, io);
         be.task.serial = &be.smo_lock;
         be.cache.installCheckpointKick(be.task.hook());
-        // The ring-recovery preflight (the reference's `preclaim_ring_
-        // recovery`): the whole ring reclaimable before the claim tx is
-        // admitted — the checkpoint task does not exist yet, so a parked
-        // claim would have no drain source.
-        be.cp.coverBringUpResidue() catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Io => return error.Io,
-            else => return error.Corrupt,
-        };
         const cpus: u32 = if (opts.cpus != 0) opts.cpus else derive.Facts.probe().cpus;
         be.cv = try conveyor.Conveyor.init(gpa, .{
             .io = io,
@@ -691,17 +682,34 @@ pub const KvBackend = struct {
         try be.startPass();
         errdefer be.stopPass();
 
-        // 10. The gate: the claim committed through `be.cv` (the pass fiber
-        // is live) and barriered through the lane; then the cover once more
-        // so the claim tx never sits committed-but-uncovered; then the
-        // checkpoint thread; then the heartbeat. A gate refusal unwinds the
-        // `errdefer`s above and closes the flock fd LAST.
+        // 10. The gate in two phases: the claim read and classified and
+        // the B1 arbitration (register ladder, acquire, preempt a stale
+        // holder) BEFORE any device write of the open — a successor under
+        // another host identity is fenced until its preempt lands; then
+        // the ring-recovery preflight (the reference's `preclaim_ring_
+        // recovery`: the whole ring reclaimable before the claim tx is
+        // admitted — the checkpoint task does not exist yet, so a parked
+        // claim would have no drain source); then the claim committed
+        // through `be.cv` (the pass fiber is live) and barriered through
+        // the lane; then the cover once more so the claim tx never sits
+        // committed-but-uncovered; then the checkpoint thread; then the
+        // heartbeat. A gate refusal unwinds the `errdefer`s above and
+        // closes the flock fd LAST.
         const t_gate = clock.monotonicNs();
-        be.guard = try guard.gate.Guard.gate(gpa, io, be, opts.guard);
+        be.guard = try guard.gate.Guard.prepare(gpa, io, be, opts.guard);
         errdefer {
             be.guard.?.deinit();
             be.guard = null;
         }
+        be.smo_lock.lockUncancelable(io);
+        const precovered = be.cp.coverBringUpResidue();
+        be.smo_lock.unlock(io);
+        precovered catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Io => return error.Io,
+            else => return error.Corrupt,
+        };
+        try be.guard.?.commit();
         be.gate_ns = clock.monotonicNs() - t_gate;
         be.smo_lock.lockUncancelable(io);
         const covered = be.cp.coverBringUpResidue();

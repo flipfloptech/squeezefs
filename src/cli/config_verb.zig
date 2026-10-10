@@ -37,7 +37,167 @@ pub fn run(p: cli.Process, c: args.Config) u8 {
     return switch (c) {
         .show => |s| show(p, s.target, s.json),
         .set_cache_paths => |s| setCachePaths(p, s.target, s.paths, s.force),
+        .set_fabric_endpoints => |s| setFabricEndpoints(p, s.target, s.specs.slice()),
+        .get_fabric_endpoints => |g| getFabricEndpoints(p, g.target, g.json),
     };
+}
+
+// ---------------------------------------------------------------------------
+// `fabric_endpoint` records (`ops_nvmet_keys.md` §3.7, the proposed design):
+// one per DATA volume inside the set config — never a second home.
+// ---------------------------------------------------------------------------
+
+const FabricBody = struct {
+    p: cli.Process,
+    specs: []const []const u8,
+
+    fn run(ctx: *anyopaque, set: *offline.Set) u8 {
+        const self: *FabricBody = @ptrCast(@alignCast(ctx));
+        const p = self.p;
+        var cur = set.cfg.clone(p.gpa) catch {
+            p.stderr.writeAll("squeezefs config set-fabric-endpoints: out of memory\n") catch {};
+            return cli.exit_failed;
+        };
+        defer cur.deinit(p.gpa);
+        for (self.specs) |word| {
+            const spec = args.parseEndpointSpec(word) orelse unreachable; // the grammar admitted it
+            var ep: set_config.FabricEndpoint = .{ .trtype = if (spec.transport == .tcp) .tcp else .loop, .adrfam = .none, .trsvcid = spec.trsvcid, .traddr = @splat(0), .subnqn = spec.subnqn };
+            if (spec.transport == .tcp) {
+                if (std.Io.net.Ip4Address.parse(spec.traddr, 0)) |v4| {
+                    ep.adrfam = .ipv4;
+                    ep.traddr[0..4].* = v4.bytes;
+                } else |_| if (std.Io.net.Ip6Address.parse(spec.traddr, 0)) |v6| {
+                    ep.adrfam = .ipv6;
+                    ep.traddr = v6.bytes;
+                } else |_| {
+                    p.stderr.print("squeezefs config set-fabric-endpoints: '{s}': traddr '{s}' is not an IPv4/IPv6 address\n", .{ word, spec.traddr }) catch {};
+                    return cli.exit_failed;
+                }
+            }
+            var m = set_config.setFabricEndpoint(p.gpa, &cur, spec.vol_tag, ep) catch |e| {
+                p.stderr.print("squeezefs config set-fabric-endpoints: '{s}': {s}\n", .{ word, switch (e) {
+                    error.UnknownVolume => "no data volume with that vol-tag in the set (`squeezefs config show`)",
+                    error.IllegalTransition => "the volume is retired",
+                    error.BadFabricEndpoint => "the subnqn or transport shape is not one the record represents",
+                    else => @errorName(e),
+                } }) catch {};
+                return cli.exit_failed;
+            };
+            cur.deinit(p.gpa);
+            cur = m.next;
+            m.next = undefined;
+        }
+        const bytes = set_config.encode(p.gpa, &cur, @intCast(geometry.recordValueCap(set.be.nodeSize()))) catch |e| {
+            p.stderr.print("squeezefs config set-fabric-endpoints: the record would not encode: {s}\n", .{@errorName(e)}) catch {};
+            return cli.exit_failed;
+        };
+        defer p.gpa.free(bytes);
+        const t = set.be.begin(@src()) catch {
+            p.stderr.writeAll("squeezefs config set-fabric-endpoints: out of memory\n") catch {};
+            return cli.exit_failed;
+        };
+        t.stagePut(key.TREE_CONTROL, set_config.CONTROL_KEY, bytes) catch {
+            set.be.abandon(t);
+            p.stderr.writeAll("squeezefs config set-fabric-endpoints: out of memory\n") catch {};
+            return cli.exit_failed;
+        };
+        set.be.commit(t) catch |e| {
+            p.stderr.print("squeezefs config set-fabric-endpoints: the record commit failed: {t}\n", .{e}) catch {};
+            return cli.exit_failed;
+        };
+        set.be.fsync() catch |e| {
+            p.stderr.print("squeezefs config set-fabric-endpoints: the durability barrier failed: {t}\n", .{e}) catch {};
+            return cli.exit_failed;
+        };
+        p.stdout.print("fabric endpoints set (config generation {d}):\n", .{cur.config_generation}) catch {};
+        for (cur.data) |d| if (d.fabric) |f| {
+            var ab: [48]u8 = undefined;
+            p.stdout.print("  vol-{x:0>16} {s}:{s}:{d}:{s}\n", .{ d.vol_tag, @tagName(f.trtype), f.traddrText(&ab), f.trsvcid, f.subnqn }) catch {};
+        };
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+};
+
+fn setFabricEndpoints(p: cli.Process, tgt: args.Target, specs: []const []const u8) u8 {
+    var resolved = target.resolve(p.gpa, p.io, tgt) catch |e| {
+        target.writeRefusal(p.stderr, "config set-fabric-endpoints", tgt, e) catch {};
+        return cli.exit_failed;
+    };
+    defer resolved.deinit(p.gpa);
+    var body: FabricBody = .{ .p = p, .specs = specs };
+    return offline.withSet(p, resolved.meta_uri, .{ .with_plane = false, .verb = "config set-fabric-endpoints" }, .{ .ctx = &body, .run = FabricBody.run });
+}
+
+fn getFabricEndpoints(p: cli.Process, tgt: args.Target, json: bool) u8 {
+    var resolved = target.resolve(p.gpa, p.io, tgt) catch |e| {
+        target.writeRefusal(p.stderr, "config get-fabric-endpoints", tgt, e) catch {};
+        return cli.exit_failed;
+    };
+    defer resolved.deinit(p.gpa);
+    var members: [uri.MAX_MEMBERS][]const u8 = undefined;
+    var udiag: uri.Refusal = undefined;
+    const meta = uri.parse(.meta, resolved.meta_uri, &members, &udiag) catch {
+        p.stderr.print("squeezefs config get-fabric-endpoints: {f}\n", .{udiag}) catch {};
+        return cli.exit_usage;
+    };
+    const path = meta.first();
+    const pool = uring_fs.Pool.init(p.gpa, uring_fs.Config.resolve(p.env, derive.facts())) catch |e| {
+        p.stderr.print("squeezefs config get-fabric-endpoints: io pool init failed ({s})\n", .{@errorName(e)}) catch {};
+        return cli.exit_failed;
+    };
+    defer pool.deinit();
+    var reason_buf: [512]u8 = undefined;
+    const snap = status.classify(p.gpa, p.env, pool, path, &reason_buf) catch |e| {
+        p.stderr.print("squeezefs config get-fabric-endpoints: cannot read {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+        return cli.exit_failed;
+    };
+    const sb = snap.sb orelse {
+        p.stderr.print("squeezefs config get-fabric-endpoints: {s} is not a formatted v4 metadata volume\n", .{path}) catch {};
+        return cli.exit_failed;
+    };
+    var rec = (status.newestLedger(p.gpa, p.env, pool, path, sb) catch null) orelse {
+        p.stderr.print("squeezefs config get-fabric-endpoints: {s} has no valid ledger record\n", .{path}) catch {};
+        return cli.exit_failed;
+    };
+    defer rec.deinit(p.gpa);
+    var cfg_reason: [512]u8 = undefined;
+    const read = status.readSetConfig(p.gpa, p.io, p.env, pool, path, sb, &rec, &cfg_reason) catch |e| {
+        p.stderr.print("squeezefs config get-fabric-endpoints: cannot read the control tree of {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+        return cli.exit_failed;
+    };
+    switch (read) {
+        .absent, .refused => {
+            p.stderr.print("squeezefs config get-fabric-endpoints: {s} carries no readable set_config record\n", .{path}) catch {};
+            return cli.exit_failed;
+        },
+        .config => |cfg_const| {
+            var cfg = cfg_const;
+            defer cfg.deinit(p.gpa);
+            if (json) {
+                p.stdout.writeAll("{\"fabric_endpoints\":[") catch {};
+                var first = true;
+                for (cfg.data) |d| if (d.fabric) |f| {
+                    if (!first) p.stdout.writeByte(',') catch {};
+                    first = false;
+                    p.stdout.print("{{\"vol_tag\":\"vol-{x:0>16}\",\"endpoint\":", .{d.vol_tag}) catch {};
+                    f.writeJson(p.stdout) catch {};
+                    p.stdout.writeByte('}') catch {};
+                };
+                p.stdout.writeAll("]}\n") catch {};
+            } else {
+                var n: usize = 0;
+                for (cfg.data) |d| if (d.fabric) |f| {
+                    var ab: [48]u8 = undefined;
+                    p.stdout.print("vol-{x:0>16} {s}:{s}:{d}:{s}\n", .{ d.vol_tag, @tagName(f.trtype), f.traddrText(&ab), f.trsvcid, f.subnqn }) catch {};
+                    n += 1;
+                };
+                if (n == 0) p.stdout.writeAll("no fabric endpoints recorded (every data volume is local or operator-connected)\n") catch {};
+            }
+            p.stdout.flush() catch {};
+            return cli.exit_ok;
+        },
+    }
 }
 
 fn show(p: cli.Process, tgt: args.Target, json: bool) u8 {

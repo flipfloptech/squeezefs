@@ -72,7 +72,9 @@ backend and on `-ENOTBLK` falls to the FILE backend (`io-cmd-file.c`, `O_DIRECT`
 `request_module("nvmet-transport-%d")` when a port's trtype has no transport, and a port is
 enabled by its FIRST subsystem link (`nvmet_port_subsys_allow_link`), after which every
 `addr_*` store refuses (`-EACCES`). `drivers/nvme/target/configfs.c`: `device_path`,
-`device_uuid`, `device_nguid`, `resv_enable` stores refuse `-EBUSY` while `enable=1`;
+`device_uuid`, `device_nguid` stores refuse `-EBUSY` while `enable=1` and `resv_enable` refuses
+`-EINVAL` (`nvmet_ns_resv_enable_store`; measured 2026-10-09 — the port's `AttrLocked` folds
+both, decision 0002 row 391);
 `nvmet_ports_make` parses the port name with `kstrtou16` — **port ids are u16**;
 `attr_allow_any_host` is 0 on a fresh subsystem. `drivers/nvme/target/pr.c` (≥ 6.13):
 reservations live in nvmet, independent of the backing (file-backed namespaces enforce PR
@@ -626,9 +628,11 @@ rtypes: WE = 1, WERO = **3** (R:832-846 — shipped as 2 = Exclusive Access unti
 rtype`: a REGISTERED second host was refused READS on nvmet 2026-08-15; TW:116-187 pins the
 enum). Status: Reservation Conflict `0x83` (R:846) ⇔ the ONE typed `error.ReservationConflict`
 (`errors.zig`, `-EBADE` ↔ `BLK_STS_RESV_CONFLICT`, R:455-469). Transport: the 72 B
-`nvme_uring_cmd` in the SQE128 command area, `NVME_URING_CMD_{IO,ADMIN}` on the `/dev/ng*` fd
-(pr_linux.zig L69-93) — the reference's `ioctl(NVME_IOCTL_{IO,ADMIN}_CMD)` on the BLOCK fd
-(R:816-820, 898-923) is decision 0002 row 182.
+`nvme_uring_cmd` in the SQE128 command area, `NVME_URING_CMD_IO` on the `/dev/ng*` fd and
+`NVME_URING_CMD_ADMIN` on the CONTROLLER node `/dev/nvme<N>` (`nvme_ns_uring_cmd` answers
+`-ENOTTY` to an admin op on the namespace node — measured by the fidelity tier, decision 0002 row
+392; `pr_linux.Device` holds both fds) — the reference's `ioctl(NVME_IOCTL_{IO,ADMIN}_CMD)` on
+the BLOCK fd (R:816-820, 898-923) is decision 0002 row 182.
 
 ### 4.3 `REGCTL` sizing — the two-step report (R:131-211, R:960-982; pr.zig L320-353)
 

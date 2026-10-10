@@ -133,6 +133,15 @@ pub const Terminal = error{
     /// The peer's storage-trust gate refused our proof (we do not hold the
     /// set's `job:enroll` secret, or its schema is not ours).
     HandshakeRefused,
+    /// The fabrics connect's network class (`/dev/nvme-fabrics` write):
+    /// EADDRNOTAVAIL — the address is not bindable on this host.
+    AddressNotAvailable,
+    /// ECONNREFUSED — nothing listens at the target address.
+    ConnectionRefused,
+    /// EHOSTUNREACH — no route to the target.
+    HostUnreachable,
+    /// EALREADY — an identical controller already exists.
+    AlreadyConnected,
 };
 
 /// A caller bug or an inadmissible device/volume state: never retried.
@@ -235,6 +244,10 @@ const table = [_]Row{
     .{ .e = .NODATA, .err = error.NoAttribute },
     .{ .e = .NOSYS, .err = error.NotImplemented },
     .{ .e = .STALE, .err = error.StaleHandle },
+    .{ .e = .ADDRNOTAVAIL, .err = error.AddressNotAvailable },
+    .{ .e = .CONNREFUSED, .err = error.ConnectionRefused },
+    .{ .e = .HOSTUNREACH, .err = error.HostUnreachable },
+    .{ .e = .ALREADY, .err = error.AlreadyConnected },
     // PERM also decodes to AccessDenied above (the first row wins on the
     // way in); on the way out PermissionDenied is the one EPERM reply.
     .{ .e = .PERM, .err = error.PermissionDenied },

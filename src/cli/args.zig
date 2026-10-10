@@ -70,6 +70,84 @@ pub const Mount = struct {
     /// `endpoint:` record is not to be trusted (a manager that moved its
     /// listener before its checkpoint landed).
     join: ?[]const u8 = null,
+    /// `--encrypt-key PATH|-`: the operator key (resolution rung 1); read
+    /// in the invoking process BEFORE a `--daemon` fork (`ops/keys.zig`).
+    encrypt_key: ?[]const u8 = null,
+};
+
+/// `nvmeof` (charter §8; `docs/porting/ops_nvmet_keys.md` §1–§4): the
+/// target verbs over the kernel nvmet, the initiator, the PR report.
+pub const Transport = enum { tcp, loop };
+
+/// Repeatable flags are collected in place (`--ip`, `--allow-host`): the
+/// `Verb` borrows argv and owns no heap.
+pub const MAX_REPEAT: usize = 16;
+
+pub const RepeatList = struct {
+    items: [MAX_REPEAT][]const u8 = undefined,
+    n: usize = 0,
+
+    pub fn slice(self: *const RepeatList) []const []const u8 {
+        return self.items[0..self.n];
+    }
+};
+
+pub const NvmeofShare = struct {
+    backing: []const u8,
+    subnqn: ?[]const u8 = null,
+    transport: Transport = .tcp,
+    ips: RepeatList = .{},
+    port: u16 = 4420,
+    allow_hosts: RepeatList = .{},
+    create_size: ?u64 = null,
+    /// `--ns-uuid 8-4-4-4-12`: the identity to re-present.
+    ns_uuid: ?[16]u8 = null,
+};
+
+pub const NvmeofConnect = struct {
+    subnqn: []const u8,
+    transport: Transport = .tcp,
+    ip: ?[]const u8 = null,
+    port: u16 = 4420,
+    hostnqn: ?[]const u8 = null,
+    hostid: ?[]const u8 = null,
+    host_traddr: ?[]const u8 = null,
+    host_iface: ?[]const u8 = null,
+    nr_io_queues: ?u32 = null,
+    /// `--ns-uuid`: verify the namespace by identity.
+    ns_uuid: ?[16]u8 = null,
+};
+
+pub const NvmeofTarget = union(enum) {
+    status: struct { json: bool = false },
+    setup,
+    systemd_unit,
+    stop,
+};
+
+pub const Nvmeof = union(enum) {
+    share: NvmeofShare,
+    unshare: struct { subnqn: []const u8 },
+    list: struct { json: bool = false },
+    restore,
+    adopt: struct { subnqn: []const u8 },
+    target: NvmeofTarget,
+    connect: NvmeofConnect,
+    disconnect: struct { subnqn: []const u8, identity_only: bool = false, hostnqn: ?[]const u8 = null, hostid: ?[]const u8 = null },
+    resv_report: struct { device: []const u8, json: bool = false, pr_matrix: bool = false, peer: ?[]const u8 = null, force: bool = false },
+};
+
+/// `storage {list, validate}` (§6): the host inventory and the classifier.
+pub const Storage = union(enum) {
+    list: struct { json: bool = false },
+    validate: struct { path: []const u8 },
+};
+
+/// `key {install, show, check}` (§7.2): the key store.
+pub const Key = union(enum) {
+    install: struct { meta_uri: []const u8, source: []const u8, force: bool = false },
+    show: struct { meta_uri: []const u8 },
+    check: struct { meta_uri: []const u8, encrypt_key: ?[]const u8 = null },
 };
 
 pub const Umount = struct {
@@ -109,6 +187,11 @@ pub const Tune = struct {
 pub const Config = union(enum) {
     show: struct { target: Target, json: bool = false },
     set_cache_paths: struct { target: Target, paths: []const u8, force: bool = false },
+    /// `set-fabric-endpoints <sqmeta-uri> vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>…`
+    /// (`ops_nvmet_keys.md` §3.7, a PROPOSED design: the per-data-volume
+    /// `FabricEndpoint` inside `set_config`).
+    set_fabric_endpoints: struct { target: Target, specs: RepeatList },
+    get_fabric_endpoints: struct { target: Target, json: bool = false },
 };
 
 pub const Staging = union(enum) {
@@ -279,6 +362,9 @@ pub const Verb = union(enum) {
     fsck_merge: FsckMerge,
     job: Job,
     defrag: Defrag,
+    nvmeof: Nvmeof,
+    storage: Storage,
+    key: Key,
 };
 
 pub const Refusal = union(enum) {
@@ -323,6 +409,18 @@ pub const Refusal = union(enum) {
     fsck_lattice: []const u8,
     /// `--shards` is not `k/N` with `0 ≤ k < N`.
     bad_shards: []const u8,
+    /// `--transport` outside tcp|loop.
+    bad_transport: []const u8,
+    /// A repeatable flag past `MAX_REPEAT`.
+    too_many_repeats: []const u8,
+    /// `--ns-uuid` not `8-4-4-4-12` hex.
+    bad_uuid: []const u8,
+    /// `connect --hostnqn` without `--hostid` or the reverse.
+    identity_half: []const u8,
+    /// `--pr-matrix` without `--peer`.
+    matrix_without_peer,
+    /// A `vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>` spec that does not parse.
+    bad_endpoint_spec: []const u8,
 
     pub fn format(self: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
@@ -355,6 +453,12 @@ pub const Refusal = union(enum) {
             .bad_shards => |t| try w.print("fsck: --shards '{s}' is not k/N with 0 ≤ k < N", .{t}),
             .bad_volume_id => |v| try w.print("'{s}' is not a volume id (vol-<16 hex>)", .{v}),
             .bad_job_id => |j| try w.print("'{s}' is not a job id (job-<16 hex>, never zero)", .{j}),
+            .bad_transport => |t| try w.print("--transport '{s}' is not one of tcp|loop", .{t}),
+            .too_many_repeats => |f| try w.print("{s} given more than {d} times", .{ f, MAX_REPEAT }),
+            .bad_uuid => |u| try w.print("--ns-uuid '{s}' is not a uuid (8-4-4-4-12 hex)", .{u}),
+            .identity_half => |f| try w.print("nvmeof connect: {s} given without its pair — hostnqn and hostid are PAIR-OR-NEITHER", .{f}),
+            .matrix_without_peer => try w.writeAll("nvmeof resv-report: --pr-matrix needs --peer <second namespace node> (a second association under a DISTINCT host identity)"),
+            .bad_endpoint_spec => |s| try w.print("config set-fabric-endpoints: '{s}' is not vol-<16 hex>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>", .{s}),
         }
     }
 };
@@ -366,7 +470,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
     const all =
         \\usage: squeezefs <verb> [flags] …
         \\  squeezefs format [--single-writer] [--meta-node-kib N] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]
-        \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] sqmeta://<path> <mountpoint>
+        \\  squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>
         \\  squeezefs umount <mountpoint>
         \\  squeezefs status sqmeta://<path>|<mountpoint>
         \\  squeezefs clients [--json] sqmeta://<path>|<mountpoint>
@@ -398,20 +502,40 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs job rotate-enroll sqmeta://<path>
         \\  squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs bench [-w] [-r] [--stat] [--del] [-t N] [-n N] [-s SIZE] [-b SIZE] [--rand] [--direct] [--time S] [-i N] [--abba] [--json] [--smoke] <mountpoint>
+        \\  squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>
+        \\  squeezefs nvmeof unshare <subnqn>
+        \\  squeezefs nvmeof list [--json]
+        \\  squeezefs nvmeof restore
+        \\  squeezefs nvmeof adopt <subnqn>
+        \\  squeezefs nvmeof target status [--json] | setup | systemd-unit | stop
+        \\  squeezefs nvmeof connect [--transport tcp|loop] [--ip ADDR] [--port N] [--hostnqn NQN --hostid UUID] [--host-traddr ADDR] [--host-iface IF] [--nr-io-queues N] [--ns-uuid UUID] <subnqn>
+        \\  squeezefs nvmeof disconnect [--identity-only [--hostnqn NQN --hostid UUID]] <subnqn>
+        \\  squeezefs nvmeof resv-report [--json] [--pr-matrix --peer <dev> [--force]] <dev>
+        \\  squeezefs storage list [--json]
+        \\  squeezefs storage validate <path>
+        \\  squeezefs key install [--force] sqmeta://<path> <keyfile|->
+        \\  squeezefs key show sqmeta://<path>
+        \\  squeezefs key check [--encrypt-key PATH|-] sqmeta://<path>
+        \\  squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>…
+        \\  squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs --version
         \\
     ;
     const v = verb orelse return all;
     return switch (v) {
         .format => "usage: squeezefs format [--single-writer] [--meta-node-kib 64|128|256|512|1024] [--meta-journal-mb N] [--block-size BYTES] [--compress none|lz4|zstd] [--encrypt none|aes-256-gcm|chacha20-poly1305 --encrypt-key PATH|-] [--disk-cache-paths a,b] [--force] sqmeta://<path> [sqdata://<path>…]\n",
-        .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] sqmeta://<path> <mountpoint>\n",
+        .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>\n",
+        .nvmeof => "usage: squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>\n       squeezefs nvmeof unshare <subnqn>\n       squeezefs nvmeof list [--json]\n       squeezefs nvmeof restore\n       squeezefs nvmeof adopt <subnqn>\n       squeezefs nvmeof target status [--json] | setup | systemd-unit | stop\n       squeezefs nvmeof connect [--transport tcp|loop] [--ip ADDR] [--port N] [--hostnqn NQN --hostid UUID] [--host-traddr ADDR] [--host-iface IF] [--nr-io-queues N] [--ns-uuid UUID] <subnqn>\n       squeezefs nvmeof disconnect [--identity-only [--hostnqn NQN --hostid UUID]] <subnqn>\n       squeezefs nvmeof resv-report [--json] [--pr-matrix --peer <dev> [--force]] <dev>\n",
+        .storage => "usage: squeezefs storage list [--json]\n       squeezefs storage validate <path>\n",
+        .key => "usage: squeezefs key install [--force] sqmeta://<path> <keyfile|->\n       squeezefs key show sqmeta://<path>\n       squeezefs key check [--encrypt-key PATH|-] sqmeta://<path>\n",
+
         .umount => "usage: squeezefs umount <mountpoint>\n",
         .status => "usage: squeezefs status sqmeta://<path>|<mountpoint>\n",
         .clients => "usage: squeezefs clients [--json] sqmeta://<path>|<mountpoint>\n",
         .df => "usage: squeezefs df [--json] sqmeta://<path>|<mountpoint>\n",
         .clone => "usage: squeezefs clone sqmeta://<path>|<mountpoint> /src/file /dest/file\n",
         .tune => "usage: squeezefs tune [--apply]\n",
-        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]\n",
+        .config => "usage: squeezefs config show [--json] sqmeta://<path>|<mountpoint>\n       squeezefs config set-cache-paths [--force] sqmeta://<path>|<mountpoint> <abs path>[,…]\n       squeezefs config set-fabric-endpoints sqmeta://<path> vol-<tag>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>…\n       squeezefs config get-fabric-endpoints [--json] sqmeta://<path>|<mountpoint>\n",
         .staging => "usage: squeezefs staging list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs staging promote sqmeta://<path>\n",
         .claim_clear => "usage: squeezefs claim clear sqmeta://<path>\n",
         .appenders => "usage: squeezefs appenders [--json] sqmeta://<path>\n",
@@ -556,8 +680,311 @@ pub fn parse(argv: []const []const u8, diag: *Refusal) Error!Verb {
     if (std.mem.eql(u8, verb, "bench")) return parseBench(words, diag);
     if (std.mem.eql(u8, verb, "job")) return parseJob(words, diag);
     if (std.mem.eql(u8, verb, "defrag")) return parseDefrag(words, diag);
+    if (std.mem.eql(u8, verb, "nvmeof")) return parseNvmeof(words, diag);
+    if (std.mem.eql(u8, verb, "storage")) return parseStorage(words, diag);
+    if (std.mem.eql(u8, verb, "key")) return parseKey(words, diag);
     diag.* = .{ .unknown_verb = verb };
     return error.Refused;
+}
+
+// ---------------------------------------------------------------------------
+// nvmeof / storage / key (rung 8).
+// ---------------------------------------------------------------------------
+
+fn parseTransport(c: *Cursor, f: Flag) Error!Transport {
+    const raw = try c.value(f);
+    if (std.mem.eql(u8, raw, "tcp")) return .tcp;
+    if (std.mem.eql(u8, raw, "loop")) return .loop;
+    c.diag.* = .{ .bad_transport = raw };
+    return error.Refused;
+}
+
+fn pushRepeat(c: *Cursor, f: Flag, list: *RepeatList) Error!void {
+    const raw = try c.value(f);
+    if (list.n == MAX_REPEAT) {
+        c.diag.* = .{ .too_many_repeats = f.name };
+        return error.Refused;
+    }
+    list.items[list.n] = raw;
+    list.n += 1;
+}
+
+/// `8-4-4-4-12` hex (or 32 bare hex digits) → bytes.
+pub fn parseUuid(word: []const u8) ?[16]u8 {
+    var out: [16]u8 = undefined;
+    var n: usize = 0;
+    var hi: ?u8 = null;
+    for (word) |ch| {
+        if (ch == '-') continue;
+        const v: u8 = switch (ch) {
+            '0'...'9' => ch - '0',
+            'a'...'f' => ch - 'a' + 10,
+            'A'...'F' => ch - 'A' + 10,
+            else => return null,
+        };
+        if (hi) |h| {
+            if (n == 16) return null;
+            out[n] = (h << 4) | v;
+            n += 1;
+            hi = null;
+        } else hi = v;
+    }
+    if (hi != null or n != 16) return null;
+    return out;
+}
+
+fn parseUuidFlag(c: *Cursor, f: Flag) Error![16]u8 {
+    const raw = try c.value(f);
+    return parseUuid(raw) orelse {
+        c.diag.* = .{ .bad_uuid = raw };
+        return error.Refused;
+    };
+}
+
+fn parseNvmeof(words: []const []const u8, diag: *Refusal) Error!Verb {
+    const sub = try subverb("nvmeof", words, diag);
+    const rest = words[1..];
+    if (std.mem.eql(u8, sub, "share")) {
+        var c: Cursor = .{ .verb = "nvmeof share", .words = rest, .diag = diag };
+        var out: NvmeofShare = .{ .backing = undefined };
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--subnqn")) {
+                out.subnqn = try c.value(f);
+            } else if (std.mem.eql(u8, f.name, "--transport")) {
+                out.transport = try parseTransport(&c, f);
+            } else if (std.mem.eql(u8, f.name, "--ip")) {
+                try pushRepeat(&c, f, &out.ips);
+            } else if (std.mem.eql(u8, f.name, "--port")) {
+                out.port = try parseIntFlag(&c, f, u16, 1, std.math.maxInt(u16));
+            } else if (std.mem.eql(u8, f.name, "--allow-host")) {
+                try pushRepeat(&c, f, &out.allow_hosts);
+            } else if (std.mem.eql(u8, f.name, "--create-size")) {
+                out.create_size = try parseSizeFlag(&c, f);
+            } else if (std.mem.eql(u8, f.name, "--ns-uuid")) {
+                out.ns_uuid = try parseUuidFlag(&c, f);
+            } else return c.unknown(f);
+        }
+        out.backing = try exactlyOne(&c, "the backing (a regular file or block device)");
+        return .{ .nvmeof = .{ .share = out } };
+    }
+    if (std.mem.eql(u8, sub, "unshare") or std.mem.eql(u8, sub, "adopt")) {
+        const is_unshare = std.mem.eql(u8, sub, "unshare");
+        var c: Cursor = .{ .verb = if (is_unshare) "nvmeof unshare" else "nvmeof adopt", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const nqn = try exactlyOne(&c, "the subsystem NQN");
+        return .{ .nvmeof = if (is_unshare) .{ .unshare = .{ .subnqn = nqn } } else .{ .adopt = .{ .subnqn = nqn } } };
+    }
+    if (std.mem.eql(u8, sub, "list")) {
+        var c: Cursor = .{ .verb = "nvmeof list", .words = rest, .diag = diag };
+        var json = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--json")) json = true else return c.unknown(f);
+        }
+        if (c.pos().len != 0) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = c.pos()[0] } };
+            return error.Refused;
+        }
+        return .{ .nvmeof = .{ .list = .{ .json = json } } };
+    }
+    if (std.mem.eql(u8, sub, "restore")) {
+        var c: Cursor = .{ .verb = "nvmeof restore", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        if (c.pos().len != 0) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = c.pos()[0] } };
+            return error.Refused;
+        }
+        return .{ .nvmeof = .restore };
+    }
+    if (std.mem.eql(u8, sub, "target")) {
+        const t = try subverb("nvmeof target", rest, diag);
+        var c: Cursor = .{ .verb = "nvmeof target", .words = rest[1..], .diag = diag };
+        var json = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--json") and std.mem.eql(u8, t, "status")) json = true else return c.unknown(f);
+        }
+        if (c.pos().len != 0) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = c.pos()[0] } };
+            return error.Refused;
+        }
+        if (std.mem.eql(u8, t, "status")) return .{ .nvmeof = .{ .target = .{ .status = .{ .json = json } } } };
+        if (std.mem.eql(u8, t, "setup")) return .{ .nvmeof = .{ .target = .setup } };
+        if (std.mem.eql(u8, t, "systemd-unit")) return .{ .nvmeof = .{ .target = .systemd_unit } };
+        if (std.mem.eql(u8, t, "stop")) return .{ .nvmeof = .{ .target = .stop } };
+        diag.* = .{ .unknown_subverb = .{ .verb = "nvmeof target", .word = t } };
+        return error.Refused;
+    }
+    if (std.mem.eql(u8, sub, "connect")) {
+        var c: Cursor = .{ .verb = "nvmeof connect", .words = rest, .diag = diag };
+        var out: NvmeofConnect = .{ .subnqn = undefined };
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--transport")) {
+                out.transport = try parseTransport(&c, f);
+            } else if (std.mem.eql(u8, f.name, "--ip")) {
+                out.ip = try c.value(f);
+            } else if (std.mem.eql(u8, f.name, "--port")) {
+                out.port = try parseIntFlag(&c, f, u16, 1, std.math.maxInt(u16));
+            } else if (std.mem.eql(u8, f.name, "--hostnqn")) {
+                out.hostnqn = try c.value(f);
+            } else if (std.mem.eql(u8, f.name, "--hostid")) {
+                out.hostid = try c.value(f);
+            } else if (std.mem.eql(u8, f.name, "--host-traddr")) {
+                out.host_traddr = try c.value(f);
+            } else if (std.mem.eql(u8, f.name, "--host-iface")) {
+                out.host_iface = try c.value(f);
+            } else if (std.mem.eql(u8, f.name, "--nr-io-queues")) {
+                // 0 is admitted by the grammar and refused by the verb BEFORE
+                // any side effect (the refusal names the minimum).
+                out.nr_io_queues = try parseIntFlag(&c, f, u32, 0, 65535);
+            } else if (std.mem.eql(u8, f.name, "--ns-uuid")) {
+                out.ns_uuid = try parseUuidFlag(&c, f);
+            } else return c.unknown(f);
+        }
+        out.subnqn = try exactlyOne(&c, "the subsystem NQN");
+        if ((out.hostnqn == null) != (out.hostid == null)) {
+            diag.* = .{ .identity_half = if (out.hostnqn != null) "--hostnqn" else "--hostid" };
+            return error.Refused;
+        }
+        return .{ .nvmeof = .{ .connect = out } };
+    }
+    if (std.mem.eql(u8, sub, "disconnect")) {
+        var c: Cursor = .{ .verb = "nvmeof disconnect", .words = rest, .diag = diag };
+        var identity_only = false;
+        var hostnqn: ?[]const u8 = null;
+        var hostid: ?[]const u8 = null;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--identity-only")) {
+                identity_only = true;
+            } else if (std.mem.eql(u8, f.name, "--hostnqn")) {
+                hostnqn = try c.value(f);
+            } else if (std.mem.eql(u8, f.name, "--hostid")) {
+                hostid = try c.value(f);
+            } else return c.unknown(f);
+        }
+        const nqn = try exactlyOne(&c, "the subsystem NQN");
+        if ((hostnqn == null) != (hostid == null)) {
+            diag.* = .{ .identity_half = if (hostnqn != null) "--hostnqn" else "--hostid" };
+            return error.Refused;
+        }
+        return .{ .nvmeof = .{ .disconnect = .{ .subnqn = nqn, .identity_only = identity_only, .hostnqn = hostnqn, .hostid = hostid } } };
+    }
+    if (std.mem.eql(u8, sub, "resv-report")) {
+        var c: Cursor = .{ .verb = "nvmeof resv-report", .words = rest, .diag = diag };
+        var json = false;
+        var matrix = false;
+        var force = false;
+        var peer: ?[]const u8 = null;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--json")) {
+                json = true;
+            } else if (std.mem.eql(u8, f.name, "--pr-matrix")) {
+                matrix = true;
+            } else if (std.mem.eql(u8, f.name, "--force")) {
+                force = true;
+            } else if (std.mem.eql(u8, f.name, "--peer")) {
+                peer = try c.value(f);
+            } else return c.unknown(f);
+        }
+        const dev = try exactlyOne(&c, "the namespace node (/dev/nvmeXnY or /dev/ngXnY)");
+        if (matrix and peer == null) {
+            diag.* = .matrix_without_peer;
+            return error.Refused;
+        }
+        return .{ .nvmeof = .{ .resv_report = .{ .device = dev, .json = json, .pr_matrix = matrix, .peer = peer, .force = force } } };
+    }
+    diag.* = .{ .unknown_subverb = .{ .verb = "nvmeof", .word = sub } };
+    return error.Refused;
+}
+
+fn parseStorage(words: []const []const u8, diag: *Refusal) Error!Verb {
+    const sub = try subverb("storage", words, diag);
+    const rest = words[1..];
+    if (std.mem.eql(u8, sub, "list")) {
+        var c: Cursor = .{ .verb = "storage list", .words = rest, .diag = diag };
+        var json = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--json")) json = true else return c.unknown(f);
+        }
+        if (c.pos().len != 0) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = c.pos()[0] } };
+            return error.Refused;
+        }
+        return .{ .storage = .{ .list = .{ .json = json } } };
+    }
+    if (std.mem.eql(u8, sub, "validate")) {
+        var c: Cursor = .{ .verb = "storage validate", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        return .{ .storage = .{ .validate = .{ .path = try exactlyOne(&c, "the device or file path") } } };
+    }
+    diag.* = .{ .unknown_subverb = .{ .verb = "storage", .word = sub } };
+    return error.Refused;
+}
+
+fn parseKey(words: []const []const u8, diag: *Refusal) Error!Verb {
+    const sub = try subverb("key", words, diag);
+    const rest = words[1..];
+    if (std.mem.eql(u8, sub, "install")) {
+        var c: Cursor = .{ .verb = "key install", .words = rest, .diag = diag };
+        var force = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--force")) force = true else return c.unknown(f);
+        }
+        const pos = c.pos();
+        if (pos.len < 1) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the sqmeta:// volume" } };
+            return error.Refused;
+        }
+        try checkUri(.meta, pos[0], diag);
+        if (pos.len < 2) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the key file (or - for stdin)" } };
+            return error.Refused;
+        }
+        if (pos.len > 2) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = pos[2] } };
+            return error.Refused;
+        }
+        return .{ .key = .{ .install = .{ .meta_uri = pos[0], .source = pos[1], .force = force } } };
+    }
+    if (std.mem.eql(u8, sub, "show")) {
+        var c: Cursor = .{ .verb = "key show", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const target = try exactlyOne(&c, "the sqmeta:// volume");
+        try checkUri(.meta, target, diag);
+        return .{ .key = .{ .show = .{ .meta_uri = target } } };
+    }
+    if (std.mem.eql(u8, sub, "check")) {
+        var c: Cursor = .{ .verb = "key check", .words = rest, .diag = diag };
+        var flag: ?[]const u8 = null;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--encrypt-key")) flag = try c.value(f) else return c.unknown(f);
+        }
+        const target = try exactlyOne(&c, "the sqmeta:// volume");
+        try checkUri(.meta, target, diag);
+        return .{ .key = .{ .check = .{ .meta_uri = target, .encrypt_key = flag } } };
+    }
+    diag.* = .{ .unknown_subverb = .{ .verb = "key", .word = sub } };
+    return error.Refused;
+}
+
+/// `vol-<16 hex>=<tcp|loop>:<traddr>:<trsvcid>:<subnqn>` (the traddr and
+/// trsvcid empty on loop: `vol-…=loop:::nqn.x`).
+pub const EndpointSpec = struct { vol_tag: u64, transport: Transport, traddr: []const u8, trsvcid: u16, subnqn: []const u8 };
+
+pub fn parseEndpointSpec(word: []const u8) ?EndpointSpec {
+    const eq = std.mem.indexOfScalar(u8, word, '=') orelse return null;
+    const tag_text = word[0..eq];
+    if (!std.mem.startsWith(u8, tag_text, "vol-") or tag_text.len != 20) return null;
+    const vol_tag = std.fmt.parseInt(u64, tag_text[4..], 16) catch return null;
+    var it = std.mem.splitScalar(u8, word[eq + 1 ..], ':');
+    const tr_text = it.next() orelse return null;
+    const transport: Transport = if (std.mem.eql(u8, tr_text, "tcp")) .tcp else if (std.mem.eql(u8, tr_text, "loop")) .loop else return null;
+    const traddr = it.next() orelse return null;
+    const svc_text = it.next() orelse return null;
+    const subnqn = it.rest();
+    if (subnqn.len == 0 or !std.mem.startsWith(u8, subnqn, "nqn.")) return null;
+    const trsvcid: u16 = if (svc_text.len == 0) 0 else std.fmt.parseInt(u16, svc_text, 10) catch return null;
+    if (transport == .tcp and (traddr.len == 0 or trsvcid == 0)) return null;
+    if (transport == .loop and (traddr.len != 0 or svc_text.len != 0)) return null;
+    return .{ .vol_tag = vol_tag, .transport = transport, .traddr = traddr, .trsvcid = trsvcid, .subnqn = subnqn };
 }
 
 /// A set-level target: a `sqmeta://` URI (validated by the ONE parser) or
@@ -701,6 +1128,44 @@ fn parseConfig(words: []const []const u8, diag: *Refusal) Error!Verb {
         }
         try checkCachePaths(pos[1], diag);
         return .{ .config = .{ .set_cache_paths = .{ .target = pos[0], .paths = pos[1], .force = force } } };
+    }
+    if (std.mem.eql(u8, sub, "set-fabric-endpoints")) {
+        var c: Cursor = .{ .verb = "config set-fabric-endpoints", .words = rest, .diag = diag };
+        while (try c.step()) |f| return c.unknown(f);
+        const pos = c.pos();
+        if (pos.len < 1) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "the sqmeta:// volume" } };
+            return error.Refused;
+        }
+        try checkUri(.meta, pos[0], diag);
+        if (pos.len < 2) {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "at least one vol-<tag>=<trtype>:<traddr>:<trsvcid>:<subnqn>" } };
+            return error.Refused;
+        }
+        var specs: RepeatList = .{};
+        for (pos[1..]) |word| {
+            if (parseEndpointSpec(word) == null) {
+                diag.* = .{ .bad_endpoint_spec = word };
+                return error.Refused;
+            }
+            if (specs.n == MAX_REPEAT) {
+                diag.* = .{ .too_many_repeats = "endpoint specs" };
+                return error.Refused;
+            }
+            specs.items[specs.n] = word;
+            specs.n += 1;
+        }
+        return .{ .config = .{ .set_fabric_endpoints = .{ .target = pos[0], .specs = specs } } };
+    }
+    if (std.mem.eql(u8, sub, "get-fabric-endpoints")) {
+        var c: Cursor = .{ .verb = "config get-fabric-endpoints", .words = rest, .diag = diag };
+        var json = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--json")) json = true else return c.unknown(f);
+        }
+        const target = try exactlyOne(&c, target_what);
+        try checkTarget(target, diag);
+        return .{ .config = .{ .get_fabric_endpoints = .{ .target = target, .json = json } } };
     }
     diag.* = .{ .unknown_subverb = .{ .verb = "config", .word = sub } };
     return error.Refused;
@@ -1380,6 +1845,8 @@ fn parseMount(words: []const []const u8, diag: *Refusal) Error!Verb {
             out.log_file = try c.value(f);
         } else if (std.mem.eql(u8, f.name, "--join")) {
             out.join = try c.value(f);
+        } else if (std.mem.eql(u8, f.name, "--encrypt-key")) {
+            out.encrypt_key = try c.value(f);
         } else return c.unknown(f);
     }
     const pos = c.pos();
@@ -1679,6 +2146,72 @@ test "appenders [--json] TARGET and appender clear TARGET ID: the URI checked, t
     try testing.expect((try refusal(av(&.{ "appender", "clear", "sqmeta:///dev/m", "x" }))) == .bad_int);
     try testing.expect((try refusal(av(&.{ "appender", "clear", "sqmeta:///dev/m", "1", "2" }))) == .extra_positional);
     try testing.expect((try refusal(av(&.{ "appender", "show", "sqmeta:///dev/m", "1" }))) == .unknown_subverb);
+}
+
+test "nvmeof: share collects repeatable --ip/--allow-host, parses --transport/--port/--create-size/--ns-uuid; connect pairs hostnqn/hostid; disconnect --identity-only; resv-report --pr-matrix needs --peer; target sub-verbs; storage and key grammars; mount --encrypt-key; config fabric-endpoint specs" {
+    var d: Refusal = undefined;
+    const s = try parse(av(&.{ "nvmeof", "share", "--transport", "loop", "--ip", "127.0.0.1", "--ip", "::1", "--port", "4421", "--allow-host", "nqn.h1", "--create-size", "1g", "--ns-uuid", "11111111-2222-3333-4444-555555555555", "--subnqn", "nqn.x", "/build/a.img" }), &d);
+    try testing.expectEqual(Transport.loop, s.nvmeof.share.transport);
+    try testing.expectEqual(@as(usize, 2), s.nvmeof.share.ips.n);
+    try testing.expectEqualStrings("::1", s.nvmeof.share.ips.slice()[1]);
+    try testing.expectEqual(@as(u16, 4421), s.nvmeof.share.port);
+    try testing.expectEqualStrings("nqn.h1", s.nvmeof.share.allow_hosts.slice()[0]);
+    try testing.expectEqual(@as(?u64, 1 << 30), s.nvmeof.share.create_size);
+    try testing.expectEqual(@as(u8, 0x11), s.nvmeof.share.ns_uuid.?[0]);
+    try testing.expectEqualStrings("nqn.x", s.nvmeof.share.subnqn.?);
+    try testing.expectEqualStrings("/build/a.img", s.nvmeof.share.backing);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "share", "--transport", "rdma", "/x" }))) == .bad_transport);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "share", "--ns-uuid", "zz", "/x" }))) == .bad_uuid);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "share", "--port", "0", "/x" }))) == .bad_int);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "share" }))) == .missing_positional);
+    const u = try parse(av(&.{ "nvmeof", "unshare", "nqn.x" }), &d);
+    try testing.expectEqualStrings("nqn.x", u.nvmeof.unshare.subnqn);
+    const l = try parse(av(&.{ "nvmeof", "list", "--json" }), &d);
+    try testing.expect(l.nvmeof.list.json);
+    try testing.expect((try parse(av(&.{ "nvmeof", "restore" }), &d)).nvmeof == .restore);
+    try testing.expectEqualStrings("nqn.y", (try parse(av(&.{ "nvmeof", "adopt", "nqn.y" }), &d)).nvmeof.adopt.subnqn);
+    try testing.expect((try parse(av(&.{ "nvmeof", "target", "status", "--json" }), &d)).nvmeof.target.status.json);
+    try testing.expect((try parse(av(&.{ "nvmeof", "target", "setup" }), &d)).nvmeof.target == .setup);
+    try testing.expect((try parse(av(&.{ "nvmeof", "target", "systemd-unit" }), &d)).nvmeof.target == .systemd_unit);
+    try testing.expect((try parse(av(&.{ "nvmeof", "target", "stop" }), &d)).nvmeof.target == .stop);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "target", "install" }))) == .unknown_subverb);
+    const c = try parse(av(&.{ "nvmeof", "connect", "--ip", "127.0.0.1", "--port", "4420", "--hostnqn", "nqn.h", "--hostid", "id", "--nr-io-queues", "0", "nqn.x" }), &d);
+    try testing.expectEqualStrings("127.0.0.1", c.nvmeof.connect.ip.?);
+    try testing.expectEqual(@as(?u32, 0), c.nvmeof.connect.nr_io_queues);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "connect", "--hostnqn", "nqn.h", "nqn.x" }))) == .identity_half);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "connect", "--hostid", "id", "nqn.x" }))) == .identity_half);
+    const dc = try parse(av(&.{ "nvmeof", "disconnect", "--identity-only", "nqn.x" }), &d);
+    try testing.expect(dc.nvmeof.disconnect.identity_only);
+    const rr = try parse(av(&.{ "nvmeof", "resv-report", "--json", "--pr-matrix", "--peer", "/dev/nvme1n1", "--force", "/dev/nvme0n1" }), &d);
+    try testing.expect(rr.nvmeof.resv_report.pr_matrix and rr.nvmeof.resv_report.force and rr.nvmeof.resv_report.json);
+    try testing.expectEqualStrings("/dev/nvme1n1", rr.nvmeof.resv_report.peer.?);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "resv-report", "--pr-matrix", "/dev/nvme0n1" }))) == .matrix_without_peer);
+    try testing.expect((try refusal(av(&.{ "nvmeof", "bogus" }))) == .unknown_subverb);
+    try testing.expect((try refusal(av(&.{"nvmeof"}))) == .missing_subverb);
+    try testing.expect((try parse(av(&.{ "storage", "list", "--json" }), &d)).storage.list.json);
+    try testing.expectEqualStrings("/dev/x", (try parse(av(&.{ "storage", "validate", "/dev/x" }), &d)).storage.validate.path);
+    try testing.expect((try refusal(av(&.{ "storage", "pool", "create" }))) == .unknown_subverb);
+    const ki = try parse(av(&.{ "key", "install", "--force", "sqmeta:///dev/m", "-" }), &d);
+    try testing.expect(ki.key.install.force);
+    try testing.expectEqualStrings("-", ki.key.install.source);
+    try testing.expect((try refusal(av(&.{ "key", "install", "sqmeta:///dev/m" }))) == .missing_positional);
+    try testing.expectEqualStrings("sqmeta:///dev/m", (try parse(av(&.{ "key", "show", "sqmeta:///dev/m" }), &d)).key.show.meta_uri);
+    const kc = try parse(av(&.{ "key", "check", "--encrypt-key", "/k", "sqmeta:///dev/m" }), &d);
+    try testing.expectEqualStrings("/k", kc.key.check.encrypt_key.?);
+    try testing.expect((try refusal(av(&.{ "key", "rotate", "sqmeta:///dev/m" }))) == .unknown_subverb);
+    const m = try parse(av(&.{ "mount", "--encrypt-key", "-", "sqmeta:///dev/m", "/mnt" }), &d);
+    try testing.expectEqualStrings("-", m.mount.encrypt_key.?);
+    const fe = try parse(av(&.{ "config", "set-fabric-endpoints", "sqmeta:///dev/m", "vol-0123456789abcdef=tcp:127.0.0.1:4420:nqn.x", "vol-0000000000000001=loop:::nqn.y" }), &d);
+    try testing.expectEqual(@as(usize, 2), fe.config.set_fabric_endpoints.specs.n);
+    const spec = parseEndpointSpec("vol-0123456789abcdef=tcp:127.0.0.1:4420:nqn.x").?;
+    try testing.expectEqual(@as(u64, 0x0123456789abcdef), spec.vol_tag);
+    try testing.expectEqual(@as(u16, 4420), spec.trsvcid);
+    try testing.expectEqualStrings("nqn.x", spec.subnqn);
+    try testing.expect(parseEndpointSpec("vol-01=tcp:1:2:nqn.x") == null);
+    try testing.expect(parseEndpointSpec("vol-0123456789abcdef=tcp::4420:nqn.x") == null);
+    try testing.expect(parseEndpointSpec("vol-0123456789abcdef=loop:1::nqn.x") == null);
+    try testing.expect((try refusal(av(&.{ "config", "set-fabric-endpoints", "sqmeta:///dev/m", "junk" }))) == .bad_endpoint_spec);
+    try testing.expect((try parse(av(&.{ "config", "get-fabric-endpoints", "--json", "/mnt" }), &d)).config.get_fabric_endpoints.json);
 }
 
 test "usage names every verb" {

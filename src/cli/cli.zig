@@ -43,6 +43,10 @@ pub const defrag_verb = if (is_linux) @import("defrag.zig") else struct {};
 /// Portable planning + a Linux engine (its own gate inside).
 pub const tune = @import("tune.zig");
 pub const bench = @import("bench.zig");
+/// The rung-8 operations verbs live under `src/ops/` (Linux: the kernel
+/// nvmet target + the initiator; portable: the key store's contracts).
+pub const nvmet = if (is_linux) @import("../ops/nvmet.zig") else struct {};
+pub const keys = @import("../ops/keys.zig");
 pub const bench_smoke = if (is_linux) @import("bench_smoke.zig") else struct {};
 
 /// Exit codes (charter §8; `sysexits`-free, three outcomes): 0 success,
@@ -107,6 +111,9 @@ pub fn run(p: Process) u8 {
         .fsck_merge => |m| return fsck_verb.runMerge(p, m),
         .job => |j| return if (is_linux) job.run(p, j) else linuxOnly(p, "job"),
         .defrag => |d| return if (is_linux) defrag_verb.run(p, d) else linuxOnly(p, "defrag"),
+        .nvmeof => |n| return if (is_linux) nvmet.run.run(p, n) else linuxOnly(p, "nvmeof"),
+        .storage => |s| return if (is_linux) nvmet.run.runStorage(p, s) else linuxOnly(p, "storage"),
+        .key => |k| return if (is_linux) keys.linux_verbs.run(p, k) else linuxOnly(p, "key"),
     }
 }
 

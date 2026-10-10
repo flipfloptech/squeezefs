@@ -103,6 +103,7 @@ FUSE = ["fuse_ops", "transport_ring_requests", "transport_ring_reads", "transpor
 # shim rows judge it by the block size, §4 of `leg`.)
 MISC = ["put_obj", "held_stores", "patch_writes", "own_block_dmas", "overlay_stores", "hot_block_hits", "ranged_reads",
         "ranged_read_bytes", "read_lane_fetches", "read_lane_fetch_bytes", "prefetch_issued",
+        "journal_lane_park_backstop_ticks", "parked_gate_waits", "parked_gate_cold_flushes",
         "daemon_cpu_ns", "mem_budget_bytes", "mem_budget_level", "direct_device_true",
         "manager_verbs", "writer_guard_mode", "symmetric_meta"]
 FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier",

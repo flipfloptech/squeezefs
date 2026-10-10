@@ -76,9 +76,9 @@ const completion = @import("../sync/completion.zig");
 const futex = @import("../sync/futex.zig");
 const mpmc = @import("../sync/mpmc.zig");
 const exec_lane = @import("../exec/lane.zig");
+const timer_heap = @import("../exec/timer_heap.zig");
 const fiber_mod = @import("../exec/fiber.zig");
 const group_mod = @import("../exec/group.zig");
-const timer_heap = @import("../exec/timer_heap.zig");
 const jc = @import("journal_core.zig");
 const journal = @import("journal.zig");
 const checkpoint = @import("checkpoint.zig");
@@ -205,8 +205,12 @@ pub const Stats = struct {
     /// Fiber parks COMPLETED (a CQE, a wake or a tick ended them); an idle
     /// lane sits inside one untimed park and adds nothing here.
     parks: counters.ShardedCounter = .{},
-    /// Backstop ticks that fired while a completion was owed — ≈ 0 healthy.
+    /// Backstop-ended parks whose re-check found PROGRESS with no wake
+    /// delivered (a lost kick absorbed by the tick) — must stay 0.
     park_tick_rescues: counters.ShardedCounter = .{},
+    /// Backstop-ended parks whose re-check found nothing moved: the owed
+    /// completion is still at the device (slow, not lost). Reporting.
+    park_backstop_ticks: counters.ShardedCounter = .{},
     prefix_waits: counters.ShardedCounter = .{},
     queue_full: counters.ShardedCounter = .{},
     volumes_failed: counters.ShardedCounter = .{},
@@ -224,7 +228,7 @@ pub var stats: Stats = .{};
 
 /// `{"journal_lanes_spawned":n,…}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
+    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
         stats.lanes_spawned.load(),
         stats.lanes_live.load(),
         stats.lane_writes.load(),
@@ -238,6 +242,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.wake_elided.load(),
         stats.parks.load(),
         stats.park_tick_rescues.load(),
+        stats.park_backstop_ticks.load(),
         stats.prefix_waits.load(),
         stats.queue_full.load(),
         stats.volumes_failed.load(),
@@ -253,6 +258,7 @@ pub const LaneSnapshot = struct {
     structural_writes: u64,
     parks: u64,
     tick_rescues: u64,
+    backstop_ticks: u64,
     wake_writes: u64,
     wake_elided: u64,
     barriers_strict: u64,
@@ -269,6 +275,7 @@ const LaneStats = struct {
     structural_writes: std.atomic.Value(u64) = .init(0),
     parks: std.atomic.Value(u64) = .init(0),
     tick_rescues: std.atomic.Value(u64) = .init(0),
+    backstop_ticks: std.atomic.Value(u64) = .init(0),
     wake_writes: std.atomic.Value(u64) = .init(0),
     wake_elided: std.atomic.Value(u64) = .init(0),
     barriers_strict: std.atomic.Value(u64) = .init(0),
@@ -287,6 +294,7 @@ const LaneStats = struct {
             .structural_writes = self.structural_writes.load(.monotonic),
             .parks = self.parks.load(.monotonic),
             .tick_rescues = self.tick_rescues.load(.monotonic),
+            .backstop_ticks = self.backstop_ticks.load(.monotonic),
             .wake_writes = self.wake_writes.load(.monotonic),
             .wake_elided = self.wake_elided.load(.monotonic),
             .barriers_strict = self.barriers_strict.load(.monotonic),
@@ -327,6 +335,10 @@ pub const TestSeams = struct {
     /// a failed `io_uring_enter` would (every in-flight op fails, the
     /// volume latches FAILED); self-disarming.
     kill_ring: std.atomic.Value(u32) = .init(0),
+    /// 1 ⇒ an admitted window's runs are NOT issued until the seam clears
+    /// (the fiber issues them at a later poll): the device-is-slow shape —
+    /// a completion owed past the backstop with nothing lost.
+    delay_issue: std.atomic.Value(u32) = .init(0),
 };
 
 pub var test_seams: TestSeams = .{};
@@ -975,6 +987,11 @@ pub const JournalLane = struct {
     fn issueWindow(self: *JournalLane, idx: u32) void {
         const w = &self.w;
         const c = &self.cells[idx];
+        if (test_seams.delay_issue.load(.acquire) != 0) {
+            // Capacity equals the cell count, which bounds the delayed set.
+            w.delayed_issue.appendAssumeCapacity(idx);
+            return;
+        }
         if (c.kind == .window and test_seams.fail_windows.load(.acquire) != 0) {
             _ = test_seams.fail_windows.fetchSub(1, .acq_rel);
             c.first_err = injectedError();
@@ -1121,6 +1138,7 @@ pub const JournalLane = struct {
     /// the pump) → the landed barrier → stage B → the coalesced barrier
     /// when due → the exit edge → ONE fiber park (timed by the backstop
     /// while a completion is owed and by the flush due) → the park verdict.
+    ///
     fn fiberMain(self: *JournalLane) void {
         const f = exec_lane.currentFiber().?;
         const w = &self.w;
@@ -1135,6 +1153,7 @@ pub const JournalLane = struct {
             var now = clock.monotonicNs();
             if (w.barrier_landed) self.barrierDone(w.barrier_outcome, now);
             self.advanceDurability();
+            if (test_seams.delay_issue.load(.acquire) == 0) while (w.delayed_issue.pop()) |idx| self.issueWindow(idx);
             now = clock.monotonicNs();
             // The trailing barrier before exit: ONE, after the last ack, so
             // every acked entry leaves durable.
@@ -1455,6 +1474,8 @@ const Worker = struct {
     last_barrier_ns: u64,
     /// Barrier-request cells awaiting their ticket.
     fsync_waiters: std.ArrayList(u32),
+    /// Cells admitted under the `delay_issue` seam, issued when it clears.
+    delayed_issue: std.ArrayList(u32),
     disconnected: bool = false,
     ring_dead: bool = false,
     ack_seq: u64 = 0,
@@ -1472,8 +1493,10 @@ const Worker = struct {
         errdefer pending.deinit(gpa);
         var group = try std.ArrayList(u32).initCapacity(gpa, cells);
         errdefer group.deinit(gpa);
-        const fsync_waiters = try std.ArrayList(u32).initCapacity(gpa, cells);
-        return .{ .slots = slots, .free_slots = free_slots, .pending = pending, .group = group, .fsync_waiters = fsync_waiters, .last_barrier_ns = clock.monotonicNs() };
+        var fsync_waiters = try std.ArrayList(u32).initCapacity(gpa, cells);
+        errdefer fsync_waiters.deinit(gpa);
+        const delayed_issue = try std.ArrayList(u32).initCapacity(gpa, cells);
+        return .{ .slots = slots, .free_slots = free_slots, .pending = pending, .group = group, .fsync_waiters = fsync_waiters, .delayed_issue = delayed_issue, .last_barrier_ns = clock.monotonicNs() };
     }
 
     fn deinit(w: *Worker, gpa: Allocator) void {
@@ -1482,28 +1505,11 @@ const Worker = struct {
         w.pending.deinit(gpa);
         w.group.deinit(gpa);
         w.fsync_waiters.deinit(gpa);
+        w.delayed_issue.deinit(gpa);
     }
 
     fn owesWork(w: *const Worker) bool {
         return w.owesCompletion() or w.needs_flush or w.fsync_waiters.items.len != 0;
-    }
-
-    /// A run, a window behind a group, a group, or a barrier is outstanding:
-    /// the park carries the backstop.
-    fn owesCompletion(w: *const Worker) bool {
-        return w.runs_in_flight != 0 or w.pending.items.len != 0 or w.group.items.len != 0 or w.barrier_in_flight != null;
-    }
-
-    /// The fiber park's tick: the backstop while a completion is owed, the
-    /// flush due when a coalesced barrier is pending, else none (the lane's
-    /// own park is bounded by its 2 s liveness tick alone).
-    fn tickFor(w: *const Worker, now: u64) ?u64 {
-        var tick: ?u64 = if (w.owesCompletion()) park_backstop_ns else null;
-        if (w.needs_flush and w.barrier_in_flight == null) {
-            const until = w.flush_due_ns -| now;
-            tick = if (tick) |t| @min(t, until) else until;
-        }
-        return tick;
     }
 
     fn claimSlot(w: *Worker, gpa: Allocator, r: Run) Error!u32 {
@@ -2124,6 +2130,63 @@ test "a parked predecessor holds its successors' answers: the prefix wait sits b
     try testing.expect(h.reg.completedUpto() >= b.res.paddedEnd());
 }
 
+// Rung 9 F6: 6–186 "rescues" per saturated write leg were 4 KiB journal
+// writes and FSYNCs outlasting the 100 ms backstop on a shared saturated
+// disk, counted at the tick. A tick that finds NOTHING moved is the device
+// being slow (`journal_lane_park_backstop_ticks`), never a rescue.
+test "a slow device: a window whose runs are owed past the backstop costs backstop ticks and ZERO tick rescues; it acks when the device answers" {
+    const h = try Harness.init(testing.allocator, "slow-device");
+    defer h.deinit();
+    try h.spawnLane(.{}, "600000", 0);
+    const lane = h.lane.?;
+    test_seams.delay_issue.store(1, .release);
+    defer test_seams.delay_issue.store(0, .release);
+    const parks0 = lane.snapshot().parks;
+    const b = try h.append(2, 400, 0xB0);
+    // Three parks the backstop ended with the window still owed (every
+    // park after the admission's is a tick's: no CQE is coming, nothing
+    // publishes); a park counts when it ends, its verdict at the next
+    // poll, so three ended parks mean two judged ticks.
+    spinUntil(struct {
+        l: *JournalLane,
+        p0: u64,
+        fn ready(s: @This()) bool {
+            return s.l.snapshot().parks >= s.p0 + 4;
+        }
+    }{ .l = lane, .p0 = parks0 });
+    try testing.expectEqual(@as(?Outcome, null), b.ticket.poll());
+    try testing.expectEqual(@as(u64, 0), lane.snapshot().tick_rescues);
+    try testing.expect(lane.snapshot().backstop_ticks >= 2);
+    // The device answers: the next tick issues the runs, the CQE acks.
+    test_seams.delay_issue.store(0, .release);
+    try b.ticket.wait().result;
+    try testing.expectEqual(@as(u64, 0), lane.snapshot().tick_rescues);
+}
+
+// The rescue stays REACHABLE: a foreign completer that forgets to `kick`
+// leaves the prefix wait with its condition satisfied and no wake — the tick
+// finds the progress and counts exactly one rescue.
+test "a lost kick: a reservation completed elsewhere without a kick is found by the backstop's re-check — exactly one tick rescue, the successor acks" {
+    const h = try Harness.init(testing.allocator, "lost-kick");
+    defer h.deinit();
+    try h.spawnLane(.{}, "600000", 0);
+    const lane = h.lane.?;
+    const a = try h.reserve(400);
+    const b = try h.append(2, 400, 0xB0);
+    spinUntil(struct {
+        l: *JournalLane,
+        fn ready(s: @This()) bool {
+            return s.l.snapshot().prefix_waits >= 1;
+        }
+    }{ .l = lane });
+    try testing.expectEqual(@as(?Outcome, null), b.ticket.poll());
+    h.reg.complete(&h.core, a.res);
+    // No kick: only the backstop can find the completed prefix.
+    try b.ticket.wait().result;
+    try testing.expectEqual(@as(u64, 1), lane.snapshot().tick_rescues);
+    try testing.expect(h.reg.completedUpto() >= b.res.paddedEnd());
+}
+
 test "a predecessor handed off late joins the group at its journal position: acks leave in journal order" {
     const h = try Harness.init(testing.allocator, "late");
     defer h.deinit();
@@ -2379,7 +2442,7 @@ test "the stats JSON names every lane counter" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
     const s = w.buffered();
-    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_structural_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_rings_dead\":", "\"journal_lane_cqe_orphan\":", "\"journal_lane_ack_out_of_order\":" }) |needle| {
+    for ([_][]const u8{ "\"journal_lanes_spawned\":", "\"journal_lanes_live\":", "\"journal_ring_lane_writes\":", "\"journal_lane_structural_writes\":", "\"journal_lane_write_failures\":", "\"journal_lane_rollbacks\":", "\"journal_lane_barriers_strict\":", "\"journal_lane_barriers_coalesced\":", "\"journal_lane_barrier_failures\":", "\"journal_lane_wake_writes\":", "\"journal_lane_wake_elided\":", "\"journal_lane_parks\":", "\"journal_lane_park_tick_rescues\":", "\"journal_lane_park_backstop_ticks\":", "\"journal_lane_prefix_waits\":", "\"journal_lane_queue_full\":", "\"journal_lane_volumes_failed\":", "\"journal_lane_rings_dead\":", "\"journal_lane_cqe_orphan\":", "\"journal_lane_ack_out_of_order\":" }) |needle| {
         try testing.expect(std.mem.indexOf(u8, s, needle) != null);
     }
 }

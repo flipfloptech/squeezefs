@@ -73,6 +73,8 @@ pub const Error = filesystem.Error;
 /// block indices × 4 MiB blocks = 16 PiB (charter §5.6 "EFBIG at
 /// u32::MAX"). A rung-3 inline file refuses far below it (`kv_fs`).
 pub const MAX_FILE_SIZE: u64 = @as(u64, std.math.maxInt(u32)) * (4 << 20);
+/// `O_DIRECT` as `fuse_read_in.flags` (the file's open flags) carries it.
+const O_DIRECT: u32 = @bitCast(linux.O{ .DIRECT = true });
 
 // ---------------------------------------------------------------------------
 // Instruments (§10).
@@ -417,7 +419,12 @@ pub fn Dispatcher(comptime Transport: type) type {
                 },
                 .read => |r| {
                     const d = try fs.vtable.read(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size, .flags = r.flags });
-                    return codec.replyRead(u, c.window[0..d.len], r.size);
+                    // A short paged reply zero-completes its pages (the
+                    // copy path's page_zeroing; under zero-copy the bytes
+                    // are already the kernel's) — never for O_DIRECT.
+                    var reply = codec.replyRead(u, c.window[0..d.len], r.size);
+                    if (r.flags & O_DIRECT == 0) reply.zero_pad = codec.readZeroTail(c.window, reply.body.len, r.size, std.heap.pageSize());
+                    return reply;
                 },
                 .write => |w| {
                     // R2-M2: a zero-length write has no side effects at all.
@@ -571,6 +578,8 @@ const Scripted = struct {
     /// A hook run inside `write` (the INTERRUPT test parks here).
     write_hook: ?*const fn (*Scripted) void = null,
     writes: u32 = 0,
+    /// A READ serves this many bytes (the window beyond is left as found).
+    short_read: ?usize = null,
 
     fn entry(self: *Scripted) filesystem.Entry {
         var a = abi.zeroed(abi.fuse_attr);
@@ -601,7 +610,7 @@ const Scripted = struct {
     }
     pub fn read(self: *Scripted, c: *Ctx, a: filesystem.ReadArgs) Error!filesystem.Data {
         try self.verdict;
-        const n = @min(a.size, c.window.len);
+        const n = @min(self.short_read orelse a.size, c.window.len);
         @memset(c.window[0..n], 0xAB);
         return .{ .len = n };
     }
@@ -809,6 +818,30 @@ test "READDIRPLUS counts one lookup reference per positive entry (never the node
     rig.d.dispatch(.{ .read = small }, Rig.meta(4, 60), s, null);
     try testing.expectEqual(@as(usize, 10), rig.lb.captured(s).?.body.len);
     try testing.expectEqual(@as(u8, 0xAB), rig.lb.captured(s).?.body[9]);
+}
+
+test "a SHORT paged READ zero-completes the requested pages past the served bytes in the reply window (the kernel copy path's page_zeroing, owed by the daemon under zero-copy); an O_DIRECT read leaves the window alone (repro-port: LTP fs gf18 — a 1,959-byte inline serve left page 0's tail as garbage the next extend exposed)" {
+    var rig: Rig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = Loopback.slot(5);
+    const win = rig.lb.replyWindow(s);
+    // The filesystem serves 1,959 bytes of a 4,096-byte request into a
+    // window full of yesterday's bytes.
+    @memset(win, 0x5A);
+    rig.fsi.short_read = 1959;
+    const rin: abi.fuse_read_in = .{ .fh = 1, .offset = 0, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
+    rig.d.dispatch(.{ .read = rin }, Rig.meta(7, 60), s, null);
+    try testing.expectEqual(@as(usize, 1959), rig.lb.captured(s).?.body.len);
+    try testing.expect(std.mem.allEqual(u8, win[0..1959], 0xAB));
+    try testing.expect(std.mem.allEqual(u8, win[1959..4096], 0));
+    // O_DIRECT: the kernel never zeroes a user buffer past the count; nor do we.
+    @memset(win, 0x5A);
+    var direct = rin;
+    direct.flags = @bitCast(linux.O{ .DIRECT = true });
+    rig.d.dispatch(.{ .read = direct }, Rig.meta(8, 60), s, null);
+    try testing.expectEqual(@as(usize, 1959), rig.lb.captured(s).?.body.len);
+    try testing.expect(std.mem.allEqual(u8, win[1959..4096], 0x5A));
 }
 
 test "the obligation: a second reply is dropped and counted (never an overwrite); an owed obligation's deinit synthesizes header-only EIO and counts" {

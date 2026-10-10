@@ -564,6 +564,11 @@ pub const Reply = struct {
     out: []const u8,
     /// The body VIEW (READ data, a link target, xattr bytes, packed dirents).
     body: []const u8,
+    /// A paged READ's page_zeroing end (`readZeroTail`): the window is
+    /// zero past `body.len` up to here, and a zero-copy bounce bridge
+    /// moves `zero_pad` bytes into the installed pages (the header still
+    /// says `body.len`). 0 = nothing to pad.
+    zero_pad: u32 = 0,
 
     /// What follows the 16-byte header: `out ‖ body`.
     pub fn extraLen(self: Reply) usize {
@@ -740,6 +745,24 @@ pub fn replyData(unique: u64, data: []const u8) Reply {
 /// READ: the body truncated to `fuse_read_in.size`.
 pub fn replyRead(unique: u64, data: []const u8, size: u32) Reply {
     return replyData(unique, data[0..@min(data.len, size)]);
+}
+
+/// The kernel's `page_zeroing` for a paged READ (`fuse_do_readfolio`,
+/// `fuse_send_readpages`): a SHORT reply leaves every requested page the
+/// bytes did not fill ZERO — the classical copy clears each partial page
+/// before copying into it. Under zero-copy the daemon's bytes land in
+/// the installed pages with no kernel copy, so the daemon zero-completes
+/// `window[len .. end)` itself, `end` = the request's size rounded up to
+/// the page (the installed pages), bounded by the window. An O_DIRECT
+/// read has no page_zeroing (the kernel never zeroes a user buffer past
+/// the returned count): its callers skip this. Found by LTP fs gf18: a
+/// 1,959-byte inline file read into page 0 left [1959, 4096) as the
+/// page's old garbage, marked uptodate; a later 1-byte extend made the
+/// garbage readable in the new hole.
+pub fn readZeroTail(window: []u8, len: usize, size: u32, page: usize) u32 {
+    const end: usize = @intCast(@min(window.len, derive.alignUp(@min(size, window.len), page)));
+    if (len < end) @memset(window[len..end], 0);
+    return @intCast(@max(end, @min(len, window.len)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,6 +1488,27 @@ test "data replies are zero-copy views; READ truncates to size; the oversize rul
     const eio = replyError(r.header.unique, .IO);
     try testing.expectEqual(@as(i32, -5), eio.header.@"error");
     try testing.expectEqual(@as(u32, 16), eio.header.len);
+}
+
+test "readZeroTail: a short paged READ zero-completes the requested pages past the served bytes (the copy path's page_zeroing), bounded by the window; a full reply and a reply past the request's last page touch nothing" {
+    var win: [3 * 4096]u8 = @splat(0xAA);
+    // 1,959 of 8,192 requested: [1959, 8192) zero, the third page untouched.
+    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 1959, 8192, 4096));
+    try testing.expect(std.mem.allEqual(u8, win[0..1959], 0xAA));
+    try testing.expect(std.mem.allEqual(u8, win[1959..8192], 0));
+    try testing.expect(std.mem.allEqual(u8, win[8192..], 0xAA));
+    // An unaligned request size rounds up to its last page.
+    win = @splat(0xAA);
+    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 100, 4097, 4096));
+    try testing.expect(std.mem.allEqual(u8, win[100..8192], 0));
+    try testing.expect(std.mem.allEqual(u8, win[8192..], 0xAA));
+    // Full reply: nothing zeroed. A request wider than the window is bounded.
+    win = @splat(0xAA);
+    try testing.expectEqual(@as(u32, 8192), readZeroTail(&win, 8192, 8192, 4096));
+    try testing.expect(std.mem.allEqual(u8, &win, 0xAA));
+    try testing.expectEqual(@as(u32, win.len), readZeroTail(&win, 12000, 1 << 20, 4096));
+    try testing.expect(std.mem.allEqual(u8, win[0..12000], 0xAA));
+    try testing.expect(std.mem.allEqual(u8, win[12000..], 0));
 }
 
 test "attrFromInode: i64-ns stamps split exact, rdev is the kernel's 32-bit encoding verbatim, blocks are 512-byte units, flags 0" {

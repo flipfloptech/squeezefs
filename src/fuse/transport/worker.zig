@@ -73,6 +73,8 @@ const assert = std.debug.assert;
 const uring128 = @import("../../io/uring128.zig");
 const ring_park = @import("../../io/ring_park.zig");
 const abi = @import("../abi.zig");
+/// `O_DIRECT` as `fuse_read_in.flags` (the file's open flags) carries it.
+const O_DIRECT: u32 = @bitCast(linux.O{ .DIRECT = true });
 const codec = @import("../codec.zig");
 const geometry = @import("../geometry.zig");
 const slot = @import("slot.zig");
@@ -556,13 +558,22 @@ pub const Member = struct {
 /// commits); the pass resolves it at its CQE.
 const Pend = struct {
     kind: Kind,
+    /// The bridge's DMA length.
     len: u32,
+    /// The reply's payload length when it differs from `len` (a short
+    /// paged READ bridges its zero-completed pages: `len` ≥ `reply_len`);
+    /// 0 = `len`.
+    reply_len: u32 = 0,
     /// Readdir-class slot while the latch is unresolved: a -EFAULT here is
     /// the probe's "copyable" verdict, not a failure.
     readdir_probe: bool = false,
     /// The filesystem's completion hook (the direct leg's post-DMA recheck,
     /// an fd-source serve's pin release), run at the CQE.
     hook: ?fsv.CompletionHook = null,
+
+    fn replyLen(self: Pend) u32 {
+        return if (self.reply_len != 0) self.reply_len else self.len;
+    }
 
     const Kind = enum(u8) {
         /// `READ_FIXED(slab @ bounce_off → slot)`; the commit cell is parked.
@@ -1237,14 +1248,20 @@ pub const Group = struct {
     /// Stage `body` in the bounce (unless it already IS the bounce) and
     /// bridge it into the slot; the commit parks until the CQE. Returns
     /// false when no bridge could be pushed.
-    fn bridgeBounce(self: *Group, gent: u32, body: []const u8, readdir_probe: bool) bool {
+    /// `zero_pad` (a short paged READ): the bounce holds zeros past the
+    /// body up to it; the bridge moves the padded length into the
+    /// installed pages (the kernel copy path's page_zeroing) while the
+    /// commit's payload length stays the body's.
+    fn bridgeBounce(self: *Group, gent: u32, body: []const u8, readdir_probe: bool, zero_pad: u32) bool {
         const win = self.bounce(gent);
         if (body.len > win.len) return false;
         if (body.ptr != win.ptr) {
             @memcpy(win[0..body.len], body);
             zc_bounce_copies.inc();
         }
-        return self.pushBridge(gent, .{ .kind = .reply_bounce, .len = @intCast(body.len), .readdir_probe = readdir_probe }, self.shared.slab.?.fd, self.bounceOffset(gent), true);
+        const dma: u32 = @intCast(@min(win.len, @max(body.len, zero_pad)));
+        if (dma > body.len) @memset(win[body.len..dma], 0);
+        return self.pushBridge(gent, .{ .kind = .reply_bounce, .len = dma, .reply_len = @intCast(body.len), .readdir_probe = readdir_probe }, self.shared.slab.?.fd, self.bounceOffset(gent), true);
     }
 
     /// The bridge deadline scan (every `BRIDGE_SCAN_PERIOD` while a pend is
@@ -1290,7 +1307,7 @@ pub const Group = struct {
                     return;
                 };
                 if (ok) {
-                    self.commitPrefilled(gent, msg.header.unique, pend.len);
+                    self.commitPrefilled(gent, msg.header.unique, pend.replyLen());
                     if (pend.kind == .reply_fd) {
                         zc_fd_body_replies.inc();
                         zc_serve_bytes.add(pend.len);
@@ -1303,7 +1320,7 @@ pub const Group = struct {
                     // Restage the keepalive body through the bounce (the
                     // view is pinned until the hook runs, AFTER the copy).
                     zc_fd_body_fallbacks.inc();
-                    const restaged = self.bridgeBounce(gent, msg.body, false);
+                    const restaged = self.bridgeBounce(gent, msg.body, false, msg.zero_pad);
                     if (pend.hook) |h| _ = h.run(false);
                     if (restaged) return;
                 }
@@ -1622,7 +1639,7 @@ pub const Group = struct {
                     const pushed = if (msg.kind == .fd_body)
                         self.pushBridge(gent, .{ .kind = .reply_fd, .len = @intCast(r.body.len), .readdir_probe = probe, .hook = hook }, msg.fd, msg.fd_off, true)
                     else
-                        self.bridgeBounce(gent, r.body, probe);
+                        self.bridgeBounce(gent, r.body, probe, r.zero_pad);
                     if (!pushed) {
                         if (hook) |h| _ = h.run(false);
                     }
@@ -2169,7 +2186,8 @@ pub const Group = struct {
     /// A served READ reply: into the window (UserEnts/BufRing — the arena
     /// or the attached buffer), or bridged through the slot (zc).
     fn commitRead(self: *Group, gent: u32, req: fsv.Request, in: abi.fuse_read_in, reply: codec.Reply) void {
-        const r = codec.replyRead(req.unique(), reply.body, in.size);
+        var r = codec.replyRead(req.unique(), reply.body, in.size);
+        r.zero_pad = self.zeroReadTail(gent, in, r.body.len);
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
         const cid = m.slots.ent(e).owing().?.commit_id;
@@ -2191,7 +2209,11 @@ pub const Group = struct {
         const m = self.memberOf(gent);
         const e = self.entIdxOf(gent);
         const sref: slot.SlotRef = .{ .qid = m.qid, .ent_idx = e, .commit_id = m.slots.ent(e).owing().?.commit_id };
-        if (self.shared.zeroCopy() and m.slots.ent(e).dir == .dest and fs.body.len > 0) {
+        // A short serve (EOF inside the requested pages) takes the copy arm:
+        // the fill-pool view has no zeros to bridge past its bytes.
+        const served: usize = @min(fs.body.len, in.size);
+        const padded = in.flags & O_DIRECT == 0 and served < @min(derive.alignUp(in.size, std.heap.pageSize()), self.payload_len);
+        if (self.shared.zeroCopy() and m.slots.ent(e).dir == .dest and fs.body.len > 0 and !padded) {
             self.hooks[gent] = fs.done;
             self.local_msgs[gent] = commit_queue.Msg.fdBody(sref, codec.replyData(fs.unique, fs.body), fs.fd, fs.off);
             self.commitReadyZc(gent, &self.local_msgs[gent], .local);
@@ -2203,6 +2225,15 @@ pub const Group = struct {
         zc_fd_source_copies.inc();
         if (fs.done) |h| _ = h.run(true);
         self.commitRead(gent, req, in, codec.replyData(fs.unique, win[0..n]));
+    }
+
+    /// The kernel's `page_zeroing` for a short paged READ on this slot's
+    /// window (`codec.readZeroTail`): under zero-copy the window IS the
+    /// installed pages and no kernel copy clears them; elsewhere the copy
+    /// path clears them again (idempotent). Never for an O_DIRECT read.
+    fn zeroReadTail(self: *Group, gent: u32, in: abi.fuse_read_in, len: usize) u32 {
+        if (in.flags & O_DIRECT != 0) return 0;
+        return codec.readZeroTail(self.window(gent), len, in.size, std.heap.pageSize());
     }
 
     /// THE READ DISPATCH LAW at the delivery CQE: (a) the filesystem's

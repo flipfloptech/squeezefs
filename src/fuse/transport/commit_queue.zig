@@ -77,11 +77,13 @@ pub const Msg = struct {
     fd: linux.fd_t = -1,
     fd_off: u64 = 0,
     prefilled: u32 = 0,
+    /// `codec.Reply.zero_pad`: the bounce bridge's length for a short paged READ.
+    zero_pad: u32 = 0,
     errno: linux.E = .SUCCESS,
 
     pub fn reply(s: slot.SlotRef, r: codec.Reply) Msg {
         std.debug.assert(r.out.len <= codec.MAX_OUT_LEN);
-        var m: Msg = .{ .kind = .reply, .slot = s, .header = r.header, .out_len = @intCast(r.out.len), .body = r.body };
+        var m: Msg = .{ .kind = .reply, .slot = s, .header = r.header, .out_len = @intCast(r.out.len), .body = r.body, .zero_pad = r.zero_pad };
         @memcpy(m.out[0..r.out.len], r.out);
         return m;
     }
@@ -114,7 +116,7 @@ pub const Msg = struct {
 
     /// The reply the worker applies (the out view points into the cell).
     pub fn asReply(self: *const Msg) codec.Reply {
-        return .{ .header = self.header, .out = self.out[0..self.out_len], .body = self.body };
+        return .{ .header = self.header, .out = self.out[0..self.out_len], .body = self.body, .zero_pad = self.zero_pad };
     }
 };
 

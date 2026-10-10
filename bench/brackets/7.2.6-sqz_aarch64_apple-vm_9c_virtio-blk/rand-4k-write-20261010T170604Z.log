@@ -1,0 +1,23 @@
+17:06:05 bracket[rand-4k-write]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-716223/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-716223/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate file; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/brk-716223
+17:06:05 bracket[rand-4k-write]: format set 0 (symmetric): sqmeta:///build/brk-716223/set0-meta.img sqdata:///build/brk-716223/set0-data0.img,/build/brk-716223/set0-data1.img
+17:06:05 bracket[rand-4k-write]: leg 1 arm A: /build/brk-716223/A/bin/squeezefs (set 0, symmetric) -o ''
+17:06:05 bracket[rand-4k-write]: mounted /build/brk-716223/mnt (daemon pid 716303)
+17:06:05 bracket[rand-4k-write]: leg 1: preparing the aging store's dataset (once per set)
+17:06:07 bracket[rand-4k-write]: leg 1: warm-up 10s (excluded)
+17:06:19 bracket[rand-4k-write]: leg 1: measured span 60s
+17:07:22 bracket[rand-4k-write]: leg 1: IOPS 7358.8 valid
+17:07:23 bracket[rand-4k-write]: leg 2 arm B: /build/brk-716223/A/bin/squeezefs (set 0, symmetric) -o ''
+17:07:24 bracket[rand-4k-write]: mounted /build/brk-716223/mnt (daemon pid 716532)
+17:07:24 bracket[rand-4k-write]: leg 2: warm-up 10s (excluded)
+17:07:37 bracket[rand-4k-write]: leg 2: measured span 60s
+17:08:39 bracket[rand-4k-write]: leg 2: IOPS 7398.6 valid
+17:08:40 bracket[rand-4k-write]: leg 3 arm B: /build/brk-716223/A/bin/squeezefs (set 0, symmetric) -o ''
+17:08:41 bracket[rand-4k-write]: mounted /build/brk-716223/mnt (daemon pid 716740)
+17:08:41 bracket[rand-4k-write]: leg 3: warm-up 10s (excluded)
+17:08:53 bracket[rand-4k-write]: leg 3: measured span 60s
+17:09:56 bracket[rand-4k-write]: leg 3: IOPS 7342.7 valid
+17:09:57 bracket[rand-4k-write]: leg 4 arm A: /build/brk-716223/A/bin/squeezefs (set 0, symmetric) -o ''
+17:09:58 bracket[rand-4k-write]: mounted /build/brk-716223/mnt (daemon pid 716950)
+17:09:58 bracket[rand-4k-write]: leg 4: warm-up 10s (excluded)
+17:10:10 bracket[rand-4k-write]: leg 4: measured span 60s
+17:11:13 bracket[rand-4k-write]: leg 4: IOPS 7342.5 valid

@@ -1,0 +1,23 @@
+; Random 4 KiB at QD ${IODEPTH} × ${NUMJOBS} jobs over a pre-written dataset
+; (charter §13: 942 k / 727 k IOPS via the shim; kernel-FUSE rand-4k ≥ 555 k).
+; Env: RW=randread|randwrite DIRECT=0|1 IOENGINE DIRECTORY SIZE RUNTIME NUMJOBS IODEPTH.
+[global]
+ioengine=${IOENGINE}
+direct=${DIRECT}
+bs=4k
+rw=${RW}
+iodepth=${IODEPTH}
+numjobs=${NUMJOBS}
+time_based=1
+runtime=${RUNTIME}
+directory=${DIRECTORY}
+filename_format=rand.$jobnum
+size=${SIZE}
+create_on_open=0
+fallocate=none
+norandommap=1
+randrepeat=0
+group_reporting=1
+invalidate=1
+end_fsync=0
+[rand]

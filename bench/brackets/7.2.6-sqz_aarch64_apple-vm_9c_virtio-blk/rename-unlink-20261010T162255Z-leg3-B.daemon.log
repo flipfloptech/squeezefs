@@ -1,0 +1,191 @@
+1791649632.447 info(squeezefs): mem_budget: cgroup cage 17179869184 B bound by /sys/fs/cgroup/memory.max
+1791649632.470 info(squeezefs): metadata device /dev/nvme0n1: O_DIRECT (grain 4096 B from statx(STATX_DIOALIGN), buffer alignment 4096 B) — every byte bypasses the host page cache
+1791649633.262 info(squeezefs): meta volume /dev/nvme0n1: writer claim committed and barriered (id 30df58838b68021b, pid 645630, mode flock+pr, pr key edd450d16e356328)
+1791649633.269 info(squeezefs): meta volume /dev/nvme0n1: appender 0 Live as the manager (term 3, node 0xb60598a56bfecf4a, mount slot 0); 0 other appender(s) live on the directory
+1791649633.269 info(squeezefs): meta volume /dev/nvme0n1: slot leases armed — M 64, A_max 1028096 B, 65 leases held, T_idle 45000 ms, N_floor 17
+1791649633.272 info(squeezefs): meta volume /dev/nvme0n1: mounted — ledger seq 278, tail 2002841704, replayed 0 entries (0 content records, 0 torn dropped, clean unmount), next_ino 2, 66 trees, 7808/8062 extents free, coalesced cadence, guard flock+pr
+1791649633.274 info(squeezefs): metadata set 0b8fe6ba…: 1 member(s) mounted in canonical order as manager, epoch 1, 0 dual claim(s) converged, native keyspace on member 0
+1791649633.275 debug(squeezefs): NvmeBlockDev lane 0 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791649633.286 debug(squeezefs): NvmeBlockDev lane 0: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791649633.286 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791649633.287 debug(squeezefs): NvmeBlockDev lane 1 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791649633.287 debug(squeezefs): NvmeBlockDev lane 1: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791649633.287 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791649633.288 info(squeezefs): mount: set config
+  set config generation 1; block 4194304 B; chunk 4194304 B; capacity 12868124672 B (12272 MiB); compression none; encryption none
+  data volumes 2 (VOLUME_LIFECYCLE: the set has diverged from its birth state)
+    vol-e0a6d99341d7904a active /dev/nvme1n1 1534 blocks (6136 MiB) device 86e41fb5-9c39-3e28-5d03-274a710fcdd1
+    vol-2110bcc59215a60c active /dev/nvme2n1 1534 blocks (6136 MiB) device 41a12f01-1bfc-22ce-0bc1-3174e678e247
+  cache-less (no disk cache paths)
+1791649633.289 debug(squeezefs): NvmeBlockDev lane 2 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791649633.289 debug(squeezefs): NvmeBlockDev lane 2: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791649633.289 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791649633.424 info(squeezefs): data volume tag e0a6d99341d7904a: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791649633.424 info(squeezefs): data volume /dev/nvme1n1: vol-e0a6d99341d7904a bound as ordinal 0: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791649633.425 debug(squeezefs): NvmeBlockDev lane 3 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791649633.425 debug(squeezefs): NvmeBlockDev lane 3: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791649633.425 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791649633.428 info(squeezefs): data volume tag 2110bcc59215a60c: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791649633.428 info(squeezefs): data volume /dev/nvme2n1: vol-2110bcc59215a60c bound as ordinal 1: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791649633.439 info(squeezefs): data plane: the set declares NO cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max (4096 B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)
+1791649634.519 info(squeezefs): data plane: 2 data volume(s), block 4194304 B, chunk 4194304 B, inline_max 4096 B, inline map cap 1364 entries, map chunk 512 ops, sweep threshold 32768 blocks, transform none/none, staging off, NVMe tier off, direct-store face pending the session
+1791649634.529 info(squeezefs): cluster wire: listening at 192.168.64.47:34261 (cap 144 connections)
+1791649634.530 info(squeezefs): cluster wire: manager of 1 volume(s) listening at 192.168.64.47:34261; membership owner term 3 (T_owner 45000 ms, grace closed)
+1791649634.532 info(squeezefs): data planes: the grant plane armed as the HOLDER of 2 data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)
+1791649634.540 info(squeezefs): job fabric: 0 job(s) adopted; 2 local worker(s), default throttle 100 %, verify 1000 ‰ (plaintext pins 1000), fleet jobs on; the admin lane on the listener
+1791649634.631 info(squeezefs): transport probe: kmbuf_ops=38/39
+1791649634.631 info(squeezefs): transport probe: RELEASE_PAYLOAD(commit_id=MAX) → -107 ⇒ retention present
+1791649634.631 info(squeezefs): kv_fs: FUSE 7.36; KILLPRIV_V2 negotiated; inline_max 4096 B; block 4194304 B; data volumes yes; staging off
+1791649634.631 info(squeezefs): transport: INIT 7.45 → 7.36: flags 0x4000020050c4f829 (over_io_uring=true, time_limits=true), max_write 1048576, max_pages 256, max_background 288, queues 9 × depth 32, payload 1048576 B, 9 drain group(s) (width 1), buffer mode zero_copy (kmbuf 38, retention present)
+1791649634.722 info(squeezefs): transport: group 0 (qids 0..0, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.731 info(squeezefs): transport: group 1 (qids 1..1, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.742 info(squeezefs): transport: group 2 (qids 2..2, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.760 info(squeezefs): transport: group 3 (qids 3..3, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.765 info(squeezefs): transport: group 4 (qids 4..4, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.770 info(squeezefs): transport: group 5 (qids 5..5, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.778 info(squeezefs): transport: group 6 (qids 6..6, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.785 info(squeezefs): transport: group 7 (qids 7..7, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.791 info(squeezefs): transport: group 8 (qids 8..8, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791649634.792 info(squeezefs): transport: FUSE-over-io_uring transport armed at /build/brk-641833/mnt: 9 queue(s) × 32 ent(s) over 9 worker(s), zero_copy
+1791649634.792 info(squeezefs): data plane: session armed — held-slot direct store ON, direct device leg ON, fd-source probe serve ON
+1791649634.794 info(squeezefs): ready: sqmeta:///dev/nvme0n1 mounted at /build/brk-641833/mnt (pid 645630; 9 queue(s) × depth 32; budget 7168 MiB; TTLs attr 1000 ms entry 1000 ms dir_entry 1000 ms negative 1000 ms)
+1791649635.294 debug(squeezefs): checkpoint tail 2002857992 < head 2006868912: inflight 2006889272, dying floors 2002857992, dirty node floor 2006881128
+1791649636.337 debug(squeezefs): checkpoint tail 2006881128 < head 2013986768: inflight 2014031560, dying floors 2006881128, dirty node floor 2014015272
+1791649637.394 debug(squeezefs): checkpoint tail 2014015272 < head 2023185416: inflight 2023254640, dying floors 2014015272, dirty node floor 2023222064
+1791649638.280 debug(squeezefs): checkpoint tail 2023222064 < head 2030800056: inflight 2031142104, dying floors 2023222064, dirty node floor 2030808200
+1791649639.343 debug(squeezefs): checkpoint tail 2030808200 < head 2039363472: inflight 18446744073709551615, dying floors 2030808200, dirty node floor 2039379971
+1791649640.426 debug(squeezefs): checkpoint tail 2039379971 < head 2046004904: inflight 18446744073709551615, dying floors 2039379971, dirty node floor 2046013048
+1791649641.486 debug(squeezefs): checkpoint tail 2046013048 < head 2053815000: inflight 18446744073709551615, dying floors 2046013048, dirty node floor 18446744073709551615
+1791649642.603 debug(squeezefs): checkpoint tail 2053815000 < head 2060928784: inflight 18446744073709551615, dying floors 2053815000, dirty node floor 2060945072
+1791649643.732 debug(squeezefs): checkpoint tail 2060945072 < head 2069418904: inflight 18446744073709551615, dying floors 2060945072, dirty node floor 2069459624
+1791649644.788 debug(squeezefs): checkpoint tail 2069459624 < head 2076935816: inflight 2077053904, dying floors 2069459624, dirty node floor 2076952104
+1791649645.922 debug(squeezefs): checkpoint tail 2076952104 < head 2085271200: inflight 2085613248, dying floors 2076952104, dirty node floor 2085271200
+1791649646.981 debug(squeezefs): checkpoint tail 2085271200 < head 2093244176: inflight 18446744073709551615, dying floors 2085271200, dirty node floor 2093284896
+1791649648.144 debug(squeezefs): checkpoint tail 2093284896 < head 2101408536: inflight 18446744073709551615, dying floors 2093284896, dirty node floor 2101746708
+1791649649.219 debug(squeezefs): checkpoint tail 2102308448 < head 2110839288: inflight 18446744073709551615, dying floors 2102308448, dirty node floor 2110847432
+1791649650.263 debug(squeezefs): checkpoint tail 2110847432 < head 2118445784: inflight 2118555728, dying floors 2110847432, dirty node floor 2118450052
+1791649651.377 debug(squeezefs): checkpoint tail 2118466144 < head 2126728232: inflight 2126846320, dying floors 2118466144, dirty node floor 2126740448
+1791649652.456 debug(squeezefs): checkpoint tail 2126760808 < head 2133585480: inflight 2133842016, dying floors 2126760808, dirty node floor 2133585480
+1791649653.538 debug(squeezefs): checkpoint tail 2133585480 < head 2142429864: inflight 2142572384, dying floors 2133585480, dirty node floor 2142462440
+1791649654.615 debug(squeezefs): checkpoint tail 2142479120 < head 2149755392: inflight 18446744073709551615, dying floors 2142479120, dirty node floor 2149759464
+1791649656.711 debug(squeezefs): checkpoint tail 2149783896 < head 2157349672: inflight 2157378176, dying floors 2149783896, dirty node floor 2157357816
+1791649657.827 debug(squeezefs): checkpoint tail 2157357816 < head 2165412232: inflight 18446744073709551615, dying floors 2157357816, dirty node floor 2165526248
+1791649658.996 debug(squeezefs): checkpoint tail 2165737992 < head 2173425928: inflight 18446744073709551615, dying floors 2165737992, dirty node floor 2173503296
+1791649660.120 debug(squeezefs): checkpoint tail 2174488720 < head 2182771168: inflight 18446744073709551615, dying floors 2174488720, dirty node floor 2182836320
+1791649661.291 debug(squeezefs): checkpoint tail 2182893328 < head 2191436384: inflight 18446744073709551615, dying floors 2182893328, dirty node floor 2191452883
+1791649662.290 debug(squeezefs): checkpoint tail 2191493603 < head 2199763624: inflight 18446744073709551615, dying floors 2191493603, dirty node floor 2199808416
+1791649663.356 debug(squeezefs): checkpoint tail 2199934859 < head 2206172952: inflight 18446744073709551615, dying floors 2199934859, dirty node floor 2206262536
+1791649664.435 debug(squeezefs): checkpoint tail 2206262536 < head 2212561920: inflight 2213005768, dying floors 2206262536, dirty node floor 2212574323
+1791649665.632 debug(squeezefs): checkpoint tail 2212574323 < head 2218295296: inflight 2218637344, dying floors 2212574323, dirty node floor 2218299555
+1791649666.835 debug(squeezefs): checkpoint tail 2218299555 < head 2222713416: inflight 18446744073709551615, dying floors 2218299555, dirty node floor 2222758208
+1791649668.008 debug(squeezefs): checkpoint tail 2222965880 < head 2226406720: inflight 18446744073709551615, dying floors 2222965880, dirty node floor 2226410979
+1791649669.135 debug(squeezefs): checkpoint tail 2226740624 < head 2230552016: inflight 2230804480, dying floors 2226740624, dirty node floor 2230556275
+1791649670.328 debug(squeezefs): checkpoint tail 2230629758 < head 2237580288: inflight 2238516848, dying floors 2230629758, dirty node floor 2237580288
+1791649671.487 debug(squeezefs): checkpoint tail 2237580288 < head 2246229216: inflight 2246848160, dying floors 2237580288, dirty node floor 2246310843
+1791649672.596 debug(squeezefs): checkpoint tail 2246767094 < head 2254352856: inflight 2254874072, dying floors 2246767094, dirty node floor 2254800776
+1791649673.715 debug(squeezefs): checkpoint tail 2254800776 < head 2261539936: inflight 18446744073709551615, dying floors 2254800776, dirty node floor 2261544400
+1791649674.809 debug(squeezefs): checkpoint tail 2261747804 < head 2270555344: inflight 2271048056, dying floors 2261747804, dirty node floor 2270559612
+1791649674.889 debug(squeezefs): checkpoint tail 2271040108 < head 2271479688: inflight 18446744073709551615, dying floors 2271040108, dirty node floor 2271487832
+1791649676.006 debug(squeezefs): checkpoint tail 2271500048 < head 2280918584: inflight 18446744073709551615, dying floors 2271500048, dirty node floor 2280951356
+1791649676.897 debug(squeezefs): checkpoint tail 2280988200 < head 2288598376: inflight 18446744073709551615, dying floors 2280988200, dirty node floor 2288614860
+1791649678.010 debug(squeezefs): checkpoint tail 2288614860 < head 2297849960: inflight 18446744073709551615, dying floors 2288614860, dirty node floor 2297866248
+1791649678.711 debug(squeezefs): checkpoint tail 2297866248 < head 2305305792: inflight 2305578616, dying floors 2297866248, dirty node floor 2305395376
+1791649679.556 debug(squeezefs): checkpoint tail 2305521818 < head 2314850560: inflight 2314907568, dying floors 2305521818, dirty node floor 2314866848
+1791649680.385 debug(squeezefs): checkpoint tail 2314866848 < head 2322575144: inflight 18446744073709551615, dying floors 2314866848, dirty node floor 2322648440
+1791649681.381 debug(squeezefs): checkpoint tail 2322766528 < head 2331659776: inflight 18446744073709551615, dying floors 2322766528, dirty node floor 2331680347
+1791649682.107 debug(squeezefs): checkpoint tail 2331680347 < head 2339441368: inflight 18446744073709551615, dying floors 2331680347, dirty node floor 2339466222
+1791649683.145 debug(squeezefs): checkpoint tail 2339494515 < head 2348403840: inflight 18446744073709551615, dying floors 2339494515, dirty node floor 2348509712
+1791649684.233 debug(squeezefs): checkpoint tail 2348509712 < head 2356075488: inflight 2356356456, dying floors 2348509712, dirty node floor 2356088076
+1791649685.288 debug(squeezefs): checkpoint tail 2356088076 < head 2364044392: inflight 2364154336, dying floors 2356088076, dirty node floor 2364048651
+1791649686.408 debug(squeezefs): checkpoint tail 2364048651 < head 2370241976: inflight 18446744073709551615, dying floors 2364048651, dirty node floor 2370307502
+1791649687.457 debug(squeezefs): checkpoint tail 2370307502 < head 2376069008: inflight 2376187096, dying floors 2370307502, dirty node floor 2376073080
+1791649688.599 debug(squeezefs): checkpoint tail 2376073080 < head 2383357888: inflight 2384058272, dying floors 2376073080, dirty node floor 2383358075
+1791649689.759 debug(squeezefs): checkpoint tail 2383358075 < head 2391681056: inflight 2392556536, dying floors 2383358075, dirty node floor 2391754726
+1791649690.943 debug(squeezefs): checkpoint tail 2392165624 < head 2399271264: inflight 2399776192, dying floors 2392165624, dirty node floor 2399458576
+1791649692.011 debug(squeezefs): checkpoint tail 2399674392 < head 2406755600: inflight 2407154656, dying floors 2399674392, dirty node floor 2406775960
+1791649693.043 debug(squeezefs): checkpoint tail 2406775960 < head 2415396384: inflight 2415526688, dying floors 2406775960, dirty node floor 2415408600
+1791649694.085 debug(squeezefs): checkpoint tail 2415469680 < head 2423585176: inflight 2423711408, dying floors 2415469680, dirty node floor 2423601464
+1791649695.011 debug(squeezefs): checkpoint tail 2423617948 < head 2432409200: inflight 2432885624, dying floors 2423617948, dirty node floor 2432413468
+1791649695.806 debug(squeezefs): checkpoint tail 2432421416 < head 2440304808: inflight 18446744073709551615, dying floors 2432421416, dirty node floor 2440304808
+1791649696.795 debug(squeezefs): checkpoint tail 2440459740 < head 2449389440: inflight 2449988024, dying floors 2440459740, dirty node floor 2449959520
+1791649697.631 debug(squeezefs): checkpoint tail 2449959520 < head 2457818480: inflight 18446744073709551615, dying floors 2449959520, dirty node floor 2457826624
+1791649698.499 debug(squeezefs): checkpoint tail 2457826624 < head 2466874608: inflight 2467420256, dying floors 2457826624, dirty node floor 2466919400
+1791649699.260 debug(squeezefs): checkpoint tail 2467049704 < head 2474696920: inflight 18446744073709551615, dying floors 2467049704, dirty node floor 2474709136
+1791649700.205 debug(squeezefs): checkpoint tail 2474709136 < head 2484127672: inflight 18446744073709551615, dying floors 2474709136, dirty node floor 2484127672
+1791649701.388 debug(squeezefs): checkpoint tail 2484127672 < head 2491823752: inflight 2492959840, dying floors 2484127672, dirty node floor 2491958128
+1791649702.498 debug(squeezefs): checkpoint tail 2491999034 < head 2501091624: inflight 18446744073709551615, dying floors 2491999034, dirty node floor 2501095883
+1791649703.534 debug(squeezefs): checkpoint tail 2501095883 < head 2508718480: inflight 2509276344, dying floors 2501095883, dirty node floor 2508763646
+1791649704.665 debug(squeezefs): checkpoint tail 2509003520 < head 2518251032: inflight 2518833328, dying floors 2509003520, dirty node floor 2518267320
+1791649705.617 debug(squeezefs): checkpoint tail 2518707096 < head 2525751656: inflight 2526602704, dying floors 2518707096, dirty node floor 2525813110
+1791649706.753 debug(squeezefs): checkpoint tail 2526268800 < head 2535797280: inflight 2536591320, dying floors 2526268800, dirty node floor 2535866504
+1791649707.473 debug(squeezefs): checkpoint tail 2536285920 < head 2543033224: inflight 18446744073709551615, dying floors 2536285920, dirty node floor 2543155580
+1791649708.554 debug(squeezefs): checkpoint tail 2543155580 < head 2553388320: inflight 18446744073709551615, dying floors 2543155580, dirty node floor 2553392980
+1791649709.212 debug(squeezefs): checkpoint tail 2553417020 < head 2559899448: inflight 18446744073709551615, dying floors 2553417020, dirty node floor 2559899448
+1791649710.221 debug(squeezefs): checkpoint tail 2559899448 < head 2570156816: inflight 18446744073709551615, dying floors 2559899448, dirty node floor 2570165156
+1791649710.867 debug(squeezefs): checkpoint tail 2570242524 < head 2577009992: inflight 18446744073709551615, dying floors 2570242524, dirty node floor 2577062928
+1791649711.932 debug(squeezefs): checkpoint tail 2577168800 < head 2586953816: inflight 2587344728, dying floors 2577168800, dirty node floor 2587063970
+1791649712.652 debug(squeezefs): checkpoint tail 2587063970 < head 2594556240: inflight 18446744073709551615, dying floors 2587063970, dirty node floor 2594568456
+1791649713.626 debug(squeezefs): checkpoint tail 2594568456 < head 2604027712: inflight 18446744073709551615, dying floors 2594568456, dirty node floor 2604039928
+1791649714.404 debug(squeezefs): checkpoint tail 2604121579 < head 2611524264: inflight 2611850024, dying floors 2604121579, dirty node floor 2611532619
+1791649715.543 debug(squeezefs): checkpoint tail 2611801160 < head 2619273280: inflight 18446744073709551615, dying floors 2611801160, dirty node floor 2619314000
+1791649716.669 debug(squeezefs): checkpoint tail 2619338432 < head 2624794912: inflight 18446744073709551615, dying floors 2619338432, dirty node floor 2624803056
+1791649717.775 debug(squeezefs): checkpoint tail 2624896712 < head 2631306040: inflight 18446744073709551615, dying floors 2624896712, dirty node floor 2631375475
+1791649718.882 debug(squeezefs): checkpoint tail 2631375475 < head 2636734016: inflight 2636974264, dying floors 2631375475, dirty node floor 2636762520
+1791649719.974 debug(squeezefs): checkpoint tail 2636913184 < head 2640150424: inflight 18446744073709551615, dying floors 2636913184, dirty node floor 2640158568
+1791649721.071 debug(squeezefs): checkpoint tail 2640284800 < head 2644283504: inflight 2644454528, dying floors 2640284800, dirty node floor 2644307936
+1791649722.144 debug(squeezefs): checkpoint tail 2644401592 < head 2648253704: inflight 2648489880, dying floors 2644401592, dirty node floor 2648262035
+1791649723.394 debug(squeezefs): checkpoint tail 2648262035 < head 2653054592: inflight 18446744073709551615, dying floors 2648262035, dirty node floor 2653054592
+1791649724.546 debug(squeezefs): checkpoint tail 2653323344 < head 2658091656: inflight 2658523288, dying floors 2653323344, dirty node floor 2658107944
+1791649725.711 debug(squeezefs): checkpoint tail 2658107944 < head 2662778528: inflight 18446744073709551615, dying floors 2658107944, dirty node floor 2662778528
+1791649726.832 debug(squeezefs): checkpoint tail 2662778528 < head 2667506120: inflight 2667807448, dying floors 2662778528, dirty node floor 2667514264
+1791649727.910 debug(squeezefs): checkpoint tail 2667685288 < head 2671765432: inflight 18446744073709551615, dying floors 2667685288, dirty node floor 2671765432
+1791649729.121 debug(squeezefs): checkpoint tail 2671765432 < head 2676203912: inflight 2676782136, dying floors 2671765432, dirty node floor 2676212056
+1791649730.281 debug(squeezefs): checkpoint tail 2676431944 < head 2680878568: inflight 2681245048, dying floors 2676431944, dirty node floor 2680882827
+1791649731.443 debug(squeezefs): checkpoint tail 2681041448 < head 2684865056: inflight 18446744073709551615, dying floors 2681041448, dirty node floor 2684893560
+1791649732.730 debug(squeezefs): checkpoint tail 2685085131 < head 2688704952: inflight 2689169160, dying floors 2685085131, dirty node floor 2688709398
+1791649733.963 debug(squeezefs): checkpoint tail 2689132699 < head 2692605928: inflight 2692943904, dying floors 2689132699, dirty node floor 2692605928
+1791649735.003 debug(squeezefs): checkpoint tail 2692605928 < head 2697541192: inflight 2697716288, dying floors 2692605928, dirty node floor 2697642992
+1791649736.055 debug(squeezefs): checkpoint tail 2697642992 < head 2704866720: inflight 18446744073709551615, dying floors 2697642992, dirty node floor 2704887080
+1791649737.130 debug(squeezefs): checkpoint tail 2704887080 < head 2714069440: inflight 18446744073709551615, dying floors 2704887080, dirty node floor 2714069440
+1791649738.224 debug(squeezefs): checkpoint tail 2714342460 < head 2723007480: inflight 18446744073709551615, dying floors 2714342460, dirty node floor 2723056344
+1791649739.081 debug(squeezefs): checkpoint tail 2723207400 < head 2731017104: inflight 2731289928, dying floors 2723207400, dirty node floor 2731061896
+1791649740.088 debug(squeezefs): checkpoint tail 2731175912 < head 2740366416: inflight 18446744073709551615, dying floors 2731175912, dirty node floor 2740407136
+1791649742.449 info(squeezefs): transport: readdir class probed paged by its first bridge
+1791649742.469 info(squeezefs): stop requested (SIGTERM/SIGINT): unmounting /build/brk-641833/mnt
+1791649742.470 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.470 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.471 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.471 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.471 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.471 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.471 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.472 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.472 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791649742.489 info(squeezefs): teardown: session closed; open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0
+1791649742.910 info(squeezefs): data volume /dev/nvme1n1: dismount teardown completed; further DMA refused (EROFS class)
+1791649742.910 info(squeezefs): data volume /dev/nvme2n1: dismount teardown completed; further DMA refused (EROFS class)
+1791649743.294 info(squeezefs): meta volume /dev/nvme0n1: clean unmount (checkpoint seq 389, tail 2740557800, head 2740557800, healthy)
+1791649743.480 error(SafeAllocator): leaked [addr: ffffa855f4e8, len: 144 (0x90) align: 8] allocated at: 
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/ops/nvmet/initiator.zig:875:45: 0x164bb5b in sample (squeezefs)
+            if (!found) try self.seen.append(gpa, cur);
+                                            ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/stats/stats.zig:414:20: 0x17c0007 in writeAll (squeezefs)
+        try f.write(src, w);
+                   ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/stats/stats.zig:853:17: 0x17baa5b in render (squeezefs)
+        writeAll(&self.sources, &out.writer) catch return error.OutOfMemory;
+                ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/kv_fs.zig:578:43: 0x15e9a23 in lookupVirtual (squeezefs)
+            const payload = try face.build(face.ctx, class, self.gpa);
+                                          ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/filesystem.zig:302:39: 0x170bbab in call (squeezefs)
+                return @field(T, name)(self, c, args);
+                                      ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/lifecycle.zig:352:51: 0x17057c3 in run (squeezefs)
+                    const e = try fs.vtable.lookup(fs.impl, c, .{ .parent = ino, .name = a.name });
+                                                  ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/lifecycle.zig:241:37: 0x170233b in dispatch (squeezefs)
+            const outcome = self.run(req, meta, &ctx, &out, lease);
+                                    ^
+(additional stack frames may have been skipped...)
+

@@ -1,0 +1,405 @@
+1791642473.950 info(squeezefs): mem_budget: cgroup cage 17179869184 B bound by /sys/fs/cgroup/memory.max
+1791642473.959 info(squeezefs): metadata device /dev/nvme0n1: O_DIRECT (grain 4096 B from statx(STATX_DIOALIGN), buffer alignment 4096 B) — every byte bypasses the host page cache
+1791642474.653 info(squeezefs): meta volume /dev/nvme0n1: writer claim committed and barriered (id 1362da6f36e32a8e, pid 449058, mode flock+pr, pr key 2e81791106e75060)
+1791642474.659 info(squeezefs): meta volume /dev/nvme0n1: appender 0 Live as the manager (term 2, node 0xb60598a56bfecf4a, mount slot 0); 0 other appender(s) live on the directory
+1791642474.659 info(squeezefs): meta volume /dev/nvme0n1: slot leases armed — M 64, A_max 262144 B, 65 leases held, T_idle 45000 ms, N_floor 17
+1791642474.661 info(squeezefs): meta volume /dev/nvme0n1: mounted — ledger seq 42, tail 117684872, replayed 0 entries (0 content records, 0 torn dropped, clean unmount), next_ino 2, 7 trees, 8054/8062 extents free, coalesced cadence, guard flock+pr
+1791642474.663 info(squeezefs): metadata set 8f3d8e89…: 1 member(s) mounted in canonical order as manager, epoch 1, 0 dual claim(s) converged, native keyspace on member 0
+1791642474.664 debug(squeezefs): NvmeBlockDev lane 0 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791642474.668 debug(squeezefs): NvmeBlockDev lane 0: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642474.668 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791642474.673 debug(squeezefs): NvmeBlockDev lane 1 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791642474.673 debug(squeezefs): NvmeBlockDev lane 1: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642474.673 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791642474.678 info(squeezefs): mount: set config
+  set config generation 1; block 4194304 B; chunk 4194304 B; capacity 12868124672 B (12272 MiB); compression none; encryption none
+  data volumes 2 (VOLUME_LIFECYCLE: the set has diverged from its birth state)
+    vol-86f9b09036357b87 active /dev/nvme1n1 1534 blocks (6136 MiB) device 84ec1694-d95f-7d91-1cb8-3611956b7bcf
+    vol-3d066ed33111bb95 active /dev/nvme2n1 1534 blocks (6136 MiB) device 8fd7f823-cf8c-20e8-db0a-3ea03ede2f0f
+  cache-less (no disk cache paths)
+1791642474.678 debug(squeezefs): NvmeBlockDev lane 2 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791642474.679 debug(squeezefs): NvmeBlockDev lane 2: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642474.679 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791642474.680 info(squeezefs): data volume /dev/nvme1n1: vol-86f9b09036357b87 bound as ordinal 0: 1534 usable blocks, 384 referenced (384 ref records), 1150 free
+1791642474.681 debug(squeezefs): NvmeBlockDev lane 3 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791642474.681 debug(squeezefs): NvmeBlockDev lane 3: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642474.681 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791642474.682 info(squeezefs): data volume /dev/nvme2n1: vol-3d066ed33111bb95 bound as ordinal 1: 1534 usable blocks, 128 referenced (128 ref records), 1406 free
+1791642474.687 info(squeezefs): data plane: the set declares NO cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max (4096 B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)
+1791642475.070 info(squeezefs): data plane: 2 data volume(s), block 4194304 B, chunk 4194304 B, inline_max 4096 B, inline map cap 1364 entries, map chunk 512 ops, sweep threshold 32768 blocks, transform none/none, staging off, NVMe tier off, direct-store face pending the session
+1791642475.072 info(squeezefs): cluster wire: listening at 192.168.64.47:39655 (cap 144 connections)
+1791642475.073 info(squeezefs): cluster wire: manager of 1 volume(s) listening at 192.168.64.47:39655; membership owner term 2 (T_owner 45000 ms, grace closed)
+1791642475.074 info(squeezefs): data planes: the grant plane armed as the HOLDER of 2 data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)
+1791642475.079 info(squeezefs): job fabric: 0 job(s) adopted; 2 local worker(s), default throttle 100 %, verify 1000 ‰ (plaintext pins 1000), fleet jobs on; the admin lane on the listener
+1791642475.082 info(squeezefs): transport probe: kmbuf_ops=38/39
+1791642475.082 info(squeezefs): transport probe: RELEASE_PAYLOAD(commit_id=MAX) → -107 ⇒ retention present
+1791642475.082 info(squeezefs): kv_fs: FUSE 7.36; KILLPRIV_V2 negotiated; inline_max 4096 B; block 4194304 B; data volumes yes; staging off
+1791642475.082 info(squeezefs): transport: INIT 7.45 → 7.36: flags 0x4000020050c4f829 (over_io_uring=true, time_limits=true), max_write 1048576, max_pages 256, max_background 288, queues 9 × depth 32, payload 1048576 B, 9 drain group(s) (width 1), buffer mode zero_copy (kmbuf 38, retention present)
+1791642475.138 info(squeezefs): transport: group 0 (qids 0..0, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.144 info(squeezefs): transport: group 1 (qids 1..1, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.150 info(squeezefs): transport: group 2 (qids 2..2, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.167 info(squeezefs): transport: group 3 (qids 3..3, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.172 info(squeezefs): transport: group 4 (qids 4..4, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.178 info(squeezefs): transport: group 5 (qids 5..5, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.183 info(squeezefs): transport: group 6 (qids 6..6, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.188 info(squeezefs): transport: group 7 (qids 7..7, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.193 info(squeezefs): transport: group 8 (qids 8..8, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642475.194 info(squeezefs): transport: FUSE-over-io_uring transport armed at /build/brk-448740/mnt: 9 queue(s) × 32 ent(s) over 9 worker(s), zero_copy
+1791642475.194 info(squeezefs): data plane: session armed — held-slot direct store ON, direct device leg ON, fd-source probe serve ON
+1791642475.195 info(squeezefs): ready: sqmeta:///dev/nvme0n1 mounted at /build/brk-448740/mnt (pid 449058; 9 queue(s) × depth 32; budget 7168 MiB; TTLs attr 1000 ms entry 1000 ms dir_entry 1000 ms negative 1000 ms)
+1791642477.757 debug(squeezefs): checkpoint tail 119932616 < head 124224504: inflight 18446744073709551615, dying floors 119932616, dirty node floor 124224504
+1791642479.094 debug(squeezefs): checkpoint tail 124224504 < head 127653128: inflight 18446744073709551615, dying floors 124224504, dirty node floor 127653246
+1791642480.227 debug(squeezefs): checkpoint tail 127661272 < head 129245280: inflight 18446744073709551615, dying floors 127661272, dirty node floor 129245280
+1791642481.301 debug(squeezefs): checkpoint tail 129253424 < head 130251064: inflight 130267352, dying floors 129253424, dirty node floor 130255136
+1791642481.373 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1023 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.374 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1024 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.377 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1033 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.389 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1038 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.390 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1045 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.390 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1040 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.393 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1041 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.393 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1044 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.396 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1045 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.396 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1046 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.397 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1039 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.397 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1039 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.398 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1040 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.405 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1047 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.406 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1039 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.406 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1039 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.407 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1039 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.407 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1041 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.408 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1039 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.417 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1043 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.418 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1049 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.418 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1028 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.419 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1033 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.419 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1017 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.420 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.420 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.425 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1051 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.469 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1022 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.469 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1056 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.469 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1051 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.470 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1064 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.470 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1023 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.471 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1052 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.471 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1045 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.472 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1051 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.472 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1045 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.478 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1064 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.478 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1029 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.497 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1071 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.497 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1069 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.498 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1069 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.505 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1086 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.505 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1039 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.505 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1078 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.506 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1037 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.506 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1036 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.507 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1033 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.508 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.508 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.509 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.510 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.511 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.511 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.512 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1011 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.513 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1012 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.522 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1088 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.522 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1095 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.642 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1213 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.648 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1220 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.648 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1212 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.649 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1215 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.649 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1189 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.652 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1216 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.652 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1184 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.653 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1224 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.657 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1188 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.657 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1221 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.658 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1222 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.660 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1186 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.660 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1200 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.661 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1224 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.662 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1183 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.662 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1223 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.662 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1194 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.670 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1184 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.670 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1201 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.670 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1230 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.671 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1201 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.671 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1181 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.671 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1212 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.674 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1200 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.676 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1196 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.681 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1215 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.681 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1181 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.682 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1195 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.685 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1215 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.685 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1184 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.685 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1195 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.689 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1215 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.689 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1187 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.690 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1198 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.690 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1185 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.713 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1213 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.725 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1222 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.725 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1246 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.737 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1232 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.738 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1252 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.745 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1244 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.746 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1256 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.749 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1249 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.750 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1249 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642481.752 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1242 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642482.318 debug(squeezefs): checkpoint tail 130259208 < head 131818784: inflight 18446744073709551615, dying floors 130259208, dirty node floor 131818784
+1791642483.334 debug(squeezefs): checkpoint tail 131818784 < head 134750624: inflight 18446744073709551615, dying floors 131818784, dirty node floor 134754696
+1791642484.357 debug(squeezefs): checkpoint tail 134754696 < head 138423568: inflight 18446744073709551615, dying floors 134754696, dirty node floor 138427640
+1791642485.403 debug(squeezefs): checkpoint tail 138427640 < head 141770752: inflight 18446744073709551615, dying floors 138427640, dirty node floor 141774824
+1791642487.481 debug(squeezefs): checkpoint tail 142703358 < head 144959128: inflight 18446744073709551615, dying floors 142703358, dirty node floor 144963200
+1791642488.499 debug(squeezefs): checkpoint tail 144967272 < head 148208584: inflight 18446744073709551615, dying floors 144967272, dirty node floor 18446744073709551615
+1791642490.901 debug(squeezefs): checkpoint tail 150297520 < head 152508616: inflight 152541192, dying floors 150297520, dirty node floor 152533048
+1791642491.960 debug(squeezefs): checkpoint tail 152533048 < head 156039040: inflight 18446744073709551615, dying floors 152533048, dirty node floor 156039158
+1791642493.612 debug(squeezefs): checkpoint tail 156104192 < head 158307144: inflight 18446744073709551615, dying floors 156104192, dirty node floor 158311216
+1791642494.635 debug(squeezefs): checkpoint tail 158311216 < head 161422224: inflight 161442584, dying floors 158311216, dirty node floor 161422342
+1791642495.670 debug(squeezefs): checkpoint tail 161422342 < head 164936360: inflight 18446744073709551615, dying floors 161422342, dirty node floor 164956720
+1791642496.692 debug(squeezefs): checkpoint tail 164956720 < head 166475576: inflight 18446744073709551615, dying floors 164956720, dirty node floor 166479648
+1791642497.713 debug(squeezefs): checkpoint tail 166479648 < head 169334120: inflight 18446744073709551615, dying floors 166479648, dirty node floor 169342264
+1791642498.787 debug(squeezefs): checkpoint tail 169358552 < head 170156664: inflight 18446744073709551615, dying floors 169358552, dirty node floor 170181096
+1791642498.789 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1035 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.789 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1014 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.796 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1042 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.796 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1000 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.796 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1021 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.810 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1054 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.810 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1034 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.810 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1013 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.811 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1036 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.811 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1013 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.811 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1032 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.814 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1015 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.814 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1034 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.819 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.819 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1019 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.820 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1035 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.824 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.827 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1027 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.827 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1038 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.827 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.828 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1027 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.832 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1016 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.839 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1022 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.899 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1058 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.899 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1075 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.940 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1066 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.943 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1119 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.943 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1092 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.943 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1069 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.944 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1110 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.945 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1070 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.945 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1111 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.945 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1089 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.961 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1085 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.962 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1121 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.976 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1098 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.976 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1119 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.977 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1137 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.977 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1117 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.977 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1113 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.978 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1137 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.978 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1106 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.979 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1113 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.979 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1128 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.979 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1106 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.980 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1115 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.981 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1101 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.987 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1131 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.987 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1115 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.993 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1128 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642498.993 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1120 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642499.087 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1214 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642499.089 error(squeezefs): transport: a FUSE_WRITE payload lease lived 1209 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791642499.801 debug(squeezefs): checkpoint tail 170181096 < head 173108864: inflight 18446744073709551615, dying floors 170181096, dirty node floor 173117008
+1791642500.241 warning(squeezefs): mem_budget: unreclaimable 7207044224 B >= 95% of the 7516192768 B budget — disk-tier publishes paused
+1791642500.850 debug(squeezefs): checkpoint tail 173117008 < head 177522912: inflight 18446744073709551615, dying floors 173117008, dirty node floor 177522912
+1791642501.863 debug(squeezefs): checkpoint tail 177522912 < head 180589128: inflight 18446744073709551615, dying floors 177522912, dirty node floor 180589246
+1791642502.870 debug(squeezefs): checkpoint tail 180589246 < head 184465672: inflight 18446744073709551615, dying floors 180589246, dirty node floor 184465672
+1791642503.902 debug(squeezefs): checkpoint tail 184465672 < head 188948944: inflight 18446744073709551615, dying floors 184465672, dirty node floor 188948944
+1791642504.941 debug(squeezefs): checkpoint tail 188948944 < head 192670752: inflight 18446744073709551615, dying floors 188948944, dirty node floor 192691112
+1791642505.963 debug(squeezefs): checkpoint tail 192691112 < head 196673528: inflight 18446744073709551615, dying floors 192691112, dirty node floor 196673528
+1791642506.245 warning(squeezefs): mem_budget: HARD BACKSTOP — unreclaimable 7674988520 B >= the full 7516192768 B budget for 3 consecutive ticks; Red sheds escalate to component floors until the pressure recedes
+1791642507.010 debug(squeezefs): checkpoint tail 196673528 < head 200981704: inflight 18446744073709551615, dying floors 196673528, dirty node floor 18446744073709551615
+1791642508.027 debug(squeezefs): checkpoint tail 200985776 < head 204312600: inflight 18446744073709551615, dying floors 200985776, dirty node floor 204316672
+1791642509.047 debug(squeezefs): checkpoint tail 204316672 < head 208535264: inflight 18446744073709551615, dying floors 204316672, dirty node floor 208535264
+1791642510.115 debug(squeezefs): checkpoint tail 208535264 < head 211870232: inflight 18446744073709551615, dying floors 208535264, dirty node floor 211874304
+1791642511.177 debug(squeezefs): checkpoint tail 211878376 < head 215331432: inflight 18446744073709551615, dying floors 211878376, dirty node floor 18446744073709551615
+1791642512.184 debug(squeezefs): checkpoint tail 215331432 < head 219602960: inflight 18446744073709551615, dying floors 215331432, dirty node floor 219602960
+1791642513.206 debug(squeezefs): checkpoint tail 219602960 < head 225116448: inflight 225157168, dying floors 219602960, dirty node floor 225120520
+1791642513.389 debug(squeezefs): handler: write on ino 7 (unique 46172) answered EAGAIN: WouldBlock
+1791642513.389 debug(squeezefs): handler: write on ino 7 (unique 46178) answered EAGAIN: WouldBlock
+1791642513.389 debug(squeezefs): handler: write on ino 7 (unique 46186) answered EAGAIN: WouldBlock
+1791642513.390 debug(squeezefs): handler: write on ino 7 (unique 46190) answered EAGAIN: WouldBlock
+1791642513.390 debug(squeezefs): handler: write on ino 7 (unique 46200) answered EAGAIN: WouldBlock
+1791642513.390 debug(squeezefs): handler: write on ino 7 (unique 46210) answered EAGAIN: WouldBlock
+1791642513.390 debug(squeezefs): handler: write on ino 5 (unique 46150) answered EAGAIN: WouldBlock
+1791642513.390 debug(squeezefs): handler: write on ino 7 (unique 46218) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 5 (unique 46154) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 7 (unique 46224) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 5 (unique 46164) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 7 (unique 46234) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 5 (unique 46170) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 7 (unique 46240) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 7 (unique 46244) answered EAGAIN: WouldBlock
+1791642513.391 debug(squeezefs): handler: write on ino 5 (unique 46180) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 7 (unique 46250) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 7 (unique 46264) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 5 (unique 46184) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 7 (unique 46268) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 5 (unique 46194) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 5 (unique 46198) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 7 (unique 46276) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 5 (unique 46206) answered EAGAIN: WouldBlock
+1791642513.392 debug(squeezefs): handler: write on ino 7 (unique 46286) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 5 (unique 46212) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 7 (unique 46290) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 5 (unique 46220) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 7 (unique 46294) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 5 (unique 46222) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 7 (unique 46298) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 7 (unique 46302) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 7 (unique 46308) answered EAGAIN: WouldBlock
+1791642513.393 debug(squeezefs): handler: write on ino 7 (unique 46312) answered EAGAIN: WouldBlock
+1791642513.394 debug(squeezefs): handler: write on ino 7 (unique 46318) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 5 (unique 46232) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 7 (unique 46326) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 5 (unique 46238) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 7 (unique 46332) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 5 (unique 46246) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 5 (unique 46256) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 7 (unique 46336) answered EAGAIN: WouldBlock
+1791642513.395 debug(squeezefs): handler: write on ino 5 (unique 46270) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 7 (unique 46344) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 5 (unique 46278) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 7 (unique 46354) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 6 (unique 46182) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 7 (unique 46364) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 7 (unique 46372) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 5 (unique 46284) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 6 (unique 46192) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 7 (unique 46376) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 5 (unique 46314) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 6 (unique 46202) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 7 (unique 46382) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 6 (unique 46208) answered EAGAIN: WouldBlock
+1791642513.396 debug(squeezefs): handler: write on ino 5 (unique 46322) answered EAGAIN: WouldBlock
+1791642513.397 debug(squeezefs): handler: write on ino 6 (unique 46216) answered EAGAIN: WouldBlock
+1791642513.397 debug(squeezefs): handler: write on ino 5 (unique 46330) answered EAGAIN: WouldBlock
+1791642513.397 debug(squeezefs): handler: write on ino 6 (unique 46228) answered EAGAIN: WouldBlock
+1791642513.397 debug(squeezefs): handler: write on ino 6 (unique 46236) answered EAGAIN: WouldBlock
+1791642513.397 debug(squeezefs): handler: write on ino 5 (unique 46340) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 5 (unique 46346) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 6 (unique 46242) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 6 (unique 46248) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 5 (unique 46358) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 5 (unique 46360) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 6 (unique 46252) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 5 (unique 46368) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 5 (unique 46378) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 5 (unique 46384) answered EAGAIN: WouldBlock
+1791642513.398 debug(squeezefs): handler: write on ino 5 (unique 46388) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 6 (unique 46258) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 5 (unique 46392) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 6 (unique 46262) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 5 (unique 46394) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 6 (unique 46266) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 6 (unique 46274) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 6 (unique 46280) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 6 (unique 46288) answered EAGAIN: WouldBlock
+1791642513.399 debug(squeezefs): handler: write on ino 6 (unique 46292) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46296) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46300) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46304) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46310) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46320) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46324) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46334) answered EAGAIN: WouldBlock
+1791642513.400 debug(squeezefs): handler: write on ino 6 (unique 46342) answered EAGAIN: WouldBlock
+1791642513.401 debug(squeezefs): handler: write on ino 6 (unique 46350) answered EAGAIN: WouldBlock
+1791642513.401 debug(squeezefs): handler: write on ino 6 (unique 46356) answered EAGAIN: WouldBlock
+1791642513.401 debug(squeezefs): handler: write on ino 6 (unique 46366) answered EAGAIN: WouldBlock
+1791642513.401 debug(squeezefs): handler: write on ino 6 (unique 46374) answered EAGAIN: WouldBlock
+1791642513.401 debug(squeezefs): handler: write on ino 6 (unique 46386) answered EAGAIN: WouldBlock
+1791642513.401 debug(squeezefs): handler: write on ino 6 (unique 46396) answered EAGAIN: WouldBlock
+1791642513.401 debug(squeezefs): handler: write on ino 6 (unique 46400) answered EAGAIN: WouldBlock
+1791642514.319 debug(squeezefs): checkpoint tail 225136808 < head 228907480: inflight 18446744073709551615, dying floors 225136808, dirty node floor 228931912
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47390) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47392) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47394) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47396) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47398) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47400) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47402) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47404) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47406) answered EAGAIN: WouldBlock
+1791642514.353 debug(squeezefs): handler: write on ino 4 (unique 47408) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47410) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47412) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47414) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47416) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47418) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47420) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47422) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47424) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47426) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47428) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47430) answered EAGAIN: WouldBlock
+1791642514.354 debug(squeezefs): handler: write on ino 4 (unique 47432) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47434) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47436) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47438) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47440) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47442) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47444) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47446) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47448) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47450) answered EAGAIN: WouldBlock
+1791642514.355 debug(squeezefs): handler: write on ino 4 (unique 47452) answered EAGAIN: WouldBlock
+1791642515.409 info(squeezefs): stop requested (SIGTERM/SIGINT): unmounting /build/brk-448740/mnt
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.410 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791642515.423 info(squeezefs): teardown: session closed; open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0
+1791642515.893 info(squeezefs): data volume /dev/nvme1n1: dismount teardown completed; further DMA refused (EROFS class)
+1791642515.893 info(squeezefs): data volume /dev/nvme2n1: dismount teardown completed; further DMA refused (EROFS class)
+1791642516.678 info(squeezefs): meta volume /dev/nvme0n1: clean unmount (checkpoint seq 84, tail 229200664, head 229200664, healthy)
+1791642516.712 error(SafeAllocator): leaked [addr: ffff9738a940, len: 144 (0x90) align: 8] allocated at: 
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/ops/nvmet/initiator.zig:875:45: 0x164bb5b in sample (squeezefs)
+            if (!found) try self.seen.append(gpa, cur);
+                                            ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/stats/stats.zig:414:20: 0x17c0007 in writeAll (squeezefs)
+        try f.write(src, w);
+                   ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/stats/stats.zig:853:17: 0x17baa5b in render (squeezefs)
+        writeAll(&self.sources, &out.writer) catch return error.OutOfMemory;
+                ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/kv_fs.zig:578:43: 0x15e9a23 in lookupVirtual (squeezefs)
+            const payload = try face.build(face.ctx, class, self.gpa);
+                                          ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/filesystem.zig:302:39: 0x170bbab in call (squeezefs)
+                return @field(T, name)(self, c, args);
+                                      ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/lifecycle.zig:352:51: 0x17057c3 in run (squeezefs)
+                    const e = try fs.vtable.lookup(fs.impl, c, .{ .parent = ino, .name = a.name });
+                                                  ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/lifecycle.zig:241:37: 0x170233b in dispatch (squeezefs)
+            const outcome = self.run(req, meta, &ctx, &out, lease);
+                                    ^
+(additional stack frames may have been skipped...)
+

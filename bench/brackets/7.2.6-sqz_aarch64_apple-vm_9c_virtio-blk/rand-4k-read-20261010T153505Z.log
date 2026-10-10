@@ -1,0 +1,28 @@
+15:35:05 bracket[rand-4k-read]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-587376/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-587376/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/brk-587376
+15:35:05 bracket[rand-4k-read]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+15:35:05 bracket[rand-4k-read]: format set 0 (symmetric): sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+15:35:05 bracket[rand-4k-read]: leg 1 arm A: /build/brk-587376/A/bin/squeezefs (set 0, symmetric) -o ''
+15:35:06 bracket[rand-4k-read]: mounted /build/brk-587376/mnt (daemon pid 587498)
+15:35:06 bracket[rand-4k-read]: leg 1: preparing the aging store's dataset (once per set)
+15:35:08 bracket[rand-4k-read]: leg 1: warm-up 10s (excluded)
+15:35:20 bracket[rand-4k-read]: leg 1: measured span 60s
+15:36:23 bracket[rand-4k-read]: leg 1: IOPS 22225.7 valid
+15:36:25 bracket[rand-4k-read]: leg 1: daemon log has 1 error( line(s)
+15:36:25 bracket[rand-4k-read]: leg 2 arm B: /build/brk-587376/A/bin/squeezefs (set 0, symmetric) -o ''
+15:36:27 bracket[rand-4k-read]: mounted /build/brk-587376/mnt (daemon pid 587751)
+15:36:27 bracket[rand-4k-read]: leg 2: warm-up 10s (excluded)
+15:36:39 bracket[rand-4k-read]: leg 2: measured span 60s
+15:37:42 bracket[rand-4k-read]: leg 2: IOPS 24087.7 valid
+15:37:44 bracket[rand-4k-read]: leg 2: daemon log has 1 error( line(s)
+15:37:44 bracket[rand-4k-read]: leg 3 arm B: /build/brk-587376/A/bin/squeezefs (set 0, symmetric) -o ''
+15:37:46 bracket[rand-4k-read]: mounted /build/brk-587376/mnt (daemon pid 601643)
+15:37:46 bracket[rand-4k-read]: leg 3: warm-up 10s (excluded)
+15:37:58 bracket[rand-4k-read]: leg 3: measured span 60s
+15:39:01 bracket[rand-4k-read]: leg 3: IOPS 23361.7 valid
+15:39:03 bracket[rand-4k-read]: leg 3: daemon log has 1 error( line(s)
+15:39:03 bracket[rand-4k-read]: leg 4 arm A: /build/brk-587376/A/bin/squeezefs (set 0, symmetric) -o ''
+15:39:05 bracket[rand-4k-read]: mounted /build/brk-587376/mnt (daemon pid 602728)
+15:39:05 bracket[rand-4k-read]: leg 4: warm-up 10s (excluded)
+15:39:17 bracket[rand-4k-read]: leg 4: measured span 60s
+15:40:20 bracket[rand-4k-read]: leg 4: IOPS 29414.9 valid
+15:40:22 bracket[rand-4k-read]: leg 4: daemon log has 1 error( line(s)

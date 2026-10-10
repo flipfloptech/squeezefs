@@ -1,0 +1,16 @@
+; Lays the aging store's sequential dataset down ONCE (outside every leg): every
+; file fully written so a read row never reads a hole and a write row measures
+; steady-state overwrites of the same inodes.
+[global]
+ioengine=psync
+direct=1
+bs=1M
+rw=write
+numjobs=${NUMJOBS}
+directory=${DIRECTORY}
+filename_format=${PREFIX}.$jobnum
+size=${SIZE}
+fallocate=none
+end_fsync=1
+group_reporting=1
+[prepare]

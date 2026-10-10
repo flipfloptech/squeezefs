@@ -1,0 +1,22 @@
+; 4 KiB buffered random writes, one fsync per write (charter §6.4: the
+; `fsync_phase_ns` exact-sum family is the row's ledger). psync: an fsync is a
+; synchronous barrier; depth comes from NUMJOBS.
+; Env: DIRECTORY SIZE RUNTIME NUMJOBS.
+[global]
+ioengine=psync
+direct=0
+bs=4k
+rw=randwrite
+fsync=1
+numjobs=${NUMJOBS}
+time_based=1
+runtime=${RUNTIME}
+directory=${DIRECTORY}
+filename_format=fsync.$jobnum
+size=${SIZE}
+create_on_open=0
+fallocate=none
+norandommap=1
+randrepeat=0
+group_reporting=1
+[fsync]

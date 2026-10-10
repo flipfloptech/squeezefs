@@ -1,0 +1,28 @@
+16:31:16 bracket[tar-x]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-673937/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-673937/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/brk-673937
+16:31:16 bracket[tar-x]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+16:31:16 bracket[tar-x]: format set 0 (symmetric): sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+16:31:16 bracket[tar-x]: leg 1 arm A: /build/brk-673937/A/bin/squeezefs (set 0, symmetric) -o ''
+16:31:17 bracket[tar-x]: mounted /build/brk-673937/mnt (daemon pid 674058)
+16:31:17 bracket[tar-x]: leg 1: preparing the aging store's dataset (once per set)
+16:31:20 bracket[tar-x]: leg 1: warm-up 10s (excluded)
+16:31:59 bracket[tar-x]: leg 1: measured span 60s
+16:33:09 bracket[tar-x]: leg 1: wire verbs/entry 0.0 valid
+16:33:57 bracket[tar-x]: leg 1: daemon log has 1 error( line(s)
+16:33:57 bracket[tar-x]: leg 2 arm B: /build/brk-673937/A/bin/squeezefs (set 0, symmetric) -o ''
+16:34:09 bracket[tar-x]: mounted /build/brk-673937/mnt (daemon pid 688251)
+16:34:09 bracket[tar-x]: leg 2: warm-up 10s (excluded)
+16:34:39 bracket[tar-x]: leg 2: measured span 60s
+16:36:02 bracket[tar-x]: leg 2: wire verbs/entry 0.0 INVALID ['mem_budget_green']
+16:37:36 bracket[tar-x]: leg 2: daemon log has 1 error( line(s)
+16:37:36 bracket[tar-x]: leg 3 arm B: /build/brk-673937/A/bin/squeezefs (set 0, symmetric) -o ''
+16:38:05 bracket[tar-x]: mounted /build/brk-673937/mnt (daemon pid 690002)
+16:38:05 bracket[tar-x]: leg 3: warm-up 10s (excluded)
+16:38:56 bracket[tar-x]: leg 3: measured span 60s
+16:40:04 bracket[tar-x]: leg 3: wire verbs/entry 0.0 valid
+16:40:54 bracket[tar-x]: leg 3: daemon log has 1 error( line(s)
+16:40:54 bracket[tar-x]: leg 4 arm A: /build/brk-673937/A/bin/squeezefs (set 0, symmetric) -o ''
+16:41:27 bracket[tar-x]: mounted /build/brk-673937/mnt (daemon pid 707670)
+16:41:27 bracket[tar-x]: leg 4: warm-up 10s (excluded)
+16:42:02 bracket[tar-x]: leg 4: measured span 60s
+16:46:02 bracket[tar-x]: WEDGE: the instrument outlived its 240s bound; daemon 707670 killed, evidence beside /build/brk-673937/leg4-A/measure
+16:46:04 bracket[tar-x]: leg 4: DAEMON DIED during the measured span (instrument rc 75) (pid 707670) — leg INVALID

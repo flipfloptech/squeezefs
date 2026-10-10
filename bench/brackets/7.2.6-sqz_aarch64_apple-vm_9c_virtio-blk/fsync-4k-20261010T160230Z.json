@@ -1,0 +1,1586 @@
+{
+ "schema": "squeezefs-bracket/1",
+ "row": "fsync-4k",
+ "date": "20261010T160230Z",
+ "verdict": "SCOPING-VALID",
+ "scoping": true,
+ "header": {
+  "row": "fsync-4k",
+  "date": "20261010T160230Z",
+  "scoping": true,
+  "instrument": "fio-3.36 psync randwrite bs=4k direct=0 QD1\u00d7numjobs=4 size=256m/job",
+  "row_kind": "fsync",
+  "shim": false,
+  "substrate": "nvmet-loop",
+  "substrate_desc": "nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc)",
+  "venue": {
+   "venue_id": "7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk",
+   "kernel": "7.2.6-sqz",
+   "arch": "aarch64",
+   "cpu": "Apple-vm",
+   "cores": 9,
+   "mem_gib": 15,
+   "disk": "vdc",
+   "disk_class": "virtio-blk",
+   "hostname": "sqz-zig",
+   "fuse_enable_uring": "Y"
+  },
+  "venue_id": "7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk",
+  "build_a": {
+   "raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)",
+   "binary": "/build/brk-616456/A/bin/squeezefs",
+   "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs",
+   "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94",
+   "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48",
+   "train": "0.1.0",
+   "commit": "ce0edf4f004d",
+   "profile": "gate",
+   "zig": "0.17.0",
+   "dirty": false
+  },
+  "build_b": {
+   "raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)",
+   "binary": "/build/brk-616456/A/bin/squeezefs",
+   "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs",
+   "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94",
+   "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48",
+   "train": "0.1.0",
+   "commit": "ce0edf4f004d",
+   "profile": "gate",
+   "zig": "0.17.0",
+   "dirty": false
+  },
+  "a_equals_b": true,
+  "lever": "binary",
+  "posture": "symmetric",
+  "mount_opts": "",
+  "duration_s": 60,
+  "warmup_s": 10,
+  "order": "A-B-B-A",
+  "numjobs": 4,
+  "iodepth": 32,
+  "mem_budget_mb": 7168,
+  "set_geometry": {
+   "meta_bytes": 2147483648,
+   "data_bytes": 6442450944,
+   "data_volumes": 2
+  },
+  "loadavg_at_start": "6.16 5.64 5.55",
+  "nproc": 9,
+  "fio": "fio-3.36",
+  "tools": "/build/tools/bin"
+ },
+ "headline": {
+  "name": "IOPS",
+  "A": {
+   "mean": 1753.5207745000002,
+   "spread": 1508.7415210000001,
+   "min": 999.150014,
+   "max": 2507.891535,
+   "spread_pct": 86.0406984017742
+  },
+  "B": {
+   "mean": 2113.516291,
+   "spread": 1044.9250200000001,
+   "min": 1591.053781,
+   "max": 2635.978801,
+   "spread_pct": 49.44012139625377
+  },
+  "all": {
+   "mean": 1933.51853275,
+   "spread": 1636.8287870000001,
+   "min": 999.150014,
+   "max": 2635.978801,
+   "spread_pct": 84.65544856567654
+  },
+  "noise_band_pct": 84.65544856567654,
+  "a_over_b": 0.8296698643710622
+ },
+ "legs": [
+  {
+   "leg": 1,
+   "arm": "A",
+   "binary": "/build/brk-616456/A/bin/squeezefs",
+   "build": {
+    "raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)",
+    "binary": "/build/brk-616456/A/bin/squeezefs",
+    "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs",
+    "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94",
+    "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48",
+    "train": "0.1.0",
+    "commit": "ce0edf4f004d",
+    "profile": "gate",
+    "zig": "0.17.0",
+    "dirty": false
+   },
+   "started_at": "2026-10-10T16:02:47Z",
+   "elapsed_s": 60.001,
+   "loadavg_before": "4.21 4.57 5.29",
+   "loadavg_after": "5.43 4.86 5.34",
+   "metrics": {
+    "instrument": "fio-3.36",
+    "jobs": 1,
+    "write": {
+     "ops": 59950,
+     "bytes": 245555200,
+     "runtime_ms": 60001,
+     "bw_bytes_per_s": 4092518,
+     "mib_per_s": 3.9029293060302734,
+     "iops": 999.150014,
+     "clat_mean_ns": 2420548.388157,
+     "clat_p50_ns": 1712128,
+     "clat_p99_ns": 9109504,
+     "clat_p999_ns": 19005440,
+     "clat_max_ns": 325241999
+    },
+    "fsync": {
+     "ops": 59950,
+     "lat_mean_ns": 1580682.250792,
+     "lat_p99_ns": 6914048
+    },
+    "instrument_errors": 0,
+    "direction": "write",
+    "ops": 59950,
+    "bytes": 245555200,
+    "elapsed_s": 60.001,
+    "user_write_bytes": 245555200,
+    "user_read_bytes": 0,
+    "bs": 4096,
+    "direct": 0,
+    "headline": {
+     "name": "IOPS",
+     "value": 999.150014
+    },
+    "instrument_rc": 0,
+    "daemon_eagain_lines": 0
+   },
+   "ledgers": {
+    "device_write_bytes_stats": 249745408,
+    "device_write_arms": {
+     "overlay_store_bytes": 0,
+     "patch_write_bytes": 245551104,
+     "own_block_dma_bytes": 0,
+     "durable_upload_bytes_escalation": 4194304,
+     "durable_upload_bytes_writeback": 0
+    },
+    "device_write_beside": {
+     "rewrite_device_write_bytes": 0,
+     "rewrite_shadow_bytes": 4194304,
+     "rewrite_user_bytes": 0
+    },
+    "device_writes_stats": 59950,
+    "device_write_reqs": {
+     "patch_writes": 59949,
+     "own_block_dmas": 0,
+     "put_obj": 1
+    },
+    "wareq_sz_stats": 4165,
+    "device_div_user_stats": 1.0170642201834863,
+    "admission_bytes": 245555200,
+    "admission_arms": {
+     "admit_write_overlay_bytes": 0,
+     "admit_write_inplace_bytes": 245551104,
+     "admit_write_accumulate_bytes": 4096,
+     "admit_write_inline_bytes": 0
+    },
+    "read_copy_bytes": 317852,
+    "read_copy_arms": {
+     "read_copy_dest_bytes": 0,
+     "read_copy_bounce_bytes": 0,
+     "read_dest_dma_bytes": 0,
+     "read_zc_serve_bytes": 0,
+     "read_copy_warm_serve_bytes": 0,
+     "read_copy_hot_serve_bytes": 0,
+     "read_copy_hold_serve_bytes": 0,
+     "read_copy_cache_serve_bytes": 0,
+     "read_copy_fill_slice_bytes": 0,
+     "read_dest_lease_bytes": 0,
+     "transport_zc_serve_bytes": 0,
+     "transport_zc_bounce_bytes_bridged": 317852
+    },
+    "reclaim": {
+     "terminal_frees": 1,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 1,
+     "block_free_discard_bytes": 4194304,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "reclaim_absolute": {
+     "terminal_frees": 1,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 1,
+     "block_free_discard_bytes": 4194304,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "wire_rpcs": 0,
+    "wire_arms": {
+     "cluster_wire_frames_sent": 0,
+     "joined_wire_verbs": 0,
+     "xv_cross_owner_steps_shipped": 0,
+     "slot_resolve_rpcs": 0,
+     "xv_cross_owner_guard_rpcs": 0,
+     "dlm_token_grants": 0,
+     "slot_ships": 0,
+     "free_shipped_blocks": 0
+    },
+    "tick_rescues": {
+     "transport_park_tick_commit_rescues": 0,
+     "transport_park_tick_cqe_rescues": 0,
+     "journal_lane_park_tick_rescues": 6,
+     "meta_conveyor_park_tick_rescues": 0,
+     "block_free_reclaim_park_tick_wakes": 0,
+     "exec_lane_tick_rescues": 0,
+     "lock_ticked_reregisters": 0,
+     "channel_ticked_reregisters": 0,
+     "write_pipeline_admission_tick_wakes": 0
+    },
+    "must_stay_0": {
+     "invariant_tripwires": 0,
+     "tripwire_sites_overflow": 0,
+     "meta_io_unaligned_refusals": 0,
+     "meta_io_buffered_fallback": 0,
+     "fuse_replies_synthesized": 0,
+     "fuse_reply_twice": 0,
+     "fuse_replies_oversize": 0,
+     "ipc_sessions_poisoned": 0,
+     "journal_lane_write_failures": 0,
+     "journal_lane_barrier_failures": 0
+    },
+    "ipc": {
+     "ipc_ops_read": 0,
+     "ipc_ops_write": 0,
+     "ipc_bytes_in": 0,
+     "ipc_bytes_out": 0,
+     "ipc_sessions_total": 0,
+     "ipc_lane_gate_kernel_routes": 0,
+     "ipc_lane_gate_kernel_bytes": 0,
+     "ipc_fast_path_serves": 0,
+     "ipc_read_handoffs": 0,
+     "ipc_dd_inline_serves": 0,
+     "ipc_write_handoffs": 0,
+     "ipc_binds_dev_override": 0,
+     "ipc_admission_refusals": 0,
+     "ipc_bind_refused_budget": 0,
+     "ipc_shed_refusals": 0,
+     "ipc_binds": 0
+    },
+    "journal": {
+     "meta_kv_journal_entries": 59980,
+     "meta_kv_journal_pad_entries": 55388,
+     "meta_kv_journal_bytes": 7080255,
+     "meta_conveyor_drained_txs": 59957,
+     "meta_conveyor_acks": 59957,
+     "journal_lane_barriers_strict": 0,
+     "journal_lane_barriers_coalesced": 56453
+    },
+    "fuse": {
+     "fuse_ops": 119952,
+     "transport_ring_requests": 119952,
+     "transport_ring_reads": 6,
+     "transport_enters": 534777,
+     "transport_fast_dispatch_serves": 0,
+     "transport_fast_dispatch_demotes": 6,
+     "transport_zc_direct_legs": 0,
+     "transport_zc_write_directs": 59949,
+     "transport_payload_leases": 59950,
+     "transport_wake_writes": 179096,
+     "transport_wake_elided": 0,
+     "transport_lease_overlong": 0,
+     "transport_requests_abandoned": 0,
+     "transport_cq_overflows": 0
+    },
+    "fsync_phase_ns": {
+     "intent_barrier": {
+      "count": 59950,
+      "sum_ns": 10938997
+     },
+     "data_flush": {
+      "count": 59950,
+      "sum_ns": 58207119
+     },
+     "staged_promote": {
+      "count": 59950,
+      "sum_ns": 1301810
+     },
+     "data_barrier": {
+      "count": 59950,
+      "sum_ns": 49426765167
+     },
+     "meta_publish": {
+      "count": 59950,
+      "sum_ns": 24392851
+     },
+     "meta_barrier": {
+      "count": 59950,
+      "sum_ns": 31022620821
+     },
+     "extent_barrier": {
+      "count": 59950,
+      "sum_ns": 4063289
+     },
+     "total": {
+      "count": 59950,
+      "sum_ns": 80548290054
+     }
+    },
+    "daemon_cpu_ns": 27221236000,
+    "misc": {
+     "held_stores": 59949,
+     "patch_writes": 59949,
+     "hot_block_hits": 0,
+     "ranged_reads": 0,
+     "ranged_read_bytes": 0,
+     "read_lane_fetches": 0,
+     "read_lane_fetch_bytes": 0,
+     "prefetch_issued": 0,
+     "manager_verbs": 0
+    },
+    "posture": {
+     "direct_device_true": 0,
+     "writer_guard_mode": "flock+pr",
+     "symmetric_meta": 1,
+     "mem_budget_bytes": 7516192768,
+     "mem_budget_level": 0,
+     "mem_budget_components_top": {
+      "exec_fiber_stacks": 793604096,
+      "transport_zc_bounce": 301989888,
+      "transport_kmbuf_region": 301989888,
+      "block_alloc_table": 37224,
+      "block_map_window": 0,
+      "hot_block_tier": 0,
+      "read_lru": 0,
+      "read_lane_hold": 0
+     },
+     "lane_gate_threshold_bytes": 0
+    },
+    "absent_keys": [
+     "lane_gate_threshold_bytes",
+     "transport_wake_elided"
+    ],
+    "device_div_user_diskstats_data": 1.0170642201834863,
+    "device_div_user_diskstats_meta": 0.9517264386989157,
+    "wareq_sz_diskstats_data": 2082
+   },
+   "diskstats": {
+    "vdc": {
+     "reads": 58774,
+     "read_sectors": 58877304,
+     "writes": 367425,
+     "write_sectors": 60910560,
+     "ms_io": 54388,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 119540,
+     "present": true,
+     "read_bytes": 30145179648,
+     "write_bytes": 31186206720,
+     "wareq_sz": 84877,
+     "rareq_sz": 512899,
+     "discard_bytes": 0
+    },
+    "nvme0n1": {
+     "reads": 1255,
+     "read_sectors": 33224,
+     "writes": 104959,
+     "write_sectors": 456448,
+     "ms_io": 36700,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 56537,
+     "present": true,
+     "read_bytes": 17010688,
+     "write_bytes": 233701376,
+     "wareq_sz": 2226,
+     "rareq_sz": 13554,
+     "discard_bytes": 0
+    },
+    "nvme1n1": {
+     "reads": 8,
+     "read_sectors": 8192,
+     "writes": 89481,
+     "write_sectors": 366080,
+     "ms_io": 44032,
+     "discards": 1,
+     "discard_sectors": 8192,
+     "flushes": 44737,
+     "present": true,
+     "read_bytes": 4194304,
+     "write_bytes": 187432960,
+     "wareq_sz": 2094,
+     "rareq_sz": 524288,
+     "discard_bytes": 4194304
+    },
+    "nvme2n1": {
+     "reads": 0,
+     "read_sectors": 0,
+     "writes": 30426,
+     "write_sectors": 121704,
+     "ms_io": 26404,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 15213,
+     "present": true,
+     "read_bytes": 0,
+     "write_bytes": 62312448,
+     "wareq_sz": 2048,
+     "rareq_sz": 0,
+     "discard_bytes": 0
+    }
+   },
+   "verdicts": [
+    {
+     "check": "must_stay_0",
+     "ok": true,
+     "detail": "every tripwire delta 0"
+    },
+    {
+     "check": "reclaim_ledger",
+     "ok": true,
+     "detail": "\u0394 queued 0 + elided 1 = terminal 1; absolute 1 = 1"
+    },
+    {
+     "check": "admission_ledger",
+     "ok": true,
+     "detail": "\u03a3 admit_write_* 245555200 vs user 245555200 (\u00d71.0000)"
+    },
+    {
+     "check": "engagement_fuse",
+     "ok": true,
+     "detail": "\u0394transport_ring_requests 119952 (handler-lane fuse_ops 119952, direct-leg serves 0, zc write directs 59949) vs instrument ops 59950 (buffered: the page cache coalesces and splits)"
+    },
+    {
+     "check": "fsync_exact_sum",
+     "ok": true,
+     "detail": "\u03a3 phases 80548290054 ns vs total 80548290054 ns over 59950 fsyncs"
+    },
+    {
+     "check": "solo_wire_rpcs_0",
+     "ok": true,
+     "detail": "wire rpcs \u0394 0 ({})"
+    },
+    {
+     "check": "mem_budget_green",
+     "ok": true,
+     "detail": "mem_budget_level 0 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 756 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)"
+    }
+   ],
+   "valid": true
+  },
+  {
+   "leg": 2,
+   "arm": "B",
+   "binary": "/build/brk-616456/A/bin/squeezefs",
+   "build": {
+    "raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)",
+    "binary": "/build/brk-616456/A/bin/squeezefs",
+    "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs",
+    "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94",
+    "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48",
+    "train": "0.1.0",
+    "commit": "ce0edf4f004d",
+    "profile": "gate",
+    "zig": "0.17.0",
+    "dirty": false
+   },
+   "started_at": "2026-10-10T16:04:05Z",
+   "elapsed_s": 60.002,
+   "loadavg_before": "5.40 4.88 5.34",
+   "loadavg_after": "5.97 5.11 5.38",
+   "metrics": {
+    "instrument": "fio-3.36",
+    "jobs": 1,
+    "write": {
+     "ops": 158164,
+     "bytes": 647839744,
+     "runtime_ms": 60002,
+     "bw_bytes_per_s": 10796969,
+     "mib_per_s": 10.296792030334473,
+     "iops": 2635.978801,
+     "clat_mean_ns": 852772.676399,
+     "clat_p50_ns": 593920,
+     "clat_p99_ns": 5013504,
+     "clat_p999_ns": 9109504,
+     "clat_max_ns": 44965167
+    },
+    "fsync": {
+     "ops": 158163,
+     "lat_mean_ns": 662901.822215,
+     "lat_p99_ns": 4177920
+    },
+    "instrument_errors": 0,
+    "direction": "write",
+    "ops": 158164,
+    "bytes": 647839744,
+    "elapsed_s": 60.002,
+    "user_write_bytes": 647839744,
+    "user_read_bytes": 0,
+    "bs": 4096,
+    "direct": 0,
+    "headline": {
+     "name": "IOPS",
+     "value": 2635.978801
+    },
+    "instrument_rc": 0,
+    "daemon_eagain_lines": 0
+   },
+   "ledgers": {
+    "device_write_bytes_stats": 656220160,
+    "device_write_arms": {
+     "overlay_store_bytes": 0,
+     "patch_write_bytes": 647831552,
+     "own_block_dma_bytes": 0,
+     "durable_upload_bytes_escalation": 8388608,
+     "durable_upload_bytes_writeback": 0
+    },
+    "device_write_beside": {
+     "rewrite_device_write_bytes": 0,
+     "rewrite_shadow_bytes": 8388608,
+     "rewrite_user_bytes": 0
+    },
+    "device_writes_stats": 158164,
+    "device_write_reqs": {
+     "patch_writes": 158162,
+     "own_block_dmas": 0,
+     "put_obj": 2
+    },
+    "wareq_sz_stats": 4148,
+    "device_div_user_stats": 1.0129359399104727,
+    "admission_bytes": 647839744,
+    "admission_arms": {
+     "admit_write_overlay_bytes": 0,
+     "admit_write_inplace_bytes": 647831552,
+     "admit_write_accumulate_bytes": 8192,
+     "admit_write_inline_bytes": 0
+    },
+    "read_copy_bytes": 317543,
+    "read_copy_arms": {
+     "read_copy_dest_bytes": 0,
+     "read_copy_bounce_bytes": 0,
+     "read_dest_dma_bytes": 0,
+     "read_zc_serve_bytes": 0,
+     "read_copy_warm_serve_bytes": 0,
+     "read_copy_hot_serve_bytes": 0,
+     "read_copy_hold_serve_bytes": 0,
+     "read_copy_cache_serve_bytes": 0,
+     "read_copy_fill_slice_bytes": 0,
+     "read_dest_lease_bytes": 0,
+     "transport_zc_serve_bytes": 0,
+     "transport_zc_bounce_bytes_bridged": 317543
+    },
+    "reclaim": {
+     "terminal_frees": 2,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 2,
+     "block_free_discard_bytes": 8388608,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "reclaim_absolute": {
+     "terminal_frees": 2,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 2,
+     "block_free_discard_bytes": 8388608,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "wire_rpcs": 0,
+    "wire_arms": {
+     "cluster_wire_frames_sent": 0,
+     "joined_wire_verbs": 0,
+     "xv_cross_owner_steps_shipped": 0,
+     "slot_resolve_rpcs": 0,
+     "xv_cross_owner_guard_rpcs": 0,
+     "dlm_token_grants": 0,
+     "slot_ships": 0,
+     "free_shipped_blocks": 0
+    },
+    "tick_rescues": {
+     "transport_park_tick_commit_rescues": 0,
+     "transport_park_tick_cqe_rescues": 0,
+     "journal_lane_park_tick_rescues": 0,
+     "meta_conveyor_park_tick_rescues": 0,
+     "block_free_reclaim_park_tick_wakes": 0,
+     "exec_lane_tick_rescues": 0,
+     "lock_ticked_reregisters": 0,
+     "channel_ticked_reregisters": 0,
+     "write_pipeline_admission_tick_wakes": 0
+    },
+    "must_stay_0": {
+     "invariant_tripwires": 0,
+     "tripwire_sites_overflow": 0,
+     "meta_io_unaligned_refusals": 0,
+     "meta_io_buffered_fallback": 0,
+     "fuse_replies_synthesized": 0,
+     "fuse_reply_twice": 0,
+     "fuse_replies_oversize": 0,
+     "ipc_sessions_poisoned": 0,
+     "journal_lane_write_failures": 0,
+     "journal_lane_barrier_failures": 0
+    },
+    "ipc": {
+     "ipc_ops_read": 0,
+     "ipc_ops_write": 0,
+     "ipc_bytes_in": 0,
+     "ipc_bytes_out": 0,
+     "ipc_sessions_total": 0,
+     "ipc_lane_gate_kernel_routes": 0,
+     "ipc_lane_gate_kernel_bytes": 0,
+     "ipc_fast_path_serves": 0,
+     "ipc_read_handoffs": 0,
+     "ipc_dd_inline_serves": 0,
+     "ipc_write_handoffs": 0,
+     "ipc_binds_dev_override": 0,
+     "ipc_admission_refusals": 0,
+     "ipc_bind_refused_budget": 0,
+     "ipc_shed_refusals": 0,
+     "ipc_binds": 0
+    },
+    "journal": {
+     "meta_kv_journal_entries": 158232,
+     "meta_kv_journal_pad_entries": 143619,
+     "meta_kv_journal_bytes": 18675884,
+     "meta_conveyor_drained_txs": 158172,
+     "meta_conveyor_acks": 158172,
+     "journal_lane_barriers_strict": 0,
+     "journal_lane_barriers_coalesced": 146932
+    },
+    "fuse": {
+     "fuse_ops": 316379,
+     "transport_ring_requests": 316379,
+     "transport_ring_reads": 6,
+     "transport_enters": 1406047,
+     "transport_fast_dispatch_serves": 0,
+     "transport_fast_dispatch_demotes": 6,
+     "transport_zc_direct_legs": 0,
+     "transport_zc_write_directs": 158162,
+     "transport_payload_leases": 158164,
+     "transport_wake_writes": 472154,
+     "transport_wake_elided": 0,
+     "transport_lease_overlong": 0,
+     "transport_requests_abandoned": 0,
+     "transport_cq_overflows": 0
+    },
+    "fsync_phase_ns": {
+     "intent_barrier": {
+      "count": 158163,
+      "sum_ns": 26819839
+     },
+     "data_flush": {
+      "count": 158163,
+      "sum_ns": 134031629
+     },
+     "staged_promote": {
+      "count": 158163,
+      "sum_ns": 3137334
+     },
+     "data_barrier": {
+      "count": 158163,
+      "sum_ns": 42780428828
+     },
+     "meta_publish": {
+      "count": 158163,
+      "sum_ns": 57395913
+     },
+     "meta_barrier": {
+      "count": 158163,
+      "sum_ns": 36415479416
+     },
+     "extent_barrier": {
+      "count": 158163,
+      "sum_ns": 11455984
+     },
+     "total": {
+      "count": 158163,
+      "sum_ns": 79428748943
+     }
+    },
+    "daemon_cpu_ns": 71539603000,
+    "misc": {
+     "held_stores": 158162,
+     "patch_writes": 158162,
+     "hot_block_hits": 0,
+     "ranged_reads": 0,
+     "ranged_read_bytes": 0,
+     "read_lane_fetches": 0,
+     "read_lane_fetch_bytes": 0,
+     "prefetch_issued": 0,
+     "manager_verbs": 0
+    },
+    "posture": {
+     "direct_device_true": 0,
+     "writer_guard_mode": "flock+pr",
+     "symmetric_meta": 1,
+     "mem_budget_bytes": 7516192768,
+     "mem_budget_level": 0,
+     "mem_budget_components_top": {
+      "exec_fiber_stacks": 803078144,
+      "transport_zc_bounce": 301989888,
+      "transport_kmbuf_region": 301989888,
+      "block_alloc_table": 37224,
+      "block_map_window": 0,
+      "hot_block_tier": 0,
+      "read_lru": 0,
+      "read_lane_hold": 0
+     },
+     "lane_gate_threshold_bytes": 0
+    },
+    "absent_keys": [
+     "lane_gate_threshold_bytes",
+     "transport_wake_elided"
+    ],
+    "device_div_user_diskstats_data": 1.0129359399104727,
+    "device_div_user_diskstats_meta": 0.9337270175261121,
+    "wareq_sz_diskstats_data": 2074
+   },
+   "diskstats": {
+    "vdc": {
+     "reads": 11783,
+     "read_sectors": 10705408,
+     "writes": 813830,
+     "write_sectors": 19819110,
+     "ms_io": 42056,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 320222,
+     "present": true,
+     "read_bytes": 5481168896,
+     "write_bytes": 10147384320,
+     "wareq_sz": 12468,
+     "rareq_sz": 465176,
+     "discard_bytes": 0
+    },
+    "nvme0n1": {
+     "reads": 1236,
+     "read_sectors": 70368,
+     "writes": 261950,
+     "write_sectors": 1181456,
+     "ms_io": 28232,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 147084,
+     "present": true,
+     "read_bytes": 36028416,
+     "write_bytes": 604905472,
+     "wareq_sz": 2309,
+     "rareq_sz": 29149,
+     "discard_bytes": 0
+    },
+    "nvme1n1": {
+     "reads": 8,
+     "read_sectors": 8192,
+     "writes": 235994,
+     "write_sectors": 952136,
+     "ms_io": 29172,
+     "discards": 1,
+     "discard_sectors": 8192,
+     "flushes": 117993,
+     "present": true,
+     "read_bytes": 4194304,
+     "write_bytes": 487493632,
+     "wareq_sz": 2065,
+     "rareq_sz": 524288,
+     "discard_bytes": 4194304
+    },
+    "nvme2n1": {
+     "reads": 8,
+     "read_sectors": 8192,
+     "writes": 80347,
+     "write_sectors": 329544,
+     "ms_io": 14504,
+     "discards": 1,
+     "discard_sectors": 8192,
+     "flushes": 40170,
+     "present": true,
+     "read_bytes": 4194304,
+     "write_bytes": 168726528,
+     "wareq_sz": 2099,
+     "rareq_sz": 524288,
+     "discard_bytes": 4194304
+    }
+   },
+   "verdicts": [
+    {
+     "check": "must_stay_0",
+     "ok": true,
+     "detail": "every tripwire delta 0"
+    },
+    {
+     "check": "reclaim_ledger",
+     "ok": true,
+     "detail": "\u0394 queued 0 + elided 2 = terminal 2; absolute 2 = 2"
+    },
+    {
+     "check": "admission_ledger",
+     "ok": true,
+     "detail": "\u03a3 admit_write_* 647839744 vs user 647839744 (\u00d71.0000)"
+    },
+    {
+     "check": "engagement_fuse",
+     "ok": true,
+     "detail": "\u0394transport_ring_requests 316379 (handler-lane fuse_ops 316379, direct-leg serves 0, zc write directs 158162) vs instrument ops 158164 (buffered: the page cache coalesces and splits)"
+    },
+    {
+     "check": "fsync_exact_sum",
+     "ok": true,
+     "detail": "\u03a3 phases 79428748943 ns vs total 79428748943 ns over 158163 fsyncs"
+    },
+    {
+     "check": "solo_wire_rpcs_0",
+     "ok": true,
+     "detail": "wire rpcs \u0394 0 ({})"
+    },
+    {
+     "check": "mem_budget_green",
+     "ok": true,
+     "detail": "mem_budget_level 0 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 765 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)"
+    }
+   ],
+   "valid": true
+  },
+  {
+   "leg": 3,
+   "arm": "B",
+   "binary": "/build/brk-616456/A/bin/squeezefs",
+   "build": {
+    "raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)",
+    "binary": "/build/brk-616456/A/bin/squeezefs",
+    "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs",
+    "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94",
+    "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48",
+    "train": "0.1.0",
+    "commit": "ce0edf4f004d",
+    "profile": "gate",
+    "zig": "0.17.0",
+    "dirty": false
+   },
+   "started_at": "2026-10-10T16:05:24Z",
+   "elapsed_s": 60.003,
+   "loadavg_before": "6.14 5.20 5.41",
+   "loadavg_after": "6.87 5.58 5.53",
+   "metrics": {
+    "instrument": "fio-3.36",
+    "jobs": 1,
+    "write": {
+     "ops": 95468,
+     "bytes": 391036928,
+     "runtime_ms": 60003,
+     "bw_bytes_per_s": 6516956,
+     "mib_per_s": 6.215053558349609,
+     "iops": 1591.053781,
+     "clat_mean_ns": 1489579.407016,
+     "clat_p50_ns": 978944,
+     "clat_p99_ns": 6651904,
+     "clat_p999_ns": 11993088,
+     "clat_max_ns": 82797791
+    },
+    "fsync": {
+     "ops": 95466,
+     "lat_mean_ns": 1022514.028565,
+     "lat_p99_ns": 5406720
+    },
+    "instrument_errors": 0,
+    "direction": "write",
+    "ops": 95468,
+    "bytes": 391036928,
+    "elapsed_s": 60.003,
+    "user_write_bytes": 391036928,
+    "user_read_bytes": 0,
+    "bs": 4096,
+    "direct": 0,
+    "headline": {
+     "name": "IOPS",
+     "value": 1591.053781
+    },
+    "instrument_rc": 0,
+    "daemon_eagain_lines": 0
+   },
+   "ledgers": {
+    "device_write_bytes_stats": 403607552,
+    "device_write_arms": {
+     "overlay_store_bytes": 0,
+     "patch_write_bytes": 391024640,
+     "own_block_dma_bytes": 0,
+     "durable_upload_bytes_escalation": 12582912,
+     "durable_upload_bytes_writeback": 0
+    },
+    "device_write_beside": {
+     "rewrite_device_write_bytes": 0,
+     "rewrite_shadow_bytes": 12582912,
+     "rewrite_user_bytes": 0
+    },
+    "device_writes_stats": 95468,
+    "device_write_reqs": {
+     "patch_writes": 95465,
+     "own_block_dmas": 0,
+     "put_obj": 3
+    },
+    "wareq_sz_stats": 4227,
+    "device_div_user_stats": 1.0321468973897012,
+    "admission_bytes": 391036928,
+    "admission_arms": {
+     "admit_write_overlay_bytes": 0,
+     "admit_write_inplace_bytes": 391024640,
+     "admit_write_accumulate_bytes": 12288,
+     "admit_write_inline_bytes": 0
+    },
+    "read_copy_bytes": 317494,
+    "read_copy_arms": {
+     "read_copy_dest_bytes": 0,
+     "read_copy_bounce_bytes": 0,
+     "read_dest_dma_bytes": 0,
+     "read_zc_serve_bytes": 0,
+     "read_copy_warm_serve_bytes": 0,
+     "read_copy_hot_serve_bytes": 0,
+     "read_copy_hold_serve_bytes": 0,
+     "read_copy_cache_serve_bytes": 0,
+     "read_copy_fill_slice_bytes": 0,
+     "read_dest_lease_bytes": 0,
+     "transport_zc_serve_bytes": 0,
+     "transport_zc_bounce_bytes_bridged": 317494
+    },
+    "reclaim": {
+     "terminal_frees": 3,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 3,
+     "block_free_discard_bytes": 12582912,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "reclaim_absolute": {
+     "terminal_frees": 3,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 3,
+     "block_free_discard_bytes": 12582912,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "wire_rpcs": 0,
+    "wire_arms": {
+     "cluster_wire_frames_sent": 0,
+     "joined_wire_verbs": 0,
+     "xv_cross_owner_steps_shipped": 0,
+     "slot_resolve_rpcs": 0,
+     "xv_cross_owner_guard_rpcs": 0,
+     "dlm_token_grants": 0,
+     "slot_ships": 0,
+     "free_shipped_blocks": 0
+    },
+    "tick_rescues": {
+     "transport_park_tick_commit_rescues": 0,
+     "transport_park_tick_cqe_rescues": 0,
+     "journal_lane_park_tick_rescues": 0,
+     "meta_conveyor_park_tick_rescues": 0,
+     "block_free_reclaim_park_tick_wakes": 0,
+     "exec_lane_tick_rescues": 0,
+     "lock_ticked_reregisters": 0,
+     "channel_ticked_reregisters": 0,
+     "write_pipeline_admission_tick_wakes": 0
+    },
+    "must_stay_0": {
+     "invariant_tripwires": 0,
+     "tripwire_sites_overflow": 0,
+     "meta_io_unaligned_refusals": 0,
+     "meta_io_buffered_fallback": 0,
+     "fuse_replies_synthesized": 0,
+     "fuse_reply_twice": 0,
+     "fuse_replies_oversize": 0,
+     "ipc_sessions_poisoned": 0,
+     "journal_lane_write_failures": 0,
+     "journal_lane_barrier_failures": 0
+    },
+    "ipc": {
+     "ipc_ops_read": 0,
+     "ipc_ops_write": 0,
+     "ipc_bytes_in": 0,
+     "ipc_bytes_out": 0,
+     "ipc_sessions_total": 0,
+     "ipc_lane_gate_kernel_routes": 0,
+     "ipc_lane_gate_kernel_bytes": 0,
+     "ipc_fast_path_serves": 0,
+     "ipc_read_handoffs": 0,
+     "ipc_dd_inline_serves": 0,
+     "ipc_write_handoffs": 0,
+     "ipc_binds_dev_override": 0,
+     "ipc_admission_refusals": 0,
+     "ipc_bind_refused_budget": 0,
+     "ipc_shed_refusals": 0,
+     "ipc_binds": 0
+    },
+    "journal": {
+     "meta_kv_journal_entries": 95514,
+     "meta_kv_journal_pad_entries": 88995,
+     "meta_kv_journal_bytes": 11279093,
+     "meta_conveyor_drained_txs": 95477,
+     "meta_conveyor_acks": 95477,
+     "journal_lane_barriers_strict": 0,
+     "journal_lane_barriers_coalesced": 88640
+    },
+    "fuse": {
+     "fuse_ops": 190986,
+     "transport_ring_requests": 190986,
+     "transport_ring_reads": 6,
+     "transport_enters": 849136,
+     "transport_fast_dispatch_serves": 0,
+     "transport_fast_dispatch_demotes": 6,
+     "transport_zc_direct_legs": 0,
+     "transport_zc_write_directs": 95465,
+     "transport_payload_leases": 95468,
+     "transport_wake_writes": 284914,
+     "transport_wake_elided": 0,
+     "transport_lease_overlong": 0,
+     "transport_requests_abandoned": 0,
+     "transport_cq_overflows": 0
+    },
+    "fsync_phase_ns": {
+     "intent_barrier": {
+      "count": 95466,
+      "sum_ns": 16000352
+     },
+     "data_flush": {
+      "count": 95466,
+      "sum_ns": 104673594
+     },
+     "staged_promote": {
+      "count": 95466,
+      "sum_ns": 1921648
+     },
+     "data_barrier": {
+      "count": 95466,
+      "sum_ns": 45618843744
+     },
+     "meta_publish": {
+      "count": 95466,
+      "sum_ns": 42007335
+     },
+     "meta_barrier": {
+      "count": 95466,
+      "sum_ns": 35428164484
+     },
+     "extent_barrier": {
+      "count": 95466,
+      "sum_ns": 6839798
+     },
+     "total": {
+      "count": 95466,
+      "sum_ns": 81218450955
+     }
+    },
+    "daemon_cpu_ns": 44072039000,
+    "misc": {
+     "held_stores": 95465,
+     "patch_writes": 95465,
+     "hot_block_hits": 0,
+     "ranged_reads": 0,
+     "ranged_read_bytes": 0,
+     "read_lane_fetches": 0,
+     "read_lane_fetch_bytes": 0,
+     "prefetch_issued": 0,
+     "manager_verbs": 0
+    },
+    "posture": {
+     "direct_device_true": 0,
+     "writer_guard_mode": "flock+pr",
+     "symmetric_meta": 1,
+     "mem_budget_bytes": 7516192768,
+     "mem_budget_level": 0,
+     "mem_budget_components_top": {
+      "exec_fiber_stacks": 789393408,
+      "transport_zc_bounce": 301989888,
+      "transport_kmbuf_region": 301989888,
+      "block_alloc_table": 37224,
+      "block_map_window": 0,
+      "hot_block_tier": 0,
+      "read_lru": 0,
+      "read_lane_hold": 0
+     },
+     "lane_gate_threshold_bytes": 0
+    },
+    "absent_keys": [
+     "lane_gate_threshold_bytes",
+     "transport_wake_elided"
+    ],
+    "device_div_user_diskstats_data": 1.0321468973897012,
+    "device_div_user_diskstats_meta": 0.958603930112708,
+    "wareq_sz_diskstats_data": 2113
+   },
+   "diskstats": {
+    "vdc": {
+     "reads": 20519,
+     "read_sectors": 19730464,
+     "writes": 556838,
+     "write_sectors": 27097808,
+     "ms_io": 52204,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 215604,
+     "present": true,
+     "read_bytes": 10101997568,
+     "write_bytes": 13874077696,
+     "wareq_sz": 24915,
+     "rareq_sz": 492324,
+     "discard_bytes": 0
+    },
+    "nvme0n1": {
+     "reads": 1190,
+     "read_sectors": 46816,
+     "writes": 165411,
+     "write_sectors": 732128,
+     "ms_io": 34636,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 88737,
+     "present": true,
+     "read_bytes": 23969792,
+     "write_bytes": 374849536,
+     "wareq_sz": 2266,
+     "rareq_sz": 20142,
+     "discard_bytes": 0
+    },
+    "nvme1n1": {
+     "reads": 24,
+     "read_sectors": 24576,
+     "writes": 142215,
+     "write_sectors": 593336,
+     "ms_io": 40732,
+     "discards": 3,
+     "discard_sectors": 24576,
+     "flushes": 71096,
+     "present": true,
+     "read_bytes": 12582912,
+     "write_bytes": 303788032,
+     "wareq_sz": 2136,
+     "rareq_sz": 524288,
+     "discard_bytes": 12582912
+    },
+    "nvme2n1": {
+     "reads": 0,
+     "read_sectors": 0,
+     "writes": 48740,
+     "write_sectors": 194960,
+     "ms_io": 22856,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 24370,
+     "present": true,
+     "read_bytes": 0,
+     "write_bytes": 99819520,
+     "wareq_sz": 2048,
+     "rareq_sz": 0,
+     "discard_bytes": 0
+    }
+   },
+   "verdicts": [
+    {
+     "check": "must_stay_0",
+     "ok": true,
+     "detail": "every tripwire delta 0"
+    },
+    {
+     "check": "reclaim_ledger",
+     "ok": true,
+     "detail": "\u0394 queued 0 + elided 3 = terminal 3; absolute 3 = 3"
+    },
+    {
+     "check": "admission_ledger",
+     "ok": true,
+     "detail": "\u03a3 admit_write_* 391036928 vs user 391036928 (\u00d71.0000)"
+    },
+    {
+     "check": "engagement_fuse",
+     "ok": true,
+     "detail": "\u0394transport_ring_requests 190986 (handler-lane fuse_ops 190986, direct-leg serves 0, zc write directs 95465) vs instrument ops 95468 (buffered: the page cache coalesces and splits)"
+    },
+    {
+     "check": "fsync_exact_sum",
+     "ok": true,
+     "detail": "\u03a3 phases 81218450955 ns vs total 81218450955 ns over 95466 fsyncs"
+    },
+    {
+     "check": "solo_wire_rpcs_0",
+     "ok": true,
+     "detail": "wire rpcs \u0394 0 ({})"
+    },
+    {
+     "check": "mem_budget_green",
+     "ok": true,
+     "detail": "mem_budget_level 0 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 752 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)"
+    }
+   ],
+   "valid": true
+  },
+  {
+   "leg": 4,
+   "arm": "A",
+   "binary": "/build/brk-616456/A/bin/squeezefs",
+   "build": {
+    "raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)",
+    "binary": "/build/brk-616456/A/bin/squeezefs",
+    "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs",
+    "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94",
+    "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48",
+    "train": "0.1.0",
+    "commit": "ce0edf4f004d",
+    "profile": "gate",
+    "zig": "0.17.0",
+    "dirty": false
+   },
+   "started_at": "2026-10-10T16:06:43Z",
+   "elapsed_s": 60.001,
+   "loadavg_before": "6.48 5.55 5.52",
+   "loadavg_after": "6.16 5.64 5.55",
+   "metrics": {
+    "instrument": "fio-3.36",
+    "jobs": 1,
+    "write": {
+     "ops": 150476,
+     "bytes": 616349696,
+     "runtime_ms": 60001,
+     "bw_bytes_per_s": 10272323,
+     "mib_per_s": 9.7964506149292,
+     "iops": 2507.891535,
+     "clat_mean_ns": 950542.450278,
+     "clat_p50_ns": 643072,
+     "clat_p99_ns": 4816896,
+     "clat_p999_ns": 6979584,
+     "clat_max_ns": 77774532
+    },
+    "fsync": {
+     "ops": 150475,
+     "lat_mean_ns": 642550.000312,
+     "lat_p99_ns": 4046848
+    },
+    "instrument_errors": 0,
+    "direction": "write",
+    "ops": 150476,
+    "bytes": 616349696,
+    "elapsed_s": 60.001,
+    "user_write_bytes": 616349696,
+    "user_read_bytes": 0,
+    "bs": 4096,
+    "direct": 0,
+    "headline": {
+     "name": "IOPS",
+     "value": 2507.891535
+    },
+    "instrument_rc": 0,
+    "daemon_eagain_lines": 0
+   },
+   "ledgers": {
+    "device_write_bytes_stats": 633110528,
+    "device_write_arms": {
+     "overlay_store_bytes": 0,
+     "patch_write_bytes": 616333312,
+     "own_block_dma_bytes": 0,
+     "durable_upload_bytes_escalation": 16777216,
+     "durable_upload_bytes_writeback": 0
+    },
+    "device_write_beside": {
+     "rewrite_device_write_bytes": 0,
+     "rewrite_shadow_bytes": 16777216,
+     "rewrite_user_bytes": 0
+    },
+    "device_writes_stats": 150476,
+    "device_write_reqs": {
+     "patch_writes": 150472,
+     "own_block_dmas": 0,
+     "put_obj": 4
+    },
+    "wareq_sz_stats": 4207,
+    "device_div_user_stats": 1.0271937053084876,
+    "admission_bytes": 616349696,
+    "admission_arms": {
+     "admit_write_overlay_bytes": 0,
+     "admit_write_inplace_bytes": 616333312,
+     "admit_write_accumulate_bytes": 16384,
+     "admit_write_inline_bytes": 0
+    },
+    "read_copy_bytes": 317583,
+    "read_copy_arms": {
+     "read_copy_dest_bytes": 0,
+     "read_copy_bounce_bytes": 0,
+     "read_dest_dma_bytes": 0,
+     "read_zc_serve_bytes": 0,
+     "read_copy_warm_serve_bytes": 0,
+     "read_copy_hot_serve_bytes": 0,
+     "read_copy_hold_serve_bytes": 0,
+     "read_copy_cache_serve_bytes": 0,
+     "read_copy_fill_slice_bytes": 0,
+     "read_dest_lease_bytes": 0,
+     "transport_zc_serve_bytes": 0,
+     "transport_zc_bounce_bytes_bridged": 317583
+    },
+    "reclaim": {
+     "terminal_frees": 4,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 4,
+     "block_free_discard_bytes": 12582912,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "reclaim_absolute": {
+     "terminal_frees": 4,
+     "block_free_reclaim_queued": 0,
+     "block_free_reclaim_elided": 4,
+     "block_free_discard_bytes": 12582912,
+     "block_free_punch_bytes": 0,
+     "pack_terminal_frees": 0
+    },
+    "wire_rpcs": 0,
+    "wire_arms": {
+     "cluster_wire_frames_sent": 0,
+     "joined_wire_verbs": 0,
+     "xv_cross_owner_steps_shipped": 0,
+     "slot_resolve_rpcs": 0,
+     "xv_cross_owner_guard_rpcs": 0,
+     "dlm_token_grants": 0,
+     "slot_ships": 0,
+     "free_shipped_blocks": 0
+    },
+    "tick_rescues": {
+     "transport_park_tick_commit_rescues": 0,
+     "transport_park_tick_cqe_rescues": 0,
+     "journal_lane_park_tick_rescues": 0,
+     "meta_conveyor_park_tick_rescues": 0,
+     "block_free_reclaim_park_tick_wakes": 0,
+     "exec_lane_tick_rescues": 0,
+     "lock_ticked_reregisters": 0,
+     "channel_ticked_reregisters": 0,
+     "write_pipeline_admission_tick_wakes": 0
+    },
+    "must_stay_0": {
+     "invariant_tripwires": 0,
+     "tripwire_sites_overflow": 0,
+     "meta_io_unaligned_refusals": 0,
+     "meta_io_buffered_fallback": 0,
+     "fuse_replies_synthesized": 0,
+     "fuse_reply_twice": 0,
+     "fuse_replies_oversize": 0,
+     "ipc_sessions_poisoned": 0,
+     "journal_lane_write_failures": 0,
+     "journal_lane_barrier_failures": 0
+    },
+    "ipc": {
+     "ipc_ops_read": 0,
+     "ipc_ops_write": 0,
+     "ipc_bytes_in": 0,
+     "ipc_bytes_out": 0,
+     "ipc_sessions_total": 0,
+     "ipc_lane_gate_kernel_routes": 0,
+     "ipc_lane_gate_kernel_bytes": 0,
+     "ipc_fast_path_serves": 0,
+     "ipc_read_handoffs": 0,
+     "ipc_dd_inline_serves": 0,
+     "ipc_write_handoffs": 0,
+     "ipc_binds_dev_override": 0,
+     "ipc_admission_refusals": 0,
+     "ipc_bind_refused_budget": 0,
+     "ipc_shed_refusals": 0,
+     "ipc_binds": 0
+    },
+    "journal": {
+     "meta_kv_journal_entries": 150545,
+     "meta_kv_journal_pad_entries": 136308,
+     "meta_kv_journal_bytes": 17775154,
+     "meta_conveyor_drained_txs": 150486,
+     "meta_conveyor_acks": 150486,
+     "journal_lane_barriers_strict": 0,
+     "journal_lane_barriers_coalesced": 140158
+    },
+    "fuse": {
+     "fuse_ops": 301003,
+     "transport_ring_requests": 301003,
+     "transport_ring_reads": 6,
+     "transport_enters": 1335260,
+     "transport_fast_dispatch_serves": 0,
+     "transport_fast_dispatch_demotes": 6,
+     "transport_zc_direct_legs": 0,
+     "transport_zc_write_directs": 150472,
+     "transport_payload_leases": 150476,
+     "transport_wake_writes": 448270,
+     "transport_wake_elided": 0,
+     "transport_lease_overlong": 0,
+     "transport_requests_abandoned": 0,
+     "transport_cq_overflows": 0
+    },
+    "fsync_phase_ns": {
+     "intent_barrier": {
+      "count": 150475,
+      "sum_ns": 23446526
+     },
+     "data_flush": {
+      "count": 150475,
+      "sum_ns": 149009448
+     },
+     "staged_promote": {
+      "count": 150475,
+      "sum_ns": 2997600
+     },
+     "data_barrier": {
+      "count": 150475,
+      "sum_ns": 38710888589
+     },
+     "meta_publish": {
+      "count": 150475,
+      "sum_ns": 64502233
+     },
+     "meta_barrier": {
+      "count": 150475,
+      "sum_ns": 32752998610
+     },
+     "extent_barrier": {
+      "count": 150475,
+      "sum_ns": 11639181
+     },
+     "total": {
+      "count": 150475,
+      "sum_ns": 71715482187
+     }
+    },
+    "daemon_cpu_ns": 66698242000,
+    "misc": {
+     "held_stores": 150472,
+     "patch_writes": 150472,
+     "hot_block_hits": 0,
+     "ranged_reads": 0,
+     "ranged_read_bytes": 0,
+     "read_lane_fetches": 0,
+     "read_lane_fetch_bytes": 0,
+     "prefetch_issued": 0,
+     "manager_verbs": 0
+    },
+    "posture": {
+     "direct_device_true": 0,
+     "writer_guard_mode": "flock+pr",
+     "symmetric_meta": 1,
+     "mem_budget_bytes": 7516192768,
+     "mem_budget_level": 0,
+     "mem_budget_components_top": {
+      "exec_fiber_stacks": 797814784,
+      "transport_zc_bounce": 301989888,
+      "transport_kmbuf_region": 301989888,
+      "block_alloc_table": 37224,
+      "block_map_window": 0,
+      "hot_block_tier": 0,
+      "read_lru": 0,
+      "read_lane_hold": 0
+     },
+     "lane_gate_threshold_bytes": 0
+    },
+    "absent_keys": [
+     "lane_gate_threshold_bytes",
+     "transport_wake_elided"
+    ],
+    "device_div_user_diskstats_data": 1.0271937053084876,
+    "device_div_user_diskstats_meta": 0.9315372551104495,
+    "wareq_sz_diskstats_data": 2103
+   },
+   "diskstats": {
+    "vdc": {
+     "reads": 1312,
+     "read_sectors": 124640,
+     "writes": 643767,
+     "write_sectors": 2992569,
+     "ms_io": 38604,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 301518,
+     "present": true,
+     "read_bytes": 63815680,
+     "write_bytes": 1532195328,
+     "wareq_sz": 2380,
+     "rareq_sz": 48640,
+     "discard_bytes": 0
+    },
+    "nvme0n1": {
+     "reads": 1234,
+     "read_sectors": 69344,
+     "writes": 249285,
+     "write_sectors": 1121392,
+     "ms_io": 27292,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 140303,
+     "present": true,
+     "read_bytes": 35504128,
+     "write_bytes": 574152704,
+     "wareq_sz": 2303,
+     "rareq_sz": 28771,
+     "discard_bytes": 0
+    },
+    "nvme1n1": {
+     "reads": 0,
+     "read_sectors": 0,
+     "writes": 224447,
+     "write_sectors": 897792,
+     "ms_io": 30512,
+     "discards": 0,
+     "discard_sectors": 0,
+     "flushes": 112223,
+     "present": true,
+     "read_bytes": 0,
+     "write_bytes": 459669504,
+     "wareq_sz": 2048,
+     "rareq_sz": 0,
+     "discard_bytes": 0
+    },
+    "nvme2n1": {
+     "reads": 32,
+     "read_sectors": 32768,
+     "writes": 76532,
+     "write_sectors": 338752,
+     "ms_io": 15620,
+     "discards": 3,
+     "discard_sectors": 24576,
+     "flushes": 38252,
+     "present": true,
+     "read_bytes": 16777216,
+     "write_bytes": 173441024,
+     "wareq_sz": 2266,
+     "rareq_sz": 524288,
+     "discard_bytes": 12582912
+    }
+   },
+   "verdicts": [
+    {
+     "check": "must_stay_0",
+     "ok": true,
+     "detail": "every tripwire delta 0"
+    },
+    {
+     "check": "reclaim_ledger",
+     "ok": true,
+     "detail": "\u0394 queued 0 + elided 4 = terminal 4; absolute 4 = 4"
+    },
+    {
+     "check": "admission_ledger",
+     "ok": true,
+     "detail": "\u03a3 admit_write_* 616349696 vs user 616349696 (\u00d71.0000)"
+    },
+    {
+     "check": "engagement_fuse",
+     "ok": true,
+     "detail": "\u0394transport_ring_requests 301003 (handler-lane fuse_ops 301003, direct-leg serves 0, zc write directs 150472) vs instrument ops 150476 (buffered: the page cache coalesces and splits)"
+    },
+    {
+     "check": "fsync_exact_sum",
+     "ok": true,
+     "detail": "\u03a3 phases 71715482187 ns vs total 71715482187 ns over 150475 fsyncs"
+    },
+    {
+     "check": "solo_wire_rpcs_0",
+     "ok": true,
+     "detail": "wire rpcs \u0394 0 ({})"
+    },
+    {
+     "check": "mem_budget_green",
+     "ok": true,
+     "detail": "mem_budget_level 0 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 760 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)"
+    }
+   ],
+   "valid": true
+  }
+ ],
+ "invalid_reasons": []
+}

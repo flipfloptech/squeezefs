@@ -1,0 +1,30 @@
+15:24:39 bracket[shim-seq-write-1m]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-580436/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-580436/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-tcp; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/brk-580436
+15:24:39 bracket[shim-seq-write-1m]: substrate: nvmet-tcp on 127.0.0.1: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+15:24:39 bracket[shim-seq-write-1m]: format set 0 (symmetric): sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+15:24:40 bracket[shim-seq-write-1m]: leg 1 arm A: /build/brk-580436/A/bin/squeezefs (set 0, symmetric) -o 'interception'
+15:24:42 bracket[shim-seq-write-1m]: mounted /build/brk-580436/mnt (daemon pid 580561)
+15:24:42 bracket[shim-seq-write-1m]: leg 1: preparing the aging store's dataset (once per set)
+15:24:47 bracket[shim-seq-write-1m]: leg 1: warm-up 10s (excluded)
+15:25:00 bracket[shim-seq-write-1m]: leg 1: measured span 60s
+15:26:02 bracket[shim-seq-write-1m]: leg 1: MiB/s 308.4 valid
+15:26:05 bracket[shim-seq-write-1m]: leg 1: daemon log has 9 error( line(s)
+15:26:05 bracket[shim-seq-write-1m]: leg 2 arm B: /build/brk-580436/A/bin/squeezefs (set 0, symmetric) -o 'interception'
+15:26:06 bracket[shim-seq-write-1m]: mounted /build/brk-580436/mnt (daemon pid 580880)
+15:26:06 bracket[shim-seq-write-1m]: leg 2: warm-up 10s (excluded)
+15:26:19 bracket[shim-seq-write-1m]: leg 2: measured span 60s
+15:27:07 bracket[shim-seq-write-1m]: leg 2: instrument rc 4 — leg INVALID (4 fio I/O errors); see /build/brk-580436/leg2-B/measure.log
+15:27:08 bracket[shim-seq-write-1m]: leg 2: MiB/s 523.1 INVALID ['instrument_ok']
+15:27:09 bracket[shim-seq-write-1m]: leg 2: daemon log has 6 error( line(s)
+15:27:09 bracket[shim-seq-write-1m]: leg 3 arm B: /build/brk-580436/A/bin/squeezefs (set 0, symmetric) -o 'interception'
+15:27:11 bracket[shim-seq-write-1m]: mounted /build/brk-580436/mnt (daemon pid 581145)
+15:27:11 bracket[shim-seq-write-1m]: leg 3: warm-up 10s (excluded)
+15:27:24 bracket[shim-seq-write-1m]: leg 3: measured span 60s
+15:28:26 bracket[shim-seq-write-1m]: leg 3: MiB/s 473.1 valid
+15:28:29 bracket[shim-seq-write-1m]: leg 3: daemon log has 5 error( line(s)
+15:28:29 bracket[shim-seq-write-1m]: leg 4 arm A: /build/brk-580436/A/bin/squeezefs (set 0, symmetric) -o 'interception'
+15:28:30 bracket[shim-seq-write-1m]: mounted /build/brk-580436/mnt (daemon pid 581408)
+15:28:30 bracket[shim-seq-write-1m]: leg 4: warm-up 10s (excluded)
+15:28:43 bracket[shim-seq-write-1m]: leg 4: measured span 60s
+15:29:43 bracket[shim-seq-write-1m]: leg 4: instrument rc 4 — leg INVALID (4 fio I/O errors); see /build/brk-580436/leg4-A/measure.log
+15:29:43 bracket[shim-seq-write-1m]: leg 4: MiB/s 537.7 INVALID ['instrument_ok']
+15:29:46 bracket[shim-seq-write-1m]: leg 4: daemon log has 5 error( line(s)

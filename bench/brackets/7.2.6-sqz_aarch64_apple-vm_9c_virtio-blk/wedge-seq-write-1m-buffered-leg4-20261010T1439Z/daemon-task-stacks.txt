@@ -1,0 +1,312 @@
+== squeezefs 454025 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-timer 454026 futex_do_wait
+[<0>] futex_do_wait+0x8c/0x98
+[<0>] __futex_wait+0x9c/0x110
+[<0>] futex_wait+0x7c/0x110
+[<0>] do_futex+0x190/0x200
+[<0>] __arm64_sys_futex+0xdc/0x140
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== sqz-fuse-ln0 454027 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ln1 454028 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ln2 454029 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ln3 454030 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ln4 454031 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ln5 454032 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ln6 454033 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ln7 454034 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-meta0 454035 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-meta1 454036 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-uring-fs0 454037 futex_do_wait
+[<0>] futex_do_wait+0x8c/0x98
+[<0>] __futex_wait+0x9c/0x110
+[<0>] futex_wait+0x7c/0x110
+[<0>] do_futex+0x190/0x200
+[<0>] __arm64_sys_futex+0xdc/0x140
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== sqz-uring-fs1 454038 futex_do_wait
+[<0>] futex_do_wait+0x8c/0x98
+[<0>] __futex_wait+0x9c/0x110
+[<0>] futex_wait+0x7c/0x110
+[<0>] do_futex+0x190/0x200
+[<0>] __arm64_sys_futex+0xdc/0x140
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== sqz-uring-fs2 454039 futex_do_wait
+[<0>] futex_do_wait+0x8c/0x98
+[<0>] __futex_wait+0x9c/0x110
+[<0>] futex_wait+0x7c/0x110
+[<0>] do_futex+0x190/0x200
+[<0>] __arm64_sys_futex+0xdc/0x140
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== sqz-uring-fs3 454040 futex_do_wait
+[<0>] futex_do_wait+0x8c/0x98
+[<0>] __futex_wait+0x9c/0x110
+[<0>] futex_wait+0x7c/0x110
+[<0>] do_futex+0x190/0x200
+[<0>] __arm64_sys_futex+0xdc/0x140
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== iou-wrk-5079 454041 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== sqz-jrnl0 454042 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== iou-wrk-5077 454045 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5078 454046 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== sqz-ckpt 454047 futex_do_wait
+[<0>] futex_do_wait+0x48/0x98
+[<0>] __futex_wait+0x9c/0x110
+[<0>] futex_wait+0x7c/0x110
+[<0>] do_futex+0x190/0x200
+[<0>] __arm64_sys_futex+0xdc/0x140
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== sqz-nvme2 454050 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-nvme3 454051 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-wire-acc 454052 inet_csk_accept
+[<0>] inet_csk_accept+0x18c/0x310
+[<0>] inet_accept+0x40/0x98
+[<0>] do_accept+0xe0/0x1a8
+[<0>] __sys_accept4+0x88/0x120
+[<0>] __arm64_sys_accept4+0x24/0x38
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== iou-wrk-5080 454053 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== sqz-fuse-ur0 454054 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur1 454055 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur2 454056 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur3 454057 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur4 454058 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur5 454059 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur6 454060 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur7 454061 io_cqring_wait
+[<0>] io_cqring_wait+0x450/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-ur8 454062 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-fuse-sb 454063 io_cqring_wait
+[<0>] io_cqring_wait+0x458/0x6a0
+[<0>] __arm64_sys_io_uring_enter+0x468/0x6d8
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+[<0>] el0t_64_sync_handler+0x98/0xe0
+[<0>] el0t_64_sync+0x168/0x170
+== sqz-membudget 454064 futex_do_wait
+[<0>] futex_do_wait+0x48/0x98
+[<0>] __futex_wait+0x9c/0x110
+[<0>] futex_wait+0x7c/0x110
+[<0>] do_futex+0x190/0x200
+[<0>] __arm64_sys_futex+0xdc/0x140
+[<0>] invoke_syscall.constprop.0+0x5c/0x100
+[<0>] do_el0_svc+0x44/0xc0
+[<0>] el0_svc+0x38/0x2a0
+== iou-wrk-5099 454070 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5097 454094 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5098 454095 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5094 454096 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5095 454097 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5100 454098 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5096 454099 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5101 454100 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5102 454101 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5091 454242 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5090 454244 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20
+== iou-wrk-5082 454471 io_wq_worker
+[<0>] io_wq_worker+0x168/0x340
+[<0>] ret_from_fork+0x10/0x20

@@ -1,0 +1,30 @@
+17:02:01 bracket[seq-write-1m-direct]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-715226/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/build/brk-715226/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/zig-out-linux/bin/squeezefs", "sha256": "3429843f3298023fe10fa77538ea86d42f0c24fa1ac975e93c51d30fd9dc9b94", "shim_sha256": "732e26b86b2eb8fb1a5604f0a94590fa4de59163fcb6b4eb37c1b74bb2364f48", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate file; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/brk-715226
+17:02:01 bracket[seq-write-1m-direct]: format set 0 (symmetric): sqmeta:///build/brk-715226/set0-meta.img sqdata:///build/brk-715226/set0-data0.img,/build/brk-715226/set0-data1.img
+17:02:01 bracket[seq-write-1m-direct]: leg 1 arm A: /build/brk-715226/A/bin/squeezefs (set 0, symmetric) -o ''
+17:02:02 bracket[seq-write-1m-direct]: mounted /build/brk-715226/mnt (daemon pid 715306)
+17:02:02 bracket[seq-write-1m-direct]: leg 1: preparing the aging store's dataset (once per set)
+17:02:04 bracket[seq-write-1m-direct]: leg 1: warm-up 10s (excluded)
+17:02:16 bracket[seq-write-1m-direct]: leg 1: measured span 60s
+17:02:43 bracket[seq-write-1m-direct]: leg 1: instrument rc 4 — leg INVALID (100 fio I/O errors); see /build/brk-715226/leg1-A/measure.log
+17:02:43 bracket[seq-write-1m-direct]: leg 1: — 0 INVALID ['instrument_ok']
+17:02:46 bracket[seq-write-1m-direct]: leg 2 arm B: /build/brk-715226/A/bin/squeezefs (set 0, symmetric) -o ''
+17:02:47 bracket[seq-write-1m-direct]: mounted /build/brk-715226/mnt (daemon pid 715531)
+17:02:47 bracket[seq-write-1m-direct]: leg 2: warm-up 10s (excluded)
+17:03:00 bracket[seq-write-1m-direct]: leg 2: measured span 60s
+17:03:54 bracket[seq-write-1m-direct]: leg 2: instrument rc 4 — leg INVALID (128 fio I/O errors); see /build/brk-715226/leg2-B/measure.log
+17:03:54 bracket[seq-write-1m-direct]: leg 2: — 0 INVALID ['instrument_ok']
+17:03:57 bracket[seq-write-1m-direct]: leg 2: daemon log has 33 error( line(s)
+17:03:57 bracket[seq-write-1m-direct]: leg 3 arm B: /build/brk-715226/A/bin/squeezefs (set 0, symmetric) -o ''
+17:03:58 bracket[seq-write-1m-direct]: mounted /build/brk-715226/mnt (daemon pid 715751)
+17:03:58 bracket[seq-write-1m-direct]: leg 3: warm-up 10s (excluded)
+17:04:11 bracket[seq-write-1m-direct]: leg 3: measured span 60s
+17:04:55 bracket[seq-write-1m-direct]: leg 3: instrument rc 4 — leg INVALID (108 fio I/O errors); see /build/brk-715226/leg3-B/measure.log
+17:04:55 bracket[seq-write-1m-direct]: leg 3: — 0 INVALID ['instrument_ok']
+17:04:56 bracket[seq-write-1m-direct]: leg 3: daemon log has 161 error( line(s)
+17:04:56 bracket[seq-write-1m-direct]: leg 4 arm A: /build/brk-715226/A/bin/squeezefs (set 0, symmetric) -o ''
+17:04:57 bracket[seq-write-1m-direct]: mounted /build/brk-715226/mnt (daemon pid 715970)
+17:04:57 bracket[seq-write-1m-direct]: leg 4: warm-up 10s (excluded)
+17:05:10 bracket[seq-write-1m-direct]: leg 4: measured span 60s
+17:06:02 bracket[seq-write-1m-direct]: leg 4: instrument rc 4 — leg INVALID (128 fio I/O errors); see /build/brk-715226/leg4-A/measure.log
+17:06:03 bracket[seq-write-1m-direct]: leg 4: — 0 INVALID ['instrument_ok']
+17:06:04 bracket[seq-write-1m-direct]: leg 4: daemon log has 89 error( line(s)

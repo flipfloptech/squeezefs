@@ -1,0 +1,261 @@
+1791642995.374 info(squeezefs): mem_budget: cgroup cage 17179869184 B bound by /sys/fs/cgroup/memory.max
+1791642995.389 info(squeezefs): metadata device /dev/nvme0n1: O_DIRECT (grain 4096 B from statx(STATX_DIOALIGN), buffer alignment 4096 B) — every byte bypasses the host page cache
+1791642996.166 info(squeezefs): meta volume /dev/nvme0n1: writer claim committed and barriered (id e677fb83683769e6, pid 452540, mode flock+pr, pr key 776c21ef25906a53)
+1791642996.180 info(squeezefs): meta volume /dev/nvme0n1: appender 0 Live as the manager (term 2, node 0xb60598a56bfecf4a, mount slot 0); 0 other appender(s) live on the directory
+1791642996.180 info(squeezefs): meta volume /dev/nvme0n1: slot leases armed — M 64, A_max 262144 B, 65 leases held, T_idle 45000 ms, N_floor 17
+1791642996.183 info(squeezefs): meta volume /dev/nvme0n1: mounted — ledger seq 80, tail 193839416, replayed 0 entries (0 content records, 0 torn dropped, clean unmount), next_ino 2, 7 trees, 8054/8062 extents free, coalesced cadence, guard flock+pr
+1791642996.186 info(squeezefs): metadata set 54d31665…: 1 member(s) mounted in canonical order as manager, epoch 1, 0 dual claim(s) converged, native keyspace on member 0
+1791642996.186 debug(squeezefs): NvmeBlockDev lane 0 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791642996.196 debug(squeezefs): NvmeBlockDev lane 0: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642996.197 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791642996.198 debug(squeezefs): NvmeBlockDev lane 1 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791642996.199 debug(squeezefs): NvmeBlockDev lane 1: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642996.199 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791642996.200 info(squeezefs): mount: set config
+  set config generation 1; block 4194304 B; chunk 4194304 B; capacity 12868124672 B (12272 MiB); compression none; encryption none
+  data volumes 2 (VOLUME_LIFECYCLE: the set has diverged from its birth state)
+    vol-29e0bc4702bf4325 active /dev/nvme1n1 1534 blocks (6136 MiB) device e8e91cb3-3600-7d17-ed69-7b2336a73ba3
+    vol-b8e78122fb0f1a75 active /dev/nvme2n1 1534 blocks (6136 MiB) device 731fe745-3fd6-62f7-1e5d-56afae196a43
+  cache-less (no disk cache paths)
+1791642996.201 debug(squeezefs): NvmeBlockDev lane 2 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791642996.201 debug(squeezefs): NvmeBlockDev lane 2: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642996.201 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791642996.203 info(squeezefs): data volume /dev/nvme1n1: vol-29e0bc4702bf4325 bound as ordinal 0: 1534 usable blocks, 384 referenced (384 ref records), 1150 free
+1791642996.204 debug(squeezefs): NvmeBlockDev lane 3 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791642996.204 debug(squeezefs): NvmeBlockDev lane 3: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791642996.204 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791642996.206 info(squeezefs): data volume /dev/nvme2n1: vol-b8e78122fb0f1a75 bound as ordinal 1: 1534 usable blocks, 128 referenced (128 ref records), 1406 free
+1791642996.211 info(squeezefs): data plane: the set declares NO cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max (4096 B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)
+1791642996.864 info(squeezefs): data plane: 2 data volume(s), block 4194304 B, chunk 4194304 B, inline_max 4096 B, inline map cap 1364 entries, map chunk 512 ops, sweep threshold 32768 blocks, transform none/none, staging off, NVMe tier off, direct-store face pending the session
+1791642996.869 info(squeezefs): cluster wire: listening at 192.168.64.47:37719 (cap 144 connections)
+1791642996.871 info(squeezefs): cluster wire: manager of 1 volume(s) listening at 192.168.64.47:37719; membership owner term 2 (T_owner 45000 ms, grace closed)
+1791642996.876 info(squeezefs): data planes: the grant plane armed as the HOLDER of 2 data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)
+1791642996.886 info(squeezefs): job fabric: 0 job(s) adopted; 2 local worker(s), default throttle 100 %, verify 1000 ‰ (plaintext pins 1000), fleet jobs on; the admin lane on the listener
+1791642996.890 info(squeezefs): transport probe: kmbuf_ops=38/39
+1791642996.890 info(squeezefs): transport probe: RELEASE_PAYLOAD(commit_id=MAX) → -107 ⇒ retention present
+1791642996.890 info(squeezefs): kv_fs: FUSE 7.36; KILLPRIV_V2 negotiated; inline_max 4096 B; block 4194304 B; data volumes yes; staging off
+1791642996.890 info(squeezefs): transport: INIT 7.45 → 7.36: flags 0x4000020050c4f829 (over_io_uring=true, time_limits=true), max_write 1048576, max_pages 256, max_background 288, queues 9 × depth 32, payload 1048576 B, 9 drain group(s) (width 1), buffer mode zero_copy (kmbuf 38, retention present)
+1791642997.044 info(squeezefs): transport: group 0 (qids 0..0, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.050 info(squeezefs): transport: group 1 (qids 1..1, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.058 info(squeezefs): transport: group 2 (qids 2..2, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.085 info(squeezefs): transport: group 3 (qids 3..3, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.093 info(squeezefs): transport: group 4 (qids 4..4, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.099 info(squeezefs): transport: group 5 (qids 5..5, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.109 info(squeezefs): transport: group 6 (qids 6..6, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.116 info(squeezefs): transport: group 7 (qids 7..7, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.122 info(squeezefs): transport: group 8 (qids 8..8, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791642997.125 info(squeezefs): transport: FUSE-over-io_uring transport armed at /build/brk-451839/mnt: 9 queue(s) × 32 ent(s) over 9 worker(s), zero_copy
+1791642997.125 info(squeezefs): data plane: session armed — held-slot direct store ON, direct device leg ON, fd-source probe serve ON
+1791642997.126 info(squeezefs): ready: sqmeta:///dev/nvme0n1 mounted at /build/brk-451839/mnt (pid 452540; 9 queue(s) × depth 32; budget 7168 MiB; TTLs attr 1000 ms entry 1000 ms dir_entry 1000 ms negative 1000 ms)
+1791642998.242 debug(squeezefs): checkpoint tail 193855704 < head 195170960: inflight 18446744073709551615, dying floors 193855704, dirty node floor 195179104
+1791643000.306 debug(squeezefs): checkpoint tail 197129592 < head 199523928: inflight 199556504, dying floors 197129592, dirty node floor 199523928
+1791643001.319 debug(squeezefs): checkpoint tail 199523928 < head 202345824: inflight 18446744073709551615, dying floors 199523928, dirty node floor 202349896
+1791643002.371 debug(squeezefs): checkpoint tail 202349896 < head 204670936: inflight 18446744073709551615, dying floors 202349896, dirty node floor 204670936
+1791643004.437 debug(squeezefs): checkpoint tail 206425968 < head 208327592: inflight 18446744073709551615, dying floors 206425968, dirty node floor 208327592
+1791643005.460 debug(squeezefs): checkpoint tail 208335736 < head 210086696: inflight 18446744073709551615, dying floors 208335736, dirty node floor 210094840
+1791643006.508 debug(squeezefs): checkpoint tail 210094840 < head 212501392: inflight 18446744073709551615, dying floors 210094840, dirty node floor 212501392
+1791643007.560 debug(squeezefs): checkpoint tail 212501392 < head 214533320: inflight 18446744073709551615, dying floors 212501392, dirty node floor 18446744073709551615
+1791643011.716 debug(squeezefs): checkpoint tail 218283750 < head 220120104: inflight 220120104, dying floors 218283750, dirty node floor 220120104
+1791643012.731 debug(squeezefs): checkpoint tail 220120104 < head 222042088: inflight 222050232, dying floors 220120104, dirty node floor 222050232
+1791643013.779 debug(squeezefs): checkpoint tail 222050232 < head 224139168: inflight 18446744073709551615, dying floors 222050232, dirty node floor 224139168
+1791643014.835 debug(squeezefs): checkpoint tail 224139168 < head 226183312: inflight 18446744073709551615, dying floors 224139168, dirty node floor 226187384
+1791643015.890 debug(squeezefs): checkpoint tail 226187384 < head 228243744: inflight 228264104, dying floors 226187384, dirty node floor 228243744
+1791643016.951 debug(squeezefs): checkpoint tail 228251888 < head 230410048: inflight 18446744073709551615, dying floors 228251888, dirty node floor 230414120
+1791643018.001 debug(squeezefs): checkpoint tail 230414120 < head 233439616: inflight 18446744073709551615, dying floors 230414120, dirty node floor 233439616
+1791643019.030 debug(squeezefs): checkpoint tail 233439616 < head 236000904: inflight 18446744073709551615, dying floors 233439616, dirty node floor 236000904
+1791643020.072 debug(squeezefs): checkpoint tail 236004976 < head 238521472: inflight 18446744073709551615, dying floors 236004976, dirty node floor 18446744073709551615
+1791643022.146 debug(squeezefs): checkpoint tail 240850656 < head 243745848: inflight 243770280, dying floors 240850656, dirty node floor 243745848
+1791643023.202 debug(squeezefs): checkpoint tail 243745848 < head 246612536: inflight 246612536, dying floors 243745848, dirty node floor 246612536
+1791643024.232 debug(squeezefs): checkpoint tail 246612536 < head 248839920: inflight 248843992, dying floors 246612536, dirty node floor 248843992
+1791643026.341 debug(squeezefs): checkpoint tail 250855560 < head 253587872: inflight 253640808, dying floors 250855560, dirty node floor 253587872
+1791643027.420 debug(squeezefs): checkpoint tail 253587872 < head 256715168: inflight 256731456, dying floors 253587872, dirty node floor 256715168
+1791643028.148 warning(squeezefs): mem_budget: unreclaimable 7168047496 B >= 95% of the 7516192768 B budget — disk-tier publishes paused
+1791643028.445 debug(squeezefs): checkpoint tail 256715168 < head 258531280: inflight 18446744073709551615, dying floors 256715168, dirty node floor 258531280
+1791643029.502 debug(squeezefs): checkpoint tail 258531280 < head 260844176: inflight 18446744073709551615, dying floors 258531280, dirty node floor 260848248
+1791643030.529 debug(squeezefs): checkpoint tail 260848248 < head 263588704: inflight 263604992, dying floors 260848248, dirty node floor 263592894
+1791643031.553 debug(squeezefs): checkpoint tail 263592894 < head 266475752: inflight 18446744073709551615, dying floors 263592894, dirty node floor 18446744073709551615
+1791643032.578 debug(squeezefs): checkpoint tail 266475752 < head 268894520: inflight 18446744073709551615, dying floors 266475752, dirty node floor 268894520
+1791643033.628 debug(squeezefs): checkpoint tail 268918952 < head 271256280: inflight 18446744073709551615, dying floors 268918952, dirty node floor 271260352
+1791643034.642 debug(squeezefs): checkpoint tail 271297000 < head 273719840: inflight 18446744073709551615, dying floors 271297000, dirty node floor 18446744073709551615
+1791643035.655 debug(squeezefs): checkpoint tail 273719958 < head 276549880: inflight 18446744073709551615, dying floors 273719958, dirty node floor 18446744073709551615
+1791643036.712 debug(squeezefs): checkpoint tail 276549880 < head 279046016: inflight 18446744073709551615, dying floors 276549880, dirty node floor 18446744073709551615
+1791643037.776 debug(squeezefs): checkpoint tail 279066376 < head 281350768: inflight 18446744073709551615, dying floors 279066376, dirty node floor 281350768
+1791643038.817 debug(squeezefs): checkpoint tail 281362984 < head 283321616: inflight 18446744073709551615, dying floors 281362984, dirty node floor 283321616
+1791643039.828 debug(squeezefs): checkpoint tail 283321616 < head 285878832: inflight 18446744073709551615, dying floors 283321616, dirty node floor 285878832
+1791643040.847 debug(squeezefs): checkpoint tail 285878832 < head 288468624: inflight 288468624, dying floors 285878832, dirty node floor 288468624
+1791643041.910 debug(squeezefs): checkpoint tail 288468624 < head 290891464: inflight 290915896, dying floors 288468624, dirty node floor 290891464
+1791643042.157 info(squeezefs): mem_budget: unreclaimable pressure receded — disk-tier publishes resume
+1791643042.956 debug(squeezefs): checkpoint tail 290895536 < head 293204360: inflight 293212504, dying floors 290895536, dirty node floor 293204360
+1791643043.990 debug(squeezefs): checkpoint tail 293204360 < head 295761576: inflight 18446744073709551615, dying floors 293204360, dirty node floor 18446744073709551615
+1791643045.012 debug(squeezefs): checkpoint tail 295761576 < head 298318792: inflight 18446744073709551615, dying floors 295761576, dirty node floor 298318792
+1791643046.069 debug(squeezefs): checkpoint tail 298318792 < head 301230272: inflight 18446744073709551615, dying floors 298318792, dirty node floor 18446744073709551615
+1791643047.095 debug(squeezefs): checkpoint tail 301242606 < head 304206904: inflight 304227264, dying floors 301242606, dirty node floor 304210976
+1791643048.153 debug(squeezefs): checkpoint tail 304215166 < head 307374920: inflight 18446744073709551615, dying floors 304215166, dirty node floor 307374920
+1791643048.854 debug(squeezefs): handler: write on ino 6 (unique 50030) answered EAGAIN: WouldBlock
+1791643048.855 debug(squeezefs): handler: write on ino 6 (unique 50034) answered EAGAIN: WouldBlock
+1791643048.856 debug(squeezefs): handler: write on ino 6 (unique 50042) answered EAGAIN: WouldBlock
+1791643048.857 debug(squeezefs): handler: write on ino 7 (unique 50044) answered EAGAIN: WouldBlock
+1791643048.857 debug(squeezefs): handler: write on ino 6 (unique 50046) answered EAGAIN: WouldBlock
+1791643048.857 debug(squeezefs): handler: write on ino 6 (unique 50050) answered EAGAIN: WouldBlock
+1791643048.858 debug(squeezefs): handler: write on ino 7 (unique 50052) answered EAGAIN: WouldBlock
+1791643048.858 debug(squeezefs): handler: write on ino 7 (unique 50056) answered EAGAIN: WouldBlock
+1791643048.859 debug(squeezefs): handler: write on ino 7 (unique 50058) answered EAGAIN: WouldBlock
+1791643048.859 debug(squeezefs): handler: write on ino 7 (unique 50060) answered EAGAIN: WouldBlock
+1791643048.860 debug(squeezefs): handler: write on ino 7 (unique 50062) answered EAGAIN: WouldBlock
+1791643048.860 debug(squeezefs): handler: write on ino 7 (unique 50064) answered EAGAIN: WouldBlock
+1791643048.861 debug(squeezefs): handler: write on ino 7 (unique 50066) answered EAGAIN: WouldBlock
+1791643048.861 debug(squeezefs): handler: write on ino 7 (unique 50068) answered EAGAIN: WouldBlock
+1791643048.862 debug(squeezefs): handler: write on ino 7 (unique 50070) answered EAGAIN: WouldBlock
+1791643048.862 debug(squeezefs): handler: write on ino 7 (unique 50072) answered EAGAIN: WouldBlock
+1791643048.863 debug(squeezefs): handler: write on ino 7 (unique 50074) answered EAGAIN: WouldBlock
+1791643048.863 debug(squeezefs): handler: write on ino 7 (unique 50076) answered EAGAIN: WouldBlock
+1791643048.864 debug(squeezefs): handler: write on ino 7 (unique 50078) answered EAGAIN: WouldBlock
+1791643048.864 debug(squeezefs): handler: write on ino 7 (unique 50080) answered EAGAIN: WouldBlock
+1791643048.865 debug(squeezefs): handler: write on ino 7 (unique 50082) answered EAGAIN: WouldBlock
+1791643048.866 debug(squeezefs): handler: write on ino 7 (unique 50084) answered EAGAIN: WouldBlock
+1791643048.866 debug(squeezefs): handler: write on ino 7 (unique 50086) answered EAGAIN: WouldBlock
+1791643048.867 debug(squeezefs): handler: write on ino 7 (unique 50088) answered EAGAIN: WouldBlock
+1791643048.867 debug(squeezefs): handler: write on ino 7 (unique 50090) answered EAGAIN: WouldBlock
+1791643048.868 debug(squeezefs): handler: write on ino 7 (unique 50092) answered EAGAIN: WouldBlock
+1791643048.868 debug(squeezefs): handler: write on ino 7 (unique 50094) answered EAGAIN: WouldBlock
+1791643048.869 debug(squeezefs): handler: write on ino 7 (unique 50096) answered EAGAIN: WouldBlock
+1791643048.869 debug(squeezefs): handler: write on ino 7 (unique 50098) answered EAGAIN: WouldBlock
+1791643048.870 debug(squeezefs): handler: write on ino 7 (unique 50100) answered EAGAIN: WouldBlock
+1791643048.870 debug(squeezefs): handler: write on ino 7 (unique 50102) answered EAGAIN: WouldBlock
+1791643048.871 debug(squeezefs): handler: write on ino 7 (unique 50104) answered EAGAIN: WouldBlock
+1791643048.872 debug(squeezefs): handler: write on ino 7 (unique 50106) answered EAGAIN: WouldBlock
+1791643048.872 debug(squeezefs): handler: write on ino 7 (unique 50108) answered EAGAIN: WouldBlock
+1791643048.885 debug(squeezefs): handler: write on ino 6 (unique 50054) answered EAGAIN: WouldBlock
+1791643048.885 debug(squeezefs): handler: write on ino 7 (unique 50110) answered EAGAIN: WouldBlock
+1791643048.886 debug(squeezefs): handler: write on ino 7 (unique 50112) answered EAGAIN: WouldBlock
+1791643048.886 debug(squeezefs): handler: write on ino 6 (unique 50118) answered EAGAIN: WouldBlock
+1791643048.887 debug(squeezefs): handler: write on ino 7 (unique 50120) answered EAGAIN: WouldBlock
+1791643048.887 debug(squeezefs): handler: write on ino 6 (unique 50122) answered EAGAIN: WouldBlock
+1791643048.887 debug(squeezefs): handler: write on ino 5 (unique 50124) answered EAGAIN: WouldBlock
+1791643048.888 debug(squeezefs): handler: write on ino 6 (unique 50126) answered EAGAIN: WouldBlock
+1791643048.888 debug(squeezefs): handler: write on ino 5 (unique 50128) answered EAGAIN: WouldBlock
+1791643048.888 debug(squeezefs): handler: write on ino 6 (unique 50130) answered EAGAIN: WouldBlock
+1791643048.889 debug(squeezefs): handler: write on ino 5 (unique 50132) answered EAGAIN: WouldBlock
+1791643048.890 debug(squeezefs): handler: write on ino 5 (unique 50138) answered EAGAIN: WouldBlock
+1791643048.890 debug(squeezefs): handler: write on ino 5 (unique 50140) answered EAGAIN: WouldBlock
+1791643048.890 debug(squeezefs): handler: write on ino 6 (unique 50134) answered EAGAIN: WouldBlock
+1791643048.891 debug(squeezefs): handler: write on ino 5 (unique 50142) answered EAGAIN: WouldBlock
+1791643048.891 debug(squeezefs): handler: write on ino 6 (unique 50144) answered EAGAIN: WouldBlock
+1791643048.892 debug(squeezefs): handler: write on ino 5 (unique 50146) answered EAGAIN: WouldBlock
+1791643048.892 debug(squeezefs): handler: write on ino 6 (unique 50148) answered EAGAIN: WouldBlock
+1791643048.892 debug(squeezefs): handler: write on ino 5 (unique 50150) answered EAGAIN: WouldBlock
+1791643048.893 debug(squeezefs): handler: write on ino 6 (unique 50152) answered EAGAIN: WouldBlock
+1791643048.893 debug(squeezefs): handler: write on ino 5 (unique 50154) answered EAGAIN: WouldBlock
+1791643048.894 debug(squeezefs): handler: write on ino 6 (unique 50158) answered EAGAIN: WouldBlock
+1791643048.894 debug(squeezefs): handler: write on ino 5 (unique 50160) answered EAGAIN: WouldBlock
+1791643048.894 debug(squeezefs): handler: write on ino 6 (unique 50164) answered EAGAIN: WouldBlock
+1791643048.894 debug(squeezefs): handler: write on ino 5 (unique 50162) answered EAGAIN: WouldBlock
+1791643048.895 debug(squeezefs): handler: write on ino 6 (unique 50166) answered EAGAIN: WouldBlock
+1791643048.895 debug(squeezefs): handler: write on ino 5 (unique 50168) answered EAGAIN: WouldBlock
+1791643048.896 debug(squeezefs): handler: write on ino 6 (unique 50170) answered EAGAIN: WouldBlock
+1791643048.896 debug(squeezefs): handler: write on ino 5 (unique 50172) answered EAGAIN: WouldBlock
+1791643048.896 debug(squeezefs): handler: write on ino 6 (unique 50174) answered EAGAIN: WouldBlock
+1791643048.896 debug(squeezefs): handler: write on ino 5 (unique 50176) answered EAGAIN: WouldBlock
+1791643048.897 debug(squeezefs): handler: write on ino 5 (unique 50182) answered EAGAIN: WouldBlock
+1791643048.897 debug(squeezefs): handler: write on ino 6 (unique 50180) answered EAGAIN: WouldBlock
+1791643048.898 debug(squeezefs): handler: write on ino 6 (unique 50184) answered EAGAIN: WouldBlock
+1791643048.898 debug(squeezefs): handler: write on ino 5 (unique 50186) answered EAGAIN: WouldBlock
+1791643048.898 debug(squeezefs): handler: write on ino 6 (unique 50188) answered EAGAIN: WouldBlock
+1791643048.899 debug(squeezefs): handler: write on ino 5 (unique 50190) answered EAGAIN: WouldBlock
+1791643048.899 debug(squeezefs): handler: write on ino 6 (unique 50192) answered EAGAIN: WouldBlock
+1791643048.899 debug(squeezefs): handler: write on ino 5 (unique 50194) answered EAGAIN: WouldBlock
+1791643048.900 debug(squeezefs): handler: write on ino 6 (unique 50196) answered EAGAIN: WouldBlock
+1791643048.900 debug(squeezefs): handler: write on ino 5 (unique 50198) answered EAGAIN: WouldBlock
+1791643048.900 debug(squeezefs): handler: write on ino 5 (unique 50202) answered EAGAIN: WouldBlock
+1791643048.900 debug(squeezefs): handler: write on ino 6 (unique 50200) answered EAGAIN: WouldBlock
+1791643048.901 debug(squeezefs): handler: write on ino 5 (unique 50206) answered EAGAIN: WouldBlock
+1791643048.902 debug(squeezefs): handler: write on ino 6 (unique 50208) answered EAGAIN: WouldBlock
+1791643048.902 debug(squeezefs): handler: write on ino 5 (unique 50210) answered EAGAIN: WouldBlock
+1791643048.902 debug(squeezefs): handler: write on ino 5 (unique 50216) answered EAGAIN: WouldBlock
+1791643048.902 debug(squeezefs): handler: write on ino 6 (unique 50212) answered EAGAIN: WouldBlock
+1791643048.903 debug(squeezefs): handler: write on ino 5 (unique 50218) answered EAGAIN: WouldBlock
+1791643048.903 debug(squeezefs): handler: write on ino 6 (unique 50220) answered EAGAIN: WouldBlock
+1791643048.904 debug(squeezefs): handler: write on ino 5 (unique 50222) answered EAGAIN: WouldBlock
+1791643048.904 debug(squeezefs): handler: write on ino 6 (unique 50224) answered EAGAIN: WouldBlock
+1791643048.904 debug(squeezefs): handler: write on ino 5 (unique 50226) answered EAGAIN: WouldBlock
+1791643048.905 debug(squeezefs): handler: write on ino 6 (unique 50228) answered EAGAIN: WouldBlock
+1791643048.905 debug(squeezefs): handler: write on ino 5 (unique 50230) answered EAGAIN: WouldBlock
+1791643048.905 debug(squeezefs): handler: write on ino 6 (unique 50232) answered EAGAIN: WouldBlock
+1791643048.906 debug(squeezefs): handler: write on ino 5 (unique 50234) answered EAGAIN: WouldBlock
+1791643048.906 debug(squeezefs): handler: write on ino 6 (unique 50236) answered EAGAIN: WouldBlock
+1791643048.906 debug(squeezefs): handler: write on ino 5 (unique 50238) answered EAGAIN: WouldBlock
+1791643048.907 debug(squeezefs): handler: write on ino 5 (unique 50242) answered EAGAIN: WouldBlock
+1791643048.907 debug(squeezefs): handler: write on ino 5 (unique 50244) answered EAGAIN: WouldBlock
+1791643048.908 debug(squeezefs): handler: write on ino 5 (unique 50246) answered EAGAIN: WouldBlock
+1791643049.211 debug(squeezefs): checkpoint tail 307383064 < head 312831400: inflight 18446744073709551615, dying floors 307383064, dirty node floor 312839544
+1791643049.571 debug(squeezefs): handler: write on ino 4 (unique 51282) answered EAGAIN: WouldBlock
+1791643049.572 debug(squeezefs): handler: write on ino 4 (unique 51284) answered EAGAIN: WouldBlock
+1791643049.572 debug(squeezefs): handler: write on ino 4 (unique 51286) answered EAGAIN: WouldBlock
+1791643049.573 debug(squeezefs): handler: write on ino 4 (unique 51288) answered EAGAIN: WouldBlock
+1791643049.573 debug(squeezefs): handler: write on ino 4 (unique 51290) answered EAGAIN: WouldBlock
+1791643049.574 debug(squeezefs): handler: write on ino 4 (unique 51292) answered EAGAIN: WouldBlock
+1791643049.574 debug(squeezefs): handler: write on ino 4 (unique 51294) answered EAGAIN: WouldBlock
+1791643049.575 debug(squeezefs): handler: write on ino 4 (unique 51296) answered EAGAIN: WouldBlock
+1791643049.576 debug(squeezefs): handler: write on ino 4 (unique 51298) answered EAGAIN: WouldBlock
+1791643049.576 debug(squeezefs): handler: write on ino 4 (unique 51300) answered EAGAIN: WouldBlock
+1791643049.577 debug(squeezefs): handler: write on ino 4 (unique 51302) answered EAGAIN: WouldBlock
+1791643049.578 debug(squeezefs): handler: write on ino 4 (unique 51304) answered EAGAIN: WouldBlock
+1791643049.578 debug(squeezefs): handler: write on ino 4 (unique 51306) answered EAGAIN: WouldBlock
+1791643049.579 debug(squeezefs): handler: write on ino 4 (unique 51308) answered EAGAIN: WouldBlock
+1791643049.579 debug(squeezefs): handler: write on ino 4 (unique 51310) answered EAGAIN: WouldBlock
+1791643049.579 debug(squeezefs): handler: write on ino 4 (unique 51312) answered EAGAIN: WouldBlock
+1791643049.580 debug(squeezefs): handler: write on ino 4 (unique 51314) answered EAGAIN: WouldBlock
+1791643049.580 debug(squeezefs): handler: write on ino 4 (unique 51316) answered EAGAIN: WouldBlock
+1791643049.581 debug(squeezefs): handler: write on ino 4 (unique 51318) answered EAGAIN: WouldBlock
+1791643049.581 debug(squeezefs): handler: write on ino 4 (unique 51320) answered EAGAIN: WouldBlock
+1791643049.582 debug(squeezefs): handler: write on ino 4 (unique 51322) answered EAGAIN: WouldBlock
+1791643049.582 debug(squeezefs): handler: write on ino 4 (unique 51324) answered EAGAIN: WouldBlock
+1791643049.583 debug(squeezefs): handler: write on ino 4 (unique 51326) answered EAGAIN: WouldBlock
+1791643049.583 debug(squeezefs): handler: write on ino 4 (unique 51328) answered EAGAIN: WouldBlock
+1791643049.584 debug(squeezefs): handler: write on ino 4 (unique 51330) answered EAGAIN: WouldBlock
+1791643049.584 debug(squeezefs): handler: write on ino 4 (unique 51332) answered EAGAIN: WouldBlock
+1791643049.585 debug(squeezefs): handler: write on ino 4 (unique 51334) answered EAGAIN: WouldBlock
+1791643049.585 debug(squeezefs): handler: write on ino 4 (unique 51336) answered EAGAIN: WouldBlock
+1791643049.586 debug(squeezefs): handler: write on ino 4 (unique 51338) answered EAGAIN: WouldBlock
+1791643049.586 debug(squeezefs): handler: write on ino 4 (unique 51340) answered EAGAIN: WouldBlock
+1791643049.587 debug(squeezefs): handler: write on ino 4 (unique 51342) answered EAGAIN: WouldBlock
+1791643049.587 debug(squeezefs): handler: write on ino 4 (unique 51344) answered EAGAIN: WouldBlock
+1791643050.230 debug(squeezefs): checkpoint tail 312839544 < head 314549784: inflight 18446744073709551615, dying floors 312839544, dirty node floor 18446744073709551615
+1791643050.454 info(squeezefs): stop requested (SIGTERM/SIGINT): unmounting /build/brk-451839/mnt
+1791643050.455 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.455 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.455 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.456 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.456 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.456 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.456 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.457 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.457 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791643050.492 info(squeezefs): teardown: session closed; open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0
+1791643051.238 info(squeezefs): data volume /dev/nvme1n1: dismount teardown completed; further DMA refused (EROFS class)
+1791643051.238 info(squeezefs): data volume /dev/nvme2n1: dismount teardown completed; further DMA refused (EROFS class)
+1791643052.206 info(squeezefs): meta volume /dev/nvme0n1: clean unmount (checkpoint seq 137, tail 314562000, head 314562000, healthy)
+1791643052.254 error(SafeAllocator): leaked [addr: ffffa305a940, len: 144 (0x90) align: 8] allocated at: 
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/ops/nvmet/initiator.zig:875:45: 0x164bb5b in sample (squeezefs)
+            if (!found) try self.seen.append(gpa, cur);
+                                            ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/stats/stats.zig:414:20: 0x17c0007 in writeAll (squeezefs)
+        try f.write(src, w);
+                   ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/stats/stats.zig:853:17: 0x17baa5b in render (squeezefs)
+        writeAll(&self.sources, &out.writer) catch return error.OutOfMemory;
+                ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/kv_fs.zig:578:43: 0x15e9a23 in lookupVirtual (squeezefs)
+            const payload = try face.build(face.ctx, class, self.gpa);
+                                          ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/filesystem.zig:302:39: 0x170bbab in call (squeezefs)
+                return @field(T, name)(self, c, args);
+                                      ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/lifecycle.zig:352:51: 0x17057c3 in run (squeezefs)
+                    const e = try fs.vtable.lookup(fs.impl, c, .{ .parent = ino, .name = a.name });
+                                                  ^
+/Users/joberdorf/Source/squeezefs-zig/.wt-brackets/src/fuse/handler/lifecycle.zig:241:37: 0x170233b in dispatch (squeezefs)
+            const outcome = self.run(req, meta, &ctx, &out, lease);
+                                    ^
+(additional stack frames may have been skipped...)
+

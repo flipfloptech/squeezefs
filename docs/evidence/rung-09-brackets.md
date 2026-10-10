@@ -132,11 +132,13 @@ no NUMA, one virtio-net queue. Not a measurement venue by AGENTS.md; two other
 agents ran gates, LTP and pjdfstest throughout (`loadavg` 4–11 on 9 CPUs,
 recorded per leg).
 
-Noise band = the spread over four legs of A = B = HEAD, per row (§4, column
-"noise band"): **5 % on the quietest fabric row (seq-read-1m-direct, nvmet-tcp)
-to 20–35 % on the IOPS and buffered rows while the other agents' suites
-ran.** A venue whose own noise is 20 % cannot judge a 5 % A/B; the box's
-noise band has to be measured first (gate §1 item 8).
+Noise band = the spread over four legs of A = B = `ce0edf4`, per row (§3,
+column "noise band"): **0.8 % on the one row that ran while the venue was
+briefly quiet (`rand-4k-write` on `file`), 15–30 % on the IOPS, mdtest and
+direct-read rows, 45–112 % on the shim and buffered rows while the other
+agents' suites ran** (`loadavg` 8–20). A venue whose own noise is 20 %
+cannot judge a 5 % A/B; the box's noise band has to be measured first (gate
+§1 item 8).
 
 The substrate chain hides the device entirely for reads: the nvmet file
 backend and the file substrate both serve reads from the VM's page cache
@@ -148,33 +150,174 @@ Writes do reach `/dev/vdc` (`device ÷ user` from the namespaces' diskstats
 
 ## 3. Scoping rows
 
-@@TABLE@@
+All rows: A = B = `ce0edf4f004d` (gate profile; sha256 `3429843f…9b94`, shim
+`732e26b8…4f48`, snapshotted into the scratch per row), 4 legs × 60 s + 10 s
+warm-up, `numjobs 4`, `iodepth 32`, 4 × 512 MiB files (2 GiB datasets),
+`SQUEEZEFS_MEM_BUDGET_MB=7168`, sets of 2 GiB meta + 2 × 6 GiB data (sparse),
+2026-10-10 14:27–17:54 UTC, `loadavg` 4–20 on 9 CPUs (two other agents' gates,
+LTP, pjdfstest and builds ran throughout). Headline = the A arm's mean over
+its two legs; "noise band" = the spread over all four legs of the same
+binary. Every INVALID row keeps its numbers in the record; the table's
+headline column shows them only where the leg produced one.
+
+(The venue's bars, for orientation, not judgement: the 4-task mdtest row sits
+at 13 % of the 32 k creates/s bar; the kernel-FUSE rand-4k rows at 5 % of
+555 k IOPS; the shim rand-4k rows at 1–2 % of the 942 k / 727 k bars; the
+seq rows at 1–20 % of the GB/s bars — on 9 vCPU, loopback TCP and one virtio
+disk, as expected.)
+
+| row | substrate | mount / lever | instrument | legs (A,B,B,A) | A mean | noise band | p50 / p99 µs | device÷user stats / disk | wareq-sz disk B | reclaim q+e=t | admission ×user | wire rpcs | tripwires | tick rescues | verdict | record |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| creates-mdtest | nvmet-loop | defaults | mdtest | 3719, 3906, 3488, 4623 | **4171 creates/s** | 28.9 % | — / — | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-VALID | `creates-mdtest-20261010T160749Z.json` |
+| creates-mdtest | nvmet-loop | lever posture (A symmetric / B single-writer) | mdtest | 4599, 4736, 4783, 4080 | **4339 creates/s** | 15.5 % | — / — | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-VALID | `creates-mdtest-20261010T164606Z.json` |
+| fsync-4k | nvmet-loop | defaults | fio-3.36 psync randwrite bs=4k direct=0 QD1×numjobs=4 size=2 | 999.2, 2636, 1591, 2508 | **1754 IOPS** | 84.7 % | 982.0 / 6398 | 1.022 / 1.022 | 2093 | 0+10=10 | ×1.0000 | 0 | 0 | 6 | SCOPING-VALID | `fsync-4k-20261010T160230Z.json` |
+| rand-4k-read | nvmet-loop | defaults | fio-3.36 libaio randread bs=4k direct=1 iodepth=32 numjobs=4 | 22226, 24088, 23362, 29415 | **25820 IOPS** | 29.0 % | 4420 / 14909 | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-VALID | `rand-4k-read-20261010T153505Z.json` |
+| rand-4k-read | nvmet-loop | direct_device_true | fio-3.36 libaio randread bs=4k direct=1 iodepth=32 numjobs=4 | 30538, 29067, 27079, 26279 | **28408 IOPS** | 15.1 % | 4108 / 12976 | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-VALID | `rand-4k-read-20261010T154023Z.json` |
+| rand-4k-write | nvmet-loop | defaults | fio-3.36 libaio randwrite bs=4k direct=1 iodepth=32 numjobs= | 4139, 0, 5260, 1890 | **3014 IOPS** | 89.6 % | 36176 / 127052 | 1.017 / 1.023 | 4192 | 0+13=13 | ×1.0000 | 0 | 0 | 3 | SCOPING-INVALID | `rand-4k-write-20261010T154534Z.json` |
+| rand-4k-write | file | defaults | fio-3.36 libaio randwrite bs=4k direct=1 iodepth=32 numjobs= | 7359, 7399, 7343, 7342 | **7351 IOPS** | 0.8 % | 15466 / 25952 | 1.035 / 1.159 | 3545 | 77+0=77 | ×1.0000 | 0 | 0 | 0 | SCOPING-VALID | `rand-4k-write-20261010T170604Z.json` |
+| rename-unlink | nvmet-loop | defaults | renames.py pool=20000 threads=4 | 1.012, 1.012, 1.012, 1.013 | **1.012 journal entries/op** | 0.1 % | — / — | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-INVALID | `rename-unlink-20261010T162255Z.json` |
+| seq-read-1m-buffered | nvmet-tcp | defaults | fio-3.36 libaio read bs=1m direct=0 iodepth=32 numjobs=4 siz | 1419, 2984, 2930, 2141 | **1780 MiB/s** | 66.1 % | 48103 / 232129 | — / — | — | 0+0=0 | — | 0 | 0 | 15 | SCOPING-VALID | `seq-read-1m-buffered-20261010T151933Z.json` |
+| seq-read-1m-direct | nvmet-tcp | defaults | fio-3.36 libaio read bs=1m direct=1 iodepth=32 numjobs=4 siz | 7955, 8529, 7262, 7799 | **7877 MiB/s** | 16.1 % | 14746 / 41943 | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-INVALID | `seq-read-1m-direct-20261010T143010Z.json` |
+| seq-write-1m-buffered | nvmet-tcp | defaults | fio-3.36 libaio write bs=1m direct=0 iodepth=32 numjobs=4 si | 0, 0, 406.4, 0 | **0.000 —** | 300.0 % | — / — | 0.997 / 1.006 | 1060241 | 0+19324=19324 | ×1.0000 | 0 | 0 | 27 | SCOPING-INVALID | `seq-write-1m-buffered-20261010T143514Z.json` |
+| seq-write-1m-direct | nvmet-tcp | defaults | fio-3.36 libaio write bs=1m direct=1 iodepth=32 numjobs=4 si | 0, 0, 0, 0 | **0.000 —** | 0.0 % | — / — | — / — | — | 0+17099=17099 | — | 0 | 0 | 83 | SCOPING-INVALID | `seq-write-1m-direct-20261010T142713Z.json` |
+| seq-write-1m-direct | file | defaults | fio-3.36 libaio write bs=1m direct=1 iodepth=32 numjobs=4 si | 0, 0, 0, 0 | **0.000 —** | 0.0 % | — / — | — / — | — | 29425+0=29425 | — | 0 | 0 | 139 | SCOPING-INVALID | `seq-write-1m-direct-20261010T170201Z.json` |
+| shim-rand-4k-read | nvmet-loop | defaults | fio-3.36 psync randread bs=4k direct=1 QD1×numjobs=4 size=51 | 13619, 13332, 11051, 7761 | **10690 IOPS** | 51.2 % | 294.9 / 1853 | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-VALID | `shim-rand-4k-read-20261010T174908Z.json` |
+| shim-rand-4k-write | nvmet-loop | defaults | fio-3.36 psync randwrite bs=4k direct=1 QD1×numjobs=4 size=5 | 4514, 13950, 13932, 3786 | **4150 IOPS** | 112.4 % | 284.7 / 6181 | 1.048 / 1.053 | 4328 | 0+183=183 | ×1.0000 | 0 | 0 | 3 | SCOPING-VALID | `shim-rand-4k-write-20261010T155710Z.json` |
+| shim-seq-read-1m | nvmet-tcp | defaults | fio-3.36 psync read bs=1m direct=1 QD1×numjobs=4 size=512m/j | 6187, 3958, 5232, 4646 | **5416 MiB/s** | 44.5 % | 741.4 / 2466 | — / — | — | 0+0=0 | — | 0 | 0 | 1 | SCOPING-VALID | `shim-seq-read-1m-20261010T152947Z.json` |
+| shim-seq-write-1m | nvmet-tcp | defaults | fio-3.36 psync write bs=1m direct=1 QD1×numjobs=4 size=512m/ | 308.4, 523.1, 473.1, 537.7 | **423.1 MiB/s** | 49.8 % | 3422 / 139821 | 0.969 / 0.977 | 1057584 | 0+24967=24967 | ×1.0000 | 0 | 0 | 646 | SCOPING-INVALID | `shim-seq-write-1m-20261010T152439Z.json` |
+| tar-x | nvmet-loop | defaults | tar -x of a 500×20 synthetic tree | 0.000, 0.000, 0.000, 0 | **0.000 —** | 0.0 % | — / — | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-INVALID | `tar-x-20261010T163116Z.json` |
+
+INVALID legs and their reasons (from the records):
+
+- `rand-4k-write` leg 2/B INVALID `daemon_wedged`: instrument outlived its bound after 140 s; fuse_ops_inflight 128, fuse_op_watchdog_overdue 3456, meta_conveyor_queued 5, meta_commit_parked 5; daemon pid 611535 killed by the harness; evidence: warmup.wedge.*
+- `rename-unlink` leg 1/A INVALID `mem_budget_green`: mem_budget_level 2 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 828 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)
+- `seq-read-1m-direct` leg 1/A INVALID `mem_budget_green`: mem_budget_level 2 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 703 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)
+- `seq-write-1m-buffered` leg 1/A INVALID `instrument_ok`: instrument rc 3, 96 I/O errors (fio io_u errors (see measure.log)); daemon log: 96 `answered EAGAIN` line(s)
+- `seq-write-1m-buffered` leg 2/B INVALID `instrument_ok`: instrument rc 4, 128 I/O errors (fio io_u errors (see measure.log)); daemon log: 128 `answered EAGAIN` line(s)
+- `seq-write-1m-buffered` leg 4/A INVALID `daemon_alive`: daemon pid 454025 died during the measured span (instrument rc 4) (see the leg's daemon.log and dmesg.tail; the venue's other agents run `pkill -9 -x squeezefs` sweeps)
+- `seq-write-1m-direct` leg 1/A INVALID `instrument_ok`: instrument rc 4, 106 I/O errors (fio io_u errors (see measure.log)); daemon log: 106 `answered EAGAIN` line(s)
+- `seq-write-1m-direct` leg 1/A INVALID `mem_budget_green`: mem_budget_level 2 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 717 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)
+- `seq-write-1m-direct` leg 2/B INVALID `instrument_ok`: instrument rc 4, 128 I/O errors (fio io_u errors (see measure.log)); daemon log: 128 `answered EAGAIN` line(s)
+- `seq-write-1m-direct` leg 2/B INVALID `mem_budget_green`: mem_budget_level 2 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 718 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)
+- `seq-write-1m-direct` leg 3/B INVALID `instrument_ok`: instrument rc 4, 126 I/O errors (fio io_u errors (see measure.log)); daemon log: 126 `answered EAGAIN` line(s)
+- `seq-write-1m-direct` leg 3/B INVALID `mem_budget_green`: mem_budget_level 2 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 725 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)
+- `seq-write-1m-direct` leg 4/A INVALID `instrument_ok`: instrument rc 4, 128 I/O errors (fio io_u errors (see measure.log)); daemon log: 128 `answered EAGAIN` line(s)
+- `seq-write-1m-direct` leg 4/A INVALID `mem_budget_green`: mem_budget_level 2 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 718 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)
+- `seq-write-1m-direct` leg 1/A INVALID `instrument_ok`: instrument rc 4, 100 I/O errors (fio io_u errors (see measure.log)); daemon log: 100 `answered EAGAIN` line(s)
+- `seq-write-1m-direct` leg 2/B INVALID `instrument_ok`: instrument rc 4, 128 I/O errors (fio io_u errors (see measure.log)); daemon log: 128 `answered EAGAIN` line(s)
+- `seq-write-1m-direct` leg 3/B INVALID `instrument_ok`: instrument rc 4, 108 I/O errors (fio io_u errors (see measure.log)); daemon log: 108 `answered EAGAIN` line(s)
+- `seq-write-1m-direct` leg 4/A INVALID `instrument_ok`: instrument rc 4, 128 I/O errors (fio io_u errors (see measure.log)); daemon log: 128 `answered EAGAIN` line(s)
+- `shim-seq-write-1m` leg 2/B INVALID `instrument_ok`: instrument rc 4, 4 I/O errors (fio job error codes [11]); daemon log: 4 `answered EAGAIN` line(s)
+- `shim-seq-write-1m` leg 4/A INVALID `instrument_ok`: instrument rc 4, 4 I/O errors (fio job error codes [11]); daemon log: 4 `answered EAGAIN` line(s)
+- `tar-x` leg 2/B INVALID `mem_budget_green`: mem_budget_level 1 at the after-snapshot (0 = Green; budget 7168 MiB; top components exec_fiber_stacks 894 MiB, transport_zc_bounce 288 MiB, transport_kmbuf_region 288 MiB, block_alloc_table 0 MiB)
+- `tar-x` leg 4/A INVALID `daemon_wedged`: instrument outlived its bound after 240 s; fuse_ops_inflight 4, fuse_op_watchdog_overdue 172, meta_conveyor_queued 5, meta_commit_parked 5; daemon pid 707670 killed by the harness; evidence: measure.wedge.*
+
+Per-row notes (from the records):
+
+- **rename-unlink**: 1.012 journal entries per rename/unlink op on every leg
+  (bar ≤ 1.05 — met at this venue's resolution; PAD entries 0.85/op beside, the
+  sector-pad law's framing), 2.6–3.6 k ops/s; the row is INVALID only because
+  leg 1 ran Red (F5).
+- **tar-x**: 0 wire verbs per entry on every live leg (bar met; the solo wire
+  census is 0 everywhere), 1.0–1.2 k entries/s, 5.21 journal entries per tar
+  entry (create + write + the setattr pair + the parent's Δtime); leg 2 Yellow,
+  leg 4 WEDGED (F1).
+- **creates-mdtest**: 3.5–4.8 k creates/s with 4 MPI tasks × 73 dirs, 215–370 k
+  files per leg, journal entries ≈ 1.01 per create; Green on every leg.
+- **posture (`--lever posture`)**: A (symmetric default) 4 599 / 4 080 vs B
+  (`--single-writer`) 4 736 / 4 783 creates/s → A/B 0.91 inside the row's
+  15–29 % noise band; `symmetric_meta` 1 vs 0 confirms the postures,
+  `writer_guard_mode` `flock+pr` on both (PR armed on the nvmet namespaces),
+  wire census 0 on all four legs. The bar ("within noise, `dlm_rpcs == 0`")
+  holds at this resolution; the box's band decides it.
+- **fsync-4k**: 60 k fsyncs per leg, `Σ phases ≡ total` to the ns
+  (80 548 290 054 = 80 548 290 054 ns); mean 1 343 µs = data_barrier 824 +
+  meta_barrier 517 + 2 µs of everything else; fio's own fsync latency mean
+  1.58 ms, p99 6.9 ms; `device ÷ user` 1.022 (stats = diskstats); reclaim
+  0 + 10 = 10.
+- **rand-4k-write (nvmet-loop, W1 patches)**: `wareq-sz` 4 096–4 279 B on the
+  data namespaces = exactly one 4 KiB device write per 4 KiB user write
+  (`device ÷ user` data 1.00–1.04), and **0.73–0.75 × user bytes on the META
+  namespace**: the journal's sector-pad law lands ≈ 3 KiB of journal page per
+  4 KiB patch (one 4 KiB-aligned run per conveyor window). On the box's 727 k
+  IOPS shape that is ≈ 2.2 GB/s of metadata-device writes (F14). Reclaim
+  0 + 13 = 13 closes; leg 2 WEDGED (F1).
+- **rand-4k-write (file)**: the quietest row of the day (noise 0.8 %) at
+  7.3 k IOPS; `device ÷ user` 1.13–1.21 on the SHARED /dev/vdc (an upper
+  bound); 77 terminal frees all queued (file substrate: punches, no elision).
+- **shim rows**: `ipc_ops_{read,write}` ≡ fio's ops on every leg (100 %
+  engagement, 4 sessions); the read copy ledger closes at ×1.0001 through
+  `read_dest_dma_bytes` (the handoff DMAs into the arena); p50 285–300 µs.
+  The shim write row's 4.5 k / 13.9 k / 13.9 k / 3.8 k legs (noise 112 %) are
+  the venue's load swings, not the daemon's: `loadavg` 8–20 during the row.
+- **rand-4k-read**: hybrid 25.8 k vs the `direct_device_true` ruler 28.4 k IOPS
+  (the ruler is faster here: no tier probe before a cache that has nothing;
+  both inside the 15–29 % band); `Δtransport_ring_requests` ≡ ops, every read
+  served by the direct device leg (`transport_zc_direct_legs`), `fuse_ops` ≈ 0.
+- **seq-read-1m-direct**: 7.3–8.5 GB/s through nvme-tcp loopback from the
+  target's page cache (F12); INVALID only by leg 1's Red (F5).
+- **seq-write rows**: every leg INVALID — EAGAIN storms (F2) and the wedge
+  (F1); the bytes they did move closed their ledgers (admission ×1.0000,
+  `device ÷ user` 0.97–1.01 on the data namespaces, `wareq-sz` 1 057–1 060 KB
+  = the 1 MiB block).
+
 
 Every record (JSON, md, harness log, per-leg daemon logs) is under
 `bench/brackets/7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk/`; the io500 run
 under `io500-<date>/` there; the wedge evidence under
 `wedge-seq-write-1m-buffered-20261010T1232Z/`.
 
-@@IO500@@
+### io500
+
+`scripts/bracket/io500.sh --scoping --substrate nvmet-tcp --budget-mb 7168`
+(`io500-scoping.ini`: the distribution's `config-minimal.ini` + a 60 s
+stonewall and capped sizes, np 4) **wedged in its first phase, ior-easy-write**
+(4 ranks × 2 MiB transfers): `meta_conveyor_queued 7`, `meta_commit_parked 7`,
+no window in flight, 4 FUSE writes overdue for 36 minutes — the fifth
+occurrence of F1. Evidence: `wedge-io500-ior-easy-write-20261010T1711Z/`
+(`.stats`, daemon log, task stacks, io500's config). No summary exists. The
+pipeline itself was validated on a 5 s / 64 MiB configuration against a file
+substrate (every phase ran, `[SCORE] Bandwidth 0.31 GiB/s : IOPS 6.0 kiops :
+TOTAL 1.36 [INVALID]` — the io500 marks a sub-300 s stonewall INVALID, as
+intended); the box runs `config-minimal.ini` unmodified once F1 is fixed.
+
 
 ## 4. Findings (what the harness caught on its first day)
 
-F1. **Commit conveyor wedge** (product, first-class — charter §1.1).
-`seq-write-1m-buffered` on nvmet-tcp (libaio QD32 × 4, 1 MiB buffered
-writes): the WARM-UP never returned. The FUSE op watchdog reported 4 writes
+F1. **Commit conveyor wedge** (product, first-class — charter §1.1; FIVE
+occurrences in one day across every write shape: `seq-write-1m-buffered`
+twice (warm-up of leg 1 at 12:32; measured span of leg 4 at 14:39),
+`rand-4k-write` twice (leg 3 at 13:18; leg 2 at 15:47), `tar -x` leg 4 at
+16:42, io500's ior-easy-write at 17:12). The first: `seq-write-1m-buffered`
+on nvmet-tcp (libaio QD32 × 4, 1 MiB buffered writes): the WARM-UP never
+returned. The FUSE op watchdog reported 4 writes
 "in flight ≥ 75 s, parked past station `meta_backend_start`"; `.stats`:
 `meta_conveyor_queued 6`, `meta_commit_parked 6`, `meta_conveyor_windows_inflight 0`,
 `meta_conveyor_park_tick_rescues 0`, `journal_lane_parks 23005`; every daemon
 thread (`sqz-jrnl0`, `sqz-meta0/1`, the lanes) parked in `io_cqring_wait`;
-fio's threads in `request_wait_answer`; `invariant_tripwires 0`. Six
-transactions enqueued on the conveyor with no leader pass running and no
-window in flight = a lost wake / leader-exit race in the conveyor's enqueue
-→ pass handoff (`src/meta/conveyor.zig`), under 128 outstanding 1 MiB
-buffered writes. Evidence: `wedge-seq-write-1m-buffered-20261010T1232Z/`
-(full `.stats`, daemon log with the watchdog's 880 overdue reports, every
-task's kernel stack, fio's stacks). Needs a red-first repro in the conveyor
-suite; the model check of the conveyor handoff should be revisited for the
-weakening this shape exercises. The row stays un-run.
+fio's threads in `request_wait_answer`; `invariant_tripwires 0`. Five to
+seven transactions enqueued on the conveyor (`meta_conveyor_queued` =
+`meta_commit_parked` = 5–7) with no leader pass running and no window in
+flight, every time = a lost wake / leader-exit race in the conveyor's enqueue
+→ pass handoff (`src/meta/conveyor.zig`). In the rand-4k occurrence the 5
+parked committers held their 4a inode guards, so 116 further writes parked on
+the lock behind them: `lock_ticked_reregisters` 109 536 (the 2 s ticked
+backstop re-registering forever — it self-heals a lost lock wake, not a
+holder that never returns) with the watchdog station `handler_entry`; in the
+buffered and tar occurrences the station is `meta_backend_start`.
+`meta_conveyor_park_tick_rescues` 0 in all five: the conveyor's own backstop
+never fires for this park. Evidence dirs:
+`wedge-seq-write-1m-buffered-20261010T1232Z/`, `wedge-rand-4k-write-leg3-20261010T1318Z/`,
+`wedge-seq-write-1m-buffered-leg4-20261010T1439Z/`, `wedge-io500-ior-easy-write-20261010T1711Z/`,
+plus `rand-4k-write-20261010T154534Z` leg 2's and `tar-x-20261010T163116Z`
+leg 4's `*.wedge.*` captures (full `.stats`, daemon logs with the watchdog's
+overdue reports and the wedge census, every task's kernel stack, the
+instrument's stacks). The harness now bounds every instrument at
+`2 × span + 120 s`, captures, kills the daemon and records the leg
+`daemon_wedged`. Needs a red-first repro in the conveyor suite; the
+conveyor-handoff model check should be re-run for the weakening this shape
+exercises (an enqueue that observes "leader running" while the leader is on
+its way out). Until it is fixed no sustained write row is VALID.
 
 F2. **EAGAIN on a blocking write(2)** (product). `seq-write-1m-direct`
 (libaio QD32 × 4) and `shim-seq-write-1m` on nvmet-tcp: fio aborts with
@@ -205,13 +348,20 @@ law caught it (72 % of ops through the ring). On the box: 32 processes ×
 2 sessions × 64 MiB = 4 GiB of arenas needs a ≥ 32 GiB budget, or the cap
 must derive from the population.
 
-F5. **The budget's unreclaimable floor** (sizing law). On this geometry
-(9 queues × 32 MiB kmbuf + payload arenas + per-lane read slabs + fiber
-stacks) `mem_budget_unreclaimable_bytes` ≈ 2.7 GiB: a 2 GiB budget runs Red
-from its first tick ("HARD BACKSTOP … Red sheds escalate to component
-floors"). The harness marks any leg not Green INVALID (`mem_budget_green`)
-and defaults to 6 GiB; the 4 GiB read dataset still took
-`seq-read-1m-buffered` to Yellow on its last leg (INVALID, recorded).
+F5. **The budget authority reads the whole container** (sizing law). R5's
+`pressure = max(Σ gauges, rss_max, unreclaim_max)` with `unreclaim` = the
+cgroup's `memory.stat` (anon + file_dirty + file_writeback + shmem +
+unevictable + slab_unreclaimable) ÷ the co-located-daemon share. The venue
+container is ONE root cgroup for three agents: its `anon` read 8.8 GB while
+this harness's daemon owned 1.3 GiB of gauges (fiber stacks 0.7 GiB, kmbuf
+0.3, zc bounce 0.3) — so legs went Yellow/Red at a 7 GiB budget on the
+neighbours' zig builds and daemons (and a 2 GiB budget sat Red from the first
+tick behind the daemon's own ≈ 2.7 GiB `unreclaimable` floor: 9 queues ×
+32 MiB kmbuf rings + arenas + slabs + stacks). Red is a real posture change
+(sheds, parked caps halve, disk-tier publishes pause), so the harness marks
+any non-Green leg INVALID (`mem_budget_green`, with the top components in
+the detail) — 7 rows here carry at least one such leg. On the box (own
+cgroup, memory-backed targets) the arm reads the daemon alone.
 
 F6. **`journal_lane_park_tick_rescues` under write saturation** (product,
 must-stay-≈0). 6–186 per 60 s leg on every saturated write row
@@ -257,8 +407,33 @@ backend likewise on the target side. The venue has no device-true read path;
 substrate's cache.
 
 F13. Other agents' `pkill -9 -x squeezefs` sweeps kill this harness's daemons
-and its CLI teardown verbs at random; the harness survives it (dead leg
-INVALID, lazy-detach, residue sweep) but a shared venue cannot be a quiet one.
+and its CLI teardown verbs at random, and a rebuild of `zig-out-linux/`
+under a running matrix swapped the binary AND the shim mid-row (the shim then
+refused to pair: `ipc_sessions_total 0`, four rows INVALID for the wrong
+reason — the first pass's records were discarded). The harness now snapshots
+the binaries into its scratch (sha256 recorded) and measured the
+`.wt-brackets` worktree build of `ce0edf4`; it survives a kill (dead leg
+INVALID, lazy-detach, residue sweep) — but a shared venue cannot be a quiet
+one.
+
+F14. **The W1 patch shape writes ≈ 0.74 × user bytes to the METADATA
+device** (`rand-4k-write` on nvmet-loop, the namespaces' diskstats: data
+1.00–1.04 ×, meta 0.73–0.75 ×; `wareq-sz` 4 096–4 279 B on data): every
+4 KiB patch is one journal transaction, and the sector-pad law frames each
+conveyor window as a 4 KiB-aligned run. At the box's 727 k IOPS bar that is
+≈ 2.2 GB/s into the metadata namespace — a term the bar's substrate (five
+memory-backed targets) must carry and the record now shows per namespace.
+
+F15. `read_dest_lease_bytes` is the dest-lease mechanism's gauge over the
+same bytes `read_dest_dma_bytes` lands (1:1 on the shim read row); summing
+both reads the copy ledger at ×2.0. Reported beside, not summed (the shim's
+`ipc_bytes_out` likewise: the handoff DMAs into the arena through the data
+plane's arm).
+
+F16. Metadata rows cost ≈ 1.01 journal entries per create and 5.21 per
+`tar` entry (create, write, the setattr pair, the parent's Δtime); the
+fsync phase ledger is dominated by the two device barriers (data 824 µs +
+meta 517 µs of 1 343 µs on nvmet-loop over a file backend).
 
 ## 5. Gaps — what cannot be measured here and what the box run needs
 
@@ -282,7 +457,10 @@ INVALID, lazy-detach, residue sweep) but a shared venue cannot be a quiet one.
 - **io500** ran the bounded `io500-scoping.ini` (60 s stonewall, capped
   sizes — never submittable); the box runs `config-minimal.ini` unmodified.
 - **A-B with A ≠ B**: every row here is A = B (the noise floor). The first
-  real A/B is the fix for F1/F2 against HEAD, through this harness.
+  real A/B is the fix for F1/F2 against `ce0edf4`, through this harness.
+- **Noise**: 5–112 % bands on a venue whose load average ran 4–20 on 9 CPUs;
+  the one quiet row (`rand-4k-write` on `file`, 0.8 %) shows what the harness
+  resolves when nothing else runs.
 
 ## 6. Owed
 

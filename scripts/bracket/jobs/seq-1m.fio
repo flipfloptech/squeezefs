@@ -1,0 +1,24 @@
+; Sequential 1 MiB at QD ${IODEPTH} × ${NUMJOBS} jobs (charter §13: the GB/s bars).
+; Env: RW=write|read DIRECT=0|1 IOENGINE=libaio|psync DIRECTORY SIZE RUNTIME NUMJOBS IODEPTH.
+; `direct=0` is the hybrid-I/O variant: O_DIRECT is NOT an admission class (§6.3),
+; so both postures are rows of the same mechanism, not two mechanisms.
+[global]
+ioengine=${IOENGINE}
+direct=${DIRECT}
+bs=1M
+rw=${RW}
+iodepth=${IODEPTH}
+numjobs=${NUMJOBS}
+time_based=1
+runtime=${RUNTIME}
+directory=${DIRECTORY}
+filename_format=seq.$jobnum
+size=${SIZE}
+create_on_open=0
+file_append=0
+fallocate=none
+group_reporting=1
+randrepeat=0
+invalidate=1
+end_fsync=0
+[seq]

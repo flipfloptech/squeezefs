@@ -151,7 +151,26 @@ fix); mem budget Green.
   the span (`--duration`), quiet the box, or record the row as not yet
   judgeable.
 
-## 6. Where the records go
+## 6. What the harness does on its own (learned on the dev venue)
+
+- It **copies** both binaries and their shims into its scratch before the
+  first leg and records their sha256: a rebuild of the install prefix under a
+  running row cannot change what is measured (it did, once).
+- It **bounds** every instrument at `2 × span + 120 s`; an instrument that
+  outlives the bound is sitting on FUSE requests the daemon never answered:
+  the harness captures `.stats`, the daemon's and the instrument's kernel
+  stacks beside the leg, kills the daemon (its own child), records the leg
+  INVALID `daemon_wedged`, and remounts the same store for the next leg.
+- A daemon that dies for any other reason mid-leg (a crash, an external
+  kill) is recorded INVALID `daemon_alive`; an instrument that fails against
+  a live mount (EAGAIN/EIO) is recorded INVALID `instrument_ok` with the
+  daemon's `answered EAGAIN` count; a leg whose daemon ran Yellow/Red is
+  INVALID `mem_budget_green` with the top R5 components in the detail.
+- Teardown is by manifest plus a pid-tagged residue sweep (`nvmeof adopt` +
+  `unshare` for anything the manifest missed); a stale FUSE mount under a dead
+  daemon is lazy-detached.
+
+## 7. Where the records go
 
 `bench/brackets/<venue-id>/` in this repository; the evidence note of the
 rung that produced them (`docs/evidence/rung-09-brackets.md` for the first

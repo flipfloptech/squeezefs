@@ -1,0 +1,147 @@
+{
+  "schema": 1,
+  "label": "scoping-venue",
+  "venue": {
+    "id": "7.2.6-sqz__arm-impl0x61-part0x000-9c__file-ext4",
+    "kernel": "7.2.6-sqz",
+    "cpu": "arm-impl0x61-part0x000-9c",
+    "disk_class": "file-ext4"
+  },
+  "instrument": {
+    "train": "0.1.0",
+    "commit": "966105390f14-dirty",
+    "profile": "gate"
+  },
+  "substrate": "file",
+  "shape": {
+    "threads": 2,
+    "files": 1,
+    "size": 268435456,
+    "iterations": 2,
+    "time_box_s": 5
+  },
+  "runs": 3,
+  "unix_time": 1791641801,
+  "groups": [
+    {
+      "ops_per_s": {
+        "mean": 1055.3041269748785,
+        "sigma": 96.65057892754591
+      },
+      "p50_ns": {
+        "mean": 2048000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 27306666.666666668,
+        "sigma": 9459306.81040283
+      },
+      "bytes": 1073741824,
+      "admission_bytes": 1073741824,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 5337.261359380299,
+        "sigma": 597.3970107660184
+      },
+      "p50_ns": {
+        "mean": 512000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 1024000,
+        "sigma": 0
+      },
+      "bytes": 1073741824,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 9858.623467291314,
+        "sigma": 700.2183149405492
+      },
+      "p50_ns": {
+        "mean": 256000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 512000,
+        "sigma": 0
+      },
+      "bytes": 432046080,
+      "admission_bytes": 0,
+      "terminal_frees": 256,
+      "reclaim_queued": 256,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 3231.7593769957493,
+        "sigma": 143.4097009573602
+      },
+      "p50_ns": {
+        "mean": 1024000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 4096000,
+        "sigma": 0
+      },
+      "bytes": 138211328,
+      "admission_bytes": 138211328,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 3302.137044969133,
+        "sigma": 457.35309227670035
+      },
+      "p50_ns": {
+        "mean": 512000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 682666.6666666666,
+        "sigma": 295603.3378250884
+      },
+      "bytes": 0,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 2486.7677540607406,
+        "sigma": 89.85695895796728
+      },
+      "p50_ns": {
+        "mean": 1024000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 1024000,
+        "sigma": 0
+      },
+      "bytes": 0,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    }
+  ]
+}

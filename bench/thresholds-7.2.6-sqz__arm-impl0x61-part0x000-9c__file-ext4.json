@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "venue_id": "7.2.6-sqz__arm-impl0x61-part0x000-9c__file-ext4",
+  "law": "max(3 sigma, 5 % of the mean) per group, from the baseline's runs",
+  "groups": [
+    {
+      "ops_per_s_drop_max": 289.95173678263774,
+      "p99_ns_rise_max": 28377920.431208488
+    },
+    {
+      "ops_per_s_drop_max": 1792.1910322980552,
+      "p99_ns_rise_max": 51200
+    },
+    {
+      "ops_per_s_drop_max": 2100.654944821648,
+      "p99_ns_rise_max": 25600
+    },
+    {
+      "ops_per_s_drop_max": 430.2291028720806,
+      "p99_ns_rise_max": 204800
+    },
+    {
+      "ops_per_s_drop_max": 1372.059276830101,
+      "p99_ns_rise_max": 886810.0134752652
+    },
+    {
+      "ops_per_s_drop_max": 269.57087687390185,
+      "p99_ns_rise_max": 51200
+    }
+  ]
+}

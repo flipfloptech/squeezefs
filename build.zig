@@ -58,6 +58,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The bench baseline rig's two resolved paths (`cli/bench_baseline_rig.zig`):
+    // the install prefix (the binary it drives) and the repo's bench/ dir.
+    // Untracked: strings, no step dependency, so the library never cycles on
+    // the binary it is part of.
+    const bench_options = b.addOptions();
+    bench_options.addOptionPathUntracked("install_prefix", .{ .relative = .{ .base = .install_prefix } });
+    bench_options.addOptionPathUntracked("bench_dir", b.path("bench"));
+    squeezefs_mod.addImport("bench_options", bench_options.createModule());
 
     // ---- vendored zstd (vendor/zstd/VERSION; decision 0002 row 118):
     //      the single-file amalgamation compiled into the library for
@@ -171,6 +179,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // The gate steps are declared here so the steps below can hang off them;
+    // their dependencies are wired where each piece lands.
+    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + sdk-smoke (the per-commit gate)");
+    const gate_release_step = b.step("gate-release", "gate + bench-compare against the committed baseline (run with -Drelease-gate=true: skips fail)");
+
     // ---- static rails: source-scanning convention tests (charter §11) ----
     const rails_tests = b.addTest(.{
         .name = "squeezefs-rails",
@@ -243,6 +256,39 @@ pub fn build(b: *std.Build) void {
     run_bench_smoke.step.dependOn(&run_smoke_tests.step);
     const bench_smoke_step = b.step("bench-smoke", "Run `squeezefs bench --smoke` against a mount the step creates (one iteration of every workload)");
     bench_smoke_step.dependOn(&run_bench_smoke.step);
+
+    // ---- the microbench baseline (charter §11 "a committed microbench
+    //      baseline with per-group regression thresholds"): the rig is its
+    //      own test root fed the binary and the repo's bench/ dir as resolved
+    //      paths; `bench-baseline` records, `bench-compare` judges (part of
+    //      gate-release, never of the per-commit gate) ----
+    const bench_baseline_step = b.step("bench-baseline", "Record the microbench baseline + thresholds for THIS venue into bench/ (3 runs; Linux, root)");
+    const bench_compare_step = b.step("bench-compare", "Judge one microbench run against bench/'s committed baseline for THIS venue (gate-release)");
+    if (target.result.os.tag == .linux) {
+        // The rig drives the INSTALLED binary (`<prefix>/bin/squeezefs`): the
+        // prefix and the repo's bench/ dir reach it through `bench_options`
+        // (untracked paths: no step the library could cycle on).
+        const record = b.addTest(.{ .name = "squeezefs-bench-baseline", .root_module = squeezefs_mod, .filters = &.{"bench baseline:"} });
+        const run_record = gated(b.addRunArtifact(record), release_gate);
+        run_record.has_side_effects = true;
+        run_record.step.dependOn(b.getInstallStep());
+        bench_baseline_step.dependOn(&run_record.step);
+        const compare = b.addTest(.{ .name = "squeezefs-bench-compare", .root_module = squeezefs_mod, .filters = &.{"bench compare:"} });
+        const run_compare = gated(b.addRunArtifact(compare), release_gate);
+        run_compare.has_side_effects = true;
+        run_compare.step.dependOn(b.getInstallStep());
+        bench_compare_step.dependOn(&run_compare.step);
+        // In the release gate the judge runs AFTER the whole per-commit gate:
+        // its numbers never share the venue with a smoke's mounts.
+        const run_compare_after_gate = gated(b.addRunArtifact(compare), release_gate);
+        run_compare_after_gate.has_side_effects = true;
+        run_compare_after_gate.step.dependOn(gate_step);
+        run_compare_after_gate.step.dependOn(b.getInstallStep());
+        gate_release_step.dependOn(&run_compare_after_gate.step);
+    } else {
+        bench_baseline_step.dependOn(&b.addFail("the bench baseline is Linux-only (charter §1.2): record it on the venue").step);
+        bench_compare_step.dependOn(&b.addFail("the bench compare is Linux-only (charter §1.2): run it on the venue").step);
+    }
 
     // ---- the shim smoke (Linux): the LD_PRELOAD battery with the staged
     //      .so beside the binary under test; after the bench smoke (one
@@ -317,7 +363,6 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&fmt.step);
 
     // ---- the per-commit gate ----
-    const gate_step = b.step("gate", "fmt + unit tests + rails + smoke + bench-smoke + sdk-smoke (the per-commit gate)");
     gate_step.dependOn(fmt_step);
     gate_step.dependOn(test_step);
     gate_step.dependOn(rails_step);
@@ -325,6 +370,12 @@ pub fn build(b: *std.Build) void {
     gate_step.dependOn(bench_smoke_step);
     gate_step.dependOn(shim_smoke_step);
     gate_step.dependOn(nvmet_smoke_step);
+
+    // ---- the release gate (charter §11): the per-commit gate plus the
+    //      microbench compare against the committed baseline (wired above,
+    //      after the gate); run with `-Drelease-gate=true` so environment
+    //      skips fail ----
+    gate_release_step.dependOn(gate_step);
 
     // ---- @anchor:sdk_build — the native SDK: libsqueezefs_sdk.{a,so} + the
     //      header + the C smoke (charter §7, §12; il_sdk §10.2–10.3) ----

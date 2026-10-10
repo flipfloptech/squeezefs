@@ -30,7 +30,10 @@ const meta_len: u64 = 256 << 20;
 const data_len: u64 = 64 << 20;
 const ready_wait_ns: u64 = 60 * std.time.ns_per_s;
 
-const Rig = struct {
+/// The bench rig: a format, a mount, the binary as a child; shared with
+/// the baseline rig (`bench_baseline_rig.zig`), which stages its own binary
+/// path through `init2`.
+pub const Rig = struct {
     gpa: std.mem.Allocator,
     io: Io,
     bin: [:0]u8,
@@ -45,21 +48,29 @@ const Rig = struct {
     env: std.process.Environ.Map,
 
     fn init(gpa: std.mem.Allocator, io: Io) !*Rig {
+        var cwd_buf: [linux.PATH_MAX]u8 = undefined;
+        const n = Io.Dir.cwd().realPath(io, &cwd_buf) catch return error.NoCwd;
+        const bin = try std.fmt.allocPrint(gpa, "{s}/squeezefs", .{cwd_buf[0..n]});
+        defer gpa.free(bin);
+        return init2(gpa, io, bin, "bench-smoke", "bench-mnt");
+    }
+
+    /// `bin` is the binary under test; `work_stem`/`mp_stem` name the
+    /// per-pid work dir and mountpoint under /build/tmp.
+    pub fn init2(gpa: std.mem.Allocator, io: Io, bin: []const u8, work_stem: []const u8, mp_stem: []const u8) !*Rig {
         const self = try gpa.create(Rig);
         errdefer gpa.destroy(self);
         const pid = linux.getpid();
         _ = linux.mkdir("/build/tmp", 0o755);
-        var cwd_buf: [linux.PATH_MAX]u8 = undefined;
-        const n = Io.Dir.cwd().realPath(io, &cwd_buf) catch return error.NoCwd;
         self.* = .{
             .gpa = gpa,
             .io = io,
-            .bin = try std.fmt.allocPrintSentinel(gpa, "{s}/squeezefs", .{cwd_buf[0..n]}, 0),
-            .work = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/bench-smoke-{d}", .{pid}, 0),
-            .mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/bench-mnt-{d}", .{pid}, 0),
-            .meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///build/tmp/bench-smoke-{d}/vol.img", .{pid}),
-            .data_uri = try std.fmt.allocPrint(gpa, "sqdata:///build/tmp/bench-smoke-{d}/d0.img,/build/tmp/bench-smoke-{d}/d1.img", .{ pid, pid }),
-            .log_path = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/bench-smoke-{d}/daemon.log", .{pid}, 0),
+            .bin = try std.fmt.allocPrintSentinel(gpa, "{s}", .{bin}, 0),
+            .work = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/{s}-{d}", .{ work_stem, pid }, 0),
+            .mp = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/{s}-{d}", .{ mp_stem, pid }, 0),
+            .meta_uri = try std.fmt.allocPrint(gpa, "sqmeta:///build/tmp/{s}-{d}/vol.img", .{ work_stem, pid }),
+            .data_uri = try std.fmt.allocPrint(gpa, "sqdata:///build/tmp/{s}-{d}/d0.img,/build/tmp/{s}-{d}/d1.img", .{ work_stem, pid, work_stem, pid }),
+            .log_path = try std.fmt.allocPrintSentinel(gpa, "/build/tmp/{s}-{d}/daemon.log", .{ work_stem, pid }, 0),
             .env = std.process.Environ.Map.init(gpa),
         };
         try self.env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -68,7 +79,7 @@ const Rig = struct {
         return self;
     }
 
-    fn deinit(self: *Rig) void {
+    pub fn deinit(self: *Rig) void {
         if (self.child) |*c| {
             _ = linux.kill(self.child_pid, .KILL);
             _ = c.wait(self.io) catch {};
@@ -87,7 +98,7 @@ const Rig = struct {
         self.gpa.destroy(self);
     }
 
-    fn sparse(self: *Rig, name: []const u8, len: u64) !void {
+    pub fn sparse(self: *Rig, name: []const u8, len: u64) !void {
         var buf: [linux.PATH_MAX]u8 = undefined;
         const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.work, name });
         const f = try Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
@@ -95,18 +106,18 @@ const Rig = struct {
         try f.setLength(self.io, len);
     }
 
-    fn squeezefs(self: *Rig, a: []const []const u8) !std.process.RunResult {
+    pub fn squeezefs(self: *Rig, a: []const []const u8) !std.process.RunResult {
         var argv: [16][]const u8 = undefined;
         argv[0] = self.bin;
         for (a, 0..) |x, i| argv[i + 1] = x;
         return std.process.run(self.gpa, self.io, .{ .argv = argv[0 .. a.len + 1], .environ_map = &self.env });
     }
 
-    fn readLog(self: *Rig) ![]u8 {
+    pub fn readLog(self: *Rig) ![]u8 {
         return Io.Dir.cwd().readFileAlloc(self.io, self.log_path, self.gpa, .limited(16 << 20));
     }
 
-    fn awaitLog(self: *Rig, needle: []const u8) !void {
+    pub fn awaitLog(self: *Rig, needle: []const u8) !void {
         const deadline = clock.monotonicNs() + ready_wait_ns;
         while (true) {
             const text = try self.readLog();
@@ -121,14 +132,14 @@ const Rig = struct {
         }
     }
 
-    fn spawnMount(self: *Rig) !void {
+    pub fn spawnMount(self: *Rig) !void {
         self.log_file = try Io.Dir.cwd().createFile(self.io, self.log_path, .{ .truncate = false });
         self.child = try std.process.spawn(self.io, .{ .argv = &.{ self.bin, "mount", self.meta_uri, self.mp }, .environ_map = &self.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
         self.child_pid = self.child.?.id.?;
         try self.awaitLog("ready: ");
     }
 
-    fn umount(self: *Rig) !void {
+    pub fn umount(self: *Rig) !void {
         const r = try self.squeezefs(&.{ "umount", self.mp });
         defer self.gpa.free(r.stdout);
         defer self.gpa.free(r.stderr);

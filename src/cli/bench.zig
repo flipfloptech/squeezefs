@@ -101,9 +101,12 @@ pub const Shape = struct {
         return blockCount(self.size, self.block);
     }
 
-    pub fn expectedOps(self: Shape, phase: Phase) u64 {
-        return switch (phase) {
-            .write, .read => @as(u64, self.threads) * self.files * self.blocksPerFile(),
+    /// A pass covers the file at ITS block (the suite's rand passes run at
+    /// 4 KiB over a 1 MiB-block shape): full coverage is `size / pass.block`
+    /// blocks per file, never the shape's block count.
+    pub fn expectedOps(self: Shape, pass: Pass) u64 {
+        return switch (pass.phase) {
+            .write, .read => @as(u64, self.threads) * self.files * blockCount(self.size, pass.block),
             .stat, .del => @as(u64, self.threads) * self.files,
         };
     }
@@ -547,7 +550,7 @@ pub const engine = if (is_linux) struct {
         }
 
         fn run(self: *Worker) error{ OutOfMemory, Io }!void {
-            const nblocks = self.shape.blocksPerFile();
+            const nblocks = blockCount(self.shape.size, self.pass.block);
             var order: []u64 = &.{};
             var buf: []align(4096) u8 = &.{};
             if (self.pass.moveBytes()) {
@@ -729,7 +732,7 @@ pub const engine = if (is_linux) struct {
         }
         for (threads) |t| t.join();
         const elapsed = clock.monotonicNs() -| t0;
-        var row: Row = .{ .pass = pass, .shape = shape, .iteration = iteration, .ops = 0, .bytes = 0, .elapsed_ns = elapsed, .expected_ops = shape.expectedOps(pass.phase), .boxed_out = false, .lat = .{}, .stats = .{} };
+        var row: Row = .{ .pass = pass, .shape = shape, .iteration = iteration, .ops = 0, .bytes = 0, .elapsed_ns = elapsed, .expected_ops = shape.expectedOps(pass), .boxed_out = false, .lat = .{}, .stats = .{} };
         for (workers) |*w| {
             if (w.failed) |e| {
                 p.stderr.print("squeezefs bench: worker {d} failed ({t}) in pass {s}\n", .{ w.tid, e, @tagName(pass.phase) }) catch {};
@@ -871,6 +874,15 @@ test "auto shape: threads clamp to [1, 16]; total = max(16 GiB, 2 GiB × threads
     try testing.expectEqual(((16 << 30) / 21 / SIZE_ROUND) * SIZE_ROUND, h.size);
     try testing.expectEqual(SMOKE_THREADS, smokeShape(4096).threads);
     try testing.expect(smokeShape(4096).totalBytes() <= 16 << 20);
+}
+
+test "a pass's coverage is the file at the PASS's block: the suite's rand 4 KiB passes over a 1 MiB-block shape expect size/4096 ops per file, not the shape's 1 MiB count (the earlier fold touched 1/256 of the file)" {
+    const shape: Shape = .{ .threads = 2, .files = 1, .size = 2 << 30, .block = 1 << 20 };
+    const suite = suitePasses(null);
+    try testing.expectEqual(@as(u64, 2 * 2048), shape.expectedOps(suite[0]));
+    try testing.expectEqual(@as(u64, 2 * 524288), shape.expectedOps(suite[2]));
+    try testing.expectEqual(@as(u64, 2 * 524288), shape.expectedOps(suite[3]));
+    try testing.expectEqual(@as(u64, 2), shape.expectedOps(suite[4]));
 }
 
 test "shape validation: zero terms refuse; --direct needs a 4 KiB-multiple block and a block-multiple size" {

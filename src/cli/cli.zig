@@ -43,11 +43,17 @@ pub const defrag_verb = if (is_linux) @import("defrag.zig") else struct {};
 /// Portable planning + a Linux engine (its own gate inside).
 pub const tune = @import("tune.zig");
 pub const bench = @import("bench.zig");
+/// The committed microbench baseline's pure half (folding, thresholds,
+/// verdict, codecs); the rig is `bench_baseline_rig.zig`.
+pub const bench_baseline = @import("bench_baseline.zig");
 /// The rung-8 operations verbs live under `src/ops/` (Linux: the kernel
 /// nvmet target + the initiator; portable: the key store's contracts).
 pub const nvmet = if (is_linux) @import("../ops/nvmet.zig") else struct {};
 pub const keys = @import("../ops/keys.zig");
 pub const bench_smoke = if (is_linux) @import("bench_smoke.zig") else struct {};
+/// The baseline rig (`zig build bench-baseline` / `bench-compare`; its
+/// tests are filtered steps, like the smoke's).
+pub const bench_baseline_rig = if (is_linux) @import("bench_baseline_rig.zig") else struct {};
 
 /// Exit codes (charter §8; `sysexits`-free, three outcomes): 0 success,
 /// 1 a refused or failed verb (the reason on stderr), 2 a usage error.
@@ -137,6 +143,7 @@ test {
     _ = supervisor;
     _ = tune;
     _ = bench;
+    _ = bench_baseline;
     _ = fsck_verb;
     if (is_linux) {
         _ = format;
@@ -159,6 +166,7 @@ test {
         _ = job;
         _ = defrag_verb;
         _ = bench_smoke;
+        _ = bench_baseline_rig;
     }
 }
 

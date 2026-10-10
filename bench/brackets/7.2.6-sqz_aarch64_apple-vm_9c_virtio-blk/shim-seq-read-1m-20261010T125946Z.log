@@ -1,0 +1,28 @@
+12:59:46 bracket[shim-seq-read-1m]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/Users/joberdorf/Source/squeezefs-zig/zig-out-linux/bin/squeezefs", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (ce0edf4f004d, gate profile, zig 0.17.0)", "binary": "/Users/joberdorf/Source/squeezefs-zig/zig-out-linux/bin/squeezefs", "train": "0.1.0", "commit": "ce0edf4f004d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-tcp; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/brk-370212
+12:59:46 bracket[shim-seq-read-1m]: substrate: nvmet-tcp on 127.0.0.1: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+12:59:46 bracket[shim-seq-read-1m]: format set 0 (symmetric): sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+12:59:46 bracket[shim-seq-read-1m]: leg 1 arm A: /Users/joberdorf/Source/squeezefs-zig/zig-out-linux/bin/squeezefs (set 0, symmetric) -o 'interception'
+12:59:47 bracket[shim-seq-read-1m]: mounted /build/brk-370212/mnt (daemon pid 370332)
+12:59:47 bracket[shim-seq-read-1m]: leg 1: preparing the aging store's dataset (once per set)
+12:59:57 bracket[shim-seq-read-1m]: leg 1: warm-up 10s (excluded)
+13:00:08 bracket[shim-seq-read-1m]: leg 1: measured span 60s
+13:01:09 bracket[shim-seq-read-1m]: leg 1: MiB/s 3852.1 valid
+13:01:11 bracket[shim-seq-read-1m]: leg 1: daemon log has 1 error( line(s)
+13:01:11 bracket[shim-seq-read-1m]: leg 2 arm B: /Users/joberdorf/Source/squeezefs-zig/zig-out-linux/bin/squeezefs (set 0, symmetric) -o 'interception'
+13:01:12 bracket[shim-seq-read-1m]: mounted /build/brk-370212/mnt (daemon pid 371224)
+13:01:12 bracket[shim-seq-read-1m]: leg 2: warm-up 10s (excluded)
+13:01:23 bracket[shim-seq-read-1m]: leg 2: measured span 60s
+13:02:24 bracket[shim-seq-read-1m]: leg 2: MiB/s 3861.6 valid
+13:02:26 bracket[shim-seq-read-1m]: leg 2: daemon log has 1 error( line(s)
+13:02:26 bracket[shim-seq-read-1m]: leg 3 arm B: /Users/joberdorf/Source/squeezefs-zig/zig-out-linux/bin/squeezefs (set 0, symmetric) -o 'interception'
+13:02:27 bracket[shim-seq-read-1m]: mounted /build/brk-370212/mnt (daemon pid 372044)
+13:02:27 bracket[shim-seq-read-1m]: leg 3: warm-up 10s (excluded)
+13:02:38 bracket[shim-seq-read-1m]: leg 3: measured span 60s
+13:03:39 bracket[shim-seq-read-1m]: leg 3: MiB/s 4593.4 valid
+13:03:41 bracket[shim-seq-read-1m]: leg 3: daemon log has 1 error( line(s)
+13:03:41 bracket[shim-seq-read-1m]: leg 4 arm A: /Users/joberdorf/Source/squeezefs-zig/zig-out-linux/bin/squeezefs (set 0, symmetric) -o 'interception'
+13:03:42 bracket[shim-seq-read-1m]: mounted /build/brk-370212/mnt (daemon pid 372794)
+13:03:42 bracket[shim-seq-read-1m]: leg 4: warm-up 10s (excluded)
+13:03:53 bracket[shim-seq-read-1m]: leg 4: measured span 60s
+13:04:54 bracket[shim-seq-read-1m]: leg 4: MiB/s 3854.9 valid
+13:04:56 bracket[shim-seq-read-1m]: leg 4: daemon log has 1 error( line(s)

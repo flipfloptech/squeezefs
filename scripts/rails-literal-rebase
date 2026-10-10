@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Rebase the literal rail's allowlist across LINE SHIFTS — never across new literals.
+
+The rail (`tests/rails.zig`, law in `src/gates/literals.zig`) keys its rows by
+`path:line | literal`, so an edit above a row makes it STALE (no violation at
+that line) and the same literal reappears UNLISTED at its new line. This tool
+reads the rail's output and moves each stale row onto an unlisted violation
+with the SAME path and the SAME literal (the nearest line), keeping the row's
+reason. An unlisted violation with no stale twin stays unlisted — a new
+literal still has to be derived, documented, or added by hand with a reason —
+and a stale row with no twin is deleted: the list only shrinks.
+
+    zig build rails 2>&1 | scripts/rails-literal-rebase
+
+Then re-run `zig build rails`.
+"""
+import re
+import sys
+
+ALLOWLIST = "tests/rails/literal-allowlist.txt"
+
+unlisted = []  # (path, line, literal)
+stale = []  # (path, line, literal)
+for raw in sys.stdin:
+    line = raw.strip()
+    m = re.match(r"^(src/\S+):(\d+) \| (\S+) \| <derive it", line)
+    if m:
+        unlisted.append((m.group(1), int(m.group(2)), m.group(3)))
+        continue
+    m = re.search(r"stale row `(src/\S+):(\d+) \| (\S+)` matches no violation", line)
+    if m:
+        stale.append((m.group(1), int(m.group(2)), m.group(3)))
+
+rows = open(ALLOWLIST).read().split("\n")
+header = [r for r in rows if r.startswith("#")]
+entries = []
+for r in rows:
+    if not r.strip() or r.startswith("#"):
+        continue
+    loc, lit, reason = r.split(" | ", 2)
+    path, ln = loc.rsplit(":", 1)
+    entries.append([path, int(ln), lit, reason])
+
+moved = deleted = 0
+free = list(unlisted)
+for s_path, s_line, s_lit in stale:
+    twins = [u for u in free if u[0] == s_path and u[2] == s_lit]
+    for e in entries:
+        if e[0] == s_path and e[1] == s_line and e[2] == s_lit:
+            if twins:
+                twin = min(twins, key=lambda u: abs(u[1] - s_line))
+                free.remove(twin)
+                e[1] = twin[1]
+                moved += 1
+            else:
+                e[1] = -1
+                deleted += 1
+            break
+
+entries = [e for e in entries if e[1] != -1]
+entries.sort(key=lambda e: (e[0], e[1], e[2]))
+with open(ALLOWLIST, "w") as f:
+    f.write("\n".join(header) + "\n")
+    for path, ln, lit, reason in entries:
+        f.write(f"{path}:{ln} | {lit} | {reason}\n")
+print(f"rebased {moved} row(s), deleted {deleted} stale row(s); {len(free)} unlisted violation(s) remain (derive, document, or add by hand)", file=sys.stderr)

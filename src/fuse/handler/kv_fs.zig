@@ -1390,11 +1390,56 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The destroy rider (charter §5.6): every corpse's inode + xattr
         /// Deletes and its reference releases in ONE entry, members packed
-        /// greedily under the whole-entry cap; a striped corpse's write-side
-        /// custody is dropped first; the blocks go to the reclaimer AFTER
-        /// each commit (RES-1).
+        /// greedily under the whole-entry cap; the blocks go to the
+        /// reclaimer AFTER the commit (RES-1).
+        ///
+        /// The order is the contract. (1) A striped corpse's write-side
+        /// custody SETTLES first, with no lock held: the flush's own merge
+        /// republishes the layout onto the blocks it uploaded and frees the
+        /// ones it displaced. (2) THEN every corpse's (3.7) layout lock,
+        /// held across the plan read AND the destroy commit, so the plan
+        /// names exactly the bindings the record carries at the commit
+        /// (the plane's promotion of a staged corpse takes the same lock).
+        /// A plan read BEFORE the settle named the displaced block — freed
+        /// twice — and never the fresh one: its `+ref` stayed durable
+        /// forever (fstests generic/013: fsstress write+truncate+unlink,
+        /// fsck C2/C8 "durable 1 vs derived 0", block_untracked_free_
+        /// refusals). The striped mutexes are not reentrant and two batches
+        /// may share a stripe: the locks are taken in ONE order (ascending
+        /// stripe, each once) — the multi-lock holder's order rule.
         fn destroyCorpses(self: *Self, c: *Ctx, corpses: []const u64) Error!void {
             const gpa = self.gpa;
+            assert(corpses.len <= RECLAIM_BATCH);
+            // (1) The nlink re-check (a forget of a live inode never reached
+            // the gather) and the settle.
+            var live: [RECLAIM_BATCH]u64 = undefined;
+            var n_live: usize = 0;
+            for (corpses) |ino| {
+                const v = (try self.readInodeOpt(ino)) orelse continue;
+                if (v.nlink != 0) continue;
+                const rec = try self.readLayout(ino);
+                const kind = kindOf(rec);
+                self.freeLayout(rec);
+                self.settleCustody(ino, kind);
+                live[n_live] = ino;
+                n_live += 1;
+            }
+            if (n_live == 0) return;
+            // (2) The locks, ascending stripe, each stripe once.
+            std.mem.sort(u64, live[0..n_live], {}, struct {
+                fn lessThan(_: void, a: u64, b: u64) bool {
+                    return layout.LayoutLocks.stripeOf(a) < layout.LayoutLocks.stripeOf(b);
+                }
+            }.lessThan);
+            var guards: [RECLAIM_BATCH]Data.LayoutGuard = undefined;
+            var n_guards: usize = 0;
+            defer for (guards[0..n_guards]) |g| g.release(self.io);
+            for (live[0..n_live], 0..) |ino, i| {
+                if (i > 0 and layout.LayoutLocks.stripeOf(live[i - 1]) == layout.LayoutLocks.stripeOf(ino)) continue;
+                guards[n_guards] = self.data.lockLayout(self.io, ino);
+                n_guards += 1;
+            }
+            // (3) The plans, from the records as they stand under the locks.
             var plans: std.ArrayList(Corpse) = .empty;
             defer {
                 for (plans.items) |*p| tree.deinitKeyValues(gpa, &p.kvs);
@@ -1402,11 +1447,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             var payloads: std.ArrayList(u64) = .empty;
             defer payloads.deinit(gpa);
-            for (corpses) |ino| {
-                // Re-check: a corpse is nlink 0 (a forget of a live inode
-                // never reached the gather).
+            var sweeps: std.ArrayList(struct { ino: u64, removed: u64 }) = .empty;
+            defer sweeps.deinit(gpa);
+            for (live[0..n_live]) |ino| {
                 const v = (try self.readInodeOpt(ino)) orelse continue;
-                if (v.nlink != 0) continue;
                 var p: Corpse = .{ .ino = ino };
                 {
                     errdefer tree.deinitKeyValues(gpa, &p.kvs);
@@ -1421,12 +1465,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                             layout_record_corrupt.fire("a corpse's layout record failed the total codec");
                             continue;
                         };
-                        self.settleCustody(ino, l.kind);
                         if (l.isKvmap()) {
                             // A tree-mapped corpse: its own tx marks it
                             // (head {size 0, sweep 0}); the sweep's terminal
                             // chunk destroys the inode and its xattrs.
-                            try self.markKvmapCorpse(c, ino, l, v.size);
+                            try self.markKvmapCorpse(c, ino, l);
+                            try sweeps.append(gpa, .{ .ino = ino, .removed = (v.size + self.block_size - 1) / self.block_size });
                             tree_mapped = true;
                             break;
                         }
@@ -1444,22 +1488,39 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
                 payloads.appendAssumeCapacity(p.bytes);
             }
-            if (plans.items.len == 0) return;
-            const ranges = try inos.packDestroyEntries(gpa, payloads.items);
-            defer gpa.free(ranges);
-            for (ranges) |rg| {
-                // Every corpse's part is complete on its own member: a
-                // range is cut where the member changes (one entry per run).
-                var start = rg.start;
-                while (start < rg.end) {
-                    var end = start + 1;
-                    while (end < rg.end and !self.spansHomes(&.{ globalOf(plans.items[start].ino), globalOf(plans.items[end].ino) })) end += 1;
-                    try self.destroyRun(c, plans.items[start..end]);
-                    start = end;
+            // (4) The commits, under the locks.
+            if (plans.items.len != 0) {
+                const ranges = try inos.packDestroyEntries(gpa, payloads.items);
+                defer gpa.free(ranges);
+                for (ranges) |rg| {
+                    // Every corpse's part is complete on its own member: a
+                    // range is cut where the member changes (one entry per run).
+                    var start = rg.start;
+                    while (start < rg.end) {
+                        var end = start + 1;
+                        while (end < rg.end and !self.spansHomes(&.{ globalOf(plans.items[start].ino), globalOf(plans.items[end].ino) })) end += 1;
+                        try self.destroyRun(c, plans.items[start..end]);
+                        start = end;
+                    }
                 }
+            }
+            // (5) The locks drop; the frees, the ring releases and the
+            // sweep drains run after them (RES-1; the sweep takes (3.7)).
+            for (guards[0..n_guards]) |g| g.release(self.io);
+            n_guards = 0;
+            for (plans.items) |*p| {
+                self.afterCommit(&p.after);
+                fuse_reclaim_blocks_freed.add(@intCast(p.after.n));
+            }
+            for (sweeps.items) |sw| {
+                var after: AfterCommit = .{};
+                after.kvmap_sweep = .{ .ino = sw.ino, .removed = sw.removed };
+                self.afterCommit(&after);
             }
         }
 
+        /// ONE tx per run (under the caller's (3.7) locks); the frees are
+        /// the caller's, after its locks drop.
         fn destroyRun(self: *Self, c: *Ctx, run: []Corpse) Error!void {
             const t = try self.store.begin(@src());
             var t_owned = true;
@@ -1477,10 +1538,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             t_owned = false;
             try self.commit(c, t);
-            for (run) |*p| {
-                self.afterCommit(&p.after);
-                fuse_reclaim_blocks_freed.add(@intCast(p.after.n));
-            }
             fuse_reclaim_destroys.add(destroyed);
             self.destroys.noteCommitted(destroyed);
             fuse_reclaim_drains.inc();
@@ -1490,15 +1547,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// §4.3 "unlink corpse"): ONE tx with the head Put {size 0, sweep 0},
         /// judged off the durable head alone; the inode record stays (nlink
         /// 0, unreachable) until the sweep destroys it. Idempotent: a mount
-        /// sweep that meets an already-marked corpse only re-kicks the drain.
-        fn markKvmapCorpse(self: *Self, c: *Ctx, ino: u64, l: Layout, size: u64) Error!void {
+        /// sweep that meets an already-marked corpse only re-kicks the drain
+        /// (the caller's, after its locks drop). Under the CALLER's (3.7):
+        /// the head is re-read under it so the Put's `prev` is the record
+        /// the commit lands on (a sweep chunk or a crossing may have moved
+        /// it since the gather).
+        fn markKvmapCorpse(self: *Self, c: *Ctx, ino: u64, l: Layout) Error!void {
             const head = l.kvmapHead().?;
             if (!(head.sweep == 0 and l.size == 0)) {
-                // (3.7) across the mark: the head is re-read under it so the
-                // Put's `prev` is the record the commit lands on (a sweep
-                // chunk or a crossing may have moved it since the gather).
-                const layout_lock = self.data.lockLayout(self.io, ino);
-                defer layout_lock.release(self.io);
                 const fresh = try self.readLayout(ino);
                 defer self.freeLayout(fresh);
                 if (fresh) |cur| if (cur.layout.isKvmap() and !(cur.layout.kvmapHead().?.sweep == 0 and cur.layout.size == 0)) {
@@ -1511,9 +1567,6 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 };
             }
             _ = self.pending.retire(ino);
-            var after: AfterCommit = .{};
-            after.kvmap_sweep = .{ .ino = ino, .removed = (size + self.block_size - 1) / self.block_size };
-            self.afterCommit(&after);
             fuse_reclaim_destroys.inc();
             self.destroys.noteCommitted(1);
         }
@@ -2132,6 +2185,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const local = try localOf(a.ino);
             const len: u64 = if (a.held) |h| h.src.len else a.data.len;
             const end = std.math.add(u64, a.offset, len) catch return error.FileTooBig;
+            // (3.7) BEFORE the layout read, held across the arm's commit
+            // (module doc): the inline and staged arms and the striped
+            // promotion are layout-record RMWs — against the plane's own
+            // promotion of this ino under (3.5)+(3.7), which re-checks the
+            // staged identity but cannot see a write whose read→publish→
+            // commit interleaves with its own (fsstress -p 20: a staged
+            // write's publish overwrote the packed record, its tenant's
+            // +ref left durable — fsck C2/C3/C8 on every pack block). The
+            // striped arm's data I/O takes none: the plane's uploads take
+            // (3.7) themselves inside their (3.5).
+            var layout_lock: ?Data.LayoutGuard = self.data.lockLayout(self.io, local);
+            errdefer if (layout_lock) |g| g.release(self.io);
             const rec = try self.readLayout(local);
             defer self.freeLayout(rec);
             const kind = kindOf(rec);
@@ -2140,11 +2205,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     fuse_write_no_data_volume_refused.inc();
                     return error.FileTooBig;
                 }
-                return self.writeInline(c, local, a, rec, end);
+                return self.writeInline(c, local, a, rec, end, &layout_lock);
             }
-            if (kind == .inline_ and end <= self.inline_max) return self.writeInline(c, local, a, rec, end);
-            if (self.data.stagingOn() and kind != .striped and end <= self.block_size) return self.writeStaged(c, local, a, rec, end);
-            return self.writeStriped(c, local, a, rec, end);
+            if (kind == .inline_ and end <= self.inline_max) return self.writeInline(c, local, a, rec, end, &layout_lock);
+            if (self.data.stagingOn() and kind != .striped and end <= self.block_size) return self.writeStaged(c, local, a, rec, end, &layout_lock);
+            return self.writeStriped(c, local, a, rec, end, &layout_lock);
+        }
+
+        /// The (3.7) guard leaves right after its commit landed (before
+        /// `afterCommit`, whose synchronous sweep takes it again).
+        fn dropLayoutLock(self: *Self, lock: *?Data.LayoutGuard) void {
+            if (lock.*) |g| g.release(self.io);
+            lock.* = null;
         }
 
         /// The payload bytes in hand (a held slot extracted once).
@@ -2153,7 +2225,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return h.extract(h.ctx, self.io) catch return error.InputOutput;
         }
 
-        fn writeInline(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64) Error!filesystem.Written {
+        fn writeInline(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!filesystem.Written {
             const data = try self.payloadBytes(a);
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
@@ -2173,6 +2245,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try self.stageInodePostlude(t, local, &v, size, a.write_flags);
             t_owned = false;
             try self.commit(c, t);
+            self.dropLayoutLock(layout_lock);
             _ = self.pending.retire(local);
             self.data.noteShape(local, size, .inline_);
             fuse_write_inline.inc();
@@ -2183,7 +2256,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The staged arm: the whole payload image re-staged under the
         /// file's identity (a fresh one for an inline/packed file), the
         /// staged layout published; a displaced tenant freed after.
-        fn writeStaged(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64) Error!filesystem.Written {
+        fn writeStaged(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!filesystem.Written {
             const data = try self.payloadBytes(a);
             const probe = try self.readInode(local);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
@@ -2210,6 +2283,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 self.data.releaseStaged(k, generation);
                 return e;
             };
+            self.dropLayoutLock(layout_lock);
             _ = self.pending.retire(local);
             self.afterCommit(&after);
             self.data.noteShape(local, size, .staged);
@@ -2222,7 +2296,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// payload DMA'd to its own block, the striped layout naming it
         /// published — block I/O before the type flip), then the data
         /// plane's admission per piece, then the inode's size claim.
-        fn writeStriped(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64) Error!filesystem.Written {
+        fn writeStriped(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!filesystem.Written {
             if (end > self.maxFileSize()) {
                 fuse_write_u32_index_refused.inc();
                 return error.FileTooBig;
@@ -2230,7 +2304,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const probe = try self.readInode(local);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             var old_size = probe.size;
+            // The promotion's layout RMW runs under the (3.7) guard the
+            // write took; the data plane's own I/O below runs without it.
             if (kindOf(rec) != .striped) old_size = try self.promoteToStriped(c, local, rec, probe.size);
+            self.dropLayoutLock(layout_lock);
             const payload: write_admit.Payload = if (a.held) |h|
                 (if (self.data.canStoreHeld()) write_admit.Payload{ .slot = .{ .src = h.src, .class = if (h.class == .direct_gup) .odirect else .page_cache, .commit_retain = false, .ctx = h.ctx, .extract = h.extract } } else .{ .bytes = try self.payloadBytes(a) })
             else if (a.placed) |p|
@@ -2981,165 +3058,362 @@ const open_table = @import("open_table.zig");
 const Loopback = seam.Loopback;
 const LoopDispatcher = lifecycle.Dispatcher(Loopback);
 
-/// One mounted MemFs behind a dispatcher; every call is a real `dispatch`
-/// on slot 0 with a fresh unique, and the captured reply comes back.
-const Harness = struct {
-    store: MemStore,
-    nodata: NoData,
-    fs: MemFs,
-    lb: Loopback,
-    reg: watchdog.Registry,
-    guards: op_guard.Table,
-    opens: open_table.OpenTable,
-    d: LoopDispatcher,
-    unique: u64 = 2,
+/// One mounted `KvFs(MemStore, Data)` behind a dispatcher; every call is a
+/// real `dispatch` on slot 0 with a fresh unique, and the captured reply
+/// comes back. `Data` is the data face: `NoData` for the mini-suite, a
+/// recording double for the paths whose contract is what they tell the
+/// data plane.
+fn HarnessOf(comptime Data: type) type {
+    return struct {
+        const Self = @This();
+        pub const Fs = KvFs(MemStore, Data);
 
-    const slot = Loopback.slot(0);
-    const window_bytes = 8192;
+        store: MemStore,
+        data: Data,
+        fs: Fs,
+        lb: Loopback,
+        reg: watchdog.Registry,
+        guards: op_guard.Table,
+        opens: open_table.OpenTable,
+        d: LoopDispatcher,
+        unique: u64 = 2,
 
-    fn init(self: *Harness) !void {
-        self.store = try MemStore.init(testing.allocator);
-        self.nodata = .{};
-        self.fs = try MemFs.mount(testing.allocator, testing.io, &self.store, &self.nodata, .{ .dlm_stripes = 64 });
-        self.lb = try Loopback.init(testing.allocator, 1, window_bytes);
-        self.reg = try watchdog.Registry.init(testing.allocator, 1);
-        self.guards = try op_guard.Table.init(testing.allocator, 64);
-        self.opens = try open_table.OpenTable.init(testing.allocator, 64);
-        self.unique = 2;
-        self.d = LoopDispatcher.init(&self.lb, .{ .fs = filesystem.Filesystem.of(MemFs, &self.fs), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens });
-    }
+        const slot = Loopback.slot(0);
+        const window_bytes = 8192;
 
-    fn deinit(self: *Harness) void {
-        self.opens.deinit();
-        self.guards.deinit();
-        self.reg.deinit();
-        self.lb.deinit();
-        self.fs.unmount();
-        self.store.deinit();
-    }
-
-    fn call(self: *Harness, req: codec.Request, nodeid: u64) Loopback.Captured {
-        const u = self.unique;
-        self.unique += abi.FUSE_REQ_ID_STEP;
-        const before = self.lb.replyCount(slot);
-        self.d.dispatch(req, .{ .unique = u, .nodeid = nodeid, .uid = 1000, .gid = 1000, .pid = 7 }, slot, null);
-        std.debug.assert(self.lb.replyCount(slot) == before + 1);
-        const c = self.lb.captured(slot).?;
-        std.debug.assert(c.header.unique == u);
-        return c;
-    }
-
-    /// A no-reply op (FORGET/BATCH_FORGET/INTERRUPT).
-    fn fire(self: *Harness, req: codec.Request, nodeid: u64) void {
-        const before = self.lb.replyCount(slot);
-        self.d.dispatch(req, .{ .unique = self.unique, .nodeid = nodeid, .uid = 1000, .gid = 1000, .pid = 7 }, slot, null);
-        self.unique += abi.FUSE_REQ_ID_STEP;
-        std.debug.assert(self.lb.replyCount(slot) == before);
-    }
-
-    fn errnoOf(c: Loopback.Captured) ?linux.E {
-        return c.errno();
-    }
-
-    fn entry(self: *Harness, c: Loopback.Captured) !abi.fuse_entry_out {
-        _ = self;
-        if (c.errno()) |e| {
-            std.debug.print("expected an entry, got errno {t}\n", .{e});
-            return error.TestUnexpectedErrno;
+        fn init(self: *Self) !void {
+            self.store = try MemStore.init(testing.allocator);
+            self.data = .{};
+            self.fs = try Fs.mount(testing.allocator, testing.io, &self.store, &self.data, .{ .dlm_stripes = 64 });
+            self.lb = try Loopback.init(testing.allocator, 1, window_bytes);
+            self.reg = try watchdog.Registry.init(testing.allocator, 1);
+            self.guards = try op_guard.Table.init(testing.allocator, 64);
+            self.opens = try open_table.OpenTable.init(testing.allocator, 64);
+            self.unique = 2;
+            self.d = LoopDispatcher.init(&self.lb, .{ .fs = filesystem.Filesystem.of(Fs, &self.fs), .io = testing.io, .registry = &self.reg, .guards = &self.guards, .opens = &self.opens });
         }
-        return abi.decodeExact(abi.fuse_entry_out, c.outBytes()) orelse error.TestBadReply;
-    }
 
-    fn attr(self: *Harness, c: Loopback.Captured) !abi.fuse_attr {
-        _ = self;
-        if (c.errno()) |e| {
-            std.debug.print("expected attrs, got errno {t}\n", .{e});
-            return error.TestUnexpectedErrno;
+        fn deinit(self: *Self) void {
+            self.opens.deinit();
+            self.guards.deinit();
+            self.reg.deinit();
+            self.lb.deinit();
+            self.fs.unmount();
+            self.store.deinit();
         }
-        return (abi.decodeExact(abi.fuse_attr_out, c.outBytes()) orelse return error.TestBadReply).attr;
-    }
 
-    fn lookup(self: *Harness, parent: u64, name: []const u8) Loopback.Captured {
-        return self.call(.{ .lookup = .{ .name = name } }, parent);
-    }
-
-    fn mkdir(self: *Harness, parent: u64, name: []const u8) !u64 {
-        return (try self.entry(self.call(.{ .mkdir = .{ .name = name, .mode = 0o755, .umask = 0 } }, parent))).nodeid;
-    }
-
-    /// CREATE: the entry's ino (the handle is open until `release`).
-    fn create(self: *Harness, parent: u64, name: []const u8, mode: u32) !u64 {
-        const c = self.call(.{ .create = .{ .name = name, .flags = 0, .mode = mode, .umask = 0, .open_flags = 0 } }, parent);
-        if (c.errno()) |e| {
-            std.debug.print("create: errno {t}\n", .{e});
-            return error.TestUnexpectedErrno;
+        fn call(self: *Self, req: codec.Request, nodeid: u64) Loopback.Captured {
+            const u = self.unique;
+            self.unique += abi.FUSE_REQ_ID_STEP;
+            const before = self.lb.replyCount(slot);
+            self.d.dispatch(req, .{ .unique = u, .nodeid = nodeid, .uid = 1000, .gid = 1000, .pid = 7 }, slot, null);
+            std.debug.assert(self.lb.replyCount(slot) == before + 1);
+            const c = self.lb.captured(slot).?;
+            std.debug.assert(c.header.unique == u);
+            return c;
         }
-        const e = abi.decodePrefix(abi.fuse_entry_out, c.outBytes()) orelse return error.TestBadReply;
-        return e.nodeid;
-    }
 
-    fn write(self: *Harness, ino: u64, offset: u64, data: []const u8, write_flags: u32) Loopback.Captured {
-        const in: abi.fuse_write_in = .{ .fh = 1, .offset = offset, .size = @intCast(data.len), .write_flags = write_flags, .lock_owner = 0, .flags = 0, .padding = 0 };
-        return self.call(.{ .write = .{ .in = in, .data = data } }, ino);
-    }
-
-    fn read(self: *Harness, ino: u64, offset: u64, size: u32) Loopback.Captured {
-        const in: abi.fuse_read_in = .{ .fh = 1, .offset = offset, .size = size, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
-        return self.call(.{ .read = in }, ino);
-    }
-
-    fn getattr(self: *Harness, ino: u64) !abi.fuse_attr {
-        return self.attr(self.call(.{ .getattr = .{ .flags = 0, .fh = null } }, ino));
-    }
-
-    fn setattr(self: *Harness, ino: u64, in: abi.fuse_setattr_in) Loopback.Captured {
-        return self.call(.{ .setattr = in }, ino);
-    }
-
-    fn release(self: *Harness, ino: u64) void {
-        _ = self.call(.{ .release = .{ .fh = 1, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, ino);
-    }
-
-    fn forget(self: *Harness, ino: u64, n: u64) void {
-        self.fire(.{ .forget = .{ .nlookup = n } }, ino);
-    }
-
-    /// Every name a READDIR of `dir` yields from `offset`, joined by ','.
-    fn readdirNames(self: *Harness, dir: u64, offset: u64, buf: []u8) ![]const u8 {
-        const in: abi.fuse_read_in = .{ .fh = 1, .offset = offset, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
-        const c = self.call(.{ .readdir = in }, dir);
-        if (c.errno()) |e| {
-            std.debug.print("readdir: errno {t}\n", .{e});
-            return error.TestUnexpectedErrno;
+        /// A no-reply op (FORGET/BATCH_FORGET/INTERRUPT).
+        fn fire(self: *Self, req: codec.Request, nodeid: u64) void {
+            const before = self.lb.replyCount(slot);
+            self.d.dispatch(req, .{ .unique = self.unique, .nodeid = nodeid, .uid = 1000, .gid = 1000, .pid = 7 }, slot, null);
+            self.unique += abi.FUSE_REQ_ID_STEP;
+            std.debug.assert(self.lb.replyCount(slot) == before);
         }
-        var w: std.Io.Writer = .fixed(buf);
-        var off: usize = 0;
-        var first = true;
-        while (off + abi.fuse_dirent.NAME_OFFSET <= c.body.len) {
-            const d = abi.decodePrefix(abi.fuse_dirent, c.body[off..]).?;
-            const name = c.body[off + abi.fuse_dirent.NAME_OFFSET ..][0..d.namelen];
-            if (!first) try w.writeByte(',');
-            first = false;
-            try w.writeAll(name);
-            off += abi.fuse_dirent.recordLen(d.namelen);
+
+        fn errnoOf(c: Loopback.Captured) ?linux.E {
+            return c.errno();
         }
-        return w.buffered();
+
+        fn entry(self: *Self, c: Loopback.Captured) !abi.fuse_entry_out {
+            _ = self;
+            if (c.errno()) |e| {
+                std.debug.print("expected an entry, got errno {t}\n", .{e});
+                return error.TestUnexpectedErrno;
+            }
+            return abi.decodeExact(abi.fuse_entry_out, c.outBytes()) orelse error.TestBadReply;
+        }
+
+        fn attr(self: *Self, c: Loopback.Captured) !abi.fuse_attr {
+            _ = self;
+            if (c.errno()) |e| {
+                std.debug.print("expected attrs, got errno {t}\n", .{e});
+                return error.TestUnexpectedErrno;
+            }
+            return (abi.decodeExact(abi.fuse_attr_out, c.outBytes()) orelse return error.TestBadReply).attr;
+        }
+
+        fn lookup(self: *Self, parent: u64, name: []const u8) Loopback.Captured {
+            return self.call(.{ .lookup = .{ .name = name } }, parent);
+        }
+
+        fn mkdir(self: *Self, parent: u64, name: []const u8) !u64 {
+            return (try self.entry(self.call(.{ .mkdir = .{ .name = name, .mode = 0o755, .umask = 0 } }, parent))).nodeid;
+        }
+
+        /// CREATE: the entry's ino (the handle is open until `release`).
+        fn create(self: *Self, parent: u64, name: []const u8, mode: u32) !u64 {
+            const c = self.call(.{ .create = .{ .name = name, .flags = 0, .mode = mode, .umask = 0, .open_flags = 0 } }, parent);
+            if (c.errno()) |e| {
+                std.debug.print("create: errno {t}\n", .{e});
+                return error.TestUnexpectedErrno;
+            }
+            const e = abi.decodePrefix(abi.fuse_entry_out, c.outBytes()) orelse return error.TestBadReply;
+            return e.nodeid;
+        }
+
+        fn write(self: *Self, ino: u64, offset: u64, data: []const u8, write_flags: u32) Loopback.Captured {
+            const in: abi.fuse_write_in = .{ .fh = 1, .offset = offset, .size = @intCast(data.len), .write_flags = write_flags, .lock_owner = 0, .flags = 0, .padding = 0 };
+            return self.call(.{ .write = .{ .in = in, .data = data } }, ino);
+        }
+
+        fn read(self: *Self, ino: u64, offset: u64, size: u32) Loopback.Captured {
+            const in: abi.fuse_read_in = .{ .fh = 1, .offset = offset, .size = size, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
+            return self.call(.{ .read = in }, ino);
+        }
+
+        fn getattr(self: *Self, ino: u64) !abi.fuse_attr {
+            return self.attr(self.call(.{ .getattr = .{ .flags = 0, .fh = null } }, ino));
+        }
+
+        fn setattr(self: *Self, ino: u64, in: abi.fuse_setattr_in) Loopback.Captured {
+            return self.call(.{ .setattr = in }, ino);
+        }
+
+        fn release(self: *Self, ino: u64) void {
+            _ = self.call(.{ .release = .{ .fh = 1, .flags = 0, .release_flags = 0, .lock_owner = 0 } }, ino);
+        }
+
+        fn forget(self: *Self, ino: u64, n: u64) void {
+            self.fire(.{ .forget = .{ .nlookup = n } }, ino);
+        }
+
+        /// Every name a READDIR of `dir` yields from `offset`, joined by ','.
+        fn readdirNames(self: *Self, dir: u64, offset: u64, buf: []u8) ![]const u8 {
+            const in: abi.fuse_read_in = .{ .fh = 1, .offset = offset, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
+            const c = self.call(.{ .readdir = in }, dir);
+            if (c.errno()) |e| {
+                std.debug.print("readdir: errno {t}\n", .{e});
+                return error.TestUnexpectedErrno;
+            }
+            var w: std.Io.Writer = .fixed(buf);
+            var off: usize = 0;
+            var first = true;
+            while (off + abi.fuse_dirent.NAME_OFFSET <= c.body.len) {
+                const d = abi.decodePrefix(abi.fuse_dirent, c.body[off..]).?;
+                const name = c.body[off + abi.fuse_dirent.NAME_OFFSET ..][0..d.namelen];
+                if (!first) try w.writeByte(',');
+                first = false;
+                try w.writeAll(name);
+                off += abi.fuse_dirent.recordLen(d.namelen);
+            }
+            return w.buffered();
+        }
+
+        /// The cookie READDIR stamped on entry `name` (the continuation offset).
+        fn readdirCookie(self: *Self, dir: u64, name: []const u8) !u64 {
+            const in: abi.fuse_read_in = .{ .fh = 1, .offset = 0, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
+            const c = self.call(.{ .readdir = in }, dir);
+            var off: usize = 0;
+            while (off + abi.fuse_dirent.NAME_OFFSET <= c.body.len) {
+                const d = abi.decodePrefix(abi.fuse_dirent, c.body[off..]).?;
+                const n = c.body[off + abi.fuse_dirent.NAME_OFFSET ..][0..d.namelen];
+                if (std.mem.eql(u8, n, name)) return d.off;
+                off += abi.fuse_dirent.recordLen(d.namelen);
+            }
+            return error.TestNameNotListed;
+        }
+    };
+}
+
+const Harness = HarnessOf(NoData);
+
+/// A data face WITH volumes whose write side holds custody: `flushCustody`
+/// lands it as the plane's upload merge does — the layout republished onto
+/// a fresh block in one tx (`+ref` new, `−ref` displaced), the displaced
+/// block freed by the flush itself. Every `freeBindings` and every staged
+/// `±ref` is recorded: what the handler tells the data plane IS the
+/// contract under test. Everything else answers as `NoData`.
+const SettlingData = struct {
+    base: NoData = .{},
+    store: ?*MemStore = null,
+    /// The custody armed to land at the next flush of `ino`: block 0 moves
+    /// `from` → `to`.
+    merge: ?struct { ino: u64, size: u64, from: Mapping, to: Mapping } = null,
+    flushes: u32 = 0,
+    /// The (3.7) balance observed inside the flush: a held lock there is
+    /// the deadlock the plane's own merge would meet.
+    locks_held_at_flush: u32 = 0,
+    locks_taken_at_flush: u32 = 0,
+    freed: std.ArrayList(Mapping) = .empty,
+    adds: std.ArrayList(layout.RefOp) = .empty,
+    releases: std.ArrayList(layout.RefOp) = .empty,
+
+    pub const OwnBlock = NoData.OwnBlock;
+    pub const Space = NoData.Space;
+    pub const LayoutGuard = NoData.LayoutGuard;
+
+    fn deinit(self: *SettlingData) void {
+        self.freed.deinit(testing.allocator);
+        self.adds.deinit(testing.allocator);
+        self.releases.deinit(testing.allocator);
     }
 
-    /// The cookie READDIR stamped on entry `name` (the continuation offset).
-    fn readdirCookie(self: *Harness, dir: u64, name: []const u8) !u64 {
-        const in: abi.fuse_read_in = .{ .fh = 1, .offset = 0, .size = 4096, .read_flags = 0, .lock_owner = 0, .flags = 0, .padding = 0 };
-        const c = self.call(.{ .readdir = in }, dir);
-        var off: usize = 0;
-        while (off + abi.fuse_dirent.NAME_OFFSET <= c.body.len) {
-            const d = abi.decodePrefix(abi.fuse_dirent, c.body[off..]).?;
-            const n = c.body[off + abi.fuse_dirent.NAME_OFFSET ..][0..d.namelen];
-            if (std.mem.eql(u8, n, name)) return d.off;
-            off += abi.fuse_dirent.recordLen(d.namelen);
-        }
-        return error.TestNameNotListed;
+    /// The striped layout `[0 → m]` of `ino` published through the store
+    /// (the own-block shape a staged file promotes to).
+    fn publishStriped(self: *SettlingData, ino: u64, size: u64, prev: ?Layout, m: Mapping) !void {
+        const store = self.store.?;
+        const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = m }).encode()};
+        const t = try store.begin(@src());
+        errdefer store.abandon(t);
+        const proof: layout.DmaProof = .{ .vol_tag = m.vol_tag, .offset = m.offset, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 };
+        try layout.publishLayout(t, .{ .ino = ino, .hash_seed = store.hashSeed(), .prev = prev, .layout = Layout.stripedInline(size, &entries), .proofs = &.{proof} }, self.refsSeam(), .default);
+        try store.commit(t);
     }
+
+    pub fn hasVolumes(_: *const SettlingData) bool {
+        return true;
+    }
+    pub fn stagingOn(_: *const SettlingData) bool {
+        return false;
+    }
+    pub fn isPassthrough(_: *const SettlingData) bool {
+        return true;
+    }
+    pub fn blockSize(_: *const SettlingData) u64 {
+        return layout.DEFAULT_CHUNK;
+    }
+    pub fn inlineMax(self: *const SettlingData) u64 {
+        return self.base.inline_max;
+    }
+    pub fn geometry(_: *const SettlingData) layout.Geometry {
+        return .default;
+    }
+    /// The plane's seam: the ledger record rides the tx (so the store's
+    /// block-ref tree is the in-process C2/C8 oracle) and the op is noted.
+    pub fn refsSeam(self: *SettlingData) layout.RefsSeam {
+        return .{ .ctx = self, .stage_add = &recordAdd, .stage_release = &recordRelease };
+    }
+    fn refOf(op: layout.RefOp) block_refs.Reference {
+        return .{ .vol_tag = op.vol_tag, .block_idx = op.block_idx, .owner_ino = op.owner_ino, .block_index = op.block_index };
+    }
+    fn recordAdd(ctx: *anyopaque, t: *tx.KvTx, op: layout.RefOp) Allocator.Error!void {
+        const self: *SettlingData = @ptrCast(@alignCast(ctx));
+        try block_refs.stageOps(t, &.{block_refs.taken(refOf(op))});
+        try self.adds.append(testing.allocator, op);
+    }
+    fn recordRelease(ctx: *anyopaque, t: *tx.KvTx, op: layout.RefOp) Allocator.Error!void {
+        const self: *SettlingData = @ptrCast(@alignCast(ctx));
+        try block_refs.stageOps(t, &.{block_refs.released(refOf(op))});
+        try self.releases.append(testing.allocator, op);
+    }
+    pub fn noteShape(_: *SettlingData, _: u64, _: u64, _: layout.Kind) void {}
+    pub fn forgetShape(_: *SettlingData, _: u64) void {}
+    pub fn canStoreHeld(_: *const SettlingData) bool {
+        return false;
+    }
+    pub fn write(_: *SettlingData, _: Io, _: u64, _: u64, _: write_admit.Payload, _: op_guard.Class, _: seams.FileView) write_admit.Error!write_admit.Outcome {
+        unreachable;
+    }
+    pub fn read(_: *SettlingData, _: Io, _: u64, _: u64, _: []u8, _: bool, _: bool) Error!usize {
+        unreachable;
+    }
+    pub fn ownBlock(_: *SettlingData, _: Io, _: u64, _: []const u8) Error!OwnBlock {
+        unreachable;
+    }
+    pub fn abandonOwnBlock(_: *SettlingData, _: OwnBlock) void {}
+    pub fn freeBindings(self: *SettlingData, _: Io, maps: []const Mapping) void {
+        for (maps) |m| self.freed.append(testing.allocator, m) catch unreachable;
+    }
+    /// The custody lands: the plane's merge under its own (3.5)+(3.7).
+    pub fn flushCustody(self: *SettlingData, io: Io, ino: u64) void {
+        self.flushes += 1;
+        self.locks_held_at_flush = self.base.layout_lock_held;
+        self.locks_taken_at_flush = self.base.layout_locks_taken;
+        const m = self.merge orelse return;
+        if (m.ino != ino) return;
+        self.merge = null;
+        const prev_entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = m.from }).encode()};
+        self.publishStriped(ino, m.size, Layout.stripedInline(m.size, &prev_entries), m.to) catch unreachable;
+        self.freeBindings(io, &.{m.from});
+    }
+    pub fn releaseIno(_: *SettlingData, _: Io, _: u64) void {}
+    pub fn fsync(_: *SettlingData, _: Io, _: u64, _: ?staging.StagingKey) Error!void {}
+    pub fn statfs(_: *SettlingData) ?Space {
+        return null;
+    }
+    pub fn mintFileId(_: *SettlingData, _: u64) layout.FileId {
+        return layout.zero_file_id;
+    }
+    pub fn stageImage(_: *SettlingData, _: staging.StagingKey, _: []const u8) Error!u64 {
+        return error.NotSupported;
+    }
+    pub fn releaseStaged(_: *SettlingData, _: staging.StagingKey, _: ?u64) void {}
+    pub fn stagedLease(_: *SettlingData, _: staging.StagingKey) ?staging.Segment.Lease {
+        return null;
+    }
+    pub fn readMappingImage(_: *SettlingData, _: Mapping, _: []u8) Error![]const u8 {
+        return error.NotSupported;
+    }
+    pub fn lockLayout(self: *SettlingData, io: Io, ino: u64) LayoutGuard {
+        return self.base.lockLayout(io, ino);
+    }
+    pub fn stageKvmapShrink(_: *SettlingData, _: *tx.KvTx, _: u64, _: Layout, _: u8, _: u64) Error!u32 {
+        unreachable;
+    }
+    pub fn stageKvmapCorpse(_: *SettlingData, _: *tx.KvTx, _: u64, _: Layout, _: u8) Error!void {
+        unreachable;
+    }
+    pub fn drainKvmapSweep(_: *SettlingData, _: u64, _: u64) void {}
 };
+
+test "the corpse destroy settles the write-side custody BEFORE it reads the layout it frees, under (3.7): the flush's merge moved the file onto a fresh block — the plan frees the fresh block once and the displaced one never again (repro-port: fstests generic/013, fsstress write+truncate+unlink — fsck C2/C8 `durable 1 vs derived 0`, block_untracked_free_refusals)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const f = try h.create(1, "f", 0o644);
+    const lf = try H.Fs.localOf(f);
+    const size: u64 = 1 << 20;
+    const from = Mapping.wholeBlock(0x11, 0, 1);
+    const to = Mapping.wholeBlock(0x11, layout.DEFAULT_CHUNK, 2);
+    // The own-block shape: striped over `from`; the write side holds
+    // custody of block 0 that lands as `to` when the destroy settles it.
+    try h.data.publishStriped(lf, size, null, from);
+    h.data.merge = .{ .ino = lf, .size = size, .from = from, .to = to };
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = "f" } }, 1).errno());
+    h.release(f);
+    h.forget(f, 1);
+    try testing.expectEqual(@as(usize, 1), h.fs.reclaim.items.len);
+    var tr = @import("op_trace.zig").OpTrace.begin(1, .other);
+    var win: [16]u8 = undefined;
+    var c: Ctx = .{ .unique = 1, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &tr, .wd_slot = null, .window = &win };
+    try h.fs.reclaimDrain(&c);
+    tr.finish();
+    // Frees: `from` once (the flush's merge), `to` once (the destroy).
+    try testing.expectEqual(@as(usize, 2), h.data.freed.items.len);
+    try testing.expect(h.data.freed.items[0].eql(from));
+    try testing.expect(h.data.freed.items[1].eql(to));
+    // The durable ledger: `+from` (the publish), `+to −from` (the merge)
+    // through the seam; the destroy rider's `−to` rides the handler's own
+    // tx — the block-ref tree ends EMPTY (the fsck C2/C8 oracle in-process:
+    // a `+to` left behind is "durable 1 vs derived 0").
+    try testing.expectEqual(@as(usize, 2), h.data.adds.items.len);
+    try testing.expectEqual(@as(usize, 1), h.data.releases.items.len);
+    try testing.expectEqual(from.blockIdx(layout.DEFAULT_CHUNK), h.data.releases.items[0].block_idx);
+    try testing.expectEqual(@as(usize, 0), h.store.countKind(key.TREE_BLOCK_REFS));
+    try testing.expectEqual(@as(usize, 0), h.store.countKind(key.TREE_XATTRS));
+    // The custody settled exactly once, with no (3.7) held (the plane's
+    // merge takes it) and before the destroy's own acquisition.
+    try testing.expectEqual(@as(u32, 1), h.data.flushes);
+    try testing.expectEqual(@as(u32, 0), h.data.locks_held_at_flush);
+    try testing.expectEqual(@as(u32, 0), h.data.locks_taken_at_flush);
+    try testing.expectEqual(@as(u32, 1), h.data.base.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.data.base.layout_lock_held);
+    try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+}
 
 test "POSIX: create → write → read → stat; an overlay write grows the file; a write past the inline bound on a volume-less set is EFBIG and counted; truncate clips, empties at 0 and zero-extends" {
     var h: Harness = undefined;
@@ -3206,43 +3480,50 @@ test "POSIX: create → write → read → stat; an overlay write grows the file
     try testing.expectEqual(@as(u32, 0), h.opens.get(f).?.count);
 }
 
-test "a truncate (SETATTR size, O_TRUNC) takes the data face's (3.7) layout lock exactly once — before its 4a set, released after the commit (balance 0), a refused size included; a chmod takes none; the lock-order rail stays silent across the op's (1) → (3.7) → (4a)" {
+test "every layout-record RMW of the filesystem takes the data face's (3.7) layout lock exactly once, held across its commit (balance 0): a WRITE on the inline/staged arm (repro-port: fsstress -p 20 — a write's staged→staged publish raced the plane's promotion under (3.5)+(3.7) and overwrote the packed record, leaving its +ref durable: fsck C2/C3/C8 on every pack block), a truncate (SETATTR size, O_TRUNC) before its 4a set, a refused size included; a chmod takes none; the lock-order rail stays silent across (1) → (3.7) → (4a)" {
     var h: Harness = undefined;
     try h.init();
     defer h.deinit();
     const inv0 = lock_order.lock_order_inversions.load();
     const f = try h.create(1, "f", 0o644);
+    // The write: the lock around its layout read → publish → commit.
     _ = h.write(f, 0, "0123456789", 0);
-    try testing.expectEqual(@as(u32, 0), h.nodata.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 1), h.data.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
+    // A refused write (EFBIG past the volume-less inline bound) releases too.
+    var big: [4097]u8 = @splat('x');
+    try testing.expectEqual(linux.E.FBIG, h.write(f, 0, &big, 0).errno().?);
+    try testing.expectEqual(@as(u32, 2), h.data.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
     var sa = abi.zeroed(abi.fuse_setattr_in);
     sa.valid = abi.FATTR_SIZE;
     sa.size = 4;
     try testing.expectEqual(@as(u64, 4), (try h.attr(h.setattr(f, sa))).size);
-    try testing.expectEqual(@as(u32, 1), h.nodata.layout_locks_taken);
-    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    try testing.expectEqual(@as(u32, 3), h.data.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
     // The refusal path (EFBIG past the inline bound) releases too.
     sa.size = 1 << 20;
     try testing.expectEqual(linux.E.FBIG, h.setattr(f, sa).errno().?);
-    try testing.expectEqual(@as(u32, 2), h.nodata.layout_locks_taken);
-    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    try testing.expectEqual(@as(u32, 4), h.data.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
     // A chmod: no layout mutation, no lock.
     var sm = abi.zeroed(abi.fuse_setattr_in);
     sm.valid = abi.FATTR_MODE;
     sm.mode = 0o600;
     try testing.expectEqual(@as(u32, S.IFREG | 0o600), (try h.attr(h.setattr(f, sm))).mode);
-    try testing.expectEqual(@as(u32, 2), h.nodata.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 4), h.data.layout_locks_taken);
     // A size the file already has (no layout mutation) still balances.
     sa.size = 4;
     _ = h.setattr(f, sa);
-    try testing.expectEqual(@as(u32, 3), h.nodata.layout_locks_taken);
-    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    try testing.expectEqual(@as(u32, 5), h.data.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
     h.release(f);
     // O_TRUNC rides the open under the lock.
     const op = h.call(.{ .open = .{ .flags = O_TRUNC, .open_flags = 0 } }, f);
     try testing.expectEqual(@as(?linux.E, null), op.errno());
     try testing.expectEqual(@as(u64, 0), (try h.getattr(f)).size);
-    try testing.expectEqual(@as(u32, 4), h.nodata.layout_locks_taken);
-    try testing.expectEqual(@as(u32, 0), h.nodata.layout_lock_held);
+    try testing.expectEqual(@as(u32, 6), h.data.layout_locks_taken);
+    try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
     h.release(f);
     try testing.expectEqual(inv0, lock_order.lock_order_inversions.load());
 }
@@ -3747,7 +4028,7 @@ test "the corpse sweep at mount: an unlinked file whose FORGET died with the dae
     h.release(f);
     // The daemon dies here: no FORGET, the corpse record stays.
     try testing.expectEqual(inodes0 + 2, h.store.countKind(key.TREE_INODES));
-    var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.nodata, .{ .dlm_stripes = 16 });
+    var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.data, .{ .dlm_stripes = 16 });
     defer next.unmount();
     const swept0 = fuse_corpse_sweep_destroyed.load();
     try testing.expectEqual(@as(u64, 1), try next.sweepCorpsesAtMount());
@@ -3780,7 +4061,7 @@ test "the corpse sweep pages through a slot tree that interleaves inode, dentry 
         try testing.expectEqual(@as(?linux.E, null), h.call(.{ .unlink = .{ .name = name } }, 1).errno());
     }
     const inodes0 = h.store.countKind(key.TREE_INODES);
-    var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.nodata, .{ .dlm_stripes = 16 });
+    var next = try MemFs.mount(testing.allocator, testing.io, &h.store, &h.data, .{ .dlm_stripes = 16 });
     defer next.unmount();
     try testing.expectEqual(@as(u64, 3), try next.sweepCorpsesAtMount());
     try testing.expectEqual(inodes0 - 3, h.store.countKind(key.TREE_INODES));

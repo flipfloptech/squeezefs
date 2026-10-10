@@ -2208,7 +2208,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return self.writeInline(c, local, a, rec, end, &layout_lock);
             }
             if (kind == .inline_ and end <= self.inline_max) return self.writeInline(c, local, a, rec, end, &layout_lock);
-            if (self.data.stagingOn() and kind != .striped and end <= self.block_size) return self.writeStaged(c, local, a, rec, end, &layout_lock);
+            // The staged arm rings the WHOLE file: its bound is the file's
+            // reach — `max(size, end)` — never the write's end alone (a
+            // file grown past the block by truncate rang a 5 MiB image no
+            // promotion could place: fstests generic/030, fsstress).
+            const reach = @max(end, (try self.readInode(local)).size);
+            if (self.data.stagingOn() and kind != .striped and reach <= self.block_size) return self.writeStaged(c, local, a, rec, end, &layout_lock);
             return self.writeStriped(c, local, a, rec, end, &layout_lock);
         }
 
@@ -2348,17 +2353,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The resident payload to its own block, the striped layout
         /// published (ONE tx), the displaced custody freed after. Returns
-        /// the size the striped file starts at.
+        /// the size the striped file starts at. The image DMA'd is at most
+        /// ONE block: a resident payload never exceeds it, and a size past
+        /// it (a truncate-grown file) is the sparse zero run the striped
+        /// layout's `size` names — never a second block of zeros (and never
+        /// EFBIG: fstests generic/030).
         fn promoteToStriped(self: *Self, c: *Ctx, local: u64, rec: ?LayoutRec, size: u64) Error!u64 {
             var after: AfterCommit = .{};
             var entries: [1]layout.MapEntryWire = undefined;
             var n_entries: usize = 0;
             var ob: ?Data.OwnBlock = null;
             if (size > 0) {
-                const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(size)));
+                const image_len = @min(size, self.block_size);
+                const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(image_len)));
                 defer self.gpa.free(buf);
                 _ = try self.residentImage(local, rec, buf);
-                ob = try self.data.ownBlock(self.io, local, buf[0..@intCast(size)]);
+                ob = try self.data.ownBlock(self.io, local, buf[0..@intCast(image_len)]);
                 entries[0] = (layout.MapEntry{ .block = 0, .mapping = ob.?.mapping }).encode();
                 n_entries = 1;
             }
@@ -3248,6 +3258,17 @@ const SettlingData = struct {
     freed: std.ArrayList(Mapping) = .empty,
     adds: std.ArrayList(layout.RefOp) = .empty,
     releases: std.ArrayList(layout.RefOp) = .empty,
+    /// The staging ring, when the test turns it on: the largest image
+    /// staged (the ring holds whole files ≤ one block, never more).
+    staging: bool = false,
+    staged_max: u64 = 0,
+    staged_images: u32 = 0,
+    /// The own-block promotions: the largest image DMA'd (≤ one block).
+    own_block_max: u64 = 0,
+    own_blocks: u32 = 0,
+    next_block_off: u64 = 0,
+    /// The striped data writes: `(offset, len, the file view's size)`.
+    writes: std.ArrayList(struct { offset: u64, len: u64, view_size: u64 }) = .empty,
 
     pub const OwnBlock = NoData.OwnBlock;
     pub const Space = NoData.Space;
@@ -3257,6 +3278,7 @@ const SettlingData = struct {
         self.freed.deinit(testing.allocator);
         self.adds.deinit(testing.allocator);
         self.releases.deinit(testing.allocator);
+        self.writes.deinit(testing.allocator);
     }
 
     /// The striped layout `[0 → m]` of `ino` published through the store
@@ -3274,8 +3296,8 @@ const SettlingData = struct {
     pub fn hasVolumes(_: *const SettlingData) bool {
         return true;
     }
-    pub fn stagingOn(_: *const SettlingData) bool {
-        return false;
+    pub fn stagingOn(self: *const SettlingData) bool {
+        return self.staging;
     }
     pub fn isPassthrough(_: *const SettlingData) bool {
         return true;
@@ -3312,14 +3334,24 @@ const SettlingData = struct {
     pub fn canStoreHeld(_: *const SettlingData) bool {
         return false;
     }
-    pub fn write(_: *SettlingData, _: Io, _: u64, _: u64, _: write_admit.Payload, _: op_guard.Class, _: seams.FileView) write_admit.Error!write_admit.Outcome {
-        unreachable;
+    /// The striped data write: recorded, every byte acked.
+    pub fn write(self: *SettlingData, _: Io, _: u64, offset: u64, payload: write_admit.Payload, _: op_guard.Class, view: seams.FileView) write_admit.Error!write_admit.Outcome {
+        const n = payload.len();
+        self.writes.append(testing.allocator, .{ .offset = offset, .len = n, .view_size = view.size }) catch return error.OutOfMemory;
+        return .{ .written = n, .size_claim = offset + n, .pieces = 1 };
     }
     pub fn read(_: *SettlingData, _: Io, _: u64, _: u64, _: []u8, _: bool, _: bool) Error!usize {
         unreachable;
     }
-    pub fn ownBlock(_: *SettlingData, _: Io, _: u64, _: []const u8) Error!OwnBlock {
-        unreachable;
+    /// The plane's own-block DMA: one block at most (the plane's own
+    /// refusal), the image length recorded.
+    pub fn ownBlock(self: *SettlingData, _: Io, _: u64, image: []const u8) Error!OwnBlock {
+        if (image.len > layout.DEFAULT_CHUNK) return error.FileTooBig;
+        self.own_blocks += 1;
+        self.own_block_max = @max(self.own_block_max, image.len);
+        const off = self.next_block_off;
+        self.next_block_off += layout.DEFAULT_CHUNK;
+        return .{ .mapping = Mapping.wholeBlock(0x11, off, 1), .proof = .{ .vol_tag = 0x11, .offset = off, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 } };
     }
     pub fn abandonOwnBlock(_: *SettlingData, _: OwnBlock) void {}
     pub fn freeBindings(self: *SettlingData, _: Io, maps: []const Mapping) void {
@@ -3345,8 +3377,11 @@ const SettlingData = struct {
     pub fn mintFileId(_: *SettlingData, _: u64) layout.FileId {
         return layout.zero_file_id;
     }
-    pub fn stageImage(_: *SettlingData, _: staging.StagingKey, _: []const u8) Error!u64 {
-        return error.NotSupported;
+    pub fn stageImage(self: *SettlingData, _: staging.StagingKey, image: []const u8) Error!u64 {
+        if (!self.staging) return error.NotSupported;
+        self.staged_images += 1;
+        self.staged_max = @max(self.staged_max, image.len);
+        return self.staged_images;
     }
     pub fn releaseStaged(_: *SettlingData, _: staging.StagingKey, _: ?u64) void {}
     pub fn stagedLease(_: *SettlingData, _: staging.StagingKey) ?staging.Segment.Lease {
@@ -3413,6 +3448,51 @@ test "the corpse destroy settles the write-side custody BEFORE it reads the layo
     try testing.expectEqual(@as(u32, 1), h.data.base.layout_locks_taken);
     try testing.expectEqual(@as(u32, 0), h.data.base.layout_lock_held);
     try testing.expectEqual(linux.E.NOENT, h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, f).errno().?);
+}
+
+test "a file grown past one block by truncate is written through the striped arm: the promotion DMAs at most one block of the resident image (the tail is the sparse zero run the size names) and the staged arm never rings an image above one block (repro-port: fstests generic/030 — `truncate 5017k` then `pwrite 0 5017k` answered EFBIG; fsstress left unpromotable ring images behind)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const bs = layout.DEFAULT_CHUNK;
+    const grown: u64 = 5017 * 1024;
+    // (a) An empty (inline, no record) file grown past the block.
+    const f = try h.create(1, "f", 0o644);
+    var in = abi.zeroed(abi.fuse_setattr_in);
+    in.valid = abi.FATTR_SIZE;
+    in.size = grown;
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(f, in).errno());
+    try testing.expectEqual(grown, (try h.getattr(f)).size);
+    const two_pages: [8192]u8 = @splat('X');
+    const w = h.write(f, 0, &two_pages, 0);
+    try testing.expectEqual(@as(?linux.E, null), w.errno());
+    try testing.expectEqual(@as(u32, 1), h.data.own_blocks);
+    try testing.expectEqual(bs, h.data.own_block_max);
+    try testing.expectEqual(@as(usize, 1), h.data.writes.items.len);
+    try testing.expectEqual(grown, h.data.writes.items[0].view_size);
+    try testing.expectEqual(grown, (try h.getattr(f)).size);
+    const rec = (try h.fs.readLayout(try H.Fs.localOf(f))).?;
+    defer h.fs.freeLayout(rec);
+    try testing.expectEqual(layout.Kind.striped, rec.layout.kind);
+    try testing.expectEqual(grown, rec.layout.size);
+    h.release(f);
+    // (b) A staged file (the ring on) grown past the block: the next write
+    // leaves the ring for the striped arm instead of ringing 5 MiB.
+    h.data.staging = true;
+    const g = try h.create(1, "g", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(g, 0, &two_pages, 0).errno());
+    try testing.expectEqual(@as(u32, 1), h.data.staged_images);
+    try testing.expectEqual(@as(?linux.E, null), h.setattr(g, in).errno());
+    try testing.expectEqual(@as(?linux.E, null), h.write(g, 4096, "tail", 0).errno());
+    try testing.expectEqual(@as(u32, 1), h.data.staged_images);
+    try testing.expect(h.data.staged_max <= bs);
+    try testing.expectEqual(@as(u32, 2), h.data.own_blocks);
+    try testing.expectEqual(bs, h.data.own_block_max);
+    try testing.expectEqual(grown, (try h.getattr(g)).size);
+    h.release(g);
 }
 
 test "POSIX: create → write → read → stat; an overlay write grows the file; a write past the inline bound on a volume-less set is EFBIG and counted; truncate clips, empties at 0 and zero-extends" {

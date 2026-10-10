@@ -8,6 +8,7 @@
 //! namespace decodes the same bytes the device would (byte-exact proof).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const errors = @import("../../core/errors.zig");
 
 /// One command's answer: the NVMe status (0 = success) and CDW0/CDW1 (`res2`).
@@ -509,4 +510,27 @@ test "report: both forms round-trip through encode/parse; the holder is the rcst
     var r4k = try parseReport(gpa, big[0..4096], true);
     defer r4k.deinit(gpa);
     try testing.expectEqual(@as(usize, 63), r4k.registrants.len);
+}
+
+fn reportImageFuzz(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    var cmd: [CMD_LEN]u8 = undefined;
+    smith.bytes(&cmd);
+    const c = UringCmd.fromBytes(&cmd);
+    try std.testing.expectEqualSlices(u8, &cmd, c.toCmdArea()[0..CMD_LEN]);
+    var img: [1024]u8 = undefined;
+    const len = smith.slice(&img);
+    for ([_]bool{ false, true }) |extended| {
+        _ = reportRegctl(img[0..len], extended);
+        if (parseReport(gpa, img[0..len], extended)) |*r| {
+            var rr = r.*;
+            defer rr.deinit(gpa);
+            // A header naming more registrants than fit decodes the ones that fit.
+            try std.testing.expect(rr.registrants.len <= rr.regctl);
+        } else |_| {}
+    }
+}
+
+test "fuzz: the uring command and the reservation report image decoders are total; a lying regctl never allocates past the image" {
+    try fuzzkit.fuzz({}, reportImageFuzz, .{});
 }

@@ -22,6 +22,7 @@
 //! fact); mode resolution is pure and the caller logs.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -445,7 +446,7 @@ test "the lattice table: auto takes the highest confirmed rung; user always; an 
 }
 
 test "linux: the ladders live on this kernel — kmbuf present with its pair (logged), the sparse table registers, CapEff reads this process's capability" {
-    if (!is_linux) return error.SkipZigTest;
+    if (!is_linux) return testkit.skip(@src(), .no_linux, "probes: Linux only");
     const page: u32 = @intCast(std.heap.pageSize());
     const v = driver.probeKmbuf(page);
     switch (v) {

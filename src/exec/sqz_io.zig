@@ -25,6 +25,7 @@
 //! Linux only.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const posix = std.posix;
@@ -1338,7 +1339,7 @@ test "placement with fuse lanes on this machine: spawnHome lands on the lane hom
     try testing.expectEqual(@as(u32, 15), renew.await(io));
     try testing.expectEqual(@as(u32, 1), sqz.lease_io.?.threads());
     const fuse = sqz.fuseLanes();
-    if (fuse.len == 0) return error.SkipZigTest;
+    if (fuse.len == 0) return testkit.skip(@src(), .no_device, "the test executor built no FUSE lanes on this host");
     const S = struct {
         fn which() u16 {
             return lane_mod.current_lane.?.index;
@@ -1389,7 +1390,7 @@ test "every fuse lane dead aborts loud (a forked child dies with SIGABRT)" {
     var status: i32 = 0;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(pid, &status, 0)));
     const st: u32 = @bitCast(status);
-    if (linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 5) return error.SkipZigTest;
+    if (linux.W.IFEXITED(st) and linux.W.EXITSTATUS(st) == 5) return testkit.skip(@src(), .no_device, "the forked child built no FUSE lanes on this host");
     try testing.expect(linux.W.IFSIGNALED(st));
     try testing.expectEqual(linux.SIG.ABRT, linux.W.TERMSIG(st));
 }

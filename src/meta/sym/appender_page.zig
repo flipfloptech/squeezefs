@@ -37,6 +37,7 @@
 //! — `dirNamedMask` and `pageWriteSlots` are the pure law.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const checksum = @import("../../core/checksum.zig");
 const journal = @import("../journal.zig");
 
@@ -718,6 +719,12 @@ fn pageFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [PAGE_LEN]u8 = undefined;
     const len = smith.slice(&buf);
     const c = classify(buf[0..len]);
+    // The strict decoder agrees with the classification.
+    if (decode(buf[0..len])) |p| try testing.expect(c == .valid and c.valid.state == p.state) else |e| try testing.expect(switch (e) {
+        error.Blank => c == .blank,
+        error.Corrupt => c == .corrupt,
+        error.ForeignLayout => c == .foreign_layout,
+    });
     if (c == .valid) {
         var re: [PAGE_LEN]u8 = undefined;
         try c.valid.encode(&re);
@@ -736,7 +743,7 @@ test "fuzz: classify is total; a valid page re-encodes byte-identically" {
     var corpus_buf: [4 + PAGE_LEN]u8 = undefined;
     @memcpy(corpus_buf[0..4], &framed);
     @memcpy(corpus_buf[4..], &img);
-    try std.testing.fuzz({}, pageFuzz, .{ .corpus = &.{&corpus_buf} });
+    try fuzzkit.fuzz({}, pageFuzz, .{ .corpus = &.{&corpus_buf} });
     var prng = std.Random.DefaultPrng.init(0xA9E);
     const r = prng.random();
     var m = img;

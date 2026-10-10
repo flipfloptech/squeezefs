@@ -22,6 +22,7 @@
 //! propagation boundary (`Io.Group` discards it).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 
 pub const TaskSet = struct {
@@ -134,7 +135,7 @@ fn cancelWakesParked(io: Io) !void {
     var set: TaskSet = .init;
     const n = 4;
     for (0..n) |_| set.spawn(io, Probe.parkForever, .{ io, &p }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     while (p.parked.load(.acquire) < n) try std.Thread.yield();
     try testing.expectEqual(@as(u64, n), set.live());
@@ -155,7 +156,7 @@ fn cancelledBeforeFirstPoll(io: Io) !void {
     var set: TaskSet = .init;
     set.cancel(io);
     set.spawn(io, Probe.quick, .{&p}) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     set.spawnAsync(io, Probe.quick, .{&p});
     set.cancel(io);
@@ -172,7 +173,7 @@ fn waitJoins(io: Io) !void {
     var p: Probe = .{};
     var set: TaskSet = .init;
     for (0..3) |_| set.spawn(io, Probe.quick, .{&p}) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     try set.wait(io);
     try testing.expectEqual(@as(u32, 3), p.ran.load(.acquire));

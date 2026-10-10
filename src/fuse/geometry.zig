@@ -25,6 +25,7 @@
 //! u16::MAX`: every REGISTER refused on a raised-sysctl box, mount failed).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
@@ -890,4 +891,14 @@ test "the plan is total over a sweep of shapes and every result satisfies the ke
         if ((in.max_background_override orelse 0) == 0) try testing.expect(p.max_background >= MAX_BACKGROUND_FLOOR);
         if ((in.congestion_override orelse 0) == 0) try testing.expectEqual(@as(u16, p.max_background / 4 * 3), p.congestion_threshold);
     }
+}
+
+fn maxPagesFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseMaxPagesLimit(buf[0..len]);
+}
+
+test "fuzz: the max_pages_limit sysfs parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, maxPagesFuzz, .{ .corpus = &.{ fuzzkit.slice("256\n"), fuzzkit.slice("99999999999999999999") } });
 }

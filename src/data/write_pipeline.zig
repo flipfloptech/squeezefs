@@ -28,6 +28,7 @@
 //! partition `total` to the nanosecond.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
@@ -803,7 +804,7 @@ test "admission_parks_at_target_and_wakes_on_completion; empty_pipe_always_admit
     };
     const waits0 = stats.write_pipeline_admission_waits.load();
     var fut = io.concurrent(Completer.run, .{ io, &g, p1 }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     const p3 = g.admitSegment(io, 4096);
     fut.await(io);
@@ -817,7 +818,7 @@ test "admission_parks_at_target_and_wakes_on_completion; empty_pipe_always_admit
             gov.complete(io_, b, 0, 1_000_000);
         }
     };
-    var fut2 = io.concurrent(Drainer.run, .{ io, &g, p2, p3 }) catch return error.SkipZigTest;
+    var fut2 = io.concurrent(Drainer.run, .{ io, &g, p2, p3 }) catch return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency");
     try testing.expect(g.quiesce(io, clock.monotonicNs() + 5 * std.time.ns_per_s));
     fut2.await(io);
     try testing.expectEqual(@as(u64, 0), g.core.inflightBytes());

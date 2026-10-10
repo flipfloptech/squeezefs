@@ -33,6 +33,8 @@
 //! a linked target), so the exact recipe is pinned without a kernel.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -1683,20 +1685,26 @@ test "the crash window: a port link that refuses leaves the namespace LIVE and t
 }
 
 test "the real face: the nvmet tree is walkable on the venue (configfs mounted by preflight) and the status counts read; skipped loud without root" {
-    if (linux.geteuid() != 0) {
-        log.warn("nvmet/configfs: not root — the real configfs walk is skipped", .{});
-        return error.SkipZigTest;
-    }
+    if (linux.geteuid() != 0) return testkit.skip(@src(), .no_root, "the real configfs walk needs root");
     var e: ?linux.E = null;
     const r = preflight(&e);
-    if (r != .ready) {
-        log.warn("nvmet/configfs: kernel target not ready ({s}) — the real walk is skipped", .{@tagName(r)});
-        return error.SkipZigTest;
-    }
+    if (r != .ready) return testkit.skip(@src(), .no_kernel_feature, "the kernel nvmet target is not ready (configfs preflight)");
     const gpa = testing.allocator;
     var walk = try walkLive(RealFs.face(), gpa);
     defer walk.deinit(gpa);
     const st = try status(RealFs.face(), gpa);
     try testing.expect(st.nvmet_present and st.configfs_mounted);
     try testing.expectEqual(walk.shares.len, @as(usize, st.subsystems));
+}
+
+fn attrTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    if (Trtype.parse(text)) |t| try std.testing.expect(Trtype.parse(t.name()) == t);
+    _ = parseUuidAttr(text);
+}
+
+test "fuzz: the trtype and uuid attribute parsers are total on arbitrary configfs text" {
+    try fuzzkit.fuzz({}, attrTextFuzz, .{ .corpus = &.{ fuzzkit.slice("tcp\n"), fuzzkit.slice("c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1\n") } });
 }

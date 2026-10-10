@@ -26,6 +26,7 @@
 //! Portable.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const errors = @import("../core/errors.zig");
 const codec = @import("codec.zig");
@@ -633,5 +634,5 @@ fn frameFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the frame and header decoders are total on arbitrary bytes" {
-    try std.testing.fuzz({}, frameFuzz, .{});
+    try fuzzkit.fuzz({}, frameFuzz, .{});
 }

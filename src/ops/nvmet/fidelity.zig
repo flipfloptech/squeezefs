@@ -30,6 +30,7 @@
 //! and `storage-list`.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -546,25 +547,13 @@ fn sleepMs(ms: u64) void {
 /// nvmet tree (preflight mounts configfs), `/dev/fuse`.
 fn venue(gpa: Allocator, io: Io) !*Rig {
     var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, "squeezefs", 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
-        log.warn("nvmet fidelity: no ./squeezefs in the cwd — the tier runs under `zig build nvmet-smoke`; skipped", .{});
-        return error.SkipZigTest;
-    }
-    if (linux.geteuid() != 0) {
-        log.warn("nvmet fidelity: not root — skipped", .{});
-        return error.SkipZigTest;
-    }
-    if (linux.errno(linux.statx(linux.AT.FDCWD, initiator.FABRICS_DEV, 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
-        log.warn("nvmet fidelity: {s} absent — skipped", .{initiator.FABRICS_DEV});
-        return error.SkipZigTest;
-    }
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "squeezefs", 0, .{ .TYPE = true }, &st)) != .SUCCESS) return testkit.skip(@src(), .other_step, "no ./squeezefs in the cwd — the tier runs under `zig build nvmet-smoke`");
+    if (linux.geteuid() != 0) return testkit.skip(@src(), .no_root, "the nvmet target needs root");
+    if (linux.errno(linux.statx(linux.AT.FDCWD, initiator.FABRICS_DEV, 0, .{ .TYPE = true }, &st)) != .SUCCESS) return testkit.skip(@src(), .no_device, initiator.FABRICS_DEV ++ " absent");
     var e: ?linux.E = null;
-    if (configfs.preflight(&e) != .ready) {
-        log.warn("nvmet fidelity: the kernel nvmet target is not ready — skipped", .{});
-        return error.SkipZigTest;
-    }
+    if (configfs.preflight(&e) != .ready) return testkit.skip(@src(), .no_kernel_feature, "the kernel nvmet target is not ready (configfs preflight)");
     return Rig.init(gpa, io) catch |err| switch (err) {
-        error.RingSetupFailed => error.SkipZigTest,
+        error.RingSetupFailed => testkit.skip(@src(), .no_kernel_feature, "the io_uring file layer's ring did not set up on this host"),
         else => err,
     };
 }

@@ -28,6 +28,7 @@
 //! module only guarantees the bytes land where the kernel reads them.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const page_size_min = std.heap.page_size_min;
@@ -1268,8 +1269,7 @@ test "the kmbuf rung on an sqz kernel: the register opcode takes a page buf_size
             else => return e,
         }
     } else {
-        log.debug("uring128: no kmbuf register opcode on this kernel (stock stratum)", .{});
-        return error.SkipZigTest;
+        return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel (stock stratum)");
     };
     log.debug("uring128: kmbuf register opcode {d} confirmed", .{rung});
     try testing.expectError(error.PathAlreadyExists, ring.registerBufRing(rung, reg));

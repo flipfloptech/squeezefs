@@ -74,7 +74,16 @@ pub fn build(b: *std.Build) void {
     zstd_c.defineCMacro("ZSTD_STATIC_LINKING_ONLY", "1");
     zstd_c.addIncludePath(b.path("vendor/zstd"));
     squeezefs_mod.addImport("zstd_c", zstd_c.createModule());
-    squeezefs_mod.addCSourceFile(.{ .file = b.path("vendor/zstd/zstd.c"), .flags = &.{ "-DZSTD_STATIC_LINKING_ONLY", "-std=c99" } });
+    // The amalgamation is its own static library, not a C source of the
+    // library module: the fuzz campaign (`zig build fuzz`, charter §11)
+    // rebuilds the test module with `-ffuzz`, and clang's coverage pass
+    // emits `__sanitizer_cov_trace_const_cmp*` hooks into C it instruments
+    // that Zig's fuzzer runtime does not define (the link fails); the
+    // decoders under fuzz are Zig, so zstd needs no instrumentation.
+    const zstd_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    zstd_mod.addCSourceFile(.{ .file = b.path("vendor/zstd/zstd.c"), .flags = &.{ "-DZSTD_STATIC_LINKING_ONLY", "-std=c99" } });
+    const zstd_lib = b.addLibrary(.{ .name = "zstd", .linkage = .static, .root_module = zstd_mod });
+    squeezefs_mod.linkLibrary(zstd_lib);
     squeezefs_mod.link_libc = true;
 
     // ---- the one CLI binary (charter §8) ----
@@ -141,6 +150,12 @@ pub fn build(b: *std.Build) void {
         break :blk staged.getDirectory();
     } else null;
 
+    // ---- release-gate mode (charter §11 "a release-gate mode turns skips
+    //      into failures"): every test run step carries the harness knob the
+    //      ONE testkit reads; a `testkit.skip` then FAILS the test except for
+    //      the classes a venue cannot honestly satisfy (`core/testkit.zig`) ----
+    const release_gate = b.option(bool, "release-gate", "Release-gate mode: environment skips fail the gate (except needs_reference_hardware / other_step)") orelse false;
+
     // ---- unit tests over the library module ----
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose names contain this text (repeatable)") orelse &.{};
     const unit_tests = b.addTest(.{
@@ -148,7 +163,11 @@ pub fn build(b: *std.Build) void {
         .root_module = squeezefs_mod,
         .filters = test_filters,
     });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const run_unit_tests = gated(b.addRunArtifact(unit_tests), release_gate);
+    // The fuzz campaign's replay seam (`core/fuzzkit.zig`): the artefact path
+    // rides the step's own environment so a replay is part of the run's
+    // cache manifest — a probe with a new artefact is never a cached pass.
+    if (b.graph.environ_map.get("SQUEEZEFS_TEST_FUZZ_REPLAY")) |p| run_unit_tests.setEnvironmentVariable("SQUEEZEFS_TEST_FUZZ_REPLAY", p);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
@@ -164,7 +183,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_rails_tests = b.addRunArtifact(rails_tests);
+    const run_rails_tests = gated(b.addRunArtifact(rails_tests), release_gate);
     // The rails scan the source tree relative to the repository root.
     run_rails_tests.setCwd(b.path("."));
     const rails_step = b.step("rails", "Run static-rail convention tests");
@@ -185,7 +204,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        const run_census = b.addRunArtifact(census_tests);
+        const run_census = gated(b.addRunArtifact(census_tests), release_gate);
         run_census.setCwd(dir);
         rails_step.dependOn(&run_census.step);
     }
@@ -200,7 +219,7 @@ pub fn build(b: *std.Build) void {
         .root_module = squeezefs_mod,
         .filters = if (test_filters.len != 0) test_filters else &.{"smoke:"},
     });
-    const run_smoke_tests = b.addRunArtifact(smoke_tests);
+    const run_smoke_tests = gated(b.addRunArtifact(smoke_tests), release_gate);
     run_smoke_tests.setCwd(exe.getEmittedBinDirectory());
     // The smoke drives a real mount on the venue's kernel: its outcome is
     // not a function of the build inputs, so every gate run re-runs it.
@@ -216,7 +235,7 @@ pub fn build(b: *std.Build) void {
         .root_module = squeezefs_mod,
         .filters = &.{"bench gate:"},
     });
-    const run_bench_smoke = b.addRunArtifact(bench_smoke_tests);
+    const run_bench_smoke = gated(b.addRunArtifact(bench_smoke_tests), release_gate);
     run_bench_smoke.setCwd(exe.getEmittedBinDirectory());
     run_bench_smoke.has_side_effects = true;
     // After the smoke: the two drive real mounts on one venue and must
@@ -235,7 +254,7 @@ pub fn build(b: *std.Build) void {
             .root_module = squeezefs_mod,
             .filters = &.{"shim smoke:"},
         });
-        const run_shim_smoke = b.addRunArtifact(shim_smoke_tests);
+        const run_shim_smoke = gated(b.addRunArtifact(shim_smoke_tests), release_gate);
         run_shim_smoke.setCwd(dir);
         run_shim_smoke.has_side_effects = true;
         run_shim_smoke.step.dependOn(&run_bench_smoke.step);
@@ -252,13 +271,42 @@ pub fn build(b: *std.Build) void {
         .root_module = squeezefs_mod,
         .filters = &.{"nvmet fidelity:"},
     });
-    const run_nvmet_smoke = b.addRunArtifact(nvmet_smoke_tests);
+    const run_nvmet_smoke = gated(b.addRunArtifact(nvmet_smoke_tests), release_gate);
     run_nvmet_smoke.setCwd(exe.getEmittedBinDirectory());
     run_nvmet_smoke.has_side_effects = true;
     run_nvmet_smoke.step.dependOn(&run_bench_smoke.step);
     if (shim_dir != null) run_nvmet_smoke.step.dependOn(shim_smoke_step);
     const nvmet_smoke_step = b.step("nvmet-smoke", "Run the nvmeof fidelity tier (share/connect/format/mount/PR legs on the kernel nvmet target)");
     nvmet_smoke_step.dependOn(&run_nvmet_smoke.step);
+
+    // ---- the nightly fuzz campaign (charter §11 "nightly fuzz"): the
+    //      driver runs the build runner's fuzzer on every census target for
+    //      `SQUEEZEFS_TEST_FUZZ_SECONDS` each, persists the corpus under
+    //      `SQUEEZEFS_TEST_FUZZ_CORPUS_DIR`, saves + minimizes crashes and
+    //      writes the campaign report (`src/gates/fuzz_campaign.zig`) ----
+    const fuzz_campaign = b.addExecutable(.{
+        .name = "fuzz-campaign",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gates/fuzz_campaign.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "squeezefs", .module = squeezefs_mod }},
+        }),
+    });
+    const run_fuzz_campaign = b.addRunArtifact(fuzz_campaign);
+    run_fuzz_campaign.addArg("--zig");
+    run_fuzz_campaign.addFileArg(.zig_exe);
+    run_fuzz_campaign.addArg("--cache-dir");
+    run_fuzz_campaign.addDirectoryArg(.cache_root);
+    run_fuzz_campaign.addArg("--prefix");
+    run_fuzz_campaign.addDirectoryArg(.{ .relative = .{ .base = .install_prefix } });
+    run_fuzz_campaign.addArg("--repo");
+    run_fuzz_campaign.addDirectoryArg(b.path("."));
+    if (b.option([]const u8, "fuzz-filter", "Run only the fuzz targets whose name contains this text")) |f| run_fuzz_campaign.addArgs(&.{ "--filter", f });
+    // A campaign's outcome is the fuzzer's, never a function of the build inputs.
+    run_fuzz_campaign.has_side_effects = true;
+    const fuzz_step = b.step("fuzz", "The nightly fuzz campaign: every fuzz target under the fuzzer for SQUEEZEFS_TEST_FUZZ_SECONDS each, persistent corpus, crash artefacts, report");
+    fuzz_step.dependOn(&run_fuzz_campaign.step);
 
     // ---- fmt check ----
     const fmt_step = b.step("fmt", "Check formatting (zig fmt --check)");
@@ -383,6 +431,13 @@ pub fn build(b: *std.Build) void {
         const refuse = b.addFail("the dist step requires -Dprofile=dist");
         dist_step.dependOn(&refuse.step);
     }
+}
+
+/// A test run step under the release-gate option: the harness knob the ONE
+/// testkit reads (`src/core/testkit.zig`) rides the step's environment.
+fn gated(run: *std.Build.Step.Run, release_gate: bool) *std.Build.Step.Run {
+    if (release_gate) run.setEnvironmentVariable("SQUEEZEFS_TEST_RELEASE_GATE", "1");
+    return run;
 }
 
 /// The release train. Bumped only as a release act across all first-party

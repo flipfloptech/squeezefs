@@ -5,6 +5,8 @@
 //! compile only on Linux.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const derive = @import("../core/derive.zig");
@@ -377,7 +379,7 @@ test "pad to grain: lengths round up to the grain; grain <= 1 is verbatim" {
 }
 
 test "the grain ladder on a regular file lands on a power of two <= 4096 from one of the three sources" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "align_probe: Linux only");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = testing.io;
@@ -395,4 +397,14 @@ test "the grain ladder on a regular file lands on a power of two <= 4096 from on
     try testing.expect(st.is_file);
     try testing.expect(!st.is_bdev);
     try testing.expectEqual(@as(?PathStat, null), try statPath("/definitely/not/here"));
+}
+
+fn logicalBlockSizeFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseLogicalBlockSize(buf[0..len]);
+}
+
+test "fuzz: the logical_block_size sysfs parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, logicalBlockSizeFuzz, .{ .corpus = &.{ fuzzkit.slice("4096\n"), fuzzkit.slice("0"), fuzzkit.slice("18446744073709551616") } });
 }

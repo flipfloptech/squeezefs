@@ -35,6 +35,7 @@
 //! release the queue lease → the census vote.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -559,4 +560,16 @@ test "the identity pair: a uuid text becomes the 16 hostid bytes; a malformed uu
 test "the association against REAL nvmet-tcp over loopback: the kernel initiator connects the namespace; the userspace association connects a SECOND time read-only, reads whole blocks through the lane's RECV leg into the area and gathers byte-exact against the kernel path; gather ≡ fill; the MQES clamp; cid/chunk custody closes; teardown clean" {
     const e2e = @import("association_e2e_linux.zig");
     try e2e.run();
+}
+
+fn identityPairFuzz(_: void, smith: *std.testing.Smith) !void {
+    var nqn: [300]u8 = undefined;
+    var uuid: [64]u8 = undefined;
+    const n = smith.slice(&nqn);
+    const u = smith.slice(&uuid);
+    if (Identity.fromPair(nqn[0..n], uuid[0..u])) |id| try std.testing.expectEqualSlices(u8, nqn[0..n], id.hostnqn[0..id.hostnqn_len]);
+}
+
+test "fuzz: the host identity pair decoder is total — an over-long NQN or a malformed uuid is null, never a panic" {
+    try fuzzkit.fuzz({}, identityPairFuzz, .{});
 }

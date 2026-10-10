@@ -11,6 +11,7 @@
 //! Portable; pure over argv slices (the `Verb` borrows them).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const knobs = @import("../core/knobs.zig");
 const meta_geometry = @import("../meta/geometry.zig");
 const transform = @import("../data/transform.zig");
@@ -2226,4 +2227,20 @@ test "usage names every verb" {
     }
     try testing.expect(std.mem.indexOf(u8, usage(.mount), "--supervise") != null);
     try testing.expect(std.mem.indexOf(u8, usage(.umount), "<mountpoint>") != null);
+}
+
+fn wordParsersFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    const word = buf[0..len];
+    _ = parseUuid(word);
+    _ = parseEndpointSpec(word);
+    _ = parseShards(word);
+    _ = parseJobIdWord(word);
+    _ = parseTakeSlots(word);
+    _ = parseSize(word);
+}
+
+test "fuzz: every argv word parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, wordParsersFuzz, .{ .corpus = &.{ fuzzkit.slice("c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"), fuzzkit.slice("127.0.0.1:4420"), fuzzkit.slice("3/8"), fuzzkit.slice("0x7fffffffffffffff"), fuzzkit.slice("1-"), fuzzkit.slice("16G"), fuzzkit.slice("99999999999999999999T") } });
 }

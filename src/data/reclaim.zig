@@ -55,6 +55,7 @@
 //! re-covered on reuse or by `trim --full`.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Atomic = std.atomic.Value;
@@ -1721,7 +1722,7 @@ test "at_cap_enqueue_parks_until_drain_relieves; a 0 ms bound soft-overflows at 
         }
     };
     var fut = io.concurrent(Drainer.run, .{ io, g.r }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     const t0 = clock.monotonicNs();
     try testing.expectEqual(FreeOutcome.terminal, g.r.freeBlock(io, 0, 2, g.alloc.stampOf(2)));

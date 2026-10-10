@@ -10,6 +10,7 @@
 //! Portable; pure; the diagnostic formats on demand.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 
 pub const Scheme = enum {
     meta,
@@ -153,4 +154,26 @@ test "schemeOf classifies an argv word" {
     try testing.expectEqual(@as(?Scheme, .data), schemeOf("sqdata:///x"));
     try testing.expectEqual(@as(?Scheme, null), schemeOf("/mnt/x"));
     try testing.expectEqual(@as(?Scheme, null), schemeOf("--force"));
+}
+
+fn uriFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    var members: [MAX_MEMBERS][]const u8 = undefined;
+    var diag: Refusal = undefined;
+    for ([_]Scheme{ .meta, .data }) |scheme| {
+        if (parse(scheme, text, &members, &diag)) |p| {
+            try std.testing.expect(p.paths.len >= 1 and p.paths.len <= MAX_MEMBERS);
+            for (p.paths) |path| try std.testing.expect(path.len != 0 and path[0] == '/');
+        } else |_| {
+            var out: [2048]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&out);
+            diag.format(&w) catch {};
+        }
+    }
+}
+
+test "fuzz: the URI parser is total on arbitrary text — every accepted member is absolute, every refusal prints" {
+    try fuzzkit.fuzz({}, uriFuzz, .{ .corpus = &.{ fuzzkit.slice("sqmeta:///a,/b"), fuzzkit.slice("sqdata://relative"), fuzzkit.slice("sqmeta://,,,,") } });
 }

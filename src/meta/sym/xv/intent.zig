@@ -19,6 +19,7 @@
 //! static (0002 row 259's law).
 
 const std = @import("std");
+const fuzzkit = @import("../../../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const counters = @import("../../../core/counters.zig");
@@ -570,20 +571,24 @@ fn decodeTotalFuzz(_: void, smith: *std.testing.Smith) anyerror!void {
     const len = smith.slice(&in);
     const input = in[0..len];
     var out: [XV_MAX_STEPS]StepRec = undefined;
+    // The stored form under an arbitrary key: total, and the key's tx_id law holds.
+    var stored_steps: [XV_MAX_STEPS]StepRec = undefined;
+    const split = @min(len, key.XATTR_KEY_LEN);
+    _ = decodeStored(input[0..split], input[split..], &stored_steps) catch {};
     const it = decode(input, &out) catch return;
     var buf: [XV_MAX_STEPS * 56 + 64]u8 = undefined;
     const re = try encode(it.op, it.flags, it.tx_id, it.steps, 1 << 20, &buf);
     try testing.expectEqualSlices(u8, input, re);
 }
 
-test "fuzz: the intent decoder is total and encode∘decode is the identity" {
+test "fuzz: the intent decoder and its stored form are total and encode∘decode is the identity" {
     var buf: [1024]u8 = undefined;
     const steps = sampleSteps();
     const img = try encode(.create, 0, 42, &steps, 16 << 10, &buf);
     var framed: [4 + 1024]u8 = undefined;
     std.mem.writeInt(u32, framed[0..4], @intCast(img.len), .little);
     @memcpy(framed[4..][0..img.len], img);
-    try testing.fuzz({}, decodeTotalFuzz, .{ .corpus = &.{framed[0 .. 4 + img.len]} });
+    try fuzzkit.fuzz({}, decodeTotalFuzz, .{ .corpus = &.{framed[0 .. 4 + img.len]} });
     // The PRNG arm: mutations of a valid image never panic and a surviving
     // decode re-encodes byte-identically.
     var prng = std.Random.DefaultPrng.init(7);

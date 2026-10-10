@@ -10,6 +10,7 @@
 //! Portable (`std.Io.net.IpAddress`'s parsers take no `Io`).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const net = std.Io.net;
 
 pub const FAMILY_NONE: u8 = 0;
@@ -172,4 +173,24 @@ test "the bind knob: absent/auto, off, explicit verbatim; malformed refuses" {
     const b = try Bind.parse("127.0.0.1:4242");
     try testing.expectEqual(@as(u16, 4242), b.explicit.port);
     try testing.expectError(error.MalformedEndpoint, Bind.parse("nonsense"));
+}
+
+fn endpointTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    if (parseEndpoint(text)) |e| {
+        // What parses prints, and the printed form parses back to the same wire value.
+        var out: [96]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try e.format(&w);
+        const back = try parseEndpoint(w.buffered());
+        try std.testing.expectEqual(e, back);
+    } else |_| {}
+    _ = Bind.parse(text) catch {};
+    _ = Bind.parse(null) catch {};
+}
+
+test "fuzz: the endpoint and bind text parsers are total and a parsed endpoint round-trips through its printed form" {
+    try fuzzkit.fuzz({}, endpointTextFuzz, .{ .corpus = &.{ fuzzkit.slice("127.0.0.1:4420"), fuzzkit.slice("[::1]:65535"), fuzzkit.slice("auto"), fuzzkit.slice("off"), fuzzkit.slice("1.2.3.4:99999") } });
 }

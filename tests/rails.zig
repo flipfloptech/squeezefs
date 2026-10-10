@@ -606,3 +606,167 @@ test "the header census parsers: a Zig export and a C prototype of the same shap
     try std.testing.expect(!sameProto(exports.items[0], protos.items[2]));
     try std.testing.expect(!sameProto(exports.items[0], protos.items[3]));
 }
+
+// ---------------------------------------------------------------------------
+// The skip rail (charter §11: every environment skip routed through one
+// testkit): the identifier `SkipZigTest` appears nowhere in the tree but in
+// `src/core/testkit.zig`. A bare skip has no class, no ledger row and no
+// release-gate verdict.
+// ---------------------------------------------------------------------------
+
+const testkit_path = "src/core/testkit.zig";
+
+/// Does the file name `SkipZigTest` as an identifier token (`error.SkipZigTest`,
+/// an error-set member)? Prose in a comment or a string does not count.
+fn namesSkipZigTest(text: [:0]const u8) ?usize {
+    var tok = std.zig.Tokenizer.init(text);
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) return null;
+        if (t.tag == .identifier and std.mem.eql(u8, text[t.loc.start..t.loc.end], "SkipZigTest")) return lineOf(text, t.loc.start);
+    }
+}
+
+test "skip rail: no bare error.SkipZigTest outside the testkit" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    const cwd = std.Io.Dir.cwd();
+    for (roots) |root| {
+        var d = try cwd.openDir(io, root, .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, root, &files);
+    }
+    try std.testing.expect(files.items.len >= min_files);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var kit_seen = false;
+    for (files.items) |path| {
+        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        defer gpa.free(text);
+        const line = namesSkipZigTest(text) orelse continue;
+        if (std.mem.eql(u8, path, testkit_path)) {
+            kit_seen = true;
+            continue;
+        }
+        try violations.writer.print("  {s}:{d}: a bare SkipZigTest — route it through testkit.skip(@src(), .<class>, \"why\")\n", .{ path, line });
+    }
+    // The kit itself names the error (a broken scanner passes vacuously otherwise).
+    try std.testing.expect(kit_seen);
+    if (violations.written().len != 0) {
+        std.debug.print("bare skip(s):\n{s}", .{violations.written()});
+        return error.BareSkip;
+    }
+}
+
+test "the skip scanner: an identifier counts, prose in a comment or a string does not" {
+    try std.testing.expectEqual(@as(?usize, 2), namesSkipZigTest("const a = 1;\nreturn error.SkipZigTest;\n"));
+    try std.testing.expectEqual(@as(?usize, null), namesSkipZigTest("// error.SkipZigTest in prose\nconst s = \"SkipZigTest\";\n"));
+}
+
+// ---------------------------------------------------------------------------
+// The fuzz census rail (charter §11 "Fuzz every untrusted decoder"): every
+// public decoder under the naming law (`src/gates/census.zig`) is NAMED by a
+// `test "fuzz: …"` in its own file; every fuzz test calls the ONE entry
+// (`fuzzkit.fuzz`); fuzz test names are unique tree-wide (the nightly
+// campaign filters by name); nothing calls `std.testing.fuzz` directly but
+// the kit. The census IS the list the campaign runs.
+// ---------------------------------------------------------------------------
+
+const census = squeezefs.gates.census;
+const fuzzkit_path = "src/core/fuzzkit.zig";
+
+/// The known population at the rail's landing (rung 9): a scanner that finds
+/// fewer decoders or fuzz tests than this is broken, not a cleaner tree.
+const min_decoders = 100;
+const min_fuzz_tests = 40;
+
+fn callsStdFuzzDirectly(text: [:0]const u8) ?usize {
+    var tok = std.zig.Tokenizer.init(text);
+    // `<receiver> . fuzz (` — the receiver is `testing` (or `std.testing`), never the kit.
+    var prev: [3]std.zig.Token.Tag = .{ .invalid, .invalid, .invalid };
+    var prev_word: [3][]const u8 = .{ "", "", "" };
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) return null;
+        if (t.tag == .l_paren and prev[2] == .identifier and std.mem.eql(u8, prev_word[2], "fuzz") and prev[1] == .period and prev[0] == .identifier and std.mem.eql(u8, prev_word[0], "testing")) {
+            return lineOf(text, t.loc.start);
+        }
+        prev[0] = prev[1];
+        prev[1] = prev[2];
+        prev[2] = t.tag;
+        prev_word[0] = prev_word[1];
+        prev_word[1] = prev_word[2];
+        prev_word[2] = text[t.loc.start..t.loc.end];
+    }
+}
+
+test "fuzz census: every public decoder has a fuzz test naming it; every fuzz test uses fuzzkit; names are unique; only the kit calls std.testing.fuzz" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    const cwd = std.Io.Dir.cwd();
+    {
+        var d = try cwd.openDir(io, "src", .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, "src", &files);
+    }
+    try std.testing.expect(files.items.len >= min_files);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var it = names.iterator();
+        while (it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            gpa.free(e.value_ptr.*);
+        }
+        names.deinit(gpa);
+    }
+    var decoders: usize = 0;
+    var fuzz_tests: usize = 0;
+    for (files.items) |path| {
+        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        defer gpa.free(text);
+        var c = try census.scan(gpa, text);
+        defer c.deinit(gpa);
+        decoders += c.decoders.items.len;
+        fuzz_tests += c.fuzz_tests.items.len;
+        for (c.decoders.items) |d| {
+            if (!c.covers(d.id)) try violations.writer.print("  {s}:{d}: decoder `{s}` has no `test \"fuzz: …\"` in this file naming it\n", .{ path, d.line, d.id });
+        }
+        for (c.fuzz_tests.items) |ft| {
+            if (!ft.uses_fuzzkit and !std.mem.eql(u8, path, fuzzkit_path)) try violations.writer.print("  {s}:{d}: `{s}` does not call fuzzkit.fuzz (the ONE entry)\n", .{ path, ft.line, ft.name });
+            const gop = try names.getOrPut(gpa, ft.name);
+            if (gop.found_existing) {
+                try violations.writer.print("  {s}:{d}: fuzz test name `{s}` is also used in {s} — the campaign filters by name; make it unique\n", .{ path, ft.line, ft.name, gop.value_ptr.* });
+            } else {
+                gop.key_ptr.* = try gpa.dupe(u8, ft.name);
+                gop.value_ptr.* = try gpa.dupe(u8, path);
+            }
+        }
+        if (!std.mem.eql(u8, path, fuzzkit_path)) {
+            if (callsStdFuzzDirectly(text)) |line| try violations.writer.print("  {s}:{d}: calls std.testing.fuzz directly — use fuzzkit.fuzz\n", .{ path, line });
+        }
+    }
+    if (violations.written().len != 0) {
+        std.debug.print("fuzz census violation(s) ({d} decoders, {d} fuzz tests scanned):\n{s}", .{ decoders, fuzz_tests, violations.written() });
+        return error.FuzzCensusViolation;
+    }
+    try std.testing.expect(decoders >= min_decoders);
+    try std.testing.expect(fuzz_tests >= min_fuzz_tests);
+}
+
+test "the direct-call scanner: `std.testing.fuzz(` and `testing.fuzz(` are caught, `fuzzkit.fuzz(` is not" {
+    try std.testing.expect(callsStdFuzzDirectly("try std.testing.fuzz({}, one, .{});") != null);
+    try std.testing.expect(callsStdFuzzDirectly("try testing.fuzz({}, one, .{});") != null);
+    try std.testing.expect(callsStdFuzzDirectly("try fuzzkit.fuzz({}, one, .{});") == null);
+}

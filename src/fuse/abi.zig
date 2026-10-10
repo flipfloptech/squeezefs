@@ -20,6 +20,7 @@
 //! that someday reads it is a one-line change, not a silently ignored byte.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 
 comptime {
@@ -1001,5 +1002,5 @@ fn decodersTotalFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: every decoder is total on arbitrary bytes" {
-    try std.testing.fuzz({}, decodersTotalFuzz, .{});
+    try fuzzkit.fuzz({}, decodersTotalFuzz, .{});
 }

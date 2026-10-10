@@ -17,6 +17,7 @@
 //! allocation: the mpsc ring is inline (`capacity` is comptime).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
 const tick = @import("tick.zig");
@@ -607,7 +608,7 @@ fn oneshotParkedReceiver(io: Io) !void {
         }
     };
     var fut = io.concurrent(Cancelled.run, .{ io, &ch2 }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     while (!ch2.receiverParked(io)) try std.Thread.yield();
     try testing.expectError(error.Canceled, fut.cancel(io));
@@ -708,7 +709,7 @@ fn mpscLastSenderAndCancel(io: Io) !void {
         }
     };
     var fut = io.concurrent(Cancelled.run, .{ io, tx2 }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     while (ch2.sendWaiters(io) == 0) try std.Thread.yield();
     try testing.expectError(error.Canceled, fut.cancel(io));
@@ -840,12 +841,12 @@ fn mpscAcrossLanes(io: Io) !void {
     };
     var s: Shared = .{};
     var p = io.concurrent(Shared.producer, .{ io, &s }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     var c = io.concurrent(Shared.consumer, .{ io, &s }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
             try p.await(io);
-            return error.SkipZigTest;
+            return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency");
         },
     };
     try p.await(io);

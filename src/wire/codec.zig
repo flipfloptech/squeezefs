@@ -21,6 +21,7 @@
 //! handed out.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 
 comptime {
@@ -324,4 +325,27 @@ test "cursor arrays: the count is checked against the bytes before the view is f
     var sb: Builder = .init(&small);
     try testing.expectError(error.Overflow, sb.put(u32, 1));
     try testing.expectError(error.Malformed, countAtMost(5, 4));
+}
+
+/// The generic field-wise decoders are total on arbitrary bytes, and a
+/// fixed-size value that decodes re-encodes byte-identically.
+fn codecTotalFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const len = smith.slice(&buf);
+    const bytes = buf[0..len];
+    const n = comptime wireSize(Fixture);
+    if (bytes.len >= n) {
+        const fixed: *const [n]u8 = bytes[0..n];
+        if (decodeFrom(Fixture, fixed)) |v| {
+            var re: [n]u8 = undefined;
+            encodeInto(Fixture, v, &re);
+            try std.testing.expectEqualSlices(u8, fixed, &re);
+        } else |_| {}
+    }
+    _ = decodePayload(Fixture, bytes) catch {};
+    _ = decodePayload(Inner, bytes) catch {};
+}
+
+test "fuzz: decodeFrom and decodePayload are total on arbitrary bytes and a decoded fixed value re-encodes to its bytes" {
+    try fuzzkit.fuzz({}, codecTotalFuzz, .{});
 }

@@ -38,6 +38,7 @@
 //! carry the trailing NUL the kernel requires (Q13).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const linux = std.os.linux;
 const abi = @import("abi.zig");
 const geometry = @import("geometry.zig");
@@ -1782,5 +1783,5 @@ fn requestFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the request path is total on arbitrary bytes" {
-    try std.testing.fuzz({}, requestFuzz, .{});
+    try fuzzkit.fuzz({}, requestFuzz, .{});
 }

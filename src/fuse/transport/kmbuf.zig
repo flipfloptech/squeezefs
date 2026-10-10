@@ -12,6 +12,7 @@
 //! which bid an ent holds is the CQE's word (`zc.Attachment`).
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -205,7 +206,7 @@ test "headers: page-granular span, ent i at base + i × 288, the iovec covers de
 test "kmbuf setup on this kernel: the headers register at index 0 (BufRing) or depth (zc), the ring registers at bgid 0 with a page-aligned buf_size and next_pow2(depth) entries, the region maps and bid 0 is real memory; teardown releases" {
     const page: u32 = @intCast(std.heap.pageSize());
     const verdict = probes.driver.probeKmbuf(page);
-    const pair = verdict.opcodes() orelse return error.SkipZigTest;
+    const pair = verdict.opcodes() orelse return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel");
     for ([_]bool{ false, true }) |zero_copy| {
         var ring = try uring128.Ring128.init(16, 0);
         defer ring.deinit();
@@ -241,7 +242,7 @@ test "pageOrder: 1 MiB on 4 KiB pages is order 8; a sub-page payload is order 0;
 test "the ENOMEM seam: every attempt answers ENOMEM — the bounded ladder retries REGISTER_RETRIES times, the refusal is the typed KmbufRingEnomem naming the remedy, nothing is pinned, the table is released" {
     const page: u32 = @intCast(std.heap.pageSize());
     const verdict = probes.driver.probeKmbuf(page);
-    const pair = verdict.opcodes() orelse return error.SkipZigTest;
+    const pair = verdict.opcodes() orelse return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel");
     var ring = try uring128.Ring128.init(16, 0);
     defer ring.deinit();
     var h = try Headers.init(6, page);

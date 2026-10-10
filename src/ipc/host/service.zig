@@ -45,6 +45,7 @@
 //! after every acked write.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -1121,4 +1122,14 @@ test "/proc/stat's cpu line parses to (total, idle + iowait); garbage is null" {
     try testing.expectEqual(@as(u64, 820), r[1]);
     try testing.expect(parseProcStatCpu("intr 1 2 3") == null);
     try testing.expect(parseProcStatCpu("cpu  1 2") == null);
+}
+
+fn procStatCpuFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseProcStatCpu(buf[0..len]);
+}
+
+test "fuzz: the /proc/<pid>/stat cpu-field parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, procStatCpuFuzz, .{ .corpus = &.{ fuzzkit.slice("1 (a) b) S 0 0 0 0 0 0 0 0 0 0 11 22 0 0\n"), fuzzkit.slice("(") } });
 }

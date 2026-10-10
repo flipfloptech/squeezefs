@@ -11,6 +11,8 @@
 //! relaxed load) and apply their own response.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
@@ -1614,7 +1616,7 @@ test "fleet share mount refusal: share 1 or an explicit tier stands down; a divi
 // ---- Linux readers and the sampler thread ----
 
 test "linux: cgroup/proc readers return plausible values" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "budget: Linux only");
     const page: u64 = derive.facts().page_size;
     const rss = readRssBytes(testing.io, page);
     try testing.expect(rss > 0);
@@ -1709,4 +1711,18 @@ test "sampler thread: SQUEEZEFS_TEST_MEM_SAMPLER_TICK_ON_STOP reads every source
         try testing.expectEqual(Level.green, b.level());
         try testing.expectEqual(@as(u64, 1), src.reads.load(.monotonic));
     }
+}
+
+fn procTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    _ = parseUnreclaimableMemoryStat(text);
+    if (parseCgroupV2Path(text)) |p| try std.testing.expect(p.len <= text.len);
+    _ = parseMemoryMax(text);
+    _ = parseStatmResidentPages(text);
+}
+
+test "fuzz: the cgroup and proc text readers are total on arbitrary text" {
+    try fuzzkit.fuzz({}, procTextFuzz, .{ .corpus = &.{ fuzzkit.slice("anon 4096\nkernel_stack 8192\nslab_unreclaimable 1\n"), fuzzkit.slice("0::/user.slice/x\n"), fuzzkit.slice("max\n"), fuzzkit.slice("12 34 5 6 0 7 0\n") } });
 }

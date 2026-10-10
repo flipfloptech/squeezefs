@@ -17,6 +17,7 @@
 //! namespace, the char twin and RESCAP. Linux only.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -279,7 +280,7 @@ test "validate: a missing path, a zero-size file, a character device and an ordi
     defer _ = linux.unlink(blank);
     const v = validate(blank);
     try testing.expect(v == .ok and !v.ok.is_bdev and v.ok.size == 1 << 20);
-    const pool = uring_fs.Pool.init(testing.allocator, uring_fs.Config.fixed(1, uring_fs.nofileSoftAsFound())) catch return error.SkipZigTest;
+    const pool = uring_fs.Pool.init(testing.allocator, uring_fs.Config.fixed(1, uring_fs.nofileSoftAsFound())) catch return testkit.skip(@src(), .no_kernel_feature, "the io_uring file layer's ring did not set up on this host");
     defer pool.deinit();
     try testing.expectEqual(Class.blank, classify(pool, blank));
     const text = "/build/tmp/storage-text.img";

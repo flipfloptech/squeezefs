@@ -29,6 +29,7 @@
 //! by `SERVICE_PARK_MAX_NS`.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const layout = @import("layout.zig");
 const futex = @import("../sync/futex.zig");
 const knobs = @import("../core/knobs.zig");
@@ -437,7 +438,7 @@ test "service park: arm sets every parked flag then snapshots; a submission afte
 }
 
 test "service park on Linux: a parked owner is woken by a client's submit on ANY owned session within the bound" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (@import("builtin").os.tag != .linux) return testkit.skip(@src(), .no_linux, "doorbell: the shared futex face is Linux only");
     // The words must live in shared memory for the shared futex face; a
     // memfd page stands in for the session header's line 1.
     const linux = std.os.linux;

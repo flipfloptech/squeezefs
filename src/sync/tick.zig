@@ -26,6 +26,7 @@
 //! smoke run, the phantom behind the "5 s stall").
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
@@ -202,7 +203,7 @@ fn fiberPark(io: Io) !void {
     var word: std.atomic.Value(u32) = .init(0);
     var c: counters.ShardedCounter = .{};
     var fut = io.concurrent(Parked.run, .{ io, &word, &c }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     // The waiter is parked (or about to be): the token ends it either way.
     std.Thread.yield() catch {};

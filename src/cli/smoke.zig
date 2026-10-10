@@ -35,6 +35,7 @@
 //! is ever partial, nothing acked is lost. Linux only.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -560,37 +561,17 @@ fn judgeDeath(name: []const u8, term: std.process.Child.Term, killed_by_us: bool
     defer if (log_text) |t| gpa.free(t);
     if (term == .signal and term.signal == .KILL and !killed_by_us) {
         std.debug.print("\n--- EXTERNAL KILL: daemon {s} died of a SIGKILL this test never sent while waiting for '{s}' — a concurrent runner swept the venue (`pkill -9 -x squeezefs` / `umount -l`); the row is SKIPPED, not failed ---\n", .{ name, waiting_for });
-        return error.SkipZigTest;
+        return testkit.skip(@src(), .external_interference, "a daemon died of a SIGKILL this test never sent (a concurrent runner swept the venue)");
     }
     std.debug.print("\n--- daemon {s} exited ({f}) while waiting for '{s}' ---\n{s}\n", .{ name, term, waiting_for, log_text orelse "" });
     return error.DaemonExited;
 }
 
 /// Root, `/dev/fuse`, `CAP_SYS_ADMIN`, the binary beside us.
-fn venueAvailable(io: Io) bool {
-    if (linux.getuid() != 0) return false;
-    const rc = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    _ = linux.close(@intCast(rc));
-    var buf: [4096]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(io, "/proc/self/status", &buf) catch return false;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    var cap_ok = false;
-    while (it.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "CapEff:")) continue;
-        const caps = std.fmt.parseInt(u64, std.mem.trim(u8, line["CapEff:".len..], " \t"), 16) catch return false;
-        cap_ok = caps & (@as(u64, 1) << 21) != 0;
-    }
-    if (!cap_ok) {
-        log.warn("smoke: CAP_SYS_ADMIN is not in this container's effective set — mount(2) would be EPERM; recreate the venue with `scripts/venue up`. Skipping.", .{});
-        return false;
-    }
-    var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, "squeezefs", 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
-        log.warn("smoke: no ./squeezefs binary in the cwd — run through `zig build smoke`. Skipping.", .{});
-        return false;
-    }
-    return true;
+/// The venue law (`testkit.venue.mount`): the binary beside us, root,
+/// `/dev/fuse`, CAP_SYS_ADMIN — each absence its own ledgered class.
+fn venueMissing(io: Io) ?testkit.Why {
+    return testkit.venue.mount(io, &.{"squeezefs"});
 }
 
 fn fuseMountsOf(gpa: std.mem.Allocator, io: Io, mp: []const u8) !usize {
@@ -697,7 +678,7 @@ const verify_script =
 
 test "smoke: format → mount → the POSIX pass through the shell → umount → remount intact → status; the gauges through SIGUSR1" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -893,7 +874,7 @@ const routing_verify_script =
 
 test "smoke: a TWO-MEMBER metadata set through the binary — format sqmeta://a,b → mount → 2000 files over 8 dirs spread over both members (routing_* gauges) → remount in the other URI order, every file present → volume list → remove-meta offline → mount with one member, every file present" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -1129,7 +1110,7 @@ fn smokeJoinerIdentity(n: u32) wire_verbs.WireIdentity {
 
 test "smoke: THE N-DAEMON POSTURE, the manager half — format (the symmetric default; meta + 2 data, cache path) → mount A: the listener is up, .stats names the pid and the wire endpoint, the durable endpoint:{0} record agrees → a second PROCESS dials A over TCP with the secret read off the device: JoinAppender, M rotor slots, a first touch, SlotBusy on A's native slot, a membership join → `appenders` lists its region Live and `clients` lists the member → a joiner that DIES is evicted at T_owner and its death recorded in the ledger → the live joiner releases, leaves (region Free) → `umount` signals A and A's own close detaches" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -1577,7 +1558,7 @@ fn matrixCreateScript(gpa: std.mem.Allocator) ![]u8 {
 
 test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SECOND PROCESS joined over TCP (no flock, the region over the wire, the page as its ledger) → `appenders`/`clients` show both → B creates 2,000 files in its own directories (0 lease conflicts, rotor mints) → A reads B's files under tokens (grants; the second read is served from the cache; a write on B recalls and A's third read is fresh) → `tar -x` on B into a directory A owns (cross-owner intents, 0 stuck, closure) → `chmod` from A on B's file (the record ship; B's stat sees it) → a 200 MiB `dd` on B (every block a ranged grant pulled from A; `df` per the rule on both; the sha round trip from A; `rm` ships the frees to A) → closure + invariant tripwires 0 on both → umount B (page Free, the member row gone) → umount A" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -1964,7 +1945,7 @@ fn expectTreeWhole(host: anytype, dir: []const u8) !usize {
 
 test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒ A evicts B at T_owner, records the death, recovers its region (dead_members_acted ≡ recorded × regions held, rollbacks 0, the page recovered → free), every file B acked is whole on A → remount B under the same node (the same-node successor) sees them → B's FIRST cross-owner mkdir succeeds → A's `rm -rf` of the recovered tree completes; recall timeouts 0, tripwires 0 on both" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -2103,7 +2084,7 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
 
 test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B PARKS-AND-RECLAIMS at T_self (acks held at the pre-admission gate, park expiries 0) → remount A (the D0 ladder: the same-host dead-pid proof, A wins volume 0 again at term 2, the grace window open, the allocation leases taken over from the dead incarnation) → B's reclaim lands in the grace window, its manager link re-points, the held writes drain and every storm file is whole on both" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -2260,7 +2241,7 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
 
 test "smoke: THE KILL ROWS (c) — `appender clear` refuses a live-mounted set; after A's clean umount parks B and B is killed unrecovered, `appender clear <uri> 1` performs the operator path (the page Recovering{0}, the writer bring-up, the EARLY record, the leave) and `appenders` shows `recovering`; `appender clear <uri> 0` refuses; the next mount's poll recovers the region and `appenders` shows `free`" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -2353,7 +2334,7 @@ test "smoke: THE KILL ROWS (c) — `appender clear` refuses a live-mounted set; 
 
 test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -2501,7 +2482,7 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
 
 test "smoke: kill -9 mid-tar -x → remount replays the window → every file present is whole or empty, none acked is lost, nothing torn after the crash; a clean cycle after it" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -2637,7 +2618,7 @@ test "smoke: kill -9 mid-tar -x → remount replays the window → every file pr
 
 test "smoke: --daemon --supervise --log-file: the invoking process returns 0 only after ready, the log file is 0600 and carries the ready line, umount ends the daemon and the supervisor; a refused daemon mount reports its reason to the invoker" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -2696,9 +2677,9 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
 
 test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming the page order and the remedy, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     // The registration is reached only where the probe confirmed kmbuf.
-    if (transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return error.SkipZigTest;
+    if (transport.probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel");
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -2740,7 +2721,7 @@ const data_volume_len: u64 = 3 * ((4 << 20) + 4096) + 4096;
 
 test "smoke: a SET format — meta + 2 data files + lz4 + aes-256-gcm + a cache path → both data superblocks written and read back → status lists both tags → a re-format refuses on the meta AND on a data volume → a mount with no key refuses naming every source → with the key it mounts, logs the set config and the key id, serves, unmounts → renumbered or blank data devices refuse the mount by name" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -3543,7 +3524,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
 
 test "smoke: the data plane WITH a cache path — dd 200 MiB sha round trip, cp 100 MiB + cmp, truncate, 4 KiB overwrites, 1000 packed 64 KiB files and their census, the 8-way storm with every ledger closed, rm → df baseline" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, io);
     defer rig.deinit();
     try dataPlanePass(rig, true);
@@ -3551,7 +3532,7 @@ test "smoke: the data plane WITH a cache path — dd 200 MiB sha round trip, cp 
 
 test "smoke: the data plane WITHOUT a cache path — staging and the NVMe tier OFF, every write beyond inline striped; the same pass with 100 one-block files" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, io);
     defer rig.deinit();
     try dataPlanePass(rig, false);
@@ -3651,7 +3632,7 @@ fn kernelAioStage(rig: *Rig, cache: bool) !void {
 
 test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PWRITEs into a fresh file (the inline → striped promotion under concurrent writes), again over the existing file, under O_DIRECT; every io_getevents res the page, byte-exact read-back — on a set WITHOUT a cache path (every write beyond inline striped) and WITH one" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     {
         const rig = try Rig.init(testing.allocator, io);
         defer rig.deinit();
@@ -3674,13 +3655,13 @@ test "smoke: KERNEL AIO on the plain mount (no shim): io_submit of 8 × 4 KiB PW
 // 2026-10-07 lost overwrite showed in ~1 run of 12 of the single pass.
 test "smoke: the cache-path overwrite and storm stages LOOPED — 0 lost overwrites, 0 drift, 0 ticked channel parks, 0 watchdog reports over every pass" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     var env = try testing.environ.createMap(gpa);
     defer env.deinit();
-    const raw = env.get(smoke_loops_knob) orelse return error.SkipZigTest;
-    const loops = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t"), 10) catch return error.SkipZigTest;
-    if (loops == 0) return error.SkipZigTest;
+    const raw = env.get(smoke_loops_knob) orelse return testkit.skip(@src(), .no_seam, smoke_loops_knob ++ " unset: the looped single-stage repro runs only when the harness arms it");
+    const loops = std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t"), 10) catch return testkit.skip(@src(), .no_seam, smoke_loops_knob ++ " is not an integer");
+    if (loops == 0) return testkit.skip(@src(), .no_seam, smoke_loops_knob ++ " is 0");
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
     try rig.formatSet(true);
@@ -3828,7 +3809,7 @@ fn remountAfterKill(rig: *Rig, recovered: ?Recovery) !Recovery {
 
 test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and mid 8-way cp storm → fsck --offline clean → remount → every fsync'd file byte-exact, every page of an in-flight file exact or a hole, C8 zero drift, C2 nothing leaked or lost, rm → df baseline → fsck clean → status" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -4013,7 +3994,7 @@ const json_scan_report = @import("../ops/fsck/finding.zig");
 
 test "smoke: FSCK AND SCRUB — format (a cache path) → fill (dirs, 200 packed small files, hard links, three fsync'd 20 MiB files, a clone) → umount → `fsck --offline --scrub` 0 findings over every block → mount, 8-way storm, kill -9 → `fsck --offline` 0 findings → remount, clean umount → a planted stray reference is exactly [C3]+[C8] on its block (exit 1), `--repair` plans, `--repair --apply` releases it, clean → a planted orphan inode is exactly [C9], destroyed on apply, clean → `merge-reports` of two residue shards ≡ the whole run" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -4279,7 +4260,7 @@ fn volumeIdOfPath(rig: *Rig, path: []const u8) !?[]u8 {
 
 test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (packed, striped, a 1.5 GiB block-map file) → umount, clone, remount → `volume add-data <mp>` ONLINE (the new volume live, the rebalance on the fabric, `backend_fill_spread` ≤ 10 pp) → `volume remove-data <mp> d0` → `job pause/resume/throttle` live → the drain retires d0 (every block moved once; df within the window) → `undrain` refused after retire → `defrag --pack <mp>` on a half-empty pack → `remove-data d1` at 25 % → kill -9 mid-drain → remount adopts and completes it → `fsck --online` 0 findings → a second daemon enrolls as a REMOTE WORKER over TCP and runs a job → `fsck --offline` clean" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -4737,7 +4718,7 @@ fn periodicCensus(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8,
 
 test "smoke: THE BLOCK-MAP TREE — a 1.5 GiB file at 1 MiB blocks crosses the inline cap: kill -9 mid-crossing (the test seam) → remount → records staged, head not flipped, C11 reports the residue → the rewrite re-crosses (the ratchet resumes, residue reconciled) → sha round trip across a remount → 4 KiB overwrites → truncate to 100 MiB (the sweep frees every block past the cut) → rm (the corpse sweep) → df baseline → C8/C11 clean" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();

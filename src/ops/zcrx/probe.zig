@@ -21,6 +21,8 @@
 //! the lane forever).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const derive = @import("../../core/derive.zig");
 const log = @import("../../core/log.zig");
@@ -419,7 +421,7 @@ test "the target override parses the 6-field and 8-field shapes; every malformed
 }
 
 test "the venue's own verdict for a loopback nvme-tcp target: RECV_ZC is present on this kernel, the route is lo, and the ladder refuses at no_hds (or too_narrow) — LOUD, the gauge set" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "probe: Linux only");
     var reg = steering.Registry.init(testing.allocator);
     defer reg.deinit();
     var a: Answers = .{ .lane_enabled = true, .target = okTarget(), .cpus = 8 };
@@ -433,4 +435,14 @@ test "the venue's own verdict for a loopback nvme-tcp target: RECV_ZC is present
     announce(v, "/dev/nvme0n1");
     try testing.expectEqual(@as(u64, v.code()), stats.zcrx_lane_absent_reason.load());
     try testing.expect(stats.zcrx_probe_refusals.load() >= 1);
+}
+
+fn targetOverrideFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseTargetOverride(buf[0..len]);
+}
+
+test "fuzz: the target-override seam parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, targetOverrideFuzz, .{ .corpus = &.{ fuzzkit.slice("127.0.0.1,4420,nqn.2014-08.org.nvmexpress:uuid:x,1,12,131072"), fuzzkit.slice(",,,,,,,,,,,,,,") } });
 }

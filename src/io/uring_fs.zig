@@ -34,6 +34,8 @@
 //! CQE is reaped.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
@@ -2297,7 +2299,7 @@ test "a block device registers direct with its logical block size as the grain (
         @memset(zeros, 0);
         try pool.writeAll(backing, zeros);
     }
-    var loop = (try LoopDevice.attach(backing)) orelse return error.SkipZigTest;
+    var loop = (try LoopDevice.attach(backing)) orelse return testkit.skip(@src(), .no_device, "no /dev/loop-control (the loop driver, root)");
     defer loop.detach();
     const dev = loop.path();
 
@@ -2383,3 +2385,18 @@ const LoopDevice = struct {
         _ = linux.close(self.backing_fd);
     }
 };
+
+fn alignedBufFuzz(_: void, smith: *std.testing.Smith) !void {
+    var src: [4096 + 64]u8 = undefined;
+    const len = smith.slice(&src);
+    // Alignments are powers of two from a byte to a page (the pad law's domain).
+    const alignment: usize = @as(usize, 1) << smith.valueRangeAtMost(u4, 0, 12);
+    var b = try AlignedBuf.fromSlice(std.testing.allocator, src[0..len], alignment);
+    defer b.deinit();
+    try std.testing.expectEqualSlices(u8, src[0..len], b.bytes);
+    try std.testing.expect(len == 0 or @intFromPtr(b.bytes.ptr) % alignment == 0);
+}
+
+test "fuzz: AlignedBuf.fromSlice copies any slice at any power-of-two alignment up to a page" {
+    try fuzzkit.fuzz({}, alignedBufFuzz, .{});
+}

@@ -24,6 +24,7 @@
 //! resync is never attempted: the stream has no self-synchronising marker.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const pdu = @import("pdu.zig");
 
 /// THE scratch: exactly the IO-queue header form.
@@ -382,5 +383,5 @@ fn streamFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the parser is total on arbitrary bytes at arbitrary chunk grains" {
-    try std.testing.fuzz({}, streamFuzz, .{});
+    try fuzzkit.fuzz({}, streamFuzz, .{});
 }

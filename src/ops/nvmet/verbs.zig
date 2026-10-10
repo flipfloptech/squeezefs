@@ -9,6 +9,7 @@
 //! `adopt` writes ONLY the ledger with a TOCTOU re-verify. Linux only.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -876,7 +877,7 @@ const Rig = struct {
 
 fn initRig(gpa: Allocator) !*Rig {
     return Rig.init(gpa) catch |e| switch (e) {
-        error.RingSetupFailed => error.SkipZigTest,
+        error.RingSetupFailed => testkit.skip(@src(), .no_kernel_feature, "the io_uring file layer's ring did not set up on this host"),
         else => e,
     };
 }
@@ -887,10 +888,8 @@ const fake_ready = struct {
     /// elsewhere.
     fn check() !void {
         var e: ?linux.E = null;
-        if (linux.geteuid() != 0 or configfs.preflight(&e) != .ready) {
-            log.warn("nvmet/verbs: the kernel nvmet tree is not reachable here — the verb tests over the fake tree are skipped", .{});
-            return error.SkipZigTest;
-        }
+        if (linux.geteuid() != 0) return testkit.skip(@src(), .no_root, "the nvmet configfs tree needs root");
+        if (configfs.preflight(&e) != .ready) return testkit.skip(@src(), .no_kernel_feature, "the kernel nvmet target is not ready (configfs preflight)");
     }
 };
 

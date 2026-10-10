@@ -21,6 +21,7 @@
 //! tier's substrate) and skips LOUD otherwise.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -282,8 +283,7 @@ test "the char twin and the controller node derive by name; a regular file resol
     try testing.expectEqual(Resolved{ .none = .not_nvme_namespace }, resolve(testing.allocator, "/proc/self/exe"));
     try testing.expectEqual(Resolved{ .none = .not_nvme_namespace }, resolve(testing.allocator, "/nonexistent/path"));
     if (!anyCharNodePresent()) {
-        log.warn("guard/pr_linux: no /dev/ng* on this venue — the real NVMe passthru leg is skipped (the fidelity tier's substrate brings nvmet-loop)", .{});
-        return error.SkipZigTest;
+        return testkit.skip(@src(), .no_device, "no /dev/ng* on this venue — the real NVMe passthru leg needs the fidelity tier's nvmet-loop");
     }
     // A real namespace: Identify answers, RESCAP reads, the report decodes.
     const ng = firstCharNode().?;
@@ -291,7 +291,7 @@ test "the char twin and the controller node derive by name; a regular file resol
     const ng_name = std.mem.sliceTo(&ng, 0);
     const bn = try std.fmt.bufPrint(&block_name, "/dev/nvme{s}", .{ng_name[2..]});
     const r = resolve(testing.allocator, bn);
-    if (r != .device) return error.SkipZigTest;
+    if (r != .device) return testkit.skip(@src(), .no_device, "the first /dev/ng* node did not resolve to an NVMe namespace device");
     defer r.device.deinit();
     var client = try pr.Client.init(testing.allocator, r.device.face(), r.device.nsid, 0x5a5a);
     defer client.deinit();

@@ -27,6 +27,7 @@
 //! a taken tag/uuid/uri).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const set_config = @import("../../data/set_config.zig");
 const router = @import("../../data/router.zig");
@@ -499,4 +500,14 @@ test "remove-data → draining (preflight refuses loud) → retire (uri cleared,
     d0_again.uri = "/dev/d0";
     try testing.expectError(error.DeviceRefused, addData(gpa, w.world(), d0_again, false)); // same device uuid is taken forever
     try testing.expectEqual(@as(usize, 2), w.config.data.len);
+}
+
+fn volumeIdWordFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseVolumeId(buf[0..len]);
+}
+
+test "fuzz: the volume-id word parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, volumeIdWordFuzz, .{ .corpus = &.{ fuzzkit.slice("0x1f"), fuzzkit.slice("18446744073709551616") } });
 }

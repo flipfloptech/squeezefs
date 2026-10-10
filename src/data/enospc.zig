@@ -40,6 +40,7 @@
 //! so the write path never parks at all — the law is in place for rung 6.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
 
@@ -462,7 +463,7 @@ test "allocation racing a trim claim window parks and lands on the returned bloc
         }
     };
     var fut = io.concurrent(Returner.run, .{ io, a, &g }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     const parks = counters.tripwireCount("alloc_trim_window_parks");
     block_alloc.stats.alloc_trim_window_parks.resetLogBudgetForTest();

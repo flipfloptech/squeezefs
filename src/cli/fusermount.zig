@@ -21,6 +21,7 @@
 //! what the kernel will drop at its last close (session.rs:521–523).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -173,7 +174,7 @@ fn haveHelper(io: Io) bool {
 
 test "fusermount3: the _FUSE_COMMFD handshake yields a /dev/fuse fd whose first request is INIT; -u detaches the mount" {
     const io = testing.io;
-    if (!haveHelper(io)) return error.SkipZigTest;
+    if (!haveHelper(io)) return testkit.skip(@src(), .no_device, "no fusermount3 helper on this host");
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
@@ -205,7 +206,7 @@ test "fusermount3: the _FUSE_COMMFD handshake yields a /dev/fuse fd whose first 
 
 test "fusermount3: a refused mount (a missing mountpoint) is a typed HelperFailed, no fd leaks" {
     const io = testing.io;
-    if (!haveHelper(io)) return error.SkipZigTest;
+    if (!haveHelper(io)) return testkit.skip(@src(), .no_device, "no fusermount3 helper on this host");
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");

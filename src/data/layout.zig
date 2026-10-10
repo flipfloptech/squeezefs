@@ -30,6 +30,8 @@
 //! `RefsSeam` (`data/block_refs.zig` binds it).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -2224,7 +2226,7 @@ test "the layout lock is 4096-way on the op guard's mix; the recorded pair colli
 const LOCK_ORDER_WALL_NS: u64 = 20 * std.time.ns_per_s;
 
 test "a staged promotion ((3.5) then (3.7)) completes against an upload holding (3.5) and merging under (3.7) on inos colliding on BOTH tables; the park seam holds the promotion between its two acquisitions until the upload is parked; the rail stays silent" {
-    if (!lock_order.enabled) return error.SkipZigTest;
+    if (!lock_order.enabled) return testkit.skip(@src(), .debug_only, "the lock-order rail is compiled out of this build mode");
     const io = testing.io;
     const locks = try testing.allocator.create(PublishLocks);
     defer testing.allocator.destroy(locks);
@@ -2324,7 +2326,7 @@ fn decodersTotalFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the layout, delta, mapping and xattr-layout decoders are total; whatever decodes re-encodes byte-identically" {
-    try std.testing.fuzz({}, decodersTotalFuzz, .{
+    try fuzzkit.fuzz({}, decodersTotalFuzz, .{
         .corpus = &.{
             // A packed header claiming body_len 56 with a garbage mapping.
             &([_]u8{ 2, 1, 1, 0, 56, 0, 0, 0 } ++ @as([24]u8, @splat(0)) ++ @as([56]u8, @splat(0xFF))),

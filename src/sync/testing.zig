@@ -3,7 +3,7 @@
 //! under `std.testing.io` (`Io.Threaded`, every host) AND under
 //! `SqzIo.testInstance()` (our executor: 2 meta lanes, Linux only) — one
 //! contract, two executors. A body that needs a unit of concurrency skips
-//! (`error.SkipZigTest`) where the executor refuses one.
+//! (`testkit.skip(.no_concurrency)`) where the executor refuses one.
 
 const std = @import("std");
 const builtin = @import("builtin");

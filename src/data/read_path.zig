@@ -52,6 +52,7 @@
 //! The RAM double below is test-only.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -2279,7 +2280,7 @@ const DeviceFixture = if (builtin.os.tag == .linux) struct {
 } else struct {};
 
 test "e2e (Linux, nvme_dev.Device): cold whole-block fill → hot hit → purge → ranged 4 KiB lease DMA into a registered aligned buffer → streaming classification over 4 contiguous requests → direct_device_true; the memfd fill pool is fd-addressable; get_obj counts every device read" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "read_path: Linux only");
     const io = testing.io;
     var f: DeviceFixture = .{ .gpa = testing.allocator };
     try f.create(false);

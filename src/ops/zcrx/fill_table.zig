@@ -29,6 +29,7 @@
 //! (`WouldBlock`, counted once per read). Declines never park.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const completion = @import("../../sync/completion.zig");
 const mpmc = @import("../../sync/mpmc.zig");
@@ -345,7 +346,7 @@ const testing = std.testing;
 
 test "exact-length law: spans accumulate by datao, SUCCESS|LAST completes exactly, a short SUCCESS fails the op, a status ≠ 0 fails the op and releases the spans; refs are taken per span and returned after the gather" {
     // The completion cell parks on the Linux futex (`sync/completion.zig`).
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "fill_table: Linux only");
     const gpa = testing.allocator;
     var ledger = try span_ledger.SpanLedger.init(gpa, 8);
     defer ledger.deinit(gpa);
@@ -410,7 +411,7 @@ test "exact-length law: spans accumulate by datao, SUCCESS|LAST completes exactl
 
 test "violations: an unknown CID, a span past the length, SUCCESS on a non-LAST PDU, a span for a CID with no pending fill" {
     // The completion cell parks on the Linux futex (`sync/completion.zig`).
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "fill_table: Linux only");
     const gpa = testing.allocator;
     var ledger = try span_ledger.SpanLedger.init(gpa, 2);
     defer ledger.deinit(gpa);
@@ -434,7 +435,7 @@ test "violations: an unknown CID, a span past the length, SUCCESS on a non-LAST 
 
 test "MEM-3: a requester that abandoned its cell leaves the driver owning the cleanup — spans released, the CID back in the pool (free == total)" {
     // The completion cell parks on the Linux futex (`sync/completion.zig`).
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "fill_table: Linux only");
     const gpa = testing.allocator;
     var ledger = try span_ledger.SpanLedger.init(gpa, 2);
     defer ledger.deinit(gpa);

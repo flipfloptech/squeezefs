@@ -24,6 +24,7 @@
 //! from the slot its own geometry names).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const alloc_core = @import("alloc_core.zig");
 const alloc_ext = @import("alloc_ext.zig");
@@ -1109,4 +1110,28 @@ test "property: the sector decoder is total on arbitrary and restamped bytes; a 
             }
         } else |_| {}
     }
+}
+
+fn superblockSectorFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [sector_len + 8]u8 = undefined;
+    const len = smith.slice(&buf);
+    var diag: Refusal = undefined;
+    _ = Superblock.decodeSector(buf[0..len], &diag) catch {};
+    if (len >= sector_len) {
+        const sector = buf[0..sector_len];
+        checksum.stamp(sector, off_checksum);
+        _ = Superblock.decodeSector(sector, &diag) catch {};
+        // The narrowest deciding binary: every later capability refuses.
+        _ = Superblock.decodeSectorWithKnown(sector, 0, &diag) catch {};
+        if (Superblock.decodeSectorWithKnown(sector, std.math.maxInt(u64), &diag)) |sb| {
+            var re: [sector_len]u8 = undefined;
+            sb.encodeSector(std.mem.readInt(u64, sector[@offsetOf(SuperblockWire, "sb_generation_le")..][0..8], .little), &re, &diag) catch return;
+            const back = try Superblock.decodeSectorWithKnown(&re, std.math.maxInt(u64), &diag);
+            try std.testing.expectEqual(sb.node_size, back.node_size);
+        } else |_| {}
+    }
+}
+
+test "fuzz: the superblock sector decoders are total on arbitrary and restamped sectors under every known-mask; a decoded superblock survives encode∘decode" {
+    try fuzzkit.fuzz({}, superblockSectorFuzz, .{});
 }

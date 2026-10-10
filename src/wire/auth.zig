@@ -38,6 +38,7 @@
 //! Portable; the randomness comes through the `Io` the caller passes.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const Io = std.Io;
 const checksum = @import("../core/checksum.zig");
 const verbs = @import("verbs.zig");
@@ -463,5 +464,5 @@ fn enrollFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the enroll decoder is total" {
-    try std.testing.fuzz({}, enrollFuzz, .{});
+    try fuzzkit.fuzz({}, enrollFuzz, .{});
 }

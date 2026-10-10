@@ -40,6 +40,7 @@
 //! has gone.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
 const tick = @import("tick.zig");
@@ -410,7 +411,7 @@ fn cancelFrontHandsWake(io: Io) !void {
         }
     };
     var fut = io.concurrent(Parked.run, .{ io, &l }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     // The task is queued behind the holder; the harness waiter behind it.
     while (l.waiters(io) == 0) try std.Thread.yield();
@@ -627,7 +628,7 @@ fn fibersAndThreadsContend(io: Io) !void {
     for (&ts) |*t| t.* = try std.Thread.spawn(.{}, Shared.threadWorker, .{ io, &s });
     for (ts) |t| t.join();
     for (futs[0..spawned]) |*f| try f.await(io);
-    if (spawned == 0) return error.SkipZigTest;
+    if (spawned == 0) return testkit.skip(@src(), .no_concurrency, "the executor refused every unit of concurrency");
     try testing.expectEqual(@as(u64, 200 * (spawned + 2)), s.n);
     try testing.expectEqual(RwLock.init, s.l);
 }

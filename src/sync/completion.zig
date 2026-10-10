@@ -15,6 +15,7 @@
 //! exactly one party and a value is never read after its owner left.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const futex = @import("futex.zig");
 const clock = @import("../core/clock.zig");
 
@@ -92,7 +93,7 @@ const testing = std.testing;
 const builtin = @import("builtin");
 
 test "complete wakes a parked waiter and hands it the value; poll sees it; reset rearms" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "completion: Linux only");
     const C = Completion(u32);
     var c: C = .{};
     try testing.expectEqual(@as(?u32, null), c.poll());
@@ -115,7 +116,7 @@ test "complete wakes a parked waiter and hands it the value; poll sees it; reset
 }
 
 test "abandon: exactly one side owns the cell — the completer when the waiter left first, the waiter otherwise" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "completion: Linux only");
     const C = Completion(u32);
     var a: C = .{};
     try testing.expect(a.abandon());
@@ -142,7 +143,7 @@ test "abandon: exactly one side owns the cell — the completer when the waiter 
 }
 
 test "a parked waiter and a racing completer never both free: 64 rounds of CAS arbitration" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "completion: Linux only");
     const C = Completion(u32);
     var cells: [64]C = @splat(.{});
     var completer_owns: std.atomic.Value(u32) = .init(0);

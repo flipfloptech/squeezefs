@@ -40,6 +40,8 @@
 //! previous round's inode under the same name.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -869,7 +871,7 @@ fn ledgerFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the ledger decoder is total on arbitrary bytes" {
-    try std.testing.fuzz({}, ledgerFuzz, .{});
+    try fuzzkit.fuzz({}, ledgerFuzz, .{});
 }
 
 test "the intent lattice: begin(pending) → finalize(active); finalize from active or removing refuses; mark_removing is idempotent; delete after teardown; begin refuses a duplicate subnqn and a duplicate backing (any state); update may not change the key; the value laws refuse at begin" {
@@ -951,7 +953,7 @@ fn finalizeA(_: void, l: *Ledger) anyerror!void {
 test "store: load never writes (an absent dir loads an empty ledger and creates nothing; 100 loads leave the file byte-identical); the first mutation creates the dir 0700 and the file 0600 by tmp + rename; the generation increments once per write; a leftover .tmp is ignored and the durable file is authoritative" {
     const gpa = testing.allocator;
     var rig = StoreRig.init(gpa) catch |e| switch (e) {
-        error.RingSetupFailed => return error.SkipZigTest,
+        error.RingSetupFailed => return testkit.skip(@src(), .no_kernel_feature, "the io_uring file layer's ring did not set up on this host"),
         else => return e,
     };
     defer rig.deinit();
@@ -1006,7 +1008,7 @@ test "store: load never writes (an absent dir loads an empty ledger and creates 
 test "store: two mutators under the flock serialize (two threads × 50 writes = generation 100, every record present)" {
     const gpa = testing.allocator;
     var rig = StoreRig.init(gpa) catch |e| switch (e) {
-        error.RingSetupFailed => return error.SkipZigTest,
+        error.RingSetupFailed => return testkit.skip(@src(), .no_kernel_feature, "the io_uring file layer's ring did not set up on this host"),
         else => return e,
     };
     defer rig.deinit();

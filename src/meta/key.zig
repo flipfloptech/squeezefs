@@ -15,6 +15,7 @@
 //! decoders are total (any byte string yields a key or a typed refusal).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const counters = @import("../core/counters.zig");
 
@@ -1320,4 +1321,27 @@ test "readdir cookie decode rejects payloads we never issue" {
     const first_bad = READDIR_COOKIE_BIAS + (1 << 62);
     try testing.expectError(error.InvalidReaddirCookie, decodeReaddirCookie(first_bad));
     _ = try decodeReaddirCookie(first_bad - 1);
+}
+
+/// Every key decoder is total on arbitrary bytes and a key that decodes
+/// re-encodes to itself; `KeyBuf.fromSlice` is a builder with a capacity
+/// precondition (its callers are the encoders here), fuzzed within it.
+fn keyDecodersFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [KEY_BUF_CAP + 64]u8 = undefined;
+    const len = smith.slice(&buf);
+    const key = buf[0..len];
+    // The extern-struct keys are their own encoding: a decoded key's bytes ARE the input.
+    if (InodeKey.decode(key)) |k| try std.testing.expectEqualSlices(u8, key, std.mem.asBytes(&k)) else |_| {}
+    if (DentryKey.decode(key)) |k| try std.testing.expectEqualSlices(u8, key, std.mem.asBytes(&k)) else |_| {}
+    if (XattrKey.decode(key)) |k| try std.testing.expectEqualSlices(u8, key, std.mem.asBytes(&k)) else |_| {}
+    if (BlockMapKey.decode(key)) |k| try std.testing.expectEqualSlices(u8, key, std.mem.asBytes(&k)) else |_| {}
+    if (BlockRefKey.decode(key)) |k| try std.testing.expectEqualSlices(u8, key, std.mem.asBytes(&k)) else |_| {}
+    if (decodeInodeKey(key)) |ino| try std.testing.expectEqualSlices(u8, key, &inodeKey(ino)) else |_| {}
+    if (InteriorValue.decode(key)) |v| try std.testing.expectEqualSlices(u8, key, &encodeInteriorValue(v.childAddr(), v.childSeq())) else |_| {}
+    const kb = KeyBuf.fromSlice(key[0..@min(len, KEY_BUF_CAP)]);
+    try std.testing.expectEqualSlices(u8, key[0..@min(len, KEY_BUF_CAP)], kb.slice());
+}
+
+test "fuzz: every key decoder and the interior value decoder are total on arbitrary bytes; whatever decodes is byte-identical to its encoding" {
+    try fuzzkit.fuzz({}, keyDecodersFuzz, .{});
 }

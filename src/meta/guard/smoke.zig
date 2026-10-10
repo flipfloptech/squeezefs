@@ -10,6 +10,7 @@
 //! (`gate.clients`, `gate.claimClear`) the CLI binds.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -187,23 +188,13 @@ fn sleepMs(ms: u64) void {
     _ = linux.nanosleep(&ts, null);
 }
 
-/// Root, `/dev/fuse`, the binary beside us (the smoke's venue law).
-fn venueAvailable() bool {
-    if (linux.getuid() != 0) return false;
-    const rc = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    _ = linux.close(@intCast(rc));
-    var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, "squeezefs", 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
-        log.warn("guard smoke: no ./squeezefs binary in the cwd — run through `zig build smoke`. Skipping.", .{});
-        return false;
-    }
-    return true;
+fn venueMissing() ?testkit.Why {
+    return testkit.venue.mount(testing.io, &.{"squeezefs"});
 }
 
 test "smoke: the D0 guard — mount → clients names the live holder → claim clear refuses the live mount → kill -9 → clients reads the holder DEAD → a second mount within the TTL mounts by the dead-pid proof → umount → claim clear is a no-op → kill -9 → claim clear clears → a fresh mount" {
     const io = testing.io;
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();

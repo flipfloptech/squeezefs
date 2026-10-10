@@ -27,6 +27,8 @@
 //! are Linux syscalls and compile only there.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const zc = @import("zstd_c");
@@ -1549,7 +1551,7 @@ fn lz4Fuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the lz4 decompressor is total on arbitrary bytes" {
-    try std.testing.fuzz({}, lz4Fuzz, .{ .corpus = &.{ fuzzSlice(&lz4_vec_abc_block), fuzzSlice(&lz4_vec_fox_block), fuzzSlice(&lz4_vec_a_block), fuzzSlice(&.{ 0x1f, 'a', 0x00, 0x00 }), fuzzSlice(&.{ 0xff, 0xff, 0xff }) } });
+    try fuzzkit.fuzz({}, lz4Fuzz, .{ .corpus = &.{ fuzzSlice(&lz4_vec_abc_block), fuzzSlice(&lz4_vec_fox_block), fuzzSlice(&lz4_vec_a_block), fuzzSlice(&.{ 0x1f, 'a', 0x00, 0x00 }), fuzzSlice(&.{ 0xff, 0xff, 0xff }) } });
 }
 
 test "property: the lz4 decompressor is total under a PRNG, including bit flips of valid blocks" {
@@ -2003,7 +2005,7 @@ fn frameFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: decodeHeader is total on arbitrary bytes" {
-    try std.testing.fuzz({}, frameFuzz, .{ .corpus = &.{fuzzSlice("SQZB\x01\x00\x01\x00\x10\x00\x00\x00\x00\x10\x00\x00" ++ @as([80]u8, @splat(0)) ++ @as([16]u8, @splat(0xaa)))} });
+    try fuzzkit.fuzz({}, frameFuzz, .{ .corpus = &.{fuzzSlice("SQZB\x01\x00\x01\x00\x10\x00\x00\x00\x00\x10\x00\x00" ++ @as([80]u8, @splat(0)) ++ @as([16]u8, @splat(0xaa)))} });
 }
 
 test "property: readInner is total under a PRNG over mutations of valid lz4/zstd/AEAD images (no panic, every refusal typed)" {
@@ -2060,7 +2062,7 @@ fn fuzzSlice(comptime bytes: []const u8) []const u8 {
 }
 
 test "key files (Linux): a 0600 regular file owned by us reads and trims; group/other bits, a symlink, a directory, short material, an oversized file refuse by class; resolution order flag → env → key dir; a wrong key refuses KeyMismatch; hardenProcess leaves the process non-dumpable with core 0" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "transform: Linux only");
     const io = testing.io;
     var dir = testing.tmpDir(.{});
     defer dir.cleanup();
@@ -2155,4 +2157,16 @@ test "key files (Linux): a 0600 regular file owned by us reads and trims; group/
     try writeKeyFileRefusal(&w, error.NoKeySource, "/etc/squeezefs/keys/0102030405060708.key");
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "--encrypt-key") != null and std.mem.indexOf(u8, w.buffered(), "SQUEEZEFS_ENCRYPT_KEY_FILE") != null and std.mem.indexOf(u8, w.buffered(), "/etc/squeezefs/keys/") != null);
     try log.testing.expectAllFired();
+}
+
+fn transformNamesFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    const s = buf[0..len];
+    _ = Compression.parse(s);
+    _ = Encryption.parse(s);
+}
+
+test "fuzz: the compression and encryption name parsers are total on arbitrary text" {
+    try fuzzkit.fuzz({}, transformNamesFuzz, .{ .corpus = &.{ fuzzkit.slice("lz4"), fuzzkit.slice("aes-256-gcm"), fuzzkit.slice("ZSTD:3") } });
 }

@@ -34,6 +34,7 @@
 //! witness until fsck's census runs").
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -1391,4 +1392,25 @@ test "placement: the pages claim max(1, ceil(region / node)) extents of the home
     try testing.expect(!screenBitmapRefs(&.{.{ .vol = 2, .start = 0, .len = 8192 }}, 40_000, &heaps)); // too short
     try testing.expect(!screenBitmapRefs(&.{.{ .vol = 2, .start = 0, .len = 32_768 }}, 40_000, &heaps)); // too long
     try testing.expect(!screenBitmapRefs(&.{.{ .vol = 2, .start = (1 << 20) - 8192, .len = 16_384 }}, 40_000, &heaps)); // past the heap
+}
+
+fn dataBitmapPageFuzz(_: void, smith: *std.testing.Smith) !void {
+    var page: [page_len + 8]u8 = undefined;
+    const plen = smith.slice(&page);
+    _ = decodePage(page[0..plen], 0, 0) catch {};
+    if (plen >= page_len) {
+        const img = page[0..page_len];
+        const index = std.mem.readInt(u32, img[off_page_index..][0..4], .little);
+        const tag = std.mem.readInt(u64, img[off_vol_tag..][0..8], .little);
+        checksum.stamp(img, off_checksum);
+        if (decodePage(img, index, tag)) |d| {
+            var re: [page_len]u8 = undefined;
+            try encodePage(index, d.generation, tag, d.bits, &re);
+            try std.testing.expectEqualSlices(u8, img, &re);
+        } else |_| {}
+    }
+}
+
+test "fuzz: the data bitmap page decoder is total on arbitrary and restamped pages; a decoded page re-encodes byte-identically" {
+    try fuzzkit.fuzz({}, dataBitmapPageFuzz, .{});
 }

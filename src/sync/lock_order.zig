@@ -29,6 +29,7 @@
 //! pops normally.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const counters = @import("../core/counters.zig");
 
@@ -198,7 +199,7 @@ fn onFreshThread(comptime body: fn () anyerror!void) !void {
 }
 
 fn ascendingIsSilent() !void {
-    if (!enabled) return error.SkipZigTest;
+    if (!enabled) return testkit.skip(@src(), .debug_only, "the lock-order rail is compiled out of this build mode");
     const inv0 = lock_order_inversions.load();
     acquiring(.op_guard);
     acquiring(.block);
@@ -224,7 +225,7 @@ test "ascending acquisitions and same-level siblings are silent; the ledger bala
 }
 
 fn inversionTrips() !void {
-    if (!enabled) return error.SkipZigTest;
+    if (!enabled) return testkit.skip(@src(), .debug_only, "the lock-order rail is compiled out of this build mode");
     const inv0 = lock_order_inversions.load();
     lock_order_inversions.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
@@ -243,7 +244,7 @@ test "a lower level taken under a higher one trips lock_order_inversions ONCE (t
 }
 
 fn handOffAndForeignRelease() !void {
-    if (!enabled) return error.SkipZigTest;
+    if (!enabled) return testkit.skip(@src(), .debug_only, "the lock-order rail is compiled out of this build mode");
     const inv0 = lock_order_inversions.load();
     // A 4a set taken, submitted with its tx (handed off), then the
     // committer takes (3.7) for the sweep it drains after the ack: silent.
@@ -263,7 +264,7 @@ test "a handed-off 4a set leaves the ledger; the foreign release is a no-op; a l
 }
 
 fn contextsAreSeparate() !void {
-    if (!enabled) return error.SkipZigTest;
+    if (!enabled) return testkit.skip(@src(), .debug_only, "the lock-order rail is compiled out of this build mode");
     const Ctx = struct {
         var id: usize = 1;
         fn current() usize {
@@ -293,7 +294,7 @@ test "two contexts interleaved on one thread never see each other's levels (fibe
 }
 
 fn overflowIsCounted() !void {
-    if (!enabled) return error.SkipZigTest;
+    if (!enabled) return testkit.skip(@src(), .debug_only, "the lock-order rail is compiled out of this build mode");
     const of0 = lock_order_ledger_overflows.load();
     lock_order_ledger_overflows.resetLogBudgetForTest();
     log.testing.expectErrorLogs(1);
@@ -305,7 +306,7 @@ fn overflowIsCounted() !void {
 }
 
 fn tryIsRecordedNotChecked() !void {
-    if (!enabled) return error.SkipZigTest;
+    if (!enabled) return testkit.skip(@src(), .debug_only, "the lock-order rail is compiled out of this build mode");
     const inv0 = lock_order_inversions.load();
     // A try-acquired (4a) beside a held (3.7): sanctioned, silent …
     acquiring(.layout);

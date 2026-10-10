@@ -15,6 +15,7 @@
 //! command-specific dwords.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 
 pub const Type = enum(u8) {
     icreq = 0x00,
@@ -652,5 +653,5 @@ fn pduFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: every PDU decoder is total on arbitrary bytes and exactly the encoder's form decodes" {
-    try std.testing.fuzz({}, pduFuzz, .{});
+    try fuzzkit.fuzz({}, pduFuzz, .{});
 }

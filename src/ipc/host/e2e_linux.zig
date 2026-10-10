@@ -14,6 +14,7 @@
 //! independent of the overlay.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -288,27 +289,8 @@ fn sleepMs(ms: u64) void {
     _ = linux.nanosleep(&ts, null);
 }
 
-fn venueAvailable(io: Io) bool {
-    if (linux.getuid() != 0) return false;
-    const rc = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    _ = linux.close(@intCast(rc));
-    var buf: [4096]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(io, "/proc/self/status", &buf) catch return false;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    var cap_ok = false;
-    while (it.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "CapEff:")) continue;
-        const caps = std.fmt.parseInt(u64, std.mem.trim(u8, line["CapEff:".len..], " \t"), 16) catch return false;
-        cap_ok = caps & (@as(u64, 1) << 21) != 0;
-    }
-    if (!cap_ok) return false;
-    var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, "squeezefs", 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
-        log.warn("il e2e: no ./squeezefs binary in the cwd — run through `zig build smoke`. Skipping.", .{});
-        return false;
-    }
-    return true;
+fn venueMissing(io: Io) ?testkit.Why {
+    return testkit.venue.mount(io, &.{"squeezefs"});
 }
 
 fn fuseMountsOf(gpa: std.mem.Allocator, io: Io, mp: []const u8) !usize {
@@ -350,7 +332,7 @@ fn served(o: client.Outcome) !usize {
 
 test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the il0 xattr → a session in-process over the ONE client library → bind → ring pwrite 4 MiB (sever-at-dequeue) read back through the kernel path byte-exact → a 4 MiB stream of 1 MiB pieces places into ONE assembly adopted by ONE merge → a cold read then a warm read on the sync fast path (arena_copy_bytes ≡ bytes) → a W1-shaped 4 KiB overwrite serves INLINE on the dd lane (patch_edge_rmw_reads 0) → 8 no-wait tickets complete in offset order → the fd screen's refusals → kernel fsync → umount with the live session tears down cleanly (the client poisoned, no mount left)" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
@@ -598,7 +580,7 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
 
 test "smoke: THE INTERCEPTION HOST, death — kill -9 the daemon under a parked ring op ⇒ the heartbeat stops and the socket dies ⇒ the client poisons inside the ladder (≈ 1 s), far inside the 20 s seam deadline; the mount is detached" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();

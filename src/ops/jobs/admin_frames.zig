@@ -14,6 +14,7 @@
 //! verb needs is the `WireError` reason of a status reply. Portable.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const codec = @import("../../wire/codec.zig");
 const records = @import("records.zig");
 
@@ -363,19 +364,21 @@ test "every admin payload round-trips; the op/verdict/type bytes are total; a pc
     try testing.expectEqual(Verdict.refused, vr.get());
 }
 
-test "fuzz: no admin payload decoder panics on arbitrary bytes" {
-    var prng = std.Random.DefaultPrng.init(0x61646d69);
-    const rnd = prng.random();
+fn adminPayloadsTotal(bytes: []const u8) void {
+    _ = codec.decodePayload(AdminJobList, bytes) catch {};
+    _ = codec.decodePayload(AdminJobControlReq, bytes) catch {};
+    _ = codec.decodePayload(AdminJobSubmitReq, bytes) catch {};
+    _ = codec.decodePayload(AdminFsckReport, bytes) catch {};
+    _ = codec.decodePayload(AdminVolumeReq, bytes) catch {};
+    _ = codec.decodePayload(AdminVolumeReply, bytes) catch {};
+}
+
+fn adminPayloadsFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [4096]u8 = undefined;
-    var round: usize = 0;
-    while (round < 3000) : (round += 1) {
-        const len = rnd.uintLessThan(usize, buf.len);
-        rnd.bytes(buf[0..len]);
-        _ = codec.decodePayload(AdminJobList, buf[0..len]) catch {};
-        _ = codec.decodePayload(AdminJobControlReq, buf[0..len]) catch {};
-        _ = codec.decodePayload(AdminJobSubmitReq, buf[0..len]) catch {};
-        _ = codec.decodePayload(AdminFsckReport, buf[0..len]) catch {};
-        _ = codec.decodePayload(AdminVolumeReq, buf[0..len]) catch {};
-        _ = codec.decodePayload(AdminVolumeReply, buf[0..len]) catch {};
-    }
+    const len = smith.slice(&buf);
+    adminPayloadsTotal(buf[0..len]);
+}
+
+test "fuzz: no admin payload decoder panics on arbitrary bytes" {
+    try fuzzkit.fuzz({}, adminPayloadsFuzz, .{});
 }

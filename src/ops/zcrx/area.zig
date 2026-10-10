@@ -19,6 +19,7 @@
 //! The field shape: 64 + 24 + 128 = 216 MiB per queue.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const derive = @import("../../core/derive.zig");
@@ -292,7 +293,7 @@ test "the sim chunk: derived 64 KiB; clamped to [64 B, PMD] and a power of two; 
 }
 
 test "the mapping lands PMD-aligned, chunk-granular, gauged and unmaps clean (venue)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "area: Linux only");
     const before = stats.zcrx_area_bytes.load();
     var m = try Mapped.map(4 * MiB, 64 << 10, null);
     try testing.expectEqual(@as(usize, 0), @intFromPtr(m.base) % PMD_BYTES);

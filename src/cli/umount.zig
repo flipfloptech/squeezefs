@@ -20,6 +20,7 @@
 //! asked for a real unmount.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -241,7 +242,7 @@ test "mountinfo: a fuse-type line at the exact mountpoint, the last line wins, a
 }
 
 test "a directory that is no mount: no daemon to signal (.stats unreadable), not a FUSE mount, and the external detach reports the kernel's EINVAL through the ONE table" {
-    if (linux.geteuid() != 0) return error.SkipZigTest;
+    if (linux.geteuid() != 0) return testkit.skip(@src(), .no_root, "umount2(2) of a non-mount needs root");
     _ = linux.mkdir("/build/tmp", 0o755);
     var pb: [64:0]u8 = undefined;
     const dir = try std.fmt.bufPrintSentinel(&pb, "/build/tmp/not-a-mount-{d}", .{linux.getpid()}, 0);

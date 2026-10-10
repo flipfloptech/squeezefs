@@ -9,6 +9,7 @@
 //! Portable; pure over bytes.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -828,4 +829,25 @@ test "Shard.parse: k/N with 0 ≤ k < N; the residue partition is total and disj
         };
         try testing.expectEqual(@as(u32, 1), owners);
     }
+}
+
+fn reportTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [2048]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    _ = Shard.parse(text);
+    if (Report.parse(std.testing.allocator, text)) |*r| {
+        var rr = r.*;
+        defer rr.deinit(std.testing.allocator);
+        // What parses prints as JSON and parses again.
+        var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        try rr.writeJson(&out.writer);
+        var again = try Report.parse(std.testing.allocator, out.written());
+        again.deinit(std.testing.allocator);
+    } else |_| {}
+}
+
+test "fuzz: the fsck report and shard parsers are total on arbitrary text and a parsed report re-serializes to a parseable report" {
+    try fuzzkit.fuzz({}, reportTextFuzz, .{ .corpus = &.{ fuzzkit.slice("3/8"), fuzzkit.slice("{\"schema\":1}"), fuzzkit.slice("{\"schema\":99,\"findings\":[]}") } });
 }

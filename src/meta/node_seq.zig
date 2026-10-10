@@ -20,6 +20,7 @@
 //! stale incarnation (node.zig), never loud.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 
 /// `K = 38`: 2^38 ≈ 2.7 × 10^11 mints per incarnation — a joiner at
 /// 200 SMOs/s (the storm rows' rate) for 43 years; leaves 25 bits =
@@ -296,4 +297,14 @@ test "the joiner's screen admits exactly B + o·2^K for 1 ≤ o ≤ ORDINAL_MAX"
     var w: std.Io.Writer = .fixed(&buf);
     try writeScreenRefusal(&w, b, b, .manager_space);
     try testing.expectEqualStrings("Joined.node_seq_base 0xabc000000000000 rejected: incarnation 0 is the manager's own space (the volume's base is 0xabc000000000000, a joiner's base is B + o · 2^38 for 1 ≤ o ≤ 33554430 — a buggy or hostile manager frame; nothing installed)", w.buffered());
+}
+
+fn incarnationsFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [32]u8 = undefined;
+    const len = smith.slice(&buf);
+    if (decodeIncarnations(buf[0..len])) |minted| try std.testing.expectEqualSlices(u8, buf[0..len], &encodeIncarnations(minted)) else |_| {}
+}
+
+test "fuzz: the node-seq incarnations record decoder is total and a decoded value re-encodes to its bytes" {
+    try fuzzkit.fuzz({}, incarnationsFuzz, .{});
 }

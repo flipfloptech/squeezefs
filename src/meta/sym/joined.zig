@@ -32,6 +32,7 @@
 //! + this one): the joiner sees no manager RAM word.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -984,4 +985,14 @@ test "a joiner's mount slot derives from the mount point with bit 31 set: never 
 test "the endpoint poll bound is three checkpoint cadences" {
     try testing.expectEqual(@as(u64, 3_000), ENDPOINT_POLL_MAX_MS);
     try testing.expect(ENDPOINT_POLL_STEP_MS < @import("../checkpoint.zig").CHECKPOINT_MAX_AGE_MS);
+}
+
+fn endpointRecordFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const len = smith.slice(&buf);
+    if (decodeEndpoint(buf[0..len])) |e| try std.testing.expectEqual(@as(u8, 0), e.reserved) else |_| {}
+}
+
+test "fuzz: the manager endpoint record decoder is total on arbitrary bytes" {
+    try fuzzkit.fuzz({}, endpointRecordFuzz, .{});
 }

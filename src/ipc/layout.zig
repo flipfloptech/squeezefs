@@ -21,6 +21,7 @@
 //! reference shim can never map a port session by accident.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const derive = @import("../core/derive.zig");
 const sizing = @import("../mem/sizing.zig");
 
@@ -688,7 +689,17 @@ test "header round-trip and refusals: a fresh header validates; bad magic / abi+
     try testing.expectError(error.Truncated, SessionHeader.decode(std.mem.asBytes(&h)[0..4095]));
 }
 
-test "fuzz: SessionHeader.decode never panics on arbitrary bytes; a mutated valid image refuses or round-trips its geometry" {
+fn sessionHeaderFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [PAGE_BYTES]u8 = undefined;
+    const len = smith.slice(&buf);
+    if (SessionHeader.decode(buf[0..len])) |d| try d.geometry.validate() else |_| {}
+}
+
+test "fuzz: SessionHeader.decode never panics on arbitrary bytes and a header that decodes carries a valid geometry" {
+    try fuzzkit.fuzz({}, sessionHeaderFuzz, .{});
+}
+
+test "property: SessionHeader.decode over PRNG bytes and a mutated valid image refuses or round-trips its geometry" {
     var prng = std.Random.DefaultPrng.init(0x5151);
     const r = prng.random();
     var buf: [PAGE_BYTES]u8 = undefined;

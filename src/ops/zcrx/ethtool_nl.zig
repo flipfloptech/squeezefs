@@ -9,6 +9,7 @@
 //! whole cell driver-blocked. Linux only; the message layouts are pinned.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const log = @import("../../core/log.zig");
@@ -262,15 +263,14 @@ test "message layout pins: GETFAMILY is 16 + 4 + nla(4 + 8) = 32 B; RINGS_GET ne
 }
 
 test "on the venue: the ethtool genetlink family resolves (or the kernel lacks CONFIG_ETHTOOL_NETLINK — a ledgered capability skip; the probe's verdict is no_hds either way); lo and eth0 carry no tcp-data-split attribute" {
-    var sock = Sock.open() catch return error.SkipZigTest;
+    var sock = Sock.open() catch return testkit.skip(@src(), .no_kernel_feature, "no generic netlink socket on this host");
     defer sock.close();
     const fam = ethtoolFamilyId(&sock) catch |e| {
         // 7.2.6-sqz ships `# CONFIG_ETHTOOL_NETLINK is not set`: GETFAMILY
         // answers NLMSG_ERROR and the HDS verdict is OFF on every NIC.
         try testing.expectEqual(error.NoFamily, e);
         try testing.expectError(error.NoFamily, tcpDataSplitOn("lo"));
-        log.warn("zcrx ethtool_nl: this kernel has no ethtool genetlink family (CONFIG_ETHTOOL_NETLINK) — the HDS verdict is OFF; the family round trip is a ledgered capability skip", .{});
-        return error.SkipZigTest;
+        return testkit.skip(@src(), .no_kernel_feature, "this kernel has no ethtool genetlink family (CONFIG_ETHTOOL_NETLINK): the HDS verdict is OFF, the family round trip cannot run");
     };
     try testing.expect(fam != 0);
     // A driver without `get_ringparam` answers NLMSG_ERROR (-EOPNOTSUPP):

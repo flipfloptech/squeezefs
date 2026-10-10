@@ -4,6 +4,7 @@
 //! syscall, so the tie tests run on every host.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const counters = @import("../core/counters.zig");
@@ -814,4 +815,14 @@ test "lane depth and ring depth: the SQ is a quarter of the admitted depth (a sa
     try testing.expect(std.math.isPowerOfTwo(ring_entries));
     try testing.expectEqual(@as(u32, uring_req_queue_cap / 2), @as(u32, ring_entries) * 2);
     try testing.expectEqual(std.time.ns_per_ms, wake_unarmed_backstop_ns);
+}
+
+fn writeCacheFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = WriteCacheClass.fromSysfs(buf[0..len]);
+}
+
+test "fuzz: the write-cache sysfs classifier is total on arbitrary text" {
+    try fuzzkit.fuzz({}, writeCacheFuzz, .{ .corpus = &.{ fuzzkit.slice("write back\n"), fuzzkit.slice("write through\n") } });
 }

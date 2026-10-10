@@ -19,6 +19,7 @@
 //! single-CPU mask reserves nothing — a lane count of 0 parks every caller.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Io = std.Io;
@@ -495,4 +496,16 @@ test "Topology.probe on this machine yields a non-empty mask and consistent node
     var it = t.mask.iterator(.{});
     while (it.next()) |cpu| if (t.node_of[cpu] != no_node) try testing.expect(t.node_of[cpu] < t.node_count);
     try testing.expect(t.laneCpus().count() >= 1);
+}
+
+fn cpuSetTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    _ = parseCpuSet(text);
+    _ = parseCmdlineIsolation(text);
+}
+
+test "fuzz: the cpuset and kernel-cmdline isolation parsers are total on arbitrary text" {
+    try fuzzkit.fuzz({}, cpuSetTextFuzz, .{ .corpus = &.{ fuzzkit.slice("0-3,8\n"), fuzzkit.slice("quiet isolcpus=1-2,5 nohz_full=1-2 rcu_nocbs=1-2\n"), fuzzkit.slice("isolcpus=") } });
 }

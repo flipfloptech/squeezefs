@@ -35,6 +35,7 @@
 //! rides `.stats`.
 
 const std = @import("std");
+const testkit = @import("../../../core/testkit.zig");
 const Allocator = std.mem.Allocator;
 const counters = @import("../../../core/counters.zig");
 const clock = @import("../../../core/clock.zig");
@@ -1275,7 +1276,7 @@ pub const TcpLink = struct {
 };
 
 test "linux: two in-process daemons over REAL TCP on loopback — B dials A's listener, joins over the wire, acquires its rotor and first-touches a slot, is a member of A's shard; A stops: B's renewals fail quietly until T_self, then B PARKS (never the poison); A's successor listens at a new port, B re-dials it through the redial seam and the reclaim lands in grace" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "join_ladder: Linux only");
     const gpa = testing.allocator;
     const d = try TwoDaemons.init(gpa);
     defer d.deinit();

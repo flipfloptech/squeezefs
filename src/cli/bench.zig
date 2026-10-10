@@ -33,6 +33,7 @@
 //! tested on every host; the engine is Linux only.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const Io = std.Io;
@@ -1009,4 +1010,15 @@ test "the A-B-B-A bracket: the arm order, the direct lever per arm, the fold ove
     try testing.expectEqual(@as(u64, 82), br.b_mean);
     try testing.expectEqual(@as(u64, 4), br.a_spread);
     try testing.expectEqual(@as(u64, 4), br.b_spread);
+}
+
+fn statsTermsFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const len = smith.slice(&buf);
+    const t = StatsTerms.parse(buf[0..len]);
+    try std.testing.expect(t.present);
+}
+
+test "fuzz: the .stats term reader is total on arbitrary JSON-shaped text" {
+    try fuzzkit.fuzz({}, statsTermsFuzz, .{ .corpus = &.{fuzzkit.slice("{\"fuse_ops\":12,\"put_obj\":-1,\"direct_device_true\":1e9}")} });
 }

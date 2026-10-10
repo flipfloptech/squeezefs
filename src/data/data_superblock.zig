@@ -27,6 +27,8 @@
 //! Portable codec + plans; the device binding (`nvme_dev.Device`) is Linux.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const checksum = @import("../core/checksum.zig");
 const derive = @import("../core/derive.zig");
@@ -662,7 +664,7 @@ fn sectorFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the data superblock decoders are total on arbitrary bytes" {
-    try std.testing.fuzz({}, sectorFuzz, .{});
+    try fuzzkit.fuzz({}, sectorFuzz, .{});
     var prng = std.Random.DefaultPrng.init(0xd474);
     const r = prng.random();
     var img: [sector_len]u8 = undefined;
@@ -681,7 +683,7 @@ test "fuzz: the data superblock decoders are total on arbitrary bytes" {
 }
 
 test "Linux: formatDataVolume on a file writes both copies and reads them back; open classifies v1; a blank file classifies Blank; a too-small file refuses; a reformat continues the generation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "data_superblock: Linux only");
     const io = testing.io;
     const gpa = testing.allocator;
     var dir = testing.tmpDir(.{});

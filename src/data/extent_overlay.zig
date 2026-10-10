@@ -18,6 +18,7 @@
 //! 4× margin), never a literal with a knob on top.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -503,5 +504,5 @@ fn decodeTotalFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the spill record decoder never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, decodeTotalFuzz, .{});
+    try fuzzkit.fuzz({}, decodeTotalFuzz, .{});
 }

@@ -15,6 +15,7 @@
 //! the handler's. Portable.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const codec = @import("../../wire/codec.zig");
 const records = @import("records.zig");
 
@@ -352,20 +353,22 @@ test "every job payload round-trips; the none descriptor is all-zero; counts pas
     try testing.expectError(error.Malformed, roundTrip(ShardAbandonReq, .{ .ref = .{ .job_id = 9, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .reason = 0, .reserved = @splat(0) }, buf));
 }
 
-test "fuzz: no job payload decoder panics on arbitrary bytes" {
-    var prng = std.Random.DefaultPrng.init(0x6672616d);
-    const rnd = prng.random();
+fn jobPayloadsTotal(bytes: []const u8) void {
+    _ = codec.decodePayload(ShardDescriptor, bytes) catch {};
+    _ = codec.decodePayload(ResultSubmitReq, bytes) catch {};
+    _ = codec.decodePayload(ReadShardResultReq, bytes) catch {};
+    _ = codec.decodePayload(ShardAbandonReq, bytes) catch {};
+    _ = codec.decodePayload(JobEnrollReq, bytes) catch {};
+    _ = codec.decodePayload(HeartbeatAck, bytes) catch {};
+    _ = codec.decodePayload(ResultAck, bytes) catch {};
+}
+
+fn jobPayloadsFuzz(_: void, smith: *std.testing.Smith) !void {
     var buf: [4096]u8 = undefined;
-    var round: usize = 0;
-    while (round < 3000) : (round += 1) {
-        const len = rnd.uintLessThan(usize, buf.len);
-        rnd.bytes(buf[0..len]);
-        _ = codec.decodePayload(ShardDescriptor, buf[0..len]) catch {};
-        _ = codec.decodePayload(ResultSubmitReq, buf[0..len]) catch {};
-        _ = codec.decodePayload(ReadShardResultReq, buf[0..len]) catch {};
-        _ = codec.decodePayload(ShardAbandonReq, buf[0..len]) catch {};
-        _ = codec.decodePayload(JobEnrollReq, buf[0..len]) catch {};
-        _ = codec.decodePayload(HeartbeatAck, buf[0..len]) catch {};
-        _ = codec.decodePayload(ResultAck, buf[0..len]) catch {};
-    }
+    const len = smith.slice(&buf);
+    jobPayloadsTotal(buf[0..len]);
+}
+
+test "fuzz: no job payload decoder panics on arbitrary bytes" {
+    try fuzzkit.fuzz({}, jobPayloadsFuzz, .{});
 }

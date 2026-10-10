@@ -13,6 +13,8 @@
 //! `rule_locs` @188, `rxfh` head 24).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -479,7 +481,7 @@ test "the flow spec encodes a v4 lane flow with big-endian ports, all-ones masks
 
 test "on the venue: 127.0.0.1 routes through lo; lo has no channels control (the refusal); the facts read; the IP-literal gate" {
     var out: [16]u8 = undefined;
-    const ifn = routeIfnameFor(Ip.parse("127.0.0.1").?, &out) orelse return error.SkipZigTest;
+    const ifn = routeIfnameFor(Ip.parse("127.0.0.1").?, &out) orelse return testkit.skip(@src(), .no_nic, "no route for 127.0.0.1 readable on this host");
     try testing.expectEqualStrings("lo", ifn);
     try testing.expect(nicIfindex("lo") >= 1);
     try testing.expect(nicMtu("lo").? >= 1280);
@@ -493,4 +495,14 @@ test "on the venue: 127.0.0.1 routes through lo; lo has no channels control (the
     try testing.expect(Ip.parse("target.example") == null);
     try testing.expect(Ip.parse("::1") != null);
     try testing.expect(Ip.parse("10.0.0.300") == null);
+}
+
+fn ipLiteralFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = Ip.parse(buf[0..len]);
+}
+
+test "fuzz: the IP-literal parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, ipLiteralFuzz, .{ .corpus = &.{ fuzzkit.slice("127.0.0.1"), fuzzkit.slice("::ffff:1.2.3.4"), fuzzkit.slice("1.2.3") } });
 }

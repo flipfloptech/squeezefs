@@ -32,6 +32,14 @@ pub const errors = @import("core/errors.zig");
 pub const counters = @import("core/counters.zig");
 pub const json_scan = @import("core/json_scan.zig");
 pub const thread_name = @import("core/thread_name.zig");
+/// The test kits (compiled only under test): the ONE skip + the ONE fuzz entry.
+pub const testkit = if (builtin.is_test) @import("core/testkit.zig") else struct {};
+pub const fuzzkit = if (builtin.is_test) @import("core/fuzzkit.zig") else struct {};
+
+// ---- the gates' shared code: the decoder/fuzz census the rail and the nightly campaign read (portable) ----
+pub const gates = struct {
+    pub const census = @import("gates/census.zig");
+};
 
 // ---- model checking: the exhaustive interleaving explorer (portable) ----
 pub const model = struct {
@@ -199,7 +207,10 @@ test {
     _ = counters;
     _ = json_scan;
     _ = thread_name;
+    _ = testkit;
+    _ = fuzzkit;
     _ = model.explorer;
+    _ = gates.census;
     _ = ops.fsck;
     _ = ops.jobs;
     _ = ops.lifecycle;

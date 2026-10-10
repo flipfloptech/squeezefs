@@ -24,6 +24,7 @@
 //! Portable.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const codec = @import("codec.zig");
 const frame = @import("frame.zig");
 const endpoint = @import("endpoint.zig");
@@ -2042,5 +2043,15 @@ fn verbsFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: every verb decoder is total on arbitrary bytes" {
-    try std.testing.fuzz({}, verbsFuzz, .{});
+    try fuzzkit.fuzz({}, verbsFuzz, .{});
+}
+
+fn peerIdFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [32]u8 = undefined;
+    const len = smith.slice(&buf);
+    if (WireIdentity.fromPeerId(buf[0..len])) |id| try std.testing.expectEqualSlices(u8, buf[0..len], &id.peerId());
+}
+
+test "fuzz: the peer-id decoder is total and a decoded identity re-encodes to its 12 bytes" {
+    try fuzzkit.fuzz({}, peerIdFuzz, .{});
 }

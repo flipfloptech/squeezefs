@@ -37,6 +37,7 @@
 //! guards outlived the answer (`dlm_inode_key_waits` p50 ≤ 16 µs).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
 const derive = @import("../core/derive.zig");
@@ -790,7 +791,7 @@ test "no deadlock over random canonical plans across threads on a tiny table (ev
         group.concurrent(io, Storm.worker, .{ &storm, t }) catch |err| switch (err) {
             error.ConcurrencyUnavailable => {
                 group.cancel(io);
-                return error.SkipZigTest;
+                return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency");
             },
         };
     }

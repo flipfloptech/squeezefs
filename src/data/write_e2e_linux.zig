@@ -11,6 +11,7 @@
 //! device's injected EIO) never joining coverage.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -178,7 +179,7 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
     const gpa = testing.allocator;
     var e: E2E = .{};
     e.init(gpa, false) catch |err| switch (err) {
-        error.DirectIoUnsupported, error.DirectOpenRefused => return error.SkipZigTest,
+        error.DirectIoUnsupported, error.DirectOpenRefused => return testkit.skip(@src(), .no_device, "the venue's filesystem refuses O_DIRECT"),
         else => return err,
     };
     defer e.deinit();
@@ -301,7 +302,7 @@ test "e2e(nvme_dev): the overlay arm — four 1 MiB page-aligned pieces of a fre
     const gpa = testing.allocator;
     var e: E2E = .{};
     e.init(gpa, true) catch |err| switch (err) {
-        error.DirectIoUnsupported, error.DirectOpenRefused => return error.SkipZigTest,
+        error.DirectIoUnsupported, error.DirectOpenRefused => return testkit.skip(@src(), .no_device, "the venue's filesystem refuses O_DIRECT"),
         else => return err,
     };
     defer e.deinit();

@@ -17,6 +17,7 @@
 //! kind byte.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const assert = std.debug.assert;
 const key = @import("../../meta/key.zig");
 
@@ -279,7 +280,7 @@ fn fuzzSlice(comptime bytes: []const u8) []const u8 {
 }
 
 test "fuzz: every data-plane record decoder is total and encode∘decode is the identity" {
-    try std.testing.fuzz({}, decodersTotalFuzz, .{ .corpus = &.{
+    try fuzzkit.fuzz({}, decodersTotalFuzz, .{ .corpus = &.{
         fuzzSlice(&encodeDelta(.{ .tag = TAG_CLEAR, .len = 1, .term = 9 })),
         fuzzSlice(&sharedIndexKey(1, 2, 3, 4)),
         fuzzSlice(&encodeSharedIndexValue()),

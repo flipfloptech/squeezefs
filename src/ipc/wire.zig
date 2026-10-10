@@ -19,6 +19,7 @@
 //!     access-mode arm has its own `rights` class.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const layout = @import("layout.zig");
 
 const assert = std.debug.assert;
@@ -603,4 +604,32 @@ test "RefuseClass: nine classes, each round-trips; anything else is BadClass; th
     try testing.expectEqual(RefuseClass.rights, RefuseClass.fromU32(9).?);
     try testing.expectEqual(@as(usize, 1), sdk_abi_accepted.len);
     try testing.expectEqual(SDK_ABI_CURRENT, sdk_abi_accepted[0]);
+}
+
+fn ctlFramesFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [1024]u8 = undefined;
+    const len = smith.slice(&buf);
+    const raw = buf[0..len];
+    _ = Il0Blob.decode(raw) catch {};
+    if (AdminReq.decode(raw)) |r| {
+        var out: [1024]u8 = undefined;
+        const n = try r.encode(&out);
+        const back = try AdminReq.decode(out[0..n]);
+        try std.testing.expectEqualSlices(u8, r.verb, back.verb);
+        try std.testing.expectEqualSlices(u8, r.arg, back.arg);
+    } else |_| {}
+    if (AdminReply.decode(raw)) |r| {
+        var out: [1024]u8 = undefined;
+        const n = try r.encode(&out);
+        const back = try AdminReply.decode(out[0..n]);
+        try std.testing.expectEqual(r.ok, back.ok);
+        try std.testing.expectEqualSlices(u8, r.body, back.body);
+    } else |_| {}
+    inline for (.{ Hello, SessionOk, Refuse, Bind, BindOk, BindRefused, Unbind, AdminHello, AdminOk }) |T| {
+        if (decodeFixed(T, raw)) |v| try std.testing.expectEqualSlices(u8, raw, frameBytes(&v)) else |_| {}
+    }
+}
+
+test "fuzz: the il0 blob, the admin datagrams and every fixed ctl frame decode totally; whatever decodes re-encodes to its bytes" {
+    try fuzzkit.fuzz({}, ctlFramesFuzz, .{});
 }

@@ -49,6 +49,7 @@
 //! binds `slotOffset` to `write_at`/`read_at`.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const checksum = @import("../core/checksum.zig");
 const counters = @import("../core/counters.zig");
@@ -1104,4 +1105,36 @@ test "pending_reclaim: a tail opens reusable_upto only once a barrier that start
     // Admission bounds against the watermark, never the in-RAM tail.
     try testing.expect(core.tryAdmit(350, .user) != null);
     try testing.expectEqual(@as(?jc.Admission, null), core.tryAdmit(351, .user));
+}
+
+/// Random bytes never pass the slot checksum, so the body also restamps a
+/// candidate (the header's magic, version and length made plausible) to
+/// reach the payload checks; a record that decodes re-encodes to its image.
+fn ledgerSlotFuzz(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+    var buf: [ROOT_LEDGER_SLOT_LEN]u8 = undefined;
+    const len = smith.slice(&buf);
+    if (LedgerRecord.decodeSlot(gpa, buf[0..len])) |*r| {
+        var rr = r.*;
+        rr.deinit(gpa);
+    } else |_| {}
+    if (len >= ROOT_LEDGER_HDR_LEN) {
+        const img = buf[0..len];
+        std.mem.writeInt(u32, img[0..4], ROOT_LEDGER_MAGIC, .little);
+        std.mem.writeInt(u16, img[4..6], ROOT_LEDGER_VERSION, .little);
+        const payload_len: usize = std.mem.readInt(u16, img[6..8], .little);
+        if (ROOT_LEDGER_HDR_LEN + payload_len <= img.len) {
+            std.mem.writeInt(u64, img[16..24], slotChecksum(img, payload_len), .little);
+            if (LedgerRecord.decodeSlot(gpa, img)) |*r| {
+                var rr = r.*;
+                defer rr.deinit(gpa);
+                const re = try rr.encodeSlot();
+                try std.testing.expectEqualSlices(u8, img[0 .. ROOT_LEDGER_HDR_LEN + payload_len], re[0 .. ROOT_LEDGER_HDR_LEN + payload_len]);
+            } else |_| {}
+        }
+    }
+}
+
+test "fuzz: the ledger slot decoder is total on arbitrary and restamped slots; a decoded record re-encodes to its image" {
+    try fuzzkit.fuzz({}, ledgerSlotFuzz, .{});
 }

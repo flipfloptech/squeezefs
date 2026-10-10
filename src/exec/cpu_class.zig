@@ -14,6 +14,8 @@
 //! Portable parsers + the ledger; the `/proc` walk is Linux only.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const thread_name = @import("../core/thread_name.zig");
@@ -297,7 +299,7 @@ test "sample over a synthetic proc tree: classes fold, a renamed thread moves cl
 }
 
 test "the live process: Σ by_class ≤ total on Linux" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "cpu_class: Linux only");
     var l: Ledger = .{};
     defer l.deinit(testing.allocator);
     const s = try sample(&l, testing.allocator, testing.io, "/proc");
@@ -305,4 +307,17 @@ test "the live process: Σ by_class ≤ total on Linux" {
     for (s.by_class) |v| sum += v;
     try testing.expect(sum <= s.total_ns);
     try testing.expect(s.total_ns > 0);
+}
+
+fn cpuAccountingFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    _ = parseSchedstatNs(text);
+    _ = parseStatCpuNs(text, 100);
+    _ = parseStatCpuNs(text, 0);
+}
+
+test "fuzz: the schedstat and stat cpu-time parsers are total on arbitrary text" {
+    try fuzzkit.fuzz({}, cpuAccountingFuzz, .{ .corpus = &.{ fuzzkit.slice("123 456 7\n"), fuzzkit.slice("1 (a b) S 0 0 0 0 0 0 0 0 0 0 11 22 0 0\n") } });
 }

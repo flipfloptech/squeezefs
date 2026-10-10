@@ -28,6 +28,7 @@
 //! (0 = the bare ENOENT).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const linux = std.os.linux;
 const knobs = @import("../core/knobs.zig");
 
@@ -596,4 +597,17 @@ test "the parser is total on arbitrary option strings" {
         _ = parseOptionString(&o, buf[0..len]);
         _ = parseSecondsNs(buf[0..len]);
     }
+}
+
+fn optionStringFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    _ = parseSecondsNs(text);
+    var opts: MountOptions = .{};
+    _ = parseOptionString(&opts, text);
+}
+
+test "fuzz: the -o option string and the seconds parsers are total on arbitrary text" {
+    try fuzzkit.fuzz({}, optionStringFuzz, .{ .corpus = &.{ fuzzkit.slice("ro,allow_other,entry_timeout=1.5,fsname=x"), fuzzkit.slice("entry_timeout=.."), fuzzkit.slice(",,,=,=") } });
 }

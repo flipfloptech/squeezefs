@@ -29,6 +29,7 @@
 //! (0002 row 259); the instruments alone are module globals.
 
 const std = @import("std");
+const fuzzkit = @import("../../../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const counters = @import("../../../core/counters.zig");
@@ -1516,4 +1517,19 @@ test "the clients seam lists every member of the shard: a writer through its row
     // The writer's pid is provably dead on this host: the row reads dead.
     try testing.expectEqual(claim.RegistrationState.dead, rows.items[0].state);
     try testing.expectEqual(claim.RegistrationState.live, rows.items[1].state);
+}
+
+fn memberRowFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [claim.CLAIM_LEN + 8]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = MemberRow.decode(buf[0..len]) catch {};
+    if (len >= claim.CLAIM_LEN) {
+        const img = buf[0..claim.CLAIM_LEN];
+        checksum.stamp(img, @offsetOf(claim.WriterClaimV1, "xxh3_le"));
+        if (MemberRow.decode(img)) |row| try std.testing.expectEqualSlices(u8, img, &row.encode()) else |_| {}
+    }
+}
+
+test "fuzz: the member row decoder is total on arbitrary and restamped claims; a decoded row re-encodes byte-identically" {
+    try fuzzkit.fuzz({}, memberRowFuzz, .{});
 }

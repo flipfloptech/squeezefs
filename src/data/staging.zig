@@ -22,6 +22,8 @@
 //! — the generation ABA model below pins it).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -1762,11 +1764,11 @@ fn recordFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the record header reader, the verifier and the marker decoder are total" {
-    try std.testing.fuzz({}, recordFuzz, .{});
+    try fuzzkit.fuzz({}, recordFuzz, .{});
 }
 
 test "linux: a ring under a tmp dir — 0700/0600 modes, mmap put/get, a remount recovers the entries, the marker round-trips two-phase through the io_uring file layer" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "staging: Linux only");
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -20,6 +20,7 @@
 //! never an allocation authority (design §9).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const counters = @import("../core/counters.zig");
 const key = @import("key.zig");
 
@@ -2799,8 +2800,8 @@ fn fuzzSlice(comptime bytes: []const u8) []const u8 {
     return &framed;
 }
 
-test "fuzz: every decoder is total on arbitrary bytes" {
-    try std.testing.fuzz({}, decodersTotalFuzz, .{ .corpus = &.{
+test "fuzz: every record value decoder is total on arbitrary bytes" {
+    try fuzzkit.fuzz({}, decodersTotalFuzz, .{ .corpus = &.{
         fuzzSlice(&fixture_layout_a),
         fuzzSlice(&fixture_delta_g),
         fuzzSlice(&.{ 9, 0, 1, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1 }),

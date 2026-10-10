@@ -29,6 +29,7 @@
 //! ino is `makeGlobalIno(local, slot, W)` over the frozen `W = 2^16`.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -927,4 +928,14 @@ test "mint ties: W = 2^16; MINT_SPREAD = STAMP_MAX_CURSORS / 4 = 64; volume heal
     for (0..6) |_| seen2[r.mintVolume(0, &.{ 500, 500, 100 })] += 1;
     try testing.expectEqual(@as(u32, 3), seen2[0]);
     try testing.expectEqual(@as(u32, 3), seen2[1]);
+}
+
+fn volumeIdTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = VolumeId.parse(buf[0..len]);
+}
+
+test "fuzz: the volume-id text parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, volumeIdTextFuzz, .{ .corpus = &.{ fuzzkit.slice("0"), fuzzkit.slice("65536"), fuzzkit.slice("-1") } });
 }

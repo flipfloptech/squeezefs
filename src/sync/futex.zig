@@ -19,6 +19,7 @@
 //! "re-check the word": every caller loops on its own predicate.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -167,7 +168,7 @@ pub fn ioWake(io: Io, word: *const Word, max_waiters: u32) void {
 const testing = std.testing;
 
 test "raw: a wake from another thread ends the wait; a changed word returns at once; a timeout reports itself" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "futex: Linux only");
     var word: Word = .init(0);
     const Waker = struct {
         fn run(w: *Word) void {
@@ -185,7 +186,7 @@ test "raw: a wake from another thread ends the wait; a changed word returns at o
 }
 
 test "raw: wakeAll wakes EVERY parked waiter (the C-int clamp), not just one" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "futex: Linux only");
     var word: Word = .init(0);
     var parked: std.atomic.Value(u32) = .init(0);
     const Sleeper = struct {
@@ -219,7 +220,7 @@ fn mapSharedWord() !*Word {
 }
 
 test "shared face: a forked child parked on a MAP_SHARED word is woken by the parent (the private flag would strand it)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "futex: Linux only");
     const word = try mapSharedWord();
     defer _ = linux.munmap(@ptrCast(word), 4096);
     // Two words: `word` is the park word, `*ack` the child's "I am parked"
@@ -251,7 +252,7 @@ test "shared face: a forked child parked on a MAP_SHARED word is woken by the pa
 }
 
 test "waitMany: a wake on ANY of several shared words ends the wait; a stale expectation returns at once; an empty set sleeps the bound" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "futex: Linux only");
     const base = try mapSharedWord();
     defer _ = linux.munmap(@ptrCast(base), 4096);
     const a: *Word = base;

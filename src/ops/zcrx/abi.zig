@@ -11,6 +11,7 @@
 //! Portable: nothing here touches the kernel.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const linux = std.os.linux;
 
 /// `IORING_REGISTER_ZCRX_IFQ` (uapi io_uring.h): register one NIC RX
@@ -223,5 +224,5 @@ fn gatesFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the CQE gates are total and admit only in-area spans" {
-    try std.testing.fuzz({}, gatesFuzz, .{});
+    try fuzzkit.fuzz({}, gatesFuzz, .{});
 }

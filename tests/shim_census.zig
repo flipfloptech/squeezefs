@@ -85,7 +85,7 @@ test "libsqueezefs_il.so: SONAME, DT_FLAGS_1 NODELETE, libc the only DT_NEEDED, 
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const bytes = std.Io.Dir.cwd().readFileAllocOptions(io, SO_NAME, gpa, .limited(64 << 20), .of(u64), null) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
+        error.FileNotFound => return squeezefs.testkit.skip(@src(), .other_step, SO_NAME ++ " is not staged in the cwd (the shim census runs under `zig build rails` on Linux)"),
         else => return err,
     };
     defer gpa.free(bytes);

@@ -13,6 +13,7 @@
 //! on the acquirer's frame.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
 const tick = @import("tick.zig");
@@ -246,7 +247,7 @@ fn freshQueuesTryBarges(io: Io) !void {
     };
     const big = s.tryAcquire(io, 1).?;
     var fut = io.concurrent(Dead.run, .{ io, &s }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     while (s.waiters(io) == 0) try std.Thread.yield();
     big.release(io);
@@ -270,7 +271,7 @@ fn cancelledAcquireUnlinks(io: Io) !void {
         }
     };
     var fut = io.concurrent(Parked.run, .{ io, &s }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     while (s.waiters(io) == 0) try std.Thread.yield();
     try testing.expectEqual(error.Canceled, fut.cancel(io));

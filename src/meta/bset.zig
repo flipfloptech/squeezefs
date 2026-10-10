@@ -12,6 +12,7 @@
 //! authority (design §9; the TEST-4 find below).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const key = @import("key.zig");
 const rec = @import("record.zig");
@@ -1519,7 +1520,7 @@ fn bsetParseFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: bset parse and the frame probe are total on arbitrary and restamped bytes" {
-    try std.testing.fuzz({}, bsetParseFuzz, .{
+    try fuzzkit.fuzz({}, bsetParseFuzz, .{
         .corpus = &.{
             // u32 LE len ‖ bytes: a 32 B header claiming u32::MAX records.
             &([_]u8{ 32, 0, 0, 0 } ++ "BSET".* ++ [_]u8{ 1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF } ++ @as([20]u8, @splat(0))),

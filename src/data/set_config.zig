@@ -37,6 +37,7 @@
 //! Portable.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const transform = @import("transform.zig");
 
@@ -1319,7 +1320,7 @@ test "fuzz: the set_config decoder is total on arbitrary bytes" {
     defer cfg.deinit(gpa);
     const bytes = try encode(gpa, &cfg, test_cap);
     defer gpa.free(bytes);
-    try std.testing.fuzz({}, decodeFuzz, .{});
+    try fuzzkit.fuzz({}, decodeFuzz, .{});
     // Mutations of the valid encoding under a re-stamped checksum reach every structural gate.
     var prng = std.Random.DefaultPrng.init(0x5e7c);
     const r = prng.random();

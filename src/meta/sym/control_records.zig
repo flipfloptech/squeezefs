@@ -25,6 +25,7 @@
 //! the field).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const key = @import("../key.zig");
 const node_seq = @import("../node_seq.zig");
 const checksum = @import("../../core/checksum.zig");
@@ -1453,7 +1454,7 @@ fn fuzzSlice(comptime bytes: []const u8) []const u8 {
 }
 
 test "fuzz: every tree-0 decoder is total on arbitrary bytes and canonical where it accepts" {
-    try std.testing.fuzz({}, decodersTotalFuzz, .{ .corpus = &.{
+    try fuzzkit.fuzz({}, decodersTotalFuzz, .{ .corpus = &.{
         fuzzSlice(&(SlotState{ .variant = .unleased, .g = 1, .root = .{ .addr = 2, .seq = 3 }, .cursor = 4 }).encode()),
         fuzzSlice(&(AppenderHint{ .ring_bytes = 1 }).encode()),
         fuzzSlice(&.{ 1, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0 }),

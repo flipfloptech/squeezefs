@@ -17,6 +17,7 @@
 //! an error log naming the key. Portable.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const checksum = @import("../../core/checksum.zig");
 const control_records = @import("../../meta/sym/control_records.zig");
 
@@ -589,7 +590,30 @@ test "JobShardV1: the head is 56 B; encode∘decode = id with 0, 1 and 64 destin
     try testing.expectError(error.Corrupt, JobShard.decode(gpa, zero_state));
 }
 
-test "fuzz: neither decoder panics on arbitrary bytes; a byte string that decodes re-encodes to itself" {
+fn recordsTotal(gpa: std.mem.Allocator, bytes: []const u8) !void {
+    if (JobRecordV1.decode(bytes)) |r| {
+        try testing.expectEqualSlices(u8, bytes, &r.encode());
+    } else |_| {}
+    if (JobShard.decode(gpa, bytes)) |s| {
+        defer gpa.free(s.dests);
+        const again = try s.encodeAlloc(gpa);
+        defer gpa.free(again);
+        try testing.expectEqualSlices(u8, bytes, again);
+    } else |_| {}
+    _ = parseJobId(bytes);
+}
+
+fn recordsFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [JOB_SHARD_MAX_LEN + 16]u8 = undefined;
+    const len = smith.slice(&buf);
+    try recordsTotal(testing.allocator, buf[0..len]);
+}
+
+test "fuzz: the job record, job shard and job-id decoders are total on arbitrary bytes; whatever decodes re-encodes to itself" {
+    try fuzzkit.fuzz({}, recordsFuzz, .{ .corpus = &.{fuzzkit.slice("job-00000000000000ff")} });
+}
+
+test "property: neither durable decoder panics on mutations of valid records; a byte string that decodes re-encodes to itself" {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6a6f62);
     const rnd = prng.random();

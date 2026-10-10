@@ -15,6 +15,7 @@
 //! arbitrary words and arbitrary bounds. Portable.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const verbs = @import("verbs.zig");
 const key = @import("../meta/key.zig");
 const node_seq = @import("../meta/node_seq.zig");
@@ -728,5 +729,5 @@ fn screenFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: every screen is total over arbitrary words and arbitrary bounds (never a panic)" {
-    try std.testing.fuzz({}, screenFuzz, .{});
+    try fuzzkit.fuzz({}, screenFuzz, .{});
 }

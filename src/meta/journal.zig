@@ -34,6 +34,7 @@
 //! `journal_core.CoreGeometry` mapping places the bytes.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const checksum = @import("../core/checksum.zig");
 const counters = @import("../core/counters.zig");
@@ -2263,4 +2264,27 @@ test "concurrent appenders through the image path: 8 threads × 4 entries, uniqu
     try testing.expectEqual(@as(usize, 32), rec.entries.len);
     for (rec.entries, 0..) |e, i| try testing.expectEqual(@as(u64, i) * 230, e.seq);
     try testing.expectEqual(@as(u64, 0), rec.dropped_torn);
+}
+
+fn journalFramesFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [2048]u8 = undefined;
+    const len = smith.slice(&buf);
+    const bytes = buf[0..len];
+    _ = parsePageHeader(bytes);
+    if (len >= PAGE_HDR_LEN) {
+        // Restamped: the page header's checksum over the fuzzed first 16 bytes.
+        std.mem.writeInt(u64, buf[16..24], checksum.xxh3(buf[0..16]), .little);
+        _ = parsePageHeader(bytes);
+    }
+    if (decodeRecordFrame(bytes)) |d| {
+        try std.testing.expect(d.used <= bytes.len);
+        const re = try std.testing.allocator.alloc(u8, @intCast(d.frame.frameLen()));
+        defer std.testing.allocator.free(re);
+        d.frame.encodeInto(re);
+        try std.testing.expectEqualSlices(u8, bytes[0..d.used], re);
+    } else |_| {}
+}
+
+test "fuzz: the journal page header and record frame decoders are total; a decoded frame re-encodes to the bytes it consumed" {
+    try fuzzkit.fuzz({}, journalFramesFuzz, .{});
 }

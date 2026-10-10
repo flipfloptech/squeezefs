@@ -18,6 +18,7 @@
 //! unreadable local boot id proves nothing (never a same-host verdict).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const checksum = @import("../../core/checksum.zig");
 
 // ---------------------------------------------------------------------------
@@ -592,4 +593,19 @@ test "refusal texts name the holder and the remedy" {
     w = .fixed(&buf);
     try writeClearOwnRefusal(&w, "/dev/v", c, now);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "own residue") != null);
+}
+
+fn claimFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [CLAIM_LEN + 8]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = Claim.decode(buf[0..len]) catch {};
+    if (len >= CLAIM_LEN) {
+        const img = buf[0..CLAIM_LEN];
+        checksum.stamp(img, @offsetOf(WriterClaimV1, "xxh3_le"));
+        if (Claim.decode(img)) |c| try std.testing.expectEqualSlices(u8, img, &c.encode()) else |_| {}
+    }
+}
+
+test "fuzz: the writer-claim decoder is total on arbitrary and restamped records; a decoded claim re-encodes byte-identically" {
+    try fuzzkit.fuzz({}, claimFuzz, .{});
 }

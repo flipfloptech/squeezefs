@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const fuzzkit = @import("fuzzkit.zig");
 
 pub const Kind = union(enum) {
     bool,
@@ -331,6 +332,13 @@ pub const registry = [_]Knob{
     .{ .key = "SQUEEZEFS_TEST_XV_SHIP_FAIL_AT", .kind = .{ .int = .{ .lo = 0, .hi = 1 << 20 } }, .default = "0", .class = .test_seam, .doc = "Test seam: the N-th shipped cross-owner step of this mount fails as a lost connection (0 = never), so the intent stays OPEN and the roll-forward cadence's completion is exercised deterministically." },
     .{ .key = "SQUEEZEFS_TEST_XV_CRASH_AFTER_STEP", .kind = .{ .int = .{ .lo = 0, .hi = 1 << 20 } }, .default = "derived", .class = .test_seam, .doc = "Test seam: the intent executor stops dead right after step N committed (0 = after step 0 + the intent; ≥ the plan length = before the retirement) — the kill -9 window the next mount's roll-forward must complete to exactly one outcome. Absent = never." },
     .{ .key = "SQUEEZEFS_TEST_XV_SERVE_SLOT_MOVED_ONCE", .kind = .bool, .default = "0", .class = .test_seam, .doc = "Test seam: the holder answers the next served cross-owner step `SlotMoved` once, so the initiator's re-resolve + re-dispatch arm (≤ 2 retries) is exercised deterministically." },
+
+    // ---- the gate's test kits (read by core/testkit.zig, core/fuzzkit.zig; charter §11 static rails + fuzz) ----
+    .{ .key = "SQUEEZEFS_TEST_SKIP_LEDGER", .kind = .harness, .default = "-", .class = .harness, .doc = "Harness: the file every `testkit.skip` appends its row to (`class<TAB>file:line<TAB>verdict<TAB>detail`), so a gate run's environment skips are counted by class; unset = stderr only." },
+    .{ .key = "SQUEEZEFS_TEST_RELEASE_GATE", .kind = .harness, .default = "0", .class = .harness, .doc = "Harness: release-gate mode (`zig build gate -Drelease-gate=true` sets it on every test run step) — a `testkit.skip` FAILS the test except for the `needs_reference_hardware` and `other_step` classes." },
+    .{ .key = "SQUEEZEFS_TEST_FUZZ_REPLAY", .kind = .harness, .default = "-", .class = .harness, .doc = "Harness: a file whose bytes every `fuzzkit.fuzz` test replays through its body before the corpus (the campaign's crash artefact and its minimizer's candidates); unset = no replay." },
+    .{ .key = "SQUEEZEFS_TEST_FUZZ_SECONDS", .kind = .harness, .default = "60", .class = .harness, .doc = "Harness: the nightly fuzz campaign's time budget per fuzz target in seconds (`zig build fuzz`); the campaign total is targets × budget." },
+    .{ .key = "SQUEEZEFS_TEST_FUZZ_CORPUS_DIR", .kind = .harness, .default = "/build/fuzz-corpus", .class = .harness, .doc = "Harness: the campaign's persistent corpus root — one directory per fuzz target (`<root>/<target slug>/`, the build cache's `f/<hash>` dir symlinked onto it) with the saved crash artefacts under `crashes/`; the venue default is /build/fuzz-corpus, elsewhere `fuzz-corpus/` under the repo (gitignored)." },
 
     // ---- membership, the death ledger and recovery: the venue legs' seam (read ONCE at the shard's arm by meta/sym/membership/shard.zig; never a process static) ----
     .{ .key = "SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", .kind = .{ .int = .{ .lo = 1000, .hi = MS_MAX } }, .default = "derived", .class = .test_seam, .doc = "Test seam: the membership lease's T_owner in ms instead of the ONE staleness TTL (45,000 ms), so the two-daemon legs (kill -9 a joiner ⇒ the home shard evicts ⇒ RecordDeath ⇒ recovery ⇒ its slots Unleased; a dead manager ⇒ park-and-reclaim) complete inside a test's budget. Every derived clock (skew_max, T_self, renew, grace, the retirement at 2 × T_owner, the custody quarantine) follows it; absent = the constant." },
@@ -860,4 +868,28 @@ test "classes: every row is one of the charter's shapes; a seam is named SQUEEZE
             .switch_, .config, .enum_select, .retired => {},
         }
     }
+}
+
+/// The ONE parser is total on arbitrary environment text: every kind
+/// returns `absent`, a value or a typed `invalid` — never a panic — and a
+/// value that parses re-parses to itself (the canonical spelling is a
+/// fixpoint).
+fn parsersTotalFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    const raw = buf[0..len];
+    _ = parseBool("SQUEEZEFS_RAIL_FIXTURE_A", raw);
+    switch (parseIntIn(i64, "SQUEEZEFS_RAIL_FIXTURE_A", raw, -7, 1 << 40)) {
+        .value => |v| try std.testing.expect(v >= -7 and v <= 1 << 40),
+        .absent, .invalid => {},
+    }
+    switch (parseEnum("SQUEEZEFS_RAIL_FIXTURE_A", raw, &.{ "auto", "off", "zc" })) {
+        .value => |canonical| try std.testing.expectEqualStrings(canonical, parseEnum("SQUEEZEFS_RAIL_FIXTURE_A", canonical, &.{ "auto", "off", "zc" }).value),
+        .absent, .invalid => {},
+    }
+    if (parseStr(raw)) |s| try std.testing.expect(s.len != 0 and s.len <= raw.len);
+}
+
+test "fuzz: the knob parsers are total on arbitrary environment text and canonical spellings are fixpoints" {
+    try fuzzkit.fuzz({}, parsersTotalFuzz, .{ .corpus = &.{ fuzzkit.slice("  yes "), fuzzkit.slice("-7"), fuzzkit.slice("1099511627777"), fuzzkit.slice("ZC") } });
 }

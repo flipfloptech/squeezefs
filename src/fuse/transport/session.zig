@@ -24,6 +24,7 @@
 //! `replyWindow`, `submitReply`, `failEnt`, `releaseLease`.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -1604,30 +1605,8 @@ const Rig = struct {
 /// Root, `/dev/fuse` and CAP_SYS_ADMIN (`mount(2)`): the venue recipe
 /// grants the capability (`scripts/venue up`); a container without it
 /// skips the mount tests LOUDLY rather than failing them with EPERM.
-fn venueAvailable() bool {
-    if (linux.getuid() != 0) return false;
-    const rc = linux.open(dev_fuse_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    _ = linux.close(@intCast(rc));
-    if (!hasCapSysAdmin()) {
-        log.warn("transport e2e: CAP_SYS_ADMIN is not in this container's effective set — mount(2) would be EPERM; recreate the venue with `scripts/venue up` (the recipe adds the capability). Skipping.", .{});
-        return false;
-    }
-    return true;
-}
-
-/// `CapEff` bit 21 from `/proc/self/status`.
-fn hasCapSysAdmin() bool {
-    var buf: [4096]u8 = undefined;
-    const text = Io.Dir.cwd().readFile(std.testing.io, "/proc/self/status", &buf) catch return false;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "CapEff:")) continue;
-        const hex = std.mem.trim(u8, line["CapEff:".len..], " \t");
-        const caps = std.fmt.parseInt(u64, hex, 16) catch return false;
-        return caps & (@as(u64, 1) << 21) != 0;
-    }
-    return false;
+fn venueMissing() ?testkit.Why {
+    return testkit.venue.mount(std.testing.io, &.{});
 }
 
 fn statSize(path: [*:0]const u8) !u64 {
@@ -1888,7 +1867,7 @@ const TeardownWatchdog = struct {
 };
 
 test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, enable_uring reads Y, every queue armed, stat/open/read from a helper thread arrive over the RING (the sideband saw no request), replies byte-exact, the geometry the kernel accepted equals the plan" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 1, &.{});
     defer rig.deinit();
     const before = Snapshot.take();
@@ -1946,7 +1925,7 @@ test "e2e: EchoFs mounts over the ring — INIT negotiated FUSE_OVER_IO_URING, e
 }
 
 test "e2e: a FUSE_WRITE payload is a zero-copy lease; a handler that replies while holding it parks the commit, the drop wakes the worker and the commit lands: parked ≡ unparked, bytes landed" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 2, &.{});
     defer rig.deinit();
     rig.fs.hold_lease_across_reply = true;
@@ -1978,7 +1957,7 @@ test "e2e: a FUSE_WRITE payload is a zero-copy lease; a handler that replies whi
 }
 
 test "e2e: FORGETs arrive and are committed (classically on this kernel) after a lookup storm and drop_caches; the sideband saw FORGET-class traffic only" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 3, &.{});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
@@ -2007,7 +1986,7 @@ test "e2e: FORGETs arrive and are committed (classically on this kernel) after a
 }
 
 test "e2e: teardown with an in-flight request — the drain synthesizes the error, the blocked reader returns, umount is not EBUSY, nothing is abandoned" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 4, &.{});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
@@ -2045,7 +2024,7 @@ test "e2e: teardown with an in-flight request — the drain synthesizes the erro
 }
 
 test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop (tick rescues stay 0), abandons nothing, overflows nothing; the partition law and parked ≡ unparked hold; the coalescer elides" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 5, &.{});
     defer rig.deinit();
     rig.fs.probe_declines = true;
@@ -2108,7 +2087,7 @@ test "e2e: a 10 s random-op storm from 4 threads never needs the 100 ms backstop
 }
 
 test "e2e: the REGISTER refusal seam — the first 5 pushes are refused, back off 1 ms doubling, every ent is eventually registered, nothing retires, the mount arms and serves" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 6, &.{.{ "SQUEEZEFS_TEST_FUSE_REGISTER_REFUSE", "5" }});
     defer rig.deinit();
     const before = Snapshot.take();
@@ -2129,7 +2108,7 @@ test "e2e: the REGISTER refusal seam — the first 5 pushes are refused, back of
 }
 
 test "e2e: SQUEEZEFS_FUSE_SQPOLL=1 — the lever builds the ring on the SQPOLL ladder and the mount still serves" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 7, &.{.{ "SQUEEZEFS_FUSE_SQPOLL", "1" }});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
@@ -2142,7 +2121,7 @@ test "e2e: SQUEEZEFS_FUSE_SQPOLL=1 — the lever builds the ring on the SQPOLL l
 }
 
 test "e2e: notify frames ride the sideband — INVAL_INODE on a held inode succeeds, on an unknown inode counts ENOENT (never logged), PRUNE is accepted or counted failed on a pre-7.45 kernel" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 8, &.{});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
@@ -2162,7 +2141,7 @@ test "e2e: notify frames ride the sideband — INVAL_INODE on a held inode succe
 }
 
 test "e2e lattice: every probe verdict on this kernel (kmbuf present with its pair, zc present with CapEff, retention present, TIME_LIMITS present); auto mounts ZeroCopy with width 1, retention armed, no user arena; the gauges publish" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 20, &.{});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
@@ -2191,7 +2170,7 @@ test "e2e lattice: every probe verdict on this kernel (kmbuf present with its pa
 }
 
 test "e2e lattice: an explicit `bufring` mounts BufRing (no arena, every payload read at the kernel address through the CQE bid); `user` mounts UserEnts (an arena, no attachments); both serve byte-exact and close the laws" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     for ([_][]const u8{ "bufring", "user" }, 0..) |mode, i| {
         const rig = try Rig.init(testing.allocator, 21 + @as(u32, @intCast(i)), &.{modeEnv(mode)});
         defer rig.deinit();
@@ -2224,7 +2203,7 @@ test "e2e lattice: an explicit `bufring` mounts BufRing (no arena, every payload
 }
 
 test "e2e lattice: an explicit `zc` on a venue without CAP_SYS_ADMIN (the seam) fails the mount LOUD naming the probe; `auto` on the same seam settles on BufRing — the probe is the only degrade point" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     {
         const rig = try Rig.init(testing.allocator, 23, &.{ modeEnv("zc"), .{ "SQUEEZEFS_TEST_FUSE_CAP_SYS_ADMIN_ABSENT", "1" } });
         defer rig.deinit();
@@ -2243,8 +2222,8 @@ test "e2e lattice: an explicit `zc` on a venue without CAP_SYS_ADMIN (the seam) 
 }
 
 test "e2e lattice: the kmbuf ring answering ENOMEM after every retry (the seam) fails the mount with the TYPED KmbufRingEnomem refusal whose detail names the page order and the remedy; nothing stays pinned or mounted" {
-    if (!venueAvailable()) return error.SkipZigTest;
-    if (probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
+    if (probes.driver.probeKmbuf(@intCast(derive.facts().page_size)).opcodes() == null) return testkit.skip(@src(), .no_kernel_feature, "no kmbuf register opcode on this kernel");
     const rig = try Rig.init(testing.allocator, 25, &.{.{ "SQUEEZEFS_TEST_KMBUF_REGISTER_ENOMEM", "1" }});
     defer rig.deinit();
     const pinned_before = kmbuf.pinned_bytes.load();
@@ -2268,7 +2247,7 @@ test "e2e lattice: the kmbuf ring answering ENOMEM after every retry (the seam) 
 }
 
 test "e2e zc READ: /big moves through the fd-source leg from the fill pool (zc_serve_bytes ≡ user bytes, daemon copies 0, every reply rode the slot); with SQUEEZEFS_READ_ZC_SERVE=0 the bounce leg serves with ONE copy per READ" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     for ([_][]const u8{ "1", "0" }, 0..) |serve, i| {
         const rig = try Rig.init(testing.allocator, 25 + @as(u32, @intCast(i)), &.{.{ "SQUEEZEFS_READ_ZC_SERVE", serve }});
         defer rig.deinit();
@@ -2315,7 +2294,7 @@ test "e2e zc READ: /big moves through the fd-source leg from the fill pool (zc_s
 }
 
 test "e2e zc WRITE: a W1-eligible aligned write is HELD in the slot and extracted lazily by the handler (one bridge, bytes land); an unaligned write is extracted at delivery; a session whose filesystem never declares eligibility extracts every paged write at delivery" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 27, &.{});
     defer rig.deinit();
     rig.fs.hold_eligible = true;
@@ -2358,7 +2337,7 @@ test "e2e zc WRITE: a W1-eligible aligned write is HELD in the slot and extracte
 }
 
 test "e2e zc bridges: a bridge that never completes (the stall seam) is cancelled at the deadline — bridge_cancels == 1, the slot still commits header-only -EIO (THE LAW: the reader gets EIO), lost/orphans stay 0, the session serves on" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 28, &.{ .{ "SQUEEZEFS_TEST_ZC_BRIDGE_STALL", "1" }, .{ "SQUEEZEFS_TEST_ZC_BRIDGE_DEADLINE_MS", "300" } });
     defer rig.deinit();
     // The tripwire's log line and the deadline scan's line.
@@ -2392,7 +2371,7 @@ test "e2e zc bridges: a bridge that never completes (the stall seam) is cancelle
 }
 
 test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns while the slot is Retained (ACK-early observed), the handler extracts AFTER the ACK, releases, the slot is Replied (retain_commits − releases ≡ 0); an O_DIRECT write is `.direct_gup` and its retain is REFUSED (committed plain, counted); teardown with a retained slot RELEASEs it before the unmount and leaves no mount" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 29, &.{});
     defer rig.deinit();
     rig.fs.hold_eligible = true;
@@ -2497,7 +2476,7 @@ test "e2e retention: a held page-cache WRITE replies RETAIN — write(2) returns
 }
 
 test "e2e retention teardown: N slots RETAINED at close — the orderly teardown RELEASEs every one while the connection is live (released_at_teardown == N, retained_outstanding == 0, release_failures unchanged, the kernel logs no `retained zc payloads` line), close returns in under 2 s, nothing is abandoned" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 40, &.{});
     defer rig.deinit();
     rig.fs.hold_eligible = true;
@@ -2564,7 +2543,7 @@ test "e2e retention teardown: N slots RETAINED at close — the orderly teardown
 }
 
 test "e2e TIME_LIMITS: a utimensat with a time outside our advertised range is clamped by the VFS to the bound before it reaches the daemon" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const rig = try Rig.init(testing.allocator, 30, &.{});
     defer rig.deinit();
     const s = try rig.mountIt(.{ .mem_budget_bytes = 0 });
@@ -2585,7 +2564,7 @@ test "e2e TIME_LIMITS: a utimensat with a time outside our advertised range is c
 }
 
 test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zc session — a probe that declines its first poll is served by the fused re-poll (fusions > 0, late demotions 0); the partition law holds; on BufRing the lever is inert (demotions)" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     for ([_][]const u8{ "auto", "bufring" }, 0..) |mode, i| {
         const rig = try Rig.init(testing.allocator, 31 + @as(u32, @intCast(i)), &.{ modeEnv(mode), .{ "SQUEEZEFS_FUSE_READ_FUSION", "1" } });
         defer rig.deinit();
@@ -2615,7 +2594,7 @@ test "e2e fused poll: SQUEEZEFS_FUSE_READ_FUSION=1 on a zc session — a probe t
 }
 
 test "e2e measured (scoping): enters per request and daemon copies per READ under UserEnts, BufRing and ZeroCopy side by side — 64 × 16 KiB preads of /big" {
-    if (!venueAvailable()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     std.debug.print("\n| mode | reads | ring requests | enters | enters/request | daemon READ copies | copies/READ | zc_serve bytes |\n|---|---|---|---|---|---|---|---|\n", .{});
     for ([_][]const u8{ "user", "bufring", "zc" }, 0..) |mode, i| {
         const rig = try Rig.init(testing.allocator, 33 + @as(u32, @intCast(i)), &.{modeEnv(mode)});

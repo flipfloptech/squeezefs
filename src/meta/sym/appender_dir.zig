@@ -12,6 +12,7 @@
 //! over a page-read seam (the device binding and the tests supply it).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const checksum = @import("../../core/checksum.zig");
 const page = @import("appender_page.zig");
 
@@ -362,4 +363,26 @@ test "the chain walk: links in order with their indices enforced; a wrong index,
     // A bound of 0 links refuses before any read.
     links.clearRetainingCapacity();
     try testing.expectError(error.Corrupt, walkChain(gpa, dev.reader(), link0, node, heap, 0, &links));
+}
+
+/// Random bytes never pass the checksum, so the body also RESTAMPS a full
+/// page (the checksum over the fuzzed bytes) to reach every check behind it;
+/// a header that decodes re-encodes byte-identically.
+fn headerFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [PAGE_LEN + 8]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = Header.decode(buf[0..len]) catch {};
+    if (len >= PAGE_LEN) {
+        const img = buf[0..PAGE_LEN];
+        std.mem.writeInt(u64, img[CHECKSUM_OFF..][0..8], checksum.xxh3(img[0..CHECKSUM_OFF]), .little);
+        if (Header.decode(img)) |h| {
+            var re: [PAGE_LEN]u8 = undefined;
+            h.encode(&re);
+            try std.testing.expectEqualSlices(u8, img, &re);
+        } else |_| {}
+    }
+}
+
+test "fuzz: the appender directory header decoder is total on arbitrary and restamped pages; a decoded header re-encodes byte-identically" {
+    try fuzzkit.fuzz({}, headerFuzz, .{});
 }

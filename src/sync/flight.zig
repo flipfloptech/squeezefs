@@ -20,6 +20,7 @@
 //! `channel_ticked_reregisters`).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
 const tick = @import("tick.zig");
@@ -335,7 +336,7 @@ fn cancelledCohortLeaves(io: Io) !void {
         error.ConcurrencyUnavailable => {
             opens(&c, io);
             leader.join();
-            return error.SkipZigTest;
+            return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency");
         },
     };
     while (f.cohort(io, 5) == 0) try std.Thread.yield();

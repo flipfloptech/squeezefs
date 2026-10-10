@@ -71,6 +71,7 @@
 //! The kill matrix below pins both.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -3069,7 +3070,7 @@ test "crash child: churn creates until killed" {
     const gpa = testing.allocator;
     var env = try testing.environ.createMap(gpa);
     defer env.deinit();
-    const vol = env.get(crash_child_knob) orelse return error.SkipZigTest;
+    const vol = env.get(crash_child_knob) orelse return testkit.skip(@src(), .no_seam, "the kill -9 matrix's child marker is not set (the parent test re-execs this body)");
     var ledger_buf: [192]u8 = undefined;
     const ledger_path = try std.fmt.bufPrint(&ledger_buf, "{s}.acks", .{vol});
     const sqz = try exec.SqzIo.testInstance();
@@ -3107,7 +3108,7 @@ fn ledgerLineCount(gpa: Allocator, path: []const u8) !usize {
 
 test "kill -9: a child mid-commit-stream is SIGKILLed; the reopened volume holds every ledger-acked create whole, next_ino is above every minted ino, the torn tripwire never fires" {
     const gpa = testing.allocator;
-    const idx = childTestIndex() orelse return error.SkipZigTest;
+    const idx = childTestIndex() orelse return testkit.skip(@src(), .no_seam, "the crash child's test index is not resolvable in this binary");
     const exe = "/proc/self/exe";
     const tripwire0 = journal.replay_dropped_after_clean_unmount.load();
     for ([_]usize{ 20, 75, 160 }) |target_acks| {

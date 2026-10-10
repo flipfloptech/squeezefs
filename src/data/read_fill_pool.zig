@@ -24,6 +24,7 @@
 //! (the reference's "over-capacity fresh backings keep the copy path").
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -304,7 +305,7 @@ test "a release past zero fires the tripwire and never frees twice" {
 }
 
 test "memfd slab (Linux): the same bytes reachable by VA and by fd offset" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "read_fill_pool: Linux only");
     const p = try Pool.initMemfd(testing.allocator, 4096, 3);
     defer p.deinit();
     const s = p.acquire().?;

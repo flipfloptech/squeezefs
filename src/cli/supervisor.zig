@@ -32,6 +32,7 @@
 //!   daemon can never answer.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const tick_law = @import("../sync/tick.zig");
 
@@ -321,4 +322,14 @@ test "waiting parses one decimal line" {
     try testing.expectEqual(@as(?u64, 0), parseWaiting("0"));
     try testing.expectEqual(@as(?u64, null), parseWaiting(""));
     try testing.expectEqual(@as(?u64, null), parseWaiting("x"));
+}
+
+fn waitingFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseWaiting(buf[0..len]);
+}
+
+test "fuzz: the supervisor's waiting-count parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, waitingFuzz, .{});
 }

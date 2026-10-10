@@ -9,6 +9,7 @@
 //! release store the readers' acquire load pairs with.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const Io = std.Io;
 const Notify = @import("notify.zig").Notify;
 const futex = @import("futex.zig");
@@ -220,7 +221,7 @@ fn cancelledLeaderReleases(io: Io) !void {
         }
     };
     var fut = io.concurrent(Leader.run, .{ io, &cell2, &c2 }) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => return error.SkipZigTest,
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
     };
     while (c2.inits.load(.acquire) == 0) try std.Thread.yield();
     try testing.expectError(error.Canceled, fut.cancel(io));

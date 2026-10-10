@@ -27,6 +27,7 @@
 //! rows are the reference-hardware bar).
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -66,19 +67,8 @@ fn alive(pid: linux.pid_t) bool {
     return close_paren + 2 < n and text[close_paren + 2] != 'Z';
 }
 
-fn venueAvailable(io: Io) bool {
-    if (linux.getuid() != 0) return false;
-    var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, "squeezefs", 0, .{ .TYPE = true }, &st)) != .SUCCESS) return false;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, SO_NAME, 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
-        log.warn("shim smoke: no ./{s} in the cwd — run through `zig build shim-smoke`. Skipping.", .{SO_NAME});
-        return false;
-    }
-    const rc = linux.open("/dev/fuse", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return false;
-    _ = linux.close(@intCast(rc));
-    _ = io;
-    return true;
+fn venueMissing(io: Io) ?testkit.Why {
+    return testkit.venue.mount(io, &.{ "squeezefs", SO_NAME });
 }
 
 const Rig = struct {
@@ -564,7 +554,7 @@ const CRows = struct {
 
 test "shim smoke: the LD_PRELOAD battery — plain-file parity with the shim silent; a SqueezeFS mount without -o interception stays pure passthrough (ipc_sessions_total 0); the C program and the libaio harness; then the engagement rows on an interception mount (dd/sha through the ring, the C program's bail-outs, aio served, the -dirty pairing refusal counted, kill -9 mid-op ⇒ the passthrough result) or PENDING when the daemon refuses the option" {
     const io = testing.io;
-    if (!venueAvailable(io)) return error.SkipZigTest;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();

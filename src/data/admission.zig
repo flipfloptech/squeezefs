@@ -26,6 +26,7 @@
 //! epoch stamp is `clock.monotonicNs` (Q11: a wall clock steps).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 
@@ -558,4 +559,14 @@ test "policy: knob parsing and the hot-budget-0 degrade" {
     try testing.expectEqual(GOVERNOR_EPOCH_NS, Governor.fromEnv(&env).epoch_ns);
     try env.put("SQUEEZEFS_TEST_READ_ADMISSION_EPOCH_MS", "50");
     try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), Governor.fromEnv(&env).epoch_ns);
+}
+
+fn policyNameFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = Policy.parse(buf[0..len]);
+}
+
+test "fuzz: the admission policy name parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, policyNameFuzz, .{});
 }

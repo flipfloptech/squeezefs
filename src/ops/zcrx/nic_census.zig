@@ -14,6 +14,7 @@
 //! (it widens the spread).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
 const Io = std.Io;
 const area = @import("area.zig");
 
@@ -270,4 +271,16 @@ test "sysfs discovery: a tcp namespace yields its target (traddr, trsvcid, subnq
     try testing.expectEqual(@as(u32, 2), tcpDevicesViaNic(io, root, "eth7", route));
     try testing.expectEqual(@as(u32, 1), tcpDevicesViaNic(io, root, "eth1", route));
     try testing.expectEqual(@as(u32, 1), tcpDevicesViaNic(io, root, "eth9", route));
+}
+
+fn censusTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    _ = parsePlainNamespace(text);
+    _ = parseAddress(text);
+}
+
+test "fuzz: the sysfs namespace-name and address parsers are total on arbitrary text" {
+    try fuzzkit.fuzz({}, censusTextFuzz, .{ .corpus = &.{ fuzzkit.slice("nvme0n1"), fuzzkit.slice("nvme0c0n1"), fuzzkit.slice("traddr=10.0.0.1,trsvcid=4420,src_addr=10.0.0.2") } });
 }

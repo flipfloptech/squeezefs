@@ -16,6 +16,7 @@
 //! Skips LOUDLY without root, `/dev/nvme-fabrics` or a ready nvmet tree.
 
 const std = @import("std");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
@@ -48,22 +49,13 @@ const port_id: u16 = 54950;
 const ident_a: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1", .hostid = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1" };
 const ident_b: initiator.HostPair = .{ .hostnqn = "nqn.2014-08.org.nvmexpress:uuid:d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2", .hostid = "d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2" };
 
-fn venueReady() bool {
-    if (linux.geteuid() != 0) {
-        log.warn("zcrx association e2e: not root — skipped", .{});
-        return false;
-    }
+fn venueMissing() ?testkit.Why {
+    if (linux.geteuid() != 0) return .{ .class = .no_root, .detail = "the nvmet target needs root" };
     var st: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, initiator.FABRICS_DEV, 0, .{ .TYPE = true }, &st)) != .SUCCESS) {
-        log.warn("zcrx association e2e: {s} absent — skipped", .{initiator.FABRICS_DEV});
-        return false;
-    }
+    if (linux.errno(linux.statx(linux.AT.FDCWD, initiator.FABRICS_DEV, 0, .{ .TYPE = true }, &st)) != .SUCCESS) return .{ .class = .no_device, .detail = initiator.FABRICS_DEV ++ " absent" };
     var e: ?linux.E = null;
-    if (configfs.preflight(&e) != .ready) {
-        log.warn("zcrx association e2e: the kernel nvmet target is not ready — skipped", .{});
-        return false;
-    }
-    return true;
+    if (configfs.preflight(&e) != .ready) return .{ .class = .no_kernel_feature, .detail = "the kernel nvmet target is not ready (configfs preflight)" };
+    return null;
 }
 
 /// A deterministic pattern: byte i of block b = f(b, i), distinct per block.
@@ -75,7 +67,7 @@ fn fillPattern(buf: []u8, offset: u64) void {
 }
 
 pub fn run() !void {
-    if (!venueReady()) return error.SkipZigTest;
+    if (venueMissing()) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const io = testing.io;
     const pid = linux.getpid();

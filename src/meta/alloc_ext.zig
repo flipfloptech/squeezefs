@@ -13,6 +13,7 @@
 //! inside `[tail, head]` until their effects are durable in pages.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const counters = @import("../core/counters.zig");
 const log = @import("../core/log.zig");
@@ -1117,4 +1118,31 @@ test "invariant drift surfaces as a loud NoSpace at the wrapper" {
     log.testing.expectErrorLogs(1);
     try testing.expectError(error.NoSpace, alloc.claimInternal());
     try log.testing.expectAllFired();
+}
+
+fn allocRecordsFuzz(_: void, smith: *std.testing.Smith) !void {
+    var key: [16]u8 = undefined;
+    var value: [16]u8 = undefined;
+    var page: [page_len + 8]u8 = undefined;
+    const klen = smith.slice(&key);
+    const vlen = smith.slice(&value);
+    const plen = smith.slice(&page);
+    var diag: DeltaRefusal = undefined;
+    _ = decodeExtentKey(key[0..klen], &diag) catch {};
+    _ = decodeAllocRecord(key[0..klen], value[0..vlen], &diag) catch {};
+    _ = decodeBitmapPage(page[0..plen], 0) catch {};
+    if (plen >= page_len) {
+        const img = page[0..page_len];
+        const index = std.mem.readInt(u32, img[off_page_index..][0..4], .little);
+        checksum.stamp(img, off_checksum);
+        if (decodeBitmapPage(img, index)) |d| {
+            var re: [page_len]u8 = undefined;
+            try encodeBitmapPage(index, d.generation, d.bits, &re);
+            try std.testing.expectEqualSlices(u8, img, &re);
+        } else |_| {}
+    }
+}
+
+test "fuzz: the extent key, alloc record and bitmap page decoders are total; a restamped page that decodes re-encodes byte-identically" {
+    try fuzzkit.fuzz({}, allocRecordsFuzz, .{});
 }

@@ -12,6 +12,7 @@
 //! synthetic machine shape.
 
 const std = @import("std");
+const fuzzkit = @import("fuzzkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
@@ -261,4 +262,14 @@ test "fleet share divides the CPU root: ceil, floor 1; possible CPUs and the pag
     try std.testing.expectEqual(320 * GiB, f.total_ram);
     // The 4-way fleet share of 32 CPUs is a quarter of the lane count (the derivation-sweep tie).
     try std.testing.expectEqual(effectiveParallelism(32, 1) / 4, effectiveParallelism(32, 4));
+}
+
+fn cpuListFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseCpuList(buf[0..len]);
+}
+
+test "fuzz: the cpu-list parser is total on arbitrary sysfs text" {
+    try fuzzkit.fuzz({}, cpuListFuzz, .{ .corpus = &.{ fuzzkit.slice("0-7\n"), fuzzkit.slice("0,2-3,9999999999\n"), fuzzkit.slice("-") } });
 }

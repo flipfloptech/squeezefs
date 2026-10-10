@@ -5,6 +5,8 @@
 //! an absent file reads as empty).
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const claim = @import("claim.zig");
@@ -235,7 +237,7 @@ test "/proc/locks: an exclusive FLOCK line on the file's (major, minor, inode) i
     const path = "/build/tmp/proc-flock-probe";
     _ = linux.mkdir("/build/tmp", 0o755);
     const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .CREAT = true }, 0o600);
-    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(rc) != .SUCCESS) return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
     const fd: linux.fd_t = @intCast(rc);
     defer {
         _ = linux.close(fd);
@@ -256,4 +258,16 @@ test "/etc/nvme reads as empty when absent, never written" {
     const before = linux.errno(linux.statx(linux.AT.FDCWD, "/etc/nvme/hostid", 0, .{ .TYPE = true }, &st));
     _ = EtcNvme.read();
     try testing.expectEqual(before, linux.errno(linux.statx(linux.AT.FDCWD, "/etc/nvme/hostid", 0, .{ .TYPE = true }, &st)));
+}
+
+fn procTextFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    const text = buf[0..len];
+    _ = parseUuid(text);
+    _ = parseStartTicks(text);
+}
+
+test "fuzz: the boot-id uuid and the /proc/<pid>/stat start-ticks parsers are total on arbitrary text" {
+    try fuzzkit.fuzz({}, procTextFuzz, .{ .corpus = &.{ fuzzkit.slice("c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"), fuzzkit.slice("1 (a) b) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 42 0\n"), fuzzkit.slice(")") } });
 }

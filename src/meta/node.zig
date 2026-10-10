@@ -23,6 +23,7 @@
 //!   otherwise the un-checkpointed replay window, dropped and counted).
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
 const checksum = @import("../core/checksum.zig");
 const counters = @import("../core/counters.zig");
 const log = @import("../core/log.zig");
@@ -2230,4 +2231,30 @@ test "merge: f(L)+f(R) ≤ ¾C ∧ min ≤ ¼C; adjacency required; the successo
     try testing.expectEqual(rec.RecordKind.delete, parent[1].kind);
     try testing.expectEqualSlices(u8, &left_max, parent[1].key);
     try testing.expectEqual(@as(u64, 50), parent[1].seq);
+}
+
+fn headerPageFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [NODE_PAGE + 8]u8 = undefined;
+    const len = smith.slice(&buf);
+    var diag: Refusal = undefined;
+    _ = decodeHeaderPage(buf[0..len], &diag) catch {};
+    if (len >= NODE_PAGE) {
+        const page = buf[0..NODE_PAGE];
+        checksum.stamp(page, NODE_HEADER_CHECKSUM_OFF);
+        if (decodeHeaderPage(page, &diag)) |h| {
+            // What decodes re-encodes: the header is the whole page's authority.
+            var re: [NODE_PAGE]u8 = undefined;
+            const layout: NodeLayout = .{ .node_size = h.node_size };
+            encodeHeaderPage(layout, .{ .node_addr = h.node_addr, .node_seq = h.node_seq, .tree_id = h.tree_id, .level = h.level, .min_key = h.min_key, .max_key = h.max_key }, &re, &diag) catch return;
+            const back = try decodeHeaderPage(&re, &diag);
+            try std.testing.expectEqual(h.node_addr, back.node_addr);
+            try std.testing.expectEqual(h.node_seq, back.node_seq);
+            try std.testing.expectEqualSlices(u8, h.min_key, back.min_key);
+            try std.testing.expectEqualSlices(u8, h.max_key, back.max_key);
+        } else |_| {}
+    }
+}
+
+test "fuzz: the node header page decoder is total on arbitrary and restamped pages; a decoded header survives encode∘decode" {
+    try fuzzkit.fuzz({}, headerPageFuzz, .{});
 }

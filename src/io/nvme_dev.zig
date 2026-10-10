@@ -26,6 +26,7 @@
 //! substrate is classified ONCE at open (`reclaimOp`), never per batch.
 
 const std = @import("std");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const nd = @import("nvme_derive.zig");
@@ -2567,28 +2568,28 @@ test "thread names: lanes are numbered process-wide as sqz-nvme<N>; the write ph
 test "loop device: capacity by seek(End), write-cache class from sysfs, aligned round-trip and barrier on a real block device" {
     // Needs the loop driver and root; skipped (and said so) elsewhere.
     const ctl_raw = linux.open("/dev/loop-control", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(ctl_raw) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(ctl_raw) != .SUCCESS) return testkit.skip(@src(), .no_device, "no /dev/loop-control (the loop driver, root)");
     const ctl: linux.fd_t = @intCast(ctl_raw);
     defer _ = linux.close(ctl);
     const LOOP_CTL_GET_FREE = 0x4C82;
     const LOOP_SET_FD = 0x4C00;
     const LOOP_CLR_FD = 0x4C01;
     const n_raw = linux.ioctl(ctl, LOOP_CTL_GET_FREE, 0);
-    if (linux.errno(n_raw) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(n_raw) != .SUCCESS) return testkit.skip(@src(), .no_device, "LOOP_CTL_GET_FREE refused");
     var tf: TestFile = .{};
     try tf.create(8 * derive.MiB);
     defer tf.destroy();
     var dev_path_buf: [32]u8 = undefined;
     const dev_path = try std.mem.printSentinel(&dev_path_buf, "/dev/loop{d}", .{n_raw}, 0);
     const loop_raw = linux.open(dev_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(loop_raw) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(loop_raw) != .SUCCESS) return testkit.skip(@src(), .no_device, "the free loop device node did not open");
     const loop_fd: linux.fd_t = @intCast(loop_raw);
     defer _ = linux.close(loop_fd);
     const backing_raw = linux.open(tf.path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(backing_raw));
     const backing: linux.fd_t = @intCast(backing_raw);
     defer _ = linux.close(backing);
-    if (linux.errno(linux.ioctl(loop_fd, LOOP_SET_FD, @intCast(backing))) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.ioctl(loop_fd, LOOP_SET_FD, @intCast(backing))) != .SUCCESS) return testkit.skip(@src(), .no_device, "LOOP_SET_FD refused");
     defer _ = linux.ioctl(loop_fd, LOOP_CLR_FD, 0);
 
     try testing.expectEqual(@as(u64, 8 * derive.MiB), try capacityBytes(dev_path));

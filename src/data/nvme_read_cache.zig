@@ -38,6 +38,8 @@
 //! publishes by memcpy into the mapping — the A/B's other arm.
 
 const std = @import("std");
+const fuzzkit = @import("../core/fuzzkit.zig");
+const testkit = @import("../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -690,7 +692,7 @@ test "a pinned entry is never overwritten: the placement bumps past it; the purg
 }
 
 test "Linux binding: segments under <root>/cache_segment are 0600 in 0700 dirs, wiped at open, and serve round-trips" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "nvme_read_cache: Linux only");
     var path_buf: [96]u8 = undefined;
     const dir: []const u8 = blk: {
         std.Io.Dir.accessAbsolute(testing.io, "/build", .{}) catch break :blk "/tmp";
@@ -719,4 +721,20 @@ test "Linux binding: segments under <root>/cache_segment are 0600 in 0700 dirs, 
     cache.deinit();
     cache = try Ring.open(testing.allocator, root, 2, 8 * GRAIN);
     try testing.expect(!cache.has(k));
+}
+
+fn cacheHeaderFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [HEADER_LEN]u8 = undefined;
+    smith.bytes(&buf);
+    _ = decodeHeader(&buf);
+    checksum.stamp(&buf, 56);
+    if (decodeHeader(&buf)) |h| {
+        var re: [HEADER_LEN]u8 = undefined;
+        encodeHeader(&re, h.key, h.val_len, h.incarnation);
+        try std.testing.expectEqualSlices(u8, &buf, &re);
+    }
+}
+
+test "fuzz: the read-cache frame header decoder is total on arbitrary and restamped headers; a decoded header re-encodes byte-identically" {
+    try fuzzkit.fuzz({}, cacheHeaderFuzz, .{});
 }

@@ -163,6 +163,14 @@ fstests_run() {
     local na; na=$(wc -l < "$RESULTS/daemon-$(basename "$m")-run$n.alerts")
     suite_log "$(basename "$m"): $logs daemon log(s), $na alert line(s)"
     grep -q TRIPWIRE "$RESULTS/daemon-$(basename "$m")-run$n.alerts" && { suite_log "TRIPWIRE fired in $(basename "$m")"; ok=1; }
+    # A daemon that died mid-test (the mount helper cleared its stale
+    # claim so the pass could go on): the run is VOID whatever `check` says.
+    if [ -s "$m/daemon-died" ]; then
+      suite_log "$(basename "$m"): a daemon DIED during the run ($(grep -c . "$m/daemon-died") time(s)) — the run is void:"
+      sed 's/^/    /' "$m/daemon-died" >&2
+      cp "$m/daemon-died" "$RESULTS/daemon-died-$(basename "$m")-run$n"
+      ok=1
+    fi
   done
   fstests_fsck_set test "$n" || ok=1
   fstests_fsck_set scratch "$n" || ok=1

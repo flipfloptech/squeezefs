@@ -91,6 +91,23 @@ while :; do
     sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; sleep 2
     continue
   fi
+  # A stale writer claim whose holder is DEAD: the previous daemon of this
+  # set died without its clean unmount (the product never auto-takes a
+  # claim on a volume without PR — operator attestation, charter D0). The
+  # harness IS the operator here and can attest: the set directory is
+  # ours alone, and the claim's pid is gone or a zombie. The death is
+  # recorded for the run's verdict (`suite_daemon_alerts` reads
+  # `daemon-died`: a run with one is VOID), the claim is cleared, the
+  # mount retried once — so the gate keeps collecting instead of failing
+  # every later test on the dead holder's lock.
+  if [ "$attempt" -lt 3 ] && grep -q 'another writer holds the single-writer guard' <<< "$out" && grep -q 'stale writer claim' "$log" 2>/dev/null; then
+    cpid=$(grep -o 'stale writer claim (id=[0-9a-f]*, pid=[0-9]*' "$log" | head -1 | grep -o 'pid=[0-9]*' | cut -d= -f2)
+    if [ -n "$cpid" ] && { [ ! -d "/proc/$cpid" ] || grep -q 'State:.*Z' "/proc/$cpid/status" 2>/dev/null; }; then
+      echo "$(date +%s) DAEMON DIED: claim pid $cpid is gone; clearing the claim (operator attestation: the set is the harness's) and retrying $attempt/3" | tee -a "$SET_DIR/mounts.log" >> "$SET_DIR/daemon-died"
+      "$SQZ_BIN" claim clear "sqmeta://$SET_DEV" >> "$SET_DIR/mounts.log" 2>&1 || true
+      continue
+    fi
+  fi
   echo "$out" >&2
   exit "$rc"
 done

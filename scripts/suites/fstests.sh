@@ -70,10 +70,12 @@ fstests_sets() {
   truncate -s "${SUITE_META_MIB}M" "$SETS/set-test/meta.img" "$SETS/set-scratch/meta.img"
   TEST_LOOP=$(losetup -f --show "$SETS/set-test/meta.img") || suite_die "losetup (test)"
   SCRATCH_LOOP=$(losetup -f --show "$SETS/set-scratch/meta.img") || suite_die "losetup (scratch)"
-  "$SUITES_DIR/mkfs.squeezefs" "$TEST_LOOP" > "$SETS/set-test/format.out" 2>&1 || { cat "$SETS/set-test/format.out" >&2; suite_die "mkfs test set"; }
-  "$SUITES_DIR/mkfs.squeezefs" "$SCRATCH_LOOP" > "$SETS/set-scratch/format.out" 2>&1 || { cat "$SETS/set-scratch/format.out" >&2; suite_die "mkfs scratch set"; }
+  "$SUITES_DIR/mkfs.squeezefs" -f "$TEST_LOOP" > "$SETS/set-test/format.out" 2>&1 || { cat "$SETS/set-test/format.out" >&2; suite_die "mkfs test set"; }
+  "$SUITES_DIR/mkfs.squeezefs" -f "$SCRATCH_LOOP" > "$SETS/set-scratch/format.out" 2>&1 || { cat "$SETS/set-scratch/format.out" >&2; suite_die "mkfs scratch set"; }
   cat > "$SETS/local.config" <<CFG
 export FSTYP=fuse.squeezefs
+# `_scratch_mkfs` reformats a set the previous test formatted: mkfs(8)'s -f.
+export MKFS_OPTIONS="-f"
 export TEST_DEV=$TEST_LOOP
 export TEST_DIR=$SETS/mnt-test
 export SCRATCH_DEV=$SCRATCH_LOOP

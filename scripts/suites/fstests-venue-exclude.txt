@@ -4,3 +4,5 @@ generic/564  needs `ulimit -f` (RLIMIT_FSIZE) raised: "cannot modify limit: Oper
 generic/597  sets the fs.protected_symlinks sysctl: /proc/sys is read-only in the container
 generic/598  sets the fs.protected_regular sysctl: /proc/sys is read-only in the container
 generic/563  cgroup-writeback accounting over a loop device created ON the scratch loop device: the helpers key a set by its backing FILE, a loop over a loop resolves to /dev (harness shape, not a semantic)
+generic/750  writes /proc/sys/vm/compact_memory in its loop: /proc/sys is read-only in the container
+generic/795  writes /proc/sys/vm/drop_caches in its loop: /proc/sys is read-only in the container

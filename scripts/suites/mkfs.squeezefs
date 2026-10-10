@@ -21,9 +21,11 @@ SUITE_DATA_GIB=${SUITE_DATA_GIB:-8}
 die() { echo "mkfs.squeezefs: $*" >&2; exit 1; }
 
 dev="" extra=()
+force=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    -f|--force|--) ;;                              # a reformat is the default here; `--` is mkfs(8)'s separator
+    -f|--force) force=1 ;;                         # mkfs(8)'s "overwrite what is there": `squeezefs format --force`
+    --) ;;                                         # mkfs(8)'s separator
     -t) shift ;;                                   # `mkfs -t fuse.squeezefs` passes the type
     -*) extra+=("$1") ;;                           # squeezefs format flags (--block-size …)
     *) if [ -z "$dev" ]; then dev=$1; else extra+=("$1"); fi ;;
@@ -37,4 +39,7 @@ case "$dev" in /dev/*) ;; *) [ -f "$dev" ] || truncate -s "${SUITE_META_MIB}M" "
 for d in d0 d1; do [ -f "$SET_DIR/$d.img" ] || truncate -s "${SUITE_DATA_GIB}G" "$SET_DIR/$d.img"; done
 # A reformat must not inherit the previous life's staging ring.
 rm -rf "$SET_DIR/cache"/*
-exec "$SQZ_BIN" format --single-writer --force --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SET_DEV" "sqdata://$SET_DIR/d0.img,$SET_DIR/d1.img"
+# Without -f the format runs as the operator would: a volume already
+# formatted refuses (generic/740 asks exactly that of a foreign filesystem).
+[ "$force" = 1 ] && extra+=(--force)
+exec "$SQZ_BIN" format --single-writer --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SET_DEV" "sqdata://$SET_DIR/d0.img,$SET_DIR/d1.img"

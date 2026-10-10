@@ -84,7 +84,9 @@ echo "$(date +%s) mount $dir -o $all log $log" >> "$SET_DIR/mounts.log"
 attempt=0
 while :; do
   attempt=$((attempt + 1))
-  out=$("$SQZ_BIN" mount --daemon --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir" 2>&1) && { [ -n "$out" ] && echo "$out"; exit 0; }
+  # The front's bring-up lines go to stderr as before (a test's golden
+  # output is stdout's alone).
+  out=$("$SQZ_BIN" mount --daemon --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir" 2>&1) && { [ -n "$out" ] && echo "$out" >&2; exit 0; }
   rc=$?
   if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
     echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"

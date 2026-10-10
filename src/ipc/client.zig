@@ -596,7 +596,11 @@ pub const Session = struct {
                 const want_bytes: u64 = @min(remaining, max_op);
                 const want_slots: u32 = @intCast(derive.ceilDiv(want_bytes, slab_bytes));
                 const run = self.claimRun(want_slots) orelse break;
-                const chunk: u32 = @intCast(@min(remaining, @as(u64, run.len) * slab_bytes));
+                // The flight is the run's bytes capped at `max_op` (the
+                // daemon's per-op screen): a slab that does not divide
+                // `max_op` — an arena that yielded to the population floor,
+                // 12 KiB slabs under a 1 MiB ceiling — rounds the run UP.
+                const chunk: u32 = @intCast(@min(want_bytes, @as(u64, run.len) * slab_bytes));
                 if (op == .write) {
                     const window = self.m.arenaWindow(@as(u64, run.base) * slab_bytes, chunk) catch unreachable;
                     @memcpy(window, buf[cursor..][0..chunk]);
@@ -1074,7 +1078,15 @@ const Fixture = struct {
     /// The daemon's REFUSE of the last `establish`.
     refusal: ?Refusal = null,
 
+    /// 64 slots of 16 pages under a 4-page max_op: the slab is the max_op
+    /// window (one slot = one flight).
+    const default_geometry: layout.Geometry = .{ .ring_entries = 64, .slots = 64, .arena_bytes = 64 * 16 * layout.PAGE_BYTES, .max_op_bytes = 4 * layout.PAGE_BYTES };
+
     fn init(self: *Fixture) !void {
+        return self.initGeometry(default_geometry);
+    }
+
+    fn initGeometry(self: *Fixture, geometry: layout.Geometry) !void {
         self.* = .{ .host = undefined, .env = std.process.Environ.Map.init(testing.allocator) };
         errdefer self.env.deinit();
         // A regular file on a local filesystem as the credential + the
@@ -1085,7 +1097,7 @@ const Fixture = struct {
         if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
         self.file_fd = @intCast(rc);
         const dev = rl.deviceOf(self.file_fd).?;
-        try self.host.init(.{ .armed = true, .our_commit = self.commit, .arena_cap_bytes = 1 << 30, .per_uid_session_cap = 64, .default_geometry = .{ .ring_entries = 64, .slots = 64, .arena_bytes = 64 * 16 * layout.PAGE_BYTES, .max_op_bytes = 4 * layout.PAGE_BYTES } }, dev);
+        try self.host.init(.{ .armed = true, .our_commit = self.commit, .arena_cap_bytes = 1 << 30, .per_uid_session_cap = 64, .default_geometry = geometry }, dev);
     }
 
     fn deinit(self: *Fixture) void {
@@ -1176,6 +1188,33 @@ test "e2e: a large op pipelines flights over slot runs under one doorbell per ba
     }
     for (big, 0..) |v, i| try testing.expectEqual(@as(u8, @truncate(5 + i)), v);
     for (s.m.slots()) |*sl| try testing.expectEqual(slot_core.FREE, sl.core.state.load(.monotonic));
+}
+
+test "e2e: a slab that does not divide max_op (64 slots of 3 pages under a 4-page ceiling — the shape of an arena that yielded to the population floor): every flight is capped at max_op, never rounded up to the run's slab multiple, and the stub's per-op screen rejects nothing" {
+    var fx: Fixture = undefined;
+    try fx.initGeometry(.{ .ring_entries = 64, .slots = 64, .arena_bytes = 64 * 3 * layout.PAGE_BYTES, .max_op_bytes = 4 * layout.PAGE_BYTES });
+    defer fx.deinit();
+    var s = try fx.establish(fx.file_fd, fx.opts());
+    defer s.teardown();
+    try testing.expectEqual(@as(u64, 3 * layout.PAGE_BYTES), s.layout.slab);
+    const b = try s.bind(fx.file_fd, .mount);
+    // 40 pages + a tail: ten 4-page flights (two slots each, the second
+    // slot one page used) and a short one.
+    const big = try testing.allocator.alloc(u8, 40 * layout.PAGE_BYTES + 77);
+    defer testing.allocator.free(big);
+    const served_before = fx.host.served.load(.monotonic);
+    switch (s.pread(b.id, big, 1000)) {
+        .served => |n| try testing.expectEqual(big.len, n),
+        else => return error.TestNotServed,
+    }
+    for (big, 0..) |v, i| try testing.expectEqual(@as(u8, @truncate(1000 + i)), v);
+    try testing.expectEqual(served_before + 11, fx.host.served.load(.monotonic));
+    switch (s.pwrite(b.id, big, 0)) {
+        .served => |n| try testing.expectEqual(big.len, n),
+        else => return error.TestNotServed,
+    }
+    for (s.m.slots()) |*sl| try testing.expectEqual(slot_core.FREE, sl.core.state.load(.monotonic));
+    try testing.expect(!s.poisoned());
 }
 
 test "e2e: the daemon's screen at BIND — a wrong-direction op completes EBADF kernel-identical; an O_PATH fd, an O_APPEND fd, a directory and a foreign-device memfd each refuse with their class" {

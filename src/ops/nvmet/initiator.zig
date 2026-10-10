@@ -32,6 +32,8 @@
 //! announcement at the first connect says.
 
 const std = @import("std");
+const fuzzkit = @import("../../core/fuzzkit.zig");
+const testkit = @import("../../core/testkit.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
@@ -843,6 +845,12 @@ pub const Sampler = struct {
     /// reappearance as live counts once); those that vanish while live are
     /// dropped; live wins on duplicates.
     pub fn sample(self: *Sampler, gpa: Allocator, ctrls: []const Controller) !void {
+        return self.sampleWith(gpa, gpa, ctrls);
+    }
+
+    /// `gpa` for the sample's transient tables, `seen_gpa` for the retained
+    /// identities (`deinit` must get the same `seen_gpa`).
+    pub fn sampleWith(self: *Sampler, gpa: Allocator, seen_gpa: Allocator, ctrls: []const Controller) !void {
         var controllers: u64 = 0;
         var not_live: u64 = 0;
         var reconnects: u64 = 0;
@@ -872,7 +880,7 @@ pub const Sampler = struct {
                 if (!prev.live and cur.live) reconnects += 1;
                 prev.live = cur.live;
             };
-            if (!found) try self.seen.append(gpa, cur);
+            if (!found) try self.seen.append(seen_gpa, cur);
         }
         // Drop identities that vanished while live; keep the not-live ones.
         var i: usize = 0;
@@ -900,15 +908,22 @@ var process_sampler: Sampler = .{};
 /// Two concurrent renders: the second skips its sample (acq_rel pairs the
 /// release below with the next taker's acquire).
 var process_sampler_busy: std.atomic.Value(bool) = .init(false);
+/// The process sampler's `seen` identities outlive every render: they are
+/// process-lifetime state (the retained not-live identities ARE the
+/// reconnect law), so they live on the process allocator, never a render's
+/// — under the test runner each test's allocator dies with the test, and a
+/// list it owned would be a dangling list on the next render (the segfault
+/// a venue with live fabric controllers showed).
+const process_sampler_gpa = std.heap.page_allocator;
 
 /// The process's sample off the real sysfs (the `.stats` render's cadence;
-/// a cold path).
+/// a cold path). `gpa` serves the sample's transient allocations only.
 pub fn sampleFabric(gpa: Allocator) void {
     if (process_sampler_busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
     defer process_sampler_busy.store(false, .release);
     const ctrls = listControllers(gpa, SYSFS_ROOT) catch return;
     defer gpa.free(ctrls);
-    process_sampler.sample(gpa, ctrls) catch {};
+    process_sampler.sampleWith(gpa, process_sampler_gpa, ctrls) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,7 +1149,7 @@ const Fixture = struct {
 
 test "discovery over fixture trees: the plain per-controller node with its nsid, uuid and char twin; a path node and a partition never match; a missing controller is an honest null; a controller's attrs read; the merged shape is detected only with a head and > 1 hostnqn" {
     const gpa = testing.allocator;
-    var fx = Fixture.init(gpa, testing.io, "disc") catch return error.SkipZigTest;
+    var fx = Fixture.init(gpa, testing.io, "disc") catch return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
     defer fx.deinit();
     try fx.controller(3, "tcp", "live", "nqn.sub", "nqn.hostA", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "traddr=127.0.0.1,trsvcid=4420,src_addr=127.0.0.1");
     try fx.namespace(3, 1, "11111111-2222-3333-4444-555555555555\n", true);
@@ -1174,6 +1189,55 @@ test "discovery over fixture trees: the plain per-controller node with its nsid,
     try fx.dir("class/nvme-subsystem/nvme-subsys0/nvme6", .{});
     try testing.expect(try multipathMergedShape(gpa, fx.root, "nqn.sub"));
     try testing.expect(!(try multipathMergedShape(gpa, fx.root, "nqn.other")));
+}
+
+/// A render's allocator that counts its live allocations.
+const LiveCount = struct {
+    inner: Allocator,
+    live: usize = 0,
+
+    fn allocator(self: *LiveCount) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LiveCount = @ptrCast(@alignCast(ctx));
+        const p = self.inner.rawAlloc(len, alignment, ret_addr);
+        if (p != null) self.live += 1;
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LiveCount = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LiveCount = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LiveCount = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+        self.live -= 1;
+    }
+};
+
+test "the process sampler's retained identities live on the process allocator: a sample through a per-render allocator leaves NOTHING live in it (the test runner's per-test allocator dies with the test; the retained list must not)" {
+    var s: Sampler = .{};
+    defer s.deinit(process_sampler_gpa);
+    var a: Controller = .{ .instance = 1 };
+    fill(&a.transport, &a.transport_len, "tcp");
+    fill(&a.state, &a.state_len, "connecting");
+    fill(&a.subsysnqn, &a.subsysnqn_len, "nqn.sub");
+    fill(&a.address, &a.address_len, "traddr=10.0.0.1,trsvcid=4420");
+    var render: LiveCount = .{ .inner = testing.allocator };
+    try s.sampleWith(render.allocator(), process_sampler_gpa, &.{a});
+    try testing.expectEqual(@as(usize, 1), s.seen.items.len);
+    try testing.expectEqual(@as(usize, 0), render.live);
+    // The next render, through another allocator, reads the retained identity whole.
+    var a_live = a;
+    fill(&a_live.state, &a_live.state_len, "live");
+    const base = stats.fabric_ctrl_reconnects.load();
+    try s.sampleWith(testing.allocator, process_sampler_gpa, &.{a_live});
+    try testing.expectEqual(base + 1, stats.fabric_ctrl_reconnects.load());
 }
 
 test "the fabric sampler: pcie skipped; unknown state not live; a missing sysfs is a zero sample; a reconnect is an observed not-live → live; renumbering of a not-live identity is tracked once; src_addr churn is one identity; the same NQN on two addresses is two" {
@@ -1256,4 +1320,14 @@ test "host-scoped parameter and admin_timeout read on the venue; absent elsewher
     _ = hs.announce();
     try testing.expect(adminTimeoutS() >= 1);
     try testing.expectEqual(@as(u64, @backingInt(hs)), stats.fabric_host_scoped.load());
+}
+
+fn readBackFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [128]u8 = undefined;
+    const len = smith.slice(&buf);
+    _ = parseReadBack(buf[0..len]);
+}
+
+test "fuzz: the nvmf_dev_read read-back parser is total on arbitrary text" {
+    try fuzzkit.fuzz({}, readBackFuzz, .{ .corpus = &.{ fuzzkit.slice("instance=3,cntlid=1\n"), fuzzkit.slice("instance=,cntlid=99999\n") } });
 }

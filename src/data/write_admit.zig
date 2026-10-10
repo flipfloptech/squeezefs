@@ -1215,6 +1215,69 @@ test "the per-piece ladder (the accumulation control arm, overlay off): out-of-o
     try testing.expect(w.f.map.seam().lookup(21, 2) != null);
 }
 
+test "every acked byte reads back across the W2 extent cap (repro-port: LTP fs gf27 — one-byte grow-by-lseek writes 4 KiB apart into block 1 read back 0 from the 65th on): 1-byte writes 512 B apart into one block, each served back by the write side before and after FOLD_MAX_EXTENTS; the flush lands all of them" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    // Block 0 is mapped (the file's first block landed); block 1 is the hole
+    // the grows extend into — the LTP shape past the first boundary.
+    try w.f.map.create(30, .striped, 0);
+    _ = try w.f.publishBlock(30, 0, 0xAA);
+    const view = w.wp.writeSideView();
+    const step: u64 = 512;
+    const n_writes: u64 = wt.BS / step; // 128 > fold_max_extents (64)
+    var size: u64 = wt.BS;
+    var i: u64 = 0;
+    var win: [wt.BS]u8 = undefined;
+    while (i < n_writes) : (i += 1) {
+        const off = wt.BS + (i + 1) * step - 1;
+        const wrote = try w.wp.write(io, .{ .ino = 30, .offset = off, .payload = .{ .bytes = "w" }, .class = .entire_op, .file = World.striped(size) });
+        try testing.expectEqual(@as(u64, 1), wrote.written);
+        size = off + 1;
+        // The read the suite does after every write: the write side's window
+        // composed the way `plane.wsStagedBlock` composes it — covered runs
+        // from the view, the gaps from the base binding it names (or the
+        // map's block once the write side let go).
+        @memset(&win, 0);
+        const o = view.serve(io, .{ .ino = 30, .block = 1, .rel = 0, .out = &win });
+        switch (o) {
+            .none => {
+                const b = w.f.map.seam().lookup(30, 1) orelse return error.TestUnexpectedResult;
+                w.f.dev.peek(b.vol_tag, b.offset, &win);
+            },
+            .partial => |p| if (p.base) |base| {
+                var img: [wt.BS]u8 = undefined;
+                w.f.dev.peek(base.vol_tag, base.offset, &img);
+                var runs: [cov.CoverageUnion.max_runs]cov.Run = undefined;
+                const covered = p.covered.coveredRunsIn(0, wt.BS, &runs);
+                var cursor: u32 = 0;
+                for (covered) |r| {
+                    if (r.start > cursor) @memcpy(win[cursor..r.start], img[cursor..r.start]);
+                    cursor = r.end;
+                }
+                if (cursor < wt.BS) @memcpy(win[cursor..], img[cursor..]);
+            },
+            .redirect => |shadow| w.f.dev.peek(shadow.vol_tag, shadow.offset, &win),
+            .served, .settle, .busy => {},
+        }
+        var k: u64 = 0;
+        while (k <= i) : (k += 1) {
+            const rel: usize = @intCast((k + 1) * step - 1);
+            if (win[rel] != 'w') {
+                std.debug.print("write {d}: byte at rel {d} reads {d}, not 'w' (outcome {t})\n", .{ i, rel, win[rel], o });
+                return error.TestUnexpectedResult;
+            }
+            if (rel > 0 and win[rel - 1] != 0) return error.TestUnexpectedResult;
+        }
+    }
+    w.wp.flushIno(io, 30);
+    try testing.expect(!w.wp.table.has(30, 1));
+    const b = w.f.map.seam().lookup(30, 1) orelse return error.TestUnexpectedResult;
+    w.f.dev.peek(b.vol_tag, b.offset, &win);
+    i = 0;
+    while (i < n_writes) : (i += 1) try testing.expectEqual(@as(u8, 'w'), win[@intCast((i + 1) * step - 1)]);
+}
+
 test "fsync through the write path: a parked block, an open overlay and a shadowed epoch all land; the phases sum exactly; nothing stays open" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, true);

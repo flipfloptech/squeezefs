@@ -379,6 +379,11 @@ pub const WriteSide = struct {
     /// probe (the warm ladder demotes: the OVERWRITE population's old key
     /// has stale tier entries, R1).
     open_overlay: *const fn (ctx: *anyopaque, ino: u64, block: u64) bool,
+    /// ANY write-side custody of `(ino, block)`: an accumulation or extent
+    /// entry, an overlay record, an epoch shadow. The direct device leg
+    /// declines on it — the device holds only what landed, never the
+    /// parked newer bytes (gf27: a fresh W2 extent after the fold).
+    has_custody: *const fn (ctx: *anyopaque, ino: u64, block: u64) bool,
 
     /// No write-side state at all (a read-only mount's view).
     pub const none: WriteSide = .{
@@ -389,6 +394,7 @@ pub const WriteSide = struct {
         .staged_payload = &noneStagedPayload,
         .has_retained_extents = &noneRetained,
         .open_overlay = &noneOpenOverlay,
+        .has_custody = &noneCustody,
     };
     const none_ctx: u8 = 0;
     fn noneOverlay(_: *anyopaque, _: u64, _: u64, _: u64, _: []u8) OverlayVerdict {
@@ -404,6 +410,9 @@ pub const WriteSide = struct {
         return .absent;
     }
     fn noneRetained(_: *anyopaque, _: u64) bool {
+        return false;
+    }
+    fn noneCustody(_: *anyopaque, _: u64, _: u64) bool {
         return false;
     }
     fn noneOpenOverlay(_: *anyopaque, _: u64, _: u64) bool {
@@ -2147,9 +2156,12 @@ test "the write side outranks every tier: an overlay serve returns its bytes; fu
         fn openOverlay(_: *anyopaque, _: u64, _: u64) bool {
             return false;
         }
+        fn custody(_: *anyopaque, _: u64, _: u64) bool {
+            return false;
+        }
     };
     var dummy: u8 = 0;
-    f.rp.write_side = .{ .ctx = &dummy, .overlay_read = &WS.overlay, .extent_runs = &WS.runs, .staged_block = &WS.stagedBlock, .staged_payload = &WS.stagedPayload, .has_retained_extents = &WS.retained, .open_overlay = &WS.openOverlay };
+    f.rp.write_side = .{ .ctx = &dummy, .overlay_read = &WS.overlay, .extent_runs = &WS.runs, .staged_block = &WS.stagedBlock, .staged_payload = &WS.stagedPayload, .has_retained_extents = &WS.retained, .open_overlay = &WS.openOverlay, .has_custody = &WS.custody };
     const buf = try alignedBuf(testing.allocator, 1 << 20);
     defer testing.allocator.free(buf);
     WS.mode = .overlay;

@@ -61,6 +61,9 @@ pub const stats = struct {
     pub var fast_dispatch_demote_pre_screen: counters.ShardedCounter = .{};
     pub var fast_dispatch_demote_contended: counters.ShardedCounter = .{};
     pub var fast_dispatch_demote_write_side: counters.ShardedCounter = .{};
+    /// Direct device legs declined because the write side holds custody
+    /// of the block (the lane composes the newer bytes).
+    pub var direct_leg_custody_declines: counters.ShardedCounter = .{};
     pub var fast_dispatch_demote_miss: counters.ShardedCounter = .{};
     pub var fast_dispatch_eof: counters.ShardedCounter = .{};
     pub var ipc_hold_probe_serves: counters.ShardedCounter = .{};
@@ -98,7 +101,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.fast_dispatch_serve_cache.load(),
         stats.direct_leg_offers.load(),
     });
-    try w.print(",\"direct_leg_recheck_failures\":{d},\"fast_dispatch_fd_source_serves\":{d},\"fast_dispatch_hold_ceremonies\":{d}}}", .{ stats.direct_leg_recheck_failures.load(), stats.fast_dispatch_fd_source_serves.load(), stats.fast_dispatch_hold_ceremonies.load() });
+    try w.print(",\"direct_leg_recheck_failures\":{d},\"direct_leg_custody_declines\":{d},\"fast_dispatch_fd_source_serves\":{d},\"fast_dispatch_hold_ceremonies\":{d}}}", .{ stats.direct_leg_recheck_failures.load(), stats.direct_leg_custody_declines.load(), stats.fast_dispatch_fd_source_serves.load(), stats.fast_dispatch_hold_ceremonies.load() });
 }
 
 /// Why the ladder declined (the handler owns the request from here).
@@ -332,6 +335,14 @@ pub const WarmLadder = struct {
         const info = rp.meta.file(rp.meta.ctx, ino) orelse return null;
         if (offset + size > info.size or info.kind != .striped) return null;
         const b = offset / rp.cfg.block_size;
+        // The write side's custody outranks the device (charter §6.3: a
+        // dirty local authority outranks durable state): a parked extent
+        // or buffer, an overlay record or an epoch shadow on the block
+        // holds bytes the mapped key does not — the lane composes them.
+        if (rp.write_side.has_custody(rp.write_side.ctx, ino, b)) {
+            stats.direct_leg_custody_declines.inc();
+            return null;
+        }
         const m = rp.meta.binding(rp.meta.ctx, ino, b) orelse return null;
         const k = BlockKey.fromMapping(m);
         if (rp.hot.contains(k) or rp.hold.contains(k) or rp.nvme.has(k) or rp.flights.inFlight(self.io, k)) return null;
@@ -470,9 +481,13 @@ test "the warm ladder asks the write side TRY-ONLY: a `busy` custody station is 
         fn openOverlay(_: *anyopaque, _: u64, _: u64) bool {
             return false;
         }
+        var custody: bool = false;
+        fn hasCustody(_: *anyopaque, _: u64, _: u64) bool {
+            return custody;
+        }
     };
     var dummy: u8 = 0;
-    f.rp.write_side = .{ .ctx = &dummy, .overlay_read = &WS.overlay, .extent_runs = &WS.runs, .staged_block = &WS.stagedBlock, .staged_payload = &WS.stagedPayload, .has_retained_extents = &WS.retained, .open_overlay = &WS.openOverlay };
+    f.rp.write_side = .{ .ctx = &dummy, .overlay_read = &WS.overlay, .extent_runs = &WS.runs, .staged_block = &WS.stagedBlock, .staged_payload = &WS.stagedPayload, .has_retained_extents = &WS.retained, .open_overlay = &WS.openOverlay, .has_custody = &WS.hasCustody };
     const ws0 = stats.fast_dispatch_demote_write_side.load();
     // Busy: the demote names the write side; the probe asked try-only.
     WS.mode = .busy;
@@ -489,6 +504,21 @@ test "the warm ladder asks the write side TRY-ONLY: a `busy` custody station is 
     // None: the tiers (cold ⇒ miss).
     WS.mode = .none;
     try testing.expectEqual(Verdict{ .demote = .miss }, ladder.probe(7, 0, 4096, false, window));
+    // The direct device leg after a decline: it DMAs the mapped block
+    // straight to the app, so it must decline while the write side holds
+    // ANY custody of the block (repro-port: LTP fs gf27 — after the W2
+    // fold published block 1, the 65th one-byte write parked a fresh
+    // extent and the next read's direct leg served the device's bytes: 0).
+    ladder.direct_leg_armed = true;
+    WS.custody = true;
+    const declines0 = stats.direct_leg_custody_declines.load();
+    try testing.expect(ladder.directLeg(7, 0, 4096, false) == null);
+    try testing.expectEqual(declines0 + 1, stats.direct_leg_custody_declines.load());
+    WS.custody = false;
+    // No custody: the gate passes (the fixture resolves no device fd, so
+    // the offer itself stays null — the custody counter is what moved).
+    try testing.expect(ladder.directLeg(7, 0, 4096, false) == null);
+    try testing.expectEqual(declines0 + 1, stats.direct_leg_custody_declines.load());
 }
 
 test "the warm ladder never blocks: a cold block demotes (miss), a held guard demotes (contended) without waiting, a tier-resident block serves byte-exact and EOF-clamped into the window, oversize and device-true O_DIRECT pre-screen; serves + demotes ≡ probes" {

@@ -2461,7 +2461,7 @@ pub const DataPlane = struct {
     // ---- the read seam over the write side ----
 
     fn writeSide(self: *DataPlane) read_path.WriteSide {
-        return .{ .ctx = self, .overlay_read = &wsOverlayRead, .extent_runs = &wsExtentRuns, .staged_block = &wsStagedBlock, .staged_payload = &wsStagedPayload, .has_retained_extents = &wsHasRetainedExtents, .open_overlay = &wsOpenOverlay };
+        return .{ .ctx = self, .overlay_read = &wsOverlayRead, .extent_runs = &wsExtentRuns, .staged_block = &wsStagedBlock, .staged_payload = &wsStagedPayload, .has_retained_extents = &wsHasRetainedExtents, .open_overlay = &wsOpenOverlay, .has_custody = &wsHasCustody };
     }
 
     /// Composed per block by `staged_block`; the whole-range face stays
@@ -2575,6 +2575,14 @@ pub const DataPlane = struct {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         if (block > std.math.maxInt(u32)) return false;
         return self.wp.overlay.hasCustody(ino, @intCast(block));
+    }
+
+    /// Any write-side custody of the block (the view's composed answer:
+    /// accumulation/extent entry, overlay record, epoch shadow).
+    fn wsHasCustody(ctx: *anyopaque, ino: u64, block: u64) bool {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        if (block > std.math.maxInt(u32)) return false;
+        return self.wp.writeSideView().hasCustody(ino, @intCast(block));
     }
 
     // ---- the lane fibers: prefetch issuer, hold ceremony ----

@@ -101,8 +101,8 @@ pub const stats = struct {
     /// `pack_release_untracked_noops`: a pin release on a block the
     /// allocator no longer tracks — must stay 0 single-writer.
     pub var pack_release_untracked_noops: counters.Tripwire = .init("pack_release_untracked_noops");
-    /// `pack_pin_refcount_drift`: at seal `refcount − committed − inflight
-    /// ≠ 1` — the two words disagree (Q-15). Must stay 0.
+    /// `pack_pin_refcount_drift`: at seal `refcount + released ≠ committed
+    /// + inflight + 1` — the words disagree (Q-15). Must stay 0.
     pub var pack_pin_refcount_drift: counters.Tripwire = .init("pack_pin_refcount_drift");
     /// `read_stale_bound_mapping`: a stale-incarnation refusal on a mapping
     /// the identity still binds (finding 51) — EIO, never zeros, never the
@@ -217,8 +217,19 @@ pub const OpenPack = struct {
     committed: std.atomic.Value(u32) = .init(0),
     /// Tenants between reserve and commit/abandon.
     inflight: std.atomic.Value(u32) = .init(0),
+    /// Committed tenants whose reference LEFT while the pack was open (an
+    /// unlink's corpse, a rewrite's displaced copy, a compactor's refused
+    /// republish): the pin arithmetic's fourth word.
+    released: std.atomic.Value(u32) = .init(0),
     /// CAS false→true: the first sealer runs the seal.
     sealed: std.atomic.Value(bool) = .init(false),
+    /// Serializes every (RAM refcount step, tenant-word step) pair of an
+    /// OPEN pack with the seal's snapshot, so the seal's arithmetic is
+    /// exact: `refcount + released ≡ committed + inflight + 1`. Held only
+    /// while `!sealed` (a release under it is nonterminal by the pin — a
+    /// RAM decrement, never the terminal ladder's park); once sealed the
+    /// words are history and every release runs the plain ladder.
+    pin_lock: jc.SpinLock = .{},
 
     /// `[prev, prev + slot_len)` iff it fits the chunk. acq_rel: the
     /// winner's slot is published to the sealer's occupancy read.
@@ -235,6 +246,28 @@ pub const OpenPack = struct {
 
     pub fn isSealed(self: *const OpenPack) bool {
         return self.sealed.load(.acquire);
+    }
+
+    /// A tenant's commit landed: in-flight → committed as ONE step against
+    /// the seal's snapshot.
+    pub fn landed(self: *OpenPack) void {
+        self.pin_lock.lock();
+        defer self.pin_lock.unlock();
+        _ = self.inflight.fetchSub(1, .acq_rel);
+        _ = self.committed.fetchAdd(1, .acq_rel);
+    }
+
+    /// The pin lock, taken only while the pack is OPEN (the seal's CAS
+    /// precedes its snapshot, so a holder that sees `!sealed` is inside
+    /// the arithmetic the seal will read). False = sealed, nothing held.
+    pub fn lockOpen(self: *OpenPack) bool {
+        if (self.isSealed()) return false;
+        self.pin_lock.lock();
+        if (self.isSealed()) {
+            self.pin_lock.unlock();
+            return false;
+        }
+        return true;
     }
 
     /// Bytes reserved so far, clipped to the chunk (an overflowing cursor
@@ -463,9 +496,11 @@ pub const Packer = struct {
                     continue;
                 }
                 if (pack.tryReserve(slot_len)) |off| {
-                    _ = pack.inflight.fetchAdd(1, .acq_rel);
-                    if (!self.alloc.pin(self.alloc.ctx, pack.vol_tag, pack.base)) {
-                        _ = pack.inflight.fetchSub(1, .acq_rel);
+                    pack.pin_lock.lock();
+                    const pinned = self.alloc.pin(self.alloc.ctx, pack.vol_tag, pack.base);
+                    if (pinned) _ = pack.inflight.fetchAdd(1, .acq_rel);
+                    pack.pin_lock.unlock();
+                    if (!pinned) {
                         if (pack.trySeal()) self.runSeal(row, pack, .full);
                         continue;
                     }
@@ -548,11 +583,17 @@ pub const Packer = struct {
     fn runSeal(self: *Packer, row: *Row, pack: *OpenPack, kind: SealKind) void {
         assert(pack.isSealed());
         _ = row.pack.cmpxchgStrong(pack, null, .acq_rel, .acquire);
+        // The snapshot under the pin lock: every tenant step of the open
+        // pack landed whole or not at all against it; `sealed` is already
+        // set, so a release arriving after it runs the plain ladder.
+        pack.pin_lock.lock();
         const committed = pack.committed.load(.acquire);
         const inflight = pack.inflight.load(.acquire);
+        const released = pack.released.load(.acquire);
         const refcount = self.alloc.refcount(self.alloc.ctx, pack.vol_tag, pack.base);
-        if (refcount != committed + inflight + 1) {
-            stats.pack_pin_refcount_drift.fire("pack seal: refcount ≠ committed + inflight + 1");
+        pack.pin_lock.unlock();
+        if (refcount + released != committed + inflight + 1) {
+            stats.pack_pin_refcount_drift.fire("pack seal: refcount + released ≠ committed + inflight + 1");
         }
         switch (self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base)) {
             .terminal => if (committed == 0 and inflight == 0) stats.pack_blocks_abandoned.inc(),
@@ -665,8 +706,7 @@ pub const Packer = struct {
             return .failed;
         };
         _ = staging.releaseStaged(c.pool, c.seg, sk, c.generation);
-        _ = prepared.tenant.pack.inflight.fetchSub(1, .acq_rel);
-        _ = prepared.tenant.pack.committed.fetchAdd(1, .acq_rel);
+        prepared.tenant.pack.landed();
         stats.layout_promoted_packed.inc();
         return .{ .committed = prev.durableCopy() };
     }
@@ -675,17 +715,51 @@ pub const Packer = struct {
     /// pack sealed and every sibling was deleted — so never under the
     /// stripe.
     fn releaseLandedSite(self: *Packer, tenant: Tenant) void {
-        _ = tenant.pack.inflight.fetchSub(1, .acq_rel);
         stats.pack_slots_abandoned.inc();
-        self.countRelease(self.alloc.release(self.alloc.ctx, tenant.pack.vol_tag, tenant.pack.base));
+        const pack = tenant.pack;
+        if (pack.lockOpen()) {
+            defer pack.pin_lock.unlock();
+            _ = pack.inflight.fetchSub(1, .acq_rel);
+            self.countRelease(self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base));
+            return;
+        }
+        _ = pack.inflight.fetchSub(1, .acq_rel);
+        self.countRelease(self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base));
     }
 
     /// Release the reference a mapping holds (a displaced durable copy, an
     /// unlinked tenant): nonterminal = a dead slot inside a live block until
     /// compaction; terminal = the block's end of life through the ordinary
-    /// ladder.
+    /// ladder. A tenant of an OPEN pack is counted against the pin
+    /// arithmetic first.
     pub fn releaseTenantRef(self: *Packer, m: Mapping) void {
+        if (self.releaseOpenTenant(m)) return;
         self.countRelease(self.alloc.release(self.alloc.ctx, m.vol_tag, m.offset));
+    }
+
+    /// THE open-tenant release face (the plane's `freeBindings` asks here
+    /// first): true iff `m` is a tenant window of a pack still open — its
+    /// reference left under the pin lock, `released + 1`, the release
+    /// nonterminal by the pin. False = not ours (a whole block, a sealed
+    /// pack's tenant): the caller runs the ordinary ladder.
+    pub fn releaseOpenTenant(self: *Packer, m: Mapping) bool {
+        if (m.whole_block) return false;
+        const pack = self.openPackAt(m.vol_tag, m.offset) orelse return false;
+        if (!pack.lockOpen()) return false;
+        defer pack.pin_lock.unlock();
+        _ = pack.released.fetchAdd(1, .acq_rel);
+        self.countRelease(self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base));
+        return true;
+    }
+
+    /// The open pack whose block is `(vol_tag, base)`, if any.
+    fn openPackAt(self: *Packer, vol_tag: u64, base: u64) ?*OpenPack {
+        for (self.rows) |*r| {
+            if (!r.used) continue;
+            const p = r.pack.load(.acquire) orelse continue;
+            if (p.vol_tag == vol_tag and p.base == base) return if (p.isSealed()) null else p;
+        }
+        return null;
     }
 
     fn countRelease(_: *Packer, v: ReleaseVerdict) void {
@@ -764,28 +838,48 @@ pub const Packer = struct {
     /// the seal checks (`refcount ≡ committed + inflight + 1`) is kept by
     /// `tenantRaised` / `tenantReleased` around every raise and release.
     pub fn landWindow(_: *Packer, tenant: Tenant) void {
-        _ = tenant.pack.inflight.fetchSub(1, .acq_rel);
-        _ = tenant.pack.committed.fetchAdd(1, .acq_rel);
+        tenant.pack.landed();
     }
 
-    /// A referencer's reference raised on a landed window (the pin's +1 is
-    /// the caller's `incrementRefcount`).
-    pub fn tenantRaised(_: *Packer, pack: *OpenPack) void {
-        _ = pack.committed.fetchAdd(1, .acq_rel);
+    /// A referencer's reference raised on a landed window: `raise` is the
+    /// caller's `incrementRefcount`, run under the pin lock while the pack
+    /// is open so the seal's snapshot never splits the pair.
+    pub fn tenantRaised(_: *Packer, pack: *OpenPack, ctx: *anyopaque, raise: *const fn (ctx: *anyopaque) bool) bool {
+        if (pack.lockOpen()) {
+            defer pack.pin_lock.unlock();
+            if (!raise(ctx)) return false;
+            _ = pack.committed.fetchAdd(1, .acq_rel);
+            return true;
+        }
+        return raise(ctx);
     }
 
-    /// A referencer refused its republish: its reference leaves the window.
-    pub fn tenantReleased(_: *Packer, pack: *OpenPack) void {
-        _ = pack.committed.fetchSub(1, .acq_rel);
+    /// A referencer refused its republish: its reference leaves the window
+    /// (`release` is the caller's `releaseRef`, paired the same way).
+    pub fn tenantReleased(_: *Packer, pack: *OpenPack, ctx: *anyopaque, release: *const fn (ctx: *anyopaque) void) void {
+        if (pack.lockOpen()) {
+            defer pack.pin_lock.unlock();
+            _ = pack.committed.fetchSub(1, .acq_rel);
+            release(ctx);
+            return;
+        }
+        release(ctx);
     }
 
     /// A landed window nobody took (every referencer refused): the slot's
     /// own reference leaves — `committed − 1` and the pin released
     /// (terminal when the pack sealed and every sibling left).
     pub fn abandonLandedWindow(self: *Packer, tenant: Tenant) void {
-        _ = tenant.pack.committed.fetchSub(1, .acq_rel);
         stats.pack_slots_abandoned.inc();
-        self.countRelease(self.alloc.release(self.alloc.ctx, tenant.pack.vol_tag, tenant.pack.base));
+        const pack = tenant.pack;
+        if (pack.lockOpen()) {
+            defer pack.pin_lock.unlock();
+            _ = pack.committed.fetchSub(1, .acq_rel);
+            self.countRelease(self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base));
+            return;
+        }
+        _ = pack.committed.fetchSub(1, .acq_rel);
+        self.countRelease(self.alloc.release(self.alloc.ctx, pack.vol_tag, pack.base));
     }
 
     /// Every open pack's block and the room left in it (the compaction's
@@ -1498,6 +1592,41 @@ test "overflow seals FULL exactly once and the next reservation refills into a f
     f.packer.releaseTenantRef(m30);
     try testing.expectEqual(partial0 + 1, stats.pack_partial_frees.load());
     f.packer.releaseTenantRef(m31);
+    try testing.expectEqual(term0 + 1, stats.pack_terminal_frees.load());
+    try testing.expectEqual(@as(u32, 0), World.refcount(&f.world, 0x11, 0));
+}
+
+test "a tenant released while its pack is still OPEN (an unlink, a rewrite's displaced copy) is counted against the pin arithmetic: the seal sees refcount + released = committed + inflight + 1 — drift 0, partial free counted; the seal's pin release then lands exactly (repro-port: fsstress — every rewrite of a packed file before the FULL seal fired pack_pin_refcount_drift)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try Fixture.init(gpa);
+    defer f.deinit();
+    var gens: [2]u64 = undefined;
+    for (0..2) |i| gens[i] = (try f.stage(@intCast(60 + i), @intCast(i), &fill(3000, 'r'))).generation;
+    for (0..2) |i| try testing.expectEqual(std.meta.Tag(CommitOutcome).committed, std.meta.activeTag(try f.promote(io, @intCast(60 + i), @intCast(i), gens[i])));
+    try testing.expectEqual(@as(u32, 3), World.refcount(&f.world, 0x11, 0));
+    const open = f.packer.openPack(.{ .vol_tag = 0x11, .scope = 0 }).?;
+    try testing.expectEqual(@as(u64, 0), open.base);
+    // Tenant 60 leaves while the pack is open: the plane's `freeBindings`
+    // face (an unlink's corpse, a re-stage's displaced tenant).
+    const m60 = World.current(&f.world, 60).?.durableCopy().?;
+    const partial0 = stats.pack_partial_frees.load();
+    try testing.expect(f.packer.releaseOpenTenant(m60));
+    try testing.expectEqual(partial0 + 1, stats.pack_partial_frees.load());
+    try testing.expectEqual(@as(u32, 2), World.refcount(&f.world, 0x11, 0));
+    try testing.expectEqual(@as(u32, 1), open.released.load(.monotonic));
+    // The seal: no drift; the pin leaves; tenant 61 alone holds the block.
+    const drift0 = stats.pack_pin_refcount_drift.load();
+    stats.pack_pin_refcount_drift.resetLogBudgetForTest();
+    try testing.expect(f.packer.sealBlock(0x11, 0));
+    try testing.expectEqual(drift0, stats.pack_pin_refcount_drift.load());
+    try testing.expectEqual(@as(u32, 1), World.refcount(&f.world, 0x11, 0));
+    // After the seal the face declines (the ordinary ladder owns the
+    // block); the plain release is terminal.
+    const m61 = World.current(&f.world, 61).?.durableCopy().?;
+    try testing.expect(!f.packer.releaseOpenTenant(m61));
+    const term0 = stats.pack_terminal_frees.load();
+    f.packer.releaseTenantRef(m61);
     try testing.expectEqual(term0 + 1, stats.pack_terminal_frees.load());
     try testing.expectEqual(@as(u32, 0), World.refcount(&f.world, 0x11, 0));
 }

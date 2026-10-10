@@ -755,16 +755,33 @@ pub const PlanePack = struct {
         self.forget(placed.vol_tag, placed.offset);
         p.abandonLandedWindow(w.tenant);
     }
+    /// A reference step on a landed window's block: the packer pairs it
+    /// with the pack's tenant word under the pin lock while the pack is
+    /// open (the seal's arithmetic), else it runs alone.
+    const RefStep = struct {
+        self: *PlanePack,
+        vol_tag: u64,
+        idx: u64,
+        fn raise(c: *anyopaque) bool {
+            const s: *RefStep = @ptrCast(@alignCast(c));
+            return PlaneMover.vt.incrementRefcount(s.self.mover_, s.vol_tag, s.idx);
+        }
+        fn release(c: *anyopaque) void {
+            const s: *RefStep = @ptrCast(@alignCast(c));
+            PlaneMover.vt.releaseRef(s.self.mover_, s.vol_tag, s.idx);
+        }
+    };
     fn incRef(ctx: *anyopaque, vol_tag: u64, idx: u64) bool {
         const self = self_(ctx);
-        if (!PlaneMover.vt.incrementRefcount(self.mover_, vol_tag, idx)) return false;
-        if (self.plane.packer) |*p| if (self.windowOf(vol_tag, idx * self.plane.chunk)) |w| p.tenantRaised(w.tenant.pack);
-        return true;
+        var step: RefStep = .{ .self = self, .vol_tag = vol_tag, .idx = idx };
+        if (self.plane.packer) |*p| if (self.windowOf(vol_tag, idx * self.plane.chunk)) |w| return p.tenantRaised(w.tenant.pack, &step, RefStep.raise);
+        return RefStep.raise(&step);
     }
     fn releaseRef(ctx: *anyopaque, vol_tag: u64, idx: u64) void {
         const self = self_(ctx);
-        if (self.plane.packer) |*p| if (self.windowOf(vol_tag, idx * self.plane.chunk)) |w| p.tenantReleased(w.tenant.pack);
-        PlaneMover.vt.releaseRef(self.mover_, vol_tag, idx);
+        var step: RefStep = .{ .self = self, .vol_tag = vol_tag, .idx = idx };
+        if (self.plane.packer) |*p| if (self.windowOf(vol_tag, idx * self.plane.chunk)) |w| return p.tenantReleased(w.tenant.pack, &step, RefStep.release);
+        RefStep.release(&step);
     }
     fn republish(ctx: *anyopaque, ino: u64, block_index: u32, expected: layout.Mapping, new: layout.Mapping) mover.RepublishError!void {
         return PlaneMover.vt.republish(self_(ctx).mover_, ino, block_index, expected, new);

@@ -1106,8 +1106,11 @@ pub const DataPlane = struct {
     /// destroyed bindings through the reclaimer's ladder.
     pub fn freeBindings(self: *DataPlane, io: Io, bindings: []const Mapping) void {
         for (bindings) |b| {
-            _ = self.reclaim_free.seam().free(io, b);
             stats.bindings_freed.inc();
+            // A tenant of a pack still OPEN leaves through the packer (the
+            // pin arithmetic counts it); everything else runs the ladder.
+            if (self.packer) |*p| if (p.releaseOpenTenant(b)) continue;
+            _ = self.reclaim_free.seam().free(io, b);
         }
     }
 

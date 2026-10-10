@@ -259,6 +259,9 @@ pub fn encodePage(p: *const Page, out: *[PAGE_LEN]u8) EncodeError!void {
     if (p.n_slots > SLOT_PAGE_BUDGET) return error.TooManySlots;
     for (p.slotEntries(), 0..) |e, i| if (i > 0 and p.slots[i - 1].slot >= e.slot) return error.Unsorted;
     @memset(out, 0);
+    // The fixed header's byte offsets are the LAYOUT table's (the module
+    // doc); `classify` reads them back at the same offsets, and the size
+    // assertions pin FIXED_LEN.
     @memcpy(out[0..4], MAGIC);
     put(out, u16, 4, LAYOUT_VERSION);
     put(out, u32, 8, p.appender_id);

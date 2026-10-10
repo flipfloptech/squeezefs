@@ -295,14 +295,14 @@ pub const WireError = struct {
     pub fn encode(self: WireError, b: *codec.Builder) codec.BuildError!void {
         try b.put(WireErrorHead, self.head);
         try b.putBytes(self.reason);
-        try b.putPadding(self.reason.len, 8);
+        try b.putPadding(self.reason.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *codec.Cursor) codec.Error!WireError {
         const head = try c.take(WireErrorHead);
         const n = try codec.countAtMost(head.reason_len, REASON_MAX);
         const reason = try c.takeBytes(n);
-        try c.takePadding(n, 8);
+        try c.takePadding(n, codec.TAIL_ALIGN);
         return .{ .head = head, .reason = reason };
     }
 

@@ -198,13 +198,13 @@ pub const AdminFsckReport = struct {
         std.debug.assert(self.head.len == self.json.len);
         try b.put(AdminFsckReportHead, self.head);
         try b.putBytes(self.json);
-        try b.putPadding(self.json.len, 8);
+        try b.putPadding(self.json.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *Cursor) Error!AdminFsckReport {
         const head = try c.take(AdminFsckReportHead);
         const json = try c.takeBytes(head.len);
-        try c.takePadding(head.len, 8);
+        try c.takePadding(head.len, codec.TAIL_ALIGN);
         return .{ .head = head, .json = json };
     }
 };
@@ -246,13 +246,13 @@ pub const AdminVolumeReq = struct {
         std.debug.assert(self.head.uri_len == self.uri.len);
         try b.put(AdminVolumeHead, self.head);
         try b.putBytes(self.uri);
-        try b.putPadding(self.uri.len, 8);
+        try b.putPadding(self.uri.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *Cursor) Error!AdminVolumeReq {
         const head = try c.take(AdminVolumeHead);
         const uri = try c.takeBytes(head.uri_len);
-        try c.takePadding(head.uri_len, 8);
+        try c.takePadding(head.uri_len, codec.TAIL_ALIGN);
         return .{ .head = head, .uri = uri };
     }
 };

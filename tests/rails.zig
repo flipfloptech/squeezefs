@@ -770,3 +770,156 @@ test "the direct-call scanner: `std.testing.fuzz(` and `testing.fuzz(` are caugh
     try std.testing.expect(callsStdFuzzDirectly("try testing.fuzz({}, one, .{});") != null);
     try std.testing.expect(callsStdFuzzDirectly("try fuzzkit.fuzz({}, one, .{});") == null);
 }
+
+// ---------------------------------------------------------------------------
+// The literal rail (charter §1.5, §11 "no runtime literal in product code"):
+// `src/gates/literals.zig` states the law; every violation it finds in a
+// non-harness file under `src/` is either derived, documented on its line,
+// or carried in `tests/rails/literal-allowlist.txt` (`path:line | literal |
+// reason`) — and a row that matches no violation is STALE and fails, so the
+// list only shrinks.
+// ---------------------------------------------------------------------------
+
+const literals = squeezefs.gates.literals;
+const allowlist_path = "tests/rails/literal-allowlist.txt";
+
+const AllowRow = struct {
+    path: []const u8,
+    line: usize,
+    literal: []const u8,
+    reason: []const u8,
+    used: bool = false,
+};
+
+fn parseAllowlist(gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(AllowRow), violations: *std.Io.Writer) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var n: usize = 0;
+    while (lines.next()) |raw| {
+        n += 1;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var cols = std.mem.splitSequence(u8, line, " | ");
+        const loc = cols.next() orelse continue;
+        const lit = cols.next() orelse {
+            try violations.print("  {s}:{d}: malformed row (want `path:line | literal | reason`)\n", .{ allowlist_path, n });
+            continue;
+        };
+        const reason = cols.rest();
+        if (std.mem.trim(u8, reason, " ").len == 0) {
+            try violations.print("  {s}:{d}: a row needs a reason\n", .{ allowlist_path, n });
+            continue;
+        }
+        const colon = std.mem.lastIndexOfScalar(u8, loc, ':') orelse {
+            try violations.print("  {s}:{d}: `{s}` is not path:line\n", .{ allowlist_path, n, loc });
+            continue;
+        };
+        const ln = std.fmt.parseInt(usize, loc[colon + 1 ..], 10) catch {
+            try violations.print("  {s}:{d}: `{s}` is not path:line\n", .{ allowlist_path, n, loc });
+            continue;
+        };
+        try out.append(gpa, .{ .path = try gpa.dupe(u8, loc[0..colon]), .line = ln, .literal = try gpa.dupe(u8, lit), .reason = reason });
+    }
+}
+
+test "literal rail: every runtime literal in product code is derived, documented on its line, or allowlisted with a reason; no allowlist row is stale" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f);
+        files.deinit(gpa);
+    }
+    const cwd = std.Io.Dir.cwd();
+    {
+        var d = try cwd.openDir(io, "src", .{ .iterate = true });
+        defer d.close(io);
+        try walk(gpa, io, d, "src", &files);
+    }
+    try std.testing.expect(files.items.len >= min_files);
+    std.mem.sort([]u8, files.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var violations: std.Io.Writer.Allocating = .init(gpa);
+    defer violations.deinit();
+    var allow: std.ArrayList(AllowRow) = .empty;
+    defer {
+        for (allow.items) |r| {
+            gpa.free(r.path);
+            gpa.free(r.literal);
+        }
+        allow.deinit(gpa);
+    }
+    const allow_text = try cwd.readFileAlloc(io, allowlist_path, gpa, .limited(16 << 20));
+    defer gpa.free(allow_text);
+    try parseAllowlist(gpa, allow_text, &allow, &violations.writer);
+    var found: usize = 0;
+    var unlisted: usize = 0;
+    var scanned_files: usize = 0;
+    for (files.items) |path| {
+        if (literals.isHarnessFile(path)) continue;
+        scanned_files += 1;
+        const text = try cwd.readFileAllocOptions(io, path, gpa, .limited(16 << 20), .of(u8), 0);
+        defer gpa.free(text);
+        var v = try literals.scan(gpa, text);
+        defer v.deinit(gpa);
+        for (v.items) |hit| {
+            found += 1;
+            var listed = false;
+            for (allow.items) |*row| {
+                if (row.line == hit.line and std.mem.eql(u8, row.path, path) and std.mem.eql(u8, row.literal, hit.literal)) {
+                    row.used = true;
+                    listed = true;
+                }
+            }
+            if (!listed) {
+                unlisted += 1;
+                try violations.writer.print("  {s}:{d} | {s} | <derive it, document it on the line, or add this row with a reason>\n", .{ path, hit.line, hit.literal });
+            }
+        }
+    }
+    var stale: usize = 0;
+    for (allow.items) |row| {
+        if (!row.used) {
+            stale += 1;
+            try violations.writer.print("  {s}: stale row `{s}:{d} | {s}` matches no violation — delete it (the literal moved, was derived, or was documented)\n", .{ allowlist_path, row.path, row.line, row.literal });
+        }
+    }
+    // The census must have found the known population (a broken scanner passes vacuously).
+    try std.testing.expect(scanned_files >= min_files);
+    if (violations.written().len != 0) {
+        std.debug.print("literal rail: {d} runtime literal(s) in {d} product files, {d} unlisted, {d} allowlisted, {d} stale row(s):\n{s}", .{ found, scanned_files, unlisted, allow.items.len, stale, violations.written() });
+        return error.LiteralRailViolation;
+    }
+}
+
+test "the allowlist parser: a row, a comment, a blank, a malformed row and a reasonless row" {
+    const gpa = std.testing.allocator;
+    var rows: std.ArrayList(AllowRow) = .empty;
+    defer {
+        for (rows.items) |r| {
+            gpa.free(r.path);
+            gpa.free(r.literal);
+        }
+        rows.deinit(gpa);
+    }
+    var v: std.Io.Writer.Allocating = .init(gpa);
+    defer v.deinit();
+    try parseAllowlist(gpa,
+        \\# a comment
+        \\
+        \\src/a.zig:12 | 4096 | the page: kernel geometry
+        \\src/b.zig:7 | 0o644
+        \\nonsense
+        \\nope | 5 | a reason
+        \\src/c.zig:3 | 9 |
+    , &rows, &v.writer);
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expectEqualStrings("src/a.zig", rows.items[0].path);
+    try std.testing.expectEqual(@as(usize, 12), rows.items[0].line);
+    try std.testing.expectEqualStrings("4096", rows.items[0].literal);
+    try std.testing.expect(std.mem.indexOf(u8, v.written(), "malformed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v.written(), "not path:line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, v.written(), "needs a reason") != null);
+}

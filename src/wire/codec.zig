@@ -171,6 +171,12 @@ pub const Cursor = struct {
     }
 };
 
+/// The tail-padding grain every variable-length payload rounds to: 8 B,
+/// the widest scalar any wire struct carries (u64), so the fixed struct
+/// that follows a byte tail is viewed in place at its natural alignment
+/// and a frame's length stays a multiple of its largest field.
+pub const TAIL_ALIGN: usize = 8;
+
 /// `n` rounded up to a multiple of `align_to` (the tail-padding law).
 pub fn padTo(n: usize, align_to: usize) usize {
     return n + (align_to - n % align_to) % align_to;

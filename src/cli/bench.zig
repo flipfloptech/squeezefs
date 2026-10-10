@@ -228,11 +228,23 @@ pub fn phasePasses(b: args.Bench, block: u64, out: *[4]Pass) []Pass {
 // The streams: block order and the fill.
 // ---------------------------------------------------------------------------
 
+/// splitmix64 (Steele, Lea & Flood 2014): the published constants and
+/// shifts verbatim — a seed mixer whose outputs are equidistributed, so a
+/// per-(tid, fid, block) seed never collides across the dataset.
 fn splitmix64(x: u64) u64 {
     var z = x +% 0x9E37_79B9_7F4A_7C15;
     z = (z ^ (z >> 30)) *% 0xBF58_476D_1CE4_E5B9;
     z = (z ^ (z >> 27)) *% 0x94D0_49BB_1331_11EB;
     return z ^ (z >> 31);
+}
+
+/// One xorshift64* step (Vigna 2016): the published 12/25/27 shift triple
+/// and the multiplier — a 2^64 − 1 period stream from any non-zero state.
+fn xorshift64star(x: *u64) u64 {
+    x.* ^= x.* >> 12;
+    x.* ^= x.* << 25;
+    x.* ^= x.* >> 27;
+    return x.* *% 0x2545_F491_4F6C_DD1D;
 }
 
 /// The stream seed of `(tid, fid, block)` under the tag.
@@ -246,12 +258,10 @@ pub fn fillBlock(buf: []u8, tid: u32, fid: u32, block: u64) void {
     if (x == 0) x = SEED_TAG;
     var i: usize = 0;
     while (i + 8 <= buf.len) : (i += 8) {
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        const word = x *% 0x2545_F491_4F6C_DD1D;
+        const word = xorshift64star(&x);
         std.mem.writeInt(u64, buf[i..][0..8], if (word == 0) 1 else word, .little);
     }
+    // The tail past the last whole word: a fixed non-zero fill byte.
     while (i < buf.len) : (i += 1) buf[i] = 0xA5;
 }
 
@@ -263,10 +273,7 @@ pub fn blockOrder(out: []u64, rand: bool, seed: u64) void {
     var x = splitmix64(seed) | 1;
     var i: usize = out.len - 1;
     while (i > 0) : (i -= 1) {
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        const j: usize = @intCast((x *% 0x2545_F491_4F6C_DD1D) % (i + 1));
+        const j: usize = @intCast(xorshift64star(&x) % (i + 1));
         std.mem.swap(u64, &out[i], &out[j]);
     }
 }

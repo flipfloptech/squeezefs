@@ -39,6 +39,7 @@ pub const fuzzkit = if (builtin.is_test) @import("core/fuzzkit.zig") else struct
 // ---- the gates' shared code: the decoder/fuzz census the rail and the nightly campaign read (portable) ----
 pub const gates = struct {
     pub const census = @import("gates/census.zig");
+    pub const literals = @import("gates/literals.zig");
 };
 
 // ---- model checking: the exhaustive interleaving explorer (portable) ----
@@ -211,6 +212,7 @@ test {
     _ = fuzzkit;
     _ = model.explorer;
     _ = gates.census;
+    _ = gates.literals;
     _ = ops.fsck;
     _ = ops.jobs;
     _ = ops.lifecycle;

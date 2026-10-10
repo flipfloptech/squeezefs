@@ -370,14 +370,14 @@ fn HeadWithBytes(comptime HeadT: type, comptime len_field: []const u8, comptime 
             std.debug.assert(@field(self.head, len_field) == self.bytes.len);
             try b.put(Head, self.head);
             try b.putBytes(self.bytes);
-            try b.putPadding(self.bytes.len, 8);
+            try b.putPadding(self.bytes.len, codec.TAIL_ALIGN);
         }
 
         pub fn decode(c: *Cursor) Error!Self {
             const head = try c.take(Head);
             const n = try codec.countAtMost(@field(head, len_field), cap);
             const bytes = try c.takeBytes(n);
-            try c.takePadding(n, 8);
+            try c.takePadding(n, codec.TAIL_ALIGN);
             return .{ .head = head, .bytes = bytes };
         }
     };
@@ -809,7 +809,7 @@ pub const Grant = struct {
         try b.put(GrantHead, self.head);
         try b.putView(SlotLeaseAckWire, self.slot_leases_ack);
         try b.putView(u16, self.slot_release_notices);
-        try b.putPadding(self.slot_release_notices.len * 2, 8);
+        try b.putPadding(self.slot_release_notices.len * 2, codec.TAIL_ALIGN);
         try b.putView(OfferedSlotWire, self.offered_slots);
     }
 
@@ -817,7 +817,7 @@ pub const Grant = struct {
         const head = try c.take(GrantHead);
         const ack = try c.takeArray(SlotLeaseAckWire, head.n_ack);
         const rel = try c.takeArray(u16, head.n_release);
-        try c.takePadding(@as(usize, head.n_release) * 2, 8);
+        try c.takePadding(@as(usize, head.n_release) * 2, codec.TAIL_ALIGN);
         const off = try c.takeArray(OfferedSlotWire, head.n_offered);
         return .{ .head = head, .slot_leases_ack = ack, .slot_release_notices = rel, .offered_slots = off };
     }
@@ -920,7 +920,7 @@ pub const MemberIterator = struct {
         self.left -= 1;
         const head = self.c.take(MemberSnapshotHead) catch unreachable;
         const mount = self.c.takeBytes(head.mount_len) catch unreachable;
-        self.c.takePadding(head.mount_len, 8) catch unreachable;
+        self.c.takePadding(head.mount_len, codec.TAIL_ALIGN) catch unreachable;
         return .{ .head = head, .mount = mount };
     }
 };
@@ -944,7 +944,7 @@ pub const CensusPage = struct {
         std.debug.assert(row.head.mount_len == row.mount.len);
         try b.put(MemberSnapshotHead, row.head);
         try b.putBytes(row.mount);
-        try b.putPadding(row.mount.len, 8);
+        try b.putPadding(row.mount.len, codec.TAIL_ALIGN);
     }
 
     pub fn encode(self: CensusPage, b: *Builder) codec.BuildError!void {
@@ -959,7 +959,7 @@ pub const CensusPage = struct {
         while (i < head.n) : (i += 1) {
             const rh = try c.take(MemberSnapshotHead);
             _ = try c.takeBytes(rh.mount_len);
-            try c.takePadding(rh.mount_len, 8);
+            try c.takePadding(rh.mount_len, codec.TAIL_ALIGN);
         }
         return .{ .head = head, .rows_bytes = c.bytes[start..c.pos] };
     }
@@ -1044,7 +1044,7 @@ pub const XattrIterator = struct {
         const h = self.c.take(XattrHead) catch unreachable;
         const name = self.c.takeBytes(h.name_len) catch unreachable;
         const value = self.c.takeBytes(h.value_len) catch unreachable;
-        self.c.takePadding(@as(usize, h.name_len) + h.value_len, 8) catch unreachable;
+        self.c.takePadding(@as(usize, h.name_len) + h.value_len, codec.TAIL_ALIGN) catch unreachable;
         return .{ .name = name, .value = value };
     }
 };
@@ -1057,7 +1057,7 @@ pub const DirIterator = struct {
         self.left -= 1;
         const h = self.c.take(DirRecordHead) catch unreachable;
         const name = self.c.takeBytes(h.name_len) catch unreachable;
-        self.c.takePadding(h.name_len, 8) catch unreachable;
+        self.c.takePadding(h.name_len, codec.TAIL_ALIGN) catch unreachable;
         return .{ .head = h, .name = name };
     }
 };
@@ -1073,14 +1073,14 @@ pub const GrantPage = struct {
         try b.put(XattrHead, .{ .name_len = @intCast(e.name.len), .reserved = 0, .value_len = @intCast(e.value.len) });
         try b.putBytes(e.name);
         try b.putBytes(e.value);
-        try b.putPadding(e.name.len + e.value.len, 8);
+        try b.putPadding(e.name.len + e.value.len, codec.TAIL_ALIGN);
     }
 
     pub fn encodeDir(b: *Builder, e: DirEntry) codec.BuildError!void {
         std.debug.assert(e.head.name_len == e.name.len);
         try b.put(DirRecordHead, e.head);
         try b.putBytes(e.name);
-        try b.putPadding(e.name.len, 8);
+        try b.putPadding(e.name.len, codec.TAIL_ALIGN);
     }
 
     pub fn encode(self: GrantPage, b: *Builder) codec.BuildError!void {
@@ -1096,14 +1096,14 @@ pub const GrantPage = struct {
         while (i < head.n_xattrs) : (i += 1) {
             const h = try c.take(XattrHead);
             _ = try c.takeBytes(@as(usize, h.name_len) + h.value_len);
-            try c.takePadding(@as(usize, h.name_len) + h.value_len, 8);
+            try c.takePadding(@as(usize, h.name_len) + h.value_len, codec.TAIL_ALIGN);
         }
         const ds = c.pos;
         i = 0;
         while (i < head.n_dir) : (i += 1) {
             const h = try c.take(DirRecordHead);
             _ = try c.takeBytes(h.name_len);
-            try c.takePadding(h.name_len, 8);
+            try c.takePadding(h.name_len, codec.TAIL_ALIGN);
         }
         return .{ .head = head, .xattrs_bytes = c.bytes[xs..ds], .dir_bytes = c.bytes[ds..c.pos] };
     }
@@ -1208,13 +1208,13 @@ pub const CustodyReply = struct {
         std.debug.assert(self.head.page_len == self.page_bytes.len);
         try b.put(CustodyReplyHead, self.head);
         try b.putBytes(self.page_bytes);
-        try b.putPadding(self.page_bytes.len, 8);
+        try b.putPadding(self.page_bytes.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *Cursor) Error!CustodyReply {
         const head = try c.take(CustodyReplyHead);
         const bytes = try c.takeBytes(head.page_len);
-        try c.takePadding(head.page_len, 8);
+        try c.takePadding(head.page_len, codec.TAIL_ALIGN);
         if (bytes.len != 0) _ = try codec.decodePayload(GrantPage, bytes);
         return .{ .head = head, .page_bytes = bytes };
     }
@@ -1278,13 +1278,13 @@ pub const XvStepReq = struct {
         std.debug.assert(self.head.step.name_len == self.name.len);
         try b.put(XvStepHead, self.head);
         try b.putBytes(self.name);
-        try b.putPadding(self.name.len, 8);
+        try b.putPadding(self.name.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *Cursor) Error!XvStepReq {
         const head = try c.take(XvStepHead);
         const name = try c.takeBytes(head.step.name_len);
-        try c.takePadding(head.step.name_len, 8);
+        try c.takePadding(head.step.name_len, codec.TAIL_ALIGN);
         return .{ .head = head, .name = name };
     }
 };
@@ -1357,7 +1357,7 @@ pub const GuardDentryIterator = struct {
         self.left -= 1;
         const h = self.c.take(GuardDentryHead) catch unreachable;
         const name = self.c.takeBytes(h.name_len) catch unreachable;
-        self.c.takePadding(h.name_len, 8) catch unreachable;
+        self.c.takePadding(h.name_len, codec.TAIL_ALIGN) catch unreachable;
         return .{ .head = h, .name = name };
     }
 };
@@ -1384,7 +1384,7 @@ pub const XvGuardsReq = struct {
         std.debug.assert(d.head.name_len == d.name.len);
         try b.put(GuardDentryHead, d.head);
         try b.putBytes(d.name);
-        try b.putPadding(d.name.len, 8);
+        try b.putPadding(d.name.len, codec.TAIL_ALIGN);
     }
 
     pub fn encode(self: XvGuardsReq, b: *Builder) codec.BuildError!void {
@@ -1402,7 +1402,7 @@ pub const XvGuardsReq = struct {
         while (i < head.n_dentries) : (i += 1) {
             const h = try c.take(GuardDentryHead);
             _ = try c.takeBytes(h.name_len);
-            try c.takePadding(h.name_len, 8);
+            try c.takePadding(h.name_len, codec.TAIL_ALIGN);
         }
         return .{ .head = head, .inodes = inodes, .dentries_bytes = c.bytes[start..c.pos] };
     }
@@ -1487,14 +1487,14 @@ pub const RecordShipReq = struct {
         try b.put(RecordShipHead, self.head);
         try b.putBytes(self.name);
         try b.putBytes(self.value);
-        try b.putPadding(self.name.len + self.value.len, 8);
+        try b.putPadding(self.name.len + self.value.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *Cursor) Error!RecordShipReq {
         const head = try c.take(RecordShipHead);
         const name = try c.takeBytes(head.name_len);
         const value = try c.takeBytes(head.value_len);
-        try c.takePadding(@as(usize, head.name_len) + head.value_len, 8);
+        try c.takePadding(@as(usize, head.name_len) + head.value_len, codec.TAIL_ALIGN);
         return .{ .head = head, .name = name, .value = value };
     }
 };
@@ -1529,14 +1529,14 @@ pub const FreeVerdicts = struct {
         std.debug.assert(self.head.n == self.verdicts.len);
         try b.put(FreeVerdictsHead, self.head);
         try b.putBytes(self.verdicts);
-        try b.putPadding(self.verdicts.len, 8);
+        try b.putPadding(self.verdicts.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *Cursor) Error!FreeVerdicts {
         const head = try c.take(FreeVerdictsHead);
         const v = try c.takeBytes(head.n);
         for (v) |b| if (b > 2) return error.Malformed;
-        try c.takePadding(head.n, 8);
+        try c.takePadding(head.n, codec.TAIL_ALIGN);
         return .{ .head = head, .verdicts = v };
     }
 };

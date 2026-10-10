@@ -246,13 +246,13 @@ pub const ReadShardResultReq = struct {
         std.debug.assert(self.head.len == self.payload.len);
         try b.put(ReadShardResultHead, self.head);
         try b.putBytes(self.payload);
-        try b.putPadding(self.payload.len, 8);
+        try b.putPadding(self.payload.len, codec.TAIL_ALIGN);
     }
 
     pub fn decode(c: *Cursor) Error!ReadShardResultReq {
         const head = try c.take(ReadShardResultHead);
         const payload = try c.takeBytes(head.len);
-        try c.takePadding(head.len, 8);
+        try c.takePadding(head.len, codec.TAIL_ALIGN);
         return .{ .head = head, .payload = payload };
     }
 };

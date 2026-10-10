@@ -91,14 +91,14 @@ on the remount, `fsck --offline --scrub` clean.
 
 | Row | Measured |
 |---|---|
-| format 1 meta + 2 data (1 MiB blocks, a cache path) → fill: 20 packed 64 KiB, 3 × 20 MiB fsync'd striped, a 1.5 GiB block-map file → umount, `clone` (a shared block), remount | 17 inodes, 1,598 blocks |
-| `volume add-data <mp> d2` ONLINE | `vol-…` live at config generation 2; the rebalance job completed; `backend_fill_spread` 165,852 ppm on the 21 %/21 %/0 % shape (every volume inside the 10 pp band of the 14 % mean; row 441) |
+| format 1 meta + 2 data (1 MiB blocks, a cache path) → fill: 80 packed 64 KiB, 3 × 20 MiB fsync'd striped, a 1.5 GiB block-map file → umount, `clone` (a shared block), remount | 27 inodes after the unlinks, 1,598 blocks |
+| `volume add-data <mp> d2` ONLINE | `vol-…` live at config generation 2; the rebalance job completed; `backend_fill_spread` 164,387–166,341 ppm across runs on the 21 %/21 %/0 % shape (every volume inside the 10 pp band of the 14 % mean; row 441) |
 | `job list/status` live; `job throttle` on a terminal job | refused by verdict `terminal`, exit 1 |
-| `volume remove-data <mp> d0` → `job throttle 25` → `job pause` (observed `paused`) → `resume` → `throttle 100` → retire | 895 blocks moved (packed, striped, shared and kvmap bindings), `volume_retired 1`; `df` used 1,636,352 → 1,636,352 KiB (the baseline law exact) |
+| `volume remove-data <mp> d0` → `job throttle 25` → `job pause` (observed `paused`) → `resume` → `throttle 100` → retire | 826–895 blocks moved per run (packed, striped, shared and kvmap bindings), `volume_retired 1`; `df` used 1,639,424 → 1,639,424 KiB (the baseline law exact) |
 | `undrain` after retire | refused (exit 1, the lattice's reason) |
-| `defrag --pack <mp>` after unlinking 10 of 20 packed files | 2 pack compactions; the kept files byte-exact |
+| `defrag --pack <mp>` after unlinking 3 of every 4 of 80 packed files (5 pack blocks at ¼ live; the corpse reclaim awaited — a compaction run before the destroys landed saw every tenant still named) | 5 pack compactions; the kept files byte-exact |
 | `remove-data d1` at 25 % → `kill -9` mid-drain → remount | `1 job(s) adopted`; the job resumed from its regenerated plan and completed; `volume_retired 1` |
-| `fsck --online <mp>` | 17 inodes, 1,598 blocks, 0 findings |
+| `fsck --online <mp>` | 27 inodes, 1,598 blocks, 0 findings |
 | every file after two drains and a compaction | `big`, `big0..2`, the clone and the kept packed files byte-exact (sha256) |
 | a second process `job worker sqmeta://…` | enrolled over TCP (`job_remote_enrollments 1`, `job_remote_workers 1`), a submitted job completed, SIGTERM → exit 0, `job_remote_workers 0` |
 | `fsck --offline --scrub` after the clean umount | 0 findings (1,598 blocks) |
@@ -110,8 +110,9 @@ exactly as §8 says — the matrix's 4 GiB sparse volumes are the venue's answer
 ## Gates
 
 - macOS (portable modules): `zig build gate` 22/22 steps, 1,934/1,958 tests passed (24 skipped).
-- Venue (7.2.6-sqz): `scripts/venue zig build gate` — see the totals in the pass's report; the jobs matrix
-  row runs inside `zig build smoke`.
+- Venue (7.2.6-sqz, root): `scripts/venue zig build gate` 38/38 steps, 2,429/2,470 tests passed (41 skipped)
+  — unit 2,229 pass / 39 skip, rails 7, shim-census 1, smoke 61 pass / 2 skip (the jobs matrix row among
+  them, 6 min for the suite), bench-smoke 40, shim-smoke 40, nvmet-smoke 51; zero nvmet residue after.
 
 ## Deviations / not delivered (stated, not hidden)
 

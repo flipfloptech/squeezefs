@@ -421,6 +421,11 @@ pub const Record = struct {
     inflight_change: sync_notify.Notify = .init,
     /// ACK-early stores acked but not yet landed.
     acked_pending: Atomic(u32) = .init(0),
+    /// The install's monotonic stamp: an ino drain owes every record
+    /// opened BEFORE it began; one opened during the drain is the next
+    /// fsync's (never a stranded record, never an endless drain under a
+    /// steady writer).
+    opened_ns: u64 = 0,
     in_use: bool = false,
 };
 
@@ -476,6 +481,7 @@ pub const Registry = struct {
         r.* = fill.*;
         r.in_use = true;
         r.inflight_change = .init;
+        r.opened_ns = clock.monotonicNs();
         self.index.putAssumeCapacity(k, r);
         _ = self.open_count.fetchAdd(1, .monotonic);
         stats.overlay_open.add(1);
@@ -1235,37 +1241,60 @@ pub const Overlay = struct {
         self.drainBlock(io, locks, ino, block, false, cs);
     }
 
-    /// §3.8: every record of `ino` — blocks at or past `keep_below`
-    /// SUPERSEDE (a shape-change op owns the discarded data; a Frozen one
-    /// is still drained, never stranded); below ⇒ drain with `barrier`.
-    /// Returns the records still open afterwards (counted by the fsync as
-    /// `overlay_unpublished_at_fsync`).
+    /// §3.8: every record of `ino` opened before the drain began — blocks
+    /// at or past `keep_below` SUPERSEDE (a shape-change op owns the
+    /// discarded data; a Frozen one is still drained, never stranded);
+    /// below ⇒ drain with `barrier`. The registry enumerates a page of
+    /// blocks at a time; the drain repeats until a page holds nothing it
+    /// owes (LTP fs_fill — xfs on a loop device over a 300 MiB file —
+    /// kept > 64 records open at once: the single page left the rest
+    /// unpublished at fsync). Returns the owed records still open
+    /// afterwards (counted by the fsync as `overlay_unpublished_at_fsync`).
     pub fn drainForIno(self: *Overlay, io: Io, locks: *seams.BlockLocks, ino: u64, keep_below: u64, barrier: bool, cs: epoch_mod.Epochs.CloseSeams) u32 {
+        const began = clock.monotonicNs();
         var blocks: [64]u32 = undefined;
-        const bl = self.registry.blocksOf(ino, &blocks);
-        for (bl) |b| {
-            if (b >= keep_below) {
-                const frozen = blk: {
-                    const g = locks.acquire(io, ino, b, .overlay_prune);
-                    defer g.release(io);
-                    const rec = self.registry.get(.{ .ino = ino, .block = b }) orelse break :blk false;
-                    if (rec.core.stateNow() == .frozen) break :blk true;
-                    self.awaitInflight(io, rec);
-                    stats.overlay_supersessions.inc();
-                    _ = rec.core.supersede();
-                    self.teardown(rec);
-                    break :blk false;
-                };
-                // A Frozen record is still drained, never stranded — on
-                // the guard-dropping ladder like every settle.
-                if (frozen) _ = self.settleWriteArm(io, locks, ino, b, barrier);
-            } else {
-                self.drainBlock(io, locks, ino, b, barrier, cs);
+        // Bounded: each pass retires what it enumerated; a pass that owes
+        // nothing ends the drain. The cap is the registry's capacity in
+        // pages plus the passes a concurrent writer's re-opens could add.
+        var passes: u32 = 0;
+        while (passes < 1024) : (passes += 1) {
+            var owed: u32 = 0;
+            for (self.registry.blocksOf(ino, &blocks)) |b| {
+                if (!self.owedSince(ino, b, began)) continue;
+                owed += 1;
+                if (b >= keep_below) {
+                    const frozen = blk: {
+                        const g = locks.acquire(io, ino, b, .overlay_prune);
+                        defer g.release(io);
+                        const rec = self.registry.get(.{ .ino = ino, .block = b }) orelse break :blk false;
+                        if (rec.core.stateNow() == .frozen) break :blk true;
+                        self.awaitInflight(io, rec);
+                        stats.overlay_supersessions.inc();
+                        _ = rec.core.supersede();
+                        self.teardown(rec);
+                        break :blk false;
+                    };
+                    // A Frozen record is still drained, never stranded — on
+                    // the guard-dropping ladder like every settle.
+                    if (frozen) _ = self.settleWriteArm(io, locks, ino, b, barrier);
+                } else {
+                    self.drainBlock(io, locks, ino, b, barrier, cs);
+                }
             }
+            if (owed == 0) break;
         }
         var left: u32 = 0;
-        for (self.registry.blocksOf(ino, &blocks)) |_| left += 1;
+        var left_blocks: [64]u32 = undefined;
+        for (self.registry.blocksOf(ino, &left_blocks)) |b| {
+            if (self.owedSince(ino, b, began)) left += 1;
+        }
         return left;
+    }
+
+    /// Whether `(ino, block)` holds a record opened at or before `since`.
+    fn owedSince(self: *Overlay, ino: u64, block: u32, since: u64) bool {
+        const rec = self.registry.get(.{ .ino = ino, .block = block }) orelse return false;
+        return rec.opened_ns <= since;
     }
 
     // ---- §3.5 the read composition ----
@@ -1450,10 +1479,10 @@ const TestWorld = struct {
     gov: pipeline.Governor,
     ov: Overlay,
 
-    fn init(gpa: Allocator, cfg_over: struct { patch_max: u64 = wt.BS / 8, overwrite: bool = true, shadow: bool = true, close_barrier: bool = false }) !*TestWorld {
+    fn init(gpa: Allocator, cfg_over: struct { patch_max: u64 = wt.BS / 8, overwrite: bool = true, shadow: bool = true, close_barrier: bool = false, blocks: u32 = 32, registry_capacity: usize = 16 }) !*TestWorld {
         const w = try gpa.create(TestWorld);
         errdefer gpa.destroy(w);
-        w.f = try wt.Fixture.init(gpa, 32);
+        w.f = try wt.Fixture.init(gpa, cfg_over.blocks);
         w.epochs = epoch_mod.Epochs.init(gpa, wt.BS, cfg_over.shadow);
         w.stripes = .{};
         w.locks = try seams.BlockLocks.init(gpa, 64);
@@ -1468,7 +1497,7 @@ const TestWorld = struct {
             .epochs = &w.epochs,
             .stripes = &w.stripes,
             .governor = &w.gov,
-        }, 16);
+        }, cfg_over.registry_capacity);
         return w;
     }
 
@@ -1569,6 +1598,29 @@ test "partial_overlay_fsync_seeds_zeros_and_publishes_whole_block; open_overlay_
     try testing.expectEqualSlices(u8, &p, got[wt.BS / 4 .. wt.BS / 2]);
     try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0));
     try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
+}
+
+test "the fsync drain covers EVERY open record of the ino, however many: 70 blocks each with an open record (more than one enumeration page) all publish, none left (repro-port: LTP fs_fill — xfs on a loop device over a 300 MiB file — fired overlay_unpublished_at_fsync five times)" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{ .blocks = 160, .registry_capacity = 96 });
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(44, .striped, 0);
+    var p: [wt.BS / 4]u8 align(4096) = undefined;
+    pattern(&p, 0x44);
+    const n: u32 = 70;
+    var b: u32 = 0;
+    while (b < n) : (b += 1) {
+        const o = try w.ov.store(io, .{ .ino = 44, .block = b, .rel = wt.BS / 4, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(@as(u64, b) * wt.BS), .overwrite = false });
+        try testing.expect(o == .stored);
+    }
+    try testing.expectEqual(@as(u32, n), w.ov.registry.open_count.load(.monotonic));
+    const unpub0 = counters.tripwireCount("overlay_unpublished_at_fsync");
+    const left = w.ov.drainForIno(io, &w.locks, 44, std.math.maxInt(u64), true, w.cs());
+    try testing.expectEqual(@as(u32, 0), left);
+    try testing.expectEqual(@as(u32, 0), w.ov.registry.open_count.load(.monotonic));
+    try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
+    b = 0;
+    while (b < n) : (b += 1) try testing.expect(w.f.map.seam().lookup(44, b) != null);
 }
 
 test "live_mapped_overwrite_rides_the_overlay_end_to_end: the install captures the old binding in ONE (3.5) section; reads serve gaps from the OLD binding; the settle seeds old bytes RANGED and FEEDS the rewrite epoch; the epoch close frees the displaced A key AFTER the save" {

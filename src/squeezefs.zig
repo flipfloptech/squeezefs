@@ -152,6 +152,7 @@ pub const ops = struct {
     pub const nvmet = if (builtin.os.tag == .linux) @import("ops/nvmet.zig") else struct {};
     pub const keys = @import("ops/keys.zig");
     // @anchor:ops_zcrx_import
+    // @anchor:ops_integrate_import
 };
 
 // ---- the client bypass: the shm session, the daemon host, the shim + SDK client (charter §7) ----
@@ -206,6 +207,7 @@ test {
     if (builtin.os.tag == .linux) _ = ops.nvmet;
     _ = ops.keys;
     // @anchor:ops_zcrx_test
+    // @anchor:ops_integrate_test
     _ = ipc.session;
     if (builtin.os.tag == .linux) _ = ipc.host;
     if (builtin.os.tag == .linux) _ = shim;

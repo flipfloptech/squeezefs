@@ -64,6 +64,9 @@ pub const stats = struct {
     pub var rewrite_shadow_close_retries: counters.ShardedCounter = .{};
     /// A close that parked on the ino's running save (closes serialize).
     pub var rewrite_shadow_close_waits: counters.ShardedCounter = .{};
+    /// A record answered `save_in_flight` and its caller parked on the
+    /// ino's running save before recording again.
+    pub var rewrite_shadow_save_waits: counters.ShardedCounter = .{};
     pub var rewrite_shadow_superseded: counters.ShardedCounter = .{};
     pub var rewrite_shadow_pressure_closes: counters.ShardedCounter = .{};
     pub var rewrite_shadow_orphan_discards: counters.ShardedCounter = .{};
@@ -79,7 +82,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"rewrite_shadow_open_epochs\":{d},\"rewrite_shadow_parked_bytes\":{d},", .{ stats.rewrite_shadow_open_epochs.load(), stats.rewrite_shadow_parked_bytes.load() });
-    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes" }) |name| {
+    inline for (.{ "rewrite_shadow_swaps", "rewrite_shadow_bytes", "rewrite_shadow_fallbacks", "rewrite_shadow_close_retries", "rewrite_shadow_close_waits", "rewrite_shadow_save_waits", "rewrite_shadow_superseded", "rewrite_shadow_pressure_closes", "rewrite_shadow_orphan_discards", "rewrite_shadow_idle_closes", "rewrite_blocks", "rewrite_user_bytes", "rewrite_device_write_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"rewrite_shadow_fence_drops\":{d},\"rewrite_shadow_displaced_drift\":{d}}}", .{ counters.tripwireCount("rewrite_shadow_fence_drops"), counters.tripwireCount("rewrite_shadow_displaced_drift") });
@@ -128,8 +131,18 @@ pub const RecordVerdict = union(enum) {
     shadowed: struct { displaced_prev: ?Binding, coverage_complete: bool },
     /// The ino's layout is not striped (a promotion in flight), or the
     /// epoch already shadows `MergeOutcome.max_displaced` other blocks (the
-    /// ONE save's size): the caller takes the durable-merge arm.
+    /// ONE save's size) and no save in flight names this block: the caller
+    /// takes the durable-merge arm.
     not_shadowed,
+    /// The open epoch is at the ONE save's size AND the ino's CLOSING epoch
+    /// shadows this block: a durable merge now would land under that
+    /// save, which then displaces a key it never parked and frees the
+    /// parked one a second time (`rewrite_shadow_displaced_drift` +
+    /// `block_untracked_free_refusals`: fstests generic/247, 500 blocks
+    /// overwritten by O_DIRECT and mmap at once). The caller publishes
+    /// nothing: it awaits the save (`awaitSaveSettled`, never under (3))
+    /// and records again over the landed B.
+    save_in_flight,
 };
 
 pub const CloseOutcome = union(enum) {
@@ -235,10 +248,14 @@ pub const Epochs = struct {
         defer self.lock.unlock();
         // The ONE save publishes at most `max_displaced` blocks: a block
         // beyond that takes the per-block durable publish instead of being
-        // dropped from the save (the pre-fix `closeEpoch` break).
+        // dropped from the save (the pre-fix `closeEpoch` break) — unless
+        // the ino's CLOSING epoch shadows it: a durable merge would land
+        // under that save (the visibility law), so the caller awaits the
+        // save instead and records again over the landed B.
         if (self.table.get(ino)) |e| if (!e.shadow.contains(block) and e.shadow.count() >= seams.MergeOutcome.max_displaced) {
             var g = guard;
             g.deinit();
+            if (self.closing.get(ino)) |c| if (c.shadowBinding(block) != null) return .save_in_flight;
             stats.rewrite_shadow_fallbacks.inc();
             return .not_shadowed;
         };
@@ -350,6 +367,27 @@ pub const Epochs = struct {
                     n.waitUncancelable(io);
                 },
             }
+        }
+    }
+
+    /// The `save_in_flight` caller's wait: until no save of `ino` is in
+    /// flight (register-then-recheck on `close_settled`; the tick is the
+    /// liveness backstop underneath). Never under a block guard (3).
+    pub fn awaitSaveSettled(self: *Epochs, io: Io, ino: u64) void {
+        while (true) {
+            var n = self.close_settled.notified();
+            _ = n.enable(io);
+            const in_flight = blk: {
+                self.lock.lock();
+                defer self.lock.unlock();
+                break :blk self.closing.contains(ino);
+            };
+            if (!in_flight) {
+                n.cancel(io);
+                return;
+            }
+            stats.rewrite_shadow_save_waits.inc();
+            n.waitUncancelable(io);
         }
     }
 
@@ -862,6 +900,92 @@ test "the ONE save's size caps the shadow: the 65th distinct block of an epoch a
     try testing.expectEqual(@as(u32, seams.MergeOutcome.max_displaced + 1), out.swapped.freed); // 64 A keys + block 0's intermediate B
     try testing.expectEqual(@as(u8, seams.MergeOutcome.max_displaced), f.map.merges.items[0].blocks);
     try testing.expect(f.map.seam().lookup(70, 0).?.eql(b_again));
+}
+
+/// The durable-merge arm as the upload runs it on `.not_shadowed`: ONE
+/// merge of `new` over the map's binding, the displaced key freed.
+fn directPublish(io: Io, f: *wt.Fixture, ino: u64, block: u32, new: Binding) void {
+    const out = f.map.seam().merge(.{ .ino = ino, .inserts = &.{.{ .block = block, .binding = new }}, .min_size = wt.BS, .proofs = &.{proofFor(new, wt.BS)}, .fencing = f.map.fencing }) catch unreachable;
+    for (out.slice()) |d| _ = f.frees.seam().free(io, d);
+}
+
+// fstests generic/247 (a 500-block file overwritten by an O_DIRECT dd and a
+// backward mmap writer at once): the epochs filled to the ONE save's size
+// and closed back to back; a record for a block the CLOSING epoch still
+// shadowed met the next epoch at its cap and took the durable merge under
+// the running save — the save then displaced that fresh key (never parked:
+// `rewrite_shadow_displaced_drift`) and freed the old A a second time
+// (`block_untracked_free_refusals`, "REFUSED begin_free of block 315").
+test "a record for a block the CLOSING epoch shadows never takes the durable merge under the save, cap or no cap: it answers save_in_flight, the caller awaits the save, and the saves land B then C with A and B freed once each — drift 0, refusals 0" {
+    const io = testing.io;
+    const f = try wt.Fixture.init(testing.allocator, 200);
+    defer f.deinit();
+    var ep = Epochs.init(testing.allocator, wt.BS, true);
+    defer ep.deinit();
+    const cs: Epochs.CloseSeams = .{ .map = f.map.seam(), .free = f.frees.seam(), .purge = .none };
+    const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
+    const refused0 = counters.tripwireCount("block_untracked_free_refusals");
+    const a = try f.publishBlock(80, 0, 0xAA);
+    const mb = try f.alloc_a.allocateBlock();
+    const b = Binding.wholeBlock(wt.VOL_A, mb.offset, mb.stamp);
+    _ = try ep.record(80, 0, a, b, proofFor(b, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, mb.idx), true);
+    // In the save's window: the next epoch fills to the cap with other
+    // blocks, then a record for block 0 arrives (the upload's venue).
+    const Racer = struct {
+        var ep_: *Epochs = undefined;
+        var f_: *wt.Fixture = undefined;
+        var io_: Io = undefined;
+        var c: Binding = undefined;
+        var verdict: ?RecordVerdict = null;
+        fn hook(_: *anyopaque, map: *wt.RamMap) void {
+            var block: u32 = 1;
+            while (block <= seams.MergeOutcome.max_displaced) : (block += 1) {
+                const ai = f_.publishBlock(80, block, 0x11) catch unreachable;
+                const m = f_.alloc_a.allocateBlock() catch unreachable;
+                const bi = Binding.wholeBlock(wt.VOL_A, m.offset, m.stamp);
+                std.debug.assert((ep_.record(80, block, ai, bi, proofFor(bi, wt.BS), 0, block_alloc.InflightAllocGuard.register(f_.alloc_a, m.idx), true) catch unreachable) == .shadowed);
+            }
+            const mc = f_.alloc_a.allocateBlock() catch unreachable;
+            c = Binding.wholeBlock(wt.VOL_A, mc.offset, mc.stamp);
+            const v = ep_.record(80, 0, map.seam().lookup(80, 0), c, proofFor(c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f_.alloc_a, mc.idx), true) catch unreachable;
+            verdict = v;
+            switch (v) {
+                .save_in_flight => {},
+                // What the upload does with the durable-merge verdict.
+                .not_shadowed => directPublish(io_, f_, 80, 0, c),
+                .shadowed => unreachable,
+            }
+        }
+    };
+    Racer.ep_ = &ep;
+    Racer.f_ = f;
+    Racer.io_ = io;
+    var dummy: u8 = 0;
+    f.map.before_merge = .{ .ctx = &dummy, .call = &Racer.hook };
+    try testing.expect(ep.close(io, 80, cs) == .swapped);
+    try testing.expect(Racer.verdict.? == .save_in_flight);
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    try testing.expectEqual(refused0, counters.tripwireCount("block_untracked_free_refusals"));
+    // The save landed B over A; A freed once; nothing is in flight for the ino.
+    try testing.expect(f.map.seam().lookup(80, 0).?.eql(b));
+    try testing.expectEqual(@as(usize, 1), f.frees.freed.items.len);
+    try testing.expect(f.frees.freed.items[0].eql(a));
+    ep.awaitSaveSettled(io, 80);
+    // The caller records again: the open epoch is still at its cap and no
+    // save names block 0 — the durable merge is now the right arm, over B.
+    const v2 = try ep.record(80, 0, f.map.seam().lookup(80, 0), Racer.c, proofFor(Racer.c, wt.BS), wt.BS, block_alloc.InflightAllocGuard.register(f.alloc_a, f.alloc_a.idxOf(Racer.c.offset)), true);
+    try testing.expect(v2 == .not_shadowed);
+    directPublish(io, f, 80, 0, Racer.c);
+    try testing.expect(f.map.seam().lookup(80, 0).?.eql(Racer.c));
+    try testing.expectEqual(@as(usize, 2), f.frees.freed.items.len);
+    try testing.expect(f.frees.freed.items[1].eql(b));
+    // The next epoch's save publishes its 64 blocks, each displacing what it parked.
+    const out = ep.close(io, 80, cs);
+    try testing.expectEqual(@as(u32, seams.MergeOutcome.max_displaced), out.swapped.freed);
+    try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
+    try testing.expectEqual(refused0, counters.tripwireCount("block_untracked_free_refusals"));
+    try testing.expect(f.map.seam().lookup(80, 0).?.eql(Racer.c));
+    try testing.expectEqual(@as(usize, 0), ep.openCount());
 }
 
 test {

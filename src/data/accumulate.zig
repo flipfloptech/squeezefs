@@ -809,7 +809,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         }
         table.upload_settled.notifyWaiters(io);
     }
-    while (true) {
+    drive: while (true) {
         // The snapshot + the epoch stamp under (3).
         var snap: Snapshot = undefined;
         var app_end: u32 = 0;
@@ -906,10 +906,19 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         deps.purge.purge(new_key);
         // Re-lock, revalidate: entry present ∧ epoch unchanged ⇒ publish;
         // superseded ⇒ free the fresh offset, publish nothing (latest-wins).
+        // A record the epoch answers `save_in_flight` releases the guard,
+        // awaits the ino's save (never under (3)) and re-enters here with
+        // the same minted image — one DMA, the publish deferred past the
+        // save it must not land under.
         var displaced: seams.MergeOutcome = .{};
         var fed_hint = false;
         var fed = false;
-        {
+        var await_save = false;
+        publish: while (true) {
+            if (await_save) {
+                await_save = false;
+                deps.epochs.awaitSaveSettled(io, ino);
+            }
             const g = deps.locks.acquire(io, ino, block, .pipeline_upload);
             defer g.release(io);
             const e = table.get(ino, block) orelse {
@@ -922,7 +931,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                 fsck_guard.deinit();
                 mint.abandon();
                 pipeline.countDisposition(.superseded, bs);
-                continue; // re-drive with the newest bytes
+                continue :drive; // re-drive with the newest bytes
             }
             const min_size = @as(u64, block) * bs + app_end;
             const striped = if (deps.map.view(ino)) |v| v.kind == .striped else false;
@@ -944,6 +953,12 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
                         fed_hint = s.coverage_complete;
                     },
                     .not_shadowed => fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx),
+                    .save_in_flight => {
+                        // The mint stays visible to fsck across the wait.
+                        fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx);
+                        await_save = true;
+                        continue :publish;
+                    },
                 }
             }
             if (!fed) {
@@ -988,6 +1003,7 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             table.retire(e);
             retired_by_us = true;
             prof.mark(.inval_tail);
+            break;
         }
         stats.write_through_blocks.inc();
         stats.write_through_bytes.add(bs);

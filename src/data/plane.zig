@@ -957,8 +957,15 @@ pub const DataPlane = struct {
         try block_refs.stageOps(t, &.{block_refs.released(.{ .vol_tag = op.vol_tag, .block_idx = op.block_idx, .owner_ino = op.owner_ino, .block_index = op.block_index })});
     }
 
-    /// The filesystem publishes an inode's shape (every layout publish and
-    /// size change); the queue-thread gates read it.
+    /// The filesystem publishes an inode's shape — the INODE's size and the
+    /// layout class — at every layout publish and size change; the
+    /// queue-thread gates (the W1 hold gate, the shared-mode probe) read
+    /// it. It is the ONE publisher of the size: the plane's own map merges
+    /// know the layout's data-reach floor, which can exceed the inode's
+    /// size (a shrink's zero tail), and a shape above the inode admits a
+    /// Shared write that extends the file under a shared guard — two such
+    /// writes race their size Δs (field overwrite, not max) and the file
+    /// ends shorter than its last write.
     pub fn noteShape(self: *DataPlane, ino: u64, size: u64, kind: layout.Kind) void {
         self.shape.publish(ino, size, kind == .striped and self.passthrough);
     }
@@ -1994,7 +2001,12 @@ pub const DataPlane = struct {
         };
         stats.layout_map_merges.inc();
         stats.layout_map_merge_blocks.add(req.inserts.len);
-        self.shape.publish(req.ino, size, self.passthrough);
+        // The shape is NOT published here (fstests generic/013: `write_
+        // shared_class_violation` ×60 per round): `size` is the layout's
+        // data-reach floor — the striped shrink's zero tail lands bytes
+        // past the new EOF and its upload's `min_size` is the old reach —
+        // never the inode's size the shared-mode classifier admits on.
+        // The filesystem publishes the inode's size at its postlude.
         return out;
     }
 
@@ -2077,7 +2089,6 @@ pub const DataPlane = struct {
         stats.layout_map_merges.inc();
         stats.layout_map_merge_blocks.add(req.inserts.len);
         self.windows.invalidate(ino);
-        self.shape.publish(ino, size, self.passthrough);
         log.info("ino {d}: block-map-tree crossing — {d} inline entries → {d} records ({d} ops over {d} tx), {d} preexisting record(s) reconciled; head flipped at size {d}, gen {d}", .{ ino, merged.len, plan.records, plan.ops.len, chunks + 1, plan.preexisting, size, kvmap.FIRST_MAP_GEN });
         return out.*;
     }
@@ -2164,7 +2175,6 @@ pub const DataPlane = struct {
         stats.layout_map_merge_blocks.add(window.len);
         kvmap.stats.kvmap_window_saves.inc();
         self.windows.invalidate(ino);
-        self.shape.publish(ino, size, self.passthrough);
         // The barrier's frees: the caller holds its (3.5) stripe across this
         // merge, so they run on the meta pool after it returns (RES-1).
         if (barrier_frees.items.len != 0) self.deferFrees(barrier_frees.toOwnedSlice(gpa) catch return out);

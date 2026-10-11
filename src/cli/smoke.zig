@@ -3008,6 +3008,15 @@ const stage_cp_script =
 ;
 
 /// Stage C: shrink to 150 MiB, grow to 220 MiB — mirrored on the image.
+/// Then the shared-mode classifier's repro (fstests generic/013,
+/// `write_shared_class_violation`): an 8 MiB striped file shrunk to
+/// 1.3 MB — the kept block's zero tail `[1.3 MB, 4 MiB)` is a write the
+/// plane folds and uploads with the BLOCK END as its map reach floor —
+/// fsync (the upload's merge lands), then ONE extending 4 KiB write at
+/// 1.5 MiB, past the new EOF and inside that block. The map merge used
+/// to publish its reach floor (4 MiB) as the inode's shape, so the write
+/// read as Shared on a size the file no longer had: `expectMustStayZero`
+/// on the pass's tail is the assertion; the mirror pins the bytes.
 const stage_truncate_script =
     \\W="$1"
     \\truncate -s 150M big
@@ -3018,6 +3027,18 @@ const stage_truncate_script =
     \\test "$(stat -c %s big)" = 230686720
     \\sync big
     \\cmp big "$W/expect"
+    \\dd if="$W/image" of=shrunk bs=1M count=8 status=none
+    \\dd if="$W/image" of="$W/shrunk" bs=1M count=8 status=none
+    \\sync shrunk
+    \\truncate -s 1300000 shrunk
+    \\truncate -s 1300000 "$W/shrunk"
+    \\sync shrunk
+    \\head -c 4096 /dev/urandom > "$W/page"
+    \\dd if="$W/page" of=shrunk bs=4k seek=384 count=1 conv=notrunc status=none
+    \\dd if="$W/page" of="$W/shrunk" bs=4k seek=384 count=1 conv=notrunc status=none
+    \\test "$(stat -c %s shrunk)" = 1576960
+    \\sync shrunk
+    \\cmp shrunk "$W/shrunk"
     \\echo stage-truncate-ok
 ;
 
@@ -3459,7 +3480,8 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
         const staged = numberAfter(tail, "\"fuse_write_staged\":") orelse 0;
         const promotions = numberAfter(tail, "\"fuse_write_promotions_to_striped\":") orelse 0;
         const clips = numberAfter(tail, "\"fuse_truncate_striped_clips\":") orelse 0;
-        try testing.expect(striped > 0 and promotions >= 1 + 1 + storm_files and clips == 1);
+        // Two striped shrinks in stage C: `big` 200 → 150 MiB and `shrunk` 8 MiB → 1.3 MB.
+        try testing.expect(striped > 0 and promotions >= 1 + 1 + storm_files and clips == 2);
         if (cache) {
             try testing.expect(staged >= small_files_staged);
             try testing.expect((numberAfter(tail, "\"held_stores\":") orelse 0) > 0);
@@ -3472,7 +3494,7 @@ fn dataPlanePass(rig: *Rig, cache: bool) !void {
     // G: rm the big files → df back to the baseline (+ the striped small
     // files on the set without staging).
     {
-        const out = try rig.onMount("rm -f big big100 storm0 storm1 storm2 storm3 storm4 storm5 storm6 storm7 && echo rm-ok");
+        const out = try rig.onMount("rm -f big big100 shrunk storm0 storm1 storm2 storm3 storm4 storm5 storm6 storm7 && echo rm-ok");
         defer gpa.free(out);
     }
     const small_kib: u64 = if (cache) 0 else small_n * (4 << 10);

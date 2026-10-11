@@ -1056,8 +1056,15 @@ pub const WritePath = struct {
                 self.spawnUpload(io, req.ino, pc.block, upload_permit, prof);
             },
             .fold => {
+                // Detached like an upload (the bytes are acked and parked;
+                // the fold is a flush): the triggering write never waits on
+                // the fold's DMAs. Inline under the synchronous override.
                 stats.parked_gate_self_flushes.inc();
-                accumulate.foldExtentBlock(&self.table, self.uploadDeps(), io, req.ino, pc.block);
+                if (self.cfg.depth_override == .sync_inline) {
+                    accumulate.foldExtentBlock(&self.table, self.uploadDeps(), io, req.ino, pc.block);
+                } else self.tasks.spawn(io, foldTask, .{ self, io, req.ino, pc.block }) catch {
+                    accumulate.foldExtentBlock(&self.table, self.uploadDeps(), io, req.ino, pc.block);
+                };
             },
         }
         return arm;
@@ -1194,6 +1201,10 @@ pub const WritePath = struct {
             var p = prof;
             self.runUpload(io, ino, block, permit, &p);
         };
+    }
+
+    fn foldTask(self: *WritePath, io: Io, ino: u64, block: u32) Io.Cancelable!void {
+        accumulate.foldExtentBlock(&self.table, self.uploadDeps(), io, ino, block);
     }
 
     fn uploadTask(self: *WritePath, io: Io, ino: u64, block: u32, permit: ?pipeline.Permit, prof: pipeline.Prof) Io.Cancelable!void {

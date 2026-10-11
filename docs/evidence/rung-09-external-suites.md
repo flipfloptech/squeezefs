@@ -205,8 +205,18 @@ wedges: `suites-probe-20261010-165924/d3-wedge-stats.json`,
 | 14 | fstests `generic/355` | a priv-killing write cleared the bits in the record (`fuse_killpriv_clears` counted) but the kernel's cached mode outlived it: the WRITE reply carries no attrs and the kernel invalidates none | kv_fs test "a file carrying S_ISUID/S_ISGID is served with attr TTL 0" | 5c88df9 |
 | 15 | fstests `generic/740` | a bare `format` overwrote a device carrying another filesystem (ext2/bfs/cramfs/minix: their superblocks live past our 8 magic bytes) | `meta/foreign_signature` table test + `cli/format` force-gate test; `mkfs.ext4/xfs/bfs/cramfs/minix` images refused by name on the venue | 426d0b2 |
 | 11 | fsstress round d3, fstests `generic/074` | the conveyor's pass fiber parked on the strength of the election winner's wake alone; the wake coalesced into the fiber's own mutex-park wake — the latch stayed set, every committer parked forever | `conveyor_core_model.PassFiber` (model 7: the word + the inner mutex park; the park without the latch re-read fails `FinalViolated`) | 9a79831 (`passEntry` re-reads `Conveyor.leaderHeld()` before every park). The defects agent fixed the same wedge independently (`.wt-defects`: the latch loop + a 2 s liveness-tick backstop with `meta_conveyor_park_tick_rescues`, a red test against a real volume); the two reconcile into ONE fix at integration — both repros stay if they cover different interleavings |
+| 16 | fstests `generic/551` (the stall; `aio-dio-write-verify`, 53 concurrent 512 B-aligned O_DIRECT AIO writes to one file) | the overlay store took its write-pipeline governor permit UNDER the (3) block guard; the in-flight permits belonged to accumulation uploads that re-take that guard to publish — four overlay writers parked at the governor holding the file's four block locks, ten uploads parked on those locks holding the whole depth (`551-stall-stats.json`: `write_pipeline_inflight_bytes` ≡ `write_pipeline_depth_target` = 10 blocks, `lock_ticked_reregisters` 41 k, 5.16 M admission waits), 53 writes in flight 30 min | write_admit test "a writer parked at the write-pipeline governor holds no block guard …" (red: `BlockLocks.tryAcquire` on the parked writer's block refused) | 720fed5 (`Overlay.store` `tryAdmit`s before a fresh install and answers `.governor_full`; the ladder drops (3), parks holding no lock, retries with the permit; `Governor.returnUnused`) |
+| 17 | fstests `generic/551` (the same repro, run standalone: `Find corruption` — a 1 MiB run of zeros where every writer had put 0x5a; at the page-size diosize 39 of 46 ranges corrupt in lap 1) | the overlay's state screen omitted the spec's "no RAM/extent custody" clause: a block whose unaligned end had parked took its aligned middle through the overlay — two write-side authorities, each publishing its complement (zeros) over the other's bytes | write_admit test "the overlay never opens a second authority on a block the RAM table holds …" (red: the middle's bytes gone from the device after the flush) | 720fed5 (`Overlay.Deps.ram_custody`, `overlay_ineligible_ram_custody`) |
+| 18 | fstests `generic/551` (the fixed binary's first standalone lap 4: a daemon panic) | `seedGaps`' whole-image leg typed its page-aligned image `?[]u8` and freed it at align 1 — the safe allocator's panic, reached once a sibling's one-authority settle met a zero-coverage overwrite record | device_overlay test "the whole-image gap seed (SQUEEZEFS_GAP_SEED_RANGED=0) …" (red: the test runner aborted with the same panic) | 720fed5 |
+| 19 | fstests `generic/074`, `generic/464` (ONE open(O_TRUNC) parked at `handler_entry` 35–40 min, no lock held, every thread asleep, `lock_ticked_reregisters` 0, `exec_fibers_live.fuse` 2) | the pre-clip custody settle (`flushCustody`) added `WritePath.quiesce` — an `Io.Group.await` of the ONE write-path task set every ino's uploads join — and the group has ONE awaiter cell: a second truncate settling at once overwrote the first's, and the last upload's exit woke only the cell it found (`std.Io.Threaded` asserts on the same second awaiter) | write_admit test "the pre-clip custody settle of one ino waits for nothing of another: two settles at once return while a third ino's upload is held in its DMA" (red: SIGABRT in Threaded's `groupAwait` assertion) | 1c516f2 (`WritePath.settleCustody` ≡ `flushIno`; `exec_group_second_awaiter` must-stay-0) |
+| 20 | fstests pass 2 `write_shared_class_violation` ×6 (a Shared-classified write whose inode size was below its end) | the O_TRUNC open ran its truncate with NO level-1 guard (the lifecycle took the exclusive guard for SETATTR-size only; ATOMIC_O_TRUNC means the kernel sends no SETATTR): the inode's size dropped under Shared-class writes admitted on `end ≤ shape size` | kv_fs test "an O_TRUNC open truncates under the level-1 EXCLUSIVE guard exactly as SETATTR-size does …" (red: the SettlingData double's shared probe was admitted inside the open's settle) | a623b07 |
+| 21 | fstests pass 2 `rewrite_shadow_displaced_drift` + `block_untracked_free_refusals` at 02:01:39 — on the TEST device under `generic/247` (a 500-block file overwritten by an O_DIRECT dd and a backward mmap writer at once), not 345 | the epoch's cap fallback (row 179) answered `not_shadowed` for a block the ino's CLOSING epoch still shadowed; the upload's durable merge landed under the running save, which then displaced a key it never parked and freed the parked A a second time | write_epoch test "a record for a block the CLOSING epoch shadows never takes the durable merge under the save, cap or no cap …" (red: both tripwires fired in the test exactly as in the log) | 82cef48 (`RecordVerdict.save_in_flight`, `Epochs.awaitSaveSettled`, `rewrite_shadow_save_waits`) |
 
-Decision 0002 rows 442–451 and 454–456 record each divergence from the reference's shape.
+Decision 0002 rows 442–451, 454–456 and 460–463 record each divergence from the reference's shape.
+
+### The stall repros (defects 16–19)
+
+Standalone `aio-dio-write-verify` loop (`.scratch/stalls-551.sh`: a fresh set under `/build/tmp/stalls-<pid>/`, the test's own random op shape, 512 B or 4 KiB diosize) on the pre-fix binary 853b20c: at diosize 512 a corrupt verify at lap 3 (or the stall); at diosize 4096 39 of 46 ranges corrupt in lap 1. On the fixed binary: 25 laps clean at 512, 25 laps clean at 4096 (the 4096 shape's 64 × 128 MiB AIO writes bark `transport_lease_overlong` ≥ 1 s — the transport's lease age under 8 GB in flight against a 4 GB budget, not a stall), fsck 0 findings. `generic/551` through the harness (100 laps per run) on a623b07: **20 of 20 runs passed**, 0 alert lines, fsck 0 findings every run (45–51 s wall; three runs 99–163 s — slower laps, no op past the watchdog's 5 s). The 074/464 shape: the two-awaiter join is deterministic in the unit test (Threaded's assertion); `generic/074` and `generic/464` through the harness on the final binary are in the table below.
 
 ## The venue (why the 3-run counts are incomplete)
 
@@ -225,17 +235,12 @@ rerun on a quiet venue before the release gate.
 
 ## Known, not yet fixed (named here so the ledger never hides them)
 
-- **generic/074 / generic/551 stalls** (pass 2, binary 6c5f5cc, the conveyor fix in): two
-  distinct shapes, both with the conveyor idle and every thread asleep. 074 (`fstest`, 3 × 512 B
-  writers, truncate loops): ONE `open` parked at `handler_entry` for 35 min
-  (`074-stall-stats.json`, the daemon log named in `074-stall-daemon-log.path`); the earlier
-  attempt on 9a79831 showed the same test with `lock_ticked_reregisters 13` before its daemon
-  died. 551 (`aio-dio-write-verify -t 2164 -a size=15272960`, 53 concurrent direct AIO writes to
-  one 15 MB file): every WRITE parked past `write_admitted`, `lock_ticked_reregisters` 41 k and
-  climbing, `parked_buffers 6` (20 MiB) — the F2 parked-buffer gate park and the block locks the
-  parked writers hold look like a cycle (`551-stall-stats.json`). Standalone `fstest` for 15 min
-  did not stall. The supervised mounts (pass 2's last change) will dump every task's kernel
-  stack after 30 s of an unanswered root stat on the next occurrence.
+- **generic/074 / 464 / 551 stalls** — FIXED (defects 16–19 above; the 551 hypothesis in pass 2
+  named the F2 gate; the cycle was the overlay store's governor park under (3), and the standalone
+  repro found a data corruption and a panic in the same shape; 074/464 were a lost wake on the
+  single-awaiter group join, not a lock). What stays: a `TaskSet` shared by handler paths must
+  never be awaited by two of them — the tripwire names it now; our `exec/group.zig` still has one
+  awaiter cell (std's contract), a multi-awaiter join is not owed.
 - **Dismount promotion `1 FAILED`** — PINNED: the only arm that declines without a storage or
   DMA error is `pack.dispatch` on an image above the chunk, and the staged arm rang exactly such
   images for truncate-grown files until defect 10; three post-fix fsstress rounds (seeds 5/9/11,
@@ -248,14 +253,12 @@ rerun on a quiet venue before the release gate.
   ring append under the record's grain padding, or the write-back class for the staged arm).
 - **Staging ring full → ENOSPC** under a 20-writer burst of 3–4 MiB files: owned by the
   `.wt-enospc` agent (F17's sibling) — not touched here.
-- **`rewrite_shadow_displaced_drift` + `block_untracked_free_refusals`** once, in `generic/345`
-  (fsx mixed mmap/buffered soak): the rewrite epoch's save displaced a binding it never parked
-  and the block was released twice. One occurrence in ≈ 10 h of suites; the 345 fsx seed is in
-  `345.full`.
-- **`write_shared_class_violation`** ×6 across pass 2 (and ×1 in a fsstress round): the handler
-  classified a write Shared (`end ≤ shape-table size`) while the inode's size was below `end`;
-  diagnostic (the plane serves the write through its ordinary arms), source of the stale-high
-  shape size not pinned.
+- **`rewrite_shadow_displaced_drift` + `block_untracked_free_refusals`** — FIXED (defect 21; the
+  pair fired on the TEST device under `generic/247`, not 345 — the alerts file's timestamp was
+  345's). A latent sibling stays named: a TRANSIENT save folds its shadows back into the next
+  epoch (`reregister`) with no cap — two full epochs fold to 128 inserts against the ONE save's
+  64-wide buffers (an assertion). Not seen; the real map's `Transient` class is the conveyor's.
+- **`write_shared_class_violation`** — FIXED (defect 20: the O_TRUNC open took no level-1 guard).
 - **exportfs / open_by_handle_at**: not a charter requirement and `FUSE_EXPORT_SUPPORT` is not
   advertised; on a capable host an unlinked file's handle answers ESTALE through the kernel's
   icache miss, a LIVE file's handle after a cycle-mount would too (no `LOOKUP "."` by nodeid).

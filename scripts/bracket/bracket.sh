@@ -211,11 +211,13 @@ format_set() {  # $1 = set index, $2 = posture
   # staging root under the scratch: cache paths are a FORMAT decision
   # (charter §6.1); without them a file past the inline bound goes striped
   # and the row would measure the wrong arm.
+  local staging_note=""
   if [ "${ROW_NEEDS_STAGING:-0}" = 1 ]; then
     mkdir -p "$SCRATCH/cache-$1"
     flags+=(--disk-cache-paths "$SCRATCH/cache-$1")
+    staging_note=" (staging root $SCRATCH/cache-$1)"
   fi
-  log "format set $1 ($2): $META_URI $DATA_URI${ROW_NEEDS_STAGING:+ (staging root $SCRATCH/cache-$1)}"
+  log "format set $1 ($2): $META_URI $DATA_URI$staging_note"
   "$BIN_A" format "${flags[@]}" "$META_URI" "$DATA_URI" > "$SCRATCH/format-$1.log" 2>&1 || { cat "$SCRATCH/format-$1.log" >&2; exit 1; }
 }
 if [ "$LEVER" = posture ]; then

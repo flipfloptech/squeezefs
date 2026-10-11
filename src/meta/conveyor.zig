@@ -262,11 +262,20 @@ pub fn holdWorthIt(gain_mean: ?u64) bool {
 /// The gain estimator's fixed point: one collected entry = 1024 (the
 /// EWMA's eighth of a difference stays whole down to 1/128 of an entry).
 pub const GAIN_UNIT: u64 = 1024;
-/// A probe hold every this many eligible windows while the gate is off:
-/// twice the estimator's memory (`1/α = 8` samples), so the gain the
-/// probes measure is at most two memories stale, at a latency cost of one
-/// hold in sixteen (≤ 6 % of the eligible windows wait ≤ one round trip).
-pub const HOLD_PROBE_PERIOD: u32 = 2 << RTT_ALPHA_SHIFT;
+/// A probe is a BURST of consecutive holds, one estimator memory long
+/// (`1/α = 8`): the gain is a property of the PACED regime — committers
+/// acked at one landing re-arrive as a cohort during the next window's
+/// flight — which takes two landings to form, so a single hold in the
+/// unpaced regime measures the spread arrivals of one flight instead
+/// (`rand-4k-write`: 0.61–0.65 per lone probe against 1.3 per paced
+/// hold), and the estimator's memory must be filled by the regime it
+/// judges.
+pub const HOLD_PROBE_BURST: u32 = 1 << RTT_ALPHA_SHIFT;
+/// A probe burst every this many eligible windows while the gate is off:
+/// sixteen bursts' worth, so a workload that starts paying is seen within
+/// ≈ 2 % of its windows at a latency cost of one hold in sixteen (≤ 6 %
+/// of the eligible windows wait ≤ one round trip).
+pub const HOLD_PROBE_PERIOD: u32 = 16 * HOLD_PROBE_BURST;
 
 /// The pad arithmetic the §L bound restates (tie tests below): a window
 /// of `n` entries of `s` bytes landing at the data start of a page on a
@@ -928,10 +937,12 @@ pub const Conveyor = struct {
     landed: sync.Notify = .init,
     rtt: RttEstimator = .{},
     /// The worth gate's measured gain (entries the re-drain collected per
-    /// hold, `GAIN_UNIT` fixed point) and the probe countdown while the
-    /// gate is off. Pass-fiber-owned.
+    /// hold, `GAIN_UNIT` fixed point), the eligible windows declined since
+    /// the last probe burst, and the burst's remaining holds.
+    /// Pass-fiber-owned.
     gain: RttEstimator = .{},
     probe_countdown: u32 = 0,
+    probe_burst_left: u32 = 0,
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -1237,14 +1248,22 @@ pub const Conveyor = struct {
             n.cancel(io);
             return unheld;
         }
-        if (!holdWorthIt(self.gain.mean())) {
-            self.probe_countdown += 1;
-            if (self.probe_countdown < HOLD_PROBE_PERIOD) {
-                n.cancel(io);
-                self.stats.holds_not_worth.inc();
-                return unheld;
+        if (holdWorthIt(self.gain.mean())) {
+            // A burst that turned the gate on is over; the next off period
+            // starts its own.
+            self.probe_burst_left = 0;
+        } else {
+            if (self.probe_burst_left == 0) {
+                self.probe_countdown += 1;
+                if (self.probe_countdown < HOLD_PROBE_PERIOD) {
+                    n.cancel(io);
+                    self.stats.holds_not_worth.inc();
+                    return unheld;
+                }
+                self.probe_countdown = 0;
+                self.probe_burst_left = HOLD_PROBE_BURST;
             }
-            self.probe_countdown = 0;
+            self.probe_burst_left -= 1;
             self.stats.hold_probes.inc();
         }
         self.stats.holds.inc();
@@ -3451,7 +3470,7 @@ test "§L tie: the RFC 6298 round-trip predictor — first sample seeds srtt = R
     try testing.expectEqual(e.srtt_ns.load(.monotonic), e.mean().?);
 }
 
-test "§L tie: the worth gate — a hold is paid while the measured gain is ≥ one collected entry per hold; no sample ⇒ off; the probe period is twice the estimator's memory" {
+test "§L tie: the worth gate — a hold is paid while the measured gain is ≥ one collected entry per hold; no sample ⇒ off; a probe is a burst of one estimator memory every sixteen bursts" {
     try testing.expect(!holdWorthIt(null));
     try testing.expect(!holdWorthIt(GAIN_UNIT - 1));
     try testing.expect(holdWorthIt(GAIN_UNIT));
@@ -3465,8 +3484,10 @@ test "§L tie: the worth gate — a hold is paid while the measured gain is ≥ 
     try testing.expect(holdWorthIt(r.mean()));
     r.sample(0);
     try testing.expect(holdWorthIt(r.mean()));
-    try testing.expectEqual(@as(u32, 16), HOLD_PROBE_PERIOD);
-    try testing.expectEqual(@as(u32, 2) << RTT_ALPHA_SHIFT, HOLD_PROBE_PERIOD);
+    // A probe burst is one estimator memory; a period sixteen bursts.
+    try testing.expectEqual(@as(u32, 8), HOLD_PROBE_BURST);
+    try testing.expectEqual(@as(u32, 128), HOLD_PROBE_PERIOD);
+    try testing.expectEqual(@as(u32, 1) << RTT_ALPHA_SHIFT, HOLD_PROBE_BURST);
 }
 
 // THE §L RED TEST (red at f27c501: 16 windows per committer round, pad
@@ -3482,7 +3503,7 @@ test "§L tie: the worth gate — a hold is paid while the measured gain is ≥ 
 // cohorts sum to N per pair of windows whatever the split, so the pad
 // fraction over the run is `1 − N·s/(2·g)` up to the first and last
 // windows.
-test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries against an 8 ms device: pad fraction ≤ 1 − N·s/(2·g) + slack, two windows per committer round, every entry acked once, zero tick rescues" {
+test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries against a 4 ms device: pad fraction ≤ 1 − N·s/(2·g) + slack past the gate's first probe period, two windows per committer round, every entry acked once, zero tick rescues" {
     // Leak-checked, no stack traces: `testing.allocator`'s trace capture
     // made a one-record apply cost ~0.5 ms in Debug — the pass latency
     // the shape measures against must stay far under the round trip.
@@ -3493,20 +3514,36 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     defer h.destroy();
     const io = testing.io;
     const n_committers = 48;
-    const per_committer = 32;
+    // Enough rounds that the gate's first probe period (128 unpaced
+    // one-entry windows) is a minority of the run.
+    const per_committer = 96;
     // The simulated journal device's round trip: long against the pass
     // latency AND the device thread's own delivery grain (a futex wake per
-    // completion, tens of µs on macOS: the 16 arrival phases must stay
-    // distinct), short for the gate (≈ 32 × 2 × 8 ms ≈ 0.5 s of landings).
-    const device_ns: u64 = 8 * std.time.ns_per_ms;
+    // completion, tens of µs on macOS: the 16 arrival phases, 250 µs
+    // apart, must stay distinct), short for the gate (≈ 96 × 2 × 4 ms ≈
+    // 0.8 s of paced landings + the probe period's).
+    const device_ns: u64 = 4 * std.time.ns_per_ms;
     h.cv.deps.window_hold = .{ .ceiling_ns = 50 * std.time.ns_per_ms };
     h.lane.hold = true;
     h.threaded_pass = true;
     var dma: Harness.DmaSim = .{};
     defer dma.deinit();
-    const pass_thread = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+    // The venue's threads are stopped and joined on EVERY exit (an
+    // assertion that fails must not leave them running into `destroy`).
     var device_stop: std.atomic.Value(bool) = .init(false);
+    const pass_thread = try std.Thread.spawn(.{}, Harness.passThreadMain, .{h});
+    defer {
+        h.cv.quiesce();
+        h.pass_stop.store(true, .release);
+        h.pass_wake.notifyOne(io);
+        pass_thread.join();
+    }
     const device_thread = try std.Thread.spawn(.{}, Harness.deviceThreadMain, .{ h, device_ns, &dma, &device_stop });
+    defer {
+        h.cv.quiesce();
+        device_stop.store(true, .release);
+        device_thread.join();
+    }
 
     // Each committer's inode exists before the Δ stream (the fold has a
     // base); the creates are their own phase, outside the measurement.
@@ -3556,19 +3593,21 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     var handles: [n_committers]std.Thread = undefined;
     for (&handles, 0..) |*hd, i| hd.* = try std.Thread.spawn(.{}, Committer.run, .{ h, &dma, inos[i], i, &errs[i] });
     for (handles) |hd| hd.join();
-    for (errs) |e| if (e) |err| return err;
+    for (errs, 0..) |e, i| if (e) |err| {
+        std.debug.print("§L: committer {d} failed: {s}\n", .{ i, @errorName(err) });
+        return err;
+    };
+    // Every window reached its terminal outcome: the ledger is final (the
+    // venue's threads are stopped by the defers).
     h.cv.quiesce();
-    device_stop.store(true, .release);
-    device_thread.join();
-    h.pass_stop.store(true, .release);
-    h.pass_wake.notifyOne(io);
-    pass_thread.join();
 
     const entries = st.written_entries.load() - ent0;
     const windows = st.written_windows.load() - win0;
     const pad = st.written_pad_bytes.load() - pad0;
     const device = st.written_device_bytes.load() - dev0;
-    try testing.expectEqual(@as(u64, n_committers * per_committer), entries);
+    // Every Δ landed as an entry (a structural entry — a leaf's compaction
+    // under the growing overlay — may ride beside them).
+    try testing.expect(entries >= n_committers * per_committer);
     try testing.expectEqual(acks0 + n_committers * per_committer, h.cv.stats.acks.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.refusals.load());
     try testing.expectEqual(@as(u64, 0), h.cv.stats.park_tick_rescues.load());
@@ -3579,7 +3618,7 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     const pair = windowCost(geo, n_committers / 2, s);
     // The expected pad over the run: the steady pairs at `1 − N·s/(2·g)`
     // plus the gate's learning period — it starts OFF and pays its first
-    // probe hold at the `HOLD_PROBE_PERIOD`th eligible window, so that
+    // probe burst at the `HOLD_PROBE_PERIOD`th eligible window, so that
     // many one-entry windows land unpaced first (the shape's ≈ 97.6 %).
     const steady_windows: u64 = 2 * per_committer;
     const probe_windows: u64 = HOLD_PROBE_PERIOD;

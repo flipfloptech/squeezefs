@@ -1328,6 +1328,13 @@ pub const VolatileImage = struct {
     image: []u8,
     base: u64,
     volatile_writes: std.ArrayList(Prior) = .empty,
+    /// The harness's device serializes its writers as a device would: the
+    /// threaded contracts land windows from a device thread while the pass
+    /// writes structural entries from its own (test-support code; the
+    /// product's device writes are the lane's and the io pool's). The
+    /// core's portable spin lock: an `Io` mutex needs an `Io` this image
+    /// never had.
+    lock: jc.SpinLock = .{},
 
     const Prior = struct { at: usize, bytes: []u8 };
 
@@ -1341,6 +1348,12 @@ pub const VolatileImage = struct {
     }
 
     pub fn write(self: *VolatileImage, offset: u64, bytes: []const u8) Allocator.Error!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.writeLocked(offset, bytes);
+    }
+
+    fn writeLocked(self: *VolatileImage, offset: u64, bytes: []const u8) Allocator.Error!void {
         const at: usize = @intCast(offset - self.base);
         const prior = try self.gpa.dupe(u8, self.image[at .. at + bytes.len]);
         errdefer self.gpa.free(prior);
@@ -1348,18 +1361,25 @@ pub const VolatileImage = struct {
         @memcpy(self.image[at .. at + bytes.len], bytes);
     }
 
+    /// One submission's ops, atomically against the other writers.
     pub fn writeOps(self: *VolatileImage, ops: []const WriteOp) Allocator.Error!void {
-        for (ops) |op| try self.write(op.offset, op.bytes);
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (ops) |op| try self.writeLocked(op.offset, op.bytes);
     }
 
     /// Everything written so far is durable.
     pub fn fdatasync(self: *VolatileImage) void {
+        self.lock.lock();
+        defer self.lock.unlock();
         for (self.volatile_writes.items) |p| self.gpa.free(p.bytes);
         self.volatile_writes.clearRetainingCapacity();
     }
 
     /// Restore every volatile write (newest first); answers the count.
     pub fn powerCut(self: *VolatileImage) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
         const n = self.volatile_writes.items.len;
         while (self.volatile_writes.pop()) |p| {
             @memcpy(self.image[p.at .. p.at + p.bytes.len], p.bytes);

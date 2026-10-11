@@ -1194,13 +1194,26 @@ pub const DataPlane = struct {
     }
 
     /// Stage the WHOLE payload under `key` (admission, placement, ledger);
-    /// the generation the layout record's publish is gated on.
-    pub fn stageImage(self: *DataPlane, key_: staging.StagingKey, image: []const u8) Error!u64 {
+    /// the generation the layout record's publish is gated on. `slack` =
+    /// `.append` when the write that stages it EXTENDS the image (§J.2: the
+    /// slot reserves a quarter of the image so the next appends land in
+    /// place).
+    pub fn stageImage(self: *DataPlane, key_: staging.StagingKey, image: []const u8, slack: staging.Slack) Error!u64 {
         const st = &(self.stage orelse return error.NotSupported);
-        const s = staging.stageWrite(&st.pool, &st.seg, key_, image, 1) catch |e| return switch (e) {
+        const s = staging.stageWrite(&st.pool, &st.seg, key_, image, 1, slack) catch |e| return switch (e) {
             error.StorageFull => error.NoSpaceLeft,
             error.OutOfMemory => error.OutOfMemory,
         };
+        return s.generation;
+    }
+
+    /// §J.2: an extending write lands IN PLACE in the resident record's
+    /// slack (`data` at value offset `at ≥ val_len`); the new generation, or
+    /// null when the caller must re-stage the whole image (no ring, no
+    /// resident copy, no slack for it).
+    pub fn appendStaged(self: *DataPlane, key_: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
+        const st = &(self.stage orelse return null);
+        const s = (staging.appendStaged(&st.pool, &st.seg, key_, at, data, 1) catch return error.OutOfMemory) orelse return null;
         return s.generation;
     }
 

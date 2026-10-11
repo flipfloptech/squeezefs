@@ -279,7 +279,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -1160,7 +1160,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     const got = try self.residentImage(ino, rec, buf);
                     const clipped = buf[0..@intCast(@min(size, got))];
                     const k = stagingKeyOf(ino, r.layout);
-                    _ = try self.data.stageImage(k, clipped);
+                    _ = try self.data.stageImage(k, clipped, .none);
                     try self.publish(t, ino, rec, Layout.staged(size, r.layout.file_id, null), &.{});
                     if (r.layout.durableCopy()) |m| after.push(0, m);
                     fuse_truncate_restages.inc();
@@ -1185,7 +1185,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     defer self.gpa.free(buf);
                     const got = try self.residentImage(ino, rec, buf);
                     const k = stagingKeyOf(ino, r.layout);
-                    _ = try self.data.stageImage(k, buf[0..@intCast(@min(size, got))]);
+                    _ = try self.data.stageImage(k, buf[0..@intCast(@min(size, got))], .none);
                     try self.publish(t, ino, rec, Layout.staged(size, r.layout.file_id, null), &.{});
                     after.push(0, m);
                     fuse_truncate_restages.inc();
@@ -2288,28 +2288,46 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return .{ .size = @intCast(data.len) };
         }
 
-        /// The staged arm: the whole payload image re-staged under the
-        /// file's identity (a fresh one for an inline/packed file), the
-        /// staged layout published; a displaced tenant freed after. Null ⇔
-        /// the ring refused the image (nothing recorded, nothing published):
-        /// the caller's own-block arm.
+        /// The staged arm (decision 0003 §J.2). An EXTENDING write (at or
+        /// past the end: O_APPEND, a sequential small write) into a file
+        /// whose ring record has slack lands IN PLACE — the appended bytes
+        /// into the slot, no image copied either way; otherwise the whole
+        /// payload image is re-staged under the file's identity (a fresh one
+        /// for an inline/packed file) with append slack when the write
+        /// extends. Then ONE tx: the staged layout (its size) and the
+        /// inode's Δ(size, mtime, ctime). A displaced tenant freed after.
+        /// Null ⇔ the ring refused the image (nothing recorded, nothing
+        /// published): the caller's own-block arm.
         fn writeStaged(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!?filesystem.Written {
             const data = try self.payloadBytes(a);
             const probe = try self.readInode(local);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
             const size = @max(probe.size, end);
-            const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(size)));
-            defer self.gpa.free(buf);
-            _ = try self.residentImage(local, rec, buf);
-            @memcpy(buf[@intCast(a.offset)..@intCast(end)], data);
-            const image = buf[0..@intCast(size)];
+            const extending = a.offset >= probe.size;
             const keep_identity = rec != null and rec.?.layout.kind == .staged;
             const file_id = if (keep_identity) rec.?.layout.file_id else self.data.mintFileId(local);
             const k = staging.StagingKey.init(file_id, local);
-            const generation = self.data.stageImage(k, image) catch |e| switch (e) {
-                error.NoSpaceLeft => return null,
-                else => |x| return x,
-            };
+            // The resident image's length is the file's size (the ring holds
+            // the whole payload), so an extending write appends at its offset.
+            var in_place = false;
+            var generation: u64 = 0;
+            if (extending and keep_identity) {
+                if (try self.data.appendStaged(k, a.offset, data)) |g| {
+                    generation = g;
+                    in_place = true;
+                }
+            }
+            if (!in_place) {
+                const buf = try self.gpa.alloc(u8, @intCast(layout.ceilGrain(size)));
+                defer self.gpa.free(buf);
+                _ = try self.residentImage(local, rec, buf);
+                @memcpy(buf[@intCast(a.offset)..@intCast(end)], data);
+                const image = buf[0..@intCast(size)];
+                generation = self.data.stageImage(k, image, if (extending) .append else .none) catch |e| switch (e) {
+                    error.NoSpaceLeft => return null,
+                    else => |x| return x,
+                };
+            }
             var after: AfterCommit = .{};
             if (!keep_identity) noteDisplaced(local, rec, &after);
             const t = try self.beginExclusive(local, @src());
@@ -2320,7 +2338,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try self.stageInodePostlude(t, local, &v, size, a.write_flags);
             t_owned = false;
             self.commit(c, t) catch |e| {
-                self.data.releaseStaged(k, generation);
+                // A whole image that will never be named leaves; an in-place
+                // append stays (the longer image is the file's, its tail
+                // past the durable size invisible).
+                if (!in_place) self.data.releaseStaged(k, generation);
                 return e;
             };
             self.dropLayoutLock(layout_lock);
@@ -2427,14 +2448,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return size;
         }
 
-        /// The inode's size claim + times + KILLPRIV_V2 in the write's tx.
+        /// The inode's size claim + times + KILLPRIV_V2 in the write's tx:
+        /// ONE Δ(size, mtime, ctime) record — the economy's shape (charter
+        /// §5.2; decision 0003 §J.2) — under the ino's exclusive guard, so
+        /// the Δs of one ino land in commit order and the fold's newest size
+        /// is the max; the mode strip (KILLPRIV) rewrites the record whole.
         fn stageInodePostlude(self: *Self, t: *tx.KvTx, local: u64, v: *InodeValue, size: u64, write_flags: u32) Error!void {
             const stamp = now();
             v.size = @max(v.size, size);
             v.mtime = stamp;
             if (economy.laterThan(stamp, v.ctime)) v.ctime = stamp;
-            if (write_flags & abi.FUSE_WRITE_KILL_SUIDGID != 0) try self.killpriv(t, local, v);
-            try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &v.encode());
+            if (write_flags & abi.FUSE_WRITE_KILL_SUIDGID != 0) {
+                try self.killpriv(t, local, v);
+                try t.stagePut(key.TREE_INODES, &key.inodeKey(local), &v.encode());
+                return;
+            }
+            try t.stageDelta(key.TREE_INODES, &key.inodeKey(local), .{ .mask = record.DELTA_SIZE | record.DELTA_TIMES, .fields = .{ .size = v.size, .mtime = v.mtime, .ctime = v.ctime } });
         }
 
         /// Nothing is deferred at the metadata plane: every write is a landed
@@ -2838,8 +2867,11 @@ pub const NoData = struct {
     pub fn mintFileId(_: *NoData, _: u64) layout.FileId {
         return layout.zero_file_id;
     }
-    pub fn stageImage(_: *NoData, _: staging.StagingKey, _: []const u8) Error!u64 {
+    pub fn stageImage(_: *NoData, _: staging.StagingKey, _: []const u8, _: staging.Slack) Error!u64 {
         return error.NotSupported;
+    }
+    pub fn appendStaged(_: *NoData, _: staging.StagingKey, _: u64, _: []const u8) Error!?u64 {
+        return null;
     }
     pub fn releaseStaged(_: *NoData, _: staging.StagingKey, _: ?u64) void {}
     pub fn stagedLease(_: *NoData, _: staging.StagingKey) ?staging.Segment.Lease {
@@ -3343,6 +3375,10 @@ const SettlingData = struct {
     stage_refuse: bool = false,
     staged_max: u64 = 0,
     staged_images: u32 = 0,
+    /// A REAL RAM ring behind the staged arm (the append law's test): the
+    /// segment, its pool, and the image they live over.
+    ring: ?*RamRing = null,
+
     /// The own-block promotions: the largest image DMA'd (≤ one block).
     own_block_max: u64 = 0,
     own_blocks: u32 = 0,
@@ -3355,6 +3391,30 @@ const SettlingData = struct {
     guards: ?*op_guard.Table = null,
     guard_nodeid: u64 = 0,
     shared_refused_at_flush: ?bool = null,
+
+    pub const RamRing = struct {
+        image: []u8,
+        seg: staging.Segment,
+        pool: staging.Pool,
+
+        fn init(cap: usize, pool_bytes: u64) !*RamRing {
+            const r = try testing.allocator.create(RamRing);
+            errdefer testing.allocator.destroy(r);
+            r.image = try testing.allocator.alloc(u8, cap);
+            errdefer testing.allocator.free(r.image);
+            @memset(r.image, 0);
+            r.seg = try staging.Segment.init(testing.allocator, r.image, .none);
+            r.pool = staging.Pool.init(testing.allocator, pool_bytes, .none);
+            return r;
+        }
+
+        fn deinit(self: *RamRing) void {
+            self.pool.deinit();
+            self.seg.deinit();
+            testing.allocator.free(self.image);
+            testing.allocator.destroy(self);
+        }
+    };
 
     pub const OwnBlock = NoData.OwnBlock;
     pub const Space = NoData.Space;
@@ -3469,16 +3529,36 @@ const SettlingData = struct {
     pub fn mintFileId(_: *SettlingData, _: u64) layout.FileId {
         return layout.zero_file_id;
     }
-    pub fn stageImage(self: *SettlingData, _: staging.StagingKey, image: []const u8) Error!u64 {
+    pub fn stageImage(self: *SettlingData, k: staging.StagingKey, image: []const u8, slack: staging.Slack) Error!u64 {
         if (!self.staging) return error.NotSupported;
         if (self.stage_refuse) return error.NoSpaceLeft;
         self.staged_images += 1;
         self.staged_max = @max(self.staged_max, image.len);
+        if (self.ring) |r| {
+            const s = staging.stageWrite(&r.pool, &r.seg, k, image, 1, slack) catch |e| return switch (e) {
+                error.StorageFull => error.NoSpaceLeft,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+            return s.generation;
+        }
         return self.staged_images;
     }
-    pub fn releaseStaged(_: *SettlingData, _: staging.StagingKey, _: ?u64) void {}
-    pub fn stagedLease(_: *SettlingData, _: staging.StagingKey) ?staging.Segment.Lease {
-        return null;
+    /// In place through the RAM ring when the test mounted one; without a
+    /// ring every staged write re-stages the whole image.
+    pub fn appendStaged(self: *SettlingData, k: staging.StagingKey, at: u64, data: []const u8) Error!?u64 {
+        const r = self.ring orelse return null;
+        const s = (staging.appendStaged(&r.pool, &r.seg, k, at, data, 1) catch return error.OutOfMemory) orelse return null;
+        return s.generation;
+    }
+    pub fn releaseStaged(self: *SettlingData, k: staging.StagingKey, generation: ?u64) void {
+        const r = self.ring orelse return;
+        if (generation) |g| {
+            _ = staging.releaseStaged(&r.pool, &r.seg, k, g);
+        } else if (r.seg.remove(k, null)) _ = r.pool.credit(k.file_id, null);
+    }
+    pub fn stagedLease(self: *SettlingData, k: staging.StagingKey) ?staging.Segment.Lease {
+        const r = self.ring orelse return null;
+        return r.seg.get(k);
     }
     pub fn readMappingImage(_: *SettlingData, _: Mapping, _: []u8) Error![]const u8 {
         return error.NotSupported;
@@ -3649,6 +3729,66 @@ test "the staged arm when the ring is FULL: the write takes the own-block arm in
     try testing.expectEqual(@as(?linux.E, null), h.write(k, 0, one_mib[0..8192], 0).errno());
     try testing.expectEqual(@as(u32, 2), h.data.staged_images);
     h.release(k);
+}
+
+test "the staged append law (repro-port: fstests generic/069 `append_writer` — 4-byte O_APPEND writes re-staged a 1–2 MiB image each, ≈ 3 ms and 2–4 MiB moved per append on c36b531): M small appends to a staged file land IN PLACE in the record's slack — ring bytes moved ≤ 11 × bytes appended (§J.2), ONE commit per append carrying a Δ(size, mtime, ctime), the image byte-exact, a re-stage only when the slack is exhausted" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    h.data.ring = try SettlingData.RamRing.init(64 << 20, 32 << 20);
+    defer h.data.ring.?.deinit();
+    const appends0 = staging.stats.staging_appends.load();
+    const abytes0 = staging.stats.staging_append_bytes.load();
+    const restages0 = staging.stats.staging_restages.load();
+    const rbytes0 = staging.stats.staging_restage_bytes.load();
+    // The file crosses the inline bound with its first write: staged from then on.
+    const f = try h.create(1, "log", 0o644);
+    const head: []u8 = try testing.allocator.alloc(u8, 6000);
+    defer testing.allocator.free(head);
+    @memset(head, 'H');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, head, 0).errno());
+    const commits0 = h.store.commits;
+    // M 4-byte appends at EOF (the integers append_writer writes).
+    const m: u32 = 3000;
+    var size: u64 = head.len;
+    var i: u32 = 0;
+    while (i < m) : (i += 1) {
+        const word = std.mem.toBytes(std.mem.nativeToLittle(u32, i));
+        try testing.expectEqual(@as(?linux.E, null), h.write(f, size, &word, 0).errno());
+        size += 4;
+    }
+    const appended: u64 = 4 * m;
+    const appends = staging.stats.staging_appends.load() - appends0;
+    const restages = staging.stats.staging_restages.load() - restages0;
+    const moved = (staging.stats.staging_append_bytes.load() - abytes0) + (staging.stats.staging_restage_bytes.load() - rbytes0);
+    // The law: moved ≤ 11 × appended; nearly every append in place (the
+    // re-stages are the slack exhaustions of the geometric chain).
+    try testing.expectEqual(@as(u64, m), appends + restages);
+    try testing.expect(restages <= 8);
+    try testing.expect(moved <= staging.STAGED_APPEND_MOVED_BOUND * appended);
+    // ONE commit per append (the Δ record; the conveyor is the RAM store here).
+    try testing.expectEqual(@as(u64, m), h.store.commits - commits0);
+    try testing.expectEqual(size, (try h.getattr(f)).size);
+    // The ring holds ONE record of the file (the image the reads serve),
+    // byte-exact: the head, then every integer in order; its layout names
+    // the size.
+    const rec = (try h.fs.readLayout(try H.Fs.localOf(f))).?;
+    defer h.fs.freeLayout(rec);
+    try testing.expectEqual(layout.Kind.staged, rec.layout.kind);
+    try testing.expectEqual(size, rec.layout.size);
+    const lease = h.data.ring.?.seg.get(staging.StagingKey.init(rec.layout.file_id, try H.Fs.localOf(f))).?;
+    defer lease.release();
+    const img = lease.bytes();
+    try testing.expectEqual(@as(usize, size), img.len);
+    try testing.expect(std.mem.allEqual(u8, img[0..head.len], 'H'));
+    i = 0;
+    while (i < m) : (i += 1) try testing.expectEqual(i, std.mem.readInt(u32, img[head.len + 4 * i ..][0..4], .little));
+    try testing.expectEqual(@as(usize, 1), h.data.ring.?.seg.live());
+    h.release(f);
 }
 
 test "POSIX: create → write → read → stat; an overlay write grows the file; a write past the inline bound on a volume-less set is EFBIG and counted; truncate clips, empties at 0 and zero-extends" {

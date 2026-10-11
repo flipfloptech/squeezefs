@@ -85,10 +85,20 @@ pub const stats = struct {
     pub var dismount_promote_failures: counters.ShardedCounter = .{};
     /// `fsync_promoted_files`: promotions the fsync lever dispatched.
     pub var fsync_promoted_files: counters.ShardedCounter = .{};
+    /// §J.2's ring ledger: `staging_appends` / `staging_append_bytes` — the
+    /// extending writes that landed IN PLACE (bytes moved = the bytes);
+    /// `staging_restages` / `staging_restage_bytes` — whole images re-staged
+    /// under a resident key (bytes moved = 2 × the image: out of the ring,
+    /// back in). `Σ ÷ appended ≤ STAGED_APPEND_MOVED_BOUND` on an append
+    /// stream.
+    pub var staging_appends: counters.ShardedCounter = .{};
+    pub var staging_append_bytes: counters.ShardedCounter = .{};
+    pub var staging_restages: counters.ShardedCounter = .{};
+    pub var staging_restage_bytes: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d}}}", .{
+    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
         stats.current_staged_write_bytes.load(),
         stats.staged_writes_in_flight.load(),
         stats.staging_over_cap_refusals.load(),
@@ -103,6 +113,10 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.dismount_promoted_bytes.load(),
         stats.dismount_promote_failures.load(),
         stats.fsync_promoted_files.load(),
+        stats.staging_appends.load(),
+        stats.staging_append_bytes.load(),
+        stats.staging_restages.load(),
+        stats.staging_restage_bytes.load(),
     });
 }
 
@@ -120,11 +134,33 @@ pub fn writePhasesJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 /// ASCII in disk order (0002 row 38).
 pub const SEGMENT_MAGIC = "SQZS".*;
-pub const SEGMENT_RECORD_VERSION: u16 = 1;
+/// v2: the record carries TWO header slots (A at the grain, B at
+/// `HEADER_B_OFF`) so an in-place append rewrites the slot that is NOT
+/// current and recovery takes the valid slot with the higher generation —
+/// a kill between any two stores leaves the old record intact (decision
+/// 0003 §J.2). A v1 record (one slot) is a torn record to this scan: the
+/// ring is a cache, wiped loud.
+pub const SEGMENT_RECORD_VERSION: u16 = 2;
 /// Records and their values sit on the LBA grain: the value is the zero-copy
 /// DMA source of a promotion (`O_DIRECT` refuses an unaligned buffer) and a
 /// header on the grain is what the recovery scan steps by.
 pub const RECORD_ALIGN: u64 = layout.GRAIN;
+/// Slot B's offset inside the record: past slot A and the 24 B key, on the
+/// next cache line.
+pub const HEADER_B_OFF: u64 = 64;
+
+pub const HeaderSlot = enum(u8) {
+    a,
+    b,
+
+    pub fn offset(self: HeaderSlot) u64 {
+        return if (self == .a) 0 else HEADER_B_OFF;
+    }
+
+    pub fn other(self: HeaderSlot) HeaderSlot {
+        return if (self == .a) .b else .a;
+    }
+};
 
 /// 40 B, little-endian; `xxh3` over header (field zeroed) ‖ key ‖ value.
 pub const SegmentRecordWire = extern struct {
@@ -168,6 +204,9 @@ comptime {
     assert(RECORD_HEADER_LEN == 40);
     assert(CHECKSUM_OFF == 32);
     assert(KEY_LEN == 24);
+    // Slot A ‖ key fit before slot B; slot B fits before the value.
+    assert(RECORD_HEADER_LEN + KEY_LEN <= HEADER_B_OFF);
+    assert(HEADER_B_OFF + RECORD_HEADER_LEN <= RECORD_ALIGN);
 }
 
 /// The value's offset inside a record: header + key rounded to the grain.
@@ -185,6 +224,37 @@ pub fn stride(key_len: u64, val_len: u64) u64 {
     return derive.alignUp(footprint(key_len, val_len), RECORD_ALIGN);
 }
 
+/// What a stage reserves beyond its footprint (§J.2).
+pub const Slack = enum {
+    /// A whole-image stage (nothing grows in place).
+    none,
+    /// The write EXTENDS the image (an append, a write at or past the end):
+    /// `max(GRAIN, V/4)` of slack so the next appends land in place.
+    append,
+};
+
+/// The append slack for an image of `val_len`: a quarter of the image, at
+/// least one grain. WHY a quarter: the pool's high-water already keeps a
+/// quarter of the ring free for the drain's lag, so the slack never exceeds
+/// what the ring has promised to hold; a re-stage at `V` moves `2V` and
+/// buys `V/4` of appends, so bytes moved per appended byte is bounded at
+/// `1 + 2(1 + ¼)/¼ = 11` over the geometric chain.
+pub fn appendSlack(val_len: u64) u64 {
+    return @max(RECORD_ALIGN, val_len / 4);
+}
+
+/// The slot a stage reserves: the stride, plus the slack rounded to the grain.
+pub fn reserveFor(key_len: u64, val_len: u64, slack: Slack) u64 {
+    return switch (slack) {
+        .none => stride(key_len, val_len),
+        .append => derive.alignUp(footprint(key_len, val_len) + appendSlack(val_len), RECORD_ALIGN),
+    };
+}
+
+/// §J.2's bound on ring bytes moved per appended byte (the tie test
+/// restates the chain): `1 + 2(1 + s)/s` at slack fraction `s = ¼`.
+pub const STAGED_APPEND_MOVED_BOUND: u64 = 11;
+
 pub const RecordHeader = struct {
     key_len: u32,
     val_len: u32,
@@ -197,24 +267,34 @@ pub const RecordHeader = struct {
     }
 };
 
-/// Write `header ‖ key ‖ zero pad ‖ value` at `rec_off` and stamp the
-/// checksum. The caller reserved `stride(key.len, value.len)` bytes.
+/// Write `header A ‖ key ‖ zero pad (slot B cleared) ‖ value` at `rec_off`
+/// and stamp the checksum. The caller reserved `≥ stride(key.len,
+/// value.len)` bytes.
 pub fn writeRecord(image: []u8, rec_off: u64, key: []const u8, value: []const u8, generation: u64, fencing: u64) void {
     const voff = valueOffset(key.len);
     assert(rec_off + voff + value.len <= image.len);
     assert(derive.isAligned(rec_off, RECORD_ALIGN));
-    var h: SegmentRecordWire = .{ .magic = SEGMENT_MAGIC, .version_le = undefined, .flags_le = .{ 0, 0 }, .key_len_le = undefined, .val_len_le = undefined, .generation_le = undefined, .fencing_le = undefined, .xxh3_le = @splat(0) };
-    std.mem.writeInt(u16, &h.version_le, SEGMENT_RECORD_VERSION, .little);
-    std.mem.writeInt(u32, &h.key_len_le, @intCast(key.len), .little);
-    std.mem.writeInt(u32, &h.val_len_le, @intCast(value.len), .little);
-    std.mem.writeInt(u64, &h.generation_le, generation, .little);
-    std.mem.writeInt(u64, &h.fencing_le, fencing, .little);
     const rec = image[@intCast(rec_off)..];
-    rec[0..RECORD_HEADER_LEN].* = std.mem.toBytes(h);
     @memcpy(rec[RECORD_HEADER_LEN..][0..key.len], key);
     @memset(rec[RECORD_HEADER_LEN + key.len .. @intCast(voff)], 0);
     @memcpy(rec[@intCast(voff)..][0..value.len], value);
-    std.mem.writeInt(u64, rec[CHECKSUM_OFF..][0..8], recordChecksum(rec[0..RECORD_HEADER_LEN], key, rec[@intCast(voff)..][0..value.len]), .little);
+    writeHeader(image, rec_off, .a, key, value.len, generation, fencing);
+}
+
+/// Write one header slot (the checksum over header ‖ key ‖ value[0..val_len]
+/// stamped last); the other slot is untouched.
+fn writeHeader(image: []u8, rec_off: u64, slot: HeaderSlot, key: []const u8, val_len: usize, generation: u64, fencing: u64) void {
+    const voff = valueOffset(key.len);
+    var h: SegmentRecordWire = .{ .magic = SEGMENT_MAGIC, .version_le = undefined, .flags_le = .{ 0, 0 }, .key_len_le = undefined, .val_len_le = undefined, .generation_le = undefined, .fencing_le = undefined, .xxh3_le = @splat(0) };
+    std.mem.writeInt(u16, &h.version_le, SEGMENT_RECORD_VERSION, .little);
+    std.mem.writeInt(u32, &h.key_len_le, @intCast(key.len), .little);
+    std.mem.writeInt(u32, &h.val_len_le, @intCast(val_len), .little);
+    std.mem.writeInt(u64, &h.generation_le, generation, .little);
+    std.mem.writeInt(u64, &h.fencing_le, fencing, .little);
+    const rec = image[@intCast(rec_off)..];
+    const hdr = rec[@intCast(slot.offset())..][0..RECORD_HEADER_LEN];
+    hdr.* = std.mem.toBytes(h);
+    std.mem.writeInt(u64, hdr[CHECKSUM_OFF..][0..8], recordChecksum(hdr, key, rec[@intCast(voff)..][0..val_len]), .little);
 }
 
 fn recordChecksum(header: []const u8, key: []const u8, value: []const u8) u64 {
@@ -227,11 +307,17 @@ fn recordChecksum(header: []const u8, key: []const u8, value: []const u8) u64 {
     return h.final();
 }
 
-/// Parse the header at `rec_off`: magic, version, zero flags, a geometry
-/// that fits the image. Null = no record starts here.
+/// Parse slot A's header at `rec_off`: magic, version, zero flags, a
+/// geometry that fits the image. Null = no record starts here.
 pub fn readHeader(image: []const u8, rec_off: u64) ?RecordHeader {
-    if (rec_off + RECORD_HEADER_LEN > image.len) return null;
-    const h = std.mem.bytesToValue(SegmentRecordWire, image[@intCast(rec_off)..][0..RECORD_HEADER_LEN]);
+    return readHeaderAt(image, rec_off, .a);
+}
+
+/// Parse one header slot of the record at `rec_off`.
+pub fn readHeaderAt(image: []const u8, rec_off: u64, slot: HeaderSlot) ?RecordHeader {
+    const hoff = rec_off + slot.offset();
+    if (hoff + RECORD_HEADER_LEN > image.len) return null;
+    const h = std.mem.bytesToValue(SegmentRecordWire, image[@intCast(hoff)..][0..RECORD_HEADER_LEN]);
     if (!std.mem.eql(u8, &h.magic, &SEGMENT_MAGIC)) return null;
     if (std.mem.readInt(u16, &h.version_le, .little) != SEGMENT_RECORD_VERSION) return null;
     if (std.mem.readInt(u16, &h.flags_le, .little) != 0) return null;
@@ -242,15 +328,36 @@ pub fn readHeader(image: []const u8, rec_off: u64) ?RecordHeader {
         .fencing = std.mem.readInt(u64, &h.fencing_le, .little),
         .xxh3 = std.mem.readInt(u64, &h.xxh3_le, .little),
     };
+    if (RECORD_HEADER_LEN + r.key_len > HEADER_B_OFF) return null;
     if (rec_off + r.footprintBytes() > image.len) return null;
     return r;
 }
 
-/// Does the record at `rec_off` carry the checksum its bytes compute?
+/// Does the record at `rec_off` carry the checksum its bytes compute (slot A)?
 pub fn verifyRecord(image: []const u8, rec_off: u64, h: RecordHeader) bool {
+    return verifyRecordAt(image, rec_off, h, .a);
+}
+
+pub fn verifyRecordAt(image: []const u8, rec_off: u64, h: RecordHeader, slot: HeaderSlot) bool {
     const rec = image[@intCast(rec_off)..];
     const voff: usize = @intCast(valueOffset(h.key_len));
-    return h.xxh3 == recordChecksum(rec[0..RECORD_HEADER_LEN], rec[RECORD_HEADER_LEN..][0..h.key_len], rec[voff..][0..h.val_len]);
+    const hdr = rec[@intCast(slot.offset())..][0..RECORD_HEADER_LEN];
+    return h.xxh3 == recordChecksum(hdr, rec[RECORD_HEADER_LEN..][0..h.key_len], rec[voff..][0..h.val_len]);
+}
+
+pub const CurrentHeader = struct { h: RecordHeader, slot: HeaderSlot };
+
+/// The record's CURRENT header: of the slots that verify, the one with the
+/// higher generation (an append writes the alternate slot last; a kill
+/// mid-write leaves the other intact). Null = no valid header here.
+pub fn currentHeader(image: []const u8, rec_off: u64) ?CurrentHeader {
+    var best: ?CurrentHeader = null;
+    inline for (.{ HeaderSlot.a, HeaderSlot.b }) |slot| {
+        if (readHeaderAt(image, rec_off, slot)) |h| {
+            if (verifyRecordAt(image, rec_off, h, slot) and (best == null or h.generation > best.?.h.generation)) best = .{ .h = h, .slot = slot };
+        }
+    }
+    return best;
 }
 
 /// Whether the record header at `rec_off` reads as a tombstone (magic
@@ -289,23 +396,37 @@ pub const Extent = struct {
     key_len: u32,
     val_len: u32,
     generation: u64,
+    /// The slot's length: `≥ stride(key_len, val_len)`; the slack past the
+    /// stride is what an in-place append grows into. Recovery sets the
+    /// stride (the slack is RAM-only knowledge).
+    reserved: u64,
+    /// The header slot that is current.
+    slot: HeaderSlot = .a,
 
     pub fn valOff(self: Extent) u64 {
         return self.rec_off + valueOffset(self.key_len);
     }
 
     pub fn end(self: Extent) u64 {
-        return self.rec_off + stride(self.key_len, self.val_len);
+        return self.rec_off + self.reserved;
+    }
+
+    /// Bytes the value can grow to in place.
+    pub fn valueCapacity(self: Extent) u64 {
+        return self.reserved - valueOffset(self.key_len);
     }
 };
 
 /// One live entry's cell: readers hold references; the index holds one.
 /// The LAST reference out reclaims a retired cell's bytes — so a same-key
 /// replace never destroys the copy a reader is inside, and a reader never
-/// sees a torn record (one intact copy at every instant).
+/// sees a torn record (one intact copy at every instant). A cell SHADOWED
+/// by an in-place append shares its bytes with its successor: the last
+/// reference frees the cell alone, never the record.
 const Cell = struct {
     refs: std.atomic.Value(u32) = .init(0),
     retired: std.atomic.Value(bool) = .init(false),
+    shadowed: bool = false,
     extent: Extent = undefined,
     key: [KEY_LEN]u8 = undefined,
 };
@@ -315,6 +436,16 @@ pub const PutError = error{
     /// durable spill); counted.
     RingFull,
     OutOfMemory,
+};
+
+pub const AppendError = error{
+    /// No resident copy under the key.
+    NotResident,
+    /// The resident copy's generation is not the one the caller read.
+    Stale,
+    /// The write does not extend the image, or the slack cannot hold it:
+    /// the caller re-stages the whole image.
+    NoRoom,
 };
 
 pub const Segment = struct {
@@ -428,8 +559,9 @@ pub const Segment = struct {
     /// retire the superseded copy. A same-key replace is ATOMIC for
     /// readers and torn-write immune (a crash between the phases leaves two
     /// copies; recovery dedups by generation).
-    pub fn put(self: *Segment, key: StagingKey, value: []const u8, generation: u64, fencing: u64) PutError!void {
-        const need = stride(KEY_LEN, value.len);
+    pub fn put(self: *Segment, key: StagingKey, value: []const u8, generation: u64, fencing: u64, reserve: u64) PutError!void {
+        const need = @max(reserve, stride(KEY_LEN, value.len));
+        assert(derive.isAligned(need, RECORD_ALIGN));
         if (need > self.image.len) {
             stats.staging_ring_full_refusals.inc();
             return error.RingFull;
@@ -441,7 +573,7 @@ pub const Segment = struct {
                 stats.staging_ring_full_refusals.inc();
                 return error.RingFull;
             };
-            const e: Extent = .{ .rec_off = rec_off, .key_len = KEY_LEN, .val_len = @intCast(value.len), .generation = generation };
+            const e: Extent = .{ .rec_off = rec_off, .key_len = KEY_LEN, .val_len = @intCast(value.len), .generation = generation, .reserved = need };
             self.pending.appendAssumeCapacity(e);
             self.write_offset = e.end();
             if (self.write_offset >= self.image.len) self.write_offset = 0;
@@ -449,7 +581,7 @@ pub const Segment = struct {
         };
         stats.staged_writes_in_flight.add(1);
         writeRecord(self.image, placed.rec_off, key.bytes(), value, generation, fencing);
-        if (self.backing.sync) |s| s(self.backing.ctx, placed.rec_off, need);
+        if (self.backing.sync) |s| s(self.backing.ctx, placed.rec_off, stride(KEY_LEN, value.len));
         self.lock.lock();
         defer self.lock.unlock();
         self.dropPendingLocked(placed.rec_off);
@@ -466,6 +598,65 @@ pub const Segment = struct {
         stats.staged_writes_in_flight.sub(1);
     }
 
+    /// §J.2: grow the resident record under `key` IN PLACE — `data` lands at
+    /// value offset `at ≥ val_len` (the gap zero-filled), inside the slot's
+    /// reserved slack — then the record's header is rewritten into the slot
+    /// that is NOT current with the new length, `generation` and checksum.
+    /// The old slot stays intact and valid for the old length until the
+    /// new one is complete, so a kill between any two stores leaves the old
+    /// record to recovery; the RAM cell is REPLACED (a reader's lease on the
+    /// old cell keeps seeing the old length), the old one shadowed. The
+    /// caller serializes writers per key (the ino's layout lock).
+    pub fn appendInPlace(self: *Segment, key: StagingKey, at: u64, data: []const u8, expect_generation: u64, generation: u64, fencing: u64) AppendError!void {
+        assert(data.len != 0);
+        // Phase 1: validate under the lock and hold a lease across the write.
+        const old: *Cell, const ext: Extent = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const cell = self.index.get(key.bytes().*) orelse return error.NotResident;
+            const e = cell.extent;
+            if (e.generation != expect_generation) return error.Stale;
+            if (at < e.val_len or at + data.len > e.valueCapacity()) return error.NoRoom;
+            _ = cell.refs.fetchAdd(1, .monotonic);
+            break :blk .{ cell, e };
+        };
+        const voff: usize = @intCast(ext.valOff());
+        const new_len: usize = @intCast(at + data.len);
+        // The gap and the bytes, beyond the old length (the old checksum
+        // still verifies over [0, val_len)).
+        @memset(self.image[voff + ext.val_len .. voff + @as(usize, @intCast(at))], 0);
+        @memcpy(self.image[voff + @as(usize, @intCast(at)) ..][0..data.len], data);
+        const slot = ext.slot.other();
+        writeHeader(self.image, ext.rec_off, slot, key.bytes(), new_len, generation, fencing);
+        if (self.backing.sync) |s| {
+            s(self.backing.ctx, ext.rec_off, RECORD_ALIGN);
+            const tail_lo = derive.alignDown(ext.valOff() + ext.val_len, RECORD_ALIGN);
+            const tail_hi = derive.alignUp(ext.valOff() + new_len, RECORD_ALIGN);
+            s(self.backing.ctx, tail_lo, tail_hi - tail_lo);
+        }
+        // Phase 2: the RAM flip.
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (old.retired.load(.acquire)) {
+            // Unlinked or promoted meanwhile: the bytes we grew belong to a
+            // record that is gone; drop the lease (the last one reclaims).
+            if (old.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(old);
+            return error.Stale;
+        }
+        const cell = self.allocCellLocked();
+        var ne = ext;
+        ne.val_len = @intCast(new_len);
+        ne.generation = generation;
+        ne.slot = slot;
+        cell.* = .{ .refs = .init(1), .extent = ne, .key = key.bytes().* };
+        self.index.putAssumeCapacity(key.bytes().*, cell);
+        old.shadowed = true;
+        old.retired.store(true, .release);
+        // The index's reference and our lease leave; the last one out frees
+        // the cell alone (shadowed: the record lives on under the successor).
+        if (old.refs.fetchSub(2, .acq_rel) == 2) self.reclaimCellLocked(old);
+    }
+
     /// Remove `key` iff present (and, when `expect_generation` is given,
     /// iff the resident copy carries it — the promotion's generation gate:
     /// a re-stage that landed since keeps its entry). True iff removed.
@@ -480,13 +671,18 @@ pub const Segment = struct {
     }
 
     fn retireLocked(self: *Segment, cell: *Cell) void {
-        // Tombstone the magic so a recovery scan never adopts the dead copy,
-        // then let the last reference reclaim the bytes. release pairs with
-        // `Lease.release`'s acq_rel.
-        @memset(self.image[@intCast(cell.extent.rec_off)..][0..4], 0);
+        // Tombstone BOTH slots' magic so a recovery scan never adopts the
+        // dead copy, then let the last reference reclaim the bytes. release
+        // pairs with `Lease.release`'s acq_rel.
+        self.tombstone(cell.extent.rec_off);
         if (self.backing.sync) |s| s(self.backing.ctx, cell.extent.rec_off, RECORD_ALIGN);
         cell.retired.store(true, .release);
         if (cell.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(cell);
+    }
+
+    fn tombstone(self: *Segment, rec_off: u64) void {
+        @memset(self.image[@intCast(rec_off)..][0..4], 0);
+        @memset(self.image[@intCast(rec_off + HEADER_B_OFF)..][0..4], 0);
     }
 
     fn reclaimCell(self: *Segment, cell: *Cell) void {
@@ -497,7 +693,8 @@ pub const Segment = struct {
 
     fn reclaimCellLocked(self: *Segment, cell: *Cell) void {
         const e = cell.extent;
-        if (self.backing.reclaim) |r| r(self.backing.ctx, e.rec_off, e.end() - e.rec_off);
+        // A shadowed cell's bytes live on under its successor: free the cell alone.
+        if (!cell.shadowed) if (self.backing.reclaim) |r| r(self.backing.ctx, e.rec_off, e.end() - e.rec_off);
         cell.* = .{};
         const idx: usize = (@intFromPtr(cell) - @intFromPtr(self.cells.ptr)) / @sizeOf(Cell);
         self.free_cells.appendAssumeCapacity(@intCast(idx));
@@ -601,17 +798,23 @@ pub const Segment = struct {
                 off = @max(off, data - data % RECORD_ALIGN);
                 if (off + RECORD_HEADER_LEN > self.image.len) break;
             }
-            const h = readHeader(self.image, off) orelse {
-                if (!isTombstone(self.image, off) and std.mem.eql(u8, self.image[@intCast(off)..][0..4], &SEGMENT_MAGIC)) rep.torn += 1;
+            // A magic in either slot names a candidate record; the current
+            // header is the valid slot with the higher generation (an
+            // append's half-written alternate slot loses to the intact one).
+            const magic_a = std.mem.eql(u8, self.image[@intCast(off)..][0..4], &SEGMENT_MAGIC);
+            const magic_b = off + HEADER_B_OFF + 4 <= self.image.len and std.mem.eql(u8, self.image[@intCast(off + HEADER_B_OFF)..][0..4], &SEGMENT_MAGIC);
+            const cur = currentHeader(self.image, off) orelse {
+                if (magic_a or magic_b) rep.torn += 1;
                 off += RECORD_ALIGN;
                 continue;
             };
-            if (h.key_len != KEY_LEN or !verifyRecord(self.image, off, h)) {
+            const h = cur.h;
+            if (h.key_len != KEY_LEN) {
                 rep.torn += 1;
                 off += RECORD_ALIGN;
                 continue;
             }
-            const e: Extent = .{ .rec_off = off, .key_len = h.key_len, .val_len = h.val_len, .generation = h.generation };
+            const e: Extent = .{ .rec_off = off, .key_len = h.key_len, .val_len = h.val_len, .generation = h.generation, .reserved = stride(h.key_len, h.val_len), .slot = cur.slot };
             const k: [KEY_LEN]u8 = self.image[@intCast(off + RECORD_HEADER_LEN)..][0..KEY_LEN].*;
             const gop = self.index.getOrPutAssumeCapacity(k);
             if (gop.found_existing) {
@@ -622,7 +825,7 @@ pub const Segment = struct {
                     gop.value_ptr.*.* = .{ .refs = .init(1), .extent = e, .key = k };
                     self.retireLocked(old);
                 } else {
-                    @memset(self.image[@intCast(off)..][0..4], 0);
+                    self.tombstone(off);
                     if (self.backing.reclaim) |r| r(self.backing.ctx, off, e.end() - off);
                 }
                 rep.superseded += 1;
@@ -826,16 +1029,17 @@ pub const Pool = struct {
 /// escalation — never a byte recorded that the pool cannot hold); place
 /// (two-phase, never destroying a live entry); ledger row `(cost,
 /// generation)`; past the high-water enqueue the entry to the merge worker.
-pub fn stageWrite(pool: *Pool, seg: *Segment, key: StagingKey, payload: []const u8, fencing: u64) StageError!Staged {
-    const padded = stride(KEY_LEN, payload.len);
-    const prior = pool.costOf(key.file_id) orelse 0;
+pub fn stageWrite(pool: *Pool, seg: *Segment, key: StagingKey, payload: []const u8, fencing: u64, slack: Slack) StageError!Staged {
+    const padded = reserveFor(KEY_LEN, payload.len, slack);
+    const prior_row = pool.costOf(key.file_id);
+    const prior = prior_row orelse 0;
     if (pool.overCap(prior, padded)) {
         stats.staging_over_cap_refusals.inc();
         if (pool.hooks.pressure) |p| p(pool.hooks.ctx, key);
         return error.StorageFull;
     }
     const generation = pool.nextGeneration();
-    seg.put(key, payload, generation, fencing) catch |e| switch (e) {
+    seg.put(key, payload, generation, fencing, padded) catch |e| switch (e) {
         error.RingFull => {
             if (!pool.ring_full_episode.swap(true, .acq_rel)) log.warn("staging ring full: a {d} B record found no hole in a {d} B segment with {d} live entries — the write takes its own-block arm until the ring drains (counted staging_ring_full_refusals; never destroying a live entry)", .{ padded, seg.capacity(), seg.live() });
             return error.StorageFull;
@@ -843,6 +1047,12 @@ pub fn stageWrite(pool: *Pool, seg: *Segment, key: StagingKey, payload: []const 
         error.OutOfMemory => return error.OutOfMemory,
     };
     pool.ring_full_episode.store(false, .release);
+    if (prior_row != null) {
+        // A re-stage under a resident key moved the image out of the ring
+        // (the caller's RMW source) and back in.
+        stats.staging_restages.inc();
+        stats.staging_restage_bytes.add(2 * payload.len);
+    }
     try pool.charge(key.file_id, padded, generation);
     var kicked = false;
     if (pool.currentBytes() > pool.highWater()) {
@@ -853,6 +1063,25 @@ pub fn stageWrite(pool: *Pool, seg: *Segment, key: StagingKey, payload: []const 
         }
     }
     return .{ .generation = generation, .kicked = kicked };
+}
+
+/// §J.2: an extending write into the resident record's slack, in place —
+/// a fresh generation (the promotion's identity probe sees the change), the
+/// ledger row re-stamped at the same cost. `null` = not in place (no
+/// resident copy, no slack for it, or the copy moved under the caller): the
+/// caller re-stages the whole image. Never kicks the drain: the ring's
+/// footprint did not grow.
+pub fn appendStaged(pool: *Pool, seg: *Segment, key: StagingKey, at: u64, data: []const u8, fencing: u64) Allocator.Error!?Staged {
+    const resident = pool.generationOf(key.file_id) orelse return null;
+    const generation = pool.nextGeneration();
+    seg.appendInPlace(key, at, data, resident, generation, fencing) catch |e| switch (e) {
+        error.NotResident, error.Stale, error.NoRoom => return null,
+    };
+    const cost = pool.costOf(key.file_id) orelse 0;
+    try pool.charge(key.file_id, cost, generation);
+    stats.staging_appends.inc();
+    stats.staging_append_bytes.add(data.len);
+    return .{ .generation = generation, .kicked = false };
 }
 
 /// The promotion released the ring entry (generation-gated: a re-stage that
@@ -1341,18 +1570,44 @@ fn ramSegment(gpa: Allocator, cap: usize) !struct { image: []u8, seg: Segment } 
     return .{ .image = image, .seg = try Segment.init(gpa, image, .none) };
 }
 
-test "segment record: 40 B header {SQZS, version, flags 0, key_len, val_len, generation, fencing, xxh3} ‖ key ‖ pad to 4 KiB ‖ value; the checksum covers header+key+value; a flipped payload byte is torn" {
+test "segment record v2: 40 B header {SQZS, version 2, flags 0, key_len, val_len, generation, fencing, xxh3} ‖ key ‖ (slot B cleared) pad to 4 KiB ‖ value; the checksum covers header+key+value; a flipped payload byte is torn; the append slack reserves a quarter of the image (one grain at least) — §J.2's chain bound is 11" {
     try testing.expectEqual(@as(u64, 4096), valueOffset(KEY_LEN));
     try testing.expectEqual(@as(u64, 4096 + 100), footprint(KEY_LEN, 100));
     try testing.expectEqual(@as(u64, 8192), stride(KEY_LEN, 100));
     try testing.expectEqual(@as(u64, 8192), stride(KEY_LEN, 4096));
     try testing.expectEqual(@as(u64, 12288), stride(KEY_LEN, 4097));
+    // The slack law (tie): max(GRAIN, V/4); the reserve is the footprint +
+    // slack on the grain.
+    try testing.expectEqual(@as(u64, 4096), appendSlack(100));
+    try testing.expectEqual(@as(u64, 4096), appendSlack(16384));
+    try testing.expectEqual(@as(u64, 1 << 20), appendSlack(4 << 20));
+    try testing.expectEqual(@as(u64, 8192), reserveFor(KEY_LEN, 100, .none));
+    try testing.expectEqual(@as(u64, 12288), reserveFor(KEY_LEN, 100, .append));
+    try testing.expectEqual(@as(u64, 4096 + (4 << 20) + (1 << 20)), reserveFor(KEY_LEN, 4 << 20, .append));
+    // The chain (tie, §J.2): re-stages at V, 1.25V, … each move 2V and buy
+    // V/4 of appends; over the chain from 4 KiB to 4 MiB bytes moved ÷
+    // appended stays under the bound, and the bound is `1 + 2(1 + ¼)/¼`.
+    var v_img: u64 = 4096;
+    var moved: u64 = 0;
+    var appended: u64 = 0;
+    while (v_img < (4 << 20)) {
+        const slack = appendSlack(v_img);
+        appended += slack; // in place, one byte moved per byte
+        moved += slack;
+        v_img += slack;
+        moved += 2 * v_img; // the re-stage when the slack is exhausted
+    }
+    try testing.expect(moved <= STAGED_APPEND_MOVED_BOUND * appended);
+    try testing.expect(moved > (STAGED_APPEND_MOVED_BOUND - 2) * appended); // the bound is tight, not slack
+    try testing.expectEqual(@as(u64, 1 + 2 * (4 + 1)), STAGED_APPEND_MOVED_BOUND);
     var image: [16384]u8 = @splat(0xEE);
     const k = tkey(1, 77);
     const v: [100]u8 = @splat(0x5A);
     writeRecord(&image, 4096, k.bytes(), &v, 9, 0xF0F0);
     try testing.expectEqualSlices(u8, "SQZS", image[4096..4100]);
-    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0 }, image[4100..4104]);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, image[4100..4104]);
+    try testing.expect(readHeaderAt(&image, 4096, .b) == null); // slot B cleared at the put
+    try testing.expectEqual(HeaderSlot.a, currentHeader(&image, 4096).?.slot);
     try testing.expectEqualSlices(u8, &.{ 24, 0, 0, 0, 100, 0, 0, 0 }, image[4104..4112]);
     try testing.expectEqualSlices(u8, &.{ 9, 0, 0, 0, 0, 0, 0, 0 }, image[4112..4120]);
     try testing.expectEqualSlices(u8, &.{ 0xF0, 0xF0, 0, 0, 0, 0, 0, 0 }, image[4120..4128]);
@@ -1393,13 +1648,13 @@ test "two-phase replace: the old copy stays live until the replacement is placed
     const k = tkey(7, 42);
     const a: [5000]u8 = @splat('a');
     const b: [3000]u8 = @splat('b');
-    try r.seg.put(k, &a, 1, 0);
+    try r.seg.put(k, &a, 1, 0, 0);
     try testing.expectEqual(@as(usize, 1), r.seg.live());
     try testing.expectEqual(@as(?u64, 1), r.seg.residentGeneration(k));
     const lease = r.seg.get(k).?;
     try testing.expectEqualSlices(u8, &a, lease.bytes());
     // Replace while the lease is held: the index flips, the old bytes stay.
-    try r.seg.put(k, &b, 2, 0);
+    try r.seg.put(k, &b, 2, 0, 0);
     try testing.expectEqualSlices(u8, &a, lease.bytes());
     try testing.expect(lease.cell.retired.load(.acquire));
     try testing.expectEqual(@as(?u64, 2), r.seg.residentGeneration(k));
@@ -1426,6 +1681,112 @@ test "two-phase replace: the old copy stays live until the replacement is placed
     try testing.expect(!r.seg.remove(k, null));
 }
 
+test "in-place append (§J.2): the appended bytes land in the reserved slack and the ALTERNATE header slot carries the new length/generation/checksum (A, B, A, …); a reader's lease across the append keeps the old length; a stale generation, a non-extending write and an exhausted slack refuse (the caller re-stages); recovery takes the valid slot with the higher generation and a torn alternate slot leaves the old record intact; a removed record's both slots are tombstoned; the pool's ledger re-stamps the generation at the same cost" {
+    const gpa = testing.allocator;
+    var r = try ramSegment(gpa, 64 * 4096);
+    defer gpa.free(r.image);
+    var seg = r.seg;
+    const k = tkey(3, 33);
+    const v: [5000]u8 = @splat('v');
+    // Reserved with append slack: 4096 + 5000 + max(4096, 1250) → 16384 (capacity 12288).
+    try seg.put(k, &v, 1, 0, reserveFor(KEY_LEN, v.len, .append));
+    const l0 = seg.get(k).?;
+    try testing.expectEqual(@as(u64, 16384), l0.cell.extent.reserved);
+    try testing.expectEqual(HeaderSlot.a, l0.cell.extent.slot);
+    // Append 100 bytes at the end: slot B becomes current; the old lease still sees 5000.
+    const a1: [100]u8 = @splat('1');
+    try seg.appendInPlace(k, 5000, &a1, 1, 2, 0);
+    try testing.expectEqual(@as(usize, 5000), l0.bytes().len);
+    try testing.expect(l0.cell.retired.load(.acquire) and l0.cell.shadowed);
+    const l1 = seg.get(k).?;
+    try testing.expectEqual(@as(usize, 5100), l1.bytes().len);
+    try testing.expectEqual(@as(u64, 2), l1.generation());
+    try testing.expectEqual(HeaderSlot.b, l1.cell.extent.slot);
+    try testing.expectEqualSlices(u8, &a1, l1.bytes()[5000..5100]);
+    try testing.expect(std.mem.allEqual(u8, l1.bytes()[0..5000], 'v'));
+    try testing.expectEqual(l0.cell.extent.rec_off, l1.cell.extent.rec_off); // in place
+    try testing.expectEqual(@as(usize, 1), seg.live());
+    // The old cell frees alone when its lease leaves (no tombstone: both slots still name the record).
+    const rec_off = l1.cell.extent.rec_off;
+    l0.release();
+    try testing.expect(currentHeader(r.image, rec_off) != null);
+    try testing.expectEqual(HeaderSlot.b, currentHeader(r.image, rec_off).?.slot);
+    // A gap append (at past the end) zero-fills; the slot alternates back to A.
+    const a2: [8]u8 = @splat('2');
+    try seg.appendInPlace(k, 5200, &a2, 2, 3, 0);
+    const l2 = seg.get(k).?;
+    try testing.expectEqual(@as(usize, 5208), l2.bytes().len);
+    try testing.expect(std.mem.allEqual(u8, l2.bytes()[5100..5200], 0));
+    try testing.expectEqualSlices(u8, &a2, l2.bytes()[5200..]);
+    try testing.expectEqual(HeaderSlot.a, l2.cell.extent.slot);
+    l1.release();
+    // Refusals: a stale generation; a write inside the image; past the slack.
+    try testing.expectError(error.Stale, seg.appendInPlace(k, 5208, &a2, 2, 4, 0));
+    try testing.expectError(error.NoRoom, seg.appendInPlace(k, 100, &a2, 3, 4, 0));
+    const big: [8000]u8 = @splat('b');
+    try testing.expectError(error.NoRoom, seg.appendInPlace(k, 5208, &big, 3, 4, 0));
+    try testing.expectError(error.NotResident, seg.appendInPlace(tkey(9, 9), 0, &a2, 1, 4, 0));
+    try testing.expectEqual(@as(usize, 5208), l2.bytes().len); // nothing of a refusal landed
+    try testing.expectEqual(@as(u64, 3), seg.residentGeneration(k).?);
+    l2.release();
+    // Recovery over the image: the higher-generation slot (A, gen 3) wins at the appended length.
+    var ext: [8]Extent = undefined;
+    _ = seg.liveExtents(&ext);
+    seg.deinit();
+    var fresh = try Segment.init(gpa, r.image, .none);
+    const rep = fresh.recover();
+    try testing.expectEqual(@as(u64, 1), rep.adopted);
+    try testing.expectEqual(@as(u64, 0), rep.torn);
+    const lr = fresh.get(k).?;
+    try testing.expectEqual(@as(usize, 5208), lr.bytes().len);
+    try testing.expectEqual(@as(u64, 3), lr.generation());
+    try testing.expectEqual(stride(KEY_LEN, 5208), lr.cell.extent.reserved); // the slack is RAM-only knowledge
+    lr.release();
+    fresh.deinit();
+    // A kill mid-append: the alternate slot (B, gen 4) half-written — a bad
+    // checksum — loses to the intact A; the old length stands, nothing torn
+    // is adopted, the record is NOT counted torn (one slot verifies).
+    writeHeader(r.image, rec_off, .b, k.bytes(), 5300, 4, 0);
+    r.image[@intCast(rec_off + HEADER_B_OFF + CHECKSUM_OFF)] ^= 0xFF;
+    var again = try Segment.init(gpa, r.image, .none);
+    const rep2 = again.recover();
+    try testing.expectEqual(@as(u64, 1), rep2.adopted);
+    try testing.expectEqual(@as(u64, 0), rep2.torn);
+    const la = again.get(k).?;
+    try testing.expectEqual(@as(usize, 5208), la.bytes().len);
+    try testing.expectEqual(@as(u64, 3), la.generation());
+    la.release();
+    // Remove: both slots' magic zeroed; a rescan adopts nothing.
+    try testing.expect(again.remove(k, 3));
+    try testing.expect(isTombstone(r.image, rec_off));
+    try testing.expect(std.mem.allEqual(u8, r.image[@intCast(rec_off + HEADER_B_OFF)..][0..4], 0));
+    again.deinit();
+    var third = try Segment.init(gpa, r.image, .none);
+    defer third.deinit();
+    try testing.expectEqual(@as(u64, 0), third.recover().adopted);
+    // The pool face: appendStaged re-stamps the ledger's generation at the
+    // same cost, counts the append; a missing row is null.
+    var pool = Pool.init(gpa, 1 << 20, .none);
+    defer pool.deinit();
+    const s1 = try stageWrite(&pool, &third, k, &v, 0, .append);
+    const cost = pool.costOf(k.file_id).?;
+    const ap0 = stats.staging_appends.load();
+    const ab0 = stats.staging_append_bytes.load();
+    const s2 = (try appendStaged(&pool, &third, k, 5000, &a1, 0)).?;
+    try testing.expect(s2.generation > s1.generation);
+    try testing.expectEqual(s2.generation, pool.generationOf(k.file_id).?);
+    try testing.expectEqual(cost, pool.costOf(k.file_id).?);
+    try testing.expectEqual(ap0 + 1, stats.staging_appends.load());
+    try testing.expectEqual(ab0 + 100, stats.staging_append_bytes.load());
+    try testing.expect((try appendStaged(&pool, &third, tkey(8, 8), 0, &a1, 0)) == null);
+    // A re-stage under the resident key counts 2 × the image moved.
+    const rs0 = stats.staging_restages.load();
+    const rb0 = stats.staging_restage_bytes.load();
+    _ = try stageWrite(&pool, &third, k, &v, 0, .none);
+    try testing.expectEqual(rs0 + 1, stats.staging_restages.load());
+    try testing.expectEqual(rb0 + 2 * v.len, stats.staging_restage_bytes.load());
+}
+
 test "placement never overlaps and reuses punched holes first-fit; a record that fits nowhere is a loud RingFull that destroys nothing" {
     const gpa = testing.allocator;
     var r = try ramSegment(gpa, 32 * 4096);
@@ -1440,7 +1801,7 @@ test "placement never overlaps and reuses punched holes first-fit; a record that
         const v = try gpa.alloc(u8, s);
         defer gpa.free(v);
         @memset(v, @intCast(i));
-        r.seg.put(tkey(@intCast(i), i), v, i + 1, 0) catch |e| {
+        r.seg.put(tkey(@intCast(i), i), v, i + 1, 0, 0) catch |e| {
             try testing.expectEqual(error.RingFull, e);
             break;
         };
@@ -1461,7 +1822,7 @@ test "placement never overlaps and reuses punched holes first-fit; a record that
     // A record larger than the ring is refused before any placement.
     const huge = try gpa.alloc(u8, 40 * 4096);
     defer gpa.free(huge);
-    try testing.expectError(error.RingFull, r.seg.put(tkey(1, 1), huge, 1, 0));
+    try testing.expectError(error.RingFull, r.seg.put(tkey(1, 1), huge, 1, 0, 0));
 
     // A full ring of 2-grain records: the 9th is a loud refusal that
     // destroys nothing; removing the 4th opens the ONE hole, and the next
@@ -1470,9 +1831,9 @@ test "placement never overlaps and reuses punched holes first-fit; a record that
     defer gpa.free(f.image);
     defer f.seg.deinit();
     const ten: [10]u8 = @splat(2);
-    for (0..8) |i| try f.seg.put(tkey(@intCast(i), i), &ten, i + 1, 0);
+    for (0..8) |i| try f.seg.put(tkey(@intCast(i), i), &ten, i + 1, 0, 0);
     const before = stats.staging_ring_full_refusals.load();
-    try testing.expectError(error.RingFull, f.seg.put(tkey(99, 99), &ten, 99, 0));
+    try testing.expectError(error.RingFull, f.seg.put(tkey(99, 99), &ten, 99, 0, 0));
     try testing.expectEqual(before + 1, stats.staging_ring_full_refusals.load());
     try testing.expectEqual(@as(usize, 8), f.seg.live());
     const fourth = f.seg.get(tkey(3, 3)).?;
@@ -1480,7 +1841,7 @@ test "placement never overlaps and reuses punched holes first-fit; a record that
     fourth.release();
     try testing.expectEqual(@as(u64, 3 * 8192), hole);
     try testing.expect(f.seg.remove(tkey(3, 3), null));
-    try f.seg.put(tkey(50, 50), &ten, 50, 0);
+    try f.seg.put(tkey(50, 50), &ten, 50, 0, 0);
     const l = f.seg.get(tkey(50, 50)).?;
     defer l.release();
     try testing.expectEqual(hole, l.cell.extent.rec_off);
@@ -1495,17 +1856,17 @@ test "recovery scan: the true geometry survives (every live record adopted, byte
     // A value that CONTAINS a plausible record header at a grain boundary.
     var decoy: [3 * 4096]u8 = @splat(0x11);
     writeRecord(decoy[4096..], 0, tkey(0xAA, 1).bytes(), "decoy", 777, 0);
-    try seg.put(tkey(1, 10), &decoy, 1, 0);
+    try seg.put(tkey(1, 10), &decoy, 1, 0, 0);
     const v2: [100]u8 = @splat(2);
-    try seg.put(tkey(2, 20), &v2, 2, 0);
+    try seg.put(tkey(2, 20), &v2, 2, 0, 0);
     const v3: [5000]u8 = @splat(3);
-    try seg.put(tkey(3, 30), &v3, 3, 0);
+    try seg.put(tkey(3, 30), &v3, 3, 0, 0);
     // A same-key replace with a crash between phases: both copies present.
     const v2b: [200]u8 = @splat(4);
     const old2 = seg.get(tkey(2, 20)).?;
     const off2 = old2.cell.extent.rec_off;
     old2.release();
-    try seg.put(tkey(2, 20), &v2b, 5, 0);
+    try seg.put(tkey(2, 20), &v2b, 5, 0, 0);
     // Resurrect the old copy's magic (as if phase 2 never ran).
     @memcpy(r.image[@intCast(off2)..][0..4], &SEGMENT_MAGIC);
     var ext: [8]Extent = undefined;
@@ -1535,7 +1896,7 @@ test "recovery scan: the true geometry survives (every live record adopted, byte
     try testing.expect(fresh.get(tkey(9, 90)) == null);
     // Post-recovery writes land past every adopted record and never overlap.
     const v6: [10]u8 = @splat(6);
-    try fresh.put(tkey(6, 60), &v6, 6, 0);
+    try fresh.put(tkey(6, 60), &v6, 6, 0, 0);
     const live_ext = fresh.liveExtents(&ext);
     std.mem.sort(Extent, live_ext, {}, Segment.extentLess);
     for (live_ext[1..], 0..) |e, i| try testing.expect(live_ext[i].end() <= e.rec_off);
@@ -1586,20 +1947,20 @@ test "pool: the ledger charges the delta on a re-stage and credits on release so
     const k = tkey(1, 1);
     const g0 = stats.current_staged_write_bytes.load();
     const v: [100]u8 = @splat(1);
-    const s1 = try stageWrite(&pool, &r.seg, k, &v, 0);
+    const s1 = try stageWrite(&pool, &r.seg, k, &v, 0, .none);
     try testing.expectEqual(@as(u64, 1), s1.generation);
     try testing.expect(!s1.kicked);
     try testing.expectEqual(@as(u64, 8192), pool.currentBytes());
     try testing.expectEqual(g0 + 8192, stats.current_staged_write_bytes.load());
     // Re-stage the same file_id larger: the delta is charged, one row.
     const v2: [5000]u8 = @splat(2);
-    const s2 = try stageWrite(&pool, &r.seg, k, &v2, 0);
+    const s2 = try stageWrite(&pool, &r.seg, k, &v2, 0, .none);
     try testing.expectEqual(@as(u64, 2), s2.generation);
     try testing.expectEqual(@as(u64, 12288), pool.currentBytes());
     try testing.expectEqual(@as(?u64, 2), pool.generationOf(k.file_id));
     // Past the high-water: kicked.
     const big: [9 * 4096 - 10]u8 = @splat(3);
-    const s3 = try stageWrite(&pool, &r.seg, tkey(2, 2), &big, 0);
+    const s3 = try stageWrite(&pool, &r.seg, tkey(2, 2), &big, 0, .none);
     try testing.expect(pool.currentBytes() > pool.highWater());
     try testing.expect(s3.kicked);
     try testing.expectEqual(@as(u32, 1), kicks.pressure);
@@ -1607,7 +1968,7 @@ test "pool: the ledger charges the delta on a re-stage and credits on release so
     const cur = pool.currentBytes();
     const live_before = r.seg.live();
     const refusals = stats.staging_over_cap_refusals.load();
-    try testing.expectError(error.StorageFull, stageWrite(&pool, &r.seg, tkey(3, 3), &big, 0));
+    try testing.expectError(error.StorageFull, stageWrite(&pool, &r.seg, tkey(3, 3), &big, 0, .none));
     try testing.expectEqual(cur, pool.currentBytes());
     try testing.expectEqual(live_before, r.seg.live());
     try testing.expectEqual(@as(u32, 2), kicks.pressure);
@@ -1641,9 +2002,9 @@ test "the three promotion points: pressure rides stageWrite; the dismount pass p
     defer gpa.free(r.image);
     defer r.seg.deinit();
     const v: [10]u8 = @splat(1);
-    try r.seg.put(tkey(1, 1), &v, 1, 0);
-    try r.seg.put(tkey(2, 2), &v, 2, 0);
-    try r.seg.put(tkey(3, 3), &v, 3, 0);
+    try r.seg.put(tkey(1, 1), &v, 1, 0, 0);
+    try r.seg.put(tkey(2, 2), &v, 2, 0, 0);
+    try r.seg.put(tkey(3, 3), &v, 3, 0, 0);
     kicks.fail_next = true;
     const f0 = stats.dismount_promoted_files.load();
     const b0 = stats.dismount_promoted_bytes.load();
@@ -1674,7 +2035,7 @@ test "the reader's view: resident ⇒ the bytes; ledger-only ⇒ in flight; neit
     defer r.seg.deinit();
     const k = tkey(5, 55);
     const v: [300]u8 = @splat(9);
-    _ = try stageWrite(&pool, &r.seg, k, &v, 0);
+    _ = try stageWrite(&pool, &r.seg, k, &v, 0, .none);
     switch (resolveStagedRead(&pool, &r.seg, k, 0, 100, 300)) {
         .resident => |l| {
             defer l.release();
@@ -1825,11 +2186,11 @@ test "linux: a ring under a tmp dir — 0700/0600 modes, mmap put/get, a remount
     try testing.expectEqual(@as(u16, 0o600), st.mode & 0o777);
     var seg = try Segment.init(gpa, ms.map, ms.backing());
     const v: [5000]u8 = @splat(0x42);
-    try seg.put(tkey(1, 11), &v, 7, 0);
+    try seg.put(tkey(1, 11), &v, 7, 0, 0);
     const l = seg.get(tkey(1, 11)).?;
     try testing.expectEqualSlices(u8, &v, l.bytes());
     l.release();
-    try seg.put(tkey(2, 22), "two", 8, 0);
+    try seg.put(tkey(2, 22), "two", 8, 0, 0);
     try testing.expect(seg.remove(tkey(2, 22), 8));
     seg.deinit();
     ms.close();

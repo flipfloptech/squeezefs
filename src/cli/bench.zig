@@ -488,11 +488,11 @@ pub const Row = struct {
         });
         const s = self.stats;
         try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
-            s.present,                    self.bytes,             s.device_write_bytes,   s.rewrite_device_write_bytes,         s.device_writes,          self.amplificationPpm(),
-            self.amplificationBoundPpm(), self.withinAmplificationBound(), self.wareqSz(),  s.admission_bytes,                    s.read_copy_bytes,        self.readCopyPpm(),
-            s.terminal_frees,             s.reclaim_queued,       s.reclaim_elided,       s.discard_bytes,                      s.fuse_ops,               s.transport_ring_requests,
-            s.transport_enters,           s.held_stores,          s.patch_writes,         s.hot_block_hits,                     s.fast_dispatch_serves,   s.zc_write_direct_bytes,
-            s.zc_write_extract_bytes,     s.zc_direct_legs,       s.zc_serve_bytes,       s.invariant_tripwires,
+            s.present,                    self.bytes,                      s.device_write_bytes, s.rewrite_device_write_bytes, s.device_writes,        self.amplificationPpm(),
+            self.amplificationBoundPpm(), self.withinAmplificationBound(), self.wareqSz(),       s.admission_bytes,            s.read_copy_bytes,      self.readCopyPpm(),
+            s.terminal_frees,             s.reclaim_queued,                s.reclaim_elided,     s.discard_bytes,              s.fuse_ops,             s.transport_ring_requests,
+            s.transport_enters,           s.held_stores,                   s.patch_writes,       s.hot_block_hits,             s.fast_dispatch_serves, s.zc_write_direct_bytes,
+            s.zc_write_extract_bytes,     s.zc_direct_legs,                s.zc_serve_bytes,     s.invariant_tripwires,
         });
     }
 

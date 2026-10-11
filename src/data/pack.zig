@@ -1374,7 +1374,7 @@ const Fixture = struct {
 
     /// Stage a file: the ring entry + the staged layout record.
     fn stage(self: *Fixture, ino: u64, seed: u8, payload: []const u8) !staging.Staged {
-        const s = try staging.stageWrite(&self.pool, &self.seg, staging.StagingKey.init(fid(seed), ino), payload, 0);
+        const s = try staging.stageWrite(&self.pool, &self.seg, staging.StagingKey.init(fid(seed), ino), payload, 0, .none);
         try self.world.setLayout(ino, layout.Layout.staged(payload.len, fid(seed), null));
         return s;
     }

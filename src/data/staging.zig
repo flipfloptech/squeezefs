@@ -51,8 +51,9 @@ pub const stats = struct {
     /// `staging_over_cap_refusals`: a stage refused `StorageFull` at the
     /// pool cap (the caller's spill escalation follows).
     pub var staging_over_cap_refusals: counters.ShardedCounter = .{};
-    /// `staging_ring_full_refusals`: a placement found no hole (loud
-    /// backpressure; never destroys a live entry).
+    /// `staging_ring_full_refusals`: a placement found no hole (never
+    /// destroys a live entry; the write takes its own-block arm — the ring
+    /// is a cache, never the set's capacity).
     pub var staging_ring_full_refusals: counters.ShardedCounter = .{};
     /// `staging_pressure_kicks`: high-water crossings that enqueued a
     /// promotion.
@@ -709,6 +710,11 @@ pub const Pool = struct {
     ledger: std.AutoHashMapUnmanaged(FileId, LedgerRow) = .empty,
     current: std.atomic.Value(u64) = .init(0),
     next_generation: std.atomic.Value(u64) = .init(FIRST_GENERATION),
+    /// The ring is in a FULL episode (a placement found no hole and the
+    /// caller took its own-block arm): one warning per episode, cleared by
+    /// the next placement that lands — 291 identical lines per burst said
+    /// nothing 1 did not.
+    ring_full_episode: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: Allocator, max_write_bytes: u64, hooks: PromotionHooks) Pool {
         return .{ .gpa = gpa, .max_write_bytes = max_write_bytes, .hooks = hooks };
@@ -817,11 +823,12 @@ pub fn stageWrite(pool: *Pool, seg: *Segment, key: StagingKey, payload: []const 
     const generation = pool.nextGeneration();
     seg.put(key, payload, generation, fencing) catch |e| switch (e) {
         error.RingFull => {
-            log.err("staging ring full: a {d} B record found no hole in a {d} B segment with {d} live entries — refusing StorageFull (never destroying a live entry)", .{ padded, seg.capacity(), seg.live() });
+            if (!pool.ring_full_episode.swap(true, .acq_rel)) log.warn("staging ring full: a {d} B record found no hole in a {d} B segment with {d} live entries — the write takes its own-block arm until the ring drains (counted staging_ring_full_refusals; never destroying a live entry)", .{ padded, seg.capacity(), seg.live() });
             return error.StorageFull;
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
+    pool.ring_full_episode.store(false, .release);
     try pool.charge(key.file_id, padded, generation);
     var kicked = false;
     if (pool.currentBytes() > pool.highWater()) {

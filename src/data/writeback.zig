@@ -188,7 +188,16 @@ pub const Deps = struct {
     dismounted: ?*const fn () bool = null,
     touched: ?*const fn (ctx: ?*anyopaque, ino: u64, ordinal: u32) void = null,
     touched_ctx: ?*anyopaque = null,
+    /// The plaintext whole-block image of a binding (the spill's seed);
+    /// null = raw device bytes.
+    image: ?seams.ImageSeam = null,
 };
+
+/// The whole plaintext image of `b` into `out`.
+fn readImage(deps: Deps, b: Binding, out: []u8) seams.ReadError!void {
+    if (deps.image) |im| return im.read(im.ctx, b, out);
+    return deps.device.read(b.vol_tag, b.offset, out);
+}
 
 /// `flush_one_active_block`: §7.1's seven steps, up to `FLUSH_ATTEMPTS`.
 pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
@@ -306,14 +315,23 @@ pub fn spillParkedBlock(table: *accumulate.Table, deps: Deps, io: Io, worker: *W
     defer g.release(io);
     const e = table.get(ino, block) orelse return error.NotParked;
     if (e.repr == .extent) {
-        if (table.escalate(e) == null) return error.PoolExhausted;
+        // The overlay escalates whole: the untouched pages from the base
+        // image (ONE read) when deferred over a binding, zeros otherwise.
+        if (e.repr.extent.base_deferred and e.old_binding != null) {
+            const img = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return error.OutOfMemory;
+            defer table.gpa.free(img);
+            readImage(deps, e.old_binding.?, img) catch return error.StorageFull;
+            table.escalate(e, img) orelse return error.PoolExhausted;
+        } else {
+            table.escalate(e, null) orelse return error.PoolExhausted;
+        }
     }
     if (!e.content_valid) {
         if (e.seed == .deferred and e.old_binding != null) {
             const old = e.old_binding.?;
             const img = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return error.OutOfMemory;
             defer table.gpa.free(img);
-            deps.device.read(old.vol_tag, old.offset, img) catch return error.StorageFull;
+            readImage(deps, old, img) catch return error.StorageFull;
             table.fillComplementFrom(e, img) catch return error.PoolExhausted;
         } else {
             e.seed = .fresh;

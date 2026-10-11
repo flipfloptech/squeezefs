@@ -222,28 +222,36 @@ pub const Begun = struct {
     rel: u32,
 };
 
-/// The state half under (3), up to and including the fence pair: the
-/// custody probes, the authoritative map lookup, the durable sole-owner
-/// verdict, retire → SeqCst → re-check. Null ⇒ one bucket counted, the
-/// caller falls through (a failed re-check already re-stabilized the
-/// word). The caller then performs ONE DMA at `dest` and MUST call
-/// `finishPatch` on BOTH exits.
-pub fn beginPatch(deps: Deps, ino: u64, block: u32, rel: u32) PatchError!?Begun {
+/// The state half's verdict: begun (the fence pair passed, the word
+/// retired) or the one bucket that declined.
+pub const Classified = union(enum) {
+    begun: Begun,
+    declined: Bucket,
+};
+
+/// The state half under (3), up to and including the fence pair, UNCOUNTED:
+/// the custody probes, the authoritative map lookup, the durable sole-owner
+/// verdict, retire → SeqCst → re-check. W1 (`beginPatch`) counts the
+/// bucket into its decision ledger; the W2 in-place fold (§J.1 landing 2)
+/// reuses the same half for its own arm and counts its own declines. On
+/// `.begun` the caller performs its DMAs at `dest` and MUST call
+/// `finishInPlace` (or `abandonInPlace` when nothing was submitted).
+pub fn beginInPlace(deps: Deps, ino: u64, block: u32, rel: u32) PatchError!Classified {
     const c = deps.custody;
-    if (c.range_shared) |rs| if (rs(c.ctx, ino, block)) return declineNull(.range_shared);
-    if (c.ram_custody(c.ctx, ino, block)) return declineNull(.overlay);
-    if (c.overlay_open(c.ctx, ino, block)) return declineNull(.device_overlay);
+    if (c.range_shared) |rs| if (rs(c.ctx, ino, block)) return .{ .declined = .range_shared };
+    if (c.ram_custody(c.ctx, ino, block)) return .{ .declined = .overlay };
+    if (c.overlay_open(c.ctx, ino, block)) return .{ .declined = .device_overlay };
     // Predicate 1: the mapping from the AUTHORITATIVE map under the held lock.
-    const m = deps.map.lookup(ino, block) orelse return declineNull(.unmapped);
-    const vol = deps.vols.byTag(m.vol_tag) orelse return declineNull(.unmapped);
-    if (!vol.passthrough) return declineNull(.transform);
-    if (!m.whole_block or m.damaged) return declineNull(.decorated);
+    const m = deps.map.lookup(ino, block) orelse return .{ .declined = .unmapped };
+    const vol = deps.vols.byTag(m.vol_tag) orelse return .{ .declined = .unmapped };
+    if (!vol.passthrough) return .{ .declined = .transform };
+    if (!m.whole_block or m.damaged) return .{ .declined = .decorated };
     // Predicate 4, durable half FIRST (before the word is retired).
     if (c.sole_owner) |so| switch (so(c.ctx, ino, m)) {
         .sole => {},
-        .shared => return declineNull(.shared),
-        .foreign_custody => return declineNull(.foreign_custody),
-        .non_holder => return declineNull(.posture),
+        .shared => return .{ .declined = .shared },
+        .foreign_custody => return .{ .declined = .foreign_custody },
+        .non_holder => return .{ .declined = .posture },
     };
     const idx = vol.alloc.idxOf(m.offset);
     // The fence pair, patch side: retire → SeqCst → peek == 1 ∧ !SHARED.
@@ -251,28 +259,42 @@ pub fn beginPatch(deps: Deps, ino: u64, block: u32, rel: u32) PatchError!?Begun 
     if (!sole) {
         // Re-stabilize under the NEW generation (content unchanged); CoW fallback.
         vol.alloc.publishBlock(idx);
-        return declineNull(.shared);
+        return .{ .declined = .shared };
     }
-    return .{ .mapping = m, .vol_tag = m.vol_tag, .idx = idx, .dest = m.offset + rel, .ordinal = vol.ordinal, .ino = ino, .block = block, .rel = rel };
+    return .{ .begun = .{ .mapping = m, .vol_tag = m.vol_tag, .idx = idx, .dest = m.offset + rel, .ordinal = vol.ordinal, .ino = ino, .block = block, .rel = rel } };
 }
 
-fn declineNull(b: Bucket) ?Begun {
-    _ = decline(b);
-    return null;
+/// W1's state half: `beginInPlace` with the decline counted into the
+/// decision ledger. Null ⇒ one bucket counted, the caller falls through (a
+/// failed re-check already re-stabilized the word). The caller then
+/// performs ONE DMA at `dest` and MUST call `finishPatch` on BOTH exits.
+pub fn beginPatch(deps: Deps, ino: u64, block: u32, rel: u32) PatchError!?Begun {
+    return switch (try beginInPlace(deps, ino, block, rel)) {
+        .begun => |b| b,
+        .declined => |bucket| {
+            _ = decline(bucket);
+            return null;
+        },
+    };
 }
 
-/// The postlude on BOTH exits of the DMA: publish (re-stabilize under the
-/// NEW generation), purge the key from the four read tiers, then — exact
-/// ⇒ the fsync touched stamp and the ledger; failed ⇒ `patch_dma_errors`,
-/// loud, the error for exactly this write (the block's old bytes intact
-/// outside the window).
-pub fn finishPatch(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void) PatchError!void {
+/// A begun in-place write nothing was submitted for: re-stabilize the word
+/// under a new generation (content unchanged, so no purge).
+pub fn abandonInPlace(deps: Deps, b: Begun) void {
+    if (deps.vols.byTag(b.vol_tag)) |vol| vol.alloc.publishBlock(b.idx);
+}
+
+/// The postlude on BOTH exits of an in-place DMA, for any arm (`arm`
+/// names it in the loud line): publish (re-stabilize under the NEW
+/// generation), purge the key from the four read tiers, then — exact ⇒
+/// the fsync touched stamp; failed ⇒ loud, the error for exactly this
+/// write (the block's old bytes intact outside the window).
+pub fn finishInPlace(deps: Deps, b: Begun, dma: seams.DmaError!void, arm: []const u8) PatchError!void {
     const vol = deps.vols.byTag(b.vol_tag) orelse return error.VolumeFailed;
     vol.alloc.publishBlock(b.idx);
     deps.purge.purge(b.mapping);
     dma catch |e| {
-        stats.patch_dma_errors.inc();
-        log.err("W1 patch ino {d} block {d} rel {d}: DMA failed ({s}) — EIO for exactly this write; the block is re-stabilized with its old bytes intact outside the window", .{ b.ino, b.block, b.rel, @errorName(e) });
+        log.err("{s} ino {d} block {d} rel {d}: DMA failed ({s}) — EIO for exactly this write; the block is re-stabilized with its old bytes intact outside the window", .{ arm, b.ino, b.block, b.rel, @errorName(e) });
         return switch (e) {
             error.InputOutput => error.InputOutput,
             error.NoSpaceLeft => error.NoSpaceLeft,
@@ -284,6 +306,15 @@ pub fn finishPatch(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void) Pat
         };
     };
     if (deps.touched) |t| t.stamp(t.ctx, b.ino, b.ordinal);
+}
+
+/// W1's postlude: `finishInPlace`, then the ledger (`patch_writes`,
+/// `patch_write_bytes`; a failure counts `patch_dma_errors`).
+pub fn finishPatch(deps: Deps, b: Begun, len: u64, dma: seams.DmaError!void) PatchError!void {
+    finishInPlace(deps, b, dma, "W1 patch") catch |e| {
+        stats.patch_dma_errors.inc();
+        return e;
+    };
     stats.patch_writes.inc();
     stats.patch_write_bytes.add(len);
 }

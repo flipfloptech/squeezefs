@@ -44,6 +44,7 @@ const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const json_scan = @import("../core/json_scan.zig");
+const extent_overlay = @import("../data/extent_overlay.zig");
 
 // ---------------------------------------------------------------------------
 // Constants (§5.3) with their WHY.
@@ -348,11 +349,12 @@ pub const StatsTerms = struct {
     /// the rewrite epoch was fed (measured: overlay 22.17 GB + rewrite
     /// 6.09 GB against diskstats 1.025 × user on a 22.28 GB row) and is
     /// read BESIDE, never summed.
-    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "durable_upload_bytes_escalation", "durable_upload_bytes_writeback" };
+    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "durable_upload_bytes_escalation", "durable_upload_bytes_writeback", "fold_inplace_write_bytes" };
     /// The device-write REQUEST arms (brk.py `DEVICE_WRITE_REQS`): `put_obj`
     /// is the block layer's put (an overlay store IS a put, never summed
-    /// twice); a W1 patch DMA and an own-block DMA bypass it.
-    pub const device_write_req_keys = [_][]const u8{ "patch_writes", "own_block_dmas", "put_obj" };
+    /// twice); a W1 patch DMA, a W2 in-place page DMA and an own-block DMA
+    /// bypass it.
+    pub const device_write_req_keys = [_][]const u8{ "patch_writes", "own_block_dmas", "put_obj", "fold_inplace_dmas" };
     pub const admission_keys = [_][]const u8{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes" };
     /// The read copy ledger (charter §6.3; brk.py `READ_COPY_ARMS`): the
     /// plane's arms plus the transport's direct-leg and bridged serves.
@@ -434,6 +436,25 @@ pub const Row = struct {
         return @intCast((@as(u128, self.stats.device_write_bytes) * PPM) / self.bytes);
     }
 
+    /// The write amplification law's bound for this pass's block (decision
+    /// 0003 §J.1; brk.py `write_amp_bound` restates it): a page multiple is
+    /// W1's or the overlay's 1×; a sub-page write at block-aligned offsets
+    /// is the in-place page fold's `pages(bs, gcd(bs, P)) × P / bs`.
+    pub fn amplificationBoundPpm(self: Row) u64 {
+        const bs: u64 = self.pass.block;
+        if (bs % extent_overlay.PAGE == 0) return PPM;
+        return extent_overlay.inPlaceBoundPpm(bs, std.math.gcd(bs, extent_overlay.PAGE));
+    }
+
+    /// The ruler's slack over the bound: the brackets gate's own 1.0–1.1
+    /// band for whole-block rows (housekeeping lands on the META device).
+    pub const AMP_SLACK_PPM: u64 = PPM / 10;
+
+    /// The `.stats` identity a write row asserts: `device ≤ bound × user`.
+    pub fn withinAmplificationBound(self: Row) bool {
+        return self.amplificationPpm() <= self.amplificationBoundPpm() + AMP_SLACK_PPM;
+    }
+
     /// `wareq-sz`: the mean device write request in bytes.
     pub fn wareqSz(self: Row) u64 {
         if (self.stats.device_writes == 0) return 0;
@@ -466,12 +487,12 @@ pub const Row = struct {
             quantileNs(self.lat, 990),             quantileNs(self.lat, 999),                      quantileNs(self.lat, 1000),
         });
         const s = self.stats;
-        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
-            s.present,        self.bytes,            s.device_write_bytes,   s.rewrite_device_write_bytes, s.device_writes,          self.amplificationPpm(),
-            self.wareqSz(),   s.admission_bytes,     s.read_copy_bytes,      self.readCopyPpm(),           s.terminal_frees,         s.reclaim_queued,
-            s.reclaim_elided, s.discard_bytes,       s.fuse_ops,             s.transport_ring_requests,    s.transport_enters,       s.held_stores,
-            s.patch_writes,   s.hot_block_hits,      s.fast_dispatch_serves, s.zc_write_direct_bytes,      s.zc_write_extract_bytes, s.zc_direct_legs,
-            s.zc_serve_bytes, s.invariant_tripwires,
+        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
+            s.present,                    self.bytes,             s.device_write_bytes,   s.rewrite_device_write_bytes,         s.device_writes,          self.amplificationPpm(),
+            self.amplificationBoundPpm(), self.withinAmplificationBound(), self.wareqSz(),  s.admission_bytes,                    s.read_copy_bytes,        self.readCopyPpm(),
+            s.terminal_frees,             s.reclaim_queued,       s.reclaim_elided,       s.discard_bytes,                      s.fuse_ops,               s.transport_ring_requests,
+            s.transport_enters,           s.held_stores,          s.patch_writes,         s.hot_block_hits,                     s.fast_dispatch_serves,   s.zc_write_direct_bytes,
+            s.zc_write_extract_bytes,     s.zc_direct_legs,       s.zc_serve_bytes,       s.invariant_tripwires,
         });
     }
 
@@ -480,7 +501,7 @@ pub const Row = struct {
         try w.print("| {s:<22} | {s:<3} | {d:>8} MiB/s | {d:>9} IOPS | {d:>8}/{d:<8} | lat p50 {d} µs p99 {d} µs p999 {d} µs mean {d} µs |{s}\n", .{ self.passName(&nb), self.pass.arm, self.mibPerS(), self.iops(), self.ops, self.expected_ops, quantileNs(self.lat, 500) / std.time.ns_per_us, quantileNs(self.lat, 990) / std.time.ns_per_us, quantileNs(self.lat, 999) / std.time.ns_per_us, self.lat.meanNs() / std.time.ns_per_us, if (self.scopingOnly()) " scoping-only (<60 s)" else "" });
         if (self.boxed_out) try w.print("|   time box expired: {d} of {d} ops ({d}% coverage)\n", .{ self.ops, self.expected_ops, if (self.expected_ops == 0) 0 else self.ops * 100 / self.expected_ops });
         if (self.pass.phase == .write and self.stats.present) {
-            try w.print("|   device bytes ÷ user bytes {d}.{d:0>3} (device {d} B / user {d} B; rewrite epoch {d} B beside); wareq-sz {d} B vs block {d} B; reclaim terminal {d} = queued {d} + elided {d}, discarded {d} B; admission {d} B\n", .{ ratioParts(self.amplificationPpm()).whole, ratioParts(self.amplificationPpm()).milli, self.stats.device_write_bytes, self.bytes, self.stats.rewrite_device_write_bytes, self.wareqSz(), self.pass.block, self.stats.terminal_frees, self.stats.reclaim_queued, self.stats.reclaim_elided, self.stats.discard_bytes, self.stats.admission_bytes });
+            try w.print("|   device bytes ÷ user bytes {d}.{d:0>3} (device {d} B / user {d} B; rewrite epoch {d} B beside) vs the §J.1 bound {d}.{d:0>3} ({s}); wareq-sz {d} B vs block {d} B; reclaim terminal {d} = queued {d} + elided {d}, discarded {d} B; admission {d} B\n", .{ ratioParts(self.amplificationPpm()).whole, ratioParts(self.amplificationPpm()).milli, self.stats.device_write_bytes, self.bytes, self.stats.rewrite_device_write_bytes, ratioParts(self.amplificationBoundPpm()).whole, ratioParts(self.amplificationBoundPpm()).milli, if (self.withinAmplificationBound()) "within" else "OVER THE BOUND", self.wareqSz(), self.pass.block, self.stats.terminal_frees, self.stats.reclaim_queued, self.stats.reclaim_elided, self.stats.discard_bytes, self.stats.admission_bytes });
         }
         if (self.pass.phase == .read and self.stats.present) {
             try w.print("|   read copy ledger Σ arms ÷ user bytes {d}.{d:0>3} (Σ {d} B / user {d} B); direct-leg serves {d} ({d} B)\n", .{ ratioParts(self.readCopyPpm()).whole, ratioParts(self.readCopyPpm()).milli, self.stats.read_copy_bytes, self.bytes, self.stats.zc_direct_legs, self.stats.zc_serve_bytes });
@@ -1030,10 +1051,23 @@ test "rows: quantiles are the bucket's UPPER bound over exact counts; MiB/s and 
     try testing.expectEqual(@as(u64, 2_000_000), row.amplificationPpm());
     try testing.expectEqual(@as(u64, 2 << 20), row.wareqSz());
     try testing.expect(row.scopingOnly());
+    // The §J.1 identity (tie): a page multiple is bound at 1× (+ the 0.1
+    // slack) — this row's 2× is OVER it; a 512 B row is bound at 8×, a
+    // 1536 B one (3 sectors, straddling once) at 5.33×.
+    try testing.expectEqual(Row.PPM, row.amplificationBoundPpm());
+    try testing.expect(!row.withinAmplificationBound());
+    var frag = row;
+    frag.pass.block = 512;
+    frag.bytes = 1 << 19;
+    frag.stats.device_write_bytes = 4 << 20;
+    try testing.expectEqual(@as(u64, 8_000_000), frag.amplificationBoundPpm());
+    try testing.expect(frag.withinAmplificationBound());
+    frag.pass.block = 1536;
+    try testing.expectEqual(@as(u64, 5_333_333), frag.amplificationBoundPpm());
     var out: Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try row.writeJson(&out.writer);
-    for ([_][]const u8{ "\"pass\":\"write\"", "\"access\":\"rand\"", "\"io\":\"direct\"", "\"mib_per_s\":2", "\"iops\":512", "\"scoping_only\":true", "\"p99\":4096000", "\"amplification_ppm\":2000000", "\"wareq_sz\":2097152", "\"reclaim\":{\"terminal_frees\":3,\"queued\":1,\"elided\":2,\"discard_bytes\":0}", "\"invariant_tripwires\":0" }) |needle| {
+    for ([_][]const u8{ "\"pass\":\"write\"", "\"access\":\"rand\"", "\"io\":\"direct\"", "\"mib_per_s\":2", "\"iops\":512", "\"scoping_only\":true", "\"p99\":4096000", "\"amplification_ppm\":2000000", "\"amplification_bound_ppm\":1000000", "\"within_amplification_bound\":false", "\"wareq_sz\":2097152", "\"reclaim\":{\"terminal_frees\":3,\"queued\":1,\"elided\":2,\"discard_bytes\":0}", "\"invariant_tripwires\":0" }) |needle| {
         if (std.mem.indexOf(u8, out.written(), needle) == null) {
             std.debug.print("\n--- missing {s} in {s} ---\n", .{ needle, out.written() });
             return error.TestExpectedNeedle;
@@ -1042,6 +1076,7 @@ test "rows: quantiles are the bucket's UPPER bound over exact counts; MiB/s and 
     out.clearRetainingCapacity();
     try row.writeText(&out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "device bytes ÷ user bytes 2.000") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "vs the §J.1 bound 1.000 (OVER THE BOUND)") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "scoping-only (<60 s)") != null);
     var long = row;
     long.elapsed_ns = 61 * std.time.ns_per_s;

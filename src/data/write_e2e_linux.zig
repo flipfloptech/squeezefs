@@ -133,8 +133,6 @@ const E2E = struct {
             .patch_max = patch_w1.patchMaxDerived(BS),
             .overlay = .{ .block_size = BS, .patch_max = patch_w1.patchMaxDerived(BS), .enabled = overlay_on },
             .rewrite_shadow = true,
-            .fold_max_extents = extent.foldMaxExtentsDerived(BS),
-            .fold_max_bytes = extent.foldMaxBytesDerived(BS),
             .parked_cap = 8,
             .depth_override = .sync_inline,
             .fsync = .{},
@@ -295,6 +293,90 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
     try expectPattern(got[5 * PAGE .. 6 * PAGE], 1 + 5 * PAGE);
     try testing.expectEqual(fence0, counters.tripwireCount("overlay_fence_drops"));
     try testing.expectEqual(unpub0, counters.tripwireCount("overlay_unpublished_at_fsync"));
+}
+
+/// Σ of the device-write byte arms (`brk.py` `DEVICE_WRITE_ARMS` minus the
+/// ring's writeback leg, which this harness never engages).
+fn deviceWriteBytes() u64 {
+    return accumulate.stats.write_through_bytes.load() + accumulate.stats.durable_upload_bytes_escalation.load() + extent.stats.fold_inplace_write_bytes.load() + patch_w1.stats.patch_write_bytes.load() + device_overlay.stats.overlay_store_bytes.load();
+}
+
+test "e2e(nvme_dev): the W2 amplification law at the 4 MiB block (repro-port: fstests generic/074 `fstest -F -b 512`, 128× on c36b531): 512 B writes at a 1 KiB stride extending a fresh file land each block ONCE at release (device bytes == blocks × 4 MiB = 2× the user bytes, one DMA per block, zero reads) and read back byte-exact; sector writes into 4 scattered pages of a published block fold IN PLACE as 4 page DMAs (16 KiB, the 8× bound) with the binding unchanged" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var e: E2E = .{};
+    e.init(gpa, false) catch |err| switch (err) {
+        error.DirectIoUnsupported, error.DirectOpenRefused => return testkit.skip(@src(), .no_device, "the venue's filesystem refuses O_DIRECT"),
+        else => return err,
+    };
+    defer e.deinit();
+    const got = try gpa.alloc(u8, BS);
+    defer gpa.free(got);
+    // Row 1: the fstest shape over 4 blocks.
+    try e.map.create(1, .striped, 0);
+    const n_blocks: u64 = 4;
+    const stride: u64 = 1024;
+    var sector: [512]u8 = undefined;
+    const puts0 = nvme_dev.stats.put_obj.load();
+    const gets0 = nvme_dev.stats.get_obj.load();
+    const dev0 = deviceWriteBytes();
+    var off: u64 = 0;
+    var size: u64 = 0;
+    var user: u64 = 0;
+    while (off < n_blocks * BS) : (off += stride) {
+        fillPattern(&sector, off);
+        const o = try e.wp.write(io, .{ .ino = 1, .offset = off, .payload = .{ .bytes = &sector }, .class = .entire_op, .file = E2E.striped(size) });
+        try testing.expectEqual(@as(u64, 512), o.written);
+        size = off + 512;
+        user += 512;
+    }
+    e.wp.flushIno(io, 1);
+    try testing.expectEqual(n_blocks * BS, deviceWriteBytes() - dev0);
+    try testing.expectEqual(puts0 + n_blocks, nvme_dev.stats.put_obj.load());
+    try testing.expectEqual(gets0, nvme_dev.stats.get_obj.load());
+    try testing.expectEqual(extent.holeBoundPpm(BS, BS / 2), (deviceWriteBytes() - dev0) * 1_000_000 / user);
+    var b: u32 = 0;
+    while (b < n_blocks) : (b += 1) {
+        const m = e.map.seam().lookup(1, b) orelse return error.TestUnexpectedResult;
+        try e.readAt(got, m.offset);
+        var rel: u64 = 0;
+        while (rel < BS) : (rel += stride) {
+            fillPattern(&sector, b * BS + rel);
+            try testing.expectEqualSlices(u8, &sector, got[rel .. rel + 512]);
+            try testing.expect(std.mem.allEqual(u8, got[rel + 512 .. rel + stride], 0));
+        }
+    }
+    // Row 2: four sector writes into scattered pages of the published block 0.
+    const m0 = e.map.seam().lookup(1, 0).?;
+    const dev1 = deviceWriteBytes();
+    const puts1 = nvme_dev.stats.put_obj.load();
+    const seeds0 = extent.stats.extent_page_seed_bytes.load();
+    const merges = e.map.merges.items.len;
+    const used = e.alloc.usedBlocks();
+    const pages = [_]u64{ 3, 40, 500, 1000 };
+    for (pages, 0..) |pg, i| {
+        fillPattern(&sector, 7000 + i);
+        const o = try e.wp.write(io, .{ .ino = 1, .offset = pg * PAGE + 2048, .payload = .{ .bytes = &sector }, .class = .shared, .file = E2E.striped(n_blocks * BS) });
+        try testing.expectEqual(@as(u32, 1), o.count(.extent));
+    }
+    // Pages ≥ block/4P would be 256 at 4 MiB: the trigger is the release here.
+    try testing.expect(e.wp.table.has(1, 0));
+    e.wp.flushIno(io, 1);
+    try testing.expect(!e.wp.table.has(1, 0));
+    try testing.expectEqual(@as(u64, 4 * PAGE), deviceWriteBytes() - dev1);
+    try testing.expectEqual(puts1 + 4, nvme_dev.stats.put_obj.load());
+    try testing.expectEqual(seeds0 + 4 * PAGE, extent.stats.extent_page_seed_bytes.load());
+    try testing.expect((deviceWriteBytes() - dev1) * 1_000_000 / (4 * 512) <= extent.inPlaceBoundPpm(512, 512));
+    try testing.expectEqual(merges, e.map.merges.items.len);
+    try testing.expectEqual(used, e.alloc.usedBlocks());
+    try testing.expect(e.map.seam().lookup(1, 0).?.eql(m0));
+    try e.readAt(got, m0.offset);
+    for (pages, 0..) |pg, i| {
+        fillPattern(&sector, 7000 + i);
+        try testing.expectEqualSlices(u8, &sector, got[pg * PAGE + 2048 .. pg * PAGE + 2560]);
+        fillPattern(&sector, pg * PAGE); // the page's first sector: the row-1 pattern, seeded back in place
+        try testing.expectEqualSlices(u8, &sector, got[pg * PAGE .. pg * PAGE + 512]);
+    }
 }
 
 test "e2e(nvme_dev): the overlay arm — four 1 MiB page-aligned pieces of a fresh block ride the overlay with ZERO userspace copies and four DMAs; the drain publishes once; an aligned 1 MiB overwrite of the published block installs an overwrite record, seeds the gaps RANGED and feeds the epoch" {

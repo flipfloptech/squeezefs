@@ -25,12 +25,12 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 /// The most out-of-order runs one block carries before the table is full.
-/// 64 = `FOLD_MAX_EXTENTS` at the shipped block: the W2 extent overlay
-/// folds at that many disjoint extents (its slabs mirror these runs
-/// exactly), and an overlay block holds at most `block / PATCH_MAX = 8`
-/// pieces above the length floor, so a full table is reachable only by a
-/// random sub-page storm into one accumulation buffer — the exit the
-/// refusal exists for. 64 × 8 B = 512 B inline per block entry.
+/// 64: the kernel's split O_DIRECT cohort of a 4 MiB block is at most
+/// `block / PATCH_MAX = 8` pieces above the length floor (the overlay) and
+/// the W2 page overlay keeps its own page set (never this table), so a
+/// full table is reachable only by a random sub-page storm into one
+/// accumulation buffer — the exit the refusal exists for. 64 × 8 B = 512 B
+/// inline per block entry.
 pub const MAX_EXTRA_RUNS: usize = 64;
 
 /// `[start, end)` in bytes within the block.

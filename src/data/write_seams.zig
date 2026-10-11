@@ -86,6 +86,16 @@ pub const DeviceSeam = struct {
     }
 };
 
+/// The PLAINTEXT whole-block image a binding names: on a transformed volume
+/// the device holds a frame, so every write-side seed (a deferred buffer's
+/// complement, the W2 CoW escalation, the seeded checkout) reads through
+/// here, never raw. The plane binds the decode; an all-passthrough set and
+/// the tests leave it unbound (raw device bytes ARE the image).
+pub const ImageSeam = struct {
+    ctx: ?*anyopaque,
+    read: *const fn (ctx: ?*anyopaque, binding: Binding, out: []u8) ReadError!void,
+};
+
 // ---------------------------------------------------------------------------
 // The volumes.
 // ---------------------------------------------------------------------------

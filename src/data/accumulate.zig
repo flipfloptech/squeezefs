@@ -58,6 +58,7 @@ const seams = @import("write_seams.zig");
 const epoch_mod = @import("write_epoch.zig");
 const pipeline = @import("write_pipeline.zig");
 const extent = @import("extent_overlay.zig");
+const patch_w1 = @import("patch_w1.zig");
 
 pub const Binding = seams.Binding;
 pub const CoverageUnion = cov.CoverageUnion;
@@ -565,19 +566,50 @@ pub const Table = struct {
         return e;
     }
 
-    /// Adopt an extent overlay's slabs as a full buffer (the 25 %
-    /// escalation): a new full entry whose coverage and deferral are the
-    /// extent's, slabs laid in place. Null at the cap.
-    pub fn escalate(self: *Table, e: *Entry) ?void {
+    /// Adopt an extent overlay's pages as a CONTENT-VALID full buffer (the
+    /// escalation, §J.1): the touched pages laid in place, the untouched
+    /// ones from `base` (the whole plaintext image of the block's binding —
+    /// the CoW arm's ONE seed read) or zeros (a hole, a deferred block
+    /// without a binding). The buffer is complete: coverage full, seeded,
+    /// content-valid — every later write is a memcpy and the block lands
+    /// ONCE at its flush. Null at the pool cap (nothing changed).
+    pub fn escalate(self: *Table, e: *Entry, base: ?[]const u8) ?void {
         assert(e.repr == .extent);
         const cell = self.pool.acquire() orelse return null;
         var ext = e.repr.extent;
-        ext.layInto(cell.data);
+        ext.completeInto(cell.data[0..self.block_size], base);
         stats.parked_full_buffer_bytes.add(self.block_size);
-        extent.stats.parked_extent_bytes.sub(ext.bytes);
         ext.deinit(self.gpa);
         e.repr = .{ .full = cell };
-        if (e.seed == .deferred) stats.overwrite_seed_deferred.inc();
+        e.coverage.setFull(self.block_size);
+        e.seed = .seeded;
+        e.content_valid = true;
+        e.last_touch_ns = clock.monotonicNs();
+        extent.stats.extent_escalations.inc();
+    }
+
+    /// Arm G's SEEDED checkout (the reference's `seeded(existing, bs)`
+    /// birth class): a new full entry whose cell already holds the block's
+    /// whole plaintext image — content-valid, coverage full — for the small
+    /// write into a block whose base cannot be seeded at the page grain (a
+    /// transformed volume: a plaintext page costs a whole-frame decode). The
+    /// piece then merges by memcpy and the block lands ONCE at its flush.
+    /// `fill` reads the image into the cell; a failed read leaves no entry.
+    pub fn checkoutSeeded(self: *Table, ino: u64, block: u32, old_binding: Binding, fill: *const fn (ctx: ?*anyopaque, b: Binding, out: []u8) seams.ReadError!void, fill_ctx: ?*anyopaque) error{ PoolExhausted, InputOutput }!*Entry {
+        const cell = self.pool.acquire() orelse return error.PoolExhausted;
+        fill(fill_ctx, old_binding, cell.data[0..self.block_size]) catch {
+            self.pool.release(cell);
+            return error.InputOutput;
+        };
+        const e = self.checkoutWith(ino, block, false, old_binding, cell) orelse {
+            self.pool.release(cell);
+            return error.PoolExhausted;
+        };
+        e.coverage.setFull(self.block_size);
+        e.seed = .seeded;
+        e.content_valid = true;
+        stats.overwrite_seed_materialized.inc();
+        return e;
     }
 
     /// An extent entry (arm F): the compact sorted list, no block buffer.
@@ -639,14 +671,18 @@ pub const Table = struct {
         e.write_epoch = nextWriteEpoch();
         e.app_end = @max(e.app_end, end);
         e.last_touch_ns = clock.monotonicNs();
-        const full = e.coverage.isFull(self.block_size);
-        if (full) {
+        // The write-through trigger is the TRANSITION to a full union (a
+        // re-write of an already complete entry never double-fires: an
+        // upload in flight re-drives on the epoch it stamped, and a
+        // content-valid buffer parked with a full union — the W2
+        // escalation's write-back class — lands once, at its flush).
+        if (v.completed) {
             if (e.coverage.n_extras != 0) stats.complete_union_with_extra_runs.fire("a complete union still holds extra runs");
             if (e.seed == .deferred) stats.overwrite_seed_skipped.inc();
             e.seed = .seeded;
             e.content_valid = true;
         }
-        return .{ .completed = full, .out_of_order = v.out_of_order };
+        return .{ .completed = v.completed, .out_of_order = v.out_of_order };
     }
 
     fn zeroCompleteLocked(self: *Table, e: *Entry) void {
@@ -702,10 +738,7 @@ pub const Table = struct {
                 self.pool.release(c);
                 stats.parked_full_buffer_bytes.sub(self.block_size);
             },
-            .extent => |*x| {
-                extent.stats.parked_extent_bytes.sub(x.bytes);
-                x.deinit(self.gpa);
-            },
+            .extent => |*x| x.deinit(self.gpa), // credits the pages' charge
         }
     }
 
@@ -838,7 +871,21 @@ pub const UploadDeps = struct {
     /// The fsync touched word (every publish stamps it).
     touched: ?*const fn (ctx: ?*anyopaque, ino: u64, ordinal: u32) void = null,
     touched_ctx: ?*anyopaque = null,
+    /// The PLAINTEXT whole-block image a binding names (a transformed
+    /// volume's frame decoded) — every whole-block seed reads through it;
+    /// null = raw through `device` (an all-passthrough set, the tests).
+    image: ?seams.ImageSeam = null,
+    /// The in-place fold's state half (W1's: custody, the sole-owner
+    /// verdict, the fence pair); null = the in-place arm is never taken.
+    custody: ?patch_w1.CustodyProbe = null,
 };
+
+/// The whole plaintext image of `b` into `out` (`image` when bound, else
+/// the raw device bytes).
+pub fn readImage(deps: UploadDeps, b: Binding, out: []u8) seams.ReadError!void {
+    if (deps.image) |im| return im.read(im.ctx, b, out);
+    return deps.device.read(b.vol_tag, b.offset, out);
+}
 
 const seams_transform = TransformSeam;
 
@@ -1087,6 +1134,9 @@ fn clearInflight(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) 
 /// escalation, a release, a spill): complete the complement under (3) —
 /// zeros on a fresh buffer, the old image on a deferred seed (one whole-
 /// block read) — then upload. `durable_upload_bytes_escalation` counts it.
+/// An extent entry folds IN PLACE when its block is a sole-owner
+/// passthrough mapping (§J.1 landing 2: the touched pages, nothing else,
+/// no upload); else it escalates (seeded whole for a CoW base) and uploads.
 pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) Disposition {
     const bs: u64 = table.block_size;
     {
@@ -1094,7 +1144,18 @@ pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block
         defer g.release(io);
         const e = table.get(ino, block) orelse return .discarded;
         if (e.repr == .extent) {
-            if (table.escalate(e) == null) return .stay_parked;
+            if (foldInPlaceLocked(table, deps, e)) |d| {
+                if (d == .published) table.capacity.notifyWaiters(io);
+                return d;
+            }
+            escalateExtentLocked(table, deps, e) catch |err| switch (err) {
+                error.PoolExhausted => return .stay_parked,
+                error.InputOutput, error.OutOfMemory => {
+                    stats.write_through_fallbacks.inc();
+                    return .stay_parked;
+                },
+            };
+            stats.durable_upload_bytes_escalation.add(bs);
         }
         if (!e.content_valid) {
             // The complement's base is the write-side authority's key NOW
@@ -1103,7 +1164,7 @@ pub fn flushParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block
             if (base) |old| {
                 const img = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return .stay_parked;
                 defer table.gpa.free(img);
-                deps.device.read(old.vol_tag, old.offset, img) catch return .stay_parked;
+                readImage(deps, old, img) catch return .stay_parked;
                 table.fillComplementFrom(e, img) catch return .stay_parked;
             } else {
                 // Fresh, or deferred without a binding (the existing bytes
@@ -1124,6 +1185,115 @@ fn uploadWith(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) Dis
     prof.finish();
     pipeline.countDisposition(d, table.block_size);
     return d;
+}
+
+// ---------------------------------------------------------------------------
+// §J.1 The W2 fold: in place at the page grain, or the whole-block escalation.
+// ---------------------------------------------------------------------------
+
+/// The RAM trigger's act (`extent.foldDue`, after the write's guard
+/// dropped): a deferred overlay over a sole-owner passthrough mapping folds
+/// IN PLACE and retires; every other shape escalates to a content-valid full
+/// buffer (seeded whole from the base for a CoW block, zeros for a hole) and
+/// stays PARKED — the block lands once, at its flush. An entry that is no
+/// longer an extent (escalated by a sibling, flushed) is left alone.
+pub fn foldExtentBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, block: u32) void {
+    const g = deps.locks.acquire(io, ino, block, .fold);
+    defer g.release(io);
+    const e = table.get(ino, block) orelse return;
+    if (e.repr != .extent) return;
+    if (foldInPlaceLocked(table, deps, e)) |d| {
+        if (d == .published) table.capacity.notifyWaiters(io);
+        return;
+    }
+    escalateExtentLocked(table, deps, e) catch |err| switch (err) {
+        // The pool is at its cap: the extent stays parked (the next write
+        // or the flush escalates once a cell exists) — never a park under (3).
+        error.PoolExhausted => extent.stats.extent_escalations_deferred.inc(),
+        error.InputOutput, error.OutOfMemory => stats.write_through_fallbacks.inc(),
+    };
+}
+
+/// The CoW arm's escalation under the caller's (3): the whole plaintext
+/// base image (ONE read; `fold_seed_reads`) under the touched pages for a
+/// deferred overlay with a binding, zeros otherwise — a content-valid full
+/// buffer that parks.
+pub fn escalateExtentLocked(table: *Table, deps: UploadDeps, e: *Entry) error{ PoolExhausted, InputOutput, OutOfMemory }!void {
+    assert(e.repr == .extent);
+    const bs: u64 = table.block_size;
+    const x = &e.repr.extent;
+    const k = x.count();
+    const base: ?Binding = if (x.base_deferred) deps.epochs.baseBinding(deps.map, e.key.ino, e.key.block) else null;
+    if (base) |old| {
+        const img = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch return error.OutOfMemory;
+        defer table.gpa.free(img);
+        readImage(deps, old, img) catch return error.InputOutput;
+        extent.stats.fold_seed_reads.inc();
+        table.escalate(e, img) orelse return error.PoolExhausted;
+    } else {
+        table.escalate(e, null) orelse return error.PoolExhausted;
+    }
+    extent.noteFold(k);
+}
+
+/// §J.1 landing 2, under the caller's (3): a deferred overlay (every
+/// touched page content-valid: the base's page + the user's bytes) over a
+/// block W1's state half passes for — the undecorated whole-block mapping
+/// on a passthrough volume, `refcount == 1 ∧ !SHARED` through the fence
+/// pair, no overlay record, no epoch binding — lands as ONE DMA per
+/// contiguous run of touched pages, at `mapping.offset + run.start`: zero
+/// allocation, free, map merge, journal. Then the W1 postlude (re-stabilize
+/// under the new generation, purge the four tiers, the touched stamp) and
+/// the entry retires. Null = declined (`fold_inplace_declines`): a hole, a
+/// CoW base, or no custody probe bound — the whole-block arm. A failed DMA
+/// leaves the entry PARKED (never lossy; the pages it holds are the truth
+/// and the next flush retries), counted and loud.
+fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
+    const x = &e.repr.extent;
+    if (!x.base_deferred) return null;
+    const probe = deps.custody orelse return null;
+    const pdeps: patch_w1.Deps = .{ .device = deps.device, .map = deps.map, .vols = deps.vols, .purge = deps.purge, .custody = probe, .touched = if (deps.touched) |t| .{ .ctx = deps.touched_ctx, .stamp = t } else null };
+    const begun = switch (patch_w1.beginInPlace(pdeps, e.key.ino, e.key.block, 0) catch {
+        extent.stats.fold_inplace_declines.inc();
+        return null;
+    }) {
+        .begun => |b| b,
+        .declined => {
+            extent.stats.fold_inplace_declines.inc();
+            return null;
+        },
+    };
+    const bs: u64 = table.block_size;
+    // The page runs assembled into a page-aligned scratch (the pages are
+    // separate allocations; a run is ONE DMA).
+    const scratch = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch {
+        patch_w1.abandonInPlace(pdeps, begun);
+        return null;
+    };
+    defer table.gpa.free(scratch);
+    var runs_buf: [extent.MAX_PAGES]extent.Run = undefined;
+    const runs = x.pageRuns(&runs_buf);
+    x.layInto(scratch);
+    var written: u64 = 0;
+    var dma: seams.DmaError!void = {};
+    for (runs) |r| {
+        dma = if (deps.device.write(begun.vol_tag, begun.dest + r.start, scratch[r.start..r.end])) |_| {} else |err| err;
+        if (dma) |_| {
+            written += r.end - r.start;
+            extent.stats.fold_inplace_dmas.inc();
+        } else |_| break;
+    }
+    patch_w1.finishInPlace(pdeps, begun, dma, "W2 in-place fold") catch {
+        extent.stats.fold_inplace_dma_errors.inc();
+        extent.stats.fold_inplace_write_bytes.add(written);
+        return .stay_parked;
+    };
+    extent.stats.fold_inplace_passes.inc();
+    extent.stats.fold_inplace_pages.add(x.pageCount());
+    extent.stats.fold_inplace_write_bytes.add(written);
+    extent.noteFold(x.count());
+    table.retire(e);
+    return .published;
 }
 
 // ---------------------------------------------------------------------------

@@ -84,8 +84,6 @@ pub const Config = struct {
     patch_max: u64,
     overlay: device_overlay.Config,
     rewrite_shadow: bool,
-    fold_max_extents: u64,
-    fold_max_bytes: u64,
     parked_cap: u64,
     depth_override: pipeline.DepthOverride,
     fsync: fsync_mod.Levers,
@@ -107,8 +105,6 @@ pub const Config = struct {
                 .ack_early_odirect = knobs.boolKnob("SQUEEZEFS_ZC_ACK_EARLY_ODIRECT", env),
             },
             .rewrite_shadow = knobs.boolKnob("SQUEEZEFS_REWRITE_SHADOW", env),
-            .fold_max_extents = extent.foldMaxExtentsFromEnv(env, block_size),
-            .fold_max_bytes = extent.foldMaxBytesFromEnv(env, block_size),
             .parked_cap = accumulate.parkedCapFromEnv(env, budget_bytes, block_size),
             .depth_override = pipeline.depthOverrideFromEnv(env),
             .fsync = fsync_mod.Levers.fromEnv(env),
@@ -157,8 +153,8 @@ pub const stats = struct {
     /// `parked_gate_waits`: visits to the parked-buffer gate at the pool
     /// cap (each a wait for a settle or a cold flush, never a refusal).
     pub var parked_gate_waits: counters.ShardedCounter = .{};
-    /// `parked_gate_self_flushes`: the fold at the last moment (this
-    /// writer's own block escalated, seeded and uploaded).
+    /// `parked_gate_self_flushes`: the W2 fold at the RAM bound (this
+    /// writer's own deferred overlay folded in place, or escalated seeded).
     pub var parked_gate_self_flushes: counters.ShardedCounter = .{};
     /// `parked_gate_cold_flushes`: a writer at the cap flushed the coldest
     /// parked block (untouched ≥ `PARKED_COLD_NS`) to make its cell.
@@ -469,6 +465,9 @@ pub const WritePath = struct {
     scratch: ?[]align(PAGE) u8,
     /// Some active volume is passthrough (the overlay has a destination).
     any_passthrough: bool,
+    /// The plaintext whole-block image of a binding (the plane decodes a
+    /// transformed frame; null = raw device bytes, an all-passthrough set).
+    image: ?seams.ImageSeam,
 
     pub const Deps = struct {
         /// The mount's `Io` for the slow paths that free parked supply
@@ -486,6 +485,8 @@ pub const WritePath = struct {
         transform: accumulate.TransformSeam = .passthrough,
         /// `transform.scratchLen(block)` when any volume is transformed; 0 otherwise.
         scratch_len: usize = 0,
+        /// The plaintext image seam (required when any volume is transformed).
+        image: ?seams.ImageSeam = null,
     };
 
     pub fn init(gpa: Allocator, cfg: Config, d: Deps) Allocator.Error!*WritePath {
@@ -519,6 +520,7 @@ pub const WritePath = struct {
             .transform = d.transform,
             .scratch = null,
             .any_passthrough = passthrough,
+            .image = d.image,
         };
         errdefer self.epochs.deinit();
         self.locks = try seams.BlockLocks.init(gpa, seams.BLOCK_LOCK_STRIPES);
@@ -579,7 +581,7 @@ pub const WritePath = struct {
     }
 
     pub fn uploadDeps(self: *WritePath) accumulate.UploadDeps {
-        return .{ .device = self.device, .map = self.map, .free = self.free, .purge = self.purge, .vols = self.vols, .picker = self.picker.picker(), .valve = self.valve, .epochs = &self.epochs, .stripes = self.stripes, .locks = &self.locks, .transform = self.transform, .scratch = self.scratch, .touched = &touchedStamp, .touched_ctx = self };
+        return .{ .device = self.device, .map = self.map, .free = self.free, .purge = self.purge, .vols = self.vols, .picker = self.picker.picker(), .valve = self.valve, .epochs = &self.epochs, .stripes = self.stripes, .locks = &self.locks, .transform = self.transform, .scratch = self.scratch, .touched = &touchedStamp, .touched_ctx = self, .image = self.image, .custody = .{ .ctx = self, .ram_custody = &epochCustody, .overlay_open = &overlayOpen } };
     }
 
     fn touchedStamp(ctx: ?*anyopaque, ino: u64, ordinal: u32) void {
@@ -590,6 +592,29 @@ pub const WritePath = struct {
     pub fn patchDeps(self: *WritePath) patch_w1.Deps {
         return .{ .device = self.device, .map = self.map, .vols = self.vols, .purge = self.purge, .custody = .{ .ctx = self, .ram_custody = &ramCustody, .overlay_open = &overlayOpen }, .touched = .{ .ctx = self, .stamp = &touchedStamp } };
     }
+
+    /// The whole plaintext image of `b` (the seeded checkout's fill).
+    fn imageRead(ctx: ?*anyopaque, b: Binding, out: []u8) seams.ReadError!void {
+        const self: *WritePath = @ptrCast(@alignCast(ctx.?));
+        if (self.image) |im| return im.read(im.ctx, b, out);
+        return self.device.read(b.vol_tag, b.offset, out);
+    }
+
+    /// The W2 page seeder over a passthrough binding: the base's page `idx`
+    /// is one ranged device read (the image IS the payload there).
+    const PageSeed = struct {
+        wp: *WritePath,
+        binding: Binding,
+
+        fn read(ctx: ?*anyopaque, idx: u32, dst: []u8) seams.ReadError!void {
+            const self: *const PageSeed = @ptrCast(@alignCast(ctx.?));
+            return self.wp.device.read(self.binding.vol_tag, self.binding.offset + @as(u64, idx) * PAGE, dst);
+        }
+
+        fn seeder(self: *const PageSeed) extent.Seeder {
+            return .{ .ctx = @constCast(self), .read = &read };
+        }
+    };
 
     // ---- the il host's faces (charter §7) ----
 
@@ -676,7 +701,7 @@ pub const WritePath = struct {
     /// generation (content unchanged, so no purge), hand the guard back;
     /// the caller takes the sever → handoff path.
     pub fn abortDirectWrite(self: *WritePath, io: Io, d: DirectBegun) void {
-        if (self.vols.byTag(d.begun.vol_tag)) |vol| vol.alloc.publishBlock(d.begun.idx);
+        patch_w1.abandonInPlace(self.patchDeps(), d.begun);
         d.guard.release(io);
     }
 
@@ -692,6 +717,13 @@ pub const WritePath = struct {
     fn ramCustody(ctx: ?*anyopaque, ino: u64, block: u32) bool {
         const self: *WritePath = @ptrCast(@alignCast(ctx.?));
         return self.table.has(ino, block) or self.epochs.bindsBlock(ino, block);
+    }
+
+    /// The in-place fold's RAM-custody probe: the folding entry IS the
+    /// table's custody of the block, so only an epoch binding declines.
+    fn epochCustody(ctx: ?*anyopaque, ino: u64, block: u32) bool {
+        const self: *WritePath = @ptrCast(@alignCast(ctx.?));
+        return self.epochs.bindsBlock(ino, block);
     }
 
     fn overlayOpen(ctx: ?*anyopaque, ino: u64, block: u32) bool {
@@ -891,44 +923,72 @@ pub const WritePath = struct {
             // E. Deferred-slot materialize.
             if (bytes.* == null) bytes.* = self.materialize(io, req.payload) catch return error.InputOutput;
             const data = bytes.*.?[pc.off .. pc.off + pc.len];
-            // F. W2 extent park.
+            // F. W2 extent park (§J.1): the page overlay. A small write into
+            //    a mapped block on a TRANSFORMED volume cannot seed its page
+            //    (a plaintext page costs a whole-frame decode): it takes the
+            //    SEEDED checkout below (one decode, a content-valid full
+            //    buffer that parks) instead of the overlay.
             const small = extent.isSmall(pc.len, bs);
             const existing = self.table.get(req.ino, pc.block);
-            if (small and !stream_adjacent and (existing == null or existing.?.repr == .extent)) {
+            const base_passthrough = if (live_binding) |b| (if (self.vols.byTag(b.vol_tag)) |v| v.passthrough else false) else true;
+            if (small and !stream_adjacent and (existing == null or existing.?.repr == .extent) and (existing != null or base_passthrough)) {
                 const e = existing orelse self.table.checkoutExtent(req.ino, pc.block, has_existing, live_binding) orelse {
                     try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                     continue;
                 };
-                e.repr.extent.merge(self.gpa, pc.rel, data) catch return error.OutOfMemory;
-                const v = e.coverage.record(pc.rel, pc.rel + pc.len, @intCast(bs)) catch {
-                    // The run table is full on an extent entry: escalate (the slabs lay into a buffer).
-                    if (self.table.escalate(e) == null) {
-                        try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
-                        continue;
-                    }
-                    extent.stats.extent_escalations.inc();
-                    stats.admit_write_accumulate_bytes.add(pc.len);
-                    break :blk .accumulate_park;
+                // The seed at the page grain: a deferred overlay's page is
+                // the base's page, read ONCE at first touch (the write-side
+                // authority's binding NOW); a hole's page is zeros.
+                const seed: PageSeed = .{ .wp = self, .binding = live_binding orelse undefined };
+                e.repr.extent.merge(self.gpa, pc.rel, data, if (e.seed == .deferred and live_binding != null) seed.seeder() else null) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InputOutput => return error.InputOutput,
                 };
-                if (v.completed) extent.stats.extent_overlay_completed_coverage.fire("an extent overlay completed the block's coverage");
                 e.write_epoch = accumulate.nextWriteEpoch();
                 e.app_end = @max(e.app_end, pc.rel + pc.len);
+                e.last_touch_ns = clock.monotonicNs();
                 extent.stats.extent_parks.inc();
-                // The piece is RECORDED either way; an escalation the pool
-                // cannot back now is DEFERRED (the extent stays parked; the
-                // block's next write or its flush escalates once a cell
-                // exists) — never a refusal, never a park under (3).
-                if (v.completed or extent.escalationDue(e.repr.extent.bytes, bs)) {
-                    if (self.table.escalate(e) != null) extent.stats.extent_escalations.inc() else extent.stats.extent_escalations_deferred.inc();
-                } else if (e.repr.extent.count() >= self.cfg.fold_max_extents or e.repr.extent.bytes >= self.cfg.fold_max_bytes) {
-                    // The fold at the last moment: escalate, seed once, upload.
-                    if (self.table.escalate(e) != null) {
-                        extent.stats.extent_escalations.inc();
-                        hint = .fold;
-                    } else extent.stats.extent_escalations_deferred.inc();
-                }
                 stats.admit_write_accumulate_bytes.add(pc.len);
+                const x = &e.repr.extent;
+                if (x.isComplete(bs)) {
+                    // Every page touched: a complete content-valid image —
+                    // the write-through trigger (an escalation the pool
+                    // cannot back now is DEFERRED to the next write/flush).
+                    if (self.table.escalate(e, null) != null) {
+                        hint = .upload;
+                        break :blk .write_through;
+                    }
+                    extent.stats.extent_escalations_deferred.inc();
+                } else if (extent.foldDue(x.pageCount(), bs)) {
+                    // The RAM bound: a hole block escalates HERE (zeros, no
+                    // I/O) and parks until its one landing; a deferred
+                    // overlay folds after the guard drops — in place at the
+                    // page grain, or the CoW escalation seeded whole.
+                    if (x.base_deferred and live_binding != null) {
+                        hint = .fold;
+                    } else if (self.table.escalate(e, null) == null) {
+                        extent.stats.extent_escalations_deferred.inc();
+                    }
+                }
                 break :blk .extent;
+            }
+            if (small and !stream_adjacent and existing == null and !base_passthrough) {
+                const seeded = self.table.checkoutSeeded(req.ino, pc.block, live_binding.?, &imageRead, self) catch |err| switch (err) {
+                    error.PoolExhausted => {
+                        try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
+                        continue;
+                    },
+                    error.InputOutput => return error.InputOutput,
+                };
+                _ = self.table.recordWrite(seeded, pc.rel, data) catch |err| switch (err) {
+                    error.PoolExhausted => {
+                        try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
+                        continue;
+                    },
+                    error.NeedsSeed => unreachable, // seeded at checkout
+                };
+                stats.admit_write_accumulate_bytes.add(pc.len);
+                break :blk .accumulate_park;
             }
             // G. Accumulation checkout (an extent entry escalates first). A
             //    PLACED payload whose assembly the first merge already
@@ -965,11 +1025,16 @@ pub const WritePath = struct {
                 };
             };
             if (e.repr == .extent) {
-                if (self.table.escalate(e) == null) {
-                    try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
-                    continue;
-                }
-                extent.stats.extent_escalations.inc();
+                // A larger or stream-adjacent piece on an extent entry: the
+                // overlay escalates first (seeded whole from the base when
+                // deferred — its untouched pages are the base's, never zeros).
+                accumulate.escalateExtentLocked(&self.table, self.uploadDeps(), e) catch |err| switch (err) {
+                    error.PoolExhausted => {
+                        try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
+                        continue;
+                    },
+                    error.InputOutput, error.OutOfMemory => |x| return x,
+                };
             }
             // I. The staged sibling supersede is the writeback module's
             //    ring key; the RAM entry outranks a spilled copy.
@@ -1007,7 +1072,7 @@ pub const WritePath = struct {
             },
             .fold => {
                 stats.parked_gate_self_flushes.inc();
-                _ = accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, req.ino, pc.block);
+                accumulate.foldExtentBlock(&self.table, self.uploadDeps(), io, req.ino, pc.block);
             },
         }
         return arm;
@@ -1028,7 +1093,7 @@ pub const WritePath = struct {
                 };
                 const img = self.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(self.cfg.block_size)) catch return error.OutOfMemory;
                 defer self.gpa.free(img);
-                self.device.read(old.vol_tag, old.offset, img) catch return error.InputOutput;
+                imageRead(self, old, img) catch return error.InputOutput;
                 self.table.fillComplementFrom(e, img) catch |e2| switch (e2) {
                     error.PoolExhausted => return error.PoolExhausted,
                     error.NeedsSeed => unreachable, // the fill IS the seed
@@ -1236,8 +1301,6 @@ test "Config.fromEnv reads every row once: defaults derive; levers log when non-
     try testing.expectEqual(@as(u64, 512 * 1024), c.patch_max);
     try testing.expect(c.overlay.enabled and c.overlay.overwrite and !c.overlay.close_barrier and c.overlay.depth_governor);
     try testing.expect(c.rewrite_shadow);
-    try testing.expectEqual(@as(u64, 64), c.fold_max_extents);
-    try testing.expectEqual(@as(u64, 1 << 20), c.fold_max_bytes);
     try testing.expectEqual(@as(u64, 1024), c.parked_cap);
     try testing.expectEqual(pipeline.DepthOverride.adaptive, c.depth_override);
     try testing.expect(c.fsync.touched_namespaces and c.fsync.parallel_legs and !c.fsync.promote_staged.on);
@@ -1265,9 +1328,6 @@ const World = struct {
             .patch_max = wt.BS / 8,
             .overlay = .{ .block_size = wt.BS, .patch_max = wt.BS / 8, .enabled = overlay_on },
             .rewrite_shadow = true,
-            // At the 64 KiB test block the derivations fold at 1 extent; the shipped shape is pinned here.
-            .fold_max_extents = 64,
-            .fold_max_bytes = wt.BS / 4,
             .parked_cap = 8,
             .depth_override = depth,
             .fsync = .{},
@@ -1428,7 +1488,7 @@ test "the per-piece ladder (the accumulation control arm, overlay off): out-of-o
     _ = try w.wp.write(io, .{ .ino = 21, .offset = 2 * wt.BS + 14 * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = World.striped(8 * wt.BS) }); // 4 pages = 25 % of 16
     try testing.expectEqual(esc0 + 1, extent.stats.extent_escalations.load());
     try testing.expect(w.wp.table.get(21, 2).?.repr == .full);
-    try testing.expectEqual(gauge_before - 2 * PAGE, extent.stats.parked_extent_bytes.load()); // the slabs left the extent budget for the buffer's
+    try testing.expectEqual(gauge_before - 2 * extent.PAGE_CHARGE, extent.stats.parked_extent_bytes.load()); // the pages left the extent budget for the buffer's
     // The shared-mode handoff: a Shared write that extends trips the wire
     // (the data plane still serves it) — the tripwire's line and the one
     // naming the ino, the range and the size.
@@ -1446,7 +1506,7 @@ test "the per-piece ladder (the accumulation control arm, overlay off): out-of-o
     try testing.expect(w.f.map.seam().lookup(21, 2) != null);
 }
 
-test "every acked byte reads back across the W2 extent cap (repro-port: LTP fs gf27 — one-byte grow-by-lseek writes 4 KiB apart into block 1 read back 0 from the 65th on): 1-byte writes 512 B apart into one block, each served back by the write side before and after FOLD_MAX_EXTENTS; the flush lands all of them" {
+test "every acked byte reads back across the W2 overlay's escalation (repro-port: LTP fs gf27 — one-byte grow-by-lseek writes 4 KiB apart into block 1 read back 0 from the 65th on): 1-byte writes 512 B apart into one block, each served back by the write side before and after the RAM trigger; the flush lands all of them" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);
@@ -1456,7 +1516,7 @@ test "every acked byte reads back across the W2 extent cap (repro-port: LTP fs g
     _ = try w.f.publishBlock(30, 0, 0xAA);
     const view = w.wp.writeSideView();
     const step: u64 = 512;
-    const n_writes: u64 = wt.BS / step; // 128 > fold_max_extents (64)
+    const n_writes: u64 = wt.BS / step; // 128 writes over all 16 pages: past the quarter-block trigger
     var size: u64 = wt.BS;
     var i: u64 = 0;
     var win: [wt.BS]u8 = undefined;
@@ -1479,14 +1539,8 @@ test "every acked byte reads back across the W2 extent cap (repro-port: LTP fs g
             .partial => |p| if (p.base) |base| {
                 var img: [wt.BS]u8 = undefined;
                 w.f.dev.peek(base.vol_tag, base.offset, &img);
-                var runs: [cov.CoverageUnion.max_runs]cov.Run = undefined;
-                const covered = p.covered.coveredRunsIn(0, wt.BS, &runs);
-                var cursor: u32 = 0;
-                for (covered) |r| {
-                    if (r.start > cursor) @memcpy(win[cursor..r.start], img[cursor..r.start]);
-                    cursor = r.end;
-                }
-                if (cursor < wt.BS) @memcpy(win[cursor..], img[cursor..]);
+                var gaps = p.covered.gaps(0, wt.BS);
+                while (gaps.next()) |gp| @memcpy(win[gp.start..gp.end], img[gp.start..gp.end]);
             },
             .redirect => |shadow| w.f.dev.peek(shadow.vol_tag, shadow.offset, &win),
             .served, .settle, .busy => {},
@@ -1507,6 +1561,201 @@ test "every acked byte reads back across the W2 extent cap (repro-port: LTP fs g
     w.f.dev.peek(b.vol_tag, b.offset, &win);
     i = 0;
     while (i < n_writes) : (i += 1) try testing.expectEqual(@as(u8, 'w'), win[@intCast((i + 1) * step - 1)]);
+}
+
+test "W2 amplification law, hole blocks (repro-port: fstests generic/074 `fstest -F -b 512` — 512 B fragmented writes extending a fresh file; 128× on c36b531): every block lands exactly ONCE at its flush — device bytes == blocks × block, zero seed reads, byte-exact readback (the patterns and the zeros between them)" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(40, .striped, 0);
+    // 256 B every 512 B (a hole between every write), block after block:
+    // 128 writes per 64 KiB test block, far past any count cap.
+    const wlen: u64 = 256;
+    const stride: u64 = 512;
+    const n_blocks: u64 = 4;
+    var buf: [256]u8 = undefined;
+    var size: u64 = 0;
+    var user: u64 = 0;
+    var off: u64 = 0;
+    const wt0 = accumulate.stats.write_through_blocks.load();
+    while (off < n_blocks * wt.BS) : (off += stride) {
+        fill(&buf, @truncate(off / stride));
+        const o = try w.wp.write(io, .{ .ino = 40, .offset = off, .payload = .{ .bytes = &buf }, .class = .entire_op, .file = World.striped(size) });
+        try testing.expectEqual(wlen, o.written);
+        size = off + wlen;
+        user += wlen;
+    }
+    w.wp.flushIno(io, 40);
+    // The law: one whole-block landing per block, nothing read.
+    try testing.expectEqual(n_blocks * wt.BS, w.f.dev.writeBytesTotal());
+    try testing.expectEqual(@as(u64, 0), w.f.dev.reads);
+    try testing.expectEqual(wt0 + n_blocks, accumulate.stats.write_through_blocks.load());
+    try testing.expectEqual(extent.holeBoundPpm(wt.BS, wt.BS / 2), w.f.dev.writeBytesTotal() * 1_000_000 / user);
+    // Byte-exact: every pattern where it was written, zeros in every hole.
+    var got: [wt.BS]u8 = undefined;
+    var b: u32 = 0;
+    while (b < n_blocks) : (b += 1) {
+        const m = w.f.map.seam().lookup(40, b) orelse return error.TestUnexpectedResult;
+        w.f.dev.peek(m.vol_tag, m.offset, &got);
+        var rel: u64 = 0;
+        while (rel < wt.BS) : (rel += stride) {
+            fill(&buf, @truncate((b * wt.BS + rel) / stride));
+            try testing.expectEqualSlices(u8, &buf, got[rel .. rel + wlen]);
+            try testing.expect(std.mem.allEqual(u8, got[rel + wlen .. rel + stride], 0));
+        }
+    }
+}
+
+test "W2 amplification law, a mapped sole-owner passthrough block folds IN PLACE at the page grain: 4 sector-aligned 512 B writes into 4 scattered pages land as 4 page DMAs (16 KiB for 2 KiB = the 8× bound, the seed exactly the touched pages, no allocation / merge / free, the binding unchanged); contiguous pages are ONE DMA; a lone parked write flushes as one page at release, never a whole-block upload" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(41, 0, 0xAA);
+    _ = try w.f.publishBlock(41, 1, 0xBB);
+    _ = try w.f.publishBlock(41, 2, 0xCC);
+    const file = World.striped(3 * wt.BS);
+    const used = w.f.alloc_a.usedBlocks();
+    const merges = w.f.map.merges.items.len;
+    const ip0 = extent.stats.fold_inplace_write_bytes.load();
+    const dmas0 = extent.stats.fold_inplace_dmas.load();
+    const passes0 = extent.stats.fold_inplace_passes.load();
+    const seeds0 = extent.stats.extent_page_seed_bytes.load();
+    const folds0 = stats.parked_gate_self_flushes.load();
+    var sector: [512]u8 = undefined;
+    // Four scattered pages of block 0 (the 4th write is the quarter-block trigger at 16 pages).
+    const pages = [_]u64{ 0, 2, 5, 9 };
+    for (pages, 0..) |pg, i| {
+        fill(&sector, @intCast(0x10 + i));
+        const o = try w.wp.write(io, .{ .ino = 41, .offset = pg * PAGE + 1024, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+        try testing.expectEqual(@as(u32, 1), o.count(.extent));
+    }
+    try testing.expect(!w.wp.table.has(41, 0)); // folded and retired
+    try testing.expectEqual(folds0 + 1, stats.parked_gate_self_flushes.load());
+    try testing.expectEqual(passes0 + 1, extent.stats.fold_inplace_passes.load());
+    try testing.expectEqual(dmas0 + 4, extent.stats.fold_inplace_dmas.load());
+    try testing.expectEqual(ip0 + 4 * PAGE, extent.stats.fold_inplace_write_bytes.load());
+    try testing.expectEqual(seeds0 + 4 * PAGE, extent.stats.extent_page_seed_bytes.load());
+    try testing.expectEqual(@as(u64, 4 * PAGE), w.f.dev.writeBytesTotal());
+    try testing.expectEqual(@as(u64, 4 * PAGE), w.f.dev.read_bytes);
+    // The bound (tie): device ÷ user ≤ pages(512, 512) × P / 512 = 8×.
+    try testing.expect(w.f.dev.writeBytesTotal() * 1_000_000 / (4 * 512) <= extent.inPlaceBoundPpm(512, 512));
+    try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(merges, w.f.map.merges.items.len);
+    try testing.expectEqual(@as(usize, 0), w.f.frees.freed.items.len);
+    try testing.expect(w.f.map.seam().lookup(41, 0).?.eql(a));
+    try testing.expect(block_alloc.Incarnation.isStable(w.f.alloc_a.incarnationWord(w.f.alloc_a.idxOf(a.offset))));
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(a.vol_tag, a.offset, &got);
+    for (pages, 0..) |pg, i| {
+        fill(&sector, @intCast(0x10 + i));
+        try testing.expectEqualSlices(u8, &sector, got[pg * PAGE + 1024 .. pg * PAGE + 1536]);
+        try testing.expect(std.mem.allEqual(u8, got[pg * PAGE .. pg * PAGE + 1024], 0xAA)); // the seeded rest of the page
+        try testing.expect(std.mem.allEqual(u8, got[pg * PAGE + 1536 .. (pg + 1) * PAGE], 0xAA));
+    }
+    try testing.expect(std.mem.allEqual(u8, got[PAGE .. 2 * PAGE], 0xAA)); // an untouched page never written
+    // Contiguous pages 10..13 of block 1: ONE DMA of 16 KiB.
+    w.f.dev.resetLedger();
+    const dmas1 = extent.stats.fold_inplace_dmas.load();
+    var pg: u64 = 10;
+    while (pg < 14) : (pg += 1) {
+        fill(&sector, @intCast(pg));
+        _ = try w.wp.write(io, .{ .ino = 41, .offset = wt.BS + pg * PAGE + 2048, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+    }
+    try testing.expect(!w.wp.table.has(41, 1));
+    try testing.expectEqual(dmas1 + 1, extent.stats.fold_inplace_dmas.load());
+    try testing.expectEqual(@as(usize, 1), w.f.dev.writes.items.len);
+    try testing.expectEqual(@as(u64, 4 * PAGE), w.f.dev.writes.items[0].len);
+    // A lone write parks; RELEASE folds it in place as ONE page.
+    w.f.dev.resetLedger();
+    fill(&sector, 0x77);
+    _ = try w.wp.write(io, .{ .ino = 41, .offset = 2 * wt.BS + 7 * PAGE, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+    try testing.expect(w.wp.table.has(41, 2));
+    w.wp.flushIno(io, 41);
+    try testing.expect(!w.wp.table.has(41, 2));
+    try testing.expectEqual(@as(u64, PAGE), w.f.dev.writeBytesTotal());
+    try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(merges, w.f.map.merges.items.len);
+    const c = w.f.map.seam().lookup(41, 2).?;
+    w.f.dev.peek(c.vol_tag, c.offset, &got);
+    try testing.expectEqualSlices(u8, &sector, got[7 * PAGE .. 7 * PAGE + 512]);
+    try testing.expect(std.mem.allEqual(u8, got[7 * PAGE + 512 .. 8 * PAGE], 0xCC));
+    try testing.expectEqual(ip0 + 4 * PAGE + 4 * PAGE + PAGE, extent.stats.fold_inplace_write_bytes.load());
+}
+
+test "W2 amplification law, CoW bases land whole ONCE per parked episode: a cloned (pinned) block declines the in-place arm, escalates seeded (one whole read) and PARKS — later small writes are memcpys and the release uploads one block to a fresh destination; a transformed volume's block takes the seeded checkout (one decode) and likewise lands once" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(42, 0, 0xAA);
+    const file = World.striped(wt.BS);
+    // A clone pins the block: refcount 2 ⇒ never in place.
+    const idx = w.f.alloc_a.idxOf(a.offset);
+    try testing.expectEqual(block_alloc.PinVerdict.pinned, w.f.alloc_a.pinBlockValidated(idx));
+    const decl0 = extent.stats.fold_inplace_declines.load();
+    const seeds0 = extent.stats.fold_seed_reads.load();
+    const ip0 = extent.stats.fold_inplace_write_bytes.load();
+    var sector: [512]u8 = undefined;
+    var pg: u64 = 0;
+    while (pg < 4) : (pg += 1) {
+        fill(&sector, @intCast(pg));
+        _ = try w.wp.write(io, .{ .ino = 42, .offset = pg * 3 * PAGE, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+    }
+    try testing.expectEqual(decl0 + 1, extent.stats.fold_inplace_declines.load());
+    try testing.expectEqual(seeds0 + 1, extent.stats.fold_seed_reads.load());
+    try testing.expectEqual(ip0, extent.stats.fold_inplace_write_bytes.load());
+    try testing.expectEqual(@as(u64, 0), w.f.dev.writeBytesTotal()); // parked, nothing landed
+    const e = w.wp.table.get(42, 0).?;
+    try testing.expect(e.repr == .full and e.content_valid);
+    // The clone goes away; the parked full buffer still lands CoW (its
+    // flush is an upload, never a patch).
+    w.f.alloc_a.unpin(idx);
+    // Eight more small writes: memcpys into the parked buffer.
+    const reads_before = w.f.dev.read_bytes;
+    pg = 0;
+    while (pg < 8) : (pg += 1) {
+        fill(&sector, @intCast(0x40 + pg));
+        _ = try w.wp.write(io, .{ .ino = 42, .offset = pg * PAGE + 100, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+    }
+    try testing.expectEqual(reads_before, w.f.dev.read_bytes);
+    try testing.expectEqual(@as(u64, 0), w.f.dev.writeBytesTotal());
+    w.wp.flushIno(io, 42);
+    try testing.expectEqual(@as(u64, wt.BS), w.f.dev.writeBytesTotal()); // ONE landing
+    const b = w.f.map.seam().lookup(42, 0).?;
+    try testing.expect(!b.eql(a)); // CoW: a fresh destination
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    fill(&sector, 0x40);
+    try testing.expectEqualSlices(u8, &sector, got[100..612]);
+    fill(&sector, 1);
+    try testing.expectEqualSlices(u8, sector[0..100], got[3 * PAGE .. 3 * PAGE + 100]); // the first write's head; the later write at +100 wins the rest
+    try testing.expect(std.mem.allEqual(u8, got[PAGE + 612 .. 2 * PAGE], 0xAA));
+    // The transformed volume (B is not passthrough): a mapped block there
+    // takes the seeded checkout — one image read, a parked content-valid
+    // buffer, one landing at release.
+    const mb = try w.f.alloc_b.allocateBlock();
+    var img: [wt.BS]u8 = @splat(0xB0);
+    try w.f.dev.seam().vtable.write(&w.f.dev, wt.VOL_B, mb.offset, &img);
+    w.f.alloc_b.publishBlock(mb.idx);
+    const bb = Binding.wholeBlock(wt.VOL_B, mb.offset, mb.stamp);
+    try w.f.map.create(43, .striped, wt.BS);
+    try w.f.map.bind(43, 0, bb);
+    w.f.dev.resetLedger();
+    const mat0 = accumulate.stats.overwrite_seed_materialized.load();
+    fill(&sector, 0x55);
+    const o = try w.wp.write(io, .{ .ino = 43, .offset = 5 * PAGE + 7, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+    try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
+    try testing.expectEqual(mat0 + 1, accumulate.stats.overwrite_seed_materialized.load());
+    try testing.expectEqual(@as(u64, wt.BS), w.f.dev.read_bytes);
+    _ = try w.wp.write(io, .{ .ino = 43, .offset = 9 * PAGE + 7, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+    try testing.expectEqual(@as(u64, wt.BS), w.f.dev.read_bytes); // no second read
+    try testing.expectEqual(@as(u64, 0), w.f.dev.writeBytesTotal());
+    w.wp.flushIno(io, 43);
+    try testing.expectEqual(@as(u64, wt.BS), w.f.dev.writeBytesTotal());
+    const nb = w.f.map.seam().lookup(43, 0).?;
+    w.f.dev.peek(nb.vol_tag, nb.offset, &got);
+    try testing.expectEqualSlices(u8, &sector, got[5 * PAGE + 7 .. 5 * PAGE + 519]);
+    try testing.expectEqualSlices(u8, &sector, got[9 * PAGE + 7 .. 9 * PAGE + 519]);
+    try testing.expect(std.mem.allEqual(u8, got[0 .. 5 * PAGE + 7], 0xB0));
 }
 
 test "fsync through the write path: a parked block, an open overlay and a shadowed epoch all land; the phases sum exactly; nothing stays open" {
@@ -1551,13 +1800,18 @@ test "the lost overwrite (2026-10-07, the smoke's dd-per-overwrite shape): a wri
     const file = World.striped(2 * wt.BS);
     const drift0 = counters.tripwireCount("rewrite_shadow_displaced_drift");
     const untracked0 = counters.tripwireCount("block_untracked_free_refusals");
-    // dd #N: an unaligned 4 KiB overwrite of block 1 (W1-ineligible ⇒ W2 park).
+    // dd #N: an unaligned 4 KiB overwrite of block 1 (W1-ineligible ⇒ W2
+    // park). A1 is CLONED (pinned: refcount 2) so the flush takes the CoW
+    // arm — a sole-owner block would fold in place and open no epoch.
+    const a1_idx = w.f.alloc_a.idxOf(a1.offset);
+    try testing.expectEqual(block_alloc.PinVerdict.pinned, w.f.alloc_a.pinBlockValidated(a1_idx));
     var p: [PAGE]u8 = @splat(0x11);
     const o1 = try w.wp.write(io, .{ .ino = 50, .offset = wt.BS + 3 * PAGE + 100, .payload = .{ .bytes = &p }, .class = .shared, .file = file });
     try testing.expectEqual(@as(u32, 1), o1.count(.extent));
     // RELEASE #N, first half: the parked block flushes and FEEDS the epoch
     // (shadow B over block 1, A1 parked); the ONE save has not run yet.
     try testing.expectEqual(accumulate.Disposition.published, accumulate.flushParkedBlock(&w.wp.table, w.wp.uploadDeps(), io, 50, 1));
+    w.f.alloc_a.unpin(a1_idx);
     try testing.expect(w.wp.epochs.bindsBlock(50, 1));
     const b = w.wp.epochs.shadowOf(50, 1).?;
     try testing.expect(w.f.map.seam().lookup(50, 1).?.eql(a1));
@@ -1575,18 +1829,20 @@ test "the lost overwrite (2026-10-07, the smoke's dd-per-overwrite shape): a wri
     // RELEASE #N, second half: the save lands (map → B, A1 freed once).
     try testing.expect(w.wp.epochs.close(io, 50, w.wp.closeSeams()) == .swapped);
     try testing.expect(w.f.map.seam().lookup(50, 1).?.eql(b));
-    // RELEASE #N+1: the flush seeds from B, feeds, and the save displaces B.
+    // RELEASE #N+1: B is the sole-owner map key now — the parked page
+    // folds IN PLACE into B (its untouched bytes were seeded from B at the
+    // touch), nothing is displaced.
     w.wp.flushIno(io, 50);
     const final = w.f.map.seam().lookup(50, 1).?;
+    try testing.expect(final.eql(b));
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(final.vol_tag, final.offset, &got);
     try testing.expect(std.mem.allEqual(u8, got[3 * PAGE + 100 .. 4 * PAGE + 100], 0x11)); // dd #N's bytes
     try testing.expect(std.mem.allEqual(u8, got[8 * PAGE .. 9 * PAGE], 0x22)); // dd #N+1's bytes
     try testing.expect(std.mem.allEqual(u8, got[0 .. 3 * PAGE], 0xBB));
     try testing.expect(std.mem.allEqual(u8, got[9 * PAGE ..], 0xBB));
-    try testing.expectEqual(@as(usize, 2), w.f.frees.freed.items.len);
+    try testing.expectEqual(@as(usize, 1), w.f.frees.freed.items.len);
     try testing.expect(w.f.frees.freed.items[0].eql(a1));
-    try testing.expect(w.f.frees.freed.items[1].eql(b));
     try testing.expectEqual(drift0, counters.tripwireCount("rewrite_shadow_displaced_drift"));
     try testing.expectEqual(untracked0, counters.tripwireCount("block_untracked_free_refusals"));
     try testing.expectEqual(@as(usize, 0), w.wp.epochs.openCount());

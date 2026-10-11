@@ -567,8 +567,6 @@ const Lab = struct {
             .patch_max = wt.BS / 8,
             .overlay = .{ .block_size = wt.BS, .patch_max = wt.BS / 8, .enabled = false },
             .rewrite_shadow = true,
-            .fold_max_extents = 64,
-            .fold_max_bytes = wt.BS / 4,
             .parked_cap = 8,
             .depth_override = .sync_inline,
             .fsync = .{},

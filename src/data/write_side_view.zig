@@ -26,6 +26,7 @@ const staging = @import("staging.zig");
 const cov = @import("write_coverage.zig");
 const seams = @import("write_seams.zig");
 const accumulate = @import("accumulate.zig");
+const extent = @import("extent_overlay.zig");
 const device_overlay = @import("device_overlay.zig");
 const enospc = @import("enospc.zig");
 const epoch_mod = @import("write_epoch.zig");
@@ -34,9 +35,95 @@ pub const Binding = seams.Binding;
 
 pub const Source = enum(u8) { accumulation, extent, device_overlay, staged };
 
+/// What of a window the view filled — EXACT in both shapes: the
+/// accumulation buffer's byte-granular runs (its union holds ≤ `max_runs`
+/// by construction) or the page overlay's page set (a touched page is
+/// content-valid whole; 1024 pages at the format's largest block). A run
+/// table that could drop runs past its capacity would hand the base's
+/// bytes to a reader over acked ones.
+pub const Covered = union(enum) {
+    runs: cov.CoverageUnion,
+    pages: extent.PageSet,
+
+    pub fn contains(self: *const Covered, start: u32, end: u32) bool {
+        switch (self.*) {
+            .runs => |*u| return u.contains(start, end),
+            .pages => |*s| {
+                var p = start / extent.PAGE;
+                const last = (end - 1) / extent.PAGE;
+                while (p <= last) : (p += 1) if (!s.isSet(p)) return false;
+                return true;
+            },
+        }
+    }
+
+    /// The gaps of `[rel, end)` in ascending order (contiguous untouched
+    /// pages coalesce into one gap: one base read each).
+    pub fn gaps(self: *const Covered, rel: u32, end: u32) GapIter {
+        var it: GapIter = .{ .rel = rel, .end = end, .cursor = rel, .shape = undefined };
+        switch (self.*) {
+            .runs => |*u| {
+                it.shape = .{ .runs = .{} };
+                it.shape.runs.n = u.coveredRunsIn(rel, end, &it.shape.runs.buf).len;
+            },
+            .pages => |*s| it.shape = .{ .pages = s.* },
+        }
+        return it;
+    }
+
+    pub const GapIter = struct {
+        rel: u32,
+        end: u32,
+        cursor: u32,
+        shape: union(enum) {
+            runs: struct { buf: [cov.CoverageUnion.max_runs]cov.Run = undefined, n: usize = 0, i: usize = 0 },
+            pages: extent.PageSet,
+        },
+
+        pub fn next(self: *GapIter) ?cov.Run {
+            switch (self.shape) {
+                .runs => |*r| {
+                    while (r.i < r.n) {
+                        const run = r.buf[r.i];
+                        r.i += 1;
+                        if (run.start > self.cursor) {
+                            const g: cov.Run = .{ .start = self.cursor, .end = run.start };
+                            self.cursor = run.end;
+                            return g;
+                        }
+                        self.cursor = @max(self.cursor, run.end);
+                    }
+                    if (self.cursor < self.end) {
+                        const g: cov.Run = .{ .start = self.cursor, .end = self.end };
+                        self.cursor = self.end;
+                        return g;
+                    }
+                    return null;
+                },
+                .pages => |*s| {
+                    while (self.cursor < self.end) {
+                        const p = self.cursor / extent.PAGE;
+                        if (s.isSet(p)) {
+                            self.cursor = @min(self.end, (p + 1) * extent.PAGE);
+                            continue;
+                        }
+                        // An untouched page: extend over the untouched run.
+                        var q = p;
+                        while ((q + 1) * extent.PAGE < self.end and !s.isSet(q + 1)) : (q += 1) {}
+                        const g: cov.Run = .{ .start = self.cursor, .end = @min(self.end, (q + 1) * extent.PAGE) };
+                        self.cursor = g.end;
+                        return g;
+                    }
+                    return null;
+                },
+            }
+        }
+    };
+};
+
 pub const Partial = struct {
-    /// The runs of `out` the view filled (block-relative, clipped to the window).
-    covered: cov.CoverageUnion,
+    /// What of `out` the view filled (block-relative, clipped to the window).
+    covered: Covered,
     /// Where the gaps come from (null ⇒ zeros: a hole).
     base: ?Binding,
 };
@@ -168,13 +255,22 @@ pub const Composite = struct {
                     .full => {
                         const snap = self.table.snapshot(e);
                         defer snap.release(&self.table.pool);
+                        // A content-valid buffer is the block (its gaps hold
+                        // the zeros or the base its exit established): the
+                        // window verbatim. A fresh one's gaps are zeros by
+                        // definition; a deferred one's are the base's.
+                        if (e.content_valid) {
+                            @memcpy(req.out, snap.bytes()[req.rel..end]);
+                            stats.write_side_serves.inc();
+                            return .{ .served = .accumulation };
+                        }
                         snap.coveredRead(req.rel, req.out);
-                        if (e.content_valid or e.seed == .fresh) {
+                        if (e.seed == .fresh) {
                             stats.write_side_serves.inc();
                             return .{ .served = .accumulation };
                         }
                         stats.write_side_partials.inc();
-                        return .{ .partial = .{ .covered = clip(&snap.coverage, req.rel, end), .base = base } };
+                        return .{ .partial = .{ .covered = .{ .runs = clip(&snap.coverage, req.rel, end) }, .base = base } };
                     },
                     .extent => |*x| {
                         x.coveredRead(req.rel, req.out);
@@ -183,7 +279,7 @@ pub const Composite = struct {
                             return .{ .served = .extent };
                         }
                         stats.write_side_partials.inc();
-                        return .{ .partial = .{ .covered = clip(&e.coverage, req.rel, end), .base = base } };
+                        return .{ .partial = .{ .covered = .{ .pages = x.pageSet() }, .base = base } };
                     },
                 }
             }
@@ -319,15 +415,58 @@ test "the seam: none answers nothing; a fresh accumulation buffer serves its cov
     try testing.expect(!o.partial.covered.contains(wt.BS / 4, wt.BS / 2));
     try testing.expect(std.mem.allEqual(u8, half[wt.BS / 4 ..], 0x44));
     w.table.retire(d);
-    // Extent overlay over a mapped block: partial as well.
+    // Extent overlay over a mapped block: partial as well, page-exact —
+    // the touched page is whole, every other page a gap for the base.
     const x = w.table.checkoutExtent(2, 0, true, a).?;
-    try x.repr.extent.merge(testing.allocator, 4096, q[0..4096]);
-    _ = try x.coverage.record(4096, 8192, @intCast(wt.BS));
+    try x.repr.extent.merge(testing.allocator, 4096 + 100, q[0..1000], null);
     const o2 = v.serve(io, .{ .ino = 2, .block = 0, .rel = 0, .out = &out });
     try testing.expect(o2 == .partial and o2.partial.covered.contains(4096, 8192));
-    try testing.expect(std.mem.allEqual(u8, out[4096..8192], 0x44));
+    try testing.expect(!o2.partial.covered.contains(0, 4096));
+    try testing.expect(std.mem.allEqual(u8, out[4096 + 100 .. 4096 + 1100], 0x44));
+    var gaps = o2.partial.covered.gaps(0, @intCast(wt.BS));
+    try testing.expectEqual(cov.Run{ .start = 0, .end = 4096 }, gaps.next().?);
+    try testing.expectEqual(cov.Run{ .start = 8192, .end = @intCast(wt.BS) }, gaps.next().?);
+    try testing.expect(gaps.next() == null);
     w.table.retire(x);
     w.table.retire(e);
+}
+
+test "Covered.gaps is exact in both shapes: byte runs (a deferred buffer's clipped union) and the page set (a scattered overlay past any run table's capacity: every untouched page is a gap, contiguous ones coalesce, the window clips)" {
+    // Runs: covered [100, 200) and [300, 400) of a [50, 450) window.
+    var u: cov.CoverageUnion = .empty;
+    _ = try u.record(100, 200, 4096);
+    _ = try u.record(300, 400, 4096);
+    const c: Covered = .{ .runs = u };
+    var it = c.gaps(50, 450);
+    try testing.expectEqual(cov.Run{ .start = 50, .end = 100 }, it.next().?);
+    try testing.expectEqual(cov.Run{ .start = 200, .end = 300 }, it.next().?);
+    try testing.expectEqual(cov.Run{ .start = 400, .end = 450 }, it.next().?);
+    try testing.expect(it.next() == null);
+    var it2 = c.gaps(100, 200);
+    try testing.expect(it2.next() == null);
+    // Pages: every other page of a 1024-page block touched — 512 runs, far
+    // past the 65 the union could hold; each untouched page is one gap.
+    var s = extent.PageSet.empty;
+    var p: usize = 0;
+    while (p < extent.MAX_PAGES) : (p += 2) s.set(p);
+    const pc: Covered = .{ .pages = s };
+    const P = extent.PAGE;
+    var n: usize = 0;
+    var it3 = pc.gaps(0, extent.MAX_PAGES * P);
+    while (it3.next()) |g| : (n += 1) {
+        try testing.expectEqual(g.start + P, g.end);
+        try testing.expectEqual(@as(u32, 1), (g.start / P) % 2);
+    }
+    try testing.expectEqual(extent.MAX_PAGES / 2, n);
+    try testing.expect(pc.contains(0, P) and !pc.contains(0, 2 * P));
+    // A window inside one untouched page clips; contiguous untouched pages coalesce.
+    var s2 = extent.PageSet.empty;
+    s2.set(5);
+    const pc2: Covered = .{ .pages = s2 };
+    var it4 = pc2.gaps(3 * P + 10, 9 * P - 10);
+    try testing.expectEqual(cov.Run{ .start = 3 * P + 10, .end = 5 * P }, it4.next().?);
+    try testing.expectEqual(cov.Run{ .start = 6 * P, .end = 9 * P - 10 }, it4.next().?);
+    try testing.expect(it4.next() == null);
 }
 
 test "precedence: an open overlay record serves (composed over the old binding) ahead of the epoch shadow; a shadowed block redirects to the B key; a block with no custody falls through" {

@@ -165,3 +165,81 @@ Charter §9 amended accordingly (lane names; the timer/fd-watch bullet).
 | The idle clock's grain | The sampler's tick count (1 Hz); Yellow trims entries idle ≥ 2 ticks, Red everything idle (0) | One tick cannot distinguish "freed a microsecond ago" from "free for a second": 2 is the least count that proves a full period idle; 0 under Red is the shed's promise that what it evicted returns in the same tick |
 | The in-flight fill headroom | Stays uncounted (the one gap left in the fill pool's Σ): `max(cores × 16, 64)` slots × block | A fill in flight is neither a tier entry nor idle; counting it needs the pool to know which checked-out slots are tiers' — the reference's `read_lane_inflight` component is the same hole; bounded by the headroom (576 MiB at 4 MiB blocks on 9 CPUs), named in the evidence note |
 | The parked-buffer component's weight | `parked_full_buffers` registers weight 0 (attribution + the idle trim of its cached cells) until the write path binds a drain-target shed | A sheddable weight with a no-op shed dilutes every other component's Red share for nothing; the drain plumbing (`drain_target.fetch_min` + the parked gate) lives in `write_admit.zig`, a concurrently owned file — the registration is here, the shed is theirs to bind (owed) |
+
+## J. Write amplification is a product defect (2026-10-11, the owner's ruling; `docs/evidence/rung-09-external-suites.md` generic/069 + generic/074)
+
+Two measured defects — the W2 fold at **128×** (109 GB of device writes for 855 MB of user
+bytes) and the staged arm re-staging a 1–2 MiB image per 4-byte append (≈ 3 ms, ≈ 2–4 MiB
+moved per append) — and the bounds that replace the charter's `2048/k + 2` (written for ~2 KiB
+extents and a whole-block fold; a COUNT cap with tiny extents is the wrong bound and a whole-block
+rewrite the wrong grain). Symbols: `B` the block (4 MiB), `P` the device grain (4 KiB), `e` one
+W2-class write's length, `a` the alignment its offsets obey (`a | P`; `a = 1` for arbitrary
+offsets), `u` the user bytes a block received between two device landings.
+
+### J.1 The W2 overlay — three landings, three bounds
+
+The overlay is **page-indexed**: a touched page is a 4 KiB buffer that is content-valid at every
+byte (zeros on a hole block; the base's page, read ONCE at first touch on a passthrough mapped
+block; a transformed base — whose plaintext page costs a whole-frame decode — takes the seeded
+full buffer, below). Coverage is therefore page-granular and exact (a 128 B page set), never a
+65-run table that silently drops runs; "uncovered bytes never escape" holds by construction.
+
+1. **A hole block lands exactly once.** Write-before-publish (a recycled block holds stale bytes;
+   only a block every byte of which was written since its allocation may be published) makes the
+   first landing a whole-block write whatever the fold grain; so a hole block is never folded
+   mid-stream — at `pages ≥ B/4P` (a quarter block of page RAM) it escalates to a zero-completed
+   full buffer and PARKS (a complete, content-valid block absorbs every later write at memcpy
+   cost) until its flush (release, fsync, the pool cap's cold flush, the budget).
+   `device = B`, `amp_hole = B / u_flush`; for a stream filling a fraction `f` of the block,
+   `amp = 1/f` (generic/074's 512 B at a 1 KiB stride: `f = ½ ⇒ 2×`). A lone small write per block
+   pays `B/e` — the physics of the law, stated, not a fold defect.
+2. **A mapped sole-owner passthrough block folds IN PLACE at the page grain** (W1's state half:
+   undecorated whole-block mapping, passthrough, `refcount == 1 ∧ !SHARED` through the fence pair,
+   no overlay record, no epoch binding): one DMA per contiguous run of touched pages, zero
+   allocation / free / map merge / journal. A write of `e` bytes at offsets `≡ 0 (mod a)` touches
+   at most `pages(e, a) = 1 + ⌊(e + P − a − 1) / P⌋` pages (the worst start is `P − a` into a page),
+   each page is written once per fold whatever it received, so
+   `amp_inplace ≤ pages(e, a) × P / e`: **8× for 512 B at 512-aligned offsets, 16× for 512 B at
+   arbitrary offsets, 2× for an unaligned 4 KiB write; 1× for the page-aligned shapes W1 already
+   takes.** The seed is the same page set, read once at first touch (`fold_inplace_seed_bytes ≤
+   fold_inplace_write_bytes`), never a whole-block image.
+3. **A CoW block (transformed volume, a cloned/shared block, an epoch-bound block) lands whole,
+   once per parked episode:** it escalates to a content-valid full buffer seeded from the base
+   (ONE whole-block read) and parks; `device = B` (+ `B` read) per flush, `amp_cow = B / u_flush`,
+   with `u_flush ≥ (B/4P) × e` at the escalation point for a sub-page `e` ⇒ `≤ 4P/e` at the
+   worst, `→ 1` as the parked buffer absorbs the stream. The former whole-block fold every 64
+   extents (`B / (64 × e)` = 128× at 512 B) is gone: nothing folds a block whole more than once
+   per episode.
+
+The trigger is the RAM bound and only the RAM bound: `pages ≥ B/4P` (the former 25 % coverage
+edge measured in what the overlay actually holds — a touched page costs a page whatever the
+write's length). `FOLD_MAX_EXTENTS` and `FOLD_MAX_BYTES` are retired (0002 rows); `fold_fill`
+keeps counting the writes a fold absorbed.
+
+**Laws (tie tests restate each; the `.stats` identity rides every write row):**
+`fold_inplace_write_bytes ÷ admit_write_accumulate_bytes ≤ pages(e, a) × P / e` on the in-place
+shape; `fold_inplace_seed_bytes ≤ fold_inplace_write_bytes`; a hole block's `device_write_bytes
+= blocks × B` exactly; `parked_extent_bytes` charges `pages × P` (+ the page struct).
+
+### J.2 The staged append — bytes moved per byte appended
+
+A staged file's ring record reserves `reserve(V) = align_up(footprint(V) + slack(V), P)` with
+`slack(V) = max(P, V/4)` when the write that stages it EXTENDS the image (an O_APPEND / sequential
+small write at or past the end — the append distribution: generic/069's 4-byte integers, a log's
+lines, `dd`'s 4 KiB; a whole-file `cp` extends nothing and reserves no slack). An extending write
+that fits the slack lands **in place** (the appended bytes into the reserved tail, then the record's
+header rewritten into the ALTERNATE header slot with the new `val_len`, generation and checksum —
+the slot not current; recovery takes the valid slot with the higher generation, so a kill between
+any two stores leaves the old record intact); a re-stage runs only when the slack is exhausted.
+Bytes moved per appended byte: an in-place append moves `1`; a re-stage at image `V` moves `2V`
+(one copy out of the ring, one in) and buys `slack(V) ≥ V/4` of appends before the next, so over
+the geometric chain `V, 1.25V, …` the total is `1 + 2(1 + ¼)/¼ = 11` (and `≤ 1 + 2V/slack(V)`
+for the last link). WHY a quarter: the ring's own headroom law (`highWater = max − max/4`) already
+reserves a quarter for the drain's lag, so the append slack never exceeds what the pool has
+promised to keep free; a larger slack (doubling → 5×) would strand half the ring under
+stop-growing files until their promotion. The journal: one Δ`(size, mtime, ctime)` inode record
+per write (the Put stays for KILLPRIV's mode strip), one entry per op, concurrent appenders
+coalesced by the conveyor's window.
+
+**Laws:** `staging_moved_bytes ÷ appended bytes ≤ 11` on an append stream (tie test over the
+geometric chain and the pinned 069 shape); `journal entries ÷ appends ≤ 1.05` (the rename gate).

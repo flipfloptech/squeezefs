@@ -541,6 +541,7 @@ pub const DataPlane = struct {
             .budget_bytes = opts.budget_bytes,
             .transform = self.transformSeam(),
             .scratch_len = if (self.xform != null) transform.scratchLen(cfg.block_size) else 0,
+            .image = if (self.xform != null) seams.ImageSeam{ .ctx = self, .read = &imageSeamRead } else null,
         }) catch return error.OutOfMemory;
         errdefer self.wp.deinit(io);
         // The write side's R5 components (spec §2.5): the parked-buffer
@@ -1635,6 +1636,23 @@ pub const DataPlane = struct {
         return .{ .ctx = self, .process_write = &seamProcessWrite, .scratch_len = &seamScratchLen };
     }
 
+    /// `seams.ImageSeam` on a transformed set: the write side's seeds read
+    /// the block's PLAINTEXT image (`readMappingImage` decodes the frame),
+    /// never the raw frame bytes.
+    fn imageSeamRead(ctx: ?*anyopaque, b: Mapping, out: []u8) seams.ReadError!void {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
+        const plain = self.readMappingImage(b, out) catch |e| return switch (e) {
+            error.ShortRead => error.ShortRead,
+            error.QueueFull => error.QueueFull,
+            error.WorkerShutdown => error.WorkerShutdown,
+            error.VolumeFailed => error.VolumeFailed,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InputOutput,
+        };
+        // A frame that decoded short (a truncate-clipped image) reads zeros past its end.
+        if (plain.len < out.len) @memset(out[plain.len..], 0);
+    }
+
     fn seamProcessWrite(ctx: ?*anyopaque, _: u64, plain: []const u8, scratch: []u8) anyerror![]const u8 {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         const x = &self.xform.?;
@@ -2536,24 +2554,14 @@ pub const DataPlane = struct {
             .served => return .{ .served = want },
             .partial => |p| {
                 const base = p.base orelse return .{ .served = want };
-                var runs: [cov.CoverageUnion.max_runs]cov.Run = undefined;
-                const covered = p.covered.coveredRunsIn(@intCast(rel_s), @intCast(rel_e), &runs);
+                // Every gap of the window from the base (one read per gap;
+                // the page shape coalesces contiguous untouched pages).
+                var gaps = p.covered.gaps(@intCast(rel_s), @intCast(rel_e));
                 if (try_only) {
-                    var whole = covered.len != 0;
-                    var c: u32 = @intCast(rel_s);
-                    for (covered) |r| {
-                        if (r.start > c) whole = false;
-                        c = r.end;
-                    }
-                    if (!whole or c < rel_e) return .busy;
+                    if (gaps.next() != null) return .busy;
                     return .{ .served = want };
                 }
-                var cursor: u32 = @intCast(rel_s);
-                for (covered) |r| {
-                    if (r.start > cursor) self.fillGap(base, cursor, out[cursor - @as(u32, @intCast(rel_s)) .. r.start - @as(u32, @intCast(rel_s))]);
-                    cursor = r.end;
-                }
-                if (cursor < rel_e) self.fillGap(base, cursor, out[cursor - @as(u32, @intCast(rel_s)) ..]);
+                while (gaps.next()) |g| self.fillGap(base, g.start, out[g.start - @as(u32, @intCast(rel_s)) .. g.end - @as(u32, @intCast(rel_s))]);
                 return .{ .served = want };
             },
             .redirect => |shadow| {

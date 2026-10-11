@@ -41,13 +41,48 @@ SECTOR = 512
 DEVICE_WRITE_ARMS = [
     "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes",
     "durable_upload_bytes_escalation", "durable_upload_bytes_writeback",
+    "fold_inplace_write_bytes",
 ]
 DEVICE_WRITE_BESIDE = ["rewrite_device_write_bytes", "rewrite_shadow_bytes", "rewrite_user_bytes"]
 # The device-write REQUEST counters beside the byte arms (the stats-side
 # `wareq-sz`; the substrate's diskstats is the ruler — these are the daemon's view).
 # `put_obj` is the block device layer's put (an overlay store IS a put — not
-# summed twice); a W1 patch DMA bypasses it and is counted by `patch_writes`.
-DEVICE_WRITE_REQS = ["patch_writes", "own_block_dmas", "put_obj"]
+# summed twice); a W1 patch DMA and a W2 in-place page DMA bypass it and are
+# counted by `patch_writes` / `fold_inplace_dmas`.
+DEVICE_WRITE_REQS = ["patch_writes", "own_block_dmas", "put_obj", "fold_inplace_dmas"]
+# The staged arm's ring ledger (decision 0003 §J.2): bytes an append moved
+# into the ring in place, and bytes a re-stage moved (out of the ring and
+# back in) when the record's slack was exhausted.
+STAGED_APPEND = ["staging_append_bytes", "staging_restage_bytes", "staging_restages", "staging_appends"]
+
+# ---------------------------------------------------------------------------
+# The write amplification law (decision 0003 §J.1; `extent_overlay.zig`
+# `inPlaceBoundPpm` restates it): a write of `bs` bytes at `bs`-aligned
+# offsets (fio's) touches at most `pages(bs, a)` pages, each written once per
+# in-place fold, so `device ÷ user ≤ pages × PAGE / bs`; a page multiple is
+# W1's (or the overlay's) 1×.
+# ---------------------------------------------------------------------------
+PAGE = 4096
+# The ruler's slack: 10 % over the bound (the brackets gate's own 1.0–1.1
+# band for whole-block rows) — the daemon's housekeeping writes land on the
+# META device, never in the data arms.
+AMP_SLACK = 0.1
+# §J.2: `1 + 2(1 + ¼)/¼` over the geometric re-stage chain at a quarter slack.
+STAGED_APPEND_BOUND = 11.0
+
+
+def pages_worst(length, offset_align):
+    return 1 + (length + PAGE - offset_align - 1) // PAGE
+
+
+def write_amp_bound(bs):
+    if bs <= 0:
+        return None
+    if bs % PAGE == 0:
+        return 1.0
+    import math
+    a = math.gcd(bs, PAGE)
+    return pages_worst(bs, a) * PAGE / bs
 ADMISSION_ARMS = [
     "admit_write_overlay_bytes", "admit_write_inplace_bytes",
     "admit_write_accumulate_bytes", "admit_write_inline_bytes",
@@ -110,7 +145,7 @@ FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier"
                 "meta_publish", "meta_barrier", "extent_barrier"]
 
 ALL_COUNTERS = (DEVICE_WRITE_ARMS + DEVICE_WRITE_BESIDE + ADMISSION_ARMS + READ_COPY_ARMS + READ_COPY_BESIDE + RECLAIM + WIRE_RPCS
-                + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC)
+                + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND)
 
 
 def flatten(doc):
@@ -366,10 +401,27 @@ def leg(args):
         reclaim["block_free_reclaim_queued"], reclaim["block_free_reclaim_elided"], reclaim["terminal_frees"],
         q_e_abs, reclaim_abs["terminal_frees"])))
     # 3. admission ledger: Σ admit_write_* ≡ user bytes at ACK (write rows).
-    if kind in ("data-write", "fsync") and user_w:
+    if kind in ("data-write", "fsync", "data-append") and user_w:
         ratio = admission / user_w
         ok = abs(admission - user_w) <= max(1 << 20, user_w // 1000)  # 0.1 % or 1 MiB: the instrument's own housekeeping writes
         verdicts.append(("admission_ledger", ok, "Σ admit_write_* %d vs user %d (×%.4f)" % (admission, user_w, ratio)))
+    # 3b. the write amplification law (§J.1): device bytes ≤ bound(bs) × user bytes on a data-write row.
+    bound = write_amp_bound(int(metrics.get("bs", 0) or 0))
+    if kind == "data-write" and user_w and bound is not None:
+        ratio = device_write_stats / user_w
+        ok = ratio <= bound + AMP_SLACK
+        verdicts.append(("write_amplification_bound", ok, "device bytes %d ÷ user %d = ×%.3f vs the §J.1 bound ×%.3f (+%.1f slack) for bs %d; in-place folds %d B over %d DMAs" % (
+            device_write_stats, user_w, ratio, bound, AMP_SLACK, int(metrics.get("bs", 0) or 0), d["fold_inplace_write_bytes"], d["fold_inplace_dmas"])))
+    # 3c. the staged append law (§J.2): ring bytes moved ≤ 11 × bytes appended on an append row.
+    if kind == "data-append" and user_w:
+        moved = d["staging_append_bytes"] + d["staging_restage_bytes"]
+        ratio = moved / user_w
+        ok = ratio <= STAGED_APPEND_BOUND
+        verdicts.append(("staged_append_bound", ok, "ring bytes moved %d (appends %d B over %d, re-stages %d B over %d) ÷ appended %d = ×%.3f vs the §J.2 bound ×%.0f" % (
+            moved, d["staging_append_bytes"], d["staging_appends"], d["staging_restage_bytes"], d["staging_restages"], user_w, ratio, STAGED_APPEND_BOUND)))
+        entries = d["meta_kv_journal_entries"]
+        per_op = entries / ops if ops else 0.0
+        verdicts.append(("journal_entries_per_append", per_op <= 1.05, "journal entries %d ÷ appends %d = %.3f/op (gate ≤ 1.05)" % (entries, ops, per_op)))
     # 4. engagement: the ops reach the mechanism under test.
     if meta.get("shim"):
         # The hybrid lane gate (charter §7): ops above `memBW × 2.3 µs / 2 copies`
@@ -391,6 +443,8 @@ def leg(args):
         direct = metrics.get("direct", 1)
         ring = d["transport_ring_requests"]
         ok = ring >= ops if direct else ring > 0
+        if kind == "data-append":
+            ok = ring >= ops  # every append is its own FUSE_WRITE (O_APPEND passes through)
         verdicts.append(("engagement_fuse", ok, "Δtransport_ring_requests %d (handler-lane fuse_ops %d, direct-leg serves %d, zc write directs %d) vs instrument ops %d (%s)" % (
             ring, d["fuse_ops"], d["transport_zc_direct_legs"], d["transport_zc_write_directs"], ops,
             "direct: ≥ one ring request per I/O" if direct else "buffered: the page cache coalesces and splits")))
@@ -427,6 +481,8 @@ def leg(args):
             "device_write_reqs": {k: d[k] for k in DEVICE_WRITE_REQS},
             "wareq_sz_stats": (device_write_stats // device_write_reqs) if device_write_reqs else 0,
             "device_div_user_stats": (device_write_stats / user_w) if user_w else None,
+            "write_amplification_bound": bound,
+            "staged_append": {k: d[k] for k in STAGED_APPEND},
             "admission_bytes": admission, "admission_arms": {k: d[k] for k in ADMISSION_ARMS},
             "read_copy_bytes": read_copy, "read_copy_arms": {k: d[k] for k in READ_COPY_ARMS},
             "read_copy_beside": {k: d[k] for k in READ_COPY_BESIDE},

@@ -1387,9 +1387,10 @@ pub const ReadPath = struct {
                 key = current;
                 continue;
             }
-            // 4. Decode the span's frames into a pool scratch; the window out.
+            // 4. Decode the span's frames into a pool scratch (exactly the
+            //    span's plaintext: the decoder needs no slack); the window out.
             const plain_len = @as(u64, span.last - span.first + 1) * transform.FRAME_GRAIN;
-            const scratch = try self.acquireBounce(plain_len + std.compress.zstd.block_size_max);
+            const scratch = try self.acquireBounce(plain_len);
             defer self.releaseBounce(scratch);
             const view = d.decode_range(d.ctx, page.bytes[0..@intCast(HEADER_PAGE_LEN)], win.bytes[0..@intCast(win_len)], span.lo, span, scratch.bytes) catch {
                 if (self.bindingIs(ino, b, k) and self.still(k, before)) return error.InputOutput;
@@ -1834,6 +1835,8 @@ const Fixture = struct {
     /// pattern (the plaintext of device block `i` at `rel` is the
     /// passthrough pattern at `i × bs + rel`, so `expected` reads the same).
     xform: ?transform.Transform = null,
+    /// The fixture is one thread: one codec over `xform`.
+    codec: ?transform.Codec = null,
     xscratch: []u8 = &.{},
     size: u64 = 0,
     kind: layout.Kind = .striped,
@@ -1858,14 +1861,15 @@ const Fixture = struct {
         if (cfg_over.compression != null) {
             var env = std.process.Environ.Map.init(gpa);
             defer env.deinit();
-            self.xform = try transform.Transform.init(gpa, &env, xcfg, null);
+            self.xform = try transform.Transform.init(&env, xcfg, null);
+            self.codec = try transform.Codec.init(gpa, &self.xform.?);
             self.xscratch = try gpa.alloc(u8, @intCast(transform.scratchLen(@intCast(bs))));
             const plain = try gpa.alloc(u8, @intCast(bs));
             defer gpa.free(plain);
             @memset(device, 0);
             for (0..dev_blocks) |i| {
                 for (plain, 0..) |*b, j| b.* = @truncate(((i * bs + j) / 4096) * 31 + (i * bs + j));
-                const img = try self.xform.?.processWrite(plain, self.xscratch);
+                const img = try self.codec.?.processWrite(plain, self.xscratch);
                 @memcpy(device[i * chunk ..][0..img.len], img);
             }
         } else {
@@ -1896,7 +1900,7 @@ const Fixture = struct {
     pub fn deinit(self: *Fixture) void {
         self.rp.deinit();
         self.alloc.deinit();
-        if (self.xform) |*x| x.deinit(self.gpa);
+        if (self.codec) |*c| c.deinit(self.gpa);
         self.gpa.free(self.xscratch);
         self.gpa.free(self.device);
         self.gpa.destroy(self);
@@ -1911,7 +1915,7 @@ const Fixture = struct {
     // The transform seam (a transformed fixture).
     fn xDecode(ctx: *anyopaque, image: []u8, out: []u8) error{Corrupt}![]const u8 {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
-        return self.xform.?.processRead(image, out) catch return error.Corrupt;
+        return self.codec.?.processRead(image, out) catch return error.Corrupt;
     }
     fn xFrameSpan(ctx: *anyopaque, page: []const u8, rel_s: u64, rel_e: u64) error{Corrupt}!FrameSpan {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
@@ -1921,7 +1925,7 @@ const Fixture = struct {
     }
     fn xDecodeRange(ctx: *anyopaque, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) error{Corrupt}![]const u8 {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
-        return self.xform.?.decodeFrames(page, window, window_off, span, out) catch return error.Corrupt;
+        return self.codec.?.decodeFrames(page, window, window_off, span, out) catch return error.Corrupt;
     }
 
     pub fn expected(dev_off: u64, out: []const u8) !void {

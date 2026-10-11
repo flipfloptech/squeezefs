@@ -69,6 +69,7 @@ const sole_owner_patch = @import("sole_owner_patch.zig");
 const accumulate = @import("accumulate.zig");
 const extent = @import("extent_overlay.zig");
 const writeback = @import("writeback.zig");
+const transform = @import("transform.zig");
 const fsync_mod = @import("fsync.zig");
 const write_side_view = @import("write_side_view.zig");
 
@@ -462,7 +463,9 @@ pub const WritePath = struct {
     view: write_side_view.Composite,
     tasks: taskset.TaskSet = .init,
     transform: accumulate.TransformSeam,
-    scratch: ?[]align(PAGE) u8,
+    /// The stored-image scratches (`scratch_pool_cap` × `scratch_len`), one
+    /// per upload in flight through its DMA; null on an all-passthrough set.
+    scratch: ?*transform.ScratchPool,
     /// Some active volume is passthrough (the overlay has a destination).
     any_passthrough: bool,
     /// The plaintext whole-block image of a binding (the plane decodes a
@@ -485,6 +488,9 @@ pub const WritePath = struct {
         transform: accumulate.TransformSeam = .passthrough,
         /// `transform.scratchLen(block)` when any volume is transformed; 0 otherwise.
         scratch_len: usize = 0,
+        /// `transform.scratchPoolCap(cpus)`: the scratches the pool holds
+        /// when `scratch_len != 0`.
+        scratch_pool_cap: u32 = 0,
         /// The plaintext image seam (required when any volume is transformed).
         image: ?seams.ImageSeam = null,
     };
@@ -533,7 +539,16 @@ pub const WritePath = struct {
         errdefer self.touched.deinit(gpa);
         self.last_write_end = try LastWriteEnd.init(gpa, op_guard.INODE_GUARD_STRIPES);
         errdefer self.last_write_end.deinit(gpa);
-        if (d.scratch_len != 0) self.scratch = try gpa.alignedAlloc(u8, .fromByteUnits(PAGE), d.scratch_len);
+        if (d.scratch_len != 0) {
+            const pool = try gpa.create(transform.ScratchPool);
+            errdefer gpa.destroy(pool);
+            pool.* = try transform.ScratchPool.init(gpa, d.scratch_pool_cap, d.scratch_len);
+            self.scratch = pool;
+        }
+        errdefer if (self.scratch) |p| {
+            p.deinit(gpa);
+            gpa.destroy(p);
+        };
         self.overlay = try device_overlay.Overlay.init(gpa, cfg.overlay, .{
             .device = d.device,
             .map = d.map,
@@ -556,7 +571,10 @@ pub const WritePath = struct {
     pub fn deinit(self: *WritePath, io: Io) void {
         self.tasks.deinit(io);
         self.overlay.deinit(io);
-        if (self.scratch) |s| self.gpa.free(s);
+        if (self.scratch) |p| {
+            p.deinit(self.gpa);
+            self.gpa.destroy(p);
+        }
         self.last_write_end.deinit(self.gpa);
         self.touched.deinit(self.gpa);
         self.table.deinit();

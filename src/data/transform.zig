@@ -36,6 +36,21 @@
 //! contract: the image IS the payload byte-identical (ranged reads, W1,
 //! the zc bridges depend on it) — `processWrite` returns its input.
 //!
+//! The CODEC CONTEXTS (decision 0003 §K10): `Transform` is the volume's
+//! immutable half (the modes, the key state, the raw lever) and `Codec`
+//! the per-LANE mutable half — the zstd compression AND decompression
+//! contexts, each a static workspace the library never grows (`ZSTD_
+//! initStaticCCtx/DCtx`; "use one different context per thread" is the
+//! library's thread-safety contract). lz4 and the AEADs keep no state
+//! between calls. A mount owns ONE `CodecPool` sized to the executor's
+//! lane population (`codecPoolSize`) and ONE `ScratchPool` of stored-image
+//! buffers (`scratchPoolCap`); a decode on any lane takes a codec with no
+//! lock and no allocation. The ONE plane-wide transform lock this replaces
+//! serialized every frame decode of every lane behind std's zstd decoder
+//! (601 µs per 64 KiB frame at ρ ≈ 4 in ReleaseSafe against the C
+//! context's 59 µs): 849 IOPS on a 9-lane venue whose lz4 twin ran 7.8 k
+//! (`docs/evidence/rung-09-read-amplification.md` §4.1, §7).
+//!
 //! Portable: the codecs, the AEADs (`std.crypto`), the derivations and the
 //! key wrap run on every host. The key-FILE laws and the process hardening
 //! are Linux syscalls and compile only there.
@@ -52,6 +67,8 @@ const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
+const mpmc = @import("../sync/mpmc.zig");
+const semaphore = @import("../sync/semaphore.zig");
 
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -576,14 +593,34 @@ pub fn writeScratchLen(block_size: u32) u64 {
 }
 
 /// ONE scratch size per volume, for the write scratch AND the read
-/// destination: `max(writeScratchLen, block + zstd.block_size_max)`. The
-/// second term is `std.compress.zstd`'s window law — the decoder keeps the
-/// whole plaintext as its window and needs one more block of free space
-/// for the last block's writable slice — so a 4 MiB volume's scratch is
-/// 4,325,376 B = block + 128 KiB: exactly the charter's envelope (§6.2
-/// item 3 "a worst-case scratch (block + 128 KiB)").
+/// destination: `writeScratchLen` = block + 4 KiB. The read side needs no
+/// slack — the C decoder writes exactly the frame's content size into its
+/// destination (std's streaming decoder, retired in decision 0002 row 118,
+/// wanted a whole extra block of window room behind the plaintext: block
+/// + 128 KiB). Inside the charter's `block + 128 KiB` envelope (§6.2 item
+/// 3), which the reference sized from its libraries' bounds.
 pub fn scratchLen(block_size: u32) u64 {
-    return @max(writeScratchLen(block_size), @as(u64, block_size) + std.compress.zstd.block_size_max);
+    return writeScratchLen(block_size);
+}
+
+/// Stored-image scratches a mount owns per `ScratchPool`:
+/// `clamp(cpus / 4, 4, 16)` — above the concurrent-transform count every
+/// handout rotates through a cache-cold buffer (+4..10 % measured; the
+/// reference's `scratch_pool_cap`). A buffer is held across the DMA its
+/// image feeds, so the pool, not a lane, is the unit: an acquirer past the
+/// cap parks (`transform_scratch_pool_waits`), never spills to the heap.
+pub fn scratchPoolCap(cpus: u32) u32 {
+    return @intCast(derive.clamp(cpus / 4, 4, 16));
+}
+
+/// Codec contexts a mount owns: ONE per executor lane (the fuse handler
+/// lanes, the meta pool, the lease and main lanes — every thread a
+/// transform runs on), floor 1. A transform never parks while it holds a
+/// codec (pure CPU; its scratch is the `ScratchPool`'s), so one per lane
+/// thread is exact: the pool never runs dry and
+/// `transform_codec_pool_waits` stays 0 by derivation.
+pub fn codecPoolSize(lanes: usize) usize {
+    return @max(lanes, 1);
 }
 
 /// Capacity in blocks of a data volume: chunks 0 and `last` are reserved
@@ -798,24 +835,30 @@ pub const lz4 = struct {
 // §2.1 zstd — level 3 (the library default), ONE frame shape: single-shot
 // `ZSTD_compress2` with the content size pledged, in a STATIC context the
 // caller's allocator provides once (no malloc per op; decision 0002 row
-// 118). Decompression is `std.compress.zstd`.
+// 118). Decompression is the same library's single-shot
+// `ZSTD_decompressDCtx` in a static `ZSTD_DCtx` — one per lane (the
+// library's "one context per thread" contract), exact to the content
+// size, total over arbitrary input.
 // ---------------------------------------------------------------------------
 
 pub const zstd = struct {
     /// `ZSTD_CLEVEL_DEFAULT`: the library's default, the reference's choice.
     pub const LEVEL: c_int = 3;
 
+    /// The static workspaces' alignment: the library asks for 8.
+    const WORKSPACE_ALIGN: std.mem.Alignment = .@"8";
+
+    pub const InitError = error{ OutOfMemory, ZstdInit };
+
     pub const Compressor = struct {
         workspace: []align(8) u8,
         cctx: *zc.ZSTD_CCtx,
-
-        pub const InitError = error{ OutOfMemory, ZstdInit };
 
         /// One context sized for `LEVEL` by the library's own estimate.
         pub fn init(gpa: Allocator) InitError!Compressor {
             const est = zc.ZSTD_estimateCCtxSize(LEVEL);
             if (zc.ZSTD_isError(est) != 0) return error.ZstdInit;
-            const ws = try gpa.alignedAlloc(u8, .@"8", est);
+            const ws = try gpa.alignedAlloc(u8, WORKSPACE_ALIGN, est);
             errdefer gpa.free(ws);
             const cctx = zc.ZSTD_initStaticCCtx(ws.ptr, est) orelse return error.ZstdInit;
             if (zc.ZSTD_isError(zc.ZSTD_CCtx_setParameter(cctx, zc.ZSTD_c_compressionLevel, LEVEL)) != 0) return error.ZstdInit;
@@ -846,22 +889,58 @@ pub const zstd = struct {
         }
     };
 
-    /// Decode exactly `plain_len` bytes of ONE frame from `src` into `out`
-    /// (`out.len ≥ plain_len + block_size_max`: the std decoder's window
-    /// law, see `scratchLen`). Total: any input yields the bytes or
-    /// `Corrupt`. The frame's window may not exceed `plain_len`: the
-    /// compressor pledges the content size, so a larger window is a
-    /// foreign frame, not ours.
-    pub fn decompress(src: []const u8, out: []u8, plain_len: u32) error{Corrupt}!void {
-        assert(out.len >= @as(usize, plain_len) + std.compress.zstd.block_size_max);
-        var in: std.Io.Reader = .fixed(src);
-        var d = std.compress.zstd.Decompress.init(&in, &.{}, .{ .window_len = @max(plain_len, 1) });
-        var w: std.Io.Writer = .fixed(out);
-        const n = d.reader.streamRemaining(&w) catch return error.Corrupt;
-        if (n != plain_len) return error.Corrupt;
-        // Exactly one frame, nothing after it.
-        if (in.seek != in.end) return error.Corrupt;
-    }
+    pub const Decompressor = struct {
+        workspace: []align(8) u8,
+        dctx: *zc.ZSTD_DCtx,
+
+        /// One context by the library's own estimate (≈ 96 KiB: the entropy
+        /// tables and the literal buffer; a single-shot decode writes its
+        /// window straight into the destination and allocates nothing).
+        pub fn init(gpa: Allocator) InitError!Decompressor {
+            const est = zc.ZSTD_estimateDCtxSize();
+            if (zc.ZSTD_isError(est) != 0) return error.ZstdInit;
+            const ws = try gpa.alignedAlloc(u8, WORKSPACE_ALIGN, est);
+            errdefer gpa.free(ws);
+            const dctx = zc.ZSTD_initStaticDCtx(ws.ptr, est) orelse return error.ZstdInit;
+            return .{ .workspace = ws, .dctx = dctx };
+        }
+
+        pub fn deinit(self: *Decompressor, gpa: Allocator) void {
+            gpa.free(self.workspace);
+            self.* = undefined;
+        }
+
+        /// Decode exactly `plain_len` bytes of ONE frame from `src` into
+        /// `out` (`out.len ≥ plain_len`). Total: any input yields the bytes
+        /// or `Corrupt` — a frame declaring more content than `plain_len`
+        /// refuses on the bounded destination, one declaring less on the
+        /// count, trailing bytes on the frame walk (the library decodes a
+        /// sequence of frames and refuses a remainder that is not one).
+        pub fn decompress(self: *Decompressor, src: []const u8, out: []u8, plain_len: u32) error{Corrupt}!void {
+            assert(out.len >= plain_len);
+            const n = zc.ZSTD_decompressDCtx(self.dctx, out.ptr, plain_len, src.ptr, src.len);
+            if (zc.ZSTD_isError(n) != 0 or n != plain_len) return error.Corrupt;
+        }
+    };
+
+    /// A lane's pair: the compressor and the decompressor.
+    pub const Context = struct {
+        c: Compressor,
+        d: Decompressor,
+
+        pub fn init(gpa: Allocator) InitError!Context {
+            var c = try Compressor.init(gpa);
+            errdefer c.deinit(gpa);
+            const d = try Decompressor.init(gpa);
+            return .{ .c = c, .d = d };
+        }
+
+        pub fn deinit(self: *Context, gpa: Allocator) void {
+            self.c.deinit(gpa);
+            self.d.deinit(gpa);
+            self.* = undefined;
+        }
+    };
 };
 
 // ---------------------------------------------------------------------------
@@ -1302,32 +1381,57 @@ pub const ReadError = DecodeError || error{
     NoKey,
 };
 
+/// The volume's IMMUTABLE transform half: the declared modes, the key state
+/// (its own atomics) and the raw lever. Shared by every lane; a `Codec`
+/// carries the per-lane state and does the work.
 pub const Transform = struct {
     cfg: VolumeTransform,
     /// Present iff `cfg.encryption != .none`.
     crypto: ?*CryptoState,
-    /// Present iff `cfg.compression == .zstd` (one static context; the
-    /// owner of a `Transform` is one lane's worth of concurrency).
-    zstd_cctx: ?zstd.Compressor,
     /// `SQUEEZEFS_TEST_TRANSFORM_FORCE_RAW`: every block takes the raw arm.
     force_raw: bool,
 
-    pub const InitError = error{ OutOfMemory, ZstdInit, KeyPostureMismatch };
+    pub const InitError = error{KeyPostureMismatch};
 
-    pub fn init(gpa: Allocator, env: *const std.process.Environ.Map, cfg: VolumeTransform, crypto: ?*CryptoState) InitError!Transform {
+    pub fn init(env: *const std.process.Environ.Map, cfg: VolumeTransform, crypto: ?*CryptoState) InitError!Transform {
         if ((cfg.encryption != .none) != (crypto != null)) return error.KeyPostureMismatch;
         if (crypto) |c| if (c.encryption != cfg.encryption) return error.KeyPostureMismatch;
         return .{
             .cfg = cfg,
             .crypto = crypto,
-            .zstd_cctx = if (cfg.compression == .zstd) try zstd.Compressor.init(gpa) else null,
             .force_raw = knobs.boolKnob("SQUEEZEFS_TEST_TRANSFORM_FORCE_RAW", env),
         };
     }
 
-    pub fn deinit(self: *Transform, gpa: Allocator) void {
-        if (self.zstd_cctx) |*z| z.deinit(gpa);
+    /// Whether a `Codec` of this volume carries state between calls (zstd's
+    /// static contexts); lz4 and the AEADs are pure functions of their
+    /// arguments, so a stateless volume's codecs are interchangeable.
+    pub fn codecHasState(self: *const Transform) bool {
+        return self.cfg.compression == .zstd;
+    }
+};
+
+/// The per-LANE codec: the zstd contexts (iff the volume compresses with
+/// zstd) over the shared `Transform`. One codec is one thread's worth of
+/// concurrency — the library's contract — and it holds nothing a caller
+/// needs past a call's return (the image lives in the caller's scratch).
+pub const Codec = struct {
+    t: *const Transform,
+    zstd: ?zstd.Context,
+
+    pub const InitError = zstd.InitError;
+
+    pub fn init(gpa: Allocator, t: *const Transform) InitError!Codec {
+        return .{ .t = t, .zstd = if (t.codecHasState()) try zstd.Context.init(gpa) else null };
+    }
+
+    pub fn deinit(self: *Codec, gpa: Allocator) void {
+        if (self.zstd) |*z| z.deinit(gpa);
         self.* = undefined;
+    }
+
+    pub fn cfg(self: *const Codec) VolumeTransform {
+        return self.t.cfg;
     }
 
     /// The image of `plain` (`len ≤ block_size`): on a passthrough volume
@@ -1335,12 +1439,13 @@ pub const Transform = struct {
     /// frames ‖ zero pad to 4 KiB` inside `scratch` (`len ≥ scratchLen(block)`),
     /// exactly ONE pooled buffer: every frame's body is compressed straight
     /// into its final offset and sealed in place; the input is never mutated.
-    pub fn processWrite(self: *Transform, plain: []const u8, scratch: []u8) WriteError![]const u8 {
-        if (plain.len > self.cfg.block_size) return error.PlainTooLarge;
-        if (self.cfg.isPassthrough()) return plain;
-        if (scratch.len < scratchLen(self.cfg.block_size)) return error.ScratchTooSmall;
+    pub fn processWrite(self: *Codec, plain: []const u8, scratch: []u8) WriteError![]const u8 {
+        const t = self.t;
+        if (plain.len > t.cfg.block_size) return error.PlainTooLarge;
+        if (t.cfg.isPassthrough()) return plain;
+        if (scratch.len < scratchLen(t.cfg.block_size)) return error.ScratchTooSmall;
         const frames = framesFor(@intCast(plain.len));
-        const encrypted = self.cfg.encryption != .none;
+        const encrypted = t.cfg.encryption != .none;
         // 1. Every frame: compress best-effort into its final place — `n ≥
         //    len` (equal too: an equal-size body is pure decompress cost for
         //    zero gain) ⇒ the raw plaintext with the entry's flag; a tag's
@@ -1354,13 +1459,13 @@ pub const Transform = struct {
             const body = scratch[off..];
             var flags: u8 = 0;
             var inner_len: usize = p.len;
-            if (self.cfg.compression != .none and !self.force_raw) {
+            if (t.cfg.compression != .none and !t.force_raw) {
                 const t0 = clock.monotonicNs();
                 const bounded = body[0 .. p.len - 1];
-                const n: ?usize = switch (self.cfg.compression) {
+                const n: ?usize = switch (t.cfg.compression) {
                     .none => unreachable,
                     .lz4 => lz4.compressBlock(p, bounded) catch null,
-                    .zstd => self.zstd_cctx.?.compress(p, bounded) catch |e| switch (e) {
+                    .zstd => self.zstd.?.c.compress(p, bounded) catch |e| switch (e) {
                         error.OutputTooSmall => null,
                         error.ZstdFailed => return error.CompressFailed,
                     },
@@ -1374,7 +1479,7 @@ pub const Transform = struct {
                 }
             } else {
                 flags |= FLAG_STORE_RAW;
-                if (self.cfg.compression != .none) stats.compress_stored_raw.inc();
+                if (t.cfg.compression != .none) stats.compress_stored_raw.inc();
             }
             if (flags & FLAG_STORE_RAW != 0) @memcpy(body[0..p.len], p);
             const body_len = inner_len + (if (encrypted) TAG_LEN else 0);
@@ -1383,9 +1488,9 @@ pub const Transform = struct {
         }
         // 2. The header (the AAD's first part) and the table with its xxh3;
         //    frame 0's body starts right after.
-        var h: Header = .{ .flags = 0, .compression = self.cfg.compression, .encryption = self.cfg.encryption, .body_len = @intCast(off - table_len), .plain_len = @intCast(plain.len), .key_blob = @splat(0), .nonce = @splat(0) };
+        var h: Header = .{ .flags = 0, .compression = t.cfg.compression, .encryption = t.cfg.encryption, .body_len = @intCast(off - table_len), .plain_len = @intCast(plain.len), .key_blob = @splat(0), .nonce = @splat(0) };
         if (encrypted) {
-            const c = self.crypto orelse return error.NoKey;
+            const c = t.crypto orelse return error.NoKey;
             h.flags |= FLAG_ENCRYPTED;
             h.key_blob = c.key_blob;
             h.nonce = c.nextNonces(frames);
@@ -1402,7 +1507,7 @@ pub const Transform = struct {
         scratch[HEADER_LEN..][0..TABLE_HEAD_LEN].* = std.mem.toBytes(tw);
         // 3. Seal every frame in place under its own nonce and AAD.
         if (encrypted) {
-            const c = self.crypto.?;
+            const c = t.crypto.?;
             const t1 = clock.monotonicNs();
             i = 0;
             while (i < frames) : (i += 1) {
@@ -1412,7 +1517,7 @@ pub const Transform = struct {
                 var aad: [HEADER_LEN + ENTRY_LEN + 4]u8 = undefined;
                 e.aad(scratch[0..HEADER_LEN], i, &aad);
                 var tag: [TAG_LEN]u8 = undefined;
-                seal(self.cfg.encryption, body[0..inner_len], &tag, body[0..inner_len], &aad, frameNonce(h.nonce, i), c.data_key);
+                seal(t.cfg.encryption, body[0..inner_len], &tag, body[0..inner_len], &aad, frameNonce(h.nonce, i), c.data_key);
                 body[inner_len..][0..TAG_LEN].* = tag;
             }
             stats.transform_phase_ns_seal.record(clock.monotonicNs() -| t1);
@@ -1421,7 +1526,7 @@ pub const Transform = struct {
         //    the device).
         const padded: usize = @intCast(derive.alignUp(off, DMA_GRAIN));
         @memset(scratch[off..padded], 0);
-        if (padded > chunkSizeFor(self.cfg)) {
+        if (padded > chunkSizeFor(t.cfg)) {
             // Unreachable by construction (the geometry law); the belt.
             stats.stored_image_overflow_refusals.fire("padded image exceeds the chunk");
             return error.PlainTooLarge;
@@ -1435,8 +1540,8 @@ pub const Transform = struct {
     /// scratchLen(block)`): every frame is opened IN PLACE in `image` (when
     /// encrypted) then decompressed, or copied when raw, into its plaintext
     /// offset. Every refusal counts on its tripwire.
-    pub fn processRead(self: *Transform, image: []u8, out: []u8) ReadError![]const u8 {
-        if (self.cfg.isPassthrough()) return image;
+    pub fn processRead(self: *Codec, image: []u8, out: []u8) ReadError![]const u8 {
+        if (self.t.cfg.isPassthrough()) return image;
         return self.readInner(image, out) catch |e| {
             switch (e) {
                 error.ScratchTooSmall, error.NoKey => {},
@@ -1447,23 +1552,24 @@ pub const Transform = struct {
     }
 
     /// The read without the counting (the fuzz target).
-    pub fn readInner(self: *Transform, image: []u8, out: []u8) ReadError![]const u8 {
-        if (out.len < scratchLen(self.cfg.block_size)) return error.ScratchTooSmall;
-        const h = try decodeHeader(self.cfg, image);
-        const t = try decodeTable(self.cfg, h, image);
-        if (image.len < tableLen(t.count) + @as(usize, h.body_len)) return error.FrameLen;
-        if (t.count == 0) return out[0..0];
-        const span: FrameSpan = .{ .first = 0, .last = t.count - 1, .lo = 0, .hi = image.len, .plain_base = 0 };
-        return self.decodeSpan(h, t, image, image, 0, span, out);
+    pub fn readInner(self: *Codec, image: []u8, out: []u8) ReadError![]const u8 {
+        const cfg_ = self.t.cfg;
+        if (out.len < scratchLen(cfg_.block_size)) return error.ScratchTooSmall;
+        const h = try decodeHeader(cfg_, image);
+        const tb = try decodeTable(cfg_, h, image);
+        if (image.len < tableLen(tb.count) + @as(usize, h.body_len)) return error.FrameLen;
+        if (tb.count == 0) return out[0..0];
+        const span: FrameSpan = .{ .first = 0, .last = tb.count - 1, .lo = 0, .hi = image.len, .plain_base = 0 };
+        return self.decodeSpan(h, tb, image, image, 0, span, out);
     }
 
     /// The SUB-BLOCK read (decision 0003 §K7): `page` is the image's first
     /// grain (the table), `window` the image bytes `[window_off, …)` the
     /// second DMA landed covering `span` (from `frameSpan`); the frames
     /// `first..=last` decode contiguously into `out` (`len ≥ the span's
-    /// plaintext + the zstd window law's slack) and the view returned
-    /// starts at `span.plain_base`. Counted refusals as `processRead`.
-    pub fn decodeFrames(self: *Transform, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
+    /// plaintext) and the view returned starts at `span.plain_base`.
+    /// Counted refusals as `processRead`.
+    pub fn decodeFrames(self: *Codec, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
         return self.decodeFramesInner(page, window, window_off, span, out) catch |e| {
             switch (e) {
                 error.ScratchTooSmall, error.NoKey => {},
@@ -1473,30 +1579,31 @@ pub const Transform = struct {
         };
     }
 
-    pub fn decodeFramesInner(self: *Transform, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
-        const h = try decodeHeader(self.cfg, page);
-        const t = try decodeTable(self.cfg, h, page);
-        if (span.first > span.last or span.last >= t.count) return error.FrameTable;
-        const a = t.get(span.first);
-        const b = t.get(span.last);
+    pub fn decodeFramesInner(self: *Codec, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
+        const cfg_ = self.t.cfg;
+        const h = try decodeHeader(cfg_, page);
+        const tb = try decodeTable(cfg_, h, page);
+        if (span.first > span.last or span.last >= tb.count) return error.FrameTable;
+        const a = tb.get(span.first);
+        const b = tb.get(span.last);
         if (a.off < window_off or @as(u64, b.off) + b.body_len > window_off + window.len) return error.FrameLen;
-        if (out.len < @as(u64, span.last - span.first + 1) * FRAME_GRAIN + std.compress.zstd.block_size_max) return error.ScratchTooSmall;
-        return self.decodeSpan(h, t, page, window, window_off, span, out);
+        if (out.len < @as(u64, span.last - span.first + 1) * FRAME_GRAIN) return error.ScratchTooSmall;
+        return self.decodeSpan(h, tb, page, window, window_off, span, out);
     }
 
     /// Frames `span.first..=span.last` of the image whose header page is
     /// `page`, bodies in `window` (image bytes from `window_off`), into
     /// `out` at `(i − first) × grain`; the plaintext view returned.
-    fn decodeSpan(self: *Transform, h: Header, t: Table, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
+    fn decodeSpan(self: *Codec, h: Header, tb: Table, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
         var key: [DATA_KEY_LEN]u8 = undefined;
         if (h.encrypted()) {
-            const c = self.crypto orelse return error.NoKey;
+            const c = self.t.crypto orelse return error.NoKey;
             key = c.keyFor(&h.key_blob) catch return error.FrameKey;
         }
         var total: usize = 0;
         var i: u32 = span.first;
         while (i <= span.last) : (i += 1) {
-            const e = t.get(i);
+            const e = tb.get(i);
             const body = window[@intCast(e.off - window_off)..][0..e.body_len];
             const dst = out[total..];
             var inner: []u8 = body;
@@ -1508,7 +1615,7 @@ pub const Transform = struct {
                 const t0 = clock.monotonicNs();
                 // Raw ⇒ open straight into the destination; compressed ⇒ in place.
                 const dest: []u8 = if (e.storeRaw()) dst[0..ct.len] else ct;
-                open(self.cfg.encryption, dest, ct, tag, &aad, frameNonce(h.nonce, i), key) catch return error.FrameAuth;
+                open(self.t.cfg.encryption, dest, ct, tag, &aad, frameNonce(h.nonce, i), key) catch return error.FrameAuth;
                 stats.transform_phase_ns_open.record(clock.monotonicNs() -| t0);
                 inner = dest;
             }
@@ -1520,12 +1627,137 @@ pub const Transform = struct {
                 switch (h.compression) {
                     .none => unreachable, // the table decoder refused a non-raw `none`
                     .lz4 => lz4.decompressBlock(inner, dst[0..e.plain_len]) catch return error.FrameBody,
-                    .zstd => zstd.decompress(inner, dst, e.plain_len) catch return error.FrameBody,
+                    .zstd => self.zstd.?.d.decompress(inner, dst, e.plain_len) catch return error.FrameBody,
                 }
             }
             total += e.plain_len;
         }
         return out[0..total];
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The mount-owned pools (decision 0003 §K10): codecs per lane, scratches
+// per concurrent stored image. Both are Vyukov free lists under a
+// semaphore — the fast path is one pop and one push; an acquirer that
+// finds the pool empty parks on the semaphore (counted) and never
+// allocates. The release pushes the item BEFORE it returns the permit, so
+// a permit holder always finds an item (the wrap-around cell a popper has
+// claimed but not yet re-sequenced is nanoseconds away: spin).
+// ---------------------------------------------------------------------------
+
+pub const CodecPool = struct {
+    codecs: []Codec,
+    free: mpmc.BoundedMpmc(*Codec),
+    permits: semaphore.Semaphore,
+    /// A stateless volume's codecs are interchangeable: every acquire is
+    /// `&codecs[0]` with no atomics (lz4 / AEAD-only volumes).
+    shared: bool,
+
+    pub const InitError = Codec.InitError;
+
+    /// `n ≥ 1` codecs over `t` (`codecPoolSize(lanes)`); a stateless volume
+    /// allocates ONE whatever `n` says.
+    pub fn init(gpa: Allocator, t: *const Transform, n: usize) InitError!CodecPool {
+        const shared = !t.codecHasState();
+        const count: usize = if (shared) 1 else @max(n, 1);
+        const codecs = try gpa.alloc(Codec, count);
+        errdefer gpa.free(codecs);
+        var built: usize = 0;
+        errdefer for (codecs[0..built]) |*c| c.deinit(gpa);
+        for (codecs) |*c| {
+            c.* = try Codec.init(gpa, t);
+            built += 1;
+        }
+        var free = try mpmc.BoundedMpmc(*Codec).init(gpa, count);
+        errdefer free.deinit(gpa);
+        for (codecs) |*c| free.pushSpin(c);
+        return .{ .codecs = codecs, .free = free, .permits = semaphore.Semaphore.init(count), .shared = shared };
+    }
+
+    pub fn deinit(self: *CodecPool, gpa: Allocator) void {
+        for (self.codecs) |*c| c.deinit(gpa);
+        gpa.free(self.codecs);
+        self.free.deinit(gpa);
+        self.* = undefined;
+    }
+
+    pub fn capacity(self: *const CodecPool) usize {
+        return self.codecs.len;
+    }
+
+    /// A codec of our own until `release`; parks only past the capacity
+    /// (counted), never allocates.
+    pub fn acquire(self: *CodecPool, io: std.Io) *Codec {
+        if (self.shared) return &self.codecs[0];
+        if (self.permits.tryAcquire(io, 1) == null) {
+            stats.transform_codec_pool_waits.inc();
+            _ = self.permits.acquireUncancelable(io, 1);
+        }
+        while (true) {
+            if (self.free.tryPop()) |c| return c;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn release(self: *CodecPool, io: std.Io, c: *Codec) void {
+        if (self.shared) return;
+        self.free.pushSpin(c);
+        self.permits.release(io, 1);
+    }
+};
+
+/// Stored-image scratches (`scratchLen(block)` each, DMA-aligned): a
+/// buffer is held from the transform through the DMA its image feeds.
+pub const ScratchPool = struct {
+    pub const Buf = []align(DMA_GRAIN) u8;
+
+    bufs: []Buf,
+    free: mpmc.BoundedMpmc(Buf),
+    permits: semaphore.Semaphore,
+
+    /// `n ≥ 1` buffers of `len` bytes (`scratchPoolCap(cpus)` × `scratchLen`).
+    pub fn init(gpa: Allocator, n: usize, len: usize) Allocator.Error!ScratchPool {
+        const count: usize = @max(n, 1);
+        const bufs = try gpa.alloc(Buf, count);
+        errdefer gpa.free(bufs);
+        var built: usize = 0;
+        errdefer for (bufs[0..built]) |b| gpa.free(b);
+        for (bufs) |*b| {
+            b.* = try gpa.alignedAlloc(u8, .fromByteUnits(DMA_GRAIN), len);
+            built += 1;
+        }
+        var free = try mpmc.BoundedMpmc(Buf).init(gpa, count);
+        errdefer free.deinit(gpa);
+        for (bufs) |b| free.pushSpin(b);
+        return .{ .bufs = bufs, .free = free, .permits = semaphore.Semaphore.init(count) };
+    }
+
+    pub fn deinit(self: *ScratchPool, gpa: Allocator) void {
+        for (self.bufs) |b| gpa.free(b);
+        gpa.free(self.bufs);
+        self.free.deinit(gpa);
+        self.* = undefined;
+    }
+
+    pub fn capacity(self: *const ScratchPool) usize {
+        return self.bufs.len;
+    }
+
+    pub fn acquire(self: *ScratchPool, io: std.Io) Buf {
+        if (self.permits.tryAcquire(io, 1) == null) {
+            stats.transform_scratch_pool_waits.inc();
+            _ = self.permits.acquireUncancelable(io, 1);
+        }
+        while (true) {
+            if (self.free.tryPop()) |b| return b;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn release(self: *ScratchPool, io: std.Io, b: Buf) void {
+        self.free.pushSpin(b);
+        self.permits.release(io, 1);
     }
 };
 
@@ -1552,6 +1784,11 @@ pub const stats = struct {
     pub var transform_frame_refusals_key: counters.Tripwire = .init("transform_frame_refusals_key");
     pub var transform_frame_refusals_body: counters.Tripwire = .init("transform_frame_refusals_body");
     pub var transform_frame_refusals_table: counters.Tripwire = .init("transform_frame_refusals_table");
+    /// Acquires that found the pool empty and parked: 0 by derivation for
+    /// the codecs (one per lane); for the scratches the write side's
+    /// concurrency past `scratchPoolCap` (a park, never a heap spill).
+    pub var transform_codec_pool_waits: counters.ShardedCounter = .{};
+    pub var transform_scratch_pool_waits: counters.ShardedCounter = .{};
     pub var transform_phase_ns_compress: counters.ShardedLatencyHistogram = .{};
     pub var transform_phase_ns_seal: counters.ShardedLatencyHistogram = .{};
     pub var transform_phase_ns_open: counters.ShardedLatencyHistogram = .{};
@@ -1674,7 +1911,8 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     var env = testEnv();
     defer env.deinit();
     const cfg2: VolumeTransform = .{ .compression = .lz4, .encryption = .none, .block_size = 131072 };
-    var t = try Transform.init(gpa, &env, cfg2, null);
+    const xf = try Transform.init(&env, cfg2, null);
+    var t = try Codec.init(gpa, &xf);
     defer t.deinit(gpa);
     var plain: [131072]u8 = undefined;
     fillCompressible(&plain, 11);
@@ -1803,20 +2041,26 @@ test "geometry: max_stored_image_len = table + block (+16 per frame encrypted) �
     try testing.expect(blockSizeValid(4 << 20) and blockSizeValid(4096) and !blockSizeValid(8 << 20) and !blockSizeValid(3 << 20) and !blockSizeValid(2048));
 }
 
-test "scratch: write scratch = ceil_4k(table + block + frames × 16) = block + 4 KiB (4,198,400 at 4 MiB; the reference's bound-sized 4,214,784 is never needed); ONE scratch = block + 128 KiB = 4,325,376 — the charter's envelope, the zstd window law" {
+test "scratch: write scratch = ceil_4k(table + block + frames × 16) = block + 4 KiB (4,198,400 at 4 MiB; the reference's bound-sized 4,214,784 is never needed); ONE scratch = the write scratch (the C decoder needs no window slack), inside the charter's block + 128 KiB envelope; the pool derivations clamp(cpus/4, 4, 16) and one codec per lane" {
     try testing.expectEqual(@as(u64, 4_198_400), writeScratchLen(4 << 20));
-    try testing.expectEqual(@as(u64, (4 << 20) + (128 << 10)), scratchLen(4 << 20));
-    try testing.expectEqual(@as(u64, 4_325_376), scratchLen(4 << 20));
-    try testing.expect(scratchLen(4 << 20) < 4_214_784 + (128 << 10));
+    try testing.expectEqual(@as(u64, 4_198_400), scratchLen(4 << 20));
+    try testing.expect(scratchLen(4 << 20) < 4_214_784);
     try testing.expectEqual(@as(u64, 8192), writeScratchLen(4096));
-    try testing.expectEqual(@as(u64, 4096 + (128 << 10)), scratchLen(4096));
+    try testing.expectEqual(@as(u64, 8192), scratchLen(4096));
     var b: u32 = MIN_BLOCK_SIZE;
     while (b <= MAX_BLOCK_SIZE) : (b *= 2) {
-        try testing.expect(scratchLen(b) >= writeScratchLen(b));
-        try testing.expect(scratchLen(b) >= @as(u64, b) + std.compress.zstd.block_size_max);
+        try testing.expectEqual(writeScratchLen(b), scratchLen(b));
+        try testing.expect(scratchLen(b) >= @as(u64, b) + tableLen(framesFor(b)) + @as(u64, framesFor(b)) * TAG_LEN);
         try testing.expect(scratchLen(b) <= @as(u64, b) + (128 << 10));
         try testing.expectEqual(@as(u64, 0), writeScratchLen(b) % DMA_GRAIN);
     }
+    // The pools: clamp(cpus / 4, 4, 16) scratches; one codec per lane, floor 1.
+    try testing.expectEqual(@as(u32, 4), scratchPoolCap(1));
+    try testing.expectEqual(@as(u32, 4), scratchPoolCap(9));
+    try testing.expectEqual(@as(u32, 8), scratchPoolCap(32));
+    try testing.expectEqual(@as(u32, 16), scratchPoolCap(256));
+    try testing.expectEqual(@as(usize, 1), codecPoolSize(0));
+    try testing.expectEqual(@as(usize, 12), codecPoolSize(12));
 }
 
 // LZ4 block vectors produced by the reference `lz4 v1.10.0` CLI (`lz4 -BI
@@ -1954,66 +2198,76 @@ test "lz4 throughput scoping row (dev box, test build; not an acceptance number)
     std.debug.print("\nlz4 scoping: 4 MiB compressible block → {d} B ({d}.{d:0>2}×); compress {d} MB/s, decompress {d} MB/s ({s}, {s})\n", .{ n, len / n, (len * 100 / n) % 100, c_mbs, d_mbs, @tagName(builtin.mode), @tagName(builtin.os.tag) });
 }
 
-test "zstd: a static context compresses level-3 single-shot frames the std decoder reads back; incompressible input refuses a bounded output; the window is the content size (single segment)" {
+test "zstd: a static context compresses level-3 single-shot frames the static DCtx reads back exactly; incompressible input refuses a bounded output; the window is the content size (single segment); two contexts decode the same frame independently" {
     const gpa = testing.allocator;
-    var z = try zstd.Compressor.init(gpa);
+    var z = try zstd.Context.init(gpa);
     defer z.deinit(gpa);
     const src = try gpa.alloc(u8, 1 << 20);
     defer gpa.free(src);
     const comp = try gpa.alloc(u8, 1 << 20);
     defer gpa.free(comp);
-    const out = try gpa.alloc(u8, (1 << 20) + std.compress.zstd.block_size_max);
+    // One byte past the largest plaintext: room for the `len + 1` refusal.
+    const out = try gpa.alloc(u8, (1 << 20) + 1);
     defer gpa.free(out);
     // Below a frame's own overhead nothing shrinks: the escape stores raw.
     for ([_]usize{ 1, 10 }) |len| {
         fillCompressible(src[0..len], len);
-        try testing.expectError(error.OutputTooSmall, z.compress(src[0..len], comp[0 .. len - 1]));
+        try testing.expectError(error.OutputTooSmall, z.c.compress(src[0..len], comp[0 .. len - 1]));
     }
     for ([_]usize{ 4096, 65536, 1 << 20 }) |len| {
         fillCompressible(src[0..len], len);
-        const n = try z.compress(src[0..len], comp[0 .. len - 1]);
+        const n = try z.c.compress(src[0..len], comp[0 .. len - 1]);
         try testing.expect(n < len);
         // Frame descriptor: Single_Segment_flag (bit 5) set, no checksum (bit 2).
         try testing.expect(comp[4] & 0x20 != 0);
         try testing.expect(comp[4] & 0x04 == 0);
-        try zstd.decompress(comp[0..n], out, @intCast(len));
+        // The destination is EXACTLY the plaintext: no window slack.
+        try z.d.decompress(comp[0..n], out[0..len], @intCast(len));
         try testing.expectEqualSlices(u8, src[0..len], out[0..len]);
-        // A wrong plain_len and trailing bytes refuse.
-        try testing.expectError(error.Corrupt, zstd.decompress(comp[0..n], out, @intCast(len - 1)));
+        // A wrong plain_len (either direction) and trailing bytes refuse.
+        try testing.expectError(error.Corrupt, z.d.decompress(comp[0..n], out, @intCast(len - 1)));
+        try testing.expectError(error.Corrupt, z.d.decompress(comp[0..n], out, @intCast(len + 1)));
         comp[n] = 0;
-        try testing.expectError(error.Corrupt, zstd.decompress(comp[0 .. n + 1], out, @intCast(len)));
+        try testing.expectError(error.Corrupt, z.d.decompress(comp[0 .. n + 1], out, @intCast(len)));
+        // A second context reads the frame a first one wrote (per-lane
+        // contexts share nothing but the bytes).
+        var other = try zstd.Decompressor.init(gpa);
+        defer other.deinit(gpa);
+        @memset(out[0..len], 0);
+        try other.decompress(comp[0..n], out[0..len], @intCast(len));
+        try testing.expectEqualSlices(u8, src[0..len], out[0..len]);
     }
     fill(src[0..4096], 1);
-    try testing.expectError(error.OutputTooSmall, z.compress(src[0..4096], comp[0..4095]));
+    try testing.expectError(error.OutputTooSmall, z.c.compress(src[0..4096], comp[0..4095]));
     // The empty frame round-trips at plain_len 0 (the transform never
     // writes it — the empty payload is stored raw — but the decoder is total).
-    const n0 = try z.compress(src[0..0], comp);
-    try zstd.decompress(comp[0..n0], out, 0);
+    const n0 = try z.c.compress(src[0..0], comp);
+    try z.d.decompress(comp[0..n0], out, 0);
 }
 
 test "property: the zstd decoder is total under a PRNG, including bit flips of valid frames" {
     const gpa = testing.allocator;
-    var z = try zstd.Compressor.init(gpa);
+    var z = try zstd.Context.init(gpa);
     defer z.deinit(gpa);
     var prng = std.Random.DefaultPrng.init(0x2222);
     const r = prng.random();
     var buf: [2048]u8 = undefined;
-    const out = try gpa.alloc(u8, 4096 + std.compress.zstd.block_size_max);
+    const out = try gpa.alloc(u8, 4096);
     defer gpa.free(out);
     for (0..3000) |_| {
         const len = r.intRangeAtMost(usize, 0, buf.len);
         r.bytes(buf[0..len]);
-        zstd.decompress(buf[0..len], out, r.intRangeAtMost(u32, 0, 4096)) catch {};
+        z.d.decompress(buf[0..len], out, r.intRangeAtMost(u32, 0, 4096)) catch {};
     }
     var src: [3000]u8 = undefined;
     fillCompressible(&src, 5);
     var comp: [3000]u8 = undefined;
-    const n = try z.compress(&src, &comp);
+    const n = try z.c.compress(&src, &comp);
     for (0..1500) |_| {
         var mut = comp;
         for (0..r.intRangeAtMost(usize, 1, 3)) |_| mut[r.intRangeLessThan(usize, 0, n)] ^= @as(u8, 1) << r.int(u3);
-        zstd.decompress(mut[0..n], out, src.len) catch {};
-        zstd.decompress(mut[0..r.intRangeAtMost(usize, 0, n)], out, src.len) catch {};
+        z.d.decompress(mut[0..n], out, src.len) catch {};
+        z.d.decompress(mut[0..r.intRangeAtMost(usize, 0, n)], out, src.len) catch {};
     }
 }
 
@@ -2137,7 +2391,8 @@ test "CryptoState: a fresh session key per init; own blob is the fast path; a fo
 fn roundTrip(gpa: Allocator, cfg: VolumeTransform, crypto: ?*CryptoState, plain: []const u8, expect_raw: bool) !void {
     var env = testEnv();
     defer env.deinit();
-    var t = try Transform.init(gpa, &env, cfg, crypto);
+    const xf = try Transform.init(&env, cfg, crypto);
+    var t = try Codec.init(gpa, &xf);
     defer t.deinit(gpa);
     const scratch = try gpa.alloc(u8, scratchLen(cfg.block_size));
     defer gpa.free(scratch);
@@ -2204,7 +2459,8 @@ test "processWrite/processRead: passthrough is the identity (same pointer, no fr
     var noise: [65536]u8 = undefined;
     fill(&noise, 2);
     {
-        var t = try Transform.init(gpa, &env, .{ .block_size = block }, null);
+        const xf = try Transform.init(&env, .{ .block_size = block }, null);
+        var t = try Codec.init(gpa, &xf);
         defer t.deinit(gpa);
         var scratch: [8]u8 = undefined;
         const img = try t.processWrite(&plain, &scratch);
@@ -2234,9 +2490,9 @@ test "processWrite/processRead: passthrough is the identity (same pointer, no fr
     try roundTrip(gpa, .{ .encryption = .chacha20poly1305, .block_size = block }, cha, &noise, true);
     try roundTrip(gpa, .{ .encryption = .chacha20poly1305, .block_size = block }, cha, "", true);
     // The key posture must match the config.
-    try testing.expectError(error.KeyPostureMismatch, Transform.init(gpa, &env, .{ .encryption = .aes256gcm, .block_size = block }, null));
-    try testing.expectError(error.KeyPostureMismatch, Transform.init(gpa, &env, .{ .encryption = .aes256gcm, .block_size = block }, cha));
-    try testing.expectError(error.KeyPostureMismatch, Transform.init(gpa, &env, .{ .block_size = block }, gcm));
+    try testing.expectError(error.KeyPostureMismatch, Transform.init(&env, .{ .encryption = .aes256gcm, .block_size = block }, null));
+    try testing.expectError(error.KeyPostureMismatch, Transform.init(&env, .{ .encryption = .aes256gcm, .block_size = block }, cha));
+    try testing.expectError(error.KeyPostureMismatch, Transform.init(&env, .{ .block_size = block }, gcm));
 }
 
 test "the force-raw seam stores a compressible block raw (the raw bit, the headroom and the window widening exercised with compressible data)" {
@@ -2245,9 +2501,10 @@ test "the force-raw seam stores a compressible block raw (the raw bit, the headr
     defer env.deinit();
     try env.put("SQUEEZEFS_TEST_TRANSFORM_FORCE_RAW", "1");
     const cfg: VolumeTransform = .{ .compression = .lz4, .block_size = 65536 };
-    var t = try Transform.init(gpa, &env, cfg, null);
+    const xf = try Transform.init(&env, cfg, null);
+    var t = try Codec.init(gpa, &xf);
     defer t.deinit(gpa);
-    try testing.expect(t.force_raw);
+    try testing.expect(xf.force_raw);
     var plain: [65536]u8 = undefined;
     fillCompressible(&plain, 4);
     const scratch = try gpa.alloc(u8, scratchLen(cfg.block_size));
@@ -2272,7 +2529,8 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     const c = try CryptoState.init(gpa, testing.io, .aes256gcm, d, 0, 1);
     defer c.deinit();
     const cfg: VolumeTransform = .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = 65536 };
-    var t = try Transform.init(gpa, &env, cfg, c);
+    const xf = try Transform.init(&env, cfg, c);
+    var t = try Codec.init(gpa, &xf);
     defer t.deinit(gpa);
     var plain: [20000]u8 = undefined;
     fillCompressible(&plain, 6);
@@ -2374,7 +2632,8 @@ test "plain_len above the block is refused before any work; the read path takes 
     var env = testEnv();
     defer env.deinit();
     const cfg: VolumeTransform = .{ .compression = .zstd, .block_size = 65536 };
-    var t = try Transform.init(gpa, &env, cfg, null);
+    const xf = try Transform.init(&env, cfg, null);
+    var t = try Codec.init(gpa, &xf);
     defer t.deinit(gpa);
     var plain: [30000]u8 = undefined;
     fillCompressible(&plain, 8);
@@ -2388,6 +2647,151 @@ test "plain_len above the block is refused before any work; the read path takes 
     try testing.expectError(error.FramePlainLen, t.readInner(image, out));
     std.mem.writeInt(u32, image[12..16], 30000, .little);
     try testing.expectEqualSlices(u8, &plain, try t.readInner(image, out));
+}
+
+/// One lane of the pool test: `rounds` sub-block decodes of `image`'s
+/// frame span through a codec acquired per op, each checked byte-exact.
+const PoolLane = struct {
+    pool: *CodecPool,
+    image: []const u8,
+    plain: []const u8,
+    span: FrameSpan,
+    rounds: usize,
+    gate: *std.atomic.Value(u32),
+    failed: *std.atomic.Value(u32),
+    peak_inside: *std.atomic.Value(u32),
+    inside: *std.atomic.Value(u32),
+
+    fn run(l: PoolLane) void {
+        const gpa = std.heap.page_allocator;
+        const window = gpa.alloc(u8, @intCast(l.span.hi - l.span.lo)) catch {
+            _ = l.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer gpa.free(window);
+        const out = gpa.alloc(u8, @as(usize, l.span.last - l.span.first + 1) * FRAME_GRAIN) catch {
+            _ = l.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer gpa.free(out);
+        // Every lane starts together: the pool must serve them all at once.
+        while (l.gate.load(.acquire) == 0) std.atomic.spinLoopHint();
+        for (0..l.rounds) |_| {
+            const c = l.pool.acquire(testing.io);
+            const now = l.inside.fetchAdd(1, .acq_rel) + 1;
+            _ = l.peak_inside.fetchMax(now, .acq_rel);
+            @memcpy(window, l.image[@intCast(l.span.lo)..@intCast(l.span.hi)]);
+            const view = c.decodeFrames(l.image[0..HEADER_PAGE_LEN], window, l.span.lo, l.span, out) catch {
+                _ = l.failed.fetchAdd(1, .monotonic);
+                _ = l.inside.fetchSub(1, .acq_rel);
+                l.pool.release(testing.io, c);
+                return;
+            };
+            if (!std.mem.eql(u8, view, l.plain[@intCast(l.span.plain_base)..][0..view.len])) _ = l.failed.fetchAdd(1, .monotonic);
+            _ = l.inside.fetchSub(1, .acq_rel);
+            l.pool.release(testing.io, c);
+        }
+    }
+};
+
+test "the codec pool (decision 0003 §K10): N lanes decode the same zstd frames at once through N codecs — every decode byte-exact, the lanes genuinely overlap, and a pool sized to the lanes parks nobody (transform_codec_pool_waits stays 0); a pool one short of the lanes parks and still decodes right; a stateless (lz4) volume's pool is one shared codec with no atomics" {
+    const gpa = testing.allocator;
+    var env = testEnv();
+    defer env.deinit();
+    const lanes: usize = 8;
+    const cfg: VolumeTransform = .{ .compression = .zstd, .block_size = 4 * FRAME_GRAIN };
+    const xf = try Transform.init(&env, cfg, null);
+    var pool = try CodecPool.init(gpa, &xf, codecPoolSize(lanes));
+    defer pool.deinit(gpa);
+    try testing.expectEqual(lanes, pool.capacity());
+    try testing.expect(!pool.shared);
+    const plain = try gpa.alloc(u8, cfg.block_size);
+    defer gpa.free(plain);
+    fillCompressible(plain, 21);
+    const scratch = try gpa.alloc(u8, scratchLen(cfg.block_size));
+    defer gpa.free(scratch);
+    const image = blk: {
+        const c = pool.acquire(testing.io);
+        defer pool.release(testing.io, c);
+        break :blk try gpa.dupe(u8, try c.processWrite(plain, scratch));
+    };
+    defer gpa.free(image);
+    const h = try decodeHeader(cfg, image);
+    const tb = try decodeTable(cfg, h, image);
+    try testing.expect(!tb.get(1).storeRaw()); // a compressed frame: the decoder has work to do
+    const span = try frameSpan(h, tb, FRAME_GRAIN + 100, 2 * FRAME_GRAIN + 100);
+    var gate: std.atomic.Value(u32) = .init(0);
+    var failed: std.atomic.Value(u32) = .init(0);
+    var peak: std.atomic.Value(u32) = .init(0);
+    var inside: std.atomic.Value(u32) = .init(0);
+    const waits0 = stats.transform_codec_pool_waits.load();
+    var threads: [lanes]std.Thread = undefined;
+    for (&threads) |*th| th.* = try std.Thread.spawn(.{}, PoolLane.run, .{PoolLane{ .pool = &pool, .image = image, .plain = plain, .span = span, .rounds = 400, .gate = &gate, .failed = &failed, .peak_inside = &peak, .inside = &inside }});
+    gate.store(1, .release);
+    for (threads) |th| th.join();
+    try testing.expectEqual(@as(u32, 0), failed.load(.acquire));
+    // The lanes overlapped inside the decode (not serialized behind one
+    // context), and nobody parked: the pool is the lane count.
+    try testing.expect(peak.load(.acquire) >= 2);
+    try testing.expectEqual(waits0, stats.transform_codec_pool_waits.load());
+    try testing.expectEqual(lanes, pool.permits.available(testing.io));
+    // One codec short of the lanes: the overflow PARKS (counted) and every
+    // decode is still right — the pool never over-admits.
+    var short = try CodecPool.init(gpa, &xf, lanes - 1);
+    defer short.deinit(gpa);
+    var gate2: std.atomic.Value(u32) = .init(0);
+    var failed2: std.atomic.Value(u32) = .init(0);
+    var peak2: std.atomic.Value(u32) = .init(0);
+    var inside2: std.atomic.Value(u32) = .init(0);
+    for (&threads) |*th| th.* = try std.Thread.spawn(.{}, PoolLane.run, .{PoolLane{ .pool = &short, .image = image, .plain = plain, .span = span, .rounds = 400, .gate = &gate2, .failed = &failed2, .peak_inside = &peak2, .inside = &inside2 }});
+    gate2.store(1, .release);
+    for (threads) |th| th.join();
+    try testing.expectEqual(@as(u32, 0), failed2.load(.acquire));
+    try testing.expect(peak2.load(.acquire) <= lanes - 1);
+    try testing.expect(stats.transform_codec_pool_waits.load() > waits0);
+    try testing.expectEqual(lanes - 1, short.permits.available(testing.io));
+    // A stateless volume: one codec, handed out by pointer, no permits touched.
+    const lz_xf = try Transform.init(&env, .{ .compression = .lz4, .block_size = 4 * FRAME_GRAIN }, null);
+    var lz = try CodecPool.init(gpa, &lz_xf, codecPoolSize(lanes));
+    defer lz.deinit(gpa);
+    try testing.expect(lz.shared);
+    try testing.expectEqual(@as(usize, 1), lz.capacity());
+    const a = lz.acquire(testing.io);
+    const b = lz.acquire(testing.io);
+    try testing.expectEqual(a, b);
+    try testing.expectEqual(@as(usize, 1), lz.permits.available(testing.io));
+    lz.release(testing.io, a);
+    lz.release(testing.io, b);
+}
+
+test "the scratch pool: capacity handouts are distinct DMA-aligned buffers of the scratch length; the one past the cap parks (counted) until a release; every buffer returns" {
+    const gpa = testing.allocator;
+    var pool = try ScratchPool.init(gpa, 2, scratchLen(4096));
+    defer pool.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), pool.capacity());
+    const waits0 = stats.transform_scratch_pool_waits.load();
+    const a = pool.acquire(testing.io);
+    const b = pool.acquire(testing.io);
+    try testing.expect(a.ptr != b.ptr);
+    try testing.expectEqual(scratchLen(4096), a.len);
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(a.ptr) % DMA_GRAIN);
+    try testing.expectEqual(waits0, stats.transform_scratch_pool_waits.load());
+    const Third = struct {
+        fn run(p: *ScratchPool, got: *std.atomic.Value(usize)) void {
+            const c = p.acquire(testing.io);
+            got.store(@intFromPtr(c.ptr), .release);
+            p.release(testing.io, c);
+        }
+    };
+    var got: std.atomic.Value(usize) = .init(0);
+    const th = try std.Thread.spawn(.{}, Third.run, .{ &pool, &got });
+    while (pool.permits.waiters(testing.io) == 0) try std.Thread.yield();
+    try testing.expectEqual(waits0 + 1, stats.transform_scratch_pool_waits.load());
+    pool.release(testing.io, a);
+    th.join();
+    try testing.expectEqual(@intFromPtr(a.ptr), got.load(.acquire));
+    pool.release(testing.io, b);
+    try testing.expectEqual(@as(usize, 2), pool.permits.available(testing.io));
 }
 
 fn frameFuzz(_: void, smith: *std.testing.Smith) !void {
@@ -2424,9 +2828,10 @@ fn tableFuzz(_: void, smith: *std.testing.Smith) !void {
         if (t.count == 0) continue;
         const span = frameSpan(h, t, 0, h.plain_len) catch continue;
         if (cfg.encryption != .none) continue;
-        var tr = Transform.init(testing.allocator, &env, cfg, null) catch continue;
+        const xf = Transform.init(&env, cfg, null) catch continue;
+        var tr = Codec.init(testing.allocator, &xf) catch continue;
         defer tr.deinit(testing.allocator);
-        var out: [2 * FRAME_GRAIN + 128 * 1024 + 1]u8 = undefined;
+        var out: [2 * FRAME_GRAIN + 1]u8 = undefined;
         _ = tr.decodeFrames(page[0..len], window[0..wlen], window_off, span, &out) catch {};
     }
 }
@@ -2458,7 +2863,8 @@ test "property: readInner is total under a PRNG over mutations of valid lz4/zstd
     var plain: [8192]u8 = undefined;
     fillCompressible(&plain, 9);
     for (cfgs) |cfg| {
-        var t = try Transform.init(gpa, &env, cfg, if (cfg.encryption != .none) c else null);
+        const xf = try Transform.init(&env, cfg, if (cfg.encryption != .none) c else null);
+        var t = try Codec.init(gpa, &xf);
         defer t.deinit(gpa);
         const image = try gpa.dupe(u8, try t.processWrite(plain[0..6000], scratch));
         defer gpa.free(image);

@@ -60,8 +60,8 @@
 //! What this wave does NOT do (recorded in `docs/evidence/rung-04-data-
 //! plane.md`): a RAM layout cache (the map authority reads the KV record —
 //! latch-free through the node cache, one decode per probe); the writeback
-//! spill of parked blocks into the ring; per-lane transform contexts (one
-//! serialized `Transform`).
+//! spill of parked blocks into the ring. The per-lane transform contexts
+//! landed with rung 9 (`Xform`: a codec per executor lane, pooled scratches).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -79,7 +79,6 @@ const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const budget = @import("../mem/budget.zig");
 const exec = @import("../exec/exec.zig");
-const sync_mutex = @import("../sync/mutex.zig");
 const lock_order = @import("../sync/lock_order.zig");
 const taskset = @import("../sync/taskset.zig");
 const nvme_dev = @import("../io/nvme_dev.zig");
@@ -318,13 +317,16 @@ const Staging = struct {
     pool: staging.Pool,
 };
 
+/// The transformed set's state (decision 0003 §K10): the immutable
+/// transform, one codec per executor lane (a decode on any lane takes a
+/// codec with no lock), and the stored-image scratches the plane's own
+/// transforms hold across their DMAs (`transformWrite` → the own-block /
+/// pack DMA; `readMappingImage`'s decode destination).
 const Xform = struct {
     t: transform.Transform,
     crypto: ?*transform.CryptoState,
-    /// One `Transform` (the zstd context is single-threaded): serialized.
-    lock: sync_mutex.Mutex = .init,
-    scratch: []align(layout.GRAIN) u8,
-    read_scratch: []align(layout.GRAIN) u8,
+    codecs: transform.CodecPool,
+    scratches: transform.ScratchPool,
 };
 
 pub const Space = struct { total_bytes: u64, free_bytes: u64 };
@@ -558,6 +560,7 @@ pub const DataPlane = struct {
             .budget_bytes = opts.budget_bytes,
             .transform = self.transformSeam(),
             .scratch_len = if (self.xform != null) transform.scratchLen(cfg.block_size) else 0,
+            .scratch_pool_cap = transform.scratchPoolCap(opts.facts.cpus),
             .image = if (self.xform != null) seams.ImageSeam{ .ctx = self, .read = &imageSeamRead } else null,
         }) catch return error.OutOfMemory;
         errdefer self.wp.deinit(io);
@@ -723,20 +726,21 @@ pub const DataPlane = struct {
             crypto = transform.CryptoState.init(gpa, io, cfg.encryption, derived, cfg.nonce_floor, 1) catch return error.TransformRefused;
         }
         errdefer if (crypto) |c| c.deinit();
-        const t = transform.Transform.init(gpa, opts.env, tcfg, crypto) catch return error.TransformRefused;
-        const scratch_len: usize = @intCast(transform.scratchLen(cfg.block_size));
-        const scratch = gpa.alignedAlloc(u8, .fromByteUnits(layout.GRAIN), scratch_len) catch return error.OutOfMemory;
-        errdefer gpa.free(scratch);
-        const read_scratch = gpa.alignedAlloc(u8, .fromByteUnits(layout.GRAIN), scratch_len) catch return error.OutOfMemory;
-        self.xform = .{ .t = t, .crypto = crypto, .scratch = scratch, .read_scratch = read_scratch };
+        const t = transform.Transform.init(opts.env, tcfg, crypto) catch return error.TransformRefused;
+        self.xform = .{ .t = t, .crypto = crypto, .codecs = undefined, .scratches = undefined };
+        const x = &self.xform.?;
+        // The codecs point at the transform IN the plane (a stable address
+        // for the mount's life); one per executor lane.
+        x.codecs = transform.CodecPool.init(gpa, &x.t, transform.codecPoolSize(self.sqz.lanes.len)) catch return error.TransformRefused;
+        errdefer x.codecs.deinit(gpa);
+        x.scratches = transform.ScratchPool.init(gpa, transform.scratchPoolCap(opts.facts.cpus), @intCast(transform.scratchLen(cfg.block_size))) catch return error.OutOfMemory;
     }
 
     fn closeTransform(self: *DataPlane) void {
         if (self.xform) |*x| {
-            x.t.deinit(self.gpa);
+            x.scratches.deinit(self.gpa);
+            x.codecs.deinit(self.gpa);
             if (x.crypto) |c| c.deinit();
-            self.gpa.free(x.scratch);
-            self.gpa.free(x.read_scratch);
             self.xform = null;
         }
     }
@@ -997,6 +1001,14 @@ pub const DataPlane = struct {
     pub fn ownBlock(self: *DataPlane, io: Io, ino: u64, image: []const u8) Error!OwnBlock {
         if (image.len > self.block_size) return error.FileTooBig;
         const tag = (self.rt.pickVolume() catch return error.OutOfMemory) orelse return error.NoSpaceLeft;
+        const stored = try self.transformWrite(tag, image);
+        defer stored.release(self);
+        return self.ownBlockStored(io, ino, tag, stored.bytes, image.len);
+    }
+
+    /// `ownBlock` from an image already transformed for `tag` (the
+    /// promotion transforms ONCE to pick its arm, then lands that image).
+    fn ownBlockStored(self: *DataPlane, io: Io, ino: u64, tag: u64, stored: []const u8, plain_len: usize) Error!OwnBlock {
         const v = self.vols.byTag(tag) orelse return error.InputOutput;
         const minted = enospc.allocateWithValve(v.alloc, io, enospc.Valve.fromReclaimer(self.reclaimer)) catch |e| return switch (e) {
             error.StorageFull => error.NoSpaceLeft,
@@ -1005,12 +1017,11 @@ pub const DataPlane = struct {
         };
         var guard = block_alloc.MintedBlockGuard.init(v.alloc, minted);
         errdefer guard.abandon();
-        const stored = try self.transformWrite(tag, image);
         self.deviceWrite(tag, minted.offset, stored) catch |e| return mapDma(e);
         v.alloc.publishBlock(minted.idx);
         guard.disarm();
         stats.own_block_dmas.inc();
-        stats.own_block_dma_bytes.add(image.len);
+        stats.own_block_dma_bytes.add(plain_len);
         self.wp.touched.stampOrdinal(ino, v.ordinal);
         // The proof names what the DMA landed: a whole-block DMA is the
         // complete payload or image by construction, so `DmaProof.covers`
@@ -1264,14 +1275,14 @@ pub const DataPlane = struct {
         try self.deviceRead(w.vol_tag, w.device_off, out[0..@intCast(w.len)], .write_side);
         if (!v.alloc.fillIncarnationStill(v.alloc.idxOf(m.offset), before)) return error.InputOutput;
         if (self.xform != null) {
-            // A tenant image is a transform frame: decode into the plane's
-            // read scratch, then the plaintext view.
+            // A tenant image is a transform frame: decode into a pooled
+            // scratch, then the plaintext view copied back into `out`.
             const x = &self.xform.?;
-            x.lock.lockUncancelable(self.io);
-            defer x.lock.unlock(self.io);
-            const plain = x.t.processRead(out[0..@intCast(w.len)], x.read_scratch) catch return error.InputOutput;
+            const scratch = x.scratches.acquire(self.io);
+            defer x.scratches.release(self.io, scratch);
+            const plain = self.decodeStored(out[0..@intCast(w.len)], scratch) catch return error.InputOutput;
             if (plain.len > out.len) return error.BufferTooSmall;
-            std.mem.copyForwards(u8, out[0..plain.len], plain);
+            @memcpy(out[0..plain.len], plain);
             return out[0..plain.len];
         }
         return out[w.lo..w.hi];
@@ -1345,13 +1356,18 @@ pub const DataPlane = struct {
             return .{ .ok = false };
         }
         const policy = if (self.packer) |*p| p.policy else pack.Policy{ .enabled = false, .max_slot = self.chunk / 2 };
-        const stored_len: u64 = if (self.xform != null) blk: {
-            const x = &self.xform.?;
-            x.lock.lockUncancelable(io);
-            defer x.lock.unlock(io);
-            const img = x.t.processWrite(image, x.scratch) catch return .{ .ok = false };
-            break :blk img.len;
-        } else image.len;
+        // ONE transform per promotion: the stored image decides the arm and
+        // is the image the own-block / packed arm lands.
+        const tag = (self.rt.pickVolume() catch return .{ .ok = false }) orelse {
+            log.debug("promotion ino {d}: no data volume to promote onto", .{ino});
+            return .{ .ok = false };
+        };
+        const stored = self.transformWrite(tag, image) catch |e| {
+            log.debug("promotion ino {d}: the transform refused ({t})", .{ ino, e });
+            return .{ .ok = false };
+        };
+        defer stored.release(self);
+        const stored_len: u64 = stored.bytes.len;
         const d = pack.dispatch(policy, cur.size, stored_len, self.inline_max, self.chunk) catch |e| {
             stats.promotions_failed.inc();
             log.debug("promotion ino {d}: no arm for size {d} / stored {d} ({t})", .{ ino, cur.size, stored_len, e });
@@ -1359,8 +1375,8 @@ pub const DataPlane = struct {
         };
         const out: Promoted = switch (d) {
             .inline_ => .{ .ok = self.promoteInline(ino, cur, cur_bytes.coll_seq, image, k, generation) },
-            .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, image, k, generation) },
-            .packed_ => self.promotePacked(io, ino, cur_bytes.coll_seq, image, k, generation),
+            .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, tag, stored.bytes, image.len, k, generation) },
+            .packed_ => self.promotePacked(io, ino, cur_bytes.coll_seq, tag, stored.bytes, k, generation),
         };
         if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else {
             stats.promotions_failed.inc();
@@ -1382,8 +1398,8 @@ pub const DataPlane = struct {
         return true;
     }
 
-    fn promoteOwnBlock(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) bool {
-        const ob = self.ownBlock(io, ino, image) catch |e| {
+    fn promoteOwnBlock(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, tag: u64, stored: []const u8, plain_len: usize, k: staging.StagingKey, generation: u64) bool {
+        const ob = self.ownBlockStored(io, ino, tag, stored, plain_len) catch |e| {
             log.debug("promotion ino {d}: own block refused ({t})", .{ ino, e });
             return false;
         };
@@ -1409,17 +1425,9 @@ pub const DataPlane = struct {
     /// The packed arm under the caller's (3.5) + (3.7): `pack.commitLocked`
     /// re-checks the identity and commits; its displaced copy rides back
     /// for the release after the locks drop.
-    fn promotePacked(self: *DataPlane, io: Io, ino: u64, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) Promoted {
+    fn promotePacked(self: *DataPlane, io: Io, ino: u64, coll_seq: u8, tag: u64, stored: []const u8, k: staging.StagingKey, generation: u64) Promoted {
         const p = &(self.packer orelse return .{ .ok = false });
         const st = &self.stage.?;
-        const tag = (self.rt.pickVolume() catch return .{ .ok = false }) orelse {
-            log.debug("promotion ino {d}: no data volume to pack onto", .{ino});
-            return .{ .ok = false };
-        };
-        const stored = self.transformWrite(tag, image) catch |e| {
-            log.debug("promotion ino {d}: the transform refused ({t})", .{ ino, e });
-            return .{ .ok = false };
-        };
         const prepared = (p.prepare(io, .{ .vol_tag = tag, .scope = self.scope }, stored, clock.monotonicNs()) catch |e| {
             log.debug("promotion ino {d}: pack prepare refused ({t})", .{ ino, e });
             return .{ .ok = false };
@@ -1668,13 +1676,39 @@ pub const DataPlane = struct {
 
     // ---- the transform seams ----
 
-    /// The stored image of `plain` (the plane's serialized transform).
-    pub fn transformWrite(self: *DataPlane, vol_tag: u64, plain: []const u8) Error![]const u8 {
+    /// A stored image in a pooled scratch, held until `release` — across
+    /// the DMA that lands it (the own-block act, the pack prepare). On a
+    /// passthrough set the bytes are `plain` itself and nothing is held.
+    pub const Stored = struct {
+        bytes: []const u8,
+        scratch: ?transform.ScratchPool.Buf,
+
+        pub fn release(self: Stored, plane: *DataPlane) void {
+            if (self.scratch) |b| plane.xform.?.scratches.release(plane.io, b);
+        }
+    };
+
+    /// The stored image of `plain`: a codec of this lane's own over a
+    /// pooled scratch (no plane-wide lock).
+    pub fn transformWrite(self: *DataPlane, vol_tag: u64, plain: []const u8) Error!Stored {
         _ = vol_tag;
-        const x = &(self.xform orelse return plain);
-        x.lock.lockUncancelable(self.io);
-        defer x.lock.unlock(self.io);
-        return x.t.processWrite(plain, x.scratch) catch return error.InputOutput;
+        const x = &(self.xform orelse return .{ .bytes = plain, .scratch = null });
+        const scratch = x.scratches.acquire(self.io);
+        errdefer x.scratches.release(self.io, scratch);
+        const codec = x.codecs.acquire(self.io);
+        defer x.codecs.release(self.io, codec);
+        const bytes = codec.processWrite(plain, scratch) catch return error.InputOutput;
+        return .{ .bytes = bytes, .scratch = scratch };
+    }
+
+    /// The plaintext of a stored `image` into `out` (≥ `scratchLen`) through
+    /// a pooled codec: the plane's whole-image decode (fsck's scrub face,
+    /// `readMappingImage`).
+    pub fn decodeStored(self: *DataPlane, image: []u8, out: []u8) error{Corrupt}![]const u8 {
+        const x = &self.xform.?;
+        const codec = x.codecs.acquire(self.io);
+        defer x.codecs.release(self.io, codec);
+        return codec.processRead(image, out) catch return error.Corrupt;
     }
 
     fn transformSeam(self: *DataPlane) accumulate.TransformSeam {
@@ -1702,9 +1736,9 @@ pub const DataPlane = struct {
     fn seamProcessWrite(ctx: ?*anyopaque, _: u64, plain: []const u8, scratch: []u8) anyerror![]const u8 {
         const self: *DataPlane = @ptrCast(@alignCast(ctx.?));
         const x = &self.xform.?;
-        x.lock.lockUncancelable(self.io);
-        defer x.lock.unlock(self.io);
-        return x.t.processWrite(plain, scratch);
+        const codec = x.codecs.acquire(self.io);
+        defer x.codecs.release(self.io, codec);
+        return codec.processWrite(plain, scratch);
     }
 
     fn seamScratchLen(ctx: ?*anyopaque, _: u64) usize {
@@ -1714,15 +1748,12 @@ pub const DataPlane = struct {
 
     fn decodeImage(ctx: *anyopaque, image: []u8, out: []u8) error{Corrupt}![]const u8 {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        const x = &self.xform.?;
-        x.lock.lockUncancelable(self.io);
-        defer x.lock.unlock(self.io);
-        return x.t.processRead(image, out) catch return error.Corrupt;
+        return self.decodeStored(image, out);
     }
 
     /// The framed sub-block read's two seams (decision 0003 §K7): the span
-    /// is pure over the header page (no lock); the frame decode takes the
-    /// transform lock for the frames alone.
+    /// is pure over the header page; the frame decode runs on a codec of
+    /// this lane's own (§K10: no plane-wide lock).
     fn decodeFrameSpan(ctx: *anyopaque, page: []const u8, rel_s: u64, rel_e: u64) error{Corrupt}!read_path.FrameSpan {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const x = &self.xform.?;
@@ -1734,9 +1765,9 @@ pub const DataPlane = struct {
     fn decodeRange(ctx: *anyopaque, page: []const u8, window: []u8, window_off: u64, span: read_path.FrameSpan, out: []u8) error{Corrupt}![]const u8 {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
         const x = &self.xform.?;
-        x.lock.lockUncancelable(self.io);
-        defer x.lock.unlock(self.io);
-        return x.t.decodeFrames(page, window, window_off, span, out) catch return error.Corrupt;
+        const codec = x.codecs.acquire(self.io);
+        defer x.codecs.release(self.io, codec);
+        return codec.decodeFrames(page, window, window_off, span, out) catch return error.Corrupt;
     }
 
     // ---- the block-map authority (seams.MapSeam) ----
@@ -2973,7 +3004,7 @@ pub const DataPlane = struct {
         try block_refs.writeStatsJson(w);
         try w.writeAll(",\"reclaim\":");
         try reclaim.writeStatsJson(w);
-        try w.print(",\"transform\":{{\"compress_stored_raw\":{d},\"crypto_key_unwraps\":{d},\"crypto_key_unwrap_hits\":{d},\"crypto_unwrap_cache_full\":{d}}}", .{ transform.stats.compress_stored_raw.load(), transform.stats.crypto_key_unwraps.load(), transform.stats.crypto_key_unwrap_hits.load(), transform.stats.crypto_unwrap_cache_full.load() });
+        try w.print(",\"transform\":{{\"compress_stored_raw\":{d},\"crypto_key_unwraps\":{d},\"crypto_key_unwrap_hits\":{d},\"crypto_unwrap_cache_full\":{d},\"transform_codec_pool_waits\":{d},\"transform_scratch_pool_waits\":{d},\"transform_codecs\":{d},\"transform_scratches\":{d}}}", .{ transform.stats.compress_stored_raw.load(), transform.stats.crypto_key_unwraps.load(), transform.stats.crypto_key_unwrap_hits.load(), transform.stats.crypto_unwrap_cache_full.load(), transform.stats.transform_codec_pool_waits.load(), transform.stats.transform_scratch_pool_waits.load(), if (self.xform) |*x| x.codecs.capacity() else 0, if (self.xform) |*x| x.scratches.capacity() else 0 });
         try w.writeAll(",\"nvme_dev\":");
         try nvme_dev.writeStatsJson(w);
         try w.writeAll(",\"purge\":");

@@ -723,7 +723,8 @@ pub const PlanePack = struct {
         const p = &(plane.packer orelse return error.Io);
         const tag = (plane.rt.pickVolume() catch return error.OutOfMemory) orelse return error.StorageFull;
         const stored = plane.transformWrite(tag, image) catch return error.Io;
-        const prepared = (p.prepare(self.io, .{ .vol_tag = tag, .scope = plane.scope }, stored, clock.monotonicNs()) catch |e| return switch (e) {
+        defer stored.release(plane);
+        const prepared = (p.prepare(self.io, .{ .vol_tag = tag, .scope = plane.scope }, stored.bytes, clock.monotonicNs()) catch |e| return switch (e) {
             error.StorageFull => error.StorageFull,
             error.OutOfMemory => error.OutOfMemory,
             else => error.Io,

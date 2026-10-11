@@ -147,8 +147,10 @@ pub const Verifier = struct {
 
 /// The one `Transform` behind a face (the portable binding; the Linux
 /// runner wraps the plane's locked transform the same way).
+/// One codec behind a face (the portable binding; the Linux runner binds
+/// the plane's codec pool the same way).
 pub const TransformBinding = struct {
-    t: *transform.Transform,
+    codec: *transform.Codec,
     scratch: []u8,
 
     pub fn face(self: *TransformBinding) TransformFace {
@@ -157,8 +159,8 @@ pub const TransformBinding = struct {
 
     fn verifyFn(ctx: *anyopaque, image: []u8) Verdict {
         const self: *TransformBinding = @ptrCast(@alignCast(ctx));
-        _ = self.t.processRead(image, self.scratch) catch return .failed;
-        return if (self.t.cfg.encryption != .none) .aead else .frame;
+        _ = self.codec.processRead(image, self.scratch) catch return .failed;
+        return if (self.codec.cfg().encryption != .none) .aead else .frame;
     }
 };
 
@@ -278,7 +280,8 @@ test "verifyStored: a passthrough block is readability-only, a transformed tenan
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     const cfg: transform.VolumeTransform = .{ .compression = .lz4, .block_size = @intCast(chunk) };
-    var t = try transform.Transform.init(gpa, &env, cfg, null);
+    const xf = try transform.Transform.init(&env, cfg, null);
+    var t = try transform.Codec.init(gpa, &xf);
     defer t.deinit(gpa);
     const scratch = try gpa.alloc(u8, @intCast(transform.scratchLen(@intCast(chunk))));
     defer gpa.free(scratch);
@@ -290,7 +293,7 @@ test "verifyStored: a passthrough block is readability-only, a transformed tenan
     defer gpa.free(wscratch);
     const frame = try t.processWrite(plain, wscratch);
     @memcpy(img[@intCast(chunk + 4096)..][0..frame.len], frame);
-    var tb: TransformBinding = .{ .t = &t, .scratch = scratch };
+    var tb: TransformBinding = .{ .codec = &t, .scratch = scratch };
     const vols = [_]VolumeXform{
         .{ .vol_tag = 0x10, .cfg = .{ .block_size = @intCast(chunk) }, .face = null },
         .{ .vol_tag = 0x20, .cfg = cfg, .face = tb.face() },

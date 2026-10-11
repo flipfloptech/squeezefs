@@ -267,8 +267,8 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         return false;
     }
 
-    /// The plane's ONE transform behind the scrub's face (serialized on
-    /// its lock: the zstd context is single-threaded).
+    /// The plane's codec pool behind the scrub's face (a codec per decode,
+    /// the scrub's own scratch).
     const TransformBind = struct {
         plane: *plane_mod.DataPlane,
         scratch: []u8,
@@ -279,11 +279,8 @@ pub const linux = if (builtin.os.tag == .linux) struct {
 
         fn verifyFn(ctx: *anyopaque, image: []u8) scrub.Verdict {
             const self: *TransformBind = @ptrCast(@alignCast(ctx));
-            const x = &self.plane.xform.?;
-            x.lock.lockUncancelable(self.plane.io);
-            defer x.lock.unlock(self.plane.io);
-            _ = x.t.processRead(image, self.scratch) catch return .failed;
-            return if (x.t.cfg.encryption != .none) .aead else .frame;
+            _ = self.plane.decodeStored(image, self.scratch) catch return .failed;
+            return if (self.plane.xform.?.t.cfg.encryption != .none) .aead else .frame;
         }
     };
 

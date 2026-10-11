@@ -30,11 +30,14 @@
 //! the durable map while the epoch shadowed the block was the 2026-10-07
 //! lost overwrite (`write_epoch.zig` module doc).
 //!
-//! Transformed volumes use a worst-case scratch (`block + 128 KiB`, the
-//! `transform.scratchLen` envelope — deliberately not the block pool, whose
-//! exactly-block buffers cannot hold expanded compressor output) through the
-//! `TransformSeam`; compression is best-effort per block (store-raw inside
-//! `transform.processWrite`).
+//! Transformed volumes take a worst-case scratch (`transform.scratchLen`,
+//! block + 4 KiB — deliberately not the block pool, whose exactly-block
+//! buffers cannot hold the table and tags) from the write path's
+//! `transform.ScratchPool` for the transform AND the DMA that lands the
+//! image: the ONE shared scratch it replaces was overwritten by the next
+//! upload's transform while the previous upload's DMA still read it (two
+//! uploads in flight on a transformed volume = a torn image on the device).
+//! Compression is best-effort per block (store-raw inside `processWrite`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -59,6 +62,7 @@ const epoch_mod = @import("write_epoch.zig");
 const pipeline = @import("write_pipeline.zig");
 const extent = @import("extent_overlay.zig");
 const sole_owner_patch = @import("sole_owner_patch.zig");
+const transform = @import("transform.zig");
 
 pub const Binding = seams.Binding;
 pub const CoverageUnion = cov.CoverageUnion;
@@ -95,13 +99,6 @@ pub fn parkedCapFromEnv(env: *const std.process.Environ.Map, budget_bytes: u64, 
 /// bounds").
 pub fn effectiveParkedCap(cap: u64, level: budget.Level) u64 {
     return if (level == .red) @max(cap / 2, 1) else cap;
-}
-
-/// The transform scratch pool: `(cpus / 4).clamp(4, 16)` — above the
-/// concurrent-transform count every handout rotates through a cache-cold
-/// buffer (+4..10 % measured).
-pub fn scratchPoolCap(cpus: u32) u64 {
-    return derive.clamp(cpus / 4, 4, 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -867,9 +864,10 @@ pub const UploadDeps = struct {
     stripes: *layout.MetaStripes,
     locks: *seams.BlockLocks,
     transform: seams_transform,
-    /// The scratch for a transformed image (`scratchLen` bytes, 4 KiB-
-    /// aligned); null on an all-passthrough set.
-    scratch: ?[]align(PAGE) u8 = null,
+    /// The stored-image scratches (`scratchLen` bytes each, DMA-aligned),
+    /// one held per upload from its transform through its DMA; null on an
+    /// all-passthrough set.
+    scratch: ?*transform.ScratchPool = null,
     /// The fsync touched word (every publish stamps it).
     touched: ?*const fn (ctx: ?*anyopaque, ino: u64, ordinal: u32) void = null,
     touched_ctx: ?*anyopaque = null,
@@ -986,27 +984,33 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
             return .stay_parked;
         };
         const need = deps.transform.scratch_len(deps.transform.ctx, vol_tag);
-        const scratch: []u8 = if (need == 0) &.{} else (deps.scratch orelse {
+        const scratch_pool: ?*transform.ScratchPool = if (need == 0) null else (deps.scratch orelse {
             fsck_guard.deinit();
             mint.abandon();
             stats.write_through_fallbacks.inc();
             return .stay_parked;
         });
-        const image = deps.transform.process_write(deps.transform.ctx, vol_tag, snap.bytes(), scratch) catch {
-            fsck_guard.deinit();
-            mint.abandon();
-            stats.write_through_fallbacks.inc();
-            return .stay_parked;
-        };
-        prof.mark(.crypto);
-        prof.mark(.allocate);
-        const proof = deps.device.write(vol_tag, pm.minted.offset, image) catch |e| {
-            fsck_guard.deinit();
-            mint.abandon();
-            stats.write_through_fallbacks.inc();
-            return switch (e) {
-                error.WriterGuardFenced, error.VolumeFailed => .fence_drop,
-                else => .stay_parked,
+        // The scratch is held from the transform through the DMA that
+        // reads the image out of it, and not an instant longer.
+        const proof = blk: {
+            const scratch: []align(PAGE) u8 = if (scratch_pool) |sp| sp.acquire(io) else &.{};
+            defer if (scratch_pool) |sp| sp.release(io, scratch);
+            const image = deps.transform.process_write(deps.transform.ctx, vol_tag, snap.bytes(), scratch) catch {
+                fsck_guard.deinit();
+                mint.abandon();
+                stats.write_through_fallbacks.inc();
+                return .stay_parked;
+            };
+            prof.mark(.crypto);
+            prof.mark(.allocate);
+            break :blk deps.device.write(vol_tag, pm.minted.offset, image) catch |e| {
+                fsck_guard.deinit();
+                mint.abandon();
+                stats.write_through_fallbacks.inc();
+                return switch (e) {
+                    error.WriterGuardFenced, error.VolumeFailed => .fence_drop,
+                    else => .stay_parked,
+                };
             };
         };
         prof.mark(.dma);
@@ -1325,15 +1329,12 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
 const testing = std.testing;
 const wt = @import("write_testing.zig");
 
-test "derivations: parked cap max(256, budget/16 ÷ bs), Red halves; scratch pool clamp(cpus/4, 4, 16)" {
+test "derivations: parked cap max(256, budget/16 ÷ bs), Red halves" {
     try testing.expectEqual(@as(u64, 256), parkedCapBuffers(4 * derive.GiB, 4 * derive.MiB));
     try testing.expectEqual(@as(u64, 1024), parkedCapBuffers(64 * derive.GiB, 4 * derive.MiB));
     try testing.expectEqual(@as(u64, 9), resolveParkedCap(9, 64 * derive.GiB, 4 * derive.MiB));
     try testing.expectEqual(@as(u64, 512), effectiveParkedCap(1024, .red));
     try testing.expectEqual(@as(u64, 1024), effectiveParkedCap(1024, .yellow));
-    try testing.expectEqual(@as(u64, 4), scratchPoolCap(8));
-    try testing.expectEqual(@as(u64, 8), scratchPoolCap(32));
-    try testing.expectEqual(@as(u64, 16), scratchPoolCap(256));
 }
 
 test "the pool and the CoW cell: unique mutates in place; a shared cell copies the covered runs into a fresh one and drops the share; the cap refuses; recycled cells return" {
@@ -1740,4 +1741,101 @@ test "two flushes of one parked block (a RELEASE racing an fsync): the second JO
     try testing.expectEqual(abandons0, block_alloc.stats.unpublished_mint_abandons.load());
     try testing.expectEqual(joins0 + 1, pipeline.stats.write_pipeline_joins.load());
     try testing.expect(!w.table.has(12, 0));
+}
+
+/// A pseudo-transform for the scratch-pool law: the image is the plaintext
+/// XOR a marker, built IN the scratch (as every real transform's is).
+const XorSeam = struct {
+    const MARK: u8 = 0x5A;
+
+    fn processWrite(_: ?*anyopaque, _: u64, plain: []const u8, scratch: []u8) anyerror![]const u8 {
+        if (scratch.len < plain.len) return error.ScratchTooSmall;
+        for (plain, scratch[0..plain.len]) |p, *s| s.* = p ^ MARK;
+        return scratch[0..plain.len];
+    }
+
+    fn scratchLen(_: ?*anyopaque, _: u64) usize {
+        return wt.BS;
+    }
+
+    const seam: TransformSeam = .{ .ctx = null, .process_write = &processWrite, .scratch_len = &scratchLen };
+};
+
+/// A device whose FIRST write is a DMA in flight: it reads its source
+/// bytes only once a second write has been issued (the second upload has
+/// transformed and reached its DMA), then forwards to the fake device.
+const InFlightDevice = struct {
+    inner: seams.DeviceSeam,
+    entered: std.atomic.Value(u32) = .init(0),
+
+    fn seam(self: *InFlightDevice) seams.DeviceSeam {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable: seams.DeviceSeam.VTable = .{ .write = &write, .write_fixed = null, .read = &read, .flush = &flush };
+
+    fn write(ctx: *anyopaque, vol: u64, off: u64, data: []const u8) seams.DmaError!void {
+        const self: *InFlightDevice = @ptrCast(@alignCast(ctx));
+        if (self.entered.fetchAdd(1, .acq_rel) == 0) {
+            while (self.entered.load(.acquire) < 2) std.Thread.yield() catch {};
+        }
+        return self.inner.vtable.write(self.inner.ctx, vol, off, data);
+    }
+
+    fn read(ctx: *anyopaque, vol: u64, off: u64, out: []u8) seams.ReadError!void {
+        const self: *InFlightDevice = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.read(self.inner.ctx, vol, off, out);
+    }
+
+    fn flush(ctx: *anyopaque, vol: u64) seams.DmaError!void {
+        const self: *InFlightDevice = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.flush(self.inner.ctx, vol);
+    }
+};
+
+test "the transform scratch is held through the DMA (decision 0003 §K10): two uploads of a transformed volume in flight at once land their OWN images — the second's transform never overwrites the scratch the first's DMA is still reading (red on the one shared scratch: block 1 landed block 2's image)" {
+    const io = testing.io;
+    const w = try UploadWorld.init(testing.allocator);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(21, .striped, 0);
+    var data1: [wt.BS]u8 = undefined;
+    var data2: [wt.BS]u8 = undefined;
+    for (&data1, 0..) |*b, i| b.* = @truncate(i * 3);
+    for (&data2, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    _ = try w.table.recordWrite(w.table.checkout(21, 1, false, null).?, 0, &data1);
+    _ = try w.table.recordWrite(w.table.checkout(21, 2, false, null).?, 0, &data2);
+    var pool = try transform.ScratchPool.init(testing.allocator, 2, wt.BS);
+    defer pool.deinit(testing.allocator);
+    var dev: InFlightDevice = .{ .inner = w.f.dev.seam() };
+    var deps = w.deps();
+    deps.device = dev.seam();
+    deps.transform = XorSeam.seam;
+    deps.scratch = &pool;
+    const Uploader = struct {
+        fn run(io_: Io, table: *Table, d: UploadDeps, block: u32, out: *Disposition) void {
+            var prof = pipeline.Prof.start();
+            out.* = uploadParkedBlock(table, d, io_, 21, block, &prof);
+        }
+    };
+    var first: Disposition = .stay_parked;
+    var second: Disposition = .stay_parked;
+    const t1 = try std.Thread.spawn(.{}, Uploader.run, .{ io, &w.table, deps, 1, &first });
+    // The first upload is in its DMA before the second starts (its scratch
+    // is the one at risk).
+    while (dev.entered.load(.acquire) == 0) try std.Thread.yield();
+    const t2 = try std.Thread.spawn(.{}, Uploader.run, .{ io, &w.table, deps, 2, &second });
+    t1.join();
+    t2.join();
+    try testing.expectEqual(Disposition.published, first);
+    try testing.expectEqual(Disposition.published, second);
+    // Every block landed ITS plaintext's image.
+    var got: [wt.BS]u8 = undefined;
+    for ([_]struct { block: u32, data: *const [wt.BS]u8 }{ .{ .block = 1, .data = &data1 }, .{ .block = 2, .data = &data2 } }) |row| {
+        const b = w.f.map.seam().lookup(21, row.block).?;
+        w.f.dev.peek(wt.VOL_A, b.offset, &got);
+        for (&got) |*g| g.* ^= XorSeam.MARK;
+        try testing.expectEqualSlices(u8, row.data, &got);
+    }
+    // Both scratches came back.
+    try testing.expectEqual(@as(usize, 2), pool.permits.available(io));
 }

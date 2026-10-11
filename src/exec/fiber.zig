@@ -218,6 +218,22 @@ pub const Stack = struct {
         stats.fiber_stack_trimmed_bytes.add(u.len);
     }
 
+    /// The pages the kernel holds for the usable region (`mincore`); 0 when
+    /// the kernel refuses the query (a mapping read torn by a concurrent
+    /// first map answers ENOMEM — attribution for one tick, never a claim).
+    pub fn residentBytes(self: Stack) u64 {
+        if (self.len <= self.page) return 0;
+        const u = self.usable();
+        // The deepest class is 8 × the 512 KiB floor on the smallest page.
+        var vec: [8 * stack_floor_bytes / std.heap.page_size_min]u8 = undefined;
+        const pages = u.len / self.page;
+        if (pages > vec.len) return 0;
+        if (linux.errno(linux.syscall3(.mincore, @intFromPtr(u.ptr), u.len, @intFromPtr(&vec))) != .SUCCESS) return 0;
+        var n: u64 = 0;
+        for (vec[0..pages]) |v| n += v & 1;
+        return n * self.page;
+    }
+
     /// A spawn re-arms a trimmed stack: it counts resident again, and the
     /// canary (debug/test) is laid down afresh over the zero pages.
     pub fn rearm(self: *Stack) void {
@@ -611,7 +627,10 @@ test "Stack.trim returns the usable region and leaves the guard counted; rearm c
     var s = try Stack.map(stackSizeFor(.meta, page), page);
     const u = s.usable();
     u[u.len - 1] = 0;
+    // Test builds lay the canary over the whole region: every page is resident until the trim.
+    try testing.expectEqual(@as(u64, u.len), s.residentBytes());
     s.trim();
+    try testing.expectEqual(@as(u64, 0), s.residentBytes());
     try testing.expect(s.trimmed);
     try testing.expectEqual(before + page, stats.fiber_stack_bytes.load());
     try testing.expectEqual(trimmed_before + u.len, stats.fiber_stack_trimmed_bytes.load());

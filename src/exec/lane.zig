@@ -422,7 +422,7 @@ pub const Lane = struct {
         };
         const group_canceled = if (group) |g| group_mod.isCanceled(g) else false;
         f.arm(kind, start_fn, context, group, group_canceled, protection, self.stack_size, self.page) catch {
-            assert(self.free.tryPush(f));
+            self.free.pushSpin(f);
             stats.spawn_refused.of(self.class).inc();
             return error.ConcurrencyUnavailable;
         };
@@ -442,7 +442,20 @@ pub const Lane = struct {
         f.idle_tick = self.clock.load(.monotonic);
         stats.fibers_live.of(self.class).sub(1);
         _ = self.live.fetchSub(1, .monotonic);
-        assert(self.free.tryPush(f));
+        // The ring holds the whole population; a refusal is the trimmer's
+        // (or a spawner's) pop mid-flight on the wrap cell (`mpmc.pushSpin`).
+        self.free.pushSpin(f);
+    }
+
+    /// The pages the kernel holds for this lane's stacks, measured
+    /// (`Stack.residentBytes` per mapped slot; any thread — a slot being
+    /// mapped concurrently reads torn and counts 0 for this tick).
+    pub fn residentStackBytes(self: *Lane) u64 {
+        var n: u64 = 0;
+        for (self.fibers) |*f| if (f.stack) |s| {
+            n += s.residentBytes();
+        };
+        return n;
     }
 
     /// The idle-trim law over this lane's slot pool (any thread; the
@@ -461,7 +474,7 @@ pub const Lane = struct {
                 s.trim();
                 trimmed += 1;
             };
-            assert(self.free.tryPush(f));
+            self.free.pushSpin(f);
         }
         return trimmed;
     }
@@ -1175,8 +1188,10 @@ test "the idle-trim law on a lane's stacks: every slot a spawn ever touched stay
     // Tick 102: every free touched stack returns its usable region; the
     // guard and the reserve stay mapped.
     idle_clock.store(102, .monotonic);
+    try testing.expect(l.residentStackBytes() >= 4 * 20_000);
     try testing.expectEqual(@as(u32, 4), l.trimIdleStacks(2));
     try testing.expectEqual(before + 4 * l.page, stats.fiber_stack_bytes.load());
+    try testing.expectEqual(@as(u64, 0), l.residentStackBytes());
     var vec: [1 << 10]u8 = undefined;
     for (l.fibers) |*f| if (f.stack) |s| {
         try testing.expect(s.trimmed);
@@ -1198,6 +1213,50 @@ test "the idle-trim law on a lane's stacks: every slot a spawn ever touched stay
         if (!s.trimmed) rearmed += 1;
     };
     try testing.expectEqual(@as(u32, 1), rearmed);
+}
+
+test "the stack trimmer races spawns and recycles: a foreign thread trims at min 0 in a tight loop while fibers spawn, park, are woken and finish; every state transition holds and every spawn lands" {
+    const l = try testLane(.meta, 8, false);
+    defer l.deinit();
+    const Shared = struct {
+        lane: *Lane,
+        stop: std.atomic.Value(bool) = .init(false),
+        trims: std.atomic.Value(u64) = .init(0),
+        fn trimmer(sh: *@This()) void {
+            while (!sh.stop.load(.acquire)) _ = sh.trims.fetchAdd(sh.lane.trimIdleStacks(0), .monotonic);
+        }
+    };
+    var sh: Shared = .{ .lane = l };
+    const t = try std.Thread.spawn(.{}, Shared.trimmer, .{&sh});
+    const S = struct {
+        fn run(context: *const anyopaque) void {
+            const c = ctxOf(context);
+            var pad: [8192]u8 = undefined;
+            @memset(&pad, 3);
+            std.mem.doNotOptimizeAway(&pad);
+            const f = currentFiber().?;
+            _ = c.probe.polled.fetchAdd(1, .acq_rel);
+            f.park();
+            c.probe.finish();
+        }
+    };
+    var round: u32 = 0;
+    while (round < 200) : (round += 1) {
+        var g = membersGroup(6);
+        var probes: [6]Probe = @splat(.{});
+        var fibers: [6]*Fiber = undefined;
+        for (&probes, 0..) |*p, i| fibers[i] = try spawnTest(l, &g, S.run, .{ .probe = p, .lane = l });
+        for (&probes, 0..) |*p, i| {
+            while (p.polled.load(.acquire) == 0) std.Thread.yield() catch {};
+            if (fibers[i].state.wake()) l.enqueue(fibers[i]);
+            p.waitDone();
+        }
+        waitQuiescent(l);
+    }
+    sh.stop.store(true, .release);
+    t.join();
+    try testing.expect(sh.trims.load(.monotonic) > 0);
+    try testing.expectEqual(@as(u32, 0), l.live.load(.monotonic));
 }
 
 test "ring entries derivation: power of two above the fiber population + wake + cancels, floor 8, ceiling 4096" {

@@ -28,13 +28,17 @@
 //! fill has touched — never a `gpa.alloc`, whose `@memset(undefined)` in
 //! the safe modes touches every byte at birth (rung 9 measured a 1.6 GiB
 //! read-LRU slab fully resident at an idle mount). A slot stays resident
-//! after its release (the next fill reuses it without faults) and is
-//! counted on the pool's `idle_resident_bytes` gauge — the pool's OWN
-//! retention, what its budget component gauges and its idle trim returns:
-//! `madvise(DONTNEED)` on the heap slab, `fallocate(PUNCH_HOLE)` on the
-//! memfd, slot by slot, each popped from the free list first (no reader
-//! or DMA can hold a free slot) and pushed back after, so a concurrent
-//! acquirer sees at most one slot missing at a time.
+//! after its release (the next fill reuses it without faults); the
+//! budget component gauges the pool's OWN retention — the FREE slots'
+//! resident pages, MEASURED (`mincore` over the slab on Linux: a slot
+//! acquired for a fill that never landed holds no page, and a 4 MiB slot
+//! half filled holds half; the first cut counted every released slot
+//! whole and read 1.3 GB against 75 MB of shmem) — and the idle trim
+//! returns them: `madvise(DONTNEED)` on the anonymous slab,
+//! `fallocate(PUNCH_HOLE)` on the memfd, slot by slot, each popped from
+//! the free list first (no reader or DMA can hold a free slot) and pushed
+//! back after, so a concurrent acquirer sees at most one slot missing at a
+//! time. Off-Linux (the portable tests) a released slot counts whole.
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");
@@ -64,9 +68,6 @@ pub const stats = struct {
     pub var read_fill_pool_exhausted: counters.ShardedCounter = .{};
     /// `read_fill_pool_memfd`: 1 when the slab is fd-addressable.
     pub var read_fill_pool_memfd: counters.Gauge = .{};
-    /// `read_fill_pool_idle_resident_bytes`: free slots whose pages the
-    /// kernel still holds, over every slab (the trim's domain).
-    pub var read_fill_pool_idle_resident_bytes: counters.Gauge = .{};
     /// `read_fill_pool_trimmed_bytes`: slot bytes returned to the kernel by
     /// the idle trim (Yellow/Red ticks and Red sheds).
     pub var read_fill_pool_trimmed_bytes: counters.ShardedCounter = .{};
@@ -75,12 +76,11 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"read_fill_pool_slots\":{d},\"read_fill_pool_bytes\":{d},\"read_fill_pool_exhausted\":{d},\"read_fill_pool_memfd\":{d},\"read_fill_pool_idle_resident_bytes\":{d},\"read_fill_pool_trimmed_bytes\":{d},\"read_fill_pool_refcount_underflow\":{d}}}", .{
+    try w.print("{{\"read_fill_pool_slots\":{d},\"read_fill_pool_bytes\":{d},\"read_fill_pool_exhausted\":{d},\"read_fill_pool_memfd\":{d},\"read_fill_pool_trimmed_bytes\":{d},\"read_fill_pool_refcount_underflow\":{d}}}", .{
         stats.read_fill_pool_slots.load(),
         stats.read_fill_pool_bytes.load(),
         stats.read_fill_pool_exhausted.load(),
         stats.read_fill_pool_memfd.load(),
-        stats.read_fill_pool_idle_resident_bytes.load(),
         stats.read_fill_pool_trimmed_bytes.load(),
         stats.refcount_underflow.load(),
     });
@@ -101,7 +101,9 @@ pub fn poolSlots(cores: u32, hot_blocks: u64, hold_blocks: u64) u32 {
 /// `zc_fill_pool`: floor 64 MiB, weight 2): the floor is one 16-fill burst
 /// on the smallest box (16 × 4 MiB), the weight the shared pool class. The
 /// gauge is the pool's idle-resident bytes (the tiers gauge the checked-out
-/// slots they hold; the in-flight headroom is the one uncounted part).
+/// slots they hold; the in-flight headroom is the one uncounted part),
+/// measured by `mincore` at every read (one syscall over the slab; the
+/// sampler's tick is where syscall-heavy work belongs).
 pub const COMPONENT_FLOOR: u64 = 64 * derive.MiB;
 pub const COMPONENT_WEIGHT: u64 = 2;
 
@@ -119,11 +121,13 @@ pub const Pool = struct {
     base: [*]align(SLOT_ALIGN) u8,
     len: usize,
     refs: []Atomic(u32),
-    /// Per slot: the kernel may hold pages for it (touched since its last
-    /// trim). Set at acquire (the fill lands next), cleared by the trim.
-    resident: []Atomic(bool),
+    /// Per slot: acquired since its last trim (the portable residency
+    /// approximation; Linux measures with `mincore`).
+    touched: []Atomic(bool),
     /// Per slot: the budget tick of its last release (the idle clock).
     freed_tick: []Atomic(u64),
+    /// One byte per page of the slab: `mincore`'s vector (the gauge's scan).
+    mincore_vec: []u8,
     free: mpmc.BoundedMpmc(u32),
     /// The memfd (Linux slab) or null (anonymous mapping / no fd source).
     fd: ?linux.fd_t,
@@ -131,8 +135,6 @@ pub const Pool = struct {
     clock: *const Atomic(u64) = &budget.authority.tick_count,
     /// Slots checked out × `slot_size`.
     checked_out_bytes: counters.Gauge = .{},
-    /// Free slots still resident × `slot_size`: the component's gauge.
-    idle_resident_bytes: counters.Gauge = .{},
 
     /// The portable slab: ONE anonymous page-aligned mapping, lazily
     /// populated (every host).
@@ -171,24 +173,25 @@ pub const Pool = struct {
         const refs = try gpa.alloc(Atomic(u32), capacity);
         errdefer gpa.free(refs);
         @memset(refs, .init(0));
-        const resident = try gpa.alloc(Atomic(bool), capacity);
-        errdefer gpa.free(resident);
-        @memset(resident, .init(false));
+        const touched = try gpa.alloc(Atomic(bool), capacity);
+        errdefer gpa.free(touched);
+        @memset(touched, .init(false));
         const freed_tick = try gpa.alloc(Atomic(u64), capacity);
         errdefer gpa.free(freed_tick);
         @memset(freed_tick, .init(0));
+        const mincore_vec = try gpa.alloc(u8, len / std.heap.pageSize());
+        errdefer gpa.free(mincore_vec);
         var free = try mpmc.BoundedMpmc(u32).init(gpa, capacity);
         errdefer free.deinit(gpa);
         var i: u32 = 0;
         while (i < capacity) : (i += 1) assert(free.tryPush(i));
-        self.* = .{ .gpa = gpa, .slot_size = slot_size, .capacity = capacity, .base = base, .len = len, .refs = refs, .resident = resident, .freed_tick = freed_tick, .free = free, .fd = fd };
+        self.* = .{ .gpa = gpa, .slot_size = slot_size, .capacity = capacity, .base = base, .len = len, .refs = refs, .touched = touched, .freed_tick = freed_tick, .mincore_vec = mincore_vec, .free = free, .fd = fd };
         stats.read_fill_pool_slots.set(capacity);
         stats.read_fill_pool_memfd.set(@intFromBool(fd != null));
         return self;
     }
 
     pub fn deinit(self: *Pool) void {
-        stats.read_fill_pool_idle_resident_bytes.sub(self.idle_resident_bytes.load());
         if (self.fd) |fd| {
             if (builtin.os.tag == .linux) {
                 _ = linux.munmap(self.base, self.len);
@@ -198,8 +201,9 @@ pub const Pool = struct {
             std.posix.munmap(@alignCast(self.base[0..self.len]));
         }
         self.free.deinit(self.gpa);
+        self.gpa.free(self.mincore_vec);
         self.gpa.free(self.freed_tick);
-        self.gpa.free(self.resident);
+        self.gpa.free(self.touched);
         self.gpa.free(self.refs);
         self.gpa.destroy(self);
     }
@@ -217,12 +221,7 @@ pub const Pool = struct {
         };
         assert(self.refs[slot].load(.monotonic) == 0);
         self.refs[slot].store(1, .monotonic);
-        // The fill lands next: the slot is resident from here; a free slot
-        // that was already resident leaves the idle gauge.
-        if (self.resident[slot].swap(true, .monotonic)) {
-            self.idle_resident_bytes.sub(self.slot_size);
-            stats.read_fill_pool_idle_resident_bytes.sub(self.slot_size);
-        }
+        self.touched[slot].store(true, .monotonic);
         self.checked_out_bytes.add(self.slot_size);
         stats.read_fill_pool_bytes.add(self.slot_size);
         return slot;
@@ -252,9 +251,9 @@ pub const Pool = struct {
         // Stamp the idle clock BEFORE the push: a trimmer that pops the slot
         // reads a stamp no older than the release.
         self.freed_tick[slot].store(self.clock.load(.monotonic), .monotonic);
-        self.idle_resident_bytes.add(self.slot_size);
-        stats.read_fill_pool_idle_resident_bytes.add(self.slot_size);
-        assert(self.free.tryPush(slot));
+        // The ring holds every slot; a refusal is the trimmer's (or an
+        // acquirer's) pop mid-flight on the wrap cell (`mpmc.pushSpin`).
+        self.free.pushSpin(slot);
         return true;
     }
 
@@ -271,18 +270,64 @@ pub const Pool = struct {
     /// over the capacity bounds the pass.
     pub fn trimToward(self: *Pool, min_idle_ticks: u64, target_idle_bytes: u64) void {
         const now = self.clock.load(.monotonic);
+        var idle = self.idleResidentBytes();
         var seen: u32 = 0;
-        while (seen < self.capacity and self.idle_resident_bytes.load() > target_idle_bytes) : (seen += 1) {
+        while (seen < self.capacity and idle > target_idle_bytes) : (seen += 1) {
             const slot = self.free.tryPop() orelse break;
-            if (self.resident[slot].load(.monotonic) and now -| self.freed_tick[slot].load(.monotonic) >= min_idle_ticks) {
-                self.returnPages(slot);
-                self.resident[slot].store(false, .monotonic);
-                self.idle_resident_bytes.sub(self.slot_size);
-                stats.read_fill_pool_idle_resident_bytes.sub(self.slot_size);
-                stats.read_fill_pool_trimmed_bytes.add(self.slot_size);
+            if (self.touched[slot].load(.monotonic) and now -| self.freed_tick[slot].load(.monotonic) >= min_idle_ticks) {
+                const held = self.slotResidentBytes(slot);
+                if (held > 0) {
+                    self.returnPages(slot);
+                    stats.read_fill_pool_trimmed_bytes.add(held);
+                    idle -|= held;
+                }
+                self.touched[slot].store(false, .monotonic);
             }
-            assert(self.free.tryPush(slot));
+            self.free.pushSpin(slot);
         }
+    }
+
+    /// The pages the kernel holds for one slot: `mincore` on Linux; the
+    /// portable approximation counts a touched slot whole.
+    fn slotResidentBytes(self: *Pool, slot: Slot) u64 {
+        if (builtin.os.tag != .linux) return if (self.touched[slot].load(.monotonic)) self.slot_size else 0;
+        const page = std.heap.pageSize();
+        const b = self.bytes(slot);
+        const vec = self.mincore_vec[@as(usize, slot) * (self.slot_size / page) ..][0 .. self.slot_size / page];
+        if (linux.errno(linux.syscall3(.mincore, @intFromPtr(b.ptr), b.len, @intFromPtr(vec.ptr))) != .SUCCESS) return 0;
+        var n: u64 = 0;
+        for (vec) |v| n += v & 1;
+        return n * page;
+    }
+
+    /// ONE `mincore` over the whole slab, split by the slots' refcounts:
+    /// `.idle` is the free slots' resident bytes (the component's gauge),
+    /// `.in_use` the checked-out slots' (the tiers' and the in-flight
+    /// fills'). A refcount read here is attribution for one tick, never a
+    /// claim on the slot.
+    pub const Residency = struct { idle: u64, in_use: u64 };
+
+    pub fn residency(self: *Pool) Residency {
+        var r: Residency = .{ .idle = 0, .in_use = 0 };
+        if (builtin.os.tag != .linux) {
+            var slot: Slot = 0;
+            while (slot < self.capacity) : (slot += 1) {
+                if (!self.touched[slot].load(.monotonic)) continue;
+                if (self.refs[slot].load(.monotonic) == 0) r.idle += self.slot_size else r.in_use += self.slot_size;
+            }
+            return r;
+        }
+        const page = std.heap.pageSize();
+        if (linux.errno(linux.syscall3(.mincore, @intFromPtr(self.base), self.len, @intFromPtr(self.mincore_vec.ptr))) != .SUCCESS) return r;
+        const per_slot = self.slot_size / page;
+        var slot: Slot = 0;
+        while (slot < self.capacity) : (slot += 1) {
+            var n: u64 = 0;
+            for (self.mincore_vec[@as(usize, slot) * per_slot ..][0..per_slot]) |v| n += v & 1;
+            if (n == 0) continue;
+            if (self.refs[slot].load(.monotonic) == 0) r.idle += n * page else r.in_use += n * page;
+        }
+        return r;
     }
 
     /// Give a slot's pages back: a hole in the memfd (the pages were shmem;
@@ -334,14 +379,15 @@ pub const Pool = struct {
         return self.checked_out_bytes.load();
     }
 
-    /// Free slots the kernel still holds pages for × `slot_size`.
-    pub fn idleResidentBytes(self: *const Pool) u64 {
-        return self.idle_resident_bytes.load();
+    /// The free slots' resident bytes (measured).
+    pub fn idleResidentBytes(self: *Pool) u64 {
+        return self.residency().idle;
     }
 
-    /// Everything the kernel may hold for this slab: checked out + idle.
-    pub fn residentBytes(self: *const Pool) u64 {
-        return self.checked_out_bytes.load() + self.idle_resident_bytes.load();
+    /// Everything the kernel holds for this slab (measured).
+    pub fn residentBytes(self: *Pool) u64 {
+        const r = self.residency();
+        return r.idle + r.in_use;
     }
 
     pub fn freeSlots(self: *const Pool) usize {
@@ -357,7 +403,12 @@ pub const Pool = struct {
 
     /// The same shape under another registry name (the ranged bounce slab).
     pub fn componentNamed(self: *Pool, name: []const u8, floor: u64, weight: u64) budget.Component {
-        return budget.Component.init(name, floor, weight, .{ .gauge = &self.idle_resident_bytes }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn });
+        return budget.Component.init(name, floor, weight, .{ .func = .{ .ctx = self, .call = &gaugeFn } }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn });
+    }
+
+    fn gaugeFn(ctx: *anyopaque) u64 {
+        const self: *Pool = @ptrCast(@alignCast(ctx));
+        return self.idleResidentBytes();
     }
 
     fn shedFn(ctx: *anyopaque, target: u64) void {
@@ -431,8 +482,9 @@ test "a release past zero fires the tripwire and never frees twice" {
     try testing.expectEqual(@as(usize, 1), p.freeSlots());
 }
 
-test "the idle-trim law on a slab: a slot is RESIDENT from its first acquire; a release stamps the idle clock and moves its bytes to the idle-resident gauge; trim(min) returns only slots idle ≥ min ticks (Yellow 2, Red 0), one at a time so an acquirer never sees a false exhaustion; a trimmed slot re-acquired is resident again" {
-    const p = try Pool.initRam(testing.allocator, 4096, 3);
+test "the idle-trim law on a slab: a filled slot is RESIDENT; a release stamps the idle clock and moves its pages to the idle gauge; trim(min) returns only slots idle ≥ min ticks (Yellow 2, Red 0), one at a time so an acquirer never sees a false exhaustion; a slot acquired but never filled holds nothing (Linux measures with mincore)" {
+    const page = std.heap.pageSize();
+    const p = try Pool.initRam(testing.allocator, page, 3);
     defer p.deinit();
     var clock: std.atomic.Value(u64) = .init(10);
     p.setClock(&clock);
@@ -442,19 +494,19 @@ test "the idle-trim law on a slab: a slot is RESIDENT from its first acquire; a 
     p.bytes(a)[0] = 1;
     p.bytes(b)[0] = 2;
     try testing.expectEqual(@as(u64, 0), p.idleResidentBytes());
-    try testing.expectEqual(@as(u64, 8192), p.residentBytes());
+    try testing.expectEqual(2 * page, p.residentBytes());
     try testing.expect(p.unpin(a)); // freed at tick 10
-    try testing.expectEqual(@as(u64, 4096), p.idleResidentBytes());
+    try testing.expectEqual(page, p.idleResidentBytes());
     clock.store(11, .monotonic);
     try testing.expect(p.unpin(b)); // freed at tick 11
-    try testing.expectEqual(@as(u64, 8192), p.idleResidentBytes());
-    try testing.expectEqual(@as(u64, 8192), p.residentBytes());
+    try testing.expectEqual(2 * page, p.idleResidentBytes());
+    try testing.expectEqual(2 * page, p.residentBytes());
     // Yellow at tick 12: only `a` (idle 2) qualifies; `b` (idle 1) stays.
     clock.store(12, .monotonic);
     const trimmed0 = stats.read_fill_pool_trimmed_bytes.load();
     p.trim(budget.trim_yellow_min_idle_ticks);
-    try testing.expectEqual(@as(u64, 4096), p.idleResidentBytes());
-    try testing.expectEqual(trimmed0 + 4096, stats.read_fill_pool_trimmed_bytes.load());
+    try testing.expectEqual(page, p.idleResidentBytes());
+    try testing.expectEqual(trimmed0 + page, stats.read_fill_pool_trimmed_bytes.load());
     try testing.expectEqual(@as(usize, 3), p.freeSlots());
     // Red: everything idle, including a slot freed in this very tick.
     const c = p.acquire().?;
@@ -464,18 +516,25 @@ test "the idle-trim law on a slab: a slot is RESIDENT from its first acquire; a 
     try testing.expectEqual(@as(u64, 0), p.idleResidentBytes());
     try testing.expectEqual(@as(u64, 0), p.residentBytes());
     try testing.expectEqual(@as(usize, 3), p.freeSlots());
-    // A trimmed slot is resident again once re-acquired.
+    // Acquired, never filled, released: nothing resident on Linux (the
+    // portable approximation counts the touched slot).
     const d = p.acquire().?;
-    try testing.expectEqual(@as(u64, 4096), p.residentBytes());
     try testing.expect(p.unpin(d));
+    if (builtin.os.tag == .linux) try testing.expectEqual(@as(u64, 0), p.idleResidentBytes()) else try testing.expectEqual(page, p.idleResidentBytes());
+    p.trim(budget.trim_red_min_idle_ticks);
     // The shed face: trimToward(target) returns idle slots down to the target, oldest first.
     const e = p.acquire().?;
     const f = p.acquire().?;
+    const g = p.acquire().?;
+    for ([_]Slot{ e, f, g }) |sl| p.bytes(sl)[0] = 9;
     try testing.expect(p.unpin(e));
     try testing.expect(p.unpin(f));
-    try testing.expectEqual(@as(u64, 3 * 4096), p.idleResidentBytes());
-    p.trimToward(budget.trim_red_min_idle_ticks, 4096);
-    try testing.expectEqual(@as(u64, 4096), p.idleResidentBytes());
+    try testing.expect(p.unpin(g));
+    try testing.expectEqual(3 * page, p.idleResidentBytes());
+    p.trimToward(budget.trim_red_min_idle_ticks, page);
+    try testing.expectEqual(page, p.idleResidentBytes());
+    const comp = p.component();
+    try testing.expectEqual(page, comp.current());
 }
 
 test "a RAM slab is lazily resident: no byte of a fresh slab is touched at init (the slab is the kernel's zero page until a fill lands); Linux reads it back through mincore" {

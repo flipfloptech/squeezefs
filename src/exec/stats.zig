@@ -39,10 +39,16 @@ pub var fibers_live: PerClass(counters.Gauge) = .{};
 /// `exec_fiber_stack_hwm_bytes`: the deepest stack use ever measured at a
 /// fiber's recycle (the canary high-water mark; debug/test builds).
 pub var fiber_stack_hwm_bytes: counters.Gauge = .{};
-/// `exec_fiber_stack_bytes`: stack bytes the kernel may hold — mapped
-/// stacks minus the usable regions the idle trim returned — the
-/// `mem_budget` component's gauge (`exec_fiber_stacks`).
+/// `exec_fiber_stack_bytes`: stack bytes MAPPED (the population's virtual
+/// reserve as slots are touched) minus the usable regions the idle trim
+/// returned.
 pub var fiber_stack_bytes: counters.Gauge = .{};
+/// `exec_fiber_stack_resident_bytes`: the pages the kernel holds for every
+/// mapped stack, measured by `mincore` at each sampler tick — the
+/// `mem_budget` component's gauge (`exec_fiber_stacks`): a 1 MiB stack
+/// touched to 176 KiB counts 176 KiB (the suites' 752 MB "mapped" gauge
+/// counted the reserve).
+pub var fiber_stack_resident_bytes: counters.Gauge = .{};
 /// `exec_fiber_stack_trimmed_bytes`: stack bytes returned by the idle trim
 /// (Yellow/Red ticks).
 pub var fiber_stack_trimmed_bytes: counters.ShardedCounter = .{};
@@ -132,7 +138,7 @@ fn perClassLoads(comptime T: type, pc: *PerClass(T)) [LaneClass.count]u64 {
 pub fn writeStatsJson(w: *Io.Writer, lanes: []const LaneView) Io.Writer.Error!void {
     try w.writeByte('{');
     try writePerClass(w, "exec_fibers_live", perClassLoads(counters.Gauge, &fibers_live));
-    try w.print(",\"exec_fiber_stack_hwm_bytes\":{d},\"exec_fiber_stack_bytes\":{d},\"exec_fiber_stack_trimmed_bytes\":{d},", .{ fiber_stack_hwm_bytes.load(), fiber_stack_bytes.load(), fiber_stack_trimmed_bytes.load() });
+    try w.print(",\"exec_fiber_stack_hwm_bytes\":{d},\"exec_fiber_stack_bytes\":{d},\"exec_fiber_stack_resident_bytes\":{d},\"exec_fiber_stack_trimmed_bytes\":{d},", .{ fiber_stack_hwm_bytes.load(), fiber_stack_bytes.load(), fiber_stack_resident_bytes.load(), fiber_stack_trimmed_bytes.load() });
     try writePerClass(w, "exec_polls", perClassLoads(counters.ShardedCounter, &polls));
     try w.writeAll(",\"exec_poll_ns\":");
     try poll_ns.snapshot().writeJson(w);

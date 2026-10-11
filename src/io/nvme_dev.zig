@@ -227,10 +227,12 @@ const BlockPool = struct {
             if (now -| c.idle_tick >= min_idle_ticks) {
                 self.cached_bytes.sub(nd.block_buf_size);
                 stats.aligned_pool_trimmed_bytes.add(nd.block_buf_size);
-                _ = linux.munmap(@as([*]u8, @ptrFromInt(c.addr)), nd.block_buf_size);
+                _ = linux.munmap(@as([*]align(std.heap.page_size_min) u8, @ptrFromInt(c.addr)), nd.block_buf_size);
                 continue;
             }
-            std.debug.assert(self.free.tryPush(c));
+            // Below the cap by construction (we hold one); a refusal is a
+            // releaser's wrap cell mid-pop (`mpmc.pushSpin`).
+            self.free.pushSpin(c);
         }
     }
 
@@ -2035,6 +2037,7 @@ test "test_read_straddling_eof_errors_instead_of_garbage_tail: [len-2048, +4096)
 }
 
 test "read_bounce_pool_routing_and_home_recycle: ≤ 64 KiB rides the slab, larger the block pool; release returns allocated_bytes exactly" {
+    try initPools();
     const p = pools();
     const r0 = p.ranged.allocated_bytes.load();
     const b0 = p.block.allocated_bytes.load();

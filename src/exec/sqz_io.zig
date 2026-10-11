@@ -140,6 +140,14 @@ pub const SqzIo = struct {
         return @intFromPtr(lane_mod.currentFiber() orelse return 0);
     }
 
+    fn residentStackBytesHook(ctx: *anyopaque) u64 {
+        const self: *SqzIo = @ptrCast(@alignCast(ctx));
+        var n: u64 = 0;
+        for (self.lanes) |l| n += l.residentStackBytes();
+        stats.fiber_stack_resident_bytes.set(n);
+        return n;
+    }
+
     /// The idle-trim hook (`mem_budget.TrimFn`): every lane's free slots.
     fn trimIdleStacksHook(ctx: *anyopaque, min_idle_ticks: u64) void {
         const self: *SqzIo = @ptrCast(@alignCast(ctx));
@@ -309,8 +317,9 @@ pub const SqzIo = struct {
         self.fuse_placement = try placement.Placement.init(gpa, homes, alive, self.topo.node_count);
 
         // Non-sheddable (the live frames are the handlers'), but the idle
-        // slots' pages return under the idle-trim law.
-        self.stack_component = mem_budget.Component.init("exec_fiber_stacks", 0, 0, .{ .gauge = &stats.fiber_stack_bytes }, null).withTrim(.{ .ctx = self, .call = &trimIdleStacksHook });
+        // slots' pages return under the idle-trim law; the gauge is the
+        // measured residency, published for the stats at every read.
+        self.stack_component = mem_budget.Component.init("exec_fiber_stacks", 0, 0, .{ .func = .{ .ctx = self, .call = &residentStackBytesHook } }, null).withTrim(.{ .ctx = self, .call = &trimIdleStacksHook });
         if (options.budget) |b| b.register(self.stack_component);
         return self;
     }
@@ -1388,13 +1397,17 @@ test "placement with fuse lanes on this machine: spawnHome lands on the lane hom
     var fut = try sqz.spawnHome(home, fuse[0].node, S.which, .{});
     try testing.expectEqual(@as(u16, 0), fut.await(io));
     try testing.expect(stats.fiber_stack_bytes.load() >= stack_bytes_before);
-    try testing.expect(budget.components()[0].current() == stats.fiber_stack_bytes.load());
-    // The component carries the idle trim: with min 0 every free touched
-    // stack on every lane returns its pages and the gauge falls.
+    // The component gauges the MEASURED residency (≤ the mapped reserve) and publishes it.
     const c = &budget.components()[0];
+    const resident = c.current();
+    try testing.expect(resident > 0 and resident <= stats.fiber_stack_bytes.load());
+    try testing.expectEqual(resident, stats.fiber_stack_resident_bytes.load());
+    // The component carries the idle trim: with min 0 every free touched
+    // stack on every lane returns its pages and both gauges fall.
     const before_trim = stats.fiber_stack_bytes.load();
     c.trim.?.call(c.trim.?.ctx, 0);
     try testing.expect(stats.fiber_stack_bytes.load() < before_trim);
+    try testing.expect(c.current() < resident);
     if (fuse.len < 2) return;
     // Kill lane 0's ring from its own thread (the lane's loud log lands
     // there): the next spawn homed on it is re-routed, counted, logged once.

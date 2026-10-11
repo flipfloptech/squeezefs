@@ -70,6 +70,18 @@ pub fn BoundedMpmc(comptime T: type) type {
             }
         }
 
+        /// A push that MUST land: the owner's ring holds its whole population
+        /// (a pool free list), so a refusal is never "full" — it is the
+        /// wrap-around cell of a consumer that CAS'd `dequeue_pos` and has
+        /// not yet stored the cell's new sequence (Vyukov's producer reads
+        /// `seq < pos` and answers full). A second consumer on such a ring
+        /// (the idle trimmer beside the spawner) makes that window real:
+        /// 2,874 refusals in 400 k pop→push cycles on an 8-slot ring in the
+        /// test below. The popper finishes within nanoseconds; spin.
+        pub fn pushSpin(self: *Self, item: T) void {
+            while (!self.tryPush(item)) std.atomic.spinLoopHint();
+        }
+
         /// Null when empty. The release store of `seq` hands the cell back
         /// to the producer at `pos + cap`, paired with its acquire load.
         pub fn tryPop(self: *Self) ?T {
@@ -197,4 +209,38 @@ test "bounded MPMC queue: 4 producers × 4 consumers deliver every item exactly 
     for (cs) |t| t.join();
     for (seen) |*s| try testing.expectEqual(@as(u8, 1), s.load(.acquire));
     try testing.expectEqual(@as(?u32, null), q.tryPop());
+}
+
+test "a pool free list at its population: two threads cycling pop → push over a ring that holds EVERY slot — the push back of a popped slot can meet the ring's own cell still mid-pop and be refused; a free-list owner must retry, never assert" {
+    // 8 slots in an 8-cell ring (the exec lanes' and the fill pools' shape).
+    const Q = BoundedMpmc(u32);
+    var q = try Q.init(testing.allocator, 8);
+    defer q.deinit(testing.allocator);
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) try testing.expect(q.tryPush(i));
+    const Cycler = struct {
+        refused: std.atomic.Value(u64) = .init(0),
+        fn run(self: *@This(), queue: *Q, rounds: u32) void {
+            var r: u32 = 0;
+            while (r < rounds) : (r += 1) {
+                const v = queue.tryPop() orelse continue;
+                if (!queue.tryPush(v)) {
+                    _ = self.refused.fetchAdd(1, .monotonic);
+                    queue.pushSpin(v);
+                }
+            }
+        }
+    };
+    var a: Cycler = .{};
+    var b: Cycler = .{};
+    const ta = try std.Thread.spawn(.{}, Cycler.run, .{ &a, &q, 200_000 });
+    const tb = try std.Thread.spawn(.{}, Cycler.run, .{ &b, &q, 200_000 });
+    ta.join();
+    tb.join();
+    // Nothing lost: all eight slots are back.
+    var n: u32 = 0;
+    while (q.tryPop()) |_| n += 1;
+    try testing.expectEqual(@as(u32, 8), n);
+    // The refusals are the point of the test, not a flake: they must occur.
+    try testing.expect(a.refused.load(.monotonic) + b.refused.load(.monotonic) > 0);
 }

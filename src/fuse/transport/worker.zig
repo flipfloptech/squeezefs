@@ -90,6 +90,7 @@ const completion = @import("../../sync/completion.zig");
 const mpmc = @import("../../sync/mpmc.zig");
 const exec = @import("../../exec/exec.zig");
 const placement = @import("../../exec/placement.zig");
+const mem_budget = @import("../../mem/budget.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("fuse/transport/worker is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -241,6 +242,14 @@ pub var zc_bounce_bytes: counters.ShardedCounter = .{};
 /// `transport_zc_bounce_copies`: reply bodies the worker memcpy'd INTO the
 /// bounce (the body was not served in place).
 pub var zc_bounce_copies: counters.ShardedCounter = .{};
+/// `transport_zc_bounce_bytes`: bounce-window bytes the kernel holds pages
+/// for (every window's page-rounded high-water since its last trim, summed
+/// over the session) — the `transport_zc_bounce` component's gauge. The
+/// slab is a LAZILY populated memfd (`Slab`): its reserve is virtual.
+pub var zc_bounce_resident_bytes: counters.Gauge = .{};
+/// `transport_zc_bounce_trimmed_bytes`: window bytes punched back to the
+/// kernel by the idle trim (Yellow/Red ticks).
+pub var zc_bounce_trimmed_bytes: counters.ShardedCounter = .{};
 /// `transport_zc_fd_body_replies` / `_fallbacks`: replies bridged straight
 /// from the filesystem's fd; fd bridges that failed and re-staged through
 /// the bounce (≈ 0).
@@ -403,7 +412,12 @@ pub const BarrierOutcome = enum(u8) { armed, failed };
 /// The session's bounce SLAB (zero-copy): ONE MAP_SHARED memfd for every
 /// queue's ent windows (`(qid × depth + ent) × stride`), two faces of one
 /// memory — a VA for CPU serves and leases, an fd for the ring's
-/// `READ_FIXED`/`WRITE_FIXED`. A non-sheddable budget component.
+/// `READ_FIXED`/`WRITE_FIXED`. LAZILY populated: a window costs pages only
+/// once a body is staged through it (rung 9 measured the populated slab
+/// at 288 MiB resident on an idle mount), and an idle window's pages
+/// return under the idle-trim law (`punch`: a hole in the memfd, the
+/// window reads zeros until the next stage). A non-sheddable budget
+/// component over the resident bytes (`zc_bounce_resident_bytes`).
 pub const Slab = struct {
     fd: linux.fd_t,
     base: []align(4096) u8,
@@ -424,8 +438,7 @@ pub const Slab = struct {
             log.err("transport: ftruncate({d}) of the zc bounce slab failed", .{span});
             return error.SlabFailed;
         }
-        // Populated: no fault on the hot path (the pbuf-ring convention).
-        const map = linux.mmap(null, span, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .POPULATE = true }, fd, 0);
+        const map = linux.mmap(null, span, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
         if (linux.errno(map) != .SUCCESS) {
             log.err("transport: mmap of the {d}-byte zc bounce slab failed ({t})", .{ span, linux.errno(map) });
             return error.SlabFailed;
@@ -450,6 +463,13 @@ pub const Slab = struct {
 
     pub fn bytes(self: *const Slab) u64 {
         return self.base.len;
+    }
+
+    /// Return one window's pages (`FALLOC_FL_PUNCH_HOLE | KEEP_SIZE`: the
+    /// offsets stay, the shmem pages go). True when the kernel took it.
+    pub fn punch(self: *Slab, qid: u16, ent_idx: u16) bool {
+        const mode = linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE;
+        return linux.errno(linux.fallocate(self.fd, mode, @intCast(self.offsetOf(qid, ent_idx)), @intCast(self.stride))) == .SUCCESS;
     }
 };
 
@@ -652,6 +672,14 @@ pub const Group = struct {
     bridge_parked: []ParkedReply,
     local_msgs: []commit_queue.Msg,
     held_len: []u32,
+    /// Per gent: the bounce window's page-rounded high-water since its
+    /// last punch (0 = no pages), and the budget tick the ent last went
+    /// idle (committed) — the idle-trim law's inputs.
+    bounce_populated: []u32,
+    bounce_idle_tick: []u64,
+    /// The sampler's trim request: `min_idle_ticks + 1` (0 = none); the
+    /// pass consumes it (`trimIdleWindows`).
+    bounce_trim_request: std.atomic.Value(u64) = .init(0),
     fused: zc.FusedQueue,
     frames: []FusedFrame,
     extract_cells: []ExtractCell,
@@ -725,6 +753,8 @@ pub const Group = struct {
             .bridge_parked = &.{},
             .local_msgs = &.{},
             .held_len = &.{},
+            .bounce_populated = &.{},
+            .bounce_idle_tick = &.{},
             .fused = undefined,
             .frames = &.{},
             .extract_cells = &.{},
@@ -800,6 +830,12 @@ pub const Group = struct {
         self.held_len = try gpa.alloc(u32, gents);
         errdefer gpa.free(self.held_len);
         @memset(self.held_len, 0);
+        self.bounce_populated = try gpa.alloc(u32, gents);
+        errdefer gpa.free(self.bounce_populated);
+        @memset(self.bounce_populated, 0);
+        self.bounce_idle_tick = try gpa.alloc(u64, gents);
+        errdefer gpa.free(self.bounce_idle_tick);
+        @memset(self.bounce_idle_tick, 0);
         self.fused = try zc.FusedQueue.init(gpa, gents);
         errdefer self.fused.deinit(gpa);
         self.frames = try gpa.alloc(FusedFrame, gents);
@@ -838,6 +874,9 @@ pub const Group = struct {
         self.gpa.free(self.extract_cells);
         self.gpa.free(self.frames);
         self.fused.deinit(self.gpa);
+        for (self.bounce_populated) |b| zc_bounce_resident_bytes.sub(b);
+        self.gpa.free(self.bounce_idle_tick);
+        self.gpa.free(self.bounce_populated);
         self.gpa.free(self.held_len);
         self.gpa.free(self.local_msgs);
         self.gpa.free(self.bridge_parked);
@@ -896,6 +935,53 @@ pub const Group = struct {
 
     fn bounceOffset(self: *Group, gent: u32) u64 {
         return self.shared.slab.?.offsetOf(self.memberOf(gent).qid, self.entIdxOf(gent));
+    }
+
+    /// The window's resident high-water rises to `len` (page-rounded,
+    /// capped at the stride); the gauge takes the delta. Worker thread.
+    fn noteBouncePopulated(self: *Group, gent: u32, len: u32) void {
+        const stride: u32 = @intCast(self.shared.slab.?.stride);
+        const rounded: u32 = @intCast(@min(derive.alignUp(len, self.shared.page), stride));
+        const cur = self.bounce_populated[gent];
+        if (rounded <= cur) return;
+        self.bounce_populated[gent] = rounded;
+        zc_bounce_resident_bytes.add(rounded - cur);
+    }
+
+    /// The sampler's face of the idle-trim law (`mem_budget.TrimFn`): ask
+    /// the pass to punch idle windows and wake the worker (an idle group
+    /// is parked in its enter). Any thread.
+    pub fn requestBounceTrim(self: *Group, min_idle_ticks: u64) void {
+        if (self.shared.slab == null) return;
+        self.bounce_trim_request.store(min_idle_ticks + 1, .release);
+        if (self.started.load(.acquire) == 1) _ = self.ring.wake();
+    }
+
+    /// The pass half: punch every populated window whose ent owes nothing
+    /// (registered, replied or retained — no handler holds its window, no
+    /// bridge moves through it) and went idle ≥ `min` ticks ago. Worker
+    /// thread only: the ent states are its own.
+    fn trimIdleWindows(self: *Group) void {
+        const req = self.bounce_trim_request.swap(0, .acquire);
+        if (req == 0) return;
+        const min_idle_ticks = req - 1;
+        const sl = self.shared.slab orelse return;
+        const now = mem_budget.authority.ticks();
+        for (self.members, 0..) |*m, ms| {
+            var e: u16 = 0;
+            while (e < self.depth) : (e += 1) {
+                const gent = self.gentOf(@intCast(ms), e);
+                const populated = self.bounce_populated[gent];
+                if (populated == 0 or self.pends[gent] != null) continue;
+                const ent = m.slots.ent(e);
+                if (ent.owing() != null or ent.lease.leased()) continue;
+                if (now -| self.bounce_idle_tick[gent] < min_idle_ticks) continue;
+                if (!sl.punch(m.qid, e)) continue;
+                self.bounce_populated[gent] = 0;
+                zc_bounce_resident_bytes.sub(populated);
+                zc_bounce_trimmed_bytes.add(populated);
+            }
+        }
     }
 
     pub fn gentOf(self: *const Group, member_slot: u32, ent_idx: u16) u32 {
@@ -1115,6 +1201,7 @@ pub const Group = struct {
         };
         prepCommit(sqe, m.qid, commit_id, gent, 0);
         m.slots.onCommitSubmitted(e);
+        self.bounce_idle_tick[gent] = mem_budget.authority.ticks();
         ring_replies.inc();
         self.commits_pushed += 1;
     }
@@ -1132,6 +1219,7 @@ pub const Group = struct {
         };
         prepCommit(sqe, m.qid, commit_id, gent, abi.FUSE_URING_COMMIT_RETAIN);
         m.slots.onCommitSubmittedRetained(e);
+        self.bounce_idle_tick[gent] = mem_budget.authority.ticks();
         ring_replies.inc();
         self.commits_pushed += 1;
         if (m.slots.ent(e).release_pending) self.pushRelease(gent, commit_id, .handler);
@@ -1227,6 +1315,9 @@ pub const Group = struct {
         };
         const e = self.entIdxOf(gent);
         if (fetch) prepBridgeFetch(sqe, src_fd, src_off, pend.len, e, gent) else prepBridgeStore(sqe, src_fd, src_off, pend.len, e, gent);
+        // Every bounce bridge names the window bytes in play (a staged body
+        // read out of it, an extraction written into it).
+        if (self.shared.slab) |sl| if (fd == sl.fd) self.noteBouncePopulated(gent, pend.len);
         self.pends[gent] = pend;
         if (self.deadlines.stamp(gent, clock.monotonicNs())) zc_bridge_pends.add(1);
         zc_bridges.inc();
@@ -1796,6 +1887,8 @@ pub const Group = struct {
             self.pumpExtracts();
             self.pumpStores();
             self.pumpReleases();
+            // 4b. The idle-trim request, if the sampler left one.
+            self.trimIdleWindows();
             // 5. Mid-pass reap of finished bridges, then ONE fused frame.
             if (self.deadlines.outstanding > 0 and !self.fused.isEmpty()) {
                 self.flushNonBlocking();

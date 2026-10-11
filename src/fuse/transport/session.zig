@@ -141,8 +141,10 @@ pub var arena_bytes: counters.Gauge = .{};
 /// `transport_umount_busy_retries`: plain `umount2` attempts that met EBUSY
 /// inside the retry window.
 pub var umount_busy_retries: counters.ShardedCounter = .{};
-/// `transport_zc_bounce_bytes`: the zc bounce slab (the budget's
-/// non-sheddable `transport_zc_bounce` component reads it).
+/// `transport_zc_bounce_reserve_bytes`: the zc bounce slab's virtual
+/// reserve (`nqueues × depth × stride`); the pages it holds are
+/// `worker.zc_bounce_resident_bytes` (`transport_zc_bounce_bytes`), the
+/// budget component's gauge.
 pub var zc_bounce_slab_bytes: counters.Gauge = .{};
 /// `transport_time_limits`: 1 when FUSE_TIME_LIMITS was echoed with our
 /// i64-ns whole-second range.
@@ -1004,7 +1006,10 @@ pub const Session = struct {
         if (self.mode == .zero_copy) {
             self.slab = worker.Slab.init(self.plan.nqueues, self.plan.depth, self.plan.payload_sz) catch return error.SlabFailed;
             zc_bounce_slab_bytes.set(self.slab.?.bytes());
-            self.slab_component = mem_budget.Component.init("transport_zc_bounce", self.slab.?.bytes(), 0, .{ .gauge = &zc_bounce_slab_bytes }, null);
+            // Non-sheddable (a populated window is a delivery in flight or
+            // its body); floor 0 — the slab is lazily populated and the idle
+            // windows return under the idle-trim law (the groups punch them).
+            self.slab_component = mem_budget.Component.init("transport_zc_bounce", 0, 0, .{ .gauge = &worker.zc_bounce_resident_bytes }, null).withTrim(.{ .ctx = self, .call = &trimBounceHook });
             if (cfg.budget) |b| b.register(self.slab_component);
         }
         errdefer if (self.slab) |*s| {
@@ -1140,6 +1145,13 @@ pub const Session = struct {
 
     /// `SQUEEZEFS_TEST_ZC_BRIDGE_STALL` / `_DEADLINE_MS`: a pipe with no
     /// writer stands in for the bridge source, and a short deadline.
+    /// The idle-trim hook (`mem_budget.TrimFn`): every drain group punches
+    /// its idle bounce windows in its next pass.
+    fn trimBounceHook(ctx: *anyopaque, min_idle_ticks: u64) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        for (self.groups) |g| g.requestBounceTrim(min_idle_ticks);
+    }
+
     fn armBridgeSeams(self: *Session, env: *const std.process.Environ.Map) void {
         const stall = knobs.intKnob("SQUEEZEFS_TEST_ZC_BRIDGE_STALL", u32, env);
         const deadline_ms = knobs.intKnob("SQUEEZEFS_TEST_ZC_BRIDGE_DEADLINE_MS", u64, env);
@@ -1376,7 +1388,9 @@ pub const Session = struct {
         try field(w, "transport_kmbuf_register_retries", kmbuf.register_retries.load());
         try field(w, "transport_kmbuf_attached_deliveries", worker.kmbuf_attached_deliveries.load());
         try field(w, "transport_kmbuf_attachment_breach", worker.kmbuf_attachment_breach.load());
-        try field(w, "transport_zc_bounce_bytes", zc_bounce_slab_bytes.load());
+        try field(w, "transport_zc_bounce_bytes", worker.zc_bounce_resident_bytes.load());
+        try field(w, "transport_zc_bounce_reserve_bytes", zc_bounce_slab_bytes.load());
+        try field(w, "transport_zc_bounce_trimmed_bytes", worker.zc_bounce_trimmed_bytes.load());
         try field(w, "transport_zc_replies", worker.zc_replies.load());
         try field(w, "transport_zc_serve_bytes", worker.zc_serve_bytes.load());
         try field(w, "transport_zc_bounce_bytes_bridged", worker.zc_bounce_bytes.load());
@@ -2165,6 +2179,11 @@ test "e2e lattice: every probe verdict on this kernel (kmbuf present with its pa
     try testing.expectEqual(@as(u64, 1), time_limits_gauge.load());
     try testing.expect(s.slab != null);
     try testing.expectEqual(s.slab.?.bytes(), zc_bounce_slab_bytes.load());
+    // The reserve is virtual: the pages the slab holds are the staged
+    // windows' (a fresh session has none; the component gauges them).
+    try testing.expect(worker.zc_bounce_resident_bytes.load() < s.slab.?.bytes());
+    try testing.expectEqual(worker.zc_bounce_resident_bytes.load(), s.slab_component.current());
+    try testing.expect(s.slab_component.trim != null);
     try testing.expect(rig.fs.caps.?.buffer_mode == .zero_copy and rig.fs.caps.?.read_zc_serve and rig.fs.caps.?.retention);
     std.debug.print("lattice: kernel max_background (fusectl) {d}, negotiated {d}\n", .{ kernel_max_background.load(), s.plan.max_background });
 }

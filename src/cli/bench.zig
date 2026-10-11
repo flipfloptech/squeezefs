@@ -362,10 +362,13 @@ pub const StatsTerms = struct {
     pub const device_write_req_keys = [_][]const u8{ "patch_writes", "own_block_dmas", "put_obj", "fold_inplace_dmas" };
     pub const admission_keys = [_][]const u8{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes" };
     /// The read copy ledger (charter §6.3; brk.py `READ_COPY_ARMS`): the
-    /// plane's arms plus the transport's direct-leg and bridged serves.
-    /// `read_dest_lease_bytes` is the dest-lease mechanism's gauge over the
-    /// bytes `read_dest_dma_bytes` lands (1:1 measured) — beside, not summed.
-    pub const read_copy_keys = [_][]const u8{ "read_copy_dest_bytes", "read_copy_bounce_bytes", "read_dest_dma_bytes", "read_zc_serve_bytes", "read_copy_warm_serve_bytes", "read_copy_hot_serve_bytes", "read_copy_hold_serve_bytes", "read_copy_cache_serve_bytes", "read_copy_fill_slice_bytes", "transport_zc_serve_bytes", "transport_zc_bounce_bytes_bridged" };
+    /// PARTITION of the user's bytes by how they reached the reply — a
+    /// daemon copy into the dest, a device DMA into the dest, the plane's
+    /// zc leg, the transport's direct device leg. The warm/hot/hold/cache/
+    /// fill-slice terms are subsets of the dest copy and the transport's
+    /// bridge terms say how a body reached the slot — beside, never summed
+    /// (summing them double-counted every tier serve).
+    pub const read_copy_keys = [_][]const u8{ "read_copy_dest_bytes", "read_dest_dma_bytes", "read_zc_serve_bytes", "transport_zc_direct_leg_serve_bytes" };
     /// The device-READ byte arms (brk.py `DEVICE_READ_ARMS`; decision 0003
     /// §K): every path that moves bytes OFF a data device, each byte in
     /// exactly one arm, by purpose. The plane's nine close against its one
@@ -1105,8 +1108,8 @@ test "rows: quantiles are the bucket's UPPER bound over exact counts; MiB/s and 
 }
 
 test "the stats delta reads the terms by key name across the families; absent keys read 0; the delta saturates; the rewrite epoch's bytes ride beside the device arms, never in them; the read ledger sums the plane's and the transport's serve arms" {
-    const before = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":10,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":100,\"patch_write_bytes\":50,\"rewrite_device_write_bytes\":40,\"put_obj\":3,\"patch_writes\":1,\"own_block_dmas\":0,\"admit_write_overlay_bytes\":100,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1,\"read_dest_dma_bytes\":10,\"read_dest_lease_bytes\":10},\"transport\":{\"transport_zc_serve_bytes\":5,\"transport_zc_direct_legs\":1}}");
-    const after = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":25,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":400,\"patch_write_bytes\":50,\"rewrite_device_write_bytes\":140,\"put_obj\":7,\"patch_writes\":2,\"own_block_dmas\":1,\"admit_write_overlay_bytes\":300,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1,\"read_dest_dma_bytes\":30,\"read_dest_lease_bytes\":30},\"transport\":{\"transport_zc_serve_bytes\":25,\"transport_zc_direct_legs\":6}}");
+    const before = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":10,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":100,\"patch_write_bytes\":50,\"rewrite_device_write_bytes\":40,\"put_obj\":3,\"patch_writes\":1,\"own_block_dmas\":0,\"admit_write_overlay_bytes\":100,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1,\"read_dest_dma_bytes\":10,\"read_dest_lease_bytes\":10},\"transport\":{\"transport_zc_serve_bytes\":5,\"transport_zc_direct_leg_serve_bytes\":5,\"transport_zc_direct_legs\":1}}");
+    const after = StatsTerms.parse("{\"daemon\":{\"fuse_ops\":25,\"invariant_tripwires\":0},\"data\":{\"overlay_store_bytes\":400,\"patch_write_bytes\":50,\"rewrite_device_write_bytes\":140,\"put_obj\":7,\"patch_writes\":2,\"own_block_dmas\":1,\"admit_write_overlay_bytes\":300,\"terminal_frees\":1,\"block_free_reclaim_queued\":1,\"direct_device_true\":1,\"read_dest_dma_bytes\":30,\"read_dest_lease_bytes\":30},\"transport\":{\"transport_zc_serve_bytes\":25,\"transport_zc_direct_leg_serve_bytes\":25,\"transport_zc_direct_legs\":6}}");
     try testing.expectEqual(@as(u64, 150), before.device_write_bytes);
     try testing.expectEqual(@as(u64, 40), before.rewrite_device_write_bytes);
     try testing.expectEqual(@as(u64, 4), before.device_writes);

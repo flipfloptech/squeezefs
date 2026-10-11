@@ -1,0 +1,25 @@
+; Random reads/writes of ${BS} at a ${BLOCKALIGN} offset grain, QD ${IODEPTH} ×
+; ${NUMJOBS} jobs over a pre-written dataset: the read-amplification shapes
+; (decision 0003 §K) — 512 B, unaligned 4 KiB, 256 KiB, 1 MiB.
+; Env: RW BS BLOCKALIGN DIRECT IOENGINE DIRECTORY SIZE RUNTIME NUMJOBS IODEPTH PREFIX.
+[global]
+ioengine=${IOENGINE}
+direct=${DIRECT}
+bs=${BS}
+blockalign=${BLOCKALIGN}
+rw=${RW}
+iodepth=${IODEPTH}
+numjobs=${NUMJOBS}
+time_based=1
+runtime=${RUNTIME}
+directory=${DIRECTORY}
+filename_format=${PREFIX}.$jobnum
+size=${SIZE}
+create_on_open=0
+fallocate=none
+norandommap=1
+randrepeat=0
+group_reporting=1
+invalidate=1
+end_fsync=0
+[rand]

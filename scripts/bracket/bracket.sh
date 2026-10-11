@@ -32,6 +32,10 @@
 #                          two sets, each aging across its own legs; one binary)
 #   --posture P            symmetric | single-writer for the whole row (lever binary)
 #   --mount-opts O         extra `-o` options for every leg (e.g. direct_device_true)
+#   --format-opts O        extra `format` flags for the set (e.g. "--compress zstd",
+#                          "--encrypt aes-256-gcm --encrypt-key KEY"; `@KEY` expands to a
+#                          0600 key file the harness mints in its scratch and passes to
+#                          every leg's mount as --encrypt-key); recorded in the header
 #   --numjobs N            instrument parallelism (default = cpus/2, floor 2)
 #   --iodepth N            instrument queue depth (default 32)
 #   --meta-size B --data-size B --data-volumes N   the set's geometry
@@ -63,6 +67,7 @@ WARMUP=10
 LEVER=binary
 POSTURE=symmetric
 MOUNT_OPTS=""
+FORMAT_OPTS=""
 NUMJOBS=""
 IODEPTH=32
 META_SIZE=$((2 << 30))
@@ -85,6 +90,7 @@ while [ $# -gt 0 ]; do
     --lever) LEVER=$2; shift ;;
     --posture) POSTURE=$2; shift ;;
     --mount-opts) MOUNT_OPTS=$2; shift ;;
+    --format-opts) FORMAT_OPTS=$2; shift ;;
     --numjobs) NUMJOBS=$2; shift ;;
     --iodepth) IODEPTH=$2; shift ;;
     --meta-size) META_SIZE=$2; shift ;;
@@ -203,6 +209,16 @@ set_uris() {   # $1 = set index
   META_URI="sqmeta://${META_DEV[$1]}"
   DATA_URI="sqdata://${DATA_DEVS_BY_SET[$1]}"
 }
+# A transformed set's key: 32 B of key material, 0600, minted once in the
+# scratch; `@KEY` in --format-opts names it and every leg's mount receives it.
+KEY_FILE=""
+MOUNT_ARGS=()
+if printf '%s' "$FORMAT_OPTS" | grep -q '@KEY'; then
+  KEY_FILE="$SCRATCH/encrypt.key"
+  head -c 32 /dev/urandom > "$KEY_FILE"; chmod 0600 "$KEY_FILE"
+  FORMAT_OPTS=${FORMAT_OPTS//@KEY/$KEY_FILE}
+  MOUNT_ARGS=(--encrypt-key "$KEY_FILE")
+fi
 format_set() {  # $1 = set index, $2 = posture
   set_uris "$1"
   local flags=()
@@ -217,7 +233,9 @@ format_set() {  # $1 = set index, $2 = posture
     flags+=(--disk-cache-paths "$SCRATCH/cache-$1")
     staging_note=" (staging root $SCRATCH/cache-$1)"
   fi
-  log "format set $1 ($2): $META_URI $DATA_URI$staging_note"
+  # shellcheck disable=SC2206
+  [ -n "$FORMAT_OPTS" ] && flags+=($FORMAT_OPTS)
+  log "format set $1 ($2): ${flags[*]} $META_URI $DATA_URI$staging_note"
   "$BIN_A" format "${flags[@]}" "$META_URI" "$DATA_URI" > "$SCRATCH/format-$1.log" 2>&1 || { cat "$SCRATCH/format-$1.log" >&2; exit 1; }
 }
 if [ "$LEVER" = posture ]; then
@@ -268,7 +286,7 @@ for arm in "${ORDER[@]}"; do
   fi
   export BRK_PRELOAD_ENV
   log "leg $leg_n arm $arm: $BIN (set $set_idx, $leg_posture) -o '${opts:-}'"
-  leg_mount "$BIN" "$META_URI" "$MNT" "$LEG_DIR/daemon.log" "$opts"
+  leg_mount "$BIN" "$META_URI" "$MNT" "$LEG_DIR/daemon.log" "$opts" "${MOUNT_ARGS[@]}"
   if ! printf '%s' "$PREPARED_SETS" | grep -q ":$set_idx:"; then
     log "leg $leg_n: preparing the aging store's dataset (once per set)"
     row_prepare "$MNT" >> "$LEG_DIR/prepare.log" 2>&1
@@ -349,7 +367,7 @@ done
 
 # ---- fold -----------------------------------------------------------------
 HEADER="$SCRATCH/header.json"
-H_ROW=$ROW H_DATE=$DATE H_SCOPING=$SCOPING H_INSTR="$ROW_INSTRUMENT" H_KIND=$ROW_KIND H_SHIM=$ROW_NEEDS_SHIM \
+H_ROW=$ROW H_DATE=$DATE H_SCOPING=$SCOPING H_INSTR="$ROW_INSTRUMENT" H_KIND=$ROW_KIND H_SHIM=$ROW_NEEDS_SHIM H_FORMAT_OPTS="${FORMAT_OPTS//$SCRATCH/<scratch>}" \
 H_SUB=$SUBSTRATE H_SUBDESC="$SUBSTRATE_DESC" H_VENUE="$VENUE" H_VENUE_ID=$VENUE_ID H_BUILD_A="$BUILD_A" H_BUILD_B="$BUILD_B" \
 H_AEQB=$A_EQ_B H_LEVER=$LEVER H_POSTURE=$POSTURE H_OPTS="$MOUNT_OPTS" H_DUR=$DURATION H_WARM=$WARMUP H_NJ=$NUMJOBS H_QD=$IODEPTH \
 H_BUDGET=$BUDGET_MB H_META=$META_SIZE H_DATA=$DATA_SIZE H_NVOL=$DATA_VOLUMES H_LOAD="$(cut -d' ' -f1-3 /proc/loadavg)" \
@@ -361,7 +379,7 @@ json.dump({"row": e["H_ROW"], "date": e["H_DATE"], "scoping": e["H_SCOPING"] == 
   "row_kind": e["H_KIND"], "shim": e["H_SHIM"] == "1", "substrate": e["H_SUB"], "substrate_desc": e["H_SUBDESC"],
   "venue": json.loads(e["H_VENUE"]), "venue_id": e["H_VENUE_ID"], "build_a": json.loads(e["H_BUILD_A"]),
   "build_b": json.loads(e["H_BUILD_B"]), "a_equals_b": e["H_AEQB"] == "true", "lever": e["H_LEVER"],
-  "posture": e["H_POSTURE"], "mount_opts": e["H_OPTS"], "duration_s": int(e["H_DUR"]), "warmup_s": int(e["H_WARM"]),
+  "posture": e["H_POSTURE"], "mount_opts": e["H_OPTS"], "format_opts": e["H_FORMAT_OPTS"], "duration_s": int(e["H_DUR"]), "warmup_s": int(e["H_WARM"]),
   "order": "A-B-B-A", "numjobs": int(e["H_NJ"]), "iodepth": int(e["H_QD"]), "mem_budget_mb": int(e["H_BUDGET"]),
   "set_geometry": {"meta_bytes": int(e["H_META"]), "data_bytes": int(e["H_DATA"]), "data_volumes": int(e["H_NVOL"])},
   "loadavg_at_start": e["H_LOAD"], "nproc": int(e["H_NPROC"]), "fio": e["H_FIO"], "tools": e["H_TOOLS"]}, open(sys.argv[1], "w"))

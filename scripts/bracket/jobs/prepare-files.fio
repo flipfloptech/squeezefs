@@ -1,0 +1,18 @@
+; Lays a MANY-FILES dataset down ONCE (outside every leg): ${NRFILES} files of
+; ${FILESIZE} each, fully written, for the per-file read shapes (the early-stop
+; reader); every file fully written so no read ever meets a hole.
+[global]
+ioengine=psync
+direct=1
+bs=1M
+rw=write
+nrfiles=${NRFILES}
+filesize=${FILESIZE}
+file_service_type=sequential
+openfiles=1
+directory=${DIRECTORY}
+filename_format=${PREFIX}.$filenum
+fallocate=none
+end_fsync=1
+group_reporting=1
+[prepare]

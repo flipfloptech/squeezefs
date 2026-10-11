@@ -279,7 +279,9 @@ pub const WarmLadder = struct {
                 if (rp.cfg.direct_device_true and odirect) return error.Miss;
                 const key = rp.meta.binding(rp.meta.ctx, ino, b) orelse return error.Miss;
                 const k = BlockKey.fromMapping(key);
-                if (rp.hot.getServing(k, out.len)) |hit| {
+                // The payback credit is the device bytes the hit avoided
+                // (the ranged window), as on the lane (`readSingleBlock`).
+                if (rp.hot.getServing(k, read_path.Window.of(rel_s, rel_e, rp.cfg.block_size).len())) |hit| {
                     const view = rp.pool.bytes(hit.slot)[@intCast(rel_s)..@intCast(rel_e)];
                     hot_tier.stats.hot_block_hits.inc();
                     read_path.stats.cache_hits.inc();

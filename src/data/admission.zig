@@ -24,6 +24,18 @@
 //! 256-deep O_DIRECT), and the COOLDOWN (a key re-escalates at most every
 //! ~32–64 s: the ghost proves REUSE, the cooldown bounds CHURN). Every
 //! epoch stamp is `clock.monotonicNs` (Q11: a wall clock steps).
+//!
+//! The clamp's RELEASE is additive-increase (decision 0003 §K): the share
+//! of foreground an epoch may spend on admissions starts at `fill_pct`
+//! when waste engages the clamp and DOUBLES on every epoch whose victims
+//! were mostly served, until 100 % (unclamped); an epoch that wastes again
+//! resets it to `fill_pct`. A binary release re-admitted a whole tier's
+//! worth in the first open epoch (the venue's rand-512b row: 656 whole
+//! blocks in 30 s, 13.7× the user bytes), and the previous-epoch-only
+//! reading flapped wherever the trickle bought fewer than two blocks per
+//! epoch. Payback is credited in the DEVICE bytes a hit avoided (the
+//! ranged window), not the user bytes: a 512 B read served from the tier
+//! saved a 4 KiB DMA.
 
 const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
@@ -57,6 +69,9 @@ pub const COOLDOWN_EPOCH_NS: u64 = 32 * std.time.ns_per_s;
 pub const GOVERNOR_EPOCH_NS: u64 = 2 * std.time.ns_per_s;
 /// The clamp's noise floor: `wasted ≥ 2 × block`.
 pub const CLAMP_FLOOR_BLOCKS: u64 = 2;
+/// The admission share's unit (percent) and its unclamped value: the
+/// ladder tops out where the whole foreground may be spent.
+pub const SHARE_UNCLAMPED_PCT: u64 = 100;
 /// Fibonacci hashing constant for the epoch tag mix.
 const TAG_MIX: u32 = 0x9E3779B9;
 
@@ -68,13 +83,16 @@ pub const stats = struct {
     pub var read_admission_wasted_bytes: counters.ShardedCounter = .{};
     pub var read_admission_governor_denials: counters.ShardedCounter = .{};
     pub var read_admission_governor_clamped: counters.Gauge = .{};
+    /// The standing admission share (100 = unclamped; `fill_pct`..99 = the
+    /// additive-increase ladder since the last wasteful epoch).
+    pub var read_admission_governor_share_pct: counters.Gauge = .{};
     pub var read_admission_stream_transients: counters.ShardedCounter = .{};
     pub var ranged_read_ghost_escalations: counters.ShardedCounter = .{};
     pub var read_odirect_ghost_admits: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"read_fill_publishes_skipped\":{d},\"read_tier_admissions\":{d},\"read_tier_admission_ghost_hits\":{d},\"read_admission_evicted_unhit\":{d},\"read_admission_wasted_bytes\":{d},\"read_admission_governor_denials\":{d},\"read_admission_governor_clamped\":{d},\"read_admission_stream_transients\":{d},\"ranged_read_ghost_escalations\":{d},\"read_odirect_ghost_admits\":{d}}}", .{
+    try w.print("{{\"read_fill_publishes_skipped\":{d},\"read_tier_admissions\":{d},\"read_tier_admission_ghost_hits\":{d},\"read_admission_evicted_unhit\":{d},\"read_admission_wasted_bytes\":{d},\"read_admission_governor_denials\":{d},\"read_admission_governor_clamped\":{d},\"read_admission_governor_share_pct\":{d},\"read_admission_stream_transients\":{d},\"ranged_read_ghost_escalations\":{d},\"read_odirect_ghost_admits\":{d}}}", .{
         stats.read_fill_publishes_skipped.load(),
         stats.read_tier_admissions.load(),
         stats.read_tier_admission_ghost_hits.load(),
@@ -82,6 +100,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.read_admission_wasted_bytes.load(),
         stats.read_admission_governor_denials.load(),
         stats.read_admission_governor_clamped.load(),
+        stats.read_admission_governor_share_pct.load(),
         stats.read_admission_stream_transients.load(),
         stats.ranged_read_ghost_escalations.load(),
         stats.read_odirect_ghost_admits.load(),
@@ -227,8 +246,14 @@ pub const EscalationCooldown = struct {
 // ---------------------------------------------------------------------------
 
 pub const Governor = struct {
-    /// `SQUEEZEFS_READ_ADMISSION_FILL_PCT` (0..=100).
+    /// `SQUEEZEFS_READ_ADMISSION_FILL_PCT` (0..=100): the share the clamp
+    /// engages at, and the additive-increase ladder's floor.
     fill_pct: u64,
+    /// The volume's block: the clamp's engage floor is two of them.
+    block: u64,
+    /// The standing admission share in percent: 100 = unclamped; else the
+    /// previous epoch's foreground × share/100 is this epoch's token mint.
+    share_pct: Atomic(u64) = .init(SHARE_UNCLAMPED_PCT),
     epoch_ns: u64 = GOVERNOR_EPOCH_NS,
     epoch_idx: Atomic(u64) = .init(0),
     evicted_cur: Atomic(u64) = .init(0),
@@ -239,15 +264,17 @@ pub const Governor = struct {
     foreground_prev: Atomic(u64) = .init(0),
     tokens: Atomic(u64) = .init(0),
 
-    pub fn init(fill_pct: u64) Governor {
-        std.debug.assert(fill_pct <= 100);
-        return .{ .fill_pct = fill_pct };
+    pub fn init(fill_pct: u64, block: u64) Governor {
+        std.debug.assert(fill_pct <= 100 and block > 0);
+        stats.read_admission_governor_share_pct.set(SHARE_UNCLAMPED_PCT);
+        stats.read_admission_governor_clamped.set(0);
+        return .{ .fill_pct = fill_pct, .block = block };
     }
 
     /// The fill share and the epoch (`SQUEEZEFS_TEST_READ_ADMISSION_EPOCH_MS`:
     /// 0 = the 2 s house epoch).
-    pub fn fromEnv(env: *const std.process.Environ.Map) Governor {
-        var g = init(knobs.intKnob("SQUEEZEFS_READ_ADMISSION_FILL_PCT", u64, env));
+    pub fn fromEnv(env: *const std.process.Environ.Map, block: u64) Governor {
+        var g = init(knobs.intKnob("SQUEEZEFS_READ_ADMISSION_FILL_PCT", u64, env), block);
         const epoch_ms = knobs.intKnob("SQUEEZEFS_TEST_READ_ADMISSION_EPOCH_MS", u64, env);
         if (epoch_ms != 0) g.epoch_ns = epoch_ms * std.time.ns_per_ms;
         return g;
@@ -260,9 +287,12 @@ pub const Governor = struct {
     }
 
     /// The CAS winner rolls: `cur → prev` (0 when the epochs are not
-    /// adjacent), tokens minted ONCE from the previous epoch's foreground
-    /// (leftovers die — the earlier two-window spend arithmetic re-admitted
-    /// a herd at every boundary, exactly 2× the budget).
+    /// adjacent), the share re-decided from the finishing epoch's eviction
+    /// evidence (an epoch without evictions carries none: the share stands
+    /// — the epochs a gap skipped had no calls, so no evictions either),
+    /// then tokens minted ONCE from the previous epoch's foreground at the
+    /// share (leftovers die — the earlier two-window spend arithmetic
+    /// re-admitted a herd at every boundary, exactly 2× the budget).
     pub fn roll(self: *Governor, now_ns: u64) void {
         const idx = now_ns / self.epoch_ns;
         const cur = self.epoch_idx.load(.monotonic);
@@ -275,7 +305,21 @@ pub const Governor = struct {
         self.evicted_prev.store(if (adjacent) ev else 0, .monotonic);
         self.wasted_prev.store(if (adjacent) wa else 0, .monotonic);
         self.foreground_prev.store(if (adjacent) fg else 0, .monotonic);
-        self.tokens.store((if (adjacent) fg else 0) * self.fill_pct / 100, .monotonic);
+        if (ev != 0) {
+            const share = self.share_pct.load(.monotonic);
+            const wasteful = 2 * wa >= ev;
+            const next: u64 = if (share == SHARE_UNCLAMPED_PCT)
+                (if (wa >= CLAMP_FLOOR_BLOCKS * self.block and wasteful) self.fill_pct else SHARE_UNCLAMPED_PCT)
+            else if (wasteful)
+                self.fill_pct
+            else
+                @min(SHARE_UNCLAMPED_PCT, @max(share * 2, 1));
+            self.share_pct.store(next, .monotonic);
+            stats.read_admission_governor_clamped.set(@intFromBool(next < SHARE_UNCLAMPED_PCT));
+            stats.read_admission_governor_share_pct.set(next);
+        }
+        const share = self.share_pct.load(.monotonic);
+        self.tokens.store(if (share < SHARE_UNCLAMPED_PCT and adjacent) fg * share / SHARE_UNCLAMPED_PCT else 0, .monotonic);
     }
 
     /// The clamp's denominator: ranged device reads and `DemandStream`
@@ -300,15 +344,13 @@ pub const Governor = struct {
     }
 
     /// Eviction-side ratio ON PURPOSE (an admission burst must not dilute
-    /// the ratio and unclamp itself): `wasted ≥ 2 × block ∧ 2 × wasted ≥
-    /// evicted` over the previous epoch.
-    pub fn clampEngaged(self: *Governor, block: u64, now_ns: u64) bool {
+    /// the ratio and unclamp itself): the clamp ENGAGES on `wasted ≥ 2 ×
+    /// block ∧ 2 × wasted ≥ evicted` over an epoch's victims (the floor is
+    /// the engage-side noise gate) and RELEASES by the additive-increase
+    /// ladder in `roll` — never in one step.
+    pub fn clampEngaged(self: *Governor, now_ns: u64) bool {
         self.roll(now_ns);
-        const wasted = self.wasted_prev.load(.monotonic);
-        const evicted = self.evicted_prev.load(.monotonic);
-        const clamped = wasted >= CLAMP_FLOOR_BLOCKS * block and 2 * wasted >= evicted;
-        stats.read_admission_governor_clamped.set(@intFromBool(clamped));
-        return clamped;
+        return self.share_pct.load(.monotonic) < SHARE_UNCLAMPED_PCT;
     }
 
     /// ONE CAS spends a block's worth of tokens.
@@ -321,20 +363,20 @@ pub const Governor = struct {
     }
 
     pub fn allowEscalation(self: *Governor, block: u64, now_ns: u64) bool {
-        if (!self.clampEngaged(block, now_ns) or self.reserveTokens(block)) return true;
+        if (!self.clampEngaged(now_ns) or self.reserveTokens(block)) return true;
         stats.read_admission_governor_denials.inc();
         return false;
     }
 
     pub fn allowStreamAdmission(self: *Governor, block: u64, now_ns: u64) bool {
-        if (!self.clampEngaged(block, now_ns) or self.reserveTokens(block)) return true;
+        if (!self.clampEngaged(now_ns) or self.reserveTokens(block)) return true;
         stats.read_admission_stream_transients.inc();
         return false;
     }
 
     /// The non-reserving peek (the direct-drive prelude of rung 7).
     pub fn escalationWouldAdmit(self: *Governor, block: u64, now_ns: u64) bool {
-        return !self.clampEngaged(block, now_ns) or self.tokens.load(.monotonic) >= block;
+        return !self.clampEngaged(now_ns) or self.tokens.load(.monotonic) >= block;
     }
 
     pub fn tokensLeft(self: *const Governor) u64 {
@@ -361,11 +403,11 @@ pub const Admission = struct {
     cooldown: EscalationCooldown,
     governor: Governor,
 
-    pub fn init(gpa: Allocator, policy: Policy, fill_pct: u64) Allocator.Error!Admission {
+    pub fn init(gpa: Allocator, policy: Policy, fill_pct: u64, block: u64) Allocator.Error!Admission {
         var ghost = try GhostTable.init(gpa);
         errdefer ghost.deinit(gpa);
         const cooldown = try EscalationCooldown.init(gpa);
-        return .{ .gpa = gpa, .policy = policy, .ghost = ghost, .cooldown = cooldown, .governor = Governor.init(fill_pct) };
+        return .{ .gpa = gpa, .policy = policy, .ghost = ghost, .cooldown = cooldown, .governor = Governor.init(fill_pct, block) };
     }
 
     pub fn deinit(self: *Admission) void {
@@ -456,8 +498,8 @@ test "cooldown: a key re-escalates only after two 32 s epochs" {
 }
 
 test "governor: waste → clamp → denials by ONE token CAS; tokens minted once from the previous epoch's foreground; fitting sets never clamp" {
-    var g = Governor.init(5);
     const block: u64 = 4 << 20;
+    var g = Governor.init(5, block);
     var now: u64 = 10 * GOVERNOR_EPOCH_NS;
     // Epoch A: 1 GiB of foreground, 4 protected victims that served nothing.
     g.noteForeground(derive_GiB, now);
@@ -469,12 +511,12 @@ test "governor: waste → clamp → denials by ONE token CAS; tokens minted once
     g.onEviction(.{ .key = .init(1, 0), .slot = 0, .len = @intCast(block), .class = .probation, .served_bytes = 0, .stream_admitted = false }, now);
     g.onEviction(.{ .key = .init(1, 0), .slot = 0, .len = @intCast(block), .class = .protected, .served_bytes = block, .stream_admitted = false }, now);
     // Still epoch A: the clamp reads the PREVIOUS epoch (0) — not engaged.
-    try testing.expect(!g.clampEngaged(block, now));
+    try testing.expect(!g.clampEngaged(now));
     try testing.expect(g.allowEscalation(block, now));
     // Epoch B: wasted_prev = 4 blocks ≥ 2 ∧ 2 × 4 ≥ 5 evicted ⇒ clamped;
     // tokens = 5 % of 1 GiB = 51.2 MiB = 12 whole blocks.
     now += GOVERNOR_EPOCH_NS;
-    try testing.expect(g.clampEngaged(block, now));
+    try testing.expect(g.clampEngaged(now));
     try testing.expectEqual(derive_GiB * 5 / 100, g.tokensLeft());
     const denials_before = stats.read_admission_governor_denials.load();
     var admits: u32 = 0;
@@ -486,22 +528,54 @@ test "governor: waste → clamp → denials by ONE token CAS; tokens minted once
     const trans_before = stats.read_admission_stream_transients.load();
     try testing.expect(!g.allowStreamAdmission(block, now));
     try testing.expectEqual(trans_before + 1, stats.read_admission_stream_transients.load());
-    // Epoch C with nothing in B: prev = 0 ⇒ unclamped; a non-adjacent jump
-    // zeroes prev too.
+    // Epoch C with no evictions in B: no evidence either way ⇒ the clamp
+    // STANDS (reading B alone made it flap: a throttled epoch evicts under
+    // the two-block floor and the next epoch admitted everything).
     now += GOVERNOR_EPOCH_NS;
-    try testing.expect(!g.clampEngaged(block, now));
+    try testing.expect(g.clampEngaged(now));
+    // Epoch D after a C that evicted ONE fully-wasted block (under the
+    // engage floor): the ratio alone re-decides ⇒ still clamped at 5 %.
+    g.onEviction(.{ .key = .init(1, 0), .slot = 0, .len = @intCast(block), .class = .protected, .served_bytes = 0, .stream_admitted = false }, now);
+    now += GOVERNOR_EPOCH_NS;
+    try testing.expect(g.clampEngaged(now));
+    try testing.expectEqual(@as(u64, 5), g.share_pct.load(.monotonic));
+    // Served epochs climb the ladder 5 → 10 → 20 → 40 → 80 → 100: the
+    // release is additive-increase, never one open epoch admitting a tier.
+    const served_victims = [_]hot_tier.Victim{
+        .{ .key = .init(1, 0), .slot = 0, .len = @intCast(block), .class = .protected, .served_bytes = block, .stream_admitted = false },
+        .{ .key = .init(1, block), .slot = 0, .len = @intCast(block), .class = .protected, .served_bytes = block, .stream_admitted = false },
+        .{ .key = .init(1, 2 * block), .slot = 0, .len = @intCast(block), .class = .protected, .served_bytes = 0, .stream_admitted = false },
+    };
+    const ladder = [_]u64{ 10, 20, 40, 80, 100 };
+    for (ladder) |want| {
+        g.noteForeground(derive_GiB, now);
+        for (served_victims) |v| g.onEviction(v, now);
+        now += GOVERNOR_EPOCH_NS;
+        try testing.expectEqual(want < 100, g.clampEngaged(now));
+        try testing.expectEqual(want, g.share_pct.load(.monotonic));
+        // Tokens at the share while clamped; none minted unclamped.
+        try testing.expectEqual(if (want < 100) derive_GiB * want / 100 else 0, g.tokensLeft());
+    }
+    // A wasteful epoch resets the ladder to the floor at once.
+    for (0..3) |n| g.onEviction(.{ .key = .init(1, n * block), .slot = 0, .len = @intCast(block), .class = .protected, .served_bytes = 0, .stream_admitted = false }, now);
+    now += GOVERNOR_EPOCH_NS;
+    try testing.expect(g.clampEngaged(now));
+    try testing.expectEqual(@as(u64, 5), g.share_pct.load(.monotonic));
+    // A non-adjacent jump zeroes prev and mints nothing (no evidence: the
+    // verdict stands).
     g.noteForeground(derive_GiB, now);
     now += 5 * GOVERNOR_EPOCH_NS;
     g.roll(now);
     try testing.expectEqual(@as(u64, 0), g.tokensLeft());
+    try testing.expect(g.clampEngaged(now));
 }
 
 const derive_GiB: u64 = 1 << 30;
 
 test "the §1.5 decision table" {
-    var a = try Admission.init(testing.allocator, .second_touch, 5);
-    defer a.deinit();
     const big: u64 = 4 << 20;
+    var a = try Admission.init(testing.allocator, .second_touch, 5, big);
+    defer a.deinit();
     const k = BlockKey.init(1, 0);
     const now: u64 = 10 * GOVERNOR_EPOCH_NS;
     // ≤ 256 KiB: always publish (the LRU class).
@@ -529,12 +603,12 @@ test "the §1.5 decision table" {
     try testing.expectEqual(PutClass.protected_stream, d4.hot_class);
     try testing.expect(d4.publish);
     // `always`: publish on first touch, RAM class probation.
-    var always = try Admission.init(testing.allocator, .always, 5);
+    var always = try Admission.init(testing.allocator, .always, 5, big);
     defer always.deinit();
     const d5 = always.decideFill(k, big, .demand, now);
     try testing.expectEqual(PutClass.probation, d5.hot_class);
     try testing.expect(d5.publish);
-    var never = try Admission.init(testing.allocator, .never, 5);
+    var never = try Admission.init(testing.allocator, .never, 5, big);
     defer never.deinit();
     const d6 = never.decideFill(k, big, .demand_stream, now);
     try testing.expectEqual(PutClass.probation_referenced, d6.hot_class);
@@ -565,10 +639,10 @@ test "policy: knob parsing and the hot-budget-0 degrade" {
     try testing.expectEqual(Policy.never, Policy.fromEnv(&env, 0));
     try env.put("SQUEEZEFS_READ_TIER_ADMISSION", "ALWAYS");
     try testing.expectEqual(Policy.always, Policy.fromEnv(&env, 1));
-    try testing.expectEqual(@as(u64, 5), Governor.fromEnv(&env).fill_pct);
-    try testing.expectEqual(GOVERNOR_EPOCH_NS, Governor.fromEnv(&env).epoch_ns);
+    try testing.expectEqual(@as(u64, 5), Governor.fromEnv(&env, 4 << 20).fill_pct);
+    try testing.expectEqual(GOVERNOR_EPOCH_NS, Governor.fromEnv(&env, 4 << 20).epoch_ns);
     try env.put("SQUEEZEFS_TEST_READ_ADMISSION_EPOCH_MS", "50");
-    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), Governor.fromEnv(&env).epoch_ns);
+    try testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), Governor.fromEnv(&env, 4 << 20).epoch_ns);
 }
 
 fn policyNameFuzz(_: void, smith: *std.testing.Smith) !void {

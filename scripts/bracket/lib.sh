@@ -29,11 +29,12 @@ LEG_MNT=""
 # shim's dirty-build pairing seam (`BRK_PRELOAD_ENV`, set per leg by
 # bracket.sh) must hold on BOTH ends: the daemon's HELLO ladder refuses a
 # `-dirty` identity unless it carries the seam too (a dev-box row).
-leg_mount() {   # bin meta_uri mnt log opts
+leg_mount() {   # bin meta_uri mnt log opts [extra mount args…]
   local bin=$1 uri=$2 mnt=$3 dlog=$4 opts=$5
+  shift 5
   local argv=("$bin" mount --daemon --log-file "$dlog")
   [ -n "$opts" ] && argv+=(-o "$opts")
-  argv+=("$uri" "$mnt")
+  argv+=("$@" "$uri" "$mnt")
   : > "$dlog"
   local dirty_seam=()
   case "${BRK_PRELOAD_ENV:-}" in *SQUEEZEFS_TEST_IPC_ALLOW_DIRTY=1*) dirty_seam=(SQUEEZEFS_TEST_IPC_ALLOW_DIRTY=1) ;; esac

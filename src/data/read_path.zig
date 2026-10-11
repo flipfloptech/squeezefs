@@ -477,7 +477,7 @@ pub const Config = struct {
     block_size: u64,
     /// `transform.isPassthrough`: no decode, ranged windows legal.
     passthrough: bool,
-    /// `SQUEEZEFS_READ_RANGED_THRESHOLD` (0 = kill switch).
+    /// `SQUEEZEFS_READ_RANGED_THRESHOLD` (0 = kill switch; derived `block − 4 KiB`).
     ranged_threshold: u64,
     /// `SQUEEZEFS_READ_DEST_LEASE`.
     dest_lease: bool,
@@ -506,7 +506,7 @@ pub const Config = struct {
         return .{
             .block_size = block_size,
             .passthrough = passthrough,
-            .ranged_threshold = knobs.intKnob("SQUEEZEFS_READ_RANGED_THRESHOLD", u64, env),
+            .ranged_threshold = resolveRangedThreshold(knobs.optIntKnob("SQUEEZEFS_READ_RANGED_THRESHOLD", u64, env), block_size),
             .dest_lease = knobs.boolKnob("SQUEEZEFS_READ_DEST_LEASE", env),
             .read_lane = knobs.boolKnob("SQUEEZEFS_READ_LANE", env),
             .direct_device_true = knobs.boolKnob("SQUEEZEFS_DIRECT_DEVICE_TRUE", env),
@@ -522,6 +522,21 @@ pub const Config = struct {
         };
     }
 };
+
+/// The derived ranged ceiling: every strictly sub-block request. A request
+/// longer than `block − grain` has a window of the whole block (the 4 KiB
+/// outward rounding), so the whole-block fetch is byte-identical and buys
+/// tier residency; below it the window is strictly smaller than the block
+/// and a random reader (no contiguity proven, no second touch yet) owes
+/// nothing more than its window (decision 0003 §K).
+pub fn derivedRangedThreshold(block_size: u64) u64 {
+    return block_size - rsc.LBA_GRAIN;
+}
+
+/// Explicit (verbatim; 0 = kill switch) > derived.
+pub fn resolveRangedThreshold(explicit: ?u64, block_size: u64) u64 {
+    return explicit orelse derivedRangedThreshold(block_size);
+}
 
 /// `ranged_eligible`: threshold on ∧ `len ≤ threshold` ∧ `block >
 /// threshold` ∧ passthrough ∧ not stream-classified (streams want whole
@@ -685,7 +700,7 @@ pub const ReadPath = struct {
         const flights = try gpa.create(single_flight.FlightTable(MAX_FLIGHTS));
         errdefer gpa.destroy(flights);
         flights.* = single_flight.FlightTable(MAX_FLIGHTS).init(pool);
-        var adm = try admission.Admission.init(gpa, cfg.admission_policy, cfg.fill_pct);
+        var adm = try admission.Admission.init(gpa, cfg.admission_policy, cfg.fill_pct, cfg.block_size);
         errdefer adm.deinit();
         self.* = .{
             .gpa = gpa,
@@ -1053,9 +1068,12 @@ pub const ReadPath = struct {
                 });
             }
         }
-        // (5) HOT tier — refcount hit, binding recheck.
+        // (5) HOT tier — refcount hit, binding recheck. The payback credit
+        //     is the DEVICE bytes the hit avoided (the ranged window a miss
+        //     would have DMA'd), not the user bytes: a 512 B serve saved a
+        //     4 KiB DMA (the governor's waste law prices device bytes).
         if (key != null and !device_true) {
-            if (self.hot.getServing(key.?, slice_len)) |hit| {
+            if (self.hot.getServing(key.?, Window.of(rel_s, rel_e, bs).len())) |hit| {
                 defer self.hot.unpin(hit);
                 @memcpy(out, self.pool.bytes(hit.slot)[@intCast(rel_s)..@intCast(rel_e)]);
                 stats.read_copy_dest_bytes.add(out.len);
@@ -1648,8 +1666,8 @@ pub const TestFixture = if (builtin.is_test) Fixture else @compileError("TestFix
 const Fixture = struct {
     pub const bs: u64 = 1 << 20;
     pub const vol_tag: u64 = 0x7001;
-    const capacity: u64 = 16 * bs;
-    const MaxBlocks = 8;
+    const capacity: u64 = 32 * bs;
+    const MaxBlocks = 24;
 
     gpa: Allocator,
     device: []align(4096) u8,
@@ -1934,6 +1952,86 @@ test "the ranged-vs-whole decision table: a random 4 KiB cold read on a passthro
     try testing.expect(!rangedEligible(262144, 4096, 1 << 22, true, true));
     try testing.expect(!rangedEligible(262144, 4096, 262144, true, false));
     try testing.expect(rangedEligible(262144, 262144, 1 << 22, true, false));
+}
+
+test "the ranged ceiling is derived from the block (every strictly sub-block request): a cold random read ABOVE the reference's 256 KiB ceiling is ONE window of its own length into an unregistered dest — never the whole block; the tie `block − 4 KiB`; the explicit knob and the kill switch stand" {
+    const io = testing.io;
+    try testing.expectEqual(Fixture.bs - rsc.LBA_GRAIN, derivedRangedThreshold(Fixture.bs));
+    try testing.expectEqual((4 << 20) - 4096, derivedRangedThreshold(4 << 20));
+    try testing.expectEqual(@as(u64, 262144), resolveRangedThreshold(262144, 4 << 20));
+    try testing.expectEqual(@as(u64, 0), resolveRangedThreshold(0, 4 << 20));
+    try testing.expectEqual(derivedRangedThreshold(4 << 20), resolveRangedThreshold(null, 4 << 20));
+    // Every request shorter than the block ranges; the block-long one is whole.
+    try testing.expect(rangedEligible(derivedRangedThreshold(4 << 20), 1 << 20, 4 << 20, true, false));
+    try testing.expect(rangedEligible(derivedRangedThreshold(4 << 20), (4 << 20) - 4096, 4 << 20, true, false));
+    try testing.expect(!rangedEligible(derivedRangedThreshold(4 << 20), 4 << 20, 4 << 20, true, false));
+    try testing.expect(!rangedEligible(derivedRangedThreshold(4 << 20), 1 << 20, 4 << 20, true, true));
+    // The 1 MiB-block fixture: a 512 KiB cold random read (above 256 KiB,
+    // below the block) costs exactly 512 KiB of device bytes, bounced into
+    // an unregistered dest, and lands in no tier.
+    const f = try Fixture.init(testing.allocator, .{ .ranged_threshold = derivedRangedThreshold(Fixture.bs) });
+    defer f.deinit();
+    f.size = 2 * Fixture.bs;
+    f.bind(0, 3);
+    const buf = try alignedBuf(testing.allocator, 512 * derive.KiB);
+    defer testing.allocator.free(buf);
+    const l0 = DmaLedger.snap();
+    const n = try f.rp.read(io, 7, 256 * derive.KiB, 512 * derive.KiB, .{ .buf = buf }, .{});
+    try testing.expectEqual(@as(usize, 512 * derive.KiB), n);
+    try Fixture.expected(3 * Fixture.bs + 256 * derive.KiB, buf);
+    const l = DmaLedger.snap();
+    try testing.expectEqual(@as(u64, 512 * derive.KiB), l.ranged - l0.ranged);
+    try testing.expectEqual(l0.demand, l.demand);
+    try testing.expectEqual(@as(u64, 512 * derive.KiB), f.device_read_bytes.load(.monotonic));
+    const key = BlockKey.init(Fixture.vol_tag, 3 * Fixture.bs);
+    try testing.expect(!f.rp.hot.contains(key) and !f.rp.nvme.has(key) and !f.rp.hold.contains(key));
+}
+
+test "the bounded-waste law under a random sub-block storm over a set ≫ the hot tier: once the clamp engages, ghost escalations spend only the governor's tokens (fill_pct of the previous epoch's ranged bytes) — the whole-block demand arm stays within W/len × (1 + f) of the user bytes" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{ .hot_budget = 4 * Fixture.bs, .read_lane = false });
+    defer f.deinit();
+    const blocks: usize = 16;
+    f.size = blocks * Fixture.bs;
+    for (0..blocks) |i| f.bind(i, @intCast(i + 1));
+    // A 10 s governor epoch never rolls on its own inside the test; the
+    // epochs are advanced by hand (`roll` at now + k × epoch), adjacent.
+    const g = &f.rp.adm.governor;
+    g.setEpochNsForTest(10 * std.time.ns_per_s);
+    const buf = try alignedBuf(testing.allocator, 4096);
+    defer testing.allocator.free(buf);
+    const esc0 = admission.stats.ranged_read_ghost_escalations.load();
+    const denials0 = admission.stats.read_admission_governor_denials.load();
+    const l0 = DmaLedger.snap();
+    // Pass 1 over blocks 0..7: first touches — ranged windows, the ghost records.
+    for (0..8) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 4096, 4096, .{ .buf = buf }, .{});
+    // Pass 2 over the same eight: second touches — every one escalates (the
+    // clamp has no evidence yet); the 4-block tier evicts four of them
+    // protected and unserved: the waste the next roll reads.
+    for (0..8) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 8192, 4096, .{ .buf = buf }, .{});
+    try testing.expectEqual(esc0 + 8, admission.stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(@as(u64, 0), admission.stats.read_admission_governor_clamped.load());
+    g.roll(clock.monotonicNs() + g.epoch_ns);
+    try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
+    // Pass 3 over blocks 8..15: first touches — ranged (this epoch's
+    // foreground: 8 × 4 KiB = 32 KiB ⇒ next epoch's tokens = 5 % of that,
+    // less than one block). The roll carries no eviction evidence: the
+    // clamp STANDS (the flap the prev-epoch-only reading had).
+    for (8..16) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 4096, 4096, .{ .buf = buf }, .{});
+    g.roll(clock.monotonicNs() + 2 * g.epoch_ns);
+    try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
+    try testing.expect(g.tokensLeft() < Fixture.bs);
+    // Pass 4 over blocks 8..15: second touches under the engaged clamp — the
+    // governor DENIES every escalation and the reads stay ranged.
+    const demand_before = DmaLedger.snap().demand;
+    for (8..16) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 8192, 4096, .{ .buf = buf }, .{});
+    const l = DmaLedger.snap();
+    try testing.expectEqual(denials0 + 8, admission.stats.read_admission_governor_denials.load());
+    try testing.expectEqual(esc0 + 8, admission.stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(demand_before, l.demand);
+    // The whole storm: 32 reads × 4 KiB user; ranged 24 windows + 8 escalated blocks.
+    try testing.expectEqual(@as(u64, 24 * 4096), l.ranged - l0.ranged);
+    try testing.expectEqual(8 * Fixture.bs, l.demand - l0.demand);
 }
 
 /// The device-read ledger's two partitions of the read path's DMA bytes.

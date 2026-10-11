@@ -94,22 +94,31 @@ ADMISSION_ARMS = [
     "admit_write_accumulate_bytes", "admit_write_inline_bytes",
 ]
 # The read copy ledger (charter §6.3 `dest + bounce + dest_dma + zc_serve ≈ user
-# bytes`): the data plane's arms plus the transport's — on a zero-copy session a
-# READ the warm ladder cannot answer is served at the delivery CQE by the direct
-# device leg (`READ_FIXED(device fd → slot)`, counted `transport_zc_serve_bytes`)
-# and never reaches a handler lane (so `fuse_ops` does not move: the engagement
-# term for kernel-FUSE rows is `transport_ring_requests`).
-# `read_dest_lease_bytes` is the dest-lease MECHANISM's gauge over the same
-# bytes `read_dest_dma_bytes` lands (measured 1:1 on the shim read row) and is
-# reported beside, not summed; a shim read's bytes land through the data
-# plane's dest DMA into the arena, so `ipc_bytes_out` is not an arm either.
+# bytes`): the PARTITION of the user's bytes by how they reached the reply —
+# a daemon copy into the dest (`read_copy_dest_bytes`: every handler-side
+# serve, the warm ladder's included), a device DMA straight into the dest
+# (`read_dest_dma_bytes`: the lease and the raw full-block leg), the plane's
+# own zc leg, and the transport's direct device leg (`transport_zc_direct_leg_
+# serve_bytes`: served at the delivery CQE on a zero-copy session, never
+# reaching a handler lane — so `fuse_ops` does not move and the engagement
+# term for kernel-FUSE rows is `transport_ring_requests`). Each user byte in
+# exactly one arm. The warm/hot/hold/cache/fill-slice terms are SUBSETS of
+# `read_copy_dest_bytes` (reported beside: summing them double-counted every
+# tier serve — the first ledger's lists were pinned on direct-leg rows where
+# they read 0); `read_copy_bounce_bytes` is an intermediate pass (an NVMe-tier
+# copy into a serve slot, an over-capacity fill backing), not a user byte;
+# `transport_zc_serve_bytes` (direct leg + fd-source bridges) and
+# `transport_zc_bounce_bytes_bridged` say how a body reached the slot, not
+# whose bytes it was; `read_dest_lease_bytes` is the dest-lease MECHANISM's
+# gauge over bytes `read_dest_dma_bytes` lands; a shim read's bytes land
+# through the data plane into the arena, so `ipc_bytes_out` is not an arm.
 READ_COPY_ARMS = [
-    "read_copy_dest_bytes", "read_copy_bounce_bytes", "read_dest_dma_bytes",
-    "read_zc_serve_bytes", "read_copy_warm_serve_bytes", "read_copy_hot_serve_bytes",
-    "read_copy_hold_serve_bytes", "read_copy_cache_serve_bytes", "read_copy_fill_slice_bytes",
-    "transport_zc_serve_bytes", "transport_zc_bounce_bytes_bridged",
+    "read_copy_dest_bytes", "read_dest_dma_bytes", "read_zc_serve_bytes", "transport_zc_direct_leg_serve_bytes",
 ]
-READ_COPY_BESIDE = ["read_dest_lease_bytes", "ipc_bytes_out", "ipc_read_demote_bytes"]
+READ_COPY_BESIDE = ["read_copy_warm_serve_bytes", "read_copy_hot_serve_bytes", "read_copy_hold_serve_bytes",
+                    "read_copy_cache_serve_bytes", "read_copy_fill_slice_bytes", "read_copy_bounce_bytes",
+                    "transport_zc_serve_bytes", "transport_zc_bounce_bytes_bridged", "read_dest_lease_bytes",
+                    "ipc_bytes_out", "ipc_read_demote_bytes"]
 # The device-READ byte arms (decision 0003 §K — the read-amplification
 # ledger): every path that moves bytes OFF a data device, each byte in exactly
 # one arm, partitioned by PURPOSE so `device ÷ user` names its source. The
@@ -536,9 +545,18 @@ def leg(args):
     amp_stats = (device_read_stats / user_r) if user_r else None
     amp_disk = (disk_read / user_r) if (user_r and data_devs) else None
     bound = metrics.get("read_amp_bound")
+    excluded = [k for k in metrics.get("read_amp_exclude", []) if k in DEVICE_READ_ARMS]
     if kind == "data-read" and user_r and bound is not None:
-        ruler = amp_disk if (exclusive and amp_disk is not None) else amp_stats
-        ruler_name = "diskstats (exclusive namespaces)" if (exclusive and amp_disk is not None) else "stats arms"
+        if excluded:
+            # An arm another mechanism owns (the fold's seed images behind a
+            # read-after-write row) is taken out of the bounded ratio: only
+            # the daemon's arms can tell purposes apart.
+            ruler = (device_read_stats - sum(d[k] for k in excluded)) / user_r
+            ruler_name = "stats arms minus %s" % "+".join(excluded)
+        elif exclusive and amp_disk is not None:
+            ruler, ruler_name = amp_disk, "diskstats (exclusive namespaces)"
+        else:
+            ruler, ruler_name = amp_stats, "stats arms"
         verdicts.append(("read_amplification_bound", ruler <= bound,
                          "device ÷ user %.4f by %s (stats %.4f, diskstats %s) vs bound %.4f — %s; arms: %s" % (
                              ruler, ruler_name, amp_stats, ("%.4f" % amp_disk) if amp_disk is not None else "—", bound,
@@ -686,10 +704,10 @@ def markdown(rec):
     lines = []
     lines.append("### %s — %s" % (rec["row"], rec["verdict"]))
     lines.append("")
-    lines.append("instrument `%s` · substrate `%s` · venue `%s` · build `%s` · posture `%s` · mount `%s` · %s · %d legs × %s s (+%s s warm-up excluded) · order %s" % (
+    lines.append("instrument `%s` · substrate `%s` · venue `%s` · build `%s` · posture `%s` · format `%s` · mount `%s` · %s · %d legs × %s s (+%s s warm-up excluded) · order %s" % (
         h.get("instrument"), h.get("substrate_desc") or h.get("substrate"), h.get("venue_id"),
         (h.get("build_a") or {}).get("raw") if h.get("a_equals_b") else "A %s / B %s" % ((h.get("build_a") or {}).get("raw"), (h.get("build_b") or {}).get("raw")), h.get("posture"),
-        h.get("mount_opts") or "defaults", h.get("date"), len(legs), h.get("duration_s"), h.get("warmup_s"), "→".join(l["arm"] for l in legs)))
+        h.get("format_opts") or "defaults", h.get("mount_opts") or "defaults", h.get("date"), len(legs), h.get("duration_s"), h.get("warmup_s"), "→".join(l["arm"] for l in legs)))
     lines.append("")
     lines.append("| leg | arm | %s | p50 µs | p99 µs | device÷user (stats) | device÷user (diskstats data / meta) | wareq-sz B (stats / disk) | reclaim q+e=t | admission ×user | wire rpcs | tripwires | tick rescues | valid |" % hl["name"])
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
@@ -872,6 +890,8 @@ def summary(args):
         trip = sum(l["ledgers"]["must_stay_0"].get("invariant_tripwires", 0) for l in live)
         ticks = sum(sum(l["ledgers"]["tick_rescues"].values()) for l in live)
         opts = h.get("mount_opts") or "defaults"
+        if h.get("format_opts"):
+            opts = "%s; format %s" % (opts, h["format_opts"])
         if h.get("lever") == "posture":
             opts = "lever posture (A symmetric / B single-writer)"
         band = ("%.1f %%" % hl["noise_band_pct"]) if hl.get("noise_band_pct") is not None else "—"
@@ -896,7 +916,7 @@ def summary(args):
             return (sum(xs) / len(xs)) if xs else None
         bound = next((l["ledgers"].get("read_amp_bound") for l in legs if l["ledgers"].get("read_amp_bound") is not None), None)
         read_lines.append("| %s | %s | %s | %s / %s | %s / %s | %s | %s / %s | %s | `%s` |" % (
-            r["row"], h["substrate"], h.get("mount_opts") or "defaults",
+            r["row"], h["substrate"], (h.get("mount_opts") or "defaults") + (("; format " + h["format_opts"]) if h.get("format_opts") else ""),
             fmt(arm_avg("A", "device_div_user_read_stats")), fmt(arm_avg("A", "device_div_user_read_diskstats_data")),
             fmt(arm_avg("B", "device_div_user_read_stats")), fmt(arm_avg("B", "device_div_user_read_diskstats_data")),
             fmt(bound), fmt(arm_avg("A", "meta_node_bytes_per_record")), fmt(arm_avg("B", "meta_node_bytes_per_record")),

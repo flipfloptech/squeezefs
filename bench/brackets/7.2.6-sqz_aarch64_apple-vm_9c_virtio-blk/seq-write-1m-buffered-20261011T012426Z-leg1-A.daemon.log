@@ -1,0 +1,257 @@
+1791681866.365 info(squeezefs): mem_budget: cgroup cage 17179869184 B bound by /sys/fs/cgroup/memory.max
+1791681866.371 info(squeezefs): metadata device /dev/nvme0n1: O_DIRECT (grain 4096 B from statx(STATX_DIOALIGN), buffer alignment 4096 B) — every byte bypasses the host page cache
+1791681866.420 info(squeezefs): meta volume /dev/nvme0n1: writer claim committed and barriered (id 6d0a91d1a48d7d5e, pid 230998, mode flock+pr, pr key 7743171382e6dab4)
+1791681866.426 info(squeezefs): meta volume /dev/nvme0n1: appender 0 Live as the manager (term 1, node 0xb60598a56bfecf4a, mount slot 0); 0 other appender(s) live on the directory
+1791681866.428 info(squeezefs): meta volume /dev/nvme0n1: slot leases armed — M 64, A_max 262144 B, 65 leases held, T_idle 45000 ms, N_floor 17
+1791681866.430 info(squeezefs): meta volume /dev/nvme0n1: mounted — ledger seq 1, tail 0, replayed 0 entries (0 content records, 0 torn dropped, clean unmount), next_ino 2, 2 trees, 8059/8062 extents free, coalesced cadence, guard flock+pr
+1791681866.432 info(squeezefs): metadata set d0dcc750…: 1 member(s) mounted in canonical order as manager, epoch 1, 0 dual claim(s) converged, native keyspace on member 0
+1791681866.432 debug(squeezefs): NvmeBlockDev lane 0 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791681866.436 debug(squeezefs): NvmeBlockDev lane 0: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791681866.436 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791681866.436 debug(squeezefs): NvmeBlockDev lane 1 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791681866.437 debug(squeezefs): NvmeBlockDev lane 1: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791681866.437 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791681866.437 info(squeezefs): mount: set config
+  set config generation 1; block 4194304 B; chunk 4194304 B; capacity 12868124672 B (12272 MiB); compression none; encryption none
+  data volumes 2 (VOLUME_LIFECYCLE: the set has diverged from its birth state)
+    vol-40405b75b8223410 active /dev/nvme1n1 1534 blocks (6136 MiB) device 7fc11c71-6436-745b-ecf2-51e36414d659
+    vol-c3c56d7f433be163 active /dev/nvme2n1 1534 blocks (6136 MiB) device e3e53071-ceb1-7d07-de85-e63fd15600fb
+  cache-less (no disk cache paths)
+1791681866.437 debug(squeezefs): NvmeBlockDev lane 2 (/dev/nvme1n1): ring rung single_issuer+defer_taskrun
+1791681866.437 debug(squeezefs): NvmeBlockDev lane 2: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791681866.437 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791681866.437 info(squeezefs): data volume tag 40405b75b8223410: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791681866.438 info(squeezefs): data volume /dev/nvme1n1: vol-40405b75b8223410 bound as ordinal 0: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791681866.438 debug(squeezefs): NvmeBlockDev lane 3 (/dev/nvme2n1): ring rung single_issuer+defer_taskrun
+1791681866.438 debug(squeezefs): NvmeBlockDev lane 3: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791681866.438 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791681866.438 info(squeezefs): data volume tag c3c56d7f433be163: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791681866.438 info(squeezefs): data volume /dev/nvme2n1: vol-c3c56d7f433be163 bound as ordinal 1: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791681866.442 info(squeezefs): data plane: the set declares NO cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max (4096 B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)
+1791681866.707 info(squeezefs): data plane: 2 data volume(s), block 4194304 B, chunk 4194304 B, inline_max 4096 B, inline map cap 1364 entries, map chunk 512 ops, sweep threshold 32768 blocks, transform none/none, staging off, NVMe tier off, direct-store face pending the session
+1791681866.709 info(squeezefs): cluster wire: listening at 192.168.64.47:44243 (cap 144 connections)
+1791681866.710 info(squeezefs): cluster wire: manager of 1 volume(s) listening at 192.168.64.47:44243; membership owner term 1 (T_owner 45000 ms, grace closed)
+1791681866.711 info(squeezefs): data planes: the grant plane armed as the HOLDER of 2 data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)
+1791681866.717 info(squeezefs): job fabric: 0 job(s) adopted; 2 local worker(s), default throttle 100 %, verify 1000 ‰ (plaintext pins 1000), fleet jobs on; the admin lane on the listener
+1791681866.717 info(squeezefs): transport probe: kmbuf_ops=38/39
+1791681866.717 info(squeezefs): transport probe: RELEASE_PAYLOAD(commit_id=MAX) → -107 ⇒ retention present
+1791681866.717 info(squeezefs): kv_fs: FUSE 7.36; KILLPRIV_V2 negotiated; inline_max 4096 B; block 4194304 B; data volumes yes; staging off
+1791681866.717 info(squeezefs): transport: INIT 7.45 → 7.36: flags 0x4000020050c4e829 (over_io_uring=true, time_limits=true), max_write 1048576, max_pages 256, max_background 288, queues 9 × depth 32, payload 1048576 B, 9 drain group(s) (width 1), buffer mode zero_copy (kmbuf 38, retention present)
+1791681866.765 info(squeezefs): transport: group 0 (qids 0..0, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.768 info(squeezefs): transport: group 1 (qids 1..1, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.772 info(squeezefs): transport: group 2 (qids 2..2, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.785 info(squeezefs): transport: group 3 (qids 3..3, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.790 info(squeezefs): transport: group 4 (qids 4..4, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.794 info(squeezefs): transport: group 5 (qids 5..5, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.799 info(squeezefs): transport: group 6 (qids 6..6, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.804 info(squeezefs): transport: group 7 (qids 7..7, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.808 info(squeezefs): transport: group 8 (qids 8..8, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791681866.808 info(squeezefs): transport: FUSE-over-io_uring transport armed at /build/tmp/enospc-ab-buffered/mnt: 9 queue(s) × 32 ent(s) over 9 worker(s), zero_copy
+1791681866.808 info(squeezefs): data plane: session armed — held-slot direct store ON, direct device leg ON, fd-source probe serve ON
+1791681866.809 info(squeezefs): ready: sqmeta:///dev/nvme0n1 mounted at /build/tmp/enospc-ab-buffered/mnt (pid 230998; 9 queue(s) × depth 32; budget 6144 MiB; TTLs attr 1000 ms entry 1000 ms dir_entry 1000 ms negative 1000 ms)
+1791681868.486 debug(squeezefs): checkpoint tail 2162232 < head 8302808: inflight 18446744073709551615, dying floors 2162232, dirty node floor 8302808
+1791681869.538 debug(squeezefs): checkpoint tail 8302808 < head 15510248: inflight 18446744073709551615, dying floors 8302808, dirty node floor 15518392
+1791681870.569 debug(squeezefs): checkpoint tail 15518392 < head 22363424: inflight 18446744073709551615, dying floors 15518392, dirty node floor 22379712
+1791681871.589 debug(squeezefs): checkpoint tail 22379712 < head 25726896: inflight 18446744073709551615, dying floors 22379712, dirty node floor 25730968
+1791681872.627 debug(squeezefs): checkpoint tail 25730968 < head 30100224: inflight 30136872, dying floors 25730968, dirty node floor 30100224
+1791681873.686 debug(squeezefs): checkpoint tail 30100224 < head 35768448: inflight 35809168, dying floors 30100224, dirty node floor 35768448
+1791681874.729 debug(squeezefs): checkpoint tail 35768448 < head 39868952: inflight 39970752, dying floors 35768448, dirty node floor 39868952
+1791681875.758 debug(squeezefs): checkpoint tail 39868952 < head 45358008: inflight 18446744073709551615, dying floors 39868952, dirty node floor 45358008
+1791681876.803 debug(squeezefs): checkpoint tail 45358008 < head 49820920: inflight 49820920, dying floors 45358008, dirty node floor 49820920
+1791681877.836 debug(squeezefs): checkpoint tail 49824992 < head 53587520: inflight 18446744073709551615, dying floors 49824992, dirty node floor 53587520
+1791681878.996 debug(squeezefs): checkpoint tail 53587520 < head 56075512: inflight 18446744073709551615, dying floors 53587520, dirty node floor 56075512
+1791681880.086 debug(squeezefs): checkpoint tail 56075512 < head 61743736: inflight 61743736, dying floors 56075512, dirty node floor 61743736
+1791681881.155 debug(squeezefs): checkpoint tail 61743736 < head 67359024: inflight 18446744073709551615, dying floors 61743736, dirty node floor 67379384
+1791681884.266 debug(squeezefs): checkpoint tail 67481184 < head 69891808: inflight 18446744073709551615, dying floors 67481184, dirty node floor 69895880
+1791681885.325 debug(squeezefs): checkpoint tail 69895880 < head 78500016: inflight 18446744073709551615, dying floors 69895880, dirty node floor 78504088
+1791681886.423 debug(squeezefs): checkpoint tail 78504088 < head 86114656: inflight 18446744073709551615, dying floors 78504088, dirty node floor 86114656
+1791681887.459 debug(squeezefs): checkpoint tail 86114656 < head 93419824: inflight 18446744073709551615, dying floors 86114656, dirty node floor 93419824
+1791681888.518 debug(squeezefs): checkpoint tail 93419824 < head 98615696: inflight 98631984, dying floors 93419824, dirty node floor 98615696
+1791681889.560 debug(squeezefs): checkpoint tail 98615696 < head 103974448: inflight 18446744073709551615, dying floors 98615696, dirty node floor 103982592
+1791681890.629 debug(squeezefs): checkpoint tail 103982592 < head 112423848: inflight 112525648, dying floors 103982592, dirty node floor 112427920
+1791681891.655 debug(squeezefs): checkpoint tail 112427920 < head 120881392: inflight 18446744073709551615, dying floors 112427920, dirty node floor 120885464
+1791681892.708 debug(squeezefs): checkpoint tail 120885464 < head 127820080: inflight 18446744073709551615, dying floors 120885464, dirty node floor 127820080
+1791681893.762 debug(squeezefs): checkpoint tail 127820080 < head 137230472: inflight 137242688, dying floors 127820080, dirty node floor 137234544
+1791681893.820 debug(squeezefs): checkpoint tail 137234544 < head 137837200: inflight 137865704, dying floors 137234544, dirty node floor 137837200
+1791681894.869 debug(squeezefs): checkpoint tail 137837200 < head 146571640: inflight 18446744073709551615, dying floors 137837200, dirty node floor 146571758
+1791681895.879 debug(squeezefs): checkpoint tail 146571758 < head 154060048: inflight 18446744073709551615, dying floors 146571758, dirty node floor 154060048
+1791681896.931 debug(squeezefs): checkpoint tail 154060048 < head 159911512: inflight 159992952, dying floors 154060048, dirty node floor 159952232
+1791681897.966 debug(squeezefs): checkpoint tail 159952232 < head 167391776: inflight 18446744073709551615, dying floors 159952232, dirty node floor 167391776
+1791681898.996 debug(squeezefs): checkpoint tail 167391776 < head 176126216: inflight 18446744073709551615, dying floors 167391776, dirty node floor 176142504
+1791681900.017 debug(squeezefs): checkpoint tail 176142504 < head 184270216: inflight 18446744073709551615, dying floors 176142504, dirty node floor 184282432
+1791681901.026 debug(squeezefs): checkpoint tail 184282432 < head 193265264: inflight 18446744073709551615, dying floors 184282432, dirty node floor 193265382
+1791681902.018 debug(squeezefs): checkpoint tail 193265382 < head 201046856: inflight 18446744073709551615, dying floors 193265382, dirty node floor 201071288
+1791681903.056 debug(squeezefs): checkpoint tail 201071288 < head 210066336: inflight 18446744073709551615, dying floors 201071288, dirty node floor 210086696
+1791681904.081 debug(squeezefs): checkpoint tail 210086696 < head 217717624: inflight 217758344, dying floors 210086696, dirty node floor 217721696
+1791681905.108 debug(squeezefs): checkpoint tail 217725886 < head 224884344: inflight 18446744073709551615, dying floors 217725886, dirty node floor 18446744073709551615
+1791681906.148 debug(squeezefs): checkpoint tail 224888416 < head 229107008: inflight 18446744073709551615, dying floors 224888416, dirty node floor 18446744073709551615
+1791681906.483 error(squeezefs): write ino 4398046511106 block 155: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681906.483 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2002 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681906.488 error(squeezefs): write ino 5497558138882 block 164: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681906.488 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681906.495 error(squeezefs): write ino 6597069766658 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2006 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681906.495 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681907.843 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2017 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681908.229 debug(squeezefs): checkpoint tail 229111080 < head 230426336: inflight 18446744073709551615, dying floors 229111080, dirty node floor 18446744073709551615
+1791681908.486 error(squeezefs): write ino 4398046511106 block 155: the parked-buffer gate's cold flushes have been refused by the plane for 2002 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681908.486 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681908.497 error(squeezefs): write ino 5497558138882 block 164: the parked-buffer gate's cold flushes have been refused by the plane for 2008 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681908.497 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2009 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681908.498 error(squeezefs): write ino 6597069766658 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681908.498 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681909.272 debug(squeezefs): checkpoint tail 230426336 < head 236147496: inflight 18446744073709551615, dying floors 230426336, dirty node floor 236147496
+1791681910.281 debug(squeezefs): checkpoint tail 236147496 < head 239519112: inflight 18446744073709551615, dying floors 236147496, dirty node floor 18446744073709551615
+1791681910.492 error(squeezefs): write ino 4398046511106 block 155: the parked-buffer gate's cold flushes have been refused by the plane for 2005 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681910.493 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2005 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681910.499 error(squeezefs): write ino 6597069766658 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681910.499 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2000 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681910.503 error(squeezefs): write ino 5497558138882 block 164: the parked-buffer gate's cold flushes have been refused by the plane for 2004 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681910.503 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2005 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681911.769 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2009 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681912.323 debug(squeezefs): checkpoint tail 239519112 < head 242214776: inflight 18446744073709551615, dying floors 239519112, dirty node floor 18446744073709551615
+1791681912.499 error(squeezefs): write ino 4398046511106 block 155: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681912.499 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2004 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681912.501 error(squeezefs): write ino 6597069766658 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681912.501 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2000 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681912.507 error(squeezefs): write ino 5497558138882 block 164: the parked-buffer gate's cold flushes have been refused by the plane for 2002 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681912.507 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2002 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681913.369 debug(squeezefs): checkpoint tail 242214776 < head 247821920: inflight 18446744073709551615, dying floors 242214776, dirty node floor 247821920
+1791681914.413 debug(squeezefs): checkpoint tail 247821920 < head 250586808: inflight 18446744073709551615, dying floors 247821920, dirty node floor 18446744073709551615
+1791681914.503 error(squeezefs): write ino 4398046511106 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681914.503 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681914.506 error(squeezefs): write ino 6597069766658 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681914.506 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2004 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681914.509 error(squeezefs): write ino 5497558138882 block 165: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681914.509 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2000 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681915.815 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2008 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681916.488 debug(squeezefs): checkpoint tail 250586808 < head 253933992: inflight 18446744073709551615, dying floors 250586808, dirty node floor 253933992
+1791681916.509 error(squeezefs): write ino 6597069766658 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681916.509 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2000 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681916.510 error(squeezefs): write ino 4398046511106 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681916.510 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2004 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681916.512 error(squeezefs): write ino 5497558138882 block 165: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681916.512 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681917.515 debug(squeezefs): checkpoint tail 253933992 < head 259728448: inflight 18446744073709551615, dying floors 253933992, dirty node floor 18446744073709551615
+1791681918.519 error(squeezefs): write ino 4398046511106 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2008 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681918.519 error(squeezefs): write ino 6597069766658 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2009 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681918.519 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2008 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681918.519 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2010 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681918.523 error(squeezefs): write ino 5497558138882 block 165: the parked-buffer gate's cold flushes have been refused by the plane for 2010 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681918.524 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2011 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681918.530 debug(squeezefs): checkpoint tail 259732520 < head 261556776: inflight 18446744073709551615, dying floors 259732520, dirty node floor 18446744073709551615
+1791681919.825 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2012 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681920.523 error(squeezefs): write ino 6597069766658 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681920.523 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681920.525 error(squeezefs): write ino 4398046511106 block 156: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681920.525 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681920.527 error(squeezefs): write ino 5497558138882 block 165: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681920.527 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681920.640 debug(squeezefs): checkpoint tail 261556776 < head 265360024: inflight 18446744073709551615, dying floors 261556776, dirty node floor 18446744073709551615
+1791681921.667 debug(squeezefs): checkpoint tail 265360024 < head 271761208: inflight 18446744073709551615, dying floors 265360024, dirty node floor 271761208
+1791681922.529 error(squeezefs): write ino 6597069766658 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2004 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681922.529 error(squeezefs): write ino 5497558138882 block 166: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681922.529 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2005 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681922.529 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681922.532 error(squeezefs): write ino 4398046511106 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2005 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681922.532 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2006 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681922.705 debug(squeezefs): checkpoint tail 271761208 < head 272327216: inflight 18446744073709551615, dying floors 271761208, dirty node floor 18446744073709551615
+1791681923.746 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681924.535 error(squeezefs): write ino 4398046511106 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681924.535 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2000 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681924.537 error(squeezefs): write ino 6597069766658 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681924.537 error(squeezefs): write ino 5497558138882 block 166: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681924.537 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2004 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681924.537 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2004 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681924.788 debug(squeezefs): checkpoint tail 272331288 < head 277519016: inflight 18446744073709551615, dying floors 272331288, dirty node floor 277519016
+1791681925.810 debug(squeezefs): checkpoint tail 277519016 < head 283517072: inflight 18446744073709551615, dying floors 277519016, dirty node floor 283517072
+1791681926.541 error(squeezefs): write ino 5497558138882 block 166: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681926.541 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681926.545 error(squeezefs): write ino 4398046511106 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2008 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681926.545 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2009 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681926.546 error(squeezefs): write ino 6597069766658 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2008 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681926.546 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2008 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681926.836 debug(squeezefs): checkpoint tail 283517072 < head 284771248: inflight 18446744073709551615, dying floors 283517072, dirty node floor 18446744073709551615
+1791681928.032 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681928.546 error(squeezefs): write ino 5497558138882 block 166: the parked-buffer gate's cold flushes have been refused by the plane for 2002 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681928.546 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681928.548 error(squeezefs): write ino 4398046511106 block 157: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681928.548 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2000 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681928.550 error(squeezefs): write ino 6597069766658 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681928.550 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681928.928 debug(squeezefs): checkpoint tail 284771248 < head 288953192: inflight 18446744073709551615, dying floors 284771248, dirty node floor 288953192
+1791681929.984 debug(squeezefs): checkpoint tail 288953192 < head 294556264: inflight 18446744073709551615, dying floors 288953192, dirty node floor 18446744073709551615
+1791681930.556 error(squeezefs): write ino 4398046511106 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2006 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681930.556 error(squeezefs): write ino 5497558138882 block 167: the parked-buffer gate's cold flushes have been refused by the plane for 2008 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681930.556 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681930.556 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2009 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681930.557 error(squeezefs): write ino 6597069766658 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2006 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681930.557 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681931.811 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2023 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681932.562 error(squeezefs): write ino 6597069766658 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681932.562 error(squeezefs): write ino 5497558138882 block 167: the parked-buffer gate's cold flushes have been refused by the plane for 2002 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681932.562 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2002 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681932.562 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681932.564 error(squeezefs): write ino 4398046511106 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2004 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681932.565 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2005 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681933.097 debug(squeezefs): checkpoint tail 295350304 < head 301067392: inflight 18446744073709551615, dying floors 295350304, dirty node floor 301067392
+1791681934.158 debug(squeezefs): checkpoint tail 301067392 < head 305851992: inflight 18446744073709551615, dying floors 301067392, dirty node floor 18446744073709551615
+1791681934.569 error(squeezefs): write ino 6597069766658 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2006 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681934.569 error(squeezefs): write ino 5497558138882 block 167: the parked-buffer gate's cold flushes have been refused by the plane for 2006 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681934.569 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2006 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681934.569 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2006 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681934.570 error(squeezefs): write ino 4398046511106 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2004 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681934.570 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2005 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681935.814 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2008 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681936.250 debug(squeezefs): checkpoint tail 305851992 < head 307651816: inflight 18446744073709551615, dying floors 305851992, dirty node floor 307651816
+1791681936.573 error(squeezefs): write ino 4398046511106 block 158: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681936.573 error(squeezefs): write ino 5497558138882 block 167: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681936.573 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681936.573 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2002 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681936.574 error(squeezefs): write ino 6597069766658 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2002 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681936.574 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681937.265 debug(squeezefs): checkpoint tail 307651816 < head 313548072: inflight 18446744073709551615, dying floors 307651816, dirty node floor 313548072
+1791681938.316 debug(squeezefs): checkpoint tail 313548072 < head 317216944: inflight 18446744073709551615, dying floors 313548072, dirty node floor 18446744073709551615
+1791681938.575 error(squeezefs): write ino 5497558138882 block 168: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681938.575 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681938.578 error(squeezefs): write ino 6597069766658 block 160: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681938.578 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2003 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681938.586 error(squeezefs): write ino 4398046511106 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2009 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681938.586 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2012 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681939.823 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2012 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681940.422 debug(squeezefs): checkpoint tail 317216944 < head 320034768: inflight 18446744073709551615, dying floors 317216944, dirty node floor 320034768
+1791681940.581 error(squeezefs): write ino 6597069766658 block 160: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681940.581 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681940.582 error(squeezefs): write ino 5497558138882 block 168: the parked-buffer gate's cold flushes have been refused by the plane for 2003 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681940.582 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2004 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681940.590 error(squeezefs): write ino 4398046511106 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681940.590 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681941.458 debug(squeezefs): checkpoint tail 320034768 < head 326142768: inflight 18446744073709551615, dying floors 320034768, dirty node floor 326142768
+1791681942.480 debug(squeezefs): checkpoint tail 326142768 < head 328512672: inflight 18446744073709551615, dying floors 326142768, dirty node floor 18446744073709551615
+1791681942.583 error(squeezefs): write ino 6597069766658 block 160: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681942.583 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2002 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681942.595 error(squeezefs): write ino 5497558138882 block 168: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681942.595 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2012 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681942.598 error(squeezefs): write ino 4398046511106 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2007 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681942.598 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2007 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681943.865 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2016 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681944.538 debug(squeezefs): checkpoint tail 328512672 < head 328537104: inflight 18446744073709551615, dying floors 328512672, dirty node floor 18446744073709551615
+1791681944.586 error(squeezefs): write ino 6597069766658 block 160: the parked-buffer gate's cold flushes have been refused by the plane for 2000 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681944.586 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2001 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681944.602 error(squeezefs): write ino 4398046511106 block 159: the parked-buffer gate's cold flushes have been refused by the plane for 2001 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681944.602 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2002 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681944.603 error(squeezefs): write ino 5497558138882 block 168: the parked-buffer gate's cold flushes have been refused by the plane for 2004 ms (wall 1000 ms; 256 parked, 1073741824 B) — answering ENOSPC; the plane is broken, not slow
+1791681944.603 error(squeezefs): transport: a FUSE_WRITE payload lease lived 2005 ms (≥ 1 s) — counted transport_lease_overlong, never a panic; a genuine escape shows as unbounded ages plus a growing parked-commit gap
+1791681946.141 info(squeezefs): stop requested (SIGTERM/SIGINT): unmounting /build/tmp/enospc-ab-buffered/mnt
+1791681946.141 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.141 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.141 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.142 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.142 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.142 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.142 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.142 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.142 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791681946.190 info(squeezefs): teardown: session closed; open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0
+1791681946.588 info(squeezefs): data volume /dev/nvme1n1: dismount teardown completed; further DMA refused (EROFS class)
+1791681946.588 info(squeezefs): data volume /dev/nvme2n1: dismount teardown completed; further DMA refused (EROFS class)
+1791681948.496 info(squeezefs): meta volume /dev/nvme0n1: clean unmount (checkpoint seq 83, tail 328553392, head 328553392, healthy)

@@ -137,6 +137,7 @@ src/data/nvme_read_cache.zig:521 | 4096 | OWED: derive it or document it on the 
 src/data/pack.zig:280 | 1000 | OWED: derive it or document it on the line (charter §1.5)
 src/data/plane.zig:1688 | 256 | OWED: derive it or document it on the line (charter §1.5)
 src/data/plane.zig:1700 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/data/plane.zig:1713 | 256 | OWED: derive it or document it on the line (charter §1.5)
 src/data/prefetch.zig:223 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:223 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:470 | 16 | OWED: derive it or document it on the line (charter §1.5)
@@ -156,6 +157,8 @@ src/data/set_config.zig:236 | 8 | OWED: derive it or document it on the line (ch
 src/data/set_config.zig:390 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/data/staging.zig:1090 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/data/staging.zig:1188 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/data/staging.zig:1305 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/data/staging.zig:1399 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/alloc_lease.zig:603 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/alloc_lease.zig:604 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/sym_planes/block_grant.zig:116 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
@@ -225,7 +228,7 @@ src/fuse/handler/kv_fs.zig:1853 | 3 | OWED: derive it or document it on the line
 src/fuse/handler/kv_fs.zig:1856 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/kv_fs.zig:1869 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/kv_fs.zig:2020 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2729 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2758 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/op_trace.zig:279 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/mount_options.zig:265 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/mount_options.zig:266 | 10 | OWED: derive it or document it on the line (charter §1.5)

@@ -219,7 +219,8 @@ roll from the finishing epoch's own eviction evidence (no evictions ⇒ it stand
 additive-increase ladder, pays back in the device bytes a hit avoided; gauge
 `read_admission_governor_share_pct`.
 
-Second root cause, found on the ReleaseSafe A/B (B 9.94× whole-run on the 60 s probe): read at
+Second root cause, found on the ReleaseSafe A/B (B 9.94× whole-run on the 60 s
+`scripts/bracket/read-probe.sh` storm): read at
 the roll alone, a storm's ONSET escalated at device bandwidth for a whole 2 s epoch before the
 first verdict — 1.37 GB of whole blocks, 30 % of the foreground. Red: the same two tests flipped
 to the stronger law (engaged inside the epoch after the 6th escalation of pass 2; the 7th and 8th

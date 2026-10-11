@@ -168,6 +168,24 @@ pub const stats = struct {
     pub var read_zc_pool_serve_warm_bytes: counters.ShardedCounter = .{};
     pub var read_fill_dma_bytes: counters.ShardedCounter = .{};
     pub var read_user_bytes: counters.ShardedCounter = .{};
+    // The device-read ledger (decision 0003 §K): every byte a READ-side DMA
+    // moves off a data device, partitioned by PURPOSE so `device ÷ user`
+    // names its source. The WHERE partition above (`read_fill_dma_bytes`
+    // pooled + `read_dest_dma_bytes` registered) sums to the same total:
+    // `Σ read_dma_* ≡ read_fill_dma_bytes + read_dest_dma_bytes`.
+    /// Ranged windows (direct into the dest or bounced), device-true included.
+    pub var read_dma_ranged_bytes: counters.ShardedCounter = .{};
+    /// Whole-block passthrough fills a reader waits for (demand, demand
+    /// stream, escalation, device-true, the settle, the raw full-block leg).
+    pub var read_dma_block_demand_bytes: counters.ShardedCounter = .{};
+    /// Whole-block passthrough fills the prefetch pipeline issued.
+    pub var read_dma_block_prefetch_bytes: counters.ShardedCounter = .{};
+    /// Whole-block passthrough fills the ahead lane issued.
+    pub var read_dma_block_lane_bytes: counters.ShardedCounter = .{};
+    /// The stored image of a transformed block (`chunk` bytes per fill, any class).
+    pub var read_dma_image_bytes: counters.ShardedCounter = .{};
+    /// The ranged mapping window of a packed tenant / staged durable copy.
+    pub var read_dma_window_bytes: counters.ShardedCounter = .{};
     // Phase families (exact-sum, span form).
     pub var read_serve_total_ns: counters.ShardedLatencyHistogram = .{};
     pub var read_fill_fetch_dma_ns: counters.ShardedLatencyHistogram = .{};
@@ -215,6 +233,14 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
         stats.read_zc_pool_serve_warm_bytes.load(),
         stats.read_fill_dma_bytes.load(),
         stats.read_user_bytes.load(),
+    });
+    try w.print("\"read_dma_ranged_bytes\":{d},\"read_dma_block_demand_bytes\":{d},\"read_dma_block_prefetch_bytes\":{d},\"read_dma_block_lane_bytes\":{d},\"read_dma_image_bytes\":{d},\"read_dma_window_bytes\":{d},", .{
+        stats.read_dma_ranged_bytes.load(),
+        stats.read_dma_block_demand_bytes.load(),
+        stats.read_dma_block_prefetch_bytes.load(),
+        stats.read_dma_block_lane_bytes.load(),
+        stats.read_dma_image_bytes.load(),
+        stats.read_dma_window_bytes.load(),
     });
     try w.writeAll("\"read_serve_phase_ns\":{\"total\":");
     try stats.read_serve_total_ns.snapshot().writeJson(w);
@@ -923,7 +949,10 @@ pub const ReadPath = struct {
         // The window into a bounce (≤ 64 KiB slab, else the fill pool), then the slice.
         const b = try self.acquireBounce(w.len);
         defer self.releaseBounce(b);
-        if (try self.vols.read_range(self.vols.ctx, w.vol_tag, w.device_off, b.bytes[0..@intCast(w.len)], .pooled) == .dma) stats.read_fill_dma_bytes.add(w.len);
+        if (try self.vols.read_range(self.vols.ctx, w.vol_tag, w.device_off, b.bytes[0..@intCast(w.len)], .pooled) == .dma) {
+            stats.read_fill_dma_bytes.add(w.len);
+            stats.read_dma_window_bytes.add(w.len);
+        }
         if (!self.still(key, before)) return error.InputOutput;
         @memcpy(out[0..got], b.bytes[w.lo..w.hi]);
         @memset(out[got..], 0);
@@ -1092,7 +1121,10 @@ pub const ReadPath = struct {
         if (key != null and dest.registered and rel_s == 0 and slice_len == bs and self.cfg.passthrough and dest.aligned()) {
             const before = self.fillIncarnation(key.?);
             if (before != null) {
-                if (try self.vols.read_range(self.vols.ctx, key.?.vol_tag, key.?.offset, out, .registered) == .dma) stats.read_dest_dma_bytes.add(bs);
+                if (try self.vols.read_range(self.vols.ctx, key.?.vol_tag, key.?.offset, out, .registered) == .dma) {
+                    stats.read_dest_dma_bytes.add(bs);
+                    stats.read_dma_block_demand_bytes.add(bs);
+                }
                 if (self.still(key.?, before.?) and self.bindingIs(ino, b, key.?)) {
                     if (!device_true and self.cfg.read_lane) self.hold.credit(key.?, bs);
                     return;
@@ -1166,14 +1198,20 @@ pub const ReadPath = struct {
             self.adm.governor.noteForeground(win.len(), clock.monotonicNs());
             if (win.bounced(req_len)) stats.ranged_read_unaligned_bounces.inc();
             if (direct) {
-                if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, out, .registered) == .dma) stats.read_dest_dma_bytes.add(win.len());
+                if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, out, .registered) == .dma) {
+                    stats.read_dest_dma_bytes.add(win.len());
+                    stats.read_dma_ranged_bytes.add(win.len());
+                }
             }
             var bounce: ?Bounce = null;
             defer if (bounce) |bb| self.releaseBounce(bb);
             if (!direct) {
                 const bb = try self.acquireBounce(win.len());
                 bounce = bb;
-                if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, bb.bytes[0..@intCast(win.len())], .pooled) == .dma) stats.read_fill_dma_bytes.add(win.len());
+                if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + win.aligned_start, bb.bytes[0..@intCast(win.len())], .pooled) == .dma) {
+                    stats.read_fill_dma_bytes.add(win.len());
+                    stats.read_dma_ranged_bytes.add(win.len());
+                }
             }
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, k);
             // Bytes in hand FIRST, then the two checks.
@@ -1273,7 +1311,7 @@ pub const ReadPath = struct {
     fn fetchBlockDeviceTrue(self: *ReadPath, key: BlockKey) Error!Block {
         var pc = PhaseClock.start();
         const before = self.fillIncarnation(key);
-        var blk = try self.fetchIntoFresh(key, &pc);
+        var blk = try self.fetchIntoFresh(key, .demand, &pc);
         blk.serve_valid = if (before) |bf| self.still(key, bf) else false;
         pc.mark(&stats.read_fill_admission_ns);
         pc.mark(&stats.read_fill_deposit_ns);
@@ -1283,8 +1321,9 @@ pub const ReadPath = struct {
 
     /// DMA (and decode) a whole block into a fresh pool slot — or an
     /// over-capacity bounce the tiers never adopt. Phases on the caller's
-    /// clock (span form).
-    fn fetchIntoFresh(self: *ReadPath, key: BlockKey, pc: *PhaseClock) Error!Block {
+    /// clock (span form); the device bytes land in the ledger arm `class`
+    /// names (a transformed image is its own arm whatever the class).
+    fn fetchIntoFresh(self: *ReadPath, key: BlockKey, class: FillClass, pc: *PhaseClock) Error!Block {
         const bs: usize = @intCast(self.cfg.block_size);
         var blk: Block = if (self.pool.acquire()) |slot| .{ .where = .pool, .slot = slot, .len = @intCast(bs), .serve_valid = false } else blk: {
             const b = self.gpa.alignedAlloc(u8, .fromByteUnits(fill_pool.SLOT_ALIGN), self.pool.slot_size) catch return error.OutOfMemory;
@@ -1301,7 +1340,10 @@ pub const ReadPath = struct {
             // The stored image into a second slot, decoded into the target.
             const img = try self.acquireBounce(d.chunk);
             defer self.releaseBounce(img);
-            if (try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, img.bytes[0..@intCast(d.chunk)], .pooled) == .dma) stats.read_fill_dma_bytes.add(d.chunk);
+            if (try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, img.bytes[0..@intCast(d.chunk)], .pooled) == .dma) {
+                stats.read_fill_dma_bytes.add(d.chunk);
+                stats.read_dma_image_bytes.add(d.chunk);
+            }
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, key);
             pc.mark(&stats.read_fill_fetch_dma_ns);
             const view = d.decode(d.ctx, img.bytes[0..@intCast(d.chunk)], target) catch return error.InputOutput;
@@ -1309,7 +1351,14 @@ pub const ReadPath = struct {
             blk.len = @intCast(view.len);
             pc.mark(&stats.read_fill_decode_ns);
         } else {
-            if (try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, target[0..bs], .pooled) == .dma) stats.read_fill_dma_bytes.add(bs);
+            if (try self.vols.read_range(self.vols.ctx, key.vol_tag, key.offset, target[0..bs], .pooled) == .dma) {
+                stats.read_fill_dma_bytes.add(bs);
+                (switch (class) {
+                    .prefetch => &stats.read_dma_block_prefetch_bytes,
+                    .lane => &stats.read_dma_block_lane_bytes,
+                    .demand, .demand_stream, .escalation => &stats.read_dma_block_demand_bytes,
+                }).add(bs);
+            }
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, key);
             pc.mark(&stats.read_fill_fetch_dma_ns);
             pc.mark(&stats.read_fill_decode_ns);
@@ -1398,10 +1447,14 @@ pub const ReadPath = struct {
         stats.cache_misses.inc();
         var pc = PhaseClock.start();
         const before = self.fillIncarnation(key);
-        var blk = self.fetchIntoFresh(key, &pc) catch |e| {
+        var blk = self.fetchIntoFresh(key, class, &pc) catch |e| {
             g.fail(io);
             return e;
         };
+        if (class == .lane) {
+            prefetch.stats.read_lane_fetches.inc();
+            prefetch.stats.read_lane_fetch_bytes.add(blk.len);
+        }
         const is_tracked = self.tracked(key);
         var serve_valid = !is_tracked;
         var publishable: ?u64 = null;
@@ -1419,8 +1472,11 @@ pub const ReadPath = struct {
             pc.mark(&stats.read_fill_admission_ns);
             const lvl = self.level();
             const freeze = lvl != .green;
+            // The hold: demand primaries deposit ledger-visible (the serve
+            // ceremony stands in for the refetch), the lane's fetch
+            // ledger-INVISIBLE (`insert_validated`); prefetch never.
             if (self.cfg.read_lane and class != .prefetch and !rsc.isSmallFill(len) and lvl != .red) {
-                _ = self.hold.insert(key, blk.slot, blk.len, true, validate);
+                _ = self.hold.insert(key, blk.slot, blk.len, class != .lane, validate);
             }
             if (rsc.isSmallFill(len)) {
                 _ = self.lru.putValidated(key, blk.bytes(self), validate, freeze);
@@ -1546,7 +1602,7 @@ pub const ReadPath = struct {
     fn envIssueLane(ctx: *anyopaque, _: u8, _: u32, block: u64) bool {
         const c: *EnvCtx = @ptrCast(@alignCast(ctx));
         const is = c.rp.issuer orelse return false;
-        return is.issue(is.ctx, c.ino, block, .demand_stream);
+        return is.issue(is.ctx, c.ino, block, .lane);
     }
 
     /// The non-serving warmer the prefetch/lane tasks run: a fill whose
@@ -1878,6 +1934,94 @@ test "the ranged-vs-whole decision table: a random 4 KiB cold read on a passthro
     try testing.expect(!rangedEligible(262144, 4096, 1 << 22, true, true));
     try testing.expect(!rangedEligible(262144, 4096, 262144, true, false));
     try testing.expect(rangedEligible(262144, 262144, 1 << 22, true, false));
+}
+
+/// The device-read ledger's two partitions of the read path's DMA bytes.
+const DmaLedger = struct {
+    ranged: u64,
+    demand: u64,
+    prefetch_: u64,
+    lane: u64,
+    image: u64,
+    window: u64,
+    pooled: u64,
+    registered: u64,
+
+    fn snap() DmaLedger {
+        return .{
+            .ranged = stats.read_dma_ranged_bytes.load(),
+            .demand = stats.read_dma_block_demand_bytes.load(),
+            .prefetch_ = stats.read_dma_block_prefetch_bytes.load(),
+            .lane = stats.read_dma_block_lane_bytes.load(),
+            .image = stats.read_dma_image_bytes.load(),
+            .window = stats.read_dma_window_bytes.load(),
+            .pooled = stats.read_fill_dma_bytes.load(),
+            .registered = stats.read_dest_dma_bytes.load(),
+        };
+    }
+
+    fn purposeSum(self: DmaLedger) u64 {
+        return self.ranged + self.demand + self.prefetch_ + self.lane + self.image + self.window;
+    }
+
+    fn whereSum(self: DmaLedger) u64 {
+        return self.pooled + self.registered;
+    }
+};
+
+test "the device-read ledger: every READ-side DMA byte lands in exactly one PURPOSE arm (ranged / demand block / prefetch block / lane block / image / window), the purpose arms sum to the WHERE arms (pooled + registered) and to the device's own count; a hit moves no arm" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{});
+    defer f.deinit();
+    f.size = 4 * Fixture.bs;
+    f.bind(0, 1);
+    f.bind(1, 2);
+    f.bind(2, 6);
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    const l0 = DmaLedger.snap();
+    const dev0 = f.device_read_bytes.load(.monotonic);
+    // A cold whole-block read: one demand block.
+    _ = try f.rp.read(io, 7, 0, Fixture.bs, .{ .buf = buf }, .{});
+    var l = DmaLedger.snap();
+    try testing.expectEqual(Fixture.bs, l.demand - l0.demand);
+    try testing.expectEqual(@as(u64, 0), (l.ranged - l0.ranged) + (l.prefetch_ - l0.prefetch_) + (l.lane - l0.lane) + (l.image - l0.image) + (l.window - l0.window));
+    // The hot hit moves nothing.
+    _ = try f.rp.read(io, 7, 4096, 4096, .{ .buf = buf[0..4096] }, .{});
+    try testing.expectEqual(l.purposeSum(), DmaLedger.snap().purposeSum());
+    // A cold 4 KiB read of another block: a ranged window, lease and bounce alike.
+    _ = try f.rp.read(io, 7, Fixture.bs + 8192, 4096, .{ .buf = buf[0..4096], .registered = true }, .{});
+    _ = try f.rp.read(io, 7, Fixture.bs + 100, 50, .{ .buf = buf[0..50] }, .{});
+    l = DmaLedger.snap();
+    try testing.expectEqual(@as(u64, 8192), l.ranged - l0.ranged);
+    // The raw full-block dest leg is a demand block too.
+    _ = try f.rp.read(io, 7, 2 * Fixture.bs, Fixture.bs, .{ .buf = buf, .registered = true }, .{});
+    l = DmaLedger.snap();
+    try testing.expectEqual(2 * Fixture.bs, l.demand - l0.demand);
+    // A prefetch warm of a cold block lands in the prefetch arm; a lane warm
+    // in the lane arm (`read_lane_fetch_bytes` counts it too).
+    f.bind(3, 7);
+    f.size = 4 * Fixture.bs;
+    const lane_bytes0 = prefetch.stats.read_lane_fetch_bytes.load();
+    f.rp.warm(io, 7, 3, .prefetch);
+    l = DmaLedger.snap();
+    try testing.expectEqual(Fixture.bs, l.prefetch_ - l0.prefetch_);
+    _ = purge.purgeBlockKey(f.rp.tiers, .init(Fixture.vol_tag, 7 * Fixture.bs));
+    f.rp.warm(io, 7, 3, .lane);
+    l = DmaLedger.snap();
+    try testing.expectEqual(Fixture.bs, l.lane - l0.lane);
+    try testing.expectEqual(lane_bytes0 + Fixture.bs, prefetch.stats.read_lane_fetch_bytes.load());
+    // A packed tenant's window.
+    f.kind = .packed_;
+    f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 5 * Fixture.bs, 1, 4096, 300);
+    f.alloc.publishBlock(5);
+    f.size = 300;
+    _ = try f.rp.read(io, 8, 0, 300, .{ .buf = buf[0..300] }, .{});
+    l = DmaLedger.snap();
+    try testing.expectEqual(@as(u64, 4096), l.window - l0.window);
+    // The two partitions agree with each other and with the device.
+    try testing.expectEqual(l.whereSum() - l0.whereSum(), l.purposeSum() - l0.purposeSum());
+    try testing.expectEqual(f.device_read_bytes.load(.monotonic) - dev0, l.purposeSum() - l0.purposeSum());
 }
 
 test "binding validation: a rebind between the fetch and the serve is a loss that re-resolves (never foreign bytes); exhaustion settles under the stripe instead of EIO; a device error on the current binding stays loud" {

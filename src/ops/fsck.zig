@@ -71,6 +71,9 @@ pub const stats = struct {
     pub var fsck_dentry_refs_indexed: counters.ShardedCounter = .{};
     pub var fsck_blocks_checked: counters.ShardedCounter = .{};
     pub var fsck_refcounts_checked: counters.ShardedCounter = .{};
+    /// Data-device bytes the C7 scrub read (the device-read ledger's
+    /// maintenance arm, decision 0003 §K — outside the plane's choke point).
+    pub var fsck_scrub_read_bytes: counters.ShardedCounter = .{};
     /// The last run's wall clock, seconds (stored).
     pub var fsck_scan_secs: counters.Gauge = .{};
     /// The inode plane's coverage: `leased ∪ tree-0 unleased` slots (stored).

@@ -9,6 +9,11 @@
 # own port-id slice and share-ledger dir, and is torn down by manifest.
 
 NVMET_TRTYPE=${NVMET_TRTYPE:?substrate must set NVMET_TRTYPE (loop|tcp)}
+# A namespace is exclusive to this mount: its diskstats read/write sectors
+# are the ruler for `device ÷ user` (verified: the namespace counts every
+# direct read issued to it even when the backing file sits in the VM's page
+# cache — `docs/evidence/rung-09-read-amplification.md` §1).
+DATA_DEVICES_EXCLUSIVE=1
 NVMET_PORT_BASE=$(( 4500 + ($$ % 400) ))
 NVMET_SHARES=()
 NVMET_CONNECTS=()

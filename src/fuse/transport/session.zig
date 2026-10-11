@@ -1400,6 +1400,8 @@ pub const Session = struct {
         try field(w, "transport_zc_direct_legs", worker.zc_direct_legs.load());
         try field(w, "transport_zc_direct_leg_fallbacks", worker.zc_direct_leg_fallbacks.load());
         try field(w, "transport_zc_direct_leg_recheck_withdrawn", worker.zc_direct_leg_recheck_withdrawn.load());
+        try field(w, "transport_zc_direct_leg_dma_bytes", worker.zc_direct_leg_dma_bytes.load());
+        try field(w, "transport_zc_direct_leg_serve_bytes", worker.zc_direct_leg_serve_bytes.load());
         try field(w, "transport_zc_write_directs", worker.zc_write_directs.load());
         try field(w, "transport_zc_write_direct_bytes", worker.zc_write_direct_bytes.load());
         try field(w, "transport_zc_write_direct_failures", worker.zc_write_direct_failures.load());

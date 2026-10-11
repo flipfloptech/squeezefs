@@ -262,6 +262,13 @@ pub var zc_direct_leg_fallbacks: counters.ShardedCounter = .{};
 /// `transport_zc_direct_leg_recheck_withdrawn`: a landed leg whose post-DMA
 /// recheck failed — the prefilled reply withdrawn, the ladder re-served.
 pub var zc_direct_leg_recheck_withdrawn: counters.ShardedCounter = .{};
+/// `transport_zc_direct_leg_dma_bytes`: every byte the direct device leg's
+/// `READ_FIXED(device fd → slot)` landed, validated or withdrawn — the
+/// transport's arm of the device-read ledger (decision 0003 §K; the
+/// filesystem's DMAs never see this read). `transport_zc_direct_leg_serve_
+/// bytes`: the validated subset the app's pages kept — the user side.
+pub var zc_direct_leg_dma_bytes: counters.ShardedCounter = .{};
+pub var zc_direct_leg_serve_bytes: counters.ShardedCounter = .{};
 /// `transport_zc_write_directs` / `_bytes` / `_failures`: held WRITE
 /// payloads landed by `WRITE_FIXED(slot → device)` — the sole-owner patch
 /// class with zero daemon passes — and the bridges that came back short.
@@ -1428,6 +1435,8 @@ pub const Group = struct {
                 self.failEnt(gent, .IO);
             },
             .direct_leg => {
+                // The device moved `res` bytes whatever the slot's fate.
+                if (res > 0) zc_direct_leg_dma_bytes.add(@intCast(res));
                 if (m.slots.ent(e).owing() == null) {
                     if (pend.hook) |h| _ = h.run(ok);
                     return;
@@ -1441,6 +1450,7 @@ pub const Group = struct {
                 if (ok and validated) {
                     zc_direct_legs.inc();
                     zc_serve_bytes.add(pend.len);
+                    zc_direct_leg_serve_bytes.add(pend.len);
                     const unique = std.mem.readInt(u64, self.headerOf(gent).in_out[8..16], .little);
                     self.commitPrefilled(gent, unique, pend.len);
                     return;

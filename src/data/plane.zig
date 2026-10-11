@@ -211,6 +211,22 @@ pub const stats = struct {
     pub var block_refs_drift_rows: counters.Gauge = .{};
     /// Device reads the plane bounced for an unaligned window.
     pub var device_read_bounces: counters.ShardedCounter = .{};
+    /// The device-read ledger's TOTAL at the plane's one read choke point
+    /// (decision 0003 §K): every byte a data device DMA'd for any purpose,
+    /// bounce padding included. Closure: `data_device_read_bytes ≡ Σ
+    /// read_path.read_dma_* + write_side_read_dma_bytes +
+    /// compose_read_dma_bytes + pack_read_dma_bytes`.
+    pub var data_device_read_bytes: counters.ShardedCounter = .{};
+    /// Device bytes the WRITE side read through its seam (overlay serves
+    /// and gap seeds, the fold/flush/spill seed images, the epoch's old
+    /// image) — grain-rounded.
+    pub var write_side_read_dma_bytes: counters.ShardedCounter = .{};
+    /// Device bytes the read seam's COMPOSITION read behind a READ: a
+    /// partial's gaps from the base, a redirect's shadow window —
+    /// ranged, never the whole seed block.
+    pub var compose_read_dma_bytes: counters.ShardedCounter = .{};
+    /// Device bytes the pack's own read seam moved (tenant copies).
+    pub var pack_read_dma_bytes: counters.ShardedCounter = .{};
     /// A device read on a volume tag no mounted volume carries (must stay 0).
     pub var unresolved_volume: counters.Tripwire = .init("data_unresolved_volume");
 };
@@ -220,7 +236,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked") });
@@ -1248,7 +1264,7 @@ pub const DataPlane = struct {
         if (w.len > out.len) return error.BufferTooSmall;
         const v = self.vols.byTag(w.vol_tag) orelse return error.InputOutput;
         const before = v.alloc.fillIncarnation(v.alloc.idxOf(m.offset)) orelse return error.InputOutput;
-        try self.deviceRead(w.vol_tag, w.device_off, out[0..@intCast(w.len)]);
+        try self.deviceRead(w.vol_tag, w.device_off, out[0..@intCast(w.len)], .write_side);
         if (!v.alloc.fillIncarnationStill(v.alloc.idxOf(m.offset), before)) return error.InputOutput;
         if (self.xform != null) {
             // A tenant image is a transform frame: decode into the plane's
@@ -1519,7 +1535,7 @@ pub const DataPlane = struct {
 
     fn packReadRange(ctx: *anyopaque, vol_tag: u64, device_off: u64, _: u64, out: []u8) pack.ReadError!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        self.deviceRead(vol_tag, device_off, out) catch |e| return switch (e) {
+        self.deviceRead(vol_tag, device_off, out, .pack) catch |e| return switch (e) {
             error.QueueFull => error.QueueFull,
             error.WorkerShutdown => error.WorkerShutdown,
             error.OutOfMemory => error.OutOfMemory,
@@ -1581,21 +1597,36 @@ pub const DataPlane = struct {
         stats.held_stores.inc();
     }
 
+    /// Who asked for a device read — the ledger arm its bytes land in. The
+    /// read path counts its own purpose arms (`read_path.stats.read_dma_*`)
+    /// at its DMA sites; the other three are counted here.
+    const ReadPurpose = enum { read_path, write_side, compose, pack };
+
     /// Any window: aligned straight into `out`, else bounced through a
-    /// pooled read of the enclosing grain window.
-    fn deviceRead(self: *DataPlane, vol_tag: u64, offset: u64, out: []u8) Error!void {
+    /// pooled read of the enclosing grain window. THE ONE data-plane read
+    /// choke point: every DMA'd byte lands in `data_device_read_bytes`.
+    fn deviceRead(self: *DataPlane, vol_tag: u64, offset: u64, out: []u8, purpose: ReadPurpose) Error!void {
         const dev = self.deviceOf(vol_tag) orelse return error.VolumeFailed;
         if (out.len == 0) return;
+        var moved: u64 = out.len;
         if (derive.isAligned(offset, layout.GRAIN) and derive.isAligned(out.len, layout.GRAIN) and derive.isAligned(@intFromPtr(out.ptr), layout.GRAIN)) {
             dev.readInto(offset, out) catch |e| return mapRead(e);
-            return;
+        } else {
+            stats.device_read_bounces.inc();
+            const start = derive.alignDown(offset, layout.GRAIN);
+            const end = derive.alignUp(offset + out.len, layout.GRAIN);
+            const buf = dev.readBlock(start, @intCast(end - start)) catch |e| return mapRead(e);
+            defer buf.release();
+            @memcpy(out, buf.bytes()[@intCast(offset - start)..][0..out.len]);
+            moved = end - start;
         }
-        stats.device_read_bounces.inc();
-        const start = derive.alignDown(offset, layout.GRAIN);
-        const end = derive.alignUp(offset + out.len, layout.GRAIN);
-        const buf = dev.readBlock(start, @intCast(end - start)) catch |e| return mapRead(e);
-        defer buf.release();
-        @memcpy(out, buf.bytes()[@intCast(offset - start)..][0..out.len]);
+        stats.data_device_read_bytes.add(moved);
+        switch (purpose) {
+            .read_path => {},
+            .write_side => stats.write_side_read_dma_bytes.add(moved),
+            .compose => stats.compose_read_dma_bytes.add(moved),
+            .pack => stats.pack_read_dma_bytes.add(moved),
+        }
     }
 
     fn mapRead(e: nvme_dev.DeviceError) Error {
@@ -1611,7 +1642,7 @@ pub const DataPlane = struct {
 
     fn devRead(ctx: *anyopaque, vol_tag: u64, offset: u64, out: []u8) seams.ReadError!void {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        self.deviceRead(vol_tag, offset, out) catch |e| return switch (e) {
+        self.deviceRead(vol_tag, offset, out, .write_side) catch |e| return switch (e) {
             error.ShortRead => error.ShortRead,
             error.QueueFull => error.QueueFull,
             error.WorkerShutdown => error.WorkerShutdown,
@@ -2495,7 +2526,7 @@ pub const DataPlane = struct {
     /// the zcrx lane's gather, when armed, decides per call ahead of this.
     fn volReadRange(ctx: *anyopaque, vol_tag: u64, device_off: u64, dest: []u8, _: read_path.DestShape) read_path.DeviceError!read_path.Served {
         const self: *DataPlane = @ptrCast(@alignCast(ctx));
-        try self.deviceRead(vol_tag, device_off, dest);
+        try self.deviceRead(vol_tag, device_off, dest, .read_path);
         return .dma;
     }
 
@@ -2604,7 +2635,7 @@ pub const DataPlane = struct {
     fn fillGap(self: *DataPlane, base: Mapping, rel: u32, out: []u8) void {
         const w = base.readWindow(self.chunk, .{ .start = rel, .end = rel + out.len }) catch return;
         if (w.hi <= w.lo) return;
-        self.deviceRead(w.vol_tag, w.device_off + w.lo, out[0 .. w.hi - w.lo]) catch {};
+        self.deviceRead(w.vol_tag, w.device_off + w.lo, out[0 .. w.hi - w.lo], .compose) catch {};
     }
 
     /// This client's ring entry for a staged file.

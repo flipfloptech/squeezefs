@@ -257,6 +257,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         const v = pl.vols.byTag(vol_tag) orelse return error.Io;
         const dev = pl.devs[v.ordinal] orelse return error.Io;
         dev.readInto(device_off, dest) catch return error.Io;
+        fsck.stats.fsck_scrub_read_bytes.add(dest.len);
     }
 
     fn isOpenPack(ctx: ?*anyopaque, vol_tag: u64, block_idx: u64) bool {

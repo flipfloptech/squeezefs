@@ -4,6 +4,7 @@
 # chain is ONE device shared with everything else on /build (the zig caches,
 # other agents' smokes): its `device bytes ÷ user bytes` is an UPPER bound
 # and the record says so; the daemon's own device-write arms are exact.
+DATA_DEVICES_EXCLUSIVE=0
 
 substrate_up() {   # bin nsets
   local nsets=$2 s v disk

@@ -110,6 +110,35 @@ READ_COPY_ARMS = [
     "transport_zc_serve_bytes", "transport_zc_bounce_bytes_bridged",
 ]
 READ_COPY_BESIDE = ["read_dest_lease_bytes", "ipc_bytes_out", "ipc_read_demote_bytes"]
+# The device-READ byte arms (decision 0003 §K — the read-amplification
+# ledger): every path that moves bytes OFF a data device, each byte in exactly
+# one arm, partitioned by PURPOSE so `device ÷ user` names its source. The
+# plane's nine arms close EXACTLY against its one read choke point
+# (`data_device_read_bytes`, read BESIDE: the `device_read_ledger` verdict);
+# the transport's direct device leg, the zcrx lane and fsck's scrub DMA
+# outside the plane and are summed in. The metadata plane's node reads are
+# a separate ledger (`META_READ`), never summed into a data row's ratio.
+DEVICE_READ_ARMS = [
+    "read_dma_ranged_bytes", "read_dma_block_demand_bytes", "read_dma_block_prefetch_bytes",
+    "read_dma_block_lane_bytes", "read_dma_image_bytes", "read_dma_window_bytes",
+    "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes",
+    "transport_zc_direct_leg_dma_bytes", "zcrx_fill_bytes", "fsck_scrub_read_bytes",
+]
+# The arms the plane's choke point sees (the closure's left side).
+DEVICE_READ_PLANE_ARMS = DEVICE_READ_ARMS[:9]
+# Beside: the plane's total, the WHERE partition (`pooled + registered ≡ the
+# read path's six purpose arms`), the request count (`get_obj` = the stats-side
+# `rareq-sz` denominator), and the user side — `read_user_bytes` (every byte the
+# data plane answered, warm ladder included) + `transport_zc_direct_leg_serve_
+# bytes` (the direct leg's validated serves never reach the plane).
+DEVICE_READ_BESIDE = ["data_device_read_bytes", "read_fill_dma_bytes", "read_dest_dma_bytes", "get_obj",
+                      "ranged_read_bytes", "read_lane_fetch_bytes", "prefetch_issued", "prefetch_wasted",
+                      "prefetch_evicted_unconsumed", "read_streams_classified", "ranged_read_ghost_escalations",
+                      "read_user_bytes", "transport_zc_direct_leg_serve_bytes"]
+# The metadata read ledger: node bytes the metadata plane read off its device
+# per record the client was answered (lookups, getattrs, dirents).
+META_READ = ["node_read_bytes", "node_reads", "meta_kv_node_cache_hits", "meta_kv_node_cache_misses",
+             "fuse_readdir_entries"]
 RECLAIM = ["terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided",
            "block_free_discard_bytes", "block_free_punch_bytes", "pack_terminal_frees"]
 # The solo-mount wire census: every path that puts a verb on the cluster wire.
@@ -149,9 +178,11 @@ MISC = ["put_obj", "held_stores", "patch_writes", "own_block_dmas", "overlay_sto
         "manager_verbs", "writer_guard_mode", "symmetric_meta"]
 FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier",
                 "meta_publish", "meta_barrier", "extent_barrier"]
+# `fuse_op_latency_ns`'s classes (`src/fuse/handler/op_trace.zig` OpClass).
+OP_CLASSES = ["lookup", "getattr", "setattr", "mkdir", "create", "unlink", "rename", "readdir", "read", "write", "other"]
 
 ALL_COUNTERS = (DEVICE_WRITE_ARMS + DEVICE_WRITE_BESIDE + DEVICE_WRITE_REQS + ADMISSION_ARMS + READ_COPY_ARMS + READ_COPY_BESIDE + RECLAIM
-                + WIRE_RPCS + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND)
+                + WIRE_RPCS + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND + DEVICE_READ_ARMS + DEVICE_READ_BESIDE + META_READ)
 
 
 def flatten(doc):
@@ -206,6 +237,12 @@ def terms(doc):
         s = paths.get("/data/families/write/fsync/fsync_phase_ns/%s/sum_ns" % ph)
         fs[ph] = {"count": num(c) if c is not None else 0, "sum_ns": num(s) if s is not None else 0}
     out["fsync_phase_ns"] = fs
+    # The per-class op counts (the metadata read ledger's denominators).
+    ops = {}
+    for cls in OP_CLASSES:
+        c = paths.get("/ops/fuse_op_latency_ns/%s/count" % cls)
+        ops[cls] = num(c) if c is not None else 0
+    out["fuse_op_counts"] = ops
     # The R5 components' current bytes (which gauge took the budget to Yellow/Red).
     comps = {}
     for k, v in paths.items():
@@ -227,6 +264,8 @@ def delta(after, before):
         if k == "fsync_phase_ns":
             d[k] = {ph: {"count": v[ph]["count"] - before[k][ph]["count"],
                          "sum_ns": v[ph]["sum_ns"] - before[k][ph]["sum_ns"]} for ph in v}
+        elif k == "fuse_op_counts":
+            d[k] = {cls: v[cls] - before[k][cls] for cls in v}
         elif isinstance(v, str):
             d[k] = v
         else:
@@ -381,6 +420,11 @@ def leg(args):
     device_write_reqs = sum(d[k] for k in DEVICE_WRITE_REQS)
     admission = sum(d[k] for k in ADMISSION_ARMS)
     read_copy = sum(d[k] for k in READ_COPY_ARMS)
+    device_read_stats = sum(d[k] for k in DEVICE_READ_ARMS)
+    device_read_plane = sum(d[k] for k in DEVICE_READ_PLANE_ARMS)
+    user_read_stats = d["read_user_bytes"] + d["transport_zc_direct_leg_serve_bytes"]
+    op_counts = d["fuse_op_counts"]
+    meta_records = op_counts["lookup"] + op_counts["getattr"] + d["fuse_readdir_entries"]
     wire = sum(d[k] for k in WIRE_RPCS)
     ticks = {k: d[k] for k in TICK_RESCUES}
     must0 = {k: d[k] for k in MUST_STAY_0}
@@ -473,6 +517,33 @@ def leg(args):
         ratio = read_copy / user_r
         verdicts.append(("read_copy_ledger", 0.98 <= ratio <= 1.02 or metrics.get("direct", 1) == 0,
                          "Σ read copy arms %d vs user %d (×%.4f)%s" % (read_copy, user_r, ratio, "" if metrics.get("direct", 1) else " (buffered: readahead moves more than the user asked)")))
+    # 9. the device-read ledger closes EXACTLY at the plane's one read choke
+    #    point (every row: writes read seed images too). An old binary without
+    #    the arms reads 0 ≡ 0 and lists them under absent_keys.
+    verdicts.append(("device_read_ledger", device_read_plane == d["data_device_read_bytes"],
+                     "Σ plane read arms %d vs data_device_read_bytes %d (%s)" % (
+                         device_read_plane, d["data_device_read_bytes"],
+                         ", ".join("%s %d" % (k, d[k]) for k in DEVICE_READ_PLANE_ARMS if d[k]) or "no device reads")))
+    # 10. the read-amplification bound (decision 0003 §K): the row's shape
+    #     derives `device ÷ user ≤ bound`; the substrate's namespaces are the
+    #     ruler when the data devices are exclusive to the mount (nvmet), the
+    #     daemon's arms otherwise. A row without a bound reports the ratio.
+    data_devs = meta.get("data_disk_devices", [])
+    meta_devs = meta.get("meta_disk_devices", [])
+    disk_read = sum(ds[x]["read_bytes"] for x in data_devs if ds.get(x, {}).get("present"))
+    disk_reads = sum(ds[x]["reads"] for x in data_devs if ds.get(x, {}).get("present"))
+    exclusive = bool(meta.get("data_devices_exclusive", False))
+    amp_stats = (device_read_stats / user_r) if user_r else None
+    amp_disk = (disk_read / user_r) if (user_r and data_devs) else None
+    bound = metrics.get("read_amp_bound")
+    if kind == "data-read" and user_r and bound is not None:
+        ruler = amp_disk if (exclusive and amp_disk is not None) else amp_stats
+        ruler_name = "diskstats (exclusive namespaces)" if (exclusive and amp_disk is not None) else "stats arms"
+        verdicts.append(("read_amplification_bound", ruler <= bound,
+                         "device ÷ user %.4f by %s (stats %.4f, diskstats %s) vs bound %.4f — %s; arms: %s" % (
+                             ruler, ruler_name, amp_stats, ("%.4f" % amp_disk) if amp_disk is not None else "—", bound,
+                             metrics.get("read_amp_bound_why", "?"),
+                             ", ".join("%s %d" % (k, d[k]) for k in DEVICE_READ_ARMS if d[k]) or "none")))
 
     rec = {
         "leg": meta.get("leg"), "arm": meta.get("arm"), "binary": meta.get("binary"), "build": meta.get("build"),
@@ -492,6 +563,20 @@ def leg(args):
             "admission_bytes": admission, "admission_arms": {k: d[k] for k in ADMISSION_ARMS},
             "read_copy_bytes": read_copy, "read_copy_arms": {k: d[k] for k in READ_COPY_ARMS},
             "read_copy_beside": {k: d[k] for k in READ_COPY_BESIDE},
+            "device_read_bytes_stats": device_read_stats,
+            "device_read_arms": {k: d[k] for k in DEVICE_READ_ARMS},
+            "device_read_beside": {k: d[k] for k in DEVICE_READ_BESIDE},
+            "user_read_bytes_stats": user_read_stats,
+            "device_div_user_read_stats": amp_stats,
+            "device_div_user_read_diskstats_data": amp_disk,
+            "rareq_sz_stats": (device_read_stats // d["get_obj"]) if d["get_obj"] else 0,
+            "rareq_sz_diskstats_data": (disk_read // disk_reads) if disk_reads else 0,
+            "read_amp_bound": bound,
+            "meta_read": {k: d[k] for k in META_READ},
+            "fuse_op_counts": op_counts,
+            "meta_records": meta_records,
+            "meta_node_bytes_per_record": (d["node_read_bytes"] / meta_records) if meta_records else None,
+            "meta_node_reads_per_record": (d["node_reads"] / meta_records) if meta_records else None,
             "reclaim": reclaim, "reclaim_absolute": reclaim_abs,
             "wire_rpcs": wire, "wire_arms": {k: d[k] for k in WIRE_RPCS},
             "tick_rescues": ticks, "must_stay_0": must0,
@@ -512,8 +597,6 @@ def leg(args):
         "valid": all(ok for (_, ok, _) in verdicts),
     }
     # device ÷ user from the substrate: the data devices' written bytes over the user bytes.
-    data_devs = meta.get("data_disk_devices", [])
-    meta_devs = meta.get("meta_disk_devices", [])
     if user_w:
         dw = sum(ds[x]["write_bytes"] for x in data_devs if ds.get(x, {}).get("present"))
         mw = sum(ds[x]["write_bytes"] for x in meta_devs if ds.get(x, {}).get("present"))
@@ -627,6 +710,35 @@ def markdown(rec):
             fmt(L["device_div_user_stats"]), fmt(dsd), fmt(dsm), L["wareq_sz_stats"], L.get("wareq_sz_diskstats_data", "—"),
             rc["block_free_reclaim_queued"], rc["block_free_reclaim_elided"], rc["terminal_frees"], adm, L["wire_rpcs"],
             L["must_stay_0"]["invariant_tripwires"], ticks, "yes" if l["valid"] else "NO"))
+    # The read-amplification ledger (decision 0003 §K) for every leg that read.
+    if any(l["metrics"].get("user_read_bytes") for l in legs):
+        lines.append("")
+        lines.append("| leg | arm | read device÷user (stats) | read device÷user (diskstats data) | bound | rareq-sz B (stats / disk) | ranged | demand blk | prefetch blk | lane blk | image | window | compose | write-side | direct leg | plane ledger |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for l in legs:
+            L = l["ledgers"]
+            a = L.get("device_read_arms", {})
+            closed = next((v["ok"] for v in l["verdicts"] if v["check"] == "device_read_ledger"), None)
+            lines.append("| %s | %s | %s | %s | %s | %s / %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+                l["leg"], l["arm"], fmt(L.get("device_div_user_read_stats")), fmt(L.get("device_div_user_read_diskstats_data")),
+                fmt(L.get("read_amp_bound")), L.get("rareq_sz_stats", "—"), L.get("rareq_sz_diskstats_data", "—"),
+                a.get("read_dma_ranged_bytes", 0), a.get("read_dma_block_demand_bytes", 0), a.get("read_dma_block_prefetch_bytes", 0),
+                a.get("read_dma_block_lane_bytes", 0), a.get("read_dma_image_bytes", 0), a.get("read_dma_window_bytes", 0),
+                a.get("compose_read_dma_bytes", 0), a.get("write_side_read_dma_bytes", 0), a.get("transport_zc_direct_leg_dma_bytes", 0),
+                {True: "closed", False: "OPEN", None: "—"}[closed]))
+    # The metadata read ledger for every leg that answered metadata.
+    if any((l["ledgers"].get("meta_records") or 0) for l in legs):
+        lines.append("")
+        lines.append("| leg | arm | lookups | getattrs | dirents | node reads | node bytes | node bytes/record | node reads/record | cache hits | cache misses |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        for l in legs:
+            L = l["ledgers"]
+            oc = L.get("fuse_op_counts", {})
+            mr = L.get("meta_read", {})
+            lines.append("| %s | %s | %d | %d | %d | %d | %d | %s | %s | %d | %d |" % (
+                l["leg"], l["arm"], oc.get("lookup", 0), oc.get("getattr", 0), mr.get("fuse_readdir_entries", 0),
+                mr.get("node_reads", 0), mr.get("node_read_bytes", 0), fmt(L.get("meta_node_bytes_per_record")), fmt(L.get("meta_node_reads_per_record")),
+                mr.get("meta_kv_node_cache_hits", 0), mr.get("meta_kv_node_cache_misses", 0)))
     lines.append("")
     lines.append("A mean %s (spread %s), B mean %s (spread %s)%s; all legs: min %s max %s spread %.1f %%." % (
         fmt(hl["A"]["mean"]), fmt(hl["A"]["spread"]), fmt(hl["B"]["mean"]), fmt(hl["B"]["spread"]),
@@ -768,6 +880,29 @@ def summary(args):
             fmt(dvu), fmt(dvd), fmt(war) if war is not None else "—", reclaim, ("×%.4f" % adm) if adm is not None else "—",
             wire, trip, ticks, r["verdict"], name))
     print("\n".join(lines))
+    # The read-amplification table: every record whose legs read.
+    read_lines = ["", "| row | substrate | mount | A read device÷user stats / disk | B read device÷user stats / disk | bound | node bytes/record A / B | verdict | record |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+    n_read = 0
+    for name, r in recs:
+        h = r["header"]
+        legs = [l for l in r["legs"] if l.get("elapsed_s") is not None]
+        if not any(l["metrics"].get("user_read_bytes") or l["ledgers"].get("meta_records") for l in legs):
+            continue
+        n_read += 1
+        def arm_avg(arm, key):
+            xs = [l["ledgers"].get(key) for l in legs if l["arm"] == arm]
+            xs = [x for x in xs if x is not None]
+            return (sum(xs) / len(xs)) if xs else None
+        bound = next((l["ledgers"].get("read_amp_bound") for l in legs if l["ledgers"].get("read_amp_bound") is not None), None)
+        read_lines.append("| %s | %s | %s | %s / %s | %s / %s | %s | %s / %s | %s | `%s` |" % (
+            r["row"], h["substrate"], h.get("mount_opts") or "defaults",
+            fmt(arm_avg("A", "device_div_user_read_stats")), fmt(arm_avg("A", "device_div_user_read_diskstats_data")),
+            fmt(arm_avg("B", "device_div_user_read_stats")), fmt(arm_avg("B", "device_div_user_read_diskstats_data")),
+            fmt(bound), fmt(arm_avg("A", "meta_node_bytes_per_record")), fmt(arm_avg("B", "meta_node_bytes_per_record")),
+            r["verdict"], name))
+    if n_read:
+        print("\n".join(read_lines))
     for name, r in recs:
         for reason in r["invalid_reasons"]:
             for f in reason["failed"]:
@@ -789,7 +924,11 @@ def dead_leg(args):
                        "read_copy_arms": {}, "reclaim": {"terminal_frees": 0, "block_free_reclaim_queued": 0, "block_free_reclaim_elided": 0},
                        "reclaim_absolute": {}, "wire_rpcs": 0, "wire_arms": {}, "tick_rescues": {}, "must_stay_0": {"invariant_tripwires": 0},
                        "ipc": {}, "journal": {}, "fuse": {}, "fsync_phase_ns": {"total": {"count": 0, "sum_ns": 0}}, "daemon_cpu_ns": 0,
-                       "misc": {}, "posture": {}, "absent_keys": []},
+                       "misc": {}, "posture": {}, "absent_keys": [],
+                       "device_read_bytes_stats": 0, "device_read_arms": {}, "device_read_beside": {}, "user_read_bytes_stats": 0,
+                       "device_div_user_read_stats": None, "device_div_user_read_diskstats_data": None, "rareq_sz_stats": 0,
+                       "rareq_sz_diskstats_data": 0, "read_amp_bound": None, "meta_read": {}, "fuse_op_counts": {}, "meta_records": 0,
+                       "meta_node_bytes_per_record": None, "meta_node_reads_per_record": None},
            "diskstats": {},
            "verdicts": [{"check": "daemon_wedged" if wedged else e.get("D_CHECK", "daemon_alive"), "ok": False,
                          "detail": wedged if wedged else (

@@ -326,6 +326,9 @@ pub const StatsTerms = struct {
     admission_bytes: u64 = 0,
     /// Σ read copy bytes over `read_copy_keys` (≈ user bytes on a direct read row).
     read_copy_bytes: u64 = 0,
+    /// Σ device-READ bytes over `device_read_keys` (the read-amplification
+    /// ledger, decision 0003 §K): `device_read_bytes ÷ user bytes` on a read row.
+    device_read_bytes: u64 = 0,
     terminal_frees: u64 = 0,
     reclaim_queued: u64 = 0,
     reclaim_elided: u64 = 0,
@@ -363,6 +366,13 @@ pub const StatsTerms = struct {
     /// `read_dest_lease_bytes` is the dest-lease mechanism's gauge over the
     /// bytes `read_dest_dma_bytes` lands (1:1 measured) — beside, not summed.
     pub const read_copy_keys = [_][]const u8{ "read_copy_dest_bytes", "read_copy_bounce_bytes", "read_dest_dma_bytes", "read_zc_serve_bytes", "read_copy_warm_serve_bytes", "read_copy_hot_serve_bytes", "read_copy_hold_serve_bytes", "read_copy_cache_serve_bytes", "read_copy_fill_slice_bytes", "transport_zc_serve_bytes", "transport_zc_bounce_bytes_bridged" };
+    /// The device-READ byte arms (brk.py `DEVICE_READ_ARMS`; decision 0003
+    /// §K): every path that moves bytes OFF a data device, each byte in
+    /// exactly one arm, by purpose. The plane's nine close against its one
+    /// read choke point (`data_device_read_bytes`, read beside); the
+    /// transport's direct device leg, the zcrx lane and fsck's scrub DMA
+    /// outside the plane and are summed in.
+    pub const device_read_keys = [_][]const u8{ "read_dma_ranged_bytes", "read_dma_block_demand_bytes", "read_dma_block_prefetch_bytes", "read_dma_block_lane_bytes", "read_dma_image_bytes", "read_dma_window_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes", "transport_zc_direct_leg_dma_bytes", "zcrx_fill_bytes", "fsck_scrub_read_bytes" };
 
     pub fn parse(text: []const u8) StatsTerms {
         var t: StatsTerms = .{ .present = true };
@@ -374,6 +384,7 @@ pub const StatsTerms = struct {
         for (device_write_req_keys) |k| t.device_writes += json_scan.number(text, k) orelse 0;
         for (admission_keys) |k| t.admission_bytes += json_scan.number(text, k) orelse 0;
         for (read_copy_keys) |k| t.read_copy_bytes += json_scan.number(text, k) orelse 0;
+        for (device_read_keys) |k| t.device_read_bytes += json_scan.number(text, k) orelse 0;
         t.terminal_frees = json_scan.number(text, "terminal_frees") orelse 0;
         t.reclaim_queued = json_scan.number(text, "block_free_reclaim_queued") orelse 0;
         t.reclaim_elided = json_scan.number(text, "block_free_reclaim_elided") orelse 0;
@@ -393,7 +404,7 @@ pub const StatsTerms = struct {
 
     pub fn delta(after: StatsTerms, before: StatsTerms) StatsTerms {
         var d: StatsTerms = .{ .present = after.present and before.present, .direct_device_true = after.direct_device_true };
-        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "rewrite_device_write_bytes", "device_writes", "admission_bytes", "read_copy_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "zc_direct_legs", "zc_serve_bytes", "invariant_tripwires" }) |f| {
+        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "rewrite_device_write_bytes", "device_writes", "admission_bytes", "read_copy_bytes", "device_read_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "zc_direct_legs", "zc_serve_bytes", "invariant_tripwires" }) |f| {
             @field(d, f) = @field(after, f) -| @field(before, f);
         }
         return d;
@@ -470,6 +481,12 @@ pub const Row = struct {
         return @intCast((@as(u128, self.stats.read_copy_bytes) * PPM) / self.bytes);
     }
 
+    /// The read-amplification ledger `Σ device-read arms ÷ user bytes` in ppm.
+    pub fn readAmplificationPpm(self: Row) u64 {
+        if (self.bytes == 0) return 0;
+        return @intCast((@as(u128, self.stats.device_read_bytes) * PPM) / self.bytes);
+    }
+
     pub fn scopingOnly(self: Row) bool {
         return self.pass.moveBytes() and self.elapsed_ns < HEADLINE_SECS * std.time.ns_per_s;
     }
@@ -489,12 +506,12 @@ pub const Row = struct {
             quantileNs(self.lat, 990),             quantileNs(self.lat, 999),                      quantileNs(self.lat, 1000),
         });
         const s = self.stats;
-        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
-            s.present,                    self.bytes,                      s.device_write_bytes, s.rewrite_device_write_bytes, s.device_writes,        self.amplificationPpm(),
-            self.amplificationBoundPpm(), self.withinAmplificationBound(), self.wareqSz(),       s.admission_bytes,            s.read_copy_bytes,      self.readCopyPpm(),
-            s.terminal_frees,             s.reclaim_queued,                s.reclaim_elided,     s.discard_bytes,              s.fuse_ops,             s.transport_ring_requests,
-            s.transport_enters,           s.held_stores,                   s.patch_writes,       s.hot_block_hits,             s.fast_dispatch_serves, s.zc_write_direct_bytes,
-            s.zc_write_extract_bytes,     s.zc_direct_legs,                s.zc_serve_bytes,     s.invariant_tripwires,
+        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"device_read_bytes\":{d},\"read_amplification_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
+            s.present,                    self.bytes,                      s.device_write_bytes,     s.rewrite_device_write_bytes, s.device_writes,   self.amplificationPpm(),
+            self.amplificationBoundPpm(), self.withinAmplificationBound(), self.wareqSz(),           s.admission_bytes,            s.read_copy_bytes, self.readCopyPpm(),
+            s.device_read_bytes,          self.readAmplificationPpm(),     s.terminal_frees,         s.reclaim_queued,             s.reclaim_elided,  s.discard_bytes,
+            s.fuse_ops,                   s.transport_ring_requests,       s.transport_enters,       s.held_stores,                s.patch_writes,    s.hot_block_hits,
+            s.fast_dispatch_serves,       s.zc_write_direct_bytes,         s.zc_write_extract_bytes, s.zc_direct_legs,             s.zc_serve_bytes,  s.invariant_tripwires,
         });
     }
 
@@ -506,7 +523,7 @@ pub const Row = struct {
             try w.print("|   device bytes ÷ user bytes {d}.{d:0>3} (device {d} B / user {d} B; rewrite epoch {d} B beside) vs the §J.1 bound {d}.{d:0>3} ({s}); wareq-sz {d} B vs block {d} B; reclaim terminal {d} = queued {d} + elided {d}, discarded {d} B; admission {d} B\n", .{ ratioParts(self.amplificationPpm()).whole, ratioParts(self.amplificationPpm()).milli, self.stats.device_write_bytes, self.bytes, self.stats.rewrite_device_write_bytes, ratioParts(self.amplificationBoundPpm()).whole, ratioParts(self.amplificationBoundPpm()).milli, if (self.withinAmplificationBound()) "within" else "OVER THE BOUND", self.wareqSz(), self.pass.block, self.stats.terminal_frees, self.stats.reclaim_queued, self.stats.reclaim_elided, self.stats.discard_bytes, self.stats.admission_bytes });
         }
         if (self.pass.phase == .read and self.stats.present) {
-            try w.print("|   read copy ledger Σ arms ÷ user bytes {d}.{d:0>3} (Σ {d} B / user {d} B); direct-leg serves {d} ({d} B)\n", .{ ratioParts(self.readCopyPpm()).whole, ratioParts(self.readCopyPpm()).milli, self.stats.read_copy_bytes, self.bytes, self.stats.zc_direct_legs, self.stats.zc_serve_bytes });
+            try w.print("|   read copy ledger Σ arms ÷ user bytes {d}.{d:0>3} (Σ {d} B / user {d} B); direct-leg serves {d} ({d} B); device read bytes ÷ user bytes {d}.{d:0>3} (device {d} B)\n", .{ ratioParts(self.readCopyPpm()).whole, ratioParts(self.readCopyPpm()).milli, self.stats.read_copy_bytes, self.bytes, self.stats.zc_direct_legs, self.stats.zc_serve_bytes, ratioParts(self.readAmplificationPpm()).whole, ratioParts(self.readAmplificationPpm()).milli, self.stats.device_read_bytes });
         }
         if (self.stats.present) {
             try w.print("|   ring requests {d} (handler-lane fuse_ops {d}, direct-leg serves {d}), enters {d}; engagement held_stores {d} patch_writes {d} hot_block_hits {d} fast_dispatch {d} zc direct {d} B extract {d} B; invariant_tripwires +{d}\n", .{ self.stats.transport_ring_requests, self.stats.fuse_ops, self.stats.zc_direct_legs, self.stats.transport_enters, self.stats.held_stores, self.stats.patch_writes, self.stats.hot_block_hits, self.stats.fast_dispatch_serves, self.stats.zc_write_direct_bytes, self.stats.zc_write_extract_bytes, self.stats.invariant_tripwires });

@@ -120,9 +120,19 @@ pub const FillClass = enum(u8) {
     /// A ranged second touch escalating to one whole-block fill: its
     /// publish is AWAITED (the admission IS the serve contract).
     escalation,
+    /// The ahead lane's fill (`read_lane_top_up`): a stream's speculation
+    /// whose hold deposit is LEDGER-INVISIBLE (it never runs the hold-serve
+    /// ceremony) and whose device bytes the amplification ledger names
+    /// apart from the demand stream's own.
+    lane,
 
     pub fn streaming(self: FillClass) bool {
-        return self == .demand_stream or self == .prefetch;
+        return self == .demand_stream or self == .prefetch or self == .lane;
+    }
+
+    /// A fill the reader did not ask for (the prefetch pipeline, the ahead lane).
+    pub fn speculative(self: FillClass) bool {
+        return self == .prefetch or self == .lane;
     }
 };
 

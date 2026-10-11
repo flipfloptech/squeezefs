@@ -324,7 +324,7 @@ PYEOF
   M_LEG=$leg_n M_ARM=$arm M_BIN=$BIN M_BUILD=$BUILD M_KIND=$ROW_KIND M_SHIM=$ROW_NEEDS_SHIM M_POSTURE=$leg_posture \
   M_SET=$set_idx M_OPTS="${opts:-}" M_STARTED=$started_at M_LOAD0="$load0" M_LOAD1="$load1" \
   M_DISKS="${DISK_DEVS[*]}" M_META_DISKS="${META_DISK_DEVS_BY_SET[$set_idx]}" M_DATA_DISKS="${DATA_DISK_DEVS_BY_SET[$set_idx]}" \
-  M_EAGAIN="$(grep -c 'answered EAGAIN' "$LEG_DIR/daemon.log" || true)" \
+  M_EAGAIN="$(grep -c 'answered EAGAIN' "$LEG_DIR/daemon.log" || true)" M_EXCL="${DATA_DEVICES_EXCLUSIVE:-0}" \
   python3 - "$LEG_DIR/meta.json" <<'EOF'
 import json, os, sys
 e = os.environ
@@ -332,7 +332,8 @@ json.dump({"leg": int(e["M_LEG"]), "arm": e["M_ARM"], "binary": e["M_BIN"], "bui
   "row_kind": e["M_KIND"], "shim": e["M_SHIM"] == "1", "solo": True, "posture": e["M_POSTURE"], "set": int(e["M_SET"]),
   "mount_opts": e["M_OPTS"], "started_at": e["M_STARTED"], "loadavg_before": e["M_LOAD0"], "loadavg_after": e["M_LOAD1"],
   "disk_devices": e["M_DISKS"].split(), "meta_disk_devices": e["M_META_DISKS"].split(),
-  "data_disk_devices": e["M_DATA_DISKS"].split(), "daemon_eagain_lines": int(e.get("M_EAGAIN") or 0)}, open(sys.argv[1], "w"))
+  "data_disk_devices": e["M_DATA_DISKS"].split(), "data_devices_exclusive": e["M_EXCL"] == "1",
+  "daemon_eagain_lines": int(e.get("M_EAGAIN") or 0)}, open(sys.argv[1], "w"))
 EOF
   python3 "$BRK" leg "$LEG_DIR/before.stats.json" "$LEG_DIR/after.stats.json" "$LEG_DIR/before.diskstats" "$LEG_DIR/after.diskstats" "$LEG_DIR/metrics.json" "$LEG_DIR/meta.json" > "$LEG_DIR/leg.json"
   LEG_RECORDS+=("$LEG_DIR/leg.json")

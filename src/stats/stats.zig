@@ -753,12 +753,20 @@ pub const Closure = struct {
     /// `parked_commits ≡ unparked_commits` (the transport's park pair).
     parked_commits: u64,
     unparked_commits: u64,
+    /// The device-read ledger (decision 0003 §K): the plane's one read
+    /// choke point's total ≡ Σ its purpose arms (the read path's six, the
+    /// write side's, the composition's, the pack's).
+    data_device_read_bytes: u64,
+    device_read_arms: u64,
 
     pub fn admissionClosed(self: Closure) bool {
         return self.admission_bytes == self.transport_write_bytes;
     }
     pub fn readCopyClosed(self: Closure) bool {
         return self.read_user_bytes == self.read_copy_bytes;
+    }
+    pub fn deviceReadClosed(self: Closure) bool {
+        return self.data_device_read_bytes == self.device_read_arms;
     }
     pub fn reclaimClosed(self: Closure) bool {
         return self.terminal_frees == self.reclaim_queued_plus_elided;
@@ -771,7 +779,7 @@ pub const Closure = struct {
     }
 
     pub fn writeJson(self: Closure, w: *Writer) Error!void {
-        try w.print("{{\"admission_ledger_closed\":{},\"read_copy_ledger_closed\":{},\"reclaim_ledger_closed\":{},\"mint_abandons_bounded\":{},\"transport_parks_closed\":{}}}", .{ self.admissionClosed(), self.readCopyClosed(), self.reclaimClosed(), self.mintAbandonsBounded(), self.parksClosed() });
+        try w.print("{{\"admission_ledger_closed\":{},\"read_copy_ledger_closed\":{},\"reclaim_ledger_closed\":{},\"mint_abandons_bounded\":{},\"transport_parks_closed\":{},\"device_read_ledger_closed\":{}}}", .{ self.admissionClosed(), self.readCopyClosed(), self.reclaimClosed(), self.mintAbandonsBounded(), self.parksClosed(), self.deviceReadClosed() });
     }
 };
 
@@ -779,7 +787,11 @@ pub fn closure() Closure {
     const wa = &write_admit.stats;
     const rp = &read_path.stats;
     const zc_direct: u64 = if (is_linux) worker.zc_write_direct_bytes.load() else 0;
+    const plane_read_total: u64 = if (is_linux) plane_mod.stats.data_device_read_bytes.load() else 0;
+    const plane_read_arms: u64 = if (is_linux) plane_mod.stats.write_side_read_dma_bytes.load() + plane_mod.stats.compose_read_dma_bytes.load() + plane_mod.stats.pack_read_dma_bytes.load() else 0;
     return .{
+        .data_device_read_bytes = plane_read_total,
+        .device_read_arms = plane_read_arms + rp.read_dma_ranged_bytes.load() + rp.read_dma_block_demand_bytes.load() + rp.read_dma_block_prefetch_bytes.load() + rp.read_dma_block_lane_bytes.load() + rp.read_dma_image_bytes.load() + rp.read_dma_window_bytes.load(),
         .admission_bytes = wa.admit_write_overlay_bytes.load() + wa.admit_write_inplace_bytes.load() + wa.admit_write_accumulate_bytes.load() + wa.admit_write_inline_bytes.load(),
         .transport_write_bytes = slot.zc_write_extract_bytes.load() + zc_direct + kv_fs.fuse_truncate_zero_tail_bytes.load(),
         .read_user_bytes = rp.read_user_bytes.load(),
@@ -1093,12 +1105,12 @@ test "the A/B levers set non-default ride the mount family; a default-valued lev
 }
 
 test "closure identities are computed booleans over one snapshot" {
-    const c: Closure = .{ .admission_bytes = 10, .transport_write_bytes = 10, .read_user_bytes = 5, .read_copy_bytes = 4, .terminal_frees = 3, .reclaim_queued_plus_elided = 3, .mint_abandons = 1, .mint_abandons_bound = 0, .parked_commits = 2, .unparked_commits = 2 };
-    try testing.expect(c.admissionClosed() and !c.readCopyClosed() and c.reclaimClosed() and !c.mintAbandonsBounded() and c.parksClosed());
+    const c: Closure = .{ .admission_bytes = 10, .transport_write_bytes = 10, .read_user_bytes = 5, .read_copy_bytes = 4, .terminal_frees = 3, .reclaim_queued_plus_elided = 3, .mint_abandons = 1, .mint_abandons_bound = 0, .parked_commits = 2, .unparked_commits = 2, .data_device_read_bytes = 8192, .device_read_arms = 4096 };
+    try testing.expect(c.admissionClosed() and !c.readCopyClosed() and c.reclaimClosed() and !c.mintAbandonsBounded() and c.parksClosed() and !c.deviceReadClosed());
     var a: Writer.Allocating = .init(testing.allocator);
     defer a.deinit();
     try c.writeJson(&a.writer);
-    try testing.expectEqualStrings("{\"admission_ledger_closed\":true,\"read_copy_ledger_closed\":false,\"reclaim_ledger_closed\":true,\"mint_abandons_bounded\":false,\"transport_parks_closed\":true}", a.written());
+    try testing.expectEqualStrings("{\"admission_ledger_closed\":true,\"read_copy_ledger_closed\":false,\"reclaim_ledger_closed\":true,\"mint_abandons_bounded\":false,\"transport_parks_closed\":true,\"device_read_ledger_closed\":false}", a.written());
     // The live fold runs on every host (zeros close every identity on an idle process).
     _ = closure();
 }

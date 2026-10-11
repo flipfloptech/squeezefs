@@ -34,23 +34,23 @@ src/cli/args.zig:1656 | 20 | a size — OWED: derive from derive.Facts or docume
 src/cli/args.zig:1666 | 86_400 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/args.zig:1668 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/args.zig:1734 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:417 | 20 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:488 | 500 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:489 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:489 | 990 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:489 | 999 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:503 | 500 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:503 | 990 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:503 | 999 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:504 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/cli/bench.zig:590 | 16 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:590 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:596 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:631 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:634 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:708 | 0o755 | a file mode (POSIX permission bits)
-src/cli/bench.zig:713 | 0o755 | a file mode (POSIX permission bits)
-src/cli/bench.zig:870 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:428 | 20 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:505 | 500 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:506 | 1000 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:506 | 990 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:506 | 999 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:520 | 500 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:520 | 990 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:520 | 999 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:521 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/cli/bench.zig:607 | 16 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:607 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:613 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:648 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:651 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:725 | 0o755 | a file mode (POSIX permission bits)
+src/cli/bench.zig:730 | 0o755 | a file mode (POSIX permission bits)
+src/cli/bench.zig:887 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/config_verb.zig:318 | 0o700 | a file mode (POSIX permission bits)
 src/cli/df.zig:97 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/cli/df.zig:98 | 20 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
@@ -135,7 +135,7 @@ src/data/layout.zig:989 | 4 | OWED: derive it or document it on the line (charte
 src/data/nvme_read_cache.zig:147 | 56 | OWED: derive it or document it on the line (charter §1.5)
 src/data/nvme_read_cache.zig:521 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/data/pack.zig:280 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/data/plane.zig:1724 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/data/plane.zig:1755 | 256 | OWED: derive it or document it on the line (charter §1.5)
 src/data/prefetch.zig:223 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:223 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:470 | 16 | OWED: derive it or document it on the line (charter §1.5)
@@ -146,10 +146,10 @@ src/data/prefetch.zig:499 | 4 | OWED: derive it or document it on the line (char
 src/data/prefetch.zig:563 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/data/read_path.zig:122 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/data/read_path.zig:122 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/read_path.zig:882 | 4 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/data/read_path.zig:1141 | 3 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/data/read_path.zig:1225 | 3 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/data/read_path.zig:1255 | 3 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/data/read_path.zig:908 | 4 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/data/read_path.zig:1173 | 3 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/data/read_path.zig:1263 | 3 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/data/read_path.zig:1293 | 3 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/data/router.zig:165 | 1_000_000 | OWED: derive it or document it on the line (charter §1.5)
 src/data/set_config.zig:236 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/data/set_config.zig:390 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
@@ -216,15 +216,15 @@ src/fuse/abi.zig:139 | 32 | a size — OWED: derive from derive.Facts or documen
 src/fuse/abi.zig:558 | 7 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/abi.zig:558 | 7 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/codec.zig:524 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:325 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/fuse/handler/kv_fs.zig:860 | 256 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1474 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1765 | 0o777 | a file mode (POSIX permission bits)
-src/fuse/handler/kv_fs.zig:1853 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1856 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1869 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2020 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2758 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:329 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/fuse/handler/kv_fs.zig:864 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1478 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1769 | 0o777 | a file mode (POSIX permission bits)
+src/fuse/handler/kv_fs.zig:1857 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1860 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1873 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2024 | 512 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2763 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/op_trace.zig:279 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/mount_options.zig:265 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/mount_options.zig:266 | 10 | OWED: derive it or document it on the line (charter §1.5)
@@ -249,16 +249,16 @@ src/fuse/transport/probes.zig:106 | 4096 | OWED: derive it or document it on the
 src/fuse/transport/probes.zig:194 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/transport/session.zig:263 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/transport/session.zig:611 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/session.zig:1538 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:321 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:321 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:321 | 32 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:321 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:321 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:321 | 9 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:446 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:1032 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/transport/worker.zig:1057 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/session.zig:1540 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:328 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:328 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:328 | 32 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:328 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:328 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:328 | 9 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:453 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:1039 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/transport/worker.zig:1064 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/gates/fuzz_campaign.zig:128 | 72 | OWED: derive it or document it on the line (charter §1.5)
 src/gates/fuzz_campaign.zig:185 | 16 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/gates/fuzz_campaign.zig:185 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
@@ -524,8 +524,8 @@ src/ops/fsck/classes.zig:1542 | 4 | OWED: derive it or document it on the line (
 src/ops/fsck/classes.zig:1544 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/fsck/finding.zig:308 | 10 | a table entry (switch/range arm) — the codec or classification table
 src/ops/fsck/finding.zig:707 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
-src/ops/fsck/runner.zig:582 | 0o700 | a file mode (POSIX permission bits)
-src/ops/fsck/runner.zig:584 | 0o700 | a file mode (POSIX permission bits)
+src/ops/fsck/runner.zig:583 | 0o700 | a file mode (POSIX permission bits)
+src/ops/fsck/runner.zig:585 | 0o700 | a file mode (POSIX permission bits)
 src/ops/jobs/admin_frames.zig:112 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/ops/jobs/admin_frames.zig:150 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/ops/jobs/fabric.zig:286 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
@@ -680,8 +680,8 @@ src/shim/sys.zig:131 | 12 | a size — OWED: derive from derive.Facts or documen
 src/shim/sys.zig:131 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/shim/sys.zig:131 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/stats/stats.zig:425 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
-src/stats/stats.zig:825 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/stats/stats.zig:825 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/stats/stats.zig:837 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/stats/stats.zig:837 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/auth.zig:50 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/auth.zig:59 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/codec.zig:40 | 8 | OWED: derive it or document it on the line (charter §1.5)

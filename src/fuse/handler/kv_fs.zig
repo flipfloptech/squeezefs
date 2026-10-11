@@ -242,6 +242,10 @@ pub var layout_record_corrupt: counters.Tripwire = .init("fuse_layout_record_cor
 pub var fuse_reserved_xattr_refusals: counters.ShardedCounter = .{};
 /// `fuse_virtual_lookups`: `.stats`/`.config`/`.trace` generations minted.
 pub var fuse_virtual_lookups: counters.ShardedCounter = .{};
+/// `fuse_readdir_entries`: dirents answered (READDIR + READDIRPLUS, the
+/// dot entries included) — the metadata read ledger's denominator for a
+/// directory walk (`node_read_bytes ÷ entries`, decision 0003 §K).
+pub var fuse_readdir_entries: counters.ShardedCounter = .{};
 
 /// The `user.squeezefs.il0` rendezvous blob an ARMED session host
 /// synthesizes (charter §7; `ipc/rendezvous.zig`): GETXATTR of the name
@@ -2630,6 +2634,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     error.EmptyName, error.NameTooLong => error.InputOutput,
                 };
             }
+            fuse_readdir_entries.inc();
             return true;
         }
 

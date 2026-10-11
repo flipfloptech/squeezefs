@@ -998,7 +998,7 @@ fn expectSameNames(gpa: std.mem.Allocator, label: []const u8, ours: []const []co
     }
 }
 
-test "bracket ledger pin: bench.zig's device-write, request, admission and read-copy term lists equal brk.py's (the harness's lists were checked against /proc/diskstats; bench follows them)" {
+test "bracket ledger pin: bench.zig's device-write, request, admission, read-copy and device-read term lists equal brk.py's (the harness's lists were checked against /proc/diskstats; bench follows them)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const text = try std.Io.Dir.cwd().readFileAlloc(io, brk_path, gpa, .limited(1 << 20));
@@ -1011,6 +1011,7 @@ test "bracket ledger pin: bench.zig's device-write, request, admission and read-
         .{ .label = "DEVICE_WRITE_REQS", .ours = &bench.StatsTerms.device_write_req_keys },
         .{ .label = "ADMISSION_ARMS", .ours = &bench.StatsTerms.admission_keys },
         .{ .label = "READ_COPY_ARMS", .ours = &bench.StatsTerms.read_copy_keys },
+        .{ .label = "DEVICE_READ_ARMS", .ours = &bench.StatsTerms.device_read_keys },
     };
     for (pins) |p| {
         const theirs = try pyListNames(gpa, text, p.label);
@@ -1030,6 +1031,14 @@ test "bracket ledger pin: bench.zig's device-write, request, admission and read-
     try std.testing.expect(rewrite_beside and lease_beside);
     for (bench.StatsTerms.device_write_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "rewrite_device_write_bytes"));
     for (bench.StatsTerms.read_copy_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "read_dest_lease_bytes"));
+    // The device-read ledger's TOTAL (the plane's choke point) and the WHERE
+    // partition are BESIDE in both: summing them would double every byte.
+    const beside_dr = try pyListNames(gpa, text, "DEVICE_READ_BESIDE");
+    defer gpa.free(beside_dr);
+    var total_beside = false;
+    for (beside_dr) |n| total_beside = total_beside or std.mem.eql(u8, n, "data_device_read_bytes");
+    try std.testing.expect(total_beside);
+    for (bench.StatsTerms.device_read_keys) |k| try std.testing.expect(!std.mem.eql(u8, k, "data_device_read_bytes") and !std.mem.eql(u8, k, "read_fill_dma_bytes") and !std.mem.eql(u8, k, "read_dest_dma_bytes"));
     if (violations.written().len != 0) {
         std.debug.print("bracket ledger pin violation(s):\n{s}", .{violations.written()});
         return error.BracketLedgerDrift;

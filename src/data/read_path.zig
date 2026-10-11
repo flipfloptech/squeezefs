@@ -104,6 +104,18 @@ pub const CONTENDED_BEFORE_ESCALATE: u32 = 2;
 pub const BACKOFF_AFTER: u32 = 4;
 /// The ranged loop's own rebind cap; then the whole-block walk.
 pub const RANGED_MAX_REBINDS: u32 = 8;
+/// The backoff tail's doubling ladder tops at `1 ms << 3` = 8 ms (the
+/// FIND-RW5-A tail, `docs/porting/data_read_path.md` §3.5): the storm a
+/// loser waits out is one allocator free-list cycle (alloc → DMA → publish
+/// of a 4 MiB block, single-digit ms on NVMe), and the `RANGED_MAX_REBINDS
+/// − BACKOFF_AFTER` = 4 tail attempts sum to 1 + 2 + 4 + 8 = 15 ms before
+/// the whole-block walk takes over.
+pub const BACKOFF_SHIFT_CAP: u32 = 3;
+
+/// The tail's sleep: `1 ms << min(step, BACKOFF_SHIFT_CAP)`.
+fn backoffSleep(io: Io, step: u32) void {
+    io.sleep(.fromMilliseconds(@as(i64, 1) << @intCast(@min(step, BACKOFF_SHIFT_CAP))), .awake) catch {};
+}
 /// Retries of the serialized settle: exist ONLY for the invariant-violation
 /// case (a mutator outside both lock disciplines).
 pub const SETTLE_ATTEMPTS: u32 = 4;
@@ -1217,7 +1229,7 @@ pub const ReadPath = struct {
                 stats.read_copy_dest_bytes.add(out.len);
                 return;
             };
-            if (attempt >= BACKOFF_AFTER) io.sleep(.fromMilliseconds(@as(i64, 1) << @intCast(@min(attempt - BACKOFF_AFTER, 3))), .awake) catch {};
+            if (attempt >= BACKOFF_AFTER) backoffSleep(io, attempt - BACKOFF_AFTER);
             // The ghost second touch escalates (not device-true, not a lease).
             if (!device_true and !lease and self.adm.rangedEscalation(k, bs, self.level() == .red, odirect, clock.monotonicNs())) {
                 const blk = try self.getBlockForIndex(io, ino, b, key, false, true, .escalation);
@@ -1308,7 +1320,7 @@ pub const ReadPath = struct {
                 stats.read_copy_dest_bytes.add(out.len);
                 return;
             };
-            if (attempt >= BACKOFF_AFTER) io.sleep(.fromMilliseconds(@as(i64, 1) << @intCast(@min(attempt - BACKOFF_AFTER, 3))), .awake) catch {};
+            if (attempt >= BACKOFF_AFTER) backoffSleep(io, attempt - BACKOFF_AFTER);
             // The ghost second touch escalates to ONE whole-block fill.
             if (self.adm.rangedEscalation(k, bs, self.level() == .red, odirect, clock.monotonicNs())) {
                 const blk = try self.getBlockForIndex(io, ino, b, key, false, true, .escalation);
@@ -1422,7 +1434,7 @@ pub const ReadPath = struct {
         var attempt: u32 = 0;
         while (attempt < ladder_cap) : (attempt += 1) {
             const k = key orelse return null;
-            if (attempt >= BACKOFF_AFTER) io.sleep(.fromMilliseconds(@as(i64, 1) << @intCast(@min(attempt - BACKOFF_AFTER, 3))), .awake) catch {};
+            if (attempt >= BACKOFF_AFTER) backoffSleep(io, attempt - BACKOFF_AFTER);
             const escalated = escalate_contended and losses >= CONTENDED_BEFORE_ESCALATE;
             const fetched = (if (device_true or escalated) self.fetchBlockDeviceTrue(k) else self.getCachedOrFetch(io, k, class)) catch |e| {
                 if (self.bindingIs(ino, b, k)) return e;
@@ -1452,7 +1464,7 @@ pub const ReadPath = struct {
         stats.stale_binding_escalations.inc();
         var attempt: u32 = 0;
         while (attempt < SETTLE_ATTEMPTS) : (attempt += 1) {
-            if (attempt > 0) io.sleep(.fromMilliseconds(@as(i64, 1) << @intCast(@min(attempt - 1, 3))), .awake) catch {};
+            if (attempt > 0) backoffSleep(io, attempt - 1);
             const guard = self.settle.acquire(io, ino);
             defer guard.release(io);
             const k = self.currentBinding(ino, b) orelse return null;

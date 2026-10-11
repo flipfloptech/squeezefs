@@ -3,6 +3,8 @@
 # §K row 8): format a set with FORMAT_OPTS on sparse files, mount, lay down
 # FILES × FILE_MB with O_DIRECT 1 MiB writes, run fio randread BS for SECS and
 # print the device-read ledger. One daemon, its own scratch, torn down.
+# PROBE_SRC=<file> feeds the prepare from that file instead of /dev/urandom
+# (a compressible source shows the ratio-ρ bound beside the incompressible one).
 #   xform-probe.sh <bin> <scratch> "<format opts>" [FILES] [FILE_MB] [BS] [SECS]
 set -euo pipefail
 BIN=$1; S=$2; FOPTS=$3; FILES=${4:-4}; FILE_MB=${5:-256}; BS=${6:-4k}; SECS=${7:-20}
@@ -18,7 +20,7 @@ PID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mount"]["
 cleanup() { "$BIN" umount "$S/mnt" > /dev/null 2>&1 || { kill -9 "$PID" 2>/dev/null; umount -l "$S/mnt" 2>/dev/null; }; }
 trap cleanup EXIT
 t0=$(date +%s)
-for i in $(seq 0 $((FILES - 1))); do dd if=/dev/urandom of="$S/mnt/f.$i" bs=1M count="$FILE_MB" oflag=direct status=none; done
+for i in $(seq 0 $((FILES - 1))); do dd if="${PROBE_SRC:-/dev/urandom}" of="$S/mnt/f.$i" bs=1M count="$FILE_MB" iflag=fullblock oflag=direct status=none; done
 sync -f "$S/mnt"
 echo "prepare: $FILES × $FILE_MB MiB in $(( $(date +%s) - t0 )) s; daemon errors $(grep -c 'error(' "$S/daemon.log" || true)"
 cat "$S/mnt/.stats" > "$S/before.json"

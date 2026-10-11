@@ -11,5 +11,7 @@ FIO_PREFIX=seq
 # docs/evidence/rung-09-brackets.md); ipc_client_aio_unknown_ctx_ops names any
 # iocb that still bypassed the ring. BRK_IOENGINE=psync is the QD1 × N control.
 FIO_HEADLINE=mib_per_s
+FIO_READ_AMP_BOUND=1.05
+FIO_READ_AMP_WHY="a classified stream fetches every whole block once through the IPC path's same ladder, × (1 + f)"
 # shellcheck source=_fio.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_fio.sh"

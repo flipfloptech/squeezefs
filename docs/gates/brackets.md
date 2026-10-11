@@ -146,6 +146,28 @@ is a split the record must explain); `queued + elided ≡ terminal frees`;
 rescue is a lost-wake finding, recorded, and the row is re-run after the
 fix); mem budget Green.
 
+### 4.1 The read-amplification rows (decision 0003 §K; `docs/evidence/rung-09-read-amplification.md`)
+
+Every read row carries a DERIVED `device ÷ user` bound the harness asserts per
+leg (`read_amplification_bound`; the ruler is the exclusive namespaces'
+`/proc/diskstats` read sectors, which count every direct read issued to the
+namespace even when its backing file sits in the VM's page cache, else the
+daemon's device-read arms) and the device-read ledger's closure
+(`device_read_ledger`: `Σ` the plane's purpose arms `≡ data_device_read_bytes`).
+`f = SQUEEZEFS_READ_ADMISSION_FILL_PCT` (5 %) is the ghost escalations' share.
+
+| shape | row | bound (`device ÷ user`) | WHY | substrate |
+|---|---|---|---|---|
+| random 4 KiB, aligned | `rand-4k-read`, `shim-rand-4k-read` | ≤ 1.05 | one 4 KiB window per miss × (1 + f) | nvmet-loop |
+| random 4 KiB at a 512 B grain | `rand-4k-read-unaligned` | ≤ 2.1 | `max W(off, 4096) / 4096 = 2` × (1 + f) | nvmet-loop |
+| random 512 B | `rand-512b-read` | ≤ 8.4 | the DMA grain is the namespace's 4 KiB LBA: `W/len = 8` × (1 + f) | nvmet-loop |
+| random 256 KiB / 1 MiB | `rand-256k-read`, `rand-1m-read` | ≤ 1.05 | every strictly sub-block random read is ranged (`block − 4 KiB` ceiling) | nvmet-loop |
+| sequential, full files | `seq-read-1m-direct`, `seq-read-1m-buffered`, `shim-seq-read-1m` | ≤ 1.05 | whole blocks once; prefetch is read, never dropped | nvmet-loop |
+| sequential with an early stop (8 MiB of 1 GiB files) | `seq-read-early-stop` | ≤ 2.1 | ≤ one prefetch window of overshoot per stream | nvmet-loop |
+| 4 KiB reads after 512 B random writes | `read-after-small-write` | ≤ 2.1 on the read arms | extent records compose over a RANGED base window; the fold's seed reads (`write_side_read_dma_bytes`) are the write-amplification ledger's and reported beside | nvmet-loop |
+| random 4 KiB on `--compress` / `--encrypt` | `rand-4k-read --format-opts` | ≤ 18 (incompressible frames) | the table grain + one 64 KiB frame window: `(4 + 68) / 4` | nvmet-loop |
+| `stat` storm / `find` over 100 k files | `stat-mdtest`, `find-readdir` | cold `node reads/record ≤ 3` (the tree height); warm ≈ 0 | one root→leaf walk per cold record; the node cache holds the working set | nvmet-loop |
+
 ## 5. What a failure means
 
 - An INVALID row is a **defect report**, filed red-first against the ledger

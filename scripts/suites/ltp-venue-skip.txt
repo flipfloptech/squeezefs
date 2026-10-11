@@ -2,3 +2,4 @@
 #   <tag>  <why it is the venue's: the control run that failed on ext4 too>
 # A row here is NEVER a filesystem semantic; the release box runs them.
 proc01  reads every /proc file; /proc/kmsg answers EPERM inside the container (fails on ext4 too — ltp-fs-run1.venue, 2026-10-10)
+setsockopt11  a CVE regression test that allocates until the kernel's OOM killer fires (anon-rss 15.9 GB at the kill): on the shared 16 GiB venue the second invocation took the squeezefs daemon down (supervisor: wait status 0x9) — a venue hazard, not a filesystem op

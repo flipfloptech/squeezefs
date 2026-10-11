@@ -73,8 +73,6 @@ pub const Error = filesystem.Error;
 /// block indices × 4 MiB blocks = 16 PiB (charter §5.6 "EFBIG at
 /// u32::MAX"). A rung-3 inline file refuses far below it (`kv_fs`).
 pub const MAX_FILE_SIZE: u64 = @as(u64, std.math.maxInt(u32)) * (4 << 20);
-/// `O_DIRECT` as `fuse_read_in.flags` (the file's open flags) carries it.
-const O_DIRECT: u32 = @bitCast(linux.O{ .DIRECT = true });
 
 // ---------------------------------------------------------------------------
 // Instruments (§10).
@@ -419,11 +417,15 @@ pub fn Dispatcher(comptime Transport: type) type {
                 },
                 .read => |r| {
                     const d = try fs.vtable.read(fs.impl, c, .{ .ino = ino, .fh = r.fh, .offset = r.offset, .size = r.size, .flags = r.flags });
-                    // A short paged reply zero-completes its pages (the
-                    // copy path's page_zeroing; under zero-copy the bytes
-                    // are already the kernel's) — never for O_DIRECT.
+                    // A short reply zero-completes the window to the
+                    // request's size (the copy path's page_zeroing; under
+                    // zero-copy the bytes are already the kernel's). The
+                    // O_DIRECT flag is the FILE's, not the path's: an mmap
+                    // fault or readahead of an O_DIRECT fd is a page-cache
+                    // fill that owes the same zeros (fstests generic/263),
+                    // and a direct read's user buffer is `size` long.
                     var reply = codec.replyRead(u, c.window[0..d.len], r.size);
-                    if (r.flags & O_DIRECT == 0) reply.zero_pad = codec.readZeroTail(c.window, reply.body.len, r.size);
+                    reply.zero_pad = codec.readZeroTail(c.window, reply.body.len, r.size);
                     return reply;
                 },
                 .write => |w| {
@@ -820,7 +822,7 @@ test "READDIRPLUS counts one lookup reference per positive entry (never the node
     try testing.expectEqual(@as(u8, 0xAB), rig.lb.captured(s).?.body[9]);
 }
 
-test "a SHORT paged READ zero-completes the requested pages past the served bytes in the reply window (the kernel copy path's page_zeroing, owed by the daemon under zero-copy); an O_DIRECT read leaves the window alone (repro-port: LTP fs gf18 — a 1,959-byte inline serve left page 0's tail as garbage the next extend exposed)" {
+test "a SHORT paged READ zero-completes the requested bytes past the served ones in the reply window, bounded by the request's size (the kernel copy path's page_zeroing, owed by the daemon under zero-copy) — for an O_DIRECT-flagged file too: `fuse_read_in.flags` is the FILE's open flags and a page-cache fill (an mmap fault, readahead) of an O_DIRECT fd carries them (repro-port: LTP fs gf18; fstests generic/263 fsx -Z MAPREAD read 0xaaaa past EOF)" {
     var rig: Rig = undefined;
     try rig.init();
     defer rig.deinit();
@@ -835,13 +837,17 @@ test "a SHORT paged READ zero-completes the requested pages past the served byte
     try testing.expectEqual(@as(usize, 1959), rig.lb.captured(s).?.body.len);
     try testing.expect(std.mem.allEqual(u8, win[0..1959], 0xAB));
     try testing.expect(std.mem.allEqual(u8, win[1959..4096], 0));
-    // O_DIRECT: the kernel never zeroes a user buffer past the count; nor do we.
+    // O_DIRECT in the flags: the same pad, to `size` and never past it (a
+    // direct read's user buffer is exactly `size` long; a page-cache fill's
+    // page is the installed window).
     @memset(win, 0x5A);
     var direct = rin;
     direct.flags = @bitCast(linux.O{ .DIRECT = true });
+    direct.size = 3072;
     rig.d.dispatch(.{ .read = direct }, Rig.meta(8, 60), s, null);
     try testing.expectEqual(@as(usize, 1959), rig.lb.captured(s).?.body.len);
-    try testing.expect(std.mem.allEqual(u8, win[1959..4096], 0x5A));
+    try testing.expect(std.mem.allEqual(u8, win[1959..3072], 0));
+    try testing.expect(std.mem.allEqual(u8, win[3072..4096], 0x5A));
 }
 
 test "the obligation: a second reply is dropped and counted (never an overwrite); an owed obligation's deinit synthesizes header-only EIO and counts" {

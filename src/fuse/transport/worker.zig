@@ -73,8 +73,6 @@ const assert = std.debug.assert;
 const uring128 = @import("../../io/uring128.zig");
 const ring_park = @import("../../io/ring_park.zig");
 const abi = @import("../abi.zig");
-/// `O_DIRECT` as `fuse_read_in.flags` (the file's open flags) carries it.
-const O_DIRECT: u32 = @bitCast(linux.O{ .DIRECT = true });
 const codec = @import("../codec.zig");
 const geometry = @import("../geometry.zig");
 const slot = @import("slot.zig");
@@ -2212,7 +2210,7 @@ pub const Group = struct {
         // A short serve (EOF inside the requested pages) takes the copy arm:
         // the fill-pool view has no zeros to bridge past its bytes.
         const served: usize = @min(fs.body.len, in.size);
-        const padded = in.flags & O_DIRECT == 0 and served < @min(in.size, self.payload_len);
+        const padded = served < @min(in.size, self.payload_len);
         if (self.shared.zeroCopy() and m.slots.ent(e).dir == .dest and fs.body.len > 0 and !padded) {
             self.hooks[gent] = fs.done;
             self.local_msgs[gent] = commit_queue.Msg.fdBody(sref, codec.replyData(fs.unique, fs.body), fs.fd, fs.off);
@@ -2230,9 +2228,11 @@ pub const Group = struct {
     /// The kernel's `page_zeroing` for a short paged READ on this slot's
     /// window (`codec.readZeroTail`): under zero-copy the window IS the
     /// installed pages and no kernel copy clears them; elsewhere the copy
-    /// path clears them again (idempotent). Never for an O_DIRECT read.
+    /// path clears them again (idempotent). The O_DIRECT flag is the
+    /// FILE's open flag, never the I/O path's: a page-cache fill of an
+    /// O_DIRECT fd (an mmap fault, readahead) owes the same zeros, and a
+    /// direct read's user buffer is exactly `in.size` long — the bound.
     fn zeroReadTail(self: *Group, gent: u32, in: abi.fuse_read_in, len: usize) u32 {
-        if (in.flags & O_DIRECT != 0) return 0;
         return codec.readZeroTail(self.window(gent), len, in.size);
     }
 

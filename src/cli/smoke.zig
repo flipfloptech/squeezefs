@@ -2653,7 +2653,11 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     defer gpa.free(text);
     const ready_i = std.mem.indexOf(u8, text, "ready: ") orelse return error.NoReadyLine;
     const pid = numberAfter(text[ready_i..], "(pid ") orelse return error.NoPid;
-    try testing.expect(std.mem.indexOf(u8, text, "supervisor: watching daemon ") != null);
+    // The supervisor's own first line lands AFTER the ready handoff that
+    // returned the invoker (a separate process, scheduled in its own time:
+    // under a loaded venue it trails the invoker's exit by seconds), so its
+    // appearance is awaited, never asserted on the snapshot above.
+    _ = try rig.awaitLog("supervisor: watching daemon ", ready_i, ready_wait_ns);
     // The mount works through the shell.
     {
         const out = try rig.shOk(rig.mp, "echo daemonized > f && test \"$(cat f)\" = daemonized && echo ok");

@@ -1429,10 +1429,12 @@ test "the per-piece ladder (the accumulation control arm, overlay off): out-of-o
     try testing.expectEqual(esc0 + 1, extent.stats.extent_escalations.load());
     try testing.expect(w.wp.table.get(21, 2).?.repr == .full);
     try testing.expectEqual(gauge_before - 2 * PAGE, extent.stats.parked_extent_bytes.load()); // the slabs left the extent budget for the buffer's
-    // The shared-mode handoff: a Shared write that extends trips the wire (the data plane still serves it).
+    // The shared-mode handoff: a Shared write that extends trips the wire
+    // (the data plane still serves it) — the tripwire's line and the one
+    // naming the ino, the range and the size.
     const viol0 = counters.tripwireCount("write_shared_class_violation");
     stats.write_shared_class_violation.resetLogBudgetForTest();
-    log.testing.expectErrorLogs(1);
+    log.testing.expectErrorLogs(2);
     _ = try w.wp.write(io, .{ .ino = 21, .offset = 9 * wt.BS, .payload = .{ .bytes = &page }, .class = .shared, .file = World.striped(8 * wt.BS) });
     try log.testing.expectAllFired();
     try testing.expectEqual(viol0 + 1, counters.tripwireCount("write_shared_class_violation"));

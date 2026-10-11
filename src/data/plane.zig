@@ -116,6 +116,7 @@ const write_side_view = @import("write_side_view.zig");
 const device_overlay = @import("device_overlay.zig");
 const patch_w1 = @import("patch_w1.zig");
 const accumulate = @import("accumulate.zig");
+const extent_overlay = @import("extent_overlay.zig");
 const cov = @import("write_coverage.zig");
 const fsync_mod = @import("fsync.zig");
 const read_path = @import("read_path.zig");
@@ -549,6 +550,10 @@ pub const DataPlane = struct {
         // drain-target shed is the write path's to bind) and the in-flight
         // DMA bytes (non-sheddable, drain by completion).
         budget.authority.register(self.wp.table.component(null));
+        // The W2 page overlays' RAM (charter §6.2 item 4: "charged to the
+        // budget as `parked_extent_bytes`"): attribution; the fold at the
+        // RAM trigger and the parked cap's Red halving are its response.
+        budget.authority.register(budget.Component.init("parked_extents", 0, 0, .{ .gauge = &extent_overlay.stats.parked_extent_bytes }, null));
         budget.authority.register(self.wp.governor.component());
 
         // 7. The packer (the promotion primitive's packed arm).

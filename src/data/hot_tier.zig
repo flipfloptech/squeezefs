@@ -124,7 +124,7 @@ pub fn derivedHotBudget(block_size: u64, read_mem_limit: u64) u64 {
 /// reference read RAM / 10 alone; a tenth of the MACHINE ignores the R5
 /// budget (a cgroup cage, a fleet share) — on the venue's 16 GiB it sized a
 /// 1.6 GiB LRU slab against a 4.4 GiB mount-time budget, 37 % of it
-/// (decision 0002 row 460). The budget's eighth is the share charter §4
+/// (decision 0002 row 465). The budget's eighth is the share charter §4
 /// gives the transport arena: the read tiers' RAM may claim the same.
 pub fn derivedReadMemLimit(facts: derive.Facts, budget_bytes: u64) u64 {
     return @min(facts.total_ram / 10, budget_bytes / 8);

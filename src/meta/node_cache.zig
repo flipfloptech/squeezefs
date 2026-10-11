@@ -2163,7 +2163,9 @@ pub const NodeCache = struct {
     /// Register as a sheddable `mem_budget` component: gauge = this cache's
     /// charge, floor 64 MiB, weight 1, shed = a checkpoint kick (an early
     /// run of the exact drain the cadence performs anyway — never-lossy by
-    /// construction: dirty state is flushed, never dropped).
+    /// construction: dirty state is flushed, never dropped). A cache that
+    /// lives for the process (the tests'); a backend's cache registers
+    /// through `KvBackend.budgetComponent`, which survives the swap.
     pub fn registerBudgetComponent(self: *NodeCache, authority: *mem_budget.MemBudget) void {
         authority.register(mem_budget.Component.init(
             "kv_node_cache",
@@ -2174,11 +2176,16 @@ pub const NodeCache = struct {
         ));
     }
 
-    fn shedHook(ctx: *anyopaque, target: u64) void {
-        const self: *NodeCache = @ptrCast(@alignCast(ctx));
+    /// The shed: count it, remember the target, kick the checkpoint.
+    pub fn shed(self: *NodeCache, target: u64) void {
         _ = self.shed_requests.fetchAdd(1, .monotonic);
         self.last_shed_target.store(target, .monotonic);
         if (self.checkpoint_kick) |h| h.call(h.ctx);
+    }
+
+    fn shedHook(ctx: *anyopaque, target: u64) void {
+        const self: *NodeCache = @ptrCast(@alignCast(ctx));
+        self.shed(target);
     }
 
     pub fn shedRequests(self: *const NodeCache) u64 {

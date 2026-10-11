@@ -358,7 +358,10 @@ pub const VolumeBinding = struct {
                 const local: u64 = if (key.splitGuestLocal(key_ino)) |g| g.local else key_ino;
                 const slot = routingSlot(fs, native);
                 try self.noteWindowSlot(slot);
-                try out.append(gpa, .{ .slot = slot, .level = 0, .seq = f.seq, .kind = windowKindOf(f.kind), .local_ino = local, .handle = handle });
+                // An xattr-kind record at local 0 is an intent at the slot's
+                // home (`xv/intent.homeIno`; no inode is ever local 0).
+                const home = local == 0 and tag.tree_id == key.TREE_XATTRS;
+                try out.append(gpa, .{ .slot = slot, .level = 0, .seq = f.seq, .kind = windowKindOf(f.kind), .local_ino = local, .home = home, .handle = handle });
             }
         }
         const seq_offset = @max(p.seq_offset, journal.seqOffsetOfWindow(rec.entries));

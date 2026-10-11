@@ -352,7 +352,8 @@ fn mountMain(ctx: *Ctx) u8 {
     // 64 MiB, weight 1, shed = a checkpoint kick): rung 9 found the caches
     // unregistered — their RAM was the largest unaccounted part of Σ gauges
     // vs RSS under the suites (`docs/evidence/rung-09-memory-footprint.md`).
-    for (be.volumes) |vol| vol.cache.registerBudgetComponent(&mem_budget.authority);
+    // Through the backend: a joiner swaps its cache while it polls.
+    for (be.volumes) |vol| mem_budget.authority.register(vol.budgetComponent());
     // A READER of a symmetric set (charter §5.5): every kernel TTL derives
     // to 0 — a cache may hold an entry exactly as long as the holder's
     // recall proves it; an explicit `-o *_timeout` refuses naming the law.

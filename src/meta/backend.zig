@@ -91,6 +91,7 @@ const key = @import("key.zig");
 const record = @import("record.zig");
 const node = @import("node.zig");
 const node_cache = @import("node_cache.zig");
+const mem_budget = @import("../mem/budget.zig");
 const node_seq = @import("node_seq.zig");
 const tree = @import("tree.zig");
 const smo = @import("smo.zig");
@@ -407,6 +408,10 @@ pub const KvBackend = struct {
     /// The cache budget this open was given (a joiner re-creates its
     /// cache while it polls the projection).
     cache_budget_bytes: u64 = node_cache.DEFAULT_CACHE_BUDGET_BYTES,
+    /// Held across the joiner's cache swap (`reopenControlProjection`) and
+    /// by the R5 component's gauge/shed, so the sampler never reads or
+    /// kicks a cache mid-replacement.
+    cache_swap: jc.SpinLock = .{},
     /// The slot-lease plane: the commit door from the first commit (its
     /// cutover state serves every volume), armed by the appender set.
     slots: *slots_plane.Plane,
@@ -1295,6 +1300,8 @@ pub const KvBackend = struct {
         // record moves into `be.mounted` (the caller's unwind owns it).
         for (be.trees.load()) |t| t.destroy();
         be.trees.deinit();
+        be.cache_swap.lock();
+        defer be.cache_swap.unlock();
         be.cache.deinit();
         be.mounted.deinit(be.gpa);
         be.mounted = fresh;
@@ -1302,6 +1309,31 @@ pub const KvBackend = struct {
         be.cache = try node_cache.NodeCache.init(be.gpa, be.io, .{ .layout = be.layout, .heap_base = be.sb.heap.start, .budget_bytes = be.cache_budget_bytes }, be.dev.loader());
         be.cache.setDurableTail(fresh.journal_tail_seq);
         try be.openControlProjection();
+    }
+
+    /// The R5 component over THIS backend's live node cache (`kv_node_cache`:
+    /// floor 64 MiB, weight 1, shed = a checkpoint kick). Registered through
+    /// the backend, never the cache: `be.cache` is replaced by a joiner's
+    /// `reopenControlProjection`, and a component holding `&cache.cached_bytes`
+    /// dangled after the swap — the sampler read a freed gauge, the garbage
+    /// pressure drove the joiner into Red, and its shed kicked a freed cache
+    /// (the kill rows' B wrote a record with no local ino into its ring).
+    pub fn budgetComponent(be: *KvBackend) mem_budget.Component {
+        return mem_budget.Component.init("kv_node_cache", node_cache.KV_NODE_CACHE_FLOOR_BYTES, node_cache.KV_NODE_CACHE_SHED_WEIGHT, .{ .func = .{ .ctx = be, .call = &cacheBytesFn } }, .{ .ctx = be, .call = &cacheShedFn });
+    }
+
+    fn cacheBytesFn(ctx: *anyopaque) u64 {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        be.cache_swap.lock();
+        defer be.cache_swap.unlock();
+        return be.cache.cachedBytes();
+    }
+
+    fn cacheShedFn(ctx: *anyopaque, target: u64) void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        be.cache_swap.lock();
+        defer be.cache_swap.unlock();
+        be.cache.shed(target);
     }
 
     /// A control record read OFF THE DEVICE at the checkpoint `rec` names,

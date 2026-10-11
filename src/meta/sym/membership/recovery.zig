@@ -167,6 +167,10 @@ pub const WindowRecord = struct {
     kind: Kind,
     /// The slot-tree record's local ino (level 0, put/delete).
     local_ino: u64 = 0,
+    /// The record sits at the slot's INTENT HOME (`xv/intent.homeIno`:
+    /// local 0, which no inode ever owns) — a cross-owner intent of the
+    /// dead appender, legal at local 0.
+    home: bool = false,
     /// The extent an `alloc` claims.
     extent: u64 = 0,
     /// An opaque handle the volume resolves at replay (the frame's bytes).
@@ -641,7 +645,10 @@ pub const Driver = struct {
     /// RE-RUN past its tree-0 step ABSORBS it, judged legal and never
     /// re-applied —, an `alloc` of an extent its grant does not hold
     /// (extent), a record keyed outside the slot it claims (key — the
-    /// seam's `local_ino` is 0 for a key that is not a slot-tree key).
+    /// seam's `local_ino` is 0 for a key that is not a slot-tree key; the
+    /// slot's intent HOME is local 0 by law and is exempt: the kill rows'
+    /// B, killed with a cross-owner mkdir's intent still inside its ring
+    /// window, was refused every poll — "no local ino").
     fn screenWindow(self: *Driver, window: []const WindowRecord, leased: []const u16, grant: []const GrantRun) Error!void {
         var absorbed: [ABSORBED_MAX]u16 = undefined;
         var n_absorbed: usize = 0;
@@ -663,7 +670,7 @@ pub const Driver = struct {
                         stats.appender_recovery_absorbed.inc();
                     }
                 }
-                if (r.level == 0 and r.local_ino == 0) {
+                if (r.level == 0 and r.local_ino == 0 and !r.home) {
                     stats.meta_kv_replay_key_violations.fire("a slot-tree record of the dead ring carries no local ino for its slot");
                     return error.Violation;
                 }
@@ -1506,6 +1513,26 @@ test "an EARLY record quarantines the recovered slots' custody for T_owner + 2 �
     log.testing.expectErrorLogs(1);
     try testing.expectEqual(Outcome.failed, f5.driver.recoverDead(f5.death()));
     try log.testing.expectAllFired();
+    // A key violation: a leased slot's content record with no local ino.
+    const f6 = try Fixture.init(gpa, false);
+    defer f6.deinit();
+    try f6.rv.window.append(gpa, .{ .slot = 10, .level = 0, .seq = 4100, .kind = .put, .local_ino = 0 });
+    const kv0 = stats.meta_kv_replay_key_violations.load();
+    stats.meta_kv_replay_key_violations.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectEqual(Outcome.failed, f6.driver.recoverDead(f6.death()));
+    try log.testing.expectAllFired();
+    try testing.expectEqual(kv0 + 1, stats.meta_kv_replay_key_violations.load());
+    // NOT a violation: the slot's INTENT HOME (local 0 by the home law —
+    // "guest cursors mint from 2, so no inode ever owns it"): a cross-owner
+    // intent minted and retired inside the window is the dead appender's
+    // own record, replayed like any other.
+    const f7 = try Fixture.init(gpa, false);
+    defer f7.deinit();
+    try f7.rv.window.append(gpa, .{ .slot = 10, .level = 0, .seq = 4100, .kind = .put, .local_ino = 0, .home = true });
+    try f7.rv.window.append(gpa, .{ .slot = 10, .level = 0, .seq = 4101, .kind = .delete, .local_ino = 0, .home = true });
+    try testing.expectEqual(Outcome.acted, f7.driver.recoverDead(f7.death()));
+    try testing.expectEqual(kv0 + 1, stats.meta_kv_replay_key_violations.load());
 }
 
 test "a release of recovered regions frees a Recovered page no lease names (identity and term kept) and leaves one a lease still names; the poll binding composes the hooks" {

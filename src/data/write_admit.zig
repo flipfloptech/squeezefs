@@ -1175,6 +1175,19 @@ pub const WritePath = struct {
         for (self.table.blocksOf(ino, &blocks)) |b| _ = accumulate.flushParkedBlock(&self.table, self.uploadDeps(), io, ino, b);
         _ = self.epochs.close(io, ino, self.closeSeams());
     }
+
+    /// The pre-clip settle (a truncate, an O_TRUNC open, the corpse
+    /// destroy): the ino's write-side custody lands or drops before its
+    /// layout is read and clipped — exactly `flushIno` (a parked block's
+    /// upload in flight is JOINED to its exit, tail included; the overlay
+    /// drains; the epoch closes) and nothing process-wide. The old form
+    /// added `quiesce`, a wait for EVERY ino's detached uploads through the
+    /// one task set's single-awaiter group join: two truncates settling at
+    /// once lost one wake for good (fstests generic/074 and 464 — ONE
+    /// open(O_TRUNC) parked 35–40 min at `handler_entry`, no lock held,
+    /// every thread asleep; `std.Io.Threaded` asserts on the same second
+    /// awaiter).
+    pub const settleCustody = flushIno;
 };
 
 // ---------------------------------------------------------------------------
@@ -2112,6 +2125,9 @@ test "the aging store through the write path (rung 9 F17): grant-armed volumes u
 const HeldDma = struct {
     gate: std.atomic.Value(u32) = .init(0),
     hits: std.atomic.Value(u32) = .init(0),
+    /// Hold only the FIRST DMA; later ones pass (a held upload of one ino
+    /// beside other inos' flushes).
+    first_only: bool = false,
 
     fn hook(self: *HeldDma) wt.Hook {
         return .{ .ctx = self, .call = &call };
@@ -2119,7 +2135,8 @@ const HeldDma = struct {
 
     fn call(ctx: *anyopaque, _: *wt.FakeDevice, _: u64, _: u64, _: u64) void {
         const self: *HeldDma = @ptrCast(@alignCast(ctx));
-        _ = self.hits.fetchAdd(1, .acq_rel);
+        const nth = self.hits.fetchAdd(1, .acq_rel);
+        if (self.first_only and nth != 0) return;
         while (self.gate.load(.acquire) == 0) std.Thread.yield() catch std.atomic.spinLoopHint();
     }
 
@@ -2281,6 +2298,68 @@ test "a writer parked at the write-pipeline governor holds no block guard: the o
     var got: [wt.BS]u8 = undefined;
     w.f.dev.peek(b.vol_tag, b.offset, &got);
     try testing.expectEqualSlices(u8, &writer.mid, got[0 .. 4 * PAGE]);
+}
+
+/// A settler of one ino's custody on its own thread (the truncate's venue).
+const Settler = struct {
+    w: *World,
+    ino: u64,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Settler) void {
+        self.w.wp.settleCustody(testing.io, self.ino);
+        self.done.store(true, .release);
+    }
+};
+
+// fstests generic/074 (`fstest`, 3 writers with truncate loops) and 464
+// (16 `xfs_io -ftc` loops over 200 files): ONE open(O_TRUNC) parked at
+// `handler_entry` for 35–40 min, no lock held, every thread asleep,
+// `lock_ticked_reregisters` 0. The pre-clip settle waited for EVERY ino's
+// detached uploads through the write path's one task set — a single-
+// awaiter group join: a second truncate settling at once overwrote the
+// first's awaiter cell, and the last upload's exit woke only one of them.
+// The settle of an ino owes nothing to another ino's upload.
+test "the pre-clip custody settle of one ino waits for nothing of another: two settles at once return while a third ino's upload is held in its DMA" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .adaptive, false);
+    defer w.deinit(testing.allocator);
+    var held: HeldDma = .{ .first_only = true };
+    w.f.dev.hook = held.hook();
+    // ino 2: a block completes; its detached upload is held in its DMA.
+    try w.f.map.create(2, .striped, 0);
+    var half: [wt.BS / 2]u8 align(4096) = undefined;
+    fill(&half, 0x20);
+    _ = try w.wp.write(io, .{ .ino = 2, .offset = 0, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(0) });
+    const o2 = try w.wp.write(io, .{ .ino = 2, .offset = wt.BS / 2, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(wt.BS / 2) });
+    try testing.expectEqual(@as(u32, 1), o2.count(.write_through));
+    while (held.hits.load(.acquire) == 0) std.Thread.yield() catch {};
+    // Two truncates of OTHER inos settle at once (each with one parked
+    // partial of its own, so the settle has real work).
+    try parkHalf(w, io, 1, 0, 0x11);
+    try parkHalf(w, io, 3, 0, 0x33);
+    var s1: Settler = .{ .w = w, .ino = 1 };
+    var s3: Settler = .{ .w = w, .ino = 3 };
+    const t1 = try std.Thread.spawn(.{}, Settler.run, .{&s1});
+    const t3 = try std.Thread.spawn(.{}, Settler.run, .{&s3});
+    // Both return while ino 2's DMA is still held. The bound is one
+    // liveness tick: a settle that owes nothing parks nowhere, and the old
+    // form never returned before the release (the verdict is judged after
+    // the release and the joins — a world torn down under a parked settler
+    // is no verdict).
+    const deadline = clock.monotonicNs() + sync_tick.tick_ns;
+    while ((!s1.done.load(.acquire) or !s3.done.load(.acquire)) and clock.monotonicNs() < deadline) std.Thread.yield() catch {};
+    const both_returned_while_held = s1.done.load(.acquire) and s3.done.load(.acquire) and held.gate.load(.acquire) == 0;
+    held.release();
+    t1.join();
+    t3.join();
+    w.wp.quiesce(io);
+    try testing.expect(both_returned_while_held);
+    // The settles did their own work: inos 1 and 3 are flushed and mapped;
+    // ino 2's upload landed once released.
+    try testing.expect(!w.wp.table.has(1, 0) and !w.wp.table.has(3, 0));
+    try testing.expect(w.f.map.seam().lookup(1, 0) != null and w.f.map.seam().lookup(3, 0) != null);
+    try testing.expect(w.f.map.seam().lookup(2, 0) != null);
 }
 
 test "writeStatsJson aggregates every family under its module key" {

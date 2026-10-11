@@ -26,6 +26,7 @@ const assert = std.debug.assert;
 const futex = @import("../sync/futex.zig");
 const fiber_mod = @import("fiber.zig");
 const lane_mod = @import("lane.zig");
+const stats = @import("stats.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("exec/group is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -112,6 +113,9 @@ fn awaitInner(g: *Io.Group, fiber: ?*Fiber, lanes: []const *Lane) void {
     g.state = @intFromPtr(&cell);
     // acq_rel pairs with `memberFinished`'s fetchSub.
     const prev = Token.fromInt(statusPtr(g).fetchOr(Token.have_awaiter_bit.toInt(), .acq_rel));
+    // ONE awaiter cell: a second concurrent awaiter displaced the first's
+    // and the join wakes only the cell it finds (a caller bug; named).
+    if (prev.have_awaiter and prev.num_running != 0) stats.group_second_awaiter.fire("a second concurrent awaiter of one Io.Group: the earlier awaiter's wake is lost");
     if (prev.num_running != 0) {
         if (fiber) |f| {
             f.awaited_group = g;

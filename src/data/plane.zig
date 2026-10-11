@@ -1118,8 +1118,7 @@ pub const DataPlane = struct {
     /// lands or drops, every detached upload of the mount lands — so the
     /// layout the caller clips is the whole truth.
     pub fn flushCustody(self: *DataPlane, io: Io, ino: u64) void {
-        self.wp.flushIno(io, ino);
-        self.wp.quiesce(io);
+        self.wp.settleCustody(io, ino);
     }
 
     /// RELEASE: the write-back class drains (parked blocks flush, the

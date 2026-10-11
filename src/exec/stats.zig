@@ -93,6 +93,11 @@ pub var inbox_overflow: counters.Tripwire = .init("exec_inbox_overflow");
 /// A fiber's parked frame used more than half its stack (the pin that
 /// fails before an overflow ever can).
 pub var fiber_stack_half: counters.Tripwire = .init("exec_fiber_stack_over_half");
+/// A second concurrent awaiter of one `Io.Group`: the join has ONE awaiter
+/// cell, so the earlier awaiter's wake is lost (`std.Io.Threaded` asserts
+/// here; fstests generic/074 and 464 parked an open(O_TRUNC) for 40 min on
+/// exactly this). A caller bug, named instead of silent.
+pub var group_second_awaiter: counters.Tripwire = .init("exec_group_second_awaiter");
 
 /// What the JSON needs from each lane.
 pub const LaneView = struct {
@@ -132,7 +137,7 @@ pub fn writeStatsJson(w: *Io.Writer, lanes: []const LaneView) Io.Writer.Error!vo
     try writePerClass(w, "exec_spawn_refused", perClassLoads(counters.ShardedCounter, &spawn_refused));
     try w.print(",\"exec_timer_arms\":{d},\"exec_timer_fires\":{d},\"exec_timer_thread_tombstones\":{d},", .{ timer_arms.load(), timer_fires.load(), timer_thread_tombstones.load() });
     try w.print("\"exec_blocking_threads\":{d},\"exec_blocking_queue_depth\":{d},\"exec_blocking_spawns\":{d},\"exec_blocking_refused\":{d},\"exec_blocking_reaped\":{d},\"exec_ring_ops\":{d},", .{ blocking_threads.load(), blocking_queue_depth.load(), blocking_spawns.load(), blocking_refused.load(), blocking_reaped.load(), ring_ops.load() });
-    try w.print("\"exec_fdwatch_double_await\":{d},\"exec_blocking_op_on_fuse_lane\":{d},\"exec_batch_on_lane\":{d},\"exec_inbox_overflow\":{d},\"exec_fiber_stack_over_half\":{d},", .{ fdwatch_double_await.load(), blocking_op_on_fuse_lane.load(), batch_on_lane.load(), inbox_overflow.load(), fiber_stack_half.load() });
+    try w.print("\"exec_fdwatch_double_await\":{d},\"exec_blocking_op_on_fuse_lane\":{d},\"exec_batch_on_lane\":{d},\"exec_inbox_overflow\":{d},\"exec_fiber_stack_over_half\":{d},\"exec_group_second_awaiter\":{d},", .{ fdwatch_double_await.load(), blocking_op_on_fuse_lane.load(), batch_on_lane.load(), inbox_overflow.load(), fiber_stack_half.load(), group_second_awaiter.load() });
     try w.writeAll("\"exec_lanes\":[");
     for (lanes, 0..) |l, i| {
         if (i != 0) try w.writeByte(',');

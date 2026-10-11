@@ -775,11 +775,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn entryOf(self: *Self, global: u64, v: InodeValue) filesystem.Entry {
-            return .{ .nodeid = global, .entry_ttl_ns = self.ttls.entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.ttls.attr_ns, .attr = self.attrOf(global, v) };
+            return .{ .nodeid = global, .entry_ttl_ns = self.ttls.entryTtlFor(economy.isDirMode(v.mode)), .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
         }
 
         fn attrReply(self: *Self, global: u64, v: InodeValue) filesystem.Attr {
-            return .{ .attr_ttl_ns = self.ttls.attr_ns, .attr = self.attrOf(global, v) };
+            return .{ .attr_ttl_ns = self.attrTtlFor(v), .attr = self.attrOf(global, v) };
+        }
+
+        /// The attr TTL a record is served with: the mount's, except for a
+        /// file carrying S_ISUID/S_ISGID — KILLPRIV_V2 is the daemon's
+        /// (module doc), the WRITE reply carries no attrs and the kernel
+        /// invalidates none on it, so a cached mode would outlive the clear
+        /// (fstests generic/355: stat after a priv-killing write showed
+        /// -rwSr-Sr--). 0 = every stat of such a file asks; they are rare.
+        fn attrTtlFor(self: *const Self, v: InodeValue) u64 {
+            if (v.mode & (S.ISUID | S.ISGID) != 0 and v.mode & S.IFMT == S.IFREG) return 0;
+            return self.ttls.attr_ns;
         }
 
         /// The live chain of `(parent, hash54(name))`: keys into `buf`, the
@@ -3073,6 +3084,42 @@ test "the layout record is the v4 `layout.Layout`: an inline write publishes kin
     const back = try Layout.decode(enc, .default);
     try testing.expectEqual(layout.Kind.inline_, back.kind);
     try testing.expectEqualStrings("hello", back.data);
+}
+
+test "a file carrying S_ISUID/S_ISGID is served with attr TTL 0 on GETATTR, LOOKUP, CREATE and SETATTR replies — the kernel caches no mode KILLPRIV_V2 is about to clear under it (the WRITE reply carries no attrs and the kernel invalidates none); a plain file keeps the mount's TTL (repro-port: fstests generic/355 — stat after a priv-killing direct write showed the cached -rwSr-Sr--)" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const ttl = h.fs.ttls.attr_ns;
+    try testing.expect(ttl > 0);
+    const plain = try h.create(1, "plain", 0o644);
+    const g0 = h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, plain);
+    try testing.expectEqual(ttl / std.time.ns_per_s, (abi.decodeExact(abi.fuse_attr_out, g0.outBytes()) orelse return error.TestBadReply).attr_valid);
+    // CREATE of a setuid file: the entry's attr TTL is 0.
+    const c = h.call(.{ .create = .{ .name = "suid", .flags = 0, .mode = 0o4755, .umask = 0, .open_flags = 0 } }, 1);
+    const ce = abi.decodePrefix(abi.fuse_entry_out, c.outBytes()) orelse return error.TestBadReply;
+    try testing.expectEqual(@as(u64, 0), ce.attr_valid);
+    try testing.expectEqual(@as(u64, 0), ce.attr_valid_nsec);
+    const suid = ce.nodeid;
+    // GETATTR and LOOKUP: 0 as well.
+    const g1 = h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, suid);
+    const a1 = abi.decodeExact(abi.fuse_attr_out, g1.outBytes()) orelse return error.TestBadReply;
+    try testing.expectEqual(@as(u64, 0), a1.attr_valid);
+    try testing.expectEqual(@as(u64, 0), a1.attr_valid_nsec);
+    const l1 = try h.entry(h.lookup(1, "suid"));
+    try testing.expectEqual(@as(u64, 0), l1.attr_valid);
+    // A setgid-only file (the group-exec sgid KILLPRIV clears) too.
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_MODE;
+    sa.mode = 0o2755;
+    const s1 = h.setattr(plain, sa);
+    try testing.expectEqual(@as(u64, 0), (abi.decodeExact(abi.fuse_attr_out, s1.outBytes()) orelse return error.TestBadReply).attr_valid);
+    // Once the bits are gone the mount's TTL returns.
+    _ = h.write(suid, 0, "y", abi.FUSE_WRITE_KILL_SUIDGID);
+    const g2 = h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, suid);
+    const a2 = abi.decodeExact(abi.fuse_attr_out, g2.outBytes()) orelse return error.TestBadReply;
+    try testing.expectEqual(@as(u32, S.IFREG | 0o755), a2.attr.mode);
+    try testing.expectEqual(ttl / std.time.ns_per_s, a2.attr_valid);
 }
 
 test "KILLPRIV_V2 mode law: suid always; sgid iff group-exec" {

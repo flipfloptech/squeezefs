@@ -41,7 +41,6 @@ const assert = std.debug.assert;
 
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
-const knobs = @import("../core/knobs.zig");
 const log = @import("../core/log.zig");
 const budget = @import("../mem/budget.zig");
 const jc = @import("../meta/journal_core.zig");
@@ -120,9 +119,15 @@ pub fn derivedHotBudget(block_size: u64, read_mem_limit: u64) u64 {
     return @max(2 * block_size, read_mem_limit / 4);
 }
 
-/// `--read-mem-cache-size` else RAM / 10.
-pub fn derivedReadMemLimit(facts: derive.Facts) u64 {
-    return facts.total_ram / 10;
+/// The read-tier RAM limit (the read LRU's slab and, through
+/// `derivedHotBudget`, the hot tier): `min(RAM / 10, budget / 8)`. The
+/// reference read RAM / 10 alone; a tenth of the MACHINE ignores the R5
+/// budget (a cgroup cage, a fleet share) — on the venue's 16 GiB it sized a
+/// 1.6 GiB LRU slab against a 4.4 GiB mount-time budget, 37 % of it
+/// (decision 0002 row 460). The budget's eighth is the share charter §4
+/// gives the transport arena: the read tiers' RAM may claim the same.
+pub fn derivedReadMemLimit(facts: derive.Facts, budget_bytes: u64) u64 {
+    return @min(facts.total_ram / 10, budget_bytes / 8);
 }
 
 /// Explicit (MiB, verbatim; 0 = tier off) > derived.
@@ -131,14 +136,9 @@ pub fn resolveHotBudget(explicit_mib: ?u64, block_size: u64, read_mem_limit: u64
     return derivedHotBudget(block_size, read_mem_limit);
 }
 
-pub fn resolveReadMemLimit(explicit_mib: ?u64, facts: derive.Facts) u64 {
+pub fn resolveReadMemLimit(explicit_mib: ?u64, facts: derive.Facts, budget_bytes: u64) u64 {
     if (explicit_mib) |m| return m * derive.MiB;
-    return derivedReadMemLimit(facts);
-}
-
-pub fn hotBudgetFromEnv(env: *const std.process.Environ.Map, block_size: u64, facts: derive.Facts) u64 {
-    const read_mem = resolveReadMemLimit(knobs.optIntKnob("SQUEEZEFS_READ_MEM_CACHE_MB", u64, env), facts);
-    return resolveHotBudget(knobs.optIntKnob("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", u64, env), block_size, read_mem);
+    return derivedReadMemLimit(facts, budget_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -765,10 +765,15 @@ test "tie: shard derivation — max(next_pow2(cores), 16), halved to the 16 MiB 
     try testing.expectEqual(@as(u32, 1), shardsForBudget(64, 8 * derive.MiB, MIN_SHARD_BYTES));
     try testing.expectEqual(@as(u32, 64), shardsForBudget(64, 4 * derive.GiB, MIN_SHARD_BYTES));
     try testing.expectEqual(@as(u32, 1), shardsForBudget(64, 0, MIN_SHARD_BYTES));
-    // Budget: max(2 × block, read_mem / 4); read_mem = RAM / 10.
+    // Budget: max(2 × block, read_mem / 4); read_mem = min(RAM / 10, budget / 8).
     try testing.expectEqual(@as(u64, 8 * derive.MiB), derivedHotBudget(4 * derive.MiB, 16 * derive.MiB));
     try testing.expectEqual(@as(u64, 256 * derive.MiB), derivedHotBudget(4 * derive.MiB, derive.GiB));
-    try testing.expectEqual(@as(u64, 32 * derive.GiB), derivedReadMemLimit(derive.Facts.synthetic(32, 320 * derive.GiB)));
+    // A whole-machine budget (70 % of RAM): RAM / 10 binds (320 GiB → 32 GiB; 224 / 8 = 28 GiB would not).
+    try testing.expectEqual(@as(u64, 28 * derive.GiB), derivedReadMemLimit(derive.Facts.synthetic(32, 320 * derive.GiB), 224 * derive.GiB));
+    try testing.expectEqual(@as(u64, 32 * derive.GiB), derivedReadMemLimit(derive.Facts.synthetic(32, 320 * derive.GiB), 320 * derive.GiB));
+    // The venue: 16 GiB RAM, a 4369 MiB mount-time budget ⇒ 546 MiB, not 1.6 GiB.
+    try testing.expectEqual(4369 * derive.MiB / 8, derivedReadMemLimit(derive.Facts.synthetic(9, 16 * derive.GiB), 4369 * derive.MiB));
+    try testing.expectEqual(@as(u64, 300 * derive.MiB), resolveReadMemLimit(300, derive.Facts.synthetic(9, 16 * derive.GiB), 4369 * derive.MiB));
     try testing.expectEqual(@as(u64, 0), resolveHotBudget(0, 4 * derive.MiB, derive.GiB));
     try testing.expectEqual(@as(u64, 48 * derive.MiB), resolveHotBudget(48, 4 * derive.MiB, derive.GiB));
 }

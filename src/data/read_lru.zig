@@ -179,18 +179,30 @@ pub const ReadLru = struct {
         return self.cache.currentBytes();
     }
 
+    /// The RAM this tier holds: its slab's resident bytes (the entries'
+    /// slots plus the freed slots the kernel still backs) — not the logical
+    /// entry bytes (`read_lru_current_bytes`), which undercount a slab
+    /// whose evicted slots stay resident.
     fn gaugeFn(ctx: *anyopaque) u64 {
         const self: *ReadLru = @ptrCast(@alignCast(ctx));
-        return self.currentBytes();
+        return self.slab.residentBytes();
     }
 
+    /// Evict down to the target, then return the idle slots the eviction
+    /// freed (Red: everything idle) so the gauge moves in the same call.
     fn shedFn(ctx: *anyopaque, target: u64) void {
         const self: *ReadLru = @ptrCast(@alignCast(ctx));
         self.shedTo(target);
+        self.slab.trimToward(budget.trim_red_min_idle_ticks, target -| self.slab.checkedOutBytes());
+    }
+
+    fn trimFn(ctx: *anyopaque, min_idle_ticks: u64) void {
+        const self: *ReadLru = @ptrCast(@alignCast(ctx));
+        self.slab.trim(min_idle_ticks);
     }
 
     pub fn component(self: *ReadLru) budget.Component {
-        return budget.Component.init("read_lru", COMPONENT_FLOOR, COMPONENT_WEIGHT, .{ .func = .{ .ctx = self, .call = &gaugeFn } }, .{ .ctx = self, .call = &shedFn });
+        return budget.Component.init("read_lru", COMPONENT_FLOOR, COMPONENT_WEIGHT, .{ .func = .{ .ctx = self, .call = &gaugeFn } }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn });
     }
 };
 
@@ -242,9 +254,15 @@ test "the small LRU: protected inserts, pinned hits copy out, the clock evicts t
     try testing.expectEqualStrings("read_lru", comp.name);
     try testing.expectEqual(COMPONENT_FLOOR, comp.floor);
     try testing.expectEqual(COMPONENT_WEIGHT, comp.weight);
-    lru.shedTo(0);
+    // The gauge is the slab's RAM: entries + evicted-but-resident slots.
+    try testing.expectEqual(lru.slab.residentBytes(), comp.current());
+    try testing.expect(comp.current() > lru.currentBytes());
+    // A shed to 0 evicts everything AND returns the freed slots: the gauge reads 0.
+    comp.shed.?.call(comp.shed.?.ctx, 0);
     try testing.expectEqual(@as(u64, 0), lru.currentBytes());
     try testing.expectEqual(@as(usize, lru.slab.capacity), lru.slab.freeSlots());
+    try testing.expectEqual(@as(u64, 0), comp.current());
+    try testing.expect(comp.trim != null);
 }
 
 const TestSink = struct {

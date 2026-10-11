@@ -474,7 +474,7 @@ pub const Config = struct {
     prefetch: prefetch.Config,
 
     pub fn fromEnv(env: *const std.process.Environ.Map, block_size: u64, passthrough: bool, facts: derive.Facts, mem_budget: u64) Config {
-        const read_mem = hot_tier.resolveReadMemLimit(knobs.optIntKnob("SQUEEZEFS_READ_MEM_CACHE_MB", u64, env), facts);
+        const read_mem = hot_tier.resolveReadMemLimit(knobs.optIntKnob("SQUEEZEFS_READ_MEM_CACHE_MB", u64, env), facts, mem_budget);
         const hot = hot_tier.resolveHotBudget(knobs.optIntKnob("SQUEEZEFS_READ_HOT_BLOCK_CACHE_MB", u64, env), block_size, read_mem);
         const cap_seam = knobs.intKnob("SQUEEZEFS_TEST_READ_REBIND_LADDER_CAP", u32, env);
         return .{
@@ -738,14 +738,15 @@ pub const ReadPath = struct {
         });
     }
 
-    /// Register every sheddable component (§2.5).
+    /// Register every sheddable component (§2.5). The two slabs gauge their
+    /// idle-resident bytes and carry the idle trim (`read_fill_pool`).
     pub fn registerComponents(self: *ReadPath, mem: *budget.MemBudget) void {
         mem.register(self.hot.component());
         mem.register(self.lru.component());
         mem.register(self.hold.component());
         mem.register(self.pool.component());
         mem.register(self.nvme.component());
-        mem.register(budget.Component.init("ranged_buf_pool", RANGED_POOL_FLOOR, 2, .{ .gauge = &self.ranged_bounce.checked_out_bytes }, null));
+        mem.register(self.ranged_bounce.componentNamed("ranged_buf_pool", RANGED_POOL_FLOOR, 2));
     }
 
     fn level(self: *const ReadPath) budget.Level {

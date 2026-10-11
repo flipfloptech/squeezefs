@@ -213,7 +213,10 @@ wedges: `suites-probe-20261010-165924/d3-wedge-stats.json`,
 | 21 | fstests pass 2 `rewrite_shadow_displaced_drift` + `block_untracked_free_refusals` at 02:01:39 — on the TEST device under `generic/247` (a 500-block file overwritten by an O_DIRECT dd and a backward mmap writer at once), not 345 | the epoch's cap fallback (row 179) answered `not_shadowed` for a block the ino's CLOSING epoch still shadowed; the upload's durable merge landed under the running save, which then displaced a key it never parked and freed the parked A a second time | write_epoch test "a record for a block the CLOSING epoch shadows never takes the durable merge under the save, cap or no cap …" (red: both tripwires fired in the test exactly as in the log) | 82cef48 (`RecordVerdict.save_in_flight`, `Epochs.awaitSaveSettled`, `rewrite_shadow_save_waits`) |
 | 22 | fstests `generic/464` on the fixed binary: `write_shared_class_violation` ×193 in ONE run, every one an append at its own EOF ("write ino 3298534883330 [1441996, 1442008): classified Shared against a striped file of size 1441996") | the lifecycle probed the shape table with the kernel NODEID; the plane publishes under the EFFECTIVE ino, and the spaces alias (the mint's rotor: nodeid 4 = slot 2's local 2, key `(3 << 40) \| 2`; key 4 = slot 0's local 4, nodeid 131074) — file #2's writes were classified on file #128's size; and every file whose nodeid ≠ key never reached the Shared class at all | plane test "the shared probe keys by the plane's effective ino: a nodeid answers its own file's shape, never the file whose key merely equals that number" (red: nodeid 4 read the sibling's 6 MiB) | 7f05638 (`DataPlane.shapeProbeKey`; the violation's log line names ino, range, kind, size); `generic/464` after: 0 alert lines |
 
-Decision 0002 rows 442–451, 454–456 and 460–464 record each divergence from the reference's shape.
+| 23 | fstests `generic/069` (`append_writer`: 3 M 4-byte O_APPEND writes; 270–380 appends/s at a 1–2 MiB image ≈ 3 ms each, ≈ 3 h for the test) | the staged arm re-staged the WHOLE image per write (one copy out of the ring, one in) and committed a whole inode `Put` + the layout `Put` per append; the record's one header made an in-place append un-killsafe | kv_fs `SettlingData` test "the staged append law … M small appends to a staged file land IN PLACE in the record's slack — ring bytes moved ≤ 11 × bytes appended, ONE commit per append carrying a Δ(size, mtime, ctime)" over a real RAM ring; staging test "in-place append (§J.2): … recovery takes the valid slot with the higher generation and a torn alternate slot leaves the old record intact" | 20a1a3d (segment record v2: two header slots, the reserved slack `max(GRAIN, V/4)` on an extending write, `Segment.appendInPlace`, `staging_appends/_restages` ledger, the inode Δ postlude); fe15347 (the checksum consumes the value FIRST and the live cell keeps its streaming state — an append hashes the appended bytes alone; a 4-byte append on a 2.7 MiB image had rehashed the image: 1,400 → 770 appends/s as the file grew, 1.26 ms of lane CPU per write) |
+| 24 | fstests `generic/074` (`fstest -n 3 -F -l 10 -f 5 -s 31457280 -b 512`: 512 B writes at a 1 KiB stride; 26,102 whole-block folds = 109 GB of device writes for 855 MB of user bytes, **128×**; the bracket row `frag-512b-write` 130–134× on c36b531) | W2's fold trigger was a COUNT cap (64 extents = 32 KiB of 512 B writes) and its grain the whole 4 MiB block (seed the image, apply, upload — then the next 64 writes into the now-mapped block seeded it again); the charter's `2048/k + 2` assumed 2 KiB extents | write_admit tests "W2 amplification law, hole blocks … every block lands exactly ONCE at its flush" (red on the old policy: 4× at the 64 KiB test block, 128× at 4 MiB), "… a mapped sole-owner passthrough block folds IN PLACE at the page grain" (16 KiB for 2 KiB = the 8× bound), "… CoW bases land whole ONCE per parked episode"; e2e(nvme_dev) "the W2 amplification law at the 4 MiB block" (2× user, one DMA per block, zero reads; the in-place fold's 4 page DMAs) | ed8a7b9 (the page-indexed overlay, the RAM-bound trigger, the in-place fold through W1's state half, the seeded CoW escalation, `FOLD_MAX_EXTENTS`/`_BYTES` deleted, `seams.ImageSeam`); 95817d9 (the seed off the write path: byte masks until the fold); 2f3c7eb (the fold detached). Through the harness: `frag-512b-write` 7.06× / 6.81× at 9.8 k / 9.4 k IOPS vs 130× at 5.3 k / 4.6 k |
+
+Decision 0002 rows 442–451, 454–456, 460–464 and 469–472 record each divergence from the reference's shape.
 
 ### The stall repros (defects 16–19)
 
@@ -260,11 +263,8 @@ rerun on a quiet venue before the release gate.
   images for truncate-grown files until defect 10; three post-fix fsstress rounds (seeds 5/9/11,
   277/280/278 promotions) failed 0, and every decline now names its cause at debug level
   (`cd00f5f`). Closed as a consequence of defect 10.
-- **Staged-arm append amplification** (`generic/069`: `append_writer 3000000` — 3 M 4-byte
-  O_APPEND writes): every write to a staged file re-stages the WHOLE image (one copy out of the
-  ring, one copy in) and commits one journal entry; measured ≈ 270–380 appends/s at 1–2 MiB
-  (≈ 3 ms each) → the test needs ≈ 3 h. Correct, slow: a write-path design item (an in-place
-  ring append under the record's grain padding, or the write-back class for the staged arm).
+- **Staged-arm append amplification** (`generic/069`) — FIXED (defect 23 below; decision 0003
+  §J.2): the staged arm appends IN PLACE in the ring record's slack, one Δ record per write.
 - **Staging ring full → ENOSPC** under a 20-writer burst of 3–4 MiB files: owned by the
   `.wt-enospc` agent (F17's sibling) — not touched here.
 - **`rewrite_shadow_displaced_drift` + `block_untracked_free_refusals`** — FIXED (defect 21; the
@@ -293,7 +293,10 @@ rerun on a quiet venue before the release gate.
   the harness the test's daemon reached 14.2 GB anon in ≈ 20 min and the kernel killed it
   (`074.dmesg`: `Killed process … (squeezefs) anon-rss:14252232kB`), twice in two runs; the
   fsck helper then refused on the dead holder's guard ("live-mounted") — the harness's fsck
-  helper owes the mount helper's dead-holder attestation. The same run shows the W2 fold's
+  helper owes the mount helper's dead-holder attestation. The same run showed the W2 fold's
   amplification on this shape: `parked_gate_self_flushes` = `write_through_blocks` = 26,102
   folds (64 × 512 B extents each) = `durable_upload_bytes_escalation` 109 GB of device writes for
-  855 MB of user bytes (128×). Both are the RSS item's and the write path's, not the stalls'.
+  855 MB of user bytes (128×) — FIXED (defect 24 below; decision 0003 §J.1). The RSS growth
+  itself is the memory-footprint item's (`rung-09-memory-footprint.md`): with the fold fixed
+  the shape's whole-block churn (26,102 allocate/upload/displace/free cycles, each a 4 MiB
+  read + write and a reclaim-queue entry) is gone, so the write path no longer feeds it.

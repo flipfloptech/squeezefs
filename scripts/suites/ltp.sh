@@ -71,7 +71,7 @@ ltp_control() {
   [ -n "$cmd" ] || { echo ours; return; }
   local ctl="$SUITES_TMP/ltp-ctl-$n"; rm -rf "$ctl"; mkdir -p "$ctl"
   local rc=0
-  (cd "$ctl" && PATH="$LTP_PREFIX/testcases/bin:$PATH" TMPDIR="$ctl" LTPROOT="$LTP_PREFIX" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-2} timeout -s KILL "$LTP_EXEC_TIMEOUT_S" sh -c "$cmd" > "$RESULTS/ctl-$tag-run$n.out" 2>&1) || rc=$?
+  (cd "$ctl" && PATH="$LTP_PREFIX/testcases/bin:$PATH" TMPDIR="$ctl" LTPROOT="$LTP_PREFIX" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL "$LTP_EXEC_TIMEOUT_S" sh -c "$cmd" > "$RESULTS/ctl-$tag-run$n.out" 2>&1) || rc=$?
   rm -rf "$ctl"
   if [ "$rc" != 0 ] && [ "$rc" != 32 ]; then echo venue; else echo ours; fi
 }
@@ -92,8 +92,10 @@ ltp_run() {
   t0=$(date +%s)
   # TMPDIR ON THE MOUNT is the whole point: every test's tst_tmpdir() lands
   # there. LTP_TIMEOUT_MUL leaves LTP's own per-test timeouts in place,
-  # doubled for the venue (a slow venue is not a defect).
-  (cd "$KIRK_DIR" && LTPROOT="$LTP_PREFIX" TMPDIR="$tmp" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-2} timeout -s KILL $((LTP_TIMEOUT_S + 120)) \
+  # ×4 for the FUSE round trip (fcntl12 opens one file getdtablesize()
+  # times inside a 30 s budget — ≈ 50 µs per OPEN across the ring is the
+  # transport's cost, not a semantic; LTP's own advice is this multiplier).
+  (cd "$KIRK_DIR" && LTPROOT="$LTP_PREFIX" TMPDIR="$tmp" LTP_TIMEOUT_MUL=${LTP_TIMEOUT_MUL:-4} timeout -s KILL $((LTP_TIMEOUT_S + 120)) \
      ./kirk --no-colors --tmp-dir "$ktmp" --run-suite "$file" ${LTP_PATTERN:+--run-pattern "$LTP_PATTERN"} --json-report "$report" --suite-timeout "$LTP_TIMEOUT_S" --exec-timeout "$LTP_EXEC_TIMEOUT_S" "${skip[@]}" > "$RESULTS/kirk-$tag.console" 2>&1) || rc=$?
   t1=$(date +%s)
   [ -s "$report" ] || { tail -20 "$RESULTS/kirk-$tag.console" >&2; suite_log "$file run $n: kirk produced no report (rc $rc)"; suite_umount "$tag"; return 1; }

@@ -13,3 +13,7 @@ run, never adjudicated here. `reason-class` ∈ {`noatime`, `thin-provisioning`,
 
 | test-id | reason-class | evidence |
 |---|---|---|
+| syscalls/epoll_ctl06 | by-design-fuse-poll | `epoll_ctl(ADD)` on a regular file must EPERM; the kernel's FUSE module gives EVERY file `fuse_file_poll` (no_poll ⇒ DEFAULT_POLLMASK), so it succeeds on any FUSE filesystem — the kernel module's shape, outside the daemon |
+| syscalls/fallocate03 | by-design-no-fallocate | `fallocate(2)` is outside the must-implement set (decision 0003; the rung-4 ops answer ENOSYS → EOPNOTSUPP); xfstests `_notrun`s 31 tests on the same absence. Named in the evidence note as a feature gap, not a defect of implemented behaviour |
+| syscalls/mremap06 | by-design-no-fallocate | the test's setup is `fallocate()`; as fallocate03 |
+| syscalls/ioctl_loop05 | by-design-ltp-pseudo-fs-policy | LTP's `tst_device` refuses to back a loop device with a file "on an unsupported pseudo-file system" — its classification of every FUSE mount; the test never reaches a filesystem op |

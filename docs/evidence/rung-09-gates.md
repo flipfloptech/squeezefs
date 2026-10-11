@@ -277,7 +277,7 @@ bug underneath):
   pin read `tick_rescues` the moment the ack returned: `expected 1, found
   0` once in the gate at load ~9, 4/200 in a loop under an 8-way `yes`
   load, 11/11 alone — the waker/wakee preemption of a loaded box, not a
-  lost rescue (the count lands microseconds later). Fix (`41ba633`): the
+  lost rescue (the count lands microseconds later). Fix (`1c47f85`): the
   pin records the count before the foreign completion and, after the ack,
   waits for the acking poll's verdict on the lane's own counter
   (`spinUntilBy`, two liveness ticks, the lane's counters on red); with the
@@ -298,7 +298,7 @@ gate` **25/25 steps, 2029/2053** (24 `no_linux` skips; unit 1905 pass, rails
 The first Linux gate of the same commits ran beside the suites agent's
 fstests (load ~9) and read unit 2331 / 41 / **1 fail** — `journal_lane` "a
 lost kick … exactly one tick rescue" (`expected 1, found 0`; the third
-hazard above, fixed in `41ba633`) — and smoke 58 / 2 / 3 fail (the two-daemon
+hazard above, fixed in `1c47f85`) — and smoke 58 / 2 / 3 fail (the two-daemon
 matrix, kill rows (a) on daemon B's `kmbuf ring registration ENOMEM
 (order-8)` — the known venue refusal under page-cache churn — and the
 `-o ro` reader), all green on the immediate re-run.

@@ -348,6 +348,11 @@ fn mountMain(ctx: *Ctx) u8 {
     }) catch |e| return ctx.failed("cannot open metadata set {s}: {s} ({t}, {s})", .{ ctx.meta_uri, openReason(e), meta_set.openErrno(e), @tagName(errors.classOf(meta_set.openCoreError(e))) });
     var be_open = true;
     defer if (be_open) be.close();
+    // Every volume's node cache is an R5 component (`kv_node_cache`: floor
+    // 64 MiB, weight 1, shed = a checkpoint kick): rung 9 found the caches
+    // unregistered — their RAM was the largest unaccounted part of Σ gauges
+    // vs RSS under the suites (`docs/evidence/rung-09-memory-footprint.md`).
+    for (be.volumes) |vol| vol.cache.registerBudgetComponent(&mem_budget.authority);
     // A READER of a symmetric set (charter §5.5): every kernel TTL derives
     // to 0 — a cache may hold an entry exactly as long as the holder's
     // recall proves it; an explicit `-o *_timeout` refuses naming the law.

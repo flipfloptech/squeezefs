@@ -543,6 +543,12 @@ pub const DataPlane = struct {
             .scratch_len = if (self.xform != null) transform.scratchLen(cfg.block_size) else 0,
         }) catch return error.OutOfMemory;
         errdefer self.wp.deinit(io);
+        // The write side's R5 components (spec §2.5): the parked-buffer
+        // pool's RAM (its cached cells return under the idle-trim law; the
+        // drain-target shed is the write path's to bind) and the in-flight
+        // DMA bytes (non-sheddable, drain by completion).
+        budget.authority.register(self.wp.table.component(null));
+        budget.authority.register(self.wp.governor.component());
 
         // 7. The packer (the promotion primitive's packed arm).
         if (self.stage != null) {

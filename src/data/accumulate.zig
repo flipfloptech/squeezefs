@@ -127,6 +127,8 @@ pub const stats = struct {
     pub var parked_full_buffer_bytes: counters.Gauge = .{};
     pub var parked_buffers: counters.Gauge = .{};
     pub var parked_pool_refusals: counters.ShardedCounter = .{};
+    /// `parked_pool_trimmed_cells`: cached cells the idle trim freed.
+    pub var parked_pool_trimmed_cells: counters.ShardedCounter = .{};
     pub var durable_upload_bytes_escalation: counters.ShardedCounter = .{};
     /// A merge whose bytes already lived in the entry's cell (a placed
     /// payload of an adopted assembly — the pointer proof): the copy elided.
@@ -140,7 +142,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "durable_upload_bytes_escalation", "placed_merge_elides" }) |name| {
+    inline for (.{ "write_through_blocks", "write_through_bytes", "write_through_fallbacks", "nt_copy_bytes", "active_block_cow_copies", "active_block_memset_elided_bytes", "active_block_ooo_runs", "active_block_run_table_completions", "overwrite_seed_deferred", "overwrite_seed_materialized", "overwrite_seed_skipped", "write_block_revisits", "parked_pool_refusals", "parked_pool_trimmed_cells", "durable_upload_bytes_escalation", "placed_merge_elides" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"parked_full_buffer_bytes\":{d},\"parked_buffers\":{d},", .{ stats.parked_full_buffer_bytes.load(), stats.parked_buffers.load() });
@@ -172,6 +174,8 @@ pub const Pool = struct {
         data: []align(PAGE) u8,
         /// Readers' shares + the owner's; 1 = unique (mutable in place).
         refs: Atomic(u32) = .init(1),
+        /// The budget tick of the cell's last release (the idle clock).
+        idle_tick: u64 = 0,
 
         /// `share`: an immutable reference (Relaxed: the owner's lock orders).
         pub fn share(self: *Cell) *Cell {
@@ -228,6 +232,7 @@ pub const Pool = struct {
     /// reads complete before the owner mutates in place.
     pub fn release(self: *Pool, c: *Cell) void {
         if (c.refs.fetchSub(1, .acq_rel) != 1) return;
+        c.idle_tick = budget.authority.ticks();
         self.lock.lock();
         defer self.lock.unlock();
         self.free.append(self.gpa, c) catch {
@@ -239,6 +244,48 @@ pub const Pool = struct {
 
     pub fn liveCells(self: *const Pool) u64 {
         return self.live.load(.monotonic);
+    }
+
+    /// The pool's RAM: every cell it allocated (parked + cached) × size —
+    /// a whole touched block each.
+    pub fn liveBytes(self: *const Pool) u64 {
+        return self.live.load(.monotonic) * self.size;
+    }
+
+    /// The idle-trim law: free the cached cells idle ≥ `min_idle_ticks`
+    /// ticks. The free list is taken in batches under the lock and freed
+    /// outside it (a 4 MiB unmap per cell must not stall a writer's acquire
+    /// on the spinlock). Returns the cells freed.
+    pub fn trimIdle(self: *Pool, min_idle_ticks: u64) u32 {
+        const now = budget.authority.ticks();
+        var freed: u32 = 0;
+        var batch: [64]*Cell = undefined;
+        while (true) {
+            var n: usize = 0;
+            {
+                self.lock.lock();
+                defer self.lock.unlock();
+                var i: usize = 0;
+                while (i < self.free.items.len and n < batch.len) {
+                    const c = self.free.items[i];
+                    if (now -| c.idle_tick >= min_idle_ticks) {
+                        batch[n] = self.free.swapRemove(i);
+                        n += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            if (n == 0) return freed;
+            for (batch[0..n]) |c| {
+                self.gpa.free(c.data);
+                self.gpa.destroy(c);
+            }
+            _ = self.live.fetchSub(n, .monotonic);
+            stats.parked_pool_trimmed_cells.add(n);
+            freed += @intCast(n);
+            if (n < batch.len) return freed;
+        }
     }
 
     /// A cell is available now (a free one, or room below the cap): the
@@ -409,10 +456,23 @@ pub const Table = struct {
         self.* = undefined;
     }
 
-    /// The R5 component: parked RAM is SHEDDABLE (the never-lossy mechanism
-    /// is the flush/spill the owner binds); kernel-visible RSS.
-    pub fn component(_: *Table, shed: ?budget.ShedFn) budget.Component {
-        return budget.Component.init("parked_full_buffers", 0, 2, .{ .gauge = &stats.parked_full_buffer_bytes }, shed);
+    /// The R5 component: the pool's RAM (parked entries AND the cached
+    /// cells a release left for the next writer — whole touched blocks,
+    /// kernel-visible RSS). The idle-trim law frees the cached cells. The
+    /// shed is the owner's never-lossy drain (flush/spill) when it binds
+    /// one; the parked cap's own Red response is `effectiveParkedCap`.
+    pub fn component(self: *Table, shed: ?budget.ShedFn) budget.Component {
+        return budget.Component.init("parked_full_buffers", 0, if (shed != null) 2 else 0, .{ .func = .{ .ctx = self, .call = &poolBytesFn } }, shed).withTrim(.{ .ctx = self, .call = &trimFn });
+    }
+
+    fn poolBytesFn(ctx: *anyopaque) u64 {
+        const self: *Table = @ptrCast(@alignCast(ctx));
+        return self.pool.liveBytes();
+    }
+
+    fn trimFn(ctx: *anyopaque, min_idle_ticks: u64) void {
+        const self: *Table = @ptrCast(@alignCast(ctx));
+        _ = self.pool.trimIdle(min_idle_ticks);
     }
 
     pub fn parkedCount(self: *const Table) u32 {
@@ -1107,6 +1167,15 @@ test "the pool and the CoW cell: unique mutates in place; a shared cell copies t
     p.release(shared);
     p.release(c);
     try testing.expectEqual(@as(u64, 2), p.liveCells());
+    // Both cells are cached: the pool's RAM stays 2 cells until the idle
+    // trim frees them (Red: everything idle); a Yellow trim leaves cells
+    // released in this tick.
+    try testing.expectEqual(@as(u64, 4 * PAGE), p.liveBytes());
+    try testing.expectEqual(@as(u32, 0), p.trimIdle(budget.trim_yellow_min_idle_ticks));
+    try testing.expectEqual(@as(u32, 2), p.trimIdle(budget.trim_red_min_idle_ticks));
+    try testing.expectEqual(@as(u64, 0), p.liveBytes());
+    const d = p.acquire().?; // the pool refills below the cap
+    p.release(d);
 }
 
 test "the buffer: fresh seed is memset-elided and uncovered bytes never escape (coverage-aware reads zero-fill); out-of-order pieces complete the union (RW3b) and content becomes valid; zeroComplete establishes validity; the write epoch advances per record" {

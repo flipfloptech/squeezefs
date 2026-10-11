@@ -40,6 +40,7 @@ const log = @import("../core/log.zig");
 const clock = @import("../core/clock.zig");
 const thread_name = @import("../core/thread_name.zig");
 const reclaim = @import("../data/reclaim.zig");
+const mem_budget = @import("../mem/budget.zig");
 
 pub const Refusal = nd.Refusal;
 pub const Terminal = nd.Terminal;
@@ -131,6 +132,9 @@ const RangedSlab = struct {
     cap: u32,
     free: mpmc.BoundedMpmc(u32),
     allocated_bytes: counters.Gauge = .{},
+    /// The whole slab: pinned by every lane's fixed-buffer registration,
+    /// resident for the process's life (`nvme_ranged_slab`).
+    slab_bytes: counters.Gauge = .{},
 
     fn init(gpa: std.mem.Allocator, cap: u32) !RangedSlab {
         const len = @as(usize, cap) * nd.ranged_buf_size;
@@ -169,20 +173,29 @@ const RangedSlab = struct {
 /// allocated lazily; exhaustion degrades to a fresh mapping
 /// (`aligned_pool_misses`), a release past the cap unmaps. Deliberately NOT
 /// registered as a fixed buffer: pinning cores×16×4 MiB (GiBs) trades real
-/// RAM for a pin cost already amortized across 4 MiB DMAs.
+/// RAM for a pin cost already amortized across 4 MiB DMAs. A cached
+/// mapping is a whole touched block (a DMA filled it): the cache is the
+/// pool's retention (`cached_bytes`, the `aligned_buf_pool` component's
+/// gauge) and the idle-trim law unmaps the entries idle long enough.
 const BlockPool = struct {
-    free: mpmc.BoundedMpmc(usize),
+    free: mpmc.BoundedMpmc(Cached),
+    cap: u32,
     allocated_bytes: counters.Gauge = .{},
+    /// Free cached mappings × the block size.
+    cached_bytes: counters.Gauge = .{},
+
+    const Cached = struct { addr: usize, idle_tick: u64 };
 
     fn init(gpa: std.mem.Allocator, cap: u32) !BlockPool {
-        return .{ .free = try mpmc.BoundedMpmc(usize).init(gpa, cap) };
+        return .{ .free = try mpmc.BoundedMpmc(Cached).init(gpa, cap), .cap = cap };
     }
 
     fn acquire(self: *BlockPool, len: usize) Terminal!Buf {
         std.debug.assert(len <= nd.block_buf_size);
-        const ptr: [*]u8 = if (self.free.tryPop()) |addr| blk: {
+        const ptr: [*]u8 = if (self.free.tryPop()) |c| blk: {
             stats.aligned_pool_hits.inc();
-            break :blk @ptrFromInt(addr);
+            self.cached_bytes.sub(nd.block_buf_size);
+            break :blk @ptrFromInt(c.addr);
         } else blk: {
             stats.aligned_pool_misses.inc();
             break :blk try mapAnon(nd.block_buf_size);
@@ -193,7 +206,50 @@ const BlockPool = struct {
 
     fn release(self: *BlockPool, ptr: [*]u8) void {
         self.allocated_bytes.sub(nd.block_buf_size);
-        if (!self.free.tryPush(@intFromPtr(ptr))) _ = linux.munmap(ptr, nd.block_buf_size);
+        // The gauge moves BEFORE the push: a trimmer that pops the entry
+        // subtracts what was added.
+        self.cached_bytes.add(nd.block_buf_size);
+        if (!self.free.tryPush(.{ .addr = @intFromPtr(ptr), .idle_tick = mem_budget.authority.ticks() })) {
+            self.cached_bytes.sub(nd.block_buf_size);
+            _ = linux.munmap(ptr, nd.block_buf_size);
+        }
+    }
+
+    /// The idle-trim law: unmap cached entries idle ≥ `min_idle_ticks`
+    /// until `cached_bytes ≤ target` (0 = every idle one). One entry out
+    /// of the FIFO at a time, pushed back when it stays; one lap over the
+    /// cap bounds the pass.
+    fn trimToward(self: *BlockPool, min_idle_ticks: u64, target_cached_bytes: u64) void {
+        const now = mem_budget.authority.ticks();
+        var seen: u32 = 0;
+        while (seen < self.cap and self.cached_bytes.load() > target_cached_bytes) : (seen += 1) {
+            const c = self.free.tryPop() orelse break;
+            if (now -| c.idle_tick >= min_idle_ticks) {
+                self.cached_bytes.sub(nd.block_buf_size);
+                stats.aligned_pool_trimmed_bytes.add(nd.block_buf_size);
+                _ = linux.munmap(@as([*]u8, @ptrFromInt(c.addr)), nd.block_buf_size);
+                continue;
+            }
+            std.debug.assert(self.free.tryPush(c));
+        }
+    }
+
+    fn shedFn(ctx: *anyopaque, target: u64) void {
+        const self: *BlockPool = @ptrCast(@alignCast(ctx));
+        self.trimToward(mem_budget.trim_red_min_idle_ticks, target);
+    }
+
+    fn trimFn(ctx: *anyopaque, min_idle_ticks: u64) void {
+        const self: *BlockPool = @ptrCast(@alignCast(ctx));
+        self.trimToward(min_idle_ticks, 0);
+    }
+
+    /// `aligned_buf_pool` (the reference's registry name for this pool):
+    /// gauge = the cached (idle) mappings; floor 16 blocks — one 16-fill
+    /// burst's worth of hot buffers survives a Red shed (the shared pool
+    /// floor of `docs/porting/mem_budget.md` §2.5); weight 2.
+    fn component(self: *BlockPool) mem_budget.Component {
+        return mem_budget.Component.init("aligned_buf_pool", 16 * nd.block_buf_size, 2, .{ .gauge = &self.cached_bytes }, .{ .ctx = self, .call = &shedFn }).withTrim(.{ .ctx = self, .call = &trimFn });
     }
 };
 
@@ -233,6 +289,12 @@ pub fn initPools() Terminal!void {
             return error.OutOfMemory;
         };
         pools_storage = .{ .ranged = ranged, .block = block };
+        // The process-lifetime pools register once: the pinned ranged slab
+        // (attribution only — a registered fixed buffer cannot be
+        // returned) and the block cache (idle-trimmed, sheddable).
+        pools_storage.ranged.slab_bytes.set(pools_storage.ranged.len);
+        mem_budget.authority.register(mem_budget.Component.init("nvme_ranged_slab", pools_storage.ranged.len, 0, .{ .gauge = &pools_storage.ranged.slab_bytes }, null));
+        mem_budget.authority.register(pools_storage.block.component());
         pools_state.store(2, .release);
         return;
     }
@@ -1989,12 +2051,35 @@ test "read_bounce_pool_routing_and_home_recycle: ≤ 64 KiB rides the slab, larg
     try testing.expectEqual(b0 + 2 * nd.block_buf_size, p.block.allocated_bytes.load());
     // Every pooled pointer honours the DMA alignment contract.
     for ([_]Buf{ a, b, c, d }) |x| try testing.expect(derive.isAligned(@intFromPtr(x.ptr), nd.dma_align));
+    const cached0 = p.block.cached_bytes.load();
     a.release();
     b.release();
     c.release();
     d.release();
     try testing.expectEqual(r0, p.ranged.allocated_bytes.load());
     try testing.expectEqual(b0, p.block.allocated_bytes.load());
+    // The two released blocks are CACHED (resident, idle): the pool's own
+    // retention, gauged; the idle trim at Red (min 0) unmaps them and the
+    // next acquire is a miss again.
+    try testing.expectEqual(cached0 + 2 * nd.block_buf_size, p.block.cached_bytes.load());
+    const comp = p.block.component();
+    try testing.expectEqualStrings("aligned_buf_pool", comp.name);
+    try testing.expectEqual(16 * nd.block_buf_size, comp.floor);
+    try testing.expectEqual(cached0 + 2 * nd.block_buf_size, comp.current());
+    const misses0 = stats.aligned_pool_misses.load();
+    comp.trim.?.call(comp.trim.?.ctx, mem_budget.trim_red_min_idle_ticks);
+    try testing.expectEqual(@as(u64, 0), p.block.cached_bytes.load());
+    const e = try acquireReadBuf(4 * derive.MiB);
+    try testing.expectEqual(misses0 + 1, stats.aligned_pool_misses.load());
+    e.release();
+    // A Yellow trim (min 2) leaves an entry released in this tick.
+    comp.trim.?.call(comp.trim.?.ctx, mem_budget.trim_yellow_min_idle_ticks);
+    try testing.expectEqual(nd.block_buf_size, p.block.cached_bytes.load());
+    // The shed face trims toward a target.
+    comp.shed.?.call(comp.shed.?.ctx, 0);
+    try testing.expectEqual(@as(u64, 0), p.block.cached_bytes.load());
+    // The pinned ranged slab is registered attribution-only at its full length.
+    try testing.expectEqual(p.ranged.len, p.ranged.slab_bytes.load());
 }
 
 test "write_lane_pool_spreads_by_offset_and_stays_byte_exact" {

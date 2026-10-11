@@ -120,8 +120,11 @@ while :; do
   # runs): mount(8) on a kernel filesystem blocks until the superblock is
   # gone; the helper waits for the holder's exit the same way (bounded),
   # then retries. A holder that stays is a real refusal.
-  if grep -q 'another writer holds the single-writer guard' <<< "$out" && grep -q 'claimed by a live writer' "$log" 2>/dev/null; then
-    lpid=$(grep -o 'claimed by a live writer (claim: id=[0-9a-f]*, pid=[0-9]*' "$log" | head -1 | grep -o 'pid=[0-9]*' | cut -d= -f2)
+  # (The guard's two live phrasings: "another squeezefs process holds the
+  # writer lock (claim: …)" — the flock — and "claimed by a live writer
+  # (claim: …)" — the on-volume claim; both name the holder's pid.)
+  if grep -q 'another writer holds the single-writer guard' <<< "$out" && grep -qE 'holds the writer lock \(claim:|claimed by a live writer \(claim:' "$log" 2>/dev/null; then
+    lpid=$(grep -oE '(holds the writer lock|claimed by a live writer) \(claim: id=[0-9a-f]*, pid=[0-9]*' "$log" | head -1 | grep -o 'pid=[0-9]*' | cut -d= -f2)
     if [ -n "$lpid" ] && [ -d "/proc/$lpid" ] && ! grep -q 'State:.*Z' "/proc/$lpid/status" 2>/dev/null; then
       waited=0
       while [ -d "/proc/$lpid" ] && ! grep -q 'State:.*Z' "/proc/$lpid/status" 2>/dev/null && [ "$waited" -lt 60 ]; do sleep 1; waited=$((waited + 1)); done

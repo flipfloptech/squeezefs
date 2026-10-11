@@ -80,13 +80,13 @@ stats and diskstats ratios agree; every plane ledger closed.
 | shape | bound | A | B | verdict |
 |---|---|---|---|---|
 | `rand-4k-read` | 1.05 | 1.000 | 1.000 (direct leg) | in bound before and after |
-| `rand-4k-read-unaligned` | 2.1 | 1.699 (scoping) · **2.986 / 2.811** (60 s legs) | **1.970 / 2.001** | fixed (the governor, §5.1–5.2) |
-| `rand-512b-read` | 8.4 | **20.9** (scoping) · **17.27 / 16.90** (60 s legs) | **8.236 / 8.328** | fixed (§5.1–5.2); 8× is the LBA law |
+| `rand-4k-read-unaligned` | 2.1 | 1.699 (scoping) · **2.986 / 2.811** (nvmet-loop) · **2.958 / 2.678** (file) | **1.970 / 2.001** (nvmet-loop) · **2.005 / 1.991** (file) | fixed (the governor, §5.2) |
+| `rand-512b-read` | 8.4 | **20.9** (scoping) · **17.27 / 16.90** (nvmet-loop) · **17.00 / 16.96** (file) | **8.236 / 8.328** (nvmet-loop) · **8.328 / 8.379** (file) | fixed (§5.2); 8× is the LBA law |
 | `rand-256k-read` | 1.05 | 1.000 | 1.000 | in bound (the direct leg at 256 KiB) |
 | `rand-1m-read` | 1.05 | 1.000 | 1.000 | in bound (the direct leg); the derived ceiling covers the pooled path |
 | `seq-read-1m-direct` | 1.05 | 1.000 | 1.000 | in bound |
 | `seq-read-early-stop` | 2.1 | 1.000 | 1.000 | in bound: the pipeline stops with the reader |
-| `read-after-small-write` | 2.1 | **4.431** (scoping) · **2.644 / 3.189** (60 s legs) | **2.009 / 1.993** | fixed (§5.2: the demand arm was the governor's escalations, 4.3–8.6 GB per A leg; the composition itself is ranged — one 4 KiB `compose_read` window per overlaid read) |
+| `read-after-small-write` | 2.1 | **4.431** (scoping) · **2.644 / 3.189** (nvmet-loop) · **2.649 / 3.639** (file) | **2.009 / 1.993** (nvmet-loop) · **1.987 / 1.994** (file) | fixed (§5.2: the demand arm was the governor's escalations, 4.3–8.6 GB per A leg; the composition itself is ranged — one 4 KiB `compose_read` window per overlaid read) |
 | `shim-rand-4k-read` | 1.05 | 1.000 | 1.000 | in bound |
 | `rand-4k-read --compress zstd` | 18 | **446.8** | §4 | fixed by the framed image |
 | `rand-4k-read --encrypt aes-256-gcm` | 18 | **446.5** | §4 | fixed by the framed image |
@@ -96,19 +96,32 @@ stats and diskstats ratios agree; every plane ledger closed.
 
 ### 3.1 The counted A/B legs (`bench/brackets/<venue>/<row>-2026-10-11T18*.{json,md}`)
 
-See the records; the per-leg numbers are in the table above. Leg 2/B of `rand-512b-read` is
-marked INVALID on `mem_budget_green` alone (level 2 at the after-snapshot with 388 MiB of
+Six rows (three shapes × `nvmet-loop`, `file`), A→B→B→A, 60 s legs; the per-leg numbers are in
+the table above. Every A leg over its bound is tagged INVALID by the harness's new
+`read_amplification_bound` verdict (the defect, now a verdict); every B leg is in bound. Two B
+legs (leg 2 of `rand-512b-read` on nvmet-loop, leg 3 of `read-after-small-write` on file) are
+tagged INVALID on `mem_budget_green` alone — level 2 at the after-snapshot with < 400 MiB of
 components under a 6 GiB budget: the budget reads the shared cgroup, where two other agents'
-daemons and suites were running at load 15); its ratio, 8.236, is the same as leg 3's.
+daemons and suites ran at load 12–15 throughout; their ratios (8.236, 1.994) match their twin
+legs. On `file` the exclusive-namespace ruler is unavailable (the backing files share `/dev/vdc`
+with everything else), so the verdict uses the arms and diskstats is reported beside (it reads
+0.1–1.1 higher: the other agents' traffic). IOPS A/B: 0.94–1.02 (B never slower; the ranged path
+is cheaper than the escalations it replaces).
 
 ### 3.2 Metadata
 
-`stat-mdtest` (mdtest `-T` over 100,242 files): the cold pass — the warm-up after a fresh mount —
-cost 26 node reads / 6.8 MB for 100,242 records = **0.00026 node reads per record, 68 B/record**:
-the tree's 100 k inodes live in ~1,660 leaves, and the stat storm's walk loaded each once. Warm: 0
-node reads, 200,471 cache hits for 100,264 records. `find-readdir`: 103,003 dirents + 2,003 readdirs
-+ 789 lookups at 91,609 entries/s cold on the mount the files were created on — 0 node reads (the
-node cache held the tree from the creates); the remount-cold walk is the open row (§7).
+`stat-mdtest` (mdtest `-T` over 100,242 files): the first cold pass (the creating mount's
+warm-up) cost 26 node reads / 6.8 MB for 100,242 records = **0.00026 node reads per record,
+68 B/record**: the tree's 100 k inodes live in ~1,660 leaves, each loaded once. Warm: 0 node
+reads, 200,471 cache hits for 100,264 records. The REMOUNT-cold pass (leg 2 of the 2-leg scoping
+run, a fresh mount after a clean unmount): **2 node reads / 512 KiB for 100,204 records**
+(5.2 B/record). `find-readdir` (103,003 dirents + 2,003 readdirs + ~800 lookups per walk):
+0 node reads on both the creating mount's walk (91.6 k entries/s) and the remount-cold walk
+(200 k entries/s, 112,030 node-cache hits, 0 misses). The mount's ledger scan loads the 66 trees
+(≈ 7 MB, far under the node-cache budget) before `ready`, so a remount is warm for a tree this
+size; the per-record bound (≤ 3) is exercised only by a tree larger than the node cache, which
+this venue's rows do not build. Both rows' `META_READ` ledger (`node_read_bytes ÷ records`) is
+in place for that.
 
 ## 4. Transformed volumes: the format call
 
@@ -142,9 +155,45 @@ decision 0002): **the framed image** (transform version 2, decision 0003 §K7, p
 Bound after: `(g + ceil_g(F + tag)) / len × (1 + f)` = **≤ 18×** at 4 KiB on an incompressible frame,
 `(4 + ceil_4k(F/ρ)) / 4` at ratio ρ (9× at ρ = 2); ≤ 1.02× at 1 MiB. Measured after: §4.1.
 
-### 4.1 Measured before/after
+### 4.1 Measured before/after (`scripts/bracket/xform-probe.sh`: 4 × 256 MiB, fio randread 4 KiB
+O_DIRECT, 4 jobs × QD16, 20 s; A = the one-frame format, B = the framed image)
 
-(filled from the venue runs below)
+| volume | source | A `device ÷ user` (IOPS) | B `device ÷ user` (IOPS) | bound |
+|---|---|---|---|---|
+| `--compress zstd` | incompressible (urandom: every frame raw) | **627.1** (2,623) | **15.58** (13,363) | 18 |
+| `--encrypt aes-256-gcm` | incompressible | **627.9** (836) | **15.53** (12,462) | 18 |
+| `--compress lz4` | incompressible | **627.4** (3,134) | **15.44** (15,415) | 18 |
+| `--compress zstd` | compressible text (ρ ≈ 3.5 at 64 KiB) | never published (§4.2: 335 `ProofMissing`, reads from custody) | **10.15** (849; ranged arm alone 5.75, the rest the tier fill's escalations in a 20 s probe) | `(4 + ceil_4k(64/ρ)) / 4` ≈ 6–7 on the ranged arm |
+| `--compress lz4` | compressible text (ρ ≈ 2.2 at 64 KiB) | never published (§4.2) | **10.43** (7,795; ranged arm alone 9.62) | ≈ 10 on the ranged arm |
+
+The A ratio is the whole image per 4 KiB read (627 = `chunk / len` × the share the hot tier did
+not hold); B is the table grain + one 64 KiB frame window rounded outward (`(4 + 68) / 4 = 18` at
+the bound; 15.5 measured because a 4 KiB read inside frame 0 reuses the grain in hand and a
+window's rounding is one grain, not two, when the frame starts aligned). Every B arm is
+`read_dma_image_bytes` alone; the ledger closed on every run; 256 ghost escalations per run (the
+second touches, one whole image each) are inside the 5 %. On the compressible runs the
+escalations are the 64–96-slot tier FILLING (73 and 123 whole images in 20 s with no evictions
+yet, so no evidence for the clamp): the ranged arm alone is at the ρ law. The zstd sub-block
+path's IOPS (849) is the plane's ONE transform context: `Decode.decode_range` takes `x.lock`, so
+every frame decode is serialized (lz4 at 7.8 k IOPS shows the same lock at a faster codec); a
+per-lane decode context is the throughput follow-up (§7) — the amplification is in bound.
+
+### 4.2 The write-side defect the compressible run exposed (fixed, `807d6e2`)
+
+With a compressible source, BOTH arms logged `the block-map publish of 1 binding(s) failed
+(ProofMissing) — the upload keeps its custody and retries` on every block (768 per run) and the
+reads then came from the write side's custody at RAM speed (280 k IOPS, 0 device bytes).
+`DmaProof.covers` demanded that a whole-block mapping's proof span the whole slot
+(`slotLen` = the chunk), but `DeviceSeam.write` mints the proof at the image's grain-padded length
+— so on a compressed volume **every block that actually compressed never published** (the
+"zstd write wedge" of the first scoping pass; incompressible images are exactly one chunk and
+passed). Red: `layout` "publishLayout …" (a 1 MiB proof from the slot's start covers a whole-block
+mapping; a proof from mid-slot, or shorter than a grain, does not; a tenant's proof still covers
+its slot). Fix: a whole-block DMA is the complete payload or image by construction (an image is
+self-delimiting; a passthrough payload is bounded by the layout's size), so its proof covers the
+mapping from the slot's start at any grain-padded length; the own-block mint's proof names what
+it landed instead of being inflated to the block. The compressible A/B is re-measured under the
+fix in §4.1's last row.
 
 ## 5. The fixes, red-first
 
@@ -206,12 +255,14 @@ admission off. Every number in §3 is from ReleaseSafe daemons unless marked.
   for a 512 B-LBA device is the measured-evidence upgrade (OQ #1 of the reference design).
 - **`read-after-small-write`'s background fold reads** (`write_side_read_dma_bytes`, 2.6 % of the
   user bytes on the probe) are the W2 fold's — the write-amplification agent's arm (defect 24).
-- **The remount-cold metadata walk** (`find-readdir` after `umount`/`mount`) was not measured: the
-  row's cold pass ran on the creating mount. The bound (≤ 3 reads/record) is the tree height; the
-  `META_READ` ledger is in place for the row.
-- **A zstd write wedge** during fio's prepare on `--compress zstd` under the old one-frame format
-  (daemon log `/build/tmp/readamp-zstd-write-wedge.daemon.log` at the time; the write side) —
-  reported to `.wt-amp`; not reproduced under the framed format in §4.1's runs.
+- **The metadata bound is not exercised by a 100 k-file tree**: the mount pre-loads it (§3.2); the
+  ledger and the rows stand for a tree larger than the node cache.
+- **The transformed sub-block decode is serialized** under the plane's one transform context
+  (`x.lock` in `Decode.decode_range`): 849 IOPS for zstd, 7.8 k for lz4 — in bound on
+  amplification, a throughput item for the owner (a per-lane decode context).
+- **The compressed-volume publish wedge** (`ProofMissing` on every block that compressed) was the
+  write side's and is fixed here (§4.2) because it stood between the format change and its
+  measurement; the W2 fold and the staged append stay `.wt-amp`'s.
 
 ## 8. Gates
 

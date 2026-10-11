@@ -165,7 +165,7 @@ pub const Page = struct {
     idx: u32,
     data: []u8,
     /// One bit per byte of `data`.
-    mask: ?*[PAGE / 8]u8,
+    mask: ?*Mask,
     /// Bytes set in `mask` (the page is content-valid at PAGE).
     covered: u32,
 };
@@ -180,7 +180,12 @@ pub const BaseReader = struct {
 /// What one page costs the budget: its buffer and its struct (+ the mask
 /// while it carries one).
 pub const PAGE_CHARGE: u64 = PAGE + @sizeOf(Page);
-pub const MASK_CHARGE: u64 = PAGE / 8;
+pub const MASK_CHARGE: u64 = PAGE / BYTE_BITS;
+/// The mask is one bit per byte of the page.
+const BYTE_BITS: u32 = 8;
+const Mask = [PAGE / BYTE_BITS]u8;
+/// A mask byte whose eight bytes are all covered.
+const MASK_FULL: u8 = 0xFF;
 
 pub const ExtentOverlay = struct {
     /// Sorted by `idx`.
@@ -243,18 +248,18 @@ pub const ExtentOverlay = struct {
     }
 
     /// Set bits `[lo, hi)` of a mask; answers how many were clear.
-    fn setBits(m: *[PAGE / 8]u8, lo: u32, hi: u32) u32 {
+    fn setBits(m: *Mask, lo: u32, hi: u32) u32 {
         var newly: u32 = 0;
         var b = lo;
         while (b < hi) {
-            if (b % 8 == 0 and hi - b >= 8) {
-                newly += @popCount(~m[b / 8]);
-                m[b / 8] = 0xFF;
-                b += 8;
+            if (b % BYTE_BITS == 0 and hi - b >= BYTE_BITS) {
+                newly += @popCount(~m[b / BYTE_BITS]);
+                m[b / BYTE_BITS] = MASK_FULL;
+                b += BYTE_BITS;
             } else {
-                const bit: u8 = @as(u8, 1) << @intCast(b % 8);
-                if (m[b / 8] & bit == 0) {
-                    m[b / 8] |= bit;
+                const bit: u8 = @as(u8, 1) << @intCast(b % BYTE_BITS);
+                if (m[b / BYTE_BITS] & bit == 0) {
+                    m[b / BYTE_BITS] |= bit;
                     newly += 1;
                 }
                 b += 1;
@@ -263,8 +268,8 @@ pub const ExtentOverlay = struct {
         return newly;
     }
 
-    fn bitSet(m: *const [PAGE / 8]u8, b: u32) bool {
-        return m[b / 8] & (@as(u8, 1) << @intCast(b % 8)) != 0;
+    fn bitSet(m: *const Mask, b: u32) bool {
+        return m[b / BYTE_BITS] & (@as(u8, 1) << @intCast(b % BYTE_BITS)) != 0;
     }
 
     /// Merge `[rel, rel + data.len)`: every page it touches is found or
@@ -283,9 +288,9 @@ pub const ExtentOverlay = struct {
             if (!f.found) {
                 const buf = try gpa.alloc(u8, PAGE);
                 errdefer gpa.free(buf);
-                var mask: ?*[PAGE / 8]u8 = null;
+                var mask: ?*Mask = null;
                 if (self.base_deferred) {
-                    const m = try gpa.create([PAGE / 8]u8);
+                    const m = try gpa.create(Mask);
                     m.* = @splat(0);
                     mask = m;
                 } else {
@@ -323,15 +328,15 @@ pub const ExtentOverlay = struct {
     fn fillPage(p: *Page, base: []const u8) void {
         const m = p.mask.?;
         var b: u32 = 0;
-        while (b < PAGE) : (b += 8) {
-            const byte = m[b / 8];
-            if (byte == 0xFF) continue;
+        while (b < PAGE) : (b += BYTE_BITS) {
+            const byte = m[b / BYTE_BITS];
+            if (byte == MASK_FULL) continue;
             if (byte == 0) {
-                @memcpy(p.data[b .. b + 8], base[b .. b + 8]);
+                @memcpy(p.data[b .. b + BYTE_BITS], base[b .. b + BYTE_BITS]);
                 continue;
             }
             var i: u32 = 0;
-            while (i < 8) : (i += 1) if (!bitSet(m, b + i)) {
+            while (i < BYTE_BITS) : (i += 1) if (!bitSet(m, b + i)) {
                 p.data[b + i] = base[b + i];
             };
         }
@@ -401,15 +406,15 @@ pub const ExtentOverlay = struct {
             const at = dst[p.idx * PAGE ..][0..PAGE];
             if (p.mask) |m| {
                 var b: u32 = 0;
-                while (b < PAGE) : (b += 8) {
-                    const byte = m[b / 8];
+                while (b < PAGE) : (b += BYTE_BITS) {
+                    const byte = m[b / BYTE_BITS];
                     if (byte == 0) continue;
-                    if (byte == 0xFF) {
-                        @memcpy(at[b .. b + 8], p.data[b .. b + 8]);
+                    if (byte == MASK_FULL) {
+                        @memcpy(at[b .. b + BYTE_BITS], p.data[b .. b + BYTE_BITS]);
                         continue;
                     }
                     var i: u32 = 0;
-                    while (i < 8) : (i += 1) if (bitSet(m, b + i)) {
+                    while (i < BYTE_BITS) : (i += 1) if (bitSet(m, b + i)) {
                         at[b + i] = p.data[b + i];
                     };
                 }

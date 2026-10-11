@@ -400,6 +400,14 @@ pub fn Dispatcher(comptime Transport: type) type {
                     return codec.replyEntry(out, u, e);
                 },
                 .open => |a| {
+                    // ATOMIC_O_TRUNC: the kernel sends no SETATTR(size=0),
+                    // so an O_TRUNC open IS the size set and takes the
+                    // size setter's whole-truncate exclusive guard (taker
+                    // list: "SETATTR iff size"); without it the truncate
+                    // ran beside Shared-class writes admitted on `end ≤
+                    // size` (`write_shared_class_violation`, fstests pass 2).
+                    const g: ?op_guard.Guard = if (a.flags & filesystem.O_TRUNC != 0) self.guards.acquire(self.io, ino, .exclusive) else null;
+                    defer if (g) |gg| gg.release(self.io);
                     const o = try fs.vtable.open(fs.impl, c, .{ .ino = ino, .flags = a.flags, .open_flags = a.open_flags });
                     _ = try self.opens.addOpen(ino);
                     return codec.replyOpen(out, u, o.fh, o.open_flags);

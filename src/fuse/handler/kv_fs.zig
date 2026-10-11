@@ -160,9 +160,8 @@ pub const RENAME_WHITEOUT: u32 = 1 << 2;
 /// `setxattr(2)` flags (uapi `linux/xattr.h`).
 pub const XATTR_CREATE: u32 = 0x1;
 pub const XATTR_REPLACE: u32 = 0x2;
-/// `O_TRUNC` / `O_DIRECT` as the kernel's open-flag word carries them.
-pub const O_TRUNC: u32 = @bitCast(linux.O{ .TRUNC = true });
-pub const O_DIRECT: u32 = @bitCast(linux.O{ .DIRECT = true });
+pub const O_TRUNC = filesystem.O_TRUNC;
+pub const O_DIRECT = filesystem.O_DIRECT;
 
 // ---------------------------------------------------------------------------
 // KILLPRIV_V2.
@@ -3350,6 +3349,12 @@ const SettlingData = struct {
     next_block_off: u64 = 0,
     /// The striped data writes: `(offset, len, the file view's size)`.
     writes: std.ArrayList(struct { offset: u64, len: u64, view_size: u64 }) = .empty,
+    /// The level-1 guard probe at the flush: `guards` + the FUSE nodeid
+    /// whose guard the op under test must hold EXCLUSIVE while the custody
+    /// settles; `shared_refused_at_flush` records a shared taker's verdict.
+    guards: ?*op_guard.Table = null,
+    guard_nodeid: u64 = 0,
+    shared_refused_at_flush: ?bool = null,
 
     pub const OwnBlock = NoData.OwnBlock;
     pub const Space = NoData.Space;
@@ -3443,6 +3448,12 @@ const SettlingData = struct {
         self.flushes += 1;
         self.locks_held_at_flush = self.base.layout_lock_held;
         self.locks_taken_at_flush = self.base.layout_locks_taken;
+        if (self.guards) |g| {
+            if (g.tryAcquire(io, self.guard_nodeid, .shared)) |held| {
+                held.release(io);
+                self.shared_refused_at_flush = false;
+            } else self.shared_refused_at_flush = true;
+        }
         const m = self.merge orelse return;
         if (m.ino != ino) return;
         self.merge = null;
@@ -3751,6 +3762,50 @@ test "every layout-record RMW of the filesystem takes the data face's (3.7) layo
     try testing.expectEqual(@as(u32, 0), h.data.layout_lock_held);
     h.release(f);
     try testing.expectEqual(inv0, lock_order.lock_order_inversions.load());
+}
+
+// The level-1 taker list says "SETATTR iff size" — and the O_TRUNC open IS a
+// size set (ATOMIC_O_TRUNC: the kernel sends no SETATTR). Without the
+// exclusive guard the open's truncate ran beside Shared-class writes
+// admitted on `end ≤ shape size`: the inode's size dropped under them and
+// the data plane fired `write_shared_class_violation` (×6 across fstests
+// pass 2, ×1 in a fsstress round).
+test "an O_TRUNC open truncates under the level-1 EXCLUSIVE guard exactly as SETATTR-size does: a shared taker is refused while the custody settles; a plain open takes no guard" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const f = try h.create(1, "f", 0o644);
+    const lf = try H.Fs.localOf(f);
+    try h.data.publishStriped(lf, 1 << 20, null, Mapping.wholeBlock(0x11, 0, 1));
+    h.data.guards = &h.guards;
+    h.data.guard_nodeid = f;
+    // The control: SETATTR size holds the exclusive guard across the settle.
+    var sa = abi.zeroed(abi.fuse_setattr_in);
+    sa.valid = abi.FATTR_SIZE;
+    sa.size = 4096;
+    try testing.expectEqual(@as(u64, 4096), (try h.attr(h.setattr(f, sa))).size);
+    try testing.expectEqual(@as(u32, 1), h.data.flushes);
+    try testing.expectEqual(@as(?bool, true), h.data.shared_refused_at_flush);
+    // The O_TRUNC open: the same guard, the same exclusion.
+    h.data.shared_refused_at_flush = null;
+    const op = h.call(.{ .open = .{ .flags = O_TRUNC, .open_flags = 0 } }, f);
+    try testing.expectEqual(@as(?linux.E, null), op.errno());
+    try testing.expectEqual(@as(u32, 2), h.data.flushes);
+    try testing.expectEqual(@as(?bool, true), h.data.shared_refused_at_flush);
+    try testing.expectEqual(@as(u64, 0), (try h.getattr(f)).size);
+    h.release(f);
+    // A plain open settles nothing and takes no guard: a shared taker is admitted meanwhile.
+    h.data.shared_refused_at_flush = null;
+    const g = h.guards.acquire(testing.io, f, .shared);
+    const plain = h.call(.{ .open = .{ .flags = 0, .open_flags = 0 } }, f);
+    g.release(testing.io);
+    try testing.expectEqual(@as(?linux.E, null), plain.errno());
+    try testing.expectEqual(@as(u32, 2), h.data.flushes);
+    h.release(f);
+    h.release(f);
 }
 
 test "POSIX: mkdir/readdir/rmdir — dot entries, cookie continuation, ENOTEMPTY, a removed directory looks up negative; lookup of . and .." {

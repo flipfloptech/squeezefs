@@ -169,6 +169,10 @@ pub const UnlinkArgs = struct { parent: u64, name: []const u8 };
 pub const RenameArgs = struct { parent: u64, name: []const u8, newparent: u64, newname: []const u8, flags: u32 };
 pub const LinkArgs = struct { ino: u64, newparent: u64, newname: []const u8 };
 pub const OpenArgs = struct { ino: u64, flags: u32, open_flags: u32 };
+/// `O_TRUNC` / `O_DIRECT` as the kernel's open-flag word carries them (the
+/// lifecycle's guard choice and the filesystem's arms read the same bits).
+pub const O_TRUNC: u32 = @bitCast(std.os.linux.O{ .TRUNC = true });
+pub const O_DIRECT: u32 = @bitCast(std.os.linux.O{ .DIRECT = true });
 pub const ReadArgs = struct { ino: u64, fh: u64, offset: u64, size: u32, flags: u32 };
 /// `data` is the payload in hand (empty when `held`); `held` is a
 /// zero-copy payload still sitting in the registered slot (the handler

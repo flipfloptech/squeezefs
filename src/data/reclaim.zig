@@ -53,6 +53,18 @@
 //! would land on a block the next mount re-carved). Crash: the queue is
 //! RAM-only space-return work; the only loss is un-returned thin space,
 //! re-covered on reuse or by `trim --full`.
+//!
+//! The debt drainer is PACED TO THE DEVICE: its trim passes feed their
+//! own completion-rate meter (`debt_meter`, the serial deallocate rate
+//! the target answers), a pressure pass under a foreground stream issues
+//! what the device completes in one manners tick (`debtBatchBlocks`, so a
+//! pass's trim claim window holds free supply out of the carvable set for
+//! ≈ one tick, never seconds) and rests one batch-time at that rate
+//! (`debtPaceMs`) — the shipped `progressed ⇒ at once` looped hot behind
+//! the write lane on a wrapped volume (the holder's virgin tail is 0 once
+//! the frontier reaches the top, so every byte of debt is "past the
+//! watermark" and the drain never deferred), and the fruitless backoff
+//! was a fixed `50 << n` ladder capped at 1 Hz (rung 9 F17).
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");
@@ -133,10 +145,6 @@ pub const DRAIN_RATE_WINDOW_MS: u64 = 250;
 /// barriers, per-file closes) the zero-mid-row-discards gate counts as
 /// "during the row". 20 ticks = 1 s.
 pub const IDLE_CONFIRM_TICKS: u64 = 20;
-/// The debt drainer's fruitless backoff: `min(50 << min(n, 5), 1000)` ms —
-/// doubling from one manners tick, capped at the park ceiling.
-pub const FRUITLESS_BACKOFF_MAX_MS: u64 = 1000;
-pub const FRUITLESS_BACKOFF_SHIFT_MAX: u6 = 5;
 
 pub const DEFAULT_BATCH_BLOCKS: u32 = knobs.intDefault("SQUEEZEFS_RECLAIM_BATCH_BLOCKS", u32);
 pub const DEFAULT_BATCH_MS: u64 = knobs.intDefault("SQUEEZEFS_RECLAIM_BATCH_MS", u64);
@@ -148,6 +156,66 @@ pub fn roomMs(batch: u64, drain_rate: u64) u64 {
     if (drain_rate == 0) return PARK_BOUND_CEILING_MS;
     return @max(1, batch * 1000 / drain_rate);
 }
+
+/// The debt drainer's pressure batch: what the device completes in ONE
+/// manners tick at its measured deallocate rate, `clamp(rate × tick, 1,
+/// batch)` — a pass's trim claim window (free supply out of the carvable
+/// set until the discards land) never outlives a tick. A cold meter (no
+/// window rolled) issues the configured batch: the first window is one
+/// tick, so it learns inside the first pass.
+pub fn debtBatchBlocks(drain_rate: u64, batch: u32) u32 {
+    if (drain_rate == 0) return batch;
+    return @intCast(derive.clamp(drain_rate * MANNERS_TICK_MS / 1000, 1, batch));
+}
+
+/// The debt drainer's pace under foreground load, and after a fruitless
+/// pass: one batch-time at the device's measured completion rate,
+/// `clamp(room, tick, ceiling)` — issue a batch, rest a batch-time, so
+/// the deallocate stream takes at most half the target's service under a
+/// foreground stream (the aggressive drain bought nothing and cost the
+/// foreground 17 % in the 128 GiB `rm` row) and a cold meter rests the
+/// shipped ceiling until it learns.
+pub fn debtPaceMs(batch: u64, drain_rate: u64) u64 {
+    return derive.clamp(roomMs(batch, drain_rate), MANNERS_TICK_MS, PARK_BOUND_CEILING_MS);
+}
+
+/// A completion-rate meter in blocks/s: the window's `blocks × 1000 ÷ dt`
+/// rolls into the α = ¼ EWMA; the FIRST window is one manners tick (a
+/// cold meter learns inside the worker's cadence — p99.9 285 ms at a
+/// 250 ms first window vs an 80 ms derived bound), every later one
+/// `DRAIN_RATE_WINDOW_MS`. One per venue: the queue's lanes and the debt
+/// drainer's trim passes complete at different widths.
+const RateMeter = struct {
+    rate: Atomic(u64) = .init(0),
+    win_start_ms: Atomic(u64) = .init(0),
+    win_blocks: Atomic(u64) = .init(0),
+    first_done: Atomic(bool) = .init(false),
+
+    /// Note `k` completions at `now_ms`; true when a window ROLLED (the
+    /// rate moved — the caller rederives what hangs on it).
+    fn note(self: *RateMeter, k: u64, now_ms: u64) bool {
+        const win_start = self.win_start_ms.load(.monotonic);
+        if (win_start == 0) {
+            self.win_start_ms.store(@max(now_ms, 1), .monotonic);
+            _ = self.win_blocks.fetchAdd(k, .monotonic);
+            return false;
+        }
+        const blocks = self.win_blocks.fetchAdd(k, .monotonic) + k;
+        const window = if (self.first_done.load(.monotonic)) DRAIN_RATE_WINDOW_MS else MANNERS_TICK_MS;
+        if (now_ms - win_start < window) return false;
+        if (self.win_start_ms.cmpxchgStrong(win_start, @max(now_ms, 1), .acq_rel, .monotonic) != null) return false;
+        self.win_blocks.store(0, .monotonic);
+        self.first_done.store(true, .monotonic);
+        const rate = blocks * 1000 / @max(now_ms - win_start, 1);
+        const prev = self.rate.load(.monotonic);
+        self.rate.store(if (prev == 0) rate else ewmaQuarter(prev, rate), .monotonic);
+        return true;
+    }
+
+    fn load(self: *const RateMeter) u64 {
+        return self.rate.load(.monotonic);
+    }
+};
 
 /// `clamp(4 × room, 50, 1000)`.
 pub fn parkBoundMs(room_ms: u64) u64 {
@@ -363,6 +431,10 @@ pub const stats = struct {
     pub var block_free_reclaim_arrival_rate: counters.Gauge = .{};
     pub var block_free_reclaim_queue_cap: counters.Gauge = .{};
     pub var block_free_reclaim_park_bound_ms: counters.Gauge = .{};
+    /// The debt drainer's measured deallocate completion rate (blocks/s)
+    /// and the pace it derives from it under foreground load.
+    pub var block_free_debt_drain_rate: counters.Gauge = .{};
+    pub var block_free_debt_pace_ms: counters.Gauge = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -370,7 +442,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "terminal_frees", "block_free_reclaim_queued", "block_free_reclaim_elided", "block_free_discards", "block_free_discard_bytes", "block_free_file_punches", "block_free_punch_bytes", "block_free_reclaim_skipped", "block_free_reclaim_batches", "block_free_reclaim_commands", "block_free_reclaim_sync_drains", "block_free_reclaim_cap_parks", "block_free_reclaim_cap_overflow", "block_free_reclaim_supply_drains", "block_free_reclaim_deferred_ticks", "block_free_trim_discards", "block_free_trim_bytes", "block_free_debt_pressure_drains", "block_free_debt_drain_passes", "block_free_debt_fruitless_passes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "block_free_reclaim_queue_bytes", "block_free_elided_debt_bytes", "block_free_reclaim_drain_rate", "block_free_reclaim_arrival_rate", "block_free_reclaim_queue_cap", "block_free_reclaim_park_bound_ms" }) |name| {
+    inline for (.{ "block_free_reclaim_queue_bytes", "block_free_elided_debt_bytes", "block_free_reclaim_drain_rate", "block_free_reclaim_arrival_rate", "block_free_reclaim_queue_cap", "block_free_reclaim_park_bound_ms", "block_free_debt_drain_rate", "block_free_debt_pace_ms" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "block_key_incarnation_refusals", "block_free_reclaim_fence_halts", "block_free_reclaim_dismount_halts" }) |name| {
@@ -494,16 +566,16 @@ pub const Reclaimer = struct {
     arr_sample: u64 = 0,
     arr_sample_ms: u64 = 0,
     arrival_peak: u64 = 0,
-    drain_rate: Atomic(u64) = .init(0),
-    drain_win_start_ms: Atomic(u64) = .init(0),
-    drain_win_blocks: Atomic(u64) = .init(0),
-    first_window_done: Atomic(bool) = .init(false),
+    /// The queue venue's completion rate (the lanes' aggregate).
+    drain_meter: RateMeter = .{},
     /// Entries finished (any venue): the valve's progress predicate.
     finished_total: Atomic(u64) = .init(0),
     // ---- the debt drainer ----
-    quiet_ticks: u64 = 0,
+    /// When the foreground signal last stood still (0 = not yet judged).
+    debt_quiet_since_ns: u64 = 0,
     debt_fg_last: u64 = 0,
-    fruitless: u6 = 0,
+    /// The trim venue's completion rate (one pass's serial commands).
+    debt_meter: RateMeter = .{},
 
     pub fn init(gpa: Allocator, cfg: Config) Allocator.Error!*Reclaimer {
         const self = try gpa.create(Reclaimer);
@@ -908,28 +980,18 @@ pub const Reclaimer = struct {
 
     // ---- rates and the rederivation (§3.3) ----
 
-    /// Per range: the drain window rolls at `DRAIN_RATE_WINDOW_MS` (the
-    /// FIRST at one manners tick) into the EWMA; the bound and the cap
-    /// rederive; a SHRINK of the bound and a RAISE of the cap are room edges.
+    /// Per range of the queue venue: the drain meter's window rolls into
+    /// the EWMA; the bound and the cap rederive; a SHRINK of the bound and
+    /// a RAISE of the cap are room edges.
     fn noteDrained(self: *Reclaimer, k: u32) void {
-        const now_ms = clock.monotonicNs() / std.time.ns_per_ms;
-        const win_start = self.drain_win_start_ms.load(.monotonic);
-        if (win_start == 0) {
-            self.drain_win_start_ms.store(@max(now_ms, 1), .monotonic);
-            _ = self.drain_win_blocks.fetchAdd(k, .monotonic);
-            return;
-        }
-        const blocks = self.drain_win_blocks.fetchAdd(k, .monotonic) + k;
-        const window = if (self.first_window_done.load(.monotonic)) DRAIN_RATE_WINDOW_MS else MANNERS_TICK_MS;
-        if (now_ms - win_start < window) return;
-        if (self.drain_win_start_ms.cmpxchgStrong(win_start, @max(now_ms, 1), .acq_rel, .monotonic) != null) return;
-        self.drain_win_blocks.store(0, .monotonic);
-        self.first_window_done.store(true, .monotonic);
-        const rate = blocks * 1000 / @max(now_ms - win_start, 1);
-        const prev = self.drain_rate.load(.monotonic);
-        self.drain_rate.store(if (prev == 0) rate else ewmaQuarter(prev, rate), .monotonic);
         // The caller fires the room edge right after this (per range).
-        _ = self.rederive();
+        if (self.drain_meter.note(k, clock.monotonicNs() / std.time.ns_per_ms)) _ = self.rederive();
+    }
+
+    /// Per range of the TRIM venue: the debt meter learns the device's
+    /// deallocate completion rate the drainer paces itself by.
+    fn noteTrimmed(self: *Reclaimer, k: u32) void {
+        if (self.debt_meter.note(k, clock.monotonicNs() / std.time.ns_per_ms)) stats.block_free_debt_drain_rate.set(self.debt_meter.load());
     }
 
     /// `sample_arrivals`: once per worker pass; the arrival rate is a
@@ -954,7 +1016,7 @@ pub const Reclaimer = struct {
     /// True when the rederivation is itself a room edge: the bound SHRANK
     /// (a cold 1 s park collapses to the derived bound) or the cap ROSE.
     fn rederive(self: *Reclaimer) bool {
-        const room = roomMs(self.cfg.batch_blocks, self.drain_rate.load(.monotonic));
+        const room = roomMs(self.cfg.batch_blocks, self.drain_meter.load());
         const bound = resolveParkBoundMs(self.cfg.explicit_park_bound_ms, parkBoundMs(room));
         const old_bound = self.park_bound_ms.swap(bound, .monotonic);
         const arrival = if (self.arrival_peak != 0) self.arrival_peak else self.cfg.displacement_seed;
@@ -965,7 +1027,7 @@ pub const Reclaimer = struct {
     }
 
     fn publishGauges(self: *Reclaimer) void {
-        stats.block_free_reclaim_drain_rate.set(self.drain_rate.load(.monotonic));
+        stats.block_free_reclaim_drain_rate.set(self.drain_meter.load());
         stats.block_free_reclaim_arrival_rate.set(self.arrival_peak);
         stats.block_free_reclaim_queue_cap.set(self.cap.load(.monotonic));
         stats.block_free_reclaim_park_bound_ms.set(self.park_bound_ms.load(.monotonic));
@@ -980,7 +1042,11 @@ pub const Reclaimer = struct {
     }
 
     pub fn drainRate(self: *const Reclaimer) u64 {
-        return self.drain_rate.load(.monotonic);
+        return self.drain_meter.load();
+    }
+
+    pub fn debtDrainRate(self: *const Reclaimer) u64 {
+        return self.debt_meter.load();
     }
 
     // ---- the worker (§3.2 ensure_worker) ----
@@ -1161,32 +1227,43 @@ pub const Reclaimer = struct {
 
     // ---- the debt drainer (§3.4) ----
 
+    /// Foreground moving ⇒ defer; else quiet for `IDLE_CONFIRM_TICKS` ticks
+    /// of WALL time (a paced pass is not a tick: twenty paced passes could
+    /// span twenty seconds).
     fn drainerMustDefer(self: *Reclaimer) bool {
+        const now = clock.monotonicNs();
         if (self.fg_signal) |s| {
-            const now = s.read(s.ctx);
-            if (now != self.debt_fg_last) {
-                self.debt_fg_last = now;
-                self.quiet_ticks = 0;
+            const cur = s.read(s.ctx);
+            if (cur != self.debt_fg_last) {
+                self.debt_fg_last = cur;
+                self.debt_quiet_since_ns = now;
                 return true;
             }
         }
-        self.quiet_ticks += 1;
-        return self.quiet_ticks < IDLE_CONFIRM_TICKS;
+        if (self.debt_quiet_since_ns == 0) self.debt_quiet_since_ns = now;
+        return now - self.debt_quiet_since_ns < IDLE_CONFIRM_TICKS * MANNERS_TICK_MS * std.time.ns_per_ms;
     }
 
-    const DebtPassOutcome = enum { idle, progressed, deferred, fruitless };
+    const DebtPass = struct {
+        verdict: enum { idle, progressed, deferred, fruitless },
+        /// The foreground was moving (the pass was a PRESSURE drain).
+        foreground: bool,
+        /// Blocks this pass issued (the pace's batch term).
+        blocks: u64,
+    };
 
     /// One pass over every debt target: `debt == 0` ⇒ skip; foreground ∧
     /// within the watermark ⇒ defer (the row pays zero discards); foreground
-    /// ∧ past it ⇒ a counted pressure drain; else ONE paced batch. The
-    /// verdict keys on what was RECLAIMED (finding 12: a fully grace-held
-    /// backlog looped hot at ≈ 5,000 jobs/s on an idle daemon at 88 °C).
-    fn debtPass(self: *Reclaimer, io: Io) DebtPassOutcome {
-        if (self.fenceHalted()) return .idle;
+    /// ∧ past it ⇒ a counted pressure drain of the device-paced batch
+    /// (`debtBatchBlocks`); idle ⇒ ONE configured batch. The verdict keys
+    /// on what was RECLAIMED (finding 12: a fully grace-held backlog looped
+    /// hot at ≈ 5,000 jobs/s on an idle daemon at 88 °C).
+    fn debtPass(self: *Reclaimer, io: Io) DebtPass {
+        if (self.fenceHalted()) return .{ .verdict = .idle, .foreground = false, .blocks = 0 };
         stats.block_free_debt_drain_passes.inc();
         const must_defer = self.drainerMustDefer();
         var outstanding: u64 = 0;
-        var progressed = false;
+        var blocks: u64 = 0;
         var deferred = false;
         for (self.vols, 0..) |*slot, vol| {
             const row = if (slot.*) |*r| r else continue;
@@ -1199,40 +1276,45 @@ pub const Reclaimer = struct {
                 deferred = true;
                 continue;
             }
-            if (must_defer) stats.block_free_debt_pressure_drains.inc();
-            const r = self.drainDebtSync(io, @intCast(vol), self.cfg.batch_blocks, false);
-            if (r.blocks > 0) progressed = true;
+            var batch = self.cfg.batch_blocks;
+            if (must_defer) {
+                stats.block_free_debt_pressure_drains.inc();
+                batch = debtBatchBlocks(self.debt_meter.load(), self.cfg.batch_blocks);
+            }
+            blocks += self.drainDebtSync(io, @intCast(vol), batch, false).blocks;
         }
         stats.block_free_elided_debt_bytes.set(self.totalDebtBytes());
-        if (outstanding == 0) return .idle;
-        if (progressed) return .progressed;
-        if (deferred) return .deferred;
-        return .fruitless;
+        const verdict: @FieldType(DebtPass, "verdict") = if (outstanding == 0) .idle else if (blocks > 0) .progressed else if (deferred) .deferred else .fruitless;
+        return .{ .verdict = verdict, .foreground = must_defer, .blocks = blocks };
     }
 
+    /// The drainer's cadence: idle ⇒ park on the first elided free; a
+    /// quiet progressed pass ⇒ the next at once (full width to empty); a
+    /// PRESSURE pass that progressed ⇒ one batch-time at the device's
+    /// measured completion rate (`debtPaceMs` — never a hot loop under a
+    /// foreground stream); deferred ⇒ re-judge next tick; fruitless (every
+    /// claimable block raced away) ⇒ one batch-time, then look again.
     fn drainerMain(self: *Reclaimer, io: Io) void {
         while (!self.stop.load(.acquire)) {
-            const outcome = self.debtPass(io);
+            const pass = self.debtPass(io);
             const now = clock.monotonicNs();
-            const deadline: u64 = switch (outcome) {
+            const deadline: u64 = switch (pass.verdict) {
                 .idle => std.math.maxInt(u64),
                 .progressed => blk: {
-                    self.fruitless = 0;
-                    break :blk now;
+                    if (!pass.foreground) break :blk now;
+                    const pace = debtPaceMs(pass.blocks, self.debt_meter.load());
+                    stats.block_free_debt_pace_ms.set(pace);
+                    break :blk now + pace * std.time.ns_per_ms;
                 },
-                .deferred => blk: {
-                    self.fruitless = 0;
-                    break :blk now + MANNERS_TICK_MS * std.time.ns_per_ms;
-                },
+                .deferred => now + MANNERS_TICK_MS * std.time.ns_per_ms,
                 .fruitless => blk: {
                     stats.block_free_debt_fruitless_passes.inc();
-                    const shift: u6 = @min(self.fruitless, FRUITLESS_BACKOFF_SHIFT_MAX);
-                    if (self.fruitless < FRUITLESS_BACKOFF_SHIFT_MAX) self.fruitless += 1;
-                    const backoff_ms: u64 = @min(MANNERS_TICK_MS << shift, FRUITLESS_BACKOFF_MAX_MS);
-                    break :blk now + backoff_ms * std.time.ns_per_ms;
+                    const pace = debtPaceMs(self.cfg.batch_blocks, self.debt_meter.load());
+                    stats.block_free_debt_pace_ms.set(pace);
+                    break :blk now + pace * std.time.ns_per_ms;
                 },
             };
-            if (outcome == .progressed) continue;
+            if (deadline == now) continue;
             if (!self.parkWake(io, &self.debt_wake, deadline)) return;
         }
     }
@@ -1291,6 +1373,7 @@ pub const Reclaimer = struct {
                 const ranges = coalesceRanges(offsets[0..c], alloc.blockSize(), &ranges_buf);
                 for (ranges) |r| {
                     self.issueRange(row, r, .trim);
+                    self.noteTrimmed(r.k);
                     out.blocks += r.k;
                     out.bytes += r.len;
                 }
@@ -1378,6 +1461,30 @@ test "reclaim_room_latency_is_batch_over_measured_drain_rate; cold reads the cei
     try testing.expectEqual(@as(u64, 10), roomMs(64, 5900)); // idle catch-up
     try testing.expectEqual(PARK_BOUND_CEILING_MS, roomMs(64, 0));
     try testing.expectEqual(@as(u64, 1), roomMs(1, 100_000));
+}
+
+test "the debt drainer's pace is the device's: batch = clamp(rate × tick, 1, batch) (cold ⇒ the configured batch); pace = clamp(batch ÷ rate, tick, ceiling) (cold ⇒ the ceiling); the meter rolls one tick first, then the window, into the ¼ EWMA" {
+    // 1,280 blocks/s × 50 ms = 64; 100 × 50 ms = 5; 10 × 50 ms = 0 ⇒ 1; 100,000 × 50 ms ⇒ 64 (the cap).
+    try testing.expectEqual(@as(u32, 64), debtBatchBlocks(1280, 64));
+    try testing.expectEqual(@as(u32, 5), debtBatchBlocks(100, 64));
+    try testing.expectEqual(@as(u32, 1), debtBatchBlocks(10, 64));
+    try testing.expectEqual(@as(u32, 64), debtBatchBlocks(100_000, 64));
+    try testing.expectEqual(@as(u32, 64), debtBatchBlocks(0, 64));
+    // 64 blocks at 1,280/s = 50 ms (the tick floor); 64 at 100/s = 640 ms; 64 at 10/s ⇒ 6,400 ⇒ the 1 s ceiling; 5 at 100/s = 50 ms; cold ⇒ ceiling.
+    try testing.expectEqual(MANNERS_TICK_MS, debtPaceMs(64, 1280));
+    try testing.expectEqual(@as(u64, 640), debtPaceMs(64, 100));
+    try testing.expectEqual(PARK_BOUND_CEILING_MS, debtPaceMs(64, 10));
+    try testing.expectEqual(MANNERS_TICK_MS, debtPaceMs(5, 100));
+    try testing.expectEqual(PARK_BOUND_CEILING_MS, debtPaceMs(64, 0));
+    // The meter: the first window is one tick; 64 blocks over 50 ms = 1,280/s; the next window is 250 ms; 64 over 250 ms = 256/s ⇒ EWMA 1280 − 320 + 64 = 1024.
+    var m: RateMeter = .{};
+    try testing.expect(!m.note(64, 1000)); // opens the window
+    try testing.expect(!m.note(0, 1049)); // 49 ms: not yet
+    try testing.expect(m.note(0, 1050));
+    try testing.expectEqual(@as(u64, 1280), m.load());
+    try testing.expect(!m.note(64, 1299)); // 249 ms into the 250 ms window
+    try testing.expect(m.note(0, 1300));
+    try testing.expectEqual(@as(u64, 1024), m.load());
 }
 
 test "reclaim_park_bound_derives_from_the_drains_room_latency: clamp(4 × room, 50, 1000)" {
@@ -1812,6 +1919,53 @@ test "the debt drainer: idle drains elided debt past the watermark to zero with 
     try log.testing.expectAllFired();
     try testing.expect(ro.r.fenceHalted());
     try testing.expectEqual(@as(u64, 0), ro.r.population());
+}
+
+// Rung 9 F17: on a wrapped volume (virgin tail 0) every byte of debt is past
+// the watermark, so under a foreground stream the shipped drainer looped
+// `progressed ⇒ at once` and drained the whole backlog behind the write lane
+// at full tilt. The pressure drain is paced to the device: ONE batch, then
+// one batch-time at the measured completion rate (the cold ceiling until the
+// meter learns).
+test "the debt drainer under a FOREGROUND stream past the watermark issues one device-paced batch per pace, never the whole backlog at once; idle it drains to zero at full width" {
+    const io = testing.io;
+    var f = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0, .batch_blocks = 4 }, .bdev_discard, 32);
+    defer f.deinit();
+    try f.mintPublished(32); // the virgin tail is 0: the watermark is passed by the first byte of debt
+    const Fg = struct {
+        var bytes: Atomic(u64) = .init(0);
+        fn read(_: ?*anyopaque) u64 {
+            return bytes.load(.monotonic);
+        }
+    };
+    Fg.bytes.store(1, .monotonic);
+    f.r.setForegroundSignal(.{ .ctx = null, .read = &Fg.read });
+    const pressure0 = stats.block_free_debt_pressure_drains.load();
+    // 16 blocks of debt, scattered (every other block): four batches'
+    // worth, landed under a moving foreground BEFORE the drainer starts
+    // (the first free's wake is a stored permit: pass 1 finds the debt,
+    // pass 2 rides the permit — deterministic).
+    var idx: u64 = 0;
+    while (idx < 32) : (idx += 2) {
+        _ = Fg.bytes.fetchAdd(1 << 20, .monotonic);
+        try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, idx, f.alloc.stampOf(idx)));
+    }
+    try testing.expectEqual(@as(u64, 16 * 4096), f.alloc.elidedDebtBytes());
+    try f.r.start(io);
+    // Two pressure passes of ONE batch each (4 blocks, the meter still
+    // cold), then the cold ceiling's rest: half a ceiling later the other
+    // 8 are still owed (the shipped hot loop drained all 16 at once).
+    stallMs(io, PARK_BOUND_CEILING_MS / 2);
+    try testing.expectEqual(@as(u64, 8 * 4096), f.alloc.elidedDebtBytes());
+    try testing.expectEqual(pressure0 + 2, stats.block_free_debt_pressure_drains.load());
+    try testing.expectEqual(PARK_BOUND_CEILING_MS, stats.block_free_debt_pace_ms.load());
+    // The foreground stops: the quiet drainer drains the rest at full width.
+    var spins: u32 = 0;
+    while (f.alloc.elidedDebtBytes() != 0 and spins < 2000) : (spins += 1) stallMs(io, 5);
+    f.r.stopAndJoin(io);
+    try testing.expectEqual(@as(u64, 0), f.alloc.elidedDebtBytes());
+    try testing.expectEqual(@as(u64, 0), f.alloc.trimClaimed());
+    try testing.expect(f.r.debtDrainRate() > 0); // the trim venue fed the meter
 }
 
 test "a refused device command counts skipped and never falls back to a zeroing write; a skip-class substrate issues nothing" {

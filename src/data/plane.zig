@@ -534,7 +534,7 @@ pub const DataPlane = struct {
         // 5. The read path over the plane's seams.
         var rcfg = read_path.Config.fromEnv(opts.env, cfg.block_size, self.passthrough, opts.facts, opts.budget_bytes);
         if (opened == 0) rcfg.read_lane = false;
-        const decode: ?read_path.Decode = if (self.xform != null) .{ .ctx = self, .chunk = cfg.chunk_size, .decode = &decodeImage } else null;
+        const decode: ?read_path.Decode = if (self.xform != null) .{ .ctx = self, .chunk = cfg.chunk_size, .decode = &decodeImage, .frame_span = &decodeFrameSpan, .decode_range = &decodeRange } else null;
         self.rp = read_path.ReadPath.init(gpa, rcfg, self.meta(), self.readVolumes(), self.writeSide(), decode, nvme, &budget.authority) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Io,
@@ -1721,6 +1721,25 @@ pub const DataPlane = struct {
         x.lock.lockUncancelable(self.io);
         defer x.lock.unlock(self.io);
         return x.t.processRead(image, out) catch return error.Corrupt;
+    }
+
+    /// The framed sub-block read's two seams (decision 0003 §K7): the span
+    /// is pure over the header page (no lock); the frame decode takes the
+    /// transform lock for the frames alone.
+    fn decodeFrameSpan(ctx: *anyopaque, page: []const u8, rel_s: u64, rel_e: u64) error{Corrupt}!read_path.FrameSpan {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const x = &self.xform.?;
+        const h = transform.decodeHeader(x.t.cfg, page) catch return error.Corrupt;
+        const t = transform.decodeTable(x.t.cfg, h, page) catch return error.Corrupt;
+        return transform.frameSpan(h, t, rel_s, rel_e) catch return error.Corrupt;
+    }
+
+    fn decodeRange(ctx: *anyopaque, page: []const u8, window: []u8, window_off: u64, span: read_path.FrameSpan, out: []u8) error{Corrupt}![]const u8 {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const x = &self.xform.?;
+        x.lock.lockUncancelable(self.io);
+        defer x.lock.unlock(self.io);
+        return x.t.decodeFrames(page, window, window_off, span, out) catch return error.Corrupt;
     }
 
     // ---- the block-map authority (seams.MapSeam) ----

@@ -79,6 +79,7 @@ const purge = @import("purge.zig");
 const single_flight = @import("single_flight_fill.zig");
 const admission = @import("admission.zig");
 const prefetch = @import("prefetch.zig");
+const transform = @import("transform.zig");
 
 pub const BlockKey = rsc.BlockKey;
 pub const Mapping = layout.Mapping;
@@ -354,13 +355,22 @@ pub const Volumes = struct {
 
 /// The transform seam for non-passthrough volumes: decode the stored
 /// `image` (the chunk read from the device) into `out` (≥ the scratch
-/// length); returns the plaintext view (inside `out` or `image`).
+/// length); returns the plaintext view (inside `out` or `image`). The
+/// framed image's SUB-BLOCK read (decision 0003 §K7): `frame_span` over
+/// the image's header page names the frames a block window needs and the
+/// image bytes to DMA for them; `decode_range` decodes those frames alone.
 pub const Decode = struct {
     ctx: *anyopaque,
     /// The stored image length to read per block (`chunk`).
     chunk: u64,
     decode: *const fn (ctx: *anyopaque, image: []u8, out: []u8) error{Corrupt}![]const u8,
+    frame_span: *const fn (ctx: *anyopaque, page: []const u8, rel_s: u64, rel_e: u64) error{Corrupt}!FrameSpan,
+    decode_range: *const fn (ctx: *anyopaque, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) error{Corrupt}![]const u8,
 };
+
+pub const FrameSpan = transform.FrameSpan;
+/// The header page every framed image starts with (`transform.HEADER_PAGE_LEN`).
+pub const HEADER_PAGE_LEN: u64 = transform.HEADER_PAGE_LEN;
 
 pub const OverlayVerdict = union(enum) {
     /// No write-side authority covers the window.
@@ -539,10 +549,11 @@ pub fn resolveRangedThreshold(explicit: ?u64, block_size: u64) u64 {
 }
 
 /// `ranged_eligible`: threshold on ∧ `len ≤ threshold` ∧ `block >
-/// threshold` ∧ passthrough ∧ not stream-classified (streams want whole
-/// blocks: 1.0× amp + the pipeline).
-pub fn rangedEligible(threshold: u64, len: u64, block_size: u64, passthrough: bool, streaming_fresh: bool) bool {
-    return threshold != 0 and len <= threshold and block_size > threshold and passthrough and !streaming_fresh;
+/// threshold` ∧ sub-block capable (a passthrough volume's window, or a
+/// framed transformed volume's frames) ∧ not stream-classified (streams
+/// want whole blocks: 1.0× amp + the pipeline).
+pub fn rangedEligible(threshold: u64, len: u64, block_size: u64, sub_block_capable: bool, streaming_fresh: bool) bool {
+    return threshold != 0 and len <= threshold and block_size > threshold and sub_block_capable and !streaming_fresh;
 }
 
 /// The ranged window: `[start & ~4095, min(ceil4k(end), block))`.
@@ -806,11 +817,20 @@ pub const ReadPath = struct {
         return self.vols.allocator_of(self.vols.ctx, key.vol_tag);
     }
 
+    /// The allocator's stride: the CHUNK on a transformed volume (block +
+    /// headroom), the block otherwise. A key's cell is `offset / stride`
+    /// — dividing by the block instead named a neighbour's incarnation
+    /// word from the 1,025th block of a transformed volume on (the
+    /// validation lattice defeated: a stale-serve class).
+    fn stride(self: *const ReadPath) u64 {
+        return if (self.decode) |d| d.chunk else self.cfg.block_size;
+    }
+
     /// `fill_incarnation`: null = unstable (never publish); an unknown
     /// volume is `UNKNOWN_STABLE` (vacuously valid, never published).
     fn fillIncarnation(self: *ReadPath, key: BlockKey) ?u64 {
         const a = self.allocatorOf(key) orelse return block_alloc.UNKNOWN_STABLE;
-        return a.fillIncarnation(key.blockIdx(self.cfg.block_size));
+        return a.fillIncarnation(key.blockIdx(self.stride()));
     }
 
     fn tracked(self: *ReadPath, key: BlockKey) bool {
@@ -819,7 +839,7 @@ pub const ReadPath = struct {
 
     fn still(self: *ReadPath, key: BlockKey, before: u64) bool {
         const a = self.allocatorOf(key) orelse return true;
-        return a.fillIncarnationStill(key.blockIdx(self.cfg.block_size), before);
+        return a.fillIncarnationStill(key.blockIdx(self.stride()), before);
     }
 
     /// The warm ladder's direct-leg pair: the pre-DMA snapshot (null =
@@ -1125,6 +1145,15 @@ pub const ReadPath = struct {
                 stats.stale_binding_rebinds.inc();
             }
         }
+        // (8f) The FRAMED sub-block read on a transformed volume (decision
+        //      0003 §K7): the header page + the frames the window needs,
+        //      decoded alone — never the whole image; ghost-escalated and
+        //      never published like a ranged window.
+        if (self.decode) |d| {
+            if (key != null and !device_true and rangedEligible(self.cfg.ranged_threshold, slice_len, bs, true, self.streamingFresh(ino, now))) {
+                return self.rangedFramedRead(io, ino, b, key, rel_s, rel_e, out, flags.odirect, d);
+            }
+        }
         // (9) RANGED dispatch — strictly after the probes missed.
         const lease_admits = dest_leaseable and key != null and !self.flights.inFlight(io, key.?);
         const ranged = key != null and ((device_true and self.cfg.passthrough) or
@@ -1255,6 +1284,115 @@ pub const ReadPath = struct {
             defer bl.release(self);
             const src = bl.bytes(self);
             @memcpy(out, src[@intCast(rel_s)..@intCast(rel_e)]);
+            stats.read_copy_dest_bytes.add(out.len);
+            stats.read_copy_fill_slice_bytes.add(out.len);
+            return;
+        }
+        @memset(out, 0);
+        stats.read_copy_dest_bytes.add(out.len);
+    }
+
+    /// §K7 — the framed sub-block read: ONE header-page DMA names the
+    /// frames `[rel_s, rel_e)` falls in, ONE window DMA lands them, the
+    /// frames decode into a pool scratch and the window is copied out.
+    /// Binding-validated like every serve (bytes in hand, then `still` and
+    /// the binding); a decode refusal under a moved binding is a LOSS (a
+    /// dead incarnation fails AEAD/LZ4), under the current one a loud EIO.
+    fn rangedFramedRead(self: *ReadPath, io: Io, ino: u64, b: u64, key0: ?BlockKey, rel_s: u64, rel_e: u64, out: []u8, odirect: bool, d: Decode) Error!void {
+        const bs = self.cfg.block_size;
+        var key = key0;
+        var attempt: u32 = 0;
+        while (attempt < RANGED_MAX_REBINDS) : (attempt += 1) {
+            const k = key orelse {
+                @memset(out, 0);
+                stats.read_copy_dest_bytes.add(out.len);
+                return;
+            };
+            if (attempt >= BACKOFF_AFTER) io.sleep(.fromMilliseconds(@as(i64, 1) << @intCast(@min(attempt - BACKOFF_AFTER, 3))), .awake) catch {};
+            // The ghost second touch escalates to ONE whole-block fill.
+            if (self.adm.rangedEscalation(k, bs, self.level() == .red, odirect, clock.monotonicNs())) {
+                const blk = try self.getBlockForIndex(io, ino, b, key, false, true, .escalation);
+                if (blk) |bl| {
+                    defer bl.release(self);
+                    const src = bl.bytes(self);
+                    const avail = if (rel_s < src.len) @min(rel_e, src.len) - rel_s else 0;
+                    @memcpy(out[0..@intCast(avail)], src[@intCast(rel_s)..][0..@intCast(avail)]);
+                    @memset(out[@intCast(avail)..], 0);
+                    stats.read_copy_dest_bytes.add(out.len);
+                    stats.read_copy_fill_slice_bytes.add(out.len);
+                    return;
+                }
+                @memset(out, 0);
+                stats.read_copy_dest_bytes.add(out.len);
+                return;
+            }
+            const before = self.fillIncarnation(k) orelse {
+                stats.stale_binding_rebinds.inc();
+                stats.ranged_read_rebinds.inc();
+                key = self.currentBinding(ino, b);
+                continue;
+            };
+            // 1. The header page.
+            const page = try self.acquireBounce(HEADER_PAGE_LEN);
+            defer self.releaseBounce(page);
+            if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset, page.bytes[0..@intCast(HEADER_PAGE_LEN)], .pooled) == .dma) {
+                stats.read_fill_dma_bytes.add(HEADER_PAGE_LEN);
+                stats.read_dma_image_bytes.add(HEADER_PAGE_LEN);
+            }
+            const span = d.frame_span(d.ctx, page.bytes[0..@intCast(HEADER_PAGE_LEN)], rel_s, rel_e) catch {
+                // A torn page under a moved binding is a loss; under the
+                // current binding the image is corrupt.
+                if (self.bindingIs(ino, b, k) and self.still(k, before)) return error.InputOutput;
+                stats.stale_binding_rebinds.inc();
+                stats.ranged_read_rebinds.inc();
+                key = self.currentBinding(ino, b);
+                continue;
+            };
+            // 2. The frames' window.
+            const win_len = span.hi - span.lo;
+            const win = try self.acquireBounce(win_len);
+            defer self.releaseBounce(win);
+            if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + span.lo, win.bytes[0..@intCast(win_len)], .pooled) == .dma) {
+                stats.read_fill_dma_bytes.add(win_len);
+                stats.read_dma_image_bytes.add(win_len);
+            }
+            stats.ranged_reads.inc();
+            stats.ranged_read_bytes.add(HEADER_PAGE_LEN + win_len);
+            self.adm.governor.noteForeground(HEADER_PAGE_LEN + win_len, clock.monotonicNs());
+            if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, k);
+            // 3. Bytes in hand FIRST, then the two checks.
+            const incarnation_ok = self.still(k, before);
+            const current = self.currentBinding(ino, b);
+            if (!(incarnation_ok and current != null and current.?.eql(k))) {
+                stats.stale_binding_rebinds.inc();
+                stats.ranged_read_rebinds.inc();
+                key = current;
+                continue;
+            }
+            // 4. Decode the span's frames into a pool scratch; the window out.
+            const plain_len = @as(u64, span.last - span.first + 1) * transform.FRAME_GRAIN;
+            const scratch = try self.acquireBounce(plain_len + std.compress.zstd.block_size_max);
+            defer self.releaseBounce(scratch);
+            const view = d.decode_range(d.ctx, page.bytes[0..@intCast(HEADER_PAGE_LEN)], win.bytes[0..@intCast(win_len)], span.lo, span, scratch.bytes) catch {
+                if (self.bindingIs(ino, b, k) and self.still(k, before)) return error.InputOutput;
+                stats.stale_binding_rebinds.inc();
+                stats.ranged_read_rebinds.inc();
+                key = self.currentBinding(ino, b);
+                continue;
+            };
+            const from: usize = @intCast(rel_s - span.plain_base);
+            @memcpy(out, view[from..][0..out.len]);
+            stats.read_copy_dest_bytes.add(out.len);
+            return;
+        }
+        // Exhaustion ⇒ the whole-block validated walk, then the slice.
+        const blk = try self.getBlockForIndex(io, ino, b, key, false, true, null);
+        if (blk) |bl| {
+            defer bl.release(self);
+            const src = bl.bytes(self);
+            const avail = if (rel_s < src.len) @min(rel_e, src.len) - rel_s else 0;
+            @memcpy(out[0..@intCast(avail)], src[@intCast(rel_s)..][0..@intCast(avail)]);
+            @memset(out[@intCast(avail)..], 0);
             stats.read_copy_dest_bytes.add(out.len);
             stats.read_copy_fill_slice_bytes.add(out.len);
             return;
@@ -1666,12 +1804,19 @@ pub const TestFixture = if (builtin.is_test) Fixture else @compileError("TestFix
 const Fixture = struct {
     pub const bs: u64 = 1 << 20;
     pub const vol_tag: u64 = 0x7001;
-    const capacity: u64 = 32 * bs;
+    const dev_blocks: u64 = 32;
     const MaxBlocks = 24;
 
     gpa: Allocator,
     device: []align(4096) u8,
     alloc: *block_alloc.BlockAllocator,
+    /// The allocator stride: `bs`, or the chunk on a transformed fixture.
+    chunk: u64 = bs,
+    /// A transformed fixture: the device holds FRAMED images of the
+    /// pattern (the plaintext of device block `i` at `rel` is the
+    /// passthrough pattern at `i × bs + rel`, so `expected` reads the same).
+    xform: ?transform.Transform = null,
+    xscratch: []u8 = &.{},
     size: u64 = 0,
     kind: layout.Kind = .striped,
     bindings: [MaxBlocks]?Mapping = @splat(null),
@@ -1681,18 +1826,36 @@ const Fixture = struct {
     fail_reads: Atomic(u32) = .init(0),
     rp: *ReadPath = undefined,
 
-    pub fn init(gpa: Allocator, cfg_over: struct { passthrough: bool = true, ranged_threshold: u64 = 256 * derive.KiB, direct_device_true: bool = false, read_lane: bool = true, rebind_cap: u32 = MAX_REBINDS, hot_budget: u64 = 4 * bs, policy: admission.Policy = .second_touch }) !*Fixture {
+    pub fn init(gpa: Allocator, cfg_over: struct { passthrough: bool = true, ranged_threshold: u64 = 256 * derive.KiB, direct_device_true: bool = false, read_lane: bool = true, rebind_cap: u32 = MAX_REBINDS, hot_budget: u64 = 4 * bs, policy: admission.Policy = .second_touch, compression: ?transform.Compression = null }) !*Fixture {
         const self = try gpa.create(Fixture);
         errdefer gpa.destroy(self);
+        const xcfg: transform.VolumeTransform = .{ .compression = cfg_over.compression orelse .none, .block_size = @intCast(bs) };
+        const chunk: u64 = if (cfg_over.compression != null) transform.chunkSizeFor(xcfg) else bs;
+        const capacity = dev_blocks * chunk;
         const device = try gpa.alignedAlloc(u8, .fromByteUnits(4096), @intCast(capacity));
         errdefer gpa.free(device);
-        for (device, 0..) |*b, i| b.* = @truncate((i / 4096) * 31 + i);
-        const alloc = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = vol_tag, .vol = 0, .block_size = bs, .capacity_bytes = capacity });
+        const alloc = try block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = vol_tag, .vol = 0, .block_size = chunk, .capacity_bytes = capacity });
         errdefer alloc.deinit();
-        self.* = .{ .gpa = gpa, .device = device, .alloc = alloc };
+        self.* = .{ .gpa = gpa, .device = device, .alloc = alloc, .chunk = chunk };
+        if (cfg_over.compression != null) {
+            var env = std.process.Environ.Map.init(gpa);
+            defer env.deinit();
+            self.xform = try transform.Transform.init(gpa, &env, xcfg, null);
+            self.xscratch = try gpa.alloc(u8, @intCast(transform.scratchLen(@intCast(bs))));
+            const plain = try gpa.alloc(u8, @intCast(bs));
+            defer gpa.free(plain);
+            @memset(device, 0);
+            for (0..dev_blocks) |i| {
+                for (plain, 0..) |*b, j| b.* = @truncate(((i * bs + j) / 4096) * 31 + (i * bs + j));
+                const img = try self.xform.?.processWrite(plain, self.xscratch);
+                @memcpy(device[i * chunk ..][0..img.len], img);
+            }
+        } else {
+            for (device, 0..) |*b, i| b.* = @truncate((i / 4096) * 31 + i);
+        }
         const cfg: Config = .{
             .block_size = bs,
-            .passthrough = cfg_over.passthrough,
+            .passthrough = cfg_over.passthrough and cfg_over.compression == null,
             .ranged_threshold = cfg_over.ranged_threshold,
             .dest_lease = true,
             .read_lane = cfg_over.read_lane,
@@ -1707,21 +1870,40 @@ const Fixture = struct {
             .prefetch = .{ .window_cap = 8, .share_pct = 50, .hot_budget = cfg_over.hot_budget, .lane_armed = cfg_over.read_lane, .depth_pin = null, .lane_budget_cap = 8 * bs },
         };
         const nvme = try nvme_read_cache.Cache.initRam(gpa, 1, 8 * bs);
-        self.rp = try ReadPath.init(gpa, cfg, self.meta(), self.vols(), WriteSide.none, null, nvme, null);
+        const decode: ?Decode = if (self.xform != null) .{ .ctx = self, .chunk = chunk, .decode = &xDecode, .frame_span = &xFrameSpan, .decode_range = &xDecodeRange } else null;
+        self.rp = try ReadPath.init(gpa, cfg, self.meta(), self.vols(), WriteSide.none, decode, nvme, null);
         return self;
     }
 
     pub fn deinit(self: *Fixture) void {
         self.rp.deinit();
         self.alloc.deinit();
+        if (self.xform) |*x| x.deinit(self.gpa);
+        self.gpa.free(self.xscratch);
         self.gpa.free(self.device);
         self.gpa.destroy(self);
     }
 
     /// Bind block `b` to device block `dev_idx` (published stable).
     pub fn bind(self: *Fixture, b: usize, dev_idx: u64) void {
-        self.bindings[b] = Mapping.wholeBlock(vol_tag, dev_idx * bs, 1);
+        self.bindings[b] = Mapping.wholeBlock(vol_tag, dev_idx * self.chunk, 1);
         self.alloc.publishBlock(dev_idx);
+    }
+
+    // The transform seam (a transformed fixture).
+    fn xDecode(ctx: *anyopaque, image: []u8, out: []u8) error{Corrupt}![]const u8 {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        return self.xform.?.processRead(image, out) catch return error.Corrupt;
+    }
+    fn xFrameSpan(ctx: *anyopaque, page: []const u8, rel_s: u64, rel_e: u64) error{Corrupt}!FrameSpan {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        const h = transform.decodeHeader(self.xform.?.cfg, page) catch return error.Corrupt;
+        const t = transform.decodeTable(self.xform.?.cfg, h, page) catch return error.Corrupt;
+        return transform.frameSpan(h, t, rel_s, rel_e) catch return error.Corrupt;
+    }
+    fn xDecodeRange(ctx: *anyopaque, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) error{Corrupt}![]const u8 {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        return self.xform.?.decodeFrames(page, window, window_off, span, out) catch return error.Corrupt;
     }
 
     pub fn expected(dev_off: u64, out: []const u8) !void {
@@ -1985,6 +2167,88 @@ test "the ranged ceiling is derived from the block (every strictly sub-block req
     try testing.expectEqual(@as(u64, 512 * derive.KiB), f.device_read_bytes.load(.monotonic));
     const key = BlockKey.init(Fixture.vol_tag, 3 * Fixture.bs);
     try testing.expect(!f.rp.hot.contains(key) and !f.rp.nvme.has(key) and !f.rp.hold.contains(key));
+}
+
+test "a transformed volume's random 4 KiB read costs the header page + ONE frame window of device bytes (≤ 4 KiB + 64 KiB + 8 KiB), never the whole image; the bytes are exact across frame boundaries; a stride-crossing block validates its own incarnation cell; the second touch escalates to one whole image; a whole-block read is one image; the image arm carries every byte" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{ .compression = .lz4, .read_lane = false, .ranged_threshold = derivedRangedThreshold(Fixture.bs) });
+    defer f.deinit();
+    try testing.expect(f.chunk == Fixture.bs + 2 * 4096 and f.rp.decode != null and !f.rp.cfg.passthrough);
+    f.size = 8 * Fixture.bs;
+    for (0..8) |i| f.bind(i, @intCast(i + 3));
+    const buf = try alignedBuf(testing.allocator, 1 << 20);
+    defer testing.allocator.free(buf);
+    const l0 = DmaLedger.snap();
+    const dev0 = f.device_read_bytes.load(.monotonic);
+    // A cold 4 KiB read inside frame 2 of block 1: the page + one frame
+    // window (the raw escape makes the frame 64 KiB + its 4 KiB rounding).
+    const n = try f.rp.read(io, 7, Fixture.bs + 2 * transform.FRAME_GRAIN + 8192, 4096, .{ .buf = buf[0..4096] }, .{});
+    try testing.expectEqual(@as(usize, 4096), n);
+    try Fixture.expected(4 * Fixture.bs + 2 * transform.FRAME_GRAIN + 8192, buf[0..4096]);
+    const dma1 = f.device_read_bytes.load(.monotonic) - dev0;
+    try testing.expect(dma1 <= HEADER_PAGE_LEN + transform.FRAME_GRAIN + 2 * 4096);
+    try testing.expect(dma1 < f.chunk / 4);
+    var l = DmaLedger.snap();
+    try testing.expectEqual(dma1, l.image - l0.image);
+    try testing.expectEqual(l0.demand, l.demand);
+    const key1 = BlockKey.init(Fixture.vol_tag, 4 * f.chunk);
+    try testing.expect(!f.rp.hot.contains(key1) and !f.rp.nvme.has(key1));
+    // A read straddling two frames of block 2 is exact and costs ≤ two frames.
+    const dev1 = f.device_read_bytes.load(.monotonic);
+    const straddle = transform.FRAME_GRAIN - 100;
+    _ = try f.rp.read(io, 7, 2 * Fixture.bs + straddle, 300, .{ .buf = buf[0..300] }, .{});
+    try Fixture.expected(5 * Fixture.bs + straddle, buf[0..300]);
+    try testing.expect(f.device_read_bytes.load(.monotonic) - dev1 <= HEADER_PAGE_LEN + 2 * transform.FRAME_GRAIN + 2 * 4096);
+    // The last partial frame of a block (the block's tail) reads exactly.
+    _ = try f.rp.read(io, 7, 3 * Fixture.bs + Fixture.bs - 4096, 4096, .{ .buf = buf[0..4096] }, .{});
+    try Fixture.expected(6 * Fixture.bs + Fixture.bs - 4096, buf[0..4096]);
+    // The second touch of block 1 is a ghost hit: ONE whole image, then a
+    // hot serve.
+    const dev2 = f.device_read_bytes.load(.monotonic);
+    const esc0 = admission.stats.ranged_read_ghost_escalations.load();
+    _ = try f.rp.read(io, 7, Fixture.bs + 100, 4096, .{ .buf = buf[0..4096] }, .{});
+    try Fixture.expected(4 * Fixture.bs + 100, buf[0..4096]);
+    try testing.expectEqual(esc0 + 1, admission.stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(f.chunk, f.device_read_bytes.load(.monotonic) - dev2);
+    try testing.expect(f.rp.hot.contains(key1));
+    const dev3 = f.device_read_bytes.load(.monotonic);
+    _ = try f.rp.read(io, 7, Fixture.bs + 500_000, 4096, .{ .buf = buf[0..4096] }, .{});
+    try Fixture.expected(4 * Fixture.bs + 500_000, buf[0..4096]);
+    try testing.expectEqual(dev3, f.device_read_bytes.load(.monotonic));
+    // A whole-block read of block 5 is one image (the chunk).
+    const dev4 = f.device_read_bytes.load(.monotonic);
+    _ = try f.rp.read(io, 7, 5 * Fixture.bs, Fixture.bs, .{ .buf = buf }, .{});
+    try Fixture.expected(8 * Fixture.bs, buf);
+    try testing.expectEqual(f.chunk, f.device_read_bytes.load(.monotonic) - dev4);
+    // The ledger: every transformed byte in the image arm, equal to the device's count.
+    l = DmaLedger.snap();
+    try testing.expectEqual(f.device_read_bytes.load(.monotonic) - dev0, l.image - l0.image);
+    try testing.expectEqual(l.whereSum() - l0.whereSum(), l.purposeSum() - l0.purposeSum());
+    // The incarnation cell is the CHUNK stride's: retiring device block 10's
+    // word under a key at `10 × chunk` (whose `offset / bs` names cell 10 of
+    // a block-strided table only by luck below 1,024 blocks — here it is
+    // cell 10 either way, so the retire is observed through `still`).
+    f.bind(7, 10);
+    f.size = 8 * Fixture.bs;
+    const key7 = BlockKey.init(Fixture.vol_tag, 10 * f.chunk);
+    try testing.expectEqual(@as(u64, 10), key7.blockIdx(f.chunk));
+    const OnceHook = struct {
+        var fired: bool = false;
+        fn hook(ctx: ?*anyopaque, k: BlockKey) void {
+            if (fired) return;
+            fired = true;
+            const fx: *Fixture = @ptrCast(@alignCast(ctx.?));
+            fx.alloc.markIncarnationUnstable(k.blockIdx(fx.chunk));
+            fx.alloc.publishBlock(k.blockIdx(fx.chunk));
+        }
+    };
+    OnceHook.fired = false;
+    f.rp.seams = .{ .after_dma = &OnceHook.hook, .after_dma_ctx = f };
+    const rebinds0 = stats.ranged_read_rebinds.load();
+    _ = try f.rp.read(io, 7, 7 * Fixture.bs + 4096, 4096, .{ .buf = buf[0..4096] }, .{});
+    f.rp.seams = .{};
+    try Fixture.expected(10 * Fixture.bs + 4096, buf[0..4096]);
+    try testing.expectEqual(rebinds0 + 1, stats.ranged_read_rebinds.load());
 }
 
 test "the bounded-waste law under a random sub-block storm over a set ≫ the hot tier: once the clamp engages, ghost escalations spend only the governor's tokens (fill_pct of the previous epoch's ranged bytes) — the whole-block demand arm stays within W/len × (1 + f) of the user bytes" {

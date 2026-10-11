@@ -1,22 +1,36 @@
 //! Per-volume compression and encryption (charter §6.5; §6.2 item 3;
 //! `docs/porting/data_transform_config.md` §1–§4, §6): the ONE 96 B
 //! `TransformFrameWire` every transformed block image carries, the
-//! per-block best-effort compression rule with its store-raw escape, the
-//! AEAD layer (AES-256-GCM / ChaCha20-Poly1305, AAD = the header), the
+//! per-FRAME best-effort compression rule with its store-raw escape, the
+//! AEAD layer (AES-256-GCM / ChaCha20-Poly1305, one seal per frame, AAD =
+//! the header ‖ the frame's table entry ‖ its index), the
 //! `hkdf-sha256/aead-kw/v2` key wrap with its exact labels and lengths, the
 //! key-file laws and process hardening, and the geometry derivations
 //! (`maxStoredImageLen`, the chunk headroom, the scratch size, the mount
 //! refusal). `processWrite`/`processRead` are the hooks every write and
-//! read path consumes (the pack, the write-through, the fill ladder).
+//! read path consumes (the pack, the write-through, the fill ladder);
+//! `frameSpan`/`decodeFrames` are the SUB-BLOCK read's (decision 0003 §K7).
 //!
 //! Format v4 (decision 0002 rows 113–120): the reference's `[u32 LE len |
 //! raw<<31] ‖ image` frame with lz4's nested prepend-size, a big-endian
 //! `wrapped_key_len` beside a little-endian word, two zstd frame shapes
 //! and an EMPTY AAD is replaced by ONE fixed little-endian header, checked
-//! field by field, authenticated whole. The charter's "frame bit 31" (the
-//! reference's raw marker in its u32 word) is `flags.STORE_RAW` here with
-//! the same meaning: the body IS the plaintext, the escape sits BELOW the
-//! AEAD layer (an encrypted volume stores `seal(raw payload)` + the flag).
+//! field by field, authenticated whole.
+//!
+//! The FRAMED image (frame version 2, decision 0003 §K7): `header page
+//! (the 96 B header ‖ an xxh3-guarded frame table ‖ zero pad to 4 KiB) ‖
+//! frames`, each frame `FRAME_GRAIN` (64 KiB) of plaintext compressed with
+//! its own raw escape (the charter's "frame bit 31" is the entry's
+//! `STORE_RAW`: that frame's body IS its plaintext, the escape sitting
+//! BELOW the AEAD layer) and sealed under its own nonce (the block's base
+//! counter + the frame index — a block reserves `frames` counters, so no
+//! two frames of any two blocks share one). One AEAD/compression frame per
+//! block meant every sub-block read decoded the whole 4 MiB image (1025×
+//! device bytes at 4 KiB); with the grain a 4 KiB read DMAs the header
+//! page and the frame it falls in and decodes 64 KiB. 64 KiB because lz4's
+//! match window is 64 KiB (no ratio cost), zstd −3 loses a few percent at
+//! 64 KiB against 4 MiB, AES-GCM pays 28 B per frame (0.04 %), and the
+//! 64-entry table fits the header page beside the header.
 //!
 //! Passthrough volumes (`none`/`none`) keep the reference's NO-frame
 //! contract: the image IS the payload byte-identical (ranged reads, W1,
@@ -150,6 +164,15 @@ pub const KEY_DIR = "/etc/squeezefs/keys";
 /// DMA branch; recycled scratch bytes must never reach the device, so the
 /// pad is ZEROS).
 pub const DMA_GRAIN: u32 = 4096;
+/// The header page: the header ‖ the frame table, one DMA grain — a
+/// sub-block read fetches it alone to learn its frame's window.
+pub const HEADER_PAGE_LEN: usize = DMA_GRAIN;
+/// The frame grain (plaintext bytes per frame): lz4's `MAX_DISTANCE` is
+/// 64 KiB so no match is lost; zstd −3 at 64 KiB costs a few percent of
+/// ratio against a 4 MiB frame; AES-GCM pays one 16 B tag per frame; a
+/// 4 KiB read decodes 64 KiB instead of 4 MiB (decision 0003 §K7).
+pub const FRAME_GRAIN_LOG2: u8 = 16;
+pub const FRAME_GRAIN: u32 = 1 << FRAME_GRAIN_LOG2;
 /// The smallest logical block is the DMA grain; the largest is the 4 MiB
 /// accumulation buffer of charter §6.2 (the allocator stride).
 pub const MIN_BLOCK_SIZE: u32 = 4096;
@@ -174,30 +197,36 @@ comptime {
 // ---------------------------------------------------------------------------
 
 pub const MAGIC = "SQZB";
-pub const FRAME_VERSION: u8 = 1;
-/// The body IS the plaintext (incompressible, or an encrypt-only volume).
+/// Version 2 = the framed image (version 1, one frame per block, is
+/// refused: pre-release, no compatibility owed — decision 0002).
+pub const FRAME_VERSION: u8 = 2;
+/// A frame ENTRY's flag: the body IS the plaintext (incompressible, or a
+/// compression-less volume). Never set in the block header.
 pub const FLAG_STORE_RAW: u8 = 1 << 0;
-/// The body is `ciphertext ‖ tag` over the (compressed | raw) plaintext.
+/// The block header's flag: every frame body is `ciphertext ‖ tag`.
 pub const FLAG_ENCRYPTED: u8 = 1 << 1;
-const FLAGS_KNOWN: u8 = FLAG_STORE_RAW | FLAG_ENCRYPTED;
+const HEADER_FLAGS_KNOWN: u8 = FLAG_ENCRYPTED;
+const ENTRY_FLAGS_KNOWN: u8 = FLAG_STORE_RAW;
 
-/// Every transformed block image: header ‖ body ‖ zero pad to 4 KiB.
-/// Little-endian throughout; every field read by position.
+/// Every transformed block image: `header page ‖ frames`. Little-endian
+/// throughout; every field read by position.
 pub const TransformFrameWire = extern struct {
     magic: [4]u8,
     version: u8,
-    /// bit0 STORE_RAW, bit1 ENCRYPTED, bit2..7 must be 0.
+    /// bit1 ENCRYPTED; every other bit must be 0.
     flags: u8,
     /// The volume's declared mode; a mismatch refuses.
     compression: u8,
     encryption: u8,
-    /// Bytes after the header: plain|compressed image, or ciphertext ‖ tag.
+    /// Bytes after the header PAGE: Σ frame bodies (each `ciphertext ‖ tag`
+    /// when encrypted).
     body_len_le: [4]u8,
     /// Declared plaintext length ≤ block_size (DUR-8e, checked FIRST).
     plain_len_le: [4]u8,
     /// `"SK" ‖ 0x02 ‖ nonce12 ‖ ct32 ‖ tag16`; all-zero when !ENCRYPTED.
     key_blob: [WRAP_V2_LEN]u8,
-    /// All-zero when !ENCRYPTED.
+    /// The block's BASE nonce (frame i seals under base + i); all-zero
+    /// when !ENCRYPTED.
     nonce: [NONCE_LEN]u8,
     reserved: [5]u8,
 };
@@ -212,6 +241,98 @@ comptime {
     assert(@offsetOf(TransformFrameWire, "reserved") == 91);
 }
 
+/// The frame table, right after the header inside the header page: a
+/// 16 B head then `frame_count` entries. The xxh3 guards the entries (a
+/// plaintext volume has no AEAD to catch a torn table; an encrypted one
+/// binds every entry into its frame's AAD as well).
+pub const FrameTableWire = extern struct {
+    /// xxh3-64 over the entries (`frame_count × 16` bytes).
+    entries_xxh3_le: [8]u8,
+    frame_count_le: [2]u8,
+    /// `FRAME_GRAIN_LOG2` (the reader never assumes the constant).
+    frame_grain_log2: u8,
+    reserved: [5]u8,
+};
+
+/// One frame: where its body sits in the image and what it decodes to.
+pub const FrameEntryWire = extern struct {
+    /// Body offset from the image start (the first = `HEADER_PAGE_LEN`;
+    /// frames are contiguous).
+    off_le: [4]u8,
+    /// Body bytes (`ciphertext ‖ tag` when encrypted).
+    body_len_le: [4]u8,
+    /// Plaintext bytes: the grain for every frame but the last.
+    plain_len_le: [4]u8,
+    /// bit0 STORE_RAW; every other bit must be 0.
+    flags: u8,
+    reserved: [3]u8,
+};
+
+pub const TABLE_HEAD_LEN: usize = @sizeOf(FrameTableWire);
+pub const ENTRY_LEN: usize = @sizeOf(FrameEntryWire);
+/// The entries the header page can hold beside the header and the table
+/// head; the largest block (4 MiB) at the grain needs 64.
+pub const MAX_FRAMES: usize = (HEADER_PAGE_LEN - HEADER_LEN - TABLE_HEAD_LEN) / ENTRY_LEN;
+comptime {
+    assert(TABLE_HEAD_LEN == 16 and ENTRY_LEN == 16);
+    assert(MAX_FRAMES >= MAX_BLOCK_SIZE / FRAME_GRAIN);
+    assert(HEADER_LEN + TABLE_HEAD_LEN + MAX_FRAMES * ENTRY_LEN <= HEADER_PAGE_LEN);
+}
+
+/// The frames a plaintext of `plain_len` takes (0 for the empty payload).
+pub fn framesFor(plain_len: u32) u32 {
+    return (plain_len + FRAME_GRAIN - 1) / FRAME_GRAIN;
+}
+
+/// Frame `i`'s nonce: the block's base counter + i (the base was minted
+/// as a RANGE of `frames` counters, so no frame of any block shares one).
+pub fn frameNonce(base: [NONCE_LEN]u8, i: u32) [NONCE_LEN]u8 {
+    var out = base;
+    const counter = std.mem.readInt(u64, base[4..12], .big);
+    std.mem.writeInt(u64, out[4..12], counter +% i, .big);
+    return out;
+}
+
+/// A decoded frame entry.
+pub const Entry = struct {
+    off: u32,
+    body_len: u32,
+    plain_len: u32,
+    flags: u8,
+
+    pub fn storeRaw(self: Entry) bool {
+        return self.flags & FLAG_STORE_RAW != 0;
+    }
+
+    fn encode(self: Entry, out: *[ENTRY_LEN]u8) void {
+        var w: FrameEntryWire = undefined;
+        std.mem.writeInt(u32, &w.off_le, self.off, .little);
+        std.mem.writeInt(u32, &w.body_len_le, self.body_len, .little);
+        std.mem.writeInt(u32, &w.plain_len_le, self.plain_len, .little);
+        w.flags = self.flags;
+        w.reserved = @splat(0);
+        out.* = std.mem.toBytes(w);
+    }
+
+    /// The AAD a frame seals under: the header ‖ this entry ‖ the index.
+    fn aad(self: Entry, header: *const [HEADER_LEN]u8, i: u32, out: *[HEADER_LEN + ENTRY_LEN + 4]u8) void {
+        out[0..HEADER_LEN].* = header.*;
+        self.encode(out[HEADER_LEN..][0..ENTRY_LEN]);
+        std.mem.writeInt(u32, out[HEADER_LEN + ENTRY_LEN ..][0..4], i, .little);
+    }
+};
+
+/// The decoded table: the entries live in the header page the caller holds.
+pub const Table = struct {
+    count: u32,
+    entries: []align(1) const FrameEntryWire,
+
+    pub fn get(self: Table, i: u32) Entry {
+        const w = self.entries[i];
+        return .{ .off = std.mem.readInt(u32, &w.off_le, .little), .body_len = std.mem.readInt(u32, &w.body_len_le, .little), .plain_len = std.mem.readInt(u32, &w.plain_len_le, .little), .flags = w.flags };
+    }
+};
+
 /// The decoded header.
 pub const Header = struct {
     flags: u8,
@@ -222,9 +343,6 @@ pub const Header = struct {
     key_blob: [WRAP_V2_LEN]u8,
     nonce: [NONCE_LEN]u8,
 
-    pub fn storeRaw(self: Header) bool {
-        return self.flags & FLAG_STORE_RAW != 0;
-    }
     pub fn encrypted(self: Header) bool {
         return self.flags & FLAG_ENCRYPTED != 0;
     }
@@ -265,9 +383,13 @@ pub const FrameRefusal = enum {
     key,
     /// The decompressor refused the body or produced ≠ `plain_len` bytes.
     body,
+    /// The frame table: a torn xxh3, a count ≠ `framesFor(plain_len)`,
+    /// a grain ≠ the constant, non-contiguous or oversized bodies, a
+    /// plain length off the grain, an entry's flag/length law.
+    table,
 };
 
-pub const DecodeError = error{ FrameLen, FramePlainLen, FrameMagic, FrameVersion, FrameFlags, FrameMode, FrameAuth, FrameKey, FrameBody };
+pub const DecodeError = error{ FrameLen, FramePlainLen, FrameMagic, FrameVersion, FrameFlags, FrameMode, FrameAuth, FrameKey, FrameBody, FrameTable };
 
 pub fn refusalOf(e: DecodeError) FrameRefusal {
     return switch (e) {
@@ -280,6 +402,7 @@ pub fn refusalOf(e: DecodeError) FrameRefusal {
         error.FrameAuth => .aad,
         error.FrameKey => .key,
         error.FrameBody => .body,
+        error.FrameTable => .table,
     };
 }
 
@@ -294,14 +417,16 @@ fn refusalError(r: FrameRefusal) DecodeError {
         .aad => error.FrameAuth,
         .key => error.FrameKey,
         .body => error.FrameBody,
+        .table => error.FrameTable,
     };
 }
 
-/// The decoder in its exact check order: length ≥ header → `plain_len ≤
-/// block_size` (the DUR-8e bound, before any other field is trusted) →
-/// magic → version → flags/reserved → the volume's modes → `body_len` fits
-/// the image → the flag/length consistency laws. Total: any byte string
-/// yields a header or a named refusal; nothing here allocates.
+/// The header decoder in its exact check order: length ≥ header →
+/// `plain_len ≤ block_size` (the DUR-8e bound, before any other field is
+/// trusted) → magic → version → flags/reserved → the volume's modes → the
+/// flag/mode law → the plaintext-volume zero law. Total: any byte string
+/// yields a header or a named refusal; nothing here allocates. The body
+/// window and the per-frame laws are the TABLE decoder's (`decodeTable`).
 pub fn decodeHeader(cfg: VolumeTransform, image: []const u8) DecodeError!Header {
     if (image.len < HEADER_LEN) return error.FrameLen;
     const w = std.mem.bytesToValue(TransformFrameWire, image[0..HEADER_LEN]);
@@ -309,54 +434,102 @@ pub fn decodeHeader(cfg: VolumeTransform, image: []const u8) DecodeError!Header 
     if (plain_len > cfg.block_size) return error.FramePlainLen;
     if (!std.mem.eql(u8, &w.magic, MAGIC)) return error.FrameMagic;
     if (w.version != FRAME_VERSION) return error.FrameVersion;
-    if (w.flags & ~FLAGS_KNOWN != 0 or !std.mem.allEqual(u8, &w.reserved, 0)) return error.FrameFlags;
+    if (w.flags & ~HEADER_FLAGS_KNOWN != 0 or !std.mem.allEqual(u8, &w.reserved, 0)) return error.FrameFlags;
     const compression = Compression.fromWire(w.compression) orelse return error.FrameMode;
     const encryption = Encryption.fromWire(w.encryption) orelse return error.FrameMode;
     if (compression != cfg.compression or encryption != cfg.encryption) return error.FrameMode;
     const body_len = std.mem.readInt(u32, &w.body_len_le, .little);
-    if (body_len > image.len - HEADER_LEN) return error.FrameLen;
     const h: Header = .{ .flags = w.flags, .compression = compression, .encryption = encryption, .body_len = body_len, .plain_len = plain_len, .key_blob = w.key_blob, .nonce = w.nonce };
     // Consistency: the flag says what the modes say.
     if (h.encrypted() != (encryption != .none)) return error.FrameFlags;
-    if (compression == .none and !h.storeRaw()) return error.FrameFlags;
-    if (h.encrypted()) {
-        if (body_len < TAG_LEN) return error.FrameFlags;
-        // The AEAD plaintext is exactly the (compressed | raw) image.
-        if (h.storeRaw() and body_len - TAG_LEN != plain_len) return error.FrameFlags;
-    } else {
-        if (!std.mem.allEqual(u8, &w.key_blob, 0) or !std.mem.allEqual(u8, &w.nonce, 0)) return error.FrameFlags;
-        if (h.storeRaw() and body_len != plain_len) return error.FrameFlags;
-    }
-    // A compressed image is strictly shorter than its plaintext (the raw
-    // escape takes every other case).
-    if (!h.storeRaw()) {
-        const inner = if (h.encrypted()) body_len - TAG_LEN else body_len;
-        if (inner >= plain_len) return error.FrameFlags;
-    }
+    if (!h.encrypted() and (!std.mem.allEqual(u8, &w.key_blob, 0) or !std.mem.allEqual(u8, &w.nonce, 0))) return error.FrameFlags;
     return h;
+}
+
+/// The table decoder over a whole header page: the xxh3 over the entries,
+/// the count (`framesFor(plain_len)`), the grain, then every entry's laws
+/// — contiguous bodies from `HEADER_PAGE_LEN` summing to `body_len`,
+/// plaintexts of the grain but the last, an encrypted body carrying its
+/// tag, a raw body exactly its plaintext, a compressed body strictly
+/// shorter, a compression-less volume all raw. Total over any page.
+pub fn decodeTable(cfg: VolumeTransform, h: Header, page: []const u8) DecodeError!Table {
+    if (page.len < HEADER_PAGE_LEN) return error.FrameLen;
+    const tw = std.mem.bytesToValue(FrameTableWire, page[HEADER_LEN..][0..TABLE_HEAD_LEN]);
+    const count = std.mem.readInt(u16, &tw.frame_count_le, .little);
+    if (count != framesFor(h.plain_len) or count > MAX_FRAMES) return error.FrameTable;
+    if (tw.frame_grain_log2 != FRAME_GRAIN_LOG2 or !std.mem.allEqual(u8, &tw.reserved, 0)) return error.FrameTable;
+    const entries_bytes = page[HEADER_LEN + TABLE_HEAD_LEN ..][0 .. @as(usize, count) * ENTRY_LEN];
+    if (std.mem.readInt(u64, &tw.entries_xxh3_le, .little) != checksum.xxh3(entries_bytes)) return error.FrameTable;
+    const t: Table = .{ .count = count, .entries = std.mem.bytesAsSlice(FrameEntryWire, entries_bytes) };
+    var off: u64 = HEADER_PAGE_LEN;
+    var plain_left: u64 = h.plain_len;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const e = t.get(i);
+        if (e.off != off) return error.FrameTable;
+        if (e.flags & ~ENTRY_FLAGS_KNOWN != 0 or !std.mem.allEqual(u8, &t.entries[i].reserved, 0)) return error.FrameTable;
+        const want_plain: u64 = if (i + 1 < count) FRAME_GRAIN else plain_left;
+        if (e.plain_len != want_plain or e.plain_len == 0) return error.FrameTable;
+        if (cfg.compression == .none and !e.storeRaw()) return error.FrameTable;
+        const inner: u64 = if (h.encrypted()) blk: {
+            if (e.body_len < TAG_LEN) return error.FrameTable;
+            break :blk e.body_len - TAG_LEN;
+        } else e.body_len;
+        if (e.storeRaw()) {
+            if (inner != e.plain_len) return error.FrameTable;
+        } else if (inner >= e.plain_len or inner == 0) return error.FrameTable;
+        off += e.body_len;
+        plain_left -= e.plain_len;
+    }
+    if (off - HEADER_PAGE_LEN != h.body_len or plain_left != 0) return error.FrameTable;
+    return t;
+}
+
+/// The frames a block-relative window `[rel_s, rel_e)` needs and the image
+/// bytes to DMA for them, rounded to the DMA grain outward (`hi` is
+/// clipped to the image's padded end).
+pub const FrameSpan = struct {
+    first: u32,
+    last: u32,
+    /// Image offsets of the DMA window (4 KiB-aligned).
+    lo: u64,
+    hi: u64,
+    /// The plaintext offset of `first`'s start.
+    plain_base: u64,
+};
+
+pub fn frameSpan(h: Header, t: Table, rel_s: u64, rel_e: u64) DecodeError!FrameSpan {
+    if (rel_e <= rel_s or rel_e > h.plain_len or t.count == 0) return error.FrameTable;
+    const first: u32 = @intCast(rel_s / FRAME_GRAIN);
+    const last: u32 = @intCast((rel_e - 1) / FRAME_GRAIN);
+    const a = t.get(first);
+    const b = t.get(last);
+    const image_end = derive.alignUp(HEADER_PAGE_LEN + @as(u64, h.body_len), DMA_GRAIN);
+    return .{ .first = first, .last = last, .lo = derive.alignDown(a.off, DMA_GRAIN), .hi = @min(derive.alignUp(@as(u64, b.off) + b.body_len, DMA_GRAIN), image_end), .plain_base = @as(u64, first) * FRAME_GRAIN };
 }
 
 // ---------------------------------------------------------------------------
 // §4 Geometry: max stored image, headroom, chunk, scratch, the refusal.
 // ---------------------------------------------------------------------------
 
-/// The largest image a block can produce: the raw escape makes the
-/// compression term never exceed the payload, so it is the header, the
-/// payload, and the AEAD tag on an encrypted volume (`96 + block + 16`).
-/// Passthrough: the payload itself (no frame).
+/// The largest image a block can produce: the header page, the payload
+/// (every frame's raw escape makes the compression term never exceed its
+/// plaintext), and one AEAD tag per frame on an encrypted volume
+/// (`4096 + block + frames × 16`). Passthrough: the payload itself (no frame).
 pub fn maxStoredImageLen(cfg: VolumeTransform) u64 {
     if (cfg.isPassthrough()) return cfg.block_size;
-    return HEADER_LEN + @as(u64, cfg.block_size) + (if (cfg.encryption != .none) TAG_LEN else 0);
+    return HEADER_PAGE_LEN + @as(u64, cfg.block_size) + (if (cfg.encryption != .none) @as(u64, framesFor(cfg.block_size)) * TAG_LEN else 0);
 }
 
-/// The worst-case non-payload bytes of an image (header + tag = 112)
-/// rounded to one LBA so chunk-interior windows stay O_DIRECT-aligned;
-/// `ceil_4k(112) = 4096` (the reference's 547 B incl. the retired 512 B
-/// RSA ghost rounded the same way, decision 0002 row 115).
-pub const TRANSFORM_BLOCK_HEADROOM: u32 = DMA_GRAIN;
+/// The worst-case non-payload bytes of an image (the header page + 64
+/// tags = 5,120) rounded to the DMA grain so chunk-interior windows stay
+/// O_DIRECT-aligned: `ceil_4k(4096 + 1024) = 8192` (the single-frame
+/// format's was 4096; the reference's 547 B incl. the retired 512 B RSA
+/// ghost rounded to 4096 too, decision 0002 row 115).
+pub const TRANSFORM_BLOCK_HEADROOM: u32 = 2 * DMA_GRAIN;
 
 comptime {
-    assert(HEADER_LEN + TAG_LEN <= TRANSFORM_BLOCK_HEADROOM);
+    assert(HEADER_PAGE_LEN + (MAX_BLOCK_SIZE / FRAME_GRAIN) * TAG_LEN <= TRANSFORM_BLOCK_HEADROOM);
 }
 
 /// The allocator stride (the chunk): the block the operator named stays a
@@ -378,15 +551,16 @@ pub fn writeGeometryRefusal(w: *std.Io.Writer, cfg: VolumeTransform, chunk_size:
     try w.print("transformed volume geometry: chunk {d} B cannot hold max_stored_image_len({d} B block) = {d} B; the set's config is corrupt or was written by a tool this binary does not know — reformat", .{ chunk_size, cfg.block_size, maxStoredImageLen(cfg) });
 }
 
-/// The write side's scratch: the header, a compressed-or-raw body that
-/// never exceeds the payload (bounded output: the compressor is given
-/// exactly `plain.len` bytes and the escape takes the overflow), the tag,
-/// rounded to the DMA grain. 4 MiB ⇒ 4,198,400 B = block + 4 KiB. The
-/// reference sized its scratch from library BOUNDS instead (`4 + max(4 +
-/// lz4_bound, zstd_bound) + 98`, 4,214,784 B = block + 20 KiB at 4 MiB) and
-/// bounced the overflow to the heap; v4 never needs the bound.
+/// The write side's scratch: the header page, per frame a compressed-or-
+/// raw body that never exceeds its plaintext (bounded output: the
+/// compressor is given exactly `plain.len − 1` bytes and the escape takes
+/// the overflow) plus its tag, rounded to the DMA grain. 4 MiB ⇒ 4,202,496 B
+/// = block + 8 KiB. The reference sized its scratch from library BOUNDS
+/// instead (`4 + max(4 + lz4_bound, zstd_bound) + 98`, 4,214,784 B = block
+/// + 20 KiB at 4 MiB) and bounced the overflow to the heap; v4 never needs
+/// the bound.
 pub fn writeScratchLen(block_size: u32) u64 {
-    return derive.alignUp(HEADER_LEN + TAG_LEN + @as(u64, block_size), DMA_GRAIN);
+    return derive.alignUp(HEADER_PAGE_LEN + @as(u64, block_size) + @as(u64, framesFor(block_size)) * TAG_LEN, DMA_GRAIN);
 }
 
 /// ONE scratch size per volume, for the write scratch AND the read
@@ -1047,8 +1221,15 @@ pub const CryptoState = struct {
     /// The next block nonce. Exhaustion of the 64-bit counter is
     /// unreachable (2^64 blocks) and still a tripwire.
     pub fn nextNonce(self: *CryptoState) [NONCE_LEN]u8 {
-        const n = self.nonce_counter.fetchAdd(1, .monotonic);
-        if (n == std.math.maxInt(u64)) stats.crypto_nonce_exhaustion.fire("nonce counter wrapped");
+        return self.nextNonces(1);
+    }
+
+    /// A RANGE of `count` counters (one per frame of a block): the base
+    /// nonce; frame i's is `frameNonce(base, i)`.
+    pub fn nextNonces(self: *CryptoState, count: u32) [NONCE_LEN]u8 {
+        const step: u64 = @max(count, 1);
+        const n = self.nonce_counter.fetchAdd(step, .monotonic);
+        if (n > std.math.maxInt(u64) - step) stats.crypto_nonce_exhaustion.fire("nonce counter wrapped");
         var out: [NONCE_LEN]u8 = undefined;
         out[0..4].* = self.nonce_salt;
         std.mem.writeInt(u64, out[4..12], n, .big);
@@ -1138,65 +1319,96 @@ pub const Transform = struct {
     }
 
     /// The image of `plain` (`len ≤ block_size`): on a passthrough volume
-    /// `plain` itself (same pointer, no frame); otherwise `header ‖ body ‖
-    /// zero pad to 4 KiB` inside `scratch` (`len ≥ scratchLen(block)`),
-    /// exactly ONE pooled buffer: the body is compressed straight into its
-    /// final offset and sealed in place; the input is never mutated.
+    /// `plain` itself (same pointer, no frame); otherwise `header page ‖
+    /// frames ‖ zero pad to 4 KiB` inside `scratch` (`len ≥ scratchLen(block)`),
+    /// exactly ONE pooled buffer: every frame's body is compressed straight
+    /// into its final offset and sealed in place; the input is never mutated.
     pub fn processWrite(self: *Transform, plain: []const u8, scratch: []u8) WriteError![]const u8 {
         if (plain.len > self.cfg.block_size) return error.PlainTooLarge;
         if (self.cfg.isPassthrough()) return plain;
         if (scratch.len < scratchLen(self.cfg.block_size)) return error.ScratchTooSmall;
-        const body = scratch[HEADER_LEN..];
-        var flags: u8 = 0;
-        var inner_len: usize = plain.len;
-        // 1. Compress, best-effort per block: `n ≥ len` (equal too — an
-        //    equal-size image is pure decompress cost for zero gain) ⇒ the
-        //    raw payload with the flag; the empty payload is raw.
-        if (self.cfg.compression != .none and !self.force_raw and plain.len > 0) {
-            const t0 = clock.monotonicNs();
-            const bounded = body[0 .. plain.len - 1];
-            const n: ?usize = switch (self.cfg.compression) {
-                .none => unreachable,
-                .lz4 => lz4.compressBlock(plain, bounded) catch null,
-                .zstd => self.zstd_cctx.?.compress(plain, bounded) catch |e| switch (e) {
-                    error.OutputTooSmall => null,
-                    error.ZstdFailed => return error.CompressFailed,
-                },
-            };
-            stats.transform_phase_ns_compress.record(clock.monotonicNs() -| t0);
-            if (n) |len| {
-                inner_len = len;
+        const frames = framesFor(@intCast(plain.len));
+        const encrypted = self.cfg.encryption != .none;
+        // 1. Every frame: compress best-effort into its final place — `n ≥
+        //    len` (equal too: an equal-size body is pure decompress cost for
+        //    zero gain) ⇒ the raw plaintext with the entry's flag; a tag's
+        //    room is reserved after each body on an encrypted volume.
+        var entries: [MAX_FRAMES]Entry = undefined;
+        var off: usize = HEADER_PAGE_LEN;
+        var i: u32 = 0;
+        while (i < frames) : (i += 1) {
+            const p = plain[@as(usize, i) * FRAME_GRAIN ..][0..@min(FRAME_GRAIN, plain.len - @as(usize, i) * FRAME_GRAIN)];
+            const body = scratch[off..];
+            var flags: u8 = 0;
+            var inner_len: usize = p.len;
+            if (self.cfg.compression != .none and !self.force_raw) {
+                const t0 = clock.monotonicNs();
+                const bounded = body[0 .. p.len - 1];
+                const n: ?usize = switch (self.cfg.compression) {
+                    .none => unreachable,
+                    .lz4 => lz4.compressBlock(p, bounded) catch null,
+                    .zstd => self.zstd_cctx.?.compress(p, bounded) catch |e| switch (e) {
+                        error.OutputTooSmall => null,
+                        error.ZstdFailed => return error.CompressFailed,
+                    },
+                };
+                stats.transform_phase_ns_compress.record(clock.monotonicNs() -| t0);
+                if (n) |len| {
+                    inner_len = len;
+                } else {
+                    flags |= FLAG_STORE_RAW;
+                    stats.compress_stored_raw.inc();
+                }
             } else {
                 flags |= FLAG_STORE_RAW;
-                stats.compress_stored_raw.inc();
+                if (self.cfg.compression != .none) stats.compress_stored_raw.inc();
             }
-        } else {
-            flags |= FLAG_STORE_RAW;
-            if (self.cfg.compression != .none) stats.compress_stored_raw.inc();
+            if (flags & FLAG_STORE_RAW != 0) @memcpy(body[0..p.len], p);
+            const body_len = inner_len + (if (encrypted) TAG_LEN else 0);
+            entries[i] = .{ .off = @intCast(off), .body_len = @intCast(body_len), .plain_len = @intCast(p.len), .flags = flags };
+            off += body_len;
         }
-        if (flags & FLAG_STORE_RAW != 0) @memcpy(body[0..plain.len], plain);
-        // 2. The header (the AAD), then the seal in place.
-        var h: Header = .{ .flags = flags, .compression = self.cfg.compression, .encryption = self.cfg.encryption, .body_len = @intCast(inner_len), .plain_len = @intCast(plain.len), .key_blob = @splat(0), .nonce = @splat(0) };
-        if (self.cfg.encryption != .none) {
+        // 2. The header page: the header (the AAD's first part), the table
+        //    with its xxh3, zeros to the page end.
+        var h: Header = .{ .flags = 0, .compression = self.cfg.compression, .encryption = self.cfg.encryption, .body_len = @intCast(off - HEADER_PAGE_LEN), .plain_len = @intCast(plain.len), .key_blob = @splat(0), .nonce = @splat(0) };
+        if (encrypted) {
             const c = self.crypto orelse return error.NoKey;
             h.flags |= FLAG_ENCRYPTED;
-            h.body_len = @intCast(inner_len + TAG_LEN);
             h.key_blob = c.key_blob;
-            h.nonce = c.nextNonce();
-            h.encode(scratch[0..HEADER_LEN]);
-            const t1 = clock.monotonicNs();
-            var tag: [TAG_LEN]u8 = undefined;
-            seal(self.cfg.encryption, body[0..inner_len], &tag, body[0..inner_len], scratch[0..HEADER_LEN], h.nonce, c.data_key);
-            body[inner_len..][0..TAG_LEN].* = tag;
-            stats.transform_phase_ns_seal.record(clock.monotonicNs() -| t1);
-        } else {
-            h.encode(scratch[0..HEADER_LEN]);
+            h.nonce = c.nextNonces(frames);
         }
-        // 3. Zero pad to the DMA grain (recycled scratch bytes never reach
+        h.encode(scratch[0..HEADER_LEN]);
+        const entries_bytes = scratch[HEADER_LEN + TABLE_HEAD_LEN ..][0 .. @as(usize, frames) * ENTRY_LEN];
+        i = 0;
+        while (i < frames) : (i += 1) entries[i].encode(entries_bytes[@as(usize, i) * ENTRY_LEN ..][0..ENTRY_LEN]);
+        var tw: FrameTableWire = undefined;
+        std.mem.writeInt(u64, &tw.entries_xxh3_le, checksum.xxh3(entries_bytes), .little);
+        std.mem.writeInt(u16, &tw.frame_count_le, @intCast(frames), .little);
+        tw.frame_grain_log2 = FRAME_GRAIN_LOG2;
+        tw.reserved = @splat(0);
+        scratch[HEADER_LEN..][0..TABLE_HEAD_LEN].* = std.mem.toBytes(tw);
+        @memset(scratch[HEADER_LEN + TABLE_HEAD_LEN + entries_bytes.len .. HEADER_PAGE_LEN], 0);
+        // 3. Seal every frame in place under its own nonce and AAD.
+        if (encrypted) {
+            const c = self.crypto.?;
+            const t1 = clock.monotonicNs();
+            i = 0;
+            while (i < frames) : (i += 1) {
+                const e = entries[i];
+                const inner_len = e.body_len - TAG_LEN;
+                const body = scratch[e.off..][0..e.body_len];
+                var aad: [HEADER_LEN + ENTRY_LEN + 4]u8 = undefined;
+                e.aad(scratch[0..HEADER_LEN], i, &aad);
+                var tag: [TAG_LEN]u8 = undefined;
+                seal(self.cfg.encryption, body[0..inner_len], &tag, body[0..inner_len], &aad, frameNonce(h.nonce, i), c.data_key);
+                body[inner_len..][0..TAG_LEN].* = tag;
+            }
+            stats.transform_phase_ns_seal.record(clock.monotonicNs() -| t1);
+        }
+        // 4. Zero pad to the DMA grain (recycled scratch bytes never reach
         //    the device).
-        const image_len = HEADER_LEN + @as(usize, h.body_len);
-        const padded: usize = @intCast(derive.alignUp(image_len, DMA_GRAIN));
-        @memset(scratch[image_len..padded], 0);
+        const padded: usize = @intCast(derive.alignUp(off, DMA_GRAIN));
+        @memset(scratch[off..padded], 0);
         if (padded > chunkSizeFor(self.cfg)) {
             // Unreachable by construction (the geometry law); the belt.
             stats.stored_image_overflow_refusals.fire("padded image exceeds the chunk");
@@ -1206,12 +1418,11 @@ pub const Transform = struct {
     }
 
     /// The plaintext of `image` (a device window: trailing bytes beyond
-    /// `body_len` are ignored by construction). On a passthrough volume
-    /// `image` itself. Otherwise a view into `out` (`len ≥ scratchLen(block)`)
-    /// or — for a stored-raw body on a compression-only volume — into
-    /// `image`; an encrypted body is opened IN PLACE in `image` before it
-    /// is decompressed into `out`, or straight into `out` when raw, so no
-    /// byte is copied twice. Every refusal counts on its tripwire.
+    /// the last frame are ignored by construction). On a passthrough
+    /// volume `image` itself. Otherwise a view into `out` (`len ≥
+    /// scratchLen(block)`): every frame is opened IN PLACE in `image` (when
+    /// encrypted) then decompressed, or copied when raw, into its plaintext
+    /// offset. Every refusal counts on its tripwire.
     pub fn processRead(self: *Transform, image: []u8, out: []u8) ReadError![]const u8 {
         if (self.cfg.isPassthrough()) return image;
         return self.readInner(image, out) catch |e| {
@@ -1227,29 +1438,82 @@ pub const Transform = struct {
     pub fn readInner(self: *Transform, image: []u8, out: []u8) ReadError![]const u8 {
         if (out.len < scratchLen(self.cfg.block_size)) return error.ScratchTooSmall;
         const h = try decodeHeader(self.cfg, image);
-        const body = image[HEADER_LEN..][0..h.body_len];
-        var inner: []u8 = body;
+        const t = try decodeTable(self.cfg, h, image);
+        if (image.len < HEADER_PAGE_LEN + @as(usize, h.body_len)) return error.FrameLen;
+        if (t.count == 0) return out[0..0];
+        const span: FrameSpan = .{ .first = 0, .last = t.count - 1, .lo = 0, .hi = image.len, .plain_base = 0 };
+        return self.decodeSpan(h, t, image, image, 0, span, out);
+    }
+
+    /// The SUB-BLOCK read (decision 0003 §K7): `page` is the image's header
+    /// page (the first DMA), `window` the image bytes `[window_off, …)` the
+    /// second DMA landed covering `span` (from `frameSpan`); the frames
+    /// `first..=last` decode contiguously into `out` (`len ≥ the span's
+    /// plaintext + the zstd window law's slack) and the view returned
+    /// starts at `span.plain_base`. Counted refusals as `processRead`.
+    pub fn decodeFrames(self: *Transform, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
+        return self.decodeFramesInner(page, window, window_off, span, out) catch |e| {
+            switch (e) {
+                error.ScratchTooSmall, error.NoKey => {},
+                else => |de| stats.fireRefusal(refusalOf(de)),
+            }
+            return e;
+        };
+    }
+
+    pub fn decodeFramesInner(self: *Transform, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
+        const h = try decodeHeader(self.cfg, page);
+        const t = try decodeTable(self.cfg, h, page);
+        if (span.first > span.last or span.last >= t.count) return error.FrameTable;
+        const a = t.get(span.first);
+        const b = t.get(span.last);
+        if (a.off < window_off or @as(u64, b.off) + b.body_len > window_off + window.len) return error.FrameLen;
+        if (out.len < @as(u64, span.last - span.first + 1) * FRAME_GRAIN + std.compress.zstd.block_size_max) return error.ScratchTooSmall;
+        return self.decodeSpan(h, t, page, window, window_off, span, out);
+    }
+
+    /// Frames `span.first..=span.last` of the image whose header page is
+    /// `page`, bodies in `window` (image bytes from `window_off`), into
+    /// `out` at `(i − first) × grain`; the plaintext view returned.
+    fn decodeSpan(self: *Transform, h: Header, t: Table, page: []const u8, window: []u8, window_off: u64, span: FrameSpan, out: []u8) ReadError![]const u8 {
+        var key: [DATA_KEY_LEN]u8 = undefined;
         if (h.encrypted()) {
             const c = self.crypto orelse return error.NoKey;
-            const key = c.keyFor(&h.key_blob) catch return error.FrameKey;
-            const ct = body[0 .. body.len - TAG_LEN];
-            const tag: [TAG_LEN]u8 = body[body.len - TAG_LEN ..][0..TAG_LEN].*;
-            const t0 = clock.monotonicNs();
-            // Raw ⇒ open straight into the destination; compressed ⇒ in place.
-            const dest: []u8 = if (h.storeRaw()) out[0..ct.len] else ct;
-            open(self.cfg.encryption, dest, ct, tag, image[0..HEADER_LEN], h.nonce, key) catch return error.FrameAuth;
-            stats.transform_phase_ns_open.record(clock.monotonicNs() -| t0);
-            inner = dest;
+            key = c.keyFor(&h.key_blob) catch return error.FrameKey;
         }
-        if (h.storeRaw()) return inner[0..h.plain_len];
-        const t1 = clock.monotonicNs();
-        defer stats.transform_phase_ns_decompress.record(clock.monotonicNs() -| t1);
-        switch (h.compression) {
-            .none => unreachable, // the decoder refused a non-raw `none`
-            .lz4 => lz4.decompressBlock(inner, out[0..h.plain_len]) catch return error.FrameBody,
-            .zstd => zstd.decompress(inner, out, h.plain_len) catch return error.FrameBody,
+        var total: usize = 0;
+        var i: u32 = span.first;
+        while (i <= span.last) : (i += 1) {
+            const e = t.get(i);
+            const body = window[@intCast(e.off - window_off)..][0..e.body_len];
+            const dst = out[total..];
+            var inner: []u8 = body;
+            if (h.encrypted()) {
+                const ct = body[0 .. body.len - TAG_LEN];
+                const tag: [TAG_LEN]u8 = body[body.len - TAG_LEN ..][0..TAG_LEN].*;
+                var aad: [HEADER_LEN + ENTRY_LEN + 4]u8 = undefined;
+                e.aad(page[0..HEADER_LEN], i, &aad);
+                const t0 = clock.monotonicNs();
+                // Raw ⇒ open straight into the destination; compressed ⇒ in place.
+                const dest: []u8 = if (e.storeRaw()) dst[0..ct.len] else ct;
+                open(self.cfg.encryption, dest, ct, tag, &aad, frameNonce(h.nonce, i), key) catch return error.FrameAuth;
+                stats.transform_phase_ns_open.record(clock.monotonicNs() -| t0);
+                inner = dest;
+            }
+            if (e.storeRaw()) {
+                if (inner.ptr != dst.ptr) @memcpy(dst[0..e.plain_len], inner[0..e.plain_len]);
+            } else {
+                const t1 = clock.monotonicNs();
+                defer stats.transform_phase_ns_decompress.record(clock.monotonicNs() -| t1);
+                switch (h.compression) {
+                    .none => unreachable, // the table decoder refused a non-raw `none`
+                    .lz4 => lz4.decompressBlock(inner, dst[0..e.plain_len]) catch return error.FrameBody,
+                    .zstd => zstd.decompress(inner, dst, e.plain_len) catch return error.FrameBody,
+                }
+            }
+            total += e.plain_len;
         }
-        return out[0..h.plain_len];
+        return out[0..total];
     }
 };
 
@@ -1275,6 +1539,7 @@ pub const stats = struct {
     pub var transform_frame_refusals_aad: counters.Tripwire = .init("transform_frame_refusals_aad");
     pub var transform_frame_refusals_key: counters.Tripwire = .init("transform_frame_refusals_key");
     pub var transform_frame_refusals_body: counters.Tripwire = .init("transform_frame_refusals_body");
+    pub var transform_frame_refusals_table: counters.Tripwire = .init("transform_frame_refusals_table");
     pub var transform_phase_ns_compress: counters.ShardedLatencyHistogram = .{};
     pub var transform_phase_ns_seal: counters.ShardedLatencyHistogram = .{};
     pub var transform_phase_ns_open: counters.ShardedLatencyHistogram = .{};
@@ -1291,6 +1556,7 @@ pub const stats = struct {
             .aad => &transform_frame_refusals_aad,
             .key => &transform_frame_refusals_key,
             .body => &transform_frame_refusals_body,
+            .table => &transform_frame_refusals_table,
         };
     }
 
@@ -1350,7 +1616,7 @@ test "TransformFrameWire is 96 B with the spec's offsets; encode∘decode = id; 
     try testing.expect(!cfg.isPassthrough());
 }
 
-test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic), magic, version, flags/reserved, mode, body_len window, the flag/length laws" {
+test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic), magic, version, flags/reserved, mode, the flag/mode law; decodeTable refuses every table law by name" {
     const cfg: VolumeTransform = .{ .compression = .lz4, .encryption = .none, .block_size = 65536 };
     const good: Header = .{ .flags = 0, .compression = .lz4, .encryption = .none, .body_len = 100, .plain_len = 4096, .key_blob = @splat(0), .nonce = @splat(0) };
     var img: [HEADER_LEN + 100]u8 = undefined;
@@ -1366,10 +1632,13 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     bad[0] = 'X';
     try testing.expectError(error.FrameMagic, decodeHeader(cfg, &bad));
     bad = img;
-    bad[4] = 2;
+    bad[4] = 1; // the single-frame format is refused, not read
     try testing.expectError(error.FrameVersion, decodeHeader(cfg, &bad));
     bad = img;
     bad[5] = 0x80;
+    try testing.expectError(error.FrameFlags, decodeHeader(cfg, &bad));
+    bad = img;
+    bad[5] = FLAG_STORE_RAW; // an ENTRY flag, never the header's
     try testing.expectError(error.FrameFlags, decodeHeader(cfg, &bad));
     bad = img;
     bad[95] = 1;
@@ -1380,13 +1649,6 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     bad = img;
     bad[7] = 7;
     try testing.expectError(error.FrameMode, decodeHeader(cfg, &bad));
-    bad = img;
-    std.mem.writeInt(u32, bad[8..12], 101, .little);
-    try testing.expectError(error.FrameLen, decodeHeader(cfg, &bad));
-    // A compressed body must be shorter than its plaintext.
-    bad = img;
-    std.mem.writeInt(u32, bad[12..16], 100, .little);
-    try testing.expectError(error.FrameFlags, decodeHeader(cfg, &bad));
     // ENCRYPTED on a plaintext volume; a nonce byte on a plaintext frame.
     bad = img;
     bad[5] = FLAG_ENCRYPTED;
@@ -1394,41 +1656,120 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     bad = img;
     bad[80] = 1;
     try testing.expectError(error.FrameFlags, decodeHeader(cfg, &bad));
-    // Raw: body_len == plain_len.
-    bad = img;
-    bad[5] = FLAG_STORE_RAW;
-    try testing.expectError(error.FrameFlags, decodeHeader(cfg, &bad));
-    std.mem.writeInt(u32, bad[12..16], 100, .little);
-    try testing.expect((try decodeHeader(cfg, &bad)).storeRaw());
-    // `none` compression without the raw flag is not a shape we write.
+    // The table: built from a real two-frame image (a 128 KiB block,
+    // 70,000 B of plaintext), then each law broken in turn.
+    const gpa = testing.allocator;
+    var env = testEnv();
+    defer env.deinit();
+    const cfg2: VolumeTransform = .{ .compression = .lz4, .encryption = .none, .block_size = 131072 };
+    var t = try Transform.init(gpa, &env, cfg2, null);
+    defer t.deinit(gpa);
+    var plain: [131072]u8 = undefined;
+    fillCompressible(&plain, 11);
+    const scratch = try gpa.alloc(u8, scratchLen(cfg2.block_size));
+    defer gpa.free(scratch);
+    const image = try gpa.dupe(u8, try t.processWrite(plain[0..70000], scratch));
+    defer gpa.free(image);
+    const h = try decodeHeader(cfg2, image);
+    const table = try decodeTable(cfg2, h, image);
+    try testing.expectEqual(@as(u32, 2), table.count);
+    try testing.expectEqual(@as(u32, FRAME_GRAIN), table.get(0).plain_len);
+    try testing.expectEqual(@as(u32, 70000 - FRAME_GRAIN), table.get(1).plain_len);
+    try testing.expectEqual(@as(u32, HEADER_PAGE_LEN), table.get(0).off);
+    try testing.expectEqual(table.get(0).off + table.get(0).body_len, table.get(1).off);
+    const mut = try gpa.alloc(u8, image.len);
+    defer gpa.free(mut);
+    // A short page.
+    try testing.expectError(error.FrameLen, decodeTable(cfg2, h, image[0 .. HEADER_PAGE_LEN - 1]));
+    // A torn entry byte: the xxh3 catches it.
+    @memcpy(mut, image);
+    mut[HEADER_LEN + TABLE_HEAD_LEN + 1] ^= 1;
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    // The count off the plaintext; the grain off the constant; a reserved byte.
+    @memcpy(mut, image);
+    std.mem.writeInt(u16, mut[HEADER_LEN + 8 ..][0..2], 1, .little);
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    @memcpy(mut, image);
+    mut[HEADER_LEN + 10] = FRAME_GRAIN_LOG2 + 1;
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    @memcpy(mut, image);
+    mut[HEADER_LEN + 11] = 1;
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    // Re-stamping the xxh3 after a law break still refuses: a non-contiguous
+    // body, a raw body ≠ its plaintext, a compressed body ≥ its plaintext, a
+    // last frame of zero plaintext, the sum off `body_len`.
+    const Restamp = struct {
+        fn run(buf: []u8, count: u32) void {
+            const eb = buf[HEADER_LEN + TABLE_HEAD_LEN ..][0 .. @as(usize, count) * ENTRY_LEN];
+            std.mem.writeInt(u64, buf[HEADER_LEN..][0..8], checksum.xxh3(eb), .little);
+        }
+    };
+    const e1 = HEADER_LEN + TABLE_HEAD_LEN + ENTRY_LEN;
+    @memcpy(mut, image);
+    std.mem.writeInt(u32, mut[e1..][0..4], table.get(1).off + 1, .little);
+    Restamp.run(mut, 2);
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    @memcpy(mut, image);
+    mut[e1 + 12] = FLAG_STORE_RAW;
+    Restamp.run(mut, 2);
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    @memcpy(mut, image);
+    std.mem.writeInt(u32, mut[e1 + 4 ..][0..4], table.get(1).plain_len, .little);
+    Restamp.run(mut, 2);
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    @memcpy(mut, image);
+    mut[e1 + 13] = 1;
+    Restamp.run(mut, 2);
+    try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
+    // A compression-less volume's entry without the raw flag.
     const enc_only: VolumeTransform = .{ .compression = .none, .encryption = .aes256gcm, .block_size = 65536 };
-    var e: Header = .{ .flags = FLAG_ENCRYPTED, .compression = .none, .encryption = .aes256gcm, .body_len = 100 + TAG_LEN, .plain_len = 100, .key_blob = @splat(1), .nonce = @splat(2) };
-    var eimg: [HEADER_LEN + 116]u8 = undefined;
-    e.encode(eimg[0..HEADER_LEN]);
-    try testing.expectError(error.FrameFlags, decodeHeader(enc_only, &eimg));
-    e.flags |= FLAG_STORE_RAW;
-    e.encode(eimg[0..HEADER_LEN]);
-    _ = try decodeHeader(enc_only, &eimg);
+    var eh: Header = .{ .flags = FLAG_ENCRYPTED, .compression = .none, .encryption = .aes256gcm, .body_len = 100 + TAG_LEN, .plain_len = 100, .key_blob = @splat(1), .nonce = @splat(2) };
+    var page: [HEADER_PAGE_LEN]u8 = @splat(0);
+    eh.encode(page[0..HEADER_LEN]);
+    const entry: Entry = .{ .off = HEADER_PAGE_LEN, .body_len = 100 + TAG_LEN, .plain_len = 100, .flags = 0 };
+    entry.encode(page[HEADER_LEN + TABLE_HEAD_LEN ..][0..ENTRY_LEN]);
+    std.mem.writeInt(u16, page[HEADER_LEN + 8 ..][0..2], 1, .little);
+    page[HEADER_LEN + 10] = FRAME_GRAIN_LOG2;
+    Restamp.run(&page, 1);
+    try testing.expectError(error.FrameTable, decodeTable(enc_only, eh, &page));
+    var raw_entry = entry;
+    raw_entry.flags = FLAG_STORE_RAW;
+    raw_entry.encode(page[HEADER_LEN + TABLE_HEAD_LEN ..][0..ENTRY_LEN]);
+    Restamp.run(&page, 1);
+    _ = try decodeTable(enc_only, eh, &page);
     // An encrypted body shorter than a tag.
-    e.body_len = 15;
-    e.plain_len = 0;
-    e.encode(eimg[0..HEADER_LEN]);
-    try testing.expectError(error.FrameFlags, decodeHeader(enc_only, &eimg));
+    raw_entry.body_len = 15;
+    raw_entry.encode(page[HEADER_LEN + TABLE_HEAD_LEN ..][0..ENTRY_LEN]);
+    Restamp.run(&page, 1);
+    try testing.expectError(error.FrameTable, decodeTable(enc_only, eh, &page));
+    // The empty payload: zero frames, nothing to span.
+    const empty = try gpa.dupe(u8, try t.processWrite("", scratch));
+    defer gpa.free(empty);
+    const eh0 = try decodeHeader(cfg2, empty);
+    const et = try decodeTable(cfg2, eh0, empty);
+    try testing.expectEqual(@as(u32, 0), et.count);
+    try testing.expectEqual(@as(usize, HEADER_PAGE_LEN), empty.len);
+    try testing.expectError(error.FrameTable, frameSpan(eh0, et, 0, 1));
 }
 
-test "geometry: max_stored_image_len = 96 + block (+16 encrypted) ≤ block + headroom; chunk = block + 4096 on transformed volumes, block on passthrough; the refusal; capacity reserves two chunks" {
+test "geometry: max_stored_image_len = 4096 + block (+16 per frame encrypted) ≤ block + headroom; chunk = block + 8192 on transformed volumes, block on passthrough; the refusal; capacity reserves two chunks" {
     const block: u32 = 4 << 20;
     const plain: VolumeTransform = .{ .block_size = block };
     const lz: VolumeTransform = .{ .compression = .lz4, .block_size = block };
     const enc: VolumeTransform = .{ .compression = .zstd, .encryption = .chacha20poly1305, .block_size = block };
     try testing.expectEqual(@as(u64, block), maxStoredImageLen(plain));
-    try testing.expectEqual(@as(u64, 4_194_400), maxStoredImageLen(lz));
-    try testing.expectEqual(@as(u64, 4_194_416), maxStoredImageLen(enc));
-    try testing.expectEqual(@as(u32, 4096), TRANSFORM_BLOCK_HEADROOM);
+    try testing.expectEqual(@as(u64, 4_198_400), maxStoredImageLen(lz));
+    try testing.expectEqual(@as(u64, 4_198_400 + 64 * 16), maxStoredImageLen(enc));
+    try testing.expectEqual(@as(u32, 8192), TRANSFORM_BLOCK_HEADROOM);
     try testing.expectEqual(block, chunkSizeFor(plain));
-    try testing.expectEqual(@as(u32, 4_198_400), chunkSizeFor(lz));
-    try testing.expectEqual(@as(u32, 4_198_400), chunkSizeFor(enc));
-    // The tie: 96 + 16 + block ≤ block + 4096 for every admissible block.
+    try testing.expectEqual(@as(u32, 4_202_496), chunkSizeFor(lz));
+    try testing.expectEqual(@as(u32, 4_202_496), chunkSizeFor(enc));
+    try testing.expectEqual(@as(u32, 64), framesFor(block));
+    try testing.expectEqual(@as(u32, 0), framesFor(0));
+    try testing.expectEqual(@as(u32, 1), framesFor(1));
+    try testing.expectEqual(@as(u32, 1), framesFor(FRAME_GRAIN));
+    try testing.expectEqual(@as(u32, 2), framesFor(FRAME_GRAIN + 1));
+    // The tie: 4096 + block + frames × 16 ≤ block + 8192 for every admissible block.
     var b: u32 = MIN_BLOCK_SIZE;
     while (b <= MAX_BLOCK_SIZE) : (b *= 2) {
         const c: VolumeTransform = .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = b };
@@ -1440,20 +1781,20 @@ test "geometry: max_stored_image_len = 96 + block (+16 encrypted) ≤ block + he
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeGeometryRefusal(&w, lz, block);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "chunk 4194304 B cannot hold max_stored_image_len(4194304 B block) = 4194400 B") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "chunk 4194304 B cannot hold max_stored_image_len(4194304 B block) = 4198400 B") != null);
     // Capacity: chunks 0 and last are reserved.
-    try testing.expectEqual(@as(u64, 0), capacityBlocks(2 * 4_198_400, 4_198_400));
-    try testing.expectEqual(@as(u64, 1), capacityBlocks(3 * 4_198_400 + 100, 4_198_400));
+    try testing.expectEqual(@as(u64, 0), capacityBlocks(2 * 4_202_496, 4_202_496));
+    try testing.expectEqual(@as(u64, 1), capacityBlocks(3 * 4_202_496 + 100, 4_202_496));
     try testing.expectEqual(@as(u64, 254), capacityBlocks(1 << 30, 4 << 20));
     try testing.expect(blockSizeValid(4 << 20) and blockSizeValid(4096) and !blockSizeValid(8 << 20) and !blockSizeValid(3 << 20) and !blockSizeValid(2048));
 }
 
-test "scratch: write scratch = ceil_4k(112 + block) = block + 4 KiB (4,198,400 at 4 MiB; the reference's bound-sized 4,214,784 is never needed); ONE scratch = block + 128 KiB = 4,325,376 — the charter's envelope, the zstd window law" {
-    try testing.expectEqual(@as(u64, 4_198_400), writeScratchLen(4 << 20));
+test "scratch: write scratch = ceil_4k(4096 + block + frames × 16) = block + 8 KiB (4,202,496 at 4 MiB; the reference's bound-sized 4,214,784 is never needed); ONE scratch = block + 128 KiB = 4,325,376 — the charter's envelope, the zstd window law" {
+    try testing.expectEqual(@as(u64, 4_202_496), writeScratchLen(4 << 20));
     try testing.expectEqual(@as(u64, (4 << 20) + (128 << 10)), scratchLen(4 << 20));
     try testing.expectEqual(@as(u64, 4_325_376), scratchLen(4 << 20));
     try testing.expect(scratchLen(4 << 20) < 4_214_784 + (128 << 10));
-    try testing.expectEqual(@as(u64, 8192), writeScratchLen(4096));
+    try testing.expectEqual(@as(u64, 12288), writeScratchLen(4096));
     try testing.expectEqual(@as(u64, 4096 + (128 << 10)), scratchLen(4096));
     var b: u32 = MIN_BLOCK_SIZE;
     while (b <= MAX_BLOCK_SIZE) : (b *= 2) {
@@ -1798,11 +2139,15 @@ fn roundTrip(gpa: Allocator, cfg: VolumeTransform, crypto: ?*CryptoState, plain:
     try testing.expect(image.len <= maxStoredImageLen(cfg) + DMA_GRAIN - 1);
     const h = try decodeHeader(cfg, image);
     try testing.expectEqual(@as(u32, @intCast(plain.len)), h.plain_len);
-    try testing.expectEqual(expect_raw, h.storeRaw());
     try testing.expectEqual(cfg.encryption != .none, h.encrypted());
-    try testing.expectEqual(raw0 + @as(u64, @intFromBool(expect_raw and cfg.compression != .none)), stats.compress_stored_raw.load());
+    const table = try decodeTable(cfg, h, image);
+    try testing.expectEqual(framesFor(@intCast(plain.len)), table.count);
+    // `expect_raw` speaks for every frame (the fixtures are uniform).
+    var i: u32 = 0;
+    while (i < table.count) : (i += 1) try testing.expectEqual(expect_raw, table.get(i).storeRaw());
+    try testing.expectEqual(raw0 + @as(u64, if (expect_raw and cfg.compression != .none) table.count else 0), stats.compress_stored_raw.load());
     // The pad is zeros.
-    try testing.expect(std.mem.allEqual(u8, image[HEADER_LEN + h.body_len ..], 0));
+    try testing.expect(std.mem.allEqual(u8, image[HEADER_PAGE_LEN + h.body_len ..], 0));
     // Read from a copy (the image buffer is the device window and may be mutated).
     const img = try gpa.dupe(u8, image);
     defer gpa.free(img);
@@ -1814,6 +2159,25 @@ fn roundTrip(gpa: Allocator, cfg: VolumeTransform, crypto: ?*CryptoState, plain:
     @memcpy(wide[0..image.len], image);
     fill(wide[image.len..], 77);
     try testing.expectEqualSlices(u8, plain, try t.processRead(wide, out));
+    // The SUB-BLOCK read: every window of every frame pair decodes to the
+    // same bytes through the header page + the span's DMA window alone.
+    if (table.count > 0) {
+        var prng = std.Random.DefaultPrng.init(plain.len);
+        const r = prng.random();
+        for (0..24) |_| {
+            const rel_s = r.intRangeLessThan(u64, 0, plain.len);
+            const rel_e = r.intRangeAtMost(u64, rel_s + 1, plain.len);
+            const span = try frameSpan(h, table, rel_s, rel_e);
+            try testing.expectEqual(@as(u64, 0), span.lo % DMA_GRAIN);
+            try testing.expect(span.hi <= image.len and span.hi % DMA_GRAIN == 0 and span.lo < span.hi);
+            try testing.expectEqual(rel_s / FRAME_GRAIN, span.first);
+            try testing.expectEqual((rel_e - 1) / FRAME_GRAIN, span.last);
+            const window = try gpa.dupe(u8, image[@intCast(span.lo)..@intCast(span.hi)]);
+            defer gpa.free(window);
+            const view = try t.decodeFrames(image[0..HEADER_PAGE_LEN], window, span.lo, span, out);
+            try testing.expectEqualSlices(u8, plain[@intCast(rel_s)..@intCast(rel_e)], view[@intCast(rel_s - span.plain_base)..@intCast(rel_e - span.plain_base)]);
+        }
+    }
 }
 
 test "processWrite/processRead: passthrough is the identity (same pointer, no frame); lz4 and zstd shrink compressible blocks and store incompressible ones raw; the empty payload is raw; both AEADs over compressed and raw bodies; encrypt-only is raw+sealed" {
@@ -1876,11 +2240,13 @@ test "the force-raw seam stores a compressible block raw (the raw bit, the headr
     defer gpa.free(scratch);
     const image = try t.processWrite(&plain, scratch);
     const h = try decodeHeader(cfg, image);
-    try testing.expect(h.storeRaw());
+    const table = try decodeTable(cfg, h, image);
+    try testing.expect(table.get(0).storeRaw());
     try testing.expectEqual(@as(u32, 65536), h.body_len);
-    // The widest image: ceil_4k(96 + block) = block + 4 KiB = the headroom.
+    // The widest plaintext image: the header page + the block = block + 4 KiB
+    // (the headroom's second page is the encrypted tags').
     try testing.expectEqual(@as(usize, 65536 + 4096), image.len);
-    try testing.expectEqual(@as(usize, chunkSizeFor(cfg)), image.len);
+    try testing.expect(image.len <= chunkSizeFor(cfg));
 }
 
 test "AAD covers the header: any flipped header byte of an encrypted image fails the open (or a prior field check); a flipped body byte fails the open; a foreign-key blob refuses by name; the tripwires count each class" {
@@ -1906,8 +2272,9 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     const mut = try gpa.alloc(u8, image.len);
     defer gpa.free(mut);
     // Every header byte: refused. A nonce byte reaches the AEAD (the header
-    // is the AAD); a blob byte fails the unwrap first (FrameKey); the rest
-    // fail a field law or the AEAD.
+    // is the AAD's first part); a blob byte fails the unwrap first
+    // (FrameKey); the rest fail a field law or the AEAD. Every TABLE byte:
+    // the xxh3 (FrameTable) or — re-stamped — the entry's AAD binding.
     var auth_fail: usize = 0;
     var key_fail: usize = 0;
     for (0..HEADER_LEN) |i| {
@@ -1928,14 +2295,25 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     }
     try testing.expectEqual(@as(usize, WRAP_V2_LEN), key_fail);
     try testing.expect(auth_fail >= NONCE_LEN);
-    // A body byte.
+    const table = try decodeTable(cfg, h, image);
+    for (0..TABLE_HEAD_LEN + @as(usize, table.count) * ENTRY_LEN) |i| {
+        @memcpy(mut, image);
+        mut[HEADER_LEN + i] ^= 0x01;
+        try testing.expectError(error.FrameTable, t.readInner(mut, out));
+    }
+    // A body byte of the first frame.
     @memcpy(mut, image);
-    mut[HEADER_LEN + 5] ^= 0x01;
+    mut[HEADER_PAGE_LEN + 5] ^= 0x01;
     try testing.expectError(error.FrameAuth, t.readInner(mut, out));
-    // A tag byte.
+    // The last frame's tag byte.
     @memcpy(mut, image);
-    mut[HEADER_LEN + h.body_len - 1] ^= 0x01;
+    mut[HEADER_PAGE_LEN + h.body_len - 1] ^= 0x01;
     try testing.expectError(error.FrameAuth, t.readInner(mut, out));
+    // A frame's body re-sealed where another frame sits (an index swap):
+    // the AAD's index refuses it — the sub-block read of frame 0 with
+    // frame 0's window is fine, with frame 1's bytes under frame 0's entry
+    // is not.
+    try testing.expect(table.count >= 1);
     // A blob that is well-formed but wrapped under another KEK.
     var d2 = deriveVolumeKey("a-third-32-byte-or-longer-key-material!!!", &(@as([32]u8, @splat(6))));
     defer d2.zeroize();
@@ -1946,11 +2324,16 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     try testing.expectError(error.FrameKey, t.readInner(mut, out));
     // The counting path: each class fires its tripwire (one log per class;
     // the rate limit is per site).
-    const classes = [_]FrameRefusal{ .aad, .key, .plain_len, .magic };
+    const classes = [_]FrameRefusal{ .aad, .key, .plain_len, .magic, .table };
     for (classes) |cls| stats.refusalTripwire(cls).resetLogBudgetForTest();
-    log.testing.expectErrorLogs(4);
+    log.testing.expectErrorLogs(5);
     @memcpy(mut, image);
-    mut[HEADER_LEN + 5] ^= 0x01;
+    mut[HEADER_LEN + TABLE_HEAD_LEN + 2] ^= 0x01;
+    const tab0 = stats.transform_frame_refusals_table.load();
+    try testing.expectError(error.FrameTable, t.processRead(mut, out));
+    try testing.expectEqual(tab0 + 1, stats.transform_frame_refusals_table.load());
+    @memcpy(mut, image);
+    mut[HEADER_PAGE_LEN + 5] ^= 0x01;
     const aad0 = stats.transform_frame_refusals_aad.load();
     try testing.expectError(error.FrameAuth, t.processRead(mut, out));
     try testing.expectEqual(aad0 + 1, stats.transform_frame_refusals_aad.load());
@@ -2005,7 +2388,37 @@ fn frameFuzz(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: decodeHeader is total on arbitrary bytes" {
-    try fuzzkit.fuzz({}, frameFuzz, .{ .corpus = &.{fuzzSlice("SQZB\x01\x00\x01\x00\x10\x00\x00\x00\x00\x10\x00\x00" ++ @as([80]u8, @splat(0)) ++ @as([16]u8, @splat(0xaa)))} });
+    try fuzzkit.fuzz({}, frameFuzz, .{ .corpus = &.{fuzzSlice("SQZB\x02\x00\x01\x00\x10\x00\x00\x00\x00\x10\x00\x00" ++ @as([80]u8, @splat(0)) ++ @as([16]u8, @splat(0xaa)))} });
+}
+
+fn tableFuzz(_: void, smith: *std.testing.Smith) !void {
+    var page: [HEADER_PAGE_LEN + 64]u8 = undefined;
+    const len = smith.slice(&page);
+    var window: [4096]u8 = undefined;
+    const wlen = smith.slice(&window);
+    const window_off = smith.value(u16);
+    const cfgs = [_]VolumeTransform{
+        .{ .compression = .lz4, .block_size = 131072 },
+        .{ .compression = .zstd, .block_size = 131072 },
+        .{ .compression = .none, .encryption = .aes256gcm, .block_size = 131072 },
+    };
+    var env = testEnv();
+    defer env.deinit();
+    for (cfgs) |cfg| {
+        const h = decodeHeader(cfg, page[0..len]) catch continue;
+        const t = decodeTable(cfg, h, page[0..len]) catch continue;
+        if (t.count == 0) continue;
+        const span = frameSpan(h, t, 0, h.plain_len) catch continue;
+        if (cfg.encryption != .none) continue;
+        var tr = Transform.init(testing.allocator, &env, cfg, null) catch continue;
+        defer tr.deinit(testing.allocator);
+        var out: [2 * FRAME_GRAIN + 128 * 1024 + 1]u8 = undefined;
+        _ = tr.decodeFrames(page[0..len], window[0..wlen], window_off, span, &out) catch {};
+    }
+}
+
+test "fuzz: decodeTable, frameSpan and decodeFrames are total on arbitrary header pages and windows" {
+    try fuzzkit.fuzz({}, tableFuzz, .{ .corpus = &.{fuzzSlice("SQZB\x02\x00\x01\x00\x10\x00\x00\x00\x00\x10\x00\x00" ++ @as([80]u8, @splat(0)) ++ @as([16]u8, @splat(0)) ++ @as([16]u8, @splat(0)))} });
 }
 
 test "property: readInner is total under a PRNG over mutations of valid lz4/zstd/AEAD images (no panic, every refusal typed)" {
@@ -2042,6 +2455,19 @@ test "property: readInner is total under a PRNG over mutations of valid lz4/zstd
             for (0..r.intRangeAtMost(usize, 1, 4)) |_| mut[r.intRangeLessThan(usize, 0, image.len)] ^= @as(u8, 1) << r.int(u3);
             _ = t.readInner(mut, out) catch {};
             _ = t.readInner(mut[0..r.intRangeAtMost(usize, 0, image.len)], out) catch {};
+            // The sub-block decoder over the same mutations: a torn page or
+            // window is a typed refusal, never a panic.
+            if (decodeHeader(cfg, mut)) |h| {
+                if (decodeTable(cfg, h, mut)) |tb| {
+                    if (tb.count > 0) {
+                        if (frameSpan(h, tb, 0, h.plain_len)) |span| {
+                            const lo: usize = @intCast(@min(span.lo, mut.len));
+                            const hi: usize = @intCast(@min(span.hi, mut.len));
+                            _ = t.decodeFramesInner(mut[0..HEADER_PAGE_LEN], mut[lo..hi], lo, span, out) catch {};
+                        } else |_| {}
+                    }
+                } else |_| {}
+            } else |_| {}
         }
         for (0..500) |_| {
             const len = r.intRangeAtMost(usize, 0, mut.len);

@@ -1,0 +1,25 @@
+; 512 B random writes, buffered (the mount is write-through: every write(2) is
+; its own FUSE_WRITE, so the daemon sees sector writes — the W2 extent overlay's
+; shape, decision 0003 §J.1: the in-place page fold's bound is 8× at sector-
+; aligned offsets). psync: the depth is the job count. Over the pre-written
+; dataset (mapped, sole-owner blocks).
+; Env: DIRECTORY SIZE RUNTIME NUMJOBS.
+[global]
+ioengine=psync
+direct=0
+bs=512
+rw=randwrite
+numjobs=${NUMJOBS}
+time_based=1
+runtime=${RUNTIME}
+directory=${DIRECTORY}
+filename_format=frag.$jobnum
+size=${SIZE}
+create_on_open=0
+fallocate=none
+norandommap=1
+randrepeat=0
+group_reporting=1
+invalidate=1
+end_fsync=0
+[frag]

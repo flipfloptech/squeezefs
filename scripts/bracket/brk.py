@@ -631,6 +631,11 @@ def markdown(rec):
     for r in rec["invalid_reasons"]:
         for f in r["failed"]:
             lines.append("- INVALID leg %s/%s: `%s` — %s" % (r["leg"], r["arm"], f["check"], f["detail"]))
+    # The §J laws, per leg, when the row engaged them.
+    for l in legs:
+        for v in l["verdicts"]:
+            if v["check"] in ("write_amplification_bound", "staged_append_bound", "journal_entries_per_append"):
+                lines.append("- leg %s/%s `%s` %s: %s" % (l["leg"], l["arm"], v["check"], "ok" if v["ok"] else "FAILED", v["detail"]))
     fs = legs[0]["ledgers"]["fsync_phase_ns"] if legs else None
     if fs and fs["total"]["count"]:
         lines.append("")

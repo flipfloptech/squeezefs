@@ -273,6 +273,12 @@ pub const Backing = struct {
     /// Return `[off, off + len)` to the host (punch + drop pages) after a
     /// tombstone; a cleanly unmounted dir scans EMPTY.
     reclaim: ?*const fn (ctx: ?*anyopaque, off: u64, len: u64) void = null,
+    /// The first offset ≥ `off` that holds DATA (`SEEK_DATA`), null past
+    /// the last. The recovery scan skips holes with it: reading a hole
+    /// through the shared mapping would populate a page-cache page per
+    /// grain (a cleanly unmounted 546 MiB ring is all holes and sat fully
+    /// resident at every mount before this). Null = scan every grain.
+    nextData: ?*const fn (ctx: ?*anyopaque, off: u64) ?u64 = null,
 
     pub const none: Backing = .{};
 };
@@ -576,9 +582,10 @@ pub const Segment = struct {
     /// checksummed record is adopted and its whole footprint skipped (value
     /// interiors are never scanned for headers); a magic whose header or
     /// checksum fails is dropped loud and the scan resyncs at the next
-    /// grain; a tombstone or a zero grain steps one grain. Same-key copies:
-    /// the higher generation wins (a crash between the replace's phases
-    /// left both), equal ⇒ the later offset. `write_offset` = the max end.
+    /// grain; a tombstone or a zero grain steps one grain; a HOLE is
+    /// skipped whole (`Backing.nextData`). Same-key copies: the higher
+    /// generation wins (a crash between the replace's phases left both),
+    /// equal ⇒ the later offset. `write_offset` = the max end.
     pub fn recover(self: *Segment) RecoverReport {
         self.lock.lock();
         defer self.lock.unlock();
@@ -587,6 +594,13 @@ pub const Segment = struct {
         var off: u64 = 0;
         var max_end: u64 = 0;
         while (off + RECORD_HEADER_LEN <= self.image.len) {
+            if (self.backing.nextData) |nd| {
+                const data = nd(self.backing.ctx, off) orelse break;
+                // Data is reported at the host's block grain; the record
+                // grain divides it, so the scan resumes on a grain inside it.
+                off = @max(off, data - data % RECORD_ALIGN);
+                if (off + RECORD_HEADER_LEN > self.image.len) break;
+            }
             const h = readHeader(self.image, off) orelse {
                 if (!isTombstone(self.image, off) and std.mem.eql(u8, self.image[@intCast(off)..][0..4], &SEGMENT_MAGIC)) rep.torn += 1;
                 off += RECORD_ALIGN;
@@ -1165,6 +1179,10 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
 
     pub const Error = error{ OpenFailed, MapFailed, GrowFailed, NameTooLong };
 
+    /// `lseek(2)`'s hole-reporting whence (std's `SEEK` carries only
+    /// SET/CUR/END).
+    const SEEK_DATA: u32 = 3;
+
     pub const MappedSegment = struct {
         fd: linux.fd_t,
         map: []align(4096) u8,
@@ -1187,8 +1205,20 @@ pub const Ring = if (builtin.os.tag == .linux) struct {
             stats.backing_reclaim_ns.record(clock.monotonicNs() - t0);
         }
 
+        /// `lseek(SEEK_DATA)`: the next data offset, null at or past the
+        /// end (`ENXIO`). A filesystem without hole reporting answers the
+        /// query offset itself (every byte is data): the scan degrades to
+        /// the grain walk.
+        fn nextData(ctx: ?*anyopaque, off: u64) ?u64 {
+            const self: *MappedSegment = @ptrCast(@alignCast(ctx.?));
+            const rc = linux.lseek(self.fd, @intCast(off), SEEK_DATA);
+            if (linux.errno(rc) != .SUCCESS) return null;
+            const data: u64 = @intCast(rc);
+            return if (data >= self.map.len) null else data;
+        }
+
         pub fn backing(self: *MappedSegment) Backing {
-            return .{ .ctx = self, .sync = sync, .reclaim = reclaim };
+            return .{ .ctx = self, .sync = sync, .reclaim = reclaim, .nextData = nextData };
         }
 
         pub fn close(self: *MappedSegment) void {
@@ -1812,6 +1842,18 @@ test "linux: a ring under a tmp dir — 0700/0600 modes, mmap put/get, a remount
     const rep = seg2.recover();
     try testing.expectEqual(@as(u64, 1), rep.adopted);
     try testing.expectEqual(@as(u64, 0), rep.torn);
+    // The scan skipped the holes: only the live record's pages (and the
+    // tombstoned second record's punched run, none) are resident — never
+    // the whole 64-grain ring. Asserted where the host filesystem reports
+    // holes (ext4; the venue's virtiofs answers SEEK_DATA with the query
+    // offset, and the scan honestly degrades to the grain walk there).
+    var vec: [64]u8 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall3(.mincore, @intFromPtr(ms2.map.ptr), ms2.map.len, @intFromPtr(&vec))));
+    var resident: u32 = 0;
+    for (vec) |b| resident += b & 1;
+    try testing.expect(resident >= 1);
+    const reports_holes = Ring.MappedSegment.nextData(&ms2, 4 * 4096) == null;
+    if (reports_holes) try testing.expect(resident <= 4); // the 5000 B record spans two grains (+ host block rounding)
     const l2 = seg2.get(tkey(1, 11)).?;
     defer l2.release();
     try testing.expectEqualSlices(u8, &v, l2.bytes());

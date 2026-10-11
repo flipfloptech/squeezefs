@@ -35,9 +35,13 @@
 //! reallocation LABEL (an owner-clock instant whose "nothing owed" sentinel
 //! is `u64::MAX` on every non-owner mount: reading it as a wait made the
 //! park unbounded on every co-writer — the s11 fleet wedge, 100 writes in
-//! flight for 30 min, `.stats` in D-state). Rung 4 has no reader plane:
-//! the base bound is 0, the wall exactly 1 s, and the grace ring is empty,
-//! so the write path never parks at all — the law is in place for rung 6.
+//! flight for 30 min, `.stats` in D-state). Who parks is the caller's
+//! class (`SupplyWait`): the RAM-freeing flush parks while the allocator's
+//! supply is VISIBLE (a grant window being refilled, a trim window, a
+//! pending drain, the grace ring — the edges all ring `supply_edge`); the
+//! fresh overlay mint never does (it declines to accumulation and yields
+//! scarce supply to the flushes). With no reader plane the base bound is
+//! 0 and the wall exactly 1 s (rung 9 F17).
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");

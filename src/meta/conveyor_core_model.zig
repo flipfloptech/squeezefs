@@ -22,6 +22,10 @@
 //!   7 pass_fiber_wake_not_lost                   — the pass fiber parks without re-reading the
 //!                                                 leader latch (the winner's wake coalesced into
 //!                                                 the fiber's own mutex-park wake)
+//!   8 hold_park_never_outlives_the_landing        — the window-fill hold reads the in-flight
+//!                                                 count BEFORE registering on the landing notify
+//!                                                 (the landing between the read and the park is
+//!                                                 lost: the pass parks on an empty flight)
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -47,6 +51,11 @@ const Weakening = enum {
     /// latch: a winner's wake that landed while the fiber was SCHEDULED
     /// (woken from its park on the queue mutex) was a no-op on the word.
     park_without_leader_recheck,
+    /// The window-fill hold checks `windows_inflight` BEFORE it registers
+    /// on the landing notify (check-then-register): a landing between the
+    /// two is a notify with no waiter, and the pass parks on a flight that
+    /// is already empty.
+    hold_check_before_register,
 };
 
 const Item = struct { id: u8, len: u8 };
@@ -844,6 +853,162 @@ fn PassFiber(comptime weakening: Weakening) type {
 }
 
 // ---------------------------------------------------------------------------
+// 8. the window-fill hold never parks on an empty flight
+// ---------------------------------------------------------------------------
+
+/// The pass has drained a pad-majority batch while ONE window is in
+/// flight (`conveyor.holdForFill`): it registers on the landing notify
+/// (snapshots the epoch), re-reads the in-flight count, and parks iff it
+/// is still non-zero; a landing (the lane's `finishWindow`: `inflight −=
+/// 1` then `notifyWaiters`: `epoch += 1`, waking a registered waiter)
+/// ends the park, after which the pass re-drains, issues, and runs on as
+/// the leader (the `Pass` loop: drain → unlead → recheck). A committer
+/// enqueues during the hold and loses its election to the holding pass
+/// (or, enqueuing after the unlead, wins and drains itself): its entry is
+/// drained exactly once — by the re-drain into the held window, by the
+/// leader's next drain, or by its own pass. The deadline is not modelled:
+/// it is the latency bound, never the liveness backstop — a hold that
+/// only the deadline could end IS the lost-wake failure.
+///
+/// Weakening `.hold_check_before_register`: the pass reads `inflight ==
+/// 1`, the lane lands and bumps the epoch, the pass registers (snapshot =
+/// the NEW epoch) and parks: nothing else will ever notify — the batch
+/// sits on a quiet ring with nothing in flight.
+fn HoldPark(comptime weakening: Weakening) type {
+    return struct {
+        const Self = @This();
+        pub const thread_count: usize = 3;
+        const pass_t = 0;
+        const lane_t = 1;
+        const committer_t = 2;
+        const items = [1]Item{.{ .id = 9, .len = 1 }};
+
+        const Ppc = enum(u8) { drained, register, check, park, parked, redrain_lock, redrain_pop, redrain_unlock, issued };
+        const Lpc = enum(u8) { landing, notify, done };
+
+        sh: Shared = .{ .leader = true },
+        /// The landing notify: its epoch and whether the pass is linked.
+        epoch: u8 = 0,
+        pass_linked: bool = false,
+        pass_epoch: u8 = 0,
+        inflight: u8 = 1,
+        ppc: Ppc = .drained,
+        lpc: Lpc = .landing,
+        /// The held window's batch: the drained entry + the re-drain.
+        batch_n: u8 = 1,
+        /// The leader's loop after the issue.
+        pass: Pass = .{ .leading = true },
+        c: Committer = .start(weakening),
+
+        pub fn init() Self {
+            return .{};
+        }
+        pub fn done(self: *const Self, t: usize) bool {
+            return switch (t) {
+                // A pass parked with nobody left to wake it is where the
+                // schedule ends (the wedge `final` names).
+                pass_t => (self.ppc == .issued and self.pass.pc == .done) or (self.ppc == .parked and self.epoch == self.pass_epoch and self.lpc == .done and self.c.phase == .done),
+                lane_t => self.lpc == .done,
+                committer_t => self.c.phase == .done,
+                else => unreachable,
+            };
+        }
+
+        fn stepPass(self: *Self) void {
+            switch (self.ppc) {
+                .drained => self.ppc = if (weakening == .hold_check_before_register) .check else .register,
+                .register => {
+                    // `n.enable(io)`: link + snapshot the epoch.
+                    self.pass_linked = true;
+                    self.pass_epoch = self.epoch;
+                    self.ppc = if (weakening == .hold_check_before_register) .park else .check;
+                },
+                .check => {
+                    if (self.inflight == 0) {
+                        // Nothing to shadow: cancel the registration, issue.
+                        self.pass_linked = false;
+                        self.ppc = .redrain_lock;
+                    } else self.ppc = if (weakening == .hold_check_before_register) .register else .park;
+                },
+                .park => {
+                    // `waitUntilUncancelable`: a passed epoch returns at once.
+                    if (self.epoch != self.pass_epoch) {
+                        self.pass_linked = false;
+                        self.ppc = .redrain_lock;
+                    } else self.ppc = .parked;
+                },
+                .parked => {
+                    // Woken by the notify (unlinked there) or still parked.
+                    if (self.epoch != self.pass_epoch) self.ppc = .redrain_lock;
+                },
+                .redrain_lock => if (!self.sh.locked) {
+                    self.sh.locked = true;
+                    self.ppc = .redrain_pop;
+                },
+                .redrain_pop => {
+                    while (self.sh.len > 0) {
+                        _ = self.sh.pop();
+                        self.batch_n += 1;
+                    }
+                    self.ppc = .redrain_unlock;
+                },
+                .redrain_unlock => {
+                    self.sh.locked = false;
+                    self.ppc = .issued;
+                },
+                // Issued: the leader's loop runs on.
+                .issued => self.pass.step(&self.sh, weakening),
+            }
+        }
+
+        fn stepLane(self: *Self) void {
+            switch (self.lpc) {
+                .landing => {
+                    // `untrack`: the in-flight count drops first.
+                    self.inflight -= 1;
+                    self.lpc = .notify;
+                },
+                .notify => {
+                    // `notifyWaiters`: bump the epoch, wake the linked waiter.
+                    self.epoch += 1;
+                    self.pass_linked = false;
+                    self.lpc = .done;
+                },
+                .done => unreachable,
+            }
+        }
+
+        pub fn step(self: *Self, t: usize) void {
+            switch (t) {
+                pass_t => self.stepPass(),
+                lane_t => self.stepLane(),
+                // The committer enqueues and elects: against the holding
+                // leader it loses and parks on its oneshot; after the
+                // leader's unlead it wins and runs its own pass.
+                committer_t => self.c.step(&self.sh, &items, weakening, true),
+                else => unreachable,
+            }
+        }
+        pub fn invariant(self: *const Self) !void {
+            // A parked pass with nothing in flight and no pending wake: the
+            // hold outlived the landing it was waiting for.
+            if (self.ppc == .parked and self.inflight == 0 and self.lpc == .done and self.epoch == self.pass_epoch) return error.HoldOutlivedLanding;
+            // A committer never leads while the holding pass holds the latch.
+            if (self.ppc != .issued and self.c.elect.won) return error.CommitterOutranTheHoldingLeader;
+        }
+        pub fn final(self: *const Self) !void {
+            if (self.ppc != .issued) return error.WindowNeverIssued;
+            if (self.sh.len != 0) return error.EntryLeftQueued;
+            // The two entries (the pre-drained one and the committer's) are
+            // drained exactly once between the held window, the leader's
+            // loop and the committer's own pass.
+            if (self.batch_n + self.pass.drained + self.c.pass.drained != 2) return error.EntriesNotDrainedExactlyOnce;
+            if (self.sh.leader) return error.LeadershipNotReleased;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -883,9 +1048,14 @@ test "conveyor_pass_fiber_wake_not_lost: holds; a park without the leader re-rea
     try explorer.expectFails(PassFiber(.park_without_leader_recheck), .{}, error.FinalViolated);
 }
 
+test "conveyor_hold_park_never_outlives_the_landing: holds (register-then-check; the late entry rides the held window); check-before-register fails (the landing between the read and the park is lost)" {
+    try explorer.expectHolds(HoldPark(.none), .{});
+    try explorer.expectFails(HoldPark(.hold_check_before_register), .{}, error.InvariantViolated);
+}
+
 // The state counts the evidence note records.
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

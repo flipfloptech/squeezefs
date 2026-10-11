@@ -684,6 +684,7 @@ pub const KvBackend = struct {
             .caps = conveyor.resolveCaps(opts.env, cpus, geo),
             .park_escalation_ns = conveyor.PARK_ESCALATION_NS,
             .door = be.slots.doorSeam(),
+            .window_hold = conveyor.windowHoldFor(flush_ms),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1057,6 +1058,7 @@ pub const KvBackend = struct {
             .door = be.slots.doorSeam(),
             .grant_fed = true,
             .pre_admission = .{ .ctx = &js.park_gate, .wait = joinedPreAdmission },
+            .window_hold = conveyor.windowHoldFor(flush_ms),
         });
         errdefer be.cv.deinit();
         try be.startPass();
@@ -1710,7 +1712,7 @@ pub const KvBackend = struct {
             .seq_base = w.seq_base,
             .ops = w.ops(),
             .entries = w.entries,
-            .bytes = w.bytes,
+            .acct = w.acct(),
             .apply_holes = w.applyHoles(),
         }, .{ .ctx = w, .call = windowDone }) catch |e| return mapSubmitError(e);
     }

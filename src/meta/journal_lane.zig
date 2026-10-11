@@ -189,6 +189,12 @@ pub const Stats = struct {
     /// Structural entries (SMO, compensation) issued on the lane
     /// (`journal_lane_structural_writes`).
     structural_writes: counters.ShardedCounter = .{},
+    /// Bytes the lane's ring landed on the metadata device
+    /// (`journal_lane_write_bytes`, per WRITE CQE): one of the two
+    /// device-write arms of the metadata-WRITE ledger (the other is
+    /// `meta_io_write_bytes`, the io pool's); their sum is the daemon's
+    /// view of the META namespace's diskstats (decision 0003 §L).
+    write_bytes: counters.ShardedCounter = .{},
     write_failures: counters.ShardedCounter = .{},
     rollbacks: counters.ShardedCounter = .{},
     barriers_strict: counters.ShardedCounter = .{},
@@ -227,11 +233,12 @@ pub var stats: Stats = .{};
 
 /// `{"journal_lanes_spawned":n,…}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
+    try w.print("{{\"journal_lanes_spawned\":{d},\"journal_lanes_live\":{d},\"journal_ring_lane_writes\":{d},\"journal_lane_structural_writes\":{d},\"journal_lane_write_bytes\":{d},\"journal_lane_write_failures\":{d},\"journal_lane_rollbacks\":{d},\"journal_lane_barriers_strict\":{d},\"journal_lane_barriers_coalesced\":{d},\"journal_lane_barrier_failures\":{d},\"journal_lane_wake_writes\":{d},\"journal_lane_wake_elided\":{d},\"journal_lane_parks\":{d},\"journal_lane_park_tick_rescues\":{d},\"journal_lane_park_backstop_ticks\":{d},\"journal_lane_prefix_waits\":{d},\"journal_lane_queue_full\":{d},\"journal_lane_volumes_failed\":{d},\"journal_lane_rings_dead\":{d},\"journal_lane_cqe_orphan\":{d},\"journal_lane_ack_out_of_order\":{d}}}", .{
         stats.lanes_spawned.load(),
         stats.lanes_live.load(),
         stats.lane_writes.load(),
         stats.structural_writes.load(),
+        stats.write_bytes.load(),
         stats.write_failures.load(),
         stats.rollbacks.load(),
         stats.barriers_strict.load(),
@@ -388,9 +395,10 @@ pub const WriteRequest = struct {
     /// The window's first record stamp (`reserveRegistered`'s `seq_base`).
     seq_base: u64,
     ops: []const WriteOp,
-    /// Accounting: surviving entries and Σ their `res.len`.
+    /// Accounting: surviving entries and the image's device terms
+    /// (`journal.WriteImage.acct`; the ledger's ONE site is the verdict).
     entries: u64,
-    bytes: u64,
+    acct: journal.WriteAccounting,
     /// The window had in-window apply failures (rolled-back members): the
     /// survivors' ack waits for a checkpoint past the window.
     apply_holes: bool = false,
@@ -435,7 +443,7 @@ const Cell = struct {
     seq_base: u64 = 0,
     ops: []const WriteOp = &.{},
     entries: u64 = 0,
-    bytes: u64 = 0,
+    acct: journal.WriteAccounting = .{},
     apply_holes: bool = false,
     /// Detached window: the hook answers and the lane frees the cell.
     done_hook: ?DoneHook = null,
@@ -460,7 +468,7 @@ const Cell = struct {
         self.seq_base = 0;
         self.ops = &.{};
         self.entries = 0;
-        self.bytes = 0;
+        self.acct = .{};
         self.apply_holes = false;
         self.done_hook = null;
         self.waiter = null;
@@ -738,7 +746,7 @@ pub const JournalLane = struct {
         c.seq_base = req.seq_base;
         c.ops = req.ops;
         c.entries = req.entries;
-        c.bytes = req.bytes;
+        c.acct = req.acct;
         c.apply_holes = req.apply_holes;
         c.done_hook = done;
         return self.publish(idx);
@@ -1073,6 +1081,7 @@ pub const JournalLane = struct {
     fn advanceRun(self: *JournalLane, i: u32, res: i32, now: u64) bool {
         const r = &self.w.slots.items[i].?;
         if (res > 0) {
+            stats.write_bytes.add(@intCast(res));
             r.written += @intCast(res);
             if (r.written < r.data.len) return true;
             self.finishRun(i, {}, now);
@@ -1307,8 +1316,7 @@ pub const JournalLane = struct {
                 c.verdict = e;
             } else {
                 self.latch.noteSuccess(.journal_write);
-                self.ring_stats.noteEntriesWritten(c.entries, c.bytes);
-                self.ring_stats.notePadWritten(c.window.pad);
+                self.ring_stats.noteWritten(c.acct, c.entries);
                 if (c.apply_holes) hole_end = @max(hole_end orelse 0, c.window.paddedEnd());
                 any_ok = true;
                 c.verdict = {};
@@ -1717,8 +1725,17 @@ const Harness = struct {
         return img.ops;
     }
 
+    /// The harness's one-entry window accounting over its aligned runs
+    /// (`build` is a solo `buildEntryWrite`: no holes; the headers are the
+    /// runs' remainder).
+    fn acctOf(res: Reservation, ops: []const WriteOp) journal.WriteAccounting {
+        var run: u64 = 0;
+        for (ops) |op| run += op.bytes.len;
+        return .{ .entry_bytes = res.len, .pad_bytes = res.pad, .header_bytes = run -| (res.len + res.pad), .hole_bytes = 0, .run_bytes = run };
+    }
+
     fn submit(self: *Harness, r: jc.InflightRegistry.Registered, ops: []const WriteOp) Error!Ticket {
-        return self.lane.?.submitWriteBatch(.{ .window = r.res, .seq_base = r.seq_base, .ops = ops, .entries = 1, .bytes = r.res.len });
+        return self.lane.?.submitWriteBatch(.{ .window = r.res, .seq_base = r.seq_base, .ops = ops, .entries = 1, .acct = acctOf(r.res, ops) });
     }
 
     fn append(self: *Harness, ino: u64, entry_len: u64, marker: u8) !struct { res: Reservation, ticket: Ticket } {
@@ -2110,7 +2127,7 @@ test "a hole checkpoint that cannot drain fails the survivors loud (no barrier, 
     const lane = h.lane.?;
     const r = try h.reserve(500);
     const ops = try h.build(r, 5, 500, 0x55);
-    const t = try lane.submitWriteBatch(.{ .window = r.res, .seq_base = r.seq_base, .ops = ops, .entries = 1, .bytes = r.res.len, .apply_holes = true });
+    const t = try lane.submitWriteBatch(.{ .window = r.res, .seq_base = r.seq_base, .ops = ops, .entries = 1, .acct = Harness.acctOf(r.res, ops), .apply_holes = true });
     try testing.expectError(error.HoleCheckpointFailed, t.wait().result);
     try testing.expectEqualSlices(u64, &.{r.res.paddedEnd()}, rl.checkpoints.items);
     try testing.expectEqual(@as(u64, 0), lane.snapshot().barriers_strict);
@@ -2120,7 +2137,7 @@ test "a hole checkpoint that cannot drain fails the survivors loud (no barrier, 
     rl.checkpoint_ok = true;
     const r2 = try h.reserve(500);
     const ops2 = try h.build(r2, 6, 500, 0x66);
-    const t2 = try lane.submitWriteBatch(.{ .window = r2.res, .seq_base = r2.seq_base, .ops = ops2, .entries = 1, .bytes = r2.res.len, .apply_holes = true });
+    const t2 = try lane.submitWriteBatch(.{ .window = r2.res, .seq_base = r2.seq_base, .ops = ops2, .entries = 1, .acct = Harness.acctOf(r2.res, ops2), .apply_holes = true });
     try t2.wait().result;
     try testing.expectEqualSlices(u64, &.{ r.res.paddedEnd(), r2.res.paddedEnd() }, rl.checkpoints.items);
     try testing.expectEqual(@as(u64, 1), lane.snapshot().barriers_strict);

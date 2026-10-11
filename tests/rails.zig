@@ -1012,11 +1012,13 @@ test "bracket ledger pin: bench.zig's device-write, request, admission, read-cop
         .{ .label = "ADMISSION_ARMS", .ours = &bench.StatsTerms.admission_keys },
         .{ .label = "READ_COPY_ARMS", .ours = &bench.StatsTerms.read_copy_keys },
         .{ .label = "DEVICE_READ_ARMS", .ours = &bench.StatsTerms.device_read_keys },
+        // The META device's two write arms (decision 0003 §L).
+        .{ .label = "META_WRITE_ARMS", .ours = &bench.StatsTerms.meta_write_keys },
     };
     for (pins) |p| {
         const theirs = try pyListNames(gpa, text, p.label);
         defer gpa.free(theirs);
-        try std.testing.expect(theirs.len >= 3);
+        try std.testing.expect(theirs.len >= 2);
         try expectSameNames(gpa, p.label, p.ours, theirs, &violations.writer);
     }
     // The rewrite epoch's gauge and the dest-lease gauge are BESIDE in both.

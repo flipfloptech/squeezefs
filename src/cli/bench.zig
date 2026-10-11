@@ -343,6 +343,21 @@ pub const StatsTerms = struct {
     zc_direct_legs: u64 = 0,
     zc_serve_bytes: u64 = 0,
     invariant_tripwires: u64 = 0,
+    /// The metadata-WRITE ledger (decision 0003 §L): Σ `meta_write_keys`
+    /// (the META device's bytes), the journal's device bytes and pad, its
+    /// windows and entries, the conveyor's pad-majority (paced) windows and
+    /// deadline-ended holds, and the window round trip's exact-sum
+    /// histogram (count, Σ ns) the pacing law divides the span by.
+    meta_write_bytes: u64 = 0,
+    journal_device_bytes: u64 = 0,
+    journal_pad_bytes: u64 = 0,
+    journal_windows: u64 = 0,
+    journal_entries: u64 = 0,
+    paced_windows: u64 = 0,
+    hold_deadlines: u64 = 0,
+    strict_barriers: u64 = 0,
+    window_rtt_count: u64 = 0,
+    window_rtt_sum_ns: u64 = 0,
     direct_device_true: bool = false,
     present: bool = false,
 
@@ -361,6 +376,11 @@ pub const StatsTerms = struct {
     /// bypass it.
     pub const device_write_req_keys = [_][]const u8{ "patch_writes", "own_block_dmas", "put_obj", "fold_inplace_dmas" };
     pub const admission_keys = [_][]const u8{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes" };
+    /// The META device's write arms (decision 0003 §L; brk.py
+    /// `META_WRITE_ARMS`): the journal lane's own ring writes and the io
+    /// pool's (node appends and images, ledger slots, bitmap and appender
+    /// pages) — Σ is the daemon's view of the META namespace's diskstats.
+    pub const meta_write_keys = [_][]const u8{ "journal_lane_write_bytes", "meta_io_write_bytes" };
     /// The read copy ledger (charter §6.3; brk.py `READ_COPY_ARMS`): the
     /// PARTITION of the user's bytes by how they reached the reply — a
     /// daemon copy into the dest, a device DMA into the dest, the plane's
@@ -401,13 +421,25 @@ pub const StatsTerms = struct {
         t.zc_direct_legs = json_scan.number(text, "transport_zc_direct_legs") orelse 0;
         t.zc_serve_bytes = json_scan.number(text, "transport_zc_serve_bytes") orelse 0;
         t.invariant_tripwires = json_scan.number(text, "invariant_tripwires") orelse 0;
+        for (meta_write_keys) |k| t.meta_write_bytes += json_scan.number(text, k) orelse 0;
+        t.journal_device_bytes = json_scan.number(text, "meta_kv_journal_device_bytes") orelse 0;
+        t.journal_pad_bytes = json_scan.number(text, "meta_kv_journal_pad_bytes") orelse 0;
+        t.journal_windows = json_scan.number(text, "meta_kv_journal_windows") orelse 0;
+        t.journal_entries = json_scan.number(text, "meta_kv_journal_entries") orelse 0;
+        t.paced_windows = (json_scan.number(text, "meta_conveyor_windows_held") orelse 0) + (json_scan.number(text, "meta_conveyor_windows_unshadowed") orelse 0);
+        t.hold_deadlines = json_scan.number(text, "meta_conveyor_hold_deadlines") orelse 0;
+        t.strict_barriers = json_scan.number(text, "journal_lane_barriers_strict") orelse 0;
+        if (json_scan.object(text, "meta_window_total")) |h| {
+            t.window_rtt_count = json_scan.number(h, "count") orelse 0;
+            t.window_rtt_sum_ns = json_scan.number(h, "sum_ns") orelse 0;
+        }
         t.direct_device_true = (json_scan.number(text, "direct_device_true") orelse 0) != 0;
         return t;
     }
 
     pub fn delta(after: StatsTerms, before: StatsTerms) StatsTerms {
         var d: StatsTerms = .{ .present = after.present and before.present, .direct_device_true = after.direct_device_true };
-        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "rewrite_device_write_bytes", "device_writes", "admission_bytes", "read_copy_bytes", "device_read_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "zc_direct_legs", "zc_serve_bytes", "invariant_tripwires" }) |f| {
+        inline for (.{ "fuse_ops", "transport_ring_requests", "transport_enters", "device_write_bytes", "rewrite_device_write_bytes", "device_writes", "admission_bytes", "read_copy_bytes", "device_read_bytes", "terminal_frees", "reclaim_queued", "reclaim_elided", "discard_bytes", "held_stores", "patch_writes", "hot_block_hits", "fast_dispatch_serves", "zc_write_direct_bytes", "zc_write_extract_bytes", "zc_direct_legs", "zc_serve_bytes", "invariant_tripwires", "meta_write_bytes", "journal_device_bytes", "journal_pad_bytes", "journal_windows", "journal_entries", "paced_windows", "hold_deadlines", "strict_barriers", "window_rtt_count", "window_rtt_sum_ns" }) |f| {
             @field(d, f) = @field(after, f) -| @field(before, f);
         }
         return d;
@@ -477,6 +509,41 @@ pub const Row = struct {
         return self.stats.device_write_bytes / self.stats.device_writes;
     }
 
+    /// The metadata-WRITE ledger (decision 0003 §L): META device bytes ÷
+    /// user bytes in ppm (`meta_device_div_user`; the bracket harness
+    /// closes the same two arms against the META namespace's diskstats).
+    pub fn metaDeviceDivUserPpm(self: Row) u64 {
+        if (self.bytes == 0) return 0;
+        return @intCast((@as(u128, self.stats.meta_write_bytes) * PPM) / self.bytes);
+    }
+
+    /// The journal's pad fraction in ppm: `pad ÷ device bytes`.
+    pub fn metaPadFractionPpm(self: Row) u64 {
+        if (self.stats.journal_device_bytes == 0) return 0;
+        return @intCast((@as(u128, self.stats.journal_pad_bytes) * PPM) / self.stats.journal_device_bytes);
+    }
+
+    /// The pacing law's bound on pad-majority windows over this row: one
+    /// per window round trip (the mean of `meta_window_total`, with 10 %
+    /// slack on the mean against the hold's own clock), plus the
+    /// deadline-ended holds, plus the first. 0 when no round trip was
+    /// measured (the law then has no term to judge).
+    pub fn metaPacedWindowsBound(self: Row) u64 {
+        if (self.stats.window_rtt_count == 0 or self.stats.window_rtt_sum_ns == 0) return 0;
+        const rtt_mean = self.stats.window_rtt_sum_ns / self.stats.window_rtt_count;
+        const per_span = (@as(u128, self.elapsed_ns) * 11 / 10) / rtt_mean;
+        return @intCast(per_span + self.stats.hold_deadlines + 1);
+    }
+
+    /// `meta_pad_fraction_bound`: the pacing law holds on a coalesced
+    /// cadence (a strict cadence arms no hold: its committers declared
+    /// latency over bytes), or nothing was measured to judge.
+    pub fn withinMetaPacingBound(self: Row) bool {
+        if (self.stats.strict_barriers != 0 or self.stats.journal_windows == 0) return true;
+        const bound = self.metaPacedWindowsBound();
+        return bound == 0 or self.stats.paced_windows <= bound;
+    }
+
     /// The read copy ledger `Σ read copy arms ÷ user bytes` in ppm (≈ 1.0
     /// on a direct read row; readahead moves more than asked on a buffered one).
     pub fn readCopyPpm(self: Row) u64 {
@@ -509,12 +576,16 @@ pub const Row = struct {
             quantileNs(self.lat, 990),             quantileNs(self.lat, 999),                      quantileNs(self.lat, 1000),
         });
         const s = self.stats;
-        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"device_read_bytes\":{d},\"read_amplification_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}}}\n", .{
+        try w.print(",\"stats_present\":{},\"user_bytes\":{d},\"device_write_bytes\":{d},\"rewrite_device_write_bytes\":{d},\"device_writes\":{d},\"amplification_ppm\":{d},\"amplification_bound_ppm\":{d},\"within_amplification_bound\":{},\"wareq_sz\":{d},\"admission_bytes\":{d},\"read_copy_bytes\":{d},\"read_copy_ppm\":{d},\"device_read_bytes\":{d},\"read_amplification_ppm\":{d},\"reclaim\":{{\"terminal_frees\":{d},\"queued\":{d},\"elided\":{d},\"discard_bytes\":{d}}},\"fuse_ops\":{d},\"transport_ring_requests\":{d},\"transport_enters\":{d},\"engagement\":{{\"held_stores\":{d},\"patch_writes\":{d},\"hot_block_hits\":{d},\"fast_dispatch_serves\":{d},\"zc_write_direct_bytes\":{d},\"zc_write_extract_bytes\":{d},\"zc_direct_legs\":{d},\"zc_serve_bytes\":{d}}},\"invariant_tripwires\":{d}", .{
             s.present,                    self.bytes,                      s.device_write_bytes,     s.rewrite_device_write_bytes, s.device_writes,   self.amplificationPpm(),
             self.amplificationBoundPpm(), self.withinAmplificationBound(), self.wareqSz(),           s.admission_bytes,            s.read_copy_bytes, self.readCopyPpm(),
             s.device_read_bytes,          self.readAmplificationPpm(),     s.terminal_frees,         s.reclaim_queued,             s.reclaim_elided,  s.discard_bytes,
             s.fuse_ops,                   s.transport_ring_requests,       s.transport_enters,       s.held_stores,                s.patch_writes,    s.hot_block_hits,
             s.fast_dispatch_serves,       s.zc_write_direct_bytes,         s.zc_write_extract_bytes, s.zc_direct_legs,             s.zc_serve_bytes,  s.invariant_tripwires,
+        });
+        try w.print(",\"meta_write\":{{\"meta_write_bytes\":{d},\"meta_device_div_user_ppm\":{d},\"journal_device_bytes\":{d},\"journal_pad_bytes\":{d},\"journal_windows\":{d},\"journal_entries\":{d},\"meta_pad_fraction_ppm\":{d},\"paced_windows\":{d},\"paced_windows_bound\":{d},\"hold_deadlines\":{d},\"meta_pad_fraction_bound\":{}}}}}\n", .{
+            s.meta_write_bytes,        self.metaDeviceDivUserPpm(), s.journal_device_bytes,       s.journal_pad_bytes, s.journal_windows,            s.journal_entries,
+            self.metaPadFractionPpm(), s.paced_windows,             self.metaPacedWindowsBound(), s.hold_deadlines,    self.withinMetaPacingBound(),
         });
     }
 
@@ -524,6 +595,7 @@ pub const Row = struct {
         if (self.boxed_out) try w.print("|   time box expired: {d} of {d} ops ({d}% coverage)\n", .{ self.ops, self.expected_ops, if (self.expected_ops == 0) 0 else self.ops * 100 / self.expected_ops });
         if (self.pass.phase == .write and self.stats.present) {
             try w.print("|   device bytes ÷ user bytes {d}.{d:0>3} (device {d} B / user {d} B; rewrite epoch {d} B beside) vs the §J.1 bound {d}.{d:0>3} ({s}); wareq-sz {d} B vs block {d} B; reclaim terminal {d} = queued {d} + elided {d}, discarded {d} B; admission {d} B\n", .{ ratioParts(self.amplificationPpm()).whole, ratioParts(self.amplificationPpm()).milli, self.stats.device_write_bytes, self.bytes, self.stats.rewrite_device_write_bytes, ratioParts(self.amplificationBoundPpm()).whole, ratioParts(self.amplificationBoundPpm()).milli, if (self.withinAmplificationBound()) "within" else "OVER THE BOUND", self.wareqSz(), self.pass.block, self.stats.terminal_frees, self.stats.reclaim_queued, self.stats.reclaim_elided, self.stats.discard_bytes, self.stats.admission_bytes });
+            try w.print("|   META device bytes ÷ user bytes {d}.{d:0>3} ({d} B); journal {d} B over {d} windows ({d} entries), pad fraction {d}.{d:0>3}; pad-majority windows {d} vs the §L pacing bound {d} ({s})\n", .{ ratioParts(self.metaDeviceDivUserPpm()).whole, ratioParts(self.metaDeviceDivUserPpm()).milli, self.stats.meta_write_bytes, self.stats.journal_device_bytes, self.stats.journal_windows, self.stats.journal_entries, ratioParts(self.metaPadFractionPpm()).whole, ratioParts(self.metaPadFractionPpm()).milli, self.stats.paced_windows, self.metaPacedWindowsBound(), if (self.withinMetaPacingBound()) "within" else "OVER THE BOUND" });
         }
         if (self.pass.phase == .read and self.stats.present) {
             try w.print("|   read copy ledger Σ arms ÷ user bytes {d}.{d:0>3} (Σ {d} B / user {d} B); direct-leg serves {d} ({d} B); device read bytes ÷ user bytes {d}.{d:0>3} (device {d} B)\n", .{ ratioParts(self.readCopyPpm()).whole, ratioParts(self.readCopyPpm()).milli, self.stats.read_copy_bytes, self.bytes, self.stats.zc_direct_legs, self.stats.zc_serve_bytes, ratioParts(self.readAmplificationPpm()).whole, ratioParts(self.readAmplificationPpm()).milli, self.stats.device_read_bytes });
@@ -1137,6 +1209,47 @@ test "the stats delta reads the terms by key name across the families; absent ke
     const wrow: Row = .{ .pass = .{ .phase = .write, .block = 4096, .rand = false, .direct = true, .time_box_s = 0 }, .shape = row.shape, .iteration = 1, .ops = 10, .bytes = 300, .elapsed_ns = 1, .expected_ops = 10, .boxed_out = false, .lat = .{}, .stats = d };
     try testing.expectEqual(Row.PPM, wrow.amplificationPpm());
     try testing.expectEqual(@as(u64, 50), wrow.wareqSz());
+}
+
+test "the metadata-WRITE ledger (§L): the META arms sum, the journal's pad fraction, the window round trip read inside ITS histogram, the pacing bound over the span, the verdict; a strict cadence is exempt" {
+    const before = StatsTerms.parse("{\"meta\":{\"conveyor\":{\"meta_conveyor_windows_held\":10,\"meta_conveyor_windows_unshadowed\":5,\"meta_conveyor_hold_deadlines\":1},\"conveyor_phases\":{\"meta_tx_queue_wait\":{\"count\":1,\"sum_ns\":99},\"meta_window_total\":{\"count\":100,\"sum_ns\":20000000}},\"journal_lane\":{\"journal_lane_write_bytes\":4096,\"journal_lane_barriers_strict\":0},\"journal\":{\"meta_kv_journal_entries\":100,\"meta_kv_journal_windows\":15,\"meta_kv_journal_device_bytes\":61440,\"meta_kv_journal_pad_bytes\":50000}},\"io\":{\"meta_io_write_bytes\":8192}}");
+    const after = StatsTerms.parse("{\"meta\":{\"conveyor\":{\"meta_conveyor_windows_held\":1010,\"meta_conveyor_windows_unshadowed\":105,\"meta_conveyor_hold_deadlines\":11},\"conveyor_phases\":{\"meta_tx_queue_wait\":{\"count\":2,\"sum_ns\":100},\"meta_window_total\":{\"count\":1200,\"sum_ns\":240000000}},\"journal_lane\":{\"journal_lane_write_bytes\":4096000,\"journal_lane_barriers_strict\":0},\"journal\":{\"meta_kv_journal_entries\":4100,\"meta_kv_journal_windows\":1115,\"meta_kv_journal_device_bytes\":4567040,\"meta_kv_journal_pad_bytes\":4050000}},\"io\":{\"meta_io_write_bytes\":1000000}}");
+    // The histogram's own count/sum, not the first histogram's in the document.
+    try testing.expectEqual(@as(u64, 100), before.window_rtt_count);
+    try testing.expectEqual(@as(u64, 20_000_000), before.window_rtt_sum_ns);
+    const d = StatsTerms.delta(after, before);
+    try testing.expectEqual(@as(u64, 4096000 - 4096 + 1000000 - 8192), d.meta_write_bytes);
+    try testing.expectEqual(@as(u64, 1100), d.paced_windows);
+    try testing.expectEqual(@as(u64, 10), d.hold_deadlines);
+    try testing.expectEqual(@as(u64, 1100), d.window_rtt_count);
+    try testing.expectEqual(@as(u64, 220_000_000), d.window_rtt_sum_ns); // mean 200 µs
+    // A 1 s span: 1,000,000 ÷ 200 × 1.1 + 10 + 1 = 5,511 paced windows allowed.
+    const row: Row = .{ .pass = .{ .phase = .write, .block = 4096, .rand = true, .direct = true, .time_box_s = 0 }, .shape = .{ .threads = 1, .files = 1, .size = 1, .block = 4096 }, .iteration = 1, .ops = 4000, .bytes = 4000 * 4096, .elapsed_ns = std.time.ns_per_s, .expected_ops = 4000, .boxed_out = false, .lat = .{}, .stats = d };
+    try testing.expectEqual(@as(u64, 5511), row.metaPacedWindowsBound());
+    try testing.expect(row.withinMetaPacingBound());
+    // 4,505,600 journal device bytes of which 4,000,000 pad: 0.888; META ÷ user 5,083,808 ÷ 16,384,000 = 0.310.
+    try testing.expectEqual(@as(u64, 887_784), row.metaPadFractionPpm());
+    try testing.expectEqual(@as(u64, 310_285), row.metaDeviceDivUserPpm());
+    // Over the bound: 20,000 paced windows in the same span.
+    var over = d;
+    over.paced_windows = 20_000;
+    const bad: Row = .{ .pass = row.pass, .shape = row.shape, .iteration = 1, .ops = 4000, .bytes = row.bytes, .elapsed_ns = std.time.ns_per_s, .expected_ops = 4000, .boxed_out = false, .lat = .{}, .stats = over };
+    try testing.expect(!bad.withinMetaPacingBound());
+    // The strict cadence arms no hold: exempt.
+    var strict = over;
+    strict.strict_barriers = 7;
+    const srow: Row = .{ .pass = row.pass, .shape = row.shape, .iteration = 1, .ops = 4000, .bytes = row.bytes, .elapsed_ns = std.time.ns_per_s, .expected_ops = 4000, .boxed_out = false, .lat = .{}, .stats = strict };
+    try testing.expect(srow.withinMetaPacingBound());
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try row.writeJson(&out.writer);
+    for ([_][]const u8{ "\"meta_write\":{", "\"meta_device_div_user_ppm\":310285", "\"meta_pad_fraction_ppm\":887784", "\"paced_windows\":1100", "\"paced_windows_bound\":5511", "\"meta_pad_fraction_bound\":true" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, out.written(), needle) != null);
+    }
+    out.clearRetainingCapacity();
+    try row.writeText(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "META device bytes ÷ user bytes 0.310") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "vs the §L pacing bound 5511 (within)") != null);
 }
 
 test "the A-B-B-A bracket: the arm order, the direct lever per arm, the fold over byte-moving rows" {

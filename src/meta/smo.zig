@@ -211,8 +211,7 @@ pub const SmoJournal = struct {
         } else {
             journal.applyOps(self.image, self.layout.base, img.ops);
         }
-        self.stats.noteEntriesWritten(1, res.len);
-        self.stats.notePadWritten(res.pad);
+        self.stats.noteWritten(img.acct, 1);
         self.last_entry = res;
     }
 
@@ -1275,6 +1274,9 @@ pub const TestVolume = struct {
         /// Ring pages (the ring image is `pages × 4 KiB`): the 8 MiB
         /// floor, whose reserve is the 256 KiB floor.
         ring_pages: u64 = journal.RING_MIN / journal.PAGE_LEN,
+        /// The ring's sector grain: 1 = unpadded (the contracts' default);
+        /// 4096 = the O_DIRECT page posture with the sector-pad law.
+        ring_grain: u64 = 1,
         /// Journaled SMOs and commits (the production shape) or the
         /// standalone minted-seq shape.
         journaled: bool = false,
@@ -1321,7 +1323,7 @@ pub const TestVolume = struct {
         const ring_image = try gpa.alloc(u8, @intCast(cfg.ring_pages * journal.PAGE_LEN));
         errdefer gpa.free(ring_image);
         @memset(ring_image, 0);
-        const geo = journal.productionGeometry(cfg.ring_pages, 1);
+        const geo = journal.productionGeometry(cfg.ring_pages, cfg.ring_grain);
         const core = try gpa.create(jc.JournalCore);
         errdefer gpa.destroy(core);
         core.* = jc.JournalCore.init(geo, 0, 0);

@@ -93,7 +93,53 @@ pub fn string(text: []const u8, key: []const u8) ?[]const u8 {
     return text[start..j];
 }
 
+/// The OBJECT value of `key` as its raw `{…}` bytes (string-aware brace
+/// matching), or null — the one way to read a histogram's `count`/`sum_ns`
+/// (every histogram shares those field names, so `number` alone would
+/// answer the first histogram in the document).
+pub fn object(text: []const u8, key: []const u8) ?[]const u8 {
+    const at = valueStart(text, key) orelse return null;
+    if (at >= text.len or text[at] != '{') return null;
+    var depth: usize = 0;
+    var i = at;
+    var in_str = false;
+    var esc = false;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (c == '\\') {
+                esc = true;
+            } else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return text[at .. i + 1];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 const testing = std.testing;
+
+test "object by key name: the raw braces of the value, string-aware; a histogram's own count/sum_ns are then read inside it" {
+    const doc =
+        \\{"h1":{"count":3,"sum_ns":30,"buckets":{"<=1us":1}},"h2":{"count":5,"sum_ns":"}{",  "x":{"y":1}},"n":4}
+    ;
+    const h2 = object(doc, "h2").?;
+    try testing.expectEqualStrings("{\"count\":5,\"sum_ns\":\"}{\",  \"x\":{\"y\":1}}", h2);
+    try testing.expectEqual(@as(?u64, 5), number(h2, "count"));
+    try testing.expectEqual(@as(?u64, 30), number(object(doc, "h1").?, "sum_ns"));
+    try testing.expect(object(doc, "n") == null);
+    try testing.expect(object(doc, "missing") == null);
+}
 
 test "number/boolean/string by key name: the first key occurrence wins, a string value equal to a key name is not a key, nested objects are transparent, absent is null" {
     const doc =

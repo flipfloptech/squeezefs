@@ -518,15 +518,75 @@ pub const WriteOp = struct {
     }
 };
 
-/// The ops of one submission plus the arena that owns their bytes.
+/// What ONE submission puts on the device, by class — the metadata-WRITE
+/// ledger's journal terms (decision 0003 §L). Exact-sum by construction:
+/// `run_bytes ≡ entry_bytes + pad_bytes + header_bytes + hole_bytes`
+/// (`closes`), where `run_bytes` is what the device sees (Σ the aligned
+/// runs' lengths), `hole_bytes` a rolled-out member's zero-filled range
+/// inside the window (0 on an unpadded ring, where nothing is written for
+/// it), `header_bytes` the 24 B page headers the run carries.
+pub const WriteAccounting = struct {
+    entry_bytes: u64 = 0,
+    pad_bytes: u64 = 0,
+    header_bytes: u64 = 0,
+    hole_bytes: u64 = 0,
+    run_bytes: u64 = 0,
+
+    pub fn closes(self: WriteAccounting) bool {
+        return self.run_bytes == self.entry_bytes + self.pad_bytes + self.header_bytes + self.hole_bytes;
+    }
+
+    /// The window carried more pad than entries: the pad law's cost
+    /// exceeded its payload (the conveyor's hold judges the SAME predicate
+    /// before issuing: `conveyor.padMajority`).
+    pub fn padMajority(self: WriteAccounting) bool {
+        return self.pad_bytes > self.entry_bytes;
+    }
+};
+
+/// The ops of one submission plus the arena that owns their bytes, and
+/// the submission's device accounting.
 pub const WriteImage = struct {
     arena: std.heap.ArenaAllocator,
     ops: []WriteOp,
+    acct: WriteAccounting,
 
     pub fn deinit(self: *WriteImage) void {
         self.arena.deinit();
     }
 };
+
+/// The page headers a span's aligned runs carry: one per page whose first
+/// byte lies inside `[start, start + len)` (that page's run begins at the
+/// page BASE). On an unpadded ring the headers written are the entries'
+/// own owned ones (counted at framing), never a hole's.
+fn headerBytesOfSpan(geo: CoreGeometry, start: u64, len: u64) u64 {
+    var n: u64 = 0;
+    var it = geo.ownedPageStarts(start, len);
+    while (it.next()) |_| n += 1;
+    return n * PAGE_HDR_LEN;
+}
+
+fn runBytesOf(ops: []const WriteOp) u64 {
+    var n: u64 = 0;
+    for (ops) |op| n += op.bytes.len;
+    return n;
+}
+
+/// The accounting of a window `window` whose survivors sum to
+/// `entry_bytes`, over its aligned (or verbatim) `ops`.
+fn accountWindow(geo: CoreGeometry, window: Reservation, entry_bytes: u64, header_ops_bytes: u64, ops: []const WriteOp) WriteAccounting {
+    const padded = geo.grain > 1;
+    const acct: WriteAccounting = .{
+        .entry_bytes = entry_bytes,
+        .pad_bytes = window.pad,
+        .header_bytes = if (padded) headerBytesOfSpan(geo, window.start, window.paddedLen()) else header_ops_bytes,
+        .hole_bytes = if (padded) window.len - entry_bytes else 0,
+        .run_bytes = runBytesOf(ops),
+    };
+    std.debug.assert(acct.closes());
+    return acct;
+}
 
 fn opLessThan(_: void, a: WriteOp, b: WriteOp) bool {
     return a.offset < b.offset;
@@ -536,8 +596,9 @@ fn opLessThan(_: void, a: WriteOp, b: WriteOp) bool {
 /// segment ops (slices of ONE whole-entry buffer) then the owned page
 /// headers. The order within one batch carries no durability meaning
 /// (unordered writeback is the crash model either way); it lets the torn-
-/// batch harness exercise payload-landed/header-lost shapes.
-fn framedEntryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, start: u64, kind: EntryKind, payload: []const u8, ops: *std.ArrayList(WriteOp)) Allocator.Error!void {
+/// batch harness exercise payload-landed/header-lost shapes. Answers the
+/// page-header bytes appended (the unpadded ring's header accounting).
+fn framedEntryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, start: u64, kind: EntryKind, payload: []const u8, ops: *std.ArrayList(WriteOp)) Allocator.Error!u64 {
     const whole = ENTRY_HDR_LEN + payload.len;
     const entry = try arena.alloc(u8, @intCast(whole));
     frameEntry(entry, start, kind, payload);
@@ -551,34 +612,39 @@ fn framedEntryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appen
         consumed += n;
     }
     std.debug.assert(consumed == entry.len);
+    var header_bytes: u64 = 0;
     var owned = geo.ownedPageStarts(start, whole);
     while (owned.next()) |page_start| {
         const feo = firstEntryOffFor(geo, start, end, page_start);
         const hdr = try arena.alloc(u8, PAGE_HDR_LEN);
         hdr[0..PAGE_HDR_LEN].* = pageHeaderImage(@truncate(geo.lap(page_start)), feo, appender_id);
         try ops.append(arena, .{ .offset = layout.pageOffset(geo.pageIndex(page_start)), .bytes = hdr });
+        header_bytes += PAGE_HDR_LEN;
     }
+    return header_bytes;
 }
 
 /// The entry's own bytes: `entryLenFor(records)` must equal `res.len`.
-fn entryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, res: Reservation, records: []const RecordFrame, ops: *std.ArrayList(WriteOp)) Error!void {
+/// Answers the page-header bytes appended.
+fn entryOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, res: Reservation, records: []const RecordFrame, ops: *std.ArrayList(WriteOp)) Error!u64 {
     const need = try entryLenFor(records);
     if (need != res.len) return error.Corrupt;
     const payload = try arena.alloc(u8, @intCast(payloadLenFor(records)));
     encodeEntryPayload(payload, records);
-    try framedEntryOps(arena, layout, geo, appender_id, res.start, .records, payload, ops);
+    return framedEntryOps(arena, layout, geo, appender_id, res.start, .records, payload, ops);
 }
 
 /// The PAD entry behind a reservation: an ordinary checksummed entry of kind
 /// PAD at `end` spanning `pad` bytes (a zero payload of `pad − 24`), owning
 /// (and writing the headers of) the pages whose first byte it covers exactly
-/// as an entry would. Nothing when `pad == 0`.
-fn padOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, end: u64, pad: u64, ops: *std.ArrayList(WriteOp)) Allocator.Error!void {
-    if (pad == 0) return;
+/// as an entry would. Nothing when `pad == 0`. Answers the page-header
+/// bytes appended.
+fn padOps(arena: Allocator, layout: RingLayout, geo: CoreGeometry, appender_id: u32, end: u64, pad: u64, ops: *std.ArrayList(WriteOp)) Allocator.Error!u64 {
+    if (pad == 0) return 0;
     std.debug.assert(pad >= jc.PAD_MIN);
     const payload = try arena.alloc(u8, @intCast(pad - ENTRY_HDR_LEN));
     @memset(payload, 0);
-    try framedEntryOps(arena, layout, geo, appender_id, end, .pad, payload, ops);
+    return framedEntryOps(arena, layout, geo, appender_id, end, .pad, payload, ops);
 }
 
 /// THE ring's aligned form (charter §5.1 "a window's ops coalesce into one
@@ -636,10 +702,10 @@ pub fn buildEntryWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, ap
     errdefer arena.deinit();
     const a = arena.allocator();
     var ops: std.ArrayList(WriteOp) = .empty;
-    try entryOps(a, layout, geo, appender_id, res, records, &ops);
-    try padOps(a, layout, geo, appender_id, res.end(), res.pad, &ops);
+    var header_ops_bytes = try entryOps(a, layout, geo, appender_id, res, records, &ops);
+    header_ops_bytes += try padOps(a, layout, geo, appender_id, res.end(), res.pad, &ops);
     const aligned = try alignedOps(a, layout, geo, res.start, res.paddedEnd(), ops.items);
-    return .{ .arena = arena, .ops = aligned };
+    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, res, res.len, header_ops_bytes, aligned) };
 }
 
 /// One surviving member of a conveyor batch: its exact-sized sub-reservation
@@ -663,10 +729,15 @@ pub fn buildBatchWrite(gpa: Allocator, layout: RingLayout, geo: CoreGeometry, ap
     errdefer arena.deinit();
     const a = arena.allocator();
     var ops: std.ArrayList(WriteOp) = .empty;
-    for (parts) |p| try entryOps(a, layout, geo, appender_id, p.res, p.records, &ops);
-    try padOps(a, layout, geo, appender_id, window.end(), window.pad, &ops);
+    var header_ops_bytes: u64 = 0;
+    var entry_bytes: u64 = 0;
+    for (parts) |p| {
+        header_ops_bytes += try entryOps(a, layout, geo, appender_id, p.res, p.records, &ops);
+        entry_bytes += p.res.len;
+    }
+    header_ops_bytes += try padOps(a, layout, geo, appender_id, window.end(), window.pad, &ops);
     const aligned = try alignedOps(a, layout, geo, window.start, window.paddedEnd(), ops.items);
-    return .{ .arena = arena, .ops = aligned };
+    return .{ .arena = arena, .ops = aligned, .acct = accountWindow(geo, window, entry_bytes, header_ops_bytes, aligned) };
 }
 
 /// Land `ops` on an image of the extent whose first byte is device offset
@@ -727,6 +798,8 @@ pub const HeadAlignment = struct {
     ops: []WriteOp,
     /// Empty on an unpadded/buffered ring (the ops land as they are).
     spans: []Span,
+    /// The spans' device cost (the pad, its headers, the rewritten prefix).
+    acct: WriteAccounting,
 
     pub fn deinit(self: *HeadAlignment) void {
         self.arena.deinit();
@@ -755,9 +828,15 @@ pub fn planHeadAlignment(gpa: Allocator, core: *jc.JournalCore, reg: *jc.Infligh
     errdefer arena.deinit();
     const a = arena.allocator();
     var ops: std.ArrayList(WriteOp) = .empty;
-    try padOps(a, layout, geo, appender_id, r.res.start, r.res.pad, &ops);
+    const header_bytes = try padOps(a, layout, geo, appender_id, r.res.start, r.res.pad, &ops);
     const spans = try rmwSpans(a, geo.grain, ops.items);
-    return .{ .arena = arena, .res = r.res, .ops = ops.items, .spans = spans };
+    var run_bytes: u64 = 0;
+    for (spans) |s| run_bytes += s.hi - s.lo;
+    // The RMW rewrites the grain's prefix (the replayed sector's own bytes)
+    // beside the pad: that prefix is neither entry nor pad of THIS write —
+    // it rides `hole_bytes` so the pad's device cost still closes exactly.
+    const acct: WriteAccounting = .{ .pad_bytes = r.res.pad, .header_bytes = header_bytes, .hole_bytes = run_bytes - r.res.pad - header_bytes, .run_bytes = run_bytes };
+    return .{ .arena = arena, .res = r.res, .ops = ops.items, .spans = spans, .acct = acct };
 }
 
 /// Complete the pad's reservation (on BOTH outcomes — an open reservation
@@ -765,7 +844,7 @@ pub fn planHeadAlignment(gpa: Allocator, core: *jc.JournalCore, reg: *jc.Infligh
 pub fn finishHeadAlignment(plan: *const HeadAlignment, core: *const jc.JournalCore, reg: *jc.InflightRegistry, stats: *RingStats, landed: bool) void {
     reg.complete(core, plan.res);
     if (!landed) return;
-    stats.notePadWritten(plan.res.pad);
+    stats.noteWritten(plan.acct, 0);
     log.info("journal ring: recovered head {d} stood mid-sector — a {d} B pad entry aligns the first reservation to the {d} B grain", .{ plan.res.start, plan.res.pad, core.geometry().grain });
 }
 
@@ -1045,13 +1124,28 @@ pub fn interiorRecordsSorted(gpa: Allocator, entries: []const ReplayedEntry) All
 // ---------------------------------------------------------------------------
 
 /// Entry bytes written into ring pages (`res.len` per committed entry,
-/// headers included) — one half of the device-byte story.
+/// headers included) — one term of the metadata-WRITE ledger.
 pub var meta_kv_journal_bytes: counters.ShardedCounter = .{};
 pub var meta_kv_journal_entries: counters.ShardedCounter = .{};
-/// The sector pad's ring-capacity cost, kept apart from the entry economy so
+/// The sector pad's cost, kept apart from the entry economy so
 /// `journal_entries` per op keeps its meaning.
 pub var meta_kv_journal_pad_entries: counters.ShardedCounter = .{};
 pub var meta_kv_journal_pad_bytes: counters.ShardedCounter = .{};
+/// The rest of the metadata-WRITE ledger's journal terms (decision 0003 §L;
+/// exact-sum `meta_kv_journal_device_bytes ≡ meta_kv_journal_bytes +
+/// meta_kv_journal_pad_bytes + meta_kv_journal_header_bytes +
+/// meta_kv_journal_hole_bytes`): the windows landed (one aligned run set
+/// each — the pad law's unit of device cost), the 24 B page headers the
+/// runs carried, a rolled-out member's zero-filled range, and the bytes
+/// the device saw. `pad_bytes ÷ device_bytes` is the pad fraction.
+pub var meta_kv_journal_windows: counters.ShardedCounter = .{};
+pub var meta_kv_journal_header_bytes: counters.ShardedCounter = .{};
+pub var meta_kv_journal_hole_bytes: counters.ShardedCounter = .{};
+pub var meta_kv_journal_device_bytes: counters.ShardedCounter = .{};
+/// Windows that carried more pad than entries (the hold's own predicate,
+/// judged on what landed): the pacing law bounds THESE to one per device
+/// round trip (`conveyor.zig`).
+pub var meta_kv_journal_windows_pad_majority: counters.ShardedCounter = .{};
 /// The last mount's confirmed drops. After a crash nonzero is working as
 /// designed; after a CLEAN unmount it is the corruption alert.
 pub var replay_dropped_torn: counters.Gauge = .{};
@@ -1064,20 +1158,31 @@ pub const RingStats = struct {
     written_entries: counters.Gauge = .{},
     written_bytes: counters.Gauge = .{},
     written_pad_bytes: counters.Gauge = .{},
+    written_windows: counters.Gauge = .{},
+    written_device_bytes: counters.Gauge = .{},
 
-    /// Entries landed in this ring (called once the write's outcome is known).
-    pub fn noteEntriesWritten(self: *RingStats, entries: u64, bytes: u64) void {
-        meta_kv_journal_bytes.add(bytes);
+    /// ONE landed submission (a conveyor window, a structural entry, the
+    /// recovery pad): its `entries` and its device accounting, called once
+    /// the write's outcome is known. The ONE site that moves the journal
+    /// terms of the metadata-WRITE ledger, so they close by construction.
+    pub fn noteWritten(self: *RingStats, acct: WriteAccounting, entries: u64) void {
+        std.debug.assert(acct.closes());
+        meta_kv_journal_bytes.add(acct.entry_bytes);
         meta_kv_journal_entries.add(entries);
-        self.written_bytes.add(bytes);
+        if (acct.pad_bytes != 0) {
+            meta_kv_journal_pad_entries.inc();
+            meta_kv_journal_pad_bytes.add(acct.pad_bytes);
+        }
+        meta_kv_journal_windows.inc();
+        meta_kv_journal_header_bytes.add(acct.header_bytes);
+        meta_kv_journal_hole_bytes.add(acct.hole_bytes);
+        meta_kv_journal_device_bytes.add(acct.run_bytes);
+        if (acct.padMajority()) meta_kv_journal_windows_pad_majority.inc();
+        self.written_bytes.add(acct.entry_bytes);
         self.written_entries.add(entries);
-    }
-
-    pub fn notePadWritten(self: *RingStats, pad: u64) void {
-        if (pad == 0) return;
-        meta_kv_journal_pad_entries.inc();
-        meta_kv_journal_pad_bytes.add(pad);
-        self.written_pad_bytes.add(pad);
+        self.written_pad_bytes.add(acct.pad_bytes);
+        self.written_windows.add(1);
+        self.written_device_bytes.add(acct.run_bytes);
     }
 };
 
@@ -1313,8 +1418,7 @@ const TestRing = struct {
         defer img.deinit();
         applyOps(self.image, self.layout.base, img.ops);
         self.reg.complete(&self.core, r.res);
-        self.stats.noteEntriesWritten(1, r.res.len);
-        self.stats.notePadWritten(r.res.pad);
+        self.stats.noteWritten(img.acct, 1);
         return r.res;
     }
 
@@ -1851,6 +1955,12 @@ test "PAD entry bytes: pos = end, len = pad − 24, kind PAD, zero payload; repl
     try testing.expectEqual(PAGE_DATA_LEN, b.start);
     try testing.expectEqual(@as(u64, 2), ring.stats.written_entries.load());
     try testing.expectEqual(a.pad + b.pad, ring.stats.written_pad_bytes.load());
+    // The per-volume ledger (§L): two windows, one page each — the device
+    // saw 8192 B for 400 B of entries; both windows pad-majority.
+    try testing.expectEqual(@as(u64, 2), ring.stats.written_windows.load());
+    try testing.expectEqual(@as(u64, 2 * PAGE_LEN), ring.stats.written_device_bytes.load());
+    try testing.expectEqual(@as(u64, 400), ring.stats.written_bytes.load());
+    try testing.expectEqual(ring.stats.written_device_bytes.load(), ring.stats.written_bytes.load() + ring.stats.written_pad_bytes.load() + 2 * PAGE_HDR_LEN);
     var rec = try ring.replay(0);
     defer rec.deinit();
     var inos: [8]u64 = undefined;
@@ -1923,6 +2033,18 @@ test "aligned runs: a window spanning pages coalesces adjacent pages into one im
     try testing.expectEqual(@as(usize, 1), img.ops.len);
     try testing.expectEqual(@as(u64, 0), img.ops[0].offset);
     try testing.expectEqual(@as(u64, 0), img.ops[0].bytes.len % 512);
+    // The metadata-WRITE ledger's exact sum over the run (decision 0003 §L):
+    // the two survivors, the window's pad, the headers of the two pages the
+    // span begins, the rolled-back member's zero hole — ≡ the run's bytes.
+    try testing.expectEqual(lens[0] + lens[2], img.acct.entry_bytes);
+    try testing.expectEqual(window.pad, img.acct.pad_bytes);
+    try testing.expectEqual(2 * PAGE_HDR_LEN, img.acct.header_bytes);
+    try testing.expectEqual(lens[1], img.acct.hole_bytes);
+    try testing.expectEqual(img.ops[0].bytes.len, img.acct.run_bytes);
+    try testing.expect(img.acct.closes());
+    // The hole and the pad outweigh the entries: a pad-majority window by the
+    // hold's predicate only if pad > entries — here pad < 2000, so it is not.
+    try testing.expectEqual(window.pad > lens[0] + lens[2], img.acct.padMajority());
     applyOps(ring.image, 0, img.ops);
     // The hole: member 2's bytes are zero.
     for (ring.image[ring.phys(m1.end() + ENTRY_HDR_LEN) .. ring.phys(m1.end() + ENTRY_HDR_LEN) + 100]) |b| try testing.expectEqual(@as(u8, 0), b);
@@ -1966,6 +2088,14 @@ test "batch of one equals a solo write byte for byte; torn first member drops al
     defer batch.deinit();
     var solo = try buildEntryWrite(testing.allocator, ring.layout, ring.geo, 0, parts[1].res, parts[1].records);
     defer solo.deinit();
+    // The unpadded ring's accounting: no pad, no hole; the headers are the
+    // ones the entries own (page 0's); the run is the ops verbatim.
+    try testing.expectEqual(@as(u64, 1800), batch.acct.entry_bytes);
+    try testing.expectEqual(@as(u64, 0), batch.acct.pad_bytes);
+    try testing.expectEqual(@as(u64, 0), batch.acct.hole_bytes);
+    try testing.expectEqual(PAGE_HDR_LEN, batch.acct.header_bytes);
+    try testing.expectEqual(@as(u64, 1800 + PAGE_HDR_LEN), batch.acct.run_bytes);
+    try testing.expect(batch.acct.closes() and !batch.acct.padMajority());
     // The member's ops appear verbatim inside the batch.
     for (solo.ops) |s| {
         var found = false;

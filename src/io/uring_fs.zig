@@ -466,6 +466,12 @@ pub const Stats = struct {
     unaligned_refusals: counters.Tripwire = .init("meta_io_unaligned_refusals"),
     /// Direct reads whose window was widened to the grain (cold-path instrument).
     read_widened: counters.ShardedCounter = .{},
+    /// Bytes the pool's WRITE CQEs landed (`meta_io_write_bytes`): the io
+    /// pool's device-write arm of the metadata-WRITE ledger — node appends
+    /// and images, ledger slots, bitmap and appender pages; beside the
+    /// journal lane's `journal_lane_write_bytes` it is the daemon's view of
+    /// the META namespace's diskstats (decision 0003 §L).
+    write_bytes: counters.ShardedCounter = .{},
     /// `canonicalize` calls: flat under a steady stream of I/O to known paths.
     mode_resolves: counters.ShardedCounter = .{},
     /// `trySend` refusals (a full queue; the cell pool shares its bound).
@@ -489,12 +495,13 @@ fn recordWritePhases(s: WriteStamps) void {
 
 /// `{"meta_io":{…},"uring_fs_write_phase_ns":{…},"uring_queue_full":n}`
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"meta_io\":{{\"meta_io_direct_paths\":{d},\"meta_io_buffered_fallback\":{d},\"meta_io_bounce_bytes\":{d},\"meta_io_unaligned_refusals\":{d},\"meta_io_read_widened\":{d}}},\"uring_fs_write_phase_ns\":{{", .{
+    try w.print("{{\"meta_io\":{{\"meta_io_direct_paths\":{d},\"meta_io_buffered_fallback\":{d},\"meta_io_bounce_bytes\":{d},\"meta_io_unaligned_refusals\":{d},\"meta_io_read_widened\":{d},\"meta_io_write_bytes\":{d}}},\"uring_fs_write_phase_ns\":{{", .{
         stats.direct_paths.load(),
         stats.buffered_fallback.load(),
         stats.bounce_bytes.load(),
         stats.unaligned_refusals.load(),
         stats.read_widened.load(),
+        stats.write_bytes.load(),
     });
     inline for (.{ WritePhase.queue_hop, WritePhase.device, WritePhase.wake_hop, WritePhase.total }, 0..) |phase, i| {
         if (i != 0) try w.writeByte(',');
@@ -912,6 +919,7 @@ const Reactor = struct {
             },
             .write => |*w| {
                 if (res > 0) {
+                    stats.write_bytes.add(@intCast(res));
                     w.written += @intCast(res);
                     if (w.written < w.data.len) return true;
                 }

@@ -173,6 +173,21 @@ IPC = ["ipc_ops_read", "ipc_ops_write", "ipc_bytes_in", "ipc_bytes_out", "ipc_se
 JOURNAL = ["meta_kv_journal_entries", "meta_kv_journal_pad_entries", "meta_kv_journal_bytes",
            "meta_conveyor_drained_txs", "meta_conveyor_acks", "journal_lane_barriers_strict",
            "journal_lane_barriers_coalesced"]
+# The metadata-WRITE ledger (decision 0003 §L). The two device-write arms of
+# the META device — the journal lane's own ring writes and the io pool's
+# (node appends and images, ledger slots, bitmap and appender pages) — sum
+# to the daemon's view of the META namespace's diskstats (`bench.zig`
+# `meta_write_keys` names the same two). The journal's exact-sum terms:
+# `meta_kv_journal_device_bytes ≡ meta_kv_journal_bytes + _pad_bytes +
+# _header_bytes + _hole_bytes`; `pad ÷ device` is the pad fraction. The
+# conveyor's window classes and hold outcomes carry the pacing law.
+META_WRITE_ARMS = ["journal_lane_write_bytes", "meta_io_write_bytes"]
+META_WRITE = ["meta_kv_journal_device_bytes", "meta_kv_journal_pad_bytes", "meta_kv_journal_header_bytes",
+              "meta_kv_journal_hole_bytes", "meta_kv_journal_windows", "meta_kv_journal_windows_pad_majority",
+              "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines",
+              "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined",
+              "meta_conveyor_hold_bound_ns", "meta_kv_node_append_bytes", "meta_kv_node_rewrite_bytes",
+              "meta_kv_ledger_writes"]
 FUSE = ["fuse_ops", "transport_ring_requests", "transport_ring_reads", "transport_enters", "transport_fast_dispatch_serves",
         "transport_fast_dispatch_demotes", "transport_zc_direct_legs", "transport_zc_write_directs", "transport_payload_leases",
         "transport_wake_writes", "transport_wakes_elided", "transport_lease_overlong",
@@ -191,7 +206,8 @@ FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier"
 OP_CLASSES = ["lookup", "getattr", "setattr", "mkdir", "create", "unlink", "rename", "readdir", "read", "write", "other"]
 
 ALL_COUNTERS = (DEVICE_WRITE_ARMS + DEVICE_WRITE_BESIDE + DEVICE_WRITE_REQS + ADMISSION_ARMS + READ_COPY_ARMS + READ_COPY_BESIDE + RECLAIM
-                + WIRE_RPCS + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND + DEVICE_READ_ARMS + DEVICE_READ_BESIDE + META_READ)
+                + WIRE_RPCS + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND + DEVICE_READ_ARMS + DEVICE_READ_BESIDE + META_READ
+                + META_WRITE_ARMS + META_WRITE)
 
 
 def flatten(doc):
@@ -252,6 +268,14 @@ def terms(doc):
         c = paths.get("/ops/fuse_op_latency_ns/%s/count" % cls)
         ops[cls] = num(c) if c is not None else 0
     out["fuse_op_counts"] = ops
+    # The conveyor's window round trip and the §L hold: exact-sum histograms
+    # (count, Σ ns) under member 0's `conveyor_phases`.
+    cp = {}
+    for ph in ("meta_window_total", "meta_pass_hold", "meta_pass_total"):
+        c = paths.get("/meta/conveyor_phases/%s/count" % ph)
+        s = paths.get("/meta/conveyor_phases/%s/sum_ns" % ph)
+        cp[ph] = {"count": num(c) if c is not None else 0, "sum_ns": num(s) if s is not None else 0}
+    out["conveyor_phase_ns"] = cp
     # The R5 components' current bytes (which gauge took the budget to Yellow/Red).
     comps = {}
     for k, v in paths.items():
@@ -270,7 +294,7 @@ def delta(after, before):
         if k == "mem_budget_components":
             d[k] = v
             continue
-        if k == "fsync_phase_ns":
+        if k in ("fsync_phase_ns", "conveyor_phase_ns"):
             d[k] = {ph: {"count": v[ph]["count"] - before[k][ph]["count"],
                          "sum_ns": v[ph]["sum_ns"] - before[k][ph]["sum_ns"]} for ph in v}
         elif k == "fuse_op_counts":
@@ -513,6 +537,34 @@ def leg(args):
         s = sum(fs[ph]["sum_ns"] for ph in FSYNC_PHASES)
         ok = s == fs["total"]["sum_ns"]
         verdicts.append(("fsync_exact_sum", ok, "Σ phases %d ns vs total %d ns over %d fsyncs" % (s, fs["total"]["sum_ns"], fs["total"]["count"])))
+    # 5b. The metadata-WRITE ledger (decision 0003 §L), whenever the journal moved.
+    meta_write_stats = sum(d[k] for k in META_WRITE_ARMS)
+    jdev = d["meta_kv_journal_device_bytes"]
+    jpad = d["meta_kv_journal_pad_bytes"]
+    jent = d["meta_kv_journal_bytes"]
+    jwin = d["meta_kv_journal_windows"]
+    cp = d["conveyor_phase_ns"]
+    rtt_ns = (cp["meta_window_total"]["sum_ns"] / cp["meta_window_total"]["count"]) if cp["meta_window_total"]["count"] else 0
+    hold_ns = (cp["meta_pass_hold"]["sum_ns"] / cp["meta_pass_hold"]["count"]) if cp["meta_pass_hold"]["count"] else 0
+    paced = d["meta_conveyor_windows_held"] + d["meta_conveyor_windows_unshadowed"]
+    elapsed_ns = (metrics.get("elapsed_s") or 0) * 1e9
+    if jwin:
+        # The journal's exact sum closes by construction; the harness restates it.
+        jsum = jent + jpad + d["meta_kv_journal_header_bytes"] + d["meta_kv_journal_hole_bytes"]
+        pad_fraction = jpad / jdev if jdev else 0.0
+        # The pacing law: pad-majority windows at most one per window round
+        # trip (+ the deadline-ended holds, + the first); 10 % slack on the
+        # round trip's mean against the hold's own clock.
+        paced_bound = (elapsed_ns / rtt_ns * 1.1 if rtt_ns else float("inf")) + d["meta_conveyor_hold_deadlines"] + 1
+        # The strict cadence arms no hold (its committers declared latency over bytes).
+        strict = d["journal_lane_barriers_strict"] > 0
+        ok = jsum == jdev and (strict or paced <= paced_bound)
+        verdicts.append(("meta_pad_fraction_bound", ok,
+                         "journal device bytes %d ≡ entries %d + pad %d + headers %d + holes %d (%s); pad fraction %.3f over %d windows (%.2f entries/window, %d B/op); pad-majority windows %d (held %d, unshadowed %d) vs the pacing bound %.0f (= span %.1f s ÷ window rtt %.0f µs × 1.1 + %d deadline-ended holds + 1); holds %d, mean hold %.0f µs, live bound %d µs" % (
+                             jdev, jent, jpad, d["meta_kv_journal_header_bytes"], d["meta_kv_journal_hole_bytes"], "closes" if jsum == jdev else "DOES NOT CLOSE",
+                             pad_fraction, jwin, (d["meta_kv_journal_entries"] / jwin), (jdev // ops) if ops else 0,
+                             paced, d["meta_conveyor_windows_held"], d["meta_conveyor_windows_unshadowed"], paced_bound, elapsed_ns / 1e9, rtt_ns / 1e3, d["meta_conveyor_hold_deadlines"],
+                             d["meta_conveyor_holds"], hold_ns / 1e3, after["meta_conveyor_hold_bound_ns"] // 1000)))
     # 6. the solo mount's wire census.
     if meta.get("solo", True):
         verdicts.append(("solo_wire_rpcs_0", wire == 0, "wire rpcs Δ %d (%s)" % (wire, {k: d[k] for k in WIRE_RPCS if d[k]})))
@@ -602,6 +654,14 @@ def leg(args):
             "journal": {k: d[k] for k in JOURNAL},
             "fuse": {k: d[k] for k in FUSE},
             "fsync_phase_ns": fs,
+            "conveyor_phase_ns": cp,
+            "meta_write_bytes_stats": meta_write_stats,
+            "meta_write_arms": {k: d[k] for k in META_WRITE_ARMS},
+            "meta_write": {k: d[k] for k in META_WRITE},
+            "meta_pad_fraction": (jpad / jdev) if jdev else None,
+            "meta_journal_bytes_per_op": (jdev / ops) if ops else None,
+            "meta_window_rtt_ns": rtt_ns,
+            "meta_hold_ns": hold_ns,
             "daemon_cpu_ns": d["daemon_cpu_ns"],
             "misc": {k: d[k] for k in ("held_stores", "patch_writes", "hot_block_hits", "ranged_reads", "ranged_read_bytes", "read_lane_fetches", "read_lane_fetch_bytes", "prefetch_issued", "manager_verbs")},
             "posture": {"direct_device_true": after["direct_device_true"], "writer_guard_mode": after["writer_guard_mode"],
@@ -620,8 +680,22 @@ def leg(args):
         mw = sum(ds[x]["write_bytes"] for x in meta_devs if ds.get(x, {}).get("present"))
         rec["ledgers"]["device_div_user_diskstats_data"] = dw / user_w if data_devs else None
         rec["ledgers"]["device_div_user_diskstats_meta"] = mw / user_w if meta_devs else None
+        rec["ledgers"]["meta_device_div_user_stats"] = meta_write_stats / user_w
         writes = sum(ds[x]["writes"] for x in data_devs if ds.get(x, {}).get("present"))
         rec["ledgers"]["wareq_sz_diskstats_data"] = (dw // writes) if writes else 0
+    # 9. The META device's ledger closes against its namespace (§L): the two
+    #    device-write arms account for the META diskstats within 2 % (the
+    #    kernel's own flushes carry no bytes), reported as `÷ user bytes`.
+    meta_present = [x for x in meta_devs if ds.get(x, {}).get("present")]
+    if meta_present and meta_write_stats:
+        mw = sum(ds[x]["write_bytes"] for x in meta_present)
+        closure = meta_write_stats / mw if mw else 0.0
+        ok = 0.98 <= closure <= 1.02
+        rec["verdicts"].append({"check": "meta_device_div_user", "ok": ok, "detail": "META device bytes: stats %d (journal lane %d + io pool %d) vs diskstats %d (×%.4f); ÷ user bytes: stats %s, diskstats %s; journal %d B/op, pad fraction %s" % (
+            meta_write_stats, d["journal_lane_write_bytes"], d["meta_io_write_bytes"], mw, closure,
+            ("%.3f" % (meta_write_stats / user_w)) if user_w else "—", ("%.3f" % (mw / user_w)) if user_w else "—",
+            (jdev // ops) if ops else 0, ("%.3f" % (jpad / jdev)) if jdev else "—")})
+        rec["valid"] = rec["valid"] and ok
     json.dump(rec, sys.stdout, indent=1, default=str)
     sys.stdout.write("\n")
 
@@ -709,8 +783,8 @@ def markdown(rec):
         (h.get("build_a") or {}).get("raw") if h.get("a_equals_b") else "A %s / B %s" % ((h.get("build_a") or {}).get("raw"), (h.get("build_b") or {}).get("raw")), h.get("posture"),
         h.get("format_opts") or "defaults", h.get("mount_opts") or "defaults", h.get("date"), len(legs), h.get("duration_s"), h.get("warmup_s"), "→".join(l["arm"] for l in legs)))
     lines.append("")
-    lines.append("| leg | arm | %s | p50 µs | p99 µs | device÷user (stats) | device÷user (diskstats data / meta) | wareq-sz B (stats / disk) | reclaim q+e=t | admission ×user | wire rpcs | tripwires | tick rescues | valid |" % hl["name"])
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| leg | arm | %s | p50 µs | p99 µs | device÷user (stats) | device÷user (diskstats data / meta) | meta pad fraction / journal B/op / entries per window | wareq-sz B (stats / disk) | reclaim q+e=t | admission ×user | wire rpcs | tripwires | tick rescues | valid |" % hl["name"])
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for l in legs:
         m = l["metrics"]
         L = l["ledgers"]
@@ -722,10 +796,15 @@ def markdown(rec):
         ticks = sum(L["tick_rescues"].values())
         dsd = L.get("device_div_user_diskstats_data")
         dsm = L.get("device_div_user_diskstats_meta")
-        lines.append("| %s | %s | %s | %s | %s | %s | %s / %s | %s / %s | %d+%d=%d | %s | %d | %d | %d | %s |" % (
+        mw = L.get("meta_write", {})
+        jwin = mw.get("meta_kv_journal_windows", 0)
+        per_window = ("%.2f" % (L["journal"]["meta_kv_journal_entries"] / jwin)) if jwin else "—"
+        lines.append("| %s | %s | %s | %s | %s | %s | %s / %s | %s / %s / %s | %s / %s | %d+%d=%d | %s | %d | %d | %d | %s |" % (
             l["leg"], l["arm"], fmt(v), fmt(lat.get("clat_p50_ns", 0) / 1000.0) if lat else "—",
             fmt(lat.get("clat_p99_ns", 0) / 1000.0) if lat else "—",
-            fmt(L["device_div_user_stats"]), fmt(dsd), fmt(dsm), L["wareq_sz_stats"], L.get("wareq_sz_diskstats_data", "—"),
+            fmt(L["device_div_user_stats"]), fmt(dsd), fmt(dsm),
+            fmt(L.get("meta_pad_fraction")), fmt(L.get("meta_journal_bytes_per_op")), per_window,
+            L["wareq_sz_stats"], L.get("wareq_sz_diskstats_data", "—"),
             rc["block_free_reclaim_queued"], rc["block_free_reclaim_elided"], rc["terminal_frees"], adm, L["wire_rpcs"],
             L["must_stay_0"]["invariant_tripwires"], ticks, "yes" if l["valid"] else "NO"))
     # The read-amplification ledger (decision 0003 §K) for every leg that read.
@@ -767,10 +846,10 @@ def markdown(rec):
     for r in rec["invalid_reasons"]:
         for f in r["failed"]:
             lines.append("- INVALID leg %s/%s: `%s` — %s" % (r["leg"], r["arm"], f["check"], f["detail"]))
-    # The §J laws, per leg, when the row engaged them.
+    # The §J and §L laws, per leg, when the row engaged them.
     for l in legs:
         for v in l["verdicts"]:
-            if v["check"] in ("write_amplification_bound", "staged_append_bound", "journal_entries_per_append"):
+            if v["check"] in ("write_amplification_bound", "staged_append_bound", "journal_entries_per_append", "meta_pad_fraction_bound", "meta_device_div_user"):
                 lines.append("- leg %s/%s `%s` %s: %s" % (l["leg"], l["arm"], v["check"], "ok" if v["ok"] else "FAILED", v["detail"]))
     fs = legs[0]["ledgers"]["fsync_phase_ns"] if legs else None
     if fs and fs["total"]["count"]:

@@ -1810,8 +1810,13 @@ const kill_row_tree_files: usize = 1000;
 /// Files visible on B before the kill: creates, cross-owner steps and
 /// writes all in flight.
 const kill_row_kill_after: usize = 200;
-/// The storm on B for the manager's death: creates in B's own slots.
-const kill_row_storm_files: usize = 2000;
+/// The storm on B for the manager's death: creates in B's own slots, OPEN-
+/// ENDED until the row drops its stop sentinel after B's reclaim — a fixed
+/// count outlasted `T_self` (≈ 3 s) only at a Debug daemon's create rate
+/// (the ReleaseSafe gate binary creates 1,800 small files in under 2 s and
+/// the row read a completed storm as "refused before the park").
+const kill_row_storm_stop = "storm.stop";
+const kill_row_storm_count = "storm.count";
 /// How long a daemon's recovery / park / reclaim is given to show in
 /// `.stats`: `T_owner` (3 s) + the reclaim cadence (5 s) + the recovery
 /// bound (≈ 1.1 s) + the next tick, with headroom for a debug venue.
@@ -2113,14 +2118,18 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
     // row pins B's OWN writes held at the gate; the finding is recorded
     // in the evidence note). The storm's stderr names a refused op and
     // its errno (read on failure).
-    var storm_script: std.Io.Writer.Allocating = .init(gpa);
-    defer storm_script.deinit();
-    try storm_script.writer.print("cd \"$1/storm\" && i=0; while [ $i -lt {d} ]; do printf 's%s\\n' $i > s$i || {{ echo \"storm: s$i refused (rc $?)\" >&2; exit 1; }}; i=$((i + 1)); done", .{kill_row_storm_files});
+    // The storm's stop sentinel and its final count live in the rig's work
+    // dir (local paths: the storm must never walk the mount root).
+    var storm_stop_buf: [192]u8 = undefined;
+    const storm_stop_path = try std.fmt.bufPrint(&storm_stop_buf, "{s}/{s}", .{ rig.work, kill_row_storm_stop });
+    var storm_count_buf: [192]u8 = undefined;
+    const storm_count_path = try std.fmt.bufPrint(&storm_count_buf, "{s}/{s}", .{ rig.work, kill_row_storm_count });
+    const storm_script = "cd \"$1/storm\" && i=0; while [ ! -e \"$2\" ]; do printf 's%s\\n' $i > s$i || { echo \"storm: s$i refused (rc $?)\" >&2; exit 1; }; i=$((i + 1)); done; echo $i > \"$3\"";
     var storm_err_buf: [192]u8 = undefined;
     const storm_err_path = try std.fmt.bufPrint(&storm_err_buf, "{s}/storm.err", .{rig.work});
     const storm_err_file = try Io.Dir.cwd().createFile(io, storm_err_path, .{ .truncate = true });
     defer storm_err_file.close(io);
-    var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", storm_script.written(), "storm", b.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .{ .file = storm_err_file } });
+    var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", storm_script, "storm", b.mp, storm_stop_path, storm_count_path }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .{ .file = storm_err_file } });
     var seen: usize = 0;
     {
         const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
@@ -2193,17 +2202,30 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
         try testing.expect(std.mem.indexOf(u8, text, "the manager's listener moved to") != null);
         try testing.expect(std.mem.indexOf(u8, text, "admitted the reclaim") != null);
     }
+    // The storm ran through the park and the reclaim: stop it now and read
+    // how many files it created (every one of them acked, none refused).
+    {
+        const stop = try Io.Dir.cwd().createFile(io, storm_stop_path, .{ .truncate = true });
+        stop.close(io);
+    }
     const storm_term = try storm.wait(io);
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, storm_term);
+    const storm_created: usize = blk: {
+        const text = try Io.Dir.cwd().readFileAlloc(io, storm_count_path, gpa, .limited(64));
+        defer gpa.free(text);
+        break :blk try std.fmt.parseInt(usize, std.mem.trim(u8, text, " \n"), 10);
+    };
+    try testing.expect(storm_created >= kill_row_kill_after);
+    std.debug.print("smoke: kill rows (b): the storm created {d} files across the kill, the park and the reclaim\n", .{storm_created});
     // Every storm file whole on B (its own slots) AND on A (under tokens
     // from B — A's reader plane dialled B's listener afresh).
     const whole_b = try expectTreeWhole(b, "storm");
-    try testing.expectEqual(kill_row_storm_files, whole_b);
+    try testing.expectEqual(storm_created, whole_b);
     {
         const out = try rig.onMount("ls storm | wc -l; cat storm/s7");
         defer gpa.free(out);
         var want_buf: [32]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "{d}\ns7\n", .{kill_row_storm_files}), out);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "{d}\ns7\n", .{storm_created}), out);
     }
     {
         const ta = try rig.onMount("cat .stats");

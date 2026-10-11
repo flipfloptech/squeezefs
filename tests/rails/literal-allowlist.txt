@@ -271,11 +271,11 @@ src/gates/fuzz_campaign.zig:376 | 64 | a size — OWED: derive from derive.Facts
 src/gates/fuzz_campaign.zig:501 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/io/nvme_dev.zig:286 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/io/nvme_dev.zig:290 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/io/nvme_dev.zig:732 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/io/nvme_dev.zig:732 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/io/nvme_dev.zig:785 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/io/nvme_dev.zig:906 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/io/nvme_dev.zig:906 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/io/nvme_dev.zig:734 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/io/nvme_dev.zig:734 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/io/nvme_dev.zig:787 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/io/nvme_dev.zig:908 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/io/nvme_dev.zig:908 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/io/uring128.zig:119 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/io/uring_fs.zig:142 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/io/uring_fs.zig:529 | 0o755 | a file mode (POSIX permission bits)

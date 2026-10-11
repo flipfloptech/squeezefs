@@ -1,0 +1,48 @@
+1791738748.477 info(squeezefs): mem_budget: cgroup cage 17179869184 B bound by /sys/fs/cgroup/memory.max
+1791738748.483 info(squeezefs): metadata device /build/tmp/amp-brk-frag-4102886/set0-meta.img: O_DIRECT (grain 512 B from statx(STATX_DIOALIGN), buffer alignment 512 B) — every byte bypasses the host page cache
+1791738748.527 info(squeezefs): meta volume /build/tmp/amp-brk-frag-4102886/set0-meta.img: writer claim committed and barriered (id 179bc5f088a056d6, pid 4102977, mode flock+claim, pr key ccf7f9517f6a3fa6)
+1791738748.531 info(squeezefs): meta volume /build/tmp/amp-brk-frag-4102886/set0-meta.img: appender 0 Live as the manager (term 1, node 0xb60598a56bfecf4a, mount slot 0); 0 other appender(s) live on the directory
+1791738748.532 info(squeezefs): meta volume /build/tmp/amp-brk-frag-4102886/set0-meta.img: slot leases armed — M 64, A_max 262144 B, 65 leases held, T_idle 45000 ms, N_floor 17
+1791738748.533 info(squeezefs): meta volume /build/tmp/amp-brk-frag-4102886/set0-meta.img: mounted — ledger seq 1, tail 0, replayed 0 entries (0 content records, 0 torn dropped, clean unmount), next_ino 2, 2 trees, 8059/8062 extents free, coalesced cadence, guard flock+claim
+1791738748.535 info(squeezefs): metadata set 2c74a2d9…: 1 member(s) mounted in canonical order as manager, epoch 1, 0 dual claim(s) converged, native keyspace on member 0
+1791738748.539 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data0.img: write cache file-backed
+1791738748.540 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data1.img: write cache file-backed
+1791738748.540 info(squeezefs): mount: set config
+  set config generation 1; block 4194304 B; chunk 4194304 B; capacity 12868124672 B (12272 MiB); compression none; encryption none
+  data volumes 2 (VOLUME_LIFECYCLE: the set has diverged from its birth state)
+    vol-15eba5e8bf30a2ce active /build/tmp/amp-brk-frag-4102886/set0-data0.img 1534 blocks (6136 MiB) device f2f302a6-5732-090d-cd2d-93174d1a522b
+    vol-d663154c8ebf6117 active /build/tmp/amp-brk-frag-4102886/set0-data1.img 1534 blocks (6136 MiB) device f39b7458-a1dc-2d34-1285-062a6d151468
+  cache-less (no disk cache paths)
+1791738748.541 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data0.img: write cache file-backed
+1791738748.541 info(squeezefs): data volume tag 15eba5e8bf30a2ce: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791738748.541 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data0.img: vol-15eba5e8bf30a2ce bound as ordinal 0: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791738748.541 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data1.img: write cache file-backed
+1791738748.541 info(squeezefs): data volume tag d663154c8ebf6117: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791738748.541 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data1.img: vol-d663154c8ebf6117 bound as ordinal 1: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791738748.544 info(squeezefs): data plane: the set declares NO cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max (4096 B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)
+1791738748.544 info(squeezefs): data plane: 2 data volume(s), block 4194304 B, chunk 4194304 B, inline_max 4096 B, inline map cap 1364 entries, map chunk 512 ops, sweep threshold 32768 blocks, transform none/none, staging off, NVMe tier off, direct-store face pending the session
+1791738748.546 info(squeezefs): cluster wire: listening at 192.168.64.47:45245 (cap 144 connections)
+1791738748.546 info(squeezefs): cluster wire: manager of 1 volume(s) listening at 192.168.64.47:45245; membership owner term 1 (T_owner 45000 ms, grace closed)
+1791738748.548 info(squeezefs): data planes: the grant plane armed as the HOLDER of 2 data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)
+1791738748.552 info(squeezefs): job fabric: 0 job(s) adopted; 2 local worker(s), default throttle 100 %, verify 1000 ‰ (plaintext pins 1000), fleet jobs on; the admin lane on the listener
+1791738748.552 info(squeezefs): transport probe: kmbuf_ops=38/39
+1791738748.553 info(squeezefs): transport probe: RELEASE_PAYLOAD(commit_id=MAX) → -107 ⇒ retention present
+1791738748.553 info(squeezefs): kv_fs: FUSE 7.36; KILLPRIV_V2 negotiated; inline_max 4096 B; block 4194304 B; data volumes yes; staging off
+1791738748.553 info(squeezefs): transport: INIT 7.45 → 7.36: flags 0x4000020050c4e829 (over_io_uring=true, time_limits=true), max_write 1048576, max_pages 256, max_background 288, queues 9 × depth 32, payload 1048576 B, 9 drain group(s) (width 1), buffer mode zero_copy (kmbuf 38, retention present)
+1791738748.557 info(squeezefs): transport: group 0 (qids 0..0, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.562 info(squeezefs): transport: group 1 (qids 1..1, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.570 info(squeezefs): transport: group 2 (qids 2..2, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.577 info(squeezefs): transport: group 3 (qids 3..3, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.593 info(squeezefs): transport: group 4 (qids 4..4, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.597 info(squeezefs): transport: group 5 (qids 5..5, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.601 info(squeezefs): transport: group 6 (qids 6..6, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.605 info(squeezefs): transport: group 7 (qids 7..7, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.610 info(squeezefs): transport: group 8 (qids 8..8, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791738748.610 info(squeezefs): transport: FUSE-over-io_uring transport armed at /build/tmp/amp-brk-frag-4102886/mnt: 9 queue(s) × 32 ent(s) over 9 worker(s), zero_copy
+1791738748.610 info(squeezefs): data plane: session armed — held-slot direct store ON, direct device leg ON, fd-source probe serve ON
+1791738748.611 info(squeezefs): ready: sqmeta:///build/tmp/amp-brk-frag-4102886/set0-meta.img mounted at /build/tmp/amp-brk-frag-4102886/mnt (pid 4102977; 9 queue(s) × depth 32; budget 6144 MiB; TTLs attr 1000 ms entry 1000 ms dir_entry 1000 ms negative 1000 ms)
+1791738826.374 info(squeezefs): stop requested (SIGTERM/SIGINT): unmounting /build/tmp/amp-brk-frag-4102886/mnt
+1791738826.486 info(squeezefs): teardown: session closed; open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0
+1791738826.489 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data0.img: dismount teardown completed; further DMA refused (EROFS class)
+1791738826.489 info(squeezefs): data volume /build/tmp/amp-brk-frag-4102886/set0-data1.img: dismount teardown completed; further DMA refused (EROFS class)
+1791738826.539 info(squeezefs): meta volume /build/tmp/amp-brk-frag-4102886/set0-meta.img: clean unmount (checkpoint seq 78, tail 256494256, head 256494256, healthy)

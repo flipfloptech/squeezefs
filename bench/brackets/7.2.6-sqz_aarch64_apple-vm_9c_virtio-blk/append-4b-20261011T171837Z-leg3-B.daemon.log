@@ -1,0 +1,138 @@
+1791739272.959 info(squeezefs): mem_budget: cgroup cage 17179869184 B bound by /sys/fs/cgroup/memory.max
+1791739272.973 info(squeezefs): metadata device /build/tmp/amp-brk-ap-4104234/set0-meta.img: O_DIRECT (grain 512 B from statx(STATX_DIOALIGN), buffer alignment 512 B) — every byte bypasses the host page cache
+1791739273.679 info(squeezefs): meta volume /build/tmp/amp-brk-ap-4104234/set0-meta.img: writer claim committed and barriered (id da4fe4f7017673a9, pid 4104918, mode flock+claim, pr key 0ee8c8ee89df0ba6)
+1791739273.684 info(squeezefs): meta volume /build/tmp/amp-brk-ap-4104234/set0-meta.img: appender 0 Live as the manager (term 3, node 0xb60598a56bfecf4a, mount slot 0); 0 other appender(s) live on the directory
+1791739273.684 info(squeezefs): meta volume /build/tmp/amp-brk-ap-4104234/set0-meta.img: slot leases armed — M 64, A_max 262144 B, 65 leases held, T_idle 45000 ms, N_floor 17
+1791739273.687 info(squeezefs): meta volume /build/tmp/amp-brk-ap-4104234/set0-meta.img: mounted — ledger seq 159, tail 377155760, replayed 0 entries (0 content records, 0 torn dropped, clean unmount), next_ino 2, 23 trees, 8038/8062 extents free, coalesced cadence, guard flock+claim
+1791739273.690 info(squeezefs): metadata set ae4e25ad…: 1 member(s) mounted in canonical order as manager, epoch 1, 0 dual claim(s) converged, native keyspace on member 0
+1791739273.690 debug(squeezefs): NvmeBlockDev lane 0 (/build/tmp/amp-brk-ap-4104234/set0-data0.img): ring rung single_issuer+defer_taskrun
+1791739273.701 debug(squeezefs): NvmeBlockDev lane 0: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791739273.701 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data0.img: write cache file-backed
+1791739273.702 debug(squeezefs): NvmeBlockDev lane 1 (/build/tmp/amp-brk-ap-4104234/set0-data1.img): ring rung single_issuer+defer_taskrun
+1791739273.702 debug(squeezefs): NvmeBlockDev lane 1: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791739273.702 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data1.img: write cache file-backed
+1791739273.703 info(squeezefs): mount: set config
+  set config generation 1; block 4194304 B; chunk 4194304 B; capacity 12868124672 B (12272 MiB); compression none; encryption none
+  data volumes 2 (VOLUME_LIFECYCLE: the set has diverged from its birth state)
+    vol-6c93c556fe42ab0b active /build/tmp/amp-brk-ap-4104234/set0-data0.img 1534 blocks (6136 MiB) device ca35e726-c948-d9b0-c0ac-eac3c2ab995f
+    vol-284cab62cc72b67a active /build/tmp/amp-brk-ap-4104234/set0-data1.img 1534 blocks (6136 MiB) device 630d420d-653f-01d0-f83b-ba369c763674
+  disk cache paths 1: /build/tmp/amp-brk-ap-4104234/cache-0
+1791739273.703 debug(squeezefs): NvmeBlockDev lane 2 (/build/tmp/amp-brk-ap-4104234/set0-data0.img): ring rung single_issuer+defer_taskrun
+1791739273.704 debug(squeezefs): NvmeBlockDev lane 2: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791739273.704 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data0.img: write cache file-backed
+1791739273.704 info(squeezefs): data volume tag 6c93c556fe42ab0b: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791739273.704 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data0.img: vol-6c93c556fe42ab0b bound as ordinal 0: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791739273.705 debug(squeezefs): NvmeBlockDev lane 3 (/build/tmp/amp-brk-ap-4104234/set0-data1.img): ring rung single_issuer+defer_taskrun
+1791739273.705 debug(squeezefs): NvmeBlockDev lane 3: registered read-bounce slab (36 MiB) as fixed buffer 0
+1791739273.705 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data1.img: write cache file-backed
+1791739273.705 info(squeezefs): data volume tag 284cab62cc72b67a: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791739273.705 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data1.img: vol-284cab62cc72b67a bound as ordinal 1: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791739273.755 info(squeezefs): staging ring /build/tmp/amp-brk-ap-4104234/cache-0/staging_segment/seg-0: 768 MiB, recovered 0 record(s) (0 B), 0 torn, 0 superseded
+1791739274.175 info(squeezefs): data plane: 2 data volume(s), block 4194304 B, chunk 4194304 B, inline_max 4096 B, inline map cap 1364 entries, map chunk 512 ops, sweep threshold 32768 blocks, transform none/none, staging ON, NVMe tier ON, direct-store face pending the session
+1791739274.179 info(squeezefs): cluster wire: listening at 192.168.64.47:39229 (cap 144 connections)
+1791739274.180 info(squeezefs): cluster wire: manager of 1 volume(s) listening at 192.168.64.47:39229; membership owner term 3 (T_owner 45000 ms, grace closed)
+1791739274.182 info(squeezefs): data planes: the grant plane armed as the HOLDER of 2 data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)
+1791739274.190 info(squeezefs): job fabric: 0 job(s) adopted; 2 local worker(s), default throttle 100 %, verify 1000 ‰ (plaintext pins 1000), fleet jobs on; the admin lane on the listener
+1791739274.191 info(squeezefs): transport probe: kmbuf_ops=38/39
+1791739274.191 info(squeezefs): transport probe: RELEASE_PAYLOAD(commit_id=MAX) → -107 ⇒ retention present
+1791739274.191 info(squeezefs): kv_fs: FUSE 7.36; KILLPRIV_V2 negotiated; inline_max 4096 B; block 4194304 B; data volumes yes; staging on
+1791739274.191 info(squeezefs): transport: INIT 7.45 → 7.36: flags 0x4000020050c4e829 (over_io_uring=true, time_limits=true), max_write 1048576, max_pages 256, max_background 288, queues 9 × depth 32, payload 1048576 B, 9 drain group(s) (width 1), buffer mode zero_copy (kmbuf 38, retention present)
+1791739274.270 info(squeezefs): transport: group 0 (qids 0..0, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.279 info(squeezefs): transport: group 1 (qids 1..1, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.298 info(squeezefs): transport: group 2 (qids 2..2, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.316 info(squeezefs): transport: group 3 (qids 3..3, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.321 info(squeezefs): transport: group 4 (qids 4..4, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.331 info(squeezefs): transport: group 5 (qids 5..5, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.338 info(squeezefs): transport: group 6 (qids 6..6, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.344 info(squeezefs): transport: group 7 (qids 7..7, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.350 info(squeezefs): transport: group 8 (qids 8..8, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791739274.351 info(squeezefs): transport: FUSE-over-io_uring transport armed at /build/tmp/amp-brk-ap-4104234/mnt: 9 queue(s) × 32 ent(s) over 9 worker(s), zero_copy
+1791739274.351 info(squeezefs): data plane: session armed — held-slot direct store ON, direct device leg ON, fd-source probe serve ON
+1791739274.353 info(squeezefs): ready: sqmeta:///build/tmp/amp-brk-ap-4104234/set0-meta.img mounted at /build/tmp/amp-brk-ap-4104234/mnt (pid 4104918; 9 queue(s) × depth 32; budget 6144 MiB; TTLs attr 1000 ms entry 1000 ms dir_entry 1000 ms negative 1000 ms)
+1791739274.708 debug(squeezefs): checkpoint tail 377158296 < head 379071624: inflight 379103200, dying floors 377158296, dirty node floor 379087400
+1791739275.352 warning(squeezefs): mem_budget: unreclaimable 8576187176 B >= 95% of the 6442450944 B budget — disk-tier publishes paused
+1791739275.720 debug(squeezefs): checkpoint tail 379087400 < head 388792000: inflight 18446744073709551615, dying floors 379087400, dirty node floor 388792512
+1791739276.724 debug(squeezefs): checkpoint tail 388792512 < head 391503952: inflight 391507512, dying floors 388792512, dirty node floor 391503952
+1791739277.353 warning(squeezefs): mem_budget: HARD BACKSTOP — unreclaimable 8780515392 B >= the full 6442450944 B budget for 3 consecutive ticks; Red sheds escalate to component floors until the pressure recedes
+1791739277.728 debug(squeezefs): checkpoint tail 391503952 < head 393925280: inflight 18446744073709551615, dying floors 391503952, dirty node floor 393925768
+1791739278.733 debug(squeezefs): checkpoint tail 393925768 < head 395932264: inflight 18446744073709551615, dying floors 393925768, dirty node floor 395933776
+1791739279.738 debug(squeezefs): checkpoint tail 395933776 < head 398377488: inflight 18446744073709551615, dying floors 395933776, dirty node floor 398378000
+1791739280.743 debug(squeezefs): checkpoint tail 398378000 < head 400600288: inflight 18446744073709551615, dying floors 398378000, dirty node floor 400600800
+1791739281.751 debug(squeezefs): checkpoint tail 400601312 < head 402292216: inflight 402294752, dying floors 400601312, dirty node floor 402292216
+1791739282.760 debug(squeezefs): checkpoint tail 402292216 < head 404411680: inflight 404415240, dying floors 402292216, dirty node floor 404411680
+1791739283.768 debug(squeezefs): checkpoint tail 404411680 < head 406094952: inflight 406098512, dying floors 404411680, dirty node floor 406095976
+1791739284.792 debug(squeezefs): checkpoint tail 406095976 < head 407305360: inflight 18446744073709551615, dying floors 406095976, dirty node floor 18446744073709551615
+1791739287.849 debug(squeezefs): checkpoint tail 407305872 < head 418102256: inflight 418107864, dying floors 407305872, dirty node floor 418104816
+1791739288.905 debug(squeezefs): checkpoint tail 418104816 < head 420946048: inflight 420956216, dying floors 418104816, dirty node floor 420948072
+1791739289.956 debug(squeezefs): checkpoint tail 420953680 < head 423651368: inflight 18446744073709551615, dying floors 420953680, dirty node floor 423652392
+1791739291.010 debug(squeezefs): checkpoint tail 423652392 < head 425959192: inflight 18446744073709551615, dying floors 423652392, dirty node floor 425959704
+1791739291.370 info(squeezefs): mem_budget: unreclaimable pressure receded — disk-tier publishes resume
+1791739291.370 info(squeezefs): mem_budget: hard backstop released
+1791739292.017 debug(squeezefs): checkpoint tail 425959704 < head 428164168: inflight 428168240, dying floors 425959704, dirty node floor 428164168
+1791739293.093 debug(squeezefs): checkpoint tail 428164168 < head 430444488: inflight 430448560, dying floors 428164168, dirty node floor 430444488
+1791739294.156 debug(squeezefs): checkpoint tail 430444488 < head 431430936: inflight 18446744073709551615, dying floors 430444488, dirty node floor 431430936
+1791739295.209 debug(squeezefs): checkpoint tail 431430936 < head 432468272: inflight 432471832, dying floors 431430936, dirty node floor 432468784
+1791739296.265 debug(squeezefs): checkpoint tail 432468784 < head 433481688: inflight 433487808, dying floors 432468784, dirty node floor 433481688
+1791739297.319 debug(squeezefs): checkpoint tail 433481688 < head 435096248: inflight 435098784, dying floors 433481688, dirty node floor 435096760
+1791739298.338 debug(squeezefs): checkpoint tail 435096760 < head 436468512: inflight 436473608, dying floors 435096760, dirty node floor 436468512
+1791739299.391 debug(squeezefs): checkpoint tail 436468512 < head 437903368: inflight 18446744073709551615, dying floors 436468512, dirty node floor 437903575
+1791739300.399 debug(squeezefs): checkpoint tail 437903575 < head 439269024: inflight 439273096, dying floors 437903575, dirty node floor 439269536
+1791739301.454 debug(squeezefs): checkpoint tail 439270048 < head 440683032: inflight 18446744073709551615, dying floors 439270048, dirty node floor 440684056
+1791739302.506 debug(squeezefs): checkpoint tail 440684056 < head 442061392: inflight 18446744073709551615, dying floors 440684056, dirty node floor 442061904
+1791739303.560 debug(squeezefs): checkpoint tail 442061904 < head 443431120: inflight 443435704, dying floors 442061904, dirty node floor 443431632
+1791739304.615 debug(squeezefs): checkpoint tail 443431632 < head 444805408: inflight 444810504, dying floors 443431632, dirty node floor 444805408
+1791739305.669 debug(squeezefs): checkpoint tail 444805408 < head 446157824: inflight 18446744073709551615, dying floors 444805408, dirty node floor 446158336
+1791739306.675 debug(squeezefs): checkpoint tail 446158336 < head 447423216: inflight 18446744073709551615, dying floors 446158336, dirty node floor 447423704
+1791739307.683 debug(squeezefs): checkpoint tail 447423704 < head 448585760: inflight 448590856, dying floors 447423704, dirty node floor 448586272
+1791739308.688 debug(squeezefs): checkpoint tail 448586272 < head 449820088: inflight 18446744073709551615, dying floors 448586272, dirty node floor 449820088
+1791739310.703 debug(squeezefs): checkpoint tail 450975512 < head 452579368: inflight 18446744073709551615, dying floors 450975512, dirty node floor 452580392
+1791739311.779 debug(squeezefs): checkpoint tail 452581416 < head 453529680: inflight 18446744073709551615, dying floors 452581416, dirty node floor 453530704
+1791739312.831 debug(squeezefs): checkpoint tail 453530704 < head 454371048: inflight 18446744073709551615, dying floors 453530704, dirty node floor 454371048
+1791739313.878 debug(squeezefs): checkpoint tail 454372072 < head 455266888: inflight 455272496, dying floors 454372072, dirty node floor 455267400
+1791739314.924 debug(squeezefs): checkpoint tail 455267607 < head 456539400: inflight 18446744073709551615, dying floors 455267607, dirty node floor 456539912
+1791739315.978 debug(squeezefs): checkpoint tail 456539912 < head 457691776: inflight 18446744073709551615, dying floors 456539912, dirty node floor 457692288
+1791739317.032 debug(squeezefs): checkpoint tail 457692288 < head 458878752: inflight 458882824, dying floors 457692288, dirty node floor 458879776
+1791739318.084 debug(squeezefs): checkpoint tail 458879776 < head 460004160: inflight 460008232, dying floors 458879776, dirty node floor 460004160
+1791739319.138 debug(squeezefs): checkpoint tail 460004160 < head 461152976: inflight 461156024, dying floors 460004160, dirty node floor 461153488
+1791739320.191 debug(squeezefs): checkpoint tail 461154695 < head 462281432: inflight 462286016, dying floors 461154695, dirty node floor 462281944
+1791739321.224 debug(squeezefs): checkpoint tail 462281944 < head 463064768: inflight 18446744073709551615, dying floors 462281944, dirty node floor 463064768
+1791739322.275 debug(squeezefs): checkpoint tail 463072400 < head 464178984: inflight 464183056, dying floors 463072400, dirty node floor 464178984
+1791739323.328 debug(squeezefs): checkpoint tail 464179984 < head 465276376: inflight 465277912, dying floors 464179984, dirty node floor 465276376
+1791739324.382 debug(squeezefs): checkpoint tail 465276376 < head 466359528: inflight 466363600, dying floors 465276376, dirty node floor 466360552
+1791739325.435 debug(squeezefs): checkpoint tail 466362088 < head 467454896: inflight 18446744073709551615, dying floors 466362088, dirty node floor 467454896
+1791739326.486 debug(squeezefs): checkpoint tail 467454896 < head 468556896: inflight 18446744073709551615, dying floors 467454896, dirty node floor 468556896
+1791739327.489 debug(squeezefs): checkpoint tail 468558103 < head 469943912: inflight 18446744073709551615, dying floors 468558103, dirty node floor 469943912
+1791739328.497 debug(squeezefs): checkpoint tail 469943912 < head 471391496: inflight 18446744073709551615, dying floors 469943912, dirty node floor 471393544
+1791739329.502 debug(squeezefs): checkpoint tail 471397104 < head 472856416: inflight 18446744073709551615, dying floors 471397104, dirty node floor 472856416
+1791739330.506 debug(squeezefs): checkpoint tail 472856416 < head 474336064: inflight 474337600, dying floors 472856416, dirty node floor 474337088
+1791739331.512 debug(squeezefs): checkpoint tail 474337600 < head 475798936: inflight 475800984, dying floors 474337600, dirty node floor 475798936
+1791739332.522 debug(squeezefs): checkpoint tail 475798936 < head 477136600: inflight 477138624, dying floors 475798936, dirty node floor 477136600
+1791739333.528 debug(squeezefs): checkpoint tail 477136600 < head 478539392: inflight 18446744073709551615, dying floors 477136600, dirty node floor 478540416
+1791739334.535 debug(squeezefs): checkpoint tail 478540416 < head 479853624: inflight 18446744073709551615, dying floors 478540416, dirty node floor 479853624
+1791739335.542 debug(squeezefs): checkpoint tail 479853624 < head 481107800: inflight 18446744073709551615, dying floors 479853624, dirty node floor 481108312
+1791739336.550 debug(squeezefs): checkpoint tail 481108824 < head 482003640: inflight 18446744073709551615, dying floors 481108824, dirty node floor 482004152
+1791739337.561 debug(squeezefs): checkpoint tail 482004152 < head 483243064: inflight 483245088, dying floors 482004152, dirty node floor 483243064
+1791739338.568 debug(squeezefs): checkpoint tail 483243064 < head 484381176: inflight 18446744073709551615, dying floors 483243064, dirty node floor 484381688
+1791739339.600 debug(squeezefs): checkpoint tail 484381688 < head 485073928: inflight 18446744073709551615, dying floors 484381688, dirty node floor 485073928
+1791739340.631 debug(squeezefs): checkpoint tail 485074440 < head 485742760: inflight 18446744073709551615, dying floors 485074440, dirty node floor 485743272
+1791739341.664 debug(squeezefs): checkpoint tail 485744296 < head 486518488: inflight 18446744073709551615, dying floors 485744296, dirty node floor 486518488
+1791739343.695 debug(squeezefs): checkpoint tail 487314040 < head 488166112: inflight 18446744073709551615, dying floors 487314040, dirty node floor 488166112
+1791739344.705 debug(squeezefs): checkpoint tail 488166112 < head 489299152: inflight 18446744073709551615, dying floors 488166112, dirty node floor 489299664
+1791739346.727 debug(squeezefs): checkpoint tail 490410808 < head 491517880: inflight 18446744073709551615, dying floors 490410808, dirty node floor 491518392
+1791739347.783 debug(squeezefs): checkpoint tail 491519392 < head 491901160: inflight 18446744073709551615, dying floors 491519392, dirty node floor 18446744073709551615
+1791739349.505 info(squeezefs): transport: readdir class probed paged by its first bridge
+1791739349.517 info(squeezefs): stop requested (SIGTERM/SIGINT): unmounting /build/tmp/amp-brk-ap-4104234/mnt
+1791739349.518 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.518 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.519 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.519 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.519 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.520 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.520 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.520 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.520 debug(squeezefs): transport: kmbuf ring unregister (opcode 39) answered Busy — the FUSE pin releases with the ring fd
+1791739349.529 info(squeezefs): dismount promotion: 0 staged file(s) (0 B) promoted, 0 failed
+1791739349.534 info(squeezefs): teardown: session closed; open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0
+1791739349.921 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data0.img: dismount teardown completed; further DMA refused (EROFS class)
+1791739349.921 info(squeezefs): data volume /build/tmp/amp-brk-ap-4104234/set0-data1.img: dismount teardown completed; further DMA refused (EROFS class)
+1791739351.936 info(squeezefs): meta volume /build/tmp/amp-brk-ap-4104234/set0-meta.img: clean unmount (checkpoint seq 237, tail 491908792, head 491908792, healthy)

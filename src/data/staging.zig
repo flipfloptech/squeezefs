@@ -267,10 +267,33 @@ pub const RecordHeader = struct {
     }
 };
 
+/// The checksum's streaming state over the VALUE (`xxh3` consumes the value
+/// FIRST, the key and the header LAST): an in-place append extends the
+/// state by the appended bytes and finishes it — O(appended), never a
+/// rehash of a 4 MiB image per 4-byte append. The live cell keeps the state.
+pub const ValueHash = std.hash.XxHash3;
+
+pub fn valueHash(value: []const u8) ValueHash {
+    var h = ValueHash.init(0);
+    h.update(value);
+    return h;
+}
+
+/// Finish the record checksum from the value's state: `xxh3(value ‖ key ‖
+/// header[0..32] ‖ 0⁸)` (the checksum field hashed as zeros).
+fn finishChecksum(state: *const ValueHash, header: []const u8, key: []const u8) u64 {
+    var h = state.*;
+    h.update(key);
+    h.update(header[0..CHECKSUM_OFF]);
+    const zeros: [8]u8 = @splat(0);
+    h.update(&zeros);
+    return h.final();
+}
+
 /// Write `header A ‖ key ‖ zero pad (slot B cleared) ‖ value` at `rec_off`
 /// and stamp the checksum. The caller reserved `≥ stride(key.len,
-/// value.len)` bytes.
-pub fn writeRecord(image: []u8, rec_off: u64, key: []const u8, value: []const u8, generation: u64, fencing: u64) void {
+/// value.len)` bytes; `state` is `valueHash(value)`.
+pub fn writeRecord(image: []u8, rec_off: u64, key: []const u8, value: []const u8, generation: u64, fencing: u64, state: *const ValueHash) void {
     const voff = valueOffset(key.len);
     assert(rec_off + voff + value.len <= image.len);
     assert(derive.isAligned(rec_off, RECORD_ALIGN));
@@ -278,13 +301,12 @@ pub fn writeRecord(image: []u8, rec_off: u64, key: []const u8, value: []const u8
     @memcpy(rec[RECORD_HEADER_LEN..][0..key.len], key);
     @memset(rec[RECORD_HEADER_LEN + key.len .. @intCast(voff)], 0);
     @memcpy(rec[@intCast(voff)..][0..value.len], value);
-    writeHeader(image, rec_off, .a, key, value.len, generation, fencing);
+    writeHeader(image, rec_off, .a, key, value.len, generation, fencing, state);
 }
 
-/// Write one header slot (the checksum over header ‖ key ‖ value[0..val_len]
-/// stamped last); the other slot is untouched.
-fn writeHeader(image: []u8, rec_off: u64, slot: HeaderSlot, key: []const u8, val_len: usize, generation: u64, fencing: u64) void {
-    const voff = valueOffset(key.len);
+/// Write one header slot (the checksum from the value's state, stamped
+/// last); the other slot is untouched.
+fn writeHeader(image: []u8, rec_off: u64, slot: HeaderSlot, key: []const u8, val_len: usize, generation: u64, fencing: u64, state: *const ValueHash) void {
     var h: SegmentRecordWire = .{ .magic = SEGMENT_MAGIC, .version_le = undefined, .flags_le = .{ 0, 0 }, .key_len_le = undefined, .val_len_le = undefined, .generation_le = undefined, .fencing_le = undefined, .xxh3_le = @splat(0) };
     std.mem.writeInt(u16, &h.version_le, SEGMENT_RECORD_VERSION, .little);
     std.mem.writeInt(u32, &h.key_len_le, @intCast(key.len), .little);
@@ -294,17 +316,12 @@ fn writeHeader(image: []u8, rec_off: u64, slot: HeaderSlot, key: []const u8, val
     const rec = image[@intCast(rec_off)..];
     const hdr = rec[@intCast(slot.offset())..][0..RECORD_HEADER_LEN];
     hdr.* = std.mem.toBytes(h);
-    std.mem.writeInt(u64, hdr[CHECKSUM_OFF..][0..8], recordChecksum(hdr, key, rec[@intCast(voff)..][0..val_len]), .little);
+    std.mem.writeInt(u64, hdr[CHECKSUM_OFF..][0..8], finishChecksum(state, hdr, key), .little);
 }
 
 fn recordChecksum(header: []const u8, key: []const u8, value: []const u8) u64 {
-    var h = std.hash.XxHash3.init(0);
-    h.update(header[0..CHECKSUM_OFF]);
-    const zeros: [8]u8 = @splat(0);
-    h.update(&zeros);
-    h.update(key);
-    h.update(value);
-    return h.final();
+    const state = valueHash(value);
+    return finishChecksum(&state, header, key);
 }
 
 /// Parse slot A's header at `rec_off`: magic, version, zero flags, a
@@ -429,6 +446,10 @@ const Cell = struct {
     shadowed: bool = false,
     extent: Extent = undefined,
     key: [KEY_LEN]u8 = undefined,
+    /// The value's checksum state (`valueHash` over `[0, val_len)`): the
+    /// append extends it. Null for a recovered record until its first
+    /// append rehashes the value once.
+    hash: ?*ValueHash = null,
 };
 
 pub const PutError = error{
@@ -439,6 +460,7 @@ pub const PutError = error{
 };
 
 pub const AppendError = error{
+    OutOfMemory,
     /// No resident copy under the key.
     NotResident,
     /// The resident copy's generation is not the one the caller read.
@@ -488,6 +510,7 @@ pub const Segment = struct {
     }
 
     pub fn deinit(self: *Segment) void {
+        for (self.cells) |*c| if (c.hash) |h| self.gpa.destroy(h);
         self.index.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.free_cells.deinit(self.gpa);
@@ -580,13 +603,15 @@ pub const Segment = struct {
             break :blk e;
         };
         stats.staged_writes_in_flight.add(1);
-        writeRecord(self.image, placed.rec_off, key.bytes(), value, generation, fencing);
+        const state = try self.gpa.create(ValueHash);
+        state.* = valueHash(value);
+        writeRecord(self.image, placed.rec_off, key.bytes(), value, generation, fencing, state);
         if (self.backing.sync) |s| s(self.backing.ctx, placed.rec_off, stride(KEY_LEN, value.len));
         self.lock.lock();
         defer self.lock.unlock();
         self.dropPendingLocked(placed.rec_off);
         const cell = self.allocCellLocked();
-        cell.* = .{ .refs = .init(1), .extent = placed, .key = key.bytes().* };
+        cell.* = .{ .refs = .init(1), .extent = placed, .key = key.bytes().*, .hash = state };
         const gop = self.index.getOrPutAssumeCapacity(key.bytes().*);
         if (gop.found_existing) {
             const old = gop.value_ptr.*;
@@ -626,8 +651,14 @@ pub const Segment = struct {
         // still verifies over [0, val_len)).
         @memset(self.image[voff + ext.val_len .. voff + @as(usize, @intCast(at))], 0);
         @memcpy(self.image[voff + @as(usize, @intCast(at)) ..][0..data.len], data);
+        // The checksum state extends by exactly the new bytes (a recovered
+        // record hashes its value once, here).
+        const state = try self.gpa.create(ValueHash);
+        errdefer self.gpa.destroy(state);
+        state.* = if (old.hash) |h| h.* else valueHash(self.image[voff .. voff + ext.val_len]);
+        state.update(self.image[voff + ext.val_len .. voff + new_len]);
         const slot = ext.slot.other();
-        writeHeader(self.image, ext.rec_off, slot, key.bytes(), new_len, generation, fencing);
+        writeHeader(self.image, ext.rec_off, slot, key.bytes(), new_len, generation, fencing, state);
         if (self.backing.sync) |s| {
             s(self.backing.ctx, ext.rec_off, RECORD_ALIGN);
             const tail_lo = derive.alignDown(ext.valOff() + ext.val_len, RECORD_ALIGN);
@@ -640,6 +671,7 @@ pub const Segment = struct {
         if (old.retired.load(.acquire)) {
             // Unlinked or promoted meanwhile: the bytes we grew belong to a
             // record that is gone; drop the lease (the last one reclaims).
+            self.gpa.destroy(state);
             if (old.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(old);
             return error.Stale;
         }
@@ -648,7 +680,7 @@ pub const Segment = struct {
         ne.val_len = @intCast(new_len);
         ne.generation = generation;
         ne.slot = slot;
-        cell.* = .{ .refs = .init(1), .extent = ne, .key = key.bytes().* };
+        cell.* = .{ .refs = .init(1), .extent = ne, .key = key.bytes().*, .hash = state };
         self.index.putAssumeCapacity(key.bytes().*, cell);
         old.shadowed = true;
         old.retired.store(true, .release);
@@ -695,6 +727,7 @@ pub const Segment = struct {
         const e = cell.extent;
         // A shadowed cell's bytes live on under its successor: free the cell alone.
         if (!cell.shadowed) if (self.backing.reclaim) |r| r(self.backing.ctx, e.rec_off, e.end() - e.rec_off);
+        if (cell.hash) |h| self.gpa.destroy(h);
         cell.* = .{};
         const idx: usize = (@intFromPtr(cell) - @intFromPtr(self.cells.ptr)) / @sizeOf(Cell);
         self.free_cells.appendAssumeCapacity(@intCast(idx));
@@ -1076,6 +1109,7 @@ pub fn appendStaged(pool: *Pool, seg: *Segment, key: StagingKey, at: u64, data: 
     const generation = pool.nextGeneration();
     seg.appendInPlace(key, at, data, resident, generation, fencing) catch |e| switch (e) {
         error.NotResident, error.Stale, error.NoRoom => return null,
+        error.OutOfMemory => return error.OutOfMemory,
     };
     const cost = pool.costOf(key.file_id) orelse 0;
     try pool.charge(key.file_id, cost, generation);
@@ -1603,7 +1637,8 @@ test "segment record v2: 40 B header {SQZS, version 2, flags 0, key_len, val_len
     var image: [16384]u8 = @splat(0xEE);
     const k = tkey(1, 77);
     const v: [100]u8 = @splat(0x5A);
-    writeRecord(&image, 4096, k.bytes(), &v, 9, 0xF0F0);
+    const vst = valueHash(&v);
+    writeRecord(&image, 4096, k.bytes(), &v, 9, 0xF0F0, &vst);
     try testing.expectEqualSlices(u8, "SQZS", image[4096..4100]);
     try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, image[4100..4104]);
     try testing.expect(readHeaderAt(&image, 4096, .b) == null); // slot B cleared at the put
@@ -1746,7 +1781,8 @@ test "in-place append (§J.2): the appended bytes land in the reserved slack and
     // A kill mid-append: the alternate slot (B, gen 4) half-written — a bad
     // checksum — loses to the intact A; the old length stands, nothing torn
     // is adopted, the record is NOT counted torn (one slot verifies).
-    writeHeader(r.image, rec_off, .b, k.bytes(), 5300, 4, 0);
+    const hst = valueHash(r.image[@intCast(rec_off + valueOffset(KEY_LEN))..][0..5300]);
+    writeHeader(r.image, rec_off, .b, k.bytes(), 5300, 4, 0, &hst);
     r.image[@intCast(rec_off + HEADER_B_OFF + CHECKSUM_OFF)] ^= 0xFF;
     var again = try Segment.init(gpa, r.image, .none);
     const rep2 = again.recover();
@@ -1855,7 +1891,8 @@ test "recovery scan: the true geometry survives (every live record adopted, byte
     var seg = r.seg;
     // A value that CONTAINS a plausible record header at a grain boundary.
     var decoy: [3 * 4096]u8 = @splat(0x11);
-    writeRecord(decoy[4096..], 0, tkey(0xAA, 1).bytes(), "decoy", 777, 0);
+    const dst = valueHash("decoy");
+    writeRecord(decoy[4096..], 0, tkey(0xAA, 1).bytes(), "decoy", 777, 0, &dst);
     try seg.put(tkey(1, 10), &decoy, 1, 0, 0);
     const v2: [100]u8 = @splat(2);
     try seg.put(tkey(2, 20), &v2, 2, 0, 0);
@@ -1876,7 +1913,8 @@ test "recovery scan: the true geometry survives (every live record adopted, byte
     var fresh = try Segment.init(gpa, r.image, .none);
     defer fresh.deinit();
     const torn_off: u64 = 60 * 4096;
-    writeRecord(r.image, torn_off, tkey(9, 90).bytes(), "torn", 9, 0);
+    const tst = valueHash("torn");
+    writeRecord(r.image, torn_off, tkey(9, 90).bytes(), "torn", 9, 0, &tst);
     r.image[@intCast(torn_off + 4096)] ^= 0xFF;
     const before_torn = stats.staging_recovery_torn_records.load();
     const rep = fresh.recover();

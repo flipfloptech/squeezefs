@@ -1,0 +1,24 @@
+17:12:28 bracket[frag-512b-write]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (f5c307987531, gate profile, zig 0.17.0)", "binary": "/build/tmp/amp-brk-frag-4102886/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-amp/zig-out-linux/bin/squeezefs", "sha256": "e2a7d8a13aba8225dead3388ebb0f8460f40e9412ff81a75cffca9a2fa19afa2", "shim_sha256": "35986916feee90a90a1923d47569421a4bea5838660fbff9143237d592d0fcd4", "train": "0.1.0", "commit": "f5c307987531", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (c36b531d542c, gate profile, zig 0.17.0)", "binary": "/build/tmp/amp-brk-frag-4102886/B/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-a/zig-out-linux/bin/squeezefs", "sha256": "14a05adbaf92e3790c33d4e2a47ac667b09dfe82b386b51fa5f61f9a86ce16ab", "shim_sha256": "ede11adbbb4d7151de48624e1e96adb7aab6a15289d8c9049d19a4e6907d8d95", "train": "0.1.0", "commit": "c36b531d542c", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate file; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/amp-brk-frag-4102886
+17:12:28 bracket[frag-512b-write]: format set 0 (symmetric): sqmeta:///build/tmp/amp-brk-frag-4102886/set0-meta.img sqdata:///build/tmp/amp-brk-frag-4102886/set0-data0.img,/build/tmp/amp-brk-frag-4102886/set0-data1.img
+17:12:28 bracket[frag-512b-write]: leg 1 arm A: /build/tmp/amp-brk-frag-4102886/A/bin/squeezefs (set 0, symmetric) -o ''
+17:12:28 bracket[frag-512b-write]: mounted /build/tmp/amp-brk-frag-4102886/mnt (daemon pid 4102977)
+17:12:28 bracket[frag-512b-write]: leg 1: preparing the aging store's dataset (once per set)
+17:12:29 bracket[frag-512b-write]: leg 1: warm-up 10s (excluded)
+17:12:41 bracket[frag-512b-write]: leg 1: measured span 60s
+17:13:46 bracket[frag-512b-write]: leg 1: IOPS 9831.0 valid
+17:13:46 bracket[frag-512b-write]: leg 2 arm B: /build/tmp/amp-brk-frag-4102886/B/bin/squeezefs (set 0, symmetric) -o ''
+17:13:47 bracket[frag-512b-write]: mounted /build/tmp/amp-brk-frag-4102886/mnt (daemon pid 4103332)
+17:13:47 bracket[frag-512b-write]: leg 2: warm-up 10s (excluded)
+17:14:00 bracket[frag-512b-write]: leg 2: measured span 60s
+17:15:02 bracket[frag-512b-write]: leg 2: IOPS 5348.6 INVALID ['write_amplification_bound', 'mem_budget_green']
+17:15:05 bracket[frag-512b-write]: leg 3 arm B: /build/tmp/amp-brk-frag-4102886/B/bin/squeezefs (set 0, symmetric) -o ''
+17:15:06 bracket[frag-512b-write]: mounted /build/tmp/amp-brk-frag-4102886/mnt (daemon pid 4103541)
+17:15:06 bracket[frag-512b-write]: leg 3: warm-up 10s (excluded)
+17:15:19 bracket[frag-512b-write]: leg 3: measured span 60s
+17:16:22 bracket[frag-512b-write]: leg 3: IOPS 4620.7 INVALID ['write_amplification_bound']
+17:16:24 bracket[frag-512b-write]: leg 4 arm A: /build/tmp/amp-brk-frag-4102886/A/bin/squeezefs (set 0, symmetric) -o ''
+17:16:25 bracket[frag-512b-write]: mounted /build/tmp/amp-brk-frag-4102886/mnt (daemon pid 4103888)
+17:16:25 bracket[frag-512b-write]: leg 4: warm-up 10s (excluded)
+17:16:38 bracket[frag-512b-write]: leg 4: measured span 60s
+17:17:41 bracket[frag-512b-write]: leg 4: IOPS 9411.7 INVALID ['mem_budget_green']
+17:17:43 bracket[frag-512b-write]: leg 4: daemon log has 2 error( line(s)

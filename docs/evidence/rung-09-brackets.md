@@ -745,6 +745,43 @@ rc 0, 373 / 456 MiB/s, 0 EAGAIN, 0 wedges, 0 rescues, `parked_pool_refusals`
 0, `journal_lane_park_backstop_ticks` 119 / 141 (p99 0.9–2.0 s on the
 saturated substrate — F7's class, not a lost wake).
 
+### The write amplification rows (2026-10-11, decision 0003 §J; binaries A = the fix, B = `c36b531`)
+
+Two rows added for the two measured defects of `docs/evidence/rung-09-external-suites.md`
+(generic/074's 128× W2 fold, generic/069's whole-image re-stage per 4-byte append), and two
+laws the harness now asserts on every leg: `write_amplification_bound` (data-write rows:
+`device bytes ÷ user bytes ≤ pages(bs, gcd(bs, 4 KiB)) × 4 KiB / bs`, + 0.1 slack — 8× at
+512 B, 1× at a page multiple) and, on the `data-append` kind, `staged_append_bound` (ring
+bytes moved ≤ 11 × bytes appended) with `journal_entries_per_append ≤ 1.05`. `fold_inplace_
+write_bytes` / `fold_inplace_dmas` joined the device-write arms (`bench.zig` pinned equal by
+the rail). Both rows ran A-B-B-A, 4 legs × 60 s (+10 s warm-up), `file` substrate, numjobs 4,
+budget 6144 MiB, this venue; the `mem_budget_green` INVALIDs below are the shared cgroup's
+pressure signal (other agents' daemons), not the rows'.
+
+| row | leg/arm | headline | p50 / p99 µs | device÷user (stats) | device÷user (diskstats) | the law | record |
+|---|---|---|---|---|---|---|---|
+| frag-512b-write (fio psync randwrite bs=512 direct=0, 256m/job × 4; the 074 shape over mapped sole-owner blocks) | 1/A | **9831 IOPS** | 239 / 1794 | **7.059** | 8.323 | `write_amplification_bound` ok (bound 8×; in-place folds 2.13 GB over 393,982 DMAs) | `frag-512b-write-20261011T171228Z.json` |
+| | 2/B | 5349 IOPS | 494 / 6128 | **129.7** | 130.7 | FAILED (bound 8×; 21.3 GB for 164 MB; in-place folds 0) | |
+| | 3/B | 4621 IOPS | 494 / 6849 | **130.3** | 136.2 | FAILED | |
+| | 4/A | **9412 IOPS** | 237 / 1991 | **6.805** | 8.139 | ok | |
+| append-4b (appends.py, 4 writers × 4 B O_APPEND integers, read back in order; a staging root formatted by the harness) | 1/A | **8110 appends/s** | — | 0 (the ring) | 170 | `staged_append_bound` ok: moved ×9.264 (484,036 in place, 56 re-stages); entries 1.001/op | `append-4b-20261011T171837Z.json` |
+| | 2/B | 2624 appends/s | — | 0 | 4986 | (c36b531 has no ring ledger: every append re-staged the image); entries 1.001/op | |
+| | 3/B | 2597 appends/s | — | 0 | 15677 | | |
+| | 4/A | **7597 appends/s** | — | 0 | 3513 | ok: moved ×9.829 (452,804 in place, 56 re-stages); 1.001/op | |
+
+A/B: `frag-512b-write` **1.93×** the IOPS at **7× instead of 130×** the device bytes (the
+daemon's own arms; diskstats on the shared disk 8.1–8.3× vs 131–136×), p50 halved, p99 a
+third; `append-4b` **3.0×** the appends/s, ring bytes moved 9.3–9.8× the appended bytes
+against the 11× bound (the geometric re-stage chain at a quarter slack; 56 re-stages for
+≈ 480 k appends per leg) where c36b531 moved the whole image per append. The appends/s
+floor on both arms is the per-write journal entry (one Δ record per write, durable at ack):
+≈ 120 µs per append across 4 writers on this substrate. Scoping runs at 2 × 15–20 s
+(`append-4b-20261011T164101Z`, `frag-512b-write-20261011T164244Z`) agree. An earlier
+cut of the fix seeded a deferred overlay's page at FIRST TOUCH (one 4 KiB device read on the
+write path): the frag row's p50 rose 317 → 502 µs; the seed moved to the fold (one ranged
+read per run of unseeded pages) and the fold itself off the write (detached), and the row's
+p50 settled at 237–239 µs against c36b531's 494.
+
 ## 5. Gaps — what cannot be measured here and what the box run needs
 
 - **Every bar.** 9 vCPU, one virtio disk, loopback TCP on one NIC queue: the

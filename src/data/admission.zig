@@ -287,12 +287,14 @@ pub const Governor = struct {
     }
 
     /// The CAS winner rolls: `cur → prev` (0 when the epochs are not
-    /// adjacent), the share re-decided from the finishing epoch's eviction
-    /// evidence (an epoch without evictions carries none: the share stands
-    /// — the epochs a gap skipped had no calls, so no evictions either),
-    /// then tokens minted ONCE from the previous epoch's foreground at the
-    /// share (leftovers die — the earlier two-window spend arithmetic
-    /// re-admitted a herd at every boundary, exactly 2× the budget).
+    /// adjacent), a clamped share re-decided from the finishing epoch's
+    /// eviction evidence (an epoch without evictions carries none: the
+    /// share stands — the epochs a gap skipped had no calls, so no
+    /// evictions either), then tokens minted ONCE from the previous epoch's
+    /// foreground at the share (leftovers die — the earlier two-window
+    /// spend arithmetic re-admitted a herd at every boundary, exactly 2× the
+    /// budget). The roll never engages: `onEviction` does, on the evidence
+    /// as it lands; the roll only holds or climbs.
     pub fn roll(self: *Governor, now_ns: u64) void {
         const idx = now_ns / self.epoch_ns;
         const cur = self.epoch_idx.load(.monotonic);
@@ -305,21 +307,28 @@ pub const Governor = struct {
         self.evicted_prev.store(if (adjacent) ev else 0, .monotonic);
         self.wasted_prev.store(if (adjacent) wa else 0, .monotonic);
         self.foreground_prev.store(if (adjacent) fg else 0, .monotonic);
-        if (ev != 0) {
-            const share = self.share_pct.load(.monotonic);
-            const wasteful = 2 * wa >= ev;
-            const next: u64 = if (share == SHARE_UNCLAMPED_PCT)
-                (if (wa >= CLAMP_FLOOR_BLOCKS * self.block and wasteful) self.fill_pct else SHARE_UNCLAMPED_PCT)
-            else if (wasteful)
-                self.fill_pct
-            else
-                @min(SHARE_UNCLAMPED_PCT, @max(share * 2, 1));
+        const share = self.share_pct.load(.monotonic);
+        if (ev != 0 and share < SHARE_UNCLAMPED_PCT) {
+            const next: u64 = if (2 * wa >= ev) self.fill_pct else @min(SHARE_UNCLAMPED_PCT, @max(share * 2, 1));
             self.share_pct.store(next, .monotonic);
             stats.read_admission_governor_clamped.set(@intFromBool(next < SHARE_UNCLAMPED_PCT));
             stats.read_admission_governor_share_pct.set(next);
         }
-        const share = self.share_pct.load(.monotonic);
-        self.tokens.store(if (share < SHARE_UNCLAMPED_PCT and adjacent) fg * share / SHARE_UNCLAMPED_PCT else 0, .monotonic);
+        const standing = self.share_pct.load(.monotonic);
+        self.tokens.store(if (standing < SHARE_UNCLAMPED_PCT and adjacent) fg * standing / SHARE_UNCLAMPED_PCT else 0, .monotonic);
+    }
+
+    /// The clamp ENGAGES the moment the running epoch's own victims clear
+    /// the floor (`wasted ≥ 2 × block ∧ 2 × wasted ≥ evicted`): read only at
+    /// the roll, a random storm's onset escalated at device bandwidth for a
+    /// whole 2 s epoch (~1 GB of whole blocks the tier evicted unhit before
+    /// the first verdict). Tokens stay as the roll left them (0 while it
+    /// was unclamped): the rest of this epoch is denied, the next roll mints
+    /// at the floor. The release is the ladder at the roll, never here.
+    fn engage(self: *Governor) void {
+        if (self.share_pct.cmpxchgStrong(SHARE_UNCLAMPED_PCT, self.fill_pct, .monotonic, .monotonic) != null) return;
+        stats.read_admission_governor_clamped.set(1);
+        stats.read_admission_governor_share_pct.set(self.fill_pct);
     }
 
     /// The clamp's denominator: ranged device reads and `DemandStream`
@@ -334,20 +343,22 @@ pub const Governor = struct {
     pub fn onEviction(self: *Governor, v: hot_tier.Victim, now_ns: u64) void {
         if (v.class != .protected) return;
         self.roll(now_ns);
-        _ = self.evicted_cur.fetchAdd(v.len, .monotonic);
+        const ev = self.evicted_cur.fetchAdd(v.len, .monotonic) + v.len;
+        var wa = self.wasted_cur.load(.monotonic);
         if (v.served_bytes < v.len) {
             const waste = v.len - v.served_bytes;
-            _ = self.wasted_cur.fetchAdd(waste, .monotonic);
+            wa = self.wasted_cur.fetchAdd(waste, .monotonic) + waste;
             stats.read_admission_wasted_bytes.add(waste);
         }
         if (v.served_bytes == 0 and !v.stream_admitted) stats.read_admission_evicted_unhit.inc();
+        if (wa >= CLAMP_FLOOR_BLOCKS * self.block and 2 * wa >= ev) self.engage();
     }
 
     /// Eviction-side ratio ON PURPOSE (an admission burst must not dilute
     /// the ratio and unclamp itself): the clamp ENGAGES on `wasted ≥ 2 ×
-    /// block ∧ 2 × wasted ≥ evicted` over an epoch's victims (the floor is
-    /// the engage-side noise gate) and RELEASES by the additive-increase
-    /// ladder in `roll` — never in one step.
+    /// block ∧ 2 × wasted ≥ evicted` over the running epoch's victims (the
+    /// floor is the engage-side noise gate) and RELEASES by the
+    /// additive-increase ladder in `roll` — never in one step.
     pub fn clampEngaged(self: *Governor, now_ns: u64) bool {
         self.roll(now_ns);
         return self.share_pct.load(.monotonic) < SHARE_UNCLAMPED_PCT;
@@ -510,11 +521,15 @@ test "governor: waste → clamp → denials by ONE token CAS; tokens minted once
     // Probation victims and partial serves are not waste.
     g.onEviction(.{ .key = .init(1, 0), .slot = 0, .len = @intCast(block), .class = .probation, .served_bytes = 0, .stream_admitted = false }, now);
     g.onEviction(.{ .key = .init(1, 0), .slot = 0, .len = @intCast(block), .class = .protected, .served_bytes = block, .stream_admitted = false }, now);
-    // Still epoch A: the clamp reads the PREVIOUS epoch (0) — not engaged.
-    try testing.expect(!g.clampEngaged(now));
-    try testing.expect(g.allowEscalation(block, now));
-    // Epoch B: wasted_prev = 4 blocks ≥ 2 ∧ 2 × 4 ≥ 5 evicted ⇒ clamped;
-    // tokens = 5 % of 1 GiB = 51.2 MiB = 12 whole blocks.
+    // Still epoch A: the clamp ENGAGED on this epoch's own evidence the
+    // moment it cleared the floor (4 wasted ≥ 2 blocks ∧ 2 × 4 ≥ 5 evicted)
+    // — waiting for the roll let a storm's onset escalate at device
+    // bandwidth for a whole epoch. No tokens until the roll mints them.
+    try testing.expect(g.clampEngaged(now));
+    try testing.expectEqual(@as(u64, 5), g.share_pct.load(.monotonic));
+    try testing.expect(!g.allowEscalation(block, now));
+    // Epoch B: still clamped (wasteful); tokens = 5 % of A's 1 GiB =
+    // 51.2 MiB = 12 whole blocks.
     now += GOVERNOR_EPOCH_NS;
     try testing.expect(g.clampEngaged(now));
     try testing.expectEqual(derive_GiB * 5 / 100, g.tokensLeft());
@@ -549,7 +564,11 @@ test "governor: waste → clamp → denials by ONE token CAS; tokens minted once
     const ladder = [_]u64{ 10, 20, 40, 80, 100 };
     for (ladder) |want| {
         g.noteForeground(derive_GiB, now);
+        const share_before = g.share_pct.load(.monotonic);
         for (served_victims) |v| g.onEviction(v, now);
+        // The release is never mid-epoch: served victims move the share
+        // only at the roll.
+        try testing.expectEqual(share_before, g.share_pct.load(.monotonic));
         now += GOVERNOR_EPOCH_NS;
         try testing.expectEqual(want < 100, g.clampEngaged(now));
         try testing.expectEqual(want, g.share_pct.load(.monotonic));

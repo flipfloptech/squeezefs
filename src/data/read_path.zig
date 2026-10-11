@@ -2269,12 +2269,15 @@ test "the bounded-waste law under a random sub-block storm over a set ≫ the ho
     const l0 = DmaLedger.snap();
     // Pass 1 over blocks 0..7: first touches — ranged windows, the ghost records.
     for (0..8) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 4096, 4096, .{ .buf = buf }, .{});
-    // Pass 2 over the same eight: second touches — every one escalates (the
-    // clamp has no evidence yet); the 4-block tier evicts four of them
-    // protected and unserved: the waste the next roll reads.
+    // Pass 2 over the same eight: second touches — the first four escalate
+    // into the empty 4-block tier, the fifth and sixth evict two of them
+    // protected and unserved, and THAT evidence (2 blocks wasted of 2
+    // evicted) engages the clamp inside the epoch: the seventh and eighth
+    // are denied (no tokens until a roll mints them) and stay ranged.
     for (0..8) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 8192, 4096, .{ .buf = buf }, .{});
-    try testing.expectEqual(esc0 + 8, admission.stats.ranged_read_ghost_escalations.load());
-    try testing.expectEqual(@as(u64, 0), admission.stats.read_admission_governor_clamped.load());
+    try testing.expectEqual(esc0 + 6, admission.stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(denials0 + 2, admission.stats.read_admission_governor_denials.load());
+    try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
     g.roll(clock.monotonicNs() + g.epoch_ns);
     try testing.expectEqual(@as(u64, 1), admission.stats.read_admission_governor_clamped.load());
     // Pass 3 over blocks 8..15: first touches — ranged (this epoch's
@@ -2290,12 +2293,12 @@ test "the bounded-waste law under a random sub-block storm over a set ≫ the ho
     const demand_before = DmaLedger.snap().demand;
     for (8..16) |b| _ = try f.rp.read(io, 7, @as(u64, b) * Fixture.bs + 8192, 4096, .{ .buf = buf }, .{});
     const l = DmaLedger.snap();
-    try testing.expectEqual(denials0 + 8, admission.stats.read_admission_governor_denials.load());
-    try testing.expectEqual(esc0 + 8, admission.stats.ranged_read_ghost_escalations.load());
+    try testing.expectEqual(denials0 + 10, admission.stats.read_admission_governor_denials.load());
+    try testing.expectEqual(esc0 + 6, admission.stats.ranged_read_ghost_escalations.load());
     try testing.expectEqual(demand_before, l.demand);
-    // The whole storm: 32 reads × 4 KiB user; ranged 24 windows + 8 escalated blocks.
-    try testing.expectEqual(@as(u64, 24 * 4096), l.ranged - l0.ranged);
-    try testing.expectEqual(8 * Fixture.bs, l.demand - l0.demand);
+    // The whole storm: 32 reads × 4 KiB user; ranged 26 windows + 6 escalated blocks.
+    try testing.expectEqual(@as(u64, 26 * 4096), l.ranged - l0.ranged);
+    try testing.expectEqual(6 * Fixture.bs, l.demand - l0.demand);
 }
 
 /// The device-read ledger's two partitions of the read path's DMA bytes.

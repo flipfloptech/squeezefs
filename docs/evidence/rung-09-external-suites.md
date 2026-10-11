@@ -211,12 +211,26 @@ wedges: `suites-probe-20261010-165924/d3-wedge-stats.json`,
 | 19 | fstests `generic/074`, `generic/464` (ONE open(O_TRUNC) parked at `handler_entry` 35–40 min, no lock held, every thread asleep, `lock_ticked_reregisters` 0, `exec_fibers_live.fuse` 2) | the pre-clip custody settle (`flushCustody`) added `WritePath.quiesce` — an `Io.Group.await` of the ONE write-path task set every ino's uploads join — and the group has ONE awaiter cell: a second truncate settling at once overwrote the first's, and the last upload's exit woke only the cell it found (`std.Io.Threaded` asserts on the same second awaiter) | write_admit test "the pre-clip custody settle of one ino waits for nothing of another: two settles at once return while a third ino's upload is held in its DMA" (red: SIGABRT in Threaded's `groupAwait` assertion) | 1c516f2 (`WritePath.settleCustody` ≡ `flushIno`; `exec_group_second_awaiter` must-stay-0) |
 | 20 | fstests pass 2 `write_shared_class_violation` ×6 (a Shared-classified write whose inode size was below its end) | the O_TRUNC open ran its truncate with NO level-1 guard (the lifecycle took the exclusive guard for SETATTR-size only; ATOMIC_O_TRUNC means the kernel sends no SETATTR): the inode's size dropped under Shared-class writes admitted on `end ≤ shape size` | kv_fs test "an O_TRUNC open truncates under the level-1 EXCLUSIVE guard exactly as SETATTR-size does …" (red: the SettlingData double's shared probe was admitted inside the open's settle) | a623b07 |
 | 21 | fstests pass 2 `rewrite_shadow_displaced_drift` + `block_untracked_free_refusals` at 02:01:39 — on the TEST device under `generic/247` (a 500-block file overwritten by an O_DIRECT dd and a backward mmap writer at once), not 345 | the epoch's cap fallback (row 179) answered `not_shadowed` for a block the ino's CLOSING epoch still shadowed; the upload's durable merge landed under the running save, which then displaced a key it never parked and freed the parked A a second time | write_epoch test "a record for a block the CLOSING epoch shadows never takes the durable merge under the save, cap or no cap …" (red: both tripwires fired in the test exactly as in the log) | 82cef48 (`RecordVerdict.save_in_flight`, `Epochs.awaitSaveSettled`, `rewrite_shadow_save_waits`) |
+| 22 | fstests `generic/464` on the fixed binary: `write_shared_class_violation` ×193 in ONE run, every one an append at its own EOF ("write ino 3298534883330 [1441996, 1442008): classified Shared against a striped file of size 1441996") | the lifecycle probed the shape table with the kernel NODEID; the plane publishes under the EFFECTIVE ino, and the spaces alias (the mint's rotor: nodeid 4 = slot 2's local 2, key `(3 << 40) \| 2`; key 4 = slot 0's local 4, nodeid 131074) — file #2's writes were classified on file #128's size; and every file whose nodeid ≠ key never reached the Shared class at all | plane test "the shared probe keys by the plane's effective ino: a nodeid answers its own file's shape, never the file whose key merely equals that number" (red: nodeid 4 read the sibling's 6 MiB) | 7f05638 (`DataPlane.shapeProbeKey`; the violation's log line names ino, range, kind, size); `generic/464` after: 0 alert lines |
 
-Decision 0002 rows 442–451, 454–456 and 460–463 record each divergence from the reference's shape.
+Decision 0002 rows 442–451, 454–456 and 460–464 record each divergence from the reference's shape.
 
 ### The stall repros (defects 16–19)
 
-Standalone `aio-dio-write-verify` loop (`.scratch/stalls-551.sh`: a fresh set under `/build/tmp/stalls-<pid>/`, the test's own random op shape, 512 B or 4 KiB diosize) on the pre-fix binary 853b20c: at diosize 512 a corrupt verify at lap 3 (or the stall); at diosize 4096 39 of 46 ranges corrupt in lap 1. On the fixed binary: 25 laps clean at 512, 25 laps clean at 4096 (the 4096 shape's 64 × 128 MiB AIO writes bark `transport_lease_overlong` ≥ 1 s — the transport's lease age under 8 GB in flight against a 4 GB budget, not a stall), fsck 0 findings. `generic/551` through the harness (100 laps per run) on a623b07: **20 of 20 runs passed**, 0 alert lines, fsck 0 findings every run (45–51 s wall; three runs 99–163 s — slower laps, no op past the watchdog's 5 s). The 074/464 shape: the two-awaiter join is deterministic in the unit test (Threaded's assertion); `generic/074` and `generic/464` through the harness on the final binary are in the table below.
+Standalone `aio-dio-write-verify` loop (`.scratch/stalls-551.sh`: a fresh set under `/build/tmp/stalls-<pid>/`, the test's own random op shape, 512 B or 4 KiB diosize) on the pre-fix binary 853b20c: at diosize 512 a corrupt verify at lap 3 (or the stall); at diosize 4096 39 of 46 ranges corrupt in lap 1. On the fixed binary: 25 laps clean at 512, 25 laps clean at 4096 (the 4096 shape's 64 × 128 MiB AIO writes bark `transport_lease_overlong` ≥ 1 s — the transport's lease age under 8 GB in flight against a 4 GB budget, not a stall), fsck 0 findings. `generic/551` through the harness (100 laps per run) on a623b07: **20 of 20 runs passed**, 0 alert lines, fsck 0 findings every run (45–51 s wall; three runs 99–163 s — slower laps, no op past the watchdog's 5 s). The 074/464 shape: the two-awaiter join is deterministic in the unit test (Threaded's assertion).
+
+### Pass 3: the stall tests through the harness on the fixed binaries (2026-10-11 11:01–12:33)
+
+| test | binary | runs | verdict |
+|---|---|---|---|
+| generic/551 | a623b07 | 20 | **20 passed**, 0 alerts, fsck 0 × 20 |
+| generic/464 | 82cef48 | 1 | passed (124 s); `write_shared_class_violation` ×193 on the scratch set → defect 22 |
+| generic/464 | 7f05638 | 1 | **passed** (127 s), **0 alert lines**, fsck 0 |
+| generic/247 | 82cef48 | 1 | passed (14 s), 0 tripwires (defect 21's shape) |
+| generic/551 | 82cef48 | 1 | passed (50 s) |
+| generic/074 | 82cef48 | 2 | the stall is gone (fstest.1 and fstest.2's 3 × 5 × 30 MiB loops ran 20 min); the TEST daemon then died of RSS growth — OOM-killed at 14.2 GB anon in both runs (the RSS item below), `_check_dmesg` failed the test |
+
+`generic/074` is fixed as a stall and open as a memory footprint (measured below); its unit pin (defect 19's test) is deterministic.
 
 ## The venue (why the 3-run counts are incomplete)
 
@@ -269,4 +283,17 @@ rerun on a quiet venue before the release gate.
   each, `block_free_reclaim_queue_bytes` up to 2 GB transiently); on the 16 GiB shared venue the
   co-tenants' OOM kills (four on 2026-10-10, two on 2026-10-11) took our daemons down twice
   without a trace. The allocator's leak report is clean — the growth is pooled, not leaked;
-  unprofiled.
+  unprofiled. **Measured on the stall-fixed binary (generic/074 now runs past its old stall)**:
+  `fstest -n 3 -F -l 10 -f 5 -s 31457280 -b 512` (three children, 512 B FRAGMENTED writes into
+  pre-sized 30 MiB files) grows the daemon's anon RSS ≈ 4.5 MB/s — 2.55 → 5.87 GB in 12 min
+  (`.scratch/rss-074.sh`, `stalls-074-*/stats-at-stop.json`) — while the budget's
+  `mem_budget_gauge_sum_bytes` sits flat at 1.29–1.31 GB (`exec_fiber_stacks` 717 MB,
+  `transport_zc_bounce`/`kmbuf_region` 288 MB each, parked buffers ≤ 3, extents 0, staging ≤
+  11 MB): the growth is OUTSIDE every component, at the user write rate (≈ 9 k × 512 B/s). Through
+  the harness the test's daemon reached 14.2 GB anon in ≈ 20 min and the kernel killed it
+  (`074.dmesg`: `Killed process … (squeezefs) anon-rss:14252232kB`), twice in two runs; the
+  fsck helper then refused on the dead holder's guard ("live-mounted") — the harness's fsck
+  helper owes the mount helper's dead-holder attestation. The same run shows the W2 fold's
+  amplification on this shape: `parked_gate_self_flushes` = `write_through_blocks` = 26,102
+  folds (64 × 512 B extents each) = `durable_upload_bytes_escalation` 109 GB of device writes for
+  855 MB of user bytes (128×). Both are the RSS item's and the write path's, not the stalls'.

@@ -1350,11 +1350,19 @@ pub const DmaProof = struct {
     len: u64,
     completed_ns: u64,
 
-    /// Does this proof cover the bytes `m` names?
+    /// Does this proof cover the bytes `m` names? A tenant's proof covers its
+    /// whole slot. A WHOLE-BLOCK DMA is the complete payload or image by
+    /// construction — a transformed image is self-delimiting (its header
+    /// bounds every read; the chunk's tail past it is never read) and a
+    /// passthrough payload is bounded by the layout's `size` — so its proof
+    /// covers the mapping from the slot's start at any grain-padded length:
+    /// a block that compressed lands an image shorter than the chunk, and
+    /// the whole-slot law refused every one of them (`ProofMissing`, the
+    /// upload retrying forever).
     pub fn covers(self: DmaProof, m: Mapping, chunk: u64) bool {
         if (self.vol_tag != m.vol_tag) return false;
         const start = m.offset + m.rel_off;
-        const end = start + m.slotLen(chunk);
+        const end = if (m.whole_block) start + GRAIN else start + m.slotLen(chunk);
         return self.offset <= start and end <= self.offset + self.len;
     }
 };
@@ -2099,8 +2107,20 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
             .{ .vol_tag = 0x22, .offset = 2 * chunk, .len = chunk, .completed_ns = 2 },
         };
         try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = pk, .layout = striped, .proofs = proofs[0..1] }, refs.seam(), tgeo));
+        // A whole-block DMA is the complete payload or image by construction
+        // (a transformed image is self-delimiting; a passthrough payload is
+        // bounded by the layout's size), so a proof from the slot's start of
+        // ANY grain-padded length covers the mapping — a compressed block's
+        // image is shorter than the chunk, and the old whole-slot law refused
+        // every block that compressed (the publish retried forever).
+        const short_image: DmaProof = .{ .vol_tag = 0x22, .offset = 2 * chunk, .len = 1 << 20, .completed_ns = 2 };
+        try testing.expect(short_image.covers(Mapping.wholeBlock(0x22, 2 * chunk, 1), chunk));
+        try testing.expect(!(DmaProof{ .vol_tag = 0x22, .offset = 2 * chunk + 4096, .len = chunk, .completed_ns = 2 }).covers(Mapping.wholeBlock(0x22, 2 * chunk, 1), chunk));
+        try testing.expect(!(DmaProof{ .vol_tag = 0x22, .offset = 2 * chunk, .len = 100, .completed_ns = 2 }).covers(Mapping.wholeBlock(0x22, 2 * chunk, 1), chunk));
+        // A tenant's proof still has to cover its whole slot.
+        try testing.expect(!(DmaProof{ .vol_tag = 0x11, .offset = 3 * chunk + 8192, .len = 2048, .completed_ns = 1 }).covers(tenant, chunk));
         refs.adds.clearRetainingCapacity();
-        try publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = pk, .layout = striped, .proofs = &proofs }, refs.seam(), tgeo);
+        try publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = pk, .layout = striped, .proofs = &.{ proofs[0], short_image } }, refs.seam(), tgeo);
         try testing.expectEqual(@as(usize, 2), refs.adds.items.len);
         try testing.expectEqual(@as(usize, 1), refs.releases.items.len);
         try testing.expectEqual(RefOp{ .vol_tag = 0x11, .block_idx = 3, .owner_ino = ino, .block_index = 0 }, refs.releases.items[0]);

@@ -679,14 +679,22 @@ pub const Reclaimer = struct {
         stats.terminal_frees.inc();
         // Step 6: the tier purge — after the retire, before reallocatable.
         if (self.tier_purge) |p| p.purge(p.ctx, vol, idx);
-        // Step 7: elision.
+        // Step 7: elision. The drainer parks without a deadline once a pass
+        // finds no debt, so every 0 → > 0 transition of a volume's debt
+        // wakes it (the one-shot "first elided free of the volume" wake left
+        // it asleep for whole legs whenever reuse cancelled every debt block
+        // between two passes: 0 trim discards on the aging store's later
+        // legs). `notifyOne` keeps one permit, so a wake landing mid-pass
+        // is the next park's immediate return.
         if (elideReclaimFor(self.cfg.elision, row.target.substrate, self.cfg.elision_class_all)) {
+            const was_clear = alloc.elidedDebtBytes() == 0;
             alloc.recordElidedDebt(idx);
             alloc.finishFree(idx);
             alloc.supply_edge.notifyWaiters(io);
             stats.block_free_reclaim_elided.inc();
             stats.block_free_elided_debt_bytes.set(self.totalDebtBytes());
-            if (!row.debt_target.swap(true, .acq_rel)) self.debt_wake.notifyOne(io);
+            row.debt_target.store(true, .release);
+            if (was_clear) self.debt_wake.notifyOne(io);
             return .terminal;
         }
         // Step 8: the queue owns `finishFree`.
@@ -1904,12 +1912,20 @@ test "the debt drainer: idle drains elided debt past the watermark to zero with 
     for ([_]u64{ 2, 3 }) |idx| try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, idx, f.alloc.stampOf(idx)));
     var spins: u32 = 0;
     while (f.alloc.elidedDebtBytes() != 0 and spins < 2000) : (spins += 1) stallMs(io, 5);
-    f.r.stopAndJoin(io);
     try testing.expectEqual(@as(u64, 0), f.alloc.elidedDebtBytes());
     try testing.expect(stats.block_free_debt_drain_passes.load() > passes0);
     try testing.expectEqual(@as(usize, 1), f.rec.commands.items.len); // [2,3] as one trim command
     try testing.expectEqual(block_alloc.State.free, f.alloc.stateOf(2));
     try testing.expectEqual(@as(u64, 0), f.alloc.trimClaimed());
+    // The drainer went idle (no debt): a LATER elided free of the same
+    // volume wakes it again — the wake is every 0 → > 0 transition, never
+    // the volume's first free alone.
+    try testing.expectEqual(FreeOutcome.terminal, f.r.freeBlock(io, 0, 5, f.alloc.stampOf(5)));
+    spins = 0;
+    while (f.alloc.elidedDebtBytes() != 0 and spins < 2000) : (spins += 1) stallMs(io, 5);
+    f.r.stopAndJoin(io);
+    try testing.expectEqual(@as(u64, 0), f.alloc.elidedDebtBytes());
+    try testing.expectEqual(@as(usize, 2), f.rec.commands.items.len);
 
     var ro = try Fixture.init(.{ .budget_bytes = test_budget, .batch_ms = 0, .read_only = true }, .file_punch, 8);
     defer ro.deinit();

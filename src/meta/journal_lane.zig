@@ -1786,6 +1786,16 @@ fn spinUntil(cond: anytype) void {
     while (!cond.ready()) std.Thread.yield() catch std.atomic.spinLoopHint();
 }
 
+/// `spinUntil` bounded by a monotonic deadline: false when it passed with
+/// the condition still unmet (the caller fails loud with its counters).
+fn spinUntilBy(cond: anytype, deadline_ns: u64) bool {
+    while (!cond.ready()) {
+        if (clock.monotonicNs() >= deadline_ns) return false;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    return true;
+}
+
 test "the flush cadence: the checkpointer's derived default (50 ms) coalesced; 0 is strict; junk keeps the default loudly" {
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
@@ -2237,6 +2247,14 @@ test "a slow device: a window whose runs are owed past the backstop costs backst
 // The rescue stays REACHABLE: a foreign completer that forgets to `kick`
 // leaves the prefix wait with its condition satisfied and no wake — the tick
 // finds the progress and counts exactly one rescue.
+//
+// The verdict is the acking poll's: its re-check finds the completed prefix,
+// runs the verdicts and ACKS the successor inside `advanceDurability`, and
+// judges the tick only after that returns — so the ack reaches its waiter
+// BEFORE the rescue is counted. Reading the counter on the ack's heels is a
+// race the waker/wakee preemption of a loaded box loses (`expected 1, found
+// 0`: 4 of 200 under an 8-way `yes` load, once in a gate at load ~9); the
+// pin waits for the VERDICT, the lane's own counter, never the ack.
 test "a lost kick: a reservation completed elsewhere without a kick is found by the backstop's re-check — exactly one tick rescue, the successor acks" {
     const h = try Harness.init(testing.allocator, "lost-kick");
     defer h.deinit();
@@ -2251,11 +2269,25 @@ test "a lost kick: a reservation completed elsewhere without a kick is found by 
         }
     }{ .l = lane });
     try testing.expectEqual(@as(?Outcome, null), b.ticket.poll());
+    const rescues0 = lane.snapshot().tick_rescues;
     h.reg.complete(&h.core, a.res);
     // No kick: only the backstop can find the completed prefix.
     try b.ticket.wait().result;
-    try testing.expectEqual(@as(u64, 1), lane.snapshot().tick_rescues);
     try testing.expect(h.reg.completedUpto() >= b.res.paddedEnd());
+    // The acking poll's verdict: one rescue, owed within the lane's next
+    // few instructions — two liveness ticks later the verdict path is gone
+    // and the row is red with the lane's counters.
+    const judged = spinUntilBy(struct {
+        l: *JournalLane,
+        want: u64,
+        fn ready(s: @This()) bool {
+            return s.l.snapshot().tick_rescues >= s.want;
+        }
+    }{ .l = lane, .want = rescues0 + 1 }, clock.monotonicNs() + 2 * exec_lane.tick_ns);
+    const snap = lane.snapshot();
+    if (!judged) std.debug.print("\nlost kick: the acking poll never counted its rescue: tick rescues {d} (expected {d}), backstop ticks {d}, parks {d}, prefix waits {d}\n", .{ snap.tick_rescues, rescues0 + 1, snap.backstop_ticks, snap.parks, snap.prefix_waits });
+    try testing.expect(judged);
+    try testing.expectEqual(rescues0 + 1, snap.tick_rescues);
 }
 
 test "a predecessor handed off late joins the group at its journal position: acks leave in journal order" {

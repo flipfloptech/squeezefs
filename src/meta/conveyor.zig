@@ -197,7 +197,8 @@ pub fn windowHoldFor(flush_interval_ms: u64) ?WindowHold {
 /// the lane thread at every window's finish and read by the pass fiber on
 /// the same thread; the RAM contracts' device thread feeds it from
 /// another, so the two words are atomics (a torn pair read is a bound,
-/// never a correctness term).
+/// never a correctness term). The same estimator smooths the committers'
+/// inter-arrival interval (fed by the pass alone) for the worth gate.
 pub const RttEstimator = struct {
     srtt_ns: std.atomic.Value(u64) = .init(0),
     rttvar_ns: std.atomic.Value(u64) = .init(0),
@@ -229,7 +230,29 @@ pub const RttEstimator = struct {
         const rto = self.srtt_ns.load(.monotonic) +| RTT_K *| self.rttvar_ns.load(.monotonic);
         return @min(rto, ceiling_ns);
     }
+
+    /// The smoothed mean alone (the inter-arrival predictor's reading);
+    /// null before the first sample.
+    pub fn mean(self: *const RttEstimator) ?u64 {
+        if (self.samples.load(.monotonic) == 0) return null;
+        return self.srtt_ns.load(.monotonic);
+    }
 };
+
+/// THE WORTH GATE: a hold is worth paying only when the arrival rate
+/// predicts a companion within the round trip — `mean inter-arrival ≤
+/// srtt` (at least one more entry expected while the in-flight window
+/// lands). Below that rate the hold waits for nobody and costs its
+/// committer the round trip for nothing: measured on `fsync-4k` (4 QD1
+/// jobs, 5 k commits/s against an 80 µs round trip: λ·R = 0.4) the ungated
+/// hold held 30 % of the windows for 48–55 µs each, collected 1.09 entries
+/// per window and cost 12 % of the fsyncs/s; on `frag-512b-write` (8.5 k/s
+/// against 76 µs: 0.65) it collected 1.36 and cost 5 % of the META bytes.
+pub fn holdWorthIt(interarrival_ns: ?u64, srtt_ns: ?u64) bool {
+    const d = interarrival_ns orelse return false;
+    const r = srtt_ns orelse return false;
+    return d <= r;
+}
 
 /// The pad arithmetic the §L bound restates (tie tests below): a window
 /// of `n` entries of `s` bytes landing at the data start of a page on a
@@ -529,6 +552,10 @@ pub const Stats = struct {
     holds: counters.ShardedCounter = .{},
     hold_landings: counters.ShardedCounter = .{},
     hold_deadlines: counters.ShardedCounter = .{},
+    /// `meta_conveyor_holds_not_worth`: pad-majority batches issued at once
+    /// because the arrival rate predicted no companion within the round
+    /// trip (`holdWorthIt`) — the QD1 shapes' windows.
+    holds_not_worth: counters.ShardedCounter = .{},
     windows_held: counters.ShardedCounter = .{},
     windows_unshadowed: counters.ShardedCounter = .{},
     windows_pipelined: counters.ShardedCounter = .{},
@@ -560,7 +587,7 @@ pub const Stats = struct {
         for (GroupSizeHistogram.labels, 0..) |l, i| {
             try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", l, self.group_size.load(i) });
         }
-        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}}}", .{
+        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}}}", .{
             self.group_bytes.load(),
             self.leader_passes.load(),
             self.group_commits.load(),
@@ -582,6 +609,7 @@ pub const Stats = struct {
             self.holds.load(),
             self.hold_landings.load(),
             self.hold_deadlines.load(),
+            self.holds_not_worth.load(),
             self.windows_held.load(),
             self.windows_unshadowed.load(),
             self.windows_pipelined.load(),
@@ -877,6 +905,11 @@ pub const Conveyor = struct {
     /// landing).
     landed: sync.Notify = .init,
     rtt: RttEstimator = .{},
+    /// The committers' inter-arrival interval (the worth gate's rate),
+    /// sampled by the pass over consecutive drained entries' enqueue
+    /// instants; `last_enqueued_ns` bridges batches. Pass-fiber-owned.
+    arrival: RttEstimator = .{},
+    last_enqueued_ns: u64 = 0,
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -1149,6 +1182,18 @@ pub const Conveyor = struct {
         return self.deps.geo.padOf(self.deps.core.headPos() + entry_bytes) > entry_bytes;
     }
 
+    /// The committers' inter-arrival samples from one drained batch: the
+    /// gaps between consecutive enqueue instants (FIFO = enqueue order),
+    /// and the gap from the previous batch's last.
+    fn sampleArrivals(self: *Conveyor, batch: []const Queued) void {
+        var prev = self.last_enqueued_ns;
+        for (batch) |m| {
+            if (prev != 0) self.arrival.sample(m.enqueued_ns -| prev);
+            prev = m.enqueued_ns;
+        }
+        self.last_enqueued_ns = prev;
+    }
+
     /// The window-fill hold (§L): a pad-majority batch waits for the
     /// window in flight to reach its terminal outcome — a park on
     /// `landed` bounded by the round-trip predictor's deadline — then the
@@ -1156,12 +1201,15 @@ pub const Conveyor = struct {
     /// Register-then-check: the landing's wake can land between the
     /// in-flight read and the park and is never lost. Holds nothing when
     /// no law is armed, nothing is in flight (a lone committer never
-    /// waits), the batch is entry-majority, the predictor has no sample
-    /// yet, or the volume is closing. One park per window, never a loop:
-    /// after a landing nothing is in flight and the window goes.
+    /// waits), the batch is entry-majority, the predictors have no sample
+    /// yet, the arrival rate predicts no companion within the round trip
+    /// (`holdWorthIt`), or the volume is closing. One park per window,
+    /// never a loop: after a landing nothing is in flight and the window
+    /// goes.
     fn holdForFill(self: *Conveyor, batch: []Queued) HeldBatch {
         const unheld: HeldBatch = .{ .batch = batch, .held = false };
         const law = self.deps.window_hold orelse return unheld;
+        self.sampleArrivals(batch);
         if (self.isClosing()) return unheld;
         var sum: u64 = 0;
         for (batch) |m| sum += m.q.len;
@@ -1169,6 +1217,10 @@ pub const Conveyor = struct {
         const bound = self.rtt.bound(law.ceiling_ns);
         self.stats.hold_bound_ns.set(bound);
         if (bound == 0) return unheld;
+        if (!holdWorthIt(self.arrival.mean(), self.rtt.mean())) {
+            self.stats.holds_not_worth.inc();
+            return unheld;
+        }
         const io = self.deps.io;
         var n = self.landed.notified();
         _ = n.enable(io);
@@ -1188,6 +1240,7 @@ pub const Conveyor = struct {
         const rest: Caps = .{ .max_txs = self.deps.caps.max_txs -| batch.len, .max_bytes = self.deps.caps.max_bytes -| sum };
         if (rest.max_txs == 0 or batch.len >= self.batch_buf.len) return .{ .batch = batch, .held = true };
         const more = self.core.drainBatch(rest, self.batch_buf[batch.len..]);
+        self.sampleArrivals(more);
         return .{ .batch = self.batch_buf[0 .. batch.len + more.len], .held = true };
     }
 
@@ -3288,7 +3341,7 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [4096]u8 = undefined;
@@ -3360,6 +3413,21 @@ test "§L tie: the RFC 6298 round-trip predictor — first sample seeds srtt = R
     for (0..64) |_| e.sample(200_000);
     try testing.expect(e.srtt_ns.load(.monotonic) >= 200_000 and e.srtt_ns.load(.monotonic) < 202_000);
     try testing.expect(e.bound(std.math.maxInt(u64)) < 210_000);
+    try testing.expectEqual(e.srtt_ns.load(.monotonic), e.mean().?);
+}
+
+test "§L tie: the worth gate — a hold is paid only when the mean inter-arrival fits inside the round trip; no sample on either side ⇒ no hold; the measured shapes" {
+    try testing.expect(!holdWorthIt(null, 200_000));
+    try testing.expect(!holdWorthIt(100_000, null));
+    // fsync-4k: 5 k commits/s (200 µs apart) against an 80 µs round trip ⇒ not worth.
+    try testing.expect(!holdWorthIt(200_000, 80_000));
+    // frag-512b-write: 8.5 k/s (118 µs) against 76 µs ⇒ not worth.
+    try testing.expect(!holdWorthIt(118_000, 76_000));
+    // rand-4k-write: 10.4 k/s (96 µs) against 183 µs ⇒ worth (≈ 1.9 companions).
+    try testing.expect(holdWorthIt(96_000, 183_000));
+    // The edge: one companion exactly.
+    try testing.expect(holdWorthIt(80_000, 80_000));
+    try testing.expect(!holdWorthIt(80_001, 80_000));
 }
 
 // THE §L RED TEST (red at f27c501: 16 windows per committer round, pad

@@ -184,7 +184,7 @@ JOURNAL = ["meta_kv_journal_entries", "meta_kv_journal_pad_entries", "meta_kv_jo
 META_WRITE_ARMS = ["journal_lane_write_bytes", "meta_io_write_bytes"]
 META_WRITE = ["meta_kv_journal_device_bytes", "meta_kv_journal_pad_bytes", "meta_kv_journal_header_bytes",
               "meta_kv_journal_hole_bytes", "meta_kv_journal_windows", "meta_kv_journal_windows_pad_majority",
-              "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines",
+              "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth",
               "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined",
               "meta_conveyor_hold_bound_ns", "meta_kv_node_append_bytes", "meta_kv_node_rewrite_bytes",
               "meta_kv_ledger_writes"]
@@ -560,11 +560,11 @@ def leg(args):
         strict = d["journal_lane_barriers_strict"] > 0
         ok = jsum == jdev and (strict or paced <= paced_bound)
         verdicts.append(("meta_pad_fraction_bound", ok,
-                         "journal device bytes %d ≡ entries %d + pad %d + headers %d + holes %d (%s); pad fraction %.3f over %d windows (%.2f entries/window, %d B/op); pad-majority windows %d (held %d, unshadowed %d) vs the pacing bound %.0f (= span %.1f s ÷ window rtt %.0f µs × 1.1 + %d deadline-ended holds + 1); holds %d, mean hold %.0f µs, live bound %d µs" % (
+                         "journal device bytes %d ≡ entries %d + pad %d + headers %d + holes %d (%s); pad fraction %.3f over %d windows (%.2f entries/window, %d B/op); pad-majority windows %d (held %d, unshadowed %d) vs the pacing bound %.0f (= span %.1f s ÷ window rtt %.0f µs × 1.1 + %d deadline-ended holds + 1); holds %d (not worth %d), mean hold %.0f µs, live bound %d µs" % (
                              jdev, jent, jpad, d["meta_kv_journal_header_bytes"], d["meta_kv_journal_hole_bytes"], "closes" if jsum == jdev else "DOES NOT CLOSE",
                              pad_fraction, jwin, (d["meta_kv_journal_entries"] / jwin), (jdev // ops) if ops else 0,
                              paced, d["meta_conveyor_windows_held"], d["meta_conveyor_windows_unshadowed"], paced_bound, elapsed_ns / 1e9, rtt_ns / 1e3, d["meta_conveyor_hold_deadlines"],
-                             d["meta_conveyor_holds"], hold_ns / 1e3, after["meta_conveyor_hold_bound_ns"] // 1000)))
+                             d["meta_conveyor_holds"], d["meta_conveyor_holds_not_worth"], hold_ns / 1e3, after["meta_conveyor_hold_bound_ns"] // 1000)))
     # 6. the solo mount's wire census.
     if meta.get("solo", True):
         verdicts.append(("solo_wire_rpcs_0", wire == 0, "wire rpcs Δ %d (%s)" % (wire, {k: d[k] for k in WIRE_RPCS if d[k]})))

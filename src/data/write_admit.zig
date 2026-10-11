@@ -355,12 +355,16 @@ pub const Request = struct {
     park_hook: ?ParkHook = null,
 };
 
-/// The gate's station seam: `parked` runs once per gate visit, before the
-/// wait, on the writer's own fiber (the FUSE handler stamps
-/// `write_parked_pool` so the op watchdog names the park).
+/// The gate's station seam, on the writer's own fiber: `parked` runs once
+/// per gate visit, before the wait (the FUSE handler stamps
+/// `write_parked_pool` so the op watchdog names the park); `refused` runs
+/// after a cold flush the plane REFUSED, with the writer still registered
+/// on the capacity notify and its tick not yet started — the dead-victim
+/// pin's rendezvous (a test holds the window there); null for the handler.
 pub const ParkHook = struct {
     ctx: *anyopaque,
     parked: *const fn (ctx: *anyopaque) void,
+    refused: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 /// A parked block untouched for a whole liveness tick is COLD: the pieces
@@ -1099,6 +1103,7 @@ pub const WritePath = struct {
                             stats.parked_gate_wall_supply_visible.fire("the parked-buffer gate's cold flushes were refused for a whole wall while fresh supply was visible");
                             gate.failed_since_ns = now;
                         }
+                        if (req.park_hook) |h| if (h.refused) |f| f(h.ctx);
                     },
                 }
             } else until = PARKED_COLD_NS - v.age_ns;
@@ -1156,6 +1161,7 @@ pub const WritePath = struct {
 
 const testing = std.testing;
 const wt = @import("write_testing.zig");
+const sync_notify = @import("../sync/notify.zig");
 const block_grant = @import("sym_planes/block_grant.zig");
 const data_bitmap = @import("sym_planes/data_bitmap.zig");
 
@@ -1654,10 +1660,15 @@ test "the one-authority screen never parks under (3): a write meeting an overlay
 
 /// Half a block (a park, never a write-through) for `(ino, block)`.
 fn parkHalf(w: *World, io: Io, ino: u64, block: u32, seed: u8) !void {
+    return parkHalfHooked(w, io, ino, block, seed, null);
+}
+
+/// `parkHalf` with the gate's station seam attached.
+fn parkHalfHooked(w: *World, io: Io, ino: u64, block: u32, seed: u8, hook: ?ParkHook) !void {
     var half: [wt.BS / 2]u8 align(4096) = undefined;
     fill(&half, seed);
     if (w.f.map.files.get(ino) == null) try w.f.map.create(ino, .striped, 0);
-    const o = try w.wp.write(io, .{ .ino = ino, .offset = @as(u64, block) * wt.BS, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(@as(u64, block) * wt.BS) });
+    const o = try w.wp.write(io, .{ .ino = ino, .offset = @as(u64, block) * wt.BS, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(@as(u64, block) * wt.BS), .park_hook = hook });
     try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
 }
 
@@ -1699,6 +1710,82 @@ test "the parked-buffer gate, cold set: the write past the cap completes at once
     try testing.expect(w.wp.table.has(1, 8));
 }
 
+/// The dead-victim pin's rendezvous on the gate's `refused` station: a
+/// writer whose cold flush the plane refused counts itself in and HOLDS
+/// there — registered on the capacity notify, its tick not started — until
+/// the test releases the set; a finished writer counts itself out. Both
+/// sides are enable-then-recheck over `sync.Notify`; the test's waits carry
+/// a deadline and fail loudly, never wedge.
+const RefusedHold = struct {
+    /// Writers at the station (release; the test's acquire load pairs).
+    reached: Atomic(u32) = .init(0),
+    /// Writers whose write returned (release; the test's acquire pairs).
+    done: Atomic(u32) = .init(0),
+    /// Bumped on every count: the test re-checks its own predicate.
+    counted: sync_notify.Notify = .init,
+    /// Set once by the test (release; the writers' acquire load pairs).
+    released: Atomic(u32) = .init(0),
+    release_notify: sync_notify.Notify = .init,
+
+    fn hook(self: *RefusedHold) ParkHook {
+        return .{ .ctx = self, .parked = &noStation, .refused = &refused };
+    }
+
+    fn noStation(_: *anyopaque) void {}
+
+    fn refused(ctx: *anyopaque) void {
+        const self: *RefusedHold = @ptrCast(@alignCast(ctx));
+        const io = testing.io;
+        self.count(io, &self.reached);
+        while (true) {
+            var n = self.release_notify.notified();
+            _ = n.enable(io);
+            if (self.released.load(.acquire) != 0) {
+                n.cancel(io);
+                return;
+            }
+            n.waitUncancelable(io);
+        }
+    }
+
+    fn count(self: *RefusedHold, io: Io, word: *Atomic(u32)) void {
+        _ = word.fetchAdd(1, .release);
+        self.counted.notifyWaiters(io);
+    }
+
+    fn release(self: *RefusedHold, io: Io) void {
+        self.released.store(1, .release);
+        self.release_notify.notifyWaiters(io);
+    }
+
+    /// `word >= want` before the deadline, else `error.RendezvousDeadline`.
+    fn awaitCount(self: *RefusedHold, io: Io, word: *const Atomic(u32), want: u32, deadline_ns: u64) error{RendezvousDeadline}!void {
+        while (true) {
+            var n = self.counted.notified();
+            _ = n.enable(io);
+            if (word.load(.acquire) >= want) {
+                n.cancel(io);
+                return;
+            }
+            if (n.waitUntilUncancelable(io, deadline_ns) == .deadline) {
+                if (word.load(.acquire) >= want) return;
+                return error.RendezvousDeadline;
+            }
+        }
+    }
+};
+
+/// The dead-victim pin's bound on every rendezvous: a writer reaches the
+/// station in one ladder round and a refused fake DMA (microseconds), and
+/// completes one tick after the heal; two ticks past either, the gate is
+/// wedged and the row goes red with its counters instead of hanging.
+const DEAD_VICTIM_BOUND_NS: u64 = 2 * PARKED_COLD_NS;
+/// The quiet window after the F2 trigger: a quarter tick — inside the
+/// ticks that began at the release by a wide margin, and ~100 round trips
+/// of a settle-riding gate (the pristine shape re-flushed 130 times in a
+/// shorter span).
+const DEAD_VICTIM_QUIET_NS: u64 = PARKED_COLD_NS / 4;
+
 // A dead victim: the coldest block's flush fails (no fresh block, a failed
 // DMA) — the gate waits a whole tick before trying again, woken only by a
 // RETIRE (capacity returned), never by an upload's exit: a failed upload
@@ -1706,6 +1793,18 @@ test "the parked-buffer gate, cold set: the write past the cap completes at once
 // notify woke one another's failed flushes forever (the bracket harness's
 // seq-write-1m-buffered leg: 7.7 M, then 3.75 M gate rounds in four
 // minutes on a set whose free blocks all sat in reclaim debt).
+//
+// The pin rides the gate's `refused` station (`RefusedHold`): the arrivals
+// are serialized there — a writer entering while a sibling's flush is in
+// flight DEFERS to that upload instead of flushing (the hot-set law), which
+// made the pristine pin's "three first-round flushes" a schedule lottery
+// whose late flushes landed on the first writer's tick (`expected 3, found
+// 4`, the wall's tripwire, and a World torn down under three live writers:
+// SIGSEGV, or the wedge of 2026-10-10). Held, nobody's tick runs while the
+// others arrive; released together, the F2 trigger is fired at the parked
+// set from the test thread — a refused flush's settle — and the quiet
+// window is a deadline wait on `upload_settled` itself: a settle inside it
+// IS a writer re-flushing on a settle.
 test "the parked-buffer gate, dead victim: three writers whose cold flushes fail retry once per tick, never spin on one another; every write completes when the device heals" {
     const io = testing.io;
     const w = try World.init(testing.allocator, .sync_inline, false);
@@ -1716,36 +1815,85 @@ test "the parked-buffer gate, dead victim: three writers whose cold flushes fail
     for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
     // Every DMA fails until the test heals the device.
     w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    var hold: RefusedHold = .{};
     const Writer = struct {
         w: *World,
+        hold: *RefusedHold,
         block: u32,
         result: anyerror!void = error.NotRun,
         fn run(self: *@This()) void {
-            self.result = parkHalf(self.w, testing.io, 1, self.block, 9);
+            self.result = parkHalfHooked(self.w, testing.io, 1, self.block, 9, self.hold.hook());
+            self.hold.count(testing.io, &self.hold.done);
         }
     };
-    var writers = [_]Writer{ .{ .w = w, .block = 8 }, .{ .w = w, .block = 9 }, .{ .w = w, .block = 10 } };
+    var writers = [_]Writer{ .{ .w = w, .hold = &hold, .block = 8 }, .{ .w = w, .hold = &hold, .block = 9 }, .{ .w = w, .hold = &hold, .block = 10 } };
     var threads: [3]std.Thread = undefined;
-    for (&threads, &writers) |*t, *wr| t.* = try std.Thread.spawn(.{}, Writer.run, .{wr});
-    // Every writer's first cold flush failed (the upload's fallback) and all
-    // three sit registered on the capacity notify.
-    while (accumulate.stats.write_through_fallbacks.load() < fallbacks0 + 3 or w.wp.table.capacity.waiters(io) < 3) std.Thread.yield() catch {};
-    const waits_at_park = stats.parked_gate_waits.load();
-    const fallbacks_at_park = accumulate.stats.write_through_fallbacks.load();
-    // They stay parked: thousands of yields later not one more flush was
-    // attempted (the settle-riding gate attempted 130 in the same span).
-    for (0..4096) |_| std.Thread.yield() catch {};
-    try testing.expectEqual(fallbacks_at_park, accumulate.stats.write_through_fallbacks.load());
-    try testing.expectEqual(waits_at_park, stats.parked_gate_waits.load());
+    var spawned: usize = 0;
+    var joined = false;
+    // A red row never tears the World down under live writers: release the
+    // held ones, fail the rest out of the gate (`VolumeFailed` ⇒
+    // `.fence_drop` ⇒ the write errors at its next tick) and join.
+    defer if (!joined) {
+        hold.release(io);
+        w.f.dev.setFailWrites(std.math.maxInt(u32), error.VolumeFailed);
+        for (threads[0..spawned]) |t| t.join();
+    };
+    const Loud = struct {
+        fn counters(w_: *World, h: *RefusedHold, io_: Io, waits0_: u64, cold0_: u64, fallbacks0_: u64) void {
+            std.debug.print("dead victim: gate waits +{d}, cold flushes +{d}, fallbacks +{d}, capacity waiters {d}, at the station {d}, done {d}\n", .{ stats.parked_gate_waits.load() - waits0_, stats.parked_gate_cold_flushes.load() - cold0_, accumulate.stats.write_through_fallbacks.load() - fallbacks0_, w_.wp.table.capacity.waiters(io_), h.reached.load(.acquire), h.done.load(.acquire) });
+        }
+    };
+    // The arrivals, one at a time: writer k is spawned once writer k−1 holds
+    // at the station (its refused flush settled, no upload in flight), so
+    // each one's FIRST round is a cold flush, never the hot-set deferral.
+    const arrival_deadline = clock.monotonicNs() + DEAD_VICTIM_BOUND_NS;
+    for (&threads, &writers, 1..) |*t, *wr, k| {
+        t.* = try std.Thread.spawn(.{}, Writer.run, .{wr});
+        spawned += 1;
+        hold.awaitCount(io, &hold.reached, @intCast(k), arrival_deadline) catch |e| {
+            std.debug.print("dead victim: writer {d} never reached the refused station\n", .{k});
+            Loud.counters(w, &hold, io, waits0, cold0, fallbacks0);
+            return e;
+        };
+    }
+    // Exactly one gate visit and one refused cold flush per writer; all
+    // three registered on the capacity notify, nothing in flight.
+    try testing.expectEqual(waits0 + 3, stats.parked_gate_waits.load());
+    try testing.expectEqual(cold0 + 3, stats.parked_gate_cold_flushes.load());
+    try testing.expectEqual(fallbacks0 + 3, accumulate.stats.write_through_fallbacks.load());
+    try testing.expectEqual(@as(u32, 3), w.wp.table.capacity.waiters(io));
+    try testing.expect(!w.wp.table.anyUploadInflight());
+    // Released together: three ticks start now.
+    hold.release(io);
+    // The F2 trigger: a refused flush's settle fired at three writers
+    // parked at the gate (block 3 stays parked, zero-completed).
+    try testing.expectEqual(accumulate.Disposition.stay_parked, accumulate.flushParkedBlock(&w.wp.table, w.wp.uploadDeps(), io, 1, 3));
+    try testing.expectEqual(fallbacks0 + 4, accumulate.stats.write_through_fallbacks.load());
+    // The quiet window on the settle notify itself.
+    var settle = w.wp.table.upload_settled.notified();
+    _ = settle.enable(io);
+    const quiet = settle.waitUntilUncancelable(io, clock.monotonicNs() + DEAD_VICTIM_QUIET_NS);
+    if (quiet != .deadline or stats.parked_gate_waits.load() != waits0 + 3 or accumulate.stats.write_through_fallbacks.load() != fallbacks0 + 4) {
+        std.debug.print("dead victim: a writer re-flushed inside its tick (settle wait: {t})\n", .{quiet});
+        Loud.counters(w, &hold, io, waits0, cold0, fallbacks0);
+        return error.WriterSpunOnSettle;
+    }
+    // The heal: the ticks' flushes land and every write completes — a round
+    // or two per writer (the tick, then a retire's wake), never thousands.
     w.f.dev.setFailWrites(0, error.InputOutput);
+    hold.awaitCount(io, &hold.done, 3, clock.monotonicNs() + DEAD_VICTIM_BOUND_NS) catch |e| {
+        std.debug.print("dead victim: the writes did not complete within two ticks of the heal\n", .{});
+        Loud.counters(w, &hold, io, waits0, cold0, fallbacks0);
+        return e;
+    };
     for (threads) |t| t.join();
+    joined = true;
     for (writers) |wr| try wr.result;
-    // A round or two per writer after the heal (the tick, then a retire's
-    // wake), never thousands.
-    try testing.expect(stats.parked_gate_waits.load() - waits_at_park <= 9);
+    try testing.expect(stats.parked_gate_waits.load() - (waits0 + 3) <= 9);
     try testing.expect(stats.parked_gate_waits.load() - waits0 >= 6);
     try testing.expect(stats.parked_gate_cold_flushes.load() - cold0 >= 4);
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    try testing.expect(w.wp.table.has(1, 3));
     for ([_]u32{ 8, 9, 10 }) |b| try testing.expect(w.wp.table.has(1, b));
 }
 

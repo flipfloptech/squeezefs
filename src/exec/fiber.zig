@@ -212,10 +212,12 @@ pub const Stack = struct {
     pub fn trim(self: *Stack) void {
         if (self.trimmed) return;
         const u = self.usable();
+        const held = self.residentBytes();
         if (linux.errno(linux.madvise(@alignCast(u.ptr), u.len, linux.MADV.DONTNEED)) != .SUCCESS) return;
         self.trimmed = true;
         stats.fiber_stack_bytes.sub(u.len);
-        stats.fiber_stack_trimmed_bytes.add(u.len);
+        // The pages the kernel actually gave back (the reserve is virtual).
+        stats.fiber_stack_trimmed_bytes.add(held);
     }
 
     /// The pages the kernel holds for the usable region (`mincore`); 0 when
@@ -633,7 +635,7 @@ test "Stack.trim returns the usable region and leaves the guard counted; rearm c
     try testing.expectEqual(@as(u64, 0), s.residentBytes());
     try testing.expect(s.trimmed);
     try testing.expectEqual(before + page, stats.fiber_stack_bytes.load());
-    try testing.expectEqual(trimmed_before + u.len, stats.fiber_stack_trimmed_bytes.load());
+    try testing.expectEqual(trimmed_before + u.len, stats.fiber_stack_trimmed_bytes.load()); // the canary touched every page
     s.trim(); // idempotent
     try testing.expectEqual(before + page, stats.fiber_stack_bytes.load());
     // The pages are gone: the top byte reads zero (not the canary, not the write).

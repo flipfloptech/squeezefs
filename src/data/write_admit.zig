@@ -759,6 +759,7 @@ pub const WritePath = struct {
         // the handler's classifier disagreeing with the data plane.
         if (req.class == .shared and (file.kind != .striped or end > file.size)) {
             stats.write_shared_class_violation.fire("a Shared-classified write extends the file or is not striped");
+            log.err("write ino {d} [{d}, {d}): classified Shared against a {t} file of size {d}", .{ req.ino, req.offset, end, file.kind, file.size });
         }
         const first: u32 = @intCast(req.offset / bs);
         const last: u32 = @intCast((end - 1) / bs);

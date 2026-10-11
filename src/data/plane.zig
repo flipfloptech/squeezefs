@@ -94,6 +94,7 @@ const tx_mod = @import("../meta/tx.zig");
 const dlm = @import("../meta/dlm.zig");
 const jc = @import("../meta/journal_core.zig");
 const inos = @import("../meta/inos.zig");
+const route_table = @import("../meta/routing/route_table.zig");
 const op_guard = @import("../fuse/handler/op_guard.zig");
 const fsv = @import("../fuse/transport/filesystem_vtable.zig");
 const transport_slot = @import("../fuse/transport/slot.zig");
@@ -2665,12 +2666,27 @@ pub const DataPlane = struct {
     }
 
     /// The shared-mode admission probe (charter §6.2): a resident striped
-    /// snapshot whose size the write stays within.
-    pub fn sharedProbe(self: *DataPlane, ino: u64, offset: u64, end: u64) ?op_guard.SharedProbe {
+    /// snapshot whose size the write stays within. `nodeid` is the
+    /// kernel's; the table is keyed by the plane's effective ino.
+    pub fn sharedProbe(self: *DataPlane, nodeid: u64, offset: u64, end: u64) ?op_guard.SharedProbe {
         _ = offset;
-        const snap = self.shape.peek(ino) orelse return null;
+        const snap = self.shape.peek(shapeProbeKey(nodeid) orelse return null) orelse return null;
         if (!snap.striped_passthrough and self.passthrough) return null;
         return .{ .size_floor = snap.size, .meta_size = snap.size, .block_size = self.block_size, .range_fully_mapped = null, .narrow = end <= snap.size };
+    }
+
+    /// The shape table's key for a kernel nodeid (the lifecycle's probe):
+    /// the plane publishes under the EFFECTIVE ino (`route_table.
+    /// effectiveIno`, the key every layout record lives under), and the two
+    /// spaces alias — the mint's rotor makes nodeid 4 slot 2's local 2 (key
+    /// `(3 << 40) | 2`) while key 4 is slot 0's local 4 (nodeid 131074), so a
+    /// raw nodeid probe read ANOTHER file's size (fstests generic/464:
+    /// `write_shared_class_violation` ×193, every one an append at its own
+    /// EOF classified Shared on a longer sibling). A nodeid outside the
+    /// mint's space (a virtual control inode) has no shape.
+    fn shapeProbeKey(nodeid: u64) ?u64 {
+        if (!route_table.isRoutable(nodeid)) return null;
+        return route_table.effectiveIno(nodeid);
     }
 
     pub fn probe(self: *DataPlane) op_guard.Probe {
@@ -2918,6 +2934,28 @@ test "the shape table publishes ino-last and a torn row never matches a foreign 
     try testing.expect(t.peek(8) == null);
     t.forget(7);
     try testing.expect(t.peek(7) == null);
+}
+
+// fstests generic/464 (`write_shared_class_violation` ×193 in one run, every
+// one an append at the file's own EOF): the shape table is keyed by the
+// plane's EFFECTIVE ino, the lifecycle probed it by the kernel NODEID, and
+// the two spaces alias — the mint's rotor gives file #2 nodeid 4 (slot 2,
+// local 2: key `(3 << 40) | 2`) and file #128 key 4 (slot 0, local 4: nodeid
+// 131074), so file #2's writes were classified on file #128's size.
+test "the shared probe keys by the plane's effective ino: a nodeid answers its own file's shape, never the file whose key merely equals that number" {
+    var t = try ShapeTable.init(testing.allocator);
+    defer t.deinit(testing.allocator);
+    const nodeid_a: u64 = 4;
+    const key_a = route_table.effectiveIno(nodeid_a);
+    const nodeid_b = route_table.globalOfEffective(nodeid_a);
+    try testing.expect(key_a != nodeid_a and nodeid_b != nodeid_a);
+    t.publish(key_a, 1 << 20, true);
+    t.publish(route_table.effectiveIno(nodeid_b), 6 << 20, true);
+    try testing.expectEqual(@as(u64, 1 << 20), t.peek(DataPlane.shapeProbeKey(nodeid_a).?).?.size);
+    try testing.expectEqual(@as(u64, 6 << 20), t.peek(DataPlane.shapeProbeKey(nodeid_b).?).?.size);
+    // A nodeid outside the mint's space (a virtual control inode) probes nothing.
+    try testing.expect(DataPlane.shapeProbeKey(0) == null);
+    try testing.expect(DataPlane.shapeProbeKey(std.math.maxInt(u64) - 7) == null);
 }
 
 test "stagingCapacity law: clamp(free/4, 64 MiB, budget/8) on the record grain" {

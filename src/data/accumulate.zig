@@ -846,7 +846,11 @@ pub fn uploadParkedBlock(table: *Table, deps: UploadDeps, io: Io, ino: u64, bloc
         }
         defer snap.release(&table.pool);
         // UNLOCKED device phase: transform → allocate (unstable) → DMA → publish.
-        const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = ino, .block = block }, io, deps.valve, null, false) catch |e| switch (e) {
+        // The mint WAITS for visible supply (a window being refilled, a
+        // trim window, a pending drain): this upload returns a parked cell
+        // and has no cheaper arm, so it outranks a fresh overlay mint
+        // (which declines to accumulation at once) under scarce supply.
+        const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = ino, .block = block }, io, deps.valve, null, false, .visible_supply) catch |e| switch (e) {
             error.StorageFull => {
                 // KD-1.7: the ENOSPC early-close frees parked supply; a
                 // release lets the next pass land, else the block stays

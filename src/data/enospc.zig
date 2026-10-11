@@ -238,22 +238,37 @@ pub fn allocateWithValve(alloc: *BlockAllocator, io: Io, valve: ?Valve) AllocErr
     }
 }
 
-/// `allocate_block_grace_bounded`: the WRITE PATH's form. `reclaimable` is
-/// "the grace ring is non-empty" (rung 6); on an unarmed mount it is
-/// structurally `false`, so this is byte-identical to `allocateWithValve`
-/// (one branch). Otherwise: park `slice` at a time on the supply edge up
-/// to the WALL, then refuse loud.
-pub fn allocateBlockGraceBounded(alloc: *BlockAllocator, io: Io, valve: ?Valve, reclaimable: bool, fence_bound: ?FenceBoundSource) AllocError!Minted {
+/// What a `StorageFull` from the valve means to the caller.
+pub const SupplyWait = enum {
+    /// Refuse at once: the caller holds a block guard, or has a cheaper
+    /// arm to fall to (the overlay store declines to accumulation — the
+    /// fresh mint YIELDS to the flush under scarce supply).
+    none,
+    /// Park on the allocator's supply edge, a slice at a time up to the
+    /// wall, while its supply is VISIBLE (`freshSupplyVisible`: a window
+    /// a top-up is refilling, blocks inside a trim window, a reclaim drain
+    /// pending, the grace ring) — the RAM-freeing flush's form: it has no
+    /// cheaper arm, and the cell it holds returns only when it lands.
+    /// Supply gone invisible is the terminal verdict at once.
+    visible_supply,
+};
+
+/// `allocate_block_grace_bounded`: the WRITE PATH's form. `.none` is
+/// byte-identical to `allocateWithValve` (one branch). `.visible_supply`:
+/// while the allocator's supply is visible, park `slice` at a time on the
+/// supply edge (the top-up, the free, the trim return and the drain ring
+/// it) up to the WALL, then refuse loud; invisible ⇒ terminal at once.
+pub fn allocateBlockGraceBounded(alloc: *BlockAllocator, io: Io, valve: ?Valve, wait: SupplyWait, fence_bound: ?FenceBoundSource) AllocError!Minted {
     const started = clock.monotonicNs();
     while (true) {
         const err = if (allocateWithValve(alloc, io, valve)) |m| return m else |e| e;
-        if (err != error.StorageFull or !reclaimable) return err;
+        if (err != error.StorageFull or wait == .none or !alloc.freshSupplyVisible()) return err;
         const base = fenceBoundBaseMs(fence_bound);
         const wall_ns = pressureParkWallMs(base) * std.time.ns_per_ms;
         const waited = clock.monotonicNs() - started;
         if (waited >= wall_ns) {
             stats.alloc_pressure_park_wall_refusals.inc();
-            log.err("data volume {d}: StorageFull after parking {d} ms for reclaimable supply (wall {d} ms = max(2 × fence bound {d} ms, 1 s)) — refusing ENOSPC; the plane is broken, not slow", .{ alloc.cfg.vol, waited / std.time.ns_per_ms, wall_ns / std.time.ns_per_ms, base });
+            log.err("data volume {d}: StorageFull after parking {d} ms for visible supply ({d} block(s) in sight; wall {d} ms = max(2 × fence bound {d} ms, 1 s)) — refusing; the plane is broken, not slow", .{ alloc.cfg.vol, waited / std.time.ns_per_ms, alloc.freeSupplyBlocks(), wall_ns / std.time.ns_per_ms, base });
             return err;
         }
         stats.alloc_pressure_parks.inc();
@@ -291,20 +306,23 @@ pub const PlacedMint = struct { alloc: *BlockAllocator, minted: Minted };
 /// `allocate_placed_block`: pick + the grace-bounded mint on the ONE picked
 /// volume; a `StorageFull` runs the pressure-supply hook and retries the
 /// mint ONCE with a fresh pick. The `under_guard` form (a caller holding a
-/// level-3.5 stripe or a 4a guard) skips the hook — the lock law.
-pub fn allocatePlacedMint(picker: Picker, place: Place, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!PlacedMint {
+/// level-3.5 stripe or a 4a guard) skips the hook — the lock law — and
+/// never waits (`wait` is the caller's class; a guard holder passes
+/// `.none`).
+pub fn allocatePlacedMint(picker: Picker, place: Place, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool, wait: SupplyWait) PlacedError!PlacedMint {
+    assert(!under_guard or wait == .none);
     const first = picker.pick(picker.ctx, place) orelse return error.NoHealthyBackends;
-    const err = if (allocateBlockGraceBounded(first, io, valve, false, null)) |m| return .{ .alloc = first, .minted = m } else |e| e;
+    const err = if (allocateBlockGraceBounded(first, io, valve, wait, null)) |m| return .{ .alloc = first, .minted = m } else |e| e;
     if (err != error.StorageFull) return err;
     if (!under_guard) {
         if (hook) |h| _ = h.run(h.ctx);
     }
     const second = picker.pick(picker.ctx, place) orelse return error.NoHealthyBackends;
-    return .{ .alloc = second, .minted = try allocateBlockGraceBounded(second, io, valve, false, null) };
+    return .{ .alloc = second, .minted = try allocateBlockGraceBounded(second, io, valve, wait, null) };
 }
 
-pub fn allocatePlaced(picker: Picker, place: Place, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool) PlacedError!Minted {
-    return (try allocatePlacedMint(picker, place, io, valve, hook, under_guard)).minted;
+pub fn allocatePlaced(picker: Picker, place: Place, io: Io, valve: ?Valve, hook: ?PressureSupplyHook, under_guard: bool, wait: SupplyWait) PlacedError!Minted {
+    return (try allocatePlacedMint(picker, place, io, valve, hook, under_guard, wait)).minted;
 }
 
 // ---------------------------------------------------------------------------
@@ -475,16 +493,25 @@ test "allocation racing a trim claim window parks and lands on the returned bloc
     try testing.expectEqual(parks + 1, counters.tripwireCount("alloc_trim_window_parks"));
 }
 
-test "the write path's grace-bounded mint: unarmed ⇒ byte-identical to the valve; armed ⇒ parks slices up to the wall then refuses loud" {
+test "the write path's grace-bounded mint: `.none` ⇒ byte-identical to the valve; `.visible_supply` on an exhausted set ⇒ terminal at once; with supply in sight ⇒ parks slices up to the wall then refuses loud; a free during the park lands the mint" {
     const io = testing.io;
     const a = try mkAlloc(1, 0);
     defer a.deinit();
     _ = try a.allocateBlock();
     const parks0 = stats.alloc_pressure_parks.load();
     const wall0 = stats.alloc_pressure_park_wall_refusals.load();
-    try testing.expectError(error.StorageFull, allocateBlockGraceBounded(a, io, null, false, null));
-    try testing.expectEqual(parks0, stats.alloc_pressure_parks.load()); // no park on an unarmed mount
-    // Armed (a non-empty grace ring, rung 6) with a tiny wall: slices then the wall refusal.
+    try testing.expectError(error.StorageFull, allocateBlockGraceBounded(a, io, null, .none, null));
+    try testing.expectEqual(parks0, stats.alloc_pressure_parks.load()); // `.none` never parks
+    // Nothing in sight: the terminal verdict at once, no park.
+    try testing.expectError(error.StorageFull, allocateBlockGraceBounded(a, io, null, .visible_supply, null));
+    try testing.expectEqual(parks0, stats.alloc_pressure_parks.load());
+    // Supply in sight that never arrives (a reclaim drain "pending" forever) with the floor wall: slices then the wall refusal.
+    const Pending = struct {
+        fn pending(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    a.space_pending = .{ .ctx = null, .pending = &Pending.pending };
     const Src = struct {
         fn base(_: ?*anyopaque) u64 {
             return 0;
@@ -492,12 +519,29 @@ test "the write path's grace-bounded mint: unarmed ⇒ byte-identical to the val
     };
     const t0 = clock.monotonicNs();
     log.testing.expectErrorLogs(1);
-    try testing.expectError(error.StorageFull, allocateBlockGraceBounded(a, io, null, true, .{ .ctx = null, .baseMs = &Src.base }));
+    try testing.expectError(error.StorageFull, allocateBlockGraceBounded(a, io, null, .visible_supply, .{ .ctx = null, .baseMs = &Src.base }));
     try log.testing.expectAllFired();
     const waited = clock.monotonicNs() - t0;
     try testing.expect(waited >= PRESSURE_PARK_WALL_FLOOR_MS * std.time.ns_per_ms);
     try testing.expect(waited < 5 * std.time.ns_per_s);
     try testing.expect(stats.alloc_pressure_parks.load() > parks0);
+    try testing.expectEqual(wall0 + 1, stats.alloc_pressure_park_wall_refusals.load());
+    // Supply that ARRIVES during the park: the free rings the edge, the mint lands on it.
+    const Freer = struct {
+        fn run(io_: Io, alloc: *BlockAllocator) void {
+            while (alloc.supply_edge.waiters(io_) == 0) std.Thread.yield() catch {};
+            _ = alloc.freeBlock(0) catch unreachable;
+            alloc.supply_edge.notifyWaiters(io_);
+        }
+    };
+    var fut = io.concurrent(Freer.run, .{ io, a }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return testkit.skip(@src(), .no_concurrency, "the executor refused a unit of concurrency"),
+    };
+    const t1 = clock.monotonicNs();
+    const m = try allocateBlockGraceBounded(a, io, null, .visible_supply, null);
+    fut.await(io);
+    try testing.expectEqual(@as(u64, 0), m.idx);
+    try testing.expect(clock.monotonicNs() - t1 < PRESSURE_PARK_WALL_FLOOR_MS * std.time.ns_per_ms);
     try testing.expectEqual(wall0 + 1, stats.alloc_pressure_park_wall_refusals.load());
 }
 
@@ -524,17 +568,17 @@ test "allocatePlaced: pick + mint; StorageFull runs the pressure hook (not under
     };
     P.first = full;
     P.second = open;
-    const m = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, .{ .ctx = null, .run = &P.hook }, false);
+    const m = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, .{ .ctx = null, .run = &P.hook }, false, .none);
     try testing.expectEqual(@as(u64, 0), m.idx);
     try testing.expectEqual(@as(u64, 1), open.usedBlocks()); // the retry landed on the fresh pick
     try testing.expectEqual(@as(u32, 2), P.picks);
     try testing.expectEqual(@as(u32, 1), P.hook_runs);
     P.picks = 0;
-    _ = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, .{ .ctx = null, .run = &P.hook }, true);
+    _ = try allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, .{ .ctx = null, .run = &P.hook }, true, .none);
     try testing.expectEqual(@as(u32, 1), P.hook_runs); // under a guard the hook never runs
     P.first = null;
     P.picks = 0;
-    try testing.expectError(error.NoHealthyBackends, allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, null, false));
+    try testing.expectError(error.NoHealthyBackends, allocatePlaced(.{ .ctx = null, .pick = &P.pick }, .{ .ino = 1, .block = 0 }, io, null, null, false, .none));
 }
 
 test "stats JSON" {

@@ -204,7 +204,7 @@ pub fn flushOne(deps: Deps, io: Io, unit: *Unit) Disposition {
             return .superseded_noop;
         }
         // 2. The placed mint (no shard guard across it) + the owners.
-        const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = unit.ino, .block = unit.block }, io, deps.valve, null, true) catch return .retry;
+        const pm = enospc.allocatePlacedMint(deps.picker, .{ .ino = unit.ino, .block = unit.block }, io, deps.valve, null, true, .none) catch return .retry;
         var mint = block_alloc.MintedBlockGuard.init(pm.alloc, pm.minted);
         var fsck_guard = block_alloc.InflightAllocGuard.register(pm.alloc, pm.minted.idx);
         const vol_tag = pm.alloc.volTag();

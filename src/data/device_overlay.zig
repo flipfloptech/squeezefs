@@ -869,11 +869,13 @@ pub const Overlay = struct {
     }
 
     /// INSTALL: `allocate_placed_block` (reserve-before-DMA; `StorageFull`
-    /// declines to accumulation — KD-B4-8 both shapes), fsck guard + mint
-    /// owner, the slot vehicle needs the direct leg, the OVERWRITE capture
-    /// in ONE (3.5) section with the install (§5.1).
+    /// declines to accumulation — KD-B4-8 both shapes; the fresh mint never
+    /// waits for supply: under (3) and with the accumulation arm to fall
+    /// to, it YIELDS scarce supply to the flushes that return RAM), fsck
+    /// guard + mint owner, the slot vehicle needs the direct leg, the
+    /// OVERWRITE capture in ONE (3.5) section with the install (§5.1).
     fn installRecord(self: *Overlay, io: Io, req: StoreRequest) StoreError!?*Record {
-        const pm = enospc.allocatePlacedMint(self.deps.picker, .{ .ino = req.ino, .block = req.block }, io, self.deps.valve, self.deps.pressure_hook, true) catch |e| switch (e) {
+        const pm = enospc.allocatePlacedMint(self.deps.picker, .{ .ino = req.ino, .block = req.block }, io, self.deps.valve, self.deps.pressure_hook, true, .none) catch |e| switch (e) {
             error.StorageFull => {
                 stats.overlay_enospc_declines.inc();
                 return null;

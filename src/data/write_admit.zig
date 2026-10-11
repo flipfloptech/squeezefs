@@ -165,10 +165,16 @@ pub const stats = struct {
     pub var parked_gate_cold_flushes: counters.ShardedCounter = .{};
     /// `parked_gate_wall_refusals`: writes answered ENOSPC after
     /// `PARKED_GATE_WALL_NS` of plane-refused cold flushes with no capacity
-    /// returned (the plane is broken, not slow). Must stay 0 on a healthy
-    /// set.
+    /// returned AND every data volume's fresh supply latched exhausted (the
+    /// set is full). Must stay 0 on a set with free blocks.
     pub var parked_gate_wall_refusals: counters.ShardedCounter = .{};
     pub var write_shared_class_violation: counters.Tripwire = .init("write_shared_class_violation");
+    /// The gate's cold flushes failed for a whole wall while fresh supply
+    /// was VISIBLE on some volume: the plane is wrong, not full — the
+    /// write stays parked (loud at the op watchdog's station), never
+    /// ENOSPC (rung 9 F17: the holder's grant ledger refused every top-up
+    /// at 25 % fill and 96 writes per leg were answered ENOSPC).
+    pub var parked_gate_wall_supply_visible: counters.Tripwire = .init("parked_gate_wall_supply_visible");
 
     pub fn ledgerSum() u64 {
         return admit_write_overlay_bytes.load() + admit_write_inplace_bytes.load() + admit_write_accumulate_bytes.load() + admit_write_inline_bytes.load();
@@ -186,7 +192,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ "admit_write_overlay_bytes", "admit_write_inplace_bytes", "admit_write_accumulate_bytes", "admit_write_inline_bytes", "write_enospc_refusals", "write_pieces", "writes_admitted", "staging_sibling_probes", "restage_churn_removes", "restage_churn_bytes", "parked_gate_waits", "parked_gate_self_flushes", "parked_gate_cold_flushes", "parked_gate_wall_refusals" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    try w.print("\"write_shared_class_violation\":{d},", .{counters.tripwireCount("write_shared_class_violation")});
+    try w.print("\"write_shared_class_violation\":{d},\"parked_gate_wall_supply_visible\":{d},", .{ counters.tripwireCount("write_shared_class_violation"), counters.tripwireCount("parked_gate_wall_supply_visible") });
     try w.writeAll("\"overlay\":");
     try device_overlay.writeStatsJson(w);
     try w.writeAll(",\"patch\":");
@@ -1046,11 +1052,14 @@ pub const WritePath = struct {
     /// fresh block to mint, a failed DMA) retires nothing and wakes nobody:
     /// one try per tick, and once the refusals have spanned
     /// `PARKED_GATE_WALL_NS` with no capacity returned the write answers
-    /// ENOSPC — the plane is broken, not slow (the allocation layer's own
-    /// wall, `parked_gate_wall_refusals`, one loud line). The venue's
-    /// aging store reached this with every mintable block held by open
-    /// rewrite-shadow epochs and reclaim debt while fill ratios read 50 %
-    /// and 17 % (rung 9, the bracket harness's seq-write-1m-buffered leg).
+    /// ENOSPC iff the SET is exhausted — every data volume's allocator
+    /// latched `StorageFull` with no supply in sight (the charter's
+    /// terminal law; `parked_gate_wall_refusals`, one loud line). With
+    /// supply visible on any volume the plane is wrong, not full: the
+    /// tripwire `parked_gate_wall_supply_visible` fires, the wall restarts
+    /// and the write stays parked — never ENOSPC on a store with free
+    /// blocks (rung 9 F17: the venue's aging store answered 96 per leg at
+    /// 25 % fill when the holder's grant ledger refused every top-up).
     fn awaitParkedCapacity(self: *WritePath, io: Io, req: Request, block: u32, gate: *GateWall) error{ NoSpaceLeft, WriterGuardFenced }!void {
         stats.parked_gate_waits.inc();
         if (req.park_hook) |h| h.parked(h.ctx);
@@ -1080,10 +1089,15 @@ pub const WritePath = struct {
                         const now = clock.monotonicNs();
                         if (gate.failed_since_ns == 0) gate.failed_since_ns = now;
                         if (now - gate.failed_since_ns >= PARKED_GATE_WALL_NS) {
-                            room.cancel(io);
-                            stats.parked_gate_wall_refusals.inc();
-                            log.err("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused by the plane for {d} ms (wall {d} ms; {d} parked, {d} B) — answering ENOSPC; the plane is broken, not slow", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, PARKED_GATE_WALL_NS / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
-                            return error.NoSpaceLeft;
+                            var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+                            if (enospc.freshSupplyExhausted(self.vols.candidates(&cands))) {
+                                room.cancel(io);
+                                stats.parked_gate_wall_refusals.inc();
+                                log.err("write ino {d} block {d}: the parked-buffer gate's cold flushes have been refused for {d} ms (wall {d} ms; {d} parked, {d} B) and every data volume's fresh supply is latched exhausted — answering ENOSPC", .{ req.ino, block, (now - gate.failed_since_ns) / std.time.ns_per_ms, PARKED_GATE_WALL_NS / std.time.ns_per_ms, self.table.parkedCount(), accumulate.stats.parked_full_buffer_bytes.load() });
+                                return error.NoSpaceLeft;
+                            }
+                            stats.parked_gate_wall_supply_visible.fire("the parked-buffer gate's cold flushes were refused for a whole wall while fresh supply was visible");
+                            gate.failed_since_ns = now;
                         }
                     },
                 }
@@ -1734,27 +1748,85 @@ test "the parked-buffer gate, dead victim: three writers whose cold flushes fail
 }
 
 // The wall: a plane that refuses the gate's cold flushes for the whole wall
-// with no capacity returned answers the write ENOSPC, once and loud — the
-// plane is broken, not slow; RAM is not grown past the cap and nothing is
-// lost (the parked set stays).
-test "the parked-buffer gate, the wall: cold flushes the plane keeps refusing end in ONE loud ENOSPC after the wall; the parked set is intact" {
+// with no capacity returned answers the write ENOSPC, once and loud, iff the
+// SET is exhausted (every volume's allocator latched, nothing in sight) —
+// RAM is not grown past the cap and nothing is lost (the parked set stays).
+test "the parked-buffer gate, the wall on an EXHAUSTED set: cold flushes the full set keeps refusing end in ONE loud ENOSPC after the wall; the parked set is intact" {
     const io = testing.io;
     // The product wall is already shorter than one tick: the second
     // refused flush crosses it.
     const w = try World.init(testing.allocator, .sync_inline, false);
     defer w.deinit(testing.allocator);
     const refusals0 = stats.parked_gate_wall_refusals.load();
+    const visible0 = counters.tripwireCount("parked_gate_wall_supply_visible");
+    const admission0 = stats.write_enospc_refusals.load();
     for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
-    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    // A reader's snapshot shares block 7's cell: the sibling piece below
+    // must copy away into a fresh cell at the cap — the gate, reached PAST
+    // the admission's terminal law (custody held, never fresh).
+    var snap = w.wp.table.snapshot(w.wp.table.get(1, 7).?);
+    defer snap.release(&w.wp.table.pool);
+    // Every block of both volumes minted away: the set is full for good.
+    while (w.f.alloc_a.allocateBlock()) |_| {} else |_| {}
+    while (w.f.alloc_b.allocateBlock()) |_| {} else |_| {}
+    var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+    try testing.expect(enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
     log.testing.expectErrorLogs(1);
     var half: [wt.BS / 2]u8 align(4096) = undefined;
     fill(&half, 9);
-    try testing.expectError(error.NoSpaceLeft, w.wp.write(io, .{ .ino = 1, .offset = 8 * wt.BS, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(8 * wt.BS) }));
+    try testing.expectError(error.NoSpaceLeft, w.wp.write(io, .{ .ino = 1, .offset = 7 * wt.BS + wt.BS / 2, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(7 * wt.BS + wt.BS / 2) }));
     try log.testing.expectAllFired();
+    try testing.expectEqual(admission0, stats.write_enospc_refusals.load()); // the gate's wall, not the admission
     try testing.expectEqual(refusals0 + 1, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(visible0, counters.tripwireCount("parked_gate_wall_supply_visible"));
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
-    try testing.expect(!w.wp.table.has(1, 8));
+    try testing.expect(w.wp.table.has(1, 7)); // the first half stays parked (never a lost byte)
+}
+
+// Rung 9 F17: the venue's aging store answered ENOSPC 96 times per leg at
+// 25 % fill — the gate's wall fired on a plane that was WRONG (the holder's
+// grant ledger refused every top-up), not FULL. With fresh supply visible
+// on any volume the wall is a tripwire and a restart, never a refusal: the
+// write stays parked and completes when the plane heals.
+test "the parked-buffer gate, the wall with supply VISIBLE: a plane refusing the cold flushes past the wall fires `parked_gate_wall_supply_visible`, answers no ENOSPC, and the write completes when the plane heals" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const refusals0 = stats.parked_gate_wall_refusals.load();
+    const visible0 = counters.tripwireCount("parked_gate_wall_supply_visible");
+    for (0..8) |b| try parkHalf(w, io, 1, @intCast(b), @intCast(b + 1));
+    var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+    try testing.expect(!enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
+    // Every DMA fails until the test heals the device: the flushes are
+    // refused, the mints abandoned — the free blocks stay in sight.
+    w.f.dev.setFailWrites(std.math.maxInt(u32), error.InputOutput);
+    // The log seam is per thread: the writer's thread declares the ONE
+    // loud line (the tripwire's) and checks it fired.
+    const Writer = struct {
+        w: *World,
+        result: anyerror!void = error.NotRun,
+        fired: anyerror!void = error.NotRun,
+        fn run(self: *@This()) void {
+            log.testing.expectErrorLogs(1);
+            const r = parkHalf(self.w, testing.io, 1, 8, 9);
+            self.fired = log.testing.expectAllFired();
+            self.result = r;
+        }
+    };
+    var wr: Writer = .{ .w = w };
+    stats.parked_gate_wall_supply_visible.resetLogBudgetForTest();
+    const t = try std.Thread.spawn(.{}, Writer.run, .{&wr});
+    // Past the wall: the tripwire fired, no refusal, the write still parked.
+    while (counters.tripwireCount("parked_gate_wall_supply_visible") == visible0) std.Thread.yield() catch {};
+    try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
+    try testing.expect(!w.wp.table.has(1, 8)); // still at the gate: no byte of it recorded
     w.f.dev.setFailWrites(0, error.InputOutput);
+    t.join();
+    try wr.result;
+    try wr.fired;
+    try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
+    try testing.expect(w.wp.table.has(1, 8));
 }
 
 /// A device hook that holds every DMA until released (the window between a

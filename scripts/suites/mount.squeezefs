@@ -39,6 +39,11 @@ if [[ "$(basename "$0")" == umount.* ]]; then
     shift
   done
   [ -n "$target" ] || die "usage: umount.fuse.squeezefs <mountpoint>"
+  # A BIND of a path inside a squeezefs mount (generic/306 binds a file)
+  # carries our fstype in the mount table but has no daemon of its own:
+  # the kernel's plain detach, silently (mount(8) prints nothing). Only a
+  # daemon's own root gets the orderly `squeezefs umount`.
+  if ! findmnt -n -o FSROOT -M "$target" 2>/dev/null | grep -qx /; then exec umount -i "$target"; fi
   exec "$SQZ_BIN" umount "$target"
 fi
 

@@ -25,7 +25,8 @@
 //!   8 hold_park_never_outlives_the_landing        — the window-fill hold reads the in-flight
 //!                                                 count BEFORE registering on the landing notify
 //!                                                 (the landing between the read and the park is
-//!                                                 lost: the pass parks on an empty flight)
+//!                                                 lost: the pass parks on an empty flight), with
+//!                                                 one and with two windows in flight
 
 const std = @import("std");
 const explorer = @import("../model/explorer.zig");
@@ -856,25 +857,27 @@ fn PassFiber(comptime weakening: Weakening) type {
 // 8. the window-fill hold never parks on an empty flight
 // ---------------------------------------------------------------------------
 
-/// The pass has drained a pad-majority batch while ONE window is in
-/// flight (`conveyor.holdForFill`): it registers on the landing notify
-/// (snapshots the epoch), re-reads the in-flight count, and parks iff it
-/// is still non-zero; a landing (the lane's `finishWindow`: `inflight −=
-/// 1` then `notifyWaiters`: `epoch += 1`, waking a registered waiter)
-/// ends the park, after which the pass re-drains, issues, and runs on as
-/// the leader (the `Pass` loop: drain → unlead → recheck). A committer
-/// enqueues during the hold and loses its election to the holding pass
-/// (or, enqueuing after the unlead, wins and drains itself): its entry is
-/// drained exactly once — by the re-drain into the held window, by the
-/// leader's next drain, or by its own pass. The deadline is not modelled:
-/// it is the latency bound, never the liveness backstop — a hold that
-/// only the deadline could end IS the lost-wake failure.
+/// The pass has drained a pad-majority batch while `inflight0` windows
+/// are in flight (`conveyor.holdForFill`): it registers on the landing
+/// notify (snapshots the epoch), re-reads the in-flight count, and parks
+/// iff it is still non-zero; a landing (the lane's `finishWindow`:
+/// `inflight −= 1` then `notifyWaiters`: `epoch += 1`, waking a registered
+/// waiter) ends the park and the pass registers and re-reads AGAIN —
+/// until the flight is empty — after which it re-drains, issues, and
+/// runs on as the leader (the `Pass` loop: drain → unlead → recheck). A
+/// committer enqueues during the hold and loses its election to the
+/// holding pass (or, enqueuing after the unlead, wins and drains itself):
+/// its entry is drained exactly once — by the re-drain into the held
+/// window, by the leader's next drain, or by its own pass. The deadline is
+/// not modelled: it is the latency bound, never the liveness backstop — a
+/// hold that only the deadline could end IS the lost-wake failure.
 ///
 /// Weakening `.hold_check_before_register`: the pass reads `inflight ==
 /// 1`, the lane lands and bumps the epoch, the pass registers (snapshot =
 /// the NEW epoch) and parks: nothing else will ever notify — the batch
-/// sits on a quiet ring with nothing in flight.
-fn HoldPark(comptime weakening: Weakening) type {
+/// sits on a quiet ring with nothing in flight. With two in flight the
+/// same race sits between any landing's wake and the next registration.
+fn HoldPark(comptime weakening: Weakening, comptime inflight0: u8) type {
     return struct {
         const Self = @This();
         pub const thread_count: usize = 3;
@@ -891,7 +894,7 @@ fn HoldPark(comptime weakening: Weakening) type {
         epoch: u8 = 0,
         pass_linked: bool = false,
         pass_epoch: u8 = 0,
-        inflight: u8 = 1,
+        inflight: u8 = inflight0,
         ppc: Ppc = .drained,
         lpc: Lpc = .landing,
         /// The held window's batch: the drained entry + the re-drain.
@@ -903,20 +906,30 @@ fn HoldPark(comptime weakening: Weakening) type {
         pub fn init() Self {
             return .{};
         }
+        /// A parked pass with no pending wake and nobody left to deliver one.
+        fn stuck(self: *const Self) bool {
+            return self.ppc == .parked and self.epoch == self.pass_epoch and self.lpc == .done and self.c.phase == .done;
+        }
         pub fn done(self: *const Self, t: usize) bool {
             return switch (t) {
                 // A pass parked with nobody left to wake it is where the
                 // schedule ends (the wedge `final` names).
-                pass_t => (self.ppc == .issued and self.pass.pc == .done) or (self.ppc == .parked and self.epoch == self.pass_epoch and self.lpc == .done and self.c.phase == .done),
+                pass_t => (self.ppc == .issued and self.pass.pc == .done) or self.stuck(),
                 lane_t => self.lpc == .done,
                 committer_t => self.c.phase == .done,
                 else => unreachable,
             };
         }
 
+        /// The step after a wake (or at the start): the sound order
+        /// registers first, the weakened one reads the flight first.
+        fn restart(comptime w: Weakening) Ppc {
+            return if (w == .hold_check_before_register) .check else .register;
+        }
+
         fn stepPass(self: *Self) void {
             switch (self.ppc) {
-                .drained => self.ppc = if (weakening == .hold_check_before_register) .check else .register,
+                .drained => self.ppc = restart(weakening),
                 .register => {
                     // `n.enable(io)`: link + snapshot the epoch.
                     self.pass_linked = true;
@@ -925,21 +938,22 @@ fn HoldPark(comptime weakening: Weakening) type {
                 },
                 .check => {
                     if (self.inflight == 0) {
-                        // Nothing to shadow: cancel the registration, issue.
+                        // The flight is empty: cancel the registration, issue.
                         self.pass_linked = false;
                         self.ppc = .redrain_lock;
                     } else self.ppc = if (weakening == .hold_check_before_register) .register else .park;
                 },
                 .park => {
-                    // `waitUntilUncancelable`: a passed epoch returns at once.
+                    // `waitUntilUncancelable`: a passed epoch returns at once
+                    // and the pass registers (or, weakened, reads) again.
                     if (self.epoch != self.pass_epoch) {
                         self.pass_linked = false;
-                        self.ppc = .redrain_lock;
+                        self.ppc = restart(weakening);
                     } else self.ppc = .parked;
                 },
                 .parked => {
                     // Woken by the notify (unlinked there) or still parked.
-                    if (self.epoch != self.pass_epoch) self.ppc = .redrain_lock;
+                    if (self.epoch != self.pass_epoch) self.ppc = restart(weakening);
                 },
                 .redrain_lock => if (!self.sh.locked) {
                     self.sh.locked = true;
@@ -969,10 +983,11 @@ fn HoldPark(comptime weakening: Weakening) type {
                     self.lpc = .notify;
                 },
                 .notify => {
-                    // `notifyWaiters`: bump the epoch, wake the linked waiter.
+                    // `notifyWaiters`: bump the epoch, wake the linked waiter;
+                    // the next window's landing follows while any is in flight.
                     self.epoch += 1;
                     self.pass_linked = false;
-                    self.lpc = .done;
+                    self.lpc = if (self.inflight == 0) .done else .landing;
                 },
                 .done => unreachable,
             }
@@ -1048,14 +1063,16 @@ test "conveyor_pass_fiber_wake_not_lost: holds; a park without the leader re-rea
     try explorer.expectFails(PassFiber(.park_without_leader_recheck), .{}, error.FinalViolated);
 }
 
-test "conveyor_hold_park_never_outlives_the_landing: holds (register-then-check; the late entry rides the held window); check-before-register fails (the landing between the read and the park is lost)" {
-    try explorer.expectHolds(HoldPark(.none), .{});
-    try explorer.expectFails(HoldPark(.hold_check_before_register), .{}, error.InvariantViolated);
+test "conveyor_hold_park_never_outlives_the_landing: holds with one and with two windows in flight (register-then-check per landing; the late entry is drained exactly once); check-before-register fails both (the landing between the read and the park is lost)" {
+    try explorer.expectHolds(HoldPark(.none, 1), .{});
+    try explorer.expectHolds(HoldPark(.none, 2), .{});
+    try explorer.expectFails(HoldPark(.hold_check_before_register, 1), .{}, error.InvariantViolated);
+    try explorer.expectFails(HoldPark(.hold_check_before_register, 2), .{}, error.InvariantViolated);
 }
 
 // The state counts the evidence note records.
 test "conveyor models: exhaustive within the explorer's default limits" {
-    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none) }) |Model| {
+    inline for (.{ LeaderUnique(.none), NoLostWakeup(.none), FifoUnderRace(.none), BudgetConserved(.none), GuardOutlives(.none), GroupAtomic(.none), PassFiber(.none), HoldPark(.none, 1), HoldPark(.none, 2) }) |Model| {
         var report: explorer.Report = undefined;
         try explorer.explore(Model, testing.allocator, .{}, &report);
         try testing.expect(report.states > 1);

@@ -552,17 +552,18 @@ pub const Stats = struct {
     rollbacks: counters.ShardedCounter = .{},
     compensations: counters.ShardedCounter = .{},
     /// The window-fill hold (decision 0003 §L). `meta_conveyor_holds`:
-    /// passes that parked on an in-flight window; `_hold_landings` /
-    /// `_hold_deadlines`: how the park ended (the landing's wake, or the
+    /// passes that parked on the flight; `_hold_landings` /
+    /// `_hold_deadlines`: how the park ended (the flight emptied, or the
     /// round-trip predictor's deadline — a deadline is the device running
     /// late, counted so the pacing law's slack is visible). Windows at
     /// handoff by class: `meta_conveyor_windows_held` (issued after a
-    /// hold), `_windows_unshadowed` (pad-majority with nothing in flight —
-    /// a lone committer's, issued at once), `_windows_pipelined`
-    /// (entry-majority, issued beside whatever is in flight). The pacing
-    /// law: `held + unshadowed ≤ landings + deadlines + 1`, so pad-majority
-    /// windows per second ≤ 1 / round trip. `meta_conveyor_hold_bound_ns`:
-    /// the live deadline (`srtt + 4·rttvar`, capped).
+    /// hold), `_windows_unshadowed` (pad-majority, not held: nothing in
+    /// flight — a lone committer's — or the worth gate declined),
+    /// `_windows_pipelined` (entry-majority, issued beside whatever is in
+    /// flight). The pacing law: `held + unshadowed − holds_not_worth ≤
+    /// landings + deadlines + 1`, so pad-majority windows the gate admits
+    /// are at most one per round trip. `meta_conveyor_hold_bound_ns`: the
+    /// live deadline (`srtt + 4·rttvar`, capped).
     holds: counters.ShardedCounter = .{},
     hold_landings: counters.ShardedCounter = .{},
     hold_deadlines: counters.ShardedCounter = .{},
@@ -1203,18 +1204,22 @@ pub const Conveyor = struct {
         return self.deps.geo.padOf(self.deps.core.headPos() + entry_bytes) > entry_bytes;
     }
 
-    /// The window-fill hold (§L): a pad-majority batch waits for the
-    /// window in flight to reach its terminal outcome — a park on
-    /// `landed` bounded by the round-trip predictor's deadline — then the
-    /// pass re-drains what arrived meanwhile into the same window.
-    /// Register-then-check: the landing's wake can land between the
-    /// in-flight read and the park and is never lost. Holds nothing when
-    /// no law is armed, nothing is in flight (a lone committer never
+    /// The window-fill hold (§L): a pad-majority batch waits until NOTHING
+    /// is in flight — every window issued before it has reached its
+    /// terminal outcome — a park on `landed` per landing, bounded by the
+    /// round-trip predictor's deadline from the hold's start; then the
+    /// pass re-drains what arrived meanwhile into the same window. In the
+    /// paced regime that is the one in-flight window's landing; in the
+    /// unpaced regime (several in flight: the gate's probe) it is the
+    /// newest's landing ≈ one round trip — a probe that ended at the FIRST
+    /// landing measured a fraction of the gain and kept the gate off
+    /// (`rand-4k-write`: 0.77–0.9 per probe against 2.3 collected per paced
+    /// hold). Register-then-check on every iteration: a landing's wake
+    /// between the in-flight read and the park is never lost. Holds nothing
+    /// when no law is armed, nothing is in flight (a lone committer never
     /// waits), the batch is entry-majority, the predictor has no sample
     /// yet, the measured gain says a hold collects nothing (`holdWorthIt`,
-    /// probed one window in `HOLD_PROBE_PERIOD`), or the volume is
-    /// closing. One park per window, never a loop: after a landing nothing
-    /// is in flight and the window goes.
+    /// probed one window in `HOLD_PROBE_PERIOD`), or the volume is closing.
     fn holdForFill(self: *Conveyor, batch: []Queued) HeldBatch {
         const unheld: HeldBatch = .{ .batch = batch, .held = false };
         const law = self.deps.window_hold orelse return unheld;
@@ -1244,10 +1249,21 @@ pub const Conveyor = struct {
         }
         self.stats.holds.inc();
         const t0 = clock.monotonicNs();
-        switch (n.waitUntilUncancelable(io, t0 + bound)) {
-            .notified => self.stats.hold_landings.inc(),
-            .deadline => self.stats.hold_deadlines.inc(),
-        }
+        const deadline = t0 + bound;
+        const flight_empty = while (true) {
+            switch (n.waitUntilUncancelable(io, deadline)) {
+                .deadline => break false,
+                .notified => {},
+            }
+            // A landing: register again, then re-read the flight.
+            n = self.landed.notified();
+            _ = n.enable(io);
+            if (self.windowsInflight() == 0) {
+                n.cancel(io);
+                break true;
+            }
+        };
+        if (flight_empty) self.stats.hold_landings.inc() else self.stats.hold_deadlines.inc();
         self.stats.pass_hold.record(clock.monotonicNs() -| t0);
         // The re-drain under the caps' remainder: FIFO is kept (the new
         // members follow the held ones); the caps bound the whole window.

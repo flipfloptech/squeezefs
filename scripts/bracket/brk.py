@@ -546,7 +546,9 @@ def leg(args):
     cp = d["conveyor_phase_ns"]
     rtt_ns = (cp["meta_window_total"]["sum_ns"] / cp["meta_window_total"]["count"]) if cp["meta_window_total"]["count"] else 0
     hold_ns = (cp["meta_pass_hold"]["sum_ns"] / cp["meta_pass_hold"]["count"]) if cp["meta_pass_hold"]["count"] else 0
-    paced = d["meta_conveyor_windows_held"] + d["meta_conveyor_windows_unshadowed"]
+    # The windows the pacing law governs: pad-majority ones the worth gate did
+    # not decline (a declined window is issued beside the flight by design).
+    paced = d["meta_conveyor_windows_held"] + d["meta_conveyor_windows_unshadowed"] - d["meta_conveyor_holds_not_worth"]
     elapsed_ns = (metrics.get("elapsed_s") or 0) * 1e9
     if jwin:
         # The journal's exact sum closes by construction; the harness restates it.
@@ -560,10 +562,10 @@ def leg(args):
         strict = d["journal_lane_barriers_strict"] > 0
         ok = jsum == jdev and (strict or paced <= paced_bound)
         verdicts.append(("meta_pad_fraction_bound", ok,
-                         "journal device bytes %d ≡ entries %d + pad %d + headers %d + holes %d (%s); pad fraction %.3f over %d windows (%.2f entries/window, %d B/op); pad-majority windows %d (held %d, unshadowed %d) vs the pacing bound %.0f (= span %.1f s ÷ window rtt %.0f µs × 1.1 + %d deadline-ended holds + 1); holds %d (not worth %d, probes %d; live gain %.3f/hold), mean hold %.0f µs, live bound %d µs" % (
+                         "journal device bytes %d ≡ entries %d + pad %d + headers %d + holes %d (%s); pad fraction %.3f over %d windows (%.2f entries/window, %d B/op); pad-majority windows under the law %d (held %d, unshadowed %d, of which the gate declined %d) vs the pacing bound %.0f (= span %.1f s ÷ window rtt %.0f µs × 1.1 + %d deadline-ended holds + 1); holds %d (not worth %d, probes %d; live gain %.3f/hold), mean hold %.0f µs, live bound %d µs" % (
                              jdev, jent, jpad, d["meta_kv_journal_header_bytes"], d["meta_kv_journal_hole_bytes"], "closes" if jsum == jdev else "DOES NOT CLOSE",
                              pad_fraction, jwin, (d["meta_kv_journal_entries"] / jwin), (jdev // ops) if ops else 0,
-                             paced, d["meta_conveyor_windows_held"], d["meta_conveyor_windows_unshadowed"], paced_bound, elapsed_ns / 1e9, rtt_ns / 1e3, d["meta_conveyor_hold_deadlines"],
+                             paced, d["meta_conveyor_windows_held"], d["meta_conveyor_windows_unshadowed"], d["meta_conveyor_holds_not_worth"], paced_bound, elapsed_ns / 1e9, rtt_ns / 1e3, d["meta_conveyor_hold_deadlines"],
                              d["meta_conveyor_holds"], d["meta_conveyor_holds_not_worth"], d["meta_conveyor_hold_probes"], after["meta_conveyor_hold_gain_milli"] / 1000.0, hold_ns / 1e3, after["meta_conveyor_hold_bound_ns"] // 1000)))
     # 6. the solo mount's wire census.
     if meta.get("solo", True):

@@ -345,9 +345,10 @@ pub const StatsTerms = struct {
     invariant_tripwires: u64 = 0,
     /// The metadata-WRITE ledger (decision 0003 §L): Σ `meta_write_keys`
     /// (the META device's bytes), the journal's device bytes and pad, its
-    /// windows and entries, the conveyor's pad-majority (paced) windows and
-    /// deadline-ended holds, and the window round trip's exact-sum
-    /// histogram (count, Σ ns) the pacing law divides the span by.
+    /// windows and entries, the conveyor's pad-majority windows under the
+    /// law (held + unshadowed − the gate's declines) and deadline-ended
+    /// holds, and the window round trip's exact-sum histogram (count,
+    /// Σ ns) the pacing law divides the span by.
     meta_write_bytes: u64 = 0,
     journal_device_bytes: u64 = 0,
     journal_pad_bytes: u64 = 0,
@@ -426,7 +427,7 @@ pub const StatsTerms = struct {
         t.journal_pad_bytes = json_scan.number(text, "meta_kv_journal_pad_bytes") orelse 0;
         t.journal_windows = json_scan.number(text, "meta_kv_journal_windows") orelse 0;
         t.journal_entries = json_scan.number(text, "meta_kv_journal_entries") orelse 0;
-        t.paced_windows = (json_scan.number(text, "meta_conveyor_windows_held") orelse 0) + (json_scan.number(text, "meta_conveyor_windows_unshadowed") orelse 0);
+        t.paced_windows = (json_scan.number(text, "meta_conveyor_windows_held") orelse 0) + (json_scan.number(text, "meta_conveyor_windows_unshadowed") orelse 0) -| (json_scan.number(text, "meta_conveyor_holds_not_worth") orelse 0);
         t.hold_deadlines = json_scan.number(text, "meta_conveyor_hold_deadlines") orelse 0;
         t.strict_barriers = json_scan.number(text, "journal_lane_barriers_strict") orelse 0;
         if (json_scan.object(text, "meta_window_total")) |h| {

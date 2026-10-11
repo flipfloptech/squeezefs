@@ -34,23 +34,23 @@ src/cli/args.zig:1656 | 20 | a size — OWED: derive from derive.Facts or docume
 src/cli/args.zig:1666 | 86_400 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/args.zig:1668 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/args.zig:1734 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:415 | 20 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:486 | 500 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:487 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:487 | 990 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:487 | 999 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:501 | 500 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:501 | 990 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:501 | 999 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/cli/bench.zig:502 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/cli/bench.zig:588 | 16 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:588 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:594 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/bench.zig:629 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:632 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/bench.zig:706 | 0o755 | a file mode (POSIX permission bits)
-src/cli/bench.zig:711 | 0o755 | a file mode (POSIX permission bits)
-src/cli/bench.zig:868 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:417 | 20 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:488 | 500 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:489 | 1000 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:489 | 990 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:489 | 999 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:503 | 500 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:503 | 990 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:503 | 999 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/cli/bench.zig:504 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/cli/bench.zig:590 | 16 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:590 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:596 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/bench.zig:631 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:634 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/bench.zig:708 | 0o755 | a file mode (POSIX permission bits)
+src/cli/bench.zig:713 | 0o755 | a file mode (POSIX permission bits)
+src/cli/bench.zig:870 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/config_verb.zig:318 | 0o700 | a file mode (POSIX permission bits)
 src/cli/df.zig:97 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/cli/df.zig:98 | 20 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
@@ -135,7 +135,7 @@ src/data/layout.zig:989 | 4 | OWED: derive it or document it on the line (charte
 src/data/nvme_read_cache.zig:147 | 56 | OWED: derive it or document it on the line (charter §1.5)
 src/data/nvme_read_cache.zig:521 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/data/pack.zig:280 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/data/plane.zig:1719 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/data/plane.zig:1724 | 256 | OWED: derive it or document it on the line (charter §1.5)
 src/data/prefetch.zig:223 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:223 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/prefetch.zig:470 | 16 | OWED: derive it or document it on the line (charter §1.5)
@@ -153,8 +153,8 @@ src/data/read_path.zig:1255 | 3 | a timing/retry constant — OWED: its measured
 src/data/router.zig:165 | 1_000_000 | OWED: derive it or document it on the line (charter §1.5)
 src/data/set_config.zig:236 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/data/set_config.zig:390 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/data/staging.zig:1319 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/data/staging.zig:1417 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/data/staging.zig:1353 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/data/staging.zig:1451 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/alloc_lease.zig:603 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/alloc_lease.zig:604 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/sym_planes/block_grant.zig:116 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)

@@ -296,9 +296,11 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
 }
 
 /// Σ of the device-write byte arms (`brk.py` `DEVICE_WRITE_ARMS` minus the
-/// ring's writeback leg, which this harness never engages).
+/// ring's writeback leg and the plane's own-block DMA, which this harness
+/// never engages; `durable_upload_bytes_escalation` is a subset of
+/// `write_through_bytes` and is not summed twice).
 fn deviceWriteBytes() u64 {
-    return accumulate.stats.write_through_bytes.load() + accumulate.stats.durable_upload_bytes_escalation.load() + extent.stats.fold_inplace_write_bytes.load() + patch_w1.stats.patch_write_bytes.load() + device_overlay.stats.overlay_store_bytes.load();
+    return accumulate.stats.write_through_bytes.load() + extent.stats.fold_inplace_write_bytes.load() + patch_w1.stats.patch_write_bytes.load() + device_overlay.stats.overlay_store_bytes.load();
 }
 
 test "e2e(nvme_dev): the W2 amplification law at the 4 MiB block (repro-port: fstests generic/074 `fstest -F -b 512`, 128× on c36b531): 512 B writes at a 1 KiB stride extending a fresh file land each block ONCE at release (device bytes == blocks × 4 MiB = 2× the user bytes, one DMA per block, zero reads) and read back byte-exact; sector writes into 4 scattered pages of a published block fold IN PLACE as 4 page DMAs (16 KiB, the 8× bound) with the binding unchanged" {

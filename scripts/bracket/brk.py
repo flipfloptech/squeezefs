@@ -38,12 +38,18 @@ SECTOR = 512
 # device ONCE. `rewrite_device_write_bytes` is the rewrite epoch's accounting
 # of the SAME overlay DMA (measured: overlay 22.17 GB + rewrite 6.09 GB against
 # diskstats 1.025 × user on a 22.28 GB row) and is reported beside, not summed.
+# `write_through_bytes` is EVERY parked full buffer's upload (the sequential
+# accumulation, the W2 escalation at its RAM trigger, the flush-time
+# complement); `durable_upload_bytes_escalation` is its flush-time-complement
+# SUBSET (measured on generic/074's growing-file shape: 825 write-through
+# blocks, 0 escalation bytes — summing the subset alone read 0 device bytes
+# against 3.5 GB on diskstats) and is reported beside.
 DEVICE_WRITE_ARMS = [
     "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes",
-    "durable_upload_bytes_escalation", "durable_upload_bytes_writeback",
+    "write_through_bytes", "durable_upload_bytes_writeback",
     "fold_inplace_write_bytes",
 ]
-DEVICE_WRITE_BESIDE = ["rewrite_device_write_bytes", "rewrite_shadow_bytes", "rewrite_user_bytes"]
+DEVICE_WRITE_BESIDE = ["rewrite_device_write_bytes", "rewrite_shadow_bytes", "rewrite_user_bytes", "durable_upload_bytes_escalation"]
 # The device-write REQUEST counters beside the byte arms (the stats-side
 # `wareq-sz`; the substrate's diskstats is the ruler — these are the daemon's view).
 # `put_obj` is the block device layer's put (an overlay store IS a put — not

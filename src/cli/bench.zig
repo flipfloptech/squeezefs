@@ -348,8 +348,10 @@ pub const StatsTerms = struct {
     /// device ONCE. `rewrite_device_write_bytes` counts the SAME overlay DMA
     /// the rewrite epoch was fed (measured: overlay 22.17 GB + rewrite
     /// 6.09 GB against diskstats 1.025 × user on a 22.28 GB row) and is
-    /// read BESIDE, never summed.
-    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "durable_upload_bytes_escalation", "durable_upload_bytes_writeback", "fold_inplace_write_bytes" };
+    /// read BESIDE, never summed. `write_through_bytes` is EVERY parked
+    /// full buffer's upload; `durable_upload_bytes_escalation` is its
+    /// flush-time-complement subset (beside).
+    pub const device_write_keys = [_][]const u8{ "overlay_store_bytes", "patch_write_bytes", "own_block_dma_bytes", "write_through_bytes", "durable_upload_bytes_writeback", "fold_inplace_write_bytes" };
     /// The device-write REQUEST arms (brk.py `DEVICE_WRITE_REQS`): `put_obj`
     /// is the block layer's put (an overlay store IS a put, never summed
     /// twice); a W1 patch DMA, a W2 in-place page DMA and an own-block DMA

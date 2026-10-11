@@ -552,7 +552,9 @@ const Lane = struct {
     }
 
     fn freeCell(self: *Lane, idx: u32) void {
-        std.debug.assert(self.free_cells.tryPush(idx));
+        // A 4096-cell ring holding all 4096 cells with many allocating
+        // threads: a refusal is a wrap cell mid-pop (`mpmc.pushSpin`).
+        self.free_cells.pushSpin(idx);
     }
 
     /// Publish a filled cell: queue push THEN wake (the coalescer orders

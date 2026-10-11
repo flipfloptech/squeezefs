@@ -131,7 +131,7 @@ pub const data = struct {
     pub const write_admit = @import("data/write_admit.zig");
     pub const write_side_view = @import("data/write_side_view.zig");
     pub const device_overlay = @import("data/device_overlay.zig");
-    pub const patch_w1 = @import("data/patch_w1.zig");
+    pub const sole_owner_patch = @import("data/sole_owner_patch.zig");
     pub const accumulate = @import("data/accumulate.zig");
     pub const extent_overlay = @import("data/extent_overlay.zig");
     pub const write_pipeline = @import("data/write_pipeline.zig");
@@ -255,7 +255,7 @@ test {
     _ = data.write_admit;
     _ = data.write_side_view;
     _ = data.device_overlay;
-    _ = data.patch_w1;
+    _ = data.sole_owner_patch;
     _ = data.accumulate;
     _ = data.extent_overlay;
     _ = data.write_pipeline;

@@ -641,7 +641,7 @@ test "the dd lane: a W1-shaped 4 KiB overwrite serves INLINE — one SQE on the 
     const serves0 = stats.ipc_dd_inline_serves.load();
     const flushes0 = stats.ipc_dd_lane_flushes.load();
     const reaps0 = stats.ipc_dd_inline_reaps.load();
-    const rmw0 = @import("../../data/patch_w1.zig").stats.patch_edge_rmw_reads.load();
+    const rmw0 = @import("../../data/sole_owner_patch.zig").stats.patch_edge_rmw_reads.load();
     // The W1 shape: page 3 of block 0, 4 KiB, aligned, non-extending.
     const w = try submitWrite(s, 1, 1, 3 * 4096, 4096, 0x55);
     try testing.expect(engine.tryInlineWrite(0, w.op, 2, w.c));
@@ -659,7 +659,7 @@ test "the dd lane: a W1-shaped 4 KiB overwrite serves INLINE — one SQE on the 
     try testing.expectEqual(serves0 + 1, stats.ipc_dd_inline_serves.load());
     try testing.expect(stats.ipc_dd_lane_flushes.load() > flushes0);
     try testing.expect(stats.ipc_dd_inline_reaps.load() + stats.ipc_dd_reaper_reaps.load() > reaps0);
-    try testing.expectEqual(rmw0, @import("../../data/patch_w1.zig").stats.patch_edge_rmw_reads.load());
+    try testing.expectEqual(rmw0, @import("../../data/sole_owner_patch.zig").stats.patch_edge_rmw_reads.load());
     var back: [4096]u8 = undefined;
     try lab.readBack(b.offset + 3 * 4096, &back);
     for (back) |v| try testing.expectEqual(@as(u8, 0x55), v);

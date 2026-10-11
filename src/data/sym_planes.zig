@@ -6,7 +6,7 @@
 //! the custody words — PORTABLE cores and models that fill the seams the
 //! rung-4 allocator left (`block_alloc.{PlaneGate, FinishFreeSink,
 //! GrantSource, AllocationLease, GraceRing, SharedFreeGate,
-//! UntrackedFreeGate}`, `reclaim.FreeTarget`, `patch_w1.CustodyProbe.
+//! UntrackedFreeGate}`, `reclaim.FreeTarget`, `sole_owner_patch.CustodyProbe.
 //! sole_owner`). Device paths ride the existing seams (the extent-grant
 //! pool, the home volume's `RegionIo`, the holder's ring as a
 //! `DeltaJournal`, tree 0 as a `ControlStore`); the wire agent's verb

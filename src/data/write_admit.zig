@@ -65,7 +65,7 @@ const cov = @import("write_coverage.zig");
 const epoch_mod = @import("write_epoch.zig");
 const pipeline = @import("write_pipeline.zig");
 const device_overlay = @import("device_overlay.zig");
-const patch_w1 = @import("patch_w1.zig");
+const sole_owner_patch = @import("sole_owner_patch.zig");
 const accumulate = @import("accumulate.zig");
 const extent = @import("extent_overlay.zig");
 const writeback = @import("writeback.zig");
@@ -89,7 +89,7 @@ pub const Config = struct {
     fsync: fsync_mod.Levers,
 
     pub fn fromEnv(env: *const std.process.Environ.Map, block_size: u64, budget_bytes: u64) Config {
-        const patch_max = patch_w1.resolvePatchMax(knobs.optIntKnob("SQUEEZEFS_PATCH_MAX_BYTES", u64, env), block_size);
+        const patch_max = sole_owner_patch.resolvePatchMax(knobs.optIntKnob("SQUEEZEFS_PATCH_MAX_BYTES", u64, env), block_size);
         const cfg: Config = .{
             .block_size = block_size,
             .patch_max = patch_max,
@@ -115,7 +115,7 @@ pub const Config = struct {
 
     /// A/B levers announce themselves when off their shipped arm.
     fn logNonDefault(self: Config, block_size: u64) void {
-        if (self.patch_max != patch_w1.patchMaxDerived(block_size)) log.info("write path: A/B lever SQUEEZEFS_PATCH_MAX_BYTES={d} (derived {d})", .{ self.patch_max, patch_w1.patchMaxDerived(block_size) });
+        if (self.patch_max != sole_owner_patch.patchMaxDerived(block_size)) log.info("write path: A/B lever SQUEEZEFS_PATCH_MAX_BYTES={d} (derived {d})", .{ self.patch_max, sole_owner_patch.patchMaxDerived(block_size) });
         if (!self.overlay.enabled) log.info("write path: A/B lever SQUEEZEFS_DEVICE_OVERLAY=0 (the accumulation control arm)", .{});
         if (!self.overlay.overwrite) log.info("write path: A/B lever SQUEEZEFS_OVERLAY_OVERWRITE=0", .{});
         if (self.overlay.close_barrier) log.info("write path: A/B lever SQUEEZEFS_OVERLAY_CLOSE_BARRIER=1 (the OW-8 posture)", .{});
@@ -192,7 +192,7 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("\"overlay\":");
     try device_overlay.writeStatsJson(w);
     try w.writeAll(",\"patch\":");
-    try patch_w1.writeStatsJson(w);
+    try sole_owner_patch.writeStatsJson(w);
     try w.writeAll(",\"accumulate\":");
     try accumulate.writeStatsJson(w);
     try w.writeAll(",\"extent\":");
@@ -589,7 +589,7 @@ pub const WritePath = struct {
         self.touched.stampOrdinal(ino, ordinal);
     }
 
-    pub fn patchDeps(self: *WritePath) patch_w1.Deps {
+    pub fn patchDeps(self: *WritePath) sole_owner_patch.Deps {
         return .{ .device = self.device, .map = self.map, .vols = self.vols, .purge = self.purge, .custody = .{ .ctx = self, .ram_custody = &ramCustody, .overlay_open = &overlayOpen }, .touched = .{ .ctx = self, .stamp = &touchedStamp } };
     }
 
@@ -634,7 +634,7 @@ pub const WritePath = struct {
     /// `begun.dest` and calls `finishDirectWrite` at the CQE.
     pub const DirectBegun = struct {
         guard: seams.BlockLocks.Guard,
-        begun: patch_w1.Begun,
+        begun: sole_owner_patch.Begun,
         len: u64,
     };
 
@@ -644,7 +644,7 @@ pub const WritePath = struct {
     };
 
     /// The il direct-drive write gate (`il_daemon.md` §4.5): the lock-free
-    /// shape half (`patch_w1.shapeEligible` with the per-ino word READ, not
+    /// shape half (`sole_owner_patch.shapeEligible` with the per-ino word READ, not
     /// swapped — a declined candidate must not disturb adjacency), then ONE
     /// `BlockLocks.tryAcquire` — never a blocking acquire on the service
     /// thread — then the state half under the held guard (`beginPatch`:
@@ -657,11 +657,11 @@ pub const WritePath = struct {
         const file = self.map.view(ino) orelse return .{ .declined = .shape };
         if (file.kind != .striped or !file.map_resident) return .{ .declined = .shape };
         const prev_end = self.last_write_end.peek(ino);
-        if (!patch_w1.shapeEligible(.{ .offset = offset, .len = len, .block_size = bs, .existing_size = file.size, .stream_adjacent = prev_end != 0 and prev_end == offset, .patch_max = self.cfg.patch_max })) return .{ .declined = .shape };
+        if (!sole_owner_patch.shapeEligible(.{ .offset = offset, .len = len, .block_size = bs, .existing_size = file.size, .stream_adjacent = prev_end != 0 and prev_end == offset, .patch_max = self.cfg.patch_max })) return .{ .declined = .shape };
         const block: u32 = @intCast(offset / bs);
         const rel: u32 = @intCast(offset % bs);
         const guard = self.locks.tryAcquire(io, ino, block) orelse return .{ .declined = .block_lock };
-        const begun = (patch_w1.beginPatch(self.patchDeps(), ino, block, rel) catch |e| {
+        const begun = (sole_owner_patch.beginPatch(self.patchDeps(), ino, block, rel) catch |e| {
             guard.release(io);
             return e;
         }) orelse {
@@ -678,14 +678,14 @@ pub const WritePath = struct {
         return .{ .begun = .{ .guard = guard, .begun = begun, .len = len } };
     }
 
-    pub const PatchError = patch_w1.PatchError;
+    pub const PatchError = sole_owner_patch.PatchError;
 
     /// A begun direct write the lane could not submit (no slab entry, a
     /// full SQ, an unknown volume): re-stabilize the word under a new
     /// generation (content unchanged, so no purge), hand the guard back;
     /// the caller takes the sever → handoff path.
     pub fn abortDirectWrite(self: *WritePath, io: Io, d: DirectBegun) void {
-        patch_w1.abandonInPlace(self.patchDeps(), d.begun);
+        sole_owner_patch.abandonInPlace(self.patchDeps(), d.begun);
         d.guard.release(io);
     }
 
@@ -693,7 +693,7 @@ pub const WritePath = struct {
     /// stamp, the ledger — or the EIO law), then the guard drops.
     pub fn finishDirectWrite(self: *WritePath, io: Io, d: DirectBegun, dma: seams.DmaError!void) PatchError!void {
         defer d.guard.release(io);
-        try patch_w1.finishPatch(self.patchDeps(), d.begun, d.len, dma);
+        try sole_owner_patch.finishPatch(self.patchDeps(), d.begun, d.len, dma);
         stats.admit_write_inplace_bytes.add(d.len);
         stats.writes_admitted.inc();
     }
@@ -790,7 +790,7 @@ pub const WritePath = struct {
         const stream_adjacent = prev_end != 0 and prev_end == req.offset;
         // The W1 request-shape half (one bucket per striped write).
         const try_patch = file.kind == .striped and file.map_resident and
-            patch_w1.shapeEligible(.{ .offset = req.offset, .len = len, .block_size = bs, .existing_size = file.size, .stream_adjacent = stream_adjacent, .patch_max = self.cfg.patch_max });
+            sole_owner_patch.shapeEligible(.{ .offset = req.offset, .len = len, .block_size = bs, .existing_size = file.size, .stream_adjacent = stream_adjacent, .patch_max = self.cfg.patch_max });
         const overlay_shape = self.overlay.shapeEligible(len, self.any_passthrough) and file.kind == .striped and file.map_resident;
         var pieces_buf: [64]Piece = undefined;
         if (maxPieces(len, bs) > pieces_buf.len) return error.FileTooBig;
@@ -857,8 +857,8 @@ pub const WritePath = struct {
             prof.mark(.lock_wait);
             // A. W1.
             if (try_patch) {
-                const vehicle: patch_w1.Vehicle = if (bytes.*) |b| .{ .bytes = b[pc.off .. pc.off + pc.len] } else .{ .slot = req.payload.slot.src };
-                if (try patch_w1.tryPatch(self.patchDeps(), io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle })) {
+                const vehicle: sole_owner_patch.Vehicle = if (bytes.*) |b| .{ .bytes = b[pc.off .. pc.off + pc.len] } else .{ .slot = req.payload.slot.src };
+                if (try sole_owner_patch.tryPatch(self.patchDeps(), io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle })) {
                     stats.admit_write_inplace_bytes.add(pc.len);
                     break :blk .patch;
                 }

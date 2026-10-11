@@ -28,7 +28,7 @@ const block_alloc = @import("block_alloc.zig");
 const seams = @import("write_seams.zig");
 const write_admit = @import("write_admit.zig");
 const accumulate = @import("accumulate.zig");
-const patch_w1 = @import("patch_w1.zig");
+const sole_owner_patch = @import("sole_owner_patch.zig");
 const device_overlay = @import("device_overlay.zig");
 const extent = @import("extent_overlay.zig");
 const writeback = @import("writeback.zig");
@@ -130,8 +130,8 @@ const E2E = struct {
         self.stripes = .{};
         const cfg: write_admit.Config = .{
             .block_size = BS,
-            .patch_max = patch_w1.patchMaxDerived(BS),
-            .overlay = .{ .block_size = BS, .patch_max = patch_w1.patchMaxDerived(BS), .enabled = overlay_on },
+            .patch_max = sole_owner_patch.patchMaxDerived(BS),
+            .overlay = .{ .block_size = BS, .patch_max = sole_owner_patch.patchMaxDerived(BS), .enabled = overlay_on },
             .rewrite_shadow = true,
             .parked_cap = 8,
             .depth_override = .sync_inline,
@@ -207,7 +207,7 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
     try expectPattern(got, 1);
 
     // Row 2: 4 KiB random overwrites on the published block ride W1.
-    const patches0 = patch_w1.stats.patch_writes.load();
+    const patches0 = sole_owner_patch.stats.patch_writes.load();
     const gets0 = nvme_dev.stats.get_obj.load();
     var page: [PAGE]u8 align(4096) = undefined;
     const offsets = [_]u64{ 37, 3, 900, 512, 1023, 64, 37 };
@@ -216,7 +216,7 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
         const o = try e.wp.write(io, .{ .ino = 1, .offset = pg * PAGE, .payload = .{ .bytes = &page }, .class = .shared, .file = E2E.striped(BS) });
         try testing.expectEqual(@as(u32, 1), o.count(.patch));
     }
-    try testing.expectEqual(patches0 + offsets.len, patch_w1.stats.patch_writes.load());
+    try testing.expectEqual(patches0 + offsets.len, sole_owner_patch.stats.patch_writes.load());
     try testing.expectEqual(gets0, nvme_dev.stats.get_obj.load()); // zero device reads
     try testing.expectEqual(@as(u64, 0), counters.tripwireCount("patch_edge_rmw_reads"));
     try testing.expect(e.map.seam().lookup(1, 0).?.eql(b1)); // in place: the binding did not move
@@ -300,7 +300,7 @@ test "e2e(nvme_dev): a 4 MiB sequential write through accumulation is 1 copy + 1
 /// never engages; `durable_upload_bytes_escalation` is a subset of
 /// `write_through_bytes` and is not summed twice).
 fn deviceWriteBytes() u64 {
-    return accumulate.stats.write_through_bytes.load() + extent.stats.fold_inplace_write_bytes.load() + patch_w1.stats.patch_write_bytes.load() + device_overlay.stats.overlay_store_bytes.load();
+    return accumulate.stats.write_through_bytes.load() + extent.stats.fold_inplace_write_bytes.load() + sole_owner_patch.stats.patch_write_bytes.load() + device_overlay.stats.overlay_store_bytes.load();
 }
 
 test "e2e(nvme_dev): the W2 amplification law at the 4 MiB block (repro-port: fstests generic/074 `fstest -F -b 512`, 128× on c36b531): 512 B writes at a 1 KiB stride extending a fresh file land each block ONCE at release (device bytes == blocks × 4 MiB = 2× the user bytes, one DMA per block, zero reads) and read back byte-exact; sector writes into 4 scattered pages of a published block fold IN PLACE as 4 page DMAs (16 KiB, the 8× bound) with the binding unchanged" {

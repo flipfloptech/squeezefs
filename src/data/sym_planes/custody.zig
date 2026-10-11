@@ -32,7 +32,7 @@ const log = @import("../../core/log.zig");
 const explorer = @import("../../model/explorer.zig");
 const jc = @import("../../meta/journal_core.zig");
 const block_alloc = @import("../block_alloc.zig");
-const patch_w1 = @import("../patch_w1.zig");
+const sole_owner_patch = @import("../sole_owner_patch.zig");
 const records = @import("records.zig");
 
 pub const BlockAllocator = block_alloc.BlockAllocator;
@@ -555,7 +555,7 @@ pub const RefProbe = struct { count: u32, shared: bool };
 /// tree, which this mount cannot read); then the durable clause: `count ==
 /// 1 ∧ !shared` ⇒ sole, anything else — or a probe that cannot read, the
 /// leak-safe direction — ⇒ shared.
-pub fn soleOwnerVerdict(armed: bool, holds_plane: bool, foreign_custody: bool, probe: ?RefProbe) patch_w1.SoleOwnerVerdict {
+pub fn soleOwnerVerdict(armed: bool, holds_plane: bool, foreign_custody: bool, probe: ?RefProbe) sole_owner_patch.SoleOwnerVerdict {
     if (!armed) return .sole;
     if (!holds_plane) return .non_holder;
     if (foreign_custody) return .foreign_custody;
@@ -580,7 +580,7 @@ pub const PostureSource = struct {
         probe: *const fn (*anyopaque, ino: u64, vol_tag: u64, block_idx: u64) ?RefProbe,
     };
 
-    fn soleOwner(ctx: ?*anyopaque, ino: u64, binding: patch_w1.Binding) patch_w1.SoleOwnerVerdict {
+    fn soleOwner(ctx: ?*anyopaque, ino: u64, binding: sole_owner_patch.Binding) sole_owner_patch.SoleOwnerVerdict {
         const self: *const PostureSource = @ptrCast(@alignCast(ctx.?));
         const holds = self.vtable.holdsPlane(self.ctx);
         const foreign = self.vtable.foreignCustody(self.ctx, ino);
@@ -590,8 +590,8 @@ pub const PostureSource = struct {
         return soleOwnerVerdict(true, holds, foreign, probe);
     }
 
-    /// The `CustodyProbe.sole_owner` seam `patch_w1` consults.
-    pub fn soleOwnerFn() *const fn (?*anyopaque, u64, patch_w1.Binding) patch_w1.SoleOwnerVerdict {
+    /// The `CustodyProbe.sole_owner` seam `sole_owner_patch` consults.
+    pub fn soleOwnerFn() *const fn (?*anyopaque, u64, sole_owner_patch.Binding) sole_owner_patch.SoleOwnerVerdict {
         return &soleOwner;
     }
 };
@@ -779,13 +779,13 @@ test "a_grant_racing_the_handover_is_censused_or_deferred: pair 2 holds in the l
 }
 
 test "w1_declines_a_foreign_custody_file_and_keeps_the_durable_probe_for_own_files; the_w1_ladders_decline_a_non_holders_patch_as_a_counted_posture_decision: the verdict order NonHolder → ForeignCustody → the durable probe; unreadable is shared (leak-safe); unarmed is the RAM pair alone" {
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.sole, soleOwnerVerdict(false, false, true, null));
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.non_holder, soleOwnerVerdict(true, false, true, .{ .count = 1, .shared = false }));
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.foreign_custody, soleOwnerVerdict(true, true, true, .{ .count = 1, .shared = false }));
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.sole, soleOwnerVerdict(true, true, false, .{ .count = 1, .shared = false }));
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.shared, soleOwnerVerdict(true, true, false, .{ .count = 2, .shared = false }));
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.shared, soleOwnerVerdict(true, true, false, .{ .count = 1, .shared = true }));
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.shared, soleOwnerVerdict(true, true, false, null));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.sole, soleOwnerVerdict(false, false, true, null));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.non_holder, soleOwnerVerdict(true, false, true, .{ .count = 1, .shared = false }));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.foreign_custody, soleOwnerVerdict(true, true, true, .{ .count = 1, .shared = false }));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.sole, soleOwnerVerdict(true, true, false, .{ .count = 1, .shared = false }));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.shared, soleOwnerVerdict(true, true, false, .{ .count = 2, .shared = false }));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.shared, soleOwnerVerdict(true, true, false, .{ .count = 1, .shared = true }));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.shared, soleOwnerVerdict(true, true, false, null));
     // The seam over a posture source: the probe is asked only once the
     // postures passed.
     const Src = struct {
@@ -811,19 +811,19 @@ test "w1_declines_a_foreign_custody_file_and_keeps_the_durable_probe_for_own_fil
     var src: Src = .{};
     var ps: PostureSource = .{ .ctx = &src, .vtable = &Src.vtable, .block_size = 4096 };
     const f = PostureSource.soleOwnerFn();
-    const b = patch_w1.Binding.wholeBlock(1, 8192, 0);
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.sole, f(&ps, 7, b));
+    const b = sole_owner_patch.Binding.wholeBlock(1, 8192, 0);
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.sole, f(&ps, 7, b));
     try testing.expectEqual(@as(u32, 1), src.probes);
     src.holds = false;
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.non_holder, f(&ps, 7, b));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.non_holder, f(&ps, 7, b));
     try testing.expectEqual(@as(u32, 1), src.probes); // no probe for a non-holder
     src.holds = true;
     src.foreign = true;
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.foreign_custody, f(&ps, 7, b));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.foreign_custody, f(&ps, 7, b));
     try testing.expectEqual(@as(u32, 1), src.probes);
     src.foreign = false;
     src.answer = .{ .count = 1, .shared = true };
-    try testing.expectEqual(patch_w1.SoleOwnerVerdict.shared, f(&ps, 7, b));
+    try testing.expectEqual(sole_owner_patch.SoleOwnerVerdict.shared, f(&ps, 7, b));
 }
 
 test "the plane gate: ONE word, a silent accessor for the posture and a loud one for the mutation sites; an allocator behind it refuses retryably" {

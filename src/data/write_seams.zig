@@ -1,6 +1,6 @@
 //! The write path's seams and lock level 3 (charter §6.2; §2 lock order;
 //! `docs/porting/data_write_path.md` §14). PORTABLE: every arm of the write
-//! path (`device_overlay`, `patch_w1`, `accumulate`, `extent_overlay`,
+//! path (`device_overlay`, `sole_owner_patch`, `accumulate`, `extent_overlay`,
 //! `writeback`, `fsync`, `write_admit`) reaches the device, the block-map
 //! authority, the read tiers and the terminal free through the vtables here,
 //! so the cores run over RAM fakes on every host and the Linux binding

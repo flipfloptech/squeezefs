@@ -114,7 +114,7 @@ const seams = @import("write_seams.zig");
 const write_admit = @import("write_admit.zig");
 const write_side_view = @import("write_side_view.zig");
 const device_overlay = @import("device_overlay.zig");
-const patch_w1 = @import("patch_w1.zig");
+const sole_owner_patch = @import("sole_owner_patch.zig");
 const accumulate = @import("accumulate.zig");
 const extent_overlay = @import("extent_overlay.zig");
 const cov = @import("write_coverage.zig");
@@ -2530,7 +2530,7 @@ pub const DataPlane = struct {
 
     /// DEVICE-byte movement (never op counts): the manners law's signal.
     fn foregroundBytes(_: ?*anyopaque) u64 {
-        return accumulate.stats.write_through_bytes.load() +% patch_w1.stats.patch_write_bytes.load() +% device_overlay.stats.overlay_store_bytes.load() +% read_path.stats.ranged_read_bytes.load() +% read_path.stats.read_fill_dma_bytes.load() +% stats.own_block_dma_bytes.load();
+        return accumulate.stats.write_through_bytes.load() +% sole_owner_patch.stats.patch_write_bytes.load() +% device_overlay.stats.overlay_store_bytes.load() +% read_path.stats.ranged_read_bytes.load() +% read_path.stats.read_fill_dma_bytes.load() +% stats.own_block_dma_bytes.load();
     }
 
     // ---- the read seam over the write side ----

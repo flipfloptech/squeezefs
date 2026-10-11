@@ -58,7 +58,7 @@ const seams = @import("write_seams.zig");
 const epoch_mod = @import("write_epoch.zig");
 const pipeline = @import("write_pipeline.zig");
 const extent = @import("extent_overlay.zig");
-const patch_w1 = @import("patch_w1.zig");
+const sole_owner_patch = @import("sole_owner_patch.zig");
 
 pub const Binding = seams.Binding;
 pub const CoverageUnion = cov.CoverageUnion;
@@ -879,7 +879,7 @@ pub const UploadDeps = struct {
     image: ?seams.ImageSeam = null,
     /// The in-place fold's state half (W1's: custody, the sole-owner
     /// verdict, the fence pair); null = the in-place arm is never taken.
-    custody: ?patch_w1.CustodyProbe = null,
+    custody: ?sole_owner_patch.CustodyProbe = null,
 };
 
 /// The whole plaintext image of `b` into `out` (`image` when bound, else
@@ -1266,8 +1266,8 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     const x = &e.repr.extent;
     if (!x.base_deferred) return null;
     const probe = deps.custody orelse return null;
-    const pdeps: patch_w1.Deps = .{ .device = deps.device, .map = deps.map, .vols = deps.vols, .purge = deps.purge, .custody = probe, .touched = if (deps.touched) |t| .{ .ctx = deps.touched_ctx, .stamp = t } else null };
-    const begun = switch (patch_w1.beginInPlace(pdeps, e.key.ino, e.key.block, 0) catch {
+    const pdeps: sole_owner_patch.Deps = .{ .device = deps.device, .map = deps.map, .vols = deps.vols, .purge = deps.purge, .custody = probe, .touched = if (deps.touched) |t| .{ .ctx = deps.touched_ctx, .stamp = t } else null };
+    const begun = switch (sole_owner_patch.beginInPlace(pdeps, e.key.ino, e.key.block, 0) catch {
         extent.stats.fold_inplace_declines.inc();
         return null;
     }) {
@@ -1281,7 +1281,7 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     // The page runs assembled into a page-aligned scratch (the pages are
     // separate allocations; a run is ONE DMA).
     const scratch = table.gpa.alignedAlloc(u8, .fromByteUnits(PAGE), @intCast(bs)) catch {
-        patch_w1.abandonInPlace(pdeps, begun);
+        sole_owner_patch.abandonInPlace(pdeps, begun);
         return null;
     };
     defer table.gpa.free(scratch);
@@ -1289,7 +1289,7 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     // per contiguous run, from the mapping itself (the block is the base).
     const base_ctx: InPlaceBase = .{ .device = deps.device, .vol_tag = begun.vol_tag, .dest = begun.dest };
     x.seedRuns(table.gpa, .{ .ctx = @constCast(&base_ctx), .read = &InPlaceBase.read }, scratch) catch {
-        patch_w1.abandonInPlace(pdeps, begun);
+        sole_owner_patch.abandonInPlace(pdeps, begun);
         stats.write_through_fallbacks.inc();
         return .stay_parked;
     };
@@ -1305,7 +1305,7 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
             extent.stats.fold_inplace_dmas.inc();
         } else |_| break;
     }
-    patch_w1.finishInPlace(pdeps, begun, dma, "W2 in-place fold") catch {
+    sole_owner_patch.finishInPlace(pdeps, begun, dma, "W2 in-place fold") catch {
         extent.stats.fold_inplace_dma_errors.inc();
         extent.stats.fold_inplace_write_bytes.add(written);
         return .stay_parked;

@@ -160,7 +160,7 @@ pub const ring = struct {
         }
 
         /// The W1 hold gate: the plane's pure predicate over the hint and
-        /// its published per-inode shape (`patch_w1`'s request-shape half
+        /// its published per-inode shape (`sole_owner_patch`'s request-shape half
         /// plus striped ∧ passthrough ∧ non-extending); no plane ⇒ nothing
         /// is held and every zc payload is extracted at delivery.
         fn fsWriteHoldEligible(ctx: *anyopaque, hint: fsv.HoldHint) bool {

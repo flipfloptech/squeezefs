@@ -18,7 +18,7 @@ arm) · `DAB` = `src/data_alloc_bitmap.rs` · `BG` = `src/block_grant.rs` · `BA
 `DSM` = `docs/design-symmetric-metadata.md` · `DMP` = `docs/design-mw-data-alloc-partition.md` ·
 `EK` = `src/env_knobs.rs` · `ACC` = `.benchmarks/2026-09-19-sym-acceptance.md`.
 Port anchors (`P/…` under `/Users/joberdorf/Source/squeezefs-zig/src/`): `P/data/block_alloc.zig`
-(`PBA`), `P/data/block_refs.zig`, `P/data/pack.zig`, `P/data/plane.zig`, `P/data/patch_w1.zig`,
+(`PBA`), `P/data/block_refs.zig`, `P/data/pack.zig`, `P/data/plane.zig`, `P/data/sole_owner_patch.zig`,
 `P/data/reclaim.zig`, `P/meta/alloc_ext.zig`, `P/meta/key.zig`, `P/meta/record.zig`,
 `P/meta/tx.zig`; the earlier spec `docs/porting/data_alloc_reclaim.md` §11 (`DAR §11`) lists the
 seams the rung-4 allocator left for this rung.
@@ -933,9 +933,9 @@ files` (`tests/sym_custody_tests.rs:882`), `the_w1_ladders_decline_a_non_holders
 posture_decision` (`tests/sym_shared_refs_tests.rs:1284`), `the_w1_predicate_confirms_sole_ownership_in_
 the_inos_slot_tree_on_an_armed_set` (`:571`).
 
-Port: `patch_w1.CustodyProbe.sole_owner` already returns `SoleOwnerVerdict{sole, shared, foreign_custody,
+Port: `sole_owner_patch.CustodyProbe.sole_owner` already returns `SoleOwnerVerdict{sole, shared, foreign_custody,
 non_holder}` and declines `.foreign_custody` / `.posture` before `beginPatchSoleOwner`
-(`P/data/patch_w1.zig:L145-158`, `L217-222`). Rung 6 binds: `non_holder` = `!PlaneGate.holds(.patch_
+(`P/data/sole_owner_patch.zig:L145-158`, `L217-222`). Rung 6 binds: `non_holder` = `!PlaneGate.holds(.patch_
 retire)` read WITHOUT the gate's ERROR line (a second, silent accessor beside `planeGate`), `foreign_
 custody` = the port's slot-custody table has a home for the ino, `shared` = the kind-6 probe's `shared`
 fold.
@@ -1000,7 +1000,7 @@ Custody (`DC`; `DG:L631-736`): `dlm_quarantined_offsets`, `dlm_quarantine_releas
 advances`, `data_dma_fence_refusals`, `data_dma_epoch_refusals`, `custody_grants / renewals / releases /
 conflicts / revokes / expiries / reclaims / grace_conflicts (must-stay-0 on a healthy failover) / unknown_
 leases / self_fences / quarantined / proofs`, `slot_custody_quarantine_refusals`, `slot_custody_
-quarantined`, `patch_ineligible_{shared, foreign_custody, posture}` (`P/data/patch_w1.zig:L64-106`
+quarantined`, `patch_ineligible_{shared, foreign_custody, posture}` (`P/data/sole_owner_patch.zig:L64-106`
 already), `accounting_plane_refusals`.
 fsck: `fsck_alloc_bitmap_leak_candidates`, `fsck_alloc_bitmap_tracked_exempted`, `alloc_census_declined`
 (`FSCK:L7405-7420`).

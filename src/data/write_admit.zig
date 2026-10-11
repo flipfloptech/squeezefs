@@ -544,6 +544,8 @@ pub const WritePath = struct {
             .epochs = &self.epochs,
             .stripes = d.stripes,
             .governor = &self.governor,
+            .ram_custody = &ramCustody,
+            .ram_custody_ctx = self,
         }, @intCast(cfg.parked_cap));
         self.view = .{ .table = &self.table, .overlay = &self.overlay, .epochs = &self.epochs, .locks = &self.locks };
         return self;
@@ -810,16 +812,25 @@ pub const WritePath = struct {
     /// Under (3), THIS order (every exit drops the guard). The ladder
     /// RESTARTS from A when the one-authority screen (C) meets a record it
     /// cannot settle in one attempt (the guard is dropped, the record
-    /// settled on the write arm's own ladder, the guard re-taken) and when
-    /// an accumulation arm meets the parked-buffer cap (the guard is
-    /// dropped, the gate waits for a cell or makes one, the guard re-taken)
-    /// — never a backoff park under (3), never a refusal: a blocking
-    /// `write(2)` on a regular file may not answer EAGAIN (POSIX reserves
-    /// it for O_NONBLOCK; rung 9 F2 saw fio abort on 100–128 per leg).
+    /// settled on the write arm's own ladder, the guard re-taken), when
+    /// the overlay arm (B) meets a full write pipe (the guard is dropped,
+    /// the governor's park runs holding no lock, the guard re-taken with
+    /// the permit in hand) and when an accumulation arm meets the parked-
+    /// buffer cap (the guard is dropped, the gate waits for a cell or
+    /// makes one, the guard re-taken) — never a park under (3), never a
+    /// refusal: a blocking `write(2)` on a regular file may not answer
+    /// EAGAIN (POSIX reserves it for O_NONBLOCK; rung 9 F2 saw fio abort
+    /// on 100–128 per leg). The governor's in-flight permits belong to
+    /// uploads that take (3) to publish: a park for one under (3) is the
+    /// generic/551 cycle.
     fn admitPiece(self: *WritePath, io: Io, req: Request, file: seams.FileView, pc: Piece, bytes: *?[]const u8, try_patch: bool, overlay_shape: bool, stream_adjacent: bool) Error!Arm {
         const bs = self.cfg.block_size;
         var hint: enum { none, overlay_drain, upload, fold } = .none;
         var upload_permit: ?pipeline.Permit = null;
+        // The overlay arm's permit, admitted holding no guard; spent by the
+        // store it is handed to, returned if another arm takes the piece.
+        var overlay_permit: ?pipeline.Permit = null;
+        defer if (overlay_permit) |p| self.governor.returnUnused(io, p);
         var prof = pipeline.Prof.start();
         var gate: GateWall = .{};
         const arm: Arm = blk: while (true) {
@@ -839,13 +850,24 @@ pub const WritePath = struct {
             if (overlay_shape and device_overlay.Overlay.pieceEligible(pc.rel, pc.len)) {
                 const vehicle: device_overlay.Vehicle = if (bytes.*) |b| .{ .bytes = b[pc.off .. pc.off + pc.len] } else .{ .slot = req.payload.slot };
                 const overwrite = self.map.lookup(req.ino, pc.block) != null;
-                switch (try self.overlay.store(io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle, .file = file, .overwrite = overwrite })) {
+                const handed = overlay_permit;
+                overlay_permit = null;
+                switch (try self.overlay.store(io, .{ .ino = req.ino, .block = pc.block, .rel = pc.rel, .vehicle = vehicle, .file = file, .overwrite = overwrite, .permit = handed })) {
                     .stored => |s| {
                         stats.admit_write_overlay_bytes.add(pc.len);
                         if (s.coverage_complete) hint = .overlay_drain;
                         break :blk .overlay;
                     },
                     .declined => {},
+                    .governor_full => {
+                        // The pipe is full: park for the permit holding
+                        // no lock, then restart the ladder with it.
+                        held = false;
+                        g.release(io);
+                        overlay_permit = self.governor.admitSegment(io, pc.len);
+                        prof.mark(.admit_wait);
+                        continue;
+                    },
                 }
             }
             // C. The one-authority screen: a record on the block settles first.
@@ -2152,6 +2174,113 @@ test "the parked-buffer gate, hot set: a writer at the cap waits for the in-flig
     w.wp.quiesce(io);
     try testing.expect(w.f.map.seam().lookup(2, 0) != null);
     try testing.expect(w.wp.table.has(1, 7));
+}
+
+// fstests generic/551 (`aio-dio-write-verify`: 53 concurrent 512 B-aligned
+// O_DIRECT AIO writes to one file): the kernel splits each write into a
+// page-aligned middle and unaligned ends; a block whose unaligned end had
+// already parked took its aligned middle through the OVERLAY — two
+// write-side authorities on one block, each publishing its complement
+// (zeros: the block was a hole) over the other's bytes. The verify read a
+// 1 MiB run of zeros where every writer had put 0x5a.
+test "the overlay never opens a second authority on a block the RAM table holds: an aligned piece arriving at a parked block takes the accumulation arm, and after the flush every byte of both pieces is on the device" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, true);
+    defer w.deinit(testing.allocator);
+    try w.f.map.create(1, .striped, 0);
+    // The unaligned head parks (a fresh entry whose complement is zeros).
+    var head: [3 * PAGE + 100]u8 = undefined;
+    fill(&head, 0x51);
+    const o1 = try w.wp.write(io, .{ .ino = 1, .offset = 0, .payload = .{ .bytes = &head }, .class = .entire_op, .file = World.striped(0) });
+    try testing.expectEqual(@as(u32, 1), o1.count(.accumulate_park) + o1.count(.extent));
+    try testing.expect(w.wp.table.has(1, 0));
+    // The aligned middle is overlay-shaped (page-aligned, above the W1
+    // ceiling, a fresh block) — but the block is HELD.
+    const installs0 = device_overlay.stats.overlay_installs.load();
+    const declines0 = device_overlay.stats.overlay_ineligible_ram_custody.load();
+    var mid: [4 * PAGE]u8 align(4096) = undefined;
+    fill(&mid, 0x52);
+    const o2 = try w.wp.write(io, .{ .ino = 1, .offset = 8 * PAGE, .payload = .{ .bytes = &mid }, .class = .entire_op, .file = World.striped(head.len) });
+    try testing.expectEqual(@as(u32, 0), o2.count(.overlay));
+    try testing.expectEqual(installs0, device_overlay.stats.overlay_installs.load());
+    try testing.expectEqual(declines0 + 1, device_overlay.stats.overlay_ineligible_ram_custody.load());
+    // The flush: ONE block carries both pieces, the rest zeros.
+    w.wp.flushIno(io, 1);
+    w.wp.quiesce(io);
+    const b = w.f.map.seam().lookup(1, 0) orelse return error.BlockUnmapped;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    try testing.expectEqualSlices(u8, &head, got[0..head.len]);
+    try testing.expectEqualSlices(u8, &mid, got[8 * PAGE .. 12 * PAGE]);
+    try testing.expect(std.mem.allEqual(u8, got[head.len .. 8 * PAGE], 0));
+    try testing.expect(std.mem.allEqual(u8, got[12 * PAGE ..], 0));
+}
+
+// generic/551's stall: the overlay store took its depth-governor permit
+// UNDER the block guard, and the in-flight permits belonged to uploads
+// that re-take that guard to publish — four overlay writers parked at the
+// governor holding the file's four block locks, ten uploads parked on
+// those locks holding the whole depth, 53 writes in flight for 30 min
+// (`551-stall-stats.json`: `write_pipeline_inflight_bytes` ≡ the target,
+// `lock_ticked_reregisters` 41 k). The law the accumulation arm already
+// kept ("the governor permit AFTER the guard") binds every arm.
+test "a writer parked at the write-pipeline governor holds no block guard: the overlay arm meeting a full pipe drops (3) for its park and completes when the in-flight upload lands" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .{ .pinned = 1 }, true);
+    defer w.deinit(testing.allocator);
+    var held: HeldDma = .{};
+    w.f.dev.hook = held.hook();
+    // ino 2: an accumulation block completes (unaligned pieces: never the
+    // overlay); its detached upload holds the whole depth (one block) in
+    // its DMA, with the block guard DROPPED for the device phase.
+    try w.f.map.create(2, .striped, 0);
+    var first: [wt.BS / 2 + 100]u8 = undefined;
+    fill(&first, 0x20);
+    _ = try w.wp.write(io, .{ .ino = 2, .offset = 0, .payload = .{ .bytes = &first }, .class = .entire_op, .file = World.striped(0) });
+    var rest: [wt.BS / 2 - 100]u8 = undefined;
+    fill(&rest, 0x21);
+    const o2 = try w.wp.write(io, .{ .ino = 2, .offset = first.len, .payload = .{ .bytes = &rest }, .class = .entire_op, .file = World.striped(first.len) });
+    try testing.expectEqual(@as(u32, 1), o2.count(.write_through));
+    while (held.hits.load(.acquire) == 0) std.Thread.yield() catch {};
+    try testing.expectEqual(wt.BS, w.wp.governor.core.inflightBytes());
+    // ino 3: an overlay-shaped fresh piece meets the full pipe.
+    try w.f.map.create(3, .striped, 0);
+    const waits0 = pipeline.stats.write_pipeline_admission_waits.load();
+    const Writer = struct {
+        w: *World,
+        mid: [4 * PAGE]u8 align(4096) = undefined,
+        result: anyerror!Outcome = error.NotRun,
+        fn run(self: *@This()) void {
+            self.result = self.w.wp.write(testing.io, .{ .ino = 3, .offset = 0, .payload = .{ .bytes = &self.mid }, .class = .entire_op, .file = World.striped(0) });
+        }
+    };
+    var writer: Writer = .{ .w = w };
+    fill(&writer.mid, 0x30);
+    const th = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    while (pipeline.stats.write_pipeline_admission_waits.load() == waits0) std.Thread.yield() catch {};
+    // THE LAW: parked at the governor, the writer holds no block guard —
+    // the upload that will return the depth could take it now. (The
+    // verdict is judged after the join: a world torn down under a parked
+    // writer is no verdict.)
+    const guard_free = if (w.wp.locks.tryAcquire(io, 3, 0)) |g| blk: {
+        g.release(io);
+        break :blk true;
+    } else false;
+    // The DMA lands: the upload publishes and completes its permit; the
+    // writer is admitted, re-takes the guard and stores through the overlay.
+    held.release();
+    th.join();
+    try testing.expect(guard_free);
+    const o3 = try writer.result;
+    try testing.expectEqual(@as(u32, 1), o3.count(.overlay));
+    w.wp.quiesce(io);
+    w.wp.flushIno(io, 3);
+    w.wp.quiesce(io);
+    try testing.expectEqual(@as(u64, 0), w.wp.governor.core.inflightBytes());
+    const b = w.f.map.seam().lookup(3, 0) orelse return error.BlockUnmapped;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(b.vol_tag, b.offset, &got);
+    try testing.expectEqualSlices(u8, &writer.mid, got[0 .. 4 * PAGE]);
 }
 
 test "writeStatsJson aggregates every family under its module key" {

@@ -124,6 +124,9 @@ pub const stats = struct {
     pub var overlay_ineligible_sub_cap: counters.ShardedCounter = .{};
     pub var overlay_ineligible_shadow_bound: counters.ShardedCounter = .{};
     pub var overlay_ineligible_range_shared: counters.ShardedCounter = .{};
+    /// A block the RAM table holds (a parked buffer or extent) declines:
+    /// one write-side authority per block (the state screen's clause).
+    pub var overlay_ineligible_ram_custody: counters.ShardedCounter = .{};
     pub var overlay_sub_cap_joins: counters.ShardedCounter = .{};
     pub var overlay_enospc_declines: counters.ShardedCounter = .{};
     pub var overlay_unreachable_declines: counters.ShardedCounter = .{};
@@ -163,7 +166,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"overlay_open\":{d},\"overlay_inflight_bytes\":{d},", .{ stats.overlay_open.load(), stats.overlay_inflight_bytes.load() });
-    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "writeback_orphan_discards_overlay" }) |name| {
+    inline for (.{ "overlay_installs", "overlay_overwrite_installs", "overlay_stores", "overlay_store_bytes", "overlay_overwrite_bytes", "overlay_ack_early_stores", "overlay_ack_early_bytes", "overlay_ack_early_retries", "overlay_short_stores", "overlay_store_fallbacks", "overlay_claim_conflicts", "overlay_governed_stores", "overlay_dma_passthrough_bytes", "overlay_dma_pool_copy_bytes", "overlay_ineligible_sub_cap", "overlay_ineligible_shadow_bound", "overlay_ineligible_range_shared", "overlay_ineligible_ram_custody", "overlay_sub_cap_joins", "overlay_enospc_declines", "overlay_unreachable_declines", "overlay_read_serves", "overlay_read_serve_bytes", "overlay_read_gap_serves", "overlay_read_gap_bytes", "overlay_read_drains", "overlay_window_escalations", "overlay_gap_seeds", "overlay_gap_seed_bytes", "overlay_gap_seed_old_bytes", "overlay_gap_seed_ranged_bytes", "overlay_gap_seed_read_bytes", "overlay_publishes", "overlay_published_bytes", "overlay_epoch_feeds", "overlay_feed_fallbacks", "overlay_supersessions", "overlay_superseded_by_merge", "overlay_superseded_dead_old_binding", "overlay_settle_retries", "overlay_teardown_waits", "writeback_orphan_discards_overlay" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     inline for (.{ "overlay_fence_drops", "overlay_unpublished_at_fsync", "overlay_ack_early_lost", "overlay_teardown_wait_overlong", "overlay_teardown_nonterminal", "overlay_install_race_under_guard", "overlay_store_superseded_under_guard", "overlay_state_word_corrupt", "overlay_registry_full" }, 0..) |name, i| {
@@ -553,6 +556,13 @@ pub const Deps = struct {
     governor: ?*pipeline.Governor = null,
     /// Rung 6: `overlay_range_shared` (a shared custody range declines).
     range_shared: ?*const fn (ino: u64, block: u32) bool = null,
+    /// The state screen's "no RAM/extent custody" clause: a block the
+    /// accumulation table holds (a parked buffer, an extent — its upload
+    /// in flight or not) declines, so one block never has two write-side
+    /// authorities each publishing its complement over the other's bytes
+    /// (fstests generic/551: a 1 MiB run of zeros in the verify).
+    ram_custody: ?*const fn (ctx: ?*anyopaque, ino: u64, block: u32) bool = null,
+    ram_custody_ctx: ?*anyopaque = null,
 };
 
 /// The payload's stability class at mint (the §3.4 stability law).
@@ -594,6 +604,11 @@ pub const StoreRequest = struct {
     /// The map's current binding of the block (the overwrite shape); the
     /// install re-derives it under (3.5).
     overwrite: bool,
+    /// A depth-governor permit for `vehicle.len()` the caller admitted
+    /// HOLDING NO BLOCK GUARD after a `.governor_full` answer; the store
+    /// spends it (its CQE completes it) or returns it unspent on any
+    /// decline. Null: the store asks the governor itself, without parking.
+    permit: ?pipeline.Permit = null,
 };
 
 pub const StoreOutcome = union(enum) {
@@ -605,6 +620,14 @@ pub const StoreOutcome = union(enum) {
         acked_early: bool,
     },
     declined,
+    /// The pipe is full and the store will not park under the caller's (3):
+    /// the in-flight permits belong to uploads that re-take that guard to
+    /// publish (generic/551: four writers parked here holding the file's
+    /// four block locks, ten uploads parked on those locks holding the
+    /// whole depth, 53 writes in flight for 30 min). The caller drops its
+    /// guard, parks at the governor holding no lock, and retries the ladder
+    /// with the permit in `StoreRequest.permit`.
+    governor_full,
 };
 
 pub const StoreError = error{ InputOutput, VolumeFailed, WriterGuardFenced, OutOfMemory, WorkerShutdown, QueueFull, NoSpaceLeft, ReadOnlyFileSystem };
@@ -675,6 +698,10 @@ pub const Overlay = struct {
     /// Arm B under (3). `.declined` falls through to the next arm; an error
     /// fails THIS write loud (nothing acked, nothing parked, nothing lost).
     pub fn store(self: *Overlay, io: Io, req: StoreRequest) StoreError!StoreOutcome {
+        // The permit is UNSPENT in `pre` until the claim lands (step 5):
+        // every earlier exit returns it, the caller's pre-admission too.
+        var pre = req.permit;
+        defer if (pre) |p| if (self.deps.governor) |g| g.returnUnused(io, p);
         const len: u64 = req.vehicle.len();
         if (!self.cfg.enabled or !pieceEligible(req.rel, len)) return .declined;
         const key: Key = .{ .ino = req.ino, .block = req.block };
@@ -707,24 +734,32 @@ pub const Overlay = struct {
             stats.overlay_ineligible_range_shared.inc();
             return .declined;
         };
+        if (self.deps.ram_custody) |rc| if (rc(self.deps.ram_custody_ctx, req.ino, req.block)) {
+            stats.overlay_ineligible_ram_custody.inc();
+            return .declined;
+        };
+        // 4. The governor permit — BEFORE a fresh install (a full pipe
+        //    leaves no zero-coverage Open record behind for a sibling's
+        //    one-authority settle to seed whole) and NEVER a park under the
+        //    caller's (3): a full pipe answers `.governor_full` and the
+        //    caller parks holding no lock (the reference parked here, after
+        //    its install; decision 0002).
+        if (self.cfg.depth_governor) if (self.deps.governor) |g| {
+            if (pre == null) pre = g.tryAdmit(len) orelse return .governor_full;
+        };
         // 3. Registry: join or install.
         const rec = existing orelse (try self.installRecord(io, req)) orelse return .declined;
-        // 4. The governor permit (after the registry, before the claim: a
-        //    parked writer holds no claim a settle would await).
-        var permit: ?pipeline.Permit = null;
-        if (self.cfg.depth_governor) if (self.deps.governor) |g| {
-            permit = g.admitSegment(io, len);
-            stats.overlay_governed_stores.inc();
-        };
-        // 5. Claim + accept.
+        // 5. Claim + accept: the permit is spent here (its CQE completes it).
         const first_page: u32 = req.rel / OVERLAY_PAGE;
         const pages: u32 = @intCast(len / OVERLAY_PAGE);
         const ticket = rec.core.beginStore(first_page, pages) catch {
             stats.overlay_claim_conflicts.inc();
-            if (permit) |p| if (self.deps.governor) |g| g.complete(io, p, rec.ordinal, 0);
             _ = self.settleOnceLocked(io, rec, false);
             return .declined;
         };
+        const permit = pre;
+        pre = null;
+        if (permit != null) stats.overlay_governed_stores.inc();
         stats.overlay_inflight_bytes.add(len);
         // 6. ACK-early: a sound (page-cache) held slot under retention
         //    lands on a detached continuation; the O_DIRECT class only
@@ -1178,7 +1213,10 @@ pub const Overlay = struct {
         for (gaps) |g| total += g.len();
         const old = rec.old_binding;
         const ranged = old != null and self.cfg.gap_seed_ranged and total < bs;
-        var whole: ?[]u8 = null;
+        // The alignment travels with the slice: a free at align 1 of a
+        // page-aligned allocation is the safe allocator's panic (the
+        // whole-image leg first ran on the venue in generic/551).
+        var whole: ?[]align(OVERLAY_PAGE) u8 = null;
         defer if (whole) |w| self.gpa.free(w);
         if (old != null and !ranged) {
             const w = self.gpa.alignedAlloc(u8, .fromByteUnits(OVERLAY_PAGE), @intCast(bs)) catch return error.OutOfMemory;
@@ -1481,7 +1519,7 @@ const TestWorld = struct {
     gov: pipeline.Governor,
     ov: Overlay,
 
-    fn init(gpa: Allocator, cfg_over: struct { patch_max: u64 = wt.BS / 8, overwrite: bool = true, shadow: bool = true, close_barrier: bool = false, blocks: u32 = 32, registry_capacity: usize = 16 }) !*TestWorld {
+    fn init(gpa: Allocator, cfg_over: struct { patch_max: u64 = wt.BS / 8, overwrite: bool = true, shadow: bool = true, close_barrier: bool = false, gap_seed_ranged: bool = true, blocks: u32 = 32, registry_capacity: usize = 16 }) !*TestWorld {
         const w = try gpa.create(TestWorld);
         errdefer gpa.destroy(w);
         w.f = try wt.Fixture.init(gpa, cfg_over.blocks);
@@ -1489,7 +1527,7 @@ const TestWorld = struct {
         w.stripes = .{};
         w.locks = try seams.BlockLocks.init(gpa, 64);
         w.gov = try pipeline.Governor.init(gpa, wt.BS, 2, .adaptive, null, pipeline.capBytes(1 * derive.GiB));
-        w.ov = try Overlay.init(gpa, .{ .block_size = wt.BS, .patch_max = cfg_over.patch_max, .overwrite = cfg_over.overwrite, .close_barrier = cfg_over.close_barrier }, .{
+        w.ov = try Overlay.init(gpa, .{ .block_size = wt.BS, .patch_max = cfg_over.patch_max, .overwrite = cfg_over.overwrite, .close_barrier = cfg_over.close_barrier, .gap_seed_ranged = cfg_over.gap_seed_ranged }, .{
             .device = w.f.dev.seam(),
             .map = w.f.map.seam(),
             .free = w.f.frees.seam(),
@@ -1667,6 +1705,35 @@ test "live_mapped_overwrite_rides_the_overlay_end_to_end: the install captures t
     try testing.expectEqualSlices(u8, &p, got[0 .. wt.BS / 2]);
     try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0xAA));
     try testing.expectEqual(ff0, stats.overlay_feed_fallbacks.load());
+}
+
+// The whole-image seed leg (the ranged lever OFF, or a gap set that is the
+// whole block) released its page-aligned image at align 1 — the safe
+// allocator's panic, first met on the venue in generic/551 once a sibling's
+// one-authority settle found a zero-coverage overwrite record.
+test "the whole-image gap seed (SQUEEZEFS_GAP_SEED_RANGED=0): ONE whole read of the old binding seeds every gap byte-exact and the image is released at its own alignment" {
+    const io = testing.io;
+    const w = try TestWorld.init(testing.allocator, .{ .gap_seed_ranged = false });
+    defer w.deinit(testing.allocator);
+    const a = try w.f.publishBlock(45, 0, 0xAA);
+    var p: [wt.BS / 2]u8 align(4096) = undefined;
+    pattern(&p, 0x66);
+    const o = try w.ov.store(io, .{ .ino = 45, .block = 0, .rel = 0, .vehicle = .{ .bytes = &p }, .file = TestWorld.striped(wt.BS), .overwrite = true });
+    try testing.expect(!o.stored.coverage_complete);
+    w.f.dev.resetLedger();
+    const whole0 = stats.overlay_gap_seed_read_bytes.load();
+    const ranged0 = stats.overlay_gap_seed_ranged_bytes.load();
+    w.ov.drainBlock(io, &w.locks, 45, 0, false, w.cs());
+    try testing.expectEqual(whole0 + wt.BS, stats.overlay_gap_seed_read_bytes.load());
+    try testing.expectEqual(ranged0, stats.overlay_gap_seed_ranged_bytes.load());
+    try testing.expectEqual(@as(u64, wt.BS), w.f.dev.read_bytes);
+    try testing.expect(w.epochs.close(io, 45, w.cs()) == .swapped);
+    try testing.expect(w.f.frees.freed.items[0].eql(a));
+    const nb = w.f.map.seam().lookup(45, 0).?;
+    var got: [wt.BS]u8 = undefined;
+    w.f.dev.peek(wt.VOL_A, nb.offset, &got);
+    try testing.expectEqualSlices(u8, &p, got[0 .. wt.BS / 2]);
+    try testing.expect(std.mem.allEqual(u8, got[wt.BS / 2 ..], 0xAA));
 }
 
 test "ineligible_shapes_decline_and_stay_byte_exact: sub-cap declines unless joining an Open record; a shadow-bound block declines; a non-striped file declines; a non-page-aligned piece declines; the overwrite lever off declines overwrites; ENOSPC declines (KD-B4-8) to accumulation" {

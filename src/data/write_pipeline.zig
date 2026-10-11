@@ -609,6 +609,15 @@ pub const Governor = struct {
         }
     }
 
+    /// A permit returned UNSPENT (the arm it was admitted for declined
+    /// before any DMA): the depth comes back and parked admitters wake, but
+    /// no lane learns from it — a zero-length service would read as
+    /// infinite bandwidth to the BDP learner.
+    pub fn returnUnused(self: *Governor, io: Io, p: Permit) void {
+        self.core.release(p.bytes);
+        self.completions.notifyWaiters(io);
+    }
+
     /// The completion: release the permit, feed the lane's BDP, feed the
     /// probe epoch (and roll it), wake parked admitters. Never waits.
     pub fn complete(self: *Governor, io: Io, p: Permit, lane_ord: u32, dur_ns: u64) void {

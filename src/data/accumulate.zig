@@ -623,7 +623,9 @@ pub const Table = struct {
         const now = clock.monotonicNs();
         e.* = .{
             .key = key,
-            .repr = .{ .extent = extent.ExtentOverlay.init(has_existing_bytes) },
+            // The overlay defers to a base only when there IS one: existing
+            // bytes below EOF with no binding are a hole (zeros).
+            .repr = .{ .extent = extent.ExtentOverlay.init(has_existing_bytes and old_binding != null) },
             .seed = if (has_existing_bytes) .deferred else .fresh,
             .content_valid = false,
             .old_binding = old_binding,
@@ -1248,6 +1250,18 @@ pub fn escalateExtentLocked(table: *Table, deps: UploadDeps, e: *Entry) error{ P
 /// CoW base, or no custody probe bound — the whole-block arm. A failed DMA
 /// leaves the entry PARKED (never lossy; the pages it holds are the truth
 /// and the next flush retries), counted and loud.
+/// The in-place fold's base: the mapped block's own device bytes.
+const InPlaceBase = struct {
+    device: seams.DeviceSeam,
+    vol_tag: u64,
+    dest: u64,
+
+    fn read(ctx: ?*anyopaque, rel: u32, dst: []u8) seams.ReadError!void {
+        const self: *const InPlaceBase = @ptrCast(@alignCast(ctx.?));
+        return self.device.read(self.vol_tag, self.dest + rel, dst);
+    }
+};
+
 fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
     const x = &e.repr.extent;
     if (!x.base_deferred) return null;
@@ -1271,6 +1285,14 @@ fn foldInPlaceLocked(table: *Table, deps: UploadDeps, e: *Entry) ?Disposition {
         return null;
     };
     defer table.gpa.free(scratch);
+    // The seed: the base's bytes under the unseeded pages, ONE ranged read
+    // per contiguous run, from the mapping itself (the block is the base).
+    const base_ctx: InPlaceBase = .{ .device = deps.device, .vol_tag = begun.vol_tag, .dest = begun.dest };
+    x.seedRuns(table.gpa, .{ .ctx = @constCast(&base_ctx), .read = &InPlaceBase.read }, scratch) catch {
+        patch_w1.abandonInPlace(pdeps, begun);
+        stats.write_through_fallbacks.inc();
+        return .stay_parked;
+    };
     var runs_buf: [extent.MAX_PAGES]extent.Run = undefined;
     const runs = x.pageRuns(&runs_buf);
     x.layInto(scratch);

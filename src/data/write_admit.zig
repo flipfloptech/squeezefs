@@ -549,7 +549,7 @@ pub const WritePath = struct {
             .ram_custody = &ramCustody,
             .ram_custody_ctx = self,
         }, @intCast(cfg.parked_cap));
-        self.view = .{ .table = &self.table, .overlay = &self.overlay, .epochs = &self.epochs, .locks = &self.locks };
+        self.view = .{ .table = &self.table, .overlay = &self.overlay, .epochs = &self.epochs, .locks = &self.locks, .device = d.device };
         return self;
     }
 
@@ -599,22 +599,6 @@ pub const WritePath = struct {
         if (self.image) |im| return im.read(im.ctx, b, out);
         return self.device.read(b.vol_tag, b.offset, out);
     }
-
-    /// The W2 page seeder over a passthrough binding: the base's page `idx`
-    /// is one ranged device read (the image IS the payload there).
-    const PageSeed = struct {
-        wp: *WritePath,
-        binding: Binding,
-
-        fn read(ctx: ?*anyopaque, idx: u32, dst: []u8) seams.ReadError!void {
-            const self: *const PageSeed = @ptrCast(@alignCast(ctx.?));
-            return self.wp.device.read(self.binding.vol_tag, self.binding.offset + @as(u64, idx) * PAGE, dst);
-        }
-
-        fn seeder(self: *const PageSeed) extent.Seeder {
-            return .{ .ctx = @constCast(self), .read = &read };
-        }
-    };
 
     // ---- the il host's faces (charter §7) ----
 
@@ -936,14 +920,9 @@ pub const WritePath = struct {
                     try self.parkAtPoolCap(io, g, &held, req, pc.block, &gate);
                     continue;
                 };
-                // The seed at the page grain: a deferred overlay's page is
-                // the base's page, read ONCE at first touch (the write-side
-                // authority's binding NOW); a hole's page is zeros.
-                const seed: PageSeed = .{ .wp = self, .binding = live_binding orelse undefined };
-                e.repr.extent.merge(self.gpa, pc.rel, data, if (e.seed == .deferred and live_binding != null) seed.seeder() else null) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.InputOutput => return error.InputOutput,
-                };
+                // No I/O: a hole's page is zeros, a deferred overlay's page
+                // waits under its mask for the base (the fold's seed).
+                e.repr.extent.merge(self.gpa, pc.rel, data) catch return error.OutOfMemory;
                 e.write_epoch = accumulate.nextWriteEpoch();
                 e.app_end = @max(e.app_end, pc.rel + pc.len);
                 e.last_touch_ns = clock.monotonicNs();
@@ -951,14 +930,20 @@ pub const WritePath = struct {
                 stats.admit_write_accumulate_bytes.add(pc.len);
                 const x = &e.repr.extent;
                 if (x.isComplete(bs)) {
-                    // Every page touched: a complete content-valid image —
-                    // the write-through trigger (an escalation the pool
-                    // cannot back now is DEFERRED to the next write/flush).
-                    if (self.table.escalate(e, null) != null) {
-                        hint = .upload;
-                        break :blk .write_through;
-                    }
-                    extent.stats.extent_escalations_deferred.inc();
+                    // Every page touched: the write-through trigger — the
+                    // escalation completes the image (the base under a
+                    // deferred overlay's masked bytes, zeros on a hole); one
+                    // the pool cannot back now is DEFERRED to the next
+                    // write/flush.
+                    accumulate.escalateExtentLocked(&self.table, self.uploadDeps(), e) catch |err| switch (err) {
+                        error.PoolExhausted => {
+                            extent.stats.extent_escalations_deferred.inc();
+                            break :blk .extent;
+                        },
+                        error.InputOutput, error.OutOfMemory => |err2| return err2,
+                    };
+                    hint = .upload;
+                    break :blk .write_through;
                 } else if (extent.foldDue(x.pageCount(), bs)) {
                     // The RAM bound: a hole block escalates HERE (zeros, no
                     // I/O) and parks until its one landing; a deferred

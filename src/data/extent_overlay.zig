@@ -3,13 +3,16 @@
 //! sub-cap patch-ineligible shapes (a transformed volume, a shared block, a
 //! hole, an unaligned write): a compact PAGE-INDEXED overlay charged to the
 //! budget as `parked_extent_bytes` — a 512 B write parks one 4 KiB page, not
-//! a 4 MiB block. A touched page is content-valid at every byte: zeros on a
-//! hole block, the base's page read ONCE at first touch on a mapped
-//! passthrough block (the seed at the page grain, never a whole-block
-//! image). Coverage is therefore page-granular and EXACT (a 128 B page set
-//! over the format's largest block), so a reader composing the window never
-//! meets a run table that silently dropped runs — "uncovered bytes never
-//! escape" holds by construction.
+//! a 4 MiB block, and does NO I/O. A hole block's page is zeros (content-
+//! valid at birth); a mapped passthrough block's page carries a byte MASK
+//! until its base arrives — ONE ranged read per contiguous run of unseeded
+//! pages at the fold (off the write's latency path; the seed at the page
+//! grain, never a whole-block image), or page by page when the block is
+//! READ before it folds. Coverage is then page-granular and EXACT (a 128 B
+//! page set over the format's largest block), so a reader composing the
+//! window never meets a run table that silently dropped runs — "uncovered
+//! bytes never escape" holds by construction (a masked page serves, lays
+//! and spills only its covered bytes).
 //!
 //! The three landings and their bounds (§J.1; the tie tests restate them):
 //! a HOLE block lands once, whole, at its flush (write-before-publish; it
@@ -106,8 +109,9 @@ pub const stats = struct {
     /// An escalation due at the parked-buffer cap, left to the block's next
     /// write or its flush (the extent stays parked; `write_admit`'s gate).
     pub var extent_escalations_deferred: counters.ShardedCounter = .{};
-    /// The base's page read ONCE at first touch (a deferred overlay on a
-    /// passthrough block) — the seed at the page grain.
+    /// The base's bytes under a deferred overlay's touched pages: one
+    /// ranged read per run of unseeded pages at the fold, one per page at a
+    /// read of the block — the seed at the page grain.
     pub var extent_page_seed_reads: counters.ShardedCounter = .{};
     pub var extent_page_seed_bytes: counters.ShardedCounter = .{};
     pub var extent_spills: counters.ShardedCounter = .{};
@@ -150,29 +154,40 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
 // The page overlay.
 // ---------------------------------------------------------------------------
 
-/// One touched page: content-valid at every byte.
+/// One touched page. `mask == null` ⇒ content-valid at every byte (a hole
+/// block's zero page; a deferred page after its base arrived). With a mask —
+/// a deferred overlay's page before its base arrived — only the bytes whose
+/// bit is set are the user's; the rest is uninitialized and never served,
+/// laid or spilled. The base arrives at the FOLD (one ranged read per run
+/// of unseeded pages, off the write's latency path) or at a READ of the
+/// block (`seedPagewise`), never on the write path: W2 writes do no I/O.
 pub const Page = struct {
     idx: u32,
     data: []u8,
+    /// One bit per byte of `data`.
+    mask: ?*[PAGE / 8]u8,
+    /// Bytes set in `mask` (the page is content-valid at PAGE).
+    covered: u32,
 };
 
-/// The base's page at first touch (a deferred overlay over a passthrough
-/// mapped block); null = zeros (a hole, or a deferred block without a
-/// binding — the existing bytes below EOF were a hole).
-pub const Seeder = struct {
+/// The base's bytes at `[rel, rel + dst.len)` of the block (block-relative;
+/// a passthrough mapping's device bytes — the only base a page overlay has).
+pub const BaseReader = struct {
     ctx: ?*anyopaque,
-    /// The base's page `idx` (PAGE bytes) into `dst`.
-    read: *const fn (ctx: ?*anyopaque, idx: u32, dst: []u8) seams.ReadError!void,
+    read: *const fn (ctx: ?*anyopaque, rel: u32, dst: []u8) seams.ReadError!void,
 };
 
-/// What one page costs the budget: its buffer and its struct.
+/// What one page costs the budget: its buffer and its struct (+ the mask
+/// while it carries one).
 pub const PAGE_CHARGE: u64 = PAGE + @sizeOf(Page);
+pub const MASK_CHARGE: u64 = PAGE / 8;
 
 pub const ExtentOverlay = struct {
     /// Sorted by `idx`.
     pages: std.ArrayList(Page) = .empty,
     /// Item B: existing device data under the extents (the untouched pages
-    /// come from the base; the touched ones were seeded at first touch).
+    /// come from the base; a touched page's uncovered bytes do too, at the
+    /// seed).
     base_deferred: bool,
     /// User bytes merged (a re-write of the same bytes counts again: the
     /// bound's denominator is what the user WROTE, which only brings the
@@ -180,16 +195,19 @@ pub const ExtentOverlay = struct {
     bytes: u64 = 0,
     /// Writes merged (`fold_fill`'s k).
     extents: u32 = 0,
-
-    pub const MergeError = error{ OutOfMemory, InputOutput };
+    /// Pages still carrying a mask.
+    unseeded: u32 = 0,
 
     pub fn init(base_deferred: bool) ExtentOverlay {
         return .{ .base_deferred = base_deferred };
     }
 
     pub fn deinit(self: *ExtentOverlay, gpa: Allocator) void {
-        for (self.pages.items) |p| gpa.free(p.data);
-        stats.parked_extent_bytes.sub(self.pages.items.len * PAGE_CHARGE);
+        for (self.pages.items) |p| {
+            gpa.free(p.data);
+            if (p.mask) |m| gpa.destroy(m);
+        }
+        stats.parked_extent_bytes.sub(self.chargedBytes());
         self.pages.deinit(gpa);
         self.* = undefined;
     }
@@ -202,9 +220,13 @@ pub const ExtentOverlay = struct {
         return self.pages.items.len;
     }
 
+    pub fn hasUnseeded(self: *const ExtentOverlay) bool {
+        return self.unseeded != 0;
+    }
+
     /// The RAM the overlay holds (the budget charge).
     pub fn chargedBytes(self: *const ExtentOverlay) u64 {
-        return self.pages.items.len * PAGE_CHARGE;
+        return self.pages.items.len * PAGE_CHARGE + @as(u64, self.unseeded) * MASK_CHARGE;
     }
 
     /// The index of page `idx` in `pages`, or its insertion point.
@@ -220,63 +242,179 @@ pub const ExtentOverlay = struct {
         return .{ .pos = lo, .found = false };
     }
 
+    /// Set bits `[lo, hi)` of a mask; answers how many were clear.
+    fn setBits(m: *[PAGE / 8]u8, lo: u32, hi: u32) u32 {
+        var newly: u32 = 0;
+        var b = lo;
+        while (b < hi) {
+            if (b % 8 == 0 and hi - b >= 8) {
+                newly += @popCount(~m[b / 8]);
+                m[b / 8] = 0xFF;
+                b += 8;
+            } else {
+                const bit: u8 = @as(u8, 1) << @intCast(b % 8);
+                if (m[b / 8] & bit == 0) {
+                    m[b / 8] |= bit;
+                    newly += 1;
+                }
+                b += 1;
+            }
+        }
+        return newly;
+    }
+
+    fn bitSet(m: *const [PAGE / 8]u8, b: u32) bool {
+        return m[b / 8] & (@as(u8, 1) << @intCast(b % 8)) != 0;
+    }
+
     /// Merge `[rel, rel + data.len)`: every page it touches is found or
-    /// created (zeros, or the base's page through `seeder` — one ranged
-    /// read, the seed at the page grain), then the bytes land. A seed that
-    /// fails leaves the overlay as it was (nothing of this write recorded).
-    pub fn merge(self: *ExtentOverlay, gpa: Allocator, rel: u32, data: []const u8, seeder: ?Seeder) MergeError!void {
+    /// created — zeros (content-valid) on a hole block, an uninitialized
+    /// page under a mask on a deferred one — then the bytes land and the
+    /// mask records them. No I/O.
+    pub fn merge(self: *ExtentOverlay, gpa: Allocator, rel: u32, data: []const u8) Allocator.Error!void {
         assert(data.len != 0);
         const end: u32 = rel + @as(u32, @intCast(data.len));
-        var idx: u32 = rel / PAGE;
-        const last: u32 = (end - 1) / PAGE;
-        // Pass 1: every page present (the seeds before any byte lands, so a
-        // failed seed records nothing).
-        while (idx <= last) : (idx += 1) {
-            const f = self.find(idx);
-            if (f.found) continue;
-            const buf = try gpa.alloc(u8, PAGE);
-            errdefer gpa.free(buf);
-            if (seeder) |s| {
-                s.read(s.ctx, idx, buf) catch return error.InputOutput;
-                stats.extent_page_seed_reads.inc();
-                stats.extent_page_seed_bytes.add(PAGE);
-            } else {
-                @memset(buf, 0);
-            }
-            try self.pages.insert(gpa, f.pos, .{ .idx = idx, .data = buf });
-            stats.parked_extent_bytes.add(PAGE_CHARGE);
-        }
-        // Pass 2: the bytes.
         var pos: u32 = rel;
         while (pos < end) {
             const pidx = pos / PAGE;
             const in_page = pos % PAGE;
             const take: u32 = @min(PAGE - in_page, end - pos);
-            const p = self.pages.items[self.find(pidx).pos];
+            const f = self.find(pidx);
+            if (!f.found) {
+                const buf = try gpa.alloc(u8, PAGE);
+                errdefer gpa.free(buf);
+                var mask: ?*[PAGE / 8]u8 = null;
+                if (self.base_deferred) {
+                    const m = try gpa.create([PAGE / 8]u8);
+                    m.* = @splat(0);
+                    mask = m;
+                } else {
+                    @memset(buf, 0);
+                }
+                errdefer if (mask) |m| gpa.destroy(m);
+                try self.pages.insert(gpa, f.pos, .{ .idx = pidx, .data = buf, .mask = mask, .covered = 0 });
+                stats.parked_extent_bytes.add(PAGE_CHARGE);
+                if (mask != null) {
+                    self.unseeded += 1;
+                    stats.parked_extent_bytes.add(MASK_CHARGE);
+                }
+            }
+            const p = &self.pages.items[self.find(pidx).pos];
             @memcpy(p.data[in_page .. in_page + take], data[pos - rel .. pos - rel + take]);
+            if (p.mask) |m| {
+                p.covered += setBits(m, in_page, in_page + take);
+                if (p.covered == PAGE) self.unmask(gpa, p);
+            }
             pos += take;
         }
         self.bytes += data.len;
         self.extents += 1;
     }
 
-    /// Every touched page as a set (the read seam's exact coverage).
+    /// The page is content-valid: the mask leaves (and its charge).
+    fn unmask(self: *ExtentOverlay, gpa: Allocator, p: *Page) void {
+        gpa.destroy(p.mask.?);
+        p.mask = null;
+        self.unseeded -= 1;
+        stats.parked_extent_bytes.sub(MASK_CHARGE);
+    }
+
+    /// Fill a masked page's uncovered bytes from `base` (its PAGE bytes).
+    fn fillPage(p: *Page, base: []const u8) void {
+        const m = p.mask.?;
+        var b: u32 = 0;
+        while (b < PAGE) : (b += 8) {
+            const byte = m[b / 8];
+            if (byte == 0xFF) continue;
+            if (byte == 0) {
+                @memcpy(p.data[b .. b + 8], base[b .. b + 8]);
+                continue;
+            }
+            var i: u32 = 0;
+            while (i < 8) : (i += 1) if (!bitSet(m, b + i)) {
+                p.data[b + i] = base[b + i];
+            };
+        }
+    }
+
+    /// The seed, page by page (a READ of the block: one base read per
+    /// unseeded page from a 4 KiB stack buffer, no allocation). After it
+    /// every touched page is content-valid.
+    pub fn seedPagewise(self: *ExtentOverlay, gpa: Allocator, base: BaseReader) seams.ReadError!void {
+        if (self.unseeded == 0) return;
+        var buf: [PAGE]u8 = undefined;
+        for (self.pages.items) |*p| {
+            if (p.mask == null) continue;
+            try base.read(base.ctx, p.idx * PAGE, &buf);
+            stats.extent_page_seed_reads.inc();
+            stats.extent_page_seed_bytes.add(PAGE);
+            fillPage(p, &buf);
+            self.unmask(gpa, p);
+        }
+    }
+
+    /// The seed at the fold: ONE ranged base read per contiguous run of
+    /// unseeded pages into `scratch` (≥ the block), then the pages fill.
+    pub fn seedRuns(self: *ExtentOverlay, gpa: Allocator, base: BaseReader, scratch: []u8) seams.ReadError!void {
+        if (self.unseeded == 0) return;
+        var i: usize = 0;
+        while (i < self.pages.items.len) {
+            if (self.pages.items[i].mask == null) {
+                i += 1;
+                continue;
+            }
+            var j = i;
+            while (j + 1 < self.pages.items.len and self.pages.items[j + 1].mask != null and self.pages.items[j + 1].idx == self.pages.items[j].idx + 1) : (j += 1) {}
+            const start = self.pages.items[i].idx * PAGE;
+            const len = (j - i + 1) * PAGE;
+            try base.read(base.ctx, start, scratch[start .. start + len]);
+            stats.extent_page_seed_reads.inc();
+            stats.extent_page_seed_bytes.add(len);
+            var k = i;
+            while (k <= j) : (k += 1) {
+                const p = &self.pages.items[k];
+                fillPage(p, scratch[p.idx * PAGE ..][0..PAGE]);
+                self.unmask(gpa, p);
+            }
+            i = j + 1;
+        }
+    }
+
+    /// Every touched page as a set (the read seam's exact coverage, once
+    /// seeded).
     pub fn pageSet(self: *const ExtentOverlay) PageSet {
         var s = PageSet.empty;
         for (self.pages.items) |p| s.set(p.idx);
         return s;
     }
 
-    /// Every page of the block is touched: the block is a complete,
-    /// content-valid image.
+    /// Every page of the block is touched.
     pub fn isComplete(self: *const ExtentOverlay, block_size: u64) bool {
         return self.pages.items.len == pagesPerBlock(block_size);
     }
 
-    /// Lay every touched page into a block buffer (the escalation; the
-    /// untouched pages are the caller's — zeros or the base).
+    /// Lay every touched page into a block buffer — a content-valid page
+    /// whole, a masked page's covered bytes only (the escalation; the
+    /// untouched bytes are the caller's — zeros or the base).
     pub fn layInto(self: *const ExtentOverlay, dst: []u8) void {
-        for (self.pages.items) |p| @memcpy(dst[p.idx * PAGE ..][0..PAGE], p.data);
+        for (self.pages.items) |p| {
+            const at = dst[p.idx * PAGE ..][0..PAGE];
+            if (p.mask) |m| {
+                var b: u32 = 0;
+                while (b < PAGE) : (b += 8) {
+                    const byte = m[b / 8];
+                    if (byte == 0) continue;
+                    if (byte == 0xFF) {
+                        @memcpy(at[b .. b + 8], p.data[b .. b + 8]);
+                        continue;
+                    }
+                    var i: u32 = 0;
+                    while (i < 8) : (i += 1) if (bitSet(m, b + i)) {
+                        at[b + i] = p.data[b + i];
+                    };
+                }
+            } else @memcpy(at, p.data);
+        }
     }
 
     /// The whole block: touched pages from the overlay, the rest from
@@ -286,7 +424,8 @@ pub const ExtentOverlay = struct {
         self.layInto(dst);
     }
 
-    /// `[rel, rel + out.len)`: touched pages' bytes, zeros between.
+    /// `[rel, rel + out.len)`: touched pages' bytes (a masked page's covered
+    /// bytes only), zeros between.
     pub fn coveredRead(self: *const ExtentOverlay, rel: u32, out: []u8) void {
         @memset(out, 0);
         const end: u32 = rel + @as(u32, @intCast(out.len));
@@ -294,7 +433,13 @@ pub const ExtentOverlay = struct {
             const ps = p.idx * PAGE;
             const a = @max(ps, rel);
             const b = @min(ps + PAGE, end);
-            if (a < b) @memcpy(out[a - rel .. b - rel], p.data[a - ps .. b - ps]);
+            if (a >= b) continue;
+            if (p.mask) |m| {
+                var i = a;
+                while (i < b) : (i += 1) if (bitSet(m, i - ps)) {
+                    out[i - rel] = p.data[i - ps];
+                };
+            } else @memcpy(out[a - rel .. b - rel], p.data[a - ps .. b - ps]);
         }
     }
 
@@ -314,15 +459,35 @@ pub const ExtentOverlay = struct {
         return out[0..n];
     }
 
-    pub fn pageRunCount(self: *const ExtentOverlay) usize {
-        var n: usize = 0;
-        var prev_end: u32 = 0;
-        for (self.pages.items, 0..) |p, i| {
-            const s = p.idx * PAGE;
-            if (i == 0 or prev_end != s) n += 1;
-            prev_end = s + PAGE;
+    /// The covered byte runs of the whole overlay in order (a content-valid
+    /// page is one run; a masked page its set-bit runs), coalesced across
+    /// abutting neighbours — the spill record's table.
+    pub fn coveredRuns(self: *const ExtentOverlay, gpa: Allocator) Allocator.Error!std.ArrayList(Run) {
+        var out: std.ArrayList(Run) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.pages.items) |p| {
+            const ps = p.idx * PAGE;
+            if (p.mask) |m| {
+                var b: u32 = 0;
+                while (b < PAGE) {
+                    if (!bitSet(m, b)) {
+                        b += 1;
+                        continue;
+                    }
+                    var e = b;
+                    while (e < PAGE and bitSet(m, e)) : (e += 1) {}
+                    try pushRun(&out, gpa, ps + b, ps + e);
+                    b = e;
+                }
+            } else try pushRun(&out, gpa, ps, ps + PAGE);
         }
-        return n;
+        return out;
+    }
+
+    fn pushRun(out: *std.ArrayList(Run), gpa: Allocator, start: u32, end: u32) Allocator.Error!void {
+        if (out.items.len != 0 and out.items[out.items.len - 1].end == start) {
+            out.items[out.items.len - 1].end = end;
+        } else try out.append(gpa, .{ .start = start, .end = end });
     }
 };
 
@@ -376,51 +541,47 @@ pub const Decoded = struct {
     }
 };
 
-pub fn encodedLen(x: *const ExtentOverlay) usize {
-    return RECORD_HEADER_LEN + x.pageRunCount() * RECORD_ENTRY_LEN + x.pageCount() * PAGE;
+/// The record's length for `runs` (`coveredRuns`): header, table, payloads.
+pub fn encodedLen(runs: []const Run) usize {
+    var payload: usize = 0;
+    for (runs) |r| payload += r.end - r.start;
+    return RECORD_HEADER_LEN + runs.len * RECORD_ENTRY_LEN + payload;
 }
 
-/// Encode the overlay as a spill record into `out` (`≥ encodedLen`): the
-/// touched pages as contiguous runs, their bytes in order.
-pub fn encode(x: *const ExtentOverlay, fencing: u64, block: u32, out: []u8) []u8 {
-    const n = encodedLen(x);
+/// Encode the overlay as a spill record into `out` (`≥ encodedLen(runs)`):
+/// `runs` = `coveredRuns(x)` — every covered byte, nothing uninitialized —
+/// its bytes in order.
+pub fn encode(x: *const ExtentOverlay, runs: []const Run, fencing: u64, block: u32, out: []u8) []u8 {
+    const n = encodedLen(runs);
     assert(out.len >= n);
-    const n_runs = x.pageRunCount();
     var h: ExtentRecordWire = undefined;
     h.magic = RECORD_MAGIC;
     std.mem.writeInt(u32, &h.version_le, EXTENT_RECORD_VERSION, .little);
     std.mem.writeInt(u64, &h.fencing_le, fencing, .little);
     std.mem.writeInt(u32, &h.block_le, block, .little);
     std.mem.writeInt(u32, &h.flags_le, if (x.base_deferred) RECORD_FLAG_BASE_DEFERRED else 0, .little);
-    std.mem.writeInt(u32, &h.count_le, @intCast(n_runs), .little);
+    std.mem.writeInt(u32, &h.count_le, @intCast(runs.len), .little);
     h.reserved_le = @splat(0);
     h.xxh3_le = @splat(0);
     @memcpy(out[0..RECORD_HEADER_LEN], std.mem.asBytes(&h));
     var pos: usize = RECORD_HEADER_LEN;
-    var prev_end: u32 = 0;
-    var run_pos: usize = RECORD_HEADER_LEN;
-    for (x.pages.items, 0..) |p, i| {
-        const s = p.idx * PAGE;
-        if (i == 0 or prev_end != s) {
-            run_pos = pos;
-            std.mem.writeInt(u32, out[pos..][0..4], s, .little);
-            std.mem.writeInt(u32, out[pos + 4 ..][0..4], PAGE, .little);
-            pos += RECORD_ENTRY_LEN;
-        } else {
-            const len = std.mem.readInt(u32, out[run_pos + 4 ..][0..4], .little);
-            std.mem.writeInt(u32, out[run_pos + 4 ..][0..4], len + PAGE, .little);
-        }
-        prev_end = s + PAGE;
+    for (runs) |r| {
+        std.mem.writeInt(u32, out[pos..][0..4], r.start, .little);
+        std.mem.writeInt(u32, out[pos + 4 ..][0..4], r.end - r.start, .little);
+        pos += RECORD_ENTRY_LEN;
     }
-    assert(pos == RECORD_HEADER_LEN + n_runs * RECORD_ENTRY_LEN);
-    for (x.pages.items) |p| {
-        @memcpy(out[pos .. pos + PAGE], p.data);
-        pos += PAGE;
+    var payload: u64 = 0;
+    for (runs) |r| {
+        // A run never straddles an uncovered byte, so its bytes are exactly
+        // the overlay's at those offsets.
+        x.coveredRead(r.start, out[pos .. pos + (r.end - r.start)]);
+        pos += r.end - r.start;
+        payload += r.end - r.start;
     }
     assert(pos == n);
     checksum.stamp(out[0..n], @offsetOf(ExtentRecordWire, "xxh3_le"));
     stats.extent_spills.inc();
-    stats.extent_spill_bytes.add(x.pageCount() * PAGE);
+    stats.extent_spill_bytes.add(payload);
     return out[0..n];
 }
 
@@ -438,8 +599,8 @@ pub fn decode(bytes: []const u8, block_size: u32) DecodeError!Decoded {
     }
     if (version != EXTENT_RECORD_VERSION) return torn();
     const count = std.mem.readInt(u32, &h.count_le, .little);
-    // At most one run per touched page.
-    if (count > MAX_PAGES) return torn();
+    // Disjoint non-abutting runs: at most one per two bytes of the block.
+    if (count > block_size / 2) return torn();
     const table_len = @as(usize, count) * RECORD_ENTRY_LEN;
     if (bytes.len < RECORD_HEADER_LEN + table_len) return torn();
     var payload_len: u64 = 0;
@@ -544,13 +705,14 @@ test "small_nonadjacent_write_parks_compactly: a 512 B write parks ONE content-v
     const g0 = stats.parked_extent_bytes.load();
     var a: [512]u8 = @splat(1);
     var b: [PAGE]u8 = @splat(2);
-    try x.merge(testing.allocator, 10 * PAGE + 1024, &a, null);
+    try x.merge(testing.allocator, 10 * PAGE + 1024, &a);
     try testing.expectEqual(@as(usize, 1), x.pageCount());
     try testing.expectEqual(@as(usize, 1), x.count());
     try testing.expectEqual(@as(u64, 512), x.bytes);
+    try testing.expect(!x.hasUnseeded());
     try testing.expectEqual(g0 + PAGE_CHARGE, stats.parked_extent_bytes.load());
-    try x.merge(testing.allocator, 2 * PAGE, &b, null);
-    try x.merge(testing.allocator, 3 * PAGE + 100, a[0..100], null);
+    try x.merge(testing.allocator, 2 * PAGE, &b);
+    try x.merge(testing.allocator, 3 * PAGE + 100, a[0..100]);
     try testing.expectEqual(@as(usize, 3), x.pageCount());
     try testing.expectEqual(@as(u32, 2), x.pages.items[0].idx);
     try testing.expectEqual(@as(u32, 3), x.pages.items[1].idx);
@@ -560,10 +722,9 @@ test "small_nonadjacent_write_parks_compactly: a 512 B write parks ONE content-v
     try testing.expectEqual(@as(usize, 2), rs.len);
     try testing.expectEqual(Run{ .start = 2 * PAGE, .end = 4 * PAGE }, rs[0]);
     try testing.expectEqual(Run{ .start = 10 * PAGE, .end = 11 * PAGE }, rs[1]);
-    try testing.expectEqual(@as(usize, 2), x.pageRunCount());
     // A straddling write touches two pages; a re-write counts in bytes again.
     var wide: [PAGE]u8 = @splat(9);
-    try x.merge(testing.allocator, 5 * PAGE + 2048, &wide, null);
+    try x.merge(testing.allocator, 5 * PAGE + 2048, &wide);
     try testing.expectEqual(@as(usize, 5), x.pageCount());
     try testing.expectEqual(@as(u64, 512 + PAGE + 100 + PAGE), x.bytes);
     try testing.expectEqual(g0 + 5 * PAGE_CHARGE, stats.parked_extent_bytes.load());
@@ -590,76 +751,129 @@ test "small_nonadjacent_write_parks_compactly: a 512 B write parks ONE content-v
     x.completeInto(&laid, null);
     try testing.expectEqual(@as(u8, 0), laid[0]);
     try testing.expectEqual(@as(u8, 9), laid[6 * PAGE]);
+    // The covered runs of a hole overlay are its page runs.
+    var cr = try x.coveredRuns(testing.allocator);
+    defer cr.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), cr.items.len);
+    try testing.expectEqual(Run{ .start = 5 * PAGE, .end = 7 * PAGE }, cr.items[1]);
 }
 
 const FakeBase = struct {
     fill: u8,
     reads: u32 = 0,
+    read_bytes: u64 = 0,
     fail: bool = false,
 
-    fn read(ctx: ?*anyopaque, idx: u32, dst: []u8) seams.ReadError!void {
+    fn read(ctx: ?*anyopaque, rel: u32, dst: []u8) seams.ReadError!void {
         const self: *FakeBase = @ptrCast(@alignCast(ctx.?));
         if (self.fail) return error.InputOutput;
         self.reads += 1;
-        @memset(dst, self.fill +% @as(u8, @intCast(idx)));
+        self.read_bytes += dst.len;
+        for (dst, 0..) |*d, i| d.* = self.fill +% @as(u8, @intCast((rel + i) / PAGE));
     }
 
-    fn seeder(self: *FakeBase) Seeder {
+    fn reader(self: *FakeBase) BaseReader {
         return .{ .ctx = self, .read = &read };
     }
 };
 
-test "a deferred overlay seeds each page from the base ONCE at first touch (the seed at the page grain: reads == pages, never a whole-block image); a seed that fails records nothing of the write; the page then holds base + user bytes" {
+test "a deferred overlay's write does NO I/O: the page lands under a byte mask (uncovered bytes never served, laid or spilled — zeros to a reader of the window), the mask is charged and leaves when the page fills; the seed arrives at the fold (ONE ranged read per contiguous run of unseeded pages) or page by page at a read; a failed seed leaves the overlay as it was" {
     var base: FakeBase = .{ .fill = 0x40 };
     var x = ExtentOverlay.init(true);
     defer x.deinit(testing.allocator);
-    const r0 = stats.extent_page_seed_reads.load();
-    const b0 = stats.extent_page_seed_bytes.load();
+    const g0 = stats.parked_extent_bytes.load();
     var a: [512]u8 = @splat(0xAA);
-    try x.merge(testing.allocator, 7 * PAGE + 1000, &a, base.seeder());
-    try x.merge(testing.allocator, 7 * PAGE + 3000, &a, base.seeder()); // the same page: no second seed
-    try testing.expectEqual(@as(u32, 1), base.reads);
-    try testing.expectEqual(r0 + 1, stats.extent_page_seed_reads.load());
-    try testing.expectEqual(b0 + PAGE, stats.extent_page_seed_bytes.load());
+    try x.merge(testing.allocator, 7 * PAGE + 1000, &a);
+    try x.merge(testing.allocator, 7 * PAGE + 3000, &a);
+    try testing.expectEqual(@as(u32, 0), base.reads); // nothing read on the write path
+    try testing.expect(x.hasUnseeded());
+    try testing.expectEqual(g0 + PAGE_CHARGE + MASK_CHARGE, stats.parked_extent_bytes.load());
     var out: [PAGE]u8 = undefined;
     x.coveredRead(7 * PAGE, &out);
-    try testing.expectEqual(@as(u8, 0x47), out[0]);
+    try testing.expectEqual(@as(u8, 0), out[0]); // uncovered: zeros, never the page's uninitialized bytes
+    try testing.expectEqual(@as(u8, 0xAA), out[1000]);
+    try testing.expectEqual(@as(u8, 0), out[1512]);
+    try testing.expectEqual(@as(u8, 0xAA), out[3000]);
+    var laid: [BS]u8 = @splat(0x11);
+    x.layInto(&laid);
+    try testing.expectEqual(@as(u8, 0x11), laid[7 * PAGE]); // uncovered untouched
+    try testing.expectEqual(@as(u8, 0xAA), laid[7 * PAGE + 1000]);
+    // The covered runs are byte-exact for a masked page.
+    var cr = try x.coveredRuns(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), cr.items.len);
+    try testing.expectEqual(Run{ .start = 7 * PAGE + 1000, .end = 7 * PAGE + 1512 }, cr.items[0]);
+    cr.deinit(testing.allocator);
+    // A page that fills completely drops its mask.
+    var full: [PAGE]u8 = @splat(0xF0);
+    try x.merge(testing.allocator, 9 * PAGE, &full);
+    try testing.expect(x.pages.items[1].mask == null);
+    try testing.expectEqual(@as(u32, 1), x.unseeded);
+    // Pages 20, 21 (a run) and 30 unseeded: the fold's seed is 2 ranged reads (8 KiB + 4 KiB), page 9 none.
+    try x.merge(testing.allocator, 20 * PAGE + 10, &a);
+    try x.merge(testing.allocator, 21 * PAGE + 10, &a);
+    try x.merge(testing.allocator, 30 * PAGE + 10, &a);
+    try testing.expectEqual(@as(u32, 4), x.unseeded);
+    // A failed seed: the overlay is unchanged.
+    base.fail = true;
+    const r0 = stats.extent_page_seed_reads.load();
+    var scratch: [BS]u8 = undefined;
+    try testing.expectError(error.InputOutput, x.seedRuns(testing.allocator, base.reader(), &scratch));
+    try testing.expectEqual(@as(u32, 4), x.unseeded);
+    base.fail = false;
+    try x.seedRuns(testing.allocator, base.reader(), &scratch);
+    try testing.expectEqual(@as(u32, 3), base.reads); // page 7; pages 20–21 as ONE read; page 30
+    try testing.expectEqual(@as(u64, 4 * PAGE), base.read_bytes);
+    try testing.expectEqual(r0 + 3, stats.extent_page_seed_reads.load());
+    try testing.expect(!x.hasUnseeded());
+    try testing.expectEqual(g0 + 5 * PAGE_CHARGE, stats.parked_extent_bytes.load()); // the masks' charge left
+    x.coveredRead(7 * PAGE, &out);
+    try testing.expectEqual(@as(u8, 0x47), out[0]); // the base's page 7 under the user's bytes
     try testing.expectEqual(@as(u8, 0xAA), out[1000]);
     try testing.expectEqual(@as(u8, 0x47), out[1512]);
-    try testing.expectEqual(@as(u8, 0xAA), out[3000]);
-    // A failed seed: the write lands nothing, the overlay is unchanged.
-    base.fail = true;
-    try testing.expectError(error.InputOutput, x.merge(testing.allocator, 9 * PAGE, &a, base.seeder()));
-    try testing.expectEqual(@as(usize, 1), x.pageCount());
-    try testing.expectEqual(@as(u64, 1024), x.bytes);
-    try testing.expectEqual(@as(usize, 2), x.count());
-    // Completeness with a base: untouched pages from it.
+    x.coveredRead(21 * PAGE, &out);
+    try testing.expectEqual(@as(u8, 0x40 +% 21), out[0]);
+    try testing.expectEqual(@as(u8, 0xAA), out[10]);
+    // The page-wise seed (a read of the block): one read per unseeded page.
+    var y = ExtentOverlay.init(true);
+    defer y.deinit(testing.allocator);
+    try y.merge(testing.allocator, 3 * PAGE + 5, &a);
+    try y.merge(testing.allocator, 4 * PAGE + 5, &a);
+    var base2: FakeBase = .{ .fill = 0x80 };
+    try y.seedPagewise(testing.allocator, base2.reader());
+    try testing.expectEqual(@as(u32, 2), base2.reads);
+    try testing.expect(!y.hasUnseeded());
     var img: [BS]u8 = @splat(0x11);
-    var laid: [BS]u8 = undefined;
-    x.completeInto(&laid, &img);
+    y.completeInto(&laid, &img);
     try testing.expectEqual(@as(u8, 0x11), laid[0]);
-    try testing.expectEqual(@as(u8, 0x47), laid[7 * PAGE]);
-    try testing.expectEqual(@as(u8, 0xAA), laid[7 * PAGE + 1000]);
+    try testing.expectEqual(@as(u8, 0x83), laid[3 * PAGE]);
+    try testing.expectEqual(@as(u8, 0xAA), laid[3 * PAGE + 5]);
 }
 
-test "spill_writes_extent_records_without_seed_reads: the record round-trips the touched pages as runs, every refusal class is detected (torn, future, malformed), the fold seeds once and applies record extents then pages newest-wins" {
+test "spill_writes_extent_records_without_seed_reads: the record round-trips exactly the covered bytes (a masked page's runs, a content-valid page whole), every refusal class is detected (torn, future, malformed), the fold seeds once and applies record extents then pages newest-wins" {
     var x = ExtentOverlay.init(true);
     defer x.deinit(testing.allocator);
     var a: [PAGE]u8 = @splat(0xA1);
     var b: [2 * PAGE]u8 = @splat(0xB2);
-    try x.merge(testing.allocator, 5 * PAGE, &a, null);
-    try x.merge(testing.allocator, 20 * PAGE, &b, null);
-    const buf = try testing.allocator.alloc(u8, encodedLen(&x));
+    var c: [100]u8 = @splat(0xC0);
+    try x.merge(testing.allocator, 5 * PAGE, &a);
+    try x.merge(testing.allocator, 20 * PAGE, &b);
+    try x.merge(testing.allocator, 30 * PAGE + 50, &c); // a masked page: 100 covered bytes
+    var runs = try x.coveredRuns(testing.allocator);
+    defer runs.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), runs.items.len);
+    const buf = try testing.allocator.alloc(u8, encodedLen(runs.items));
     defer testing.allocator.free(buf);
-    const rec = encode(&x, 77, 3, buf);
-    try testing.expectEqual(RECORD_HEADER_LEN + 2 * RECORD_ENTRY_LEN + 3 * PAGE, rec.len);
+    const rec = encode(&x, runs.items, 77, 3, buf);
+    try testing.expectEqual(RECORD_HEADER_LEN + 3 * RECORD_ENTRY_LEN + 3 * PAGE + 100, rec.len);
     const d = try decode(rec, BS);
     try testing.expectEqual(@as(u64, 77), d.fencing);
     try testing.expectEqual(@as(u32, 3), d.block);
     try testing.expect(d.base_deferred);
-    try testing.expectEqual(@as(usize, 2), d.table.len);
+    try testing.expectEqual(@as(usize, 3), d.table.len);
     try testing.expectEqual([2]u32{ 5 * PAGE, PAGE }, d.table[0]);
     try testing.expectEqual([2]u32{ 20 * PAGE, 2 * PAGE }, d.table[1]);
+    try testing.expectEqual([2]u32{ 30 * PAGE + 50, 100 }, d.table[2]);
+    try testing.expect(std.mem.allEqual(u8, d.payloads[3 * PAGE ..], 0xC0));
     // Torn: a flipped payload byte.
     rec[rec.len - 1] ^= 1;
     try testing.expectError(error.Torn, decode(rec, BS));
@@ -684,19 +898,20 @@ test "spill_writes_extent_records_without_seed_reads: the record round-trips the
     var composed: [BS]u8 = seed;
     d2.applyTo(&composed);
     const Composed = struct {
-        fn read(ctx: ?*anyopaque, idx: u32, dst: []u8) seams.ReadError!void {
+        fn read(ctx: ?*anyopaque, rel: u32, dst: []u8) seams.ReadError!void {
             const img: *const [BS]u8 = @ptrCast(@alignCast(ctx.?));
-            @memcpy(dst, img[idx * PAGE ..][0..PAGE]);
+            @memcpy(dst, img[rel..][0..dst.len]);
         }
     };
     var newer = ExtentOverlay.init(true);
     defer newer.deinit(testing.allocator);
-    var c: [PAGE]u8 = @splat(0xC3);
-    try newer.merge(testing.allocator, 5 * PAGE + 100, &c, .{ .ctx = &composed, .read = &Composed.read }); // overlaps the record's first extent: newest wins
+    var cc: [PAGE]u8 = @splat(0xC3);
+    try newer.merge(testing.allocator, 5 * PAGE + 100, &cc); // overlaps the record's first extent: newest wins
+    try newer.seedPagewise(testing.allocator, .{ .ctx = &composed, .read = &Composed.read });
     var out: [BS]u8 = undefined;
     const reads0 = stats.fold_seed_reads.load();
     const k = fold(&seed, d2, &newer, &out);
-    try testing.expectEqual(@as(u64, 3), k);
+    try testing.expectEqual(@as(u64, 4), k);
     try testing.expectEqual(reads0 + 1, stats.fold_seed_reads.load());
     try testing.expectEqual(@as(u8, 0x11), out[0]);
     try testing.expectEqual(@as(u8, 0xA1), out[5 * PAGE + 50]); // the record's bytes under the page, through the seed
@@ -705,6 +920,7 @@ test "spill_writes_extent_records_without_seed_reads: the record round-trips the
     try testing.expectEqual(@as(u8, 0x11), out[6 * PAGE + 100]);
     try testing.expectEqual(@as(u8, 0x11), out[7 * PAGE]);
     try testing.expectEqual(@as(u8, 0xB2), out[21 * PAGE]);
+    try testing.expectEqual(@as(u8, 0xC0), out[30 * PAGE + 60]);
     // A hole folds with NO seed read (G-RW6).
     const k2 = fold(null, null, &newer, &out);
     try testing.expectEqual(@as(u64, 1), k2);

@@ -218,6 +218,23 @@ pub const Composite = struct {
     epochs: *epoch_mod.Epochs,
     locks: *seams.BlockLocks,
     staged: ?Staged = null,
+    /// The device: a READ of a block whose deferred page overlay still has
+    /// unseeded pages seeds them here first (the base's page bytes — a
+    /// passthrough mapping's own), so the page coverage it answers is
+    /// exact. Null (a fixture without a device) serves the masked pages'
+    /// covered bytes alone.
+    device: ?seams.DeviceSeam = null,
+
+    /// The seed's base reader: `binding.offset + rel` on the device.
+    const SeedBase = struct {
+        device: seams.DeviceSeam,
+        binding: Binding,
+
+        fn read(ctx: ?*anyopaque, rel: u32, dst: []u8) seams.ReadError!void {
+            const self: *const SeedBase = @ptrCast(@alignCast(ctx.?));
+            return self.device.read(self.binding.vol_tag, self.binding.offset + rel, dst);
+        }
+    };
 
     pub const Staged = struct {
         pool: *staging.Pool,
@@ -273,11 +290,29 @@ pub const Composite = struct {
                         return .{ .partial = .{ .covered = .{ .runs = clip(&snap.coverage, req.rel, end) }, .base = base } };
                     },
                     .extent => |*x| {
-                        x.coveredRead(req.rel, req.out);
                         if (!x.base_deferred) {
+                            x.coveredRead(req.rel, req.out);
                             stats.write_side_serves.inc();
                             return .{ .served = .extent };
                         }
+                        // A deferred overlay's masked pages take their base
+                        // now (a device act — never on a try-only probe), so
+                        // every touched page is whole and the page set exact.
+                        if (x.hasUnseeded()) {
+                            if (req.try_only) {
+                                stats.write_side_busy.inc();
+                                return .busy;
+                            }
+                            // A base that cannot be read leaves the pages
+                            // masked: their uncovered bytes serve as zeros
+                            // (the gap fill's own law on a failed read) and
+                            // the next read retries the seed.
+                            if (self.device) |dev| if (base) |b| {
+                                const sb: SeedBase = .{ .device = dev, .binding = b };
+                                x.seedPagewise(self.table.gpa, .{ .ctx = @constCast(&sb), .read = &SeedBase.read }) catch {};
+                            };
+                        }
+                        x.coveredRead(req.rel, req.out);
                         stats.write_side_partials.inc();
                         return .{ .partial = .{ .covered = .{ .pages = x.pageSet() }, .base = base } };
                     },
@@ -367,7 +402,7 @@ const ViewWorld = struct {
         errdefer gpa.destroy(w);
         w.* = .{ .f = try wt.Fixture.init(gpa, 16), .table = try accumulate.Table.init(gpa, @intCast(wt.BS), 4), .epochs = epoch_mod.Epochs.init(gpa, wt.BS, true), .locks = try seams.BlockLocks.init(gpa, 64), .gov = try pipeline.Governor.init(gpa, wt.BS, 2, .adaptive, null, pipeline.capBytes(1 << 30)), .ov = undefined, .comp = undefined };
         w.ov = try device_overlay.Overlay.init(gpa, .{ .block_size = wt.BS, .patch_max = wt.BS / 8 }, .{ .device = w.f.dev.seam(), .map = w.f.map.seam(), .free = w.f.frees.seam(), .purge = .none, .vols = &w.f.vols, .picker = .{ .ctx = w.f.alloc_a, .pick = &pickA }, .epochs = &w.epochs, .stripes = &w.stripes, .governor = &w.gov }, 8);
-        w.comp = .{ .table = &w.table, .overlay = &w.ov, .epochs = &w.epochs, .locks = &w.locks };
+        w.comp = .{ .table = &w.table, .overlay = &w.ov, .epochs = &w.epochs, .locks = &w.locks, .device = w.f.dev.seam() };
         return w;
     }
 
@@ -418,7 +453,7 @@ test "the seam: none answers nothing; a fresh accumulation buffer serves its cov
     // Extent overlay over a mapped block: partial as well, page-exact —
     // the touched page is whole, every other page a gap for the base.
     const x = w.table.checkoutExtent(2, 0, true, a).?;
-    try x.repr.extent.merge(testing.allocator, 4096 + 100, q[0..1000], null);
+    try x.repr.extent.merge(testing.allocator, 4096 + 100, q[0..1000]);
     const o2 = v.serve(io, .{ .ino = 2, .block = 0, .rel = 0, .out = &out });
     try testing.expect(o2 == .partial and o2.partial.covered.contains(4096, 8192));
     try testing.expect(!o2.partial.covered.contains(0, 4096));

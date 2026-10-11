@@ -1,0 +1,13 @@
+16:42:45 bracket[frag-512b-write]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (4376198cbd2f, gate profile, zig 0.17.0)", "binary": "/build/tmp/amp-brk-4096772/A/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-amp/zig-out-linux/bin/squeezefs", "sha256": "dc79c65d50ebac6860090663f4c4fe3707060222ee067dd075961e52cee735ee", "shim_sha256": "86f309b961e1aa6bac5523d91ea3ebe250233346b17c9770e7aed01690c119bc", "train": "0.1.0", "commit": "4376198cbd2f", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (c36b531d542c, gate profile, zig 0.17.0)", "binary": "/build/tmp/amp-brk-4096772/B/bin/squeezefs", "source": "/Users/joberdorf/Source/squeezefs-zig/.wt-a/zig-out-linux/bin/squeezefs", "sha256": "14a05adbaf92e3790c33d4e2a47ac667b09dfe82b386b51fa5f61f9a86ce16ab", "shim_sha256": "ede11adbbb4d7151de48624e1e96adb7aab6a15289d8c9049d19a4e6907d8d95", "train": "0.1.0", "commit": "c36b531d542c", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate file; lever binary; posture symmetric; 20s legs (+3s warm-up); numjobs 2 iodepth 32; scratch /build/tmp/amp-brk-4096772
+16:42:45 bracket[frag-512b-write]: format set 0 (symmetric): sqmeta:///build/tmp/amp-brk-4096772/set0-meta.img sqdata:///build/tmp/amp-brk-4096772/set0-data0.img,/build/tmp/amp-brk-4096772/set0-data1.img (staging root /build/tmp/amp-brk-4096772/cache-0)
+16:42:45 bracket[frag-512b-write]: leg 1 arm A: /build/tmp/amp-brk-4096772/A/bin/squeezefs (set 0, symmetric) -o ''
+16:42:46 bracket[frag-512b-write]: mounted /build/tmp/amp-brk-4096772/mnt (daemon pid 4096864)
+16:42:46 bracket[frag-512b-write]: leg 1: preparing the aging store's dataset (once per set)
+16:42:47 bracket[frag-512b-write]: leg 1: warm-up 3s (excluded)
+16:42:52 bracket[frag-512b-write]: leg 1: measured span 20s
+16:43:14 bracket[frag-512b-write]: leg 1: IOPS 3034.9 INVALID ['mem_budget_green']
+16:43:15 bracket[frag-512b-write]: leg 2 arm B: /build/tmp/amp-brk-4096772/B/bin/squeezefs (set 0, symmetric) -o ''
+16:43:16 bracket[frag-512b-write]: mounted /build/tmp/amp-brk-4096772/mnt (daemon pid 4097182)
+16:43:16 bracket[frag-512b-write]: leg 2: warm-up 3s (excluded)
+16:43:22 bracket[frag-512b-write]: leg 2: measured span 20s
+16:43:44 bracket[frag-512b-write]: leg 2: IOPS 3847.9 INVALID ['write_amplification_bound']

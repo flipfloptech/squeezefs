@@ -144,8 +144,8 @@ MISC = ["put_obj", "held_stores", "patch_writes", "own_block_dmas", "overlay_sto
 FSYNC_PHASES = ["intent_barrier", "data_flush", "staged_promote", "data_barrier",
                 "meta_publish", "meta_barrier", "extent_barrier"]
 
-ALL_COUNTERS = (DEVICE_WRITE_ARMS + DEVICE_WRITE_BESIDE + ADMISSION_ARMS + READ_COPY_ARMS + READ_COPY_BESIDE + RECLAIM + WIRE_RPCS
-                + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND)
+ALL_COUNTERS = (DEVICE_WRITE_ARMS + DEVICE_WRITE_BESIDE + DEVICE_WRITE_REQS + ADMISSION_ARMS + READ_COPY_ARMS + READ_COPY_BESIDE + RECLAIM
+                + WIRE_RPCS + TICK_RESCUES + MUST_STAY_0 + IPC + JOURNAL + FUSE + MISC + STAGED_APPEND)
 
 
 def flatten(doc):

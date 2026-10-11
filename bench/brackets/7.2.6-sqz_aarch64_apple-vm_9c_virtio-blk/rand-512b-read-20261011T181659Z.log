@@ -1,0 +1,24 @@
+18:17:00 bracket[rand-512b-read]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (564631b052a1, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/A/bin/squeezefs", "source": "/build/tmp/readamp-rsA/bin/squeezefs", "sha256": "e7a2dd6cdd9ff8e92e63c70f5336de00cc1acee103219a8cfb75705fbbb03d38", "shim_sha256": "442bcfdf0fd4d18dcb2afc327ef911279cdd04dd48d1c64ae68fac9bab41846c", "train": "0.1.0", "commit": "564631b052a1", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (8ed8824dae3b, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/B/bin/squeezefs", "source": "/build/tmp/readamp-rsB/bin/squeezefs", "sha256": "b02b78c6d978b79de7e611e31cca7e1d1477ffcba93a305f7c62ded9e8500309", "shim_sha256": "2b6a8d9fa1c85595752cca8b509d94f0c067665acc13dc0d23f00ae9ff7c1497", "train": "0.1.0", "commit": "8ed8824dae3b", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/readamp-brk
+18:17:00 bracket[rand-512b-read]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+18:17:00 bracket[rand-512b-read]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+18:17:00 bracket[rand-512b-read]: leg 1 arm A: /build/tmp/readamp-brk/A/bin/squeezefs (set 0, symmetric) -o ''
+18:17:00 bracket[rand-512b-read]: mounted /build/tmp/readamp-brk/mnt (daemon pid 5291)
+18:17:00 bracket[rand-512b-read]: leg 1: preparing the aging store's dataset (once per set)
+18:17:02 bracket[rand-512b-read]: leg 1: warm-up 10s (excluded)
+18:17:15 bracket[rand-512b-read]: leg 1: measured span 60s
+18:18:18 bracket[rand-512b-read]: leg 1: IOPS 14620.3 INVALID ['read_amplification_bound']
+18:18:18 bracket[rand-512b-read]: leg 2 arm B: /build/tmp/readamp-brk/B/bin/squeezefs (set 0, symmetric) -o ''
+18:18:19 bracket[rand-512b-read]: mounted /build/tmp/readamp-brk/mnt (daemon pid 5529)
+18:18:19 bracket[rand-512b-read]: leg 2: warm-up 10s (excluded)
+18:18:31 bracket[rand-512b-read]: leg 2: measured span 60s
+18:19:34 bracket[rand-512b-read]: leg 2: IOPS 16526.0 INVALID ['mem_budget_green']
+18:19:35 bracket[rand-512b-read]: leg 3 arm B: /build/tmp/readamp-brk/B/bin/squeezefs (set 0, symmetric) -o ''
+18:19:35 bracket[rand-512b-read]: mounted /build/tmp/readamp-brk/mnt (daemon pid 5760)
+18:19:35 bracket[rand-512b-read]: leg 3: warm-up 10s (excluded)
+18:19:48 bracket[rand-512b-read]: leg 3: measured span 60s
+18:20:51 bracket[rand-512b-read]: leg 3: IOPS 15490.6 valid
+18:20:51 bracket[rand-512b-read]: leg 4 arm A: /build/tmp/readamp-brk/A/bin/squeezefs (set 0, symmetric) -o ''
+18:20:52 bracket[rand-512b-read]: mounted /build/tmp/readamp-brk/mnt (daemon pid 7848)
+18:20:52 bracket[rand-512b-read]: leg 4: warm-up 10s (excluded)
+18:21:05 bracket[rand-512b-read]: leg 4: measured span 60s
+18:22:07 bracket[rand-512b-read]: leg 4: IOPS 15344.4 INVALID ['read_amplification_bound']

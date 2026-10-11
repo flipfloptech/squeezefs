@@ -1,0 +1,27 @@
+18:42:53 bracket[read-after-small-write]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (564631b052a1, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/A/bin/squeezefs", "source": "/build/tmp/readamp-rsA/bin/squeezefs", "sha256": "e7a2dd6cdd9ff8e92e63c70f5336de00cc1acee103219a8cfb75705fbbb03d38", "shim_sha256": "442bcfdf0fd4d18dcb2afc327ef911279cdd04dd48d1c64ae68fac9bab41846c", "train": "0.1.0", "commit": "564631b052a1", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (8ed8824dae3b, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/B/bin/squeezefs", "source": "/build/tmp/readamp-rsB/bin/squeezefs", "sha256": "b02b78c6d978b79de7e611e31cca7e1d1477ffcba93a305f7c62ded9e8500309", "shim_sha256": "2b6a8d9fa1c85595752cca8b509d94f0c067665acc13dc0d23f00ae9ff7c1497", "train": "0.1.0", "commit": "8ed8824dae3b", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate file; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/readamp-brk
+18:42:53 bracket[read-after-small-write]: format set 0 (symmetric):  sqmeta:///build/tmp/readamp-brk/set0-meta.img sqdata:///build/tmp/readamp-brk/set0-data0.img,/build/tmp/readamp-brk/set0-data1.img
+18:42:54 bracket[read-after-small-write]: leg 1 arm A: /build/tmp/readamp-brk/A/bin/squeezefs (set 0, symmetric) -o ''
+18:42:54 bracket[read-after-small-write]: mounted /build/tmp/readamp-brk/mnt (daemon pid 39841)
+18:42:54 bracket[read-after-small-write]: leg 1: preparing the aging store's dataset (once per set)
+18:42:56 bracket[read-after-small-write]: leg 1: warm-up 10s (excluded)
+18:43:09 bracket[read-after-small-write]: leg 1: measured span 60s
+18:44:11 bracket[read-after-small-write]: leg 1: IOPS 25655.9 INVALID ['read_amplification_bound']
+18:44:14 bracket[read-after-small-write]: leg 1: daemon log has 402 error( line(s)
+18:44:14 bracket[read-after-small-write]: leg 2 arm B: /build/tmp/readamp-brk/B/bin/squeezefs (set 0, symmetric) -o ''
+18:44:15 bracket[read-after-small-write]: mounted /build/tmp/readamp-brk/mnt (daemon pid 40246)
+18:44:15 bracket[read-after-small-write]: leg 2: warm-up 10s (excluded)
+18:44:27 bracket[read-after-small-write]: leg 2: measured span 60s
+18:45:30 bracket[read-after-small-write]: leg 2: IOPS 25536.1 valid
+18:45:30 bracket[read-after-small-write]: leg 2: daemon log has 458 error( line(s)
+18:45:30 bracket[read-after-small-write]: leg 3 arm B: /build/tmp/readamp-brk/B/bin/squeezefs (set 0, symmetric) -o ''
+18:45:31 bracket[read-after-small-write]: mounted /build/tmp/readamp-brk/mnt (daemon pid 40581)
+18:45:31 bracket[read-after-small-write]: leg 3: warm-up 10s (excluded)
+18:45:44 bracket[read-after-small-write]: leg 3: measured span 60s
+18:46:47 bracket[read-after-small-write]: leg 3: IOPS 13872.8 INVALID ['mem_budget_green']
+18:46:47 bracket[read-after-small-write]: leg 3: daemon log has 417 error( line(s)
+18:46:47 bracket[read-after-small-write]: leg 4 arm A: /build/tmp/readamp-brk/A/bin/squeezefs (set 0, symmetric) -o ''
+18:46:48 bracket[read-after-small-write]: mounted /build/tmp/readamp-brk/mnt (daemon pid 41127)
+18:46:48 bracket[read-after-small-write]: leg 4: warm-up 10s (excluded)
+18:47:01 bracket[read-after-small-write]: leg 4: measured span 60s
+18:48:03 bracket[read-after-small-write]: leg 4: IOPS 19037.2 INVALID ['read_amplification_bound']
+18:48:04 bracket[read-after-small-write]: leg 4: daemon log has 439 error( line(s)

@@ -1,0 +1,23 @@
+18:37:44 bracket[rand-4k-read-unaligned]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (564631b052a1, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/A/bin/squeezefs", "source": "/build/tmp/readamp-rsA/bin/squeezefs", "sha256": "e7a2dd6cdd9ff8e92e63c70f5336de00cc1acee103219a8cfb75705fbbb03d38", "shim_sha256": "442bcfdf0fd4d18dcb2afc327ef911279cdd04dd48d1c64ae68fac9bab41846c", "train": "0.1.0", "commit": "564631b052a1", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (8ed8824dae3b, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/B/bin/squeezefs", "source": "/build/tmp/readamp-rsB/bin/squeezefs", "sha256": "b02b78c6d978b79de7e611e31cca7e1d1477ffcba93a305f7c62ded9e8500309", "shim_sha256": "2b6a8d9fa1c85595752cca8b509d94f0c067665acc13dc0d23f00ae9ff7c1497", "train": "0.1.0", "commit": "8ed8824dae3b", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate file; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/readamp-brk
+18:37:44 bracket[rand-4k-read-unaligned]: format set 0 (symmetric):  sqmeta:///build/tmp/readamp-brk/set0-meta.img sqdata:///build/tmp/readamp-brk/set0-data0.img,/build/tmp/readamp-brk/set0-data1.img
+18:37:44 bracket[rand-4k-read-unaligned]: leg 1 arm A: /build/tmp/readamp-brk/A/bin/squeezefs (set 0, symmetric) -o ''
+18:37:44 bracket[rand-4k-read-unaligned]: mounted /build/tmp/readamp-brk/mnt (daemon pid 27769)
+18:37:44 bracket[rand-4k-read-unaligned]: leg 1: preparing the aging store's dataset (once per set)
+18:37:47 bracket[rand-4k-read-unaligned]: leg 1: warm-up 10s (excluded)
+18:37:59 bracket[rand-4k-read-unaligned]: leg 1: measured span 60s
+18:39:02 bracket[rand-4k-read-unaligned]: leg 1: IOPS 14922.2 INVALID ['read_amplification_bound']
+18:39:02 bracket[rand-4k-read-unaligned]: leg 2 arm B: /build/tmp/readamp-brk/B/bin/squeezefs (set 0, symmetric) -o ''
+18:39:03 bracket[rand-4k-read-unaligned]: mounted /build/tmp/readamp-brk/mnt (daemon pid 28534)
+18:39:03 bracket[rand-4k-read-unaligned]: leg 2: warm-up 10s (excluded)
+18:39:15 bracket[rand-4k-read-unaligned]: leg 2: measured span 60s
+18:40:18 bracket[rand-4k-read-unaligned]: leg 2: IOPS 15035.1 valid
+18:40:19 bracket[rand-4k-read-unaligned]: leg 3 arm B: /build/tmp/readamp-brk/B/bin/squeezefs (set 0, symmetric) -o ''
+18:40:20 bracket[rand-4k-read-unaligned]: mounted /build/tmp/readamp-brk/mnt (daemon pid 29252)
+18:40:20 bracket[rand-4k-read-unaligned]: leg 3: warm-up 10s (excluded)
+18:40:32 bracket[rand-4k-read-unaligned]: leg 3: measured span 60s
+18:41:35 bracket[rand-4k-read-unaligned]: leg 3: IOPS 15770.4 valid
+18:41:36 bracket[rand-4k-read-unaligned]: leg 4 arm A: /build/tmp/readamp-brk/A/bin/squeezefs (set 0, symmetric) -o ''
+18:41:36 bracket[rand-4k-read-unaligned]: mounted /build/tmp/readamp-brk/mnt (daemon pid 29975)
+18:41:36 bracket[rand-4k-read-unaligned]: leg 4: warm-up 10s (excluded)
+18:41:49 bracket[rand-4k-read-unaligned]: leg 4: measured span 60s
+18:42:52 bracket[rand-4k-read-unaligned]: leg 4: IOPS 19697.5 INVALID ['read_amplification_bound']

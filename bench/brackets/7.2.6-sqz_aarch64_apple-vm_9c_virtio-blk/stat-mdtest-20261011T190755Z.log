@@ -1,0 +1,14 @@
+19:07:56 bracket[stat-mdtest]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (564631b052a1, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/A/bin/squeezefs", "source": "/build/tmp/readamp-rsA/bin/squeezefs", "sha256": "e7a2dd6cdd9ff8e92e63c70f5336de00cc1acee103219a8cfb75705fbbb03d38", "shim_sha256": "442bcfdf0fd4d18dcb2afc327ef911279cdd04dd48d1c64ae68fac9bab41846c", "train": "0.1.0", "commit": "564631b052a1", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (807d6e259b5e-dirty, gate profile, zig 0.17.0)", "binary": "/build/tmp/readamp-brk/B/bin/squeezefs", "source": "/build/tmp/readamp-rsB/bin/squeezefs", "sha256": "b042043187cd6a7495e1be3163f0d1577cf96a9686b1d42780fdf65a27955468", "shim_sha256": "d58858e52e47df36a714865a7f76460fb1f83a4548ead3161d7c469a2bdaff92", "train": "0.1.0", "commit": "807d6e259b5e-dirty", "profile": "gate", "zig": "0.17.0", "dirty": true}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/readamp-brk
+19:07:56 bracket[stat-mdtest]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+19:07:56 bracket[stat-mdtest]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+19:07:56 bracket[stat-mdtest]: leg 1 arm A: /build/tmp/readamp-brk/A/bin/squeezefs (set 0, symmetric) -o ''
+19:07:56 bracket[stat-mdtest]: mounted /build/tmp/readamp-brk/mnt (daemon pid 125986)
+19:07:56 bracket[stat-mdtest]: leg 1: preparing the aging store's dataset (once per set)
+19:08:05 bracket[stat-mdtest]: leg 1: warm-up 10s (excluded)
+19:08:09 bracket[stat-mdtest]: leg 1: measured span 60s
+19:08:14 bracket[stat-mdtest]: leg 1: stats/s 52582.1 valid
+19:08:16 bracket[stat-mdtest]: leg 2 arm B: /build/tmp/readamp-brk/B/bin/squeezefs (set 0, symmetric) -o ''
+19:08:23 bracket[stat-mdtest]: mounted /build/tmp/readamp-brk/mnt (daemon pid 126179)
+19:08:23 bracket[stat-mdtest]: leg 2: warm-up 10s (excluded)
+19:08:28 bracket[stat-mdtest]: leg 2: measured span 60s
+19:08:32 bracket[stat-mdtest]: leg 2: stats/s 51360.8 valid

@@ -46,10 +46,11 @@ rm -rf "$SET_DIR/cache"/*
 # the set's own ledger (a test that runs `_scratch_mkfs` bare captures them
 # into its golden output — generic/631, 634, 732, 754, 800); a refusal is
 # the diagnosis and goes to stderr with the exit code.
-if out=$("$SQZ_BIN" format --single-writer --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SET_DEV" "sqdata://$SET_DIR/d0.img,$SET_DIR/d1.img" 2>&1); then
+rc=0
+out=$("$SQZ_BIN" format --single-writer --disk-cache-paths "$SET_DIR/cache" "${extra[@]}" "sqmeta://$SET_DEV" "sqdata://$SET_DIR/d0.img,$SET_DIR/d1.img" 2>&1) || rc=$?
+if [ "$rc" = 0 ]; then
   printf '%s\n' "$(date +%s) format $dev" "$out" >> "$SET_DIR/formats.log"
   exit 0
 fi
-rc=$?
 printf '%s\n' "$out" >&2
 exit "$rc"

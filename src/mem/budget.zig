@@ -64,6 +64,20 @@ pub const max_components = 64;
 /// production census, so this is a porting error, not a runtime condition.
 pub var registry_full: counters.Tripwire = .init("mem_budget_registry_full");
 
+/// The idle-trim law (charter §6.2 "memory returns under pressure"; the
+/// reference's lever here was jemalloc's `arena.4096.purge` on Red ticks —
+/// this port's pools hold their idle memory explicitly, so each returns it
+/// itself). The idle clock is `ticks`, bumped at the start of every tick;
+/// a pool stamps an entry with the clock at its release, so `now − stamp`
+/// = 1 means "freed somewhere inside the last period" and 2 "free for at
+/// least one FULL period". On a YELLOW tick every trimmable component
+/// returns the entries idle ≥ 2 (returning what the live workload touched
+/// inside the last second would only refault it under "freeze growth");
+/// on a RED tick everything idle goes (min 0), after the shed pass so the
+/// entries the shed just evicted return in the same tick.
+pub const trim_yellow_min_idle_ticks: u64 = 2;
+pub const trim_red_min_idle_ticks: u64 = 0;
+
 pub const Level = enum(u8) {
     green = 0,
     yellow = 1,
@@ -371,6 +385,11 @@ fn readSmallFile(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {
 
 pub const GaugeFn = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque) u64 };
 pub const ShedFn = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, target: u64) void };
+/// Return the pool's idle (free-but-resident) memory to the kernel: every
+/// entry idle for ≥ `min_idle_ticks` sampler ticks (`MemBudget.ticks` is
+/// the clock the pools stamp their frees with). Never touches a live
+/// entry; never lossy. Invoked from the sampler thread with no lock held.
+pub const TrimFn = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, min_idle_ticks: u64) void };
 
 /// Where a component's logical bytes come from: a plain ledger read
 /// directly, or a computed level. Callable from the sampler thread without
@@ -405,7 +424,11 @@ pub const Component = struct {
     /// f1 trace: 5 GiB of reclaimed tier bytes pinned Red; their kill-relevant
     /// residue arrives via the unreclaimable arm).
     kernel_reclaimable: bool = false,
+    /// The idle-trim hook (`trim_*_min_idle_ticks`); null ⇒ the component
+    /// holds no idle memory of its own (in-flight DMAs, kernel regions).
+    trim: ?TrimFn = null,
     sheds: std.atomic.Value(u64) = .init(0),
+    trims: std.atomic.Value(u64) = .init(0),
 
     pub fn init(name: []const u8, floor: u64, weight: u64, source: Source, shed: ?ShedFn) Component {
         return .{ .name = name, .source = source, .floor = floor, .weight = weight, .shed = shed };
@@ -418,6 +441,13 @@ pub const Component = struct {
         return c;
     }
 
+    /// Builder: the idle-trim hook.
+    pub fn withTrim(self: Component, trim: TrimFn) Component {
+        var c = self;
+        c.trim = trim;
+        return c;
+    }
+
     pub fn current(self: *const Component) u64 {
         return self.source.current();
     }
@@ -427,8 +457,19 @@ pub const Component = struct {
         return self.sheds.load(.monotonic);
     }
 
+    /// Trim calls received (Yellow and Red ticks).
+    pub fn trimCount(self: *const Component) u64 {
+        return self.trims.load(.monotonic);
+    }
+
     fn callShed(self: *const Component, target: u64) void {
         if (self.shed) |s| s.call(s.ctx, target);
+    }
+
+    fn callTrim(self: *Component, min_idle_ticks: u64) void {
+        const t = self.trim orelse return;
+        _ = self.trims.fetchAdd(1, .monotonic);
+        t.call(t.ctx, min_idle_ticks);
     }
 };
 
@@ -456,6 +497,9 @@ pub const MemBudget = struct {
     count: std.atomic.Value(usize) = .init(0),
 
     flag_budget: std.atomic.Value(u64) = .init(0),
+    /// Ticks taken (the idle clock the pools stamp their frees with; one
+    /// tick ≈ one sampler period).
+    tick_count: std.atomic.Value(u64) = .init(0),
     /// The effective cgroup cage of the last resolution (0 = uncapped).
     cgroup_cap: std.atomic.Value(u64) = .init(0),
     budget: std.atomic.Value(u64) = .init(0),
@@ -515,6 +559,10 @@ pub const MemBudget = struct {
     }
     pub fn budgetBytes(self: *const MemBudget) u64 {
         return self.budget.load(.monotonic);
+    }
+    /// The sampler's tick count: the idle clock (`TrimFn`).
+    pub fn ticks(self: *const MemBudget) u64 {
+        return self.tick_count.load(.monotonic);
     }
     pub fn pressureBytes(self: *const MemBudget) u64 {
         return self.pressure.load(.monotonic);
@@ -589,6 +637,7 @@ pub const MemBudget = struct {
     /// tier pause → backstop → level + events → shed.
     pub fn tickInner(self: *MemBudget, budget_now: u64, rss_sample: u64, unreclaimable_sample: u64) void {
         self.budget.store(budget_now, .monotonic);
+        _ = self.tick_count.fetchAdd(1, .monotonic);
         const rss_max = pushWindow(&self.rss_window, &self.rss_idx, rss_sample);
         const unreclaim_max = pushWindow(&self.unreclaim_window, &self.unreclaim_idx, unreclaimable_sample);
         self.unreclaimable.store(unreclaim_max, .monotonic);
@@ -672,11 +721,20 @@ pub const MemBudget = struct {
         }
 
         // EVERY Red tick sheds, not just the entry edge. The reference also
-        // purges jemalloc's retained dirty pages here (`arena.4096.purge`);
-        // the std allocators expose no release-to-OS call, so there is no
-        // allocator lever in this port — retained-page drift shows up in the
-        // statm arm.
+        // purged jemalloc's retained dirty pages here (`arena.4096.purge`);
+        // the std allocators expose no release-to-OS call, so the pools
+        // return their own idle memory: the idle-trim pass, Yellow and Red
+        // (after the shed, so what the shed evicted returns in this tick).
         if (next == .red) self.shedToWeights(budget_now, pressure_now, reg);
+        switch (next) {
+            .green => {},
+            .yellow => self.trimIdle(reg, trim_yellow_min_idle_ticks),
+            .red => self.trimIdle(reg, trim_red_min_idle_ticks),
+        }
+    }
+
+    fn trimIdle(_: *MemBudget, reg: []Component, min_idle_ticks: u64) void {
+        for (reg) |*c| c.callTrim(min_idle_ticks);
     }
 
     /// Red response: distribute the excess over the 85 % target (or over Σ
@@ -842,11 +900,11 @@ pub const MemBudget = struct {
     pub fn writeStatsJson(self: *const MemBudget, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print("{{\"mem_budget_bytes\":{d},\"mem_budget_pressure_bytes\":{d},\"mem_budget_gauge_sum_bytes\":{d},\"mem_budget_level\":{d},", .{ self.budgetBytes(), self.pressureBytes(), self.gaugeSumBytes(), @backingInt(self.level()) });
         try w.print("\"mem_budget_yellow_events\":{d},\"mem_budget_red_events\":{d},\"mem_budget_floors_clamped\":{},\"mem_budget_unreclaimable_bytes\":{d},", .{ self.yellowEvents(), self.redEvents(), self.floorsClamped(), self.unreclaimableBytes() });
-        try w.print("\"mem_budget_hard_backstops\":{d},\"mem_budget_backstop_active\":{},\"mem_budget_tier_publish_paused\":{},", .{ self.hardBackstops(), self.backstopActive(), self.tierPublishPaused() });
+        try w.print("\"mem_budget_hard_backstops\":{d},\"mem_budget_backstop_active\":{},\"mem_budget_tier_publish_paused\":{},\"mem_budget_ticks\":{d},", .{ self.hardBackstops(), self.backstopActive(), self.tierPublishPaused(), self.ticks() });
         try w.writeAll("\"mem_budget_components\":{");
         for (self.components(), 0..) |*c, i| {
             if (i != 0) try w.writeByte(',');
-            try w.print("\"{s}\":{{\"current\":{d},\"floor\":{d},\"weight\":{d},\"sheds\":{d}}}", .{ c.name, c.current(), c.floor, c.weight, c.shedCount() });
+            try w.print("\"{s}\":{{\"current\":{d},\"floor\":{d},\"weight\":{d},\"sheds\":{d},\"trims\":{d}}}", .{ c.name, c.current(), c.floor, c.weight, c.shedCount(), c.trimCount() });
         }
         try w.writeAll("}}");
     }
@@ -905,6 +963,8 @@ const ShedLog = struct {
     const Entry = struct { name: []const u8, target: u64 };
     entries: [32]Entry = undefined,
     len: usize = 0,
+    name_bytes: [1024]u8 = undefined,
+    name_len: usize = 0,
 
     fn push(self: *ShedLog, name: []const u8, target: u64) void {
         self.entries[self.len] = .{ .name = name, .target = target };
@@ -919,6 +979,13 @@ const ShedLog = struct {
     }
     fn slice(self: *const ShedLog) []const Entry {
         return self.entries[0..self.len];
+    }
+    /// A copy of `name` that outlives the caller's buffer.
+    fn intern(self: *ShedLog, name: []const u8) []const u8 {
+        const dst = self.name_bytes[self.name_len..][0..name.len];
+        @memcpy(dst, name);
+        self.name_len += name.len;
+        return dst;
     }
 };
 
@@ -961,6 +1028,16 @@ const TestComp = struct {
     /// No shed at all (attribution-only).
     fn inert(self: *TestComp, floor: u64, weight: u64) Component {
         return Component.init(self.name, floor, weight, .{ .func = .{ .ctx = self, .call = current } }, null);
+    }
+    fn recordTrim(ctx: *anyopaque, min_idle_ticks: u64) void {
+        const self: *TestComp = @ptrCast(@alignCast(ctx));
+        var buf: [64]u8 = undefined;
+        self.shed_log.push(self.shed_log.intern(std.fmt.bufPrint(&buf, "{s}:trim", .{self.name}) catch unreachable), min_idle_ticks);
+    }
+    /// A recording shed plus a recording trim (`<name>:trim`, target = the
+    /// idle-tick minimum).
+    fn trimming(self: *TestComp, floor: u64, weight: u64) Component {
+        return Component.init(self.name, floor, weight, .{ .func = .{ .ctx = self, .call = current } }, .{ .ctx = self, .call = record }).withTrim(.{ .ctx = self, .call = recordTrim });
     }
 };
 
@@ -1190,6 +1267,45 @@ test "Red sheds ∝ weight over floors, once per tick; at-floor components get n
     shed_log.clear();
     b.tickInner(1200, 0, 0);
     try testing.expectEqual(Level.yellow, b.level());
+    try testing.expectEqual(@as(usize, 0), shed_log.len);
+}
+
+test "the idle-trim law: Green ticks trim nothing; a Yellow tick asks every trimmable component for entries idle ≥ 1 tick; a Red tick for everything idle (min 0), after the shed; the tick counter advances once per tick" {
+    var b: MemBudget = .{};
+    var shed_log: ShedLog = .{};
+    var pool = TestComp.init("pool", 500, &shed_log);
+    var plain = TestComp.init("plain", 300, &shed_log);
+    b.register(pool.trimming(0, 1));
+    b.register(plain.recording(0, 1));
+    try testing.expectEqual(@as(u64, 0), b.ticks());
+    // 800 / 1000 = 80 % ⇒ Yellow: a trim call with min_idle_ticks 1, no shed.
+    b.tickInner(1000, 0, 0);
+    try testing.expectEqual(@as(u64, 1), b.ticks());
+    try testing.expectEqual(Level.yellow, b.level());
+    try testing.expectEqual(@as(usize, 1), shed_log.len);
+    try testing.expectEqual(@as(?u64, trim_yellow_min_idle_ticks), shed_log.find("pool:trim"));
+    try testing.expectEqual(@as(u64, 0), b.components()[0].shedCount());
+    // Green: nothing.
+    shed_log.clear();
+    b.tickInner(10_000, 0, 0);
+    try testing.expectEqual(@as(u64, 2), b.ticks());
+    try testing.expectEqual(Level.green, b.level());
+    try testing.expectEqual(@as(usize, 0), shed_log.len);
+    // Red (800 / 820 = 97 %): the shed first (both components, weight 1
+    // each), then the trim with min 0 — the order the log records.
+    b.tickInner(820, 0, 0);
+    try testing.expectEqual(Level.red, b.level());
+    try testing.expectEqual(@as(usize, 3), shed_log.len);
+    try testing.expectEqualStrings("pool", shed_log.slice()[0].name);
+    try testing.expectEqualStrings("plain", shed_log.slice()[1].name);
+    try testing.expectEqualStrings("pool:trim", shed_log.slice()[2].name);
+    try testing.expectEqual(@as(u64, trim_red_min_idle_ticks), shed_log.slice()[2].target);
+    try testing.expectEqual(@as(u64, 1), b.components()[0].shedCount());
+    try testing.expectEqual(@as(u64, 2), b.components()[0].trimCount());
+    try testing.expectEqual(@as(u64, 0), b.components()[1].trimCount());
+    // A 0 budget never trims (idle Green with every escalation cleared).
+    shed_log.clear();
+    b.tickInner(0, 0, 0);
     try testing.expectEqual(@as(usize, 0), shed_log.len);
 }
 
@@ -1474,12 +1590,14 @@ test "stats JSON carries every spec key with live values" {
     try testing.expectEqual(@as(i64, 0), o.get("mem_budget_hard_backstops").?.integer);
     try testing.expectEqual(false, o.get("mem_budget_backstop_active").?.bool);
     try testing.expectEqual(false, o.get("mem_budget_tier_publish_paused").?.bool);
+    try testing.expectEqual(@as(i64, 1), o.get("mem_budget_ticks").?.integer);
     const comps = o.get("mem_budget_components").?.object;
     const hot = comps.get("hot_block_tier").?.object;
     try testing.expectEqual(@as(i64, 960), hot.get("current").?.integer);
     try testing.expectEqual(@as(i64, 100), hot.get("floor").?.integer);
     try testing.expectEqual(@as(i64, 4), hot.get("weight").?.integer);
     try testing.expectEqual(@as(i64, 1), hot.get("sheds").?.integer);
+    try testing.expectEqual(@as(i64, 0), hot.get("trims").?.integer);
 }
 
 // ---- §6 knob faces ----

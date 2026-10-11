@@ -1156,6 +1156,8 @@ pub const WritePath = struct {
 
 const testing = std.testing;
 const wt = @import("write_testing.zig");
+const block_grant = @import("sym_planes/block_grant.zig");
+const data_bitmap = @import("sym_planes/data_bitmap.zig");
 
 test "the splitter: pieces are single-block, page offsets preserved; a straddling write of a skewed grid yields one piece per block touched" {
     var buf: [8]Piece = undefined;
@@ -1827,6 +1829,112 @@ test "the parked-buffer gate, the wall with supply VISIBLE: a plane refusing the
     try testing.expectEqual(refusals0, stats.parked_gate_wall_refusals.load());
     try testing.expectEqual(@as(u32, 8), w.wp.table.parkedCount());
     try testing.expect(w.wp.table.has(1, 8));
+}
+
+/// A data volume of the test World armed as the grant plane's HOLDER: the
+/// bitmap over the allocator (its finish-free sink), a small ledger, the
+/// own window bound to its sink — the solo symmetric mount's shape.
+const ArmedVolume = struct {
+    bitmap: *data_bitmap.DataBitmap,
+    holder: block_grant.HolderGrants,
+    arm: block_grant.WriterArm,
+    sink: block_grant.LocalSink,
+
+    fn arm_(self: *ArmedVolume, gpa: Allocator, alloc: *block_alloc.BlockAllocator, ledger_slots: usize) !void {
+        const blocks = alloc.capacityBlocks();
+        self.bitmap = try data_bitmap.DataBitmap.init(gpa, alloc, .{ .vol_tag = alloc.volTag(), .term = 1, .blocks = blocks, .ring_capacity = data_bitmap.ringCapacity(block_grant.BLOCK_GRANT_FLOOR, 1, 64) });
+        self.holder = .{ .ledger = try block_grant.Ledger.init(gpa, ledger_slots), .bitmap = self.bitmap };
+        self.arm = .{ .capacity_blocks = blocks };
+        self.sink = .{ .holder = &self.holder, .writer = 0, .window = &self.arm.window };
+        self.arm.sink = self.sink.sink();
+        alloc.grant_source = self.arm.grantSource();
+        alloc.finish_free_sink = self.bitmap.finishFreeSink();
+    }
+
+    fn disarm(self: *ArmedVolume, alloc: *block_alloc.BlockAllocator) void {
+        alloc.grant_source = null;
+        alloc.finish_free_sink = null;
+        self.holder.ledger.deinit();
+        self.bitmap.deinit();
+    }
+};
+
+// Rung 9 F17 through the write path: the bracket harness's aging store in
+// miniature — two grant-armed volumes, four files of four blocks (a quarter
+// of the set live), whole-block overwrites lap after lap through the overlay
+// and the accumulation arms, every displaced block freed back into the
+// holder's bitmap. The ledger has 16 slots (the product's 1,024 filled in
+// one 60 s leg the same way once the carves fragmented): at `53d05e1` the
+// consumed grants filled it, every top-up answered `deferred`, the mints
+// read `StorageFull` at a quarter full, the pieces parked, the pool filled
+// and the gate's wall answered ENOSPC (96 per leg).
+test "the aging store through the write path (rung 9 F17): grant-armed volumes under laps of whole-block overwrites — every write lands, no ENOSPC, the gate's wall never fires, the ledger never fills, the set never reads exhausted" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const w = try World.init(gpa, .sync_inline, true);
+    defer w.deinit(gpa);
+    var va: ArmedVolume = undefined;
+    try va.arm_(gpa, w.f.alloc_a, 16);
+    defer va.disarm(w.f.alloc_a);
+    var vb: ArmedVolume = undefined;
+    try vb.arm_(gpa, w.f.alloc_b, 16);
+    defer vb.disarm(w.f.alloc_b);
+    const wall0 = stats.parked_gate_wall_refusals.load();
+    const visible0 = counters.tripwireCount("parked_gate_wall_supply_visible");
+    const refusals0 = stats.write_enospc_refusals.load();
+    const deferred0 = block_grant.stats.block_grant_deferred.load();
+    const exhausted0 = block_grant.stats.block_grant_exhausted.load();
+    const files: u64 = 4;
+    const blocks_per_file: u32 = 4;
+    var whole: [wt.BS]u8 align(4096) = undefined;
+    var lap: u8 = 0;
+    while (lap < 12) : (lap += 1) {
+        var ino: u64 = 1;
+        while (ino <= files) : (ino += 1) {
+            if (lap == 0) try w.f.map.create(ino, .striped, 0);
+            var b: u32 = 0;
+            while (b < blocks_per_file) : (b += 1) {
+                // The laps interleave the files' blocks so the frees scatter.
+                const block = (b + lap) % blocks_per_file;
+                fill(&whole, @truncate(lap * 17 + block));
+                const size: u64 = if (lap == 0) @as(u64, block) * wt.BS else blocks_per_file * wt.BS;
+                const o = w.wp.write(io, .{ .ino = ino, .offset = @as(u64, block) * wt.BS, .payload = .{ .bytes = &whole }, .class = .entire_op, .file = World.striped(size) }) catch |e| {
+                    std.debug.print("lap {d} ino {d} block {d}: {t}; clear bits a {d} b {d}, open grants a {d} b {d}, parked {d}\n", .{ lap, ino, block, e, w.f.alloc_a.capacityBlocks() - va.bitmap.populationNow(), w.f.alloc_b.capacityBlocks() - vb.bitmap.populationNow(), va.holder.ledger.openCount(), vb.holder.ledger.openCount(), w.wp.table.parkedCount() });
+                    return e;
+                };
+                try testing.expectEqual(wt.BS, o.written);
+            }
+            w.wp.quiesce(io);
+        }
+        // Every file's epoch closed (full coverage): the displaced blocks are free again.
+        ino = 1;
+        while (ino <= files) : (ino += 1) w.wp.flushIno(io, ino);
+        w.wp.quiesce(io);
+    }
+    try testing.expectEqual(wall0, stats.parked_gate_wall_refusals.load());
+    try testing.expectEqual(visible0, counters.tripwireCount("parked_gate_wall_supply_visible"));
+    try testing.expectEqual(refusals0, stats.write_enospc_refusals.load());
+    try testing.expectEqual(deferred0, block_grant.stats.block_grant_deferred.load());
+    try testing.expectEqual(exhausted0, block_grant.stats.block_grant_exhausted.load());
+    try testing.expect(va.holder.ledger.openCount() <= block_grant.GRANTS_MAX + 1);
+    try testing.expect(vb.holder.ledger.openCount() <= block_grant.GRANTS_MAX + 1);
+    var cands: [router.MAX_VOLUMES]*block_alloc.BlockAllocator = undefined;
+    try testing.expect(!enospc.freshSupplyExhausted(w.f.vols.candidates(&cands)));
+    // The live set is what the files hold: nothing parked, nothing leaked.
+    try testing.expectEqual(@as(u32, 0), w.wp.table.parkedCount());
+    // The last lap's bytes are on the device, byte-exact.
+    var got: [wt.BS]u8 = undefined;
+    const last_lap: u8 = 11;
+    var ino: u64 = 1;
+    while (ino <= files) : (ino += 1) {
+        var b: u32 = 0;
+        while (b < blocks_per_file) : (b += 1) {
+            const m = w.f.map.seam().lookup(ino, b) orelse return error.BlockUnmapped;
+            w.f.dev.peek(m.vol_tag, m.offset, &got);
+            fill(&whole, @truncate(last_lap * 17 + b));
+            try testing.expectEqualSlices(u8, &whole, &got);
+        }
+    }
 }
 
 /// A device hook that holds every DMA until released (the window between a

@@ -23,7 +23,7 @@
 //! harness's 6 GiB aging store the holder's own window hit 1,024 consumed
 //! slots in one 60 s leg (fragmented carves ≈ 9 blocks each once the
 //! frontier wrapped), every top-up answered `deferred`, every mint read an
-//! empty window as `StorageFull` at 25 % fill (rung 9 F17; 0002 row 454).
+//! empty window as `StorageFull` at 25 % fill (rung 9 F17; 0002 row 455).
 //!
 //! The writer's `GrantWindow` mints lowest-first, gives a minted-never-
 //! published block back (merged onto its neighbours), and PULLS a top-up

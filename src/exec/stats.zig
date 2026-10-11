@@ -39,9 +39,13 @@ pub var fibers_live: PerClass(counters.Gauge) = .{};
 /// `exec_fiber_stack_hwm_bytes`: the deepest stack use ever measured at a
 /// fiber's recycle (the canary high-water mark; debug/test builds).
 pub var fiber_stack_hwm_bytes: counters.Gauge = .{};
-/// `exec_fiber_stack_bytes`: stack bytes currently mapped — the
-/// `mem_budget` component's gauge (non-sheddable).
+/// `exec_fiber_stack_bytes`: stack bytes the kernel may hold — mapped
+/// stacks minus the usable regions the idle trim returned — the
+/// `mem_budget` component's gauge (`exec_fiber_stacks`).
 pub var fiber_stack_bytes: counters.Gauge = .{};
+/// `exec_fiber_stack_trimmed_bytes`: stack bytes returned by the idle trim
+/// (Yellow/Red ticks).
+pub var fiber_stack_trimmed_bytes: counters.ShardedCounter = .{};
 /// `exec_polls[class]`: fiber switches into a fiber.
 pub var polls: PerClass(counters.ShardedCounter) = .{};
 /// `exec_poll_ns`: each poll's wall duration — the long-poll watchdog (a
@@ -128,7 +132,7 @@ fn perClassLoads(comptime T: type, pc: *PerClass(T)) [LaneClass.count]u64 {
 pub fn writeStatsJson(w: *Io.Writer, lanes: []const LaneView) Io.Writer.Error!void {
     try w.writeByte('{');
     try writePerClass(w, "exec_fibers_live", perClassLoads(counters.Gauge, &fibers_live));
-    try w.print(",\"exec_fiber_stack_hwm_bytes\":{d},\"exec_fiber_stack_bytes\":{d},", .{ fiber_stack_hwm_bytes.load(), fiber_stack_bytes.load() });
+    try w.print(",\"exec_fiber_stack_hwm_bytes\":{d},\"exec_fiber_stack_bytes\":{d},\"exec_fiber_stack_trimmed_bytes\":{d},", .{ fiber_stack_hwm_bytes.load(), fiber_stack_bytes.load(), fiber_stack_trimmed_bytes.load() });
     try writePerClass(w, "exec_polls", perClassLoads(counters.ShardedCounter, &polls));
     try w.writeAll(",\"exec_poll_ns\":");
     try poll_ns.snapshot().writeJson(w);

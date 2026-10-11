@@ -140,6 +140,20 @@ pub const SqzIo = struct {
         return @intFromPtr(lane_mod.currentFiber() orelse return 0);
     }
 
+    /// The idle-trim hook (`mem_budget.TrimFn`): every lane's free slots.
+    fn trimIdleStacksHook(ctx: *anyopaque, min_idle_ticks: u64) void {
+        const self: *SqzIo = @ptrCast(@alignCast(ctx));
+        _ = self.trimIdleStacks(min_idle_ticks);
+    }
+
+    /// Return the stack pages of every free slot idle ≥ `min_idle_ticks` on
+    /// every lane; the count trimmed.
+    pub fn trimIdleStacks(self: *SqzIo, min_idle_ticks: u64) u32 {
+        var n: u32 = 0;
+        for (self.lanes) |l| n += l.trimIdleStacks(min_idle_ticks);
+        return n;
+    }
+
     pub fn init(gpa: std.mem.Allocator, options: Options) InitError!*SqzIo {
         const self = try gpa.create(SqzIo);
         errdefer gpa.destroy(self);
@@ -294,7 +308,9 @@ pub const SqzIo = struct {
         self.fuse_homes = homes;
         self.fuse_placement = try placement.Placement.init(gpa, homes, alive, self.topo.node_count);
 
-        self.stack_component = mem_budget.Component.init("exec_fiber_stacks", 0, 0, .{ .gauge = &stats.fiber_stack_bytes }, null);
+        // Non-sheddable (the live frames are the handlers'), but the idle
+        // slots' pages return under the idle-trim law.
+        self.stack_component = mem_budget.Component.init("exec_fiber_stacks", 0, 0, .{ .gauge = &stats.fiber_stack_bytes }, null).withTrim(.{ .ctx = self, .call = &trimIdleStacksHook });
         if (options.budget) |b| b.register(self.stack_component);
         return self;
     }
@@ -966,6 +982,28 @@ test "capacity derivations: the fuse formula from the geometry, the budget eight
     try testing.expectEqual(@as(u32, 256), meta_capacity_default);
 }
 
+test "the stack reserve of the venue's population is the per-lane in-flight ceilings summed: 9 queues × depth 32 on 9 lanes = 9 × (32 + slack) fuse slots, 2 × 256 meta, 16 main (+16 lease); the reserve is virtual, the gauge counts what the kernel may hold" {
+    const page: usize = 4096;
+    const fuse_lanes: u32 = 9;
+    const fuse_slots = fuse_lanes * fuseCapacity(.{ .nqueues = 9, .q_depth = 32 }, fuse_lanes);
+    try testing.expectEqual(@as(u32, 9 * 48), fuse_slots);
+    const meta_slots = placement.metaLanesFrom(9) * meta_capacity_default;
+    try testing.expectEqual(@as(u32, 512), meta_slots);
+    const handler_stack = fiber_mod.stackSizeFor(.fuse, page) + page;
+    const big_stack = fiber_mod.stackSizeFor(.main, page) + page;
+    // The whole-population reserve the venue's 752 MB gauge was converging
+    // to (every slot touched once): (432 + 512 + 16) handler-class stacks
+    // + 16 main-class = 1,077,739,520 B ≈ 1.0 GiB of VIRTUAL reserve; the
+    // kernel holds only touched pages (the measured deepest frame under
+    // fsstress: 205 KiB), and the idle trim returns those.
+    const reserve = (fuse_slots + meta_slots + lease_capacity_default) * handler_stack + main_capacity_default * big_stack;
+    try testing.expectEqual(@as(usize, 1_077_739_520), reserve);
+    // Capacity never exceeds the budget's eighth: a 4 GiB budget holds the
+    // full meta population at 1 MiB stacks, a 1 GiB budget halves it.
+    try testing.expectEqual(meta_capacity_default, capacityFromBudget(meta_capacity_default, 4 * derive.GiB, fiber_mod.stackSizeFor(.meta, page)));
+    try testing.expectEqual(@as(u32, 128), capacityFromBudget(meta_capacity_default, derive.GiB, fiber_mod.stackSizeFor(.meta, page)));
+}
+
 test "testInstance: 2 meta lanes, a main lane, a running timer thread and pool; the vtable delegates Threaded's file ops" {
     const sqz = try SqzIo.testInstance();
     defer sqz.deinit();
@@ -1351,6 +1389,12 @@ test "placement with fuse lanes on this machine: spawnHome lands on the lane hom
     try testing.expectEqual(@as(u16, 0), fut.await(io));
     try testing.expect(stats.fiber_stack_bytes.load() >= stack_bytes_before);
     try testing.expect(budget.components()[0].current() == stats.fiber_stack_bytes.load());
+    // The component carries the idle trim: with min 0 every free touched
+    // stack on every lane returns its pages and the gauge falls.
+    const c = &budget.components()[0];
+    const before_trim = stats.fiber_stack_bytes.load();
+    c.trim.?.call(c.trim.?.ctx, 0);
+    try testing.expect(stats.fiber_stack_bytes.load() < before_trim);
     if (fuse.len < 2) return;
     // Kill lane 0's ring from its own thread (the lane's loud log lands
     // there): the next spawn homed on it is re-routed, counted, logged once.

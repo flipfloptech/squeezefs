@@ -63,6 +63,7 @@ const fiber_mod = @import("fiber.zig");
 const timer_heap = @import("timer_heap.zig");
 const placement = @import("placement.zig");
 const stats = @import("stats.zig");
+const mem_budget = @import("../mem/budget.zig");
 const group_mod = @import("group.zig");
 
 comptime {
@@ -203,6 +204,9 @@ pub const Lane = struct {
     in_flight: u32 = 0,
     /// Fibers between spawn and recycle.
     live: std.atomic.Value(u32) = .init(0),
+    /// The idle clock the recycled slots are stamped with: the budget
+    /// sampler's tick count (a test points it at its own).
+    clock: *const std.atomic.Value(u64) = &mem_budget.authority.tick_count,
     /// `exec_lane_queue_depth`: ready + inbox depth as of the last pass.
     queue_depth: counters.Gauge = .{},
     tick_rescues: std.atomic.Value(u64) = .init(0),
@@ -262,6 +266,7 @@ pub const Lane = struct {
         self.fibers = try gpa.alloc(Fiber, options.fiber_capacity);
         for (self.fibers, 0..) |*f, i| {
             f.stack = null;
+            f.idle_tick = 0;
             f.reset(self, @intCast(i));
             assert(self.free.tryPush(f));
         }
@@ -432,9 +437,33 @@ pub const Lane = struct {
     pub fn recycle(self: *Lane, f: *Fiber) void {
         f.recordHighWater();
         f.reset(self, f.slot);
+        // Stamp the idle clock BEFORE the push: a trimmer that pops the slot
+        // reads a stamp no older than the recycle.
+        f.idle_tick = self.clock.load(.monotonic);
         stats.fibers_live.of(self.class).sub(1);
         _ = self.live.fetchSub(1, .monotonic);
         assert(self.free.tryPush(f));
+    }
+
+    /// The idle-trim law over this lane's slot pool (any thread; the
+    /// sampler's): return the stack pages of every FREE slot idle for
+    /// ≥ `min_idle_ticks` ticks. A slot is popped, trimmed and pushed back
+    /// before the next, so a concurrent spawn is at most one slot short
+    /// for the microseconds of one madvise; one lap over the capacity
+    /// bounds the pass. Returns the stacks trimmed.
+    pub fn trimIdleStacks(self: *Lane, min_idle_ticks: u64) u32 {
+        const now = self.clock.load(.monotonic);
+        var trimmed: u32 = 0;
+        var seen: u32 = 0;
+        while (seen < self.fiber_capacity) : (seen += 1) {
+            const f = self.free.tryPop() orelse break;
+            if (f.stack) |*s| if (!s.trimmed and now -| f.idle_tick >= min_idle_ticks) {
+                s.trim();
+                trimmed += 1;
+            };
+            assert(self.free.tryPush(f));
+        }
+        return trimmed;
     }
 
     /// Queue a SCHEDULED fiber (the caller's `state.wake()` returned true).
@@ -1105,6 +1134,70 @@ test "a resident: started/stopping run on the lane thread, a NOP under a residen
     waitQuiescent(l);
     l.stopAndJoin();
     try testing.expectEqual(r.started_on.load(.acquire), r.stopped_on.load(.acquire));
+}
+
+test "the idle-trim law on a lane's stacks: every slot a spawn ever touched stays mapped; trimIdleStacks returns the pages of free slots idle ≥ min ticks (the mapped-not-returned gauge falls by the usable region), mincore agrees, a re-spawn re-arms the slot and the gauge rises again" {
+    // Capacity 4 = the population: after four spawns every slot is mapped,
+    // so the fifth must re-arm a trimmed one.
+    const l = try testLane(.meta, 4, false);
+    defer l.deinit();
+    var idle_clock: std.atomic.Value(u64) = .init(100);
+    l.clock = &idle_clock;
+    const S = struct {
+        fn run(context: *const anyopaque) void {
+            // A frame deep enough to touch a few pages, then finish.
+            var pad: [20_000]u8 = undefined;
+            @memset(&pad, 7);
+            std.mem.doNotOptimizeAway(&pad);
+            ctxOf(context).probe.finish();
+        }
+    };
+    const before = stats.fiber_stack_bytes.load();
+    var g = membersGroup(4);
+    var probes: [4]Probe = @splat(.{});
+    for (&probes) |*p| _ = try spawnTest(l, &g, S.run, .{ .probe = p, .lane = l });
+    for (&probes) |*p| p.waitDone();
+    waitQuiescent(l);
+    // 4 slots touched: 4 stacks mapped and counted (the FIFO pool hands out
+    // distinct slots), none trimmed yet.
+    var mapped: u32 = 0;
+    var resident: u32 = 0;
+    for (l.fibers) |*f| if (f.stack) |s| {
+        mapped += 1;
+        if (!s.trimmed) resident += 1;
+    };
+    try testing.expectEqual(@as(u32, 4), mapped);
+    try testing.expectEqual(@as(u32, 4), resident);
+    try testing.expectEqual(before + 4 * (l.stack_size + l.page), stats.fiber_stack_bytes.load());
+    // Yellow at tick 101: idle 1 < 2 — nothing returns.
+    idle_clock.store(101, .monotonic);
+    try testing.expectEqual(@as(u32, 0), l.trimIdleStacks(2));
+    // Tick 102: every free touched stack returns its usable region; the
+    // guard and the reserve stay mapped.
+    idle_clock.store(102, .monotonic);
+    try testing.expectEqual(@as(u32, 4), l.trimIdleStacks(2));
+    try testing.expectEqual(before + 4 * l.page, stats.fiber_stack_bytes.load());
+    var vec: [1 << 10]u8 = undefined;
+    for (l.fibers) |*f| if (f.stack) |s| {
+        try testing.expect(s.trimmed);
+        const u = s.usable();
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall3(.mincore, @intFromPtr(u.ptr), u.len, @intFromPtr(&vec))));
+        for (vec[0 .. u.len / l.page]) |v| try testing.expectEqual(@as(u8, 0), v & 1);
+    };
+    // A second pass finds nothing to do.
+    try testing.expectEqual(@as(u32, 0), l.trimIdleStacks(0));
+    // Re-spawn: the slot re-arms (the canary is refilled in test builds), the gauge counts it again.
+    var g2 = membersGroup(1);
+    var p2: Probe = .{};
+    _ = try spawnTest(l, &g2, S.run, .{ .probe = &p2, .lane = l });
+    p2.waitDone();
+    waitQuiescent(l);
+    try testing.expectEqual(before + 4 * l.page + l.stack_size, stats.fiber_stack_bytes.load());
+    var rearmed: u32 = 0;
+    for (l.fibers) |*f| if (f.stack) |s| {
+        if (!s.trimmed) rearmed += 1;
+    };
+    try testing.expectEqual(@as(u32, 1), rearmed);
 }
 
 test "ring entries derivation: power of two above the fiber population + wake + cancels, floor 8, ceiling 4096" {

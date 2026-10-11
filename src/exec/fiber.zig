@@ -14,6 +14,17 @@
 //! frame ever parked and the `exec_fiber_stack_over_half` tripwire fires
 //! before an overflow ever can.
 //!
+//! A stack is mapped at a slot's FIRST spawn and stays mapped for the
+//! lane's life (the slot pool is a FIFO, so every slot is touched within a
+//! few hundred spawns and the population's whole reserve is mapped); the
+//! kernel holds pages only for the depth a frame touched (ReleaseSafe —
+//! the canary fill touches everything in debug/test). The idle-trim law
+//! (`mem/budget.zig`) returns a free slot's pages (`Stack.trim`:
+//! `MADV_DONTNEED` over the usable region; the reserve and the guard stay)
+//! and the next spawn refaults what it uses. `exec_fiber_stack_bytes`
+//! counts the bytes the kernel MAY hold: mapped stacks minus the trimmed
+//! usable regions.
+//!
 //! The entry trampoline is std's shape (`Io/Uring.zig` `AsyncClosure.entry`):
 //! a naked stub moves the `Switch` pointer the first `contextSwitch` hands
 //! over into the first argument register and tail-calls `call`, which
@@ -164,6 +175,9 @@ pub const Stack = struct {
     base: [*]align(std.heap.page_size_min) u8,
     len: usize,
     page: usize,
+    /// The usable region's pages were returned (`trim`) and no spawn has
+    /// re-armed the slot since: the gauge counts the guard alone.
+    trimmed: bool = false,
 
     pub const MapError = error{StackMapFailed};
 
@@ -188,8 +202,29 @@ pub const Stack = struct {
     }
 
     pub fn unmap(self: Stack) void {
-        stats.fiber_stack_bytes.sub(self.len);
+        stats.fiber_stack_bytes.sub(if (self.trimmed) self.page else self.len);
         _ = linux.munmap(self.base, self.len);
+    }
+
+    /// Return the usable region's pages to the kernel (a free slot: no
+    /// frame is live). The mapping stays; the next touch is a zero page.
+    /// Idempotent; a refused madvise leaves the stack counted resident.
+    pub fn trim(self: *Stack) void {
+        if (self.trimmed) return;
+        const u = self.usable();
+        if (linux.errno(linux.madvise(@alignCast(u.ptr), u.len, linux.MADV.DONTNEED)) != .SUCCESS) return;
+        self.trimmed = true;
+        stats.fiber_stack_bytes.sub(u.len);
+        stats.fiber_stack_trimmed_bytes.add(u.len);
+    }
+
+    /// A spawn re-arms a trimmed stack: it counts resident again, and the
+    /// canary (debug/test) is laid down afresh over the zero pages.
+    pub fn rearm(self: *Stack) void {
+        if (!self.trimmed) return;
+        self.trimmed = false;
+        stats.fiber_stack_bytes.add(self.usable().len);
+        if (canary_enabled) @memset(self.usable(), canary_byte);
     }
 
     /// The writable region above the guard.
@@ -273,6 +308,9 @@ pub const Fiber = struct {
     /// Index in `lane.fibers`.
     slot: u32,
     stack: ?Stack,
+    /// The budget tick of this slot's last recycle (the idle clock the
+    /// stack trim reads); written by `Lane.recycle` before the push.
+    idle_tick: u64,
     result: [max_result_size]u8 align(16),
     context: [max_context_size]u8 align(16),
 
@@ -309,6 +347,7 @@ pub const Fiber = struct {
             .lane = lane,
             .slot = slot,
             .stack = f.stack,
+            .idle_tick = f.idle_tick,
             .result = undefined,
             .context = undefined,
         };
@@ -321,6 +360,7 @@ pub const Fiber = struct {
     pub fn arm(f: *Fiber, kind: Kind, start: Start, context: []const u8, group: ?*Io.Group, group_canceled: bool, protection: Protection, stack_size: usize, page: usize) Stack.MapError!void {
         assert(context.len <= max_context_size);
         if (f.stack == null) f.stack = try Stack.map(stack_size, page);
+        f.stack.?.rearm();
         f.state = .newScheduled();
         var cw = CancelWord.fromGroup(group);
         cw.requested = group_canceled;
@@ -560,6 +600,30 @@ test "Stack.map: a guard page below a canary-filled usable region; the high-wate
     try testing.expectEqual(@as(usize, 10_000), s.highWater());
     s.refillCanary(10_000);
     try testing.expectEqual(@as(usize, 0), s.highWater());
+    s.unmap();
+    try testing.expectEqual(before, stats.fiber_stack_bytes.load());
+}
+
+test "Stack.trim returns the usable region and leaves the guard counted; rearm counts it again and re-lays the canary; unmap after a trim subtracts only the guard" {
+    const page = std.heap.pageSize();
+    const before = stats.fiber_stack_bytes.load();
+    const trimmed_before = stats.fiber_stack_trimmed_bytes.load();
+    var s = try Stack.map(stackSizeFor(.meta, page), page);
+    const u = s.usable();
+    u[u.len - 1] = 0;
+    s.trim();
+    try testing.expect(s.trimmed);
+    try testing.expectEqual(before + page, stats.fiber_stack_bytes.load());
+    try testing.expectEqual(trimmed_before + u.len, stats.fiber_stack_trimmed_bytes.load());
+    s.trim(); // idempotent
+    try testing.expectEqual(before + page, stats.fiber_stack_bytes.load());
+    // The pages are gone: the top byte reads zero (not the canary, not the write).
+    try testing.expectEqual(@as(u8, 0), u[u.len - 1]);
+    s.rearm();
+    try testing.expect(!s.trimmed);
+    try testing.expectEqual(before + s.len, stats.fiber_stack_bytes.load());
+    try testing.expectEqual(@as(usize, 0), s.highWater()); // the canary is back
+    s.trim();
     s.unmap();
     try testing.expectEqual(before, stats.fiber_stack_bytes.load());
 }

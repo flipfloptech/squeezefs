@@ -9,6 +9,10 @@
 //!     loud (charter §1.8; decision 0002 row 9) instead of becoming UB; the
 //!     1–3 % the bounds checks cost on the hot paths is a counted A/B at
 //!     rung 9, which must PRECEDE taking the faster posture (charter §1).
+//! The binary (and the SDK libraries, and the shim) are ReleaseSafe in both
+//! profiles; the TEST artifacts default to Debug (the lock-order rail and the
+//! fiber-stack canary are debug-only rails). `-Doptimize=<mode>` /
+//! `--release=<mode>` sets every artifact.
 //! The binary names its profile (`squeezefs --version` prints train, commit,
 //! profile — `build_options`, imported by `main` alone: the library never
 //! depends on the commit string, so a HEAD move invalidates only the exe).
@@ -47,9 +51,22 @@ const Profile = enum { gate, dist };
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const profile = b.option(Profile, "profile", "Build profile: gate (default, ReleaseSafe + thin LTO) or dist (ReleaseSafe + fat LTO + split debug)") orelse .gate;
-    // Both profiles are ReleaseSafe (see the module doc); -Doptimize overrides
-    // it (tests want Debug for the best diagnostics; `zig build -Doptimize=Debug test`).
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
+    // The product binary is ReleaseSafe in both profiles (the module doc);
+    // the test artifacts default to Debug (the lock-order rail and the
+    // fiber-stack canary are debug-only). `-Doptimize=<mode>` or
+    // `--release=<mode>` sets EVERY artifact explicitly. Not
+    // `standardOptimizeOption(.{ .preferred_optimize_mode })`: that returns
+    // Debug unless `--release` is passed, so the suites and brackets ran a
+    // Debug daemon whose canary fills and `undefined` memsets touched every
+    // pool byte (rung 9's 3–5.6 GB RSS; `docs/evidence/rung-09-memory-footprint.md`).
+    const explicit_optimize: ?std.builtin.Optimize = b.option(std.builtin.Optimize, "optimize", "Optimize mode for every artifact (default: the binary ReleaseSafe, the tests Debug)") orelse switch (b.graph.release_mode) {
+        .off => null,
+        .any, .safe => .safe,
+        .fast => .fast,
+        .small => .small,
+    };
+    const optimize: std.builtin.Optimize = explicit_optimize orelse .debug;
+    const exe_optimize: std.builtin.Optimize = explicit_optimize orelse .safe;
 
     // ---- build identity: train, commit, profile (charter §11 "Versioning") ----
     const build_options = b.addOptions();
@@ -58,12 +75,9 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "git_commit", gitCommit(b));
     const build_options_mod = build_options.createModule();
 
-    // ---- the library module every artifact imports (no build identity) ----
-    const squeezefs_mod = b.addModule("squeezefs", .{
-        .root_source_file = b.path("src/squeezefs.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // ---- the library module every artifact imports (no build identity):
+    //      one instance per optimize mode — the test artifacts' (Debug by
+    //      default) and the binary's (ReleaseSafe) ----
     // The bench baseline rig's two resolved paths (`cli/bench_baseline_rig.zig`):
     // the install prefix (the binary it drives) and the repo's bench/ dir.
     // Untracked: strings, no step dependency, so the library never cycles on
@@ -71,34 +85,9 @@ pub fn build(b: *std.Build) void {
     const bench_options = b.addOptions();
     bench_options.addOptionPathUntracked("install_prefix", .{ .relative = .{ .base = .install_prefix } });
     bench_options.addOptionPathUntracked("bench_dir", b.path("bench"));
-    squeezefs_mod.addImport("bench_options", bench_options.createModule());
-
-    // ---- vendored zstd (vendor/zstd/VERSION; decision 0002 row 118):
-    //      the single-file amalgamation compiled into the library for
-    //      COMPRESSION only (std's zstd is decompress-only); the header
-    //      translated into the `zstd_c` module `data/transform.zig`
-    //      imports. `ZSTD_STATIC_LINKING_ONLY` for the static-context API
-    //      (`ZSTD_initStaticCCtx`: a compressor that mallocs nothing per
-    //      op, charter §12). Portable: the dev box runs the codec tests too. ----
-    const zstd_c = b.addTranslateC(.{
-        .root_source_file = b.path("vendor/zstd/zstd.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    zstd_c.defineCMacro("ZSTD_STATIC_LINKING_ONLY", "1");
-    zstd_c.addIncludePath(b.path("vendor/zstd"));
-    squeezefs_mod.addImport("zstd_c", zstd_c.createModule());
-    // The amalgamation is its own static library, not a C source of the
-    // library module: the fuzz campaign (`zig build fuzz`, charter §11)
-    // rebuilds the test module with `-ffuzz`, and clang's coverage pass
-    // emits `__sanitizer_cov_trace_const_cmp*` hooks into C it instruments
-    // that Zig's fuzzer runtime does not define (the link fails); the
-    // decoders under fuzz are Zig, so zstd needs no instrumentation.
-    const zstd_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
-    zstd_mod.addCSourceFile(.{ .file = b.path("vendor/zstd/zstd.c"), .flags = &.{ "-DZSTD_STATIC_LINKING_ONLY", "-std=c99" } });
-    const zstd_lib = b.addLibrary(.{ .name = "zstd", .linkage = .static, .root_module = zstd_mod });
-    squeezefs_mod.linkLibrary(zstd_lib);
-    squeezefs_mod.link_libc = true;
+    const bench_options_mod = bench_options.createModule();
+    const squeezefs_mod = libraryModule(b, target, optimize, bench_options_mod, true);
+    const squeezefs_exe_mod = if (exe_optimize == optimize) squeezefs_mod else libraryModule(b, target, exe_optimize, bench_options_mod, false);
 
     // ---- the one CLI binary (charter §8) ----
     const exe = b.addExecutable(.{
@@ -106,9 +95,9 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = exe_optimize,
             .imports = &.{
-                .{ .name = "squeezefs", .module = squeezefs_mod },
+                .{ .name = "squeezefs", .module = squeezefs_exe_mod },
                 .{ .name = "build_options", .module = build_options_mod },
             },
         }),
@@ -429,10 +418,11 @@ pub fn build(b: *std.Build) void {
     const sdk_step = b.step("sdk", "Build and install libsqueezefs_sdk.a, libsqueezefs_sdk.so and include/squeezefs_sdk.h (Linux)");
     const sdk_smoke_step = b.step("sdk-smoke", "Compile tests/sdk/c_smoke.c against the header, link the static SDK and run it against the in-process stub host (Linux)");
     if (target.result.os.tag == .linux) {
+        // Product artifacts like the binary: ReleaseSafe whatever the test mode.
         const sdk_core = b.createModule(.{
             .root_source_file = b.path("src/squeezefs.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = exe_optimize,
         });
         sdk_core.link_libc = true;
         // The root also names the train (`sqz_version` prints it; read
@@ -442,7 +432,7 @@ pub fn build(b: *std.Build) void {
         const sdk_mod = b.createModule(.{
             .root_source_file = sdk_root,
             .target = target,
-            .optimize = optimize,
+            .optimize = exe_optimize,
             .imports = &.{ .{ .name = "squeezefs", .module = sdk_core }, .{ .name = "build_options", .module = build_options_mod } },
         });
         sdk_mod.link_libc = true;
@@ -524,6 +514,45 @@ pub fn build(b: *std.Build) void {
         const refuse = b.addFail("the dist step requires -Dprofile=dist");
         dist_step.dependOn(&refuse.step);
     }
+}
+
+/// The library module (`src/squeezefs.zig`) with its imports, in one
+/// optimize mode. `public` names it `squeezefs` for dependents (one
+/// instance may carry the name).
+///
+/// The vendored zstd (vendor/zstd/VERSION; decision 0002 row 118): the
+/// single-file amalgamation compiled into the library for COMPRESSION only
+/// (std's zstd is decompress-only); the header translated into the
+/// `zstd_c` module `data/transform.zig` imports. `ZSTD_STATIC_LINKING_ONLY`
+/// for the static-context API (`ZSTD_initStaticCCtx`: a compressor that
+/// mallocs nothing per op, charter §12). Portable: the dev box runs the
+/// codec tests too. The amalgamation is its own static library, not a C
+/// source of the library module: the fuzz campaign (`zig build fuzz`,
+/// charter §11) rebuilds the test module with `-ffuzz`, and clang's
+/// coverage pass emits `__sanitizer_cov_trace_const_cmp*` hooks into C it
+/// instruments that Zig's fuzzer runtime does not define (the link fails);
+/// the decoders under fuzz are Zig, so zstd needs no instrumentation.
+fn libraryModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, bench_options_mod: *std.Build.Module, public: bool) *std.Build.Module {
+    const options: std.Build.Module.CreateOptions = .{
+        .root_source_file = b.path("src/squeezefs.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    };
+    const mod = if (public) b.addModule("squeezefs", options) else b.createModule(options);
+    mod.addImport("bench_options", bench_options_mod);
+    const zstd_c = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/zstd/zstd.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zstd_c.defineCMacro("ZSTD_STATIC_LINKING_ONLY", "1");
+    zstd_c.addIncludePath(b.path("vendor/zstd"));
+    mod.addImport("zstd_c", zstd_c.createModule());
+    const zstd_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    zstd_mod.addCSourceFile(.{ .file = b.path("vendor/zstd/zstd.c"), .flags = &.{ "-DZSTD_STATIC_LINKING_ONLY", "-std=c99" } });
+    mod.linkLibrary(b.addLibrary(.{ .name = "zstd", .linkage = .static, .root_module = zstd_mod }));
+    return mod;
 }
 
 /// A test run step under the release-gate option: the harness knob the ONE

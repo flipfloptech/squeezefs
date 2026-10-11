@@ -535,7 +535,9 @@ own_block_dma_bytes, durable_upload_bytes_escalation,
 durable_upload_bytes_writeback`), `rewrite_device_write_bytes` is read beside;
 `device_write_req_keys` = `DEVICE_WRITE_REQS` (`patch_writes, own_block_dmas,
 put_obj`). The rail "bracket ledger pin…" (`tests/rails.zig`) holds the four
-lists equal to brk.py's and the two gauges beside in both.
+lists equal to brk.py's and the two gauges beside in both. (`d41eec7`: the
+escalation counter is `write_through_bytes`' subset and moved beside; see the
+write amplification rows in §4.)
 
 F10. **Reads on a zero-copy session never reach a handler lane**
 (accounting). An O_DIRECT READ the warm ladder cannot answer is served at the
@@ -781,6 +783,16 @@ cut of the fix seeded a deferred overlay's page at FIRST TOUCH (one 4 KiB device
 write path): the frag row's p50 rose 317 → 502 µs; the seed moved to the fold (one ranged
 read per run of unseeded pages) and the fold itself off the write (detached), and the row's
 p50 settled at 237–239 µs against c36b531's 494.
+
+F9's arm list moved once more (`d41eec7`): `write_through_bytes` — EVERY parked full
+buffer's upload (the sequential accumulation, the W2 escalation at its RAM trigger, the
+flush-time complement) — is a device-write arm, and `durable_upload_bytes_escalation`, its
+flush-time-complement subset, is read beside. Found on generic/074's growing-file shape
+through the fixed fold: 825 write-through blocks (3.5 GB on the device) and 0 escalation
+bytes — the ledger summed the subset and read 0 device bytes. The two bracket rows above
+are unaffected (the `frag-512b-write` row writes into mapped blocks, which fold in place;
+`append-4b` lives in the ring); the sequential rows were overlay-eligible (arm B) and
+carried no write-through bytes.
 
 ## 5. Gaps — what cannot be measured here and what the box run needs
 

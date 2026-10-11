@@ -241,5 +241,10 @@ stop-growing files until their promotion. The journal: one Δ`(size, mtime, ctim
 per write (the Put stays for KILLPRIV's mode strip), one entry per op, concurrent appenders
 coalesced by the conveyor's window.
 
-**Laws:** `staging_moved_bytes ÷ appended bytes ≤ 11` on an append stream (tie test over the
+The chain is over the image's GROWTH: a write that lands `e` bytes `h` bytes past the end grows
+the record by `e + h` (the hole is zero-filled in the ring), so the bound on moved bytes per USER
+byte is `11 × (e + h) / e` — `11` for a dense append stream, `22` for generic/074's fstest `-F`
+shape (512 B at a 1 KiB stride; measured 17× over its staged life).
+
+**Laws:** `staging_moved_bytes ÷ appended bytes ≤ 11` on a dense append stream (tie test over the
 geometric chain and the pinned 069 shape); `journal entries ÷ appends ≤ 1.05` (the rename gate).

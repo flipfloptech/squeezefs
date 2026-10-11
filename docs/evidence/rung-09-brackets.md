@@ -625,6 +625,109 @@ never fills). Owed: a supply wait for the completed block's upload (the
 grace-bounded form, or priority for a flush that frees RAM over a fresh
 overlay mint), and the reclaim's debt drain paced to the device, not 1 Hz.
 
+*Resolution* (`36acb58` the ledger, `09a1014` the supply wait and the
+gate's law, `a8ee356` the paced debt drain; decision 0002 rows 455–458).
+Root cause — NOT the reclaim and NOT the hot overlay writers: the grant
+plane's `Ledger` is a 1,024-slot table of OPEN grants and nothing ever
+retired the holder's own CONSUMED grants (the reference's `Vec` kept them
+too, unbounded; the port's bound turned the growth into `table_full ⇒
+Deferred`). Once the frontier wraps, carves truncate at the first set bit
+(≈ 9 blocks each on the fragmented 6 GiB set), so the holder's own window
+carved > 1,024 times in one 60 s leg; every top-up then answered
+`deferred`, the window never refilled, and every mint on that volume read
+an empty window as `StorageFull` while the bitmap was 25 % populated
+(`alloc_fresh_supply_exhausted` stayed [0, 2] because the clear bits were
+in sight). The repro at `53d05e1` (direct row, 512m/job, two legs):
+`block_grant_deferred` 7,669 / 7,457 ≡ `block_grant_topup_deferred`,
+`block_grant_exhausted` 7,876 / 7,900, the holder's word on vol 0 at the
+end of both legs `open_grants 1,024, own_window_remaining 0`, vol 1 216 /
+156 — and the stripe-unit affinity kept each file's blocks on its volume,
+so the files on vol 0 failed every mint, parked, met the gate, and the
+gate's victim flushes failed the same way until the wall. The 24 GiB set
+never wrapped inside a leg (every carve a full 64-block run), hence VALID.
+Fixes: (1) an open grant is what the writer still HOLDS — `Ledger.
+syncWriter` retires every slot the writer's ask no longer names
+(`block_grant_consumed_retired`), the in-process sink is bound to its
+window and syncs before every ask; the ledger takes its own lock (the wire
+service's threads and the holder's own top-up mutated it unserialized);
+(2) `block_alloc.MintAnswer`: an empty window answers its CLASS — the
+holder's `full` is `StorageFull`, a top-up owed by a deferred/unreachable
+holder is `PlaneRefused` (never a latch); `WriterArm.mintBlock` is the ONE
+grant source, and a racer that lost the single-flight latch at an EMPTY
+window waits for the in-process carve (`block_grant_topup_waits`) instead
+of reading the gap as exhaustion (over the wire: `retry`); (3) the
+RAM-freeing upload's mint parks grace-bounded for VISIBLE supply
+(`enospc.SupplyWait.visible_supply`: slices on the supply edge, which every
+landed top-up now rings, up to the 1 s wall) while the fresh overlay mint
+declines to accumulation at once — the fresh mint yields scarce supply to
+the flushes that return RAM; (4) the gate's wall answers ENOSPC iff
+`enospc.freshSupplyExhausted` over the placement candidates (the charter's
+terminal law), else fires the must-stay-0 tripwire
+`parked_gate_wall_supply_visible`, restarts the wall and keeps the write
+parked at its watchdog station; (5) the debt drainer is paced to the
+device: its trim ranges feed their own completion meter
+(`block_free_debt_drain_rate`), a pressure pass claims one tick's worth of
+completions (`debtBatchBlocks`) and rests one batch-time at the measured
+rate (`debtPaceMs`, `block_free_debt_pace_ms`) — the shipped `progressed ⇒
+at once` loop ran 110–145 serialized passes per leg behind the write lane
+on the wrapped volume (virgin tail 0 ⇒ every byte of debt "past the
+watermark"), its fruitless backoff a fixed 1 Hz ladder. Red tests:
+`block_grant` "the aging store (rung 9 F17)…" (a 64-slot table over a
+fragmented 256-block volume, 40 laps of scattered overwrite: without the
+sync it fails at lap 6 mint 810 — "PlaneRefused with 128 clear bits, 64
+open grants, window 0") and "an empty window with another minter's INLINE
+top-up in flight…"; `enospc` "the write path's grace-bounded mint…" (the
+three classes); `write_admit` "the wall on an EXHAUSTED set" / "the wall
+with supply VISIBLE"; `reclaim` "the debt drainer's pace is the device's…"
+(the tie) and "the debt drainer under a FOREGROUND stream…" (16 blocks of
+debt: two single-batch passes then the cold rest with 8 still owed; the
+shipped loop drained all 16 at once).
+
+**The first A/B through the harness** (A = `53d05e1`, B = `7f76af1`,
+nvmet-tcp, the DEFAULT 6 GiB × 2 set, 1g/job, QD32 × 4, A→B→B→A,
+record `seq-write-1m-direct-20261011T011807Z`): both A legs INVALID — fio
+rc 3, 96 ENOSPC (error 28) each, `parked_gate_wall_refusals` 96,
+`alloc_valve_passes` 3,916 / 3,924, `overlay_enospc_declines` 1,216 /
+1,218, `write_through_fallbacks` 651–654 ≡ `write_pipeline_stay_parked`,
+`block_grant_deferred` 7,589 / 7,685, `block_grant_exhausted` 7,832 /
+7,848, `alloc_fresh_mints` 7,889 / 8,463, `open_grants` 1,024 on vol 0 at
+the end, `block_free_elided_debt_bytes` 5.23 / 4.76 GB at the end
+(`block_free_trim_discards` 2,274 / 2,682 absolute, 110 / 145 pressure
+passes); both B legs VALID — **1,247 / 1,263 MiB/s**, fio rc 0, 0
+ENOSPC, `parked_gate_wall_refusals` 0, `parked_gate_wall_supply_visible`
+0, `parked_gate_waits` 0 (the pool never fills), `alloc_valve_passes` 0,
+`overlay_enospc_declines` 0, `write_through_fallbacks` 0,
+`alloc_fresh_supply_exhausted` [0, 2], `block_grant_deferred` 0,
+`block_grant_exhausted` 0, `block_grant_consumed_retired` 7,152 / 8,942,
+`open_grants` 2–4 at every leg's end, `alloc_fresh_mints` 18,736 / 18,979
+(2.3 × the A legs: the store was writing the whole leg), tripwires 0,
+tick rescues 0 (A: 1,850 / 1,750 `lock_ticked_reregisters`), mem budget
+Green; device ÷ user **0.996** (stats) / **1.000** data + **0.010** meta
+(diskstats), `wareq-sz` 1,047,635 / 1,052,635 B; the debt at the end 4.11 /
+4.73 GB (1,776 / 1,778 trim discards absolute at 15–19 blocks/s, pace
+105–133 ms, 0 fruitless passes) — the debt is `⊆ free` by construction and
+the drain is hygiene paced to the device, not supply.
+`seq-write-1m-buffered` (the same set and shape, record
+`seq-write-1m-buffered-20261011T012426Z`): A legs INVALID — fio rc 3, 60 /
+66 ENOSPC, `parked_gate_wall_refusals` 60 / 66, `alloc_valve_passes`
+3,628 / 3,684, `overlay_enospc_declines` 1,144 / 1,150,
+`write_through_fallbacks` 578 / 591, `block_grant_deferred` 6,925 /
+6,947, `open_grants` 1,024 at the end, 640 / 522 MiB/s for what fio did
+write; B legs VALID — **1,002 / 790 MiB/s**, fio rc 0, 0 ENOSPC, every
+F17 counter 0, `block_grant_consumed_retired` 6,139 / 4,996,
+`open_grants` 2–10, tripwires 0, tick rescues 0 (A: 0 too on this row),
+device ÷ user 0.996 / 1.000 + 0.010 (A: 0.972 / 0.974 — the A legs'
+device bytes are the bytes they refused). The debt at the end: A 7.31 /
+8.44 GB, B 4.48 / 8.29 GB — and legs 3 (B) and 4 (A) show WHY the second
+pair sits high: 0 trim discards and 0 pressure passes on BOTH binaries,
+the drainer asleep for the whole leg. Its only wake was `debt_target`'s
+first false → true swap per volume; once reuse cancelled every debt block
+between two passes, the idle park (no deadline) outlived the mount.
+`8b40238`: the elision arm notifies on every 0 → > 0 transition of a
+volume's debt (`notifyOne` keeps one permit); red: the "idle drains elided
+debt…" test extended with a later free of the same volume ("expected 0,
+found 4096").
+
 ### Measured rows after the F1/F2/F6 fixes (binary `34dedf3`, nvmet-tcp, QD32 × 4)
 
 `seq-write-1m-buffered` (1g/job, 4 legs × 60 s): **0 wedges** (pre-fix:

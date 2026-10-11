@@ -165,6 +165,26 @@ rerun on a quiet venue before the release gate.
   StorageFull`): the promotion under pressure lags the writers and the application sees ENOSPC
   on a volume with 1,700 free blocks. Loud (charter §1.8), but the right arm is a bounded park
   or the own-block arm, not a refusal.
+  *Resolution* (`7f76af1` the arm, `508e668` the log; decision 0002 row 459). The ring is a
+  cache, never the set's capacity: `kv_fs.writeStaged` answers null when the ring refuses the
+  image (no hole, or the pool at its cap — nothing recorded, nothing published) and `write`
+  routes the same payload through the striped arm — the resident image promoted durably to its
+  own block, the layout flipped to striped, the piece admitted through the data plane
+  (`fuse_write_staged_ring_full_own_block`); a truly exhausted set is still refused, by the
+  plane's own terminal law. A full ring is one `warn` per episode (latched on the first refusal,
+  cleared by the next placement that lands), not an error line per placement. Red test (kv_fs,
+  the `SettlingData` harness's new `stage_refuse` seam): "the staged arm when the ring is
+  FULL…" — a 1 MiB staged resident, the ring fills, a 2.5 MiB tail: pre-fix `expected null,
+  found .NOSPC`; post-fix one own-block DMA of the 1 MiB resident, the tail admitted striped,
+  the size 3.5 MiB, the ring saw no second image; a fresh file's first write goes striped with
+  zero DMAs; the healed ring stages again. Venue repro (`--single-writer --disk-cache-paths`,
+  `SQUEEZEFS_MEM_BUDGET_MB=512` ⇒ the 64 MiB ring floor, 20 concurrent 3.5 MiB buffered writers
+  then `fsstress -p 20 -n 1000 -r`): at `53d05e1` **19 of 20 writers failed ENOSPC**, 594
+  `staging ring full` error lines; at the fix **0 failed**, `staging_ring_full_refusals` 291 ≡
+  `fuse_write_staged_ring_full_own_block` 291, `write_enospc_refusals` 0, fsstress rc 0 with 0
+  "No space left", `fsck --offline` clean on both. Owed still: the staged-arm append
+  amplification above (every write to a staged file re-stages the whole image), which is what
+  makes the ring fill under a burst in the first place.
 - **Daemon RSS**: ≈ 1.9 GB idle → ≈ 3.0–3.7 GB under the suites and it does not return after
   idle/unlink (`exec_fiber_stack_bytes` 752 MB, `transport_zc_bounce` + `kmbuf_region` 302 MB
   each, `block_free_reclaim_queue_bytes` up to 2 GB transiently); on the 16 GiB shared venue

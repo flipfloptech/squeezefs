@@ -200,6 +200,11 @@ pub var fuse_write_striped: counters.ShardedCounter = .{};
 /// Durable promotions a write forced BEFORE its type flip (inline/staged/
 /// packed → striped: the resident payload landed on its own block).
 pub var fuse_write_promotions_to_striped: counters.ShardedCounter = .{};
+/// `fuse_write_staged_ring_full_own_block`: staged-arm writes the ring
+/// refused (no hole for the image, the pool at its cap) that took the
+/// own-block arm instead of answering ENOSPC — the ring is a cache, never
+/// the set's capacity (rung 9: the fsstress 20-writer burst).
+pub var fuse_write_staged_ring_full_own_block: counters.ShardedCounter = .{};
 /// Truncates by arm: the packed passthrough clip (zero device writes),
 /// the striped map clip (+ the kept tail's zero-complete), the re-stage.
 pub var fuse_truncate_packed_clips: counters.ShardedCounter = .{};
@@ -2213,7 +2218,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             // file grown past the block by truncate rang a 5 MiB image no
             // promotion could place: fstests generic/030, fsstress).
             const reach = @max(end, (try self.readInode(local)).size);
-            if (self.data.stagingOn() and kind != .striped and reach <= self.block_size) return self.writeStaged(c, local, a, rec, end, &layout_lock);
+            if (self.data.stagingOn() and kind != .striped and reach <= self.block_size) {
+                if (try self.writeStaged(c, local, a, rec, end, &layout_lock)) |w| return w;
+                // The ring cannot hold the image (no hole, the pool at its
+                // cap): the ring is a cache, never the set's capacity — the
+                // own-block arm takes the write (the resident image lands
+                // durably on its own block, the piece is admitted striped;
+                // ENOSPC stays the data plane's own terminal verdict). The
+                // payload is in hand already: the striped arm reads it as
+                // bytes (rung 9: a 20-writer fsstress burst answered ENOSPC
+                // on a volume with 1,700 free blocks).
+                fuse_write_staged_ring_full_own_block.inc();
+                var in_hand = a;
+                in_hand.data = try self.payloadBytes(a);
+                in_hand.held = null;
+                return self.writeStriped(c, local, in_hand, rec, end, &layout_lock);
+            }
             return self.writeStriped(c, local, a, rec, end, &layout_lock);
         }
 
@@ -2260,8 +2280,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The staged arm: the whole payload image re-staged under the
         /// file's identity (a fresh one for an inline/packed file), the
-        /// staged layout published; a displaced tenant freed after.
-        fn writeStaged(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!filesystem.Written {
+        /// staged layout published; a displaced tenant freed after. Null ⇔
+        /// the ring refused the image (nothing recorded, nothing published):
+        /// the caller's own-block arm.
+        fn writeStaged(self: *Self, c: *Ctx, local: u64, a: filesystem.WriteArgs, rec: ?LayoutRec, end: u64, layout_lock: *?Data.LayoutGuard) Error!?filesystem.Written {
             const data = try self.payloadBytes(a);
             const probe = try self.readInode(local);
             if (probe.mode & S.IFMT != S.IFREG) return error.InvalidArgument;
@@ -2274,7 +2296,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const keep_identity = rec != null and rec.?.layout.kind == .staged;
             const file_id = if (keep_identity) rec.?.layout.file_id else self.data.mintFileId(local);
             const k = staging.StagingKey.init(file_id, local);
-            const generation = try self.data.stageImage(k, image);
+            const generation = self.data.stageImage(k, image) catch |e| switch (e) {
+                error.NoSpaceLeft => return null,
+                else => |x| return x,
+            };
             var after: AfterCommit = .{};
             if (!keep_identity) noteDisplaced(local, rec, &after);
             const t = try self.beginExclusive(local, @src());
@@ -3265,8 +3290,11 @@ const SettlingData = struct {
     adds: std.ArrayList(layout.RefOp) = .empty,
     releases: std.ArrayList(layout.RefOp) = .empty,
     /// The staging ring, when the test turns it on: the largest image
-    /// staged (the ring holds whole files ≤ one block, never more).
+    /// staged (the ring holds whole files ≤ one block, never more); the
+    /// ring FULL (no hole for the image, the pool at its cap): every stage
+    /// refuses `NoSpaceLeft`.
     staging: bool = false,
+    stage_refuse: bool = false,
     staged_max: u64 = 0,
     staged_images: u32 = 0,
     /// The own-block promotions: the largest image DMA'd (≤ one block).
@@ -3385,6 +3413,7 @@ const SettlingData = struct {
     }
     pub fn stageImage(self: *SettlingData, _: staging.StagingKey, image: []const u8) Error!u64 {
         if (!self.staging) return error.NotSupported;
+        if (self.stage_refuse) return error.NoSpaceLeft;
         self.staged_images += 1;
         self.staged_max = @max(self.staged_max, image.len);
         return self.staged_images;
@@ -3499,6 +3528,69 @@ test "a file grown past one block by truncate is written through the striped arm
     try testing.expectEqual(bs, h.data.own_block_max);
     try testing.expectEqual(grown, (try h.getattr(g)).size);
     h.release(g);
+}
+
+// Rung 9 (the external suites' fsstress rounds): a 20-writer burst of 3–4 MiB
+// files outran the ring's promotion — `staging ring full: a 3.5 MB record
+// found no hole in a 343 MB segment with 155 live entries` — and the
+// application saw ENOSPC on a volume with 1,700 free blocks. The ring is a
+// cache, never the set's capacity: an image the ring cannot hold takes the
+// OWN-BLOCK arm (the resident image promoted durably, the write admitted
+// striped); ENOSPC stays the data plane's own terminal verdict.
+test "the staged arm when the ring is FULL: the write takes the own-block arm instead of answering ENOSPC — the resident image lands on its own block, the layout flips to striped, the piece is admitted; a fresh file likewise; the refusal stays the plane's (repro-port: fsstress 20-writer burst, `staging ring full … refusing StorageFull`)" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    h.data.staging = true;
+    const bs = layout.DEFAULT_CHUNK;
+    const own_block0 = fuse_write_staged_ring_full_own_block.load();
+    // (a) A staged resident of 1 MiB; then the ring fills (every stage
+    // refuses): the next write — a 2.5 MiB tail that would re-stage a
+    // 3.5 MiB image — promotes the resident to its own block and goes
+    // striped. Nothing is answered ENOSPC; the image rang nothing.
+    const f = try h.create(1, "f", 0o644);
+    const one_mib: []u8 = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(one_mib);
+    @memset(one_mib, 'A');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, one_mib, 0).errno());
+    try testing.expectEqual(@as(u32, 1), h.data.staged_images);
+    h.data.stage_refuse = true;
+    const tail: []u8 = try testing.allocator.alloc(u8, (5 << 20) / 2);
+    defer testing.allocator.free(tail);
+    @memset(tail, 'B');
+    try testing.expectEqual(@as(?linux.E, null), h.write(f, 1 << 20, tail, 0).errno());
+    try testing.expectEqual(@as(u32, 1), h.data.staged_images); // the ring saw no second image
+    try testing.expectEqual(@as(u32, 1), h.data.own_blocks); // the 1 MiB resident promoted
+    try testing.expectEqual(@as(u64, 1 << 20), h.data.own_block_max);
+    try testing.expectEqual(@as(usize, 1), h.data.writes.items.len); // the tail admitted striped
+    try testing.expectEqual(@as(u64, 1 << 20), h.data.writes.items[0].offset);
+    try testing.expectEqual(@as(u64, (5 << 20) / 2), h.data.writes.items[0].len);
+    try testing.expectEqual(own_block0 + 1, fuse_write_staged_ring_full_own_block.load());
+    try testing.expectEqual(@as(u64, (7 << 20) / 2), (try h.getattr(f)).size);
+    {
+        const rec = (try h.fs.readLayout(try H.Fs.localOf(f))).?;
+        defer h.fs.freeLayout(rec);
+        try testing.expectEqual(layout.Kind.striped, rec.layout.kind);
+    }
+    h.release(f);
+    // (b) A fresh file's first write while the ring is full: no resident to
+    // promote (zero own-block DMAs), the write admitted striped at once.
+    const g = try h.create(1, "g", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(g, 0, one_mib, 0).errno());
+    try testing.expectEqual(@as(u32, 1), h.data.own_blocks);
+    try testing.expectEqual(@as(usize, 2), h.data.writes.items.len);
+    try testing.expectEqual(own_block0 + 2, fuse_write_staged_ring_full_own_block.load());
+    try testing.expect(h.data.staged_max <= bs);
+    h.release(g);
+    // (c) The ring heals: a small file stages again.
+    h.data.stage_refuse = false;
+    const k = try h.create(1, "k", 0o644);
+    try testing.expectEqual(@as(?linux.E, null), h.write(k, 0, one_mib[0..8192], 0).errno());
+    try testing.expectEqual(@as(u32, 2), h.data.staged_images);
+    h.release(k);
 }
 
 test "POSIX: create → write → read → stat; an overlay write grows the file; a write past the inline bound on a volume-less set is EFBIG and counted; truncate clips, empties at 0 and zero-extends" {

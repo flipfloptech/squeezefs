@@ -14,3 +14,5 @@ generic/777  exportfs: as generic/426
 generic/310  clears dmesg (`dmesg -c`): "clear kernel buffer failed: Operation not permitted" in the container (no CAP_SYSLOG)
 generic/394  needs `ulimit -f` raised: "cannot modify limit: Operation not permitted" in the container
 generic/460  writes /proc/sys/vm/dirty_*ratio: /proc/sys is read-only in the container
+generic/504  `exec {fd}<> file; flock -x $fd` then `grep :$ino /proc/locks`: no row appears for an ext4 file in the container either (control 2026-10-11: rc 0, 0 rows), while python's flock(2) on our mount shows `FLOCK ADVISORY WRITE … 00:27:2` — the shape is the venue's (util-linux flock-by-fd under this container), not a lock semantic
+generic/519  FIBMAP "requires root privileges" inside the container (CAP_SYS_RAWIO absent); `_require_fibmap` passes on the ioctl's presence alone

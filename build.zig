@@ -520,12 +520,13 @@ pub fn build(b: *std.Build) void {
 /// optimize mode. `public` names it `squeezefs` for dependents (one
 /// instance may carry the name).
 ///
-/// The vendored zstd (vendor/zstd/VERSION; decision 0002 row 118): the
-/// single-file amalgamation compiled into the library for COMPRESSION only
-/// (std's zstd is decompress-only); the header translated into the
+/// The vendored zstd (vendor/zstd/VERSION; decision 0002 rows 118, 477): the
+/// single-file amalgamation compiled into the library for compression AND
+/// decompression (a static context of each per executor lane; std's zstd
+/// decoder was 10× slower and is retired); the header translated into the
 /// `zstd_c` module `data/transform.zig` imports. `ZSTD_STATIC_LINKING_ONLY`
-/// for the static-context API (`ZSTD_initStaticCCtx`: a compressor that
-/// mallocs nothing per op, charter §12). Portable: the dev box runs the
+/// for the static-context API (`ZSTD_initStaticCCtx/DCtx`: contexts that
+/// malloc nothing per op, charter §12). Portable: the dev box runs the
 /// codec tests too. The amalgamation is its own static library, not a C
 /// source of the library module: the fuzz campaign (`zig build fuzz`,
 /// charter §11) rebuilds the test module with `-ffuzz`, and clang's

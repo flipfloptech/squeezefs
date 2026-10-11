@@ -103,6 +103,9 @@ $H --substrate nvmet-loop --numjobs 32 rand-4k-read  $A $B               # bar: 
 $H --substrate nvmet-loop --numjobs 32 rand-4k-read --mount-opts direct_device_true $A $B   # the ruler row (device-true)
 $H --substrate nvmet-loop --numjobs 32 rand-4k-write $A $B
 $H --substrate nvmet-tcp  --numjobs 32 shim-rand-4k-read $A $B           # the fabric-sensitive twin
+$H --substrate nvmet-loop --numjobs 32 rand-4k-read-zstd $A $B           # the transformed twins (decision 0003 §K7/§K10):
+$H --substrate nvmet-loop --numjobs 32 rand-4k-read-lz4  $A $B           #   device ÷ user ≤ 18.9 per leg, IOPS vs rand-4k-read
+$H --substrate nvmet-loop --numjobs 32 rand-4k-read-aes  $A $B
 
 # 3. metadata
 $H --substrate nvmet-loop --numjobs 32 creates-mdtest $A $B              # bar: ≥ 32 k creates/s many-dirs
@@ -165,7 +168,7 @@ daemon's device-read arms) and the device-read ledger's closure
 | sequential, full files | `seq-read-1m-direct`, `seq-read-1m-buffered`, `shim-seq-read-1m` | ≤ 1.05 | whole blocks once; prefetch is read, never dropped | nvmet-loop |
 | sequential with an early stop (8 MiB of 1 GiB files) | `seq-read-early-stop` | ≤ 2.1 | ≤ one prefetch window of overshoot per stream | nvmet-loop |
 | 4 KiB reads after 512 B random writes | `read-after-small-write` | ≤ 2.1 on the read arms | extent records compose over a RANGED base window; the fold's seed reads (`write_side_read_dma_bytes`) are the write-amplification ledger's and reported beside | nvmet-loop |
-| random 4 KiB on `--compress` / `--encrypt` | `rand-4k-read --format-opts` | ≤ 18 (incompressible frames) | the table grain + one 64 KiB frame window: `(4 + 68) / 4` | nvmet-loop |
+| random 4 KiB on `--compress` / `--encrypt` | `rand-4k-read-zstd`, `rand-4k-read-lz4`, `rand-4k-read-aes` (each names its own `--format-opts`) | ≤ 18.9 (incompressible frames) | the table grain + one 64 KiB frame window: `(4 + 68) / 4` × (1 + f); the headline IOPS is the transform's throughput (§K10: a codec per lane, `transform_codec_pool_waits` 0), judged against `rand-4k-read` on the same venue | nvmet-loop |
 | `stat` storm / `find` over 100 k files | `stat-mdtest`, `find-readdir` | cold `node reads/record ≤ 3` (the tree height); warm ≈ 0 | one root→leaf walk per cold record; the node cache holds the working set | nvmet-loop |
 
 ## 5. What a failure means

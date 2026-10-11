@@ -158,6 +158,40 @@ pad      zeros to the 4 KiB DMA grain
 - Bound for a random 4 KiB read (decision 0003 §K7): `(4 KiB + ceil_4k(F + tag)) / 4 KiB ≤ 18×` on
   an incompressible frame, `(4 + ceil_4k(F/ρ)) / 4` at ratio ρ.
 
+### 1.5 The codec contexts (2026-10-11, decision 0003 §K10): a codec per lane, a scratch per DMA
+
+The reference's `scratch_pool_cap = clamp(cpus/4, 4, 16)` (measured: above the concurrent-transform
+count every handout rotates through a cache-cold buffer, +4..10 %) is the stored-image SCRATCH pool;
+its transform state is per call. The port had ONE `Transform` behind a mutex and ONE write scratch
+— every lane's frame decode queued (849 IOPS on the zstd sub-block read), and the scratch was
+overwritten by the next upload's transform while the previous upload's DMA still read it.
+
+- `transform.Transform` — the volume's IMMUTABLE half: the modes, the key state (its own atomics),
+  the raw lever. `transform.Codec` — the per-LANE half: a static `ZSTD_CCtx` + a static `ZSTD_DCtx`
+  of the vendored library (its "one context per thread" contract; ≈ 96 KiB per DCtx, the CCtx by
+  `ZSTD_estimateCCtxSize(3)`), present iff the volume compresses with zstd; lz4 and the AEADs are
+  pure functions of their arguments. Every entry point (`processWrite`, `processRead`,
+  `decodeFrames`) is the codec's.
+- `transform.CodecPool`: `codecPoolSize(lanes) = max(lanes, 1)` codecs (every executor lane — the
+  fuse handler lanes, the meta pool, the lease and main lanes — may transform; a transform never
+  parks holding a codec, so one per lane thread is exact and `transform_codec_pool_waits` stays 0 by
+  derivation); a Vyukov free list under a semaphore (the fast path one pop + one push; an acquirer
+  past the capacity parks, counted, never allocates); a stateless volume hands out one shared codec
+  with no atomics.
+- `transform.ScratchPool`: `scratchPoolCap(cpus)` buffers of `scratchLen(block)`, DMA-aligned, each
+  held from the transform THROUGH the DMA that reads the image (`transform_scratch_pool_waits`
+  counts the parks past the cap). The plane owns one (`transformWrite` → `Stored{bytes, scratch}`
+  released by the caller after its DMA: the own-block act, the pack prepare; `readMappingImage`'s
+  decode destination); the write path owns one (`uploadParkedBlock`: acquired before the transform,
+  released after `device.write` returns).
+- `scratchLen(block) = writeScratchLen(block)` = block + 4 KiB: the C decoder writes exactly the
+  content size (std's streaming decoder's window law — block + 128 KiB, the charter's envelope —
+  is retired with it; decision 0002 row 118 → 477).
+- Zstd decompression: `ZSTD_decompressDCtx(dctx, out, plain_len, src, len)`; `n != plain_len` or an
+  error code ⇒ `Corrupt` — a frame declaring more content refuses on the bounded destination, one
+  declaring less on the count, trailing bytes on the library's frame walk. Total over arbitrary
+  input (the PRNG property test and the fuzz rows stand).
+
 ---
 
 ## 2. Compression and AEAD
@@ -167,7 +201,7 @@ pad      zeros to the 4 KiB DMA grain
 | item | reference | WHY / v4 |
 |---|---|---|
 | lz4 | `lz4_flex` block format (`compress_prepend_size` `:479`; `block::compress_into` `:789`); decode `decompress_size_prepended` `:531` | fast arm; **v4:** raw lz4 block (vendored C `lz4` — std has no lz4), sizes from the header |
-| zstd | level **3** (`:483`, `:797`); WHY: the library default `ZSTD_CLEVEL_DEFAULT` | **v4:** level 3 single-shot via vendored `zstd` (std's zstd is decompress-only — verify at implementation) |
+| zstd | level **3** (`:483`, `:797`); WHY: the library default `ZSTD_CLEVEL_DEFAULT` | **v4:** level 3 single-shot via the vendored `zstd` in a static `ZSTD_CCtx`; decode through the same library's static `ZSTD_DCtx` (§1.5; std's decoder was 10× slower and wanted a window-sized scratch) |
 | AES-256-GCM | `ring::aead::AES_256_GCM` (`:4`, `:164`), 32 B key (`:71`), 12 B nonce, 16 B tag | **v4:** `std.crypto.aead.aes_gcm.Aes256Gcm` |
 | ChaCha20-Poly1305 | `CHACHA20_POLY1305` (`:165`) | **v4:** `std.crypto.aead.chacha_poly.ChaCha20Poly1305` |
 | mode spellings | `"none"|""`, `"lz4"`, `"zstd"` (`:126-129`); `"aes256gcm"|"aes256gcm-rsa"`, `"chacha20"|"chacha20-rsa"` — the `-rsa` names are deprecated aliases "retained only so a pre-KW-1 config still parses far enough to be refused" (`:114-116`, `:141-144`) | **v4:** u8 enums in the config record; no string parsing per block (the reference's own P2-3 "no string trim/match per block", `:105`, `:938`) |

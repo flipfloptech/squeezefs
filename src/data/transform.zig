@@ -851,7 +851,7 @@ pub const zstd = struct {
     pub const InitError = error{ OutOfMemory, ZstdInit };
 
     pub const Compressor = struct {
-        workspace: []align(8) u8,
+        workspace: []align(WORKSPACE_ALIGN.toByteUnits()) u8,
         cctx: *zc.ZSTD_CCtx,
 
         /// One context sized for `LEVEL` by the library's own estimate.
@@ -890,7 +890,7 @@ pub const zstd = struct {
     };
 
     pub const Decompressor = struct {
-        workspace: []align(8) u8,
+        workspace: []align(WORKSPACE_ALIGN.toByteUnits()) u8,
         dctx: *zc.ZSTD_DCtx,
 
         /// One context by the library's own estimate (≈ 96 KiB: the entropy

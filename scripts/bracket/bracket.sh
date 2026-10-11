@@ -35,7 +35,9 @@
 #   --format-opts O        extra `format` flags for the set (e.g. "--compress zstd",
 #                          "--encrypt aes-256-gcm --encrypt-key KEY"; `@KEY` expands to a
 #                          0600 key file the harness mints in its scratch and passes to
-#                          every leg's mount as --encrypt-key); recorded in the header
+#                          every leg's mount as --encrypt-key); recorded in the header.
+#                          A row may name its own (`ROW_FORMAT_OPTS`: the transformed
+#                          rows rand-4k-read-{zstd,lz4,aes}); the option overrides it
 #   --numjobs N            instrument parallelism (default = cpus/2, floor 2)
 #   --iodepth N            instrument queue depth (default 32)
 #   --meta-size B --data-size B --data-volumes N   the set's geometry
@@ -144,6 +146,9 @@ source "$ROW_FILE"
 : "${ROW_KIND:?row must set ROW_KIND}" "${ROW_INSTRUMENT:?row must set ROW_INSTRUMENT}"
 ROW_NEEDS_SHIM=${ROW_NEEDS_SHIM:-0}
 ROW_NEEDS_STAGING=${ROW_NEEDS_STAGING:-0}
+# A transformed row (`rand-4k-read-zstd` …) names its set's format
+# (`ROW_FORMAT_OPTS`); an explicit --format-opts still wins.
+[ -n "$FORMAT_OPTS" ] || FORMAT_OPTS=${ROW_FORMAT_OPTS:-}
 # The budget must clear the daemon's UNRECLAIMABLE floor (≈ 2.7 GiB on this
 # geometry: 9 queues × 32 MiB kmbuf rings + payload arenas + per-lane read
 # slabs + fiber stacks) or the mount runs Red from its first tick and sheds —

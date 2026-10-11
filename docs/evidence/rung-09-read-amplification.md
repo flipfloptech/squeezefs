@@ -195,6 +195,56 @@ mapping from the slot's start at any grain-padded length; the own-block mint's p
 it landed instead of being inflated to the block. The compressible A/B is re-measured under the
 fix in §4.1's last row.
 
+### 4.3 The decode serialization, fixed: per-lane codec contexts (`7c261ce`; decision 0003 §K10)
+
+Root cause of the 849 IOPS in §4.1: the plane held ONE `Transform` behind a mutex (`Xform.lock`),
+so every lane's frame decode queued behind every other's, and that one context decoded zstd through
+`std.compress.zstd` — measured on the dev box in ReleaseSafe at **601 µs per 64 KiB frame at ρ ≈ 3.9**
+(108 MB/s) against the vendored library's static `ZSTD_DCtx` at **59 µs** (1.1 GB/s): a 10× codec
+and a 9-lane serialization stacked. The same lock guarded ONE write scratch that the next upload's
+transform overwrote while the previous upload's DMA still read it (a data race on transformed
+volumes with two uploads in flight — red in `accumulate.zig`: block 1 landed block 2's image).
+
+Fix: `transform.Transform` is the immutable half (modes, key state, raw lever); `transform.Codec`
+the per-LANE half (a static `ZSTD_CCtx` + a static `ZSTD_DCtx`; lz4 and the AEADs carry no state);
+`CodecPool` = one codec per executor lane (`codecPoolSize(lanes)`, 11 on the venue: 9 fuse + 2
+meta/main) in a Vyukov free list under a semaphore — a transform never parks holding a codec, so the
+pool never runs dry and `transform_codec_pool_waits` is 0 by derivation (the red test: 8 threads
+decode at once, overlapped, 0 waits; one codec short parks and still decodes right; an lz4/AEAD
+volume hands out one shared codec with no atomics); `ScratchPool` = `clamp(cpus/4, 4, 16)`
+stored-image scratches each held from the transform THROUGH the DMA (the plane's own-block / pack
+prepare and every write-through upload). The decoder's window slack is gone (`scratchLen` = block
++ 4 KiB; the read path's arm 8f bounce is exactly the span's plaintext).
+
+Measured (`scripts/bracket/xform-probe.sh`, the §4.1 shape: 4 × 256 MiB, fio randread 4 KiB
+O_DIRECT, 4 jobs × QD16, 20 s; A = `2fe5103`, B = `dfb6705`; A and B back to back per row on the
+venue at load 7–9 throughout — another agent's bracket legs ran beside every row, so the absolute
+IOPS sit below §4.1's quiet-ish A figures; the A/B is like for like):
+
+| volume | source | A IOPS (`device ÷ user`) | B IOPS (`device ÷ user`) | B ÷ A | bound |
+|---|---|---|---|---|---|
+| `--compress zstd` | incompressible (every frame raw) | 7,357 (15.68) | **15,199** (15.49) | 2.07× | 18 |
+| `--compress lz4` | incompressible | 9,747 (15.61) | **21,024** (15.29) | 2.16× | 18 |
+| `--encrypt aes-256-gcm` | incompressible | 6,517 (15.69) | **19,824** (15.28) | 3.04× | 18 |
+| `--compress zstd` | text (ρ ≈ 3.9 at 64 KiB) | **782** (8.79) | **19,599** (4.98) | **25.1×** | `(4 + ceil_4k(64/ρ)) / 4` ≈ 6 on the ranged arm |
+| `--compress lz4` | text (ρ ≈ 2.4) | 8,052 (6.76) | **19,736** (6.61) | 2.45× | ≈ 8 |
+| `--encrypt aes-256-gcm` | text (raw bodies: AEAD alone) | 6,586 (15.78) | **19,418** (15.32) | 2.95× | 18 |
+| passthrough | incompressible | — | **74,106** (1.000, the direct leg) | — | 1.05 |
+
+Every B run: `transform_codec_pool_waits` 0, `transform_scratch_pool_waits` 0, the ledger closed
+(`read_dma_image_bytes` is the whole device total), 0 daemon error lines, every ratio in bound. The
+zstd text row's ratio fell from 8.79 to 4.98 because B's 392 k reads make the tier fill's 154
+whole-image escalations a small share (A's 15.7 k reads did not). After the fix every transform
+converges on **19.4–21 k IOPS** whatever the codec — the lane CPU and the frame window's DMA
+(≈ 72 KiB per 4 KiB read, 1.4 GB/s of device reads at 20 k IOPS) are the bound now, not a lock.
+
+**The transform's honest cost against passthrough on the same venue, same probe, same load:
+0.21–0.28× the passthrough IOPS** (15.2–21 k vs 74.1 k): the §K7 format's price for a random
+4 KiB read is the table grain + one 64 KiB frame window of DMA (15.3–15.7× the user bytes) and one
+64 KiB frame decode — not a serialization. The harness carries it from here as three counted rows
+(`rand-4k-read-zstd`, `rand-4k-read-lz4`, `rand-4k-read-aes`: each names its own `--format-opts`,
+bound 18.9 per leg, IOPS judged beside `rand-4k-read`; `docs/gates/brackets.md` §3, §4.1).
+
 ## 5. The fixes, red-first
 
 ### 5.1 The ranged ceiling is derived (`9afb295`)
@@ -258,9 +308,14 @@ admission off. Every number in §3 is from ReleaseSafe daemons unless marked.
   user bytes on the probe) are the W2 fold's — the write-amplification agent's arm (defect 24).
 - **The metadata bound is not exercised by a 100 k-file tree**: the mount pre-loads it (§3.2); the
   ledger and the rows stand for a tree larger than the node cache.
-- **The transformed sub-block decode is serialized** under the plane's one transform context
-  (`x.lock` in `Decode.decode_range`): 849 IOPS for zstd, 7.8 k for lz4 — in bound on
-  amplification, a throughput item for the owner (a per-lane decode context).
+- **The transformed sub-block decode is no longer serialized** (§4.3, `7c261ce`): a codec per lane
+  and the vendored library's static `ZSTD_DCtx`; 782 → 19.6 k IOPS on the compressible zstd probe,
+  2–3× on every other transform; 0.21–0.28× of passthrough is the format's honest cost. The one
+  shared write scratch the lock guarded was a data race across the upload's DMA — fixed by the same
+  pool (`ScratchPool`, held through the DMA).
+- **`write_shared_class_violation` on the fsstress rounds** (§8) was the plane's map merge publishing
+  the LAYOUT's reach floor as the inode's shape (`dfb6705`; `rung-09-external-suites.md` defect 25):
+  73 → 0 lines on the five tests.
 - **The compressed-volume publish wedge** (`ProofMissing` on every block that compressed) was the
   write side's and is fixed here (§4.2) because it stood between the format change and its
   measurement; the W2 fold and the staged append stay `.wt-amp`'s.
@@ -277,10 +332,12 @@ admission off. Every number in §3 is from ReleaseSafe daemons unless marked.
   and on `dev`, and the re-run gate on the rebased series was clean: 46/46 steps, 2,554 pass /
   43 skip (unit 2,362, smoke 61, bench-smoke 40, shim-smoke 40).
 - `scripts/suites/fstests.sh` generic/013, 075, 112, 127, 263 on A and on B: all five pass, fsck
-  `--offline --scrub` 0 findings on both sets. Both arms log the same single alert class,
-  `write_shared_class_violation` (16 on A, 19 on B: the shared-mode write classifier against
-  striped files extended by fsstress — the write side's, pre-existing on `dev`); the suite's
-  "stale ledger rows" are the adjudicated failures a 5-test subset never reaches.
+  `--offline --scrub` 0 findings on both sets. Both arms logged the same single alert class,
+  `write_shared_class_violation` (16 on A, 19 on B; 18 tripwire lines / 73 detail lines on the
+  re-run of `2fe5103`): fixed in `dfb6705` — the plane's map merge published the layout's reach
+  floor as the inode's shape (`rung-09-external-suites.md` defect 25); the same five tests on
+  `dfb6705`: **5/5 pass, 0 alert lines, 0 detail lines, fsck 0 findings on both sets**. The
+  suite's "stale ledger rows" are the adjudicated failures a 5-test subset never reaches.
 - Every read-path stale-serve law stands: the binding-validated serves (every arm re-checks the
   binding and the fill incarnation after its bytes are in hand, arm 8f included), the one purge
   helper over all tiers, the coverage-aware zero fill; `fsx`/`fsstress` rounds above are green.
@@ -292,5 +349,6 @@ admission off. Every number in §3 is from ReleaseSafe daemons unless marked.
 table, the one-grain headroom, the feature bit · `569f1dd` §K7/§K3, porting §1.4 · `62ed47c`
 `BACKOFF_SHIFT_CAP`, the sequential rows' bounds, brackets.md §4.1, 0002 rows 473–476 · `2a655d4`
 the whole-block proof law · `92feb14` this note · `d00f8d8` `read-probe.sh` · `f9239a6` the
-records · `3fe8f98` the interception host smoke · the landing commit (this section, the gate
-totals).
+records · `3fe8f98` the interception host smoke · `2fe5103` the landing commit (the gate totals) ·
+`7c261ce` the per-lane codec contexts and the scratch pools (§4.3) · `dfb6705` the shape fix
+(`write_shared_class_violation`) · the §4.3 / §K10 / rows / 0002 row 477 docs commit.

@@ -13,3 +13,4 @@ generic/756  exportfs: as generic/426 (the 2026-10-10 "returned 1 incorrectly on
 generic/777  exportfs: as generic/426
 generic/310  clears dmesg (`dmesg -c`): "clear kernel buffer failed: Operation not permitted" in the container (no CAP_SYSLOG)
 generic/394  needs `ulimit -f` raised: "cannot modify limit: Operation not permitted" in the container
+generic/460  writes /proc/sys/vm/dirty_*ratio: /proc/sys is read-only in the container

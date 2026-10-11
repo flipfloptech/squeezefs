@@ -157,9 +157,14 @@ suite_mount() {
   # The kmbuf ring wants order-8 contiguous pages; a fragmented venue
   # (other agents' daemons, a hot page cache) answers ENOMEM. Compact and
   # retry — never a weaker buffer mode to pass (charter §1.6/§1.8).
+  # `--supervise` IS the release posture (charter §4 "an external mount
+  # supervisor"): a daemon that dies is named with its wait status in the
+  # log (two silent deaths under venue OOM pressure left no trace without
+  # it), and a daemon that stops answering is dumped (every task's kernel
+  # stack) and aborted — a wedge becomes evidence, never a hung suite.
   local attempt
   for attempt in 1 2 3; do
-    "$SQZ_BIN" mount --daemon --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$tag]}" "$mnt" && break
+    "$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$SUITE_MOUNT_OPTS" "$@" "${SUITE_META[$tag]}" "$mnt" && break
     if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' "$log"; then
       suite_log "mount $tag: kmbuf ENOMEM (fragmented venue); compacting memory and retrying ($attempt/3)"
       sync; { echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory; } 2>/dev/null || true; sleep 2

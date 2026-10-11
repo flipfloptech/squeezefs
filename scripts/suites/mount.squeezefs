@@ -90,7 +90,9 @@ while :; do
   # daemon log's (a test that runs `_scratch_mount` bare captures stderr
   # into its golden output — generic/631, 634); on failure they are the
   # diagnosis and go to stderr.
-  out=$("$SQZ_BIN" mount --daemon --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir" 2>&1) && exit 0
+  # `--supervise`: the release posture's external supervisor (common.sh's
+  # `suite_mount` says why) — a death gets its wait status, a wedge its dump.
+  out=$("$SQZ_BIN" mount --daemon --supervise --log-file "$log" -o "$all" "sqmeta://$SET_DEV" "$dir" 2>&1) && exit 0
   rc=$?
   if [ "$attempt" -lt 3 ] && grep -q 'ENOMEM (order-8' <<< "$out"; then
     echo "$(date +%s) mount $dir: kmbuf ENOMEM (fragmented venue); compacting memory, retry $attempt/3" >> "$SET_DIR/mounts.log"

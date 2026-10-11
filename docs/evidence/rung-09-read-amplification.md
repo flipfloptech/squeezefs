@@ -265,6 +265,32 @@ admission off. Every number in §3 is from ReleaseSafe daemons unless marked.
   write side's and is fixed here (§4.2) because it stood between the format change and its
   measurement; the W2 fold and the staged append stay `.wt-amp`'s.
 
-## 8. Gates
+## 8. Gates and suites
 
-(filled at landing)
+- macOS `zig build gate` on the rebased series: 28/28 steps, unit 1,926 pass / 25 skip, rails 16/16,
+  `zig fmt --check` clean.
+- Venue `zig build gate` (ReleaseSafe exe, 7.2.6-sqz): unit 2,361 pass / 41 skip, rails 16/16, smoke
+  61 pass / 2 skip (the interception host's step 3 restated to the derived ceiling: the unaligned
+  512 KiB read's second touch escalates, then the aligned read serves warm), bench-smoke 40,
+  shim-smoke 40. One run saw `shim.e2e` "fio's shape" collect 3 of 4 stub-host completions inside
+  its 5 s deadline under the gate's full parallel load; it passes 7/7 in isolation on this tree
+  and on `dev`, and the re-run gate on the rebased series was clean: 46/46 steps, 2,554 pass /
+  43 skip (unit 2,362, smoke 61, bench-smoke 40, shim-smoke 40).
+- `scripts/suites/fstests.sh` generic/013, 075, 112, 127, 263 on A and on B: all five pass, fsck
+  `--offline --scrub` 0 findings on both sets. Both arms log the same single alert class,
+  `write_shared_class_violation` (16 on A, 19 on B: the shared-mode write classifier against
+  striped files extended by fsstress — the write side's, pre-existing on `dev`); the suite's
+  "stale ledger rows" are the adjudicated failures a 5-test subset never reaches.
+- Every read-path stale-serve law stands: the binding-validated serves (every arm re-checks the
+  binding and the fill incarnation after its bytes are in hand, arm 8f included), the one purge
+  helper over all tiers, the coverage-aware zero fill; `fsx`/`fsstress` rounds above are green.
+
+## 9. The commits (on `dev`, in order)
+
+`907c3de` the ledger · `f05a7a5` the governor's ladder, the derived ceiling, the rows, §K ·
+`8ba05c3` the framed image · `e0a21f2` the governor's mid-epoch engage · `2560995` the compact
+table, the one-grain headroom, the feature bit · `569f1dd` §K7/§K3, porting §1.4 · `62ed47c`
+`BACKOFF_SHIFT_CAP`, the sequential rows' bounds, brackets.md §4.1, 0002 rows 473–476 · `2a655d4`
+the whole-block proof law · `92feb14` this note · `d00f8d8` `read-probe.sh` · `f9239a6` the
+records · `3fe8f98` the interception host smoke · the landing commit (this section, the gate
+totals).

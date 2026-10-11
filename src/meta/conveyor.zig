@@ -239,20 +239,34 @@ pub const RttEstimator = struct {
     }
 };
 
-/// THE WORTH GATE: a hold is worth paying only when the arrival rate
-/// predicts a companion within the round trip — `mean inter-arrival ≤
-/// srtt` (at least one more entry expected while the in-flight window
-/// lands). Below that rate the hold waits for nobody and costs its
-/// committer the round trip for nothing: measured on `fsync-4k` (4 QD1
-/// jobs, 5 k commits/s against an 80 µs round trip: λ·R = 0.4) the ungated
-/// hold held 30 % of the windows for 48–55 µs each, collected 1.09 entries
-/// per window and cost 12 % of the fsyncs/s; on `frag-512b-write` (8.5 k/s
-/// against 76 µs: 0.65) it collected 1.36 and cost 5 % of the META bytes.
-pub fn holdWorthIt(interarrival_ns: ?u64, srtt_ns: ?u64) bool {
-    const d = interarrival_ns orelse return false;
-    const r = srtt_ns orelse return false;
-    return d <= r;
+/// THE WORTH GATE: a hold pays for itself iff it collects at least one
+/// entry that would otherwise have been its own window (one more entry on
+/// the same page is one grain saved; the hold's cost is its members' wait
+/// of ≤ one round trip). The gate is the MEASURED gain — the smoothed
+/// count of entries the re-drain collected per hold (RFC 6298's mean, in
+/// `GAIN_UNIT` fixed point) — because the arrival rate alone misjudges a
+/// closed loop: a QD1 committer delayed by the hold arrives later, and the
+/// rate the hold needs is the rate it suppresses. Measured ungated on the
+/// venue: `fsync-4k` (4 QD1 jobs) held 30 % of its windows for 48–55 µs,
+/// collected 0.09 per hold and lost 12 % of the fsyncs/s; `frag-512b-
+/// write` (4 QD1 jobs) collected 0.35 and wrote 8 % MORE META bytes at
+/// −11 % IOPS (the hold broke the jobs' natural coincidence); `rand-4k-
+/// write` (QD32 × 4) collected 1.3 and took the META bytes from 0.70 to
+/// 0.46 × user at +20 % IOPS. An off gate PROBES one eligible window in
+/// `HOLD_PROBE_PERIOD` so a workload that starts paying is seen within
+/// twice the estimator's memory.
+pub fn holdWorthIt(gain_mean: ?u64) bool {
+    return (gain_mean orelse 0) >= GAIN_UNIT;
 }
+
+/// The gain estimator's fixed point: one collected entry = 1024 (the
+/// EWMA's eighth of a difference stays whole down to 1/128 of an entry).
+pub const GAIN_UNIT: u64 = 1024;
+/// A probe hold every this many eligible windows while the gate is off:
+/// twice the estimator's memory (`1/α = 8` samples), so the gain the
+/// probes measure is at most two memories stale, at a latency cost of one
+/// hold in sixteen (≤ 6 % of the eligible windows wait ≤ one round trip).
+pub const HOLD_PROBE_PERIOD: u32 = 2 << RTT_ALPHA_SHIFT;
 
 /// The pad arithmetic the §L bound restates (tie tests below): a window
 /// of `n` entries of `s` bytes landing at the data start of a page on a
@@ -553,9 +567,14 @@ pub const Stats = struct {
     hold_landings: counters.ShardedCounter = .{},
     hold_deadlines: counters.ShardedCounter = .{},
     /// `meta_conveyor_holds_not_worth`: pad-majority batches issued at once
-    /// because the arrival rate predicted no companion within the round
-    /// trip (`holdWorthIt`) — the QD1 shapes' windows.
+    /// with a window in flight because the measured gain said a hold
+    /// collects nothing (`holdWorthIt`) — the QD1 shapes' windows;
+    /// `meta_conveyor_hold_probes`: the holds paid while the gate was off
+    /// to re-measure it (one in `HOLD_PROBE_PERIOD`); `meta_conveyor_hold_
+    /// gain_milli`: the live gain (entries collected per hold × 1000).
     holds_not_worth: counters.ShardedCounter = .{},
+    hold_probes: counters.ShardedCounter = .{},
+    hold_gain_milli: counters.Gauge = .{},
     windows_held: counters.ShardedCounter = .{},
     windows_unshadowed: counters.ShardedCounter = .{},
     windows_pipelined: counters.ShardedCounter = .{},
@@ -587,7 +606,7 @@ pub const Stats = struct {
         for (GroupSizeHistogram.labels, 0..) |l, i| {
             try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", l, self.group_size.load(i) });
         }
-        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}}}", .{
+        try w.print("}},\"meta_commit_group_bytes\":{d},\"meta_conveyor_leader_passes\":{d},\"meta_conveyor_group_commits\":{d},\"meta_conveyor_group_txs\":{d},\"meta_conveyor_lane_handoffs\":{d},\"meta_conveyor_windows_inflight\":{d},\"meta_conveyor_windows_inflight_hwm\":{d},\"meta_conveyor_queued\":{d},\"meta_commit_parked\":{d},\"meta_conveyor_drained_txs\":{d},\"meta_conveyor_acks\":{d},\"meta_conveyor_refusals\":{d},\"meta_kv_journal_full_stalls\":{d},\"meta_conveyor_park_tick_rescues\":{d},\"manager_dependency_stalls\":{d},\"meta_conveyor_rollbacks\":{d},\"meta_conveyor_compensations\":{d},\"meta_conveyor_pass_panics\":{d},\"meta_conveyor_holds\":{d},\"meta_conveyor_hold_landings\":{d},\"meta_conveyor_hold_deadlines\":{d},\"meta_conveyor_holds_not_worth\":{d},\"meta_conveyor_hold_probes\":{d},\"meta_conveyor_hold_gain_milli\":{d},\"meta_conveyor_windows_held\":{d},\"meta_conveyor_windows_unshadowed\":{d},\"meta_conveyor_windows_pipelined\":{d},\"meta_conveyor_hold_bound_ns\":{d}}}", .{
             self.group_bytes.load(),
             self.leader_passes.load(),
             self.group_commits.load(),
@@ -610,6 +629,8 @@ pub const Stats = struct {
             self.hold_landings.load(),
             self.hold_deadlines.load(),
             self.holds_not_worth.load(),
+            self.hold_probes.load(),
+            self.hold_gain_milli.load(),
             self.windows_held.load(),
             self.windows_unshadowed.load(),
             self.windows_pipelined.load(),
@@ -905,11 +926,11 @@ pub const Conveyor = struct {
     /// landing).
     landed: sync.Notify = .init,
     rtt: RttEstimator = .{},
-    /// The committers' inter-arrival interval (the worth gate's rate),
-    /// sampled by the pass over consecutive drained entries' enqueue
-    /// instants; `last_enqueued_ns` bridges batches. Pass-fiber-owned.
-    arrival: RttEstimator = .{},
-    last_enqueued_ns: u64 = 0,
+    /// The worth gate's measured gain (entries the re-drain collected per
+    /// hold, `GAIN_UNIT` fixed point) and the probe countdown while the
+    /// gate is off. Pass-fiber-owned.
+    gain: RttEstimator = .{},
+    probe_countdown: u32 = 0,
     stats: Stats = .{},
 
     pub fn init(gpa: Allocator, deps: Deps) Allocator.Error!*Conveyor {
@@ -1182,18 +1203,6 @@ pub const Conveyor = struct {
         return self.deps.geo.padOf(self.deps.core.headPos() + entry_bytes) > entry_bytes;
     }
 
-    /// The committers' inter-arrival samples from one drained batch: the
-    /// gaps between consecutive enqueue instants (FIFO = enqueue order),
-    /// and the gap from the previous batch's last.
-    fn sampleArrivals(self: *Conveyor, batch: []const Queued) void {
-        var prev = self.last_enqueued_ns;
-        for (batch) |m| {
-            if (prev != 0) self.arrival.sample(m.enqueued_ns -| prev);
-            prev = m.enqueued_ns;
-        }
-        self.last_enqueued_ns = prev;
-    }
-
     /// The window-fill hold (§L): a pad-majority batch waits for the
     /// window in flight to reach its terminal outcome — a park on
     /// `landed` bounded by the round-trip predictor's deadline — then the
@@ -1201,15 +1210,14 @@ pub const Conveyor = struct {
     /// Register-then-check: the landing's wake can land between the
     /// in-flight read and the park and is never lost. Holds nothing when
     /// no law is armed, nothing is in flight (a lone committer never
-    /// waits), the batch is entry-majority, the predictors have no sample
-    /// yet, the arrival rate predicts no companion within the round trip
-    /// (`holdWorthIt`), or the volume is closing. One park per window,
-    /// never a loop: after a landing nothing is in flight and the window
-    /// goes.
+    /// waits), the batch is entry-majority, the predictor has no sample
+    /// yet, the measured gain says a hold collects nothing (`holdWorthIt`,
+    /// probed one window in `HOLD_PROBE_PERIOD`), or the volume is
+    /// closing. One park per window, never a loop: after a landing nothing
+    /// is in flight and the window goes.
     fn holdForFill(self: *Conveyor, batch: []Queued) HeldBatch {
         const unheld: HeldBatch = .{ .batch = batch, .held = false };
         const law = self.deps.window_hold orelse return unheld;
-        self.sampleArrivals(batch);
         if (self.isClosing()) return unheld;
         var sum: u64 = 0;
         for (batch) |m| sum += m.q.len;
@@ -1217,16 +1225,22 @@ pub const Conveyor = struct {
         const bound = self.rtt.bound(law.ceiling_ns);
         self.stats.hold_bound_ns.set(bound);
         if (bound == 0) return unheld;
-        if (!holdWorthIt(self.arrival.mean(), self.rtt.mean())) {
-            self.stats.holds_not_worth.inc();
-            return unheld;
-        }
         const io = self.deps.io;
         var n = self.landed.notified();
         _ = n.enable(io);
         if (self.windowsInflight() == 0) {
             n.cancel(io);
             return unheld;
+        }
+        if (!holdWorthIt(self.gain.mean())) {
+            self.probe_countdown += 1;
+            if (self.probe_countdown < HOLD_PROBE_PERIOD) {
+                n.cancel(io);
+                self.stats.holds_not_worth.inc();
+                return unheld;
+            }
+            self.probe_countdown = 0;
+            self.stats.hold_probes.inc();
         }
         self.stats.holds.inc();
         const t0 = clock.monotonicNs();
@@ -1238,9 +1252,14 @@ pub const Conveyor = struct {
         // The re-drain under the caps' remainder: FIFO is kept (the new
         // members follow the held ones); the caps bound the whole window.
         const rest: Caps = .{ .max_txs = self.deps.caps.max_txs -| batch.len, .max_bytes = self.deps.caps.max_bytes -| sum };
-        if (rest.max_txs == 0 or batch.len >= self.batch_buf.len) return .{ .batch = batch, .held = true };
+        if (rest.max_txs == 0 or batch.len >= self.batch_buf.len) {
+            self.gain.sample(0);
+            return .{ .batch = batch, .held = true };
+        }
         const more = self.core.drainBatch(rest, self.batch_buf[batch.len..]);
-        self.sampleArrivals(more);
+        // The hold's gain: what the re-drain collected (the gate's sample).
+        self.gain.sample(@as(u64, more.len) * GAIN_UNIT);
+        self.stats.hold_gain_milli.set(self.gain.mean().? * 1000 / GAIN_UNIT);
         return .{ .batch = self.batch_buf[0 .. batch.len + more.len], .held = true };
     }
 
@@ -3341,7 +3360,7 @@ test "the stats JSON names every conveyor face" {
     var w: std.Io.Writer = .fixed(&buf);
     try s.writeJson(&w);
     const out = w.buffered();
-    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns" }) |name| {
+    for ([_][]const u8{ "meta_commit_group_size", "meta_conveyor_leader_passes", "meta_conveyor_windows_inflight_hwm", "meta_conveyor_acks", "meta_kv_journal_full_stalls", "meta_conveyor_park_tick_rescues", "meta_conveyor_pass_panics", "meta_conveyor_holds", "meta_conveyor_hold_landings", "meta_conveyor_hold_deadlines", "meta_conveyor_holds_not_worth", "meta_conveyor_hold_probes", "meta_conveyor_hold_gain_milli", "meta_conveyor_windows_held", "meta_conveyor_windows_unshadowed", "meta_conveyor_windows_pipelined", "meta_conveyor_hold_bound_ns" }) |name| {
         try testing.expect(std.mem.indexOf(u8, out, name) != null);
     }
     var pb: [4096]u8 = undefined;
@@ -3416,18 +3435,22 @@ test "§L tie: the RFC 6298 round-trip predictor — first sample seeds srtt = R
     try testing.expectEqual(e.srtt_ns.load(.monotonic), e.mean().?);
 }
 
-test "§L tie: the worth gate — a hold is paid only when the mean inter-arrival fits inside the round trip; no sample on either side ⇒ no hold; the measured shapes" {
-    try testing.expect(!holdWorthIt(null, 200_000));
-    try testing.expect(!holdWorthIt(100_000, null));
-    // fsync-4k: 5 k commits/s (200 µs apart) against an 80 µs round trip ⇒ not worth.
-    try testing.expect(!holdWorthIt(200_000, 80_000));
-    // frag-512b-write: 8.5 k/s (118 µs) against 76 µs ⇒ not worth.
-    try testing.expect(!holdWorthIt(118_000, 76_000));
-    // rand-4k-write: 10.4 k/s (96 µs) against 183 µs ⇒ worth (≈ 1.9 companions).
-    try testing.expect(holdWorthIt(96_000, 183_000));
-    // The edge: one companion exactly.
-    try testing.expect(holdWorthIt(80_000, 80_000));
-    try testing.expect(!holdWorthIt(80_001, 80_000));
+test "§L tie: the worth gate — a hold is paid while the measured gain is ≥ one collected entry per hold; no sample ⇒ off; the probe period is twice the estimator's memory" {
+    try testing.expect(!holdWorthIt(null));
+    try testing.expect(!holdWorthIt(GAIN_UNIT - 1));
+    try testing.expect(holdWorthIt(GAIN_UNIT));
+    var g: RttEstimator = .{};
+    // fsync-4k's measured shape: 0.09 collected per hold ⇒ off.
+    for (0..16) |i| g.sample(if (i % 11 == 0) GAIN_UNIT else 0);
+    try testing.expect(!holdWorthIt(g.mean()));
+    // rand-4k-write's: 1.3 per hold ⇒ on (and stays on through a lean hold).
+    var r: RttEstimator = .{};
+    for (0..16) |i| r.sample(if (i % 10 < 3) 2 * GAIN_UNIT else GAIN_UNIT);
+    try testing.expect(holdWorthIt(r.mean()));
+    r.sample(0);
+    try testing.expect(holdWorthIt(r.mean()));
+    try testing.expectEqual(@as(u32, 16), HOLD_PROBE_PERIOD);
+    try testing.expectEqual(@as(u32, 2) << RTT_ALPHA_SHIFT, HOLD_PROBE_PERIOD);
 }
 
 // THE §L RED TEST (red at f27c501: 16 windows per committer round, pad
@@ -3538,22 +3561,36 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     const s: u64 = 76;
     const geo = h.vol.journal.geo;
     const pair = windowCost(geo, n_committers / 2, s);
-    const bound_ppm = pair.padFractionPpm();
+    // The expected pad over the run: the steady pairs at `1 − N·s/(2·g)`
+    // plus the gate's learning period — it starts OFF and pays its first
+    // probe hold at the `HOLD_PROBE_PERIOD`th eligible window, so that
+    // many one-entry windows land unpaced first (the shape's ≈ 97.6 %).
+    const steady_windows: u64 = 2 * per_committer;
+    const probe_windows: u64 = HOLD_PROBE_PERIOD;
+    const bound_ppm = (pair.padFractionPpm() * steady_windows + windowCost(geo, 1, s).padFractionPpm() * probe_windows) / (steady_windows + probe_windows);
     const pad_ppm = (pad * WindowCost.PPM) / device;
     // 12 pp of slack: the first windows (the cohorts forming) and the
     // last (committers finishing) carry more pad than the steady pairs.
     const slack_ppm = 12 * WindowCost.PPM / 100;
-    std.debug.print("\n§L red test: {d} entries in {d} windows, pad {d} B of {d} B device = {d}.{d:0>1} % (bound {d}.{d:0>1} % + 12 pp); holds {d} (landings {d}, deadlines {d}); held {d}, unshadowed {d}, pipelined {d}; hold bound {d} µs\n", .{ entries, windows, pad, device, pad_ppm / 10_000, (pad_ppm % 10_000) / 1000, bound_ppm / 10_000, (bound_ppm % 10_000) / 1000, h.cv.stats.holds.load(), h.cv.stats.hold_landings.load(), h.cv.stats.hold_deadlines.load(), h.cv.stats.windows_held.load(), h.cv.stats.windows_unshadowed.load(), h.cv.stats.windows_pipelined.load(), h.cv.stats.hold_bound_ns.load() / 1000 });
+    std.debug.print("\n§L red test: {d} entries in {d} windows, pad {d} B of {d} B device = {d}.{d:0>1} % (bound {d}.{d:0>1} % + 12 pp); holds {d} (landings {d}, deadlines {d}, probes {d}, not worth {d}; gain {d}/1000); held {d}, unshadowed {d}, pipelined {d}; hold bound {d} µs\n", .{ entries, windows, pad, device, pad_ppm / 10_000, (pad_ppm % 10_000) / 1000, bound_ppm / 10_000, (bound_ppm % 10_000) / 1000, h.cv.stats.holds.load(), h.cv.stats.hold_landings.load(), h.cv.stats.hold_deadlines.load(), h.cv.stats.hold_probes.load(), h.cv.stats.holds_not_worth.load(), h.cv.stats.hold_gain_milli.load(), h.cv.stats.windows_held.load(), h.cv.stats.windows_unshadowed.load(), h.cv.stats.windows_pipelined.load(), h.cv.stats.hold_bound_ns.load() / 1000 });
     try testing.expect(pad_ppm <= bound_ppm + slack_ppm);
     // The pacing law's counts: every handoff is one class; a hold ended by
     // the landing's wake or the deadline; one window per round trip means
     // TWO windows per committer round (the alternating cohorts), plus the
-    // forming/finishing transient — against entries/2 ≈ 768 unpaced.
+    // forming/finishing transient and the gate's first probe period —
+    // against entries/2 ≈ 768 unpaced.
     const handoffs = h.cv.stats.lane_handoffs.load();
     try testing.expectEqual(handoffs, h.cv.stats.windows_held.load() + h.cv.stats.windows_unshadowed.load() + h.cv.stats.windows_pipelined.load());
     try testing.expectEqual(h.cv.stats.holds.load(), h.cv.stats.hold_landings.load() + h.cv.stats.hold_deadlines.load());
     try testing.expect(h.cv.stats.holds.load() >= per_committer);
-    try testing.expect(windows <= 2 * per_committer + 8);
+    // Two windows per round, a third when the re-drain races a cohort's
+    // tail (the device thread lands and completes DMAs from one clock),
+    // plus the probe period and the forming/finishing transient.
+    try testing.expect(windows <= (5 * per_committer) / 2 + HOLD_PROBE_PERIOD + 8);
+    // The gate learned: one probe turned it on and it stayed on.
+    try testing.expect(h.cv.stats.hold_probes.load() >= 1);
+    try testing.expect(h.cv.stats.holds_not_worth.load() < 2 * HOLD_PROBE_PERIOD);
+    try testing.expect(holdWorthIt(h.cv.stats.hold_gain_milli.load() * GAIN_UNIT / 1000));
     try testing.expect(h.cv.stats.hold_landings.load() >= h.cv.stats.hold_deadlines.load());
     // Every Δ landed: the fold's newest size per inode is the last write's.
     for (inos) |ino| try testing.expect(try h.present(ino));

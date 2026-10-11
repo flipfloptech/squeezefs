@@ -14,3 +14,4 @@ row cites its decision 0002 row.
 
 | test-id | reason-class | evidence |
 |---|---|---|
+| generic/192 | noatime | atime is never stamped by a READ: the data plane's read ladder (charter §4 try-only warm ladder, zero-copy serves) performs no inode write per read, and the kernel sends no SETATTR for atime on a FUSE mount — the charter's adjudicated `noatime` class; the test measures `delta1 == 0` where it expects 5–7 s |

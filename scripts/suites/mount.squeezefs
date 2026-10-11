@@ -15,8 +15,10 @@
 # `noatime`, `nodiratime`, `sync`, `dirsync`, `nosuid`, `nodev`, `noexec`
 # and the daemon's own `-o` names pass through to `squeezefs mount`, which
 # refuses anything it does not know (charter §1.6: a junk option is a
-# loud refusal, never dropped). `remount` is refused here: the daemon has
-# no remount verb (a test that needs it reports its reason).
+# loud refusal, never dropped). `remount` is the KERNEL's: a FUSE
+# superblock's ro/rw flip (`fuse_reconfigure`) needs no daemon verb, so
+# `-o remount,…` goes straight to mount(8) with `-i` (no helper recursion)
+# — generic/294 and 306 test the EROFS laws through it.
 set -euo pipefail
 
 ENV_FILE=${SQZ_SUITES_ENV:-/run/squeezefs-suites.env}
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$dev" ] && [ -n "$dir" ] || die "usage: mount.fuse.squeezefs <meta-volume-path> <mountpoint> [-o opts]"
+case ",$opts," in *,remount,*|*,remount=*) exec mount -i -o "$opts" "$dir" ;; esac
 
 # Options: the release posture first, then the caller's (minus the mount
 # table words util-linux adds and the ones a FUSE daemon cannot honour).
@@ -62,7 +65,6 @@ IFS=',' read -ra items <<< "$opts"
 for it in "${items[@]}"; do
   case "$it" in
     ""|rw|defaults|auto|noauto|user|nouser|owner|group|_netdev|nofail|loop) ;;
-    remount*) die "-o remount is not a squeezefs mount verb (the daemon has no remount; unmount and mount)" ;;
     *) pass+=("$it") ;;
   esac
 done

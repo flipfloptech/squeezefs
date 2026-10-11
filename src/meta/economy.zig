@@ -981,9 +981,16 @@ pub fn stageSetattr(t: *tx.KvTx, pending: *PendingTimes, ino: u64, stored: Inode
         v.gid = g;
         ctime_updated = true;
     }
+    var mtime_updated = false;
     if (req.size) |s| {
+        // truncate(2): "shall mark for update the last data modification
+        // and last file status change timestamps" — Linux's do_truncate
+        // stamps both on EVERY size set (same-size included); the kernel
+        // sends no FATTR_MTIME with it without the writeback cache, so the
+        // stamp is ours (fstests generic/313).
         v.size = s;
         ctime_updated = true;
+        mtime_updated = true;
     }
     // utimensat(2): an explicit atime/mtime set IS a status change (POSIX
     // "shall mark the last file status change timestamp for update");
@@ -998,6 +1005,8 @@ pub fn stageSetattr(t: *tx.KvTx, pending: *PendingTimes, ino: u64, stored: Inode
     if (req.mtime) |m| {
         v.mtime = m;
         ctime_updated = true;
+    } else if (mtime_updated and laterThan(now, v.mtime)) {
+        v.mtime = now;
     }
     if (req.ctime) |c| {
         v.ctime = c;
@@ -1650,6 +1659,32 @@ test "absorber: the echo (times-only, mtime equal, ctime ahead) parks with zero 
     try testing.expectEqual(SetattrVerdict.absorbed, o4.verdict);
     try testing.expect(pending.parked(43) == null);
     try testing.expectEqual(@as(u64, 1), pending.len());
+}
+
+test "a size set (truncate/ftruncate/O_TRUNC) marks the data modification AND the status change: mtime and ctime both advance to now, monotone; an explicit mtime beside the size wins (repro-port: fstests generic/313 — mtime not updated after truncate down/up/ftruncate)" {
+    var pending = try PendingTimes.init(testing.allocator);
+    defer pending.deinit();
+    var t = newTx();
+    defer t.deinit();
+    const stored = fileValue(1);
+    // Down, up and same-size: Linux's do_truncate stamps both every time.
+    for ([_]u64{ 1, stored.size + 4096, stored.size }) |sz| {
+        var tx1 = newTx();
+        defer tx1.deinit();
+        const out = try stageSetattr(&tx1, &pending, 42, stored, .{ .size = sz }, t_now + 9);
+        try testing.expectEqual(SetattrVerdict.staged, out.verdict);
+        try testing.expectEqual(sz, out.value.size);
+        try testing.expectEqual(t_now + 9, out.value.mtime);
+        try testing.expectEqual(t_now + 9, out.value.ctime);
+    }
+    // Never backwards: a coarse `now` behind the stored stamps leaves them.
+    const back = try stageSetattr(&t, &pending, 42, stored, .{ .size = 7 }, stored.mtime - 5);
+    try testing.expectEqual(stored.mtime, back.value.mtime);
+    try testing.expectEqual(stored.ctime, back.value.ctime);
+    // An explicit mtime beside the size is exact-set (utimensat after a truncate in one request).
+    const ex = try stageSetattr(&t, &pending, 42, stored, .{ .size = 7, .mtime = 5 }, t_now + 9);
+    try testing.expectEqual(@as(u64, 5), ex.value.mtime);
+    try testing.expectEqual(t_now + 9, ex.value.ctime);
 }
 
 test "absorber: never blanket suppression — a changed mtime, an explicit utimes (exact, even backwards, with a live refinement), a value field, and a ctime-less times request all stage ONE Put" {

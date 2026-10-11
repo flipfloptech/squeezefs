@@ -10,7 +10,8 @@
 //! 4 KiB sector with the field zeroed (`meta/superblock.zig`'s discipline):
 //! `{magic "SQZDATLV", version, block, chunk, compression, encryption,
 //! volume_len (the tail copy's self-location), vol_tag, set_uuid,
-//! device_uuid, features_incompat (0 today; unknown ⇒ refuse loud),
+//! device_uuid, features_incompat (bit 0 = framed images on a transformed
+//! volume; unknown ⇒ refuse loud),
 //! sb_generation, reserved, xxh3}`.
 //!
 //! `format` per data volume: zero chunk 0 and the LAST chunk (both are
@@ -44,8 +45,19 @@ const Allocator = std.mem.Allocator;
 pub const sector_len: usize = 4096;
 pub const magic_value = "SQZDATLV";
 pub const version_v1: u16 = 1;
-/// No capability bit is defined today; an unknown one refuses loud.
-pub const features_incompat_known: u64 = 0;
+/// A transformed volume's block images are FRAMED (`transform.FRAME_VERSION`
+/// 2: a header page + 64 KiB frames each sealed alone; decision 0003 §K7):
+/// a binary that knows only one-frame images refuses this bit loud instead
+/// of refusing every block it reads, and this binary refuses a transformed
+/// volume WITHOUT it (its images are the old shape; pre-release, no
+/// compatibility owed — decision 0002). A passthrough volume carries 0.
+pub const feature_framed_images: u64 = 1 << 0;
+pub const features_incompat_known: u64 = feature_framed_images;
+
+/// The feature word `format` stamps for a transform configuration.
+pub fn featuresFor(cfg: transform.VolumeTransform) u64 {
+    return if (cfg.isPassthrough()) 0 else feature_framed_images;
+}
 
 pub const DataSuperblockWire = extern struct {
     magic: [8]u8,
@@ -129,6 +141,7 @@ pub const DataSuperblock = struct {
         if (self.chunk_size != transform.chunkSizeFor(self.transformCfg())) return refuse(diag, .{ .chunk_mismatch = .{ .chunk = self.chunk_size, .want = transform.chunkSizeFor(self.transformCfg()) } });
         const unknown = self.features_incompat & ~features_incompat_known;
         if (unknown != 0) return refuse(diag, .{ .unknown_incompat_bits = unknown });
+        if (self.features_incompat != featuresFor(self.transformCfg())) return refuse(diag, .{ .framed_images_mismatch = .{ .features = self.features_incompat, .want = featuresFor(self.transformCfg()) } });
         if (self.chunkCount() < 3) return refuse(diag, .{ .volume_too_small = .{ .volume_len = self.volume_len, .chunk = self.chunk_size } });
     }
 
@@ -183,7 +196,7 @@ pub const DataSuperblock = struct {
     }
 };
 
-pub const DecodeError = error{ BadLength, BadMagic, WrongVersion, ChecksumMismatch, ReservedNotZero, BadMode, InvalidBlockSize, ChunkMismatch, UnknownIncompatBits, VolumeTooSmall, InvalidMagic };
+pub const DecodeError = error{ BadLength, BadMagic, WrongVersion, ChecksumMismatch, ReservedNotZero, BadMode, InvalidBlockSize, ChunkMismatch, UnknownIncompatBits, FramedImagesMismatch, VolumeTooSmall, InvalidMagic };
 
 pub const Refusal = union(enum) {
     bad_length: usize,
@@ -195,6 +208,7 @@ pub const Refusal = union(enum) {
     invalid_block_size: u32,
     chunk_mismatch: struct { chunk: u32, want: u32 },
     unknown_incompat_bits: u64,
+    framed_images_mismatch: struct { features: u64, want: u64 },
     volume_too_small: struct { volume_len: u64, chunk: u32 },
     invalid_magic: [8]u8,
 
@@ -209,6 +223,7 @@ pub const Refusal = union(enum) {
             .invalid_block_size => error.InvalidBlockSize,
             .chunk_mismatch => error.ChunkMismatch,
             .unknown_incompat_bits => error.UnknownIncompatBits,
+            .framed_images_mismatch => error.FramedImagesMismatch,
             .volume_too_small => error.VolumeTooSmall,
             .invalid_magic => error.InvalidMagic,
         };
@@ -225,6 +240,7 @@ pub const Refusal = union(enum) {
             .invalid_block_size => |b| try w.print("data superblock block size {d} is not a power of two in [{d}, {d}]", .{ b, transform.MIN_BLOCK_SIZE, transform.MAX_BLOCK_SIZE }),
             .chunk_mismatch => |c| try w.print("data superblock chunk {d} is not the {d} its block and transform derive", .{ c.chunk, c.want }),
             .unknown_incompat_bits => |u| try w.print("unknown incompatible feature bits on the data superblock (0x{x}) — upgrade squeezefs to mount this volume", .{u}),
+            .framed_images_mismatch => |f| try w.print("data superblock feature word 0x{x} is not the 0x{x} its transform requires (framed block images, format change of 2026-10-11, decision 0003 §K7) — this volume was formatted by another train; reformat it (pre-release: no compatibility owed, decision 0002)", .{ f.features, f.want }),
             .volume_too_small => |v| try w.print("data volume of {d} bytes holds fewer than 3 chunks of {d} bytes (two are reserved; at least one usable block is required) — grow the volume or choose a smaller --block-size", .{ v.volume_len, v.chunk }),
             .invalid_magic => |m| try w.print("invalid data superblock magic {x} (expected \"{s}\"): not a squeezefs data volume — a filesystem, a partition table or another product's signature", .{ &m, magic_value }),
         }
@@ -385,7 +401,7 @@ fn pushZero(a: Allocator, steps: *std.ArrayList(Step), zeros: []const u8, start:
 // ---------------------------------------------------------------------------
 
 pub const linux_dev = if (builtin.os.tag == .linux) struct {
-    pub const DeviceError = error{ DeviceRefused, Io, OutOfMemory, VolumeTooSmall, InvalidBlockSize, ChunkMismatch, UnknownIncompatBits, ReadbackMismatch, Unexpected };
+    pub const DeviceError = error{ DeviceRefused, Io, OutOfMemory, VolumeTooSmall, InvalidBlockSize, ChunkMismatch, UnknownIncompatBits, FramedImagesMismatch, ReadbackMismatch, Unexpected };
 
     pub const Opened = struct {
         classified: Classified,
@@ -472,17 +488,20 @@ pub const linux_dev = if (builtin.os.tag == .linux) struct {
 
 const testing = std.testing;
 
+/// A transformed 4 MiB block's chunk: block + the transform headroom (4 KiB).
+const fixture_chunk: u32 = (4 << 20) + transform.TRANSFORM_BLOCK_HEADROOM;
+
 fn fixture() DataSuperblock {
     return .{
         .block_size = 4 << 20,
-        .chunk_size = 4_198_400,
+        .chunk_size = fixture_chunk,
         .compression = .lz4,
         .encryption = .aes256gcm,
         .volume_len = 1 << 30,
         .vol_tag = 0x0123_4567_89ab_cdef,
         .set_uuid = "set-uuid-fixture".*,
         .device_uuid = "device-uuid-fixt".*,
-        .features_incompat = 0,
+        .features_incompat = feature_framed_images,
     };
 }
 
@@ -495,6 +514,7 @@ test "the wire is 128 B at the spec's offsets; encode∘decode = id; the sector'
     try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, img[8..10], .little));
     try testing.expectEqual(@as(u32, 4 << 20), std.mem.readInt(u32, img[12..16], .little));
     try testing.expectEqual(@as(u32, 4_198_400), std.mem.readInt(u32, img[16..20], .little));
+    try testing.expectEqual(feature_framed_images, std.mem.readInt(u64, img[72..80], .little));
     try testing.expectEqual(@as(u64, 1 << 30), std.mem.readInt(u64, img[24..32], .little));
     try testing.expectEqual(@as(u64, 7), sectorGeneration(&img));
     try testing.expect(std.mem.allEqual(u8, img[128..], 0));
@@ -510,11 +530,12 @@ test "the wire is 128 B at the spec's offsets; encode∘decode = id; the sector'
     plain.compression = .none;
     plain.encryption = .none;
     plain.chunk_size = 4 << 20;
+    plain.features_incompat = 0;
     try plain.validate(null);
     try testing.expectEqual(@as(u64, 254), plain.capacityBlocks());
 }
 
-test "decode refuses by class in order: length, magic, version, checksum, reserved (incl. padding), mode, block size, chunk, unknown bits, too small; classifySector0 tells Blank from a foreign magic" {
+test "decode refuses by class in order: length, magic, version, checksum, reserved (incl. padding), mode, block size, chunk, unknown bits, the framed-images bit, too small; classifySector0 tells Blank from a foreign magic" {
     const sb = fixture();
     var img: [sector_len]u8 = undefined;
     try sb.encodeSector(1, &img, null);
@@ -564,8 +585,22 @@ test "decode refuses by class in order: length, magic, version, checksum, reserv
     var w: std.Io.Writer = .fixed(&buf);
     try diag.write(&w);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "0x20") != null);
+    // A transformed volume WITHOUT the framed-images bit (an older train's
+    // images) refuses; a passthrough volume WITH it refuses the same way.
     bad = img;
-    std.mem.writeInt(u64, bad[24..32], 2 * 4_198_400, .little);
+    std.mem.writeInt(u64, bad[72..80], 0, .little);
+    Restamp.go(&bad);
+    try testing.expectError(error.FramedImagesMismatch, DataSuperblock.decodeSector(&bad, &diag));
+    w = .fixed(&buf);
+    try diag.write(&w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "reformat") != null);
+    var plain_bit = sb;
+    plain_bit.compression = .none;
+    plain_bit.encryption = .none;
+    plain_bit.chunk_size = 4 << 20;
+    try testing.expectError(error.FramedImagesMismatch, plain_bit.encodeSector(1, &bad, &diag));
+    bad = img;
+    std.mem.writeInt(u64, bad[24..32], 2 * fixture_chunk, .little);
     Restamp.go(&bad);
     try testing.expectError(error.VolumeTooSmall, DataSuperblock.decodeSector(&bad, &diag));
     const zero: [sector_len]u8 = @splat(0);
@@ -574,7 +609,7 @@ test "decode refuses by class in order: length, magic, version, checksum, reserv
     try testing.expectError(error.BadLength, classifySector0(zero[0..4095], &diag));
     // The encoder refuses the same laws.
     var small = sb;
-    small.volume_len = 2 * 4_198_400;
+    small.volume_len = 2 * fixture_chunk;
     try testing.expectError(error.VolumeTooSmall, small.encodeSector(1, &bad, &diag));
 }
 
@@ -619,7 +654,7 @@ test "DUR-5: a classifying primary (Blank included) is authoritative; the tail s
 test "the format plan: zero chunk 0 (sector 0 first) and the last chunk, the tail copy with a barrier, sector 0 last with a barrier; applied to an image it classifies from the primary; the prefix before the last step reads Blank" {
     const gpa = testing.allocator;
     var sb = fixture();
-    sb.volume_len = 5 * 4_198_400 + 1000; // a slack tail past the last whole chunk
+    sb.volume_len = 5 * fixture_chunk + 1000; // a slack tail past the last whole chunk
     var plan = try planFormat(gpa, sb, 2, null);
     defer plan.deinit();
     const s = plan.steps;
@@ -627,7 +662,7 @@ test "the format plan: zero chunk 0 (sector 0 first) and the last chunk, the tai
     try testing.expectEqual(@as(usize, 5 + 5 + 2), s.len);
     try testing.expectEqual(@as(u64, 0), s[0].offset);
     try testing.expect(std.mem.allEqual(u8, s[0].bytes, 0));
-    try testing.expectEqual(@as(u64, 4 * 4_198_400), s[5].offset);
+    try testing.expectEqual(@as(u64, 4 * fixture_chunk), s[5].offset);
     try testing.expectEqual(sb.backupOffset(), s[10].offset);
     try testing.expect(s[10].barrier_after);
     try testing.expectEqual(@as(u64, 0), s[11].offset);
@@ -649,7 +684,7 @@ test "the format plan: zero chunk 0 (sector 0 first) and the last chunk, the tai
     try testing.expectEqual(Slot.primary, done.slot);
     try testing.expectEqual(sb, done.format.v1);
     // The slack past the last whole chunk and the data chunks are untouched.
-    try testing.expect(std.mem.allEqual(u8, image[4_198_400 .. 4 * 4_198_400], 0xee));
+    try testing.expect(std.mem.allEqual(u8, image[fixture_chunk .. 4 * fixture_chunk], 0xee));
     try testing.expectEqual(@as(u64, 3), done.format.v1.capacityBlocks());
 }
 

@@ -1332,7 +1332,7 @@ pub const ReadPath = struct {
                 key = self.currentBinding(ino, b);
                 continue;
             };
-            // 1. The header page.
+            // 1. The image's first grain: the header and the frame table.
             const page = try self.acquireBounce(HEADER_PAGE_LEN);
             defer self.releaseBounce(page);
             if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset, page.bytes[0..@intCast(HEADER_PAGE_LEN)], .pooled) == .dma) {
@@ -1348,17 +1348,23 @@ pub const ReadPath = struct {
                 key = self.currentBinding(ino, b);
                 continue;
             };
-            // 2. The frames' window.
+            // 2. The frames' window. Frame 0's body begins inside the first
+            //    grain (right after the table): a span starting there reuses
+            //    the grain in hand and DMAs only the rest — one grain is
+            //    never read twice.
             const win_len = span.hi - span.lo;
             const win = try self.acquireBounce(win_len);
             defer self.releaseBounce(win);
-            if (try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + span.lo, win.bytes[0..@intCast(win_len)], .pooled) == .dma) {
-                stats.read_fill_dma_bytes.add(win_len);
-                stats.read_dma_image_bytes.add(win_len);
+            const dma_lo = @max(span.lo, HEADER_PAGE_LEN);
+            if (span.lo < dma_lo) @memcpy(win.bytes[0..@intCast(HEADER_PAGE_LEN)], page.bytes[0..@intCast(HEADER_PAGE_LEN)]);
+            const dma_len = span.hi - dma_lo;
+            if (dma_len != 0 and try self.vols.read_range(self.vols.ctx, k.vol_tag, k.offset + dma_lo, win.bytes[@intCast(dma_lo - span.lo)..][0..@intCast(dma_len)], .pooled) == .dma) {
+                stats.read_fill_dma_bytes.add(dma_len);
+                stats.read_dma_image_bytes.add(dma_len);
             }
             stats.ranged_reads.inc();
-            stats.ranged_read_bytes.add(HEADER_PAGE_LEN + win_len);
-            self.adm.governor.noteForeground(HEADER_PAGE_LEN + win_len, clock.monotonicNs());
+            stats.ranged_read_bytes.add(HEADER_PAGE_LEN + dma_len);
+            self.adm.governor.noteForeground(HEADER_PAGE_LEN + dma_len, clock.monotonicNs());
             if (self.seams.after_dma) |f| f(self.seams.after_dma_ctx, k);
             // 3. Bytes in hand FIRST, then the two checks.
             const incarnation_ok = self.still(k, before);
@@ -2169,11 +2175,11 @@ test "the ranged ceiling is derived from the block (every strictly sub-block req
     try testing.expect(!f.rp.hot.contains(key) and !f.rp.nvme.has(key) and !f.rp.hold.contains(key));
 }
 
-test "a transformed volume's random 4 KiB read costs the header page + ONE frame window of device bytes (≤ 4 KiB + 64 KiB + 8 KiB), never the whole image; the bytes are exact across frame boundaries; a stride-crossing block validates its own incarnation cell; the second touch escalates to one whole image; a whole-block read is one image; the image arm carries every byte" {
+test "a transformed volume's random 4 KiB read costs the table grain + ONE frame window of device bytes (≤ 4 KiB + 64 KiB + 8 KiB), never the whole image; a frame-0 read reuses the grain in hand; the bytes are exact across frame boundaries; a stride-crossing block validates its own incarnation cell; the second touch escalates to one whole image; a whole-block read is one image; the image arm carries every byte" {
     const io = testing.io;
     const f = try Fixture.init(testing.allocator, .{ .compression = .lz4, .read_lane = false, .ranged_threshold = derivedRangedThreshold(Fixture.bs) });
     defer f.deinit();
-    try testing.expect(f.chunk == Fixture.bs + 2 * 4096 and f.rp.decode != null and !f.rp.cfg.passthrough);
+    try testing.expect(f.chunk == Fixture.bs + 4096 and f.rp.decode != null and !f.rp.cfg.passthrough);
     f.size = 8 * Fixture.bs;
     for (0..8) |i| f.bind(i, @intCast(i + 3));
     const buf = try alignedBuf(testing.allocator, 1 << 20);
@@ -2202,6 +2208,15 @@ test "a transformed volume's random 4 KiB read costs the header page + ONE frame
     // The last partial frame of a block (the block's tail) reads exactly.
     _ = try f.rp.read(io, 7, 3 * Fixture.bs + Fixture.bs - 4096, 4096, .{ .buf = buf[0..4096] }, .{});
     try Fixture.expected(6 * Fixture.bs + Fixture.bs - 4096, buf[0..4096]);
+    // Frame 0 of block 6 begins inside the table grain: the grain in hand
+    // serves as the window's head and the DMA is the grain + the rest of
+    // the frame — never the grain twice (≤ 64 KiB + 2 × 4 KiB in all).
+    const dev_f0 = f.device_read_bytes.load(.monotonic);
+    _ = try f.rp.read(io, 7, 6 * Fixture.bs + 1000, 4096, .{ .buf = buf[0..4096] }, .{});
+    try Fixture.expected(9 * Fixture.bs + 1000, buf[0..4096]);
+    const dma_f0 = f.device_read_bytes.load(.monotonic) - dev_f0;
+    try testing.expect(dma_f0 <= transform.FRAME_GRAIN + 2 * 4096);
+    try testing.expectEqual(@as(u64, 0), dma_f0 % 4096);
     // The second touch of block 1 is a ghost hit: ONE whole image, then a
     // hot serve.
     const dev2 = f.device_read_bytes.load(.monotonic);

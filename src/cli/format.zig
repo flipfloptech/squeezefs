@@ -348,7 +348,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
             .vol_tag = r.vol_tag,
             .set_uuid = set.set_uuid,
             .device_uuid = r.device_uuid,
-            .features_incompat = 0,
+            .features_incompat = data_superblock.featuresFor(tcfg),
         };
         data_superblock.linux_dev.format(p.gpa, d.path, sb, d.next_generation) catch |e| {
             p.stderr.print("squeezefs format: data volume {s}: {s}\n", .{ d.path, @errorName(e) }) catch {};

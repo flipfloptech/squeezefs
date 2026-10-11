@@ -85,7 +85,7 @@ pub const OfflineWorld = struct {
             .vol_tag = vol_tag,
             .set_uuid = self.be.setUuid(),
             .device_uuid = dev.uuid,
-            .features_incompat = 0,
+            .features_incompat = data_superblock.featuresFor(.{ .compression = cfg.compression, .encryption = cfg.encryption, .block_size = cfg.block_size }),
         };
         data_superblock.linux_dev.format(self.gpa, dev.uri, sb, 1) catch |e| {
             log.err("volume add-data: {s}: the data superblock could not be written ({s})", .{ dev.uri, @errorName(e) });

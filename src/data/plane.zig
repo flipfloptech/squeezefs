@@ -1286,14 +1286,24 @@ pub const DataPlane = struct {
 
     fn promoteLocked(self: *DataPlane, io: Io, ino: u64, k: staging.StagingKey, generation: u64, image: []const u8) Promoted {
         const st = &self.stage.?;
-        const cur_bytes = (self.layoutRecord(ino) catch return .{ .ok = false }) orelse {
+        // Every decline names itself at debug level: the dismount pass counts
+        // them as FAILED, and a count without a cause is not evidence.
+        const cur_bytes = (self.layoutRecord(ino) catch |e| {
+            log.debug("promotion ino {d}: the layout record failed to read ({t})", .{ ino, e });
+            return .{ .ok = false };
+        }) orelse {
             stats.promotions_stale.inc();
+            log.debug("promotion ino {d}: stale — no layout record (the file is gone; the ring entry is an orphan)", .{ino});
             return .{ .ok = false };
         };
         defer self.gpa.free(cur_bytes.value);
-        const cur = layout.XattrLayout.decode(cur_bytes.value, self.geo) catch return .{ .ok = false };
+        const cur = layout.XattrLayout.decode(cur_bytes.value, self.geo) catch |e| {
+            log.debug("promotion ino {d}: the layout record failed to decode ({t})", .{ ino, e });
+            return .{ .ok = false };
+        };
         if (cur.kind != .staged or !std.mem.eql(u8, &cur.file_id, &k.file_id) or st.seg.residentGeneration(k) != generation) {
             stats.promotions_stale.inc();
+            log.debug("promotion ino {d}: stale — layout kind {t}, file id {s}, resident generation {?d} vs leased {d}", .{ ino, cur.kind, if (std.mem.eql(u8, &cur.file_id, &k.file_id)) "same" else "DIFFERENT", st.seg.residentGeneration(k), generation });
             return .{ .ok = false };
         }
         const policy = if (self.packer) |*p| p.policy else pack.Policy{ .enabled = false, .max_slot = self.chunk / 2 };
@@ -1304,8 +1314,9 @@ pub const DataPlane = struct {
             const img = x.t.processWrite(image, x.scratch) catch return .{ .ok = false };
             break :blk img.len;
         } else image.len;
-        const d = pack.dispatch(policy, cur.size, stored_len, self.inline_max, self.chunk) catch {
+        const d = pack.dispatch(policy, cur.size, stored_len, self.inline_max, self.chunk) catch |e| {
             stats.promotions_failed.inc();
+            log.debug("promotion ino {d}: no arm for size {d} / stored {d} ({t})", .{ ino, cur.size, stored_len, e });
             return .{ .ok = false };
         };
         const out: Promoted = switch (d) {
@@ -1313,7 +1324,10 @@ pub const DataPlane = struct {
             .own_block => .{ .ok = self.promoteOwnBlock(io, ino, cur, cur_bytes.coll_seq, image, k, generation) },
             .packed_ => self.promotePacked(io, ino, cur_bytes.coll_seq, image, k, generation),
         };
-        if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else stats.promotions_failed.inc();
+        if (out.ok) self.noteShape(ino, cur.size, if (d == .own_block) .striped else if (d == .inline_) .inline_ else .packed_) else {
+            stats.promotions_failed.inc();
+            log.debug("promotion ino {d}: the {t} arm declined (size {d}, stored {d})", .{ ino, d, cur.size, stored_len });
+        }
         return out;
     }
 
@@ -1331,7 +1345,10 @@ pub const DataPlane = struct {
     }
 
     fn promoteOwnBlock(self: *DataPlane, io: Io, ino: u64, prev: layout.Layout, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) bool {
-        const ob = self.ownBlock(io, ino, image) catch return false;
+        const ob = self.ownBlock(io, ino, image) catch |e| {
+            log.debug("promotion ino {d}: own block refused ({t})", .{ ino, e });
+            return false;
+        };
         const entries = [_]layout.MapEntryWire{(layout.MapEntry{ .block = 0, .mapping = ob.mapping }).encode()};
         const t = self.backend.begin(@src()) catch {
             self.abandonOwnBlock(ob);
@@ -1357,9 +1374,21 @@ pub const DataPlane = struct {
     fn promotePacked(self: *DataPlane, io: Io, ino: u64, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) Promoted {
         const p = &(self.packer orelse return .{ .ok = false });
         const st = &self.stage.?;
-        const tag = (self.rt.pickVolume() catch return .{ .ok = false }) orelse return .{ .ok = false };
-        const stored = self.transformWrite(tag, image) catch return .{ .ok = false };
-        const prepared = (p.prepare(io, .{ .vol_tag = tag, .scope = self.scope }, stored, clock.monotonicNs()) catch return .{ .ok = false }) orelse return .{ .ok = false };
+        const tag = (self.rt.pickVolume() catch return .{ .ok = false }) orelse {
+            log.debug("promotion ino {d}: no data volume to pack onto", .{ino});
+            return .{ .ok = false };
+        };
+        const stored = self.transformWrite(tag, image) catch |e| {
+            log.debug("promotion ino {d}: the transform refused ({t})", .{ ino, e });
+            return .{ .ok = false };
+        };
+        const prepared = (p.prepare(io, .{ .vol_tag = tag, .scope = self.scope }, stored, clock.monotonicNs()) catch |e| {
+            log.debug("promotion ino {d}: pack prepare refused ({t})", .{ ino, e });
+            return .{ .ok = false };
+        }) orelse {
+            log.debug("promotion ino {d}: the pack arm is stopped", .{ino});
+            return .{ .ok = false };
+        };
         const t = self.backend.begin(@src()) catch {
             return .{ .ok = false };
         };
@@ -1378,8 +1407,9 @@ pub const DataPlane = struct {
         }, t);
         return switch (outcome) {
             .committed => |displaced| .{ .ok = true, .displaced = displaced },
-            .stale, .failed => blk: {
+            .stale, .failed => |_, tag_| blk: {
                 self.backend.abandon(t);
+                log.debug("promotion ino {d}: the pack commit answered {t}", .{ ino, tag_ });
                 break :blk .{ .ok = false };
             },
         };

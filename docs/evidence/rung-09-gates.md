@@ -239,6 +239,50 @@ after the bench edit, `1` after the shim identity) with
 `scripts/rails-literal-rebase` — the line-keyed row is the brittleness the
 rail's law bought; the rebase never admits a literal.
 
+Two gate hazards made deterministic afterwards (both test-side; no product
+bug underneath):
+
+- **`write_admit` "dead victim"** (`5db4540`, rung 9 F2): the pin spawned
+  three writers at once and spun until three fallbacks and three capacity
+  waiters showed — but a writer entering the gate while a sibling's cold
+  flush is in flight DEFERS to that upload (the hot-set law), so the third
+  first-round flush could land a whole tick late, on the first writer's
+  tick: `expected 3, found 4|5` (16/100 in a loop on the venue), the wall's
+  tripwire logged (7/100), and on that early return the World was torn down
+  under three live, never-joined writers on a dead device — SIGSEGV in
+  `waitUntilUncancelable` (9/100) or the panic-handler wedge seen once in
+  four pristine `dev` runs (26 min). Fix (`0166ea7`): `ParkHook.refused`,
+  the gate's second station (after a refused cold flush, registered on the
+  capacity notify, the tick not started); the test's `RefusedHold` holds
+  each writer there over `sync.Notify` — arrivals serialized, counters
+  exact, the F2 trigger (a refused flush's settle) fired at the released set
+  from the test thread, the quiet window a quarter-tick deadline wait on
+  `upload_settled` itself; every test-side wait bounded at two ticks with
+  the gate's counters on red, the writers fenced out and joined on every
+  exit. The settle-riding gate re-introduced goes red in 3 s. Proof:
+  **100/100** venue (2.01 s ×99, 2.02 s ×1), **30/30** under an 8-way `yes`
+  load (2.01–2.03 s), **60/60** macOS (2.02–2.05 s).
+- **`--daemon --supervise` smoke**: the row asserted the supervisor's
+  `watching daemon` line on the log snapshot taken right after the invoker
+  returned, but that line is written by the intermediate process AFTER the
+  ready handoff that returns the invoker: 3/10 red under an 8-way `yes`
+  load (load 6–9), green alone. Fix (`8e69fb9`): `awaitLog` from the ready
+  line under the rig's bring-up bound (the log printed on a timeout).
+  Proof: **15/15** under the same load (load 10–13).
+
+Gates at the landing (`8e69fb9` rebased onto `c65935a`): macOS `zig build
+gate` **25/25 steps, 2029/2053** (24 `no_linux` skips; unit 1905 pass, rails
+16/16); Linux `scripts/venue zig build gate` on a quiet venue **43/43 steps,
+2543/2586** (43 skipped): unit 2334 pass / 41 skip, rails 16/16, shim census
+1/1, smoke 61 pass / 2 skip, bench-smoke 40, shim-smoke 40, nvmet-smoke 51.
+The first Linux gate of the same commits ran beside the suites agent's
+fstests (load ~9) and read unit 2331 / 41 / **1 fail** — `journal_lane` "a
+lost kick … exactly one tick rescue" (`expected 1, found 0`, a tick-count
+timing row; 11/11 green alone) — and smoke 58 / 2 / 3 fail (the two-daemon
+matrix, kill rows (a) on daemon B's `kmbuf ring registration ENOMEM
+(order-8)` — the known venue refusal under page-cache churn — and the
+`-o ro` reader), all green on the immediate re-run.
+
 ## 8. Found and fixed along the way
 
 - `ops/nvmet/initiator.zig`: the `.stats` render's fabric sampler kept its
@@ -258,6 +302,10 @@ rail's law bought; the rebase never admits a literal.
   when fabric controllers are present in sysfs (the sampler's transient
   tables allocate per render): make the sampler's tables fixed-capacity or
   scope the law. Pre-existing; surfaced by the concurrent nvmet suites.
+- `journal_lane.zig` "a lost kick … exactly one tick rescue" read
+  `expected 1, found 0` once in a gate beside the suites agent's fstests
+  (load ~9); 11/11 green alone. A tick-count row with a timing window —
+  the same class as the two pins above; pre-existing.
 - The campaign at 60 s per target (the nightly default) on the venue, and a
   60 s campaign after every decoder change; a crash's red repro by the
   documented recipe.

@@ -407,20 +407,30 @@ test "smoke: THE INTERCEPTION HOST — format → mount -o interception → the 
 
     // 3. Reads on the sync fast path. A cold ALIGNED ring read is the
     //    handler's dest lease: a ranged DMA straight into the arena (zero
-    //    daemon copies, never published — demoted, not warmed); a cold
-    //    UNALIGNED read takes the whole-block walk, which fills the hot
-    //    tier; the next read of that block serves WARM on the service
-    //    thread with exactly its bytes on the arena copy ledger.
+    //    daemon copies, never published — demoted, not warmed, no ghost
+    //    touch); a cold UNALIGNED read is a RANGED window too (decision
+    //    0003 §K2: every strictly sub-block random read — the 256 KiB
+    //    ceiling that sent it to the whole-block walk was the read-LRU's
+    //    population bound borrowed as a DMA policy) and the ghost records
+    //    the touch; its SECOND touch escalates to the ONE whole-block fill
+    //    that warms the hot tier; the next read of that block serves WARM on
+    //    the service thread with exactly its bytes on the arena copy ledger.
     const rbuf = try gpa.alloc(u8, 512 * 1024 + 100);
     defer gpa.free(rbuf);
     const demotes0 = try rig.stat("ipc_fast_path_miss_demotions");
     const dma0 = try rig.stat("read_dest_dma_bytes");
+    const esc0 = try rig.stat("ranged_read_ghost_escalations");
     try testing.expectEqual(@as(usize, 512 * 1024), try served(s.pread(b.id, rbuf[0 .. 512 * 1024], 1 * MiB)));
     try expectPattern(rbuf[0 .. 512 * 1024], 1 * MiB);
     try testing.expect((try rig.stat("read_dest_dma_bytes")) >= dma0 + 512 * 1024);
     try testing.expectEqual(rbuf.len, try served(s.pread(b.id, rbuf, 1 * MiB + 100)));
     try expectPattern(rbuf, 1 * MiB + 100);
     try testing.expectEqual(demotes0 + 2, try rig.stat("ipc_fast_path_miss_demotions"));
+    try testing.expectEqual(esc0, try rig.stat("ranged_read_ghost_escalations"));
+    try testing.expectEqual(rbuf.len, try served(s.pread(b.id, rbuf, 1 * MiB + 100)));
+    try expectPattern(rbuf, 1 * MiB + 100);
+    try testing.expectEqual(demotes0 + 3, try rig.stat("ipc_fast_path_miss_demotions"));
+    try testing.expectEqual(esc0 + 1, try rig.stat("ranged_read_ghost_escalations"));
     const serves0 = try rig.stat("ipc_fast_path_serves");
     const copy0 = try rig.stat("ipc_read_arena_copy_bytes");
     const ops_read0 = try rig.stat("ipc_ops_read");

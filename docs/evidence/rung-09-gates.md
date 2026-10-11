@@ -239,7 +239,7 @@ after the bench edit, `1` after the shim identity) with
 `scripts/rails-literal-rebase` — the line-keyed row is the brittleness the
 rail's law bought; the rebase never admits a literal.
 
-Two gate hazards made deterministic afterwards (both test-side; no product
+Three gate hazards made deterministic afterwards (all test-side; no product
 bug underneath):
 
 - **`write_admit` "dead victim"** (`5db4540`, rung 9 F2): the pin spawned
@@ -269,6 +269,26 @@ bug underneath):
   load (load 6–9), green alone. Fix (`8e69fb9`): `awaitLog` from the ready
   line under the rig's bring-up bound (the log printed on a timeout).
   Proof: **15/15** under the same load (load 10–13).
+- **`journal_lane` "a lost kick … exactly one tick rescue"** (F6,
+  `9774031`): F6 moved the backstop tick's verdict to the next poll's
+  re-check — the poll that finds the completed prefix also ACKS the
+  successor inside `advanceDurability` and judges the tick only after that
+  returns, so the ack reaches its waiter BEFORE the rescue is counted. The
+  pin read `tick_rescues` the moment the ack returned: `expected 1, found
+  0` once in the gate at load ~9, 4/200 in a loop under an 8-way `yes`
+  load, 11/11 alone — the waker/wakee preemption of a loaded box, not a
+  lost rescue (the count lands microseconds later). Fix (`41ba633`): the
+  pin records the count before the foreign completion and, after the ack,
+  waits for the acking poll's verdict on the lane's own counter
+  (`spinUntilBy`, two liveness ticks, the lane's counters on red); with the
+  rescue path removed the row is red in 4 s (`tick rescues 0 (expected 1),
+  backstop ticks 1, parks 3, prefix waits 1`). Proof: **500/500** on the
+  venue under the 8-way load (0.11–0.17 s; load 6.5–8.5). Linux-only.
+  Gates at its landing (on `0b6df4e`): macOS 25/25, 2029/2053 (24 skips;
+  unit 1905, rails 16/16); Linux unit **2334 pass / 41 skip**, rails 16/16,
+  shim census 1/1, smoke 60 / 2 / 1 fail beside the suites agent (daemon
+  C's kmbuf order-8 ENOMEM, the known venue refusal) and **61 pass / 2 skip**
+  with bench-smoke 40, shim-smoke 40, nvmet-smoke 51 on the immediate re-run.
 
 Gates at the landing (`8e69fb9` rebased onto `c65935a`): macOS `zig build
 gate` **25/25 steps, 2029/2053** (24 `no_linux` skips; unit 1905 pass, rails
@@ -277,8 +297,8 @@ gate` **25/25 steps, 2029/2053** (24 `no_linux` skips; unit 1905 pass, rails
 1/1, smoke 61 pass / 2 skip, bench-smoke 40, shim-smoke 40, nvmet-smoke 51.
 The first Linux gate of the same commits ran beside the suites agent's
 fstests (load ~9) and read unit 2331 / 41 / **1 fail** — `journal_lane` "a
-lost kick … exactly one tick rescue" (`expected 1, found 0`, a tick-count
-timing row; 11/11 green alone) — and smoke 58 / 2 / 3 fail (the two-daemon
+lost kick … exactly one tick rescue" (`expected 1, found 0`; the third
+hazard above, fixed in `41ba633`) — and smoke 58 / 2 / 3 fail (the two-daemon
 matrix, kill rows (a) on daemon B's `kmbuf ring registration ENOMEM
 (order-8)` — the known venue refusal under page-cache churn — and the
 `-o ro` reader), all green on the immediate re-run.
@@ -302,10 +322,6 @@ matrix, kill rows (a) on daemon B's `kmbuf ring registration ENOMEM
   when fabric controllers are present in sysfs (the sampler's transient
   tables allocate per render): make the sampler's tables fixed-capacity or
   scope the law. Pre-existing; surfaced by the concurrent nvmet suites.
-- `journal_lane.zig` "a lost kick … exactly one tick rescue" read
-  `expected 1, found 0` once in a gate beside the suites agent's fstests
-  (load ~9); 11/11 green alone. A tick-count row with a timing window —
-  the same class as the two pins above; pre-existing.
 - The campaign at 60 s per target (the nightly default) on the venue, and a
   60 s campaign after every decoder change; a crash's red repro by the
   documented recipe.

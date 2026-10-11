@@ -122,6 +122,42 @@ comptime std.debug.assert(@sizeOf(TransformFrameWire) == 96);
 - Passthrough volumes keep the reference's NO-frame contract (ranged reads, W1, zc bridges).
 - `max_stored_image_len(block) = 96 + block` (§4); the 4 KiB pad law is kept.
 
+### 1.4 Version 2 (2026-10-11, decision 0003 §K7): the FRAMED image — `header ‖ table ‖ frames`
+
+One frame per block made every sub-block read decode the whole image (1025× device bytes for a
+4 KiB read; measured 446× on the venue). Version 2 splits the plaintext into `F = 64 KiB` frames
+(`transform.FRAME_GRAIN`: lz4's match window, so no ratio is lost; zstd −3 loses a few percent at
+64 KiB; AES-GCM pays 28 B per frame) and reads only the frames a window needs. Version 1 images
+are refused (`transform_frame_refusals_version`; pre-release, decision 0002).
+
+```
+header   96 B   TransformFrameWire as §1.3 with version = 2; flags: bit1 ENCRYPTED only (STORE_RAW
+                moved to the entry); body_len = Σ frame bodies AFTER the table; nonce = the block's
+                BASE counter (frame i seals under base + i; the writer mints `frames` counters at once)
+table    16 B   FrameTableWire { entries_xxh3 u64 (over the entries), frame_count u16, frame_grain_log2 u8 = 16, reserved[5] }
+entries  16 B × frame_count   FrameEntryWire { off u32 (from the image start; contiguous), body_len u32, plain_len u32 (F but the last), flags u8 (bit0 STORE_RAW), reserved[3] }
+frames   frame 0's body begins at tableLen(count) = 96 + 16 + 16·count (128 B for one frame, 1,136 B for 64);
+         each body = compressed-or-raw plaintext ‖ tag (encrypted); AAD = header ‖ entry ‖ index (u32 LE)
+pad      zeros to the 4 KiB DMA grain
+```
+
+- **The table is compact, never a padded page.** The header ‖ table always fit the image's FIRST
+  4 KiB grain (`MAX_FRAMES = 248 ≥ 64`), so a sub-block read DMAs that grain alone to learn its
+  frames' window (`frameSpan`: `[floor_4k(first.off), ceil_4k(last.off + last.body_len))`), DMAs
+  the window — reusing the grain in hand when frame 0 is inside it — and decodes those frames
+  alone (`decodeFrames`; `read_path.zig` arm 8f, never published, ghost-escalated like a ranged
+  read). A padded header page would have doubled every small packed tenant's slot
+  (`pack_slot_len = ceil_4k(image)`) and the DMA that reads it.
+- `max_stored_image_len(block) = tableLen(frames) + block + frames × 16 (encrypted)`; the headroom
+  stays ONE grain (`1,136 + 1,024 ≤ 4,096`), `chunk = block + 4 KiB` as before.
+- The data superblock's `features_incompat` bit 0 (`data_superblock.feature_framed_images`) names
+  the format on transformed volumes: an older train refuses the bit loud at mount; this train
+  refuses a transformed volume without it (another train's images — reformat).
+- fsck's C-pass verifies a framed image through the same decoder: the table's xxh3, the bodies'
+  coverage of `body_len`, every frame's tag or decode.
+- Bound for a random 4 KiB read (decision 0003 §K7): `(4 KiB + ceil_4k(F + tag)) / 4 KiB ≤ 18×` on
+  an incompressible frame, `(4 + ceil_4k(F/ρ)) / 4` at ratio ρ.
+
 ---
 
 ## 2. Compression and AEAD

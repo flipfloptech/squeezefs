@@ -257,9 +257,10 @@ pub const AllocError = error{
     StorageFull,
     /// A read-only mount refuses every ownership mutation.
     ReadOnly,
-    /// Rung 6: this mount does not hold the volume's allocation lease; rung
-    /// 8: its mint source is disarmed while a carved window holds the
-    /// frontier (retryable; never latches `StorageFull`).
+    /// Rung 6: this mount does not hold the volume's allocation lease, or
+    /// its grant window is empty with the top-up owed by an unreachable or
+    /// deferred holder; rung 8: its mint source is disarmed while a carved
+    /// window holds the frontier (retryable; never latches `StorageFull`).
     PlaneRefused,
     /// `allocateSpecificBlock` on a block that is not free.
     NotFree,
@@ -307,6 +308,13 @@ pub const FinishFreeSink = struct {
     noteFinishFree: *const fn (?*anyopaque, vol_tag: u64, idx: u64) bool,
 };
 
+/// A grant-armed mint's answer: the block, or WHY the window is empty —
+/// `full` is the holder's terminal word (no clear bit remains: this
+/// allocator's `StorageFull`, latched), `retry` the retryable class (the
+/// holder unreachable or deferred, a top-up owed: `PlaneRefused`, never a
+/// latch — "a manager failover on a joined writer with a drained window").
+pub const MintAnswer = union(enum) { minted: u64, full, retry };
+
 /// §11 item 3: the ranged-grant window as the fresh-mint source. Absent ⇒
 /// the local cursor.
 pub const GrantSource = struct {
@@ -314,8 +322,9 @@ pub const GrantSource = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// The next block of the window, or null when it is empty.
-        mint: *const fn (*anyopaque) ?u64,
+        /// The next block of the window (the PULL folded in), or the
+        /// class of its emptiness.
+        mint: *const fn (*anyopaque) MintAnswer,
         /// An unpublished mint returns to its window; false ⇒ not ours.
         giveBack: *const fn (*anyopaque, u64) bool,
         remaining: *const fn (*anyopaque) u64,
@@ -778,12 +787,21 @@ pub const BlockAllocator = struct {
 
     /// The fresh mint: the grant window when armed, else a CAS on the
     /// cursor; `StorageFull` iff `idx ≥ cap` — a refused racer never bumps
-    /// the cursor (BA:L2099-2144).
+    /// the cursor (BA:L2099-2144). An armed window's emptiness carries its
+    /// class: the holder's `full` is this allocator's terminal verdict, a
+    /// top-up still owed (`retry`) is `PlaneRefused` and never latches.
     fn nextFreshBlock(self: *BlockAllocator) AllocError!u64 {
         if (self.grant_source) |g| {
-            const idx = g.vtable.mint(g.ctx) orelse {
-                g.vtable.noteExhausted(g.ctx);
-                return error.StorageFull;
+            const idx = switch (g.vtable.mint(g.ctx)) {
+                .minted => |idx| idx,
+                .full => {
+                    g.vtable.noteExhausted(g.ctx);
+                    return error.StorageFull;
+                },
+                .retry => {
+                    g.vtable.noteExhausted(g.ctx);
+                    return error.PlaneRefused;
+                },
             };
             _ = self.highest.fetchMax(idx + 1, .acq_rel);
             // The window's bits were SET at the carve (charter §5.5).
@@ -2085,11 +2103,11 @@ test "seams: a grant window is the ONE mint source when armed; a finish-free sin
         end: u64 = 10,
         given_back: u64 = 0,
         exhausted: u32 = 0,
-        fn mint(ctx: *anyopaque) ?u64 {
+        fn mint(ctx: *anyopaque) MintAnswer {
             const w: *@This() = @ptrCast(@alignCast(ctx));
-            if (w.next >= w.end) return null;
+            if (w.next >= w.end) return if (w.exhausted == 0) .full else .retry;
             w.next += 1;
-            return w.next - 1;
+            return .{ .minted = w.next - 1 };
         }
         fn giveBack(ctx: *anyopaque, _: u64) bool {
             const w: *@This() = @ptrCast(@alignCast(ctx));
@@ -2115,8 +2133,10 @@ test "seams: a grant window is the ONE mint source when armed; a finish-free sin
     try testing.expectEqual(@as(u64, 9), a.highestBlockIndex());
     try testing.expectEqual(@as(u64, 1), a.freeSupplyBlocks()); // the window's remainder (virgin tail is the holder's)
     const m9 = try a.allocateBlock();
-    try testing.expectError(error.StorageFull, a.allocateBlock());
+    try testing.expectError(error.StorageFull, a.allocateBlock()); // the window's `full`: terminal
     try testing.expectEqual(@as(u32, 1), w.exhausted);
+    try testing.expectError(error.PlaneRefused, a.allocateBlock()); // the window's `retry`: never a latch
+    try testing.expectEqual(@as(u32, 2), w.exhausted);
     var g = MintedBlockGuard.init(a, m9);
     g.abandon();
     try testing.expectEqual(@as(u64, 1), w.given_back);

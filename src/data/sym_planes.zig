@@ -223,7 +223,7 @@ const TwoWriters = struct {
         f.a_lease.window_remaining = &block_grant.GrantWindow.remainingFn;
         f.a_lease.window_ctx = &f.a_arm.window;
         f.a_alloc.lease = f.a_lease.lease();
-        f.a_alloc.grant_source = f.a_arm.window.grantSource();
+        f.a_alloc.grant_source = f.a_arm.grantSource();
         f.a_alloc.finish_free_sink = f.a_bitmap.finishFreeSink();
         f.a_alloc.plane_gate = f.a_gate.gate();
         f.a_alloc.untracked_gate = f.a_executor.untrackedGate();
@@ -235,7 +235,7 @@ const TwoWriters = struct {
         f.b_lease.window_remaining = &block_grant.GrantWindow.remainingFn;
         f.b_lease.window_ctx = &f.b_arm.window;
         f.b_alloc.lease = f.b_lease.lease();
-        f.b_alloc.grant_source = f.b_arm.window.grantSource();
+        f.b_alloc.grant_source = f.b_arm.grantSource();
         f.b_client = .{ .executor = &f.a_executor };
         f.b_tracking = .{};
         f.b_epoch = .{};

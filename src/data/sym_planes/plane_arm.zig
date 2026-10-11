@@ -96,18 +96,25 @@ pub const LEDGER_CAPACITY: usize = 1024;
 // The inline-top-up grant source over a writer arm.
 // ---------------------------------------------------------------------------
 
-/// The allocator's `GrantSource` over a `WriterArm`: the window's mint,
-/// and the PULL inline when it is empty (the charter's "writer tops up at
-/// 50 % as a PULL": the 50 % mark pulls here too, single-flight).
+/// The allocator's `GrantSource` over a `WriterArm`: the arm's mint (the
+/// PULL folded in at the 50 % mark, single-flight — the charter's "writer
+/// tops up at 50 % as a PULL"; an empty window answers its class), the
+/// inline asks counted, and a landed top-up ringing the allocator's supply
+/// edge: a flush parked there for visible supply (`enospc.
+/// allocateBlockGraceBounded`) wakes on the grant, not on its slice.
 const ArmSource = struct {
     arm: *block_grant.WriterArm,
+    alloc: *block_alloc.BlockAllocator,
+    io: Io,
 
-    fn mint(ctx: *anyopaque) ?u64 {
+    fn mint(ctx: *anyopaque) block_alloc.MintAnswer {
         const self: *ArmSource = @ptrCast(@alignCast(ctx));
-        if (self.arm.window.wantsTopup()) {
-            if (self.arm.topup() != .not_asked) stats.block_grant_inline_topups.inc();
+        const m = self.arm.mintBlock();
+        if (m.asked) {
+            stats.block_grant_inline_topups.inc();
+            self.alloc.supply_edge.notifyWaiters(self.io);
         }
-        return self.arm.window.mint();
+        return m.answer;
     }
 
     fn giveBack(ctx: *anyopaque, idx: u64) bool {
@@ -224,9 +231,11 @@ pub const HolderPlane = struct {
         v.grants = .{ .ledger = try block_grant.Ledger.init(gpa, LEDGER_CAPACITY), .bitmap = v.bitmap };
         v.frees = .{ .alloc = r.alloc, .durable = .{ .ctx = v, .refcount = &durableRefcount }, .ladder = .{ .ctx = v, .free = &ladderFree } };
         v.handlers = .{ .vol_tag = r.vol_tag, .grants = &v.grants, .frees = &v.frees, .writer_ctx = self, .writerId = &writerIdFn };
-        v.own_sink = .{ .holder = &v.grants, .writer = HOLDER_WRITER };
+        // The own window is bound to its sink: every top-up retires the
+        // grants it consumed (the ledger holds OPEN grants only).
+        v.own_sink = .{ .holder = &v.grants, .writer = HOLDER_WRITER, .window = &v.own.window };
         v.own.sink = v.own_sink.sink();
-        v.own_src = .{ .arm = &v.own };
+        v.own_src = .{ .arm = &v.own, .alloc = r.alloc, .io = self.io };
         // The holder's bits and frees: the bitmap's finish-free sink
         // clears a carved bit; the shipped-free executor adjudicates
         // the untracked class; the mint source is the own window.
@@ -388,8 +397,10 @@ pub const WriterPlane = struct {
                 .shipper = .{ .vol_tag = r.vol_tag, .tracking = .{ .ctx = v, .purge = &trackPurge, .retire = &trackRetire, .release = &trackRelease }, .lease_epoch = .{ .ctx = v, .epoch = &leaseEpoch } },
                 .writer = self,
             };
-            v.arm.sink = .{ .ctx = v, .ask = &askGrant };
-            v.src = .{ .arm = &v.arm };
+            // The wire ask parks on its round trip: a lost single-flight
+            // latch at an empty window is the retryable class, never a wait.
+            v.arm.sink = .{ .ctx = v, .ask = &askGrant, .inline_answer = false };
+            v.src = .{ .arm = &v.arm, .alloc = r.alloc, .io = io };
             v.shipper.client = .{ .ctx = v, .send = &sendFrees, .resolve = &resolveHolder };
             r.alloc.grant_source = v.src.source();
             r.alloc.lease = .{ .ctx = v, .vtable = &writer_lease_vtable };

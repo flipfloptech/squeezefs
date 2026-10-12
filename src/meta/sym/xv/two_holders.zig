@@ -155,6 +155,9 @@ pub const Holder = struct {
     /// A STALE view: this holder believes the other leases `slot`
     /// whatever its table says (the redirect contracts).
     assume_other_holds: ?u16 = null,
+    /// A DEAD view: the first resolution of `slot` names a holder with no
+    /// reachable listener (the dead lessee the manager has since replaced).
+    unreachable_once: ?u16 = null,
 
     fn other(self: *Holder) *Holder {
         return if (self.id == 1) &self.set.b else &self.set.a;
@@ -162,6 +165,10 @@ pub const Holder = struct {
 
     fn homeOf(ctx: *anyopaque, slot: u16) ops.Home {
         const self: *Holder = @ptrCast(@alignCast(ctx));
+        if (self.unreachable_once == slot) {
+            self.unreachable_once = null;
+            return .{ .unreachable_ = .{ .holder = 7 } };
+        }
         if (self.store.leases(slot)) return .{ .local = .{ .volume = 0 } };
         const o = self.other();
         if (o.store.leases(slot) or self.assume_other_holds == slot) return .{ .foreign = .{ .holder = o.id, .link = linkOf(&self.conn) } };
@@ -531,6 +538,50 @@ test "a shipped step refused SlotMoved at its holder is re-dispatched ONCE after
     try testing.expect((try f.b.dentry(DIR_B, "f")) != null);
     try testing.expectEqual(retries0 + 1, ops.stats.xv_cross_owner_step_slot_moved_retries.load());
     try testing.expectEqual(@as(u32, 1), f.refreshes);
+    try f.noOpenIntents();
+}
+
+test "a holder that cannot be reached is re-resolved before the ship is given up (found by the shared hot directory row: a creator dialled the killed holder of a stripe the manager had recovered until its intents stood past the TTL): the step lands at the holder the re-resolve names, in the same plan; a slot still unreachable after the retries leaves the intent open, counted abandoned" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    // The plan's guards travel under a live view; the step's own
+    // resolution then meets the dead holder.
+    {
+        const plan = steps.planCreate(.{ .parent = DIR_B, .name = "f", .child = f.a.mint(), .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+        const scope = f.a.plane.mintScope();
+        var held = try f.a.plane.acquirePlanGuards(&plan, scope, false);
+        defer held.release(gpa);
+        f.a.unreachable_once = 3;
+        const refreshes0 = f.refreshes;
+        const done = try f.a.plane.execute(&plan, scope, 1_000);
+        try testing.expect(done.refused == null);
+        try testing.expectEqual(refreshes0 + 1, f.refreshes);
+    }
+    try testing.expect((try f.b.dentry(DIR_B, "f")) != null);
+    try f.noOpenIntents();
+    // Nobody leases the slot through every re-resolve: the ship is given
+    // up after the retries, the intent left open for the roll-forward.
+    const abandoned0 = ops.stats.xv_abandoned.load();
+    {
+        const plan = steps.planCreate(.{ .parent = DIR_B, .name = "g", .child = f.a.mint(), .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 });
+        const scope = f.a.plane.mintScope();
+        var held = try f.a.plane.acquirePlanGuards(&plan, scope, false);
+        defer held.release(gpa);
+        const i = std.mem.indexOfScalar(u16, f.b.store.leased.items, 3).?;
+        _ = f.b.store.leased.swapRemove(i);
+        const refreshes1 = f.refreshes;
+        try testing.expectError(error.ShipFailed, f.a.plane.execute(&plan, scope, 1_000));
+        try testing.expectEqual(refreshes1 + ops.SLOT_MOVED_RETRIES, f.refreshes);
+    }
+    try testing.expectEqual(abandoned0 + 1, ops.stats.xv_abandoned.load());
+    try testing.expect(f.a.plane.register.anyAbandoned());
+    // The slot's holder is back (the manager re-leased it): the roll-
+    // forward lands the open intent there.
+    try f.b.store.leased.append(gpa, 3);
+    try testing.expectEqual(@as(u32, 1), try f.a.plane.cadenceTick(clock.monotonicNs()));
+    try testing.expect((try f.b.dentry(DIR_B, "g")) != null);
     try f.noOpenIntents();
 }
 

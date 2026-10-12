@@ -289,6 +289,9 @@ pub fn Plane(comptime Store: type) type {
         scope_seq: std.atomic.Value(u64) = .init(1),
         ships: std.atomic.Value(u32) = .init(0),
         serve_moved_armed: std.atomic.Value(bool),
+        /// The ship seam fired on the last ship (its failure is terminal,
+        /// never re-resolved).
+        seam_fired: std.atomic.Value(bool) = .init(false),
         /// The cadence's last pass stamp (a pass runs only while the
         /// register holds an abandoned intent).
         last_pass_ns: u64 = 0,
@@ -569,7 +572,12 @@ pub fn Plane(comptime Store: type) type {
 
         /// Dispatch one step: own slot ⇒ the local applier; foreign ⇒ ONE
         /// `XvStep` to the holder; a `SlotMoved` answer from either arm
-        /// re-resolves at the manager and dispatches again, ≤ 2.
+        /// re-resolves at the manager and dispatches again, ≤ 2. A holder
+        /// that cannot be reached (no endpoint, a lost connection — a DEAD
+        /// holder whose slot the manager has since recovered) is the same
+        /// class: the slot's home is re-resolved before the ship is given
+        /// up (the roll-forward of an intent left open by a death lands at
+        /// the slot's new home instead of dialling the dead one forever).
         fn dispatch(self: *Self, tx_id: u64, idx: usize, step: Step, rider: applier.Rider, scope: guards.Scope, now: u64, arm: Arm) Error!Dispatched {
             var tries: u32 = 0;
             const slot = route_table.slotOf(step.homeIno());
@@ -605,9 +613,23 @@ pub fn Plane(comptime Store: type) type {
                     },
                     .foreign => |f| {
                         if (arm == .local_only) return error.SlotMoved;
-                        if (try self.ship(f.link, tx_id, idx, step, scope)) |out| return .{ .out = out, .shipped = true };
+                        const shipped = self.ship(f.link, tx_id, idx, step, scope) catch |e| switch (e) {
+                            error.ShipFailed => blk: {
+                                if (self.seam_fired.swap(false, .acq_rel)) return error.ShipFailed;
+                                if (tries == SLOT_MOVED_RETRIES) {
+                                    stats.xv_abandoned.inc();
+                                    return error.ShipFailed;
+                                }
+                                break :blk null;
+                            },
+                            else => return e,
+                        };
+                        if (shipped) |out| return .{ .out = out, .shipped = true };
                     },
-                    .unreachable_ => return error.ShipFailed,
+                    .unreachable_ => if (tries == SLOT_MOVED_RETRIES) {
+                        stats.xv_abandoned.inc();
+                        return error.ShipFailed;
+                    },
                 }
                 // The slot-moved class from either arm.
                 if (tries == SLOT_MOVED_RETRIES) return error.SlotMoved;
@@ -656,8 +678,11 @@ pub fn Plane(comptime Store: type) type {
         /// slot-moved class (re-resolve). A lost connection is a failed ship.
         fn ship(self: *Self, link: Link, tx_id: u64, idx: usize, step: Step, scope: guards.Scope) Error!?Outcome {
             const n = self.ships.fetchAdd(1, .monotonic) + 1;
+            // The seam's failure is terminal for the plan (the row pins the
+            // intent left open): counted here, never re-resolved.
             if (self.seams.ship_fail_at != 0 and n == self.seams.ship_fail_at) {
                 stats.xv_abandoned.inc();
+                self.seam_fired.store(true, .release);
                 return error.ShipFailed;
             }
             stats.xv_cross_owner_steps_shipped.inc();
@@ -667,19 +692,13 @@ pub fn Plane(comptime Store: type) type {
                 error.StaleOwnerEra => {
                     // Retried ONCE with the same ids after the lane relearned the era.
                     stats.xv_cross_owner_step_stale_era_retries.inc();
-                    const again = link.call(link.ctx, .{ .xv_step = .{ .head = .{ .volume = self.volume, .step_idx = @intCast(idx), .reserved = 0, .tx_id = tx_id, .scope = scope, .step = rec.w }, .name = rec.name } }) catch {
-                        stats.xv_abandoned.inc();
-                        return error.ShipFailed;
-                    };
+                    const again = link.call(link.ctx, .{ .xv_step = .{ .head = .{ .volume = self.volume, .step_idx = @intCast(idx), .reserved = 0, .tx_id = tx_id, .scope = scope, .step = rec.w }, .name = rec.name } }) catch return error.ShipFailed;
                     return outcomeOf(again.xv_step);
                 },
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Deferred => return error.Deferred,
                 error.Rejected => return error.Corrupt,
-                else => {
-                    stats.xv_abandoned.inc();
-                    return error.ShipFailed;
-                },
+                else => return error.ShipFailed,
             };
             return outcomeOf(rep.xv_step);
         }

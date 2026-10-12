@@ -1657,9 +1657,16 @@ pub const DataPlane = struct {
         }, t);
         return switch (outcome) {
             .committed => |displaced| .{ .ok = true, .displaced = displaced },
-            .stale, .failed => |_, tag_| blk: {
+            .stale => blk: {
                 self.backend.abandon(t);
-                log.debug("promotion ino {d}: the pack commit answered {t}", .{ ino, tag_ });
+                log.debug("promotion ino {d}: the pack commit answered stale", .{ino});
+                break :blk .{ .ok = false };
+            },
+            .failed => |why| blk: {
+                // A failed COMMIT already consumed the tx (`KvBackend.commit`'s
+                // contract); only a failed publish leaves it ours to abandon.
+                if (why == .publish) self.backend.abandon(t);
+                log.debug("promotion ino {d}: the pack commit answered failed ({t})", .{ ino, why });
                 break :blk .{ .ok = false };
             },
         };

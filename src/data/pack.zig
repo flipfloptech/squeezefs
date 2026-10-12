@@ -343,6 +343,9 @@ pub const LookupSeam = struct {
 pub const CommitError = error{ CommitFailed, OutOfMemory };
 
 /// The KV backend's commit of a staged tx (`meta/backend.zig`'s conveyor).
+/// The backend's contract: `commit` CONSUMES the tx on every return — a
+/// failed commit has already abandoned it (`KvBackend.commit`), so the
+/// caller never touches it again.
 pub const CommitSeam = struct {
     ctx: *anyopaque,
     commit: *const fn (ctx: *anyopaque, t: *tx.KvTx) CommitError!void,
@@ -376,10 +379,21 @@ pub const CommitOutcome = union(enum) {
     /// the caller's to `releaseTenantRef` AFTER its locks drop.
     committed: ?Mapping,
     /// The identity moved (re-staged, promoted elsewhere, gone): the slot is
-    /// abandoned, nothing published.
+    /// abandoned, nothing published; the tx is untouched (the caller's).
     stale,
-    /// The KV commit failed: refs retracted with the tx, the slot abandoned.
-    failed,
+    /// The slot abandoned, nothing published; who still owns the tx is the
+    /// payload's word.
+    failed: Failed,
+
+    pub const Failed = enum {
+        /// The layout publish failed before any commit: the tx is live and
+        /// the caller's to abandon.
+        publish,
+        /// The KV commit failed: the conveyor CONSUMED the tx (refs
+        /// retracted with it) — abandoning it again was the dismount
+        /// double-free (a joiner promoting its packed files at `umount`).
+        commit,
+    };
 };
 
 pub const CommitCtx = struct {
@@ -720,11 +734,11 @@ pub const Packer = struct {
         const new = layout.Layout.packedTenant(@max(prev.size, prepared.image_len), c.file_id, prepared.mapping);
         layout.publishLayout(t, .{ .ino = c.ino, .name_key = c.name_key, .coll_seq = c.coll_seq, .prev = prev, .layout = new, .proofs = &.{prepared.proof} }, c.refs, c.geo) catch {
             self.releaseLandedSite(prepared.tenant);
-            return .failed;
+            return .{ .failed = .publish };
         };
         c.commit.commit(c.commit.ctx, t) catch {
             self.releaseLandedSite(prepared.tenant);
-            return .failed;
+            return .{ .failed = .commit };
         };
         _ = staging.releaseStaged(c.pool, c.seg, sk, c.generation);
         prepared.tenant.pack.landed();
@@ -1288,9 +1302,12 @@ const World = struct {
         return .{ .ctx = self, .commit = commitTx };
     }
 
-    /// Apply the tx's records to the RAM KV (the conveyor's effect).
+    /// Apply the tx's records to the RAM KV (the conveyor's effect); the
+    /// tx is CONSUMED on every return (`CommitSeam`'s contract — the
+    /// backend's conveyor does the same).
     fn commitTx(ctx: *anyopaque, t: *tx.KvTx) CommitError!void {
         const self: *World = @ptrCast(@alignCast(ctx));
+        defer t.deinit();
         if (self.commit_fail_next) {
             self.commit_fail_next = false;
             return error.CommitFailed;
@@ -1327,10 +1344,15 @@ const World = struct {
     /// Install a layout directly (the write path's staged publish).
     fn setLayout(self: *World, ino: u64, l: layout.Layout) !void {
         var t = tx.KvTx.init(self.gpa, @src());
-        defer t.deinit();
-        const buf = try self.gpa.alloc(u8, (layout.XattrLayout{ .layout = l }).encodedLen());
+        const buf = self.gpa.alloc(u8, (layout.XattrLayout{ .layout = l }).encodedLen()) catch |e| {
+            t.deinit();
+            return e;
+        };
         defer self.gpa.free(buf);
-        try t.stagePut(key.TREE_XATTRS, &layoutKey(ino), (layout.XattrLayout{ .layout = l }).encodeInto(buf));
+        t.stagePut(key.TREE_XATTRS, &layoutKey(ino), (layout.XattrLayout{ .layout = l }).encodeInto(buf)) catch |e| {
+            t.deinit();
+            return e;
+        };
         try commitTx(self, &t);
     }
 
@@ -1415,6 +1437,17 @@ const Fixture = struct {
         return out;
     }
 
+    /// The plane's arm over the outcome: the tx is abandoned only where the
+    /// outcome says the caller still owns it (`stale`, a failed publish);
+    /// the committed and commit-failed arms were consumed by the seam.
+    fn settleTx(out: CommitOutcome, t: *tx.KvTx) void {
+        switch (out) {
+            .committed => {},
+            .stale => t.deinit(),
+            .failed => |why| if (why == .publish) t.deinit(),
+        }
+    }
+
     /// The ONE primitive: read the ring image, prepare, commit.
     fn promote(self: *Fixture, io: Io, ino: u64, seed: u8, generation: u64) !CommitOutcome {
         const k: PackKey = .{ .vol_tag = 0x11, .scope = 0 };
@@ -1422,8 +1455,9 @@ const Fixture = struct {
         defer lease.release();
         const prepared = (try self.packer.prepare(io, k, lease.bytes(), 1)) orelse return error.ArmStopped;
         var t = tx.KvTx.init(self.world.gpa, @src());
-        defer t.deinit();
-        return self.commit(io, prepared, self.ctx(ino, seed, generation), &t);
+        const out = self.commit(io, prepared, self.ctx(ino, seed, generation), &t);
+        settleTx(out, &t);
+        return out;
     }
 };
 
@@ -1517,9 +1551,12 @@ test "commitLocked re-checks the identity under the caller's stripe + layout loc
     const prepared3 = (try f.packer.prepare(io, k, lease3.bytes(), 1)).?;
     lease3.release();
     f.world.commit_fail_next = true;
+    // The failed COMMIT consumed the tx (the seam's contract): the outcome
+    // says so, and the caller abandons nothing — the dismount double-free.
     var t3 = tx.KvTx.init(gpa, @src());
-    defer t3.deinit();
-    try testing.expectEqual(std.meta.Tag(CommitOutcome).failed, std.meta.activeTag(f.commit(io, prepared3, f.ctx(20, 1, g2), &t3)));
+    const failed = f.commit(io, prepared3, f.ctx(20, 1, g2), &t3);
+    try testing.expectEqual(CommitOutcome{ .failed = .commit }, failed);
+    Fixture.settleTx(failed, &t3);
     try testing.expectEqual(@as(u32, 0), f.world.durableRefcount(0x11, 0));
     try testing.expectEqual(layout.Kind.staged, World.current(&f.world, 20).?.kind);
     try testing.expect(f.seg.get(staging.StagingKey.init(Fixture.fid(1), 20)) != null);

@@ -317,6 +317,12 @@ const JoinedHalf = struct {
             cursor = pg.head.next;
         }
         self.census.commit(grace_open, now);
+        // The joiner's death fan-out: the census is the only word it gets
+        // of an eviction, so the token holder sweeps against it at once —
+        // a recall waiting on the dead reader completes now, not at the
+        // pass's next expiry tick (11.25 s, past every caller's reply
+        // bound while the pass holds a served step).
+        _ = self.plane.holder.sweepExpired(self.plane.io, clock.monotonicNs());
     }
 
     fn selfLive(ctx: ?*anyopaque, _: u64) bool {
@@ -1540,12 +1546,15 @@ const LeaseOracle = struct {
         };
     }
 
-    /// The token lane's verdict: the asking client is in contact NOW, so
-    /// a census that does not list it is older than its join — unknown,
-    /// never a refusal.
-    fn verdict(ctx: ?*anyopaque, client: tokens.table.ClientId, now_ns: u64) tokens.table.LeaseVerdict {
+    /// The token lane's verdict: `since_ns` is the client's last grant
+    /// ask (`now` for an ask in hand — a census that does not list an
+    /// asking client is older than its join: unknown, never a refusal); a
+    /// census newer than a reader's last ask that does not list it is its
+    /// eviction, so a recall to a corpse completes at the census instead
+    /// of the 45 s deadline.
+    fn verdict(ctx: ?*anyopaque, client: tokens.table.ClientId, since_ns: u64, now_ns: u64) tokens.table.LeaseVerdict {
         const self: *LeaseOracle = @ptrCast(@alignCast(ctx.?));
-        return self.word(client, now_ns, now_ns);
+        return self.word(client, since_ns, now_ns);
     }
 
     /// The parked guard scopes' face (`xv.guards.Liveness`): a scope's
@@ -1955,7 +1964,7 @@ test "linux: the daemon's wire plane over a real symmetric set — the listener 
         try testing.expectEqual(renewals0 + 1, shard.stats.membership_renewals.load());
         try testing.expectEqual(shard.Liveness.live, plane.mgr.?.owner.liveness(member.id, now + plane.mgr.?.owner.clocks.renew_ms + 1));
         // The token holder's lease oracle sees the member as live.
-        try testing.expectEqual(tokens.table.LeaseVerdict.live, plane.oracle.oracle().verdict(plane.oracle.oracle().ctx, clientIdOf(member.id), 0));
+        try testing.expectEqual(tokens.table.LeaseVerdict.live, plane.oracle.oracle().verdict(plane.oracle.oracle().ctx, clientIdOf(member.id), 0, 0));
         // The clean leave: the region Free, the member gone, its row deleted.
         try member.leave();
         for (joiner.leased.items) |l| {

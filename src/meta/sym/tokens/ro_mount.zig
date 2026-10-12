@@ -172,7 +172,9 @@ pub const OwnerLeases = struct {
         return .{ .ctx = self, .verdict = &verdictFn, .remaining = &remainingFn };
     }
 
-    fn verdictFn(ctx: ?*anyopaque, client: table.ClientId, now_ns: u64) table.LeaseVerdict {
+    /// The owner's own table: a member it does not list has left,
+    /// whatever the client's last contact (`since_ns` unread).
+    fn verdictFn(ctx: ?*anyopaque, client: table.ClientId, _: u64, now_ns: u64) table.LeaseVerdict {
         const self: *OwnerLeases = @ptrCast(@alignCast(ctx.?));
         self.lock.lock();
         defer self.lock.unlock();
@@ -516,13 +518,13 @@ test "the member lease: T_owner from the grant; the owner's table answers live/e
     var ol = OwnerLeases.init(testing.allocator);
     defer ol.deinit();
     const o = ol.oracle();
-    try testing.expectEqual(table.LeaseVerdict.expired, o.verdict(o.ctx, 5, 0));
+    try testing.expectEqual(table.LeaseVerdict.expired, o.verdict(o.ctx, 5, 0, 0));
     try ol.grant(5, 10);
-    try testing.expectEqual(table.LeaseVerdict.live, o.verdict(o.ctx, 5, 10));
+    try testing.expectEqual(table.LeaseVerdict.live, o.verdict(o.ctx, 5, 10, 10));
     try testing.expectEqual(@as(?u64, table.T_OWNER_NS - 5), o.remaining(o.ctx, 5, 15));
-    try testing.expectEqual(table.LeaseVerdict.expired, o.verdict(o.ctx, 5, 10 + table.T_OWNER_NS));
+    try testing.expectEqual(table.LeaseVerdict.expired, o.verdict(o.ctx, 5, 10, 10 + table.T_OWNER_NS));
     ol.remove(5);
-    try testing.expectEqual(table.LeaseVerdict.expired, o.verdict(o.ctx, 5, 10));
+    try testing.expectEqual(table.LeaseVerdict.expired, o.verdict(o.ctx, 5, 10, 10));
 }
 
 test "every reader TTL derives to 0 under tokens; an explicit -o *_timeout on a token reader refuses loud naming the law" {

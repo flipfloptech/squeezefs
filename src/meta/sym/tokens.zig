@@ -91,6 +91,7 @@ const key = @import("../key.zig");
 const inos = @import("../inos.zig");
 const route_table = @import("../routing/route_table.zig");
 const jc = @import("../journal_core.zig");
+const census_view = @import("membership/census_view.zig");
 
 test {
     _ = table;
@@ -761,6 +762,102 @@ test "an unacked recall completes at the reader's lease expiry (expired_with_lea
     f.holder.noteMemberDeparted(io, 2);
     try testing.expectEqual(swept0 + 1, table.stats.dlm_token_lease_swept_grants.load());
     try testing.expectEqual(@as(u64, 0), f.holder.outstandingGrants(io));
+}
+
+/// The joiner's lease face as `wire_plane.LeaseOracle` binds it: every
+/// member but the manager is judged by the owner's census as the beat
+/// last pulled it.
+const CensusOracle = struct {
+    view: census_view.CensusView,
+
+    fn oracle(self: *CensusOracle) table.LeaseOracle {
+        return .{ .ctx = self, .verdict = &verdictFn, .remaining = &noRemaining };
+    }
+    fn verdictFn(ctx: ?*anyopaque, client: table.ClientId, since_ns: u64, now_ns: u64) table.LeaseVerdict {
+        const self: *CensusOracle = @ptrCast(@alignCast(ctx.?));
+        return self.view.verdict(client, since_ns, now_ns);
+    }
+    fn noRemaining(_: ?*anyopaque, _: table.ClientId, _: u64) ?u64 {
+        return null;
+    }
+};
+
+/// A pass on its own thread (the conveyor's A1½ under a served step).
+const PassThread = struct {
+    f: *TwoMembers,
+    object: u64,
+    sum: ?table.RecallSummary = null,
+    waited_ns: u64 = 0,
+    fn run(self: *PassThread) void {
+        const t0 = clock.monotonicNs();
+        self.sum = self.f.commit(&.{self.object}, &bumpMtime) catch null;
+        self.waited_ns = clock.monotonicNs() - t0;
+    }
+};
+
+test "a joiner's holder and a reader the owner evicted (found by the shared hot directory row: C's served step parked 45 s on a recall to the killed B): the census pulled after the reader's last grant no longer lists it ⇒ the pass sweeps its grant before recalling anyone (lease_swept, timeouts_live 0), nothing waits the deadline; a recall ALREADY waiting completes at the census commit's sweep, not at the pass's next expiry tick; an asking client a stale census does not list is never refused" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 2);
+    defer f.deinit();
+    var co: CensusOracle = .{ .view = census_view.CensusView.init(gpa, io) };
+    defer co.view.deinit();
+    // A view that answers for the whole test (two renew intervals).
+    co.view.setRenewInterval(table.T_OWNER_NS);
+    f.holder.oracle = co.oracle();
+    // The deadline a corpse used to cost, shortened so the red run ends.
+    f.holder.seams.recall_deadline_ns = 4 * std.time.ns_per_s;
+    // The view before the grants lists both readers.
+    try co.view.stage(1, .live);
+    try co.view.stage(2, .live);
+    co.view.commit(false, clock.monotonicNs());
+    var s = (try f.reader(0).serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    // B1 dies: unreachable, and the next census (newer than its grant,
+    // the owner's grace window closed) no longer lists it.
+    f.peers.unreachable_[0] = true;
+    try co.view.stage(2, .live);
+    co.view.commit(false, clock.monotonicNs() + 1);
+    const live0 = table.stats.dlm_token_recall_timeouts_live.load();
+    const swept0 = table.stats.dlm_token_lease_swept_grants.load();
+    const t0 = clock.monotonicNs();
+    const sum = try f.commit(&.{objectOf(3)}, &bumpMtime);
+    const waited = clock.monotonicNs() - t0;
+    // The pass's A1½ sweeps the corpse's grant before it recalls anyone.
+    try testing.expectEqual(@as(u32, 0), sum.recalled);
+    try testing.expectEqual(swept0 + 1, table.stats.dlm_token_lease_swept_grants.load());
+    try testing.expectEqual(live0, table.stats.dlm_token_recall_timeouts_live.load());
+    try testing.expect(waited < f.holder.recallDeadlineNs() / 2);
+    try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 1));
+    // A reader the census has never listed (it joined after the pull)
+    // asks: in contact now, so the stale view's silence is no refusal.
+    s = (try f.reader(0).serve(io, objectOf(4), .{})).?;
+    s.release(io);
+    try testing.expect(f.holder.holdsGrant(io, objectOf(4), 1));
+    // B2 holds object 3, then dies while a pass recalls it: the pass waits
+    // (the census still lists B2), the next census drops it, and the
+    // commit's sweep wakes the pass — far inside the 45 s deadline's
+    // 11.25 s tick.
+    f.holder.seams.recall_deadline_ns = 0;
+    s = (try f.reader(1).serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    f.peers.unreachable_[1] = true;
+    const batches0 = table.stats.dlm_token_recall_batches.load();
+    var pass: PassThread = .{ .f = f, .object = objectOf(3) };
+    const t = try std.Thread.spawn(.{}, PassThread.run, .{&pass});
+    var spins: u32 = 0;
+    while (table.stats.dlm_token_recall_batches.load() == batches0) : (spins += 1) {
+        try testing.expect(spins < 10_000_000);
+        std.Thread.yield() catch {};
+    }
+    try testing.expectEqual(@as(u32, 0), f.holder.sweepExpired(io, clock.monotonicNs()));
+    co.view.commit(false, clock.monotonicNs() + 1);
+    try testing.expect(f.holder.sweepExpired(io, clock.monotonicNs()) >= 1);
+    t.join();
+    try testing.expectEqual(@as(u32, 1), pass.sum.?.expired_with_lease);
+    try testing.expect(pass.waited_ns < table.expiryTickNs(table.RECALL_DEADLINE_NS) / 2);
+    try testing.expect(!f.holder.holdsGrant(io, objectOf(3), 2));
+    try testing.expectEqual(live0, table.stats.dlm_token_recall_timeouts_live.load());
 }
 
 test "a recall unacked by a LIVE member past the deadline is the must-stay-0 (dlm_token_recall_timeouts_live fires once); the token is retired and the commit proceeds" {

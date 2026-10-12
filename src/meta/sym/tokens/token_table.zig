@@ -166,14 +166,18 @@ pub const LeaseVerdict = enum { live, expired, unknown };
 
 pub const LeaseOracle = struct {
     ctx: ?*anyopaque,
-    verdict: *const fn (ctx: ?*anyopaque, client: ClientId, now_ns: u64) LeaseVerdict,
+    /// `since_ns`: the instant the client was last in contact with this
+    /// holder (its latest grant ask; `now_ns` for an ask in hand) — a
+    /// word OLDER than that contact cannot call the client's absence a
+    /// death (a joiner's census view; the owner's roster ignores it).
+    verdict: *const fn (ctx: ?*anyopaque, client: ClientId, since_ns: u64, now_ns: u64) LeaseVerdict,
     /// Remaining ns of a live lease at `now`; null = unknown.
     remaining: *const fn (ctx: ?*anyopaque, client: ClientId, now_ns: u64) ?u64,
 
     /// No owner installed: every client unknown.
     pub const none: LeaseOracle = .{ .ctx = null, .verdict = &unknownVerdict, .remaining = &noRemaining };
 
-    fn unknownVerdict(_: ?*anyopaque, _: ClientId, _: u64) LeaseVerdict {
+    fn unknownVerdict(_: ?*anyopaque, _: ClientId, _: u64, _: u64) LeaseVerdict {
         return .unknown;
     }
     fn noRemaining(_: ?*anyopaque, _: ClientId, _: u64) ?u64 {
@@ -415,6 +419,8 @@ const Frame = struct {
 
 const Client = struct {
     grants: u32 = 0,
+    /// The client's latest grant ask (the lease oracle's `since_ns`).
+    contact_ns: u64 = 0,
     /// At most ONE in-flight frame per client: the pass is serialized per
     /// volume and waits for the frames it issued before it proceeds.
     frame: ?Frame = null,
@@ -514,13 +520,15 @@ pub const Holder = struct {
 
     // ---- the lane (every function below runs under `lock`) ----
 
-    /// Register `(object, client)`; true when it was already held.
-    fn registerLocked(self: *Holder, object: Object, client: ClientId) Error!bool {
+    /// Register `(object, client)` asked at `now_ns`; true when it was
+    /// already held.
+    fn registerLocked(self: *Holder, object: Object, client: ClientId, now_ns: u64) Error!bool {
         const c = self.clients.getPtr(client) orelse blk: {
             if (self.clients.count() >= self.cap_clients) return error.TableFull;
             self.clients.putAssumeCapacity(client, .{});
             break :blk self.clients.getPtr(client).?;
         };
+        c.contact_ns = @max(c.contact_ns, now_ns);
         const h = self.objects.getPtr(object) orelse blk: {
             if (self.objects.count() >= self.cap_objects) return error.TableFull;
             self.objects.putAssumeCapacity(object, .{});
@@ -589,9 +597,9 @@ pub const Holder = struct {
     fn sweepExpiredLocked(self: *Holder, now_ns: u64, summary: ?*RecallSummary) void {
         var expired: std.ArrayListUnmanaged(ClientId) = .empty;
         defer expired.deinit(self.gpa);
-        var it = self.clients.keyIterator();
-        while (it.next()) |c| {
-            if (self.oracle.verdict(self.oracle.ctx, c.*, now_ns) == .expired) expired.append(self.gpa, c.*) catch break;
+        var it = self.clients.iterator();
+        while (it.next()) |e| {
+            if (self.oracle.verdict(self.oracle.ctx, e.key_ptr.*, e.value_ptr.contact_ns, now_ns) == .expired) expired.append(self.gpa, e.key_ptr.*) catch break;
         }
         for (expired.items) |c| self.sweepClientLocked(c, summary);
     }
@@ -607,7 +615,7 @@ pub const Holder = struct {
             if (e.value_ptr.frame) |f| if (now_ns >= f.deadline_ns) overdue.append(self.gpa, e.key_ptr.*) catch break;
         }
         for (overdue.items) |c| {
-            const verdict = self.oracle.verdict(self.oracle.ctx, c, now_ns);
+            const verdict = self.oracle.verdict(self.oracle.ctx, c, self.clients.get(c).?.contact_ns, now_ns);
             const n = self.retireFrameLocked(c);
             if (verdict == .live) {
                 stats.dlm_token_recall_timeouts_live.fire("a recall stood unacked past the lease TTL by a member the owner lists LIVE; the token is retired and the commit proceeds");
@@ -707,6 +715,9 @@ pub const Holder = struct {
         }
         // Wait for the recalls this pass ISSUED: a grant registered after
         // the union went in flight is parked on the gate, never counted.
+        // The owner's word is read AFTER the wake is armed (register-then-
+        // check): a census that lands between the two is swept here, one
+        // that lands after wakes the wait (`sweepExpired`).
         while (true) {
             var n = self.ack_wake.notified();
             const pre = n.enable(io);
@@ -714,18 +725,16 @@ pub const Holder = struct {
             {
                 self.lock.lockUncancelable(io);
                 defer self.lock.unlock(io);
+                const now = clock.monotonicNs();
+                self.sweepExpiredLocked(now, &summary);
+                self.expireOverdueLocked(now, &summary);
                 if (self.outstandingLocked(objects) == 0) {
                     n.cancel(io);
                     break;
                 }
-                wake_at = self.nextWakeLocked(clock.monotonicNs());
+                wake_at = self.nextWakeLocked(now);
             }
             if (!pre) _ = n.waitUntilUncancelable(io, wake_at) else n.cancel(io);
-            const now = clock.monotonicNs();
-            self.lock.lockUncancelable(io);
-            defer self.lock.unlock(io);
-            self.sweepExpiredLocked(now, &summary);
-            self.expireOverdueLocked(now, &summary);
         }
         const t_end = clock.monotonicNs();
         // The exact-sum cuts: clamp monotone into [t0, t_end].
@@ -792,6 +801,32 @@ pub const Holder = struct {
         self.ack_wake.notifyWaiters(io);
     }
 
+    /// The lease sweep at a NEW word from the owner (a joiner's census
+    /// commit — a joiner hears no eviction, only the census that no longer
+    /// lists the member): every client the oracle now calls expired
+    /// against its last contact loses its grants; one with a recall in
+    /// flight is left to the pass, woken NOW (its own sweep retires the
+    /// frame into its summary) instead of at its next expiry tick.
+    /// Answers the clients judged expired.
+    pub fn sweepExpired(self: *Holder, io: Io, now_ns: u64) u32 {
+        var n: u32 = 0;
+        {
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            var expired: std.ArrayListUnmanaged(ClientId) = .empty;
+            defer expired.deinit(self.gpa);
+            var it = self.clients.iterator();
+            while (it.next()) |e| {
+                if (self.oracle.verdict(self.oracle.ctx, e.key_ptr.*, e.value_ptr.contact_ns, now_ns) != .expired) continue;
+                n += 1;
+                if (e.value_ptr.frame == null) expired.append(self.gpa, e.key_ptr.*) catch break;
+            }
+            for (expired.items) |c| self.sweepClientLocked(c, null);
+        }
+        if (n != 0) self.ack_wake.notifyWaiters(io);
+        return n;
+    }
+
     /// `Grant` (spec §1.3 G3): membership first, register-then-check, a
     /// pending recall of this `(client, object)` waited out, an object in
     /// flight parked to the settle (bounded by the recall deadline), the
@@ -800,7 +835,7 @@ pub const Holder = struct {
     /// `scratch` (the session's).
     pub fn serveGrant(self: *Holder, io: Io, ask: GrantAsk, source: RecordSource, scratch: []u8) Error!GrantReply {
         const now = clock.monotonicNs();
-        if (self.oracle.verdict(self.oracle.ctx, ask.client, now) == .expired) {
+        if (self.oracle.verdict(self.oracle.ctx, ask.client, now, now) == .expired) {
             stats.dlm_token_nonmember_refusals.fire("a member whose lease the owner lists EXPIRED asked for a grant");
             return .not_member;
         }
@@ -833,7 +868,7 @@ pub const Holder = struct {
             {
                 self.lock.lockUncancelable(io);
                 defer self.lock.unlock(io);
-                _ = try self.registerLocked(ask.object, ask.client);
+                _ = try self.registerLocked(ask.object, ask.client, now);
             }
             if (!try self.awaitSettled(io, ask.object, park_deadline)) {
                 self.retract(io, ask.object, ask.client);

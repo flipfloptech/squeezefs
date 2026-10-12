@@ -7,7 +7,12 @@
 //!   resolve the budget (pure) → open the backend (the D0 ladder's layer A:
 //!   the flock; a FAILED/refusal class is loud and names its errno through
 //!   the ONE table) → the set config (`set_config` in tree 0: present,
-//!   decodable, the stamp's set; every data volume's device read and
+//!   decodable, the stamp's set; a data volume with a `fabric_endpoint`
+//!   record is CONNECTED by the daemon under its own host identity first
+//!   — or a predecessor's association under that identity reused — and
+//!   its uri becomes the live node (`ops/nvmet/mount_fabric.zig`; the
+//!   §5.2 ladder judges every other volume under an explicit pair); every
+//!   data volume's device read and
 //!   checked against its record — the §5.4 URI-disagreement refusals; an
 //!   encrypted set resolves and verifies its key here — a wrong key file
 //!   refuses the mount instead of failing every read) → the handler
@@ -52,8 +57,11 @@
 //! (the dismount pass: staged files promote, packs seal DISMOUNT, the
 //! reclaimer drains, the devices close — charter §8 `umount`) →
 //! `KvBackend.close` (the final checkpoint: an empty replay window for the
-//! next mount) → exit 0; a volume that latched FAILED exits 1 naming the
-//! reason — AFTER the same `Session.close`, so its slots are released too.
+//! next mount) → the daemon's own fabric associations released
+//! (`disconnect --identity-only`: exactly the controllers of its records'
+//! subsystems under its pair, after every device fd closed) → exit 0; a
+//! volume that latched FAILED exits 1 naming the reason — AFTER the same
+//! `Session.close`, so its slots are released too.
 //!
 //! Every exit of `mountMain` runs that order: the stop latch (SIGTERM /
 //! SIGINT — what `squeezefs umount` sends, having found this daemon's pid
@@ -106,6 +114,7 @@ const errors = @import("../core/errors.zig");
 const log = @import("../core/log.zig");
 const keys = @import("../ops/keys.zig");
 const jobs = @import("../ops/jobs.zig");
+const mount_fabric = @import("../ops/nvmet/mount_fabric.zig");
 const proc = @import("../meta/guard/proc.zig");
 const sym_join = @import("../meta/sym/join.zig");
 const checkpoint = @import("../meta/checkpoint.zig");
@@ -157,6 +166,10 @@ const Ctx = struct {
     /// `--encrypt-key`'s material, read in the INVOKING process before any
     /// fork (`ops/keys.zig`): consumed and zeroized by `loadSetConfig`.
     stash: ?*keys.SecretBuf = null,
+    /// The daemon-owned fabric associations of the data volumes with a
+    /// `fabric_endpoint` record (`ops/nvmet/mount_fabric.zig`): bound by
+    /// `loadSetConfig` before discovery, released after the plane closed.
+    fabric: mount_fabric.Plan,
 
     /// Report a bring-up failure: the log, stderr (foreground) or the
     /// supervisor pipe (daemon); exit 1.
@@ -324,7 +337,9 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .join = m.join,
         .reporter = reporter,
         .stash = stash,
+        .fabric = mount_fabric.Plan.init(p.gpa),
     };
+    defer ctx.fabric.deinit();
     return sqz.run(mountMain, .{&ctx}) catch |e| ctx.failed("the root task could not start ({s})", .{@errorName(e)});
 }
 
@@ -350,6 +365,10 @@ fn mountMain(ctx: *Ctx) u8 {
     }) catch |e| return ctx.failed("cannot open metadata set {s}: {s} ({t}, {s})", .{ ctx.meta_uri, openReason(e), meta_set.openErrno(e), @tagName(errors.classOf(meta_set.openCoreError(e))) });
     var be_open = true;
     defer if (be_open) be.close();
+    // The daemon's own fabric associations go AFTER the plane closed its
+    // device fds (this `defer` sits below the plane's) and before the
+    // metadata set (which they never served).
+    defer ctx.fabric.release();
     // Every volume's node cache is an R5 component (`kv_node_cache`: floor
     // 64 MiB, weight 1, shed = a checkpoint kick): rung 9 found the caches
     // unregistered — their RAM was the largest unaccounted part of Σ gauges
@@ -407,6 +426,7 @@ fn mountMain(ctx: *Ctx) u8 {
         .cfg = &cfg,
     };
     defer vs.renderer.deinit();
+    vs.renderer.sources.fabric = &ctx.fabric;
     fs.bindVirtual(vs.face());
     op_trace.armTrace(gpa, env, facts.possible_cpus, ctx.budget_bytes) catch return ctx.failed("out of memory (op-trace ring)", .{});
     defer op_trace.disarmTrace();
@@ -783,6 +803,23 @@ fn loadSetConfig(ctx: *Ctx, be: *meta_set.MetaSet) ?set_config.Config {
         _ = ctx.failed("{s}: {s}", .{ ctx.meta_uri, w.buffered() });
         return null;
     };
+    {
+        // The fabric plane BEFORE discovery: a data volume with a
+        // `fabric_endpoint` record is connected (or its predecessor's
+        // association reused) under this mount's identity and its uri
+        // becomes the live node; the §5.2 ladder judges every other volume
+        // under an explicit pair. Discovery's superblock read right after
+        // is the identity law for what the connect brought up.
+        var fdiag: mount_fabric.Refusal = undefined;
+        ctx.fabric.bind(ctx.p.env, &cfg, ctx.paths, ctx.mountpoint, &fdiag) catch {
+            var buf: [1024]u8 = undefined;
+            var w: Io.Writer = .fixed(&buf);
+            fdiag.write(&w) catch {};
+            _ = ctx.failed("fabric: {s}", .{w.buffered()});
+            cfg.deinit(gpa);
+            return null;
+        };
+    }
     {
         // Every data device read once (O_DIRECT, both superblock copies)
         // and released: the data plane's own opens come with its wiring.

@@ -310,16 +310,23 @@ pub fn build(b: *std.Build) void {
     //      kernel nvmet target (loop + tcp), zero mocks; after the shim
     //      smoke (one mount on the venue at a time); skips loudly off the
     //      venue ----
+    // `-Dnvmet-filter=<text>` narrows the tier to the legs whose name
+    // contains the text (filters OR together, so the text replaces the
+    // tier's prefix — spell `nvmet fidelity: <leg>`) and drops the gate's
+    // ordering (a developer's single leg, not the per-commit run).
+    const nvmet_filter = b.option([]const u8, "nvmet-filter", "Run only the nvmet fidelity legs whose name contains this text (skips the gate's smoke ordering)");
     const nvmet_smoke_tests = b.addTest(.{
         .name = "squeezefs-nvmet-smoke",
         .root_module = squeezefs_mod,
-        .filters = &.{"nvmet fidelity:"},
+        .filters = &.{nvmet_filter orelse "nvmet fidelity:"},
     });
     const run_nvmet_smoke = gated(b.addRunArtifact(nvmet_smoke_tests), release_gate);
     run_nvmet_smoke.setCwd(exe.getEmittedBinDirectory());
     run_nvmet_smoke.has_side_effects = true;
-    run_nvmet_smoke.step.dependOn(&run_bench_smoke.step);
-    if (shim_dir != null) run_nvmet_smoke.step.dependOn(shim_smoke_step);
+    if (nvmet_filter == null) {
+        run_nvmet_smoke.step.dependOn(&run_bench_smoke.step);
+        if (shim_dir != null) run_nvmet_smoke.step.dependOn(shim_smoke_step);
+    }
     const nvmet_smoke_step = b.step("nvmet-smoke", "Run the nvmeof fidelity tier (share/connect/format/mount/PR legs on the kernel nvmet target)");
     nvmet_smoke_step.dependOn(&run_nvmet_smoke.step);
 

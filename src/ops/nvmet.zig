@@ -5,7 +5,8 @@
 //! intent share ledger (`ledger.zig`), the verbs `share / unshare / list /
 //! restore / adopt / target *` (`verbs.zig`), the initiator over
 //! `/dev/nvme-fabrics` with identity, discovery and the `fabric_*` sampler
-//! (`initiator.zig`), the `storage` census (`storage.zig`), the real
+//! (`initiator.zig`), the daemon-owned data-plane connect at mount and
+//! its release at umount (`mount_fabric.zig`), the `storage` census (`storage.zig`), the real
 //! reservation matrix on nvmet-loop and nvmet-tcp (`pr_legs.zig`) and the
 //! fidelity tier that stands the fabric up through the product's own
 //! verbs with zero mocks (`fidelity.zig`, `zig build nvmet-smoke`).
@@ -21,6 +22,7 @@ pub const stats = @import("nvmet/stats.zig");
 pub const configfs = @import("nvmet/configfs.zig");
 pub const ledger = @import("nvmet/ledger.zig");
 pub const initiator = @import("nvmet/initiator.zig");
+pub const mount_fabric = @import("nvmet/mount_fabric.zig");
 pub const verbs = @import("nvmet/verbs.zig");
 pub const storage = @import("nvmet/storage.zig");
 pub const pr_legs = @import("nvmet/pr_legs.zig");
@@ -32,6 +34,7 @@ test {
     _ = configfs;
     _ = ledger;
     _ = initiator;
+    _ = mount_fabric;
     _ = verbs;
     _ = storage;
     _ = pr_legs;

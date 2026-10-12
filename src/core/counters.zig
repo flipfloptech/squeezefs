@@ -387,6 +387,14 @@ pub fn writeFieldsJson(ptr: anytype, w: *std.Io.Writer) std.Io.Writer.Error!void
 /// non-instrument declarations (functions, types, seams) are skipped.
 pub fn writeNamespaceJson(comptime Ns: type, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeByte('{');
+    _ = try writeNamespaceEntries(Ns, w);
+    try w.writeByte('}');
+}
+
+/// The entries of `writeNamespaceJson` without the braces (a family that
+/// appends instance rows after the module's instruments); true iff any
+/// entry was written (the caller's comma).
+pub fn writeNamespaceEntries(comptime Ns: type, w: *std.Io.Writer) std.Io.Writer.Error!bool {
     var first = true;
     inline for (@typeInfo(Ns).@"struct".decl_names) |name| {
         const T = @TypeOf(@field(Ns, name));
@@ -396,7 +404,7 @@ pub fn writeNamespaceJson(comptime Ns: type, w: *std.Io.Writer) std.Io.Writer.Er
             try writeInstrumentEntry(T, name, &@field(Ns, name), w);
         }
     }
-    try w.writeByte('}');
+    return !first;
 }
 
 /// The instrument declarations of a namespace, by name (the inverse rail's

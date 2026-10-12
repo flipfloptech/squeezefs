@@ -377,6 +377,58 @@ const Rig = struct {
         return self.sqzOk(&.{ "nvmeof", "list", "--json" });
     }
 
+    /// `config set-fabric-endpoints` for the set's FIRST data volume: the
+    /// record that makes the data volume the daemon's own connect.
+    fn setDataEndpoint(self: *Rig, meta_uri: []const u8, transport: configfs.Trtype, port: u16, data_nqn: []const u8) !void {
+        const show = try self.sqzOk(&.{ "config", "show", "--json", meta_uri });
+        defer self.gpa.free(show);
+        const tag = json_scan.string(show, "vol_tag") orelse return error.NoVolTag;
+        var spec: [400]u8 = undefined;
+        const word = switch (transport) {
+            .tcp => try std.fmt.bufPrint(&spec, "{s}=tcp:127.0.0.1:{d}:{s}", .{ tag, port, data_nqn }),
+            .loop => try std.fmt.bufPrint(&spec, "{s}=loop:::{s}", .{ tag, data_nqn }),
+        };
+        const out = try self.sqzOk(&.{ "config", "set-fabric-endpoints", meta_uri, word });
+        defer self.gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "fabric endpoints set") != null);
+    }
+
+    /// The controllers of `nqn` under `ident`, deleted (a daemon's
+    /// leftovers after a kill -9 are the rig's to sweep); the count.
+    fn disconnectIdentity(self: *Rig, nqn: []const u8, ident: initiator.HostPair) !u32 {
+        const n = try initiator.disconnect(self.gpa, .{ .subsysnqn = nqn, .identity = .{ .hostnqn = ident.hostnqn, .hostid = ident.hostid } });
+        const deadline = clock.monotonicNs() + initiator.DISCONNECT_WAIT_S * std.time.ns_per_s;
+        while (clock.monotonicNs() < deadline) {
+            if ((try self.controllersOf(nqn, ident)) == 0) break;
+            sleepMs(50);
+        }
+        return n;
+    }
+
+    /// Live controllers of `nqn` carrying `ident` (null = any identity).
+    fn controllersOf(self: *Rig, nqn: []const u8, ident: ?initiator.HostPair) !u32 {
+        const ctrls = try initiator.listControllers(self.gpa, initiator.SYSFS_ROOT);
+        defer self.gpa.free(ctrls);
+        var n: u32 = 0;
+        for (ctrls) |c| {
+            if (!std.mem.eql(u8, c.subsysnqnOf(), nqn)) continue;
+            if (ident) |i| if (!c.hasIdentity(i.hostnqn, i.hostid)) continue;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// `/sys/class/nvme` as a sorted census of `nvme<N>` names, for the
+    /// "as it was" comparison around a mount.
+    fn controllerCensus(self: *Rig) ![]u8 {
+        const ctrls = try initiator.listControllers(self.gpa, initiator.SYSFS_ROOT);
+        defer self.gpa.free(ctrls);
+        var out: Io.Writer.Allocating = .init(self.gpa);
+        errdefer out.deinit();
+        for (ctrls) |c| try out.writer.print("{s}:{s}:{s}\n", .{ c.nameOf(), c.subsysnqnOf(), c.hostnqnOf() });
+        return out.toOwnedSlice();
+    }
+
     fn resvReportJson(self: *Rig, dev: []const u8) ![]u8 {
         return self.sqzOk(&.{ "nvmeof", "resv-report", "--json", dev });
     }
@@ -683,26 +735,70 @@ test "nvmet fidelity: pr-matrix-tcp — the same legs on nvmet-tcp, plus a regis
     try prMatrixLeg(.tcp);
 }
 
+/// A set whose data volume is the DAEMON's connect: meta + data shares,
+/// both connected by the operator for `format` (the data node's only use
+/// before the record), the data volume's `fabric_endpoint` record set,
+/// the operator's data association released — the daemon connects its
+/// own at mount.
+const DaemonSet = struct {
+    meta_nqn: []const u8,
+    data_nqn: []const u8,
+    cm: Connected,
+    meta_uri_buf: [64]u8 = undefined,
+    meta_uri_len: usize = 0,
+
+    fn metaUri(self: *const DaemonSet) []const u8 {
+        return self.meta_uri_buf[0..self.meta_uri_len];
+    }
+};
+
+fn daemonSet(rig: *Rig, prefix: []const u8, transport: configfs.Trtype, port_base: u16, format_extra: []const []const u8) !DaemonSet {
+    var mb: [64]u8 = undefined;
+    var db: [64]u8 = undefined;
+    const meta_nqn = try rig.share(try std.fmt.bufPrint(&mb, "{s}meta", .{prefix}), meta_len, transport, port_base);
+    const data_nqn = try rig.share(try std.fmt.bufPrint(&db, "{s}data", .{prefix}), data_len, transport, port_base + 1);
+    const cm = try rig.connect(meta_nqn, transport, port_base, null, &.{});
+    const cd = try rig.connect(data_nqn, transport, port_base + 1, null, &.{});
+    var out: DaemonSet = .{ .meta_nqn = meta_nqn, .data_nqn = data_nqn, .cm = cm };
+    out.meta_uri_len = (try std.fmt.bufPrint(&out.meta_uri_buf, "sqmeta://{s}", .{cm.dev()})).len;
+    var du: [64]u8 = undefined;
+    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
+    var argv: [12][]const u8 = undefined;
+    var n: usize = 0;
+    argv[n] = "format";
+    argv[n + 1] = "--single-writer";
+    n += 2;
+    for (format_extra) |e| {
+        argv[n] = e;
+        n += 1;
+    }
+    argv[n] = out.metaUri();
+    argv[n + 1] = data_uri;
+    n += 2;
+    const fmt_out = try rig.sqzOk(argv[0..n]);
+    defer rig.gpa.free(fmt_out);
+    try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
+    try rig.setDataEndpoint(out.metaUri(), transport, port_base + 1, data_nqn);
+    try rig.disconnect(&cd);
+    return out;
+}
+
 /// THE row (charter §8): meta + data shares → connect both → format on
-/// the connected namespaces → mount → PR armed → a second identity refused
-/// → kill -9 → remount through the own-stale ladder → umount → regctl 0.
+/// the connected namespaces → the data volume's endpoint record → mount
+/// (the daemon connects the data volume itself) → PR armed → a second
+/// identity refused → kill -9 → remount through the own-stale ladder
+/// (the data association REUSED) → umount → regctl 0, the association
+/// released.
 fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
     const gpa = testing.allocator;
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
-    const meta_nqn = try rig.share("meta", meta_len, transport, port_base);
-    const data_nqn = try rig.share("data", data_len, transport, port_base + 1);
-    const cm = try rig.connect(meta_nqn, transport, port_base, null, &.{});
-    const cd = try rig.connect(data_nqn, transport, port_base + 1, null, &.{});
-    var mu: [64]u8 = undefined;
-    var du: [64]u8 = undefined;
-    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
-    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
-    // Format on the connected namespaces (O_DIRECT; the grain from DIOALIGN).
-    const fmt_out = try rig.sqzOk(&.{ "format", "--single-writer", meta_uri, data_uri });
-    defer gpa.free(fmt_out);
-    try testing.expect(std.mem.indexOf(u8, fmt_out, "data volumes 1") != null);
-    // Mount A under the derived identity.
+    const set = try daemonSet(rig, "", transport, port_base, &.{});
+    const meta_nqn = set.meta_nqn;
+    const data_nqn = set.data_nqn;
+    const cm = set.cm;
+    const meta_uri = set.metaUri();
+    // Mount A under the rig's identity: the data volume is its own connect.
     const a = try rig.spawnMount("a", meta_uri, null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
     const st = try rig.stats(a);
@@ -712,6 +808,10 @@ fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
     try testing.expectEqual(@as(?u64, 1), json_scan.number(st, "pr_rtype"));
     try testing.expectEqual(@as(?u64, 1), json_scan.number(st, "pr_registrants_per_namespace"));
     try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "pr_own_stale_recoveries"));
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(st, "fabric_daemon_connects"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "fabric_daemon_reuses"));
+    try testing.expect(std.mem.indexOf(u8, st, data_nqn) != null);
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
     const pr_key = json_scan.string(st, "pr_key").?;
     // The device agrees: the holder IS the mount's key (through the ng twin
     // of the META connection, under the SAME association).
@@ -743,8 +843,10 @@ fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
     try rig.disconnect(&cm_b);
     // kill -9 → remount under the same identity: a DIFFERENT per-incarnation
     // key under the SAME host id — nvmet conflicts, the ladder unregisters
-    // exactly the stale one.
+    // exactly the stale one. The data association the killed daemon left
+    // (its pair, its subsystem) is REUSED, never a second connect.
     try rig.kill9(a);
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
     const a2 = try rig.spawnMount("a2", meta_uri, null, &.{});
     try rig.awaitLog(a2, "ready: ", ready_wait_ns);
     const st2 = try rig.stats(a2);
@@ -752,16 +854,23 @@ fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
     try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "pr_own_stale_recoveries"));
     try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "pr_registrants_per_namespace"));
     try testing.expectEqual(@as(?u64, 0), json_scan.number(st2, "writer_guard_fenced"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st2, "fabric_daemon_connects"));
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(st2, "fabric_daemon_reuses"));
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
     const sum2 = try rig.onMount(a2, "cksum payload | cut -d' ' -f1");
     defer gpa.free(sum2);
     try testing.expectEqualStrings(sum, sum2);
-    // umount: release + unregister = zero registrants.
+    // umount: release + unregister = zero registrants; the daemon's data
+    // association released with it.
     try rig.umount(a2);
     const rr2 = try rig.resvReportJson(cm.dev());
     defer gpa.free(rr2);
     try testing.expectEqual(@as(?u64, 0), json_scan.number(rr2, "regctl"));
     try testing.expectEqual(@as(?u64, 0), json_scan.number(rr2, "rtype"));
-    try rig.disconnect(&cd);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
+    const log2 = try rig.readLog(a2);
+    defer gpa.free(log2);
+    try testing.expect(std.mem.indexOf(u8, log2, "under this mount's identity released") != null);
     try rig.disconnect(&cm);
     try rig.unshare(data_nqn);
     try rig.unshare(meta_nqn);
@@ -769,7 +878,103 @@ fn mountLeg(transport: configfs.Trtype, port_base: u16) !void {
     try expectNoResidue(rig, data_nqn);
 }
 
-test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces; format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount recovers via the own-stale ladder (pr_own_stale_recoveries 1, payload intact) → umount → regctl 0 → disconnect → unshare" {
+/// The daemon-owned data-plane connect (the rung-8a3 owed row): a mount
+/// by endpoint record with NO pre-connected namespace connects, serves and
+/// disconnects leaving `/sys/class/nvme` as it was; without the record the
+/// §5.2 ladder refuses the mount naming the verb; a namespace ANOTHER
+/// identity connected is never touched by the daemon's release.
+fn daemonConnectLeg(transport: configfs.Trtype, port_base: u16) !void {
+    const gpa = testing.allocator;
+    var rig = try venue(gpa, testing.io);
+    defer rig.deinit();
+    const meta_nqn = try rig.share("dcmeta", meta_len, transport, port_base);
+    const data_nqn = try rig.share("dcdata", data_len, transport, port_base + 1);
+    const cm = try rig.connect(meta_nqn, transport, port_base, null, &.{});
+    const cd = try rig.connect(data_nqn, transport, port_base + 1, null, &.{});
+    var mu: [64]u8 = undefined;
+    var du: [64]u8 = undefined;
+    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
+    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
+    const fmt_out = try rig.sqzOk(&.{ "format", "--single-writer", meta_uri, data_uri });
+    gpa.free(fmt_out);
+    // RED: an explicit pair, a data volume with NO record — the ladder
+    // refuses UNIFORMLY (the operator's controller under the SAME pair
+    // included), naming the verb.
+    {
+        const r = try rig.spawnMount("dc-norec", meta_uri, null, &.{});
+        const dm = &rig.daemons.items[r];
+        const deadline = clock.monotonicNs() + ready_wait_ns;
+        while (alive(dm.pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        try testing.expect(!alive(dm.pid));
+        const term = try dm.child.wait(rig.io);
+        dm.reaped = true;
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+        const text = try rig.readLog(r);
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "set-fabric-endpoints") != null);
+    }
+    try rig.setDataEndpoint(meta_uri, transport, port_base + 1, data_nqn);
+    // The operator's data association released: NO pre-connected namespace.
+    try rig.disconnect(&cd);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
+    const before = try rig.controllerCensus();
+    defer gpa.free(before);
+    // The mount connects, serves, and its umount disconnects.
+    const a = try rig.spawnMount("dc-a", meta_uri, null, &.{});
+    try rig.awaitLog(a, "ready: ", ready_wait_ns);
+    const st = try rig.stats(a);
+    defer gpa.free(st);
+    try testing.expectEqual(@as(?u64, 1), json_scan.number(st, "fabric_daemon_connects"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "fabric_daemon_reuses"));
+    try testing.expectEqual(@as(?u64, 0), json_scan.number(st, "fabric_ladder_refusals"));
+    var needle: [320]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, st, try std.fmt.bufPrint(&needle, "\"subnqn\":\"{s}\",\"instance\":", .{data_nqn})) != null);
+    try testing.expect(std.mem.indexOf(u8, st, "\"reused\":false") != null);
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
+    const sum = try rig.onMount(a, "head -c 8388608 /dev/urandom > payload && sync && cksum payload | cut -d' ' -f1");
+    defer gpa.free(sum);
+    const during = try rig.controllerCensus();
+    defer gpa.free(during);
+    try rig.umount(a);
+    const after = try rig.controllerCensus();
+    defer gpa.free(after);
+    try testing.expectEqualStrings(before, after);
+    const log_a = try rig.readLog(a);
+    defer gpa.free(log_a);
+    try testing.expect(std.mem.indexOf(u8, log_a, "1 controller(s) of ") != null and std.mem.indexOf(u8, log_a, "under this mount's identity released") != null);
+    std.debug.print("\ndaemon-connect ({s}): /sys/class/nvme before the mount:\n{s}during (the daemon's own association beside the operator's meta connect):\n{s}after the umount:\n{s}fabric_daemon_connects {?d} fabric_daemon_reuses {?d} fabric_ladder_refusals {?d}\n", .{ transport.name(), before, during, after, json_scan.number(st, "fabric_daemon_connects"), json_scan.number(st, "fabric_daemon_reuses"), json_scan.number(st, "fabric_ladder_refusals") });
+    // A namespace ANOTHER process connected (identity B) is never the
+    // daemon's to release: the mount connects its OWN beside it and its
+    // umount leaves B's standing; the payload reads back through the
+    // daemon's fresh association.
+    const cd_b = try rig.connect(data_nqn, transport, port_base + 1, ident_b, &.{});
+    const a2 = try rig.spawnMount("dc-a2", meta_uri, null, &.{});
+    try rig.awaitLog(a2, "ready: ", ready_wait_ns);
+    try testing.expectEqual(@as(u32, 2), try rig.controllersOf(data_nqn, null));
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
+    const sum2 = try rig.onMount(a2, "cksum payload | cut -d' ' -f1");
+    defer gpa.free(sum2);
+    try testing.expectEqualStrings(sum, sum2);
+    try rig.umount(a2);
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_b));
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, ident_a));
+    try rig.disconnect(&cd_b);
+    try rig.disconnect(&cm);
+    try rig.unshare(data_nqn);
+    try rig.unshare(meta_nqn);
+    try expectNoResidue(rig, meta_nqn);
+    try expectNoResidue(rig, data_nqn);
+}
+
+test "nvmet fidelity: daemon-connect-loop — a mount by endpoint record with NO pre-connected namespace connects the data volume itself (fabric_daemon_connects 1, the bound row names the subsystem), serves, and its umount releases exactly its own association (/sys/class/nvme as it was); without the record the ladder refuses naming set-fabric-endpoints; a namespace another identity connected survives the daemon's release" {
+    try daemonConnectLeg(.loop, 0);
+}
+
+test "nvmet fidelity: daemon-connect-tcp — the same over nvmet-tcp on 127.0.0.1" {
+    try daemonConnectLeg(.tcp, 4490);
+}
+
+test "nvmet fidelity: fidelity-mount (loop) — THE row: the metadata and data volumes ARE connected namespaces (the data volume the daemon's own connect from its endpoint record); format → mount → PR armed for real (holder == pr_key, regctl 1) → a second identity refused → kill -9 → remount recovers via the own-stale ladder (pr_own_stale_recoveries 1, payload intact) and REUSES the data association → umount → regctl 0, the association released → disconnect → unshare" {
     try mountLeg(.loop, 0);
 }
 
@@ -782,16 +987,11 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
     const transport: configfs.Trtype = .loop;
-    const meta_nqn = try rig.share("smeta", meta_len, transport, 0);
-    const data_nqn = try rig.share("sdata", data_len, transport, 0);
-    const cm = try rig.connect(meta_nqn, transport, 0, null, &.{});
-    const cd = try rig.connect(data_nqn, transport, 0, null, &.{});
-    var mu: [64]u8 = undefined;
-    var du: [64]u8 = undefined;
-    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
-    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
-    const fmt_out = try rig.sqzOk(&.{ "format", "--single-writer", meta_uri, data_uri });
-    gpa.free(fmt_out);
+    const set = try daemonSet(rig, "s", transport, 0, &.{});
+    const meta_nqn = set.meta_nqn;
+    const data_nqn = set.data_nqn;
+    const cm = set.cm;
+    const meta_uri = set.metaUri();
     const a = try rig.spawnMount("sa", meta_uri, null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
     const w0 = try rig.onMount(a, "echo before > f && sync");
@@ -829,14 +1029,20 @@ test "nvmet fidelity: sigstop-preempt — a SIGSTOPped holder is preempted by a 
         defer rig.freeRun(r);
         try testing.expect(!r.term.success());
     }
+    // B's data association is B's own (identity B beside A's).
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_b));
+    try testing.expectEqual(@as(u32, 1), try rig.controllersOf(data_nqn, ident_a));
     try rig.kill9(a);
     try rig.umount(b);
+    // B released exactly its own; the killed A's leftover is the rig's.
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, ident_b));
+    try testing.expectEqual(@as(u32, 1), try rig.disconnectIdentity(data_nqn, ident_a));
     try rig.disconnect(&cm_b);
-    try rig.disconnect(&cd);
     try rig.disconnect(&cm);
     try rig.unshare(data_nqn);
     try rig.unshare(meta_nqn);
     try expectNoResidue(rig, meta_nqn);
+    try expectNoResidue(rig, data_nqn);
 }
 
 test "nvmet fidelity: g2-restore-tcp — the PTPL lapse: the subsystem wiped by hand under a LIVE tcp mount; list shows down; restore rebuilds it with the recorded uuid; the controller reconnects; the heartbeat re-acquires (writer_guard_pr_reacquires 1, writer_guard_fenced 0); the payload is intact; a second restore is a verified no-op" {
@@ -844,16 +1050,11 @@ test "nvmet fidelity: g2-restore-tcp — the PTPL lapse: the subsystem wiped by 
     var rig = try venue(gpa, testing.io);
     defer rig.deinit();
     const port: u16 = 4450;
-    const meta_nqn = try rig.share("gmeta", meta_len, .tcp, port);
-    const data_nqn = try rig.share("gdata", data_len, .tcp, port + 1);
-    const cm = try rig.connect(meta_nqn, .tcp, port, null, &.{});
-    const cd = try rig.connect(data_nqn, .tcp, port + 1, null, &.{});
-    var mu: [64]u8 = undefined;
-    var du: [64]u8 = undefined;
-    const meta_uri = try std.fmt.bufPrint(&mu, "sqmeta://{s}", .{cm.dev()});
-    const data_uri = try std.fmt.bufPrint(&du, "sqdata://{s}", .{cd.dev()});
-    const fmt_out = try rig.sqzOk(&.{ "format", "--single-writer", meta_uri, data_uri });
-    gpa.free(fmt_out);
+    const set = try daemonSet(rig, "g", .tcp, port, &.{});
+    const meta_nqn = set.meta_nqn;
+    const data_nqn = set.data_nqn;
+    const cm = set.cm;
+    const meta_uri = set.metaUri();
     const a = try rig.spawnMount("ga", meta_uri, null, &.{});
     try rig.awaitLog(a, "ready: ", ready_wait_ns);
     const sum = try rig.onMount(a, "head -c 4194304 /dev/urandom > payload && sync && cksum payload | cut -d' ' -f1");
@@ -891,11 +1092,12 @@ test "nvmet fidelity: g2-restore-tcp — the PTPL lapse: the subsystem wiped by 
     defer gpa.free(ro2);
     try testing.expect(std.mem.indexOf(u8, ro2, "verified no-op") != null);
     try rig.umount(a);
-    try rig.disconnect(&cd);
+    try testing.expectEqual(@as(u32, 0), try rig.controllersOf(data_nqn, null));
     try rig.disconnect(&cm);
     try rig.unshare(data_nqn);
     try rig.unshare(meta_nqn);
     try expectNoResidue(rig, meta_nqn);
+    try expectNoResidue(rig, data_nqn);
 }
 
 test "nvmet fidelity: crash-window — W-N1: a share with a TEST-NET-1 listener fails at its second port link (EADDRNOTAVAIL) leaving a PENDING record claiming both ids; a second share of the backing refuses mid-window; restore finalizes; unshare removes both ports. W-N2: a never-linkable share → pending → the subsystem wiped by hand → restore garbage-collects it and sweeps the port shell" {

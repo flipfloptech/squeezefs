@@ -40,6 +40,17 @@ pub var fabric_host_identity_source: counters.Gauge = .{};
 pub var fabric_connects: counters.ShardedCounter = .{};
 pub var fabric_connect_failures: counters.ShardedCounter = .{};
 pub var fabric_disconnects: counters.ShardedCounter = .{};
+/// The daemon's OWN data-plane associations (`mount_fabric.zig`): connects
+/// made at mount from a `fabric_endpoint` record, controllers already
+/// riding the mount's identity reused (a predecessor's), connect failures
+/// that refused the mount, controllers released at the clean umount, and
+/// mounts the §5.2 ladder refused (no record / a foreign identity / the
+/// merged shape).
+pub var fabric_daemon_connects: counters.ShardedCounter = .{};
+pub var fabric_daemon_reuses: counters.ShardedCounter = .{};
+pub var fabric_daemon_connect_failures: counters.ShardedCounter = .{};
+pub var fabric_daemon_disconnects: counters.ShardedCounter = .{};
+pub var fabric_ladder_refusals: counters.ShardedCounter = .{};
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try counters.writeNamespaceJson(@This(), w);
@@ -49,7 +60,7 @@ test "the family names every nvmet_* and fabric_* instrument" {
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeStatsJson(&w);
-    inline for (.{ "nvmet_shares_applied", "nvmet_configfs_write_failures", "nvmet_ledger_generation", "fabric_controllers", "fabric_ctrl_not_live", "fabric_ctrl_reconnects", "fabric_host_scoped", "fabric_host_identity_source", "fabric_connects" }) |k| {
+    inline for (.{ "nvmet_shares_applied", "nvmet_configfs_write_failures", "nvmet_ledger_generation", "fabric_controllers", "fabric_ctrl_not_live", "fabric_ctrl_reconnects", "fabric_host_scoped", "fabric_host_identity_source", "fabric_connects", "fabric_daemon_connects", "fabric_daemon_reuses", "fabric_daemon_disconnects", "fabric_ladder_refusals" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"" ++ k ++ "\":") != null);
     }
 }

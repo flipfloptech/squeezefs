@@ -100,6 +100,7 @@ const lifecycle_stats = @import("../ops/lifecycle/stats.zig");
 const defrag_metrics = @import("../ops/defrag/metrics.zig");
 const nvmet_stats = @import("../ops/nvmet/stats.zig");
 const nvmet_initiator = if (is_linux) @import("../ops/nvmet/initiator.zig") else struct {};
+const nvmet_mount_fabric = if (is_linux) @import("../ops/nvmet/mount_fabric.zig") else struct {};
 const zcrx_stats = @import("../ops/zcrx/stats.zig");
 
 pub const Error = Writer.Error;
@@ -173,6 +174,9 @@ pub const Sources = struct {
     wire: if (is_linux) ?*sym.wire_plane.WirePlane else ?*void = null,
     /// A `-o ro` reader's plane (the token client or the quiescent reader).
     reader: if (is_linux) ?*sym.reader_plane.ReaderPlane else ?*void = null,
+    /// The daemon-owned fabric associations (`mount_fabric.Plan`): the
+    /// `fabric_daemon_bound` rows of the nvmet family.
+    fabric: if (is_linux) ?*const nvmet_mount_fabric.Plan else ?*void = null,
     key_census: ?KeyCensus = null,
     /// The CPU ledger (+ its allocator) and an `Io` for the `/proc/self/
     /// task` walk; absent ⇒ zeros (every family stays present).
@@ -627,10 +631,18 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
 /// The `nvmet_*` / `fabric_*` family; the fabric controllers are SAMPLED
 /// off `/sys/class/nvme` at every render (a cold path: the `.stats` build
 /// is the cadence, never an op). The sampler owns its tables for the
-/// process's life and borrows nothing from the render (the allocation law).
-fn writeNvmet(_: *Sources, w: *Writer) Error!void {
+/// process's life and borrows nothing from the render (the allocation law);
+/// the daemon-owned associations (`mount_fabric.Plan`) render in the same
+/// object.
+fn writeNvmet(src: *Sources, w: *Writer) Error!void {
     if (is_linux) nvmet_initiator.sampleFabric();
-    try nvmet_stats.writeStatsJson(w);
+    try w.writeByte('{');
+    const any = try counters.writeNamespaceEntries(nvmet_stats, w);
+    if (is_linux) if (src.fabric) |plan| {
+        if (any) try w.writeByte(',');
+        try plan.writeStatsJson(w);
+    };
+    try w.writeByte('}');
 }
 
 /// The `zcrx_*` family (`ops/zcrx/stats.zig`): the lane's engagement,

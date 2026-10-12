@@ -27,6 +27,8 @@ pub const recovery = @import("membership/recovery.zig");
 pub const park_reclaim = @import("membership/park_reclaim.zig");
 pub const fencing = @import("membership/fencing.zig");
 pub const join_ladder = @import("membership/join_ladder.zig");
+/// A joiner's view of the owner's census (the liveness law of its sweeps).
+pub const census_view = @import("membership/census_view.zig");
 /// The recovery driver's `Volume` seam over the real backend (Linux).
 pub const volume_bind = if (builtin.os.tag == .linux) @import("membership/volume_bind.zig") else struct {};
 
@@ -61,6 +63,7 @@ test {
     _ = park_reclaim;
     _ = fencing;
     _ = join_ladder;
+    _ = census_view;
     if (builtin.os.tag == .linux) _ = volume_bind;
 }
 

@@ -229,6 +229,11 @@ const JoinedHalf = struct {
     /// The declaration's frame bytes for the member's next renewal (the
     /// member borrows them for the call on this thread).
     decl_buf: []u8,
+    /// The owner's census as this member sees it: pulled by the beat once
+    /// per renew interval, read by the token lease oracle and the parked
+    /// guard scopes' sweep for every member but the manager (whose word is
+    /// this member's own lease).
+    census: membership.census_view.CensusView,
 
     /// A tenth of the shipped `T_self` floor (the smoke's `T_owner` of
     /// 3 s derives a 797 ms `T_self`; a tick every 80 ms meets a 265 ms
@@ -240,6 +245,7 @@ const JoinedHalf = struct {
         var name_buf: @import("../../core/thread_name.zig").CommBuf = undefined;
         _ = @import("../../core/thread_name.zig").nameCurrentThread(&name_buf, "sqz-member");
         while (!self.stop.load(.acquire)) {
+            self.pullCensusIfDue();
             // The windows this writer holds ride the renewal (charter §5.5):
             // refreshed every beat from the writer plane once it is armed.
             if (self.windows.load(.acquire)) |wp| {
@@ -283,6 +289,34 @@ const JoinedHalf = struct {
             const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(TICK_MS * std.time.ns_per_ms) };
             _ = linux.nanosleep(&ts, null);
         }
+    }
+
+    /// One census walk per renew interval (the renewal's own cadence; the
+    /// pages ride the manager link on this thread, never a sweep's): the
+    /// view the sweeps read for every other member's lease.
+    fn pullCensusIfDue(self: *JoinedHalf) void {
+        const renew_ns = (self.member.clocks orelse return).renew_ms * std.time.ns_per_ms;
+        const now = clock.monotonicNs();
+        if (!self.census.due(now, renew_ns)) return;
+        var cursor: u64 = 0;
+        var grace_open = false;
+        while (true) {
+            const rep = self.js.link.call(.{ .census = .{ .cursor = cursor, .limit = verbs.CENSUS_PAGE_MAX, .reserved = 0 } }) catch {
+                self.census.abandon();
+                return;
+            };
+            const pg = rep.census;
+            grace_open = pg.head.grace_open != 0;
+            var rows = pg.rows();
+            // `state` passed the row screen at the decode (≤ 2).
+            while (rows.next()) |row| self.census.stage(clientIdOf(row.head.id), @fromBackingInt(@intCast(row.head.state))) catch {
+                self.census.abandon();
+                return;
+            };
+            if (pg.head.has_next == 0) break;
+            cursor = pg.head.next;
+        }
+        self.census.commit(grace_open, now);
     }
 
     fn selfLive(ctx: ?*anyopaque, _: u64) bool {
@@ -424,6 +458,12 @@ pub const WirePlane = struct {
         errdefer self.peers.deinit();
         if (be0.sym != null) try self.startManagerHalf(t_owner_ms, identity) else try self.startJoinedHalfPre();
         errdefer self.stopHalf();
+        // The parked guard scopes' sweep reads the owner's word on each
+        // scope's client (the manager's roster; a joiner's census view);
+        // the belt for a client it has no word on is the manager's
+        // `T_owner` (a joiner learns the grant's).
+        xv_plane.parked.bindLiveness(self.oracle.guardLiveness(), t_owner_ms * std.time.ns_per_ms);
+        errdefer xv_plane.parked.bindLiveness(null, xv.guards.SCOPE_GRACE_NS);
         // The divert's self-lease: the manager IS its own membership owner
         // (never lapses); a joiner's is its member lease.
         const lease: tokens.cache.SelfLease = if (self.joined) |j| j.selfLease() else .always;
@@ -620,6 +660,7 @@ pub const WirePlane = struct {
             .member = undefined,
             .poison = .{ .set = self.set },
             .decl_buf = decl_buf,
+            .census = membership.census_view.CensusView.init(gpa, self.io),
         };
         j.member = .{
             .gpa = gpa,
@@ -665,6 +706,9 @@ pub const WirePlane = struct {
         const clocks = j.member.clocks.?;
         // `T_park_max = failover_bound + grace` at the grant's `T_owner`.
         j.js.park_gate.t_park_max_ms = membership.park_reclaim.tParkMaxMs(@import("extent_grant.zig").failoverBoundMs(0, 0), clocks.grace_ms);
+        j.census.setRenewInterval(clocks.renew_ms * std.time.ns_per_ms);
+        // The parked guard scopes' grace belt is the grant's `T_owner`.
+        self.steps.plane.parked.bindLiveness(self.oracle.guardLiveness(), clocks.t_owner_ms * std.time.ns_per_ms);
         j.beat = std.Thread.spawn(.{}, JoinedHalf.run, .{j}) catch return error.OutOfMemory;
     }
 
@@ -696,6 +740,7 @@ pub const WirePlane = struct {
             self.mgr = null;
         }
         if (self.joined) |j| {
+            j.census.deinit();
             self.gpa.free(j.decl_buf);
             self.gpa.destroy(j);
             self.joined = null;
@@ -737,6 +782,8 @@ pub const WirePlane = struct {
         if (self.kvda) |k| self.gpa.destroy(k);
         self.gpa.free(self.heaps);
         self.gpa.free(self.decl_bounds);
+        // The sweep's word goes before the oracle it reads.
+        self.steps.plane.parked.bindLiveness(null, xv.guards.SCOPE_GRACE_NS);
         self.stopHalf();
         self.gpa.destroy(self);
     }
@@ -1472,17 +1519,51 @@ const LeaseOracle = struct {
         return null;
     }
 
-    fn verdict(ctx: ?*anyopaque, client: tokens.table.ClientId, now_ns: u64) tokens.table.LeaseVerdict {
-        const self: *LeaseOracle = @ptrCast(@alignCast(ctx.?));
+    /// The owner's word on a member's lease — ONE law for the token
+    /// holder's recalls and the parked guard scopes' sweep: the roster on
+    /// the manager; on a joiner the manager's own lease is this member's
+    /// (the manager cannot be evicted by anyone this member hears from),
+    /// every other member's is the owner's census as the beat last saw it
+    /// (`since_ns`: the instant the client was last known to be in
+    /// contact — a census older than it cannot call its silence a death).
+    fn word(self: *LeaseOracle, client: tokens.table.ClientId, since_ns: u64, now_ns: u64) tokens.table.LeaseVerdict {
         if (self.plane.joined) |j| {
-            if (client != clientIdOf(shard.writerMemberId(j.js.manager_identity))) return .unknown;
-            return if (JoinedHalf.selfLive(j, now_ns)) .live else .expired;
+            if (client == clientIdOf(shard.writerMemberId(j.js.manager_identity))) return if (JoinedHalf.selfLive(j, now_ns)) .live else .expired;
+            return j.census.verdict(client, since_ns, now_ns);
         }
         const m = self.plane.mgr.?;
         const id = self.find(client) orelse return .unknown;
         return switch (m.owner.liveness(id, WirePlane.nowMs())) {
             .live => .live,
             .dead => .expired,
+            .unknown => .unknown,
+        };
+    }
+
+    /// The token lane's verdict: the asking client is in contact NOW, so
+    /// a census that does not list it is older than its join — unknown,
+    /// never a refusal.
+    fn verdict(ctx: ?*anyopaque, client: tokens.table.ClientId, now_ns: u64) tokens.table.LeaseVerdict {
+        const self: *LeaseOracle = @ptrCast(@alignCast(ctx.?));
+        return self.word(client, now_ns, now_ns);
+    }
+
+    /// The parked guard scopes' face (`xv.guards.Liveness`): a scope's
+    /// client was in contact when it parked; the roster not listing it on
+    /// the manager, or a census newer than the scope not listing it on a
+    /// joiner, is its eviction — the scope goes with the lease (§5.9).
+    fn guardLiveness(self: *LeaseOracle) xv.guards.Liveness {
+        return .{ .ctx = self, .verdict = &guardVerdict };
+    }
+
+    fn guardVerdict(ctx: *anyopaque, client: u64, since_ns: u64, now_ns: u64) xv.guards.Verdict {
+        const self: *LeaseOracle = @ptrCast(@alignCast(ctx));
+        if (self.plane.mgr) |m| if (self.find(client) == null) {
+            return if (m.owner.graceOpenForReassert(WirePlane.nowMs())) .unknown else .dead;
+        };
+        return switch (self.word(client, since_ns, now_ns)) {
+            .live => .live,
+            .expired => .dead,
             .unknown => .unknown,
         };
     }
@@ -2082,12 +2163,16 @@ test "linux: THE SAME-NODE SUCCESSOR IS REACHED — a member joins at a dead inc
     try testing.expect(plane.peers.by_holder.get(r1.appenderId()).?.link.endpointNow().eql(plane.advertised));
 }
 
-test "client ids: one per member id, stable, distinct across two members" {
+test "client ids: one per member id, stable, distinct across two members; the parked scopes' client key of a session's proven peer IS the token client id of that member (one membership verdict for both sweeps)" {
     const a: shard.MemberId = @splat(1);
     var b: shard.MemberId = @splat(1);
     b[15] = 2;
     try testing.expectEqual(clientIdOf(a), clientIdOf(a));
     try testing.expect(clientIdOf(a) != clientIdOf(b));
+    const identity: verbs.WireIdentity = .{ .node_token = 0xa1afa2cc30f28bb6, .writer_id = 0x192f88cd, .mount_slot = 0xf44a79f8, .reserved = 0 };
+    // The handshake proves the 12 B peer id; the writer id never travels.
+    const proven = verbs.WireIdentity.fromPeerId(&identity.peerId()).?;
+    try testing.expectEqual(clientIdOf(shard.writerMemberId(identity)), xv.guards.clientOf(proven));
 }
 
 test "the start refusals name their rung and cause" {

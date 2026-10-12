@@ -219,7 +219,7 @@ const FamilyEcho = struct {
                 var id: [16]u8 = @splat(0);
                 @memcpy(id[0..12], &req.peer.?.peerId());
                 verbs.CensusPage.encodeRow(&b, .{ .head = .{ .id = id, .boot = @splat(0), .endpoint = .none, .role = 0, .state = 0, .mount_len = 3, .pid = 1, .reserved = 0, .epoch = 1, .age_ms = 0, .expires_in_ms = 1, .acked_free_epoch = 0 }, .mount = "/m0" }) catch unreachable;
-                break :blk .{ .ok = .{ .census = .{ .head = .{ .n = 1, .has_next = 0, .reserved = @splat(0), .next = 0 }, .rows_bytes = b.written() } } };
+                break :blk .{ .ok = .{ .census = .{ .head = .{ .n = 1, .has_next = 0, .grace_open = 0, .reserved = @splat(0), .next = 0 }, .rows_bytes = b.written() } } };
             },
             .token_grant => .{ .ok = .{ .token_grant = .{ .head = .{ .kind = 0, .flags = verbs.PAGE_XATTRS_COMPLETE, .reserved = 0, .n_xattrs = 0, .n_dir = 0, .holder = 0, .attrs = attrs, .reserved2 = @splat(0) }, .xattrs_bytes = "", .dir_bytes = "" } } },
             .token_recall => .{ .ok = .{ .token_recall = .acked } },

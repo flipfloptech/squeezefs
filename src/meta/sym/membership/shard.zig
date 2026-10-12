@@ -480,7 +480,10 @@ pub const Owner = struct {
         return g.until_ms - now_ms;
     }
 
-    fn graceOpenForReassert(self: *const Owner, now_ms: u64) bool {
+    /// The re-assertion window stands: a member the roster does not list
+    /// may still be a predecessor's member on its way back (silence is
+    /// unknown, never a death — the census page carries the word).
+    pub fn graceOpenForReassert(self: *const Owner, now_ms: u64) bool {
         const g = self.grace orelse return false;
         return now_ms < g.until_ms;
     }
@@ -720,7 +723,7 @@ pub const Owner = struct {
             try verbs.CensusPage.encodeRow(b, .{ .head = .{ .id = m.id, .boot = m.boot, .endpoint = m.endpoint, .role = @backingInt(m.role), .state = @backingInt(state), .mount_len = m.mount_len, .pid = m.pid, .reserved = 0, .epoch = m.epoch, .age_ms = now_ms -| m.joined_ms, .expires_in_ms = m.deadline_ms -| now_ms, .acked_free_epoch = m.acked_free_epoch }, .mount = m.mountPath() });
         }
         const has_next = take < n;
-        return .{ .n = @intCast(take), .has_next = @intFromBool(has_next), .reserved = @splat(0), .next = if (has_next) self.members.items[sorted[take]].join_seq else 0 };
+        return .{ .n = @intCast(take), .has_next = @intFromBool(has_next), .grace_open = @intFromBool(self.graceOpenForReassert(now_ms)), .reserved = @splat(0), .next = if (has_next) self.members.items[sorted[take]].join_seq else 0 };
     }
 
     // ---- the push carriage ----

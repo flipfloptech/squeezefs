@@ -14,8 +14,13 @@
 //!
 //! The holder's lease-expiry sweep is the backstop: a scope is kept while
 //! its client is a LIVE member, released the sweep after the owner
-//! evicts it; a client the owner does not know keeps the grace window
-//! `T_owner` as the belt. PORTABLE.
+//! evicts it (`xv_cross_owner_guards_swept_dead` — a dead member's locks
+//! at every holder go with its lease, charter §5.9: before it every op on
+//! those stripes waited, and the session serving them with it); a client
+//! the owner does not know keeps the grace window `T_owner` as the belt
+//! (the tripwire). The verdict is the membership owner's: its roster on
+//! the manager, its census on a joiner (`membership/census_view.zig`).
+//! PORTABLE.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -23,6 +28,7 @@ const Io = std.Io;
 const counters = @import("../../../core/counters.zig");
 const errors = @import("../../../core/errors.zig");
 const clock = @import("../../../core/clock.zig");
+const checksum = @import("../../../core/checksum.zig");
 const sync = @import("../../../sync/sync.zig");
 const verbs = @import("../../../wire/verbs.zig");
 const service = @import("../../../wire/service.zig");
@@ -44,8 +50,13 @@ pub const stats = struct {
     pub var xv_cross_owner_guard_stale_reresolves: counters.ShardedCounter = .{};
     /// Scopes parked at this holder (served `XvGuards`).
     pub var xv_cross_owner_guards_parked: counters.ShardedCounter = .{};
-    /// A parked scope released by the expiry sweep, never by its client:
-    /// must stay 0.
+    /// A parked scope released by the sweep because the membership owner
+    /// lists its client DEAD (evicted, or absent outside the grace window):
+    /// the §5.9 path — a dead member's locks go with its lease.
+    pub var xv_cross_owner_guards_swept_dead: counters.ShardedCounter = .{};
+    /// A parked scope released by the grace belt alone — a client the
+    /// owner does not know, aged past `T_owner`, never released by its
+    /// client: must stay 0.
     pub var xv_cross_owner_guard_expiries: counters.Tripwire = .init("xv_cross_owner_guard_expiries");
     /// Served steps that applied under the scope's parked guards.
     pub var xv_cross_owner_steps_covered: counters.ShardedCounter = .{};
@@ -83,12 +94,32 @@ const Parked = struct {
 
 pub const ServeGuards = enum { covered, take };
 
-/// Who the holder asks whether a client is live (the membership owner's
-/// verdict; null = in-process contracts: every client is live).
+/// The membership owner's word on a scope's client: `live` keeps the
+/// scope, `dead` (evicted, or absent outside the owner's grace window)
+/// releases it now, `unknown` (no owner view) leaves the grace belt.
+pub const Verdict = enum { live, dead, unknown };
+
+/// Who the holder asks whether a client is a live member (the membership
+/// owner's verdict: its roster on the manager, its census on a joiner;
+/// null = in-process contracts: every client is unknown). `since_ns` is
+/// the instant the scope parked — the client was in contact then, so
+/// only a word NEWER than it may call the client's absence a death.
 pub const Liveness = struct {
     ctx: *anyopaque,
-    isLive: *const fn (ctx: *anyopaque, client: u64) bool,
+    verdict: *const fn (ctx: *anyopaque, client: u64, since_ns: u64, now_ns: u64) Verdict,
 };
+
+/// A scope's client key: the peer's token client id (`hash64` of its 16 B
+/// member id — the identity's 12 B peer id, zero-padded), the SAME key the
+/// token holder's lease oracle is asked about, so one membership verdict
+/// serves both sweeps (`wire_plane.clientIdOf(shard.writerMemberId(..))`
+/// ties to it). A session without a proven peer is client 0.
+pub fn clientOf(peer: ?verbs.WireIdentity) u64 {
+    const p = peer orelse return 0;
+    var id: [16]u8 = @splat(0);
+    @memcpy(id[0..12], &p.peerId());
+    return checksum.hash64(&id);
+}
 
 pub const ParkedScopes = struct {
     gpa: Allocator,
@@ -97,6 +128,10 @@ pub const ParkedScopes = struct {
     lock: sync.Mutex = .init,
     map: std.AutoHashMapUnmanaged(Scope, Parked) = .empty,
     liveness: ?Liveness = null,
+    /// The grace window an UNKNOWN client's scope keeps: the plane's
+    /// `T_owner` once bound (the owner's eviction clock — a client it
+    /// never listed cannot be evicted, so its scope lives one lease).
+    grace_ns: u64 = SCOPE_GRACE_NS,
 
     pub fn init(gpa: Allocator, io: Io, locks: *dlm.Manager) ParkedScopes {
         return .{ .gpa = gpa, .io = io, .locks = locks };
@@ -106,6 +141,15 @@ pub const ParkedScopes = struct {
         var it = self.map.valueIterator();
         while (it.next()) |p| p.set.release(self.io);
         self.map.deinit(self.gpa);
+    }
+
+    /// The owner's word bound (the wire plane's start) or withdrawn (its
+    /// stop, before the oracle goes) under the sweep's lock.
+    pub fn bindLiveness(self: *ParkedScopes, liveness: ?Liveness, grace_ns: u64) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.liveness = liveness;
+        self.grace_ns = grace_ns;
     }
 
     /// Serve `XvGuards`: `lockMany` in THIS table of the requests the
@@ -177,11 +221,13 @@ pub const ParkedScopes = struct {
         return if (self.locks.covers(dlm.wide_requests, &p.set, inodes, dentries)) .covered else .take;
     }
 
-    /// The expiry sweep: a scope whose client the owner lists dead (or
-    /// unknown past the grace window) is released — the backstop, never
-    /// the path.
+    /// The expiry sweep: a scope whose client the owner lists DEAD is
+    /// released now (the §5.9 path); one whose client is unknown and aged
+    /// past the grace window is released loud (the backstop); a live
+    /// client's scope is kept however long its plan runs.
     pub fn sweepExpired(self: *ParkedScopes, now_ns: u64) u32 {
-        var doomed: [64]Scope = undefined;
+        const Doomed = struct { scope: Scope, dead: bool };
+        var doomed: [64]Doomed = undefined;
         var n: usize = 0;
         {
             self.lock.lockUncancelable(self.io);
@@ -189,15 +235,23 @@ pub const ParkedScopes = struct {
             var it = self.map.iterator();
             while (it.next()) |e| {
                 if (n == doomed.len) break;
-                const live = if (self.liveness) |l| l.isLive(l.ctx, e.value_ptr.client) else true;
-                const aged = now_ns -| e.value_ptr.since_ns > SCOPE_GRACE_NS;
-                if (!live or aged) {
-                    doomed[n] = e.key_ptr.*;
-                    n += 1;
+                const v: Verdict = if (self.liveness) |l| l.verdict(l.ctx, e.value_ptr.client, e.value_ptr.since_ns, now_ns) else .unknown;
+                switch (v) {
+                    .live => {},
+                    .dead => {
+                        doomed[n] = .{ .scope = e.key_ptr.*, .dead = true };
+                        n += 1;
+                    },
+                    .unknown => if (now_ns -| e.value_ptr.since_ns > self.grace_ns) {
+                        doomed[n] = .{ .scope = e.key_ptr.*, .dead = false };
+                        n += 1;
+                    },
                 }
             }
         }
-        for (doomed[0..n]) |s| if (self.release(s)) stats.xv_cross_owner_guard_expiries.fire("a parked guard scope outlived its client");
+        for (doomed[0..n]) |d| if (self.release(d.scope)) {
+            if (d.dead) stats.xv_cross_owner_guards_swept_dead.inc() else stats.xv_cross_owner_guard_expiries.fire("a parked guard scope outlived its client");
+        };
         return @intCast(n);
     }
 
@@ -234,8 +288,7 @@ pub const GuardsService = struct {
         var nd: usize = 0;
         var it = r.dentries();
         while (it.next()) |d| : (nd += 1) dents[nd] = .{ .parent = d.head.parent, .name = d.name, .mode = if (d.head.exclusive != 0) .exclusive else .shared };
-        const client: u64 = if (req.peer) |p| p.writer_id else 0;
-        self.parked.serve(r.head.scope, client, inodes[0..r.inodes.len], dents[0..nd]) catch |e| return switch (e) {
+        self.parked.serve(r.head.scope, clientOf(req.peer), inodes[0..r.inodes.len], dents[0..nd]) catch |e| return switch (e) {
             error.PlanTooLarge => service.Answer.rejected("xv_guards plan past the wide bound"),
             error.OutOfMemory => service.Answer.refused(error.OutOfMemory, "out of memory parking the scope"),
             else => unreachable,
@@ -429,7 +482,7 @@ fn askRemote(gpa: Allocator, io: Io, t: *Travelling, tables: Tables, a: AcquireA
 
 const testing = std.testing;
 
-test "the parked scopes: a served XvGuards parks the holder's canonical set under the scope; a second ask under the scope skips covered stripes; the verdict is `covered` by (class, stripe) with the mode floor and `take` otherwise; release drops it; the sweep releases a dead client's scope (the tripwire)" {
+test "the parked scopes: a served XvGuards parks the holder's canonical set under the scope; a second ask under the scope skips covered stripes; the verdict is `covered` by (class, stripe) with the mode floor and `take` otherwise; release drops it; the sweep releases a DEAD client's scope at once (swept_dead, quiet), keeps a live client's however old, and lets an unknown client's go only past the grace window (the tripwire)" {
     const gpa = testing.allocator;
     var locks = try dlm.Manager.init(gpa, 64);
     defer locks.deinit();
@@ -453,21 +506,51 @@ test "the parked scopes: a served XvGuards parks the holder's canonical set unde
     // The stripes are free again.
     var s = (try locks.tryLockMany(testing.io, &.{.{ .ino = 10, .mode = .exclusive }}, &.{})).?;
     s.release(testing.io);
-    // The sweep: a live client keeps its scope; a dead one loses it loud.
-    const Dead = struct {
-        fn isLive(_: *anyopaque, client: u64) bool {
-            return client != 9;
+    // The sweep by the owner's word: client 7 live, 9 dead, 11 unknown.
+    const Owner = struct {
+        fn verdict(_: *anyopaque, client: u64, _: u64, _: u64) Verdict {
+            return switch (client) {
+                7 => .live,
+                9 => .dead,
+                else => .unknown,
+            };
         }
     };
     var marker: u8 = 0;
-    parked.liveness = .{ .ctx = &marker, .isLive = &Dead.isLive };
+    parked.liveness = .{ .ctx = &marker, .verdict = &Owner.verdict };
     try parked.serve(mintScope(6), 7, &.{.{ .ino = 20, .mode = .exclusive }}, &.{});
     try parked.serve(mintScope(7), 9, &.{.{ .ino = 21, .mode = .exclusive }}, &.{});
+    try parked.serve(mintScope(8), 11, &.{.{ .ino = 22, .mode = .exclusive }}, &.{});
     const exp0 = stats.xv_cross_owner_guard_expiries.load();
+    const dead0 = stats.xv_cross_owner_guards_swept_dead.load();
+    const now = clock.monotonicNs();
+    // The dead client's scope goes at once and quietly; the live and the
+    // unknown stay (both fresh).
+    try testing.expectEqual(@as(u32, 1), parked.sweepExpired(now));
+    try testing.expectEqual(dead0 + 1, stats.xv_cross_owner_guards_swept_dead.load());
+    try testing.expectEqual(exp0, stats.xv_cross_owner_guard_expiries.load());
+    try testing.expect(parked.isParked(mintScope(6)) and !parked.isParked(mintScope(7)) and parked.isParked(mintScope(8)));
+    // Past the grace window the unknown client's scope is released loud;
+    // the live client's is kept however old.
     stats.xv_cross_owner_guard_expiries.resetLogBudgetForTest();
     @import("../../../core/log.zig").testing.expectErrorLogs(1);
-    try testing.expectEqual(@as(u32, 1), parked.sweepExpired(clock.monotonicNs()));
+    try testing.expectEqual(@as(u32, 1), parked.sweepExpired(now + parked.grace_ns + 1));
     try @import("../../../core/log.zig").testing.expectAllFired();
     try testing.expectEqual(exp0 + 1, stats.xv_cross_owner_guard_expiries.load());
-    try testing.expect(parked.isParked(mintScope(6)) and !parked.isParked(mintScope(7)));
+    try testing.expect(parked.isParked(mintScope(6)) and !parked.isParked(mintScope(8)));
+    // Without an owner's view every client is unknown: the grace belt alone.
+    parked.liveness = null;
+    try testing.expectEqual(@as(u32, 0), parked.sweepExpired(now));
+    try testing.expect(parked.isParked(mintScope(6)));
+}
+
+test "clientOf: the token client id of the peer's member id — stable, distinct across two members, 0 for an unproven session" {
+    const a: verbs.WireIdentity = .{ .node_token = 0x1111, .writer_id = 5, .mount_slot = 1, .reserved = 0 };
+    const b: verbs.WireIdentity = .{ .node_token = 0x1111, .writer_id = 5, .mount_slot = 2, .reserved = 0 };
+    // The incarnation (writer id) is not the member: one key per (node, mount slot).
+    const a2: verbs.WireIdentity = .{ .node_token = 0x1111, .writer_id = 9, .mount_slot = 1, .reserved = 0 };
+    try testing.expect(clientOf(a) != 0);
+    try testing.expectEqual(clientOf(a), clientOf(a2));
+    try testing.expect(clientOf(a) != clientOf(b));
+    try testing.expectEqual(@as(u64, 0), clientOf(null));
 }

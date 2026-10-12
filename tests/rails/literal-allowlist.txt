@@ -461,7 +461,7 @@ src/meta/sym/membership/recovery.zig:135 | 10 | a size — OWED: derive from der
 src/meta/sym/membership/recovery.zig:135 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/membership/recovery.zig:137 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/membership/recovery.zig:138 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
-src/meta/sym/membership/shard.zig:796 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/membership/shard.zig:799 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/region.zig:325 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:429 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:430 | 100 | OWED: derive it or document it on the line (charter §1.5)
@@ -483,8 +483,8 @@ src/meta/sym/tokens/token_table.zig:151 | 9 | OWED: derive it or document it on 
 src/meta/sym/tokens/token_table.zig:152 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:152 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:153 | 11 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/wire_plane.zig:256 | 3 | a table entry (switch/range arm) — the codec or classification table
-src/meta/sym/wire_plane.zig:257 | 4 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:262 | 3 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:263 | 4 | a table entry (switch/range arm) — the codec or classification table
 src/meta/sym/xv/applier.zig:295 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/xv/intent.zig:160 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/intent.zig:191 | 8 | OWED: derive it or document it on the line (charter §1.5)
@@ -683,15 +683,15 @@ src/wire/frame.zig:52 | 48 | OWED: derive it or document it on the line (charter
 src/wire/verbs.zig:166 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/wire/verbs.zig:194 | 0xFFF0 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/wire/verbs.zig:271 | 12 | OWED: derive it or document it on the line (charter §1.5)
-src/wire/verbs.zig:1030 | 3 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/wire/verbs.zig:1044 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/wire/verbs.zig:1284 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/wire/verbs.zig:1284 | 6 | OWED: derive it or document it on the line (charter §1.5)
-src/wire/verbs.zig:1462 | 3 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/wire/verbs.zig:1463 | 4 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/wire/verbs.zig:1464 | 5 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/wire/verbs.zig:1465 | 6 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/wire/verbs.zig:1466 | 0x7F | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
-src/wire/verbs.zig:1517 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/wire/verbs.zig:1658 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/wire/verbs.zig:1659 | 32 | OWED: derive it or document it on the line (charter §1.5)
+src/wire/verbs.zig:1035 | 3 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/wire/verbs.zig:1049 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/wire/verbs.zig:1289 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/wire/verbs.zig:1289 | 6 | OWED: derive it or document it on the line (charter §1.5)
+src/wire/verbs.zig:1467 | 3 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/wire/verbs.zig:1468 | 4 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/wire/verbs.zig:1469 | 5 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/wire/verbs.zig:1470 | 6 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/wire/verbs.zig:1471 | 0x7F | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
+src/wire/verbs.zig:1522 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/wire/verbs.zig:1663 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/wire/verbs.zig:1664 | 32 | OWED: derive it or document it on the line (charter §1.5)

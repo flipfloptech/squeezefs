@@ -958,11 +958,16 @@ pub const MemberIterator = struct {
 pub const CensusPageHead = extern struct {
     n: u16,
     has_next: u8,
-    reserved: [5]u8,
+    /// 1 while the owner's grace window for re-assertion stands (a
+    /// successor's roster is still filling): a member ABSENT from the
+    /// census is then unknown, never departed — a reader of the census
+    /// must not treat the silence as a death.
+    grace_open: u8,
+    reserved: [4]u8,
     next: u64,
 
     pub fn check(self: CensusPageHead) bool {
-        return self.n <= CENSUS_PAGE_MAX and self.has_next <= 1 and (self.has_next == 1 or self.next == 0);
+        return self.n <= CENSUS_PAGE_MAX and self.has_next <= 1 and self.grace_open <= 1 and (self.has_next == 1 or self.next == 0);
     }
 };
 
@@ -2020,11 +2025,16 @@ test "membership payloads: join with a mount path, the grant's three carriages, 
     const row: MemberSnapshot = .{ .head = .{ .id = id, .boot = @splat(1), .endpoint = ep, .role = 0, .state = 0, .mount_len = 6, .pid = 4, .reserved = 0, .epoch = 4, .age_ms = 10, .expires_in_ms = 44_000, .acked_free_epoch = 1 }, .mount = "/mnt/a" };
     try CensusPage.encodeRow(&rb, row);
     try CensusPage.encodeRow(&rb, row);
-    const page = try roundTrip(CensusPage, .{ .head = .{ .n = 2, .has_next = 1, .reserved = @splat(0), .next = 2 }, .rows_bytes = rb.written() });
+    const page = try roundTrip(CensusPage, .{ .head = .{ .n = 2, .has_next = 1, .grace_open = 1, .reserved = @splat(0), .next = 2 }, .rows_bytes = rb.written() });
+    try testing.expectEqual(@as(u8, 1), page.head.grace_open);
     var rows = page.rows();
     try testing.expectEqualStrings("/mnt/a", rows.next().?.mount);
     _ = rows.next().?;
     try testing.expectEqual(@as(?MemberSnapshot, null), rows.next());
+    // The grace word is a bit: anything else is refused at the screen.
+    var lb: Builder = .init(&buf);
+    try (CensusPage{ .head = .{ .n = 0, .has_next = 0, .grace_open = 2, .reserved = @splat(0), .next = 0 }, .rows_bytes = &.{} }).encode(&lb);
+    try testing.expectError(error.Malformed, codec.decodePayload(CensusPage, lb.written()));
 }
 
 test "token payloads: the grant ask, a page with xattrs and a dentry page, recall/ack/release, the custody reply carrying a page" {

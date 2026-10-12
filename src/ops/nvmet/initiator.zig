@@ -379,29 +379,53 @@ fn readSysfs(buf: []u8, comptime fmt: []const u8, args: anytype) ?[]const u8 {
     return std.mem.trim(u8, t, " \t\r\n");
 }
 
-fn listDir(gpa: Allocator, comptime fmt: []const u8, args: anytype) ![][]u8 {
-    var pb: [linux.PATH_MAX]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&pb, fmt, args, 0) catch return error.NameTooLong;
-    const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return errors.fromErrno(linux.errno(rc));
-    const fd: linux.fd_t = @intCast(rc);
-    defer _ = linux.close(fd);
-    var out: std.ArrayList([]u8) = .empty;
-    errdefer configfs.freeNames(gpa, out.toOwnedSlice(gpa) catch &.{});
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = linux.getdents64(fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return errors.fromErrno(linux.errno(n));
-        if (n == 0) break;
-        var off: usize = 0;
-        while (off < n) {
-            const d: *align(1) linux.dirent64 = @ptrCast(&buf[off]);
+/// A directory's entries straight off `getdents64` into a stack buffer:
+/// no allocation, directory order, `.`/`..` skipped. The fabric sampler
+/// walks `class/nvme` through it (the `.stats` render's one-allocation
+/// law); `listDir` sorts a duped copy for the callers that keep names.
+const DirWalk = struct {
+    fd: linux.fd_t,
+    buf: [8192]u8 = undefined,
+    len: usize = 0,
+    off: usize = 0,
+
+    fn open(comptime fmt: []const u8, args: anytype) !DirWalk {
+        var pb: [linux.PATH_MAX]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&pb, fmt, args, 0) catch return error.NameTooLong;
+        const rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return errors.fromErrno(linux.errno(rc));
+        return .{ .fd = @intCast(rc) };
+    }
+
+    fn close(self: *DirWalk) void {
+        _ = linux.close(self.fd);
+    }
+
+    /// The next entry's name (valid until the next call), null at the end.
+    fn next(self: *DirWalk) !?[]const u8 {
+        while (true) {
+            if (self.off >= self.len) {
+                const n = linux.getdents64(self.fd, &self.buf, self.buf.len);
+                if (linux.errno(n) != .SUCCESS) return errors.fromErrno(linux.errno(n));
+                if (n == 0) return null;
+                self.len = n;
+                self.off = 0;
+            }
+            const d: *align(1) linux.dirent64 = @ptrCast(&self.buf[self.off]);
             const name = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&d.name)), 0);
-            off += d.reclen;
+            self.off += d.reclen;
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            try out.append(gpa, try gpa.dupe(u8, name));
+            return name;
         }
     }
+};
+
+fn listDir(gpa: Allocator, comptime fmt: []const u8, args: anytype) ![][]u8 {
+    var walk = try DirWalk.open(fmt, args);
+    defer walk.close();
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer configfs.freeNames(gpa, out.toOwnedSlice(gpa) catch &.{});
+    while (try walk.next()) |name| try out.append(gpa, try gpa.dupe(u8, name));
     std.mem.sort([]u8, out.items, {}, struct {
         fn lt(_: void, a: []u8, b: []u8) bool {
             return std.mem.lessThan(u8, a, b);
@@ -823,10 +847,24 @@ pub const Sampler = struct {
         key: u64,
         live: bool,
     };
+    /// The retained identities (the reconnect law's state).
     seen: std.ArrayList(Ident) = .empty,
+    /// The sample's working tables, RETAINED across samples (cleared,
+    /// never freed): the identities this sample merged and, per retained
+    /// identity, whether the sample met it. They grow only when the
+    /// population grows, so a steady fabric samples with NO allocation —
+    /// the `.stats` render's one-allocation law holds with controllers
+    /// present (every render allocated and freed them before).
+    current: std.ArrayList(Ident) = .empty,
+    present: std.ArrayList(bool) = .empty,
+    /// The sample in progress: fabric controllers seen, not-live among them.
+    controllers: u64 = 0,
+    not_live: u64 = 0,
 
     pub fn deinit(self: *Sampler, gpa: Allocator) void {
         self.seen.deinit(gpa);
+        self.current.deinit(gpa);
+        self.present.deinit(gpa);
     }
 
     fn keyOf(c: *const Controller) u64 {
@@ -844,44 +882,64 @@ pub const Sampler = struct {
     /// not-live → live transitions. State law (F:279-341): identities
     /// that vanish while not-live are RETAINED (a give-up + renumbered
     /// reappearance as live counts once); those that vanish while live are
-    /// dropped; live wins on duplicates.
+    /// dropped; live wins on duplicates. `gpa` owns every table of this
+    /// sampler (`deinit` takes the same one).
     pub fn sample(self: *Sampler, gpa: Allocator, ctrls: []const Controller) !void {
-        return self.sampleWith(gpa, gpa, ctrls);
+        try self.begin(gpa);
+        for (ctrls) |*c| try self.observe(gpa, c);
+        try self.finish(gpa);
     }
 
-    /// `gpa` for the sample's transient tables, `seen_gpa` for the retained
-    /// identities (`deinit` must get the same `seen_gpa`).
-    pub fn sampleWith(self: *Sampler, gpa: Allocator, seen_gpa: Allocator, ctrls: []const Controller) !void {
-        var controllers: u64 = 0;
-        var not_live: u64 = 0;
-        var reconnects: u64 = 0;
-        var present = try gpa.alloc(bool, self.seen.items.len);
-        defer gpa.free(present);
-        @memset(present, false);
-        var current: std.ArrayList(Ident) = .empty;
-        defer current.deinit(gpa);
-        for (ctrls) |*c| {
-            if (!c.isFabric()) continue;
-            controllers += 1;
-            const live = c.isLive();
-            if (!live) not_live += 1;
-            const k = keyOf(c);
-            var merged = false;
-            for (current.items) |*cur| if (cur.key == k) {
-                cur.live = cur.live or live;
-                merged = true;
-            };
-            if (!merged) try current.append(gpa, .{ .key = k, .live = live });
+    /// One sample straight off `<root>/class/nvme`: every controller is
+    /// read into a stack `Controller` and folded as it is met — nothing is
+    /// listed, duped or sorted. An absent `class/nvme` is a zero sample.
+    pub fn sampleSysfs(self: *Sampler, gpa: Allocator, root: []const u8) !void {
+        try self.begin(gpa);
+        var walk = DirWalk.open("{s}/class/nvme", .{root}) catch |e| switch (e) {
+            error.FileNotFound => return self.finish(gpa),
+            else => return e,
+        };
+        defer walk.close();
+        while (try walk.next()) |name| {
+            const c = readController(root, name) orelse continue;
+            try self.observe(gpa, &c);
         }
-        for (current.items) |cur| {
+        try self.finish(gpa);
+    }
+
+    fn begin(self: *Sampler, gpa: Allocator) !void {
+        self.controllers = 0;
+        self.not_live = 0;
+        self.current.clearRetainingCapacity();
+        self.present.clearRetainingCapacity();
+        try self.present.appendNTimes(gpa, false, self.seen.items.len);
+    }
+
+    fn observe(self: *Sampler, gpa: Allocator, c: *const Controller) !void {
+        if (!c.isFabric()) return;
+        self.controllers += 1;
+        const live = c.isLive();
+        if (!live) self.not_live += 1;
+        const k = keyOf(c);
+        for (self.current.items) |*cur| if (cur.key == k) {
+            cur.live = cur.live or live;
+            return;
+        };
+        try self.current.append(gpa, .{ .key = k, .live = live });
+    }
+
+    fn finish(self: *Sampler, gpa: Allocator) !void {
+        var reconnects: u64 = 0;
+        const present = self.present.items;
+        for (self.current.items) |cur| {
             var found = false;
-            for (self.seen.items, 0..) |*prev, i| if (prev.key == cur.key) {
+            for (self.seen.items[0..present.len], 0..) |*prev, i| if (prev.key == cur.key) {
                 found = true;
                 present[i] = true;
                 if (!prev.live and cur.live) reconnects += 1;
                 prev.live = cur.live;
             };
-            if (!found) try self.seen.append(seen_gpa, cur);
+            if (!found) try self.seen.append(gpa, cur);
         }
         // Drop identities that vanished while live; keep the not-live ones.
         var i: usize = 0;
@@ -899,8 +957,11 @@ pub const Sampler = struct {
             kept += 1;
         }
         self.seen.shrinkRetainingCapacity(kept);
-        stats.fabric_controllers.set(controllers);
-        stats.fabric_ctrl_not_live.set(not_live);
+        // The next sample's presence table is sized NOW, with the population
+        // that grew it: a sample over a steady fabric allocates nothing.
+        try self.present.ensureTotalCapacity(gpa, self.seen.items.len);
+        stats.fabric_controllers.set(self.controllers);
+        stats.fabric_ctrl_not_live.set(self.not_live);
         if (reconnects != 0) stats.fabric_ctrl_reconnects.add(reconnects);
     }
 };
@@ -909,22 +970,25 @@ var process_sampler: Sampler = .{};
 /// Two concurrent renders: the second skips its sample (acq_rel pairs the
 /// release below with the next taker's acquire).
 var process_sampler_busy: std.atomic.Value(bool) = .init(false);
-/// The process sampler's `seen` identities outlive every render: they are
-/// process-lifetime state (the retained not-live identities ARE the
-/// reconnect law), so they live on the process allocator, never a render's
-/// — under the test runner each test's allocator dies with the test, and a
-/// list it owned would be a dangling list on the next render (the segfault
-/// a venue with live fabric controllers showed).
+/// The process sampler's tables outlive every render: the `seen`
+/// identities are process-lifetime state (the retained not-live identities
+/// ARE the reconnect law) and the working tables are reused sample after
+/// sample, so they live on the process allocator, never a render's — under
+/// the test runner each test's allocator dies with the test, and a list it
+/// owned would be a dangling list on the next render (the segfault a venue
+/// with live fabric controllers showed); and a render allocates ONE payload
+/// and nothing else (`stats.zig`'s allocation law), controllers or not.
 const process_sampler_gpa = std.heap.page_allocator;
+/// Test seam: the process sampler's sysfs root (null = `SYSFS_ROOT`), so a
+/// render can be measured over a fixture tree of controllers.
+pub var test_sysfs_root: ?[]const u8 = null;
 
 /// The process's sample off the real sysfs (the `.stats` render's cadence;
-/// a cold path). `gpa` serves the sample's transient allocations only.
-pub fn sampleFabric(gpa: Allocator) void {
+/// a cold path). Takes no allocator: the render has nothing to lend.
+pub fn sampleFabric() void {
     if (process_sampler_busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
     defer process_sampler_busy.store(false, .release);
-    const ctrls = listControllers(gpa, SYSFS_ROOT) catch return;
-    defer gpa.free(ctrls);
-    process_sampler.sampleWith(gpa, process_sampler_gpa, ctrls) catch {};
+    process_sampler.sampleSysfs(process_sampler_gpa, test_sysfs_root orelse SYSFS_ROOT) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,12 +1164,12 @@ test "the strict namespace shape: nvme0n1 and nvme12n34 match; a hidden path nod
 /// state,subsysnqn,hostnqn,hostid,address,<ns>/}`, `class/block/<ns>/
 /// {nsid,uuid}`, `class/nvme-generic/<ng>/dev`, `class/nvme-subsystem/
 /// <sub>/{subsysnqn, nvme<N>/, <head>/}`.
-const Fixture = struct {
+pub const Fixture = struct {
     gpa: Allocator,
     io: Io,
     root: []u8,
 
-    fn init(gpa: Allocator, io: Io, tag: []const u8) !Fixture {
+    pub fn init(gpa: Allocator, io: Io, tag: []const u8) !Fixture {
         _ = linux.mkdir("/build/tmp", 0o755);
         const root = try std.fmt.allocPrint(gpa, "/build/tmp/sysfs-fixture-{s}-{d}", .{ tag, linux.getpid() });
         Io.Dir.cwd().deleteTree(io, root) catch {};
@@ -1113,25 +1177,25 @@ const Fixture = struct {
         return .{ .gpa = gpa, .io = io, .root = root };
     }
 
-    fn deinit(self: *Fixture) void {
+    pub fn deinit(self: *Fixture) void {
         Io.Dir.cwd().deleteTree(self.io, self.root) catch {};
         self.gpa.free(self.root);
     }
 
-    fn file(self: *Fixture, comptime rel: []const u8, args: anytype, content: []const u8) !void {
+    pub fn file(self: *Fixture, comptime rel: []const u8, args: anytype, content: []const u8) !void {
         var pb: [512]u8 = undefined;
         const p = try std.fmt.bufPrint(&pb, "{s}/" ++ rel, .{self.root} ++ args);
         try Io.Dir.cwd().createDirPath(self.io, std.fs.path.dirname(p).?);
         try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = p, .data = content });
     }
 
-    fn dir(self: *Fixture, comptime rel: []const u8, args: anytype) !void {
+    pub fn dir(self: *Fixture, comptime rel: []const u8, args: anytype) !void {
         var pb: [512]u8 = undefined;
         const p = try std.fmt.bufPrint(&pb, "{s}/" ++ rel, .{self.root} ++ args);
         try Io.Dir.cwd().createDirPath(self.io, p);
     }
 
-    fn controller(self: *Fixture, n: u32, transport: []const u8, state: []const u8, nqn: []const u8, hostnqn: []const u8, hostid: []const u8, address: []const u8) !void {
+    pub fn controller(self: *Fixture, n: u32, transport: []const u8, state: []const u8, nqn: []const u8, hostnqn: []const u8, hostid: []const u8, address: []const u8) !void {
         try self.file("class/nvme/nvme{d}/transport", .{n}, transport);
         try self.file("class/nvme/nvme{d}/state", .{n}, state);
         try self.file("class/nvme/nvme{d}/subsysnqn", .{n}, nqn);
@@ -1140,7 +1204,7 @@ const Fixture = struct {
         try self.file("class/nvme/nvme{d}/address", .{n}, address);
     }
 
-    fn namespace(self: *Fixture, ctrl: u32, ns: u32, uuid: []const u8, with_char: bool) !void {
+    pub fn namespace(self: *Fixture, ctrl: u32, ns: u32, uuid: []const u8, with_char: bool) !void {
         try self.dir("class/nvme/nvme{d}/nvme{d}n{d}", .{ ctrl, ctrl, ns });
         try self.file("class/block/nvme{d}n{d}/nsid", .{ ctrl, ns }, "1\n");
         try self.file("class/block/nvme{d}n{d}/uuid", .{ ctrl, ns }, uuid);
@@ -1192,53 +1256,90 @@ test "discovery over fixture trees: the plain per-controller node with its nsid,
     try testing.expect(!(try multipathMergedShape(gpa, fx.root, "nqn.other")));
 }
 
-/// A render's allocator that counts its live allocations.
-const LiveCount = struct {
+/// An allocator that counts its calls (the sampler's zero-allocation pin).
+const CallCount = struct {
     inner: Allocator,
-    live: usize = 0,
+    allocs: usize = 0,
+    resizes: usize = 0,
+    remaps: usize = 0,
+    frees: usize = 0,
 
-    fn allocator(self: *LiveCount) Allocator {
+    fn allocator(self: *CallCount) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *LiveCount = @ptrCast(@alignCast(ctx));
-        const p = self.inner.rawAlloc(len, alignment, ret_addr);
-        if (p != null) self.live += 1;
-        return p;
+        const self: *CallCount = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.inner.rawAlloc(len, alignment, ret_addr);
     }
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *LiveCount = @ptrCast(@alignCast(ctx));
+        const self: *CallCount = @ptrCast(@alignCast(ctx));
+        self.resizes += 1;
         return self.inner.rawResize(memory, alignment, new_len, ret_addr);
     }
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *LiveCount = @ptrCast(@alignCast(ctx));
+        const self: *CallCount = @ptrCast(@alignCast(ctx));
+        self.remaps += 1;
         return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
     }
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *LiveCount = @ptrCast(@alignCast(ctx));
+        const self: *CallCount = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
         self.inner.rawFree(memory, alignment, ret_addr);
-        self.live -= 1;
+    }
+
+    fn total(self: *const CallCount) usize {
+        return self.allocs + self.resizes + self.remaps + self.frees;
     }
 };
 
-test "the process sampler's retained identities live on the process allocator: a sample through a per-render allocator leaves NOTHING live in it (the test runner's per-test allocator dies with the test; the retained list must not)" {
+test "the sampler's tables are retained across samples: over a fixture tree of three fabric controllers the first sysfs sample grows them, the second and every later sample of the same population touches the allocator NOT ONCE (no list, no dupe, no sort, no transient table); the reconnect law still reads across samples; the retained identities outlive the render" {
+    const gpa = testing.allocator;
+    var fx = Fixture.init(gpa, testing.io, "sampler") catch return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer fx.deinit();
+    try fx.controller(0, "pcie", "live", "nqn.local", "", "", "");
+    try fx.controller(1, "tcp", "connecting", "nqn.sub-a", "nqn.host", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "traddr=10.0.0.1,trsvcid=4420");
+    try fx.controller(2, "loop", "live", "nqn.sub-b", "nqn.host", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "traddr=,trsvcid=");
+    try fx.controller(3, "tcp", "live", "nqn.sub-c", "nqn.host", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "traddr=10.0.0.2,trsvcid=4420");
+    var counting: CallCount = .{ .inner = gpa };
     var s: Sampler = .{};
-    defer s.deinit(process_sampler_gpa);
+    defer s.deinit(counting.allocator());
+    try s.sampleSysfs(counting.allocator(), fx.root);
+    try testing.expectEqual(@as(u64, 3), stats.fabric_controllers.load());
+    try testing.expectEqual(@as(u64, 1), stats.fabric_ctrl_not_live.load());
+    try testing.expectEqual(@as(usize, 3), s.seen.items.len);
+    try testing.expect(counting.total() > 0);
+    // Steady population: the tables are already sized — zero calls.
+    const grown = counting.total();
+    try s.sampleSysfs(counting.allocator(), fx.root);
+    try s.sampleSysfs(counting.allocator(), fx.root);
+    try testing.expectEqual(grown, counting.total());
+    try testing.expectEqual(@as(u64, 3), stats.fabric_controllers.load());
+    // A reconnect read across samples (the retained identity, now live).
+    const base = stats.fabric_ctrl_reconnects.load();
+    try fx.file("class/nvme/nvme1/state", .{}, "live");
+    try s.sampleSysfs(counting.allocator(), fx.root);
+    try testing.expectEqual(base + 1, stats.fabric_ctrl_reconnects.load());
+    try testing.expectEqual(@as(u64, 0), stats.fabric_ctrl_not_live.load());
+    try testing.expectEqual(grown, counting.total());
+    // The controller list face folds through the same tables: still zero.
     var a: Controller = .{ .instance = 1 };
     fill(&a.transport, &a.transport_len, "tcp");
-    fill(&a.state, &a.state_len, "connecting");
-    fill(&a.subsysnqn, &a.subsysnqn_len, "nqn.sub");
+    fill(&a.state, &a.state_len, "live");
+    fill(&a.subsysnqn, &a.subsysnqn_len, "nqn.sub-a");
     fill(&a.address, &a.address_len, "traddr=10.0.0.1,trsvcid=4420");
-    var render: LiveCount = .{ .inner = testing.allocator };
-    try s.sampleWith(render.allocator(), process_sampler_gpa, &.{a});
-    try testing.expectEqual(@as(usize, 1), s.seen.items.len);
-    try testing.expectEqual(@as(usize, 0), render.live);
-    // The next render, through another allocator, reads the retained identity whole.
-    var a_live = a;
-    fill(&a_live.state, &a_live.state_len, "live");
-    const base = stats.fabric_ctrl_reconnects.load();
-    try s.sampleWith(testing.allocator, process_sampler_gpa, &.{a_live});
-    try testing.expectEqual(base + 1, stats.fabric_ctrl_reconnects.load());
+    try s.sample(counting.allocator(), &.{a});
+    try testing.expectEqual(grown, counting.total());
+    try testing.expectEqual(@as(u64, 1), stats.fabric_controllers.load());
+    // A missing class/nvme is a zero sample, still without a call.
+    try s.sampleSysfs(counting.allocator(), "/nonexistent-sysfs-root");
+    try testing.expectEqual(@as(u64, 0), stats.fabric_controllers.load());
+    try testing.expectEqual(grown, counting.total());
+    // The process sampler reads the seam's root and lends nothing to a render.
+    test_sysfs_root = fx.root;
+    defer test_sysfs_root = null;
+    sampleFabric();
+    try testing.expectEqual(@as(u64, 3), stats.fabric_controllers.load());
 }
 
 test "the fabric sampler: pcie skipped; unknown state not live; a missing sysfs is a zero sample; a reconnect is an observed not-live → live; renumbering of a not-live identity is tracked once; src_addr churn is one identity; the same NQN on two addresses is two" {

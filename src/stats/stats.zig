@@ -32,6 +32,7 @@ const counters = @import("../core/counters.zig");
 const knobs = @import("../core/knobs.zig");
 const clock = @import("../core/clock.zig");
 const log = @import("../core/log.zig");
+const testkit = @import("../core/testkit.zig");
 // ---- the families' modules ----
 const session = if (is_linux) @import("../fuse/transport/session.zig") else struct {};
 const slot = @import("../fuse/transport/slot.zig");
@@ -625,9 +626,10 @@ fn writeOps(_: *Sources, w: *Writer) Error!void {
 
 /// The `nvmet_*` / `fabric_*` family; the fabric controllers are SAMPLED
 /// off `/sys/class/nvme` at every render (a cold path: the `.stats` build
-/// is the cadence, never an op).
-fn writeNvmet(src: *Sources, w: *Writer) Error!void {
-    if (is_linux) if (src.gpa) |gpa| nvmet_initiator.sampleFabric(gpa);
+/// is the cadence, never an op). The sampler owns its tables for the
+/// process's life and borrows nothing from the render (the allocation law).
+fn writeNvmet(_: *Sources, w: *Writer) Error!void {
+    if (is_linux) nvmet_initiator.sampleFabric();
     try nvmet_stats.writeStatsJson(w);
 }
 
@@ -1165,6 +1167,33 @@ test "allocation law: after the warm-up render a render is exactly ONE allocatio
     try testing.expectEqual(before.remaps, ca.remaps);
     try testing.expect(p.buf.len >= p.len);
     try testing.expectEqual(r.last_len, p.len);
+}
+
+test "allocation law under fabric controllers (linux): with three fabric controllers in the sampled sysfs the sampler borrows nothing from the render — the render after the warm-up is still exactly ONE allocation, and the fabric gauges read the controllers" {
+    if (!is_linux) return testkit.skip(@src(), .no_linux, "the fabric sampler reads sysfs");
+    var fx = nvmet_initiator.Fixture.init(testing.allocator, testing.io, "stats-law") catch return testkit.skip(@src(), .no_device, "/build/tmp is not writable on this host (the venue's cache volume)");
+    defer fx.deinit();
+    try fx.controller(0, "pcie", "live", "nqn.local", "", "", "");
+    try fx.controller(1, "tcp", "connecting", "nqn.sub-a", "nqn.host", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "traddr=10.0.0.1,trsvcid=4420");
+    try fx.controller(2, "loop", "live", "nqn.sub-b", "nqn.host", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "traddr=,trsvcid=");
+    try fx.controller(3, "tcp", "live", "nqn.sub-c", "nqn.host", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "traddr=10.0.0.2,trsvcid=4420");
+    nvmet_initiator.test_sysfs_root = fx.root;
+    defer nvmet_initiator.test_sysfs_root = null;
+    var ca: CountingAllocator = .{ .inner = testing.allocator };
+    var r = Renderer.init(ca.allocator(), .{});
+    defer r.deinit();
+    const warm = try r.render();
+    warm.deinit(ca.allocator());
+    try testing.expectEqual(@as(u64, 3), nvmet_stats.fabric_controllers.load());
+    const before = ca;
+    const p = try r.render();
+    defer p.deinit(ca.allocator());
+    try testing.expectEqual(before.allocs + 1, ca.allocs);
+    try testing.expectEqual(before.resizes, ca.resizes);
+    try testing.expectEqual(before.remaps, ca.remaps);
+    try testing.expectEqual(before.frees, ca.frees);
+    try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"fabric_controllers\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, p.bytes(), "\"fabric_ctrl_not_live\":1") != null);
 }
 
 test "renderConfig: build + mount + the set writer's object + the URIs, one newline" {

@@ -579,8 +579,8 @@ src/ops/nvmet/initiator.zig:123 | 10 | OWED: derive it or document it on the lin
 src/ops/nvmet/initiator.zig:125 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/nvmet/initiator.zig:277 | 63 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/nvmet/initiator.zig:354 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/nvmet/initiator.zig:550 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/ops/nvmet/initiator.zig:599 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/nvmet/initiator.zig:574 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/ops/nvmet/initiator.zig:623 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/nvmet/ledger.zig:100 | 56 | OWED: derive it or document it on the line (charter §1.5)
 src/ops/nvmet/verbs.zig:57 | 0x0f | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/ops/nvmet/verbs.zig:57 | 0x40 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
@@ -675,9 +675,9 @@ src/shim/sys.zig:131 | 0xfff | an encoding constant (magic, mask, flag bit, hash
 src/shim/sys.zig:131 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/shim/sys.zig:131 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/shim/sys.zig:131 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/stats/stats.zig:425 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
-src/stats/stats.zig:837 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/stats/stats.zig:837 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/stats/stats.zig:426 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
+src/stats/stats.zig:839 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/stats/stats.zig:839 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/auth.zig:50 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/auth.zig:59 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/codec.zig:40 | 8 | OWED: derive it or document it on the line (charter §1.5)

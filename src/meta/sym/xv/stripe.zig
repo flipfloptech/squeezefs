@@ -804,6 +804,11 @@ pub fn SupplyService(comptime Store: type) type {
             const face = self.plane.striping orelse return .{ .ok = .{ .supply_stripe_inos = .{ .head = .{ .n = 0, .reserved = @splat(0) }, .items = &.{} } } };
             var minted: [K_MAX]u64 = undefined;
             const n = face.supply(face.ctx, r.head.dir, .{ .mode = r.head.mode, .uid = r.head.uid, .gid = r.head.gid, .ts_ns = r.head.ts_ns }, r.indices, minted[0..r.indices.len]);
+            // The reply follows this creator's durability lane: the
+            // holder's flip names these records in its map, and a stripe
+            // whose record died with its creator's ring is C17's
+            // missing-stripe.
+            if (n != 0) self.plane.apply.barrier() catch return service.Answer.refused(error.InputOutput, "the supplied stripe records could not be made durable");
             stats.dir_stripe_supplies_served.inc();
             const out = std.mem.bytesAsSlice(u64, scratch[0 .. n * @sizeOf(u64)]);
             for (minted[0..n], 0..) |ino, i| out[i] = ino;

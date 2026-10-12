@@ -506,6 +506,10 @@ pub fn RecordShipService(comptime Store: type) type {
                 error.ValueTooLarge => error.ValueTooLarge,
                 else => error.Io,
             };
+            // The reply follows the holder's durability lane: the writer
+            // acks its application on this answer (a publish's bytes, a
+            // size claim) and cannot barrier this holder's ring itself.
+            a.barrier() catch return error.Io;
             stats.record_served.inc();
             if (call.isPublish()) stats.foreign_publish_served.inc();
             self.sink.noteServed(global, call.isPublish());

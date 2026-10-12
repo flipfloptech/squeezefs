@@ -55,6 +55,8 @@ pub const HolderStore = struct {
     leased: std.ArrayListUnmanaged(u16) = .empty,
     refusals: u32 = 0,
     commits: u32 = 0,
+    /// The commits the last barrier covered (what a crash keeps).
+    durable: u32 = 0,
 
     pub fn coreError(e: StoreError) errors.Error {
         return switch (e) {
@@ -100,7 +102,8 @@ pub const HolderStore = struct {
     }
 
     pub fn fsync(self: *HolderStore) StoreError!void {
-        return self.mem.fsync();
+        try self.mem.fsync();
+        self.durable = self.commits;
     }
 
     pub fn nameKey(self: *const HolderStore) *const key.NameKey {
@@ -967,6 +970,38 @@ fn namesOf(gpa: Allocator, recs: []const stripe.DirRec) ![][]const u8 {
     const out = try gpa.alloc([]const u8, recs.len);
     for (recs, 0..) |r, i| out[i] = r.name;
     return out;
+}
+
+test "a served mutation's reply follows the holder's durability lane (found by the shared hot directory row: fsck C9 found a live inode named by no dentry after kill -9 of the stripes' holder — the holder had answered a served insert before its window landed, the creator retired its intent on that answer, and the dentry died with the holder's ring): a served step, a served record verb and a served stripe supply each leave the holder durable through its last commit before the reply" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    // The served step: A's create in B's directory.
+    const c0 = f.b.store.commits;
+    _ = try f.a.create(DIR_B, "f", S.IFREG | 0o644);
+    try testing.expect(f.b.store.commits > c0);
+    try testing.expectEqual(f.b.store.commits, f.b.store.durable);
+    // The served record verb: a chmod of B's file from A.
+    var view: HolderView = .{};
+    var rs_b: RecordShipService = .{ .plane = &f.b.plane, .sink = view.sink() };
+    rs_b.register(&f.b.svc);
+    const file = gino(50, 3);
+    try f.b.seedFile(file, 1);
+    const c1 = f.b.store.commits;
+    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .setattr = .{ .mode = 0o600 } }, 0)).?;
+    try testing.expect(f.b.store.commits > c1);
+    try testing.expectEqual(f.b.store.commits, f.b.store.durable);
+    // The served supply: B asks A for two stripe inos of B's directory.
+    var src_a: StripeSource = .{ .h = &f.a };
+    f.a.plane.striping = src_a.face();
+    var supply_a: stripe.SupplyService(HolderStore) = .{ .plane = &f.a.plane };
+    supply_a.register(&f.a.svc);
+    const c2 = f.a.store.commits;
+    var minted: [2]u64 = undefined;
+    try testing.expectEqual(@as(usize, 2), try stripe.supplyRemote(linkOf(&f.b.conn), 0, DIR_B, .{ .mode = S.IFDIR | 0o755, .uid = 1, .gid = 2, .ts_ns = 1_000 }, &.{ 0, 1 }, &minted));
+    try testing.expect(f.a.store.commits > c2);
+    try testing.expectEqual(f.a.store.commits, f.a.store.durable);
 }
 
 test "striping: a flip supplied by the other creator OVER THE WIRE (`SupplyStripeInos`, one batch for its share) maps K stripes under ONE intent (the commit marker last), every stripe record flagged; a create into the striped directory keys the STRIPE (shipped when the stripe is foreign); a name left in D re-homes lazily on its next mutation and reads from the stripe (LWW); readdir is the K-way merge in cookie order with a stable continuation across the flip; stat folds nlink and times; rmdir is ONE intent and leaves no map, no stripe, no name; C17 is clean" {

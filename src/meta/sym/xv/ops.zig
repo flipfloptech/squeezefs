@@ -968,6 +968,11 @@ pub fn Plane(comptime Store: type) type {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.Io,
             };
+            // The reply follows the holder's durability lane: the
+            // initiator retires its intent on this answer, so a step
+            // acked out of a window that never landed would die with this
+            // holder while the intent that could replay it is gone.
+            self.apply.barrier() catch return error.Io;
             stats.xv_cross_owner_steps_served.inc();
             if (step == .insert_dentry and out.status == .applied) {
                 // The census' CREATOR is the shipped child's slot holder

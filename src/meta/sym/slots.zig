@@ -21,6 +21,7 @@ pub const acquire = @import("slots/acquire.zig");
 pub const handover = @import("slots/handover.zig");
 pub const page_budget = @import("slots/page_budget.zig");
 pub const resolve = @import("slots/resolve.zig");
+pub const tails_spill = @import("slots/tails_spill.zig");
 
 pub const LeaseTable = lease_table.LeaseTable;
 pub const Door = door.Door;
@@ -74,6 +75,8 @@ pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try counters.writeNamespaceJson(page_budget.stats, w);
     try w.writeAll(",\"resolve\":");
     try counters.writeNamespaceJson(resolve.stats, w);
+    try w.writeAll(",\"tails_spill\":");
+    try counters.writeNamespaceJson(tails_spill.stats, w);
     try w.writeByte('}');
 }
 
@@ -85,6 +88,7 @@ test {
     _ = handover;
     _ = page_budget;
     _ = resolve;
+    _ = tails_spill;
 }
 
 test "the tree gauges fold a sorted census: p50/p99/max of inos and bytes; empty reads 0" {

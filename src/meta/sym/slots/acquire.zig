@@ -39,6 +39,7 @@ const journal = @import("../../journal.zig");
 const geometry = @import("../../geometry.zig");
 const cr = @import("../control_records.zig");
 const manager = @import("../manager.zig");
+const tails_spill = @import("tails_spill.zig");
 const page = @import("../appender_page.zig");
 const lt = @import("lease_table.zig");
 const door_mod = @import("door.zig");
@@ -695,19 +696,61 @@ pub const Verbs = struct {
         const next: cr.SlotState = .{ .variant = .unleased, .g = req.g, .root = req.words.root, .cursor = @max(req.words.cursor, cur.cursor), .slot_tree_extents = req.words.extents, .last_written = self.table.lease_seq + 1, .seq_floor = @max(req.words.seq_floor, cur.seq_floor) };
         const value = next.encode();
         const value_cap = geometry.recordValueCap(g.node_size);
-        const tails_buf = try gpa.alloc(u8, cr.slotTailsEncodedLen(.{ .inline_tails = .{ .g = req.g, .tails = req.tails } }));
-        defer gpa.free(tails_buf);
-        const tails_enc = cr.encodeSlotTails(.{ .inline_tails = .{ .g = req.g, .tails = req.tails } }, tails_buf) catch return error.Corrupt;
         const sk = cr.slotStateKey(req.slot);
         const tk = cr.slotTailsKey(req.slot);
-        var recs: [2]manager.ControlRecord = .{ .{ .put = .{ .key = sk.slice(), .value = &value } }, .{ .put = .{ .key = tk.slice(), .value = tails_enc } } };
-        // A tails set past the inline cap spills at the recovery/leave
-        // rung; here the entry carries what fits and drops the rest loud.
-        const n_recs: usize = if (tails_enc.len > value_cap) 1 else 2;
-        try self.control(recs[0..n_recs]);
+        var recs: std.ArrayList(manager.ControlRecord) = .empty;
+        defer recs.deinit(gpa);
+        try recs.append(gpa, .{ .put = .{ .key = sk.slice(), .value = &value } });
+        // The tails: inline under the value cap, else SPILLED into claimed
+        // extents (`tails_spill`) named by the record and the entry's
+        // `alloc` deltas; a spill the heap refuses lands the release
+        // without its tails (the leaves screen by the lease alone, loud).
+        var spilled: ?tails_spill.Spilled = null;
+        defer if (spilled) |*sp| sp.deinit();
+        const inline_rec: cr.SlotTails = .{ .inline_tails = .{ .g = req.g, .tails = req.tails } };
+        var tails_rec: ?cr.SlotTails = inline_rec;
+        if (cr.slotTailsEncodedLen(inline_rec) > value_cap) {
+            if (tails_spill.spill(gpa, self.mgr.vol, req.tails)) |sp| {
+                spilled = sp;
+                tails_rec = sp.record(req.g);
+            } else |e| switch (e) {
+                error.NoSpace => {
+                    log.warn("slot leases: slot {d}'s {d} leaf tails exceed the inline cap and the heap refused the spill — released WITHOUT its tails (its leaves screen by the lease alone)", .{ req.slot, req.tails.len });
+                    tails_rec = null;
+                },
+                error.Io => return error.Io,
+                error.OutOfMemory => return error.OutOfMemory,
+            }
+        }
+        var tails_buf: []u8 = &.{};
+        defer gpa.free(tails_buf);
+        if (tails_rec) |tr| {
+            tails_buf = try gpa.alloc(u8, cr.slotTailsEncodedLen(tr));
+            const tails_enc = cr.encodeSlotTails(tr, tails_buf) catch return error.Corrupt;
+            try recs.append(gpa, .{ .put = .{ .key = tk.slice(), .value = tails_enc } });
+        }
+        if (spilled) |sp| for (sp.extents) |e| try recs.append(gpa, .{ .alloc = e });
+        // A spilled record this one supersedes gives its extents back
+        // with the same entry (the frees land durable before the bits).
+        var old_extents: []u64 = &.{};
+        defer gpa.free(old_extents);
+        if (try self.mgr.vol.vt.lookup(self.mgr.vol.ctx, gpa, tk.slice())) |old_raw| {
+            defer gpa.free(old_raw);
+            if (cr.decodeSlotTails(old_raw)) |old| {
+                if (old.spilled) {
+                    old_extents = try tails_spill.extentsOf(gpa, self.mgr.vol, old);
+                    for (old_extents) |e| try recs.append(gpa, .{ .free = e });
+                }
+            } else |_| {}
+        }
+        self.control(recs.items) catch |e| {
+            if (spilled) |sp| for (sp.extents) |x| self.mgr.vol.vt.releaseUnpublished(self.mgr.vol.ctx, x);
+            return e;
+        };
+        for (old_extents) |e| self.mgr.vol.vt.releaseUnpublished(self.mgr.vol.ctx, e);
         // The frame screen's rule 2 reads the tails the entry just made
         // durable (the RAM index follows the durable word).
-        if (n_recs == 2) try self.table.recordTails(req.slot, req.g, req.tails);
+        if (tails_rec != null) try self.table.recordTails(req.slot, req.g, req.tails);
         self.seams.raiseRing0SeqFloor(self.seams.ctx, next.seq_floor);
         switch (try self.table.release(req.slot, req.appender_id, req.g, .{ .root = next.root, .cursor = next.cursor, .extents = next.slot_tree_extents, .seq_floor = next.seq_floor }, clock.monotonicNs())) {
             .released => {},
@@ -1196,6 +1239,48 @@ test "ReleaseSlot: the words are screened before any effect (a floor at the gran
     try testing.expectEqual(@as(u32, 2), g2.granted.grants[0].g);
     try testing.expectEqual(@as(u64, 40), g2.granted.grants[0].words.cursor);
     try testing.expectEqual(@as(u64, 10), g2.granted.grants[0].words.seq_floor);
+}
+
+test "ReleaseSlot past the inline cap SPILLS (rung 10 item 5b): 1,100 tails at the 64 KiB node (cap 1,039) land in one claimed extent named by a spilled record with the extent's alloc delta in the SAME entry; the RAM index holds every tail; the next release of the slot with a small set goes inline and gives the spill extent back (the free delta, the bit)" {
+    const gpa = testing.allocator;
+    const p = try TestPlane.init(gpa);
+    defer p.deinit();
+    const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{5} });
+    gpa.free(g.granted.grants);
+    const in_heap = p.tv.g.heap.start + 7 * p.tv.g.node_size;
+    const ok: SlotWords = .{ .root = .{ .addr = in_heap, .seq = 5 }, .cursor = 40, .extents = 2, .seq_floor = 10 };
+    const cap = cr.slotTailsInlineCap(geometry.recordValueCap(p.tv.g.node_size));
+    try testing.expectEqual(@as(u32, 1039), cap);
+    const n: usize = 1100;
+    const tails = try gpa.alloc(cr.TailEntry, n);
+    defer gpa.free(tails);
+    for (tails, 0..) |*t, i| t.* = .{ .leaf_addr = p.tv.g.heap.start + (i + 8) * p.tv.g.node_size, .tail = @intCast(4096 + i) };
+    const claimed0 = p.tv.allocatedExtents();
+    const entries0 = p.tv.control_entries;
+    const spills0 = tails_spill.stats.slot_tails_spills.load();
+    try testing.expectEqual(Verbs.ReleaseResult.released, try p.verbs.releaseSlot(gpa, .{ .appender_id = 0, .slot = 5, .g = 1, .words = ok, .tails = tails }));
+    try testing.expectEqual(entries0 + 1, p.tv.control_entries);
+    try testing.expectEqual(claimed0 + 1, p.tv.allocatedExtents());
+    try testing.expectEqual(spills0 + 1, tails_spill.stats.slot_tails_spills.load());
+    const dt = cr.decodeSlotTails(p.tv.get(cr.slotTailsKey(5).slice()).?) catch unreachable;
+    try testing.expect(dt.spilled and dt.count == 1 and dt.g == 1);
+    try testing.expectEqual(@as(u32, n), dt.spillRunAt(0).count);
+    // The RAM index (the frame screen's rule 2) holds the first and the last.
+    try testing.expectEqual(@as(u32, 4096), p.table.recordedTail(5, tails[0].leaf_addr).?.tail);
+    try testing.expectEqual(@as(u32, 4096 + n - 1), p.table.recordedTail(5, tails[n - 1].leaf_addr).?.tail);
+    // The spilled images read back whole through the volume's reader.
+    var back: std.ArrayList(cr.TailEntry) = .empty;
+    defer back.deinit(gpa);
+    try testing.expect(try tails_spill.read(gpa, p.tv.volume().reader(), dt, &back));
+    try testing.expectEqual(n, back.items.len);
+    // Re-leased, then released with two tails: inline, the spill extent back.
+    const g2 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{5} });
+    gpa.free(g2.granted.grants);
+    const small = [_]cr.TailEntry{ .{ .leaf_addr = in_heap, .tail = 1 }, .{ .leaf_addr = in_heap + p.tv.g.node_size, .tail = 2 } };
+    try testing.expectEqual(Verbs.ReleaseResult.released, try p.verbs.releaseSlot(gpa, .{ .appender_id = 0, .slot = 5, .g = 2, .words = .{ .root = ok.root, .cursor = 41, .extents = 2, .seq_floor = 11 }, .tails = &small }));
+    try testing.expectEqual(claimed0, p.tv.allocatedExtents());
+    const dt2 = cr.decodeSlotTails(p.tv.get(cr.slotTailsKey(5).slice()).?) catch unreachable;
+    try testing.expect(!dt2.spilled and dt2.count == 2 and dt2.g == 2);
 }
 
 test "the in-process accept: an offer standing for the requester runs the holder's transfer then the grant under one hold; a lapsed offer is an ordinary refusal; ResolveSlot answers the table; the door's first touch acquires through the verb and the handlers round-trip the wire codecs through the manager's table" {

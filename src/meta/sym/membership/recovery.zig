@@ -57,6 +57,7 @@ const checkpoint = @import("../../checkpoint.zig");
 const cr = @import("../control_records.zig");
 const page = @import("../appender_page.zig");
 const manager = @import("../manager.zig");
+const tails_spill = @import("../slots/tails_spill.zig");
 const lt = @import("../slots/lease_table.zig");
 const inos = @import("../../inos.zig");
 const custody = @import("../../../data/sym_planes/custody.zig");
@@ -256,6 +257,11 @@ pub const Volume = struct {
         quarantineCustody: *const fn (ctx: *anyopaque, slot: u16, until_realtime_ns: u64) void,
         /// The parked doors woken (`handover_done`).
         notifyHandoverDone: *const fn (ctx: *anyopaque) void,
+        /// A slot's tails past the inline cap SPILLED into claimed extents
+        /// (`slots/tails_spill`): the record and the `alloc` deltas the
+        /// entry carries. Null = no spill home (the RAM fixtures): such a
+        /// set is `Corrupt` here.
+        spillTails: ?*const fn (ctx: *anyopaque, gpa: Allocator, tails: []const cr.TailEntry) Error!tails_spill.Spilled = null,
     };
 };
 
@@ -541,21 +547,27 @@ pub const Driver = struct {
             const state: cr.SlotState = .{ .variant = .unleased, .g = pl.g, .root = pl.root, .cursor = pl.cursor, .slot_tree_extents = pl.extents, .last_written = table.lease_seq + 1, .seq_floor = pl.seq_floor };
             const sv = state.encode();
             const tails = tails_per_slot.items[i].items;
-            if (tails.len > TAILS_INLINE_MAX) return error.Corrupt;
-            const tv = cr.encodeSlotTails(.{ .inline_tails = .{ .g = pl.g, .tails = tails } }, &tails_buf) catch return error.Corrupt;
-            var recs: [3]manager.ControlRecord = undefined;
-            var n: usize = 0;
-            recs[n] = .{ .put = .{ .key = cr.slotStateKey(pl.slot).slice(), .value = &sv } };
-            n += 1;
-            recs[n] = .{ .put = .{ .key = cr.slotTailsKey(pl.slot).slice(), .value = tv } };
-            n += 1;
+            var recs: std.ArrayList(manager.ControlRecord) = .empty;
+            defer recs.deinit(gpa);
+            try recs.append(gpa, .{ .put = .{ .key = cr.slotStateKey(pl.slot).slice(), .value = &sv } });
+            // The tails inline under the cap, else spilled (the leave's
+            // path, `slots/tails_spill`) with the extents' `alloc` deltas.
+            var spilled: ?tails_spill.Spilled = null;
+            defer if (spilled) |*sp| sp.deinit();
+            if (tails.len > TAILS_INLINE_MAX) {
+                const f = self.vol.vt.spillTails orelse return error.Corrupt;
+                spilled = try f(self.vol.ctx, gpa, tails);
+            }
+            const tails_rec: cr.SlotTails = if (spilled) |sp| sp.record(pl.g) else .{ .inline_tails = .{ .g = pl.g, .tails = tails } };
+            const tv = cr.encodeSlotTails(tails_rec, &tails_buf) catch return error.Corrupt;
+            try recs.append(gpa, .{ .put = .{ .key = cr.slotTailsKey(pl.slot).slice(), .value = tv } });
+            if (spilled) |sp| for (sp.extents) |e| try recs.append(gpa, .{ .alloc = e });
             var qv: [cr.CustodyQuarantineWire.LEN]u8 = undefined;
             if (quarantine_until) |u| {
                 qv = cr.CustodyQuarantineWire.init(u).encode();
-                recs[n] = .{ .put = .{ .key = cr.custodyQuarantineKey(pl.slot).slice(), .value = &qv } };
-                n += 1;
+                try recs.append(gpa, .{ .put = .{ .key = cr.custodyQuarantineKey(pl.slot).slice(), .value = &qv } });
             }
-            try self.vol.vt.controlEntry(self.vol.ctx, recs[0..n]);
+            try self.vol.vt.controlEntry(self.vol.ctx, recs.items);
             try self.vol.vt.noteUnleased(self.vol.ctx, pl.slot, state);
             // The frame screen's rule 2 reads the tails just made durable.
             try table.recordTails(pl.slot, pl.g, tails);
@@ -726,8 +738,10 @@ pub const Driver = struct {
 /// A directory wider than this is past the ring budget on any volume the
 /// charter sizes (`heap/16 ÷ ring`, 32 MiB floor rings on a 16 TiB heap).
 pub const APPENDER_SCAN_MAX: u32 = 4096;
-/// The inline tails a recovery writes per slot (spill is the leave's
-/// path; a tree with more leaves than this is `Corrupt` here).
+/// The inline tails a recovery writes per slot: 1,024 × 16 B + the 12 B
+/// head = 16,396 B, under the smallest allowed node's value cap (64 KiB
+/// → 16,640 B, `geometry.recordValueCap`) and the stack buffer's size; a
+/// tree with more leaves spills (`slots/tails_spill`).
 pub const TAILS_INLINE_MAX: usize = 1024;
 pub const GRANT_RUNS_INLINE_MAX: usize = 256;
 /// Slots one re-run can absorb: the page budget's entries + the overflow

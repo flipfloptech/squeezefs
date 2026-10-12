@@ -461,10 +461,10 @@ src/meta/sym/extent_grant.zig:491 | 3 | OWED: derive it or document it on the li
 src/meta/sym/extent_grant.zig:514 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/manager.zig:138 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/sym/manager.zig:138 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/sym/membership/recovery.zig:134 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/membership/recovery.zig:134 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/meta/sym/membership/recovery.zig:136 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/membership/recovery.zig:135 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/meta/sym/membership/recovery.zig:135 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/membership/recovery.zig:137 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
+src/meta/sym/membership/recovery.zig:138 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/membership/shard.zig:796 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/meta/sym/region.zig:325 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:429 | 3 | OWED: derive it or document it on the line (charter §1.5)
@@ -472,7 +472,7 @@ src/meta/sym/region.zig:430 | 100 | OWED: derive it or document it on the line (
 src/meta/sym/region.zig:451 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:493 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/region.zig:498 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/slots.zig:59 | 100 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/slots.zig:60 | 100 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/slots/lease_table.zig:97 | 0xFFFF_FFFF | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/meta/sym/slots/lease_table.zig:98 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/slots/lease_table.zig:99 | 40 | a size — OWED: derive from derive.Facts or document the physical/format reason
@@ -673,9 +673,9 @@ src/shim/sys.zig:131 | 0xfff | an encoding constant (magic, mask, flag bit, hash
 src/shim/sys.zig:131 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/shim/sys.zig:131 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/shim/sys.zig:131 | 8 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/stats/stats.zig:430 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
-src/stats/stats.zig:851 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/stats/stats.zig:851 | 8 | OWED: derive it or document it on the line (charter §1.5)
+src/stats/stats.zig:431 | 0x20 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
+src/stats/stats.zig:852 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/stats/stats.zig:852 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/auth.zig:50 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/auth.zig:59 | 32 | OWED: derive it or document it on the line (charter §1.5)
 src/wire/codec.zig:40 | 8 | OWED: derive it or document it on the line (charter §1.5)

@@ -451,7 +451,7 @@ pub const Volume = struct {
         return self.vt.geometry(self.ctx);
     }
 
-    fn reader(self: *const Volume) dir.PageReader {
+    pub fn reader(self: *const Volume) dir.PageReader {
         return .{ .ctx = @constCast(self), .read = readPageSeam };
     }
 
@@ -1660,7 +1660,7 @@ pub const TestVolume = struct {
         self.gpa.destroy(self);
     }
 
-    fn at(self: *TestVolume, offset: u64) []u8 {
+    pub fn at(self: *TestVolume, offset: u64) []u8 {
         return self.image[@intCast(offset - self.image_base)..];
     }
 

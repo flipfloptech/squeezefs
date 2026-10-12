@@ -40,6 +40,8 @@ const region_mod = @import("../region.zig");
 const shard_mod = @import("../membership/shard.zig");
 const join_ladder_mod = @import("../membership/join_ladder.zig");
 const manager = @import("../manager.zig");
+const tails_spill = @import("tails_spill.zig");
+const appender_dir = @import("../appender_dir.zig");
 const slots = @import("../slots.zig");
 const verbs_wire = @import("../../../wire/verbs.zig");
 const lt = slots.lease_table;
@@ -200,17 +202,27 @@ pub const Plane = struct {
         for (kvs.items) |kv| {
             const slot = cr.slotOfKey(kv.key) orelse continue;
             const d = cr.decodeSlotTails(kv.value) catch return error.Corrupt;
-            // A spilled set is the leave's/recovery's rung (`slot_tails`
-            // past the inline cap stays owed); its leaves screen by the
-            // lease alone.
-            if (d.spilled) continue;
             entries.clearRetainingCapacity();
-            var i: usize = 0;
-            while (i < d.count) : (i += 1) try entries.append(gpa, d.tailEntryAt(i));
+            if (d.spilled) {
+                // The set folded back from its spill extents; images that
+                // fail their hash leave the slot's leaves to screen by the
+                // lease alone (counted there).
+                if (!try tails_spill.read(gpa, .{ .ctx = self, .read = &readPageFn }, d, &entries)) continue;
+            } else {
+                var i: usize = 0;
+                while (i < d.count) : (i += 1) try entries.append(gpa, d.tailEntryAt(i));
+            }
             try self.table.recordTails(slot, d.g, entries.items);
         }
         if (!fencing.test_unprimed_first_writer.load(.acquire)) try self.frames.prime(held.items, native_unleased[0..n_native]);
         be.cache.installFrameSeam(self.frames.seam());
+    }
+
+    fn readPageFn(ctx: *anyopaque, offset: u64, out: *[appender_dir.PAGE_LEN]u8) error{Io}!void {
+        const self = self_(ctx);
+        const img = self.be.dev.readRange(self.gpa, offset, appender_dir.PAGE_LEN) catch return error.Io;
+        defer self.gpa.free(img);
+        @memcpy(out, img[0..appender_dir.PAGE_LEN]);
     }
 
     /// Before the backend's task and lane go: the cadence's flight joined

@@ -49,6 +49,7 @@ const cr = @import("../control_records.zig");
 const grant = @import("../extent_grant.zig");
 const lt = @import("../slots/lease_table.zig");
 const slots_plane = @import("../slots/plane.zig");
+const tails_spill = @import("../slots/tails_spill.zig");
 const xv_set_bind = @import("../xv/set_bind.zig");
 const block_alloc = @import("../../../data/block_alloc.zig");
 const data_bitmap = @import("../../../data/sym_planes/data_bitmap.zig");
@@ -419,6 +420,15 @@ pub const VolumeBinding = struct {
     /// ONE ring-0 control entry in the USER class, DRAIN-AND-RETRY on a
     /// full window (the recovery never parks behind the checkpoint task:
     /// it cycles the checkpoint itself, bounded by `COVER_CYCLES_MAX`).
+    fn spillTailsFn(ctx: *anyopaque, gpa: Allocator, tails: []const cr.TailEntry) Error!tails_spill.Spilled {
+        const self = self_(ctx);
+        return tails_spill.spill(gpa, self.set().volume(), tails) catch |e| switch (e) {
+            error.NoSpace => error.Corrupt,
+            error.Io => error.Io,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
     fn controlEntryFn(ctx: *anyopaque, recs: []const manager.ControlRecord) Error!void {
         const self = self_(ctx);
         const vol = self.set().volume();
@@ -929,6 +939,7 @@ pub const VolumeBinding = struct {
         .leasedTo = &leasedToFn,
         .grantRecord = &grantRecordFn,
         .controlEntry = &controlEntryFn,
+        .spillTails = &spillTailsFn,
         .noteUnleased = &noteUnleasedFn,
         .table = &tableFn,
         .treeState = &treeStateFn,

@@ -361,6 +361,7 @@ pub const covered = [_]Covered{
     .{ .path = "src/meta/sym/slots/handover.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/page_budget.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/resolve.zig", .by = "src/meta/sym.zig" },
+    .{ .path = "src/meta/sym/slots/tails_spill.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/slots/plane.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/token_table.zig", .by = "src/meta/sym.zig" },
     .{ .path = "src/meta/sym/tokens/token_cache.zig", .by = "src/meta/sym.zig" },
@@ -1021,7 +1022,7 @@ test "every instrument declared in a generated namespace is a key of the documen
     const p = try r.render();
     defer p.deinit(testing.allocator);
     const text = p.bytes();
-    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.slots.stats, sym.slots.door.stats, sym.slots.acquire.stats, sym.slots.handover.stats, sym.slots.page_budget.stats, sym.slots.resolve.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats, sym.xv.intent.stats, sym.xv.applier.stats, sym.xv.guards.stats, sym.xv.dir_rename.stats, sym.xv.ops.stats, sym.xv.record_ship.stats, sym.xv.stripe.stats }) |Ns| {
+    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.slots.stats, sym.slots.door.stats, sym.slots.acquire.stats, sym.slots.handover.stats, sym.slots.page_budget.stats, sym.slots.resolve.stats, sym.slots.tails_spill.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats, sym.xv.intent.stats, sym.xv.applier.stats, sym.xv.guards.stats, sym.xv.dir_rename.stats, sym.xv.ops.stats, sym.xv.record_ship.stats, sym.xv.stripe.stats }) |Ns| {
         inline for (comptime counters.instrumentNames(Ns)) |name| {
             const T = @TypeOf(@field(Ns, name));
             const k = if (T == counters.Tripwire) @field(Ns, name).site else name;

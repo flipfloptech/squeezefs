@@ -514,7 +514,7 @@ test "the wire is 128 B at the spec's offsets; encode∘decode = id; the sector'
     var img: [sector_len]u8 = undefined;
     try sb.encodeSector(7, &img, null);
     try testing.expectEqualStrings("SQZDATLV", img[0..8]);
-    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, img[8..10], .little));
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, img[8..10], .little));
     try testing.expectEqual(@as(u32, 4 << 20), std.mem.readInt(u32, img[12..16], .little));
     try testing.expectEqual(@as(u32, 4_198_400), std.mem.readInt(u32, img[16..20], .little));
     try testing.expectEqual(feature_framed_images, std.mem.readInt(u64, img[72..80], .little));
@@ -549,8 +549,14 @@ test "decode refuses by class in order: length, magic, version, checksum, reserv
     try testing.expectError(error.BadMagic, DataSuperblock.decodeSector(&bad, &diag));
     try testing.expectError(error.InvalidMagic, classifySector0(&bad, &diag));
     try testing.expect(diag == .invalid_magic);
+    // A v1 image (xxh3-64 checksums) and a later version both refuse by
+    // version BEFORE any checksum check; the message names the reformat.
     bad = img;
-    std.mem.writeInt(u16, bad[8..10], 2, .little);
+    std.mem.writeInt(u16, bad[8..10], 1, .little);
+    try testing.expectError(error.WrongVersion, DataSuperblock.decodeSector(&bad, &diag));
+    try testing.expect(diag == .wrong_version and diag.wrong_version == 1);
+    bad = img;
+    std.mem.writeInt(u16, bad[8..10], 3, .little);
     try testing.expectError(error.WrongVersion, DataSuperblock.decodeSector(&bad, &diag));
     bad = img;
     bad[40] ^= 1;

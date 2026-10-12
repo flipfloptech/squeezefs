@@ -708,7 +708,7 @@ test "sector image: every field at its offset in the 192 B extern struct, checks
     var img: [sector_len]u8 = undefined;
     try sb.encodeSector(0, &img, null);
     try testing.expectEqualStrings("SQZMETLV", img[0..8]);
-    try testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, img[8..10], .little));
+    try testing.expectEqual(@as(u16, 5), std.mem.readInt(u16, img[8..10], .little));
     try testing.expectEqualSlices(u8, &.{ 0, 0 }, img[10..12]);
     try testing.expectEqual(@as(u32, 65536), std.mem.readInt(u32, img[12..16], .little));
     try testing.expectEqual(@as(u64, 64 << 20), std.mem.readInt(u64, img[16..24], .little));

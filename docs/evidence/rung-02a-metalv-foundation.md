@@ -120,7 +120,7 @@ totality under `std.testing.fuzz` for every codec (keys, records, inode value, b
 entry + page header, ledger record, superblock), replay ≡ RAM (`crashReplay` over `smo.TestVolume`),
 SMO completeness, the Linux kill matrix (every tx acked BEFORE the cut present whole, no partial tx,
 the DUR-8c watermark `max(ledger, replayed + 1)` exactly), `format → open → commit → close → open`
-on the one-member forest. `tests/fixtures/findvsa_pred_bset.v4.bin` is Zig-generated
+on the one-member forest. `tests/fixtures/findvsa_pred_bset.v5.bin` is Zig-generated
 (`tests/fixtures/gen_findvsa_pred_bset.zig`; README records the seed, horizon and counts) and pinned
 to 254,932 bytes / 3,515 records.
 

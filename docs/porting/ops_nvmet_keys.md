@@ -1,5 +1,14 @@
 # PORTING SPEC — `ops_nvmet_keys` (kernel `nvmet` target management, the fabrics initiator, the REAL PR legs, the fidelity tier, `storage`, key handling — rung 8)
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 Charter: §8 "NVMe-oF targets" (charter.md L257: nvmet via configfs is THE target; the
 write-ahead-intent ledger `pending/active/removing`, atomic renamed writes, forward-only,
 reconcile against live state, never trust configfs bookkeeping; one namespace per subsystem;

@@ -1,5 +1,14 @@
 # PORTING SPEC — Symmetric metadata, part A: appenders, the appender page/directory, and the MANAGER
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 > Scope: charter §5.5 "The forest (KD-SYM-2)", "Partition law", "Appenders", "The record-seq space
 > is monotone across rings", "Node seqs are incarnation-scoped", "The manager lease", "Extent grants";
 > §5.1 (the format's appender directory + appender-0 page); §5.7 (the D0 winner IS the manager);

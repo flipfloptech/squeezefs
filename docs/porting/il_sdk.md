@@ -1,5 +1,14 @@
 # PORTING SPEC — the native SDK (`libsqueezefs`, the C ABI): a second client kind on the il wire, the buffer-lease law, the one-release version window, strengthen-only per-open durability
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 Charter authority: §7 (`docs/charter.md:244` — "**SDK**: the same wire as a second client kind; positional-only ops on arena-backed 4 KiB-aligned buffers under a buffer-lease law (`free` while SUBMITTED = EBUSY, never deferred; poison ⇒ never recycled); versioned over a one-release window; strengthen-only per-open durability"), §12 (`charter.md:298` — "the SDK exports a C ABI"), §11 (`charter.md:287` — "the daemon and shim refuse to pair across builds"), §13 rung 7 (`charter.md:312` — "The interception shim + direct-drive lanes + doorbell; the SDK").
 
 ## 0. Status of the reference: the SDK is DESIGNED, NOT BUILT — what this spec is derived from

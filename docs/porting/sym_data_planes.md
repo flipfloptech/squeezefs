@@ -1,5 +1,14 @@
 # Porting spec — the symmetric DATA planes: allocation lease, data bitmap, ranged block grants, frees, the shared-block index, custody (rung 6)
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 Scope: charter §5.5 "Data-plane planes under the symmetric model", §5.6 (refs; `block_ref_probes`),
 §6.1–§6.2 (the ONE-writer allocator + reclaim already landed), §8 (`df`); decisions 0002 (rows 44,
 45, 104, 175, 185) and 0003 (Q3). The reference is EVIDENCE (0002 §1); every quirk is in §9 with the

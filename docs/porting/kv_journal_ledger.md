@@ -1,5 +1,14 @@
 # PORTING SPEC — MetaLV journal ring + reservation core + root ledger ("PR K3")
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 > **v4 decisions (format v4, 2026-10-05; decision 0003 WP-F; 0002 rows 37, 40, 41).** The tables below
 > are the reference's v3 bytes — evidence for the derivations; where a "v4:" row exists it is what
 > `squeezefs-zig` writes. No compatibility with the reference is owed (0002 §2); the "Zig-side
@@ -49,7 +58,7 @@ Files: `R/src/meta_backend/kv/journal_core.rs` (641), `journal.rs` (2425),
 `journal_lane.rs` (195), `checkpoint.rs` (ledger half), `backend.rs`
 (conveyor/durability lane), `R/loom-models/src/lib.rs` (`journal_core` models
 1261–1598, two-stage composition 6560–6900). All integers little-endian.
-Checksum everywhere = xxh3_64 (xxhash_rust `xxh3_64` / streaming `Xxh3`).
+Checksum everywhere = xxh3_64 (xxhash_rust `xxh3_64` / streaming `Xxh3`) in the reference; v5: `checksum.hash64` / `checksum.Hasher` (sqzhash128 low 64, format key).
 
 ---------------------------------------------------------------------------
 ## 1. JOURNAL RING ON-DISK FORMAT

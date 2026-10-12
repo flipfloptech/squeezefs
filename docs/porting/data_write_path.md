@@ -1,5 +1,14 @@
 # Porting spec — The data write path: ONE admission, five arms, fsync
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 Scope: charter §6.2 ("ONE write admission — the cheapest legal I/O, judged per
 page-aligned single-block PIECE"), §6.4 (fsync), §6.5 (`process_write` at every
 write path), §1.3 (1 copy + 1 DMA; 0 + 1 zero-copy), §2 lock levels (2)/(3)/(3.5),

@@ -1643,7 +1643,7 @@ test "segment record v3: 40 B header {SQZS, version 3, flags 0, key_len, val_len
     const vst = valueHash(&v);
     writeRecord(&image, 4096, k.bytes(), &v, 9, 0xF0F0, &vst);
     try testing.expectEqualSlices(u8, "SQZS", image[4096..4100]);
-    try testing.expectEqualSlices(u8, &.{ 2, 0, 0, 0 }, image[4100..4104]);
+    try testing.expectEqualSlices(u8, &.{ 3, 0, 0, 0 }, image[4100..4104]);
     try testing.expect(readHeaderAt(&image, 4096, .b) == null); // slot B cleared at the put
     try testing.expectEqual(HeaderSlot.a, currentHeader(&image, 4096).?.slot);
     try testing.expectEqualSlices(u8, &.{ 24, 0, 0, 0, 100, 0, 0, 0 }, image[4104..4112]);

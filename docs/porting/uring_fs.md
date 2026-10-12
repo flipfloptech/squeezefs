@@ -1,5 +1,14 @@
 # PORTING SPEC — `uring_fs` (pooled io_uring file layer) + the O_DIRECT metadata posture
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 Reference: `/Users/joberdorf/Source/squeezefs/src/uring_fs.rs` (3036 lines; the posture lives IN this file,
 lines 542–1080), `tests/uring_fs_tests.rs`, `tests/meta_io_direct_tests.rs`, pad law in
 `src/meta_backend/kv/journal_core.rs` + `journal.rs`. All `file:line` cites are into that tree.

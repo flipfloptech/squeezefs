@@ -1,10 +1,19 @@
 # PORTING SPEC — MetaLV record / bset layer ("PR K1")
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 > **v4 decisions (format v4, 2026-10-05; decision 0003 WP-F; 0002 rows 35–39, 47).** The bytes below are
 > the reference's v3 — evidence; where a "v4:" row exists it is what `squeezefs-zig` writes. §10's
 > "the Zig port must match the BYTES" is retired (0002 §2): the Zig codecs are pinned by their own
 > encode∘decode = id, totality fuzzers and the Zig-generated FIND-VS-A fixture
-> (`tests/fixtures/findvsa_pred_bset.v4.bin`, 254,932 B, 3,515 records).
+> (`tests/fixtures/findvsa_pred_bset.v5.bin`, 254,932 B, 3,515 records).
 >
 > **v4: keys — ONE layout, the kind byte on every key** (`key.zig`): inode `ino u64 BE ‖ 01` (9 B);
 > dentry `parent u64 BE ‖ 02 ‖ hash54_coll u64 BE` (17 B); xattr `ino ‖ 03 ‖ hash56_coll` (17 B); block map
@@ -153,8 +162,8 @@ legacy_key_slot(kind, legacy) = same, from legacy offsets (16 for refs, 0 otherw
 ### 1.6 Seeded hashes (`record.rs:533-542`)
 
 ```
-hash54(name, seed) = xxh3_64_with_seed(name, seed) >> 10
-hash56(name, seed) = xxh3_64_with_seed(name, seed) >> 8
+hash54(name, seed) = xxh3_64_with_seed(name, seed) >> 10   // v5: low64(sqzhash128(name, Key(zero_extend(seed)))) >> 10
+hash56(name, seed) = xxh3_64_with_seed(name, seed) >> 8    // v5: low64(sqzhash128(name, Key(zero_extend(seed)))) >> 8
 ```
 `seed` = superblock `hash_seed` (random at format). `xxh3_64_with_seed` is XXH3-64 with the
 standard seed parameter (xxhash-rust semantics == upstream xxHash `XXH3_64bits_withSeed`).
@@ -554,7 +563,7 @@ max_key`, zero-filled to 4096; checksum = xxh3 over the whole page with `[32..40
 
 ---
 
-## 5. CHECKSUMS (all xxh3-64, stored LE)
+## 5. CHECKSUMS (all xxh3-64 in the reference; v5: sqzhash128 low 64 under the format key — stored LE)
 
 | unit | covers | field treatment |
 |---|---|---|

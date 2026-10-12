@@ -1,5 +1,14 @@
 # PORTING SPEC — MetaLV superblock v3, volume format/image builder, extent allocator
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 > **v4 decisions (format v4, 2026-10-05; decision 0003 WP-F; 0002 rows 42–47).** The byte tables below
 > are the reference's v3 layout — EVIDENCE, read for derivations and the WHY of every number. Where a
 > "v4:" row exists it is what `squeezefs-zig` writes; nothing below obliges compatibility with the
@@ -62,7 +71,7 @@ Reference (read-only): `~/Source/squeezefs` (Rust). Target: `~/Source/squeezefs-
 Charter anchors: §1.7 (forward-only format; unknown incompat ⇒ "reformat required"; old
 binaries refuse new volumes loud), §5.1 (superblock / bitmap / heap), §5.3 "Space".
 Rust PRs covered: **K4** (`alloc_ext_core.rs`, `alloc_ext.rs`) and **K6a** (`superblock.rs`,
-`builder.rs`). All integers little-endian unless marked BE. xxh3 = xxh3-64 (xxhash_rust).
+`builder.rs`). All integers little-endian unless marked BE. xxh3 = xxh3-64 (xxhash_rust) in the reference; v5 writes sqzhash128's low 64 bits under the format key in the same 8 bytes.
 Acceptance bar: a Zig `format` output must pass `classify_volume` + `KvMetaBackend::open`
 (SB → newest ledger → bitmap+replay → tree roots) of the Rust binary, and
 `be.free_extents() == sb.total_extents() − extents_allocated` (`tests/kv_backend_tests.rs:1455-1460`).

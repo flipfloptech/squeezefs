@@ -1,5 +1,14 @@
 # Architecture survey — KV tree, node cache, commit conveyor, checkpoint/SMO
 
+> **Checksum amendment (2026-10-11, decision 0003 §M; 0002 row 480).** Every `xxh3` / `xxh3-64` /
+> `xxh3_64` below names the hash the reference used and this port used until format v5. The port's
+> ONE hash is now **sqzhash128** (`src/core/sqzhash.zig`, the pinned definition): every 8-byte checksum
+> and identity field is its LOW 64 bits under the fixed public format key (`checksum.hash64`,
+> `hash64FieldZeroed`, `stamp`/`verify`, the streaming `checksum.Hasher`); the seeded name hashes
+> (`hash54`/`hash56`) are `hash64Keyed` under the per-mount name key (`key.NameKey`: the volume's
+> `hash_seed` zero-extended, expanded once at mount). Field names on the wire read `csum`. Byte
+> layouts, offsets and widths below are unchanged; only the function behind the 8 bytes is.
+
 Reference: `~/Source/squeezefs/src/meta_backend/kv/` (Rust, read-only). Target: the Zig
 port under `~/Source/squeezefs-zig`, charter §5.2 (commit pipeline), §5.3 (checkpoints,
 writeback, SMOs, space), §2 "Lock order". This document is architecture-level: every

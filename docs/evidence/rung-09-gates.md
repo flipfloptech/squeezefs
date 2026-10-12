@@ -239,7 +239,7 @@ after the bench edit, `1` after the shim identity) with
 `scripts/rails-literal-rebase` — the line-keyed row is the brittleness the
 rail's law bought; the rebase never admits a literal.
 
-Four gate hazards made deterministic afterwards (all test-side; no product
+Six gate hazards made deterministic afterwards (all test-side; no product
 bug underneath):
 
 - **`write_admit` "dead victim"** (`5db4540`, rung 9 F2): the pin spawned
@@ -366,7 +366,46 @@ bug underneath):
   suites-smoke ok, smoke 64 / 2 skip, bench-smoke 40, shim-smoke 40. Skip
   ledger: other_step 40, no_seam 2, no_kernel_feature 1
   (CONFIG_ETHTOOL_NETLINK), the kit's two probe rows.
+- **The hash microbench unit test's `chained ≥ throughput`** (the closing
+  gate at `d390207`, once per host on a QUIET venue under the gate's own
+  `-j`; 3/3 alone): the test asserted that a real chained cell's ps/op was
+  ≥ its throughput sibling's — two durations measured 100 ms apart under
+  whatever the scheduler was doing. **67/150** red in a loop under an
+  8-way `yes` load. Fix (`22e764b`): the unit test keeps the pure rows
+  (cell arithmetic, JSON names, the three columns' deterministic values,
+  the measurement loop's own law — span ≥ `MIN_SPAN_NS`, ops ≥
+  `FIRST_BATCH`, the mode's `access` name) and pins the relation on FIXED
+  counts (2^20 × 16 B in 100 vs 250 ms: 95.367 / 238.418 ns/op, 167 / 67
+  MB/s); the real relation is a new `bench gate:` row of `bench-smoke` —
+  `squeezefs bench --hash --json` once, 24 cells with the measurement-law
+  fields, the 16 B chained vs cpu ps/op per algorithm REPORTED (venue:
+  xxh3-64 5115/2178, sqzhash128 5733/1349, sqzhash64 5582/1349), never
+  asserted. Proof: **150/150** under the load (0.46–0.75 s); bench-smoke 41
+  rows in 9 s.
+- **The shim e2e "fio's shape" row's `served == ops`** (the same closing
+  gate; reported as "3 of 4 completions inside the 5 s deadline" — it was
+  not: all four ring completions were reaped every time, the read at `shim/
+  e2e.zig:548` found the HOST's account at 3). `StubHost.serveOne` bumped
+  `served` AFTER `completeAndWake` (the slot's DONE release + the doorbell
+  wake), so the woken reaper read the account before the host thread
+  reached its increment — the waker/wakee preemption again: **7/300** under
+  the 8-way load, each red run 0.4 s (never the bound). Every e2e/SDK row
+  asserting `served` on a completion's heels carried the window. Fix
+  (`9042514`, the stub, which is test infrastructure in `ipc/client.zig`):
+  the bump precedes `slot_core.completeAndWake`, so the DONE swap's Release
+  half publishes it to any client that acquires the completion; the fio
+  row's reap loop keeps its 5 s only as a wedge bound (the reap itself is
+  the rendezvous: the doorbell park re-checks every 5 ms) and prints the
+  reaped count, the host's account, the park eras and the abandoned slots
+  when a completion is missing. Proof: **400/400** under the load
+  (0.13–0.19 s; load 3.3–7.4). Gates at the landing of five and six (on
+  `d390207`, a quiet venue): macOS **28/28, 2083/2108** (25 skips; unit
+  1959, rails 16/16); Linux **46/46, 2611/2655** (44 skipped): unit 2398
+  pass / 42 skip (2397 / 43 once the hash row's unit-run skip joined the
+  ledger as `other_step`), rails 16/16, shim census 1/1, smoke 64 / 2 skip,
+  bench-smoke **41** (the hash row), shim-smoke 40, nvmet-smoke 51.
 
+Gates at the landing (`8e69fb9` rebased onto `c65935a`): macOS `zig build
 gate` **25/25 steps, 2029/2053** (24 `no_linux` skips; unit 1905 pass, rails
 16/16); Linux `scripts/venue zig build gate` on a quiet venue **43/43 steps,
 2543/2586** (43 skipped): unit 2334 pass / 41 skip, rails 16/16, shim census

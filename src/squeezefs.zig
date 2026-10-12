@@ -24,6 +24,7 @@ pub const Version = struct {
 
 // ---- core ----
 pub const checksum = @import("core/checksum.zig");
+pub const sqzhash = @import("core/sqzhash.zig");
 pub const clock = @import("core/clock.zig");
 pub const derive = @import("core/derive.zig");
 pub const knobs = @import("core/knobs.zig");
@@ -201,6 +202,7 @@ pub const nvme_dev = if (builtin.os.tag == .linux) @import("io/nvme_dev.zig") el
 test {
     std.testing.refAllDecls(@This());
     _ = checksum;
+    _ = sqzhash;
     _ = clock;
     _ = derive;
     _ = knobs;

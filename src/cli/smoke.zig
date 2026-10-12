@@ -2342,7 +2342,7 @@ fn envWith(gpa: std.mem.Allocator, base: *const std.process.Environ.Map, overrid
     return m;
 }
 
-test "smoke: MutualTls on this kernel — `key tls-init`/`tls-issue` ×3 through the binary (OpenSSL verifies the chain, a foreign CA's leaf fails it) → a mount under SQUEEZEFS_WIRE_CHANNEL=mutual_tls REFUSES on the console naming the missing kernel TLS ULP (the record layer is the kernel's — never a userspace fall-back) → a CA-less mutual_tls refuses naming the CA → a mismatched key refuses → the plaintext mount of the same set serves and unmounts; the two-daemon matrix over kTLS is the skip ledger's until the kernel carries CONFIG_TLS" {
+test "smoke: MutualTls on this kernel — `key tls-init`/`tls-issue` ×3 through the binary (OpenSSL verifies the chain, a foreign CA's leaf fails it) → a mount under SQUEEZEFS_WIRE_CHANNEL=mutual_tls: WITH the tls ULP it comes up (channel 1) and unmounts clean, WITHOUT it it REFUSES on the console naming the missing ULP (the record layer is the kernel's — never a userspace fall-back) → a CA-less mutual_tls refuses naming the CA → a mismatched key refuses → the plaintext mount of the same set serves and unmounts" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -2401,15 +2401,33 @@ test "smoke: MutualTls on this kernel — `key tls-init`/`tls-issue` ×3 through
     var key_b: [320]u8 = undefined;
     var ca_missing: [320]u8 = undefined;
     try rig.formatSet(true);
-    // 1. A mount under mutual_tls with a good identity: on a kernel without
-    //    the tls ULP it refuses on the console naming the ULP and the
-    //    remedy (CONFIG_TLS) — never a userspace fall-back.
+    // 1. A mount under mutual_tls with a good identity: with the tls ULP it
+    //    comes up and unmounts clean; without it it refuses on the console
+    //    naming the ULP and the remedy (CONFIG_TLS) — never a userspace
+    //    fall-back.
     var env_tls = try envWith(gpa, &rig.env, &.{ .{ "SQUEEZEFS_WIRE_CHANNEL", "mutual_tls" }, .{ "SQUEEZEFS_WIRE_TLS_CA", ca_path }, .{ "SQUEEZEFS_WIRE_TLS_CERT", try std.fmt.bufPrint(&cert_a, "{s}/node.pem", .{dir_a}) }, .{ "SQUEEZEFS_WIRE_TLS_KEY", try std.fmt.bufPrint(&key_a, "{s}/node.key", .{dir_a}) } });
     defer env_tls.deinit();
     const ulps = try rig.shOk(rig.work, "cat /proc/sys/net/ipv4/tcp_available_ulp");
     defer gpa.free(ulps);
     const kernel_has_tls = std.mem.indexOf(u8, ulps, "tls") != null;
-    {
+    if (kernel_has_tls) {
+        const a = try Peer.init(rig, "a-tls");
+        defer a.deinit();
+        a.env = &env_tls;
+        try a.spawn(&.{});
+        _ = try a.awaitReady();
+        const text = try a.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "channel class mutual_tls — node 'node-a' under CA 'smoke-ca'") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "channel mutual_tls)") != null);
+        const st = try a.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"cluster_wire_channel_mutual_tls\":"));
+        try a.umount();
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try a.waitExit());
+        try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, a.mp));
+        std.debug.print("smoke: mtls: mount under mutual_tls on kernel TLS (ulp '{s}'): up with channel 1, unmounted clean\n", .{std.mem.trimEnd(u8, ulps, "\n")});
+    } else {
         const a = try Peer.init(rig, "a-tls");
         defer a.deinit();
         a.env = &env_tls;
@@ -2418,10 +2436,10 @@ test "smoke: MutualTls on this kernel — `key tls-init`/`tls-issue` ×3 through
         try testing.expect(!term.success());
         const text = try a.readLog();
         defer gpa.free(text);
-        const needle: []const u8 = if (kernel_has_tls) "kTLS data path is owed" else "needs kernel TLS and this kernel has no `tls` ULP";
+        const needle = "needs kernel TLS and this kernel has no `tls` ULP";
         if (std.mem.indexOf(u8, text, needle) == null) std.debug.print("\n--- the mutual_tls mount's log ---\n{s}\n", .{text});
         try testing.expect(std.mem.indexOf(u8, text, needle) != null);
-        try testing.expect(std.mem.indexOf(u8, text, "never a userspace fall-back") != null or std.mem.indexOf(u8, text, "never a silent fall-back") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "never a userspace fall-back") != null);
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| if (std.mem.indexOf(u8, line, needle) != null) {
             std.debug.print("smoke: mtls: mount under mutual_tls: {f}; {s}\n", .{ term, line[0..@min(line.len, 360)] });
@@ -2469,7 +2487,6 @@ test "smoke: MutualTls on this kernel — `key tls-init`/`tls-issue` ×3 through
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
-    return testkit.skip(@src(), .no_kernel_feature, if (kernel_has_tls) "the two-daemon matrix over kernel TLS: this build's kTLS data path is owed (docs/evidence/rung-10-mtls.md §9); the fail-loud rows ran" else "the two-daemon matrix over kernel TLS needs CONFIG_TLS (the tls ULP): this kernel has none; the fail-loud rows ran");
 }
 
 /// The MutualTls matrix's `dd` on B: 200 MiB over 4 MiB blocks (the

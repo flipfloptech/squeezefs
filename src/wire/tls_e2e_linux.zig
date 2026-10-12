@@ -362,6 +362,13 @@ const KtlsPair = struct {
         return .{ .server = acc.conn.?, .client = client, .server_tcp = acc.tcp, .client_tcp = tcp };
     }
 
+    /// After placement: the Conns' inner links point at THIS pair's
+    /// `TcpLink`s (the handshake ran over locals of `init`).
+    fn arm(self: *KtlsPair) void {
+        self.server.inner = self.server_tcp.link();
+        self.client.inner = self.client_tcp.link();
+    }
+
     fn deinit(self: *KtlsPair, gpa: std.mem.Allocator) void {
         self.server.destroy(gpa);
         self.client.destroy(gpa);
@@ -380,6 +387,7 @@ test "tls e2e [ktls]: a loopback pair of our engines over KERNEL TLS — confide
     defer id_b.deinit(gpa);
     {
         var p = try KtlsPair.init(gpa, io, &id_a, &id_b, now);
+        p.arm();
         defer p.deinit(gpa);
         try testing.expect(p.server.ktls_tx and p.server.ktls_rx and p.client.ktls_tx and p.client.ktls_rx);
         try testing.expect(p.server.confidential() and p.client.confidential());
@@ -398,7 +406,8 @@ test "tls e2e [ktls]: a loopback pair of our engines over KERNEL TLS — confide
         defer gpa.free(big);
         for (big, 0..) |*x, i| x.* = @truncate(i *% 31);
         try cl.writeAll(big);
-        try testing.expectEqual(@as(u64, 65 + 2), p.client.ktls_records_sent);
+        // One small record before it, then ⌈(1 MiB + 80) / 2^14⌉ = 65.
+        try testing.expectEqual(@as(u64, 1 + 65), p.client.ktls_records_sent);
         const got = try gpa.alloc(u8, big.len);
         defer gpa.free(got);
         try sl.readExact(got, 5000);
@@ -418,7 +427,7 @@ test "tls e2e [ktls]: a loopback pair of our engines over KERNEL TLS — confide
         // client's next write.
         const req = [_]u8{ @backingInt(std.crypto.tls.HandshakeType.key_update), 0, 0, 1, @backingInt(std.crypto.tls.KeyUpdateRequest.update_requested) };
         try tls.ktls.sendRecord(p.server.ktls_fd, @backingInt(std.crypto.tls.ContentType.handshake), &req);
-        p.server.ktls_records_sent = tls.KEY_UPDATE_RECORDS;
+        try tls.ktls.rotateTx(p.server);
         try sl.writeAll("x");
         try cl.readExact(buf[0..1], 2000);
         try testing.expect(p.client.peer_update_requested.load(.acquire));
@@ -438,6 +447,7 @@ test "tls e2e [ktls]: a loopback pair of our engines over KERNEL TLS — confide
         // A fatal alert (internal_error) from the server: the client's read
         // closes loud and counted.
         var p = try KtlsPair.init(gpa, io, &id_a, &id_b, now);
+        p.arm();
         defer p.deinit(gpa);
         const fa0 = stats.cluster_wire_tls_fatal_alerts.load();
         try tls.ktls.sendRecord(p.server.ktls_fd, @backingInt(std.crypto.tls.ContentType.alert), &.{ @backingInt(std.crypto.tls.Alert.Level.fatal), @backingInt(std.crypto.tls.Alert.Description.internal_error) });

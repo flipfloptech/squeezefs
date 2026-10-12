@@ -327,10 +327,7 @@ pub const Conn = struct {
     /// Records this side has written under the current TX key (the
     /// KeyUpdate ceiling's word; the kernel owns the sequence itself).
     ktls_records_sent: u64 = 0,
-    /// Under `.ktls` `rd_plain[0..rd_end]` accumulates a control record
-    /// that arrived split across `recvmsg` calls (a reader's buffer with
-    /// fewer bytes left than the record).
-    ctl_type: u8 = 0,
+
     /// A record header has been read (a timeout before it is `PeerSilent`;
     /// the first header's bound is `first_record_timeout_ms`).
     seen_bytes: bool = false,
@@ -1628,6 +1625,7 @@ pub const ktls = if (is_linux) struct {
         _ = linux.setsockopt(fd, linux.SOL.TLS, TLS_RX_EXPECT_NO_PAD, std.mem.asBytes(&one), @sizeOf(c_int));
         conn.ktls_fd = fd;
         conn.ktls_records_sent = 0;
+        conn.rd_start = 0;
         conn.rd_end = 0;
     }
 
@@ -1669,51 +1667,50 @@ pub const ktls = if (is_linux) struct {
         }
     }
 
+    /// The next generation of OUR key into `TLS_TX` (after the KeyUpdate
+    /// that announces it has gone out under the current one).
+    pub fn rotateTx(conn: *Conn) error{KtlsInstallFailed}!void {
+        var next = conn.wr.?.updated();
+        try setKeys(conn.ktls_fd, TLS_TX, &next);
+        conn.wr.?.zeroize();
+        conn.wr = next;
+        next.zeroize();
+        conn.ktls_records_sent = 0;
+    }
+
     /// Our KeyUpdate (the ceiling or the peer's request): the message under
     /// the current key, then the next generation into `TLS_TX`.
     fn keyUpdate(conn: *Conn) session.FrameError!void {
         const msg = [_]u8{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, @backingInt(tls.KeyUpdateRequest.update_not_requested) };
         sendRecord(conn.ktls_fd, @backingInt(tls.ContentType.handshake), &msg) catch return error.TransportFailed;
-        var next = conn.wr.?.updated();
-        setKeys(conn.ktls_fd, TLS_TX, &next) catch return error.TransportFailed;
-        conn.wr.?.zeroize();
-        conn.wr = next;
-        next.zeroize();
-        conn.ktls_records_sent = 0;
+        rotateTx(conn) catch return error.TransportFailed;
         conn.key_updates_sent += 1;
         stats.cluster_wire_tls_key_updates.inc();
     }
 
-    /// A control record's bytes (possibly a fragment: the reader's buffer
-    /// had fewer bytes left than the record): accumulate in `rd_plain`,
-    /// dispatch each complete message.
+    /// One complete control record (the kernel hands a record whole when
+    /// the buffer holds it — `rd_plain` holds any record): dispatch each
+    /// message it carries. A message spanning records is refused (no peer
+    /// of this wire sends one; a ticket is one record).
     fn control(conn: *Conn, ct: u8, bytes: []const u8) session.FrameError!void {
-        if (conn.rd_end != 0 and conn.ctl_type != ct) return error.TransportFailed;
-        conn.ctl_type = ct;
-        if (conn.rd_end + bytes.len > conn.rd_plain.len) return error.TransportFailed;
-        @memcpy(conn.rd_plain[conn.rd_end..][0..bytes.len], bytes);
-        conn.rd_end += bytes.len;
         switch (ct) {
-            @backingInt(tls.ContentType.alert) => {
-                if (conn.rd_end < 2) return;
-                const v = alertVerdict(conn.rd_plain[0..2]);
-                conn.rd_end = 0;
-                return v;
-            },
+            @backingInt(tls.ContentType.alert) => return alertVerdict(bytes),
             @backingInt(tls.ContentType.handshake) => {
                 var used: usize = 0;
-                while (conn.rd_end - used >= Handshake.MSG_HEADER) {
-                    const len: usize = std.mem.readInt(u24, conn.rd_plain[used + 1 ..][0..3], .big);
-                    if (conn.rd_end - used < Handshake.MSG_HEADER + len) break;
-                    const ht = conn.rd_plain[used];
-                    const body = conn.rd_plain[used + Handshake.MSG_HEADER ..][0..len];
+                while (used < bytes.len) {
+                    if (bytes.len - used < Handshake.MSG_HEADER) return error.TransportFailed;
+                    const len: usize = std.mem.readInt(u24, bytes[used + 1 ..][0..3], .big);
+                    if (bytes.len - used < Handshake.MSG_HEADER + len) return error.TransportFailed;
+                    const ht = bytes[used];
+                    const body = bytes[used + Handshake.MSG_HEADER ..][0..len];
                     used += Handshake.MSG_HEADER + len;
                     switch (ht) {
                         @backingInt(tls.HandshakeType.key_update) => {
                             if (body.len != 1) return error.TransportFailed;
                             const req = std.enums.fromInt(tls.KeyUpdateRequest, body[0]) orelse return error.TransportFailed;
                             // The 6.14 rekey: the kernel holds the records that
-                            // follow until RX carries the next generation.
+                            // follow (EKEYEXPIRED) until RX carries the next
+                            // generation.
                             var next = conn.rd.?.updated();
                             setKeys(conn.ktls_fd, TLS_RX, &next) catch return error.TransportFailed;
                             conn.rd.?.zeroize();
@@ -1726,10 +1723,6 @@ pub const ktls = if (is_linux) struct {
                         else => return error.TransportFailed,
                     }
                 }
-                if (used != 0) {
-                    std.mem.copyForwards(u8, conn.rd_plain[0 .. conn.rd_end - used], conn.rd_plain[used..conn.rd_end]);
-                    conn.rd_end -= used;
-                }
             },
             else => return error.TransportFailed,
         }
@@ -1737,15 +1730,25 @@ pub const ktls = if (is_linux) struct {
 
     pub const link_vtable: session.Link.VTable = .{ .readExact = linkRead, .writeAll = linkWrite, .shutdown = linkShutdown, .close = linkClose };
 
-    /// The receive discipline over the kernel's records: `poll` for the
-    /// bound, `recvmsg` with a control buffer (a non-data record WITHOUT one
-    /// is EIO), application bytes into the caller's buffer, a control
-    /// record's bytes to the dispatcher (they never advance the caller).
+    /// The receive discipline over the kernel's records: serve the caller
+    /// from the decrypted window first; else `poll` for the bound and
+    /// `recvmsg` ONE record whole into `rd_plain` with a control buffer (a
+    /// non-data record without one is EIO; one read into a caller buffer
+    /// smaller than a control record splits it and the kernel then
+    /// reports the remainder unreadable — measured on 7.2.6-sqz) — a data
+    /// record becomes the window, a control record is dispatched.
     fn linkRead(ctx: *anyopaque, buf: []u8, timeout_ms: ?u32) session.FrameError!void {
         const self: *Conn = @ptrCast(@alignCast(ctx));
         const fd = self.ktls_fd;
         var filled: usize = 0;
         while (filled < buf.len) {
+            if (self.rd_start < self.rd_end) {
+                const n = @min(buf.len - filled, self.rd_end - self.rd_start);
+                @memcpy(buf[filled..][0..n], self.rd_plain[self.rd_start..][0..n]);
+                self.rd_start += n;
+                filled += n;
+                continue;
+            }
             if (timeout_ms) |ms| {
                 var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
                 const n = linux.poll(&pfd, 1, @intCast(ms));
@@ -1753,7 +1756,7 @@ pub const ktls = if (is_linux) struct {
                 if (n == 0) return error.Timeout;
             }
             var ctl: [CMSG_SPACE_1]u8 = undefined;
-            var iov = [_]std.posix.iovec{.{ .base = buf[filled..].ptr, .len = buf.len - filled }};
+            var iov = [_]std.posix.iovec{.{ .base = &self.rd_plain, .len = self.rd_plain.len }};
             var msg: linux.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &ctl, .controllen = ctl.len, .flags = 0 };
             const rc = linux.recvmsg(fd, &msg, 0);
             switch (linux.errno(rc)) {
@@ -1774,11 +1777,12 @@ pub const ktls = if (is_linux) struct {
             if (rc == 0) return error.Eof;
             if (parseRecordType(&ctl, msg.controllen)) |ct| {
                 if (ct != @backingInt(tls.ContentType.application_data)) {
-                    try control(self, ct, buf[filled..][0..rc]);
+                    try control(self, ct, self.rd_plain[0..rc]);
                     continue;
                 }
             }
-            filled += rc;
+            self.rd_start = 0;
+            self.rd_end = rc;
         }
     }
 

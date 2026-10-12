@@ -251,6 +251,7 @@ const FamilyEcho = struct {
             .admin_fsck_report => .{ .ok = .{ .admin_fsck_report = .{ .head = .{ .len = 0, .verdict = 0, .reserved = @splat(0) }, .json = "" } } },
             .admin_volume => .{ .ok = .{ .admin_volume = .refusal(.ok) } },
             .admin_rekey => .{ .ok = .{ .admin_rekey = .refusal(.ok, .none) } },
+            .admin_fsck => .{ .ok = .{ .admin_fsck = .{ .job_id = 1, .verdict = 0, .reserved = @splat(0) } } },
             .ping, .challenge, .prove, .admitted, .refused => unreachable,
         };
     }
@@ -374,6 +375,7 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     _ = try c.call(.{ .admin_fsck_report = .{ .job_id = 1 } });
     _ = try c.call(.{ .admin_volume = .{ .head = .{ .op = 2, .no_rebalance = 0, .reserved = @splat(0), .vol_tag = 7, .uri_len = 0, .reserved2 = 0 }, .uri = "" } });
     _ = try c.call(.{ .admin_rekey = .{ .kdf_salt = @splat(1), .key_id = @splat(2), .throttle_pct = 0, .reserved = @splat(0) } });
+    _ = try c.call(.{ .admin_fsck = .{ .flags = 0, .throttle_pct = 0, .reserved = @splat(0), .shard_k = 0, .shard_n = 0 } });
     _ = try c.call(.{ .ping = .{} });
     // Every verb reached daemon 1 exactly once (ping is served before the table).
     var total: u32 = 0;

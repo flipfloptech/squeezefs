@@ -210,10 +210,14 @@ const linux_arm = if (is_linux) struct {
             const self: *Online = @ptrCast(@alignCast(ctx));
             const p = self.p;
             const gpa = p.gpa;
-            var arg0: u64 = 0;
-            if (self.a.scrub) arg0 |= fsck.JOB_ARG_SCRUB;
-            if (self.a.scrub_only) arg0 |= fsck.JOB_ARG_SCRUB_ONLY;
-            const sub = lane.admin().submit(.{ .job_type = .fsck, .throttle_pct = self.a.throttle, .arg0 = arg0 }) catch |e| {
+            var flags: u32 = 0;
+            if (self.a.scrub) flags |= admin_lane.frames.FSCK_FLAG_SCRUB;
+            if (self.a.scrub_only) flags |= admin_lane.frames.FSCK_FLAG_SCRUB_ONLY;
+            // `admin_fsck`: the typed verb carries the shard word (its codec
+            // refuses a malformed one); the whole set when none was asked.
+            const shard_k: u32 = if (self.a.shards) |s| s.k else 0;
+            const shard_n: u32 = if (self.a.shards) |s| s.n else 0;
+            const sub = lane.admin().fsck(flags, self.a.throttle, shard_k, shard_n) catch |e| {
                 p.stderr.print("squeezefs {s}: the submission failed ({s}, {t})\n", .{ self.verb, @errorName(e), errors.toErrno(e) }) catch {};
                 return cli.exit_failed;
             };
@@ -222,7 +226,11 @@ const linux_arm = if (is_linux) struct {
                 p.stderr.flush() catch {};
                 return cli.exit_failed;
             }
-            p.stderr.print("squeezefs {s}: job-{x:0>16} submitted to the live mount; waiting for its terminal state\n", .{ self.verb, sub.job_id }) catch {};
+            if (self.a.shards) |s| {
+                p.stderr.print("squeezefs {s}: job-{x:0>16} submitted to the live mount (shard {d}/{d}); waiting for its terminal state\n", .{ self.verb, sub.job_id, s.k, s.n }) catch {};
+            } else {
+                p.stderr.print("squeezefs {s}: job-{x:0>16} submitted to the live mount; waiting for its terminal state\n", .{ self.verb, sub.job_id }) catch {};
+            }
             p.stderr.flush() catch {};
             const rec = admin_lane.waitTerminal(lane, sub.job_id, clock.monotonicNs() + ONLINE_WAIT_NS) catch |e| {
                 p.stderr.print("squeezefs {s}: the live table could not be read ({s}, {t})\n", .{ self.verb, @errorName(e), errors.toErrno(e) }) catch {};
@@ -282,7 +290,7 @@ const linux_arm = if (is_linux) struct {
 
 const testing = std.testing;
 
-test "the grammar: the mode defaults by target kind; the lattice refuses --apply without --repair, --repair on a shard, --shards online, --offline on a mountpoint, --online on a URI; scrub takes no repair flags" {
+test "the grammar: the mode defaults by target kind; the lattice refuses --apply without --repair, --repair on a shard, --offline on a mountpoint, --online on a URI; a shard is admitted online (the admin lane's `admin_fsck`); scrub takes no repair flags" {
     var d: args.Refusal = undefined;
     const f = try args.parse(&.{ "squeezefs", "fsck", "sqmeta:///dev/m" }, &d);
     try testing.expect(f.fsck.offline() and !f.fsck.scrub_only);
@@ -297,7 +305,9 @@ test "the grammar: the mode defaults by target kind; the lattice refuses --apply
     try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--apply", "sqmeta:///dev/m" }, &d));
     try testing.expect(d == .fsck_lattice);
     try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--repair", "--shards", "0/2", "sqmeta:///dev/m" }, &d));
-    try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--shards", "0/2", "/mnt/x" }, &d));
+    const osh = try args.parse(&.{ "squeezefs", "fsck", "--shards", "0/2", "/mnt/x" }, &d);
+    try testing.expect(!osh.fsck.offline());
+    try testing.expectEqual(args.FsckShard{ .k = 0, .n = 2 }, osh.fsck.shards.?);
     try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--offline", "/mnt/x" }, &d));
     try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--online", "sqmeta:///dev/m" }, &d));
     try testing.expectError(error.Refused, args.parse(&.{ "squeezefs", "fsck", "--shards", "2/2", "sqmeta:///dev/m" }, &d));

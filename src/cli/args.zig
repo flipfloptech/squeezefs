@@ -337,7 +337,8 @@ pub const Fsck = struct {
     scrub_only: bool = false,
     /// 0 / 100 = unthrottled.
     throttle: u8 = 0,
-    /// `--shards k/N` (offline only): the residue shard; validated here.
+    /// `--shards k/N`: the residue shard (offline, or online through the
+    /// admin lane's `admin_fsck`); validated here.
     shards: ?FsckShard = null,
     repair: bool = false,
     apply: bool = false,
@@ -1370,7 +1371,6 @@ fn parseFsck(words: []const []const u8, diag: *Refusal, scrub_only: bool) Error!
     if (out.mode == .online and !mountpoint) return lattice(diag, "--online needs the mountpoint (a sqmeta:// URI is the offline set)");
     if ((out.apply or out.quarantine_dir != null) and !out.repair) return lattice(diag, "--apply / --quarantine-dir need --repair");
     if (out.shards != null and out.repair) return lattice(diag, "--repair is refused on a shard (merge the shard reports, then repair whole)");
-    if (out.shards != null and !out.offline()) return lattice(diag, "--shards is offline only (the online run is whole on the coordinator)");
     if (out.quarantine_dir) |d| if (d.len == 0 or d[0] != '/') return lattice(diag, "--quarantine-dir must be an absolute path");
     return .{ .fsck = out };
 }

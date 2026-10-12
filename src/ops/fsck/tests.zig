@@ -91,6 +91,66 @@ test "a healthy populated set reports zero findings offline and online, with eve
     }
 }
 
+test "the fleet member's residue is its custody: `custody_only` takes the block census from the inos of the slots this mount leases alone (a live lessee's slots are readable only on the lessee), so the scrub reads nothing of a slot it does not hold and everything of one it does" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    _ = try populate(set);
+    var h = set.host(.online);
+    h.custody_only = true;
+    // Slot 0 is this mount's: the custody IS the whole fixture.
+    var mine = try ram.runHost(set, &h, .{ .scrub = true });
+    defer mine.deinit(gpa);
+    try ram.expectClasses(mine, &.{});
+    try testing.expect(mine.counters.scrub_blocks_scanned >= 7);
+    try testing.expect(mine.counters.inodes_scanned >= 7);
+    // Nothing leased here (another member's custody): no row, no block.
+    _ = set.scope.leased.remove(0);
+    defer set.scope.leased.put(gpa, 0, {}) catch unreachable;
+    var theirs = try ram.runHost(set, &h, .{ .scrub = true });
+    defer theirs.deinit(gpa);
+    try ram.expectClasses(theirs, &.{});
+    try testing.expectEqual(@as(u64, 0), theirs.counters.scrub_blocks_scanned);
+    try testing.expectEqual(@as(u64, 0), theirs.counters.inodes_scanned);
+}
+
+test "the block plane under a live lessee: a block a lessee's record references is the lessee's (its ring lags this census — the first N-daemon fleet run read every pack B shared as `refcount 64 vs 63`), so C2/C3/C8 scope it out and count it; the member's custody run judges no allocator arm at all (a non-holder's allocator is not the truth)" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    const p = try populate(set);
+    // The lessee's file under this mount's `dir`, sharing block 20 with a
+    // record this census cannot see (the refcount says 2, the view says 1).
+    const lessee: u16 = 7;
+    _ = try set.mkfileGuest(lessee, 5, p.dir, "theirs", VOL_A, &.{20});
+    set.setRefcount(VOL_A, 20, 2);
+    try set.freezeEra();
+    // Unleased (nobody's): the record is judged and the refcount drifts.
+    try set.scope.unleased.put(gpa, lessee, {});
+    var judged = try ram.run(set, .online, .{});
+    defer judged.deinit(gpa);
+    try ram.expectClasses(judged, &.{.c3});
+    _ = set.scope.unleased.remove(lessee);
+    // A LIVE lessee's: scoped, counted, no finding.
+    try set.scope.foreign_live.put(gpa, lessee, {});
+    var scoped = try ram.run(set, .online, .{});
+    defer scoped.deinit(gpa);
+    try ram.expectClasses(scoped, &.{});
+    try testing.expect(scoped.counters.block_plane_foreign_scoped >= 1);
+    _ = set.scope.foreign_live.remove(lessee);
+    // The member's custody run: a leak the holder's allocator reports is
+    // not this residue's to judge.
+    set.leak(VOL_A, 30);
+    var whole = try ram.run(set, .online, .{});
+    defer whole.deinit(gpa);
+    try ram.expectClasses(whole, &.{ .c2, .c3 });
+    var h = set.host(.online);
+    h.custody_only = true;
+    var custody = try ram.runHost(set, &h, .{});
+    defer custody.deinit(gpa);
+    try ram.expectClasses(custody, &.{});
+}
+
 test "C9: a prior-era unreferenced inode with blocks is ONE finding; dry-run plans and mutates nothing; apply destroys it, releases its references and frees its blocks; the next run is clean; a current-era one is never reported" {
     const gpa = testing.allocator;
     const set = try RamSet.init(gpa);
@@ -592,9 +652,21 @@ test "C4/C5 through the staging face: an orphan custody record is quarantined th
     };
     var face: Face = .{ .gpa = gpa, .residents = .empty };
     defer face.residents.deinit(gpa);
-    // A live file's custody (fine) and a custody naming a reclaimed ino.
+    // A live file's custody (fine) and a custody naming a reclaimed ino —
+    // prior-era (the start watermark sits above it), so it IS judged.
+    const floor: u64 = 4001;
+    try set.scope.era_floor.put(gpa, 0, floor);
     try face.residents.append(gpa, .{ .key = staging.StagingKey.init(@splat(1), RamSet.local(p.f1)), .cost = 4096, .generation = 1 });
     try face.residents.append(gpa, .{ .key = staging.StagingKey.init(@splat(2), 4000), .cost = 4096, .generation = 2 });
+    // Two custodies this census cannot judge: a joiner's ino (its slot is a
+    // LIVE foreign lessee's — the first online run of a two-daemon set read
+    // every file B was creating as a C4 orphan) and a native ino minted past
+    // the start watermark (the current era: its record may not be written
+    // yet). Both are scoped out and counted, never findings.
+    const joiner_slot: u16 = 3;
+    try set.scope.foreign_live.put(gpa, joiner_slot, {});
+    try face.residents.append(gpa, .{ .key = staging.StagingKey.init(@splat(3), key.guestLocalIno(joiner_slot, 77)), .cost = 4096, .generation = 3 });
+    try face.residents.append(gpa, .{ .key = staging.StagingKey.init(@splat(4), floor + 5), .cost = 4096, .generation = 4 });
     var h = set.host(.online);
     h.staging = .{ .ctx = &face, .vtable = &Face.vtable };
     var sink: RamSink = .{ .gpa = gpa };
@@ -603,9 +675,11 @@ test "C4/C5 through the staging face: an orphan custody record is quarantined th
     defer r.deinit(gpa);
     try ram.expectClasses(r, &.{.c4});
     try testing.expectEqual(@as(u64, 4000), r.findings[0].c4_orphan.ino);
+    try testing.expectEqual(@as(u64, 2), r.counters.c4_custody_scoped);
     try testing.expectEqual(finding.Outcome.applied, r.repair.?.rows[0].outcome);
-    try testing.expectEqual(@as(usize, 1), face.residents.items.len);
+    try testing.expectEqual(@as(usize, 3), face.residents.items.len);
     try testing.expectEqual(@as(usize, 1), sink.puts.items.len);
+    _ = set.scope.foreign_live.remove(joiner_slot);
     face.verdict = .dead;
     var r2 = try ram.runHost(set, &h, .{ .repair = repairOpts(&sink, true) });
     defer r2.deinit(gpa);
@@ -841,6 +915,28 @@ test "the pack-open ledger shields an open pack's +1 pin from C2/C3/C8; an open 
     var r2 = try ram.run(set, .online, .{});
     defer r2.deinit(gpa);
     try ram.expectClasses(r2, &.{ .c2, .c9 });
+}
+
+test "C10's cross-owner names: a dentry in a judged directory naming a child in a LIVE foreign lessee's slot is the lessee's to judge (scoped, counted — a joiner's files under the manager's directory read as 50 dangling names on the two-daemon set), and a child minted past the census ceiling in the current era is the create window, never a blind dangling" {
+    const gpa = testing.allocator;
+    const set = try RamSet.init(gpa);
+    defer set.deinit();
+    const p = try populate(set);
+    // A joiner (slot 7, live) created `theirs` under this mount's `dir`:
+    // the dentry is here, the child's record is in the joiner's tree.
+    const joiner_slot: u16 = 7;
+    try set.scope.foreign_live.put(gpa, joiner_slot, {});
+    try set.dangle(p.dir, "theirs", inos.makeGlobalIno(40, joiner_slot, inos.ROUTING_WIDTH));
+    // A name created during the walk whose record follows it: its raw
+    // lies past the census ceiling AND at or past the era floor.
+    try set.freezeEra();
+    try set.dangle(p.dir, "future", RamSet.global(5000));
+    var r = try ram.run(set, .online, .{});
+    defer r.deinit(gpa);
+    try ram.expectClasses(r, &.{});
+    try testing.expect(r.counters.inode_plane_foreign_dentry_scoped >= 1);
+    try testing.expect(r.counters.current_era_exempted >= 1);
+    _ = set.scope.foreign_live.remove(joiner_slot);
 }
 
 test "forest scoping: a slot a LIVE foreign lessee holds is never judged (its orphans are its lessee's), a reader's uncovered window takes no inode-plane verdict, and tree 0's unleased witness makes an unknown-floor slot prior-era" {

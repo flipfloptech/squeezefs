@@ -348,7 +348,35 @@ pub const RekeyRefusal = enum(u8) {
     plane = 5,
 };
 
+// ---- admin_fsck ----
+
+/// The online run's option bits (`ops/fsck.zig`'s `JOB_ARG_*` tie to these).
+pub const FSCK_FLAG_SCRUB: u32 = 1 << 0;
+pub const FSCK_FLAG_SCRUB_ONLY: u32 = 1 << 1;
+pub const FSCK_FLAGS_KNOWN: u32 = FSCK_FLAG_SCRUB | FSCK_FLAG_SCRUB_ONLY;
+
+/// `fsck|scrub --online [--shards k/N] [--throttle PCT]`: the engine's
+/// online face (`runner.linux.JobBody`) submitted as a fabric job — the
+/// option bits, the shard the run judges (`0/0` = the whole set), the
+/// duty cycle. The reply is `AdminJobSubmitted` (the job id + verdict).
+pub const AdminFsckReq = extern struct {
+    flags: u32,
+    /// 0 ⇒ the fabric's default.
+    throttle_pct: u8,
+    reserved: [3]u8,
+    shard_k: u32,
+    shard_n: u32,
+
+    pub fn check(self: AdminFsckReq) bool {
+        if (self.flags & ~FSCK_FLAGS_KNOWN != 0) return false;
+        // 100: a duty cycle is a percentage; the record codec refuses above it.
+        if (self.throttle_pct > 100 or !std.mem.allEqual(u8, &self.reserved, 0)) return false;
+        return (self.shard_n == 0 and self.shard_k == 0) or self.shard_k < self.shard_n;
+    }
+};
+
 comptime {
+    std.debug.assert(codec.wireSize(AdminFsckReq) == 16);
     std.debug.assert(codec.wireSize(AdminRekeyReq) == 48);
     std.debug.assert(codec.wireSize(AdminRekeyReply) == 24);
     std.debug.assert(codec.wireSize(AdminJobListReq) == 8);
@@ -433,9 +461,20 @@ test "every admin payload round-trips; the op/verdict/type bytes are total; a pc
     try testing.expectEqual(Verdict.refused, rr.get());
     try testing.expectEqual(RekeyRefusal.key_unresolved, rr.why());
     try testing.expectError(error.Malformed, roundTrip(AdminRekeyReply, .{ .verdict = 0, .reason = 99, .reserved = @splat(0), .job_id = 1, .config_generation = 2 }, buf));
+    // The online fsck: a whole-set run, a shard, and the malformed shapes
+    // (an unknown flag bit, k ≥ N, a lone k, a duty past 100).
+    const fw = try roundTrip(AdminFsckReq, .{ .flags = FSCK_FLAG_SCRUB, .throttle_pct = 50, .reserved = @splat(0), .shard_k = 0, .shard_n = 0 }, buf);
+    try testing.expectEqual(FSCK_FLAG_SCRUB, fw.flags);
+    const fs = try roundTrip(AdminFsckReq, .{ .flags = 0, .throttle_pct = 0, .reserved = @splat(0), .shard_k = 2, .shard_n = 3 }, buf);
+    try testing.expectEqual(@as(u32, 3), fs.shard_n);
+    try testing.expectError(error.Malformed, roundTrip(AdminFsckReq, .{ .flags = 1 << 7, .throttle_pct = 0, .reserved = @splat(0), .shard_k = 0, .shard_n = 0 }, buf));
+    try testing.expectError(error.Malformed, roundTrip(AdminFsckReq, .{ .flags = 0, .throttle_pct = 0, .reserved = @splat(0), .shard_k = 3, .shard_n = 3 }, buf));
+    try testing.expectError(error.Malformed, roundTrip(AdminFsckReq, .{ .flags = 0, .throttle_pct = 0, .reserved = @splat(0), .shard_k = 1, .shard_n = 0 }, buf));
+    try testing.expectError(error.Malformed, roundTrip(AdminFsckReq, .{ .flags = 0, .throttle_pct = 101, .reserved = @splat(0), .shard_k = 0, .shard_n = 0 }, buf));
 }
 
 fn adminPayloadsTotal(bytes: []const u8) void {
+    _ = codec.decodePayload(AdminFsckReq, bytes) catch {};
     _ = codec.decodePayload(AdminJobList, bytes) catch {};
     _ = codec.decodePayload(AdminJobControlReq, bytes) catch {};
     _ = codec.decodePayload(AdminJobSubmitReq, bytes) catch {};

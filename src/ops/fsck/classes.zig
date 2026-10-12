@@ -179,6 +179,8 @@ pub const Host = struct {
     reader: ?BlockReader = null,
     mem_budget: u64,
     shard: ?finding.Shard = null,
+    /// The fleet member's residue (`census.Options.custody_only`).
+    custody_only: bool = false,
     /// `SQUEEZEFS_FSCK_SETTLE_MS` (online only).
     settle_ns: u64,
     cancel: ?*const std.atomic.Value(bool) = null,
@@ -188,6 +190,13 @@ pub const Host = struct {
     hold: ?*const std.atomic.Value(bool) = null,
     /// The pre-registry test hook: fires at the Phase-A registry boundary.
     pre_registry_hook: ?*const fn () void = null,
+
+    /// A residue of the set — an ino shard or a fleet member's custody:
+    /// the whole-set classes (C8, C11–C17) and the allocator-truth arms
+    /// are the coordinator's whole run's, exactly as for an offline shard.
+    pub fn residue(self: *const Host) bool {
+        return self.shard != null or self.custody_only;
+    }
 
     pub fn volume(self: *const Host, vol_tag: u64) ?*const Volume {
         for (self.volumes) |*v| if (v.vol_tag == vol_tag) return v;
@@ -340,6 +349,10 @@ pub const Pass = struct {
     arena: std.heap.ArenaAllocator,
     cen: census.Census,
     dentries: census.DentryPass,
+    /// Blocks a live lessee's record references (`(vol_tag, block_idx)`):
+    /// the lessee's ring lags this census, so their refs are its to judge —
+    /// C2/C3/C8 scope them out (`block_plane_foreign_scoped`).
+    foreign_blocks: std.AutoHashMapUnmanaged(ForeignBlock, void) = .empty,
     counters: finding.Counters = .{},
     suspects: std.ArrayList(Finding) = .empty,
     findings: std.ArrayList(Finding) = .empty,
@@ -365,6 +378,7 @@ pub const Pass = struct {
         const gpa = self.gpa;
         self.cen.deinit();
         self.dentries.deinit();
+        self.foreign_blocks.deinit(gpa);
         self.suspects.deinit(gpa);
         self.findings.deinit(gpa);
         gpa.free(self.scan_epoch);
@@ -381,7 +395,7 @@ pub const Pass = struct {
     }
 
     fn censusOptions(self: *const Pass, tags: []const u64) census.Options {
-        return .{ .scope = self.host.scope, .shard = self.host.shard, .mem_budget = self.host.mem_budget, .geo = self.host.geo, .known_vol_tags = tags, .hold = self.host.hold };
+        return .{ .scope = self.host.scope, .shard = self.host.shard, .custody_only = self.host.custody_only, .mem_budget = self.host.mem_budget, .geo = self.host.geo, .known_vol_tags = tags, .hold = self.host.hold };
     }
 
     /// Pass 1: latch the allocators' scan epochs, the census, the dentry pass.
@@ -400,6 +414,16 @@ pub const Pass = struct {
         p.cen = try census.run(gpa, host.store, p.censusOptions(tags));
         errdefer p.cen.deinit();
         p.dentries = try census.dentryPass(gpa, host.store, .{ .scope = host.scope, .shard = host.shard, .mem_budget = host.mem_budget, .ceiling = p.cen.rawCeiling(), .hold = host.hold });
+        // A member's custody names live in OTHER members' directories (a
+        // joiner's tree under the manager's root, every cross-owner name),
+        // which this mount does not read: its referenced set is incomplete
+        // by construction, so the name-dependent arms (C9, C10) take no
+        // verdict here — the first fleet run read B's own directory as
+        // unreferenced. The block plane and C1/C4 of its slots are its.
+        if (host.custody_only) p.dentries.complete = false;
+        for (p.cen.owners.items) |o| if (host.scope.unjudged(census.ofKeyIno(o.ino).slot)) {
+            for (o.bindings) |b| try p.foreign_blocks.put(gpa, .{ .vol_tag = b.vol_tag, .block_idx = b.block_idx }, {});
+        };
         p.counters.inodes_scanned = p.cen.inodes_scanned;
         p.counters.dentry_refs_indexed = p.dentries.refs_indexed;
         p.counters.inode_plane_foreign_dentry_scoped = p.dentries.foreign_dentry_scoped;
@@ -573,6 +597,16 @@ pub const Pass = struct {
         for (residents) |r| {
             const ino = r.key.ino();
             if (self.host.shard) |sh| if (!sh.owns(census.globalOfKeyIno(ino))) continue;
+            // The staging dir is the data plane's: a joiner stages through
+            // it too, so a custody may name an ino of a slot this census
+            // does not judge (a live lessee's, changing under the walk) or
+            // one minted in the current era (its record may follow the
+            // custody). Scoped out and counted: its holder judges it.
+            const sl = census.ofKeyIno(ino);
+            if (self.host.scope.unjudged(sl.slot) or self.host.scope.era(sl) != .prior) {
+                self.counters.c4_custody_scoped += 1;
+                continue;
+            }
             const v = self.host.readInode(gpa, ino) catch continue; // an infrastructure error is never a finding
             if (v == null or v.?.nlink == 0) try self.suspect(.{ .c4_orphan = .{ .file_id = r.key.file_id, .ino = ino } });
         }
@@ -591,7 +625,20 @@ pub const Pass = struct {
     fn c2c3c6(self: *Pass) Error!void {
         const gpa = self.gpa;
         const host = self.host;
-        const sharded = host.shard != null;
+        // A fleet member is a non-holder: its allocator is a pulled window,
+        // never the truth these arms compare against (the coordinator's).
+        if (host.custody_only) return;
+        // The reference-count arms (C3, the leaked arm) compare the
+        // allocator's truth against the references THIS forest shows; a
+        // live lessee's slot trees left it at the grant (`forgetTree`) with
+        // every record they carry — a predecessor's files included — so
+        // while any lessee is live the count is incomplete by construction
+        // and the arms take no verdict (counted). The members' derived
+        // censuses merged at the coordinator are the fleet's next step;
+        // the lost arm (a reference the allocator does not track) stays.
+        const counts_complete = host.scope.foreign_live.count() == 0;
+        const sharded = host.residue() or !counts_complete;
+        if (!counts_complete) self.counters.alloc_census_declined += 1;
         for (host.volumes) |v| {
             var derived: std.AutoHashMapUnmanaged(u64, u32) = .empty;
             defer derived.deinit(gpa);
@@ -604,6 +651,10 @@ pub const Pass = struct {
             var it = derived.iterator();
             while (it.next()) |e| {
                 const idx = e.key_ptr.*;
+                if (self.foreign_blocks.contains(.{ .vol_tag = v.vol_tag, .block_idx = idx })) {
+                    self.counters.block_plane_foreign_scoped += 1;
+                    continue;
+                }
                 self.counters.blocks_checked += 1;
                 const out_of_range = idx >= cap;
                 const tracked = !out_of_range and v.alloc.refcount(idx) != null;
@@ -688,18 +739,48 @@ pub const Pass = struct {
     // ---- C8: durable vs derived references ----
 
     fn c8(self: *Pass) Error!void {
-        if (self.host.shard != null) return;
+        // The durable-vs-derived drift needs every reference in view (the
+        // live-lessee law of `c2c3c6`).
+        if (self.host.residue() or self.host.scope.foreign_live.count() != 0) return;
         for (self.host.volumes) |v| {
-            var rep = block_refs.verifyRefs(self.gpa, self.host.store.refStore(), v.vol_tag, self.cen.owners.items, self.exemptions()) catch |e| switch (e) {
+            var x: C8Exempt = .{ .pass = self, .vol_tag = v.vol_tag };
+            var rep = block_refs.verifyRefs(self.gpa, self.host.store.refStore(), v.vol_tag, self.cen.owners.items, x.exemptions()) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue,
             };
             defer rep.deinit(self.gpa);
             self.counters.pack_ledger_exempted += rep.pack_exempted;
             self.counters.inflight_exempted += rep.inflight_exempted;
+            self.counters.block_plane_foreign_scoped += rep.foreign_exempted;
             for (rep.rows) |r| try self.suspect(.{ .c8_drift = .{ .vol_tag = v.vol_tag, .block_idx = r.block_idx, .durable = r.durable, .derived = r.derived } });
         }
     }
+
+    /// C8's exemption context: the host's open-pack and in-flight faces,
+    /// the pass's foreign blocks of ONE volume.
+    const C8Exempt = struct {
+        pass: *Pass,
+        vol_tag: u64,
+
+        fn exemptions(self: *C8Exempt) block_refs.Exemptions {
+            return .{ .ctx = self, .isOpenPack = &isOpenPack, .isInflight = &isInflight, .isForeignRef = &isForeignRef };
+        }
+
+        fn isOpenPack(ctx: ?*anyopaque, block_idx: u64) bool {
+            const self: *C8Exempt = @ptrCast(@alignCast(ctx.?));
+            return isOpenPackAny(@constCast(self.pass.host), block_idx);
+        }
+
+        fn isInflight(ctx: ?*anyopaque, block_idx: u64) bool {
+            const self: *C8Exempt = @ptrCast(@alignCast(ctx.?));
+            return isInflightAny(@constCast(self.pass.host), block_idx);
+        }
+
+        fn isForeignRef(ctx: ?*anyopaque, block_idx: u64) bool {
+            const self: *C8Exempt = @ptrCast(@alignCast(ctx.?));
+            return self.pass.foreign_blocks.contains(.{ .vol_tag = self.vol_tag, .block_idx = block_idx });
+        }
+    };
 
     fn exemptions(self: *Pass) block_refs.Exemptions {
         return .{ .ctx = @constCast(self.host), .isOpenPack = &isOpenPackAny, .isInflight = &isInflightAny };
@@ -721,7 +802,7 @@ pub const Pass = struct {
     // ---- C11: the map plane ----
 
     fn c11(self: *Pass) Error!void {
-        if (self.host.shard != null) return;
+        if (self.host.residue()) return;
         const gpa = self.gpa;
         const host = self.host;
         const ms = host.store.mapStore();
@@ -772,7 +853,7 @@ pub const Pass = struct {
     const Window = struct { off: u64, len: u64, ino: u64, block_index: u32 };
 
     fn c12(self: *Pass) Error!void {
-        if (self.host.shard != null) return;
+        if (self.host.residue()) return;
         try c12Over(self, &self.cen, true);
         try self.c12Overrun();
     }
@@ -860,7 +941,7 @@ pub const Pass = struct {
     // ---- C13 / C16 / C17 / C14+C15: the forest and the data-plane oracles ----
 
     fn c13(self: *Pass) Error!void {
-        if (self.host.shard != null) return;
+        if (self.host.residue()) return;
         const f = self.host.forest orelse return;
         var out: std.ArrayList(Finding) = .empty;
         defer out.deinit(self.gpa);
@@ -869,7 +950,7 @@ pub const Pass = struct {
     }
 
     fn c16(self: *Pass) Error!void {
-        if (self.host.shard != null) return;
+        if (self.host.residue()) return;
         const face = self.host.shared orelse return;
         for (self.host.volumes) |v| {
             const d = try sharedDrift(self.gpa, face, v.vol_tag);
@@ -878,7 +959,7 @@ pub const Pass = struct {
     }
 
     fn c17(self: *Pass) Error!void {
-        if (self.host.shard != null) return;
+        if (self.host.residue()) return;
         var out: std.ArrayList(stripe.Finding) = .empty;
         defer out.deinit(self.gpa);
         try stripeFindings(self, &self.cen, &self.dentries, &out);
@@ -886,7 +967,7 @@ pub const Pass = struct {
     }
 
     fn c14c15(self: *Pass) Error!void {
-        if (self.host.shard != null) return;
+        if (self.host.residue()) return;
         const f = self.host.forest orelse return;
         const fc = try f.vtable.custody(f.ctx, self.arena.allocator());
         var out: std.ArrayList(Finding) = .empty;
@@ -1012,24 +1093,49 @@ pub const Pass = struct {
         var v: V = .{ .pass = self, .dangling = &dangling_children };
         self.dentries.referenced.eachAbsentFrom(&self.cen.live, &v, V.visit);
         if (v.err) |e| return e;
-        for (self.dentries.unindexed.items) |rec| try dangling_children.put(gpa, rec.child, {});
-        if (dangling_children.count() == 0) return;
-        // One extra dentry walk collecting the RECORD identities of the
-        // dangling children (a collision chain holds several keys for one
-        // name, so the key is the identity); a child whose record exists
-        // NOW is the create window.
-        var collected = try census.dentryPass(gpa, self.host.store, .{ .scope = self.host.scope, .shard = self.host.shard, .mem_budget = self.host.mem_budget, .ceiling = self.cen.rawCeiling(), .collect = &dangling_children, .stripes = false });
-        defer collected.deinit();
-        for (collected.names.items) |rec| {
-            const sl = census.ofGlobalIno(rec.child);
-            const present = if (sl) |s| (self.host.readInode(gpa, census.keyInoOf(s)) catch null) != null else false;
-            if (present) {
+        if (dangling_children.count() != 0) {
+            // One extra dentry walk collecting the RECORD identities of
+            // the dangling children (a collision chain holds several keys
+            // for one name, so the key is the identity); a child whose
+            // record exists NOW is the create window.
+            var collected = try census.dentryPass(gpa, self.host.store, .{ .scope = self.host.scope, .shard = self.host.shard, .mem_budget = self.host.mem_budget, .ceiling = self.cen.rawCeiling(), .collect = &dangling_children, .stripes = false });
+            defer collected.deinit();
+            for (collected.names.items) |rec| {
+                const sl = census.ofGlobalIno(rec.child);
+                const present = if (sl) |s| (self.host.readInode(gpa, census.keyInoOf(s)) catch null) != null else false;
+                if (present) {
+                    self.counters.nlink_transient_cleared += 1;
+                    continue;
+                }
+                try self.suspect(.{ .c10_dangling = .{ .parent = rec.parent, .suffix = rec.suffix, .child = rec.child } });
+            }
+        }
+        // The names the bitmap could not index: a child outside the
+        // routable space is a corrupt value (dangling by construction);
+        // one past the census ceiling takes the inode plane's gates — the
+        // lessee scope, then ONLINE the era floor (a create during the
+        // walk whose record follows its name; offline nothing mints, so a
+        // name past the cursor is corrupt), then the record itself.
+        for (self.dentries.unindexed.items) |rec| {
+            const sl = census.ofGlobalIno(rec.child) orelse {
+                try self.suspect(.{ .c10_dangling = .{ .parent = rec.parent, .suffix = rec.suffix, .child = rec.child } });
+                continue;
+            };
+            if (self.unjudgedGlobal(rec.child)) continue;
+            if (self.host.mode == .online) switch (self.host.scope.era(sl)) {
+                .current => {
+                    self.counters.current_era_exempted += 1;
+                    continue;
+                },
+                .unknown => continue,
+                .prior => {},
+            };
+            if ((self.host.readInode(gpa, census.keyInoOf(sl)) catch null) != null) {
                 self.counters.nlink_transient_cleared += 1;
                 continue;
             }
             try self.suspect(.{ .c10_dangling = .{ .parent = rec.parent, .suffix = rec.suffix, .child = rec.child } });
         }
-        for (self.dentries.unindexed.items) |rec| try self.suspect(.{ .c10_dangling = .{ .parent = rec.parent, .suffix = rec.suffix, .child = rec.child } });
     }
 
     fn unjudgedGlobal(self: *Pass, global: u64) bool {
@@ -1587,15 +1693,29 @@ fn stripeFindings(p: *Pass, cen: *const census.Census, d: *const census.DentryPa
     while (it.next()) |e| try views.append(gpa, .{ .dir = e.key_ptr.*, .markers = e.value_ptr.*.markers.items, .names = e.value_ptr.*.names.items });
     const Has = struct {
         var census_ptr: ?*const census.Census = null;
+        var scope_ptr: ?*const census.SlotScope = null;
         fn has(ino: u64) bool {
             const c = census_ptr orelse return false;
             // A stripe is named by its GLOBAL ino in the marker; the census
-            // indexes key inos.
-            return c.hasInode(ino);
+            // indexes key inos. A stripe minted in a slot this census does
+            // not judge (a live lessee's, a foreign window's) or past the
+            // start watermark (the current era) is not MISSING: its record
+            // is its holder's to judge — the stripes of one directory are
+            // minted across the members' slots, so a joined set's map names
+            // inos of every member (the first N-daemon online run read them
+            // all as `missing_stripe`).
+            if (c.hasInode(ino)) return true;
+            const sl = census.ofGlobalIno(ino) orelse return false;
+            const s = scope_ptr orelse return false;
+            return s.unjudged(sl.slot) or s.era(sl) != .prior;
         }
     };
     Has.census_ptr = cen;
-    defer Has.census_ptr = null;
+    Has.scope_ptr = p.host.scope;
+    defer {
+        Has.census_ptr = null;
+        Has.scope_ptr = null;
+    }
     try stripe.verifyStripes(gpa, views.items, &Has.has, p.host.name_key, out);
 }
 
@@ -1605,6 +1725,9 @@ fn stripeFindings(p: *Pass, cen: *const census.Census, d: *const census.DentryPa
 /// entries, leased slots or the manager role; a `Recovering` page the
 /// ledger does not name.
 const PairKey = struct { vol: u16, slot: u16, lo: u32, hi: u32 };
+
+/// A block of one volume (`Pass.foreign_blocks`' key).
+pub const ForeignBlock = struct { vol_tag: u64, block_idx: u64 };
 
 pub fn custodyFindings(gpa: Allocator, fc: ForestCensus, out: *std.ArrayList(Finding)) Error!void {
     var seen: std.AutoHashMapUnmanaged(PairKey, void) = .empty;

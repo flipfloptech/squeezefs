@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const counters = @import("../core/counters.zig");
+const admin_frames = @import("jobs/admin_frames.zig");
 
 pub const finding = @import("fsck/finding.zig");
 pub const census = @import("fsck/census.zig");
@@ -53,9 +54,25 @@ pub const REPORT_SCHEMA: u32 = 1;
 /// KiB; the durable report stays complete, FSCK:L1216).
 pub const ADMIN_WIRE_CAP: usize = 60 * 1024;
 /// The online job's `arg0` option bits (`JobType.fsck`; the CLI's
-/// `--scrub` / the `scrub` verb ride the record, never a string).
-pub const JOB_ARG_SCRUB: u64 = 1 << 0;
-pub const JOB_ARG_SCRUB_ONLY: u64 = 1 << 1;
+/// `--scrub` / the `scrub` verb ride the record, never a string) — the
+/// admin lane's `AdminFsckReq.flags` verbatim.
+pub const JOB_ARG_SCRUB: u64 = admin_frames.FSCK_FLAG_SCRUB;
+pub const JOB_ARG_SCRUB_ONLY: u64 = admin_frames.FSCK_FLAG_SCRUB_ONLY;
+
+/// The online job's `arg1`: the shard `k/N` the run judges — `N` in the
+/// high word, `k` in the low; 0 = the whole set (an unsharded run). One
+/// durable word, so an adopted sharded run resumes as the same shard.
+pub fn jobShardArg(shard: ?finding.Shard) u64 {
+    const s = shard orelse return 0;
+    return (@as(u64, s.n) << 32) | s.k;
+}
+
+pub fn jobShardOf(arg1: u64) ?finding.Shard {
+    const n: u32 = @truncate(arg1 >> 32); // the high word (`jobShardArg`'s layout)
+    const k: u32 = @truncate(arg1);
+    if (n == 0 or k >= n) return null;
+    return .{ .k = k, .n = n };
+}
 
 // ---------------------------------------------------------------------------
 // Observability (`ops_fsck.md` §6): the `fsck_*`, `scrub_*` and the repair
@@ -92,6 +109,8 @@ pub const stats = struct {
     pub var fsck_alloc_census_declined: counters.ShardedCounter = .{};
     // ---- forest scoping ----
     pub var fsck_c1_projection_slots_scoped: counters.ShardedCounter = .{};
+    pub var fsck_c4_custody_scoped: counters.ShardedCounter = .{};
+    pub var fsck_block_plane_foreign_scoped: counters.ShardedCounter = .{};
     pub var fsck_inode_plane_foreign_slot_scoped: counters.ShardedCounter = .{};
     pub var fsck_inode_plane_window_scoped: counters.ShardedCounter = .{};
     pub var fsck_inode_plane_foreign_dentry_scoped: counters.ShardedCounter = .{};
@@ -151,6 +170,17 @@ test {
     _ = scrub;
     _ = runner;
     _ = @import("fsck/tests.zig");
+}
+
+test "the online job's shard word: k/N round-trips through arg1, 0 is the whole set, a malformed word (N 0, k ≥ N) decodes to none" {
+    try std.testing.expectEqual(@as(u64, 0), jobShardArg(null));
+    try std.testing.expectEqual(@as(?finding.Shard, null), jobShardOf(0));
+    const s: finding.Shard = .{ .k = 2, .n = 3 };
+    const w = jobShardArg(s);
+    try std.testing.expectEqual(@as(u64, (3 << 32) | 2), w);
+    try std.testing.expectEqual(s, jobShardOf(w).?);
+    try std.testing.expectEqual(@as(?finding.Shard, null), jobShardOf((3 << 32) | 3));
+    try std.testing.expectEqual(@as(?finding.Shard, null), jobShardOf(5));
 }
 
 test "stats JSON names the tripwire by its site, the class array as one array and the honesty gauge" {

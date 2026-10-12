@@ -73,7 +73,7 @@ pub const AdminService = struct {
     fabric: *Fabric,
     world: ?AdminWorld,
 
-    const all_verbs = .{ .admin_job_list, .admin_job_control, .admin_job_submit, .admin_fsck_report, .admin_volume, .admin_rekey };
+    const all_verbs = .{ .admin_job_list, .admin_job_control, .admin_job_submit, .admin_fsck_report, .admin_volume, .admin_rekey, .admin_fsck };
 
     pub fn register(self: *AdminService, svc: *service.Service) void {
         const h: service.Handler = .{ .ctx = self, .serve = &serve };
@@ -95,6 +95,7 @@ pub const AdminService = struct {
             .admin_fsck_report => |p| self.report(p, scratch),
             .admin_volume => |p| self.volume(p),
             .admin_rekey => |p| self.rekey(p),
+            .admin_fsck => |p| self.fsckSubmit(p),
             else => unreachable,
         };
         return answer;
@@ -111,7 +112,9 @@ pub const AdminService = struct {
         var out: std.ArrayList(records.JobRecord) = .empty;
         defer out.deinit(self.fabric.gpa);
         self.fabric.listJobs(self.io, self.fabric.gpa, &out) catch return service.Answer.refused(error.OutOfMemory, "out of memory listing jobs");
-        const n = @min(out.items.len, frames.LIST_ROWS_MAX);
+        // `usize` on purpose: `@min` against the comptime cap narrows to u9,
+        // and the byte count below is computed in `n`'s type.
+        const n: usize = @min(out.items.len, frames.LIST_ROWS_MAX);
         if (scratch.len < n * @sizeOf(frames.JobRow)) return service.Answer.refused(error.ValueTooLarge, "the job list does not fit the session's scratch");
         const rows = std.mem.bytesAsSlice(frames.JobRow, scratch[0 .. n * @sizeOf(frames.JobRow)]);
         for (out.items[0..n], rows) |r, *row| row.* = .{ .bytes = r.encode() };
@@ -137,20 +140,35 @@ pub const AdminService = struct {
 
     fn submit(self: *AdminService, p: frames.AdminJobSubmitReq) service.Answer {
         // The rotation sweep is minted by `admin_rekey` alone (the window
-        // must be open and the plane's wrap swapped before any pass).
-        if (p.jobType() == .rekey) return .{ .ok = .{ .admin_job_submit = .{ .job_id = 0, .verdict = @backingInt(refusedCount(.refused)), .reserved = @splat(0) } } };
-        const id = self.fabric.submit(self.io, .{ .job_type = p.jobType(), .throttle_pct = p.throttle_pct, .arg0 = p.arg0, .arg1 = p.arg1, .paused = p.paused == 1 }) catch |e| {
+        // must be open and the plane's wrap swapped before any pass); an
+        // online fsck by `admin_fsck` (its shard word is the verb's codec).
+        if (p.jobType() == .rekey or p.jobType() == .fsck) return .{ .ok = .{ .admin_job_submit = .{ .job_id = 0, .verdict = @backingInt(refusedCount(.refused)), .reserved = @splat(0) } } };
+        const sub = self.submitTyped(.{ .job_type = p.jobType(), .throttle_pct = p.throttle_pct, .arg0 = p.arg0, .arg1 = p.arg1, .paused = p.paused == 1 }) catch return service.Answer.refused(error.OutOfMemory, "out of memory");
+        return .{ .ok = .{ .admin_job_submit = sub } };
+    }
+
+    /// `fsck|scrub --online [--shards k/N]`: the engine's online face as a
+    /// `JobType.fsck` job — `arg0` the option bits, `arg1` the shard word
+    /// (`fsck.jobShardArg`'s layout: N high, k low; 0 = the whole set).
+    fn fsckSubmit(self: *AdminService, p: frames.AdminFsckReq) service.Answer {
+        const shard: u64 = if (p.shard_n == 0) 0 else (@as(u64, p.shard_n) << 32) | p.shard_k;
+        const sub = self.submitTyped(.{ .job_type = .fsck, .throttle_pct = p.throttle_pct, .arg0 = p.flags, .arg1 = shard }) catch return service.Answer.refused(error.OutOfMemory, "out of memory");
+        return .{ .ok = .{ .admin_fsck = sub } };
+    }
+
+    fn submitTyped(self: *AdminService, s: fabric_mod.Submission) error{OutOfMemory}!frames.AdminJobSubmitted {
+        const id = self.fabric.submit(self.io, s) catch |e| {
             const v: Verdict = switch (e) {
                 error.NotCoordinator => .not_coordinator,
                 error.TableFull => .table_full,
                 error.Io => .io,
-                error.OutOfMemory => return service.Answer.refused(error.OutOfMemory, "out of memory"),
+                error.OutOfMemory => return error.OutOfMemory,
             };
-            return .{ .ok = .{ .admin_job_submit = .{ .job_id = 0, .verdict = @backingInt(refusedCount(v)), .reserved = @splat(0) } } };
+            return .{ .job_id = 0, .verdict = @backingInt(refusedCount(v)), .reserved = @splat(0) };
         };
         stats.admin_submissions.inc();
-        log.info("admin lane: {s} job-{x:0>16} submitted (throttle {d} %, arg0 {x}, arg1 {x}{s})", .{ p.jobType().name(), id, p.throttle_pct, p.arg0, p.arg1, if (p.paused == 1) ", paused" else "" });
-        return .{ .ok = .{ .admin_job_submit = .{ .job_id = id, .verdict = @backingInt(Verdict.ok), .reserved = @splat(0) } } };
+        log.info("admin lane: {s} job-{x:0>16} submitted (throttle {d} %, arg0 {x}, arg1 {x}{s})", .{ s.job_type.name(), id, s.throttle_pct, s.arg0, s.arg1, if (s.paused) ", paused" else "" });
+        return .{ .job_id = id, .verdict = @backingInt(Verdict.ok), .reserved = @splat(0) };
     }
 
     fn report(self: *AdminService, p: frames.AdminFsckReportReq, scratch: []u8) service.Answer {
@@ -269,6 +287,12 @@ pub const Client = struct {
     pub fn rekey(self: Client, kdf_salt: [32]u8, key_id: [8]u8, throttle_pct: u8) Error!frames.AdminRekeyReply {
         const rep = try self.call(self.ctx, .{ .admin_rekey = .{ .kdf_salt = kdf_salt, .key_id = key_id, .throttle_pct = throttle_pct, .reserved = @splat(0) } });
         return rep.admin_rekey;
+    }
+
+    /// The online fsck/scrub: `shard = (k, n)`, `(0, 0)` for the whole set.
+    pub fn fsck(self: Client, flags: u32, throttle_pct: u8, shard_k: u32, shard_n: u32) Error!Submitted {
+        const rep = try self.call(self.ctx, .{ .admin_fsck = .{ .flags = flags, .throttle_pct = throttle_pct, .reserved = @splat(0), .shard_k = shard_k, .shard_n = shard_n } });
+        return .{ .job_id = rep.admin_fsck.job_id, .verdict = rep.admin_fsck.get() };
     }
 };
 
@@ -416,6 +440,28 @@ test "the admin lane over the loopback: list is the live table; submit is coordi
     try testing.expectError(error.WireMalformed, r.conn.call(.{ .admin_job_control = .{ .job_id = s.job_id, .op = 0, .pct = 5, .reserved = @splat(0) } }));
 }
 
+test "the job list carries a table past five records: the row-count arithmetic is `usize` (a `@min` against the 256-row cap would narrow it to u9, and 6 × 96 B overflowed that on the sixth online fsck of a mount)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const r = try Rig.init(gpa, io);
+    defer r.deinit(gpa);
+    const c = r.cc.client();
+    // Twelve paused jobs: twice the record count that tripped the u9 bound,
+    // well inside the table and the session scratch.
+    const n_jobs = 12;
+    var ids: [n_jobs]u64 = undefined;
+    for (&ids) |*id| {
+        const s = try c.submit(.{ .job_type = .noop, .arg0 = 1, .arg1 = 0, .paused = true });
+        try testing.expectEqual(Verdict.ok, s.verdict);
+        id.* = s.job_id;
+    }
+    var list: std.ArrayList(records.JobRecord) = .empty;
+    defer list.deinit(gpa);
+    try c.list(gpa, &list);
+    try testing.expectEqual(@as(usize, n_jobs), list.items.len);
+    for (ids, list.items) |id, rec| try testing.expectEqual(id, rec.job_id);
+}
+
 test "the admin lane's volume verbs run the world; a lattice refusal is the `refused` verdict with the victim named; the fsck report rides whole or answers no_report" {
     const gpa = testing.allocator;
     const io = testing.io;
@@ -459,4 +505,30 @@ test "the admin lane's volume verbs run the world; a lattice refusal is the `ref
     r.admin.world = null;
     try testing.expectEqual(Verdict.not_coordinator, (try c.volume(.undrain, 0x77, "", false)).get());
     try testing.expectEqual(Verdict.not_coordinator, (try c.rekey(@splat(3), @splat(1), 0)).get());
+}
+
+test "admin_fsck mints the online run: a whole-set scrub and a shard 1/3 land as `JobType.fsck` records carrying the option bits in arg0 and the shard word in arg1; the generic submit of the fsck type is refused; a non-coordinator answers not_coordinator; a malformed shard never reaches the handler" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const r = try Rig.init(gpa, io);
+    defer r.deinit(gpa);
+    const c = r.cc.client();
+    const fsck_root = @import("../fsck.zig");
+    const whole = try c.fsck(frames.FSCK_FLAG_SCRUB, 25, 0, 0);
+    try testing.expectEqual(Verdict.ok, whole.verdict);
+    const w = r.fabric.snapshot(io, whole.job_id).?;
+    try testing.expectEqual(records.JobType.fsck, w.job_type);
+    try testing.expectEqual(@as(u64, fsck_root.JOB_ARG_SCRUB), w.arg0);
+    try testing.expectEqual(@as(u64, 0), w.arg1);
+    try testing.expectEqual(@as(?fsck_root.finding.Shard, null), fsck_root.jobShardOf(w.arg1));
+    try testing.expectEqual(@as(u8, 25), w.throttle_pct);
+    const sh = try c.fsck(0, 0, 1, 3);
+    try testing.expectEqual(Verdict.ok, sh.verdict);
+    const s = r.fabric.snapshot(io, sh.job_id).?;
+    try testing.expectEqual(fsck_root.finding.Shard{ .k = 1, .n = 3 }, fsck_root.jobShardOf(s.arg1).?);
+    try testing.expectEqual(fsck_root.jobShardArg(.{ .k = 1, .n = 3 }), s.arg1);
+    try testing.expectEqual(Verdict.refused, (try c.submit(.{ .job_type = .fsck })).verdict);
+    try testing.expectError(error.WireMalformed, r.conn.call(.{ .admin_fsck = .{ .flags = 0, .throttle_pct = 0, .reserved = @splat(0), .shard_k = 3, .shard_n = 3 } }));
+    r.fabric.setCoordinator(false);
+    try testing.expectEqual(Verdict.not_coordinator, (try c.fsck(0, 0, 0, 0)).verdict);
 }

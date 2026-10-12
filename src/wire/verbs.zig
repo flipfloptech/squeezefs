@@ -148,6 +148,7 @@ pub const Verb = enum(u16) {
     admin_fsck_report = 0x0703,
     admin_volume = 0x0704,
     admin_rekey = 0x0705,
+    admin_fsck = 0x0706,
     // ---- the handshake 0xFFF0 (MAC-less, the handshake class cap) ----
     challenge = 0xFFF0,
     prove = 0xFFF1,
@@ -1738,6 +1739,7 @@ pub fn ReqType(comptime v: Verb) type {
         .admin_fsck_report => admin_frames.AdminFsckReportReq,
         .admin_volume => admin_frames.AdminVolumeReq,
         .admin_rekey => admin_frames.AdminRekeyReq,
+        .admin_fsck => admin_frames.AdminFsckReq,
         .challenge => Challenge,
         .prove => Prove,
         .admitted => Admitted,
@@ -1794,6 +1796,7 @@ pub fn RepType(comptime v: Verb) type {
         .admin_fsck_report => admin_frames.AdminFsckReport,
         .admin_volume => admin_frames.AdminVolumeReply,
         .admin_rekey => admin_frames.AdminRekeyReply,
+        .admin_fsck => admin_frames.AdminJobSubmitted,
         // The handshake frames are not calls: no reply type.
         .challenge, .prove, .admitted, .refused => Empty,
     };
@@ -1859,7 +1862,7 @@ test "verb numbers: block-coded, unique, the handshake frames at 0xFFF0, every b
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0508));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0200));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0606));
-    try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0706));
+    try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0707));
     try testing.expectEqual(Block.admin, Verb.admin_job_list.block());
     try testing.expectEqual(ADMIN_SCHEMA, Verb.admin_volume.schema());
     try testing.expectEqual(frame.Class.control, Verb.admin_job_list.class());

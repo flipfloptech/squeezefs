@@ -559,6 +559,12 @@ pub const Options = struct {
     known_vol_tags: []const u64,
     /// The census-hold test seam.
     hold: ?*const std.atomic.Value(bool) = null,
+    /// A fleet member's residue: the inos of the slots THIS mount leases
+    /// (a live lessee's slots are readable only on the lessee — its
+    /// coordinator cannot scrub them), so the block census takes rows of
+    /// its own custody alone and the merge at the coordinator lands every
+    /// block exactly once.
+    custody_only: bool = false,
 };
 
 pub const Census = struct {
@@ -673,6 +679,7 @@ pub fn run(gpa: Allocator, store: Store, opts: Options) Error!Census {
             ceiling = @max(ceiling, sl.raw);
             const global = globalOfKeyIno(key_ino);
             if (opts.shard) |s| if (!s.owns(global)) continue;
+            if (opts.custody_only and !opts.scope.leased.contains(sl.slot)) continue;
             scanned += 1;
             // The block census reads EVERY slot (a foreign lessee's blocks
             // are real references; the ladder shields its churn); the
@@ -738,6 +745,7 @@ fn layoutPass(gpa: Allocator, store: Store, opts: Options, c: *Census) Error!voi
         const sl = ofKeyIno(key_ino);
         if (opts.scope.watermarks.get(sl.slot)) |w| if (sl.raw >= w) continue;
         if (opts.shard) |s| if (!s.owns(globalOfKeyIno(key_ino))) continue;
+        if (opts.custody_only and !opts.scope.leased.contains(sl.slot)) continue;
         var binds: std.ArrayList(block_refs.Binding) = .empty;
         errdefer binds.deinit(gpa);
         const l = layout.Layout.decode(xv.value, opts.geo) catch |e| {
@@ -939,6 +947,13 @@ pub fn dentryPass(gpa: Allocator, store: Store, opts: DentryOptions) Error!Dentr
             if (p.unindexed.items.len < ceiling) try p.unindexed.append(gpa, rec);
             continue;
         };
+        // A cross-owner name: the child's slot is a live lessee's (a
+        // joiner's file under this mount's directory), so its record is
+        // the lessee's to judge — scoped like a dentry of its own tree.
+        if (opts.scope.unjudged(csl.slot)) {
+            p.foreign_dentry_scoped += 1;
+            continue;
+        }
         switch (try p.referenced.mark(csl)) {
             .newly_set => p.refs_indexed += 1,
             .already_set => {

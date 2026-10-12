@@ -42,6 +42,9 @@ pub const Options = struct {
     throttle: scrub.Throttle = .none,
     /// Null = detection only.
     repair: ?repair.Options = null,
+    /// Fold the report into the instruments (`Report.publish`); a fleet
+    /// run publishes its MERGED report once instead of every residue's.
+    publish: bool = true,
 };
 
 /// `SQUEEZEFS_FSCK_SETTLE_MS` as nanoseconds (the §5.6 step-2 window).
@@ -65,7 +68,7 @@ pub fn run(host: *const Host, opts: Options, verifier: ?*scrub.Verifier) Error!f
         // ones that stood after the window.
         var tags_buf: [64]u64 = undefined;
         const tags = host.knownTags(&tags_buf);
-        var fresh = try census.run(host.gpa, host.store, .{ .scope = host.scope, .shard = host.shard, .mem_budget = host.mem_budget, .geo = host.geo, .known_vol_tags = tags });
+        var fresh = try census.run(host.gpa, host.store, .{ .scope = host.scope, .shard = host.shard, .custody_only = host.custody_only, .mem_budget = host.mem_budget, .geo = host.geo, .known_vol_tags = tags });
         defer fresh.deinit();
         try scrub.run(&pass, &fresh, verifier.?, opts.throttle);
     }
@@ -79,7 +82,7 @@ pub fn run(host: *const Host, opts: Options, verifier: ?*scrub.Verifier) Error!f
         report.repair = try eng.run(report.findings);
     }
     report.counters.scan_ms = (clock.monotonicNs() -| t0) / std.time.ns_per_ms;
-    report.publish();
+    if (opts.publish) report.publish();
     return report;
 }
 
@@ -113,6 +116,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
     const uring_fs = @import("../../io/uring_fs.zig");
     const fabric = @import("../jobs/fabric.zig");
     const job_seams = @import("../jobs/seams.zig");
+    const wire_mod = @import("../jobs/wire.zig");
 
     pub const BackendFs = handler.BackendFs;
 
@@ -170,6 +174,12 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         var s: u32 = 0;
         while (s < inos.ROUTING_WIDTH) : (s += 1) try b.scope.leased.put(gpa, @intCast(s), {});
         try refreshScope(b);
+        // The forest's classes off tree 0 and the pages: an appender LIVE
+        // on the directory with its ring unrecovered keeps its slots (the
+        // open refuses them until the recovery ladder runs) — they are a
+        // live lessee's to this census, never judged (the offline fsck
+        // after a killed member read its directory's name as dangling).
+        try refreshLiveScope(b);
         // The data volumes.
         var vols: std.ArrayList(classes.Volume) = .empty;
         errdefer vols.deinit(gpa);
@@ -249,6 +259,185 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                 try b.scope.era_floor.put(gpa, slot, c);
             }
         }
+    }
+
+    /// This process's appender id on `be` (the manager's region 0, a
+    /// joiner's region); null on a flat volume.
+    fn ownAppenderId(be: *meta_set.KvBackend) ?u32 {
+        if (be.sym) |set| return set.region0().appenderId();
+        if (be.joined) |js| return js.appenderId();
+        return null;
+    }
+
+    /// The JOINED posture's binding (`ops_fsck.md` §2.5, the fabric's at
+    /// every online pass): the posture itself (a joiner is a `member`; the
+    /// D0 winner a `manager`), each routing slot's class off tree 0 and
+    /// the appender pages — leased HERE (this process's appender id, or a
+    /// native slot of a volume this process manages), FOREIGN-LIVE (a
+    /// lessee whose page is Live or Recovering: its tree changes under
+    /// this census — never judged), UNLEASED (nobody's: every record
+    /// prior-era) — and the WINDOWS: every live foreign appender's ring
+    /// scanned from its page's tail off the device, the GLOBAL inos its
+    /// slot-tree frames name (a dentry's child from the frame's value, a
+    /// DELETE's child through the tree) scoped out of C9/C10. A ring that
+    /// cannot be read makes the WHOLE inode plane abstain
+    /// (`window_unknown`). On a flat set every slot stays this open's.
+    pub fn refreshLiveScope(b: *Bound) Allocator.Error!void {
+        try refreshScope(b);
+        const gpa = b.gpa;
+        const set = b.be;
+        var symmetric = false;
+        for (set.volumes) |be| symmetric = symmetric or be.sb.symmetricPlaneStamped();
+        if (!symmetric) return;
+        // The probe (an offline open) keeps its posture: every judged slot
+        // is prior-era there; the lessee classes below still apply.
+        if (b.scope.posture != .probe) b.scope.posture = if (set.posture == .joined) .member else .manager;
+        b.scope.leased.clearRetainingCapacity();
+        b.scope.foreign_live.clearRetainingCapacity();
+        b.scope.unleased.clearRetainingCapacity();
+        b.scope.window_inos.clearRetainingCapacity();
+        b.scope.window_unknown = false;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var pages: std.ArrayList(page.Page) = .empty;
+        defer pages.deinit(gpa);
+        var vol_of_page: std.ArrayList(u16) = .empty;
+        defer vol_of_page.deinit(gpa);
+        var tree0: std.ArrayList(classes.Tree0Row) = .empty;
+        for (set.volumes, 0..) |be, vi| {
+            if (!be.sb.symmetricPlaneStamped()) continue;
+            const before = pages.items.len;
+            ForestBind.readPages(gpa, be, &pages) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    b.scope.window_unknown = true;
+                    continue;
+                },
+            };
+            for (before..pages.items.len) |_| try vol_of_page.append(gpa, @intCast(vi));
+            ForestBind.readTree0(gpa, a, be, @intCast(vi), &tree0) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => b.scope.window_unknown = true,
+            };
+        }
+        var s: u32 = 0;
+        while (s < inos.ROUTING_WIDTH) : (s += 1) {
+            const slot: u16 = @intCast(s);
+            const vi = set.volumeIndexOfSlot(slot);
+            const be = set.volumes[vi];
+            const mine = ownAppenderId(be);
+            var row: ?cr.SlotState = null;
+            for (tree0.items) |r| if (r.vol == vi and r.slot == slot) {
+                row = r.state;
+            };
+            const native_here = be.stamp.native_slot != null and be.stamp.native_slot.? == slot;
+            if (row == null or row.?.variant == .unleased) {
+                // A native slot is its volume's manager's; a joiner sees the
+                // manager's native slot as a live foreign lessee's.
+                if (native_here) {
+                    if (be.posture == .joined) try b.scope.foreign_live.put(gpa, slot, {}) else try b.scope.leased.put(gpa, slot, {});
+                } else try b.scope.unleased.put(gpa, slot, {});
+                continue;
+            }
+            const st = row.?;
+            if (st.variant == .leased and mine != null and st.appender_id == mine.?) {
+                try b.scope.leased.put(gpa, slot, {});
+                continue;
+            }
+            // Another lessee, or the recovery's structural mark: its tree is
+            // not this census's to judge (a dead lessee's recovery rewrites
+            // it under the manager's serialization).
+            try b.scope.foreign_live.put(gpa, slot, {});
+        }
+        // The live lease table is this mount's own authority on what it
+        // holds: a joiner's tree 0 is a projection of the manager's pen
+        // and lags its own grants (a fleet member read none of its slots
+        // as leased, and its custody residue scrubbed nothing).
+        var held: std.ArrayList(u16) = .empty;
+        defer held.deinit(gpa);
+        for (set.volumes) |be| {
+            if (!be.sb.symmetricPlaneStamped()) continue;
+            try be.slots.table.heldBy(be.slots.me, &held);
+        }
+        for (held.items) |slot| {
+            try b.scope.leased.put(gpa, slot, {});
+            _ = b.scope.foreign_live.remove(slot);
+            _ = b.scope.unleased.remove(slot);
+        }
+        // The windows of every live foreign appender.
+        for (pages.items, vol_of_page.items) |*p, vi| {
+            if (p.state != .live and p.state != .recovering) continue;
+            const be = set.volumes[vi];
+            if (ownAppenderId(be)) |mine| if (p.appender_id == mine) continue;
+            if (p.head_hint <= p.ledger_tail_seq) continue;
+            foreignWindowInos(b, be, p) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    b.scope.window_unknown = true;
+                    log.warn("fsck online: appender {d}'s ring on meta volume {d} could not be read ({s}) — the inode plane takes no verdict this run", .{ p.appender_id, vi, @errorName(e) });
+                },
+            };
+        }
+        log.debug("fsck online: the forest scope — posture {t}, {d} leased, {d} foreign-live, {d} unleased slot(s), {d} window ino(s), {d} tree-0 row(s), {d} page(s){s}", .{ b.scope.posture, b.scope.leased.count(), b.scope.foreign_live.count(), b.scope.unleased.count(), b.scope.window_inos.count(), tree0.items.len, pages.items.len, if (b.scope.window_unknown) ", a window UNREADABLE" else "" });
+    }
+
+    /// One live foreign ring's window into `scope.window_inos`: the ring's
+    /// segments read whole off the device (a snapshot of a ring being
+    /// appended — the scan stops at the first torn entry, which is the
+    /// appender's in-flight write, never an acked record), scanned from
+    /// the page's tail with the journal's own total decoder.
+    fn foreignWindowInos(b: *Bound, be: *meta_set.KvBackend, p: *const page.Page) Error!void {
+        const gpa = b.gpa;
+        const part = page.ringPartOf(p.appender_id, &p.segments);
+        var exts: [page.RING_SEGMENTS_MAX]journal.ExtentRef = undefined;
+        for (part.slice(), 0..) |seg, i| exts[i] = .{ .start = seg.start, .len = seg.len };
+        const ring_layout = journal.RingLayout.fromSegments(exts[0..part.len]) catch return error.Corrupt;
+        const geo = journal.productionGeometry(ring_layout.pages, be.dev.mode.grain());
+        const image = try gpa.alloc(u8, @intCast(ring_layout.ringBytes()));
+        defer gpa.free(image);
+        var off: usize = 0;
+        for (part.slice()) |seg| {
+            const bytes = be.dev.readRange(gpa, seg.start, @intCast(seg.len)) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+            };
+            defer gpa.free(bytes);
+            @memcpy(image[off .. off + bytes.len], bytes);
+            off += bytes.len;
+        }
+        var rec = try journal.replayScanImage(gpa, image, geo, p.ledger_tail_seq, p.appender_id);
+        defer rec.deinit();
+        var named: u64 = 0;
+        for (rec.entries) |e| {
+            var it = e.records();
+            while (it.next()) |f| {
+                const tag = journal.untag(f.tag);
+                if (tag.level != 0 or !key.isSlotTreeKind(tag.tree_id)) continue;
+                _ = key.checkSlotTreeKey(tag.tree_id, f.key) catch continue;
+                const key_ino = std.mem.readInt(u64, f.key[key.routeOff(tag.tree_id)..][0..8], .big);
+                try b.scope.window_inos.put(gpa, census.globalOfKeyIno(key_ino), {});
+                named += 1;
+                if (tag.tree_id != key.TREE_DENTRIES) continue;
+                // The child: off a Put's value, else (a DELETE) the tree's
+                // record of the key, if it still stands.
+                const child: ?u64 = blk: {
+                    if (f.value.len != 0) {
+                        const dv = record.DentryValue.decode(f.value) catch break :blk null;
+                        break :blk dv.child_ino;
+                    }
+                    const v = (b.host.store.lookup(gpa, key.TREE_DENTRIES, f.key) catch break :blk null) orelse break :blk null;
+                    defer gpa.free(v);
+                    const dv = record.DentryValue.decode(v) catch break :blk null;
+                    break :blk dv.child_ino;
+                };
+                if (child) |c| {
+                    try b.scope.window_inos.put(gpa, c, {});
+                    named += 1;
+                }
+            }
+        }
+        fsck.stats.fsck_inode_plane_window_scoped.add(named);
     }
 
     /// The device read: the data volume's `readInto` (O_DIRECT grain).
@@ -366,6 +555,52 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             }
         };
 
+        /// Every appender page of `be` (appender 0's newest of its four
+        /// slots, then the directory chain's pairs), appended to `out`.
+        fn readPages(gpa: Allocator, be: *meta_set.KvBackend, out: *std.ArrayList(page.Page)) Error!void {
+            var rd: Reader = .{ .be = be };
+            const reader: dir.PageReader = .{ .ctx = &rd, .read = &Reader.read };
+            {
+                const offs = page.appender0PageOffsets(be.sb.journal.start);
+                var bufs: [page.PAGE_SLOTS][page.PAGE_LEN]u8 = undefined;
+                var imgs: [page.PAGE_SLOTS]?[]const u8 = .{ null, null, null, null };
+                for (offs, 0..) |off, i| {
+                    Reader.read(&rd, off, &bufs[i]) catch return error.Io;
+                    imgs[i] = &bufs[i];
+                }
+                if (page.newestValid(imgs) catch return error.Corrupt) |p| try out.append(gpa, p);
+            }
+            var links: std.ArrayList(dir.Link) = .empty;
+            defer links.deinit(gpa);
+            dir.walkChain(gpa, reader, .{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, be.sb.node_size, .{ .start = be.sb.heap.start, .len = be.sb.heap.len }, be.sb.totalExtents(), &links) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+                error.Corrupt => error.Corrupt,
+            };
+            for (links.items) |l| {
+                var pair: u32 = 0;
+                while (pair < l.header.pairs) : (pair += 1) {
+                    const imgs = dir.readPair(reader, l, pair) catch return error.Io;
+                    if (imgs.foreign) return error.Corrupt;
+                    const p = imgs.newest() orelse continue;
+                    try out.append(gpa, p);
+                }
+            }
+        }
+
+        /// Tree 0's `slot_state` rows of `be`.
+        fn readTree0(gpa: Allocator, arena: Allocator, be: *meta_set.KvBackend, vol: u16, out: *std.ArrayList(classes.Tree0Row)) Error!void {
+            const r = cr.rangeOf(.slot_state);
+            var kvs: std.ArrayList(tree.KeyValue) = .empty;
+            defer tree.deinitKeyValues(gpa, &kvs);
+            be.range(gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs) catch return error.Io;
+            for (kvs.items) |kv| {
+                const slot = cr.slotOfKey(kv.key) orelse continue;
+                const st = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
+                try out.append(arena, .{ .vol = vol, .slot = slot, .state = st });
+            }
+        }
+
         fn custodyFn(ctx: *anyopaque, arena: Allocator) Error!classes.ForestCensus {
             const self: *ForestBind = @ptrCast(@alignCast(ctx));
             var pages: std.ArrayList(classes.PageView) = .empty;
@@ -380,45 +615,11 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                 // this volume. Reading the slots as pages would judge the
                 // ring's bytes as a torn page census (`Corrupt`).
                 if (!be.sb.symmetricPlaneStamped()) continue;
-                var rd: Reader = .{ .be = be };
-                const reader: dir.PageReader = .{ .ctx = &rd, .read = &Reader.read };
-                // Appender 0.
-                {
-                    const offs = page.appender0PageOffsets(be.sb.journal.start);
-                    var bufs: [page.PAGE_SLOTS][page.PAGE_LEN]u8 = undefined;
-                    var imgs: [page.PAGE_SLOTS]?[]const u8 = .{ null, null, null, null };
-                    for (offs, 0..) |off, i| {
-                        Reader.read(&rd, off, &bufs[i]) catch return error.Io;
-                        imgs[i] = &bufs[i];
-                    }
-                    if (page.newestValid(imgs) catch return error.Corrupt) |p| try pages.append(arena, try view(arena, vol, p));
-                }
-                var links: std.ArrayList(dir.Link) = .empty;
-                defer links.deinit(self.gpa);
-                dir.walkChain(self.gpa, reader, .{ .start = be.sb.appender_dir.start, .len = be.sb.appender_dir.len }, be.sb.node_size, .{ .start = be.sb.heap.start, .len = be.sb.heap.len }, be.sb.totalExtents(), &links) catch |e| return switch (e) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.Io => error.Io,
-                    error.Corrupt => error.Corrupt,
-                };
-                for (links.items) |l| {
-                    var pair: u32 = 0;
-                    while (pair < l.header.pairs) : (pair += 1) {
-                        const imgs = dir.readPair(reader, l, pair) catch return error.Io;
-                        if (imgs.foreign) return error.Corrupt;
-                        const p = imgs.newest() orelse continue;
-                        try pages.append(arena, try view(arena, vol, p));
-                    }
-                }
-                // Tree 0's slot_state rows.
-                const r = cr.rangeOf(.slot_state);
-                var kvs: std.ArrayList(tree.KeyValue) = .empty;
-                defer tree.deinitKeyValues(self.gpa, &kvs);
-                be.range(self.gpa, key.TREE_CONTROL, r.start.slice(), r.end.slice(), std.math.maxInt(usize), &kvs) catch return error.Io;
-                for (kvs.items) |kv| {
-                    const slot = cr.slotOfKey(kv.key) orelse continue;
-                    const st = cr.SlotStateWire.decode(kv.value) catch return error.Corrupt;
-                    try tree0.append(arena, .{ .vol = vol, .slot = slot, .state = st });
-                }
+                var raw: std.ArrayList(page.Page) = .empty;
+                defer raw.deinit(self.gpa);
+                try readPages(self.gpa, be, &raw);
+                for (raw.items) |p| try pages.append(arena, try view(arena, vol, p));
+                try readTree0(self.gpa, arena, be, vol, &tree0);
             }
             // Volume 0's death ledger.
             {
@@ -481,6 +682,9 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         staging_root: ?[]const u8,
         bound: *Bound,
         last: ?finding.Report = null,
+        /// The fleet READ-shard dispatcher (the coordinator's; `none`
+        /// without a wire): a pass with read capacity ships residues.
+        fleet: job_seams.FleetDispatch = job_seams.FleetDispatch.none,
 
         pub fn deinit(self: *JobBody) void {
             if (self.last) |*r| r.deinit(self.gpa);
@@ -496,19 +700,40 @@ pub const linux = if (builtin.os.tag == .linux) struct {
             return .{ .env = self.env, .mode = .online, .mem_budget = self.mem_budget, .fs = self.fs, .staging_root = self.staging_root };
         }
 
-        fn passFn(ctx: *anyopaque, io: Io, f: *fabric.Fabric, job: *fabric.JobCtl) fabric.PassError!fabric.PassOutcome {
-            const self: *JobBody = @ptrCast(@alignCast(ctx));
+        /// The binding is REBUILT when the plane's volume population
+        /// changed; the host takes this run's io and stop words, then the
+        /// fabric's binding (the live forest's posture, leased / foreign-
+        /// live / unleased slots, the foreign windows).
+        fn rebind(self: *JobBody, io: Io, cancel: ?*const std.atomic.Value(bool), pause: ?*const std.atomic.Value(bool)) Allocator.Error!void {
             if (self.bound.vols.len != self.plane.vols.n()) {
                 const fresh = bind(self.gpa, io, self.be, self.plane, self.bindOptions()) catch return error.OutOfMemory;
                 destroy(self.bound);
                 self.bound = fresh;
             }
             self.bound.host.io = io;
-            self.bound.host.cancel = &job.cancel_intent;
-            self.bound.host.pause = &job.pause_intent;
-            try refreshScope(self.bound);
+            self.bound.host.cancel = cancel;
+            self.bound.host.pause = pause;
+            try refreshLiveScope(self.bound);
+        }
+
+        fn passFn(ctx: *anyopaque, io: Io, f: *fabric.Fabric, job: *fabric.JobCtl) fabric.PassError!fabric.PassOutcome {
+            const self: *JobBody = @ptrCast(@alignCast(ctx));
+            try self.rebind(io, &job.cancel_intent, &job.pause_intent);
             var pacer: FabricThrottle = .{ .t = job_seams.Throttle.forJob(f, job) };
-            const report = run(&self.bound.host, .{ .scrub = job.rec.arg0 & fsck.JOB_ARG_SCRUB != 0, .scrub_only = job.rec.arg0 & fsck.JOB_ARG_SCRUB_ONLY != 0, .throttle = pacer.throttle() }, if (self.bound.verifier) |*v| v else null) catch |e| return switch (e) {
+            const opts: Options = .{ .scrub = job.rec.arg0 & fsck.JOB_ARG_SCRUB != 0, .scrub_only = job.rec.arg0 & fsck.JOB_ARG_SCRUB_ONLY != 0, .throttle = pacer.throttle() };
+            // The record's shard word (`admin_fsck`'s): a sharded run judges
+            // its residue of the inode plane alone, like the offline shard;
+            // a WHOLE run with read capacity ships residues to the fleet.
+            const requested = fsck.jobShardOf(job.rec.arg1);
+            const capacity: u32 = if (requested == null) self.fleet.readCapacity() else 0;
+            const report = if (capacity == 0) blk: {
+                self.bound.host.shard = requested;
+                self.bound.host.custody_only = false;
+                break :blk run(&self.bound.host, opts, if (self.bound.verifier) |*v| v else null) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.Body,
+                };
+            } else self.runFleet(io, job, opts, 1 + capacity) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.Body,
             };
@@ -527,6 +752,111 @@ pub const linux = if (builtin.os.tag == .linux) struct {
         pub fn lastReportJson(self: *JobBody, gpa: Allocator) Allocator.Error!?[]u8 {
             const r = self.last orelse return null;
             return try r.boundedJson(gpa, fsck.ADMIN_WIRE_CAP);
+        }
+
+        /// The fleet run (spec §1.9a, `ops_fsck.md` §7) over the set's
+        /// CUSTODY: a live lessee's slots are readable only on the lessee
+        /// (its trees leave the coordinator's forest at the grant), so the
+        /// residues are the members' custodies, never ino residues — `n − 1`
+        /// member shards QUEUED for the read-capable workers first (each
+        /// runs its engine over its own leased slots alone), the whole of
+        /// THIS mount's view run HERE online with the suspect/settle
+        /// machinery armed, then every shipped residue collected: a
+        /// proposal merges (its report parsed by the ONE decoder); a lost
+        /// one is counted (`job_fleet_shards_relocal`) and the local view
+        /// re-run once — a dead member's slots are the manager's again
+        /// after its recovery, a live-but-silent member's stay its own. The
+        /// shards retire at the pass end; the MERGED report publishes once.
+        fn runFleet(self: *JobBody, io: Io, job: *fabric.JobCtl, opts: Options, n: u32) Error!finding.Report {
+            const gpa = self.gpa;
+            var queued: [wire_mod.MAX_READ_SHARDS]bool = @splat(false);
+            const shards: u32 = @min(n, @as(u32, @intCast(wire_mod.MAX_READ_SHARDS)));
+            var k: u32 = 1;
+            while (k < shards) : (k += 1) {
+                queued[k] = self.fleet.queueReadShard(.{ .id = .{ .job_id = job.id(), .shard = k }, .fleet_k = k, .fleet_n = shards, .inode_plane = 0, .throttle_pct = job.ctl.loadPct() }, job.rec.arg0);
+            }
+            defer self.fleet.retireFleetShards(job.id());
+            var parts: std.ArrayList(finding.Report) = .empty;
+            defer {
+                for (parts.items) |*p| p.deinit(gpa);
+                parts.deinit(gpa);
+            }
+            var local = opts;
+            local.publish = false;
+            self.bound.host.shard = null;
+            self.bound.host.custody_only = false;
+            try parts.append(gpa, try run(&self.bound.host, local, if (self.bound.verifier) |*v| v else null));
+            var remote: u32 = 0;
+            var lost: u32 = 0;
+            k = 1;
+            while (k < shards) : (k += 1) {
+                var landed = false;
+                if (queued[k]) switch (self.fleet.collectReadShard(io, gpa, .{ .job_id = job.id(), .shard = k })) {
+                    .payload => |p| {
+                        defer self.fleet.release(gpa, p);
+                        if (finding.Report.parse(gpa, p)) |rep| {
+                            try parts.append(gpa, rep);
+                            landed = true;
+                            remote += 1;
+                        } else |_| log.warn("fsck fleet: residue {d}/{d} of job-{x:0>16} proposed a report that does not parse — lost", .{ k, shards, job.id() });
+                    },
+                    .lost => {},
+                };
+                if (!landed) lost += 1;
+            }
+            if (lost != 0 and !self.bound.host.cancelled()) {
+                // The local view again, in place of the first pass: what a
+                // dead member's recovery returned to this mount is in it.
+                var again = try run(&self.bound.host, local, if (self.bound.verifier) |*v| v else null);
+                parts.items[0].deinit(gpa);
+                parts.items[0] = again;
+                again = undefined;
+            }
+            var merged = try finding.merge(gpa, parts.items);
+            merged.mode = .online;
+            merged.publish();
+            log.info("fsck fleet: job-{x:0>16} judged {d} residue(s): {d} proposed by the fleet, {d} run here", .{ job.id(), shards, remote, shards - remote });
+            return merged;
+        }
+
+        /// The worker side (`wire.ReadRunner`): THIS member's engine over
+        /// its own binding — its plane's read path, its posture's scope —
+        /// running the residue the coordinator leased it, the cancel the
+        /// lease clock raises as the stop latch; the report as JSON.
+        pub fn readRunner(self: *JobBody) wire_mod.ReadRunner {
+            return .{ .ctx = self, .run = &readShardFn };
+        }
+
+        fn readShardFn(ctx: *anyopaque, io: Io, gpa: Allocator, d: wire_mod.ReadDescriptor, cancel: *const std.atomic.Value(bool)) error{ OutOfMemory, Io }!?[]u8 {
+            const self: *JobBody = @ptrCast(@alignCast(ctx));
+            try self.rebind(io, cancel, null);
+            // The member's residue is its custody: the slots it leases.
+            self.bound.host.shard = null;
+            self.bound.host.custody_only = true;
+            var pacer: FixedThrottle = .{ .pct = d.throttle_pct };
+            var report = run(&self.bound.host, .{ .scrub = d.arg0 & fsck.JOB_ARG_SCRUB != 0, .scrub_only = d.arg0 & fsck.JOB_ARG_SCRUB_ONLY != 0, .throttle = pacer.throttle() }, if (self.bound.verifier) |*v| v else null) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Io,
+            };
+            defer report.deinit(gpa);
+            if (cancel.load(.acquire)) return null;
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            errdefer out.deinit();
+            report.writeJson(&out.writer) catch return error.OutOfMemory;
+            return try out.toOwnedSlice();
+        }
+    };
+
+    /// The descriptor's duty cycle as the scrub's pacer (a remote shard
+    /// keeps the duty it was granted).
+    const FixedThrottle = struct {
+        pct: u8,
+        fn throttle(self: *FixedThrottle) scrub.Throttle {
+            return .{ .ctx = self, .pct = &pctFn };
+        }
+        fn pctFn(ctx: ?*anyopaque) u8 {
+            const self: *FixedThrottle = @ptrCast(@alignCast(ctx.?));
+            return self.pct;
         }
     };
 

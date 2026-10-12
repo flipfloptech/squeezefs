@@ -249,6 +249,33 @@ pub const RamSet = struct {
         return global(l);
     }
 
+    /// `mkfile` minted in guest slot `slot` at raw local `raw` (a lessee's
+    /// record under this mount's directory): the records keyed by the
+    /// guest key ino, the dentry naming the GLOBAL ino. Returns the global.
+    pub fn mkfileGuest(self: *RamSet, slot: u16, raw: u64, parent: u64, name: []const u8, vol_tag: u64, blocks: []const u64) !u64 {
+        const l = key.guestLocalIno(slot, raw);
+        const g = inos.makeGlobalIno(raw, slot, inos.ROUTING_WIDTH);
+        const t = try self.mem.begin(@src());
+        errdefer self.mem.abandon(t);
+        try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * blocks.len, .ctime = 7 });
+        try self.putDentry(t, local(parent), name, g, economy.S.IFREG);
+        var entries: std.ArrayList(layout.MapEntryWire) = .empty;
+        defer entries.deinit(self.gpa);
+        var proofs: std.ArrayList(layout.DmaProof) = .empty;
+        defer proofs.deinit(self.gpa);
+        for (blocks, 0..) |b, i| {
+            const m = layout.Mapping.wholeBlock(vol_tag, b * CHUNK, 0);
+            try entries.append(self.gpa, (layout.MapEntry{ .block = @intCast(i), .mapping = m }).encode());
+            try proofs.append(self.gpa, .{ .vol_tag = vol_tag, .offset = b * CHUNK, .len = CHUNK, .completed_ns = 1 });
+            self.trackBlock(vol_tag, b);
+            @memset(self.devs[if (vol_tag == VOL_A) 0 else 1][@intCast(b * CHUNK)..][0..@intCast(CHUNK)], @truncate(b + 1));
+        }
+        const lay = layout.Layout.stripedInline(CHUNK * blocks.len, entries.items);
+        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = proofs.items }, classes.refs_seam, self.geo);
+        try self.commitTx(t);
+        return g;
+    }
+
     /// A packed small file: ONE tenant window `[rel_off, rel_off + len)`
     /// of block `blk` on `vol_tag`.
     pub fn mkpacked(self: *RamSet, parent: u64, name: []const u8, vol_tag: u64, blk: u64, rel_off: u32, len: u32) !u64 {

@@ -668,9 +668,11 @@ pub const Drift = struct {
 
 pub const DriftReport = struct {
     rows: []Drift,
-    /// Blocks excused: an open pack block, a live in-flight owner.
+    /// Blocks excused: an open pack block, a live in-flight owner, a live
+    /// lessee's reference.
     pack_exempted: u64,
     inflight_exempted: u64,
+    foreign_exempted: u64 = 0,
 
     pub fn deinit(self: *DriftReport, gpa: Allocator) void {
         gpa.free(self.rows);
@@ -689,6 +691,9 @@ pub const Exemptions = struct {
     isOpenPack: *const fn (?*anyopaque, block_idx: u64) bool,
     /// A block with a live in-flight owner (`InflightAllocGuard`).
     isInflight: *const fn (?*anyopaque, block_idx: u64) bool,
+    /// A block a LIVE lessee's record references (the fsck's forest scope:
+    /// the lessee's ring lags the census, its refs are its own to judge).
+    isForeignRef: ?*const fn (?*anyopaque, block_idx: u64) bool = null,
 };
 
 /// Durable population per block from the ledger scan vs the derived census
@@ -741,6 +746,10 @@ fn judge(rows: *std.ArrayList(Drift), gpa: Allocator, report: *DriftReport, exem
             stats.inflight_exempted.inc();
             return;
         }
+        if (x.isForeignRef) |f| if (f(x.ctx, idx)) {
+            report.foreign_exempted += 1;
+            return;
+        };
     }
     try rows.append(gpa, .{ .block_idx = idx, .durable = durable, .derived = derived });
 }

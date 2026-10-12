@@ -561,7 +561,7 @@ pub const Engine = struct {
         if (self.pass.fresh.cen == null) {
             var tags_buf: [64]u64 = undefined;
             const tags = self.pass.host.knownTags(&tags_buf);
-            self.pass.fresh.cen = try census.run(self.gpa, self.pass.host.store, .{ .scope = self.pass.host.scope, .shard = self.pass.host.shard, .mem_budget = self.pass.host.mem_budget, .geo = self.pass.host.geo, .known_vol_tags = tags });
+            self.pass.fresh.cen = try census.run(self.gpa, self.pass.host.store, .{ .scope = self.pass.host.scope, .shard = self.pass.host.shard, .custody_only = self.pass.host.custody_only, .mem_budget = self.pass.host.mem_budget, .geo = self.pass.host.geo, .known_vol_tags = tags });
         }
         return &self.pass.fresh.cen.?;
     }

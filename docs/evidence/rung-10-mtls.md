@@ -1,5 +1,15 @@
 # Rung 10 — the `MutualTls` channel class, end to end
 
+> **The owner's direction of 2026-10-12 (after §1–§8 landed): the record layer on Linux is the KERNEL's
+> (kTLS).** The handshake, the PKI, the OpenSSL interop and the exporter-bound session key stay; after
+> the handshake the traffic keys go to the `tls` ULP and the socket is plain TCP to the daemon. **The
+> venue kernel has no kTLS** (`# CONFIG_TLS is not set` in 7.2.6-sqz, §9.1), so per the direction this
+> landing stops at the DESIGN (§9) plus the FAIL-LOUD path (§9.3): on Linux a `mutual_tls` mount and every
+> TLS dial refuse by name, never a silent fall-back to the userspace record layer, which stays the
+> handshake's transport and the portable path. §4–§6 below are the userspace record layer's record (the
+> comparison column of §9.6) — the two-daemon matrix and the wire's verb rows over TLS ran green under it
+> and are now the skip ledger's until a kernel with `CONFIG_TLS` arrives.
+
 Charter §8 ("remote workers over TCP/TLS with HMAC enrollment … verify-read sampling below 100 % is
 admissible only on authenticated ∧ confidential"), §1.2 (the TCP/TLS stack is the sanctioned non-uring
 exception); `docs/porting/sym_wire_membership_recovery.md` §1.1 channel classes (CW:987–1008: `Plaintext`
@@ -170,13 +180,157 @@ Knobs: `SQUEEZEFS_WIRE_CHANNEL` (enum, switch), `SQUEEZEFS_WIRE_TLS_CA`, `SQUEEZ
 `SQUEEZEFS_WIRE_TLS_KEY` (config) — read by `wire/tls.zig`. Counters (`wire/stats.zig`, the `wire` family):
 `cluster_wire_channel_mutual_tls` (gauge), `cluster_wire_tls_handshakes`, `cluster_wire_tls_refused_untrusted`,
 `cluster_wire_tls_refused_expired`, `cluster_wire_tls_refused_protocol`, `cluster_wire_plaintext_refused`,
-`cluster_wire_tls_key_updates`, `cluster_wire_tls_dial_refused`. Rails: the knob census, the fuzz census
+`cluster_wire_tls_key_updates`, `cluster_wire_tls_dial_refused`, `cluster_wire_ktls_refused` (§9.3). Rails:
+the knob census, the fuzz census
 (two new fuzz tests naming every new `parse*`/`decode*`), the literal rail (every DER/TLS constant
 documented on its line; the allowlist rebased across the CLI line shifts, no new rows).
 
 ## 8. Owed
 
+Superseded by §10 after the owner's kTLS direction.
+
+## 9. The kernel record layer (kTLS): facts, design, the fail-loud path
+
+### 9.1 The venue kernel's facts (7.2.6-sqz, 2026-10-12)
+
+| Probe | Result |
+|---|---|
+| `zcat /proc/config.gz \| grep CONFIG_TLS` | **`# CONFIG_TLS is not set`**; no `CONFIG_TLS_DEVICE`, no `CONFIG_TLS_TOE` |
+| `CONFIG_MODULES` | `# CONFIG_MODULES is not set` — a monolithic kernel: no `modprobe`, no `/lib/modules`, the ULP cannot be loaded later |
+| `/proc/sys/net/ipv4/tcp_available_ulp` | empty (one newline) — no `tls` ULP registered |
+| `/proc/kallsyms` `tls_*` | 15 symbols, ALL `net/handshake`'s upcall helpers (`tls_handshake_accept/done/cancel`, `tls_client_hello_x509`, `tls_alert_send`, `tls_get_record_type`, … — `CONFIG_NET_HANDSHAKE=y`); none of `tls_set_sw_offload` / `tls_sw_sendmsg` / `tls_sw_recvmsg` / `tls_set_device_offload` |
+| `setsockopt(TCP_ULP, "tls")` on an established loopback pair (`tls.ktls.probeKernel`) | fails → `absent` |
+| TLS 1.3 + rekey acceptance (6.14+ `TLS_TX`/`TLS_RX` re-setsockopt after a KeyUpdate) | **not testable here** — the kernel series (7.2) is past 6.14, so the API is expected present once `CONFIG_TLS=y`; the design below assumes it and the owed test row pins it |
+
+**The venue change the kTLS record layer needs:** `CONFIG_TLS=y` (and `CONFIG_TLS_DEVICE=y` for NIC
+offload) in the sqz kernel config. Everything below is designed against the upstream uapi
+(`include/uapi/linux/tls.h`) and recorded so the data path lands as one commit when the kernel does.
+
+### 9.2 The design: handshake in-tree, record layer = kTLS
+
+1. **After the handshake** (`Conn.armRecordLayer`, both roles): `setsockopt(fd, SOL_TCP, TCP_ULP, "tls", 3)`
+   on the ESTABLISHED socket (`linux.TCP.ULP` = 31), then `setsockopt(fd, SOL_TLS = 282, TLS_TX = 1,
+   &tls12_crypto_info_aes_gcm_128)` with OUR application traffic keys and `TLS_RX = 2` with the PEER's:
+   `{ version = TLS_1_3_VERSION (0x0304), cipher_type = TLS_CIPHER_AES_GCM_128 (51), salt = iv[0..4],
+   iv = iv[4..12], key = key[16], rec_seq = 0 }` (`tls.ktls.cryptoInfo(Traffic)`, 40 B, comptime-pinned).
+   The handshake's records (ClientHello … Finished) are the userspace layer's; nothing of the application
+   epoch has been read into userspace when `TLS_RX` is installed (the record reader consumes exactly one
+   record per read, so the socket's queue holds only application-epoch records and the kernel's `rec_seq`
+   starts at 0 exactly). Optionally `TLS_RX_EXPECT_NO_PAD` (4): neither this engine nor OpenSSL pads.
+   `confidential()` = both halves installed (the owner's law, `Conn.confidential`, already in code).
+2. **From then on the socket is plain TCP to the daemon**: the session's `TcpLink` writes frames with
+   `sendto` as the Plaintext class does (one record per ≤ 16 KiB; the kernel seals), and READS with
+   `recvmsg` carrying a control buffer — never plain `recv`: a non-data record arriving without
+   `msg_control` is `-EIO` (`tls_record_content_type` + `MSG_CTRUNC`). Each `recvmsg` returns bytes of ONE
+   record type; the cmsg `SOL_TLS / TLS_GET_RECORD_TYPE (2)` carries it:
+   - `application_data` (23): the frame bytes — the session's receive discipline unchanged;
+   - `alert` (21): `close_notify` → `error.Eof` (orderly), any other → `error.TransportFailed`, both
+     counted (`cluster_wire_tls_alerts_{close_notify,fatal}`, owed) and logged loud;
+   - `handshake` (22): `KeyUpdate` (type 24) → derive the peer's next RX secret
+     (`HKDF-Expand-Label(secret, "traffic upd", "", 32)`), re-`setsockopt(TLS_RX)` with the new key and
+     `rec_seq = 0` (the 6.14 rekey), count `cluster_wire_tls_key_updates`; `update_requested` sets the
+     writer's pending flag; `NewSessionTicket` (type 4) → ignored and counted
+     (`cluster_wire_tls_tickets_ignored`, owed); anything else → `error.TransportFailed`;
+   - any other type → `error.TransportFailed`.
+   The owner's wording "`IORING_OP_RECVMSG`": the Plaintext wire's frame path is NOT on io_uring — it is
+   the blocking-syscall path on the wire's OS threads by design (spec §1.1 "deliberately not io_uring",
+   CW:100–102; charter §1.2's TCP/TLS exception; §9 thread-per-connection). The kTLS socket rides the SAME
+   path, with `recvmsg(2)` where the Plaintext class uses `recvfrom(2)`; moving the wire's frames onto
+   io_uring (`IORING_OP_RECVMSG`/`SEND_ZC`) is a separate decision about the Plaintext class too, named
+   for the owner in the report, not taken here.
+3. **Our KeyUpdate** (the 2^23-record ceiling, or the peer's request, honoured at the writer's next write
+   under its own serialization): `sendmsg` of the 5 B KeyUpdate with cmsg `SOL_TLS / TLS_SET_RECORD_TYPE
+   (1) = handshake` under the CURRENT key, then re-`setsockopt(TLS_TX)` with the next secret's key/iv and
+   `rec_seq = 0`. The record count the ceiling judges is ⌈len / 2^14⌉ per write (the kernel splits as the
+   userspace layer did).
+4. **close_notify**: `sendmsg` of the 2 B alert with `TLS_SET_RECORD_TYPE = alert`, then the socket close
+   (today's `linkClose`, over the kernel).
+5. **The dead-on-arrival peek** stays on the raw socket; under kTLS the kernel presents the DECRYPTED
+   queue to `MSG_PEEK`, so a queued close_notify is a control record the peek cannot see as EOF — the
+   mux reader's `recvmsg` classifies it (the §O row stands).
+6. **Tests owed with the data path** (each a `wire e2e` row gated on `tls.ktls.probeKernel() == .present`):
+   the 1,000-verb row over kTLS (`authenticated() ∧ confidential()`, 2 handshakes + 1 admission); a
+   `close_notify` from the peer closes the session loud and counted; a fatal alert closes loud and
+   counted; a KeyUpdate from the peer re-keys RX and the stream continues (and a `TLS_RX`
+   re-setsockopt is ACCEPTED — the 6.14 rekey pin); our own KeyUpdate at the ceiling re-keys TX; a
+   `NewSessionTicket` from `openssl s_server` is ignored and counted; the OpenSSL oracle rows over kTLS;
+   the two-daemon matrix (its contract and its userspace-layer output are §5).
+
+### 9.3 The fail-loud path (this build)
+
+- **At the posture install** (`tls.linux_files.installFromEnv`, every `mutual_tls` mount / admin lane /
+  `job worker`, BEFORE the fork): `tls.ktls.probeKernel()` — a loopback TCP pair, one `TCP_ULP "tls"`
+  setsockopt, everything closed. `absent` → `InstallError.KernelTlsMissing` and the console line:
+  `SQUEEZEFS_WIRE_CHANNEL=mutual_tls needs kernel TLS and this kernel has no \`tls\` ULP
+  (/proc/sys/net/ipv4/tcp_available_ulp: ''): build it with CONFIG_TLS=y (CONFIG_TLS_DEVICE=y for NIC
+  offload) or load the tls module — the MutualTls record layer on Linux is the kernel's, never a userspace
+  fall-back`; `present` → `KernelTlsRecordLayerOwed` ("this build's kTLS data path is owed … never a
+  silent fall-back"). Either way the mount exits 1 and nothing is mounted (the smoke row).
+- **At every connection** (defence in depth; `RecordLayer.ktls` requested by the listener and the dialer
+  with the socket): after a GOOD handshake `armRecordLayer` attaches the ULP → `KtlsUnavailable` /
+  `KtlsRecordLayerOwed`, a fatal `internal_error` alert to the peer, the refusal counted
+  (`cluster_wire_ktls_refused`) and logged on BOTH ends, the session never admitted. Measured on the venue
+  (`wire e2e over MutualTls, the kernel record layer's law`): one MutualTls dial → 2 counts (the dialer
+  arms after its Finished and refuses first; the listener after reading that Finished), 0 admissions, 0
+  verbs served; the two class-mismatch rows (a Plaintext dialer answered by name at 5,003 ms; a MutualTls
+  dialer at a Plaintext listener) run BEFORE any record layer and still hold; then
+  `skip[no_kernel_feature]` for the verb rows.
+- **The userspace record layer** (`Conn.linkRead/linkWrite`) is reachable only with
+  `RecordLayer.userspace`, which no Linux product path requests: it is the handshake's transport
+  everywhere and the application path of the portable tests and the engine's OpenSSL oracle rows (which
+  prove the handshake, the certificate verdicts and the exporter — all of which the kTLS design reuses).
+
+### 9.4 The smoke row on this kernel
+
+```
+smoke: mtls: the PKI through the binary; openssl: …/pki/a/node.pem: OK  …/pki/b/node.pem: OK  1
+smoke: mtls: mount under mutual_tls: exited with code 1; squeezefs mount: cluster wire:
+       SQUEEZEFS_WIRE_CHANNEL=mutual_tls needs kernel TLS and this kernel has no `tls` ULP
+       (/proc/sys/net/ipv4/tcp_available_ulp: ''): build it with CONFIG_TLS=y (CONFIG_TLS_DEVICE=y for NIC
+       offload) or load the tls module — the MutualTls record layer on Linux is the kernel's, never a
+       userspace fall-back
+skip[no_kernel_feature] cli/smoke.zig: the two-daemon matrix over kernel TLS needs CONFIG_TLS (the tls
+       ULP): this kernel has none; the fail-loud rows ran
+```
+
+Asserted: the five PKI verbs through the binary (a second `tls-init` without `--force` refuses "never
+overwritten"); OpenSSL verifies node-a and node-b under the CA and FAILS node-c (the foreign CA of the same
+name); a `mutual_tls` mount refuses on the console naming the ULP and the remedy, nothing mounted; a CA-less
+`mutual_tls` refuses naming the CA ("never downgraded"); node-b's key under node-a's certificate refuses
+("does not match"); the same set under `plaintext` serves and unmounts clean (`cluster_wire_channel_mutual_tls`
+0). The two-daemon matrix (§5) is the skip ledger's.
+
+### 9.5 zcrx and kTLS (hardware-owed row, beside `rung-08b1-zcrx-lane.md`'s)
+
+`RECV_ZC` delivers the NIC's raw TCP payload pages into the zcrx area; SOFTWARE kTLS (`tls_sw_*`) decrypts
+in the socket's receive path, which zcrx bypasses — the two cannot share a socket. Only NIC TLS RX offload
+(`CONFIG_TLS_DEVICE=y`, `ethtool -K <nic> tls-hw-rx-offload on`, a NIC that decrypts in line) delivers
+plaintext payload pages zcrx can hand up. The cluster wire's sockets are never zcrx sockets today (zcrx is
+the NVMe/TCP READ lane to an nvmet target, charter §6.3; nvme-tcp's own TLS is PSK-based kTLS and not this
+wire), so there is no product site to refuse at; the rule binds the day a `RECV_ZC` path touches a
+`MutualTls` socket: **refuse (counted) unless the device reports TLS RX offload for that flow** — a
+hardware-owed row like the zcrx lane's ifq/steering rows.
+
+### 9.6 Measurements: Plaintext vs MutualTls
+
+| | plaintext | mutual_tls, userspace record layer (§6) | mutual_tls, kTLS |
+|---|---|---|---|
+| connect + handshake | 10 µs | 509 µs (the handshake is in-tree either way) | = userspace (the handshake is the same code) — to measure |
+| 64 KiB writes | 21.48 GB/s | 2.01 GB/s | owed: no `CONFIG_TLS` on 7.2.6-sqz |
+| 1 MiB writes | 9.98 GB/s | 1.99 GB/s | owed |
+| daemon CPU per GB | — | — (not measured before the direction) | owed — the point of kTLS: the AEAD on the kernel's softirq/`sendmsg` path, `SEND_ZC` where the frame body is pinned |
+
+The kTLS column's harness is written into the design: the scoping row gains `CLOCK_PROCESS_CPUTIME_ID`
+around the transfer (CPU-s per GB) and runs the three columns when the probe reads `present`.
+
+## 10. Owed (revised)
+
+- **The kernel:** `CONFIG_TLS=y` (+ `CONFIG_TLS_DEVICE=y`) in the sqz kernel series — the venue change.
+- **The kTLS data path** (§9.2) and its tests (§9.2.6), one commit against that kernel; the measurement
+  column (§9.6); the two-daemon matrix re-armed (§5's contract).
 - The join ladder's console line for a refused channel (`verbError`: `HandshakeRefused → Refused`) — the
   symmetric plane's owner.
 - A durable channel class in `set_config` if the owner wants the set, not the node, to declare it (0003 §O).
+- The wire's frame path on io_uring (`IORING_OP_RECVMSG` / `SEND_ZC`) is a decision about the Plaintext
+  class as much as the TLS one (spec §1.1 keeps the wire off io_uring by design) — the owner's call.
 - Revocation / intermediates are out of scope by design (one leaf under one CA; rotation = re-issue).

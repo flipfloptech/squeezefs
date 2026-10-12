@@ -93,6 +93,17 @@ buggy/hostile-peer class, off the must-stay-0 gauge), or "not now" (`STATUS_DEFE
   plaintext `Refused` at half the dial bound), `cluster_wire_tls_dial_refused`; `cluster_wire_tls_handshakes`,
   `cluster_wire_tls_key_updates`, the gauge `cluster_wire_channel_mutual_tls`. `Framer.confidential()` =
   `authenticated() ∧ mutual_tls` is the ladder's word (CW:1010–1051).
+- **The record layer on Linux is the kernel's (kTLS; the owner's direction of 2026-10-12, 0003 §O):**
+  after the handshake the traffic keys go to the `tls` ULP (`TCP_ULP` → `TLS_TX`/`TLS_RX`,
+  `tls12_crypto_info_aes_gcm_128` at `TLS_1_3_VERSION`); control records (alerts, KeyUpdate,
+  NewSessionTicket) arrive as `TLS_GET_RECORD_TYPE` cmsgs on `recvmsg`; the rekey is a second
+  `TLS_TX`/`TLS_RX` (Linux ≥ 6.14). `confidential()` only with both halves installed. **Venue facts
+  (7.2.6-sqz):** `# CONFIG_TLS is not set`, `# CONFIG_MODULES is not set`, `tcp_available_ulp` empty, the
+  `tls_*` kallsyms are `net/handshake`'s upcall helpers — no kTLS; the product REFUSES a `mutual_tls` mount
+  and every TLS dial by name (`KernelTlsMissing` / `KtlsUnavailable`, `cluster_wire_ktls_refused`), never a
+  silent fall-back to the in-tree record layer (the handshake's transport and the portable path). The kTLS
+  data path, its tests and the CPU-per-GB measurement are owed against a `CONFIG_TLS=y` kernel
+  (`rung-10-mtls.md` §9). zcrx's `RECV_ZC` combines only with NIC TLS RX offload (`CONFIG_TLS_DEVICE`).
 
 ### 1.2 Framing — the reference's bytes, and the port's v4 frame
 

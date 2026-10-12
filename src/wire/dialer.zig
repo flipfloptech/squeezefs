@@ -160,12 +160,17 @@ pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, se
     switch (posture) {
         .plaintext => {},
         .mutual_tls => |identity| {
-            mux.tls_conn = tls.clientHandshake(gpa, mux.link.link(), identity, io, .{}) catch |e| {
+            mux.tls_conn = tls.clientHandshake(gpa, mux.link.link(), identity, io, .{ .record_layer = .ktls, .socket = stream.socket.handle }) catch |e| {
                 stats.cluster_wire_tls_dial_refused.inc();
                 return switch (e) {
                     error.Eof => error.BeforeChallenge,
                     error.Timeout, error.PeerSilent, error.Transport => error.Unreachable,
                     error.OutOfMemory => error.OutOfMemory,
+                    error.KtlsUnavailable, error.KtlsRecordLayerOwed => blk: {
+                        tls.countRefusal(e);
+                        log.warn("cluster wire: dial to {f}: {s}", .{ ep, tls.refusalText(e) });
+                        break :blk error.HandshakeRefused;
+                    },
                     else => blk: {
                         log.warn("cluster wire: peer at {f} refused at the TLS handshake: {s}", .{ ep, tls.refusalText(e) });
                         break :blk error.HandshakeRefused;
@@ -216,7 +221,7 @@ pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, se
     }
     if (verdict.header.verb != @backingInt(verbs.Verb.admitted)) return error.Protocol;
     _ = codec.decodePayload(verbs.Admitted, verdict.payload) catch return error.Protocol;
-    mux.sess.framer.admitOn(ans.session_key, posture.channel());
+    mux.sess.framer.admitOn(ans.session_key, if (mux.tls_conn) |c| (if (c.confidential()) tls.Channel.mutual_tls else .plaintext) else .plaintext);
     // Step 5: the mux's cells and its reader.
     mux.cells = gpa.alloc(Cell, MUX_IN_FLIGHT) catch return error.OutOfMemory;
     errdefer gpa.free(mux.cells);

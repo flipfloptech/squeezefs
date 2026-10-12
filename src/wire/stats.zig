@@ -87,6 +87,10 @@ pub var cluster_wire_tls_key_updates: counters.ShardedCounter = .{};
 /// Dials this side abandoned at the TLS handshake (the peer's CA is not
 /// ours, our leaf is not under its CA, a plaintext listener answered).
 pub var cluster_wire_tls_dial_refused: counters.ShardedCounter = .{};
+/// Connections refused after a GOOD handshake because the kernel record
+/// layer could not be armed (no `tls` ULP, or this build's kTLS data path
+/// owed) — never a silent fall-back to the userspace record layer.
+pub var cluster_wire_ktls_refused: counters.ShardedCounter = .{};
 
 comptime {
     std.debug.assert(cluster_wire_refusals_by_class.len == @typeInfo(frame.RefusalClass).@"enum".field_names.len);

@@ -33,8 +33,23 @@
 //! channel confidential, the exporter-bound MAC keeps a frame from being
 //! replayed across channels.
 //!
+//! THE RECORD LAYER ON LINUX IS THE KERNEL'S (the owner's direction of
+//! 2026-10-12; decision 0003 §O): the handshake runs here, then the traffic
+//! keys go to the `tls` ULP (`TCP_ULP` → `TLS_TX`/`TLS_RX`) and the socket
+//! is a plain TCP socket to the daemon — the charter's TLS exception to
+//! "io_uring everywhere" shrinks to the handshake. The userspace record
+//! layer below is the HANDSHAKE's transport on every OS and the PORTABLE
+//! application path for the macOS tests; on Linux the product requests
+//! `RecordLayer.ktls` and REFUSES loud when the kernel has no `tls` ULP
+//! (`CONFIG_TLS`) — never a silent fall-back to the userspace layer
+//! (`ktls`, `docs/evidence/rung-10-mtls.md` §9: the venue's 7.2.6-sqz has
+//! `# CONFIG_TLS is not set`, so the kTLS data path is DESIGNED there and
+//! owed to a kernel that carries it; this build's kTLS arm is the probe
+//! and the refusal).
+//!
 //! Portable: the engine, the identity and the in-memory tests; the file
-//! loaders and the posture installer are Linux (the key file's 0600 law).
+//! loaders, the posture installer and the kTLS probe are Linux (the key
+//! file's 0600 law, the socket options).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -257,6 +272,16 @@ pub const HandshakeError = error{
     PeerSignatureInvalid,
     /// The peer sent a fatal alert (not about our certificate).
     Alert,
+    /// `RecordLayer.ktls` was requested and this kernel has no `tls` ULP
+    /// (`CONFIG_TLS` unset / the module absent): the MutualTls class is
+    /// unavailable on Linux without it — refused loud, never the
+    /// userspace record layer.
+    KtlsUnavailable,
+    /// The kernel HAS the ULP, and this build's kTLS data path (the
+    /// cmsg-dispatching receive, the rekey, the close_notify) is designed
+    /// and owed (`docs/evidence/rung-10-mtls.md` §9): refused loud until it
+    /// lands — the same law, never a silent fall-back.
+    KtlsRecordLayerOwed,
     /// The peer's alert refused OUR certificate (unknown_ca, bad_certificate,
     /// certificate_unknown/required/expired): the peer is under another CA
     /// or judges our leaf's validity differently — counted as untrusted.
@@ -288,6 +313,12 @@ pub const Conn = struct {
     peer_name: [pki.NAME_MAX]u8 = @splat(0),
     peer_name_len: u8 = 0,
     established: bool = false,
+    /// The record layer the application path runs on. `.userspace` =
+    /// this module's AEAD path (the portable tests); `.ktls` = the
+    /// kernel's, once BOTH halves are installed (`ktls_tx`, `ktls_rx`).
+    record_layer: RecordLayer = .userspace,
+    ktls_tx: bool = false,
+    ktls_rx: bool = false,
     /// A record header has been read (a timeout before it is `PeerSilent`;
     /// the first header's bound is `first_record_timeout_ms`).
     seen_bytes: bool = false,
@@ -305,6 +336,17 @@ pub const Conn = struct {
 
     pub fn peerName(self: *const Conn) []const u8 {
         return self.peer_name[0..self.peer_name_len];
+    }
+
+    /// The channel is confidential: established, and on the kernel record
+    /// layer only once BOTH `TLS_TX` and `TLS_RX` are installed (the
+    /// owner's law) — the word `Framer.confidential()` is admitted under.
+    pub fn confidential(self: *const Conn) bool {
+        if (!self.established) return false;
+        return switch (self.record_layer) {
+            .userspace => true,
+            .ktls => self.ktls_tx and self.ktls_rx,
+        };
     }
 
     /// An `Alert` whose description names OUR certificate is the peer's
@@ -331,6 +373,23 @@ pub const Conn = struct {
         var out: [BINDING_BYTES]u8 = undefined;
         self.exporter(BINDING_LABEL, &out);
         return out;
+    }
+
+    /// After a completed handshake: under `.ktls` the traffic keys go to
+    /// the kernel (Linux); this build's arm is the probe and the refusal
+    /// (module doc) — a kernel without the ULP is `KtlsUnavailable`, one
+    /// with it `KtlsRecordLayerOwed`. Under `.userspace` nothing to do.
+    fn armRecordLayer(self: *Conn, opts: Options) HandshakeError!void {
+        self.record_layer = opts.record_layer;
+        switch (opts.record_layer) {
+            .userspace => {},
+            .ktls => {
+                if (!is_linux) return error.KtlsUnavailable;
+                const fd = opts.socket orelse return error.KtlsUnavailable;
+                try ktls.attachUlp(fd);
+                return error.KtlsRecordLayerOwed;
+            },
+        }
     }
 
     pub fn link(self: *Conn) session.Link {
@@ -833,6 +892,7 @@ const Handshake = struct {
     io: Io,
     now_s: u64,
     timeout_ms: u32,
+    opts: Options,
     transcript: Sha256 = .init(.{}),
     buf: [HANDSHAKE_BUF]u8 = undefined,
     /// Bytes of handshake messages received and not yet consumed.
@@ -1020,6 +1080,18 @@ const Handshake = struct {
     }
 };
 
+/// Where the application records are sealed and opened after the handshake.
+pub const RecordLayer = enum {
+    /// This module's AEAD path over the `Link`: the handshake's transport
+    /// everywhere and the portable application path (macOS, the in-memory
+    /// tests, the engine's OpenSSL oracle rows).
+    userspace,
+    /// The kernel's `tls` ULP over the socket (Linux product paths): the
+    /// traffic keys handed to `TLS_TX`/`TLS_RX`, the socket plain TCP to
+    /// the daemon from then on. Requires `Options.socket`.
+    ktls,
+};
+
 pub const Options = struct {
     /// The handshake's read bound (the listener's `DIAL_TIMEOUT`).
     timeout_ms: u32 = session.DIAL_TIMEOUT_MS,
@@ -1029,6 +1101,9 @@ pub const Options = struct {
     first_record_timeout_ms: u32 = session.DIAL_TIMEOUT_MS / 2,
     /// The wall clock the peer's certificate is judged at; null = now.
     now_s: ?u64 = null,
+    record_layer: RecordLayer = .userspace,
+    /// The connected TCP socket the keys go to under `.ktls`.
+    socket: ?std.os.linux.fd_t = null,
 };
 
 fn randomBytes(io: Io, comptime n: usize) HandshakeError![n]u8 {
@@ -1054,11 +1129,14 @@ pub fn serverHandshake(gpa: std.mem.Allocator, inner: session.Link, identity: *c
         hs.deinit();
         gpa.destroy(hs);
     }
-    hs.* = .{ .conn = conn, .identity = identity, .io = io, .now_s = wallS(opts), .timeout_ms = opts.timeout_ms };
+    hs.* = .{ .conn = conn, .identity = identity, .io = io, .now_s = wallS(opts), .timeout_ms = opts.timeout_ms, .opts = opts };
     serverBody(hs) catch |raw| {
         const e = conn.classify(raw);
         switch (e) {
             error.PeerPlaintext, error.PeerSilent, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.PeerRefusedOurCertificate, error.OutOfMemory => {},
+            // The record layer could not be armed after a GOOD handshake:
+            // tell the peer we are going away (internal_error), then refuse.
+            error.KtlsUnavailable, error.KtlsRecordLayerOwed => conn.writeAlert(.fatal, .internal_error),
             error.ProfileMismatch => conn.writeAlert(.fatal, .handshake_failure),
             error.PeerCertificateMissing => conn.writeAlert(.fatal, .certificate_required),
             error.PeerCertificateUntrusted => conn.writeAlert(.fatal, .unknown_ca),
@@ -1139,6 +1217,7 @@ fn serverBody(hs: *Handshake) HandshakeError!void {
     try hs.readAuthFlight(.client, hs.client_hs);
     conn.rd.?.zeroize();
     conn.rd = .fromSecret(app.client);
+    try conn.armRecordLayer(hs.opts);
     conn.established = true;
     stats.cluster_wire_tls_handshakes.inc();
 }
@@ -1153,11 +1232,14 @@ pub fn clientHandshake(gpa: std.mem.Allocator, inner: session.Link, identity: *c
         hs.deinit();
         gpa.destroy(hs);
     }
-    hs.* = .{ .conn = conn, .identity = identity, .io = io, .now_s = wallS(opts), .timeout_ms = opts.timeout_ms };
+    hs.* = .{ .conn = conn, .identity = identity, .io = io, .now_s = wallS(opts), .timeout_ms = opts.timeout_ms, .opts = opts };
     clientBody(hs) catch |raw| {
         const e = conn.classify(raw);
         switch (e) {
             error.PeerPlaintext, error.PeerSilent, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.PeerRefusedOurCertificate, error.OutOfMemory => {},
+            // The record layer could not be armed after a GOOD handshake:
+            // tell the peer we are going away (internal_error), then refuse.
+            error.KtlsUnavailable, error.KtlsRecordLayerOwed => conn.writeAlert(.fatal, .internal_error),
             error.ProfileMismatch => conn.writeAlert(.fatal, .handshake_failure),
             error.PeerCertificateMissing => conn.writeAlert(.fatal, .certificate_required),
             error.PeerCertificateUntrusted => conn.writeAlert(.fatal, .unknown_ca),
@@ -1239,6 +1321,7 @@ fn clientBody(hs: *Handshake) HandshakeError!void {
     try hs.sendFlight(o.written());
     conn.wr.?.zeroize();
     conn.wr = .fromSecret(app.client);
+    try conn.armRecordLayer(hs.opts);
     conn.established = true;
     stats.cluster_wire_tls_handshakes.inc();
 }
@@ -1258,6 +1341,8 @@ pub fn refusalText(e: HandshakeError) []const u8 {
         error.PeerCertificateNotYetValid => "the peer's certificate is not yet valid",
         error.PeerSignatureInvalid => "the peer's CertificateVerify/Finished did not verify",
         error.Alert => "the peer sent a fatal TLS alert",
+        error.KtlsUnavailable => "this kernel has no `tls` ULP (CONFIG_TLS is not set / the module is absent): the MutualTls class's record layer on Linux is kernel TLS — refused, never the userspace record layer",
+        error.KtlsRecordLayerOwed => "kernel TLS is present but this build's kTLS data path is owed (docs/evidence/rung-10-mtls.md §9) — refused, never a silent fall-back",
         error.PeerRefusedOurCertificate => "the peer refused THIS node's certificate (its alert names our certificate: the peer is under another CA, or judges our leaf's validity differently)",
         error.Transport => "transport failure during the TLS handshake",
         error.Timeout => "the TLS handshake timed out",
@@ -1272,6 +1357,7 @@ pub fn countRefusal(e: HandshakeError) void {
         error.PeerPlaintext, error.PeerSilent => stats.cluster_wire_plaintext_refused.inc(),
         error.PeerCertificateUntrusted, error.PeerCertificateMissing, error.PeerSignatureInvalid, error.PeerRefusedOurCertificate => stats.cluster_wire_tls_refused_untrusted.inc(),
         error.PeerCertificateExpired, error.PeerCertificateNotYetValid => stats.cluster_wire_tls_refused_expired.inc(),
+        error.KtlsUnavailable, error.KtlsRecordLayerOwed => stats.cluster_wire_ktls_refused.inc(),
         else => stats.cluster_wire_tls_refused_protocol.inc(),
     }
 }
@@ -1321,6 +1407,11 @@ pub const InstallError = error{
     LeafExpired,
     LeafNotYetValid,
     KeyMismatch,
+    /// `mutual_tls` on a Linux kernel without the `tls` ULP.
+    KernelTlsMissing,
+    /// `mutual_tls` on a kernel WITH the ULP: this build's kTLS data path
+    /// is owed (never a silent fall-back).
+    KernelTlsRecordLayerOwed,
     OutOfMemory,
 };
 
@@ -1421,9 +1512,115 @@ pub const linux_files = if (is_linux) struct {
             return .{ .identity = null, .channel = .plaintext };
         }
         const id = try loadIdentity(gpa, Paths.fromEnv(env), clock.realtimeCoarseS());
+        errdefer {
+            id.deinit(gpa);
+            gpa.destroy(id);
+        }
+        // The record layer is the kernel's: a kernel without it refuses
+        // the mount here, loud, before any socket exists.
+        switch (ktls.probeKernel()) {
+            .absent => return error.KernelTlsMissing,
+            .present => return error.KernelTlsRecordLayerOwed,
+        }
         install(id);
         log.info("cluster wire: channel class mutual_tls — node '{s}' under CA '{s}' (leaf valid to {d})", .{ id.nodeName(), id.ca.commonName(), id.cert.notAfterS() });
         return .{ .identity = id, .channel = .mutual_tls };
+    }
+} else struct {};
+
+/// The kernel TLS arm (Linux): the probe this build drives and the
+/// constants the designed data path binds to (`docs/evidence/
+/// rung-10-mtls.md` §9: `TCP_ULP "tls"` → `TLS_TX`/`TLS_RX` with the
+/// handshake's AES-128-GCM traffic keys at `TLS_1_3_VERSION`; control
+/// records as `TLS_GET_RECORD_TYPE` cmsgs on `recvmsg`; the rekey as a
+/// second `TLS_TX`/`TLS_RX` after a KeyUpdate).
+pub const ktls = if (is_linux) struct {
+    const linux = std.os.linux;
+
+    /// `include/uapi/linux/tls.h`.
+    pub const TLS_TX: u32 = 1;
+    pub const TLS_RX: u32 = 2;
+    pub const TLS_1_3_VERSION: u16 = 0x0304;
+    pub const TLS_CIPHER_AES_GCM_128: u16 = 51;
+    pub const TLS_SET_RECORD_TYPE: u32 = 1;
+    pub const TLS_GET_RECORD_TYPE: u32 = 2;
+    /// The ULP's name as `setsockopt(SOL_TCP, TCP_ULP)` takes it.
+    pub const ULP_NAME = "tls";
+
+    /// `struct tls12_crypto_info_aes_gcm_128`: the 12 B TLS 1.3 IV is
+    /// `salt(4) ‖ iv(8)`; `rec_seq` is the starting record sequence (0
+    /// after the handshake and after every rekey).
+    pub const CryptoInfoAesGcm128 = extern struct {
+        version: u16,
+        cipher_type: u16,
+        iv: [8]u8,
+        key: [KEY_BYTES]u8,
+        salt: [4]u8,
+        rec_seq: [8]u8,
+    };
+
+    comptime {
+        std.debug.assert(@sizeOf(CryptoInfoAesGcm128) == 40);
+        std.debug.assert(IV_BYTES == 4 + 8);
+    }
+
+    /// The traffic keys in the kernel's shape (the designed `TLS_TX`/`TLS_RX`
+    /// payload; exact by construction from `Traffic`).
+    pub fn cryptoInfo(t: *const Traffic) CryptoInfoAesGcm128 {
+        return .{
+            .version = TLS_1_3_VERSION,
+            .cipher_type = TLS_CIPHER_AES_GCM_128,
+            .iv = t.iv[4..12].*,
+            .key = t.key,
+            .salt = t.iv[0..4].*,
+            .rec_seq = @splat(0),
+        };
+    }
+
+    /// Attach the `tls` ULP to an established TCP socket: ENOENT = no
+    /// such ULP (CONFIG_TLS unset / module absent).
+    pub fn attachUlp(fd: linux.fd_t) error{KtlsUnavailable}!void {
+        const rc = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.ULP, ULP_NAME, ULP_NAME.len);
+        if (linux.errno(rc) != .SUCCESS) return error.KtlsUnavailable;
+    }
+
+    pub const Probe = enum { absent, present };
+
+    /// Whether this kernel carries the ULP: a loopback TCP pair (the ULP
+    /// attaches only to an ESTABLISHED socket), one `TCP_ULP` setsockopt,
+    /// everything closed. Run once at the posture install.
+    pub fn probeKernel() Probe {
+        const lfd_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(lfd_rc) != .SUCCESS) return .absent;
+        const lfd: linux.fd_t = @intCast(lfd_rc);
+        defer _ = linux.close(lfd);
+        var addr: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7F00_0001) }; // 127.0.0.1
+        if (linux.errno(linux.bind(lfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return .absent;
+        if (linux.errno(linux.listen(lfd, 1)) != .SUCCESS) return .absent;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        if (linux.errno(linux.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return .absent;
+        const cfd_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(cfd_rc) != .SUCCESS) return .absent;
+        const cfd: linux.fd_t = @intCast(cfd_rc);
+        defer _ = linux.close(cfd);
+        if (linux.errno(linux.connect(cfd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return .absent;
+        const afd_rc = linux.accept4(lfd, null, null, linux.SOCK.CLOEXEC);
+        if (linux.errno(afd_rc) != .SUCCESS) return .absent;
+        const afd: linux.fd_t = @intCast(afd_rc);
+        defer _ = linux.close(afd);
+        attachUlp(cfd) catch return .absent;
+        return .present;
+    }
+
+    /// `/proc/sys/net/ipv4/tcp_available_ulp`'s text (for the refusal).
+    pub fn availableUlps(buf: *[256]u8) []const u8 {
+        const rc = linux.open("/proc/sys/net/ipv4/tcp_available_ulp", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return "";
+        const fd: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        const n = linux.read(fd, buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) return "";
+        return std.mem.trim(u8, buf[0..n], " \n");
     }
 } else struct {};
 
@@ -1441,6 +1638,11 @@ pub fn writeInstallRefusal(w: *Io.Writer, e: InstallError, paths: Paths) Io.Writ
         error.LeafExpired => try w.print("the node certificate {s} has expired — re-issue it (`squeezefs key tls-issue`)", .{paths.cert}),
         error.LeafNotYetValid => try w.print("the node certificate {s} is not yet valid (check the clock)", .{paths.cert}),
         error.KeyMismatch => try w.print("the node key {s} does not match the node certificate {s}", .{ paths.key, paths.cert }),
+        error.KernelTlsMissing => {
+            var ulps: [256]u8 = undefined;
+            try w.print("SQUEEZEFS_WIRE_CHANNEL=mutual_tls needs kernel TLS and this kernel has no `tls` ULP (/proc/sys/net/ipv4/tcp_available_ulp: '{s}'): build it with CONFIG_TLS=y (CONFIG_TLS_DEVICE=y for NIC offload) or load the tls module — the MutualTls record layer on Linux is the kernel's, never a userspace fall-back", .{if (is_linux) ktls.availableUlps(&ulps) else ""});
+        },
+        error.KernelTlsRecordLayerOwed => try w.writeAll("SQUEEZEFS_WIRE_CHANNEL=mutual_tls: kernel TLS is present but this build's kTLS data path is owed (docs/evidence/rung-10-mtls.md §9) — refused, never a silent fall-back to the userspace record layer"),
         error.OutOfMemory => try w.writeAll("out of memory loading the TLS identity"),
     }
 }

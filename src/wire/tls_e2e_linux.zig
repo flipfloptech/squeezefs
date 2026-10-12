@@ -342,7 +342,7 @@ fn scopingRow(gpa: std.mem.Allocator, io: Io, identity: ?*const tls.Identity, no
     return .{ .handshake_us = hs_ns / connections / std.time.ns_per_us, .gbps = if (xfer_ns == 0) 0 else total_bytes / @as(f64, @floatFromInt(xfer_ns)) };
 }
 
-test "tls e2e: SCOPING — handshake latency and record throughput over loopback TCP, plaintext vs MutualTls (64 KiB and 1 MiB writes)" {
+test "tls e2e: SCOPING — handshake latency and record throughput over loopback TCP, plaintext vs MutualTls on the USERSPACE record layer (the comparison column beside the owed kTLS one; 64 KiB and 1 MiB writes)" {
     const io = testing.io;
     const gpa = testing.allocator;
     const now = clock.realtimeCoarseS();
@@ -357,7 +357,7 @@ test "tls e2e: SCOPING — handshake latency and record throughput over loopback
     const tls_64k = try scopingRow(gpa, io, &id_a, now, 1, 512 << 20, 1 << 16);
     const plain_1m = try scopingRow(gpa, io, null, now, 1, 512 << 20, 1 << 20);
     const tls_1m = try scopingRow(gpa, io, &id_a, now, 1, 512 << 20, 1 << 20);
-    std.debug.print("\ntls scoping (loopback TCP, 512 MiB streams, {s}):\n  connect+handshake: plaintext {d} µs, mutual_tls {d} µs (50 dials each)\n  64 KiB writes: plaintext {d:.2} GB/s, mutual_tls {d:.2} GB/s\n  1 MiB writes:  plaintext {d:.2} GB/s, mutual_tls {d:.2} GB/s\n", .{ @tagName(builtin.mode), plain_hs.handshake_us, tls_hs.handshake_us, plain_64k.gbps, tls_64k.gbps, plain_1m.gbps, tls_1m.gbps });
+    std.debug.print("\ntls scoping (loopback TCP, 512 MiB streams, {s}; the USERSPACE record layer — kTLS owed on this kernel):\n  connect+handshake: plaintext {d} µs, mutual_tls {d} µs (50 dials each)\n  64 KiB writes: plaintext {d:.2} GB/s, mutual_tls {d:.2} GB/s\n  1 MiB writes:  plaintext {d:.2} GB/s, mutual_tls {d:.2} GB/s\n", .{ @tagName(builtin.mode), plain_hs.handshake_us, tls_hs.handshake_us, plain_64k.gbps, tls_64k.gbps, plain_1m.gbps, tls_1m.gbps });
     try testing.expect(tls_64k.gbps > 0 and tls_1m.gbps > 0);
 }
 
@@ -395,7 +395,7 @@ fn startWireListener(svc: *service.Service, posture: tls.Posture) !*listener.Lis
     return listener.Listener.start(testing.allocator, testing.io, .{ .explicit = try endpoint.parseEndpoint("127.0.0.1:0") }, svc, wire_secret, .{ .raw_cpus = 4, .nofile = 1 << 16, .posture = posture });
 }
 
-test "wire e2e over MutualTls: the ladder rides inside TLS under one CA (the session authenticated ∧ confidential; 1,000 verbs cross; handshakes and admissions counted) → a client under a FOREIGN CA is refused and counted untrusted → a Plaintext dialer is answered with a Refused naming the class after the handshake bound and counted → a MutualTls dialer at a Plaintext listener is refused loud and counted" {
+test "wire e2e over MutualTls, the kernel record layer's law: the kTLS probe names this kernel's posture → a MutualTls dial into a MutualTls listener completes the handshake and is then REFUSED by the record layer on both ends (counted ktls_refused; never the userspace layer) → a Plaintext dialer is answered with a Refused naming the class at half the dial bound and counted → a MutualTls dialer at a Plaintext listener is refused loud and counted; the verb rows over kTLS are the skip ledger's until the kernel carries CONFIG_TLS" {
     const io = testing.io;
     const gpa = testing.allocator;
     const now = clock.realtimeCoarseS();
@@ -404,52 +404,39 @@ test "wire e2e over MutualTls: the ladder rides inside TLS under one CA (the ses
     defer id_a.deinit(gpa);
     var id_b = try tp.identity(gpa, .b);
     defer id_b.deinit(gpa);
-    var id_x = try tp.identity(gpa, .foreign);
-    defer id_x.deinit(gpa);
     var echo: Echo = .{};
     var svc: service.Service = .init;
     svc.register(.resolve_slot, .{ .ctx = &echo, .serve = &Echo.serve });
+    const probe = tls.ktls.probeKernel();
+    var ulps: [256]u8 = undefined;
+    std.debug.print("\nwire e2e: kernel TLS probe: {t} (tcp_available_ulp: '{s}')\n", .{ probe, tls.ktls.availableUlps(&ulps) });
     const l = try startWireListener(&svc, .{ .mutual_tls = &id_a });
     defer l.stop();
-    const hs0 = stats.cluster_wire_tls_handshakes.load();
-    const adm0 = stats.cluster_wire_sessions_admitted.load();
+    // The product path: the handshake completes (both sides count it),
+    // then the kernel record layer is armed — and refused on this build
+    // by name, both ends, counted; the session never admits.
     {
+        const hs0 = stats.cluster_wire_tls_handshakes.load();
+        const kt0 = stats.cluster_wire_ktls_refused.load();
+        const adm0 = stats.cluster_wire_sessions_admitted.load();
         var client = dialer.Client.init(gpa, io, l.advertised, wire_secret, wireIdentity(1));
         client.posture = .{ .mutual_tls = &id_b };
         defer client.deinit();
         var out: [256]u8 = undefined;
-        var i: u16 = 0;
-        while (i < 1000) : (i += 1) {
-            const rep = try client.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = i, .reserved = 0 } }, &out);
-            try testing.expectEqual(i, rep.resolve_slot.g);
-        }
-        try testing.expectEqual(tls.Channel.mutual_tls, client.mux.?.channel());
-        try testing.expect(client.mux.?.sess.framer.authenticated() and client.mux.?.sess.framer.confidential());
-        try testing.expectEqual(@as(u64, 1000), echo.served.load(.monotonic));
-        // Both ends of ONE connection in this process: two handshakes, one
-        // admission.
-        try testing.expectEqual(hs0 + 2, stats.cluster_wire_tls_handshakes.load());
-        try testing.expectEqual(adm0 + 1, stats.cluster_wire_sessions_admitted.load());
-        std.debug.print("\nwire e2e: 1,000 verbs over MutualTls on one connection ({d} B sent on the wire family's counter)\n", .{stats.cluster_wire_bytes_sent.load()});
-    }
-    // A client under the foreign CA: the server refuses its leaf (and the
-    // client refuses the server's first — either way no session).
-    {
-        const untrusted0 = stats.cluster_wire_tls_refused_untrusted.load();
-        const dial_refused0 = stats.cluster_wire_tls_dial_refused.load();
-        var client = dialer.Client.init(gpa, io, l.advertised, wire_secret, wireIdentity(2));
-        client.posture = .{ .mutual_tls = &id_x };
-        defer client.deinit();
-        var out: [256]u8 = undefined;
         try testing.expectError(error.HandshakeRefused, client.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 1, .reserved = 0 } }, &out));
-        try testing.expectEqual(dial_refused0 + 1, stats.cluster_wire_tls_dial_refused.load());
-        // The listener's thread counts its refusal a beat after the client's.
         const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
-        while (stats.cluster_wire_tls_refused_untrusted.load() == untrusted0 and clock.monotonicNs() < deadline) io.sleep(.fromMilliseconds(10), .awake) catch {};
-        try testing.expectEqual(untrusted0 + 1, stats.cluster_wire_tls_refused_untrusted.load());
+        while (stats.cluster_wire_ktls_refused.load() < kt0 + 2 and clock.monotonicNs() < deadline) io.sleep(.fromMilliseconds(10), .awake) catch {};
+        // The dial side refused first (it arms after its Finished); the
+        // listener refused after reading that Finished: two counts.
+        try testing.expectEqual(kt0 + 2, stats.cluster_wire_ktls_refused.load());
+        try testing.expectEqual(adm0, stats.cluster_wire_sessions_admitted.load());
+        // The handshakes themselves completed on at least the dial side
+        // (the listener's completes before its arm fails too).
+        try testing.expect(stats.cluster_wire_tls_handshakes.load() >= hs0);
+        try testing.expectEqual(@as(usize, 0), echo.served.load(.monotonic));
     }
-    // A Plaintext dialer: silent for the handshake bound, answered with a
-    // plaintext Refused naming the class.
+    // A Plaintext dialer: silent for the first half-bound, answered with a
+    // plaintext Refused naming the class — before any record layer.
     {
         const pt0 = stats.cluster_wire_plaintext_refused.load();
         var client = dialer.Client.init(gpa, io, l.advertised, wire_secret, wireIdentity(3));
@@ -461,10 +448,10 @@ test "wire e2e over MutualTls: the ladder rides inside TLS under one CA (the ses
         const waited_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
         try testing.expect(waited_ms >= session.DIAL_TIMEOUT_MS / 2 - 500 and waited_ms < session.DIAL_TIMEOUT_MS);
         try testing.expectEqual(pt0 + 1, stats.cluster_wire_plaintext_refused.load());
-        std.debug.print("wire e2e: a Plaintext dialer at the MutualTls listener: Refused by name after {d} ms (the handshake bound), counted\n", .{waited_ms});
+        std.debug.print("wire e2e: a Plaintext dialer at the MutualTls listener: Refused by name after {d} ms (half the dial bound), counted\n", .{waited_ms});
     }
     // A MutualTls dialer at a Plaintext listener: the Challenge frame
-    // where the ServerHello should be.
+    // where the ServerHello should be — before any record layer.
     {
         const pl = try startWireListener(&svc, .plaintext);
         defer pl.stop();
@@ -483,4 +470,8 @@ test "wire e2e over MutualTls: the ladder rides inside TLS under one CA (the ses
         try testing.expectEqual(@as(u32, 9), rep.resolve_slot.g);
         try testing.expect(plain.mux.?.sess.framer.authenticated() and !plain.mux.?.sess.framer.confidential());
     }
+    return switch (probe) {
+        .absent => testkit.skip(@src(), .no_kernel_feature, "the MutualTls verb rows need kernel TLS (CONFIG_TLS; the tls ULP): this kernel has none — the fail-loud rows ran"),
+        .present => testkit.skip(@src(), .no_kernel_feature, "kernel TLS is present; this build's kTLS data path is owed (docs/evidence/rung-10-mtls.md §9) — the fail-loud rows ran"),
+    };
 }

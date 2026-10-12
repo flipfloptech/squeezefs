@@ -357,7 +357,9 @@ fn connMain(conn: *Conn) void {
     switch (l.posture) {
         .plaintext => {},
         .mutual_tls => |identity| {
-            conn.tls_conn = tls.serverHandshake(l.gpa, conn.link.link(), identity, l.io, .{}) catch |e| {
+            // The product's record layer is the kernel's (`RecordLayer.ktls`
+            // over this socket); the handshake rides the userspace layer.
+            conn.tls_conn = tls.serverHandshake(l.gpa, conn.link.link(), identity, l.io, .{ .record_layer = .ktls, .socket = conn.link.stream.socket.handle }) catch |e| {
                 tls.countRefusal(e);
                 stats.cluster_wire_admissions_refused.inc();
                 log.warn("cluster wire: connection {d} refused at the TLS handshake: {s}", .{ conn.id, tls.refusalText(e) });
@@ -425,7 +427,9 @@ fn handshake(conn: *Conn, binding: []const u8) bool {
         .admitted => |adm| {
             stats.cluster_wire_outstanding_challenges.set(l.gate.nonces.liveCount());
             conn.sess.sendHandshake(verbs.Admitted, .admitted, .{ .schema = verbs.CLUSTER_WIRE_SCHEMA, .reserved = 0 }) catch return false;
-            conn.sess.framer.admitOn(adm.session_key, l.posture.channel());
+            // The class the session is admitted on is the CHANNEL's word:
+            // confidential only with both kernel halves installed.
+            conn.sess.framer.admitOn(adm.session_key, if (conn.tls_conn) |c| (if (c.confidential()) tls.Channel.mutual_tls else .plaintext) else .plaintext);
             conn.peer = adm.member();
             stats.cluster_wire_sessions_admitted.inc();
             return true;

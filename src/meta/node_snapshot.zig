@@ -58,6 +58,12 @@ pub const stats = struct {
     /// `meta_kv_fold_memo_bytes`: Σ memo bytes alive, Drop-exact; rides the
     /// node-cache budget too.
     pub var meta_kv_fold_memo_bytes: counters.Gauge = .{};
+    /// `meta_kv_node_index_bytes`: Σ `RecordIndex` array bytes alive
+    /// (`RecordIndex.indexBytes`), deinit-exact; rides the node-cache
+    /// budget too. Every published base index lives until the last
+    /// snapshot over it dies, so this counts the retired ones a reader
+    /// still holds as well as the current.
+    pub var meta_kv_node_index_bytes: counters.Gauge = .{};
 };
 
 // ---------------------------------------------------------------------------
@@ -177,19 +183,45 @@ comptime {
 pub const Range = struct { lo: usize, hi: usize };
 
 /// The merged-sorted view over every serialized source of a node.
+///
+/// Its RAM — the entries array and the sources table — is charged to the
+/// owning cache's gauge at build (`indexBytes`) and credited exactly at
+/// `deinit`: an index outlives the freeze that superseded it for as long
+/// as a reader holds a snapshot over it, and the footprint note measured
+/// ≈ 5 live indexes per mapped node (a quarter of the cache's RAM) that no
+/// gauge named before this charge.
 pub const RecordIndex = struct {
     /// Backing bset images, oldest → newest; entries borrow them zero-copy.
     sources: []Bytes,
     /// `(key asc, seq desc, newer source first)`.
     entries: []IdxRec,
+    /// The owning cache's budget gauge (null for a standalone index).
+    charge: ?*counters.Gauge,
+    /// Exactly what `build`/`extendWith` charged: `indexBytes(entries.len,
+    /// sources.len)`; `deinit` credits it.
+    charged: u64,
 
     pub const BuildError = bset.ParseError || error{TooManySources};
+
+    /// The RAM an index of `entries` records over `sources` images takes:
+    /// the entries array and the sources side table (the images themselves
+    /// are the extent's, charged with the mapping).
+    pub fn indexBytes(entries: usize, sources: usize) u64 {
+        return @as(u64, entries) * @sizeOf(IdxRec) + @as(u64, sources) * @sizeOf(Bytes);
+    }
+
+    fn chargeArrays(self: *RecordIndex) void {
+        self.charged = indexBytes(self.entries.len, self.sources.len);
+        if (self.charge) |g| g.add(self.charged);
+        stats.meta_kv_node_index_bytes.add(self.charged);
+    }
 
     /// Merge-build from bset images, OLDEST → NEWEST (append order), taking
     /// ownership of `sources` (the slice and its references, on every
     /// outcome). Ties on `(key, seq)` order the newer source first — the
-    /// `bset.merge` convention.
-    pub fn build(gpa: Allocator, sources: []Bytes) BuildError!RecordIndex {
+    /// `bset.merge` convention. `charge` is the owning cache's gauge
+    /// (`NodeCache.cached_bytes`), inherited by every `extendWith`.
+    pub fn build(gpa: Allocator, sources: []Bytes, charge: ?*counters.Gauge) BuildError!RecordIndex {
         errdefer {
             for (sources) |s| s.deinit();
             gpa.free(sources);
@@ -235,8 +267,9 @@ pub const RecordIndex = struct {
             n += 1;
         }
         assert(n == total);
-        var idx: RecordIndex = .{ .sources = sources, .entries = entries };
+        var idx: RecordIndex = .{ .sources = sources, .entries = entries, .charge = charge, .charged = 0 };
         idx.normalizeRuns();
+        idx.chargeArrays();
         return idx;
     }
 
@@ -334,13 +367,19 @@ pub const RecordIndex = struct {
         @memcpy(entries[n..][0 .. self.entries.len - a], self.entries[a..]);
         n += self.entries.len - a;
         @memcpy(entries[n..][0 .. fresh.len - b], fresh[b..]);
-        return .{ .sources = sources, .entries = entries };
+        var idx: RecordIndex = .{ .sources = sources, .entries = entries, .charge = self.charge, .charged = 0 };
+        idx.chargeArrays();
+        return idx;
     }
 
     pub fn deinit(self: *RecordIndex, gpa: Allocator) void {
         for (self.sources) |s| s.deinit();
         gpa.free(self.sources);
         gpa.free(self.entries);
+        if (self.charged > 0) {
+            if (self.charge) |g| g.sub(self.charged);
+            stats.meta_kv_node_index_bytes.sub(self.charged);
+        }
         self.* = undefined;
     }
 
@@ -1178,7 +1217,7 @@ fn emptyRun(gpa: Allocator) !*Arc(Run) {
 }
 
 fn snapshotOver(gpa: Allocator, sources: []Bytes) !*Arc(NodeSnapshot) {
-    const idx = try Arc(RecordIndex).create(gpa, try RecordIndex.build(gpa, sources));
+    const idx = try Arc(RecordIndex).create(gpa, try RecordIndex.build(gpa, sources, null));
     errdefer idx.release();
     const stable = try emptyRun(gpa);
     errdefer stable.release();
@@ -1201,7 +1240,7 @@ test "RecordIndex.build merges sources (key asc, seq desc, newer source first) a
     sources[0] = try imageOf(gpa, &oldest);
     sources[1] = try imageOf(gpa, &mid);
     sources[2] = try imageOf(gpa, &newest);
-    var idx = try RecordIndex.build(gpa, sources);
+    var idx = try RecordIndex.build(gpa, sources, null);
     defer idx.deinit(gpa);
     const want = [_]struct { u64, u64, u16 }{ .{ 1, 9, 2 }, .{ 1, 6, 1 }, .{ 1, 5, 1 }, .{ 1, 2, 0 }, .{ 2, 7, 2 }, .{ 2, 7, 0 }, .{ 3, 6, 1 }, .{ 4, 1, 0 } };
     try testing.expectEqual(want.len, idx.entries.len);
@@ -1219,6 +1258,44 @@ test "RecordIndex.build merges sources (key asc, seq desc, newer source first) a
     try testing.expectEqual(@intFromPtr(sources[2].slice().ptr) + bset.BSET_HEADER_LEN + rec.RECORD_HEADER_LEN, @intFromPtr(idx.recordRef(0).key.ptr));
 }
 
+test "RecordIndex charge tie: indexBytes = entries × @sizeOf(IdxRec) + sources × @sizeOf(Bytes); build charges the gauge and the stat, extendWith charges a second index while the first still stands, each deinit credits exactly its own" {
+    const gpa = testing.allocator;
+    try testing.expectEqual(@as(u64, 0), RecordIndex.indexBytes(0, 0));
+    try testing.expectEqual(@as(u64, 24 * 2_000 + 16 * 3), RecordIndex.indexBytes(2_000, 3));
+    try testing.expectEqual(@as(usize, 16), @sizeOf(Bytes));
+    var a = [_]Record{ try put(gpa, 1, 1), try put(gpa, 3, 2), try put(gpa, 5, 3) };
+    defer rec.deinitRecords(gpa, &a);
+    var b = [_]Record{ try dtimes(gpa, 1, 4, 1, 1), try put(gpa, 2, 5) };
+    defer rec.deinitRecords(gpa, &b);
+    var gauge: counters.Gauge = .{};
+    const g0 = stats.meta_kv_node_index_bytes.load();
+    const s1 = try gpa.alloc(Bytes, 1);
+    s1[0] = try imageOf(gpa, &a);
+    var first = try RecordIndex.build(gpa, s1, &gauge);
+    const first_bytes = RecordIndex.indexBytes(3, 1);
+    try testing.expectEqual(first_bytes, first.charged);
+    try testing.expectEqual(first_bytes, gauge.load());
+    try testing.expectEqual(g0 + first_bytes, stats.meta_kv_node_index_bytes.load());
+    // The incremental extension is a NEW index: both charge until the old one dies.
+    var second = try first.extendWith(gpa, try imageOf(gpa, &b));
+    const second_bytes = RecordIndex.indexBytes(5, 2);
+    try testing.expectEqual(second_bytes, second.charged);
+    try testing.expect(second.charge == first.charge);
+    try testing.expectEqual(first_bytes + second_bytes, gauge.load());
+    first.deinit(gpa);
+    try testing.expectEqual(second_bytes, gauge.load());
+    second.deinit(gpa);
+    try testing.expectEqual(@as(u64, 0), gauge.load());
+    try testing.expectEqual(g0, stats.meta_kv_node_index_bytes.load());
+    // A standalone index (no cache) charges the stat alone.
+    const s2 = try gpa.alloc(Bytes, 1);
+    s2[0] = try imageOf(gpa, &b);
+    var alone = try RecordIndex.build(gpa, s2, null);
+    try testing.expectEqual(g0 + RecordIndex.indexBytes(2, 1), stats.meta_kv_node_index_bytes.load());
+    alone.deinit(gpa);
+    try testing.expectEqual(g0, stats.meta_kv_node_index_bytes.load());
+}
+
 test "RecordIndex.extendWith equals a from-scratch build over the same sources" {
     const gpa = testing.allocator;
     var a = [_]Record{ try put(gpa, 1, 1), try put(gpa, 3, 2), try put(gpa, 5, 3) };
@@ -1233,7 +1310,7 @@ test "RecordIndex.extendWith equals a from-scratch build over the same sources" 
     // Incremental.
     const s1 = try gpa.alloc(Bytes, 1);
     s1[0] = ia.clone();
-    var inc1 = try RecordIndex.build(gpa, s1);
+    var inc1 = try RecordIndex.build(gpa, s1, null);
     defer inc1.deinit(gpa);
     var inc2 = try inc1.extendWith(gpa, ib.clone());
     defer inc2.deinit(gpa);
@@ -1244,7 +1321,7 @@ test "RecordIndex.extendWith equals a from-scratch build over the same sources" 
     s3[0] = ia;
     s3[1] = ib;
     s3[2] = ic;
-    var full = try RecordIndex.build(gpa, s3);
+    var full = try RecordIndex.build(gpa, s3, null);
     defer full.deinit(gpa);
     try testing.expectEqual(full.entries.len, inc3.entries.len);
     for (0..full.entries.len) |i| {

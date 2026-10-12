@@ -310,7 +310,7 @@ pub const Config = struct {
     /// Byte offset of heap extent 0.
     heap_base: u64,
     /// Cache budget in bytes; each cached node charges one extent plus its
-    /// overlay, heads and memo bytes.
+    /// overlay, heads, memo and base-index bytes.
     budget_bytes: u64,
     /// Open-delta size that triggers a writeback enqueue.
     writeback_delta_bytes: usize = DEFAULT_WRITEBACK_DELTA_BYTES,
@@ -689,7 +689,7 @@ pub const CachedNode = struct {
         }
         // The index owns the sources from here (on every outcome).
         sources_ours = false;
-        const index = RecordIndex.build(gpa, sources) catch |e| switch (e) {
+        const index = RecordIndex.build(gpa, sources, &cache.cached_bytes) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             // The ranges were verified by the load walk; our own count is bounded.
             error.Corrupt, error.ChecksumMismatch, error.TooManySources => unreachable,
@@ -1427,8 +1427,10 @@ pub const NodeCache = struct {
     clock: Clock = .{},
     retired: Retired = .{},
     /// `meta_kv_node_cache_bytes`: Σ mapped extents + overlay bytes incl.
-    /// heads + snapshot memo bytes (the latter two owned by the dirty
-    /// halves and memos through this gauge, deinit-exact).
+    /// heads + snapshot memo bytes + the base indexes' arrays (the latter
+    /// three owned by the dirty halves, memos and `RecordIndex`es through
+    /// this gauge, deinit-exact — an index charges for as long as any
+    /// snapshot over it lives).
     cached_bytes: counters.Gauge = .{},
     /// `meta_kv_heap_promised`: Σ extents promised to pending SMOs.
     heap_promised: counters.Gauge = .{},
@@ -2789,7 +2791,14 @@ test "property: over random histories (puts, deltas, deletes, freezes, rollback 
 
 // ---- §5.7 accounting and eviction ----
 
-test "a node's charge is extent + overlay (incl. heads) + memo; freezing releases the overlay charge; a dead snapshot's memo bytes leave the gauge exactly" {
+/// The base index's charge of `n`'s CURRENT snapshot.
+fn indexCharge(n: *CachedNode) u64 {
+    const s = n.snapshotLoad();
+    defer s.release();
+    return s.value.base.value.charged;
+}
+
+test "a node's charge is extent + base index + overlay (incl. heads) + memo; freezing moves the overlay charge into the extended index's arrays; a dead snapshot's memo bytes leave the gauge exactly" {
     var vol = try Vol.init(2, 8);
     defer vol.deinit();
     vol.arm();
@@ -2797,6 +2806,8 @@ test "a node's charge is extent + overlay (incl. heads) + memo; freezing release
     const leaf = (try vol.cache.load(Vol.addrOf(0))).?;
     defer leaf.release();
     const extent_only = vol.cache.cachedBytes();
+    // A header-only leaf indexes nothing: the extent is the whole charge.
+    try testing.expectEqual(@as(u64, 0), indexCharge(leaf));
     try testing.expectEqual(@as(u64, NODE_SIZE), extent_only);
     const k = key.inodeKey(9);
     _ = try vol.apply(leaf, &k, .put, &iv(2).encode());
@@ -2807,7 +2818,11 @@ test "a node's charge is extent + overlay (incl. heads) + memo; freezing release
     try vol.freezeAndAppend(leaf);
     const after_freeze = vol.cache.cachedBytes();
     try testing.expect(after_freeze < with_overlay);
-    try testing.expectEqual(@as(u64, NODE_SIZE), after_freeze);
+    // The nine frozen records (the Put and the deltas newer than it) are
+    // now the extended index's entries over one source; the superseded
+    // index died with its snapshot.
+    try testing.expectEqual(RecordIndex.indexBytes(9, 1), indexCharge(leaf));
+    try testing.expectEqual(NODE_SIZE + indexCharge(leaf), after_freeze);
     const g0 = snapshot.stats.meta_kv_fold_memo_bytes.load();
     const s = leaf.snapshotLoad();
     var l = try s.value.lookup(testing.allocator, &k);
@@ -3434,4 +3449,97 @@ test "the cache registers as a sheddable mem_budget component: gauge, 64 MiB flo
     try testing.expectEqual(@as(u64, 1), Kick.kicks);
     try testing.expectEqual(@as(u64, 85 * MiB), vol.cache.last_shed_target.load(.monotonic));
     vol.cache.cached_bytes.set(0);
+}
+
+/// An allocator that keeps the LIVE byte count of everything allocated
+/// through it (the R5 "what the gauge counts" measurement).
+const LiveBytes = struct {
+    inner: Allocator,
+    live: usize = 0,
+
+    fn allocator(self: *LiveBytes) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LiveBytes = @ptrCast(@alignCast(ctx));
+        const p = self.inner.rawAlloc(len, alignment, ret_addr);
+        if (p != null) self.live += len;
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LiveBytes = @ptrCast(@alignCast(ctx));
+        const ok = self.inner.rawResize(memory, alignment, new_len, ret_addr);
+        if (ok) self.live = self.live - memory.len + new_len;
+        return ok;
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LiveBytes = @ptrCast(@alignCast(ctx));
+        const p = self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+        if (p != null) self.live = self.live - memory.len + new_len;
+        return p;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LiveBytes = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+        self.live -= memory.len;
+    }
+};
+
+test "R5 measure: the charge of N cached nodes with M records each — every node's base index charges exactly indexBytes(entries, sources); the allocator's live bytes above the charge are the fixed per-node objects, never the index; eviction credits the index with the extent" {
+    var live: LiveBytes = .{ .inner = testing.allocator };
+    const cgpa = live.allocator();
+    const gpa = testing.allocator;
+    const N: u64 = 16;
+    const M: usize = 400;
+    var ram = try RamLoader.init(gpa, @intCast(N * NODE_SIZE));
+    defer ram.deinit(gpa);
+    const layout = try NodeLayout.new(NODE_SIZE, null);
+    const cache = try NodeCache.init(cgpa, testing.io, .{ .layout = layout, .heap_base = 0, .budget_bytes = 2 * N * NODE_SIZE, .writeback_delta_bytes = std.math.maxInt(usize) }, ram.loader());
+    defer cache.deinit();
+    for (0..N) |ext| {
+        const records = try gpa.alloc(Record, M);
+        defer gpa.free(records);
+        for (records, 0..) |*r, i| r.* = try Record.put(gpa, &key.inodeKey(ext * M + i + 1), ext * M + i + 1, &iv(ext * M + i).encode());
+        defer rec.deinitRecords(gpa, records);
+        const refs = try gpa.alloc(RecordRef, M);
+        defer gpa.free(refs);
+        for (records, refs) |*r, *o| o.* = r.ref();
+        var w = try node.writeNode(gpa, layout, .{ .node_addr = Vol.addrOf(ext), .node_seq = ext + 1, .tree_id = key.KIND_INTERIOR, .level = 0, .min_key = &key.inodeKey(ext * M + 1), .max_key = &key.inodeKey(ext * M + M) }, refs, ext * M + M, null);
+        defer w.deinit(gpa);
+        ram.write(w.node_addr, w.image);
+    }
+    const live_empty = live.live;
+    try testing.expectEqual(@as(u64, 0), cache.cachedBytes());
+    var index_bytes: u64 = 0;
+    for (0..N) |ext| {
+        const n = (try cache.load(Vol.addrOf(ext))).?;
+        defer n.release();
+        const s = n.snapshotLoad();
+        defer s.release();
+        const idx = &s.value.base.value;
+        try testing.expectEqual(M, idx.entries.len);
+        // The per-node tie: what the index charged is the formula over its own arrays.
+        try testing.expectEqual(snapshot.RecordIndex.indexBytes(idx.entries.len, idx.sources.len), idx.charged);
+        index_bytes += idx.charged;
+    }
+    const charged = cache.cachedBytes();
+    const uncharged = live.live - live_empty - charged;
+    // RED before the charge: the residual was ≥ the index bytes (+ the
+    // fixed objects); charged, the residual is the fixed objects alone —
+    // the node struct, the snapshot and its memo cells, the Arc headers,
+    // the key bounds, the map and clock slots: under a page per node.
+    try testing.expectEqual(N * NODE_SIZE + index_bytes, charged);
+    try testing.expect(uncharged < index_bytes);
+    try testing.expect(uncharged < N * bset.NODE_PAGE);
+    // The index bytes leave with the mapping: evict everything.
+    cache.cfg.budget_bytes = 0;
+    try cache.evictToBudget();
+    try testing.expectEqual(@as(usize, 0), cache.mappedCount());
+    try testing.expectEqual(@as(u64, 0), cache.cachedBytes());
+    // What stays allocated is the cache's own tables (the clock ring and
+    // the shard maps keep their grown capacity): under a page, no node.
+    try testing.expect(live.live - live_empty < bset.NODE_PAGE);
 }

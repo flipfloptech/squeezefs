@@ -598,7 +598,7 @@ const Cur = struct {
         return std.mem.readInt(u16, (try self.take(2))[0..2], .big);
     }
     fn word24(self: *Cur) error{Protocol}!u24 {
-        return std.mem.readInt(u24, (try self.take(3))[0..3], .big);
+        return std.mem.readInt(u24, (try self.take(3))[0..3], .big); // a 24-bit length (3 octets)
     }
     /// A `<0..2^16-1>` vector.
     fn vec16(self: *Cur) error{Protocol}![]const u8 {
@@ -864,20 +864,23 @@ const Handshake = struct {
         return tls.hmac(Hmac, &transcript_hash, fk);
     }
 
+    /// RFC 8446 §4: `HandshakeType(1) ‖ length(3)` heads every message.
+    const MSG_HEADER: usize = 4;
+
     /// Read the next handshake message (type, body), reading records as
     /// needed; a message may span records. The body is valid until the
     /// next call.
     fn nextMessage(self: *Handshake) HandshakeError!struct { ht: u8, body: []const u8, raw: []const u8 } {
         while (true) {
-            if (self.have - self.used >= 4) {
-                const hdr = self.buf[self.used..][0..4];
-                const len: usize = std.mem.readInt(u24, hdr[1..4], .big);
-                if (4 + len > HANDSHAKE_BUF) return error.Protocol;
-                if (self.have - self.used >= 4 + len) {
-                    const raw = self.buf[self.used..][0 .. 4 + len];
+            if (self.have - self.used >= MSG_HEADER) {
+                const hdr = self.buf[self.used..][0..MSG_HEADER];
+                const len: usize = std.mem.readInt(u24, hdr[1..MSG_HEADER], .big);
+                if (MSG_HEADER + len > HANDSHAKE_BUF) return error.Protocol;
+                if (self.have - self.used >= MSG_HEADER + len) {
+                    const raw = self.buf[self.used..][0 .. MSG_HEADER + len];
                     @memcpy(self.msg[0..raw.len], raw);
-                    self.used += 4 + len;
-                    return .{ .ht = hdr[0], .body = self.msg[4..raw.len], .raw = self.msg[0..raw.len] };
+                    self.used += MSG_HEADER + len;
+                    return .{ .ht = hdr[0], .body = self.msg[MSG_HEADER..raw.len], .raw = self.msg[0..raw.len] };
                 }
             }
             // Compact and read another record.

@@ -112,12 +112,12 @@ const Der = struct {
             try self.prependByte(@intCast(len));
         } else if (len <= std.math.maxInt(u8)) {
             try self.prependByte(@intCast(len));
-            try self.prependByte(0x81);
+            try self.prependByte(0x81); // long form, one length octet
         } else if (len <= std.math.maxInt(u16)) {
             var w: [2]u8 = undefined;
             std.mem.writeInt(u16, &w, @intCast(len), .big);
             try self.prepend(&w);
-            try self.prependByte(0x82);
+            try self.prependByte(0x82); // long form, two length octets
         } else return error.Overflow;
         try self.prependByte(@backingInt(tag));
     }
@@ -129,7 +129,7 @@ const Der = struct {
     }
 
     fn boolean(self: *Der, v: bool) DerError!void {
-        try self.primitive(.boolean, &[_]u8{if (v) 0xFF else 0x00});
+        try self.primitive(.boolean, &[_]u8{if (v) 0xFF else 0x00}); // DER TRUE is 0xFF (X.690 §11.1)
     }
 
     /// A positive INTEGER: a leading zero when the top bit is set (X.690 §8.3).
@@ -171,6 +171,7 @@ const Der = struct {
         const d = civilFromUnix(unix_s);
         var text: [15]u8 = undefined;
         if (d.year <= UTC_TIME_LAST_YEAR) {
+            // UTCTime: two-digit year (RFC 5280 §4.1.2.5.1 fixes the century).
             const t = std.fmt.bufPrint(&text, "{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{ d.year % 100, d.month, d.day, d.hour, d.minute, d.second }) catch unreachable;
             try self.primitive(.utc_time, t);
         } else {
@@ -388,14 +389,14 @@ const Screen = struct {
         const size_byte = b[index + 1];
         var i = index + 2;
         var end: usize = undefined;
-        if (size_byte >> 7 == 0) {
+        if (size_byte >> 7 == 0) { // X.690 §8.1.3.4: bit 8 clear = the short form
             end = i + size_byte;
         } else {
-            const len_size: usize = size_byte & 0x7F;
+            const len_size: usize = size_byte & 0x7F; // bits 7..1 = the count of length octets
             if (len_size == 0 or len_size > @sizeOf(u32)) return error.CertificateMalformed;
             if (i + len_size > parent_end) return error.CertificateMalformed;
             var long: usize = 0;
-            for (b[i .. i + len_size]) |x| long = (long << 8) | x;
+            for (b[i .. i + len_size]) |x| long = (long << 8) | x; // big-endian octets
             i += len_size;
             end = i + long;
         }

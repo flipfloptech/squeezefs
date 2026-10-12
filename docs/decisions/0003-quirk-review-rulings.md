@@ -424,3 +424,93 @@ box's metadata namespaces should be formatted at 512 B LBAs (nvmet's file backen
   replaced — it flip-flopped on the borderline shapes (`frag-512b-write` λ·R ≈ 0.9: half the windows
   held, 1.35 collected, +8 % META bytes, −11 % IOPS) because a closed loop's rate is not independent
   of the hold.
+
+## M. The hash: sqzhash128 replaces xxh3-64 everywhere (2026-10-11, the owner's ruling; `docs/evidence/rung-09-sqzhash.md`)
+
+The owner's decision: adopt **sqzhash128** — the owner's own keyed AES-round 128-bit hash
+(`~/Source/zig_hash_bench/src/sqzhash.zig`, ported bit-exact into `src/core/sqzhash.zig`, which
+is now the format's pinned definition: any output change is a format change) — as the ONE hash of
+the on-disk format and the wire, replacing xxh3-64 in every checksum, identity and name hash.
+Two reasons, both measured: it is faster on every format shape (§M.3; the owner re-confirmed the
+measurement the same day), and it is SMHasher3-clean in full — all 252 tests with `--extra`, both
+as 128 bits and on the low 64 bits alone (verification values `0xAB49D6E0` / `0xD6703A98`) —
+where XXH3-128 passes 214 of 250 in SMHasher3's published results. The charter names the
+mechanisms (checksums everywhere, verified once at load; a keyed name hash so names cannot be
+chosen to collide), not the algorithm; decision 0002 owes no compatibility, so the swap is one
+format act (row 480).
+
+### M.1 The projection: 8-byte fields carry the LOW 64 bits
+
+sqzhash128's state is 128 bits wide whatever the output, so the low 64 bits cost the same as the
+whole (one register move less) and are the half SMHasher3 verified on its own. Every 8-byte format
+field — the superblock, ledger slot, journal page header and entry, node header, bset, bitmap page,
+appender page, intent, claim, record frames, the wire frame — is `@truncate(u64, h128)`
+(`checksum.low64`). The facade (`src/core/checksum.zig`) is algorithm-neutral: `hash64`, `hash128`,
+`hash64Keyed`, `hash64FieldZeroed`, `stamp`/`verify`, the streaming `Hasher` (`final` u128 /
+`finalLow64`); the algorithm's name lives in `sqzhash.zig` and in the format version. Wire and page
+fields read `csum_le` / `CSUM_OFF` — the algorithm's name leaves the format's field names.
+
+### M.2 Two keys, never more
+
+- **The FORMAT key** (`checksum.FORMAT_KEY = 0x5351_5A46_5320_464F_524D_4154_204B_4559`, the
+  ASCII of `SQZFS FORMAT KEY`): fixed and PUBLIC on purpose. A checksum detects corruption and keeps
+  no secret, and sector 0 must verify before any per-volume value exists. Expanded at comptime
+  (`checksum.format_key`; the engine's software AES round runs under `@inComptime()`, proven equal
+  to both hardware paths), so no mount pays the 40-round expansion and no code path can forget it.
+- **The NAME key** (`key.NameKey`): the superblock's random `hash_seed` widened to the hash's
+  128-bit secret by ZERO-EXTENSION (`checksum.keyFromSeed`; the rule is the format's — the name
+  hashes on disk depend on it; `FORMAT_KEY`'s upper half is non-zero so no seed can expand to it),
+  expanded ONCE at open/mount/format and handed to every `hash54`/`hash56` by pointer through every
+  store (`KvBackend`, `MetaSet`, the fsck and test stores), the image builder, the data plane, the
+  fsck host and the stripe map. Never a key expansion per name: a `Key.init` is 40 AES rounds, and
+  the per-call seeded form the reference used paid the equivalent on every lookup.
+
+### M.3 The measurement (`squeezefs bench --hash`; ReleaseSafe, the gate profile)
+
+Two modes per (algorithm, shape): THROUGHPUT (independent hashes the core overlaps — a stream of
+page checksums) and CHAINED (the previous result written into the input before the next hash — a
+probe chain's dependent latency). The venue (`7.2.6-sqz`, 9 vCPU Apple-VM aarch64, two other
+agents' gates sharing it) and the dev box (Apple M3 Pro, macOS 27) agree within a few percent:
+
+| shape | xxh3-64 (std) tput | sqzhash64 tput | ratio | xxh3-64 chained | sqzhash64 chained |
+|---|---|---|---|---|---|
+| 16 B name | 2.17 ns (7.4 GB/s) | **1.35 ns** (11.8 GB/s) | 1.6× | **5.15 ns** | 5.9 ns |
+| 100 B record | 8.55 ns (11.7 GB/s) | **3.11 ns** (32.1 GB/s) | 2.7× | 8.69 ns | **6.46 ns** |
+| 4 KiB page | 3.67 µs (1.1 GB/s) | **29.4 ns** (139 GB/s) | 125× | 3.67 µs | **29.5 ns** |
+| 256 KiB node | 207 µs (1.3 GB/s) | **2.60 µs** (101 GB/s) | 80× | 208 µs | **2.62 µs** |
+
+WHY the long shapes are two orders apart: `std.hash.XxHash3`'s stripe is a `@Vector(8, u64)`
+`(lo32 × hi32)` multiply, which AArch64 NEON has no instruction for — LLVM scalarizes it into eight
+`MUL`s with extracts and inserts, and the accumulate loop runs at ~1 GB/s on this core (the owner's
+hand-written xxh3 in `zig_hash_bench` reaches 46–60 GiB/s with `UMLAL` splits, which the std
+implementation does not do). The product paid the std rate on every node header, bset and page.
+The one shape xxh3 keeps is the 16 B DEPENDENT chain (5.15 vs 5.9 ns: one multiply-fold against
+four dependent AES rounds), which the owner's own table also records; the throughput at 16 B and
+everything from 17 B up is sqzhash's. The `sqzhash128` column (the full 128-bit result, both halves
+folded) tracks `sqzhash64` within noise on macOS and reads 2× slower at 100 B throughput on the
+venue's Linux build (6.9 vs 3.1 ns, reproducible across three runs) — the u128 return leaves the
+vector register there; the format pays the 64-bit projection, which is the judged baseline column.
+
+### M.4 The format act
+
+Metadata format **v5**: v4's layout with every checksum re-defined. `classifySector0` names a
+`SQZMETLV` sector with version `< 5` LEGACY before any checksum check — a v4 image verifies nowhere
+under this binary, and the mount's refusal names the lever ("a pre-v5 squeezefs format (version 4)
+… reformat required: run `squeezefs format`"), never a tear. The data superblock moves to v2
+(version before checksum, the same lever), the framed block image to `FRAME_VERSION 3`, the staging
+segment record to v3 and its marker to v2 (a v2/v1 record or marker is torn to the scan: the ring
+is a cache, wiped loud), the NVMe read-cache frame to v2 (a stale frame refills). The FIND-VS-A
+fixture is regenerated as `findvsa_pred_bset.v5.bin` (same 254,932 bytes, 3,515 records; every
+checksum and every `hash54` differs). The kill matrix and fsck's C-passes verify every checksum
+under the new definition (both gates green on both venues, `rung-09-sqzhash.md`).
+
+### M.5 What was NOT changed
+
+- The on-disk layouts: every offset, width and `@offsetOf` assertion holds; only the function
+  behind the 8 bytes changed.
+- `std.hash.Wyhash` for the model checker's state fingerprints and the fuzz corpus's directory
+  names (RAM-only cache paths, never format); `std.hash.XxHash3` survives only as the bench's
+  reference column.
+- The staged cell's value-first streaming state (`staging.ValueHash = checksum.Hasher`): the law
+  (O(appended) per in-place append) holds; the state grew from ~600 B to ~4.7 KiB per LIVE cell
+  (the engine's 16-chunk buffer), bounded by the ring's live cells — recorded, not optimized.

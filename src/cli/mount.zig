@@ -696,7 +696,10 @@ fn mountMain(ctx: *Ctx) u8 {
         return ctx.failed("cannot spawn the times drain cadence", .{});
     };
 
-    // 6. Ready.
+    // 6. Ready. The heartbeat's first stamp lands HERE, before the
+    //    supervisor's first probe can read it (the watchdog's first tick is
+    //    one interval away; a page still 0 reads as a missed probe).
+    if (ctx.heartbeat) |h| h.beat();
     log.info("ready: {s} mounted at {s} (pid {d}; {d} queue(s) × depth {d}; budget {d} MiB; TTLs attr {d} ms entry {d} ms dir_entry {d} ms negative {d} ms)", .{ ctx.meta_uri, ctx.mountpoint, linux.getpid(), session.plan.nqueues, session.plan.depth, ctx.budget_bytes >> 20, ctx.opts.ttls.attr_ns / std.time.ns_per_ms, ctx.opts.ttls.entry_ns / std.time.ns_per_ms, ctx.opts.ttls.dir_entry_ns / std.time.ns_per_ms, ctx.opts.ttls.negative_ns / std.time.ns_per_ms });
     if (ctx.reporter) |*r| {
         r.ready();

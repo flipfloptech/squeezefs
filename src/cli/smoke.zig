@@ -55,6 +55,7 @@ const json_scan = @import("../core/json_scan.zig");
 const handler = @import("../fuse/handler.zig");
 const transport = @import("../fuse/transport.zig");
 const status_verb = @import("status.zig");
+const cli_supervisor = @import("supervisor.zig");
 const uring_fs = @import("../io/uring_fs.zig");
 const superblock = @import("../meta/superblock.zig");
 const ledger = @import("../meta/ledger.zig");
@@ -4427,6 +4428,130 @@ test "smoke: umount of a BUSY mount (another process's cwd inside it) — the ve
     try expectSupervisorSilent(after[ready_i..]);
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
     try testing.expect(!status_verb.writerGuardHeld(rig.img));
+}
+
+/// The reads a holder completed on its cwd (`<work>/count`), 0 before its
+/// first.
+fn holderCount(rig: *Rig) u64 {
+    var pb: [192]u8 = undefined;
+    var buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/count", .{rig.work}) catch return 0;
+    const text = Io.Dir.cwd().readFile(rig.io, path, &buf) catch return 0;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch 0;
+}
+
+/// Bounded poll until the holder's count passes `floor`.
+fn awaitHolderReads(rig: *Rig, floor: u64, deadline_ns: u64) !u64 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        const n = holderCount(rig);
+        if (n > floor) return n;
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- the holder made no progress past {d} reads ---\n", .{floor});
+            return error.Timeout;
+        }
+        sleepMs(20);
+    }
+}
+
+test "smoke: `umount --lazy` of a BUSY mount — the verb returns at once naming the holders it leaves, the mountpoint is gone from the table, the holder KEEPS reading its detached cwd (every ls and .stats served), the supervisor switches to the heartbeat and never warns; when the holder leaves the kernel ends the connection and the daemon tears down clean (`exited (wait status 0x0)`); `--lazy` on an unheld mount is the orderly stop" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, "-o", "default_permissions,allow_other", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    const text0 = try rig.readLog();
+    defer gpa.free(text0);
+    const ready_i = std.mem.indexOf(u8, text0, "ready: ") orelse return error.NoReadyLine;
+    const pid: linux.pid_t = @intCast(numberAfter(text0[ready_i..], "(pid ") orelse return error.NoPid);
+    _ = try rig.awaitLog("supervisor: watching daemon ", ready_i, ready_wait_ns);
+    // The holder: cwd = the mount root, reading it (ls + the control
+    // inode) until the stop file appears OUTSIDE the mount; its count of
+    // served reads lands beside the stop file.
+    var script: [512]u8 = undefined;
+    // `-d work` too: a row that fails before the stop file leaves no
+    // holder spinning on a deleted work dir.
+    const holder_script = try std.fmt.bufPrint(&script, "n=0; while [ -d {s} ] && [ ! -e {s}/stop ]; do ls . >/dev/null || exit 2; cat .stats >/dev/null || exit 3; n=$((n+1)); echo $n > {s}/count; sleep 0.05; done; exit 0", .{ rig.work, rig.work, rig.work });
+    var holder = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", holder_script }, .cwd = .{ .path = rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+    const holder_pid = holder.id.?;
+    var stop_buf: [192]u8 = undefined;
+    const stop_path = try std.fmt.bufPrint(&stop_buf, "{s}/stop", .{rig.work});
+    defer Io.Dir.cwd().writeFile(io, .{ .sub_path = stop_path, .data = "" }) catch {};
+    const before = try awaitHolderReads(rig, 0, 10 * std.time.ns_per_s);
+    var pid_text: [16]u8 = undefined;
+    const pid_s = try std.fmt.bufPrint(&pid_text, "{d}", .{holder_pid});
+    // 1. The lazy detach: at once, the holder named, the path free.
+    const lazy_mark = try rig.logLen();
+    {
+        const t0 = clock.monotonicNs();
+        const r = try rig.squeezefs(&.{ "umount", "--lazy", rig.mp });
+        defer rig.freeRun(r);
+        const took_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        if (!r.term.success() or took_ms > 5000) std.debug.print("\n--- umount --lazy: rc {f} after {d} ms; stdout:\n{s}\nstderr:\n{s}\n", .{ r.term, took_ms, r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(took_ms <= 5000);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "detached") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, pid_s) != null);
+    }
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    try testing.expect(alive(pid));
+    _ = try rig.awaitLog("detached lazily with", lazy_mark, 10 * std.time.ns_per_s);
+    // 2. The holder keeps being served on the detached superblock.
+    const after_detach = try awaitHolderReads(rig, before + 10, 20 * std.time.ns_per_s);
+    try testing.expect(after_detach > before);
+    // 3. The supervisor notices the detach, switches probes, stays silent.
+    _ = try rig.awaitLog("is no longer attached", lazy_mark, 3 * cli_supervisor.PROBE_INTERVAL_NS);
+    _ = try awaitHolderReads(rig, after_detach, 20 * std.time.ns_per_s);
+    try testing.expect(alive(pid));
+    {
+        const during = try rig.readLog();
+        defer gpa.free(during);
+        try expectSupervisorSilent(during[ready_i..]);
+    }
+    // 4. The holder leaves: the kernel ends the connection, the daemon
+    //    tears down clean, the supervisor reaps 0x0.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = stop_path, .data = "" });
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try holder.wait(io));
+    _ = try rig.awaitLog("the FUSE session ended (unmounted): tearing down", lazy_mark, 20 * std.time.ns_per_s);
+    _ = try rig.awaitLog("exited (wait status 0x0); done", lazy_mark, 20 * std.time.ns_per_s);
+    try testing.expect(!alive(pid));
+    {
+        const after = try rig.readLog();
+        defer gpa.free(after);
+        try testing.expect(std.mem.indexOf(u8, after[lazy_mark..], "clean unmount") != null);
+        try expectSupervisorSilent(after[ready_i..]);
+    }
+    try testing.expect(!status_verb.writerGuardHeld(rig.img));
+    // 5. `--lazy` on an unheld mount: the orderly stop, nothing lazy.
+    Io.Dir.cwd().deleteFile(io, stop_path) catch {};
+    const mark2 = try rig.logLen();
+    {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+    }
+    const ready2 = try rig.awaitReady(mark2);
+    {
+        const r = try rig.squeezefs(&.{ "umount", "-l", rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\n--- umount -l (unheld): {f}\n{s}\n", .{ r.term, r.stderr });
+        try testing.expect(r.term.success());
+    }
+    _ = try rig.awaitLog("lazy stop requested (SIGUSR2): unmounting", ready2, 10 * std.time.ns_per_s);
+    _ = try rig.awaitLog("exited (wait status 0x0); done", ready2, 20 * std.time.ns_per_s);
+    const final = try rig.readLog();
+    defer gpa.free(final);
+    try testing.expect(std.mem.indexOf(u8, final[ready2..], "clean unmount") != null);
+    try testing.expect(std.mem.indexOf(u8, final[ready2..], "detached lazily") == null);
+    try expectSupervisorSilent(final[ready2..]);
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
 }
 
 test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming the page order and the remedy, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {

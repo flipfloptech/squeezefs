@@ -719,6 +719,7 @@ carries the `+ref`/`−ref` in the same tx; the displaced binding is freed only 
 | `staging_put_bytes_{drain,flush,teardown,wt_fallback}`, `staging_sibling_probes`, `staging_sibling_hops_elided` | ring traffic | — |
 | `staged_writes_in_flight`, `current_staged_write_bytes` (`staging_mmap`) | ring population / budget | levels |
 | `staging_cell_state_bytes` (`staging_cell_state`, attribution-only) | the live cells' value-hash states, `@sizeOf(ValueHash)` = 1,056 B each | `≤ maxCells(capacity) × 1,056` (`Segment.cellStateBound`) |
+| `staging_tables_bytes` (`staging_tables`, attribution-only) | the segment's fixed per-cell tables, preallocated at `maxCells` for the ring's life: `cells` (80 B), `free_cells` (4 B), `pending` (40 B), `scratch` (40 B, one extra), the key index (`ceilPow2(n / 0.8 + 1)` slots × 33 B) | `= Segment.tablesBound(capacity)` per open segment: 31,574,220 B at the venue's 546 MiB ring, 3,768,524 B at 64 MiB — 5.5 % of the ring; still through puts and removes, returned at `deinit` |
 | `dismount_promoted_{files,bytes,inline_files}`, `dismount_promote_failures`, `fsync_promoted_files` | the two promotion points | — |
 | `nvme_unaligned_write_fallbacks` | device pad arm | EXPECTED growth per packed non-4 KiB image (pre-declared, design §10) |
 | `block_key_incarnation_{refusals,unknown,exhausted}` | stale-lifetime refusal / honest unknown / mint exhaustion | `refusals` **must-stay-0** |

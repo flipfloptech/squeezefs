@@ -52,6 +52,12 @@ pub const stats = struct {
     /// (`@sizeOf(ValueHash)` each — the budget component
     /// `staging_cell_state`'s gauge); `≤ Segment.cellStateBound(capacity)`.
     pub var staging_cell_state_bytes: counters.Gauge = .{};
+    /// `staging_tables_bytes`: the segment's fixed per-cell tables (the
+    /// cells, the free list, the pending list, the placement scratch, the
+    /// key index), preallocated at `maxCells` for the ring's life — the
+    /// budget component `staging_tables`' gauge; `= Segment.tablesBound(
+    /// capacity)` per open segment.
+    pub var staging_tables_bytes: counters.Gauge = .{};
     /// `staging_over_cap_refusals`: a stage refused `StorageFull` at the
     /// pool cap (the caller's spill escalation follows).
     pub var staging_over_cap_refusals: counters.ShardedCounter = .{};
@@ -102,10 +108,11 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
+    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_tables_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
         stats.current_staged_write_bytes.load(),
         stats.staged_writes_in_flight.load(),
         stats.staging_cell_state_bytes.load(),
+        stats.staging_tables_bytes.load(),
         stats.staging_over_cap_refusals.load(),
         stats.staging_ring_full_refusals.load(),
         stats.staging_pressure_kicks.load(),
@@ -292,6 +299,14 @@ comptime {
 /// cells is `staging_mmap`'s promotion kick; heap bytes, never page cache.
 pub fn cellStateComponent() budget.Component {
     return budget.Component.init("staging_cell_state", 0, 0, .{ .gauge = &stats.staging_cell_state_bytes }, null);
+}
+
+/// The R5 component over the segment's fixed per-cell tables: attribution-
+/// only (weight 0) — they are allocated once at `Segment.init` for the
+/// ring's life and leave with it; nothing short of closing the ring returns
+/// them. Heap, never page cache.
+pub fn tablesComponent() budget.Component {
+    return budget.Component.init("staging_tables", 0, 0, .{ .gauge = &stats.staging_tables_bytes }, null);
 }
 
 pub fn valueHash(value: []const u8) ValueHash {
@@ -518,6 +533,35 @@ pub const Segment = struct {
         return @as(u64, maxCells(cap)) * @sizeOf(ValueHash);
     }
 
+    /// Bytes of one key-index slot: the std hash map's metadata byte
+    /// (state + fingerprint) beside the key and the cell pointer.
+    const INDEX_SLOT_BYTES: u64 = 1 + KEY_LEN + @sizeOf(*Cell);
+
+    /// The key index's slot count for `n` entries — the std hash map's own
+    /// law (`capacityForSize`): `n / load + 1` rounded up to a power of two
+    /// at its default load (`std.hash_map.default_max_load_percentage`).
+    /// Restated here so the tables' gauge is a pure derivation; the tie test
+    /// pins it against the live map's `capacity()`.
+    pub fn indexSlots(n: usize) u64 {
+        const percent: u64 = 100;
+        return std.math.ceilPowerOfTwo(u64, @as(u64, n) * percent / std.hash_map.default_max_load_percentage + 1) catch unreachable;
+    }
+
+    /// The RAM the fixed per-cell tables take at `cap`: `n = maxCells(cap)`
+    /// cells, `n` free-list and pending slots, `n + 1` scratch extents and
+    /// the key index's slot arrays (its 3-word header is not counted).
+    /// Every table is sized ONCE at `init` and lives with the segment.
+    pub fn tablesBound(cap: u64) u64 {
+        const n: u64 = maxCells(cap);
+        return n * @sizeOf(Cell) + n * @sizeOf(u32) + n * @sizeOf(Extent) + (n + 1) * @sizeOf(Extent) + indexSlots(@intCast(n)) * INDEX_SLOT_BYTES;
+    }
+
+    /// What this segment's tables take — the same terms read off the live
+    /// tables (`tablesBound(capacity)` by construction; the tie test says so).
+    pub fn tablesBytes(self: *const Segment) u64 {
+        return @as(u64, self.cells.len) * @sizeOf(Cell) + @as(u64, self.free_cells.capacity) * @sizeOf(u32) + @as(u64, self.pending.capacity) * @sizeOf(Extent) + @as(u64, self.scratch.len) * @sizeOf(Extent) + @as(u64, self.index.capacity()) * INDEX_SLOT_BYTES;
+    }
+
     /// A cell's value-hash state, gauged at birth; `destroyState` undoes it.
     fn createState(self: *Segment) Allocator.Error!*ValueHash {
         const state = try self.gpa.create(ValueHash);
@@ -543,12 +587,17 @@ pub const Segment = struct {
         const scratch = try gpa.alloc(Extent, n + 1);
         errdefer gpa.free(scratch);
         var self: Segment = .{ .gpa = gpa, .image = image, .backing = backing, .cells = cells, .free_cells = free, .scratch = scratch };
+        errdefer self.index.deinit(gpa);
         try self.index.ensureTotalCapacity(gpa, @intCast(n));
-        try self.pending.ensureTotalCapacity(gpa, n);
+        errdefer self.pending.deinit(gpa);
+        // Precise: the pending list is one of the gauged fixed tables.
+        try self.pending.ensureTotalCapacityPrecise(gpa, n);
+        stats.staging_tables_bytes.add(self.tablesBytes());
         return self;
     }
 
     pub fn deinit(self: *Segment) void {
+        stats.staging_tables_bytes.sub(self.tablesBytes());
         for (self.cells) |*c| if (c.hash) |h| self.destroyState(h);
         self.index.deinit(self.gpa);
         self.pending.deinit(self.gpa);
@@ -2122,6 +2171,51 @@ test "the live cells' value-hash states are gauged (R5): N staged records carry 
     try testing.expectEqual(stats.staging_cell_state_bytes.load(), c.current());
 }
 
+test "the segment's fixed per-cell tables are gauged (R5): tablesBound(cap) = maxCells × (Cell + u32 + 2 × Extent) + Extent + indexSlots × (1 + KEY_LEN + ptr); an open segment carries exactly it in staging_tables_bytes (the live tables agree term by term, the std map's capacity law pinned), puts move nothing, deinit returns it; the component is attribution-only; the tables are ≈ 5.5 % of the ring" {
+    const gpa = testing.allocator;
+    // The tie, restated: n = cap / grain + 1 cells.
+    const cap: u64 = 64 * 4096;
+    const n: u64 = cap / RECORD_ALIGN + 1;
+    try testing.expectEqual(n, Segment.maxCells(cap));
+    try testing.expectEqual(@as(u64, 128), Segment.indexSlots(@intCast(n)));
+    try testing.expectEqual(n * @sizeOf(Cell) + n * @sizeOf(u32) + (2 * n + 1) * @sizeOf(Extent) + 128 * (1 + KEY_LEN + @sizeOf(*Cell)), Segment.tablesBound(cap));
+    // The std map's capacity law at the boundary: 80 % load, power of two.
+    try testing.expectEqual(@as(u64, 16), Segment.indexSlots(12));
+    try testing.expectEqual(@as(u64, 32), Segment.indexSlots(13));
+    const g0 = stats.staging_tables_bytes.load();
+    const r = try ramSegment(gpa, cap);
+    defer gpa.free(r.image);
+    var seg = r.seg;
+    try testing.expectEqual(Segment.tablesBound(cap), seg.tablesBytes());
+    try testing.expectEqual(g0 + Segment.tablesBound(cap), stats.staging_tables_bytes.load());
+    try testing.expectEqual(@as(u64, Segment.indexSlots(@intCast(n))), @as(u64, seg.index.capacity()));
+    try testing.expectEqual(n, @as(u64, seg.pending.capacity));
+    try testing.expectEqual(n, @as(u64, seg.free_cells.capacity));
+    // Puts and removes move cells between the fixed tables; the gauge is still.
+    const v: [100]u8 = @splat(7);
+    for (0..8) |i| try seg.put(tkey(@intCast(i + 1), i + 1), &v, i + 1, 0, 0);
+    try testing.expect(seg.remove(tkey(3, 3), null));
+    try testing.expectEqual(g0 + Segment.tablesBound(cap), stats.staging_tables_bytes.load());
+    seg.deinit();
+    try testing.expectEqual(g0, stats.staging_tables_bytes.load());
+    // The share of the ring: 31,574,220 B at the venue's 546 MiB ring
+    // (139,777 cells × (80 + 4 + 80) B + 262,144 index slots × 33 B) and
+    // 3,768,524 B at 64 MiB — 5.5 % of either, the index's power-of-two
+    // rounding the swing.
+    const venue_ring: u64 = 546 * derive.MiB;
+    try testing.expectEqual(@as(u64, 31_574_220), Segment.tablesBound(venue_ring));
+    try testing.expectEqual(@as(u64, 3_768_524), Segment.tablesBound(64 * derive.MiB));
+    try testing.expect(Segment.tablesBound(venue_ring) * 1000 / venue_ring == 55);
+    try testing.expect(Segment.tablesBound(64 * derive.MiB) * 1000 / (64 * derive.MiB) == 56);
+    // The R5 component: attribution-only (the tables live with the segment), heap, not page cache.
+    const c = tablesComponent();
+    try testing.expectEqualStrings("staging_tables", c.name);
+    try testing.expectEqual(@as(u64, 0), c.weight);
+    try testing.expectEqual(@as(u64, 0), c.floor);
+    try testing.expect(!c.kernel_reclaimable);
+    try testing.expectEqual(stats.staging_tables_bytes.load(), c.current());
+}
+
 test "the three promotion points: pressure rides stageWrite; the dismount pass promotes every resident (failures stay resident, counted); fsync promotes only under the lever (default off), a failure never fails it" {
     const gpa = testing.allocator;
     var kicks: Kicks = .{};
@@ -2274,6 +2368,7 @@ test "stats JSON names every instrument" {
     const out = w.buffered();
     try testing.expect(std.mem.startsWith(u8, out, "{\"current_staged_write_bytes\":"));
     try testing.expect(std.mem.indexOf(u8, out, "\"staging_cell_state_bytes\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_tables_bytes\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"staged_payload_lost_reads\":") != null);
     try testing.expect(std.mem.endsWith(u8, out, "}"));
 }

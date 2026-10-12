@@ -784,8 +784,10 @@ pub const DataPlane = struct {
         st.pool = staging.Pool.init(gpa, capacity, .{ .ctx = self, .pressure = &promotionPressure, .promote = &promoteHook });
         st.pool.seedFromRecovery(&st.seg) catch return error.OutOfMemory;
         budget.authority.register(st.pool.component());
-        // The live cells' value-hash states (R5: ≤ `cellStateBound(capacity)`).
+        // The live cells' value-hash states (R5: ≤ `cellStateBound(capacity)`)
+        // and the segment's fixed per-cell tables (= `tablesBound(capacity)`).
         budget.authority.register(staging.cellStateComponent());
+        budget.authority.register(staging.tablesComponent());
         log.info("staging ring {s}/{s}/{s}: {d} MiB, recovered {d} record(s) ({d} B), {d} torn, {d} superseded", .{ root, staging.Ring.SEGMENT_DIR, STAGING_SEGMENT_NAME, capacity >> 20, rep.adopted, rep.bytes, rep.torn, rep.superseded });
     }
 

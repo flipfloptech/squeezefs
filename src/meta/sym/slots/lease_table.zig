@@ -34,6 +34,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const clock = @import("../../../core/clock.zig");
 const jc = @import("../../journal_core.zig");
 const inos = @import("../../inos.zig");
 const route_table = @import("../../routing/route_table.zig");
@@ -345,7 +346,8 @@ pub const LeaseTable = struct {
         defer self.lock.unlock();
         const v = self.view(slot);
         if (v.state != .unleased) return .{ .refused = .{ .holder = v.holder, .g = v.g, .state = v.state, .dead = v.dead } };
-        _ = try self.coldOf(slot);
+        const c = try self.coldOf(slot);
+        c.offer_expires_ns = 0;
         try self.addHeld(holder, slot);
         const g = v.g +% 1;
         self.cells[slot].g.store(g, .release);
@@ -423,6 +425,21 @@ pub const LeaseTable = struct {
         return if (now_ns < c.offer_expires_ns) c.offered_to else null;
     }
 
+    /// The accepter an UNLEASED slot is reserved for: a handover's
+    /// release leaves the offer's stand in place until the accepter's
+    /// grant lands or the stand ends (`offerStandNs`), so no other
+    /// appender's first touch takes the slot in the gap between the
+    /// holder's release and the requester's grant — the gap in which the
+    /// requester's OWN ships, served at the releasing holder, used to
+    /// first-touch the slot back to the holder and refuse the accept.
+    pub fn reservedFor(self: *LeaseTable, slot: u16, now_ns: u64) ?AppenderId {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.view(slot).state != .unleased) return null;
+        const c = self.cold.get(slot) orelse return null;
+        return if (c.offered_to != 0 and now_ns < c.offer_expires_ns) c.offered_to else null;
+    }
+
     /// Every offer whose stand ended goes back to `leased` (T3); the
     /// lapsed ones are reported for the counters and a wire recall's
     /// withdrawal. Bounded by `out`.
@@ -456,7 +473,9 @@ pub const LeaseTable = struct {
         defer self.lock.unlock();
         const v = self.view(slot);
         if ((v.state != .leased and v.state != .offered) or v.holder != holder) return null;
-        if (self.cold.getPtr(slot)) |c| c.offer_expires_ns = 0;
+        // The offer's stand is KEPT: it is the accepter's reservation
+        // across the release (`reservedFor`); `offeredTo` reads nothing
+        // off a slot that is not `.offered`.
         self.storeWord(slot, .releasing, holder, dead, v.rotor);
         return v.g;
     }
@@ -491,7 +510,6 @@ pub const LeaseTable = struct {
         const c = try self.coldOf(slot);
         c.words = words;
         c.last_written = self.lease_seq;
-        c.offer_expires_ns = 0;
         c.handover_at_ns = now_ns;
         self.storeWord(slot, .unleased, MANAGER, false, false);
         return .released;
@@ -700,9 +718,13 @@ pub const LeaseTable = struct {
         defer self.lock.unlock();
         var ranks: [PICK_MAX]u64 = undefined;
         var n: usize = 0;
+        const now_ns = clock.monotonicNs();
         for (candidates) |s| {
             if (self.view(s).state != .unleased) continue;
-            const lw = if (self.cold.get(s)) |c| c.last_written else 0;
+            const lw = if (self.cold.get(s)) |c| blk: {
+                if (c.offered_to != 0 and now_ns < c.offer_expires_ns) continue;
+                break :blk c.last_written;
+            } else 0;
             // Insertion into the bounded best-`out.len` list (want ≤ 128).
             var i = n;
             while (i > 0 and rankLess(lw, s, ranks[i - 1], out[i - 1])) : (i -= 1) {

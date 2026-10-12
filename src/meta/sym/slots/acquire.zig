@@ -55,6 +55,10 @@ pub const stats = struct {
     pub var slot_grants: counters.ShardedCounter = .{};
     /// An explicit ask for a slot another appender holds (legal).
     pub var slot_acquire_refusals: counters.ShardedCounter = .{};
+    /// Of those: a first touch in a handover's release → grant gap, the
+    /// slot reserved for its accepter (the requester's own served ships
+    /// at the releasing holder used to take the slot back).
+    pub var slot_acquire_reserved_refusals: counters.ShardedCounter = .{};
     /// A rotor ask past `2 × M` (legal).
     pub var slot_rotor_cap_refusals: counters.ShardedCounter = .{};
     /// Releases that landed (`ReleaseSlot` and the in-process accept's).
@@ -510,6 +514,14 @@ pub const Verbs = struct {
         for (req.explicit) |s| {
             const v = self.table.view(s);
             if (v.state == .unleased) {
+                // A slot released by a handover stays RESERVED for its
+                // accepter while the offer's stand holds: another first
+                // touch in the release → grant gap is refused naming it.
+                if (self.table.reservedFor(s, clock.monotonicNs())) |to| if (to != req.appender_id) {
+                    stats.slot_acquire_refusals.inc();
+                    stats.slot_acquire_reserved_refusals.inc();
+                    return .{ .refused = .{ .slot = s, .holder = to, .g = v.g } };
+                };
                 try picked.append(gpa, s);
             } else if (v.holder == req.appender_id and v.state != .migrating) {
                 already += 1;
@@ -1347,4 +1359,44 @@ test "the in-process accept: an offer standing for the requester runs the holder
     try verbs.encodeRequest(.{ .acquire_slots = .{ .volume = 0, .want = 129, .appender_id = 2 } }, &b);
     try testing.expectEqual(manager.Status.rejected, table.dispatch(&p.mgr, gpa, .acquire_slots, b.written()).status);
     try testing.expectEqual(manager.Status.malformed, table.dispatch(&p.mgr, gpa, .offer_slot, "xx").status);
+}
+
+test "the release → grant gap of an accept: the released slot stays RESERVED for its accepter while the offer's stand holds — a first touch by the holder (its served ship of the requester) or any third appender is refused naming the accepter and counted, the rotor pick skips it, the accepter's grant lands; a lapsed stand frees it" {
+    const gpa = testing.allocator;
+    const p = try TestPlane.init(gpa);
+    defer p.deinit();
+    p.own_n = 3;
+    const g = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{4} });
+    gpa.free(g.granted.grants);
+    // The offer stands for 1; the holder's own transfer (the accept's first
+    // half) releases the slot with the stand kept.
+    try testing.expectEqual(Verbs.OfferResult.offered, try p.verbs.offerSlot(0, 4, 1, std.math.maxInt(u64)));
+    try TestPlane.transfer(p, 4, 0, 1);
+    try testing.expectEqual(lt.State.unleased, p.table.view(4).state);
+    try testing.expectEqual(@as(?AppenderId, 1), p.table.reservedFor(4, clock.monotonicNs()));
+    // The holder's first touch (a served ship of 1 landing in the gap) and
+    // a third appender's are refused naming the accepter.
+    const refusals0 = stats.slot_acquire_reserved_refusals.load();
+    const r0 = try p.verbs.acquireSlot(gpa, 0, 4, .try_);
+    try testing.expectEqual(@as(u32, 1), r0.refused.holder);
+    const r2 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 2, .explicit = &.{4} });
+    try testing.expectEqual(@as(u32, 1), r2.refused.holder);
+    try testing.expectEqual(refusals0 + 2, stats.slot_acquire_reserved_refusals.load());
+    // The rotor pick never hands the reserved slot out.
+    var picked: [4]u16 = undefined;
+    for (p.table.pickUnleased(&.{ 4, 5, 6 }, picked[0..2])) |s| try testing.expect(s != 4);
+    // The accepter's grant lands and clears the reservation.
+    const acc = try p.verbs.acquireSlots(gpa, .{ .appender_id = 1, .explicit = &.{4} });
+    defer gpa.free(acc.granted.grants);
+    try testing.expect(p.table.view(4).leasedBy(1));
+    try testing.expectEqual(@as(?AppenderId, null), p.table.reservedFor(4, clock.monotonicNs()));
+    // A lapsed stand: the released slot is anyone's.
+    const g5 = try p.verbs.acquireSlots(gpa, .{ .appender_id = 0, .explicit = &.{5} });
+    gpa.free(g5.granted.grants);
+    try testing.expectEqual(Verbs.OfferResult.offered, try p.verbs.offerSlot(0, 5, 1, clock.monotonicNs() + 1));
+    try TestPlane.transfer(p, 5, 0, 1);
+    try testing.expectEqual(@as(?AppenderId, null), p.table.reservedFor(5, clock.monotonicNs() + 2));
+    const g5b = try p.verbs.acquireSlots(gpa, .{ .appender_id = 2, .explicit = &.{5} });
+    gpa.free(g5b.granted.grants);
+    try testing.expect(p.table.view(5).leasedBy(2));
 }

@@ -7,33 +7,33 @@ src/cli/admin_lane.zig:93 | 16 | a size — OWED: derive from derive.Facts or do
 src/cli/admin_lane.zig:93 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/args.zig:101 | 4420 | a port number (4420 is the IANA nvme-tcp port; 4433 its sibling in the harness slice)
 src/cli/args.zig:112 | 4420 | a port number (4420 is the IANA nvme-tcp port; 4433 its sibling in the harness slice)
-src/cli/args.zig:730 | 10 | a table entry (switch/range arm) — the codec or classification table
-src/cli/args.zig:731 | 10 | a table entry (switch/range arm) — the codec or classification table
-src/cli/args.zig:735 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:736 | 4 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/args.zig:984 | 20 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:985 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:993 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1071 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:734 | 10 | a table entry (switch/range arm) — the codec or classification table
+src/cli/args.zig:735 | 10 | a table entry (switch/range arm) — the codec or classification table
+src/cli/args.zig:739 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:740 | 4 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/args.zig:988 | 20 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:989 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:997 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/args.zig:1075 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1298 | 100 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1426 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1430 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1543 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1547 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1551 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/cli/args.zig:1576 | 100 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1583 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1614 | 10 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1627 | 10 | a table entry (switch/range arm) — the codec or classification table
-src/cli/args.zig:1628 | 20 | a table entry (switch/range arm) — the codec or classification table
-src/cli/args.zig:1629 | 30 | a table entry (switch/range arm) — the codec or classification table
-src/cli/args.zig:1630 | 40 | a table entry (switch/range arm) — the codec or classification table
-src/cli/args.zig:1662 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1664 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/args.zig:1674 | 86_400 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/args.zig:1676 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/args.zig:1757 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/args.zig:1079 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1302 | 100 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1433 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1437 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1550 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1554 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1558 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/cli/args.zig:1583 | 100 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1590 | 16 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1621 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1634 | 10 | a table entry (switch/range arm) — the codec or classification table
+src/cli/args.zig:1635 | 20 | a table entry (switch/range arm) — the codec or classification table
+src/cli/args.zig:1636 | 30 | a table entry (switch/range arm) — the codec or classification table
+src/cli/args.zig:1637 | 40 | a table entry (switch/range arm) — the codec or classification table
+src/cli/args.zig:1669 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1671 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/args.zig:1681 | 86_400 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/args.zig:1683 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/args.zig:1764 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/bench.zig:465 | 20 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/cli/bench.zig:577 | 500 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/bench.zig:578 | 1000 | OWED: derive it or document it on the line (charter §1.5)
@@ -83,7 +83,7 @@ src/cli/supervisor.zig:235 | 10 | a timing/retry constant — OWED: its measured
 src/cli/supervisor.zig:239 | 10 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/cli/tune.zig:71 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/umount.zig:159 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/cli/volume.zig:315 | 10 | OWED: derive it or document it on the line (charter §1.5)
+src/cli/volume.zig:321 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/core/counters.zig:101 | 26 | OWED: derive it or document it on the line (charter §1.5)
 src/core/counters.zig:155 | 256 | OWED: derive it or document it on the line (charter §1.5)
 src/core/derive.zig:19 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason

@@ -260,8 +260,9 @@ pub fn planFormatWith(gpa: Allocator, volume_len: u64, opts: FormatOptions, desc
     };
 }
 
-/// `zero_range` in ≤ 1 MiB chunks, every chunk a view of ONE zero buffer.
-fn pushZero(a: Allocator, steps: *std.ArrayList(Step), zeros: []const u8, start: u64, len: u64) Allocator.Error!void {
+/// `zero_range` in ≤ 1 MiB chunks, every chunk a view of ONE zero buffer
+/// (the format's and `enable-symmetric`'s).
+pub fn pushZero(a: Allocator, steps: *std.ArrayList(Step), zeros: []const u8, start: u64, len: u64) Allocator.Error!void {
     var off = start;
     const end = start + len;
     while (off < end) {

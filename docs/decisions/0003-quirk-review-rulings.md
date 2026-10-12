@@ -621,3 +621,10 @@ under the new definition (both gates green on both venues, `rung-09-sqzhash.md`)
   RESOLVED 2026-10-12 (`rung-09-sqzhash.md` §3.1): the state is the construction's minimum, 1,056 B
   (the key by pointer; the input itself while ≤ 1 KiB, else 16 lanes + the last chunk), pinned, the
   output unchanged, and gauged as the R5 component `staging_cell_state`.
+
+## N. Rung-10 design calls (2026-10-12, the symmetric plane's owed items; `docs/evidence/rung-10-symmetric-completion.md`)
+
+| Call | Decision | Why |
+|---|---|---|
+| `enable-symmetric`'s order | The claim (bitmap + restated ledger) lands BEFORE the stamp; the stamp is the last write. A crash between them leaves a flat volume with one claimed extent no root reaches, which the re-run finds by CONTENT (`findStrandedLink`) and resumes onto; the alternative — stamp first, claim at the first symmetric mount — would make a mount a repair site and leave a window in which the directory the superblock names is free in the bitmap | charter §5.3 "any ledger slot a mount may select references only never-overwritten extents"; §5.5 "every verb is idempotent against DURABLE state" |
+| `enable-symmetric`'s window law | A non-empty replay window REFUSES (typed `WindowNotEmpty`, the remedy named: mount and unmount cleanly); the verb never replays. The ring is zeroed end to end rather than re-based byte for byte: positions are logical and the symmetric geometry maps them to other pages, so kept bytes would be phantom chain links | charter §5.9's recovery belongs to the mount path; §5.5 "every carved ring extent is ZEROED before a page names it" |

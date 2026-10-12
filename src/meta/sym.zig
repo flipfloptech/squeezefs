@@ -25,6 +25,8 @@ pub const region = @import("sym/region.zig");
 pub const extent_grant = @import("sym/extent_grant.zig");
 pub const manager = @import("sym/manager.zig");
 pub const join = @import("sym/join.zig");
+pub const enable_symmetric = @import("sym/enable_symmetric.zig");
+pub const enable_symmetric_bind = if (builtin.os.tag == .linux) @import("sym/enable_symmetric_bind.zig") else struct {};
 pub const slots = @import("sym/slots.zig");
 pub const bind = if (builtin.os.tag == .linux) @import("sym/bind.zig") else struct {};
 pub const joined = if (builtin.os.tag == .linux) @import("sym/joined.zig") else struct {};
@@ -92,6 +94,8 @@ test {
     _ = extent_grant;
     _ = manager;
     _ = join;
+    _ = enable_symmetric;
+    if (builtin.os.tag == .linux) _ = enable_symmetric_bind;
     _ = slots;
     if (builtin.os.tag == .linux) _ = bind;
     if (builtin.os.tag == .linux) _ = wire_plane;

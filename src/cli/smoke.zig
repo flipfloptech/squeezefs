@@ -1808,6 +1808,153 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
 }
 
 // ---------------------------------------------------------------------------
+// `volume enable-symmetric` (charter §5.4, §8): the flat class converted in
+// place, then the ordinary symmetric posture over it.
+// ---------------------------------------------------------------------------
+
+/// The flat tree the conversion must carry over: 4 directories × 50 files.
+const convert_dirs: usize = 4;
+const convert_files_per_dir: usize = 50;
+
+fn convertTreeScript(gpa: std.mem.Allocator) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try w.writer.print("for d in $(seq 0 {d}); do mkdir f$d; for i in $(seq 0 {d}); do printf 'f%s-%s\\n' $d $i > f$d/n$i; done; done; printf 'inline\\n' > top; find . -path ./.stats -prune -o -type f -print | wc -l", .{ convert_dirs - 1, convert_files_per_dir - 1 });
+    return w.toOwnedSlice();
+}
+
+fn convertVerifyScript(gpa: std.mem.Allocator) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try w.writer.print("for d in $(seq 0 {d}); do for i in $(seq 0 {d}); do test \"$(cat f$d/n$i)\" = \"f$d-$i\"; done; done; cat top; find . -path ./.stats -prune -o -type f -print | wc -l", .{ convert_dirs - 1, convert_files_per_dir - 1 });
+    return w.toOwnedSlice();
+}
+
+test "smoke: `volume enable-symmetric` — format --single-writer (meta + 2 data, a cache path) → mount, a tree of 201 files, the verb REFUSES the mounted volume (exit 1, MOUNTED) → clean umount → the verb converts (the link claimed, the ring re-based, the stamp) → a second run refuses (already symmetric) → mount A: the MANAGER posture (manager_lease held, symmetric_meta 1, appenders 1 page mgr), every file intact → B JOINS as a second process (appender 1), creates in its own slots, A reads B's files under tokens → umount B, umount A → `fsck --offline --scrub` 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSetWith(true, &.{"--single-writer"});
+    // The flat mount and its tree.
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const script = try convertTreeScript(gpa);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("201\n", out);
+        const tail = try rig.stats();
+        defer gpa.free(tail);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"manager_lease\":\"solo\"") != null);
+    }
+    // The verb against the MOUNTED volume: the flock refuses, nothing written.
+    {
+        const r = try rig.squeezefs(&.{ "volume", "enable-symmetric", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "MOUNTED") != null);
+        std.debug.print("\nsmoke: enable-symmetric on the mounted volume: {s}", .{r.stderr});
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // The conversion, then its idempotent refusal.
+    {
+        const r = try rig.squeezefs(&.{ "volume", "enable-symmetric", rig.meta_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nenable-symmetric: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "SYMMETRIC_PLANE enabled") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "1 member(s) converted, 0 already symmetric") != null);
+        std.debug.print("smoke: {s}", .{r.stdout});
+    }
+    {
+        const r = try rig.squeezefs(&.{ "volume", "enable-symmetric", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "already carries SYMMETRIC_PLANE") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "0 member(s) converted, 1 already symmetric") != null);
+    }
+    // `appenders` offline: appender 0's Free page on the converted slots.
+    {
+        const r = try rig.squeezefs(&.{ "appenders", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "1 appender page(s)") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "free") != null);
+    }
+    // Mount A: the symmetric manager; the tree intact; the clean-unmount
+    // verdict on the re-based ring.
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    const ready = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark..ready], ", clean unmount") != null);
+        try testing.expect(std.mem.indexOf(u8, text[mark..ready], "appender 0 Live as the manager (term 1") != null);
+        const script = try convertVerifyScript(gpa);
+        defer gpa.free(script);
+        const out = try rig.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("inline\n201\n", out);
+        const tail = try rig.stats();
+        defer gpa.free(tail);
+        try testing.expect(std.mem.indexOf(u8, tail, "\"manager_lease\":\"held\"") != null);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tail, "\"symmetric_meta\":"));
+        try testing.expect(std.mem.indexOf(u8, tail, "\"wire_listener_up\":1") != null);
+    }
+    // B joins over the wire and writes into its own slots; A reads them.
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+        const out = try b.onMount("mkdir bj && for i in $(seq 0 99); do printf 'bj-%s\\n' $i > bj/f$i; done; ls bj | wc -l");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("100\n", out);
+        const from_a = try rig.onMount("ls bj | wc -l; cat bj/f42; cat f2/n7");
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings("100\nbj-42\nf2-7\n", from_a);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"slot_lease_conflicts\":"));
+        try testing.expect((numberAfter(tb, "\"dlm_token_grants\":") orelse 0) > 0);
+        try expectMustStayZero(tb);
+        const r = try rig.squeezefs(&.{ "appenders", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "2 appender page(s)") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "mgr") != null);
+        std.debug.print("smoke: enable-symmetric: B joined the converted volume — token grants on B {d}, rotor mints {d}\n", .{ numberAfter(tb, "\"dlm_token_grants\":") orelse 0, numberAfter(tb, "\"rotor_mints\":") orelse 0 });
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"membership_members\":"));
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    {
+        const after = try rig.onMount("ls bj | wc -l; cat bj/f42");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("100\nbj-42\n", after);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the conversion and the two-daemon pass");
+}
+
+// ---------------------------------------------------------------------------
 // THE KILL ROWS (charter §5.5 "Death and recovery", "PARK-AND-RECLAIM",
 // §8 `appender clear`): two daemons over real TCP, `kill -9` of either.
 // ---------------------------------------------------------------------------

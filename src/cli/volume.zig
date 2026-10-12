@@ -1,11 +1,15 @@
 //! `squeezefs volume {list, add-meta, remove-meta, repair-set,
-//! migrate-meta-slot}` (charter §8; §5.4; `docs/porting/dynamic_routing.md`
-//! §3, §4): the metadata set's membership verbs over the `sqmeta://` URI.
-//! Linux only.
+//! enable-symmetric, migrate-meta-slot}` (charter §8; §5.4; `docs/porting/
+//! dynamic_routing.md` §3, §4): the metadata set's membership verbs over
+//! the `sqmeta://` URI. Linux only.
 //!
 //! `list` is a probe (never blocked by a live mount); `add-meta`,
 //! `remove-meta` and `repair-set` are OFFLINE (every member's door; a live
-//! writer refuses by name) and run `meta/routing/offline.zig`. `migrate-
+//! writer refuses by name) and run `meta/routing/offline.zig`;
+//! `enable-symmetric` is OFFLINE too (`meta/sym/enable_symmetric_bind.zig`:
+//! the writer door held, every member of the set converted in URI order,
+//! a member already converted skipped — the re-run after a crash converts
+//! the rest). `migrate-
 //! meta-slot` runs the ONLINE engine (`meta/routing/migrate.zig`: the tree
 //! copy, the tee, the gate, the target-first flip) over a set this verb
 //! opens exclusively — the live-mount leg (the engine beside a serving
@@ -44,6 +48,7 @@ comptime {
 
 const offline = routing.offline;
 const migrate = routing.migrate;
+const enable_bind = @import("../meta/sym.zig").enable_symmetric_bind;
 
 pub fn run(p: cli.Process, v: args.Volume) u8 {
     const meta_uri = switch (v) {
@@ -86,6 +91,7 @@ pub fn run(p: cli.Process, v: args.Volume) u8 {
         .add_meta => |a| withExecutor(p, facts, budget_bytes, AddCtx{ .p = p, .opts = opts, .paths = meta.paths, .device = a.device, .take = a.take }, AddCtx.run),
         .remove_meta => |r| withExecutor(p, facts, budget_bytes, RemoveCtx{ .p = p, .opts = opts, .paths = meta.paths, .victim = r.victim }, RemoveCtx.run),
         .repair_set => withExecutor(p, facts, budget_bytes, RepairCtx{ .p = p, .opts = opts, .paths = meta.paths }, RepairCtx.run),
+        .enable_symmetric => withExecutor(p, facts, budget_bytes, EnableSymmetricCtx{ .p = p, .opts = opts, .paths = meta.paths }, EnableSymmetricCtx.run),
         .migrate_meta_slot => |m| withExecutor(p, facts, budget_bytes, MigrateCtx{ .p = p, .opts = opts, .paths = meta.paths, .slot = m.slot, .target = m.target }, MigrateCtx.run),
         .add_data => |a| blk: {
             var body: DataBody = .{ .p = p, .verb = .{ .add = .{ .device = a.device, .no_rebalance = a.no_rebalance } } };
@@ -364,6 +370,54 @@ const RepairCtx = struct {
         self.p.stdout.print("volume repair-set: {d} member(s) re-stamped{s}\n", .{ r.restamped, if (r.inferred) " (one inferred)" else "" }) catch {};
         self.p.stdout.flush() catch {};
         return cli.exit_ok;
+    }
+};
+
+/// `volume enable-symmetric`: every member through the device binding;
+/// a member already carrying the plane is skipped (a crashed run's
+/// resume); any other refusal stops the walk, named.
+const EnableSymmetricCtx = struct {
+    p: cli.Process,
+    opts: offline.Options,
+    paths: []const []const u8,
+
+    fn run(self: *EnableSymmetricCtx, io: Io) u8 {
+        const p = self.p;
+        var converted: usize = 0;
+        var skipped: usize = 0;
+        for (self.paths) |path| {
+            var diag: enable_bind.Refusal = undefined;
+            const out = enable_bind.enableSymmetric(p.gpa, io, path, .{ .env = self.opts.env, .pool = self.opts.pool }, &diag) catch |e| switch (e) {
+                error.AlreadySymmetric => {
+                    p.stdout.print("volume enable-symmetric: {s}: ", .{path}) catch {};
+                    diag.write(p.stdout) catch {};
+                    p.stdout.writeAll(" (skipped)\n") catch {};
+                    skipped += 1;
+                    continue;
+                },
+                error.Mounted, error.WindowNotEmpty, error.JournalTooSmall, error.NoFreeExtent, error.Corrupt => {
+                    p.stderr.print("squeezefs volume enable-symmetric: {s}: refused: ", .{path}) catch {};
+                    diag.write(p.stderr) catch {};
+                    p.stderr.writeAll("\n") catch {};
+                    p.stderr.flush() catch {};
+                    p.stdout.flush() catch {};
+                    return cli.exit_failed;
+                },
+                error.DeviceRefused, error.NotFormatted, error.Io, error.OutOfMemory => {
+                    p.stderr.print("squeezefs volume enable-symmetric: {s}: {s}\n", .{ path, @errorName(e) }) catch {};
+                    p.stderr.flush() catch {};
+                    p.stdout.flush() catch {};
+                    return cli.exit_failed;
+                },
+            };
+            p.stdout.print("volume enable-symmetric: {s}: SYMMETRIC_PLANE enabled — appender directory at 0x{x} ({s}), ring proper {d} B of the {d} B journal{s}\n", .{ path, out.link.start, if (out.resumed) "a crashed run's link resumed" else "claimed", out.ring_bytes, out.journal_len, if (out.ledger_seq) |_| ", the ledger restated at the claim's generation" else "" }) catch {};
+            converted += 1;
+        }
+        p.stdout.print("volume enable-symmetric: {d} member(s) converted, {d} already symmetric. The next `mount` is the manager; later RW mounts join it over the wire.\n", .{ converted, skipped }) catch {};
+        p.stdout.flush() catch {};
+        // Nothing to do on a set that was symmetric throughout IS the
+        // already-symmetric refusal, loud.
+        return if (converted == 0) cli.exit_failed else cli.exit_ok;
     }
 };
 

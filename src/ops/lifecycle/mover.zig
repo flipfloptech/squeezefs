@@ -181,7 +181,7 @@ fn moveAfterPin(seam: Seam, gpa: Allocator, task: Task, pick: DestPick, pinned_p
     const image = try gpa.alloc(u8, chunk);
     defer gpa.free(image);
     const n = try vt.readImage(ctx, src_vol, src_idx, image);
-    const src_hash = checksum.xxh3(image[0..n]);
+    const src_hash = checksum.hash64(image[0..n]);
     stats.evacuate_inflight_bytes.add(n);
     defer stats.evacuate_inflight_bytes.sub(n);
     try vt.kill(ctx, .after_copy);
@@ -198,7 +198,7 @@ fn moveAfterPin(seam: Seam, gpa: Allocator, task: Task, pick: DestPick, pinned_p
         const back = try gpa.alloc(u8, chunk);
         defer gpa.free(back);
         const m = vt.readBack(ctx, dst, back) catch break :blk false;
-        if (m != n or checksum.xxh3(back[0..m]) != src_hash) {
+        if (m != n or checksum.hash64(back[0..m]) != src_hash) {
             log.err("mover: vol {x} block {d} → vol {x} block {d}: the verify-read mismatched the source image — destination freed, source untouched", .{ src_vol, src_idx, dst.vol_tag, dst.idx });
             break :blk false;
         }

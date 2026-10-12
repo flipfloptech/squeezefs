@@ -1458,7 +1458,7 @@ pub const PublishArm = union(enum) {
 pub const Publish = struct {
     /// The LOCAL key ino.
     ino: u64,
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     /// The layout xattr's chain slot (the caller resolved it).
     coll_seq: u8 = 0,
     /// The layout being replaced (its named references are diffed against
@@ -1503,7 +1503,7 @@ pub fn publishLayout(t: *tx.KvTx, p: Publish, refs: RefsSeam, geo: Geometry) Pub
         }
         if (!covered) return error.ProofMissing;
     }
-    const xk = key.xattrKey(p.ino, key.xattrNameHash56(LAYOUT_XATTR_NAME, p.hash_seed), p.coll_seq);
+    const xk = key.xattrKey(p.ino, key.xattrNameHash56(LAYOUT_XATTR_NAME, p.name_key), p.coll_seq);
     const enc_len = (XattrLayout{ .layout = p.layout }).encodedLen();
     // The record value staged ONCE: the xattr envelope + the layout bytes
     // are built straight into the tx arena.
@@ -2048,19 +2048,19 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
     const gpa = testing.allocator;
     var refs: TestRefs = .{};
     defer refs.deinit();
-    const seed: u64 = 0x5EED;
+    const seed: key.NameKey = .init(0x5EED);
     const ino: u64 = 42;
     const chunk = tgeo.chunk;
     // A fresh staged file: no refs.
     {
         var t = tx.KvTx.init(gpa, @src());
         defer t.deinit();
-        try publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = null, .layout = Layout.staged(100, fid(1), null), .proofs = &.{} }, refs.seam(), tgeo);
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = null, .layout = Layout.staged(100, fid(1), null), .proofs = &.{} }, refs.seam(), tgeo);
         try testing.expectEqual(@as(usize, 1), t.staged.items.len);
         try testing.expectEqual(key.TREE_XATTRS, t.staged.items[0].tree_id);
         const xk = try key.XattrKey.decode(t.staged.items[0].key);
         try testing.expectEqual(ino, xk.ino());
-        try testing.expectEqual(key.xattrNameHash56(LAYOUT_XATTR_NAME, seed), xk.hash56());
+        try testing.expectEqual(key.xattrNameHash56(LAYOUT_XATTR_NAME, &seed), xk.hash56());
         const l = try XattrLayout.decode(t.staged.items[0].value, tgeo);
         try testing.expectEqual(Kind.staged, l.kind);
         try testing.expectEqual(@as(usize, 0), refs.adds.items.len);
@@ -2071,13 +2071,13 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
     {
         var t = tx.KvTx.init(gpa, @src());
         defer t.deinit();
-        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = Layout.staged(100, fid(1), null), .layout = pk, .proofs = &.{} }, refs.seam(), tgeo));
+        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = Layout.staged(100, fid(1), null), .layout = pk, .proofs = &.{} }, refs.seam(), tgeo));
         // A proof for the wrong window is no proof.
         const wrong: DmaProof = .{ .vol_tag = 0x11, .offset = 3 * chunk, .len = 8192, .completed_ns = 1 };
-        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = Layout.staged(100, fid(1), null), .layout = pk, .proofs = &.{wrong} }, refs.seam(), tgeo));
+        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = Layout.staged(100, fid(1), null), .layout = pk, .proofs = &.{wrong} }, refs.seam(), tgeo));
         const proof: DmaProof = .{ .vol_tag = 0x11, .offset = 3 * chunk + 8192, .len = 4096, .completed_ns = 1 };
         try testing.expect(proof.covers(tenant, chunk));
-        try publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = Layout.staged(100, fid(1), null), .layout = pk, .proofs = &.{proof} }, refs.seam(), tgeo);
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = Layout.staged(100, fid(1), null), .layout = pk, .proofs = &.{proof} }, refs.seam(), tgeo);
         try testing.expectEqual(@as(usize, 1), refs.adds.items.len);
         try testing.expectEqual(RefOp{ .vol_tag = 0x11, .block_idx = 3, .owner_ino = ino, .block_index = 0 }, refs.adds.items[0]);
         try testing.expectEqual(@as(usize, 0), refs.releases.items.len);
@@ -2087,7 +2087,7 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
         var t = tx.KvTx.init(gpa, @src());
         defer t.deinit();
         const n = refs.adds.items.len;
-        try publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = pk, .layout = Layout.packedTenant(50, fid(1), tenant.clip(50)), .proofs = &.{} }, refs.seam(), tgeo);
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = pk, .layout = Layout.packedTenant(50, fid(1), tenant.clip(50)), .proofs = &.{} }, refs.seam(), tgeo);
         try testing.expectEqual(n, refs.adds.items.len);
         try testing.expectEqual(@as(usize, 0), refs.releases.items.len);
         try testing.expectEqual(@as(usize, 1), t.staged.items.len);
@@ -2106,7 +2106,7 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
             .{ .vol_tag = 0x11, .offset = 7 * chunk, .len = chunk, .completed_ns = 2 },
             .{ .vol_tag = 0x22, .offset = 2 * chunk, .len = chunk, .completed_ns = 2 },
         };
-        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = pk, .layout = striped, .proofs = proofs[0..1] }, refs.seam(), tgeo));
+        try testing.expectError(error.ProofMissing, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = pk, .layout = striped, .proofs = proofs[0..1] }, refs.seam(), tgeo));
         // A whole-block DMA is the complete payload or image by construction
         // (a transformed image is self-delimiting; a passthrough payload is
         // bounded by the layout's size), so a proof from the slot's start of
@@ -2120,25 +2120,26 @@ test "publishLayout stages ONE xattr Put of the record and the ±ref diff in the
         // A tenant's proof still has to cover its whole slot.
         try testing.expect(!(DmaProof{ .vol_tag = 0x11, .offset = 3 * chunk + 8192, .len = 2048, .completed_ns = 1 }).covers(tenant, chunk));
         refs.adds.clearRetainingCapacity();
-        try publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = pk, .layout = striped, .proofs = &.{ proofs[0], short_image } }, refs.seam(), tgeo);
+        try publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = pk, .layout = striped, .proofs = &.{ proofs[0], short_image } }, refs.seam(), tgeo);
         try testing.expectEqual(@as(usize, 2), refs.adds.items.len);
         try testing.expectEqual(@as(usize, 1), refs.releases.items.len);
         try testing.expectEqual(RefOp{ .vol_tag = 0x11, .block_idx = 3, .owner_ino = ino, .block_index = 0 }, refs.releases.items[0]);
         // Striped is terminal.
-        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = striped, .layout = Layout.inlineData(1, "x"), .proofs = &.{} }, refs.seam(), tgeo));
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = striped, .layout = Layout.inlineData(1, "x"), .proofs = &.{} }, refs.seam(), tgeo));
         // A fresh file cannot be packed.
-        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = null, .layout = pk, .proofs = &.{} }, refs.seam(), tgeo));
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = null, .layout = pk, .proofs = &.{} }, refs.seam(), tgeo));
         // An inadmissible layout refuses before anything is staged.
         var bad = Layout.inlineData(1, "x");
         bad.flags = F_MAP_GEN;
         const staged_before = t.staged.items.len;
-        try testing.expectError(error.Corrupt, publishLayout(&t, .{ .ino = ino, .hash_seed = seed, .prev = null, .layout = bad, .proofs = &.{} }, refs.seam(), tgeo));
+        try testing.expectError(error.Corrupt, publishLayout(&t, .{ .ino = ino, .name_key = &seed, .prev = null, .layout = bad, .proofs = &.{} }, refs.seam(), tgeo));
         try testing.expectEqual(staged_before, t.staged.items.len);
     }
 }
 
 test "the flip to the block-map tree releases NOTHING (the diff arm would release every moved entry — the port hazard); a kvmap head never regresses to an inline map; a kvmap → kvmap head Put stages no ref op; the flip arm refuses any other shape" {
     const gpa = testing.allocator;
+    const one_key: key.NameKey = .init(1);
     var refs: TestRefs = .{};
     defer refs.deinit();
     const chunk = tgeo.chunk;
@@ -2154,7 +2155,7 @@ test "the flip to the block-map tree releases NOTHING (the diff arm would releas
     {
         var t = tx.KvTx.init(gpa, @src());
         defer t.deinit();
-        try publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = inline_map, .layout = head, .proofs = &.{} }, refs.seam(), tgeo);
+        try publishLayout(&t, .{ .ino = 9, .name_key = &one_key, .prev = inline_map, .layout = head, .proofs = &.{} }, refs.seam(), tgeo);
         try testing.expectEqual(@as(usize, 3), refs.releases.items.len);
         refs.releases.clearRetainingCapacity();
     }
@@ -2162,7 +2163,7 @@ test "the flip to the block-map tree releases NOTHING (the diff arm would releas
     {
         var t = tx.KvTx.init(gpa, @src());
         defer t.deinit();
-        try publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = inline_map, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 3 } } }, refs.seam(), tgeo);
+        try publishLayout(&t, .{ .ino = 9, .name_key = &one_key, .prev = inline_map, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 3 } } }, refs.seam(), tgeo);
         try testing.expectEqual(@as(usize, 0), refs.releases.items.len);
         try testing.expectEqual(@as(usize, 0), refs.adds.items.len);
         try testing.expectEqual(@as(usize, 1), t.staged.items.len);
@@ -2172,8 +2173,8 @@ test "the flip to the block-map tree releases NOTHING (the diff arm would releas
     {
         var t = tx.KvTx.init(gpa, @src());
         defer t.deinit();
-        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = head, .layout = inline_map, .proofs = &.{} }, refs.seam(), tgeo));
-        try publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = head, .layout = Layout.stripedKvmap(1 * chunk, 1, 1), .proofs = &.{} }, refs.seam(), tgeo);
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .name_key = &one_key, .prev = head, .layout = inline_map, .proofs = &.{} }, refs.seam(), tgeo));
+        try publishLayout(&t, .{ .ino = 9, .name_key = &one_key, .prev = head, .layout = Layout.stripedKvmap(1 * chunk, 1, 1), .proofs = &.{} }, refs.seam(), tgeo);
         try testing.expectEqual(@as(usize, 0), refs.releases.items.len + refs.adds.items.len);
         try testing.expectEqual(@as(usize, 1), t.staged.items.len);
     }
@@ -2181,9 +2182,9 @@ test "the flip to the block-map tree releases NOTHING (the diff arm would releas
     {
         var t = tx.KvTx.init(gpa, @src());
         defer t.deinit();
-        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = null, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 0 } } }, refs.seam(), tgeo));
-        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = head, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 0 } } }, refs.seam(), tgeo));
-        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .hash_seed = 1, .prev = inline_map, .layout = Layout.stripedInline(3 * chunk, entries), .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 3 } } }, refs.seam(), tgeo));
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .name_key = &one_key, .prev = null, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 0 } } }, refs.seam(), tgeo));
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .name_key = &one_key, .prev = head, .layout = head, .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 0 } } }, refs.seam(), tgeo));
+        try testing.expectError(error.InvalidTransition, publishLayout(&t, .{ .ino = 9, .name_key = &one_key, .prev = inline_map, .layout = Layout.stripedInline(3 * chunk, entries), .proofs = &.{}, .arm = .{ .flip_to_kvmap = .{ .moved = 3 } } }, refs.seam(), tgeo));
     }
     try testing.expect(validMapTransition(null, head));
     try testing.expect(validMapTransition(inline_map, head));

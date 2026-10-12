@@ -12,7 +12,7 @@
 //! volume_len (the tail copy's self-location), vol_tag, set_uuid,
 //! device_uuid, features_incompat (bit 0 = framed images on a transformed
 //! volume; unknown ⇒ refuse loud),
-//! sb_generation, reserved, xxh3}`.
+//! sb_generation, reserved, hash64}`.
 //!
 //! `format` per data volume: zero chunk 0 and the LAST chunk (both are
 //! RESERVED from the allocator and both are where partition tables and
@@ -44,7 +44,10 @@ const Allocator = std.mem.Allocator;
 /// One O_DIRECT sector: the identity's durable unit.
 pub const sector_len: usize = 4096;
 pub const magic_value = "SQZDATLV";
-pub const version_v1: u16 = 1;
+/// v2 = v1's layout with the sector checksum sqzhash128's low 64 bits
+/// instead of xxh3-64 (decision 0003 §M, 0002 row 480): a v1 image is
+/// refused by its version — reformat — before any checksum check.
+pub const version_v2: u16 = 2;
 /// A transformed volume's block images are FRAMED (`transform.FRAME_VERSION`
 /// 2: a header page + 64 KiB frames each sealed alone; decision 0003 §K7):
 /// a binary that knows only one-frame images refuses this bit loud instead
@@ -83,7 +86,7 @@ pub const DataSuperblockWire = extern struct {
     sb_generation_le: [8]u8,
     /// Must be all 0.
     reserved: [32]u8,
-    /// xxh3 over the 4096 B sector with this field zeroed.
+    /// hash64 over the 4096 B sector with this field zeroed.
     checksum_le: [8]u8,
 };
 
@@ -150,7 +153,7 @@ pub const DataSuperblock = struct {
         @memset(out, 0);
         var w: DataSuperblockWire = undefined;
         w.magic = magic_value.*;
-        std.mem.writeInt(u16, &w.version_le, version_v1, .little);
+        std.mem.writeInt(u16, &w.version_le, version_v2, .little);
         std.mem.writeInt(u16, &w.reserved0_le, 0, .little);
         std.mem.writeInt(u32, &w.block_size_le, self.block_size, .little);
         std.mem.writeInt(u32, &w.chunk_size_le, self.chunk_size, .little);
@@ -174,7 +177,7 @@ pub const DataSuperblock = struct {
         if (buf.len != sector_len) return refuse(diag, .{ .bad_length = buf.len });
         if (!std.mem.eql(u8, buf[0..8], magic_value)) return refuse(diag, .bad_magic);
         const version = std.mem.readInt(u16, buf[off_version..][0..2], .little);
-        if (version != version_v1) return refuse(diag, .{ .wrong_version = version });
+        if (version != version_v2) return refuse(diag, .{ .wrong_version = version });
         if (!checksum.verify(buf, off_checksum)) return refuse(diag, .checksum_mismatch);
         const w = std.mem.bytesToValue(DataSuperblockWire, buf[0..fixed_len]);
         if (std.mem.readInt(u16, &w.reserved0_le, .little) != 0 or !std.mem.allEqual(u8, &w.reserved1, 0) or !std.mem.allEqual(u8, &w.reserved, 0) or !std.mem.allEqual(u8, buf[fixed_len..], 0)) {
@@ -233,7 +236,7 @@ pub const Refusal = union(enum) {
         switch (self) {
             .bad_length => |n| try w.print("data superblock sector must be {d} bytes, got {d}", .{ sector_len, n }),
             .bad_magic => try w.writeAll("bad data superblock magic (corrupted or foreign volume)"),
-            .wrong_version => |v| try w.print("data superblock version {d} is not {d} — upgrade squeezefs", .{ v, version_v1 }),
+            .wrong_version => |v| try w.print("data superblock version {d} is not {d} — a v1 volume (xxh3-64 checksums) needs a reformat (`squeezefs format`, destroys its contents); a later version needs a newer squeezefs", .{ v, version_v2 }),
             .checksum_mismatch => try w.writeAll("data superblock checksum mismatch — corrupted superblock"),
             .reserved_not_zero => try w.writeAll("data superblock reserved bytes are not zero (a writer this binary does not know, or corruption under a valid checksum)"),
             .bad_mode => try w.writeAll("data superblock names a compression or encryption mode this binary does not know — upgrade squeezefs"),
@@ -259,7 +262,7 @@ fn refuse(diag: ?*Refusal, r: Refusal) DecodeError {
 pub const VolumeFormat = union(enum) {
     /// All-zero magic: never formatted.
     blank,
-    v1: DataSuperblock,
+    v2: DataSuperblock,
 };
 
 pub fn classifySector0(sector: []const u8, diag: ?*Refusal) DecodeError!VolumeFormat {
@@ -267,7 +270,7 @@ pub fn classifySector0(sector: []const u8, diag: ?*Refusal) DecodeError!VolumeFo
     const magic = sector[0..8];
     if (std.mem.allEqual(u8, magic, 0)) return .blank;
     if (!std.mem.eql(u8, magic, magic_value)) return refuse(diag, .{ .invalid_magic = magic.* });
-    return .{ .v1 = try DataSuperblock.decodeSector(sector, diag) };
+    return .{ .v2 = try DataSuperblock.decodeSector(sector, diag) };
 }
 
 /// The generation stamped in an image (0 on anything shorter).
@@ -301,7 +304,7 @@ pub const Classified = struct { format: VolumeFormat, slot: Slot };
 
 /// The loader's choice (the meta superblock's law): a primary that
 /// classifies — Blank included — is authoritative; the tail is read only
-/// when the primary ERRORS and accepted iff it classifies v1 and its own
+/// when the primary ERRORS and accepted iff it classifies v2 and its own
 /// `volume_len` names the slot it came from; otherwise the primary's error
 /// stands.
 pub fn classifyImages(primary: []const u8, backup: ?[]const u8, device_len: u64, diag: ?*Refusal) DecodeError!Classified {
@@ -313,7 +316,7 @@ pub fn classifyImages(primary: []const u8, backup: ?[]const u8, device_len: u64,
     if (backup) |tail| {
         if (backupOffsetFor(device_len)) |off| {
             if (classifySector0(tail, null)) |fmt| {
-                if (fmt == .v1 and fmt.v1.backupOffset() == off) return .{ .format = fmt, .slot = .backup };
+                if (fmt == .v2 and fmt.v2.backupOffset() == off) return .{ .format = fmt, .slot = .backup };
             } else |_| {}
         }
     }
@@ -326,7 +329,7 @@ pub fn observation(classified: anyerror!Classified) set_config.Observation {
     const c = classified catch return .refused;
     return switch (c.format) {
         .blank => .blank,
-        .v1 => |sb| .{ .identity = sb.identity() },
+        .v2 => |sb| .{ .identity = sb.identity() },
     };
 }
 
@@ -605,7 +608,7 @@ test "decode refuses by class in order: length, magic, version, checksum, reserv
     try testing.expectError(error.VolumeTooSmall, DataSuperblock.decodeSector(&bad, &diag));
     const zero: [sector_len]u8 = @splat(0);
     try testing.expect((try classifySector0(&zero, &diag)) == .blank);
-    try testing.expect((try classifySector0(&img, &diag)) == .v1);
+    try testing.expect((try classifySector0(&img, &diag)) == .v2);
     try testing.expectError(error.BadLength, classifySector0(zero[0..4095], &diag));
     // The encoder refuses the same laws.
     var small = sb;
@@ -633,7 +636,7 @@ test "DUR-5: a classifying primary (Blank included) is authoritative; the tail s
     corrupt[50] ^= 1;
     const from_tail = try classifyImages(&corrupt, &tail, len, &diag);
     try testing.expectEqual(Slot.backup, from_tail.slot);
-    try testing.expectEqual(sb.vol_tag, from_tail.format.v1.vol_tag);
+    try testing.expectEqual(sb.vol_tag, from_tail.format.v2.vol_tag);
     try testing.expectError(error.ChecksumMismatch, classifyImages(&corrupt, &tail, len + 4096, &diag));
     try testing.expectError(error.ChecksumMismatch, classifyImages(&corrupt, null, len, &diag));
     try testing.expectError(error.ChecksumMismatch, classifyImages(&corrupt, &zero, len, &diag));
@@ -682,10 +685,10 @@ test "the format plan: zero chunk 0 (sector 0 first) and the last chunk, the tai
     plan.apply(image);
     const done = try classifyImages(image[0..4096], image[@intCast(sb.backupOffset())..][0..4096], sb.volume_len, &diag);
     try testing.expectEqual(Slot.primary, done.slot);
-    try testing.expectEqual(sb, done.format.v1);
+    try testing.expectEqual(sb, done.format.v2);
     // The slack past the last whole chunk and the data chunks are untouched.
     try testing.expect(std.mem.allEqual(u8, image[fixture_chunk .. 4 * fixture_chunk], 0xee));
-    try testing.expectEqual(@as(u64, 3), done.format.v1.capacityBlocks());
+    try testing.expectEqual(@as(u64, 3), done.format.v2.capacityBlocks());
 }
 
 fn sectorFuzz(_: void, smith: *std.testing.Smith) !void {
@@ -717,7 +720,7 @@ test "fuzz: the data superblock decoders are total on arbitrary bytes" {
     }
 }
 
-test "Linux: formatDataVolume on a file writes both copies and reads them back; open classifies v1; a blank file classifies Blank; a too-small file refuses; a reformat continues the generation" {
+test "Linux: formatDataVolume on a file writes both copies and reads them back; open classifies v2; a blank file classifies Blank; a too-small file refuses; a reformat continues the generation" {
     if (builtin.os.tag != .linux) return testkit.skip(@src(), .no_linux, "data_superblock: Linux only");
     const io = testing.io;
     const gpa = testing.allocator;
@@ -743,7 +746,7 @@ test "Linux: formatDataVolume on a file writes both copies and reads them back; 
     try linux_dev.format(gpa, path, sb, blank.next_generation);
     const opened = try linux_dev.open(gpa, path);
     try testing.expectEqual(Slot.primary, opened.classified.slot);
-    try testing.expectEqual(sb, opened.classified.format.v1);
+    try testing.expectEqual(sb, opened.classified.format.v2);
     try testing.expectEqual(@as(u64, 2), opened.next_generation);
     try testing.expectEqual(len, opened.volume_len);
     // A reformat continues the generation.

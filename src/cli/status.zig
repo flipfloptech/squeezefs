@@ -94,7 +94,7 @@ pub fn classify(gpa: std.mem.Allocator, env: *const std.process.Environ.Map, poo
             break :blk .{ .prior = .blank, .sb = null, .slot = classified.slot, .volume_len = volume_len };
         },
         .legacy => |v| .{ .prior = .{ .legacy = v }, .sb = null, .slot = classified.slot, .volume_len = volume_len },
-        .v4 => |sb| .{ .prior = .formatted, .sb = sb, .slot = classified.slot, .volume_len = volume_len },
+        .v5 => |sb| .{ .prior = .formatted, .sb = sb, .slot = classified.slot, .volume_len = volume_len },
     };
 }
 
@@ -320,7 +320,7 @@ pub fn readSetConfig(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
 pub fn writeReport(w: *Io.Writer, meta_uri: []const u8, snap: Snapshot, rec: ?ledger.LedgerRecord, cfg: ?SetConfigRead, census: []const VolCensus, mounted: bool) Io.Writer.Error!void {
     switch (snap.prior) {
         .blank => return w.print("{s}: not formatted (zeroed superblock) — run `squeezefs format` first\n", .{meta_uri}),
-        .legacy => |v| return w.print("{s}: a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required\n", .{ meta_uri, v }),
+        .legacy => |v| return w.print("{s}: a pre-v5 squeezefs format (version {d}), which this binary does not mount — reformat required\n", .{ meta_uri, v }),
         .refused => |reason| return w.print("{s}: superblock refused: {s}\n", .{ meta_uri, reason }),
         .foreign => |hit| return w.print("{s}: not formatted as SqueezeFS, but carries {f} — `squeezefs format` refuses it without --force\n", .{ meta_uri, hit }),
         .formatted => {},

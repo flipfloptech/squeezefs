@@ -26,7 +26,7 @@ pub const Extent = page.Extent;
 
 /// The header page: `"KVAD" ‖ version u16 ‖ reserved u16 ‖ pairs u32 ‖
 /// reserved u32 ‖ chain_index u32 ‖ reserved u32 ‖ next.start u64 ‖
-/// next.len u64 ‖ zero ‖ xxh3 @4088`.
+/// next.len u64 ‖ zero ‖ hash64 @4088`.
 pub const Header = struct {
     /// Pairs this link holds (`pairCount(node_size)`; written so a reader
     /// needs no node size to walk).
@@ -49,7 +49,7 @@ pub const Header = struct {
         std.mem.writeInt(u32, out[16..20], self.chain_index, .little);
         std.mem.writeInt(u64, out[24..32], self.next.start, .little);
         std.mem.writeInt(u64, out[32..40], self.next.len, .little);
-        std.mem.writeInt(u64, out[CHECKSUM_OFF..][0..8], checksum.xxh3(out[0..CHECKSUM_OFF]), .little);
+        std.mem.writeInt(u64, out[CHECKSUM_OFF..][0..8], checksum.hash64(out[0..CHECKSUM_OFF]), .little);
     }
 
     /// Total: length, magic, checksum, version, every reserved word and the
@@ -58,7 +58,7 @@ pub const Header = struct {
     pub fn decode(img: []const u8) error{Corrupt}!Header {
         if (img.len != PAGE_LEN) return error.Corrupt;
         if (!std.mem.eql(u8, img[0..4], MAGIC)) return error.Corrupt;
-        if (std.mem.readInt(u64, img[CHECKSUM_OFF..][0..8], .little) != checksum.xxh3(img[0..CHECKSUM_OFF])) return error.Corrupt;
+        if (std.mem.readInt(u64, img[CHECKSUM_OFF..][0..8], .little) != checksum.hash64(img[0..CHECKSUM_OFF])) return error.Corrupt;
         if (std.mem.readInt(u16, img[4..6], .little) != VERSION) return error.Corrupt;
         if (std.mem.readInt(u16, img[6..8], .little) != 0 or std.mem.readInt(u32, img[12..16], .little) != 0 or std.mem.readInt(u32, img[20..24], .little) != 0) return error.Corrupt;
         if (!std.mem.allEqual(u8, img[40..CHECKSUM_OFF], 0)) return error.Corrupt;
@@ -258,23 +258,23 @@ test "the KVAD header round-trips; pairs per extent derive from the node size (3
     try testing.expect(!f.hasNext() and f.chain_index == 0 and f.pairs == 7);
     var m = img;
     m[6] = 1;
-    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.xxh3(m[0..CHECKSUM_OFF]), .little);
+    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.hash64(m[0..CHECKSUM_OFF]), .little);
     try testing.expectError(error.Corrupt, Header.decode(&m));
     m = img;
     m[100] = 1;
-    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.xxh3(m[0..CHECKSUM_OFF]), .little);
+    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.hash64(m[0..CHECKSUM_OFF]), .little);
     try testing.expectError(error.Corrupt, Header.decode(&m));
     m = img;
     m[4] = 2;
-    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.xxh3(m[0..CHECKSUM_OFF]), .little);
+    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.hash64(m[0..CHECKSUM_OFF]), .little);
     try testing.expectError(error.Corrupt, Header.decode(&m));
     m = img;
     std.mem.writeInt(u32, m[8..12], 0, .little);
-    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.xxh3(m[0..CHECKSUM_OFF]), .little);
+    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.hash64(m[0..CHECKSUM_OFF]), .little);
     try testing.expectError(error.Corrupt, Header.decode(&m));
     m = img;
     std.mem.writeInt(u64, m[24..32], 5, .little); // next.start with len 0
-    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.xxh3(m[0..CHECKSUM_OFF]), .little);
+    std.mem.writeInt(u64, m[CHECKSUM_OFF..][0..8], checksum.hash64(m[0..CHECKSUM_OFF]), .little);
     try testing.expectError(error.Corrupt, Header.decode(&m));
     m = img;
     m[7] ^= 1; // torn
@@ -345,7 +345,7 @@ test "the chain walk: links in order with their indices enforced; a wrong index,
     try testing.expect(!taken.isFree() and taken.newest().?.appender_id == 1);
     // A foreign layout in a pair refuses the allocation read.
     std.mem.writeInt(u16, pimg[4..6], 9, .little);
-    std.mem.writeInt(u64, pimg[page.CHECKSUM_OFF..][0..8], checksum.xxh3(pimg[0..page.CHECKSUM_OFF]), .little);
+    std.mem.writeInt(u64, pimg[page.CHECKSUM_OFF..][0..8], checksum.hash64(pimg[0..page.CHECKSUM_OFF]), .little);
     @memcpy(image[@intCast(pairOffsets(link0, 0)[1] - heap.start)..][0..PAGE_LEN], &pimg);
     try testing.expectError(error.ForeignLayout, lowestFreePair(dev.reader(), links.items));
     // A cycle: link 1 points back at link 0 — the walk refuses at the bound
@@ -374,7 +374,7 @@ fn headerFuzz(_: void, smith: *std.testing.Smith) !void {
     _ = Header.decode(buf[0..len]) catch {};
     if (len >= PAGE_LEN) {
         const img = buf[0..PAGE_LEN];
-        std.mem.writeInt(u64, img[CHECKSUM_OFF..][0..8], checksum.xxh3(img[0..CHECKSUM_OFF]), .little);
+        std.mem.writeInt(u64, img[CHECKSUM_OFF..][0..8], checksum.hash64(img[0..CHECKSUM_OFF]), .little);
         if (Header.decode(img)) |h| {
             var re: [PAGE_LEN]u8 = undefined;
             h.encode(&re);

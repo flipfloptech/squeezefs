@@ -44,6 +44,7 @@ const counters = @import("../core/counters.zig");
 const clock = @import("../core/clock.zig");
 const derive = @import("../core/derive.zig");
 const json_scan = @import("../core/json_scan.zig");
+const checksum = @import("../core/checksum.zig");
 const extent_overlay = @import("../data/extent_overlay.zig");
 
 // ---------------------------------------------------------------------------
@@ -1004,7 +1005,151 @@ pub const engine = if (is_linux) struct {
     }
 } else struct {};
 
+// ---------------------------------------------------------------------------
+// The hash microbench (`--hash`; decision 0003 §M): the format's hash on
+// the format's shapes against the xxh3-64 reference column. CPU only and
+// portable — the evidence records it on both venues; the baseline rig
+// folds its `sqzhash128` rows into the `hash_*` groups.
+// ---------------------------------------------------------------------------
+
+pub const hash_bench = struct {
+    /// The format's shapes: a 16 B name, a 100 B record, a 4 KiB page, a
+    /// 256 KiB node (the default node size).
+    pub const sizes = [_]usize{ 16, 100, 4096, 262_144 };
+
+    pub const Algo = enum {
+        /// The reference column: the hash the format used before §M.
+        xxh3_64,
+        /// The format's hash under the comptime-expanded format key.
+        sqzhash128,
+        /// Its low 64 bits — the 8-byte field projection (the same work).
+        sqzhash64,
+
+        pub fn name(self: Algo) []const u8 {
+            return switch (self) {
+                .xxh3_64 => "xxh3-64",
+                .sqzhash128 => "sqzhash128",
+                .sqzhash64 => "sqzhash64",
+            };
+        }
+    };
+
+    pub const algos = [_]Algo{ .xxh3_64, .sqzhash128, .sqzhash64 };
+    pub const cell_count = sizes.len * algos.len;
+
+    /// A cell's span doubles its batch until it covers at least this long:
+    /// a 100 ns clock read is then under 0.001 % of the measurement, and a
+    /// 20 ms span rides above the scheduler's tick.
+    pub const MIN_SPAN_NS: u64 = 20 * std.time.ns_per_ms;
+    /// The first batch (doubled until the span holds).
+    pub const FIRST_BATCH: u64 = 256;
+    /// Picoseconds per nanosecond: `ps_per_op` keeps three decimals of ns
+    /// as an integer (no floats on a wire, the rows' law).
+    pub const PS_PER_NS: u64 = 1000;
+    /// Megabytes per gigabyte (decimal): the text row prints GB/s with three decimals.
+    pub const MB_PER_GB: u64 = 1000;
+
+    pub const Cell = struct {
+        algo: Algo,
+        size: usize,
+        ops: u64,
+        elapsed_ns: u64,
+
+        pub fn bytes(self: Cell) u64 {
+            return self.ops * self.size;
+        }
+
+        /// Picoseconds per hash (ns × 1000).
+        pub fn psPerOp(self: Cell) u64 {
+            if (self.ops == 0) return 0;
+            return @intCast((@as(u128, self.elapsed_ns) * PS_PER_NS) / self.ops);
+        }
+
+        /// Decimal megabytes per second (10^6 B/s; GB/s = this / 1000).
+        pub fn mbPerS(self: Cell) u64 {
+            if (self.elapsed_ns == 0) return 0;
+            return @intCast((@as(u128, self.bytes()) * std.time.ns_per_s) / self.elapsed_ns / 1_000_000);
+        }
+
+        /// One machine-parseable line: `pass` is `hash`, the shape rides in
+        /// `block`, the algorithm in `algo` (the baseline's fold keys on both).
+        pub fn writeJson(self: Cell, w: *Io.Writer) Io.Writer.Error!void {
+            try w.print("{{\"pass\":\"hash\",\"algo\":\"{s}\",\"block\":{d},\"access\":\"cpu\",\"ops\":{d},\"elapsed_ns\":{d},\"bytes\":{d},\"ps_per_op\":{d},\"mb_per_s\":{d}}}\n", .{ self.algo.name(), self.size, self.ops, self.elapsed_ns, self.bytes(), self.psPerOp(), self.mbPerS() });
+        }
+
+        pub fn writeText(self: Cell, w: *Io.Writer) Io.Writer.Error!void {
+            const ps = self.psPerOp();
+            try w.print("| hash {s:<11} | {d:>7} B | {d:>7}.{d:0>3} ns/op | {d:>7}.{d:0>3} GB/s | {d:>10} ops |\n", .{ self.algo.name(), self.size, ps / PS_PER_NS, ps % PS_PER_NS, self.mbPerS() / MB_PER_GB, self.mbPerS() % MB_PER_GB, self.ops });
+        }
+    };
+
+    fn hashOnce(comptime algo: Algo, input: []const u8) u64 {
+        return switch (algo) {
+            .xxh3_64 => std.hash.XxHash3.hash(0, input),
+            .sqzhash128 => blk: {
+                const h = checksum.hash128(input);
+                break :blk checksum.low64(h) ^ checksum.low64(h >> 64); // both halves folded: the whole 128-bit result stays live
+            },
+            .sqzhash64 => checksum.hash64(input),
+        };
+    }
+
+    /// `batch` hashes of `input`; the pointer clobber makes every iteration
+    /// re-read the input (no hoisting), the result sink keeps every hash.
+    /// The algorithm is comptime so no dispatch rides inside the loop.
+    fn batchNs(comptime algo: Algo, input: []const u8, batch: u64) u64 {
+        const t0 = clock.monotonicNs();
+        var i: u64 = 0;
+        while (i < batch) : (i += 1) {
+            std.mem.doNotOptimizeAway(input.ptr);
+            std.mem.doNotOptimizeAway(hashOnce(algo, input));
+        }
+        return clock.monotonicNs() -| t0;
+    }
+
+    fn measureAlgo(comptime algo: Algo, input: []const u8) Cell {
+        _ = batchNs(algo, input, FIRST_BATCH);
+        var batch: u64 = FIRST_BATCH;
+        while (true) : (batch *= 2) {
+            const ns = batchNs(algo, input, batch);
+            if (ns >= MIN_SPAN_NS) return .{ .algo = algo, .size = input.len, .ops = batch, .elapsed_ns = ns };
+        }
+    }
+
+    /// One cell: a warm-up batch, then batches doubling until the span holds.
+    pub fn measure(algo: Algo, input: []const u8) Cell {
+        return switch (algo) {
+            inline else => |a| measureAlgo(a, input),
+        };
+    }
+
+    /// Every cell in algorithm-major order over a fixed non-zero fill.
+    pub fn runAll(out: *[cell_count]Cell, buf: []u8) void {
+        std.debug.assert(buf.len >= sizes[sizes.len - 1]);
+        for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        var n: usize = 0;
+        for (algos) |algo| {
+            for (sizes) |size| {
+                out[n] = measure(algo, buf[0..size]);
+                n += 1;
+            }
+        }
+    }
+
+    pub fn run(p: cli.Process, json: bool) u8 {
+        const buf = p.gpa.alloc(u8, sizes[sizes.len - 1]) catch return cli.exit_failed;
+        defer p.gpa.free(buf);
+        var cells: [cell_count]Cell = undefined;
+        runAll(&cells, buf);
+        if (!json) p.stdout.print("instrument=squeezefs bench --hash {s} {s} profile={s}\n| algorithm        |    size |          ns/op |            GB/s |        ops |\n", .{ p.build.train, p.build.commit, p.build.profile }) catch {};
+        for (cells) |c| (if (json) c.writeJson(p.stdout) else c.writeText(p.stdout)) catch {};
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+};
+
 pub fn run(p: cli.Process, b: args.Bench) u8 {
+    if (b.hash) return hash_bench.run(p, b.json);
     if (!is_linux) {
         p.stderr.writeAll("squeezefs bench: Linux only (charter §1.2)\n") catch {};
         return cli.exit_failed;
@@ -1281,4 +1426,32 @@ fn statsTermsFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: the .stats term reader is total on arbitrary JSON-shaped text" {
     try fuzzkit.fuzz({}, statsTermsFuzz, .{ .corpus = &.{fuzzkit.slice("{\"fuse_ops\":12,\"put_obj\":-1,\"direct_device_true\":1e9}")} });
+}
+
+test "the hash microbench: the format's four shapes × three columns; a cell's ps/op and MB/s arithmetic; the JSON names pass=hash, the algo and the shape; every column hashes the same bytes to a deterministic value" {
+    try testing.expectEqual(@as(usize, 12), hash_bench.cell_count);
+    const c: hash_bench.Cell = .{ .algo = .sqzhash128, .size = 4096, .ops = 1_000_000, .elapsed_ns = 250_000_000 };
+    // 250 ns/op = 250,000 ps; 4096 B × 4 M/s = 16,384 MB/s.
+    try testing.expectEqual(@as(u64, 250_000), c.psPerOp());
+    try testing.expectEqual(@as(u64, 16_384), c.mbPerS());
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try c.writeJson(&out.writer);
+    try testing.expectEqualStrings("{\"pass\":\"hash\",\"algo\":\"sqzhash128\",\"block\":4096,\"access\":\"cpu\",\"ops\":1000000,\"elapsed_ns\":250000000,\"bytes\":4096000000,\"ps_per_op\":250000,\"mb_per_s\":16384}\n", out.written());
+    out.clearRetainingCapacity();
+    try c.writeText(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "250.000 ns/op") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "16.384 GB/s") != null);
+    var buf: [4096]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    // The facade's low 64 is what `sqzhash64` measures; `sqzhash128` folds both halves of the same hash.
+    try testing.expectEqual(checksum.hash64(&buf), hash_bench.hashOnce(.sqzhash64, &buf));
+    const h128 = checksum.hash128(&buf);
+    try testing.expectEqual(checksum.low64(h128) ^ checksum.low64(h128 >> 64), hash_bench.hashOnce(.sqzhash128, &buf));
+    try testing.expectEqual(std.hash.XxHash3.hash(0, &buf), hash_bench.hashOnce(.xxh3_64, &buf));
+    // A real (tiny) measurement: the batch doubles until the span holds.
+    const cell = hash_bench.measure(.sqzhash64, buf[0..16]);
+    try testing.expect(cell.elapsed_ns >= hash_bench.MIN_SPAN_NS);
+    try testing.expect(cell.ops >= hash_bench.FIRST_BATCH);
+    try testing.expect(cell.psPerOp() > 0);
 }

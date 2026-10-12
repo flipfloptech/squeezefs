@@ -343,7 +343,7 @@ pub const linux_dev = if (builtin.os.tag == .linux) struct {
         }
     };
 
-    /// One volume: both superblock copies classified (blank and pre-v4
+    /// One volume: both superblock copies classified (blank and pre-v5
     /// refuse by name), the newest valid ledger record (a ledger with no
     /// valid record observes as STAMPLESS — the repair's input, never a
     /// refusal here).
@@ -362,7 +362,7 @@ pub const linux_dev = if (builtin.os.tag == .linux) struct {
         const sb = switch (classified.format) {
             .blank => return error.NotFormatted,
             .legacy => return error.LegacyFormat,
-            .v4 => |s| s,
+            .v5 => |s| s,
         };
         const ledger_img = try dev.readRange(gpa, sb.root_ledger.start, @intCast(sb.root_ledger.len));
         defer gpa.free(ledger_img);

@@ -456,8 +456,8 @@ pub fn blockRange(vol_tag: u64, block_idx: u64) KeyRange {
 /// The durable identity of a data volume as 8 key bytes: `vol-` + exactly
 /// 16 hex digits decodes to that u64 verbatim (the tag IS the id — no hash,
 /// no collision argument); any other id (grandfathered device basenames)
-/// hashes with unseeded xxh3-64. A key component, so it must be identical on
-/// every mount forever: it derives from the id string alone.
+/// hashes with the format-keyed hash64. A key component, so it must be
+/// identical on every mount forever: it derives from the id string alone.
 pub fn volumeTag(volume_id: []const u8) u64 {
     if (std.mem.startsWith(u8, volume_id, "vol-")) {
         const hex = volume_id["vol-".len..];
@@ -465,7 +465,7 @@ pub fn volumeTag(volume_id: []const u8) u64 {
             if (parseHexU64Strict(hex)) |v| return v;
         }
     }
-    return checksum.xxh3(volume_id);
+    return checksum.hash64(volume_id);
 }
 
 /// Strict hex: ≥ 1 hex digits of either case after an optional leading `+`
@@ -763,18 +763,31 @@ pub fn sameKindSuccessor(key: []const u8) ?KeyBuf {
 }
 
 // ---------------------------------------------------------------------------
-// §1.6 Seeded name hashes — the per-volume `hash_seed` keys them so names
-// cannot be chosen off-line to collide.
+// §1.6 Keyed name hashes — the per-volume `hash_seed` keys them so names
+// cannot be chosen off-line to collide (decision 0003 §M).
 // ---------------------------------------------------------------------------
 
-/// `xxh3_64_with_seed(name, seed) >> 10`: the top 54 bits.
-pub fn dentryNameHash54(name: []const u8, hash_seed: u64) u64 {
-    return checksum.xxh3Seeded(hash_seed, name) >> 10;
+/// The per-volume NAME key: the superblock's `hash_seed` expanded ONCE — at
+/// mount, open or format, never per name (the expansion is 40 AES rounds;
+/// `checksum.keyFromSeed` is the widening rule) — and handed to every
+/// dentry/xattr hash by pointer. A distinct type from `checksum.Key` so the
+/// format key can never be passed where a volume's name key belongs.
+pub const NameKey = struct {
+    key: checksum.Key,
+
+    pub fn init(hash_seed: u64) NameKey {
+        return .{ .key = checksum.keyFromSeed(hash_seed) };
+    }
+};
+
+/// `hash64Keyed(name_key, name) >> 10`: the top 54 bits of the low 64.
+pub fn dentryNameHash54(name: []const u8, name_key: *const NameKey) u64 {
+    return checksum.hash64Keyed(&name_key.key, name) >> 10;
 }
 
-/// `xxh3_64_with_seed(name, seed) >> 8`: the top 56 bits.
-pub fn xattrNameHash56(name: []const u8, hash_seed: u64) u64 {
-    return checksum.xxh3Seeded(hash_seed, name) >> 8;
+/// `hash64Keyed(name_key, name) >> 8`: the top 56 bits of the low 64.
+pub fn xattrNameHash56(name: []const u8, name_key: *const NameKey) u64 {
+    return checksum.hash64Keyed(&name_key.key, name) >> 8;
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,18 +1065,18 @@ test "volume and block ranges are half-open and cover exactly their prefix" {
     try testing.expect(order(&max_key, last_block.hi.slice()) == .lt);
 }
 
-test "volume tag: vol-<16 hex> decodes verbatim; anything else hashes with unseeded xxh3" {
+test "volume tag: vol-<16 hex> decodes verbatim; anything else hashes with the format-keyed hash64" {
     try testing.expectEqual(@as(u64, 0x0123_4567_89AB_CDEF), volumeTag("vol-0123456789abcdef"));
-    try testing.expectEqual(checksum.xxh3("vol-0123456789abcde"), volumeTag("vol-0123456789abcde"));
-    try testing.expectEqual(checksum.xxh3("vol-0123456789abcdefg"), volumeTag("vol-0123456789abcdefg"));
-    try testing.expectEqual(checksum.xxh3("vol-zz23456789abcdef"), volumeTag("vol-zz23456789abcdef"));
-    try testing.expectEqual(checksum.xxh3("nvme0n1"), volumeTag("nvme0n1"));
+    try testing.expectEqual(checksum.hash64("vol-0123456789abcde"), volumeTag("vol-0123456789abcde"));
+    try testing.expectEqual(checksum.hash64("vol-0123456789abcdefg"), volumeTag("vol-0123456789abcdefg"));
+    try testing.expectEqual(checksum.hash64("vol-zz23456789abcdef"), volumeTag("vol-zz23456789abcdef"));
+    try testing.expectEqual(checksum.hash64("nvme0n1"), volumeTag("nvme0n1"));
     // Strict hex acceptance: either case; a leading `+`; never `_`
     // separators or whitespace.
     try testing.expectEqual(@as(u64, 0x0123_4567_89AB_CDEF), volumeTag("vol-0123456789ABCDEF"));
     try testing.expectEqual(@as(u64, 0x0_0123_4567_89AB_CDE), volumeTag("vol-+0123456789abcde"));
-    try testing.expectEqual(checksum.xxh3("vol-0123_456789abcde"), volumeTag("vol-0123_456789abcde"));
-    try testing.expectEqual(checksum.xxh3("vol- 123456789abcdef"), volumeTag("vol- 123456789abcdef"));
+    try testing.expectEqual(checksum.hash64("vol-0123_456789abcde"), volumeTag("vol-0123_456789abcde"));
+    try testing.expectEqual(checksum.hash64("vol- 123456789abcdef"), volumeTag("vol- 123456789abcdef"));
 }
 
 test "guest keyspace: (slot+1) << 40 | local, split inverts, natives are below 2^40" {
@@ -1243,20 +1256,27 @@ test "interior journal key is slot u32 BE ‖ separator; split refuses len ≤ 4
     _ = try splitInteriorJournalKey(&.{ 0, 0, 0, 1, 0xAB });
 }
 
-test "hash54/hash56 are the seeded xxh3's top bits; pinned against xxhash-rust vectors" {
-    // xxhash-rust: xxh3_64("") and xxh3_64_with_seed("hello", 42), ("user.layout", 42).
-    try testing.expectEqual(@as(u64, 0x2d06800538d394c2), checksum.xxh3(""));
-    try testing.expectEqual(@as(u64, 0xbafa072f07db7937), checksum.xxh3Seeded(42, "hello"));
-    try testing.expectEqual(@as(u64, 0x886617549b8fab20), checksum.xxh3Seeded(42, "user.layout"));
-    try testing.expectEqual(@as(u64, 0xbafa072f07db7937 >> 10), dentryNameHash54("hello", 42));
-    try testing.expectEqual(@as(u64, 0x886617549b8fab20 >> 8), xattrNameHash56("user.layout", 42));
-    try testing.expect(dentryNameHash54("hello", 1) != dentryNameHash54("hello", 2));
-    try testing.expect(xattrNameHash56("user.layout", 1) != xattrNameHash56("user.layout", 2));
+test "hash54/hash56 are the keyed hash64's top bits; pinned against the source implementation's vectors (the name key = the seed zero-extended)" {
+    // sqzhash128 under Key.init(42): low 64 of hash("hello") and hash("user.layout").
+    const k42: NameKey = .init(42);
+    try testing.expectEqual(@as(u64, 0x57efcfaac4954437), checksum.hash64Keyed(&k42.key, "hello"));
+    try testing.expectEqual(@as(u64, 0xe67f1d17ff5c7b1c), checksum.hash64Keyed(&k42.key, "user.layout"));
+    try testing.expectEqual(@as(u64, 0x57efcfaac4954437 >> 10), dentryNameHash54("hello", &k42));
+    try testing.expectEqual(@as(u64, 0xe67f1d17ff5c7b1c >> 8), xattrNameHash56("user.layout", &k42));
+    // The fixture seed (`bset.findvsa_fixture_seed`), pinned too.
+    const kf: NameKey = .init(0xF1D5_A000_0000_0004);
+    try testing.expectEqual(@as(u64, 0xa3f02b1f32b81a4f >> 10), dentryNameHash54("hello", &kf));
+    try testing.expectEqual(@as(u64, 0x6636c98f1c152250 >> 8), xattrNameHash56("user.layout", &kf));
+    const k1: NameKey = .init(1);
+    const k2: NameKey = .init(2);
+    try testing.expect(dentryNameHash54("hello", &k1) != dentryNameHash54("hello", &k2));
+    try testing.expect(xattrNameHash56("user.layout", &k1) != xattrNameHash56("user.layout", &k2));
+    const kfeed: NameKey = .init(0xFEED);
     var name: [32]u8 = undefined;
     for (0..4096) |i| {
         const n = try std.fmt.bufPrint(&name, "name-{d}", .{i});
-        try testing.expect(dentryNameHash54(n, 0xFEED) <= HASH54_MAX);
-        try testing.expect(xattrNameHash56(n, 0xFEED) <= HASH56_MAX);
+        try testing.expect(dentryNameHash54(n, &kfeed) <= HASH54_MAX);
+        try testing.expect(xattrNameHash56(n, &kfeed) <= HASH56_MAX);
     }
 }
 

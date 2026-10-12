@@ -77,7 +77,7 @@ const Allocator = std.mem.Allocator;
 
 /// The physical page-header length the pad law accounts for: a logical page
 /// start maps to the byte AFTER it. `{magic u32, lap u32, first_entry_off
-/// u16, reserved u16, appender_id u32, xxh3 u64}` (`journal.zig` asserts
+/// u16, reserved u16, appender_id u32, hash64 u64}` (`journal.zig` asserts
 /// equality).
 pub const PAGE_HDR_LEN: u64 = 24;
 

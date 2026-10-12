@@ -2568,7 +2568,7 @@ const Harness = struct {
     posture: heap_law.HeapFullPosture = .{},
     space_retry: heap_law.SpaceRetryHold = .{},
     cv: *Conveyor,
-    hash_seed: u64 = 0x5EED,
+    name_key: key.NameKey = .init(0x5EED),
     inos: inos_mod.InoWatermark,
     park_kicks: u64 = 0,
     threshold_kicks: u64 = 0,
@@ -2821,7 +2821,7 @@ const Harness = struct {
     fn stageCreate(h: *Harness, t: *tx.KvTx, name: []const u8) !u64 {
         const ino = h.inos.allocate();
         const parent_value: record.InodeValue = .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2 };
-        _ = try economy.stageCreate(t, .{ .hash_seed = h.hash_seed, .now = 1000, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = ino, .global_ino = ino });
+        _ = try economy.stageCreate(t, .{ .name_key = &h.name_key, .now = 1000, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = ino, .global_ino = ino });
         return ino;
     }
 
@@ -3404,7 +3404,7 @@ test "power cut after an acked coalesced commit loses it (never barriered); afte
     // No partial tx: the dentry of the lost create is absent too.
     var kvs: std.ArrayList(tree.KeyValue) = .empty;
     defer tree.deinitKeyValues(h.gpa, &kvs);
-    const range = tx.dentryChainRange(1, key.dentryNameHash54("acked-not-barriered", h.hash_seed));
+    const range = tx.dentryChainRange(1, key.dentryNameHash54("acked-not-barriered", &h.name_key));
     try r.treeOf(.native).range(h.gpa, &range.start, &range.end, 8, &kvs);
     try testing.expectEqual(@as(usize, 0), kvs.items.len);
 

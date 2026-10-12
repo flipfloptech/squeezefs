@@ -273,7 +273,7 @@ pub const VirtualFace = struct {
 
 pub fn assertStore(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "allocateIno", "allocatedInos", "hashSeed", "nodeSize", "space", "isFailed" }) |name| {
+        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "allocateIno", "allocatedInos", "nameKey", "nodeSize", "space", "isFailed" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Store: lacks `" ++ name ++ "`");
         }
     }
@@ -799,7 +799,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The live chain of `(parent, hash54(name))`: keys into `buf`, the
         /// matching dentry (by FULL name) if any.
         fn scanChain(self: *Self, parent: u64, name: []const u8, buf: *ChainBuf, kvs: *std.ArrayList(tree.KeyValue)) Error!?Found {
-            const r = tx.dentryChainRange(parent, key.dentryNameHash54(name, self.store.hashSeed()));
+            const r = tx.dentryChainRange(parent, key.dentryNameHash54(name, self.store.nameKey()));
             self.store.range(self.gpa, key.TREE_DENTRIES, &r.start, &r.end, 256, kvs) catch |e| return storeErr(e);
             var found: ?Found = null;
             buf.len = 0;
@@ -858,7 +858,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn findXattr(self: *Self, ino: u64, name: []const u8, occupied: *[256]u8, occupied_len: *usize) Error!?XattrHit {
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
-            const h = key.xattrNameHash56(name, self.store.hashSeed());
+            const h = key.xattrNameHash56(name, self.store.nameKey());
             const start = key.xattrKey(ino, h, 0);
             const end = key.xattrKey(ino, h, std.math.maxInt(u8));
             self.store.range(self.gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return storeErr(e);
@@ -897,7 +897,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var n: usize = 0;
             if (try self.findXattr(ino, name, &occ, &n)) |hit| return .{ .k = hit.k, .existing = hit.value };
             const coll = key.firstFreeCollSeq(occ[0..n]) orelse return error.NoSpaceLeft;
-            return .{ .k = key.xattrKey(ino, key.xattrNameHash56(name, self.store.hashSeed()), coll), .existing = null };
+            return .{ .k = key.xattrKey(ino, key.xattrNameHash56(name, self.store.nameKey()), coll), .existing = null };
         }
 
         fn stageXattrPut(self: *Self, t: *tx.KvTx, k: *const [key.XATTR_KEY_LEN]u8, name: []const u8, value: []const u8) Error!void {
@@ -1032,7 +1032,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// in `t`); a refused shape is a caller bug (every layout built
         /// here is admissible) and answers EIO.
         fn publish(self: *Self, t: *tx.KvTx, ino: u64, prev: ?LayoutRec, new: Layout, proofs: []const layout.DmaProof) Error!void {
-            layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.store.hashSeed(), .coll_seq = if (prev) |p| p.coll_seq else 0, .prev = if (prev) |p| p.layout else null, .layout = new, .proofs = proofs }, self.data.refsSeam(), self.geo) catch |e| return switch (e) {
+            layout.publishLayout(t, .{ .ino = ino, .name_key = self.store.nameKey(), .coll_seq = if (prev) |p| p.coll_seq else 0, .prev = if (prev) |p| p.layout else null, .layout = new, .proofs = proofs }, self.data.refsSeam(), self.geo) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.InputOutput,
             };
@@ -1709,13 +1709,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (try self.scanChain(parent, name, &chain, &kvs) != null) return error.PathAlreadyExists;
             const stamp = now();
             const out = if (child.target) |target|
-                economy.stageSymlink(t, .{ .hash_seed = self.store.hashSeed(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice() }) catch |e| return switch (e) {
+                economy.stageSymlink(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .uid = c.uid, .gid = c.gid, .local_ino = local, .global_ino = global, .target = target, .chain = chain.slice() }) catch |e| return switch (e) {
                     error.SymlinkTargetTooLong, error.NameTooLong => error.NameTooLong,
                     error.DentryChainOverflow => error.NoSpaceLeft,
                     error.OutOfMemory => error.OutOfMemory,
                 }
             else
-                economy.stageCreate(t, .{ .hash_seed = self.store.hashSeed(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice() }) catch |e| return switch (e) {
+                economy.stageCreate(t, .{ .name_key = self.store.nameKey(), .now = stamp, .parent = parent, .parent_value = pv, .name = name, .mode = child.mode, .uid = c.uid, .gid = c.gid, .rdev = child.rdev, .local_ino = local, .global_ino = global, .chain = chain.slice() }) catch |e| return switch (e) {
                     error.NameTooLong => error.NameTooLong,
                     error.DentryChainOverflow => error.NoSpaceLeft,
                     error.OutOfMemory => error.OutOfMemory,
@@ -1753,7 +1753,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 const t = try self.store.begin(@src());
                 var t_owned = true;
                 errdefer if (t_owned) self.store.abandon(t);
-                try self.stageXattrPut(t, &key.xattrKey(local, key.xattrNameHash56(economy.SYMLINK_XATTR, self.store.hashSeed()), 0), economy.SYMLINK_XATTR, target);
+                try self.stageXattrPut(t, &key.xattrKey(local, key.xattrNameHash56(economy.SYMLINK_XATTR, self.store.nameKey()), 0), economy.SYMLINK_XATTR, target);
                 t.token_quiet = true;
                 t_owned = false;
                 try self.commit(c, t);
@@ -1909,7 +1909,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 wo = .{ .local = l, .global = globalOf(l) };
             }
             _ = economy.stageRename(t, .{
-                .hash_seed = self.store.hashSeed(),
+                .name_key = self.store.nameKey(),
                 .now = now(),
                 .old_parent = old_parent,
                 .old_name = a.name,
@@ -2083,7 +2083,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             if (try self.scanChain(parent, a.newname, &chain, &kvs) != null) return error.PathAlreadyExists;
-            const out = economy.stageLink(t, .{ .hash_seed = self.store.hashSeed(), .now = now(), .parent = parent, .parent_value = pv, .name = a.newname, .child = child, .global_child = a.ino, .child_value = cv, .chain = chain.slice() }) catch |e| return switch (e) {
+            const out = economy.stageLink(t, .{ .name_key = self.store.nameKey(), .now = now(), .parent = parent, .parent_value = pv, .name = a.newname, .child = child, .global_child = a.ino, .child_value = cv, .chain = chain.slice() }) catch |e| return switch (e) {
                 error.TooManyLinks => error.TooManyLinks,
                 error.NameTooLong => error.NameTooLong,
                 error.DentryChainOverflow => error.NoSpaceLeft,
@@ -2933,6 +2933,7 @@ pub const MemStore = struct {
     /// in a handler is a loud ENOENT here, not a coincidence.
     next_ino: u64 = inos.LOCAL_INO_BASE + 3,
     seed: u64 = 0x5EED_0F_7E57,
+    name_key: key.NameKey = .init(0x5EED_0F_7E57),
     node_size_: usize = 65536,
     commits: u64 = 0,
     fsyncs: u64 = 0,
@@ -3079,8 +3080,8 @@ pub const MemStore = struct {
         return self.next_ino - inos.LOCAL_INO_BASE;
     }
 
-    pub fn hashSeed(self: *const MemStore) u64 {
-        return self.seed;
+    pub fn nameKey(self: *const MemStore) *const key.NameKey {
+        return &self.name_key;
     }
 
     pub fn nodeSize(self: *const MemStore) usize {
@@ -3440,7 +3441,7 @@ const SettlingData = struct {
         const t = try store.begin(@src());
         errdefer store.abandon(t);
         const proof: layout.DmaProof = .{ .vol_tag = m.vol_tag, .offset = m.offset, .len = layout.DEFAULT_CHUNK, .completed_ns = 1 };
-        try layout.publishLayout(t, .{ .ino = ino, .hash_seed = store.hashSeed(), .prev = prev, .layout = Layout.stripedInline(size, &entries), .proofs = &.{proof} }, self.refsSeam(), .default);
+        try layout.publishLayout(t, .{ .ino = ino, .name_key = store.nameKey(), .prev = prev, .layout = Layout.stripedInline(size, &entries), .proofs = &.{proof} }, self.refsSeam(), .default);
         try store.commit(t);
     }
 

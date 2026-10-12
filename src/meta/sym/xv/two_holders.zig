@@ -103,8 +103,8 @@ pub const HolderStore = struct {
         return self.mem.fsync();
     }
 
-    pub fn hashSeed(self: *const HolderStore) u64 {
-        return self.mem.hashSeed();
+    pub fn nameKey(self: *const HolderStore) *const key.NameKey {
+        return self.mem.nameKey();
     }
 };
 
@@ -833,14 +833,14 @@ test "striping: a flip supplied by the other creator maps K stripes under ONE in
     // readdir across the flip: the same four names, markers never shown,
     // cookie order, a stable continuation.
     var merged: std.ArrayList(stripe.DirRec) = .empty;
-    try stripe.readdirMerged(src_b.src(), arena, &map, 0, 64, f.b.store.hashSeed(), &merged);
+    try stripe.readdirMerged(src_b.src(), arena, &map, 0, 64, f.b.store.nameKey(), &merged);
     try testing.expectEqual(@as(usize, 4), merged.items.len);
     for (merged.items, 0..) |r, i| {
         try testing.expect(!stripe.isMarkerName(r.name));
         try testing.expectEqual(before.items[i].cookie, r.cookie);
     }
     // A create into the striped directory keys the stripe of hash(name).
-    const seed = f.b.store.hashSeed();
+    const seed = f.b.store.nameKey();
     const route_new = map.routeName("five", seed);
     const key_parent = try st.mutationParent(&map, "five", 2_000);
     try testing.expectEqual(route_new.stripe, key_parent);

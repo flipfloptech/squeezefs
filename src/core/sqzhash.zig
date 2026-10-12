@@ -54,7 +54,7 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const aes = std.crypto.core.aes;
 
-const Vec = @Vector(16, u8);
+const Vec = @Vector(16, u8); // one AES block: 16 bytes
 /// The AES block: 16 bytes, the unit every rule below counts in.
 const block_len = 16;
 const zero: Vec = @splat(0);
@@ -254,13 +254,13 @@ fn buildSbox() [256]u8 {
         const a: u8 = @intCast(i);
         var inv: u8 = 1;
         var base = a;
-        var e: u8 = 254;
+        var e: u8 = 254; // a^254 = a^-1 in GF(2^8) (a^255 = 1)
         while (e != 0) : (e >>= 1) {
             if (e & 1 != 0) inv = gmul(inv, base);
             base = gmul(base, base);
         }
         if (a == 0) inv = 0;
-        out[i] = inv ^ std.math.rotl(u8, inv, 1) ^ std.math.rotl(u8, inv, 2) ^ std.math.rotl(u8, inv, 3) ^ std.math.rotl(u8, inv, 4) ^ 0x63;
+        out[i] = inv ^ std.math.rotl(u8, inv, 1) ^ std.math.rotl(u8, inv, 2) ^ std.math.rotl(u8, inv, 3) ^ std.math.rotl(u8, inv, 4) ^ 0x63; // FIPS 197 §5.1.1 (5.2)
     }
     return out;
 }
@@ -279,7 +279,7 @@ fn softRound(in: Vec) Vec {
     // ShiftRows: row r of the column-major state rotates left by r.
     var r: [16]u8 = undefined;
     for (0..4) |c| {
-        for (0..4) |row| r[row + 4 * c] = s[row + 4 * ((c + row) % 4)];
+        for (0..4) |row| r[row + 4 * c] = s[row + 4 * ((c + row) % 4)]; // 4 rows × 4 columns
     }
     // MixColumns: the circulant (2 3 1 1) matrix per column.
     var out: [16]u8 = undefined;
@@ -492,13 +492,13 @@ fn Engine(comptime path: Path) type {
                 else
                     compressTree(2, input, key)
             else if (len <= tree_max)
-                if (len <= 8 * block_len)
-                    if (len <= 4 * block_len)
-                        compressTree(4, input, key)
-                    else if (len <= 6 * block_len) compressTree(6, input, key) else compressTree(8, input, key)
-                else if (len <= 12 * block_len) compressTree(12, input, key) else compressTree(16, input, key)
+                if (len <= 8 * block_len) // the six tree sizes: 2, 4, 6, 8, 12, 16 blocks
+                    if (len <= 4 * block_len) // 4 blocks
+                        compressTree(4, input, key) // 4 leaves
+                    else if (len <= 6 * block_len) compressTree(6, input, key) else compressTree(8, input, key) // 6 or 8 leaves
+                else if (len <= 12 * block_len) compressTree(12, input, key) else compressTree(16, input, key) // 12 or 16 leaves
             else if (len <= medium_max)
-                compressLanes(8, input, key)
+                compressLanes(8, input, key) // 8 lanes to 1 KiB
             else
                 compressLanes(large_lanes, input, key);
             return finalize(h, key);
@@ -629,6 +629,7 @@ pub const native = Engine(.native);
 // produced by the source implementation and guard against accidental change.
 
 const testing = std.testing;
+const testkit = @import("testkit.zig");
 
 fn fillTestData(buf: []u8) void {
     for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
@@ -1025,7 +1026,7 @@ test "partialBlock matches copy-and-pad for every short length and alignment" {
 }
 
 test "short inputs that end at an inaccessible page are read in bounds" {
-    if (over_read_page == null) return error.SkipZigTest;
+    if (over_read_page == null) return testkit.skip(@src(), .no_kernel_feature, "the whole-page over-read applies only to page-mapped targets (Linux, Darwin, the BSDs, Windows)");
     const page_size = std.heap.pageSize();
     const mem: []align(std.heap.page_size_min) u8 = @alignCast(try std.heap.page_allocator.alloc(u8, 2 * page_size));
     defer std.heap.page_allocator.free(mem);

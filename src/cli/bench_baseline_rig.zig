@@ -6,8 +6,10 @@
 //!
 //!   `zig build bench-baseline` — `bench baseline: record`: a format, a
 //!   mount, `runs` (3) invocations of `squeezefs bench --json` on the
-//!   baseline shape, folded per group; writes `bench/baseline-<venue id>.json`
-//!   and `bench/thresholds-<venue id>.json` labelled `scoping-venue`.
+//!   baseline shape each followed by one `squeezefs bench --hash --json`
+//!   (the CPU hash groups, decision 0003 §M), folded per group; writes
+//!   `bench/baseline-<venue id>.json` and `bench/thresholds-<venue id>.json`
+//!   labelled `scoping-venue`.
 //!
 //!   `zig build bench-compare` — `bench compare: judge`: one invocation on
 //!   the same shape, judged per group against the committed baseline under
@@ -152,9 +154,17 @@ const Session = struct {
         defer gpa.free(r.stderr);
         if (!r.term.success()) std.debug.print("\nbench: {s}\n{s}\n", .{ r.stdout, r.stderr });
         try testing.expect(r.term.success());
-        const folded = try baseline.foldRun(gpa, r.stdout);
+        // The CPU hash groups after the mounted passes (the mount is idle then).
+        const h = try self.rig.squeezefs(&.{ "bench", "--hash", "--json" });
+        defer gpa.free(h.stdout);
+        defer gpa.free(h.stderr);
+        if (!h.term.success()) std.debug.print("\nbench --hash: {s}\n{s}\n", .{ h.stdout, h.stderr });
+        try testing.expect(h.term.success());
+        const rows = try std.mem.concat(gpa, u8, &.{ r.stdout, h.stdout });
+        defer gpa.free(rows);
+        const folded = try baseline.foldRun(gpa, rows);
         if (!folded.rows_long_enough) std.debug.print("bench baseline: the rows:\n{s}\n", .{r.stdout});
-        // Every row's must-stay-0 census.
+        // Every mounted row's must-stay-0 census.
         var lines = std.mem.tokenizeScalar(u8, r.stdout, '\n');
         while (lines.next()) |line| try testing.expectEqual(@as(?u64, 0), json_scan.number(line, "invariant_tripwires"));
         return folded;

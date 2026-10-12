@@ -5,7 +5,7 @@
 //! and `job:enroll`. The reference kept them as additive JSON xattrs with
 //! string `error`/`created_by` fields (decision 0002 rows 121–124's law
 //! applied to the job plane): here they are canonical `extern struct`s,
-//! explicit enum bytes, a TYPED error class, the stable identity, xxh3.
+//! explicit enum bytes, a TYPED error class, the stable identity, hash64.
 //!
 //! The record is ADVISORY: correctness is plan regeneration (§1.9). What
 //! it must get right is the TERMINAL law — a terminal state persists
@@ -208,7 +208,7 @@ pub const JobRecordV1 = extern struct {
     arg1_le: [8]u8,
     updated_realtime_s_le: [8]u8,
     reserved: [8]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 
     pub const VERSION: u16 = 1;
     pub const LEN: usize = 96;
@@ -239,7 +239,7 @@ pub const JobRecordV1 = extern struct {
         wr(u64, &w.updated_realtime_s_le, r.updated_realtime_s);
         w.reserved = @splat(0);
         const body = std.mem.asBytes(&w)[0 .. LEN - 8];
-        wr(u64, &w.xxh3_le, checksum.xxh3(body));
+        wr(u64, &w.csum_le, checksum.hash64(body));
         return w;
     }
 
@@ -253,7 +253,7 @@ pub const JobRecordV1 = extern struct {
     /// decode = id).
     pub fn decode(bytes: []const u8) DecodeError!JobRecord {
         if (bytes.len != LEN) return error.Corrupt;
-        if (checksum.xxh3(bytes[0 .. LEN - 8]) != rd(u64, bytes[LEN - 8 ..][0..8])) return error.Corrupt;
+        if (checksum.hash64(bytes[0 .. LEN - 8]) != rd(u64, bytes[LEN - 8 ..][0..8])) return error.Corrupt;
         const w = std.mem.bytesToValue(JobRecordV1, bytes[0..LEN]);
         if (rd(u16, &w.version_le) != VERSION) return error.Corrupt;
         const flags = rd(u16, &w.flags_le);
@@ -397,7 +397,7 @@ pub const JobShard = struct {
             @memcpy(out[off..][0..DestTupleWire.LEN], std.mem.asBytes(&t));
             off += DestTupleWire.LEN;
         }
-        wr(u64, out[off..][0..8], checksum.xxh3(out[0..off]));
+        wr(u64, out[off..][0..8], checksum.hash64(out[0..off]));
         return out[0..n];
     }
 
@@ -421,7 +421,7 @@ pub const JobShard = struct {
         if (n_dest > SHARD_DEST_MAX) return error.Corrupt;
         const n = JobShardV1Head.LEN + @as(usize, n_dest) * DestTupleWire.LEN + 8;
         if (bytes.len != n) return error.Corrupt;
-        if (checksum.xxh3(bytes[0 .. n - 8]) != rd(u64, bytes[n - 8 ..][0..8])) return error.Corrupt;
+        if (checksum.hash64(bytes[0 .. n - 8]) != rd(u64, bytes[n - 8 ..][0..8])) return error.Corrupt;
         const job_id = rd(u64, &h.job_id_le);
         if (job_id == 0) return error.Corrupt;
         const dests = try gpa.alloc(DestTuple, n_dest);
@@ -543,7 +543,7 @@ test "JobRecordV1 decode is total: a tampered byte, a wrong version, an unknown 
 
 fn restamp(b: [JobRecordV1.LEN]u8) [JobRecordV1.LEN]u8 {
     var out = b;
-    std.mem.writeInt(u64, out[88..96], checksum.xxh3(out[0..88]), .little);
+    std.mem.writeInt(u64, out[88..96], checksum.hash64(out[0..88]), .little);
     return out;
 }
 
@@ -586,7 +586,7 @@ test "JobShardV1: the head is 56 B; encode∘decode = id with 0, 1 and 64 destin
     var zero_state = try (JobShard{ .job_id = 9, .shard = 0, .state = .completed, .lease_ttl_ms = 0, .shard_fencing = 0, .updated_realtime_s = 0, .dests = &.{} }).encodeAlloc(gpa);
     defer gpa.free(zero_state);
     zero_state[4] = 0;
-    std.mem.writeInt(u64, zero_state[zero_state.len - 8 ..][0..8], checksum.xxh3(zero_state[0 .. zero_state.len - 8]), .little);
+    std.mem.writeInt(u64, zero_state[zero_state.len - 8 ..][0..8], checksum.hash64(zero_state[0 .. zero_state.len - 8]), .little);
     try testing.expectError(error.Corrupt, JobShard.decode(gpa, zero_state));
 }
 
@@ -633,7 +633,7 @@ test "property: neither durable decoder panics on mutations of valid records; a 
             const flips = rnd.uintLessThan(usize, 3);
             var f: usize = 0;
             while (f < flips) : (f += 1) buf[rnd.uintLessThan(usize, 88)] ^= @as(u8, 1) << rnd.int(u3);
-            if (flips > 0) std.mem.writeInt(u64, buf[88..96], checksum.xxh3(buf[0..88]), .little);
+            if (flips > 0) std.mem.writeInt(u64, buf[88..96], checksum.hash64(buf[0..88]), .little);
         }
         if (JobRecordV1.decode(buf[0..len])) |r| {
             try testing.expectEqualSlices(u8, buf[0..len], &r.encode());

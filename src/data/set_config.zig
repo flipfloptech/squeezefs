@@ -9,7 +9,7 @@
 //! The codec is canonical, total, versioned and checksummed, every field by
 //! position (`ledger.zig`'s discipline): a 128 B little-endian head, then
 //! `n_data` data-volume records (64 B fixed + the uri), then `n_cache_paths`
-//! length-framed paths, then xxh3-64 over everything before it. A lying
+//! length-framed paths, then hash64 over everything before it. A lying
 //! length is never an allocation authority: every count is checked against
 //! the bytes actually present before anything is allocated. The reference
 //! kept this as a `serde_json` xattr `user.squeezefs.format_config` on ino

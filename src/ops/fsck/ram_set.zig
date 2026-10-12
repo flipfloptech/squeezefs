@@ -61,8 +61,8 @@ pub const FaultStore = struct {
     pub fn abandon(self: *FaultStore, t: *tx.KvTx) void {
         self.inner.abandon(t);
     }
-    pub fn hashSeed(self: *const FaultStore) u64 {
-        return self.inner.hashSeed();
+    pub fn nameKey(self: *const FaultStore) *const key.NameKey {
+        return self.inner.nameKey();
     }
 };
 
@@ -131,7 +131,7 @@ pub const RamSet = struct {
             .io = testing.io,
             .store = self.store(),
             .geo = self.geo,
-            .hash_seed = self.mem.hashSeed(),
+            .name_key = self.mem.nameKey(),
             .volumes = &self.vols,
             .scope = &self.scope,
             .mode = mode,
@@ -197,7 +197,7 @@ pub const RamSet = struct {
     }
 
     fn dentryKeyFor(self: *RamSet, parent_local: u64, name: []const u8) [key.DENTRY_KEY_LEN]u8 {
-        return key.dentryKey(parent_local, key.dentryNameHash54(name, self.mem.hashSeed()), 0);
+        return key.dentryKey(parent_local, key.dentryNameHash54(name, self.mem.nameKey()), 0);
     }
 
     fn putDentry(self: *RamSet, t: *tx.KvTx, parent_local: u64, name: []const u8, child_global: u64, mode: u32) !void {
@@ -244,7 +244,7 @@ pub const RamSet = struct {
             @memset(self.devs[if (vol_tag == VOL_A) 0 else 1][@intCast(b * CHUNK)..][0..@intCast(CHUNK)], @truncate(b + 1));
         }
         const lay = layout.Layout.stripedInline(CHUNK * blocks.len, entries.items);
-        try layout.publishLayout(t, .{ .ino = l, .hash_seed = self.mem.hashSeed(), .prev = null, .layout = lay, .proofs = proofs.items }, classes.refs_seam, self.geo);
+        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = proofs.items }, classes.refs_seam, self.geo);
         try self.commitTx(t);
         return global(l);
     }
@@ -262,10 +262,10 @@ pub const RamSet = struct {
         // Packed is reached only by promotion of a staged file: the staged
         // record first, the tenant as its promotion (one tx, the later Put wins).
         const staged = layout.Layout.staged(len, file_id, null);
-        try layout.publishLayout(t, .{ .ino = l, .hash_seed = self.mem.hashSeed(), .prev = null, .layout = staged, .proofs = &.{} }, classes.refs_seam, self.geo);
+        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = staged, .proofs = &.{} }, classes.refs_seam, self.geo);
         const lay = layout.Layout.packedTenant(len, file_id, m);
         self.trackBlock(vol_tag, blk);
-        try layout.publishLayout(t, .{ .ino = l, .hash_seed = self.mem.hashSeed(), .prev = staged, .layout = lay, .proofs = &.{.{ .vol_tag = vol_tag, .offset = blk * CHUNK, .len = CHUNK, .completed_ns = 1 }} }, classes.refs_seam, self.geo);
+        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = staged, .layout = lay, .proofs = &.{.{ .vol_tag = vol_tag, .offset = blk * CHUNK, .len = CHUNK, .completed_ns = 1 }} }, classes.refs_seam, self.geo);
         try self.commitTx(t);
         return global(l);
     }
@@ -413,7 +413,7 @@ pub const RamSet = struct {
         enc[off..][0..layout.MAPPING_WIRE_LEN].* = std.mem.toBytes(m.encode());
         const xv: record.XattrValue = .{ .name = layout.LAYOUT_XATTR_NAME, .value = enc };
         var xbuf: [300]u8 = undefined;
-        try t.stagePut(key.TREE_XATTRS, &key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.mem.hashSeed()), 0), try xv.encodeInto(&xbuf));
+        try t.stagePut(key.TREE_XATTRS, &key.xattrKey(l, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.mem.nameKey()), 0), try xv.encodeInto(&xbuf));
         // The base IS referenced: its durable record exists as any publish's would.
         try block_refs.stageOps(t, &.{block_refs.taken(.{ .vol_tag = vol_tag, .block_idx = blk, .owner_ino = l, .block_index = 0 })});
         try self.commitTx(t);
@@ -437,7 +437,7 @@ pub const RamSet = struct {
         try self.putInode(t, l, .{ .mode = economy.S.IFREG | 0o644, .nlink = 1, .size = CHUNK * 100, .ctime = 7 });
         try self.putDentry(t, local(parent), name, global(l), economy.S.IFREG);
         const lay = layout.Layout.stripedKvmap(CHUNK * 100, null, 1);
-        try layout.publishLayout(t, .{ .ino = l, .hash_seed = self.mem.hashSeed(), .prev = null, .layout = lay, .proofs = &.{} }, classes.refs_seam, self.geo);
+        try layout.publishLayout(t, .{ .ino = l, .name_key = self.mem.nameKey(), .prev = null, .layout = lay, .proofs = &.{} }, classes.refs_seam, self.geo);
         try self.commitTx(t);
         return global(l);
     }

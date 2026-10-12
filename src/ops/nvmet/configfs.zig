@@ -20,7 +20,7 @@
 //! other record names the host.
 //!
 //! Port ids ride a reserved u16 range `[base, base + 999]` (the kernel
-//! names ports with `kstrtou16`): the first candidate is `base + xxh3(key)
+//! names ports with `kstrtou16`): the first candidate is `base + hash64(key)
 //! % 900` (900 hash slots; the last 100 are pure probe headroom), then a
 //! linear probe wrapping through the whole range; an existing port is
 //! OURS-AND-MATCHING iff its `(trtype, adrfam, traddr, trsvcid)` match and
@@ -521,9 +521,9 @@ pub const Ownership = struct {
     }
 };
 
-/// `base + xxh3(key) % 900` (quirk Q5: xxh3, the ONE hash in the tree).
+/// `base + hash64(key) % 900` (quirk Q5: hash64, the ONE hash in the tree).
 pub fn firstCandidate(base: u16, key: []const u8) u16 {
-    return base + @as(u16, @intCast(checksum.xxh3(key) % PORT_HASH_SLOTS));
+    return base + @as(u16, @intCast(checksum.hash64(key) % PORT_HASH_SLOTS));
 }
 
 pub const AllocError = error{PortRangeExhausted};
@@ -1442,7 +1442,7 @@ const none_ledgered: Ownership = .{ .ctx = @ptrCast(&RealFs.token), .isLedgered 
     }
 }.f };
 
-test "port ids: frozen xxh3 first-candidate vectors inside the 900 slots; a relocated base shifts them; a probe wraps through the full range; ownership reuse vs foreign skip; exhaustion names the knob" {
+test "port ids: frozen hash64 first-candidate vectors inside the 900 slots; a relocated base shifts them; a probe wraps through the full range; ownership reuse vs foreign skip; exhaustion names the knob" {
     const l1 = try Listener.tcp("10.0.0.1", 4420);
     const l2 = try Listener.tcp("127.0.0.1", 4420);
     const l3 = try Listener.tcp("127.0.0.1", 4421);
@@ -1453,7 +1453,7 @@ test "port ids: frozen xxh3 first-candidate vectors inside the 900 slots; a relo
     const c1 = firstCandidate(PORT_ID_BASE_DEFAULT, "tcp:10.0.0.1:4420");
     const c2 = firstCandidate(PORT_ID_BASE_DEFAULT, "tcp:127.0.0.1:4420");
     const c3 = firstCandidate(PORT_ID_BASE_DEFAULT, "loop");
-    try testing.expectEqual(@as(u16, PORT_ID_BASE_DEFAULT + @as(u16, @intCast(checksum.xxh3("tcp:10.0.0.1:4420") % 900))), c1);
+    try testing.expectEqual(@as(u16, PORT_ID_BASE_DEFAULT + @as(u16, @intCast(checksum.hash64("tcp:10.0.0.1:4420") % 900))), c1);
     try testing.expect(c1 >= PORT_ID_BASE_DEFAULT and c1 < PORT_ID_BASE_DEFAULT + PORT_HASH_SLOTS);
     try testing.expect(c2 >= PORT_ID_BASE_DEFAULT and c2 < PORT_ID_BASE_DEFAULT + PORT_HASH_SLOTS);
     try testing.expect(c3 >= PORT_ID_BASE_DEFAULT and c3 < PORT_ID_BASE_DEFAULT + PORT_HASH_SLOTS);

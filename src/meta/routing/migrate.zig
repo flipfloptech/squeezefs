@@ -615,7 +615,7 @@ test "migrate a loaded slot WHILE a writer storm hits it: every acked create pre
                     std.mem.writeInt(u64, &vb, i, .little);
                     var xb: [64]u8 = undefined;
                     const xv = (record.XattrValue{ .name = "user.storm", .value = &vb }).encodeInto(&xb) catch unreachable;
-                    t.stagePut(key.TREE_XATTRS, &key.xattrKey(eff, key.xattrNameHash56("user.storm", self.set.hashSeed()), 0), xv) catch {
+                    t.stagePut(key.TREE_XATTRS, &key.xattrKey(eff, key.xattrNameHash56("user.storm", self.set.nameKey()), 0), xv) catch {
                         self.set.abandon(t);
                         continue;
                     };
@@ -671,7 +671,7 @@ test "migrate a loaded slot WHILE a writer storm hits it: every acked create pre
         for (storm.acked.items) |g| try testing.expect(try meta_set.present(set, g));
         for (victims.items) |g| {
             const eff = set.effectiveIno(g);
-            const xv = (try set.lookup(gpa, key.TREE_XATTRS, &key.xattrKey(eff, key.xattrNameHash56("user.storm", set.hashSeed()), 0))).?;
+            const xv = (try set.lookup(gpa, key.TREE_XATTRS, &key.xattrKey(eff, key.xattrNameHash56("user.storm", set.nameKey()), 0))).?;
             defer gpa.free(xv);
         }
         // The source no longer holds the slot's tree; the target does.

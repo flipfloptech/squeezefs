@@ -315,12 +315,12 @@ fn planMsg(buf: []u8, r: PlanRefusal) []const u8 {
     return w.buffered();
 }
 
-test "mintSetIdentity: two mints differ in both fields and the seed is not xxh3(set_uuid) (independent draws)" {
+test "mintSetIdentity: two mints differ in both fields and the seed is not hash64(set_uuid) (independent draws)" {
     const a = try mintSetIdentity(testing.io);
     const b = try mintSetIdentity(testing.io);
     try testing.expect(!std.mem.eql(u8, &a.set_uuid, &b.set_uuid));
     try testing.expect(a.hash_seed != b.hash_seed);
-    try testing.expect(a.hash_seed != checksum.xxh3(&a.set_uuid));
+    try testing.expect(a.hash_seed != checksum.hash64(&a.set_uuid));
     try testing.expect(a.hash_seed != std.mem.readInt(u64, a.set_uuid[0..8], .little));
 }
 

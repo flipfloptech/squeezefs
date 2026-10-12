@@ -155,9 +155,9 @@ pub const MemberRow = struct {
         std.mem.writeInt(u64, &w.hostname_hash_le, self.hostname_hash, .little);
         std.mem.writeInt(u64, &w.heartbeat_seq_le, self.epoch, .little);
         std.mem.writeInt(u64, &w.term_le, self.term, .little);
-        w.xxh3_le = @splat(0);
+        w.csum_le = @splat(0);
         var bytes = std.mem.toBytes(w);
-        checksum.stamp(&bytes, @offsetOf(claim.WriterClaimV1, "xxh3_le"));
+        checksum.stamp(&bytes, @offsetOf(claim.WriterClaimV1, "csum_le"));
         return bytes;
     }
 
@@ -165,7 +165,7 @@ pub const MemberRow = struct {
     /// under a member key is corruption, never a member.
     pub fn decode(bytes: []const u8) error{Corrupt}!MemberRow {
         if (bytes.len != claim.CLAIM_LEN) return error.Corrupt;
-        if (!checksum.verify(bytes, @offsetOf(claim.WriterClaimV1, "xxh3_le"))) return error.Corrupt;
+        if (!checksum.verify(bytes, @offsetOf(claim.WriterClaimV1, "csum_le"))) return error.Corrupt;
         const w = std.mem.bytesToValue(claim.WriterClaimV1, bytes[0..claim.CLAIM_LEN]);
         if (!std.mem.eql(u8, &w.magic, &claim.MAGIC) or w.version != claim.VERSION or w.kind != claim.KIND_MEMBER) return error.Corrupt;
         if (!std.mem.allEqual(u8, &w.reserved0, 0) or !std.mem.allEqual(u8, &w.reserved1, 0)) return error.Corrupt;
@@ -1525,7 +1525,7 @@ fn memberRowFuzz(_: void, smith: *std.testing.Smith) !void {
     _ = MemberRow.decode(buf[0..len]) catch {};
     if (len >= claim.CLAIM_LEN) {
         const img = buf[0..claim.CLAIM_LEN];
-        checksum.stamp(img, @offsetOf(claim.WriterClaimV1, "xxh3_le"));
+        checksum.stamp(img, @offsetOf(claim.WriterClaimV1, "csum_le"));
         if (MemberRow.decode(img)) |row| try std.testing.expectEqualSlices(u8, img, &row.encode()) else |_| {}
     }
 }

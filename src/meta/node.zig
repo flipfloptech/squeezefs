@@ -343,10 +343,10 @@ pub const NodeWriteParams = struct {
     max_key: []const u8,
 };
 
-/// xxh3 over the WHOLE page with bytes [32..40) zeroed — streamed, so the
+/// hash64 over the WHOLE page with bytes [32..40) zeroed — streamed, so the
 /// zero-filled slot is hashed in place, never skipped.
 pub fn headerPageChecksum(page: *const [NODE_PAGE]u8) u64 {
-    return checksum.xxh3FieldZeroed(page, NODE_HEADER_CHECKSUM_OFF);
+    return checksum.hash64FieldZeroed(page, NODE_HEADER_CHECKSUM_OFF);
 }
 
 /// The ONE header encoder. Refuses keys that do not fit the page.
@@ -772,7 +772,7 @@ pub fn residueSeqCeiling(buf: []const u8) u64 {
         const hdr = buf[pos..][0..FRAME_LEN];
         if (std.mem.readInt(u32, hdr[0..4], .little) != bset.BSET_FRAME_MAGIC) continue;
         const checked = bset.BSET_FRAME_CHECKSUM_OFF;
-        if (std.mem.readInt(u64, hdr[checked..][0..8], .little) != checksum.xxh3(hdr[0..checked])) continue;
+        if (std.mem.readInt(u64, hdr[checked..][0..8], .little) != checksum.hash64(hdr[0..checked])) continue;
         ceiling = @max(ceiling, std.mem.readInt(u64, hdr[8..16], .little));
     }
     return ceiling;
@@ -790,7 +790,7 @@ pub fn residueStampedBy(buf: []const u8, appender_id: u32) bool {
         const hdr = buf[pos..][0..FRAME_LEN];
         if (std.mem.readInt(u32, hdr[0..4], .little) != bset.BSET_FRAME_MAGIC) continue;
         const checked = bset.BSET_FRAME_CHECKSUM_OFF;
-        if (std.mem.readInt(u64, hdr[checked..][0..8], .little) != checksum.xxh3(hdr[0..checked])) continue;
+        if (std.mem.readInt(u64, hdr[checked..][0..8], .little) != checksum.hash64(hdr[0..checked])) continue;
         if (std.mem.readInt(u32, hdr[24..28], .little) == appender_id) return true;
     }
     return false;
@@ -1202,7 +1202,7 @@ test "record value cap is min(ceiling, node/4) + the 256 envelope; the §1.4 geo
     try testing.expectEqual(@as(u32, 8), PROJECTION_REFRESH_EVERY);
 }
 
-test "header page byte layout: KVND @0, version @4, tree_id @6, level @7, node_addr @8, node_seq @16, node_size @24, min/max len @28/@30, xxh3 @32 over the field-zeroed page, keys packed at 40" {
+test "header page byte layout: KVND @0, version @4, tree_id @6, level @7, node_addr @8, node_seq @16, node_size @24, min/max len @28/@30, hash64 @32 over the field-zeroed page, keys packed at 40" {
     const l = defaultLayout();
     var page: [NODE_PAGE]u8 = undefined;
     try encodeHeaderPage(l, .{ .node_addr = 0x840000, .node_seq = 0x574beb7afdab4e6c, .tree_id = 1, .level = 0, .min_key = &.{}, .max_key = &key.KEY_SPACE_MAX }, &page, null);
@@ -1218,11 +1218,11 @@ test "header page byte layout: KVND @0, version @4, tree_id @6, level @7, node_a
     try testing.expect(std.mem.allEqual(u8, page[40..72], 0xFF));
     try testing.expect(std.mem.allEqual(u8, page[72..], 0));
     // The streaming recipe: [0..32) ‖ 8 zero bytes ‖ [40..4096).
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(page[0..32]);
     h.update(&@as([8]u8, @splat(0)));
     h.update(page[40..]);
-    try testing.expectEqual(h.final(), std.mem.readInt(u64, page[32..40], .little));
+    try testing.expectEqual(h.finalLow64(), std.mem.readInt(u64, page[32..40], .little));
     try testing.expectEqual(headerPageChecksum(&page), std.mem.readInt(u64, page[32..40], .little));
     const dec = try decodeHeaderPage(&page, null);
     try testing.expectEqual(@as(u64, 0x840000), dec.node_addr);
@@ -1634,7 +1634,7 @@ test "torn-tail classifier: a torn unit truncates the view and is counted (prior
 /// (not the field-zeroed whole header), so the structural gates behind it
 /// are reachable.
 fn restampFrame(hdr: *[FRAME_LEN]u8) void {
-    std.mem.writeInt(u64, hdr[bset.BSET_FRAME_CHECKSUM_OFF..][0..8], checksum.xxh3(hdr[0..bset.BSET_FRAME_CHECKSUM_OFF]), .little);
+    std.mem.writeInt(u64, hdr[bset.BSET_FRAME_CHECKSUM_OFF..][0..8], checksum.hash64(hdr[0..bset.BSET_FRAME_CHECKSUM_OFF]), .little);
 }
 
 /// A frame image with an explicit stamp, for the screen tests.

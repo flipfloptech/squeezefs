@@ -271,7 +271,7 @@ pub fn ValidatedServeModel(comptime weakening: ServeWeakening) type {
         pub fn final(_: *const Self) !void {}
 
         pub fn key(self: *const Self) u64 {
-            return std.hash.XxHash3.hash(0, std.mem.asBytes(self));
+            return std.hash.Wyhash.hash(0, std.mem.asBytes(self));
         }
     };
 }

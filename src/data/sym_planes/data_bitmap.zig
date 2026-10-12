@@ -57,7 +57,7 @@ pub const BlockAllocator = block_alloc.BlockAllocator;
 /// One page = one 4 KiB sector: the torn-write unit, so an A/B pair makes
 /// a tear damage only the copy being replaced.
 pub const page_len: usize = 4096;
-/// `magic u32 ‖ page_index u32 ‖ generation u64 ‖ vol_tag u64 ‖ xxh3 u64`:
+/// `magic u32 ‖ page_index u32 ‖ generation u64 ‖ vol_tag u64 ‖ hash64 u64`:
 /// the meta bitmap's 24-B `KVAB` header plus the volume word, so a page of
 /// another volume's bitmap never reads as ours.
 pub const page_hdr_len: usize = 32;

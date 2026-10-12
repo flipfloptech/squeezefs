@@ -485,7 +485,7 @@ pub const IdentityStamp = struct {
     id_hash: u64,
 
     pub fn of(hostnqn: []const u8, hostid: []const u8) IdentityStamp {
-        return .{ .nqn_hash = checksum.xxh3(hostnqn), .id_hash = checksum.xxh3(hostid) };
+        return .{ .nqn_hash = checksum.hash64(hostnqn), .id_hash = checksum.hash64(hostid) };
     }
 
     pub fn eql(a: IdentityStamp, b: IdentityStamp) bool {

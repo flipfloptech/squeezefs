@@ -505,7 +505,7 @@ pub const EXTENT_RECORD_VERSION: u32 = 2;
 pub const RECORD_FLAG_BASE_DEFERRED: u32 = 1 << 0;
 
 /// 40 B little-endian header; then `count` × `(start u32, len u32)`, then the
-/// payloads concatenated. The xxh3 covers header (field zeroed) ‖ table ‖
+/// payloads concatenated. The hash64 covers header (field zeroed) ‖ table ‖
 /// payloads.
 pub const ExtentRecordWire = extern struct {
     magic: [4]u8,
@@ -515,7 +515,7 @@ pub const ExtentRecordWire = extern struct {
     flags_le: [4]u8,
     count_le: [4]u8,
     reserved_le: [4]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 };
 
 pub const RECORD_HEADER_LEN: usize = @sizeOf(ExtentRecordWire);
@@ -523,7 +523,7 @@ pub const RECORD_ENTRY_LEN: usize = 8;
 
 comptime {
     assert(RECORD_HEADER_LEN == 40);
-    assert(@offsetOf(ExtentRecordWire, "xxh3_le") == 32);
+    assert(@offsetOf(ExtentRecordWire, "csum_le") == 32);
 }
 
 pub const DecodeError = error{ Torn, FutureVersion, Malformed };
@@ -567,7 +567,7 @@ pub fn encode(x: *const ExtentOverlay, runs: []const Run, fencing: u64, block: u
     std.mem.writeInt(u32, &h.flags_le, if (x.base_deferred) RECORD_FLAG_BASE_DEFERRED else 0, .little);
     std.mem.writeInt(u32, &h.count_le, @intCast(runs.len), .little);
     h.reserved_le = @splat(0);
-    h.xxh3_le = @splat(0);
+    h.csum_le = @splat(0);
     @memcpy(out[0..RECORD_HEADER_LEN], std.mem.asBytes(&h));
     var pos: usize = RECORD_HEADER_LEN;
     for (runs) |r| {
@@ -584,7 +584,7 @@ pub fn encode(x: *const ExtentOverlay, runs: []const Run, fencing: u64, block: u
         payload += r.end - r.start;
     }
     assert(pos == n);
-    checksum.stamp(out[0..n], @offsetOf(ExtentRecordWire, "xxh3_le"));
+    checksum.stamp(out[0..n], @offsetOf(ExtentRecordWire, "csum_le"));
     stats.extent_spills.inc();
     stats.extent_spill_bytes.add(payload);
     return out[0..n];
@@ -624,7 +624,7 @@ pub fn decode(bytes: []const u8, block_size: u32) DecodeError!Decoded {
     }
     const total = RECORD_HEADER_LEN + table_len + payload_len;
     if (bytes.len < total) return torn();
-    if (!checksum.verify(bytes[0..@intCast(total)], @offsetOf(ExtentRecordWire, "xxh3_le"))) return torn();
+    if (!checksum.verify(bytes[0..@intCast(total)], @offsetOf(ExtentRecordWire, "csum_le"))) return torn();
     const flags = std.mem.readInt(u32, &h.flags_le, .little);
     if (flags & ~RECORD_FLAG_BASE_DEFERRED != 0 or !std.mem.allEqual(u8, &h.reserved_le, 0)) return torn();
     stats.extent_records_recovered.inc();

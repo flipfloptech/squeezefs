@@ -72,7 +72,7 @@ const OfflineVolume = struct {
         var diag: superblock.Refusal = undefined;
         const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &diag) catch return error.Corrupt;
         self.sb = switch (classified.format) {
-            .v4 => |s| s,
+            .v5 => |s| s,
             else => return error.NotFormatted,
         };
         return self;

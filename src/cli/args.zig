@@ -298,6 +298,10 @@ pub const Bench = struct {
     /// buffered): A = `--direct` as given, B = its opposite.
     abba: bool = false,
     json: bool = false,
+    /// The hash microbench (`bench.hash_bench`): the format's hash against
+    /// the xxh3-64 reference column on the format's shapes; CPU only, no
+    /// mountpoint (the one `bench` form without one).
+    hash: bool = false,
 
     pub fn anyPhase(self: Bench) bool {
         return self.write or self.read or self.stat or self.del;
@@ -401,6 +405,8 @@ pub const Refusal = union(enum) {
     /// `config`/`staging`/`claim` need a sub-verb.
     missing_subverb: []const u8,
     unknown_subverb: struct { verb: []const u8, word: []const u8 },
+    /// `bench --hash`: a phase, shape or bracket flag beside the CPU bench.
+    bench_hash_with_shape,
     /// `bench`: a size word that is not `<int>[k|m|g|t]`.
     bad_size: struct { flag: []const u8, word: []const u8 },
     bench_suite_with_shape: []const u8,
@@ -449,6 +455,7 @@ pub const Refusal = union(enum) {
             .unknown_subverb => |u| try w.print("{s}: '{s}' is not a sub-verb", .{ u.verb, u.word }),
             .bad_size => |b| try w.print("bench: {s} '{s}' is not a size (<integer>[k|m|g|t], ≥ 1)", .{ b.flag, b.word }),
             .bench_suite_with_shape => |f| try w.print("bench: '{s}' needs a phase flag (-w/-r/--stat/--del) — the bare invocation runs the fixed saturation suite", .{f}),
+            .bench_hash_with_shape => try w.writeAll("bench: --hash is the CPU hash microbench — it takes no mountpoint, phase, shape or bracket flag (only --json)"),
             .bad_take_slots => |t| try w.print("volume add-meta: --take-slots '{s}' is neither a count (≥ 1) nor a comma list of slot ids (each < 65536)", .{t}),
             .fsck_lattice => |why| try w.print("fsck: {s}", .{why}),
             .bad_shards => |t| try w.print("fsck: --shards '{s}' is not k/N with 0 ≤ k < N", .{t}),
@@ -503,6 +510,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs job rotate-enroll sqmeta://<path>
         \\  squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>
         \\  squeezefs bench [-w] [-r] [--stat] [--del] [-t N] [-n N] [-s SIZE] [-b SIZE] [--rand] [--direct] [--time S] [-i N] [--abba] [--json] [--smoke] <mountpoint>
+        \\  squeezefs bench --hash [--json]
         \\  squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>
         \\  squeezefs nvmeof unshare <subnqn>
         \\  squeezefs nvmeof list [--json]
@@ -546,7 +554,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n       squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…]|<mountpoint> <device>\n       squeezefs volume remove-data sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n       squeezefs volume undrain sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n",
         .job => "usage: squeezefs job list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs job status|pause|resume|cancel sqmeta://<path>|<mountpoint> job-<16 hex>\n       squeezefs job throttle <mountpoint> job-<16 hex> <pct>\n       squeezefs job worker sqmeta://<path>\n       squeezefs job rotate-enroll sqmeta://<path>\n",
         .defrag => "usage: squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>\n",
-        .bench => "usage: squeezefs bench [-w] [-r] [--stat] [--del] [-t THREADS] [-n FILES] [-s SIZE] [-b BLOCK] [--rand] [--direct] [--time SECS] [-i ITERATIONS] [--abba] [--json] [--smoke] <mountpoint>\n",
+        .bench => "usage: squeezefs bench [-w] [-r] [--stat] [--del] [-t THREADS] [-n FILES] [-s SIZE] [-b BLOCK] [--rand] [--direct] [--time SECS] [-i ITERATIONS] [--abba] [--json] [--smoke] <mountpoint>\n       squeezefs bench --hash [--json]\n",
         .version, .help => all,
     };
 }
@@ -1672,7 +1680,22 @@ fn parseBench(words: []const []const u8, diag: *Refusal) Error!Verb {
             out.abba = true;
         } else if (std.mem.eql(u8, f.name, "--json")) {
             out.json = true;
+        } else if (std.mem.eql(u8, f.name, "--hash")) {
+            out.hash = true;
         } else return c.unknown(f);
+    }
+    if (out.hash) {
+        // CPU only: no mountpoint, and no shape word may pretend otherwise.
+        if (c.pos().len != 0) {
+            diag.* = .{ .extra_positional = .{ .verb = c.verb, .word = c.pos()[0] } };
+            return error.Refused;
+        }
+        if (out.anyPhase() or out.smoke or out.abba or out.block != null or out.rand) {
+            diag.* = .{ .bench_hash_with_shape = {} };
+            return error.Refused;
+        }
+        out.mountpoint = "";
+        return .{ .bench = out };
     }
     out.mountpoint = try exactlyOne(&c, "the mountpoint");
     if (out.mountpoint.len == 0 or out.mountpoint[0] != '/') {
@@ -2135,6 +2158,12 @@ test "bench: every flag; sizes accept k/m/g/t and refuse garbage and 0; the bare
     try testing.expect((try refusal(av(&.{ "bench", "-i", "0", "/mnt/sqz" }))) == .bad_int);
     try testing.expect((try refusal(av(&.{ "bench", "mnt" }))) == .bad_target);
     try testing.expect((try refusal(av(&.{"bench"}))) == .missing_positional);
+    // The CPU hash microbench: no mountpoint; `--json` is its only companion.
+    const hb = try parse(av(&.{ "bench", "--hash", "--json" }), &d);
+    try testing.expect(hb.bench.hash and hb.bench.json and hb.bench.mountpoint.len == 0);
+    try testing.expect((try refusal(av(&.{ "bench", "--hash", "/mnt/sqz" }))) == .extra_positional);
+    try testing.expect((try refusal(av(&.{ "bench", "--hash", "-w" }))) == .bench_hash_with_shape);
+    try testing.expect((try refusal(av(&.{ "bench", "--hash", "--smoke" }))) == .bench_hash_with_shape);
 }
 
 test "appenders [--json] TARGET and appender clear TARGET ID: the URI checked, the id through the one integer parser, sub-verbs refused by name" {

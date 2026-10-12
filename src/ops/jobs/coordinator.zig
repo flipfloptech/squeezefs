@@ -1094,14 +1094,14 @@ pub const Node = struct {
     const PlaneVerify = struct {
         plane: *plane_mod.DataPlane,
         fn vr(self: *PlaneVerify) wire_mod.VerifyRead {
-            return .{ .ctx = self, .read_xxh3 = &read };
+            return .{ .ctx = self, .read_csum = &read };
         }
         fn read(ctx: *anyopaque, d: DestTuple, len: u64) error{Io}!u64 {
             const self: *PlaneVerify = @ptrCast(@alignCast(ctx));
             const buf = self.plane.gpa.alloc(u8, @intCast(len)) catch return error.Io;
             defer self.plane.gpa.free(buf);
             self.plane.deviceSeam().read(d.vol_tag, d.block_idx * self.plane.chunk, buf) catch return error.Io;
-            return @import("../../core/checksum.zig").xxh3(buf);
+            return @import("../../core/checksum.zig").hash64(buf);
         }
     };
 

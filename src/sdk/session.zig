@@ -25,6 +25,7 @@
 //! before DONE daemon-side, so its CQE already implies durability.
 
 const std = @import("std");
+const checksum = @import("../core/checksum.zig");
 const linux = std.os.linux;
 const Atomic = std.atomic.Value;
 const assert = std.debug.assert;
@@ -1380,13 +1381,13 @@ test "sdk e2e: a 64 MiB buffer — the whole default arena as ONE allocation —
     const data = s.bufAddr(big).?[0..big.len];
     var prng = std.Random.DefaultPrng.init(0x64);
     prng.random().bytes(data);
-    const expect_hash = std.hash.XxHash3.hash(0, data);
+    const expect_hash = checksum.hash64(data);
     const iov = [_]IoVec{.{ .buf = big, .buf_off = 0, .len = big.len }};
     try testing.expectEqual(@as(i64, 64 << 20), s.rw(f, .write, &iov, 0));
     @memset(data, 0);
     try testing.expectEqual(@as(i64, 64 << 20), s.rw(f, .read, &iov, 0));
-    try testing.expectEqual(expect_hash, std.hash.XxHash3.hash(0, data));
-    try testing.expectEqual(expect_hash, std.hash.XxHash3.hash(0, fx.store.?));
+    try testing.expectEqual(expect_hash, checksum.hash64(data));
+    try testing.expectEqual(expect_hash, checksum.hash64(fx.store.?));
     for (s.cl.m.slots()) |*sl| try testing.expectEqual(@as(u32, 0), sl.core.state.load(.monotonic));
     // A vector: three windows of the one buffer; a read past the store's
     // end is short and the fold stops there (prefix).

@@ -392,7 +392,7 @@ const Rig = struct {
 
     /// O_DIRECT round trip of `roundtrip_len` random bytes through the
     /// io_uring file layer on the block node; the content read back
-    /// equals what was written (xxh3 per chunk).
+    /// equals what was written (hash64 per chunk).
     fn roundTrip(self: *Rig, dev: []const u8) !void {
         _ = uring_fs.registerMetaDevice(self.gpa, &self.env, dev) catch return error.DirectOpenRefused;
         var buf = try uring_fs.AlignedBuf.zeroed(self.gpa, roundtrip_chunk, 4096);
@@ -401,14 +401,14 @@ const Rig = struct {
         var prng = std.Random.DefaultPrng.init(@intCast(self.pid));
         for (&sums, 0..) |*s, i| {
             prng.random().bytes(buf.bytes);
-            s.* = checksum.xxh3(buf.bytes);
+            s.* = checksum.hash64(buf.bytes);
             try self.pool.writeAt(dev, i * roundtrip_chunk, buf.bytes);
         }
         try self.pool.fdatasync(dev);
         for (sums, 0..) |s, i| {
             var res = try self.pool.readAt(dev, i * roundtrip_chunk, roundtrip_chunk);
             defer res.deinit();
-            try testing.expectEqual(s, checksum.xxh3(res.bytes()));
+            try testing.expectEqual(s, checksum.hash64(res.bytes()));
         }
     }
 

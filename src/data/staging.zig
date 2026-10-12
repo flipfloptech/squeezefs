@@ -134,13 +134,14 @@ pub fn writePhasesJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 /// ASCII in disk order (0002 row 38).
 pub const SEGMENT_MAGIC = "SQZS".*;
-/// v2: the record carries TWO header slots (A at the grain, B at
-/// `HEADER_B_OFF`) so an in-place append rewrites the slot that is NOT
-/// current and recovery takes the valid slot with the higher generation —
-/// a kill between any two stores leaves the old record intact (decision
-/// 0003 §J.2). A v1 record (one slot) is a torn record to this scan: the
-/// ring is a cache, wiped loud.
-pub const SEGMENT_RECORD_VERSION: u16 = 2;
+/// v3: v2's two header slots (A at the grain, B at `HEADER_B_OFF`, so an
+/// in-place append rewrites the slot that is NOT current and recovery takes
+/// the valid slot with the higher generation — a kill between any two
+/// stores leaves the old record intact, decision 0003 §J.2) with the
+/// checksum sqzhash128's low 64 bits (0003 §M). A v1 (one slot) or v2
+/// (xxh3-64) record is a torn record to this scan: the ring is a cache,
+/// wiped loud.
+pub const SEGMENT_RECORD_VERSION: u16 = 3;
 /// Records and their values sit on the LBA grain: the value is the zero-copy
 /// DMA source of a promotion (`O_DIRECT` refuses an unaligned buffer) and a
 /// header on the grain is what the recovery scan steps by.
@@ -162,7 +163,7 @@ pub const HeaderSlot = enum(u8) {
     }
 };
 
-/// 40 B, little-endian; `xxh3` over header (field zeroed) ‖ key ‖ value.
+/// 40 B, little-endian; `hash64` over header (field zeroed) ‖ key ‖ value.
 pub const SegmentRecordWire = extern struct {
     magic: [4]u8,
     version_le: [2]u8,
@@ -172,11 +173,11 @@ pub const SegmentRecordWire = extern struct {
     val_len_le: [4]u8,
     generation_le: [8]u8,
     fencing_le: [8]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 };
 
 pub const RECORD_HEADER_LEN: usize = @sizeOf(SegmentRecordWire);
-const CHECKSUM_OFF: usize = @offsetOf(SegmentRecordWire, "xxh3_le");
+const CHECKSUM_OFF: usize = @offsetOf(SegmentRecordWire, "csum_le");
 
 /// `file_id[16] ‖ ino u64 LE` — 24 B.
 pub const StagingKey = extern struct {
@@ -260,26 +261,26 @@ pub const RecordHeader = struct {
     val_len: u32,
     generation: u64,
     fencing: u64,
-    xxh3: u64,
+    csum: u64,
 
     pub fn footprintBytes(self: RecordHeader) u64 {
         return footprint(self.key_len, self.val_len);
     }
 };
 
-/// The checksum's streaming state over the VALUE (`xxh3` consumes the value
+/// The checksum's streaming state over the VALUE (`hash64` consumes the value
 /// FIRST, the key and the header LAST): an in-place append extends the
 /// state by the appended bytes and finishes it — O(appended), never a
 /// rehash of a 4 MiB image per 4-byte append. The live cell keeps the state.
-pub const ValueHash = std.hash.XxHash3;
+pub const ValueHash = checksum.Hasher;
 
 pub fn valueHash(value: []const u8) ValueHash {
-    var h = ValueHash.init(0);
+    var h: ValueHash = .init();
     h.update(value);
     return h;
 }
 
-/// Finish the record checksum from the value's state: `xxh3(value ‖ key ‖
+/// Finish the record checksum from the value's state: `hash64(value ‖ key ‖
 /// header[0..32] ‖ 0⁸)` (the checksum field hashed as zeros).
 fn finishChecksum(state: *const ValueHash, header: []const u8, key: []const u8) u64 {
     var h = state.*;
@@ -287,7 +288,7 @@ fn finishChecksum(state: *const ValueHash, header: []const u8, key: []const u8) 
     h.update(header[0..CHECKSUM_OFF]);
     const zeros: [8]u8 = @splat(0);
     h.update(&zeros);
-    return h.final();
+    return h.finalLow64();
 }
 
 /// Write `header A ‖ key ‖ zero pad (slot B cleared) ‖ value` at `rec_off`
@@ -307,7 +308,7 @@ pub fn writeRecord(image: []u8, rec_off: u64, key: []const u8, value: []const u8
 /// Write one header slot (the checksum from the value's state, stamped
 /// last); the other slot is untouched.
 fn writeHeader(image: []u8, rec_off: u64, slot: HeaderSlot, key: []const u8, val_len: usize, generation: u64, fencing: u64, state: *const ValueHash) void {
-    var h: SegmentRecordWire = .{ .magic = SEGMENT_MAGIC, .version_le = undefined, .flags_le = .{ 0, 0 }, .key_len_le = undefined, .val_len_le = undefined, .generation_le = undefined, .fencing_le = undefined, .xxh3_le = @splat(0) };
+    var h: SegmentRecordWire = .{ .magic = SEGMENT_MAGIC, .version_le = undefined, .flags_le = .{ 0, 0 }, .key_len_le = undefined, .val_len_le = undefined, .generation_le = undefined, .fencing_le = undefined, .csum_le = @splat(0) };
     std.mem.writeInt(u16, &h.version_le, SEGMENT_RECORD_VERSION, .little);
     std.mem.writeInt(u32, &h.key_len_le, @intCast(key.len), .little);
     std.mem.writeInt(u32, &h.val_len_le, @intCast(val_len), .little);
@@ -343,7 +344,7 @@ pub fn readHeaderAt(image: []const u8, rec_off: u64, slot: HeaderSlot) ?RecordHe
         .val_len = std.mem.readInt(u32, &h.val_len_le, .little),
         .generation = std.mem.readInt(u64, &h.generation_le, .little),
         .fencing = std.mem.readInt(u64, &h.fencing_le, .little),
-        .xxh3 = std.mem.readInt(u64, &h.xxh3_le, .little),
+        .csum = std.mem.readInt(u64, &h.csum_le, .little),
     };
     if (RECORD_HEADER_LEN + r.key_len > HEADER_B_OFF) return null;
     if (rec_off + r.footprintBytes() > image.len) return null;
@@ -359,7 +360,7 @@ pub fn verifyRecordAt(image: []const u8, rec_off: u64, h: RecordHeader, slot: He
     const rec = image[@intCast(rec_off)..];
     const voff: usize = @intCast(valueOffset(h.key_len));
     const hdr = rec[@intCast(slot.offset())..][0..RECORD_HEADER_LEN];
-    return h.xxh3 == recordChecksum(hdr, rec[RECORD_HEADER_LEN..][0..h.key_len], rec[voff..][0..h.val_len]);
+    return h.csum == recordChecksum(hdr, rec[RECORD_HEADER_LEN..][0..h.key_len], rec[voff..][0..h.val_len]);
 }
 
 pub const CurrentHeader = struct { h: RecordHeader, slot: HeaderSlot };
@@ -1202,7 +1203,9 @@ pub fn resolveStagedRead(pool: *Pool, seg: *Segment, key: StagingKey, offset: u6
 // ---------------------------------------------------------------------------
 
 pub const MARKER_MAGIC = "SQZM".*;
-pub const MARKER_VERSION: u16 = 1;
+/// v2: the v1 marker under sqzhash128's low 64 bits (0003 §M); a v1 marker
+/// is Corrupt to this binary and the ring is wiped loud.
+pub const MARKER_VERSION: u16 = 2;
 /// The marker names the previous set epoch too (an `add-meta` rebind in
 /// flight).
 pub const MARKER_FLAG_DUAL: u16 = 1 << 0;
@@ -1220,30 +1223,30 @@ pub const StagingMarkerWire = extern struct {
     content_version_le: [4]u8,
     identity_le: [8]u8,
     prev_set_epoch_le: [8]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 };
 
 pub const MARKER_LEN: usize = @sizeOf(StagingMarkerWire);
-const MARKER_CHECKSUM_OFF: usize = @offsetOf(StagingMarkerWire, "xxh3_le");
+const MARKER_CHECKSUM_OFF: usize = @offsetOf(StagingMarkerWire, "csum_le");
 
 comptime {
     assert(MARKER_LEN == 72);
     assert(MARKER_CHECKSUM_OFF == 64);
 }
 
-/// The ring's identity: `xxh3(set_uuid ‖ "staging")`. WHY: a ring binds to
+/// The ring's identity: `hash64(set_uuid ‖ "staging")`. WHY: a ring binds to
 /// ONE volume set for its life, and the set uuid is the one durable identity
 /// every member's superblock carries (so a reformat — a new uuid — or a
 /// different set never adopts a stale ring); the domain-separating suffix
 /// keeps the value distinct from every other derivation of the same uuid
-/// (`hash_seed` once was `xxh3(uuid)`, 0002 row 42), so no two identities
-/// can be forged from one another; xxh3-64 is the format's ONE checksum.
+/// (`hash_seed` once was `hash64(uuid)`, 0002 row 42), so no two identities
+/// can be forged from one another; hash64 is the format's ONE checksum.
 /// Printed as 16 hex digits in logs and directory names; compared as a u64.
 pub fn stagingIdentity(set_uuid: [16]u8) u64 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(&set_uuid);
     h.update("staging");
-    return h.final();
+    return h.finalLow64();
 }
 
 pub const MarkerError = error{Corrupt};
@@ -1273,7 +1276,7 @@ pub const Marker = struct {
             .content_version_le = undefined,
             .identity_le = undefined,
             .prev_set_epoch_le = undefined,
-            .xxh3_le = @splat(0),
+            .csum_le = @splat(0),
         };
         std.mem.writeInt(u16, &w.version_le, MARKER_VERSION, .little);
         std.mem.writeInt(u16, &w.flags_le, if (self.prev_set_epoch != null) MARKER_FLAG_DUAL else 0, .little);
@@ -1355,9 +1358,9 @@ pub fn shardPlan(per_device_capacity: u64, cores: u32, max_entry: u64) u32 {
     return @intCast(shards);
 }
 
-/// `xxh3(key) % shards`.
+/// `hash64(key) % shards`.
 pub fn shardOf(key: StagingKey, shards: u32) u32 {
-    return @intCast(checksum.xxh3(key.bytes()) % shards);
+    return @intCast(checksum.hash64(key.bytes()) % shards);
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,7 +1607,7 @@ fn ramSegment(gpa: Allocator, cap: usize) !struct { image: []u8, seg: Segment } 
     return .{ .image = image, .seg = try Segment.init(gpa, image, .none) };
 }
 
-test "segment record v2: 40 B header {SQZS, version 2, flags 0, key_len, val_len, generation, fencing, xxh3} ‖ key ‖ (slot B cleared) pad to 4 KiB ‖ value; the checksum covers header+key+value; a flipped payload byte is torn; the append slack reserves a quarter of the image (one grain at least) — §J.2's chain bound is 11" {
+test "segment record v3: 40 B header {SQZS, version 3, flags 0, key_len, val_len, generation, fencing, csum} ‖ key ‖ (slot B cleared) pad to 4 KiB ‖ value; the checksum covers header+key+value; a flipped payload byte is torn; the append slack reserves a quarter of the image (one grain at least) — §J.2's chain bound is 11" {
     try testing.expectEqual(@as(u64, 4096), valueOffset(KEY_LEN));
     try testing.expectEqual(@as(u64, 4096 + 100), footprint(KEY_LEN, 100));
     try testing.expectEqual(@as(u64, 8192), stride(KEY_LEN, 100));
@@ -2095,19 +2098,19 @@ test "the reader's view: resident ⇒ the bytes; ledger-only ⇒ in flight; neit
     try testing.expectEqual(@as(u64, 300), lostStagedRangeLen(0, std.math.maxInt(u64), 300));
 }
 
-test "the marker: 72 B, checksummed, identity = xxh3(set_uuid ‖ \"staging\") and checked against its own uuid; every refusal; the bind ladder's verdicts" {
+test "the marker: 72 B, checksummed, identity = hash64(set_uuid ‖ \"staging\") and checked against its own uuid; every refusal; the bind ladder's verdicts" {
     const uuid: [16]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     const m: Marker = .{ .set_uuid = uuid, .set_epoch = 3, .node_token = 0xABC, .mount_slot = 2 };
     const bytes = m.encode();
     try testing.expectEqual(@as(usize, 72), bytes.len);
     try testing.expectEqualSlices(u8, "SQZM", bytes[0..4]);
     try testing.expectEqualSlices(u8, &uuid, bytes[8..24]);
-    var want = std.hash.XxHash3.init(0);
+    var want: checksum.Hasher = .init();
     want.update(&uuid);
     want.update("staging");
-    try testing.expectEqual(want.final(), stagingIdentity(uuid));
+    try testing.expectEqual(want.finalLow64(), stagingIdentity(uuid));
     try testing.expectEqual(stagingIdentity(uuid), std.mem.readInt(u64, bytes[48..56], .little));
-    try testing.expect(stagingIdentity(uuid) != checksum.xxh3(&uuid));
+    try testing.expect(stagingIdentity(uuid) != checksum.hash64(&uuid));
     const back = try Marker.decode(&bytes);
     try testing.expectEqual(m, back);
     // Refusals: length, a flipped byte, a foreign identity for the carried uuid, an unknown flag, a non-dual prev epoch.

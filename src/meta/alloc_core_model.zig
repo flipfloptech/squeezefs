@@ -206,7 +206,7 @@ pub fn Model(comptime cfg: Config, comptime Checks: type) type {
         }
 
         pub fn key(self: *const Self) u64 {
-            var h = std.hash.XxHash3.init(0);
+            var h = std.hash.Wyhash.init(0);
             std.hash.autoHash(&h, self.*);
             return h.final();
         }

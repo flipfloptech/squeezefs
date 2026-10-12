@@ -33,6 +33,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const counters = @import("../../core/counters.zig");
+const checksum = @import("../../core/checksum.zig");
 const log = @import("../../core/log.zig");
 const service = @import("../../wire/service.zig");
 const verbs = @import("../../wire/verbs.zig");
@@ -72,10 +73,10 @@ pub const stats = struct {
 /// mount_slot)` folded to the ledger's u32 (a KEY, never an allocation
 /// authority; the holder itself is writer 0 = appender 0).
 pub fn writerKeyOf(id: records.WriterIdentity) u32 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(std.mem.asBytes(&id.node_token));
     h.update(std.mem.asBytes(&id.mount_slot));
-    return @truncate(h.final());
+    return @truncate(h.finalLow64());
 }
 
 /// The holder's own key.

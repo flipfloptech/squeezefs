@@ -11,7 +11,7 @@
 //! the wire's client otherwise); the device-bound joiner runtime (the
 //! lane over the ring) is `bind.zig`'s.
 //!
-//! Identity (`appender_page.Identity`): `node_token = xxh3(boot_id ‖
+//! Identity (`appender_page.Identity`): `node_token = hash64(boot_id ‖
 //! hostname_hash)` — ONE per host, so N daemons on one box share it and
 //! differ by `mount_slot` (the production shape: `0x5000 + n` for the
 //! in-process harness, the mount's lane index for a daemon); `writer_id`
@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const counters = @import("../../core/counters.zig");
+const checksum = @import("../../core/checksum.zig");
 const log = @import("../../core/log.zig");
 const claim = @import("../guard/claim.zig");
 const node_seq = @import("../node_seq.zig");
@@ -45,10 +46,10 @@ pub const HARNESS_MOUNT_SLOT_BASE: u32 = 0x5000;
 
 /// ONE token per host.
 pub fn nodeToken(id: claim.Identity) u64 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(&id.boot_id);
     h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, id.hostname_hash)));
-    return h.final();
+    return h.finalLow64();
 }
 
 /// The appender identity a mount presents at `mount_slot`.

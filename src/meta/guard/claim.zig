@@ -72,7 +72,7 @@ pub const WriterClaimV1 = extern struct {
     version: u8,
     kind: u8,
     reserved0: [2]u8,
-    /// `xxh3(boot_id ‖ hostname ‖ mount_slot ‖ pid ‖ start_ticks)`: one
+    /// `hash64(boot_id ‖ hostname ‖ mount_slot ‖ pid ‖ start_ticks)`: one
     /// value per INCARNATION, so a crashed incarnation's PR registration is
     /// visible as "own stale" to the register ladder (a per-host key would
     /// make every kill -9 remount an idempotent same-key register and the
@@ -90,7 +90,7 @@ pub const WriterClaimV1 = extern struct {
     heartbeat_seq_le: [8]u8,
     /// The DLM S2 era — rung 6; 0 until then.
     term_le: [8]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 };
 
 pub const CLAIM_LEN: usize = @sizeOf(WriterClaimV1);
@@ -105,7 +105,7 @@ comptime {
     std.debug.assert(@offsetOf(WriterClaimV1, "hostname_hash_le") == 56);
     std.debug.assert(@offsetOf(WriterClaimV1, "heartbeat_seq_le") == 64);
     std.debug.assert(@offsetOf(WriterClaimV1, "term_le") == 72);
-    std.debug.assert(@offsetOf(WriterClaimV1, "xxh3_le") == 80);
+    std.debug.assert(@offsetOf(WriterClaimV1, "csum_le") == 80);
 }
 
 /// The RAM form.
@@ -134,9 +134,9 @@ pub const Claim = struct {
         std.mem.writeInt(u64, &w.hostname_hash_le, self.hostname_hash, .little);
         std.mem.writeInt(u64, &w.heartbeat_seq_le, self.heartbeat_seq, .little);
         std.mem.writeInt(u64, &w.term_le, self.term, .little);
-        w.xxh3_le = @splat(0);
+        w.csum_le = @splat(0);
         var bytes = std.mem.toBytes(w);
-        checksum.stamp(&bytes, @offsetOf(WriterClaimV1, "xxh3_le"));
+        checksum.stamp(&bytes, @offsetOf(WriterClaimV1, "csum_le"));
         return bytes;
     }
 
@@ -146,7 +146,7 @@ pub const Claim = struct {
     /// auto-taken).
     pub fn decode(bytes: []const u8) error{Corrupt}!Claim {
         if (bytes.len != CLAIM_LEN) return error.Corrupt;
-        if (!checksum.verify(bytes, @offsetOf(WriterClaimV1, "xxh3_le"))) return error.Corrupt;
+        if (!checksum.verify(bytes, @offsetOf(WriterClaimV1, "csum_le"))) return error.Corrupt;
         const w = std.mem.bytesToValue(WriterClaimV1, bytes[0..CLAIM_LEN]);
         if (!std.mem.eql(u8, &w.magic, &MAGIC) or w.version != VERSION or w.kind != KIND_WRITER) return error.Corrupt;
         if (!std.mem.allEqual(u8, &w.reserved0, 0) or !std.mem.allEqual(u8, &w.reserved1, 0)) return error.Corrupt;
@@ -210,13 +210,13 @@ pub const Identity = struct {
     /// `writer_id` for mount slot `slot` (the volume's lane index — the
     /// per-daemon coordinate two concurrent volumes of one set differ by).
     pub fn writerId(self: Identity, slot: u16) u64 {
-        var h = std.hash.XxHash3.init(0);
+        var h: checksum.Hasher = .init();
         h.update(&self.boot_id);
         h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, self.hostname_hash)));
         h.update(std.mem.asBytes(&std.mem.nativeToLittle(u16, slot)));
         h.update(std.mem.asBytes(&std.mem.nativeToLittle(u32, self.pid)));
         h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, self.start_ticks)));
-        return h.final();
+        return h.finalLow64();
     }
 
     /// A fresh claim of ours: beat 0 at `now_ns`.
@@ -225,19 +225,19 @@ pub const Identity = struct {
     }
 };
 
-/// The PR key: `xxh3(writer_id ‖ NUL ‖ boot_id)` from the two words the
+/// The PR key: `hash64(writer_id ‖ NUL ‖ boot_id)` from the two words the
 /// claim carries, so a report's holder cross-checks against the record
 /// (B:846-850).
 pub fn prKey(writer_id: u64, boot_id: [16]u8) u64 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, writer_id)));
     h.update(&[_]u8{0});
     h.update(&boot_id);
-    return h.final();
+    return h.finalLow64();
 }
 
 pub fn hostnameHash(name: []const u8) u64 {
-    return checksum.xxh3(name);
+    return checksum.hash64(name);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +477,7 @@ test "the record round-trips byte-exactly; decode is total (length, magic, versi
     // A re-stamped forgery of a reserved byte still refuses (reserved read as 0).
     var forged = bytes;
     forged[6] = 1;
-    checksum.stamp(&forged, @offsetOf(WriterClaimV1, "xxh3_le"));
+    checksum.stamp(&forged, @offsetOf(WriterClaimV1, "csum_le"));
     try testing.expectError(error.Corrupt, Claim.decode(&forged));
     try testing.expectError(error.Corrupt, Claim.decode(&[_]u8{}));
 }
@@ -601,7 +601,7 @@ fn claimFuzz(_: void, smith: *std.testing.Smith) !void {
     _ = Claim.decode(buf[0..len]) catch {};
     if (len >= CLAIM_LEN) {
         const img = buf[0..CLAIM_LEN];
-        checksum.stamp(img, @offsetOf(WriterClaimV1, "xxh3_le"));
+        checksum.stamp(img, @offsetOf(WriterClaimV1, "csum_le"));
         if (Claim.decode(img)) |c| try std.testing.expectEqualSlices(u8, img, &c.encode()) else |_| {}
     }
 }

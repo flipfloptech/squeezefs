@@ -1,4 +1,4 @@
-//! Bsets: sorted, xxh3-checksummed record batches — build / verify / binary
+//! Bsets: sorted, hash64-checksummed record batches — build / verify / binary
 //! search / n-way merge — and the node-level `KBSF` frame they ride in
 //! (charter §5.1 bset `{…}` framing; `docs/porting/kv_record_bset.md` §4–§5).
 //!
@@ -32,7 +32,7 @@ const RecordKind = rec.RecordKind;
 pub const BSET_MAGIC: u32 = std.mem.readInt(u32, "BSET", .little);
 pub const BSET_VERSION: u16 = 1;
 pub const BSET_HEADER_LEN: usize = 32;
-/// The checksum field: xxh3 over `[0..24) ‖ 8 × 0x00 ‖ [32..)`.
+/// The checksum field: hash64 over `[0..24) ‖ 8 × 0x00 ‖ [32..)`.
 pub const BSET_CHECKSUM_OFF: usize = 24;
 
 /// `magic u32 ‖ version u16 ‖ reserved u16 ‖ record_count u32 ‖ data_len u32
@@ -75,12 +75,12 @@ comptime {
     assert(@offsetOf(BsetHeader, "checksum_le") == BSET_CHECKSUM_OFF);
 }
 
-/// xxh3 over a bset image with the checksum field zeroed. Public so tests
+/// hash64 over a bset image with the checksum field zeroed. Public so tests
 /// and fuzzers can RESTAMP a doctored image: the digest is integrity, not
 /// authentication, and the structural gates behind it must be reachable.
 pub fn checksumImage(buf: []const u8) u64 {
     assert(buf.len >= BSET_HEADER_LEN);
-    return checksum.xxh3FieldZeroed(buf, BSET_CHECKSUM_OFF);
+    return checksum.hash64FieldZeroed(buf, BSET_CHECKSUM_OFF);
 }
 
 pub fn stampChecksum(buf: []u8) void {
@@ -435,7 +435,7 @@ pub const NODE_PAGE: usize = 4096;
 pub const BSET_FRAME_MAGIC: u32 = std.mem.readInt(u32, "KBSF", .little);
 /// The ONE frame (format v4; decision 0002 row 37): `magic u32 ‖ version
 /// u16 ‖ reserved u16 (= 0, checked) ‖ node_seq_at_write u64 ‖ padded_len
-/// u32 ‖ bset_len u32 ‖ appender_id u32 ‖ g u32 ‖ xxh3 u64` over `[0..32)`.
+/// u32 ‖ bset_len u32 ‖ appender_id u32 ‖ g u32 ‖ hash64 u64` over `[0..32)`.
 /// The fencing stamp is on EVERY frame — charter §5.5 "Detection-grade
 /// frame screen on every bset frame"; `(0, 0)` is the manager's structural
 /// stamp and the one-member forest's.
@@ -519,7 +519,7 @@ pub fn encodeBsetFrame(gpa: Allocator, stamp: FrameStamp, node_size: usize, node
     std.mem.writeInt(u32, &h.g_le, stamp.g, .little);
     // The checksum follows the bytes it covers: everything before it.
     const covered = std.mem.asBytes(&h)[0..BSET_FRAME_CHECKSUM_OFF];
-    std.mem.writeInt(u64, &h.checksum_le, checksum.xxh3(covered), .little);
+    std.mem.writeInt(u64, &h.checksum_le, checksum.hash64(covered), .little);
     out[0..BSET_FRAME_LEN].* = std.mem.toBytes(h);
     @memcpy(out[BSET_FRAME_LEN..][0..bset.len], bset);
     return out;
@@ -556,7 +556,7 @@ pub fn probeFrame(buf: []const u8, pos: usize, node_seq: u64) FrameProbe {
     const hdr = buf[pos..][0..BSET_FRAME_LEN];
     const h = std.mem.bytesToValue(FrameHeaderWire, hdr);
     if (std.mem.readInt(u32, &h.magic_le, .little) != BSET_FRAME_MAGIC) return .clean_end;
-    if (std.mem.readInt(u64, &h.checksum_le, .little) != checksum.xxh3(hdr[0..BSET_FRAME_CHECKSUM_OFF])) return .garbage;
+    if (std.mem.readInt(u64, &h.checksum_le, .little) != checksum.hash64(hdr[0..BSET_FRAME_CHECKSUM_OFF])) return .garbage;
     if (std.mem.readInt(u16, &h.version_le, .little) != BSET_FRAME_VERSION) return .garbage;
     if (std.mem.readInt(u16, &h.reserved_le, .little) != 0) return .garbage;
     const node_seq_at_write = std.mem.readInt(u64, &h.node_seq_at_write_le, .little);
@@ -729,7 +729,7 @@ test "bset build rejects empty, unsorted and duplicate inputs" {
     try testing.expectError(error.RecordsNotAscending, buildFrom(gpa, &dup, 5));
 }
 
-test "bset parse detects corruption anywhere via xxh3; structural gates come first in order" {
+test "bset parse detects corruption anywhere via hash64; structural gates come first in order" {
     const gpa = testing.allocator;
     var recs = [_]Record{ try put(gpa, 1, 1), try put(gpa, 2, 2) };
     defer rec.deinitRecords(gpa, &recs);
@@ -1206,7 +1206,7 @@ test "forced collision chain resolves by full name and orders cookies like keys"
 
 /// The committed fixture's path, relative to the repository root (the test
 /// binary's cwd).
-pub const findvsa_fixture_path = "tests/fixtures/findvsa_pred_bset.v4.bin";
+pub const findvsa_fixture_path = "tests/fixtures/findvsa_pred_bset.v5.bin";
 pub const findvsa_fixture_seed: u64 = 0xF1D5_A000_0000_0004;
 pub const findvsa_fixture_horizon: u64 = 72_220_661;
 /// Files under the fixture's one directory: enough that the leaf is a
@@ -1220,6 +1220,7 @@ pub const findvsa_fixture_files: usize = 1640;
 pub fn findVsAFixtureImage(gpa: Allocator) (BuildError || rec.EncodeError)![]u8 {
     var prng = std.Random.DefaultPrng.init(findvsa_fixture_seed);
     const r = prng.random();
+    const name_key: key.NameKey = .init(findvsa_fixture_seed);
     var recs: std.ArrayList(Record) = .empty;
     defer freeAll(gpa, &recs);
     const dir_ino: u64 = 2;
@@ -1233,7 +1234,7 @@ pub fn findVsAFixtureImage(gpa: Allocator) (BuildError || rec.EncodeError)![]u8 
         try recs.append(gpa, try Record.put(gpa, &key.inodeKey(ino), seq, &v.encode()));
         seq += 1;
         const dv = try (rec.DentryValue{ .child_ino = ino, .file_type = 8, .name = name }).encodeInto(&dbuf);
-        try recs.append(gpa, try Record.put(gpa, &key.dentryKey(dir_ino, key.dentryNameHash54(name, findvsa_fixture_seed), 0), seq, dv));
+        try recs.append(gpa, try Record.put(gpa, &key.dentryKey(dir_ino, key.dentryNameHash54(name, &name_key), 0), seq, dv));
         seq += 1;
         if (i % 7 == 0) {
             try recs.append(gpa, try Record.delta(gpa, &key.inodeKey(ino), seq, rec.InodeDelta.times(seq, seq)));
@@ -1285,7 +1286,7 @@ test "the committed FIND-VS-A fixture is the generator's bytes; it parses, every
     try testing.expectEqual(distinct, out.items.len);
 }
 
-test "frame: 40 B header {KBSF, version 1, reserved 0, node_seq, padded_len, bset_len, appender_id, g, xxh3 over [0..32)}, bset at 40, zero pad to a 4 KiB multiple; probe order" {
+test "frame: 40 B header {KBSF, version 1, reserved 0, node_seq, padded_len, bset_len, appender_id, g, hash64 over [0..32)}, bset at 40, zero pad to a 4 KiB multiple; probe order" {
     const gpa = testing.allocator;
     var recs = [_]Record{ try put(gpa, 1, 1), try put(gpa, 2, 2) };
     defer rec.deinitRecords(gpa, &recs);
@@ -1305,7 +1306,7 @@ test "frame: 40 B header {KBSF, version 1, reserved 0, node_seq, padded_len, bse
     const bset_len = std.mem.readInt(u32, frame[20..24], .little);
     try testing.expectEqualSlices(u8, &.{ 2, 1, 0, 0 }, frame[24..28]);
     try testing.expectEqualSlices(u8, &.{ 4, 3, 0, 0 }, frame[28..32]);
-    try testing.expectEqual(checksum.xxh3(frame[0..32]), std.mem.readInt(u64, frame[32..40], .little));
+    try testing.expectEqual(checksum.hash64(frame[0..32]), std.mem.readInt(u64, frame[32..40], .little));
     const bset = try buildBset(gpa, refs, 2);
     defer gpa.free(bset);
     try testing.expectEqual(@as(u32, @intCast(bset.len)), bset_len);
@@ -1335,12 +1336,12 @@ test "frame: 40 B header {KBSF, version 1, reserved 0, node_seq, padded_len, bse
     try testing.expectEqual(FrameProbe.garbage, probeFrame(torn, 0, 0xABCD));
     @memcpy(torn, frame);
     torn[4] = 2;
-    std.mem.writeInt(u64, torn[32..40], checksum.xxh3(torn[0..32]), .little);
+    std.mem.writeInt(u64, torn[32..40], checksum.hash64(torn[0..32]), .little);
     try testing.expectEqual(FrameProbe.garbage, probeFrame(torn, 0, 0xABCD));
     // Reserved is CHECKED: a restamped non-zero reserved is a verified liar.
     @memcpy(torn, frame);
     torn[6] = 1;
-    std.mem.writeInt(u64, torn[32..40], checksum.xxh3(torn[0..32]), .little);
+    std.mem.writeInt(u64, torn[32..40], checksum.hash64(torn[0..32]), .little);
     try testing.expectEqual(FrameProbe.garbage, probeFrame(torn, 0, 0xABCD));
     try testing.expectEqual(FrameProbe.stale_incarnation, probeFrame(frame, 0, 0xABCE));
     try testing.expectEqual(FrameProbe.stale_incarnation, probeFrame(frame, 0, 0xABCC));

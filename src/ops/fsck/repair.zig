@@ -519,7 +519,7 @@ pub const Engine = struct {
         if (self.hook(f)) return .{ .refused = "aborted after the quarantine (re-detected next run)" };
         const t = try host.store.begin(@src());
         errdefer host.store.abandon(t);
-        layout.publishLayout(t, .{ .ino = ino, .hash_seed = host.hash_seed, .coll_seq = rec.coll_seq, .prev = rec.layout, .layout = flipped, .proofs = &.{} }, classes.refs_seam, host.geo) catch |e| return switch (e) {
+        layout.publishLayout(t, .{ .ino = ino, .name_key = host.name_key, .coll_seq = rec.coll_seq, .prev = rec.layout, .layout = flipped, .proofs = &.{} }, classes.refs_seam, host.geo) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => .{ .refused = "the flipped layout was refused by the publish law" },
         };

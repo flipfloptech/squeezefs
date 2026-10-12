@@ -856,7 +856,7 @@ fn openReason(e: meta_set.OpenError) []const u8 {
         error.Busy => "another writer holds the single-writer guard (the flock, or a live writer claim — see the log)",
         error.InvalidIdentity => "SQUEEZEFS_HOSTNQN / SQUEEZEFS_HOSTID must be configured as a pair or not at all",
         error.NotFormatted => "not formatted (zeroed superblock) — run `squeezefs format` first",
-        error.LegacyFormat => "a pre-v4 squeezefs format, which this binary does not mount — reformat required",
+        error.LegacyFormat => "a pre-v5 squeezefs format, which this binary does not mount — reformat required",
         error.UnsupportedFormat => "unknown or later-rung capability bits — reformat or a later binary",
         error.Corrupt => "corruption outside the replay window (see the log)",
         error.DeviceRefused => "the device refused registration (O_DIRECT posture) or does not exist",

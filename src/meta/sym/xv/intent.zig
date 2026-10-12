@@ -3,7 +3,7 @@
 //! roll-forward at mount and on the cadence"; `docs/porting/
 //! sym_tokens_intents_striping.md` §2.1, §2.8): the v4 image — a 32 B
 //! `IntentHeaderWire` + `step_count` × `XvStepWire` (48 B + the padded
-//! name) checksummed xxh3-64 over the field-zeroed image; the KEY law
+//! name) checksummed hash64 over the field-zeroed image; the KEY law
 //! (the id IS the key: 56 bits in the xattr hash field, 8 in the
 //! collision byte — injective, so a write needs no chain probe and no new
 //! lock); the HOME law (local 0 of a slot's namespace, which no inode ever
@@ -79,15 +79,15 @@ pub const IntentHeaderWire = extern struct {
     tx_id_le: [8]u8,
     step_count_le: [2]u8,
     reserved_le: [2]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 
     pub const LEN: usize = 32;
-    pub const XXH3_OFF: usize = 24;
+    pub const CSUM_OFF: usize = 24;
 };
 
 comptime {
     assert(@sizeOf(IntentHeaderWire) == IntentHeaderWire.LEN);
-    assert(@offsetOf(IntentHeaderWire, "xxh3_le") == IntentHeaderWire.XXH3_OFF);
+    assert(@offsetOf(IntentHeaderWire, "csum_le") == IntentHeaderWire.CSUM_OFF);
     assert(@sizeOf(StepWire) == 48);
 }
 
@@ -141,7 +141,7 @@ pub fn encode(op: Op, flags: u8, tx_id: u64, steps: []const StepRec, cap: usize,
     std.mem.writeInt(u64, &h.tx_id_le, tx_id, .little);
     std.mem.writeInt(u16, &h.step_count_le, @intCast(steps.len), .little);
     std.mem.writeInt(u16, &h.reserved_le, 0, .little);
-    @memset(&h.xxh3_le, 0);
+    @memset(&h.csum_le, 0);
     out[0..IntentHeaderWire.LEN].* = std.mem.toBytes(h);
     var off: usize = IntentHeaderWire.LEN;
     for (steps) |s| {
@@ -154,7 +154,7 @@ pub fn encode(op: Op, flags: u8, tx_id: u64, steps: []const StepRec, cap: usize,
         off += padded;
     }
     assert(off == n);
-    checksum.stamp(out[0..n], IntentHeaderWire.XXH3_OFF);
+    checksum.stamp(out[0..n], IntentHeaderWire.CSUM_OFF);
     return out[0..n];
 }
 
@@ -171,7 +171,7 @@ pub fn decode(bytes: []const u8, steps_out: []StepRec) DecodeError!Intent {
     const op = std.enums.fromInt(Op, h.op) orelse return error.Corrupt;
     const n = std.mem.readInt(u16, &h.step_count_le, .little);
     if (n == 0 or n > XV_MAX_STEPS or n > steps_out.len) return error.Corrupt;
-    if (!checksum.verify(bytes, IntentHeaderWire.XXH3_OFF)) return error.Corrupt;
+    if (!checksum.verify(bytes, IntentHeaderWire.CSUM_OFF)) return error.Corrupt;
     var off: usize = IntentHeaderWire.LEN;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -511,7 +511,7 @@ fn sampleSteps() [3]StepRec {
     };
 }
 
-test "the intent image round-trips: 32 B header + 48 B steps + padded names, xxh3 over the field-zeroed image; every refusal class — magic, version, flags, reserved, checksum, 0 or 137 steps, a bad step word, a trailing byte, a non-zero pad, a record past the cap" {
+test "the intent image round-trips: 32 B header + 48 B steps + padded names, hash64 over the field-zeroed image; every refusal class — magic, version, flags, reserved, checksum, 0 or 137 steps, a bad step word, a trailing byte, a non-zero pad, a record past the cap" {
     var buf: [4096]u8 = undefined;
     const steps = sampleSteps();
     const img = try encode(.create, 0, (3 << 40) | 42, &steps, 16 << 10, &buf);
@@ -547,12 +547,12 @@ test "the intent image round-trips: 32 B header + 48 B steps + padded names, xxh
     // A non-zero pad byte (re-stamped so only the pad law refuses).
     @memcpy(bad[0..img.len], img);
     bad[32 + 48 + 48 + 5] = 1;
-    checksum.stamp(bad[0..img.len], IntentHeaderWire.XXH3_OFF);
+    checksum.stamp(bad[0..img.len], IntentHeaderWire.CSUM_OFF);
     try testing.expectError(error.Corrupt, decode(bad[0..img.len], &out));
     // A step with a count word on a dentry kind (step 1's `w0`).
     @memcpy(bad[0..img.len], img);
     bad[32 + 48 + 32] = 1;
-    checksum.stamp(bad[0..img.len], IntentHeaderWire.XXH3_OFF);
+    checksum.stamp(bad[0..img.len], IntentHeaderWire.CSUM_OFF);
     try testing.expectError(error.Corrupt, decode(bad[0..img.len], &out));
     // The step bounds and the cap.
     try testing.expectError(error.TooManySteps, encode(.create, 0, 1, &.{}, 16 << 10, &buf));

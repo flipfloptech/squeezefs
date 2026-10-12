@@ -1197,11 +1197,11 @@ const LeaseOracle = struct {
     }
 };
 
-/// A member's token client id: xxh3 of its 16 B member id (a reader's id
+/// A member's token client id: hash64 of its 16 B member id (a reader's id
 /// is random, a writer's is its stable identity; both hash injectively
 /// enough for a table keyed per holder).
 pub fn clientIdOf(id: shard.MemberId) tokens.table.ClientId {
-    return checksum.xxh3(&id);
+    return checksum.hash64(&id);
 }
 
 /// The dialled links to this daemon's peers, ONE session per peer, bound

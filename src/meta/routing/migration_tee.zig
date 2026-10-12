@@ -21,6 +21,7 @@
 //! `route_table.slotOfKey` (refs by their owner ino) — no kind skip-list.
 
 const std = @import("std");
+const checksum = @import("../../core/checksum.zig");
 const Allocator = std.mem.Allocator;
 const key = @import("../key.zig");
 const tx = @import("../tx.zig");
@@ -73,7 +74,7 @@ const KeySet = struct {
     /// True iff inserted (absent before).
     fn insert(self: *KeySet, k: []const u8) bool {
         const mask = self.slots.len - 1;
-        var i: usize = @intCast(std.hash.XxHash3.hash(0, k) & mask);
+        var i: usize = @intCast(checksum.hash64(k) & mask);
         while (self.used[i]) : (i = (i + 1) & mask) {
             if (std.mem.eql(u8, self.slots[i].slice(), k)) return false;
         }

@@ -141,7 +141,7 @@ pub const OpenError = error{
     InvalidIdentity,
     /// Blank superblock: `squeezefs format` first.
     NotFormatted,
-    /// A pre-v4 volume: reformat required.
+    /// A pre-v5 volume: reformat required.
     LegacyFormat,
     /// Unknown incompat bits, or a capability bit of a later rung: reformat
     /// or a later binary.
@@ -334,6 +334,9 @@ pub const KvBackend = struct {
     pool_owned: bool,
     volume_len: u64,
     sb: superblock.Superblock,
+    /// `sb.hash_seed` expanded once at open (`key.NameKey`): every name hash
+    /// on this volume takes it by pointer.
+    name_key: key.NameKey,
     /// The DUR-5 generation the next superblock write carries (one past the
     /// newest valid image at open).
     sb_generation: u64,
@@ -491,6 +494,7 @@ pub const KvBackend = struct {
             .pool_owned = opts.pool == null,
             .volume_len = volume_len,
             .sb = sb,
+            .name_key = .init(sb.hash_seed),
             .sb_generation = classified.next_generation,
             .mounted = mounted,
             .dev = dev,
@@ -782,10 +786,10 @@ pub const KvBackend = struct {
                 return error.NotFormatted;
             },
             .legacy => |v| {
-                log.err("{s} is a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required", .{ path, v });
+                log.err("{s} is a pre-v5 squeezefs format (version {d}), which this binary does not mount — reformat required", .{ path, v });
                 return error.LegacyFormat;
             },
-            .v4 => |s| s,
+            .v5 => |s| s,
         };
         if (classified.slot == .backup) log.err("{s}: sector 0 is unreadable — mounting from the redundant superblock copy; investigate the device", .{path});
         if (sb.unknownIncompat() != 0) {
@@ -902,6 +906,7 @@ pub const KvBackend = struct {
             .pool_owned = opts.pool == null,
             .volume_len = volume_len,
             .sb = sb,
+            .name_key = .init(sb.hash_seed),
             .sb_generation = classified.next_generation,
             .mounted = mounted,
             .dev = dev,
@@ -1135,6 +1140,7 @@ pub const KvBackend = struct {
             .pool_owned = opts.pool == null,
             .volume_len = volume_len,
             .sb = sb,
+            .name_key = .init(sb.hash_seed),
             .sb_generation = classified.next_generation,
             .mounted = mounted,
             .dev = dev,
@@ -2210,8 +2216,8 @@ pub const KvBackend = struct {
         return be.ino.snapshot();
     }
 
-    pub fn hashSeed(be: *const KvBackend) u64 {
-        return be.sb.hash_seed;
+    pub fn nameKey(be: *const KvBackend) *const key.NameKey {
+        return &be.name_key;
     }
 
     /// The block-map tree's self-arming ratchet (charter §5.6; finding 43):
@@ -2492,14 +2498,14 @@ fn stageCreate(be: *KvBackend, t: *KvTx, name: []const u8, value_len: usize) !u6
     const parent_value: record.InodeValue = .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2 };
     // The dentry names the GLOBAL ino (charter §5.4: `(local − 2)·W + slot
     // + 2`, slot 0 on the single volume).
-    _ = try economy.stageCreate(t, .{ .hash_seed = be.hashSeed(), .now = 1000, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = ino, .global_ino = inos.makeGlobalIno(ino, 0, inos.ROUTING_WIDTH) });
+    _ = try economy.stageCreate(t, .{ .name_key = be.nameKey(), .now = 1000, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = ino, .global_ino = inos.makeGlobalIno(ino, 0, inos.ROUTING_WIDTH) });
     if (value_len > 0) {
         const v = try be.gpa.alloc(u8, value_len);
         defer be.gpa.free(v);
         @memset(v, 0x5A);
         var xb: [8192]u8 = undefined;
         const xv = try (record.XattrValue{ .name = "user.pad", .value = v }).encodeInto(&xb);
-        try t.stagePut(key.TREE_XATTRS, &key.xattrKey(ino, key.xattrNameHash56("user.pad", be.hashSeed()), 0), xv);
+        try t.stagePut(key.TREE_XATTRS, &key.xattrKey(ino, key.xattrNameHash56("user.pad", be.nameKey()), 0), xv);
     }
     return ino;
 }
@@ -2520,7 +2526,7 @@ fn present(be: *KvBackend, ino: u64) !bool {
 fn dentryPresent(be: *KvBackend, name: []const u8) !bool {
     var kvs: std.ArrayList(tree.KeyValue) = .empty;
     defer tree.deinitKeyValues(testing.allocator, &kvs);
-    const r = tx.dentryChainRange(1, key.dentryNameHash54(name, be.hashSeed()));
+    const r = tx.dentryChainRange(1, key.dentryNameHash54(name, be.nameKey()));
     try be.range(testing.allocator, key.TREE_DENTRIES, &r.start, &r.end, 8, &kvs);
     return kvs.items.len != 0;
 }
@@ -2567,7 +2573,7 @@ test "format (device path) → open → N creates (singles + a group of 8) → l
         // The default format is the symmetric class (charter §5.5).
         try testing.expectEqual(superblock.symmetric_plane, be.sb.features_incompat);
         try testing.expectEqualSlices(u8, &test_set.set_uuid, &be.mounted.membership_stamp.set_uuid);
-        try testing.expectEqual(test_set.hash_seed, be.hashSeed());
+        try testing.expectEqual(test_set.hash_seed, be.sb.hash_seed);
         try testing.expectEqual(@as(?u16, 0), be.mounted.membership_stamp.native_slot);
         var i: usize = 0;
         while (i < 16) : (i += 1) {
@@ -2995,7 +3001,7 @@ test "ONE thread per volume: the pass runs on sqz-jrnl<N>; a 4-thread storm of s
                 const ino: u64 = 1000 + lane_id * per_thread + i;
                 var xb: [256]u8 = undefined;
                 const xv = (record.XattrValue{ .name = "user.one", .value = "x" }).encodeInto(&xb) catch unreachable;
-                t.stagePut(key.TREE_XATTRS, &key.xattrKey(ino, key.xattrNameHash56("user.one", b.hashSeed()), 0), xv) catch unreachable;
+                t.stagePut(key.TREE_XATTRS, &key.xattrKey(ino, key.xattrNameHash56("user.one", b.nameKey()), 0), xv) catch unreachable;
                 b.commit(t) catch unreachable;
             }
         }

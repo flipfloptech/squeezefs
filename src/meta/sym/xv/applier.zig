@@ -13,7 +13,7 @@
 //! | foreign_skipped` with the post-image a count/create step answers.
 //!
 //! Generic over the `Store` contract `fuse/handler/kv_fs.zig` names
-//! (`begin/abandon/commit/lookup/range/hashSeed/fsync`): the product's
+//! (`begin/abandon/commit/lookup/range/nameKey/fsync`): the product's
 //! `MetaSet` (the commit door inside its commit), the portable `MemStore`
 //! in the contracts. The store's commit takes the DOOR — a `SlotBusy`
 //! there is the retryable class the dispatcher re-resolves on.
@@ -100,7 +100,7 @@ pub const Rider = union(enum) {
 
 pub fn assertStore(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "hashSeed" }) |name| {
+        for ([_][]const u8{ "StoreError", "coreError", "begin", "abandon", "commit", "lookup", "range", "fsync", "nameKey" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not an xv Store: lacks `" ++ name ++ "`");
         }
     }
@@ -156,7 +156,7 @@ pub fn Applier(comptime Store: type) type {
         /// The live chain of `(parent, hash54(name))`: the matching dentry
         /// (by FULL name) and every chain key (for the insert's probe).
         pub fn scanChain(self: *Self, parent_key: u64, name: []const u8, kvs: *std.ArrayList(tree.KeyValue)) Error!?Found {
-            const r = tx.dentryChainRange(parent_key, key.dentryNameHash54(name, self.store.hashSeed()));
+            const r = tx.dentryChainRange(parent_key, key.dentryNameHash54(name, self.store.nameKey()));
             self.store.range(self.gpa, key.TREE_DENTRIES, &r.start, &r.end, 256, kvs) catch |e| return storeErr(e);
             var found: ?Found = null;
             for (kvs.items) |kv| {
@@ -287,7 +287,7 @@ pub fn Applier(comptime Store: type) type {
                     }
                     var chain: [256][]const u8 = undefined;
                     for (kvs.items, 0..) |kv, i| chain[i] = kv.key;
-                    const dk = tx.dentryInsertKey(t, self.store.hashSeed(), parent_key, s.name, chain[0..kvs.items.len]) catch |e| return switch (e) {
+                    const dk = tx.dentryInsertKey(t, self.store.nameKey(), parent_key, s.name, chain[0..kvs.items.len]) catch |e| return switch (e) {
                         error.NameTooLong => error.Corrupt,
                         error.DentryChainOverflow => error.ChainFull,
                     };

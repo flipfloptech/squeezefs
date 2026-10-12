@@ -25,7 +25,7 @@ pub const AllocClass = alloc_core.AllocClass;
 /// One bitmap page = one 4 KiB sector: the torn-write unit, so an A/B pair
 /// makes a tear damage only the copy being replaced.
 pub const page_len: usize = 4096;
-/// `magic u32 ‖ page_index u32 ‖ generation u64 ‖ xxh3 u64`.
+/// `magic u32 ‖ page_index u32 ‖ generation u64 ‖ hash64 u64`.
 pub const page_hdr_len: usize = 24;
 pub const page_data_len: usize = page_len - page_hdr_len;
 /// Extents per page: `4072 × 8`. A 1 TiB heap of 256 KiB extents is 4 M bits

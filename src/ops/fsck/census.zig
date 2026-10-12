@@ -57,7 +57,7 @@ pub const Store = struct {
         begin: *const fn (*anyopaque, site: tx.Site) Error!*tx.KvTx,
         commit: *const fn (*anyopaque, *tx.KvTx) Error!void,
         abandon: *const fn (*anyopaque, *tx.KvTx) void,
-        hashSeed: *const fn (*anyopaque) u64,
+        nameKey: *const fn (*anyopaque) *const key.NameKey,
     };
 
     pub fn from(comptime S: type, s: *S) Store {
@@ -82,11 +82,11 @@ pub const Store = struct {
                 const st: *S = @ptrCast(@alignCast(ctx));
                 st.abandon(t);
             }
-            fn hashSeedFn(ctx: *anyopaque) u64 {
+            fn nameKeyFn(ctx: *anyopaque) *const key.NameKey {
                 const st: *S = @ptrCast(@alignCast(ctx));
-                return st.hashSeed();
+                return st.nameKey();
             }
-            const vtable: VTable = .{ .range = &rangeFn, .lookup = &lookupFn, .begin = &beginFn, .commit = &commitFn, .abandon = &abandonFn, .hashSeed = &hashSeedFn };
+            const vtable: VTable = .{ .range = &rangeFn, .lookup = &lookupFn, .begin = &beginFn, .commit = &commitFn, .abandon = &abandonFn, .nameKey = &nameKeyFn };
         };
         return .{ .ctx = s, .vtable = &Adapter.vtable };
     }
@@ -119,8 +119,8 @@ pub const Store = struct {
         self.vtable.abandon(self.ctx, t);
     }
 
-    pub fn hashSeed(self: Store) u64 {
-        return self.vtable.hashSeed(self.ctx);
+    pub fn nameKey(self: Store) *const key.NameKey {
+        return self.vtable.nameKey(self.ctx);
     }
 
     /// The refs oracle's face over this store (kind 6).

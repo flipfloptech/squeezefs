@@ -454,7 +454,7 @@ pub fn RecordShipService(comptime Store: type) type {
             const a = &self.plane.apply;
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(a.gpa, &kvs);
-            const h = key.xattrNameHash56(name, a.store.hashSeed());
+            const h = key.xattrNameHash56(name, a.store.nameKey());
             const start = key.xattrKey(k, h, 0);
             const end = key.xattrKey(k, h, std.math.maxInt(u8));
             a.store.range(a.gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch return error.Io;
@@ -478,7 +478,7 @@ pub fn RecordShipService(comptime Store: type) type {
             var n: usize = 0;
             const xk = if (try self.scanXattr(k, name, &occ, &n)) |hit| hit.k else blk: {
                 const coll = key.firstFreeCollSeq(occ[0..n]) orelse return error.ValueTooLarge;
-                break :blk key.xattrKey(k, key.xattrNameHash56(name, self.plane.apply.store.hashSeed()), coll);
+                break :blk key.xattrKey(k, key.xattrNameHash56(name, self.plane.apply.store.nameKey()), coll);
             };
             const buf = self.plane.apply.gpa.alloc(u8, 1 + name.len + value.len) catch return error.OutOfMemory;
             defer self.plane.apply.gpa.free(buf);

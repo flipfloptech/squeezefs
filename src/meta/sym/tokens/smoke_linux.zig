@@ -210,7 +210,7 @@ fn stageFile(be: *backend.KvBackend, t: *backend.KvTx, slot: u16, name: []const 
     const ino = try be.allocateInoInSlot(slot);
     const parent_value: record.InodeValue = .{ .mode = economy.S.IFDIR | 0o755, .nlink = 2 };
     const global = inos.makeGlobalIno(ino, slot, inos.ROUTING_WIDTH);
-    _ = try economy.stageCreate(t, .{ .hash_seed = be.hashSeed(), .now = mtime, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = route_table.effectiveIno(global), .global_ino = global });
+    _ = try economy.stageCreate(t, .{ .name_key = be.nameKey(), .now = mtime, .parent = 1, .parent_value = parent_value, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = route_table.effectiveIno(global), .global_ino = global });
     return route_table.effectiveIno(global);
 }
 

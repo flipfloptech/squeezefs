@@ -266,9 +266,9 @@ pub const DentryInsertError = error{
 /// `coll_seq` in the seeded-hash chain, overlay-aware (a rename EXCHANGE
 /// re-inserts into the slot it just deleted). `live_chain_keys` is the live
 /// scan of `dentryChainRange(parent, hash54(name))`.
-pub fn dentryInsertKey(tx: *const KvTx, hash_seed: u64, parent: u64, name: []const u8, live_chain_keys: []const []const u8) DentryInsertError![key.DENTRY_KEY_LEN]u8 {
+pub fn dentryInsertKey(tx: *const KvTx, name_key: *const key.NameKey, parent: u64, name: []const u8, live_chain_keys: []const []const u8) DentryInsertError![key.DENTRY_KEY_LEN]u8 {
     if (name.len > record.NAME_MAX) return error.NameTooLong;
-    const hash = key.dentryNameHash54(name, hash_seed);
+    const hash = key.dentryNameHash54(name, name_key);
     const range = dentryChainRange(parent, hash);
     var buf: [256]u8 = undefined;
     const occupied = chainOccupancy(tx, key.TREE_DENTRIES, live_chain_keys, &range.start, &range.end, &buf);
@@ -523,11 +523,12 @@ const TestGuards = struct {
 };
 
 fn stageCreate(tx: *KvTx, parent: u64, child: u64, name: []const u8, seed: u64) !void {
+    const name_key: key.NameKey = .init(seed);
     const iv = record.InodeValue{ .mode = 0o100644, .nlink = 1 };
     try tx.stagePut(key.TREE_INODES, &key.inodeKey(child), &iv.encode());
     var dbuf: [300]u8 = undefined;
     const dv = try (record.DentryValue{ .child_ino = child, .file_type = 8, .name = name }).encodeInto(&dbuf);
-    const dk = try dentryInsertKey(tx, seed, parent, name, &.{});
+    const dk = try dentryInsertKey(tx, &name_key, parent, name, &.{});
     try tx.stagePut(key.TREE_DENTRIES, &dk, dv);
     try tx.stageDelta(key.TREE_INODES, &key.inodeKey(parent), record.InodeDelta.times(7, 7));
 }
@@ -717,9 +718,9 @@ test "guards travel with the entry and release exactly once at the terminal outc
 }
 
 test "chain occupancy folds the live scan through the overlay: a staged Delete frees its slot, a staged Put takes one, a Delta is inert, other chains are ignored" {
-    const seed: u64 = 99;
+    const seed: key.NameKey = .init(99);
     const parent: u64 = 1;
-    const hash = key.dentryNameHash54("name-a", seed);
+    const hash = key.dentryNameHash54("name-a", &seed);
     const range = dentryChainRange(parent, hash);
     const k0 = key.dentryKey(parent, hash, 0);
     const k1 = key.dentryKey(parent, hash, 1);
@@ -743,7 +744,7 @@ test "chain occupancy folds the live scan through the overlay: a staged Delete f
     try testing.expectEqualSlices(u8, &.{ 0, 2, 7 }, chainOccupancy(&tx, key.TREE_DENTRIES, &live, &range.start, &range.end, &buf));
 
     // The insert key is the first free slot through the overlay.
-    const ins = try dentryInsertKey(&tx, seed, parent, "name-a", &live);
+    const ins = try dentryInsertKey(&tx, &seed, parent, "name-a", &live);
     try testing.expectEqual(@as(u8, 1), (try key.DentryKey.decode(&ins)).collSeq());
     try testing.expectEqual(hash, (try key.DentryKey.decode(&ins)).hash54());
 }
@@ -752,10 +753,11 @@ test "dentry insert key: name too long refuses; a full chain of 256 is the count
     var tx = KvTx.init(testing.allocator, @src());
     defer tx.deinit();
     const long: [256]u8 = @splat('n');
-    try testing.expectError(error.NameTooLong, dentryInsertKey(&tx, 1, 1, &long, &.{}));
+    const nk1: key.NameKey = .init(1);
+    try testing.expectError(error.NameTooLong, dentryInsertKey(&tx, &nk1, 1, &long, &.{}));
 
-    const seed: u64 = 5;
-    const hash = key.dentryNameHash54("crowded", seed);
+    const seed: key.NameKey = .init(5);
+    const hash = key.dentryNameHash54("crowded", &seed);
     var keys: [256][key.DENTRY_KEY_LEN]u8 = undefined;
     var live: [256][]const u8 = undefined;
     for (0..256) |i| {
@@ -763,11 +765,11 @@ test "dentry insert key: name too long refuses; a full chain of 256 is the count
         live[i] = &keys[i];
     }
     const before = key.stats.meta_kv_dentry_collision_overflows.load();
-    try testing.expectError(error.DentryChainOverflow, dentryInsertKey(&tx, seed, 1, "crowded", &live));
+    try testing.expectError(error.DentryChainOverflow, dentryInsertKey(&tx, &seed, 1, "crowded", &live));
     try testing.expectEqual(before + 1, key.stats.meta_kv_dentry_collision_overflows.load());
     // One staged Delete reopens exactly that slot.
     try tx.stageDelete(key.TREE_DENTRIES, &keys[200]);
-    const ins = try dentryInsertKey(&tx, seed, 1, "crowded", &live);
+    const ins = try dentryInsertKey(&tx, &seed, 1, "crowded", &live);
     try testing.expectEqual(@as(u8, 200), (try key.DentryKey.decode(&ins)).collSeq());
 }
 

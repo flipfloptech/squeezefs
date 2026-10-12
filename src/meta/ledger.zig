@@ -19,7 +19,7 @@
 //! never leave a longer predecessor's tail parseable):
 //!
 //!     [0..4)   magic "KVRL"   [4..6) version u16 = 1   [6..8) len = payload_len
-//!     [8..16)  seq            [16..24) xxh3( image[0..16] ‖ 0⁸ ‖ payload )
+//!     [8..16)  seq            [16..24) hash64( image[0..16] ‖ 0⁸ ‖ payload )
 //!     payload @24:
 //!       journal_tail_seq u64 ‖ next_ino u64 ‖ alloc_bitmap_generation u64 ‖
 //!       node_seq_watermark u64 ‖
@@ -71,7 +71,7 @@ pub const ROOT_LEDGER_LEN: u64 = ROOT_LEDGER_SLOTS * ROOT_LEDGER_SLOT_LEN;
 pub const ROOT_LEDGER_MAGIC: u32 = std.mem.readInt(u32, "KVRL", .little);
 /// The record layout's version: the v4 format's first (and only) one.
 pub const ROOT_LEDGER_VERSION: u16 = 1;
-/// `magic ‖ version ‖ len ‖ seq ‖ xxh3`.
+/// `magic ‖ version ‖ len ‖ seq ‖ hash64`.
 pub const ROOT_LEDGER_HDR_LEN: usize = 24;
 /// `4 × u64 + n_roots u16`.
 pub const PAYLOAD_FIXED_LEN: usize = 8 + 8 + 8 + 8 + 2;
@@ -496,14 +496,14 @@ pub const LedgerRecord = struct {
     }
 };
 
-/// xxh3 over the slot header with the checksum field zeroed, then the payload.
+/// hash64 over the slot header with the checksum field zeroed, then the payload.
 fn slotChecksum(image: []const u8, payload_len: usize) u64 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(image[0..16]);
     const zeros: [8]u8 = @splat(0);
     h.update(&zeros);
     h.update(image[ROOT_LEDGER_HDR_LEN .. ROOT_LEDGER_HDR_LEN + payload_len]);
-    return h.final();
+    return h.finalLow64();
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +696,7 @@ fn restamp(img: *[ROOT_LEDGER_SLOT_LEN]u8) void {
     std.mem.writeInt(u64, img[16..24], slotChecksum(img, plen), .little);
 }
 
-test "slot byte layout: KVRL, version 1, len u16, seq, checksum = xxh3(hdr[0..16] ‖ 0⁸ ‖ payload); payload offsets incl. the always-present stamp; zero-padded to 4096" {
+test "slot byte layout: KVRL, version 1, len u16, seq, checksum = hash64(hdr[0..16] ‖ 0⁸ ‖ payload); payload offsets incl. the always-present stamp; zero-padded to 4096" {
     const rec = plainRecord(5);
     const img = try rec.encodeSlot();
     try testing.expectEqualStrings("KVRL", img[0..4]);
@@ -708,7 +708,7 @@ test "slot byte layout: KVRL, version 1, len u16, seq, checksum = xxh3(hdr[0..16
     @memcpy(concat[0..16], img[0..16]);
     @memset(concat[16..24], 0);
     @memcpy(concat[24..], img[24 .. 24 + payload_len]);
-    try testing.expectEqual(checksum.xxh3(&concat), std.mem.readInt(u64, img[16..24], .little));
+    try testing.expectEqual(checksum.hash64(&concat), std.mem.readInt(u64, img[16..24], .little));
     try testing.expectEqual(@as(u64, 20000), std.mem.readInt(u64, img[24..32], .little));
     try testing.expectEqual(@as(u64, 1005), std.mem.readInt(u64, img[32..40], .little));
     try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, img[40..48], .little));

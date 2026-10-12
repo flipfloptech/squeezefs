@@ -7,8 +7,8 @@
 //! On-media frame (Q9 — the reference's `0xCAFEBABE ‖ key_len ‖ val_len`
 //! had no checksum, an integer magic and a 4 KiB key pad): ONE 64 B
 //! `extern struct` `{magic "SQZRCACH", version, flags, key, val_len,
-//! incarnation, xxh3}` on the 4 KiB grain, the value at `+4096` so a serve
-//! can DMA from it. The xxh3 covers the HEADER: a torn or stale header is
+//! incarnation, hash64}` on the 4 KiB grain, the value at `+4096` so a serve
+//! can DMA from it. The hash64 covers the HEADER: a torn or stale header is
 //! refused; the value's integrity is the incarnation + binding lattice's
 //! (a read cache serves only bytes it itself wrote under a validated fill).
 //! No `msync` anywhere: a read cache owes no durability — it is WIPED at
@@ -60,7 +60,9 @@ pub const BlockKey = rsc.BlockKey;
 pub const Validate = hot_tier.Validate;
 
 pub const MAGIC = "SQZRCACH".*;
-pub const FRAME_VERSION: u16 = 1;
+/// v2: the v1 frame under sqzhash128's low 64 bits (0003 §M); a v1 frame
+/// is a stale frame (the cache refills).
+pub const FRAME_VERSION: u16 = 2;
 /// The record grain: header at `off`, value at `off + GRAIN`, every extent
 /// a multiple of the grain (the O_DIRECT / `READ_FIXED` grain of a future
 /// device-side serve).
@@ -78,12 +80,12 @@ pub const FrameWire = extern struct {
     offset_le: [8]u8,
     incarnation_le: [8]u8,
     reserved: [16]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 };
 
 comptime {
     assert(@sizeOf(FrameWire) == HEADER_LEN);
-    assert(@offsetOf(FrameWire, "xxh3_le") == 56);
+    assert(@offsetOf(FrameWire, "csum_le") == 56);
 }
 
 pub const stats = struct {
@@ -94,7 +96,7 @@ pub const stats = struct {
     pub var read_cache_evictions: counters.ShardedCounter = .{};
     pub var read_cache_logical_bytes: counters.Gauge = .{};
     pub var read_cache_shards: counters.Gauge = .{};
-    /// A frame whose header failed its magic/xxh3 under a live index entry
+    /// A frame whose header failed its magic/hash64 under a live index entry
     /// (must stay 0: the index is RAM-only and the mapping ours).
     pub var read_cache_torn_frames: counters.Tripwire = .init("read_cache_torn_frames");
 };
@@ -142,14 +144,14 @@ pub fn encodeHeader(out: *[HEADER_LEN]u8, key: BlockKey, val_len: u32, incarnati
     std.mem.writeInt(u64, &h.offset_le, key.offset, .little);
     std.mem.writeInt(u64, &h.incarnation_le, incarnation, .little);
     h.reserved = @splat(0);
-    h.xxh3_le = @splat(0);
+    h.csum_le = @splat(0);
     out.* = std.mem.toBytes(h);
     checksum.stamp(out, 56);
 }
 
 pub const Header = struct { key: BlockKey, val_len: u32, incarnation: u64 };
 
-/// Total: null on any refusal (magic, version, flags, reserved, xxh3).
+/// Total: null on any refusal (magic, version, flags, reserved, hash64).
 pub fn decodeHeader(bytes: *const [HEADER_LEN]u8) ?Header {
     if (!checksum.verify(bytes, 56)) return null;
     const h = std.mem.bytesToValue(FrameWire, bytes);

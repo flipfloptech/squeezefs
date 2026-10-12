@@ -278,8 +278,8 @@ pub const DentryError = tx.DentryInsertError || Allocator.Error;
 /// deleted is free again — the rename EXCHANGE and the whiteout re-insert
 /// into the slot they vacated). Single-copy: the value encodes straight
 /// into a stack frame the tx dupes once.
-fn stageDentryPut(t: *tx.KvTx, hash_seed: u64, parent: u64, name: []const u8, chain: []const []const u8, child_global: u64, file_type: u8) DentryError![key.DENTRY_KEY_LEN]u8 {
-    const dk = try tx.dentryInsertKey(t, hash_seed, parent, name, chain);
+fn stageDentryPut(t: *tx.KvTx, name_key: *const key.NameKey, parent: u64, name: []const u8, chain: []const []const u8, child_global: u64, file_type: u8) DentryError![key.DENTRY_KEY_LEN]u8 {
+    const dk = try tx.dentryInsertKey(t, name_key, parent, name, chain);
     var buf: [DENTRY_VALUE_MAX]u8 = undefined;
     const dv = (record.DentryValue{ .child_ino = child_global, .file_type = file_type, .name = name }).encodeInto(&buf) catch unreachable;
     try t.stagePut(key.TREE_DENTRIES, &dk, dv);
@@ -291,7 +291,7 @@ fn stageDentryPut(t: *tx.KvTx, hash_seed: u64, parent: u64, name: []const u8, ch
 // ---------------------------------------------------------------------------
 
 pub const Create = struct {
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     /// The coarse kernel-domain stamp (a fine clock could LEAD the kernel's
     /// own wb-cache cmtime by a tick and invert cross-inode ctime order —
     /// fstests generic/423).
@@ -349,7 +349,7 @@ pub fn stageCreate(t: *tx.KvTx, p: Create) DentryError!CreateOutcome {
         .ctime = p.now,
     };
     try t.stagePut(key.TREE_INODES, &key.inodeKey(p.local_ino), &child.encode());
-    _ = try stageDentryPut(t, p.hash_seed, p.parent, p.name, p.chain, p.global_ino, ftByte(mode));
+    _ = try stageDentryPut(t, p.name_key, p.parent, p.name, p.chain, p.global_ino, ftByte(mode));
     const rec = try stageParentUpdate(t, p.parent, !is_dir, if (is_dir) 1 else 0, p.now, p.parent_value);
     var plan: GuardPlan = .{};
     plan.inode(p.parent, parentGuardFor(rec));
@@ -366,7 +366,7 @@ pub fn stageMkdir(t: *tx.KvTx, p: Create) DentryError!CreateOutcome {
 }
 
 pub const Symlink = struct {
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     now: u64,
     parent: u64,
     parent_value: InodeValue,
@@ -389,7 +389,7 @@ pub const SymlinkError = DentryError || error{SymlinkTargetTooLong};
 pub fn stageSymlink(t: *tx.KvTx, p: Symlink) SymlinkError!CreateOutcome {
     if (p.target.len > SYMLINK_TARGET_MAX) return error.SymlinkTargetTooLong;
     const out = try stageCreate(t, .{
-        .hash_seed = p.hash_seed,
+        .name_key = p.name_key,
         .now = p.now,
         .parent = p.parent,
         .parent_value = p.parent_value,
@@ -404,12 +404,12 @@ pub fn stageSymlink(t: *tx.KvTx, p: Symlink) SymlinkError!CreateOutcome {
     });
     var buf: [1 + SYMLINK_XATTR.len + SYMLINK_TARGET_MAX]u8 = undefined;
     const xv = (record.XattrValue{ .name = SYMLINK_XATTR, .value = p.target }).encodeInto(&buf) catch unreachable;
-    try t.stagePut(key.TREE_XATTRS, &key.xattrKey(p.local_ino, key.xattrNameHash56(SYMLINK_XATTR, p.hash_seed), 0), xv);
+    try t.stagePut(key.TREE_XATTRS, &key.xattrKey(p.local_ino, key.xattrNameHash56(SYMLINK_XATTR, p.name_key), 0), xv);
     return out;
 }
 
 pub const Link = struct {
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     now: u64,
     parent: u64,
     /// null = unreadable: the parent times are best-effort (the v2 arm).
@@ -443,7 +443,7 @@ pub fn stageLink(t: *tx.KvTx, p: Link) LinkError!LinkOutcome {
     child.nlink += 1;
     if (laterThan(p.now, child.ctime)) child.ctime = p.now;
     try t.stagePut(key.TREE_INODES, &key.inodeKey(p.child), &child.encode());
-    _ = try stageDentryPut(t, p.hash_seed, p.parent, p.name, p.chain, p.global_child, ftByte(child.mode));
+    _ = try stageDentryPut(t, p.name_key, p.parent, p.name, p.chain, p.global_child, ftByte(child.mode));
     const rec = try stageParentUpdate(t, p.parent, false, 0, p.now, p.parent_value);
     var plan: GuardPlan = .{};
     plan.inode(p.parent, parentGuardFor(rec));
@@ -539,7 +539,7 @@ pub const RenameFlags = struct {
 pub const Whiteout = struct { local: u64, global: u64 };
 
 pub const Rename = struct {
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     now: u64,
     old_parent: u64,
     old_name: []const u8,
@@ -609,8 +609,8 @@ pub fn stageRename(t: *tx.KvTx, p: Rename) RenameError!RenameOutcome {
         const new_d = p.new_pos orelse return error.SourceNotFound;
         try t.stageDelete(key.TREE_DENTRIES, &old_d.key);
         try t.stageDelete(key.TREE_DENTRIES, &new_d.key);
-        const nk = try stageDentryPut(t, p.hash_seed, p.new_parent, p.new_name, p.new_chain, old_d.child_ino, old_d.file_type);
-        _ = try stageDentryPut(t, p.hash_seed, p.old_parent, p.old_name, p.old_chain, new_d.child_ino, new_d.file_type);
+        const nk = try stageDentryPut(t, p.name_key, p.new_parent, p.new_name, p.new_chain, old_d.child_ino, old_d.file_type);
+        _ = try stageDentryPut(t, p.name_key, p.old_parent, p.old_name, p.old_chain, new_d.child_ino, new_d.file_type);
         // Both parents' Δtimes + both swapped inodes' Δctimes ride the
         // swap entry, deduped for the shared-parent / same-inode shapes.
         try (SharedTimes{ .parent = p.old_parent, .now = p.now }).stage(t);
@@ -667,7 +667,7 @@ pub fn stageRename(t: *tx.KvTx, p: Rename) RenameError!RenameOutcome {
         try t.stageDelete(key.TREE_DENTRIES, &new_d.key);
     }
     try t.stageDelete(key.TREE_DENTRIES, &old_d.key);
-    const nk = try stageDentryPut(t, p.hash_seed, p.new_parent, p.new_name, p.new_chain, old_d.child_ino, old_d.file_type);
+    const nk = try stageDentryPut(t, p.name_key, p.new_parent, p.new_name, p.new_chain, old_d.child_ino, old_d.file_type);
     // The moved inode's ctime in the same entry — unless the dest-replace
     // `Put` already stamped the same local inode (rename over a hardlink
     // of itself).
@@ -690,7 +690,7 @@ pub fn stageRename(t: *tx.KvTx, p: Rename) RenameError!RenameOutcome {
             .ctime = p.now,
         };
         try t.stagePut(key.TREE_INODES, &key.inodeKey(w.local), &wv.encode());
-        _ = try stageDentryPut(t, p.hash_seed, p.old_parent, p.old_name, p.old_chain, w.global, ftByte(S.IFCHR));
+        _ = try stageDentryPut(t, p.name_key, p.old_parent, p.old_name, p.old_chain, w.global, ftByte(S.IFCHR));
     }
     if (p.src_local) |src| plan.inode(src, .exclusive);
     if (p.dest_local) |dst| plan.inode(dst, .exclusive);
@@ -1026,7 +1026,7 @@ const testing = std.testing;
 const inos = @import("inos.zig");
 const journal = @import("journal.zig");
 
-const seed: u64 = 0xC0FFEE;
+const seed: key.NameKey = .init(0xC0FFEE);
 const t_now: u64 = 1_700_000_000_000_000_000;
 
 fn dirValue(nlink: u32) InodeValue {
@@ -1043,7 +1043,7 @@ fn newTx() tx.KvTx {
 
 /// A live dentry for `(parent, name)` at `coll` naming `child`.
 fn pos(parent: u64, name: []const u8, coll: u8, child: u64, mode: u32) DentryPos {
-    return .{ .key = key.dentryKey(parent, key.dentryNameHash54(name, seed), coll), .child_ino = child, .file_type = ftByte(mode) };
+    return .{ .key = key.dentryKey(parent, key.dentryNameHash54(name, &seed), coll), .child_ino = child, .file_type = ftByte(mode) };
 }
 
 const Shape = struct { tree: u8, kind: record.RecordKind };
@@ -1078,7 +1078,7 @@ fn stagedDentry(t: *const tx.KvTx, i: usize, parent: u64, name: []const u8) !rec
     try testing.expectEqual(record.RecordKind.put, s.kind);
     const dk = try key.DentryKey.decode(s.key);
     try testing.expectEqual(parent, dk.parentIno());
-    try testing.expectEqual(key.dentryNameHash54(name, seed), dk.hash54());
+    try testing.expectEqual(key.dentryNameHash54(name, &seed), dk.hash54());
     const dv = try record.DentryValue.decode(s.value);
     try testing.expectEqualStrings(name, dv.name);
     return dv;
@@ -1156,7 +1156,7 @@ test "guard plan: repeated inos keep the strongest mode, dentries dedup, the par
 test "create (regular file): inode Put + dentry Put + parent Δtimes; the parent guard is SHARED; the fold moves only the parent's times" {
     var t = newTx();
     defer t.deinit();
-    const out = try stageCreate(&t, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = dirValue(3), .name = "f", .mode = S.IFREG | 0o644, .uid = 100, .gid = 200, .local_ino = 42, .global_ino = 42_000 });
+    const out = try stageCreate(&t, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = dirValue(3), .name = "f", .mode = S.IFREG | 0o644, .uid = 100, .gid = 200, .local_ino = 42, .global_ino = 42_000 });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta } });
     try testing.expectEqual(@as(u64, 42), try key.decodeInodeKey(t.staged.items[0].key));
     const child = try stagedInode(&t, 0);
@@ -1189,7 +1189,7 @@ test "create: the chain probe takes the first free coll_seq; setgid parents hand
     var parent = dirValue(2);
     parent.mode |= S.ISGID;
     parent.gid = 777;
-    const f = try stageCreate(&t, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = parent, .name = "dup", .mode = S.IFCHR | 0o600, .uid = 1, .gid = 2, .rdev = 0x0501, .initial_size = 0, .local_ino = 50, .global_ino = 50, .chain = &.{ &k0, &k1 } });
+    const f = try stageCreate(&t, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = parent, .name = "dup", .mode = S.IFCHR | 0o600, .uid = 1, .gid = 2, .rdev = 0x0501, .initial_size = 0, .local_ino = 50, .global_ino = 50, .chain = &.{ &k0, &k1 } });
     try testing.expectEqual(@as(u8, 2), (try key.DentryKey.decode(t.staged.items[1].key)).collSeq());
     try testing.expectEqual(@as(u32, 777), f.child.gid);
     try testing.expectEqual(S.IFCHR | 0o600, f.child.mode);
@@ -1197,7 +1197,7 @@ test "create: the chain probe takes the first free coll_seq; setgid parents hand
     try testing.expectEqual(ftByte(S.IFCHR), (try stagedDentry(&t, 1, 1, "dup")).file_type);
     var t2 = newTx();
     defer t2.deinit();
-    const d = try stageMkdir(&t2, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = parent, .name = "sub", .mode = 0o755, .uid = 1, .gid = 2, .local_ino = 51, .global_ino = 51 });
+    const d = try stageMkdir(&t2, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = parent, .name = "sub", .mode = 0o755, .uid = 1, .gid = 2, .local_ino = 51, .global_ino = 51 });
     try testing.expectEqual(S.IFDIR | S.ISGID | 0o755, d.child.mode);
     try testing.expectEqual(@as(u32, 777), d.child.gid);
     try testing.expectEqual(@as(u32, 2), d.child.nlink);
@@ -1206,7 +1206,7 @@ test "create: the chain probe takes the first free coll_seq; setgid parents hand
 test "mkdir: inode Put (nlink 2) + dentry Put + parent Put (nlink + 1, times) under the EXCLUSIVE parent; the fold shows the bump" {
     var t = newTx();
     defer t.deinit();
-    const out = try stageMkdir(&t, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = dirValue(3), .name = "d", .mode = S.IFDIR | 0o700, .uid = 0, .gid = 0, .local_ino = 60, .global_ino = 60 });
+    const out = try stageMkdir(&t, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = dirValue(3), .name = "d", .mode = S.IFDIR | 0o700, .uid = 0, .gid = 0, .local_ino = 60, .global_ino = 60 });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .put } });
     try testing.expectEqual(@as(u32, 2), out.child.nlink);
     try testing.expectEqual(ftByte(S.IFDIR), (try stagedDentry(&t, 1, 1, "d")).file_type);
@@ -1223,14 +1223,14 @@ test "mkdir: inode Put (nlink 2) + dentry Put + parent Put (nlink + 1, times) un
 test "symlink: the create records sized by the target plus the system.symlink xattr Put at coll_seq 0, ONE entry; a target past 4095 refuses" {
     var t = newTx();
     defer t.deinit();
-    const out = try stageSymlink(&t, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "l", .uid = 5, .gid = 6, .local_ino = 70, .global_ino = 70, .target = "/etc/passwd" });
+    const out = try stageSymlink(&t, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "l", .uid = 5, .gid = 6, .local_ino = 70, .global_ino = 70, .target = "/etc/passwd" });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_XATTRS, .kind = .put } });
     try testing.expectEqual(S.IFLNK | 0o777, out.child.mode);
     try testing.expectEqual(@as(u64, "/etc/passwd".len), out.child.size);
     try testing.expectEqual(ftByte(S.IFLNK), (try stagedDentry(&t, 1, 1, "l")).file_type);
     const xk = try key.XattrKey.decode(t.staged.items[3].key);
     try testing.expectEqual(@as(u64, 70), xk.ino());
-    try testing.expectEqual(key.xattrNameHash56(SYMLINK_XATTR, seed), xk.hash56());
+    try testing.expectEqual(key.xattrNameHash56(SYMLINK_XATTR, &seed), xk.hash56());
     try testing.expectEqual(@as(u8, 0), xk.collSeq());
     const xv = try record.XattrValue.decode(t.staged.items[3].value);
     try testing.expectEqualStrings(SYMLINK_XATTR, xv.name);
@@ -1240,10 +1240,10 @@ test "symlink: the create records sized by the target plus the system.symlink xa
     var t2 = newTx();
     defer t2.deinit();
     const long: [SYMLINK_TARGET_MAX + 1]u8 = @splat('x');
-    try testing.expectError(error.SymlinkTargetTooLong, stageSymlink(&t2, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "l", .uid = 5, .gid = 6, .local_ino = 71, .global_ino = 71, .target = &long }));
+    try testing.expectError(error.SymlinkTargetTooLong, stageSymlink(&t2, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "l", .uid = 5, .gid = 6, .local_ino = 71, .global_ino = 71, .target = &long }));
     try testing.expect(t2.isEmpty());
     const max: [SYMLINK_TARGET_MAX]u8 = @splat('y');
-    _ = try stageSymlink(&t2, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "l", .uid = 5, .gid = 6, .local_ino = 71, .global_ino = 71, .target = &max });
+    _ = try stageSymlink(&t2, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "l", .uid = 5, .gid = 6, .local_ino = 71, .global_ino = 71, .target = &max });
     try testing.expectEqual(@as(u64, 1), try entriesOf(&t2));
 }
 
@@ -1257,7 +1257,7 @@ test "link: child Put (nlink + 1, ctime monotone over the folded refinement) + d
     _ = try pending.park(80, 5, t_now + 500);
     var child = fileValue(1);
     pending.fold(80, &child);
-    const out = try stageLink(&t, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "hard", .child = 80, .global_child = 80_000, .child_value = child });
+    const out = try stageLink(&t, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "hard", .child = 80, .global_child = 80_000, .child_value = child });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .put } });
     const c = try stagedInode(&t, 0);
     try testing.expectEqual(@as(u32, 2), c.nlink);
@@ -1280,14 +1280,14 @@ test "link: child Put (nlink + 1, ctime monotone over the folded refinement) + d
     // nothing for it (best-effort) but still plans the exclusive class.
     var t2 = newTx();
     defer t2.deinit();
-    const o2 = try stageLink(&t2, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = null, .name = "hard", .child = 80, .global_child = 80_000, .child_value = fileValue(1) });
+    const o2 = try stageLink(&t2, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = null, .name = "hard", .child = 80, .global_child = 80_000, .child_value = fileValue(1) });
     try testing.expectEqual(@as(usize, 2), t2.staged.items.len);
     try testing.expectEqual(t_now, o2.child.ctime);
     try testing.expectEqual(dlm.Mode.exclusive, o2.guards.inodeMode(1).?);
 
     var t3 = newTx();
     defer t3.deinit();
-    try testing.expectError(error.TooManyLinks, stageLink(&t3, .{ .hash_seed = seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "hard", .child = 80, .global_child = 80, .child_value = fileValue(NLINK_MAX) }));
+    try testing.expectError(error.TooManyLinks, stageLink(&t3, .{ .name_key = &seed, .now = t_now, .parent = 1, .parent_value = dirValue(2), .name = "hard", .child = 80, .global_child = 80, .child_value = fileValue(NLINK_MAX) }));
     try testing.expect(t3.isEmpty());
 }
 
@@ -1361,7 +1361,7 @@ test "rename (same dir, regular file): ONE tx = ONE entry — parent Δtimes, de
     var t = newTx();
     defer t.deinit();
     const old = pos(1, "a", 0, 42_000, S.IFREG);
-    const out = try stageRename(&t, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = null, .src_local = 42 });
+    const out = try stageRename(&t, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = null, .src_local = 42 });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta } });
     const pd = try stagedDelta(&t, 0, 1, record.DELTA_TIMES);
     try testing.expectEqual(t_now, pd.fields.mtime);
@@ -1397,7 +1397,7 @@ test "rename (same dir, regular file): ONE tx = ONE entry — parent Δtimes, de
 test "a staged rename builds ONE conveyor queue entry carrying every record in stage order (the whole-tx shape the pass writes)" {
     var t = newTx();
     const old = pos(1, "a", 0, 42_000, S.IFREG);
-    const out = try stageRename(&t, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .old_pos = old, .new_pos = null, .src_local = 42 });
+    const out = try stageRename(&t, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .old_pos = old, .new_pos = null, .src_local = 42 });
     const staged = t.staged.items.len;
     try testing.expectEqual(@as(usize, 5), staged);
     // Consumes the tx: its arena moves into the entry.
@@ -1417,7 +1417,7 @@ test "rename (cross dir, regular file): both parents' Δtimes, both SHARED; a di
     var t = newTx();
     defer t.deinit();
     const old = pos(1, "a", 0, 42_000, S.IFREG);
-    const out = try stageRename(&t, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .old_pos = old, .new_pos = null, .src_local = 42 });
+    const out = try stageRename(&t, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .old_pos = old, .new_pos = null, .src_local = 42 });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta } });
     _ = try stagedDelta(&t, 0, 1, record.DELTA_TIMES);
     _ = try stagedDelta(&t, 1, 2, record.DELTA_TIMES);
@@ -1429,7 +1429,7 @@ test "rename (cross dir, regular file): both parents' Δtimes, both SHARED; a di
     var t2 = newTx();
     defer t2.deinit();
     const old_dir = pos(1, "d", 0, 60, S.IFDIR);
-    const o2 = try stageRename(&t2, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 2, .new_name = "e", .old_pos = old_dir, .new_pos = null, .src_local = 60, .old_parent_value = dirValue(4), .new_parent_value = dirValue(2) });
+    const o2 = try stageRename(&t2, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 2, .new_name = "e", .old_pos = old_dir, .new_pos = null, .src_local = 60, .old_parent_value = dirValue(4), .new_parent_value = dirValue(2) });
     try expectShape(&t2, &.{ .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta } });
     const op = try stagedInode(&t2, 0);
     try testing.expectEqual(@as(u64, 1), try key.decodeInodeKey(t2.staged.items[0].key));
@@ -1450,19 +1450,19 @@ test "rename (cross dir, regular file): both parents' Δtimes, both SHARED; a di
     const before = stats.dir_nlink_underflows.load();
     var t3 = newTx();
     defer t3.deinit();
-    _ = try stageRename(&t3, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 2, .new_name = "e", .old_pos = old_dir, .new_pos = null, .old_parent_value = dirValue(2), .new_parent_value = dirValue(2) });
+    _ = try stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 2, .new_name = "e", .old_pos = old_dir, .new_pos = null, .old_parent_value = dirValue(2), .new_parent_value = dirValue(2) });
     try testing.expectEqual(@as(u32, 2), (try stagedInode(&t3, 0)).nlink);
     try testing.expectEqual(before + 1, stats.dir_nlink_underflows.load());
     // Unreadable parents on a directory move: nothing staged for them.
     var t4 = newTx();
     defer t4.deinit();
-    const o4 = try stageRename(&t4, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 2, .new_name = "e", .old_pos = old_dir, .new_pos = null });
+    const o4 = try stageRename(&t4, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 2, .new_name = "e", .old_pos = old_dir, .new_pos = null });
     try testing.expectEqual(@as(usize, 2), t4.staged.items.len);
     try testing.expectEqual(dlm.Mode.exclusive, o4.guards.inodeMode(1).?);
     // A same-directory directory rename: Δtimes only, SHARED.
     var t5 = newTx();
     defer t5.deinit();
-    const o5 = try stageRename(&t5, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 1, .new_name = "e", .old_pos = old_dir, .new_pos = null, .src_local = 60 });
+    const o5 = try stageRename(&t5, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "d", .new_parent = 1, .new_name = "e", .old_pos = old_dir, .new_pos = null, .src_local = 60 });
     try testing.expectEqual(dlm.Mode.shared, o5.guards.inodeMode(1).?);
     _ = try stagedDelta(&t5, 0, 1, record.DELTA_TIMES);
 }
@@ -1477,7 +1477,7 @@ test "rename replacing a target: dest Put (nlink − 1 / dir ⇒ 0, ctime) befor
     const new_chain = [_][]const u8{ &sib0.key, &sib1.key, &new.key };
     var t = newTx();
     defer t.deinit();
-    const out = try stageRename(&t, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = new, .new_chain = &new_chain, .src_local = 42, .dest_local = 43, .dest_value = fileValue(1) });
+    const out = try stageRename(&t, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = new, .new_chain = &new_chain, .src_local = 42, .dest_local = 43, .dest_value = fileValue(1) });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta } });
     const dest = try stagedInode(&t, 1);
     try testing.expectEqual(@as(u64, 43), try key.decodeInodeKey(t.staged.items[1].key));
@@ -1499,7 +1499,7 @@ test "rename replacing a target: dest Put (nlink − 1 / dir ⇒ 0, ctime) befor
     // A hardlinked destination survives with nlink − 1.
     var t2 = newTx();
     defer t2.deinit();
-    const o2 = try stageRename(&t2, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = new, .src_local = 42, .dest_local = 43, .dest_value = fileValue(3) });
+    const o2 = try stageRename(&t2, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = new, .src_local = 42, .dest_local = 43, .dest_value = fileValue(3) });
     try testing.expectEqual(@as(u32, 2), o2.dest_nlink.?);
 
     // A directory destination: empty ⇒ nlink 0; populated ⇒ ENOTEMPTY,
@@ -1507,24 +1507,24 @@ test "rename replacing a target: dest Put (nlink − 1 / dir ⇒ 0, ctime) befor
     const new_dir = pos(1, "b", 0, 61, S.IFDIR);
     var t3 = newTx();
     defer t3.deinit();
-    const o3 = try stageRename(&t3, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = pos(1, "a", 0, 60, S.IFDIR), .new_pos = new_dir, .src_local = 60, .dest_local = 61, .dest_value = dirValue(2) });
+    const o3 = try stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = pos(1, "a", 0, 60, S.IFDIR), .new_pos = new_dir, .src_local = 60, .dest_local = 61, .dest_value = dirValue(2) });
     try testing.expectEqual(@as(u32, 0), o3.dest_nlink.?);
     var t4 = newTx();
     defer t4.deinit();
-    try testing.expectError(error.TargetNotEmpty, stageRename(&t4, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = pos(1, "a", 0, 60, S.IFDIR), .new_pos = new_dir, .src_local = 60, .dest_local = 61, .dest_value = dirValue(3), .dest_has_entries = true }));
+    try testing.expectError(error.TargetNotEmpty, stageRename(&t4, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = pos(1, "a", 0, 60, S.IFDIR), .new_pos = new_dir, .src_local = 60, .dest_local = 61, .dest_value = dirValue(3), .dest_has_entries = true }));
 
     var t5 = newTx();
     defer t5.deinit();
-    try testing.expectError(error.TargetExists, stageRename(&t5, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .noreplace = true }, .old_pos = old, .new_pos = new }));
+    try testing.expectError(error.TargetExists, stageRename(&t5, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .noreplace = true }, .old_pos = old, .new_pos = new }));
     try testing.expect(t5.isEmpty());
-    try testing.expectError(error.SourceNotFound, stageRename(&t5, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = null, .new_pos = null }));
+    try testing.expectError(error.SourceNotFound, stageRename(&t5, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = null, .new_pos = null }));
     try testing.expect(t5.isEmpty());
 
     // Rename over a hardlink of itself: the dest Put already stamped the
     // inode — no second Δctime.
     var t6 = newTx();
     defer t6.deinit();
-    const o6 = try stageRename(&t6, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = pos(1, "b", 2, 42_000, S.IFREG), .src_local = 42, .dest_local = 42, .dest_value = fileValue(2) });
+    const o6 = try stageRename(&t6, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = pos(1, "b", 2, 42_000, S.IFREG), .src_local = 42, .dest_local = 42, .dest_value = fileValue(2) });
     try expectShape(&t6, &.{ .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put } });
     try testing.expectEqual(@as(u32, 1), o6.dest_nlink.?);
     try testing.expectEqual(@as(usize, 2), o6.guards.inodes().len);
@@ -1532,7 +1532,7 @@ test "rename replacing a target: dest Put (nlink − 1 / dir ⇒ 0, ctime) befor
     // Delete alone; the remote fragment stamps its inode.
     var t7 = newTx();
     defer t7.deinit();
-    _ = try stageRename(&t7, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = new, .src_local = 42 });
+    _ = try stageRename(&t7, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .old_pos = old, .new_pos = new, .src_local = 42 });
     try expectShape(&t7, &.{ .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta } });
 }
 
@@ -1547,7 +1547,7 @@ test "rename EXCHANGE: two Deletes, two Puts re-occupying the vacated slots, bot
     const new_chain = [_][]const u8{ &new_sib.key, &new.key };
     var t = newTx();
     defer t.deinit();
-    const out = try stageRename(&t, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new, .old_chain = &old_chain, .new_chain = &new_chain, .src_local = 42, .dest_local = 60 });
+    const out = try stageRename(&t, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new, .old_chain = &old_chain, .new_chain = &new_chain, .src_local = 42, .dest_local = 60 });
     try expectShape(&t, &.{ .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .delta } });
     try expectDentryDelete(&t, 0, &old.key);
     try expectDentryDelete(&t, 1, &new.key);
@@ -1575,16 +1575,16 @@ test "rename EXCHANGE: two Deletes, two Puts re-occupying the vacated slots, bot
     var t2 = newTx();
     defer t2.deinit();
     const new1 = pos(1, "b", 0, 42_000, S.IFREG);
-    _ = try stageRename(&t2, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new1, .src_local = 42, .dest_local = 42 });
+    _ = try stageRename(&t2, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new1, .src_local = 42, .dest_local = 42 });
     try expectShape(&t2, &.{ .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .delta } });
     _ = try stagedDelta(&t2, 4, 1, record.DELTA_TIMES);
     _ = try stagedDelta(&t2, 5, 42, record.DELTA_CTIME);
 
     var t3 = newTx();
     defer t3.deinit();
-    try testing.expectError(error.SourceNotFound, stageRename(&t3, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = null }));
-    try testing.expectError(error.InvalidFlags, stageRename(&t3, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true, .noreplace = true }, .old_pos = old, .new_pos = new1 }));
-    try testing.expectError(error.InvalidFlags, stageRename(&t3, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new1, .whiteout = .{ .local = 9, .global = 9 } }));
+    try testing.expectError(error.SourceNotFound, stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = null }));
+    try testing.expectError(error.InvalidFlags, stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true, .noreplace = true }, .old_pos = old, .new_pos = new1 }));
+    try testing.expectError(error.InvalidFlags, stageRename(&t3, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 1, .new_name = "b", .flags = .{ .exchange = true }, .old_pos = old, .new_pos = new1, .whiteout = .{ .local = 9, .global = 9 } }));
     try testing.expect(t3.isEmpty());
 }
 
@@ -1594,7 +1594,7 @@ test "rename WHITEOUT: the char-0:0 whiteout inode and its dentry at the OLD nam
     const old_chain = [_][]const u8{ &sib.key, &old.key };
     var t = newTx();
     defer t.deinit();
-    const out = try stageRename(&t, .{ .hash_seed = seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .old_pos = old, .new_pos = null, .old_chain = &old_chain, .src_local = 42, .whiteout = .{ .local = 90, .global = 90_000 } });
+    const out = try stageRename(&t, .{ .name_key = &seed, .now = t_now, .old_parent = 1, .old_name = "a", .new_parent = 2, .new_name = "b", .old_pos = old, .new_pos = null, .old_chain = &old_chain, .src_local = 42, .whiteout = .{ .local = 90, .global = 90_000 } });
     try expectShape(&t, &.{ .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_DENTRIES, .kind = .delete }, .{ .tree = key.TREE_DENTRIES, .kind = .put }, .{ .tree = key.TREE_INODES, .kind = .delta }, .{ .tree = key.TREE_INODES, .kind = .put }, .{ .tree = key.TREE_DENTRIES, .kind = .put } });
     const wv = try stagedInode(&t, 5);
     try testing.expectEqual(@as(u64, 90), try key.decodeInodeKey(t.staged.items[5].key));
@@ -1926,8 +1926,8 @@ test "SharedTimes property: two children's creates interleaved in any order fold
         defer tb.deinit();
         const now_a = t_now + rnd.intRangeAtMost(u64, 0, 1000);
         const now_b = t_now + rnd.intRangeAtMost(u64, 0, 1000);
-        _ = try stageCreate(&ta, .{ .hash_seed = seed, .now = now_a, .parent = parent, .parent_value = base, .name = "a", .mode = S.IFREG | 0o644, .uid = 1, .gid = 1, .local_ino = 10, .global_ino = 10 });
-        _ = try stageCreate(&tb, .{ .hash_seed = seed, .now = now_b, .parent = parent, .parent_value = base, .name = "b", .mode = S.IFREG | 0o644, .uid = 1, .gid = 1, .local_ino = 11, .global_ino = 11 });
+        _ = try stageCreate(&ta, .{ .name_key = &seed, .now = now_a, .parent = parent, .parent_value = base, .name = "a", .mode = S.IFREG | 0o644, .uid = 1, .gid = 1, .local_ino = 10, .global_ino = 10 });
+        _ = try stageCreate(&tb, .{ .name_key = &seed, .now = now_b, .parent = parent, .parent_value = base, .name = "b", .mode = S.IFREG | 0o644, .uid = 1, .gid = 1, .local_ino = 11, .global_ino = 11 });
         // A random interleaving preserving each tx's own order, seqs by
         // position: the conveyor stamps queue order.
         var merged: std.ArrayList(tx.Staged) = .empty;

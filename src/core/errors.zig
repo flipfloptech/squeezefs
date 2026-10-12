@@ -165,7 +165,7 @@ pub const Refusal = error{
     LaneStopped,
     /// Another writer holds the volume's single-writer guard (EBUSY).
     Busy,
-    /// A blank, pre-v4 or capability-stamped volume this binary does not
+    /// A blank, pre-v5 or capability-stamped volume this binary does not
     /// mount (EINVAL: reformat or a later binary).
     UnsupportedVolume,
     /// A key that decodes as no kind, or not as the kind it was staged

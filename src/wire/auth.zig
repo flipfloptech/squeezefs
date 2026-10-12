@@ -82,7 +82,7 @@ pub const JobEnrollV1 = extern struct {
     version_le: [2]u8,
     reserved_le: [2]u8,
     secret: Secret,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 };
 
 pub const ENROLL_LEN: usize = @sizeOf(JobEnrollV1);
@@ -90,7 +90,7 @@ pub const ENROLL_LEN: usize = @sizeOf(JobEnrollV1);
 comptime {
     std.debug.assert(ENROLL_LEN == 48);
     std.debug.assert(@offsetOf(JobEnrollV1, "secret") == 8);
-    std.debug.assert(@offsetOf(JobEnrollV1, "xxh3_le") == 40);
+    std.debug.assert(@offsetOf(JobEnrollV1, "csum_le") == 40);
 }
 
 /// Mint a fresh secret (format time; `Io.randomSecure` is the one source
@@ -107,9 +107,9 @@ pub fn encodeEnroll(secret: Secret) [ENROLL_LEN]u8 {
     std.mem.writeInt(u16, &w.version_le, ENROLL_VERSION, .little);
     w.reserved_le = @splat(0);
     w.secret = secret;
-    w.xxh3_le = @splat(0);
+    w.csum_le = @splat(0);
     var bytes = std.mem.toBytes(w);
-    checksum.stamp(&bytes, @offsetOf(JobEnrollV1, "xxh3_le"));
+    checksum.stamp(&bytes, @offsetOf(JobEnrollV1, "csum_le"));
     return bytes;
 }
 
@@ -117,7 +117,7 @@ pub fn encodeEnroll(secret: Secret) [ENROLL_LEN]u8 {
 /// (the record stands, the mount refuses loud — never re-minted).
 pub fn decodeEnroll(bytes: []const u8) error{Corrupt}!Secret {
     if (bytes.len != ENROLL_LEN) return error.Corrupt;
-    if (!checksum.verify(bytes, @offsetOf(JobEnrollV1, "xxh3_le"))) return error.Corrupt;
+    if (!checksum.verify(bytes, @offsetOf(JobEnrollV1, "csum_le"))) return error.Corrupt;
     const w = std.mem.bytesToValue(JobEnrollV1, bytes[0..ENROLL_LEN]);
     if (!std.mem.eql(u8, &w.magic, &ENROLL_MAGIC)) return error.Corrupt;
     if (std.mem.readInt(u16, &w.version_le, .little) != ENROLL_VERSION) return error.Corrupt;

@@ -7,11 +7,15 @@
 //!
 //! GROUPS are the six workloads of `squeezefs bench` (write seq 1 MiB, read
 //! seq 1 MiB, read rand 4 KiB, write rand 4 KiB, stat, del), each keyed from
-//! a row's `pass`/`block`/`access`. A RUN folds the rows of one `bench`
-//! invocation per group: ops/s over the group's total elapsed, the median of
-//! the rows' p50 and the max of the rows' p99 (the bucket upper bounds the
-//! bench reports — never a midpoint), plus the admission and reclaim
-//! ledgers summed. A BASELINE is `runs` RUNS (3 by default) of the same
+//! a row's `pass`/`block`/`access`, plus the four shapes of the hash
+//! microbench (`bench --hash`, decision 0003 §M: the format's `sqzhash128`
+//! column at 16 B, 100 B, 4 KiB, 256 KiB — hashes/s is the group's ops/s;
+//! the xxh3-64 reference and the low-64 columns ride in the rows, unjudged).
+//! A RUN folds the rows of one `bench` invocation per group: ops/s over the
+//! group's total elapsed, the median of the rows' p50 and the max of the
+//! rows' p99 (the bucket upper bounds the bench reports — never a midpoint;
+//! a hash cell has no histogram and reports 0), plus the admission and
+//! reclaim ledgers summed. A BASELINE is `runs` RUNS (3 by default) of the same
 //! shape on one venue: per group the mean and the sample standard deviation
 //! of ops/s and p99, and the measurement-law fields — instrument (train,
 //! commit, profile), substrate, venue (kernel, cpu, disk class), label
@@ -40,8 +44,35 @@ pub const Group = enum {
     write_rand_4k,
     stat,
     del,
+    hash_16b,
+    hash_100b,
+    hash_4k,
+    hash_256k,
 
     pub const count = @typeInfo(Group).@"enum".field_names.len;
+
+    /// The hash microbench's judged column.
+    pub const judged_hash_algo = "sqzhash128";
+
+    /// From a hash row's `algo` and `block`: the product's column at one of
+    /// the four shapes; the reference and low-64 columns are null (unjudged).
+    pub fn ofHashRow(algo: []const u8, block: u64) ?Group {
+        if (!std.mem.eql(u8, algo, judged_hash_algo)) return null;
+        return switch (block) {
+            16 => .hash_16b,
+            100 => .hash_100b,
+            4096 => .hash_4k,
+            262_144 => .hash_256k,
+            else => null,
+        };
+    }
+
+    pub fn isHash(self: Group) bool {
+        return switch (self) {
+            .hash_16b, .hash_100b, .hash_4k, .hash_256k => true,
+            else => false,
+        };
+    }
 
     /// From a row's `pass`, `block` and `access` (the bench's JSON).
     pub fn ofRow(pass: []const u8, block: u64, rand: bool) ?Group {
@@ -107,7 +138,7 @@ pub fn foldRun(gpa: Allocator, json_lines: []const u8) !Run {
         const pass = json_scan.string(line, "pass") orelse continue;
         const block = json_scan.number(line, "block") orelse continue;
         const access = json_scan.string(line, "access") orelse continue;
-        const g = Group.ofRow(pass, block, std.mem.eql(u8, access, "rand")) orelse continue;
+        const g = (if (std.mem.eql(u8, pass, "hash")) Group.ofHashRow(json_scan.string(line, "algo") orelse continue, block) else Group.ofRow(pass, block, std.mem.eql(u8, access, "rand"))) orelse continue;
         const rg = &run.groups[@backingInt(g)];
         const elapsed = json_scan.number(line, "elapsed_ns") orelse 0;
         rg.ops += json_scan.number(line, "ops") orelse 0;
@@ -121,7 +152,7 @@ pub fn foldRun(gpa: Allocator, json_lines: []const u8) !Run {
         rg.p99_ns = @max(rg.p99_ns, json_scan.number(line, "p99") orelse 0);
         try p50s[@backingInt(g)].append(gpa, json_scan.number(line, "p50") orelse 0);
         rg.rows += 1;
-        const moves_bytes = g != .stat and g != .del;
+        const moves_bytes = g != .stat and g != .del and !g.isHash();
         if (moves_bytes and (json_scan.number(line, "ops") orelse 0) < MIN_ROW_OPS) run.rows_long_enough = false;
     }
     for (&run.groups, 0..) |*rg, i| {
@@ -418,6 +449,24 @@ test "fold: rows key into their groups; ops/s over the group's total elapsed; p5
     try testing.expect(run.rows_long_enough);
     const short = try foldRun(testing.allocator, "{\"pass\":\"write\",\"block\":1048576,\"access\":\"seq\",\"elapsed_ns\":5000000000,\"ops\":255,\"bytes\":1,\"p50\":1,\"p99\":1}\n");
     try testing.expect(!short.rows_long_enough);
+}
+
+test "Group.ofHashRow: the sqzhash128 column keys the four hash groups by shape; the reference and low-64 columns and a foreign shape are null; the fold reads a hash row" {
+    try testing.expectEqual(Group.hash_16b, Group.ofHashRow("sqzhash128", 16).?);
+    try testing.expectEqual(Group.hash_100b, Group.ofHashRow("sqzhash128", 100).?);
+    try testing.expectEqual(Group.hash_4k, Group.ofHashRow("sqzhash128", 4096).?);
+    try testing.expectEqual(Group.hash_256k, Group.ofHashRow("sqzhash128", 262_144).?);
+    try testing.expectEqual(@as(?Group, null), Group.ofHashRow("xxh3-64", 16));
+    try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash64", 16));
+    try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash128", 17));
+    try testing.expect(Group.hash_4k.isHash() and !Group.stat.isHash());
+    const run = try foldRun(testing.allocator, "{\"pass\":\"hash\",\"algo\":\"sqzhash128\",\"block\":4096,\"access\":\"cpu\",\"ops\":1000000,\"elapsed_ns\":250000000,\"bytes\":4096000000,\"ps_per_op\":250000,\"mb_per_s\":16384}\n{\"pass\":\"hash\",\"algo\":\"xxh3-64\",\"block\":4096,\"access\":\"cpu\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n");
+    const g = run.group(.hash_4k);
+    try testing.expectEqual(@as(u32, 1), g.rows);
+    try testing.expectEqual(@as(u64, 1_000_000), g.ops);
+    try testing.expectApproxEqAbs(@as(f64, 4_000_000), g.opsPerS(), 0.01);
+    try testing.expectEqual(@as(u64, 0), g.p99_ns);
+    try testing.expect(run.rows_long_enough);
 }
 
 test "Group.ofRow: the six workloads; a foreign block or access is null" {

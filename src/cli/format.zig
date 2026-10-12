@@ -67,7 +67,7 @@ pub fn forceGate(prior: Prior, force: bool, w: *Io.Writer) Io.Writer.Error!bool 
         },
         .legacy => |v| {
             if (force) return true;
-            try w.print("Metadata volume carries prior on-disk state (a pre-v4 squeezefs format, version {d}); refusing to destroy it. Pass --force to reformat.", .{v});
+            try w.print("Metadata volume carries prior on-disk state (a pre-v5 squeezefs format, version {d}); refusing to destroy it. Pass --force to reformat.", .{v});
             return false;
         },
         .refused => |reason| {
@@ -246,7 +246,7 @@ pub fn run(p: cli.Process, f: args.Format) u8 {
                 // Blank to our magic: the foreign probe has the last word
                 // (the same law as the metadata volume's).
                 .blank => if (status.probeForeignOnPath(p.gpa, p.env, pool, dp) catch null) |hit| .{ .refused = std.fmt.bufPrint(&dreason, "{f}", .{hit}) catch "" } else .blank,
-                .v1 => |sb| .{ .formatted = sb },
+                .v2 => |sb| .{ .formatted = sb },
             };
         } else |e| switch (e) {
             error.DeviceRefused, error.Io, error.OutOfMemory, error.ReadbackMismatch, error.Unexpected => {

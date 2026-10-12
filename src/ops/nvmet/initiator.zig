@@ -40,6 +40,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const errors = @import("../../core/errors.zig");
+const checksum = @import("../../core/checksum.zig");
 const log = @import("../../core/log.zig");
 const clock = @import("../../core/clock.zig");
 const pr = @import("../../meta/guard/pr.zig");
@@ -830,13 +831,13 @@ pub const Sampler = struct {
 
     fn keyOf(c: *const Controller) u64 {
         var eb: [128]u8 = undefined;
-        var h = std.hash.XxHash3.init(0);
+        var h: checksum.Hasher = .init();
         h.update(c.transportOf());
         h.update("\x00");
         h.update(c.subsysnqnOf());
         h.update("\x00");
         h.update(stableEndpoint(c.addressOf(), &eb));
-        return h.final();
+        return h.finalLow64();
     }
 
     /// One sample over the controllers: the two gauges and the observed

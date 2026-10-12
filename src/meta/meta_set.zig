@@ -110,6 +110,8 @@ pub const MetaSet = struct {
     slot_rr: std.atomic.Value(u64) = .init(0),
     set_uuid: [16]u8,
     hash_seed: u64,
+    /// `hash_seed` expanded once at mount: the set's name key.
+    name_key: key.NameKey,
     node_size: u32,
     /// One slot migration at a time per set (the coordinator's
     /// one-flip-per-slot law, made structural).
@@ -149,7 +151,7 @@ pub const MetaSet = struct {
                     return error.NotFormatted;
                 },
                 error.LegacyFormat => {
-                    log.err("Metadata volume {s} is a pre-v4 squeezefs format — reformat required", .{p});
+                    log.err("Metadata volume {s} is a pre-v5 squeezefs format — reformat required", .{p});
                     return error.LegacyFormat;
                 },
                 error.DeviceRefused => error.DeviceRefused,
@@ -236,6 +238,7 @@ pub const MetaSet = struct {
             .rotors = rotors,
             .set_uuid = disc.set_uuid,
             .hash_seed = disc.hash_seed,
+            .name_key = .init(disc.hash_seed),
             .node_size = disc.node_size,
             .posture = posture,
         };
@@ -468,8 +471,8 @@ pub const MetaSet = struct {
         for (self.volumes) |be| try be.checkpointNow();
     }
 
-    pub fn hashSeed(self: *const MetaSet) u64 {
-        return self.hash_seed;
+    pub fn nameKey(self: *const MetaSet) *const key.NameKey {
+        return &self.name_key;
     }
 
     pub fn nodeSize(self: *const MetaSet) usize {
@@ -795,7 +798,7 @@ pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
         return global;
     }
     const t = try set.begin(@src());
-    _ = economy.stageCreate(t, .{ .hash_seed = set.hashSeed(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global }) catch |e| {
+    _ = economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global }) catch |e| {
         set.abandon(t);
         return e;
     };

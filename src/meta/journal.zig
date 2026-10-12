@@ -15,11 +15,11 @@
 //!     page k (4096 B) = header (24 B) ‖ data (4072 B)
 //!       header: magic "KVJP" u32 ‖ lap u32 ‖ first_entry_off u16 ‖
 //!               reserved u16 (= 0, checked) ‖ appender_id u32 ‖
-//!               xxh3(bytes[0..16]) u64
+//!               hash64(bytes[0..16]) u64
 //!     logical byte space = the data areas back to back, never wrapping
 //!     entry at logical pos p: pos u64 (== p) ‖ len u32 (payload only) ‖
 //!               kind u8 (0 = records, 1 = PAD) ‖ reserved[3] (= 0, checked) ‖
-//!               xxh3(bytes[0..16] ‖ payload) u64 ‖ payload
+//!               hash64(bytes[0..16] ‖ payload) u64 ‖ payload
 //!       payload = repeated ( tag u8 ‖ record frame )
 //!       record frame (K1's codec; only its framing is needed here) =
 //!               key_len u16 ‖ kind u8 ‖ flags u8 (= 0) ‖ val_len u32 ‖
@@ -53,7 +53,7 @@ pub const Reservation = jc.Reservation;
 /// The page = the atomic sector unit and the O_DIRECT grain ceiling.
 pub const PAGE_LEN: u64 = 4096;
 /// `{magic u32, lap u32, first_entry_off u16, reserved u16, appender_id u32,
-/// xxh3 u64}`: naturally aligned, the checksum over the first 16 B.
+/// hash64 u64}`: naturally aligned, the checksum over the first 16 B.
 pub const PAGE_HDR_LEN: u64 = 24;
 pub const PAGE_DATA_LEN: u64 = PAGE_LEN - PAGE_HDR_LEN;
 /// ASCII "KVJP" read as a little-endian u32: ASCII order on disk.
@@ -61,7 +61,7 @@ pub const PAGE_MAGIC: u32 = std.mem.readInt(u32, "KVJP", .little);
 /// An impossible physical in-page offset (> 4095): "no entry starts here" —
 /// the page is continuation bytes of an entry begun earlier.
 pub const FIRST_ENTRY_NONE: u16 = 0xFFFF;
-/// `pos u64 ‖ len u32 ‖ kind u8 ‖ reserved[3] ‖ xxh3 u64` (format v4,
+/// `pos u64 ‖ len u32 ‖ kind u8 ‖ reserved[3] ‖ hash64 u64` (format v4,
 /// decision 0003 Q1): naturally aligned, the entry kind explicit.
 pub const ENTRY_HDR_LEN: u64 = 24;
 /// Whole-entry cap, header included — a charter law (§5.1 "max 128 KiB").
@@ -278,7 +278,7 @@ pub fn pageHeaderImage(lap: u32, first_entry_off: u16, appender_id: u32) [PAGE_H
     std.mem.writeInt(u32, hdr[4..8], lap, .little);
     std.mem.writeInt(u16, hdr[8..10], first_entry_off, .little);
     std.mem.writeInt(u32, hdr[12..16], appender_id, .little);
-    std.mem.writeInt(u64, hdr[16..24], checksum.xxh3(hdr[0..16]), .little);
+    std.mem.writeInt(u64, hdr[16..24], checksum.hash64(hdr[0..16]), .little);
     return hdr;
 }
 
@@ -287,7 +287,7 @@ pub fn pageHeaderImage(lap: u32, first_entry_off: u16, appender_id: u32) [PAGE_H
 pub fn parsePageHeader(page: []const u8) ?PageHeader {
     if (page.len < PAGE_HDR_LEN) return null;
     if (std.mem.readInt(u32, page[0..4], .little) != PAGE_MAGIC) return null;
-    if (std.mem.readInt(u64, page[16..24], .little) != checksum.xxh3(page[0..16])) return null;
+    if (std.mem.readInt(u64, page[16..24], .little) != checksum.hash64(page[0..16])) return null;
     if (std.mem.readInt(u16, page[10..12], .little) != 0) return null;
     return .{
         .lap = std.mem.readInt(u32, page[4..8], .little),
@@ -470,13 +470,13 @@ fn entryHeaderPrefix(pos: u64, len: u32, kind: EntryKind) [ENTRY_HDR_CHECKSUM_OF
     return prefix;
 }
 
-/// `xxh3_64(pos ‖ len ‖ kind ‖ reserved ‖ payload)` with the payload as
+/// `hash64(pos ‖ len ‖ kind ‖ reserved ‖ payload)` with the payload as
 /// slices (no copy).
 pub fn entryChecksumParts(pos: u64, len: u32, kind: EntryKind, parts: []const []const u8) u64 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(&entryHeaderPrefix(pos, len, kind));
     for (parts) |p| h.update(p);
-    return h.final();
+    return h.finalLow64();
 }
 
 pub fn entryChecksum(pos: u64, kind: EntryKind, payload: []const u8) u64 {
@@ -925,14 +925,14 @@ fn parseEntryAt(arena: Allocator, image: []const u8, geo: CoreGeometry, pos: u64
     // The garbage-len guard: rejected on bounds alone.
     if (whole > MAX_ENTRY_LEN or pos + whole > chain_end) return .fail;
     const payload_pos = pos + ENTRY_HDR_LEN;
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(hdr[0..ENTRY_HDR_CHECKSUM_OFF]);
     var segs = geo.segments(payload_pos, len);
     while (segs.next()) |seg| {
         const at = imageOffset(seg);
         h.update(image[at .. at + @as(usize, @intCast(seg.len))]);
     }
-    if (h.final() != stored) return .fail;
+    if (h.finalLow64() != stored) return .fail;
     if (!std.mem.allEqual(u8, hdr[13..16], 0)) return .fail;
     const kind: EntryKind = switch (hdr[12]) {
         @backingInt(EntryKind.records) => .records,
@@ -1570,13 +1570,13 @@ test "ring grain: a power of two ≤ 4096 verbatim, anything else is the unpadde
     try testing.expectEqual(@as(u64, 0), ringMaxPadFor(1));
 }
 
-test "page header: byte layout {magic, lap, first_entry_off, reserved = 0, appender_id u32, xxh3 over [0..16)}; parse total; a non-zero reserved field is refused" {
+test "page header: byte layout {magic, lap, first_entry_off, reserved = 0, appender_id u32, hash64 over [0..16)}; parse total; a non-zero reserved field is refused" {
     const hdr = pageHeaderImage(7, 24, 0);
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, hdr[4..8], .little));
     try testing.expectEqual(@as(u16, 24), std.mem.readInt(u16, hdr[8..10], .little));
     try testing.expectEqualSlices(u8, &.{ 0, 0 }, hdr[10..12]);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, hdr[12..16]);
-    try testing.expectEqual(checksum.xxh3(hdr[0..16]), std.mem.readInt(u64, hdr[16..24], .little));
+    try testing.expectEqual(checksum.hash64(hdr[0..16]), std.mem.readInt(u64, hdr[16..24], .little));
     const parsed = parsePageHeader(&hdr).?;
     try testing.expectEqual(PageHeader{ .lap = 7, .first_entry_off = 24, .appender_id = 0 }, parsed);
     const w = pageHeaderImage(1, FIRST_ENTRY_NONE, 0x0001_0003);
@@ -1591,7 +1591,7 @@ test "page header: byte layout {magic, lap, first_entry_off, reserved = 0, appen
     // Reserved is CHECKED: restamped so only the reserved rule rejects.
     bad = hdr;
     bad[10] = 1;
-    std.mem.writeInt(u64, bad[16..24], checksum.xxh3(bad[0..16]), .little);
+    std.mem.writeInt(u64, bad[16..24], checksum.hash64(bad[0..16]), .little);
     try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(&bad));
     try testing.expectEqual(@as(?PageHeader, null), parsePageHeader(hdr[0..20]));
     const zeros: [24]u8 = @splat(0);
@@ -1681,10 +1681,10 @@ test "entry checksum: streaming over pos ‖ len ‖ kind ‖ reserved ‖ paylo
     std.mem.writeInt(u64, concat[0..8], 12345, .little);
     std.mem.writeInt(u32, concat[8..12], payload.len, .little);
     @memcpy(concat[16..], payload);
-    try testing.expectEqual(checksum.xxh3(&concat), entryChecksum(12345, .records, payload));
-    try testing.expectEqual(checksum.xxh3(&concat), entryChecksumParts(12345, payload.len, .records, &.{ payload[0..10], payload[10..] }));
+    try testing.expectEqual(checksum.hash64(&concat), entryChecksum(12345, .records, payload));
+    try testing.expectEqual(checksum.hash64(&concat), entryChecksumParts(12345, payload.len, .records, &.{ payload[0..10], payload[10..] }));
     concat[12] = 1;
-    try testing.expectEqual(checksum.xxh3(&concat), entryChecksum(12345, .pad, payload));
+    try testing.expectEqual(checksum.hash64(&concat), entryChecksum(12345, .pad, payload));
     try testing.expect(entryChecksum(12345, .pad, payload) != entryChecksum(12345, .records, payload));
 }
 
@@ -2016,10 +2016,10 @@ test "a PAD entry with a nonzero payload byte, an unknown entry kind or a non-ze
             1 => entry[12] = 2,
             else => entry[14] = 1,
         }
-        var h = std.hash.XxHash3.init(0);
+        var h: checksum.Hasher = .init();
         h.update(entry[0..ENTRY_HDR_CHECKSUM_OFF]);
         h.update(entry[ENTRY_HDR_LEN..]);
-        std.mem.writeInt(u64, entry[ENTRY_HDR_CHECKSUM_OFF..][0..8], h.final(), .little);
+        std.mem.writeInt(u64, entry[ENTRY_HDR_CHECKSUM_OFF..][0..8], h.finalLow64(), .little);
         var rec = try ring.replay(0);
         defer rec.deinit();
         var inos: [8]u64 = undefined;
@@ -2423,7 +2423,7 @@ fn journalFramesFuzz(_: void, smith: *std.testing.Smith) !void {
     _ = parsePageHeader(bytes);
     if (len >= PAGE_HDR_LEN) {
         // Restamped: the page header's checksum over the fuzzed first 16 bytes.
-        std.mem.writeInt(u64, buf[16..24], checksum.xxh3(buf[0..16]), .little);
+        std.mem.writeInt(u64, buf[16..24], checksum.hash64(buf[0..16]), .little);
         _ = parsePageHeader(bytes);
     }
     if (decodeRecordFrame(bytes)) |d| {

@@ -86,6 +86,8 @@ const Xattr = struct { ino: u64, name: []u8, value: []u8 };
 pub const ImageBuilder = struct {
     gpa: Allocator,
     cfg: BuilderConfig,
+    /// `cfg.hash_seed` expanded once per build.
+    name_key: key.NameKey,
     layout: NodeLayout,
     /// Insertion order == ino order (inos are minted monotonically).
     inodes: std.AutoArrayHashMapUnmanaged(u64, InodeValue),
@@ -100,7 +102,7 @@ pub const ImageBuilder = struct {
     /// `dir_nlink_underflows` tripwire on every first full `rm -rf`).
     pub fn init(gpa: Allocator, cfg: BuilderConfig) (node.Error || Allocator.Error)!ImageBuilder {
         const layout = try NodeLayout.new(cfg.node_size, null);
-        var self: ImageBuilder = .{ .gpa = gpa, .cfg = cfg, .layout = layout, .inodes = .empty, .dentries = .empty, .xattrs = .empty, .next_ino = ROOT_INO + 1 };
+        var self: ImageBuilder = .{ .gpa = gpa, .cfg = cfg, .name_key = .init(cfg.hash_seed), .layout = layout, .inodes = .empty, .dentries = .empty, .xattrs = .empty, .next_ino = ROOT_INO + 1 };
         errdefer self.deinit();
         try self.inodes.put(gpa, ROOT_INO, .{ .mode = S_IFDIR | 0o755, .nlink = 2 });
         try self.dentries.put(gpa, ROOT_INO, .empty);
@@ -260,7 +262,7 @@ pub const ImageBuilder = struct {
             groups.clearRetainingCapacity();
             for (names) |name| {
                 const d = dir.get(name).?;
-                const hash = key.dentryNameHash54(name, self.cfg.hash_seed);
+                const hash = key.dentryNameHash54(name, &self.name_key);
                 const coll = (try nextInChain(u64, gpa, &groups, hash)) orelse {
                     key.stats.meta_kv_dentry_collision_overflows.inc();
                     return error.DentryChainOverflow;
@@ -289,7 +291,7 @@ pub const ImageBuilder = struct {
         var groups: std.AutoHashMapUnmanaged([2]u64, u16) = .empty;
         defer groups.deinit(gpa);
         for (sorted) |x| {
-            const hash = key.xattrNameHash56(x.name, self.cfg.hash_seed);
+            const hash = key.xattrNameHash56(x.name, &self.name_key);
             const coll = (try nextInChain([2]u64, gpa, &groups, .{ x.ino, hash })) orelse return error.XattrChainOverflow;
             const value = (rec.XattrValue{ .name = x.name, .value = x.value }).encodeAlloc(gpa) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -323,11 +325,11 @@ pub const ImageBuilder = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    /// The post-fold digest of the description's USER content: xxh3 over
+    /// The post-fold digest of the description's USER content: hash64 over
     /// `kind ‖ (len ‖ key ‖ len ‖ value)*` for kinds 1, 2, 3 in kind-then-
     /// key order.
     pub fn digest(self: *const ImageBuilder, gpa: Allocator) DescribeError!u64 {
-        var h = std.hash.XxHash3.init(0);
+        var h: checksum.Hasher = .init();
         inline for (.{ key.TREE_INODES, key.TREE_DENTRIES, key.TREE_XATTRS }) |kind| {
             const records = switch (kind) {
                 key.TREE_INODES => try self.inodeRecords(gpa),
@@ -344,7 +346,7 @@ pub const ImageBuilder = struct {
             for (records, refs) |*r, *o| o.* = r.ref();
             digestUserKind(&h, kind, refs);
         }
-        return h.final();
+        return h.finalLow64();
     }
 };
 
@@ -386,7 +388,7 @@ pub fn isMountGuardXattr(value: []const u8) bool {
 /// One user kind's contribution to the digest walk: the kind byte, then per
 /// live record `len ‖ key ‖ len ‖ value` (u64 LE lengths), mount-guard
 /// xattrs excluded.
-pub fn digestUserKind(h: *std.hash.XxHash3, kind: u8, records: []const RecordRef) void {
+pub fn digestUserKind(h: *checksum.Hasher, kind: u8, records: []const RecordRef) void {
     h.update(&[_]u8{kind});
     for (records) |r| {
         if (kind == key.TREE_XATTRS and isMountGuardXattr(r.value)) continue;
@@ -403,12 +405,12 @@ pub fn digestUserKind(h: *std.hash.XxHash3, kind: u8, records: []const RecordRef
 pub const KindSetDigest = struct { count: u64, sum: u64 };
 
 /// The ORDER-INDEPENDENT per-kind oracle for the set-shaped kinds (6, 7):
-/// `(count, wrapping Σ xxh3(len ‖ key ‖ len ‖ value))` — a sum, because a
+/// `(count, wrapping Σ hash64(len ‖ key ‖ len ‖ value))` — a sum, because a
 /// forest's kind-routed walk yields these per slot tree.
 pub fn digestKindSet(records: []const RecordRef) KindSetDigest {
     var out: KindSetDigest = .{ .count = 0, .sum = 0 };
     for (records) |r| {
-        var h = std.hash.XxHash3.init(0);
+        var h: checksum.Hasher = .init();
         var len: [8]u8 = undefined;
         std.mem.writeInt(u64, &len, r.key.len, .little);
         h.update(&len);
@@ -417,7 +419,7 @@ pub fn digestKindSet(records: []const RecordRef) KindSetDigest {
         h.update(&len);
         h.update(r.value);
         out.count += 1;
-        out.sum +%= h.final();
+        out.sum +%= h.finalLow64();
     }
     return out;
 }
@@ -825,7 +827,8 @@ test "record assembly: inode records in ino order; dentry keys hash-shuffled the
     for (dentries) |r| {
         const dk = try key.DentryKey.decode(r.key);
         const dv = try rec.DentryValue.decode(r.value);
-        try testing.expectEqual(key.dentryNameHash54(dv.name, test_cfg.hash_seed), dk.hash54());
+        const nk: key.NameKey = .init(test_cfg.hash_seed);
+        try testing.expectEqual(key.dentryNameHash54(dv.name, &nk), dk.hash54());
         try testing.expectEqual(@as(u8, 0), dk.collSeq());
         if (std.mem.eql(u8, dv.name, "docs")) {
             try testing.expectEqual(@as(u64, 1), dk.parentIno());
@@ -986,11 +989,11 @@ test "digest walks: kind-then-key chained hash excludes writer_claim/writer_term
     try testing.expect(isMountGuardXattr(claim));
     try testing.expect(!isMountGuardXattr(user));
     try testing.expect(!isMountGuardXattr("\xff"));
-    var h1 = std.hash.XxHash3.init(0);
+    var h1: checksum.Hasher = .init();
     digestUserKind(&h1, key.TREE_XATTRS, &.{ .{ .key = "a", .seq = 0, .kind = .put, .value = user }, .{ .key = "b", .seq = 0, .kind = .put, .value = claim } });
-    var h2 = std.hash.XxHash3.init(0);
+    var h2: checksum.Hasher = .init();
     digestUserKind(&h2, key.TREE_XATTRS, &.{.{ .key = "a", .seq = 0, .kind = .put, .value = user }});
-    try testing.expectEqual(h1.final(), h2.final());
+    try testing.expectEqual(h1.finalLow64(), h2.finalLow64());
     const a = RecordRef{ .key = "k1", .seq = 0, .kind = .put, .value = "v1" };
     const b = RecordRef{ .key = "k2", .seq = 0, .kind = .put, .value = "v2" };
     const ab = digestKindSet(&.{ a, b });

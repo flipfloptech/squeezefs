@@ -18,7 +18,7 @@
 //! field by field, authenticated whole.
 //!
 //! The FRAMED image (frame version 2, decision 0003 §K7): `header page
-//! (the 96 B header ‖ an xxh3-guarded frame table ‖ zero pad to 4 KiB) ‖
+//! (the 96 B header ‖ a hash64-guarded frame table ‖ zero pad to 4 KiB) ‖
 //! frames`, each frame `FRAME_GRAIN` (64 KiB) of plaintext compressed with
 //! its own raw escape (the charter's "frame bit 31" is the entry's
 //! `STORE_RAW`: that frame's body IS its plaintext, the escape sitting
@@ -218,9 +218,11 @@ comptime {
 // ---------------------------------------------------------------------------
 
 pub const MAGIC = "SQZB";
-/// Version 2 = the framed image (version 1, one frame per block, is
-/// refused: pre-release, no compatibility owed — decision 0002).
-pub const FRAME_VERSION: u8 = 2;
+/// Version 3 = the framed image with the table's checksum sqzhash128's low
+/// 64 bits (decision 0003 §M); version 2 (the same image under xxh3-64) and
+/// version 1 (one frame per block) are refused: pre-release, no
+/// compatibility owed — decision 0002 rows 480.
+pub const FRAME_VERSION: u8 = 3;
 /// A frame ENTRY's flag: the body IS the plaintext (incompressible, or a
 /// compression-less volume). Never set in the block header.
 pub const FLAG_STORE_RAW: u8 = 1 << 0;
@@ -263,12 +265,12 @@ comptime {
 }
 
 /// The frame table, right after the header inside the header page: a
-/// 16 B head then `frame_count` entries. The xxh3 guards the entries (a
+/// 16 B head then `frame_count` entries. The hash64 guards the entries (a
 /// plaintext volume has no AEAD to catch a torn table; an encrypted one
 /// binds every entry into its frame's AAD as well).
 pub const FrameTableWire = extern struct {
-    /// xxh3-64 over the entries (`frame_count × 16` bytes).
-    entries_xxh3_le: [8]u8,
+    /// hash64 over the entries (`frame_count × 16` bytes).
+    entries_csum_le: [8]u8,
     frame_count_le: [2]u8,
     /// `FRAME_GRAIN_LOG2` (the reader never assumes the constant).
     frame_grain_log2: u8,
@@ -410,7 +412,7 @@ pub const FrameRefusal = enum {
     key,
     /// The decompressor refused the body or produced ≠ `plain_len` bytes.
     body,
-    /// The frame table: a torn xxh3, a count ≠ `framesFor(plain_len)`,
+    /// The frame table: a torn hash64, a count ≠ `framesFor(plain_len)`,
     /// a grain ≠ the constant, non-contiguous or oversized bodies, a
     /// plain length off the grain, an entry's flag/length law.
     table,
@@ -473,7 +475,7 @@ pub fn decodeHeader(cfg: VolumeTransform, image: []const u8) DecodeError!Header 
     return h;
 }
 
-/// The table decoder over the image's first grain: the xxh3 over the
+/// The table decoder over the image's first grain: the hash64 over the
 /// entries, the count (`framesFor(plain_len)`), the grain, then every
 /// entry's laws — contiguous bodies from `tableLen(count)` summing to `body_len`,
 /// plaintexts of the grain but the last, an encrypted body carrying its
@@ -486,7 +488,7 @@ pub fn decodeTable(cfg: VolumeTransform, h: Header, page: []const u8) DecodeErro
     if (count != framesFor(h.plain_len) or count > MAX_FRAMES) return error.FrameTable;
     if (tw.frame_grain_log2 != FRAME_GRAIN_LOG2 or !std.mem.allEqual(u8, &tw.reserved, 0)) return error.FrameTable;
     const entries_bytes = page[HEADER_LEN + TABLE_HEAD_LEN ..][0 .. @as(usize, count) * ENTRY_LEN];
-    if (std.mem.readInt(u64, &tw.entries_xxh3_le, .little) != checksum.xxh3(entries_bytes)) return error.FrameTable;
+    if (std.mem.readInt(u64, &tw.entries_csum_le, .little) != checksum.hash64(entries_bytes)) return error.FrameTable;
     const t: Table = .{ .count = count, .entries = std.mem.bytesAsSlice(FrameEntryWire, entries_bytes) };
     var off: u64 = tableLen(count);
     var plain_left: u64 = h.plain_len;
@@ -1486,7 +1488,7 @@ pub const Codec = struct {
             entries[i] = .{ .off = @intCast(off), .body_len = @intCast(body_len), .plain_len = @intCast(p.len), .flags = flags };
             off += body_len;
         }
-        // 2. The header (the AAD's first part) and the table with its xxh3;
+        // 2. The header (the AAD's first part) and the table with its hash64;
         //    frame 0's body starts right after.
         var h: Header = .{ .flags = 0, .compression = t.cfg.compression, .encryption = t.cfg.encryption, .body_len = @intCast(off - table_len), .plain_len = @intCast(plain.len), .key_blob = @splat(0), .nonce = @splat(0) };
         if (encrypted) {
@@ -1500,7 +1502,7 @@ pub const Codec = struct {
         i = 0;
         while (i < frames) : (i += 1) entries[i].encode(entries_bytes[@as(usize, i) * ENTRY_LEN ..][0..ENTRY_LEN]);
         var tw: FrameTableWire = undefined;
-        std.mem.writeInt(u64, &tw.entries_xxh3_le, checksum.xxh3(entries_bytes), .little);
+        std.mem.writeInt(u64, &tw.entries_csum_le, checksum.hash64(entries_bytes), .little);
         std.mem.writeInt(u16, &tw.frame_count_le, @intCast(frames), .little);
         tw.frame_grain_log2 = FRAME_GRAIN_LOG2;
         tw.reserved = @splat(0);
@@ -1931,7 +1933,7 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     defer gpa.free(mut);
     // A short page.
     try testing.expectError(error.FrameLen, decodeTable(cfg2, h, image[0 .. HEADER_PAGE_LEN - 1]));
-    // A torn entry byte: the xxh3 catches it.
+    // A torn entry byte: the hash64 catches it.
     @memcpy(mut, image);
     mut[HEADER_LEN + TABLE_HEAD_LEN + 1] ^= 1;
     try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
@@ -1945,13 +1947,13 @@ test "decodeHeader refuses by class in order: len, plain_len FIRST (before magic
     @memcpy(mut, image);
     mut[HEADER_LEN + 11] = 1;
     try testing.expectError(error.FrameTable, decodeTable(cfg2, h, mut));
-    // Re-stamping the xxh3 after a law break still refuses: a non-contiguous
+    // Re-stamping the hash64 after a law break still refuses: a non-contiguous
     // body, a raw body ≠ its plaintext, a compressed body ≥ its plaintext, a
     // last frame of zero plaintext, the sum off `body_len`.
     const Restamp = struct {
         fn run(buf: []u8, count: u32) void {
             const eb = buf[HEADER_LEN + TABLE_HEAD_LEN ..][0 .. @as(usize, count) * ENTRY_LEN];
-            std.mem.writeInt(u64, buf[HEADER_LEN..][0..8], checksum.xxh3(eb), .little);
+            std.mem.writeInt(u64, buf[HEADER_LEN..][0..8], checksum.hash64(eb), .little);
         }
     };
     const e1 = HEADER_LEN + TABLE_HEAD_LEN + ENTRY_LEN;
@@ -2546,7 +2548,7 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     // Every header byte: refused. A nonce byte reaches the AEAD (the header
     // is the AAD's first part); a blob byte fails the unwrap first
     // (FrameKey); the rest fail a field law or the AEAD. Every TABLE byte:
-    // the xxh3 (FrameTable) or — re-stamped — the entry's AAD binding.
+    // the hash64 (FrameTable) or — re-stamped — the entry's AAD binding.
     var auth_fail: usize = 0;
     var key_fail: usize = 0;
     for (0..HEADER_LEN) |i| {

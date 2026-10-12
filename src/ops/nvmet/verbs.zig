@@ -73,7 +73,7 @@ pub const Outcome = enum(u8) { ok = 0, failed = 1 };
 
 pub const ShareOptions = struct {
     backing_path: []const u8,
-    /// Null = `OWNERSHIP_NQN_PREFIX ‖ xxh3(canonical backing)`.
+    /// Null = `OWNERSHIP_NQN_PREFIX ‖ hash64(canonical backing)`.
     subnqn: ?[]const u8 = null,
     trtype: configfs.Trtype = .tcp,
     /// `--ip` (tcp): ≥ 1; forbidden on loop.
@@ -94,7 +94,7 @@ fn fail(ctx: *Ctx, comptime fmt: []const u8, args: anytype) Outcome {
 
 /// The default share NQN: classification only, never ownership.
 pub fn defaultSubnqn(buf: *[128]u8, canonical: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}{x:0>16}", .{ configfs.OWNERSHIP_NQN_PREFIX, checksum.xxh3(canonical) }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}{x:0>16}", .{ configfs.OWNERSHIP_NQN_PREFIX, checksum.hash64(canonical) }) catch unreachable;
 }
 
 fn preflightFor(ctx: *Ctx, verb: []const u8) ?Outcome {

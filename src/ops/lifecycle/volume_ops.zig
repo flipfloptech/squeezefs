@@ -178,7 +178,7 @@ pub fn probeDevice(gpa: Allocator, io: Io, path: []const u8, set_uuid: [16]u8, c
         else => return error.DeviceRefused,
     };
     switch (opened.classified.format) {
-        .v1 => |sb| if (std.mem.eql(u8, &sb.set_uuid, &set_uuid)) return error.DeviceRefused,
+        .v2 => |sb| if (std.mem.eql(u8, &sb.set_uuid, &set_uuid)) return error.DeviceRefused,
         .blank => {},
     }
     var uuid: [16]u8 = undefined;

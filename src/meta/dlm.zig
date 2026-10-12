@@ -134,9 +134,9 @@ pub fn keyWord(a: u64, b: u64) u64 {
     return splitmix64(a ^ std.math.rotl(u64, b, 32)) | 1;
 }
 
-/// The dentry class's hash input: `parent ^ rotl(xxh3_64(name), 1)`.
+/// The dentry class's hash input: `parent ^ rotl(hash64(name), 1)`.
 pub fn dentryKey(parent: u64, name: []const u8) u64 {
-    return parent ^ std.math.rotl(u64, checksum.xxh3(name), 1);
+    return parent ^ std.math.rotl(u64, checksum.hash64(name), 1);
 }
 
 // ===========================================================================

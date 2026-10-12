@@ -111,7 +111,7 @@ pub const stats = struct {
 pub const JOINER_MOUNT_SLOT_BIT: u32 = 1 << 31;
 
 pub fn joinerMountSlot(mountpoint: []const u8) u32 {
-    return JOINER_MOUNT_SLOT_BIT | (@as(u32, @truncate(checksum.xxh3(mountpoint))) & (JOINER_MOUNT_SLOT_BIT - 1));
+    return JOINER_MOUNT_SLOT_BIT | (@as(u32, @truncate(checksum.hash64(mountpoint))) & (JOINER_MOUNT_SLOT_BIT - 1));
 }
 
 /// How long a joiner polls the projection for the manager's endpoint

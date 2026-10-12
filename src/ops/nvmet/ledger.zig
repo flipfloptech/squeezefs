@@ -92,8 +92,8 @@ pub const LedgerHeadWire = extern struct {
     generation_le: [8]u8,
     written_s_le: [8]u8,
     reserved: [16]u8,
-    /// xxh3 over `head[0..56] ‖ body`.
-    xxh3_le: [8]u8,
+    /// hash64 over `head[0..56] ‖ body`.
+    csum_le: [8]u8,
 };
 
 pub const HEAD_LEN: usize = @sizeOf(LedgerHeadWire);
@@ -165,7 +165,7 @@ pub const LISTENER_LEN: usize = @sizeOf(ListenerWire);
 
 comptime {
     std.debug.assert(HEAD_LEN == 64);
-    std.debug.assert(@offsetOf(LedgerHeadWire, "xxh3_le") == HEAD_HASHED);
+    std.debug.assert(@offsetOf(LedgerHeadWire, "csum_le") == HEAD_HASHED);
     std.debug.assert(RECORD_HEAD_LEN == 48);
     std.debug.assert(@offsetOf(ShareRecordWire, "ns_uuid") == 32);
     std.debug.assert(LISTENER_LEN == 24);
@@ -367,7 +367,7 @@ pub fn encode(gpa: Allocator, l: *const Ledger) EncodeError![]u8 {
     std.mem.writeInt(u64, &h.generation_le, l.generation, .little);
     std.mem.writeInt(i64, &h.written_s_le, l.written_s, .little);
     h.reserved = @splat(0);
-    h.xxh3_le = @splat(0);
+    h.csum_le = @splat(0);
     out[0..HEAD_LEN].* = std.mem.toBytes(h);
     var off: usize = HEAD_LEN;
     for (l.records.items) |*r| {
@@ -416,12 +416,12 @@ fn putFramed(out: []u8, off: usize, bytes: []const u8) usize {
     return off + 2 + bytes.len;
 }
 
-/// xxh3 over `head[0..56] ‖ body` (the checksum field excluded by position).
+/// hash64 over `head[0..56] ‖ body` (the checksum field excluded by position).
 fn hashImage(bytes: []const u8) u64 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     h.update(bytes[0..HEAD_HASHED]);
     h.update(bytes[HEAD_LEN..]);
-    return h.final();
+    return h.finalLow64();
 }
 
 pub const DecodeError = error{
@@ -483,7 +483,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) DecodeError!Ledger {
     if (!std.mem.allEqual(u8, &h.reserved, 0)) return error.ReservedNotZero;
     const body_len = std.mem.readInt(u64, &h.body_len_le, .little);
     if (body_len != bytes.len - HEAD_LEN) return error.BadLength;
-    if (std.mem.readInt(u64, &h.xxh3_le, .little) != hashImage(bytes)) return error.ChecksumMismatch;
+    if (std.mem.readInt(u64, &h.csum_le, .little) != hashImage(bytes)) return error.ChecksumMismatch;
     const count: usize = std.mem.readInt(u32, &h.record_count_le, .little);
     if (count > MAX_RECORDS or count * RECORD_HEAD_LEN > body_len) return error.Truncated;
     var out: Ledger = .{ .generation = std.mem.readInt(u64, &h.generation_le, .little), .written_s = std.mem.readInt(i64, &h.written_s_le, .little) };

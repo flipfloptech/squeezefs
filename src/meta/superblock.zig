@@ -1,14 +1,14 @@
-//! Superblock v4 — sector 0 (charter §5.1, §1.7; `docs/porting/kv_alloc_superblock.md`
+//! Superblock v5 — sector 0 (charter §5.1, §1.7; `docs/porting/kv_alloc_superblock.md`
 //! §1). Pure: images in, images out. The loader's primary/backup choice and
 //! the write order are expressed over images and as an ordered plan the io
 //! task executes.
 //!
 //! ONE `extern struct` with explicit little-endian fields and the checksum
-//! LAST (format v4; decision 0002 rows 40–42): `{magic[8], version u16,
+//! LAST (format v5; decision 0002 rows 40–42, 480): `{magic[8], version u16,
 //! reserved u16, node_size u32, volume_len u64, features_incompat u64,
 //! features_ro u64, root_ledger, journal, alloc_bitmap, heap, appender_dir
 //! (5 × {start u64, len u64}), uuid[16], set_uuid[16], hash_seed u64,
-//! sb_generation u64, reserved[16], xxh3 u64}` = 192 B; `[192, 4096)` is
+//! sb_generation u64, reserved[16], checksum u64}` = 192 B; `[192, 4096)` is
 //! zero padding under the checksum (the whole sector with the field zeroed).
 //!
 //! Forward-only (charter §1.7): the version IS every always-on mechanism of
@@ -36,7 +36,10 @@ pub const magic_value = "SQZMETLV";
 /// The pre-v4 magic (the Rust reference's v2/v3 images): recognised only to
 /// refuse with "reformat required" instead of "foreign volume".
 pub const legacy_magic_value = "METALV01";
-pub const version_v4: u16 = 4;
+/// v5 = v4's layout with every checksum sqzhash128's low 64 bits instead of
+/// xxh3-64 (decision 0003 §M, 0002 row 480): a v4 image verifies nowhere,
+/// so it classifies LEGACY (reformat) by its version before any checksum.
+pub const version_v5: u16 = 5;
 
 /// The fixed-field layout: the codec reads and writes exactly these bytes.
 pub const SuperblockWire = extern struct {
@@ -220,7 +223,7 @@ pub const Superblock = struct {
         @memset(out, 0);
         var w: SuperblockWire = undefined;
         w.magic = magic_value.*;
-        std.mem.writeInt(u16, &w.version_le, version_v4, .little);
+        std.mem.writeInt(u16, &w.version_le, version_v5, .little);
         std.mem.writeInt(u16, &w.reserved0_le, 0, .little);
         std.mem.writeInt(u32, &w.node_size_le, self.node_size, .little);
         std.mem.writeInt(u64, &w.volume_len_le, self.volume_len, .little);
@@ -254,9 +257,9 @@ pub const Superblock = struct {
         if (buf.len != sector_len) return refuse(diag, .{ .bad_length = buf.len });
         if (!std.mem.eql(u8, buf[0..8], magic_value)) return refuse(diag, .bad_magic);
         const version = std.mem.readInt(u16, buf[off_version..][0..2], .little);
-        if (version != version_v4) return refuse(diag, .{ .wrong_version = version });
+        if (version != version_v5) return refuse(diag, .{ .wrong_version = version });
         const stored = std.mem.readInt(u64, buf[off_checksum..][0..8], .little);
-        const computed = checksum.xxh3FieldZeroed(buf, off_checksum);
+        const computed = checksum.hash64FieldZeroed(buf, off_checksum);
         if (stored != computed) return refuse(diag, .{ .checksum_mismatch = .{ .stored = stored, .computed = computed } });
         const w = std.mem.bytesToValue(SuperblockWire, buf[0..fixed_len]);
         const sb = Superblock{
@@ -437,7 +440,7 @@ pub const Refusal = union(enum) {
         switch (self) {
             .bad_length => |n| try w.print("superblock sector must be {d} bytes, got {d}", .{ sector_len, n }),
             .bad_magic => try w.writeAll("bad superblock magic (corrupted or foreign volume)"),
-            .wrong_version => |v| try w.print("v4 decoder handed superblock version {d} (classification bug)", .{v}),
+            .wrong_version => |v| try w.print("v5 decoder handed superblock version {d} (classification bug)", .{v}),
             .checksum_mismatch => |c| try w.print("superblock checksum mismatch: stored 0x{x:0>16}, computed 0x{x:0>16} — corrupted superblock", .{ c.stored, c.computed }),
             .reserved_not_zero => try w.writeAll("superblock reserved bytes are not zero (a writer this binary does not know, or corruption under a valid checksum)"),
             .unknown_incompat_bits => |unknown| {
@@ -472,7 +475,7 @@ pub const Refusal = union(enum) {
                 try writeByteList(w, magic_value);
                 try w.writeAll(") — corrupted or foreign volume");
             },
-            .unsupported_version => |v| try w.print("unsupported metadata format version {d} (this binary supports exactly {d}) — upgrade squeezefs", .{ v, version_v4 }),
+            .unsupported_version => |v| try w.print("unsupported metadata format version {d} (this binary supports exactly {d}) — upgrade squeezefs", .{ v, version_v5 }),
             .symmetric_plane_repoint => |r| try w.print("SYMMETRIC_PLANE is already stamped with appender directory 0x{x}+{d} — refusing to re-point it at 0x{x}+{d}", .{ r.have.start, r.have.len, r.want.start, r.want.len }),
         }
     }
@@ -500,17 +503,18 @@ fn refuse(diag: ?*Refusal, r: Refusal) DecodeError {
 pub const VolumeFormat = union(enum) {
     /// All-zero magic: never formatted (mount: loud; format: proceed).
     blank,
-    /// The pre-v4 magic (the reference's v2/v3 images): recognised, never
-    /// decoded — reformat required.
+    /// The pre-v4 magic (the reference's v2/v3 images) or an earlier version
+    /// of this magic (v4: xxh3-64 checksums): recognised, never decoded —
+    /// reformat required.
     legacy: u32,
-    v4: Superblock,
+    v5: Superblock,
 
     /// The mount's refusal for the two non-v4 classifications.
     pub fn writeMountRefusal(self: VolumeFormat, w: *std.Io.Writer, path: []const u8) std.Io.Writer.Error!void {
         switch (self) {
             .blank => try w.print("{s} is not formatted (zeroed superblock) — run `squeezefs format` first", .{path}),
-            .legacy => |v| try w.print("Metadata volume {s} is a pre-v4 squeezefs format (version {d}), which this binary does not mount — reformat required: run `squeezefs format` (destroys the old contents)", .{ path, v }),
-            .v4 => {},
+            .legacy => |v| try w.print("Metadata volume {s} is a pre-v5 squeezefs format (version {d}), which this binary does not mount — reformat required: run `squeezefs format` (destroys the old contents)", .{ path, v }),
+            .v5 => {},
         }
     }
 };
@@ -522,7 +526,10 @@ pub fn classifySector0(sector: []const u8, diag: ?*Refusal) DecodeError!VolumeFo
     if (std.mem.eql(u8, magic, legacy_magic_value)) return .{ .legacy = std.mem.readInt(u32, sector[8..12], .little) };
     if (!std.mem.eql(u8, magic, magic_value)) return refuse(diag, .{ .invalid_magic = magic.* });
     const version = std.mem.readInt(u16, sector[off_version..][0..2], .little);
-    if (version == version_v4) return .{ .v4 = try Superblock.decodeSector(sector, diag) };
+    if (version == version_v5) return .{ .v5 = try Superblock.decodeSector(sector, diag) };
+    // An earlier version of this magic verifies nowhere under this binary's
+    // checksum: the lever is a reformat, named before any checksum check.
+    if (version < version_v5) return .{ .legacy = version };
     return refuse(diag, .{ .unsupported_version = version });
 }
 
@@ -579,7 +586,7 @@ pub fn classifyVolumeImages(primary: []const u8, backup: ?[]const u8, device_len
     if (backup) |tail| {
         if (backupOffsetFor(device_len)) |off| {
             if (classifySector0(tail, null)) |fmt| {
-                if (fmt == .v4 and fmt.v4.backupOffset() == off) return .{ .format = fmt, .slot = .backup };
+                if (fmt == .v5 and fmt.v5.backupOffset() == off) return .{ .format = fmt, .slot = .backup };
             } else |_| {}
         }
     }
@@ -693,7 +700,7 @@ test "incompat table: four capability bits, pairwise disjoint, union == KNOWN, o
     try testing.expectEqual(Presence.format_time, incompat_bits[0].presence);
     try testing.expectEqualStrings("SYMMETRIC_PLANE", incompat_bits[0].name);
     for (incompat_bits[1..]) |b| try testing.expectEqual(Presence.stamped_later, b.presence);
-    try testing.expectEqual(@as(u16, 4), version_v4);
+    try testing.expectEqual(@as(u16, 5), version_v5);
 }
 
 test "sector image: every field at its offset in the 192 B extern struct, checksum LAST over the whole sector with [184,192) zeroed; the zero padding and reserved bytes are checked" {
@@ -722,7 +729,7 @@ test "sector image: every field at its offset in the 192 B extern struct, checks
     // The checksum recipe: the LAST field, over the whole sector.
     var copy = img;
     @memset(copy[184..192], 0);
-    try testing.expectEqual(checksum.xxh3(&copy), std.mem.readInt(u64, img[184..192], .little));
+    try testing.expectEqual(checksum.hash64(&copy), std.mem.readInt(u64, img[184..192], .little));
     const back = try Superblock.decodeSector(&img, null);
     try testing.expectEqual(sb, back);
     try testing.expectEqual(@as(u64, 1004), back.totalExtents());
@@ -773,7 +780,7 @@ test "decoder check order and refusals: length, magic, version, checksum, reserv
     bad = img;
     std.mem.writeInt(u16, bad[8..10], 3, .little);
     try testing.expectError(error.WrongVersion, Superblock.decodeSector(&bad, &diag));
-    try testing.expectEqualStrings("v4 decoder handed superblock version 3 (classification bug)", msg(&buf, diag));
+    try testing.expectEqualStrings("v5 decoder handed superblock version 3 (classification bug)", msg(&buf, diag));
 
     // A byte flipped at offset 900 — deep in the padding — fails the checksum.
     bad = img;
@@ -911,7 +918,7 @@ test "validate_geometry: every refusal with its text; heap_start % node_size enf
     try testing.expectError(error.AppenderDirShape, s.validateGeometry(&diag));
 }
 
-test "classify_sector0: Blank only for all-zero magic; the pre-v4 magic is legacy; foreign magic; v4; another version named BEFORE any checksum check" {
+test "classify_sector0: Blank only for all-zero magic; the pre-v4 magic is legacy; foreign magic; v5; a v4 image (xxh3-64 checksums) is legacy by its version, a later version is unsupported — both named BEFORE any checksum check" {
     const sb = testFixture();
     var img: [sector_len]u8 = undefined;
     try sb.encodeSector(0, &img, null);
@@ -940,18 +947,34 @@ test "classify_sector0: Blank only for all-zero magic; the pre-v4 magic is legac
     std.mem.writeInt(u32, legacy[8..12], 2, .little);
     try testing.expectEqual(VolumeFormat{ .legacy = 2 }, try classifySector0(&legacy, &diag));
 
-    const v4 = try classifySector0(&img, &diag);
-    try testing.expectEqual(sb, v4.v4);
+    const v5 = try classifySector0(&img, &diag);
+    try testing.expectEqual(sb, v5.v5);
+
+    // A v4 image — this magic, version 4, every checksum xxh3-64 — is
+    // LEGACY by its version, named before any checksum check: the mount
+    // refusal names the lever (reformat), never a tear.
+    var v4 = img;
+    std.mem.writeInt(u16, v4[8..10], 4, .little);
+    try testing.expectEqual(VolumeFormat{ .legacy = 4 }, try classifySector0(&v4, &diag));
+    var v4_torn = v4;
+    v4_torn[900] ^= 1;
+    try testing.expectEqual(VolumeFormat{ .legacy = 4 }, try classifySector0(&v4_torn, &diag));
+    {
+        var w4_buf: [512]u8 = undefined;
+        var w4: std.Io.Writer = .fixed(&w4_buf);
+        try (VolumeFormat{ .legacy = 4 }).writeMountRefusal(&w4, "/dev/meta0");
+        try testing.expectEqualStrings("Metadata volume /dev/meta0 is a pre-v5 squeezefs format (version 4), which this binary does not mount — reformat required: run `squeezefs format` (destroys the old contents)", w4.buffered());
+    }
 
     // Version 99 with a now-wrong checksum: "upgrade", never "checksum".
     var future = img;
     std.mem.writeInt(u16, future[8..10], 99, .little);
     try testing.expectError(error.UnsupportedVersion, classifySector0(&future, &diag));
     const m = msg(&buf, diag);
-    try testing.expectEqualStrings("unsupported metadata format version 99 (this binary supports exactly 4) — upgrade squeezefs", m);
+    try testing.expectEqualStrings("unsupported metadata format version 99 (this binary supports exactly 5) — upgrade squeezefs", m);
     try testing.expect(std.mem.indexOf(u8, m, "checksum") == null);
 
-    // A torn v4 primary classifies as a checksum error.
+    // A torn v5 primary classifies as a checksum error.
     var torn = img;
     torn[900] ^= 1;
     try testing.expectError(error.ChecksumMismatch, classifySector0(&torn, &diag));
@@ -962,7 +985,7 @@ test "classify_sector0: Blank only for all-zero magic; the pre-v4 magic is legac
     try testing.expectEqualStrings("/dev/meta0 is not formatted (zeroed superblock) — run `squeezefs format` first", w.buffered());
     w = .fixed(&mount_buf);
     try (VolumeFormat{ .legacy = 3 }).writeMountRefusal(&w, "/dev/meta0");
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "pre-v4") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "pre-v5") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "version 3") != null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "reformat required") != null);
 }
@@ -991,7 +1014,7 @@ test "DUR-5: the backup is self-located at the last aligned sector of the superb
     try testing.expectEqual(@as(u64, 1), nextSuperblockGeneration(null, null));
 }
 
-test "loader choice: a classifying primary (even Blank/legacy) is authoritative; the backup is consulted only on a primary ERROR, accepted only as a v4 whose own volume_len names the slot it came from; else the primary's error stands" {
+test "loader choice: a classifying primary (even Blank/legacy) is authoritative; the backup is consulted only on a primary ERROR, accepted only as a v5 whose own volume_len names the slot it came from; else the primary's error stands" {
     const sb = testFixture();
     const len: u64 = 64 << 20;
     var p: [sector_len]u8 = undefined;
@@ -1014,7 +1037,7 @@ test "loader choice: a classifying primary (even Blank/legacy) is authoritative;
     torn[900] ^= 1;
     const rec = try classifyVolumeImages(&torn, &b, len, &diag);
     try testing.expectEqual(SuperblockSlot.backup, rec.slot);
-    try testing.expectEqual(sb, rec.format.v4);
+    try testing.expectEqual(sb, rec.format.v5);
 
     // Both torn ⇒ the PRIMARY's checksum error.
     var torn_b = b;
@@ -1053,7 +1076,7 @@ test "write plan: backup → barrier → sector 0 → barrier, one image at one 
     try testing.expectEqual(@as(u64, 0), plan.slice()[1].offset);
     try testing.expect(plan.slice()[1].barrier_after);
     try testing.expectEqual(@as(u64, 9), sectorGeneration(plan.bytes()));
-    try testing.expectEqual(sb, (try classifySector0(plan.bytes(), null)).v4);
+    try testing.expectEqual(sb, (try classifySector0(plan.bytes(), null)).v5);
 
     const repair = try planRepairPrimary(sb, 4, null);
     try testing.expectEqual(@as(u64, 0), repair.step.offset);
@@ -1103,9 +1126,9 @@ test "property: the sector decoder is total on arbitrary and restamped bytes; a 
         for (0..flips) |_| buf[r.intRangeLessThan(usize, 0, fixed_len)] ^= @as(u8, 1) << r.int(u3);
         checksum.stamp(&buf, off_checksum);
         if (classifySector0(&buf, null)) |fmt| {
-            if (fmt == .v4) {
+            if (fmt == .v5) {
                 var again: [sector_len]u8 = undefined;
-                try fmt.v4.encodeSector(sectorGeneration(&buf), &again, null);
+                try fmt.v5.encodeSector(sectorGeneration(&buf), &again, null);
                 try testing.expectEqualSlices(u8, &buf, &again);
             }
         } else |_| {}

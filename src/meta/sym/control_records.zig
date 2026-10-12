@@ -456,8 +456,8 @@ pub const SpillRun = struct { extent_addr: u64, count: u32 };
 
 pub const SlotTails = union(enum) {
     inline_tails: struct { g: u32, tails: []const TailEntry },
-    /// `xxh3` over the concatenated entry images of every spill extent.
-    spilled: struct { g: u32, runs: []const SpillRun, xxh3: u64 },
+    /// `hash64` over the concatenated entry images of every spill extent.
+    spilled: struct { g: u32, runs: []const SpillRun, csum: u64 },
 
     pub fn g(self: SlotTails) u32 {
         return switch (self) {
@@ -521,7 +521,7 @@ pub fn encodeSlotTails(t: SlotTails, out: []u8) error{ Overflow, BufferTooSmall 
                 wr(u32, &w.reserved_le, 0);
                 @memcpy(out[SlotTailsHead.LEN + i * SpillRunWire.LEN ..][0..SpillRunWire.LEN], &std.mem.toBytes(w));
             }
-            std.mem.writeInt(u64, out[len - 8 ..][0..8], v.xxh3, .little);
+            std.mem.writeInt(u64, out[len - 8 ..][0..8], v.csum, .little);
         },
     }
     return out[0..len];
@@ -536,7 +536,7 @@ pub const DecodedSlotTails = struct {
     spilled: bool,
     count: u32,
     entries: []const u8,
-    xxh3: u64,
+    csum: u64,
 
     pub fn tailEntryAt(self: DecodedSlotTails, i: usize) TailEntry {
         assert(!self.spilled and i < self.count);
@@ -576,15 +576,15 @@ pub fn decodeSlotTails(bytes: []const u8) DecodeError!DecodedSlotTails {
         .spilled = spilled,
         .count = count,
         .entries = entries,
-        .xxh3 = if (spilled) std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little) else 0,
+        .csum = if (spilled) std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little) else 0,
     };
 }
 
-/// The spill checksum law: xxh3 over the concatenated entry images.
+/// The spill checksum law: hash64 over the concatenated entry images.
 pub fn spillChecksum(images: []const []const u8) u64 {
-    var h = std.hash.XxHash3.init(0);
+    var h: checksum.Hasher = .init();
     for (images) |img| h.update(img);
-    return h.final();
+    return h.finalLow64();
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,12 +1245,12 @@ test "slot_tails: inline and spilled round-trip behind the flag bit; the count i
     try testing.expectEqual(tails[1], d.tailEntryAt(1));
     const runs = [_]SpillRun{.{ .extent_addr = 0x300000, .count = 4096 }};
     const img = [_]u8{ 1, 2, 3 };
-    const sp = try encodeSlotTails(.{ .spilled = .{ .g = 10, .runs = &runs, .xxh3 = spillChecksum(&.{&img}) } }, &buf);
+    const sp = try encodeSlotTails(.{ .spilled = .{ .g = 10, .runs = &runs, .csum = spillChecksum(&.{&img}) } }, &buf);
     try testing.expectEqual(@as(usize, 12 + 16 + 8), sp.len);
     const ds = try decodeSlotTails(sp);
     try testing.expect(ds.spilled);
     try testing.expectEqual(runs[0], ds.spillRunAt(0));
-    try testing.expectEqual(checksum.xxh3(&img), ds.xxh3);
+    try testing.expectEqual(checksum.hash64(&img), ds.csum);
     // A count that does not match the length refuses before any element is read.
     var short = buf;
     @memcpy(short[0..enc.len], enc);

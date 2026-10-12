@@ -163,7 +163,7 @@ pub const BlockChecksum = extern struct {
     vol_tag: u64,
     block_idx: u64,
     len: u64,
-    xxh3: u64,
+    csum: u64,
 };
 
 pub const ResultSubmitHead = extern struct {
@@ -203,7 +203,7 @@ pub const RefusalReason = enum(u8) {
     /// A tuple outside the shard's pre-allocated window, a count mismatch,
     /// a missing checksum.
     window = 3,
-    /// A length or xxh3 mismatch on verify-read (treated as an expired
+    /// A length or hash64 mismatch on verify-read (treated as an expired
     /// lease: fencing bump + quarantine).
     verify_failed = 4,
     /// Not the coordinator.
@@ -336,9 +336,9 @@ test "every job payload round-trips; the none descriptor is all-zero; counts pas
         try b.putView(TupleWire, srcs[0..2]);
         try testing.expectError(error.Malformed, codec.decodePayload(ShardDescriptor, b.written()));
     }
-    const cs = [_]BlockChecksum{ .{ .vol_tag = 1, .block_idx = 2, .len = 4096, .xxh3 = 7 }, .{ .vol_tag = 1, .block_idx = 3, .len = 4096, .xxh3 = 8 } };
+    const cs = [_]BlockChecksum{ .{ .vol_tag = 1, .block_idx = 2, .len = 4096, .csum = 7 }, .{ .vol_tag = 1, .block_idx = 3, .len = 4096, .csum = 8 } };
     const r = try roundTrip(ResultSubmitReq, .{ .head = .{ .ref = .{ .job_id = 9, .shard = 2, .reserved = 0, .shard_fencing = 1 }, .n = 2, .reserved = 0 }, .checksums = &cs }, buf);
-    try testing.expectEqual(@as(u64, 8), r.checksums[1].xxh3);
+    try testing.expectEqual(@as(u64, 8), r.checksums[1].csum);
     try testing.expectError(error.Malformed, roundTrip(ResultSubmitReq, .{ .head = .{ .ref = .{ .job_id = 0, .shard = 2, .reserved = 0, .shard_fencing = 1 }, .n = 2, .reserved = 0 }, .checksums = &cs }, buf));
     const ack = try roundTrip(ResultAck, ResultAck.of(.verify_failed), buf);
     try testing.expectEqual(RefusalReason.verify_failed, ack.verdict());

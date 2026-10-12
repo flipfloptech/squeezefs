@@ -135,7 +135,7 @@ pub const Conn = struct {
             // checksum: the MAC is the layer that must refuse it.
             self.tamper_next = false;
             self.frame_buf[frame.HEADER_LEN] ^= 0x01;
-            std.mem.writeInt(u64, self.frame_buf[frame.XXH3_OFF..][0..8], frame.frameChecksum(self.frame_buf[0..frame.HEADER_LEN], self.frame_buf[frame.HEADER_LEN..][0..b.pos]), .little);
+            std.mem.writeInt(u64, self.frame_buf[frame.CSUM_OFF..][0..8], frame.frameChecksum(self.frame_buf[0..frame.HEADER_LEN], self.frame_buf[frame.HEADER_LEN..][0..b.pos]), .little);
         }
         // The callee's side.
         const in = self.server.accept(self.frame_buf[0..n]) catch |e| {

@@ -365,7 +365,7 @@ pub const DataPlane = struct {
     chunk: u64,
     inline_max: u64,
     geo: layout.Geometry,
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     passthrough: bool,
     vols: seams.Volumes = .{},
     devs: [router.MAX_VOLUMES]?*nvme_dev.Device = @splat(null),
@@ -457,7 +457,7 @@ pub const DataPlane = struct {
             .chunk = cfg.chunk_size,
             .inline_max = inline_max,
             .geo = .{ .chunk = cfg.chunk_size, .inline_ceiling = layout.inlineMaxCeiling(node_size) },
-            .hash_seed = be.hashSeed(),
+            .name_key = be.nameKey(),
             .passthrough = tcfg.isPassthrough(),
             .rt = undefined,
             .reclaimer = undefined,
@@ -665,7 +665,7 @@ pub const DataPlane = struct {
             const fmt = data_superblock.classifySector0(sector.bytes(), null) catch return error.IdentityMismatch;
             const sb = switch (fmt) {
                 .blank => return error.IdentityMismatch,
-                .v1 => |sb| sb,
+                .v2 => |sb| sb,
             };
             if (sb.vol_tag != d.vol_tag or !std.mem.eql(u8, &sb.device_uuid, &d.device_uuid) or sb.block_size != self.block_size or sb.chunk_size != self.chunk) {
                 log.err("data volume {s}: identity disagrees with the set_config record (device vol-{x:0>16} vs record vol-{x:0>16})", .{ d.uri, sb.vol_tag, d.vol_tag });
@@ -1132,7 +1132,7 @@ pub const DataPlane = struct {
             .inline_, .staged => return error.Superseded,
         };
         const t = self.backend.begin(@src()) catch return error.OutOfMemory;
-        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = rec.coll_seq, .prev = prev, .layout = next, .proofs = &.{proof} }, self.refsSeam(), self.geo) catch |e| {
+        layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = rec.coll_seq, .prev = prev, .layout = next, .proofs = &.{proof} }, self.refsSeam(), self.geo) catch |e| {
             self.backend.abandon(t);
             return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -1395,7 +1395,7 @@ pub const DataPlane = struct {
     fn promoteInline(self: *DataPlane, ino: u64, prev: layout.Layout, coll_seq: u8, image: []const u8, k: staging.StagingKey, generation: u64) bool {
         const data = image[0..@intCast(@min(image.len, prev.size))];
         const t = self.backend.begin(@src()) catch return false;
-        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.inlineData(prev.size, data), .proofs = &.{} }, self.refsSeam(), self.geo) catch {
+        layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.inlineData(prev.size, data), .proofs = &.{} }, self.refsSeam(), self.geo) catch {
             self.backend.abandon(t);
             return false;
         };
@@ -1415,7 +1415,7 @@ pub const DataPlane = struct {
             self.abandonOwnBlock(ob);
             return false;
         };
-        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedInline(prev.size, &entries), .proofs = &.{ob.proof} }, self.refsSeam(), self.geo) catch {
+        layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedInline(prev.size, &entries), .proofs = &.{ob.proof} }, self.refsSeam(), self.geo) catch {
             self.backend.abandon(t);
             self.abandonOwnBlock(ob);
             return false;
@@ -1447,7 +1447,7 @@ pub const DataPlane = struct {
         };
         const outcome = p.commitLocked(prepared, .{
             .ino = ino,
-            .hash_seed = self.hash_seed,
+            .name_key = self.name_key,
             .coll_seq = coll_seq,
             .file_id = k.file_id,
             .generation = generation,
@@ -1803,7 +1803,7 @@ pub const DataPlane = struct {
         };
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(self.gpa, &kvs);
-        const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.hash_seed);
+        const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.name_key);
         const start = key.xattrKey(ino, h, 0);
         const end = key.xattrKey(ino, h, std.math.maxInt(u8));
         self.backend.range(self.gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return KvBackend.coreError(e);
@@ -1981,7 +1981,7 @@ pub const DataPlane = struct {
         const size = @max(if (prev) |p| p.size else 0, req.min_size);
         const new = layout.Layout.stripedInline(size, merged.items);
         const t = self.backend.begin(@src()) catch return error.OutOfMemory;
-        layout.publishLayout(t, .{ .ino = req.ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = req.proofs }, self.refsSeam(), self.geo) catch |e| {
+        layout.publishLayout(t, .{ .ino = req.ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = req.proofs }, self.refsSeam(), self.geo) catch |e| {
             self.backend.abandon(t);
             stats.layout_map_merge_failures.inc();
             log.err("ino {d}: the block-map publish of {d} binding(s) failed ({s}) — the upload keeps its custody and retries", .{ req.ino, req.inserts.len, @errorName(e) });
@@ -2050,7 +2050,7 @@ pub const DataPlane = struct {
                 return mapKvErr(e);
             };
             if (flip_here) {
-                layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = head, .proofs = req.proofs, .arm = .{ .flip_to_kvmap = .{ .moved = prev.entries.len } } }, self.refsSeam(), self.geo) catch |e| {
+                layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = head, .proofs = req.proofs, .arm = .{ .flip_to_kvmap = .{ .moved = prev.entries.len } } }, self.refsSeam(), self.geo) catch |e| {
                     self.backend.abandon(t);
                     stats.layout_map_merge_failures.inc();
                     log.err("ino {d}: the block-map-tree flip failed to stage ({s})", .{ ino, @errorName(e) });
@@ -2153,7 +2153,7 @@ pub const DataPlane = struct {
             return mapKvErr(e);
         };
         if (size != prev.size or !std.meta.eql(cursor, head.sweep)) {
-            layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(size, cursor, head.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| {
+            layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(size, cursor, head.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| {
                 self.backend.abandon(t);
                 stats.layout_map_merge_failures.inc();
                 return switch (e) {
@@ -2231,7 +2231,7 @@ pub const DataPlane = struct {
                 return error.Transient;
             };
             const cursor_after: u32 = next orelse end;
-            layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = rec.coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(prev.size, cursor_after, prev.kvmapHead().?.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch {
+            layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = rec.coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(prev.size, cursor_after, prev.kvmapHead().?.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch {
                 self.backend.abandon(t);
                 return error.Transient;
             };
@@ -2278,7 +2278,7 @@ pub const DataPlane = struct {
         const head = prev.kvmapHead() orelse return error.InvalidArgument;
         const k: u32 = @intCast(@min(self.blocksOf(new_size), std.math.maxInt(u32) - 1));
         const cursor = if (head.sweep) |c| @min(c, k) else k;
-        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(new_size, cursor, head.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| return switch (e) {
+        layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = layout.Layout.stripedKvmap(new_size, cursor, head.gen orelse kvmap.FIRST_MAP_GEN), .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InputOutput,
         };
@@ -2435,7 +2435,7 @@ pub const DataPlane = struct {
     }
 
     fn publishHead(self: *DataPlane, t: *tx_mod.KvTx, ino: u64, coll_seq: u8, prev: layout.Layout, new: layout.Layout) Error!void {
-        layout.publishLayout(t, .{ .ino = ino, .hash_seed = self.hash_seed, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| return switch (e) {
+        layout.publishLayout(t, .{ .ino = ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = &.{} }, self.refsSeam(), self.geo) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InputOutput,
         };

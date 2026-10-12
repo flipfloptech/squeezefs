@@ -205,7 +205,7 @@ pub const linux = if (builtin.os.tag == .linux) struct {
                 break :blk st;
             },
             .geo = if (plane) |pl| pl.geo else .{},
-            .hash_seed = be.hashSeed(),
+            .name_key = be.nameKey(),
             .volumes = b.vols,
             .scope = &b.scope,
             .mode = opts.mode,

@@ -5,7 +5,7 @@
 //!
 //!     frame = header[48] ‖ payload[len] ‖ (MAC_PRESENT ? HMAC(session_key, header ‖ payload) : ∅)
 //!
-//! The header's own xxh3 covers `header[0..40] ‖ payload`, so a garbage or
+//! The header's own hash64 covers `header[0..40] ‖ payload`, so a garbage or
 //! misframed frame is refused by a checksum before any MAC work; the MAC
 //! covers the header too, so direction, sequence, length, verb, status and
 //! correlation are all authenticated (the reference MACs `dir ‖ seq ‖ len
@@ -110,7 +110,7 @@ pub const FrameHeaderWire = extern struct {
     seq_le: [8]u8,
     schema_le: [4]u8,
     reserved_le: [4]u8,
-    xxh3_le: [8]u8,
+    csum_le: [8]u8,
 };
 
 comptime {
@@ -124,10 +124,10 @@ comptime {
     std.debug.assert(@offsetOf(FrameHeaderWire, "seq_le") == 24);
     std.debug.assert(@offsetOf(FrameHeaderWire, "schema_le") == 32);
     std.debug.assert(@offsetOf(FrameHeaderWire, "reserved_le") == 36);
-    std.debug.assert(@offsetOf(FrameHeaderWire, "xxh3_le") == 40);
+    std.debug.assert(@offsetOf(FrameHeaderWire, "csum_le") == 40);
 }
 
-pub const XXH3_OFF: usize = @offsetOf(FrameHeaderWire, "xxh3_le");
+pub const CSUM_OFF: usize = @offsetOf(FrameHeaderWire, "csum_le");
 
 // ---------------------------------------------------------------------------
 // The ONE status table (§1.7; decision 0002 row 223: the reference's words
@@ -353,7 +353,7 @@ pub const HeaderRefusal = enum {
 };
 
 /// The pre-payload screen: magic, framing version, known flags, reserved
-/// zero, `len ≤ cap`. The xxh3 is verified AFTER the payload arrives
+/// zero, `len ≤ cap`. The hash64 is verified AFTER the payload arrives
 /// (`verifyChecksum`) because it covers the payload too.
 pub fn decodeHeader(bytes: *const [HEADER_LEN]u8, cap: u32) union(enum) { ok: Header, refused: HeaderRefusal } {
     const w = std.mem.bytesToValue(FrameHeaderWire, bytes);
@@ -375,16 +375,16 @@ pub fn decodeHeader(bytes: *const [HEADER_LEN]u8, cap: u32) union(enum) { ok: He
     } };
 }
 
-/// xxh3-64 over `header[0..40] ‖ payload`.
+/// hash64 over `header[0..40] ‖ payload`.
 pub fn frameChecksum(header: *const [HEADER_LEN]u8, payload: []const u8) u64 {
-    var h = std.hash.XxHash3.init(0);
-    h.update(header[0..XXH3_OFF]);
+    var h: checksum.Hasher = .init();
+    h.update(header[0..CSUM_OFF]);
     h.update(payload);
-    return h.final();
+    return h.finalLow64();
 }
 
 pub fn verifyChecksum(header: *const [HEADER_LEN]u8, payload: []const u8) bool {
-    return std.mem.readInt(u64, header[XXH3_OFF..][0..8], .little) == frameChecksum(header, payload);
+    return std.mem.readInt(u64, header[CSUM_OFF..][0..8], .little) == frameChecksum(header, payload);
 }
 
 /// Stamp a header (the checksum last, over the payload the caller will
@@ -401,9 +401,9 @@ pub fn encodeHeader(h: Header, payload: []const u8, out: *[HEADER_LEN]u8) void {
     std.mem.writeInt(u64, &w.seq_le, h.seq, .little);
     std.mem.writeInt(u32, &w.schema_le, h.schema, .little);
     w.reserved_le = @splat(0);
-    w.xxh3_le = @splat(0);
+    w.csum_le = @splat(0);
     out.* = std.mem.toBytes(w);
-    std.mem.writeInt(u64, out[XXH3_OFF..][0..8], frameChecksum(out, payload), .little);
+    std.mem.writeInt(u64, out[CSUM_OFF..][0..8], frameChecksum(out, payload), .little);
 }
 
 // ---------------------------------------------------------------------------
@@ -541,19 +541,19 @@ test "a MACed frame round-trips; tamper, wrong key, reflection (dir flip), reord
     var t = buf;
     t[HEADER_LEN] ^= 1;
     try testing.expectEqual(DecodeRefusal.checksum, decodeFrame(t[0..n], CONTROL_CAP, &key).refused);
-    std.mem.writeInt(u64, t[XXH3_OFF..][0..8], frameChecksum(t[0..HEADER_LEN], t[HEADER_LEN..][0..5]), .little);
+    std.mem.writeInt(u64, t[CSUM_OFF..][0..8], frameChecksum(t[0..HEADER_LEN], t[HEADER_LEN..][0..5]), .little);
     try testing.expectEqual(DecodeRefusal.mac, decodeFrame(t[0..n], CONTROL_CAP, &key).refused);
     // Wrong key.
     try testing.expectEqual(DecodeRefusal.mac, decodeFrame(buf[0..n], CONTROL_CAP, &other).refused);
     // Reflection: the direction bit flipped (checksum re-stamped).
     var r = buf;
     r[6] ^= @intCast(FLAG_DIR_PEER_TO_COORD);
-    std.mem.writeInt(u64, r[XXH3_OFF..][0..8], frameChecksum(r[0..HEADER_LEN], r[HEADER_LEN..][0..5]), .little);
+    std.mem.writeInt(u64, r[CSUM_OFF..][0..8], frameChecksum(r[0..HEADER_LEN], r[HEADER_LEN..][0..5]), .little);
     try testing.expectEqual(DecodeRefusal.mac, decodeFrame(r[0..n], CONTROL_CAP, &key).refused);
     // Reorder: the seq word changed.
     var s = buf;
     s[24] = 4;
-    std.mem.writeInt(u64, s[XXH3_OFF..][0..8], frameChecksum(s[0..HEADER_LEN], s[HEADER_LEN..][0..5]), .little);
+    std.mem.writeInt(u64, s[CSUM_OFF..][0..8], frameChecksum(s[0..HEADER_LEN], s[HEADER_LEN..][0..5]), .little);
     try testing.expectEqual(DecodeRefusal.mac, decodeFrame(s[0..n], CONTROL_CAP, &key).refused);
     // A session frame without the trailer; a trailer where none is expected.
     try testing.expectEqual(DecodeRefusal.short, decodeFrame(buf[0 .. n - MAC_BYTES], CONTROL_CAP, &key).refused);

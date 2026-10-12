@@ -31,7 +31,7 @@ pub const VERSION: u8 = 1;
 // ---------------------------------------------------------------------------
 
 /// `{node_token, mount_slot, writer_id}` — the port's incarnation identity
-/// (0002 row 185: `writer_id = xxh3(boot_id ‖ hostname ‖ mount_slot ‖ pid ‖
+/// (0002 row 185: `writer_id = hash64(boot_id ‖ hostname ‖ mount_slot ‖ pid ‖
 /// start_ticks)`, a u64, never a uuid).
 pub const WriterIdentity = struct {
     node_token: u64,

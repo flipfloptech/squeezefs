@@ -188,8 +188,8 @@ pub const StripeMap = struct {
         return .{ .index = i, .stripe = self.stripes[i] };
     }
 
-    pub fn routeName(self: *const StripeMap, name: []const u8, seed: u64) Route {
-        return self.route(key.dentryNameHash54(name, seed));
+    pub fn routeName(self: *const StripeMap, name: []const u8, name_key: *const key.NameKey) Route {
+        return self.route(key.dentryNameHash54(name, name_key));
     }
 
     pub fn isStripe(self: *const StripeMap, ino: u64) bool {
@@ -567,8 +567,8 @@ pub fn hasUserName(src: DirSource, arena: Allocator, dir: u64) errors.Error!bool
 
 /// `stripe_locate`: the stripe first, then `D`'s own tree (LWW: the
 /// stripe wins).
-pub fn locate(src: DirSource, arena: Allocator, map: *const StripeMap, name: []const u8, seed: u64) errors.Error!?DirRec {
-    const r = map.routeName(name, seed);
+pub fn locate(src: DirSource, arena: Allocator, map: *const StripeMap, name: []const u8, name_key: *const key.NameKey) errors.Error!?DirRec {
+    const r = map.routeName(name, name_key);
     if (try findName(src, arena, r.stripe, name)) |d| return d;
     return findName(src, arena, map.dir, name);
 }
@@ -618,7 +618,7 @@ const Stream = struct {
 /// entry from `D`'s own stream whose stripe holds the same name is the
 /// LWW loser and skipped; markers never show. The returned cookie is the
 /// exact continuation.
-pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, offset: u64, max: usize, seed: u64, out: *std.ArrayList(DirRec)) errors.Error!void {
+pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, offset: u64, max: usize, name_key: *const key.NameKey, out: *std.ArrayList(DirRec)) errors.Error!void {
     stats.dir_stripe_readdir_merges.inc();
     const page = @max(max / (@as(usize, map.k) + 1), MERGE_STREAM_PAGE_FLOOR);
     var streams: [K_MAX + 1]Stream = undefined;
@@ -640,7 +640,7 @@ pub fn readdirMerged(src: DirSource, arena: Allocator, map: *const StripeMap, of
         if (isMarkerName(rec.name)) continue;
         if (bi == map.k) {
             // D's own tree: the LWW loser when its stripe holds the name.
-            const r = map.routeName(rec.name, seed);
+            const r = map.routeName(rec.name, name_key);
             if (try findName(src, arena, r.stripe, rec.name) != null) continue;
         }
         try out.append(arena, rec);
@@ -666,7 +666,7 @@ pub const DirView = struct {
 /// The five shapes over ONE dentry walk: `dirs` = every directory with a
 /// NUL-led name (the nomination), `records` = the inode census (an ino
 /// → present), `names_of(stripe)` the stripes' own names.
-pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const fn (ino: u64) bool, seed: u64, out: *std.ArrayList(Finding)) Allocator.Error!void {
+pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const fn (ino: u64) bool, name_key: *const key.NameKey, out: *std.ArrayList(Finding)) Allocator.Error!void {
     var mapped: std.AutoHashMapUnmanaged(u64, u64) = .empty;
     defer mapped.deinit(gpa);
     for (views) |v| {
@@ -692,7 +692,7 @@ pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const f
                 idx = @intCast(i);
             };
             const i = idx orelse continue;
-            for (sv.names) |nm| if (stripeOf(key.dentryNameHash54(nm.name, seed), map.k) != i) {
+            for (sv.names) |nm| if (stripeOf(key.dentryNameHash54(nm.name, name_key), map.k) != i) {
                 try out.append(gpa, .{ .shape = .misrouted_name, .dir = sv.dir, .ino = nm.child });
             };
         }
@@ -825,8 +825,7 @@ pub fn Striping(comptime Store: type) type {
         /// goes with its count), then the caller revalidates against the
         /// stripe alone.
         pub fn mutationParent(self: *Self, map: *const StripeMap, name: []const u8, now: u64) Error!u64 {
-            const seed = self.plane.apply.store.hashSeed();
-            const r = map.routeName(name, seed);
+            const r = map.routeName(name, self.plane.apply.store.nameKey());
             var arena_state = std.heap.ArenaAllocator.init(self.plane.gpa);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -867,7 +866,7 @@ pub fn Striping(comptime Store: type) type {
         /// user names under the exclusive guard.
         pub fn migrate(self: *Self, map: *StripeMap, now: u64) Error!u32 {
             if (!self.plane.isLocal(map.dir)) return error.NotHolder;
-            const seed = self.plane.apply.store.hashSeed();
+            const name_key = self.plane.apply.store.nameKey();
             var moved: u32 = 0;
             var rounds: u32 = 0;
             while (rounds < MIGRATION_ROUNDS_MAX) : (rounds += 1) {
@@ -880,7 +879,7 @@ pub fn Striping(comptime Store: type) type {
                 for (recs.items) |r| {
                     if (isMarkerName(r.name)) continue;
                     any = true;
-                    try self.migrateOne(map, map.route(key.dentryNameHash54(r.name, seed)).stripe, r, now);
+                    try self.migrateOne(map, map.route(key.dentryNameHash54(r.name, name_key)).stripe, r, now);
                     moved += 1;
                 }
                 if (!any) break;
@@ -1111,7 +1110,7 @@ test "the census: due iff ≥ 2 distinct creators and total > N_floor over the h
 
 test "fsck C17 finds every planted shape and nothing else: multiply-mapped, missing-stripe, incomplete-map, misrouted-name, unmigrated-name" {
     const gpa = testing.allocator;
-    const seed: u64 = 0x5EED;
+    const seed: key.NameKey = .init(0x5EED);
     const good = [_]Marker{ .{ .name = "\x00sqz.stripe:00", .child = 100 }, .{ .name = "\x00sqz.stripe:01", .child = 101 }, .{ .name = STRIPED, .child = 100 } };
     const incomplete = [_]Marker{ .{ .name = "\x00sqz.stripe:00", .child = 200 }, .{ .name = STRIPED, .child = 200 } };
     const shared = [_]Marker{ .{ .name = "\x00sqz.stripe:00", .child = 101 }, .{ .name = "\x00sqz.stripe:01", .child = 300 }, .{ .name = STRIPED, .child = 101 } };
@@ -1121,7 +1120,7 @@ test "fsck C17 finds every planted shape and nothing else: multiply-mapped, miss
     var misrouted: [1]u8 = undefined;
     while (n <= 'z') : (n += 1) {
         misrouted[0] = n;
-        if (stripeOf(key.dentryNameHash54(&misrouted, seed), 2) == 1) break;
+        if (stripeOf(key.dentryNameHash54(&misrouted, &seed), 2) == 1) break;
     }
     const s0_names = [_]DirRec{.{ .cookie = 1, .child = 900, .file_type = 8, .name = &misrouted }};
     const d_names = [_]DirRec{.{ .cookie = 2, .child = 901, .file_type = 8, .name = "left" }};
@@ -1141,7 +1140,7 @@ test "fsck C17 finds every planted shape and nothing else: multiply-mapped, miss
     defer out.deinit(gpa);
     stats.fsck_stripe_findings.resetLogBudgetForTest();
     @import("../../../core/log.zig").testing.expectErrorLogs(1);
-    try verifyStripes(gpa, &views, &Has.has, seed, &out);
+    try verifyStripes(gpa, &views, &Has.has, &seed, &out);
     try @import("../../../core/log.zig").testing.expectAllFired();
     var seen: [5]u32 = @splat(0);
     for (out.items) |f| seen[@backingInt(f.shape)] += 1;
@@ -1155,6 +1154,6 @@ test "fsck C17 finds every planted shape and nothing else: multiply-mapped, miss
     var clean: std.ArrayList(Finding) = .empty;
     defer clean.deinit(gpa);
     const cv = [_]DirView{ .{ .dir = 9, .markers = &.{ good[0], good[1], .{ .name = MIGRATING, .child = 100 }, good[2] }, .names = &d_names }, .{ .dir = 100, .markers = &.{}, .names = &.{} }, .{ .dir = 101, .markers = &.{}, .names = &.{} } };
-    try verifyStripes(gpa, &cv, &Has.has, seed, &clean);
+    try verifyStripes(gpa, &cv, &Has.has, &seed, &clean);
     try testing.expectEqual(@as(usize, 0), clean.items.len);
 }

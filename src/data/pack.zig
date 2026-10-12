@@ -382,7 +382,7 @@ pub const CommitOutcome = union(enum) {
 pub const CommitCtx = struct {
     /// The LOCAL key ino.
     ino: u64,
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     coll_seq: u8 = 0,
     file_id: layout.FileId,
     /// The ring generation the image was read at.
@@ -697,7 +697,7 @@ pub const Packer = struct {
         }
         const prev = cur.?;
         const new = layout.Layout.packedTenant(@max(prev.size, prepared.image_len), c.file_id, prepared.mapping);
-        layout.publishLayout(t, .{ .ino = c.ino, .hash_seed = c.hash_seed, .coll_seq = c.coll_seq, .prev = prev, .layout = new, .proofs = &.{prepared.proof} }, c.refs, c.geo) catch {
+        layout.publishLayout(t, .{ .ino = c.ino, .name_key = c.name_key, .coll_seq = c.coll_seq, .prev = prev, .layout = new, .proofs = &.{prepared.proof} }, c.refs, c.geo) catch {
             self.releaseLandedSite(prepared.tenant);
             return .failed;
         };
@@ -1294,7 +1294,7 @@ const World = struct {
     }
 
     fn layoutKey(ino: u64) [key.XATTR_KEY_LEN]u8 {
-        return key.xattrKey(ino, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, SEED), 0);
+        return key.xattrKey(ino, key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, &seed_key), 0);
     }
 
     fn current(ctx: *anyopaque, ino: u64) ?layout.Layout {
@@ -1327,6 +1327,7 @@ const World = struct {
 };
 
 const SEED: u64 = 0x5EED;
+const seed_key: key.NameKey = .init(SEED);
 
 /// A `len`-byte payload of one byte (the `"x" ** n` the 0.17 grammar lost).
 fn fill(comptime len: usize, b: u8) [len]u8 {
@@ -1380,7 +1381,7 @@ const Fixture = struct {
     }
 
     fn ctx(self: *Fixture, ino: u64, seed: u8, generation: u64) CommitCtx {
-        return .{ .ino = ino, .hash_seed = SEED, .file_id = fid(seed), .generation = generation, .lookup = self.world.lookupSeam(), .refs = self.world.refsSeam(), .commit = self.world.commitSeam(), .pool = &self.pool, .seg = &self.seg, .geo = self.world.geo };
+        return .{ .ino = ino, .name_key = &seed_key, .file_id = fid(seed), .generation = generation, .lookup = self.world.lookupSeam(), .refs = self.world.refsSeam(), .commit = self.world.commitSeam(), .pool = &self.pool, .seg = &self.seg, .geo = self.world.geo };
     }
 
     /// The plane's commit section: `commitLocked` under (3.5) then (3.7),

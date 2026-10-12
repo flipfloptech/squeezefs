@@ -8,7 +8,7 @@
 //! checkpoint, one read per recovery. It never names tree 0's root or the
 //! stamp, so two managers are unrepresentable (KD-SYM-3). PORTABLE.
 //!
-//! v4 layout (fixed 296 B, xxh3 LAST over `[0..4088)`, the version right
+//! v4 layout (fixed 296 B, hash64 LAST over `[0..4088)`, the version right
 //! after the magic — the superblock's conventions, 0002 row 43):
 //! ```
 //! @0   "KVAP"            @4  layout_version u16 = 1   @6  reserved u16
@@ -21,7 +21,7 @@
 //! @96  recovered_by_term u64
 //! @104 segments[8]{start u64, len u64}      @232 grants[4]{start u64, len u64}
 //! @296 SlotEntry × n_slots (35 B each, slot-ascending), zero tail to @4088
-//! @4088 xxh3 u64
+//! @4088 hash64 u64
 //! ```
 //! `SLOT_PAGE_BUDGET = (4088 − 296) / 35 = 108` — DERIVED from the fixed
 //! part and the entry width, never a free constant (the charter's 108 at
@@ -300,7 +300,7 @@ pub fn encodePage(p: *const Page, out: *[PAGE_LEN]u8) EncodeError!void {
         std.mem.writeInt(u64, &w.cursor_le, e.cursor, .little);
         @memcpy(out[FIXED_LEN + i * SLOT_ENTRY_LEN ..][0..SLOT_ENTRY_LEN], &std.mem.toBytes(w));
     }
-    put(out, u64, CHECKSUM_OFF, checksum.xxh3(out[0..CHECKSUM_OFF]));
+    put(out, u64, CHECKSUM_OFF, checksum.hash64(out[0..CHECKSUM_OFF]));
 }
 
 /// The four-slot reader's classification (`A:593-675`).
@@ -321,7 +321,7 @@ pub fn classify(img: []const u8) Classified {
     if (img.len != PAGE_LEN) return .corrupt;
     if (std.mem.allEqual(u8, img, 0)) return .blank;
     if (!std.mem.eql(u8, img[0..4], MAGIC)) return .corrupt;
-    if (get(img, u64, CHECKSUM_OFF) != checksum.xxh3(img[0..CHECKSUM_OFF])) return .corrupt;
+    if (get(img, u64, CHECKSUM_OFF) != checksum.hash64(img[0..CHECKSUM_OFF])) return .corrupt;
     if (get(img, u16, 4) != LAYOUT_VERSION) return .foreign_layout;
     const p = decodeVerified(img) catch return .corrupt;
     return .{ .valid = p };
@@ -587,7 +587,7 @@ test "decode is total and canonical: reserved bytes, an unsorted list, an unknow
     try p.encode(&img);
     const Mut = struct {
         fn stamp(buf: *[PAGE_LEN]u8) void {
-            put(buf, u64, CHECKSUM_OFF, checksum.xxh3(buf[0..CHECKSUM_OFF]));
+            put(buf, u64, CHECKSUM_OFF, checksum.hash64(buf[0..CHECKSUM_OFF]));
         }
     };
     var m = img;
@@ -665,7 +665,7 @@ test "newest valid page wins over the four slots; a torn newest falls back to it
     const zero: [PAGE_LEN]u8 = @splat(0);
     try testing.expectEqual(@as(?Page, null), try newestValid(.{ &zero, &zero, null, null }));
     put(&imgs[0], u16, 4, 3);
-    put(&imgs[0], u64, CHECKSUM_OFF, checksum.xxh3(imgs[0][0..CHECKSUM_OFF]));
+    put(&imgs[0], u64, CHECKSUM_OFF, checksum.hash64(imgs[0][0..CHECKSUM_OFF]));
     try testing.expectError(error.ForeignLayout, newestValid(.{ &imgs[0], &imgs[1], &imgs[2], &imgs[3] }));
 }
 
@@ -753,7 +753,7 @@ test "fuzz: classify is total; a valid page re-encodes byte-identically" {
     for (0..3000) |_| {
         m = img;
         for (0..r.intRangeAtMost(usize, 1, 4)) |_| m[r.intRangeLessThan(usize, 0, PAGE_LEN)] ^= @as(u8, 1) << r.int(u3);
-        put(&m, u64, CHECKSUM_OFF, checksum.xxh3(m[0..CHECKSUM_OFF]));
+        put(&m, u64, CHECKSUM_OFF, checksum.hash64(m[0..CHECKSUM_OFF]));
         if (classify(&m) == .valid) {
             var re: [PAGE_LEN]u8 = undefined;
             try classify(&m).valid.encode(&re);

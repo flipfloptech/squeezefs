@@ -4,12 +4,12 @@ Every byte here is produced by code in this repository. No fixture is copied
 from the Rust reference (decision 0002 §3: the reference oracle is retired for
 the trees; the Zig-side invariants are the oracle).
 
-## `findvsa_pred_bset.v4.bin`
+## `findvsa_pred_bset.v5.bin`
 
 The FIND-VS-A predecessor leaf: a populated bset image of the shape the
 reference's capture had — one directory's dentries hash-shuffled among their
 inodes, `Put`s and Δtime `Delta`s, no tombstones, a `journal_seq_horizon`
-above every record seq — in the format-v4 record frame (16 B header) over v4
+above every record seq — in the format-v5 record frame (16 B header) over v4
 keys (the kind byte on every key).
 
 Generator: `src/meta/bset.zig` `findVsAFixtureImage` — directory ino 2 with

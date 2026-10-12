@@ -1,4 +1,4 @@
-//! Regenerates `findvsa_pred_bset.v4.bin` from the in-tree generator
+//! Regenerates `findvsa_pred_bset.v5.bin` from the in-tree generator
 //! (`meta/bset.findVsAFixtureImage`), which the pin test in `bset.zig`
 //! compares the committed bytes against. Run from the repository root:
 //!

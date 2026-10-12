@@ -68,7 +68,7 @@ fn checkContract(comptime Model: type) void {
 
 fn stateKey(comptime Model: type, m: *const Model) u64 {
     if (@hasDecl(Model, "key")) return m.key();
-    return std.hash.XxHash3.hash(0, std.mem.asBytes(m));
+    return std.hash.Wyhash.hash(0, std.mem.asBytes(m));
 }
 
 /// Explore every schedule of `Model`. On failure the returned error carries

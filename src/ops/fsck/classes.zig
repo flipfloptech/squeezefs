@@ -162,7 +162,7 @@ pub const Host = struct {
     io: Io,
     store: Store,
     geo: layout.Geometry,
-    hash_seed: u64,
+    name_key: *const key.NameKey,
     volumes: []const Volume,
     scope: *const census.SlotScope,
     mode: finding.Mode,
@@ -241,7 +241,7 @@ pub const Host = struct {
     pub fn readLayout(self: *const Host, gpa: Allocator, key_ino: u64) Error!?LayoutRec {
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(gpa, &kvs);
-        const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.hash_seed);
+        const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, self.name_key);
         const start = key.xattrKey(key_ino, h, 0);
         const end = key.xattrKey(key_ino, h, std.math.maxInt(u8));
         try self.store.range(gpa, key.TREE_XATTRS, &start, &end, 256, &kvs);
@@ -1304,7 +1304,7 @@ pub const Pass = struct {
                 gpa.free(v);
                 var kvs: std.ArrayList(tree.KeyValue) = .empty;
                 defer tree.deinitKeyValues(gpa, &kvs);
-                const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, host.hash_seed);
+                const h = key.xattrNameHash56(layout.LAYOUT_XATTR_NAME, host.name_key);
                 try host.store.range(gpa, key.TREE_XATTRS, &key.xattrKey(f.ino, h, 0), &key.xattrKey(f.ino, h, std.math.maxInt(u8)), 256, &kvs);
                 const Still = struct {
                     f: @TypeOf(f),
@@ -1596,7 +1596,7 @@ fn stripeFindings(p: *Pass, cen: *const census.Census, d: *const census.DentryPa
     };
     Has.census_ptr = cen;
     defer Has.census_ptr = null;
-    try stripe.verifyStripes(gpa, views.items, &Has.has, p.host.hash_seed, out);
+    try stripe.verifyStripes(gpa, views.items, &Has.has, p.host.name_key, out);
 }
 
 /// C14 + C15 over ONE forest census: a slot `Live` on two pages, a `Live`

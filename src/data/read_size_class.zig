@@ -56,10 +56,10 @@ pub const BlockKey = extern struct {
         return a.vol_tag == b.vol_tag and a.offset == b.offset;
     }
 
-    /// xxh3 over the 16 key bytes: the shard index, the ghost slot and the
+    /// hash64 over the 16 key bytes: the shard index, the ghost slot and the
     /// cooldown slot all derive from this one hash.
     pub fn hash(self: BlockKey) u64 {
-        return checksum.xxh3(std.mem.asBytes(&self));
+        return checksum.hash64(std.mem.asBytes(&self));
     }
 
     pub fn blockIdx(self: BlockKey, block_size: u64) u64 {
@@ -71,7 +71,7 @@ comptime {
     std.debug.assert(@sizeOf(BlockKey) == 16);
 }
 
-/// The `std.AutoHashMap` context for `BlockKey` (xxh3, not the default
+/// The `std.AutoHashMap` context for `BlockKey` (hash64, not the default
 /// Wyhash: one hash function per key across every tier and the ghost).
 pub const KeyContext = struct {
     pub fn hash(_: KeyContext, k: BlockKey) u64 {

@@ -304,7 +304,7 @@ fn symOpts() FormatOptions {
 fn expectMounts(gpa: Allocator, image: []const u8, volume_len: u64, extents_allocated: u64) !void {
     const fmt = try superblock.classifyVolumeImages(image[0..4096], image[@intCast(superblock.backupOffsetFor(volume_len).?)..][0..4096], volume_len, null);
     try testing.expectEqual(superblock.SuperblockSlot.primary, fmt.slot);
-    const sb = fmt.format.v4;
+    const sb = fmt.format.v5;
     try testing.expectEqual(sb.symmetricPlaneStamped(), !sb.appender_dir.isNone());
     try testing.expectEqual(sb.features_incompat & ~superblock.symmetric_plane, 0);
     const layout = try node.NodeLayout.new(sb.node_size, null);
@@ -502,8 +502,8 @@ test "determinism: one description + uuid + set identity ⇒ byte-identical imag
     try testing.expect(!std.mem.eql(u8, a, c));
     // Same set identity ⇒ same hash_seed and stamp: the xattr/dentry keys
     // agree; the node seqs and uuid differ.
-    const sb_a = (try superblock.classifySector0(a[0..4096], null)).v4;
-    const sb_c = (try superblock.classifySector0(c[0..4096], null)).v4;
+    const sb_a = (try superblock.classifySector0(a[0..4096], null)).v5;
+    const sb_c = (try superblock.classifySector0(c[0..4096], null)).v5;
     try testing.expectEqual(test_set.hash_seed, sb_a.hash_seed);
     try testing.expectEqual(sb_a.hash_seed, sb_c.hash_seed);
     try testing.expectEqualSlices(u8, &test_set.set_uuid, &sb_a.set_uuid);

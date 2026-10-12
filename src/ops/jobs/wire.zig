@@ -72,15 +72,15 @@ pub fn sampled(permille: u16, job_id: u64, shard: u32, i: usize) bool {
     std.mem.writeInt(u64, b[0..8], job_id, .little);
     std.mem.writeInt(u32, b[8..12], shard, .little);
     std.mem.writeInt(u64, b[12..20], i, .little);
-    return checksum.xxh3(&b) % 1000 < permille;
+    return checksum.hash64(&b) % 1000 < permille;
 }
 
 /// The coordinator's device read-back of a proposed destination: the
-/// stored image's xxh3 over `len` bytes (the plane binds the device seam;
+/// stored image's hash64 over `len` bytes (the plane binds the device seam;
 /// tests a RAM world).
 pub const VerifyRead = struct {
     ctx: *anyopaque,
-    read_xxh3: *const fn (ctx: *anyopaque, dest: DestTuple, len: u64) error{Io}!u64,
+    read_csum: *const fn (ctx: *anyopaque, dest: DestTuple, len: u64) error{Io}!u64,
 };
 
 /// The most enrolled workers one coordinator tracks.
@@ -382,16 +382,16 @@ pub const Coordinator = struct {
         const pm = self.permille();
         for (p.checksums, 0..) |c, i| {
             if (!sampled(pm, id.job_id, id.shard, i)) continue;
-            const got = self.verify.read_xxh3(self.verify.ctx, .{ .vol_tag = c.vol_tag, .block_idx = c.block_idx }, c.len) catch {
+            const got = self.verify.read_csum(self.verify.ctx, .{ .vol_tag = c.vol_tag, .block_idx = c.block_idx }, c.len) catch {
                 stats.job_remote_verify_failures.inc();
                 _ = self.table.lease().expire(id, clock.monotonicNs());
                 self.requeueExpired();
                 return refusedAck(.verify_failed);
             };
             stats.job_remote_verify_read_bytes.add(c.len);
-            if (got != c.xxh3) {
+            if (got != c.csum) {
                 stats.job_remote_verify_failures.inc();
-                log.err("job fabric: shard ({x}, {d}) proposed vol {x} block {d} with xxh3 {x} but the device reads {x} — refused; the lease is treated as expired (fencing bump + quarantine), nothing published", .{ id.job_id, id.shard, c.vol_tag, c.block_idx, c.xxh3, got });
+                log.err("job fabric: shard ({x}, {d}) proposed vol {x} block {d} with checksum {x} but the device reads {x} — refused; the lease is treated as expired (fencing bump + quarantine), nothing published", .{ id.job_id, id.shard, c.vol_tag, c.block_idx, c.csum, got });
                 _ = self.table.lease().expire(id, clock.monotonicNs());
                 self.requeueExpired();
                 return refusedAck(.verify_failed);
@@ -603,7 +603,7 @@ const RamVerify = struct {
     sums: std.AutoHashMapUnmanaged(u128, u64) = .empty,
     fail_io: bool = false,
     fn vr(self: *RamVerify) VerifyRead {
-        return .{ .ctx = self, .read_xxh3 = &read };
+        return .{ .ctx = self, .read_csum = &read };
     }
     fn read(ctx: *anyopaque, d: DestTuple, _: u64) error{Io}!u64 {
         const self: *RamVerify = @ptrCast(@alignCast(ctx));
@@ -758,13 +758,13 @@ test "a proposal is screened before any device read: a tuple outside the window 
     const ref: frames.ShardRef = .{ .job_id = 77, .shard = 3, .reserved = 0, .shard_fencing = a.fencing };
     const hb = try r.cc.conn.call(.{ .heartbeat = ref });
     try testing.expectEqual(@as(u8, 0), hb.heartbeat.verdict);
-    const outside = [_]frames.BlockChecksum{.{ .vol_tag = 5, .block_idx = 9, .len = 4096, .xxh3 = 1 }};
+    const outside = [_]frames.BlockChecksum{.{ .vol_tag = 5, .block_idx = 9, .len = 4096, .csum = 1 }};
     const w = try r.cc.conn.call(.{ .result_submit = .{ .head = .{ .ref = ref, .n = 1, .reserved = 0 }, .checksums = &outside } });
     try testing.expectEqual(frames.RefusalReason.window, w.result_submit.verdict());
     try testing.expectEqual(seams.LeaseVerdict.live, r.table.lease().check(sid, a.fencing));
     // The right tuple, the wrong checksum.
     try r.verify.sums.put(gpa, (@as(u128, 5) << 64) | 1, 0xAAAA);
-    const bad = [_]frames.BlockChecksum{.{ .vol_tag = 5, .block_idx = 1, .len = 4096, .xxh3 = 0xBBBB }};
+    const bad = [_]frames.BlockChecksum{.{ .vol_tag = 5, .block_idx = 1, .len = 4096, .csum = 0xBBBB }};
     log.testing.expectErrorLogs(1);
     const v = try r.cc.conn.call(.{ .result_submit = .{ .head = .{ .ref = ref, .n = 1, .reserved = 0 }, .checksums = &bad } });
     try log.testing.expectAllFired();
@@ -777,7 +777,7 @@ test "a proposal is screened before any device read: a tuple outside the window 
     const fresh = [_]DestTuple{.{ .vol_tag = 5, .block_idx = 10 }};
     const b = try r.table.lease().assign(sid, .{ .node_token = 2, .mount_slot = 1 }, &fresh, clock.monotonicNs());
     try r.verify.sums.put(gpa, (@as(u128, 5) << 64) | 10, 0xCCCC);
-    const good = [_]frames.BlockChecksum{.{ .vol_tag = 5, .block_idx = 10, .len = 4096, .xxh3 = 0xCCCC }};
+    const good = [_]frames.BlockChecksum{.{ .vol_tag = 5, .block_idx = 10, .len = 4096, .csum = 0xCCCC }};
     const ref2: frames.ShardRef = .{ .job_id = 77, .shard = 3, .reserved = 0, .shard_fencing = b.fencing };
     const ok = try r.cc.conn.call(.{ .result_submit = .{ .head = .{ .ref = ref2, .n = 1, .reserved = 0 }, .checksums = &good } });
     try testing.expectEqual(frames.RefusalReason.accepted, ok.result_submit.verdict());

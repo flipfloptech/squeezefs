@@ -72,7 +72,7 @@ pub fn TriggerModel(comptime segs: []const cov.Run, comptime len: u32, comptime 
         /// The union's bytes carry an undefined tail past `n_extras`; hash
         /// only the defined state.
         pub fn key(self: *const Self) u64 {
-            var h = std.hash.XxHash3.init(0);
+            var h = std.hash.Wyhash.init(0);
             h.update(std.mem.asBytes(&self.u.primary));
             h.update(std.mem.sliceAsBytes(self.u.extras[0..self.u.n_extras]));
             h.update(std.mem.asBytes(&self.done_flags));

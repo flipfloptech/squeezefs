@@ -40,7 +40,7 @@ comptime {
 pub const Class = union(enum) {
     /// `SQZMETLV` v4: a metadata member of the set.
     meta: struct { set_uuid: [16]u8, member_uuid: [16]u8 },
-    /// A pre-v4 metadata image.
+    /// A pre-v5 metadata image.
     meta_legacy: u32,
     /// A data volume: `vol_tag` + the set.
     data: struct { vol_tag: u64, set_uuid: [16]u8, device_uuid: [16]u8 },
@@ -58,7 +58,7 @@ pub const Class = union(enum) {
                 try configfs.writeUuid(w, m.member_uuid);
                 try w.writeByte(')');
             },
-            .meta_legacy => |v| try w.print("squeezefs pre-v4 metadata image (version {d}; reformat required)", .{v}),
+            .meta_legacy => |v| try w.print("squeezefs pre-v5 metadata image (version {d}; reformat required)", .{v}),
             .data => |d| {
                 try w.print("squeezefs data volume vol-{x:0>16} of set ", .{d.vol_tag});
                 try configfs.writeUuid(w, d.set_uuid);
@@ -97,11 +97,11 @@ pub fn classify(pool: *uring_fs.Pool, path: []const u8) Class {
     if (superblock.classifySector0(sector, null)) |f| switch (f) {
         .blank => return .blank,
         .legacy => |v| return .{ .meta_legacy = v },
-        .v4 => |sb| return .{ .meta = .{ .set_uuid = sb.set_uuid, .member_uuid = sb.uuid } },
+        .v5 => |sb| return .{ .meta = .{ .set_uuid = sb.set_uuid, .member_uuid = sb.uuid } },
     } else |_| {}
     if (data_superblock.classifySector0(sector, null)) |f| switch (f) {
         .blank => return .blank,
-        .v1 => |sb| return .{ .data = .{ .vol_tag = sb.vol_tag, .set_uuid = sb.set_uuid, .device_uuid = sb.device_uuid } },
+        .v2 => |sb| return .{ .data = .{ .vol_tag = sb.vol_tag, .set_uuid = sb.set_uuid, .device_uuid = sb.device_uuid } },
     } else |_| {}
     return .foreign;
 }

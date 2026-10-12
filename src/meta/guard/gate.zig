@@ -366,7 +366,7 @@ pub const Guard = struct {
     fn readClaim(g: *Guard, gpa: Allocator) backend.OpenError!Found {
         var kvs: std.ArrayList(tree.KeyValue) = .empty;
         defer tree.deinitKeyValues(gpa, &kvs);
-        const h = key.xattrNameHash56(claim.CLAIM_XATTR, g.be.hashSeed());
+        const h = key.xattrNameHash56(claim.CLAIM_XATTR, g.be.nameKey());
         const start = key.xattrKey(inos.ROOT_INO, h, 0);
         const end = key.xattrKey(inos.ROOT_INO, h, std.math.maxInt(u8));
         g.be.range(gpa, key.TREE_XATTRS, &start, &end, 256, &kvs) catch |e| return switch (e) {
@@ -656,7 +656,7 @@ pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, p
     var diag: superblock.Refusal = undefined;
     const classified = superblock.classifyVolumeImages(sector0, backup, volume_len, &diag) catch return error.Corrupt;
     const sb = switch (classified.format) {
-        .v4 => |s| s,
+        .v5 => |s| s,
         else => return error.NotFormatted,
     };
     const ledger_img = try dev.readRange(gpa, sb.root_ledger.start, @intCast(sb.root_ledger.len));
@@ -695,7 +695,9 @@ pub fn probeClaim(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, p
         error.Io => return error.Io,
         else => return error.Corrupt,
     };
-    const h = key.xattrNameHash56(claim.CLAIM_XATTR, sb.hash_seed);
+    // A mount-time path: the key is expanded once per call, never per name.
+    const name_key: key.NameKey = .init(sb.hash_seed);
+    const h = key.xattrNameHash56(claim.CLAIM_XATTR, &name_key);
     const start = key.xattrKey(inos.ROOT_INO, h, 0);
     const end = key.xattrKey(inos.ROOT_INO, h, std.math.maxInt(u8));
     const t = tree.routeContent(trees.items, key.TREE_XATTRS, &start) orelse return error.Corrupt;

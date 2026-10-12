@@ -216,14 +216,17 @@ and the `TLS_TX` re-setsockopt after ours all ACCEPTED (§9.2.6's rows). `/proc/
 `TlsTxSw 132 TlsRxSw 132 TlsDecryptError 0 TlsRxNoPadViolation 0` (neither we nor OpenSSL pad; `TlsDecryptRetry`
 counts the control records `TLS_RX_EXPECT_NO_PAD` had to re-decrypt into the kernel's own buffer).
 
-**The third fact — the kernel's AES-GCM is the GENERIC one:** `/proc/crypto` `gcm(aes)` → driver
+**The third fact — the first kTLS kernel's AES-GCM was the GENERIC one:** `/proc/crypto` `gcm(aes)` → driver
 `gcm_base(ctr(aes-lib),ghash-lib)`, priority 100, because `# CONFIG_CRYPTO_AES_ARM64_CE_BLK is not set` and
 `# CONFIG_CRYPTO_GHASH_ARM64_CE is not set` — although the CPU exposes `aes pmull sha2`. Software kTLS
-therefore encrypts WITHOUT the Crypto Extensions, and §9.6 measures exactly that: 0.4 GB/s at 4.2 CPU-s/GB
-against the userspace layer's 2.0 GB/s at 0.94 (std.crypto's AES-GCM uses the CE). **The next kernel change:**
-`CONFIG_CRYPTO_AES_ARM64_CE_BLK=y` + `CONFIG_CRYPTO_GHASH_ARM64_CE=y` (→ the `gcm-aes-ce` driver, priority
-300) — the point of kTLS (CPU per GB, `SEND_ZC`) materialises with the CE or with NIC offload, not with
-`aes-lib`. The rows are ledgered on the probe either way.
+therefore encrypted WITHOUT the Crypto Extensions, and §9.6's first kTLS row set measures exactly that: 0.4 GB/s
+at 4.2 CPU-s/GB against the userspace layer's 2.0 GB/s at 0.94 (std.crypto's AES-GCM uses the CE).
+
+**The second rebuild (the owner, 2026-10-12, on this finding):** `CONFIG_CRYPTO_AES_ARM64_CE_BLK=y` +
+`CONFIG_CRYPTO_GHASH_ARM64_CE=y` added to the fragment (which carries the WHY), Image sha `36a9604b…`, the
+container recreated onto it. **After:** `/proc/crypto` `gcm(aes)` → `gcm-aes-ce` (priority 300), `ctr(aes)` →
+`ctr-aes-ce`; `CONFIG_TLS=y`, `CONFIG_TLS_DEVICE=y`, `tcp_available_ulp` → `tls` unchanged; the six kTLS rows
+stay green (the driver changed, the UAPI did not); §9.6's second kTLS row set is this kernel's.
 
 ### 9.2 The record layer: handshake in-tree, record layer = kTLS (`tls.ktls`, written)
 
@@ -343,33 +346,39 @@ wire), so there is no product site to refuse at; the rule binds the day a `RECV_
 `MutualTls` socket: **refuse (counted) unless the device reports TLS RX offload for that flow** — a
 hardware-owed row like the zcrx lane's ifq/steering rows.
 
-### 9.6 Measurements: Plaintext vs MutualTls (userspace record layer) vs MutualTls (kernel TLS)
+### 9.6 Measurements: Plaintext vs MutualTls (userspace record layer) vs MutualTls (kernel TLS), before and after `gcm-aes-ce`
 
-`tls e2e: SCOPING`, ReleaseSafe, loopback TCP, 512 MiB streams, one connection, the rebuilt 7.2.6-sqz on the
-9-vCPU aarch64 venue; CPU = `CLOCK_PROCESS_CPUTIME_ID` over the transfer with BOTH ends in the process
-(sender + receiver per GB):
+`tls e2e: SCOPING`, ReleaseSafe, loopback TCP, 512 MiB streams, one connection, 7.2.6-sqz on the 9-vCPU
+aarch64 venue; CPU = `CLOCK_PROCESS_CPUTIME_ID` over the transfer with BOTH ends in the process (sender +
+receiver per GB). The two kTLS columns are the two kernels; the plaintext and userspace columns are the same
+code on both (their run-to-run spread is the venue's: plaintext 1 MiB 8.9–13.1 GB/s, userspace TLS 1.94–2.04 GB/s).
 
-| | plaintext | mutual_tls, userspace record layer | mutual_tls, kernel TLS (`aes-lib`, no CE) |
-|---|---|---|---|
-| connect + handshake (50 dials) | 6 µs | 501 µs | 542 µs (the same in-tree handshake + 3 setsockopts) |
-| 64 KiB writes | 19.21 GB/s, 0.096 CPU-s/GB | 2.04 GB/s, 0.943 CPU-s/GB | **0.41 GB/s, 4.27 CPU-s/GB** |
-| 1 MiB writes | 13.12 GB/s, 0.120 CPU-s/GB | 2.03 GB/s, 0.946 CPU-s/GB | **0.44 GB/s, 4.18 CPU-s/GB** |
+| | plaintext | mutual_tls, userspace record layer | mutual_tls, kernel TLS — `aes-lib` (first kTLS kernel, `ed38bb5b…`) | **mutual_tls, kernel TLS — `gcm-aes-ce` (`36a9604b…`)** |
+|---|---|---|---|---|
+| connect + handshake (50 dials) | 6–7 µs | 501–562 µs | 542 µs | **584 µs** (the same in-tree handshake + 3 setsockopts) |
+| 64 KiB writes | 19.2–19.7 GB/s, 0.096–0.099 CPU-s/GB | 1.95–2.04 GB/s, 0.943–0.996 CPU-s/GB | 0.41 GB/s, 4.27 CPU-s/GB | **3.51 GB/s, 0.498 CPU-s/GB** |
+| 1 MiB writes | 8.9–13.1 GB/s, 0.120–0.126 CPU-s/GB | 1.94–2.03 GB/s, 0.946–0.995 CPU-s/GB | 0.44 GB/s, 4.18 CPU-s/GB | **2.12 GB/s, 0.535 CPU-s/GB** |
 
-The reading is the kernel config's, not kTLS's: the ULP encrypts through `gcm_base(ctr(aes-lib),ghash-lib)`
-(§9.1, no ARMv8 Crypto Extensions compiled in) while `std.crypto`'s AES-GCM uses the CE — so on THIS kernel
-the kernel path costs 4.5× the CPU per GB of the userspace one and runs 5× slower. The wire's own traffic is
-unaffected in practice (§9.7: the 200 MiB `dd` across the TLS wire is 50 frames / 9,136 B each way; the
-record layer never sees a block), and the CPU-per-GB column is what `CONFIG_CRYPTO_AES_ARM64_CE_BLK=y` +
-`CONFIG_CRYPTO_GHASH_ARM64_CE=y` (or NIC TLS offload) must turn around before kTLS pays for itself — the row
-re-measures itself on every kernel. Before the direction, the userspace layer's ReleaseSafe figures on the
-first kernel were 509 µs / 2.01 / 1.99 GB/s (§6): unchanged by the rebuild, as expected.
+**The verdict, plainly.** With the Crypto Extensions in the kernel, **kTLS beats the userspace record layer on
+CPU per GB by 2.0× (0.50 vs 1.00 CPU-s/GB at 64 KiB; 0.54 vs 1.00 at 1 MiB)** and on throughput by 1.8× at
+64 KiB (3.5 vs 1.95 GB/s) and 1.1× at 1 MiB (2.1 vs 1.94 GB/s). Without the CE it lost 4.5× on CPU and 5× on
+throughput — the first kTLS kernel's `gcm_base(ctr(aes-lib),ghash-lib)` was the whole story, not the ULP. **The
+remaining gap to plaintext** is 5× on CPU (0.50 vs 0.10 CPU-s/GB) and 5.6× on throughput at 64 KiB (3.5 vs
+19.7 GB/s; 4.2× at 1 MiB): that is the AEAD itself — one AES-128-GCM pass over every byte on the sender and
+again on the receiver, both in this process's CPU figure — plus the record framing; NIC TLS offload
+(`CONFIG_TLS_DEVICE=y` is in, the hardware is not) is what would take that out of the CPU column. The wire's
+own traffic is far below either bound (§9.7: the 200 MiB `dd` across the TLS wire is 51 frames / 9,248 B each
+way — the record layer never sees a block), so the CPU-per-GB column matters for a future bulk use of the
+channel (the job fabric's remote workers), where it now reads in kTLS's favour. The row re-measures itself on
+every kernel. Before the direction, the userspace layer's ReleaseSafe figures on the first kernel were
+509 µs / 2.01 / 1.99 GB/s (§6): unchanged by either rebuild, as expected.
 
-### 9.7 The two-daemon matrix over kernel TLS (`smoke.zig`, the rebuilt kernel)
+### 9.7 The two-daemon matrix over kernel TLS (`smoke.zig`; both kTLS kernels, the `gcm-aes-ce` run below)
 
 ```
 smoke: mtls matrix [ktls]: B joined over kernel TLS — A: handshakes 1, sessions admitted 1; B: handshakes 2, wire verbs 3
-smoke: mtls matrix: 200 MiB dd on B in 522 ms, sha from A equal; wire over TLS — A: frames received 50,
-       bytes received 9136, grants 3; B: frames sent 50, bytes sent 9136, key updates 0; MAC failures 0, refusals 0 on both
+smoke: mtls matrix: 200 MiB dd on B in 580 ms, sha from A equal; wire over TLS — A: frames received 51,
+       bytes received 9248, grants 3; B: frames sent 51, bytes sent 9248, key updates 0; MAC failures 0, refusals 0 on both
 smoke: mtls matrix: a daemon under a FOREIGN CA: mount exited with code 1; A counts tls_refused_untrusted 1
 smoke: mtls matrix: C's log: … refused at the TLS handshake: the peer's certificate is not under this set's CA
 smoke: mtls matrix: a PLAINTEXT daemon: mount exited with code 1; A counts plaintext_refused 1
@@ -383,8 +392,9 @@ then the foreign-CA daemon and the plaintext daemon refused by name and counted;
 
 ## 10. Owed (revised)
 
-- **The kernel's AES-GCM:** `CONFIG_CRYPTO_AES_ARM64_CE_BLK=y` + `CONFIG_CRYPTO_GHASH_ARM64_CE=y` in the sqz
-  container kernel (§9.1's third fact) — then re-read §9.6's kTLS column; the row measures itself.
+- ~~The kernel's AES-GCM~~ — done (the second rebuild, §9.1; §9.6's fourth column).
+- NIC TLS offload (`CONFIG_TLS_DEVICE=y` is in; the hardware row is the zcrx lane's sibling, §9.5): the only
+  lever left on the CPU-per-GB gap to plaintext.
 - The join ladder's console line for a refused channel (`verbError`: `HandshakeRefused → Refused`) — the
   symmetric plane's owner.
 - A durable channel class in `set_config` if the owner wants the set, not the node, to declare it (0003 §P).

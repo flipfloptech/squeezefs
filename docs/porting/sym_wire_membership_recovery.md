@@ -104,10 +104,11 @@ buggy/hostile-peer class, off the must-stay-0 gauge), or "not now" (`STATUS_DEFE
   `tls`, the TLS 1.3 AES-128-GCM install and the 6.14 rekey accepted, every kTLS row green
   (`rung-10-mtls.md` §9). Without the ULP the product REFUSES a `mutual_tls` mount and every TLS dial by name
   (`KernelTlsMissing` / `KtlsUnavailable`, `cluster_wire_ktls_refused`), never a silent fall-back to the
-  in-tree record layer (the handshake's transport and the portable path). **The kernel's `gcm(aes)` is the
-  generic `aes-lib`/`ghash-lib`** (no `CONFIG_CRYPTO_AES_ARM64_CE_BLK` / `GHASH_ARM64_CE`): kernel TLS measures
-  0.41 GB/s at 4.3 CPU-s/GB against the userspace layer's 2.0 GB/s at 0.94 — the CE config is the next kernel
-  change. zcrx's `RECV_ZC` combines only with NIC TLS RX offload (`CONFIG_TLS_DEVICE`).
+  in-tree record layer (the handshake's transport and the portable path). The first kTLS kernel's `gcm(aes)`
+  was the generic `aes-lib`/`ghash-lib` (kernel TLS 0.41 GB/s at 4.3 CPU-s/GB); the second rebuild
+  (`CONFIG_CRYPTO_AES_ARM64_CE_BLK=y` + `CONFIG_CRYPTO_GHASH_ARM64_CE=y`, Image `36a9604b…`, `gcm-aes-ce`)
+  reads 3.5 GB/s at 0.50 CPU-s/GB — 2.0× less CPU per GB than the userspace layer (2.0 GB/s at 1.00), 5× the
+  CPU of plaintext (0.10). zcrx's `RECV_ZC` combines only with NIC TLS RX offload (`CONFIG_TLS_DEVICE`).
 
 ### 1.2 Framing — the reference's bytes, and the port's v4 frame
 

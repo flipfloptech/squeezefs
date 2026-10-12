@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 zig-out-linux/
+zig-out-dev/
 *.debug
 .DS_Store
 fuzz-corpus/

@@ -1555,6 +1555,13 @@ test "sdk e2e: the op deadline is the last rung — a frozen daemon with a live 
 
 test "sdk e2e: the ABI window — a daemon whose window excludes the app's wire word refuses with the text naming both values (once per mount on stderr, every time in the last error); a -dirty daemon admits the SDK (the window, never the commit) while it refuses a shim" {
     const gpa = testing.allocator;
+    // Every expected value below is DERIVED from the daemon's window
+    // (`wire.sdk_abi_accepted`) and the coarse ipc word, never written as
+    // a number: a release act that bumps either edits the words alone.
+    const window = version.windowBounds(&wire.sdk_abi_accepted);
+    const outside_window: u32 = window.max + 1;
+    try testing.expect(!version.windowAccepts(&wire.sdk_abi_accepted, outside_window));
+    try testing.expect(version.windowAccepts(&wire.sdk_abi_accepted, version.WIRE_ABI));
     var fx: Fixture = undefined;
     try fx.init(gpa, test_geometry, 0);
     defer fx.deinit(gpa);
@@ -1580,17 +1587,19 @@ test "sdk e2e: the ABI window — a daemon whose window excludes the app's wire 
         // Nothing connected: retire the pending acceptor by connecting a throwaway shim that the daemon refuses.
         var dirty_env = std.process.Environ.Map.init(gpa);
         defer dirty_env.deinit();
-        try testing.expectError(error.Refused, client.Session.establish(gpa, &blob, cred, .{ .build_commit = "0123456789ab-dirty", .mount_uid = linux.geteuid(), .env = &dirty_env, .kind = .sdk, .sdk_abi = version.WIRE_ABI + 1 }, &refusal));
+        try testing.expectError(error.Refused, client.Session.establish(gpa, &blob, cred, .{ .build_commit = "0123456789ab-dirty", .mount_uid = linux.geteuid(), .env = &dirty_env, .kind = .sdk, .sdk_abi = outside_window }, &refusal));
         try testing.expectEqual(wire.RefuseClass.version, refusal.?.class);
-        try testing.expectEqual(version.WIRE_ABI, refusal.?.sdk_abi_min);
-        try testing.expectEqual(version.WIRE_ABI, refusal.?.sdk_abi_max);
+        // The daemon names ITS window: the set's oldest and newest words.
+        try testing.expectEqual(window.min, refusal.?.sdk_abi_min);
+        try testing.expectEqual(window.max, refusal.?.sdk_abi_max);
         fx.joinAcceptor();
         fx.resetHost();
     }
-    // The refusal text through the SDK's own open: the daemon's window is
-    // {1}; make the SDK's HELLO carry a word outside it by driving the
-    // client directly is above; here the SDK's path is exercised with the
-    // blob's coarse ipc_abi off by one (the pre-check names both values).
+    // The refusal text through the SDK's own open: the SDK's HELLO always
+    // carries this build's wire word, which its own daemon's window holds
+    // (driving the client directly, above, is how a word outside it is
+    // sent); here the SDK's path is exercised with the blob's coarse
+    // ipc_abi off by one — the pre-check names both values.
     {
         var blob = try fx.host.blob(fx.commit);
         blob.abi += 1;
@@ -1599,15 +1608,17 @@ test "sdk e2e: the ABI window — a daemon whose window excludes the app's wire 
         _ = linux.write(fd, blob.bytes(), wire.BLOB_LEN);
         _ = linux.close(fd);
         fx.armSeam();
+        var want_buf: [version.TEXT_MAX]u8 = undefined;
+        const want_ipc = try std.fmt.bufPrint(&want_buf, "ipc abi mismatch (sdk {d}, daemon {d})", .{ wire.IPC_ABI, wire.IPC_ABI + 1 });
         const lines_before = refusalLinesPrinted();
         try testing.expect(Session.open(gpa, fx.dir().ptr, default_opts) == null);
         try testing.expectEqual(@as(i32, @intCast(neg(.PROTONOSUPPORT))), lastError());
-        try testing.expectEqualStrings("ipc abi mismatch (sdk 1, daemon 2)", lastErrorText());
+        try testing.expectEqualStrings(want_ipc, lastErrorText());
         try testing.expectEqual(lines_before + 1, refusalLinesPrinted());
         // Once per (mount, reason): a second refusal prints nothing new.
         try testing.expect(Session.open(gpa, fx.dir().ptr, default_opts) == null);
         try testing.expectEqual(lines_before + 1, refusalLinesPrinted());
-        try testing.expectEqualStrings("ipc abi mismatch (sdk 1, daemon 2)", lastErrorText());
+        try testing.expectEqualStrings(want_ipc, lastErrorText());
     }
     // Not armed: a seam path that does not exist reads as no bootstrap xattr.
     {
@@ -1618,10 +1629,13 @@ test "sdk e2e: the ABI window — a daemon whose window excludes the app's wire 
     // A path that is not a directory.
     try testing.expect(Session.open(gpa, fx.file().ptr, default_opts) == null);
     try testing.expectEqual(@as(i32, @intCast(neg(.NOTDIR))), lastError());
-    // The window text itself.
-    const r: version.Reason = .{ .sdk_abi_window = .{ .app = version.WIRE_ABI, .min = 2, .max = 3 } };
+    // The window text itself, as the SDK would print THIS daemon's refusal
+    // of the word just past its window.
+    const r: version.Reason = .{ .sdk_abi_window = .{ .app = outside_window, .min = window.min, .max = window.max } };
     var tb: [version.TEXT_MAX]u8 = undefined;
-    try testing.expectEqualStrings("sdk abi outside the daemon's window (app 1, daemon accepts 2..3)", version.text(&tb, r));
+    var wb: [version.TEXT_MAX]u8 = undefined;
+    const want_window = try std.fmt.bufPrint(&wb, "sdk abi outside the daemon's window (app {d}, daemon accepts {d}..{d})", .{ outside_window, window.min, window.max });
+    try testing.expectEqualStrings(want_window, version.text(&tb, r));
 }
 
 test "sdk: the fork child poisons every session (SUBMITTED buffers POISONED, the socket copy closed) while the parent's session serves on; the unload pin is harmless in a static image" {

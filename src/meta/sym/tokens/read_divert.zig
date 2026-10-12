@@ -60,6 +60,11 @@ pub const stats = struct {
     /// Serves answered locally because the slot is this mount's (or
     /// unleased on the manager): the writer's "reads locally" verdict.
     pub var dlm_token_local_reads: counters.ShardedCounter = .{};
+    /// `getattr(1)` served off the LAST root entry this mount held while
+    /// the root's holder was unreachable (a parked joiner under a dead
+    /// manager, `.stats` reachable): a stale root attribute misleads no
+    /// reader — the root pin never moves.
+    pub var dlm_token_root_served_last: counters.ShardedCounter = .{};
     /// The kernel view invalidated for a recalled object (+ the prune).
     pub var dlm_token_kernel_invals: counters.ShardedCounter = .{};
     pub var dlm_token_kernel_prunes: counters.ShardedCounter = .{};
@@ -136,6 +141,10 @@ pub const Divert = struct {
     budget_bytes: u64,
     lock: sync.Mutex = .init,
     planes: std.AutoHashMapUnmanaged(ClientId, *cache.Reader) = .empty,
+    /// The root's attributes as last served under a token (kept past the
+    /// cache's shed on a lapsed lease: the parked joiner's `getattr(1)`).
+    last_root: ?record.InodeValue = null,
+    last_root_lock: sync.Mutex = .init,
 
     pub fn init(gpa: Allocator, io: Io, resolver: Resolver, client_id: ClientId, volume: u16, sink: cache.RecallSink, lease: cache.SelfLease, budget_bytes: u64) Divert {
         return .{ .gpa = gpa, .io = io, .resolver = resolver, .client_id = client_id, .volume = volume, .sink = sink, .lease = lease, .budget_bytes = budget_bytes };
@@ -221,7 +230,7 @@ pub const Divert = struct {
                 .foreign => |f| {
                     stats.dlm_token_reader_holder_resolves.inc();
                     const plane = try self.planeFor(io, f.identity, f.holder);
-                    return plane.serve(io, object, wants) catch |e| switch (e) {
+                    const served = plane.serve(io, object, wants) catch |e| switch (e) {
                         error.StaleHolderView => {
                             // The holder's word is fresher than our view: a
                             // WRITER re-resolves ONCE inside the same op.
@@ -247,9 +256,27 @@ pub const Divert = struct {
                         },
                         else => return e,
                     };
+                    if (object == inos.ROOT_INO) if (served.entry) |e| self.rememberRoot(e.attrs);
+                    return served;
                 },
             }
         }
+    }
+
+    fn rememberRoot(self: *Divert, attrs: record.InodeValue) void {
+        self.last_root_lock.lockUncancelable(self.io);
+        defer self.last_root_lock.unlock(self.io);
+        self.last_root = attrs;
+    }
+
+    /// The root's attributes as last served under a token, if ever (the
+    /// parked joiner's `getattr(1)` under a dead manager; counted).
+    pub fn lastRoot(self: *Divert) ?record.InodeValue {
+        self.last_root_lock.lockUncancelable(self.io);
+        defer self.last_root_lock.unlock(self.io);
+        const v = self.last_root orelse return null;
+        stats.dlm_token_root_served_last.inc();
+        return v;
     }
 };
 

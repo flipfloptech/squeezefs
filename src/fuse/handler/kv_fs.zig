@@ -1616,7 +1616,15 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn getattr(self: *Self, c: *Ctx, a: filesystem.GetattrArgs) Error!filesystem.Attr {
             if (virtual_inodes.isVirtualIno(a.ino)) return self.virtualGetattr(a.ino);
             c.stage(.meta_backend_start);
-            const v = try self.readInode(try localOf(a.ino));
+            const v = self.readInode(try localOf(a.ino)) catch |e| blk: {
+                // The root under an unreachable holder (a parked joiner
+                // whose manager died): the kernel revalidates the root
+                // before every virtual lookup, so `.stats` stays reachable
+                // off the last root entry this mount held — the same
+                // exemption the `-o ro` fail-stop gate grants `getattr(1)`.
+                if (a.ino == inos.ROOT_INO and errors.classOf(e) == .retryable) if (self.divert) |d| if (d.lastRoot()) |last| break :blk last;
+                return e;
+            };
             c.stage(.meta_backend_done);
             return self.attrReply(a.ino, v);
         }
@@ -4746,6 +4754,42 @@ test "POSIX: fsync reaches the store's barrier; statfs reports the heap in pages
     try testing.expectEqual(linux.E.NOSYS, h.call(.{ .access = .{ .mask = 4 } }, 1).errno().?);
     try testing.expectEqual(linux.E.NOSYS, h.call(.{ .fallocate = abi.zeroed(abi.fuse_fallocate_in) }, f).errno().?);
     h.release(f);
+}
+
+test "the parked joiner's `.stats` under a dead manager (rung 10 item 5a): getattr(1) whose token serve refuses retryable (the root's holder dead) is served off the divert's last root entry — the exemption the -o ro fail-stop gate grants getattr(1); with no root ever served the refusal stands (EAGAIN); another ino never falls back" {
+    const H = HarnessOf(NoData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    // A divert whose every slot is a DEAD holder's: the serve refuses
+    // HolderUnreachable before any dial.
+    const Dead = struct {
+        fn homeOf(_: *anyopaque, _: u16) read_divert.Home {
+            return .{ .dead = .{ .holder = 4 } };
+        }
+        fn refresh(_: *anyopaque, _: u16, _: u32) read_divert.Home {
+            return .{ .dead = .{ .holder = 4 } };
+        }
+        fn dial(_: *anyopaque, _: u64, _: u32) ?read_divert.cache.Link {
+            return null;
+        }
+    };
+    var marker: u8 = 0;
+    var d = read_divert.Divert.init(testing.allocator, testing.io, .{ .ctx = &marker, .homeOf = &Dead.homeOf, .refresh = &Dead.refresh, .dial = &Dead.dial }, 1, 0, read_divert.cache.RecallSink.none, read_divert.cache.SelfLease.always, read_divert.cache.recordsBudgetBytes(0));
+    defer d.deinit();
+    h.fs.bindDivert(&d);
+    // No root ever served under a token: the refusal stands, typed EAGAIN.
+    try testing.expectEqual(@as(?linux.E, .AGAIN), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, 1).errno());
+    // The last root entry: served, with its words.
+    d.last_root = .{ .mode = S.IFDIR | 0o755, .nlink = 9, .mtime = 777 * std.time.ns_per_s, .ctime = 777 * std.time.ns_per_s };
+    const served0 = read_divert.stats.dlm_token_root_served_last.load();
+    const a = try h.getattr(1);
+    try testing.expectEqual(@as(u32, 9), a.nlink);
+    try testing.expectEqual(@as(u64, 777), a.mtime);
+    try testing.expectEqual(served0 + 1, read_divert.stats.dlm_token_root_served_last.load());
+    // Any other ino under the dead holder refuses as before.
+    try testing.expectEqual(@as(?linux.E, .AGAIN), h.call(.{ .getattr = .{ .flags = 0, .fh = null } }, 2).errno());
+    try testing.expectEqual(served0 + 1, read_divert.stats.dlm_token_root_served_last.load());
 }
 
 test "unlinked-open file: readable until the final FORGET; the forget gathers the corpse; the drain destroys inode + layout in ONE commit; open_count_stranded stays 0 and the open table closes" {

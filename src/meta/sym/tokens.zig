@@ -255,8 +255,9 @@ const ReaderResolver = struct {
 
 /// A's resolver: it leases `SLOT`.
 const HolderResolver = struct {
+    /// A holds `SLOT` and slot 0 (the root's: the manager's own).
     fn homeOf(_: *anyopaque, slot: u16) divert.Home {
-        return if (slot == SLOT) .local else .{ .foreign = .{ .holder = 9, .identity = 0x9 } };
+        return if (slot == SLOT or slot == 0) .local else .{ .foreign = .{ .holder = 9, .identity = 0x9 } };
     }
     fn refresh(_: *anyopaque, _: u16, _: u32) divert.Home {
         return .local;
@@ -828,6 +829,50 @@ test "a grant on a slot another appender leases is answered NotHolder and the re
     try testing.expectError(error.HolderUnreachable, d.serve(io, foreign, .{}));
     try testing.expectEqual(followed0 + 1, divert.stats.dlm_token_reader_redirects_followed.load());
     try testing.expectEqual(@as(u32, 1), f.resolvers[0].refreshes);
+}
+
+test "the parked joiner's root (rung 10 item 5a): the divert remembers the root's attributes as last served under a token; past T_self the serve refuses MembershipPending and the cache is shed, yet `lastRoot` still answers them (counted) — the `getattr(1)` a parked joiner serves so `.stats` stays reachable; a divert that never served the root has none" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    // The root is A's object here (slot 0 is the manager's).
+    try f.records.putInode(inos.ROOT_INO, .{ .mode = 0o040755, .nlink = 7, .mtime = 4242 });
+    const RootIsA = struct {
+        inner: *ReaderResolver,
+        fn homeOf(_: *anyopaque, _: u16) divert.Home {
+            return .{ .foreign = .{ .holder = A_APPENDER, .identity = A_ID } };
+        }
+        fn refresh(_: *anyopaque, _: u16, _: u32) divert.Home {
+            return .{ .foreign = .{ .holder = A_APPENDER, .identity = A_ID } };
+        }
+        fn dial(ctx: *anyopaque, id: u64, h: u32) ?cache.Link {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return ReaderResolver.dial(self.inner, id, h);
+        }
+    };
+    var r: RootIsA = .{ .inner = &f.resolvers[0] };
+    var d = divert.Divert.init(gpa, io, .{ .ctx = &r, .homeOf = &RootIsA.homeOf, .refresh = &RootIsA.refresh, .dial = &RootIsA.dial }, 1, 0, cache.RecallSink.none, f.member_leases[0].selfLease(), cache.recordsBudgetBytes(0));
+    defer d.deinit();
+    const served_last0 = divert.stats.dlm_token_root_served_last.load();
+    // Never served: nothing to fall back on.
+    try testing.expectEqual(@as(?record.InodeValue, null), d.lastRoot());
+    var s = (try d.serve(io, inos.ROOT_INO, .{})).?;
+    try testing.expectEqual(@as(u64, 4242), s.entry.?.attrs.mtime);
+    s.release(io);
+    // Another object's serve leaves the root memo alone.
+    s = (try d.serve(io, objectOf(3), .{})).?;
+    s.release(io);
+    try testing.expectEqual(@as(u32, 7), d.lastRoot().?.nlink);
+    // The manager dies: past T_self every serve refuses and the cache is
+    // shed; the root's last attributes still answer.
+    f.member_leases[0].deadline_ns.store(1, .release);
+    try testing.expectError(error.MembershipPending, d.serve(io, inos.ROOT_INO, .{}));
+    try testing.expectEqual(@as(usize, 0), d.planeOf(io, A_ID).?.cache.count(io));
+    const last = d.lastRoot().?;
+    try testing.expectEqual(@as(u64, 4242), last.mtime);
+    try testing.expectEqual(@as(u32, 7), last.nlink);
+    try testing.expectEqual(served_last0 + 2, divert.stats.dlm_token_root_served_last.load());
 }
 
 test "the serve gate: a reader past T_self serves NOTHING from its cache; a holder that moved its listener is re-pointed in place, every token dropped, the channel fail-closed until a round completes" {

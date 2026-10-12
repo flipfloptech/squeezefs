@@ -2907,7 +2907,17 @@ test "smoke: THE KILL ROWS (b) — kill -9 A (the manager) mid-storm on B ⇒ B 
             return error.StormRefusedBeforePark;
         }
     }
-    std.debug.print("smoke: kill rows (b): B PARKED {d} ms after the kill (acks held); the storm child is alive, waiting\n", .{parked_ms});
+    // The parked joiner's `.stats` (rung 10 item 5a): the kernel
+    // revalidates the root before the virtual lookup, and the root is the
+    // dead manager's object — the read lands (the cached token while the
+    // lease stands, the last root entry once it lapses: the unit rows) and
+    // names the park, so the operator reads WHY the mount is parked.
+    {
+        const tb = (try b.statsTry()) orelse return error.ParkedStatsUnreadable;
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, @backingInt(membership.park_reclaim.Word.parked)), numberAfter(tb, "\"appender_parked\":"));
+    }
+    std.debug.print("smoke: kill rows (b): B PARKED {d} ms after the kill (acks held; .stats readable, naming the park); the storm child is alive, waiting\n", .{parked_ms});
     // Remount A: the D0 ladder's same-host dead-pid proof; A wins volume
     // 0 again as the manager at term 2 with the grace window open.
     const mark = try rig.logLen();

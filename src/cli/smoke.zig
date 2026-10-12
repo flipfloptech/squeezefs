@@ -4294,6 +4294,141 @@ test "smoke: --daemon --supervise --log-file: the invoking process returns 0 onl
     try testing.expect(!@import("status.zig").writerGuardHeld(rig.img));
 }
 
+/// A process whose cwd is the mount (the holder of the busy-umount rows):
+/// `sleep` parks with the mount root as its cwd until killed.
+const Holder = struct {
+    child: std.process.Child,
+    pid: linux.pid_t,
+    gone: bool = false,
+
+    fn spawn(rig: *Rig) !Holder {
+        const c = try std.process.spawn(rig.io, .{ .argv = &.{ "sleep", "300" }, .cwd = .{ .path = rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        return .{ .child = c, .pid = c.id.? };
+    }
+
+    /// Kill and reap (idempotent: the row's `defer` meets an already-gone holder).
+    fn kill(self: *Holder, io: Io) void {
+        if (self.gone) return;
+        self.gone = true;
+        _ = linux.kill(self.pid, .KILL);
+        _ = self.child.wait(io) catch {};
+    }
+};
+
+/// The supervisor's verdict lines after `from`: none of the escalation
+/// ladder may appear on an orderly cycle (charter §1.1: a daemon is never
+/// "unresponsive" for being asked to unmount).
+fn expectSupervisorSilent(text: []const u8) !void {
+    inline for (.{ "missed a probe", "heartbeat stale", "unresponsive for", "is dead (wait status", "detaching lazily" }) |needle| {
+        if (std.mem.indexOf(u8, text, needle)) |i| {
+            std.debug.print("\n--- the supervisor/transport fired on an orderly cycle: '{s}' ---\n{s}\n", .{ needle, text[i..@min(text.len, i + 400)] });
+            return error.SupervisorFired;
+        }
+    }
+}
+
+test "smoke: umount of a BUSY mount (another process's cwd inside it) — the verb REFUSES loud within a tick naming the holder's pid (EBUSY, exit 1), the daemon keeps serving (stat, a write), nothing detaches, the supervisor stays silent; a bare SIGTERM is refused the same way (counted in .stats); after the holder leaves the next umount is the clean one (`clean unmount`, `exited (wait status 0x0)`)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.formatSet(true);
+    {
+        const r = try rig.squeezefs(&.{ "mount", "--daemon", "--supervise", "--log-file", rig.log_path, "-o", "default_permissions,allow_other", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndaemon mount: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    const text0 = try rig.readLog();
+    defer gpa.free(text0);
+    const ready_i = std.mem.indexOf(u8, text0, "ready: ") orelse return error.NoReadyLine;
+    const pid: linux.pid_t = @intCast(numberAfter(text0[ready_i..], "(pid ") orelse return error.NoPid);
+    _ = try rig.awaitLog("supervisor: watching daemon ", ready_i, ready_wait_ns);
+    {
+        const out = try rig.shOk(rig.mp, "echo before > f && test \"$(cat f)\" = before");
+        defer gpa.free(out);
+    }
+    var holder = try Holder.spawn(rig);
+    defer holder.kill(io);
+    // The holder's cwd is the mount root: readable through /proc.
+    {
+        var pb: [64:0]u8 = undefined;
+        var lb: [linux.PATH_MAX]u8 = undefined;
+        const link = try std.fmt.bufPrintSentinel(&pb, "/proc/{d}/cwd", .{holder.pid}, 0);
+        const rc = linux.readlink(link.ptr, &lb, lb.len);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        try testing.expectEqualStrings(rig.mp, lb[0..rc]);
+    }
+    var pid_text: [16]u8 = undefined;
+    const pid_s = try std.fmt.bufPrint(&pid_text, "{d}", .{holder.pid});
+    // 1. The verb refuses: EBUSY within one lock-plane tick, the holder
+    //    named, exit 1 — never 0, never 29 s, never a dead daemon.
+    {
+        const t0 = clock.monotonicNs();
+        const r = try rig.squeezefs(&.{ "umount", rig.mp });
+        defer rig.freeRun(r);
+        const took_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        if (r.term.success() or took_ms > 5000) std.debug.print("\n--- umount of the busy mount: rc {f} after {d} ms (expected exit 1 within a tick); stderr:\n{s}\n", .{ r.term, took_ms, r.stderr });
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(took_ms <= 5000);
+        if (std.mem.indexOf(u8, r.stderr, "busy") == null or std.mem.indexOf(u8, r.stderr, pid_s) == null) std.debug.print("\n--- the refusal did not name the holder {d}:\n{s}\n", .{ holder.pid, r.stderr });
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "busy") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, pid_s) != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "cwd") != null);
+    }
+    // The daemon is alive and the mount serves: the control inode answers
+    // and a write lands.
+    try testing.expect(alive(pid));
+    try testing.expectEqual(@as(usize, 1), try fuseMountsOf(gpa, io, rig.mp));
+    {
+        const out = try rig.shOk(rig.mp, "test -s .stats && echo during > g && test \"$(cat g)\" = during && test \"$(cat f)\" = before");
+        defer gpa.free(out);
+    }
+    // 2. A bare SIGTERM (an operator's `kill`) meets the daemon's own
+    //    census: refused, logged, counted; the mount keeps serving.
+    {
+        const mark = try rig.logLen();
+        _ = linux.kill(pid, .TERM);
+        _ = try rig.awaitLog("is busy", mark, 10 * std.time.ns_per_s);
+        try testing.expect(alive(pid));
+        const out = try rig.shOk(rig.mp, "test \"$(cat g)\" = during");
+        defer gpa.free(out);
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(st, "\"transport_umount_busy_refusals\":"));
+    }
+    {
+        const during = try rig.readLog();
+        defer gpa.free(during);
+        try expectSupervisorSilent(during[ready_i..]);
+        try testing.expect(std.mem.indexOf(u8, during[ready_i..], "stop requested") != null);
+    }
+    // 3. The holder leaves; the orderly unmount is the clean one.
+    holder.kill(io);
+    {
+        const t0 = clock.monotonicNs();
+        const r = try rig.squeezefs(&.{ "umount", rig.mp });
+        defer rig.freeRun(r);
+        const took_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        if (!r.term.success()) std.debug.print("\n--- the clean umount failed ({f}) after {d} ms:\n{s}\n", .{ r.term, took_ms, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(took_ms <= 20_000);
+    }
+    {
+        const deadline = clock.monotonicNs() + exit_wait_ns;
+        while (alive(pid) and clock.monotonicNs() < deadline) sleepMs(20);
+        try testing.expect(!alive(pid));
+    }
+    _ = try rig.awaitLog("exited (wait status 0x0); done", ready_i, 20 * std.time.ns_per_s);
+    const after = try rig.readLog();
+    defer gpa.free(after);
+    try testing.expect(std.mem.indexOf(u8, after[ready_i..], "clean unmount") != null);
+    try expectSupervisorSilent(after[ready_i..]);
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+    try testing.expect(!status_verb.writerGuardHeld(rig.img));
+}
+
 test "smoke: a LATE bring-up refusal — the kmbuf ring answers ENOMEM (the seam) after the data plane registered its budget sources: the daemon exits 1 (never a signal) with the typed refusal naming the page order and the remedy, nothing stays mounted or held, and the R5 sampler, ticking at its stop under its seam, reads no freed source; a clean mount → umount under the same sampler seam exits 0" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

@@ -360,3 +360,127 @@ test "tls e2e: SCOPING — handshake latency and record throughput over loopback
     std.debug.print("\ntls scoping (loopback TCP, 512 MiB streams, {s}):\n  connect+handshake: plaintext {d} µs, mutual_tls {d} µs (50 dials each)\n  64 KiB writes: plaintext {d:.2} GB/s, mutual_tls {d:.2} GB/s\n  1 MiB writes:  plaintext {d:.2} GB/s, mutual_tls {d:.2} GB/s\n", .{ @tagName(builtin.mode), plain_hs.handshake_us, tls_hs.handshake_us, plain_64k.gbps, tls_64k.gbps, plain_1m.gbps, tls_1m.gbps });
     try testing.expect(tls_64k.gbps > 0 and tls_1m.gbps > 0);
 }
+
+// ---------------------------------------------------------------------------
+// The wire over MutualTls: the listener's and the dialer's arms.
+// ---------------------------------------------------------------------------
+
+const service = @import("service.zig");
+const verbs = @import("verbs.zig");
+const auth = @import("auth.zig");
+const endpoint = @import("endpoint.zig");
+const listener = @import("listener.zig");
+const stats = @import("stats.zig");
+
+const Echo = struct {
+    served: std.atomic.Value(u64) = .init(0),
+
+    fn serve(ctx: *anyopaque, req: *const service.Request, _: []u8) service.Answer {
+        const self: *Echo = @ptrCast(@alignCast(ctx));
+        _ = self.served.fetchAdd(1, .monotonic);
+        switch (req.payload) {
+            .resolve_slot => |r| return .{ .ok = .{ .resolve_slot = .{ .kind = 0, .reserved = @splat(0), .appender_id = 0, .g = r.slot, .reserved2 = 0 } } },
+            else => return .{ .status = .{ .status = .not_manager } },
+        }
+    }
+};
+
+const wire_secret: auth.Secret = @splat(0x7A);
+
+fn wireIdentity(n: u32) verbs.WireIdentity {
+    return .{ .node_token = 0xBEEF00 + n, .writer_id = 1, .mount_slot = n, .reserved = 0 };
+}
+
+fn startWireListener(svc: *service.Service, posture: tls.Posture) !*listener.Listener {
+    return listener.Listener.start(testing.allocator, testing.io, .{ .explicit = try endpoint.parseEndpoint("127.0.0.1:0") }, svc, wire_secret, .{ .raw_cpus = 4, .nofile = 1 << 16, .posture = posture });
+}
+
+test "wire e2e over MutualTls: the ladder rides inside TLS under one CA (the session authenticated ∧ confidential; 1,000 verbs cross; handshakes and admissions counted) → a client under a FOREIGN CA is refused and counted untrusted → a Plaintext dialer is answered with a Refused naming the class after the handshake bound and counted → a MutualTls dialer at a Plaintext listener is refused loud and counted" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const now = clock.realtimeCoarseS();
+    const tp = try tls.TestPki.init(io, now);
+    var id_a = try tp.identity(gpa, .a);
+    defer id_a.deinit(gpa);
+    var id_b = try tp.identity(gpa, .b);
+    defer id_b.deinit(gpa);
+    var id_x = try tp.identity(gpa, .foreign);
+    defer id_x.deinit(gpa);
+    var echo: Echo = .{};
+    var svc: service.Service = .init;
+    svc.register(.resolve_slot, .{ .ctx = &echo, .serve = &Echo.serve });
+    const l = try startWireListener(&svc, .{ .mutual_tls = &id_a });
+    defer l.stop();
+    const hs0 = stats.cluster_wire_tls_handshakes.load();
+    const adm0 = stats.cluster_wire_sessions_admitted.load();
+    {
+        var client = dialer.Client.init(gpa, io, l.advertised, wire_secret, wireIdentity(1));
+        client.posture = .{ .mutual_tls = &id_b };
+        defer client.deinit();
+        var out: [256]u8 = undefined;
+        var i: u16 = 0;
+        while (i < 1000) : (i += 1) {
+            const rep = try client.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = i, .reserved = 0 } }, &out);
+            try testing.expectEqual(i, rep.resolve_slot.g);
+        }
+        try testing.expectEqual(tls.Channel.mutual_tls, client.mux.?.channel());
+        try testing.expect(client.mux.?.sess.framer.authenticated() and client.mux.?.sess.framer.confidential());
+        try testing.expectEqual(@as(u64, 1000), echo.served.load(.monotonic));
+        // Both ends of ONE connection in this process: two handshakes, one
+        // admission.
+        try testing.expectEqual(hs0 + 2, stats.cluster_wire_tls_handshakes.load());
+        try testing.expectEqual(adm0 + 1, stats.cluster_wire_sessions_admitted.load());
+        std.debug.print("\nwire e2e: 1,000 verbs over MutualTls on one connection ({d} B sent on the wire family's counter)\n", .{stats.cluster_wire_bytes_sent.load()});
+    }
+    // A client under the foreign CA: the server refuses its leaf (and the
+    // client refuses the server's first — either way no session).
+    {
+        const untrusted0 = stats.cluster_wire_tls_refused_untrusted.load();
+        const dial_refused0 = stats.cluster_wire_tls_dial_refused.load();
+        var client = dialer.Client.init(gpa, io, l.advertised, wire_secret, wireIdentity(2));
+        client.posture = .{ .mutual_tls = &id_x };
+        defer client.deinit();
+        var out: [256]u8 = undefined;
+        try testing.expectError(error.HandshakeRefused, client.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 1, .reserved = 0 } }, &out));
+        try testing.expectEqual(dial_refused0 + 1, stats.cluster_wire_tls_dial_refused.load());
+        // The listener's thread counts its refusal a beat after the client's.
+        const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+        while (stats.cluster_wire_tls_refused_untrusted.load() == untrusted0 and clock.monotonicNs() < deadline) io.sleep(.fromMilliseconds(10), .awake) catch {};
+        try testing.expectEqual(untrusted0 + 1, stats.cluster_wire_tls_refused_untrusted.load());
+    }
+    // A Plaintext dialer: silent for the handshake bound, answered with a
+    // plaintext Refused naming the class.
+    {
+        const pt0 = stats.cluster_wire_plaintext_refused.load();
+        var client = dialer.Client.init(gpa, io, l.advertised, wire_secret, wireIdentity(3));
+        client.posture = .plaintext;
+        defer client.deinit();
+        var out: [256]u8 = undefined;
+        const t0 = clock.monotonicNs();
+        try testing.expectError(error.HandshakeRefused, client.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 1, .reserved = 0 } }, &out));
+        const waited_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        try testing.expect(waited_ms >= session.DIAL_TIMEOUT_MS / 2 - 500 and waited_ms < session.DIAL_TIMEOUT_MS);
+        try testing.expectEqual(pt0 + 1, stats.cluster_wire_plaintext_refused.load());
+        std.debug.print("wire e2e: a Plaintext dialer at the MutualTls listener: Refused by name after {d} ms (the handshake bound), counted\n", .{waited_ms});
+    }
+    // A MutualTls dialer at a Plaintext listener: the Challenge frame
+    // where the ServerHello should be.
+    {
+        const pl = try startWireListener(&svc, .plaintext);
+        defer pl.stop();
+        const dial_refused0 = stats.cluster_wire_tls_dial_refused.load();
+        var client = dialer.Client.init(gpa, io, pl.advertised, wire_secret, wireIdentity(4));
+        client.posture = .{ .mutual_tls = &id_b };
+        defer client.deinit();
+        var out: [256]u8 = undefined;
+        try testing.expectError(error.HandshakeRefused, client.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 1, .reserved = 0 } }, &out));
+        try testing.expectEqual(dial_refused0 + 1, stats.cluster_wire_tls_dial_refused.load());
+        // And the plaintext client still works there, unconfidential.
+        var plain = dialer.Client.init(gpa, io, pl.advertised, wire_secret, wireIdentity(5));
+        plain.posture = .plaintext;
+        defer plain.deinit();
+        const rep = try plain.callTyped(.{ .resolve_slot = .{ .volume = 0, .slot = 9, .reserved = 0 } }, &out);
+        try testing.expectEqual(@as(u32, 9), rep.resolve_slot.g);
+        try testing.expect(plain.mux.?.sess.framer.authenticated() and !plain.mux.?.sess.framer.confidential());
+    }
+}

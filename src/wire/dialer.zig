@@ -39,6 +39,7 @@ const session = @import("session.zig");
 const service = @import("service.zig");
 const endpoint = @import("endpoint.zig");
 const stats = @import("stats.zig");
+const tls = @import("tls.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("wire/dialer is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -139,8 +140,11 @@ pub fn connectTimeout(addr: net.IpAddress, timeout_ms: u32) error{Unreachable}!n
     return .{ .socket = .{ .handle = fd, .address = addr } };
 }
 
-/// One attempt: connect, the ladder's peer side, the mux stood up.
-pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, secret: *const auth.Secret, peer_id: []const u8) DialError!*Mux {
+/// One attempt: connect, under `mutual_tls` the TLS handshake (a refusal
+/// is loud: the listener's CA is not ours, our leaf is not under its CA,
+/// a Plaintext listener answered), the ladder's peer side with the key
+/// bound to the channel's exporter, the mux stood up.
+pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, secret: *const auth.Secret, peer_id: []const u8, posture: tls.Posture) DialError!*Mux {
     const addr = ep.toIp() orelse return error.Unreachable;
     const stream = try connectTimeout(addr, session.DIAL_TIMEOUT_MS);
     session.TcpLink.setNoDelay(stream);
@@ -150,21 +154,53 @@ pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, se
     };
     errdefer gpa.destroy(mux);
     mux.* = .{ .gpa = gpa, .io = io, .link = .{ .io = io, .stream = stream }, .sess = undefined, .cells = undefined };
-    mux.sess = session.Session.init(gpa, mux.link.link(), .peer, 0) catch {
-        stream.close(io);
-        return error.OutOfMemory;
-    };
-    errdefer mux.sess.deinit();
     errdefer stream.close(io);
+    var binding: [tls.BINDING_BYTES]u8 = undefined;
+    var binding_len: usize = 0;
+    switch (posture) {
+        .plaintext => {},
+        .mutual_tls => |identity| {
+            mux.tls_conn = tls.clientHandshake(gpa, mux.link.link(), identity, io, .{}) catch |e| {
+                stats.cluster_wire_tls_dial_refused.inc();
+                return switch (e) {
+                    error.Eof => error.BeforeChallenge,
+                    error.Timeout, error.PeerSilent, error.Transport => error.Unreachable,
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => blk: {
+                        log.warn("cluster wire: peer at {f} refused at the TLS handshake: {s}", .{ ep, tls.refusalText(e) });
+                        break :blk error.HandshakeRefused;
+                    },
+                };
+            };
+            binding = mux.tls_conn.?.binding();
+            binding_len = binding.len;
+        },
+    }
+    errdefer if (mux.tls_conn) |c| c.destroy(gpa);
+    mux.sess = session.Session.init(gpa, mux.stream(), .peer, 0) catch return error.OutOfMemory;
+    errdefer mux.sess.deinit();
     // Step 1: the coordinator speaks first. EOF here = BeforeChallenge.
     const ch_in = mux.sess.recvFrame(session.DIAL_TIMEOUT_MS) catch |e| return switch (e) {
         error.Eof => error.BeforeChallenge,
+        error.HeaderRefused => blk: {
+            // A frame that is not a frame: a MutualTls listener's TLS
+            // alert/record where the Challenge should be.
+            if (posture == .plaintext) log.warn("cluster wire: peer at {f} did not answer with a plaintext Challenge (a MutualTls listener at a plaintext dialer?)", .{ep});
+            break :blk error.HandshakeRefused;
+        },
         else => error.Unreachable,
     };
+    if (ch_in.header.verb == @backingInt(verbs.Verb.refused)) {
+        // A MutualTls listener answering a Plaintext dialer in its own
+        // framing after the handshake bound: the refusal names the class.
+        const r = codec.decodePayload(verbs.Refused, ch_in.payload) catch return error.Protocol;
+        log.warn("cluster wire: peer at {f} refused the connection before its challenge: {s}", .{ ep, r.bytes });
+        return error.HandshakeRefused;
+    }
     if (ch_in.header.verb != @backingInt(verbs.Verb.challenge)) return error.Protocol;
     const ch = codec.decodePayload(verbs.Challenge, ch_in.payload) catch return error.Protocol;
     // Steps 2–4.
-    const ans = auth.answer(io, secret, peer_id, ch, "") catch |e| return switch (e) {
+    const ans = auth.answer(io, secret, peer_id, ch, binding[0..binding_len]) catch |e| return switch (e) {
         error.SchemaMismatch => blk: {
             log.warn("cluster wire: peer at {f} speaks wire schema {d}, this binary {d} — refusing", .{ ep, ch.schema, verbs.CLUSTER_WIRE_SCHEMA });
             break :blk error.HandshakeRefused;
@@ -180,7 +216,7 @@ pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, se
     }
     if (verdict.header.verb != @backingInt(verbs.Verb.admitted)) return error.Protocol;
     _ = codec.decodePayload(verbs.Admitted, verdict.payload) catch return error.Protocol;
-    mux.sess.framer.admit(ans.session_key);
+    mux.sess.framer.admitOn(ans.session_key, posture.channel());
     // Step 5: the mux's cells and its reader.
     mux.cells = gpa.alloc(Cell, MUX_IN_FLIGHT) catch return error.OutOfMemory;
     errdefer gpa.free(mux.cells);
@@ -195,10 +231,16 @@ pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, se
 /// first EOF ("the 14th member of the box's 32-member fleet died on that
 /// word"). Other refusals map once: nobody listening ⇒ `HolderUnreachable`.
 pub fn connect(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, secret: *const auth.Secret, peer_id: []const u8) errors.Error!*Mux {
+    return connectWith(gpa, io, ep, secret, peer_id, tls.posture());
+}
+
+/// `connect` under an explicit channel posture (the process posture is
+/// the product's; the tests pair classes freely).
+pub fn connectWith(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, secret: *const auth.Secret, peer_id: []const u8, posture: tls.Posture) errors.Error!*Mux {
     const deadline = nowMs() + session.DIAL_TIMEOUT_MS;
     var backoff_ms: u64 = DIAL_RETRY_BASE_MS;
     while (true) {
-        return connectOnce(gpa, io, ep, secret, peer_id) catch |e| switch (e) {
+        return connectOnce(gpa, io, ep, secret, peer_id, posture) catch |e| switch (e) {
             error.BeforeChallenge => {
                 const now = nowMs();
                 if (now >= deadline) {
@@ -240,7 +282,10 @@ const Cell = struct {
 pub const Mux = struct {
     gpa: std.mem.Allocator,
     io: Io,
+    /// The raw socket (the shutdown nudge's and the peek's target).
     link: session.TcpLink,
+    /// The TLS record layer over it under `mutual_tls`.
+    tls_conn: ?*tls.Conn = null,
     sess: session.Session,
     cells: []Cell,
     write_lock: Io.Mutex = .init,
@@ -250,6 +295,17 @@ pub const Mux = struct {
 
     pub fn isPoisoned(self: *const Mux) bool {
         return self.poisoned.load(.acquire);
+    }
+
+    /// The byte stream the session reads and writes.
+    fn stream(self: *Mux) session.Link {
+        if (self.tls_conn) |c| return c.link();
+        return self.link.link();
+    }
+
+    /// The channel class this session was admitted on.
+    pub fn channel(self: *const Mux) tls.Channel {
+        return self.sess.framer.channel;
     }
 
     fn correlationOf(index: usize, generation: u32) u64 {
@@ -400,7 +456,10 @@ pub const Mux = struct {
         self.link.link().shutdown();
         self.reader.join();
         self.poison();
-        self.link.link().close();
+        if (self.tls_conn) |c| {
+            c.link().close();
+            c.destroy(self.gpa);
+        } else self.link.link().close();
         self.sess.deinit();
         self.gpa.free(self.cells);
         self.gpa.destroy(self);
@@ -416,6 +475,8 @@ pub const Client = struct {
     secret: auth.Secret,
     identity: verbs.WireIdentity,
     mux: ?*Mux = null,
+    /// null = the process posture.
+    posture: ?tls.Posture = null,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, secret: auth.Secret, identity: verbs.WireIdentity) Client {
         return .{ .gpa = gpa, .io = io, .ep = ep, .secret = secret, .identity = identity };
@@ -434,7 +495,7 @@ pub const Client = struct {
             stats.cluster_wire_reconnects.inc();
         }
         const peer_id = self.identity.peerId();
-        const m = try connect(self.gpa, self.io, self.ep, &self.secret, &peer_id);
+        const m = try connectWith(self.gpa, self.io, self.ep, &self.secret, &peer_id, self.posture orelse tls.posture());
         self.mux = m;
         return m;
     }

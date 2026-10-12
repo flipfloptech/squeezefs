@@ -253,7 +253,7 @@ test "tcp e2e: a stranger without the set's secret is refused at the handshake (
     while (l.liveConnections() < listener.MAX_CONNS_FLOOR and i < 10_000) : (i += 1) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     try testing.expectEqual(listener.MAX_CONNS_FLOOR, l.liveConnections());
     const refused_conns_before = stats.cluster_wire_connections_refused.load();
-    try testing.expectError(error.BeforeChallenge, dialer.connectOnce(testing.allocator, testing.io, l.advertised, &secret, &peer_id));
+    try testing.expectError(error.BeforeChallenge, dialer.connectOnce(testing.allocator, testing.io, l.advertised, &secret, &peer_id, .plaintext));
     try testing.expectEqual(refused_conns_before + 1, stats.cluster_wire_connections_refused.load());
     try testing.expectEqual(linux.E.AGAIN, errors.toErrno(error.ListenerRefused));
     try testing.expectEqual(linux.E.AGAIN, errors.toErrno(error.QueueFull));

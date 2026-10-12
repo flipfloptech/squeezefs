@@ -33,9 +33,11 @@ const frame = @import("frame.zig");
 const codec = @import("codec.zig");
 const verbs = @import("verbs.zig");
 const stats = @import("stats.zig");
+const tls = @import("tls.zig");
 const log = @import("../core/log.zig");
 
 pub const Role = enum { coordinator, peer };
+pub const Channel = tls.Channel;
 
 /// Socket timeouts (one bound, three uses — §1.5): the dial, the
 /// handshake's reads and writes, and a call's reply bound. 10 s is the
@@ -72,6 +74,10 @@ pub const Framer = struct {
     key: ?frame.SessionKey = null,
     send_seq: u64 = 0,
     recv_seq: u64 = 0,
+    /// The channel class the session was admitted on (spec CW:1010–1051:
+    /// the verification-strength ladder keys on `authenticated()` ∧
+    /// `confidential()`, never on "transport == tls").
+    channel: Channel = .plaintext,
 
     pub fn init(role: Role) Framer {
         return .{ .role = role };
@@ -79,13 +85,27 @@ pub const Framer = struct {
 
     /// Step 5 of the ladder: from here every frame carries the MAC.
     pub fn admit(self: *Framer, key: frame.SessionKey) void {
+        self.admitOn(key, .plaintext);
+    }
+
+    /// `admit` naming the channel class (the session key is already bound
+    /// to the channel's exporter under `mutual_tls`).
+    pub fn admitOn(self: *Framer, key: frame.SessionKey, channel: Channel) void {
         self.key = key;
+        self.channel = channel;
         self.send_seq = 0;
         self.recv_seq = 0;
     }
 
+    /// Proof verified ∧ MAC engaged.
     pub fn authenticated(self: *const Framer) bool {
         return self.key != null;
+    }
+
+    /// Authenticated AND the channel is the TLS class: the ONLY posture
+    /// that admits verify-read sampling below 100 % (the job fabric's law).
+    pub fn confidential(self: *const Framer) bool {
+        return self.authenticated() and self.channel.confidential();
     }
 
     fn dirFlag(self: *const Framer) u16 {
@@ -481,6 +501,38 @@ test "two framers back to back: a call and its reply ride (dir, seq) and the MAC
     try testing.expectEqual(frame.CONTROL_CAP, Framer.capFor(0x7777));
     try testing.expectEqual(frame.BULK_CAP, Framer.capFor(0x0601));
     try testing.expectEqual(frame.CONTROL_CAP, Framer.capFor(0x0602));
+}
+
+test "the channel-bound key: two sessions from one secret and one nonce pair under two channel bindings hold different keys, so a frame sealed on one channel is refused on the other; `confidential()` is true only on the mutual_tls class" {
+    const auth = @import("auth.zig");
+    const secret: auth.Secret = @splat(0x11);
+    const n1: auth.Nonce = @splat(1);
+    const n2: auth.Nonce = @splat(2);
+    const binding_a: [auth.BINDING_BYTES]u8 = @splat(0xA0);
+    const binding_b: [auth.BINDING_BYTES]u8 = @splat(0xB0);
+    const key_a = auth.sessionKey(&secret, "peer", &n1, &n2, &binding_a);
+    const key_b = auth.sessionKey(&secret, "peer", &n1, &n2, &binding_b);
+    try testing.expect(!std.mem.eql(u8, &key_a, &key_b));
+    var peer_a: Framer = .init(.peer);
+    peer_a.admitOn(key_a, .mutual_tls);
+    var coord_b: Framer = .init(.coordinator);
+    coord_b.admitOn(key_b, .mutual_tls);
+    var buf: [256]u8 = undefined;
+    var b: codec.Builder = .init(buf[frame.HEADER_LEN..]);
+    try b.put(verbs.Empty, .{});
+    const n = try peer_a.seal(peer_a.nextHeader(.ping, .ok, 1, false), &buf, 0);
+    stats.cluster_wire_mac_failures.resetLogBudgetForTest();
+    log.testing.expectErrorLogs(1);
+    try testing.expectError(error.MacFailed, coord_b.accept(buf[0..n]));
+    try log.testing.expectAllFired();
+    var coord_a: Framer = .init(.coordinator);
+    coord_a.admitOn(key_a, .mutual_tls);
+    _ = try coord_a.accept(buf[0..n]);
+    try testing.expect(coord_a.authenticated() and coord_a.confidential());
+    var plain: Framer = .init(.coordinator);
+    try testing.expect(!plain.authenticated() and !plain.confidential());
+    plain.admit(key_a);
+    try testing.expect(plain.authenticated() and !plain.confidential());
 }
 
 /// A `Link` over two in-memory byte queues (the session tests' pipe; the

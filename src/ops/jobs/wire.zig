@@ -48,10 +48,9 @@ const ShardId = seams.ShardId;
 const DestTuple = records.DestTuple;
 const StableIdentity = records.StableIdentity;
 
-/// The channel's trust class decides the verify strength (`auth.zig`:
-/// the session key is bound to the channel's exporter; mTLS lands without
-/// a wire change).
-pub const Channel = enum { plaintext, mutual_tls };
+/// The channel's trust class decides the verify strength (`wire/tls.zig`:
+/// the session key is bound to the channel's exporter under `mutual_tls`).
+pub const Channel = @import("../../wire/tls.zig").Channel;
 
 /// The verify-read permille the channel admits: 1000 pinned on plaintext;
 /// the knob (`SQUEEZEFS_JOB_WIRE_VERIFY_PERMILLE`) honoured only under

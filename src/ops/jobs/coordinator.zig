@@ -36,6 +36,7 @@ const records = @import("records.zig");
 const fabric_mod = @import("fabric.zig");
 const lease_mod = @import("lease.zig");
 const wire_mod = @import("wire.zig");
+const wire_tls = @import("../../wire/tls.zig");
 const seams = @import("seams.zig");
 const stats_mod = @import("stats.zig");
 const mover = @import("../lifecycle/mover.zig");
@@ -1317,7 +1318,7 @@ pub const Node = struct {
         };
         n.fabric = Fabric.init(gpa, n.store.store(), .{ .identity = in.identity, .pid = in.pid, .default_throttle_pct = opts.cpu_limit, .park_delay_ns = opts.park_delay_ns, .held = in.held, .random = in.random });
         n.table = lease_mod.ShardTable.init(seams.LEASE_TTL_MS, n.sink.sink(), null);
-        n.coord = wire_mod.Coordinator.init(gpa, io, &n.fabric, &n.table, .{ .verify = n.verify.vr(), .channel = .plaintext, .configured_permille = opts.verify_permille, .wero = if (in.wero) |w| w.wero() else null });
+        n.coord = wire_mod.Coordinator.init(gpa, io, &n.fabric, &n.table, .{ .verify = n.verify.vr(), .channel = wire_tls.posture().channel(), .configured_permille = opts.verify_permille, .wero = if (in.wero) |w| w.wero() else null });
         n.sink.coord = &n.coord;
         // The bodies over the plane (every job type this daemon can run).
         n.world_ = .{ .be = in.backend, .plane = in.plane, .fabric = &n.fabric, .io = io, .random = in.random };

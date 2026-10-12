@@ -236,6 +236,11 @@ pub const HandshakeError = error{
     /// The peer's first bytes are the plaintext frame magic: a Plaintext
     /// dial into a MutualTls listener (or the reverse).
     PeerPlaintext,
+    /// Not one byte inside the handshake bound. The plaintext ladder's
+    /// coordinator speaks first and TLS's client does, so a Plaintext
+    /// dialer at a MutualTls listener is exactly this silence: the
+    /// listener answers it with a plaintext `Refused` naming the class.
+    PeerSilent,
     /// Not a TLS record at all.
     PeerNotTls,
     /// A malformed or out-of-order handshake message.
@@ -250,8 +255,12 @@ pub const HandshakeError = error{
     PeerCertificateNotYetValid,
     /// CertificateVerify or Finished did not verify.
     PeerSignatureInvalid,
-    /// The peer sent a fatal alert.
+    /// The peer sent a fatal alert (not about our certificate).
     Alert,
+    /// The peer's alert refused OUR certificate (unknown_ca, bad_certificate,
+    /// certificate_unknown/required/expired): the peer is under another CA
+    /// or judges our leaf's validity differently — counted as untrusted.
+    PeerRefusedOurCertificate,
     Transport,
     Timeout,
     Eof,
@@ -279,6 +288,12 @@ pub const Conn = struct {
     peer_name: [pki.NAME_MAX]u8 = @splat(0),
     peer_name_len: u8 = 0,
     established: bool = false,
+    /// A record header has been read (a timeout before it is `PeerSilent`;
+    /// the first header's bound is `first_record_timeout_ms`).
+    seen_bytes: bool = false,
+    first_record_timeout_ms: u32 = session.DIAL_TIMEOUT_MS / 2,
+    /// The description of the last alert the peer sent (its class).
+    last_alert: ?u8 = null,
     /// Set by the reader on a KeyUpdate(update_requested); honoured by the
     /// next write under the writer's own serialization (a reader never
     /// writes: the mux's halves are owned by different threads).
@@ -290,6 +305,17 @@ pub const Conn = struct {
 
     pub fn peerName(self: *const Conn) []const u8 {
         return self.peer_name[0..self.peer_name_len];
+    }
+
+    /// An `Alert` whose description names OUR certificate is the peer's
+    /// refusal of us (the mirror of our refusal of it).
+    fn classify(self: *const Conn, e: HandshakeError) HandshakeError {
+        if (e != error.Alert) return e;
+        const d = self.last_alert orelse return e;
+        return switch (d) {
+            @backingInt(tls.Alert.Description.unknown_ca), @backingInt(tls.Alert.Description.bad_certificate), @backingInt(tls.Alert.Description.certificate_unknown), @backingInt(tls.Alert.Description.certificate_required), @backingInt(tls.Alert.Description.certificate_expired), @backingInt(tls.Alert.Description.certificate_revoked), @backingInt(tls.Alert.Description.unsupported_certificate) => error.PeerRefusedOurCertificate,
+            else => e,
+        };
     }
 
     /// RFC 8446 §7.5: `TLS-Exporter(label, "", 32)`.
@@ -326,7 +352,9 @@ pub const Conn = struct {
     /// than the ceiling is `Protocol` (RFC 8446 §5.2 `record_overflow`).
     fn readRawRecord(self: *Conn, timeout_ms: ?u32) HandshakeError!struct { ct: tls.ContentType, body: []u8 } {
         const hdr = self.rd_cipher[0..RECORD_HEADER];
-        self.inner.readExact(hdr, timeout_ms) catch |e| return mapLink(e);
+        const bound: ?u32 = if (self.seen_bytes) timeout_ms else @min(timeout_ms orelse self.first_record_timeout_ms, self.first_record_timeout_ms);
+        self.inner.readExact(hdr, bound) catch |e| return if (e == error.Timeout and !self.seen_bytes) error.PeerSilent else mapLink(e);
+        self.seen_bytes = true;
         // The frame magic where a record header should be: a peer of the
         // other channel class (judged before the length word, which is
         // the magic's own bytes).
@@ -354,7 +382,10 @@ pub const Conn = struct {
                     // A cleartext alert after keys are armed is a peer that
                     // gave up mid-handshake (OpenSSL's `s_client` on a
                     // refused certificate): report it as such.
-                    if (raw.ct == .alert) return error.Alert;
+                    if (raw.ct == .alert) {
+                        if (raw.body.len == 2) self.last_alert = raw.body[1];
+                        return error.Alert;
+                    }
                     return error.Protocol;
                 }
                 if (raw.body.len < TAG_BYTES + 1) return error.Protocol;
@@ -369,8 +400,10 @@ pub const Conn = struct {
                 while (n > 0 and m[n - 1] == 0) n -= 1;
                 if (n == 0) return error.Protocol;
                 const ct = contentType(m[n - 1]) orelse return error.Protocol;
+                if (ct == .alert and n - 1 == 2) self.last_alert = m[1];
                 return .{ .ct = ct, .plain = m[0 .. n - 1] };
             }
+            if (raw.ct == .alert and raw.body.len == 2) self.last_alert = raw.body[1];
             @memcpy(self.rd_plain[0..raw.body.len], raw.body);
             return .{ .ct = raw.ct, .plain = self.rd_plain[0..raw.body.len] };
         }
@@ -987,6 +1020,10 @@ const Handshake = struct {
 pub const Options = struct {
     /// The handshake's read bound (the listener's `DIAL_TIMEOUT`).
     timeout_ms: u32 = session.DIAL_TIMEOUT_MS,
+    /// The FIRST record's bound: half the dial bound, so a MutualTls
+    /// listener's plaintext `Refused` to a silent (Plaintext) dialer lands
+    /// before that dialer's own Challenge wait expires at the full bound.
+    first_record_timeout_ms: u32 = session.DIAL_TIMEOUT_MS / 2,
     /// The wall clock the peer's certificate is judged at; null = now.
     now_s: ?u64 = null,
 };
@@ -1008,16 +1045,17 @@ fn wallS(opts: Options) u64 {
 pub fn serverHandshake(gpa: std.mem.Allocator, inner: session.Link, identity: *const Identity, io: Io, opts: Options) HandshakeError!*Conn {
     const conn = try gpa.create(Conn);
     errdefer gpa.destroy(conn);
-    conn.* = .{ .inner = inner, .role = .server };
+    conn.* = .{ .inner = inner, .role = .server, .first_record_timeout_ms = opts.first_record_timeout_ms };
     const hs = try gpa.create(Handshake);
     defer {
         hs.deinit();
         gpa.destroy(hs);
     }
     hs.* = .{ .conn = conn, .identity = identity, .io = io, .now_s = wallS(opts), .timeout_ms = opts.timeout_ms };
-    serverBody(hs) catch |e| {
+    serverBody(hs) catch |raw| {
+        const e = conn.classify(raw);
         switch (e) {
-            error.PeerPlaintext, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.OutOfMemory => {},
+            error.PeerPlaintext, error.PeerSilent, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.PeerRefusedOurCertificate, error.OutOfMemory => {},
             error.ProfileMismatch => conn.writeAlert(.fatal, .handshake_failure),
             error.PeerCertificateMissing => conn.writeAlert(.fatal, .certificate_required),
             error.PeerCertificateUntrusted => conn.writeAlert(.fatal, .unknown_ca),
@@ -1106,16 +1144,17 @@ fn serverBody(hs: *Handshake) HandshakeError!void {
 pub fn clientHandshake(gpa: std.mem.Allocator, inner: session.Link, identity: *const Identity, io: Io, opts: Options) HandshakeError!*Conn {
     const conn = try gpa.create(Conn);
     errdefer gpa.destroy(conn);
-    conn.* = .{ .inner = inner, .role = .client };
+    conn.* = .{ .inner = inner, .role = .client, .first_record_timeout_ms = opts.first_record_timeout_ms };
     const hs = try gpa.create(Handshake);
     defer {
         hs.deinit();
         gpa.destroy(hs);
     }
     hs.* = .{ .conn = conn, .identity = identity, .io = io, .now_s = wallS(opts), .timeout_ms = opts.timeout_ms };
-    clientBody(hs) catch |e| {
+    clientBody(hs) catch |raw| {
+        const e = conn.classify(raw);
         switch (e) {
-            error.PeerPlaintext, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.OutOfMemory => {},
+            error.PeerPlaintext, error.PeerSilent, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.PeerRefusedOurCertificate, error.OutOfMemory => {},
             error.ProfileMismatch => conn.writeAlert(.fatal, .handshake_failure),
             error.PeerCertificateMissing => conn.writeAlert(.fatal, .certificate_required),
             error.PeerCertificateUntrusted => conn.writeAlert(.fatal, .unknown_ca),
@@ -1206,6 +1245,7 @@ fn clientBody(hs: *Handshake) HandshakeError!void {
 pub fn refusalText(e: HandshakeError) []const u8 {
     return switch (e) {
         error.PeerPlaintext => "a Plaintext peer at a MutualTls channel (the peer's SQUEEZEFS_WIRE_CHANNEL is plaintext)",
+        error.PeerSilent => "silent for the whole handshake bound: a Plaintext peer waiting for the Challenge a MutualTls channel never sends (set SQUEEZEFS_WIRE_CHANNEL=mutual_tls on the peer)",
         error.PeerNotTls => "not a TLS peer",
         error.Protocol => "malformed or out-of-order TLS handshake",
         error.ProfileMismatch => "no common TLS profile (TLS 1.3, AES-128-GCM-SHA256, x25519, ed25519)",
@@ -1215,6 +1255,7 @@ pub fn refusalText(e: HandshakeError) []const u8 {
         error.PeerCertificateNotYetValid => "the peer's certificate is not yet valid",
         error.PeerSignatureInvalid => "the peer's CertificateVerify/Finished did not verify",
         error.Alert => "the peer sent a fatal TLS alert",
+        error.PeerRefusedOurCertificate => "the peer refused THIS node's certificate (its alert names our certificate: the peer is under another CA, or judges our leaf's validity differently)",
         error.Transport => "transport failure during the TLS handshake",
         error.Timeout => "the TLS handshake timed out",
         error.Eof => "the peer closed during the TLS handshake",
@@ -1225,8 +1266,8 @@ pub fn refusalText(e: HandshakeError) []const u8 {
 /// Count a listener-side refusal under its class.
 pub fn countRefusal(e: HandshakeError) void {
     switch (e) {
-        error.PeerPlaintext => stats.cluster_wire_plaintext_refused.inc(),
-        error.PeerCertificateUntrusted, error.PeerCertificateMissing, error.PeerSignatureInvalid => stats.cluster_wire_tls_refused_untrusted.inc(),
+        error.PeerPlaintext, error.PeerSilent => stats.cluster_wire_plaintext_refused.inc(),
+        error.PeerCertificateUntrusted, error.PeerCertificateMissing, error.PeerSignatureInvalid, error.PeerRefusedOurCertificate => stats.cluster_wire_tls_refused_untrusted.inc(),
         error.PeerCertificateExpired, error.PeerCertificateNotYetValid => stats.cluster_wire_tls_refused_expired.inc(),
         else => stats.cluster_wire_tls_refused_protocol.inc(),
     }

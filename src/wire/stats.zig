@@ -84,6 +84,9 @@ pub var cluster_wire_tls_refused_protocol: counters.ShardedCounter = .{};
 pub var cluster_wire_plaintext_refused: counters.ShardedCounter = .{};
 /// KeyUpdates this side sent (the record ceiling or a peer's request).
 pub var cluster_wire_tls_key_updates: counters.ShardedCounter = .{};
+/// Dials this side abandoned at the TLS handshake (the peer's CA is not
+/// ours, our leaf is not under its CA, a plaintext listener answered).
+pub var cluster_wire_tls_dial_refused: counters.ShardedCounter = .{};
 
 comptime {
     std.debug.assert(cluster_wire_refusals_by_class.len == @typeInfo(frame.RefusalClass).@"enum".field_names.len);

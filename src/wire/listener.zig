@@ -39,6 +39,7 @@ const session = @import("session.zig");
 const service = @import("service.zig");
 const endpoint = @import("endpoint.zig");
 const stats = @import("stats.zig");
+const tls = @import("tls.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("wire/listener is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -116,17 +117,30 @@ pub const Options = struct {
     raw_cpus: u32,
     /// The `RLIMIT_NOFILE` in force (`raiseNofile()`).
     nofile: u64,
+    /// The channel class; null = the process posture (`tls.posture()`,
+    /// installed at bring-up). A set configured `mutual_tls` refuses a
+    /// Plaintext peer loud at the handshake and counts it.
+    posture: ?tls.Posture = null,
 };
 
 pub const StartError = error{ BindOff, OutOfMemory, ThreadSpawnFailed } || net.IpAddress.ListenError || endpoint.ParseError;
 
 const Conn = struct {
     listener: *Listener,
+    /// The raw socket (the stop nudge's and the sever's target).
     link: session.TcpLink,
+    /// The TLS record layer over it under `mutual_tls`.
+    tls_conn: ?*tls.Conn = null,
     sess: session.Session,
     id: u64,
     slot: usize,
     peer: ?verbs.WireIdentity = null,
+
+    /// The byte stream the session reads and writes.
+    fn stream(self: *Conn) session.Link {
+        if (self.tls_conn) |c| return c.link();
+        return self.link.link();
+    }
 };
 
 pub const Listener = struct {
@@ -137,6 +151,7 @@ pub const Listener = struct {
     server: net.Server,
     advertised: endpoint.EndpointWire,
     max_conns: u32,
+    posture: tls.Posture,
     /// Live connections — the futex word `stop` waits on.
     live: futex.Word = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
@@ -188,9 +203,10 @@ pub const Listener = struct {
             .off => unreachable,
         };
         adv.port = bound_port;
-        self.* = .{ .gpa = gpa, .io = io, .svc = svc, .gate = gate, .server = server, .advertised = adv, .max_conns = resolved.value, .conns = conns };
+        const posture = opts.posture orelse tls.posture();
+        self.* = .{ .gpa = gpa, .io = io, .svc = svc, .gate = gate, .server = server, .advertised = adv, .max_conns = resolved.value, .posture = posture, .conns = conns };
         self.accept_thread = std.Thread.spawn(.{}, acceptMain, .{self}) catch return error.ThreadSpawnFailed;
-        log.info("cluster wire: listening at {f} (cap {d} connections)", .{ adv, resolved.value });
+        log.info("cluster wire: listening at {f} (cap {d} connections, channel {t})", .{ adv, resolved.value, posture.channel() });
         return self;
     }
 
@@ -294,19 +310,15 @@ pub const Listener = struct {
                 self.retire();
                 continue;
             };
+            // The session (and under `mutual_tls` the record layer) is set
+            // up on the connection's own thread: the TLS handshake is that
+            // thread's first act, never the accept thread's.
             conn.* = .{ .listener = self, .link = .{ .io = self.io, .stream = stream }, .sess = undefined, .id = self.next_id.fetchAdd(1, .monotonic), .slot = slot };
-            conn.sess = session.Session.init(self.gpa, conn.link.link(), .coordinator, conn.id) catch {
-                stream.close(self.io);
-                self.gpa.destroy(conn);
-                self.retire();
-                continue;
-            };
             self.lockConns();
             self.conns[slot] = conn;
             self.unlockConns();
             const t = std.Thread.spawn(.{}, connMain, .{conn}) catch {
                 self.unregister(conn);
-                conn.sess.deinit();
                 stream.close(self.io);
                 self.gpa.destroy(conn);
                 self.retire();
@@ -321,21 +333,47 @@ fn nowMs() u64 {
     return clock.monotonicNs() / std.time.ns_per_ms;
 }
 
-/// The connection thread: the ladder under the handshake deadline, then
-/// the request loop until EOF, an idle timeout, a framing failure or the
-/// listener's stop nudge.
+/// The connection thread: under `mutual_tls` the TLS handshake first (a
+/// refusal is counted by class and logged loud — a Plaintext peer, a
+/// foreign CA, an expired leaf — and the socket closes), then the ladder
+/// under the handshake deadline with the session key bound to the
+/// channel's exporter, then the request loop until EOF, an idle timeout, a
+/// framing failure or the listener's stop nudge.
 fn connMain(conn: *Conn) void {
     var name_buf: thread_name.CommBuf = undefined;
     _ = thread_name.nameCurrentThread(&name_buf, CONN_THREAD_NAME);
     const l = conn.listener;
     defer {
         l.unregister(conn);
-        conn.link.link().close();
-        conn.sess.deinit();
+        if (conn.tls_conn) |c| {
+            c.link().close();
+            c.destroy(l.gpa);
+        } else conn.link.link().close();
         l.gpa.destroy(conn);
         l.retire();
     }
-    if (!handshake(conn)) return;
+    var binding: [tls.BINDING_BYTES]u8 = undefined;
+    var binding_len: usize = 0;
+    switch (l.posture) {
+        .plaintext => {},
+        .mutual_tls => |identity| {
+            conn.tls_conn = tls.serverHandshake(l.gpa, conn.link.link(), identity, l.io, .{}) catch |e| {
+                tls.countRefusal(e);
+                stats.cluster_wire_admissions_refused.inc();
+                log.warn("cluster wire: connection {d} refused at the TLS handshake: {s}", .{ conn.id, tls.refusalText(e) });
+                // The silent peer is a Plaintext dialer parked on the
+                // Challenge: answer it in ITS framing so its log names
+                // the class instead of a bare dial timeout.
+                if (e == error.PeerSilent) refusePlaintextPeer(conn);
+                return;
+            };
+            binding = conn.tls_conn.?.binding();
+            binding_len = binding.len;
+        },
+    }
+    conn.sess = session.Session.init(l.gpa, conn.stream(), .coordinator, conn.id) catch return;
+    defer conn.sess.deinit();
+    if (!handshake(conn, binding[0..binding_len])) return;
     defer if (l.departure.load(.acquire)) |d| d.call(d.ctx, conn.id);
     while (!l.stopping.load(.acquire)) {
         const in = conn.sess.recvFrame(session.SESSION_IDLE_TIMEOUT_MS) catch |e| {
@@ -352,20 +390,42 @@ fn connMain(conn: *Conn) void {
     }
 }
 
-/// Steps 1–5 on the coordinator's side; false ⇒ the connection closes.
-fn handshake(conn: *Conn) bool {
+/// A plaintext `Refused` handshake frame straight onto the raw socket (no
+/// session: the peer never got a Challenge and never will).
+fn refusePlaintextPeer(conn: *Conn) void {
+    const text = "this channel is MutualTls (set SQUEEZEFS_WIRE_CHANNEL=mutual_tls and install the node's certificate)";
+    var buf: [frame.HEADER_LEN + frame.HANDSHAKE_CAP]u8 = undefined;
+    var b: codec.Builder = .init(buf[frame.HEADER_LEN..]);
+    codec.encodePayload(verbs.Refused, .{ .head = .{ .reason_len = text.len, .reserved = @splat(0) }, .bytes = text }, &b) catch return;
+    var framer: session.Framer = .init(.coordinator);
+    const n = framer.seal(framer.handshakeHeader(.refused), &buf, b.pos) catch return;
+    conn.link.link().writeAll(buf[0..n]) catch {};
+}
+
+/// Steps 1–5 on the coordinator's side (`binding` = the channel's
+/// exporter under `mutual_tls`, empty on plaintext); false ⇒ the
+/// connection closes. A plaintext peer's first bytes at a `mutual_tls`
+/// listener never reach here (the record layer refused them); a TLS
+/// peer's at a plaintext listener fail the frame header's magic screen.
+fn handshake(conn: *Conn, binding: []const u8) bool {
     const l = conn.listener;
     const ch = l.gate.challenge(l.io, nowMs()) catch return false;
     stats.cluster_wire_outstanding_challenges.set(l.gate.nonces.liveCount());
     conn.sess.sendHandshake(verbs.Challenge, .challenge, ch) catch return false;
-    const in = conn.sess.recvFrame(session.DIAL_TIMEOUT_MS) catch return false;
+    const in = conn.sess.recvFrame(session.DIAL_TIMEOUT_MS) catch |e| {
+        if (e == error.HeaderRefused and l.posture == .plaintext) {
+            stats.cluster_wire_admissions_refused.inc();
+            log.warn("cluster wire: connection {d} refused: not a plaintext frame (a MutualTls peer at a plaintext channel?)", .{conn.id});
+        }
+        return false;
+    };
     if (in.header.verb != @backingInt(verbs.Verb.prove)) return false;
     const prove = codec.decodePayload(verbs.Prove, in.payload) catch return false;
-    switch (l.gate.verify(prove, "", nowMs())) {
+    switch (l.gate.verify(prove, binding, nowMs())) {
         .admitted => |adm| {
             stats.cluster_wire_outstanding_challenges.set(l.gate.nonces.liveCount());
             conn.sess.sendHandshake(verbs.Admitted, .admitted, .{ .schema = verbs.CLUSTER_WIRE_SCHEMA, .reserved = 0 }) catch return false;
-            conn.sess.framer.admit(adm.session_key);
+            conn.sess.framer.admitOn(adm.session_key, l.posture.channel());
             conn.peer = adm.member();
             stats.cluster_wire_sessions_admitted.inc();
             return true;

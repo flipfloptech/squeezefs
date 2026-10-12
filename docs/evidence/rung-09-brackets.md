@@ -588,6 +588,49 @@ conveyor window as a 4 KiB-aligned run. At the box's 727 k IOPS bar that is
 ≈ 2.2 GB/s into the metadata namespace — a term the bar's substrate (five
 memory-backed targets) must carry and the record now shows per namespace.
 
+*Resolution* (the owner's ruling: a measured amplification is a product
+defect; decision 0003 §L, 0002 rows 478–479; the suites note's defect 26).
+The 2.2 GB/s extrapolation was wrong in its own terms — the conveyor has
+no timer, so a window carries `λ × pass latency` entries (34 µs: 1.46 at
+12 k IOPS, 25 at 727 k, where the page fills by itself) and the journal
+could never issue more than `1/L_p ≈ 29 k` pages/s — but the ratio was
+real: 0.71 × user bytes of pad at the venue's rates, 1.51 GB of pad on
+generic/074. The fix is **the pacing law**: a pad-majority window (its pad
+> its entries) waits until the flight is empty — the pass parks on the
+landing notify, per landing, bounded by the round trip's RFC 6298
+predictor — then re-drains and issues; a lone committer never waits; an
+entry-majority window pipelines; and **the worth gate** holds only while
+the measured gain (entries the re-drain collected per hold) pays — opens
+at ½ an entry on a probe burst's mean, closes at ¼. The ledger: the
+journal's exact sum `device ≡ entries + pad + headers + holes`, the META
+device's two write arms (`journal_lane_write_bytes + meta_io_write_bytes`,
+×1.0000 against the META namespace's diskstats on every leg), the window
+classes and hold outcomes; two verdicts on every write row
+(`meta_pad_fraction_bound`, `meta_device_div_user`); the table's new
+column `meta pad fraction / journal B/op / entries per window`.
+
+A/B (A = `f27c501`, B = `855589c` — the metapad branch before its rebase onto `dev`, `c2a6cbe` after, the same tree for every file the law touches; nvmet-loop, 4 × 60 s legs A B B A,
+2026-10-12 00:02–00:46 UTC on the rebooted venue, `loadavg` 1.6–4.9;
+records `bench/brackets/<venue>/{rand-4k-write,frag-512b-write,fsync-4k,
+creates-mdtest}-20261012T00*.json`):
+
+| row | A legs 1/4 | B legs 2/3 | A/B (spread) | META ÷ user A → B | entries per window | p50 / p99 (A → B) | gate |
+|---|---|---|---|---|---|---|---|
+| `rand-4k-write` (QD32 × 4) | 11 982 / 11 989 IOPS | 12 088 / 11 943 | 0.997 (1.2 %) | 0.712 → **0.475** | 1.46 → 2.24 (1 824 B/op) | 8 290 → 8 290 µs / 25.0 → 24.8 ms | open 88 % of the windows (258 k holds, mean 97 µs, 1 100 deadline-ended); pacing 286 k ≤ 368 k |
+| `frag-512b-write` (QD1 × 4, 512 B buffered) | 9 026 / 8 735 | 8 726 / 8 944 | 1.005 (3.4 %) | 5.24–5.30 → 5.35–5.40 | 1.46 → 1.55 | 247–253 → 249–253 µs / 2.0–2.1 ms both | off (5 % probed in bursts, gain 0–0.25) |
+| `fsync-4k` (QD1 × 4, fsync per write) | 6 259 / 6 089 fsyncs/s | 6 285 / 6 319 | 0.980 (3.7 %) | 0.960 → 0.960 | 1.07 | fsync mean 339/348 → 337/335 µs, p99 618/651 → 610/602 µs; `data_barrier` 147/150 → 145/144, `meta_barrier` 124/128 → 124/124 | off (2 % probed, gain 0–0.13) |
+| `creates-mdtest` (4 tasks) | 12 283 / 9 389 creates/s | 12 754 / 12 235 | 0.867 (28.8 %) | 4 884 / 4 973 → 4 753 / 4 748 B/create | 1.73 / 1.69 | — | mostly off (12 % held in bursts, gain 0.1–0.4) |
+
+Every leg VALID: 0 tick rescues (`meta_conveyor_park_tick_rescues` 0 — the
+hold wakes on the landing, never the tick), 0 tripwires, the admission and
+META ledgers closing to ×1.0000. The pad fraction itself barely moves
+(0.966 → 0.953 on `rand-4k-write`): with 76 B entries the page is 97.6 %
+pad at one entry and 94.6 % at two — the bytes per op halve while the
+fraction hardly reads it; `entries per window` and `B/op` are the
+instruments. The floor the law cannot cross on the 512 B shape (the entry
+and the bset appends ≈ 180 B/op) and the grain lever (512 B LBAs on the
+metadata namespaces) are in §L.4.
+
 F15. `read_dest_lease_bytes` is the dest-lease mechanism's gauge over the
 same bytes `read_dest_dma_bytes` lands (1:1 on the shim read row); summing
 both reads the copy ledger at ×2.0. Reported beside, not summed (the shim's

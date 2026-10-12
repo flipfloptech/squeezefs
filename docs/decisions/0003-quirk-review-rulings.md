@@ -288,3 +288,139 @@ pinned on direct-leg rows where every subset is 0). The ahead lane's fills are t
 them — it had been declared and printed but never incremented). `fuse_readdir_entries` is the
 dirent denominator. The transport's direct device leg counts its DMA (`transport_zc_direct_leg_dma_
 bytes`, validated or withdrawn) apart from its serves.
+
+## L. The journal's pad economy (2026-10-11, the owner's write-amplification ruling; `docs/evidence/rung-09-brackets.md` F14, `rung-09-external-suites.md` defect 26)
+
+The measured defect: on fstests generic/074's shape (3 writers, 512 B fragmented writes, 4.61 M
+journal entries) the metadata device took **1.51 GB of PAD for 2.36 GB of user bytes** — 77 % of
+its write bytes pad, ≈ 430 B per op; the brackets' `rand-4k-write` on nvmet-loop landed **0.71 ×
+the user bytes on the META namespace** (1.46 entries per 4 KiB window, F14). The pad is the
+sector-pad law's price (charter §5.1: every reservation ends aligned behind a PAD entry) paid once
+per conveyor window; the conveyor has no timer, so a window carries what arrived during the previous
+pass's own latency. Symbols: `s` the entry (24 B header + Σ(1 + 16 + key + value); the 512 B-write
+shape's Δ(size, mtime, ctime) inode record is **76 B**, a W1 patch's Δ(mtime, ctime) 68 B, a create
+≈ 200 B), `g` the device grain (4096: the O_DIRECT page posture; `g_d = g − 24` data bytes per
+page), `λ` the entries' arrival rate, `L_p` the pass latency (drain → handoff; measured 34 µs), `R`
+the window round trip (handoff → terminal outcome; 180–300 µs on nvmet-loop under the 4 KiB rows,
+70–95 µs under the QD1 rows), `n` the entries per window.
+
+### L.1 The cost of a window
+
+A window of `n` entries occupies `⌈(n·s + PAD_MIN)/g_d⌉` pages and lands as that many grains:
+`device = pages × g`, of which `n·s` are entries, `24 × pages` page headers and the rest PAD
+(`conveyor.windowCost`, tie-tested). For a sub-page window `device = g` whatever it carries:
+
+    bytes per op = g / n            pad fraction = 1 − n·s / (pages × g)
+
+A 76 B entry alone is 97.6 % pad; 27 of them stop being pad-majority (`pad > entries` — the hold's
+predicate); 53 fill the page; 54 spill into a second, nearly whole pad. The exact-sum identity makes
+every term measurable: `meta_kv_journal_device_bytes ≡ meta_kv_journal_bytes + _pad_bytes +
+_header_bytes + _hole_bytes` (`journal.WriteAccounting.closes`, asserted at the ONE accounting
+site; the harness restates it per leg), and the META device's bytes are the sum of its two write
+arms, `journal_lane_write_bytes + meta_io_write_bytes ≡ the META namespace's diskstats` (measured
+×1.0000 on every nvmet-loop leg).
+
+### L.2 The window population, before: `n = λ·L_p`
+
+With no timer the pass drains whatever the last pass's latency brought: `n = max(1, λ·L_p)`, so
+`bytes/op = g / (λ·L_p)` until `λ·L_p ≥ g_d/s` — for the 76 B entry at `L_p = 34 µs` that is
+λ ≥ 1.6 M entries/s, past the 727 k IOPS bar. Measured: `n̄ = 1.46` at 12.4 k IOPS (λ·L_p = 0.42:
+every window is one page), `n̄ ≈ 12` on generic/074 (the page cache's writeback bursts, not the
+rate). The journal could issue up to `1/L_p ≈ 29 k` windows per second — 120 MB/s of pad-majority
+pages on a device whose own round trip is 7× the pass.
+
+### L.3 What the bound SHOULD be — the pacing law, its gate and its budget
+
+The pad is the price of a window; a window is worth issuing when the device would otherwise be
+idle (pad on an idle device costs nothing the workload can feel) and not when it would queue behind
+the journal's own previous windows. So:
+
+**A pad-majority window waits until the flight is empty.** The pass that drained a pad-majority
+batch (`pad(head + Σ) > Σ`) parks on the landing notify, per landing, until every window issued
+before it reached its terminal outcome — bounded by the round trip's predictor from the hold's
+start — then re-drains what arrived meanwhile into the SAME window and issues it
+(`conveyor.holdForFill`). Consequences, each a law:
+
+1. **Pad-majority windows under the law number at most one per device round trip**: `windows_held +
+   windows_unshadowed − holds_not_worth ≤ span / R + deadline-ended holds + 1` (the harness verdict
+   `meta_pad_fraction_bound`, `bench.Row.withinMetaPacingBound`). The journal's pad-majority device
+   traffic is bounded by `g / R` bytes per second whatever `λ` — 14–22 MB/s on nvmet-loop — and its
+   device utilization by one window per round trip: the journal can never saturate its device with
+   pad.
+2. **Each paced window carries `n ≥ λ·(R + L_p)` entries**, so `bytes/op ≤ windowCost(n, s)/n`
+   (`conveyor.bytesPerOpBound`); an entry-majority window pipelines as before (its device write is
+   majority payload — the batching has nothing left to recover) and costs under `2s` per entry.
+3. **The latency budget: a commit's latency at most doubles, and a lone committer never waits.**
+   A held committer waits for one round trip — the latency the device would have charged its own
+   write; nothing in flight ⇒ nothing to shadow ⇒ no hold (QD1 shapes: `tar -x`, a single `fsync`
+   job, one mdtest task pay nothing). The deadline that bounds the park is the round trip's own
+   predictor, RFC 6298's `srtt + 4·rttvar` (gains 1/8 and 1/4, K = 4: TCP's ruling on where a
+   round trip stops being a round trip and starts being a stall; no clamp below — a sub-µs device
+   holds sub-µs), capped at the coalesced flush interval (a hold past the barrier cadence would carry
+   a window across the barrier due to cover it). The fsync phase ledger (F16: `data_barrier` 824 µs
+   + `meta_barrier` 517 µs on nvmet-loop; 152–194 µs + 132–176 µs on the quiet reboot) is the
+   ruler: a durable op already pays two barriers; the hold spends at most one write round trip,
+   under one barrier, and only when another committer's window is in flight — strict mode
+   (`META_FLUSH_INTERVAL_MS=0`) holds nothing: a per-commit-barrier committer declared latency over
+   bytes.
+4. **The worth gate: a hold is paid only while it pays.** A hold saves one grain iff it collects at
+   least one entry that would otherwise have been its own window, so the gate is the MEASURED gain
+   — the smoothed count of entries the re-drain collected per hold (`srtt` of `holdWorthIt`, 1024
+   fixed point) — not the arrival rate: in a closed loop the committer the hold delays arrives later,
+   and the rate the hold needs is the rate it suppresses. Measured ungated on the venue, `fsync-4k`
+   (4 QD1 jobs, 5 k commits/s against an 80 µs round trip) held 30 % of its windows for 48–55 µs,
+   collected 0.09 per hold and lost 12 % of its fsyncs/s; `frag-512b-write` (4 QD1 jobs) collected
+   0.35, wrote 8 % MORE META bytes (the hold broke the jobs' natural coincidence) at −11 % IOPS;
+   `rand-4k-write` (QD32 × 4) collected 1.3 and took the META bytes from 0.70 to 0.46 × user. The
+   gate starts OFF (never pay without evidence) and PROBES one eligible window in `HOLD_PROBE_PERIOD
+   = 2/α = 16` (twice the estimator's memory: the gain it carries is at most two memories stale, at
+   a cost of one hold in sixteen); a probe waits for the whole flight, not the first landing — in the
+   unpaced regime several windows are in flight and the first landing comes in a fraction of a round
+   trip (a first-landing probe measured 0.77–0.9 of the gain `rand-4k-write` pays 2.3 for, and kept
+   the gate off).
+5. **Liveness** is the landing's wake, never a tick: the pass registers on the notify BEFORE it
+   re-reads the in-flight count, on every iteration (`sync/notify.zig`'s register-then-check law);
+   conveyor model 8 (`HoldPark`, one and two windows in flight) proves the reversed order parks the
+   pass on an empty flight (`hold_check_before_register` fails `InvariantViolated` in both), and
+   `meta_conveyor_park_tick_rescues` stays 0. The hold is a parked timer on the pass fiber (the
+   lane's own heap), never a sleep.
+
+### L.4 The bound at each shape (nvmet-loop, `g = 4096`; the A/B rows in `rung-09-brackets.md` F14)
+
+| shape | `s` | `λ` | `R` | `λ·R` | the law | before | after |
+|---|---|---|---|---|---|---|---|
+| `rand-4k-write` (W1 patch, QD32 × 4) | 76 | 9.5–11 k/s | 180–300 µs | 1.9–3 | gate ON: `n ≥ 2.3` ⇒ ≤ 1,760 B/op | 0.70–0.71 × user (n̄ 1.46) | **0.475 × user** (n̄ 2.24, 1,824 B/op), IOPS 11,982/11,989 → 12,088/11,943 (A/B 0.997, spread 1.2 %), p50 8,290 → 8,290 µs, p99 25.0 → 24.8 ms; the gate open 88 % of the windows (gain 0.7–0.9 per hold at the band) |
+| `frag-512b-write` (generic/074's 512 B at a 1 KiB stride, 4 QD1 jobs) | 76 | 8.4 k/s | 76–95 µs | 0.65–0.8 | gate OFF (0.35 collected per probe): unchanged by design — the floor below | 5.4–5.8 × user (2,800 B/op; n̄ 1.46) | 5.35–5.40 × user (gate off: 5 % of the windows probed, gain 0–0.25), IOPS 9,026/8,735 → 8,726/8,944 (A/B 1.005), p50 247–253 µs both |
+| `creates-mdtest` (4 tasks, QD1 each) | ≈ 200 | 9–13 k/s | 66–110 µs | 0.8–1.2 | borderline: the gate decides on the measured gain | ≈ 5.1 KB/create (half of it node images and appends) | 4,753/4,748 B/create (gate mostly off: 12 % held in bursts, gain 0.1–0.4; 1.7 entries/window), creates/s 12,283/9,389 → 12,754/12,235 (A/B 0.867 inside the row's 29 % spread) |
+| `fsync-4k` (4 jobs, QD1 each, fsync per write) | 76 + layout | 5–6 k/s | 80 µs | 0.4 | gate OFF (0.09): no hold | 0.96 × user, fsync p50 281–322 µs | 0.960 → 0.960 × user (gate off: 2 % probed, gain 0–0.13), fsyncs/s 6,259/6,089 → 6,285/6,319 (A/B 0.980), fsync mean 339/348 → 337/335 µs, p99 618/651 → 610/602 µs; `data_barrier` 147/150 → 145/144, `meta_barrier` 124/128 → 124/124 |
+| `tar -x` (one thread) | ≈ 200 | 1–1.2 k entries/s | — | — | nothing in flight when the next arrives: no hold | 5.21 entries/tar entry | unchanged by construction |
+| the 727 k IOPS bar (box) | 76 | 727 k/s | ≈ 100 µs | 73 | entry-majority: pipelined, `2s` = 152 B/op | — | the law never engages: `λ·L_p` already fills pages |
+
+The floor the law cannot cross: a 76 B entry is 1.9 % of a 4 KiB page, and the 512 B shape also
+lands ≈ 100 B/op of bset appends (the inode Δ records flushed from the leaves), so that shape's
+metadata cost is ≥ ≈ 180 B/op (0.35 × user) at any pacing — the entry and the bset, not the pad —
+and at its QD1 × 4 rate the hold collects nothing. The remaining lever is the grain: on a 512 B-LBA
+metadata namespace the pad per window is ≤ 536 B and a lone 76 B entry costs 512 B, not 4,096 — the
+box's metadata namespaces should be formatted at 512 B LBAs (nvmet's file backend defaults to 4 KiB,
+`blksize_shift` 12, the venue's number).
+
+### L.5 Rejected
+
+- **Tail-page rewrite** (the next window rewrites the previous window's last partial page with the
+  same prefix plus new entries): saves ring CAPACITY (the pad no longer occupies the ring), not
+  device bytes — every window is still one grain-aligned device write, and the measured defect is
+  device bytes per op. It would also make a landed page mutable (a torn rewrite loses an ACKED
+  entry's bytes unless the rewrite is atomic at the grain — the one honest RMW the ring allows today
+  is the recovery pad at open). Not built.
+- **Entry economy** (shrinking the 76 B Δ): the pad is `g − n·s`; at `n = 1.46` shrinking `s` by
+  20 B saves 29 B of a 4 KiB write. Irrelevant to this defect (relevant at the box's rates, where
+  `2s` per op is the bound).
+- **A fixed or rate-derived hold longer than one round trip** (`H = (g − Σ)/(s·λ̂)` would be 2–5 ms
+  at the venue's rates): it buys `n ∝ H` but costs every committer `H` — a QD1 loop's throughput
+  falls by `H/R_op` (mdtest −25 % at 1 ms) and the owner's ruling is performance first. The round
+  trip is the one budget the committer already pays; a longer hold is a measurement lever for the box
+  (not built: the knob would be a free-floating constant).
+- **An arrival-rate gate** (`mean inter-arrival ≤ srtt`, one companion expected): built, measured,
+  replaced — it flip-flopped on the borderline shapes (`frag-512b-write` λ·R ≈ 0.9: half the windows
+  held, 1.35 collected, +8 % META bytes, −11 % IOPS) because a closed loop's rate is not independent
+  of the hold.

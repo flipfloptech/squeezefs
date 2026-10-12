@@ -110,6 +110,8 @@ const transform = @import("transform.zig");
 const rekey = @import("../ops/defrag/rekey.zig");
 const set_config = @import("set_config.zig");
 const data_superblock = @import("data_superblock.zig");
+const verbs = @import("../wire/verbs.zig");
+const record_ship = @import("../meta/sym/xv/record_ship.zig");
 const seams = @import("write_seams.zig");
 const write_admit = @import("write_admit.zig");
 const write_side_view = @import("write_side_view.zig");
@@ -229,6 +231,15 @@ pub const stats = struct {
     pub var pack_read_dma_bytes: counters.ShardedCounter = .{};
     /// A device read on a volume tag no mounted volume carries (must stay 0).
     pub var unresolved_volume: counters.Tripwire = .init("data_unresolved_volume");
+    /// A foreign-slot file's block-map merge SHIPPED to its holder as one
+    /// layout publish (charter §5.5), and the kvmap shapes refused on a
+    /// foreign file (a tree-mapped head / a crossing: the records are the
+    /// holder's slot tree's — write a PB-class file from its holder).
+    pub var layout_map_merges_shipped: counters.ShardedCounter = .{};
+    pub var foreign_publish_kvmap_refusals: counters.ShardedCounter = .{};
+    /// Shipped publishes served here: the record and its refs staged
+    /// through the plane's face.
+    pub var layout_publishes_served: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
@@ -236,7 +247,7 @@ pub fn writeStatsJson(w: *Io.Writer) Io.Writer.Error!void {
     inline for (.{ "data_volumes", "data_staging_on", "data_nvme_tier_on", "block_refs_drift_rows" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
-    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
+    inline for (.{ "layout_map_merges", "layout_map_merge_blocks", "layout_map_merge_failures", "layout_map_merges_shipped", "foreign_publish_kvmap_refusals", "layout_publishes_served", "kvmap_sweep_spawn_refusals", "promotions_run", "promotions_stale", "promotions_failed", "own_block_dmas", "own_block_dma_bytes", "held_stores", "held_store_failures", "hold_gate_admits", "hold_gate_declines", "prefetch_fibers", "prefetch_fiber_refusals", "hold_ceremony_fibers", "bindings_freed", "device_read_bounces", "data_device_read_bytes", "write_side_read_dma_bytes", "compose_read_dma_bytes", "pack_read_dma_bytes" }) |name| {
         try w.print("\"{s}\":{d},", .{ name, @field(stats, name).load() });
     }
     try w.print("\"data_unresolved_volume\":{d},\"kvmap_resolve_failures\":{d},\"kvmap_head_put_unlocked\":{d}}}", .{ counters.tripwireCount("data_unresolved_volume"), counters.tripwireCount("kvmap_resolve_failures"), counters.tripwireCount("kvmap_head_put_unlocked") });
@@ -414,6 +425,10 @@ pub const DataPlane = struct {
     /// The token divert's layout face (bound by the daemon once the wire
     /// plane is up; null = a flat mount: every slot local).
     foreign_layout: ?ForeignLayout = null,
+    /// The foreign-slot layout PUBLISH's ship (charter §5.5 "Record-level
+    /// mutations of a foreign-slot file — the layout publish"): bound with
+    /// the layout face; null = a merge on a foreign record is refused.
+    foreign_publish: ?ForeignPublish = null,
     /// `dismount` ran (once; `close` runs it if nobody did).
     dismounted: bool = false,
 
@@ -438,6 +453,40 @@ pub const DataPlane = struct {
     /// through it when bound.
     pub fn bindForeignLayout(self: *DataPlane, f: ?ForeignLayout) void {
         self.foreign_layout = f;
+    }
+
+    /// A foreign-slot file's layout publish shipped to its holder as ONE
+    /// record verb: the encoded layout record and the writer's DMA proofs
+    /// behind every block it newly names.
+    pub const ForeignPublish = struct {
+        ctx: *anyopaque,
+        ship: *const fn (ctx: *anyopaque, ino: u64, value: []const u8, proofs: []const verbs.DmaProofWire) errors.Error!void,
+    };
+
+    pub fn bindForeignPublish(self: *DataPlane, f: ?ForeignPublish) void {
+        self.foreign_publish = f;
+    }
+
+    /// The HOLDER's side of a shipped publish (`record_ship.PublishFace`):
+    /// the layout record staged through `publishLayout` with its `±ref`
+    /// diff against the record in place — the writer's proofs re-minted
+    /// from the wire words, so a block without its DMA witness refuses.
+    pub fn servedPublishFace(self: *DataPlane) record_ship.PublishFace {
+        return .{ .ctx = self, .stage = &servedPublishStage };
+    }
+
+    fn servedPublishStage(ctx: *anyopaque, t: *tx_mod.KvTx, key_ino: u64, coll_seq: u8, prev_bytes: ?[]const u8, value: []const u8, proofs: []align(1) const verbs.DmaProofWire) record_ship.PublishFace.PublishError!void {
+        const self: *DataPlane = @ptrCast(@alignCast(ctx));
+        const prev: ?layout.Layout = if (prev_bytes) |pb| (layout.XattrLayout.decode(pb, self.geo) catch return error.Rejected) else null;
+        const new = layout.Layout.decode(value, self.geo) catch return error.Rejected;
+        var pbuf: [verbs.PUBLISH_PROOFS_MAX]layout.DmaProof = undefined;
+        for (proofs, 0..) |w, i| pbuf[i] = .{ .vol_tag = w.vol_tag, .offset = w.offset, .len = w.len, .completed_ns = w.completed_ns };
+        layout.publishLayout(t, .{ .ino = key_ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = pbuf[0..proofs.len] }, self.refsSeam(), self.geo) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ProofMissing => error.ProofMissing,
+            else => error.Rejected,
+        };
+        stats.layout_publishes_served.inc();
     }
 
     // ---- open / close ----
@@ -2102,6 +2151,17 @@ pub const DataPlane = struct {
         if (req.fencing != 1) return error.FencingTokenExpired;
         const lock = self.lockLayout(io, req.ino);
         defer lock.release(io);
+        // A FOREIGN-slot file (the record under its holder's token): the
+        // merge is computed here and the publish SHIPS to the holder.
+        var foreign = false;
+        if (self.foreign_layout) |f| switch (f.lookup(f.ctx, gpa, req.ino) catch return error.Transient) {
+            .local => {},
+            .gone => return error.NotFound,
+            .foreign => |x| {
+                if (x.layout) |v| gpa.free(v);
+                foreign = true;
+            },
+        };
         const rec = (self.layoutRecord(req.ino) catch return error.Transient);
         defer if (rec) |r| gpa.free(r.value);
         var prev: ?layout.Layout = null;
@@ -2112,7 +2172,10 @@ pub const DataPlane = struct {
             // A binding for a file that is no longer striped belongs to a
             // dead generation (a truncate to zero re-classed it): discard.
             if (prev.?.kind != .striped) return error.NotFound;
-            if (prev.?.isKvmap()) return self.kvmapMerge(req, prev.?, coll_seq);
+            if (prev.?.isKvmap()) {
+                if (foreign) return self.refuseForeignKvmap(req.ino, "a tree-mapped head");
+                return self.kvmapMerge(req, prev.?, coll_seq);
+            }
         } else {
             // The inode must still exist: a destroyed ino takes no map.
             if ((self.inodeSize(req.ino) catch return error.Transient) == null) return error.NotFound;
@@ -2125,9 +2188,16 @@ pub const DataPlane = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.Corrupt => error.Transient,
         };
-        if (merged.items.len > self.inlineMapCap()) return self.crossing(req, prev.?, coll_seq, merged.items, &out);
+        if (merged.items.len > self.inlineMapCap()) {
+            if (foreign) return self.refuseForeignKvmap(req.ino, "the inline cap's crossing");
+            return self.crossing(req, prev.?, coll_seq, merged.items, &out);
+        }
         const size = @max(if (prev) |p| p.size else 0, req.min_size);
         const new = layout.Layout.stripedInline(size, merged.items);
+        if (foreign) {
+            try self.shipMerge(req, new);
+            return out;
+        }
         const t = self.backend.begin(@src()) catch return error.OutOfMemory;
         layout.publishLayout(t, .{ .ino = req.ino, .name_key = self.name_key, .coll_seq = coll_seq, .prev = prev, .layout = new, .proofs = req.proofs }, self.refsSeam(), self.geo) catch |e| {
             self.backend.abandon(t);
@@ -2156,6 +2226,61 @@ pub const DataPlane = struct {
         // never the inode's size the shared-mode classifier admits on.
         // The filesystem publishes the inode's size at its postlude.
         return out;
+    }
+
+    /// The foreign arm of `mapMerge`: the new layout record and the
+    /// window's proofs as ONE `record_ship` publish to the holder (which
+    /// stages the record and its `±ref` diff in ITS slot tree and recalls
+    /// the file's tokens — this writer's included).
+    fn shipMerge(self: *DataPlane, req: seams.MergeRequest, new: layout.Layout) seams.MergeError!void {
+        const gpa = self.gpa;
+        const f = self.foreign_publish orelse {
+            stats.layout_map_merge_failures.inc();
+            log.err("ino {d}: the block-map publish of {d} binding(s) names a slot another appender leases and no publish ship is bound", .{ req.ino, req.inserts.len });
+            return error.Transient;
+        };
+        if (req.proofs.len > verbs.PUBLISH_PROOFS_MAX) return error.Transient;
+        const value = new.encodeAlloc(gpa) catch return error.OutOfMemory;
+        defer gpa.free(value);
+        var proofs: [verbs.PUBLISH_PROOFS_MAX]verbs.DmaProofWire = undefined;
+        for (req.proofs, 0..) |p, i| proofs[i] = .{ .vol_tag = p.vol_tag, .offset = p.offset, .len = p.len, .completed_ns = p.completed_ns };
+        f.ship(f.ctx, route_table.globalOfEffective(req.ino), value, proofs[0..req.proofs.len]) catch |e| {
+            stats.layout_map_merge_failures.inc();
+            log.warn("ino {d}: the shipped block-map publish of {d} binding(s) did not land ({s}) — the upload keeps its custody and retries", .{ req.ino, req.inserts.len, @errorName(e) });
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Transient,
+            };
+        };
+        stats.layout_map_merges.inc();
+        stats.layout_map_merges_shipped.inc();
+        stats.layout_map_merge_blocks.add(req.inserts.len);
+    }
+
+    /// The filesystem's promotion of a FOREIGN-slot file (the inline /
+    /// staged / packed image on its own block, the striped layout naming
+    /// it): the same ship as a merge — the holder stages the record and
+    /// its `+ref`.
+    pub fn publishForeign(self: *DataPlane, _: Io, ino: u64, l: layout.Layout, proofs: []const layout.DmaProof) errors.Error!void {
+        const f = self.foreign_publish orelse return error.HolderUnreachable;
+        if (proofs.len > verbs.PUBLISH_PROOFS_MAX) return error.InvalidArgument;
+        const value = try l.encodeAlloc(self.gpa);
+        defer self.gpa.free(value);
+        var wire: [verbs.PUBLISH_PROOFS_MAX]verbs.DmaProofWire = undefined;
+        for (proofs, 0..) |p, i| wire[i] = .{ .vol_tag = p.vol_tag, .offset = p.offset, .len = p.len, .completed_ns = p.completed_ns };
+        try f.ship(f.ctx, route_table.globalOfEffective(ino), value, wire[0..proofs.len]);
+        stats.layout_map_merges_shipped.inc();
+    }
+
+    /// A tree-mapped shape on a FOREIGN file: refused, counted and named
+    /// — its records are the holder's slot tree's (the upload retries;
+    /// the file is written from its holder).
+    fn refuseForeignKvmap(self: *DataPlane, ino: u64, what: []const u8) seams.MergeError!seams.MergeOutcome {
+        _ = self;
+        stats.foreign_publish_kvmap_refusals.inc();
+        stats.layout_map_merge_failures.inc();
+        log.err("ino {d}: {s} on a file whose slot another appender leases is refused — a block-map tree is written from the file's holder", .{ ino, what });
+        return error.Transient;
     }
 
     // ---- the block-map tree: the crossing, the window merge, the sweep ----

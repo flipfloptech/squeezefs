@@ -45,6 +45,7 @@ const errors = @import("../../../core/errors.zig");
 const clock = @import("../../../core/clock.zig");
 const knobs = @import("../../../core/knobs.zig");
 const sync = @import("../../../sync/sync.zig");
+const service = @import("../../../wire/service.zig");
 const key = @import("../../key.zig");
 const record = @import("../../record.zig");
 const tree = @import("../../tree.zig");
@@ -66,8 +67,14 @@ pub const stats = struct {
     /// Striped directories this mount knows (gauge).
     pub var dir_striped_dirs: counters.Gauge = .{};
     pub var dir_stripe_flips: counters.ShardedCounter = .{};
-    /// Stripe inos supplied by other creators (one ask per mint).
+    /// `SupplyStripeInos` asks sent (one BATCH per creator per flip) and
+    /// the stripe records they brought back; the served side's count.
     pub var dir_stripe_supply_rpcs: counters.ShardedCounter = .{};
+    pub var dir_stripe_supplied: counters.ShardedCounter = .{};
+    pub var dir_stripe_supplies_served: counters.ShardedCounter = .{};
+    /// A creator that declined or could not be reached: its batch was
+    /// minted by the holder instead.
+    pub var dir_stripe_supply_declined: counters.ShardedCounter = .{};
     /// Creates into a striped directory keyed to a FOREIGN stripe.
     pub var dir_stripe_ships: counters.ShardedCounter = .{};
     pub var dir_stripe_readdir_merges: counters.ShardedCounter = .{};
@@ -326,7 +333,7 @@ pub fn windowEpoch(now_ns: u64, t_idle_ns: u64) u64 {
 /// Per-directory creator census over the half-window pair: O(1)
 /// increments, `distinct` and `total` folded over `cur` + `prev`.
 pub const DirCensus = struct {
-    const MAX_CREATORS = 8;
+    pub const MAX_CREATORS = 8;
     const Bucket = struct {
         epoch: u64 = 0,
         creators: [MAX_CREATORS]u32 = @splat(0),
@@ -416,6 +423,21 @@ pub const DirCensus = struct {
     }
 };
 
+/// `N_floor` as the census reads it: the handover judge's live derivation
+/// where a slot plane is armed ("the striping trigger reads its window"),
+/// else a fixed word (the harness's).
+pub const Floor = union(enum) {
+    fixed: u32,
+    live: struct { ctx: *anyopaque, read: *const fn (ctx: *anyopaque) u32 },
+
+    pub fn now(self: Floor) u32 {
+        return switch (self) {
+            .fixed => |f| f,
+            .live => |l| l.read(l.ctx),
+        };
+    }
+};
+
 /// The per-mount trigger state: a bounded census (least-recently-touched
 /// evicted at the cap) and the single-flight set.
 pub const Census = struct {
@@ -424,11 +446,10 @@ pub const Census = struct {
     dirs: std.AutoHashMapUnmanaged(u64, DirCensus) = .empty,
     in_flight: std.AutoHashMapUnmanaged(u64, void) = .empty,
     t_idle_ns: u64 = T_IDLE_NS,
-    /// The floor in force (the seam's word, else the derivation).
-    n_floor: u32,
+    floor: Floor,
 
-    pub fn init(gpa: Allocator, io: Io, n_floor: u32) Allocator.Error!Census {
-        var c: Census = .{ .io = io, .n_floor = n_floor };
+    pub fn init(gpa: Allocator, io: Io, floor: Floor) Allocator.Error!Census {
+        var c: Census = .{ .io = io, .floor = floor };
         try c.dirs.ensureTotalCapacity(gpa, CENSUS_DIRS_MAX + 1);
         try c.in_flight.ensureTotalCapacity(gpa, 64);
         return c;
@@ -453,7 +474,7 @@ pub const Census = struct {
         }
         const c = self.dirs.getPtr(dir).?;
         c.note(creator, now_ns, self.t_idle_ns);
-        if (!c.due(self.n_floor)) return null;
+        if (!c.due(self.floor.now())) return null;
         const out = c.heaviest(suppliers);
         self.in_flight.putAssumeCapacity(dir, {});
         return out;
@@ -704,12 +725,88 @@ pub fn verifyStripes(gpa: Allocator, views: []const DirView, hasRecord: *const f
 // The flip, the re-home, the rmdir — over a plane.
 // ---------------------------------------------------------------------------
 
-/// A creator asked to mint a stripe ino in ITS slot on `D`'s volume
-/// (`SupplyStripeIno`): null = declined or gone, replaced by the next.
-pub const Supplier = struct {
+/// A stripe's record: nameless, `S_IFDIR` with its directory's mode bits,
+/// owner and stamp, `INODE_FLAG_STRIPE` set (the durable "I am a stripe"
+/// every reader judges by — a stripe never carries a map, feeds no
+/// census and is never flipped).
+pub fn stripeRecord(attrs: ops.StripeAttrs) InodeValue {
+    return .{ .mode = S.IFDIR | (attrs.mode & 0o7777), .uid = attrs.uid, .gid = attrs.gid, .nlink = 2, .flags = record.INODE_FLAG_STRIPE, .atime = attrs.ts_ns, .mtime = attrs.ts_ns, .ctime = attrs.ts_ns };
+}
+
+pub fn isStripeRecord(v: InodeValue) bool {
+    return economy.isDirMode(v.mode) and v.flags & record.INODE_FLAG_STRIPE != 0;
+}
+
+/// The directory's words a stripe record is minted with.
+pub fn attrsOf(dv: InodeValue) ops.StripeAttrs {
+    return .{ .mode = dv.mode, .uid = dv.uid, .gid = dv.gid, .ts_ns = dv.mtime };
+}
+
+/// Write the stripe records of `inos` in ONE entry (the holder's
+/// remainder under the flip's guard set; a creator's supplied batch —
+/// brand-new inos nobody can reach need no guard of their own).
+pub fn writeStripeRecords(comptime Store: type, store: *Store, inos_: []const u64, attrs: ops.StripeAttrs) errors.Error!void {
+    const t = store.begin(@src()) catch return error.OutOfMemory;
+    var owned = true;
+    errdefer if (owned) store.abandon(t);
+    const v = stripeRecord(attrs).encode();
+    for (inos_) |ino| try t.stagePut(key.TREE_INODES, &key.inodeKey(route_table.effectiveIno(ino)), &v);
+    owned = false;
+    store.commit(t) catch |e| return Store.coreError(e);
+}
+
+/// Phase A's share: with `creators` suppliers each supplies `K /
+/// (creators + 1)` stripes and the holder keeps the rest — the load
+/// spreads over every writer of the directory from the flip (decision
+/// 0003 §Q.2).
+pub fn supplyShare(k: u8, creators: usize) u8 {
+    return @intCast(@as(usize, k) / (creators + 1));
+}
+
+/// The holder's own mint of a stripe ino in ITS slot on `dir`'s volume
+/// (the store's allocator behind the filesystem): null = no space.
+pub const Minter = struct {
     ctx: *anyopaque,
-    mint: *const fn (ctx: *anyopaque, creator: u32, dir: u64, index: u8) ?u64,
+    mint: *const fn (ctx: *anyopaque, dir: u64) ?u64,
 };
+
+/// `SupplyStripeInos` over a link: the creator's stripe inos for
+/// `indices` of `dir` (in order; fewer = the rest declined).
+pub fn supplyRemote(link: ops.Link, volume: u16, dir: u64, attrs: ops.StripeAttrs, indices: []const u8, out: []u64) errors.Error!usize {
+    assert(indices.len >= 1 and indices.len <= K_MAX and out.len >= indices.len);
+    const rep = try link.call(link.ctx, .{ .supply_stripe_inos = .{ .head = .{ .volume = volume, .n = @intCast(indices.len), .reserved = 0, .dir = dir, .mode = attrs.mode, .uid = attrs.uid, .gid = attrs.gid, .reserved2 = 0, .ts_ns = attrs.ts_ns }, .indices = indices } });
+    const items = rep.supply_stripe_inos.items;
+    const n = @min(items.len, indices.len);
+    for (items[0..n], 0..) |ino, i| out[i] = ino;
+    return n;
+}
+
+/// The served side of `SupplyStripeInos` (a creator's wire face): the
+/// records minted in THIS mount's slot on the directory's volume through
+/// the plane's striping face; a plane without the face declines (0).
+pub fn SupplyService(comptime Store: type) type {
+    return struct {
+        const Self = @This();
+        plane: *ops.Plane(Store),
+
+        pub fn register(self: *Self, svc: *service.Service) void {
+            svc.register(.supply_stripe_inos, .{ .ctx = self, .serve = &serve });
+        }
+
+        fn serve(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const r = req.payload.supply_stripe_inos;
+            if (r.head.volume != self.plane.volume) return service.Answer.rejected("supply_stripe_inos names a volume this node does not hold");
+            const face = self.plane.striping orelse return .{ .ok = .{ .supply_stripe_inos = .{ .head = .{ .n = 0, .reserved = @splat(0) }, .items = &.{} } } };
+            var minted: [K_MAX]u64 = undefined;
+            const n = face.supply(face.ctx, r.head.dir, .{ .mode = r.head.mode, .uid = r.head.uid, .gid = r.head.gid, .ts_ns = r.head.ts_ns }, r.indices, minted[0..r.indices.len]);
+            stats.dir_stripe_supplies_served.inc();
+            const out = std.mem.bytesAsSlice(u64, scratch[0 .. n * @sizeOf(u64)]);
+            for (minted[0..n], 0..) |ino, i| out[i] = ino;
+            return .{ .ok = .{ .supply_stripe_inos = .{ .head = .{ .n = @intCast(n), .reserved = @splat(0) }, .items = out } } };
+        }
+    };
+}
 
 pub fn Striping(comptime Store: type) type {
     return struct {
@@ -718,19 +815,24 @@ pub fn Striping(comptime Store: type) type {
 
         plane: *Plane,
         src: DirSource,
-        supplier: ?Supplier = null,
-        /// The holder's own mint (a `S_IFDIR` record in its rotor).
-        mintOwn: *const fn (ctx: *anyopaque, dir: u64, index: u8) ?u64,
-        mint_ctx: *anyopaque,
+        minter: Minter,
         census: Census,
         k: u8,
         /// The last fold persisted per directory (the cadence bound).
         persisted: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+        /// What a flip the census triggered hands back (the filesystem's
+        /// map cache, the migration's queue); null = the harness.
+        flipped: ?FlippedSink = null,
+
+        pub const FlippedSink = struct {
+            ctx: *anyopaque,
+            note: *const fn (ctx: *anyopaque, map: StripeMap) void,
+        };
 
         pub const Error = ops.Error || error{ NotADirectory, AlreadyStriped, IsAStripe, StripingOff, NotHolder, NotEmpty, Changed };
 
-        pub fn init(plane: *Plane, src: DirSource, mint_ctx: *anyopaque, mintOwn: *const fn (ctx: *anyopaque, dir: u64, index: u8) ?u64, k: u8, n_floor: u32) Allocator.Error!Self {
-            return .{ .plane = plane, .src = src, .mintOwn = mintOwn, .mint_ctx = mint_ctx, .census = try Census.init(plane.gpa, plane.io, n_floor), .k = k };
+        pub fn init(plane: *Plane, src: DirSource, minter: Minter, k: u8, floor: Floor) Allocator.Error!Self {
+            return .{ .plane = plane, .src = src, .minter = minter, .census = try Census.init(plane.gpa, plane.io, floor), .k = k };
         }
 
         pub fn deinit(self: *Self) void {
@@ -749,7 +851,8 @@ pub fn Striping(comptime Store: type) type {
             var suppliers: [DirCensus.MAX_CREATORS * 2]u32 = undefined;
             const sup = self.census.noteServedInsert(parent, creator, clock.monotonicNs(), &suppliers) orelse return;
             defer self.census.flipDone(parent);
-            _ = self.flip(parent, self.k, sup) catch {};
+            const map = self.flip(parent, self.k, sup) catch return;
+            if (self.flipped) |f| f.note(f.ctx, map);
         }
 
         /// The flip, on the HOLDER of `D`: refuse off / not a directory /
@@ -762,24 +865,42 @@ pub fn Striping(comptime Store: type) type {
             const arena = arena_state.allocator();
             const dv = (self.plane.apply.readInode(dir) catch return error.Io) orelse return error.Corrupt;
             if (!economy.isDirMode(dv.mode)) return error.NotADirectory;
+            if (isStripeRecord(dv)) return error.IsAStripe;
             if ((readMap(self.src, arena, dir) catch return error.Io) != null) return error.AlreadyStriped;
-            // Phase A: the supplied stripes (heaviest creators first).
+            const attrs = attrsOf(dv);
+            // Phase A: the supplied stripes — one BATCH per creator
+            // (heaviest first), each its share of the indices; a creator
+            // that declines or is unreachable leaves its batch to the
+            // holder.
             var stripes: [K_MAX]u64 = @splat(0);
-            var n: u8 = 0;
-            if (self.supplier) |sup| {
-                for (suppliers) |c| {
-                    if (n == k) break;
-                    if (c == self.plane.own_id) continue;
-                    stats.dir_stripe_supply_rpcs.inc();
-                    if (sup.mint(sup.ctx, c, dir, n)) |ino| {
-                        stripes[n] = ino;
-                        n += 1;
-                    }
-                }
+            var supplied: [K_MAX]bool = @splat(false);
+            var creators: usize = 0;
+            for (suppliers) |c| {
+                if (c != self.plane.own_id) creators += 1;
             }
+            const share = supplyShare(k, creators);
+            var next: u8 = 0;
+            if (share > 0) for (suppliers) |c| {
+                if (c == self.plane.own_id) continue;
+                if (next + share > k) break;
+                var indices: [K_MAX]u8 = undefined;
+                for (0..share) |i| indices[i] = next + @as(u8, @intCast(i));
+                stats.dir_stripe_supply_rpcs.inc();
+                const link = self.plane.resolver.linkOf(self.plane.resolver.ctx, c);
+                const got = if (link) |l| supplyRemote(l, self.plane.volume, dir, attrs, indices[0..share], stripes[next .. next + share]) catch 0 else 0;
+                if (got < share) stats.dir_stripe_supply_declined.inc();
+                stats.dir_stripe_supplied.add(got);
+                for (0..got) |i| supplied[next + i] = true;
+                next += share;
+            };
             // Phase B: the remainder's inos in the holder's slot.
-            const first_own = n;
-            while (n < k) : (n += 1) stripes[n] = self.mintOwn(self.mint_ctx, dir, n) orelse return error.NoSpace;
+            var own: [K_MAX]u64 = undefined;
+            var n_own: usize = 0;
+            for (0..k) |i| if (!supplied[i]) {
+                stripes[i] = self.minter.mint(self.minter.ctx, dir) orelse return error.NoSpace;
+                own[n_own] = stripes[i];
+                n_own += 1;
+            };
             // Phase C: the ONE guard set — I{D} + I{D_i} minted here + every
             // marker name — canonical, taken once.
             var names: [K_MAX][MARKER_NAME_LEN]u8 = undefined;
@@ -789,7 +910,7 @@ pub fn Striping(comptime Store: type) type {
             var nd: usize = 0;
             inodes[ni] = .{ .ino = dir, .mode = .exclusive };
             ni += 1;
-            for (stripes[first_own..k]) |s| {
+            for (own[0..n_own]) |s| {
                 inodes[ni] = .{ .ino = s, .mode = .exclusive };
                 ni += 1;
             }
@@ -803,10 +924,13 @@ pub fn Striping(comptime Store: type) type {
             nd += 1;
             var held = self.plane.locks.lockManyWide(self.plane.io, inodes[0..ni], dents[0..nd]) catch return error.PlanTooLarge;
             defer held.release(self.plane.io);
-            // Phase D: the remainder's records under the set.
-            for (stripes[first_own..k]) |s| {
-                _ = self.plane.apply.apply(.{ .create_inode = .{ .ino = s, .mode = S.IFDIR | (dv.mode & 0o7777), .uid = dv.uid, .gid = dv.gid, .rdev = 0, .size = 0, .ts_ns = dv.mtime } }, .none, .none, dv.mtime) catch return error.Io;
-            }
+            // Phase D: the remainder's records under the set, ONE entry.
+            if (n_own > 0) writeStripeRecords(Store, self.plane.apply.store, own[0..n_own], attrs) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.SlotMoved => error.SlotMoved,
+                error.Deferred => error.Deferred,
+                else => error.Io,
+            };
             // ONE intent: the map, the commit marker last.
             var plan_names: [K_MAX][MARKER_NAME_LEN]u8 = undefined;
             const plan = planFlip(dir, stripes[0..k], &plan_names);
@@ -865,34 +989,53 @@ pub fn Striping(comptime Store: type) type {
         /// `migrating` marker clears when `D`'s tree is re-verified empty of
         /// user names under the exclusive guard.
         pub fn migrate(self: *Self, map: *StripeMap, now: u64) Error!u32 {
-            if (!self.plane.isLocal(map.dir)) return error.NotHolder;
-            const name_key = self.plane.apply.store.nameKey();
             var moved: u32 = 0;
             var rounds: u32 = 0;
             while (rounds < MIGRATION_ROUNDS_MAX) : (rounds += 1) {
-                var arena_state = std.heap.ArenaAllocator.init(self.plane.gpa);
-                defer arena_state.deinit();
-                const arena = arena_state.allocator();
-                var recs: std.ArrayList(DirRec) = .empty;
-                _ = self.src.page(self.src.ctx, arena, map.dir, 0, MIGRATION_SCAN_PAGE, &recs) catch return error.Io;
-                var any = false;
-                for (recs.items) |r| {
-                    if (isMarkerName(r.name)) continue;
-                    any = true;
-                    try self.migrateOne(map, map.route(key.dentryNameHash54(r.name, name_key)).stripe, r, now);
-                    moved += 1;
-                }
-                if (!any) break;
+                const page = try self.migratePage(map, now);
+                moved += page;
+                if (page == 0) break;
             }
-            // Clear `migrating` under I{D} + D{D, migrating}, re-verified.
+            _ = try self.clearMigrating(map, now);
+            return moved;
+        }
+
+        /// ONE round of the migration (the cadence's unit): a page of
+        /// names moved; an empty page re-verifies `D` and clears the
+        /// marker — true when the directory is migrated.
+        pub fn migrateRound(self: *Self, map: *StripeMap, now: u64) Error!bool {
+            if (try self.migratePage(map, now) != 0) return false;
+            return self.clearMigrating(map, now);
+        }
+
+        fn migratePage(self: *Self, map: *const StripeMap, now: u64) Error!u32 {
+            if (!self.plane.isLocal(map.dir)) return error.NotHolder;
+            const name_key = self.plane.apply.store.nameKey();
+            var arena_state = std.heap.ArenaAllocator.init(self.plane.gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var recs: std.ArrayList(DirRec) = .empty;
+            _ = self.src.page(self.src.ctx, arena, map.dir, 0, MIGRATION_SCAN_PAGE, &recs) catch return error.Io;
+            var moved: u32 = 0;
+            for (recs.items) |r| {
+                if (isMarkerName(r.name)) continue;
+                try self.migrateOne(map, map.route(key.dentryNameHash54(r.name, name_key)).stripe, r, now);
+                moved += 1;
+            }
+            return moved;
+        }
+
+        /// Clear `migrating` under I{D} + D{D, migrating}, re-verified
+        /// EMPTY of user names under the guard; false when a name remains.
+        fn clearMigrating(self: *Self, map: *StripeMap, now: u64) Error!bool {
             var held = self.plane.locks.lockManyUncancelable(self.plane.io, &.{.{ .ino = map.dir, .mode = .exclusive }}, &.{.{ .parent = map.dir, .name = MIGRATING, .mode = .exclusive }}) catch return error.PlanTooLarge;
             defer held.release(self.plane.io);
             var arena_state = std.heap.ArenaAllocator.init(self.plane.gpa);
             defer arena_state.deinit();
-            if (hasUserName(self.src, arena_state.allocator(), map.dir) catch return error.Io) return moved;
-            _ = self.plane.apply.apply(.{ .remove_dentry = .{ .parent = map.dir, .name = MIGRATING, .expect_child = map.stripes[0], .parent_update = .none } }, .none, .none, now) catch return error.Io;
+            if (hasUserName(self.src, arena_state.allocator(), map.dir) catch return error.Io) return false;
+            if (map.migrating) _ = self.plane.apply.apply(.{ .remove_dentry = .{ .parent = map.dir, .name = MIGRATING, .expect_child = map.stripes[0], .parent_update = .none } }, .none, .none, now) catch return error.Io;
             map.migrating = false;
-            return moved;
+            return true;
         }
 
         /// `stat D`: every stripe's record at its holder, folded; the
@@ -1058,6 +1201,22 @@ test "the plans: the flip is K + 2 inserts with the commit marker LAST under the
     try testing.expectEqual(@as(u64, 100), rp.steps[6].set_nlink.ino);
     try testing.expectEqual(@as(u64, 9), rp.steps[8].set_nlink.ino);
     try testing.expectEqual(@as(u32, 5), rp.steps[8].set_nlink.pre);
+    // The WIDEST plan — the K = 64 rmdir under a NAME_MAX parent name with
+    // every stripe at count 2 and `migrating` set — encodes inside the
+    // image bound (the smoke's `rm -rf` of a 64-way directory answered
+    // EINVAL off a 56 B-per-step buffer: the marker names pad to 16).
+    {
+        var wide: StripeMap = .{ .dir = 9, .k = K_MAX, .stripes = @splat(0), .migrating = true };
+        for (0..K_MAX) |i| wide.stripes[i] = 1000 + i;
+        const twos: [K_MAX]u32 = @splat(2);
+        const long_name: [record.NAME_MAX]u8 = @splat('n');
+        const wp = planRmdirStriped(1, &long_name, &wide, &twos, 2, &names, 7);
+        try testing.expectEqual(@as(usize, 1 + 1 + 1 + K_MAX + K_MAX + 1), wp.len);
+        var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
+        var img: [intent.IMAGE_MAX]u8 = undefined;
+        const image = try intent.encode(.rmdir, 0, 1, wp.recs(&recs), 16 << 10, &img);
+        try testing.expect(image.len <= intent.IMAGE_MAX);
+    }
     const folded = foldAttrs(.{ .nlink = 2, .mtime = 5, .ctime = 5 }, &.{ .{ .nlink = 4, .mtime = 9, .ctime = 1 }, null, .{ .nlink = 2, .mtime = 1, .ctime = 12 }, .{ .nlink = 1 } });
     try testing.expectEqual(@as(u32, 4), folded.nlink);
     try testing.expectEqual(@as(u64, 9), folded.mtime);
@@ -1088,7 +1247,7 @@ test "the census: due iff ≥ 2 distinct creators and total > N_floor over the h
     c.note(9, 2 * t, t);
     try testing.expectEqual(@as(u32, 1), c.total());
     const gpa = testing.allocator;
-    var census = try Census.init(gpa, testing.io, 2);
+    var census = try Census.init(gpa, testing.io, .{ .fixed = 2 });
     defer census.deinit(gpa);
     var sup: [4]u32 = undefined;
     try testing.expect(census.noteServedInsert(50, 1, 10, &sup) == null);

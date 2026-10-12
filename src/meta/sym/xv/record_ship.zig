@@ -43,13 +43,15 @@ const route_table = @import("../../routing/route_table.zig");
 const layout = @import("../../../data/layout.zig");
 const token_cache = @import("../tokens/token_cache.zig");
 const ops = @import("ops.zig");
+const stripe = @import("stripe.zig");
 
 const S = economy.S;
 pub const Link = token_cache.Link;
 pub const InodeValue = record.InodeValue;
 
 pub const stats = struct {
-    /// Logical record verbs shipped (once per verb, redirects included).
+    /// Logical record verbs that LANDED at a holder (once per verb at its
+    /// terminal reply; a redirect re-dispatches the same verb).
     pub var record_ships: counters.ShardedCounter = .{};
     /// Verbs served at this holder.
     pub var record_served: counters.ShardedCounter = .{};
@@ -61,7 +63,8 @@ pub const stats = struct {
     /// A foreign slot whose holder has no bound endpoint: EAGAIN.
     pub var record_unreachable: counters.ShardedCounter = .{};
     /// Layout publishes that landed at a foreign holder / served here /
-    /// terminal failures (`ships ≡ served` fleet-wide at rest).
+    /// the REQUESTER's terminal failures and rejections (`ships ≡ served`
+    /// fleet-wide at rest).
     pub var foreign_publish_ships: counters.ShardedCounter = .{};
     pub var foreign_publish_served: counters.ShardedCounter = .{};
     pub var foreign_publish_refusals: counters.ShardedCounter = .{};
@@ -140,12 +143,25 @@ pub const Call = union(verbs.RecordShipKind) {
     setattr: Setattr,
     setxattr: struct { name: []const u8, value: []const u8 },
     removexattr: struct { name: []const u8 },
-    /// The encoded layout record (the `layout` xattr's value).
-    publish_layout: struct { value: []const u8 },
+    /// The encoded layout record (the `layout` xattr's value) with the
+    /// writer's completed DMAs behind every block it newly names.
+    publish_layout: struct { value: []const u8, proofs: []align(1) const verbs.DmaProofWire = &.{} },
 
     pub fn isPublish(self: Call) bool {
         return self == .publish_layout;
     }
+};
+
+/// The holder's layout-publish face (the data plane's): stage the
+/// shipped layout record AND its `+ref`/`−ref` diff against the record
+/// in place into `t` — ONE tx, the refs living in the owner's slot tree
+/// (charter §5.6). `prev` is the stored xattr record value (null = a
+/// fresh file); the proofs are the writer's, carried over the wire.
+pub const PublishFace = struct {
+    ctx: *anyopaque,
+    stage: *const fn (ctx: *anyopaque, t: *tx.KvTx, key_ino: u64, coll_seq: u8, prev: ?[]const u8, value: []const u8, proofs: []align(1) const verbs.DmaProofWire) PublishError!void,
+
+    pub const PublishError = error{ OutOfMemory, Rejected, ProofMissing };
 };
 
 /// What a served verb answered.
@@ -204,10 +220,6 @@ pub fn ship(resolver: ops.Resolver, volume: u16, global: u64, call: Call, lease_
         switch (home) {
             .local => return null,
             .foreign => |f| {
-                if (!redirected) {
-                    stats.record_ships.inc();
-                    if (call.isPublish()) stats.foreign_publish_ships.inc();
-                }
                 const ts = clock.monotonicNs();
                 defer stats.record_ship_phase_rtt.record(clock.monotonicNs() - ts);
                 const rep = f.link.call(f.link.ctx, .{ .record_ship = request(volume, global, call, lease_epoch) }) catch |e| switch (e) {
@@ -224,7 +236,10 @@ pub fn ship(resolver: ops.Resolver, volume: u16, global: u64, call: Call, lease_
                     },
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Deferred => return error.Deferred,
-                    error.Rejected => return error.Rejected,
+                    error.Rejected => {
+                        if (call.isPublish()) stats.foreign_publish_refusals.inc();
+                        return error.Rejected;
+                    },
                     error.ValueTooLarge => return error.ValueTooLarge,
                     error.NoAttribute => return error.NoAttribute,
                     error.ConnectionLost, error.HolderUnreachable, error.NotManager => {
@@ -248,6 +263,11 @@ pub fn ship(resolver: ops.Resolver, volume: u16, global: u64, call: Call, lease_
                     };
                     continue;
                 }
+                // The LOGICAL verb landed: counted once at the terminal
+                // reply (a redirect re-dispatches the same verb; a
+                // rejection lands nothing) — `ships ≡ served` at rest.
+                stats.record_ships.inc();
+                if (call.isPublish()) stats.foreign_publish_ships.inc();
                 return .{ .inode = if (r.has_inode != 0) (InodeValue.decode(&std.mem.toBytes(r.inode)) catch return error.Io) else null };
             },
         }
@@ -255,9 +275,10 @@ pub fn ship(resolver: ops.Resolver, volume: u16, global: u64, call: Call, lease_
 }
 
 fn request(volume: u16, global: u64, call: Call, lease_epoch: u64) verbs.RecordShipReq {
-    var head: verbs.RecordShipHead = .{ .volume = volume, .kind = @backingInt(@as(verbs.RecordShipKind, call)), .reserved = 0, .name_len = 0, .reserved2 = 0, .value_len = 0, .reserved3 = 0, .ino = global, .lease_epoch = lease_epoch, .setattr = .none };
+    var head: verbs.RecordShipHead = .{ .volume = volume, .kind = @backingInt(@as(verbs.RecordShipKind, call)), .reserved = 0, .name_len = 0, .n_proofs = 0, .value_len = 0, .reserved3 = 0, .ino = global, .lease_epoch = lease_epoch, .setattr = .none };
     var name: []const u8 = "";
     var value: []const u8 = "";
+    var proofs: []align(1) const verbs.DmaProofWire = &.{};
     switch (call) {
         .setattr => |a| head.setattr = a.toWire(),
         .setxattr => |x| {
@@ -268,11 +289,13 @@ fn request(volume: u16, global: u64, call: Call, lease_epoch: u64) verbs.RecordS
         .publish_layout => |p| {
             name = layout.LAYOUT_XATTR_NAME;
             value = p.value;
+            proofs = p.proofs;
         },
     }
     head.name_len = @intCast(name.len);
     head.value_len = @intCast(value.len);
-    return .{ .head = head, .name = name, .value = value };
+    head.n_proofs = @intCast(proofs.len);
+    return .{ .head = head, .name = name, .value = value, .proofs = proofs };
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +368,16 @@ pub fn RecordShipService(comptime Store: type) type {
         sink: ServedSink = .{},
         /// The handover judge's feed (every served record verb).
         served_ship: ?ops.ServedShipSink = null,
+        /// The data plane's publish face, armed after the plane is open
+        /// (the release store here pairs with the acquire load in `apply`:
+        /// a publish arriving before the arm meets a typed rejection,
+        /// never a torn face); a holder without one (a volume-less set)
+        /// rejects every shipped publish.
+        publish: std.atomic.Value(?*const PublishFace) = .init(null),
+
+        pub fn armPublish(self: *Self, face: ?*const PublishFace) void {
+            self.publish.store(face, .release);
+        }
 
         pub fn register(self: *Self, svc: *service.Service) void {
             svc.register(.record_ship, .{ .ctx = self, .serve = &serve });
@@ -360,7 +393,7 @@ pub fn RecordShipService(comptime Store: type) type {
                 .removexattr => .{ .removexattr = .{ .name = r.name } },
                 .publish_layout => blk: {
                     if (!std.mem.eql(u8, r.name, layout.LAYOUT_XATTR_NAME)) return service.Answer.rejected("a layout publish must name the layout record");
-                    break :blk .{ .publish_layout = .{ .value = r.value } };
+                    break :blk .{ .publish_layout = .{ .value = r.value, .proofs = r.proofs } };
                 },
             };
             const rep = self.apply(r.head.ino, call) catch |e| return switch (e) {
@@ -372,9 +405,13 @@ pub fn RecordShipService(comptime Store: type) type {
                     // An absent name is the caller's ENODATA, not a refusal.
                     break :blk .{ .ok = .{ .record_ship = .{ .kind = @backingInt(verbs.RecordShipReplyKind.served), .has_inode = 0, .reserved = 0, .holder = 0, .inode = std.mem.zeroes(verbs.InodeValueWire), .reserved2 = @splat(0) } } };
                 },
-                error.Io, error.Rejected, error.HolderUnreachable => blk: {
+                // The screen's class: a publish without a face or a proof,
+                // a command on a plane without the striping face — typed
+                // `STATUS_REJECTED`, never the merits tripwire (the
+                // requester counts its terminal publish failures).
+                error.Rejected => service.Answer.rejected("the holder rejected the record verb (no publish face, a block without its DMA proof, or an unarmed command)"),
+                error.Io, error.HolderUnreachable => blk: {
                     stats.record_refusals.fire("a served record verb failed on its merits");
-                    if (call.isPublish()) stats.foreign_publish_refusals.inc();
                     break :blk service.Answer.refused(error.InputOutput, "the holder could not apply the record verb");
                 },
             };
@@ -388,12 +425,31 @@ pub fn RecordShipService(comptime Store: type) type {
         }
 
         /// Apply `call` to `global` at this holder under its door: ONE
-        /// entry; the own-cache and kernel invalidation after it.
+        /// entry; the own-cache and kernel invalidation after it. A verb
+        /// naming an inode with NO record here is refused (a shipped
+        /// publish never plants a layout for a missing record — the
+        /// ordering law a reader relies on).
         pub fn apply(self: *Self, global: u64, call: Call) ShipError!Reply {
             if (!self.plane.isLocal(global)) return error.SlotMoved;
             const a = &self.plane.apply;
             const k = route_table.effectiveIno(global);
             var v = (a.readInode(global) catch return error.Io) orelse return error.Io;
+            // The explicit flip COMMAND shipped to the holder (`setfattr -n
+            // user.squeezefs.stripes -v K` from a non-holder): the striping
+            // face runs it; the reply is the directory's folded record.
+            if (call == .setxattr and std.mem.eql(u8, call.setxattr.name, stripe.COMMAND_XATTR)) {
+                const face = self.plane.striping orelse return error.Rejected;
+                face.flip(face.ctx, global, stripe.clampExplicitK(call.setxattr.value, self.plane.stripe_k)) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.Deferred => error.Deferred,
+                    error.SlotMoved, error.StaleHolderView => error.SlotMoved,
+                    error.HolderUnreachable => error.HolderUnreachable,
+                    error.PathAlreadyExists, error.NotDir, error.InvalidArgument, error.NotSupported => error.Rejected,
+                    else => error.Io,
+                };
+                stats.record_served.inc();
+                return .{ .inode = (a.readInode(global) catch return error.Io) orelse v };
+            }
             const t = a.store.begin(@src()) catch return error.OutOfMemory;
             var owned = true;
             errdefer if (owned) a.store.abandon(t);
@@ -425,9 +481,21 @@ pub fn RecordShipService(comptime Store: type) type {
                     t.stagePut(key.TREE_INODES, &key.inodeKey(k), &v.encode()) catch return error.OutOfMemory;
                 },
                 .publish_layout => |p| {
-                    try self.stageXattr(t, k, layout.LAYOUT_XATTR_NAME, p.value);
-                    // The layout record is the control plane's: no token
+                    // The layout record AND its `±ref` diff through the data
+                    // plane's face (the refs live in this slot tree); the
+                    // layout record is the control plane's: no token
                     // carries it beside the object's own.
+                    const face = self.publish.load(.acquire) orelse return error.Rejected;
+                    var occ: [256]u8 = undefined;
+                    var n: usize = 0;
+                    const hit = try self.scanXattr(k, layout.LAYOUT_XATTR_NAME, &occ, &n);
+                    const prev: ?[]u8 = if (hit) |h| ((a.store.lookup(a.gpa, key.TREE_XATTRS, &h.k) catch return error.Io) orelse return error.Io) else null;
+                    defer if (prev) |pv| a.gpa.free(pv);
+                    const coll: u8 = if (hit) |h| h.k[h.k.len - 1] else (key.firstFreeCollSeq(occ[0..n]) orelse return error.ValueTooLarge);
+                    face.stage(face.ctx, t, k, coll, prev, p.value, p.proofs) catch |e| return switch (e) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        error.Rejected, error.ProofMissing => error.Rejected,
+                    };
                 },
             }
             owned = false;

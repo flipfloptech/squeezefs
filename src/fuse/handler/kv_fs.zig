@@ -116,6 +116,7 @@ const sym_handover = @import("../../meta/sym/slots/handover.zig");
 const sym_acquire = @import("../../meta/sym/slots/acquire.zig");
 const read_divert = @import("../../meta/sym/tokens/read_divert.zig");
 const sym_xv = @import("../../meta/sym/xv.zig");
+const kv_fs_stripes = @import("kv_fs_stripes.zig");
 const layout = @import("../../data/layout.zig");
 const staging = @import("../../data/staging.zig");
 const block_refs = @import("../../data/block_refs.zig");
@@ -197,6 +198,9 @@ pub var fuse_kvmap_sweeps_kicked: counters.ShardedCounter = .{};
 pub var fuse_write_inline: counters.ShardedCounter = .{};
 pub var fuse_write_staged: counters.ShardedCounter = .{};
 pub var fuse_write_striped: counters.ShardedCounter = .{};
+/// Writes to a FOREIGN-slot file taken through the striped arm (every
+/// record a shipped verb to the holder, charter §5.5).
+pub var fuse_write_foreign_striped: counters.ShardedCounter = .{};
 /// `fuse_write_times_parked`: size-neutral striped writes whose Δ(mtime,
 /// ctime) was PARKED (decision 0003 §L.6) — fold-visible on every read,
 /// journaled by the batched drain — instead of committed as a 76 B entry
@@ -289,7 +293,7 @@ pub fn assertStore(comptime T: type) void {
 /// the product; `NoData` is the volume-less set).
 pub fn assertData(comptime T: type) void {
     comptime {
-        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep" }) |name| {
+        for ([_][]const u8{ "hasVolumes", "stagingOn", "blockSize", "inlineMax", "geometry", "refsSeam", "noteShape", "forgetShape", "isPassthrough", "canStoreHeld", "write", "read", "ownBlock", "abandonOwnBlock", "freeBindings", "flushCustody", "releaseIno", "fsync", "statfs", "mintFileId", "stageImage", "appendStaged", "releaseStaged", "stagedLease", "readMappingImage", "lockLayout", "stageKvmapShrink", "stageKvmapCorpse", "drainKvmapSweep", "publishForeign" }) |name| {
             if (!@hasDecl(T, name)) @compileError(@typeName(T) ++ " is not a kv_fs Data face: lacks `" ++ name ++ "`");
         }
     }
@@ -332,12 +336,12 @@ const HeldGuards = struct {
 };
 
 /// A dentry as found: the record's position plus the child's two inos.
-const Found = struct {
+pub const FoundT = struct {
     pos: economy.DentryPos,
     local: u64,
     global: u64,
 
-    fn isDir(self: Found) bool {
+    pub fn isDir(self: FoundT) bool {
         return @as(u32, self.pos.file_type) << 12 == S.IFDIR;
     }
 };
@@ -386,6 +390,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
     assertData(Data);
     return struct {
         const Self = @This();
+        pub const StoreType = Store;
+        pub const Found = FoundT;
+        /// The striping module over this filesystem (`kv_fs_stripes.zig`).
+        pub const Stripes = kv_fs_stripes.Stripes(Self);
 
         gpa: Allocator,
         io: Io,
@@ -436,6 +444,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// The set-wide `dir_rename` lease's taker (every directory-source
         /// rename across holders takes it); null = a flat mount.
         dir_rename: ?*sym_xv.dir_rename.Taker = null,
+        /// Directory striping (charter §5.5): the prelude every dentry op
+        /// runs; null = no cross-owner plane (a flat mount stripes nothing).
+        stripes: ?*Stripes = null,
         /// Committed corpse destroys on this volume: the subtrahend of the
         /// LIVE inode population `statfs.ffree` reports (POSIX-1: never the
         /// monotone watermark, which made `IUsed` rise forever).
@@ -507,11 +518,41 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return p.recoverOpen(now()) catch |e| return xvErr(e);
         }
 
+        /// Arm directory striping over the bound plane (after `bindXv`,
+        /// before the wire serves): the plane's striping face and the
+        /// served-insert census sink are this module's.
+        pub fn bindStripes(self: *Self, k: u8, floor: sym_xv.stripe.Floor) Allocator.Error!*Stripes {
+            const p = self.xv.?;
+            const st = try Stripes.create(self.gpa, self.io, self, p, k, floor);
+            self.stripes = st;
+            p.striping = st.face();
+            p.served_insert = st.servedInsertSink();
+            return st;
+        }
+
+        /// Disarm (before `unmount`; the plane's faces are cleared first).
+        pub fn unbindStripes(self: *Self) void {
+            const st = self.stripes orelse return;
+            if (self.xv) |p| {
+                p.striping = null;
+                p.served_insert = null;
+            }
+            self.stripes = null;
+            st.destroy();
+        }
+
         /// The cadence tick the daemon's meta fiber drives: the expiry
-        /// sweep, the roll-forward of abandoned intents, the gauges.
+        /// sweep, the roll-forward of abandoned intents, the gauges, the
+        /// striped directories' lazy migration.
         pub fn xvCadenceTick(self: *Self) void {
             const p = self.xv orelse return;
             _ = p.cadenceTick(clock.monotonicNs()) catch |e| log.warn("cross-owner cadence: a roll-forward pass failed ({t}); the next tick retries", .{e});
+            if (self.stripes) |st| st.tick();
+        }
+
+        /// The wall-clock stamp every record mutation carries.
+        pub fn nowNs() u64 {
+            return now();
         }
 
         fn xvWitnessRead(ctx: *anyopaque, global: u64) errors.Error!?InodeValue {
@@ -702,7 +743,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// A key ino → its global (`route_table.globalOfEffective`).
-        fn globalOf(local: u64) u64 {
+        pub fn globalOf(local: u64) u64 {
             return route_table.globalOfEffective(local);
         }
 
@@ -767,7 +808,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         /// The inode as stored, FOLDED through the pending refinements;
         /// null when absent.
-        fn readInodeOpt(self: *Self, ino: u64) Error!?InodeValue {
+        pub fn readInodeOpt(self: *Self, ino: u64) Error!?InodeValue {
             if (try self.tokenServe(ino, .{})) |served| {
                 // A foreign object: the holder's folded record (its pending
                 // times are the holder's business).
@@ -835,7 +876,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return found;
         }
 
-        fn findDentry(self: *Self, parent: u64, name: []const u8) Error!?Found {
+        pub fn findDentry(self: *Self, parent: u64, name: []const u8) Error!?Found {
             // A foreign directory: the token's resident WINDOW around the
             // name's cookies (its hash orders them); a window cut inside the
             // name's run is re-served from its end until the absence is
@@ -1308,18 +1349,54 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 return self.entryOf(p, v);
             }
             c.stage(.meta_backend_start);
-            const found = (try self.findDentry(try localOf(a.parent), a.name)) orelse {
+            const found = (try self.findChild(a.parent, a.name)) orelse {
                 c.stage(.meta_backend_done);
                 if (!self.ttls.negativeEnabled()) return error.FileNotFound;
                 return filesystem.Entry.negative(self.ttls.negative_ns);
             };
-            const v = (try self.readInodeOpt(found.local)) orelse {
+            var v = (try self.readInodeOpt(found.local)) orelse {
                 dentry_without_inode.fire("lookup found a dentry whose inode record is absent");
                 return error.InputOutput;
             };
+            if (economy.isDirMode(v.mode)) v = try self.foldIfStriped(found.global, v);
             c.stage(.meta_backend_done);
             if (economy.isDirMode(v.mode)) self.rememberParent(found.global, a.parent);
             return self.entryOf(found.global, v);
+        }
+
+        /// `(parent, name)` → the dentry, through the striped prelude: a
+        /// striped parent routes the name to its stripe (the stripe first,
+        /// `D`'s own tree second — LWW).
+        pub fn findChild(self: *Self, parent_global: u64, name: []const u8) Error!?Found {
+            if (self.stripes) |st| if (try st.mapOf(parent_global)) |map| return st.locate(&map, name);
+            return self.findDentry(try localOf(parent_global), name);
+        }
+
+        /// `stat D` of a striped directory is the FOLD over its stripes
+        /// (`nlink = D.nlink + Σ (D_i.nlink − 2)`, times = max); any other
+        /// directory is its record.
+        fn foldIfStriped(self: *Self, global: u64, v: InodeValue) Error!InodeValue {
+            const st = self.stripes orelse return v;
+            const map = (try st.mapOf(global)) orelse return v;
+            return st.fold(&map, v);
+        }
+
+        /// The key parent of a NEW name under `parent`: the stripe of a
+        /// striped parent (EEXIST screened over `D`'s own tree, a dying
+        /// stripe refused), else the parent itself.
+        fn insertParentOf(self: *Self, parent_global: u64, name: []const u8) Error!u64 {
+            const st = self.stripes orelse return parent_global;
+            const map = (try st.mapOf(parent_global)) orelse return parent_global;
+            return st.insertParent(&map, name);
+        }
+
+        /// The key parent of a MUTATION of `name` under `parent`: the
+        /// stripe (the name re-homed first) of a striped parent, else the
+        /// parent itself.
+        fn mutationParentOf(self: *Self, parent_global: u64, name: []const u8) Error!u64 {
+            const st = self.stripes orelse return parent_global;
+            const map = (try st.mapOf(parent_global)) orelse return parent_global;
+            return st.mutationParent(&map, name);
         }
 
         pub fn forget(self: *Self, c: *Ctx, a: filesystem.ForgetArgs) void {
@@ -1632,8 +1709,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 if (a.ino == inos.ROOT_INO and errors.classOf(e) == .retryable) if (self.divert) |d| if (d.lastRoot()) |last| break :blk last;
                 return e;
             };
+            const folded = if (economy.isDirMode(v.mode)) try self.foldIfStriped(a.ino, v) else v;
             c.stage(.meta_backend_done);
-            return self.attrReply(a.ino, v);
+            return self.attrReply(a.ino, folded);
         }
 
         pub fn setattr(self: *Self, c: *Ctx, a: filesystem.SetattrArgs) Error!filesystem.Attr {
@@ -1722,15 +1800,22 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// parent read and the EEXIST probe under them, ONE entry.
         const NewChild = struct { mode: u32, rdev: u32 = 0, target: ?[]const u8 = null };
 
+        /// The striped prelude: a striped parent's new name keys the
+        /// STRIPE (`hash54 % K`), the `..` memo keeps the directory.
         fn createChild(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, child: NewChild) Error!filesystem.Entry {
             try checkMutableName(parent_global, name);
+            const key_parent = try self.insertParentOf(parent_global, name);
+            return self.createChildAt(c, key_parent, parent_global, name, child);
+        }
+
+        fn createChildAt(self: *Self, c: *Ctx, parent_global: u64, logical_parent: u64, name: []const u8, child: NewChild) Error!filesystem.Entry {
             const is_dir = economy.isDirMode(child.mode);
             const parent = try localOf(parent_global);
             // The mint first: the child's home decides the arm (a foreign
             // parent or a rotor on another member ⇒ ONE intent).
             const local = self.store.allocateIno(parent, false, try self.gatherOptIn(parent)) catch |e| return storeErr(e);
             const global = globalOf(local);
-            if (self.spansHomes(&.{ parent_global, global })) return self.xvCreate(c, parent_global, name, child, local, global);
+            if (self.spansHomes(&.{ parent_global, global })) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
             var plan: economy.GuardPlan = .{};
             plan.inode_reqs[0] = .{ .ino = parent, .mode = if (is_dir) .exclusive else .shared };
             plan.inode_len = 1;
@@ -1760,10 +1845,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 };
             t_owned = false;
             self.commit(c, t) catch |e| {
-                if (self.redispatches(e)) return self.xvCreate(c, parent_global, name, child, local, global);
+                if (self.redispatches(e)) return self.xvCreate(c, parent_global, logical_parent, name, child, local, global);
                 return e;
             };
-            if (is_dir) self.rememberParent(global, parent_global);
+            if (is_dir) self.rememberParent(global, logical_parent);
             if (child.mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
             return self.entryOf(global, out.child);
         }
@@ -1774,9 +1859,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// own entry on the child's slot BEFORE the intent (a crash between
         /// leaves an xattr no inode owns: fsck's orphan-xattr class, never a
         /// symlink without its target).
-        fn xvCreate(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, child: NewChild, local: u64, global: u64) Error!filesystem.Entry {
+        fn xvCreate(self: *Self, c: *Ctx, parent_global: u64, logical_parent: u64, name: []const u8, child: NewChild, local: u64, global: u64) Error!filesystem.Entry {
             const parent = try localOf(parent_global);
             const pv = try self.readDir(parent);
+            if (pv.nlink == 0) return error.FileNotFound;
             if (try self.findDentry(parent, name) != null) return error.PathAlreadyExists;
             var mode = child.mode;
             var gid = c.gid;
@@ -1798,7 +1884,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             const plan = sym_xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = c.uid, .gid = gid, .rdev = child.rdev, .size = size, .now = now() });
             const done = try self.runPlan(c, &plan);
-            if (economy.isDirMode(mode)) self.rememberParent(global, parent_global);
+            if (economy.isDirMode(mode)) self.rememberParent(global, logical_parent);
             if (mode & S.IFMT == S.IFREG) self.data.noteShape(local, 0, .inline_);
             return self.entryOf(global, done.inode(0) orelse return error.InputOutput);
         }
@@ -1822,13 +1908,24 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         /// unlink/rmdir: find (no guards) → lock the full set → revalidate
-        /// → stage → commit.
-        fn removeChild(self: *Self, c: *Ctx, parent_global: u64, name: []const u8, want_dir: bool) Error!void {
-            try checkMutableName(parent_global, name);
+        /// → stage → commit. The striped prelude: a striped parent's name
+        /// is re-homed into its stripe first and the stripe is the key
+        /// parent; the rmdir of a STRIPED directory is ONE intent over it
+        /// and every stripe (`Stripes.rmdir`).
+        fn removeChild(self: *Self, c: *Ctx, logical_parent: u64, name: []const u8, want_dir: bool) Error!void {
+            try checkMutableName(logical_parent, name);
+            const parent_global = try self.mutationParentOf(logical_parent, name);
             const parent = try localOf(parent_global);
             const probe = (try self.findDentry(parent, name)) orelse return error.FileNotFound;
             if (want_dir and !probe.isDir()) return error.NotDir;
             if (!want_dir and probe.isDir()) return error.IsDir;
+            if (want_dir) if (self.stripes) |st| if (try st.mapOf(probe.global) != null) {
+                c.stage(.meta_backend_start);
+                defer c.stage(.meta_backend_done);
+                try st.rmdir(parent_global, name, probe.global);
+                self.forgetParent(probe.global);
+                return;
+            };
             if (self.spansHomes(&.{ parent_global, probe.global })) return self.xvRemove(c, parent_global, name, probe, want_dir);
             var plan: economy.GuardPlan = .{};
             const shared = economy.unlinkParentShared(want_dir, parent, probe.local);
@@ -1877,9 +1974,26 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             return self.removeChild(c, a.parent, a.name, true);
         }
 
-        pub fn rename(self: *Self, c: *Ctx, a: filesystem.RenameArgs) Error!void {
-            try checkMutableName(a.parent, a.name);
-            try checkMutableName(a.newparent, a.newname);
+        /// The striped prelude: each side's name keys ITS stripe (the
+        /// source re-homed first; the destination screened over `D`'s own
+        /// tree and re-homed when it exists there) — a rename within one
+        /// striped directory across two stripes is the ordinary two-parent
+        /// rename, cross-owner when the stripes' holders differ. The
+        /// LOGICAL parents stay the `..` memo's and the ancestry walk's.
+        pub fn rename(self: *Self, c: *Ctx, a0: filesystem.RenameArgs) Error!void {
+            try checkMutableName(a0.parent, a0.name);
+            try checkMutableName(a0.newparent, a0.newname);
+            var a = a0;
+            a.parent = try self.mutationParentOf(a0.parent, a0.name);
+            a.newparent = try self.mutationParentOf(a0.newparent, a0.newname);
+            return self.renameKeyed(c, a, .{ .old = a0.parent, .new = a0.newparent });
+        }
+
+        /// The logical (`..`) parents of a rename whose key parents may be
+        /// stripes.
+        const LogicalParents = struct { old: u64, new: u64 };
+
+        fn renameKeyed(self: *Self, c: *Ctx, a: filesystem.RenameArgs, logical: LogicalParents) Error!void {
             const flags: economy.RenameFlags = .{ .noreplace = a.flags & RENAME_NOREPLACE != 0, .exchange = a.flags & RENAME_EXCHANGE != 0 };
             const whiteout = a.flags & RENAME_WHITEOUT != 0;
             if (a.flags & ~@as(u32, RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0) return error.InvalidArgument;
@@ -1897,7 +2011,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     homes[3] = d.global;
                     n = 4;
                 }
-                if (self.spansHomes(homes[0..n])) return self.xvRename(c, a, flags, whiteout, old0, new0);
+                if (self.spansHomes(homes[0..n])) return self.xvRename(c, a, logical, flags, whiteout, old0, new0);
             }
             // The conservative set: both parents exclusive (≥ what the
             // staged records require), both inodes, both names.
@@ -1976,13 +2090,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             };
             t_owned = false;
             self.commit(c, t) catch |e| {
-                if (self.redispatches(e)) return self.xvRename(c, a, flags, whiteout, old, new);
+                if (self.redispatches(e)) return self.xvRename(c, a, logical, flags, whiteout, old, new);
                 return e;
             };
-            if (old.isDir()) self.rememberParent(old.global, a.newparent);
+            if (old.isDir()) self.rememberParent(old.global, logical.new);
             if (new) |n| {
                 if (flags.exchange) {
-                    if (n.isDir()) self.rememberParent(n.global, a.parent);
+                    if (n.isDir()) self.rememberParent(n.global, logical.old);
                 } else if (n.isDir()) self.forgetParent(n.global);
             }
         }
@@ -1991,7 +2105,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// `dir_rename` lease OUTERMOST and walks the destination's
         /// ancestry on exact data; the destination's witness at ITS holder;
         /// the ENOTEMPTY probe before any step; ONE intent.
-        fn xvRename(self: *Self, c: *Ctx, a: filesystem.RenameArgs, flags: economy.RenameFlags, whiteout: bool, old0: Found, new0: ?Found) Error!void {
+        fn xvRename(self: *Self, c: *Ctx, a: filesystem.RenameArgs, logical: LogicalParents, flags: economy.RenameFlags, whiteout: bool, old0: Found, new0: ?Found) Error!void {
             var lease: ?sym_xv.dir_rename.Taker.Held = null;
             defer if (lease) |*l| l.release();
             if (old0.isDir()) {
@@ -2002,7 +2116,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                         else => error.InputOutput,
                     };
                 }
-                if (a.parent != a.newparent) sym_xv.dir_rename.refuseRenameIntoOwnSubtree(self.ancestry(), old0.global, a.newparent) catch |e| return sym_xv.dir_rename.walkError(e);
+                if (logical.old != logical.new) sym_xv.dir_rename.refuseRenameIntoOwnSubtree(self.ancestry(), old0.global, logical.new) catch |e| return sym_xv.dir_rename.walkError(e);
             }
             const cv = (try self.readInodeOpt(old0.local)) orelse return error.FileNotFound;
             if (new0) |n| {
@@ -2019,8 +2133,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 const nv = (try self.readInodeOpt(n.local)) orelse return error.FileNotFound;
                 const plan = sym_xv.steps.planExchange(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .a = old0.global, .a_mode = cv.mode, .b = n.global, .b_mode = nv.mode, .now = stamp });
                 _ = try self.runPlan(c, &plan);
-                if (old0.isDir()) self.rememberParent(old0.global, a.newparent);
-                if (n.isDir()) self.rememberParent(n.global, a.parent);
+                if (old0.isDir()) self.rememberParent(old0.global, logical.new);
+                if (n.isDir()) self.rememberParent(n.global, logical.old);
                 return;
             }
             var dest: ?struct { ino: u64, value: InodeValue } = null;
@@ -2032,7 +2146,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             const plan = sym_xv.steps.planRename(.{ .old_parent = a.parent, .old_name = a.name, .new_parent = a.newparent, .new_name = a.newname, .child = old0.global, .child_mode = cv.mode, .dest = if (dest) |d| .{ .ino = d.ino, .value = d.value } else null, .whiteout = wo, .now = stamp });
             _ = try self.runPlan(c, &plan);
-            if (old0.isDir()) self.rememberParent(old0.global, a.newparent);
+            if (old0.isDir()) self.rememberParent(old0.global, logical.new);
             if (new0) |n| if (n.isDir()) self.forgetParent(n.global);
         }
 
@@ -2052,18 +2166,36 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         fn ancestryScan(ctx: *anyopaque, dir: u64, name_buf: *[255]u8) ?sym_xv.dir_rename.ParentLink {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const parent = self.parentOf(dir) orelse return null;
-            const plocal = localOf(parent) catch return null;
+            // A striped parent's names live in its stripes: the scan walks
+            // every stripe, then the directory's own tree.
+            var homes: [sym_xv.stripe.K_MAX + 1]u64 = undefined;
+            var n: usize = 0;
+            if (self.stripes) |st| if (st.mapOf(parent) catch null) |map| {
+                for (map.slice()) |s| {
+                    homes[n] = s;
+                    n += 1;
+                }
+            };
+            homes[n] = parent;
+            n += 1;
+            for (homes[0..n]) |home| if (self.scanDirFor(home, dir, name_buf)) |name| return .{ .parent = parent, .name = name };
+            return null;
+        }
+
+        /// The name under `home` whose child is `child`, if any.
+        fn scanDirFor(self: *Self, home: u64, child: u64, name_buf: *[255]u8) ?[]const u8 {
+            const hlocal = localOf(home) catch return null;
             var arena_state = std.heap.ArenaAllocator.init(self.gpa);
             defer arena_state.deinit();
             var recs: std.ArrayList(sym_xv.stripe.DirRec) = .empty;
             var after: u64 = 0;
             while (true) {
                 recs.clearRetainingCapacity();
-                const more = self.dirPage(arena_state.allocator(), plocal, after, 512, &recs) catch return null;
+                const more = self.dirPage(arena_state.allocator(), hlocal, after, 512, &recs) catch return null;
                 for (recs.items) |r| {
-                    if (r.child == dir) {
+                    if (r.child == child and !sym_xv.stripe.isMarkerName(r.name)) {
                         @memcpy(name_buf[0..r.name.len], r.name);
-                        return .{ .parent = parent, .name = name_buf[0..r.name.len] };
+                        return name_buf[0..r.name.len];
                     }
                     after = r.cookie;
                 }
@@ -2073,17 +2205,19 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
 
         fn ancestryExact(ctx: *anyopaque, parent: u64, name: []const u8) errors.Error!?u64 {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            const f = (try self.findDentry(try localOf(parent), name)) orelse return null;
+            const f = (try self.findChild(parent, name)) orelse return null;
             return f.global;
         }
 
-        fn ancestryStripe(_: *anyopaque, _: u64) ?u64 {
-            return null;
+        fn ancestryStripe(ctx: *anyopaque, ino: u64) ?u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const st = self.stripes orelse return null;
+            return st.stripeOwner(ino);
         }
 
         /// A directory's dentry page at its holder (the divert's dentry set
         /// for a foreign one; the store's range for ours).
-        fn dirPage(self: *Self, arena: Allocator, dir_local: u64, after: u64, max: usize, out: *std.ArrayList(sym_xv.stripe.DirRec)) Error!bool {
+        pub fn dirPage(self: *Self, arena: Allocator, dir_local: u64, after: u64, max: usize, out: *std.ArrayList(sym_xv.stripe.DirRec)) Error!bool {
             if (try self.tokenServe(dir_local, .{ .dentries = true, .after = after })) |served| {
                 defer served.release(self.io);
                 const e = served.entry orelse return false;
@@ -2099,9 +2233,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             };
         }
 
-        pub fn link(self: *Self, c: *Ctx, a: filesystem.LinkArgs) Error!filesystem.Entry {
-            try checkMutableName(a.newparent, a.newname);
-            if (virtual_inodes.isVirtualIno(a.ino)) return error.PermissionDenied;
+        pub fn link(self: *Self, c: *Ctx, a0: filesystem.LinkArgs) Error!filesystem.Entry {
+            try checkMutableName(a0.newparent, a0.newname);
+            if (virtual_inodes.isVirtualIno(a0.ino)) return error.PermissionDenied;
+            // The striped prelude: the new name keys its stripe.
+            var a = a0;
+            a.newparent = try self.insertParentOf(a0.newparent, a0.newname);
             const parent = try localOf(a.newparent);
             const child = try localOf(a.ino);
             if (self.spansHomes(&.{ a.newparent, a.ino })) return self.xvLink(c, a);
@@ -2264,6 +2401,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                     return error.FileTooBig;
                 }
                 return self.writeInline(c, local, a, rec, end, &layout_lock);
+            }
+            // A FOREIGN-slot file (charter §5.5 "the layout publish" of a
+            // file another appender holds) is always written through the
+            // striped arm: its bytes land on a block of this writer's own
+            // grant and every record it needs — the promotion's layout, the
+            // merge's, the size claim — is ONE shipped verb to the holder;
+            // the inline and staged arms' records would ride a tx the
+            // holder's door refuses.
+            if (self.foreignSlot(a.ino)) {
+                fuse_write_foreign_striped.inc();
+                return self.writeStriped(c, local, a, rec, end, &layout_lock);
             }
             if (kind == .inline_ and end <= self.inline_max) return self.writeInline(c, local, a, rec, end, &layout_lock);
             // The staged arm rings the WHOLE file: its bound is the file's
@@ -2441,7 +2589,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             };
             c.stage(.write_done);
             // The postlude: SIZE NEVER LEADS DATA — the claim lands after the
-            // pieces were acked by their arms.
+            // pieces were acked by their arms. A foreign-slot file's claim
+            // is ONE shipped record verb (its stamp never parks here: the
+            // holder's record is the fold's authority).
+            if (self.foreignSlot(globalOf(local))) {
+                const held = try self.readInode(local);
+                const size = @max(held.size, outcome.size_claim);
+                const stamp = now();
+                _ = try self.shipRecord(globalOf(local), .{ .setattr = .{ .size = size, .mtime = stamp, .ctime = stamp } });
+                self.data.noteShape(local, size, .striped);
+                fuse_write_striped.inc();
+                return .{ .size = @intCast(outcome.written) };
+            }
             const t = try self.beginExclusive(local, @src());
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
@@ -2618,13 +2777,23 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             errdefer if (ob) |o| self.data.abandonOwnBlock(o);
             noteDisplaced(local, rec, &after);
-            const t = try self.beginExclusive(local, @src());
-            var t_owned = true;
-            errdefer if (t_owned) self.store.abandon(t);
             const proofs: []const layout.DmaProof = if (ob) |o| &.{o.proof} else &.{};
-            try self.publish(t, local, rec, Layout.stripedInline(size, entries[0..n_entries]), proofs);
-            t_owned = false;
-            try self.commit(c, t);
+            const new = Layout.stripedInline(size, entries[0..n_entries]);
+            if (self.foreignSlot(globalOf(local))) {
+                // A foreign-slot file: the promotion's publish is ONE record
+                // verb to the holder (charter §5.5 "the layout publish"); the
+                // holder stages the record and the `+ref` in its tree.
+                c.stage(.meta_backend_start);
+                defer c.stage(.meta_backend_done);
+                try self.data.publishForeign(self.io, local, new, proofs);
+            } else {
+                const t = try self.beginExclusive(local, @src());
+                var t_owned = true;
+                errdefer if (t_owned) self.store.abandon(t);
+                try self.publish(t, local, rec, new, proofs);
+                t_owned = false;
+                try self.commit(c, t);
+            }
             self.afterCommit(&after);
             fuse_write_promotions_to_striped.inc();
             return size;
@@ -2740,6 +2909,35 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const after: u64 = switch (pos) {
                 .after_entry => a.offset,
                 else => 0,
+            };
+            // A STRIPED directory: the K-way merge of its stripes and its own
+            // tree in cookie order (markers never show); every emitted cookie
+            // is the exact continuation.
+            if (self.stripes) |st| if (try st.mapOf(a.ino)) |map| {
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                var cursor = after;
+                while (true) {
+                    var recs: std.ArrayList(sym_xv.stripe.DirRec) = .empty;
+                    try st.readdir(arena, &map, cursor, READDIR_SCAN, &recs);
+                    if (recs.items.len == 0) break;
+                    for (recs.items) |rec| {
+                        cursor = rec.cookie;
+                        const child_local = localOf(rec.child) catch {
+                            dentry_without_inode.fire("readdir found a dentry naming a foreign-slot ino");
+                            continue;
+                        };
+                        const cv = (try self.readInodeOpt(child_local)) orelse {
+                            dentry_without_inode.fire("readdir found a dentry whose inode record is absent");
+                            continue;
+                        };
+                        if (plus and economy.isDirMode(cv.mode)) self.rememberParent(rec.child, a.ino);
+                        if (!(try self.emit(&plain, &rich, plus, rec.child, rec.cookie, cv, rec.name, false))) return .{ .len = self.written(&plain, &rich, plus) };
+                    }
+                    if (recs.items.len < READDIR_SCAN) break;
+                }
+                return .{ .len = self.written(&plain, &rich, plus) };
             };
             if (try self.tokenServe(dir, .{ .dentries = true, .after = after })) |served| {
                 defer served.release(self.io);
@@ -2860,6 +3058,20 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         pub fn setxattr(self: *Self, c: *Ctx, a: filesystem.SetxattrArgs) Error!void {
             try checkName(a.name);
             if (virtual_inodes.isVirtualIno(a.ino)) return error.PermissionDenied;
+            // `user.squeezefs.stripes` is a COMMAND intercepted BEFORE the
+            // allowlist, never a stored value: the explicit flip, at the
+            // holder (a non-holder ships it as ONE record verb); unarmed, the
+            // name is the reserved family's (the screen's refusal).
+            if (std.mem.eql(u8, a.name, sym_xv.stripe.COMMAND_XATTR)) if (self.stripes) |st| {
+                c.stage(.meta_backend_start);
+                defer c.stage(.meta_backend_done);
+                if (self.foreignSlot(a.ino)) {
+                    _ = try self.shipRecord(a.ino, .{ .setxattr = .{ .name = a.name, .value = a.value } });
+                    return;
+                }
+                _ = try st.flipExplicit(a.ino, sym_xv.stripe.clampExplicitK(a.value, st.core.k));
+                return;
+            };
             try screenXattr(a.name, error.PermissionDenied);
             if (a.value.len > record.xattrValueCap(self.store.nodeSize())) return error.ValueTooLarge;
             const local = try localOf(a.ino);
@@ -2890,12 +3102,13 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             try checkName(a.name);
             if (virtual_inodes.isVirtualIno(a.ino)) return error.NoAttribute;
             // `user.squeezefs.stripes` is a COMMAND, never a stored value: a
-            // read answers the striping width in force on a directory.
+            // read answers the K in force on a STRIPED directory, ENODATA on
+            // any other object (the command's read face; never listed).
             if (std.mem.eql(u8, a.name, sym_xv.stripe.COMMAND_XATTR)) {
-                const p = self.xv orelse return error.NoAttribute;
-                if (!economy.isDirMode((try self.readInode(try localOf(a.ino))).mode)) return error.NoAttribute;
+                const st = self.stripes orelse return error.NoAttribute;
+                const map = (try st.mapOf(a.ino)) orelse return error.NoAttribute;
                 var buf: [4]u8 = undefined;
-                const digits = std.fmt.bufPrint(&buf, "{d}\n", .{p.stripe_k}) catch unreachable;
+                const digits = std.fmt.bufPrint(&buf, "{d}\n", .{map.k}) catch unreachable;
                 if (a.size == 0) return .{ .size = @intCast(digits.len) };
                 if (digits.len > a.size or digits.len > c.window.len) return error.BufferTooSmall;
                 @memcpy(c.window[0..digits.len], digits);
@@ -3052,6 +3265,10 @@ pub const NoData = struct {
     pub fn freeBindings(_: *NoData, _: Io, _: []const Mapping) void {}
     pub fn flushCustody(_: *NoData, _: Io, _: u64) void {}
     pub fn releaseIno(_: *NoData, _: Io, _: u64) void {}
+    /// A volume-less set has no wire: a foreign publish cannot ship.
+    pub fn publishForeign(_: *NoData, _: Io, _: u64, _: Layout, _: []const layout.DmaProof) Error!void {
+        return error.HolderUnreachable;
+    }
     pub fn fsync(_: *NoData, _: Io, _: u64, _: ?staging.StagingKey) Error!void {}
     pub fn statfs(_: *NoData) ?Space {
         return null;
@@ -3715,6 +3932,9 @@ const SettlingData = struct {
         self.freeBindings(io, &.{m.from});
     }
     pub fn releaseIno(_: *SettlingData, _: Io, _: u64) void {}
+    pub fn publishForeign(_: *SettlingData, _: Io, _: u64, _: Layout, _: []const layout.DmaProof) Error!void {
+        return error.HolderUnreachable;
+    }
     pub fn fsync(_: *SettlingData, _: Io, _: u64, _: ?staging.StagingKey) Error!void {}
     pub fn statfs(_: *SettlingData) ?Space {
         return null;

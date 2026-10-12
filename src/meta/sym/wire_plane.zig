@@ -343,6 +343,12 @@ pub const WirePlane = struct {
     /// served under this holder's door, its kernel view invalidated).
     guards_svc: xv.guards.GuardsService,
     record_svc: xv.record_ship.RecordShipService(MetaSet),
+    /// The striping's `SupplyStripeInos` served side (a creator mints
+    /// stripe records in its slot on the directory's volume).
+    supply_svc: xv.stripe.SupplyService(MetaSet),
+    /// The data plane's publish face for shipped layout publishes
+    /// (`bindServedPublish`; its address is what `record_svc` arms).
+    served_publish: xv.record_ship.PublishFace = undefined,
     t_owner_ms: u64,
     /// This mount's read divert (charter §5.5 "Every writer is also a
     /// token client of the holders it writes to"): a slot another
@@ -410,6 +416,7 @@ pub const WirePlane = struct {
             .steps = .{ .plane = xv_plane },
             .guards_svc = .{ .parked = &xv_plane.parked, .volume = 0 },
             .record_svc = .{ .plane = xv_plane },
+            .supply_svc = .{ .plane = xv_plane },
             .t_owner_ms = t_owner_ms,
             .divert = undefined,
             .sink = .{},
@@ -445,6 +452,7 @@ pub const WirePlane = struct {
         self.steps.register(&self.svc);
         self.guards_svc.register(&self.svc);
         self.record_svc.register(&self.svc);
+        self.supply_svc.register(&self.svc);
         // The data planes' grant verbs: registered now, armed by
         // `bindDataPlanes` once the data plane is open.
         self.svc.register(.block_grant, .{ .ctx = self, .serve = &serveBlockGrant });
@@ -1074,6 +1082,30 @@ pub const WirePlane = struct {
     /// verdict reads the store).
     pub fn foreignLayout(self: *WirePlane) @import("../../data/plane.zig").DataPlane.ForeignLayout {
         return .{ .ctx = self, .lookup = &foreignLayoutFn };
+    }
+
+    /// The data plane's publish SHIP (charter §5.5 "the layout publish"
+    /// of a foreign-slot file): ONE `record_ship` verb to the holder with
+    /// the window's DMA proofs.
+    pub fn foreignPublish(self: *WirePlane) @import("../../data/plane.zig").DataPlane.ForeignPublish {
+        return .{ .ctx = self, .ship = &foreignPublishFn };
+    }
+
+    fn foreignPublishFn(ctx: *anyopaque, ino: u64, value: []const u8, proofs: []const verbs.DmaProofWire) errors.Error!void {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        const p = self.steps.plane;
+        const rep = xv.record_ship.ship(p.resolver, p.volume, ino, .{ .publish_layout = .{ .value = value, .proofs = proofs } }, 0) catch |e| return xv.record_ship.coreError(e);
+        // `null` = the slot is ours after a redirect: the merge re-runs
+        // locally on the caller's retry.
+        if (rep == null) return error.SlotMoved;
+    }
+
+    /// Arm the holder side of shipped publishes with the data plane's
+    /// face (after the plane is open; the record service loads it with
+    /// an acquire).
+    pub fn bindServedPublish(self: *WirePlane, face: @import("xv/record_ship.zig").PublishFace) void {
+        self.served_publish = face;
+        self.record_svc.armPublish(&self.served_publish);
     }
 
     fn foreignLayoutFn(ctx: *anyopaque, gpa: Allocator, ino: u64) errors.Error!@import("../../data/plane.zig").DataPlane.ForeignLayout.Verdict {

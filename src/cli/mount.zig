@@ -457,7 +457,11 @@ fn mountMain(ctx: *Ctx) u8 {
     if (xv_bound) |xb| {
         const rolled = fs.bindXv(&xb.plane) catch |e| return ctx.failed("the cross-owner roll-forward at mount failed ({t})", .{e});
         if (rolled != 0) log.info("mount: {d} open cross-owner intent(s) rolled forward before serving", .{rolled});
+        // Directory striping (charter §5.5) over the plane, BEFORE the wire
+        // serves: the census floor is the slot plane's live `N_floor`.
+        _ = fs.bindStripes(xb.plane.stripe_k, stripeFloor(be)) catch return ctx.failed("out of memory (directory striping)", .{});
     }
+    defer fs.unbindStripes();
     // The READER's plane (charter §5.5 "`-o ro` mounts are member-readers
     // + token clients … with NO live writer … the QUIESCENT reader"): the
     // divert over every slot as foreign, or the projection with the
@@ -488,8 +492,13 @@ fn mountMain(ctx: *Ctx) u8 {
         // The cross-owner plane's step sessions: a foreign holder's steps
         // ship over the wire plane's dialled links.
         xv_bound.?.bindDialer(wp.peers.xvDialer());
-        // A foreign file's layout record comes off its holder's token.
+        // A foreign file's layout record comes off its holder's token; a
+        // foreign file's layout PUBLISH ships to its holder as ONE record
+        // verb, and a shipped publish served here stages its refs through
+        // the plane.
         plane.bindForeignLayout(wp.foreignLayout());
+        plane.bindForeignPublish(wp.foreignPublish());
+        wp.bindServedPublish(plane.servedPublishFace());
         // The data planes' arms: the manager holds the allocation lease
         // and serves the grants; a joiner mints from pulled grants and
         // ships its terminal frees.
@@ -727,6 +736,7 @@ fn mountMain(ctx: *Ctx) u8 {
     // a stopped plane).
     if (wire) |wp| {
         plane.bindForeignLayout(null);
+        plane.bindForeignPublish(null);
         xv_bound.?.bindDialer(null);
         wp.stop();
     }
@@ -766,6 +776,18 @@ fn mountMain(ctx: *Ctx) u8 {
 /// the node's creation (ids are identities, never secrets; 0 is never a
 /// job id — the fabric re-rolls it).
 var job_id_seed: std.atomic.Value(u64) = .init(0);
+
+/// The striping census' `N_floor`: the slot plane's live derivation on
+/// volume 0 (the handover judge's word — "the striping trigger reads its
+/// window"), read at every served insert.
+fn stripeFloor(be: *meta_set.MetaSet) sym_xv.stripe.Floor {
+    return .{ .live = .{ .ctx = be.volumes[0], .read = &stripeFloorRead } };
+}
+
+fn stripeFloorRead(ctx: *anyopaque) u32 {
+    const be0: *meta_set.KvBackend = @ptrCast(@alignCast(ctx));
+    return @intCast(@min(be0.slots.judge.nFloorNow(), std.math.maxInt(u32)));
+}
 
 fn seedJobIds(io: Io) void {
     var b: [8]u8 = undefined;

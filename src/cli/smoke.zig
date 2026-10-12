@@ -64,6 +64,7 @@ const cr = @import("../meta/sym/control_records.zig");
 const route_table = @import("../meta/routing/route_table.zig");
 const appender_page = @import("../meta/sym/appender_page.zig");
 const membership = @import("../meta/sym/membership.zig");
+const sym_xv = @import("../meta/sym/xv.zig");
 const shard = membership.shard;
 const join_ladder = membership.join_ladder;
 const wire_verbs = @import("../wire/verbs.zig");
@@ -1446,6 +1447,21 @@ const Peer = struct {
         return Io.Dir.cwd().readFileAlloc(self.rig.io, self.log_path, self.rig.gpa, .limited(16 << 20));
     }
 
+    /// `onMount` under `timeout -s KILL <secs>` (`Rig.onMountTimed`'s law).
+    fn onMountTimed(self: *Peer, script: []const u8, secs: u32) ![]u8 {
+        const rig = self.rig;
+        var buf: [16]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "{d}", .{secs});
+        const r = try std.process.run(rig.gpa, rig.io, .{ .argv = &.{ "timeout", "-s", "KILL", s, "sh", "-e", "-c", script, "smoke", rig.work }, .cwd = .{ .path = self.mp }, .environ_map = &rig.env });
+        defer rig.gpa.free(r.stderr);
+        if (!r.term.success()) {
+            std.debug.print("\n--- {s}: mount script failed ({f}) ---\n{s}\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n", .{ self.name, r.term, script, r.stdout, r.stderr });
+            rig.gpa.free(r.stdout);
+            return error.ScriptFailed;
+        }
+        return r.stdout;
+    }
+
     /// `Rig.expectAlive`'s law for the peer.
     fn expectAlive(self: *Peer, waiting_for: []const u8) !void {
         if (self.child == null or alive(self.pid)) return;
@@ -1573,7 +1589,7 @@ fn matrixCreateScript(gpa: std.mem.Allocator) ![]u8 {
     return w.toOwnedSlice();
 }
 
-test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SECOND PROCESS joined over TCP (no flock, the region over the wire, the page as its ledger) → `appenders`/`clients` show both → B creates 2,000 files in its own directories (0 lease conflicts, rotor mints) → A reads B's files under tokens (grants; the second read is served from the cache; a write on B recalls and A's third read is fresh) → `tar -x` on B into a directory A owns (cross-owner intents, 0 stuck, closure) → `chmod` from A on B's file (the record ship; B's stat sees it) → a 200 MiB `dd` on B (every block a ranged grant pulled from A; `df` per the rule on both; the sha round trip from A; `rm` ships the frees to A) → closure + invariant tripwires 0 on both → umount B (page Free, the member row gone) → umount A" {
+test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SECOND PROCESS joined over TCP (no flock, the region over the wire, the page as its ledger) → `appenders`/`clients` show both → B creates 2,000 files in its own directories (0 lease conflicts, rotor mints) → A reads B's files under tokens (grants; the second read is served from the cache; a write on B recalls and A's third read is fresh) → `tar -x` on B into a directory A owns (cross-owner intents, 0 stuck, closure) → `chmod` from A on B's file (the record ship; B's stat sees it) → a 200 MiB `dd` on B (every block a ranged grant pulled from A; `df` per the rule on both; the sha round trip from A; `rm` ships the frees to A) → A writes 8 MiB into B's file (the promotion and every block-map merge SHIP as layout publishes to B, the size claim as one setattr; the sha equal on both) → closure + invariant tripwires 0 on both → umount B (page Free, the member row gone) → umount A" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
@@ -1773,6 +1789,40 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
         const df_b = try b.onMount("df -k . | tail -1 | awk '{print $3}'");
         defer gpa.free(df_b);
         std.debug.print("smoke: matrix: 200 MiB dd on B — {d} grant(s) / {d} blocks pulled from A in {d} top-up(s); sha from A equal; df used B {d} KiB, A {d} KiB; after rm on B: {d} frees shipped and freed at A, df A {d} KiB, B {s} KiB\n", .{ grants, granted_blocks, topups, used_b, used_a, numberAfter(tb2, "\"free_shipped_blocks\":") orelse 0, used_a_after, std.mem.trimEnd(u8, df_b, "\n") });
+    }
+    // A WRITES B's file AFTER the df arithmetic above (the holder's own
+    // carve for the write counts as used from B's view): charter §5.5 "the
+    // layout publish" of a
+    // foreign-slot file): 8 MiB from A into b2/f9 — the promotion of B's
+    // inline record and every block-map merge SHIP as layout publishes to
+    // B (B stages the record and its refs in ITS tree, recalls A's token),
+    // the size claim ships as one setattr; B reads the bytes back
+    // byte-exact and A reads them under B's token.
+    {
+        const out = try rig.onMount("dd if=/dev/urandom of=b2/f9 bs=1M count=8 conv=notrunc status=none && sync b2/f9 && sha256sum b2/f9 | cut -d' ' -f1 && stat -c %s b2/f9");
+        defer gpa.free(out);
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        const sha_a = lines.next() orelse return error.ShaMissing;
+        try testing.expectEqualStrings("8388608", std.mem.trim(u8, lines.next() orelse "", " \n"));
+        const from_b = try b.onMount("sha256sum b2/f9 | cut -d' ' -f1 && stat -c %s b2/f9");
+        defer gpa.free(from_b);
+        var bl = std.mem.splitScalar(u8, from_b, '\n');
+        try testing.expectEqualStrings(sha_a, bl.next() orelse "");
+        try testing.expectEqualStrings("8388608", std.mem.trim(u8, bl.next() orelse "", " \n"));
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        const shipped = numberAfter(ta, "\"layout_map_merges_shipped\":") orelse 0;
+        const served = numberAfter(tb, "\"layout_publishes_served\":") orelse 0;
+        try testing.expect(shipped >= 2);
+        try testing.expectEqual(shipped, numberAfter(ta, "\"foreign_publish_ships\":") orelse 0);
+        try testing.expectEqual(shipped, served);
+        try testing.expectEqual(served, numberAfter(tb, "\"foreign_publish_served\":") orelse 0);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"foreign_publish_refusals\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"foreign_publish_kvmap_refusals\":"));
+        try testing.expect((numberAfter(ta, "\"fuse_write_foreign_striped\":") orelse 0) >= 1);
+        std.debug.print("smoke: matrix: A wrote 8 MiB into B's file — layout publishes shipped {d} (= served at B {d}), foreign striped writes {d}, record ships {d}; sha equal on both\n", .{ shipped, served, numberAfter(ta, "\"fuse_write_foreign_striped\":") orelse 0, numberAfter(ta, "\"record_ships\":") orelse 0 });
     }
     // Closure on both daemons.
     {
@@ -3563,6 +3613,108 @@ test "smoke: THE HANDOVER DRAINS PARKED STAMPS (rung 10 item 4) — A (the manag
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     _ = try fsckClean(rig, "the handover row");
+}
+
+/// The striped directory's population: 10,000 names over K = 64 stripes
+/// (≈ 156 per stripe — the readdir merge reads every stripe's page set
+/// several times over; the rename storm's 1,000 moves cross stripes with
+/// probability 63/64).
+const stripe_row_files: usize = 10_000;
+const stripe_row_renames: usize = 1_000;
+
+/// `setfattr -n user.squeezefs.stripes -v K <dir>` without `attr` in the
+/// image: python's `os.setxattr` is the handler's own xattr path.
+fn setStripesScript(buf: []u8, dir: []const u8, k: u32) ![]const u8 {
+    return std.fmt.bufPrint(buf, "python3 -c 'import os,sys; os.setxattr(sys.argv[1], \"user.squeezefs.stripes\", sys.argv[2].encode())' {s} {d}", .{ dir, k });
+}
+
+fn getStripesScript(buf: []u8, dir: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "python3 -c 'import os,sys; sys.stdout.write(os.getxattr(sys.argv[1], \"user.squeezefs.stripes\").decode())' {s}", .{dir});
+}
+
+test "smoke: A STRIPED DIRECTORY ON ONE DAEMON — mkdir hot → the explicit flip (`user.squeezefs.stripes` = 64 through setxattr; getxattr answers 64, a plain directory ENODATA) → 10,000 creates key their stripes (dir_stripe_routed_mutations ≥ 10,000; D's own tree holds the 66 markers alone) → `ls | wc -l` = 10,000 and `find` = 10,001 (the K-way merge, every name once) → a 1,000-move rename storm across stripes, every target present, every source gone → stat's nlink folds a subdirectory in → rm -rf: the striped rmdir is ONE intent → umount → fsck --offline --scrub 0 findings (C17 clean)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    var sbuf: [512]u8 = undefined;
+    // The flip: ENODATA before, 64 after; a second flip refuses EEXIST.
+    {
+        const out = try rig.onMount("mkdir hot plain && if python3 -c 'import os,sys; os.getxattr(sys.argv[1], \"user.squeezefs.stripes\")' hot 2>/dev/null; then echo had-k; else echo no-k; fi");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("no-k\n", out);
+    }
+    {
+        const out = try rig.onMount(try setStripesScript(&sbuf, "hot", 64));
+        gpa.free(out);
+        const k = try rig.onMount(try getStripesScript(&sbuf, "hot"));
+        defer gpa.free(k);
+        try testing.expectEqualStrings("64\n", k);
+        const again = try rig.sh(rig.mp, try setStripesScript(&sbuf, "hot", 8));
+        defer rig.freeRun(again);
+        try testing.expect(!again.term.success());
+        try testing.expect(std.mem.indexOf(u8, again.stderr, "File exists") != null);
+        const plain = try rig.sh(rig.mp, try getStripesScript(&sbuf, "plain"));
+        defer rig.freeRun(plain);
+        try testing.expect(!plain.term.success());
+    }
+    // 10,000 creates through the shell, then the counts.
+    {
+        var script: std.Io.Writer.Allocating = .init(gpa);
+        defer script.deinit();
+        try script.writer.print("cd hot && i=0; while [ $i -lt {d} ]; do : > f$i; i=$((i+1)); done; cd ..; ls hot | wc -l; find hot | wc -l; find hot -name 'f*' | wc -l", .{stripe_row_files});
+        const out = try rig.onMountTimed(script.written(), 600);
+        defer gpa.free(out);
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&sbuf, "{d}", .{stripe_row_files}), std.mem.trim(u8, lines.next().?, " "));
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&sbuf, "{d}", .{stripe_row_files + 1}), std.mem.trim(u8, lines.next().?, " "));
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&sbuf, "{d}", .{stripe_row_files}), std.mem.trim(u8, lines.next().?, " "));
+    }
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dir_stripe_flips\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dir_striped_dirs\":"));
+        try testing.expect((numberAfter(ta, "\"dir_stripe_routed_mutations\":") orelse 0) >= stripe_row_files);
+        try testing.expect((numberAfter(ta, "\"dir_stripe_readdir_merges\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dir_stripe_dying_refusals\":"));
+    }
+    // The rename storm across stripes: every target present, every source
+    // gone, the count unchanged.
+    {
+        var script: std.Io.Writer.Allocating = .init(gpa);
+        defer script.deinit();
+        try script.writer.print("cd hot && i=0; while [ $i -lt {d} ]; do mv f$i r$i; i=$((i+1)); done; i=0; while [ $i -lt {d} ]; do test -e r$i; test ! -e f$i; i=$((i+1)); done; ls | wc -l", .{ stripe_row_renames, stripe_row_renames });
+        const out = try rig.onMountTimed(script.written(), 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&sbuf, "{d}\n", .{stripe_row_files}), out);
+    }
+    // stat: the fold — a subdirectory inside bumps D's nlink.
+    {
+        const out = try rig.onMount("stat -c %h hot; mkdir hot/sub; stat -c %h hot; rmdir hot/sub; stat -c %h hot");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("2\n3\n2\n", out);
+    }
+    // rm -rf: every name through its stripe, then the striped rmdir.
+    {
+        const out = try rig.onMountTimed("rm -rf hot && test ! -e hot && ls | wc -l", 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("1\n", out);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dir_stripe_rmdirs\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dir_striped_dirs\":"));
+        try expectMustStayZero(ta);
+        std.debug.print("\nsmoke: striped directory on one daemon — flips {d}, routed lookups {d}, routed mutations {d}, readdir merges {d}, verdict hits {d} / reads {d}, rmdirs {d}\n", .{ numberAfter(ta, "\"dir_stripe_flips\":") orelse 0, numberAfter(ta, "\"dir_stripe_routed_lookups\":") orelse 0, numberAfter(ta, "\"dir_stripe_routed_mutations\":") orelse 0, numberAfter(ta, "\"dir_stripe_readdir_merges\":") orelse 0, numberAfter(ta, "\"dir_stripe_verdict_hits\":") orelse 0, numberAfter(ta, "\"dir_stripe_verdict_reads\":") orelse 0, numberAfter(ta, "\"dir_stripe_rmdirs\":") orelse 0 });
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the striped directory row");
 }
 
 test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again" {

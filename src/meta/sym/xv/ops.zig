@@ -124,8 +124,11 @@ pub const CADENCE_TICK_NS: u64 = 1_100 * std.time.ns_per_ms;
 pub const Home = union(enum) {
     /// This mount leases the slot (or maintains it as the manager): the
     /// volume ordinal it lives on (a flat multi-volume set spans volumes
-    /// with every slot local).
-    local: struct { volume: u16 },
+    /// with every slot local) and the slot's lease GENERATION (0 when no
+    /// slot plane is armed) — the stamp a per-slot hint is valid under
+    /// (the striping's negative cache: "a stale lease stamp reads as no
+    /// hint").
+    local: struct { volume: u16, g: u32 = 0 },
     foreign: struct { holder: AppenderId, link: Link },
     /// The lessee has no bound endpoint yet (or is dead): never dialled.
     unreachable_: struct { holder: AppenderId },
@@ -140,7 +143,31 @@ pub const Resolver = struct {
     /// is the mount's own rotor slot (the home of an intent whose step 0
     /// is foreign).
     localSlots: *const fn (ctx: *anyopaque, out: []u16) []u16,
+    /// The dialled session to appender `holder` (the striping's supply
+    /// asks name a CREATOR, not a slot); null = no endpoint bound.
+    linkOf: *const fn (ctx: *anyopaque, holder: AppenderId) ?Link,
 };
+
+/// The directory striping's faces on the plane (charter §5.5 "Directory
+/// striping"), bound by the filesystem's striping module BEFORE the wire
+/// serves: a striping DOMAIN (a striped directory or a stripe) feeds no
+/// census and no dominance window; the `SupplyStripeInos` served side
+/// mints stripe records in THIS mount's slot on the directory's volume;
+/// the explicit flip COMMAND shipped to the holder runs here.
+pub const StripingFace = struct {
+    ctx: *anyopaque,
+    isDomain: *const fn (ctx: *anyopaque, ino: u64) bool,
+    /// Mint one `S_IFDIR` stripe record per index into `out` (the
+    /// records carry the directory's mode bits, uid, gid and stamp);
+    /// returns how many were minted (a short count = the rest declined).
+    supply: *const fn (ctx: *anyopaque, dir: u64, attrs: StripeAttrs, indices: []const u8, out: []u64) usize,
+    /// `setfattr -n user.squeezefs.stripes -v K` served at the holder.
+    flip: *const fn (ctx: *anyopaque, dir: u64, k: u8) errors.Error!void,
+};
+
+/// The attributes a supplied stripe record is minted with (its
+/// directory's).
+pub const StripeAttrs = struct { mode: u32, uid: u32, gid: u32, ts_ns: u64 };
 
 /// The witness of a FOREIGN object read through the token divert (the
 /// compensation's child type; null = unknown).
@@ -250,6 +277,7 @@ pub fn Plane(comptime Store: type) type {
         resolver: Resolver,
         witness: ?Witness = null,
         served_insert: ?ServedInsertSink = null,
+        striping: ?StripingFace = null,
         minter: intent.Minter,
         register: intent.Register,
         seams: Seams,
@@ -313,6 +341,32 @@ pub fn Plane(comptime Store: type) type {
         /// Is `global`'s slot this mount's?
         pub fn isLocal(self: *Self, global: u64) bool {
             return self.homeOfIno(global) == .local;
+        }
+
+        /// The lease generation this mount holds `global`'s slot under
+        /// (0 on an unarmed plane); null for a slot it does not hold.
+        pub fn localGen(self: *Self, global: u64) ?u32 {
+            return switch (self.homeOfIno(global)) {
+                .local => |l| l.g,
+                else => null,
+            };
+        }
+
+        /// The holder of `global`'s slot as this mount sees it: null for a
+        /// slot this mount holds.
+        pub fn holderOf(self: *Self, global: u64) ?AppenderId {
+            return switch (self.homeOfIno(global)) {
+                .local => null,
+                .foreign => |f| f.holder,
+                .unreachable_ => |u| u.holder,
+            };
+        }
+
+        /// Is `ino` a striped directory or a stripe (the striping face's
+        /// word; a plane without the face knows none)?
+        pub fn inStripingDomain(self: *Self, ino: u64) bool {
+            const f = self.striping orelse return false;
+            return f.isDomain(f.ctx, ino);
         }
 
         /// The travelling-guard tables for the op's keys.
@@ -434,7 +488,7 @@ pub fn Plane(comptime Store: type) type {
             const tx_id = self.minter.next();
             var done: Done = .{ .tx_id = tx_id };
             var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
-            var img_buf: [intent.XV_MAX_STEPS * 56 + intent.IntentHeaderWire.LEN]u8 = undefined;
+            var img_buf: [intent.IMAGE_MAX]u8 = undefined;
             const image = intent.encode(plan.op, 0, tx_id, plan.recs(&recs), self.record_cap, &img_buf) catch |e| return switch (e) {
                 error.TooManySteps => error.PlanTooLarge,
                 error.ValueTooLarge => error.ValueTooLarge,
@@ -639,7 +693,7 @@ pub fn Plane(comptime Store: type) type {
         /// REVERSE through the same applier, the retirement.
         fn compensate(self: *Self, tx_id: u64, home: u64, plan: *const Plan, refused_idx: usize, done: *Done, scope: guards.Scope, now: u64) Error!void {
             var recs: [intent.XV_MAX_STEPS]intent.StepRec = undefined;
-            var img_buf: [intent.XV_MAX_STEPS * 56 + intent.IntentHeaderWire.LEN]u8 = undefined;
+            var img_buf: [intent.IMAGE_MAX]u8 = undefined;
             const image = intent.encode(plan.op, intent.FLAG_ABORTING, tx_id, plan.recs(&recs), self.record_cap, &img_buf) catch return error.ValueTooLarge;
             self.apply.commitRiderAlone(.{ .put = .{ .home = home, .tx_id = tx_id, .image = image } }, .none) catch |e| return mapApply(e);
             self.apply.barrier() catch |e| return mapApply(e);
@@ -872,7 +926,13 @@ pub fn Plane(comptime Store: type) type {
             };
             stats.xv_cross_owner_steps_served.inc();
             if (step == .insert_dentry and out.status == .applied) {
-                if (self.served_insert) |s| if (requester) |r| s.note(s.ctx, step.insert_dentry.parent, r);
+                // The census' CREATOR is the shipped child's slot holder
+                // (a create in a foreign directory mints the child in the
+                // creator's rotor); the requester's word stands in when the
+                // child is ours. A striping domain feeds no census.
+                const parent = step.insert_dentry.parent;
+                const creator = self.holderOf(step.insert_dentry.child) orelse requester;
+                if (self.served_insert) |s| if (creator) |r| if (!self.inStripingDomain(parent)) s.note(s.ctx, parent, r);
             }
             return out;
         }
@@ -918,7 +978,10 @@ pub fn StepService(comptime Store: type) type {
                 error.OutOfMemory => service.Answer.refused(error.OutOfMemory, "out of memory serving the step"),
                 error.Io => service.Answer.refused(error.InputOutput, "the holder's records could not be read or written"),
             };
-            if (self.served_ship) |ss| if (req.peer) |p| ss.note(ss.ctx, r.head.volume, route_table.slotOf(step.homeIno()), p);
+            // "A ship into a striping domain feeds no window" (charter
+            // §5.5): a striped directory's or a stripe's ships never earn
+            // a handover offer.
+            if (self.served_ship) |ss| if (req.peer) |p| if (!self.plane.inStripingDomain(step.homeIno())) ss.note(ss.ctx, r.head.volume, route_table.slotOf(step.homeIno()), p);
             var w: verbs.StepOutcome = .{ .status = @backingInt(out.status), .has_inode = 0, .reserved = @splat(0), .inode = std.mem.zeroes(verbs.InodeValueWire), .reserved2 = @splat(0) };
             if (out.inode) |v| {
                 w.has_inode = 1;

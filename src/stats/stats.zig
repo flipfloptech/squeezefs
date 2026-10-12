@@ -76,6 +76,7 @@ const op_guard = @import("../fuse/handler/op_guard.zig");
 const open_table = @import("../fuse/handler/open_table.zig");
 const watchdog = @import("../fuse/handler/watchdog.zig");
 const kv_fs = @import("../fuse/handler/kv_fs.zig");
+const kv_fs_stripes = @import("../fuse/handler/kv_fs_stripes.zig");
 const virtual_inodes = @import("../fuse/handler/virtual_inodes.zig");
 const op_trace = @import("../fuse/handler/op_trace.zig");
 const codec = @import("../fuse/codec.zig");
@@ -268,6 +269,7 @@ pub const sources = [_]Source{
     .{ .path = "src/fuse/handler/open_table.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/watchdog.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/kv_fs.zig", .family = "fuse" },
+    .{ .path = "src/fuse/handler/kv_fs_stripes.zig", .family = "fuse" },
     .{ .path = "src/fuse/handler/virtual_inodes.zig", .family = "fuse" },
     .{ .path = "src/meta/checkpoint_cycle.zig", .family = "meta" },
     .{ .path = "src/fuse/handler/op_trace.zig", .family = "ops" },
@@ -577,7 +579,7 @@ fn writeMeta(src: *Sources, w: *Writer) Error!void {
 
 fn writeFuse(_: *Sources, w: *Writer) Error!void {
     try w.writeByte('{');
-    inline for (.{ .{ "lifecycle", lifecycle }, .{ "op_guard", op_guard }, .{ "open_table", open_table }, .{ "watchdog", watchdog }, .{ "kv_fs", kv_fs }, .{ "virtual_inodes", virtual_inodes.stats }, .{ "codec", codec } }, 0..) |m, i| {
+    inline for (.{ .{ "lifecycle", lifecycle }, .{ "op_guard", op_guard }, .{ "open_table", open_table }, .{ "watchdog", watchdog }, .{ "kv_fs", kv_fs }, .{ "kv_fs_stripes", kv_fs_stripes.stats }, .{ "virtual_inodes", virtual_inodes.stats }, .{ "codec", codec } }, 0..) |m, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":", .{m[0]});
         try counters.writeNamespaceJson(m[1], w);
@@ -1022,7 +1024,7 @@ test "every instrument declared in a generated namespace is a key of the documen
     const p = try r.render();
     defer p.deinit(testing.allocator);
     const text = p.bytes();
-    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.slots.stats, sym.slots.door.stats, sym.slots.acquire.stats, sym.slots.handover.stats, sym.slots.page_budget.stats, sym.slots.resolve.stats, sym.slots.tails_spill.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats, sym.xv.intent.stats, sym.xv.applier.stats, sym.xv.guards.stats, sym.xv.dir_rename.stats, sym.xv.ops.stats, sym.xv.record_ship.stats, sym.xv.stripe.stats }) |Ns| {
+    inline for (.{ node_cache.stats, tree.stats, smo.stats, leaf_merge.stats, alloc_ext, journal, ledger, record.stats, key.stats, tx.stats, economy.stats, inos.stats, dlm, heap_law.stats, node, node_snapshot.stats, node_state_core, checkpoint.stats, lifecycle, op_guard, open_table, watchdog, kv_fs, virtual_inodes.stats, codec, placement, tick, arc_swap, lock_order, transform.stats, write_seams.stats, stats, sym.stats, sym.manager.stats, sym.join.stats, sym.slots.stats, sym.slots.door.stats, sym.slots.acquire.stats, sym.slots.handover.stats, sym.slots.page_budget.stats, sym.slots.resolve.stats, sym.slots.tails_spill.stats, sym.tokens.table.stats, sym.tokens.cache.stats, sym.tokens.divert.stats, sym.tokens.ro.stats, sym.xv.intent.stats, sym.xv.applier.stats, sym.xv.guards.stats, sym.xv.dir_rename.stats, sym.xv.ops.stats, sym.xv.record_ship.stats, sym.xv.stripe.stats, kv_fs_stripes.stats }) |Ns| {
         inline for (comptime counters.instrumentNames(Ns)) |name| {
             const T = @TypeOf(@field(Ns, name));
             const k = if (T == counters.Tripwire) @field(Ns, name).site else name;

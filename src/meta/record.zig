@@ -149,6 +149,14 @@ fn inodeFieldBit(comptime name: []const u8) u16 {
     unreachable;
 }
 
+/// `InodeValue.flags` bit 0: the directory is a STRIPE of another
+/// (charter §5.5 "Directory striping"): nameless, minted by the flip or a
+/// `SupplyStripeInos`, it never carries a map, feeds no census and is
+/// never flipped itself — the record says so wherever it is read (the
+/// reference's reverse scan for `is_stripe` needed the parent; decision
+/// 0003 §Q).
+pub const INODE_FLAG_STRIPE: u32 = 1 << 0;
+
 pub const InodeValue = struct {
     mode: u32 = 0,
     uid: u32 = 0,

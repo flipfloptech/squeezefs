@@ -46,8 +46,16 @@ pub const ParentUpdate = verbs.ParentUpdate;
 /// XV_GUARDS_MAX`, `dlm.wide_requests`).
 pub const XV_MAX_STEPS: usize = 2 * acquire.MINT_SPREAD + 8;
 
+/// The widest image a plan encodes to: the header, every step but one
+/// carrying at most a MARKER name (`\0sqz.stripe:NN`, 14 B, padded to
+/// 16 — the striped `rmdir`'s `K + 2` removes; the count steps carry
+/// none) and ONE user name at `NAME_MAX` (the parent's dentry step, padded
+/// to 8) — ≈ 8.9 KiB, inside the 16 KiB record cap at 64 KiB nodes.
+pub const IMAGE_MAX: usize = IntentHeaderWire.LEN + (XV_MAX_STEPS - 1) * (@sizeOf(StepWire) + codec.padTo(14, 8)) + @sizeOf(StepWire) + codec.padTo(record.NAME_MAX, 8);
+
 comptime {
     assert(XV_MAX_STEPS == 136 and XV_MAX_STEPS == verbs.XV_GUARDS_MAX);
+    assert(IMAGE_MAX < 16 << 10);
 }
 
 /// The op the intent carries (the header's `op`; explicit values — the

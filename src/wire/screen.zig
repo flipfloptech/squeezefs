@@ -684,7 +684,7 @@ test "tokens, steps, guards, the record ship" {
     const g0 = [_]verbs.GuardInodeWire{.{ .ino = 0, .exclusive = 0, .reserved = @splat(0) }};
     try expectRejected(.guard_ino_zero, xvGuards(.{ .head = .{ .volume = 0, .n_inodes = 1, .n_dentries = 0, .reserved = 0, .scope = 5 }, .inodes = &g0, .dentries_bytes = "" }));
     try expectRejected(.object_zero, lookupExact(.{ .head = .{ .volume = 0, .name_len = 1, .reserved = 0, .reserved2 = 0, .parent = 0 }, .bytes = "a" }));
-    const ship: verbs.RecordShipReq = .{ .head = .{ .volume = 0, .kind = 2, .reserved = 0, .name_len = 1, .reserved2 = 0, .value_len = 5, .reserved3 = 0, .ino = 9, .lease_epoch = 1, .setattr = .none }, .name = "a", .value = "vvvvv" };
+    const ship: verbs.RecordShipReq = .{ .head = .{ .volume = 0, .kind = 2, .reserved = 0, .name_len = 1, .n_proofs = 0, .value_len = 5, .reserved3 = 0, .ino = 9, .lease_epoch = 1, .setattr = .none }, .name = "a", .value = "vvvvv" };
     try testing.expect(recordShip(ship, 16384).isOk());
     try expectRejected(.value_past_record_cap, recordShip(ship, 4));
     var ship0 = ship;

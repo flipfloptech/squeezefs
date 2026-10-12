@@ -100,6 +100,7 @@ pub const Verb = enum(u16) {
     xv_release = 0x0303,
     record_ship = 0x0304,
     free_blocks = 0x0305,
+    supply_stripe_inos = 0x0306,
     // ---- tokens 0x0400 ----
     token_grant = 0x0400,
     token_recall = 0x0401,
@@ -1480,12 +1481,30 @@ pub const SetattrWire = extern struct {
     }
 };
 
+/// A shipped layout publish's witness that the writer's DMA of `[offset,
+/// offset + len)` on `vol_tag` COMPLETED (`data/layout.DmaProof` on the
+/// wire): the holder's `publishLayout` demands one per block the new
+/// layout names and the old did not — the DMA-before-type-flip law keeps
+/// its shape across the ship.
+pub const DmaProofWire = extern struct {
+    vol_tag: u64,
+    offset: u64,
+    len: u64,
+    completed_ns: u64,
+};
+
+/// The proofs a shipped publish may carry: one per binding of the widest
+/// inline map a publish merges (`kv_fs.MAX_BINDINGS_PER_INO`); 1,400 ×
+/// 32 B stays far inside the control cap.
+pub const PUBLISH_PROOFS_MAX: usize = 1400;
+
 pub const RecordShipHead = extern struct {
     volume: u16,
     kind: u8,
     reserved: u8,
     name_len: u16,
-    reserved2: u16,
+    /// `publish_layout` alone: the `DmaProofWire` tail's count.
+    n_proofs: u16,
     value_len: u32,
     reserved3: u32,
     ino: u64,
@@ -1495,11 +1514,12 @@ pub const RecordShipHead = extern struct {
 
     pub fn check(self: RecordShipHead) bool {
         if (self.kind < 1 or self.kind > 4) return false;
-        if (self.name_len > record.NAME_MAX or self.value_len > RECORD_VALUE_MAX) return false;
+        if (self.name_len > record.NAME_MAX or self.value_len > RECORD_VALUE_MAX or self.n_proofs > PUBLISH_PROOFS_MAX) return false;
         return switch (@as(RecordShipKind, @fromBackingInt(@intCast(self.kind)))) {
-            .setattr => self.name_len == 0 and self.value_len == 0,
-            .setxattr, .publish_layout => self.name_len != 0 and self.setattr.valid == 0,
-            .removexattr => self.name_len != 0 and self.value_len == 0 and self.setattr.valid == 0,
+            .setattr => self.name_len == 0 and self.value_len == 0 and self.n_proofs == 0,
+            .setxattr => self.name_len != 0 and self.setattr.valid == 0 and self.n_proofs == 0,
+            .publish_layout => self.name_len != 0 and self.setattr.valid == 0,
+            .removexattr => self.name_len != 0 and self.value_len == 0 and self.setattr.valid == 0 and self.n_proofs == 0,
         };
     }
 };
@@ -1509,13 +1529,15 @@ pub const RecordShipReq = struct {
     head: RecordShipHead,
     name: []const u8,
     value: []const u8,
+    proofs: []align(1) const DmaProofWire = &.{},
 
     pub fn encode(self: RecordShipReq, b: *Builder) codec.BuildError!void {
-        std.debug.assert(self.head.name_len == self.name.len and self.head.value_len == self.value.len);
+        std.debug.assert(self.head.name_len == self.name.len and self.head.value_len == self.value.len and self.head.n_proofs == self.proofs.len);
         try b.put(RecordShipHead, self.head);
         try b.putBytes(self.name);
         try b.putBytes(self.value);
         try b.putPadding(self.name.len + self.value.len, codec.TAIL_ALIGN);
+        try b.putView(DmaProofWire, self.proofs);
     }
 
     pub fn decode(c: *Cursor) Error!RecordShipReq {
@@ -1523,9 +1545,68 @@ pub const RecordShipReq = struct {
         const name = try c.takeBytes(head.name_len);
         const value = try c.takeBytes(head.value_len);
         try c.takePadding(@as(usize, head.name_len) + head.value_len, codec.TAIL_ALIGN);
-        return .{ .head = head, .name = name, .value = value };
+        const proofs = try c.takeArray(DmaProofWire, head.n_proofs);
+        return .{ .head = head, .name = name, .value = value, .proofs = proofs };
     }
 };
+
+/// `SupplyStripeInos{dir, indices[]}` (charter §5.5 "Directory striping",
+/// Phase A of the flip; decision 0002 Q14: batched per creator): the
+/// holder of `D` asks a creator to mint one nameless `S_IFDIR` stripe
+/// record per index in the CREATOR's slot on `D`'s volume, carrying `D`'s
+/// mode bits, owner and stamp.
+pub const SupplyStripeInosHead = extern struct {
+    volume: u16,
+    n: u16,
+    reserved: u32,
+    dir: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    reserved2: u32,
+    ts_ns: u64,
+
+    pub fn check(self: SupplyStripeInosHead) bool {
+        return self.n >= 1 and self.n <= STRIPES_MAX and self.dir != 0;
+    }
+};
+
+/// `K = MINT_SPREAD = 64`: a map's widest index set (the marker codec's
+/// two digits bound it too).
+pub const STRIPES_MAX: usize = 64;
+
+pub const SupplyStripeInosReq = struct {
+    head: SupplyStripeInosHead,
+    /// The stripe indices asked for (each `< STRIPES_MAX`), `n` of them.
+    indices: []const u8,
+
+    pub fn encode(self: SupplyStripeInosReq, b: *Builder) codec.BuildError!void {
+        std.debug.assert(self.head.n == self.indices.len);
+        try b.put(SupplyStripeInosHead, self.head);
+        try b.putBytes(self.indices);
+        try b.putPadding(self.indices.len, codec.TAIL_ALIGN);
+    }
+
+    pub fn decode(c: *Cursor) Error!SupplyStripeInosReq {
+        const head = try c.take(SupplyStripeInosHead);
+        const indices = try c.takeBytes(head.n);
+        for (indices) |i| if (i >= STRIPES_MAX) return error.Malformed;
+        try c.takePadding(head.n, codec.TAIL_ALIGN);
+        return .{ .head = head, .indices = indices };
+    }
+};
+
+/// The supplied inos, in the ask's index order; `n < asked` = the rest
+/// declined (the holder mints them itself).
+pub const StripeInosSuppliedHead = extern struct {
+    n: u16,
+    reserved: [6]u8,
+
+    pub fn check(self: StripeInosSuppliedHead) bool {
+        return self.n <= STRIPES_MAX;
+    }
+};
+pub const StripeInosSupplied = HeadWithArray(StripeInosSuppliedHead, u64, "n", STRIPES_MAX);
 
 pub const RecordShipReplyKind = enum(u8) { served = 0, slot_moved = 1 };
 
@@ -1614,6 +1695,7 @@ pub fn ReqType(comptime v: Verb) type {
         .xv_release => XvReleaseReq,
         .record_ship => RecordShipReq,
         .free_blocks => FreeBlocksReq,
+        .supply_stripe_inos => SupplyStripeInosReq,
         .token_grant => TokenGrantReq,
         .token_recall => TokenRecallReq,
         .token_recall_ack => TokenRecallAckReq,
@@ -1674,6 +1756,7 @@ pub fn RepType(comptime v: Verb) type {
         .xv_guards, .xv_release => Ack,
         .record_ship => RecordShipReply,
         .free_blocks => FreeVerdicts,
+        .supply_stripe_inos => StripeInosSupplied,
         .token_grant => GrantPage,
         .token_recall => RecallVerdict,
         .token_recall_ack => Ack,
@@ -2010,9 +2093,24 @@ test "cross-owner payloads: a step with a name, the exact lookup, travelling gua
     try testing.expectEqual(@as(?GuardDentry, null), dit.next());
     _ = try roundTrip(XvReleaseReq, .{ .volume = 0, .reserved = 0, .reserved2 = 0, .scope = 1 << 40 | 3, .ino = 9 });
     const sa: SetattrWire = .{ .valid = SETATTR_MODE | SETATTR_MTIME, .mode = 0o644, .uid = 0, .gid = 0, .size = 0, .atime = 0, .mtime = 123, .ctime = 0 };
-    _ = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 1, .reserved = 0, .name_len = 0, .reserved2 = 0, .value_len = 0, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = sa }, .name = "", .value = "" });
-    const rs = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 2, .reserved = 0, .name_len = 6, .reserved2 = 0, .value_len = 3, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = .none }, .name = "user.a", .value = "xyz" });
+    _ = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 1, .reserved = 0, .name_len = 0, .n_proofs = 0, .value_len = 0, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = sa }, .name = "", .value = "" });
+    const rs = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 2, .reserved = 0, .name_len = 6, .n_proofs = 0, .value_len = 3, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = .none }, .name = "user.a", .value = "xyz" });
     try testing.expectEqualStrings("xyz", rs.value);
+    // A publish carries its DMA proofs; a record verb never does.
+    const proofs = [_]DmaProofWire{ .{ .vol_tag = 11, .offset = 1 << 22, .len = 1 << 22, .completed_ns = 5 }, .{ .vol_tag = 11, .offset = 1 << 23, .len = 4096, .completed_ns = 6 } };
+    const pl = try roundTrip(RecordShipReq, .{ .head = .{ .volume = 0, .kind = 4, .reserved = 0, .name_len = 6, .n_proofs = 2, .value_len = 3, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = .none }, .name = "layout", .value = "LAY", .proofs = &proofs });
+    try testing.expectEqual(@as(u64, 1 << 23), pl.proofs[1].offset);
+    var pb: Builder = .init(&buf);
+    try (RecordShipReq{ .head = .{ .volume = 0, .kind = 2, .reserved = 0, .name_len = 6, .n_proofs = 1, .value_len = 3, .reserved3 = 0, .ino = 9, .lease_epoch = 2, .setattr = .none }, .name = "user.a", .value = "xyz", .proofs = proofs[0..1] }).encode(&pb);
+    try testing.expectError(error.Malformed, codec.decodePayload(RecordShipReq, pb.written()));
+    // The stripe supply: indices below the width, a batch per creator.
+    const ss = try roundTrip(SupplyStripeInosReq, .{ .head = .{ .volume = 0, .n = 3, .reserved = 0, .dir = 1 << 40 | 9, .mode = 0o755, .uid = 1, .gid = 2, .reserved2 = 0, .ts_ns = 7 }, .indices = &.{ 0, 5, 63 } });
+    try testing.expectEqual(@as(u8, 63), ss.indices[2]);
+    var sb: Builder = .init(&buf);
+    try (SupplyStripeInosReq{ .head = .{ .volume = 0, .n = 1, .reserved = 0, .dir = 9, .mode = 0, .uid = 0, .gid = 0, .reserved2 = 0, .ts_ns = 0 }, .indices = &.{64} }).encode(&sb);
+    try testing.expectError(error.Malformed, codec.decodePayload(SupplyStripeInosReq, sb.written()));
+    const inos_ = [_]u64{ 1 << 40 | 100, 1 << 40 | 101 };
+    _ = try roundTrip(StripeInosSupplied, .{ .head = .{ .n = 2, .reserved = @splat(0) }, .items = &inos_ });
     _ = try roundTrip(RecordShipReply, .{ .kind = 1, .has_inode = 0, .reserved = 0, .holder = 4, .inode = std.mem.zeroes(InodeValueWire), .reserved2 = @splat(0) });
     const blocks = [_]u64{ 5, 6, 7 };
     _ = try roundTrip(FreeBlocksReq, .{ .head = .{ .volume = 0, .n = 3, .reserved = 0, .vol_tag = 11, .lease_epoch = 2 }, .items = &blocks });

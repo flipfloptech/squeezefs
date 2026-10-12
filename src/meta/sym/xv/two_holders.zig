@@ -181,8 +181,13 @@ pub const Holder = struct {
         return out[0..n];
     }
 
+    fn linkOfFn(ctx: *anyopaque, holder: u32) ?ops.Link {
+        const self: *Holder = @ptrCast(@alignCast(ctx));
+        return if (holder == self.other().id) linkOf(&self.conn) else null;
+    }
+
     fn resolver(self: *Holder) ops.Resolver {
-        return .{ .ctx = self, .homeOf = &homeOf, .refresh = &refresh, .localSlots = &localSlots };
+        return .{ .ctx = self, .homeOf = &homeOf, .refresh = &refresh, .localSlots = &localSlots, .linkOf = &linkOfFn };
     }
 
     /// The divert stand-in: a foreign object's record read at its holder.
@@ -695,13 +700,37 @@ const HolderView = struct {
     }
 };
 
-test "record ship: a chmod/setxattr/removexattr/layout publish of a FOREIGN-slot file lands at its holder as ONE verb each, under the holder's door, and the holder invalidates its own attr cache and kernel view (INVAL_INODE then PRUNE); a local file ships nothing; a slot-moved answer redirects once; ships ≡ served" {
+/// The harness's publish face: the layout record staged verbatim (the
+/// refs diff is the data plane's; the RAM holder has none), the proofs
+/// counted — a publish naming blocks without a proof is what the plane's
+/// face refuses, pinned by `data/plane.zig`.
+const RamPublish = struct {
+    staged: u32 = 0,
+    proofs_seen: usize = 0,
+    fn stage(ctx: *anyopaque, t: *tx.KvTx, key_ino: u64, coll_seq: u8, _: ?[]const u8, value: []const u8, proofs: []align(1) const verbs.DmaProofWire) record_ship.PublishFace.PublishError!void {
+        const self: *RamPublish = @ptrCast(@alignCast(ctx));
+        self.staged += 1;
+        self.proofs_seen += proofs.len;
+        const layout_mod = @import("../../../data/layout.zig");
+        var buf: [64]u8 = undefined;
+        const enc = (record.XattrValue{ .name = layout_mod.LAYOUT_XATTR_NAME, .value = value }).encodeInto(&buf) catch return error.Rejected;
+        const seed: key.NameKey = .init(0x5EED_0F_7E57);
+        t.stagePut(key.TREE_XATTRS, &key.xattrKey(key_ino, key.xattrNameHash56(layout_mod.LAYOUT_XATTR_NAME, &seed), coll_seq), enc) catch return error.OutOfMemory;
+    }
+    fn face(self: *RamPublish) record_ship.PublishFace {
+        return .{ .ctx = self, .stage = &stage };
+    }
+};
+
+test "record ship: a chmod/setxattr/removexattr/layout publish of a FOREIGN-slot file lands at its holder as ONE verb each, under the holder's door, and the holder invalidates its own attr cache and kernel view (INVAL_INODE then PRUNE); the publish carries its DMA proofs to the holder's face and is REJECTED where no face is armed; a local file ships nothing; a slot-moved answer redirects once; ships ≡ served" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
     defer f.deinit();
     var view: HolderView = .{};
     var rs_b: RecordShipService = .{ .plane = &f.b.plane, .sink = view.sink() };
     rs_b.register(&f.b.svc);
+    var ram_pub: RamPublish = .{};
+    const pub_face = ram_pub.face();
     const file = gino(50, 3);
     try f.b.seedFile(file, 1);
     const ships0 = record_ship.stats.record_ships.load();
@@ -724,11 +753,20 @@ test "record ship: a chmod/setxattr/removexattr/layout publish of a FOREIGN-slot
     try testing.expect(r2.inode != null);
     const r3 = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .removexattr = .{ .name = "user.a" } }, 0)).?;
     try testing.expect(r3.inode == null);
-    // The layout publish: whole-inode invalidation, counted as a publish.
+    // The layout publish: REJECTED while the holder has no publish face
+    // (a volume-less holder stages no refs — never a dangling record);
+    // armed, it lands with its proofs, whole-inode invalidation, counted.
     const pub0 = record_ship.stats.foreign_publish_ships.load();
     const pubs0 = record_ship.stats.foreign_publish_served.load();
-    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .publish_layout = .{ .value = "LAYOUT" } }, 3)).?;
+    const refused0 = record_ship.stats.foreign_publish_refusals.load();
+    const proofs = [_]verbs.DmaProofWire{.{ .vol_tag = 11, .offset = 1 << 22, .len = 1 << 22, .completed_ns = 5 }};
+    try testing.expectError(error.Rejected, record_ship.ship(f.a.plane.resolver, 0, file, .{ .publish_layout = .{ .value = "LAYOUT", .proofs = &proofs } }, 3));
+    try testing.expectEqual(refused0 + 1, record_ship.stats.foreign_publish_refusals.load());
+    rs_b.armPublish(&pub_face);
+    _ = (try record_ship.ship(f.a.plane.resolver, 0, file, .{ .publish_layout = .{ .value = "LAYOUT", .proofs = &proofs } }, 3)).?;
     try testing.expectEqual(@as(i64, 0), view.last_off);
+    try testing.expectEqual(@as(u32, 1), ram_pub.staged);
+    try testing.expectEqual(@as(usize, 1), ram_pub.proofs_seen);
     try testing.expectEqual(pub0 + 1, record_ship.stats.foreign_publish_ships.load());
     try testing.expectEqual(pubs0 + 1, record_ship.stats.foreign_publish_served.load());
     // A LOCAL file ships nothing.
@@ -772,18 +810,29 @@ const StripeSource = struct {
     fn src(self: *StripeSource) stripe.DirSource {
         return .{ .ctx = self, .page = &page, .inode = &inode };
     }
-    /// The supplier: the OTHER creator mints a stripe record in ITS slot.
-    fn supply(ctx: *anyopaque, creator: u32, _: u64, _: u8) ?u64 {
-        const self: *StripeSource = @ptrCast(@alignCast(ctx));
-        const o = self.h.other();
-        if (o.id != creator) return null;
-        const ino = o.mint();
-        _ = o.plane.apply.apply(.{ .create_inode = .{ .ino = ino, .mode = S.IFDIR | 0o755, .uid = 0, .gid = 0, .rdev = 0, .size = 0, .ts_ns = 1 } }, .none, .none, 1) catch return null;
-        return ino;
-    }
-    fn mintOwn(ctx: *anyopaque, _: u64, _: u8) ?u64 {
+    fn mintOwn(ctx: *anyopaque, _: u64) ?u64 {
         const self: *StripeSource = @ptrCast(@alignCast(ctx));
         return self.h.mint();
+    }
+    fn minter(self: *StripeSource) stripe.Minter {
+        return .{ .ctx = self, .mint = &mintOwn };
+    }
+    /// The striping face of holder `h` (the `SupplyStripeInos` served
+    /// side): a batch of stripe records minted in ITS rotor, one entry.
+    fn isDomain(_: *anyopaque, _: u64) bool {
+        return false;
+    }
+    fn supply(ctx: *anyopaque, _: u64, attrs: ops.StripeAttrs, indices: []const u8, out: []u64) usize {
+        const self: *StripeSource = @ptrCast(@alignCast(ctx));
+        for (indices, 0..) |_, i| out[i] = self.h.mint();
+        stripe.writeStripeRecords(HolderStore, &self.h.store, out[0..indices.len], attrs) catch return 0;
+        return indices.len;
+    }
+    fn flipFace(_: *anyopaque, _: u64, _: u8) errors.Error!void {
+        return error.NotSupported;
+    }
+    fn face(self: *StripeSource) ops.StripingFace {
+        return .{ .ctx = self, .isDomain = &isDomain, .supply = &supply, .flip = &flipFace };
     }
 };
 
@@ -793,15 +842,19 @@ fn namesOf(gpa: Allocator, recs: []const stripe.DirRec) ![][]const u8 {
     return out;
 }
 
-test "striping: a flip supplied by the other creator maps K stripes under ONE intent (the commit marker last); a create into the striped directory keys the STRIPE (shipped when the stripe is foreign); a name left in D re-homes lazily on its next mutation and reads from the stripe (LWW); readdir is the K-way merge in cookie order with a stable continuation across the flip; stat folds nlink and times; rmdir is ONE intent and leaves no map, no stripe, no name; C17 is clean" {
+test "striping: a flip supplied by the other creator OVER THE WIRE (`SupplyStripeInos`, one batch for its share) maps K stripes under ONE intent (the commit marker last), every stripe record flagged; a create into the striped directory keys the STRIPE (shipped when the stripe is foreign); a name left in D re-homes lazily on its next mutation and reads from the stripe (LWW); readdir is the K-way merge in cookie order with a stable continuation across the flip; stat folds nlink and times; rmdir is ONE intent and leaves no map, no stripe, no name; C17 is clean" {
     const gpa = testing.allocator;
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
     defer f.deinit();
     const K: u8 = 4;
     var src_b: StripeSource = .{ .h = &f.b };
-    var st = try Striping.init(&f.b.plane, src_b.src(), &src_b, &StripeSource.mintOwn, K, 2);
+    var st = try Striping.init(&f.b.plane, src_b.src(), src_b.minter(), K, .{ .fixed = 2 });
     defer st.deinit();
-    st.supplier = .{ .ctx = &src_b, .mint = &StripeSource.supply };
+    // A serves the supply on its wire face (the creator's side).
+    var src_a: StripeSource = .{ .h = &f.a };
+    f.a.plane.striping = src_a.face();
+    var supply_a: stripe.SupplyService(HolderStore) = .{ .plane = &f.a.plane };
+    supply_a.register(&f.a.svc);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -814,20 +867,34 @@ test "striping: a flip supplied by the other creator maps K stripes under ONE in
     var before: std.ArrayList(stripe.DirRec) = .empty;
     _ = try stripe.pageFromStore(HolderStore, &f.b.store, arena, DIR_B, 0, 64, &before);
     try testing.expectEqual(@as(usize, 4), before.items.len);
-    // The flip: A supplies (the census' heaviest creator), B mints the rest.
+    // The flip: A supplies its share (K / 2 = 2 stripes in ONE ask over
+    // the wire), B mints the rest.
     const flips0 = stripe.stats.dir_stripe_flips.load();
     const sup0 = stripe.stats.dir_stripe_supply_rpcs.load();
+    const supplied0 = stripe.stats.dir_stripe_supplied.load();
+    const served0 = stripe.stats.dir_stripe_supplies_served.load();
     var map = try st.flip(DIR_B, K, &.{1});
     try testing.expectEqual(flips0 + 1, stripe.stats.dir_stripe_flips.load());
     try testing.expectEqual(sup0 + 1, stripe.stats.dir_stripe_supply_rpcs.load());
+    try testing.expectEqual(supplied0 + 2, stripe.stats.dir_stripe_supplied.load());
+    try testing.expectEqual(served0 + 1, stripe.stats.dir_stripe_supplies_served.load());
     try testing.expectEqual(K, map.k);
     try testing.expectEqual(@as(u16, 1), route_table.slotOf(map.stripes[0]));
-    try testing.expectEqual(@as(u16, 3), route_table.slotOf(map.stripes[1]));
+    try testing.expectEqual(@as(u16, 1), route_table.slotOf(map.stripes[1]));
+    try testing.expectEqual(@as(u16, 3), route_table.slotOf(map.stripes[2]));
+    try testing.expectEqual(@as(u16, 3), route_table.slotOf(map.stripes[3]));
+    // Every stripe record carries the flag at its holder; D does not.
+    for (map.slice()) |s| {
+        const hh: *Holder = if (f.a.store.leases(route_table.slotOf(s))) &f.a else &f.b;
+        try testing.expect(stripe.isStripeRecord((try hh.inode(s)).?));
+    }
+    try testing.expect(!stripe.isStripeRecord((try f.b.inode(DIR_B)).?));
     const read_back = (try stripe.readMap(src_b.src(), arena, DIR_B)).?;
     try testing.expectEqualSlices(u64, map.slice(), read_back.slice());
     try testing.expect(read_back.migrating);
-    // A stripe never carries a map; a second flip refuses.
-    try testing.expect((try stripe.readMap(src_b.src(), arena, map.stripes[1])) == null);
+    // A stripe never carries a map, never flips; a second flip refuses.
+    try testing.expect((try stripe.readMap(src_b.src(), arena, map.stripes[2])) == null);
+    try testing.expectError(error.IsAStripe, st.flip(map.stripes[2], K, &.{}));
     try testing.expectError(error.AlreadyStriped, st.flip(DIR_B, K, &.{}));
     try testing.expectError(error.StripingOff, st.flip(DIR_A, 1, &.{}));
     // readdir across the flip: the same four names, markers never shown,
@@ -949,31 +1016,40 @@ test "the automatic trigger: foreign ships into one directory from MORE THAN ONE
     const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
     defer f.deinit();
     var src_b: StripeSource = .{ .h = &f.b };
-    var st = try Striping.init(&f.b.plane, src_b.src(), &src_b, &StripeSource.mintOwn, 2, 3);
+    var st = try Striping.init(&f.b.plane, src_b.src(), src_b.minter(), 2, .{ .fixed = 3 });
     defer st.deinit();
-    st.supplier = .{ .ctx = &src_b, .mint = &StripeSource.supply };
     f.b.plane.served_insert = st.servedInsertSink();
-    f.b.step_svc.requesterOf = &struct {
-        fn of(p: verbs.WireIdentity) ?u32 {
-            return @intCast(p.mount_slot);
-        }
-    }.of;
     try f.b.seedDir(DIR_B);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const flips0 = stripe.stats.dir_stripe_flips.load();
-    // One creator (A) ships four names: a handover candidate, never a stripe.
+    // One creator (A, the shipped child's slot holder — no requester word
+    // needed) ships four names: a handover candidate, never a stripe.
     for ([_][]const u8{ "a1", "a2", "a3", "a4" }) |nm| _ = try f.a.create(DIR_B, nm, S.IFREG | 0o644);
     try testing.expectEqual(flips0, stripe.stats.dir_stripe_flips.load());
+    try testing.expectEqual(@as(u32, 1), st.census.dirs.get(DIR_B).?.distinct());
     try testing.expect((try stripe.readMap(src_b.src(), arena, DIR_B)) == null);
     // A second creator's served ship crosses the floor: the flip runs,
     // contained, after the served step.
     f.b.plane.served_insert.?.note(f.b.plane.served_insert.?.ctx, DIR_B, 9);
     try testing.expectEqual(flips0 + 1, stripe.stats.dir_stripe_flips.load());
-    try testing.expect((try stripe.readMap(src_b.src(), arena, DIR_B)) != null);
+    const map = (try stripe.readMap(src_b.src(), arena, DIR_B)).?;
+    // A ship INTO a stripe feeds no census (the face says so).
+    f.b.plane.striping = src_b.face();
+    const StripeDomain = struct {
+        var m: ?stripe.StripeMap = null;
+        fn isDomain(_: *anyopaque, ino: u64) bool {
+            return m.?.dir == ino or m.?.isStripe(ino);
+        }
+    };
+    StripeDomain.m = map;
+    f.b.plane.striping.?.isDomain = &StripeDomain.isDomain;
+    const dirs0 = st.census.dirs.count();
+    _ = try f.a.create(map.stripes[0], "into-stripe", S.IFREG | 0o644);
+    try testing.expectEqual(dirs0, st.census.dirs.count());
     // The control arm: K = 1 flips nothing.
-    var off = try Striping.init(&f.b.plane, src_b.src(), &src_b, &StripeSource.mintOwn, 1, 1);
+    var off = try Striping.init(&f.b.plane, src_b.src(), src_b.minter(), 1, .{ .fixed = 1 });
     defer off.deinit();
     try f.b.seedDir(gino(3, 3));
     try testing.expectError(error.StripingOff, off.flip(gino(3, 3), 1, &.{}));

@@ -236,6 +236,7 @@ const FamilyEcho = struct {
                 @memset(scratch[0..n], 1);
                 break :blk .{ .ok = .{ .free_blocks = .{ .head = .{ .n = @intCast(n), .reserved = @splat(0) }, .verdicts = scratch[0..n] } } };
             },
+            .supply_stripe_inos => .{ .ok = .{ .supply_stripe_inos = .{ .head = .{ .n = 0, .reserved = @splat(0) }, .items = &.{} } } },
             // @anchor:ops_jobs_loopback_echo — the job block's canned shapes.
             .job_enroll => .{ .ok = .{ .job_enroll = .{ .heartbeat_ms = 10_000, .lease_ttl_ms = 30_000 } } },
             .shard_assign => .{ .ok = .{ .shard_assign = .none } },
@@ -351,9 +352,11 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     _ = try c.call(.{ .lookup_exact = .{ .head = .{ .volume = 0, .name_len = 1, .reserved = 0, .reserved2 = 0, .parent = 1 }, .bytes = "a" } });
     _ = try c.call(.{ .xv_guards = .{ .head = .{ .volume = 0, .n_inodes = 0, .n_dentries = 0, .reserved = 0, .scope = 5 }, .inodes = &.{}, .dentries_bytes = "" } });
     _ = try c.call(.{ .xv_release = .{ .volume = 0, .reserved = 0, .reserved2 = 0, .scope = 5, .ino = 9 } });
-    _ = try c.call(.{ .record_ship = .{ .head = .{ .volume = 0, .kind = 3, .reserved = 0, .name_len = 1, .reserved2 = 0, .value_len = 0, .reserved3 = 0, .ino = 9, .lease_epoch = 0, .setattr = .none }, .name = "a", .value = "" } });
+    _ = try c.call(.{ .record_ship = .{ .head = .{ .volume = 0, .kind = 3, .reserved = 0, .name_len = 1, .n_proofs = 0, .value_len = 0, .reserved3 = 0, .ino = 9, .lease_epoch = 0, .setattr = .none }, .name = "a", .value = "" } });
     const fv = try c.call(.{ .free_blocks = .{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .vol_tag = 11, .lease_epoch = 0 }, .items = &objs } });
     try testing.expectEqual(@as(usize, 2), fv.free_blocks.verdicts.len);
+    const ss = try c.call(.{ .supply_stripe_inos = .{ .head = .{ .volume = 0, .n = 2, .reserved = 0, .dir = 9, .mode = 0o755, .uid = 0, .gid = 0, .reserved2 = 0, .ts_ns = 1 }, .indices = &.{ 0, 1 } } });
+    try testing.expectEqual(@as(usize, 0), ss.supply_stripe_inos.items.len);
     // Ping is the service's own.
     // @anchor:ops_jobs_loopback_calls — the job block's six verbs.
     _ = try c.call(.{ .job_enroll = .{ .pr_key = 0, .caps = 0, .reserved = 0 } });

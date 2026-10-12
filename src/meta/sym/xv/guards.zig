@@ -271,14 +271,16 @@ pub const Tables = struct {
 
 const Remote = struct { holder: AppenderId, link: Link };
 
-/// A held travelling set: the local canonical set plus one parked scope
-/// per remote table; released in reverse (the remote releases are
+/// A held travelling set: the local canonical set (the WIDE shape — the
+/// one-intent striped `rmdir` holds `I{D}` + every `I{D_i}` + every
+/// marker here when the stripes are ours) plus one parked scope per
+/// remote table; released in reverse (the remote releases are
 /// fire-and-forget — the holder's sweep is the belt).
 pub const Travelling = struct {
     io: Io,
     scope: Scope,
     volume: u16,
-    local: dlm.GuardSet = .{},
+    local: dlm.WideGuardSet = .{},
     remotes: std.ArrayListUnmanaged(Remote) = .empty,
 
     pub fn release(self: *Travelling, gpa: Allocator) void {
@@ -366,10 +368,10 @@ fn sortTables(ids: []AppenderId, links: []?Link) void {
     }
 }
 
-fn lockLocal(locks: *dlm.Manager, io: Io, tables: Tables, a: AcquireArgs) Error!dlm.GuardSet {
-    var inodes: [dlm.max_requests]dlm.InodeReq = undefined;
+fn lockLocal(locks: *dlm.Manager, io: Io, tables: Tables, a: AcquireArgs) Error!dlm.WideGuardSet {
+    var inodes: [dlm.wide_requests]dlm.InodeReq = undefined;
     var ni: usize = 0;
-    var dents: [dlm.max_requests]dlm.DentryReq = undefined;
+    var dents: [dlm.wide_requests]dlm.DentryReq = undefined;
     var nd: usize = 0;
     for (a.inodes) |r| if (tables.tableOf(tables.ctx, r.ino) == .local) {
         if (ni == inodes.len) return error.PlanTooLarge;
@@ -381,7 +383,7 @@ fn lockLocal(locks: *dlm.Manager, io: Io, tables: Tables, a: AcquireArgs) Error!
         dents[nd] = r;
         nd += 1;
     };
-    return locks.lockManyUncancelable(io, inodes[0..ni], dents[0..nd]) catch return error.PlanTooLarge;
+    return locks.lockManyWide(io, inodes[0..ni], dents[0..nd]) catch return error.PlanTooLarge;
 }
 
 fn askRemote(gpa: Allocator, io: Io, t: *Travelling, tables: Tables, a: AcquireArgs, holder: AppenderId, link: Link) Error!void {

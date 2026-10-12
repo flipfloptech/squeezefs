@@ -8,9 +8,10 @@
 //! GROUPS are the six workloads of `squeezefs bench` (write seq 1 MiB, read
 //! seq 1 MiB, read rand 4 KiB, write rand 4 KiB, stat, del), each keyed from
 //! a row's `pass`/`block`/`access`, plus the four shapes of the hash
-//! microbench (`bench --hash`, decision 0003 §M: the format's `sqzhash128`
-//! column at 16 B, 100 B, 4 KiB, 256 KiB — hashes/s is the group's ops/s;
-//! the xxh3-64 reference and the low-64 columns ride in the rows, unjudged).
+//! microbench (`bench --hash`, decision 0003 §M: the `sqzhash64` column —
+//! the low-64 projection every 8-byte format field pays — at 16 B, 100 B,
+//! 4 KiB, 256 KiB; hashes/s is the group's ops/s; the xxh3-64 reference and
+//! the full 128-bit columns ride in the rows, unjudged).
 //! A RUN folds the rows of one `bench` invocation per group: ops/s over the
 //! group's total elapsed, the median of the rows' p50 and the max of the
 //! rows' p99 (the bucket upper bounds the bench reports — never a midpoint;
@@ -51,11 +52,12 @@ pub const Group = enum {
 
     pub const count = @typeInfo(Group).@"enum".field_names.len;
 
-    /// The hash microbench's judged column.
-    pub const judged_hash_algo = "sqzhash128";
+    /// The hash microbench's judged column: the low-64 projection, what
+    /// every 8-byte format field pays (`checksum.hash64`).
+    pub const judged_hash_algo = "sqzhash64";
 
     /// From a hash row's `algo` and `block`: the product's column at one of
-    /// the four shapes; the reference and low-64 columns are null (unjudged).
+    /// the four shapes; the reference and full-128 columns are null (unjudged).
     pub fn ofHashRow(algo: []const u8, block: u64) ?Group {
         if (!std.mem.eql(u8, algo, judged_hash_algo)) return null;
         return switch (block) {
@@ -452,16 +454,16 @@ test "fold: rows key into their groups; ops/s over the group's total elapsed; p5
     try testing.expect(!short.rows_long_enough);
 }
 
-test "Group.ofHashRow: the sqzhash128 column keys the four hash groups by shape; the reference and low-64 columns and a foreign shape are null; the fold reads a hash row" {
-    try testing.expectEqual(Group.hash_16b, Group.ofHashRow("sqzhash128", 16).?);
-    try testing.expectEqual(Group.hash_100b, Group.ofHashRow("sqzhash128", 100).?);
-    try testing.expectEqual(Group.hash_4k, Group.ofHashRow("sqzhash128", 4096).?);
-    try testing.expectEqual(Group.hash_256k, Group.ofHashRow("sqzhash128", 262_144).?);
+test "Group.ofHashRow: the sqzhash64 column keys the four hash groups by shape; the reference and full-128 columns and a foreign shape are null; the fold reads a hash row's throughput mode only" {
+    try testing.expectEqual(Group.hash_16b, Group.ofHashRow("sqzhash64", 16).?);
+    try testing.expectEqual(Group.hash_100b, Group.ofHashRow("sqzhash64", 100).?);
+    try testing.expectEqual(Group.hash_4k, Group.ofHashRow("sqzhash64", 4096).?);
+    try testing.expectEqual(Group.hash_256k, Group.ofHashRow("sqzhash64", 262_144).?);
     try testing.expectEqual(@as(?Group, null), Group.ofHashRow("xxh3-64", 16));
-    try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash64", 16));
-    try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash128", 17));
+    try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash128", 16));
+    try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash64", 17));
     try testing.expect(Group.hash_4k.isHash() and !Group.stat.isHash());
-    const run = try foldRun(testing.allocator, "{\"pass\":\"hash\",\"algo\":\"sqzhash128\",\"block\":4096,\"access\":\"cpu\",\"ops\":1000000,\"elapsed_ns\":250000000,\"bytes\":4096000000,\"ps_per_op\":250000,\"mb_per_s\":16384}\n{\"pass\":\"hash\",\"algo\":\"xxh3-64\",\"block\":4096,\"access\":\"cpu\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n{\"pass\":\"hash\",\"algo\":\"sqzhash128\",\"block\":4096,\"access\":\"chained\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n");
+    const run = try foldRun(testing.allocator, "{\"pass\":\"hash\",\"algo\":\"sqzhash64\",\"block\":4096,\"access\":\"cpu\",\"ops\":1000000,\"elapsed_ns\":250000000,\"bytes\":4096000000,\"ps_per_op\":250000,\"mb_per_s\":16384}\n{\"pass\":\"hash\",\"algo\":\"xxh3-64\",\"block\":4096,\"access\":\"cpu\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n{\"pass\":\"hash\",\"algo\":\"sqzhash64\",\"block\":4096,\"access\":\"chained\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n");
     const g = run.group(.hash_4k);
     try testing.expectEqual(@as(u32, 1), g.rows);
     try testing.expectEqual(@as(u64, 1_000_000), g.ops);

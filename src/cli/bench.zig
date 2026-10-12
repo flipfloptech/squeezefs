@@ -1009,7 +1009,7 @@ pub const engine = if (is_linux) struct {
 // The hash microbench (`--hash`; decision 0003 §M): the format's hash on
 // the format's shapes against the xxh3-64 reference column. CPU only and
 // portable — the evidence records it on both venues; the baseline rig
-// folds its `sqzhash128` rows into the `hash_*` groups.
+// folds the `sqzhash64` throughput rows into the `hash_*` groups.
 // ---------------------------------------------------------------------------
 
 pub const hash_bench = struct {

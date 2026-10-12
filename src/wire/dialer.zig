@@ -166,7 +166,7 @@ pub fn connectOnce(gpa: std.mem.Allocator, io: Io, ep: endpoint.EndpointWire, se
                     error.Eof => error.BeforeChallenge,
                     error.Timeout, error.PeerSilent, error.Transport => error.Unreachable,
                     error.OutOfMemory => error.OutOfMemory,
-                    error.KtlsUnavailable, error.KtlsRecordLayerOwed => blk: {
+                    error.KtlsUnavailable, error.KtlsInstallFailed => blk: {
                         tls.countRefusal(e);
                         log.warn("cluster wire: dial to {f}: {s}", .{ ep, tls.refusalText(e) });
                         break :blk error.HandshakeRefused;

@@ -41,11 +41,15 @@
 //! layer below is the HANDSHAKE's transport on every OS and the PORTABLE
 //! application path for the macOS tests; on Linux the product requests
 //! `RecordLayer.ktls` and REFUSES loud when the kernel has no `tls` ULP
-//! (`CONFIG_TLS`) — never a silent fall-back to the userspace layer
-//! (`ktls`, `docs/evidence/rung-10-mtls.md` §9: the venue's 7.2.6-sqz has
-//! `# CONFIG_TLS is not set`, so the kTLS data path is DESIGNED there and
-//! owed to a kernel that carries it; this build's kTLS arm is the probe
-//! and the refusal).
+//! (`CONFIG_TLS`) — never a silent fall-back to the userspace layer. The
+//! kernel path (`ktls`): `TLS_TX`/`TLS_RX` with the handshake's AES-128-GCM
+//! traffic keys at `TLS_1_3_VERSION`; frames written with `sendto` and read
+//! with `recvmsg` carrying a control buffer, where a non-data record
+//! arrives as a `TLS_GET_RECORD_TYPE` cmsg (an alert closes loud and
+//! counted, a KeyUpdate re-keys RX by a second `TLS_RX`, a NewSessionTicket
+//! is ignored and counted); our KeyUpdate is a `TLS_SET_RECORD_TYPE`
+//! `sendmsg` then a second `TLS_TX`. Its tests run where the probe finds
+//! the ULP (`docs/evidence/rung-10-mtls.md` §9).
 //!
 //! Portable: the engine, the identity and the in-memory tests; the file
 //! loaders, the posture installer and the kTLS probe are Linux (the key
@@ -277,11 +281,10 @@ pub const HandshakeError = error{
     /// unavailable on Linux without it — refused loud, never the
     /// userspace record layer.
     KtlsUnavailable,
-    /// The kernel HAS the ULP, and this build's kTLS data path (the
-    /// cmsg-dispatching receive, the rekey, the close_notify) is designed
-    /// and owed (`docs/evidence/rung-10-mtls.md` §9): refused loud until it
-    /// lands — the same law, never a silent fall-back.
-    KtlsRecordLayerOwed,
+    /// The ULP attached but the kernel refused the traffic keys
+    /// (`TLS_TX`/`TLS_RX`): a kernel without TLS 1.3 kTLS or without
+    /// AES-128-GCM — refused loud, the errno logged.
+    KtlsInstallFailed,
     /// The peer's alert refused OUR certificate (unknown_ca, bad_certificate,
     /// certificate_unknown/required/expired): the peer is under another CA
     /// or judges our leaf's validity differently — counted as untrusted.
@@ -319,6 +322,15 @@ pub const Conn = struct {
     record_layer: RecordLayer = .userspace,
     ktls_tx: bool = false,
     ktls_rx: bool = false,
+    /// The socket under `.ktls` (the keys' home; `recvmsg`/`sendto` target).
+    ktls_fd: std.os.linux.fd_t = -1,
+    /// Records this side has written under the current TX key (the
+    /// KeyUpdate ceiling's word; the kernel owns the sequence itself).
+    ktls_records_sent: u64 = 0,
+    /// Under `.ktls` `rd_plain[0..rd_end]` accumulates a control record
+    /// that arrived split across `recvmsg` calls (a reader's buffer with
+    /// fewer bytes left than the record).
+    ctl_type: u8 = 0,
     /// A record header has been read (a timeout before it is `PeerSilent`;
     /// the first header's bound is `first_record_timeout_ms`).
     seen_bytes: bool = false,
@@ -376,9 +388,9 @@ pub const Conn = struct {
     }
 
     /// After a completed handshake: under `.ktls` the traffic keys go to
-    /// the kernel (Linux); this build's arm is the probe and the refusal
-    /// (module doc) — a kernel without the ULP is `KtlsUnavailable`, one
-    /// with it `KtlsRecordLayerOwed`. Under `.userspace` nothing to do.
+    /// the kernel (Linux) — a kernel without the ULP is `KtlsUnavailable`,
+    /// one that refuses the keys `KtlsInstallFailed`; both loud, never a
+    /// fall-back. Under `.userspace` nothing to do.
     fn armRecordLayer(self: *Conn, opts: Options) HandshakeError!void {
         self.record_layer = opts.record_layer;
         switch (opts.record_layer) {
@@ -386,14 +398,13 @@ pub const Conn = struct {
             .ktls => {
                 if (!is_linux) return error.KtlsUnavailable;
                 const fd = opts.socket orelse return error.KtlsUnavailable;
-                try ktls.attachUlp(fd);
-                return error.KtlsRecordLayerOwed;
+                try ktls.install(self, fd);
             },
         }
     }
 
     pub fn link(self: *Conn) session.Link {
-        return .{ .ctx = self, .vtable = &vtable };
+        return .{ .ctx = self, .vtable = if (self.record_layer == .ktls and is_linux) &ktls.link_vtable else &vtable };
     }
 
     pub fn destroy(self: *Conn, gpa: std.mem.Allocator) void {
@@ -533,7 +544,7 @@ pub const Conn = struct {
                     self.key_updates_received += 1;
                     if (req == .update_requested) self.peer_update_requested.store(true, .release);
                 },
-                @backingInt(tls.HandshakeType.new_session_ticket) => {},
+                @backingInt(tls.HandshakeType.new_session_ticket) => stats.cluster_wire_tls_tickets_ignored.inc(),
                 else => return error.Protocol,
             }
         }
@@ -556,12 +567,7 @@ pub const Conn = struct {
                         self.postHandshake(rec.plain) catch |e| return mapHandshake(e);
                         continue;
                     },
-                    .alert => {
-                        // close_notify = an orderly EOF; anything else a
-                        // peer that tore the session down.
-                        if (rec.plain.len == 2 and rec.plain[1] == @backingInt(tls.Alert.Description.close_notify)) return error.Eof;
-                        return error.TransportFailed;
-                    },
+                    .alert => return alertVerdict(rec.plain),
                     else => return error.TransportFailed,
                 }
                 continue;
@@ -615,6 +621,21 @@ fn contentType(b: u8) ?tls.ContentType {
         @backingInt(tls.ContentType.application_data) => .application_data,
         else => null,
     };
+}
+
+/// An alert on an established session: close_notify = an orderly EOF
+/// (counted); anything else a peer that tore the session down (loud,
+/// counted).
+fn alertVerdict(plain: []const u8) session.FrameError {
+    if (plain.len == 2 and plain[1] == @backingInt(tls.Alert.Description.close_notify)) {
+        stats.cluster_wire_tls_close_notify.inc();
+        return error.Eof;
+    }
+    stats.cluster_wire_tls_fatal_alerts.inc();
+    if (plain.len == 2) {
+        log.warn("cluster wire: the peer sent a fatal TLS alert ({d}) — closing", .{plain[1]});
+    } else log.warn("cluster wire: the peer sent a malformed TLS alert ({d} B) — closing", .{plain.len});
+    return error.TransportFailed;
 }
 
 fn mapLink(e: session.FrameError) HandshakeError {
@@ -1136,7 +1157,7 @@ pub fn serverHandshake(gpa: std.mem.Allocator, inner: session.Link, identity: *c
             error.PeerPlaintext, error.PeerSilent, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.PeerRefusedOurCertificate, error.OutOfMemory => {},
             // The record layer could not be armed after a GOOD handshake:
             // tell the peer we are going away (internal_error), then refuse.
-            error.KtlsUnavailable, error.KtlsRecordLayerOwed => conn.writeAlert(.fatal, .internal_error),
+            error.KtlsUnavailable, error.KtlsInstallFailed => conn.writeAlert(.fatal, .internal_error),
             error.ProfileMismatch => conn.writeAlert(.fatal, .handshake_failure),
             error.PeerCertificateMissing => conn.writeAlert(.fatal, .certificate_required),
             error.PeerCertificateUntrusted => conn.writeAlert(.fatal, .unknown_ca),
@@ -1239,7 +1260,7 @@ pub fn clientHandshake(gpa: std.mem.Allocator, inner: session.Link, identity: *c
             error.PeerPlaintext, error.PeerSilent, error.PeerNotTls, error.Eof, error.Timeout, error.Transport, error.Alert, error.PeerRefusedOurCertificate, error.OutOfMemory => {},
             // The record layer could not be armed after a GOOD handshake:
             // tell the peer we are going away (internal_error), then refuse.
-            error.KtlsUnavailable, error.KtlsRecordLayerOwed => conn.writeAlert(.fatal, .internal_error),
+            error.KtlsUnavailable, error.KtlsInstallFailed => conn.writeAlert(.fatal, .internal_error),
             error.ProfileMismatch => conn.writeAlert(.fatal, .handshake_failure),
             error.PeerCertificateMissing => conn.writeAlert(.fatal, .certificate_required),
             error.PeerCertificateUntrusted => conn.writeAlert(.fatal, .unknown_ca),
@@ -1342,7 +1363,7 @@ pub fn refusalText(e: HandshakeError) []const u8 {
         error.PeerSignatureInvalid => "the peer's CertificateVerify/Finished did not verify",
         error.Alert => "the peer sent a fatal TLS alert",
         error.KtlsUnavailable => "this kernel has no `tls` ULP (CONFIG_TLS is not set / the module is absent): the MutualTls class's record layer on Linux is kernel TLS — refused, never the userspace record layer",
-        error.KtlsRecordLayerOwed => "kernel TLS is present but this build's kTLS data path is owed (docs/evidence/rung-10-mtls.md §9) — refused, never a silent fall-back",
+        error.KtlsInstallFailed => "the kernel's tls ULP refused the TLS 1.3 AES-128-GCM traffic keys (TLS_TX/TLS_RX) — refused, never a silent fall-back",
         error.PeerRefusedOurCertificate => "the peer refused THIS node's certificate (its alert names our certificate: the peer is under another CA, or judges our leaf's validity differently)",
         error.Transport => "transport failure during the TLS handshake",
         error.Timeout => "the TLS handshake timed out",
@@ -1357,7 +1378,7 @@ pub fn countRefusal(e: HandshakeError) void {
         error.PeerPlaintext, error.PeerSilent => stats.cluster_wire_plaintext_refused.inc(),
         error.PeerCertificateUntrusted, error.PeerCertificateMissing, error.PeerSignatureInvalid, error.PeerRefusedOurCertificate => stats.cluster_wire_tls_refused_untrusted.inc(),
         error.PeerCertificateExpired, error.PeerCertificateNotYetValid => stats.cluster_wire_tls_refused_expired.inc(),
-        error.KtlsUnavailable, error.KtlsRecordLayerOwed => stats.cluster_wire_ktls_refused.inc(),
+        error.KtlsUnavailable, error.KtlsInstallFailed => stats.cluster_wire_ktls_refused.inc(),
         else => stats.cluster_wire_tls_refused_protocol.inc(),
     }
 }
@@ -1409,9 +1430,6 @@ pub const InstallError = error{
     KeyMismatch,
     /// `mutual_tls` on a Linux kernel without the `tls` ULP.
     KernelTlsMissing,
-    /// `mutual_tls` on a kernel WITH the ULP: this build's kTLS data path
-    /// is owed (never a silent fall-back).
-    KernelTlsRecordLayerOwed,
     OutOfMemory,
 };
 
@@ -1518,10 +1536,7 @@ pub const linux_files = if (is_linux) struct {
         }
         // The record layer is the kernel's: a kernel without it refuses
         // the mount here, loud, before any socket exists.
-        switch (ktls.probeKernel()) {
-            .absent => return error.KernelTlsMissing,
-            .present => return error.KernelTlsRecordLayerOwed,
-        }
+        if (ktls.probeKernel() == .absent) return error.KernelTlsMissing;
         install(id);
         log.info("cluster wire: channel class mutual_tls — node '{s}' under CA '{s}' (leaf valid to {d})", .{ id.nodeName(), id.ca.commonName(), id.cert.notAfterS() });
         return .{ .identity = id, .channel = .mutual_tls };
@@ -1584,6 +1599,224 @@ pub const ktls = if (is_linux) struct {
         if (linux.errno(rc) != .SUCCESS) return error.KtlsUnavailable;
     }
 
+    /// `TLS_RX_EXPECT_NO_PAD`: neither this engine nor OpenSSL pads a TLS
+    /// 1.3 record; the kernel skips a copy when told so (optional: an
+    /// older ULP without the option is fine).
+    pub const TLS_RX_EXPECT_NO_PAD: u32 = 4;
+
+    /// One half's keys into the kernel (`rec_seq` 0: a fresh epoch — after
+    /// the handshake and after every rekey).
+    fn setKeys(fd: linux.fd_t, which: u32, t: *const Traffic) error{KtlsInstallFailed}!void {
+        var info = cryptoInfo(t);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&info));
+        const rc = linux.setsockopt(fd, linux.SOL.TLS, which, @ptrCast(&info), @sizeOf(CryptoInfoAesGcm128));
+        if (linux.errno(rc) != .SUCCESS) {
+            log.warn("cluster wire: kernel TLS refused the traffic keys ({s}: {t})", .{ if (which == TLS_TX) "TLS_TX" else "TLS_RX", linux.errno(rc) });
+            return error.KtlsInstallFailed;
+        }
+    }
+
+    /// The handover: ULP, our TX keys, the peer's RX keys; the connection
+    /// is confidential only once BOTH took.
+    pub fn install(conn: *Conn, fd: linux.fd_t) HandshakeError!void {
+        try attachUlp(fd);
+        try setKeys(fd, TLS_TX, &conn.wr.?);
+        conn.ktls_tx = true;
+        try setKeys(fd, TLS_RX, &conn.rd.?);
+        conn.ktls_rx = true;
+        const one: c_int = 1;
+        _ = linux.setsockopt(fd, linux.SOL.TLS, TLS_RX_EXPECT_NO_PAD, std.mem.asBytes(&one), @sizeOf(c_int));
+        conn.ktls_fd = fd;
+        conn.ktls_records_sent = 0;
+        conn.rd_end = 0;
+    }
+
+    /// A control message carrying one record-type byte: the header, the
+    /// byte, padding to `cmsg_align` (`CMSG_SPACE(1)`).
+    const CMSG_HDR: usize = @sizeOf(linux.cmsghdr);
+    const CMSG_SPACE_1: usize = CMSG_HDR + linux.cmsg_align;
+
+    fn recordTypeCmsg(buf: *[CMSG_SPACE_1]u8, ct: u8) void {
+        @memset(buf, 0);
+        const hdr: linux.cmsghdr = .{ .len = CMSG_HDR + 1, .level = linux.SOL.TLS, .type = @intCast(TLS_SET_RECORD_TYPE) };
+        buf[0..CMSG_HDR].* = std.mem.toBytes(hdr);
+        buf[CMSG_HDR] = ct;
+    }
+
+    /// The record type a `recvmsg` reported, or null for application data
+    /// (the kernel attaches the cmsg only for non-data records).
+    fn parseRecordType(buf: *const [CMSG_SPACE_1]u8, controllen: usize) ?u8 {
+        if (controllen < CMSG_HDR + 1) return null;
+        const hdr = std.mem.bytesToValue(linux.cmsghdr, buf[0..CMSG_HDR]);
+        if (hdr.level != linux.SOL.TLS or hdr.type != TLS_GET_RECORD_TYPE) return null;
+        return buf[CMSG_HDR];
+    }
+
+    /// `sendmsg` of one control record (an alert, a KeyUpdate) under the
+    /// current TX key; tiny, one call.
+    pub fn sendRecord(fd: linux.fd_t, ct: u8, payload: []const u8) error{Transport}!void {
+        var ctl: [CMSG_SPACE_1]u8 = undefined;
+        recordTypeCmsg(&ctl, ct);
+        var iov = [_]std.posix.iovec_const{.{ .base = payload.ptr, .len = payload.len }};
+        const msg: linux.msghdr_const = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &ctl, .controllen = CMSG_HDR + 1, .flags = 0 };
+        while (true) {
+            const rc = linux.sendmsg(fd, &msg, linux.MSG.NOSIGNAL);
+            switch (linux.errno(rc)) {
+                .SUCCESS => return if (rc == payload.len) {} else error.Transport,
+                .INTR => continue,
+                else => return error.Transport,
+            }
+        }
+    }
+
+    /// Our KeyUpdate (the ceiling or the peer's request): the message under
+    /// the current key, then the next generation into `TLS_TX`.
+    fn keyUpdate(conn: *Conn) session.FrameError!void {
+        const msg = [_]u8{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, @backingInt(tls.KeyUpdateRequest.update_not_requested) };
+        sendRecord(conn.ktls_fd, @backingInt(tls.ContentType.handshake), &msg) catch return error.TransportFailed;
+        var next = conn.wr.?.updated();
+        setKeys(conn.ktls_fd, TLS_TX, &next) catch return error.TransportFailed;
+        conn.wr.?.zeroize();
+        conn.wr = next;
+        next.zeroize();
+        conn.ktls_records_sent = 0;
+        conn.key_updates_sent += 1;
+        stats.cluster_wire_tls_key_updates.inc();
+    }
+
+    /// A control record's bytes (possibly a fragment: the reader's buffer
+    /// had fewer bytes left than the record): accumulate in `rd_plain`,
+    /// dispatch each complete message.
+    fn control(conn: *Conn, ct: u8, bytes: []const u8) session.FrameError!void {
+        if (conn.rd_end != 0 and conn.ctl_type != ct) return error.TransportFailed;
+        conn.ctl_type = ct;
+        if (conn.rd_end + bytes.len > conn.rd_plain.len) return error.TransportFailed;
+        @memcpy(conn.rd_plain[conn.rd_end..][0..bytes.len], bytes);
+        conn.rd_end += bytes.len;
+        switch (ct) {
+            @backingInt(tls.ContentType.alert) => {
+                if (conn.rd_end < 2) return;
+                const v = alertVerdict(conn.rd_plain[0..2]);
+                conn.rd_end = 0;
+                return v;
+            },
+            @backingInt(tls.ContentType.handshake) => {
+                var used: usize = 0;
+                while (conn.rd_end - used >= Handshake.MSG_HEADER) {
+                    const len: usize = std.mem.readInt(u24, conn.rd_plain[used + 1 ..][0..3], .big);
+                    if (conn.rd_end - used < Handshake.MSG_HEADER + len) break;
+                    const ht = conn.rd_plain[used];
+                    const body = conn.rd_plain[used + Handshake.MSG_HEADER ..][0..len];
+                    used += Handshake.MSG_HEADER + len;
+                    switch (ht) {
+                        @backingInt(tls.HandshakeType.key_update) => {
+                            if (body.len != 1) return error.TransportFailed;
+                            const req = std.enums.fromInt(tls.KeyUpdateRequest, body[0]) orelse return error.TransportFailed;
+                            // The 6.14 rekey: the kernel holds the records that
+                            // follow until RX carries the next generation.
+                            var next = conn.rd.?.updated();
+                            setKeys(conn.ktls_fd, TLS_RX, &next) catch return error.TransportFailed;
+                            conn.rd.?.zeroize();
+                            conn.rd = next;
+                            next.zeroize();
+                            conn.key_updates_received += 1;
+                            if (req == .update_requested) conn.peer_update_requested.store(true, .release);
+                        },
+                        @backingInt(tls.HandshakeType.new_session_ticket) => stats.cluster_wire_tls_tickets_ignored.inc(),
+                        else => return error.TransportFailed,
+                    }
+                }
+                if (used != 0) {
+                    std.mem.copyForwards(u8, conn.rd_plain[0 .. conn.rd_end - used], conn.rd_plain[used..conn.rd_end]);
+                    conn.rd_end -= used;
+                }
+            },
+            else => return error.TransportFailed,
+        }
+    }
+
+    pub const link_vtable: session.Link.VTable = .{ .readExact = linkRead, .writeAll = linkWrite, .shutdown = linkShutdown, .close = linkClose };
+
+    /// The receive discipline over the kernel's records: `poll` for the
+    /// bound, `recvmsg` with a control buffer (a non-data record WITHOUT one
+    /// is EIO), application bytes into the caller's buffer, a control
+    /// record's bytes to the dispatcher (they never advance the caller).
+    fn linkRead(ctx: *anyopaque, buf: []u8, timeout_ms: ?u32) session.FrameError!void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        const fd = self.ktls_fd;
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            if (timeout_ms) |ms| {
+                var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+                const n = linux.poll(&pfd, 1, @intCast(ms));
+                if (linux.errno(n) != .SUCCESS) return error.TransportFailed;
+                if (n == 0) return error.Timeout;
+            }
+            var ctl: [CMSG_SPACE_1]u8 = undefined;
+            var iov = [_]std.posix.iovec{.{ .base = buf[filled..].ptr, .len = buf.len - filled }};
+            var msg: linux.msghdr = .{ .name = null, .namelen = 0, .iov = &iov, .iovlen = 1, .control = &ctl, .controllen = ctl.len, .flags = 0 };
+            const rc = linux.recvmsg(fd, &msg, 0);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                .BADMSG => {
+                    // The kernel's AEAD refused a record: the peer's key is
+                    // not ours — the userspace layer's `PeerSignatureInvalid`.
+                    stats.cluster_wire_tls_fatal_alerts.inc();
+                    log.warn("cluster wire: kernel TLS: a record failed authentication (EBADMSG) — closing", .{});
+                    return error.TransportFailed;
+                },
+                else => |e| {
+                    log.warn("cluster wire: kernel TLS: recvmsg failed ({t}) — closing", .{e});
+                    return error.TransportFailed;
+                },
+            }
+            if (rc == 0) return error.Eof;
+            if (parseRecordType(&ctl, msg.controllen)) |ct| {
+                if (ct != @backingInt(tls.ContentType.application_data)) {
+                    try control(self, ct, buf[filled..][0..rc]);
+                    continue;
+                }
+            }
+            filled += rc;
+        }
+    }
+
+    /// One wire frame → the kernel seals ⌈len / 2^14⌉ records from one
+    /// `sendto` stream; a pending KeyUpdate goes out first.
+    fn linkWrite(ctx: *anyopaque, bytes: []const u8) session.FrameError!void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        if (self.peer_update_requested.swap(false, .acq_rel) or self.ktls_records_sent >= KEY_UPDATE_RECORDS) try keyUpdate(self);
+        const fd = self.ktls_fd;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const rc = linux.sendto(fd, bytes[sent..].ptr, bytes.len - sent, linux.MSG.NOSIGNAL, null, 0);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.TransportFailed,
+            }
+            if (rc == 0) return error.TransportFailed;
+            sent += rc;
+        }
+        self.ktls_records_sent += (bytes.len + MAX_PLAINTEXT - 1) / MAX_PLAINTEXT;
+    }
+
+    fn linkShutdown(ctx: *anyopaque) void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        self.inner.shutdown();
+    }
+
+    /// close_notify through the kernel (best effort), then the socket.
+    fn linkClose(ctx: *anyopaque) void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        if (self.established and !self.close_notify_sent) {
+            self.close_notify_sent = true;
+            sendRecord(self.ktls_fd, @backingInt(tls.ContentType.alert), &.{ @backingInt(tls.Alert.Level.warning), @backingInt(tls.Alert.Description.close_notify) }) catch {};
+        }
+        self.inner.close();
+    }
+
     pub const Probe = enum { absent, present };
 
     /// Whether this kernel carries the ULP: a loopback TCP pair (the ULP
@@ -1642,7 +1875,6 @@ pub fn writeInstallRefusal(w: *Io.Writer, e: InstallError, paths: Paths) Io.Writ
             var ulps: [256]u8 = undefined;
             try w.print("SQUEEZEFS_WIRE_CHANNEL=mutual_tls needs kernel TLS and this kernel has no `tls` ULP (/proc/sys/net/ipv4/tcp_available_ulp: '{s}'): build it with CONFIG_TLS=y (CONFIG_TLS_DEVICE=y for NIC offload) or load the tls module — the MutualTls record layer on Linux is the kernel's, never a userspace fall-back", .{if (is_linux) ktls.availableUlps(&ulps) else ""});
         },
-        error.KernelTlsRecordLayerOwed => try w.writeAll("SQUEEZEFS_WIRE_CHANNEL=mutual_tls: kernel TLS is present but this build's kTLS data path is owed (docs/evidence/rung-10-mtls.md §9) — refused, never a silent fall-back to the userspace record layer"),
         error.OutOfMemory => try w.writeAll("out of memory loading the TLS identity"),
     }
 }

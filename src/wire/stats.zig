@@ -88,9 +88,16 @@ pub var cluster_wire_tls_key_updates: counters.ShardedCounter = .{};
 /// ours, our leaf is not under its CA, a plaintext listener answered).
 pub var cluster_wire_tls_dial_refused: counters.ShardedCounter = .{};
 /// Connections refused after a GOOD handshake because the kernel record
-/// layer could not be armed (no `tls` ULP, or this build's kTLS data path
-/// owed) — never a silent fall-back to the userspace record layer.
+/// layer could not be armed (no `tls` ULP, or the kernel refused the
+/// keys) — never a silent fall-back to the userspace record layer.
 pub var cluster_wire_ktls_refused: counters.ShardedCounter = .{};
+/// Orderly close_notify alerts received on established TLS sessions.
+pub var cluster_wire_tls_close_notify: counters.ShardedCounter = .{};
+/// Fatal alerts (or records that failed authentication) received on
+/// established TLS sessions — each closes the session loud.
+pub var cluster_wire_tls_fatal_alerts: counters.ShardedCounter = .{};
+/// NewSessionTicket messages a foreign server sent: ignored (no resumption).
+pub var cluster_wire_tls_tickets_ignored: counters.ShardedCounter = .{};
 
 comptime {
     std.debug.assert(cluster_wire_refusals_by_class.len == @typeInfo(frame.RefusalClass).@"enum".field_names.len);

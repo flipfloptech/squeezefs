@@ -72,15 +72,20 @@ pub inline fn hash64Keyed(key: *const Key, bytes: []const u8) u64 {
 /// Streaming sqzhash128 under the format key (`init`) or a caller's key
 /// (`initKeyed`): `update` any split, then `final` (u128) or `finalLow64`
 /// (the 8-byte field). Streaming equals one-shot whatever the split.
+///
+/// The state holds the key by POINTER and the construction's minimum
+/// (`sqzhash.zig`'s `Hasher`: ≤ 1056 B against the 4.7 KiB a 16-chunk
+/// buffer and a key copy cost) — one lives per staged cell (charter R5).
 pub const Hasher = struct {
     inner: sqzhash.Hasher,
 
     pub fn init() Hasher {
-        return .{ .inner = .initWithKey(format_key) };
+        return .{ .inner = .initWithKey(&format_key) };
     }
 
+    /// `key` must outlive the hasher: the per-mount name key a store owns.
     pub fn initKeyed(key: *const Key) Hasher {
-        return .{ .inner = .initWithKey(key.*) };
+        return .{ .inner = .initWithKey(key) };
     }
 
     pub fn update(self: *Hasher, bytes: []const u8) void {

@@ -521,92 +521,143 @@ fn Engine(comptime path: Path) type {
 
         /// Streaming sqzhash128. Produces the same result as `hash` regardless of
         /// how the input is split across `update` calls.
+        ///
+        /// The state is the construction's MINIMUM (charter R5: a per-object
+        /// state is derived and bounded — the staging ring keeps one per live
+        /// cell, the fibers one per frame): the key by POINTER (the format key
+        /// is a comptime constant, a name key lives once per mount; a copy was
+        /// 320 B per state), and ONE of two phases:
+        ///
+        /// - `prefix` while the input is ≤ `medium_max` (1 KiB): every regime
+        ///   below 16 lanes (one block, the 2…16-leaf tree, 8 lanes) is a
+        ///   function of the WHOLE input in a shape the 16-lane state cannot
+        ///   produce, so the bytes themselves are the state and `final` hashes
+        ///   them one-shot.
+        /// - `lanes` beyond: the 16 lane states and the last `chunk_len` bytes
+        ///   seen. The final chunk is aligned on the END of the input and may
+        ///   start at any byte, so `final` takes it from that window; a chunk
+        ///   is absorbed only once a byte FOLLOWS it, which proves it is not
+        ///   the final one.
         pub const Hasher = struct {
             const chunk_len = large_chunk_len;
-            const buffer_size = 16 * chunk_len;
+            /// The one-shot regimes end here; the lanes begin at the next byte.
+            const prefix_len = medium_max;
+
+            const Phase = union(enum) {
+                /// `[0, total_len)` of the input, `total_len ≤ prefix_len`.
+                prefix: [prefix_len]u8,
+                lanes: Lanes,
+            };
+
+            const Lanes = struct {
+                lanes: [large_lanes]Vec,
+                /// The last `chunk_len` input bytes, in order (`total_len >
+                /// prefix_len > chunk_len` in this phase). Its tail past
+                /// `absorbed(total_len)` — 1 to `chunk_len` bytes — awaits a
+                /// byte that follows; its head is the previous chunk's end.
+                window: [chunk_len]u8,
+            };
+
             comptime {
-                // Inputs that fit in the buffer are hashed one-shot in `final`, which
-                // covers every input that uses fewer than 16 lanes.
-                assert(buffer_size > medium_max);
+                // The window must reach back into the previous chunk, and the
+                // prefix must hold three whole chunks plus the window at the
+                // switch (`absorbLargeChunks` over `prefix_len - chunk_len`).
+                assert(prefix_len >= 2 * chunk_len);
+                assert(prefix_len % chunk_len == 0);
+                // The derived minimum: the larger phase + the union's tag, both
+                // at the lane vector's alignment, the length and the key pointer.
+                assert(prefix_len > @sizeOf(Lanes));
+                assert(@sizeOf(Hasher) <= prefix_len + @alignOf(Vec) + @sizeOf(u64) + @sizeOf(*const Key));
             }
 
-            key: Key,
-            lanes: [large_lanes]Vec,
+            key: *const Key,
             total_len: u64 = 0,
-            /// Bytes not yet consumed. When `buffered < chunk_len`, the tail of the
-            /// buffer still holds the input bytes that directly precede them, which
-            /// `final` needs to assemble the last chunk.
-            buffer: [buffer_size]u8 = undefined,
-            buffered: usize = 0,
+            phase: Phase = .{ .prefix = undefined },
 
-            pub fn initWithKey(key: Key) Hasher {
-                return .{ .key = key, .lanes = key.lanes(large_lanes) };
+            /// `key` must outlive the hasher (it is read by `update` and `final`).
+            pub fn initWithKey(key: *const Key) Hasher {
+                return .{ .key = key };
             }
 
-            /// `data.len` must be a multiple of the chunk length, and the caller must
-            /// guarantee that more input follows: the final chunk is handled separately.
-            fn consume(lanes: *[large_lanes]Vec, data: []const u8) void {
-                var local = lanes.*;
-                absorbLargeChunks(&local, data);
-                lanes.* = local;
+            /// Bytes absorbed into the lanes after `total` bytes of input: every
+            /// whole chunk that a byte follows (the one holding the last byte
+            /// may be the end-aligned final chunk, so it waits).
+            inline fn absorbed(total: u64) u64 {
+                return ((total - 1) / chunk_len) * chunk_len;
             }
 
             pub fn update(self: *Hasher, input: []const u8) void {
-                self.total_len += input.len;
-
-                if (input.len <= buffer_size - self.buffered) {
-                    @memcpy(self.buffer[self.buffered..][0..input.len], input);
-                    self.buffered += input.len;
-                    return;
+                switch (self.phase) {
+                    .prefix => |*prefix| {
+                        const have: usize = @intCast(self.total_len);
+                        if (input.len <= prefix_len - have) {
+                            @memcpy(prefix[have..][0..input.len], input);
+                            self.total_len += input.len;
+                            return;
+                        }
+                        // The input carries the total past the prefix: fill it,
+                        // absorb every chunk but the last (a byte follows each)
+                        // and switch phases with the last chunk as the window —
+                        // through locals, since the two phases share storage.
+                        const fill = prefix_len - have;
+                        @memcpy(prefix[have..], input[0..fill]);
+                        var lanes = self.key.lanes(large_lanes);
+                        absorbLargeChunks(&lanes, prefix[0 .. prefix_len - chunk_len]);
+                        const window: [chunk_len]u8 = prefix[prefix_len - chunk_len ..].*;
+                        self.phase = .{ .lanes = .{ .lanes = lanes, .window = window } };
+                        self.total_len = prefix_len;
+                        self.updateLanes(input[fill..]);
+                    },
+                    .lanes => self.updateLanes(input),
                 }
+            }
 
-                // The input overflows the buffer, so more data follows whatever is
-                // buffered and the whole buffer can be consumed.
-                var rest = input;
-                if (self.buffered > 0) {
-                    const fill = buffer_size - self.buffered;
-                    @memcpy(self.buffer[self.buffered..], rest[0..fill]);
-                    rest = rest[fill..];
-                    consume(&self.lanes, &self.buffer);
-                    self.buffered = 0;
+            fn updateLanes(self: *Hasher, input: []const u8) void {
+                const st = &self.phase.lanes;
+                const before = self.total_len;
+                const after = before + input.len;
+                const done_before = absorbed(before);
+                const done_after = absorbed(after);
+                if (done_after > done_before) {
+                    var lanes = st.lanes;
+                    // The first chunk to absorb completes the held bytes with the
+                    // input's head; the rest lie whole inside the input.
+                    const held: usize = @intCast(before - done_before);
+                    if (held == chunk_len) {
+                        absorbChunk(large_lanes, &lanes, &st.window);
+                    } else {
+                        var first: [chunk_len]u8 = undefined;
+                        @memcpy(first[0..held], st.window[chunk_len - held ..]);
+                        @memcpy(first[held..], input[0 .. chunk_len - held]);
+                        absorbChunk(large_lanes, &lanes, &first);
+                    }
+                    absorbLargeChunks(&lanes, input[chunk_len - held .. @intCast(done_after - before)]);
+                    st.lanes = lanes;
                 }
-                assert(rest.len > 0);
-
-                if (rest.len > buffer_size) {
-                    // Hash directly from the input, holding back the chunk with the final byte.
-                    const consumable = ((rest.len - 1) / chunk_len) * chunk_len;
-                    consume(&self.lanes, rest[0..consumable]);
-                    @memcpy(self.buffer[buffer_size - chunk_len ..], rest[consumable - chunk_len .. consumable]);
-                    rest = rest[consumable..];
+                // The window slides: the last `chunk_len` bytes of window ‖ input.
+                if (input.len >= chunk_len) {
+                    st.window = input[input.len - chunk_len ..][0..chunk_len].*;
+                } else {
+                    std.mem.copyForwards(u8, st.window[0 .. chunk_len - input.len], st.window[input.len..]);
+                    @memcpy(st.window[chunk_len - input.len ..], input);
                 }
-
-                @memcpy(self.buffer[0..rest.len], rest);
-                self.buffered = rest.len;
+                self.total_len = after;
             }
 
             /// Returns the hash of everything passed to `update` so far. Does not
             /// modify the hasher, so more data may be added afterwards.
             pub fn final(self: *const Hasher) u128 {
                 @setEvalBranchQuota(20_000);
-                if (self.total_len <= medium_max) {
-                    // Nothing is consumed until the buffer overflows, so the whole input is here.
-                    return hash(&self.key, self.buffer[0..@intCast(self.total_len)]);
+                switch (self.phase) {
+                    .prefix => |*prefix| return hash(self.key, prefix[0..@intCast(self.total_len)]),
+                    .lanes => |*st| {
+                        // Every chunk a byte follows is in the lanes; the window IS
+                        // the end-aligned final chunk.
+                        var lanes = st.lanes;
+                        absorbChunk(large_lanes, &lanes, &st.window);
+                        return toInt(finalize(mergeLanes(large_lanes, lanes, self.total_len, self.key), self.key));
+                    },
                 }
-                assert(self.buffered > 0);
-
-                var lanes = self.lanes;
-                var last_chunk: [chunk_len]u8 = undefined;
-                if (self.buffered >= chunk_len) {
-                    const consumable = ((self.buffered - 1) / chunk_len) * chunk_len;
-                    consume(&lanes, self.buffer[0..consumable]);
-                    last_chunk = self.buffer[self.buffered - chunk_len ..][0..chunk_len].*;
-                } else {
-                    const from_previous = chunk_len - self.buffered;
-                    @memcpy(last_chunk[0..from_previous], self.buffer[buffer_size - from_previous ..]);
-                    @memcpy(last_chunk[from_previous..], self.buffer[0..self.buffered]);
-                }
-                absorbChunk(large_lanes, &lanes, &last_chunk);
-                return toInt(finalize(mergeLanes(large_lanes, lanes, self.total_len, &self.key), &self.key));
             }
 
             /// The low 64 bits of `final`: the format's 8-byte checksum projection.
@@ -724,7 +775,7 @@ fn expectPinned(comptime E: type, secret: u128, vectors: []const PinnedVector, b
         try testing.expectEqual(v.h128, h);
         try testing.expectEqual(v.low64, @as(u64, @truncate(h)));
         try testing.expectEqual(v.low64, E.hash64(&key, buf[0..v.len]));
-        var s: E.Hasher = .initWithKey(key);
+        var s: E.Hasher = .initWithKey(&key);
         s.update(buf[0..v.len]);
         try testing.expectEqual(v.h128, s.final());
         try testing.expectEqual(v.low64, s.finalLow64());
@@ -819,10 +870,12 @@ test "streaming matches one-shot for assorted lengths and chunk sizes" {
         const key: native.Key = .init(secret);
         for (test_lengths) |len| {
             const expected = native.hash(&key, buf[0..len]);
-            // Chunks above the 4 KiB buffer take the direct path in `update`.
-            for ([_]usize{ 1, 15, 16, 17, 255, 256, 257, 1000, 4096, 4097, 5000, 20_000 }) |chunk| {
+            // Splits around the lane chunk (the window's slide and the held
+            // chunk), around the 1 KiB phase switch (a fill that lands short
+            // of it, on it and past it), and whole-input.
+            for ([_]usize{ 1, 15, 16, 17, 255, 256, 257, 1000, 1023, 1024, 1025, 4096, 4097, 5000, 20_000 }) |chunk| {
                 errdefer std.debug.print("len={d} chunk={d}\n", .{ len, chunk });
-                var h: native.Hasher = .initWithKey(key);
+                var h: native.Hasher = .initWithKey(&key);
                 var rest = buf[0..len];
                 while (rest.len > 0) {
                     const n = @min(chunk, rest.len);
@@ -836,11 +889,31 @@ test "streaming matches one-shot for assorted lengths and chunk sizes" {
     }
 }
 
+test "the streaming state is the construction's minimum (charter R5 — one lives per staged cell): the key by pointer, and the larger of the two phases — the whole input while it is ≤ 1 KiB (every regime below 16 lanes is a function of all of it), else 16 lane states + the last chunk" {
+    // Phase 1: the one-shot regimes (one block, the 2…16-leaf tree, 8 lanes)
+    // end at `medium_max`; the bytes themselves are the state until then.
+    const prefix_phase = medium_max;
+    // Phase 2: 16 lane states and the end-aligned final chunk's window.
+    const lane_phase = large_lanes * block_len + large_chunk_len;
+    try testing.expect(prefix_phase > lane_phase);
+    // The union carries the larger phase and its tag, rounded to the lane
+    // vector's alignment; beside it the length and the key pointer — and
+    // nothing else (the tie is equality: 1056 B, against the 4736 B of the
+    // 16-chunk buffer plus a key copy it replaces).
+    const bound = prefix_phase + @alignOf(Vec) + @sizeOf(u64) + @sizeOf(*const native.Key);
+    try testing.expectEqual(@as(usize, 1056), bound);
+    try testing.expectEqual(bound, @sizeOf(native.Hasher));
+    // The key is shared, never copied: the state is smaller than one expansion
+    // plus the lane phase, which any copy would exceed.
+    try testing.expect(@sizeOf(native.Key) == 20 * block_len);
+    try testing.expect(@sizeOf(native.Hasher) < @sizeOf(native.Key) + prefix_phase);
+}
+
 test "final does not disturb streaming state" {
     var buf: [10_000]u8 = undefined;
     fillTestData(&buf);
     const key: native.Key = .init(7);
-    var h: native.Hasher = .initWithKey(key);
+    var h: native.Hasher = .initWithKey(&key);
     var pos: usize = 0;
     while (pos < buf.len) : (pos += 250) {
         h.update(buf[pos..][0..250]);

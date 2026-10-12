@@ -3894,6 +3894,323 @@ test "smoke: THE HANDOVER DRAINS PARKED STAMPS (rung 10 item 4) — A (the manag
     _ = try fsckClean(rig, "the handover row");
 }
 
+/// The shared-directory matrix's third daemon runs as another node (its
+/// own UTS namespace, like the kill rows' B).
+const stripe_peer_node_c = "sqz-nodec";
+/// The storm's grain: how many creates a phase lets land past the counter
+/// it waits for before the storm is stopped — enough that the merged
+/// listing spans several readdir pages per stripe, small enough that the
+/// three-way `ls`/`find`/`stat` comparison stays inside the stage's bound.
+const stripe_matrix_phase_floor: u64 = 400;
+
+/// A background create storm into `hot/` under the mount `$1`, names
+/// `<prefix>$i`, until the stop sentinel `$2` exists; a refused create
+/// (EAGAIN while the directory's holder is dead or mid-move) is retried
+/// after a short pause; a retry that meets EEXIST landed the first time
+/// (the ship applied, the reply did not return) and counts once; the
+/// count of landed names is written to `$3` at the end. `true >` rather
+/// than `: >`: a redirection failure on a SPECIAL builtin exits a POSIX
+/// shell. The loop also ends when the test process (`$PPID` at spawn) is
+/// gone: a runner killed past every defer must not leave a writer
+/// spinning on a detached mount (the sentinel lives in the rig's work
+/// directory, which the rig's teardown removes).
+const stripe_storm_script = "p=$PPID; cd \"$1\" || exit 1; i=0; while [ ! -e \"$2\" ] && kill -0 \"$p\" 2>/dev/null; do if true > \"hot/$4$i\" 2>/dev/null || [ -e \"hot/$4$i\" ]; then i=$((i + 1)); else sleep 0.05; fi; done; echo $i > \"$3\"";
+
+/// One storm's handles: the child (the leader of its own process group,
+/// so a teardown reaches its `sleep` too), its sentinel and count paths.
+/// `deinit` kills a storm `finish` did not reap: every exit path of the
+/// row (success, a failed expectation, a timeout) ends its writers.
+const Storm = struct {
+    child: std.process.Child,
+    stop: []const u8,
+    count: []const u8,
+    err_file: Io.File,
+
+    fn start(rig: *Rig, mp: []const u8, tag: []const u8, prefix: []const u8) !Storm {
+        const gpa = rig.gpa;
+        const stop = try std.fmt.allocPrint(gpa, "{s}/storm-{s}.stop", .{ rig.work, tag });
+        errdefer gpa.free(stop);
+        const count = try std.fmt.allocPrint(gpa, "{s}/storm-{s}.count", .{ rig.work, tag });
+        errdefer gpa.free(count);
+        const err_path = try std.fmt.allocPrint(gpa, "{s}/storm-{s}.err", .{ rig.work, tag });
+        defer gpa.free(err_path);
+        Io.Dir.cwd().deleteFile(rig.io, stop) catch {};
+        Io.Dir.cwd().deleteFile(rig.io, count) catch {};
+        const err_file = try Io.Dir.cwd().createFile(rig.io, err_path, .{ .truncate = true });
+        errdefer err_file.close(rig.io);
+        const child = try std.process.spawn(rig.io, .{ .argv = &.{ "sh", "-c", stripe_storm_script, "storm", mp, stop, count, prefix }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .{ .file = err_file }, .pgid = 0 });
+        return .{ .child = child, .stop = stop, .count = count, .err_file = err_file };
+    }
+
+    /// Raise the sentinel, wait the child out, read its count (a storm
+    /// that died early names its cause on stderr, printed here).
+    fn finish(self: *Storm, rig: *Rig) !u64 {
+        const f = try Io.Dir.cwd().createFile(rig.io, self.stop, .{ .truncate = true });
+        f.close(rig.io);
+        const term = try self.child.wait(rig.io);
+        const text = Io.Dir.cwd().readFileAlloc(rig.io, self.count, rig.gpa, .limited(64)) catch |e| {
+            var err_path_buf: [256]u8 = undefined;
+            const err_path = try std.fmt.bufPrint(&err_path_buf, "{s}.err", .{self.stop[0 .. self.stop.len - ".stop".len]});
+            const err_text = Io.Dir.cwd().readFileAlloc(rig.io, err_path, rig.gpa, .limited(4096)) catch "";
+            defer if (err_text.len != 0) rig.gpa.free(err_text);
+            std.debug.print("\n--- storm {s} left no count ({f}; {t}) ---\n{s}\n", .{ self.stop, term, e, err_text });
+            return e;
+        };
+        defer rig.gpa.free(text);
+        return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch error.StormCountUnparsed;
+    }
+
+    fn deinit(self: *Storm, rig: *Rig) void {
+        if (self.child.id) |pid| _ = linux.kill(-pid, .KILL);
+        self.child.kill(rig.io);
+        self.err_file.close(rig.io);
+        rig.gpa.free(self.stop);
+        rig.gpa.free(self.count);
+    }
+};
+
+/// Poll `host`'s stats until `key` reads exactly `want` (owned tail).
+fn awaitExactly(host: anytype, key: []const u8, want: u64, deadline_ns: u64) ![]u8 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        try host.expectAlive(key);
+        const tail = (try host.statsTry()) orelse {
+            if (clock.monotonicNs() >= deadline) return error.StatsUnreadable;
+            sleepMs(200);
+            continue;
+        };
+        if ((numberAfter(tail, key) orelse std.math.maxInt(u64)) == want or clock.monotonicNs() >= deadline) return tail;
+        testing.allocator.free(tail);
+        sleepMs(200);
+    }
+}
+
+/// The three-way view of `hot/`: the count of names `ls` lists, the count
+/// of files `find` reaches and a digest of `stat(2)` of every entry
+/// (name, ino, links, size) — equal on every daemon when the striped
+/// directory is one directory. The listings land in the work directory
+/// (`$1`) first so a failed `ls`/`find` fails the script (`sh -e` judges a
+/// pipeline by its last command) with its stderr instead of counting 0.
+const hot_view_script = "ls hot > \"$1/view.ls\"; wc -l < \"$1/view.ls\"; find hot -type f > \"$1/view.find\"; wc -l < \"$1/view.find\"; find hot -type f -exec stat -c '%n %i %h %s' {} + > \"$1/view.stat\"; sort \"$1/view.stat\" | sha256sum | cut -d' ' -f1; stat -c %h hot";
+
+test "smoke: THE SHARED HOT DIRECTORY ACROSS DAEMONS — A (the manager) mkdirs `hot`; B JOINED storms creates into it ⇒ A's judge: B dominates past N_floor, the OFFER rides B's renewal grant, B accepts, the slot MOVES (slot_offers_pushed ≥ 1, slot_handovers 1 at A; A's census flips nothing — one creator) → A and a THIRD daemon C storm into `hot`, now B's ⇒ two creators past N_floor: B FLIPS it over K = 64 stripes, 21 supplied by A and 21 by C over `SupplyStripeInos` (one batch each), 22 minted by B; every later create keys a stripe and ships into a striping domain feed no window (handovers stay 1) → `ls | wc -l`, `find` and the (name, ino) digest of every entry EQUAL from A, B and C → kill -9 B (the holder of `hot` and 22 stripes) mid-storm ⇒ A evicts B at T_owner and recovers its region (hot's slot and B's stripes the manager's), every open intent rolls forward (stuck 0), the storms continue → the view equal from A and C → umount C, A → fsck --offline --scrub 0 findings (C17 clean)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    const c = try Peer.init(rig, "c");
+    defer c.deinit();
+    c.node = stripe_peer_node_c;
+    try c.spawn(&.{});
+    _ = try c.awaitReady();
+    {
+        const mk = try rig.onMount("mkdir hot");
+        gpa.free(mk);
+    }
+    // Phase 1: B alone storms into A's directory — every create ONE
+    // shipped insert served at A under its door; B dominates the slot's
+    // window past N_floor, A offers, the offer rides B's renewal, B
+    // accepts, A's flush-then-transfer moves the slot. One creator feeds
+    // the census and never flips.
+    var storm_b = try Storm.start(rig, b.mp, "b", "b");
+    defer storm_b.deinit(rig);
+    const t_phase1 = clock.monotonicNs();
+    {
+        const moved = try awaitAtLeast(rig, "\"slot_handovers\":", 1, kill_row_wait_ns);
+        defer gpa.free(moved);
+        try testing.expect((numberAfter(moved, "\"slot_handovers\":") orelse 0) >= 1);
+        // B's acceptance is the grant that follows A's transfer: the probe
+        // below must see B HOLDING the slot (a touch by A between the
+        // release and the grant would first-touch it back).
+        const accepted = try awaitAtLeast(b, "\"joined_wire_offers_accepted\":", 1, kill_row_wait_ns);
+        defer gpa.free(accepted);
+        try testing.expect((numberAfter(accepted, "\"joined_wire_offers_accepted\":") orelse 0) >= 1);
+    }
+    const nb = try storm_b.finish(rig);
+    const handover_ms = (clock.monotonicNs() - t_phase1) / std.time.ns_per_ms;
+    var offers_pushed: u64 = 0;
+    var handovers: u64 = 0;
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        offers_pushed = numberAfter(ta, "\"slot_offers_pushed\":") orelse 0;
+        handovers = numberAfter(ta, "\"slot_handovers\":") orelse 0;
+        try testing.expect(offers_pushed >= 1);
+        try testing.expect(handovers >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dir_stripe_flips\":"));
+        try testing.expect((numberAfter(ta, "\"xv_cross_owner_steps_served\":") orelse 0) >= 1);
+    }
+    // The directory's holder is B now: a create from A ships to B.
+    {
+        const steps_b0 = blk: {
+            const tb = try b.stats();
+            defer gpa.free(tb);
+            break :blk numberAfter(tb, "\"xv_cross_owner_steps_served\":") orelse 0;
+        };
+        const out = try rig.onMount(": > hot/probe-a && echo ok");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        std.debug.print("\nsmoke: shared hot dir: after the move — A: handovers {d}, leases held {d}, steps served {d}, intents minted {d}, routed mutations {d}; B: steps served {d} (was {d}), leases held {d}, offers accepted {d}, slot acquires {d}, intents minted {d}\n", .{ numberAfter(ta, "\"slot_handovers\":") orelse 0, numberAfter(ta, "\"slot_leases_held\":") orelse 0, numberAfter(ta, "\"xv_cross_owner_steps_served\":") orelse 0, numberAfter(ta, "\"xv_cross_owner_intents_minted\":") orelse 0, numberAfter(ta, "\"dir_stripe_routed_mutations\":") orelse 0, numberAfter(tb, "\"xv_cross_owner_steps_served\":") orelse 0, steps_b0, numberAfter(tb, "\"slot_leases_held\":") orelse 0, numberAfter(tb, "\"joined_wire_offers_accepted\":") orelse 0, numberAfter(tb, "\"slot_acquires\":") orelse 0, numberAfter(tb, "\"xv_cross_owner_intents_minted\":") orelse 0 });
+        try testing.expect((numberAfter(tb, "\"xv_cross_owner_steps_served\":") orelse 0) > steps_b0);
+    }
+    std.debug.print("\nsmoke: shared hot dir: phase 1 — B's {d} creates moved the slot in {d} ms (offers pushed {d}, handovers {d}, flips at A 0)\n", .{ nb, handover_ms, offers_pushed, handovers });
+    // Phase 2: A and C storm into `hot`, B's now — two creators past
+    // N_floor at B's census ⇒ the flip at B: A and C each supply their
+    // share over the wire, B mints the rest; the stripes land in their
+    // suppliers' slots on the directory's volume.
+    var storm_a = try Storm.start(rig, rig.mp, "a", "a");
+    defer storm_a.deinit(rig);
+    var storm_c = try Storm.start(rig, c.mp, "c", "c");
+    defer storm_c.deinit(rig);
+    const t_phase2 = clock.monotonicNs();
+    {
+        const flipped = try awaitAtLeast(b, "\"dir_stripe_flips\":", 1, kill_row_wait_ns);
+        defer gpa.free(flipped);
+        if ((numberAfter(flipped, "\"dir_stripe_flips\":") orelse 0) != 1) {
+            const ta = try rig.stats();
+            defer gpa.free(ta);
+            const tc = try c.stats();
+            defer gpa.free(tc);
+            std.debug.print("\nno flip — B: steps served {d}, census dirs {d}, flip failures {d}, n_floor {d}, leases held {d}; A: intents minted {d}, steps shipped {d}, open {d}, stuck {d}; C: intents minted {d}, steps shipped {d}, open {d}\n", .{ numberAfter(flipped, "\"xv_cross_owner_steps_served\":") orelse 0, numberAfter(flipped, "\"dir_stripe_census_dirs\":") orelse 0, numberAfter(flipped, "\"dir_stripe_flip_failures\":") orelse 0, numberAfter(flipped, "\"slot_offer_n_floor\":") orelse 0, numberAfter(flipped, "\"slot_leases_held\":") orelse 0, numberAfter(ta, "\"xv_cross_owner_intents_minted\":") orelse 0, numberAfter(ta, "\"xv_cross_owner_steps_shipped\":") orelse 0, numberAfter(ta, "\"xv_cross_owner_intents_open\":") orelse 0, numberAfter(ta, "\"xv_cross_owner_intents_stuck\":") orelse 0, numberAfter(tc, "\"xv_cross_owner_intents_minted\":") orelse 0, numberAfter(tc, "\"xv_cross_owner_steps_shipped\":") orelse 0, numberAfter(tc, "\"xv_cross_owner_intents_open\":") orelse 0 });
+        }
+        try testing.expectEqual(@as(?u64, 1), numberAfter(flipped, "\"dir_stripe_flips\":"));
+    }
+    const flip_ms = (clock.monotonicNs() - t_phase2) / std.time.ns_per_ms;
+    // Let the storms run on past the flip: every later create keys its
+    // stripe (routed at the creator off B's token — a ship to the
+    // stripe's holder, or local when the stripe is the creator's own).
+    {
+        const routed = try awaitAtLeast(rig, "\"dir_stripe_routed_mutations\":", stripe_matrix_phase_floor, kill_row_wait_ns);
+        defer gpa.free(routed);
+        const routed_c = try awaitAtLeast(c, "\"dir_stripe_routed_mutations\":", stripe_matrix_phase_floor, kill_row_wait_ns);
+        defer gpa.free(routed_c);
+    }
+    const na1 = try storm_a.finish(rig);
+    const nc1 = try storm_c.finish(rig);
+    const share = sym_xv.stripe.supplyShare(sym_xv.stripe.K_MAX, 2);
+    {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"dir_stripe_flips\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"dir_striped_dirs\":"));
+        try testing.expectEqual(@as(?u64, 2), numberAfter(tb, "\"dir_stripe_supply_rpcs\":"));
+        try testing.expectEqual(@as(?u64, 2 * share), numberAfter(tb, "\"dir_stripe_supplied\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"dir_stripe_supply_declined\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"dir_stripe_dying_refusals\":"));
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        const tc = try c.stats();
+        defer gpa.free(tc);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"dir_stripe_supplies_served\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tc, "\"dir_stripe_supplies_served\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"dir_stripe_flips\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tc, "\"dir_stripe_flips\":"));
+        // Ships into a striping domain feed no window: no further handover.
+        try testing.expectEqual(handovers, numberAfter(ta, "\"slot_handovers\":") orelse 0);
+        try testing.expect((numberAfter(ta, "\"dir_stripe_ships\":") orelse 0) >= 1);
+        std.debug.print("smoke: shared hot dir: phase 2 — the flip at B {d} ms after A and C's storms began: K {d}, supplied {d} ({d} from A + {d} from C in one batch each), minted by B {d}; A created {d}, C {d}; handovers still {d}; stripe ships from A {d}, from C {d}\n", .{ flip_ms, sym_xv.stripe.K_MAX, numberAfter(tb, "\"dir_stripe_supplied\":") orelse 0, share, share, sym_xv.stripe.K_MAX - 2 * share, na1, nc1, numberAfter(ta, "\"slot_handovers\":") orelse 0, numberAfter(ta, "\"dir_stripe_ships\":") orelse 0, numberAfter(tc, "\"dir_stripe_ships\":") orelse 0 });
+    }
+    // The view from every daemon: one directory.
+    const total1 = nb + na1 + nc1 + 1;
+    {
+        const va = try rig.onMountTimed(hot_view_script, 300);
+        defer gpa.free(va);
+        const vb = try b.onMount(hot_view_script);
+        defer gpa.free(vb);
+        const vc = try c.onMount(hot_view_script);
+        defer gpa.free(vc);
+        try testing.expectEqualStrings(va, vb);
+        try testing.expectEqualStrings(va, vc);
+        var lines = std.mem.splitScalar(u8, va, '\n');
+        var nbuf: [16]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&nbuf, "{d}", .{total1}), std.mem.trim(u8, lines.next().?, " "));
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&nbuf, "{d}", .{total1}), std.mem.trim(u8, lines.next().?, " "));
+        std.debug.print("smoke: shared hot dir: {d} entries — ls, find and the (name, ino) digest equal from A, B and C\n", .{total1});
+    }
+    // Phase 3: kill -9 B — the holder of `hot` and 22 stripes — with A's
+    // and C's storms running; A evicts B at T_owner and recovers its
+    // region (the slot and the stripes are the manager's now), the
+    // storms' refused creates retry, every open intent rolls forward.
+    var storm_a2 = try Storm.start(rig, rig.mp, "a2", "x");
+    defer storm_a2.deinit(rig);
+    var storm_c2 = try Storm.start(rig, c.mp, "c2", "y");
+    defer storm_c2.deinit(rig);
+    {
+        const warm = try awaitAtLeast(c, "\"dir_stripe_routed_mutations\":", stripe_matrix_phase_floor + 50, kill_row_wait_ns);
+        gpa.free(warm);
+    }
+    const t_kill = clock.monotonicNs();
+    try b.kill();
+    const ta_rec = try awaitStats(rig, &.{ .{ .key = "\"appender_recoveries\":", .want = 1 }, .{ .key = "\"recovered_regions_released\":", .want = 1 } }, kill_row_wait_ns);
+    defer gpa.free(ta_rec);
+    const recovered_ms = (clock.monotonicNs() - t_kill) / std.time.ns_per_ms;
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta_rec, "\"membership_evictions\":"));
+    try testing.expectEqual(@as(?u64, 1), numberAfter(ta_rec, "\"appender_recoveries\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta_rec, "\"appender_recovery_rollbacks\":"));
+    {
+        const settled = try awaitAtLeast(rig, "\"dir_stripe_routed_mutations\":", (numberAfter(ta_rec, "\"dir_stripe_routed_mutations\":") orelse 0) + 50, kill_row_wait_ns);
+        gpa.free(settled);
+    }
+    const na2 = try storm_a2.finish(rig);
+    const nc2 = try storm_c2.finish(rig);
+    // Every intent the dead holder left open at its creators rolls forward
+    // once the slots are the manager's: `open` returns to 0 on both, and
+    // none stood open past the 45 s membership TTL (`xv_cross_owner_
+    // intent_stuck` is a must-stay-0 tripwire at each creator).
+    const t_open = clock.monotonicNs();
+    {
+        const oa = try awaitExactly(rig, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        defer gpa.free(oa);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_open\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(oa, "\"xv_cross_owner_intents_stuck\":"));
+        const oc = try awaitExactly(c, "\"xv_cross_owner_intents_open\":", 0, 2 * kill_row_wait_ns);
+        defer gpa.free(oc);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(oc, "\"xv_cross_owner_intents_open\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(oc, "\"xv_cross_owner_intents_stuck\":"));
+    }
+    const open_ms = (clock.monotonicNs() - t_open) / std.time.ns_per_ms;
+    // The view from the survivors: the same directory, every entry that
+    // landed present (the recovered stripes read locally at A, under A's
+    // tokens at C).
+    {
+        const va = try rig.onMountTimed(hot_view_script, 300);
+        defer gpa.free(va);
+        const vc = try c.onMountTimed(hot_view_script, 300);
+        defer gpa.free(vc);
+        try testing.expectEqualStrings(va, vc);
+        var lines = std.mem.splitScalar(u8, va, '\n');
+        const listed = try std.fmt.parseInt(u64, std.mem.trim(u8, lines.next().?, " "), 10);
+        // Every counted name is listed; at most one more per storm — a
+        // create refused EAGAIN after it landed (the reply lost to the
+        // death) is counted only when the retry meets it, and a storm
+        // stopped between the two leaves it uncounted.
+        try testing.expect(listed >= total1 + na2 + nc2 and listed <= total1 + na2 + nc2 + 2);
+        try testing.expectEqualStrings(std.mem.trim(u8, lines.next().?, " "), std.mem.trim(u8, std.mem.sliceTo(va, '\n'), " "));
+        std.debug.print("smoke: shared hot dir: phase 3 — B killed; A recovered its region {d} ms after (evictions 1, recoveries 1, rollbacks 0); A created {d} and C {d} more across the death (retried, never counted twice); {d} entries listed (ls = find), digests equal from A and C; open intents 0 on both {d} ms after the storms stopped, stuck 0\n", .{ recovered_ms, na2, nc2, listed, open_ms });
+    }
+    try c.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try c.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the shared hot directory row");
+}
+
 /// The striped directory's population: 10,000 names over K = 64 stripes
 /// (≈ 156 per stripe — the readdir merge reads every stripe's page set
 /// several times over; the rename storm's 1,000 moves cross stripes with

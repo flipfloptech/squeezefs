@@ -45,6 +45,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const counters = @import("../../core/counters.zig");
+const knobs = @import("../../core/knobs.zig");
 const checksum = @import("../../core/checksum.zig");
 const log = @import("../../core/log.zig");
 const service = @import("../../wire/service.zig");
@@ -153,6 +154,11 @@ pub const HoldInput = struct {
 /// Open grants the ledger tracks per volume: the appender capacity's order
 /// (`GRANTS_MAX` windows per writer × the joiners a venue reaches).
 pub const LEDGER_CAPACITY: usize = 1024;
+
+/// The capacity at the arm: the derived one, or the test seam's.
+pub fn ledgerCapacityFromEnv(env: *const std.process.Environ.Map) usize {
+    return knobs.optIntKnob("SQUEEZEFS_TEST_BLOCK_GRANT_LEDGER_CAP", usize, env) orelse LEDGER_CAPACITY;
+}
 
 // ---------------------------------------------------------------------------
 // The inline-top-up grant source over a writer arm.
@@ -313,7 +319,7 @@ pub const HolderPlane = struct {
             .ring_capacity = data_bitmap.ringCapacity(block_grant.BLOCK_GRANT_FLOOR, @max(writers_known, 1), free_ship.FREE_BATCH_MAX),
         });
         errdefer v.bitmap.deinit();
-        v.grants = .{ .ledger = try block_grant.Ledger.init(gpa, LEDGER_CAPACITY), .bitmap = v.bitmap };
+        v.grants = .{ .ledger = try block_grant.Ledger.init(gpa, ledgerCapacityFromEnv(plane.env)), .bitmap = v.bitmap };
         errdefer v.grants.ledger.deinit();
         if (self.home) |home| try self.holdPages(v, home, hold);
         errdefer {

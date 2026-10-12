@@ -2714,6 +2714,91 @@ test "smoke: THE KVDA PAGE SINK's fallback — the same row with the dying holde
     try kvdaKillRow(true);
 }
 
+// ---------------------------------------------------------------------------
+// THE JOINER-SIDE GRANT LEDGER (rung 9 F17's sibling; charter §5.5 "every
+// live writer declares its held windows on each renewal").
+// ---------------------------------------------------------------------------
+
+/// The row's ledger capacity (the seam): a joiner that writes 24 floor
+/// grants' worth drives the holder's table three times past it unless
+/// every consumed grant retired at a renewal declaration.
+const grant_ledger_row_cap: u64 = 8;
+/// 1 MiB blocks: one floor grant (64 blocks) is one 64 MiB file, so 24
+/// files = 24 grants = 1.5 GiB over the set's two 2 GiB volumes.
+const grant_ledger_row_block: u64 = 1 << 20;
+const grant_ledger_row_files: u64 = 24;
+
+test "smoke: THE JOINER-SIDE GRANT LEDGER — the holder's ledger capped at 8 open grants (the seam), 1 MiB blocks; B writes 24 files of one floor grant each (24 grants, three times the cap): every consumed grant RETIRES at B's renewal declaration (`block_grant_consumed_retired` ≥ files − cap = 16, the table's structural bound), `block_grant_deferred` 0 at A, `block_grant_topup_deferred` 0 and `block_grant_exhausted` 0 at B, `open_grants` ≤ the cap per volume throughout, B's window ≤ GRANTS_MAX ranges; every file whole from A" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var cap_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_BLOCK_GRANT_LEDGER_CAP", try std.fmt.bufPrint(&cap_text, "{d}", .{grant_ledger_row_cap}));
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetWith(false, &.{ "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{grant_ledger_row_block}) });
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    // B's files, one floor grant each, with the holder's table watched
+    // between files (never above the cap).
+    var i: u64 = 0;
+    var max_open: u64 = 0;
+    while (i < grant_ledger_row_files) : (i += 1) {
+        var script_buf: [192]u8 = undefined;
+        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "mkdir -p g && dd if=/dev/zero of=g/f{d} bs=1M count=64 status=none && sync g/f{d}", .{ i, i }));
+        gpa.free(out);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, ta, pos, "\"open_grants\":")) |at| {
+            const n = numberAfter(ta[at..], "\"open_grants\":") orelse 0;
+            max_open = @max(max_open, n);
+            pos = at + "\"open_grants\":".len;
+        }
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"block_grant_deferred\":"));
+    }
+    const ta = try rig.stats();
+    defer gpa.free(ta);
+    const tb = try b.stats();
+    defer gpa.free(tb);
+    const grants = numberAfter(ta, "\"block_grants\":") orelse 0;
+    const retired = numberAfter(ta, "\"block_grant_consumed_retired\":") orelse 0;
+    try testing.expect(grants >= grant_ledger_row_files);
+    try testing.expect(max_open <= grant_ledger_row_cap);
+    // The structural bound: the table holds ≤ cap open grants, so every
+    // grant past the cap had to RETIRE for `deferred` to read 0.
+    try testing.expect(retired >= grant_ledger_row_files - grant_ledger_row_cap);
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"block_grant_deferred\":"));
+    // Declarations ride the renewal beat (one per beat per volume): a
+    // count, never a per-file law — the mechanism ran on both sides.
+    try testing.expect((numberAfter(ta, "\"block_grant_windows_declared\":") orelse 0) >= 1);
+    try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"block_grant_topup_deferred\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"block_grant_exhausted\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"block_grant_topup_refused\":"));
+    try testing.expect((numberAfter(tb, "\"block_grant_windows_declared_by_writer\":") orelse 0) >= 1);
+    try expectMustStayZero(ta);
+    try expectMustStayZero(tb);
+    {
+        const from_a = try rig.onMount("ls g | wc -l; cmp g/f0 g/f23 && stat -c %s g/f23");
+        defer gpa.free(from_a);
+        var want_buf: [32]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "{d}\n{d}\n", .{ grant_ledger_row_files, 64 << 20 }), from_a);
+    }
+    std.debug.print("\nsmoke: grant ledger: {d} grants carved for B over {d} files at a cap of {d}; consumed retired {d}, open grants peaked at {d}, deferred 0 at A; B: top-ups {d}, deferred 0, exhausted 0, declarations {d}\n", .{ grants, grant_ledger_row_files, grant_ledger_row_cap, retired, max_open, numberAfter(tb, "\"block_grant_topups\":") orelse 0, numberAfter(tb, "\"block_grant_windows_declared_by_writer\":") orelse 0 });
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

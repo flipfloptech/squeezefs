@@ -824,7 +824,7 @@ After the pass: `measure_pack` + `refresh_d1_d3_gauges` (walk-priced re-gauge fr
 | `SQUEEZEFS_TEST_JOB_PANIC_AFTER` | — | — | DELETED | — | a panic seam has no Zig analogue; the claim-release-on-error path is pinned by an error-returning noop task instead |
 | `SQUEEZEFS_TEST_JOB_HOLD_SUBMISSION` | bool | 0 | `test_seam` | the worker parks before `result_submit` (`W:3459-3463`) | the zombie window |
 | `SQUEEZEFS_TEST_MOVER_PRE_PUBLISH_HOLD` | bool | 0 | `test_seam` | `mover.zig` parks after the copy, before the flush lock (`J:618-642`) | the supersession / crash-injection window |
-| `SQUEEZEFS_JOB_WIRE_BIND/_CA_CERT/_CA_KEY/_MAX_CONNS/_ENROLL_FRESHNESS_MS` | — | — | NOT ADDED | the job verbs ride the ONE listener: `SQUEEZEFS_MW_BIND`, `SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS` (`knobs.zig:284-285`), the wire's TLS rows when rung 8 adds them | one listener, one bind (quirk §6 #2) |
+| `SQUEEZEFS_JOB_WIRE_BIND/_CA_CERT/_CA_KEY/_MAX_CONNS/_ENROLL_FRESHNESS_MS` | — | — | NOT ADDED | the job verbs ride the ONE listener: `SQUEEZEFS_MW_BIND`, `SQUEEZEFS_CLUSTER_WIRE_MAX_CONNS` (`knobs.zig:284-285`), and the wire's TLS rows `SQUEEZEFS_WIRE_CHANNEL` + `SQUEEZEFS_WIRE_TLS_{CA,CERT,KEY}` (rung 10, 0003 §O; the verify-permille knob is honoured once the posture is `mutual_tls`) | one listener, one bind (quirk §6 #2) |
 | `SQUEEZEFS_SMALL_FILE_PACKING`, `SQUEEZEFS_PACK_MAX_SLOT_BYTES` | existing | | | the `--pack` gate + victim line (`knobs.zig:205-206`) | |
 
 ### 4.2 Gauges (`counters.ShardedCounter` unless noted; `Gauge` for levels)

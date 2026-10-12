@@ -82,6 +82,17 @@ buggy/hostile-peer class, off the must-stay-0 gauge), or "not now" (`STATUS_DEFE
   `ChannelClass` enum reserves `.mutual_tls` and the exporter-binding slot in the session key (§1.3), so
   rung 8 adds it without a wire change. Charter §9: **thread-per-connection** — the reference's venue
   since the rip-tokio conversion (CW:76-85).
+- **Landed at rung 10 (decision 0003 §O; 0002 rows 486–488; `docs/evidence/rung-10-mtls.md`):**
+  `MutualTls` = the same ladder inside ONE TLS 1.3 profile written in-tree over `std.crypto`
+  (`wire/tls.zig`: `TLS_AES_128_GCM_SHA256`, X25519, Ed25519; server + client; the RFC 8446 §7.5 exporter
+  fills `binding`; KeyUpdate; a record layer behind the session `Link`), under the cluster's own Ed25519 PKI
+  (`wire/pki.zig`; `squeezefs key tls-init` / `tls-issue`). The class is the PROCESS posture
+  (`SQUEEZEFS_WIRE_CHANNEL`, `SQUEEZEFS_WIRE_TLS_{CA,CERT,KEY}`), installed before the fork; a CA-less
+  `mutual_tls` refuses the mount. Refusals by class on both ends: `cluster_wire_tls_refused_{untrusted,
+  expired,protocol}`, `cluster_wire_plaintext_refused` (a Plaintext dialer's silence answered with a
+  plaintext `Refused` at half the dial bound), `cluster_wire_tls_dial_refused`; `cluster_wire_tls_handshakes`,
+  `cluster_wire_tls_key_updates`, the gauge `cluster_wire_channel_mutual_tls`. `Framer.confidential()` =
+  `authenticated() ∧ mutual_tls` is the ladder's word (CW:1010–1051).
 
 ### 1.2 Framing — the reference's bytes, and the port's v4 frame
 

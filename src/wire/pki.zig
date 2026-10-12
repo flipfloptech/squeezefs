@@ -1,5 +1,5 @@
 //! The cluster's own PKI (charter §8 "remote workers over TCP/TLS";
-//! decision 0003 §N): ONE profile — Ed25519 everywhere — issued by this
+//! decision 0003 §O): ONE profile — Ed25519 everywhere — issued by this
 //! binary (`squeezefs key tls-init` mints the cluster CA, `key tls-issue`
 //! a node certificate under it) and consumed by `wire/tls.zig`'s
 //! `MutualTls` channel, which pins the CA and accepts exactly a one-leaf

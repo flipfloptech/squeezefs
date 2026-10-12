@@ -1,6 +1,6 @@
 //! The `MutualTls` channel class (charter §8 "remote workers over TCP/TLS";
 //! `docs/porting/sym_wire_membership_recovery.md` §1.1 channel classes;
-//! decision 0003 §N): ONE TLS 1.3 profile, written here over `std.crypto`'s
+//! decision 0003 §O): ONE TLS 1.3 profile, written here over `std.crypto`'s
 //! primitives — `TLS_AES_128_GCM_SHA256`, X25519, Ed25519 certificates
 //! under the cluster's own CA (`wire/pki.zig`) — with mutual
 //! authentication (the server REQUIRES a client certificate under the
@@ -9,7 +9,7 @@
 //! key to THIS channel (`auth.sessionKey`'s `binding`), and a record layer
 //! that frames once per wire frame with no allocation per record.
 //!
-//! Why written and not vendored (0003 §N): Zig 0.17's `std.crypto.tls`
+//! Why written and not vendored (0003 §O): Zig 0.17's `std.crypto.tls`
 //! ships a CLIENT only — no server, no client-certificate arm (a
 //! `CertificateRequest` is `TlsUnexpectedMessage`), no exporter; BearSSL
 //! has no TLS 1.3; mbedTLS would bring a 100-file C tree and a config

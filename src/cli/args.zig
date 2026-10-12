@@ -145,7 +145,7 @@ pub const Storage = union(enum) {
 };
 
 /// `key {install, show, check}` (§7.2): the key store; `key {tls-init,
-/// tls-issue}`: the cluster wire's own PKI (decision 0003 §N).
+/// tls-issue}`: the cluster wire's own PKI (decision 0003 §O).
 pub const Key = union(enum) {
     install: struct { meta_uri: []const u8, source: []const u8, force: bool = false },
     show: struct { meta_uri: []const u8 },

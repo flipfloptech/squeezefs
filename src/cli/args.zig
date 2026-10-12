@@ -144,11 +144,16 @@ pub const Storage = union(enum) {
     validate: struct { path: []const u8 },
 };
 
-/// `key {install, show, check}` (§7.2): the key store.
+/// `key {install, show, check}` (§7.2): the key store; `key {tls-init,
+/// tls-issue}`: the cluster wire's own PKI (decision 0003 §N).
 pub const Key = union(enum) {
     install: struct { meta_uri: []const u8, source: []const u8, force: bool = false },
     show: struct { meta_uri: []const u8 },
     check: struct { meta_uri: []const u8, encrypt_key: ?[]const u8 = null },
+    /// Mint the cluster CA into `<dir>/ca.pem` + `<dir>/ca.key`.
+    tls_init: struct { dir: []const u8, name: ?[]const u8 = null, force: bool = false },
+    /// Issue `<out|dir>/node.pem` + `node.key` for `--node NAME` under `<dir>`'s CA.
+    tls_issue: struct { dir: []const u8, node: []const u8, out: ?[]const u8 = null, force: bool = false },
 };
 
 pub const Umount = struct {
@@ -554,7 +559,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .mount => "usage: squeezefs mount [-o opt[,opt…]] [--daemon --log-file PATH [--supervise]] [--join host:port] [--encrypt-key PATH|-] sqmeta://<path> <mountpoint>\n",
         .nvmeof => "usage: squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>\n       squeezefs nvmeof unshare <subnqn>\n       squeezefs nvmeof list [--json]\n       squeezefs nvmeof restore\n       squeezefs nvmeof adopt <subnqn>\n       squeezefs nvmeof target status [--json] | setup | systemd-unit | stop\n       squeezefs nvmeof connect [--transport tcp|loop] [--ip ADDR] [--port N] [--hostnqn NQN --hostid UUID] [--host-traddr ADDR] [--host-iface IF] [--nr-io-queues N] [--ns-uuid UUID] <subnqn>\n       squeezefs nvmeof disconnect [--identity-only [--hostnqn NQN --hostid UUID]] <subnqn>\n       squeezefs nvmeof resv-report [--json] [--pr-matrix --peer <dev> [--force]] <dev>\n",
         .storage => "usage: squeezefs storage list [--json]\n       squeezefs storage validate <path>\n",
-        .key => "usage: squeezefs key install [--force] sqmeta://<path> <keyfile|->\n       squeezefs key show sqmeta://<path>\n       squeezefs key check [--encrypt-key PATH|-] sqmeta://<path>\n",
+        .key => "usage: squeezefs key install [--force] sqmeta://<path> <keyfile|->\n       squeezefs key show sqmeta://<path>\n       squeezefs key check [--encrypt-key PATH|-] sqmeta://<path>\n       squeezefs key tls-init [--name CA-NAME] [--force] <dir>\n       squeezefs key tls-issue --node NAME [--out DIR] [--force] <ca-dir>\n",
 
         .umount => "usage: squeezefs umount <mountpoint>\n",
         .status => "usage: squeezefs status sqmeta://<path>|<mountpoint>\n",
@@ -987,6 +992,31 @@ fn parseKey(words: []const []const u8, diag: *Refusal) Error!Verb {
         const target = try exactlyOne(&c, "the sqmeta:// volume");
         try checkUri(.meta, target, diag);
         return .{ .key = .{ .check = .{ .meta_uri = target, .encrypt_key = flag } } };
+    }
+    if (std.mem.eql(u8, sub, "tls-init")) {
+        var c: Cursor = .{ .verb = "key tls-init", .words = rest, .diag = diag };
+        var name: ?[]const u8 = null;
+        var force = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--name")) name = try c.value(f) else if (std.mem.eql(u8, f.name, "--force")) force = true else return c.unknown(f);
+        }
+        const dir = try exactlyOne(&c, "the directory for ca.pem and ca.key");
+        return .{ .key = .{ .tls_init = .{ .dir = dir, .name = name, .force = force } } };
+    }
+    if (std.mem.eql(u8, sub, "tls-issue")) {
+        var c: Cursor = .{ .verb = "key tls-issue", .words = rest, .diag = diag };
+        var node: ?[]const u8 = null;
+        var out: ?[]const u8 = null;
+        var force = false;
+        while (try c.step()) |f| {
+            if (std.mem.eql(u8, f.name, "--node")) node = try c.value(f) else if (std.mem.eql(u8, f.name, "--out")) out = try c.value(f) else if (std.mem.eql(u8, f.name, "--force")) force = true else return c.unknown(f);
+        }
+        const dir = try exactlyOne(&c, "the CA directory (ca.pem + ca.key)");
+        const n = node orelse {
+            diag.* = .{ .missing_positional = .{ .verb = c.verb, .what = "--node NAME (the certificate's CN)" } };
+            return error.Refused;
+        };
+        return .{ .key = .{ .tls_issue = .{ .dir = dir, .node = n, .out = out, .force = force } } };
     }
     diag.* = .{ .unknown_subverb = .{ .verb = "key", .word = sub } };
     return error.Refused;
@@ -2287,6 +2317,16 @@ test "nvmeof: share collects repeatable --ip/--allow-host, parses --transport/--
     const kc = try parse(av(&.{ "key", "check", "--encrypt-key", "/k", "sqmeta:///dev/m" }), &d);
     try testing.expectEqualStrings("/k", kc.key.check.encrypt_key.?);
     try testing.expect((try refusal(av(&.{ "key", "rotate", "sqmeta:///dev/m" }))) == .unknown_subverb);
+    const ti = try parse(av(&.{ "key", "tls-init", "--name", "lab-ca", "/etc/squeezefs/tls" }), &d);
+    try testing.expectEqualStrings("lab-ca", ti.key.tls_init.name.?);
+    try testing.expectEqualStrings("/etc/squeezefs/tls", ti.key.tls_init.dir);
+    try testing.expect(!ti.key.tls_init.force);
+    const tis = try parse(av(&.{ "key", "tls-issue", "--node", "node-a", "--out", "/tmp/a", "--force", "/etc/squeezefs/tls" }), &d);
+    try testing.expectEqualStrings("node-a", tis.key.tls_issue.node);
+    try testing.expectEqualStrings("/tmp/a", tis.key.tls_issue.out.?);
+    try testing.expect(tis.key.tls_issue.force);
+    try testing.expect((try refusal(av(&.{ "key", "tls-issue", "/etc/squeezefs/tls" }))) == .missing_positional);
+    try testing.expect((try refusal(av(&.{ "key", "tls-init" }))) == .missing_positional);
     const m = try parse(av(&.{ "mount", "--encrypt-key", "-", "sqmeta:///dev/m", "/mnt" }), &d);
     try testing.expectEqualStrings("-", m.mount.encrypt_key.?);
     const fe = try parse(av(&.{ "config", "set-fabric-endpoints", "sqmeta:///dev/m", "vol-0123456789abcdef=tcp:127.0.0.1:4420:nqn.x", "vol-0000000000000001=loop:::nqn.y" }), &d);

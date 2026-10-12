@@ -32,6 +32,7 @@ const exec = @import("../exec/exec.zig");
 const wire_auth = @import("../wire/auth.zig");
 const wire_endpoint = @import("../wire/endpoint.zig");
 const dialer = @import("../wire/dialer.zig");
+const wire_tls = @import("../wire/tls.zig");
 const verbs = @import("../wire/verbs.zig");
 const jobs = @import("../ops/jobs.zig");
 
@@ -169,6 +170,16 @@ pub fn withLane(p: cli.Process, verb: []const u8, mountpoint: []const u8, body: 
 
         fn main(c: *@This(), io: Io) u8 {
             const gpa_ = c.p.gpa;
+            // The channel class this host dials with (the same knobs the
+            // daemon read; a CA-less mutual_tls refuses here too).
+            var posture = wire_tls.linux_files.installFromEnv(gpa_, c.p.env) catch |e| {
+                var tb: [1024]u8 = undefined;
+                var tw: Io.Writer = .fixed(&tb);
+                wire_tls.writeInstallRefusal(&tw, e, wire_tls.Paths.fromEnv(c.p.env)) catch {};
+                c.p.stderr.print("squeezefs {s}: cluster wire: {s}\n", .{ c.verb, tw.buffered() }) catch {};
+                return cli.exit_failed;
+            };
+            defer posture.deinit(gpa_);
             // The storage-trust proof: the secret off tree 0 of volume 0.
             const secret: wire_auth.Secret = blk: {
                 const set = meta_set.MetaSet.open(gpa_, io, c.paths, .{ .env = c.p.env, .pool = c.pool, .cache_budget_bytes = c.cache, .cpus = c.cpus, .read_only = true }) catch |e| {

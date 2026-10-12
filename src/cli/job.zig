@@ -31,6 +31,7 @@ const exec = @import("../exec/exec.zig");
 const wire_auth = @import("../wire/auth.zig");
 const wire_endpoint = @import("../wire/endpoint.zig");
 const dialer = @import("../wire/dialer.zig");
+const wire_tls = @import("../wire/tls.zig");
 const verbs = @import("../wire/verbs.zig");
 const errors = @import("../core/errors.zig");
 const clock = @import("../core/clock.zig");
@@ -289,6 +290,14 @@ fn worker(p: cli.Process, meta_uri: []const u8) u8 {
 
         fn main(c: *@This(), io: Io) u8 {
             const gpa = c.p.gpa;
+            var posture = wire_tls.linux_files.installFromEnv(gpa, c.p.env) catch |e| {
+                var tb: [1024]u8 = undefined;
+                var tw: Io.Writer = .fixed(&tb);
+                wire_tls.writeInstallRefusal(&tw, e, wire_tls.Paths.fromEnv(c.p.env)) catch {};
+                c.p.stderr.print("squeezefs job worker: cluster wire: {s}\n", .{tw.buffered()}) catch {};
+                return cli.exit_failed;
+            };
+            defer posture.deinit(gpa);
             var secret: wire_auth.Secret = undefined;
             var ep: wire_endpoint.EndpointWire = .none;
             {

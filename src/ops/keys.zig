@@ -295,23 +295,181 @@ pub const linux_verbs = if (is_linux) struct {
     fn writeStoreFile(pool: *uring_fs.Pool, dest: [:0]const u8, material: []const u8) !void {
         _ = linux.mkdir(KEY_DIR_PARENT, 0o700);
         _ = linux.mkdir(KEY_DIR, 0o700);
-        var tb: [160]u8 = undefined;
+        try writeAtomic(pool, KEY_DIR, dest, material, 0o600);
+    }
+
+    /// `dest` inside `dir`: a `.tmp` created O_EXCL at `mode`, the bytes
+    /// through the io_uring file layer, fdatasync, rename, fsync(dir).
+    fn writeAtomic(pool: *uring_fs.Pool, dir: [:0]const u8, dest: [:0]const u8, bytes: []const u8, mode: linux.mode_t) !void {
+        var tb: [linux.PATH_MAX]u8 = undefined;
         const tmp = try std.fmt.bufPrintSentinel(&tb, "{s}.tmp", .{dest}, 0);
         _ = linux.unlink(tmp);
-        const rc = linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
+        const rc = linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, mode);
         if (linux.errno(rc) != .SUCCESS) return @import("../core/errors.zig").fromErrno(linux.errno(rc));
         _ = linux.close(@intCast(rc));
         errdefer _ = linux.unlink(tmp);
-        try pool.writeAt(tmp, 0, material);
+        try pool.writeAt(tmp, 0, bytes);
         try pool.fdatasync(tmp);
         const rr = linux.renameat(linux.AT.FDCWD, tmp, linux.AT.FDCWD, dest);
         if (linux.errno(rr) != .SUCCESS) return @import("../core/errors.zig").fromErrno(linux.errno(rr));
-        const drc = linux.open(KEY_DIR, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        const drc = linux.open(dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
         if (linux.errno(drc) == .SUCCESS) {
             const dfd: linux.fd_t = @intCast(drc);
             defer _ = linux.close(dfd);
             _ = linux.fsync(dfd);
         }
+    }
+
+    // ---- the cluster wire's PKI (`wire/pki.zig`; decision 0003 §N) ----
+
+    const pki = @import("../wire/pki.zig");
+    const wire_tls = @import("../wire/tls.zig");
+    const clock = @import("../core/clock.zig");
+
+    /// The default CA name when `--name` is absent.
+    pub const DEFAULT_CA_NAME = "squeezefs-ca";
+    /// A fresh certificate's `notBefore` is backdated this much so a peer
+    /// whose clock lags by an NTP-grade offset still sees it valid at the
+    /// first handshake (charter §5.5's membership skew is 500 ppm of
+    /// T_owner ≈ 23 ms; five minutes covers an unsynchronised host).
+    pub const NOT_BEFORE_SKEW_S: u64 = 5 * std.time.s_per_min;
+
+    fn tlsPath(buf: *[linux.PATH_MAX]u8, dir: []const u8, name: []const u8) ![:0]const u8 {
+        return std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ dir, name }, 0) catch error.NameTooLong;
+    }
+
+    fn dirZ(buf: *[linux.PATH_MAX]u8, dir: []const u8) ![:0]const u8 {
+        return std.fmt.bufPrintSentinel(buf, "{s}", .{dir}, 0) catch error.NameTooLong;
+    }
+
+    fn fileExists(path: [:0]const u8) bool {
+        var stx: linux.Statx = undefined;
+        return linux.errno(linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &stx)) == .SUCCESS;
+    }
+
+    /// Write a PEM pair: the key 0600, the certificate 0644 (public; the
+    /// loader's law is "nobody else may WRITE it").
+    fn writePemPair(pool: *uring_fs.Pool, dir: [:0]const u8, cert_path: [:0]const u8, key_path: [:0]const u8, der: []const u8, kp: *const pki.KeyPair) !void {
+        var text: [4096]u8 = undefined;
+        var seed = pki.seedOf(kp);
+        defer std.crypto.secureZero(u8, &seed);
+        var pkcs8 = pki.encodePkcs8(&seed);
+        defer std.crypto.secureZero(u8, &pkcs8);
+        const key_pem = try pki.pemEncode(pki.PEM_PRIVATE_KEY, &pkcs8, &text);
+        try writeAtomic(pool, dir, key_path, key_pem, 0o600);
+        std.crypto.secureZero(u8, &text);
+        const cert_pem = try pki.pemEncode(pki.PEM_CERTIFICATE, der, &text);
+        try writeAtomic(pool, dir, cert_path, cert_pem, 0o644);
+    }
+
+    fn openPool(p: cli.Process, verb: []const u8) ?*uring_fs.Pool {
+        return uring_fs.Pool.init(p.gpa, uring_fs.Config.resolve(p.env, derive.facts())) catch |e| {
+            p.stderr.print("squeezefs {s}: io pool init failed ({s})\n", .{ verb, @errorName(e) }) catch {};
+            return null;
+        };
+    }
+
+    /// `key tls-init [--name NAME] [--force] <dir>`: the cluster CA.
+    pub fn tlsInit(p: cli.Process, dir: []const u8, name: ?[]const u8, force: bool) u8 {
+        const ca_name = name orelse DEFAULT_CA_NAME;
+        if (!pki.nameValid(ca_name)) {
+            p.stderr.print("squeezefs key tls-init: the CA name must be 1..{d} printable ASCII characters\n", .{pki.NAME_MAX}) catch {};
+            return cli.exit_usage;
+        }
+        var db: [linux.PATH_MAX]u8 = undefined;
+        var cb: [linux.PATH_MAX]u8 = undefined;
+        var kb: [linux.PATH_MAX]u8 = undefined;
+        const dz = dirZ(&db, dir) catch return cli.exit_usage;
+        const cert_path = tlsPath(&cb, dir, "ca.pem") catch return cli.exit_usage;
+        const key_path = tlsPath(&kb, dir, "ca.key") catch return cli.exit_usage;
+        _ = linux.mkdir(dz, 0o700);
+        if (fileExists(key_path) and !force) {
+            p.stderr.print("squeezefs key tls-init: {s} exists — a CA key is never overwritten by accident; pass --force to mint a NEW CA (every node certificate under the old one stops verifying)\n", .{key_path}) catch {};
+            return cli.exit_failed;
+        }
+        const now = clock.realtimeCoarseS();
+        const ca = pki.mintCa(p.io, ca_name, now - NOT_BEFORE_SKEW_S) catch |e| {
+            p.stderr.print("squeezefs key tls-init: cannot mint the CA ({s})\n", .{@errorName(e)}) catch {};
+            return cli.exit_failed;
+        };
+        const pool = openPool(p, "key tls-init") orelse return cli.exit_failed;
+        defer pool.deinit();
+        writePemPair(pool, dz, cert_path, key_path, ca.der(), &ca.key) catch |e| {
+            p.stderr.print("squeezefs key tls-init: cannot write {s}: {s}\n", .{ dir, @errorName(e) }) catch {};
+            return cli.exit_failed;
+        };
+        p.stdout.print("minted CA '{s}' (Ed25519, valid {d} days): {s} (0644), {s} (0600) — issue node certificates with `squeezefs key tls-issue --node NAME {s}`\n", .{ ca_name, pki.CA_VALIDITY_S / std.time.s_per_day, cert_path, key_path, dir }) catch {};
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+
+    /// `key tls-issue --node NAME [--out DIR] [--force] <ca-dir>`: a node
+    /// certificate + key under the CA.
+    pub fn tlsIssue(p: cli.Process, dir: []const u8, node: []const u8, out: ?[]const u8, force: bool) u8 {
+        if (!pki.nameValid(node)) {
+            p.stderr.print("squeezefs key tls-issue: the node name must be 1..{d} printable ASCII characters\n", .{pki.NAME_MAX}) catch {};
+            return cli.exit_usage;
+        }
+        var cb: [linux.PATH_MAX]u8 = undefined;
+        var kb: [linux.PATH_MAX]u8 = undefined;
+        const ca_cert_path = tlsPath(&cb, dir, "ca.pem") catch return cli.exit_usage;
+        const ca_key_path = tlsPath(&kb, dir, "ca.key") catch return cli.exit_usage;
+        // The CA under the file laws (the key 0600, the cert nobody else writes).
+        var ca_text: [transform.MAX_KEY_FILE_BYTES]u8 = undefined;
+        const ca_pem = wire_tls.linux_files.readTrustFile(ca_cert_path, &ca_text) catch |e| {
+            p.stderr.print("squeezefs key tls-issue: cannot read the CA certificate {s} ({s}; a regular file owned by you or root that nobody else may write)\n", .{ ca_cert_path, @errorName(e) }) catch {};
+            return cli.exit_failed;
+        };
+        var ca_der: [pki.CERT_MAX_DER]u8 = undefined;
+        const ca_parsed = pki.parseCertificatePem(ca_pem, &ca_der) catch {
+            p.stderr.print("squeezefs key tls-issue: {s} is not a PEM Ed25519 certificate\n", .{ca_cert_path}) catch {};
+            return cli.exit_failed;
+        };
+        var key_text: [transform.MAX_KEY_FILE_BYTES + 1]u8 = undefined;
+        defer std.crypto.secureZero(u8, &key_text);
+        const key_pem = transform.linux_keys.readKeyFile(ca_key_path, &key_text) catch |e| {
+            var buf: [512]u8 = undefined;
+            var w: Io.Writer = .fixed(&buf);
+            transform.writeKeyFileRefusal(&w, e, ca_key_path) catch {};
+            p.stderr.print("squeezefs key tls-issue: {s}\n", .{w.buffered()}) catch {};
+            return cli.exit_failed;
+        };
+        const ca_key = pki.parsePrivateKeyPem(key_pem) catch {
+            p.stderr.print("squeezefs key tls-issue: {s} is not a PEM PKCS#8 Ed25519 private key\n", .{ca_key_path}) catch {};
+            return cli.exit_failed;
+        };
+        if (!std.mem.eql(u8, ca_parsed.publicKey(), &ca_key.public_key.toBytes())) {
+            p.stderr.print("squeezefs key tls-issue: {s} is not the key of {s}\n", .{ ca_key_path, ca_cert_path }) catch {};
+            return cli.exit_failed;
+        }
+        var ca_issued: pki.Issued = .{ .der_buf = undefined, .der_len = ca_parsed.der.len, .key = ca_key };
+        @memcpy(ca_issued.der_buf[0..ca_parsed.der.len], ca_parsed.der);
+        const out_dir = out orelse dir;
+        var db: [linux.PATH_MAX]u8 = undefined;
+        var ncb: [linux.PATH_MAX]u8 = undefined;
+        var nkb: [linux.PATH_MAX]u8 = undefined;
+        const dz = dirZ(&db, out_dir) catch return cli.exit_usage;
+        const cert_path = tlsPath(&ncb, out_dir, "node.pem") catch return cli.exit_usage;
+        const key_path = tlsPath(&nkb, out_dir, "node.key") catch return cli.exit_usage;
+        _ = linux.mkdir(dz, 0o700);
+        if (fileExists(key_path) and !force) {
+            p.stderr.print("squeezefs key tls-issue: {s} exists — pass --force to replace the node's key and certificate\n", .{key_path}) catch {};
+            return cli.exit_failed;
+        }
+        const now = clock.realtimeCoarseS();
+        const issued = pki.mintNode(p.io, &ca_issued, ca_parsed.commonName(), node, now - NOT_BEFORE_SKEW_S, pki.NODE_VALIDITY_S) catch |e| {
+            p.stderr.print("squeezefs key tls-issue: cannot issue the certificate ({s})\n", .{@errorName(e)}) catch {};
+            return cli.exit_failed;
+        };
+        const pool = openPool(p, "key tls-issue") orelse return cli.exit_failed;
+        defer pool.deinit();
+        writePemPair(pool, dz, cert_path, key_path, issued.der(), &issued.key) catch |e| {
+            p.stderr.print("squeezefs key tls-issue: cannot write {s}: {s}\n", .{ out_dir, @errorName(e) }) catch {};
+            return cli.exit_failed;
+        };
+        p.stdout.print("issued node certificate CN='{s}' under CA '{s}' (Ed25519, valid {d} days): {s} (0644), {s} (0600) — point SQUEEZEFS_WIRE_TLS_CERT/_KEY at them (or install them as {s}/node.pem and node.key) and set SQUEEZEFS_WIRE_CHANNEL=mutual_tls\n", .{ node, ca_parsed.commonName(), pki.NODE_VALIDITY_S / std.time.s_per_day, cert_path, key_path, wire_tls.TLS_DIR }) catch {};
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
     }
 
     /// `key show <sqmeta-uri>`: scheme, key id, salt hex, and WHICH source
@@ -370,6 +528,8 @@ pub const linux_verbs = if (is_linux) struct {
             .install => |i| install(p, i.meta_uri, i.source, i.force),
             .show => |s| show(p, s.meta_uri),
             .check => |c| check(p, c.meta_uri, c.encrypt_key),
+            .tls_init => |t| tlsInit(p, t.dir, t.name, t.force),
+            .tls_issue => |t| tlsIssue(p, t.dir, t.node, t.out, t.force),
         };
     }
 } else struct {};

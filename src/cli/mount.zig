@@ -90,6 +90,7 @@ const node_cache = @import("../meta/node_cache.zig");
 const dlm = @import("../meta/dlm.zig");
 const sym_xv = @import("../meta/sym/xv.zig");
 const sym_wire = @import("../meta/sym/wire_plane.zig");
+const wire_tls = @import("../wire/tls.zig");
 const sym_reader = @import("../meta/sym/reader_plane.zig");
 const ro_mount = @import("../meta/sym/tokens/ro_mount.zig");
 const wire_endpoint = @import("../wire/endpoint.zig");
@@ -276,6 +277,20 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         stash = &stash_storage;
     }
     defer if (stash) |st| st.deinit();
+
+    // The cluster wire's channel class (SQUEEZEFS_WIRE_CHANNEL): under
+    // `mutual_tls` the CA, the node certificate and its key are loaded
+    // NOW — before the fork, so a CA-less or malformed configuration fails
+    // on the caller's console, never over the ready pipe; the identity
+    // crosses the fork in memory like the encrypt-key stash.
+    var wire_posture = wire_tls.linux_files.installFromEnv(p.gpa, p.env) catch |e| {
+        var tb: [1024]u8 = undefined;
+        var tw: Io.Writer = .fixed(&tb);
+        wire_tls.writeInstallRefusal(&tw, e, wire_tls.Paths.fromEnv(p.env)) catch {};
+        p.stderr.print("squeezefs mount: cluster wire: {s}\n", .{tw.buffered()}) catch {};
+        return cli.exit_failed;
+    };
+    defer wire_posture.deinit(p.gpa);
 
     // `--daemon`: the log file first (its refusal reaches the terminal),
     // then the fork — before any thread exists.

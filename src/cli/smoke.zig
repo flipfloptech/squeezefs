@@ -4684,7 +4684,11 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
         try testing.expect(r.term.success());
         const t = try rig.squeezefs(&.{ "job", "throttle", rig.mp, drain_id, "100" });
         defer rig.freeRun(t);
-        try testing.expect(t.term.success());
+        // The resumed drain may retire its last blocks before the throttle
+        // lands (a 25 % throttle over a tail of a few blocks on a quiet
+        // venue): a terminal job refuses control by design — that verdict
+        // is the lane's, not a failure of the row.
+        if (!t.term.success()) try testing.expect(std.mem.indexOf(u8, t.stderr, "the job is terminal") != null);
     }
     try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, drain_id, 900 * std.time.ns_per_s));
     {

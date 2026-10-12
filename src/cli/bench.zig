@@ -1056,11 +1056,12 @@ pub const hash_bench = struct {
     pub const cell_count = sizes.len * algos.len * modes.len;
 
     /// A cell's span doubles its batch until it covers at least this long:
-    /// a 100 ns clock read is then under 0.001 % of the measurement, and a
-    /// 20 ms span rides above the scheduler's tick.
-    pub const MIN_SPAN_NS: u64 = 20 * std.time.ns_per_ms;
+    /// a 100 ns clock read is then under 0.0001 % of the measurement, and a
+    /// 100 ms span averages over tens of scheduler ticks (a 20 ms span read
+    /// a 100 B cell 2.3× apart between two runs on a shared venue).
+    pub const MIN_SPAN_NS: u64 = 100 * std.time.ns_per_ms;
     /// The first batch (doubled until the span holds).
-    pub const FIRST_BATCH: u64 = 256;
+    pub const FIRST_BATCH: u64 = 1024;
     /// Picoseconds per nanosecond: `ps_per_op` keeps three decimals of ns
     /// as an integer (no floats on a wire, the rows' law).
     pub const PS_PER_NS: u64 = 1000;

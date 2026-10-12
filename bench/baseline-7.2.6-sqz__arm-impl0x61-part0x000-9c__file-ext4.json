@@ -9,7 +9,7 @@
   },
   "instrument": {
     "train": "0.1.0",
-    "commit": "f8ab6ac25352",
+    "commit": "60cfc3491099",
     "profile": "gate"
   },
   "substrate": "file",
@@ -21,16 +21,16 @@
     "time_box_s": 5
   },
   "runs": 3,
-  "unix_time": 1791778051,
+  "unix_time": 1791778397,
   "groups": [
     {
       "ops_per_s": {
-        "mean": 1285.7306356426964,
-        "sigma": 208.98579966741914
+        "mean": 1406.5261313806268,
+        "sigma": 49.84583624760288
       },
       "p50_ns": {
-        "mean": 1365333.3333333333,
-        "sigma": 591206.6756501768
+        "mean": 1024000,
+        "sigma": 0
       },
       "p99_ns": {
         "mean": 32768000,
@@ -38,19 +38,19 @@
       },
       "bytes": 1073741824,
       "admission_bytes": 1073741824,
-      "terminal_frees": 128,
-      "reclaim_queued": 128,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
       "reclaim_elided": 0,
       "discard_bytes": 0
     },
     {
       "ops_per_s": {
-        "mean": 7442.292872835995,
-        "sigma": 1783.6652776395783
+        "mean": 9556.428092644122,
+        "sigma": 143.35214000430315
       },
       "p50_ns": {
-        "mean": 341333.3333333333,
-        "sigma": 147801.6689125442
+        "mean": 256000,
+        "sigma": 0
       },
       "p99_ns": {
         "mean": 682666.6666666666,
@@ -65,8 +65,8 @@
     },
     {
       "ops_per_s": {
-        "mean": 18743.287017877337,
-        "sigma": 936.9886441543006
+        "mean": 20200.69834648322,
+        "sigma": 862.8383764858811
       },
       "p50_ns": {
         "mean": 128000,
@@ -76,7 +76,7 @@
         "mean": 256000,
         "sigma": 0
       },
-      "bytes": 780390400,
+      "bytes": 859799552,
       "admission_bytes": 0,
       "terminal_frees": 128,
       "reclaim_queued": 128,
@@ -85,19 +85,19 @@
     },
     {
       "ops_per_s": {
-        "mean": 7079.719111178026,
-        "sigma": 62.23600191893014
+        "mean": 7868.1247993680545,
+        "sigma": 344.8531468469652
       },
       "p50_ns": {
         "mean": 256000,
         "sigma": 0
       },
       "p99_ns": {
-        "mean": 512000,
-        "sigma": 0
+        "mean": 853333.3333333334,
+        "sigma": 295603.3378250884
       },
-      "bytes": 292544512,
-      "admission_bytes": 292544512,
+      "bytes": 312356864,
+      "admission_bytes": 312356864,
       "terminal_frees": 0,
       "reclaim_queued": 0,
       "reclaim_elided": 0,
@@ -105,8 +105,28 @@
     },
     {
       "ops_per_s": {
-        "mean": 4947.980757980985,
-        "sigma": 699.1023848626687
+        "mean": 5253.04613826718,
+        "sigma": 432.9595877682193
+      },
+      "p50_ns": {
+        "mean": 256000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 341333.3333333333,
+        "sigma": 147801.6689125442
+      },
+      "bytes": 0,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 4349.2311353555515,
+        "sigma": 700.8770975438429
       },
       "p50_ns": {
         "mean": 426666.6666666667,
@@ -125,28 +145,8 @@
     },
     {
       "ops_per_s": {
-        "mean": 3552.6507856061994,
-        "sigma": 370.28656016791496
-      },
-      "p50_ns": {
-        "mean": 682666.6666666666,
-        "sigma": 295603.3378250884
-      },
-      "p99_ns": {
-        "mean": 853333.3333333334,
-        "sigma": 295603.3378250884
-      },
-      "bytes": 0,
-      "admission_bytes": 0,
-      "terminal_frees": 0,
-      "reclaim_queued": 0,
-      "reclaim_elided": 0,
-      "discard_bytes": 0
-    },
-    {
-      "ops_per_s": {
-        "mean": 711264666.9911417,
-        "sigma": 15611870.230039153
+        "mean": 716287611.3104497,
+        "sigma": 14666487.469888275
       },
       "p50_ns": {
         "mean": 0,
@@ -165,8 +165,8 @@
     },
     {
       "ops_per_s": {
-        "mean": 217846970.15889958,
-        "sigma": 14612433.016034318
+        "mean": 139044868.4806385,
+        "sigma": 7232617.636965504
       },
       "p50_ns": {
         "mean": 0,
@@ -176,7 +176,7 @@
         "mean": 0,
         "sigma": 0
       },
-      "bytes": 838860800,
+      "bytes": 419430400,
       "admission_bytes": 0,
       "terminal_frees": 0,
       "reclaim_queued": 0,
@@ -185,8 +185,8 @@
     },
     {
       "ops_per_s": {
-        "mean": 32451015.116205256,
-        "sigma": 606203.981536084
+        "mean": 32922751.764694322,
+        "sigma": 705092.22150958
       },
       "p50_ns": {
         "mean": 0,
@@ -205,8 +205,8 @@
     },
     {
       "ops_per_s": {
-        "mean": 367716.2631359951,
-        "sigma": 7884.685005836116
+        "mean": 372827.07176442613,
+        "sigma": 7736.41749882502
       },
       "p50_ns": {
         "mean": 0,

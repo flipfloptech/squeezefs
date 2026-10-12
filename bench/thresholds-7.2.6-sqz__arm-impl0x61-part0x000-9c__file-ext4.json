@@ -4,43 +4,43 @@
   "law": "max(3 sigma, 5 % of the mean) per group, from the baseline's runs",
   "groups": [
     {
-      "ops_per_s_drop_max": 626.9573990022575,
+      "ops_per_s_drop_max": 149.53750874280865,
       "p99_ns_rise_max": 1638400
     },
     {
-      "ops_per_s_drop_max": 5350.995832918735,
+      "ops_per_s_drop_max": 477.8214046322061,
       "p99_ns_rise_max": 886810.0134752652
     },
     {
-      "ops_per_s_drop_max": 2810.965932462902,
+      "ops_per_s_drop_max": 2588.5151294576435,
       "p99_ns_rise_max": 12800
     },
     {
-      "ops_per_s_drop_max": 353.98595555890125,
-      "p99_ns_rise_max": 25600
-    },
-    {
-      "ops_per_s_drop_max": 2097.307154588006,
-      "p99_ns_rise_max": 25600
-    },
-    {
-      "ops_per_s_drop_max": 1110.8596805037448,
+      "ops_per_s_drop_max": 1034.5594405408956,
       "p99_ns_rise_max": 886810.0134752652
     },
     {
-      "ops_per_s_drop_max": 46835610.69011746,
+      "ops_per_s_drop_max": 1298.878763304658,
+      "p99_ns_rise_max": 443405.0067376326
+    },
+    {
+      "ops_per_s_drop_max": 2102.6312926315286,
+      "p99_ns_rise_max": 25600
+    },
+    {
+      "ops_per_s_drop_max": 43999462.409664825,
       "p99_ns_rise_max": 0
     },
     {
-      "ops_per_s_drop_max": 43837299.04810295,
+      "ops_per_s_drop_max": 21697852.91089651,
       "p99_ns_rise_max": 0
     },
     {
-      "ops_per_s_drop_max": 1818611.944608252,
+      "ops_per_s_drop_max": 2115276.66452874,
       "p99_ns_rise_max": 0
     },
     {
-      "ops_per_s_drop_max": 23654.055017508348,
+      "ops_per_s_drop_max": 23209.25249647506,
       "p99_ns_rise_max": 0
     }
   ]

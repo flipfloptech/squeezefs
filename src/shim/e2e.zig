@@ -33,6 +33,12 @@ const clock = @import("../core/clock.zig");
 
 const testing = std.testing;
 
+/// The aio reap loop's wedge bound: four stub completions land in
+/// microseconds and the reap re-checks its doorbell park every 5 ms, so a
+/// completion still missing after this is LOST — the row then prints the
+/// host's account beside the reaped count to say on which side.
+const REAP_BOUND_NS: u64 = 5 * std.time.ns_per_s;
+
 /// The injected mount: real `fstat`/`F_GETFL`/`lseek` on the scratch file,
 /// FUSE magic and the host's blob from the fake.
 const Mount = struct {
@@ -534,9 +540,14 @@ test "e2e: fio's shape — a context from libaio's io_queue_init rides the ring 
         .done => |n| try testing.expectEqual(@as(c_int, 4), n),
         .real => return error.TestExpectedServed,
     }
+    // The reap IS the rendezvous on the completions: each call parks on the
+    // session's completion doorbell (register → snapshot → re-scan, 5 ms
+    // re-check) and returns as soon as one lands; the outer bound only
+    // keeps a lost completion from wedging the row — on expiry the host's
+    // own account says whether it was lost before or after the ring.
     var events: [4]aio.IoEvent = undefined;
     var got: usize = 0;
-    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    const deadline = clock.monotonicNs() + REAP_BOUND_NS;
     while (got < 4 and clock.monotonicNs() < deadline) {
         var ts: linux.timespec = .{ .sec = 1, .nsec = 0 };
         switch (aio.getevents(rig.st, ctx, 1, @intCast(4 - got), events[got..].ptr, &ts, RawAio.fns)) {
@@ -544,7 +555,10 @@ test "e2e: fio's shape — a context from libaio's io_queue_init rides the ring 
             .real => return error.TestExpectedServed,
         }
     }
+    if (got != 4) std.debug.print("\nfio's shape: {d} of 4 ring completions reaped within {d} s — host served {d}, park eras {d}, abandoned slots {d}\n", .{ got, REAP_BOUND_NS / std.time.ns_per_s, rig.served(), session.statsPage().il_park_eras.load(.monotonic), session.il_abandoned_slots.load(.monotonic) });
     try testing.expectEqual(@as(usize, 4), got);
+    // The host's account is published WITH each completion (its `served`
+    // bump precedes the DONE release): exact on the last reap's heels.
     try testing.expectEqual(@as(u64, 4), rig.served());
     try testing.expectEqual(@as(c_int, 0), interpose.wrappers.io_queue_release(ctx));
     try testing.expect(aio.registry.lookup(ctx) == null);

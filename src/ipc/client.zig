@@ -1013,9 +1013,14 @@ pub const StubHost = struct {
         } else |_| {
             result = -@as(i64, @backingInt(linux.E.INVAL));
         }
+        // The account BEFORE the completion: the DONE swap's Release half
+        // publishes it, so a client that acquires the completion reads a
+        // `served` that includes it — the engagement law (`served == ops`)
+        // is asserted on a completion's heels. Counted after the wake, the
+        // woken reader beat this thread to the read under load (7/300).
+        _ = self.served.fetchAdd(1, .monotonic);
         slot_core.completeAndWake(slot, result);
         _ = doorbell.completeAndWake(&m.header().cqe, self.latch);
-        _ = self.served.fetchAdd(1, .monotonic);
     }
 
     /// BIND/UNBIND on the ctl socket, non-blocking.

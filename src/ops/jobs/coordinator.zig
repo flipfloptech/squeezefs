@@ -1309,6 +1309,13 @@ pub const Node = struct {
     noop_body: fabric_mod.NoopBody = .{},
     /// The fsck engine over the LIVE binding (null until `bindFsck`).
     fsck_body: ?*fsck_runner.linux.JobBody = null,
+    /// The MEMBER's fleet worker (a joined mount with `SQUEEZEFS_FLEET_JOBS`
+    /// on): enrolled read-capable at the coordinator over the member's own
+    /// manager link, pulling READ shards for the fsck engine over this
+    /// mount's binding. Null on the coordinator and on a wire-less mount.
+    fleet_caller: ?wire_mod.Caller,
+    fleet_worker: ?*wire_mod.Worker = null,
+    fleet_task: ?Io.Future(void) = null,
     /// The admin lane (registered beside the job block).
     admin_: PlaneAdmin,
     admin_svc: admin_mod.AdminService,
@@ -1350,6 +1357,10 @@ pub const Node = struct {
         /// The meta set the D4 arm (`defrag --meta`) compacts and merges;
         /// null = the arm is not bound (the body fails typed).
         meta_set: ?*meta_set.MetaSet = null,
+        /// A JOINED mount's dialed link to the manager (the member's own
+        /// session, so the member's death expires its shards): the fleet
+        /// worker enrolls over it. Null on the manager and without a wire.
+        fleet_caller: ?wire_mod.Caller = null,
     };
 
     pub fn create(gpa: Allocator, io: Io, opts: Options, in: Init) Allocator.Error!*Node {
@@ -1384,6 +1395,7 @@ pub const Node = struct {
             .meta_body = undefined,
             .admin_ = undefined,
             .admin_svc = undefined,
+            .fleet_caller = in.fleet_caller,
         };
         n.fabric = Fabric.init(gpa, n.store.store(), .{ .identity = in.identity, .pid = in.pid, .default_throttle_pct = opts.cpu_limit, .park_delay_ns = opts.park_delay_ns, .held = in.held, .random = in.random });
         n.table = lease_mod.ShardTable.init(seams.LEASE_TTL_MS, n.sink.sink(), null);
@@ -1435,9 +1447,40 @@ pub const Node = struct {
         const b = try fsck_runner.linux.bind(self.gpa, self.io, be, self.plane, .{ .env = env, .mode = .online, .mem_budget = mem_budget, .fs = fs, .staging_root = staging_root });
         errdefer fsck_runner.linux.destroy(b);
         const body = try self.gpa.create(fsck_runner.linux.JobBody);
-        body.* = .{ .gpa = self.gpa, .be = be, .plane = self.plane, .env = env, .mem_budget = mem_budget, .fs = fs, .staging_root = staging_root, .bound = b };
+        body.* = .{ .gpa = self.gpa, .be = be, .plane = self.plane, .env = env, .mem_budget = mem_budget, .fs = fs, .staging_root = staging_root, .bound = b, .fleet = if (self.opts.fleet_jobs) self.coord.fleet() else seams.FleetDispatch.none };
         self.fsck_body = body;
         self.fabric.registerBody(.fsck, body.body());
+    }
+
+    /// The member's fleet worker: enroll (retried at the heartbeat cadence
+    /// while the coordinator's block is not yet served — a manager mid-
+    /// bring-up or mid-failover), then pull until the stop; a dead link
+    /// ends one round and the next re-enrols (the departure expired this
+    /// member's shards at the coordinator). Never a sleep: the parks are
+    /// the worker's own notify under a bound.
+    fn fleetMain(self: *Node) void {
+        const w = self.fleet_worker.?;
+        var enrolled = false;
+        while (!w.stop.load(.acquire)) {
+            if (!enrolled) {
+                if (w.enroll()) |en| {
+                    enrolled = true;
+                    log.info("job fabric: this member enrolled at the coordinator as a fleet READ worker (heartbeat {d} ms, lease TTL {d} ms)", .{ en.heartbeat_ms, en.lease_ttl_ms });
+                } else |e| {
+                    log.debug("job fabric: fleet enrollment refused ({s}); retrying at the heartbeat cadence", .{@errorName(e)});
+                    var n = w.wake.notified();
+                    _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + @as(u64, w.heartbeat_ms) * std.time.ns_per_ms);
+                    continue;
+                }
+            }
+            w.serve() catch |e| {
+                if (w.stop.load(.acquire)) break;
+                log.warn("job fabric: the fleet worker's link to the coordinator ended ({s}) after {d} read shard(s); re-enrolling", .{ @errorName(e), w.read_shards_run });
+                enrolled = false;
+                var n = w.wake.notified();
+                _ = n.waitUntilUncancelable(self.io, clock.monotonicNs() + @as(u64, w.heartbeat_ms) * std.time.ns_per_ms);
+            };
+        }
     }
 
     /// The sheddable `job_copy_buffers` component: sized from the ACTUAL
@@ -1474,7 +1517,15 @@ pub const Node = struct {
         var i: u32 = 0;
         while (i < self.opts.workers) : (i += 1) try self.workers.spawn(self.io, workerMain, .{self});
         self.sweeper = try self.io.concurrent(sweeperMain, .{self});
-        log.info("job fabric: {d} job(s) adopted; {d} local worker(s), default throttle {d} %, verify {d} ‰ (plaintext pins 1000), fleet jobs {s}; the admin lane {s}", .{ adopted, self.opts.workers, self.opts.cpu_limit, self.coord.permille(), if (self.opts.fleet_jobs) "on" else "off", if (svc != null) "on the listener" else "unserved (no wire)" });
+        // A JOINED member with the fleet on and the engine bound is a
+        // read-capable worker of the coordinator's.
+        if (self.opts.fleet_jobs and !self.fabric.is_coordinator.load(.acquire)) if (self.fleet_caller) |caller| if (self.fsck_body) |body| {
+            const w = try self.gpa.create(wire_mod.Worker);
+            w.* = .{ .io = self.io, .caller = caller, .gpa = self.gpa, .caps = @import("frames.zig").CAP_FLEET_READ, .read_runner = body.readRunner(), .hold_submission = self.opts.hold_submission };
+            self.fleet_worker = w;
+            self.fleet_task = try self.io.concurrent(fleetMain, .{self});
+        };
+        log.info("job fabric: {d} job(s) adopted; {d} local worker(s), default throttle {d} %, verify {d} ‰ (plaintext pins 1000), fleet jobs {s}{s}; the admin lane {s}", .{ adopted, self.opts.workers, self.opts.cpu_limit, self.coord.permille(), if (self.opts.fleet_jobs) "on" else "off", if (self.fleet_worker != null) " (this member is a READ worker)" else "", if (svc != null) "on the listener" else "unserved (no wire)" });
     }
 
     fn workerMain(self: *Node) Io.Cancelable!void {
@@ -1512,6 +1563,14 @@ pub const Node = struct {
         }
         self.sweeper_stop.store(true, .release);
         self.fabric.stop(self.io);
+        // The fleet worker FIRST: a read shard mid-walk ends at its next
+        // step (the stop raises the cancel) and is abandoned over the live
+        // link before the wire plane stops.
+        if (self.fleet_worker) |w| w.requestStop();
+        if (self.fleet_task) |*t| {
+            t.cancel(self.io);
+            self.fleet_task = null;
+        }
         if (self.sweeper) |*f| {
             f.cancel(self.io);
             self.sweeper = null;
@@ -1520,10 +1579,12 @@ pub const Node = struct {
     }
 
     pub fn destroy(self: *Node) void {
+        if (self.fleet_worker) |w| self.gpa.destroy(w);
         if (self.fsck_body) |b| {
             b.deinit();
             self.gpa.destroy(b);
         }
+        self.coord.deinit();
         self.data_body.deinit();
         self.fabric.deinit();
         self.gpa.destroy(self);

@@ -335,7 +335,7 @@ fn worker(p: cli.Process, meta_uri: []const u8) u8 {
             const buf = gpa.alloc(u8, admin_lane.REPLY_BUF_LEN) catch return cli.exit_failed;
             defer gpa.free(buf);
             var caller: Caller = .{ .client = &client, .buf = buf };
-            var w: jobs.wire.Worker = .{ .io = io, .caller = .{ .ctx = &caller, .call = &Caller.call }, .hold_submission = @import("../core/knobs.zig").boolKnob("SQUEEZEFS_TEST_JOB_HOLD_SUBMISSION", c.p.env) };
+            var w: jobs.wire.Worker = .{ .io = io, .caller = .{ .ctx = &caller, .call = &Caller.call }, .gpa = gpa, .hold_submission = @import("../core/knobs.zig").boolKnob("SQUEEZEFS_TEST_JOB_HOLD_SUBMISSION", c.p.env) };
             const en = w.enroll() catch |e| {
                 c.p.stderr.print("squeezefs job worker: enrollment refused at {f} ({s})\n", .{ ep, @errorName(e) }) catch {};
                 return cli.exit_failed;

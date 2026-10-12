@@ -119,6 +119,7 @@ const jobs = @import("../ops/jobs.zig");
 const mount_fabric = @import("../ops/nvmet/mount_fabric.zig");
 const proc = @import("../meta/guard/proc.zig");
 const sym_join = @import("../meta/sym/join.zig");
+const sym_joined = @import("../meta/sym/joined.zig");
 const checkpoint = @import("../meta/checkpoint.zig");
 const clock = @import("../core/clock.zig");
 
@@ -526,6 +527,8 @@ fn mountMain(ctx: *Ctx) u8 {
             .random = &jobRandom,
             .data_arm = if (wire != null) data_arm.arm() else null,
             .meta_set = be,
+            // A joined member is a fleet READ worker over its own manager link.
+            .fleet_caller = if (be.volumes[0].joined) |js| jobs.wire.Caller{ .ctx = &js.link, .call = &sym_joined.SharedLink.callFn } else null,
         }) catch return ctx.failed("out of memory (job fabric)", .{});
         node = n;
         n.setManager(if (wire) |wp| wp.posture == .manager else true);

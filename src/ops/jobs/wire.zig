@@ -85,12 +85,45 @@ pub const VerifyRead = struct {
 /// The most enrolled workers one coordinator tracks.
 pub const MAX_WORKERS: usize = 256;
 
+/// Fleet READ shards in flight at one coordinator: one fleet fsck ships
+/// `readCapacity()` shards (≤ `MAX_WORKERS`) and the next job's wait for
+/// this one's retire — two jobs' worth is the headroom.
+pub const MAX_READ_SHARDS: usize = 2 * MAX_WORKERS;
+
+/// A lost READ shard is re-leased once (another idle capable session, or
+/// the same one re-pulling after a torn result) before it runs locally:
+/// every residue lands exactly once either way, and a second remote try
+/// buys nothing a local run does not.
+pub const READ_SHARD_ATTEMPTS_MAX: u32 = 2;
+
+/// The collect loop's PROGRESS bound in lease TTLs (spec §1.9a: "a worker
+/// whose heartbeats keep beating while its shard never proposes hung the
+/// fleet fsck 31 min"): four TTLs = 2 min at the charter's 30 s — a shard
+/// still unproposed past it is lost whatever its heartbeats say.
+pub const READ_SHARD_PROGRESS_TTLS: u64 = 4;
+
 const Enrolled = struct {
     identity: StableIdentity,
     pr_key: u64,
     caps: u32,
     /// The session id the listener gave the connection (the departure key).
     session_id: u64,
+};
+
+/// A fleet READ shard from `queue` to its retire: queued until a capable
+/// worker pulls it, leased while it runs, done with its payload, or lost
+/// (the attempts spent, or no capable session left) — the collector runs
+/// a lost residue locally.
+const ReadShard = struct {
+    d: seams.FleetDispatch.Descriptor,
+    /// `fsck.JOB_ARG_*` for the engine's options on the worker.
+    arg0: u64,
+    state: enum { queued, leased, done, lost } = .queued,
+    attempts: u32 = 0,
+    /// The proposed report (owned by the coordinator's gpa) once `done`.
+    payload: ?[]u8 = null,
+    /// Woken on `done` / `lost` (the collector's park).
+    settled: sync.Notify = .init,
 };
 
 /// The coordinator side: the handlers, the enrolled table, the remote
@@ -109,6 +142,8 @@ pub const Coordinator = struct {
     /// The remote whole-job shards in flight: `(job, shard 1)` → the
     /// claimed JobCtl (a noop job is ONE shard).
     bound: [MAX_WORKERS]?Bound = @splat(null),
+    /// The fleet READ shards (`FleetDispatch`): queued, leased, done, lost.
+    read_shards: [MAX_READ_SHARDS]?*ReadShard = @splat(null),
     /// The WERO on the data namespaces, acquired at FIRST enrollment and
     /// released at LAST departure (the plane binds it; null = no data
     /// namespaces armed — the deferred-reclaim class, loud once).
@@ -133,6 +168,16 @@ pub const Coordinator = struct {
 
     pub fn init(gpa: Allocator, io: Io, f: *Fabric, table: *ShardTable, opts: Options) Coordinator {
         return .{ .gpa = gpa, .io = io, .fabric = f, .table = table, .verify = opts.verify, .channel = opts.channel, .configured_permille = opts.configured_permille, .wero = opts.wero };
+    }
+
+    /// Drop every read shard still tracked (the node's teardown; a live
+    /// collector is gone by then — the fabric stopped first).
+    pub fn deinit(self: *Coordinator) void {
+        for (&self.read_shards) |*slot| if (slot.*) |rs| {
+            if (rs.payload) |p| self.gpa.free(p);
+            self.gpa.destroy(rs);
+            slot.* = null;
+        };
     }
 
     /// Register the block's handlers on the coordinator's service.
@@ -222,10 +267,15 @@ pub const Coordinator = struct {
     }
 
     /// Every bound job whose shard is no longer live under its fencing
-    /// (expired, abandoned) goes back to Queued for any population.
+    /// (expired, abandoned) goes back to Queued for any population; a
+    /// leased READ shard whose lease went re-queues for another capable
+    /// pull while attempts remain and a capable session exists, else it is
+    /// LOST (the collector runs it locally).
     fn requeueExpired(self: *Coordinator) void {
         var victims: [MAX_WORKERS]?*JobCtl = @splat(null);
         var n: usize = 0;
+        var settled: [MAX_READ_SHARDS]?*ReadShard = @splat(null);
+        var ns: usize = 0;
         {
             self.lock.lock();
             defer self.lock.unlock();
@@ -236,8 +286,132 @@ pub const Coordinator = struct {
                 n += 1;
                 slot.* = null;
             };
+            const capacity = self.readCapacityLocked();
+            for (self.read_shards[0..]) |slot| if (slot) |rs| {
+                if (rs.state != .leased or self.table.isAssigned(rs.d.id)) continue;
+                stats.job_remote_reassignments.inc();
+                if (rs.attempts < READ_SHARD_ATTEMPTS_MAX and capacity > 0) {
+                    rs.state = .queued;
+                } else {
+                    rs.state = .lost;
+                    settled[ns] = rs;
+                    ns += 1;
+                }
+            };
         }
         for (victims[0..n]) |v| self.fabric.requeue(self.io, v.?);
+        for (settled[0..ns]) |rs| rs.?.settled.notifyWaiters(self.io);
+    }
+
+    fn readCapacityLocked(self: *Coordinator) u32 {
+        var n: u32 = 0;
+        for (self.workers[0..self.n_workers]) |slot| if (slot) |e| if (e.caps & frames.CAP_FLEET_READ != 0) {
+            n += 1;
+        };
+        return n;
+    }
+
+    // ---- the fleet READ-shard dispatcher (`seams.FleetDispatch`) ----
+
+    pub fn fleet(self: *Coordinator) seams.FleetDispatch {
+        return .{ .ctx = self, .vtable = &fleet_vt };
+    }
+
+    const fleet_vt: seams.FleetDispatch.VTable = .{ .readCapacity = &fleetCapacity, .queueReadShard = &fleetQueue, .collectReadShard = &fleetCollect, .release = &fleetRelease, .retireFleetShards = &fleetRetire, .shardLeaseTtlMs = &fleetTtl };
+
+    fn fleetCapacity(ctx: *anyopaque) u32 {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx));
+        return self.readCapacity();
+    }
+
+    /// Queue `d` for the next capable pull; false = the table is full
+    /// (the caller runs the residue locally).
+    fn fleetQueue(ctx: *anyopaque, d: seams.FleetDispatch.Descriptor, arg0: u64) bool {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx));
+        const rs = self.gpa.create(ReadShard) catch return false;
+        rs.* = .{ .d = d, .arg0 = arg0 };
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.read_shards) |*slot| if (slot.* == null) {
+            slot.* = rs;
+            stats.job_fleet_shards_dispatched.inc();
+            return true;
+        };
+        self.gpa.destroy(rs);
+        return false;
+    }
+
+    fn findReadShardLocked(self: *Coordinator, id: ShardId) ?*ReadShard {
+        for (self.read_shards[0..]) |slot| if (slot) |rs| if (rs.d.id.eql(id)) return rs;
+        return null;
+    }
+
+    /// Park until the shard is done or lost; the progress bound (TTLs) and
+    /// a queued shard with no capable session left are the lost arms.
+    fn fleetCollect(ctx: *anyopaque, io: Io, _: Allocator, id: ShardId) seams.ReadShardOutcome {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx));
+        const deadline = clock.monotonicNs() + READ_SHARD_PROGRESS_TTLS * @as(u64, self.table.ttl_ms) * std.time.ns_per_ms;
+        while (true) {
+            self.lock.lock();
+            const rs = self.findReadShardLocked(id) orelse {
+                self.lock.unlock();
+                return .lost;
+            };
+            switch (rs.state) {
+                .done => {
+                    const p = rs.payload.?;
+                    rs.payload = null;
+                    self.lock.unlock();
+                    stats.job_fleet_shards_completed.inc();
+                    return .{ .payload = p };
+                },
+                .lost => {
+                    self.lock.unlock();
+                    stats.job_fleet_shards_relocal.inc();
+                    return .lost;
+                },
+                .queued, .leased => {},
+            }
+            const timed_out = clock.monotonicNs() >= deadline;
+            const no_capacity = rs.state == .queued and self.readCapacityLocked() == 0;
+            if (timed_out or no_capacity) {
+                const leased_id: ?ShardId = if (rs.state == .leased) rs.d.id else null;
+                rs.state = .lost;
+                self.lock.unlock();
+                // A holder still mid-walk past the bound: its lease is
+                // expired now, so its late proposal is refused stale.
+                if (leased_id) |lid| _ = self.table.lease().expire(lid, clock.monotonicNs());
+                stats.job_fleet_shards_relocal.inc();
+                return .lost;
+            }
+            var n = rs.settled.notified();
+            _ = n.enable(io);
+            self.lock.unlock();
+            _ = n.waitUntilUncancelable(io, @min(deadline, clock.monotonicNs() + lease_mod.sweepTickNs(self.table.ttl_ms)));
+        }
+    }
+
+    fn fleetRelease(ctx: *anyopaque, _: Allocator, payload: []const u8) void {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx));
+        self.gpa.free(payload);
+    }
+
+    /// Drop the job's read shards and their leases (pass end).
+    fn fleetRetire(ctx: *anyopaque, job_id: u64) void {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx));
+        self.lock.lock();
+        for (&self.read_shards) |*slot| if (slot.*) |rs| if (rs.d.id.job_id == job_id) {
+            if (rs.payload) |p| self.gpa.free(p);
+            self.gpa.destroy(rs);
+            slot.* = null;
+        };
+        self.lock.unlock();
+        self.table.lease().retire(job_id);
+    }
+
+    fn fleetTtl(ctx: *anyopaque) u32 {
+        const self: *Coordinator = @ptrCast(@alignCast(ctx));
+        return self.table.ttl_ms;
     }
 
     fn serve(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
@@ -307,14 +481,42 @@ pub const Coordinator = struct {
         return .{ .ok = .{ .job_enroll = .{ .heartbeat_ms = seams.HEARTBEAT_MS, .lease_ttl_ms = self.table.ttl_ms } } };
     }
 
-    /// The worker pulls: a wire-executable job claimed for it becomes shard
+    /// The worker pulls: a queued fleet READ shard first when the worker
+    /// is read-capable (leased to it with no destinations — the fencing
+    /// arm alone), else a wire-executable job claimed for it becomes shard
     /// 1 of that job; none ⇒ the empty descriptor.
     fn assign(self: *Coordinator, who: StableIdentity, p: frames.ShardAssignReq, _: []u8) service.Answer {
-        _ = p;
         {
             self.lock.lock();
             defer self.lock.unlock();
-            if (self.findWorkerLocked(who) == null) return service.Answer.rejected("shard_assign before job_enroll");
+            const e = self.findWorkerLocked(who) orelse return service.Answer.rejected("shard_assign before job_enroll");
+            if (p.caps & frames.CAP_FLEET_READ != 0 and e.caps & frames.CAP_FLEET_READ != 0) {
+                for (self.read_shards[0..]) |slot| if (slot) |rs| if (rs.state == .queued) {
+                    const a = self.table.lease().assign(rs.d.id, who, &.{}, clock.monotonicNs()) catch continue;
+                    rs.state = .leased;
+                    rs.attempts += 1;
+                    stats.job_remote_shards.inc();
+                    const head: frames.ShardDescriptorHead = .{
+                        .job_id = rs.d.id.job_id,
+                        .shard = rs.d.id.shard,
+                        .shard_fencing_lo = @truncate(a.fencing),
+                        .shard_fencing_hi = @truncate(a.fencing >> 32), // the descriptor's two u32 halves (`ShardDescriptorHead.fencing`)
+                        .lease_ttl_ms = a.lease_ttl_ms,
+                        .job_type = @backingInt(records.JobType.fsck),
+                        .throttle_pct = rs.d.throttle_pct,
+                        .reserved0 = @splat(0),
+                        .n_src = 0,
+                        .n_dest = 0,
+                        .block_len = 0,
+                        .arg0 = rs.arg0,
+                        .arg1 = 0,
+                        .fleet_k = rs.d.fleet_k,
+                        .fleet_n = rs.d.fleet_n,
+                        .inode_plane = rs.d.inode_plane,
+                    };
+                    return .{ .ok = .{ .shard_assign = .{ .head = head, .sources = &.{}, .destinations = &.{} } } };
+                };
+            }
         }
         const job = self.fabric.claimNext(self.io, true) orelse return .{ .ok = .{ .shard_assign = frames.ShardDescriptor.none } };
         const id: ShardId = .{ .job_id = job.id(), .shard = 1 };
@@ -334,7 +536,7 @@ pub const Coordinator = struct {
             .job_id = id.job_id,
             .shard = id.shard,
             .shard_fencing_lo = @truncate(a.fencing),
-            .shard_fencing_hi = @truncate(a.fencing >> 32),
+            .shard_fencing_hi = @truncate(a.fencing >> 32), // the descriptor's two u32 halves (`ShardDescriptorHead.fencing`)
             .lease_ttl_ms = a.lease_ttl_ms,
             .job_type = @backingInt(job.jobType()),
             .throttle_pct = job.ctl.loadPct(),
@@ -427,10 +629,33 @@ pub const Coordinator = struct {
         self.table.lease().retire(id.job_id);
     }
 
+    /// A fleet READ shard's proposal: fencing-checked exactly like a
+    /// mutating one (`complete` under the current fencing), the payload
+    /// kept for the collector; a stale or unknown shard is refused, a
+    /// shard the collector already gave up (lost) is a replay.
     fn readResult(self: *Coordinator, p: frames.ReadShardResultReq) service.Answer {
         const id: ShardId = .{ .job_id = p.head.ref.job_id, .shard = p.head.ref.shard };
+        // A non-live verdict is counted by the table (`job_remote_refused_stale`).
         if (self.table.lease().complete(id, p.head.ref.shard_fencing) != .live) return service.Answer.rejected("stale or unknown read shard");
-        stats.job_fleet_shards_completed.inc();
+        stats.job_remote_submissions.inc();
+        const copy = self.gpa.dupe(u8, p.payload) catch return service.Answer.refused(error.OutOfMemory, "out of memory");
+        var wake: ?*ReadShard = null;
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (self.findReadShardLocked(id)) |rs| {
+                if (rs.state == .leased) {
+                    rs.state = .done;
+                    rs.payload = copy;
+                    wake = rs;
+                }
+            }
+        }
+        const rs = wake orelse {
+            self.gpa.free(copy);
+            return .{ .ok = .{ .read_shard_result = verbs.Ack.replay } };
+        };
+        rs.settled.notifyWaiters(self.io);
         return .{ .ok = .{ .read_shard_result = verbs.Ack.fresh } };
     }
 
@@ -462,6 +687,29 @@ pub const REVALIDATE_BATCH: usize = 16;
 
 pub const WorkerError = error{ EnrollRefused, Incapable } || errors.Error;
 
+/// A fleet READ shard as the worker's engine sees it.
+pub const ReadDescriptor = struct {
+    job_id: u64,
+    shard: u32,
+    fleet_k: u32,
+    fleet_n: u32,
+    /// `fsck.JOB_ARG_*`.
+    arg0: u64,
+    throttle_pct: u8,
+    inode_plane: u64,
+};
+
+/// The engine a read-capable worker runs a shard on (the fsck runner over
+/// the member's OWN binding — its plane's read path, its posture's scope;
+/// a RAM runner in the loopback tests). `cancel` is raised when the lease
+/// clock expired or the worker stops: the walk ends at its next step and
+/// the runner answers null (nothing is proposed). The report (JSON, owned
+/// by `gpa`) otherwise.
+pub const ReadRunner = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, io: Io, gpa: Allocator, d: ReadDescriptor, cancel: *const Atomic(bool)) error{ OutOfMemory, Io }!?[]u8,
+};
+
 /// `job worker`: enroll, then pull shards until the coordinator goes away
 /// or `stop` latches. A local lease clock starts a full TTL at assignment
 /// and every `HeartbeatAck` extends it; past half-TTL ONE heartbeat
@@ -470,6 +718,11 @@ pub const WorkerError = error{ EnrollRefused, Incapable } || errors.Error;
 pub const Worker = struct {
     io: Io,
     caller: Caller,
+    /// The read-shard engine; null = a `noop`-only worker (a read shard
+    /// pulled without one is abandoned `incapable`).
+    read_runner: ?ReadRunner = null,
+    /// The read shards' report buffers.
+    gpa: Allocator,
     caps: u32 = 0,
     pr_key: u64 = 0,
     heartbeat_ms: u32 = seams.HEARTBEAT_MS,
@@ -477,7 +730,8 @@ pub const Worker = struct {
     stop: Atomic(bool) = .init(false),
     wake: sync.Notify = .init,
     /// `SQUEEZEFS_TEST_JOB_HOLD_SUBMISSION`: park before `result_submit`
-    /// until `release_hold` fires (the zombie window).
+    /// (or a read shard's `read_shard_result`) until `release_hold` fires
+    /// (the zombie window).
     hold_submission: bool = false,
     release_hold: sync.Notify = .init,
     held: Atomic(bool) = .init(false),
@@ -485,6 +739,7 @@ pub const Worker = struct {
     shards_done: u64 = 0,
     shards_refused: u64 = 0,
     heartbeats: u64 = 0,
+    read_shards_run: u64 = 0,
 
     pub fn enroll(self: *Worker) WorkerError!frames.JobEnrolled {
         const rep = self.caller.call(self.caller.ctx, .{ .job_enroll = .{ .pr_key = self.pr_key, .caps = self.caps, .reserved = 0 } }) catch |e| return switch (e) {
@@ -506,9 +761,10 @@ pub const Worker = struct {
         if (d.isNone()) return .none;
         const ref: frames.ShardRef = .{ .job_id = d.head.job_id, .shard = d.head.shard, .reserved = 0, .shard_fencing = d.head.fencing() };
         const job_type: records.JobType = @fromBackingInt(@intCast(d.head.job_type));
+        if (job_type == .fsck and d.head.fleet_n != 0) return self.runReadShard(d, ref);
         if (job_type != .noop) {
-            // Only noop ships whole over the wire; a read shard rides the
-            // fsck engine's runner (the fleet dispatcher's), not this loop.
+            // Only noop ships whole over the wire and fsck ships as READ
+            // shards; a mover is never a worker's.
             _ = try self.caller.call(self.caller.ctx, .{ .shard_abandon = .{ .ref = ref, .reason = @backingInt(frames.AbandonReason.incapable), .reserved = @splat(0) } });
             return .abandoned;
         }
@@ -551,6 +807,115 @@ pub const Worker = struct {
         self.shards_refused += 1;
         return .refused;
     }
+
+    /// A fleet READ shard (spec §1.9a): the engine's sharded walk on this
+    /// member's own binding while a heartbeat fiber renews the lease
+    /// underneath (the half-TTL law: one round trip per `heartbeat_ms`; a
+    /// `stale`/`unknown` verdict or a dead wire raises the cancel and the
+    /// walk ends at its next step — nothing is proposed); the report is
+    /// PROPOSED as `read_shard_result` under the lease's fencing. The
+    /// coordinator fencing-checks it like any proposal.
+    fn runReadShard(self: *Worker, d: frames.ShardDescriptor, ref: frames.ShardRef) WorkerError!Pulled {
+        const runner = self.read_runner orelse {
+            _ = try self.caller.call(self.caller.ctx, .{ .shard_abandon = .{ .ref = ref, .reason = @backingInt(frames.AbandonReason.incapable), .reserved = @splat(0) } });
+            return .abandoned;
+        };
+        var hb: Heartbeat = .{ .worker = self, .ref = ref, .deadline_ns = .init(clock.monotonicNs() + @as(u64, d.head.lease_ttl_ms) * std.time.ns_per_ms) };
+        var hb_task = self.io.concurrent(Heartbeat.run, .{&hb}) catch return error.OutOfMemory;
+        const desc: ReadDescriptor = .{ .job_id = d.head.job_id, .shard = d.head.shard, .fleet_k = d.head.fleet_k, .fleet_n = d.head.fleet_n, .arg0 = d.head.arg0, .throttle_pct = d.head.throttle_pct, .inode_plane = d.head.inode_plane };
+        stats.job_fleet_worker_shards.inc();
+        const payload = runner.run(runner.ctx, self.io, self.gpa, desc, &hb.cancel) catch |e| switch (e) {
+            error.OutOfMemory => blk: {
+                hb.stopRequested(self.io);
+                hb_task.cancel(self.io);
+                break :blk null;
+            },
+            error.Io => null,
+        };
+        hb.stopRequested(self.io);
+        hb_task.cancel(self.io);
+        self.heartbeats += hb.beats;
+        defer if (payload) |p| self.gpa.free(p);
+        if (self.hold_submission) {
+            self.held.store(true, .release);
+            var n = self.release_hold.notified();
+            n.waitUncancelable(self.io);
+            self.held.store(false, .release);
+        }
+        if (payload == null or hb.cancel.load(.acquire) or clock.monotonicNs() >= hb.deadline_ns.load(.acquire) or self.stop.load(.acquire)) {
+            // Expired, stopped, or the engine failed: abandon, never a
+            // proposal under a lease this worker cannot vouch for.
+            const reason: frames.AbandonReason = if (self.stop.load(.acquire)) .stopped else if (payload == null and !hb.cancel.load(.acquire)) .incapable else .lease_expired;
+            _ = try self.caller.call(self.caller.ctx, .{ .shard_abandon = .{ .ref = ref, .reason = @backingInt(reason), .reserved = @splat(0) } });
+            return .abandoned;
+        }
+        const p = payload.?;
+        if (p.len > frames.READ_SHARD_PAYLOAD_MAX) {
+            _ = try self.caller.call(self.caller.ctx, .{ .shard_abandon = .{ .ref = ref, .reason = @backingInt(frames.AbandonReason.incapable), .reserved = @splat(0) } });
+            return .abandoned;
+        }
+        self.read_shards_run += 1;
+        // A stale or unknown shard is the coordinator's REJECTION (the
+        // fencing moved under a zombie): refused, never a worker failure.
+        const ack = self.caller.call(self.caller.ctx, .{ .read_shard_result = .{ .head = .{ .ref = ref, .len = @intCast(p.len), .reserved = 0 }, .payload = p } }) catch |e| switch (e) {
+            error.Rejected => {
+                self.shards_refused += 1;
+                return .refused;
+            },
+            else => return e,
+        };
+        if (ack.read_shard_result.already == 0) {
+            self.shards_done += 1;
+            return .done;
+        }
+        self.shards_refused += 1;
+        return .refused;
+    }
+
+    /// The read shard's heartbeat fiber: a renewal every `heartbeat_ms`
+    /// (the lease clock extended by each ack); a non-live verdict or a dead
+    /// wire raises `cancel`. Parks on the worker's own notify (never a
+    /// sleep); `stopRequested` ends it.
+    const Heartbeat = struct {
+        worker: *Worker,
+        ref: frames.ShardRef,
+        /// The local lease clock (release by the fiber's ack, acquire by
+        /// the proposer's check).
+        deadline_ns: Atomic(u64),
+        cancel: Atomic(bool) = .init(false),
+        stop: Atomic(bool) = .init(false),
+        wake: sync.Notify = .init,
+        beats: u64 = 0,
+
+        fn stopRequested(self: *Heartbeat, io: Io) void {
+            self.stop.store(true, .release);
+            self.wake.notifyWaiters(io);
+        }
+
+        fn run(self: *Heartbeat) void {
+            const w = self.worker;
+            const period_ns = @as(u64, w.heartbeat_ms) * std.time.ns_per_ms;
+            while (!self.stop.load(.acquire)) {
+                var n = self.wake.notified();
+                _ = n.waitUntilUncancelable(w.io, clock.monotonicNs() + period_ns);
+                if (self.stop.load(.acquire)) return;
+                if (w.stop.load(.acquire)) {
+                    self.cancel.store(true, .release);
+                    return;
+                }
+                const rep = w.caller.call(w.caller.ctx, .{ .heartbeat = self.ref }) catch {
+                    self.cancel.store(true, .release);
+                    return;
+                };
+                self.beats += 1;
+                if (rep.heartbeat.verdict != @backingInt(seams.LeaseVerdict.live)) {
+                    self.cancel.store(true, .release);
+                    return;
+                }
+                self.deadline_ns.store(clock.monotonicNs() + @as(u64, rep.heartbeat.lease_ttl_ms) * std.time.ns_per_ms, .release);
+            }
+        }
+    };
 
     const Lease = enum { live, expired };
 
@@ -648,7 +1013,7 @@ const Rig = struct {
         _ = try r.hub.addDaemon(&r.worker_svc, secret, .{ .node_token = 2, .writer_id = 2, .mount_slot = 1, .reserved = 0 });
         r.conn = try r.hub.connect(1, 0);
         r.cc = .{ .conn = &r.conn };
-        r.worker = .{ .io = io, .caller = r.cc.caller() };
+        r.worker = .{ .io = io, .caller = r.cc.caller(), .gpa = gpa };
         return r;
     }
 
@@ -792,6 +1157,175 @@ test "a proposal is screened before any device read: a tuple outside the window 
     const ab2 = try r.cc.conn.call(.{ .shard_abandon = .{ .ref = .{ .job_id = 78, .shard = 1, .reserved = 0, .shard_fencing = c.fencing }, .reason = @backingInt(frames.AbandonReason.memory_red), .reserved = @splat(0) } });
     try testing.expectEqual(@as(u8, 1), ab2.shard_abandon.already);
     try testing.expectEqual(@as(?u64, c.fencing + 1), r.table.fencingOf(sid2));
+}
+
+/// The loopback's read-shard engine: a canned report naming the residue,
+/// a cancel-honouring park (the kill row's zombie), a failure arm.
+const RamReadRunner = struct {
+    io: Io,
+    /// Park inside the run (the shard "mid-walk") until `releaseHold` or
+    /// the cancel — a real engine reads the cancel at its next step.
+    hold: bool = false,
+    released: Atomic(bool) = .init(false),
+    release: sync.Notify = .init,
+    holding: Atomic(bool) = .init(false),
+    fail: bool = false,
+    runs: u64 = 0,
+    cancelled: u64 = 0,
+
+    /// The hold's poll grain: the engine's "next step".
+    const STEP_NS: u64 = 10 * std.time.ns_per_ms;
+
+    fn runner(self: *RamReadRunner) ReadRunner {
+        return .{ .ctx = self, .run = &run };
+    }
+
+    fn releaseHold(self: *RamReadRunner, io: Io) void {
+        self.released.store(true, .release);
+        self.release.notifyWaiters(io);
+    }
+
+    fn run(ctx: *anyopaque, io: Io, gpa: Allocator, d: ReadDescriptor, cancel: *const Atomic(bool)) error{ OutOfMemory, Io }!?[]u8 {
+        const self: *RamReadRunner = @ptrCast(@alignCast(ctx));
+        self.runs += 1;
+        if (self.fail) return error.Io;
+        if (self.hold) {
+            self.holding.store(true, .release);
+            while (!self.released.load(.acquire) and !cancel.load(.acquire)) {
+                var n = self.release.notified();
+                _ = n.waitUntilUncancelable(io, clock.monotonicNs() + STEP_NS);
+            }
+            self.released.store(false, .release);
+            self.holding.store(false, .release);
+        }
+        if (cancel.load(.acquire)) {
+            self.cancelled += 1;
+            return null;
+        }
+        return try std.fmt.allocPrint(gpa, "{{\"shard\":\"{d}/{d}\",\"job\":{d},\"arg0\":{d}}}", .{ d.fleet_k, d.fleet_n, d.job_id, d.arg0 });
+    }
+};
+
+test "a fleet READ shard end to end over the loopback: the coordinator queues shard 1/2 (no destinations, the fencing arm alone), a read-capable worker pulls it, runs its engine, PROPOSES the report; the collector gets the payload (dispatched ≡ completed + relocal + pending); a worker without the capability never sees it; a queued shard with no capable session is LOST at once (relocal); the pass end retires the shard and a late proposal is the unknown-shard rejection" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const r = try Rig.init(gpa, io, 30_000);
+    defer r.deinit(gpa);
+    defer r.coord.deinit();
+    var engine: RamReadRunner = .{ .io = io };
+    r.worker.read_runner = engine.runner();
+    const fd = r.coord.fleet();
+    // No capable session: a queued shard is lost at once.
+    try testing.expectEqual(@as(u32, 0), fd.readCapacity());
+    const d1: seams.FleetDispatch.Descriptor = .{ .id = .{ .job_id = 0x900, .shard = 1 }, .fleet_k = 1, .fleet_n = 2, .inode_plane = 0, .throttle_pct = 100 };
+    try testing.expect(fd.queueReadShard(d1, 1));
+    const relocal0 = stats.job_fleet_shards_relocal.load();
+    try testing.expectEqual(seams.ReadShardOutcome.lost, fd.collectReadShard(io, gpa, d1.id));
+    try testing.expectEqual(relocal0 + 1, stats.job_fleet_shards_relocal.load());
+    fd.retireFleetShards(0x900);
+    // A noop-only worker (no capability) never receives a read shard.
+    _ = try r.worker.enroll();
+    try testing.expectEqual(@as(u32, 0), fd.readCapacity());
+    try testing.expect(fd.queueReadShard(d1, 1));
+    try testing.expectEqual(Worker.Pulled.none, try r.worker.pullOnce());
+    // The capable worker: pull → run → propose → the collector's payload.
+    r.worker.caps = frames.CAP_FLEET_READ;
+    _ = try r.worker.enroll();
+    try testing.expectEqual(@as(u32, 1), fd.readCapacity());
+    const done0 = stats.job_fleet_shards_completed.load();
+    try testing.expectEqual(Worker.Pulled.done, try r.worker.pullOnce());
+    try testing.expectEqual(@as(u64, 1), engine.runs);
+    try testing.expectEqual(@as(u64, 1), r.worker.read_shards_run);
+    const out = fd.collectReadShard(io, gpa, d1.id);
+    try testing.expect(out == .payload);
+    defer fd.release(gpa, out.payload);
+    try testing.expectEqualStrings("{\"shard\":\"1/2\",\"job\":2304,\"arg0\":1}", out.payload);
+    try testing.expectEqual(done0 + 1, stats.job_fleet_shards_completed.load());
+    try testing.expect(stats_mod.fleetClosure(0));
+    // Retired: a late proposal under the old fencing is unknown.
+    fd.retireFleetShards(0x900);
+    try testing.expectError(error.Rejected, r.cc.conn.call(.{ .read_shard_result = .{ .head = .{ .ref = .{ .job_id = 0x900, .shard = 1, .reserved = 0, .shard_fencing = 0 }, .len = 2, .reserved = 0 }, .payload = "{}" } }));
+    try testing.expectEqual(Worker.Pulled.none, try r.worker.pullOnce());
+}
+
+test "a fleet READ shard whose worker dies mid-walk: the lease expires at the sweeper (fencing +1), the shard RE-QUEUES for the next capable pull, the zombie's late proposal is refused stale and nothing merges, the fresh pull runs it under fencing 1 and the collector gets exactly one payload; a second loss spends the attempts and the shard is LOST to the local run; a worker whose heartbeat reads stale cancels its walk and abandons" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const r = try Rig.init(gpa, io, 1000);
+    defer r.deinit(gpa);
+    defer r.coord.deinit();
+    var engine: RamReadRunner = .{ .io = io, .hold = true };
+    r.worker.read_runner = engine.runner();
+    r.worker.caps = frames.CAP_FLEET_READ;
+    _ = try r.worker.enroll();
+    const fd = r.coord.fleet();
+    const d: seams.FleetDispatch.Descriptor = .{ .id = .{ .job_id = 0x901, .shard = 1 }, .fleet_k = 1, .fleet_n = 2, .inode_plane = 0, .throttle_pct = 100 };
+    try testing.expect(fd.queueReadShard(d, 0));
+    const Pull = struct {
+        fn run(w: *Worker, out: *Worker.Pulled) void {
+            out.* = w.pullOnce() catch .refused;
+        }
+    };
+    var out1: Worker.Pulled = .none;
+    const th = try std.Thread.spawn(.{}, Pull.run, .{ &r.worker, &out1 });
+    while (!engine.holding.load(.acquire)) std.atomic.spinLoopHint();
+    try testing.expectEqual(@as(?u64, 0), r.table.fencingOf(d.id));
+    // The worker "dies": the sweeper past the TTL expires the lease; the
+    // shard re-queues (attempt 1 of 2, a capable session stands).
+    const exp0 = stats.job_remote_lease_expiries.load();
+    try testing.expectEqual(@as(usize, 1), r.coord.sweep(clock.monotonicNs() + 3 * std.time.ns_per_s));
+    try testing.expectEqual(exp0 + 1, stats.job_remote_lease_expiries.load());
+    try testing.expectEqual(@as(?u64, 1), r.table.fencingOf(d.id));
+    // The zombie wakes and proposes under fencing 0: refused stale.
+    const stale0 = stats.job_remote_refused_stale.load();
+    engine.releaseHold(io);
+    th.join();
+    try testing.expectEqual(Worker.Pulled.refused, out1);
+    try testing.expectEqual(stale0 + 1, stats.job_remote_refused_stale.load());
+    // The fresh pull runs it under fencing 1 and the collector gets it.
+    engine.hold = false;
+    try testing.expectEqual(Worker.Pulled.done, try r.worker.pullOnce());
+    const got = fd.collectReadShard(io, gpa, d.id);
+    try testing.expect(got == .payload);
+    fd.release(gpa, got.payload);
+    try testing.expectEqual(@as(u64, 2), engine.runs);
+    fd.retireFleetShards(0x901);
+    // Two losses spend the attempts: the shard is lost to the local run.
+    const d2: seams.FleetDispatch.Descriptor = .{ .id = .{ .job_id = 0x902, .shard = 1 }, .fleet_k = 1, .fleet_n = 2, .inode_plane = 0, .throttle_pct = 100 };
+    try testing.expect(fd.queueReadShard(d2, 0));
+    engine.hold = true;
+    var k: u32 = 0;
+    while (k < READ_SHARD_ATTEMPTS_MAX) : (k += 1) {
+        var out: Worker.Pulled = .none;
+        const t = try std.Thread.spawn(.{}, Pull.run, .{ &r.worker, &out });
+        while (!engine.holding.load(.acquire)) std.atomic.spinLoopHint();
+        _ = r.coord.sweep(clock.monotonicNs() + 3 * std.time.ns_per_s);
+        engine.releaseHold(io);
+        t.join();
+        try testing.expectEqual(Worker.Pulled.refused, out);
+    }
+    const relocal0 = stats.job_fleet_shards_relocal.load();
+    try testing.expectEqual(seams.ReadShardOutcome.lost, fd.collectReadShard(io, gpa, d2.id));
+    try testing.expectEqual(relocal0 + 1, stats.job_fleet_shards_relocal.load());
+    fd.retireFleetShards(0x902);
+    // A heartbeat that reads stale (the lease expired under a long walk)
+    // cancels the engine: the worker abandons, nothing is proposed.
+    const d3: seams.FleetDispatch.Descriptor = .{ .id = .{ .job_id = 0x903, .shard = 1 }, .fleet_k = 1, .fleet_n = 2, .inode_plane = 0, .throttle_pct = 100 };
+    try testing.expect(fd.queueReadShard(d3, 0));
+    r.worker.heartbeat_ms = 50;
+    const cancelled0 = engine.cancelled;
+    var out3: Worker.Pulled = .none;
+    const t3 = try std.Thread.spawn(.{}, Pull.run, .{ &r.worker, &out3 });
+    while (!engine.holding.load(.acquire)) std.atomic.spinLoopHint();
+    _ = r.coord.sweep(clock.monotonicNs() + 3 * std.time.ns_per_s);
+    // The next heartbeat (50 ms) reads stale and raises the cancel; the
+    // engine sees it at its next step and answers null — never released
+    // by the test, the walk ends on the lease alone.
+    t3.join();
+    try testing.expectEqual(Worker.Pulled.abandoned, out3);
+    try testing.expectEqual(cancelled0 + 1, engine.cancelled);
+    try testing.expect(r.worker.heartbeats >= 1);
+    fd.retireFleetShards(0x903);
 }
 
 test "a non-coordinator answers the job block not_manager; the worker's enroll reports it as refused" {

@@ -218,9 +218,14 @@ pub const FleetDispatch = struct {
     pub const VTable = struct {
         /// Enrolled read-capable sessions NOW (0 ⇒ `run()` verbatim).
         readCapacity: *const fn (ctx: *anyopaque) u32,
-        /// Ship one read shard; blocks until the proposal lands or the lease
-        /// law gives it up. The progress deadline derives from the TTL.
-        dispatchReadShard: *const fn (ctx: *anyopaque, io: Io, gpa: Allocator, d: Descriptor) ReadShardOutcome,
+        /// Queue one read shard for the next capable pull (`arg0` = the
+        /// engine's option bits the worker runs under); false = refused
+        /// (the caller runs the residue locally). Never blocks: the
+        /// coordinator runs shard 0 while the fleet walks the rest.
+        queueReadShard: *const fn (ctx: *anyopaque, d: Descriptor, arg0: u64) bool,
+        /// Park until the shard's proposal lands or the lease law gives it
+        /// up (the progress deadline derives from the TTL).
+        collectReadShard: *const fn (ctx: *anyopaque, io: Io, gpa: Allocator, id: ShardId) ReadShardOutcome,
         release: *const fn (ctx: *anyopaque, gpa: Allocator, payload: []const u8) void,
         retireFleetShards: *const fn (ctx: *anyopaque, job_id: u64) void,
         shardLeaseTtlMs: *const fn (ctx: *anyopaque) u32,
@@ -229,8 +234,11 @@ pub const FleetDispatch = struct {
     pub fn readCapacity(self: FleetDispatch) u32 {
         return self.vtable.readCapacity(self.ctx);
     }
-    pub fn dispatchReadShard(self: FleetDispatch, io: Io, gpa: Allocator, d: Descriptor) ReadShardOutcome {
-        return self.vtable.dispatchReadShard(self.ctx, io, gpa, d);
+    pub fn queueReadShard(self: FleetDispatch, d: Descriptor, arg0: u64) bool {
+        return self.vtable.queueReadShard(self.ctx, d, arg0);
+    }
+    pub fn collectReadShard(self: FleetDispatch, io: Io, gpa: Allocator, id: ShardId) ReadShardOutcome {
+        return self.vtable.collectReadShard(self.ctx, io, gpa, id);
     }
     pub fn release(self: FleetDispatch, gpa: Allocator, payload: []const u8) void {
         return self.vtable.release(self.ctx, gpa, payload);
@@ -246,11 +254,14 @@ pub const FleetDispatch = struct {
     /// mount's fsck is literally the shipped path).
     pub const none: FleetDispatch = .{ .ctx = @ptrCast(@constCast(&none_ctx)), .vtable = &none_vt };
     const none_ctx: u8 = 0;
-    const none_vt: VTable = .{ .readCapacity = &noneCapacity, .dispatchReadShard = &noneDispatch, .release = &noneRelease, .retireFleetShards = &noneRetire, .shardLeaseTtlMs = &noneTtl };
+    const none_vt: VTable = .{ .readCapacity = &noneCapacity, .queueReadShard = &noneQueue, .collectReadShard = &noneCollect, .release = &noneRelease, .retireFleetShards = &noneRetire, .shardLeaseTtlMs = &noneTtl };
     fn noneCapacity(_: *anyopaque) u32 {
         return 0;
     }
-    fn noneDispatch(_: *anyopaque, _: Io, _: Allocator, _: Descriptor) ReadShardOutcome {
+    fn noneQueue(_: *anyopaque, _: Descriptor, _: u64) bool {
+        return false;
+    }
+    fn noneCollect(_: *anyopaque, _: Io, _: Allocator, _: ShardId) ReadShardOutcome {
         return .lost;
     }
     fn noneRelease(_: *anyopaque, _: Allocator, _: []const u8) void {}

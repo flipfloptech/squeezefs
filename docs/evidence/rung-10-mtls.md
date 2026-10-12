@@ -16,9 +16,9 @@ exception); `docs/porting/sym_wire_membership_recovery.md` §1.1 channel classes
 authenticated-not-confidential, `MutualTls` CA-pinned authenticated AND confidential; CW:63–71, 1054–1078,
 1146–1156 a CA-less TLS config REFUSED, never downgraded; CW:1010–1051 the ladder keys on
 `authenticated()` ∧ `confidential()`, never on "transport == tls"); `ops_jobs_lifecycle.md` §7: the
-verify-permille knob honoured only under mTLS. Decision 0003 §O; decision 0002 rows 486–488.
+verify-permille knob honoured only under mTLS. Decision 0003 §P; decision 0002 rows 489–491.
 
-## 1. The engine decision (0003 §O, first row)
+## 1. The engine decision (0003 §P, first row)
 
 **Written in-tree over `std.crypto`'s primitives; nothing vendored.** The survey that decided it:
 
@@ -38,7 +38,7 @@ Module: `src/wire/tls.zig` (the engine, the identity, the posture, the record la
 `NewSessionTicket` is ignored), 0-RTT, HelloRetryRequest (one group, offered by every peer we accept),
 renegotiation, ALPN, SNI, middlebox CCS (received ones dropped per RFC 8446 D.4).
 
-## 2. The PKI's shape (0003 §O, third row)
+## 2. The PKI's shape (0003 §P, third row)
 
 Ed25519 everywhere, issued by the binary:
 
@@ -59,7 +59,7 @@ field (Ed25519, the two extensions, the validity).
 under the fuzzer) — `pki.Screen` walks exactly the schema it will walk, bounds-checked, before it runs
 (`fuzz: the PKI decoders`).
 
-## 3. The wire (0003 §O, rows 4–7)
+## 3. The wire (0003 §P, rows 4–7)
 
 - **Posture:** `SQUEEZEFS_WIRE_CHANNEL = plaintext | mutual_tls` (switch), `SQUEEZEFS_WIRE_TLS_CA / _CERT /
   _KEY` (config, defaults `/etc/squeezefs/tls/{ca.pem,node.pem,node.key}`). `mount`, the admin lane and
@@ -247,7 +247,7 @@ offload) in the sqz kernel config. Everything below is designed against the upst
    (today's `linkClose`, over the kernel).
 5. **The dead-on-arrival peek** stays on the raw socket; under kTLS the kernel presents the DECRYPTED
    queue to `MSG_PEEK`, so a queued close_notify is a control record the peek cannot see as EOF — the
-   mux reader's `recvmsg` classifies it (the §O row stands).
+   mux reader's `recvmsg` classifies it (the §P row stands).
 6. **Tests owed with the data path** (each a `wire e2e` row gated on `tls.ktls.probeKernel() == .present`):
    the 1,000-verb row over kTLS (`authenticated() ∧ confidential()`, 2 handshakes + 1 admission); a
    `close_notify` from the peer closes the session loud and counted; a fatal alert closes loud and
@@ -330,7 +330,7 @@ around the transfer (CPU-s per GB) and runs the three columns when the probe rea
   column (§9.6); the two-daemon matrix re-armed (§5's contract).
 - The join ladder's console line for a refused channel (`verbError`: `HandshakeRefused → Refused`) — the
   symmetric plane's owner.
-- A durable channel class in `set_config` if the owner wants the set, not the node, to declare it (0003 §O).
+- A durable channel class in `set_config` if the owner wants the set, not the node, to declare it (0003 §P).
 - The wire's frame path on io_uring (`IORING_OP_RECVMSG` / `SEND_ZC`) is a decision about the Plaintext
   class as much as the TLS one (spec §1.1 keeps the wire off io_uring by design) — the owner's call.
 - Revocation / intermediates are out of scope by design (one leaf under one CA; rotation = re-issue).

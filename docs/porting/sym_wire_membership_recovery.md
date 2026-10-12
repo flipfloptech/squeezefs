@@ -82,7 +82,7 @@ buggy/hostile-peer class, off the must-stay-0 gauge), or "not now" (`STATUS_DEFE
   `ChannelClass` enum reserves `.mutual_tls` and the exporter-binding slot in the session key (§1.3), so
   rung 8 adds it without a wire change. Charter §9: **thread-per-connection** — the reference's venue
   since the rip-tokio conversion (CW:76-85).
-- **Landed at rung 10 (decision 0003 §O; 0002 rows 486–488; `docs/evidence/rung-10-mtls.md`):**
+- **Landed at rung 10 (decision 0003 §P; 0002 rows 489–491; `docs/evidence/rung-10-mtls.md`):**
   `MutualTls` = the same ladder inside ONE TLS 1.3 profile written in-tree over `std.crypto`
   (`wire/tls.zig`: `TLS_AES_128_GCM_SHA256`, X25519, Ed25519; server + client; the RFC 8446 §7.5 exporter
   fills `binding`; KeyUpdate; a record layer behind the session `Link`), under the cluster's own Ed25519 PKI
@@ -93,7 +93,7 @@ buggy/hostile-peer class, off the must-stay-0 gauge), or "not now" (`STATUS_DEFE
   plaintext `Refused` at half the dial bound), `cluster_wire_tls_dial_refused`; `cluster_wire_tls_handshakes`,
   `cluster_wire_tls_key_updates`, the gauge `cluster_wire_channel_mutual_tls`. `Framer.confidential()` =
   `authenticated() ∧ mutual_tls` is the ladder's word (CW:1010–1051).
-- **The record layer on Linux is the kernel's (kTLS; the owner's direction of 2026-10-12, 0003 §O):**
+- **The record layer on Linux is the kernel's (kTLS; the owner's direction of 2026-10-12, 0003 §P):**
   after the handshake the traffic keys go to the `tls` ULP (`TCP_ULP` → `TLS_TX`/`TLS_RX`,
   `tls12_crypto_info_aes_gcm_128` at `TLS_1_3_VERSION`); control records (alerts, KeyUpdate,
   NewSessionTicket) arrive as `TLS_GET_RECORD_TYPE` cmsgs on `recvmsg`; the rekey is a second

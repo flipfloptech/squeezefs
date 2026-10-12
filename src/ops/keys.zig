@@ -320,7 +320,7 @@ pub const linux_verbs = if (is_linux) struct {
         }
     }
 
-    // ---- the cluster wire's PKI (`wire/pki.zig`; decision 0003 §O) ----
+    // ---- the cluster wire's PKI (`wire/pki.zig`; decision 0003 §P) ----
 
     const pki = @import("../wire/pki.zig");
     const wire_tls = @import("../wire/tls.zig");

@@ -32,6 +32,7 @@ pub const log = @import("core/log.zig");
 pub const errors = @import("core/errors.zig");
 pub const counters = @import("core/counters.zig");
 pub const json_scan = @import("core/json_scan.zig");
+pub const mountinfo = @import("core/mountinfo.zig");
 pub const thread_name = @import("core/thread_name.zig");
 /// The test kits (compiled only under test): the ONE skip + the ONE fuzz entry.
 pub const testkit = if (builtin.is_test) @import("core/testkit.zig") else struct {};
@@ -210,6 +211,7 @@ test {
     _ = errors;
     _ = counters;
     _ = json_scan;
+    _ = mountinfo;
     _ = thread_name;
     _ = testkit;
     _ = fuzzkit;

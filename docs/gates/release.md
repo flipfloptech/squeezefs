@@ -61,8 +61,12 @@ An ABI bump is a code change, not just a number: the dry run
 (2026-10-10) moved `SDK_ABI_CURRENT` 1 → 2 with the window `{2, 1}`,
 `SDK_ABI` 1 → 2, both header words and the `.so` minor 0 → 1, and the
 verification then FAILED the SDK window test (`sdk e2e: the ABI window`
-pins the window's numbers) — the act refuses: the window tests' new values
-land in the same commit as the bump, written by hand before the act.
+pinned the window's numbers) — the act refuses: the window tests' new values
+land in the same commit as the bump, written by hand before the act. Since
+`ecec435` the e2e fixture derives every expected value from
+`wire.sdk_abi_accepted` and `wire.IPC_ABI`; what still pins today's set by
+hand are `wire.zig`'s and `version.zig`'s "today's set is {1}" tests — the
+act's deliberate edits.
 
 What the act does NOT do: run the release gate. `zig build gate-release
 -Drelease-gate=true` (the per-commit gate with environment skips turned into

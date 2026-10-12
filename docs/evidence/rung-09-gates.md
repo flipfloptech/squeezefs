@@ -433,15 +433,44 @@ matrix, kill rows (a) on daemon B's `kmbuf ring registration ENOMEM
 
 - The literal allowlist's 616 OWED rows (§4): per-module passes deriving or
   documenting them, each a commit that shrinks the file.
-- `stats.zig` "allocation law: a render is exactly ONE allocation" fails
+- ~~`stats.zig` "allocation law: a render is exactly ONE allocation" fails
   when fabric controllers are present in sysfs (the sampler's transient
   tables allocate per render): make the sampler's tables fixed-capacity or
-  scope the law. Pre-existing; surfaced by the concurrent nvmet suites.
+  scope the law. Pre-existing; surfaced by the concurrent nvmet suites.~~
+  **Resolved 2026-10-12 (`8b0df62`; 0003 §I).** The cause, not the law: the
+  sampler owns its tables for the process's life (the merged identities and
+  the presence table join the retained identities on the process allocator,
+  sized when the population grows and reused after), and the sysfs walk folds
+  controllers straight off `getdents64` into a stack `Controller` — no name
+  list, no dupe, no sort, no controller array; `sampleFabric()` takes no
+  allocator. Measured on the venue with ONE real nvmet-loop controller
+  connected (`nvmeof share --transport loop` + `nvmeof connect`, torn down
+  after): the old render was **6 allocations** (the law's test on `84610ce`:
+  `expected 6, found 11` — the payload plus five sampler allocations, each
+  freed again) and the new render **1** (the same test on `8b0df62`, 42/42).
+  Red first: `stats.zig` "allocation law under fabric controllers (linux) …"
+  renders over a fixture sysfs of three fabric controllers (the process
+  sampler's root is a test seam) and asserts the warm render is exactly one
+  allocation with no resize, remap or free while the gauges read the
+  controllers; `initiator.zig` "the sampler's tables are retained across
+  samples …" pins the sampler's own zero calls from the second sample on,
+  the reconnect law across samples, and the zero sample of an absent
+  `class/nvme`.
 - The campaign at 60 s per target (the nightly default) on the venue, and a
   60 s campaign after every decoder change; a crash's red repro by the
   documented recipe.
 - A `bench-compare` and a baseline on a quiet venue (every number in §5 was
   taken beside another agent's suites); the reference box's baseline when it
   exists.
-- The "sdk e2e: the ABI window" fixture should derive its expected window
-  text from `wire.sdk_abi_accepted` so an ABI bump does not need a hand edit.
+- ~~The "sdk e2e: the ABI window" fixture should derive its expected window
+  text from `wire.sdk_abi_accepted` so an ABI bump does not need a hand edit.~~
+  **Resolved 2026-10-12 (`ecec435`).** Every expected value of
+  `src/sdk/session.zig` "sdk e2e: the ABI window …" is derived: the refused
+  HELLO word is `windowBounds(&wire.sdk_abi_accepted).max + 1` (asserted
+  outside the window and the build's own word inside it), the refusal's
+  `sdk_abi_min/max` are the window's bounds, the ipc-mismatch line is printed
+  from `wire.IPC_ABI` and `IPC_ABI + 1`, and the window line from the bounds
+  and the refused word — a `--wire-abi-bump` release act edits the words
+  alone (`docs/gates/release.md`'s "written by hand before the act" no longer
+  applies to this fixture; `wire.zig`'s and `version.zig`'s "today's set is
+  {1}" pins stay the act's deliberate edits).

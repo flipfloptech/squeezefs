@@ -76,11 +76,12 @@ nvmet-loop unless stated) and every row is SCOPING: the charter's bars are the b
   every bar in charter §12 is measured there, never here.
 - xfstests `-g auto` three consecutive clean runs and LTP `syscalls` ×3 on a quiet venue with the
   final binary (every stall and tripwire they found is fixed; the runs themselves are owed).
-- The literal allowlist's ~609 OWED rows; the `stats` "allocation law" under fabric controllers; the
-  nightly 60 s campaign; a quiet-venue `bench-compare`.
+- The literal allowlist's ~609 OWED rows; ~~the `stats` "allocation law" under fabric controllers~~
+  (resolved `8b0df62`, `rung-09-gates.md` §9); the nightly 60 s campaign; a quiet-venue `bench-compare`.
 - The joiner-side grant ledger (a wire writer's consumed grants until the renewal declaration); the
-  slot-lease handover draining parked stamps; the node snapshot `RecordIndex.entries` arrays charged
-  to `kv_node_cache`; the `Segment`'s fixed per-cell tables as a budget component.
+  slot-lease handover draining parked stamps; ~~the node snapshot `RecordIndex.entries` arrays charged
+  to `kv_node_cache`; the `Segment`'s fixed per-cell tables as a budget component~~ (resolved
+  `352f7f2` and `1d91625`, `rung-09-memory-footprint.md` §6).
 - A 512 B DMA grain on 512 B-LBA devices (the read-side 8× and the journal's pad floor both move
   with it); the transient save's fold into a full next epoch vs the 64-wide save buffers (latent).
 - The harness's third lever (a `SQUEEZEFS_*` A/B knob on one binary).

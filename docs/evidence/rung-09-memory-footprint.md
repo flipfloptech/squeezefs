@@ -263,8 +263,37 @@ unaccounted, and it is the metadata layer's.
 
 ## 6. What stays open
 
-- **The residual, and the one gauge still wrong: the node cache charges its extent images,
-  not its snapshot INDEXES.** After idle + unlink the fixed daemon keeps ≈ 0.55 GB of live
+- ~~**The residual, and the one gauge still wrong: the node cache charges its extent images,
+  not its snapshot INDEXES.**~~ **Resolved 2026-10-12 (`352f7f2`; 0003 §I).** `RecordIndex`
+  charges `indexBytes(entries, sources) = entries × 24 B + sources × 16 B` to the owning
+  cache's `kv_node_cache` gauge at `build`/`extendWith` and credits it exactly at `deinit`
+  (the same deinit-exact law the memos and heads follow), so an index charges for as long
+  as any snapshot over it lives — the superseded indexes a reader still holds included —
+  and eviction returns it with the extent. The stat `meta_kv_node_index_bytes` names the
+  live index bytes process-wide; `index ÷ mapped nodes` on a quiet mount is now the
+  direct read of the retained-index question below. Measured by the new R5 test
+  (`node_cache.zig` "R5 measure: the charge of N cached nodes with M records each …",
+  16 nodes × 400 records over a 64 KiB layout, a live-byte allocator around the cache):
+
+  | | charge (`kv_node_cache`) | allocator's live bytes above the empty cache | uncharged | per node |
+  |---|---|---|---|---|
+  | before | 1,048,576 B (16 extents) | 1,220,136 B | **171,560 B (14.1 %)** | 10,722 B, of which the index 9,616 B |
+  | after | **1,202,432 B** (16 extents + 153,856 B of indexes) | 1,220,136 B | 17,704 B (1.4 %) | 1,106 B of fixed objects: the node, the snapshot's 8 memo cells, three Arc headers, the key bounds, a map and a clock slot |
+
+  Red first: the test fails on the old charge by exactly the index bytes (`expected
+  1202432, found 1048576`); after `evictToBudget` at budget 0 the charge reads 0 and the
+  allocator holds 984 B — the shard maps' and the clock ring's grown capacity, no node. The
+  per-node tie (`RecordIndex.indexBytes`, `node_snapshot.zig` "RecordIndex charge tie …")
+  pins build, extend (a second index charges while the first stands), deinit and the
+  standalone (cache-less) case; the freeze test restates a node's charge as extent + index
+  + overlay + memo and that the superseded index dies with its snapshot. What remains
+  of the audit ("why ≈ 5 indexes per mapped node"): the index of a node is a MERGE that
+  keeps every superseded record as an entry until a compaction rewrites the node, so a
+  leaf that absorbed k freezes carries `Σ frozen records × 24 B` — the 64 → 128 → 192 →
+  256 → 324 KiB ladder is one node's index growing, charged now; whether retired indexes
+  also outlive their snapshots is what the new stat answers on the next profile.
+
+  The original finding, kept for the record: after idle + unlink the fixed daemon keeps ≈ 0.55 GB of live
   64–256 KiB heap allocations (the pressure row: 3,077 × 64 KiB, 1,530 × 128 KiB, 569 × 192 KiB,
   150 × 256 KiB; stable over the idle minutes); under LTP `syscalls` the same class reaches
   ≈ 1.7 GB (7,722 × 64 KiB, 3,567 × 128 KiB, 1,441 × 192 KiB, 507 × 256 KiB, 313 × 324 KiB …)
@@ -281,6 +310,20 @@ unaccounted, and it is the metadata layer's.
   to `cached_bytes` (and audit why the old indexes outlive their snapshots), then the Red shed
   (a checkpoint kick) and the clock will act on the real bytes; until then Σ gauges undercounts
   the daemon by the index arrays and the RSS arm carries the difference.
+- **The staging segment's fixed per-cell tables are a component — resolved 2026-10-12
+  (`1d91625`; 0003 §I; `rung-09-sqzhash.md` §3.1 named them beside the cell states).**
+  `staging_tables` (attribution-only, weight 0, heap): the cells (80 B), the free list (4 B),
+  the pending list (40 B) and the placement scratch (40 B, one extra) at `maxCells`, and the
+  key index's `ceilPow2(n / 0.8 + 1)` slots × 33 B — `Segment.tablesBound(capacity)`, charged
+  at `Segment.init` and credited at `deinit`, registered beside `staging_cell_state` at
+  `openStaging`, the `.stats` row `staging_tables_bytes`, the `data_layouts.md` §8 row.
+  Measured: **31,574,220 B at the venue's 546 MiB ring** (139,777 cells; 30.1 MiB) and
+  3,768,524 B at 64 MiB — 5.5 % of the ring either way (the index's power-of-two rounding is
+  the swing), none of it a component before (Σ gauges did not see it; the RSS arm carried it).
+  The tie test (`staging.zig` "the segment's fixed per-cell tables are gauged (R5) …") pins the
+  formula term by term against the live tables, the std hash map's capacity law against the
+  live map's `capacity()`, the two measured sizes, stillness through puts and removes, and the
+  return at `deinit`; the pending list is now sized precisely so every table IS the formula.
 - **Two defects the faster mount surfaced in the kill rows** (fixed in this series): the
   `kv_node_cache` component held `&cache.cached_bytes` while a joiner's
   `reopenControlProjection` replaced its cache (a freed gauge read by the sampler; now registered

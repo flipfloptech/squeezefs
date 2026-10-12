@@ -46,6 +46,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const Io = std.Io;
 const clock = @import("../core/clock.zig");
+const inos = @import("../meta/inos.zig");
 const log = @import("../core/log.zig");
 const counters = @import("../core/counters.zig");
 const derive = @import("../core/derive.zig");
@@ -1541,6 +1542,14 @@ const Peer = struct {
             _ = linux.kill(self.pid, .KILL);
         }
         return c.wait(self.rig.io);
+    }
+
+    /// `waitExit` judged: a clean exit 0, else the log (a panic's trace
+    /// starts no `error(` line, so `printAlerts` would miss it).
+    fn expectCleanExit(self: *Peer, waiting_for: []const u8) !void {
+        const term = try self.waitExit();
+        if (term == .exited and term.exited == 0) return;
+        return judgeDeath(self.name, term, self.killed, waiting_for, self.readLog() catch null, self.rig.gpa);
     }
 
     /// `kill -9`: the daemon dies mid-flight, its dead connection is
@@ -5594,7 +5603,7 @@ test "smoke: THE KILL MATRIX — kill -9 at 50/100/150 MiB of a 200 MiB dd and m
 
 /// `squeezefs fsck …` through the binary; the report's JSON, the exit code
 /// and both streams (printed on a surprise).
-fn fsckJson(rig: *Rig, extra: []const []const u8) !struct { report: json_scan_report.Report, code: u8 } {
+fn fsckJson(rig: *Rig, extra: []const []const u8) !FsckOutcome {
     var argv: [12][]const u8 = undefined;
     var n: usize = 0;
     argv[n] = "fsck";
@@ -6490,6 +6499,392 @@ test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta no
 
 const extent_overlay = @import("../data/extent_overlay.zig");
 
+// ---- the online fsck: shards, the storm, the set ----
+
+/// The online report (JSON) of `target` through the admin lane; a shard
+/// when asked. The caller judges the code.
+fn fsckOnline(rig: *Rig, target: []const u8, residue: ?[]const u8) !FsckOutcome {
+    if (residue) |s| return fsckJsonTarget(rig, target, &.{ "--online", "--shards", s });
+    return fsckJsonTarget(rig, target, &.{"--online"});
+}
+
+/// Write the online report's JSON to `<work>/<name>` (the merge's input).
+fn fsckOnlineToFile(rig: *Rig, residue: []const u8, name: []const u8) !void {
+    const r = try rig.squeezefs(&.{ "fsck", "--json", "--online", "--shards", residue, rig.mp });
+    defer rig.freeRun(r);
+    if (r.term != .exited or r.term.exited != 0) std.debug.print("\n--- fsck --online --shards {s} ({f}) ---\n{s}\n", .{ residue, r.term, r.stderr });
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+    var pb: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ rig.work, name });
+    const f = try Io.Dir.cwd().createFile(rig.io, path, .{ .truncate = true });
+    defer f.close(rig.io);
+    try f.writeStreamingAll(rig.io, r.stdout);
+}
+
+test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed files, hard links, three fsync'd 20 MiB files) → `fsck --online` whole = 0 findings → `--shards 0/3, 1/3, 2/3` online (each report names its shard, each judges its residue) → `merge-reports` of the three ≡ the whole run (0 findings, the inode census summed exactly) → an 8-way `cp` storm with three online runs INSIDE it: 0 findings each (the zero-FP law under churn) → the two-daemon set: B JOINED creates 2,000 files and a tree under A's root → `fsck --online` on A reads B's slots as foreign-live and B's ring as a window (foreign_slot_scoped > 0), 0 findings; on B's mount the lane refuses by verdict (not the coordinator)" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.createImage();
+    const storm_sources = try rig.shOk(rig.work, "i=0; while [ $i -lt 8 ]; do dd if=image of=s$i bs=1M skip=$((i * 25)) count=50 status=none; i=$((i + 1)); done; echo ok");
+    gpa.free(storm_sources);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // 1. The fill.
+    {
+        const out = try rig.onMount("mkdir -p d/e/f g; i=0; while [ $i -lt 200 ]; do dd if=\"$1/image\" of=d/e/p$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; ln d/e/p1 g/link1; ln d/e/p2 g/link2; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; echo filled");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
+    }
+    // 2. Whole, then the three shards, then the merge ≡ the whole.
+    var whole = try fsckOnline(rig, rig.mp, null);
+    defer whole.report.deinit(gpa);
+    if (whole.report.findings.len != 0) for (whole.report.findings) |f| std.debug.print("  unexpected: {f}\n", .{f});
+    try testing.expectEqual(@as(usize, 0), whole.report.findings.len);
+    try testing.expectEqual(@as(u8, 0), whole.code);
+    try testing.expect(whole.report.shard == null);
+    try testing.expect(whole.report.counters.inodes_scanned >= 208);
+    var shard_inodes: u64 = 0;
+    inline for (.{ "0/3", "1/3", "2/3" }, .{ "shard0.json", "shard1.json", "shard2.json" }, 0..) |s, name, k| {
+        var got = try fsckOnline(rig, rig.mp, s);
+        defer got.report.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expectEqual(json_scan_report.Shard{ .k = k, .n = 3 }, got.report.shard.?);
+        try testing.expect(got.report.counters.inodes_scanned < whole.report.counters.inodes_scanned);
+        shard_inodes += got.report.counters.inodes_scanned;
+        try fsckOnlineToFile(rig, s, name);
+    }
+    try testing.expectEqual(whole.report.counters.inodes_scanned, shard_inodes);
+    {
+        var p0: [256]u8 = undefined;
+        var p1: [256]u8 = undefined;
+        var p2: [256]u8 = undefined;
+        const r = try rig.squeezefs(&.{ "fsck", "merge-reports", "--json", try std.fmt.bufPrint(&p0, "{s}/shard0.json", .{rig.work}), try std.fmt.bufPrint(&p1, "{s}/shard1.json", .{rig.work}), try std.fmt.bufPrint(&p2, "{s}/shard2.json", .{rig.work}) });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
+        var merged = try json_scan_report.Report.parse(gpa, r.stdout);
+        defer merged.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), merged.findings.len);
+        try testing.expect(merged.shard == null);
+        try testing.expectEqual(whole.report.counters.inodes_scanned, merged.counters.inodes_scanned);
+        try testing.expectEqual(whole.report.counters.dentry_refs_indexed, merged.counters.dentry_refs_indexed);
+        std.debug.print("smoke[fsck-online]: whole {d} inode(s), {d} dentry ref(s), {d} block(s); 3 shards online summed {d} inode(s); merge-reports ≡ whole (0 findings, the census exact)\n", .{ whole.report.counters.inodes_scanned, whole.report.counters.dentry_refs_indexed, whole.report.counters.blocks_checked, shard_inodes });
+    }
+    // 3. The storm with the online runs INSIDE it: 0 findings each; the
+    //    shields' counters grow (the engagement law).
+    {
+        var storm_cmd: [1024]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(&storm_cmd, "i=0; while [ $i -lt 8 ]; do ( cp {s}/s$i {s}/storm$i && rm {s}/storm$i ) & i=$((i + 1)); done; wait", .{ rig.work, rig.mp, rig.mp });
+        var storm = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", cmd }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        var runs: u32 = 0;
+        var exempted: u64 = 0;
+        while (runs < 3) : (runs += 1) {
+            var got = try fsckOnline(rig, rig.mp, null);
+            defer got.report.deinit(gpa);
+            if (got.report.findings.len != 0) for (got.report.findings) |f| std.debug.print("  storm run {d} unexpected: {f}\n", .{ runs, f });
+            try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+            try testing.expectEqual(@as(u8, 0), got.code);
+            exempted += got.report.counters.current_era_exempted + got.report.counters.epoch_exempted + got.report.counters.inflight_exempted + got.report.counters.suspects_cleared;
+        }
+        _ = try storm.wait(io);
+        std.debug.print("smoke[fsck-online]: 3 online runs inside the 8-way cp storm: 0 findings; shield engagement over the runs {d} (current-era + epoch + in-flight exemptions + suspects cleared)\n", .{exempted});
+    }
+    try rig.expectAlive("the storm");
+    // 4. The two-daemon set. The rig's daemons share ONE cache root (the
+    // paths are the set's format decision), and the staging marker is
+    // scoped to the set alone today — a second mount on the host adopts
+    // the first's live residents as its own and promotes them at ITS
+    // dismount (through slots it does not hold: 197 commits refused, the
+    // pack's pin arithmetic tripped). A is remounted first: its dismount
+    // promotes every resident (charter §8 `umount`), and B's recovery
+    // must find nothing.
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    const remount_mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(remount_mark);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try testing.expectEqual(@as(u64, 0), numberAfter(sb, "\"staging_recovery_records\":") orelse 1);
+    }
+    {
+        const script = try matrixCreateScript(gpa);
+        defer gpa.free(script);
+        const out = try b.onMount(script);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("500\n", out);
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+        const tree_out = try b.onMount("cd a-dir && i=0; while [ $i -lt 100 ]; do printf 'x%s\\n' $i > x$i; i=$((i + 1)); done; ls | wc -l");
+        defer gpa.free(tree_out);
+        try testing.expectEqualStrings("100\n", tree_out);
+        // The set quiesced: both members' barriers (the cross-owner
+        // intents' halves land on both sides before the census).
+        const sb = try b.onMount("sync -f . && echo synced");
+        defer gpa.free(sb);
+        try testing.expectEqualStrings("synced\n", sb);
+        const sa = try rig.onMount("sync -f . && echo synced");
+        defer gpa.free(sa);
+        try testing.expectEqualStrings("synced\n", sa);
+    }
+    {
+        // The live set's block plane from A: `scrub --online` (C7 alone)
+        // reads every block A's forest shows (B's custody is B's: the
+        // fleet residue, judged by B's engine and merged here), 0 findings.
+        var got = try verbJsonTarget(rig, "scrub", rig.mp, &.{"--online"});
+        defer got.report.deinit(gpa);
+        const c = got.report.counters;
+        std.debug.print("smoke[fsck-online]: the two-daemon set from A: scrub --online read {d} block(s) ({d} B), {d} failure(s), {d} finding(s); fleet dispatched {d}\n", .{ c.scrub_blocks_scanned, c.scrub_bytes_scanned, c.scrub_failures, got.report.findings.len, blk: {
+            const sa = try rig.stats();
+            defer gpa.free(sa);
+            break :blk numberAfter(sa, "\"job_fleet_shards_dispatched\":") orelse 0;
+        } });
+        if (got.report.findings.len != 0) for (got.report.findings[0..@min(got.report.findings.len, 12)]) |f| std.debug.print("  set unexpected: {f}\n", .{f});
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expectEqual(@as(u8, 0), got.code);
+        try testing.expectEqual(@as(u64, 0), c.scrub_failures);
+        try testing.expect(c.scrub_blocks_scanned >= 15);
+    }
+    {
+        // The whole inode plane from A over the live set: the census
+        // scopes what is a lessee's (its slots, the names its directories
+        // hold, the blocks its records reference; the reference-count
+        // arms decline while a lessee is live). The verdict over a joiner's
+        // cross-owner mints is this rung's stated gap (`rung-10-jobs.md`
+        // §owed): the report is read for its scoping counters here.
+        var got = try fsckOnline(rig, rig.mp, null);
+        defer got.report.deinit(gpa);
+        const c = got.report.counters;
+        std.debug.print("smoke[fsck-online]: the two-daemon set from A: fsck --online {d} inode(s), {d} dentry ref(s), {d} finding(s) (the stated gap); foreign-slot scoped {d}, foreign-dentry scoped {d}, window scoped {d}, slots covered {d}, block-plane foreign scoped {d}, alloc census declined {d}\n", .{ c.inodes_scanned, c.dentry_refs_indexed, got.report.findings.len, c.inode_plane_foreign_slot_scoped, c.inode_plane_foreign_dentry_scoped, c.inode_plane_window_scoped, c.inode_plane_slots_covered, c.block_plane_foreign_scoped, c.alloc_census_declined });
+        for (got.report.findings[0..@min(got.report.findings.len, 6)]) |f| std.debug.print("  set (stated gap): {f}\n", .{f});
+        // B's slots are its own: A's census scopes them out rather than
+        // judging a tree that changes under it.
+        try testing.expect(c.inode_plane_foreign_dentry_scoped > 0 or c.inode_plane_foreign_slot_scoped > 0);
+        try testing.expect(c.inode_plane_slots_covered < inos.ROUTING_WIDTH);
+    }
+    {
+        // B is not the coordinator: its lane answers by verdict.
+        const r = try rig.squeezefs(&.{ "fsck", "--online", b.mp });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "not the coordinator") != null);
+    }
+    try b.expectAlive("the set's fsck");
+    {
+        // Neither daemon tripped an invariant across the set's runs.
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        try testing.expectEqual(@as(u64, 0), numberAfter(sb, "\"invariant_tripwires\":") orelse 0);
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        try testing.expectEqual(@as(u64, 0), numberAfter(sa, "\"invariant_tripwires\":") orelse 0);
+    }
+    const mark_b_dismount = blk: {
+        const t = try b.readLog();
+        defer gpa.free(t);
+        break :blk t.len;
+    };
+    try b.umount();
+    try b.expectCleanExit("B's unmount");
+    {
+        // B's dismount promotes every staged resident it still holds
+        // (charter §8 `umount`: "teardown promotes staged files first"),
+        // none failed — a joiner's packed promotions commit through its
+        // own slot.
+        const text = try b.readLog();
+        defer gpa.free(text);
+        const tail = text[@min(mark_b_dismount, text.len)..];
+        const line_at = std.mem.indexOf(u8, tail, "dismount promotion: ") orelse {
+            std.debug.print("\n--- daemon b: no dismount promotion line ---\n{s}\n", .{tail});
+            return error.NoDismountPromotionLine;
+        };
+        const line = tail[line_at..];
+        if (std.mem.indexOf(u8, line[0..@min(line.len, 200)], ", 0 failed") == null) {
+            std.debug.print("\n--- daemon b: the dismount promotion failed residents ---\n", .{});
+            var it = std.mem.splitScalar(u8, tail, '\n');
+            var n: usize = 0;
+            while (it.next()) |l| if (std.mem.indexOf(u8, l, "promotion") != null or std.mem.indexOf(u8, l, "pack") != null) {
+                std.debug.print("{s}\n", .{l[0..@min(l.len, 300)]});
+                n += 1;
+                if (n == 30) break;
+            };
+            return error.DismountPromotionFailed;
+        }
+    }
+    try rig.expectAlive("the set");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the online fsck row");
+}
+
+// ---- the fleet READ shard: B as the coordinator's worker ----
+
+/// The fleet row's data: 1 GiB in 8 × 128 MiB fsync'd files, half written
+/// on each daemon (the set's 4 MiB blocks: 256 blocks to scrub).
+const fleet_files_per_side: usize = 4;
+const fleet_file_mib: u64 = 128;
+const fleet_blocks: u64 = 2 * fleet_files_per_side * fleet_file_mib / 4;
+
+fn fleetFillScript(gpa: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    try w.writer.print("mkdir -p {s}; i=0; while [ $i -lt {d} ]; do dd if=\"$1/image\" of={s}/f$i bs=1M skip=$((i * 32)) count={d} conv=fsync status=none; i=$((i + 1)); done; echo filled", .{ prefix, fleet_files_per_side, prefix, fleet_file_mib });
+    return w.toOwnedSlice();
+}
+
+/// Both daemons' fabric lines since the marks (a fleet stage's post-mortem).
+fn printFleetLines(rig: *Rig, b: *Peer, a_from: usize, b_from: usize) !void {
+    const gpa = rig.gpa;
+    const ta = try rig.readLog();
+    defer gpa.free(ta);
+    const tb = try b.readLog();
+    defer gpa.free(tb);
+    inline for (.{ .{ "A", ta, a_from }, .{ "B", tb, b_from } }) |side| {
+        std.debug.print("\n--- daemon {s}: the fabric since the stage began ---\n", .{side[0]});
+        var it = std.mem.splitScalar(u8, side[1][@min(side[2], side[1].len)..], '\n');
+        var n: usize = 0;
+        while (it.next()) |l| if (std.mem.indexOf(u8, l, "fleet") != null or std.mem.indexOf(u8, l, "job fabric") != null or std.mem.indexOf(u8, l, "admin lane") != null or std.mem.indexOf(u8, l, "fsck") != null or std.mem.indexOf(u8, l, "shard") != null) {
+            std.debug.print("{s}\n", .{l[0..@min(l.len, 300)]});
+            n += 1;
+            if (n == 40) break;
+        };
+    }
+}
+
+/// A bounded poll of a daemon's `.stats` word until it reads ≥ `want`.
+fn awaitPeerAtLeast(b: *Peer, k: []const u8, want: u64, bound_ns: u64) !u64 {
+    const deadline = clock.monotonicNs() + bound_ns;
+    while (true) {
+        if (try b.statsTry()) |st| {
+            defer b.rig.gpa.free(st);
+            const v = numberAfter(st, k) orelse 0;
+            if (v >= want) return v;
+        }
+        try b.expectAlive(k);
+        if (clock.monotonicNs() >= deadline) {
+            std.debug.print("\n--- daemon {s}: {s} never reached {d} ---\n", .{ b.name, k, want });
+            return error.Timeout;
+        }
+        sleepMs(100);
+    }
+}
+
+test "smoke: THE FLEET READ SHARD — mount A (the coordinator) + B JOINED with the fleet on: B enrolls at A as a READ worker over its own manager link (job_remote_workers 1 on A) → 1 GiB of fsync'd files, 512 MiB written on each side → `scrub --online <A>` partitions 2 ways: shard 0 on A online, shard 1 LEASED to B, run by B's engine over B's own plane (B's scrub_blocks_scanned grows, job_fleet_worker_shards 1), PROPOSED as read_shard_result and merged on A (dispatched 1 = completed 1, relocal 0; every block scanned, 0 findings) → `scrub --online --throttle 5` again: B's residue stretched by the duty cycle, kill -9 B inside it → A's departure expires the lease (fencing +1), the residue is LOST and the local view re-run (relocal 1), the job completes whole, 0 findings; the engagement counters per side" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    try rig.formatSet(true);
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    _ = try b.awaitLog("enrolled at the coordinator as a fleet READ worker", 0, 60 * std.time.ns_per_s);
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(u64, 1), numberAfter(st, "\"job_remote_workers\":") orelse 0);
+    }
+    // 1. The fill: 512 MiB on each side.
+    {
+        const sa = try fleetFillScript(gpa, "a");
+        defer gpa.free(sa);
+        const oa = try rig.onMount(sa);
+        defer gpa.free(oa);
+        try testing.expect(std.mem.indexOf(u8, oa, "filled") != null);
+        const sb = try fleetFillScript(gpa, "b");
+        defer gpa.free(sb);
+        const ob = try b.onMount(sb);
+        defer gpa.free(ob);
+        try testing.expect(std.mem.indexOf(u8, ob, "filled") != null);
+    }
+    // 2. The sharded scrub: shard 1 runs on B.
+    const b_scanned0 = blk: {
+        const st = try b.stats();
+        defer gpa.free(st);
+        break :blk numberAfter(st, "\"scrub_blocks_scanned\":") orelse 0;
+    };
+    const a_mark = try rig.logLen();
+    {
+        var got = try fsckJsonTarget(rig, rig.mp, &.{ "--online", "--scrub" });
+        defer got.report.deinit(gpa);
+        if (got.report.findings.len != 0) for (got.report.findings) |f| std.debug.print("  unexpected: {f}\n", .{f});
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        const sb = try b.stats();
+        defer gpa.free(sb);
+        const b_scanned = numberAfter(sb, "\"scrub_blocks_scanned\":") orelse 0;
+        std.debug.print("smoke[fleet]: scrub --online on A over {d} block(s): shard 0 on A, shard 1 on B — A: dispatched {d}, completed {d}, relocal {d}, remote shards {d}; B: worker shards {d}, its scrub scanned {d} block(s) ({d} B read off its own plane); merged report {d} block(s) scanned ({d} B), {d} failure(s), {d} finding(s), exit {d}\n", .{ fleet_blocks, numberAfter(sa, "\"job_fleet_shards_dispatched\":") orelse 0, numberAfter(sa, "\"job_fleet_shards_completed\":") orelse 0, numberAfter(sa, "\"job_fleet_shards_relocal\":") orelse 0, numberAfter(sa, "\"job_remote_shards\":") orelse 0, numberAfter(sb, "\"job_fleet_worker_shards\":") orelse 0, b_scanned - b_scanned0, numberAfter(sb, "\"fsck_scrub_read_bytes\":") orelse 0, got.report.counters.scrub_blocks_scanned, got.report.counters.scrub_bytes_scanned, got.report.counters.scrub_failures, got.report.findings.len, got.code });
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expectEqual(@as(u8, 0), got.code);
+        try testing.expect(got.report.counters.scrub_blocks_scanned >= fleet_blocks);
+        try testing.expectEqual(@as(u64, 0), got.report.counters.scrub_failures);
+        _ = try rig.awaitLog("1 proposed by the fleet, 1 run here", a_mark, 10 * std.time.ns_per_s);
+        try testing.expectEqual(@as(u64, 1), numberAfter(sa, "\"job_fleet_shards_dispatched\":") orelse 0);
+        try testing.expectEqual(@as(u64, 1), numberAfter(sa, "\"job_fleet_shards_completed\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(sa, "\"job_fleet_shards_relocal\":") orelse 0);
+        try testing.expectEqual(@as(u64, 1), numberAfter(sb, "\"job_fleet_worker_shards\":") orelse 0);
+        try testing.expect(b_scanned > b_scanned0);
+    }
+    // 3. kill -9 B mid-shard. The scrub throttled to 5 % duty stretches
+    // B's residue to tens of seconds (the §8 duty-cycle law); B's shard
+    // counter moves at the shard's START, so the kill lands inside it.
+    const a_mark2 = try rig.logLen();
+    const b_shards0 = blk: {
+        const st = try b.stats();
+        defer gpa.free(st);
+        break :blk numberAfter(st, "\"job_fleet_worker_shards\":") orelse 0;
+    };
+    const exp0 = blk: {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        break :blk numberAfter(st, "\"job_remote_lease_expiries\":") orelse 0;
+    };
+    // The scrub in a child: it waits for the job's terminal state.
+    var scrub = try std.process.spawn(io, .{ .argv = &.{ rig.bin, "scrub", "--online", "--json", "--throttle", "5", rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = rig.log_file.? }, .stderr = .{ .file = rig.log_file.? } });
+    _ = awaitPeerAtLeast(b, "\"job_fleet_worker_shards\":", b_shards0 + 1, 120 * std.time.ns_per_s) catch |e| {
+        try printFleetLines(rig, b, a_mark2, 0);
+        return e;
+    };
+    try b.kill();
+    // Exit 0 is the CLI's word for a clean report (findings exit 1).
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try scrub.wait(io));
+    _ = try rig.awaitLog("0 proposed by the fleet, 2 run here", a_mark2, 300 * std.time.ns_per_s);
+    {
+        const sa = try rig.stats();
+        defer gpa.free(sa);
+        std.debug.print("smoke[fleet]: kill -9 B mid-shard — A: lease expiries {d} (was {d}), relocal {d}, dispatched {d}, completed {d}, remote workers {d}; the job completed whole (exit 0: 0 findings)\n", .{ numberAfter(sa, "\"job_remote_lease_expiries\":") orelse 0, exp0, numberAfter(sa, "\"job_fleet_shards_relocal\":") orelse 0, numberAfter(sa, "\"job_fleet_shards_dispatched\":") orelse 0, numberAfter(sa, "\"job_fleet_shards_completed\":") orelse 0, numberAfter(sa, "\"job_remote_workers\":") orelse 99 });
+        try testing.expect((numberAfter(sa, "\"job_remote_lease_expiries\":") orelse 0) >= exp0 + 1);
+        try testing.expectEqual(@as(u64, 1), numberAfter(sa, "\"job_fleet_shards_relocal\":") orelse 0);
+        try testing.expectEqual(@as(u64, 2), numberAfter(sa, "\"job_fleet_shards_dispatched\":") orelse 0);
+        try testing.expectEqual(@as(u64, 1), numberAfter(sa, "\"job_fleet_shards_completed\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(sa, "\"job_remote_workers\":") orelse 99);
+        try testing.expectEqual(@as(u64, 0), numberAfter(sa, "\"invariant_tripwires\":") orelse 0);
+    }
+    try rig.expectAlive("the fleet row");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the fleet row");
+}
+
 /// The `key id {16 hex}` the rekey verb prints (the new key's id).
 fn keyIdIn(text: []const u8) ?[]const u8 {
     const i = std.mem.indexOf(u8, text, "onto key id ") orelse return null;
@@ -6734,10 +7129,18 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
 }
 
 /// `fsckJson` over any target (the online arm's mountpoint).
-fn fsckJsonTarget(rig: *Rig, target: []const u8, extra: []const []const u8) !struct { report: json_scan_report.Report, code: u8 } {
+/// A JSON fsck verb's parsed report and exit code.
+const FsckOutcome = struct { report: json_scan_report.Report, code: u8 };
+
+fn fsckJsonTarget(rig: *Rig, target: []const u8, extra: []const []const u8) !FsckOutcome {
+    return verbJsonTarget(rig, "fsck", target, extra);
+}
+
+/// `fsck` or `scrub` (C7 alone) with `--json`; the report parsed.
+fn verbJsonTarget(rig: *Rig, verb: []const u8, target: []const u8, extra: []const []const u8) !FsckOutcome {
     var argv: [8][]const u8 = undefined;
     var n: usize = 0;
-    argv[n] = "fsck";
+    argv[n] = verb;
     n += 1;
     argv[n] = "--json";
     n += 1;

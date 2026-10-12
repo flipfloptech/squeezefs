@@ -92,7 +92,7 @@ pub const Census = struct {
     n_named: usize = 0,
     total: usize = 0,
 
-    pub fn busy(self: *const Census) bool {
+    pub fn busy(self: Census) bool {
         return self.total > 0;
     }
 
@@ -105,7 +105,7 @@ pub const Census = struct {
     }
 
     /// `N holder(s): pid 12 (bash) cwd, pid 40 (vim) fd 3, +2 more`.
-    pub fn format(self: *const Census, w: *Io.Writer) Io.Writer.Error!void {
+    pub fn format(self: Census, w: *Io.Writer) Io.Writer.Error!void {
         try w.print("{d} holder(s): ", .{self.total});
         for (self.named[0..self.n_named], 0..) |h, i| {
             if (i != 0) try w.writeAll(", ");

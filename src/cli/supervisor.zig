@@ -2,20 +2,40 @@
 //! supervisor (`--daemon --supervise`: stat a control inode every 5 s;
 //! after 30 s dump task stacks, SIGABRT→SIGKILL, then write
 //! `/sys/fs/fuse/connections/<minor>/abort` if `waiting > 0`)";
-//! `docs/porting/fuse_abi_session.md` §9.1, Q10).
+//! `docs/porting/fuse_abi_session.md` §9.1, Q10; decision 0003 §S).
 //!
 //! It runs in the daemon's PARENT process (the intermediate of the double
 //! fork, `daemon.zig`), std-only, no executor: it must outlive a wedged
 //! daemon whose every thread is parked. The pure state machine `State` is
 //! portable and tested; `run` is the Linux loop over it.
 //!
+//! Two probes, one per state of the mount (`probeKind`):
+//! - ATTACHED (the mount's entry, by its id, is in the mount table at the
+//!   mountpoint): `stat(<mountpoint>/.stats)` — the charter's control
+//!   inode, a LOOKUP-only entry with TTL 0, so every probe REACHES the
+//!   daemon as a request and proves the FUSE path answers (a root `stat`
+//!   under the 1 s attr TTL would measure the dentry cache;
+//!   `stats_cli.md` §7 Q19).
+//! - NOT ATTACHED (the daemon's own `umount2` landed and its teardown
+//!   runs; or `squeezefs umount --lazy` detached the mountpoint and the
+//!   daemon serves the holders left on the detached superblock until the
+//!   kernel ends the connection): there is no path to stat — a stat of
+//!   the mountpoint would reach whatever sits under it — and a detached
+//!   but referenced mount is a DEFINED state, not a dead daemon. The probe
+//!   is the daemon's HEARTBEAT: its watchdog tick stamps a word on a page
+//!   the two processes share (`Heartbeat`, mapped by the intermediate
+//!   before the fork), and a stamp older than two ticks is a miss. The
+//!   watchdog runs through the whole teardown, so a long dismount pass
+//!   (many staged files promoting) is never mistaken for a wedge.
+//! A stat that fails on a mount that left the table between the two
+//! looks is the teardown in progress, judged by the heartbeat too.
+//!
 //! Constants with their reasons:
-//! - `PROBE_INTERVAL_NS` 5 s: the probe is a `stat` of `<mountpoint>/.stats`
-//!   (the charter's control inode: a LOOKUP-only entry with TTL 0, so every
-//!   probe REACHES the daemon as a LOOKUP and renders a payload — a root
-//!   `stat` under the 1 s attr TTL would measure the kernel's dentry cache,
-//!   not the daemon; `stats_cli.md` §7 Q19); 5 s is one daemon watchdog
-//!   tick, the slowest periodic cadence the daemon already runs.
+//! - `PROBE_INTERVAL_NS` 5 s: one daemon watchdog tick (`watchdog.TICK_NS`,
+//!   tied in `mount.zig`), the slowest periodic cadence the daemon already
+//!   runs; past the 1 s attr TTL.
+//! - `HEARTBEAT_STALE_NS` 2 × the interval: one tick of slack for a tick
+//!   that lands late under load — a stamp two ticks old is a miss.
 //! - `UNRESPONSIVE_NS` 30 s: six missed probes = six ticks of the daemon's
 //!   own 5 s watchdog, long enough that a cold-device checkpoint or a
 //!   ring-admission park never trips it (both are bounded in seconds, and
@@ -35,14 +55,18 @@ const std = @import("std");
 const fuzzkit = @import("../core/fuzzkit.zig");
 const builtin = @import("builtin");
 const tick_law = @import("../sync/tick.zig");
+const clock = @import("../core/clock.zig");
+const mountinfo = @import("../core/mountinfo.zig");
 
 pub const PROBE_INTERVAL_NS: u64 = 5 * std.time.ns_per_s;
+pub const HEARTBEAT_STALE_NS: u64 = 2 * PROBE_INTERVAL_NS;
 pub const UNRESPONSIVE_NS: u64 = 30 * std.time.ns_per_s;
 pub const ABORT_GRACE_NS: u64 = tick_law.tick_ns;
 
 pub const Policy = struct {
     probe_interval_ns: u64 = PROBE_INTERVAL_NS,
     unresponsive_after_ns: u64 = UNRESPONSIVE_NS,
+    heartbeat_stale_ns: u64 = HEARTBEAT_STALE_NS,
     write_abort: bool = true,
 };
 
@@ -85,6 +109,50 @@ pub const State = struct {
     }
 };
 
+/// The page the daemon and its supervisor share: the daemon's watchdog
+/// tick stamps `tick_ns` (release); the supervisor reads it (acquire).
+/// `extern` so the layout is one word at offset 0 across the fork.
+pub const Heartbeat = extern struct {
+    tick_ns: u64 = 0,
+
+    pub fn beat(self: *Heartbeat) void {
+        // release pairs with `lastNs`'s acquire in the other process.
+        @atomicStore(u64, &self.tick_ns, clock.monotonicNs(), .release);
+    }
+
+    pub fn lastNs(self: *const Heartbeat) u64 {
+        return @atomicLoad(u64, &self.tick_ns, .acquire);
+    }
+
+    /// A stamp within `stale_after_ns` of `now_ns`; a page never stamped
+    /// (0) is stale — the daemon's first tick is one interval after ready.
+    pub fn fresh(self: *const Heartbeat, now_ns: u64, stale_after_ns: u64) bool {
+        const last = self.lastNs();
+        return last != 0 and now_ns -| last < stale_after_ns;
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Heartbeat) == @sizeOf(u64));
+}
+
+pub const ProbeKind = enum {
+    control_inode,
+    heartbeat,
+
+    pub fn text(self: ProbeKind) []const u8 {
+        return switch (self) {
+            .control_inode => "stat of the control inode",
+            .heartbeat => "the heartbeat",
+        };
+    }
+};
+
+/// Which probe judges this round (module doc).
+pub fn probeKind(attached: bool) ProbeKind {
+    return if (attached) .control_inode else .heartbeat;
+}
+
 /// `waiting` is a decimal count on one line.
 pub fn parseWaiting(text: []const u8) ?u64 {
     const t = std.mem.trim(u8, text, " \t\r\n");
@@ -96,11 +164,20 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
     const linux = std.os.linux;
     const Io = std.Io;
     const log = @import("../core/log.zig");
-    const clock = @import("../core/clock.zig");
     const thread_name = @import("../core/thread_name.zig");
     const completion = @import("../sync/completion.zig");
 
     pub const sysfs_connections = "/sys/fs/fuse/connections";
+
+    /// Map the shared page (`MAP_SHARED|MAP_ANONYMOUS`): called by the
+    /// intermediate BEFORE it forks the daemon, so both see one page.
+    pub fn mapHeartbeat() ?*Heartbeat {
+        const rc = linux.mmap(null, std.heap.pageSize(), .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .ANONYMOUS = true }, -1, 0);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        const page: *Heartbeat = @ptrFromInt(rc);
+        page.* = .{};
+        return page;
+    }
 
     /// A probe runs on its own thread so a wedged mount cannot wedge the
     /// supervisor: the cell is shared, the LAST party to touch it frees it
@@ -156,6 +233,24 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
         const rc = linux.statx(linux.AT.FDCWD, path.ptr, 0, linux.STATX.BASIC_STATS, &st);
         if (linux.errno(rc) != .SUCCESS) return null;
         return st.dev_minor;
+    }
+
+    /// The mount's id in the table at START (null when the table does not
+    /// name the mountpoint): what `attached` is judged against.
+    pub fn mountIdAt(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) ?u64 {
+        const buf = gpa.alloc(u8, mountinfo.READ_BYTES) catch return null;
+        defer gpa.free(buf);
+        const e = mountinfo.entryAt(mountinfo.read(io, buf), mountpoint) orelse return null;
+        return e.id;
+    }
+
+    /// Is the mount with `id` still attached at `mountpoint`? An unknown
+    /// id (the table was unreadable at start) reads the path's presence.
+    pub fn attached(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, id: ?u64) bool {
+        const buf = gpa.alloc(u8, mountinfo.READ_BYTES) catch return true;
+        defer gpa.free(buf);
+        const e = mountinfo.entryAt(mountinfo.read(io, buf), mountpoint) orelse return false;
+        return if (id) |want| e.id == want else true;
     }
 
     fn sleepNs(ns: u64) void {
@@ -223,8 +318,8 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
 
     /// The charter's ladder, once: dump → SIGABRT → (grace) → SIGKILL →
     /// reap → `abort` iff `waiting > 0`.
-    pub fn escalate(io: Io, pid: linux.pid_t, conn: ?u64, for_ns: u64, policy: Policy) void {
-        log.err("supervisor: daemon {d} unresponsive for {d} s (no answer to stat of the mount root) — dumping state, then SIGABRT → SIGKILL", .{ pid, for_ns / std.time.ns_per_s });
+    pub fn escalate(io: Io, pid: linux.pid_t, conn: ?u64, for_ns: u64, kind: ProbeKind, policy: Policy) void {
+        log.err("supervisor: daemon {d} unresponsive for {d} s (no answer to {s}) — dumping state, then SIGABRT → SIGKILL", .{ pid, for_ns / std.time.ns_per_s, kind.text() });
         dumpDaemonState(io, pid);
         _ = linux.kill(pid, .ABRT);
         const deadline = clock.monotonicNs() + ABORT_GRACE_NS;
@@ -257,14 +352,19 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
 
     /// The loop (the intermediate process after `ready`): returns the exit
     /// code — 0 when the daemon exited on its own (a clean umount), 1 after
-    /// an escalation.
-    pub fn run(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, mountpoint: [:0]const u8, policy: Policy) u8 {
+    /// an escalation. `heartbeat` is the shared page (null only when the
+    /// map failed at the fork: then the heartbeat probe is always a miss,
+    /// said so at start).
+    pub fn run(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, mountpoint: [:0]const u8, policy: Policy, heartbeat: ?*const Heartbeat) u8 {
         var name_buf: thread_name.CommBuf = undefined;
         _ = thread_name.nameCurrentThread(&name_buf, "sqz-supervise");
         const conn = connectionId(mountpoint);
-        if (conn) |c| log.info("supervisor: watching daemon {d} at {s} (fuse connection {d}; probe every {d} s, escalate after {d} s)", .{ pid, mountpoint, c, policy.probe_interval_ns / std.time.ns_per_s, policy.unresponsive_after_ns / std.time.ns_per_s }) else log.warn("supervisor: stat({s}) failed at start — the connection id is unknown, the abort rung is disabled", .{mountpoint});
+        const mount_id = mountIdAt(gpa, io, mountpoint);
+        if (conn) |c| log.info("supervisor: watching daemon {d} at {s} (fuse connection {d}, mount id {?d}; probe every {d} s, escalate after {d} s)", .{ pid, mountpoint, c, mount_id, policy.probe_interval_ns / std.time.ns_per_s, policy.unresponsive_after_ns / std.time.ns_per_s }) else log.warn("supervisor: stat({s}) failed at start — the connection id is unknown, the abort rung is disabled", .{mountpoint});
+        if (heartbeat == null) log.warn("supervisor: no shared heartbeat page — a detached mount's liveness cannot be judged; the escalation fires {d} s after its detach", .{policy.unresponsive_after_ns / std.time.ns_per_s});
         var state = State.init(clock.monotonicNs());
         var escalated = false;
+        var was_attached = true;
         while (true) {
             sleepNs(policy.probe_interval_ns);
             var status: i32 = 0;
@@ -273,15 +373,30 @@ pub const linux_loop = if (builtin.os.tag == .linux) struct {
                 return if (escalated) 1 else 0;
             }
             if (!alive(pid)) return if (escalated) 1 else 0;
-            const ok = probe(gpa, mountpoint, policy.probe_interval_ns);
+            var is_attached = attached(gpa, io, mountpoint, mount_id);
+            var kind = probeKind(is_attached);
+            var ok = switch (kind) {
+                .control_inode => probe(gpa, mountpoint, policy.probe_interval_ns),
+                .heartbeat => if (heartbeat) |h| h.fresh(clock.monotonicNs(), policy.heartbeat_stale_ns) else false,
+            };
+            // A stat that failed on a mount that left the table meanwhile
+            // is the teardown (or a lazy detach) in progress: the heartbeat
+            // judges it.
+            if (!ok and kind == .control_inode and !attached(gpa, io, mountpoint, mount_id)) {
+                is_attached = false;
+                kind = .heartbeat;
+                ok = if (heartbeat) |h| h.fresh(clock.monotonicNs(), policy.heartbeat_stale_ns) else false;
+            }
+            if (was_attached and !is_attached) log.info("supervisor: {s} is no longer attached (the daemon's own unmount in progress, or a lazy detach serving its holders): liveness by {s} from here", .{ mountpoint, kind.text() });
+            was_attached = is_attached;
             const now = clock.monotonicNs();
             switch (state.observe(now, ok, policy)) {
                 .healthy, .escalated => {},
                 .recovered => log.warn("supervisor: daemon {d} answers again", .{pid}),
-                .grace => |for_ns| log.warn("supervisor: daemon {d} missed a probe ({d} s unresponsive; grace window {d} s)", .{ pid, for_ns / std.time.ns_per_s, policy.unresponsive_after_ns / std.time.ns_per_s }),
+                .grace => |for_ns| log.warn("supervisor: daemon {d} missed a probe ({s}; {d} s unresponsive; grace window {d} s)", .{ pid, kind.text(), for_ns / std.time.ns_per_s, policy.unresponsive_after_ns / std.time.ns_per_s }),
                 .escalate => |for_ns| {
                     escalated = true;
-                    escalate(io, pid, conn, for_ns, policy);
+                    escalate(io, pid, conn, for_ns, kind, policy);
                     return 1;
                 },
             }
@@ -311,10 +426,60 @@ test "state machine: escalates exactly once after the threshold; a success re-ar
     try testing.expectEqual(Verdict{ .escalate = 30 * std.time.ns_per_s }, s.observe(1000 + 436 * std.time.ns_per_s, false, p));
 }
 
-test "constants: the probe reaches the daemon past the 1 s attr TTL; six probes to escalation; the abort grace is one lock-plane tick" {
+test "constants: the probe reaches the daemon past the 1 s attr TTL; six probes to escalation; a heartbeat is stale after two ticks; the abort grace is one lock-plane tick" {
     try testing.expect(PROBE_INTERVAL_NS > std.time.ns_per_s);
     try testing.expectEqual(@as(u64, 6), UNRESPONSIVE_NS / PROBE_INTERVAL_NS);
+    try testing.expectEqual(2 * PROBE_INTERVAL_NS, HEARTBEAT_STALE_NS);
+    try testing.expect(HEARTBEAT_STALE_NS < UNRESPONSIVE_NS);
     try testing.expectEqual(tick_law.tick_ns, ABORT_GRACE_NS);
+}
+
+test "the probe kind follows the mount's attachment: the control inode while attached, the heartbeat once detached" {
+    try testing.expectEqual(ProbeKind.control_inode, probeKind(true));
+    try testing.expectEqual(ProbeKind.heartbeat, probeKind(false));
+}
+
+test "heartbeat: a never-stamped page is stale; a beat is fresh for two ticks and stale after; the daemon's beat is readable through the page" {
+    var h: Heartbeat = .{};
+    try testing.expect(!h.fresh(100 * std.time.ns_per_s, HEARTBEAT_STALE_NS));
+    @atomicStore(u64, &h.tick_ns, 50 * std.time.ns_per_s, .release);
+    try testing.expect(h.fresh(50 * std.time.ns_per_s + HEARTBEAT_STALE_NS - 1, HEARTBEAT_STALE_NS));
+    try testing.expect(!h.fresh(50 * std.time.ns_per_s + HEARTBEAT_STALE_NS, HEARTBEAT_STALE_NS));
+    // A clock that reads earlier than the stamp (another process's view)
+    // is fresh, never a wrap.
+    try testing.expect(h.fresh(49 * std.time.ns_per_s, HEARTBEAT_STALE_NS));
+    h.beat();
+    try testing.expect(h.fresh(clock.monotonicNs(), HEARTBEAT_STALE_NS));
+    try testing.expect(h.lastNs() != 0);
+}
+
+test "a detached mount under heartbeat: fresh beats keep the machine healthy through the teardown; a daemon whose beats stop is escalated on the same 30 s law" {
+    const p: Policy = .{};
+    var h: Heartbeat = .{};
+    var s = State.init(0);
+    // Beats every tick for a minute: healthy throughout.
+    var t: u64 = PROBE_INTERVAL_NS;
+    while (t <= 60 * std.time.ns_per_s) : (t += PROBE_INTERVAL_NS) {
+        @atomicStore(u64, &h.tick_ns, t - 1, .release);
+        try testing.expectEqual(Verdict.healthy, s.observe(t, h.fresh(t, p.heartbeat_stale_ns), p));
+    }
+    // The beats stop: stale after two ticks, escalated 30 s after the last OK.
+    const last_ok = t - PROBE_INTERVAL_NS;
+    var verdicts: usize = 0;
+    while (t < last_ok + 60 * std.time.ns_per_s) : (t += PROBE_INTERVAL_NS) {
+        const v = s.observe(t, h.fresh(t, p.heartbeat_stale_ns), p);
+        switch (v) {
+            .healthy => try testing.expect(t - last_ok < HEARTBEAT_STALE_NS),
+            .grace => |for_ns| try testing.expect(for_ns < UNRESPONSIVE_NS),
+            .escalate => |for_ns| {
+                verdicts += 1;
+                try testing.expect(for_ns >= UNRESPONSIVE_NS);
+            },
+            .escalated => {},
+            .recovered => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), verdicts);
 }
 
 test "waiting parses one decimal line" {

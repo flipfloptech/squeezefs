@@ -16,16 +16,19 @@
 //! to stderr and exits 1; on `ready` it exits 0 silently. Without
 //! `--supervise` C1 exits right after the relay (C2 is reparented to init);
 //! with it C1 stays as the external supervisor (`supervisor.zig`) over C2,
-//! which is its child — so it can reap it and name its wait status.
+//! which is its child — so it can reap it and name its wait status — and
+//! the two share one anonymous page mapped before the fork: the daemon's
+//! heartbeat, the supervisor's probe once the mount is no longer attached.
 //!
 //! The fork happens BEFORE the executor starts a single thread (the knob
 //! gate and the argument parse are the only work done so far), so the
 //! children never inherit a half-built thread state.
 //!
 //! Signals (charter §9 "stop latches, never abort from outside"): the
-//! daemon installs ONE handler for SIGTERM/SIGINT (latch stop) and SIGUSR1
-//! (dump the stats to the log — the `.stats` inode's stand-in until rung
-//! 5); the handler only ORs a bit into an atomic and writes the daemon's
+//! daemon installs ONE handler for SIGTERM/SIGINT (the orderly stop —
+//! refused while the mount is busy, decision 0003 §S), SIGUSR2 (the lazy
+//! stop: `squeezefs umount --lazy`) and SIGUSR1 (dump the stats to the
+//! log); the handler only ORs a bit into an atomic and writes the daemon's
 //! eventfd (both async-signal-safe); the main task waits on that eventfd
 //! through its lane ring (`SqzIo.readable`) and acts in its own context.
 //! SIGPIPE is ignored (a relay pipe closed early must not kill a mount).
@@ -155,8 +158,9 @@ fn makePipe() ?[2]linux.fd_t {
 pub const Role = union(enum) {
     /// This process is the shell's child: the exit code to return.
     parent: u8,
-    /// This process is the daemon: report through the reporter.
-    daemon: Reporter,
+    /// This process is the daemon: report through the reporter; beat the
+    /// heartbeat page when the supervisor watches (`--supervise`).
+    daemon: struct { reporter: Reporter, heartbeat: ?*supervisor.Heartbeat },
 };
 
 pub const Options = struct {
@@ -217,6 +221,9 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
         writeAll(pipe_a[1], "pipe failed in the intermediate process\n");
         linux.exit(1);
     };
+    // The heartbeat page BEFORE the fork, so both processes map the one
+    // page (`MAP_SHARED|MAP_ANONYMOUS` survives a fork as shared memory).
+    const heartbeat: ?*supervisor.Heartbeat = if (opts.supervise) supervisor.linux_loop.mapHeartbeat() else null;
     const pid2 = fork() orelse {
         writeAll(pipe_a[1], "fork failed in the intermediate process\n");
         linux.exit(1);
@@ -225,7 +232,7 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
         // C2: the daemon (stdio already C1's).
         _ = linux.close(pipe_a[1]);
         _ = linux.close(pipe_b[0]);
-        return .{ .daemon = .{ .fd = pipe_b[1] } };
+        return .{ .daemon = .{ .reporter = .{ .fd = pipe_b[1] }, .heartbeat = heartbeat } };
     }
     // C1: the inherited key material goes first (the daemon owns it now),
     // then relay B → A, then exit or supervise.
@@ -244,7 +251,7 @@ pub fn detach(gpa: std.mem.Allocator, io: Io, opts: Options, stderr: *Io.Writer)
         linux.exit(1);
     }
     if (!opts.supervise) linux.exit(0);
-    linux.exit(supervisor.linux_loop.run(gpa, io, pid2, opts.mountpoint, opts.policy));
+    linux.exit(supervisor.linux_loop.run(gpa, io, pid2, opts.mountpoint, opts.policy, heartbeat));
 }
 
 fn fork() ?linux.pid_t {
@@ -273,6 +280,10 @@ fn redirectStdioTo(fd: linux.fd_t) void {
 /// Pending-signal bits (ORed by the handler, swapped out by the main task).
 pub const SIG_STOP: u32 = 1 << 0;
 pub const SIG_STATS: u32 = 1 << 1;
+/// SIGUSR2: `squeezefs umount --lazy` (decision 0003 §S shape b) — detach
+/// the mountpoint now and serve its holders until the kernel ends the
+/// connection; an unheld mount stops orderly like SIGTERM.
+pub const SIG_STOP_LAZY: u32 = 1 << 2;
 
 /// The one process-wide signal word and the eventfd it rings. Installed
 /// once per process (`Signals.install`), before any thread exists.
@@ -301,6 +312,7 @@ pub const Signals = struct {
         _ = linux.sigaction(.TERM, &act, null);
         _ = linux.sigaction(.INT, &act, null);
         _ = linux.sigaction(.USR1, &act, null);
+        _ = linux.sigaction(.USR2, &act, null);
         var ign: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
         _ = linux.sigaction(.PIPE, &ign, null);
     }
@@ -331,6 +343,7 @@ pub const Signals = struct {
         const bit: u32 = switch (sig) {
             .TERM, .INT => SIG_STOP,
             .USR1 => SIG_STATS,
+            .USR2 => SIG_STOP_LAZY,
             else => return,
         };
         // release pairs with `take`'s acq_rel: the main task sees the bit
@@ -406,6 +419,9 @@ test "signals: the handler latches TERM as stop and USR1 as the stats bit, rings
     Signals.drain();
     try testing.expectEqual(SIG_STOP, Signals.take());
     try testing.expectEqual(@as(u32, 0), Signals.take());
+    Signals.handle(.USR2);
+    Signals.drain();
+    try testing.expectEqual(SIG_STOP_LAZY, Signals.take());
     Signals.handle(.HUP);
     try testing.expectEqual(@as(u32, 0), Signals.take());
 }

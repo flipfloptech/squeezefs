@@ -149,6 +149,12 @@ pub fn unmount(io: Io, mountpoint: []const u8) bool {
         _ = linux.nanosleep(&ts, null);
     }
     log.warn("fusermount3 -u {s} stayed busy for {d} × {d} ms; detaching lazily", .{ mountpoint, UMOUNT_RETRIES, UMOUNT_RETRY_NS / std.time.ns_per_ms });
+    return unmountLazy(io, mountpoint);
+}
+
+/// `fusermount3 -u -z`: the lazy detach alone (`squeezefs umount --lazy`
+/// on an unprivileged mount); true once detached.
+pub fn unmountLazy(io: Io, mountpoint: []const u8) bool {
     return runHelper(io, &.{ helper, "-u", "-z", "--", mountpoint });
 }
 

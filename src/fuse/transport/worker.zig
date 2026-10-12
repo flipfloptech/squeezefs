@@ -314,7 +314,9 @@ pub var retained_released_at_teardown: counters.ShardedCounter = .{};
 /// `transport_retained_kernel_drained`: retained slots the drain found on
 /// a connection already gone, or whose RELEASE met one (`-ENOTCONN`: an
 /// external `umount(8)`, a sysfs abort or a lazy detach beat the drain) —
-/// the kernel's drain owns them. Non-zero only on a disconnect not ours.
+/// the kernel's drain owns them. Non-zero only on a disconnect the kernel
+/// began: an external `umount(8)`, or the end of a lazily detached mount
+/// (`squeezefs umount --lazy`) once its last holder left.
 pub var retained_kernel_drained: counters.ShardedCounter = .{};
 /// `transport_zc_releases_inflight`: RELEASE SQEs pushed whose CQE is not
 /// yet reaped — the RELEASE ledger's closure term (`releases − verdicts`),
@@ -517,6 +519,11 @@ pub const Shared = struct {
     /// The session's liveness: flipped once by `shutdown`; every worker
     /// drains when it reads false.
     active: std.atomic.Value(bool) = .init(true),
+    /// The teardown detached the mountpoint lazily with a holder still on
+    /// it (the session's race-case exit): no umount straggler can arrive and
+    /// no holder will end the connection, so the residency has nothing to
+    /// wait for (the connection ends at the process's exit).
+    detached: std.atomic.Value(bool) = .init(false),
     /// The arm barrier: queues whose REGISTERs were all PUSHED.
     queues_registered: std.atomic.Value(u32) = .init(0),
     /// Completed by the worker that pushes the last queue's REGISTERs, or by
@@ -2582,10 +2589,12 @@ pub const Group = struct {
     }
 
     /// Stay resident up to 30 s answering fresh deliveries ENOTCONN, in
-    /// bounded parks on this ring; exit on a disconnect.
+    /// bounded parks on this ring; exit on a disconnect, or at once when
+    /// the session detached the mount lazily (acquire pairs with
+    /// `unmountDetached`'s release).
     fn residency(self: *Group) void {
         const deadline = clock.monotonicNs() + RESIDENCY_NS;
-        while (!self.disconnected and !self.ring.isDead()) {
+        while (!self.disconnected and !self.ring.isDead() and !self.shared.detached.load(.acquire)) {
             const now = clock.monotonicNs();
             if (now >= deadline) {
                 log.warn("transport: group {d}: residency backstop lapsed with {d} slot(s) owing", .{ self.index, self.owedCount() });

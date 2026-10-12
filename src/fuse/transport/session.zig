@@ -48,6 +48,7 @@ const log = @import("../../core/log.zig");
 const knobs = @import("../../core/knobs.zig");
 const derive = @import("../../core/derive.zig");
 const thread_name = @import("../../core/thread_name.zig");
+const mountinfo = @import("../../core/mountinfo.zig");
 const futex = @import("../../sync/futex.zig");
 const mpmc = @import("../../sync/mpmc.zig");
 const completion = @import("../../sync/completion.zig");
@@ -141,6 +142,10 @@ pub var arena_bytes: counters.Gauge = .{};
 /// `transport_umount_busy_retries`: plain `umount2` attempts that met EBUSY
 /// inside the retry window.
 pub var umount_busy_retries: counters.ShardedCounter = .{};
+/// `transport_umount_busy_refusals`: orderly stops (SIGTERM, `squeezefs
+/// umount`) refused because the holder census found the mount busy
+/// (decision 0003 §S); the daemon kept serving.
+pub var umount_busy_refusals: counters.ShardedCounter = .{};
 /// `transport_zc_bounce_reserve_bytes`: the zc bounce slab's virtual
 /// reserve (`nqueues × depth × stride`); the pages it holds are
 /// `worker.zc_bounce_resident_bytes` (`transport_zc_bounce_bytes`), the
@@ -210,11 +215,11 @@ pub const Hook = struct {
     }
 };
 
-/// The unprivileged path's unmounter (`fusermount3 -u`): true once the
-/// mountpoint is detached.
+/// The unprivileged path's unmounter (`fusermount3 -u`, `-u -z` when
+/// `lazy`): true once the mountpoint is detached.
 pub const Unmounter = struct {
     ctx: *anyopaque,
-    call: *const fn (ctx: *anyopaque, mountpoint: [:0]const u8) bool,
+    call: *const fn (ctx: *anyopaque, mountpoint: [:0]const u8, lazy: bool) bool,
 };
 
 pub const Config = struct {
@@ -651,6 +656,10 @@ pub const Session = struct {
     /// could detach a NEW mount at the path) — release there, acquire in
     /// `unmount`, ordered through `shutdown`'s swap.
     mounted: std.atomic.Value(bool) = .init(false),
+    /// The mount's id in the mount table at `mount(2)` (null when the table
+    /// was unreadable): the proof `unmount` demands before an `umount2` by
+    /// path.
+    mount_id: ?u64 = null,
     unmounter: ?Unmounter = null,
     on_shutdown: ?Hook = null,
     init_reply: codec.InitReply = undefined,
@@ -926,6 +935,10 @@ pub const Session = struct {
         }
         self.mounted.store(true, .release);
         errdefer self.unmountDetached();
+        // The mount's identity: every later `umount2` by path first proves
+        // the mount at the path is still THIS one (a kernel-ended mount
+        // may have a successor at the same path by the time we tear down).
+        if (self.mountEntry()) |e| self.mount_id = e.id;
 
         // 1. The classical INIT read on the sideband ring. The buffer covers
         //    any max_write the plan can reach (`limit × page`) plus a header
@@ -1260,15 +1273,25 @@ pub const Session = struct {
 
     /// A plain `umount2` first: the drain already answered every blocked
     /// caller, so the only EBUSY left is a caller still returning from its
-    /// syscall or closing its fd — a bounded retry, never a lazy detach by
-    /// default (that would hide an owed reply behind MNT_DETACH).
+    /// syscall or closing its fd — a bounded retry. The orderly stop
+    /// (decision 0003 §S) runs the holder census BEFORE this teardown and
+    /// refuses a busy mount while it still serves; an EBUSY that outlives
+    /// the window here is a holder that arrived inside the drain's
+    /// milliseconds, and the session is already drained — the lazy detach
+    /// is the one remaining honest exit (loud; the straggler's next request
+    /// answers ENOTCONN, the connection ends at this daemon's exit).
     fn unmount(self: *Session) void {
         if (!self.mounted.load(.acquire)) return;
+        if (!self.stillOurs()) {
+            log.info("transport: {s} is no longer this session's mount (detached externally, or a successor mounted there) — nothing to unmount", .{self.mountpoint});
+            self.mounted.store(false, .release);
+            return;
+        }
         if (self.unmounter) |u| {
             // The unprivileged path: `fusermount3 -u` (bounded retries
             // inside); a failure leaves the mount for the operator — a
             // non-root process has no `MNT_DETACH`.
-            if (!u.call(u.ctx, self.mountpoint)) log.err("transport: fusermount3 -u {s} failed — a mount is left behind", .{self.mountpoint});
+            if (!u.call(u.ctx, self.mountpoint, false)) log.err("transport: fusermount3 -u {s} failed — a mount is left behind", .{self.mountpoint});
             self.mounted.store(false, .release);
             return;
         }
@@ -1280,20 +1303,25 @@ pub const Session = struct {
                 self.mounted.store(false, .release);
                 return;
             }
-            if (e != .BUSY or clock.monotonicNs() >= deadline) {
-                log.warn("transport: umount2({s}) failed ({t}); detaching lazily", .{ self.mountpoint, e });
-                self.unmountDetached();
-                return;
+            if (e == .BUSY and clock.monotonicNs() < deadline) {
+                umount_busy_retries.inc();
+                std.Thread.yield() catch {};
+                continue;
             }
-            umount_busy_retries.inc();
-            std.Thread.yield() catch {};
+            if (e == .BUSY) {
+                log.warn("transport: umount2({s}) still EBUSY {d} s after the drain — a holder arrived after the stop's census; detaching lazily: its next request answers ENOTCONN and the connection ends at this daemon's exit", .{ self.mountpoint, UMOUNT_RETRY_NS / std.time.ns_per_s });
+            } else {
+                log.warn("transport: umount2({s}) failed ({t}); detaching lazily", .{ self.mountpoint, e });
+            }
+            self.unmountDetached();
+            return;
         }
     }
 
     fn unmountDetached(self: *Session) void {
         if (!self.mounted.load(.acquire)) return;
         if (self.unmounter) |u| {
-            if (!u.call(u.ctx, self.mountpoint)) log.err("transport: fusermount3 -u {s} failed — a mount is left behind", .{self.mountpoint});
+            if (!u.call(u.ctx, self.mountpoint, true)) log.err("transport: fusermount3 -u -z {s} failed — a mount is left behind", .{self.mountpoint});
             self.mounted.store(false, .release);
             return;
         }
@@ -1301,11 +1329,62 @@ pub const Session = struct {
         const rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
         if (linux.errno(rc) != .SUCCESS) log.err("transport: umount2({s}, MNT_DETACH) failed ({t}) — a mount is left behind", .{ self.mountpoint, linux.errno(rc) });
         self.mounted.store(false, .release);
+        // The workers' residency has nothing to wait for on a detached
+        // connection no holder will end (release pairs with the residency
+        // loop's acquire).
+        self.shared.detached.store(true, .release);
         // A detached superblock lives on behind any open fd, and the uring
         // queues hold the connection's devs, so closing our fd never aborts
         // it: a later FLUSH on that fd would wait forever. fusectl's abort
         // ends it (when fusectl is mounted; the supervisor's last rung).
         if (minor) |m| self.abortConnection(m);
+    }
+
+    /// `squeezefs umount --lazy` (decision 0003 §S shape b): detach the
+    /// mountpoint NOW — `MNT_DETACH`, `fusermount3 -u -z` unprivileged —
+    /// and keep serving every request on the detached superblock until the
+    /// kernel ends the connection (the last holder's reference drops → the
+    /// sideband's read answers the disconnect → `shutdown` → the daemon's
+    /// teardown). False when nothing is attached (already detached or the
+    /// detach refused); the caller logs either way.
+    pub fn detachLazily(self: *Session) bool {
+        if (!self.mounted.load(.acquire)) return false;
+        if (!self.stillOurs()) {
+            self.mounted.store(false, .release);
+            return false;
+        }
+        if (self.unmounter) |u| {
+            const ok = u.call(u.ctx, self.mountpoint, true);
+            if (ok) self.mounted.store(false, .release);
+            return ok;
+        }
+        const rc = linux.umount2(self.mountpoint.ptr, linux.MNT.DETACH);
+        if (linux.errno(rc) != .SUCCESS) {
+            log.err("transport: umount2({s}, MNT_DETACH) failed ({t}) — the mount stays attached", .{ self.mountpoint, linux.errno(rc) });
+            return false;
+        }
+        self.mounted.store(false, .release);
+        return true;
+    }
+
+    const MountIdentity = struct { id: u64, dev_minor: u32 };
+
+    /// The mount table's entry at our mountpoint (the last line wins), by
+    /// value: the table's buffer does not outlive the call.
+    fn mountEntry(self: *Session) ?MountIdentity {
+        const buf = self.gpa.alloc(u8, mountinfo.READ_BYTES) catch return null;
+        defer self.gpa.free(buf);
+        const text = mountinfo.read(self.io, buf);
+        const e = mountinfo.entryAt(text, self.mountpoint) orelse return null;
+        return .{ .id = e.id, .dev_minor = e.dev_minor };
+    }
+
+    /// Is the mount at our path still the one we made? An unreadable table
+    /// (no procfs) answers yes: the path is then the only fact there is.
+    fn stillOurs(self: *Session) bool {
+        const want = self.mount_id orelse return true;
+        const e = self.mountEntry() orelse return false;
+        return e.id == want;
     }
 
     /// The mountpoint's device minor = the fusectl connection id, read from
@@ -1314,9 +1393,8 @@ pub const Session = struct {
     /// reply was never written (the refused-mode path) and is a request to
     /// our own mount on every other.
     fn connectionMinor(self: *Session) ?u32 {
-        var buf: [64 * 1024]u8 = undefined;
-        const text = Io.Dir.cwd().readFile(self.io, "/proc/self/mountinfo", &buf) catch return null;
-        return mountinfoMinor(text, self.mountpoint);
+        const e = self.mountEntry() orelse return null;
+        return e.dev_minor;
     }
 
     /// `/sys/fs/fuse/connections/<minor>/abort` ← 1 (a control write through
@@ -1477,6 +1555,8 @@ pub const Session = struct {
         try field(w, "transport_enters", worker.enters.load());
         try field(w, "transport_passes", worker.passes.load());
         try field(w, "transport_residency_replies", worker.residency_replies.load());
+        try field(w, "transport_umount_busy_retries", umount_busy_retries.load());
+        try field(w, "transport_umount_busy_refusals", umount_busy_refusals.load());
         try field(w, "transport_commit_batch_flushes", worker.commit_batch_flushes.load());
         try field(w, "transport_commit_batch_commits", worker.commit_batch_commits.load());
         try w.writeAll("\"transport_commit_batch\":{");
@@ -1522,24 +1602,11 @@ pub fn ensureKernelUringEnabled(io: Io) void {
 }
 
 /// The device MINOR of the mount at `mountpoint` from a `mountinfo` text
-/// (fields: `id parent major:minor root MOUNTPOINT …`; a mountpoint with
-/// spaces is octal-escaped there, which our paths never are). The LAST
-/// matching line wins (a later mount over the same path shadows).
+/// (`core/mountinfo.zig`: the last matching line wins; a malformed line
+/// is no record).
 pub fn mountinfoMinor(text: []const u8, mountpoint: []const u8) ?u32 {
-    var found: ?u32 = null;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        var it = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = it.next() orelse continue;
-        _ = it.next() orelse continue;
-        const majmin = it.next() orelse continue;
-        _ = it.next() orelse continue;
-        const mp = it.next() orelse continue;
-        if (!std.mem.eql(u8, mp, mountpoint)) continue;
-        const colon = std.mem.indexOfScalar(u8, majmin, ':') orelse continue;
-        found = std.fmt.parseInt(u32, majmin[colon + 1 ..], 10) catch continue;
-    }
-    return found;
+    const e = mountinfo.entryAt(text, mountpoint) orelse return null;
+    return e.dev_minor;
 }
 
 /// The parameter's current verdict (null when unreadable: no FUSE module
@@ -2263,8 +2330,8 @@ test "e2e lattice: the kmbuf ring answering ENOMEM after every retry (the seam) 
     try testing.expectEqual(retries_before + kmbuf.REGISTER_RETRIES, kmbuf.register_retries.load());
     try testing.expectEqual(pinned_before, kmbuf.pinned_bytes.load());
     var mi_buf: [64 * 1024]u8 = undefined;
-    const mountinfo = try Io.Dir.cwd().readFile(testing.io, "/proc/self/mountinfo", &mi_buf);
-    try testing.expectEqual(@as(?u32, null), mountinfoMinor(mountinfo, rig.path));
+    const table = try Io.Dir.cwd().readFile(testing.io, "/proc/self/mountinfo", &mi_buf);
+    try testing.expectEqual(@as(?u32, null), mountinfoMinor(table, rig.path));
 }
 
 test "e2e zc READ: /big moves through the fd-source leg from the fill pool (zc_serve_bytes ≡ user bytes, daemon copies 0, every reply rode the slot); with SQUEEZEFS_READ_ZC_SERVE=0 the bounce leg serves with ONE copy per READ" {

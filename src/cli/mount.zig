@@ -83,6 +83,7 @@ const args = @import("args.zig");
 const uri = @import("uri.zig");
 const daemon = @import("daemon.zig");
 const fusermount = @import("fusermount.zig");
+const holders = @import("holders.zig");
 const exec = @import("../exec/exec.zig");
 const meta_set = @import("../meta/meta_set.zig");
 const guard = @import("../meta/guard.zig");
@@ -162,6 +163,9 @@ const Ctx = struct {
     join: ?[]const u8,
     /// The raw `-o` string (the fusermount3 path forwards it).
     reporter: ?daemon.Reporter,
+    /// The supervisor's shared page (`--daemon --supervise`): the watchdog
+    /// tick beats it for the mount's whole life, teardown included.
+    heartbeat: ?*cli.supervisor.Heartbeat = null,
     session_ended: std.atomic.Value(bool) = .init(false),
     /// The verified volume key of an encrypted set (zeroized once the plane
     /// holds its crypto state).
@@ -202,9 +206,9 @@ fn onSessionShutdown(ctx_ptr: *anyopaque) void {
 
 const UnmountCtx = struct {
     io: Io,
-    fn call(ctx_ptr: *anyopaque, mountpoint: [:0]const u8) bool {
+    fn call(ctx_ptr: *anyopaque, mountpoint: [:0]const u8, lazy: bool) bool {
         const self: *UnmountCtx = @ptrCast(@alignCast(ctx_ptr));
-        return fusermount.unmount(self.io, mountpoint);
+        return if (lazy) fusermount.unmountLazy(self.io, mountpoint) else fusermount.unmount(self.io, mountpoint);
     }
 };
 
@@ -296,6 +300,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
     // `--daemon`: the log file first (its refusal reaches the terminal),
     // then the fork — before any thread exists.
     var reporter: ?daemon.Reporter = null;
+    var heartbeat: ?*cli.supervisor.Heartbeat = null;
     if (m.daemon) {
         var lf_buf: [linux.PATH_MAX:0]u8 = undefined;
         const lfz = std.fmt.bufPrintSentinel(&lf_buf, "{s}", .{m.log_file.?}, 0) catch {
@@ -309,7 +314,8 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
             // (the `defer` above): the child owns the key material now.
             .parent => |code| return code,
             .daemon => |r| {
-                reporter = r;
+                reporter = r.reporter;
+                heartbeat = r.heartbeat;
                 // C2: re-harden (a forked child's dumpable flag may be
                 // cleared again by a later exec-less transition; the
                 // reference re-issues it on every call for the same reason).
@@ -355,6 +361,7 @@ pub fn run(p: cli.Process, m: args.Mount) u8 {
         .opts = opts,
         .join = m.join,
         .reporter = reporter,
+        .heartbeat = heartbeat,
         .stash = stash,
         .fabric = mount_fabric.Plan.init(p.gpa),
     };
@@ -664,8 +671,12 @@ fn mountMain(ctx: *Ctx) u8 {
     var sampler_live = true;
     defer if (sampler_live) mem_budget.authority.stopSampler(ctx.p.io);
 
-    // 5. The watchdog loop and the reclaim cadence on the meta pool.
+    // 5. The watchdog loop and the reclaim cadence on the meta pool. The
+    //    watchdog's tick beats the supervisor's heartbeat and runs until
+    //    the end of the teardown (the supervisor judges a detached or
+    //    unmounting daemon by it; a long dismount pass is not a wedge).
     var wd = watchdog.Watchdog.init(&registry);
+    if (ctx.heartbeat) |h| wd.on_tick = .{ .ctx = h, .call = &beatHeartbeat };
     var wd_fut = ctx.sqz.spawnMeta(watchdogMain, .{ &wd, io }) catch return ctx.failed("cannot spawn the watchdog", .{});
     var reclaim: ReclaimCadence = .{ .fs = &fs, .io = io, .wire = wire, .plane = plane, .node = node };
     var reclaim_fut = ctx.sqz.spawnMeta(ReclaimCadence.run, .{&reclaim}) catch {
@@ -708,8 +719,6 @@ fn mountMain(ctx: *Ctx) u8 {
     }
     host_live = false;
     session.close();
-    wd.requestStop();
-    wd_fut.cancel(io);
     reclaim.requestStop();
     reclaim_fut.cancel(io);
     if (times_drain_fut) |*f| {
@@ -766,6 +775,10 @@ fn mountMain(ctx: *Ctx) u8 {
     plane.close();
     be_open = false;
     be.close();
+    // The watchdog last: its tick is the heartbeat the supervisor judged
+    // the whole teardown by.
+    wd.requestStop();
+    wd_fut.cancel(io);
     if (failed) {
         log.err("a member of {s} latched FAILED during this mount (EIO until remount) — exiting 1", .{ctx.meta_uri});
         return cli.exit_failed;
@@ -991,6 +1004,12 @@ fn watchdogMain(wd: *watchdog.Watchdog, io: Io) void {
     wd.run(io);
 }
 
+/// The watchdog's tick hook: stamp the supervisor's page.
+fn beatHeartbeat(ctx: *anyopaque) void {
+    const h: *cli.supervisor.Heartbeat = @ptrCast(@alignCast(ctx));
+    h.beat();
+}
+
 /// The periodic drain of the corpse gather (module doc).
 const ReclaimCadence = struct {
     fs: *BackendFs,
@@ -1100,6 +1119,17 @@ const HeldStore = struct {
     }
 };
 
+/// The serve loop: parks on the daemon's eventfd; returns when the
+/// teardown may begin. A stop (SIGTERM/SIGINT, what `squeezefs umount`
+/// sends) first runs the holder census (decision 0003 §S): a busy mount
+/// REFUSES the stop — logged with its holders, counted
+/// (`transport_umount_busy_refusals`), the daemon serving on — because an
+/// orderly unmount of a busy mount is EBUSY on every Linux filesystem and
+/// the teardown's drains cannot be undone once begun. The lazy stop
+/// (SIGUSR2, `umount --lazy`) detaches an unheld mount orderly (the same
+/// drain-first teardown) and a held one NOW, serving its holders until the
+/// kernel ends the connection (the sideband's disconnect fires the
+/// `on_shutdown` hook, and the teardown runs then).
 fn serve(ctx: *Ctx, session: *Session, vs: *VirtualSource) void {
     const efd = daemon.Signals.eventfd();
     while (true) {
@@ -1110,8 +1140,26 @@ fn serve(ctx: *Ctx, session: *Session, vs: *VirtualSource) void {
         daemon.Signals.drain();
         const bits = daemon.Signals.take();
         if (bits & daemon.SIG_STATS != 0) dumpStats(vs);
-        if (bits & daemon.SIG_STOP != 0) {
-            log.info("stop requested (SIGTERM/SIGINT): unmounting {s}", .{ctx.mountpoint});
+        if (bits & (daemon.SIG_STOP | daemon.SIG_STOP_LAZY) != 0) {
+            const lazy = bits & daemon.SIG_STOP_LAZY != 0;
+            const what: []const u8 = if (lazy) "lazy stop requested (SIGUSR2)" else "stop requested (SIGTERM/SIGINT)";
+            // The census over everyone but this process (its own fds are
+            // the devices and the staging segments, never the mount).
+            const c = holders.censusAt(ctx.p.gpa, ctx.p.io, ctx.mountpoint, &.{linux.getpid()});
+            if (c != null and c.?.busy()) {
+                if (!lazy) {
+                    log.warn("{s} but {s} is busy ({f}) — not unmounting; still serving (`squeezefs umount` retries when they are gone; `--lazy` detaches now and serves them to the end)", .{ what, ctx.mountpoint, c.? });
+                    transport.session.umount_busy_refusals.inc();
+                    continue;
+                }
+                if (session.detachLazily()) {
+                    log.warn("{s}: {s} detached lazily with {f} — serving them until the kernel ends the connection, then tearing down", .{ what, ctx.mountpoint, c.? });
+                } else {
+                    log.warn("{s}: {s} is no longer attached — the connection ends when its last holder leaves ({f})", .{ what, ctx.mountpoint, c.? });
+                }
+                continue;
+            }
+            log.info("{s}: unmounting {s}", .{ what, ctx.mountpoint });
             return;
         }
         // acquire pairs with the hook's release.
@@ -1170,6 +1218,7 @@ const VirtualSource = struct {
 
 const testing = std.testing;
 
-test "the reclaim cadence is one watchdog tick" {
+test "the reclaim cadence is one watchdog tick; the supervisor's probe interval is that tick (its heartbeat is the watchdog's)" {
     try testing.expectEqual(watchdog.TICK_NS, RECLAIM_CADENCE_NS);
+    try testing.expectEqual(watchdog.TICK_NS, cli.supervisor.PROBE_INTERVAL_NS);
 }

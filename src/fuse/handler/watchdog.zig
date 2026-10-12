@@ -325,18 +325,27 @@ pub const Watchdog = struct {
     registry: *Registry,
     stop: std.atomic.Value(bool) = .init(false),
     ticks: std.atomic.Value(u64) = .init(0),
+    /// Fired after every tick's scan (the daemon's supervisor heartbeat:
+    /// a tick that lands is the proof the meta lane schedules).
+    on_tick: ?TickHook = null,
+
+    pub const TickHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque) void,
+    };
 
     pub fn init(registry: *Registry) Watchdog {
         return .{ .registry = registry };
     }
 
     /// One tick at `now_ns`: refresh the coarse clock, derive the
-    /// thresholds, scan.
+    /// thresholds, scan, fire the hook.
     pub fn tickOnce(self: *Watchdog, now_ns: u64) Registry.TickReport {
         self.registry.refreshCoarse(now_ns);
         const thresholds = deriveThresholds();
         const r = self.registry.tick(now_ns, &thresholds);
         _ = self.ticks.fetchAdd(1, .monotonic);
+        if (self.on_tick) |h| h.call(h.ctx);
         return r;
     }
 

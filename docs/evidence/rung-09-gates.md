@@ -239,7 +239,7 @@ after the bench edit, `1` after the shim identity) with
 `scripts/rails-literal-rebase` — the line-keyed row is the brittleness the
 rail's law bought; the rebase never admits a literal.
 
-Three gate hazards made deterministic afterwards (all test-side; no product
+Four gate hazards made deterministic afterwards (all test-side; no product
 bug underneath):
 
 - **`write_admit` "dead victim"** (`5db4540`, rung 9 F2): the pin spawned
@@ -289,8 +289,84 @@ bug underneath):
   shim census 1/1, smoke 60 / 2 / 1 fail beside the suites agent (daemon
   C's kmbuf order-8 ENOMEM, the known venue refusal) and **61 pass / 2 skip**
   with bench-smoke 40, shim-smoke 40, nvmet-smoke 51 on the immediate re-run.
+- **The smoke's `kill -9 mid-tar -x` row judged at the FILE grain where the
+  charter's promise is the WRITE(2) grain** (found by the definitive gate
+  at `585152f`: `f199` read **512 bytes, not whole** → `error.TornFile`,
+  once in weeks of gates). The tree is 1,500 entries of exactly 1,000 B
+  (`file-NNNNN:` + 989 letters) archived with `tar -cf ktree.tar -C ktree .`
+  — a 512 B header + 1,000 B of data padded to 1,024 B per entry, the `./`
+  directory header first. GNU tar 1.35 reads the archive in records of
+  `-b20` × 512 B = 10,240 B (`tar --show-defaults`) and `extract_file`
+  issues one `write(2)` per record-contiguous span (`available_space_after`),
+  so an entry whose data straddles a record boundary is extracted as TWO
+  writes. The arithmetic: entry *i*'s header sits at block 1 + 3*i* (the
+  `./` header is block 0), its data at blocks 2 + 3*i* and 3 + 3*i*; the
+  data straddles iff 2 + 3*i* ≡ 19 (mod 20) ⇔ *i* ≡ **19 (mod 20)** — not
+  the ≡ 6 a headerless archive would give. **strace of `tar -xf` on a
+  scratch ext4 dir** (`-f -e trace=write,openat`, the same archive): 1,500
+  files, **75 written in two calls — exactly f19, f39, …, f199, …, f1499
+  (every archive index ≡ 19 mod 20), each `write(…, 512) = 512` then
+  `write(…, 488) = 488`**; the other 1,425 one `write(…, 1000)`. `tar -R
+  -tf` confirms the layout (`block 0: ./`, `block 1: ./f0`, `block 58:
+  ./f19`, `block 61: ./f20`). The row kills at ≥ 200 files visible, so the
+  entry in flight at the kill is usually **f199 — a two-write entry**: the
+  kill lands between an entry's two writes far more often than 75 in 1,500.
+  **The repro** (a driver mirroring the row: format, mount, `tar -xf` under
+  strace, SIGKILL at 200 visible, remount, read every file; 40 rounds under
+  strace, 40 without): **29/40** rounds under strace and **17/40** without
+  (the row's 5 ms poll cadence makes it rarer still) ended with ONE
+  non-whole file, **f199 at 512 B every time, byte-equal to the expected
+  body's prefix**, `st_size` 512; tar's own ledger beside it in all 29:
+  `openat(4, "f199", O_CREAT|O_EXCL) = 5`, then in 25 `write(5, …, 512) =
+  512` followed by `write(5, …, 488) = -1 ECONNABORTED` (16) or `ECANCELED`
+  (9) — the second write never acked — and in 4 `write(5, …, 512) = -1
+  ECONNABORTED` — the first write landed, its reply lost. The recovery
+  side: every remount read `0 torn dropped`, and a hit round replayed
+  **1007 entries / 1615 content records against 1008 / 1617** for a round
+  with f199 whole — exactly ONE transaction fewer (the 488 B write's layout
+  Put + inode Δ), never a dropped or truncated one; the inline arm
+  (`kv_fs.writeInline`) publishes the WHOLE image per `write(2)` as one
+  journal entry, so no single write can leave a prefix. **Verdict: H1** —
+  the 512 B prefix is tar's first `write(2)` exactly, a legitimate POSIX
+  crash state (the 1,000 B write the row assumed never existed for that
+  entry); no torn write, no charter violation; the oracle judged files
+  where the charter (§1.10 "zero acked loss") promises syscalls. Fix (test
+  side, this commit): `TarWriteGrain` derives each entry's first-write
+  length from the ARCHIVE (`tar -R -tf` header blocks × `--show-defaults`'
+  record) and tar's stderr is the ack ledger (`Cannot open/write` ⇒
+  unacked, as the kill rows (a) already read it): an entry tar was ACKED on
+  must be present and whole (`error.AckedWriteLost` / `AckedCreateLost`);
+  an unacked one may be whole, empty or cut EXACTLY at its first write
+  (counted, printed), anything else `error.TornFile`. The strict-cadence
+  twin (`SQUEEZEFS_META_FLUSH_INTERVAL_MS=0`, the barrier before every ack;
+  the mount line names the cadence) runs the same body; the oracle itself
+  is a pure function with its own test (the gate's 512 B → accepted when
+  unacked on a two-write entry, `AckedWriteLost` when acked, `TornFile` on
+  a one-write entry or at 700/488 B), and the kill poll is tight (readdir
+  back to back) so the state is exercised, not merely tolerated. Proof:
+  **30/30 runs of both rows (60 rows, 0 failures)** via `zig build smoke
+  -Dtest-filter="kill -9 mid-tar -x"` on the venue, the record-boundary
+  state met and accepted **3 times** (all under the strict cadence, whose
+  per-group barrier widens the gap; `f199: 512 bytes = tar's first
+  write(2) of the entry, its second (488 B) never acked`), tar's unacked
+  set 1,299–1,301 entries every time and every acked entry whole; a prior
+  30-run loop at the old 5 ms poll cadence 60/60 with 0 hits. Gates at the
+  landing: macOS `zig build gate` **28/28 steps** (the portable half; the
+  rails re-run directly against the tree 16/16 — `smoke.zig` is not in the
+  macOS compile, so its unit and rails steps were cache hits); Linux
+  `scripts/venue zig build gate` with the skip ledger: unit **2375 pass /
+  41 skip**, rails 16/16, shim census 1/1, smoke **64 pass / 2 skip** (both
+  kill rows green), bench-smoke 40, shim-smoke 40, sdk-smoke ok, and
+  nvmet-smoke **49 / 2 fail** beside the brackets agent's live nvmet-loop
+  shares (`brk-1126008-set0-*` in the SHARED configfs tree: a non-harness
+  port id on our listener, their subsystem first in `foreign_live` — the
+  venue-sharing class above), which blocked suites-smoke; once the tree was
+  quiet (25 min later) `nvmet-smoke suites-smoke` and their smoke chain
+  re-ran **23/23 steps, 195/197 (2 skipped)**: nvmet-smoke 51/51,
+  suites-smoke ok, smoke 64 / 2 skip, bench-smoke 40, shim-smoke 40. Skip
+  ledger: other_step 40, no_seam 2, no_kernel_feature 1
+  (CONFIG_ETHTOOL_NETLINK), the kit's two probe rows.
 
-Gates at the landing (`8e69fb9` rebased onto `c65935a`): macOS `zig build
 gate` **25/25 steps, 2029/2053** (24 `no_linux` skips; unit 1905 pass, rails
 16/16); Linux `scripts/venue zig build gate` on a quiet venue **43/43 steps,
 2543/2586** (43 skipped): unit 2334 pass / 41 skip, rails 16/16, shim census

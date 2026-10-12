@@ -29,10 +29,16 @@
 //! The durability contract the kill matrix pins is the COALESCED one
 //! (charter §5.2–§5.3, `meta/backend.zig` module doc): no `fsync` is
 //! called, so an acked mutation is a LANDED journal entry — whole-
-//! transaction atomic, torn-write immune — and after `kill -9` every file
-//! present on the remount is either complete (its one WRITE transaction
-//! landed) or empty (its CREATE landed, its WRITE never issued); nothing
-//! is ever partial, nothing acked is lost. Linux only.
+//! transaction atomic, torn-write immune — and after `kill -9` the tree is
+//! judged at the WRITE(2) grain (charter §1.10 "zero acked loss" is a
+//! promise about syscalls, not files): every write tar was acked on is
+//! present whole; a file tar was NOT acked on is whole (landed, the reply
+//! lost), empty (its CREATE landed, its WRITE never issued) or cut exactly
+//! at one of tar's own write(2) boundaries — GNU tar extracts an entry
+//! whose data straddles a 10,240 B record as TWO writes (`TarWriteGrain`);
+//! nothing is ever torn inside a write, nothing acked is lost. The strict
+//! cadence (`SQUEEZEFS_META_FLUSH_INTERVAL_MS=0`: the barrier before every
+//! ack) pins the same contract through the lane's other arm. Linux only.
 
 const std = @import("std");
 const testkit = @import("../core/testkit.zig");
@@ -90,7 +96,14 @@ const kill_tree_files: usize = 1500;
 const kill_tree_file_len: usize = 1000;
 /// Files observed on the mount before the kill is sent: deep enough into
 /// the extraction that creates, writes and setattrs are all in flight.
+/// The file in flight at the kill is usually the newest visible one, f199
+/// — a two-write entry under GNU tar's record grain (`TarWriteGrain`), so
+/// the kill lands between an entry's two writes far more often than the
+/// 75-in-1,500 chance.
 const kill_after_files: usize = 200;
+/// The tar block (POSIX ustar): headers and data padding are 512 B units;
+/// `tar -R` counts in them.
+const tar_block: u64 = 512;
 
 const Rig = struct {
     gpa: std.mem.Allocator,
@@ -1856,10 +1869,11 @@ fn killRowTarSource(rig: *Rig) !void {
 
 /// The files `tar -x` reported it could NOT open or write (`tar: tree/tN:
 /// Cannot open: …`, `… Cannot write: …`) — the UNACKED set: their create
-/// or write never returned to tar. Every other `tree/` entry tar touched
-/// was acked (a later `Cannot change mode`/`utime`/`close` is an op after
-/// the data's ack). Owned names.
-fn tarUnackedNames(gpa: std.mem.Allocator, tar_err: []const u8) !std.ArrayList([]const u8) {
+/// or write never returned to tar. Every other entry tar touched was acked
+/// (a later `Cannot change mode`/`utime`/`close` is an op after the data's
+/// ack). `prefix` is the message head up to the member name (`tar: tree/`
+/// for a `tar -cf … tree` archive, `tar: ./` for `-C dir .`). Owned names.
+fn tarUnackedNames(gpa: std.mem.Allocator, tar_err: []const u8, prefix: []const u8) !std.ArrayList([]const u8) {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (out.items) |n| gpa.free(n);
@@ -1867,7 +1881,6 @@ fn tarUnackedNames(gpa: std.mem.Allocator, tar_err: []const u8) !std.ArrayList([
     }
     var it = std.mem.splitScalar(u8, tar_err, '\n');
     while (it.next()) |line| {
-        const prefix = "tar: tree/";
         if (!std.mem.startsWith(u8, line, prefix)) continue;
         const rest = line[prefix.len..];
         const colon = std.mem.indexOf(u8, rest, ": Cannot ") orelse continue;
@@ -2003,7 +2016,7 @@ test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒
     const tar_term = try tar.wait(io);
     const tar_err = try Io.Dir.cwd().readFileAlloc(io, tar_err_path, gpa, .limited(1 << 20));
     defer gpa.free(tar_err);
-    var unacked = try tarUnackedNames(gpa, tar_err);
+    var unacked = try tarUnackedNames(gpa, tar_err, "tar: tree/");
     defer freeNames(gpa, &unacked);
     // tar met the dead transport (exit 2, every later entry refused): a
     // tar that finished clean never saw the kill.
@@ -2502,12 +2515,174 @@ test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
-test "smoke: kill -9 mid-tar -x → remount replays the window → every file present is whole or empty, none acked is lost, nothing torn after the crash; a clean cycle after it" {
+/// GNU tar's write(2) grain on extraction. `extract_file` issues one
+/// `write(2)` per record-contiguous span of an entry's data (the record is
+/// `-b N` blocks of `tar_block`; `tar --show-defaults` names N, GNU tar's
+/// default 20 = 10,240 B), so an entry whose data straddles a record
+/// boundary lands as TWO writes — the first exactly the bytes to the
+/// record's end. For this tree (a 512 B header + 1,000 B of data padded to
+/// 1,024 B per entry, the `./` directory header first) the data of every
+/// 20th file — f19, f39, …, f199, … — starts at a record's last block:
+/// 512 + 488, 75 of the 1,500 (strace-proven; `docs/evidence/rung-09-
+/// gates.md` §7). A crash between the two leaves a legitimate POSIX state
+/// — the first write landed, the second never issued or never acked — so
+/// the oracle accepts a file cut THERE and nowhere else. The table is
+/// derived from the ARCHIVE (`tar -R -tf`: each entry's header block),
+/// never assumed from the name.
+const TarWriteGrain = struct {
+    record_blocks: u64,
+    /// The length of tar's first `write(2)` for `f<idx>`: the entry's size
+    /// when its data lies inside one record.
+    first_write: [kill_tree_files]u16,
+
+    /// `-bN` from `tar --show-defaults`.
+    fn recordBlocks(defaults: []const u8) !u64 {
+        var it = std.mem.tokenizeAny(u8, defaults, " \n");
+        while (it.next()) |word| {
+            if (std.mem.startsWith(u8, word, "-b")) return std.fmt.parseInt(u64, word["-b".len..], 10);
+        }
+        return error.TarDefaultsUnparsed;
+    }
+
+    /// The first write of an entry of `size` whose header sits at
+    /// `header_block`: its data starts at the next block and the write
+    /// spans to the record's end.
+    fn firstWrite(header_block: u64, size: u64, record_blocks: u64) u64 {
+        const data_block = header_block + 1;
+        return @min(size, (record_blocks - data_block % record_blocks) * tar_block);
+    }
+
+    /// From `tar -R -tf` (`block N: ./fIDX` per member); every file of the
+    /// tree named exactly once.
+    fn parse(listing: []const u8, record_blocks: u64) !TarWriteGrain {
+        var g: TarWriteGrain = .{ .record_blocks = record_blocks, .first_write = @splat(0) };
+        var named: usize = 0;
+        var lines = std.mem.splitScalar(u8, listing, '\n');
+        while (lines.next()) |line| {
+            const head = "block ";
+            if (!std.mem.startsWith(u8, line, head)) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.TarListingUnparsed;
+            const block = try std.fmt.parseInt(u64, line[head.len..colon], 10);
+            const member = "./f";
+            if (line.len < colon + ": ".len) return error.TarListingUnparsed;
+            const name = line[colon + ": ".len ..];
+            if (!std.mem.startsWith(u8, name, member)) continue;
+            const idx = try std.fmt.parseInt(usize, name[member.len..], 10);
+            if (idx >= kill_tree_files or g.first_write[idx] != 0) return error.TarListingUnparsed;
+            g.first_write[idx] = @intCast(firstWrite(block, kill_tree_file_len, record_blocks));
+            named += 1;
+        }
+        if (named != kill_tree_files) return error.TarListingUnparsed;
+        return g;
+    }
+
+    /// How many entries tar extracts in two writes.
+    fn twoWriteEntries(self: *const TarWriteGrain) usize {
+        var n: usize = 0;
+        for (self.first_write) |w| n += @intFromBool(w < kill_tree_file_len);
+        return n;
+    }
+};
+
+test "smoke: tar's write(2) grain — the record blocks from --show-defaults, the first write from the header block (data at a record's last block = one block, else the size), the -R listing parsed once per member" {
+    try testing.expectEqual(@as(u64, 20), try TarWriteGrain.recordBlocks("--format=gnu -f- -b20 --quoting-style=escape\n"));
+    try testing.expectError(error.TarDefaultsUnparsed, TarWriteGrain.recordBlocks("--format=gnu -f-\n"));
+    // ./ at block 0, f0's header at 1 (data 2–3), f1 at 4, … f19 at 58:
+    // data at 59 = the record's last block → 512; f20 at 61 → whole.
+    try testing.expectEqual(@as(u64, 1000), TarWriteGrain.firstWrite(1, 1000, 20));
+    try testing.expectEqual(@as(u64, 512), TarWriteGrain.firstWrite(58, 1000, 20));
+    try testing.expectEqual(@as(u64, 1000), TarWriteGrain.firstWrite(61, 1000, 20));
+    // A 1,024 B entry at the record's last block is 512 + 512; a 300 B one
+    // there fits its first write.
+    try testing.expectEqual(@as(u64, 512), TarWriteGrain.firstWrite(58, 1024, 20));
+    try testing.expectEqual(@as(u64, 300), TarWriteGrain.firstWrite(58, 300, 20));
+    // The full tree in archive order: 75 two-write entries, all ≡ 19 (mod 20).
+    var listing: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer listing.deinit();
+    try listing.writer.writeAll("block 0: ./\n");
+    for (0..kill_tree_files) |i| try listing.writer.print("block {d}: ./f{d}\n", .{ 1 + 3 * i, i });
+    const g = try TarWriteGrain.parse(listing.written(), 20);
+    try testing.expectEqual(@as(usize, 75), g.twoWriteEntries());
+    for (g.first_write, 0..) |w, i| try testing.expectEqual(@as(u16, if (i % 20 == 19) 512 else 1000), w);
+    // A listing that names a member twice or misses one is refused.
+    try testing.expectError(error.TarListingUnparsed, TarWriteGrain.parse("block 0: ./\nblock 1: ./f0\nblock 4: ./f0\n", 20));
+    try testing.expectError(error.TarListingUnparsed, TarWriteGrain.parse("block 0: ./\nblock 1: ./f0\n", 20));
+}
+
+/// One extracted entry's state after the crash, at tar's write(2) grain.
+const EntryState = enum { whole, empty, first_write_only };
+
+/// THE write(2)-grain oracle for one entry (charter §1.10 "zero acked
+/// loss"): `got` against the body the name promises; `acked` = tar's
+/// write(s) returned before the kill (its stderr names the unacked set);
+/// `first_write` = tar's first `write(2)` length for the entry
+/// (`TarWriteGrain`). An acked entry is whole or LOST; an unacked one is
+/// whole (landed, the reply lost), empty (its create landed, no write did)
+/// or cut exactly at its first write (the second never landed) — any other
+/// content is TORN: a prefix inside a single write, or bytes that are not
+/// the body's.
+fn judgeAtWriteGrain(got: []const u8, want: []const u8, acked: bool, first_write: u64) error{ AckedWriteLost, TornFile }!EntryState {
+    const prefix_ok = got.len <= want.len and std.mem.eql(u8, got, want[0..got.len]);
+    if (prefix_ok and got.len == want.len) return .whole;
+    if (acked) return error.AckedWriteLost;
+    if (got.len == 0) return .empty;
+    if (prefix_ok and got.len == first_write) return .first_write_only;
+    return error.TornFile;
+}
+
+/// The body the kill tree's `f<idx>` promises: `file-NNNNN:` + the letter.
+fn killTreeBody(idx: usize, want: *[kill_tree_file_len]u8) !void {
+    const head = try std.fmt.bufPrint(want, "file-{d:0>5}:", .{idx});
+    @memset(want[head.len..], 'a' + @as(u8, @intCast(idx % 26)));
+}
+
+test "smoke: the write(2)-grain oracle — acked ⇒ whole or lost; unacked ⇒ whole, empty or exactly tar's first write; a prefix inside a write, or at a boundary the entry does not have, is torn" {
+    var want: [kill_tree_file_len]u8 = undefined;
+    try killTreeBody(199, &want);
+    try testing.expectEqualStrings("file-00199:rrr", want[0..14]);
+    // Whole is whole either way.
+    try testing.expectEqual(EntryState.whole, try judgeAtWriteGrain(&want, &want, true, 512));
+    try testing.expectEqual(EntryState.whole, try judgeAtWriteGrain(&want, &want, false, 1000));
+    // The gate's finding: 512 B of a two-write entry tar was NOT acked on.
+    try testing.expectEqual(EntryState.first_write_only, try judgeAtWriteGrain(want[0..512], &want, false, 512));
+    // The same 512 B of an entry tar WAS acked on: an acked write lost.
+    try testing.expectError(error.AckedWriteLost, judgeAtWriteGrain(want[0..512], &want, true, 512));
+    // 512 B of a ONE-write entry (first write = the size): torn inside a write.
+    try testing.expectError(error.TornFile, judgeAtWriteGrain(want[0..512], &want, false, 1000));
+    // A prefix that is not the first write's length is torn even on a two-write entry.
+    try testing.expectError(error.TornFile, judgeAtWriteGrain(want[0..700], &want, false, 512));
+    try testing.expectError(error.TornFile, judgeAtWriteGrain(want[0..488], &want, false, 512));
+    // Empty: the create landed, no write did — unacked only.
+    try testing.expectEqual(EntryState.empty, try judgeAtWriteGrain("", &want, false, 512));
+    try testing.expectError(error.AckedWriteLost, judgeAtWriteGrain("", &want, true, 1000));
+    // Bytes that are not the body's (a swapped neighbour): torn at any
+    // length, lost when acked.
+    var swapped: [kill_tree_file_len]u8 = undefined;
+    try killTreeBody(198, &swapped);
+    try testing.expectError(error.TornFile, judgeAtWriteGrain(&swapped, &want, false, 512));
+    try testing.expectError(error.AckedWriteLost, judgeAtWriteGrain(&swapped, &want, true, 512));
+    try testing.expectError(error.TornFile, judgeAtWriteGrain(swapped[0..512], &want, false, 512));
+    // Longer than the body: torn.
+    const longer: [kill_tree_file_len + 1]u8 = @splat('r');
+    try testing.expectError(error.TornFile, judgeAtWriteGrain(&longer, &want, false, 512));
+}
+
+/// The kill row's body (the coalesced and the strict cadence rows):
+/// format → mount → `tar -xf` of the 1,500-file tree in a child → `kill
+/// -9` once `kill_after_files` are visible → the dead connection unmounted
+/// → remount (the window replays) → the tree judged at tar's write(2)
+/// grain against tar's own ack ledger (its stderr) and the archive's write
+/// boundaries (`TarWriteGrain`) → the gauges → a clean cycle.
+fn killRowTarX(strict: bool) !void {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
     const gpa = testing.allocator;
     const rig = try Rig.init(gpa, io);
     defer rig.deinit();
+    // The strict cadence: ONE barrier per group before any ack (the knob's
+    // A/B control arm), named by the mount line.
+    if (strict) try rig.env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", "0");
+    const cadence_word: []const u8 = if (strict) "strict cadence" else "coalesced cadence";
     {
         const f = try Io.Dir.cwd().createFile(io, rig.img, .{ .truncate = true });
         defer f.close(io);
@@ -2537,21 +2712,45 @@ test "smoke: kill -9 mid-tar -x → remount replays the window → every file pr
         const out = try rig.shOk(rig.work, script.written());
         defer gpa.free(out);
     }
+    // tar's write(2) boundaries, from the archive it will extract.
+    const grain = blk: {
+        const defaults = try rig.shOk(rig.work, "tar --show-defaults");
+        defer gpa.free(defaults);
+        const listing = try rig.shOk(rig.work, "tar -R -tf ktree.tar");
+        defer gpa.free(listing);
+        break :blk try TarWriteGrain.parse(listing, try TarWriteGrain.recordBlocks(defaults));
+    };
     try rig.spawnMount(&.{});
-    _ = try rig.awaitReady(0);
-    // tar -x in a child; kill the daemon once enough files exist.
+    const ready1 = try rig.awaitReady(0);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[0..ready1], cadence_word) != null);
+    }
+    // tar -x in a child; kill the daemon once enough files exist. tar's
+    // stderr IS its ack ledger: the entries it could not open or write
+    // when the daemon died are the unacked ones (read after the wait).
     var tar_argv_buf: [64]u8 = undefined;
     const tar_path = try std.fmt.bufPrint(&tar_argv_buf, "{s}/ktree.tar", .{rig.work});
-    var tar = try std.process.spawn(io, .{ .argv = &.{ "tar", "-xf", tar_path, "-C", rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    var tar_err_buf: [192]u8 = undefined;
+    const tar_err_path = try std.fmt.bufPrint(&tar_err_buf, "{s}/tar.err", .{rig.work});
+    const tar_err_file = try Io.Dir.cwd().createFile(io, tar_err_path, .{ .truncate = true });
+    defer tar_err_file.close(io);
+    var tar = try std.process.spawn(io, .{ .argv = &.{ "tar", "-xf", tar_path, "-C", rig.mp }, .environ_map = &rig.env, .stdin = .ignore, .stdout = .ignore, .stderr = .{ .file = tar_err_file } });
     var seen: usize = 0;
     {
+        // A TIGHT poll (readdir back to back, no sleep): the kill should
+        // land as soon as the `kill_after_files`-th entry is visible — while
+        // its two writes are still in flight — so the record-boundary state
+        // is exercised, not merely tolerated (met 3 times in 60 rows, all
+        // under the strict cadence whose barrier widens the gap; the 5 ms
+        // cadence before met it once in weeks of gates).
         const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
         while (clock.monotonicNs() < deadline) {
             var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{ .iterate = true });
             defer dir.close(io);
             seen = try countFiles(gpa, io, dir);
             if (seen >= kill_after_files) break;
-            sleepMs(5);
         }
     }
     try testing.expect(seen >= kill_after_files);
@@ -2563,7 +2762,13 @@ test "smoke: kill -9 mid-tar -x → remount replays the window → every file pr
     try testing.expect(!tar_term.success());
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
-    std.debug.print("\nsmoke: kill -9 sent with {d} of {d} files visible\n", .{ seen, kill_tree_files });
+    const tar_err = try Io.Dir.cwd().readFileAlloc(io, tar_err_path, gpa, .limited(1 << 20));
+    defer gpa.free(tar_err);
+    var unacked = try tarUnackedNames(gpa, tar_err, "tar: ./");
+    defer freeNames(gpa, &unacked);
+    // A tar that finished clean never met the kill.
+    try testing.expect(unacked.items.len > 0);
+    std.debug.print("\nsmoke: kill -9 sent with {d} of {d} files visible ({s}); tar {f}, {d} entries unacked\n", .{ seen, kill_tree_files, cadence_word, tar_term, unacked.items.len });
 
     // Remount: the window replays (NOT a clean unmount), nothing torn is a
     // corruption alert only after a clean one — here it is counted.
@@ -2577,12 +2782,19 @@ test "smoke: kill -9 mid-tar -x → remount replays the window → every file pr
         const seg = text[mark..ready2];
         try testing.expect(std.mem.indexOf(u8, seg, "mounted — ledger seq") != null);
         try testing.expect(std.mem.indexOf(u8, seg, ", clean unmount") == null);
+        try testing.expect(std.mem.indexOf(u8, seg, cadence_word) != null);
         replayed = numberAfter(seg, "replayed ") orelse 0;
     }
-    // Every file present is whole or empty; count both classes.
+    // The tree at tar's write(2) grain: an entry tar was ACKED on is
+    // present and whole; an unacked one is whole (landed, the reply lost),
+    // empty (its create landed, no write did) or exactly tar's FIRST write
+    // (a record-boundary entry whose second write never landed); anything
+    // else is torn.
     var whole: usize = 0;
     var empty: usize = 0;
+    var first_only: usize = 0;
     var present: usize = 0;
+    var present_set: [kill_tree_files]bool = @splat(false);
     {
         var dir = try Io.Dir.cwd().openDir(io, rig.mp, .{ .iterate = true });
         defer dir.close(io);
@@ -2592,25 +2804,39 @@ test "smoke: kill -9 mid-tar -x → remount replays the window → every file pr
             present += 1;
             const got = try dir.readFileAlloc(io, ent.name, gpa, .limited(1 << 20));
             defer gpa.free(got);
-            if (got.len == 0) {
-                empty += 1;
-                continue;
-            }
             // The expected body from the name: `file-NNNNN:` + the letter.
             const idx = try std.fmt.parseInt(usize, ent.name[1..], 10);
+            if (idx >= kill_tree_files) return error.UnexpectedName;
+            present_set[idx] = true;
+            const acked = !namesContain(unacked.items, ent.name);
             var want: [kill_tree_file_len]u8 = undefined;
-            const head = try std.fmt.bufPrint(&want, "file-{d:0>5}:", .{idx});
-            @memset(want[head.len..], 'a' + @as(u8, @intCast(idx % 26)));
-            if (!std.mem.eql(u8, got, &want)) {
-                std.debug.print("\n--- {s}: {d} bytes, not whole ---\n", .{ ent.name, got.len });
-                return error.TornFile;
+            try killTreeBody(idx, &want);
+            const state = judgeAtWriteGrain(got, &want, acked, grain.first_write[idx]) catch |e| {
+                std.debug.print("\n--- {s}: {d} bytes, {s} by tar, its first write(2) {d} B — {t} ---\n", .{ ent.name, got.len, if (acked) "ACKED" else "unacked", grain.first_write[idx], e });
+                return e;
+            };
+            switch (state) {
+                .whole => whole += 1,
+                .empty => empty += 1,
+                .first_write_only => {
+                    std.debug.print("smoke: {s}: {d} bytes = tar's first write(2) of the entry, its second ({d} B) never acked — the write(2)-grain state the oracle accepts\n", .{ ent.name, got.len, kill_tree_file_len - got.len });
+                    first_only += 1;
+                },
             }
-            whole += 1;
         }
+    }
+    // Every entry tar was acked on (not in its unacked set) is present.
+    for (present_set, 0..) |is_present, idx| {
+        if (is_present) continue;
+        var name_buf: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "f{d}", .{idx});
+        if (namesContain(unacked.items, name)) continue;
+        std.debug.print("\n--- {s}: ACKED by tar (its open returned), absent on the remount — an acked create lost ---\n", .{name});
+        return error.AckedCreateLost;
     }
     try testing.expect(present >= kill_after_files);
     try testing.expect(whole > 0);
-    std.debug.print("smoke: after kill -9: replayed {d} journal entries; {d} files present ({d} whole, {d} empty — created, write not yet issued), {d} never created\n", .{ replayed, present, whole, empty, kill_tree_files - present });
+    std.debug.print("smoke: after kill -9 ({s}): replayed {d} journal entries; {d} files present ({d} whole, {d} empty — created, write not yet issued, {d} at tar's first write(2) boundary), {d} never created; every entry tar was acked on is whole; {d} of {d} entries are two-write entries under tar's {d}-block record\n", .{ cadence_word, replayed, present, whole, empty, first_only, kill_tree_files - present, grain.twoWriteEntries(), kill_tree_files, grain.record_blocks });
     // The gauges on the recovered mount, then a clean cycle: the next
     // remount's window is empty and nothing torn.
     {
@@ -2636,6 +2862,14 @@ test "smoke: kill -9 mid-tar -x → remount replays the window → every file pr
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, rig.mp));
+}
+
+test "smoke: kill -9 mid-tar -x → remount replays the window → judged at tar's write(2) grain: every write tar was acked on is present whole, an unacked file is whole, empty or cut exactly at tar's first write of a record-boundary entry, nothing else; a clean cycle after it" {
+    try killRowTarX(false);
+}
+
+test "smoke: kill -9 mid-tar -x under the STRICT cadence (SQUEEZEFS_META_FLUSH_INTERVAL_MS=0: the barrier before every ack) → the same write(2)-grain contract — every acked write present whole, the unacked tail whole, empty or at tar's first write; a clean cycle after it" {
+    try killRowTarX(true);
 }
 
 test "smoke: --daemon --supervise --log-file: the invoking process returns 0 only after ready, the log file is 0600 and carries the ready line, umount ends the daemon and the supervisor; a refused daemon mount reports its reason to the invoker" {

@@ -12,6 +12,19 @@
 //! key (`dlm.Manager.covers`), so a scope that parked unrelated keys never
 //! lets a step apply unguarded.
 //!
+//! The served acquisition NEVER PARKS THE SESSION (decision 0003 §Q): a
+//! listener serves one frame at a time per connection while the dialer
+//! multiplexes every call of a daemon to that peer on ONE session, so a
+//! served ask parked on a stripe another parked scope of the SAME
+//! initiator holds would wait behind itself — that scope's step and
+//! release frames queue behind the parked serve (found by the shared hot
+//! directory row: the holder's migration and its own creates into one
+//! stripe wedged the session until the grace belt). The holder takes the
+//! set in the TRY form and answers `Busy` on contention; the initiator
+//! retries the ask on its own thread with a doubling backoff under the
+//! wire's reply bound — the patience a parked ask had, spent where it
+//! blocks nobody.
+//!
 //! The holder's lease-expiry sweep is the backstop: a scope is kept while
 //! its client is a LIVE member, released the sweep after the owner
 //! evicts it (`xv_cross_owner_guards_swept_dead` — a dead member's locks
@@ -64,7 +77,23 @@ pub const stats = struct {
     pub var xv_cross_owner_steps_took_guards: counters.ShardedCounter = .{};
     /// The round trip of a guard ask.
     pub var xv_cross_owner_guard_rtt_ns: counters.ShardedLatencyHistogram = .{};
+    /// Served asks answered `Busy` (a stripe held in this table): the
+    /// initiator retries, the session serves on.
+    pub var xv_cross_owner_guards_contended: counters.ShardedCounter = .{};
+    /// Asks the initiator retried after a `Busy`.
+    pub var xv_cross_owner_guard_retries: counters.ShardedCounter = .{};
+    /// Asks given up after the contention bound (`GuardRefused`).
+    pub var xv_cross_owner_guard_contention_refusals: counters.ShardedCounter = .{};
 };
+
+/// The initiator's backoff after a `Busy` ask: the first retry one
+/// millisecond on (a stripe is held for a plan's local steps — tens of
+/// microseconds to a few milliseconds), doubling to the cap (a holder's
+/// commit under device pressure), under the wire's reply bound — the
+/// patience a parked ask had before the holder stopped parking.
+pub const GUARD_RETRY_BACKOFF_MIN_MS: u64 = 1;
+pub const GUARD_RETRY_BACKOFF_MAX_MS: u64 = 16;
+pub const GUARD_CONTENTION_BOUND_MS: u64 = @import("../../../wire/session.zig").DIAL_TIMEOUT_MS;
 
 /// `mint_guard_scope = seq & 2^40−1 | 2^40`: nonzero by construction (0 on
 /// the wire = "no scope travelled").
@@ -81,6 +110,10 @@ pub const SCOPE_GRACE_NS: u64 = token_table.T_OWNER_NS;
 pub const STALE_HOLDER_RETRIES: u32 = 2;
 
 pub const Error = error{ OutOfMemory, PlanTooLarge, GuardRefused, HolderUnreachable, StaleHolderView };
+
+/// The served acquisition's refusal: a stripe of the ask is held in this
+/// table (`Busy` on the wire; the initiator retries).
+pub const ServeError = error{ OutOfMemory, PlanTooLarge, Contended };
 
 // ---------------------------------------------------------------------------
 // The holder's parked scopes.
@@ -152,10 +185,11 @@ pub const ParkedScopes = struct {
         self.grace_ns = grace_ns;
     }
 
-    /// Serve `XvGuards`: `lockMany` in THIS table of the requests the
-    /// scope does not already cover (a second call under one scope must
-    /// never wait behind itself), parked under `scope`.
-    pub fn serve(self: *ParkedScopes, scope: Scope, client: u64, inodes: []const dlm.InodeReq, dentries: []const dlm.DentryReq) Error!void {
+    /// Serve `XvGuards`: the TRY `lockMany` in THIS table of the requests
+    /// the scope does not already cover (a second call under one scope
+    /// must never wait behind itself), parked under `scope`; a held stripe
+    /// is `Contended` — nothing taken, the session serves on.
+    pub fn serve(self: *ParkedScopes, scope: Scope, client: u64, inodes: []const dlm.InodeReq, dentries: []const dlm.DentryReq) ServeError!void {
         assert(scope != 0);
         // Which requests are already covered? Judged under the map lock,
         // taken OUTSIDE it (the acquisition parks).
@@ -181,7 +215,10 @@ pub const ParkedScopes = struct {
             }
         }
         if (ni == 0 and nd == 0) return;
-        var set = self.locks.lockManyWide(self.io, need_i[0..ni], need_d[0..nd]) catch return error.PlanTooLarge;
+        var set = (self.locks.tryLockManyWide(self.io, need_i[0..ni], need_d[0..nd]) catch return error.PlanTooLarge) orelse {
+            stats.xv_cross_owner_guards_contended.inc();
+            return error.Contended;
+        };
         errdefer set.release(self.io);
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -291,7 +328,7 @@ pub const GuardsService = struct {
         self.parked.serve(r.head.scope, clientOf(req.peer), inodes[0..r.inodes.len], dents[0..nd]) catch |e| return switch (e) {
             error.PlanTooLarge => service.Answer.rejected("xv_guards plan past the wide bound"),
             error.OutOfMemory => service.Answer.refused(error.OutOfMemory, "out of memory parking the scope"),
-            else => unreachable,
+            error.Contended => .{ .status = .{ .status = .busy, .err = error.Busy, .reason = "a stripe of the ask is held in this table" } },
         };
         return .{ .ok = .{ .xv_guards = .fresh } };
     }
@@ -440,7 +477,6 @@ fn lockLocal(locks: *dlm.Manager, io: Io, tables: Tables, a: AcquireArgs) Error!
 }
 
 fn askRemote(gpa: Allocator, io: Io, t: *Travelling, tables: Tables, a: AcquireArgs, holder: AppenderId, link: Link) Error!void {
-    _ = io;
     var inodes: [dlm.wide_requests]verbs.GuardInodeWire = undefined;
     var ni: usize = 0;
     var dbuf: [dlm.wide_requests * (16 + 256)]u8 = undefined;
@@ -462,14 +498,30 @@ fn askRemote(gpa: Allocator, io: Io, t: *Travelling, tables: Tables, a: AcquireA
     };
     const t0 = clock.monotonicNs();
     stats.xv_cross_owner_guard_rpcs.inc();
-    const rep = link.call(link.ctx, .{ .xv_guards = .{ .head = .{ .volume = a.volume, .n_inodes = @intCast(ni), .n_dentries = nd, .reserved = 0, .scope = a.scope }, .inodes = inodes[0..ni], .dentries_bytes = db.written() } }) catch |e| {
-        // A refused or timed-out ask gets a fire-and-forget release behind it.
-        _ = link.call(link.ctx, .{ .xv_release = .{ .volume = a.volume, .reserved = 0, .reserved2 = 0, .scope = a.scope, .ino = 0 } }) catch {};
-        return switch (e) {
-            error.StaleHolderView, error.SlotMoved => error.StaleHolderView,
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.GuardRefused,
+    const deadline = t0 + GUARD_CONTENTION_BOUND_MS * std.time.ns_per_ms;
+    var backoff_ms: u64 = GUARD_RETRY_BACKOFF_MIN_MS;
+    const rep: verbs.Reply = blk: while (true) {
+        const r = link.call(link.ctx, .{ .xv_guards = .{ .head = .{ .volume = a.volume, .n_inodes = @intCast(ni), .n_dentries = nd, .reserved = 0, .scope = a.scope }, .inodes = inodes[0..ni], .dentries_bytes = db.written() } }) catch |e| {
+            if (e == error.Busy) {
+                // A held stripe at the holder: wait HERE, under the bound.
+                const now = clock.monotonicNs();
+                if (now < deadline) {
+                    stats.xv_cross_owner_guard_retries.inc();
+                    io.sleep(.fromMilliseconds(@intCast(@min(backoff_ms, (deadline - now) / std.time.ns_per_ms + 1))), .awake) catch {};
+                    backoff_ms = @min(backoff_ms * 2, GUARD_RETRY_BACKOFF_MAX_MS);
+                    continue;
+                }
+                stats.xv_cross_owner_guard_contention_refusals.inc();
+            }
+            // A refused or timed-out ask gets a fire-and-forget release behind it.
+            _ = link.call(link.ctx, .{ .xv_release = .{ .volume = a.volume, .reserved = 0, .reserved2 = 0, .scope = a.scope, .ino = 0 } }) catch {};
+            return switch (e) {
+                error.StaleHolderView, error.SlotMoved => error.StaleHolderView,
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.GuardRefused,
+            };
         };
+        break :blk r;
     };
     stats.xv_cross_owner_guard_rtt_ns.record(clock.monotonicNs() -| t0);
     _ = rep.xv_guards;

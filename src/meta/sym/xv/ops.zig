@@ -687,18 +687,36 @@ pub fn Plane(comptime Store: type) type {
             }
             stats.xv_cross_owner_steps_shipped.inc();
             const rec = step.toRec();
-            const rep = link.call(link.ctx, .{ .xv_step = .{ .head = .{ .volume = self.volume, .step_idx = @intCast(idx), .reserved = 0, .tx_id = tx_id, .scope = scope, .step = rec.w }, .name = rec.name } }) catch |e| switch (e) {
-                error.SlotMoved, error.StaleHolderView => return null,
-                error.StaleOwnerEra => {
-                    // Retried ONCE with the same ids after the lane relearned the era.
-                    stats.xv_cross_owner_step_stale_era_retries.inc();
-                    const again = link.call(link.ctx, .{ .xv_step = .{ .head = .{ .volume = self.volume, .step_idx = @intCast(idx), .reserved = 0, .tx_id = tx_id, .scope = scope, .step = rec.w }, .name = rec.name } }) catch return error.ShipFailed;
-                    return outcomeOf(again.xv_step);
-                },
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Deferred => return error.Deferred,
-                error.Rejected => return error.Corrupt,
-                else => return error.ShipFailed,
+            // A `Busy` answer (the holder's try-lock met a held stripe) is
+            // retried from here with the guard ask's backoff and bound.
+            const deadline = clock.monotonicNs() + guards.GUARD_CONTENTION_BOUND_MS * std.time.ns_per_ms;
+            var backoff_ms: u64 = guards.GUARD_RETRY_BACKOFF_MIN_MS;
+            const rep: verbs.Reply = blk: while (true) {
+                const r = link.call(link.ctx, .{ .xv_step = .{ .head = .{ .volume = self.volume, .step_idx = @intCast(idx), .reserved = 0, .tx_id = tx_id, .scope = scope, .step = rec.w }, .name = rec.name } }) catch |e| switch (e) {
+                    error.Busy => {
+                        const now = clock.monotonicNs();
+                        if (now >= deadline) {
+                            guards.stats.xv_cross_owner_guard_contention_refusals.inc();
+                            return error.ShipFailed;
+                        }
+                        guards.stats.xv_cross_owner_guard_retries.inc();
+                        self.io.sleep(.fromMilliseconds(@intCast(@min(backoff_ms, (deadline - now) / std.time.ns_per_ms + 1))), .awake) catch {};
+                        backoff_ms = @min(backoff_ms * 2, guards.GUARD_RETRY_BACKOFF_MAX_MS);
+                        continue;
+                    },
+                    error.SlotMoved, error.StaleHolderView => return null,
+                    error.StaleOwnerEra => {
+                        // Retried ONCE with the same ids after the lane relearned the era.
+                        stats.xv_cross_owner_step_stale_era_retries.inc();
+                        const again = link.call(link.ctx, .{ .xv_step = .{ .head = .{ .volume = self.volume, .step_idx = @intCast(idx), .reserved = 0, .tx_id = tx_id, .scope = scope, .step = rec.w }, .name = rec.name } }) catch return error.ShipFailed;
+                        return outcomeOf(again.xv_step);
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Deferred => return error.Deferred,
+                    error.Rejected => return error.Corrupt,
+                    else => return error.ShipFailed,
+                };
+                break :blk r;
             };
             return outcomeOf(rep.xv_step);
         }
@@ -891,10 +909,14 @@ pub fn Plane(comptime Store: type) type {
 
         // ---- the served side ----
 
-        pub const ServeError = error{ SlotMoved, Rejected, Deferred, Io, OutOfMemory };
+        pub const ServeError = error{ SlotMoved, Rejected, Deferred, Contended, Io, OutOfMemory };
 
         /// `xv_serve_step` under the holder's door: the lease check FIRST,
-        /// the insert's child screen, the guard verdict, the apply.
+        /// the insert's child screen, the guard verdict, the apply. A step
+        /// the scope does not cover takes its keys in the TRY form: a held
+        /// stripe is `Contended` (`Busy` on the wire, the initiator's
+        /// retry) — a served step never parks the session (module doc of
+        /// `guards.zig`).
         pub fn serveStep(self: *Self, step: Step, scope: guards.Scope, requester: ?AppenderId, now: u64) ServeError!Outcome {
             const slot = route_table.slotOf(step.homeIno());
             if (self.resolver.homeOf(self.resolver.ctx, slot) != .local) return error.SlotMoved;
@@ -931,7 +953,10 @@ pub fn Plane(comptime Store: type) type {
                 .covered => guards.stats.xv_cross_owner_steps_covered.inc(),
                 .take => {
                     guards.stats.xv_cross_owner_steps_took_guards.inc();
-                    const set = self.locks.lockManyUncancelable(self.io, inodes[0..ni], dents[0..nd]) catch return error.Rejected;
+                    const set = (self.locks.tryLockMany(self.io, inodes[0..ni], dents[0..nd]) catch return error.Rejected) orelse {
+                        guards.stats.xv_cross_owner_guards_contended.inc();
+                        return error.Contended;
+                    };
                     const h = self.gpa.create(HeldSet) catch return error.OutOfMemory;
                     h.* = .{ .io = self.io, .gpa = self.gpa, .set = set };
                     held = tx.GuardSet.init(h, &HeldSet.release);
@@ -994,6 +1019,7 @@ pub fn StepService(comptime Store: type) type {
                 error.SlotMoved => .{ .status = .{ .status = .not_holder } },
                 error.Rejected => service.Answer.rejected("a served insert names a child no holder has a record for"),
                 error.Deferred => service.Answer.deferred("the holder's door deferred the step"),
+                error.Contended => .{ .status = .{ .status = .busy, .err = error.Busy, .reason = "a stripe of the step is held in this table" } },
                 error.OutOfMemory => service.Answer.refused(error.OutOfMemory, "out of memory serving the step"),
                 error.Io => service.Answer.refused(error.InputOutput, "the holder's records could not be read or written"),
             };

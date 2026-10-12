@@ -722,6 +722,82 @@ test "the travelling guards: an op whose parent is foreign parks ONE scope at th
     try testing.expectEqual(took0 + 1, guards.stats.xv_cross_owner_steps_took_guards.load());
 }
 
+/// A's ask for B's table while a local op at B holds the stripe: the
+/// initiator's retry loop on its own thread.
+const ContendedAsk = struct {
+    f: *TwoHolders,
+    plan: steps.Plan,
+    scope: guards.Scope,
+    held: ?guards.Travelling = null,
+    err: ?ops.Error = null,
+    fn run(self: *ContendedAsk) void {
+        self.held = self.f.a.plane.acquirePlanGuards(&self.plan, self.scope, false) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+};
+
+test "the served acquisition never parks the holder's session: an ask on a stripe a local op at B holds answers Busy (nothing taken, no scope parked), the initiator retries on its own thread with the backoff, B's session serves another call meanwhile, and the ask lands once the stripe is freed; a step the scope does not cover meets the same law" {
+    const gpa = testing.allocator;
+    const f = try TwoHolders.init(gpa, testing.io, .{}, .{});
+    defer f.deinit();
+    try f.b.seedDir(DIR_B);
+    // B's own op holds the directory's stripe.
+    var local = (try f.b.locks.tryLockMany(testing.io, &.{.{ .ino = DIR_B, .mode = .exclusive }}, &.{})).?;
+    const contended0 = guards.stats.xv_cross_owner_guards_contended.load();
+    const retries0 = guards.stats.xv_cross_owner_guard_retries.load();
+    const refusals0 = guards.stats.xv_cross_owner_guard_contention_refusals.load();
+    var ask: ContendedAsk = .{ .f = f, .plan = steps.planCreate(.{ .parent = DIR_B, .name = "h", .child = f.a.mint(), .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 }), .scope = f.a.plane.mintScope() };
+    const t = try std.Thread.spawn(.{}, ContendedAsk.run, .{&ask});
+    // The holder answered Busy at least once and parked nothing; its
+    // session is free: another call lands while the ask is retrying.
+    var spins: u32 = 0;
+    while (guards.stats.xv_cross_owner_guards_contended.load() == contended0) : (spins += 1) {
+        try testing.expect(spins < 10_000_000);
+        std.Thread.yield() catch {};
+    }
+    try testing.expect(!f.b.plane.parked.isParked(ask.scope));
+    try testing.expect((try f.a.plane.readWitness(DIR_B)) != null);
+    // The stripe freed: the retry lands, the scope parks, the plan runs.
+    local.release(testing.io);
+    t.join();
+    try testing.expect(ask.err == null);
+    try testing.expect(f.b.plane.parked.isParked(ask.scope));
+    try testing.expect(guards.stats.xv_cross_owner_guard_retries.load() > retries0);
+    try testing.expectEqual(refusals0, guards.stats.xv_cross_owner_guard_contention_refusals.load());
+    const done = try f.a.plane.execute(&ask.plan, ask.scope, 1_000);
+    try testing.expect(done.refused == null);
+    ask.held.?.release(gpa);
+    try testing.expect(!f.b.plane.parked.isParked(ask.scope));
+    // A scope-less step against a held stripe: Busy, retried, landed.
+    var local2 = (try f.b.locks.tryLockMany(testing.io, &.{.{ .ino = DIR_B, .mode = .exclusive }}, &.{})).?;
+    const Step = struct {
+        f: *TwoHolders,
+        plan: steps.Plan,
+        done: ?ops.Done = null,
+        err: ?ops.Error = null,
+        fn run(self: *@This()) void {
+            self.done = self.f.a.plane.execute(&self.plan, 0, 1_000) catch |e| {
+                self.err = e;
+                return;
+            };
+        }
+    };
+    var st: Step = .{ .f = f, .plan = steps.planCreate(.{ .parent = DIR_B, .name = "i", .child = f.a.mint(), .mode = S.IFREG | 0o644, .uid = 1, .gid = 2, .now = 1_000 }) };
+    const contended1 = guards.stats.xv_cross_owner_guards_contended.load();
+    const t2 = try std.Thread.spawn(.{}, Step.run, .{&st});
+    spins = 0;
+    while (guards.stats.xv_cross_owner_guards_contended.load() == contended1) : (spins += 1) {
+        try testing.expect(spins < 10_000_000);
+        std.Thread.yield() catch {};
+    }
+    local2.release(testing.io);
+    t2.join();
+    try testing.expect(st.err == null and st.done.?.refused == null);
+    try testing.expectEqual(st.plan.steps[1].insert_dentry.child, (try f.b.dentry(DIR_B, "i")).?.child);
+}
+
 const RecordShipService = record_ship.RecordShipService(HolderStore);
 
 /// The holder's own-cache + kernel view, recorded.

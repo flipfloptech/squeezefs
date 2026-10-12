@@ -124,6 +124,17 @@ N puts carry N × 1,056; an in-place append swaps a state for a state; a same-ke
 one with the last lease; a release frees one; `deinit` the rest; a recovered record carries none until
 its first append. Every other `checksum.Hasher` (21 sites, on fiber stacks) shrank with it.
 
+Gates on the rebased branch (on `7e6a481`), both green: macOS unit 1959 pass / 25 skip (1984), rails
+16/16; the Linux venue unit 2397 pass / 42 skip (2439), rails 16/16 + census 1, smoke 64 pass / 2 skip
+(the kill matrix and fsck's C-passes re-verify every staged record under the new state), bench-smoke
+40, shim-smoke 40, nvmet-smoke 51, 12 min 1 s wall. Two shared-venue artifacts met on the way and not
+again: a run concurrent with another agent's gate read `fleet share 2` in `mem.budget`'s cgroup census
+(the other agent's `squeezefs-unit` in the same cage) and failed the dd-lane and nvmet round-trip rows
+beside it; and the jobs matrix's post-resume `job throttle 100` met the drain's terminal verdict on the
+quiet venue (the race `7e6a481` accepts). The bench's hash microbench timing assertion (`chained ≥
+throughput` ps/op on 16 B one-shot hashes, not the `Hasher`) flipped once under the gate's parallel
+load on each host and passed alone 3/3.
+
 Facade pins: `hash54("hello", Key(42)) = 0x57efcfaac4954437 >> 10`,
 `hash56("user.layout", Key(42)) = 0xe67f1d17ff5c7b1c >> 8`; `hash64("") = 0x60faebc5c5bda514`;
 `stamp` → `verify` round trips and every single-byte flip over a 4 KiB page fails `verify`;

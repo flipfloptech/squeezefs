@@ -24,6 +24,7 @@ pub const frame = @import("frame.zig");
 pub const verbs = @import("verbs.zig");
 pub const screen = @import("screen.zig");
 pub const auth = @import("auth.zig");
+pub const pki = @import("pki.zig");
 pub const endpoint = @import("endpoint.zig");
 pub const service = @import("service.zig");
 pub const session = @import("session.zig");
@@ -49,6 +50,7 @@ test {
     _ = verbs;
     _ = screen;
     _ = auth;
+    _ = pki;
     _ = endpoint;
     _ = service;
     _ = session;

@@ -62,5 +62,6 @@ test {
         _ = listener;
         _ = dialer;
         _ = @import("tcp_e2e_linux.zig");
+        _ = @import("tls_e2e_linux.zig");
     }
 }

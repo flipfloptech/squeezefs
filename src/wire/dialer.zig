@@ -98,7 +98,7 @@ fn nowMs() u64 {
 /// (the `Io`'s connect has no timeout arm; the kernel's own SYN ladder is
 /// ~2 min — far past the bound), then the socket back to blocking for the
 /// session's reads. Raw syscalls on the wire's OS thread.
-fn connectTimeout(addr: net.IpAddress, timeout_ms: u32) error{Unreachable}!net.Stream {
+pub fn connectTimeout(addr: net.IpAddress, timeout_ms: u32) error{Unreachable}!net.Stream {
     var storage: [128]u8 align(8) = undefined;
     var len: linux.socklen_t = undefined;
     var family: u32 = undefined;

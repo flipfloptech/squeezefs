@@ -105,6 +105,7 @@ const tx = @import("../../meta/tx.zig");
 const tree = @import("../../meta/tree.zig");
 const dlm = @import("../../meta/dlm.zig");
 const lock_order = @import("../../sync/lock_order.zig");
+const sync = @import("../../sync/sync.zig");
 const economy = @import("../../meta/economy.zig");
 const guard_claim = @import("../../meta/guard/claim.zig");
 const virtual_inodes = @import("virtual_inodes.zig");
@@ -196,6 +197,11 @@ pub var fuse_kvmap_sweeps_kicked: counters.ShardedCounter = .{};
 pub var fuse_write_inline: counters.ShardedCounter = .{};
 pub var fuse_write_staged: counters.ShardedCounter = .{};
 pub var fuse_write_striped: counters.ShardedCounter = .{};
+/// `fuse_write_times_parked`: size-neutral striped writes whose Δ(mtime,
+/// ctime) was PARKED (decision 0003 §L.6) — fold-visible on every read,
+/// journaled by the batched drain — instead of committed as a 76 B entry
+/// that cost one grain-aligned window and one device round trip per op.
+pub var fuse_write_times_parked: counters.ShardedCounter = .{};
 /// Durable promotions a write forced BEFORE its type flip (inline/staged/
 /// packed → striped: the resident payload landed on its own block).
 pub var fuse_write_promotions_to_striped: counters.ShardedCounter = .{};
@@ -298,6 +304,12 @@ pub const Options = struct {
     /// The mount identity: the owner of the virtual control inodes.
     uid: u32 = 0,
     gid: u32 = 0,
+    /// The coalesced cadence (`SQUEEZEFS_META_FLUSH_INTERVAL_MS` > 0): a
+    /// size-neutral striped write PARKS its times (decision 0003 §L.6) and
+    /// the daemon's drain cadence journals them. Strict mode (`= 0`, a
+    /// barrier before every ack) commits them per write as before — that
+    /// mount declared latency over bytes and its ack means durable.
+    times_park: bool = true,
 };
 
 /// A held 4a set travelling with a transaction; it drops at the terminal
@@ -385,6 +397,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         geo: layout.Geometry,
         blksize: u32,
         pending: economy.PendingTimes,
+        /// `Options.times_park`.
+        times_park: bool,
+        /// The drain cadence's wake (the daemon's `TimesDrainCadence` parks
+        /// on it with the flush interval as its deadline): a park that
+        /// crosses `PENDING_TIMES_DRAIN_CAP` notifies it ahead of the tick.
+        times_drain_wake: sync.Notify = .init,
         locks: dlm.Manager,
         /// The `..` memo (module doc).
         parents_lock: jc.SpinLock = .{},
@@ -437,6 +455,7 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 .geo = data.geometry(),
                 .blksize = opts.page_size,
                 .pending = try economy.PendingTimes.init(gpa),
+                .times_park = opts.times_park,
                 .locks = undefined,
                 .uid = opts.uid,
                 .gid = opts.gid,
@@ -1259,8 +1278,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         pub fn destroy(self: *Self, c: *Ctx, _: filesystem.DestroyArgs) void {
-            // The dismount sweep: every gathered corpse destroyed.
+            // The dismount sweep: every gathered corpse destroyed, then
+            // every parked stamp journaled (the dismount's durability point).
             self.reclaimDrain(c) catch |e| log.err("kv_fs: dismount reclaim drain failed: {t}", .{e});
+            _ = self.drainPendingTimes(c) catch |e| log.err("kv_fs: dismount times drain failed: {t} ({d} refinement(s) stay parked)", .{ e, self.pending.len() });
         }
 
         pub fn lookup(self: *Self, c: *Ctx, a: filesystem.LookupArgs) Error!filesystem.Entry {
@@ -2408,13 +2429,121 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             errdefer if (t_owned) self.store.abandon(t);
             var v = try self.readInode(local);
             const size = @max(v.size, outcome.size_claim);
-            try self.stageInodePostlude(t, local, &v, size, a.write_flags);
-            t_owned = false;
-            try self.commit(c, t);
-            _ = self.pending.retire(local);
+            if (self.times_park and size == v.size and a.write_flags & abi.FUSE_WRITE_KILL_SUIDGID == 0) {
+                // §L.6: a size-neutral write's only record would be the
+                // 76 B Δ(mtime, ctime) — one grain-aligned window and one
+                // device round trip for two timestamps. Park the stamp
+                // under the guard instead (fold-visible on every read; the
+                // drain journals it); the tx stays empty, nothing commits.
+                try self.parkWriteTimes(local);
+                t_owned = false;
+                self.store.abandon(t);
+            } else {
+                try self.stageInodePostlude(t, local, &v, size, a.write_flags);
+                t_owned = false;
+                try self.commit(c, t);
+                _ = self.pending.retire(local);
+            }
             self.data.noteShape(local, size, .striped);
             fuse_write_striped.inc();
             return .{ .size = @intCast(outcome.written) };
+        }
+
+        /// The write's stamp parked as `local`'s pending refinement (under
+        /// the caller's exclusive guard — `PendingTimes`' per-ino law): the
+        /// signed monotone max, the same law `fold` serves it by. A park
+        /// that crosses the cap wakes the drain ahead of its tick.
+        fn parkWriteTimes(self: *Self, local: u64) Error!void {
+            const stamp = now();
+            switch (try self.pending.park(local, stamp, stamp)) {
+                .parked => {},
+                .parked_wake_drain => self.times_drain_wake.notifyOne(self.io),
+            }
+            fuse_write_times_parked.inc();
+        }
+
+        /// The stored record UNFOLDED (null when absent): the drain's base —
+        /// `economy.drainDelta` measures the parked stamp's advance against
+        /// what is durable, and a folded read would already carry it.
+        fn readInodeStored(self: *Self, ino: u64) Error!?InodeValue {
+            const bytes = (self.store.lookup(self.gpa, key.TREE_INODES, &key.inodeKey(ino)) catch |e| return storeErr(e)) orelse return null;
+            defer self.gpa.free(bytes);
+            return InodeValue.decode(bytes) catch return error.InputOutput;
+        }
+
+        /// Commit one drain batch under ONE canonical exclusive plan (the
+        /// ordinary op's width, `dlm.max_requests`): the members whose
+        /// stamp still advances the stored record are staged (the rest —
+        /// destroyed, or superseded by a committed write — carry nothing);
+        /// then every member is retired IF its parked stamp is still the one
+        /// drained — the guards drop at the commit's terminal outcome, and a
+        /// write that parked a newer stamp before the retire keeps it for
+        /// the next drain. A failed commit keeps the batch parked for the
+        /// next trigger — except a slot that moved to another appender
+        /// (`SlotMoved`), whose refinements this mount can never commit:
+        /// those are dropped and counted (`meta_kv_times_echo_foreign_
+        /// dropped`), never left to refuse every later batch at the door.
+        fn drainTimesBatch(self: *Self, c: *Ctx, batch: []const u64) Error!u64 {
+            assert(batch.len <= dlm.max_requests);
+            var plan: economy.GuardPlan = .{};
+            for (batch) |ino| {
+                plan.inode_reqs[plan.inode_len] = .{ .ino = ino, .mode = .exclusive };
+                plan.inode_len += 1;
+            }
+            const held = try self.lockPlan(&plan);
+            const t = try self.beginWith(held, @src());
+            var t_owned = true;
+            errdefer if (t_owned) self.store.abandon(t);
+            var drained: [dlm.max_requests]?economy.Times = @splat(null);
+            var staged: u64 = 0;
+            for (batch, 0..) |ino, i| {
+                const parked = self.pending.parked(ino) orelse continue;
+                drained[i] = parked;
+                if ((try economy.stageDrainMember(t, ino, parked, try self.readInodeStored(ino))) == .staged) staged += 1;
+            }
+            t_owned = false;
+            if (staged == 0) {
+                self.store.abandon(t);
+            } else self.commit(c, t) catch |e| {
+                if (e != error.SlotMoved) return e;
+                for (batch) |ino| _ = self.pending.retire(ino);
+                sym_handover.stats.meta_kv_times_echo_foreign_dropped.add(batch.len);
+                return 0;
+            };
+            for (batch, drained[0..batch.len]) |ino, d| if (d) |times| {
+                _ = self.pending.retireIfStill(ino, times);
+            };
+            if (staged != 0) economy.noteDrainCommitted(staged);
+            return staged;
+        }
+
+        /// THE TIMES DRAIN (decision 0003 §L.6; charter §5.2 "Journal
+        /// economy"): every parked refinement — the write path's stamps,
+        /// the absorbed SETATTR echoes — made durable in batched Δ commits,
+        /// `dlm.max_requests` inos per entry. Run by the daemon's cadence
+        /// (the flush interval; the cap wakes it early), by `fsyncdir` and
+        /// the dismount ahead of their barriers, and by tests. Returns the
+        /// refinements made durable.
+        pub fn drainPendingTimes(self: *Self, c: *Ctx) Error!u64 {
+            var total: u64 = 0;
+            var buf: [economy.PENDING_TIMES_DRAIN_BATCH]u64 = undefined;
+            while (true) {
+                const snapshot = self.pending.drainBatch(&buf);
+                if (snapshot.len == 0) return total;
+                var i: usize = 0;
+                while (i < snapshot.len) : (i += dlm.max_requests) {
+                    total += try self.drainTimesBatch(c, snapshot[i..@min(i + dlm.max_requests, snapshot.len)]);
+                }
+                if (snapshot.len < buf.len) return total;
+            }
+        }
+
+        /// `fsync(ino)`'s durability covers the ino's parked stamp: ONE Δ
+        /// commit ahead of the barriers when one is parked, nothing
+        /// otherwise (the common case is one relaxed load).
+        fn drainTimesOf(self: *Self, c: *Ctx, local: u64) Error!void {
+            if (self.pending.parked(local) == null) return;
+            _ = try self.drainTimesBatch(c, &.{local});
         }
 
         /// The resident payload to its own block, the striped layout
@@ -2457,6 +2586,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// §5.2; decision 0003 §J.2) — under the ino's exclusive guard, so
         /// the Δs of one ino land in commit order and the fold's newest size
         /// is the max; the mode strip (KILLPRIV) rewrites the record whole.
+        /// A size-neutral striped write under the coalesced cadence never
+        /// reaches here: its stamp is parked (`parkWriteTimes`, §L.6).
         fn stageInodePostlude(self: *Self, t: *tx.KvTx, local: u64, v: *InodeValue, size: u64, write_flags: u32) Error!void {
             const stamp = now();
             v.size = @max(v.size, size);
@@ -2483,10 +2614,12 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             if (self.data.hasVolumes()) self.data.releaseIno(self.io, local);
         }
 
-        /// fsync (charter §6.4): the data legs through the plane, then the
-        /// trailing coalesced meta barrier (every acked entry durable).
+        /// fsync (charter §6.4): the ino's parked stamp journaled (§L.6),
+        /// the data legs through the plane, then the trailing coalesced
+        /// meta barrier (every acked entry durable).
         pub fn fsync(self: *Self, c: *Ctx, a: filesystem.FsyncArgs) Error!void {
             const local = try localOf(a.ino);
+            try self.drainTimesOf(c, local);
             if (self.data.hasVolumes()) {
                 const rec = try self.readLayout(local);
                 defer self.freeLayout(rec);
@@ -2501,7 +2634,10 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.store.fsync() catch |e| return storeErr(e);
         }
 
+        /// fsyncdir: the syncfs-class durability point — every parked
+        /// stamp journaled ahead of the barrier that covers it.
         pub fn fsyncdir(self: *Self, c: *Ctx, _: filesystem.FsyncArgs) Error!void {
+            _ = try self.drainPendingTimes(c);
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
             self.store.fsync() catch |e| return storeErr(e);
@@ -3795,6 +3931,126 @@ test "the staged append law (repro-port: fstests generic/069 `append_writer` —
     while (i < m) : (i += 1) try testing.expectEqual(i, std.mem.readInt(u32, img[head.len + 4 * i ..][0..4], .little));
     try testing.expectEqual(@as(usize, 1), h.data.ring.?.seg.live());
     h.release(f);
+}
+
+test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neutral 512 B overwrites cost 533 k journal entries, 1.56 per 4 KiB window, 2.6 KB of metadata device per op): a size-neutral striped write commits NOTHING — its (mtime, ctime) is parked, fold-visible on getattr while the stored record lags; the drain commits ONE Δ entry per ≤ 16 parked inos and a retire never drops a stamp parked after it; fsync(ino) drains that ino ahead of its barrier; an extending write still commits its Δ(size, mtime, ctime) (§J.2); the cap wakes the cadence; strict mode commits per write" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: []u8 = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(image);
+    @memset(image, 'I');
+    // Four files past the inline bound: striped from their first write.
+    var files: [4]u64 = undefined;
+    var names: [4][2]u8 = undefined;
+    for (&files, &names, 0..) |*f, *nm, i| {
+        nm.* = .{ 'f', @intCast('0' + i) };
+        f.* = try h.create(1, nm, 0o644);
+        try testing.expectEqual(@as(?linux.E, null), h.write(f.*, 0, image, 0).errno());
+    }
+    const commits0 = h.store.commits;
+    const parked0 = fuse_write_times_parked.load();
+    const drains0 = economy.stats.meta_kv_times_echo_drain_commits.load();
+    const drained0 = economy.stats.meta_kv_times_echo_drained.load();
+    const stored_before = (try h.fs.readInodeStored(try H.Fs.localOf(files[0]))).?;
+    // The stamps are the COARSE clock's (`now`): a stamp inside the tick
+    // of the last committed one advances nothing (the drain then stages
+    // nothing, rightly), so the overwrites below start on a later tick.
+    awaitCoarseTickAfter(stored_before.mtime);
+    // 100 size-neutral 512 B overwrites per file: zero commits, every one parked.
+    var sector: [512]u8 = @splat('s');
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        for (files) |f| try testing.expectEqual(@as(?linux.E, null), h.write(f, @as(u64, (i * 37) % 15) * 512, &sector, 0).errno());
+    }
+    try testing.expectEqual(commits0, h.store.commits);
+    try testing.expectEqual(parked0 + 400, fuse_write_times_parked.load());
+    try testing.expectEqual(@as(u64, 4), h.fs.pending.len());
+    // Fold-visible: the served mtime advanced, the stored record did not.
+    const served = try h.getattr(files[0]);
+    const served_mtime_ns = served.mtime * std.time.ns_per_s + served.mtimensec;
+    try testing.expect(economy.laterThan(served_mtime_ns, stored_before.mtime));
+    try testing.expectEqual(stored_before.mtime, (try h.fs.readInodeStored(try H.Fs.localOf(files[0]))).?.mtime);
+    // The drain: ONE entry carrying the four Δs; the stored record now
+    // carries exactly the served stamp; nothing stays parked.
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    try testing.expectEqual(@as(u64, 4), try h.fs.drainPendingTimes(&ctx));
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(drains0 + 1, economy.stats.meta_kv_times_echo_drain_commits.load());
+    try testing.expectEqual(drained0 + 4, economy.stats.meta_kv_times_echo_drained.load());
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    try testing.expectEqual(served_mtime_ns, (try h.fs.readInodeStored(try H.Fs.localOf(files[0]))).?.mtime);
+    // A drain with nothing parked commits nothing.
+    try testing.expectEqual(@as(u64, 0), try h.fs.drainPendingTimes(&ctx));
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    // The conditional retire: a stamp parked AFTER the drained one stands.
+    const l0 = try H.Fs.localOf(files[0]);
+    const older: economy.Times = .{ .mtime = served_mtime_ns, .ctime = served_mtime_ns };
+    awaitCoarseTickAfter(served_mtime_ns);
+    try testing.expectEqual(@as(?linux.E, null), h.write(files[0], 0, &sector, 0).errno());
+    try testing.expect(!h.fs.pending.retireIfStill(l0, older));
+    try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
+    // fsync(ino) drains that ino alone: one commit, the stamp durable.
+    try testing.expectEqual(@as(?linux.E, null), h.write(files[1], 0, &sector, 0).errno());
+    try testing.expectEqual(@as(u64, 2), h.fs.pending.len());
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsync = .{ .fh = 1, .datasync = false } }, files[0]).errno());
+    try testing.expectEqual(commits0 + 2, h.store.commits);
+    try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
+    try testing.expect(h.fs.pending.parked(l0) == null);
+    const a0 = try h.getattr(files[0]);
+    try testing.expectEqual(a0.mtime * std.time.ns_per_s + a0.mtimensec, (try h.fs.readInodeStored(l0)).?.mtime);
+    // An fsync with nothing parked commits nothing.
+    try testing.expectEqual(@as(?linux.E, null), h.call(.{ .fsync = .{ .fh = 1, .datasync = false } }, files[0]).errno());
+    try testing.expectEqual(commits0 + 2, h.store.commits);
+    // An extending write commits its Δ(size, mtime, ctime) per op (§J.2)
+    // and retires the ino's parked stamp (the Δ carries a newer one).
+    try testing.expectEqual(@as(?linux.E, null), h.write(files[1], 8192, &sector, 0).errno());
+    try testing.expectEqual(commits0 + 3, h.store.commits);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    try testing.expectEqual(@as(u64, 8192 + 512), (try h.getattr(files[1])).size);
+    // Strict mode: the size-neutral write commits as before.
+    h.fs.times_park = false;
+    try testing.expectEqual(@as(?linux.E, null), h.write(files[2], 0, &sector, 0).errno());
+    try testing.expectEqual(commits0 + 4, h.store.commits);
+    try testing.expectEqual(parked0 + 402, fuse_write_times_parked.load());
+    h.fs.times_park = true;
+    // The cap: the park that crosses PENDING_TIMES_DRAIN_CAP wakes the
+    // cadence (a permit stored for its next registration).
+    var wake = h.fs.times_drain_wake.notified();
+    try testing.expect(!wake.enable(testing.io));
+    wake.cancel(testing.io);
+    const cap: usize = @intCast(economy.PENDING_TIMES_DRAIN_CAP);
+    const crowd = try testing.allocator.alloc(u64, cap);
+    defer testing.allocator.free(crowd);
+    var name_buf: [8]u8 = undefined;
+    for (crowd, 0..) |*f, n| {
+        f.* = try h.create(1, try std.fmt.bufPrint(&name_buf, "c{d}", .{n}), 0o644);
+        try testing.expectEqual(@as(?linux.E, null), h.write(f.*, 0, image, 0).errno());
+    }
+    awaitCoarseTickAfter(@bitCast(clock.realtimeCoarseNs()));
+    for (crowd) |f| try testing.expectEqual(@as(?linux.E, null), h.write(f, 512, &sector, 0).errno());
+    try testing.expectEqual(economy.PENDING_TIMES_DRAIN_CAP, h.fs.pending.len());
+    wake = h.fs.times_drain_wake.notified();
+    try testing.expect(wake.enable(testing.io));
+    wake.waitUncancelable(testing.io);
+    // The drain over the cap's population: ⌈512 / 16⌉ entries.
+    const commits_cap = h.store.commits;
+    try testing.expectEqual(economy.PENDING_TIMES_DRAIN_CAP, try h.fs.drainPendingTimes(&ctx));
+    try testing.expectEqual(commits_cap + (economy.PENDING_TIMES_DRAIN_CAP + dlm.max_requests - 1) / dlm.max_requests, h.store.commits);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    for (crowd) |f| h.release(f);
+    for (files) |f| h.release(f);
+}
+
+/// The coarse clock (`now`) past `stamp`: the stamps a test compares must
+/// sit on different ticks (4 ms on the venue; the macOS clock is fine).
+fn awaitCoarseTickAfter(stamp: u64) void {
+    while (!economy.laterThan(@bitCast(clock.realtimeCoarseNs()), stamp)) std.atomic.spinLoopHint();
 }
 
 test "POSIX: create → write → read → stat; an overlay write grows the file; a write past the inline bound on a volume-less set is EFBIG and counted; truncate clips, empties at 0 and zero-extends" {

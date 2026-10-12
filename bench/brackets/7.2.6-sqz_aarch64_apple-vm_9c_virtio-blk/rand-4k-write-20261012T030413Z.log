@@ -1,0 +1,24 @@
+03:04:13 bracket[rand-4k-write]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-rand-4k-write/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (585152f3a24d-dirty, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-rand-4k-write/B/bin/squeezefs", "source": "/build/tmp/meta512-rows/fix/bin/squeezefs", "sha256": "603a03b22b0b573092b742e0b6bd454308366a5683af56d9bd216d277ca070c7", "shim_sha256": "9693777653254bcc417527672a0c5472b7982dbd5a33356aab4e7336c410b966", "train": "0.1.0", "commit": "585152f3a24d-dirty", "profile": "gate", "zig": "0.17.0", "dirty": true}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/meta512-rows/ab-rand-4k-write
+03:04:13 bracket[rand-4k-write]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+03:04:13 bracket[rand-4k-write]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+03:04:13 bracket[rand-4k-write]: leg 1 arm A: /build/tmp/meta512-rows/ab-rand-4k-write/A/bin/squeezefs (set 0, symmetric) -o ''
+03:04:13 bracket[rand-4k-write]: mounted /build/tmp/meta512-rows/ab-rand-4k-write/mnt (daemon pid 1126153)
+03:04:13 bracket[rand-4k-write]: leg 1: preparing the aging store's dataset (once per set)
+03:04:15 bracket[rand-4k-write]: leg 1: warm-up 10s (excluded)
+03:04:27 bracket[rand-4k-write]: leg 1: measured span 60s
+03:05:30 bracket[rand-4k-write]: leg 1: IOPS 11010.9 valid
+03:05:31 bracket[rand-4k-write]: leg 2 arm B: /build/tmp/meta512-rows/ab-rand-4k-write/B/bin/squeezefs (set 0, symmetric) -o ''
+03:05:32 bracket[rand-4k-write]: mounted /build/tmp/meta512-rows/ab-rand-4k-write/mnt (daemon pid 1127807)
+03:05:32 bracket[rand-4k-write]: leg 2: warm-up 10s (excluded)
+03:05:45 bracket[rand-4k-write]: leg 2: measured span 60s
+03:06:47 bracket[rand-4k-write]: leg 2: IOPS 24432.3 valid
+03:06:48 bracket[rand-4k-write]: leg 3 arm B: /build/tmp/meta512-rows/ab-rand-4k-write/B/bin/squeezefs (set 0, symmetric) -o ''
+03:06:49 bracket[rand-4k-write]: mounted /build/tmp/meta512-rows/ab-rand-4k-write/mnt (daemon pid 1129394)
+03:06:49 bracket[rand-4k-write]: leg 3: warm-up 10s (excluded)
+03:07:02 bracket[rand-4k-write]: leg 3: measured span 60s
+03:08:04 bracket[rand-4k-write]: leg 3: IOPS 24534.1 valid
+03:08:05 bracket[rand-4k-write]: leg 4 arm A: /build/tmp/meta512-rows/ab-rand-4k-write/A/bin/squeezefs (set 0, symmetric) -o ''
+03:08:06 bracket[rand-4k-write]: mounted /build/tmp/meta512-rows/ab-rand-4k-write/mnt (daemon pid 1129961)
+03:08:06 bracket[rand-4k-write]: leg 4: warm-up 10s (excluded)
+03:08:19 bracket[rand-4k-write]: leg 4: measured span 60s
+03:09:21 bracket[rand-4k-write]: leg 4: IOPS 12378.6 valid

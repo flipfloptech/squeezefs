@@ -1,0 +1,24 @@
+02:59:01 bracket[frag-512b-write]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-frag-512b-write/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (585152f3a24d-dirty, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-frag-512b-write/B/bin/squeezefs", "source": "/build/tmp/meta512-rows/fix/bin/squeezefs", "sha256": "603a03b22b0b573092b742e0b6bd454308366a5683af56d9bd216d277ca070c7", "shim_sha256": "9693777653254bcc417527672a0c5472b7982dbd5a33356aab4e7336c410b966", "train": "0.1.0", "commit": "585152f3a24d-dirty", "profile": "gate", "zig": "0.17.0", "dirty": true}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/meta512-rows/ab-frag-512b-write
+02:59:01 bracket[frag-512b-write]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+02:59:01 bracket[frag-512b-write]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+02:59:01 bracket[frag-512b-write]: leg 1 arm A: /build/tmp/meta512-rows/ab-frag-512b-write/A/bin/squeezefs (set 0, symmetric) -o ''
+02:59:01 bracket[frag-512b-write]: mounted /build/tmp/meta512-rows/ab-frag-512b-write/mnt (daemon pid 1092641)
+02:59:01 bracket[frag-512b-write]: leg 1: preparing the aging store's dataset (once per set)
+02:59:02 bracket[frag-512b-write]: leg 1: warm-up 10s (excluded)
+02:59:15 bracket[frag-512b-write]: leg 1: measured span 60s
+03:00:17 bracket[frag-512b-write]: leg 1: IOPS 7792.9 valid
+03:00:19 bracket[frag-512b-write]: leg 2 arm B: /build/tmp/meta512-rows/ab-frag-512b-write/B/bin/squeezefs (set 0, symmetric) -o ''
+03:00:20 bracket[frag-512b-write]: mounted /build/tmp/meta512-rows/ab-frag-512b-write/mnt (daemon pid 1093983)
+03:00:20 bracket[frag-512b-write]: leg 2: warm-up 10s (excluded)
+03:00:33 bracket[frag-512b-write]: leg 2: measured span 60s
+03:01:36 bracket[frag-512b-write]: leg 2: IOPS 11222.7 valid
+03:01:36 bracket[frag-512b-write]: leg 3 arm B: /build/tmp/meta512-rows/ab-frag-512b-write/B/bin/squeezefs (set 0, symmetric) -o ''
+03:01:37 bracket[frag-512b-write]: mounted /build/tmp/meta512-rows/ab-frag-512b-write/mnt (daemon pid 1109256)
+03:01:37 bracket[frag-512b-write]: leg 3: warm-up 10s (excluded)
+03:01:50 bracket[frag-512b-write]: leg 3: measured span 60s
+03:02:53 bracket[frag-512b-write]: leg 3: IOPS 12720.3 valid
+03:02:55 bracket[frag-512b-write]: leg 4 arm A: /build/tmp/meta512-rows/ab-frag-512b-write/A/bin/squeezefs (set 0, symmetric) -o ''
+03:02:56 bracket[frag-512b-write]: mounted /build/tmp/meta512-rows/ab-frag-512b-write/mnt (daemon pid 1124185)
+03:02:56 bracket[frag-512b-write]: leg 4: warm-up 10s (excluded)
+03:03:08 bracket[frag-512b-write]: leg 4: measured span 60s
+03:04:11 bracket[frag-512b-write]: leg 4: IOPS 7765.8 valid

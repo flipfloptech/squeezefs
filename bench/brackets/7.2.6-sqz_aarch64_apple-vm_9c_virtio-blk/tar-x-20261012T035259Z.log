@@ -1,0 +1,14 @@
+03:53:00 bracket[tar-x]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-tar-x/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (585152f3a24d-dirty, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-tar-x/B/bin/squeezefs", "source": "/build/tmp/meta512-rows/fix/bin/squeezefs", "sha256": "603a03b22b0b573092b742e0b6bd454308366a5683af56d9bd216d277ca070c7", "shim_sha256": "9693777653254bcc417527672a0c5472b7982dbd5a33356aab4e7336c410b966", "train": "0.1.0", "commit": "585152f3a24d-dirty", "profile": "gate", "zig": "0.17.0", "dirty": true}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/meta512-rows/ab-tar-x
+03:53:00 bracket[tar-x]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+03:53:00 bracket[tar-x]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+03:53:00 bracket[tar-x]: leg 1 arm A: /build/tmp/meta512-rows/ab-tar-x/A/bin/squeezefs (set 0, symmetric) -o ''
+03:53:00 bracket[tar-x]: mounted /build/tmp/meta512-rows/ab-tar-x/mnt (daemon pid 1308370)
+03:53:00 bracket[tar-x]: leg 1: preparing the aging store's dataset (once per set)
+03:53:06 bracket[tar-x]: leg 1: warm-up 10s (excluded)
+03:53:29 bracket[tar-x]: leg 1: measured span 60s
+03:54:35 bracket[tar-x]: leg 1: wire verbs/entry 0.0 valid
+03:55:16 bracket[tar-x]: leg 2 arm B: /build/tmp/meta512-rows/ab-tar-x/B/bin/squeezefs (set 0, symmetric) -o ''
+03:55:21 bracket[tar-x]: mounted /build/tmp/meta512-rows/ab-tar-x/mnt (daemon pid 1320466)
+03:55:21 bracket[tar-x]: leg 2: warm-up 10s (excluded)
+03:55:40 bracket[tar-x]: leg 2: measured span 60s
+03:56:54 bracket[tar-x]: leg 2: wire verbs/entry 0.0 valid

@@ -1,0 +1,24 @@
+03:09:24 bracket[fsync-4k]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-fsync-4k/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (585152f3a24d-dirty, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/ab-fsync-4k/B/bin/squeezefs", "source": "/build/tmp/meta512-rows/fix/bin/squeezefs", "sha256": "603a03b22b0b573092b742e0b6bd454308366a5683af56d9bd216d277ca070c7", "shim_sha256": "9693777653254bcc417527672a0c5472b7982dbd5a33356aab4e7336c410b966", "train": "0.1.0", "commit": "585152f3a24d-dirty", "profile": "gate", "zig": "0.17.0", "dirty": true}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/meta512-rows/ab-fsync-4k
+03:09:24 bracket[fsync-4k]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+03:09:24 bracket[fsync-4k]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+03:09:24 bracket[fsync-4k]: leg 1 arm A: /build/tmp/meta512-rows/ab-fsync-4k/A/bin/squeezefs (set 0, symmetric) -o ''
+03:09:24 bracket[fsync-4k]: mounted /build/tmp/meta512-rows/ab-fsync-4k/mnt (daemon pid 1130422)
+03:09:24 bracket[fsync-4k]: leg 1: preparing the aging store's dataset (once per set)
+03:09:25 bracket[fsync-4k]: leg 1: warm-up 10s (excluded)
+03:09:37 bracket[fsync-4k]: leg 1: measured span 60s
+03:10:40 bracket[fsync-4k]: leg 1: IOPS 6082.7 valid
+03:10:42 bracket[fsync-4k]: leg 2 arm B: /build/tmp/meta512-rows/ab-fsync-4k/B/bin/squeezefs (set 0, symmetric) -o ''
+03:10:43 bracket[fsync-4k]: mounted /build/tmp/meta512-rows/ab-fsync-4k/mnt (daemon pid 1130675)
+03:10:43 bracket[fsync-4k]: leg 2: warm-up 10s (excluded)
+03:10:55 bracket[fsync-4k]: leg 2: measured span 60s
+03:11:58 bracket[fsync-4k]: leg 2: IOPS 7490.6 valid
+03:11:59 bracket[fsync-4k]: leg 3 arm B: /build/tmp/meta512-rows/ab-fsync-4k/B/bin/squeezefs (set 0, symmetric) -o ''
+03:12:00 bracket[fsync-4k]: mounted /build/tmp/meta512-rows/ab-fsync-4k/mnt (daemon pid 1130902)
+03:12:00 bracket[fsync-4k]: leg 3: warm-up 10s (excluded)
+03:12:12 bracket[fsync-4k]: leg 3: measured span 60s
+03:13:15 bracket[fsync-4k]: leg 3: IOPS 7663.4 valid
+03:13:16 bracket[fsync-4k]: leg 4 arm A: /build/tmp/meta512-rows/ab-fsync-4k/A/bin/squeezefs (set 0, symmetric) -o ''
+03:13:16 bracket[fsync-4k]: mounted /build/tmp/meta512-rows/ab-fsync-4k/mnt (daemon pid 1131136)
+03:13:16 bracket[fsync-4k]: leg 4: warm-up 10s (excluded)
+03:13:29 bracket[fsync-4k]: leg 4: measured span 60s
+03:14:32 bracket[fsync-4k]: leg 4: IOPS 6227.8 valid

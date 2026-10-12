@@ -172,7 +172,10 @@ IPC = ["ipc_ops_read", "ipc_ops_write", "ipc_bytes_in", "ipc_bytes_out", "ipc_se
        "ipc_client_aio_unknown_ctx_ops"]
 JOURNAL = ["meta_kv_journal_entries", "meta_kv_journal_pad_entries", "meta_kv_journal_bytes",
            "meta_conveyor_drained_txs", "meta_conveyor_acks", "journal_lane_barriers_strict",
-           "journal_lane_barriers_coalesced"]
+           "journal_lane_barriers_coalesced",
+           # The write-stamp park (decision 0003 §L.6): size-neutral writes that journaled
+           # nothing, the batched drains that made their stamps durable, the Δs they carried.
+           "fuse_write_times_parked", "meta_kv_times_echo_drain_commits", "meta_kv_times_echo_drained"]
 # The metadata-WRITE ledger (decision 0003 §L). The two device-write arms of
 # the META device — the journal lane's own ring writes and the io pool's
 # (node appends and images, ledger slots, bitmap and appender pages) — sum

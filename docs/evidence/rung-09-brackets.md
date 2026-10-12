@@ -166,6 +166,11 @@ at 13 % of the 32 k creates/s bar; the kernel-FUSE rand-4k rows at 5 % of
 seq rows at 1–20 % of the GB/s bars — on 9 vCPU, loopback TCP and one virtio
 disk, as expected.)
 
+**Build mode: every daemon in this table was a DEBUG build** (`ce0edf4` predates `efdc88b`,
+which made the product binary ReleaseSafe by default — `rung-09-memory-footprint.md` §1; the
+"gate profile" label names the step, not the optimize mode). The numbers stand as recorded;
+§3.1 re-measures the key rows on the ReleaseSafe binary.
+
 | row | substrate | mount / lever | instrument | legs (A,B,B,A) | A mean | noise band | p50 / p99 µs | device÷user stats / disk | wareq-sz disk B | reclaim q+e=t | admission ×user | wire rpcs | tripwires | tick rescues | verdict | record |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | creates-mdtest | nvmet-loop | defaults | mdtest | 3719, 3906, 3488, 4623 | **4171 creates/s** | 28.9 % | — / — | — / — | — | 0+0=0 | — | 0 | 0 | 0 | SCOPING-VALID | `creates-mdtest-20261010T160749Z.json` |
@@ -266,6 +271,40 @@ Every record (JSON, md, harness log, per-leg daemon logs) is under
 `bench/brackets/7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk/`; the io500 run
 under `io500-<date>/` there; the wedge evidence under
 `wedge-seq-write-1m-buffered-20261010T1232Z/`.
+
+### 3.1 ReleaseSafe scoping rows at `585152f` (2026-10-12 02:25–02:55 UTC)
+
+The key rows of §3 re-measured on the ReleaseSafe binary (`585152f3a24d`, the
+default build since `efdc88b`; `bench/brackets/<venue>/<row>-20261012T02*`),
+SCOPING: 2 legs × 60 s (+10 s warm-up) of the same binary on **nvmet-loop**
+for every row (§3 ran the seq rows on nvmet-tcp — the two loopback fabrics
+serve reads from the same page cache), `BRK_FILE_SIZE=512m` (4 × 512 MiB),
+budget 7168 MiB, numjobs 4, iodepth 32 (the shim read row ran libaio QD32
+here; §3's ran psync QD1 — not the same shape). The venue was NOT quiet: a
+second agent's `kill -9 mid-tar -x` smoke loop ran throughout (`loadavg`
+2–10 per leg, recorded in each record). Every leg VALID, every ledger verdict
+green (admission ×1.0000, META arms ≡ diskstats ×1.0000, the §L pacing bound,
+the §K read bounds, 0 tripwires, 0 tick rescues, Green budget).
+
+| row | legs (A, B) | p50 / p99 µs | device ÷ user data ; META (diskstats) | the rest of the ledger | Debug row (§3) → delta | record |
+|---|---|---|---|---|---|---|
+| rand-4k-read | **39 630 / 47 130 IOPS** | 2 900 / 8 454 ; 2 408 / 7 242 | read 1.000 ; — | every read the direct device leg, `read_amplification_bound` 1.000 ≤ 1.05 | 25 820 (band 29 %) → **+1.5–1.8×** | `rand-4k-read-20261012T022545Z` |
+| rand-4k-write | **10 724 / 12 479 IOPS** | 9 110 / 27 394 ; 7 897 / 24 773 | 1.003 / 1.002 ; **0.576 / 0.592** | `wareq-sz` 4 122 / 4 118 B (one 4 KiB patch per write); 1.83 / 1.78 entries per window, 2 243 / 2 305 journal B/op, the worth gate open; reclaim 0+4=4 | 3 014 INVALID (nvmet-loop), 7 351 (file, band 0.8 %) → **+1.5–1.7× the file row**; META 0.73–0.75 → 0.58–0.59 (§L's gate) | `rand-4k-write-20261012T022822Z` |
+| seq-read-1m-direct | **18 347 / 16 597 MiB/s** | 6 521 / 14 090 ; 7 242 / 15 794 | read 1.000 ; — | the target's page cache through nvme loopback (F12); `read_amplification_bound` ok | 7 877 (nvmet-tcp, band 16 %) → **+2.1–2.3×** (part fabric: loop vs TCP) | `seq-read-1m-direct-20261012T023058Z` |
+| seq-write-1m-direct | **1 737 / 1 235 MiB/s** | 68 682 / 333 447 ; 77 070 / 583 008 | 1.000 / 1.000 ; 0.005 / 0.005 | `wareq-sz` 1 069 874 / 1 067 801 B (the 1 MiB block); reclaim 0+26 060 / 0+18 663 (every terminal free elided); 0 EAGAIN, 0 wedges, 0 wall refusals | 0 INVALID (F1/F2/F17), 1 247 / 1 263 on `7f76af1` (Debug, nvmet-tcp, 6 GiB set) → **+0–1.4×** | `seq-write-1m-direct-20261012T023335Z` |
+| creates-mdtest | **7 556 / 9 722 creates/s** | — | — ; — | 1.009 journal entries per create, 2 523 / 2 669 journal B/create + 2 457 / 2 412 B/create of node appends (the bsets); 1.64 / 1.55 entries per window | 4 171 (band 29 %) → **+1.8–2.3×** | `creates-mdtest-20261012T023612Z` |
+| stat-mdtest | **50 703 / 52 582 stats/s** | — | — ; — | 100 k stats over a tree created once; 0 journal entries; the warm pass 0 node reads (every record cache-resident) | no Debug row (added 2026-10-11 on ReleaseSafe: 19:07 UTC's record) | `stat-mdtest-20261012T024445Z` |
+| fsync-4k | **6 171 / 4 920 fsyncs/s** | write 268 / 651 ; 301 / 1 270 | 1.019 / 1.021 ; 0.964 / 0.962 | fsync mean **277 µs** = `data_barrier` 147 + `meta_barrier` 128 (+ 2 µs); 1.07 entries per window; reclaim 0+7=7 | 1 754 (band 85 %; fsync mean 1 343 µs = 824 + 517) → **+2.8–3.5×**, the barriers 5× cheaper on the rebooted venue (F14's A/B measured the same 145/124) | `fsync-4k-20261012T024524Z` |
+| shim-rand-4k-read | **24 712 / 23 193 IOPS** (libaio QD32 × 4) | 3 981 / 20 578 ; 4 178 / 21 103 | read 1.000 ; — | `ipc_ops_read` ≡ fio's ops (100 % engagement, 4 sessions), the copy ledger ×1.000, `read_amplification_bound` 1.000 ≤ 1.05 | 10 690 (psync QD1 × 4, band 51 %) → not the same shape; per-op the shim's path is unchanged | `shim-rand-4k-read-20261012T024800Z` |
+| tar-x | **1 842 / 2 064 entries/s** | — | — ; — | 12 extractions × 10 501 entries per leg, 0 wire verbs per entry, **5.236 / 5.233 journal entries per tar entry** (create + write + utimes/chmod), 1.45 / 1.43 entries per window | 1.0–1.2 k entries/s (INVALID: F1's wedge, Yellow) → **+1.5–2×**, no wedge | `tar-x-20261012T025036Z` |
+
+The delta is the build mode AND the day's fixes (F1/F2/F6/F17, §L, the
+read-amplification series) AND the rebooted venue's cheaper barriers — the
+§3 numbers were never a baseline to regress against (the noise band itself
+was 15–112 %); these are the first rows the box can be compared to. The
+metadata-plane ratios that are build-mode-independent agree with §3 where a
+§3 row had them: 1.01 entries per create, 5.23 per tar entry, `device ÷ user`
+1.00–1.02 on the data namespaces.
 
 ### io500
 
@@ -627,9 +666,57 @@ META ledgers closing to ×1.0000. The pad fraction itself barely moves
 (0.966 → 0.953 on `rand-4k-write`): with 76 B entries the page is 97.6 %
 pad at one entry and 94.6 % at two — the bytes per op halve while the
 fraction hardly reads it; `entries per window` and `B/op` are the
-instruments. The floor the law cannot cross on the 512 B shape (the entry
+instruments. ~~The floor the law cannot cross on the 512 B shape (the entry
 and the bset appends ≈ 180 B/op) and the grain lever (512 B LBAs on the
-metadata namespaces) are in §L.4.
+metadata namespaces) are in §L.4.~~ Superseded by the second resolution.
+
+*Second resolution — the 512 B shape was not at a floor* (2026-10-12; decision
+0003 §L.6, 0002 rows 481–482; the suites note's defect 27). The owner asked
+for the arithmetic: 5.3 × 512 B ≈ 2.7 KB of metadata device per 512 B write
+does not match a 180 B/op floor. It does not, because 180 B/op was the
+entry-and-bset floor WITH one entry per write and the shape paid for the
+PAD: per write (the B legs of `frag-512b-write-20261012T001908Z`; the A legs
+agree within 2 %) — 1.0004 journal entries of 76.0 B; windows of **1.56
+entries**, every one a 4 KiB page; `journal_lane_write_bytes` **2,628 B/op**
+= entries 76.0 + page headers 15.4 + **pad 2,536** (96.5 %);
+`meta_io_write_bytes` **110 B/op** (node appends 100.9 — one Δ record per
+write in the leaf's bsets — rewrites 5.0, ledger 3.8); staging / W2 spill 0
+(staging off; a spill targets the ring); Σ **2,738 B/op = 5.35 ×**. The FUSE
+write size was 512 B (533,297 writes = 533,349 FUSE ops = 533,297 payload
+leases; nothing merged). The committers: 4 (the row is psync QD1 × 4, not
+QD32); a commit's journal phase ≈ 27 µs pass + 92 µs round trip of a 451 µs
+mean op, so ≈ 1 committer sits in the journal at any instant, the pass
+drains `λ·L_p = 0.24` beyond the first and bunching lifts it to 1.56; 55 %
+of the windows found NOTHING in flight, and the hold's probes collected
+0–0.25 because the free committers were `4 − n_flight − n_held ≈ 0.9`. With
+one entry per write a closed loop of `c` committers caps the window at
+`n ≤ c`, so `journal B/op = g/n̄ ∈ [g/c, g]` = 1,024–4,096 here whatever the
+pacing — the component above its derived bound was the ENTRY COUNT: a
+size-neutral write's record is two timestamps, and the reference's law for
+it is zero entries (`park_write_times`). The fix: a size-neutral striped
+write PARKS its stamp (fold-visible, drained in batched Δ commits of ≤ 16
+inos on the flush cadence / fsync / dismount); an extending write commits
+its Δ(size, mtime, ctime) as before; strict mode commits per write.
+
+A/B (A = `585152f`, B = the park on the same tree; nvmet-loop, 4 × 60 s legs
+A B B A, 2026-10-12 02:59–03:3x UTC, a second agent's kill-loop live on the
+venue (`loadavg` 3.8–4.6); records `bench/brackets/<venue>/{frag-512b-write,
+rand-4k-write,fsync-4k,creates-mdtest}-20261012T0{259,304,3..}*`):
+
+| row | A legs 1/4 | B legs 2/3 | A/B (spread) | META ÷ user A → B | journal B/op; entries/op | p50 / p99 (A → B) | the park |
+|---|---|---|---|---|---|---|---|
+| `frag-512b-write` (QD1 × 4, 512 B buffered over pre-sized files) | 7 793 / 7 766 IOPS | **11 223 / 12 720** | **0.650** (A 0.3 %, B 12 %) | **5.885 / 5.661 → 0.019 / 0.017** | 2 903 / 2 789 → **7.3 / 6.4 B/op**; 1.000 → **0.0018 / 0.0016** entries per write (1 200 / 1 193 entries per leg = one drain per 50 ms carrying 3.9 Δs; `meta_io` 110 → 2.2 B/op; node reads 382 → 8) | 276 / 268 → **116 / 111 µs**; p99 2.5 / 2.9 ms → **0.88 / 0.39 ms** | `fuse_write_times_parked` 673 374 / 763 534 ≡ the writes; drains 1 188 / 1 181, Δs 4 691 / 4 720; data `device ÷ user` 7.00 / 6.99 → 7.08 / 6.96 (the §J.1 in-place fold, unchanged); daemon CPU 81.8 / 80.5 s → 79.0 / 87.1 s for 1.45–1.64 × the ops |
+| `rand-4k-write` (QD32 × 4, W1 patches) | 11 011 / 12 379 IOPS | **24 432 / 24 534** | **0.478** (A 12 %, B 0.4 %) | **0.586 / 0.598 → 0.0008 / 0.0008** | 2 283 / 2 331 → **2 B/op**; 1.000 → **0.0005** entries per write (789 / 720 drain entries per leg, 3.9 Δs each); `meta_io` 116 → 1 B/op | 8 716 / 7 963 → **2 572 / 2 441 µs** (mean 11.6 / 10.3 → 5.2 / 5.2 ms); p99 25.8 / 25.3 → 59.0 / 61.1 ms — the data namespace's queue at twice the throughput (`device ÷ user` data 1.007 / 1.003 → 0.997 / 0.996, `wareq-sz` the 4 KiB patch) | parked 1 466 109 / 1 472 388 ≡ the writes; the worth gate had nothing to pace (holds 139 k / 126 k → 0); daemon CPU 121 / 132 → 129 / 130 s for 2.0–2.2 × the ops |
+| `fsync-4k` (QD1 × 4, fsync per write) | 6 083 / 6 228 fsyncs/s | **7 491 / 7 663** | **0.812** (A 2.4 %, B 2.3 %) | **0.959 / 0.958 → 0.129 / 0.126** | 3 822 / 3 816 → **514 / 503 B/op**; 1.000 → **0.133 / 0.130** entries per op: `fsync(ino)` drains that ino's stamp, and a stamp inside the COARSE clock's tick of the last drained one (4 ms on the venue) advances nothing — one Δ per file per tick (4 files × 250 ticks/s ≈ 1 000 drains/s ≈ 59.8 k per leg), every fsync still returning with the served mtime durable | write p50 276 / 268 → **151 / 148 µs** (p99 659 / 635 → 489 / 477); fsync mean 279 / 273 → **252 / 245 µs** = `data_barrier` 150 / 147 → 137 / 134 + `meta_barrier` 128 / 125 → 113 / 111 | parked 449 446 / 459 811 ≡ the writes; drains 59 789 / 59 833 (one Δ each); data `device ÷ user` 1.006 / 1.014 → 1.023 / 1.024 |
+| `creates-mdtest` (4 tasks) | 12 659 / 10 302 creates/s | 10 555 / 10 946 | 1.068 inside A's 20.5 % spread | — (no user bytes) | 2 458 / 2 610 → 2 621 / 2 557 B/create; 1.009 → 1.009 entries per create | — | **unchanged by construction**: a create parks nothing (`fuse_write_times_parked` 0 on every leg); the worth gate's holds 69–74 k → 65–71 k |
+
+Every leg VALID, 0 tripwires, 0 tick rescues, the admission / META / read
+ledgers closing to ×1.0000; the data-side `write_amplification_bound`
+(§J.1) holds on every write leg with the same ratios on both arms. `tar-x`
+(a 2-leg scoping A/B, `tar-x-20261012T035259Z`): 1 958 → 2 304 entries/s
+inside the row's noise, 5.234 / 5.233 journal entries per tar entry, 0
+parks on either arm — unchanged by construction (a tar entry is a create,
+an EXTENDING write and a setattr).
 
 F15. `read_dest_lease_bytes` is the dest-lease mechanism's gauge over the
 same bytes `read_dest_dma_bytes` lands (1:1 on the shim read row); summing
@@ -728,7 +815,8 @@ with supply VISIBLE"; `reclaim` "the debt drainer's pace is the device's…"
 debt: two single-batch passes then the cold rest with 8 still owed; the
 shipped loop drained all 16 at once).
 
-**The first A/B through the harness** (A = `53d05e1`, B = `7f76af1`,
+**The first A/B through the harness** (A = `53d05e1`, B = `7f76af1` — both
+DEBUG builds: both trees predate `efdc88b`'s ReleaseSafe default;
 nvmet-tcp, the DEFAULT 6 GiB × 2 set, 1g/job, QD32 × 4, A→B→B→A,
 record `seq-write-1m-direct-20261011T011807Z`): both A legs INVALID — fio
 rc 3, 96 ENOSPC (error 28) each, `parked_gate_wall_refusals` 96,
@@ -775,6 +863,9 @@ found 4096").
 
 ### Measured rows after the F1/F2/F6 fixes (binary `34dedf3`, nvmet-tcp, QD32 × 4)
 
+Build mode: `34dedf3` is a DEBUG build (it predates `efdc88b`); the wedge, EAGAIN and rescue
+counts below are build-mode-independent, the MiB/s are not — §3.1 carries the ReleaseSafe rows.
+
 `seq-write-1m-buffered` (1g/job, 4 legs × 60 s): **0 wedges** (pre-fix:
 2 of 4 legs wedged on this row, 5 wedges in the day); 483–519 MiB/s;
 `meta_conveyor_park_tick_rescues` 0 / `journal_lane_park_tick_rescues` 0
@@ -801,7 +892,10 @@ bytes moved ≤ 11 × bytes appended) with `journal_entries_per_append ≤ 1.05`
 write_bytes` / `fold_inplace_dmas` joined the device-write arms (`bench.zig` pinned equal by
 the rail). Both rows ran A-B-B-A, 4 legs × 60 s (+10 s warm-up), `file` substrate, numjobs 4,
 budget 6144 MiB, this venue; the `mem_budget_green` INVALIDs below are the shared cgroup's
-pressure signal (other agents' daemons), not the rows'.
+pressure signal (other agents' daemons), not the rows'. Build mode: the A arm (`f5c3079`) is
+ReleaseSafe, the B arm (`c36b531`, `efdc88b`'s parent) a DEBUG build — the device-byte
+ratios (the rows' law) are build-mode-independent; the IOPS and latency deltas carry the
+build mode beside the fix.
 
 | row | leg/arm | headline | p50 / p99 µs | device÷user (stats) | device÷user (diskstats) | the law | record |
 |---|---|---|---|---|---|---|---|

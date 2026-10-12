@@ -238,8 +238,9 @@ for the last link). WHY a quarter: the ring's own headroom law (`highWater = max
 reserves a quarter for the drain's lag, so the append slack never exceeds what the pool has
 promised to keep free; a larger slack (doubling → 5×) would strand half the ring under
 stop-growing files until their promotion. The journal: one Δ`(size, mtime, ctime)` inode record
-per write (the Put stays for KILLPRIV's mode strip), one entry per op, concurrent appenders
-coalesced by the conveyor's window.
+per EXTENDING write (the Put stays for KILLPRIV's mode strip), one entry per append, concurrent
+appenders coalesced by the conveyor's window; a size-neutral striped write journals nothing of its
+own — its stamp is a parked refinement (§L.6).
 
 The chain is over the image's GROWTH: a write that lands `e` bytes `h` bytes past the end grows
 the record by `e + h` (the hole is zero-filled in the ring), so the bound on moved bytes per USER
@@ -390,19 +391,119 @@ start — then re-drains what arrived meanwhile into the SAME window and issues 
 | shape | `s` | `λ` | `R` | `λ·R` | the law | before | after |
 |---|---|---|---|---|---|---|---|
 | `rand-4k-write` (W1 patch, QD32 × 4) | 76 | 9.5–11 k/s | 180–300 µs | 1.9–3 | gate ON: `n ≥ 2.3` ⇒ ≤ 1,760 B/op | 0.70–0.71 × user (n̄ 1.46) | **0.475 × user** (n̄ 2.24, 1,824 B/op), IOPS 11,982/11,989 → 12,088/11,943 (A/B 0.997, spread 1.2 %), p50 8,290 → 8,290 µs, p99 25.0 → 24.8 ms; the gate open 88 % of the windows (gain 0.7–0.9 per hold at the band) |
-| `frag-512b-write` (generic/074's 512 B at a 1 KiB stride, 4 QD1 jobs) | 76 | 8.4 k/s | 76–95 µs | 0.65–0.8 | gate OFF (0.35 collected per probe): unchanged by design — the floor below | 5.4–5.8 × user (2,800 B/op; n̄ 1.46) | 5.35–5.40 × user (gate off: 5 % of the windows probed, gain 0–0.25), IOPS 9,026/8,735 → 8,726/8,944 (A/B 1.005), p50 247–253 µs both |
+| `frag-512b-write` (generic/074's 512 B at a 1 KiB stride, 4 QD1 jobs) | 76 | 8.4 k/s | 76–95 µs | 0.65–0.8 | gate OFF (0.35 collected per probe): the pacing law cannot reach it — the entry was not owed (§L.6) | 5.4–5.8 × user (2,800 B/op; n̄ 1.46) | 5.35–5.40 × user (gate off: 5 % of the windows probed, gain 0–0.25), IOPS 9,026/8,735 → 8,726/8,944 (A/B 1.005), p50 247–253 µs both; **§L.6: 0.019 × user at +54 % IOPS** |
 | `creates-mdtest` (4 tasks, QD1 each) | ≈ 200 | 9–13 k/s | 66–110 µs | 0.8–1.2 | borderline: the gate decides on the measured gain | ≈ 5.1 KB/create (half of it node images and appends) | 4,753/4,748 B/create (gate mostly off: 12 % held in bursts, gain 0.1–0.4; 1.7 entries/window), creates/s 12,283/9,389 → 12,754/12,235 (A/B 0.867 inside the row's 29 % spread) |
 | `fsync-4k` (4 jobs, QD1 each, fsync per write) | 76 + layout | 5–6 k/s | 80 µs | 0.4 | gate OFF (0.09): no hold | 0.96 × user, fsync p50 281–322 µs | 0.960 → 0.960 × user (gate off: 2 % probed, gain 0–0.13), fsyncs/s 6,259/6,089 → 6,285/6,319 (A/B 0.980), fsync mean 339/348 → 337/335 µs, p99 618/651 → 610/602 µs; `data_barrier` 147/150 → 145/144, `meta_barrier` 124/128 → 124/124 |
 | `tar -x` (one thread) | ≈ 200 | 1–1.2 k entries/s | — | — | nothing in flight when the next arrives: no hold | 5.21 entries/tar entry | unchanged by construction |
 | the 727 k IOPS bar (box) | 76 | 727 k/s | ≈ 100 µs | 73 | entry-majority: pipelined, `2s` = 152 B/op | — | the law never engages: `λ·L_p` already fills pages |
 
-The floor the law cannot cross: a 76 B entry is 1.9 % of a 4 KiB page, and the 512 B shape also
-lands ≈ 100 B/op of bset appends (the inode Δ records flushed from the leaves), so that shape's
-metadata cost is ≥ ≈ 180 B/op (0.35 × user) at any pacing — the entry and the bset, not the pad —
-and at its QD1 × 4 rate the hold collects nothing. The remaining lever is the grain: on a 512 B-LBA
-metadata namespace the pad per window is ≤ 536 B and a lone 76 B entry costs 512 B, not 4,096 — the
-box's metadata namespaces should be formatted at 512 B LBAs (nvmet's file backend defaults to 4 KiB,
-`blksize_shift` 12, the venue's number).
+~~The floor the law cannot cross: a 76 B entry is 1.9 % of a 4 KiB page, and the 512 B shape also
+lands ≈ 100 B/op of bset appends, so that shape's metadata cost is ≥ ≈ 180 B/op (0.35 × user) at any
+pacing.~~ **Superseded by §L.6 (2026-10-12)**: 180 B/op was the entry-and-bset floor WITH one entry
+per write, not what the shape paid — it paid 2,738 B/op, 92.6 % of it pad, because a closed loop
+of `c` committers caps the window at `n ≤ c` entries and the measured `n̄` was 1.56; and the entry
+itself was not owed: a size-neutral write's record is two timestamps. The grain lever stands as a
+substrate fact (a 512 B-LBA metadata namespace prices a lone entry at 512 B, not 4,096; nvmet's file
+backend defaults to `blksize_shift` 12), but it is no longer the remaining lever.
+
+### L.6 The write-stamp park: a size-neutral write journals nothing (2026-10-12; `rung-09-brackets.md` F14's second resolution, `rung-09-external-suites.md` defect 27)
+
+**The decomposition** (`frag-512b-write`, 4 psync QD1 jobs — NOT QD32 — of 512 B buffered random
+writes over pre-sized files, nvmet-loop, the recorded B legs of `frag-512b-write-20261012T001908Z`;
+the A legs agree within 2 %): 533,297 writes = 533,349 FUSE ops = 533,297 payload leases — every
+write(2) is its own 512 B `FUSE_WRITE` (the mount is write-through; nothing merges). Journal entries
+533,522 = **1.0004 per write**, 76.0 B each (the Δ(size, mtime, ctime) of §J.2); windows 342,143 →
+**n̄ = 1.56 entries per window**, every window ONE 4 KiB page (342,143 page headers). META device
+bytes per write: `journal_lane_write_bytes` **2,628 B/op** = entries 76.0 + page headers 15.4 +
+**pad 2,536** (96.5 % of the journal's bytes); `meta_io_write_bytes` **110 B/op** = node appends
+100.9 (the leaf's bset flushes: ≈ one Δ record per write, 4 KiB-padded per checkpoint; the leaf fills
+and rewrites every ≈ 0.3 s — `node_rewrite` 5.0) + ledger 3.8; staging ring / W2 spill **0** (staging
+is off on the set; a spill targets the staging ring, never the metadata device). Total **2,738 B/op =
+5.35 × 512** — the arithmetic closes on the measured 5.347. The committers: 4; a commit's journal
+phase ≈ pass 27 µs + round trip 92 µs of a 451 µs mean op (p50 253 µs), so ≈ 1.06 committers sit
+in the journal at any instant, the pass drains `λ·L_p = 8.7 k/s × 27 µs = 0.24` beyond the first,
+and cohort bunching lifts it to 1.56; 55 % of the windows found NOTHING in flight (`unshadowed −
+not_worth` = 189 k of 342 k) and the hold's probes collected 0–0.25: the free committers were
+`c − n_flight − n_held ≈ 0.9`, each back inside a 92 µs hold with probability `R / T_nj ≈ 92/330`.
+
+**The bound at a closed loop.** With one entry per write and `c` committers each waiting for its
+landing (charter §5.2: acks after the landing), a window carries `1 ≤ n ≤ c` entries whatever the
+pacing — perfect coalescing is `c` per window and costs every committer the slowest one's cycle —
+so on a `g`-grained ring
+
+    journal bytes/op = g / n̄ + 24/n̄ (headers)    with    1 ≤ n̄ ≤ c    ⇒    g/c ≤ bytes/op ≤ g
+
+4 KiB / 4 = 1,024 B/op at the unreachable best, 2,628 measured at n̄ 1.56, 4,096 at a lone
+committer: `bytes/op = f(g, s, c)` is dominated by `g/n̄`, the entry `s` enters only as `n̄·s` of
+the page (119 B of 4,096) and through the bset's ≈ 101 B/op, and NO pacing of a one-entry-per-write
+journal gets this shape under 2 × the user bytes. The component above its derived bound is therefore **the entry count**: a size-neutral
+write — the W1 patch, the W2 overwrite, generic/074's whole shape, every `rand*write` row over a
+pre-sized file — changes only `mtime`/`ctime`, and the reference's law for exactly that record is
+ZERO entries: `park_write_times` ("the ONE durable authority for the write's mtime/ctime — the same
+stamp the FUSE handler publishes to the attr cache. RAM-parked (zero hot-path journal entries),
+fold-visible on every read, journaled by the batched drain / the fsync/unmount durability points";
+the size claim "publishes ONLY when the claim was genuine growth"). The port had the map
+(`economy.PendingTimes`, the SETATTR-echo absorber) and the drain's helpers but no drain task, and
+its write postlude committed the Δ per write — §J.2's "one entry per op" was derived for APPENDS
+(growth) and applied to every write. A port gap, not a reference quirk.
+
+**The ruling** (`kv_fs.writeStriped`, `parkWriteTimes`, `drainPendingTimes`; `cli/mount.zig`
+`TimesDrainCadence`):
+
+1. **A size-neutral striped write parks its stamp** under the ino's exclusive guard (`PendingTimes.
+   park`, the signed monotone max — the same law `fold` serves it by on every inode read); the tx
+   stays empty, nothing commits, the write's latency loses the journal round trip. An EXTENDING write
+   commits its Δ(size, mtime, ctime) per op as before (§J.2: size never leads data; the kill matrix's
+   "whole or empty" rests on it); a KILLPRIV write commits its Put. Under the coalesced cadence only —
+   **strict mode (`META_FLUSH_INTERVAL_MS=0`) commits per write**: that mount declared latency over
+   bytes and its ack means durable, and parking there would make it mean "within a drain".
+2. **The drain** journals every parked refinement (the write stamps, the absorbed echoes) in batched
+   Δ commits — `PENDING_TIMES_DRAIN_BATCH` (128) snapshotted per pass, committed in sub-batches of
+   `dlm.max_requests` (16) inos under ONE ordinary canonical plan each (a drain never holds more
+   inodes exclusive across a commit than any op's own guard set may; the reference's 128-wide set is
+   not owed). Triggers: the daemon's cadence (a meta fiber parked on `times_drain_wake` with the
+   flush interval as its deadline — register-then-check, never a sleep), the cap crossing (512
+   parked wakes it early), `fsync(ino)` (that ino alone, ONE Δ ahead of the barriers — the exact
+   POSIX scope; the reference drains the whole volume), `fsyncdir` and the dismount (`destroy`,
+   every teardown path) ahead of their barriers. A drain member whose stamp no longer advances the
+   stored record (a committed write superseded it; a destroyed corpse) stages nothing and retires.
+3. **The retire is conditional** (`PendingTimes.retireIfStill`): the drain's guards drop at the
+   commit's terminal outcome before the retire runs, so a write that parked a NEWER stamp in between
+   keeps it for the next drain — an unconditional retire would lose a stream's last stamp.
+4. **A moved slot's refinements are dropped, never left to poison the door**: a batch refused
+   `SlotMoved` (the slot leased to another appender since the park) retires its members and counts
+   `meta_kv_times_echo_foreign_dropped` (the reference's defect 31); any other failure keeps them
+   parked for the next trigger.
+5. **Durability.** A parked stamp is journaled within one flush interval of its write (50 ms
+   shipped) — the same bound the coalesced barrier already gives an ACKED entry against a power cut,
+   and tighter than ext4's 5 s commit interval for an inode dirtied by a buffered write; a daemon kill
+   inside the interval leaves the file with its new bytes (the W1 patch landed; a W2 park's bytes
+   were volatile anyway) and the previous mtime — ext4's own post-crash shape. `fsync` closes it.
+   A write's stamp never regresses an mtime set ahead of it by `utimes` (the fold's law; the
+   reference's too).
+
+**Laws** (the §L.6 test in `kv_fs.zig` restates each over a RAM store): a size-neutral striped
+write commits 0 entries and parks 1 stamp (`fuse_write_times_parked`); the drain commits ⌈parked /
+16⌉ entries and the stored record then carries exactly the served stamp; `fsync(ino)` costs ≤ 1
+entry; an extending write costs 1 (§J.2's `≤ 1.05` for appends stands); the cap wakes the cadence;
+strict mode commits per write. The bound this buys the 512 B shape: journal entries per op ≤
+`⌈inos / 16⌉ / (interval × IOPS)` = 4 inos at 50 ms and 8.7 k IOPS → **0.0023 entries/op**, ≈ 9 B/op
+of journal + the bset's Δ once per inode per checkpoint; the data device's §J.1 bound is untouched.
+On an fsync-per-write shape the bound is one Δ per file per tick of the COARSE stamp clock (a stamp
+inside the tick of the last drained one advances nothing and the drain stages nothing): 4 files at
+the venue's 4 ms tick → ≤ 1,000 entries/s whatever the fsync rate.
+
+**Measured** (nvmet-loop, 4 × 60 s legs A B B A, A = `585152f`, B = the park on the same tree;
+`rung-09-brackets.md` F14, second resolution): `frag-512b-write` META ÷ user **5.885 / 5.661 → 0.019 /
+0.017**, journal 2,903 / 2,789 → 7.3 / 6.4 B/op (0.0018 entries per write: one drain per 50 ms carrying
+3.9 Δs), IOPS 7,793 / 7,766 → **11,223 / 12,720** (A/B 0.650), p50 276 / 268 → **116 / 111 µs**, p99
+2.5 / 2.9 → 0.88 / 0.39 ms, the data device's 7.0× (§J.1) unchanged; `rand-4k-write` META ÷ user
+**0.586 / 0.598 → 0.0008**, IOPS 11,011 / 12,379 → **24,432 / 24,534** (A/B 0.478, B spread 0.4 %),
+p50 8.7 / 8.0 → 2.6 / 2.4 ms (p99 25.8 → 59–61 ms: the data namespace's own queue at twice the
+throughput); `fsync-4k` META ÷ user **0.959 → 0.128**, 0.13 entries per op (the tick law above),
+fsyncs/s 6,083 / 6,228 → **7,491 / 7,663** (A/B 0.812), write p50 276 → 151 µs, fsync mean 279 →
+252 µs; `creates-mdtest` unchanged by construction (0 parks; A/B 1.068 inside A's 20.5 % spread).
+Every leg VALID, 0 tripwires, 0 tick rescues, every ledger closing to ×1.0000.
 
 ### L.5 Rejected
 

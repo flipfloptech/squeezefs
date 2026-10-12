@@ -712,11 +712,13 @@ pub fn renameEntriesPerOp(ops: u64, drain_commits: u64) f64 {
 // setattr + THE ABSORBER.
 // ---------------------------------------------------------------------------
 
-/// Inos per drain transaction — one DLM `lockMany` set, one entry (the
-/// `destroy_inodes` batching shape: wide enough that a storm's echoes
-/// amortize to a few entries per thousand ops, narrow enough that one
-/// entry's records stay far inside the 128 KiB whole-entry cap at 10–18 B
-/// per Δ).
+/// Inos per drain pass's snapshot (the `destroy_inodes` batching shape:
+/// wide enough that a storm's refinements amortize to a few entries per
+/// thousand ops, narrow enough that a pass's records stay far inside the
+/// 128 KiB whole-entry cap at 10–18 B per Δ). The drain commits it in
+/// sub-batches of `dlm.max_requests` inos — one ordinary canonical plan
+/// per entry, so a drain never holds more inodes exclusive across a commit
+/// than any op's own guard set may.
 pub const PENDING_TIMES_DRAIN_BATCH: usize = 128;
 
 /// The parked population that wakes the drain AHEAD of its cadence tick:
@@ -756,13 +758,19 @@ pub const Absorb = enum {
 };
 
 /// The pending-times map, `ino → (mtime, ctime)`: the kernel's post-op
-/// writeback echoes parked by `absorb` (and the write path's own stamp —
-/// the generic/003 single-authority law: the stamp the handler publishes
-/// to the attr cache is the ONLY author of a write's times, and this is
-/// how it becomes durable). Folded over EVERY inode read (`fold`) as a
-/// signed monotone max — a stale refinement never regresses a fresher
-/// committed write; made durable by batched drain transactions on the
-/// flush cadence / fsync / unmount / the cap.
+/// writeback echoes parked by `absorb`, and the write path's own stamp for
+/// a SIZE-NEUTRAL striped write (decision 0003 §L.6: a 76 B Δ(mtime, ctime)
+/// alone cost one grain-aligned journal window and one device round trip
+/// per 512 B overwrite — 2.6 KB of metadata device per op on `frag-512b-
+/// write`; the generic/003 single-authority law: the stamp the handler
+/// publishes to the attr cache is the ONLY author of a write's times, and
+/// this is how it becomes durable). Folded over EVERY inode read (`fold`)
+/// as a signed monotone max — a stale refinement never regresses a fresher
+/// committed write; made durable by batched drain transactions
+/// (`kv_fs.drainPendingTimes`) on the flush cadence / fsync / fsyncdir /
+/// the dismount / the cap. A write's stamp therefore never regresses an
+/// mtime set ahead of it by utimes (the fold's law, the reference's too);
+/// an EXTENDING write commits its Δ(size, mtime, ctime) per op (§J.2).
 ///
 /// Mutations of ONE ino run under its 4a I-guard (absorb, the commit-side
 /// retire) or the drain's own guard set, so entries never race per ino;
@@ -856,6 +864,24 @@ pub const PendingTimes = struct {
         s.lock.lock();
         defer s.lock.unlock();
         if (s.map.fetchRemove(ino) == null) return false;
+        _ = self.count.fetchSub(1, .monotonic);
+        stats.meta_kv_times_echo_pending.sub(1);
+        return true;
+    }
+
+    /// The drain's retire: `ino`'s refinement leaves iff it is still
+    /// `drained` — the stamp the landed drain carried. The drain's guards
+    /// drop at the commit's terminal outcome, before this runs, so a write
+    /// that parked a newer stamp in between keeps it for the next drain
+    /// (an unconditional retire would lose a stream's last stamp). True
+    /// iff retired.
+    pub fn retireIfStill(self: *PendingTimes, ino: u64, drained: Times) bool {
+        const s = self.stripeOf(ino);
+        s.lock.lock();
+        defer s.lock.unlock();
+        const cur = s.map.get(ino) orelse return false;
+        if (cur.mtime != drained.mtime or cur.ctime != drained.ctime) return false;
+        _ = s.map.remove(ino);
         _ = self.count.fetchSub(1, .monotonic);
         stats.meta_kv_times_echo_pending.sub(1);
         return true;

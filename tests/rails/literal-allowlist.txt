@@ -69,9 +69,9 @@ src/cli/fsck.zig:37 | 20 | a size — OWED: derive from derive.Facts or document
 src/cli/fsck.zig:37 | 64 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/job.zig:323 | 0xFFFF | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/cli/job.zig:323 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:719 | 13 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:720 | 7 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:721 | 17 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:738 | 13 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:739 | 7 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:740 | 17 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/staging_verb.zig:65 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/status.zig:220 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/status.zig:229 | 512 | OWED: derive it or document it on the line (charter §1.5)
@@ -212,15 +212,15 @@ src/fuse/abi.zig:139 | 32 | a size — OWED: derive from derive.Facts or documen
 src/fuse/abi.zig:558 | 7 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/abi.zig:558 | 7 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/codec.zig:524 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:329 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/fuse/handler/kv_fs.zig:864 | 256 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1478 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1769 | 0o777 | a file mode (POSIX permission bits)
-src/fuse/handler/kv_fs.zig:1857 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1860 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1873 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2024 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2763 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:341 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/fuse/handler/kv_fs.zig:883 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1499 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1790 | 0o777 | a file mode (POSIX permission bits)
+src/fuse/handler/kv_fs.zig:1878 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1881 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1894 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2045 | 512 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2899 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/op_trace.zig:279 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/mount_options.zig:265 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/mount_options.zig:266 | 10 | OWED: derive it or document it on the line (charter §1.5)

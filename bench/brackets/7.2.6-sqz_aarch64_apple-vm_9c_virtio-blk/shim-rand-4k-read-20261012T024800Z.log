@@ -1,0 +1,14 @@
+02:48:00 bracket[shim-rand-4k-read]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/brk-shim-rand-4k-read/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/brk-shim-rand-4k-read/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/meta512-rows/brk-shim-rand-4k-read
+02:48:00 bracket[shim-rand-4k-read]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+02:48:00 bracket[shim-rand-4k-read]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+02:48:00 bracket[shim-rand-4k-read]: leg 1 arm A: /build/tmp/meta512-rows/brk-shim-rand-4k-read/A/bin/squeezefs (set 0, symmetric) -o 'interception'
+02:48:00 bracket[shim-rand-4k-read]: mounted /build/tmp/meta512-rows/brk-shim-rand-4k-read/mnt (daemon pid 799670)
+02:48:00 bracket[shim-rand-4k-read]: leg 1: preparing the aging store's dataset (once per set)
+02:48:02 bracket[shim-rand-4k-read]: leg 1: warm-up 10s (excluded)
+02:48:15 bracket[shim-rand-4k-read]: leg 1: measured span 60s
+02:49:17 bracket[shim-rand-4k-read]: leg 1: IOPS 24711.7 valid
+02:49:18 bracket[shim-rand-4k-read]: leg 2 arm B: /build/tmp/meta512-rows/brk-shim-rand-4k-read/A/bin/squeezefs (set 0, symmetric) -o 'interception'
+02:49:19 bracket[shim-rand-4k-read]: mounted /build/tmp/meta512-rows/brk-shim-rand-4k-read/mnt (daemon pid 799952)
+02:49:19 bracket[shim-rand-4k-read]: leg 2: warm-up 10s (excluded)
+02:49:31 bracket[shim-rand-4k-read]: leg 2: measured span 60s
+02:50:34 bracket[shim-rand-4k-read]: leg 2: IOPS 23193.4 valid

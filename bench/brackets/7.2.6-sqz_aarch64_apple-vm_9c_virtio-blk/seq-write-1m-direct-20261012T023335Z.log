@@ -1,0 +1,15 @@
+02:33:35 bracket[seq-write-1m-direct]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/brk-seq-write-1m-direct/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/brk-seq-write-1m-direct/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/meta512-rows/brk-seq-write-1m-direct
+02:33:35 bracket[seq-write-1m-direct]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+02:33:35 bracket[seq-write-1m-direct]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+02:33:35 bracket[seq-write-1m-direct]: leg 1 arm A: /build/tmp/meta512-rows/brk-seq-write-1m-direct/A/bin/squeezefs (set 0, symmetric) -o ''
+02:33:35 bracket[seq-write-1m-direct]: mounted /build/tmp/meta512-rows/brk-seq-write-1m-direct/mnt (daemon pid 506191)
+02:33:35 bracket[seq-write-1m-direct]: leg 1: preparing the aging store's dataset (once per set)
+02:33:37 bracket[seq-write-1m-direct]: leg 1: warm-up 10s (excluded)
+02:33:49 bracket[seq-write-1m-direct]: leg 1: measured span 60s
+02:34:52 bracket[seq-write-1m-direct]: leg 1: MiB/s 1736.8 valid
+02:34:54 bracket[seq-write-1m-direct]: leg 2 arm B: /build/tmp/meta512-rows/brk-seq-write-1m-direct/A/bin/squeezefs (set 0, symmetric) -o ''
+02:34:54 bracket[seq-write-1m-direct]: mounted /build/tmp/meta512-rows/brk-seq-write-1m-direct/mnt (daemon pid 508130)
+02:34:54 bracket[seq-write-1m-direct]: leg 2: warm-up 10s (excluded)
+02:35:07 bracket[seq-write-1m-direct]: leg 2: measured span 60s
+02:36:10 bracket[seq-write-1m-direct]: leg 2: MiB/s 1235.4 valid
+02:36:11 bracket[seq-write-1m-direct]: leg 2: daemon log has 16 error( line(s)

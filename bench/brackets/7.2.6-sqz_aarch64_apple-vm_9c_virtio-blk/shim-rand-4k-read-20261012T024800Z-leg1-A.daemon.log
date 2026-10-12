@@ -1,0 +1,57 @@
+1791773280.744 info(squeezefs): mem_budget: cgroup cage 17179869184 B bound by /sys/fs/cgroup/memory.max
+1791773280.750 info(squeezefs): metadata device /dev/nvme0n1: O_DIRECT (grain 4096 B from statx(STATX_DIOALIGN), buffer alignment 4096 B) — every byte bypasses the host page cache
+1791773280.800 info(squeezefs): meta volume /dev/nvme0n1: writer claim committed and barriered (id b71c651c37675111, pid 799670, mode flock+pr, pr key 4b037d1eee488509)
+1791773280.805 info(squeezefs): meta volume /dev/nvme0n1: appender 0 Live as the manager (term 1, node 0x761ac1c75eb30c70, mount slot 0); 0 other appender(s) live on the directory
+1791773280.807 info(squeezefs): meta volume /dev/nvme0n1: slot leases armed — M 64, A_max 262144 B, 65 leases held, T_idle 45000 ms, N_floor 17
+1791773280.808 info(squeezefs): meta volume /dev/nvme0n1: mounted — ledger seq 1, tail 0, replayed 0 entries (0 content records, 0 torn dropped, clean unmount), next_ino 2, 2 trees, 8059/8062 extents free, coalesced cadence, guard flock+pr
+1791773280.811 info(squeezefs): metadata set 8616b558…: 1 member(s) mounted in canonical order as manager, epoch 1, 0 dual claim(s) converged, native keyspace on member 0
+1791773280.815 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791773280.816 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791773280.817 info(squeezefs): mount: set config
+  set config generation 1; block 4194304 B; chunk 4194304 B; capacity 12868124672 B (12272 MiB); compression none; encryption none
+  data volumes 2 (VOLUME_LIFECYCLE: the set has diverged from its birth state)
+    vol-68caaf3dec9431c0 active /dev/nvme1n1 1534 blocks (6136 MiB) device de509402-a036-1e4f-c446-46a186c935f7
+    vol-20c3c933b51a9658 active /dev/nvme2n1 1534 blocks (6136 MiB) device 04728f23-72cc-0ffc-096e-e6ce4c45a049
+  cache-less (no disk cache paths)
+1791773280.818 info(squeezefs): data volume /dev/nvme1n1: write cache write-back
+1791773280.818 info(squeezefs): data volume tag 68caaf3dec9431c0: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791773280.818 info(squeezefs): data volume /dev/nvme1n1: vol-68caaf3dec9431c0 bound as ordinal 0: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791773280.819 info(squeezefs): data volume /dev/nvme2n1: write cache write-back
+1791773280.819 info(squeezefs): data volume tag 20c3c933b51a9658: the durable reference population is EMPTY — declining the seed; the derived layout walk seeds the allocator
+1791773280.819 info(squeezefs): data volume /dev/nvme2n1: vol-20c3c933b51a9658 bound as ordinal 1: 1534 usable blocks, 0 referenced (0 ref records), 1534 free
+1791773280.822 info(squeezefs): data plane: the set declares NO cache paths — staging and the NVMe read tier are OFF: a write ≤ inline_max (4096 B) stays inline, anything larger goes STRIPED (no packed layout, no promotion pass at dismount)
+1791773280.823 info(squeezefs): data plane: 2 data volume(s), block 4194304 B, chunk 4194304 B, inline_max 4096 B, inline map cap 1364 entries, map chunk 512 ops, sweep threshold 32768 blocks, transform none/none, staging off, NVMe tier off, direct-store face pending the session
+1791773280.824 info(squeezefs): cluster wire: listening at 192.168.64.2:33889 (cap 144 connections)
+1791773280.826 info(squeezefs): cluster wire: manager of 1 volume(s) listening at 192.168.64.2:33889; membership owner term 1 (T_owner 45000 ms, grace closed)
+1791773280.828 info(squeezefs): data planes: the grant plane armed as the HOLDER of 2 data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)
+1791773280.833 info(squeezefs): job fabric: 0 job(s) adopted; 2 local worker(s), default throttle 100 %, verify 1000 ‰ (plaintext pins 1000), fleet jobs on; the admin lane on the listener
+1791773280.833 info(squeezefs): transport probe: kmbuf_ops=38/39
+1791773280.833 info(squeezefs): transport probe: RELEASE_PAYLOAD(commit_id=MAX) → -107 ⇒ retention present
+1791773280.834 info(squeezefs): kv_fs: FUSE 7.36; KILLPRIV_V2 negotiated; inline_max 4096 B; block 4194304 B; data volumes yes; staging off
+1791773280.834 info(squeezefs): transport: INIT 7.45 → 7.36: flags 0x4000020050c4e829 (over_io_uring=true, time_limits=true), max_write 1048576, max_pages 256, max_background 288, queues 9 × depth 32, payload 1048576 B, 9 drain group(s) (width 1), buffer mode zero_copy (kmbuf 38, retention present)
+1791773280.835 info(squeezefs): transport: group 0 (qids 0..0, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.836 info(squeezefs): transport: group 1 (qids 1..1, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.838 info(squeezefs): transport: group 2 (qids 2..2, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.852 info(squeezefs): transport: group 3 (qids 3..3, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.854 info(squeezefs): transport: group 4 (qids 4..4, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.855 info(squeezefs): transport: group 5 (qids 5..5, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.857 info(squeezefs): transport: group 6 (qids 6..6, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.858 info(squeezefs): transport: group 7 (qids 7..7, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.860 info(squeezefs): transport: group 8 (qids 8..8, 1 members × depth 32, zero_copy) ring armed on rung 0 (single_issuer+defer_taskrun+taskrun_flag), sq 64, payload 1048576 B, arena 0 B, kmbuf 33554432 B
+1791773280.860 info(squeezefs): transport: FUSE-over-io_uring transport armed at /build/tmp/meta512-rows/brk-shim-rand-4k-read/mnt: 9 queue(s) × 32 ent(s) over 9 worker(s), zero_copy
+1791773280.860 info(squeezefs): data plane: session armed — held-slot direct store ON, direct device leg ON, fd-source probe serve ON
+1791773280.863 info(squeezefs): ipc: interception armed — socket sqz-il0-799670-671eb752 + /run/squeezefs/sqz-il0-799670-671eb752.sock; 4 service lane(s), 4 dd shard(s), arena 48 MiB (768 slots × 64 KiB) × cap 896 MiB = 18 session(s) (population floor 18), ctl cap 36
+1791773280.863 info(squeezefs): ready: sqmeta:///dev/nvme0n1 mounted at /build/tmp/meta512-rows/brk-shim-rand-4k-read/mnt (pid 799670; 9 queue(s) × depth 32; budget 7168 MiB; TTLs attr 1000 ms entry 1000 ms dir_entry 1000 ms negative 1000 ms)
+1791773292.840 info(squeezefs): ipc: session (pid 799775, owner 3) torn down: ctl socket EOF
+1791773292.844 info(squeezefs): ipc: session (pid 799772, owner 0) torn down: ctl socket EOF
+1791773292.847 info(squeezefs): ipc: session (pid 799774, owner 1) torn down: ctl socket EOF
+1791773292.851 info(squeezefs): ipc: session (pid 799773, owner 2) torn down: ctl socket EOF
+1791773355.324 info(squeezefs): ipc: session (pid 799835, owner 1) torn down: ctl socket EOF
+1791773355.336 info(squeezefs): ipc: session (pid 799837, owner 0) torn down: ctl socket EOF
+1791773355.336 info(squeezefs): ipc: session (pid 799834, owner 2) torn down: ctl socket EOF
+1791773355.336 info(squeezefs): ipc: session (pid 799836, owner 3) torn down: ctl socket EOF
+1791773357.654 info(squeezefs): stop requested (SIGTERM/SIGINT): unmounting /build/tmp/meta512-rows/brk-shim-rand-4k-read/mnt
+1791773357.729 info(squeezefs): teardown: session closed; open_count_stranded=0 transport_requests_abandoned=0 tick_rescues=0/0
+1791773357.731 info(squeezefs): data volume /dev/nvme1n1: dismount teardown completed; further DMA refused (EROFS class)
+1791773357.731 info(squeezefs): data volume /dev/nvme2n1: dismount teardown completed; further DMA refused (EROFS class)
+1791773358.824 info(squeezefs): meta volume /dev/nvme0n1: clean unmount (checkpoint seq 23, tail 10387672, head 10387672, healthy)

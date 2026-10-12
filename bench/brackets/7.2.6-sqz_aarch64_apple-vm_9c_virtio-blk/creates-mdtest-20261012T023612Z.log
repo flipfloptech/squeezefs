@@ -1,0 +1,14 @@
+02:36:13 bracket[creates-mdtest]: venue 7.2.6-sqz_aarch64_apple-vm_9c_virtio-blk; A={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/brk-creates-mdtest/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; B={"raw": "squeezefs 0.1.0 (585152f3a24d, gate profile, zig 0.17.0)", "binary": "/build/tmp/meta512-rows/brk-creates-mdtest/A/bin/squeezefs", "source": "/build/tmp/meta512-rows/dev/bin/squeezefs", "sha256": "13de22e75cd4cf622aea854fdebb1f73423c3bdde87d38117b09f7b2a7837486", "shim_sha256": "301546b885c209535c6b67345aa2eddecdb36f60164a4ec9507ff2fc038ad849", "train": "0.1.0", "commit": "585152f3a24d", "profile": "gate", "zig": "0.17.0", "dirty": false}; substrate nvmet-loop; lever binary; posture symmetric; 60s legs (+10s warm-up); numjobs 4 iodepth 32; scratch /build/tmp/meta512-rows/brk-creates-mdtest
+02:36:13 bracket[creates-mdtest]: substrate: nvmet-loop: 3 kernel nvmet namespaces (resv_enable=1) connected through `nvmeof connect`, backed by sparse files on /build (/dev/vdc); meta /dev/nvme0n1; data /dev/nvme1n1,/dev/nvme2n1
+02:36:13 bracket[creates-mdtest]: format set 0 (symmetric):  sqmeta:///dev/nvme0n1 sqdata:///dev/nvme1n1,/dev/nvme2n1
+02:36:13 bracket[creates-mdtest]: leg 1 arm A: /build/tmp/meta512-rows/brk-creates-mdtest/A/bin/squeezefs (set 0, symmetric) -o ''
+02:36:13 bracket[creates-mdtest]: mounted /build/tmp/meta512-rows/brk-creates-mdtest/mnt (daemon pid 508763)
+02:36:13 bracket[creates-mdtest]: leg 1: preparing the aging store's dataset (once per set)
+02:36:13 bracket[creates-mdtest]: leg 1: warm-up 10s (excluded)
+02:36:21 bracket[creates-mdtest]: leg 1: measured span 60s
+02:37:34 bracket[creates-mdtest]: leg 1: creates/s 7556.1 valid
+02:40:27 bracket[creates-mdtest]: leg 2 arm B: /build/tmp/meta512-rows/brk-creates-mdtest/A/bin/squeezefs (set 0, symmetric) -o ''
+02:40:29 bracket[creates-mdtest]: mounted /build/tmp/meta512-rows/brk-creates-mdtest/mnt (daemon pid 569540)
+02:40:29 bracket[creates-mdtest]: leg 2: warm-up 10s (excluded)
+02:40:35 bracket[creates-mdtest]: leg 2: measured span 60s
+02:41:50 bracket[creates-mdtest]: leg 2: creates/s 9721.9 valid

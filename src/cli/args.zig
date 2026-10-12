@@ -269,11 +269,15 @@ pub const Defrag = struct {
     fold: bool = false,
     rebalance: bool = false,
     report_only: bool = false,
+    /// `--rekey --encrypt-key <path|->`: the key-rotation sweep on a LIVE
+    /// mount — exclusive of every other arm (`ops/defrag/rekey.zig`).
+    rekey: bool = false,
+    encrypt_key: ?[]const u8 = null,
     throttle: u8 = 100,
     json: bool = false,
 
     pub fn anyArm(self: Defrag) bool {
-        return self.data or self.pack or self.meta or self.fold or self.rebalance or self.report_only;
+        return self.data or self.pack or self.meta or self.fold or self.rebalance or self.report_only or self.rekey;
     }
 };
 
@@ -398,6 +402,9 @@ pub const Refusal = union(enum) {
     bad_encryption: []const u8,
     /// `--encrypt` names an algorithm but no `--encrypt-key` was given.
     encrypt_without_key,
+    /// `defrag --rekey` without `--encrypt-key`, `--encrypt-key` without
+    /// `--rekey`, `--rekey` beside another arm, or `--rekey` on a set URI.
+    rekey_shape: enum { no_key, key_without_rekey, other_arm, offline },
     /// `--encrypt-key` on a plaintext set.
     key_without_encrypt,
     bad_cache_path: []const u8,
@@ -451,6 +458,12 @@ pub const Refusal = union(enum) {
             .bad_encryption => |e| try w.print("format: --encrypt '{s}' is not one of none|aes-256-gcm|chacha20-poly1305", .{e}),
             .encrypt_without_key => try w.writeAll("format: --encrypt names an algorithm but no key was given — pass --encrypt-key <path|-> (≥ 32 bytes of key material, mode 0600)"),
             .key_without_encrypt => try w.writeAll("format: --encrypt-key was given for a plaintext set — pass --encrypt aes-256-gcm|chacha20-poly1305 or drop the key"),
+            .rekey_shape => |r| switch (r) {
+                .no_key => try w.writeAll("defrag --rekey: the NEW key is required — pass --encrypt-key <path|-> (≥ 32 bytes of key material, mode 0600)"),
+                .key_without_rekey => try w.writeAll("defrag: --encrypt-key belongs to --rekey (the key-rotation sweep) — pass --rekey or drop the key"),
+                .other_arm => try w.writeAll("defrag --rekey runs alone: every block of the set is rewritten onto the new key; run the other arms in their own invocation"),
+                .offline => try w.writeAll("defrag --rekey runs on a LIVE mount (the sweep is the mount's fabric; the window opens in its config): pass the mountpoint, not the sqmeta:// set"),
+            },
             .bad_cache_path => |p| try w.print("cache path member '{s}' is not an absolute path outside the system roots (/, /home, /etc, /usr, /var, /boot, /root), or repeats", .{p}),
             .bad_target => |t| try w.print("'{s}' is neither a sqmeta://<absolute path>[,…] URI nor an absolute mountpoint", .{t}),
             .bad_set_path => |t| try w.print("clone: '{s}' is not an absolute path inside the set (`/dir/file`)", .{t}),
@@ -513,6 +526,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         \\  squeezefs job worker sqmeta://<path>
         \\  squeezefs job rotate-enroll sqmeta://<path>
         \\  squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>
+        \\  squeezefs defrag --rekey --encrypt-key <path|-> [--throttle PCT] <mountpoint>
         \\  squeezefs bench [-w] [-r] [--stat] [--del] [-t N] [-n N] [-s SIZE] [-b SIZE] [--rand] [--direct] [--time S] [-i N] [--abba] [--json] [--smoke] <mountpoint>
         \\  squeezefs bench --hash [--json]
         \\  squeezefs nvmeof share [--subnqn NQN] [--transport tcp|loop] [--ip ADDR]… [--port N] [--allow-host NQN]… [--create-size SIZE] [--ns-uuid UUID] <backing>
@@ -557,7 +571,7 @@ pub fn usage(verb: ?std.meta.Tag(Verb)) []const u8 {
         .fsck_merge => "usage: squeezefs fsck merge-reports [--json] <report.json>…\n",
         .volume => "usage: squeezefs volume list sqmeta://<path>[,…]\n       squeezefs volume add-meta --take-slots K|s1,s2,… sqmeta://<path>[,…] <device>\n       squeezefs volume remove-meta sqmeta://<path>[,…] <victim device>\n       squeezefs volume repair-set sqmeta://<path>[,…]\n       squeezefs volume enable-symmetric sqmeta://<path>[,…]\n       squeezefs volume migrate-meta-slot sqmeta://<path>[,…] <slot> <target member index>\n       squeezefs volume add-data [--no-rebalance] sqmeta://<path>[,…]|<mountpoint> <device>\n       squeezefs volume remove-data sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n       squeezefs volume undrain sqmeta://<path>[,…]|<mountpoint> vol-<16 hex>\n",
         .job => "usage: squeezefs job list [--json] sqmeta://<path>|<mountpoint>\n       squeezefs job status|pause|resume|cancel sqmeta://<path>|<mountpoint> job-<16 hex>\n       squeezefs job throttle <mountpoint> job-<16 hex> <pct>\n       squeezefs job worker sqmeta://<path>\n       squeezefs job rotate-enroll sqmeta://<path>\n",
-        .defrag => "usage: squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>\n",
+        .defrag => "usage: squeezefs defrag [--data] [--pack] [--volume vol-<16 hex>] [--meta] [--fold] [--rebalance] [--report-only] [--throttle PCT] [--json] sqmeta://<path>|<mountpoint>\n       squeezefs defrag --rekey --encrypt-key <path|-> [--throttle PCT] <mountpoint>\n",
         .bench => "usage: squeezefs bench [-w] [-r] [--stat] [--del] [-t THREADS] [-n FILES] [-s SIZE] [-b BLOCK] [--rand] [--direct] [--time SECS] [-i ITERATIONS] [--abba] [--json] [--smoke] <mountpoint>\n       squeezefs bench --hash [--json]\n",
         .version, .help => all,
     };
@@ -1579,8 +1593,10 @@ fn parseDefrag(words: []const []const u8, diag: *Refusal) Error!Verb {
     var c: Cursor = .{ .verb = "defrag", .words = words, .diag = diag };
     var d: Defrag = .{ .target = "" };
     while (try c.step()) |f| {
-        if (std.mem.eql(u8, f.name, "--data")) d.data = true else if (std.mem.eql(u8, f.name, "--pack")) d.pack = true else if (std.mem.eql(u8, f.name, "--meta")) d.meta = true else if (std.mem.eql(u8, f.name, "--fold")) d.fold = true else if (std.mem.eql(u8, f.name, "--rebalance")) d.rebalance = true else if (std.mem.eql(u8, f.name, "--report-only")) d.report_only = true else if (std.mem.eql(u8, f.name, "--json")) d.json = true else if (std.mem.eql(u8, f.name, "--throttle")) {
+        if (std.mem.eql(u8, f.name, "--data")) d.data = true else if (std.mem.eql(u8, f.name, "--pack")) d.pack = true else if (std.mem.eql(u8, f.name, "--meta")) d.meta = true else if (std.mem.eql(u8, f.name, "--fold")) d.fold = true else if (std.mem.eql(u8, f.name, "--rebalance")) d.rebalance = true else if (std.mem.eql(u8, f.name, "--report-only")) d.report_only = true else if (std.mem.eql(u8, f.name, "--rekey")) d.rekey = true else if (std.mem.eql(u8, f.name, "--json")) d.json = true else if (std.mem.eql(u8, f.name, "--throttle")) {
             d.throttle = try parseIntFlag(&c, f, u8, 1, 100);
+        } else if (std.mem.eql(u8, f.name, "--encrypt-key")) {
+            d.encrypt_key = try c.value(f);
         } else if (std.mem.eql(u8, f.name, "--volume")) {
             const raw = try c.value(f);
             if (!isVolumeIdWord(raw)) {
@@ -1593,7 +1609,24 @@ fn parseDefrag(words: []const []const u8, diag: *Refusal) Error!Verb {
     d.target = try exactlyOne(&c, target_what);
     try checkTarget(d.target, diag);
     if (!d.anyArm()) {
-        diag.* = .{ .missing_positional = .{ .verb = "defrag", .what = "an arm: --data, --pack, --meta, --fold, --rebalance or --report-only" } };
+        diag.* = .{ .missing_positional = .{ .verb = "defrag", .what = "an arm: --data, --pack, --meta, --fold, --rebalance, --rekey or --report-only" } };
+        return error.Refused;
+    }
+    if (d.rekey) {
+        if (d.encrypt_key == null) {
+            diag.* = .{ .rekey_shape = .no_key };
+            return error.Refused;
+        }
+        if (d.data or d.pack or d.meta or d.fold or d.rebalance or d.report_only or d.volume != null) {
+            diag.* = .{ .rekey_shape = .other_arm };
+            return error.Refused;
+        }
+        if (!targetIsMountpoint(d.target)) {
+            diag.* = .{ .rekey_shape = .offline };
+            return error.Refused;
+        }
+    } else if (d.encrypt_key != null) {
+        diag.* = .{ .rekey_shape = .key_without_rekey };
         return error.Refused;
     }
     return .{ .defrag = d };
@@ -2137,6 +2170,22 @@ test "rung-5 verbs: clients/df/config show/staging list take [--json] TARGET (UR
     try testing.expectEqualStrings("sqmeta:///dev/m,/dev/n", cc.claim_clear.meta_uri);
     try testing.expect((try refusal(av(&.{ "claim", "clear", "/mnt" }))) == .bad_uri);
     try testing.expect((try refusal(av(&.{ "claim", "show", "sqmeta:///dev/m" }))) == .unknown_subverb);
+}
+
+test "defrag: the arms; --rekey needs --encrypt-key, runs alone and on a mountpoint; --encrypt-key belongs to --rekey" {
+    var d: Refusal = undefined;
+    const a = try parse(av(&.{ "defrag", "--data", "--pack", "--throttle", "25", "/mnt/sqz" }), &d);
+    try testing.expect(a.defrag.data and a.defrag.pack and !a.defrag.rekey and a.defrag.throttle == 25);
+    const r = try parse(av(&.{ "defrag", "--rekey", "--encrypt-key", "/etc/new.key", "--throttle", "50", "/mnt/sqz" }), &d);
+    try testing.expect(r.defrag.rekey and r.defrag.throttle == 50);
+    try testing.expectEqualStrings("/etc/new.key", r.defrag.encrypt_key.?);
+    const stdin_key = try parse(av(&.{ "defrag", "--rekey", "--encrypt-key", "-", "/mnt/sqz" }), &d);
+    try testing.expectEqualStrings("-", stdin_key.defrag.encrypt_key.?);
+    try testing.expectEqual(Refusal{ .rekey_shape = .no_key }, try refusal(av(&.{ "defrag", "--rekey", "/mnt/sqz" })));
+    try testing.expectEqual(Refusal{ .rekey_shape = .key_without_rekey }, try refusal(av(&.{ "defrag", "--data", "--encrypt-key", "/k", "/mnt/sqz" })));
+    try testing.expectEqual(Refusal{ .rekey_shape = .other_arm }, try refusal(av(&.{ "defrag", "--rekey", "--encrypt-key", "/k", "--pack", "/mnt/sqz" })));
+    try testing.expectEqual(Refusal{ .rekey_shape = .offline }, try refusal(av(&.{ "defrag", "--rekey", "--encrypt-key", "/k", "sqmeta:///dev/m" })));
+    try testing.expect((try refusal(av(&.{ "defrag", "/mnt/sqz" }))) == .missing_positional);
 }
 
 test "bench: every flag; sizes accept k/m/g/t and refuse garbage and 0; the bare invocation refuses -b and --rand; iterations ≥ 1; the mountpoint is absolute" {

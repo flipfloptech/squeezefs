@@ -71,7 +71,7 @@ pub const Scope = union(enum) {
 
     pub fn fromRecord(r: JobRecord) Scope {
         if (!r.job_type.isMover()) return .none;
-        if (r.job_type == .rebalance or r.arg0 == 0) return .whole_set;
+        if (r.job_type.wholeSet() or r.arg0 == 0) return .whole_set;
         return .{ .volume = r.arg0 };
     }
 

@@ -78,6 +78,9 @@ pub const stats = struct {
     pub var pack_blocks_sealed_full: counters.ShardedCounter = .{};
     pub var pack_blocks_sealed_dismount: counters.ShardedCounter = .{};
     pub var pack_blocks_sealed_drain: counters.ShardedCounter = .{};
+    /// The key-rotation sweep's confirming census seals every open pack
+    /// (its tenants become classifiable; no old-key tenant lands after).
+    pub var pack_blocks_sealed_rekey: counters.ShardedCounter = .{};
     pub var pack_blocks_abandoned: counters.ShardedCounter = .{};
     /// Refill / OQ-1 / dead slots (`refills ≈ opened`).
     pub var pack_reservation_refills: counters.ShardedCounter = .{};
@@ -112,7 +115,7 @@ pub const stats = struct {
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("{");
-    inline for (.{ "layout_promoted_inline", "layout_promoted_block", "layout_promoted_packed", "pack_own_block_promotions", "pack_promoted_bytes", "pack_slot_pad_bytes", "pack_blocks_opened", "pack_blocks_sealed_full", "pack_blocks_sealed_dismount", "pack_blocks_sealed_drain", "pack_blocks_abandoned", "pack_reservation_refills", "pack_refill_storage_full", "pack_arm_stopped_promotions", "pack_slots_abandoned", "pack_partial_frees", "pack_terminal_frees", "pack_mapping_clips", "packed_reads", "packed_read_bytes", "staged_identity_retries", "pack_open_blocks", "pack_open_scopes", "pack_max_slot_bytes", "pack_release_untracked_noops", "pack_pin_refcount_drift", "read_stale_bound_mapping" }, 0..) |name, i| {
+    inline for (.{ "layout_promoted_inline", "layout_promoted_block", "layout_promoted_packed", "pack_own_block_promotions", "pack_promoted_bytes", "pack_slot_pad_bytes", "pack_blocks_opened", "pack_blocks_sealed_full", "pack_blocks_sealed_dismount", "pack_blocks_sealed_drain", "pack_blocks_sealed_rekey", "pack_blocks_abandoned", "pack_reservation_refills", "pack_refill_storage_full", "pack_arm_stopped_promotions", "pack_slots_abandoned", "pack_partial_frees", "pack_terminal_frees", "pack_mapping_clips", "packed_reads", "packed_read_bytes", "staged_identity_retries", "pack_open_blocks", "pack_open_scopes", "pack_max_slot_bytes", "pack_release_untracked_noops", "pack_pin_refcount_drift", "read_stale_bound_mapping" }, 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\":{d}", .{ name, @field(stats, name).load() });
     }
@@ -198,7 +201,7 @@ pub const PackKey = struct { vol_tag: u64, scope: u64 };
 // §4.2–§4.3 The open pack.
 // ---------------------------------------------------------------------------
 
-pub const SealKind = enum { full, dismount, drain };
+pub const SealKind = enum { full, dismount, drain, rekey };
 
 pub const OpenPack = struct {
     vol_tag: u64,
@@ -604,6 +607,7 @@ pub const Packer = struct {
             .full => stats.pack_blocks_sealed_full.inc(),
             .dismount => stats.pack_blocks_sealed_dismount.inc(),
             .drain => stats.pack_blocks_sealed_drain.inc(),
+            .rekey => stats.pack_blocks_sealed_rekey.inc(),
         }
         stats.pack_open_blocks.sub(1);
         self.refreshScopeGauge();
@@ -623,11 +627,28 @@ pub const Packer = struct {
     /// DISMOUNT: seal every open pack (after the promotion pass, before
     /// "Dismount clean").
     pub fn sealAll(self: *Packer) void {
+        self.sealAllAs(.dismount);
+    }
+
+    /// Every open pack sealed under `kind` (the rotation sweep's confirming
+    /// census: `.rekey`).
+    pub fn sealAllAs(self: *Packer, kind: SealKind) void {
         for (self.rows) |*r| {
             if (!r.used) continue;
             const p = r.pack.load(.acquire) orelse continue;
-            if (p.trySeal()) self.runSeal(r, p, .dismount);
+            if (p.trySeal()) self.runSeal(r, p, kind);
         }
+    }
+
+    /// Tenants between reserve and commit/abandon over EVERY pack this
+    /// mount opened (sealed ones included: a reserved slot lands after the
+    /// seal): the rotation sweep's quiescence word.
+    pub fn tenantsInFlight(self: *Packer) u64 {
+        self.rows_lock.lock();
+        defer self.rows_lock.unlock();
+        var n: u64 = 0;
+        for (self.opened.items) |p| n += p.inflight.load(.acquire);
+        return n;
     }
 
     /// DRAIN: the mover found the open pack on its victim block.

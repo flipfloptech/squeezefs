@@ -438,7 +438,7 @@ test "defrag --pack on half-empty packs: fewer blocks, every file byte-exact, th
     const r = try Rig.init(gpa);
     defer r.deinit(gpa);
     var data: [mover.RamWorld.DATA]u8 = undefined;
-    for (&data, 0..) |*d, i| d.* = @intCast(i * 3);
+    for (&data, 0..) |*d, i| d.* = @truncate(i * 3);
     // Three packs with 10 B tenants at 0/20/40 (the fake's slots).
     var ino: u64 = 1;
     for ([_]u64{ 0, 1, 2 }) |idx| {

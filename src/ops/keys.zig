@@ -251,6 +251,45 @@ pub const linux_verbs = if (is_linux) struct {
         return cli.exit_ok;
     }
 
+    pub const InstallOutcome = enum { installed, identical };
+    pub const InstallError = error{ Exists, Unreadable, WriteFailed };
+
+    /// The store file of `key_id` written from `material` (the rotation's
+    /// next key, whose id the caller derived): identical bytes ⇒ no-op;
+    /// different ⇒ `Exists` unless `force`.
+    pub fn installMaterial(pool: *uring_fs.Pool, key_id: [transform.KEY_ID_LEN]u8, material: []const u8, force: bool) InstallError!InstallOutcome {
+        var pb: [128]u8 = undefined;
+        const dest = keyPath(&pb, key_id);
+        var existing_buf: [transform.MAX_KEY_FILE_BYTES + 1]u8 = undefined;
+        defer std.crypto.secureZero(u8, &existing_buf);
+        if (transform.linux_keys.readKeyFile(dest, &existing_buf)) |existing| {
+            if (std.mem.eql(u8, existing, material)) return .identical;
+            if (!force) return error.Exists;
+        } else |e| switch (e) {
+            error.KeyFileOpenFailed => {},
+            else => return error.Unreadable,
+        }
+        writeStoreFile(pool, dest, material) catch return error.WriteFailed;
+        return .installed;
+    }
+
+    /// The rotation's NEXT key: the key dir alone (`--encrypt-key` and
+    /// `SQUEEZEFS_ENCRYPT_KEY_FILE` name the primary), derived against the
+    /// window's salt and verified against its id.
+    pub fn resolveNextKey(salt: *const [transform.KDF_SALT_LEN]u8, key_id: [transform.KEY_ID_LEN]u8) transform.KeyFileError!transform.DerivedKey {
+        var pb: [128]u8 = undefined;
+        const path = keyPath(&pb, key_id);
+        var material_buf: [transform.MAX_KEY_FILE_BYTES + 1]u8 = undefined;
+        defer std.crypto.secureZero(u8, &material_buf);
+        const m = try transform.linux_keys.readKeyFile(path, &material_buf);
+        var derived = transform.deriveVolumeKey(m, salt);
+        if (!std.mem.eql(u8, &derived.key_id, &key_id)) {
+            derived.zeroize();
+            return error.KeyMismatch;
+        }
+        return derived;
+    }
+
     /// 0700 dirs, a 0600 `.tmp` created O_EXCL, the bytes through the
     /// io_uring file layer, fdatasync, rename, fsync(dir).
     fn writeStoreFile(pool: *uring_fs.Pool, dest: [:0]const u8, material: []const u8) !void {

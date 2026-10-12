@@ -163,6 +163,8 @@ const Ctx = struct {
     /// The verified volume key of an encrypted set (zeroized once the plane
     /// holds its crypto state).
     derived_key: ?transform.DerivedKey = null,
+    /// An open rotation window's next key (the key dir), likewise.
+    derived_next: ?transform.DerivedKey = null,
     /// `--encrypt-key`'s material, read in the INVOKING process before any
     /// fork (`ops/keys.zig`): consumed and zeroized by `loadSetConfig`.
     stash: ?*keys.SecretBuf = null,
@@ -396,8 +398,9 @@ fn mountMain(ctx: *Ctx) u8 {
     defer guards.deinit();
     var opens = open_table.OpenTable.init(gpa, open_table.derivedCapacity(facts.possible_cpus, fuse_geometry.Q_DEPTH_DESIRED)) catch return ctx.failed("out of memory (open table)", .{});
     defer opens.deinit();
-    const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .derived_key = ctx.derived_key, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
+    const plane = plane_mod.DataPlane.open(gpa, io, ctx.sqz, be, &cfg, .{ .env = env, .facts = facts, .budget_bytes = ctx.budget_bytes, .derived_key = ctx.derived_key, .derived_next = ctx.derived_next, .guards = &guards }) catch |e| return ctx.failed("the data plane could not open ({s}) — see the log", .{@errorName(e)});
     if (ctx.derived_key) |*k| k.zeroize();
+    if (ctx.derived_next) |*k| k.zeroize();
     var plane_open = true;
     defer if (plane_open) plane.close();
     const flush_interval_ms = checkpoint.flushIntervalMsFromEnv(env);
@@ -883,6 +886,23 @@ fn loadSetConfig(ctx: *Ctx, be: *meta_set.MetaSet) ?set_config.Config {
         // copies them); the caller zeroizes this copy right after.
         ctx.derived_key = derived;
         log.info("mount: encryption key verified ({s}, id {x}, from {s})", .{ transform.KEY_WRAP_SCHEME_NAME, &cfg.key_id, served });
+        // An open rotation window: the NEXT key from the key dir (the
+        // sweep resumes under it; every block is readable under one of
+        // the two) — missing or wrong refuses the mount by name.
+        if (cfg.next_key) |nk| {
+            var nb: [128]u8 = undefined;
+            const next = keys.linux_verbs.resolveNextKey(&nk.kdf_salt, nk.key_id) catch |e| {
+                var buf: [512]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
+                transform.writeKeyFileRefusal(&w, e, keys.keyPath(&nb, nk.key_id)) catch {};
+                _ = ctx.failed("encrypted set with a key-rotation window open (next key id {x}): {s} — install it with `squeezefs key install`, or finish the rotation where it started", .{ &nk.key_id, w.buffered() });
+                if (ctx.derived_key) |*k| k.zeroize();
+                cfg.deinit(gpa);
+                return null;
+            };
+            ctx.derived_next = next;
+            log.info("mount: key-rotation window OPEN — next key id {x} verified from {s}; the sweep resumes on this mount's fabric", .{ &nk.key_id, keys.keyPath(&nb, nk.key_id) });
+        }
     }
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();

@@ -983,10 +983,15 @@ pub const ReadPath = struct {
     }
 
     /// A packed tenant / durable copy: the window on the mapping's OWN
-    /// volume through the ONE choke point.
+    /// volume through the ONE choke point. The window law runs under the
+    /// volume's stride (`chunk` on a transformed volume: a tenant's block
+    /// offset is a chunk multiple, and `block_size` refused every block
+    /// past index 0 as a window-law breach); a transformed tenant is ONE
+    /// frame, decoded whole on this lane's codec before the slice.
     fn readMappingWindow(self: *ReadPath, m: Mapping, rel_start: u64, out: []u8) Error!usize {
-        const w = m.readWindow(self.cfg.block_size, .{ .start = rel_start, .end = rel_start + out.len }) catch return error.InputOutput;
         const key = BlockKey.fromMapping(m);
+        if (self.decode) |d| return self.readMappingFramed(d, m, key, rel_start, out);
+        const w = m.readWindow(self.stride(), .{ .start = rel_start, .end = rel_start + out.len }) catch return error.InputOutput;
         const before = self.fillIncarnation(key) orelse return error.InputOutput;
         const got = w.hi - w.lo;
         if (got == 0) {
@@ -1003,6 +1008,32 @@ pub const ReadPath = struct {
         if (!self.still(key, before)) return error.InputOutput;
         @memcpy(out[0..got], b.bytes[w.lo..w.hi]);
         @memset(out[got..], 0);
+        stats.read_copy_dest_bytes.add(out.len);
+        return out.len;
+    }
+
+    /// The transformed tenant: the stored frame `[rel_off, rel_off +
+    /// ceil(len))` (≤ half a chunk by the packer's dispatch) into a bounce,
+    /// decoded into a fill-pool slot (≥ `scratchLen` = the chunk), then
+    /// `[rel_start, rel_start + out.len)` of the plaintext; past its end,
+    /// zeros (the entry already clipped the request to the file size).
+    fn readMappingFramed(self: *ReadPath, d: Decode, m: Mapping, key: BlockKey, rel_start: u64, out: []u8) Error!usize {
+        const w = m.readWindow(d.chunk, null) catch return error.InputOutput;
+        const before = self.fillIncarnation(key) orelse return error.InputOutput;
+        const img = try self.acquireBounce(w.len);
+        defer self.releaseBounce(img);
+        if (try self.vols.read_range(self.vols.ctx, w.vol_tag, w.device_off, img.bytes[0..@intCast(w.len)], .pooled) == .dma) {
+            stats.read_fill_dma_bytes.add(w.len);
+            stats.read_dma_window_bytes.add(w.len);
+        }
+        if (!self.still(key, before)) return error.InputOutput;
+        const target = try self.acquireBounce(self.pool.slot_size);
+        defer self.releaseBounce(target);
+        const view = d.decode(d.ctx, img.bytes[0..@intCast(w.len)], target.bytes) catch return error.InputOutput;
+        const start: usize = @intCast(@min(rel_start, view.len));
+        const end: usize = @intCast(@min(rel_start + out.len, view.len));
+        @memcpy(out[0 .. end - start], view[start..end]);
+        @memset(out[end - start ..], 0);
         stats.read_copy_dest_bytes.add(out.len);
         return out.len;
     }
@@ -2655,6 +2686,33 @@ test "inline and packed layouts: inline from the record zero-padded; a packed te
     log.testing.expectErrorLogs(1);
     try testing.expectError(error.InputOutput, f.rp.read(io, 7, 0, 10, .{ .buf = &out }, .{}));
     try log.testing.expectAllFired();
+}
+
+test "a packed tenant on a TRANSFORMED volume: the window law runs under the chunk stride (block + 4 KiB — `block_size` refused every tenant past index 0 and tripped packed_mapping_refusals), the whole frame decodes on the lane's codec, the plaintext slice serves byte-exact" {
+    const io = testing.io;
+    const f = try Fixture.init(testing.allocator, .{ .compression = .lz4 });
+    defer f.deinit();
+    // The tenant: a 6,000-byte plaintext framed at rel_off 8192 of device
+    // block 3 (3 × chunk is NOT a multiple of `bs`: the stride defect's shape).
+    var plain: [6000]u8 = undefined;
+    for (&plain, 0..) |*b, j| b.* = @truncate(j * 7 + 3);
+    const img = try f.codec.?.processWrite(&plain, f.xscratch);
+    const dev_off: usize = @intCast(3 * f.chunk + 8192);
+    @memcpy(f.device[dev_off..][0..img.len], img);
+    f.kind = .packed_;
+    f.size = plain.len;
+    f.bindings[0] = Mapping.tenant(Fixture.vol_tag, 3 * f.chunk, 1, 8192, @intCast(img.len));
+    f.alloc.publishBlock(3);
+    const before = layout.stats.packed_mapping_refusals.load();
+    var out: [1000]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1000), try f.rp.read(io, 7, 5000, 1000, .{ .buf = &out }, .{}));
+    try testing.expectEqualSlices(u8, plain[5000..6000], &out);
+    try testing.expectEqual(@as(usize, 1000), try f.rp.read(io, 7, 0, 1000, .{ .buf = &out }, .{}));
+    try testing.expectEqualSlices(u8, plain[0..1000], &out);
+    // The whole frame is the window (the header page + the body), never a
+    // raw grain of ciphertext.
+    try testing.expectEqual(2 * layout.ceilGrain(@intCast(img.len)), f.device_read_bytes.load(.monotonic));
+    try testing.expectEqual(before, layout.stats.packed_mapping_refusals.load());
 }
 
 test "the write side outranks every tier: an overlay serve returns its bytes; full extent runs serve without a base; partial runs compose over the fetched base; a staged custody block serves from the ring" {

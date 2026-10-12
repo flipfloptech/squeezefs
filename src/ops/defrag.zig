@@ -7,13 +7,16 @@
 //! charter §6.1), the report and its bounded JSON (`report.zig`), and the
 //! fabric bodies (`bodies.zig`: `defrag_data` over the ONE mover,
 //! `defrag_pack` over the compactor, `defrag_fold` and `defrag_meta` as
-//! kicks of the existing machinery through seams). Portable.
+//! kicks of the existing machinery through seams), and the key-rotation
+//! sweep (`rekey.zig`: `defrag --rekey`, the ONE mover with a re-encrypt
+//! hook, the window flipped last). Portable.
 
 pub const metrics = @import("defrag/metrics.zig");
 pub const plan = @import("defrag/plan.zig");
 pub const pack_compact = @import("defrag/pack_compact.zig");
 pub const report = @import("defrag/report.zig");
 pub const bodies = @import("defrag/bodies.zig");
+pub const rekey = @import("defrag/rekey.zig");
 
 test {
     _ = metrics;
@@ -21,4 +24,5 @@ test {
     _ = pack_compact;
     _ = report;
     _ = bodies;
+    _ = rekey;
 }

@@ -59,15 +59,21 @@ pub const AdminWorld = struct {
         undrain: *const fn (ctx: *anyopaque, gpa: Allocator, vol_tag: u64) lattice.Error!VolumeOutcome,
         /// The fsck job's last bounded report (owned by `gpa`), or null.
         fsckReport: *const fn (ctx: *anyopaque, gpa: Allocator, job_id: u64) Allocator.Error!?[]u8,
+        /// `defrag --rekey`: resolve the next key (the key dir), open the
+        /// window durably, arm the plane's wrap, submit the sweep.
+        rekey: *const fn (ctx: *anyopaque, gpa: Allocator, req: frames.AdminRekeyReq) RekeyError!RekeyOutcome,
     };
 };
+
+pub const RekeyError = error{ OutOfMemory, Io, NotCoordinator, Plaintext, WindowOpen, KeyUnresolved, SameKey, Plane, TableFull };
+pub const RekeyOutcome = struct { job_id: u64, config_generation: u64 };
 
 pub const AdminService = struct {
     io: Io,
     fabric: *Fabric,
     world: ?AdminWorld,
 
-    const all_verbs = .{ .admin_job_list, .admin_job_control, .admin_job_submit, .admin_fsck_report, .admin_volume };
+    const all_verbs = .{ .admin_job_list, .admin_job_control, .admin_job_submit, .admin_fsck_report, .admin_volume, .admin_rekey };
 
     pub fn register(self: *AdminService, svc: *service.Service) void {
         const h: service.Handler = .{ .ctx = self, .serve = &serve };
@@ -88,6 +94,7 @@ pub const AdminService = struct {
             .admin_job_submit => |p| self.submit(p),
             .admin_fsck_report => |p| self.report(p, scratch),
             .admin_volume => |p| self.volume(p),
+            .admin_rekey => |p| self.rekey(p),
             else => unreachable,
         };
         return answer;
@@ -129,6 +136,9 @@ pub const AdminService = struct {
     }
 
     fn submit(self: *AdminService, p: frames.AdminJobSubmitReq) service.Answer {
+        // The rotation sweep is minted by `admin_rekey` alone (the window
+        // must be open and the plane's wrap swapped before any pass).
+        if (p.jobType() == .rekey) return .{ .ok = .{ .admin_job_submit = .{ .job_id = 0, .verdict = @backingInt(refusedCount(.refused)), .reserved = @splat(0) } } };
         const id = self.fabric.submit(self.io, .{ .job_type = p.jobType(), .throttle_pct = p.throttle_pct, .arg0 = p.arg0, .arg1 = p.arg1, .paused = p.paused == 1 }) catch |e| {
             const v: Verdict = switch (e) {
                 error.NotCoordinator => .not_coordinator,
@@ -190,6 +200,29 @@ pub const AdminService = struct {
             .capacity_blocks = out.capacity_blocks,
         } } };
     }
+
+    fn rekey(self: *AdminService, p: frames.AdminRekeyReq) service.Answer {
+        const w = self.world orelse return .{ .ok = .{ .admin_rekey = frames.AdminRekeyReply.refusal(refusedCount(.not_coordinator), .none) } };
+        const out = w.vtable.rekey(w.ctx, self.fabric.gpa, p) catch |e| {
+            const reply: frames.AdminRekeyReply = switch (e) {
+                error.OutOfMemory => return service.Answer.refused(error.OutOfMemory, "out of memory"),
+                error.NotCoordinator => .refusal(.not_coordinator, .none),
+                error.TableFull => .refusal(.table_full, .none),
+                error.Io => .refusal(.io, .none),
+                error.Plaintext => .refusal(.refused, .plaintext),
+                error.WindowOpen => .refusal(.refused, .window_open),
+                error.KeyUnresolved => .refusal(.refused, .key_unresolved),
+                error.SameKey => .refusal(.refused, .same_key),
+                error.Plane => .refusal(.io, .plane),
+            };
+            log.warn("admin lane: defrag --rekey refused ({s})", .{@errorName(e)});
+            _ = refusedCount(reply.get());
+            return .{ .ok = .{ .admin_rekey = reply } };
+        };
+        stats.admin_submissions.inc();
+        log.info("admin lane: rekey job-{x:0>16} submitted (next key id {x}, throttle {d} %, config generation {d})", .{ out.job_id, &p.key_id, p.throttle_pct, out.config_generation });
+        return .{ .ok = .{ .admin_rekey = .{ .verdict = @backingInt(Verdict.ok), .reason = 0, .reserved = @splat(0), .job_id = out.job_id, .config_generation = out.config_generation } } };
+    }
 };
 
 /// The caller side (the CLI's `admin_lane.zig`, the tests): typed calls
@@ -232,6 +265,11 @@ pub const Client = struct {
         const rep = try self.call(self.ctx, .{ .admin_volume = .{ .head = .{ .op = @backingInt(op), .no_rebalance = @intFromBool(no_rebalance), .reserved = @splat(0), .vol_tag = vol_tag, .uri_len = @intCast(uri.len), .reserved2 = 0 }, .uri = uri } });
         return rep.admin_volume;
     }
+
+    pub fn rekey(self: Client, kdf_salt: [32]u8, key_id: [8]u8, throttle_pct: u8) Error!frames.AdminRekeyReply {
+        const rep = try self.call(self.ctx, .{ .admin_rekey = .{ .kdf_salt = kdf_salt, .key_id = key_id, .throttle_pct = throttle_pct, .reserved = @splat(0) } });
+        return rep.admin_rekey;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -254,11 +292,13 @@ const RamAdminWorld = struct {
     undrains: u32 = 0,
     refuse_remove: bool = false,
     report: ?[]const u8 = null,
+    rekeys: u32 = 0,
+    rekey_refuse: ?RekeyError = null,
 
     fn world(self: *RamAdminWorld) AdminWorld {
         return .{ .ctx = self, .vtable = &vt };
     }
-    const vt: AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .fsckReport = &fsckReport };
+    const vt: AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .fsckReport = &fsckReport, .rekey = &rekeyFn };
     fn self_(ctx: *anyopaque) *RamAdminWorld {
         return @ptrCast(@alignCast(ctx));
     }
@@ -283,6 +323,12 @@ const RamAdminWorld = struct {
         const self = self_(ctx);
         const r = self.report orelse return null;
         return try gpa.dupe(u8, r);
+    }
+    fn rekeyFn(ctx: *anyopaque, _: Allocator, req: frames.AdminRekeyReq) RekeyError!RekeyOutcome {
+        const self = self_(ctx);
+        if (self.rekey_refuse) |e| return e;
+        self.rekeys += 1;
+        return .{ .job_id = std.mem.readInt(u64, &req.key_id, .little), .config_generation = 9 };
     }
 };
 
@@ -398,7 +444,19 @@ test "the admin lane's volume verbs run the world; a lattice refusal is the `ref
     const got = (try c.fsckReport(gpa, 5)).?;
     defer gpa.free(got);
     try testing.expectEqualStrings("{\"schema\":1}", got);
+    // The rotation: the world's outcome rides whole; its typed refusals
+    // name their class; a generic submit of the sweep type is refused.
+    const rk = try c.rekey(@splat(3), .{ 8, 7, 6, 5, 4, 3, 2, 1 }, 25);
+    try testing.expectEqual(Verdict.ok, rk.get());
+    try testing.expectEqual(@as(u64, 9), rk.config_generation);
+    try testing.expectEqual(@as(u32, 1), r.world.rekeys);
+    r.world.rekey_refuse = error.KeyUnresolved;
+    const rk2 = try c.rekey(@splat(3), .{ 8, 7, 6, 5, 4, 3, 2, 1 }, 25);
+    try testing.expectEqual(Verdict.refused, rk2.get());
+    try testing.expectEqual(frames.RekeyRefusal.key_unresolved, rk2.why());
+    try testing.expectEqual(Verdict.refused, (try c.submit(.{ .job_type = .rekey })).verdict);
     // Without a world the volume verbs answer not_coordinator (a joiner).
     r.admin.world = null;
     try testing.expectEqual(Verdict.not_coordinator, (try c.volume(.undrain, 0x77, "", false)).get());
+    try testing.expectEqual(Verdict.not_coordinator, (try c.rekey(@splat(3), @splat(1), 0)).get());
 }

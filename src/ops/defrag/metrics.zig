@@ -74,6 +74,27 @@ pub const stats = struct {
     pub var pack_compaction_skipped_lone_victim: counters.ShardedCounter = .{};
     /// A structural refusal of the pre-publish raise (must-stay-0).
     pub var pack_compaction_raise_refused: counters.Tripwire = .init("pack_compaction_raise_refused");
+    /// The key-rotation sweep (`rekey.zig`): blocks re-encrypted through
+    /// the mover and their bytes; blocks the mover found already under the
+    /// next key; passes; confirming-census deferrals (the plane not
+    /// quiescent, or an allocated block still under the previous key);
+    /// windows closed (the primary flipped). Gauges: the window's state
+    /// and the blocks the last pass still owed.
+    pub var rekey_blocks_rewritten: counters.ShardedCounter = .{};
+    pub var rekey_bytes_rewritten: counters.ShardedCounter = .{};
+    pub var rekey_blocks_skipped_current: counters.ShardedCounter = .{};
+    pub var rekey_passes: counters.ShardedCounter = .{};
+    pub var rekey_confirm_deferrals: counters.ShardedCounter = .{};
+    pub var rekey_windows_closed: counters.ShardedCounter = .{};
+    pub var rekey_window_open: counters.Gauge = .{};
+    pub var rekey_remaining_blocks: counters.Gauge = .{};
+    /// Two referencers of one tenant window naming different stored
+    /// lengths on a transformed set (must-stay-0: a tenant's re-stage is a
+    /// new window there).
+    pub var rekey_tenant_len_conflict: counters.Tripwire = .init("rekey_tenant_len_conflict");
+    /// A re-encoded image whose stored length differs from the old one
+    /// (must-stay-0: the same plaintext and codec give the same bodies).
+    pub var rekey_image_len_drift: counters.Tripwire = .init("rekey_image_len_drift");
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {

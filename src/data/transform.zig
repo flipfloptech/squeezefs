@@ -1249,16 +1249,43 @@ pub fn unwrapCacheCapacity(writers_known: u32) u32 {
 pub const CryptoState = struct {
     encryption: Encryption,
     data_key: [DATA_KEY_LEN]u8,
-    /// The session key wrapped once under the KEK; rides every header.
-    key_blob: [WRAP_V2_LEN]u8,
-    kek: [KEK_LEN]u8,
-    key_id: [KEY_ID_LEN]u8,
+    /// The KEY WRAP in force: the session key's blob under the current
+    /// KEK and the unwrap arms (`Wrap`), published as an IMMUTABLE
+    /// snapshot behind one pointer so a rotation never tears a 63 B blob
+    /// a lane is copying into a header (release pairs with every reader's
+    /// acquire; a retired wrap is zeroized only after the plane's codec
+    /// barrier proved every reader of it returned — `retireWrap`).
+    wrap: std.atomic.Value(*const Wrap),
+    /// The wrap a rotation retired, kept until `retireWrap` (the plane's
+    /// quiescence barrier) zeroizes it.
+    retired: ?*Wrap = null,
     /// `nonce = salt ‖ BE counter`: the salt is a per-mount random prefix;
     /// the counter a monotone word starting at the config's durable floor.
     nonce_salt: [4]u8,
     nonce_counter: std.atomic.Value(u64),
     cache: []CacheEntry,
     gpa: Allocator,
+
+    /// One key wrap: the current KEK + id, the session key's blob under it,
+    /// and the PREVIOUS KEK + id while a rotation window is open (the
+    /// unwrap-only arm of the retiring key). Immutable once published.
+    pub const Wrap = struct {
+        kek: [KEK_LEN]u8,
+        key_id: [KEY_ID_LEN]u8,
+        /// The session key wrapped under `kek`; rides every header.
+        key_blob: [WRAP_V2_LEN]u8,
+        prev: ?Prev,
+
+        pub const Prev = struct { kek: [KEK_LEN]u8, key_id: [KEY_ID_LEN]u8 };
+
+        fn zeroize(self: *Wrap) void {
+            std.crypto.secureZero(u8, &self.kek);
+            if (self.prev) |*p| std.crypto.secureZero(u8, &p.kek);
+        }
+    };
+
+    /// Which key a header's blob is wrapped under.
+    pub const BlobClass = enum { current, previous, foreign };
 
     const CacheEntry = struct {
         /// 0 empty → 1 filling → 2 ready (release; readers acquire). An
@@ -1274,41 +1301,121 @@ pub const CryptoState = struct {
     /// A fresh session key and salt from `io.randomSecure` (a failure
     /// refuses: never a weaker fallback, decision 0002 row 119); the blob
     /// pre-wrapped under `derived.kek` with a fresh wrap nonce. `derived`
-    /// is copied; the caller zeroizes its own.
-    pub fn init(gpa: Allocator, io: std.Io, encryption: Encryption, derived: DerivedKey, nonce_floor: u64, writers_known: u32) InitError!*CryptoState {
+    /// (and `prev`, the retiring key of an open rotation window) are
+    /// copied; the caller zeroizes its own.
+    pub fn init(gpa: Allocator, io: std.Io, encryption: Encryption, derived: DerivedKey, prev: ?DerivedKey, nonce_floor: u64, writers_known: u32) InitError!*CryptoState {
         assert(encryption != .none);
         const self = try gpa.create(CryptoState);
         errdefer gpa.destroy(self);
         const cache = try gpa.alloc(CacheEntry, unwrapCacheCapacity(writers_known));
         errdefer gpa.free(cache);
         @memset(cache, .{});
+        const wrap = try gpa.create(Wrap);
+        errdefer gpa.destroy(wrap);
         self.* = .{
             .encryption = encryption,
             .data_key = undefined,
-            .key_blob = undefined,
-            .kek = derived.kek,
-            .key_id = derived.key_id,
+            .wrap = .init(wrap),
             .nonce_salt = undefined,
             .nonce_counter = .init(nonce_floor),
             .cache = cache,
             .gpa = gpa,
         };
-        var wrap_nonce: [NONCE_LEN]u8 = undefined;
         io.randomSecure(&self.data_key) catch return error.RandomFailed;
         io.randomSecure(&self.nonce_salt) catch return error.RandomFailed;
-        io.randomSecure(&wrap_nonce) catch return error.RandomFailed;
-        self.key_blob = wrapDataKey(encryption, self.kek, self.key_id, wrap_nonce, self.data_key);
+        wrap.* = try self.wrapUnder(io, derived, if (prev) |p| .{ .kek = p.kek, .key_id = p.key_id } else null);
         return self;
+    }
+
+    fn wrapUnder(self: *CryptoState, io: std.Io, derived: DerivedKey, prev: ?Wrap.Prev) InitError!Wrap {
+        var wrap_nonce: [NONCE_LEN]u8 = undefined;
+        io.randomSecure(&wrap_nonce) catch return error.RandomFailed;
+        return .{ .kek = derived.kek, .key_id = derived.key_id, .key_blob = wrapDataKey(self.encryption, derived.kek, derived.key_id, wrap_nonce, self.data_key), .prev = prev };
     }
 
     /// Zeroize every key-bearing byte, then free.
     pub fn deinit(self: *CryptoState) void {
         std.crypto.secureZero(u8, &self.data_key);
-        std.crypto.secureZero(u8, &self.kek);
+        const w = @constCast(self.wrap.load(.acquire));
+        w.zeroize();
+        self.gpa.destroy(w);
+        if (self.retired) |r| {
+            r.zeroize();
+            self.gpa.destroy(r);
+        }
         for (self.cache) |*e| std.crypto.secureZero(u8, &e.key);
         const gpa = self.gpa;
         gpa.free(self.cache);
         gpa.destroy(self);
+    }
+
+    /// The wrap in force (the writer's blob, the readers' unwrap arms).
+    pub fn current(self: *const CryptoState) *const Wrap {
+        // acquire pairs with the release of `beginRotation`'s store.
+        return self.wrap.load(.acquire);
+    }
+
+    /// The session key's blob under the current KEK (every header's).
+    pub fn keyBlob(self: *const CryptoState) [WRAP_V2_LEN]u8 {
+        return self.current().key_blob;
+    }
+
+    pub fn keyId(self: *const CryptoState) [KEY_ID_LEN]u8 {
+        return self.current().key_id;
+    }
+
+    /// A rotation window is open: the previous key is an unwrap arm.
+    pub fn rotating(self: *const CryptoState) bool {
+        return self.current().prev != null;
+    }
+
+    pub const RotateError = error{ OutOfMemory, RandomFailed, RotationOpen };
+
+    /// Open the rotation window in RAM: from here every header wraps the
+    /// session key under `next`; blocks under the old KEK still unwrap
+    /// (`prev`). The old wrap is kept until `retireWrap` — the plane calls
+    /// that behind its codec-pool barrier, which proves every reader that
+    /// loaded the old pointer has returned. Refused while a window is open.
+    pub fn beginRotation(self: *CryptoState, io: std.Io, next: DerivedKey) RotateError!void {
+        const old = self.current();
+        if (old.prev != null or self.retired != null) return error.RotationOpen;
+        const wrap = try self.gpa.create(Wrap);
+        errdefer self.gpa.destroy(wrap);
+        wrap.* = try self.wrapUnder(io, next, .{ .kek = old.kek, .key_id = old.key_id });
+        self.retired = @constCast(old);
+        // release pairs with `current`'s acquire.
+        self.wrap.store(wrap, .release);
+    }
+
+    /// Close the window in RAM: a wrap without the previous arm is
+    /// published and the two-key wrap retired — its KEK (the previous key)
+    /// is zeroized by `retireWrap`, which the caller runs behind its
+    /// quiescence barrier (a reader may still hold the retired pointer).
+    /// Only after the sweep's last publish is durable and the config
+    /// flipped. A retired wrap of an earlier `beginRotation` nobody retired
+    /// is zeroized first (safe: the window's whole span has passed since).
+    pub fn endRotation(self: *CryptoState) void {
+        const cur = self.current();
+        if (cur.prev == null) return;
+        const wrap = self.gpa.create(Wrap) catch {
+            // Without a fresh snapshot the arm stays: a future `endRotation`
+            // retries; the key is still forgotten at `deinit`.
+            return;
+        };
+        wrap.* = .{ .kek = cur.kek, .key_id = cur.key_id, .key_blob = cur.key_blob, .prev = null };
+        self.retireWrap();
+        self.retired = @constCast(cur);
+        // release pairs with `current`'s acquire.
+        self.wrap.store(wrap, .release);
+    }
+
+    /// Zeroize + free the wrap a rotation retired. Safe only once no reader
+    /// can hold it: the plane runs it behind its codec-pool barrier.
+    pub fn retireWrap(self: *CryptoState) void {
+        const r = self.retired orelse return;
+        self.retired = null;
+        r.zeroize();
+        self.gpa.destroy(r);
     }
 
     /// The next block nonce. Exhaustion of the 64-bit counter is
@@ -1334,11 +1441,32 @@ pub const CryptoState = struct {
         return self.nonce_counter.load(.monotonic);
     }
 
+    /// Which key wrapped `blob`: the current KEK, the previous (an open
+    /// window's retiring key), or neither. An AEAD open per arm; the
+    /// rotation sweep's classifier (a cold path).
+    pub fn classify(self: *const CryptoState, blob: *const [WRAP_V2_LEN]u8) BlobClass {
+        const w = self.current();
+        if (std.mem.eql(u8, blob, &w.key_blob)) return .current;
+        if (unwrapDataKey(self.encryption, w.kek, w.key_id, blob)) |k| {
+            var key = k;
+            std.crypto.secureZero(u8, &key);
+            return .current;
+        } else |_| {}
+        if (w.prev) |p| if (unwrapDataKey(self.encryption, p.kek, p.key_id, blob)) |k| {
+            var key = k;
+            std.crypto.secureZero(u8, &key);
+            return .previous;
+        } else |_| {};
+        return .foreign;
+    }
+
     /// The data key a header's blob names: our own blob is the fast path
     /// (every block this mount wrote); a foreign blob (an earlier
-    /// incarnation's) unwraps under the KEK through the cache.
+    /// incarnation's) unwraps under the KEK — or, inside a rotation
+    /// window, under the previous KEK — through the cache.
     pub fn keyFor(self: *CryptoState, blob: *const [WRAP_V2_LEN]u8) UnwrapError![DATA_KEY_LEN]u8 {
-        if (std.mem.eql(u8, blob, &self.key_blob)) return self.data_key;
+        const w = self.current();
+        if (std.mem.eql(u8, blob, &w.key_blob)) return self.data_key;
         stats.crypto_key_unwraps.inc();
         for (self.cache) |*e| {
             if (e.state.load(.acquire) != 2) continue;
@@ -1347,7 +1475,12 @@ pub const CryptoState = struct {
                 return e.key;
             }
         }
-        const key = try unwrapDataKey(self.encryption, self.kek, self.key_id, blob);
+        const key = unwrapDataKey(self.encryption, w.kek, w.key_id, blob) catch |e| blk: {
+            const p = w.prev orelse return e;
+            if (e != error.ForeignKey) return e;
+            stats.crypto_key_unwraps_previous.inc();
+            break :blk try unwrapDataKey(self.encryption, p.kek, p.key_id, blob);
+        };
         // Claim an empty slot (CAS 0 → 1); fill; publish (release 2 — paired
         // with the readers' acquire above). A full table just does not cache.
         for (self.cache) |*e| {
@@ -1494,7 +1627,7 @@ pub const Codec = struct {
         if (encrypted) {
             const c = t.crypto orelse return error.NoKey;
             h.flags |= FLAG_ENCRYPTED;
-            h.key_blob = c.key_blob;
+            h.key_blob = c.keyBlob();
             h.nonce = c.nextNonces(frames);
         }
         h.encode(scratch[0..HEADER_LEN]);
@@ -1773,6 +1906,9 @@ pub const stats = struct {
     pub var compress_stored_raw: counters.ShardedCounter = .{};
     pub var crypto_key_unwraps: counters.ShardedCounter = .{};
     pub var crypto_key_unwrap_hits: counters.ShardedCounter = .{};
+    /// Unwraps that fell to the PREVIOUS key of an open rotation window
+    /// (blocks the sweep has not yet rewritten): 0 outside a rotation.
+    pub var crypto_key_unwraps_previous: counters.ShardedCounter = .{};
     pub var crypto_unwrap_cache_full: counters.ShardedCounter = .{};
     pub var crypto_nonce_exhaustion: counters.Tripwire = .init("crypto_nonce_exhaustion");
     pub var stored_image_overflow_refusals: counters.Tripwire = .init("stored_image_overflow_refusals");
@@ -2362,20 +2498,20 @@ test "CryptoState: a fresh session key per init; own blob is the fast path; a fo
     const gpa = testing.allocator;
     var d = deriveVolumeKey("material-material-material-material-material", &(@as([32]u8, @splat(9))));
     defer d.zeroize();
-    const a = try CryptoState.init(gpa, testing.io, .aes256gcm, d, 1000, 1);
+    const a = try CryptoState.init(gpa, testing.io, .aes256gcm, d, null, 1000, 1);
     defer a.deinit();
-    const b = try CryptoState.init(gpa, testing.io, .aes256gcm, d, 0, 1);
+    const b = try CryptoState.init(gpa, testing.io, .aes256gcm, d, null, 0, 1);
     defer b.deinit();
     try testing.expect(!std.mem.eql(u8, &a.data_key, &b.data_key));
-    try testing.expect(!std.mem.eql(u8, &a.key_blob, &b.key_blob));
-    try testing.expectEqual(a.data_key, try a.keyFor(&a.key_blob));
+    try testing.expect(!std.mem.eql(u8, &a.keyBlob(), &b.keyBlob()));
+    try testing.expectEqual(a.data_key, try a.keyFor(&a.keyBlob()));
     const unwraps0 = stats.crypto_key_unwraps.load();
     const hits0 = stats.crypto_key_unwrap_hits.load();
-    try testing.expectEqual(b.data_key, try a.keyFor(&b.key_blob));
-    try testing.expectEqual(b.data_key, try a.keyFor(&b.key_blob));
+    try testing.expectEqual(b.data_key, try a.keyFor(&b.keyBlob()));
+    try testing.expectEqual(b.data_key, try a.keyFor(&b.keyBlob()));
     try testing.expectEqual(unwraps0 + 2, stats.crypto_key_unwraps.load());
     try testing.expectEqual(hits0 + 1, stats.crypto_key_unwrap_hits.load());
-    var junk: [63]u8 = b.key_blob;
+    var junk: [63]u8 = b.keyBlob();
     junk[30] ^= 1;
     try testing.expectError(error.ForeignKey, a.keyFor(&junk));
     const n1 = a.nextNonce();
@@ -2388,6 +2524,79 @@ test "CryptoState: a fresh session key per init; own blob is the fast path; a fo
     try testing.expectEqual(@as(u32, 16), unwrapCacheCapacity(8));
     try testing.expectEqual(@as(u32, 34), unwrapCacheCapacity(17));
     try testing.expectEqual(@as(usize, 16), a.cache.len);
+}
+
+test "the rotation arm: beginRotation re-wraps the SAME session key under the next KEK (a new blob; headers written after carry it), the old blob still unwraps as `previous` through the retiring arm and is counted; a state opened WITH a previous key reads both; a second begin refuses while open; endRotation forgets the previous key (its blob is foreign after); a block sealed before the swap decodes after it" {
+    const gpa = testing.allocator;
+    var ka = deriveVolumeKey("material-A-material-A-material-A-material-A", &(@as([32]u8, @splat(1))));
+    defer ka.zeroize();
+    var kb = deriveVolumeKey("material-B-material-B-material-B-material-B", &(@as([32]u8, @splat(2))));
+    defer kb.zeroize();
+    const c = try CryptoState.init(gpa, testing.io, .aes256gcm, ka, null, 0, 1);
+    defer c.deinit();
+    const blob_a = c.keyBlob();
+    const session = c.data_key;
+    try testing.expect(!c.rotating());
+    // A block sealed under A before the swap.
+    var env = testEnv();
+    defer env.deinit();
+    const cfg: VolumeTransform = .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = 64 << 10 };
+    const xf = try Transform.init(&env, cfg, c);
+    var codec = try Codec.init(gpa, &xf);
+    defer codec.deinit(gpa);
+    const scratch = try gpa.alloc(u8, scratchLen(cfg.block_size));
+    defer gpa.free(scratch);
+    const plain = try gpa.alloc(u8, 10_000);
+    defer gpa.free(plain);
+    for (plain, 0..) |*b, i| b.* = @intCast((i * 7) & 0xff);
+    const image_a = try gpa.dupe(u8, try codec.processWrite(plain, scratch));
+    defer gpa.free(image_a);
+    try testing.expectEqualSlices(u8, &blob_a, image_a[16..79]);
+    // The swap.
+    try c.beginRotation(testing.io, kb);
+    try testing.expect(c.rotating());
+    try testing.expectEqualSlices(u8, &session, &c.data_key);
+    const blob_b = c.keyBlob();
+    try testing.expect(!std.mem.eql(u8, &blob_a, &blob_b));
+    try testing.expectEqualSlices(u8, &kb.key_id, &c.keyId());
+    try testing.expectError(error.RotationOpen, c.beginRotation(testing.io, ka));
+    try testing.expectEqual(CryptoState.BlobClass.current, c.classify(&blob_b));
+    try testing.expectEqual(CryptoState.BlobClass.previous, c.classify(&blob_a));
+    var junk = blob_a;
+    junk[40] ^= 1;
+    try testing.expectEqual(CryptoState.BlobClass.foreign, c.classify(&junk));
+    // The old block decodes after the swap (the previous arm, counted); a
+    // new one carries the new blob.
+    const prev0 = stats.crypto_key_unwraps_previous.load();
+    const out = try gpa.alloc(u8, scratchLen(cfg.block_size));
+    defer gpa.free(out);
+    const back = try codec.processRead(image_a, out);
+    try testing.expectEqualSlices(u8, plain, back);
+    try testing.expectEqual(prev0 + 1, stats.crypto_key_unwraps_previous.load());
+    const image_b = try codec.processWrite(plain, scratch);
+    try testing.expectEqualSlices(u8, &blob_b, image_b[16..79]);
+    try testing.expectEqual(image_a.len, image_b.len);
+    // A state opened with a previous key (the remount inside a window).
+    const resumed = try CryptoState.init(gpa, testing.io, .aes256gcm, kb, ka, 0, 1);
+    defer resumed.deinit();
+    try testing.expect(resumed.rotating());
+    try testing.expectEqual(CryptoState.BlobClass.previous, resumed.classify(&blob_a));
+    try testing.expectEqual(session, try resumed.keyFor(&blob_a));
+    try testing.expectEqual(session, try resumed.keyFor(&blob_b));
+    // The close: the previous key is forgotten — its blob is foreign now.
+    c.retireWrap();
+    c.endRotation();
+    c.retireWrap();
+    try testing.expect(!c.rotating());
+    try testing.expectEqual(CryptoState.BlobClass.foreign, c.classify(&blob_a));
+    try testing.expectEqual(CryptoState.BlobClass.current, c.classify(&blob_b));
+    // The blob was cached while the arm was live: the cache answers it
+    // still (the key, not the wrap, is what a reader needs); a fresh state
+    // without the arm refuses it.
+    const fresh = try CryptoState.init(gpa, testing.io, .aes256gcm, kb, null, 0, 1);
+    defer fresh.deinit();
+    try testing.expectError(error.ForeignKey, fresh.keyFor(&blob_a));
+    c.endRotation();
 }
 
 fn roundTrip(gpa: Allocator, cfg: VolumeTransform, crypto: ?*CryptoState, plain: []const u8, expect_raw: bool) !void {
@@ -2474,9 +2683,9 @@ test "processWrite/processRead: passthrough is the identity (same pointer, no fr
     }
     var d = deriveVolumeKey("a-32-byte-or-longer-key-material-string!!", &(@as([32]u8, @splat(3))));
     defer d.zeroize();
-    const gcm = try CryptoState.init(gpa, testing.io, .aes256gcm, d, 0, 1);
+    const gcm = try CryptoState.init(gpa, testing.io, .aes256gcm, d, null, 0, 1);
     defer gcm.deinit();
-    const cha = try CryptoState.init(gpa, testing.io, .chacha20poly1305, d, 0, 1);
+    const cha = try CryptoState.init(gpa, testing.io, .chacha20poly1305, d, null, 0, 1);
     defer cha.deinit();
     for ([_]Compression{ .lz4, .zstd }) |comp| {
         try roundTrip(gpa, .{ .compression = comp, .block_size = block }, null, &plain, false);
@@ -2528,7 +2737,7 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     defer env.deinit();
     var d = deriveVolumeKey("another-32-byte-or-longer-key-material!!", &(@as([32]u8, @splat(5))));
     defer d.zeroize();
-    const c = try CryptoState.init(gpa, testing.io, .aes256gcm, d, 0, 1);
+    const c = try CryptoState.init(gpa, testing.io, .aes256gcm, d, null, 0, 1);
     defer c.deinit();
     const cfg: VolumeTransform = .{ .compression = .lz4, .encryption = .aes256gcm, .block_size = 65536 };
     const xf = try Transform.init(&env, cfg, c);
@@ -2591,10 +2800,10 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     // A blob that is well-formed but wrapped under another KEK.
     var d2 = deriveVolumeKey("a-third-32-byte-or-longer-key-material!!!", &(@as([32]u8, @splat(6))));
     defer d2.zeroize();
-    const other = try CryptoState.init(gpa, testing.io, .aes256gcm, d2, 0, 1);
+    const other = try CryptoState.init(gpa, testing.io, .aes256gcm, d2, null, 0, 1);
     defer other.deinit();
     @memcpy(mut, image);
-    mut[16..79].* = other.key_blob;
+    mut[16..79].* = other.keyBlob();
     try testing.expectError(error.FrameKey, t.readInner(mut, out));
     // The counting path: each class fires its tripwire (one log per class;
     // the rate limit is per site).
@@ -2612,7 +2821,7 @@ test "AAD covers the header: any flipped header byte of an encrypted image fails
     try testing.expectError(error.FrameAuth, t.processRead(mut, out));
     try testing.expectEqual(aad0 + 1, stats.transform_frame_refusals_aad.load());
     @memcpy(mut, image);
-    mut[16..79].* = other.key_blob;
+    mut[16..79].* = other.keyBlob();
     const key0 = stats.transform_frame_refusals_key.load();
     try testing.expectError(error.FrameKey, t.processRead(mut, out));
     try testing.expectEqual(key0 + 1, stats.transform_frame_refusals_key.load());
@@ -2848,7 +3057,7 @@ test "property: readInner is total under a PRNG over mutations of valid lz4/zstd
     defer env.deinit();
     var d = deriveVolumeKey("fuzz-32-byte-or-longer-key-material-string", &(@as([32]u8, @splat(7))));
     defer d.zeroize();
-    const c = try CryptoState.init(gpa, testing.io, .chacha20poly1305, d, 0, 1);
+    const c = try CryptoState.init(gpa, testing.io, .chacha20poly1305, d, null, 0, 1);
     defer c.deinit();
     const block: u32 = 8192;
     const cfgs = [_]VolumeTransform{

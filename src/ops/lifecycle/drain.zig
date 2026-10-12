@@ -335,7 +335,7 @@ const Rig = struct {
 
     fn plant(self: *Rig, vol: u64, idx: u64, fill: u8, owners: []const mover.RamWorld.BindKey) !void {
         var data: [mover.RamWorld.DATA]u8 = @splat(fill);
-        _ = try self.dw.w.plant(vol, idx, &data, owners);
+        _ = try self.dw.w.plant(vol, idx, data[0..@min(data.len, self.dw.w.chunk)], owners);
     }
 };
 

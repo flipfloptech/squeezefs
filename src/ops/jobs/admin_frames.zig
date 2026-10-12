@@ -286,7 +286,71 @@ pub const AdminVolumeReply = extern struct {
     }
 };
 
+// ---- admin_rekey ----
+
+/// `defrag --rekey`: the next key's PUBLIC reference — its salt and id;
+/// never material (the daemon resolves the key file itself through the
+/// key dir). Opens the rotation window durably, arms the plane's wrap,
+/// submits the sweep.
+pub const AdminRekeyReq = extern struct {
+    kdf_salt: [32]u8,
+    key_id: [8]u8,
+    /// 0 ⇒ the fabric's default.
+    throttle_pct: u8,
+    reserved: [7]u8,
+
+    pub fn check(self: AdminRekeyReq) bool {
+        // 100: a duty cycle is a percentage; the record codec refuses above it.
+        return self.throttle_pct <= 100 and std.mem.allEqual(u8, &self.reserved, 0);
+    }
+};
+
+/// The verdict, the sweep's job id (0 on a refusal), the config generation
+/// that opened the window, and WHY a refusal: a class the CLI names.
+pub const AdminRekeyReply = extern struct {
+    verdict: u8,
+    /// `RekeyRefusal`.
+    reason: u8,
+    reserved: [6]u8,
+    job_id: u64,
+    config_generation: u64,
+
+    pub fn check(self: AdminRekeyReply) bool {
+        return verdictOk(self.verdict) and std.enums.fromInt(RekeyRefusal, self.reason) != null;
+    }
+
+    pub fn get(self: AdminRekeyReply) Verdict {
+        return @fromBackingInt(@intCast(self.verdict));
+    }
+
+    pub fn why(self: AdminRekeyReply) RekeyRefusal {
+        return @fromBackingInt(@intCast(self.reason));
+    }
+
+    pub fn refusal(v: Verdict, r: RekeyRefusal) AdminRekeyReply {
+        return .{ .verdict = @backingInt(v), .reason = @backingInt(r), .reserved = @splat(0), .job_id = 0, .config_generation = 0 };
+    }
+};
+
+pub const RekeyRefusal = enum(u8) {
+    none = 0,
+    /// The set is plaintext: nothing to rotate.
+    plaintext = 1,
+    /// A window is open with ANOTHER next key.
+    window_open = 2,
+    /// The next key did not resolve from the key dir (`key install` it on
+    /// this host first), or its id did not match.
+    key_unresolved = 3,
+    /// The next key id equals the primary's.
+    same_key = 4,
+    /// The window opened but the plane's wrap did not swap (random
+    /// source) — the record stands; retry.
+    plane = 5,
+};
+
 comptime {
+    std.debug.assert(codec.wireSize(AdminRekeyReq) == 48);
+    std.debug.assert(codec.wireSize(AdminRekeyReply) == 24);
     std.debug.assert(codec.wireSize(AdminJobListReq) == 8);
     std.debug.assert(codec.wireSize(AdminJobListHead) == 8);
     std.debug.assert(codec.wireSize(JobRow) == 96);
@@ -362,6 +426,13 @@ test "every admin payload round-trips; the op/verdict/type bytes are total; a pc
     try testing.expectEqual(@as(u64, 0x55), rm.head.vol_tag);
     const vr = try roundTrip(AdminVolumeReply, AdminVolumeReply.refusal(.refused), buf);
     try testing.expectEqual(Verdict.refused, vr.get());
+    const rk = try roundTrip(AdminRekeyReq, .{ .kdf_salt = @splat(7), .key_id = .{ 1, 2, 3, 4, 5, 6, 7, 8 }, .throttle_pct = 25, .reserved = @splat(0) }, buf);
+    try testing.expectEqual(@as(u8, 25), rk.throttle_pct);
+    try testing.expectError(error.Malformed, roundTrip(AdminRekeyReq, .{ .kdf_salt = @splat(7), .key_id = @splat(1), .throttle_pct = 101, .reserved = @splat(0) }, buf));
+    const rr = try roundTrip(AdminRekeyReply, AdminRekeyReply.refusal(.refused, .key_unresolved), buf);
+    try testing.expectEqual(Verdict.refused, rr.get());
+    try testing.expectEqual(RekeyRefusal.key_unresolved, rr.why());
+    try testing.expectError(error.Malformed, roundTrip(AdminRekeyReply, .{ .verdict = 0, .reason = 99, .reserved = @splat(0), .job_id = 1, .config_generation = 2 }, buf));
 }
 
 fn adminPayloadsTotal(bytes: []const u8) void {
@@ -371,6 +442,8 @@ fn adminPayloadsTotal(bytes: []const u8) void {
     _ = codec.decodePayload(AdminFsckReport, bytes) catch {};
     _ = codec.decodePayload(AdminVolumeReq, bytes) catch {};
     _ = codec.decodePayload(AdminVolumeReply, bytes) catch {};
+    _ = codec.decodePayload(AdminRekeyReq, bytes) catch {};
+    _ = codec.decodePayload(AdminRekeyReply, bytes) catch {};
 }
 
 fn adminPayloadsFuzz(_: void, smith: *std.testing.Smith) !void {

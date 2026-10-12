@@ -646,6 +646,9 @@ const defrag_bodies = @import("../defrag/bodies.zig");
 const defrag_plan = @import("../defrag/plan.zig");
 const pack_compact = @import("../defrag/pack_compact.zig");
 const pack = @import("../../data/pack.zig");
+const rekey_mod = @import("../defrag/rekey.zig");
+const transform = @import("../../data/transform.zig");
+const keys = @import("../keys.zig");
 
 /// `pack_compact.PackSeam` over the plane + its packer: a window the
 /// compactor prepared lands at once (`Packer.landWindow` — the slot is a
@@ -884,6 +887,117 @@ pub const PlaneDefrag = struct {
     }
 };
 
+/// `rekey.RekeySeam` over the plane: the mover's table with the plane's
+/// rewrite hook bound, the classifier off the device, the confirming
+/// census's universe, the plane's quiescence, and the CLOSE — ONE config
+/// tx flipping the primary to the next key (durable, fsync'd) and the
+/// plane's wrap closed behind it.
+pub const PlaneRekey = struct {
+    plane: *plane_mod.DataPlane,
+    io: Io,
+    be: *KvBackend,
+    mover_: *PlaneMover,
+    /// The mover's table + `rewrite`.
+    vt_: mover.Seam.VTable,
+
+    pub fn init(plane: *plane_mod.DataPlane, io: Io, be: *KvBackend, m: *PlaneMover) PlaneRekey {
+        var vt_ = PlaneMover.vt;
+        vt_.rewrite = &rewrite;
+        return .{ .plane = plane, .io = io, .be = be, .mover_ = m, .vt_ = vt_ };
+    }
+
+    pub fn seam(self: *PlaneRekey) rekey_mod.RekeySeam {
+        return .{ .ctx = self, .vtable = &vt };
+    }
+
+    const vt: rekey_mod.RekeySeam.VTable = .{ .mover = &moverFn, .windowKeyId = &windowKeyId, .refs = &refs, .allocatedBlocks = &allocatedBlocks, .classify = &classify, .quiesce = &quiesce, .drainReclaim = &drainReclaim, .close = &close, .chunk = &chunk };
+
+    fn self_(ctx: *anyopaque) *PlaneRekey {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn moverFn(ctx: *anyopaque) mover.Seam {
+        const self = self_(ctx);
+        return .{ .ctx = self.mover_, .vtable = &self.vt_ };
+    }
+    /// The mover's ctx is the `PlaneMover`; the plane is its.
+    fn rewrite(ctx: *anyopaque, task: mover.Task, image: []u8, len: usize) mover.SeamError!?usize {
+        const m: *PlaneMover = @ptrCast(@alignCast(ctx));
+        return m.plane.rekeyRewrite(task, image, len);
+    }
+    fn windowKeyId(ctx: *anyopaque) ?[transform.KEY_ID_LEN]u8 {
+        const self = self_(ctx);
+        const value = (self.be.lookup(self.plane.gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return null) orelse return null;
+        defer self.plane.gpa.free(value);
+        var diag: set_config.Refusal = undefined;
+        var cfg = set_config.decode(self.plane.gpa, value, &diag) catch return null;
+        defer cfg.deinit(self.plane.gpa);
+        const nk = cfg.next_key orelse return null;
+        return nk.key_id;
+    }
+    fn refs(ctx: *anyopaque, gpa: Allocator) Allocator.Error![]census.Ref {
+        const self = self_(ctx);
+        var list: std.ArrayList(census.Ref) = .empty;
+        errdefer list.deinit(gpa);
+        const Collect = struct {
+            gpa: Allocator,
+            list: *std.ArrayList(census.Ref),
+            fn visit(c: *@This(), ino: u64, bi: u32, m: layout.Mapping) plane_mod.Error!void {
+                try c.list.append(c.gpa, .{ .ino = ino, .block_index = bi, .mapping = m });
+            }
+        };
+        var col: Collect = .{ .gpa = gpa, .list = &list };
+        self.plane.forEachBinding(*Collect, &col, Collect.visit) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => blk: {
+                log.warn("defrag --rekey: the layout walk failed ({s}) — the pass plans nothing", .{@errorName(e)});
+                list.clearRetainingCapacity();
+                break :blk list.toOwnedSlice(gpa);
+            },
+        };
+        return list.toOwnedSlice(gpa);
+    }
+    fn allocatedBlocks(ctx: *anyopaque, gpa: Allocator) Allocator.Error![]rekey_mod.BlockKey {
+        return self_(ctx).plane.rekeyAllocatedBlocks(gpa);
+    }
+    fn classify(ctx: *anyopaque, vol_tag: u64, block_idx: u64, rel_off: u32) rekey_mod.Class {
+        return self_(ctx).plane.rekeyClassify(vol_tag, block_idx, rel_off);
+    }
+    fn quiesce(ctx: *anyopaque, io: Io) bool {
+        return self_(ctx).plane.rekeyQuiesce(io);
+    }
+    fn drainReclaim(ctx: *anyopaque) void {
+        const self = self_(ctx);
+        _ = self.plane.reclaimer.drainSync(self.io);
+    }
+    /// THE LAST STEP: `closeRekey` on the record in ONE tx + the barrier,
+    /// then the plane's wrap closed.
+    fn close(ctx: *anyopaque) error{Io}!void {
+        const self = self_(ctx);
+        const gpa = self.plane.gpa;
+        const value = (self.be.lookup(gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return error.Io) orelse return error.Io;
+        defer gpa.free(value);
+        var diag: set_config.Refusal = undefined;
+        var cfg = set_config.decode(gpa, value, &diag) catch return error.Io;
+        defer cfg.deinit(gpa);
+        var m = set_config.closeRekey(gpa, &cfg) catch return error.Io;
+        defer m.next.deinit(gpa);
+        const bytes = set_config.encode(gpa, &m.next, @intCast(geometry.recordValueCap(self.be.nodeSize()))) catch return error.Io;
+        defer gpa.free(bytes);
+        const t = self.be.begin(@src()) catch return error.Io;
+        t.stagePut(key.TREE_CONTROL, set_config.CONTROL_KEY, bytes) catch {
+            self.be.abandon(t);
+            return error.Io;
+        };
+        self.be.commit(t) catch return error.Io;
+        self.be.fsync() catch return error.Io;
+        self.plane.closeRekey(self.io) catch |e| log.err("defrag --rekey: the record flipped to key id {x} (generation {d}) but the plane's wrap did not close ({s}) — the previous key stays an unwrap arm until the next mount", .{ &m.next.key_id, m.next.config_generation, @errorName(e) });
+        log.info("defrag --rekey: the primary key is now id {x} (config generation {d})", .{ &m.next.key_id, m.next.config_generation });
+    }
+    fn chunk(ctx: *anyopaque) u64 {
+        return self_(ctx).plane.chunk;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // The admin lane's world over the ONLINE set (`admin.AdminWorld`): the
 // lattice through `PlaneWorld` with the plane attach + the grant-plane arm
@@ -913,7 +1027,7 @@ pub const PlaneAdmin = struct {
         return .{ .ctx = self, .vtable = &vt };
     }
 
-    const vt: admin_mod.AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .fsckReport = &fsckReport };
+    const vt: admin_mod.AdminWorld.VTable = .{ .addData = &addData, .removeData = &removeData, .undrain = &undrain, .fsckReport = &fsckReport, .rekey = &rekey };
 
     fn self_(ctx: *anyopaque) *PlaneAdmin {
         return @ptrCast(@alignCast(ctx));
@@ -1043,7 +1157,51 @@ pub const PlaneAdmin = struct {
         const body = node.fsck_body orelse return null;
         return body.lastReportJson(gpa);
     }
+
+    /// `defrag --rekey`: the next key resolved from the key dir and
+    /// verified → the window opened in ONE config tx (durable BEFORE any
+    /// block is written under it) → the plane's wrap swapped behind its
+    /// barriers → the sweep submitted. A window already open with the same
+    /// next key resumes (a new sweep record); another next key refuses.
+    fn rekey(ctx: *anyopaque, gpa: Allocator, req: frames_mod.AdminRekeyReq) admin_mod.RekeyError!admin_mod.RekeyOutcome {
+        const self = self_(ctx);
+        const node = self.node;
+        if (!node.fabric.is_coordinator.load(.acquire)) return error.NotCoordinator;
+        var cfg = PlaneWorld.vt.loadConfig(&self.world_, gpa) catch return error.Io;
+        defer cfg.deinit(gpa);
+        if (cfg.encryption == .none) return error.Plaintext;
+        if (std.mem.eql(u8, &cfg.key_id, &req.key_id)) return error.SameKey;
+        if (cfg.next_key) |nk| if (!std.mem.eql(u8, &nk.key_id, &req.key_id) or !std.mem.eql(u8, &nk.kdf_salt, &req.kdf_salt)) return error.WindowOpen;
+        var derived = keys.linux_verbs.resolveNextKey(&req.kdf_salt, req.key_id) catch return error.KeyUnresolved;
+        defer derived.zeroize();
+        var generation = cfg.config_generation;
+        if (cfg.next_key == null) {
+            var m = set_config.openRekey(gpa, &cfg, .{ .kdf_salt = req.kdf_salt, .key_id = req.key_id }) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.WindowOpen,
+            };
+            defer m.next.deinit(gpa);
+            PlaneWorld.vt.commit(&self.world_, &m.next, null) catch return error.Io;
+            generation = m.next.config_generation;
+        }
+        // The plane's wrap: a window already open in RAM (a resumed verb on
+        // the same mount) is fine; a crashed mount's window armed at mount.
+        if (!node.plane.rekeyWindowOpen()) node.plane.beginRekey(node.io, derived) catch |e| switch (e) {
+            error.RotationOpen => {},
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NotEncrypted, error.RandomFailed => return error.Plane,
+        };
+        const job_id = node.fabric.submit(node.io, .{ .job_type = .rekey, .throttle_pct = req.throttle_pct, .arg0 = std.mem.readInt(u64, &req.key_id, .little) }) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.NotCoordinator => error.NotCoordinator,
+            error.TableFull => error.TableFull,
+            error.Io => error.Io,
+        };
+        return .{ .job_id = job_id, .config_generation = generation };
+    }
 };
+
+const frames_mod = @import("admin_frames.zig");
 
 const rebalance_mod = @import("rebalance.zig");
 const volume_ops = @import("../lifecycle/volume_ops.zig");
@@ -1078,6 +1236,8 @@ pub const Node = struct {
     defrag_: PlaneDefrag,
     data_body: defrag_bodies.DefragDataBody,
     pack_body: defrag_bodies.DefragPackBody,
+    rekey_: PlaneRekey,
+    rekey_body: rekey_mod.RekeyBody,
     noop_body: fabric_mod.NoopBody = .{},
     /// The fsck engine over the LIVE binding (null until `bindFsck`).
     fsck_body: ?*fsck_runner.linux.JobBody = null,
@@ -1145,6 +1305,8 @@ pub const Node = struct {
             .defrag_ = undefined,
             .data_body = undefined,
             .pack_body = undefined,
+            .rekey_ = undefined,
+            .rekey_body = undefined,
             .admin_ = undefined,
             .admin_svc = undefined,
         };
@@ -1165,6 +1327,9 @@ pub const Node = struct {
         n.fabric.registerBody(.rebalance, n.rebalance_body.body());
         n.fabric.registerBody(.defrag_data, n.data_body.body());
         n.fabric.registerBody(.defrag_pack, n.pack_body.body());
+        n.rekey_ = PlaneRekey.init(in.plane, io, in.backend, &n.mover_);
+        n.rekey_body = .{ .gpa = gpa, .seam = n.rekey_.seam() };
+        n.fabric.registerBody(.rekey, n.rekey_body.body());
         n.admin_ = .{ .node = n, .world_ = n.world_, .arm = in.data_arm };
         n.admin_svc = .{ .io = io, .fabric = &n.fabric, .world = n.admin_.world() };
         return n;

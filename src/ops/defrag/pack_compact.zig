@@ -286,14 +286,14 @@ test "victims below half re-pack into one fresh pack and free; every tenant byte
     // data cap is 64 B; the "4 KiB grain" is modelled as 20 B slots here
     // by using rel_off multiples the fake does not re-align).
     var data: [mover.RamWorld.DATA]u8 = undefined;
-    for (&data, 0..) |*d, i| d.* = @intCast(i);
+    for (&data, 0..) |*d, i| d.* = @truncate(i);
     // block 0: tenants at 0 (len 10, shared by ino 1 and 2 — the clone share) and 20 (len 10, ino 3).
-    _ = try w.plant(0xA, 0, &data, &.{});
+    _ = try w.plant(0xA, 0, data[0..4096], &.{});
     _ = try w.plantTenant(0xA, 0, 0, 10, .{ .ino = 1, .block_index = 0 });
     _ = try w.plantTenant(0xA, 0, 0, 10, .{ .ino = 2, .block_index = 0 });
     _ = try w.plantTenant(0xA, 0, 20, 10, .{ .ino = 3, .block_index = 0 });
     // block 1: a nested prefix share at 0 (len 5 for ino 4, len 12 for ino 5).
-    _ = try w.plant(0xA, 1, &data, &.{});
+    _ = try w.plant(0xA, 1, data[0..4096], &.{});
     _ = try w.plantTenant(0xA, 1, 0, 5, .{ .ino = 4, .block_index = 0 });
     _ = try w.plantTenant(0xA, 1, 0, 12, .{ .ino = 5, .block_index = 0 });
     const victims = [_]PackVictim{
@@ -339,7 +339,7 @@ test "a refused publish releases exactly one destination reference; a tenant re-
     try w.addVolume(0xA, 8);
     var pw: RamPackWorld = .{ .w = &w, .open_vol = 0xA, .chunk = 4096 };
     var data: [mover.RamWorld.DATA]u8 = @splat(0x5A);
-    _ = try w.plant(0xA, 0, &data, &.{});
+    _ = try w.plant(0xA, 0, data[0..4096], &.{});
     _ = try w.plantTenant(0xA, 0, 0, 8, .{ .ino = 1, .block_index = 0 });
     _ = try w.plantTenant(0xA, 0, 16, 8, .{ .ino = 2, .block_index = 0 });
     const v: PackVictim = .{ .vol_tag = 0xA, .block_idx = 0, .live_bytes = 16, .windows = @constCast(&[_]metrics.PackWindow{ .{ .off = 0, .len = 8 }, .{ .off = 16, .len = 8 } }), .refs = @constCast(&[_]Ref{

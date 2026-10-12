@@ -181,7 +181,8 @@ pub const FABRIC_FIXED_LEN: usize = @sizeOf(FabricEndpointWire);
 pub const HeadWire = extern struct {
     magic: [8]u8,
     version_le: [2]u8,
-    reserved0_le: [2]u8,
+    /// `FLAG_*`; an unknown bit refuses.
+    flags_le: [2]u8,
     /// Monotone; +1 per committed mutation; the live mirror's compare word.
     config_generation_le: [8]u8,
     block_size_le: [4]u8,
@@ -216,6 +217,22 @@ pub const HeadWire = extern struct {
 
 pub const HEAD_LEN: usize = @sizeOf(HeadWire);
 
+/// Head flag bit 0: a KEY-ROTATION WINDOW is open — a `RekeyWire` follows
+/// the cache paths (charter §6.5 + `ops_nvmet_keys.md` §7.4: `{scheme,
+/// salt, key_id}` stays the key EVERY block is readable under once no
+/// window is open; `next` is the key new writes wrap under meanwhile; the
+/// sweep flips the primary to `next` LAST, after the last block's publish
+/// is durable). Every pre-rung-10 image reads as no window.
+pub const FLAG_REKEY_WINDOW: u16 = 1 << 0;
+const FLAGS_KNOWN: u16 = FLAG_REKEY_WINDOW;
+
+/// The window's record: the NEXT key's salt and id (40 B, LE-free bytes).
+pub const RekeyWire = extern struct {
+    kdf_salt: [transform.KDF_SALT_LEN]u8,
+    key_id: [transform.KEY_ID_LEN]u8,
+};
+pub const REKEY_LEN: usize = @sizeOf(RekeyWire);
+
 /// A data-volume record's fixed part: 64 B, then `uri_len` bytes.
 pub const DataVolumeWire = extern struct {
     vol_tag_le: [8]u8,
@@ -237,6 +254,7 @@ pub const CHECKSUM_LEN: usize = 8;
 
 comptime {
     assert(HEAD_LEN == 128);
+    assert(REKEY_LEN == 40);
     assert(DATA_VOLUME_FIXED_LEN == 64);
     assert(FABRIC_FIXED_LEN == 20);
     assert(@offsetOf(DataVolumeWire, "fabric_len_le") == 58);
@@ -259,6 +277,10 @@ pub const Config = struct {
     key_id: [transform.KEY_ID_LEN]u8,
     nonce_floor: u64,
     inline_max: u32,
+    /// The open rotation window's NEXT key (`FLAG_REKEY_WINDOW`); null =
+    /// no window. New writes wrap under it; reads unwrap under it or the
+    /// primary; `closeRekey` makes it the primary.
+    next_key: ?KeyRef = null,
     data: []DataVolume,
     cache_paths: [][]const u8,
 
@@ -314,9 +336,10 @@ pub const Config = struct {
         return out;
     }
 
-    /// The encoded length (head + records + paths + checksum).
+    /// The encoded length (head + records + paths + the window + checksum).
     pub fn encodedLen(self: *const Config) usize {
         var n: usize = HEAD_LEN + CHECKSUM_LEN;
+        if (self.next_key != null) n += REKEY_LEN;
         for (self.data) |d| {
             n += DATA_VOLUME_FIXED_LEN + d.uri.len;
             if (d.fabric) |f| n += f.encodedLen();
@@ -356,6 +379,7 @@ pub const Config = struct {
         try writeUuid(w, self.set_uuid);
         try w.print("\",\"config_generation\":{d},\"block_size\":{d},\"chunk_size\":{d},\"capacity_bytes\":{d},\"compression\":\"{s}\",\"encryption\":\"{s}\"", .{ self.config_generation, self.block_size, self.chunk_size, self.capacity, @tagName(self.compression), self.encryption.name() });
         if (self.encryption != .none) try w.print(",\"key_id\":\"{x}\"", .{&self.key_id});
+        if (self.next_key) |nk| try w.print(",\"key_id_next\":\"{x}\"", .{&nk.key_id});
         try w.print(",\"inline_max\":{d},\"lifecycle_diverged\":{},\"data\":[", .{ self.inline_max, self.lifecycleDiverged() });
         for (self.data, 0..) |d, i| {
             if (i != 0) try w.writeByte(',');
@@ -381,6 +405,7 @@ pub const Config = struct {
         try w.print("  set config generation {d}; block {d} B; chunk {d} B; capacity {d} B ({d} MiB); compression {s}; encryption {s}", .{ self.config_generation, self.block_size, self.chunk_size, self.capacity, self.capacity >> 20, @tagName(self.compression), self.encryption.name() });
         if (self.encryption != .none) {
             try w.print("; key {s} id {x} (resolution: --encrypt-key → SQUEEZEFS_ENCRYPT_KEY_FILE → {s}/{x}.key)", .{ transform.KEY_WRAP_SCHEME_NAME, &self.key_id, transform.KEY_DIR, &self.key_id });
+            if (self.next_key) |nk| try w.print("; ROTATION WINDOW OPEN: next key id {x} ({s}/{x}.key; `defrag --rekey` sweeps every block onto it and flips the primary last)", .{ &nk.key_id, transform.KEY_DIR, &nk.key_id });
         }
         if (self.inline_max != 0) try w.print("; inline_max override {d}", .{self.inline_max});
         try w.print("\n  data volumes {d}", .{self.data.len});
@@ -438,7 +463,7 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
     var h: HeadWire = undefined;
     h.magic = MAGIC.*;
     std.mem.writeInt(u16, &h.version_le, VERSION, .little);
-    std.mem.writeInt(u16, &h.reserved0_le, 0, .little);
+    std.mem.writeInt(u16, &h.flags_le, if (cfg.next_key != null) FLAG_REKEY_WINDOW else 0, .little);
     std.mem.writeInt(u64, &h.config_generation_le, cfg.config_generation, .little);
     std.mem.writeInt(u32, &h.block_size_le, cfg.block_size, .little);
     std.mem.writeInt(u32, &h.chunk_size_le, cfg.chunk_size, .little);
@@ -492,6 +517,10 @@ pub fn encode(gpa: Allocator, cfg: *const Config, cap: usize) EncodeError![]u8 {
         off += 2;
         @memcpy(out[off..][0..p.len], p);
         off += p.len;
+    }
+    if (cfg.next_key) |nk| {
+        out[off..][0..REKEY_LEN].* = std.mem.toBytes(RekeyWire{ .kdf_salt = nk.kdf_salt, .key_id = nk.key_id });
+        off += REKEY_LEN;
     }
     assert(off + CHECKSUM_LEN == len);
     checksum.stamp(out, off);
@@ -581,11 +610,14 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
     const sum_off = bytes.len - CHECKSUM_LEN;
     if (!checksum.verify(bytes, sum_off)) return refuse(diag, .checksum_mismatch);
     const h = std.mem.bytesToValue(HeadWire, bytes[0..HEAD_LEN]);
-    if (std.mem.readInt(u16, &h.reserved0_le, .little) != 0 or h.reserved1 != 0 or !std.mem.allEqual(u8, &h.reserved, 0)) return refuse(diag, .reserved_not_zero);
+    const flags = std.mem.readInt(u16, &h.flags_le, .little);
+    if (flags & ~FLAGS_KNOWN != 0 or h.reserved1 != 0 or !std.mem.allEqual(u8, &h.reserved, 0)) return refuse(diag, .reserved_not_zero);
     const compression = Compression.fromWire(h.compression) orelse return refuse(diag, .bad_mode);
     const encryption = Encryption.fromWire(h.encryption) orelse return refuse(diag, .bad_mode);
     if (h.key_scheme != 0 and h.key_scheme != transform.KEY_WRAP_SCHEME_V2) return refuse(diag, .{ .bad_key_scheme = h.key_scheme });
     if ((h.key_scheme != 0) != (encryption != .none)) return refuse(diag, .{ .bad_key_scheme = h.key_scheme });
+    // A window on a plaintext set is a shape no verb writes.
+    if (flags & FLAG_REKEY_WINDOW != 0 and encryption == .none) return refuse(diag, .{ .bad_key_scheme = h.key_scheme });
     const block_size = std.mem.readInt(u32, &h.block_size_le, .little);
     const chunk_size = std.mem.readInt(u32, &h.chunk_size_le, .little);
     const tcfg: transform.VolumeTransform = .{ .compression = compression, .encryption = encryption, .block_size = block_size };
@@ -593,9 +625,12 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
     const n_data: usize = std.mem.readInt(u16, &h.n_data_le, .little);
     const n_paths: usize = std.mem.readInt(u16, &h.n_cache_paths_le, .little);
     var off: usize = HEAD_LEN;
-    // The counts against the bytes present, before any allocation.
-    if (n_data > MAX_DATA_VOLUMES or n_data * DATA_VOLUME_FIXED_LEN > sum_off - off) return refuse(diag, .truncated);
-    if (n_paths > MAX_CACHE_PATHS or n_paths * 2 > sum_off - off - n_data * DATA_VOLUME_FIXED_LEN) return refuse(diag, .truncated);
+    // The counts against the bytes present, before any allocation (the
+    // window's fixed tail included).
+    const tail_fixed: usize = if (flags & FLAG_REKEY_WINDOW != 0) REKEY_LEN else 0;
+    if (sum_off - off < tail_fixed) return refuse(diag, .truncated);
+    if (n_data > MAX_DATA_VOLUMES or n_data * DATA_VOLUME_FIXED_LEN > sum_off - off - tail_fixed) return refuse(diag, .truncated);
+    if (n_paths > MAX_CACHE_PATHS or n_paths * 2 > sum_off - off - tail_fixed - n_data * DATA_VOLUME_FIXED_LEN) return refuse(diag, .truncated);
     var cfg: Config = .{
         .config_generation = std.mem.readInt(u64, &h.config_generation_le, .little),
         .set_uuid = h.set_uuid,
@@ -685,6 +720,14 @@ pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Co
         if (len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null) return refuse(diag, .{ .bad_record = n_data });
         p.* = try gpa.dupe(u8, path);
         p_done += 1;
+    }
+    if (flags & FLAG_REKEY_WINDOW != 0) {
+        if (sum_off - off < REKEY_LEN) return refuse(diag, .truncated);
+        const rk = std.mem.bytesToValue(RekeyWire, bytes[off..][0..REKEY_LEN]);
+        off += REKEY_LEN;
+        // The next key is a DIFFERENT key (the same id is no rotation).
+        if (std.mem.eql(u8, &rk.key_id, &h.key_id)) return refuse(diag, .{ .bad_record = n_data });
+        cfg.next_key = .{ .kdf_salt = rk.kdf_salt, .key_id = rk.key_id };
     }
     if (off != sum_off) return refuse(diag, .trailing_bytes);
     cfg.data = data;
@@ -868,6 +911,37 @@ pub fn setFabricEndpoint(gpa: Allocator, prev: *const Config, vol_tag: u64, ep: 
         copy.subnqn = try gpa.dupe(u8, e.subnqn);
         d.fabric = copy;
     }
+    return finish(prev, next);
+}
+
+/// `defrag --rekey`'s FIRST durable step: open the rotation window with
+/// the next key's `{salt, key_id}` BEFORE any block is written under it
+/// (a crash after this leaves every block readable under one of the two
+/// keys named here). Refused on a plaintext set, on a next id equal to
+/// the primary, and on a window already open with ANOTHER next key (one
+/// rotation at a time); the same next key again is idempotent (the
+/// resumed verb).
+pub fn openRekey(gpa: Allocator, prev: *const Config, next_key: KeyRef) VerbError!Mutation {
+    if (prev.encryption == .none) return error.IllegalTransition;
+    if (std.mem.eql(u8, &next_key.key_id, &prev.key_id)) return error.IllegalTransition;
+    if (prev.next_key) |cur| if (!std.mem.eql(u8, &cur.key_id, &next_key.key_id) or !std.mem.eql(u8, &cur.kdf_salt, &next_key.kdf_salt)) return error.IllegalTransition;
+    var next = try prev.clone(gpa);
+    errdefer next.deinit(gpa);
+    next.next_key = next_key;
+    return finish(prev, next);
+}
+
+/// The rotation's LAST durable step, after the sweep found no block under
+/// the primary and the last publish is durable: the next key becomes the
+/// primary `{scheme, salt, key_id}` and the window closes — the old key
+/// is forgotten here and nowhere earlier. Refused with no window open.
+pub fn closeRekey(gpa: Allocator, prev: *const Config) VerbError!Mutation {
+    const nk = prev.next_key orelse return error.IllegalTransition;
+    var next = try prev.clone(gpa);
+    errdefer next.deinit(gpa);
+    next.kdf_salt = nk.kdf_salt;
+    next.key_id = nk.key_id;
+    next.next_key = null;
     return finish(prev, next);
 }
 
@@ -1180,6 +1254,90 @@ test "fabric endpoints (the proposed §3.7 record): set/clear round-trips throug
     try testing.expectError(error.BadRecord, decode(gpa, badtr, null));
 }
 
+test "the rotation window: openRekey sets the head flag and a 40 B tail that round-trips byte-canonically; a pre-window image reads as no window; open refuses a plaintext set, the primary's own id and a second next key (the same next key is idempotent); closeRekey makes the next key the primary and drops the tail; a window on a plaintext head and a next id equal to the primary refuse at decode" {
+    const gpa = testing.allocator;
+    var cfg = try fixture(gpa);
+    defer cfg.deinit(gpa);
+    const nk: KeyRef = .{ .kdf_salt = @splat(0xAA), .key_id = .{ 9, 8, 7, 6, 5, 4, 3, 2 } };
+    var opened = try openRekey(gpa, &cfg, nk);
+    defer opened.next.deinit(gpa);
+    try testing.expectEqual(@as(u64, 2), opened.next.config_generation);
+    try testing.expect(!opened.lifecycle_bit_needed);
+    try testing.expectEqual(nk, opened.next.next_key.?);
+    // The primary is untouched by the open.
+    try testing.expectEqualSlices(u8, &cfg.key_id, &opened.next.key_id);
+    const bytes = try encode(gpa, &opened.next, test_cap);
+    defer gpa.free(bytes);
+    try testing.expectEqual(FLAG_REKEY_WINDOW, std.mem.readInt(u16, bytes[10..12], .little));
+    try testing.expectEqual(cfg.encodedLen() + REKEY_LEN, bytes.len);
+    var back = try decode(gpa, bytes, null);
+    defer back.deinit(gpa);
+    try testing.expectEqual(nk, back.next_key.?);
+    const again = try encode(gpa, &back, test_cap);
+    defer gpa.free(again);
+    try testing.expectEqualSlices(u8, bytes, again);
+    // The pre-window image: no flag, no tail.
+    const plain = try encode(gpa, &cfg, test_cap);
+    defer gpa.free(plain);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, plain[10..12], .little));
+    var back0 = try decode(gpa, plain, null);
+    defer back0.deinit(gpa);
+    try testing.expect(back0.next_key == null);
+    // JSON + summary name the next id.
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try back.writeJson(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"key_id\":\"0102030405060708\",\"key_id_next\":\"0908070605040302\"") != null);
+    out.clearRetainingCapacity();
+    try back.writeSummary(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "ROTATION WINDOW OPEN: next key id 0908070605040302") != null);
+    // Refusals of the open.
+    try testing.expectError(error.IllegalTransition, openRekey(gpa, &cfg, .{ .kdf_salt = @splat(1), .key_id = cfg.key_id }));
+    try testing.expectError(error.IllegalTransition, openRekey(gpa, &opened.next, .{ .kdf_salt = @splat(0xBB), .key_id = .{ 1, 1, 1, 1, 1, 1, 1, 1 } }));
+    var same = try openRekey(gpa, &opened.next, nk);
+    defer same.next.deinit(gpa);
+    try testing.expectEqual(@as(u64, 3), same.next.config_generation);
+    var plaintext = try birth(gpa, test_set_uuid, .{ .compression = .none, .encryption = .none, .block_size = 1 << 20 }, null, &.{}, &.{});
+    defer plaintext.deinit(gpa);
+    try testing.expectError(error.IllegalTransition, openRekey(gpa, &plaintext, nk));
+    try testing.expectError(error.IllegalTransition, closeRekey(gpa, &cfg));
+    // The close: the next key is the primary, the window gone.
+    var closed = try closeRekey(gpa, &opened.next);
+    defer closed.next.deinit(gpa);
+    try testing.expect(closed.next.next_key == null);
+    try testing.expectEqualSlices(u8, &nk.key_id, &closed.next.key_id);
+    try testing.expectEqualSlices(u8, &nk.kdf_salt, &closed.next.kdf_salt);
+    const closed_bytes = try encode(gpa, &closed.next, test_cap);
+    defer gpa.free(closed_bytes);
+    try testing.expectEqual(plain.len, closed_bytes.len);
+    // Decode refusals: the flag with no tail; the flag on a plaintext head;
+    // a next id equal to the primary; an unknown flag bit.
+    var notail = try gpa.dupe(u8, plain);
+    defer gpa.free(notail);
+    std.mem.writeInt(u16, notail[10..12], FLAG_REKEY_WINDOW, .little);
+    checksum.stamp(notail, notail.len - CHECKSUM_LEN);
+    try testing.expectError(error.Truncated, decode(gpa, notail, null));
+    const pt_bytes = try encode(gpa, &plaintext, test_cap);
+    defer gpa.free(pt_bytes);
+    var pflag = try gpa.alloc(u8, pt_bytes.len + REKEY_LEN);
+    defer gpa.free(pflag);
+    @memcpy(pflag[0 .. pt_bytes.len - CHECKSUM_LEN], pt_bytes[0 .. pt_bytes.len - CHECKSUM_LEN]);
+    @memset(pflag[pt_bytes.len - CHECKSUM_LEN ..], 0x11);
+    std.mem.writeInt(u16, pflag[10..12], FLAG_REKEY_WINDOW, .little);
+    checksum.stamp(pflag, pflag.len - CHECKSUM_LEN);
+    try testing.expectError(error.BadKeyScheme, decode(gpa, pflag, null));
+    var same_id = try gpa.dupe(u8, bytes);
+    defer gpa.free(same_id);
+    same_id[bytes.len - CHECKSUM_LEN - transform.KEY_ID_LEN ..][0..transform.KEY_ID_LEN].* = cfg.key_id;
+    checksum.stamp(same_id, same_id.len - CHECKSUM_LEN);
+    try testing.expectError(error.BadRecord, decode(gpa, same_id, null));
+    var unknown_flag = try gpa.dupe(u8, plain);
+    defer gpa.free(unknown_flag);
+    std.mem.writeInt(u16, unknown_flag[10..12], 1 << 7, .little);
+    checksum.stamp(unknown_flag, unknown_flag.len - CHECKSUM_LEN);
+    try testing.expectError(error.ReservedNotZero, decode(gpa, unknown_flag, null));
+}
+
 test "writeJson names exactly the registered volumes with their tags, states, device uuids and uris, the cache paths, and the key id only on an encrypted set" {
     const vols = [_]DataVolume{
         .{ .vol_tag = 0xfeed, .state = .active, .device_uuid = @splat(1), .added_ts = 0, .capacity_blocks = 10, .volume_len = 1 << 30, .uri = "/dev/d0" },
@@ -1231,7 +1389,8 @@ test "decode refuses by class in order and names each; the record cap refuses at
         }
     };
     @memcpy(mut, bytes);
-    mut[10] = 1;
+    // An unknown head flag bit (bit 0 is the rotation window's).
+    mut[11] = 0x80;
     Restamp.go(mut);
     try testing.expectError(error.ReservedNotZero, decode(gpa, mut, &diag));
     @memcpy(mut, bytes);

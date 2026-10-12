@@ -16,6 +16,13 @@
 //! fail typed (`body`) until their plane seams are bound (stated in the
 //! rung-8 evidence) — never a silent queue. `--report-only` is the
 //! offline measure (the set's gauges ride `.stats` on a live mount).
+//! `--rekey --encrypt-key <path|->` (charter §6.5; `ops/defrag/rekey.zig`):
+//! the NEW key's material read through the ONE reader in THIS process, a
+//! fresh salt minted, the key id derived, the key-dir file installed
+//! (0600, atomic; the daemon resolves the next key from there — material
+//! never crosses the lane), then `admin_rekey` with the PUBLIC `{salt,
+//! key_id}`: the daemon opens the window durably, swaps its wrap and
+//! submits the sweep.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -56,6 +63,10 @@ pub fn run(p: cli.Process, d: args.Defrag) u8 {
 
 const admin_lane = @import("admin_lane.zig");
 const errors = @import("../core/errors.zig");
+const keys = @import("../ops/keys.zig");
+const transform = @import("../data/transform.zig");
+const uring_fs = @import("../io/uring_fs.zig");
+const derive = @import("../core/derive.zig");
 
 /// The live arms: one submission per arm through the lane; the fabric's
 /// verdict decides the exit.
@@ -67,6 +78,7 @@ const Live = struct {
         const self: *Live = @ptrCast(@alignCast(ctx));
         const p = self.p;
         const d = self.d;
+        if (d.rekey) return self.rekey(lane);
         const types = [_]struct { on: bool, t: jobs.JobType }{ .{ .on = d.data, .t = .defrag_data }, .{ .on = d.pack, .t = .defrag_pack }, .{ .on = d.meta, .t = .defrag_meta }, .{ .on = d.fold, .t = .defrag_fold }, .{ .on = d.rebalance, .t = .rebalance } };
         var n: usize = 0;
         p.stdout.print("submitted at throttle {d} %:", .{d.throttle}) catch {};
@@ -88,6 +100,66 @@ const Live = struct {
             n += 1;
         }
         p.stdout.print(" ({d} job(s); `squeezefs job list {s}` follows them)\n", .{ n, d.target }) catch {};
+        p.stdout.flush() catch {};
+        return cli.exit_ok;
+    }
+
+    /// The rotation: material → salt → id → the key-dir file → the lane.
+    fn rekey(self: *Live, lane: *admin_lane.Lane) u8 {
+        const p = self.p;
+        const d = self.d;
+        var stash = keys.linux_verbs.readStash(p.gpa, d.encrypt_key.?) catch |e| switch (e) {
+            error.OutOfMemory => return oom(p),
+            else => |ke| {
+                var buf: [512]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
+                transform.writeKeyFileRefusal(&w, ke, d.encrypt_key.?) catch {};
+                p.stderr.print("squeezefs defrag --rekey: {s}\n", .{w.buffered()}) catch {};
+                return cli.exit_failed;
+            },
+        };
+        defer stash.deinit();
+        var salt: [transform.KDF_SALT_LEN]u8 = undefined;
+        p.io.randomSecure(&salt) catch {
+            p.stderr.writeAll("squeezefs defrag --rekey: the random source failed (the salt is never a weaker fallback)\n") catch {};
+            return cli.exit_failed;
+        };
+        var derived = transform.deriveVolumeKey(stash.material(), &salt);
+        defer derived.zeroize();
+        const key_id = derived.key_id;
+        // The key-dir file FIRST: the daemon resolves the next key there.
+        const pool = uring_fs.Pool.init(p.gpa, uring_fs.Config.resolve(p.env, derive.facts())) catch |e| {
+            p.stderr.print("squeezefs defrag --rekey: io pool init failed ({s})\n", .{@errorName(e)}) catch {};
+            return cli.exit_failed;
+        };
+        defer pool.deinit();
+        var pb: [128]u8 = undefined;
+        const dest = keys.keyPath(&pb, key_id);
+        switch (keys.linux_verbs.installMaterial(pool, key_id, stash.material(), false) catch |e| {
+            p.stderr.print("squeezefs defrag --rekey: cannot install the new key at {s}: {s} (root with {s} writable is required; a different file under that id is never replaced)\n", .{ dest, @errorName(e), keys.KEY_DIR_PARENT }) catch {};
+            return cli.exit_failed;
+        }) {
+            .installed => p.stdout.print("installed the new key at {s} (id {x})\n", .{ dest, &key_id }) catch {},
+            .identical => p.stdout.print("{s} already holds the new key (id {x})\n", .{ dest, &key_id }) catch {},
+        }
+        stash.zeroize();
+        const rep = lane.admin().rekey(salt, key_id, d.throttle) catch |e| {
+            p.stderr.print("squeezefs defrag --rekey: the lane call failed ({s}, {t})\n", .{ @errorName(e), errors.toErrno(e) }) catch {};
+            return cli.exit_failed;
+        };
+        if (rep.get() != .ok) {
+            p.stderr.print("squeezefs defrag --rekey: refused: {s}{s}\n", .{ admin_lane.verdictText(rep.get()), switch (rep.why()) {
+                .none => "",
+                .plaintext => " — the set is plaintext (encryption none): there is no key to rotate",
+                .window_open => " — a rotation window is already open with ANOTHER next key; finish it (`job list`) before starting a new one",
+                .key_unresolved => " — the daemon could not resolve the new key from its key dir (is the daemon on this host, with the same /etc/squeezefs/keys?)",
+                .same_key => " — the new key derives the set's CURRENT key id: that is not a rotation",
+                .plane => " — the window opened but the daemon's crypto state did not swap; retry",
+            } }) catch {};
+            p.stderr.flush() catch {};
+            return cli.exit_failed;
+        }
+        p.stdout.print("rotation window open (config generation {d}): job-{x:0>16} re-encrypts every block onto key id {x} at throttle {d} %; the primary flips LAST, after the last block's publish is durable — `squeezefs job list {s}` follows it; every OTHER host of this set needs {s} installed before it mounts\n", .{ rep.config_generation, rep.job_id, &key_id, d.throttle, d.target, dest }) catch {};
         p.stdout.flush() catch {};
         return cli.exit_ok;
     }

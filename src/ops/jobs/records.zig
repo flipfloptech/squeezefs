@@ -55,14 +55,25 @@ pub const JobType = enum(u8) {
     defrag_meta = 8,
     /// `defrag --fold`: D3, every parked/spilled block kicked through the W2 fold.
     defrag_fold = 9,
+    /// `defrag --rekey`: the key-rotation sweep — every block re-encrypted
+    /// through the ONE mover onto the next key, the config flipped LAST
+    /// (`ops/defrag/rekey.zig`). `arg0` = the next key id (the witness an
+    /// adopted record is checked against the open window).
+    rekey = 10,
 
     /// A mover-class job holds a volume (or whole-set) SCOPE: one per
     /// volume at a time (the mover-scope law, §1.3).
     pub fn isMover(self: JobType) bool {
         return switch (self) {
-            .evacuate_volume, .rebalance, .defrag_data, .defrag_pack => true,
+            .evacuate_volume, .rebalance, .defrag_data, .defrag_pack, .rekey => true,
             .noop, .migrate_meta_slot, .fsck, .defrag_meta, .defrag_fold => false,
         };
+    }
+
+    /// Whole-set movers (the rebalance and the rotation sweep): never a
+    /// per-volume scope, whatever `arg0` carries.
+    pub fn wholeSet(self: JobType) bool {
+        return self == .rebalance or self == .rekey;
     }
 
     /// Only `noop` ships whole jobs over the wire: a mover's publish is a

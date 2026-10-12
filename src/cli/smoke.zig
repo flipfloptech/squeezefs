@@ -5297,6 +5297,246 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
     _ = try fsckClean(rig, "the jobs matrix");
 }
 
+/// The `key id {16 hex}` the rekey verb prints (the new key's id).
+fn keyIdIn(text: []const u8) ?[]const u8 {
+    const i = std.mem.indexOf(u8, text, "onto key id ") orelse return null;
+    const start = i + "onto key id ".len;
+    if (text.len < start + 16) return null;
+    for (text[start .. start + 16]) |c| if (!std.ascii.isHex(c)) return null;
+    return text[start .. start + 16];
+}
+
+/// A key file of 48 random bytes (base64), 0600, at `work/<name>`.
+fn makeKeyFile(rig: *Rig, name: []const u8) ![]u8 {
+    var script: std.Io.Writer.Allocating = .init(rig.gpa);
+    defer script.deinit();
+    try script.writer.print("umask 077; head -c 48 /dev/urandom | base64 > {s}; chmod 600 {s}", .{ name, name });
+    const out = try rig.shOk(rig.work, script.written());
+    rig.gpa.free(out);
+    return std.fmt.allocPrint(rig.gpa, "{s}/{s}", .{ rig.work, name });
+}
+
+/// The key-dir files the rotation rows installed (process-wide state on
+/// the venue): removed at the row's end.
+fn removeKeyDirFile(key_id_hex: []const u8) void {
+    var pb: [128:0]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pb, "/etc/squeezefs/keys/{s}.key", .{key_id_hex}, 0) catch return;
+    _ = linux.unlink(path.ptr);
+}
+
+test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a cache path) → fill (40 packed 64 KiB files, three fsync'd 20 MiB incompressible striped files, an 8 MiB compressible one) → umount/remount (the packs) → `defrag --rekey --encrypt-key B --throttle 50 <mp>` opens the window and sweeps every block onto B through the ONE mover while a write lands under B → the window closes (rekey_window_open 0, windows_closed 1, len drift 0), every file byte-exact → `config show` names B and no next key → a mount with key A refuses by id, with B serves every file → a second rotation to C at 10 % killed -9 mid-sweep → remount under B resolves C from the key dir, adopts the job, converges and flips to C → fsck --offline --scrub clean under C" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var bs_buf: [16]u8 = undefined;
+    try rig.createMetaVolume();
+    for ([_][:0]const u8{ rig.d0, rig.d1 }) |dp| {
+        const f = try Io.Dir.cwd().createFile(io, dp, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, matrix_vol_len);
+    }
+    _ = linux.mkdir(rig.cache.ptr, 0o700);
+    const key_a = try makeKeyFile(rig, "a.key");
+    defer gpa.free(key_a);
+    const key_b = try makeKeyFile(rig, "b.key");
+    defer gpa.free(key_b);
+    const key_c = try makeKeyFile(rig, "c.key");
+    defer gpa.free(key_c);
+    var key_b_id: [16]u8 = undefined;
+    var key_c_id: [16]u8 = undefined;
+    var ids_installed: u8 = 0;
+    defer {
+        if (ids_installed >= 1) removeKeyDirFile(&key_b_id);
+        if (ids_installed >= 2) removeKeyDirFile(&key_c_id);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "format", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}), "--compress", "lz4", "--encrypt", "aes-256-gcm", "--encrypt-key", key_a, "--disk-cache-paths", rig.cache, rig.meta_uri, rig.data_uri });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nformat: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+    }
+    try rig.createImage();
+    try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", key_a);
+    try rig.env.put("SQUEEZEFS_BLOCK_REFS_VERIFY", "1");
+
+    // 1. The fill under A; umount (the staged files promote into packs);
+    //    remount; the shas.
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const out = try rig.onMount("mkdir -p p && i=0; while [ $i -lt 40 ]; do dd if=\"$1/image\" of=p/small$i bs=64k skip=$i count=1 status=none; i=$((i + 1)); done; for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 20)) count=20 conv=fsync status=none; done; yes compressible-rotation-row | head -c 8388608 > zeroish && sync; echo filled");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    var mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMount("sha256sum big0 big1 big2 zeroish p/small* | sort -k2 > \"$1/before.sha\"; echo ok");
+        defer gpa.free(out);
+    }
+    {
+        // Every packed tenant byte-exact against its SOURCE slice (the
+        // before/after shas alone passed with every tenant refused EIO:
+        // sha256sum skipped them identically on both sides).
+        const out = try rig.onMount("i=0; bad=0; while [ $i -lt 40 ]; do dd if=\"$1/image\" bs=64k skip=$i count=1 status=none | cmp - p/small$i >/dev/null 2>&1 || bad=$((bad + 1)); i=$((i + 1)); done; echo packed-bad=$bad");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "packed-bad=0") != null);
+    }
+    const blocks_before = blk: {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        break :blk numberAfter(st, "\"rekey_blocks_rewritten\":") orelse 0;
+    };
+
+    // 2. The rotation A → B at 50 %: the verb installs B's key-dir file,
+    //    opens the window, submits the sweep; a write during the sweep
+    //    lands under B; the sweep converges and closes the window.
+    var job_b_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    {
+        const r = try rig.squeezefs(&.{ "defrag", "--rekey", "--encrypt-key", key_b, "--throttle", "50", rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nrekey B: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "rotation window open") != null);
+        @memcpy(&job_b_buf, jobIdIn(r.stdout) orelse return error.NoRekeyJob);
+        @memcpy(&key_b_id, keyIdIn(r.stdout) orelse return error.NoKeyId);
+        ids_installed = 1;
+    }
+    {
+        const out = try rig.onMount("dd if=\"$1/image\" of=during bs=1M skip=100 count=4 conv=fsync status=none && sha256sum during > \"$1/during.sha\"; echo written");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "written") != null);
+    }
+    try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, &job_b_buf, 900 * std.time.ns_per_s));
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const rewritten = (numberAfter(st, "\"rekey_blocks_rewritten\":") orelse 0) - blocks_before;
+        std.debug.print("\nsmoke[rekey]: A → B: {d} block(s) rewritten ({d} B), {d} pass(es), {d} confirming deferral(s); windows closed {d}, window open {d}, previous-key unwraps {d}; tripwires len_drift {d} tenant_len_conflict {d}\n", .{ rewritten, numberAfter(st, "\"rekey_bytes_rewritten\":") orelse 0, numberAfter(st, "\"rekey_passes\":") orelse 0, numberAfter(st, "\"rekey_confirm_deferrals\":") orelse 0, numberAfter(st, "\"rekey_windows_closed\":") orelse 0, numberAfter(st, "\"rekey_window_open\":") orelse 99, numberAfter(st, "\"crypto_key_unwraps_previous\":") orelse 0, numberAfter(st, "\"rekey_image_len_drift\":") orelse 99, numberAfter(st, "\"rekey_tenant_len_conflict\":") orelse 99 });
+        // 60 MiB of striped blocks + the 8 MiB file + the packs: well over 60.
+        try testing.expect(rewritten >= 60);
+        try testing.expectEqual(@as(u64, 1), numberAfter(st, "\"rekey_windows_closed\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"rekey_window_open\":") orelse 99);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"rekey_image_len_drift\":") orelse 99);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"rekey_tenant_len_conflict\":") orelse 99);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"packed_mapping_refusals\":") orelse 99);
+    }
+    {
+        const out = try rig.onMount("sha256sum big0 big1 big2 zeroish p/small* | sort -k2 | cmp - \"$1/before.sha\" && sha256sum during | cmp - \"$1/during.sha\" && echo all-exact");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "all-exact") != null);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "config", "show", "--json", rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        var needle: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r.stdout, try std.fmt.bufPrint(&needle, "\"key_id\":\"{s}\"", .{&key_b_id})) != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "key_id_next") == null);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // 3. Key A is retired: a mount under it refuses by id; under B it serves.
+    {
+        const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
+        defer rig.freeRun(r);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "key id differs") != null);
+    }
+    try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", key_b);
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const out = try rig.onMount("sha256sum big0 big1 big2 zeroish p/small* | sort -k2 | cmp - \"$1/before.sha\" && sha256sum during | cmp - \"$1/during.sha\" && echo all-exact-under-b");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "all-exact-under-b") != null);
+    }
+    // 4. B → C at 10 %, kill -9 mid-sweep → remount under B: C resolves
+    //    from the key dir, the window is open, the job adopted; it
+    //    converges and flips the primary to C.
+    var job_c_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    {
+        const r = try rig.squeezefs(&.{ "defrag", "--rekey", "--encrypt-key", key_c, "--throttle", "10", rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nrekey C: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        @memcpy(&job_c_buf, jobIdIn(r.stdout) orelse return error.NoRekeyJob);
+        @memcpy(&key_c_id, keyIdIn(r.stdout) orelse return error.NoKeyId);
+        ids_installed = 2;
+    }
+    {
+        // Mid-sweep: at least one block rewritten, the job still running.
+        const deadline = clock.monotonicNs() + 120 * std.time.ns_per_s;
+        var mid = false;
+        while (clock.monotonicNs() < deadline) {
+            const r = try rig.squeezefs(&.{ "job", "status", rig.mp, &job_c_buf });
+            defer rig.freeRun(r);
+            if (std.mem.indexOf(u8, r.stdout, " running, ")) |_| {
+                if (std.mem.indexOf(u8, r.stdout, ", 0/")) |_| {} else {
+                    mid = true;
+                    break;
+                }
+            }
+            sleepMs(50);
+        }
+        try testing.expect(mid);
+    }
+    rig.killed = true;
+    _ = linux.kill(rig.child_pid, .KILL);
+    try testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, try rig.waitChild());
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.umount2(rig.mp.ptr, 0)));
+    mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text[mark..], "key-rotation window OPEN") != null);
+        try testing.expect(std.mem.indexOf(u8, text[mark..], "job(s) adopted") != null);
+    }
+    try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, &job_c_buf, 900 * std.time.ns_per_s));
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        std.debug.print("smoke[rekey]: B → C killed -9 mid-sweep → remount adopted it: {d} block(s) rewritten after the remount, windows closed {d}, window open {d}, previous-key unwraps {d} (the remount's unwrap cache is cold: every block the sweep rewrote decoded under B)\n", .{ numberAfter(st, "\"rekey_blocks_rewritten\":") orelse 0, numberAfter(st, "\"rekey_windows_closed\":") orelse 0, numberAfter(st, "\"rekey_window_open\":") orelse 99, numberAfter(st, "\"crypto_key_unwraps_previous\":") orelse 0 });
+        try testing.expectEqual(@as(u64, 1), numberAfter(st, "\"rekey_windows_closed\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"rekey_window_open\":") orelse 99);
+        // The A → B line showed 0 here: the pre-rotation shas had filled the
+        // blob-keyed unwrap cache. After the remount the sweep's decodes
+        // are the first unwraps of their blobs and fall to the previous key.
+        try testing.expect((numberAfter(st, "\"crypto_key_unwraps_previous\":") orelse 0) >= 1);
+    }
+    {
+        const out = try rig.onMount("sha256sum big0 big1 big2 zeroish p/small* | sort -k2 | cmp - \"$1/before.sha\" && sha256sum during | cmp - \"$1/during.sha\" && echo all-exact-under-c");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "all-exact-under-c") != null);
+    }
+    {
+        const r = try rig.squeezefs(&.{ "config", "show", "--json", rig.mp });
+        defer rig.freeRun(r);
+        var needle: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r.stdout, try std.fmt.bufPrint(&needle, "\"key_id\":\"{s}\"", .{&key_c_id})) != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "key_id_next") == null);
+    }
+    try rig.expectAlive("the rekey row");
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"packed_mapping_refusals\":") orelse 99);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"invariant_tripwires\":") orelse 99);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", key_c);
+    _ = try fsckClean(rig, "the rekey row");
+}
+
 /// `fsckJson` over any target (the online arm's mountpoint).
 fn fsckJsonTarget(rig: *Rig, target: []const u8, extra: []const []const u8) !struct { report: json_scan_report.Report, code: u8 } {
     var argv: [8][]const u8 = undefined;

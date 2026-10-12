@@ -12,7 +12,12 @@
 //!   3. PIN the source (`pinned` ⇒ proceed; `pinned_unstable` ⇒ defer;
 //!      `refused` tracked ⇒ superseded (freed concurrently — census
 //!      stale); `refused` untracked ⇒ pin-less).
-//!   4. COPY the STORED image verbatim (transform-opaque); `src_hash`.
+//!   4. COPY the STORED image verbatim (transform-opaque); `src_hash`. A
+//!      seam with a REWRITE hook (the key-rotation sweep, `ops/defrag/
+//!      rekey.zig`) transforms the copy in RAM before the hash — the
+//!      destination lands the rewritten image, the verify-read compares
+//!      against it; a hook answering "nothing to rewrite" ends the move
+//!      as superseded before any mint.
 //!   5. DESTINATION per `DestPick`: `balance` (the hint if eligible else
 //!      the lowest-fill survivor), `compact_low` (`allocateBlockBelow`,
 //!      no gap ⇒ superseded this pass), `backend_ascending` (`AtOrAbove`
@@ -108,6 +113,12 @@ pub const Seam = struct {
         unpin: *const fn (ctx: *anyopaque, vol_tag: u64, block_idx: u64) void,
         /// The STORED image of the whole block into `out`; the bytes read.
         readImage: *const fn (ctx: *anyopaque, vol_tag: u64, block_idx: u64, out: []u8) SeamError!usize,
+        /// Transform the copied image IN PLACE before it is hashed and
+        /// written (`image[0..len]` is what `readImage` returned; the
+        /// buffer is a whole chunk): the new length, or null = the block
+        /// needs no rewrite (the move ends superseded, nothing minted).
+        /// Null hook = the verbatim copy of every other mover.
+        rewrite: ?*const fn (ctx: *anyopaque, task: Task, image: []u8, len: usize) SeamError!?usize = null,
         allocate: *const fn (ctx: *anyopaque, pick: DestPick, src_vol: u64, src_idx: u64) SeamError!?Minted,
         abandonUnpublished: *const fn (ctx: *anyopaque, m: Minted) void,
         write: *const fn (ctx: *anyopaque, m: Minted, image: []const u8) SeamError!void,
@@ -180,7 +191,14 @@ fn moveAfterPin(seam: Seam, gpa: Allocator, task: Task, pick: DestPick, pinned_p
     // 4. The copy (the stored image, transform-opaque).
     const image = try gpa.alloc(u8, chunk);
     defer gpa.free(image);
-    const n = try vt.readImage(ctx, src_vol, src_idx, image);
+    var n = try vt.readImage(ctx, src_vol, src_idx, image);
+    if (vt.rewrite) |rw| {
+        n = (try rw(ctx, task, image, n)) orelse {
+            if (pinned) vt.unpin(ctx, src_vol, src_idx);
+            pinned = false;
+            return .superseded;
+        };
+    }
     const src_hash = checksum.hash64(image[0..n]);
     stats.evacuate_inflight_bytes.add(n);
     defer stats.evacuate_inflight_bytes.sub(n);
@@ -289,7 +307,11 @@ pub const RamWorld = struct {
         /// The recovered-without-refs class: no RAM cell (pin-less moves).
         untracked: bool = false,
     };
-    pub const DATA: usize = 64;
+    /// A block's RAM image: wide enough for a REAL transform image (the
+    /// rotation sweep's tests re-encrypt framed images in this world: a
+    /// one-frame image is one 4 KiB grain; a two-tenant pack two) — the
+    /// bindings' tests use the first few bytes.
+    pub const DATA: usize = 16 << 10;
     pub const BindKey = struct { ino: u64, block_index: u32 };
 
     gpa: Allocator,
@@ -339,8 +361,10 @@ pub const RamWorld = struct {
         return &self.vols.get(vol_tag).?[@intCast(idx)];
     }
 
-    /// Plant a block holding `data` and bind it to each `(ino, block_index)`.
+    /// Plant a block holding `data` (≤ the chunk — a whole block's image is
+    /// at most its chunk) and bind it to each `(ino, block_index)`.
     pub fn plant(self: *RamWorld, vol_tag: u64, idx: u64, data: []const u8, owners: []const BindKey) !Mapping {
+        std.debug.assert(data.len <= self.chunk and data.len <= DATA);
         const b = self.block(vol_tag, idx);
         b.state = .allocated;
         b.incarnation = self.next_incarnation;
@@ -615,7 +639,7 @@ const Fixture = struct {
     fn plant(self: *Fixture, gpa: Allocator, vol: u64, idx: u64, fill: u8, owners: []const RamWorld.BindKey) !void {
         var data: [RamWorld.DATA]u8 = @splat(fill);
         data[1] = @intCast(idx);
-        _ = try self.w.plant(vol, idx, &data, owners);
+        _ = try self.w.plant(vol, idx, data[0..@min(RamWorld.DATA, CHUNK)], owners);
         for (owners) |o| try self.expect.put(gpa, o, data);
     }
 

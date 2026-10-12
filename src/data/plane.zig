@@ -107,6 +107,7 @@ const block_refs = @import("block_refs.zig");
 const reclaim = @import("reclaim.zig");
 const enospc = @import("enospc.zig");
 const transform = @import("transform.zig");
+const rekey = @import("../ops/defrag/rekey.zig");
 const set_config = @import("set_config.zig");
 const data_superblock = @import("data_superblock.zig");
 const seams = @import("write_seams.zig");
@@ -337,6 +338,9 @@ pub const Options = struct {
     budget_bytes: u64,
     /// The volume key (an encrypted set); zeroized by the caller after.
     derived_key: ?transform.DerivedKey,
+    /// An open rotation window's NEXT key (`set_config.next_key`): new
+    /// writes wrap under it, the primary becomes the unwrap-only arm.
+    derived_next: ?transform.DerivedKey = null,
     /// The level-1 guard table the warm ladder try-locks.
     guards: *op_guard.Table,
 };
@@ -723,7 +727,13 @@ pub const DataPlane = struct {
         var crypto: ?*transform.CryptoState = null;
         if (cfg.encryption != .none) {
             const derived = opts.derived_key orelse return error.TransformRefused;
-            crypto = transform.CryptoState.init(gpa, io, cfg.encryption, derived, cfg.nonce_floor, 1) catch return error.TransformRefused;
+            // Inside a rotation window the NEXT key is the wrap in force and
+            // the primary the retiring arm (`rekey.zig`'s law).
+            if (opts.derived_next) |next| {
+                crypto = transform.CryptoState.init(gpa, io, cfg.encryption, next, derived, cfg.nonce_floor, 1) catch return error.TransformRefused;
+            } else {
+                crypto = transform.CryptoState.init(gpa, io, cfg.encryption, derived, null, cfg.nonce_floor, 1) catch return error.TransformRefused;
+            }
         }
         errdefer if (crypto) |c| c.deinit();
         const t = transform.Transform.init(opts.env, tcfg, crypto) catch return error.TransformRefused;
@@ -734,6 +744,140 @@ pub const DataPlane = struct {
         x.codecs = transform.CodecPool.init(gpa, &x.t, transform.codecPoolSize(self.sqz.lanes.len)) catch return error.TransformRefused;
         errdefer x.codecs.deinit(gpa);
         x.scratches = transform.ScratchPool.init(gpa, transform.scratchPoolCap(opts.facts.cpus), @intCast(transform.scratchLen(cfg.block_size))) catch return error.OutOfMemory;
+    }
+
+    // ---- the key-rotation faces (`ops/defrag/rekey.zig`; charter §6.5) ----
+
+    pub const RekeyError = error{ NotEncrypted, RotationOpen, RandomFailed, OutOfMemory };
+
+    /// Open the window in RAM: the session key re-wrapped under `next`
+    /// (every header written from here carries it), then the two barriers
+    /// — every codec acquired and released (every transform under the old
+    /// wrap has returned; the retired wrap is zeroized behind it), then
+    /// every scratch (every old-wrap image's DMA has landed — a scratch is
+    /// held through the DMA that reads it). After this the sweep's census
+    /// is complete by construction.
+    pub fn beginRekey(self: *DataPlane, io: Io, next: transform.DerivedKey) RekeyError!void {
+        const x = &(self.xform orelse return error.NotEncrypted);
+        const c = x.crypto orelse return error.NotEncrypted;
+        try c.beginRotation(io, next);
+        try self.codecBarrier(io);
+        c.retireWrap();
+        try self.scratchBarrier(io);
+        log.info("data plane: key-rotation window open — new writes wrap under key id {x}; the previous key unwraps only", .{&c.keyId()});
+    }
+
+    /// Close the window in RAM after the config flipped durably: the
+    /// previous key's arm drops and its KEK is zeroized behind the codec
+    /// barrier (no reader can hold the retired wrap past it).
+    pub fn closeRekey(self: *DataPlane, io: Io) RekeyError!void {
+        const x = &(self.xform orelse return error.NotEncrypted);
+        const c = x.crypto orelse return error.NotEncrypted;
+        c.endRotation();
+        try self.codecBarrier(io);
+        c.retireWrap();
+        log.info("data plane: key-rotation window closed — key id {x} is the only key; the previous key is forgotten", .{&c.keyId()});
+    }
+
+    /// Hold every codec at once, then release them: every transform that
+    /// held one before has returned.
+    fn codecBarrier(self: *DataPlane, io: Io) error{OutOfMemory}!void {
+        const x = &self.xform.?;
+        const held = try self.gpa.alloc(*transform.Codec, x.codecs.capacity());
+        defer self.gpa.free(held);
+        for (held) |*h| h.* = x.codecs.acquire(io);
+        for (held) |h| x.codecs.release(io, h);
+    }
+
+    /// Hold every scratch at once, then release them: every DMA that read
+    /// an image out of one has landed.
+    fn scratchBarrier(self: *DataPlane, io: Io) error{OutOfMemory}!void {
+        const x = &self.xform.?;
+        const held = try self.gpa.alloc(transform.ScratchPool.Buf, x.scratches.capacity());
+        defer self.gpa.free(held);
+        for (held) |*h| h.* = x.scratches.acquire(io);
+        for (held) |h| x.scratches.release(io, h);
+    }
+
+    /// Whether the plane's crypto state has a rotation window open.
+    pub fn rekeyWindowOpen(self: *DataPlane) bool {
+        const x = &(self.xform orelse return false);
+        const c = x.crypto orelse return false;
+        return c.rotating();
+    }
+
+    /// The sweep's quiescence before its confirming census: the detached
+    /// uploads and promotions done, every open pack sealed (its tenants
+    /// classifiable; no old-key tenant lands in a pack opened after the
+    /// barriers), no tenant between reserve and commit.
+    pub fn rekeyQuiesce(self: *DataPlane, io: Io) bool {
+        self.wp.quiesce(io);
+        self.tasks.wait(io) catch {};
+        if (self.packer) |*p| {
+            p.sealAllAs(.rekey);
+            return p.tenantsInFlight() == 0;
+        }
+        return true;
+    }
+
+    /// Which key wraps the image at `rel_off` of a block: its first header
+    /// grain read and classified. `none` for a non-image (a zeroed window).
+    pub fn rekeyClassify(self: *DataPlane, vol_tag: u64, block_idx: u64, rel_off: u32) rekey.Class {
+        const x = &(self.xform orelse return .none);
+        const c = x.crypto orelse return .none;
+        const v = self.vols.byTag(vol_tag) orelse return .none;
+        if (rel_off >= self.chunk) return .none;
+        const page = x.scratches.acquire(self.io);
+        defer x.scratches.release(self.io, page);
+        const grain = page[0..transform.HEADER_PAGE_LEN];
+        self.deviceRead(vol_tag, v.alloc.offsetOf(block_idx) + rel_off, grain, .write_side) catch return .none;
+        const h = transform.decodeHeader(x.t.cfg, grain) catch return .none;
+        return switch (c.classify(&h.key_blob)) {
+            .current => .current,
+            .previous => .previous,
+            .foreign => .foreign,
+        };
+    }
+
+    /// Every allocated block of every volume but the reserved chunk 0: the
+    /// confirming census's universe (an image DMA'd before its publish is
+    /// allocated and so inside it).
+    pub fn rekeyAllocatedBlocks(self: *DataPlane, gpa: Allocator) Allocator.Error![]rekey.BlockKey {
+        var out: std.ArrayList(rekey.BlockKey) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.vols.rows[0..self.vols.n()]) |r| {
+            const v = r.?;
+            const high = v.alloc.highestBlockIndex();
+            var idx: u64 = RESERVED_BLOCKS;
+            while (idx <= high) : (idx += 1) {
+                if (v.alloc.stateOf(idx) == .allocated) try out.append(gpa, .{ .vol_tag = v.vol_tag, .block_idx = idx });
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// The mover's rewrite hook: every window of `task` under the previous
+    /// key re-encoded under the current one through a codec of this lane.
+    pub fn rekeyRewrite(self: *DataPlane, task: rekey.Task, image: []u8, len: usize) error{ Io, OutOfMemory }!?usize {
+        const x = &(self.xform orelse return error.Io);
+        const c = x.crypto orelse return error.Io;
+        const w = rekey.Windows.of(task) catch |e| {
+            switch (e) {
+                error.LenConflict => rekey.stats.rekey_tenant_len_conflict.fire("two referencers of one tenant window name different stored lengths"),
+                error.TooManyWindows => rekey.stats.rekey_tenant_len_conflict.fire("more tenant windows than a chunk holds"),
+            }
+            return error.Io;
+        };
+        const codec = x.codecs.acquire(self.io);
+        defer x.codecs.release(self.io, codec);
+        return rekey.rewriteImage(self.gpa, codec, c, w, image, len) catch |e| switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.LenDrift => blk: {
+                rekey.stats.rekey_image_len_drift.fire("a re-encoded image's stored length differs from the old one");
+                break :blk error.Io;
+            },
+            error.Corrupt => error.Io,
+        };
     }
 
     fn closeTransform(self: *DataPlane) void {

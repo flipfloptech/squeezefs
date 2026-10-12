@@ -44,13 +44,18 @@
 //! (`SqzIo.readable`): a signal (`daemon.Signals`) or the session's
 //! `on_shutdown` hook (DESTROY from an external `umount`, a disconnect, a
 //! failed queue) wakes it. SIGUSR1 logs every `.stats` family through the
-//! ONE aggregator (`stats/stats.zig`), one line per family. Stop latches;
-//! nothing is aborted from outside.
+//! ONE aggregator (`stats/stats.zig`), one line per family. A stop
+//! (SIGTERM/SIGINT) is REFUSED while the mount is busy — the holder census
+//! names them, `transport_umount_busy_refusals` counts it, the daemon
+//! serves on (decision 0003 §S); the lazy stop (SIGUSR2) detaches a held
+//! mount and serves it until the kernel ends the connection. Nothing is
+//! aborted from outside.
 //!
 //! Teardown: the sampler stopped and joined (every source still live) →
 //! `Session.close` (the drains RELEASE every retained zc slot while the
 //! connection is live and synthesize every owed reply, then the unmount,
-//! the workers join) → the watchdog and the cadence cancelled → the
+//! the workers join) → the cadences cancelled (the watchdog runs on to the
+//! very end: its tick is the supervisor's heartbeat) → the
 //! cluster wire stopped (every connection severed, the token hook
 //! disarmed on every pass — before the backend it serves over) →
 //! `Session.deinit` → the filesystem's dismount sweep → `DataPlane.close`

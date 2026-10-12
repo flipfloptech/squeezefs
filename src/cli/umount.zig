@@ -131,6 +131,12 @@ pub const Fallback = enum {
     }
 };
 
+/// The daemon's build commit out of `.stats` (`build.commit`, the first
+/// `"commit"` key: the build family precedes every other).
+pub fn buildCommitOf(stats_text: []const u8) ?[]const u8 {
+    return json_scan.string(stats_text, "commit");
+}
+
 /// The signalled path's verdict.
 pub const Signalled = union(enum) {
     /// The daemon unmounted (its mount left the table while it lived) and
@@ -149,6 +155,10 @@ pub const Signalled = union(enum) {
     /// The daemon is still alive at the deadline (never detached from
     /// under it: its drains may still owe the kernel replies).
     still_alive: linux.pid_t,
+    /// `--lazy` on a daemon of another build: SIGUSR2's default action
+    /// KILLS a process without our handler, so the lazy stop is sent only
+    /// to a daemon that provably has one — the same build as this verb.
+    foreign_build: linux.pid_t,
     fallback: Fallback,
 };
 
@@ -166,6 +176,8 @@ fn alive(io: Io, pid: linux.pid_t) bool {
     return rest.len == 0 or rest[0] != 'Z';
 }
 
+/// `<mountpoint>/.stats` (owned); null when unreadable. The 16 MiB bound
+/// is the renderer's own document cap.
 fn readStats(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8) ?[]u8 {
     const path = std.fmt.allocPrint(gpa, "{s}/.stats", .{mountpoint}) catch return null;
     defer gpa.free(path);
@@ -218,10 +230,11 @@ const Watched = struct {
 
 /// Signal the daemon serving `mountpoint` (TERM, or USR2 under `lazy`)
 /// and judge the outcome by the order of the kernel's facts (module doc).
-pub fn signalDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, lazy: bool, watched: *const Watched) Signalled {
+pub fn signalDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, lazy: bool, our_commit: []const u8, watched: *const Watched) Signalled {
     const text = readStats(gpa, io, mountpoint) orelse return .{ .fallback = .stats_unreadable };
     defer gpa.free(text);
     const pid = daemonPidOf(text) orelse return .{ .fallback = .no_pid };
+    if (lazy and !std.mem.eql(u8, buildCommitOf(text) orelse "", our_commit)) return .{ .foreign_build = pid };
     const refusals_before = refusalsOf(text);
     if (linux.errno(linux.kill(pid, if (lazy) .USR2 else .TERM)) != .SUCCESS) return .{ .fallback = .daemon_gone };
     const deadline = clock.monotonicNs() + DAEMON_EXIT_WAIT_NS;
@@ -239,7 +252,9 @@ pub fn signalDaemon(gpa: std.mem.Allocator, io: Io, mountpoint: []const u8, lazy
             return .{ .exited = pid };
         }
         if (detached) {
-            if (lazy and watched.census(pid).busy()) return .{ .detached_held = pid };
+            // The census is a /proc walk: at the document cadence, not the
+            // liveness quantum.
+            if (lazy and polls % STATS_POLL_EVERY == 0 and watched.census(pid).busy()) return .{ .detached_held = pid };
         } else if (!lazy and polls % STATS_POLL_EVERY == 0) {
             // Still attached and serving: did the daemon's census refuse?
             if (readStats(gpa, io, mountpoint)) |now_text| {
@@ -303,7 +318,7 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
         const c = watched.census(0);
         if (c.busy()) return refuseBusy(p, path, c);
     }
-    switch (signalDaemon(p.gpa, p.io, path, u.lazy, &watched)) {
+    switch (signalDaemon(p.gpa, p.io, path, u.lazy, p.build.commit, &watched)) {
         .exited => |pid| {
             if (!isFuseMount(p.io, p.gpa, path)) return cli.exit_ok;
             // A successor mounted over the path after ours left: not ours
@@ -325,6 +340,10 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
             p.stderr.print("squeezefs umount: daemon {d} has not exited {d} s after the signal — its teardown is still running (or wedged: see its log and supervisor); not detaching from under it\n", .{ pid, DAEMON_EXIT_WAIT_NS / std.time.ns_per_s }) catch {};
             return cli.exit_failed;
         },
+        .foreign_build => |pid| {
+            p.stderr.print("squeezefs umount: daemon {d} at {s} is another build than this verb — the lazy stop (SIGUSR2) is sent only to a daemon known to handle it; `squeezefs umount {s}` (the orderly stop) works across builds\n", .{ pid, path, path }) catch {};
+            return cli.exit_failed;
+        },
         .fallback => |why| {
             p.stderr.print("squeezefs umount: {s}: {s} — detaching externally (an external unmount of a type-fuse mount sends the daemon no DESTROY; a still-running daemon tears down on the connection's abort)\n", .{ path, why.text() }) catch {};
             const rc = detachExternally(p, path);
@@ -339,12 +358,14 @@ pub fn run(p: cli.Process, u: args.Umount) u8 {
 
 const testing = std.testing;
 
-test "the daemon pid is the mount family's `pid`; 0 or absent names no daemon; the refusal count defaults to 0" {
+test "the daemon pid is the mount family's `pid`; 0 or absent names no daemon; the refusal count defaults to 0; the build commit is the build family's" {
     try testing.expectEqual(@as(?linux.pid_t, 4242), daemonPidOf("{\"build\":{},\"mount\":{\"uid\":0,\"gid\":0,\"pid\":4242,\"mountpoint\":\"/m\"}}"));
     try testing.expectEqual(@as(?linux.pid_t, null), daemonPidOf("{\"mount\":{\"uid\":0,\"pid\":0}}"));
     try testing.expectEqual(@as(?linux.pid_t, null), daemonPidOf("{\"mount\":{\"uid\":0}}"));
     try testing.expectEqual(@as(?linux.pid_t, null), daemonPidOf("{\"mount\":{\"pid\":4294967296}}"));
     try testing.expectEqual(@as(u64, 0), refusalsOf("{\"mount\":{\"pid\":1}}"));
+    try testing.expectEqualStrings("abc123", buildCommitOf("{\"build\":{\"train\":\"0.1.0\",\"commit\":\"abc123\",\"profile\":\"gate\"},\"mount\":{\"pid\":1}}").?);
+    try testing.expect(buildCommitOf("{\"mount\":{\"pid\":1}}") == null);
     try testing.expectEqual(@as(u64, 3), refusalsOf("{\"transport\":{\"transport_umount_busy_retries\":9,\"transport_umount_busy_refusals\":3}}"));
 }
 
@@ -383,7 +404,7 @@ test "a directory that is no mount: no daemon to signal (.stats unreadable), not
     defer watched.deinit();
     try testing.expect(watched.target == null);
     try testing.expect(!watched.attached());
-    try testing.expectEqual(Signalled{ .fallback = .stats_unreadable }, signalDaemon(testing.allocator, testing.io, dir, false, &watched));
+    try testing.expectEqual(Signalled{ .fallback = .stats_unreadable }, signalDaemon(testing.allocator, testing.io, dir, false, "", &watched));
     try testing.expect(!isFuseMount(testing.io, testing.allocator, dir));
     const e = umountAsRoot(dir);
     try testing.expectEqual(linux.E.INVAL, e);
@@ -415,7 +436,7 @@ test "a .stats document naming a dead pid falls back as `daemon_gone`" {
     try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = text });
     var watched = Watched.init(testing.allocator, testing.io, dir);
     defer watched.deinit();
-    try testing.expectEqual(Signalled{ .fallback = .daemon_gone }, signalDaemon(testing.allocator, testing.io, dir, false, &watched));
+    try testing.expectEqual(Signalled{ .fallback = .daemon_gone }, signalDaemon(testing.allocator, testing.io, dir, false, "", &watched));
 }
 
 test "a tmpfs held by a child's cwd: the pre-signal census refuses it by name (the verb's law), the plain umount2 is EBUSY, and after the child leaves nobody holds it" {

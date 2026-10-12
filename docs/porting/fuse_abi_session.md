@@ -641,7 +641,12 @@ fuse_over_uring.rs:7165–7182). Optional/never: access (default_permissions), b
   interception|writeback|writeback_cache` from the kernel string (:30904–30938).
 - Unmount (`inner_unmount`, session.rs:490–594): notify destroy; await the mount task; unprivileged:
   `fusermount3 -u` up to 10× at 100 ms, then `-u -z` (lazy); root: `umount(2)` up to 10× then
-  `umount2(MNT_DETACH)` — a bystander's transient fd keeps the non-lazy form EBUSY.
+  `umount2(MNT_DETACH)` — a bystander's transient fd keeps the non-lazy form EBUSY. **Port (0002 row
+  499, 0003 §S): the lazy detach is NOT the default.** The orderly stop runs the holder census
+  (`cli/holders.zig`, by mount id) BEFORE the drains and REFUSES a held mount (`error.Busy`, the
+  holders named, `transport_umount_busy_refusals`); `squeezefs umount --lazy` (SIGUSR2) detaches a
+  held mount and the daemon serves it until the kernel ends the connection; the supervisor probes a
+  detached or unmounting daemon by its heartbeat page, not by a stat of a path that is gone.
 
 ### 10.2 Kernel TTL classes (`KernelCacheTtls{attr, entry, dir_entry, negative}`, fuse_client.rs:338–437)
 - Defaults **1 s each** (write mount, :345–353). Read-only mounts derive all four from the reader's

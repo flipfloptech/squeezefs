@@ -132,7 +132,7 @@ pub fn parseFdinfoMountId(text: []const u8) ?u64 {
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "mnt_id:")) continue;
         const v = std.mem.trim(u8, line["mnt_id:".len..], " \t\r");
-        return std.fmt.parseInt(u64, v, 10) catch null;
+        return std.fmt.parseInt(u64, v, 10) catch null; // decimal, as proc(5) prints it
     }
     return null;
 }
@@ -197,7 +197,7 @@ fn processHolds(gpa: std.mem.Allocator, io: Io, pid: linux.pid_t, target: Target
             defer dir.close(io);
             var it = dir.iterate();
             while (it.next(io) catch null) |ent| {
-                const fd = std.fmt.parseInt(u32, ent.name, 10) catch continue;
+                const fd = std.fmt.parseInt(u32, ent.name, 10) catch continue; // the fd number, decimal
                 var ib: [64]u8 = undefined;
                 var fb: [512]u8 = undefined;
                 const info = std.fmt.bufPrint(&ib, "/proc/{d}/fdinfo/{d}", .{ pid, fd }) catch continue;
@@ -236,7 +236,7 @@ pub fn census(gpa: std.mem.Allocator, io: Io, target: Target, mountinfo_text: []
     defer proc_dir.close(io);
     var it = proc_dir.iterate();
     while (it.next(io) catch null) |ent| {
-        const pid = std.fmt.parseInt(linux.pid_t, ent.name, 10) catch continue;
+        const pid = std.fmt.parseInt(linux.pid_t, ent.name, 10) catch continue; // a pid directory, decimal
         if (skipped(skip, pid)) continue;
         if (processHolds(gpa, io, pid, target)) |held| {
             var h = held;

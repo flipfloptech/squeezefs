@@ -97,6 +97,9 @@ pub const Plane = struct {
     /// The directory-parent memo the filesystem binds (null = the shipped
     /// per-slot count: a miss credits nothing); global inos.
     memo: ?handover.ParentMemo = null,
+    /// The filesystem's parked-times drain the handover's step 0 runs
+    /// (null = no filesystem over this plane: a test rig's bare set).
+    times_drain: ?handover.TimesDrain = null,
     /// The cadence's single flight after a tick.
     cadence: sync.TaskSet = .init,
     cadence_busy: std.atomic.Value(bool) = .init(false),
@@ -264,18 +267,36 @@ pub const Plane = struct {
     /// (one process, one table); an offer when the rule says so.
     fn foreignTouchFn(ctx: *anyopaque, slot: u16, holder: AppenderId, requester: AppenderId) void {
         const self = self_(ctx);
-        if (!self.armed or !ownsFn(ctx, holder)) return;
+        _ = self.noteShip(slot, holder, requester, false);
+    }
+
+    /// A served ship over the wire by `requester` on a slot this process
+    /// holds (charter §5.5 "the holder OFFERS"): the requester's op noted
+    /// on the window, the rule, the offer with the WIRE stand. Answers the
+    /// holder when an offer was made (the caller's carriage push), null
+    /// otherwise.
+    pub fn noteWireShip(self: *Plane, slot: u16, requester: AppenderId) ?AppenderId {
+        const holder = self.table.view(slot).holder;
+        return if (self.noteShip(slot, holder, requester, true)) holder else null;
+    }
+
+    fn noteShip(self: *Plane, slot: u16, holder: AppenderId, requester: AppenderId, wire: bool) bool {
+        if (!self.armed or !ownsFn(self, holder) or requester == holder) return false;
         const now = clock.monotonicNs();
-        const d = self.judge.noteShip(slot, requester, now) catch return;
-        if (d == .serve) return;
-        const expires = now + self.verbs.offerStandNs(false);
-        const r = self.verbs.offerSlot(holder, slot, requester, expires) catch return;
+        const d = self.judge.noteShip(slot, requester, now, wire) catch return false;
+        if (d == .serve) return false;
+        const expires = now + self.verbs.offerStandNs(wire);
+        const r = self.verbs.offerSlot(holder, slot, requester, expires) catch return false;
         switch (r) {
             .offered => {
                 handover.stats.slot_offers.inc();
                 if (d == .offer_idle) handover.stats.slot_offers_idle.inc() else handover.stats.slot_offers_dominated.inc();
+                return true;
             },
-            .busy => handover.stats.slot_offers_busy.inc(),
+            .busy => {
+                handover.stats.slot_offers_busy.inc();
+                return false;
+            },
         }
     }
 
@@ -371,6 +392,10 @@ pub const Plane = struct {
 
     pub fn bindMemo(self: *Plane, memo: handover.ParentMemo) void {
         self.memo = memo;
+    }
+
+    pub fn bindTimesDrain(self: *Plane, drain: handover.TimesDrain) void {
+        self.times_drain = drain;
     }
 
     /// A cutover moved `slot` off this volume: the lease, the view and the
@@ -847,11 +872,16 @@ pub const Plane = struct {
         return .{ .ctx = self, .drainPendingTimes = drainPendingTimesFn, .cycleOnce = cycleOnceFn, .reusableUpto = reusableUptoFn, .rootPublished = rootPublishedFn, .recallTokens = recallTokensFn, .words = wordsFn, .tails = tailsFn, .pageReleasing = pageReleasingFn, .releaseDurably = releaseDurablyFn, .pageDrop = pageDropFn, .seam = &self.seam };
     }
 
-    /// The port's pending-times refinements are gated commits routed at
-    /// their own door entry (`economy.PendingTimes`): a refinement whose
-    /// slot moved parks, then refuses `SlotBusy` and is dropped by its
-    /// drain — never a wedge; nothing to drain here.
-    fn drainPendingTimesFn(_: *anyopaque, _: u16) void {}
+    /// Step 0 of the handover: the slot's parked stamps (`economy.
+    /// PendingTimes`, gated commits routed at the slot's door entry)
+    /// journaled through the filesystem while this holder's door still
+    /// admits them. A refinement that parks after the gate meets the moved
+    /// door at its drain and is dropped counted — never a wedge.
+    fn drainPendingTimesFn(ctx: *anyopaque, slot: u16) void {
+        const self = self_(ctx);
+        const d = self.times_drain orelse return;
+        handover.stats.meta_kv_times_handover_drained.add(d.drainSlot(d.ctx, slot));
+    }
 
     fn cycleOnceFn(ctx: *anyopaque, slot: u16) handover.Error!u64 {
         const self = self_(ctx);

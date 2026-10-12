@@ -1346,6 +1346,69 @@ test "the handover's kill matrix: a death after the page named the slot Releasin
     }
 }
 
+test "the handover's step 0 drains the departing slot's parked stamps (rung 10 item 4): the plane calls the filesystem's TimesDrain for exactly the slot handed over while the door STILL ADMITS the holder's commits (before the gate), and credits what it drained to meta_kv_times_handover_drained; a plane without a filesystem drains nothing" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "hand-times", .symmetric);
+    defer v.destroy();
+    const iv: record.InodeValue = .{ .mode = 0o100644, .nlink = 1 };
+    const value = iv.encode();
+    const be = try v.open();
+    defer be.close();
+    const plane = be.slots;
+    const t = try be.begin(@src());
+    const k = try putInodeInSlot(be, 4, 20);
+    defer gpa.free(k);
+    try t.stagePut(key.TREE_INODES, k, &value);
+    try be.commit(t);
+    try be.checkpointNow();
+    try testing.expect(plane.table.view(4).leasedBy(0));
+    const Probe = struct {
+        plane: *slots_plane.Plane,
+        calls: u32 = 0,
+        slot: ?u16 = null,
+        admitted_at_step0: bool = false,
+        fn drainSlot(ctx: *anyopaque, slot: u16) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.slot = slot;
+            // The door's verdict for the holder's own commit at step 0:
+            // admitted (the token backed out — the drain at step 1b waits
+            // for exactly the admitted ones).
+            if (self.plane.door.tryEnter(slot, 0, clock.monotonicNs()) == .admitted) {
+                self.admitted_at_step0 = true;
+                _ = self.plane.table.leaveToken(slot);
+            }
+            return 3;
+        }
+    };
+    // Unbound: nothing drained, the counter still.
+    const drained0 = slots.handover.stats.meta_kv_times_handover_drained.load();
+    plane.verbs.handover_lock.lockUncancelable(be.io);
+    _ = try slots.handover.transfer(gpa, &plane.door, plane.table, plane.steps(), be.io, 0, 4);
+    plane.verbs.handover_lock.unlock(be.io);
+    try testing.expectEqual(drained0, slots.handover.stats.meta_kv_times_handover_drained.load());
+    try testing.expectEqual(slots.lease_table.State.unleased, plane.table.view(4).state);
+    // Re-leased by a first touch; bound: step 0 calls the drain for slot 4
+    // alone, before the gate, and credits its count.
+    const t2 = try be.begin(@src());
+    const k2 = try putInodeInSlot(be, 4, 21);
+    defer gpa.free(k2);
+    try t2.stagePut(key.TREE_INODES, k2, &value);
+    try be.commit(t2);
+    try be.checkpointNow();
+    try testing.expect(plane.table.view(4).leasedBy(0));
+    var probe: Probe = .{ .plane = plane };
+    plane.bindTimesDrain(.{ .ctx = &probe, .drainSlot = Probe.drainSlot });
+    plane.verbs.handover_lock.lockUncancelable(be.io);
+    _ = try slots.handover.transfer(gpa, &plane.door, plane.table, plane.steps(), be.io, 0, 4);
+    plane.verbs.handover_lock.unlock(be.io);
+    try testing.expectEqual(@as(u32, 1), probe.calls);
+    try testing.expectEqual(@as(?u16, 4), probe.slot);
+    try testing.expect(probe.admitted_at_step0);
+    try testing.expectEqual(drained0 + 3, slots.handover.stats.meta_kv_times_handover_drained.load());
+    try testing.expectEqual(slots.lease_table.State.unleased, plane.table.view(4).state);
+}
+
 test "the page-budget overflow law: region 0 leasing 109 slots names 108 on its page and publishes the overflow root into tree 0 (publish-before-drop, counted); a remount opens every tree from the home that names it" {
     const gpa = testing.allocator;
     const v = try TestVol.create(gpa, "overflow", .symmetric);

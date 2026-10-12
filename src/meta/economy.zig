@@ -911,6 +911,20 @@ pub const PendingTimes = struct {
         return .absorbed;
     }
 
+    /// Every parked ino of ONE forest slot (the handover's step 0: the
+    /// departing holder drains the slot's refinements while its door still
+    /// admits them), appended to `out` in any order.
+    pub fn parkedOfSlot(self: *PendingTimes, gpa: Allocator, slot: key.ForestSlot, out: *std.ArrayList(u64)) Allocator.Error!void {
+        for (&self.stripes) |*s| {
+            s.lock.lock();
+            defer s.lock.unlock();
+            var it = s.map.keyIterator();
+            while (it.next()) |k| {
+                if (key.forestSlotOfIno(k.*) == slot) try out.append(gpa, k.*);
+            }
+        }
+    }
+
     /// Snapshot up to one batch of parked inos (any order) — BEFORE any
     /// gate or guard, so a drain with no work touches nothing. A full
     /// batch tells the drain to loop.

@@ -61,6 +61,7 @@ const device_loader = @import("../meta/device_loader.zig");
 const node_seq = @import("../meta/node_seq.zig");
 const proc = @import("../meta/guard/proc.zig");
 const cr = @import("../meta/sym/control_records.zig");
+const route_table = @import("../meta/routing/route_table.zig");
 const appender_page = @import("../meta/sym/appender_page.zig");
 const membership = @import("../meta/sym/membership.zig");
 const shard = membership.shard;
@@ -3369,6 +3370,172 @@ test "smoke: THE JOINER-SIDE GRANT LEDGER — the holder's ledger capped at 8 op
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
+/// Poll `host`'s `.stats` until `key` reads ≥ `want` (a climbing counter)
+/// or the deadline passes; answers the last tail read.
+fn awaitAtLeast(host: anytype, key: []const u8, want: u64, deadline_ns: u64) ![]u8 {
+    const deadline = clock.monotonicNs() + deadline_ns;
+    while (true) {
+        try host.expectAlive(key);
+        const tail = (try host.statsTry()) orelse {
+            if (clock.monotonicNs() >= deadline) return error.StatsUnreadable;
+            sleepMs(200);
+            continue;
+        };
+        if ((numberAfter(tail, key) orelse 0) >= want or clock.monotonicNs() >= deadline) return tail;
+        testing.allocator.free(tail);
+        sleepMs(200);
+    }
+}
+
+/// The ships B lands on f's slot: past `N_floor` at the cold seed (17) and
+/// twice the holder's own ops on the slot (the create and the layout
+/// publish), with room for the judge's half-window rotation.
+const handover_row_ships: u64 = 48;
+/// Files A mints over its rotor: past the rotor's width (M ≤ MINT_SPREAD
+/// = 64), so the pigeonhole puts two on one routing slot.
+const handover_row_files: usize = 72;
+/// The times-drain cadence IS the flush interval: held a minute away so
+/// the parked stamp is still parked when the handover runs (the row ends
+/// long before; `sync` and the umount barrier on their own).
+const handover_row_flush_ms: u64 = 60_000;
+
+test "smoke: THE HANDOVER DRAINS PARKED STAMPS (rung 10 item 4) — A (the manager) parks a size-neutral write's mtime on a file of slot S (the drain cadence held a minute away); B's 48 setattr ships on ANOTHER file of S dominate A's judge (holder ops read net of served ships) → A OFFERS the slot to B, pushed on B's renewal grant → B ACCEPTS over the wire → A's flush-then-transfer runs step 0: the parked stamp journaled BEFORE the gate (`meta_kv_times_handover_drained` ≥ 1, `meta_kv_times_echo_foreign_dropped` 0 on both) → B, the new holder, serves exactly the mtime A had promised; fsck clean" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    // The offer rides B's renewal beat: a short lease keeps the beat short.
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    var flush_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_META_FLUSH_INTERVAL_MS", try std.fmt.bufPrint(&flush_text, "{d}", .{handover_row_flush_ms}));
+    try rig.formatSetWith(false, &.{});
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // A's endpoint record on tree 0 rides the same held cadence: B dials
+    // the listener by name (`--join`).
+    var ep_buf: [64]u8 = undefined;
+    const ep = blk: {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        break :blk try std.fmt.bufPrint(&ep_buf, "{s}", .{json_scan.string(ta, "wire_endpoint") orelse return error.NoWireEndpoint});
+    };
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{ "--join", ep });
+    _ = try b.awaitReady();
+    // A's striped files over its rotor: two of them share a routing slot
+    // (the rotor wraps at M); the stamp parks on ONE, B ships on the OTHER
+    // (a served op on the parked file itself would commit its record and
+    // fold the stamp in — the ordinary retire, nothing left to carry).
+    var pair_buf: [2][8]u8 = undefined;
+    var pair: [2][]const u8 = undefined;
+    {
+        var script_buf: [256]u8 = undefined;
+        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "mkdir d && i=0; while [ $i -lt {d} ]; do dd if=/dev/zero of=d/f$i bs=32k count=1 status=none; i=$((i+1)); done; sync d; stat -c '%n %i' d/f*", .{handover_row_files}));
+        defer gpa.free(out);
+        var inos_of: [handover_row_files]u64 = undefined;
+        var names_of: [handover_row_files][]const u8 = undefined;
+        var n: usize = 0;
+        var lines = std.mem.splitScalar(u8, out, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var cols = std.mem.splitScalar(u8, line, ' ');
+            names_of[n] = cols.next().?;
+            inos_of[n] = try std.fmt.parseInt(u64, cols.next().?, 10);
+            n += 1;
+        }
+        try testing.expectEqual(@as(usize, handover_row_files), n);
+        var found = false;
+        outer: for (0..n) |i| for (i + 1..n) |k| if (route_table.slotOf(inos_of[i]) == route_table.slotOf(inos_of[k])) {
+            pair[0] = try std.fmt.bufPrint(&pair_buf[0], "{s}", .{names_of[i]});
+            pair[1] = try std.fmt.bufPrint(&pair_buf[1], "{s}", .{names_of[k]});
+            found = true;
+            break :outer;
+        };
+        try testing.expect(found);
+    }
+    // A size-neutral overwrite of the first on a later coarse tick: the
+    // stamp PARKS (no commit) and getattr serves it folded.
+    const parked0 = blk: {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        break :blk numberAfter(ta, "\"fuse_write_times_parked\":") orelse 0;
+    };
+    var mtime_buf: [40]u8 = undefined;
+    const mtime_a_owned = blk: {
+        var script_buf: [160]u8 = undefined;
+        const out = try rig.onMount(try std.fmt.bufPrint(&script_buf, "dd if=/dev/urandom of={s} bs=512 count=1 conv=notrunc status=none && stat -c %.9Y {s}", .{ pair[0], pair[0] }));
+        defer gpa.free(out);
+        break :blk try std.fmt.bufPrint(&mtime_buf, "{s}", .{std.mem.trimEnd(u8, out, "\n")});
+    };
+    {
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"fuse_write_times_parked\":") orelse 0) >= parked0 + 1);
+        try testing.expect((numberAfter(ta, "\"meta_kv_times_echo_pending\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"slot_handovers\":"));
+    }
+    // B's ships on the slot's OTHER file: record verbs served at A under
+    // its door.
+    {
+        var script_buf: [224]u8 = undefined;
+        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "i=0; while [ $i -lt {d} ]; do chmod 600 {s}; chmod 644 {s}; i=$((i+2)); done; echo ok", .{ handover_row_ships, pair[1], pair[1] }));
+        defer gpa.free(out);
+        try testing.expectEqualStrings("ok\n", out);
+    }
+    // The offer, the push, B's accept, A's transfer with step 0.
+    {
+        const moved = try awaitAtLeast(rig, "\"slot_handovers\":", 1, kill_row_wait_ns);
+        defer gpa.free(moved);
+        try testing.expect((numberAfter(moved, "\"slot_handovers\":") orelse 0) >= 1);
+    }
+    // A's ORDINARY drain after the move (`fsyncdir` runs it): a stamp
+    // step 0 had left parked would meet the moved door here and be
+    // dropped counted — the counter the row holds at 0.
+    {
+        const out = try rig.onMount("sync d");
+        gpa.free(out);
+    }
+    const ta = try rig.stats();
+    defer gpa.free(ta);
+    std.debug.print("\nsmoke: handover row at A — record_served {d}, slot_ships {d}, offers {d} (idle {d}, dominated {d}, busy {d}, pushed {d}), handovers {d}, n_floor {d}, times pending {d}\n", .{ numberAfter(ta, "\"record_served\":") orelse 0, numberAfter(ta, "\"slot_ships\":") orelse 0, numberAfter(ta, "\"slot_offers\":") orelse 0, numberAfter(ta, "\"slot_offers_idle\":") orelse 0, numberAfter(ta, "\"slot_offers_dominated\":") orelse 0, numberAfter(ta, "\"slot_offers_busy\":") orelse 0, numberAfter(ta, "\"slot_offers_pushed\":") orelse 0, numberAfter(ta, "\"slot_handovers\":") orelse 0, numberAfter(ta, "\"slot_offer_n_floor\":") orelse 0, numberAfter(ta, "\"meta_kv_times_echo_pending\":") orelse 0 });
+    try testing.expect((numberAfter(ta, "\"slot_handovers\":") orelse 0) >= 1);
+    try testing.expect((numberAfter(ta, "\"slot_offers_pushed\":") orelse 0) >= 1);
+    try testing.expect((numberAfter(ta, "\"slot_offers_dominated\":") orelse 0) >= 1);
+    try testing.expect((numberAfter(ta, "\"meta_kv_times_handover_drained\":") orelse 0) >= 1);
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"meta_kv_times_echo_foreign_dropped\":"));
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"meta_kv_times_echo_pending\":"));
+    try expectMustStayZero(ta);
+    // B's accept is witnessed by A's transfer and grant above and by the
+    // mtime B serves below (its accepted-offer counter follows the
+    // publication of the installed lease, which may defer under load).
+    const tb = try b.stats();
+    defer gpa.free(tb);
+    try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"meta_kv_times_echo_foreign_dropped\":"));
+    try expectMustStayZero(tb);
+    // The promise kept: the new holder serves A's parked mtime off the
+    // record step 0 journaled; A reads the same under B's token.
+    {
+        var script_buf: [64]u8 = undefined;
+        const script = try std.fmt.bufPrint(&script_buf, "stat -c %.9Y {s}", .{pair[0]});
+        const from_b = try b.onMount(script);
+        defer gpa.free(from_b);
+        try testing.expectEqualStrings(mtime_a_owned, std.mem.trimEnd(u8, from_b, "\n"));
+        const from_a = try rig.onMount(script);
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings(mtime_a_owned, std.mem.trimEnd(u8, from_a, "\n"));
+    }
+    std.debug.print("\nsmoke: handover drains parked stamps: {d} ships served at A (slot_ships {d}), offers {d} (dominated {d}, pushed {d}), handovers {d}; step 0 drained {d} stamp(s), foreign-dropped 0 on both; B accepted {d}; mtime {s} served by B after the move\n", .{ handover_row_ships, numberAfter(ta, "\"slot_ships\":") orelse 0, numberAfter(ta, "\"slot_offers\":") orelse 0, numberAfter(ta, "\"slot_offers_dominated\":") orelse 0, numberAfter(ta, "\"slot_offers_pushed\":") orelse 0, numberAfter(ta, "\"slot_handovers\":") orelse 0, numberAfter(ta, "\"meta_kv_times_handover_drained\":") orelse 0, numberAfter(tb, "\"joined_wire_offers_accepted\":") orelse 0, mtime_a_owned });
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the handover row");
 }
 
 test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again" {

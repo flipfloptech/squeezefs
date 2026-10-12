@@ -156,6 +156,15 @@ pub const ServedInsertSink = struct {
     note: *const fn (ctx: *anyopaque, parent: u64, creator: AppenderId) void,
 };
 
+/// A served ship by a wire peer on a slot this holder leases: the
+/// handover judge's feed (charter §5.5 "the holder OFFERS slot s to
+/// requester q"; `slots/plane.zig` `noteWireShip`). The peer travels as
+/// its wire identity — the slot's volume resolves the appender id.
+pub const ServedShipSink = struct {
+    ctx: *anyopaque,
+    note: *const fn (ctx: *anyopaque, volume: u16, slot: u16, peer: verbs.WireIdentity) void,
+};
+
 /// Test seams, read ONCE at the plane's init (never process statics).
 pub const Seams = struct {
     /// The N-th ship (1-based) of this plane fails as a lost connection
@@ -884,6 +893,8 @@ pub fn StepService(comptime Store: type) type {
         /// The requester's appender id per peer identity (the census
         /// feed); null = unknown.
         requesterOf: ?*const fn (peer: verbs.WireIdentity) ?AppenderId = null,
+        /// The handover judge's feed (every served step).
+        served_ship: ?ServedShipSink = null,
 
         pub fn register(self: *Self, svc: *service.Service) void {
             svc.register(.xv_step, .{ .ctx = self, .serve = &serveStep });
@@ -907,6 +918,7 @@ pub fn StepService(comptime Store: type) type {
                 error.OutOfMemory => service.Answer.refused(error.OutOfMemory, "out of memory serving the step"),
                 error.Io => service.Answer.refused(error.InputOutput, "the holder's records could not be read or written"),
             };
+            if (self.served_ship) |ss| if (req.peer) |p| ss.note(ss.ctx, r.head.volume, route_table.slotOf(step.homeIno()), p);
             var w: verbs.StepOutcome = .{ .status = @backingInt(out.status), .has_inode = 0, .reserved = @splat(0), .inode = std.mem.zeroes(verbs.InodeValueWire), .reserved2 = @splat(0) };
             if (out.inode) |v| {
                 w.has_inode = 1;

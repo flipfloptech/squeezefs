@@ -343,6 +343,8 @@ pub fn RecordShipService(comptime Store: type) type {
 
         plane: *Plane,
         sink: ServedSink = .{},
+        /// The handover judge's feed (every served record verb).
+        served_ship: ?ops.ServedShipSink = null,
 
         pub fn register(self: *Self, svc: *service.Service) void {
             svc.register(.record_ship, .{ .ctx = self, .serve = &serve });
@@ -376,6 +378,7 @@ pub fn RecordShipService(comptime Store: type) type {
                     break :blk service.Answer.refused(error.InputOutput, "the holder could not apply the record verb");
                 },
             };
+            if (self.served_ship) |ss| if (req.peer) |p| ss.note(ss.ctx, r.head.volume, route_table.slotOf(r.head.ino), p);
             var w: verbs.RecordShipReply = .{ .kind = @backingInt(verbs.RecordShipReplyKind.served), .has_inode = 0, .reserved = 0, .holder = 0, .inode = std.mem.zeroes(verbs.InodeValueWire), .reserved2 = @splat(0) };
             if (rep.inode) |v| {
                 w.has_inode = 1;

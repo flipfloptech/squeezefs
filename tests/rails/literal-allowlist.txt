@@ -213,13 +213,13 @@ src/fuse/abi.zig:558 | 7 | OWED: derive it or document it on the line (charter �
 src/fuse/codec.zig:524 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/kv_fs.zig:341 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/handler/kv_fs.zig:883 | 256 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1499 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1790 | 0o777 | a file mode (POSIX permission bits)
-src/fuse/handler/kv_fs.zig:1878 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1881 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:1894 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2045 | 512 | OWED: derive it or document it on the line (charter §1.5)
-src/fuse/handler/kv_fs.zig:2899 | 4096 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1501 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1792 | 0o777 | a file mode (POSIX permission bits)
+src/fuse/handler/kv_fs.zig:1880 | 3 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1883 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:1896 | 4 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2047 | 512 | OWED: derive it or document it on the line (charter §1.5)
+src/fuse/handler/kv_fs.zig:2932 | 4096 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/handler/op_trace.zig:279 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/fuse/mount_options.zig:265 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/fuse/mount_options.zig:266 | 10 | OWED: derive it or document it on the line (charter §1.5)
@@ -459,8 +459,8 @@ src/meta/sym/control_records.zig:1110 | 6 | OWED: derive it or document it on th
 src/meta/sym/extent_grant.zig:474 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/extent_grant.zig:491 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/extent_grant.zig:514 | 3 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/manager.zig:137 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/sym/manager.zig:137 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/sym/manager.zig:138 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/sym/manager.zig:138 | 100 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/sym/membership/recovery.zig:134 | 10 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/membership/recovery.zig:134 | 256 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/membership/recovery.zig:136 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
@@ -487,13 +487,13 @@ src/meta/sym/tokens/token_table.zig:151 | 9 | OWED: derive it or document it on 
 src/meta/sym/tokens/token_table.zig:152 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:152 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:153 | 11 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/wire_plane.zig:255 | 3 | a table entry (switch/range arm) — the codec or classification table
-src/meta/sym/wire_plane.zig:256 | 4 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:256 | 3 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:257 | 4 | a table entry (switch/range arm) — the codec or classification table
 src/meta/sym/xv/applier.zig:295 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/xv/intent.zig:152 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/intent.zig:183 | 8 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/xv/ops.zig:270 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/xv/record_ship.zig:460 | 256 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/xv/ops.zig:279 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/sym/xv/record_ship.zig:463 | 256 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/stripe.zig:141 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/stripe.zig:142 | 10 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/sym/xv/stripe.zig:433 | 64 | OWED: derive it or document it on the line (charter §1.5)

@@ -41,6 +41,7 @@ const log = @import("../../core/log.zig");
 const checkpoint = @import("../checkpoint.zig");
 const geometry = @import("../geometry.zig");
 const journal = @import("../journal.zig");
+const jc = @import("../journal_core.zig");
 const key = @import("../key.zig");
 const node_seq = @import("../node_seq.zig");
 const cr = @import("control_records.zig");
@@ -493,6 +494,13 @@ pub const Manager = struct {
     /// manager the table dispatches on. Opaque here so the manager never
     /// imports the plane it serves.
     slot_plane: ?*anyopaque = null,
+    /// Live appenders by the STABLE identity they joined under — `(node,
+    /// mount slot)`, the part a wire peer id carries (RAM; the pages are
+    /// the truth): the join and the leave keep it, a miss re-reads the
+    /// directory ONCE (a member that joined the predecessor manager). The
+    /// handover judge's feed: a served ship's peer → its appender id.
+    identities: std.AutoHashMapUnmanaged(cr.StableIdentity, u32) = .empty,
+    identities_lock: jc.SpinLock = .{},
 
     pub fn init(gpa: Allocator, io: std.Io, vol: Volume) Manager {
         return .{ .gpa = gpa, .io = io, .vol = vol };
@@ -500,6 +508,65 @@ pub const Manager = struct {
 
     pub fn deinit(self: *Manager) void {
         self.endpoints.deinit(self.gpa);
+        self.identities.deinit(self.gpa);
+    }
+
+    /// The appender id a peer's stable identity joined this volume under,
+    /// null for one no Live page carries (a reader, a departed member).
+    pub fn appenderOfIdentity(self: *Manager, identity: cr.StableIdentity) ?u32 {
+        if (self.identityHit(identity)) |id| return id;
+        // The miss: the directory's Live pages, under the verbs lock (one
+        // walk per unknown identity; the next ship hits).
+        self.verbs_lock.lockUncancelable(self.io);
+        defer self.verbs_lock.unlock(self.io);
+        var d = self.readDirectory() catch return null;
+        defer d.deinit(self.gpa);
+        for (d.links.items) |l| {
+            var pair: u32 = 0;
+            while (pair < l.header.pairs) : (pair += 1) {
+                const imgs = dir.readPair(self.vol.reader(), l, pair) catch return null;
+                const pg = imgs.newest() orelse continue;
+                if (pg.state == .live) self.rememberIdentity(pg.identity, pg.appender_id);
+            }
+        }
+        return self.identityHit(identity);
+    }
+
+    /// The stable identity appender `appender_id` is Live under, if known.
+    pub fn identityOfAppender(self: *Manager, appender_id: u32) ?cr.StableIdentity {
+        self.identities_lock.lock();
+        defer self.identities_lock.unlock();
+        var it = self.identities.iterator();
+        while (it.next()) |e| if (e.value_ptr.* == appender_id) return e.key_ptr.*;
+        return null;
+    }
+
+    fn identityHit(self: *Manager, identity: cr.StableIdentity) ?u32 {
+        self.identities_lock.lock();
+        defer self.identities_lock.unlock();
+        return self.identities.get(identity);
+    }
+
+    fn rememberIdentity(self: *Manager, identity: page.Identity, appender_id: u32) void {
+        self.identities_lock.lock();
+        defer self.identities_lock.unlock();
+        self.forgetAppenderLocked(appender_id);
+        self.identities.put(self.gpa, .{ .node_token = identity.node_token, .mount_slot = identity.mount_slot }, appender_id) catch {};
+    }
+
+    fn forgetAppender(self: *Manager, appender_id: u32) void {
+        self.identities_lock.lock();
+        defer self.identities_lock.unlock();
+        self.forgetAppenderLocked(appender_id);
+    }
+
+    fn forgetAppenderLocked(self: *Manager, appender_id: u32) void {
+        var it = self.identities.iterator();
+        while (it.next()) |e| if (e.value_ptr.* == appender_id) {
+            const k = e.key_ptr.*;
+            _ = self.identities.remove(k);
+            return;
+        };
     }
 
     pub fn holdLease(self: *Manager, term: u64) void {
@@ -832,6 +899,7 @@ pub const Manager = struct {
             }
         }
         if (existing) |ex| {
+            self.rememberIdentity(req.identity, ex.p.appender_id);
             const minted = try self.mintIncarnation();
             var out: Joined = .{ .appender_id = ex.p.appender_id, .page_addr = ex.slots[0], .term = ex.p.term, .generation = ex.p.generation, .head_hint = ex.p.head_hint, .ring_segments = ex.p.segments, .grant = undefined, .n_grant = 0, .already = true, .node_seq_base = minted.base };
             var rec = try self.readGrantRecord(ex.p.appender_id);
@@ -908,6 +976,7 @@ pub const Manager = struct {
         p.grants = .{};
         p.n_slots = 0;
         try self.writeBothDirSlots(&p, pair.offsets);
+        self.rememberIdentity(req.identity, appender_id);
         stats.appender_joins.inc();
         d.live += 1;
         self.appenders_known = @max(d.live, 1);
@@ -1012,6 +1081,7 @@ pub const Manager = struct {
         const ring = p.segments;
         p.state = .free;
         p.identity = .none;
+        self.forgetAppender(p.appender_id);
         p.ledger_tail_seq = p.head_hint;
         p.segments = .{};
         p.grants = .{};

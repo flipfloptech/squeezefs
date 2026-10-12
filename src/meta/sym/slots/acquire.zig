@@ -417,6 +417,16 @@ pub const Verbs = struct {
     m: u64,
     /// `A_max` in force, bytes.
     a_max: u64,
+    /// An offer to a WIRE requester rides its next renewal grant (the
+    /// shard owner's carriage, charter §5.5 "the holder OFFERS slot s to
+    /// requester q"); bound by the wire plane on the manager, null on a
+    /// RAM harness. An in-process requester reads the table directly.
+    offer_push: ?OfferPush = null,
+
+    pub const OfferPush = struct {
+        ctx: *anyopaque,
+        push: *const fn (ctx: *anyopaque, to: AppenderId, slot: u16, holder: AppenderId) void,
+    };
 
     pub fn init(gpa: Allocator, io: Io, mgr: *manager.Manager, table: *LeaseTable, door: *Door, seams: Seams, m: u64, a_max: u64) Verbs {
         stats.slot_rotor.set(m);
@@ -615,7 +625,10 @@ pub const Verbs = struct {
         // any other; the wire screen (`screen.offer`) refuses `to == 0`.
         if (!screen.slot(slot).isOk() or to == holder) return error.Rejected;
         return switch (try self.table.offer(slot, holder, to, expires_ns)) {
-            .offered => .offered,
+            .offered => blk: {
+                if (self.offer_push) |op| if (!self.seams.ownsRegion(self.seams.ctx, to)) op.push(op.ctx, to, slot, holder);
+                break :blk .offered;
+            },
             .busy => .busy,
             .not_holder => error.Refused,
         };

@@ -584,6 +584,15 @@ pub const MetaSet = struct {
         for (self.volumes) |be| be.slots.bindMemo(memo);
     }
 
+    /// The handover's step-0 drain over every member's plane (the
+    /// filesystem's parked stamps of a slot, committed before its door
+    /// closes).
+    pub fn bindTimesDrain(self: *MetaSet, drain: routing_slots.handover.TimesDrain) void {
+        // A `-o ro` reader has no slot plane (nothing it holds moves).
+        if (self.posture == .reader) return;
+        for (self.volumes) |be| be.slots.bindTimesDrain(drain);
+    }
+
     /// The one closed cutover slot across the members, if any.
     fn closedSlot(self: *MetaSet) ?u16 {
         if (self.posture == .reader) return null;
@@ -899,6 +908,30 @@ test "a refs range always merges every slot tree: one volume's references owned 
     try set.range(gpa, key.TREE_BLOCK_REFS, br.lo.slice(), br.hi.slice(), 100, &kvs);
     try testing.expectEqual(@as(usize, 3), kvs.items.len);
     for (kvs.items, owners) |kv, o| try testing.expectEqual(o, (try key.BlockRefKey.decode(kv.key)).ownerIno());
+}
+
+test "a `-o ro` reader of a symmetric set has no slot plane: the filesystem's handover binds (the parent memo, the step-0 times drain) are no-ops on it — never a dereference of the unarmed plane (rung 10 item 4's regression: the -o ro row's reader aborted at bindTimesDrain)" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "ro-binds", 1);
+    defer s.destroy();
+    {
+        const set = try s.open();
+        set.close();
+    }
+    const reader = try MetaSet.open(gpa, s.io(), s.pathList(), .{ .env = &s.env, .cache_budget_bytes = 64 << 20, .cpus = 4, .read_only = true });
+    defer reader.close();
+    try testing.expect(reader.isReader());
+    const Probe = struct {
+        fn parentOf(_: *anyopaque, _: u64) ?u64 {
+            return null;
+        }
+        fn drainSlot(_: *anyopaque, _: u16) u64 {
+            return 0;
+        }
+    };
+    var marker: u8 = 0;
+    reader.bindParentMemo(.{ .ctx = &marker, .parentOf = &Probe.parentOf });
+    reader.bindTimesDrain(.{ .ctx = &marker, .drainSlot = &Probe.drainSlot });
 }
 
 test "a tx spanning two members never reaches a member: refused EIO on the tripwire, nothing written; a one-member tx of a guest slot lands" {

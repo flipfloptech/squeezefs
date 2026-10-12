@@ -1273,6 +1273,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             self.killpriv_v2 = a.has(abi.FUSE_HANDLE_KILLPRIV_V2);
             // The directory-parent memo feeds the handover's subtree credit.
             if (@hasDecl(Store, "bindParentMemo")) self.store.bindParentMemo(.{ .ctx = self, .parentOf = parentMemoSeam });
+            // The handover's step 0 drains the departing slot's parked stamps.
+            if (@hasDecl(Store, "bindTimesDrain")) self.store.bindTimesDrain(.{ .ctx = self, .drainSlot = timesDrainSeam });
             fuse_killpriv_negotiated.set(@intFromBool(self.killpriv_v2));
             log.info("kv_fs: FUSE 7.{d}; KILLPRIV_V2 {s}; inline_max {d} B; block {d} B; data volumes {s}; staging {s}", .{ self.minor, if (self.killpriv_v2) "negotiated" else "absent", self.inline_max, self.block_size, if (self.data.hasVolumes()) "yes" else "NONE (inline only)", if (self.data.stagingOn()) "on" else "off" });
         }
@@ -2536,6 +2538,37 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 }
                 if (snapshot.len < buf.len) return total;
             }
+        }
+
+        /// THE HANDOVER'S STEP 0 (`sym_handover.TimesDrain`; charter §5.5):
+        /// every stamp parked on an inode of routing slot `slot` committed
+        /// as a Δ while this holder's door still admits the slot's commits,
+        /// `dlm.max_requests` inos per entry; the other slots' stamps stay
+        /// for the cadence. Returns the refinements made durable.
+        pub fn drainPendingTimesOfSlot(self: *Self, c: *Ctx, slot: u16) Error!u64 {
+            var inos_of_slot: std.ArrayList(u64) = .empty;
+            defer inos_of_slot.deinit(self.gpa);
+            try self.pending.parkedOfSlot(self.gpa, route_table.forestSlotOf(slot), &inos_of_slot);
+            var total: u64 = 0;
+            var i: usize = 0;
+            while (i < inos_of_slot.items.len) : (i += dlm.max_requests) {
+                total += try self.drainTimesBatch(c, inos_of_slot.items[i..@min(i + dlm.max_requests, inos_of_slot.items.len)]);
+            }
+            return total;
+        }
+
+        /// The handover's step 0 as the plane calls it (its own op context:
+        /// the transfer runs on the wire service or the plane's cadence,
+        /// never under a FUSE request).
+        fn timesDrainSeam(ctx: *anyopaque, slot: u16) u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            var trace = op_trace.OpTrace.begin(0, .other);
+            defer trace.finish();
+            var c: Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = self.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+            return self.drainPendingTimesOfSlot(&c, slot) catch |e| {
+                log.warn("kv_fs: the handover's step-0 times drain of slot {d} failed ({t}); the slot's remaining parked refinements meet the moved door at the next drain and are dropped counted", .{ slot, e });
+                return 0;
+            };
         }
 
         /// `fsync(ino)`'s durability covers the ino's parked stamp: ONE Δ
@@ -4044,6 +4077,67 @@ test "§L.6 the write-stamp park (repro-port: frag-512b-write — 533 k size-neu
     try testing.expectEqual(commits_cap + (economy.PENDING_TIMES_DRAIN_CAP + dlm.max_requests - 1) / dlm.max_requests, h.store.commits);
     try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
     for (crowd) |f| h.release(f);
+    for (files) |f| h.release(f);
+}
+
+test "the handover's step 0 (rung 10 item 4): drainPendingTimesOfSlot commits the parked stamps of ONE routing slot in one Δ entry — the stored records of that slot carry their served mtimes, another slot's stamp stays parked for the cadence, a slot with nothing to refine commits nothing; the binding is the plane's TimesDrain seam" {
+    const H = HarnessOf(SettlingData);
+    var h: H = undefined;
+    try h.init();
+    defer h.deinit();
+    defer h.data.deinit();
+    h.data.store = &h.store;
+    const image: []u8 = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(image);
+    @memset(image, 'I');
+    // Four striped files (the RAM store mints every ino on slot 0).
+    var files: [4]u64 = undefined;
+    var names: [4][2]u8 = undefined;
+    for (&files, &names, 0..) |*f, *nm, i| {
+        nm.* = .{ 'h', @intCast('0' + i) };
+        f.* = try h.create(1, nm, 0o644);
+        try testing.expectEqual(@as(?linux.E, null), h.write(f.*, 0, image, 0).errno());
+        try testing.expectEqual(@as(u16, 0), route_table.slotOf(f.*));
+    }
+    // The overwrites start on a tick past EVERY stored stamp (the four
+    // first writes may straddle a tick): the last-written file's is the max.
+    const stored_before = (try h.fs.readInodeStored(try H.Fs.localOf(files[3]))).?;
+    awaitCoarseTickAfter(stored_before.mtime);
+    var sector: [512]u8 = @splat('s');
+    for (files) |f| try testing.expectEqual(@as(?linux.E, null), h.write(f, 0, &sector, 0).errno());
+    // A stamp parked on another slot's keyspace (guest slot 5): the drain
+    // of slot 0 must leave it.
+    const foreign = key.guestLocalIno(5, 77);
+    const stamp: u64 = @bitCast(clock.realtimeCoarseNs());
+    try testing.expect(try h.fs.pending.park(foreign, stamp, stamp) == .parked);
+    try testing.expectEqual(@as(u64, 5), h.fs.pending.len());
+    const commits0 = h.store.commits;
+    var trace = op_trace.OpTrace.begin(0, .other);
+    defer trace.finish();
+    var ctx: filesystem.Ctx = .{ .unique = 0, .uid = 0, .gid = 0, .pid = 0, .io = testing.io, .trace = &trace, .wd_slot = null, .window = &.{} };
+    // Slot 0: ONE commit carrying the four Δs; the foreign stamp stays.
+    const served = try h.getattr(files[1]);
+    try testing.expectEqual(@as(u64, 4), try h.fs.drainPendingTimesOfSlot(&ctx, 0));
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(@as(u64, 1), h.fs.pending.len());
+    try testing.expect(h.fs.pending.parked(foreign) != null);
+    const l1 = try H.Fs.localOf(files[1]);
+    try testing.expect(h.fs.pending.parked(l1) == null);
+    try testing.expectEqual(served.mtime * std.time.ns_per_s + served.mtimensec, (try h.fs.readInodeStored(l1)).?.mtime);
+    // Slot 0 again: nothing parked, no commit.
+    try testing.expectEqual(@as(u64, 0), try h.fs.drainPendingTimesOfSlot(&ctx, 0));
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    // Slot 5 through the seam the plane binds (its own op context): the
+    // stamp names no stored record — nothing to refine, no commit, the
+    // park retired.
+    try testing.expectEqual(@as(u64, 0), H.Fs.timesDrainSeam(&h.fs, 5));
+    try testing.expectEqual(commits0 + 1, h.store.commits);
+    try testing.expectEqual(@as(u64, 0), h.fs.pending.len());
+    // The seam over a slot with work: the count it answers is the drain's.
+    awaitCoarseTickAfter(served.mtime * std.time.ns_per_s + served.mtimensec);
+    try testing.expectEqual(@as(?linux.E, null), h.write(files[2], 0, &sector, 0).errno());
+    try testing.expectEqual(@as(u64, 1), H.Fs.timesDrainSeam(&h.fs, 0));
+    try testing.expectEqual(commits0 + 2, h.store.commits);
     for (files) |f| h.release(f);
 }
 

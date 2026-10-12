@@ -85,6 +85,7 @@ const data_bitmap = @import("../../data/sym_planes/data_bitmap.zig");
 const sym_records = @import("../../data/sym_planes/records.zig");
 const kvda_home = @import("kvda_home.zig");
 const slots_lt = @import("slots/lease_table.zig");
+const slots_handover = @import("slots/handover.zig");
 const DataPlane = @import("../../data/plane.zig").DataPlane;
 const router = @import("../../data/router.zig");
 const set_config = @import("../../data/set_config.zig");
@@ -555,6 +556,41 @@ pub const WirePlane = struct {
         m.projection = .{ .ledger = &m.ledger, .volumes = hooks[0..n_bound], .vol_tags = &.{}, .roll_forward = m.roll_forward.seam() };
         m.rename_lease = .{ .io = self.io, .store = m.rename_store.store(), .term = term, .own_id = sym0.region0().appenderId() };
         m.rename_svc = .{ .lease = &m.rename_lease };
+        // The holder-decided handover over the wire (charter §5.5): every
+        // served step / record verb feeds the slot's judge; an offer the
+        // rule makes rides the requester's next renewal grant.
+        self.steps.served_ship = .{ .ctx = self, .note = &servedShipFn };
+        self.record_svc.served_ship = .{ .ctx = self, .note = &servedShipFn };
+        for (set.volumes) |be| {
+            if (be.sym == null) continue;
+            be.slots.verbs.offer_push = .{ .ctx = self, .push = &offerPushFn };
+        }
+    }
+
+    /// A served ship by `peer` on `slot` of `volume`: the peer's appender
+    /// id on that volume (the directory's Live page under its identity),
+    /// the judge, the offer (the push rides `offerSlot`).
+    fn servedShipFn(ctx: *anyopaque, volume: u16, slot: u16, peer: verbs.WireIdentity) void {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        if (volume >= self.set.volumes.len) return;
+        const be = self.set.volumes[volume];
+        const s = be.sym orelse return;
+        const requester = s.manager.appenderOfIdentity(.{ .node_token = peer.node_token, .mount_slot = peer.mount_slot }) orelse return;
+        _ = be.slots.noteWireShip(slot, requester);
+    }
+
+    /// `offerSlot`'s push: the offer to appender `to` of the volume whose
+    /// plane made it, carried on `to`'s member's next renewal grant.
+    fn offerPushFn(ctx: *anyopaque, to: slots_lt.AppenderId, slot: u16, holder: slots_lt.AppenderId) void {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        const m = self.mgr orelse return;
+        const be = self.set.volumeOfSlot(slot);
+        const s = be.sym orelse return;
+        // A writer's member id IS its peer id (node, mount slot).
+        const identity = s.manager.identityOfAppender(to) orelse return;
+        const wire_id: verbs.WireIdentity = .{ .node_token = identity.node_token, .writer_id = 0, .mount_slot = identity.mount_slot, .reserved = 0 };
+        m.owner.pushOffer(shard.writerMemberId(wire_id), slot, holder) catch return;
+        slots_handover.stats.slot_offers_pushed.inc();
     }
 
     /// The joined half before the listener: the member's words (its

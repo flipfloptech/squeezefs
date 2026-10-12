@@ -52,8 +52,29 @@ pub const stats = struct {
     pub var slot_handover_phase_ns: [Phase.count]counters.ShardedLatencyHistogram = @splat(.{});
     /// `N_floor` in force.
     pub var slot_offer_n_floor: counters.Gauge = .{};
-    /// Pending-times refinements dropped at step 0 (another appender's slot).
+    /// Offers to a WIRE requester pushed onto its renewal carriage (the
+    /// manager-held slot's handover over the wire; `slot_offers` counts
+    /// the offer itself).
+    pub var slot_offers_pushed: counters.ShardedCounter = .{};
+    /// Pending-times refinements dropped at the drain's door: the slot had
+    /// moved to another appender before they were journaled. The handover's
+    /// step 0 (`TimesDrain`) exists so this reads 0 across a handover.
     pub var meta_kv_times_echo_foreign_dropped: counters.ShardedCounter = .{};
+    /// Parked refinements the handover's step 0 made durable (one batched
+    /// Δ entry per `dlm.max_requests` inos) before the slot's door closed.
+    pub var meta_kv_times_handover_drained: counters.ShardedCounter = .{};
+};
+
+/// The filesystem's parked-times drain scoped to ONE routing slot (the
+/// handover's step 0; `kv_fs.drainPendingTimesOfSlot`): every stamp parked
+/// on an inode of the slot committed as a Δ while the departing holder's
+/// door still admits its commits — a `utimes`-visible mtime is never lost
+/// across a handover. Answers the refinements made durable; a failure is
+/// the filesystem's to log (the step is best effort: the drain's door
+/// refusal catches what it misses, counted).
+pub const TimesDrain = struct {
+    ctx: *anyopaque,
+    drainSlot: *const fn (ctx: *anyopaque, slot: u16) u64,
 };
 
 pub const Phase = enum(u8) {
@@ -160,6 +181,10 @@ const RequesterOps = struct {
 const SlotRequesters = struct {
     rows: [REQUESTERS_PER_SLOT_MAX]RequesterOps = @splat(.{}),
     n: u8 = 0,
+    /// Ships SERVED on the slot (every requester): each one committed
+    /// under the holder's own door and counted there as a holder op, so
+    /// the rule reads the holder's ops NET of them (`servedOps`).
+    served: RequesterOps = .{},
 };
 
 pub const DominanceWindow = struct {
@@ -222,6 +247,37 @@ pub const DominanceWindow = struct {
         }
         r.touched = epoch;
         return r.total(epoch);
+    }
+
+    /// One SERVED ship on `slot` at `now` (the apply committed under the
+    /// holder's door); answers the slot's served total over the window.
+    pub fn noteServed(self: *DominanceWindow, slot: u16, now_ns: u64) Allocator.Error!u64 {
+        const epoch = self.epochOf(now_ns);
+        self.lock.lock();
+        defer self.lock.unlock();
+        const gop = try self.slots.getOrPut(self.gpa, slot);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const r = &gop.value_ptr.served;
+        if (r.epoch == epoch) {
+            r.cur +|= 1;
+        } else if (r.epoch +% 1 == epoch) {
+            r.prev = r.cur;
+            r.cur = 1;
+            r.epoch = epoch;
+        } else {
+            r.prev = 0;
+            r.cur = 1;
+            r.epoch = epoch;
+        }
+        return r.total(epoch);
+    }
+
+    pub fn servedOps(self: *DominanceWindow, slot: u16, now_ns: u64) u64 {
+        const epoch = self.epochOf(now_ns);
+        self.lock.lock();
+        defer self.lock.unlock();
+        const sr = self.slots.get(slot) orelse return 0;
+        return sr.served.total(epoch);
     }
 
     pub fn opsOf(self: *DominanceWindow, slot: u16, q: AppenderId, now_ns: u64) u64 {
@@ -288,10 +344,15 @@ pub const Judge = struct {
     /// A served ship (or, in one process, a refused foreign touch) by `q`
     /// on `slot` held by this mount: the requester's op noted, the
     /// holder's read over the SAME window, the rule, the cooldown valve.
-    pub fn noteShip(self: *Judge, slot: u16, q: AppenderId, now_ns: u64) Allocator.Error!Decision {
+    /// `served`: the op was APPLIED here under the holder's door (a wire
+    /// ship) — the door counted it as a holder op, so the holder's ops are
+    /// read net of every served ship on the slot; a refused in-process
+    /// touch committed nothing and subtracts nothing.
+    pub fn noteShip(self: *Judge, slot: u16, q: AppenderId, now_ns: u64, served: bool) Allocator.Error!Decision {
         stats.slot_ships.inc();
         const ops_q = try self.window.note(slot, q, now_ns);
-        const ops_h = self.table.holderOps(slot, now_ns, self.t_idle_ns);
+        const served_total = if (served) try self.window.noteServed(slot, now_ns) else self.window.servedOps(slot, now_ns);
+        const ops_h = self.table.holderOps(slot, now_ns, self.t_idle_ns) -| served_total;
         const d = decide(ops_q, ops_h, self.nFloorNow());
         if (d == .serve) return .serve;
         const at = self.table.handoverAt(slot);
@@ -514,34 +575,68 @@ test "dominance over a common window: a requester's ops rotate with the holder's
     // The holder does 3 ops; requester 2 does 6: not 2× and below N_floor.
     for (0..3) |_| t.noteHolderOp(5, 100, 2 * half);
     var d: Decision = .serve;
-    for (0..6) |_| d = try j.noteShip(5, 2, 100);
+    for (0..6) |_| d = try j.noteShip(5, 2, 100, false);
     try testing.expectEqual(Decision.serve, d);
     // Seven more: 13 ≥ 7 and ≥ 2 × 3 ⇒ dominated.
-    for (0..7) |_| d = try j.noteShip(5, 2, 100);
+    for (0..7) |_| d = try j.noteShip(5, 2, 100, false);
     try testing.expectEqual(Decision.offer_dominated, d);
     // Two epochs later everything zeroes; an idle holder is offered at
     // N_floor ships.
-    for (0..6) |_| d = try j.noteShip(5, 2, 100 + 2 * half);
+    for (0..6) |_| d = try j.noteShip(5, 2, 100 + 2 * half, false);
     try testing.expectEqual(Decision.serve, d);
-    d = try j.noteShip(5, 2, 100 + 2 * half);
+    d = try j.noteShip(5, 2, 100 + 2 * half, false);
     try testing.expectEqual(Decision.offer_idle, d);
     // The cooldown: a handover at this instant silences the next window.
     try t.noteHandover(5, 100 + 2 * half);
-    for (0..10) |_| d = try j.noteShip(5, 2, 200 + 2 * half);
+    for (0..10) |_| d = try j.noteShip(5, 2, 200 + 2 * half, false);
     try testing.expectEqual(Decision.serve, d);
-    for (0..10) |_| d = try j.noteShip(5, 2, 100 + 13 * half);
+    for (0..10) |_| d = try j.noteShip(5, 2, 100 + 13 * half, false);
     try testing.expectEqual(Decision.offer_idle, d);
     // 8 requesters each at 1/8: none reaches 2× a holder of 1 op.
     t.noteHolderOp(7, 100 + 20 * half, 2 * half);
     _ = try t.acquire(7, 1, false);
     var i: AppenderId = 10;
-    while (i < 18) : (i += 1) d = try j.noteShip(7, i, 100 + 20 * half);
+    while (i < 18) : (i += 1) d = try j.noteShip(7, i, 100 + 20 * half, false);
     try testing.expectEqual(Decision.serve, d);
     // The 9th evicts the LRU (all equal: the lowest ops/touched) and starts at 0.
     try testing.expectEqual(@as(u64, 1), try j.window.note(7, 99, 100 + 20 * half));
     try testing.expectEqual(@as(u64, 0), j.window.opsOf(7, 10, 100 + 20 * half));
     j.window.forget(7);
     try testing.expectEqual(@as(u64, 0), j.window.opsOf(7, 99, 100 + 20 * half));
+}
+
+test "a SERVED wire ship commits under the holder's door and the door counts it as a holder op (rung 10): the judge reads the holder's ops net of the slot's served ships, so a wire requester dominates exactly as an in-process one does; the holder's OWN ops still count" {
+    const gpa = testing.allocator;
+    const t = try LeaseTable.init(gpa);
+    defer t.deinit();
+    const half: u64 = 1000;
+    var j = Judge.init(gpa, t, 2 * half, 10 * half);
+    defer j.deinit();
+    j.seed(100, 100);
+    try testing.expectEqual(@as(u64, 7), j.nFloorNow());
+    _ = try t.acquire(5, 0, false);
+    // The holder's own 3 ops, then 13 ships from requester 2 each applied
+    // under the holder's door (the door's count climbs with them).
+    for (0..3) |_| t.noteHolderOp(5, 100, 2 * half);
+    var d: Decision = .serve;
+    for (0..13) |_| {
+        t.noteHolderOp(5, 100, 2 * half);
+        d = try j.noteShip(5, 2, 100, true);
+    }
+    // Gross the holder read 16 ≥ 13/2; net of the 13 served it reads 3:
+    // 13 ≥ N_floor and ≥ 2 × 3 ⇒ dominated.
+    try testing.expectEqual(@as(u64, 16), t.holderOps(5, 100, 2 * half));
+    try testing.expectEqual(@as(u64, 13), j.window.servedOps(5, 100));
+    try testing.expectEqual(Decision.offer_dominated, d);
+    // The holder's own ops still defend: 20 more of its own and the next
+    // served ship serves (14 < 2 × 23).
+    for (0..20) |_| t.noteHolderOp(5, 100, 2 * half);
+    t.noteHolderOp(5, 100, 2 * half);
+    try testing.expectEqual(Decision.serve, try j.noteShip(5, 2, 100, true));
+    // An in-process refusal subtracts nothing of its own but reads the
+    // same served total.
+    try testing.expectEqual(Decision.serve, try j.noteShip(5, 3, 100, false));
+    try testing.expectEqual(@as(u64, 14), j.window.servedOps(5, 100));
 }
 
 const MemoFixture = struct {

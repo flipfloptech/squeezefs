@@ -84,6 +84,46 @@ streaming `Hasher` (`init()` under the format key, `initKeyed(key)`, `update`, `
   and `dentryNameHash54(name, *const NameKey)` / `xattrNameHash56` take it by pointer. 47 call sites
   read it through a store's `nameKey()`; no path expands a key per name.
 
+### 3.1 The streaming state is the construction's minimum (resolved 2026-10-12)
+
+The adoption's one recorded caveat (0003 §M.5): the staged cell's value-first streaming state
+(`staging.ValueHash = checksum.Hasher`) grew from ~600 B (xxh3's) to **4,736 B** per LIVE cell. Measured
+(`@sizeOf`, both venues): a COPY of the expanded `Key` (320 B: 20 vectors), the 16 lane states (256 B),
+a **4,096 B** pending buffer (16 chunks — the source's streaming shape, sized for throughput, not for a
+resident state), two counters and 48 B of padding to the key's 64-B alignment. One such state lives per
+live staged record; the ring's cell population is bounded by `capacity / 4 KiB + 1` (`Segment.maxCells`),
+so at the venue's measured 546 MiB ring (`rung-09-memory-footprint.md`) 139,777 cells could hold
+**662 MB** of hasher state — 116 % of the ring they describe, 14.5 % of any budget at the `budget/8`
+ring ceiling — and none of it was a budget component (R5's Σ did not see it).
+
+The derived minimum (`sqzhash.zig` `Hasher`, the tie test "the streaming state is the construction's
+minimum"): the key by POINTER (the format key is a comptime constant, the name key lives once per
+mount), and ONE of two phases, a union — `prefix`, the input itself while it is ≤ `medium_max` (1 KiB:
+every regime below 16 lanes — one block, the 2…16-leaf tree, 8 lanes — is a function of the WHOLE
+input in a shape the 16-lane state cannot produce, so `final` hashes it one-shot), else `lanes`, the
+16 lane states (256 B) and the last 256 B seen (the final chunk is aligned on the END of the input and
+may start at any byte; a chunk is absorbed only once a byte FOLLOWS it). Size: `1024 + 16 (tag, at the
+vector alignment) + 8 (length) + 8 (key pointer) = `**1,056 B**, pinned as an equality. The OUTPUT is
+unchanged — the 28 pinned vectors, the source's 24, streaming ≡ one-shot over 42 lengths × 15 splits
+(now including fills that land short of, on and past the 1 KiB switch) × 3 keys, and the facade's
+split test all pass unchanged on both venues.
+
+| | per live cell | 64 MiB ring (16,385 cells) | 546 MiB ring (139,777 cells) | share of the ring | share of the budget at `budget/8` |
+|---|---|---|---|---|---|
+| before | 4,736 B | 77.6 MB | 662.0 MB | 116 % | ≤ 14.5 % |
+| after | **1,056 B** | 17.3 MB | 147.6 MB | 25.8 % | ≤ 3.2 % |
+
+The states are now GAUGED: `staging_cell_state_bytes` (every `create`/`destroy` of a cell's state in
+`Segment`, through one pair of helpers) is the budget component **`staging_cell_state`** (attribution-
+only, weight 0 — a state leaves with its cell, and the never-lossy lever that empties cells is
+`staging_mmap`'s promotion kick; heap, not page cache), registered beside `staging_mmap` at
+`openStaging`; `Segment.cellStateBound(capacity) = maxCells × @sizeOf(ValueHash)` is the bound the test
+restates, and a comptime rail pins `@sizeOf(ValueHash) < RECORD_ALIGN` (the RAM beside a record never
+outweighs the grain the record occupies). Test: "the live cells' value-hash states are gauged (R5)" —
+N puts carry N × 1,056; an in-place append swaps a state for a state; a same-key replace frees the old
+one with the last lease; a release frees one; `deinit` the rest; a recovered record carries none until
+its first append. Every other `checksum.Hasher` (21 sites, on fiber stacks) shrank with it.
+
 Facade pins: `hash54("hello", Key(42)) = 0x57efcfaac4954437 >> 10`,
 `hash56("user.layout", Key(42)) = 0xe67f1d17ff5c7b1c >> 8`; `hash64("") = 0x60faebc5c5bda514`;
 `stamp` → `verify` round trips and every single-byte flip over a 4 KiB page fails `verify`;
@@ -197,6 +237,9 @@ registry's, not the hash's).
 ## 9. What changed, in one list
 
 - `src/core/sqzhash.zig` (new, the pinned definition), `src/core/checksum.zig` (the facade).
+- §3.1 (the day after): `sqzhash.Hasher` holds the key by pointer and a two-phase union (1,056 B,
+  pinned, from 4,736; output unchanged); `staging.stats.staging_cell_state_bytes`, the component
+  `staging_cell_state`, `Segment.cellStateBound`, the `@sizeOf(ValueHash) < RECORD_ALIGN` rail.
 - `src/meta/key.zig` `NameKey` + `hash54`/`hash56` by pointer; `nameKey()` on `KvBackend`,
   `MetaSet`, `MemStore`, `FaultStore`, the census `Store` vtable, `HolderStore`; `name_key` on
   `ImageBuilder`, `DataPlane`, `pack.CommitCtx`, `layout.Publish`, the fsck `Host`, economy's

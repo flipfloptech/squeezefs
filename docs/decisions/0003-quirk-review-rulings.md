@@ -613,5 +613,8 @@ under the new definition (both gates green on both venues, `rung-09-sqzhash.md`)
   names (RAM-only cache paths, never format); `std.hash.XxHash3` survives only as the bench's
   reference column.
 - The staged cell's value-first streaming state (`staging.ValueHash = checksum.Hasher`): the law
-  (O(appended) per in-place append) holds; the state grew from ~600 B to ~4.7 KiB per LIVE cell
-  (the engine's 16-chunk buffer), bounded by the ring's live cells — recorded, not optimized.
+  (O(appended) per in-place append) holds. The state had grown from ~600 B to 4,736 B per LIVE cell
+  (the engine's 16-chunk buffer plus a key copy — up to 116 % of the ring's own bytes, ungauged);
+  RESOLVED 2026-10-12 (`rung-09-sqzhash.md` §3.1): the state is the construction's minimum, 1,056 B
+  (the key by pointer; the input itself while ≤ 1 KiB, else 16 lanes + the last chunk), pinned, the
+  output unchanged, and gauged as the R5 component `staging_cell_state`.

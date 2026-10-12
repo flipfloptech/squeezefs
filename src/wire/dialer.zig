@@ -352,6 +352,7 @@ pub const Mux = struct {
                 // Give up unless the reader is already delivering.
                 if (cell.state.cmpxchgStrong(Cell.ARMED, Cell.FREE, .acq_rel, .acquire) == null) {
                     stats.cluster_wire_call_timeouts.inc();
+                    log.warn("cluster wire: {t} to {f} got no reply within {d} ms — the session's serving half is blocked behind a parked serve, or the peer is gone", .{ @as(verbs.Verb, req), self.link.stream.socket.address, CALL_REPLY_BOUND_MS });
                     return error.HolderUnreachable;
                 }
                 while (cell.done.load(.acquire) == 0) futex.wait(&cell.done, 0);

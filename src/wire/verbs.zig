@@ -161,6 +161,12 @@ pub const Verb = enum(u16) {
         return std.enums.fromInt(Verb, w);
     }
 
+    /// The verb's name for a log line; a word off the table is named by
+    /// its class.
+    pub fn nameOf(w: u16) []const u8 {
+        return if (fromWire(w)) |v| @tagName(v) else "unknown-verb";
+    }
+
     pub fn block(self: Verb) Block {
         const w = @backingInt(self);
         return switch (w >> 8) {
@@ -1863,7 +1869,10 @@ test "verb numbers: block-coded, unique, the handshake frames at 0xFFF0, every b
         try testing.expectEqual(i, v.index());
         _ = v.block();
         _ = v.schema();
+        try testing.expectEqualStrings(@tagName(v), Verb.nameOf(value));
     }
+    // A log line names a word off the table by its class.
+    try testing.expectEqualStrings("unknown-verb", Verb.nameOf(0x0508));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0508));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0200));
     try testing.expectEqual(@as(?Verb, null), Verb.fromWire(0x0606));

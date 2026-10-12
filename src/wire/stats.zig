@@ -59,6 +59,9 @@ pub var cluster_wire_dead_on_arrival: counters.ShardedCounter = .{};
 pub var cluster_wire_call_timeouts: counters.ShardedCounter = .{};
 /// Replies that arrived for a call that had already given up.
 pub var cluster_wire_late_replies: counters.ShardedCounter = .{};
+/// Serves that held a session past `listener.SLOW_SERVE_WARN_MS` (every
+/// call multiplexed on the session waited behind each).
+pub var cluster_wire_slow_serves: counters.ShardedCounter = .{};
 /// Sessions a transport failure poisoned (every parked call failed).
 pub var cluster_wire_sessions_poisoned: counters.ShardedCounter = .{};
 /// Header reads refused before any payload byte (magic/version/flags/

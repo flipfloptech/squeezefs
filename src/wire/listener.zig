@@ -62,6 +62,12 @@ pub const MAX_CONNS_FLOOR: u32 = 64;
 pub const CONNECTION_FDS: u32 = 2;
 /// The listener may spend a quarter of `RLIMIT_NOFILE` (the `fd_cache_cap` law).
 pub const LISTENER_FD_SHARE: u32 = 4;
+/// A serve that holds a session this long is named loud: the request loop
+/// is sequential per connection, so a parked serve (a grant on an object
+/// in flight, a guard behind a held lock) stalls every call the dialer
+/// multiplexed on the session — a tenth of the dialer's reply bound, so
+/// the warning lands before the callers time out.
+pub const SLOW_SERVE_WARN_MS: u64 = session.DIAL_TIMEOUT_MS / 10;
 /// Accept errors ride a doubling backoff: a bare `continue` turned EMFILE
 /// into a busy loop.
 pub const ACCEPT_BACKOFF_MIN_MS: u64 = 5;
@@ -386,7 +392,13 @@ fn connMain(conn: *Conn) void {
             return;
         };
         if (in.header.isReply()) return; // a reply on the serving half is a protocol error
+        const t_serve = clock.monotonicNs();
         const served = l.svc.serve(in.header, in.payload, conn.peer, conn.id, conn.sess.payloadWindow(), conn.sess.scratch);
+        const serve_ms = (clock.monotonicNs() -| t_serve) / std.time.ns_per_ms;
+        if (serve_ms >= SLOW_SERVE_WARN_MS) {
+            stats.cluster_wire_slow_serves.inc();
+            log.warn("cluster wire: connection {d}: {s} served in {d} ms — every call multiplexed on this session waited behind it", .{ conn.id, verbs.Verb.nameOf(in.header.verb), serve_ms });
+        }
         const rh = conn.sess.framer.nextHeaderRaw(in.header.verb, in.header.schema, served.status, in.header.correlation, true);
         conn.sess.sendSealed(rh, served.payload.len) catch return;
     }

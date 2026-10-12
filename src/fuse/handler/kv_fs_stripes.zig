@@ -380,10 +380,12 @@ pub fn Stripes(comptime Fs: type) type {
 
         // ---- the cadence ----
 
-        /// One migration round per migrating directory: a page of names
-        /// moved into their stripes; a directory re-verified empty of user
-        /// names clears `migrating` and leaves the queue.
+        /// The census' due flips, then one migration round per migrating
+        /// directory: a page of names moved into their stripes; a directory
+        /// re-verified empty of user names clears `migrating` and leaves
+        /// the queue.
         pub fn tick(self: *Self) void {
+            self.core.runPending();
             var dirs: [16]u64 = undefined;
             var n: usize = 0;
             {

@@ -1030,9 +1030,13 @@ test "the automatic trigger: foreign ships into one directory from MORE THAN ONE
     try testing.expectEqual(flips0, stripe.stats.dir_stripe_flips.load());
     try testing.expectEqual(@as(u32, 1), st.census.dirs.get(DIR_B).?.distinct());
     try testing.expect((try stripe.readMap(src_b.src(), arena, DIR_B)) == null);
-    // A second creator's served ship crosses the floor: the flip runs,
-    // contained, after the served step.
+    // A second creator's served ship crosses the floor: the flip is DUE
+    // and runs on the cadence, never inside the served step (whose
+    // initiator still holds its scope over `I{D}` here).
     f.b.plane.served_insert.?.note(f.b.plane.served_insert.?.ctx, DIR_B, 9);
+    try testing.expectEqual(flips0, stripe.stats.dir_stripe_flips.load());
+    try testing.expectEqual(@as(usize, 1), st.pending.items.len);
+    st.runPending();
     try testing.expectEqual(flips0 + 1, stripe.stats.dir_stripe_flips.load());
     const map = (try stripe.readMap(src_b.src(), arena, DIR_B)).?;
     // A ship INTO a stripe feeds no census (the face says so).

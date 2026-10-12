@@ -44,6 +44,7 @@ const counters = @import("../../../core/counters.zig");
 const errors = @import("../../../core/errors.zig");
 const clock = @import("../../../core/clock.zig");
 const knobs = @import("../../../core/knobs.zig");
+const log = @import("../../../core/log.zig");
 const sync = @import("../../../sync/sync.zig");
 const service = @import("../../../wire/service.zig");
 const key = @import("../../key.zig");
@@ -75,6 +76,9 @@ pub const stats = struct {
     /// A creator that declined or could not be reached: its batch was
     /// minted by the holder instead.
     pub var dir_stripe_supply_declined: counters.ShardedCounter = .{};
+    /// A census-triggered flip that did not land (named loud; the
+    /// directory re-enters the census at its next served insert).
+    pub var dir_stripe_flip_failures: counters.ShardedCounter = .{};
     /// Creates into a striped directory keyed to a FOREIGN stripe.
     pub var dir_stripe_ships: counters.ShardedCounter = .{};
     pub var dir_stripe_readdir_merges: counters.ShardedCounter = .{};
@@ -823,11 +827,22 @@ pub fn Striping(comptime Store: type) type {
         /// What a flip the census triggered hands back (the filesystem's
         /// map cache, the migration's queue); null = the harness.
         flipped: ?FlippedSink = null,
+        /// Directories the census found due, with their suppliers: the
+        /// flips run on the cadence (`runPending`), NEVER inside the served
+        /// step that made them due — that step's initiator still holds its
+        /// travelling scope over `I{D}` at this holder while it waits for
+        /// the step's reply, and the flip's own `I{D}` would wait for it
+        /// (the scope's expiry sweep was the only way out: 45 s of every
+        /// create into the directory parked).
+        pending_lock: sync.Mutex = .init,
+        pending: std.ArrayList(PendingFlip) = .empty,
 
         pub const FlippedSink = struct {
             ctx: *anyopaque,
             note: *const fn (ctx: *anyopaque, map: StripeMap) void,
         };
+
+        const PendingFlip = struct { dir: u64, suppliers: [DirCensus.MAX_CREATORS * 2]u32, n: u8 };
 
         pub const Error = ops.Error || error{ NotADirectory, AlreadyStriped, IsAStripe, StripingOff, NotHolder, NotEmpty, Changed };
 
@@ -838,6 +853,7 @@ pub fn Striping(comptime Store: type) type {
         pub fn deinit(self: *Self) void {
             self.census.deinit(self.plane.gpa);
             self.persisted.deinit(self.plane.gpa);
+            self.pending.deinit(self.plane.gpa);
         }
 
         /// The served-insert census hook (the ops plane's sink): due ⇒ flip.
@@ -848,11 +864,32 @@ pub fn Striping(comptime Store: type) type {
         fn noteServed(ctx: *anyopaque, parent: u64, creator: u32) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             if (self.k <= 1) return;
-            var suppliers: [DirCensus.MAX_CREATORS * 2]u32 = undefined;
-            const sup = self.census.noteServedInsert(parent, creator, clock.monotonicNs(), &suppliers) orelse return;
-            defer self.census.flipDone(parent);
-            const map = self.flip(parent, self.k, sup) catch return;
-            if (self.flipped) |f| f.note(f.ctx, map);
+            var pf: PendingFlip = .{ .dir = parent, .suppliers = undefined, .n = 0 };
+            const sup = self.census.noteServedInsert(parent, creator, clock.monotonicNs(), &pf.suppliers) orelse return;
+            pf.n = @intCast(sup.len);
+            self.pending_lock.lockUncancelable(self.plane.io);
+            defer self.pending_lock.unlock(self.plane.io);
+            self.pending.append(self.plane.gpa, pf) catch self.census.flipDone(parent);
+        }
+
+        /// The cadence's half of the trigger: every directory the census
+        /// found due is flipped now, contained (a failure is named loud and
+        /// the directory re-enters the census at its next served insert).
+        pub fn runPending(self: *Self) void {
+            while (true) {
+                const pf = blk: {
+                    self.pending_lock.lockUncancelable(self.plane.io);
+                    defer self.pending_lock.unlock(self.plane.io);
+                    break :blk self.pending.pop() orelse return;
+                };
+                defer self.census.flipDone(pf.dir);
+                const map = self.flip(pf.dir, self.k, pf.suppliers[0..pf.n]) catch |e| {
+                    stats.dir_stripe_flip_failures.inc();
+                    log.warn("directory {d}: the census flip over {d} stripes with {d} supplier(s) did not land ({t}); the directory re-enters the census at its next served insert", .{ pf.dir, self.k, pf.n, e });
+                    continue;
+                };
+                if (self.flipped) |f| f.note(f.ctx, map);
+            }
         }
 
         /// The flip, on the HOLDER of `D`: refuse off / not a directory /

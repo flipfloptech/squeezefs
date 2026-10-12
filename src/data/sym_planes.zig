@@ -369,9 +369,14 @@ test "two writers in process: A holds the lease; B pulls grants, writes, its fre
     // B's own declared window is adopted under its name; A is dead (never
     // declares), so the remainder — A's window — is released.
     const adopted = dl.adoptDeclared(&b_holder.ledger, b_bitmap, 2, b_decl.items);
-    try testing.expectEqual(f.b_arm.window.remaining(), adopted);
-    const released = dl.convergeDeferred(b_bitmap, true);
-    try testing.expectEqual(f.a_arm.window.remaining(), released);
+    try testing.expectEqual(f.b_arm.window.remaining(), adopted.adopted);
+    try testing.expectEqual(@as(u64, 0), adopted.relearned);
+    // A is dead and recovered, B is the holder: B's own census (the refs
+    // ledger) is exact — A's unconsumed window is released, nothing
+    // referenced is touched.
+    const converged = dl.convergeDeferred(b_bitmap, &f.a_ledger.words);
+    try testing.expectEqual(f.a_arm.window.remaining(), converged.released);
+    try testing.expectEqual(@as(u64, 0), converged.referenced);
     try testing.expect(dl.closureHolds());
     // B's first carve as the holder lands above the adopted frontier.
     const frontier = b_holder.ledger.grantFrontier();

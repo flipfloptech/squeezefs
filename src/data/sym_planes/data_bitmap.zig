@@ -190,7 +190,18 @@ pub const DeltaRing = struct {
         return self.len == self.buf.len;
     }
 
+    /// Queue a delta; a delta that continues the tail run (same sense and
+    /// term, adjacent) EXTENDS it instead — a truncate's per-block frees
+    /// and a sequential carve are then one run record each, so a free
+    /// storm never fills the ring with a thousand one-bit CLEARs.
     pub fn push(self: *DeltaRing, d: RunDelta) bool {
+        if (self.len > 0) {
+            const tail = &self.buf[(self.head + self.len - 1) % self.buf.len];
+            if (tail.set == d.set and tail.term == d.term and tail.start + tail.len == d.start and @as(u64, tail.len) + d.len <= std.math.maxInt(u32)) {
+                tail.len += d.len;
+                return true;
+            }
+        }
         if (self.isFull()) return false;
         self.buf[(self.head + self.len) % self.buf.len] = d;
         self.len += 1;
@@ -245,13 +256,29 @@ pub const stats = struct {
     /// Must-stay-0: the maintained population disagreed with the popcount.
     pub var data_alloc_population_drift: counters.Tripwire = .init("data_alloc_population_drift");
     /// A SET delta the ring could not hold at a carve — cannot happen: the
-    /// carve drains before it carves.
+    /// grant drains BEFORE it carves and a ring still full defers the
+    /// grant without moving a bit (`HolderGrants.blockGrant`).
     pub var data_alloc_bitmap_set_dropped: counters.Tripwire = .init("data_alloc_bitmap_set_dropped");
-    /// Deltas a holder with no journal sink (the RAM posture) did not
-    /// queue — the KVDA page sink is the next wave's (0002 row 292).
+    /// Deltas a holder with no journal sink did not queue: the RAM posture
+    /// of a rig with no home bound (the product's holder binds ring 0 at
+    /// its arm — `plane_arm.Home`), so a growing count on a mount is a
+    /// wiring defect.
     pub var data_alloc_bitmap_deltas_unjournaled: counters.ShardedCounter = .{};
     /// Population scans the allocation funnel performed (0 by contract).
     pub var population_scans: counters.ShardedCounter = .{};
+    /// The page sink (charter §5.5 "pages written before barrier #1"):
+    /// holds published at an arm (the pages claimed on the home volume
+    /// and the refs in `alloc_lease:`), and pages a successor's arm
+    /// LOADED through a predecessor's refs with the bits they carried
+    /// beyond the refs census (the granted-but-unminted ranges the
+    /// successor never re-learns from a declaration).
+    pub var data_alloc_bitmap_holds: counters.ShardedCounter = .{};
+    pub var data_alloc_bitmap_successor_loads: counters.ShardedCounter = .{};
+    pub var data_alloc_bitmap_bits_loaded: counters.ShardedCounter = .{};
+    /// The kept window folded onto a predecessor's pages by its same-node
+    /// successor (the manager's own predecessor; a joined holder's fold is
+    /// the recovery driver's `recovery_data_bitmaps_replayed`).
+    pub var data_alloc_bitmap_predecessor_folds: counters.ShardedCounter = .{};
     /// Levels.
     pub var data_alloc_bitmap_population: counters.Gauge = .{};
     pub var data_alloc_bitmap_queued: counters.Gauge = .{};
@@ -371,6 +398,13 @@ pub const DataBitmap = struct {
         self.mutations.lock();
         defer self.mutations.unlock();
         return self.ring.len;
+    }
+
+    /// A SET queued now would be dropped (the grant path's refusal gate).
+    pub fn ringFull(self: *DataBitmap) bool {
+        self.mutations.lock();
+        defer self.mutations.unlock();
+        return self.journal != null and self.ring.isFull();
     }
 
     // ---- the mutations (each under the ONE lock) ----
@@ -891,6 +925,76 @@ pub fn screenBitmapRefs(refs: []const records.BitmapRef, blocks: u64, heaps: []c
     return total >= region and total <= derive.ceilDiv(region, node) * node;
 }
 
+/// A region offset (`PageWrite.offset`) → the device offset through the
+/// refs (the pages laid across the claims in ref order); null past them.
+pub fn regionToDevice(refs: []const records.BitmapRef, offset: u64) ?u64 {
+    var acc: u64 = 0;
+    for (refs) |r| {
+        if (offset < acc + r.len) return r.start + (offset - acc);
+        acc += r.len;
+    }
+    return null;
+}
+
+/// The checkpoint step over held pages (§2.5): every dirty page's image
+/// written through the refs; the cycle's own barrier #1 covers them. A
+/// write that fails re-dirties the set (law 1) — the next cycle rewrites.
+/// Returns the pages written.
+pub fn writeDirtyPagesThroughRefs(bm: *DataBitmap, io: RegionIo, refs: []const records.BitmapRef, generation: u64) error{ Io, OutOfMemory, Corrupt }!usize {
+    var set = try bm.takeDirtyPlan(generation);
+    defer set.deinit();
+    if (set.writes.len == 0) return 0;
+    for (set.writes) |*w| {
+        const dev_off = regionToDevice(refs, w.offset) orelse {
+            set.abort(bm);
+            return error.Corrupt;
+        };
+        io.vtable.write(io.ctx, dev_off, &w.image) catch {
+            set.abort(bm);
+            return error.Io;
+        };
+    }
+    const n = set.writes.len;
+    set.commit(bm);
+    return n;
+}
+
+pub const FoldOutcome = struct { bits_changed: u64, pages_written: usize };
+
+/// The fold a successor runs over a dead holder's pages (§2.6 — the re-
+/// hold's first half): the image read through the screened refs, loaded
+/// over a scratch allocator of the lease's geometry, the window's kind-5
+/// deltas of exactly `term` folded (per-key LWW by seq), the changed pages
+/// written back through the refs at `generation` and BARRIERED. The pages
+/// are the durable outcome: no journal is bound, the scratch ring holds
+/// every folded block at once. Nothing written when no bit changed.
+pub fn foldOntoRegion(gpa: Allocator, io: RegionIo, refs: []const records.BitmapRef, vol_tag: u64, blocks: u64, term: u64, deltas: []const DataBitmap.ReplayRecord, generation: u64) error{ Io, OutOfMemory, Corrupt }!FoldOutcome {
+    const alloc = BlockAllocator.init(gpa, .{ .vol_tag = vol_tag, .vol = 0, .capacity_bytes = blocks * block_alloc.CHUNK_SIZE }) catch return error.OutOfMemory;
+    defer alloc.deinit();
+    var folded_blocks: u64 = 0;
+    for (deltas) |d| {
+        const dd = records.decodeDelta(d.value) catch continue;
+        folded_blocks += dd.len;
+    }
+    const bm = try DataBitmap.init(gpa, alloc, .{ .vol_tag = vol_tag, .term = term, .blocks = blocks, .ring_capacity = @intCast(@min(@max(folded_blocks, 1), blocks)) });
+    defer bm.deinit();
+    const image = readRegionImage(gpa, io, refs, blocks) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Io => error.Io,
+        error.GrantExhausted, error.TooManyRefs => error.Corrupt,
+    };
+    defer gpa.free(image);
+    _ = bm.loadRegionImage(image) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TornPage => error.Corrupt,
+    };
+    const changed = try bm.replay(deltas, term);
+    if (changed == 0) return .{ .bits_changed = 0, .pages_written = 0 };
+    const written = try writeDirtyPagesThroughRefs(bm, io, refs, generation);
+    try io.vtable.barrier(io.ctx);
+    return .{ .bits_changed = changed, .pages_written = written };
+}
+
 /// Read the predecessor's pages through screened refs into one image
 /// (`regionLen(blocks)` bytes, zero-extended); nothing proportional is
 /// allocated before the screen passed (the caller's duty).
@@ -1089,22 +1193,22 @@ test "page_round_trips_and_refuses_the_wrong_volume_and_index; every header word
     try testing.expectEqual(@as(u8, 0), img[33]);
 }
 
-test "the ring: push to capacity, peek without pop, pop after the journal; never grown" {
+test "the ring: push to capacity, peek without pop, pop after the journal; never grown (the pushes separated so none continues the tail)" {
     var r = try DeltaRing.init(testing.allocator, 3);
     defer r.deinit(testing.allocator);
     try testing.expect(r.push(.{ .set = true, .start = 1, .len = 1, .term = 1 }));
     try testing.expect(r.push(.{ .set = false, .start = 2, .len = 1, .term = 1 }));
-    try testing.expect(r.push(.{ .set = true, .start = 3, .len = 1, .term = 1 }));
-    try testing.expect(!r.push(.{ .set = true, .start = 4, .len = 1, .term = 1 }));
+    try testing.expect(r.push(.{ .set = true, .start = 30, .len = 1, .term = 1 }));
+    try testing.expect(!r.push(.{ .set = true, .start = 40, .len = 1, .term = 1 }));
     var out: [2]RunDelta = undefined;
     try testing.expectEqual(@as(usize, 2), r.peek(&out));
     try testing.expectEqual(@as(u64, 1), out[0].start);
     try testing.expectEqual(@as(usize, 3), r.len);
     r.pop(2);
-    try testing.expect(r.push(.{ .set = true, .start = 5, .len = 1, .term = 1 }));
+    try testing.expect(r.push(.{ .set = true, .start = 50, .len = 1, .term = 1 }));
     try testing.expectEqual(@as(usize, 2), r.peek(&out));
-    try testing.expectEqual(@as(u64, 3), out[0].start);
-    try testing.expectEqual(@as(u64, 5), out[1].start);
+    try testing.expectEqual(@as(u64, 30), out[0].start);
+    try testing.expectEqual(@as(u64, 50), out[1].start);
 }
 
 test "deltas_fold_lww_and_the_run_carve_skips_set_bits: a carve SETs under the lock and journals ONE run; a finish-free CLEAR is one record; the replay folds by seq and ignores another term" {
@@ -1226,6 +1330,34 @@ test "a full ring drops a CLEAR leak-safe and counts it; a SET never meets a ful
     _ = bm.carveRun(4, 1).?;
     try log.testing.expectAllFired();
     try testing.expectEqual(trip0 + 1, counters.tripwireCount("data_alloc_bitmap_set_dropped"));
+}
+
+test "the ring coalesces a run's continuation (rung 10): 1,400 per-block CLEARs of a truncate's sweep are ONE delta, a sequential carve's SETs one more; a gap, the other sense or another term starts a new record; the drained records restate the runs exactly" {
+    const a = try testAlloc(2048);
+    defer a.deinit();
+    const bm = try DataBitmap.init(testing.allocator, a, .{ .vol_tag = 0xDA7A, .term = 1, .blocks = 2048, .ring_capacity = 4 });
+    defer bm.deinit();
+    var j: RamJournal = .{ .gpa = testing.allocator };
+    defer j.deinit();
+    bm.journal = j.sink();
+    // 1,400 blocks SET as one run (frontier 100), then freed one by one.
+    try testing.expectEqual(@as(u32, 1400), bm.setRun(100, 1400));
+    try testing.expectEqual(@as(usize, 1), bm.queuedDeltas());
+    var idx: u64 = 100;
+    while (idx < 1500) : (idx += 1) try testing.expect(bm.noteFinishFree(idx));
+    try testing.expectEqual(@as(usize, 2), bm.queuedDeltas());
+    // A gap starts a new record; a second term never joins the first.
+    try testing.expectEqual(@as(u32, 1), bm.setRun(1600, 1));
+    try testing.expectEqual(@as(u32, 1), bm.setRun(1601, 1));
+    try testing.expectEqual(@as(usize, 3), bm.queuedDeltas());
+    try testing.expectEqual(@as(u32, 1), bm.setRun(1700, 1));
+    try testing.expectEqual(@as(usize, 4), bm.queuedDeltas());
+    try testing.expectEqual(DataBitmap.DrainOutcome.drained, bm.drain());
+    try testing.expectEqual(@as(usize, 4), j.entries.items.len);
+    try testing.expect(j.entries.items[0].delta.set and j.entries.items[0].delta.start == 100 and j.entries.items[0].delta.len == 1400);
+    try testing.expect(!j.entries.items[1].delta.set and j.entries.items[1].delta.start == 100 and j.entries.items[1].delta.len == 1400);
+    try testing.expect(j.entries.items[2].delta.set and j.entries.items[2].delta.start == 1600 and j.entries.items[2].delta.len == 2);
+    try testing.expect(j.entries.items[3].delta.set and j.entries.items[3].delta.start == 1700 and j.entries.items[3].delta.len == 1);
 }
 
 test "pages before barrier #1: the dirty plan writes the alternate slot at a raised generation, commit advances the state, abort re-dirties; a second volume's checkpoint never writes the holder's pages" {
@@ -1392,6 +1524,78 @@ test "placement: the pages claim max(1, ceil(region / node)) extents of the home
     try testing.expect(!screenBitmapRefs(&.{.{ .vol = 2, .start = 0, .len = 8192 }}, 40_000, &heaps)); // too short
     try testing.expect(!screenBitmapRefs(&.{.{ .vol = 2, .start = 0, .len = 32_768 }}, 40_000, &heaps)); // too long
     try testing.expect(!screenBitmapRefs(&.{.{ .vol = 2, .start = (1 << 20) - 8192, .len = 16_384 }}, 40_000, &heaps)); // past the heap
+}
+
+test "THE PAGE SINK's two device acts (rung 10 item 2): the cycle's write through the refs lands only the DIRTY pages in the alternate slot (a second write with nothing dirty writes none); a successor's fold reads the pages through the refs, replays the kept window's deltas of exactly the dead term, rewrites the changed pages and barriers — another term's deltas and an empty window change nothing" {
+    const gpa = testing.allocator;
+    const a = try testAlloc(40_000); // two pages
+    defer a.deinit();
+    const bm = try testBitmap(a, 1);
+    defer bm.deinit();
+    var ring: RamJournal = .{ .gpa = gpa };
+    defer ring.deinit();
+    bm.journal = ring.sink();
+    var home = try RamHome.init(gpa, 8192, 8);
+    defer home.deinit();
+    // The hold: the image at the arm (10 bits carved), published refs.
+    _ = bm.carveRun(0, 10).?;
+    const image = try gpa.alloc(u8, @intCast(regionLen(40_000)));
+    defer gpa.free(image);
+    bm.regionImage(5, image);
+    var refs: std.ArrayList(records.BitmapRef) = .empty;
+    defer refs.deinit(gpa);
+    try holdPages(gpa, home.pool(), home.io(), 2, image, &refs);
+    try testing.expectEqual(DataBitmap.DrainOutcome.drained, bm.drain());
+    // The hold wrote the image outside the dirty plan, so the first cycle
+    // rewrites every page dirty since the arm (the carve's page 0 and the
+    // new carve's page 1); a cycle with nothing dirty writes none; a carve
+    // on page 1 alone then lands one page.
+    _ = bm.setRun(35_000, 3);
+    try testing.expectEqual(@as(usize, 2), try writeDirtyPagesThroughRefs(bm, home.io(), refs.items, 7));
+    try testing.expectEqual(@as(usize, 0), try writeDirtyPagesThroughRefs(bm, home.io(), refs.items, 8));
+    _ = bm.setRun(35_010, 1);
+    try testing.expectEqual(@as(usize, 1), try writeDirtyPagesThroughRefs(bm, home.io(), refs.items, 9));
+    {
+        const back = try readRegionImage(gpa, home.io(), refs.items, 40_000);
+        defer gpa.free(back);
+        const b = try testAlloc(40_000);
+        defer b.deinit();
+        const probe = try testBitmap(b, 1);
+        defer probe.deinit();
+        const l = try probe.loadRegionImage(back);
+        try testing.expectEqual(@as(u64, 14), l.bits_set);
+        try testing.expect(probe.isSet(35_002) and probe.isSet(35_010) and probe.isSet(9) and !probe.isSet(10));
+    }
+    // The holder dies with two more carves in its ring only (never paged).
+    _ = bm.setRun(100, 64);
+    _ = bm.setRun(36_000, 2);
+    try testing.expectEqual(DataBitmap.DrainOutcome.drained, bm.drain());
+    const kept = try ring.replayRecords(gpa);
+    defer RamJournal.freeReplay(gpa, kept);
+    // Another term's deltas fold nothing and write nothing.
+    const none = try foldOntoRegion(gpa, home.io(), refs.items, 0xDA7A, 40_000, 2, kept, 10);
+    try testing.expectEqual(@as(u64, 0), none.bits_changed);
+    try testing.expectEqual(@as(usize, 0), none.pages_written);
+    // The dead term's: both pages change (block 100 on page 0, 36,000 on
+    // page 1), both rewritten.
+    const out = try foldOntoRegion(gpa, home.io(), refs.items, 0xDA7A, 40_000, 1, kept, 10);
+    try testing.expectEqual(@as(u64, 66), out.bits_changed);
+    try testing.expectEqual(@as(usize, 2), out.pages_written);
+    {
+        const back = try readRegionImage(gpa, home.io(), refs.items, 40_000);
+        defer gpa.free(back);
+        const b = try testAlloc(40_000);
+        defer b.deinit();
+        const succ = try testBitmap(b, 2);
+        defer succ.deinit();
+        const l = try succ.loadRegionImage(back);
+        try testing.expectEqual(@as(u64, 10 + 3 + 1 + 64 + 2), l.bits_set);
+        try testing.expect(succ.isSet(163) and succ.isSet(36_001));
+        try testing.expectEqual(bm.populationNow(), succ.populationNow());
+    }
+    // An empty kept window: nothing to fold.
+    const empty = try foldOntoRegion(gpa, home.io(), refs.items, 0xDA7A, 40_000, 1, &.{}, 11);
+    try testing.expectEqual(@as(u64, 0), empty.bits_changed);
 }
 
 fn dataBitmapPageFuzz(_: void, smith: *std.testing.Smith) !void {

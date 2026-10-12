@@ -139,6 +139,13 @@ pub const RecordSource = struct {
     /// the cycle's fixpoint (no dirty node, no dying floor) — the region
     /// tail law's input. Null on a single-writer volume.
     appenderPages: ?*const fn (ctx: *anyopaque, record: *const ledger.LedgerRecord, cache_clean: bool) IoError!void = null,
+    /// The data allocation bitmaps' `KVDA` pages of every allocation lease
+    /// HOMED on this backend (charter §5.5 "pages written before barrier
+    /// #1"; `sym_data_planes.md` §2.5), at C6 beside the meta bitmap's own
+    /// page write and at the same generation: the record's tail passes
+    /// every delta journaled below the cycle's head, so the pages must
+    /// already carry them. Null on a volume that is home to no lease.
+    dataPages: ?*const fn (ctx: *anyopaque, generation: u64) IoError!void = null,
 };
 
 pub const FlushFailure = enum { none, io, corrupt, out_of_memory };
@@ -840,6 +847,7 @@ pub const Checkpointer = struct {
         // on the device before the record that names it.
         const ckpt_seq = self.checkpoint_seq.load(.acquire) + 1;
         try self.writeDirtyPages(ckpt_seq);
+        if (self.deps.record.dataPages) |f| try f(self.deps.record.ctx, ckpt_seq);
         const t_pages = clock.monotonicNs();
 
         // ---- C7: barrier #1. A failure counts toward the lattice and aborts

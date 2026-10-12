@@ -32,6 +32,7 @@ pub const bind = if (builtin.os.tag == .linux) @import("sym/bind.zig") else stru
 pub const joined = if (builtin.os.tag == .linux) @import("sym/joined.zig") else struct {};
 pub const wire_plane = if (builtin.os.tag == .linux) @import("sym/wire_plane.zig") else struct {};
 pub const reader_plane = if (builtin.os.tag == .linux) @import("sym/reader_plane.zig") else struct {};
+pub const kvda_home = if (builtin.os.tag == .linux) @import("sym/kvda_home.zig") else struct {};
 pub const tokens = @import("sym/tokens.zig");
 pub const membership = @import("sym/membership.zig");
 pub const xv = @import("sym/xv.zig");

@@ -207,6 +207,15 @@ fn readLease(store: ControlStore, gpa: Allocator, vol_tag: u64) StoreError!?Leas
     return .{ .rec = dec.lease, .refs = refs };
 }
 
+/// The record as the successor's fold reads it (the holder, its term and
+/// geometry, its pages); null = no lease on the volume.
+pub const LeaseView = struct { holder: WriterIdentity, term: u64, blocks: u64, home_vol: u16, refs: Refs };
+
+pub fn readLeaseRefs(store: ControlStore, gpa: Allocator, vol_tag: u64) StoreError!?LeaseView {
+    const l = (try readLease(store, gpa, vol_tag)) orelse return null;
+    return .{ .holder = l.holder(), .term = l.rec.term, .blocks = l.rec.blocks, .home_vol = l.rec.home_vol, .refs = l.refs };
+}
+
 fn writeLease(store: ControlStore, vol_tag: u64, rec: cr.AllocLease, refs: []const BitmapRef, admission: Admission) StoreError!void {
     var buf: [records.ALLOC_LEASE_MAX_LEN]u8 = undefined;
     var r = rec;

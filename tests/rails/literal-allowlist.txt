@@ -152,18 +152,17 @@ src/data/set_config.zig:236 | 8 | OWED: derive it or document it on the line (ch
 src/data/set_config.zig:390 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/data/staging.zig:1443 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/data/staging.zig:1541 | 4096 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/alloc_lease.zig:603 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/alloc_lease.zig:604 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/alloc_lease.zig:612 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/alloc_lease.zig:613 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/sym_planes/block_grant.zig:116 | 1000 | a timing/retry constant — OWED: its measured WHY on the line or a derivation (charter §1.5)
 src/data/sym_planes/block_grant.zig:118 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/block_grant.zig:118 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/block_grant.zig:323 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/block_grant.zig:962 | 63 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/block_grant.zig:962 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/block_grant.zig:978 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/block_grant.zig:982 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/block_grant.zig:990 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/block_grant.zig:1031 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/block_grant.zig:331 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/block_grant.zig:972 | 63 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/block_grant.zig:972 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/block_grant.zig:988 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/block_grant.zig:992 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/block_grant.zig:1000 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/data/sym_planes/clone_protocol.zig:285 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/clone_protocol.zig:315 | 4 | a table entry (switch/range arm) — the codec or classification table
 src/data/sym_planes/clone_protocol.zig:316 | 3 | a table entry (switch/range arm) — the codec or classification table
@@ -178,17 +177,17 @@ src/data/sym_planes/custody.zig:379 | 3 | OWED: derive it or document it on the 
 src/data/sym_planes/custody.zig:383 | 4 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/custody.zig:398 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/custody.zig:402 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/data_bitmap.zig:309 | 63 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/data_bitmap.zig:309 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/data_bitmap.zig:362 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/data_bitmap.zig:500 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/data_bitmap.zig:578 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/data_bitmap.zig:596 | 64 | OWED: derive it or document it on the line (charter §1.5)
-src/data/sym_planes/data_bitmap.zig:606 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/data_bitmap.zig:706 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/data_bitmap.zig:784 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/data_bitmap.zig:784 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/data/sym_planes/data_bitmap.zig:789 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/data_bitmap.zig:322 | 63 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/data_bitmap.zig:322 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/data_bitmap.zig:375 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/data_bitmap.zig:513 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/data_bitmap.zig:591 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/data_bitmap.zig:609 | 64 | OWED: derive it or document it on the line (charter §1.5)
+src/data/sym_planes/data_bitmap.zig:619 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/data_bitmap.zig:719 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/data_bitmap.zig:797 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/data_bitmap.zig:797 | 64 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/data/sym_planes/data_bitmap.zig:802 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/records.zig:84 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/records.zig:85 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/data/sym_planes/records.zig:86 | 0x11 | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
@@ -300,8 +299,8 @@ src/meta/alloc_ext.zig:323 | 64 | OWED: derive it or document it on the line (ch
 src/meta/alloc_ext.zig:370 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/alloc_ext.zig:687 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/bset.zig:628 | 4 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/checkpoint_cycle.zig:678 | 1000 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/checkpoint_cycle.zig:679 | 1000 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/checkpoint_cycle.zig:685 | 1000 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/checkpoint_cycle.zig:686 | 1000 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/conveyor.zig:568 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/conveyor.zig:569 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/conveyor.zig:569 | 8 | OWED: derive it or document it on the line (charter §1.5)
@@ -488,8 +487,8 @@ src/meta/sym/tokens/token_table.zig:151 | 9 | OWED: derive it or document it on 
 src/meta/sym/tokens/token_table.zig:152 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:152 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:153 | 11 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/wire_plane.zig:233 | 3 | a table entry (switch/range arm) — the codec or classification table
-src/meta/sym/wire_plane.zig:234 | 4 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:252 | 3 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:253 | 4 | a table entry (switch/range arm) — the codec or classification table
 src/meta/sym/xv/applier.zig:295 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/xv/intent.zig:152 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/intent.zig:183 | 8 | OWED: derive it or document it on the line (charter §1.5)

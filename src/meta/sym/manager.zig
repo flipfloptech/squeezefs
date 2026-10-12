@@ -398,6 +398,12 @@ pub const ControlRecord = union(enum) {
     alloc: u64,
     /// A kind-4 `free(extent, retire 0)` delta — immediately reusable.
     free: u64,
+    /// A kind-5 data-allocation RUN delta of the holder's bitmap
+    /// (`data/sym_planes/records.zig`: `vol_tag ‖ start` → `{tag, len,
+    /// term}`), journaled into ring 0 so a successor's fold re-learns the
+    /// carve the page did not yet carry (charter §5.5 "mutations are
+    /// `vol_tag`-prefixed deltas in the holder's ring").
+    data_delta: struct { key: []const u8, value: []const u8 },
 };
 
 pub const KeyValue = struct { key: []u8, value: []u8 };
@@ -1528,6 +1534,8 @@ pub const TestVolume = struct {
     bits: []bool,
     ring0_head: u64 = 1000,
     control_entries: u64 = 0,
+    /// Kind-5 data deltas the entries carried (the page sink's ring).
+    data_deltas: u64 = 0,
     barriers: u64 = 0,
     zeroed_bytes: u64 = 0,
     /// Seams: refuse the next N control entries with a full window; the
@@ -1680,6 +1688,7 @@ pub const TestVolume = struct {
             .delete => |k| self.del(k),
             .alloc => |e| self.bits[@intCast(e)] = true,
             .free => |e| self.bits[@intCast(e)] = false,
+            .data_delta => self.data_deltas += 1,
         };
         self.control_entries += 1;
         self.barriers += 1;

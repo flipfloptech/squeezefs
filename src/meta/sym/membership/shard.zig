@@ -803,10 +803,21 @@ pub const OwnerRegistrations = struct {
 // The owner's wire face: the four membership verbs on the ONE listener.
 // ---------------------------------------------------------------------------
 
+/// The renewal's window declarations' target (charter §5.5 "every live
+/// writer declares its held windows on each renewal"): the allocation
+/// holder of the declared volume adopts them (`plane_arm.HolderPlane.
+/// declareWindows`). Null = no holder plane in this process.
+pub const WindowSink = struct {
+    ctx: *anyopaque,
+    declare: *const fn (ctx: *anyopaque, identity: WireIdentity, vol_tag: u64, ranges: []align(1) const verbs.GrantRunWire) void,
+};
+
 pub const OwnerService = struct {
     owner: *Owner,
     /// The data volumes the renewal's window declarations are screened by.
     data_volumes: []const screen.DataVolumeBounds = &.{},
+    /// Where a screened, granted renewal's declarations go.
+    windows: ?WindowSink = null,
     /// The owner's monotonic clock in ms (tests inject a manual one).
     now: *const fn (ctx: ?*anyopaque) u64,
     now_ctx: ?*anyopaque = null,
@@ -896,6 +907,13 @@ pub const OwnerService = struct {
         const now_ms = self.now(self.now_ctx);
         return switch (self.owner.renew(r.head.id, r.head.epoch, r.head.acked_free_epoch, now_ms)) {
             .granted => |g| blk: {
+                // The declarations of a LIVE member (the renewal granted
+                // is the liveness proof): one per data volume, screened
+                // above, to the holder.
+                if (self.windows) |ws| if (memberIdentity(r.head.id)) |identity| {
+                    var it = r.windows();
+                    while (it.next()) |w| ws.declare(ws.ctx, identity, w.vol_tag, w.ranges);
+                };
                 const a = self.grant(g, now_ms, r.head.id, scratch);
                 break :blk switch (a) {
                     .ok => |rep| .{ .ok = .{ .renew = rep.join } },

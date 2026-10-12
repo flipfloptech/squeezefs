@@ -404,7 +404,9 @@ pub fn volumePopulation(store: RefStore, gpa: Allocator, vol_tag: u64, idxs: *st
             try idxs.append(gpa, k.blockIdx());
             total += 1;
         }
-        if (page.items.len < SCAN_PAGE) break;
+        // A page shorter than the cap may still be followed (a forest's
+        // merged page is cut at the smallest full tree's last key): only
+        // an EMPTY page ends the scan.
         cursor = key.sameKindSuccessor(page.items[page.items.len - 1].key) orelse break;
     }
     if (total == 0) {
@@ -764,7 +766,6 @@ fn volumePopulationQuiet(store: RefStore, gpa: Allocator, vol_tag: u64, idxs: *s
             try idxs.append(gpa, k.blockIdx());
             total += 1;
         }
-        if (page.items.len < SCAN_PAGE) break;
         cursor = key.sameKindSuccessor(page.items[page.items.len - 1].key) orelse break;
     }
     return total;

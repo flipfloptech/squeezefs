@@ -709,6 +709,7 @@ pub const AppenderSet = struct {
                 alloc_keys.appendAssumeCapacity(alloc_ext.extentKey(e));
                 try frames.append(gpa, .{ .tag = key.tagFor(alloc_ext.tree_alloc_reserved, 0), .key = &alloc_keys.items[alloc_keys.items.len - 1], .kind = .put, .seq = 0, .value = &alloc_ext.freeRecordValue(0) });
             },
+            .data_delta => |d| try frames.append(gpa, .{ .tag = key.tagFor(key.TREE_DATA_ALLOC_RESERVED, 0), .key = d.key, .kind = .put, .seq = 0, .value = d.value }),
         };
         if (frames.items.len == 0) return;
         const len = journal.entryLenFor(frames.items) catch return error.ValueTooLarge;

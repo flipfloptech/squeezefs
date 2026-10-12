@@ -628,69 +628,18 @@ pub const VolumeBinding = struct {
     }
 
     fn foldOneBitmap(self: *VolumeBinding, vol_tag: u64, lease: cr.AllocLease, refs: []const records.BitmapRef, deltas: []const data_bitmap.DataBitmap.ReplayRecord) Error!void {
-        const gpa = self.gpa;
         const be = self.be;
         const heaps = [_]data_bitmap.HeapGeometry{.{ .vol = be.index, .heap_start = be.sb.heap.start, .heap_len = be.sb.heap.len, .node_size = be.sb.node_size }};
         if (!data_bitmap.screenBitmapRefs(refs, lease.blocks, &heaps)) return error.Corrupt;
-        const alloc = block_alloc.BlockAllocator.init(gpa, .{ .vol_tag = vol_tag, .vol = 0, .capacity_bytes = lease.blocks * block_alloc.CHUNK_SIZE }) catch return error.OutOfMemory;
-        defer alloc.deinit();
-        // The fold re-journals every surviving bit as the holder's own
-        // set/clear; no journal is bound here (the pages ARE the durable
-        // outcome), so the ring must hold every folded block at once.
-        var folded_blocks: u64 = 0;
-        for (deltas) |d| {
-            const dd = records.decodeDelta(d.value) catch continue;
-            folded_blocks += dd.len;
-        }
-        const bm = data_bitmap.DataBitmap.init(gpa, alloc, .{ .vol_tag = vol_tag, .term = lease.term, .blocks = lease.blocks, .ring_capacity = @intCast(@min(@max(folded_blocks, 1), lease.blocks)) }) catch return error.OutOfMemory;
-        defer bm.deinit();
         var io: DeviceRegion = .{ .be = be };
-        const image = data_bitmap.readRegionImage(gpa, io.io(), refs, lease.blocks) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Io => error.Io,
-            error.GrantExhausted, error.TooManyRefs => error.Corrupt,
-        };
-        defer gpa.free(image);
-        _ = bm.loadRegionImage(image) catch |e| return switch (e) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.TornPage => error.Corrupt,
-        };
-        const changed = try bm.replay(deltas, lease.term);
-        if (changed == 0) return;
-        var set_ = try bm.takeDirtyPlan(be.cp.checkpointSeq() + 1);
-        defer set_.deinit();
-        for (set_.writes) |*w| {
-            const dev_off = regionToDevice(refs, w.offset) orelse {
-                set_.abort(bm);
-                return error.Corrupt;
-            };
-            be.pool.writeAt(be.path, dev_off, &w.image) catch {
-                set_.abort(bm);
-                return error.Io;
-            };
-        }
-        be.dev.barrier() catch {
-            set_.abort(bm);
-            return error.Io;
-        };
-        set_.commit(bm);
-        stats.recovery_data_bitmap_pages_written.add(set_.writes.len);
+        const out = try data_bitmap.foldOntoRegion(self.gpa, io.io(), refs, vol_tag, lease.blocks, lease.term, deltas, be.cp.checkpointSeq() + 1);
+        if (out.bits_changed == 0) return;
+        stats.recovery_data_bitmap_pages_written.add(out.pages_written);
         stats.recovery_data_bitmaps_replayed.inc();
     }
 
-    /// A region-image offset onto the device through the refs (the image
-    /// is the refs' bytes in order).
-    fn regionToDevice(refs: []const records.BitmapRef, offset: u64) ?u64 {
-        var acc: u64 = 0;
-        for (refs) |r| {
-            if (offset < acc + r.len) return r.start + (offset - acc);
-            acc += r.len;
-        }
-        return null;
-    }
-
     /// The home volume's device face for the pages.
-    const DeviceRegion = struct {
+    pub const DeviceRegion = struct {
         be: *KvBackend,
 
         const vt: data_bitmap.RegionIo.VTable = .{ .write = &write, .read = &read, .barrier = &barrier };

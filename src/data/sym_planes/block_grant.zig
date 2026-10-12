@@ -159,10 +159,18 @@ pub const stats = struct {
     // ≡ released + adopted + pending`).
     pub var data_alloc_bitmap_leaks_deferred: counters.ShardedCounter = .{};
     pub var data_alloc_bitmap_leaks_released: counters.ShardedCounter = .{};
+    pub var data_alloc_bitmap_leaks_referenced: counters.ShardedCounter = .{};
     pub var data_alloc_bitmap_leaks_adopted: counters.ShardedCounter = .{};
     pub var data_alloc_bitmap_decls_screened: counters.ShardedCounter = .{};
     /// Must-stay-0: a poisoned window declaration.
     pub var data_alloc_bitmap_decls_rejected: counters.Tripwire = .init("data_alloc_bitmap_decls_rejected");
+    /// Blocks of a LIVE writer's declared window that read CLEAR at the
+    /// successor — a carve the predecessor's page never carried and its
+    /// ring did not fold (the KVDA page sink's fallback): SET again under
+    /// the successor's term and adopted. 0 when the pages landed.
+    pub var block_grant_relearned_from_windows: counters.ShardedCounter = .{};
+    /// Declarations the holder folded (`syncWriter` + adopt per renewal).
+    pub var block_grant_windows_declared: counters.ShardedCounter = .{};
     /// Levels.
     pub var block_grant_window_remaining: counters.Gauge = .{};
     pub var data_alloc_bitmap_leaks_pending: counters.Gauge = .{};
@@ -674,10 +682,19 @@ pub const HolderGrants = struct {
 
     /// `BlockGrant{writer, want, held_unconsumed}`: `want == 0` ⇒ the
     /// derivation at the floor; else the holder CAPS the writer's named
-    /// want; carve → drain → the reply. A refused drain gives the bits back
+    /// want; drain → carve → drain → the reply. The first drain makes room
+    /// for the carve's SET (a free storm's CLEARs queued since the last
+    /// drain); a ring still full after it — the window full, or another
+    /// drainer mid-flight — defers the grant WITHOUT moving a bit (the
+    /// writer's retry class). A refused second drain gives the bits back
     /// and answers `deferred`.
     pub fn blockGrant(self: *HolderGrants, writer: u32, want: u64, held_unconsumed: u64) GrantReply {
         const w = if (want == 0) deriveGrant(0, BEAT_MAX_MS, self.bitmap.blocks(), self.writers()) else capGrant(want, self.bitmap.blocks(), self.writers());
+        _ = self.bitmap.drain();
+        if (self.bitmap.ringFull()) {
+            stats.block_grant_deferred.inc();
+            return .deferred;
+        }
         switch (self.ledger.carve(self.bitmap, writer, w, held_unconsumed)) {
             .already => |g| return .{ .granted = .{ .grants = g, .already = true, .word = self.word() } },
             .full => return .{ .full = self.word() },
@@ -957,6 +974,8 @@ pub const DeferredLeaks = struct {
     deferred: u64 = 0,
     released: u64 = 0,
     adopted: u64 = 0,
+    /// Candidates the exact census referenced after all: never leaks.
+    referenced: u64 = 0,
 
     pub fn init(gpa: Allocator, blocks: u64) Allocator.Error!DeferredLeaks {
         const words = try gpa.alloc(u64, @intCast((blocks + 63) / 64));
@@ -994,54 +1013,91 @@ pub const DeferredLeaks = struct {
         stats.data_alloc_bitmap_leaks_pending.set(self.pendingCount());
     }
 
-    /// A live writer's screened declaration: the PENDING ∩ range blocks
-    /// whose bits are SET are ADOPTED into the ledger under the writer's
-    /// name as runs (its death revokes them, its leave returns them).
-    pub fn adoptDeclared(self: *DeferredLeaks, ledger: *Ledger, bitmap: *const DataBitmap, writer: u32, ranges: []const BlockGrant) u64 {
-        var adopted: u64 = 0;
+    pub const Adopted = struct { adopted: u64, relearned: u64 };
+
+    /// A live writer's screened declaration (charter §5.5 "every live
+    /// writer declares its held windows on each renewal so a successor
+    /// adopts/releases a crashed incarnation's bits"): over each range,
+    /// a PENDING ∩ SET block is ADOPTED (the leak candidate was a live
+    /// window), a CLEAR block is RE-LEARNT — SET + journaled under this
+    /// holder's term (`block_grant_relearned_from_windows`: a carve the
+    /// pages never carried) — and every block of the range not already
+    /// granted enters the ledger under the writer's name as runs (its
+    /// death revokes them, its leave returns them). A block already set
+    /// and not pending (minted, referenced) is the writer's own and moves
+    /// nothing.
+    pub fn adoptDeclared(self: *DeferredLeaks, ledger: *Ledger, bitmap: *DataBitmap, writer: u32, ranges: []const BlockGrant) Adopted {
+        var out: Adopted = .{ .adopted = 0, .relearned = 0 };
         for (ranges) |r| {
             var run_start: ?u64 = null;
             var idx = r.start;
             while (idx <= r.end()) : (idx += 1) {
-                const take = idx < r.end() and self.isPending(idx) and bitmap.isSet(idx) and !ledger.isGranted(idx);
+                var take = false;
+                if (idx < r.end() and !ledger.isGranted(idx)) {
+                    if (!bitmap.isSet(idx)) {
+                        if (bitmap.setRun(idx, 1) == 1) out.relearned += 1;
+                        self.clearPending(idx);
+                        take = true;
+                    } else if (self.isPending(idx)) {
+                        self.clearPending(idx);
+                        out.adopted += 1;
+                        take = true;
+                    }
+                }
                 if (take) {
                     if (run_start == null) run_start = idx;
-                    self.clearPending(idx);
-                    adopted += 1;
-                } else if (run_start) |s| {
-                    _ = ledger.adopt(writer, .{ .start = s, .len = @intCast(idx - s) });
+                } else if (run_start) |st| {
+                    _ = ledger.adopt(writer, .{ .start = st, .len = @intCast(idx - st) });
                     run_start = null;
                 }
             }
         }
-        self.adopted += adopted;
-        stats.data_alloc_bitmap_leaks_adopted.add(adopted);
+        self.adopted += out.adopted;
+        stats.data_alloc_bitmap_leaks_adopted.add(out.adopted);
+        stats.block_grant_relearned_from_windows.add(out.relearned);
         stats.data_alloc_bitmap_leaks_pending.set(self.pendingCount());
-        return adopted;
+        return out;
     }
 
-    /// Once every live peer declared (`all_declared`), the remainder is
-    /// released: bit CLEAR + delta, ascending.
-    pub fn convergeDeferred(self: *DeferredLeaks, bitmap: *DataBitmap, all_declared: bool) u64 {
-        if (!all_declared) return 0;
-        var released: u64 = 0;
-        for (self.pending, 0..) |*w, wi| {
+    pub const Converged = struct { released: u64, referenced: u64 };
+
+    /// The remainder's verdict under an EXACT census — the holder's own
+    /// refs scan when it is the ONLY writer (every peer departed, or dead
+    /// and recovered into the holder's trees): a pending block nothing
+    /// references is RELEASED (bit CLEAR + delta, ascending); one the
+    /// census does reference was never a leak and leaves `pending`
+    /// (`data_alloc_bitmap_leaks_referenced`). While another writer is
+    /// live the holder's census is a projection of that writer's trees
+    /// (its unflushed publishes are invisible here), so no release runs
+    /// — a leak costs space, a release of a live block costs data; the
+    /// remainder is reported and fsck C6 counts it.
+    pub fn convergeDeferred(self: *DeferredLeaks, bitmap: *DataBitmap, referenced: []const u64) Converged {
+        assert(referenced.len == self.pending.len);
+        var out: Converged = .{ .released = 0, .referenced = 0 };
+        for (self.pending, referenced, 0..) |*w, refd, wi| {
             var bits = w.*;
             while (bits != 0) : (bits &= bits - 1) {
-                const idx = @as(u64, wi) * 64 + @ctz(bits);
-                if (bitmap.isSet(idx)) released += bitmap.clearRun(idx, 1);
+                const idx = @as(u64, wi) * 64 + @ctz(bits); // 64 bits per word
+                const bit = @as(u64, 1) << @intCast(idx % 64); // the bit inside its word
+                if (refd & bit != 0) {
+                    out.referenced += 1;
+                } else if (bitmap.isSet(idx)) {
+                    out.released += bitmap.clearRun(idx, 1);
+                }
             }
             w.* = 0;
         }
-        self.released += released;
-        stats.data_alloc_bitmap_leaks_released.add(released);
+        self.released += out.released;
+        self.referenced += out.referenced;
+        stats.data_alloc_bitmap_leaks_released.add(out.released);
+        stats.data_alloc_bitmap_leaks_referenced.add(out.referenced);
         stats.data_alloc_bitmap_leaks_pending.set(0);
-        return released;
+        return out;
     }
 
-    /// `deferred ≡ released + adopted + pending`.
+    /// `deferred ≡ released + adopted + referenced + pending`.
     pub fn closureHolds(self: *const DeferredLeaks) bool {
-        return self.deferred == self.released + self.adopted + self.pendingCount();
+        return self.deferred == self.released + self.adopted + self.referenced + self.pendingCount();
     }
 };
 
@@ -1340,8 +1396,6 @@ test "a_poisoned_window_declaration_is_refused_before_any_walk; a crashed incarn
     dl.deferLeaks(leaks.items);
     try testing.expectEqual(@as(u64, 128), dl.pendingCount());
     try testing.expect(dl.closureHolds());
-    // Not yet converged: a live peer has not declared.
-    try testing.expectEqual(@as(u64, 0), dl.convergeDeferred(bm, false));
     // Writer 2's declaration (its window 8..72, minus 4 minted-unpublished
     // in flight at 8..12 that it also declares): screened, then adopted.
     const decl = [_]BlockGrant{ .{ .start = 8, .len = 4 }, .{ .start = 12, .len = 60 } };
@@ -1365,13 +1419,17 @@ test "a_poisoned_window_declaration_is_refused_before_any_walk; a crashed incarn
         try log.testing.expectAllFired();
     }
     try testing.expectEqual(rej0 + 5, counters.tripwireCount("data_alloc_bitmap_decls_rejected"));
-    try testing.expectEqual(@as(u64, 64), dl.adoptDeclared(&h.ledger, bm, 2, &decl));
+    try testing.expectEqual(@as(u64, 64), dl.adoptDeclared(&h.ledger, bm, 2, &decl).adopted);
     try testing.expect(h.ledger.isGranted(8) and h.ledger.isGranted(71) and !h.ledger.isGranted(72));
     try testing.expectEqual(@as(u64, 72), h.ledger.grantFrontier());
     try testing.expectEqual(@as(u64, 64), dl.pendingCount());
     try testing.expect(dl.closureHolds());
-    // Every live peer declared: the remainder (the dead writer's 72..136) is released.
-    try testing.expectEqual(@as(u64, 64), dl.convergeDeferred(bm, true));
+    // The holder alone (the dead writer recovered, writer 2 departed):
+    // the exact census references none of the remainder (the dead
+    // writer's 72..136) — released.
+    const converged = dl.convergeDeferred(bm, &referenced);
+    try testing.expectEqual(@as(u64, 64), converged.released);
+    try testing.expectEqual(@as(u64, 0), converged.referenced);
     try testing.expect(!bm.isSet(72) and !bm.isSet(135) and bm.isSet(71));
     try testing.expectEqual(@as(u64, 0), dl.pendingCount());
     try testing.expect(dl.closureHolds());
@@ -1385,6 +1443,108 @@ test "a_poisoned_window_declaration_is_refused_before_any_walk; a crashed incarn
     try testing.expectEqual(@as(u64, 0), h.revokeDeadWriter(3, 1));
     // The adopted writer's leave returns the adopted blocks.
     try testing.expectEqual(@as(u64, 64), h.ledger.releaseWriter(bm, 2));
+}
+
+test "THE KVDA PAGE SINK'S TWO OUTCOMES (rung 10 item 2): a holder carves two grants, its pages land at the cadence, a third carve lands only in its ring; it dies. The successor that folds page + ring starts with every granted bit SET and the live writer's declaration RE-LEARNS NOTHING (adopted = the window, relearned 0); a successor whose predecessor's page never landed (the fallback) re-learns exactly the declared blocks the page did not carry — SET under its own term, journaled, adopted — and the counter reads them" {
+    const gpa = testing.allocator;
+    // The predecessor: 512 blocks, three carves to writer 7 (the first two
+    // on the page, the third in the ring only).
+    const a = try testAlloc(512);
+    defer a.deinit();
+    const pred = try testBitmap(a);
+    defer pred.deinit();
+    var ring: data_bitmap.RamJournal = .{ .gpa = gpa };
+    defer ring.deinit();
+    pred.journal = ring.sink();
+    var h: HolderGrants = .{ .ledger = try Ledger.init(gpa, 16), .bitmap = pred };
+    defer h.ledger.deinit();
+    const g1 = h.blockGrant(7, 64, 0).granted.grants.buf[0];
+    const g2 = h.blockGrant(7, 64, 0).granted.grants.buf[0];
+    const region = try gpa.alloc(u8, @intCast(data_bitmap.regionLen(512)));
+    defer gpa.free(region);
+    @memset(region, 0);
+    var set1 = try pred.takeDirtyPlan(5);
+    defer set1.deinit();
+    set1.applyToRegion(pred, region);
+    const g3 = h.blockGrant(7, 64, 0).granted.grants.buf[0];
+    try testing.expectEqual(@as(usize, 0), pred.queuedDeltas()); // every carve drained before its reply
+    const recs = try ring.replayRecords(gpa);
+    defer data_bitmap.RamJournal.freeReplay(gpa, recs);
+    // The writer minted 10 of g1 and declares the rest of all three.
+    const decl = [_]BlockGrant{ .{ .start = g1.start + 10, .len = g1.len - 10 }, .{ .start = g2.start, .len = g2.len }, .{ .start = g3.start, .len = g3.len } };
+    try testing.expect(screenWindowDecl(&decl, 512));
+    const relearned0 = stats.block_grant_relearned_from_windows.load();
+
+    // Successor 1: page + ring fold.
+    {
+        const sa = try testAlloc(512);
+        defer sa.deinit();
+        const s = try DataBitmap.init(gpa, sa, .{ .vol_tag = 0x61, .term = 2, .blocks = 512, .ring_capacity = data_bitmap.ringCapacity(BLOCK_GRANT_FLOOR, 4, 64) });
+        defer s.deinit();
+        var sj: data_bitmap.RamJournal = .{ .gpa = gpa };
+        defer sj.deinit();
+        s.journal = sj.sink();
+        _ = try s.loadRegionImage(region);
+        try testing.expectEqual(@as(u64, 128), s.populationNow());
+        _ = try s.replay(recs, 1);
+        try testing.expectEqual(@as(u64, 192), s.populationNow());
+        var sh: HolderGrants = .{ .ledger = try Ledger.init(gpa, 16), .bitmap = s };
+        defer sh.ledger.deinit();
+        var dl = try DeferredLeaks.init(gpa, 512);
+        defer dl.deinit();
+        var leaks: std.ArrayList(u64) = .empty;
+        defer leaks.deinit(gpa);
+        var referenced: [8]u64 = @splat(0);
+        var granted: [8]u64 = @splat(0);
+        const drift = try s.verifyBitmap(&referenced, &granted, &leaks);
+        try testing.expectEqual(@as(u64, 192), drift.leak);
+        dl.deferLeaks(leaks.items);
+        const out = dl.adoptDeclared(&sh.ledger, s, 7, &decl);
+        try testing.expectEqual(@as(u64, 182), out.adopted);
+        try testing.expectEqual(@as(u64, 0), out.relearned);
+        try testing.expectEqual(@as(u64, 10), dl.pendingCount()); // the 10 minted-unreferenced blocks
+        try testing.expectEqual(@as(usize, 0), sj.entries.items.len); // nothing re-journaled
+        try testing.expect(sh.ledger.isGranted(g3.start) and sh.ledger.isGranted(g3.end() - 1));
+    }
+    // Successor 2: the page alone (the ring never folded — a carve the
+    // page did not carry): g3's 64 blocks read CLEAR and are re-learnt.
+    {
+        const sa = try testAlloc(512);
+        defer sa.deinit();
+        const s = try DataBitmap.init(gpa, sa, .{ .vol_tag = 0x61, .term = 2, .blocks = 512, .ring_capacity = data_bitmap.ringCapacity(BLOCK_GRANT_FLOOR, 4, 64) });
+        defer s.deinit();
+        var sj: data_bitmap.RamJournal = .{ .gpa = gpa };
+        defer sj.deinit();
+        s.journal = sj.sink();
+        _ = try s.loadRegionImage(region);
+        try testing.expectEqual(@as(u64, 128), s.populationNow());
+        var sh: HolderGrants = .{ .ledger = try Ledger.init(gpa, 16), .bitmap = s };
+        defer sh.ledger.deinit();
+        var dl = try DeferredLeaks.init(gpa, 512);
+        defer dl.deinit();
+        var leaks: std.ArrayList(u64) = .empty;
+        defer leaks.deinit(gpa);
+        var referenced: [8]u64 = @splat(0);
+        var granted: [8]u64 = @splat(0);
+        _ = try s.verifyBitmap(&referenced, &granted, &leaks);
+        dl.deferLeaks(leaks.items);
+        const out = dl.adoptDeclared(&sh.ledger, s, 7, &decl);
+        try testing.expectEqual(@as(u64, 118), out.adopted);
+        try testing.expectEqual(@as(u64, 64), out.relearned);
+        try testing.expectEqual(@as(u64, 192), s.populationNow());
+        try testing.expect(s.isSet(g3.start) and s.isSet(g3.end() - 1));
+        // Every re-learnt bit was journaled under the successor's term
+        // (the holder drains at the declaration).
+        try testing.expectEqual(DataBitmap.DrainOutcome.drained, s.drain());
+        var journaled: u64 = 0;
+        for (sj.entries.items) |e| {
+            try testing.expect(e.delta.set and e.delta.term == 2);
+            journaled += e.delta.len;
+        }
+        try testing.expectEqual(@as(u64, 64), journaled);
+        try testing.expect(sh.ledger.isGranted(g3.start));
+        try testing.expectEqual(relearned0 + 64, stats.block_grant_relearned_from_windows.load());
+    }
 }
 
 test "held_block_ranges: the declaration is the unconsumed window plus the in-flight registrations, coalesced ascending" {
@@ -1406,6 +1566,53 @@ test "held_block_ranges: the declaration is the unconsumed window plus the in-fl
     try testing.expectEqual(BlockGrant{ .start = 20, .len = 2 }, out.items[1]);
     try testing.expectEqual(BlockGrant{ .start = 50, .len = 1 }, out.items[2]);
     try testing.expect(screenWindowDecl(out.items, 128));
+}
+
+test "the grant drains BEFORE it carves (rung 10): a ring filled by a free storm under a refusing window defers the grant without moving a bit and without the SET tripwire; once the window admits, the next ask drains the storm's CLEARs and carves" {
+    const gpa = testing.allocator;
+    const a = try testAlloc(1024);
+    defer a.deinit();
+    // Capacity 2: the storm's CLEARs (two separated runs) fill it.
+    const bm = try DataBitmap.init(gpa, a, .{ .vol_tag = 0x62, .term = 1, .blocks = 1024, .ring_capacity = 2 });
+    defer bm.deinit();
+    var j: data_bitmap.RamJournal = .{ .gpa = gpa };
+    defer j.deinit();
+    bm.journal = j.sink();
+    var h: HolderGrants = .{ .ledger = try Ledger.init(gpa, 16), .bitmap = bm };
+    defer h.ledger.deinit();
+    // Two runs minted and freed again while the window refuses: the ring
+    // holds exactly their two CLEARs.
+    try testing.expectEqual(@as(u32, 64), bm.setRun(0, 64));
+    try testing.expectEqual(@as(u32, 64), bm.setRun(128, 64));
+    try testing.expectEqual(DataBitmap.DrainOutcome.drained, bm.drain());
+    // The window refuses the next entry (the ask's pre-drain).
+    j.refuse_next = 1;
+    try testing.expectEqual(@as(u32, 64), bm.clearRun(0, 64));
+    try testing.expectEqual(@as(u32, 64), bm.clearRun(128, 64));
+    try testing.expectEqual(@as(usize, 2), bm.queuedDeltas());
+    try testing.expect(bm.ringFull());
+    const trip0 = counters.tripwireCount("data_alloc_bitmap_set_dropped");
+    const deferred0 = stats.block_grant_deferred.load();
+    const grants0 = stats.block_grants.load();
+    const pop0 = bm.populationNow();
+    // The ask: the first drain is refused, the ring stays full, the grant
+    // defers — no carve, no tripwire, the table empty.
+    try testing.expect(h.blockGrant(7, 0, 0) == .deferred);
+    try testing.expectEqual(deferred0 + 1, stats.block_grant_deferred.load());
+    try testing.expectEqual(grants0, stats.block_grants.load());
+    try testing.expectEqual(pop0, bm.populationNow());
+    try testing.expectEqual(trip0, counters.tripwireCount("data_alloc_bitmap_set_dropped"));
+    try testing.expectEqual(@as(u64, 0), h.ledger.openCount());
+    // The window admits: the next ask drains the two CLEARs, carves, and
+    // journals its SET before the reply.
+    const r = h.blockGrant(7, 0, 0);
+    try testing.expect(r == .granted);
+    try testing.expectEqual(@as(u64, 64), r.granted.grants.slice()[0].len);
+    // The two mints' SETs, then the storm's two CLEARs, then the carve.
+    try testing.expectEqual(@as(usize, 5), j.entries.items.len);
+    try testing.expect(!j.entries.items[2].delta.set and !j.entries.items[3].delta.set and j.entries.items[4].delta.set);
+    try testing.expectEqual(@as(usize, 0), bm.queuedDeltas());
+    try testing.expectEqual(trip0, counters.tripwireCount("data_alloc_bitmap_set_dropped"));
 }
 
 test "the aging store (rung 9 F17): a holder's own window over a fragmented volume under sustained overwrite — every consumed grant retires at the next ask, the table never fills, no mint reads an empty window as StorageFull while a clear bit remains (the shipped ledger kept 1,024 consumed slots: `block_grant_deferred` 7,669 and 96 ENOSPC per leg at 25 % fill)" {

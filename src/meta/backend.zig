@@ -117,6 +117,8 @@ const routing = @import("routing.zig");
 const slot_state = routing.slot_state;
 const stamp_cell = routing.stamp_cell;
 const sym = @import("sym.zig");
+const data_bitmap = @import("../data/sym_planes/data_bitmap.zig");
+const sym_records = @import("../data/sym_planes/records.zig");
 const slots_plane = @import("sym/slots/plane.zig");
 const manager = @import("sym/manager.zig");
 const endpoint = @import("../wire/endpoint.zig");
@@ -418,7 +420,31 @@ pub const KvBackend = struct {
     /// The slot-lease plane: the commit door from the first commit (its
     /// cutover state serves every volume), armed by the appender set.
     slots: *slots_plane.Plane,
+    /// THE KEPT WINDOW (`sym_data_planes.md` §2.6): the kind-5 data-
+    /// allocation deltas the mount's replay met in the fixed ring, kept
+    /// because the bring-up checkpoint advances the tail past them BEFORE
+    /// any allocation lease is re-held — the same-node successor of a
+    /// dead manager folds them onto its predecessor's `KVDA` pages. Owned
+    /// copies; consumed by the data planes' arm or dropped at `close`.
+    kept_data_deltas: std.ArrayList(KeptDelta) = .empty,
+    /// The data allocation bitmaps' page sink (the holder plane's), run at
+    /// the cycle's C6 before barrier #1; installed and cleared under
+    /// `smo_lock` (the cycle runs under it), so the task never reads a
+    /// torn seam. Null until the holder plane arms, and on a joiner.
+    kvda_sink: ?KvdaSink = null,
+    /// `SQUEEZEFS_TEST_KVDA_PAGE_SKIP`: the cycle skips the sink (the
+    /// fallback kill row), read once at the open.
+    kvda_pages_skipped: bool = false,
     closed: bool = false,
+
+    pub const KeptDelta = struct { seq: u64, key: [sym_records.DELTA_KEY_LEN]u8, value: [sym_records.DELTA_LEN]u8 };
+
+    /// `checkpoint_cycle.RecordSource.dataPages`' target: every held
+    /// bitmap's dirty pages written through its refs at `generation`.
+    pub const KvdaSink = struct {
+        ctx: *anyopaque,
+        writePages: *const fn (ctx: *anyopaque, generation: u64) checkpoint_cycle.IoError!void,
+    };
 
     // ---- open ----
 
@@ -577,6 +603,9 @@ pub const KvBackend = struct {
             }
         }
         be.replay.content_records = content_records;
+        be.kvda_pages_skipped = knobs.boolKnob("SQUEEZEFS_TEST_KVDA_PAGE_SKIP", opts.env);
+        try be.keepDataDeltas(recovery.entries);
+        errdefer be.kept_data_deltas.deinit(gpa);
         {
             var roots_buf: std.ArrayList(u64) = .empty;
             defer roots_buf.deinit(gpa);
@@ -657,7 +686,7 @@ pub const KvBackend = struct {
             .barrier = be.dev.barrierSink(),
             .ledger = .{ .ctx = be, .writeSlot = ledgerSlotHook },
             .pages = be.dev.pageSink(),
-            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .appenderPages = if (sb.symmetricPlaneStamped()) appenderPagesHook else null },
+            .record = .{ .ctx = be, .treeRoots = treeRootsFn, .next_ino = &be.ino, .node_seq = &be.seq, .membershipStamp = stampForLedger, .publishGuestRoots = publishGuestRootsHook, .appenderPages = if (sb.symmetricPlaneStamped()) appenderPagesHook else null, .dataPages = if (sb.symmetricPlaneStamped()) dataPagesHook else null },
             .smo = be.ckpt_seam.seam(),
             .maintenance = .{ .ctx = be, .pop = popMaintenance, .pending = maintenancePending, .requeue = requeueMaintenance },
         });
@@ -1597,6 +1626,48 @@ pub const KvBackend = struct {
         return set.onCheckpoint(rec, cache_clean);
     }
 
+    /// `checkpoint_cycle.RecordSource.dataPages`: the held `KVDA` pages
+    /// through the installed sink (the cycle holds `smo_lock`, the seam's
+    /// own lock).
+    fn dataPagesHook(ctx: *anyopaque, generation: u64) checkpoint_cycle.IoError!void {
+        const be: *KvBackend = @ptrCast(@alignCast(ctx));
+        const sink = be.kvda_sink orelse return;
+        if (be.kvda_pages_skipped) return;
+        return sink.writePages(sink.ctx, generation);
+    }
+
+    /// The holder plane's arm installs its page sink (null clears it at
+    /// the stop) under the SMO lock, so a cycle in flight sees the seam
+    /// whole or not at all.
+    pub fn installKvdaSink(be: *KvBackend, sink: ?KvdaSink) void {
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        be.kvda_sink = sink;
+    }
+
+    /// The window's kind-5 frames kept as owned copies (module field doc).
+    fn keepDataDeltas(be: *KvBackend, entries: []const journal.ReplayedEntry) Allocator.Error!void {
+        for (entries) |e| {
+            var it = e.records();
+            while (it.next()) |f| {
+                const t = journal.untag(f.tag);
+                if (t.level != 0 or t.tree_id != key.TREE_DATA_ALLOC_RESERVED) continue;
+                // A frame of another shape is the decoder's refusal at the
+                // fold, never a reason to drop the window here.
+                if (f.key.len != sym_records.DELTA_KEY_LEN or f.value.len != sym_records.DELTA_LEN) continue;
+                try be.kept_data_deltas.append(be.gpa, .{ .seq = f.seq, .key = f.key[0..sym_records.DELTA_KEY_LEN].*, .value = f.value[0..sym_records.DELTA_LEN].* });
+            }
+        }
+    }
+
+    /// The kept window as the bitmap's replay records (borrowing the kept
+    /// copies; the caller frees the slice alone).
+    pub fn keptDataDeltas(be: *KvBackend, gpa: Allocator) Allocator.Error![]data_bitmap.DataBitmap.ReplayRecord {
+        const out = try gpa.alloc(data_bitmap.DataBitmap.ReplayRecord, be.kept_data_deltas.items.len);
+        for (be.kept_data_deltas.items, out) |*k, *o| o.* = .{ .seq = k.seq, .key = &k.key, .value = &k.value };
+        return out;
+    }
+
     /// The threshold drain's source: the trees' queues, round-robin from
     /// the tree after the last pop so a storm on one tree never starves
     /// another's items (every queue is lock-free; the task is the one popper).
@@ -2182,8 +2253,14 @@ pub const KvBackend = struct {
     }
 
     /// Range scan over `[start, end]` of one kind; both bounds route to the
-    /// same slot tree (a slot IS a contiguous key range).
+    /// same slot tree (a slot IS a contiguous key range). The block-refs
+    /// kind is the ONE exception: a ref's slot is its OWNER's (`06 ‖ vol_tag
+    /// ‖ block_idx ‖ owner_ino ‖ …` routes by the owner at a fixed offset),
+    /// so a `(vol_tag, block_idx)` prefix range spans EVERY slot tree this
+    /// backend holds — the mount seed, the refcount probe and the census
+    /// read them all, k-way merged in key order (`rangeRefs`).
     pub fn range(be: *KvBackend, gpa: Allocator, kind: u8, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        if (kind == key.TREE_BLOCK_REFS) return be.rangeRefs(gpa, start, end, max, out);
         const t = be.treeForKey(kind, start) orelse return error.Corrupt;
         if (be.treeForKey(kind, end) != t) return error.Corrupt;
         t.range(gpa, start, end, max, out) catch |e| return switch (e) {
@@ -2191,6 +2268,45 @@ pub const KvBackend = struct {
             error.Io => error.Io,
             else => error.Corrupt,
         };
+    }
+
+    /// The refs range over every slot tree, PAGED soundly: each tree is
+    /// asked for `max`; when any tree filled its page the merged page is
+    /// cut at the SMALLEST such tree's last key (every key below it from
+    /// every tree is in hand; the keys above return on the caller's next
+    /// page from the cursor it derives from the last key), so no ref is
+    /// skipped across the tree boundary. Sorted ascending.
+    fn rangeRefs(be: *KvBackend, gpa: Allocator, start: []const u8, end: []const u8, max: usize, out: *std.ArrayList(tree.KeyValue)) Error!void {
+        const first = out.items.len;
+        var bound: ?[]const u8 = null;
+        for (be.trees.load()) |t| {
+            if (t.forest_slot == null) continue;
+            const before = out.items.len;
+            t.range(gpa, start, end, max, out) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+                else => error.Corrupt,
+            };
+            const got = out.items.len - before;
+            if (got == max and max != std.math.maxInt(usize)) {
+                const last = out.items[out.items.len - 1].key;
+                if (bound == null or key.lessThan(last, bound.?)) bound = last;
+            }
+        }
+        const page = out.items[first..];
+        std.mem.sort(tree.KeyValue, page, {}, struct {
+            fn lt(_: void, a: tree.KeyValue, b: tree.KeyValue) bool {
+                return key.lessThan(a.key, b.key);
+            }
+        }.lt);
+        if (bound) |b| {
+            var keep = page.len;
+            while (keep > 0 and key.lessThan(b, page[keep - 1].key)) : (keep -= 1) {
+                var kv = page[keep - 1];
+                kv.deinit(gpa);
+            }
+            out.items.len = first + keep;
+        }
     }
 
     /// `fsync`: the trailing coalesced barrier (every acked entry durable on
@@ -2391,6 +2507,7 @@ pub const KvBackend = struct {
         be.stamp.deinit();
         be.guest_published.deinit(gpa);
         be.guest_cursor_floors.deinit(gpa);
+        be.kept_data_deltas.deinit(gpa);
         be.cache.deinit();
         be.alloc.deinit();
         be.reg.deinit();

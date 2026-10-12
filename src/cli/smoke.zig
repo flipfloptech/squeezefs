@@ -2514,6 +2514,206 @@ test "smoke: THE KILL ROWS (c) — `appender clear` refuses a live-mounted set; 
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+// ---------------------------------------------------------------------------
+// THE KVDA PAGE SINK (charter §5.5 "pages written before barrier #1";
+// rung 10 item 2): the holder dies with a joiner's grants outstanding.
+// ---------------------------------------------------------------------------
+
+/// The joiner's first `dd` on the kill row: 200 MiB = 50 blocks over the
+/// set's two data volumes, pulled as floor grants (64 each) — far more
+/// granted than minted, so the holder dies with a wide unconsumed window.
+const kvda_dd_mib: u64 = 200;
+const kvda_dd_blocks: u64 = kvda_dd_mib / 4;
+
+/// The two outcomes of one row (`skip_pages` = `SQUEEZEFS_TEST_KVDA_PAGE_SKIP`
+/// on the dying holder): with the pages the successor re-learns nothing;
+/// without them it re-learns the joiner's window from the declaration.
+fn kvdaKillRow(skip_pages: bool) !void {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    if (skip_pages) try rig.env.put("SQUEEZEFS_TEST_KVDA_PAGE_SKIP", "1");
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    // The holder's pages: held on volume 0 and published, one per data volume.
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "its pages held on the home volume and journaled into ring 0") != null);
+        const ta = try rig.stats();
+        defer gpa.free(ta);
+        try testing.expectEqual(@as(?u64, 2), numberAfter(ta, "\"data_alloc_bitmap_holds\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"data_alloc_bitmap_successor_loads\":"));
+    }
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.node = kill_peer_node;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    // B's dd: the grants pulled from A, every carve's SET journaled into
+    // ring 0 before its reply; B's renewals DECLARE its windows and A
+    // folds them (the joiner-side grant ledger: consumed grants retire).
+    var sha1_buf: [80]u8 = undefined;
+    var sha1: []const u8 = "";
+    {
+        var script_buf: [256]u8 = undefined;
+        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "mkdir kv && dd if=/dev/urandom of=kv/one bs=1M count={d} status=none && sync kv/one && sha256sum kv/one | cut -d' ' -f1", .{kvda_dd_mib}));
+        defer gpa.free(out);
+        sha1 = try std.fmt.bufPrint(&sha1_buf, "{s}", .{std.mem.trimEnd(u8, out, "\n")});
+    }
+    const ckpts0 = blk: {
+        // B's beat declares every renewal: the holder's count climbs.
+        const ta = inner: {
+            const deadline = clock.monotonicNs() + kill_row_wait_ns;
+            while (true) {
+                const t = try rig.stats();
+                if ((numberAfter(t, "\"block_grant_windows_declared\":") orelse 0) >= 1 or clock.monotonicNs() >= deadline) break :inner t;
+                gpa.free(t);
+                sleepMs(200);
+            }
+        };
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"block_grant_blocks\":") orelse 0) >= kvda_dd_blocks);
+        try testing.expect((numberAfter(ta, "\"data_alloc_bitmap_deltas_journaled\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"block_grant_deferred\":"));
+        break :blk numberAfter(ta, "\"meta_kv_checkpoints\":") orelse 0;
+    };
+    // Two more checkpoints on A: the tail moves past every delta of the
+    // dd's carves (what a successor's kept window would otherwise fold),
+    // and — unless the seam skips them — the pages carry the carves.
+    {
+        var ckpt_buf: [48]u8 = undefined;
+        const ta = try awaitStats(rig, &.{.{ .key = "\"meta_kv_checkpoints\":", .want = ckpts0 + 2 }}, kill_row_wait_ns);
+        defer gpa.free(ta);
+        const pages = numberAfter(ta, "\"data_alloc_bitmap_pages_written\":") orelse 0;
+        if (skip_pages) try testing.expectEqual(@as(u64, 0), pages) else try testing.expect(pages >= 1);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expect((numberAfter(tb, "\"block_grant_windows_declared_by_writer\":") orelse 0) >= 1);
+        std.debug.print("\nsmoke: kvda ({s}): B's dd pulled {d} grant(s) / {d} blocks; A journaled {d} delta(s), wrote {d} page(s), folded {d} declaration(s) (open grants {s}); killing A\n", .{ if (skip_pages) "pages SKIPPED" else "pages held", numberAfter(ta, "\"block_grants\":") orelse 0, numberAfter(ta, "\"block_grant_blocks\":") orelse 0, numberAfter(ta, "\"data_alloc_bitmap_deltas_journaled\":") orelse 0, pages, numberAfter(ta, "\"block_grant_windows_declared\":") orelse 0, if (std.mem.indexOf(u8, ta, "\"open_grants\":")) |i| ta[i..@min(ta.len, i + 16)] else try std.fmt.bufPrint(&ckpt_buf, "?", .{}) });
+    }
+    // The holder dies with B's windows outstanding; B parks at T_self.
+    try rig.kill();
+    _ = try b.awaitLog("appender park: T_self reached with the home volume 0's manager unreachable — parked", 0, kill_row_wait_ns);
+    // The successor: the same-node takeover folds the kept window onto
+    // the predecessor's pages and loads them at its arm.
+    if (skip_pages) _ = rig.env.swapRemove("SQUEEZEFS_TEST_KVDA_PAGE_SKIP");
+    const mark = try rig.logLen();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(mark);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        const seg = text[mark..];
+        try testing.expect(std.mem.indexOf(u8, seg, "appender 0 Live as the manager (term 2") != null);
+        try testing.expect(std.mem.indexOf(u8, seg, "the kept window (") != null);
+        try testing.expect(std.mem.indexOf(u8, seg, "predecessor bitmap page(s) loaded through") != null);
+        try testing.expect(std.mem.indexOf(u8, seg, "no grant plane armed") == null);
+    }
+    // B's reclaim lands and its next renewal DECLARES its windows to the
+    // successor: adopted under its name.
+    {
+        const reclaimed = try awaitStats(b, &.{.{ .key = "\"appender_parked\":", .want = 0 }}, kill_row_wait_ns);
+        defer gpa.free(reclaimed);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(reclaimed, "\"appender_park_expiries\":"));
+    }
+    // The successor's first folded declaration (B's beat declares every
+    // renewal: the count climbs from 0 at the remount).
+    const ta2 = blk: {
+        const deadline = clock.monotonicNs() + kill_row_wait_ns;
+        while (true) {
+            const ta = try rig.stats();
+            if ((numberAfter(ta, "\"block_grant_windows_declared\":") orelse 0) >= 1 or clock.monotonicNs() >= deadline) break :blk ta;
+            gpa.free(ta);
+            sleepMs(200);
+        }
+    };
+    defer gpa.free(ta2);
+    std.debug.print("smoke: kvda ({s}): after the remount — successor loads {d}, folds {d}, bits loaded {d}, leaks adopted {d}, relearned {d}, declarations folded {d}, takeovers {d}; holder rows {s}\n", .{ if (skip_pages) "pages SKIPPED" else "pages held", numberAfter(ta2, "\"data_alloc_bitmap_successor_loads\":") orelse 0, numberAfter(ta2, "\"data_alloc_bitmap_predecessor_folds\":") orelse 0, numberAfter(ta2, "\"data_alloc_bitmap_bits_loaded\":") orelse 0, numberAfter(ta2, "\"data_alloc_bitmap_leaks_adopted\":") orelse 0, numberAfter(ta2, "\"block_grant_relearned_from_windows\":") orelse 0, numberAfter(ta2, "\"block_grant_windows_declared\":") orelse 0, numberAfter(ta2, "\"alloc_lease_same_node_takeovers\":") orelse 0, if (std.mem.indexOf(u8, ta2, "\"block_grant_holder\":")) |i| ta2[i..@min(ta2.len, i + 400)] else "?" });
+    try testing.expectEqual(@as(?u64, 2), numberAfter(ta2, "\"data_alloc_bitmap_successor_loads\":"));
+    try testing.expectEqual(@as(?u64, 2), numberAfter(ta2, "\"data_alloc_bitmap_predecessor_folds\":"));
+    try testing.expectEqual(@as(?u64, 2), numberAfter(ta2, "\"alloc_lease_same_node_takeovers\":"));
+    const relearned = numberAfter(ta2, "\"block_grant_relearned_from_windows\":") orelse 0;
+    const adopted = numberAfter(ta2, "\"data_alloc_bitmap_leaks_adopted\":") orelse 0;
+    const loaded = numberAfter(ta2, "\"data_alloc_bitmap_bits_loaded\":") orelse 0;
+    if (skip_pages) {
+        // The fallback: the stale pages carried none of the dd's carves,
+        // the kept window was checkpointed away — B's declared window is
+        // re-learnt, SET under the successor's term.
+        try testing.expect(relearned >= 1);
+    } else {
+        // The pages carried every carve: B's window was LOADED, then
+        // ADOPTED by its declaration — nothing re-learnt.
+        try testing.expectEqual(@as(u64, 0), relearned);
+        try testing.expect(loaded >= 1 and adopted >= 1);
+    }
+    try testing.expectEqual(@as(?u64, 0), numberAfter(ta2, "\"data_alloc_bitmap_decls_rejected\":"));
+    // B keeps minting from its ADOPTED window (never re-granted to anyone
+    // else) and the successor serves its top-ups; both files whole from A.
+    var sha2_buf: [80]u8 = undefined;
+    var sha2: []const u8 = "";
+    {
+        var script_buf: [256]u8 = undefined;
+        const out = try b.onMount(try std.fmt.bufPrint(&script_buf, "dd if=/dev/urandom of=kv/two bs=1M count={d} status=none && sync kv/two && sha256sum kv/two | cut -d' ' -f1", .{kvda_dd_mib / 2}));
+        defer gpa.free(out);
+        sha2 = try std.fmt.bufPrint(&sha2_buf, "{s}", .{std.mem.trimEnd(u8, out, "\n")});
+    }
+    {
+        const from_a = try rig.onMount("sha256sum kv/one kv/two | cut -d' ' -f1");
+        defer gpa.free(from_a);
+        var lines = std.mem.splitScalar(u8, from_a, '\n');
+        try testing.expectEqualStrings(sha1, lines.next() orelse "");
+        try testing.expectEqualStrings(sha2, lines.next() orelse "");
+    }
+    {
+        const ta3 = try rig.stats();
+        defer gpa.free(ta3);
+        try expectMustStayZero(ta3);
+        try testing.expectEqual(relearned, numberAfter(ta3, "\"block_grant_relearned_from_windows\":") orelse 0);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta3, "\"block_grant_deferred\":"));
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try expectMustStayZero(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"block_grant_topup_refused\":"));
+        std.debug.print("smoke: kvda ({s}): the successor loaded {d} bit(s) from the predecessor's pages, adopted {d} from B's declaration, re-learnt {d}; B's second dd minted from its adopted window; both shas equal from A\n", .{ if (skip_pages) "pages SKIPPED" else "pages held", loaded, adopted, relearned });
+    }
+    // B leaves: the holder is the only writer, and the remainder the
+    // declarations never named (B's published blocks, invisible to A's
+    // census while B's trees were B's) converges under A's now-exact
+    // census — REFERENCED after all, never released.
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    {
+        const ta4 = try awaitStats(rig, &.{.{ .key = "\"data_alloc_bitmap_leaks_pending\":", .want = 0 }}, kill_row_wait_ns);
+        defer gpa.free(ta4);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta4, "\"data_alloc_bitmap_leaks_pending\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta4, "\"data_alloc_bitmap_leaks_released\":"));
+        // With the pages, B's published blocks were candidates the census
+        // referenced; without them nothing was ever a candidate (the stale
+        // pages carried no bit beyond the refs census) — the consumed
+        // blocks below B's windows are the frontier's to protect.
+        if (!skip_pages) try testing.expect((numberAfter(ta4, "\"data_alloc_bitmap_leaks_referenced\":") orelse 0) >= 1);
+        std.debug.print("smoke: kvda ({s}): after B's leave the sole writer's census converged the remainder — referenced {d}, released {d}\n", .{ if (skip_pages) "pages SKIPPED" else "pages held", numberAfter(ta4, "\"data_alloc_bitmap_leaks_referenced\":") orelse 0, numberAfter(ta4, "\"data_alloc_bitmap_leaks_released\":") orelse 0 });
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the KVDA kill row");
+}
+
+test "smoke: THE KVDA PAGE SINK — A holds the leases with its pages on volume 0 and every carve's delta in ring 0; B pulls grants (200 MiB dd), its renewals declare its windows (the joiner-side grant ledger retires the consumed ones) → kill -9 A with B's window outstanding → remount A: the same-node takeover folds the kept window onto the pages, the arm LOADS them, B's reclaim declaration ADOPTS its window — relearned 0 → B keeps minting from it, both files whole from A → fsck clean (C6/C13)" {
+    try kvdaKillRow(false);
+}
+
+test "smoke: THE KVDA PAGE SINK's fallback — the same row with the dying holder's page writes SKIPPED (the seam): the successor's stale pages carry no carve and the kept window was checkpointed away, so B's declaration RE-LEARNS its window (`block_grant_relearned_from_windows` ≥ 1 — the delta the pages otherwise make 0); no double allocation, both files whole, fsck clean" {
+    try kvdaKillRow(true);
+}
+
 test "smoke: THE `-o ro` READER OF A LIVE SET — C mounts `-o ro` beside A (the manager) and B (joined): no flock, no claim, no region; a member-reader + token client (TTLs 0, reader_staleness_bound_ms 0) reading B's 2,000 files and A's tree under tokens (0 local reads) → B writes ⇒ C's next read is fresh → A and B leave ⇒ C becomes the QUIESCENT reader of their last checkpoint → A mounts again ⇒ C fail-stops ESTALE at its next op (`.stats` still readable) → remount C ⇒ a token reader again" {
     const io = testing.io;
     if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);

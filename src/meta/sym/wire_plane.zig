@@ -80,7 +80,11 @@ const xv = @import("xv.zig");
 const dir_rename = xv.dir_rename;
 const alloc_lease = @import("../../data/sym_planes/alloc_lease.zig");
 const plane_arm = @import("../../data/sym_planes/plane_arm.zig");
+const block_grant = @import("../../data/sym_planes/block_grant.zig");
+const data_bitmap = @import("../../data/sym_planes/data_bitmap.zig");
 const sym_records = @import("../../data/sym_planes/records.zig");
+const kvda_home = @import("kvda_home.zig");
+const slots_lt = @import("slots/lease_table.zig");
 const DataPlane = @import("../../data/plane.zig").DataPlane;
 const joined = @import("joined.zig");
 const wire_auth = @import("../../wire/auth.zig");
@@ -88,6 +92,8 @@ const listener = @import("../../wire/listener.zig");
 const endpoint = @import("../../wire/endpoint.zig");
 const service = @import("../../wire/service.zig");
 const verbs = @import("../../wire/verbs.zig");
+const frame = @import("../../wire/frame.zig");
+const screen_mod = @import("../../wire/screen.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("sym/wire_plane is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -213,6 +219,12 @@ const JoinedHalf = struct {
     /// parked, 3 fenced, 4 rejoined).
     last_verdict: std.atomic.Value(u8) = .init(0),
     renewals: std.atomic.Value(u64) = .init(0),
+    /// The writer plane whose windows every renewal declares (published
+    /// by `bindDataPlanes` with release; the beat reads it with acquire).
+    windows: std.atomic.Value(?*plane_arm.WriterPlane) = .init(null),
+    /// The declaration's frame bytes for the member's next renewal (the
+    /// member borrows them for the call on this thread).
+    decl_buf: []u8,
 
     /// A tenth of the shipped `T_self` floor (the smoke's `T_owner` of
     /// 3 s derives a 797 ms `T_self`; a tick every 80 ms meets a 265 ms
@@ -224,6 +236,13 @@ const JoinedHalf = struct {
         var name_buf: @import("../../core/thread_name.zig").CommBuf = undefined;
         _ = @import("../../core/thread_name.zig").nameCurrentThread(&name_buf, "sqz-member");
         while (!self.stop.load(.acquire)) {
+            // The windows this writer holds ride the renewal (charter §5.5):
+            // refreshed every beat from the writer plane once it is armed.
+            if (self.windows.load(.acquire)) |wp| {
+                const d = wp.declareWindows(self.decl_buf);
+                self.member.windows_bytes = d.bytes;
+                self.member.n_windows = d.n_windows;
+            }
             const t = clock.monotonicNs();
             const v = self.member.tick(t / std.time.ns_per_ms, t);
             self.last_verdict.store(switch (v) {
@@ -334,6 +353,13 @@ pub const WirePlane = struct {
     /// the stop's alone.
     holder_plane: std.atomic.Value(?*plane_arm.HolderPlane) = .init(null),
     writer_plane: ?*plane_arm.WriterPlane = null,
+    /// The holder's page sink home (`kvda_home.zig`): volume 0's heap and
+    /// ring for the KVDA pages and their deltas; the set's heap geometries
+    /// the lease verbs' ref screen reads. Null on a joiner.
+    kvda: ?*kvda_home.KvdaHome = null,
+    heaps: []data_bitmap.HeapGeometry = &.{},
+    /// The data volumes the renewal's declarations are screened by.
+    decl_bounds: []screen_mod.DataVolumeBounds = &.{},
 
     /// Arm the plane (module doc); null on a set whose volume 0 carries no
     /// symmetric plane (the `--single-writer` class: no wire). The posture
@@ -532,11 +558,17 @@ pub const WirePlane = struct {
         const j = try gpa.create(JoinedHalf);
         errdefer gpa.destroy(j);
         const local = @import("../guard/proc.zig").localIdentity();
+        // The declaration frame: the renewal's class cap (one `WindowDecl`
+        // per data volume, its runs the window's and the in-flight
+        // registrations').
+        const decl_buf = try gpa.alloc(u8, frame.CONTROL_CAP);
+        errdefer gpa.free(decl_buf);
         j.* = .{
             .plane = self,
             .js = js,
             .member = undefined,
             .poison = .{ .set = self.set },
+            .decl_buf = decl_buf,
         };
         j.member = .{
             .gpa = gpa,
@@ -613,6 +645,7 @@ pub const WirePlane = struct {
             self.mgr = null;
         }
         if (self.joined) |j| {
+            self.gpa.free(j.decl_buf);
             self.gpa.destroy(j);
             self.joined = null;
         }
@@ -643,9 +676,16 @@ pub const WirePlane = struct {
         // and before the manager half (its control store releases the
         // leases).
         if (self.holder_plane.swap(null, .acq_rel)) |hp| {
+            // The page sink leaves the cycle before the plane it writes
+            // through goes; the leases released after (their records
+            // name the pages until then).
+            self.set.volumes[0].installKvdaSink(null);
             self.releaseAllocLeases(hp);
             hp.destroy();
         }
+        if (self.kvda) |k| self.gpa.destroy(k);
+        self.gpa.free(self.heaps);
+        self.gpa.free(self.decl_bounds);
         self.stopHalf();
         self.gpa.destroy(self);
     }
@@ -666,19 +706,52 @@ pub const WirePlane = struct {
     pub fn bindDataPlanes(self: *WirePlane, dp: *DataPlane) BindDataError!void {
         const gpa = self.gpa;
         if (self.mgr) |m| {
+            // The home: volume 0's heap, ring and tree 0, with every
+            // member's heap geometry for the refs screen.
+            const heaps = try gpa.alloc(data_bitmap.HeapGeometry, self.set.volumes.len);
+            errdefer gpa.free(heaps);
+            for (self.set.volumes, heaps) |be, *h| h.* = .{ .vol = be.index, .heap_start = be.sb.heap.start, .heap_len = be.sb.heap.len, .node_size = be.sb.node_size };
+            self.heaps = heaps;
+            const kv = try gpa.create(kvda_home.KvdaHome);
+            errdefer gpa.destroy(kv);
+            kv.* = .{ .gpa = gpa, .be = self.set.volumes[0], .aset = self.set0(), .control = m.ledger_store.store().control, .screen = self.leaseScreen(dp), .identity = self.writerIdentity() };
+            self.kvda = kv;
             const n = dp.vols.n();
             const terms = try gpa.alloc(u64, n);
             defer gpa.free(terms);
+            const holds = try gpa.alloc(plane_arm.HoldInput, n);
+            defer gpa.free(holds);
+            var refs = try gpa.alloc(alloc_lease.Refs, n);
+            defer gpa.free(refs);
             for (dp.vols.rows[0..n], 0..) |row, i| {
-                terms[i] = (try self.acquireAllocLease(dp, row.?.vol_tag, row.?.alloc.capacityBlocks())) orelse return;
+                const g = (try self.acquireAllocLease(dp, row.?.vol_tag, row.?.alloc.capacityBlocks())) orelse return;
+                terms[i] = g.term;
+                refs[i] = g.refs;
+                holds[i] = .{ .refs = refs[i].slice(), .already = g.already };
             }
-            const hp = try plane_arm.HolderPlane.create(gpa, self.io, dp, .{ .ctx = self, .isMember = &isMemberFn }, terms, m.owner.members.items.len + 1);
+            const hp = plane_arm.HolderPlane.create(gpa, self.io, dp, .{ .ctx = self, .isMember = &isMemberFn, .liveWriters = &liveWritersFn, .foreignSlots = &foreignSlotsFn }, kv.home(), terms, holds, m.owner.members.items.len + 1) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io, error.Corrupt => error.Io,
+            };
             // Paired with the acquire loads in the grant verb handlers.
             self.holder_plane.store(hp, .release);
+            // The renewal's declarations reach the holder (screened against
+            // the plane's volumes first); the KVDA pages ride volume 0's
+            // cycle before its barrier #1.
+            const bounds = try gpa.alloc(screen_mod.DataVolumeBounds, n);
+            errdefer gpa.free(bounds);
+            for (dp.vols.rows[0..n], bounds) |row, *b| b.* = .{ .vol_tag = row.?.vol_tag, .blocks = row.?.alloc.capacityBlocks() };
+            self.decl_bounds = bounds;
+            m.owner_svc.data_volumes = bounds;
+            m.owner_svc.windows = .{ .ctx = hp, .declare = &declareWindowsFn };
+            self.set.volumes[0].installKvdaSink(.{ .ctx = hp, .writePages = &plane_arm.HolderPlane.writeKvdaPages });
             return;
         }
         const js = self.set.volumes[0].joined.?;
         self.writer_plane = try plane_arm.WriterPlane.create(gpa, self.io, dp, js.link.tokenLink(), self.identity);
+        // The member's renewals declare the writer's held windows from now
+        // on (the beat thread reads the pointer with acquire).
+        if (self.joined) |j| j.windows.store(self.writer_plane, .release);
     }
 
     /// The ONLINE `volume add-data` arm (charter §8): the volume the plane
@@ -689,9 +762,27 @@ pub const WirePlane = struct {
         const m = self.mgr orelse return error.Io;
         const hp = self.holder_plane.load(.acquire) orelse return error.Io;
         const row = dp.vols.rows[ordinal].?;
-        const term = (try self.acquireAllocLease(dp, row.vol_tag, row.alloc.capacityBlocks())) orelse return error.Io;
-        try hp.armVolume(ordinal, term, m.owner.members.items.len + 1);
-        log.info("data planes: vol {x} armed online as ordinal {d} under the allocation lease at term {d}", .{ row.vol_tag, ordinal, term });
+        const g = (try self.acquireAllocLease(dp, row.vol_tag, row.alloc.capacityBlocks())) orelse return error.Io;
+        hp.armVolume(ordinal, g.term, .{ .refs = g.refs.slice(), .already = g.already }, m.owner.members.items.len + 1) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Io, error.Corrupt => error.Io,
+        };
+        log.info("data planes: vol {x} armed online as ordinal {d} under the allocation lease at term {d}", .{ row.vol_tag, ordinal, g.term });
+    }
+
+    fn leaseScreen(self: *WirePlane, dp: *DataPlane) alloc_lease.Screen {
+        return .{ .ctx = dp, .dataVolumeBlocks = &dataVolumeBlocksFn, .set_width = @intCast(self.set.volumes.len), .heaps = self.heaps };
+    }
+
+    /// `shard.WindowSink`'s target: the holder adopts the member's declared
+    /// windows under the writer key of its identity (the wire runs copied
+    /// into the ledger's shape; a renewal is never a hot path).
+    fn declareWindowsFn(ctx: *anyopaque, identity: verbs.WireIdentity, vol_tag: u64, ranges: []align(1) const verbs.GrantRunWire) void {
+        const hp: *plane_arm.HolderPlane = @ptrCast(@alignCast(ctx));
+        const runs = hp.gpa.alloc(block_grant.BlockGrant, ranges.len) catch return;
+        defer hp.gpa.free(runs);
+        for (ranges, runs) |r, *o| o.* = .{ .start = r.start, .len = r.len };
+        hp.declareWindows(plane_arm.writerKeyOf(.{ .node_token = identity.node_token, .mount_slot = identity.mount_slot, .writer_id = identity.writer_id }), vol_tag, runs);
     }
 
     /// The allocation lease of ONE data volume on tree 0 (charter §5.5
@@ -705,20 +796,21 @@ pub const WirePlane = struct {
     /// = `busy` / `deferred`: NO grant plane armed (logged); the grant verbs
     /// answer `Busy` and the joiners' writes wait (EAGAIN) — never two mints
     /// over one volume.
-    fn acquireAllocLease(self: *WirePlane, dp: *DataPlane, vol_tag: u64, blocks: u64) BindDataError!?u64 {
+    fn acquireAllocLease(self: *WirePlane, dp: *DataPlane, vol_tag: u64, blocks: u64) BindDataError!?alloc_lease.Granted {
         const gpa = self.gpa;
         const m = self.mgr orelse return error.Io;
         const control = m.ledger_store.store().control;
-        const screen: alloc_lease.Screen = .{ .ctx = dp, .dataVolumeBlocks = &dataVolumeBlocksFn, .set_width = @intCast(self.set.volumes.len), .heaps = &.{} };
+        const screen = self.leaseScreen(dp);
         const sym0 = self.set.volumes[0].sym.?;
         const me = self.writerIdentity();
         const me_page: join_ladder.Identity = .{ .node_token = me.node_token, .mount_slot = me.mount_slot, .writer_id = me.writer_id };
         var proof: join_ladder.SameNodeProof = .{ .page0_at_open = sym0.page0_at_open orelse me_page, .me = me_page };
-        const recover: alloc_lease.Recover = .{ .ctx = null, .recover = &predecessorBitmapRecovered };
+        var rctx: RecoverCtx = .{ .plane = self, .vol_tag = vol_tag };
+        const recover: alloc_lease.Recover = .{ .ctx = &rctx, .recover = &predecessorBitmapRecovered };
         switch (alloc_lease.acquireAndHold(control, gpa, screen, true, .{ .vol_tag = vol_tag, .identity = me, .home_vol = 0, .appender_id = 0, .blocks = blocks }, proof.d0Proof(), recover, @intCast(clock.realtimeCoarseNs()))) {
             .granted => |g| {
-                if (g.refs.n != 0) log.info("data planes: the allocation lease of vol {x} at term {d} names {d} predecessor bitmap page ref(s); the bitmap re-learns the granted ranges from the live writers' declarations (no KVDA page is read in this wave)", .{ vol_tag, g.term, g.refs.n });
-                return g.term;
+                if (g.refs.n != 0) log.info("data planes: the allocation lease of vol {x} at term {d} names {d} bitmap page ref(s) ({s}) — the pages are loaded at the arm; what they carry beyond the refs census is deferred to the live writers' declarations", .{ vol_tag, g.term, g.refs.n, if (g.already) "this holder's own" else "the predecessor's, folded" });
+                return g;
             },
             .busy => {
                 log.warn("data planes: the allocation lease of vol {x} is held by a LIVE holder that is not this manager — no grant plane armed; grants answer Busy until it releases", .{vol_tag});
@@ -740,12 +832,23 @@ pub const WirePlane = struct {
         }
     }
 
+    const RecoverCtx = struct { plane: *WirePlane, vol_tag: u64 };
+
     /// `alloc_lease.Recover` for the predecessor manager's bitmap: its
-    /// ring IS the fixed ring this open replayed at the mount, and the
-    /// holder's bitmap is RAM in this wave (0002 row 292) — nothing to
-    /// fold; the live writers' declarations re-learn the granted ranges.
-    fn predecessorBitmapRecovered(_: ?*anyopaque, _: sym_records.WriterIdentity, _: u16, _: u64) bool {
-        return true;
+    /// ring IS the fixed ring this open replayed at the mount, so the
+    /// KEPT WINDOW's deltas of its term are folded onto its pages through
+    /// the record's refs (`kvda_home.KvdaHome.foldPredecessor`) before the
+    /// lease moves — the successor's arm then loads pages that carry every
+    /// carve the predecessor journaled.
+    fn predecessorBitmapRecovered(ctx: ?*anyopaque, dead: sym_records.WriterIdentity, _: u16, term: u64) bool {
+        const rc: *RecoverCtx = @ptrCast(@alignCast(ctx.?));
+        const self = rc.plane;
+        const kv = self.kvda orelse return true;
+        const m = self.mgr orelse return false;
+        const control = m.ledger_store.store().control;
+        const lease = (alloc_lease.readLeaseRefs(control, self.gpa, rc.vol_tag) catch return false) orelse return true;
+        if (!lease.holder.sameMount(dead) or lease.term != term) return true;
+        return kv.foldPredecessor(rc.vol_tag, lease.refs.slice(), lease.blocks, term);
     }
 
     fn writerIdentity(self: *const WirePlane) sym_records.WriterIdentity {
@@ -768,6 +871,24 @@ pub const WirePlane = struct {
         const dp: *DataPlane = @ptrCast(@alignCast(ctx.?));
         const v = dp.vols.byTag(vol_tag) orelse return null;
         return v.alloc.capacityBlocks();
+    }
+
+    /// The live WRITERS of the home shard (the declaration protocol's
+    /// convergence term; readers hold no window).
+    fn liveWritersFn(ctx: *anyopaque) u64 {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        const m = self.mgr orelse return 0;
+        var n: u64 = 0;
+        for (m.owner.members.items) |mem| n += @intFromBool(mem.role == .writer);
+        return n;
+    }
+
+    /// Slot trees another appender holds in volume 0's lease table (a
+    /// lease, an offer, a release in flight, a dead lessee's).
+    fn foreignSlotsFn(ctx: *anyopaque) u64 {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        const table = self.set.volumes[0].slots.table;
+        return table.leasedCount() -| table.heldCount(slots_lt.MANAGER);
     }
 
     /// A grant is served to a live member of the home shard (or the
@@ -835,6 +956,7 @@ pub const WirePlane = struct {
         stats.wire_plane_ticks.inc();
         stats.wire_listener_connections.set(self.listener.liveConnections());
         if (self.writer_plane) |w| w.tick();
+        if (self.holder_plane.load(.acquire)) |hp| hp.tick();
         const m = self.mgr orelse return;
         const now = nowMs();
         const evicted = m.owner.expireDue(now);

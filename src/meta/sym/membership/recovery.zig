@@ -1123,7 +1123,7 @@ const RamVolume = struct {
                 self.gpa.free(kv.key);
                 self.gpa.free(kv.value);
             },
-            .alloc, .free => {},
+            .alloc, .free, .data_delta => {},
         };
         self.control_entries += 1;
     }

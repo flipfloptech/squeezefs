@@ -11,12 +11,24 @@
 //! CLEARS them), the grant `Ledger`, the served `BlockGrant` /
 //! `ReturnBlocks` / `FreeBlocks` behind ONE dispatcher by `vol_tag`, and
 //! the holder's OWN window — its mints come from its own carves too, so
-//! its cursor never walks into a range it granted. The bitmap's pages and
-//! deltas have no device home in this wave (`journal = null`): a holder's
-//! death loses the RAM carve, and the successor re-learns the granted
-//! ranges from every live writer's declared windows (charter §5.5) and the
-//! published refs — the leak class fsck C2/C6 reports, never a double
-//! allocation (a joiner mints only inside a range the holder set).
+//! its cursor never walks into a range it granted. THE PAGE SINK (rung 10
+//! item 2; charter §5.5 "A/B pages `KVDA` … in extents of the holder's
+//! grant on its HOME volume; mutations are `vol_tag`-prefixed deltas in the
+//! holder's ring … pages written before barrier #1"): the holder's `Home`
+//! binds the bitmap to its home volume — the pages held in claimed extents
+//! and their refs published in `alloc_lease:` at the arm, every carve's
+//! SET and every shipped free's CLEAR journaled into ring 0 before the
+//! reply, the dirty pages rewritten at every checkpoint cycle's C6 through
+//! the refs. A SUCCESSOR's arm reads its predecessor's (folded) pages
+//! through the record's refs, loads them over its own bits, and what the
+//! pages carried beyond the refs census — the granted-but-unminted ranges
+//! — enters the deferred-leak protocol: a live writer's renewal
+//! declaration ADOPTS its window (nothing re-learnt), a dead incarnation's
+//! remainder is RELEASED once every live writer declared, and only a carve
+//! the page never carried and the ring never folded is RE-LEARNT from the
+//! declaration (`block_grant_relearned_from_windows` — the fallback the
+//! pages make rare, never the rule). Without a `Home` (a test rig) the
+//! bitmap is RAM.
 //!
 //! The WRITER (a joiner): a `GrantWindow` per data volume as the
 //! allocator's ONE mint source, topped up as a PULL over the wire — inline
@@ -37,6 +49,7 @@ const checksum = @import("../../core/checksum.zig");
 const log = @import("../../core/log.zig");
 const service = @import("../../wire/service.zig");
 const verbs = @import("../../wire/verbs.zig");
+const codec = @import("../../wire/codec.zig");
 const block_alloc = @import("../block_alloc.zig");
 const block_refs = @import("../block_refs.zig");
 const reclaim = @import("../reclaim.zig");
@@ -67,6 +80,9 @@ pub const stats = struct {
     pub var free_ship_cadence_flushes: counters.ShardedCounter = .{};
     /// Unconsumed window runs a joiner returned to the holder at its stop.
     pub var block_grant_window_runs_returned: counters.ShardedCounter = .{};
+    /// Renewals this writer declared its windows on (the joiner side of
+    /// the grant ledger: the holder retires what the word no longer names).
+    pub var block_grant_windows_declared_by_writer: counters.ShardedCounter = .{};
 };
 
 /// The grant ledger's writer key of a wire identity: `(node_token,
@@ -83,10 +99,55 @@ pub fn writerKeyOf(id: records.WriterIdentity) u32 {
 pub const HOLDER_WRITER: u32 = 0;
 
 /// The holder's appender directory: a grant is served to a LIVE member of
-/// the home shard only (an unknown identity is `Rejected`).
+/// the home shard only (an unknown identity is `Rejected`); the live
+/// writer count is the declaration protocol's convergence term ("once
+/// every live peer declared").
 pub const WriterDirectory = struct {
     ctx: *anyopaque,
     isMember: *const fn (*anyopaque, records.WriterIdentity) bool,
+    liveWriters: *const fn (*anyopaque) u64,
+    /// Slot trees another appender holds (leased, releasing, or a dead
+    /// lessee's awaiting recovery): while any stands, this holder's refs
+    /// census is a projection of that tree, never exact.
+    foreignSlots: *const fn (*anyopaque) u64,
+};
+
+/// The holder's HOME volume for its pages (`sym_data_planes.md` §2.3,
+/// §2.5; charter §5.5): the device face, the ring-0 delta journal, and
+/// the acts that touch the heap and tree 0 — the hold (extents claimed
+/// and journaled, the image written and barriered), the publish
+/// (`AllocLeaseBitmap` on tree 0 of volume 0), the free of a
+/// predecessor's extents once this holder's own pages are published.
+pub const Home = struct {
+    ctx: *anyopaque,
+    home_vol: u16,
+    io: data_bitmap.RegionIo,
+    journal: data_bitmap.DeltaJournal,
+    vt: *const VTable,
+
+    pub const PublishVerdict = enum { published, already, refused };
+
+    pub const VTable = struct {
+        hold: *const fn (ctx: *anyopaque, image: []const u8, out_refs: *std.ArrayList(records.BitmapRef)) data_bitmap.HoldError!void,
+        publish: *const fn (ctx: *anyopaque, vol_tag: u64, term: u64, refs: []const records.BitmapRef) PublishVerdict,
+        freeExtents: *const fn (ctx: *anyopaque, refs: []const records.BitmapRef) void,
+        /// The checkpoint seq the next page images carry (the cycle's own
+        /// generation law: above every page copy on the device).
+        generation: *const fn (ctx: *anyopaque) u64,
+        /// The EXACT refs census of `vol_tag` into `out` (one bit per
+        /// block): the holder's own trees, read when it is the only writer
+        /// (the convergence's precondition — another writer's unflushed
+        /// publishes are invisible to this scan).
+        referencedFresh: *const fn (ctx: *anyopaque, vol_tag: u64, out: []u64) error{Io}!void,
+    };
+};
+
+/// What the lease verb answered the arm: the record's refs (a
+/// predecessor's pages at a succession, this holder's own at a replay,
+/// none at term 1) and whether the record was already this holder's.
+pub const HoldInput = struct {
+    refs: []const records.BitmapRef = &.{},
+    already: bool = false,
 };
 
 /// Open grants the ledger tracks per volume: the appender capacity's order
@@ -154,9 +215,16 @@ pub const HolderPlane = struct {
     io: Io,
     plane: *DataPlane,
     dir: WriterDirectory,
+    /// The page sink's home (null = the RAM posture of a rig with none).
+    home: ?Home,
     /// `router.MAX_VOLUMES` rows, `n_vols` armed (module law above).
     vols: []Vol,
     n_vols: usize,
+    /// The declaration protocol's lock: a renewal's declaration lands
+    /// from a wire thread while the tick converges on the reclaim fiber
+    /// (a spin lock: every section is one pass over a window's ranges and
+    /// the ledger's slots, and the tick's fiber carries no `Io` here).
+    decl_lock: @import("../../meta/journal_core.zig").SpinLock = .{},
 
     const Vol = struct {
         vol_tag: u64,
@@ -174,6 +242,17 @@ pub const HolderPlane = struct {
         own: block_grant.WriterArm,
         own_src: ArmSource,
         holder: *HolderPlane,
+        /// The published page refs (empty in the RAM posture).
+        refs: std.ArrayList(records.BitmapRef) = .empty,
+        /// The successor's leak census (§3.7): candidates the pages carried
+        /// beyond the refs census, resolved by the live writers'
+        /// declarations; null when the arm loaded no predecessor page.
+        leaks: ?block_grant.DeferredLeaks = null,
+        /// Writers that declared since the arm (the convergence term).
+        declared: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        /// The remainder reported once (every live writer declared, the
+        /// rest waits for an exact census).
+        remainder_reported: bool = false,
     };
 
     /// Arm every data volume: the bitmap over the allocator at the
@@ -183,17 +262,19 @@ pub const HolderPlane = struct {
     /// to by the allocator's seams (lease, mint source, sinks), so a row
     /// never moves — the online `volume add-data` arms the NEXT row in
     /// place (`armVolume`).
-    pub fn create(gpa: Allocator, io: Io, plane: *DataPlane, dir: WriterDirectory, terms: []const u64, writers_known: u64) Allocator.Error!*HolderPlane {
+    pub const ArmError = error{ OutOfMemory, Io, Corrupt };
+
+    pub fn create(gpa: Allocator, io: Io, plane: *DataPlane, dir: WriterDirectory, home: ?Home, terms: []const u64, holds: []const HoldInput, writers_known: u64) ArmError!*HolderPlane {
         const self = try gpa.create(HolderPlane);
         errdefer gpa.destroy(self);
         const n = plane.vols.n();
-        std.debug.assert(terms.len == n);
+        std.debug.assert(terms.len == n and holds.len == n);
         const vols = try gpa.alloc(Vol, router.MAX_VOLUMES);
         errdefer gpa.free(vols);
-        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .dir = dir, .vols = vols, .n_vols = 0 };
+        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .dir = dir, .home = home, .vols = vols, .n_vols = 0 };
         errdefer for (vols[0..self.n_vols]) |*v| self.disarm(v);
-        for (terms, 0..) |term, i| try self.armVolume(@intCast(i), term, writers_known);
-        log.info("data planes: the grant plane armed as the HOLDER of {d} data volume(s) (the bitmap over the allocator; grants carve at the frontier; the own window is the mint source)", .{n});
+        for (terms, holds, 0..) |term, hold, i| try self.armVolume(@intCast(i), term, hold, writers_known);
+        log.info("data planes: the grant plane armed as the HOLDER of {d} data volume(s) (the bitmap over the allocator, its pages {s}; grants carve at the frontier; the own window is the mint source)", .{ n, if (home != null) "held on the home volume and journaled into ring 0" else "RAM (no home bound)" });
         return self;
     }
 
@@ -201,8 +282,11 @@ pub const HolderPlane = struct {
     /// create for every volume, online for a volume `volume add-data` just
     /// attached — the holder's bitmap, ledger, free executor and own window
     /// over its allocator. The lease term is the caller's (acquired on tree
-    /// 0 before this arm).
-    pub fn armVolume(self: *HolderPlane, ordinal: u16, term: u64, writers_known: u64) Allocator.Error!void {
+    /// 0 before this arm); `hold` is what the verb answered. With a home:
+    /// a predecessor's pages are LOADED over the refs census and their
+    /// surplus deferred, then this holder's own pages are held and
+    /// published (a replay of our own refs re-holds them: no copy).
+    pub fn armVolume(self: *HolderPlane, ordinal: u16, term: u64, hold: HoldInput, writers_known: u64) ArmError!void {
         const gpa = self.gpa;
         const plane = self.plane;
         std.debug.assert(ordinal == self.n_vols and ordinal < router.MAX_VOLUMES);
@@ -230,6 +314,12 @@ pub const HolderPlane = struct {
         });
         errdefer v.bitmap.deinit();
         v.grants = .{ .ledger = try block_grant.Ledger.init(gpa, LEDGER_CAPACITY), .bitmap = v.bitmap };
+        errdefer v.grants.ledger.deinit();
+        if (self.home) |home| try self.holdPages(v, home, hold);
+        errdefer {
+            v.refs.deinit(gpa);
+            if (v.leaks) |*l| l.deinit();
+        }
         v.frees = .{ .alloc = r.alloc, .durable = .{ .ctx = v, .refcount = &durableRefcount }, .ladder = .{ .ctx = v, .free = &ladderFree } };
         v.handlers = .{ .vol_tag = r.vol_tag, .grants = &v.grants, .frees = &v.frees, .writer_ctx = self, .writerId = &writerIdFn };
         // The own window is bound to its sink: every top-up retires the
@@ -249,6 +339,144 @@ pub const HolderPlane = struct {
         stats.alloc_lease_held_volumes.set(@intCast(self.n_vols));
     }
 
+    /// The page sink's arm (module doc): the predecessor's pages loaded
+    /// and their surplus deferred, this holder's pages held + published,
+    /// the ring-0 journal bound.
+    fn holdPages(self: *HolderPlane, v: *Vol, home: Home, hold: HoldInput) ArmError!void {
+        const gpa = self.gpa;
+        const blocks = v.bitmap.blocks();
+        const words = v.alloc.bitmapWords();
+        if (hold.refs.len != 0) {
+            // The bits BEFORE the load are the refs census (what the mount
+            // seeded); what the pages add beyond them is granted-but-
+            // unminted — the leak candidates the declarations resolve.
+            const before = try gpa.alloc(u64, words.len);
+            defer gpa.free(before);
+            for (words, before) |*w, *b| b.* = w.load(.acquire);
+            const image = data_bitmap.readRegionImage(gpa, home.io, hold.refs, blocks) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+                error.GrantExhausted, error.TooManyRefs => error.Corrupt,
+            };
+            defer gpa.free(image);
+            const loaded = v.bitmap.loadRegionImage(image) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.TornPage => error.Corrupt,
+            };
+            data_bitmap.stats.data_alloc_bitmap_successor_loads.inc();
+            data_bitmap.stats.data_alloc_bitmap_bits_loaded.add(loaded.bits_set);
+            var leaks = try block_grant.DeferredLeaks.init(gpa, blocks);
+            errdefer leaks.deinit();
+            var candidates: std.ArrayList(u64) = .empty;
+            defer candidates.deinit(gpa);
+            for (words, before, 0..) |*w, b, wi| {
+                var bits = w.load(.acquire) & ~b;
+                while (bits != 0) : (bits &= bits - 1) try candidates.append(gpa, @as(u64, wi) * 64 + @ctz(bits)); // 64 bits per word
+            }
+            leaks.deferLeaks(candidates.items);
+            v.leaks = leaks;
+            log.info("data planes: vol {x} — {d} predecessor bitmap page(s) loaded through {d} ref(s): {d} granted-but-unminted block(s) beyond the refs census deferred to the live writers' declarations", .{ v.vol_tag, loaded.pages_valid, hold.refs.len, candidates.items.len });
+        }
+        if (hold.already and hold.refs.len != 0) {
+            // Our own pages at a replay: re-held on the same extents.
+            try v.refs.appendSlice(gpa, hold.refs);
+        } else {
+            const image = try gpa.alloc(u8, @intCast(data_bitmap.regionLen(blocks)));
+            defer gpa.free(image);
+            v.bitmap.regionImage(home.vt.generation(home.ctx), image);
+            home.vt.hold(home.ctx, image, &v.refs) catch |e| return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Io => error.Io,
+                error.GrantExhausted, error.TooManyRefs => error.Corrupt,
+            };
+            switch (home.vt.publish(home.ctx, v.vol_tag, v.term, v.refs.items)) {
+                .published, .already => {},
+                .refused => return error.Corrupt,
+            }
+            data_bitmap.stats.data_alloc_bitmap_holds.inc();
+            // The predecessor's extents are nobody's once the record names
+            // ours (the publish is barriered before this free is issued).
+            if (hold.refs.len != 0) home.vt.freeExtents(home.ctx, hold.refs);
+        }
+        v.bitmap.journal = home.journal;
+    }
+
+    /// A live writer's renewal declaration for one volume (charter §5.5
+    /// "every live writer declares its held windows on each renewal"):
+    /// the ledger learns what the writer still HOLDS (the consumed grants
+    /// retire — the joiner-side F17), the deferred candidates it names
+    /// are adopted and a carve the pages never carried is re-learnt; the
+    /// deltas drained. A declaration naming no volume of this holder is
+    /// ignored (the screen admitted it against the plane's volumes).
+    pub fn declareWindows(self: *HolderPlane, writer: u32, vol_tag: u64, ranges: []const block_grant.BlockGrant) void {
+        const v = self.volOf(vol_tag) orelse return;
+        if (!block_grant.screenWindowDecl(ranges, v.bitmap.blocks())) return;
+        self.decl_lock.lock();
+        defer self.decl_lock.unlock();
+        // The adopt BEFORE the sync: a candidate another writer's slot
+        // already names is skipped there, and the sync then makes this
+        // writer's slots exactly its word (adopted runs included).
+        if (v.leaks) |*l| {
+            const out = l.adoptDeclared(&v.grants.ledger, v.bitmap, writer, ranges);
+            if (out.relearned != 0) log.warn("data planes: vol {x} — writer {x}'s declaration re-learnt {d} block(s) its predecessor's pages never carried (the page sink's fallback; the ring did not fold them)", .{ vol_tag, writer, out.relearned });
+        }
+        _ = v.grants.ledger.syncWriter(writer, ranges);
+        _ = v.bitmap.drain();
+        v.declared.put(self.gpa, writer, {}) catch {};
+        block_grant.stats.block_grant_windows_declared.inc();
+    }
+
+    /// The cadence: queued deltas drained (a CLEAR the finish-free sink
+    /// queued waits for no carve); the deferred candidates CONVERGED under
+    /// an exact census once this holder is the only writer (every peer
+    /// departed, or dead and recovered) — while peers are live the
+    /// remainder after their declarations is reported once and left SET
+    /// for fsck C6 (a leak, never a release of a live block).
+    pub fn tick(self: *HolderPlane) void {
+        const live = self.dir.liveWriters(self.dir.ctx);
+        // The exact census exists only when this holder's trees ARE the
+        // set's: no live writer, and every slot tree another appender held
+        // adopted (a clean leave's release) or recovered (a death).
+        const exact = live == 0 and self.dir.foreignSlots(self.dir.ctx) == 0;
+        for (self.vols[0..self.n_vols]) |*v| {
+            _ = v.bitmap.drain();
+            self.decl_lock.lock();
+            defer self.decl_lock.unlock();
+            const l = &(v.leaks orelse continue);
+            const pending = l.pendingCount();
+            if (pending == 0) continue;
+            if (exact) {
+                const home = self.home orelse continue;
+                const referenced = self.gpa.alloc(u64, v.alloc.bitmapWords().len) catch continue;
+                defer self.gpa.free(referenced);
+                home.vt.referencedFresh(home.ctx, v.vol_tag, referenced) catch continue;
+                const out = l.convergeDeferred(v.bitmap, referenced);
+                _ = v.bitmap.drain();
+                log.info("data planes: vol {x} — the only writer's exact census converged {d} deferred block(s): {d} released (no reference), {d} referenced after all", .{ v.vol_tag, pending, out.released, out.referenced });
+            } else if (!v.remainder_reported and v.declared.count() >= live) {
+                v.remainder_reported = true;
+                log.info("data planes: vol {x} — every live writer declared; {d} block(s) stay SET that no window names and this holder's census does not reference (a live writer's unflushed publishes are invisible here): left as a leak for fsck C6, never released", .{ v.vol_tag, pending });
+            }
+        }
+    }
+
+    /// The checkpoint cycle's C6 (`KvBackend.KvdaSink`): every held
+    /// bitmap's dirty pages through its refs at the cycle's generation;
+    /// the cycle's barrier #1 covers them.
+    pub fn writeKvdaPages(ctx: *anyopaque, generation: u64) error{Io}!void {
+        const self: *HolderPlane = @ptrCast(@alignCast(ctx));
+        const home = self.home orelse return;
+        for (self.vols[0..self.n_vols]) |*v| {
+            if (v.refs.items.len == 0) continue;
+            _ = data_bitmap.writeDirtyPagesThroughRefs(v.bitmap, home.io, v.refs.items, generation) catch |e| switch (e) {
+                error.Io => return error.Io,
+                // The set re-dirtied itself: the next cycle rewrites.
+                error.OutOfMemory, error.Corrupt => return error.Io,
+            };
+            _ = v.bitmap.populationDriftCheck();
+        }
+    }
+
     fn disarm(self: *HolderPlane, v: *Vol) void {
         self.plane.reclaimer.setFreeTarget(v.ordinal, null);
         v.alloc.grant_source = null;
@@ -257,6 +485,9 @@ pub const HolderPlane = struct {
         v.alloc.untracked_gate = null;
         v.grants.ledger.deinit();
         v.bitmap.deinit();
+        v.refs.deinit(self.gpa);
+        if (v.leaks) |*l| l.deinit();
+        v.declared.deinit(self.gpa);
     }
 
     /// `df` per the rule on the holder: the bitmap's population and
@@ -343,7 +574,7 @@ pub const HolderPlane = struct {
         for (self.vols[0..self.n_vols], 0..) |*v, i| {
             if (i != 0) try w.writeByte(',');
             const word = v.grants.word();
-            try w.print("{{\"vol_tag\":\"{x:0>16}\",\"population\":{d},\"frontier\":{d},\"open_grants\":{d},\"writers\":{d},\"own_window_remaining\":{d},\"used_blocks\":{d}}}", .{ v.vol_tag, word.population, word.frontier, v.grants.ledger.openCount(), v.grants.writers(), v.own.window.remaining(), word.population -| v.own.window.remaining() });
+            try w.print("{{\"vol_tag\":\"{x:0>16}\",\"population\":{d},\"frontier\":{d},\"open_grants\":{d},\"writers\":{d},\"own_window_remaining\":{d},\"used_blocks\":{d},\"page_refs\":{d},\"leaks_pending\":{d},\"writers_declared\":{d}}}", .{ v.vol_tag, word.population, word.frontier, v.grants.ledger.openCount(), v.grants.writers(), v.own.window.remaining(), word.population -| v.own.window.remaining(), v.refs.items.len, if (v.leaks) |*l| l.pendingCount() else 0, v.declared.count() });
         }
         try w.writeAll("]");
     }
@@ -465,6 +696,34 @@ pub const WriterPlane = struct {
         for (self.vols) |*v| {
             if (v.shipper.flush() == .served) stats.free_ship_cadence_flushes.inc();
         }
+    }
+
+    pub const Declaration = struct { bytes: []const u8, n_windows: u16 };
+
+    /// The renewal's carriage (charter §5.5 "every live writer declares its
+    /// held windows on each renewal"): per data volume ONE `WindowDecl` of
+    /// what this writer still HOLDS — the unconsumed window plus the
+    /// in-flight registrations, coalesced ascending (`heldBlockRanges`) —
+    /// encoded into `buf`. A declaration that does not fit the buffer is
+    /// withheld whole (a partial word would read as a release at the
+    /// holder): the whole renewal declares nothing that beat.
+    pub fn declareWindows(self: *WriterPlane, buf: []u8) Declaration {
+        const gpa = self.gpa;
+        var b: codec.Builder = .init(buf);
+        var n: u16 = 0;
+        for (self.vols) |*v| {
+            var held: std.ArrayList(block_grant.BlockGrant) = .empty;
+            defer held.deinit(gpa);
+            block_grant.heldBlockRanges(&v.arm.window, v.alloc, gpa, &held) catch return .{ .bytes = "", .n_windows = 0 };
+            if (held.items.len > std.math.maxInt(u16)) return .{ .bytes = "", .n_windows = 0 };
+            const runs = gpa.alloc(verbs.GrantRunWire, held.items.len) catch return .{ .bytes = "", .n_windows = 0 };
+            defer gpa.free(runs);
+            for (held.items, runs) |h, *r| r.* = .{ .start = h.start, .len = h.len, .reserved = 0 };
+            verbs.RenewReq.encodeWindows(&b, &.{.{ .vol_tag = v.vol_tag, .ranges = runs }}) catch return .{ .bytes = "", .n_windows = 0 };
+            n += 1;
+        }
+        stats.block_grant_windows_declared_by_writer.inc();
+        return .{ .bytes = b.written(), .n_windows = n };
     }
 
     /// `BlockGrant` over the wire: the PULL.

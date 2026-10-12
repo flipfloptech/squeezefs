@@ -97,14 +97,17 @@ buggy/hostile-peer class, off the must-stay-0 gauge), or "not now" (`STATUS_DEFE
   after the handshake the traffic keys go to the `tls` ULP (`TCP_ULP` → `TLS_TX`/`TLS_RX`,
   `tls12_crypto_info_aes_gcm_128` at `TLS_1_3_VERSION`); control records (alerts, KeyUpdate,
   NewSessionTicket) arrive as `TLS_GET_RECORD_TYPE` cmsgs on `recvmsg`; the rekey is a second
-  `TLS_TX`/`TLS_RX` (Linux ≥ 6.14). `confidential()` only with both halves installed. **Venue facts
-  (7.2.6-sqz):** `# CONFIG_TLS is not set`, `# CONFIG_MODULES is not set`, `tcp_available_ulp` empty, the
-  `tls_*` kallsyms are `net/handshake`'s upcall helpers — no kTLS; the product REFUSES a `mutual_tls` mount
-  and every TLS dial by name (`KernelTlsMissing` / `KtlsUnavailable`, `cluster_wire_ktls_refused`), never a
-  silent fall-back to the in-tree record layer (the handshake's transport and the portable path). The kTLS
-  data path is written (`tls.ktls`); its rows and the CPU-per-GB column run where the probe finds the ULP
-  and are the ledger's `other_step` skip until then (`rung-10-mtls.md` §9). zcrx's `RECV_ZC` combines only
-  with NIC TLS RX offload (`CONFIG_TLS_DEVICE`).
+  `TLS_TX`/`TLS_RX` (Linux ≥ 6.14). `confidential()` only with both halves installed. **Venue facts:** the
+  first 7.2.6-sqz had `# CONFIG_TLS is not set` (monolithic, `tcp_available_ulp` empty); the orchestrator
+  rebuilt it (the reference's `feat/kernel-sqz-container-arm64` `44752ce5`, `config-fragment-container-arm64`
+  + `CONFIG_TLS=y CONFIG_TLS_DEVICE=y`, Image `ed38bb5b…`; the container recreated) — `tcp_available_ulp` →
+  `tls`, the TLS 1.3 AES-128-GCM install and the 6.14 rekey accepted, every kTLS row green
+  (`rung-10-mtls.md` §9). Without the ULP the product REFUSES a `mutual_tls` mount and every TLS dial by name
+  (`KernelTlsMissing` / `KtlsUnavailable`, `cluster_wire_ktls_refused`), never a silent fall-back to the
+  in-tree record layer (the handshake's transport and the portable path). **The kernel's `gcm(aes)` is the
+  generic `aes-lib`/`ghash-lib`** (no `CONFIG_CRYPTO_AES_ARM64_CE_BLK` / `GHASH_ARM64_CE`): kernel TLS measures
+  0.41 GB/s at 4.3 CPU-s/GB against the userspace layer's 2.0 GB/s at 0.94 — the CE config is the next kernel
+  change. zcrx's `RECV_ZC` combines only with NIC TLS RX offload (`CONFIG_TLS_DEVICE`).
 
 ### 1.2 Framing — the reference's bytes, and the port's v4 frame
 

@@ -1481,16 +1481,33 @@ test "the hash microbench: the format's four shapes × three columns; a cell's p
     const h128 = checksum.hash128(&buf);
     try testing.expectEqual(checksum.low64(h128) ^ checksum.low64(h128 >> 64), hash_bench.hashOnce(.sqzhash128, &buf));
     try testing.expectEqual(std.hash.XxHash3.hash(0, &buf), hash_bench.hashOnce(.xxh3_64, &buf));
-    // A real (tiny) measurement in each mode: the batch doubles until the
-    // span holds; a chained cell can never be faster than a throughput cell.
+    // A real (tiny) measurement in each mode pins the loop's own law — the
+    // batch doubles until the span holds — which no scheduler load can
+    // break. The RELATION between the two modes' figures (a dependent chain
+    // is never faster than independent hashes) is a measurement: the bench
+    // smoke's hash row reports it; asserted here it flipped once per host
+    // under the gate's parallel load (the chained cell measured one
+    // scheduler slice later than its throughput sibling).
     const cell = hash_bench.measure(.sqzhash64, .throughput, buf[0..16]);
     try testing.expect(cell.elapsed_ns >= hash_bench.MIN_SPAN_NS);
     try testing.expect(cell.ops >= hash_bench.FIRST_BATCH);
     try testing.expect(cell.psPerOp() > 0);
     const chained = hash_bench.measure(.sqzhash64, .chained, buf[0..16]);
-    try testing.expect(chained.psPerOp() >= cell.psPerOp());
+    try testing.expect(chained.elapsed_ns >= hash_bench.MIN_SPAN_NS);
+    try testing.expect(chained.ops >= hash_bench.FIRST_BATCH);
     var chained_json: Io.Writer.Allocating = .init(testing.allocator);
     defer chained_json.deinit();
     try chained.writeJson(&chained_json.writer);
     try testing.expect(std.mem.indexOf(u8, chained_json.written(), "\"access\":\"chained\"") != null);
+    // The relation on FIXED counts (the deterministic surrogate): the same
+    // ops over a longer span is a slower cell in both figures — 2^20 hashes
+    // of 16 B in 100 ms = 95.367 ns/op at 167 MB/s; in 250 ms = 238.418
+    // ns/op at 67 MB/s.
+    const fixed_throughput: hash_bench.Cell = .{ .algo = .sqzhash64, .mode = .throughput, .size = 16, .ops = 1 << 20, .elapsed_ns = 100_000_000 };
+    const fixed_chained: hash_bench.Cell = .{ .algo = .sqzhash64, .mode = .chained, .size = 16, .ops = 1 << 20, .elapsed_ns = 250_000_000 };
+    try testing.expectEqual(@as(u64, 95_367), fixed_throughput.psPerOp());
+    try testing.expectEqual(@as(u64, 238_418), fixed_chained.psPerOp());
+    try testing.expectEqual(@as(u64, 167), fixed_throughput.mbPerS());
+    try testing.expectEqual(@as(u64, 67), fixed_chained.mbPerS());
+    try testing.expect(fixed_chained.psPerOp() > fixed_throughput.psPerOp() and fixed_chained.mbPerS() < fixed_throughput.mbPerS());
 }

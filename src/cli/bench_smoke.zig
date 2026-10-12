@@ -17,6 +17,8 @@ const linux = std.os.linux;
 const Io = std.Io;
 const clock = @import("../core/clock.zig");
 const json_scan = @import("../core/json_scan.zig");
+const testkit = @import("../core/testkit.zig");
+const hash_bench = @import("bench.zig").hash_bench;
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("cli/bench_smoke is Linux only (charter §1.2); gate the import on builtin.os.tag");
@@ -215,4 +217,55 @@ test "bench gate: format → mount → `squeezefs bench --smoke --json` runs eve
     try testing.expectEqual(linux.geteuid(), st.uid);
     try testing.expect(st.size > 1024);
     try rig.umount();
+}
+
+// The hash microbench's one iteration (charter §11): every cell a row with
+// the measurement-law fields. The chained/throughput RELATION per algorithm
+// (a dependent chain is never faster than independent hashes) is a
+// measurement under whatever load the venue carries — reported here as the
+// smallest shape's figures, asserted nowhere (as a unit assertion it
+// flipped once per host under the gate's parallel load).
+test "bench gate: `squeezefs bench --hash --json` — every cell of the format's hash microbench is a row with the measurement-law fields; the chained/throughput relation is reported, not asserted" {
+    if (!venueAvailable(testing.io)) return testkit.skip(@src(), .other_step, "no ./squeezefs binary in the cwd: the bench-smoke step stages it");
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, testing.io);
+    defer rig.deinit();
+    const r = try rig.squeezefs(&.{ "bench", "--hash", "--json" });
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    if (!r.term.success()) std.debug.print("\nbench --hash: {s}\n{s}\n", .{ r.stdout, r.stderr });
+    try testing.expect(r.term.success());
+    // Per algorithm, the smallest shape's ps/op in each mode.
+    var ps: [hash_bench.algos.len][hash_bench.modes.len]?u64 = @splat(@splat(null));
+    var lines = std.mem.tokenizeScalar(u8, r.stdout, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        n += 1;
+        for ([_][]const u8{ "{\"pass\":\"hash\",\"algo\":\"", "\"block\":", "\"access\":\"", "\"ops\":", "\"elapsed_ns\":", "\"bytes\":", "\"ps_per_op\":", "\"mb_per_s\":" }) |needle| {
+            if (std.mem.indexOf(u8, line, needle) == null) {
+                std.debug.print("\n--- hash row lacks {s}: {s} ---\n", .{ needle, line });
+                return error.RowFieldMissing;
+            }
+        }
+        const elapsed = json_scan.number(line, "elapsed_ns") orelse return error.RowFieldMissing;
+        const ops = json_scan.number(line, "ops") orelse return error.RowFieldMissing;
+        try testing.expect(elapsed >= hash_bench.MIN_SPAN_NS);
+        try testing.expect(ops >= hash_bench.FIRST_BATCH);
+        if (json_scan.number(line, "block") != @as(?u64, hash_bench.sizes[0])) continue;
+        const algo = json_scan.string(line, "algo") orelse return error.RowFieldMissing;
+        const access = json_scan.string(line, "access") orelse return error.RowFieldMissing;
+        for (hash_bench.algos, 0..) |a, ai| {
+            for (hash_bench.modes, 0..) |m, mi| {
+                if (std.mem.eql(u8, algo, a.name()) and std.mem.eql(u8, access, m.name())) ps[ai][mi] = json_scan.number(line, "ps_per_op");
+            }
+        }
+    }
+    try testing.expectEqual(hash_bench.cell_count, n);
+    std.debug.print("bench-smoke: hash — {d} rows; {d} B chained vs cpu ps/op:", .{ n, hash_bench.sizes[0] });
+    for (hash_bench.algos, 0..) |a, ai| {
+        const t = ps[ai][0] orelse return error.RowMissing;
+        const c = ps[ai][1] orelse return error.RowMissing;
+        std.debug.print(" {s} {d}/{d} ({s})", .{ a.name(), c, t, if (c >= t) "chained slower, as expected" else "chained FASTER: a measurement artifact of the load" });
+    }
+    std.debug.print("\n", .{});
 }

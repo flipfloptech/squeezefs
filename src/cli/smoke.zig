@@ -1353,6 +1353,9 @@ const Peer = struct {
     rig: *Rig,
     name: []const u8,
     node: ?[]const u8 = null,
+    /// This daemon's environment when it differs from the rig's (the
+    /// MutualTls rows: every node its own certificate and key).
+    env: ?*const std.process.Environ.Map = null,
     mp: [:0]u8,
     log_path: [:0]u8,
     log_file: ?Io.File = null,
@@ -1431,7 +1434,7 @@ const Peer = struct {
         n += 1;
         argv[n] = self.mp;
         n += 1;
-        self.child = try std.process.spawn(rig.io, .{ .argv = argv[0..n], .environ_map = &rig.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
+        self.child = try std.process.spawn(rig.io, .{ .argv = argv[0..n], .environ_map = self.env orelse &rig.env, .stdin = .ignore, .stdout = .{ .file = self.log_file.? }, .stderr = .{ .file = self.log_file.? } });
         self.pid = self.child.?.id.?;
         self.killed = false;
         var tag_buf: [32]u8 = undefined;
@@ -2325,6 +2328,218 @@ fn expectTreeWhole(host: anytype, dir: []const u8) !usize {
     const out = try host.onMount(script.written());
     defer testing.allocator.free(out);
     return std.fmt.parseInt(usize, std.mem.trimEnd(u8, out, "\n"), 10);
+}
+
+/// A copy of `base` with `overrides` applied (the MutualTls rows' per-node
+/// environments).
+fn envWith(gpa: std.mem.Allocator, base: *const std.process.Environ.Map, overrides: []const [2][]const u8) !std.process.Environ.Map {
+    var m = std.process.Environ.Map.init(gpa);
+    errdefer m.deinit();
+    var it = base.iterator();
+    while (it.next()) |e| try m.put(e.key_ptr.*, e.value_ptr.*);
+    for (overrides) |kv| try m.put(kv[0], kv[1]);
+    return m;
+}
+
+/// The MutualTls matrix's `dd` on B: 200 MiB over 4 MiB blocks (the
+/// Plaintext matrix's shape, byte for byte).
+const mtls_dd_mib: u64 = 200;
+
+test "smoke: THE TWO-DAEMON MATRIX over MutualTls — `key tls-init` + `tls-issue` ×2 → mount A (SQUEEZEFS_WIRE_CHANNEL=mutual_tls, node-a) → mount B (node-b) JOINED over TLS (.stats: channel 1, handshakes, 0 refusals) → A reads B's file under a token, B's write recalls it → B's mkdir under A's root (a cross-owner intent) → a 200 MiB dd on B, the sha from A equal (the Plaintext row's result) → 0 MAC failures and 0 refusals on both → a THIRD daemon under a FOREIGN CA is refused (its mount fails naming the CA, A counts tls_refused_untrusted) → a PLAINTEXT daemon is refused by name at the handshake bound (A counts plaintext_refused) → umount B, A" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    // The PKI through the binary: one CA, node-a and node-b under it; a
+    // FOREIGN CA of the same name with node-c under it.
+    var pki_buf: [256]u8 = undefined;
+    const pki_dir = try std.fmt.bufPrint(&pki_buf, "{s}/pki", .{rig.work});
+    var pa: [320]u8 = undefined;
+    var pb: [320]u8 = undefined;
+    var pc: [320]u8 = undefined;
+    var pf: [320]u8 = undefined;
+    const dir_a = try std.fmt.bufPrint(&pa, "{s}/a", .{pki_dir});
+    const dir_b = try std.fmt.bufPrint(&pb, "{s}/b", .{pki_dir});
+    const dir_c = try std.fmt.bufPrint(&pc, "{s}/c", .{pki_dir});
+    const dir_f = try std.fmt.bufPrint(&pf, "{s}/foreign", .{pki_dir});
+    inline for (.{
+        .{ "key", "tls-init", "--name", "smoke-ca", pki_dir },
+        .{ "key", "tls-issue", "--node", "node-a", "--out", dir_a, pki_dir },
+        .{ "key", "tls-issue", "--node", "node-b", "--out", dir_b, pki_dir },
+        .{ "key", "tls-init", "--name", "smoke-ca", dir_f },
+        .{ "key", "tls-issue", "--node", "node-c", "--out", dir_c, dir_f },
+    }) |argv| {
+        const r = try rig.squeezefs(&argv);
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\n--- {s} {s}: {s}\n", .{ argv[0], argv[1], r.stderr });
+        try testing.expect(r.term.success());
+    }
+    var ca_path_buf: [320]u8 = undefined;
+    const ca_path = try std.fmt.bufPrint(&ca_path_buf, "{s}/ca.pem", .{pki_dir});
+    var cert_a: [320]u8 = undefined;
+    var key_a: [320]u8 = undefined;
+    var cert_b: [320]u8 = undefined;
+    var key_b: [320]u8 = undefined;
+    var cert_c: [320]u8 = undefined;
+    var key_c: [320]u8 = undefined;
+    var ca_f: [320]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_WIRE_CHANNEL", "mutual_tls");
+    try rig.env.put("SQUEEZEFS_WIRE_TLS_CA", ca_path);
+    try rig.env.put("SQUEEZEFS_WIRE_TLS_CERT", try std.fmt.bufPrint(&cert_a, "{s}/node.pem", .{dir_a}));
+    try rig.env.put("SQUEEZEFS_WIRE_TLS_KEY", try std.fmt.bufPrint(&key_a, "{s}/node.key", .{dir_a}));
+    var env_b = try envWith(gpa, &rig.env, &.{ .{ "SQUEEZEFS_WIRE_TLS_CERT", try std.fmt.bufPrint(&cert_b, "{s}/node.pem", .{dir_b}) }, .{ "SQUEEZEFS_WIRE_TLS_KEY", try std.fmt.bufPrint(&key_b, "{s}/node.key", .{dir_b}) } });
+    defer env_b.deinit();
+    var env_c = try envWith(gpa, &rig.env, &.{ .{ "SQUEEZEFS_WIRE_TLS_CA", try std.fmt.bufPrint(&ca_f, "{s}/ca.pem", .{dir_f}) }, .{ "SQUEEZEFS_WIRE_TLS_CERT", try std.fmt.bufPrint(&cert_c, "{s}/node.pem", .{dir_c}) }, .{ "SQUEEZEFS_WIRE_TLS_KEY", try std.fmt.bufPrint(&key_c, "{s}/node.key", .{dir_c}) } });
+    defer env_c.deinit();
+    var env_d = try envWith(gpa, &rig.env, &.{.{ "SQUEEZEFS_WIRE_CHANNEL", "plaintext" }});
+    defer env_d.deinit();
+    try rig.formatSet(true);
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    {
+        const text = try rig.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "channel class mutual_tls — node 'node-a' under CA 'smoke-ca'") != null);
+    }
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    b.env = &env_b;
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    {
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "mounted JOINED as appender 1") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "channel class mutual_tls — node 'node-b'") != null);
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 1), numberAfter(ta, "\"cluster_wire_channel_mutual_tls\":"));
+        try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"cluster_wire_channel_mutual_tls\":"));
+        try testing.expect((numberAfter(ta, "\"cluster_wire_tls_handshakes\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(tb, "\"cluster_wire_tls_handshakes\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"cluster_wire_plaintext_refused\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"cluster_wire_tls_refused_untrusted\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"cluster_wire_tls_refused_expired\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"cluster_wire_tls_refused_protocol\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"cluster_wire_tls_dial_refused\":"));
+        std.debug.print("\nsmoke: mtls matrix: B joined over TLS — A: handshakes {d}, sessions admitted {d}; B: handshakes {d}, wire verbs {d}\n", .{ numberAfter(ta, "\"cluster_wire_tls_handshakes\":") orelse 0, numberAfter(ta, "\"cluster_wire_sessions_admitted\":") orelse 0, numberAfter(tb, "\"cluster_wire_tls_handshakes\":") orelse 0, numberAfter(tb, "\"joined_wire_verbs\":") orelse 0 });
+    }
+    // A reads B's file under a token; B's write recalls it; A's next read
+    // is fresh.
+    {
+        const w = try b.onMount("mkdir b-dir && printf 'b-f\\n' > b-dir/f");
+        gpa.free(w);
+        const first = try rig.onMount("cat b-dir/f");
+        defer gpa.free(first);
+        try testing.expectEqualStrings("b-f\n", first);
+        const w2 = try b.onMount("printf 'fresh\\n' > b-dir/f");
+        gpa.free(w2);
+        const second = try rig.onMount("cat b-dir/f");
+        defer gpa.free(second);
+        try testing.expectEqualStrings("fresh\n", second);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expect((numberAfter(tb, "\"dlm_token_grants\":") orelse 0) >= 1);
+        try testing.expect((numberAfter(tb, "\"dlm_token_recalls\":") orelse 0) >= 1);
+    }
+    // B's mkdir under A's root: a cross-owner intent shipped over TLS.
+    {
+        const mk = try rig.onMount("mkdir a-dir");
+        gpa.free(mk);
+        const out = try b.onMount("mkdir a-dir/from-b && printf 'x\\n' > a-dir/from-b/f && ls a-dir");
+        defer gpa.free(out);
+        try testing.expectEqualStrings("from-b\n", out);
+        const seen = try rig.onMount("ls a-dir; cat a-dir/from-b/f");
+        defer gpa.free(seen);
+        try testing.expectEqualStrings("from-b\nx\n", seen);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expect((numberAfter(tb, "\"xv_cross_owner_intents_minted\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"xv_cross_owner_intents_stuck\":"));
+    }
+    // The 200 MiB dd on B (its grants pulled from A over TLS); the sha
+    // round trip from A: the Plaintext row's result, byte for byte.
+    {
+        var script: [256]u8 = undefined;
+        const t0 = clock.monotonicNs();
+        const out = try b.onMount(try std.fmt.bufPrint(&script, "mkdir b-data && dd if=/dev/urandom of=b-data/big bs=1M count={d} status=none && sync b-data/big && sha256sum b-data/big | cut -d' ' -f1", .{mtls_dd_mib}));
+        defer gpa.free(out);
+        const dd_ms = (clock.monotonicNs() - t0) / std.time.ns_per_ms;
+        const sha_b = std.mem.trimEnd(u8, out, "\n");
+        const from_a = try rig.onMount("sha256sum b-data/big | cut -d' ' -f1");
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings(sha_b, std.mem.trimEnd(u8, from_a, "\n"));
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expect((numberAfter(ta, "\"block_grants\":") orelse 0) >= 1);
+        try expectMustStayZero(ta);
+        try expectMustStayZero(tb);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"cluster_wire_mac_failures\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"cluster_wire_mac_failures\":"));
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"cluster_wire_admissions_refused\":"));
+        std.debug.print("smoke: mtls matrix: 200 MiB dd on B in {d} ms, sha from A equal; wire over TLS — A: frames received {d}, bytes received {d}, grants {d}; B: frames sent {d}, bytes sent {d}, key updates {d}; MAC failures 0, refusals 0 on both\n", .{ dd_ms, numberAfter(ta, "\"cluster_wire_frames_received\":") orelse 0, numberAfter(ta, "\"cluster_wire_bytes_received\":") orelse 0, numberAfter(ta, "\"block_grants\":") orelse 0, numberAfter(tb, "\"cluster_wire_frames_sent\":") orelse 0, numberAfter(tb, "\"cluster_wire_bytes_sent\":") orelse 0, numberAfter(tb, "\"cluster_wire_tls_key_updates\":") orelse 0 });
+    }
+    // The negative half: a THIRD daemon under a FOREIGN CA of the same
+    // name — its dial is refused at the TLS handshake (its log names the
+    // CA), its mount fails, and A counts the untrusted peer.
+    {
+        const c = try Peer.init(rig, "c");
+        defer c.deinit();
+        c.env = &env_c;
+        try c.spawn(&.{});
+        const term = try c.waitExit();
+        try testing.expect(!term.success());
+        const text = try c.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "refused at the TLS handshake") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "not under this set's CA") != null or std.mem.indexOf(u8, text, "refused THIS node's certificate") != null);
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"cluster_wire_tls_refused_untrusted\":") orelse 0) >= 1);
+        try testing.expectEqual(@as(?u64, 0), numberAfter(ta, "\"cluster_wire_sessions_poisoned\":"));
+        std.debug.print("smoke: mtls matrix: a daemon under a FOREIGN CA: mount {f}; A counts tls_refused_untrusted {d}\n", .{ term, numberAfter(ta, "\"cluster_wire_tls_refused_untrusted\":") orelse 0 });
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| if (std.mem.indexOf(u8, line, "TLS handshake") != null) {
+            std.debug.print("smoke: mtls matrix: C's log: {s}\n", .{line[0..@min(line.len, 300)]});
+            break;
+        };
+    }
+    // A PLAINTEXT daemon at the MutualTls set: silent for the handshake
+    // bound, answered with a Refused naming the class.
+    {
+        const d = try Peer.init(rig, "d");
+        defer d.deinit();
+        d.env = &env_d;
+        try d.spawn(&.{});
+        const term = try d.waitExit();
+        try testing.expect(!term.success());
+        const text = try d.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "this channel is MutualTls") != null);
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try testing.expect((numberAfter(ta, "\"cluster_wire_plaintext_refused\":") orelse 0) >= 1);
+        std.debug.print("smoke: mtls matrix: a PLAINTEXT daemon: mount {f}; A counts plaintext_refused {d}\n", .{ term, numberAfter(ta, "\"cluster_wire_plaintext_refused\":") orelse 0 });
+    }
+    // umount B (the clean leave over TLS), then A.
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try testing.expectEqual(@as(usize, 0), try fuseMountsOf(gpa, io, b.mp));
+    {
+        const after = try rig.onMount("cat b-dir/f; ls a-dir");
+        defer gpa.free(after);
+        try testing.expectEqualStrings("fresh\nfrom-b\n", after);
+    }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
 test "smoke: THE KILL ROWS (a) — kill -9 B mid-`tar -x` into A's directory ⇒ A evicts B at T_owner, records the death, recovers its region (dead_members_acted ≡ recorded × regions held, rollbacks 0, the page recovered → free), every file B acked is whole on A → remount B under the same node (the same-node successor) sees them → B's FIRST cross-owner mkdir succeeds → A's `rm -rf` of the recovered tree completes; recall timeouts 0, tripwires 0 on both" {

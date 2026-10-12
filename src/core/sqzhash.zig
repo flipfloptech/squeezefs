@@ -524,9 +524,9 @@ fn Engine(comptime path: Path) type {
         ///
         /// The state is the construction's MINIMUM (charter R5: a per-object
         /// state is derived and bounded — the staging ring keeps one per live
-        /// cell, the fibers one per frame): the key by POINTER (the format key
-        /// is a comptime constant, a name key lives once per mount; a copy was
-        /// 320 B per state), and ONE of two phases:
+        /// cell): the key by POINTER (the format key is a comptime constant, a
+        /// name key lives once per mount; a copy was 320 B per state), and ONE
+        /// of two phases:
         ///
         /// - `prefix` while the input is ≤ `medium_max` (1 KiB): every regime
         ///   below 16 lanes (one block, the 2…16-leaf tree, 8 lanes) is a
@@ -559,9 +559,8 @@ fn Engine(comptime path: Path) type {
             };
 
             comptime {
-                // The window must reach back into the previous chunk, and the
-                // prefix must hold three whole chunks plus the window at the
-                // switch (`absorbLargeChunks` over `prefix_len - chunk_len`).
+                // At the switch the prefix is whole chunks (absorbed) plus the
+                // window (the last of them), so it is at least two of them.
                 assert(prefix_len >= 2 * chunk_len);
                 assert(prefix_len % chunk_len == 0);
                 // The derived minimum: the larger phase + the union's tag, both

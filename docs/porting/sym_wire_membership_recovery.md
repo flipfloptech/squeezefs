@@ -102,8 +102,9 @@ buggy/hostile-peer class, off the must-stay-0 gauge), or "not now" (`STATUS_DEFE
   `tls_*` kallsyms are `net/handshake`'s upcall helpers — no kTLS; the product REFUSES a `mutual_tls` mount
   and every TLS dial by name (`KernelTlsMissing` / `KtlsUnavailable`, `cluster_wire_ktls_refused`), never a
   silent fall-back to the in-tree record layer (the handshake's transport and the portable path). The kTLS
-  data path, its tests and the CPU-per-GB measurement are owed against a `CONFIG_TLS=y` kernel
-  (`rung-10-mtls.md` §9). zcrx's `RECV_ZC` combines only with NIC TLS RX offload (`CONFIG_TLS_DEVICE`).
+  data path is written (`tls.ktls`); its rows and the CPU-per-GB column run where the probe finds the ULP
+  and are the ledger's `other_step` skip until then (`rung-10-mtls.md` §9). zcrx's `RECV_ZC` combines only
+  with NIC TLS RX offload (`CONFIG_TLS_DEVICE`).
 
 ### 1.2 Framing — the reference's bytes, and the port's v4 frame
 

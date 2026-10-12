@@ -3,12 +3,14 @@
 > **The owner's direction of 2026-10-12 (after §1–§8 landed): the record layer on Linux is the KERNEL's
 > (kTLS).** The handshake, the PKI, the OpenSSL interop and the exporter-bound session key stay; after
 > the handshake the traffic keys go to the `tls` ULP and the socket is plain TCP to the daemon. **The
-> venue kernel has no kTLS** (`# CONFIG_TLS is not set` in 7.2.6-sqz, §9.1), so per the direction this
-> landing stops at the DESIGN (§9) plus the FAIL-LOUD path (§9.3): on Linux a `mutual_tls` mount and every
-> TLS dial refuse by name, never a silent fall-back to the userspace record layer, which stays the
-> handshake's transport and the portable path. §4–§6 below are the userspace record layer's record (the
-> comparison column of §9.6) — the two-daemon matrix and the wire's verb rows over TLS ran green under it
-> and are now the skip ledger's until a kernel with `CONFIG_TLS` arrives.
+> venue kernel has no kTLS** (`# CONFIG_TLS is not set` in 7.2.6-sqz, §9.1; the orchestrator is rebuilding
+> it with `CONFIG_TLS=y` + `CONFIG_TLS_DEVICE=y`). This landing carries the kTLS record layer WRITTEN against
+> the UAPI (§9.2, `tls.ktls`) with every kTLS row gated on the runtime probe — a ledgered `other_step` skip
+> naming the kernel that goes red→green the moment the ULP exists — plus the FAIL-LOUD path (§9.3): on Linux
+> a `mutual_tls` mount and every TLS dial refuse by name without the ULP, never a silent fall-back to the
+> userspace record layer, which stays the handshake's transport and the portable path. §4–§6 below are the
+> userspace record layer's record (the comparison column of §9.6) — the two-daemon matrix and the wire's verb
+> rows ran green under it before the direction and now run over kTLS where the kernel carries it.
 
 Charter §8 ("remote workers over TCP/TLS with HMAC enrollment … verify-read sampling below 100 % is
 admissible only on authenticated ∧ confidential"), §1.2 (the TCP/TLS stack is the sanctioned non-uring
@@ -203,10 +205,11 @@ Superseded by §10 after the owner's kTLS direction.
 | TLS 1.3 + rekey acceptance (6.14+ `TLS_TX`/`TLS_RX` re-setsockopt after a KeyUpdate) | **not testable here** — the kernel series (7.2) is past 6.14, so the API is expected present once `CONFIG_TLS=y`; the design below assumes it and the owed test row pins it |
 
 **The venue change the kTLS record layer needs:** `CONFIG_TLS=y` (and `CONFIG_TLS_DEVICE=y` for NIC
-offload) in the sqz kernel config. Everything below is designed against the upstream uapi
-(`include/uapi/linux/tls.h`) and recorded so the data path lands as one commit when the kernel does.
+offload) in the sqz kernel config — in progress (the orchestrator, 2026-10-12). Everything below is written
+against the upstream uapi (`include/uapi/linux/tls.h`); the rows that need the ULP are the ledger's
+(`skip[other_step] … kernel 7.2.6-sqz: no tls ULP (CONFIG_TLS)`) until it lands.
 
-### 9.2 The design: handshake in-tree, record layer = kTLS
+### 9.2 The record layer: handshake in-tree, record layer = kTLS (`tls.ktls`, written)
 
 1. **After the handshake** (`Conn.armRecordLayer`, both roles): `setsockopt(fd, SOL_TCP, TCP_ULP, "tls", 3)`
    on the ESTABLISHED socket (`linux.TCP.ULP` = 31), then `setsockopt(fd, SOL_TLS = 282, TLS_TX = 1,
@@ -248,13 +251,16 @@ offload) in the sqz kernel config. Everything below is designed against the upst
 5. **The dead-on-arrival peek** stays on the raw socket; under kTLS the kernel presents the DECRYPTED
    queue to `MSG_PEEK`, so a queued close_notify is a control record the peek cannot see as EOF — the
    mux reader's `recvmsg` classifies it (the §P row stands).
-6. **Tests owed with the data path** (each a `wire e2e` row gated on `tls.ktls.probeKernel() == .present`):
-   the 1,000-verb row over kTLS (`authenticated() ∧ confidential()`, 2 handshakes + 1 admission); a
-   `close_notify` from the peer closes the session loud and counted; a fatal alert closes loud and
-   counted; a KeyUpdate from the peer re-keys RX and the stream continues (and a `TLS_RX`
-   re-setsockopt is ACCEPTED — the 6.14 rekey pin); our own KeyUpdate at the ceiling re-keys TX; a
-   `NewSessionTicket` from `openssl s_server` is ignored and counted; the OpenSSL oracle rows over kTLS;
-   the two-daemon matrix (its contract and its userspace-layer output are §5).
+6. **The tests, written and gated on `tls.ktls.probeKernel()`** (`skip[other_step]` naming the kernel
+   when the ULP is absent): `tls e2e [ktls]` — a loopback pair of our engines over kernel TLS
+   (`confidential()` only with both halves; records both ways; a 1 MiB + 80 B frame = 65 + 2 kernel
+   records; our KeyUpdate forced through the ceiling re-keys the peer's RX by a second `TLS_RX` and the
+   stream continues — the 6.14 rekey pin; a peer-requested update honoured by the next write;
+   close_notify = EOF counted; a fatal alert closes loud and counted); OpenSSL in both roles over kTLS
+   (`s_server`'s two NewSessionTickets ignored and counted off the cmsg; `s_client`'s exporter equal;
+   close_notify through `TLS_SET_RECORD_TYPE`); the wire's verb rows (1,000 verbs on one kernel-TLS
+   connection, `authenticated() ∧ confidential()`, the foreign-CA client refused); the scoping row's kTLS
+   column with CPU per GB (§9.6); the two-daemon matrix over kTLS (`smoke.zig`, §5's contract).
 
 ### 9.3 The fail-loud path (this build)
 
@@ -267,8 +273,9 @@ offload) in the sqz kernel config. Everything below is designed against the upst
   fall-back`; `present` → `KernelTlsRecordLayerOwed` ("this build's kTLS data path is owed … never a
   silent fall-back"). Either way the mount exits 1 and nothing is mounted (the smoke row).
 - **At every connection** (defence in depth; `RecordLayer.ktls` requested by the listener and the dialer
-  with the socket): after a GOOD handshake `armRecordLayer` attaches the ULP → `KtlsUnavailable` /
-  `KtlsRecordLayerOwed`, a fatal `internal_error` alert to the peer, the refusal counted
+  with the socket): after a GOOD handshake `armRecordLayer` installs the keys → without the ULP
+  `KtlsUnavailable`, with it but refused keys `KtlsInstallFailed` (the errno logged), a fatal
+  `internal_error` alert to the peer, the refusal counted
   (`cluster_wire_ktls_refused`) and logged on BOTH ends, the session never admitted. Measured on the venue
   (`wire e2e over MutualTls, the kernel record layer's law`): one MutualTls dial → 2 counts (the dialer
   arms after its Finished and refuses first; the listener after reading that Finished), 0 admissions, 0
@@ -277,8 +284,9 @@ offload) in the sqz kernel config. Everything below is designed against the upst
   `skip[no_kernel_feature]` for the verb rows.
 - **The userspace record layer** (`Conn.linkRead/linkWrite`) is reachable only with
   `RecordLayer.userspace`, which no Linux product path requests: it is the handshake's transport
-  everywhere and the application path of the portable tests and the engine's OpenSSL oracle rows (which
-  prove the handshake, the certificate verdicts and the exporter — all of which the kTLS design reuses).
+  everywhere and the application path of the portable tests and the engine's `[userspace]` OpenSSL
+  oracle rows (which prove the handshake, the certificate verdicts and the exporter — all of which the
+  kTLS path reuses verbatim: the same `Conn`, the same `Traffic` keys, the same exporter).
 
 ### 9.4 The smoke row on this kernel
 
@@ -320,14 +328,18 @@ hardware-owed row like the zcrx lane's ifq/steering rows.
 | 1 MiB writes | 9.98 GB/s | 1.99 GB/s | owed |
 | daemon CPU per GB | — | — (not measured before the direction) | owed — the point of kTLS: the AEAD on the kernel's softirq/`sendmsg` path, `SEND_ZC` where the frame body is pinned |
 
-The kTLS column's harness is written into the design: the scoping row gains `CLOCK_PROCESS_CPUTIME_ID`
-around the transfer (CPU-s per GB) and runs the three columns when the probe reads `present`.
+The scoping row now measures `CLOCK_PROCESS_CPUTIME_ID` around the transfer (CPU-s per GB, both ends in
+one process) and runs the kTLS column when the probe reads `present`. Debug-profile readings on this
+kernel for the two columns that run (the ReleaseSafe table above stands for throughput): plaintext 0.09–0.13
+CPU-s/GB; userspace TLS 38–42 CPU-s/GB in Debug (the AEAD unoptimised — the ReleaseSafe figure is the one to
+compare kTLS against, to be taken on the new kernel in the same run).
 
 ## 10. Owed (revised)
 
 - **The kernel:** `CONFIG_TLS=y` (+ `CONFIG_TLS_DEVICE=y`) in the sqz kernel series — the venue change.
-- **The kTLS data path** (§9.2) and its tests (§9.2.6), one commit against that kernel; the measurement
-  column (§9.6); the two-daemon matrix re-armed (§5's contract).
+- **Running the kTLS rows** (§9.2.6: the pair, OpenSSL both roles, the wire's verbs, the scoping column,
+  the two-daemon matrix) on that kernel — the code and the rows are landed and ledgered; the §9.6 kTLS
+  column and §5's output over kTLS are what the kernel unblocks.
 - The join ladder's console line for a refused channel (`verbError`: `HandshakeRefused → Refused`) — the
   symmetric plane's owner.
 - A durable channel class in `set_config` if the owner wants the set, not the node, to declare it (0003 §P).

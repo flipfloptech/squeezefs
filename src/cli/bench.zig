@@ -1160,7 +1160,7 @@ pub const hash_bench = struct {
         for (modes) |mode| {
             for (algos) |algo| {
                 for (sizes) |size| {
-                    for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+                    for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7); // the vectors' fill (`sqzhash.fillTestData`)
                     out[n] = measure(algo, mode, buf[0..size]);
                     n += 1;
                 }

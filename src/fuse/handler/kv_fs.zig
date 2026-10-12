@@ -836,11 +836,18 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         }
 
         fn findDentry(self: *Self, parent: u64, name: []const u8) Error!?Found {
-            if (try self.tokenServe(parent, .{ .dentries = true })) |served| {
+            // A foreign directory: the token's resident WINDOW around the
+            // name's cookies (its hash orders them); a window cut inside the
+            // name's run is re-served from its end until the absence is
+            // definitive — bounded by the set.
+            const hash54 = key.dentryNameHash54(name, self.store.nameKey());
+            var wants = read_divert.cache.Wants.forName(hash54);
+            while (try self.tokenServe(parent, wants)) |served| {
                 defer served.release(self.io);
                 const e = served.entry orelse return null;
-                const rec = e.lookupName(name) orelse return null;
-                return try foundFromToken(parent, rec);
+                if (e.lookupName(name)) |rec| return try foundFromToken(parent, rec);
+                if (e.coversName(hash54)) return null;
+                wants.after = e.lastCookie();
             }
             var buf: ChainBuf = .{};
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
@@ -2077,13 +2084,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
         /// A directory's dentry page at its holder (the divert's dentry set
         /// for a foreign one; the store's range for ours).
         fn dirPage(self: *Self, arena: Allocator, dir_local: u64, after: u64, max: usize, out: *std.ArrayList(sym_xv.stripe.DirRec)) Error!bool {
-            if (try self.tokenServe(dir_local, .{ .dentries = true })) |served| {
+            if (try self.tokenServe(dir_local, .{ .dentries = true, .after = after })) |served| {
                 defer served.release(self.io);
                 const e = served.entry orelse return false;
                 const page = e.pageAfter(after);
                 const n = @min(page.len, max);
                 for (page[0..n]) |r| try out.append(arena, .{ .cookie = r.cookie, .child = r.child_ino, .file_type = r.file_type, .name = try arena.dupe(u8, r.name) });
-                return page.len > max;
+                // More follows past this page, or past the window's end.
+                return page.len > max or !e.dir_complete;
             }
             return sym_xv.stripe.pageFromStore(Store, self.store, arena, globalOf(dir_local), after, max, out) catch |e| switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -2725,15 +2733,17 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             }
             c.stage(.meta_backend_start);
             defer c.stage(.meta_backend_done);
-            // A foreign directory: the page is the token's cookie-ordered set
-            // strictly after the resume cookie (one binary search).
-            if (try self.tokenServe(dir, .{ .dentries = true })) |served| {
+            // A foreign directory: the page is the token's cookie-ordered
+            // WINDOW strictly after the resume cookie (one binary search); a
+            // window that ends before the set does ends the reply there and
+            // the kernel's next call, at its last cookie, pages the rest in.
+            const after: u64 = switch (pos) {
+                .after_entry => a.offset,
+                else => 0,
+            };
+            if (try self.tokenServe(dir, .{ .dentries = true, .after = after })) |served| {
                 defer served.release(self.io);
                 const e = served.entry orelse return error.FileNotFound;
-                const after: u64 = switch (pos) {
-                    .after_entry => a.offset,
-                    else => 0,
-                };
                 for (e.pageAfter(after)) |rec| {
                     // The striping markers (NUL-led) never show (the ONE pager).
                     if (sym_xv.stripe.isMarkerName(rec.name)) continue;

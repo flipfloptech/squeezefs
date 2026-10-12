@@ -37,6 +37,7 @@ const verbs = @import("../../../wire/verbs.zig");
 const codec = @import("../../../wire/codec.zig");
 const frame = @import("../../../wire/frame.zig");
 const record = @import("../../record.zig");
+const key = @import("../../key.zig");
 const mem_budget = @import("../../../mem/budget.zig");
 const table = @import("token_table.zig");
 
@@ -56,6 +57,14 @@ pub const ClientId = table.ClientId;
 /// grant page could be resident.
 pub fn recordsBudgetBytes(mem_budget_bytes: u64) u64 {
     return @max(mem_budget_bytes / 256, @as(u64, frame.CONTROL_CAP));
+}
+
+/// The dentry WINDOW a directory's entry holds resident (spec Q13, the
+/// paged-resident set): a quarter of the records budget, so three other
+/// objects' entries stay resident beside one huge directory's window; at
+/// least one wire page, so a tiny budget still pages instead of refusing.
+pub fn dirWindowBytes(records_budget_bytes: u64) u64 {
+    return @max(records_budget_bytes / 4, @as(u64, frame.CONTROL_CAP));
 }
 /// 64 generation slots = `u64::BITS`, the poison mask's width — a
 /// representation bound; ≥ 64 s at one step per second per volume.
@@ -92,6 +101,9 @@ pub const stats = struct {
     pub var dlm_token_sheds: counters.ShardedCounter = .{};
     /// ONE entry over the whole records budget: refused loud.
     pub var dlm_token_oversize_refusals: counters.ShardedCounter = .{};
+    /// Dentry fetches cut at the window bound (the set is larger than one
+    /// resident window; the rest pages in on demand).
+    pub var dlm_token_dir_windows: counters.ShardedCounter = .{};
     /// Serves refused by the gate (lease past T_self, channel not ok).
     pub var dlm_token_serve_refusals: counters.ShardedCounter = .{};
     /// Rounds completed on a holder's channel (grants + pushes).
@@ -316,8 +328,12 @@ pub const Entry = struct {
     /// Sorted by name (the holder pages them in name order).
     xattrs: []Xattr,
     xattrs_complete: bool,
-    /// Cookie order; null when the fetch did not ask for dentries.
+    /// Cookie order; null when the fetch did not ask for dentries. The
+    /// resident WINDOW of the set: the records STRICTLY after `dir_from`
+    /// up to the set's end (`dir_complete`) or the window's byte bound.
     dir: ?[]DirRecord,
+    dir_from: u64 = 0,
+    dir_complete: bool = true,
     /// `128 + Σ xattr bytes + Σ (24 + name) per dentry`.
     bytes: u64,
     state: State = .live,
@@ -337,6 +353,31 @@ pub const Entry = struct {
         const d = self.dir orelse return null;
         for (d) |r| if (std.mem.eql(u8, r.name, name)) return r;
         return null;
+    }
+
+    /// Does the resident window answer a page STRICTLY after `cookie`:
+    /// the window starts at or before it and either reaches the set's end
+    /// or holds at least one record past it.
+    pub fn coversAfter(self: *const Entry, cookie: u64) bool {
+        const d = self.dir orelse return false;
+        if (cookie < self.dir_from) return false;
+        return self.dir_complete or (d.len > 0 and cookie < d[d.len - 1].cookie);
+    }
+
+    /// Is a name's absence from the window DEFINITIVE: every cookie a
+    /// record of `hash54` can carry (`coll_seq` 0…255) lies inside it.
+    pub fn coversName(self: *const Entry, hash54: u64) bool {
+        const d = self.dir orelse return false;
+        const first = key.encodeReaddirCookie(hash54, 0);
+        const last = key.encodeReaddirCookie(hash54, std.math.maxInt(u8));
+        if (first <= self.dir_from) return false;
+        return self.dir_complete or (d.len > 0 and d[d.len - 1].cookie >= last);
+    }
+
+    /// The last cookie the window holds (`dir_from` when empty).
+    pub fn lastCookie(self: *const Entry) u64 {
+        const d = self.dir orelse return self.dir_from;
+        return if (d.len == 0) self.dir_from else d[d.len - 1].cookie;
     }
 
     /// The records STRICTLY after `cookie` (0 = start).
@@ -409,11 +450,11 @@ pub const Cache = struct {
     }
 
     /// A hit: LIVE and carrying the dentries when asked; pinned.
-    pub fn probe(self: *Cache, io: Io, object: Object, wants_dentries: bool) ?*Entry {
+    pub fn probe(self: *Cache, io: Io, object: Object, wants: Wants) ?*Entry {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         const e = self.entries.get(object) orelse return null;
-        if (e.state != .live or (wants_dentries and e.dir == null)) return null;
+        if (e.state != .live or (wants.dentries and !e.coversAfter(wants.after))) return null;
         e.pins += 1;
         e.used = true;
         return e;
@@ -599,7 +640,20 @@ pub fn coreError(e: Error) errors.Error {
     };
 }
 
-pub const Wants = struct { dentries: bool = false, records: bool = true };
+pub const Wants = struct {
+    dentries: bool = false,
+    records: bool = true,
+    /// With `dentries`: the cookie the caller's page or lookup starts
+    /// STRICTLY after (0 = the set's start); the resident window must
+    /// cover it, else the fetch starts there.
+    after: u64 = 0,
+
+    /// The window a lookup of a name hashing to `hash54` needs: from just
+    /// before its first possible cookie.
+    pub fn forName(hash54: u64) Wants {
+        return .{ .dentries = true, .after = key.encodeReaddirCookie(hash54, 0) - 1 };
+    }
+};
 
 /// A frame handed to the drain lane: the ack travels once the serves
 /// below `gen` landed and the census is purged.
@@ -638,9 +692,11 @@ pub const Reader = struct {
     deferred_wake: sync.Notify = .init,
     /// The last holder redirect the wire named (`NotHolder` / `HolderDead`).
     last_redirect_holder: std.atomic.Value(u32) = .init(0),
+    /// The dentry window's byte bound (`dirWindowBytes`; a test lowers it).
+    dir_window_bytes: u64,
 
     pub fn init(gpa: Allocator, io: Io, client_id: ClientId, volume: u16, link: Link, sink: RecallSink, lease: SelfLease, budget_bytes: u64) Reader {
-        return .{ .gpa = gpa, .io = io, .client_id = client_id, .volume = volume, .link = link, .sink = sink, .lease = lease, .cache = Cache.init(gpa, budget_bytes) };
+        return .{ .gpa = gpa, .io = io, .client_id = client_id, .volume = volume, .link = link, .sink = sink, .lease = lease, .cache = Cache.init(gpa, budget_bytes), .dir_window_bytes = dirWindowBytes(budget_bytes) };
     }
 
     pub fn deinit(self: *Reader) void {
@@ -677,7 +733,7 @@ pub const Reader = struct {
         // membership lease's expiry — the gate above. The fail-closed
         // channel gates FETCHES: a holder whose last round failed grants
         // nothing new until a round completes (0002 row 355).
-        if (self.cache.probe(io, object, wants.dentries)) |e| {
+        if (self.cache.probe(io, object, wants)) |e| {
             stats.dlm_token_hits.inc();
             return .{ .entry = e, .cache = &self.cache };
         }
@@ -689,7 +745,7 @@ pub const Reader = struct {
             return error.TokenChannelStale;
         }
         while (true) {
-            if (self.cache.probe(io, object, wants.dentries)) |e| {
+            if (self.cache.probe(io, object, wants)) |e| {
                 stats.dlm_token_hits.inc();
                 return .{ .entry = e, .cache = &self.cache };
             }
@@ -745,8 +801,9 @@ pub const Reader = struct {
         var dir: std.ArrayList(DirRecord) = .empty;
         var xattr_after: []const u8 = "";
         var records_done = false;
-        var dir_after: u64 = 0;
+        var dir_after: u64 = wants.after;
         var dir_done = !wants.dentries;
+        var dir_complete = true;
         var first = true;
         while (!(records_done and dir_done)) {
             var want_bits: u8 = 0;
@@ -795,7 +852,16 @@ pub const Reader = struct {
                 carried += 1;
             }
             var ds = page.dir();
+            var cut = false;
             while (ds.next()) |d| {
+                // The window's bound (spec Q13): a record that would carry
+                // the entry past it ends the window here — at least one
+                // record per window, so a walk always advances; the rest
+                // of the set pages in on demand from the window's end.
+                if (dir.items.len > 0 and e.bytes + table.DIR_RECORD_BYTES + d.name.len > self.dir_window_bytes) {
+                    cut = true;
+                    break;
+                }
                 const name = arena.dupe(u8, d.name) catch return error.OutOfMemory;
                 dir.append(arena, .{ .cookie = d.head.cookie, .child_ino = d.head.child_ino, .file_type = d.head.file_type, .name = name }) catch return error.OutOfMemory;
                 e.bytes += table.DIR_RECORD_BYTES + name.len;
@@ -804,6 +870,11 @@ pub const Reader = struct {
             }
             records_done = page.head.flags & verbs.PAGE_XATTRS_COMPLETE != 0;
             if (page.head.flags & verbs.PAGE_HAS_DIR != 0) dir_done = page.head.flags & verbs.PAGE_DIR_COMPLETE != 0;
+            if (cut) {
+                dir_done = true;
+                dir_complete = false;
+                stats.dlm_token_dir_windows.inc();
+            }
             if (e.bytes > self.cache.budget_bytes) {
                 stats.dlm_token_oversize_refusals.inc();
                 return error.Oversize;
@@ -814,7 +885,11 @@ pub const Reader = struct {
         stats.dlm_token_grant_rtt_ns.record(clock.monotonicNs() -| t0);
         e.xattrs = xattrs.items;
         e.xattrs_complete = true;
-        if (wants.dentries) e.dir = dir.items;
+        if (wants.dentries) {
+            e.dir = dir.items;
+            e.dir_from = wants.after;
+            e.dir_complete = dir_complete;
+        }
         // Room by voluntary releases, drained + purged THEN released.
         var retired: std.ArrayList(Object) = .empty;
         defer retired.deinit(self.gpa);
@@ -1087,14 +1162,14 @@ test "the cache: install under gen0 is refused by a bump the check sees and foun
     const e2 = try mk(gpa, 7, true);
     try testing.expectEqual(e2, c.install(io, e2, gen1).installed);
     try testing.expectEqual(@as(usize, 1), c.count(io));
-    try testing.expect(c.probe(io, 7, true) != null);
+    try testing.expect(c.probe(io, 7, .{ .dentries = true }) != null);
     c.unpin(io, e2);
     // A bare entry never displaces the dentry-bearing one: the richer one
     // is served (pinned) in its place.
     const e3 = try mk(gpa, 7, false);
     try testing.expectEqual(e2, c.install(io, e3, gen1).installed);
     c.unpin(io, e2);
-    try testing.expect(c.probe(io, 7, true) != null);
+    try testing.expect(c.probe(io, 7, .{ .dentries = true }) != null);
     // Revoked while pinned (twice): alive until the last unpin.
     c.unpin(io, e2);
     try testing.expectEqual(@as(u32, 1), try c.revoke(io, &.{7}));
@@ -1127,7 +1202,7 @@ test "the budget: ONE oversize entry is refused loud; eviction gives the used bi
     }
     // Object 2 was used (probed): the first pass clears its bit and takes
     // another; it survives.
-    _ = c.probe(io, 2, false).?;
+    _ = c.probe(io, 2, .{}).?;
     c.unpin(io, es[1]);
     var out: std.ArrayList(Object) = .empty;
     defer out.deinit(gpa);

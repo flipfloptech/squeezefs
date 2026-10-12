@@ -532,6 +532,74 @@ test "a directory's token carries its dentry set paged by cookie: lookup by name
     try testing.expect(!f.holder.holdsGrant(io, objectOf(99), 1));
 }
 
+test "the paged-resident dentry set (rung 10 item 5c, spec Q13): a directory larger than the reader's window is never refused — the entry holds one cookie WINDOW from the serve's `after`, a readdir pages window after window (each a fetch, dir_complete false until the last), a lookup by name fetches the window around the name's cookies and judges absence only inside it (a cut mid-run re-serves from the window's end); a cached window is a hit; oversize refusals stay 0" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const f = try TwoMembers.init(gpa, io, 1);
+    defer f.deinit();
+    // A's directory 5 with 5,000 children (several wire pages) whose
+    // cookies ARE their names' hashes (the filesystem's law), under the
+    // fixture's name key.
+    const name_key = key.NameKey.init(0xABCD);
+    const n: usize = 5000;
+    const names = try gpa.alloc([5]u8, n);
+    defer gpa.free(names);
+    for (names, 0..) |*nm, i| _ = std.fmt.bufPrint(nm, "n{d:0>4}", .{i}) catch unreachable;
+    try f.records.putInode(objectOf(5), .{ .mode = 0o040755, .nlink = 2, .mtime = 100 });
+    for (names, 0..) |*nm, i| try f.records.putDentry(objectOf(5), key.encodeReaddirCookie(key.dentryNameHash54(nm, &name_key), 0), inos.makeGlobalIno(100 + i, SLOT, inos.ROUTING_WIDTH), nm);
+    const b = f.reader(0);
+    // Bind the plane, then shrink its window to ~1,500 records (a wire
+    // page carries ~2,000: the cut lands at a page boundary).
+    var s0 = (try b.serve(io, objectOf(3), .{})).?;
+    s0.release(io);
+    const plane = b.planeOf(io, A_ID).?;
+    plane.dir_window_bytes = table.TOKEN_ENTRY_BYTES + 1500 * (table.DIR_RECORD_BYTES + 5);
+    const oversize0 = cache.stats.dlm_token_oversize_refusals.load();
+    const windows0 = cache.stats.dlm_token_dir_windows.load();
+    // The readdir walk: windows until complete, every record once, in order.
+    var seen: usize = 0;
+    var after: u64 = 0;
+    var windows: u32 = 0;
+    var last_cookie: u64 = 0;
+    while (true) {
+        var s = (try b.serve(io, objectOf(5), .{ .dentries = true, .after = after })).?;
+        defer s.release(io);
+        const e = s.entry.?;
+        try testing.expect(e.coversAfter(after));
+        const page = e.pageAfter(after);
+        for (page) |r| {
+            try testing.expect(r.cookie > last_cookie);
+            last_cookie = r.cookie;
+            seen += 1;
+        }
+        windows += 1;
+        if (e.dir_complete) break;
+        try testing.expect(page.len >= 1);
+        after = e.lastCookie();
+    }
+    try testing.expectEqual(n, seen);
+    try testing.expect(windows >= 2);
+    try testing.expectEqual(windows0 + windows - 1, cache.stats.dlm_token_dir_windows.load());
+    // A lookup by name: the window around its cookies, found; a second
+    // lookup inside the same window is a hit (no fetch).
+    const h35 = key.dentryNameHash54("n3500", &name_key);
+    var s = (try b.serve(io, objectOf(5), cache.Wants.forName(h35))).?;
+    try testing.expectEqual(inos.makeGlobalIno(3600, SLOT, inos.ROUTING_WIDTH), s.entry.?.lookupName("n3500").?.child_ino);
+    try testing.expect(s.entry.?.coversName(h35));
+    s.release(io);
+    const g0 = cache.stats.dlm_token_grants.load();
+    s = (try b.serve(io, objectOf(5), cache.Wants.forName(h35))).?;
+    s.release(io);
+    try testing.expectEqual(g0, cache.stats.dlm_token_grants.load());
+    // An absent name: null, and the window judges the absence.
+    const hzz = key.dentryNameHash54("zz", &name_key);
+    s = (try b.serve(io, objectOf(5), cache.Wants.forName(hzz))).?;
+    try testing.expect(s.entry.?.lookupName("zz") == null);
+    try testing.expect(s.entry.?.coversName(hzz) or s.entry.?.lastCookie() < key.encodeReaddirCookie(hzz, 0));
+    s.release(io);
+    try testing.expectEqual(oversize0, cache.stats.dlm_token_oversize_refusals.load());
+}
+
 /// A recall pushed while a DMA read is in flight on the reader.
 const InFlightRig = struct {
     f: *TwoMembers,

@@ -48,6 +48,10 @@ pub const stats = struct {
     pub var current_staged_write_bytes: counters.Gauge = .{};
     /// `staged_writes_in_flight`: ring keys resident or being placed.
     pub var staged_writes_in_flight: counters.Gauge = .{};
+    /// `staging_cell_state_bytes`: the live cells' value-hash states
+    /// (`@sizeOf(ValueHash)` each — the budget component
+    /// `staging_cell_state`'s gauge); `≤ Segment.cellStateBound(capacity)`.
+    pub var staging_cell_state_bytes: counters.Gauge = .{};
     /// `staging_over_cap_refusals`: a stage refused `StorageFull` at the
     /// pool cap (the caller's spill escalation follows).
     pub var staging_over_cap_refusals: counters.ShardedCounter = .{};
@@ -98,9 +102,10 @@ pub const stats = struct {
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
+    try w.print("{{\"current_staged_write_bytes\":{d},\"staged_writes_in_flight\":{d},\"staging_cell_state_bytes\":{d},\"staging_over_cap_refusals\":{d},\"staging_ring_full_refusals\":{d},\"staging_pressure_kicks\":{d},\"staging_recovery_records\":{d},\"staging_recovery_torn_records\":{d},\"staging_generation_discards\":{d},\"staging_foreign_scope_refusals\":{d},\"staged_payload_lost_reads\":{d},\"dismount_promoted_files\":{d},\"dismount_promoted_bytes\":{d},\"dismount_promote_failures\":{d},\"fsync_promoted_files\":{d},\"staging_appends\":{d},\"staging_append_bytes\":{d},\"staging_restages\":{d},\"staging_restage_bytes\":{d}}}", .{
         stats.current_staged_write_bytes.load(),
         stats.staged_writes_in_flight.load(),
+        stats.staging_cell_state_bytes.load(),
         stats.staging_over_cap_refusals.load(),
         stats.staging_ring_full_refusals.load(),
         stats.staging_pressure_kicks.load(),
@@ -271,8 +276,23 @@ pub const RecordHeader = struct {
 /// The checksum's streaming state over the VALUE (`hash64` consumes the value
 /// FIRST, the key and the header LAST): an in-place append extends the
 /// state by the appended bytes and finishes it — O(appended), never a
-/// rehash of a 4 MiB image per 4-byte append. The live cell keeps the state.
+/// rehash of a 4 MiB image per 4-byte append. The live cell keeps the state
+/// (one per live record, `gpa`-owned, gauged `staging_cell_state_bytes`).
 pub const ValueHash = checksum.Hasher;
+
+comptime {
+    // A record occupies at least one grain of the ring; the RAM state kept
+    // beside it must stay under that, or the states outweigh the ring they
+    // describe (the 16-chunk hasher did: 4.7 KiB per cell against 4 KiB).
+    assert(@sizeOf(ValueHash) < RECORD_ALIGN);
+}
+
+/// The R5 component over the cells' states: attribution-only (weight 0) —
+/// a state leaves with its cell, and the never-lossy lever that empties
+/// cells is `staging_mmap`'s promotion kick; heap bytes, never page cache.
+pub fn cellStateComponent() budget.Component {
+    return budget.Component.init("staging_cell_state", 0, 0, .{ .gauge = &stats.staging_cell_state_bytes }, null);
+}
 
 pub fn valueHash(value: []const u8) ValueHash {
     var h: ValueHash = .init();
@@ -492,6 +512,24 @@ pub const Segment = struct {
         return @intCast(cap / RECORD_ALIGN + 1);
     }
 
+    /// The most RAM the live cells' value-hash states can take at `cap`:
+    /// one state per cell (`staging_cell_state_bytes` never exceeds it).
+    pub fn cellStateBound(cap: u64) u64 {
+        return @as(u64, maxCells(cap)) * @sizeOf(ValueHash);
+    }
+
+    /// A cell's value-hash state, gauged at birth; `destroyState` undoes it.
+    fn createState(self: *Segment) Allocator.Error!*ValueHash {
+        const state = try self.gpa.create(ValueHash);
+        stats.staging_cell_state_bytes.add(@sizeOf(ValueHash));
+        return state;
+    }
+
+    fn destroyState(self: *Segment, state: *ValueHash) void {
+        stats.staging_cell_state_bytes.sub(@sizeOf(ValueHash));
+        self.gpa.destroy(state);
+    }
+
     pub fn init(gpa: Allocator, image: []u8, backing: Backing) Allocator.Error!Segment {
         assert(derive.isAligned(image.len, RECORD_ALIGN));
         const n = maxCells(image.len);
@@ -511,7 +549,7 @@ pub const Segment = struct {
     }
 
     pub fn deinit(self: *Segment) void {
-        for (self.cells) |*c| if (c.hash) |h| self.gpa.destroy(h);
+        for (self.cells) |*c| if (c.hash) |h| self.destroyState(h);
         self.index.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.free_cells.deinit(self.gpa);
@@ -604,7 +642,7 @@ pub const Segment = struct {
             break :blk e;
         };
         stats.staged_writes_in_flight.add(1);
-        const state = try self.gpa.create(ValueHash);
+        const state = try self.createState();
         state.* = valueHash(value);
         writeRecord(self.image, placed.rec_off, key.bytes(), value, generation, fencing, state);
         if (self.backing.sync) |s| s(self.backing.ctx, placed.rec_off, stride(KEY_LEN, value.len));
@@ -654,8 +692,8 @@ pub const Segment = struct {
         @memcpy(self.image[voff + @as(usize, @intCast(at)) ..][0..data.len], data);
         // The checksum state extends by exactly the new bytes (a recovered
         // record hashes its value once, here).
-        const state = try self.gpa.create(ValueHash);
-        errdefer self.gpa.destroy(state);
+        const state = try self.createState();
+        errdefer self.destroyState(state);
         state.* = if (old.hash) |h| h.* else valueHash(self.image[voff .. voff + ext.val_len]);
         state.update(self.image[voff + ext.val_len .. voff + new_len]);
         const slot = ext.slot.other();
@@ -672,7 +710,7 @@ pub const Segment = struct {
         if (old.retired.load(.acquire)) {
             // Unlinked or promoted meanwhile: the bytes we grew belong to a
             // record that is gone; drop the lease (the last one reclaims).
-            self.gpa.destroy(state);
+            self.destroyState(state);
             if (old.refs.fetchSub(1, .acq_rel) == 1) self.reclaimCellLocked(old);
             return error.Stale;
         }
@@ -728,7 +766,7 @@ pub const Segment = struct {
         const e = cell.extent;
         // A shadowed cell's bytes live on under its successor: free the cell alone.
         if (!cell.shadowed) if (self.backing.reclaim) |r| r(self.backing.ctx, e.rec_off, e.end() - e.rec_off);
-        if (cell.hash) |h| self.gpa.destroy(h);
+        if (cell.hash) |h| self.destroyState(h);
         cell.* = .{};
         const idx: usize = (@intFromPtr(cell) - @intFromPtr(self.cells.ptr)) / @sizeOf(Cell);
         self.free_cells.appendAssumeCapacity(@intCast(idx));
@@ -2036,6 +2074,54 @@ test "pool: the ledger charges the delta on a re-stage and credits on release so
     try testing.expectEqual(@as(u32, 3), kicks.pressure);
 }
 
+test "the live cells' value-hash states are gauged (R5): N staged records carry N × @sizeOf(ValueHash) in staging_cell_state_bytes, an in-place append replaces a state for a state, a release frees it, deinit frees the rest; the bound is the cell population × the state, under one grain per record; the component is attribution-only" {
+    const gpa = testing.allocator;
+    const cap = 64 * 4096;
+    const r = try ramSegment(gpa, cap);
+    defer gpa.free(r.image);
+    var seg = r.seg;
+    const state_bytes: u64 = @sizeOf(ValueHash);
+    // A state is smaller than the grain its record occupies on the device:
+    // the RAM beside a record never outweighs the record (4.7 KiB did).
+    try testing.expect(state_bytes < RECORD_ALIGN);
+    try testing.expectEqual(Segment.maxCells(cap) * state_bytes, Segment.cellStateBound(cap));
+    try testing.expect(Segment.cellStateBound(cap) < cap / 2);
+    const g0 = stats.staging_cell_state_bytes.load();
+    const v: [100]u8 = @splat(7);
+    const n_live: u64 = 12;
+    for (0..n_live) |i| try seg.put(tkey(@intCast(i + 1), i + 1), &v, i + 1, 0, 0);
+    try testing.expectEqual(g0 + n_live * state_bytes, stats.staging_cell_state_bytes.load());
+    try testing.expect(stats.staging_cell_state_bytes.load() - g0 <= Segment.cellStateBound(cap));
+    // An in-place append mints the successor's state and frees the shadowed cell's.
+    try seg.appendInPlace(tkey(1, 1), 100, &v, 1, 100, 0);
+    try testing.expectEqual(g0 + n_live * state_bytes, stats.staging_cell_state_bytes.load());
+    // A same-key replace: the old cell's state goes with the last reference.
+    const lease = seg.get(tkey(2, 2)).?;
+    try seg.put(tkey(2, 2), &v, 200, 0, 0);
+    try testing.expectEqual(g0 + (n_live + 1) * state_bytes, stats.staging_cell_state_bytes.load());
+    lease.release();
+    try testing.expectEqual(g0 + n_live * state_bytes, stats.staging_cell_state_bytes.load());
+    // A release frees the state; a recovered record has none until its first append.
+    try testing.expect(seg.remove(tkey(3, 3), null));
+    try testing.expectEqual(g0 + (n_live - 1) * state_bytes, stats.staging_cell_state_bytes.load());
+    seg.deinit();
+    try testing.expectEqual(g0, stats.staging_cell_state_bytes.load());
+    var again = try Segment.init(gpa, r.image, .none);
+    defer again.deinit();
+    _ = again.recover();
+    try testing.expectEqual(n_live - 1, again.live());
+    try testing.expectEqual(g0, stats.staging_cell_state_bytes.load());
+    try again.appendInPlace(tkey(4, 4), 100, &v, 4, 400, 0);
+    try testing.expectEqual(g0 + state_bytes, stats.staging_cell_state_bytes.load());
+    // The R5 component: attribution-only (its states leave with their cells —
+    // the never-lossy lever is `staging_mmap`'s promotion kick), heap, not page cache.
+    const c = cellStateComponent();
+    try testing.expectEqualStrings("staging_cell_state", c.name);
+    try testing.expectEqual(@as(u64, 0), c.weight);
+    try testing.expect(!c.kernel_reclaimable);
+    try testing.expectEqual(stats.staging_cell_state_bytes.load(), c.current());
+}
+
 test "the three promotion points: pressure rides stageWrite; the dismount pass promotes every resident (failures stay resident, counted); fsync promotes only under the lever (default off), a failure never fails it" {
     const gpa = testing.allocator;
     var kicks: Kicks = .{};
@@ -2187,6 +2273,7 @@ test "stats JSON names every instrument" {
     try writeStatsJson(&w);
     const out = w.buffered();
     try testing.expect(std.mem.startsWith(u8, out, "{\"current_staged_write_bytes\":"));
+    try testing.expect(std.mem.indexOf(u8, out, "\"staging_cell_state_bytes\":") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"staged_payload_lost_reads\":") != null);
     try testing.expect(std.mem.endsWith(u8, out, "}"));
 }

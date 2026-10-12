@@ -718,6 +718,7 @@ carries the `+ref`/`−ref` in the same tx; the displaced binding is freed only 
 | `staging_generation_discards`, `staging_scope_upgrades`, `staging_foreign_scope_{refusals,discards,records}`, `staging_drain_barriers`, `staging_writer_scope` | the generation/scope gate | `refusals` = a mount refused |
 | `staging_put_bytes_{drain,flush,teardown,wt_fallback}`, `staging_sibling_probes`, `staging_sibling_hops_elided` | ring traffic | — |
 | `staged_writes_in_flight`, `current_staged_write_bytes` (`staging_mmap`) | ring population / budget | levels |
+| `staging_cell_state_bytes` (`staging_cell_state`, attribution-only) | the live cells' value-hash states, `@sizeOf(ValueHash)` = 1,056 B each | `≤ maxCells(capacity) × 1,056` (`Segment.cellStateBound`) |
 | `dismount_promoted_{files,bytes,inline_files}`, `dismount_promote_failures`, `fsync_promoted_files` | the two promotion points | — |
 | `nvme_unaligned_write_fallbacks` | device pad arm | EXPECTED growth per packed non-4 KiB image (pre-declared, design §10) |
 | `block_key_incarnation_{refusals,unknown,exhausted}` | stale-lifetime refusal / honest unknown / mint exhaustion | `refusals` **must-stay-0** |

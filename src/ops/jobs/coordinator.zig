@@ -423,6 +423,7 @@ pub const PlaneMover = struct {
 
 const census = @import("../lifecycle/census.zig");
 const lattice = @import("../lifecycle/lattice.zig");
+const lifecycle_stats = @import("../lifecycle/stats.zig").stats;
 const drain_mod = @import("../lifecycle/drain.zig");
 const preflight = @import("preflight.zig");
 const set_config = @import("../../data/set_config.zig");
@@ -527,6 +528,9 @@ pub const PlaneWorld = struct {
         }
         self.be.commit(t) catch return error.Io;
         self.be.fsync() catch return error.Io;
+        // The generation the membership grants carry from now on (a
+        // joiner behind it pulls the record at its next renewal).
+        lifecycle_stats.volume_config_generation.set(cfg.config_generation);
     }
     fn publish(ctx: *anyopaque, vol_tag: u64, state: set_config.State) lattice.Error!void {
         const self = self_(ctx);
@@ -990,6 +994,7 @@ pub const PlaneRekey = struct {
         };
         self.be.commit(t) catch return error.Io;
         self.be.fsync() catch return error.Io;
+        lifecycle_stats.volume_config_generation.set(m.next.config_generation);
         self.plane.closeRekey(self.io) catch |e| log.err("defrag --rekey: the record flipped to key id {x} (generation {d}) but the plane's wrap did not close ({s}) — the previous key stays an unwrap arm until the next mount", .{ &m.next.key_id, m.next.config_generation, @errorName(e) });
         log.info("defrag --rekey: the primary key is now id {x} (config generation {d})", .{ &m.next.key_id, m.next.config_generation });
     }

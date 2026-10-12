@@ -240,7 +240,7 @@ pub const LeaseClocks = struct {
 
     /// The grant's clock words.
     pub fn grantHead(self: LeaseClocks, epoch: u64, term: u64, now_ms: u64, ack_prior_epoch: u64) verbs.GrantHead {
-        return .{ .epoch = epoch, .term = term, .granted_at_owner_ms = now_ms, .ack_prior_epoch = ack_prior_epoch, .t_owner_ms = @intCast(self.t_owner_ms), .skew_max_ms = @intCast(self.skew_max_ms), .d_purge_ms = @intCast(self.d_purge_ms), .renew_ms = @intCast(self.renew_ms), .checkpoint_ceiling_ms = CHECKPOINT_LANDING_CEILING_MS, .n_ack = 0, .n_release = 0, .n_offered = 0, .reserved = @splat(0) };
+        return .{ .epoch = epoch, .term = term, .granted_at_owner_ms = now_ms, .ack_prior_epoch = ack_prior_epoch, .t_owner_ms = @intCast(self.t_owner_ms), .skew_max_ms = @intCast(self.skew_max_ms), .d_purge_ms = @intCast(self.d_purge_ms), .renew_ms = @intCast(self.renew_ms), .checkpoint_ceiling_ms = CHECKPOINT_LANDING_CEILING_MS, .n_ack = 0, .n_release = 0, .n_offered = 0, .reserved = @splat(0), .config_generation = 0 };
     }
 };
 
@@ -812,6 +812,14 @@ pub const WindowSink = struct {
     declare: *const fn (ctx: *anyopaque, identity: WireIdentity, vol_tag: u64, ranges: []align(1) const verbs.GrantRunWire) void,
 };
 
+/// The owner's `set_config` generation the grant carries (the online
+/// `volume add-data` / `remove-data` push): the wire plane binds the
+/// process's word; null = 0 on the wire (not carried).
+pub const GenerationSource = struct {
+    ctx: ?*anyopaque,
+    read: *const fn (ctx: ?*anyopaque) u64,
+};
+
 pub const OwnerService = struct {
     owner: *Owner,
     /// The data volumes the renewal's window declarations are screened by.
@@ -821,6 +829,7 @@ pub const OwnerService = struct {
     /// The owner's monotonic clock in ms (tests inject a manual one).
     now: *const fn (ctx: ?*anyopaque) u64,
     now_ctx: ?*anyopaque = null,
+    generation: ?GenerationSource = null,
 
     pub fn register(self: *OwnerService, svc: *service.Service) void {
         svc.register(.join, .{ .ctx = self, .serve = &serveJoin });
@@ -844,6 +853,7 @@ pub const OwnerService = struct {
         var head = self.owner.clocks.grantHead(g.epoch, self.owner.term, now_ms, g.ack_prior_epoch);
         head.n_offered = @intCast(off.len);
         head.n_release = @intCast(nt.len);
+        if (self.generation) |src| head.config_generation = src.read(src.ctx);
         return .{ .ok = .{ .join = .{ .head = head, .slot_leases_ack = &.{}, .slot_release_notices = nt, .offered_slots = off } } };
     }
 
@@ -987,6 +997,10 @@ pub const Member = struct {
     /// The windows the renewal declares (the block-grant plane's).
     windows_bytes: []const u8 = "",
     n_windows: u16 = 0,
+    /// The owner's `set_config` generation the last grant carried (0 =
+    /// never carried): the beat compares it with the process's own word
+    /// and pulls the record at a bump (`wire_plane.learnSetConfig`).
+    config_generation: u64 = 0,
 
     fn joinReq(self: *const Member, prior_epoch: ?u64) verbs.Request {
         var flags: u8 = 0;
@@ -1002,6 +1016,7 @@ pub const Member = struct {
         if (self.clocks.?.t_self_ms == 0) return error.UnsafeClocks;
         self.epoch = h.epoch;
         self.label += 1;
+        self.config_generation = h.config_generation;
         _ = self.words.renewed(self.label, sent_ms, self.clocks.?.t_self_ms, h.renew_ms);
         stats.membership_epoch.set(h.epoch);
         stats.membership_renew_cadence_ms.set(h.renew_ms);
@@ -1417,13 +1432,19 @@ const Carriage = struct {
     }
 };
 
-test "the member over the owner's wire face: join learns the clocks anchored on the send instant; the tick renews at the cadence and never between beats; the carriage's offer lands at the member; a dead venue past T_self PARKS a symmetric appender (never the poison) and the reclaim beat rejoins once the successor admits it; a remote-custody lease poisons" {
+var manual_generation: u64 = 0;
+fn manualGeneration(_: ?*anyopaque) u64 {
+    return manual_generation;
+}
+
+test "the member over the owner's wire face: join learns the clocks anchored on the send instant; the tick renews at the cadence and never between beats; the carriage's offer lands at the member and the owner's set-config generation rides every grant; a dead venue past T_self PARKS a symmetric appender (never the poison) and the reclaim beat rejoins once the successor admits it; a remote-custody lease poisons" {
     const gpa = testing.allocator;
     const clocks = try LeaseClocks.derive(45_000, 0, 100);
     var o = try Owner.arm(gpa, clocks, 0, 1, 0, &.{}, 0);
     defer o.deinit();
     manual_now_ms = 0;
-    var osvc: OwnerService = .{ .owner = &o, .now = &manualNow };
+    manual_generation = 3;
+    var osvc: OwnerService = .{ .owner = &o, .now = &manualNow, .generation = .{ .ctx = null, .read = &manualGeneration } };
     const me = testIdentity(1);
     var dl: DirectLink = .{ .owner_svc = &osvc, .peer = me };
     osvc.register(&dl.svc);
@@ -1433,17 +1454,21 @@ test "the member over the owner's wire face: join learns the clocks anchored on 
     var m: Member = .{ .gpa = gpa, .id = writerMemberId(me), .role = .writer, .link = dl.link(), .pid = 7, .boot = "boot-boot-boot-0".*, .endpoint = .none, .pr_key = 0x77, .mount = "/mnt/m", .gate = &gate, .poison = p.sink(), .carriage = carriage.sink() };
     try testing.expectEqual(Member.JoinOutcome.granted, m.join(100, null));
     try testing.expectEqual(@as(u64, 1), m.epoch);
+    try testing.expectEqual(@as(u64, 3), m.config_generation);
     try testing.expectEqual(@as(u64, 100 + clocks.t_self_ms), m.words.learnedLabel().deadline_ms);
     try testing.expectEqual(@as(u64, 10_100), m.words.renew_at_ms.load(.acquire));
-    // Between beats: idle; at the beat: renewed; the offer rides it.
+    // Between beats: idle; at the beat: renewed; the offer rides it, and
+    // so does the generation the owner's word moved to (an online add).
     try testing.expectEqual(TickVerdict.idle, m.tick(5_000, 0));
     try o.pushOffer(m.id, 12, 0);
     manual_now_ms = 10_100;
+    manual_generation = 4;
     const renewals0 = stats.membership_renewals.load();
     try testing.expectEqual(TickVerdict.renewed, m.tick(10_100, 0));
     try testing.expectEqual(renewals0 + 1, stats.membership_renewals.load());
     try testing.expectEqual(@as(u32, 1), carriage.offered);
     try testing.expectEqual(@as(u16, 12), carriage.slot);
+    try testing.expectEqual(@as(u64, 4), m.config_generation);
     try testing.expectEqual(@as(u64, 10_100 + clocks.t_self_ms), m.words.learnedLabel().deadline_ms);
     // The venue dies: beats fail quietly until T_self, then the PARK.
     dl.dead = true;

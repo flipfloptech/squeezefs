@@ -1807,6 +1807,225 @@ test "smoke: THE TWO-DAEMON MATRIX — mount A (the manager) → mount B as a SE
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
 }
 
+/// The grant-plane row of `vol_tag` in a `.stats` text (`block_grant_holder`
+/// / `block_grant_writer`): the JSON from its `"vol_tag"` on, or null.
+fn grantRowOf(stats_text: []const u8, family: []const u8, tag_hex: []const u8) ?[]const u8 {
+    const fam = std.mem.indexOf(u8, stats_text, family) orelse return null;
+    var needle: [40]u8 = undefined;
+    const n = std.fmt.bufPrint(&needle, "\"vol_tag\":\"{s}\"", .{tag_hex}) catch return null;
+    const i = std.mem.indexOfPos(u8, stats_text, fam, n) orelse return null;
+    return stats_text[i..];
+}
+
+test "smoke: THE ONLINE VOLUME ROW ACROSS DAEMONS — mount A (the manager) + B JOINED → `volume add-data --no-rebalance <A> d2` → B learns the generation bump at its next renewal (NO remount): the record pulled over the wire, d2 attached and armed on B (data_volumes 3, writer volumes 3, its generation = A's) → B writes 4 MiB files until one's stripe unit hashes onto d2 (B's writer row on d2 consumed grants A's holder row carved) and A reads every file back byte-exact → B removes them (the frees ship to A) → `volume remove-data <A> d2` → B flips d2 Draining at the bump and returns its window (24 more files on B place nothing there) → the drain retires d2 → B flips it Retired → closure on both → umount B, A" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    try rig.env.put("SQUEEZEFS_MW_BIND", "127.0.0.1:0");
+    var t_owner_text: [8]u8 = undefined;
+    try rig.env.put("SQUEEZEFS_TEST_MEMBERSHIP_T_OWNER_MS", try std.fmt.bufPrint(&t_owner_text, "{d}", .{smoke_t_owner_ms}));
+    // fsync promotes a staged file (the A/B lever's ON arm): each file
+    // lands its block through the router's placement at its own fsync, so
+    // the row reads placement per file instead of at B's dismount.
+    try rig.env.put("SQUEEZEFS_FSYNC_PROMOTE_STAGED", "1");
+    try rig.formatSet(true);
+    const d2 = try std.fmt.allocPrintSentinel(gpa, "{s}/d2.img", .{rig.work}, 0);
+    defer gpa.free(d2);
+    {
+        const f = try Io.Dir.cwd().createFile(io, d2, .{ .truncate = true });
+        defer f.close(io);
+        try f.setLength(io, data_len);
+    }
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+    const b = try Peer.init(rig, "b");
+    defer b.deinit();
+    try b.spawn(&.{});
+    _ = try b.awaitReady();
+    const gen0 = blk: {
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try testing.expectEqual(@as(?u64, 2), numberAfter(tb, "\"data_volumes\":"));
+        break :blk numberAfter(tb, "\"volume_config_generation\":") orelse return error.NoGeneration;
+    };
+    // 1. add-data on A (the manager), no rebalance: the row watches B's
+    //    OWN placement onto the new volume.
+    var tag_buf: [20]u8 = undefined;
+    var gen_after: u64 = 0;
+    {
+        const r = try rig.squeezefs(&.{ "volume", "add-data", "--no-rebalance", rig.mp, d2 });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nadd-data: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "live") != null);
+        const i = std.mem.indexOf(u8, r.stdout, "vol-") orelse return error.NoVolumeId;
+        @memcpy(&tag_buf, r.stdout[i .. i + 20]);
+        gen_after = numberAfter(r.stdout, "config generation ") orelse return error.NoGeneration;
+    }
+    try testing.expectEqual(gen0 + 1, gen_after);
+    const tag_id: []const u8 = &tag_buf;
+    const tag_hex = tag_buf[4..20];
+    // 2. B learns at its next renewal (T_owner 3 s ⇒ a 265 ms cadence):
+    //    the grant carried the generation, B pulled the record, attached
+    //    d2 as ordinal 2 and armed its writer row — no remount.
+    {
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        while (true) {
+            const probe = try b.stats();
+            defer gpa.free(probe);
+            if ((numberAfter(probe, "\"volume_config_generation\":") orelse 0) == gen_after) {
+                // A render reads the plane's family before the lifecycle's:
+                // the words are judged on a snapshot taken AFTER the bump.
+                const tb = try b.stats();
+                defer gpa.free(tb);
+                try testing.expectEqual(@as(?u64, 3), numberAfter(tb, "\"data_volumes\":"));
+                try testing.expectEqual(@as(?u64, 3), numberAfter(tb, "\"block_grant_writer_volumes\":"));
+                try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"volume_online_attached\":"));
+                try testing.expectEqual(@as(?u64, 1), numberAfter(tb, "\"volume_config_pulls\":"));
+                try testing.expectEqual(@as(?u64, 0), numberAfter(tb, "\"volume_config_pull_failures\":"));
+                try testing.expect(grantRowOf(tb, "\"block_grant_writer\":", tag_hex) != null);
+                break;
+            }
+            if (clock.monotonicNs() >= deadline) {
+                std.debug.print("\n--- B never learnt generation {d} ---\n{s}\n", .{ gen_after, probe });
+                return error.JoinerNeverLearnt;
+            }
+            sleepMs(100);
+        }
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "joined this mount ONLINE as ordinal 2 (active)") != null);
+    }
+    // 3. B writes 4 MiB files (one block each, promoted at their fsync
+    //    through the router's round-robin band of three) until d2 holds
+    //    one (bounded at 40): every block there is minted from a grant B's
+    //    writer row pulled from A's holder row on d2; A reads every file
+    //    back.
+    var consumed_d2: u64 = 0;
+    var files: u32 = 0;
+    while (files < 40) {
+        var script: [256]u8 = undefined;
+        const out = try b.onMount(try std.fmt.bufPrint(&script, "mkdir -p b-data && for n in $(seq {d} {d}); do dd if=/dev/urandom of=b-data/f$n bs=1M count=4 conv=fsync status=none; done && echo ok", .{ files, files + 7 }));
+        gpa.free(out);
+        files += 8;
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        const row_b = grantRowOf(tb, "\"block_grant_writer\":", tag_hex) orelse return error.NoWriterRow;
+        consumed_d2 = numberAfter(row_b, "\"consumed\":") orelse 0;
+        if (consumed_d2 >= 1) break;
+    }
+    try testing.expect(consumed_d2 >= 1);
+    {
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        const row_a = grantRowOf(ta, "\"block_grant_holder\":", tag_hex) orelse return error.NoHolderRow;
+        const population_d2 = numberAfter(row_a, "\"population\":") orelse 0;
+        try testing.expect(population_d2 >= consumed_d2);
+        const from_b = try b.onMount("sha256sum b-data/f* | sort -k2");
+        defer gpa.free(from_b);
+        const from_a = try rig.onMount("sha256sum b-data/f* | sort -k2");
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings(from_b, from_a);
+        std.debug.print("\nsmoke[online-volume]: B learnt generation {d} at its renewal; d2 armed online as ordinal 2; {d} file(s) on B put {d} block(s) on d2 (A's holder population {d}); every sha from A equal\n", .{ gen_after, files, consumed_d2, population_d2 });
+    }
+    // 4. remove-data d2 on A: B flips it Draining at the bump (its window
+    //    on d2 returns to A) and places nothing more there; the drain
+    //    retires it; B flips it Retired. B's files go first: the mover's
+    //    census walks the manager's OWN slot trees, so a drain over blocks
+    //    a joiner's files reference waits on the cross-owner census (owed,
+    //    stated in the evidence) — the frees ship to A at B's cadence.
+    var drain_id_buf: [jobs_records.JOB_ID_TEXT_LEN]u8 = undefined;
+    {
+        const rm = try b.onMount("rm -f b-data/f*; echo ok");
+        gpa.free(rm);
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        while (true) {
+            const tb = try b.stats();
+            defer gpa.free(tb);
+            if ((numberAfter(tb, "\"free_ship_freed\":") orelse 0) >= @as(u64, files)) break;
+            if (clock.monotonicNs() >= deadline) return error.FreesNeverShipped;
+            sleepMs(200);
+        }
+    }
+    {
+        const r = try rig.squeezefs(&.{ "volume", "remove-data", rig.mp, tag_id });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\nremove-data: {s}\n{s}\n", .{ r.stdout, r.stderr });
+        try testing.expect(r.term.success());
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "Draining") != null);
+        @memcpy(&drain_id_buf, jobIdIn(r.stdout) orelse return error.NoDrainJob);
+    }
+    {
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        while (true) {
+            const tb = try b.stats();
+            defer gpa.free(tb);
+            if ((numberAfter(tb, "\"volume_config_generation\":") orelse 0) == gen_after + 1) {
+                const again = try b.stats();
+                defer gpa.free(again);
+                try testing.expectEqual(@as(?u64, 1), numberAfter(again, "\"volume_online_flips\":"));
+                break;
+            }
+            if (clock.monotonicNs() >= deadline) return error.JoinerNeverLearntDraining;
+            sleepMs(100);
+        }
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "active → draining") != null);
+        // Draining is ineligible for placement: 24 more files, none on d2
+        // (its window returned: nothing remains installed there).
+        const out = try b.onMount("for n in $(seq 100 123); do dd if=/dev/urandom of=b-data/g$n bs=1M count=4 conv=fsync status=none; done && echo ok");
+        defer gpa.free(out);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        const row_b = grantRowOf(tb, "\"block_grant_writer\":", tag_hex) orelse return error.NoWriterRow;
+        try testing.expectEqual(consumed_d2, numberAfter(row_b, "\"consumed\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(row_b, "\"window_remaining\":") orelse 99);
+    }
+    try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, &drain_id_buf, 300 * std.time.ns_per_s));
+    {
+        const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+        while (true) {
+            const tb = try b.stats();
+            defer gpa.free(tb);
+            if ((numberAfter(tb, "\"volume_config_generation\":") orelse 0) == gen_after + 2) {
+                const again = try b.stats();
+                defer gpa.free(again);
+                try testing.expectEqual(@as(?u64, 2), numberAfter(again, "\"volume_online_flips\":"));
+                try testing.expectEqual(@as(?u64, 0), numberAfter(again, "\"volume_config_pull_failures\":"));
+                break;
+            }
+            if (clock.monotonicNs() >= deadline) return error.JoinerNeverLearntRetired;
+            sleepMs(100);
+        }
+        const text = try b.readLog();
+        defer gpa.free(text);
+        try testing.expect(std.mem.indexOf(u8, text, "draining → retired") != null);
+        // B's later files read equal on both.
+        const from_b = try b.onMount("sha256sum b-data/g* | sort -k2");
+        defer gpa.free(from_b);
+        const from_a = try rig.onMount("sha256sum b-data/g* | sort -k2");
+        defer gpa.free(from_a);
+        try testing.expectEqualStrings(from_b, from_a);
+        std.debug.print("smoke[online-volume]: remove-data on A → B flipped d2 draining at generation {d} (its window returned; 24 more files placed nothing there) and retired at {d}; B's files read equal on both\n", .{ gen_after + 1, gen_after + 2 });
+    }
+    // Closure on both daemons.
+    {
+        const ta = try rig.onMount("cat .stats");
+        defer gpa.free(ta);
+        try expectMustStayZero(ta);
+        const tb = try b.stats();
+        defer gpa.free(tb);
+        try expectMustStayZero(tb);
+    }
+    try b.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try b.waitExit());
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+}
+
 // ---------------------------------------------------------------------------
 // `volume enable-symmetric` (charter §5.4, §8): the flat class converted in
 // place, then the ordinary symmetric posture over it.
@@ -5431,16 +5650,18 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "all-exact") != null);
     }
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    // The durable record (`config show` reads the newest ledger record —
+    // the dismount's checkpoint landed the flip): B primary, no next key.
     {
-        const r = try rig.squeezefs(&.{ "config", "show", "--json", rig.mp });
+        const r = try rig.squeezefs(&.{ "config", "show", "--json", rig.meta_uri });
         defer rig.freeRun(r);
         try testing.expect(r.term.success());
         var needle: [64]u8 = undefined;
         try testing.expect(std.mem.indexOf(u8, r.stdout, try std.fmt.bufPrint(&needle, "\"key_id\":\"{s}\"", .{&key_b_id})) != null);
         try testing.expect(std.mem.indexOf(u8, r.stdout, "key_id_next") == null);
     }
-    try rig.umount();
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
     // 3. Key A is retired: a mount under it refuses by id; under B it serves.
     {
         const r = try rig.squeezefs(&.{ "mount", rig.meta_uri, rig.mp });
@@ -5517,13 +5738,6 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "all-exact-under-c") != null);
     }
-    {
-        const r = try rig.squeezefs(&.{ "config", "show", "--json", rig.mp });
-        defer rig.freeRun(r);
-        var needle: [64]u8 = undefined;
-        try testing.expect(std.mem.indexOf(u8, r.stdout, try std.fmt.bufPrint(&needle, "\"key_id\":\"{s}\"", .{&key_c_id})) != null);
-        try testing.expect(std.mem.indexOf(u8, r.stdout, "key_id_next") == null);
-    }
     try rig.expectAlive("the rekey row");
     {
         const st = try rig.stats();
@@ -5533,6 +5747,14 @@ test "smoke: THE REKEY ROW — format (1 MiB blocks, lz4 + aes-256-gcm, key A, a
     }
     try rig.umount();
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    {
+        const r = try rig.squeezefs(&.{ "config", "show", "--json", rig.meta_uri });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        var needle: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r.stdout, try std.fmt.bufPrint(&needle, "\"key_id\":\"{s}\"", .{&key_c_id})) != null);
+        try testing.expect(std.mem.indexOf(u8, r.stdout, "key_id_next") == null);
+    }
     try rig.env.put("SQUEEZEFS_ENCRYPT_KEY_FILE", key_c);
     _ = try fsckClean(rig, "the rekey row");
 }

@@ -29,6 +29,7 @@ const codec = @import("codec.zig");
 const frame = @import("frame.zig");
 const endpoint = @import("endpoint.zig");
 const record = @import("../meta/record.zig");
+const geometry = @import("../meta/geometry.zig");
 // @anchor:ops_jobs_verbs — the job fabric's payloads (decision 0003 §G).
 const job_frames = @import("../ops/jobs/frames.zig");
 const admin_frames = @import("../ops/jobs/admin_frames.zig");
@@ -131,6 +132,7 @@ pub const Verb = enum(u16) {
     resolve_endpoint = 0x05B2,
     publish_roots = 0x05B3,
     grow_ring = 0x05B4,
+    resolve_set_config = 0x05B5,
     // ---- the job fabric 0x0600 (@anchor:ops_jobs_verb_numbers) ----
     job_enroll = 0x0600,
     shard_assign = 0x0601,
@@ -221,6 +223,10 @@ pub const REASON_MAX: usize = 1024;
 /// The largest record value a shipped record-level mutation carries
 /// (charter §5.1's `min(64 KiB, node_size/4)` cap at its widest).
 pub const RECORD_VALUE_MAX: usize = 64 << 10;
+/// The `set_config` control record a joiner pulls at a generation bump:
+/// the record-value cap at the widest node (`geometry.recordValueCap`),
+/// which is the bound the verb that wrote it enforced.
+pub const SET_CONFIG_MAX: usize = @intCast(geometry.recordValueCap(geometry.allowed_node_kib[geometry.allowed_node_kib.len - 1] * 1024));
 /// Any u16-counted array of 8..16 B items fits the 1 MiB control cap;
 /// u32 counts are bounded by the bytes present (`takeArray`) and these.
 pub const ROOTS_MAX: usize = 65536;
@@ -496,6 +502,23 @@ pub const RingGrown = extern struct {
         return self.present <= 1 and (self.present == 1 or (self.segment.start == 0 and self.segment.len == 0));
     }
 };
+
+/// `ResolveSetConfig` (the joiner's pull at a generation bump the renewal
+/// grant pushed): volume 0's `set_config` record as the manager reads it
+/// off tree 0 — the joiner decodes it with the record's own total codec.
+pub const ResolveSetConfigReq = extern struct { volume: u16, reserved: [6]u8 };
+
+pub const SetConfigHead = extern struct {
+    /// The record's `config_generation` (0 with `len` 0: no record).
+    generation: u64,
+    len: u32,
+    reserved: u32,
+
+    pub fn check(self: SetConfigHead) bool {
+        return self.len != 0 or self.generation == 0;
+    }
+};
+pub const SetConfigReply = HeadWithBytes(SetConfigHead, "len", SET_CONFIG_MAX);
 
 // ---------------------------------------------------------------------------
 // Manager — slots.
@@ -796,6 +819,10 @@ pub const GrantHead = extern struct {
     n_release: u16,
     n_offered: u16,
     reserved: [6]u8,
+    /// The owner's `set_config` generation: the carriage's push of an
+    /// online `volume add-data` / `remove-data` (a joiner whose own word is
+    /// behind pulls the record with `ResolveSetConfig`). 0 = not carried.
+    config_generation: u64,
 };
 
 /// The membership grant: the lease clocks, the slot-lease carriage.
@@ -1616,6 +1643,7 @@ pub fn ReqType(comptime v: Verb) type {
         .resolve_endpoint => ResolveEndpointReq,
         .publish_roots => PublishRootsReq,
         .grow_ring => GrowRingReq,
+        .resolve_set_config => ResolveSetConfigReq,
         .job_enroll => job_frames.JobEnrollReq,
         .shard_assign => job_frames.ShardAssignReq,
         .heartbeat => job_frames.HeartbeatReq,
@@ -1671,6 +1699,7 @@ pub fn RepType(comptime v: Verb) type {
         .resolve_endpoint => EndpointReply,
         .publish_roots => RootsPublished,
         .grow_ring => RingGrown,
+        .resolve_set_config => SetConfigReply,
         .job_enroll => job_frames.JobEnrolled,
         .shard_assign => job_frames.ShardDescriptor,
         .heartbeat => job_frames.HeartbeatAck,
@@ -1772,6 +1801,8 @@ test "verb numbers: block-coded, unique, the handshake frames at 0xFFF0, every b
     try testing.expectEqual(TOKEN_SCHEMA, Verb.custody_grant.schema());
     try testing.expectEqual(@as(u16, 0x0586), @backingInt(Verb.record_death));
     try testing.expectEqual(@as(u16, 0x05B4), @backingInt(Verb.grow_ring));
+    try testing.expectEqual(@as(u16, 0x05B5), @backingInt(Verb.resolve_set_config));
+    try testing.expectEqual(Block.manager, Verb.resolve_set_config.block());
 }
 
 test "WireIdentity: the peer id is node_token BE ‖ mount_slot BE; the member pair never includes the incarnation" {
@@ -1872,7 +1903,8 @@ test "membership payloads: join with a mount path, the grant's three carriages, 
     const acks = [_]SlotLeaseAckWire{.{ .g = 2, .slot = 17, .reserved = 0 }};
     const rels = [_]u16{ 5, 6, 7 };
     const offers = [_]OfferedSlotWire{.{ .slot = 9, .reserved = 0, .holder = 2 }};
-    const g = try roundTrip(Grant, .{ .head = .{ .epoch = 4, .term = 2, .granted_at_owner_ms = 1000, .ack_prior_epoch = 3, .t_owner_ms = 45_000, .skew_max_ms = 23, .d_purge_ms = 20, .renew_ms = 10_000, .checkpoint_ceiling_ms = 1100, .n_ack = 1, .n_release = 3, .n_offered = 1, .reserved = @splat(0) }, .slot_leases_ack = &acks, .slot_release_notices = &rels, .offered_slots = &offers });
+    const g = try roundTrip(Grant, .{ .head = .{ .epoch = 4, .term = 2, .granted_at_owner_ms = 1000, .ack_prior_epoch = 3, .t_owner_ms = 45_000, .skew_max_ms = 23, .d_purge_ms = 20, .renew_ms = 10_000, .checkpoint_ceiling_ms = 1100, .n_ack = 1, .n_release = 3, .n_offered = 1, .reserved = @splat(0), .config_generation = 9 }, .slot_leases_ack = &acks, .slot_release_notices = &rels, .offered_slots = &offers });
+    try testing.expectEqual(@as(u64, 9), g.head.config_generation);
     try testing.expectEqual(@as(u16, 7), g.slot_release_notices[2]);
     try testing.expectEqual(@as(u16, 9), g.offered_slots[0].slot);
     // Renewal windows: two volumes, nested ranges.
@@ -2047,6 +2079,23 @@ fn verbsFuzz(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: every verb decoder is total on arbitrary bytes" {
     try fuzzkit.fuzz({}, verbsFuzz, .{});
+}
+
+fn setConfigReplyFuzz(_: void, smith: *std.testing.Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const len = smith.slice(&buf);
+    const rep = codec.decodePayload(SetConfigReply, buf[0..len]) catch return;
+    // A decoded reply obeys its head's law and re-encodes to its bytes.
+    try std.testing.expect(rep.head.check());
+    try std.testing.expect(rep.bytes.len <= SET_CONFIG_MAX);
+    var out: [4096 + 16]u8 = undefined;
+    var b: Builder = .init(&out);
+    try codec.encodePayload(SetConfigReply, rep, &b);
+    try std.testing.expectEqualSlices(u8, buf[0..len], b.written());
+}
+
+test "fuzz: the resolve_set_config reply decoder is total on arbitrary bytes and a decoded reply re-encodes to its bytes" {
+    try fuzzkit.fuzz({}, setConfigReplyFuzz, .{});
 }
 
 fn peerIdFuzz(_: void, smith: *std.testing.Smith) !void {

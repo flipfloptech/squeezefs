@@ -597,7 +597,11 @@ pub const WriterPlane = struct {
     /// The lease holder's session (the manager's listener).
     link: Link,
     identity: verbs.WireIdentity,
+    /// `router.MAX_VOLUMES` rows, `n_vols` armed (the holder's law: every
+    /// `Vol` is pointed to by the allocator's seams, so a row never moves
+    /// — a volume the manager added online arms the NEXT row in place).
     vols: []Vol,
+    n_vols: usize,
 
     const Vol = struct {
         vol_tag: u64,
@@ -620,42 +624,71 @@ pub const WriterPlane = struct {
         const self = try gpa.create(WriterPlane);
         errdefer gpa.destroy(self);
         const n = plane.vols.n();
-        const vols = try gpa.alloc(Vol, n);
+        const vols = try gpa.alloc(Vol, router.MAX_VOLUMES);
         errdefer gpa.free(vols);
-        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .link = link, .identity = identity, .vols = vols };
-        for (plane.vols.rows[0..n], 0..) |row, i| {
-            const r = row.?;
-            const v = &vols[i];
-            v.* = .{
-                .vol_tag = r.vol_tag,
-                .ordinal = @intCast(r.ordinal),
-                .alloc = r.alloc,
-                .arm = .{ .capacity_blocks = r.alloc.capacityBlocks() },
-                .src = undefined,
-                .shipper = .{ .vol_tag = r.vol_tag, .tracking = .{ .ctx = v, .purge = &trackPurge, .retire = &trackRetire, .release = &trackRelease }, .lease_epoch = .{ .ctx = v, .epoch = &leaseEpoch } },
-                .writer = self,
-            };
-            // The wire ask parks on its round trip: a lost single-flight
-            // latch at an empty window is the retryable class, never a wait.
-            v.arm.sink = .{ .ctx = v, .ask = &askGrant, .inline_answer = false };
-            v.src = .{ .arm = &v.arm, .alloc = r.alloc, .io = io };
-            v.shipper.client = .{ .ctx = v, .send = &sendFrees, .resolve = &resolveHolder };
-            r.alloc.grant_source = v.src.source();
-            r.alloc.lease = .{ .ctx = v, .vtable = &writer_lease_vtable };
-            plane.reclaimer.setFreeTarget(v.ordinal, v.shipper.freeTarget());
-            // The first PULL at the arm: an empty window is below the 50 %
-            // mark, and the reply's holder word is what `df` reads before
-            // this mount writes a byte. A holder not yet serving answers
-            // `Busy` → the first mint re-asks.
-            _ = v.arm.topup();
-        }
-        stats.block_grant_writer_volumes.set(@intCast(n));
+        self.* = .{ .gpa = gpa, .io = io, .plane = plane, .link = link, .identity = identity, .vols = vols, .n_vols = 0 };
+        for (0..n) |i| self.armVolume(@intCast(i));
         log.info("data planes: {d} data volume(s) armed as a NON-holder — every mint from a ranged grant pulled from the lease holder, every terminal free shipped to it", .{n});
         return self;
     }
 
+    /// Arm ONE volume (the plane's row at `ordinal`, already open): at
+    /// create for every volume, online for a volume the manager's
+    /// `volume add-data` added and this joiner attached at the generation
+    /// bump its renewal grant carried.
+    pub fn armVolume(self: *WriterPlane, ordinal: u16) void {
+        const plane = self.plane;
+        std.debug.assert(ordinal == self.n_vols and ordinal < router.MAX_VOLUMES);
+        const r = plane.vols.rows[ordinal].?;
+        const v = &self.vols[ordinal];
+        v.* = .{
+            .vol_tag = r.vol_tag,
+            .ordinal = ordinal,
+            .alloc = r.alloc,
+            .arm = .{ .capacity_blocks = r.alloc.capacityBlocks() },
+            .src = undefined,
+            .shipper = .{ .vol_tag = r.vol_tag, .tracking = .{ .ctx = v, .purge = &trackPurge, .retire = &trackRetire, .release = &trackRelease }, .lease_epoch = .{ .ctx = v, .epoch = &leaseEpoch } },
+            .writer = self,
+        };
+        // The wire ask parks on its round trip: a lost single-flight
+        // latch at an empty window is the retryable class, never a wait.
+        v.arm.sink = .{ .ctx = v, .ask = &askGrant, .inline_answer = false };
+        v.src = .{ .arm = &v.arm, .alloc = r.alloc, .io = self.io };
+        v.shipper.client = .{ .ctx = v, .send = &sendFrees, .resolve = &resolveHolder };
+        r.alloc.grant_source = v.src.source();
+        r.alloc.lease = .{ .ctx = v, .vtable = &writer_lease_vtable };
+        plane.reclaimer.setFreeTarget(v.ordinal, v.shipper.freeTarget());
+        self.n_vols += 1;
+        stats.block_grant_writer_volumes.set(@intCast(self.n_vols));
+        // The first PULL at the arm: an empty window is below the 50 %
+        // mark, and the reply's holder word is what `df` reads before
+        // this mount writes a byte. A holder not yet serving answers
+        // `Busy` → the first mint re-asks.
+        _ = v.arm.topup();
+    }
+
+    /// Volumes armed.
+    pub fn armed(self: *const WriterPlane) usize {
+        return self.n_vols;
+    }
+
+    /// A volume this joiner learnt Draining / Retired: its pending frees
+    /// ship and every unconsumed run of its window RETURNS to the holder
+    /// now (a draining volume takes no placement, and a run left SET at
+    /// the holder would hold the retire — the drain's "used 0" — forever).
+    /// An `undrain` re-pulls at the first mint. False = no such row.
+    pub fn returnWindowOf(self: *WriterPlane, vol_tag: u64) bool {
+        for (self.vols[0..self.n_vols]) |*v| {
+            if (v.vol_tag != vol_tag) continue;
+            _ = v.shipper.flush();
+            self.returnWindow(v);
+            return true;
+        }
+        return false;
+    }
+
     pub fn destroy(self: *WriterPlane) void {
-        for (self.vols) |*v| {
+        for (self.vols[0..self.n_vols]) |*v| {
             // The pending frees ship; every unconsumed run of the window
             // RETURNS to the holder (its bits clear again) — a leave never
             // leaves a granted run SET at the holder.
@@ -699,7 +732,7 @@ pub const WriterPlane = struct {
 
     /// The cadence: every volume's pending shipped frees flushed.
     pub fn tick(self: *WriterPlane) void {
-        for (self.vols) |*v| {
+        for (self.vols[0..self.n_vols]) |*v| {
             if (v.shipper.flush() == .served) stats.free_ship_cadence_flushes.inc();
         }
     }
@@ -717,7 +750,7 @@ pub const WriterPlane = struct {
         const gpa = self.gpa;
         var b: codec.Builder = .init(buf);
         var n: u16 = 0;
-        for (self.vols) |*v| {
+        for (self.vols[0..self.n_vols]) |*v| {
             var held: std.ArrayList(block_grant.BlockGrant) = .empty;
             defer held.deinit(gpa);
             block_grant.heldBlockRanges(&v.arm.window, v.alloc, gpa, &held) catch return .{ .bytes = "", .n_windows = 0 };
@@ -812,7 +845,7 @@ pub const WriterPlane = struct {
 
     pub fn writeStatsJson(self: *WriterPlane, w: *Io.Writer) Io.Writer.Error!void {
         try w.writeAll("[");
-        for (self.vols, 0..) |*v, i| {
+        for (self.vols[0..self.n_vols], 0..) |*v, i| {
             if (i != 0) try w.writeByte(',');
             try w.print("{{\"vol_tag\":\"{x:0>16}\",\"window_remaining\":{d},\"installed\":{d},\"consumed\":{d},\"pending_frees\":{d}}}", .{ v.vol_tag, v.arm.window.remaining(), v.arm.window.installed.load(.monotonic), v.arm.window.consumed.load(.monotonic), v.shipper.pending_n });
         }

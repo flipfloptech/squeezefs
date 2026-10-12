@@ -602,6 +602,18 @@ fn refuse(diag: ?*Refusal, r: Refusal) DecodeError {
 /// authority is the bytes present) → each record's fixed part and its uri
 /// length against the remaining bytes → the paths likewise → exactly the
 /// checksum left → record laws. Total.
+/// The record's generation alone, under the head's magic, version and
+/// the total checksum (the manager's `ResolveSetConfig` reply head: the
+/// joiner decodes the rest with `decode`). Null = not a set_config record.
+pub fn peekGeneration(bytes: []const u8) ?u64 {
+    if (bytes.len < HEAD_LEN + CHECKSUM_LEN) return null;
+    if (!std.mem.eql(u8, bytes[0..8], MAGIC)) return null;
+    if (std.mem.readInt(u16, bytes[8..10], .little) != VERSION) return null;
+    if (!checksum.verify(bytes, bytes.len - CHECKSUM_LEN)) return null;
+    const h = std.mem.bytesToValue(HeadWire, bytes[0..HEAD_LEN]);
+    return std.mem.readInt(u64, &h.config_generation_le, .little);
+}
+
 pub fn decode(gpa: Allocator, bytes: []const u8, diag: ?*Refusal) DecodeError!Config {
     if (bytes.len < HEAD_LEN + CHECKSUM_LEN) return refuse(diag, .{ .bad_length = bytes.len });
     if (!std.mem.eql(u8, bytes[0..8], MAGIC)) return refuse(diag, .bad_magic);

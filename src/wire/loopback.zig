@@ -190,6 +190,7 @@ const FamilyEcho = struct {
             .leave_appender => .{ .ok = .{ .leave_appender = .fresh } },
             .publish_endpoint => .{ .ok = .{ .publish_endpoint = .fresh } },
             .resolve_endpoint => .{ .ok = .{ .resolve_endpoint = .{ .present = 0, .reserved = @splat(0), .endpoint = .none } } },
+            .resolve_set_config => .{ .ok = .{ .resolve_set_config = .{ .head = .{ .generation = 0, .len = 0, .reserved = 0 }, .bytes = &.{} } } },
             .publish_roots => .{ .ok = .{ .publish_roots = .{ .published = 0, .already = 0 } } },
             .grow_ring => .{ .ok = .{ .grow_ring = .{ .present = 0, .reserved = @splat(0), .segment = .{ .start = 0, .len = 0 } } } },
             .acquire_slots, .acquire_slot => |_, tag| if (tag == .acquire_slots) service.Answer{ .ok = .{ .acquire_slots = .{ .head = .{ .kind = 1, .reserved = 0, .n = 0, .already = 0, .slot = 1, .holder = self.me, .g = 2 }, .items = &.{} } } } else service.Answer{ .ok = .{ .acquire_slot = .{ .head = .{ .kind = 1, .reserved = 0, .n = 0, .already = 0, .slot = 1, .holder = self.me, .g = 2 }, .items = &.{} } } },
@@ -209,7 +210,7 @@ const FamilyEcho = struct {
             .record_recovered => .{ .ok = .{ .record_recovered = .fresh } },
             .record_death => .{ .ok = .{ .record_death = .fresh } },
             .join, .renew => |_, tag| blk: {
-                const g: verbs.Grant = .{ .head = .{ .epoch = 1, .term = 1, .granted_at_owner_ms = 0, .ack_prior_epoch = 0, .t_owner_ms = 45_000, .skew_max_ms = 23, .d_purge_ms = 20, .renew_ms = 10_000, .checkpoint_ceiling_ms = 1100, .n_ack = 0, .n_release = 0, .n_offered = 0, .reserved = @splat(0) }, .slot_leases_ack = &.{}, .slot_release_notices = &.{}, .offered_slots = &.{} };
+                const g: verbs.Grant = .{ .head = .{ .epoch = 1, .term = 1, .granted_at_owner_ms = 0, .ack_prior_epoch = 0, .t_owner_ms = 45_000, .skew_max_ms = 23, .d_purge_ms = 20, .renew_ms = 10_000, .checkpoint_ceiling_ms = 1100, .n_ack = 0, .n_release = 0, .n_offered = 0, .reserved = @splat(0), .config_generation = 0 }, .slot_leases_ack = &.{}, .slot_release_notices = &.{}, .offered_slots = &.{} };
                 break :blk if (tag == .join) service.Answer{ .ok = .{ .join = g } } else service.Answer{ .ok = .{ .renew = g } };
             },
             .leave => .{ .ok = .{ .leave = .replay } },
@@ -303,6 +304,7 @@ test "four in-process daemons exchange every verb family's shape over the hub: e
     _ = try c.call(.{ .leave_appender = .{ .head = .{ .volume = 0, .n_unclaimed = 0, .appender_id = 100, .identity = me, .reserved = 0 }, .items = &.{} } });
     _ = try c.call(.{ .publish_endpoint = .{ .volume = 0, .reserved = 0, .appender_id = 100, .identity = me, .pr_key = 0, .endpoint = .none, .reserved2 = @splat(0) } });
     _ = try c.call(.{ .resolve_endpoint = .{ .volume = 0, .reserved = 0, .appender_id = 101 } });
+    _ = try c.call(.{ .resolve_set_config = .{ .volume = 0, .reserved = @splat(0) } });
     _ = try c.call(.{ .publish_roots = .{ .head = .{ .volume = 0, .reserved = 0, .appender_id = 100, .n = 0, .reserved2 = 0 }, .items = &.{} } });
     _ = try c.call(.{ .grow_ring = .{ .volume = 0, .reserved = 0, .appender_id = 100, .want_bytes = 1 << 20 } });
     // Rename, clone, alloc, death.

@@ -34,6 +34,21 @@ pub const stats = struct {
     pub var volume_undrained: counters.ShardedCounter = .{};
     /// Draining volumes NOW.
     pub var volume_draining: counters.Gauge = .{};
+
+    // ---- the set config's generation across the fleet ----
+    /// This daemon's `set_config` generation (the record it last read or
+    /// committed). The manager's membership grants carry it; a joiner's
+    /// word trails the manager's by at most one renewal.
+    pub var volume_config_generation: counters.Gauge = .{};
+    /// A joiner pulled the record at a bump the grant carried.
+    pub var volume_config_pulls: counters.ShardedCounter = .{};
+    /// Data volumes a joiner attached ONLINE (the manager's `add-data`).
+    pub var volume_online_attached: counters.ShardedCounter = .{};
+    /// Placement flips a joiner applied at a bump (draining / retired / active).
+    pub var volume_online_flips: counters.ShardedCounter = .{};
+    /// A pull, a decode or an attach that failed (logged loud; the next
+    /// bump or the next mount retries).
+    pub var volume_config_pull_failures: counters.ShardedCounter = .{};
 };
 
 pub fn writeStatsJson(w: *std.Io.Writer) std.Io.Writer.Error!void {

@@ -86,6 +86,9 @@ const sym_records = @import("../../data/sym_planes/records.zig");
 const kvda_home = @import("kvda_home.zig");
 const slots_lt = @import("slots/lease_table.zig");
 const DataPlane = @import("../../data/plane.zig").DataPlane;
+const router = @import("../../data/router.zig");
+const set_config = @import("../../data/set_config.zig");
+const lifecycle_stats = @import("../../ops/lifecycle/stats.zig").stats;
 const joined = @import("joined.zig");
 const wire_auth = @import("../../wire/auth.zig");
 const listener = @import("../../wire/listener.zig");
@@ -270,6 +273,9 @@ const JoinedHalf = struct {
                 _ = self.plane.publishToManager();
                 log.info("cluster wire: the home shard's successor at {f} admitted the reclaim (epoch {d}) — the manager's token plane re-pointed, this listener re-published", .{ self.js.managerEndpoint(), self.member.epoch });
             }
+            // The grant's set-config generation ahead of this daemon's
+            // word: the manager added or removed a data volume online.
+            if ((v == .renewed or v == .rejoined) and self.member.config_generation > lifecycle_stats.volume_config_generation.load()) self.plane.learnSetConfig(self.member.config_generation);
             _ = self.js.park_gate.expireIfDue(clock.monotonicNs(), self.poison.sink());
             // A plain OS thread of the daemon's own: the kernel's sleep,
             // never an `Io` handle (the lanes' timers are the lanes').
@@ -431,6 +437,7 @@ pub const WirePlane = struct {
             m.owner_svc.register(&self.svc);
             m.ledger_handlers.register(&self.svc);
             m.rename_svc.register(&self.svc);
+            self.svc.register(.resolve_set_config, .{ .ctx = self, .serve = &serveResolveSetConfig });
         }
         self.holder_svc.register(&self.svc);
         self.reader_svc.register(&self.svc);
@@ -526,7 +533,7 @@ pub const WirePlane = struct {
         errdefer m.ledger.deinit();
         m.death_fanout = .{ .plane = self, .ledger = m.ledger.deathSink() };
         m.owner.bindDeathSink(m.death_fanout.sink());
-        m.owner_svc = .{ .owner = &m.owner, .now = &nowMsFn };
+        m.owner_svc = .{ .owner = &m.owner, .now = &nowMsFn, .generation = .{ .ctx = null, .read = &configGenerationFn } };
         m.ledger_handlers = .{ .ledger = &m.ledger, .census = &m.owner, .now = &nowMsFn, .is_vol0_manager = &isVol0ManagerFn, .now_ctx = self };
         // The recovery driver bound over every managed volume: the poll's
         // hooks (`releaseRecovered` → `recoverDead` → `regionPending`) and
@@ -688,6 +695,109 @@ pub const WirePlane = struct {
         self.gpa.free(self.decl_bounds);
         self.stopHalf();
         self.gpa.destroy(self);
+    }
+
+    // ---- the set config across the fleet ----
+
+    /// The owner's grant carries this daemon's `set_config` generation
+    /// (`lifecycle_stats.volume_config_generation`: set at the mount's read
+    /// and at every lifecycle commit).
+    fn configGenerationFn(_: ?*anyopaque) u64 {
+        return lifecycle_stats.volume_config_generation.load();
+    }
+
+    /// `ResolveSetConfig` (the manager's face): volume 0's `set_config`
+    /// record as this manager reads it off tree 0 — a joiner's pull at the
+    /// generation bump its renewal grant carried. The bytes travel in the
+    /// reply scratch (the record's own total codec decodes them there).
+    fn serveResolveSetConfig(ctx: *anyopaque, req: *const service.Request, scratch: []u8) service.Answer {
+        const self: *WirePlane = @ptrCast(@alignCast(ctx));
+        const r = req.payload.resolve_set_config;
+        if (r.volume != 0 or self.mgr == null) return .{ .status = .{ .status = .not_manager } };
+        const bytes = (self.set.volumes[0].lookup(self.gpa, key.TREE_CONTROL, set_config.CONTROL_KEY) catch return service.Answer.refused(error.InputOutput, "set_config")) orelse
+            return .{ .ok = .{ .resolve_set_config = .{ .head = .{ .generation = 0, .len = 0, .reserved = 0 }, .bytes = &.{} } } };
+        defer self.gpa.free(bytes);
+        const generation = set_config.peekGeneration(bytes) orelse return service.Answer.refused(error.InputOutput, "set_config head");
+        if (bytes.len > scratch.len or bytes.len > verbs.SET_CONFIG_MAX) return service.Answer.refused(error.ValueTooLarge, "set_config record exceeds the reply scratch");
+        @memcpy(scratch[0..bytes.len], bytes);
+        return .{ .ok = .{ .resolve_set_config = .{ .head = .{ .generation = generation, .len = @intCast(bytes.len), .reserved = 0 }, .bytes = scratch[0..bytes.len] } } };
+    }
+
+    /// A joiner learns an online `volume add-data` / `remove-data`
+    /// (charter §8): the record pulled from the manager at the bump, then
+    /// per data volume — one this plane lacks is ATTACHED (opened, the
+    /// router row disabled), its writer row armed over the manager link
+    /// (the window pulls its first grant at the first mint), then its
+    /// recorded state published; one it has takes the record's state
+    /// (`draining` / `retired` / `active` — the router's lattice decides
+    /// the legality). A volume with a fabric endpoint record is left to
+    /// the next mount (the daemon's own connect is the mount's act), said
+    /// loud. The word moves to the record's generation only when every
+    /// volume applied; a failure leaves it behind, so the next renewal
+    /// retries (counted).
+    pub fn learnSetConfig(self: *WirePlane, generation: u64) void {
+        const gpa = self.gpa;
+        const js = self.set.volumes[0].joined orelse return;
+        const wp = self.writer_plane orelse return;
+        const dp = wp.plane;
+        const rep = js.link.call(.{ .resolve_set_config = .{ .volume = 0, .reserved = @splat(0) } }) catch |e| {
+            lifecycle_stats.volume_config_pull_failures.inc();
+            log.warn("set config: the manager's record at generation {d} could not be pulled ({s}) — the next renewal retries", .{ generation, @errorName(e) });
+            return;
+        };
+        lifecycle_stats.volume_config_pulls.inc();
+        const r = rep.resolve_set_config;
+        if (r.head.len == 0) return;
+        var diag: set_config.Refusal = undefined;
+        var cfg = set_config.decode(gpa, r.bytes, &diag) catch {
+            lifecycle_stats.volume_config_pull_failures.inc();
+            log.err("set config: the manager's record at generation {d} did not decode — this joiner keeps generation {d}", .{ r.head.generation, lifecycle_stats.volume_config_generation.load() });
+            return;
+        };
+        defer cfg.deinit(gpa);
+        var complete = true;
+        for (cfg.data) |d| {
+            const want: router.VolumeState = switch (d.state) {
+                .active => .active,
+                .draining => .draining,
+                .retired => .retired,
+                .disabled => .disabled,
+            };
+            if (dp.rt.volume(d.vol_tag)) |v| {
+                if (v.state == want) continue;
+                dp.setVolumeState(d.vol_tag, want) catch |e| {
+                    log.warn("set config: vol {x} {t} → {t} refused on this joiner ({s})", .{ d.vol_tag, v.state, want, @errorName(e) });
+                    complete = false;
+                    continue;
+                };
+                lifecycle_stats.volume_online_flips.inc();
+                // Off placement: the window goes back to the holder (the
+                // drain's retire waits on every bit it carved).
+                if (want == .draining or want == .retired) _ = wp.returnWindowOf(d.vol_tag);
+                continue;
+            }
+            if (d.state == .retired or d.uri.len == 0) continue;
+            if (d.fabric != null) {
+                log.warn("set config: vol {x} was added with a fabric endpoint record — this joiner connects it at its next mount (the daemon's own connect is the mount's act)", .{d.vol_tag});
+                complete = false;
+                continue;
+            }
+            const ordinal = dp.attachVolume(d) catch |e| {
+                lifecycle_stats.volume_config_pull_failures.inc();
+                log.err("set config: vol {x} ({s}) could not be attached to this joiner's plane ({s}) — it joins at the next mount", .{ d.vol_tag, d.uri, @errorName(e) });
+                complete = false;
+                continue;
+            };
+            wp.armVolume(ordinal);
+            dp.setVolumeState(d.vol_tag, want) catch |e| {
+                log.warn("set config: vol {x} attached but its state {t} was refused ({s})", .{ d.vol_tag, want, @errorName(e) });
+                complete = false;
+                continue;
+            };
+            lifecycle_stats.volume_online_attached.inc();
+            log.info("set config: vol {x} ({s}) joined this mount ONLINE as ordinal {d} ({t}) at generation {d} — the manager's `volume add-data` learnt at the renewal", .{ d.vol_tag, d.uri, ordinal, want, cfg.config_generation });
+        }
+        if (complete) lifecycle_stats.volume_config_generation.set(cfg.config_generation);
     }
 
     // ---- the data planes' arms ----

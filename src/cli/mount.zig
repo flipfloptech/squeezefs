@@ -100,6 +100,7 @@ const mount_options = @import("../fuse/mount_options.zig");
 const mem_budget = @import("../mem/budget.zig");
 const key = @import("../meta/key.zig");
 const set_config = @import("../data/set_config.zig");
+const lifecycle_stats = @import("../ops/lifecycle/stats.zig").stats;
 const transform = @import("../data/transform.zig");
 const data_superblock = @import("../data/data_superblock.zig");
 const plane_mod = @import("../data/plane.zig");
@@ -806,6 +807,9 @@ fn loadSetConfig(ctx: *Ctx, be: *meta_set.MetaSet) ?set_config.Config {
         _ = ctx.failed("{s}: {s}", .{ ctx.meta_uri, w.buffered() });
         return null;
     };
+    // This daemon's word of the set config's generation: the manager's
+    // grants carry it, a joiner compares its own against the grant's.
+    lifecycle_stats.volume_config_generation.set(cfg.config_generation);
     {
         // The fabric plane BEFORE discovery: a data volume with a
         // `fabric_endpoint` record is connected (or its predecessor's

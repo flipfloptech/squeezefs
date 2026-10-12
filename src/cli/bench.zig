@@ -1035,7 +1035,25 @@ pub const hash_bench = struct {
     };
 
     pub const algos = [_]Algo{ .xxh3_64, .sqzhash128, .sqzhash64 };
-    pub const cell_count = sizes.len * algos.len;
+
+    /// Two measurements per (algorithm, shape): THROUGHPUT (independent
+    /// hashes the core overlaps — the checksum of a stream of pages) and
+    /// CHAINED (the previous result written into the input before the next
+    /// hash: the dependent latency a name lookup's probe chain pays).
+    pub const Mode = enum {
+        throughput,
+        chained,
+
+        pub fn name(self: Mode) []const u8 {
+            return switch (self) {
+                .throughput => "cpu",
+                .chained => "chained",
+            };
+        }
+    };
+
+    pub const modes = [_]Mode{ .throughput, .chained };
+    pub const cell_count = sizes.len * algos.len * modes.len;
 
     /// A cell's span doubles its batch until it covers at least this long:
     /// a 100 ns clock read is then under 0.001 % of the measurement, and a
@@ -1051,6 +1069,7 @@ pub const hash_bench = struct {
 
     pub const Cell = struct {
         algo: Algo,
+        mode: Mode,
         size: usize,
         ops: u64,
         elapsed_ns: u64,
@@ -1072,14 +1091,16 @@ pub const hash_bench = struct {
         }
 
         /// One machine-parseable line: `pass` is `hash`, the shape rides in
-        /// `block`, the algorithm in `algo` (the baseline's fold keys on both).
+        /// `block`, the algorithm in `algo`, the mode in `access` (`cpu` =
+        /// throughput, `chained` = dependent latency); the baseline's fold
+        /// keys on the first three and takes the throughput rows.
         pub fn writeJson(self: Cell, w: *Io.Writer) Io.Writer.Error!void {
-            try w.print("{{\"pass\":\"hash\",\"algo\":\"{s}\",\"block\":{d},\"access\":\"cpu\",\"ops\":{d},\"elapsed_ns\":{d},\"bytes\":{d},\"ps_per_op\":{d},\"mb_per_s\":{d}}}\n", .{ self.algo.name(), self.size, self.ops, self.elapsed_ns, self.bytes(), self.psPerOp(), self.mbPerS() });
+            try w.print("{{\"pass\":\"hash\",\"algo\":\"{s}\",\"block\":{d},\"access\":\"{s}\",\"ops\":{d},\"elapsed_ns\":{d},\"bytes\":{d},\"ps_per_op\":{d},\"mb_per_s\":{d}}}\n", .{ self.algo.name(), self.size, self.mode.name(), self.ops, self.elapsed_ns, self.bytes(), self.psPerOp(), self.mbPerS() });
         }
 
         pub fn writeText(self: Cell, w: *Io.Writer) Io.Writer.Error!void {
             const ps = self.psPerOp();
-            try w.print("| hash {s:<11} | {d:>7} B | {d:>7}.{d:0>3} ns/op | {d:>7}.{d:0>3} GB/s | {d:>10} ops |\n", .{ self.algo.name(), self.size, ps / PS_PER_NS, ps % PS_PER_NS, self.mbPerS() / MB_PER_GB, self.mbPerS() % MB_PER_GB, self.ops });
+            try w.print("| hash {s:<11} | {s:<10} | {d:>7} B | {d:>7}.{d:0>3} ns/op | {d:>7}.{d:0>3} GB/s | {d:>10} ops |\n", .{ self.algo.name(), @tagName(self.mode), self.size, ps / PS_PER_NS, ps % PS_PER_NS, self.mbPerS() / MB_PER_GB, self.mbPerS() % MB_PER_GB, self.ops });
         }
     };
 
@@ -1096,42 +1117,52 @@ pub const hash_bench = struct {
 
     /// `batch` hashes of `input`; the pointer clobber makes every iteration
     /// re-read the input (no hoisting), the result sink keeps every hash.
-    /// The algorithm is comptime so no dispatch rides inside the loop.
-    fn batchNs(comptime algo: Algo, input: []const u8, batch: u64) u64 {
+    /// CHAINED writes the previous result's low byte into the input first,
+    /// so each hash waits for the one before (a store-to-load forward and
+    /// the hash's own dependent rounds). The algorithm and the mode are
+    /// comptime so no dispatch rides inside the loop.
+    fn batchNs(comptime algo: Algo, comptime mode: Mode, input: []u8, batch: u64) u64 {
         const t0 = clock.monotonicNs();
+        var prev: u64 = 0;
         var i: u64 = 0;
         while (i < batch) : (i += 1) {
+            if (mode == .chained) input[0] = @truncate(prev);
             std.mem.doNotOptimizeAway(input.ptr);
-            std.mem.doNotOptimizeAway(hashOnce(algo, input));
+            prev = hashOnce(algo, input);
+            std.mem.doNotOptimizeAway(prev);
         }
         return clock.monotonicNs() -| t0;
     }
 
-    fn measureAlgo(comptime algo: Algo, input: []const u8) Cell {
-        _ = batchNs(algo, input, FIRST_BATCH);
+    fn measureCell(comptime algo: Algo, comptime mode: Mode, input: []u8) Cell {
+        _ = batchNs(algo, mode, input, FIRST_BATCH);
         var batch: u64 = FIRST_BATCH;
         while (true) : (batch *= 2) {
-            const ns = batchNs(algo, input, batch);
-            if (ns >= MIN_SPAN_NS) return .{ .algo = algo, .size = input.len, .ops = batch, .elapsed_ns = ns };
+            const ns = batchNs(algo, mode, input, batch);
+            if (ns >= MIN_SPAN_NS) return .{ .algo = algo, .mode = mode, .size = input.len, .ops = batch, .elapsed_ns = ns };
         }
     }
 
     /// One cell: a warm-up batch, then batches doubling until the span holds.
-    pub fn measure(algo: Algo, input: []const u8) Cell {
+    pub fn measure(algo: Algo, mode: Mode, input: []u8) Cell {
         return switch (algo) {
-            inline else => |a| measureAlgo(a, input),
+            inline else => |a| switch (mode) {
+                inline else => |m| measureCell(a, m, input),
+            },
         };
     }
 
-    /// Every cell in algorithm-major order over a fixed non-zero fill.
+    /// Every cell in mode-, then algorithm-major order over a fixed non-zero fill.
     pub fn runAll(out: *[cell_count]Cell, buf: []u8) void {
         std.debug.assert(buf.len >= sizes[sizes.len - 1]);
-        for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
         var n: usize = 0;
-        for (algos) |algo| {
-            for (sizes) |size| {
-                out[n] = measure(algo, buf[0..size]);
-                n += 1;
+        for (modes) |mode| {
+            for (algos) |algo| {
+                for (sizes) |size| {
+                    for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+                    out[n] = measure(algo, mode, buf[0..size]);
+                    n += 1;
+                }
             }
         }
     }
@@ -1141,7 +1172,7 @@ pub const hash_bench = struct {
         defer p.gpa.free(buf);
         var cells: [cell_count]Cell = undefined;
         runAll(&cells, buf);
-        if (!json) p.stdout.print("instrument=squeezefs bench --hash {s} {s} profile={s}\n| algorithm        |    size |          ns/op |            GB/s |        ops |\n", .{ p.build.train, p.build.commit, p.build.profile }) catch {};
+        if (!json) p.stdout.print("instrument=squeezefs bench --hash {s} {s} profile={s}\n| algorithm        | mode       |      size |          ns/op |            GB/s |        ops |\n", .{ p.build.train, p.build.commit, p.build.profile }) catch {};
         for (cells) |c| (if (json) c.writeJson(p.stdout) else c.writeText(p.stdout)) catch {};
         p.stdout.flush() catch {};
         return cli.exit_ok;
@@ -1429,8 +1460,8 @@ test "fuzz: the .stats term reader is total on arbitrary JSON-shaped text" {
 }
 
 test "the hash microbench: the format's four shapes × three columns; a cell's ps/op and MB/s arithmetic; the JSON names pass=hash, the algo and the shape; every column hashes the same bytes to a deterministic value" {
-    try testing.expectEqual(@as(usize, 12), hash_bench.cell_count);
-    const c: hash_bench.Cell = .{ .algo = .sqzhash128, .size = 4096, .ops = 1_000_000, .elapsed_ns = 250_000_000 };
+    try testing.expectEqual(@as(usize, 24), hash_bench.cell_count);
+    const c: hash_bench.Cell = .{ .algo = .sqzhash128, .mode = .throughput, .size = 4096, .ops = 1_000_000, .elapsed_ns = 250_000_000 };
     // 250 ns/op = 250,000 ps; 4096 B × 4 M/s = 16,384 MB/s.
     try testing.expectEqual(@as(u64, 250_000), c.psPerOp());
     try testing.expectEqual(@as(u64, 16_384), c.mbPerS());
@@ -1449,9 +1480,16 @@ test "the hash microbench: the format's four shapes × three columns; a cell's p
     const h128 = checksum.hash128(&buf);
     try testing.expectEqual(checksum.low64(h128) ^ checksum.low64(h128 >> 64), hash_bench.hashOnce(.sqzhash128, &buf));
     try testing.expectEqual(std.hash.XxHash3.hash(0, &buf), hash_bench.hashOnce(.xxh3_64, &buf));
-    // A real (tiny) measurement: the batch doubles until the span holds.
-    const cell = hash_bench.measure(.sqzhash64, buf[0..16]);
+    // A real (tiny) measurement in each mode: the batch doubles until the
+    // span holds; a chained cell can never be faster than a throughput cell.
+    const cell = hash_bench.measure(.sqzhash64, .throughput, buf[0..16]);
     try testing.expect(cell.elapsed_ns >= hash_bench.MIN_SPAN_NS);
     try testing.expect(cell.ops >= hash_bench.FIRST_BATCH);
     try testing.expect(cell.psPerOp() > 0);
+    const chained = hash_bench.measure(.sqzhash64, .chained, buf[0..16]);
+    try testing.expect(chained.psPerOp() >= cell.psPerOp());
+    var chained_json: Io.Writer.Allocating = .init(testing.allocator);
+    defer chained_json.deinit();
+    try chained.writeJson(&chained_json.writer);
+    try testing.expect(std.mem.indexOf(u8, chained_json.written(), "\"access\":\"chained\"") != null);
 }

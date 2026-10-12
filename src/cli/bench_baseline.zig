@@ -138,7 +138,8 @@ pub fn foldRun(gpa: Allocator, json_lines: []const u8) !Run {
         const pass = json_scan.string(line, "pass") orelse continue;
         const block = json_scan.number(line, "block") orelse continue;
         const access = json_scan.string(line, "access") orelse continue;
-        const g = (if (std.mem.eql(u8, pass, "hash")) Group.ofHashRow(json_scan.string(line, "algo") orelse continue, block) else Group.ofRow(pass, block, std.mem.eql(u8, access, "rand"))) orelse continue;
+        // A hash row: the throughput mode (`access` = `cpu`) of the judged column; the chained rows are evidence, not a group.
+        const g = (if (std.mem.eql(u8, pass, "hash")) (if (std.mem.eql(u8, access, "cpu")) Group.ofHashRow(json_scan.string(line, "algo") orelse continue, block) else null) else Group.ofRow(pass, block, std.mem.eql(u8, access, "rand"))) orelse continue;
         const rg = &run.groups[@backingInt(g)];
         const elapsed = json_scan.number(line, "elapsed_ns") orelse 0;
         rg.ops += json_scan.number(line, "ops") orelse 0;
@@ -460,7 +461,7 @@ test "Group.ofHashRow: the sqzhash128 column keys the four hash groups by shape;
     try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash64", 16));
     try testing.expectEqual(@as(?Group, null), Group.ofHashRow("sqzhash128", 17));
     try testing.expect(Group.hash_4k.isHash() and !Group.stat.isHash());
-    const run = try foldRun(testing.allocator, "{\"pass\":\"hash\",\"algo\":\"sqzhash128\",\"block\":4096,\"access\":\"cpu\",\"ops\":1000000,\"elapsed_ns\":250000000,\"bytes\":4096000000,\"ps_per_op\":250000,\"mb_per_s\":16384}\n{\"pass\":\"hash\",\"algo\":\"xxh3-64\",\"block\":4096,\"access\":\"cpu\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n");
+    const run = try foldRun(testing.allocator, "{\"pass\":\"hash\",\"algo\":\"sqzhash128\",\"block\":4096,\"access\":\"cpu\",\"ops\":1000000,\"elapsed_ns\":250000000,\"bytes\":4096000000,\"ps_per_op\":250000,\"mb_per_s\":16384}\n{\"pass\":\"hash\",\"algo\":\"xxh3-64\",\"block\":4096,\"access\":\"cpu\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n{\"pass\":\"hash\",\"algo\":\"sqzhash128\",\"block\":4096,\"access\":\"chained\",\"ops\":1,\"elapsed_ns\":1,\"bytes\":4096,\"ps_per_op\":1,\"mb_per_s\":1}\n");
     const g = run.group(.hash_4k);
     try testing.expectEqual(@as(u32, 1), g.rows);
     try testing.expectEqual(@as(u64, 1_000_000), g.ops);

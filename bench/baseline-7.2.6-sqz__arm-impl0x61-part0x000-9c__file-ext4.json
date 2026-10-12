@@ -9,7 +9,7 @@
   },
   "instrument": {
     "train": "0.1.0",
-    "commit": "966105390f14-dirty",
+    "commit": "f8ab6ac25352",
     "profile": "gate"
   },
   "substrate": "file",
@@ -21,40 +21,40 @@
     "time_box_s": 5
   },
   "runs": 3,
-  "unix_time": 1791641801,
+  "unix_time": 1791778051,
   "groups": [
     {
       "ops_per_s": {
-        "mean": 1055.3041269748785,
-        "sigma": 96.65057892754591
+        "mean": 1285.7306356426964,
+        "sigma": 208.98579966741914
       },
       "p50_ns": {
-        "mean": 2048000,
-        "sigma": 0
+        "mean": 1365333.3333333333,
+        "sigma": 591206.6756501768
       },
       "p99_ns": {
-        "mean": 27306666.666666668,
-        "sigma": 9459306.81040283
+        "mean": 32768000,
+        "sigma": 0
       },
       "bytes": 1073741824,
       "admission_bytes": 1073741824,
-      "terminal_frees": 0,
-      "reclaim_queued": 0,
+      "terminal_frees": 128,
+      "reclaim_queued": 128,
       "reclaim_elided": 0,
       "discard_bytes": 0
     },
     {
       "ops_per_s": {
-        "mean": 5337.261359380299,
-        "sigma": 597.3970107660184
+        "mean": 7442.292872835995,
+        "sigma": 1783.6652776395783
       },
       "p50_ns": {
-        "mean": 512000,
-        "sigma": 0
+        "mean": 341333.3333333333,
+        "sigma": 147801.6689125442
       },
       "p99_ns": {
-        "mean": 1024000,
-        "sigma": 0
+        "mean": 682666.6666666666,
+        "sigma": 295603.3378250884
       },
       "bytes": 1073741824,
       "admission_bytes": 0,
@@ -65,8 +65,28 @@
     },
     {
       "ops_per_s": {
-        "mean": 9858.623467291314,
-        "sigma": 700.2183149405492
+        "mean": 18743.287017877337,
+        "sigma": 936.9886441543006
+      },
+      "p50_ns": {
+        "mean": 128000,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 256000,
+        "sigma": 0
+      },
+      "bytes": 780390400,
+      "admission_bytes": 0,
+      "terminal_frees": 128,
+      "reclaim_queued": 128,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 7079.719111178026,
+        "sigma": 62.23600191893014
       },
       "p50_ns": {
         "mean": 256000,
@@ -76,28 +96,8 @@
         "mean": 512000,
         "sigma": 0
       },
-      "bytes": 432046080,
-      "admission_bytes": 0,
-      "terminal_frees": 256,
-      "reclaim_queued": 256,
-      "reclaim_elided": 0,
-      "discard_bytes": 0
-    },
-    {
-      "ops_per_s": {
-        "mean": 3231.7593769957493,
-        "sigma": 143.4097009573602
-      },
-      "p50_ns": {
-        "mean": 1024000,
-        "sigma": 0
-      },
-      "p99_ns": {
-        "mean": 4096000,
-        "sigma": 0
-      },
-      "bytes": 138211328,
-      "admission_bytes": 138211328,
+      "bytes": 292544512,
+      "admission_bytes": 292544512,
       "terminal_frees": 0,
       "reclaim_queued": 0,
       "reclaim_elided": 0,
@@ -105,15 +105,35 @@
     },
     {
       "ops_per_s": {
-        "mean": 3302.137044969133,
-        "sigma": 457.35309227670035
+        "mean": 4947.980757980985,
+        "sigma": 699.1023848626687
       },
       "p50_ns": {
+        "mean": 426666.6666666667,
+        "sigma": 147801.6689125442
+      },
+      "p99_ns": {
         "mean": 512000,
         "sigma": 0
       },
-      "p99_ns": {
+      "bytes": 0,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 3552.6507856061994,
+        "sigma": 370.28656016791496
+      },
+      "p50_ns": {
         "mean": 682666.6666666666,
+        "sigma": 295603.3378250884
+      },
+      "p99_ns": {
+        "mean": 853333.3333333334,
         "sigma": 295603.3378250884
       },
       "bytes": 0,
@@ -125,18 +145,78 @@
     },
     {
       "ops_per_s": {
-        "mean": 2486.7677540607406,
-        "sigma": 89.85695895796728
+        "mean": 711264666.9911417,
+        "sigma": 15611870.230039153
       },
       "p50_ns": {
-        "mean": 1024000,
+        "mean": 0,
         "sigma": 0
       },
       "p99_ns": {
-        "mean": 1024000,
+        "mean": 0,
         "sigma": 0
       },
-      "bytes": 0,
+      "bytes": 268435456,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 217846970.15889958,
+        "sigma": 14612433.016034318
+      },
+      "p50_ns": {
+        "mean": 0,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 0,
+        "sigma": 0
+      },
+      "bytes": 838860800,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 32451015.116205256,
+        "sigma": 606203.981536084
+      },
+      "p50_ns": {
+        "mean": 0,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 0,
+        "sigma": 0
+      },
+      "bytes": 4294967296,
+      "admission_bytes": 0,
+      "terminal_frees": 0,
+      "reclaim_queued": 0,
+      "reclaim_elided": 0,
+      "discard_bytes": 0
+    },
+    {
+      "ops_per_s": {
+        "mean": 367716.2631359951,
+        "sigma": 7884.685005836116
+      },
+      "p50_ns": {
+        "mean": 0,
+        "sigma": 0
+      },
+      "p99_ns": {
+        "mean": 0,
+        "sigma": 0
+      },
+      "bytes": 2147483648,
       "admission_bytes": 0,
       "terminal_frees": 0,
       "reclaim_queued": 0,

@@ -825,6 +825,22 @@ pub const Table = struct {
         }
         return out[0..n];
     }
+
+    /// Every parked EXTENT entry's key (the D3 fold targets: the W2
+    /// overlays charged as `parked_extent_bytes`), owned by `gpa`. A
+    /// snapshot under the table lock: an entry that escalates or retires
+    /// between the census and the kick is the kick's clean no-op.
+    pub fn extentKeys(self: *Table, gpa: Allocator) Allocator.Error![]Key {
+        var out: std.ArrayList(Key) = .empty;
+        errdefer out.deinit(gpa);
+        self.lock.lock();
+        defer self.lock.unlock();
+        var it = self.index.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.*.repr == .extent) try out.append(gpa, kv.key_ptr.*);
+        }
+        return out.toOwnedSlice(gpa);
+    }
 };
 
 // ---------------------------------------------------------------------------

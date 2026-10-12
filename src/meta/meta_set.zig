@@ -657,6 +657,11 @@ pub const MetaSet = struct {
                 continue;
             }
             try be.conveyorStats().writeJson(w);
+            // The heap census (`defrag --meta`'s before/after words): node
+            // images = allocated extents less the retirements awaiting their
+            // covering barrier.
+            const census = be.residentNodeCensus();
+            try w.print(",\"heap_total_extents\":{d},\"heap_free_extents\":{d},\"heap_pending_free\":{d},\"resident_leaves\":{d},\"resident_interior\":{d}", .{ be.alloc.totalExtents(), be.alloc.freeExtents(), be.alloc.pendingCount(), census.leaves, census.interior });
             try w.writeAll(",\"checkpointer\":");
             try counters.writeFieldsJson(&be.cp, w);
             if (be.guard) |g| {

@@ -713,6 +713,27 @@ pub fn freezeForSmo(cache: *NodeCache, n: *CachedNode) Error!?ForcedFreezeGuard 
     return .{ .n = n, .armed = true };
 }
 
+/// D4's compaction threshold (`defrag --meta`, `ops_jobs_lifecycle.md`
+/// §3.1 "dead_bset_ratio = 1 − live/indexed"): a leaf compacts when at
+/// least HALF of its serialized log is dead — the one law's node face
+/// (the pack face's `live ≤ CHUNK/2`): the rewrite costs `live` bytes and
+/// reclaims `log − live`, which pays iff `live ≤ log/2`.
+pub const DEFRAG_COMPACT_DEAD_PERMILLE: u64 = 500;
+
+/// The D4 nudge: a resident LEAF whose log is mostly dead folds into ONE
+/// fresh image through the §4.6 replacement — `freezeForSmo` (a clean
+/// node takes the forced freeze; a dirty one freezes its open delta) then
+/// `smoReplace` with the FIFO valve KEPT (never the flush pass's forced
+/// posture: a maintenance job is not what discharges a tail-pinning
+/// floor, so it refuses pre-swap and the caller's cycle remedies). False =
+/// the candidate went stale (superseded, a racing freeze) — a no-op.
+pub fn compactForDefrag(t: *KvTree, ctx: *SmoContext, n: *CachedNode, out: *MaintenanceOutcome) Error!bool {
+    var g = (try freezeForSmo(t.cache, n)) orelse return false;
+    defer g.release();
+    try smoReplace(t, ctx, n, out, false);
+    return true;
+}
+
 /// Move the records of `leftovers` whose keys fall in `[min, max]` into
 /// `succ`'s open delta with EXACT per-record floors (each carries its own
 /// entry start from its original apply, so every successor gets exactly
@@ -1750,6 +1771,69 @@ test "writeback_appends_then_compacts_then_splits: threshold appends never move 
     try testing.expectEqual(g0 + 1, stats.meta_kv_root_grows.load());
     for ([_]u64{ 1000, 1100, n - 1 }) |p| try expectLookup(t, &ikey(p), tree.testValue(p, 40, &buf));
     try expectLookup(t, &ikey(3), tree.testValue(3 * 31, 24, &buf));
+}
+
+test "the D4 nudge (defrag --meta): a leaf whose serialized log is mostly dead (one key band overwritten across drains) measures past DEFRAG_COMPACT_DEAD_PERMILLE and `compactForDefrag` folds it into ONE fresh image — a compaction, never a split, the old extent pending-free, every key current, the occupancy dead share ~0 after; a fresh leaf below the threshold is not a candidate; a superseded node is the clean no-op" {
+    const gpa = testing.allocator;
+    var vol = try TestVolume.init(gpa, .{});
+    defer vol.deinit();
+    const t = try vol.createTree(.native);
+    var buf: [64]u8 = undefined;
+    for (0..200) |i| try t.insert(&ikey(i), tree.testValue(i, 24, &buf));
+    _ = try vol.drain(t);
+    const root0 = t.rootPtr();
+    {
+        const n = try vol.cache.get(root0.addr);
+        defer n.release();
+        // One base frame: nothing dead yet.
+        const occ = leaf_merge.leafOccupancy(t, n);
+        try testing.expect(occ.log_bytes > 0);
+        try testing.expect(occ.deadPermille() < DEFRAG_COMPACT_DEAD_PERMILLE);
+    }
+    // Overwrite the band across drains: every drain appends a frame that
+    // shadows the previous one — the log grows, the fold does not. Stop
+    // BEFORE the threshold maintenance's own compaction fires.
+    const c0 = stats.meta_kv_node_compactions.load();
+    var rounds: u32 = 0;
+    while (rounds < 64) : (rounds += 1) {
+        for (0..200) |i| try t.insert(&ikey(i), tree.testValue(i * 7 + rounds, 24, &buf));
+        _ = try vol.drain(t);
+        try testing.expectEqual(c0, stats.meta_kv_node_compactions.load());
+        const n = try vol.cache.get(t.rootPtr().addr);
+        defer n.release();
+        if (leaf_merge.leafOccupancy(t, n).deadPermille() >= DEFRAG_COMPACT_DEAD_PERMILLE) break;
+    }
+    try testing.expect(rounds < 64);
+    try testing.expectEqual(@as(u64, 500), DEFRAG_COMPACT_DEAD_PERMILLE);
+    const pending0 = vol.alloc.pendingCount();
+    {
+        const n = try vol.cache.get(t.rootPtr().addr);
+        defer n.release();
+        var out: MaintenanceOutcome = .{};
+        try testing.expect(try compactForDefrag(t, &vol.ctx, n, &out));
+        try testing.expectEqual(@as(u64, 1), out.compactions);
+        try testing.expectEqual(@as(u64, 0), out.splits);
+        try testing.expect(n.state.isSuperseded());
+        // A second nudge on the superseded object is the no-op.
+        var again: MaintenanceOutcome = .{};
+        try testing.expect(!try compactForDefrag(t, &vol.ctx, n, &again));
+        try testing.expectEqual(@as(u64, 0), again.compactions);
+    }
+    try testing.expectEqual(c0 + 1, stats.meta_kv_node_compactions.load());
+    try testing.expect(t.rootPtr().addr != root0.addr);
+    try testing.expectEqual(pending0 + 1, vol.alloc.pendingCount());
+    {
+        const n = try vol.cache.get(t.rootPtr().addr);
+        defer n.release();
+        // A fresh image is ONE frame of its fold: 0 dead (the measure is
+        // frame-rounded on both sides, so a leaf the nudge cannot shrink is
+        // never a candidate again).
+        const occ = leaf_merge.leafOccupancy(t, n);
+        try testing.expectEqual(@as(u64, 0), occ.deadPermille());
+        try testing.expectEqual(@as(u64, 0), occ.deadBytes());
+    }
+    var i: u64 = 0;
+    while (i < 200) : (i += 13) try expectLookup(t, &ikey(i), tree.testValue(i * 7 + rounds, 24, &buf));
 }
 
 test "interior_recursion_grows_root_to_depth_three: the level-1 root splits itself; every key resolves through two interior levels and streams in order" {

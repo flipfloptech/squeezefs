@@ -69,9 +69,9 @@ src/cli/fsck.zig:37 | 20 | a size — OWED: derive from derive.Facts or document
 src/cli/fsck.zig:37 | 64 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/job.zig:332 | 0xFFFF | an encoding constant (magic, mask, flag bit, hash seed) — OWED: name it or document the table
 src/cli/job.zig:332 | 32 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:777 | 13 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:778 | 7 | a size — OWED: derive from derive.Facts or document the physical/format reason
-src/cli/mount.zig:779 | 17 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:778 | 13 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:779 | 7 | a size — OWED: derive from derive.Facts or document the physical/format reason
+src/cli/mount.zig:780 | 17 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/staging_verb.zig:65 | 20 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/cli/status.zig:220 | 512 | OWED: derive it or document it on the line (charter §1.5)
 src/cli/status.zig:229 | 512 | OWED: derive it or document it on the line (charter §1.5)
@@ -393,9 +393,9 @@ src/meta/record.zig:1047 | 4 | OWED: derive it or document it on the line (chart
 src/meta/record.zig:1066 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/record.zig:1106 | 16 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/routing/migration_tee.zig:56 | 16 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/smo.zig:1332 | 1024 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/smo.zig:1609 | 7 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
-src/meta/smo.zig:1609 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/smo.zig:1353 | 1024 | OWED: derive it or document it on the line (charter §1.5)
+src/meta/smo.zig:1630 | 7 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
+src/meta/smo.zig:1630 | 8 | a percentage — OWED: derive it (charter §1.5) or document the measured reason
 src/meta/superblock.zig:148 | 3 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/superblock.zig:450 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/appender_dir.zig:24 | 8 | encoding offset/width of a fixed layout (the module's layout table; the comptime size asserts pin it)

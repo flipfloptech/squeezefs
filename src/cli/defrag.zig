@@ -12,10 +12,11 @@
 //! adopts and runs through the ONE mover. A MOUNTPOINT target SUBMITS the
 //! arms through the daemon's admin lane (`admin_lane.zig`): the fabric
 //! runs them at once; the daemon's bodies are D1/D2 (`--data`), the
-//! compactor (`--pack`) and the rebalance; `--meta` / `--fold` submit and
-//! fail typed (`body`) until their plane seams are bound (stated in the
-//! rung-8 evidence) — never a silent queue. `--report-only` is the
-//! offline measure (the set's gauges ride `.stats` on a live mount).
+//! compactor (`--pack`), the rebalance, D3 (`--fold`: the write side's
+//! parked W2 extents through its own fold) and D4 (`--meta`: the leaf
+//! compaction nudge and the merge lap under each volume's SMO lock).
+//! `--report-only` is the offline measure (the set's gauges ride `.stats`
+//! on a live mount).
 //! `--rekey --encrypt-key <path|->` (charter §6.5; `ops/defrag/rekey.zig`):
 //! the NEW key's material read through the ONE reader in THIS process, a
 //! fresh salt minted, the key id derived, the key-dir file installed

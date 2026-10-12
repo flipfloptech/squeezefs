@@ -6063,6 +6063,281 @@ test "smoke: THE JOBS MATRIX — format (1 MiB blocks, a cache path) → fill (p
     _ = try fsckClean(rig, "the jobs matrix");
 }
 
+// ---- defrag --fold / --meta on a live mount ----
+
+/// The D3 row's shape: three striped files, four sector-aligned 512 B
+/// writes each into scattered pages of their first blocks, held OPEN
+/// across the job (a RELEASE folds a lone parked write on its own).
+const fold_files: usize = 3;
+const fold_writes_per_file: usize = 4;
+const fold_page: u64 = 4096;
+
+/// The D4 row's forest: `defrag_forest_files` files created, every tenth
+/// kept, the survivors rewritten `defrag_rewrite_rounds` times — the
+/// leaves then hold a few live records under a log that is mostly dead
+/// puts (compaction candidates) and most leaves fold under ¼ (merge
+/// candidates) at the 64 KiB node the row formats.
+const defrag_forest_files: usize = 8000;
+const defrag_rewrite_rounds: usize = 4;
+
+fn defragForestScript(gpa: std.mem.Allocator) ![]u8 {
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    // Four parallel lanes build the population; the rewrites follow.
+    try w.writer.print("mkdir -p m; for lane in 0 1 2 3; do ( i=$lane; while [ $i -lt {d} ]; do printf 'm%s\\n' $i > m/f$i; i=$((i + 4)); done ) & done; wait; i=0; while [ $i -lt {d} ]; do if [ $((i % 10)) -ne 0 ]; then rm m/f$i; fi; i=$((i + 1)); done; r=0; while [ $r -lt {d} ]; do i=0; while [ $i -lt {d} ]; do printf 'm%s-r%s\\n' $i $r > m/f$i; i=$((i + 10)); done; r=$((r + 1)); done; ls m | wc -l", .{ defrag_forest_files, defrag_forest_files, defrag_rewrite_rounds, defrag_forest_files });
+    return w.toOwnedSlice();
+}
+
+/// The whole `.stats` once the meta heap has no retirement awaiting its
+/// barrier (`heap_pending_free` 0 — the compactions' and merges' old
+/// extents return at the barriered cycles that follow), bounded; the
+/// last read either way.
+fn heapSettledStats(rig: *Rig) ![]u8 {
+    const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+    while (true) {
+        const st = try rig.stats();
+        if ((numberAfter(st, "\"heap_pending_free\":") orelse 0) == 0 or clock.monotonicNs() >= deadline) return st;
+        rig.gpa.free(st);
+        sleepMs(200);
+    }
+}
+
+/// A bounded poll until the job reads `running` with ≥ 1 task done (the
+/// kill row's "mid-job").
+fn awaitJobMidRun(rig: *Rig, job_id: []const u8, bound_ns: u64) !void {
+    const deadline = clock.monotonicNs() + bound_ns;
+    while (clock.monotonicNs() < deadline) {
+        const r = try rig.squeezefs(&.{ "job", "status", rig.mp, job_id });
+        defer rig.freeRun(r);
+        if (std.mem.indexOf(u8, r.stdout, " running, ") != null and std.mem.indexOf(u8, r.stdout, ", 0/") == null) return;
+        if (std.mem.indexOf(u8, r.stdout, " completed") != null) return error.JobCompletedEarly;
+        sleepMs(50);
+    }
+    return error.JobNeverMidRun;
+}
+
+test "smoke: DEFRAG --fold AND --meta ON A LIVE MOUNT — format (64 KiB meta nodes, 1 MiB blocks, a cache path) → three fsync'd striped files held OPEN with 12 sector-aligned 512 B writes parked as W2 extents (parked_extent_bytes ≥ 12 pages) → `defrag --fold <mp>` folds every one in place (12 page DMAs for 6 KiB of user bytes ≤ the §J 8× bound, parked_extent_bytes 0, every byte exact after the close) → a forest of 8,000 files cut to 800 and rewritten 4× → `defrag --meta --throttle 1` runs under the duty cycle: `job cancel` mid-run → cancelled; a second at throttle 1: `job pause` → paused → `resume` → running → kill -9 mid-job → remount adopts it and it completes by plan regeneration → compactions + merges ≥ 1, nodes walked after ≤ before, `fsck --online` 0 findings" {
+    const io = testing.io;
+    if (venueMissing(io)) |why| return testkit.skipWhy(@src(), why);
+    const gpa = testing.allocator;
+    const rig = try Rig.init(gpa, io);
+    defer rig.deinit();
+    var bs_buf: [16]u8 = undefined;
+    try rig.formatSetWith(true, &.{ "--meta-node-kib", "64", "--block-size", try std.fmt.bufPrint(&bs_buf, "{d}", .{kvmap_block}) });
+    try rig.createImage();
+    try rig.spawnMount(&.{});
+    _ = try rig.awaitReady(0);
+
+    // 1. D3: the striped files, then the parked writes from THIS process
+    //    (the fds stay open until the job completes).
+    {
+        const out = try rig.onMount("for n in 0 1 2; do dd if=\"$1/image\" of=big$n bs=1M skip=$((n * 8)) count=8 conv=fsync status=none; done; echo filled");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "filled") != null);
+    }
+    var fds: [fold_files]linux.fd_t = undefined;
+    var opened: usize = 0;
+    defer for (fds[0..opened]) |fd| {
+        _ = linux.close(fd);
+    };
+    var sector: [512]u8 = undefined;
+    for (0..fold_files) |n| {
+        var pb: [linux.PATH_MAX:0]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&pb, "{s}/big{d}", .{ rig.mp, n }, 0);
+        const rc = linux.open(path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        fds[n] = @intCast(rc);
+        opened += 1;
+        for (0..fold_writes_per_file) |k| {
+            @memset(&sector, @as(u8, @intCast(0x40 + n * 8 + k)));
+            // Block k, page 3 + 2k, 512 B into the page: a sub-cap,
+            // sector-aligned, unaligned-to-the-page write — the extent class.
+            const off: u64 = @as(u64, k) * kvmap_block + (3 + 2 * @as(u64, k)) * fold_page + 512;
+            const w = linux.pwrite(fds[n], &sector, sector.len, @intCast(off));
+            try testing.expectEqual(@as(usize, 512), w);
+        }
+    }
+    const user_bytes: u64 = fold_files * fold_writes_per_file * 512;
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const parked = numberAfter(st, "\"parked_extent_bytes\":") orelse 0;
+        const parks = numberAfter(st, "\"extent_parks\":") orelse 0;
+        std.debug.print("smoke[defrag]: {d} parked extent write(s) across {d} open file(s): parked_extent_bytes {d}, extent_parks {d}\n", .{ fold_files * fold_writes_per_file, fold_files, parked, parks });
+        try testing.expect(parked >= fold_files * fold_writes_per_file * fold_page);
+        try testing.expect(parks >= fold_files * fold_writes_per_file);
+    }
+    const ip_bytes0 = blk: {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        break :blk numberAfter(st, "\"fold_inplace_write_bytes\":") orelse 0;
+    };
+    {
+        const r = try rig.squeezefs(&.{ "defrag", "--fold", "--throttle", "50", rig.mp });
+        defer rig.freeRun(r);
+        if (!r.term.success()) std.debug.print("\ndefrag --fold: {s}\n", .{r.stderr});
+        try testing.expect(r.term.success());
+        const id = jobIdIn(r.stdout) orelse return error.NoFoldJob;
+        try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, id, 120 * std.time.ns_per_s));
+    }
+    {
+        const st = try rig.stats();
+        defer gpa.free(st);
+        const kicked = numberAfter(st, "\"defrag_folds_kicked\":") orelse 0;
+        const parked = numberAfter(st, "\"parked_extent_bytes\":") orelse 99;
+        const passes = numberAfter(st, "\"fold_inplace_passes\":") orelse 0;
+        const ip_bytes = (numberAfter(st, "\"fold_inplace_write_bytes\":") orelse 0) - ip_bytes0;
+        const declines = numberAfter(st, "\"fold_inplace_declines\":") orelse 0;
+        std.debug.print("smoke[defrag]: --fold: {d} ino(s) kicked, {d} in-place pass(es), {d} B written in place for {d} B of user writes (×{d}; the §J bound 8×), parked_extent_bytes {d} after, in-place declines {d}\n", .{ kicked, passes, ip_bytes, user_bytes, ip_bytes / user_bytes, parked, declines });
+        try testing.expectEqual(@as(u64, fold_files), kicked);
+        try testing.expectEqual(@as(u64, 0), parked);
+        try testing.expect(passes >= fold_files * fold_writes_per_file);
+        try testing.expectEqual(user_bytes * fold_page / 512, ip_bytes);
+        try testing.expect(ip_bytes * 1_000_000 / user_bytes <= extent_overlay.inPlaceBoundPpm(512, 512));
+    }
+    // Close the fds (nothing left parked to flush) and verify every byte:
+    // the 512 B patterns, the untouched rest of each page from the image.
+    for (fds[0..opened]) |fd| _ = linux.close(fd);
+    opened = 0;
+    {
+        // Byte-exact against the image everywhere BUT the 12 sectors; the
+        // sectors carry their byte (the expected image rebuilt with `tr`
+        // mapping 512 zeros onto the octal byte).
+        var w: std.Io.Writer.Allocating = .init(gpa);
+        defer w.deinit();
+        for (0..fold_files) |n| {
+            try w.writer.print("cp big{d} \"$1/got{d}\"; dd if=\"$1/image\" of=\"$1/want{d}\" bs=1M skip={d} count=8 status=none; ", .{ n, n, n, n * 8 });
+            for (0..fold_writes_per_file) |k| {
+                const off: u64 = @as(u64, k) * kvmap_block + (3 + 2 * @as(u64, k)) * fold_page + 512;
+                try w.writer.print("printf '%0512d' 0 | tr 0 \"\\{o:0>3}\" | dd of=\"$1/want{d}\" bs=512 seek={d} count=1 conv=notrunc status=none; ", .{ 0x40 + n * 8 + k, n, off / 512 });
+            }
+            try w.writer.print("cmp \"$1/got{d}\" \"$1/want{d}\" && ", .{ n, n });
+        }
+        try w.writer.writeAll("echo fold-exact");
+        const out = try rig.onMount(w.written());
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "fold-exact") != null);
+    }
+
+    // 2. D4: the forest, the before words.
+    {
+        const script = try defragForestScript(gpa);
+        defer gpa.free(script);
+        const out = try rig.onMountTimed(script, 600);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("800\n", out);
+    }
+    try rig.expectAlive("the forest build");
+    {
+        var got = try fsckJsonTarget(rig, rig.mp, &.{"--online"});
+        defer got.report.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+    }
+    // The meta volume's node census BEFORE: the online fsck just paged
+    // every tree, so the resident leaves ARE the leaves; the heap words
+    // (allocated = total − free) ride along.
+    const before, const heap_before, const kicked0, const merges0, const laps0 = blk: {
+        const st = try heapSettledStats(rig);
+        defer gpa.free(st);
+        const total = numberAfter(st, "\"heap_total_extents\":") orelse 0;
+        const free = numberAfter(st, "\"heap_free_extents\":") orelse 0;
+        break :blk .{ numberAfter(st, "\"resident_leaves\":") orelse 0, total - free, numberAfter(st, "\"defrag_meta_compactions_kicked\":") orelse 0, numberAfter(st, "\"defrag_meta_merges\":") orelse 0, numberAfter(st, "\"meta_kv_merge_laps\":") orelse 0 };
+    };
+    // 2a. Cancel mid-run at throttle 1 (every chunk parks 99× its work).
+    {
+        const r = try rig.squeezefs(&.{ "defrag", "--meta", "--throttle", "1", rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const id = jobIdIn(r.stdout) orelse return error.NoMetaJob;
+        try awaitJobState(rig, id, "running", 30 * std.time.ns_per_s);
+        const c = try rig.squeezefs(&.{ "job", "cancel", rig.mp, id });
+        defer rig.freeRun(c);
+        try testing.expect(c.term.success());
+        try testing.expectEqualStrings("cancelled", try awaitJobTerminal(rig, id, 120 * std.time.ns_per_s));
+    }
+    // 2b. Pause → resume → kill -9 mid-job → remount adopts → completes.
+    var mark: usize = 0;
+    {
+        const r = try rig.squeezefs(&.{ "defrag", "--meta", "--throttle", "1", rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const id = jobIdIn(r.stdout) orelse return error.NoMetaJob;
+        try awaitJobState(rig, id, "running", 30 * std.time.ns_per_s);
+        {
+            const p = try rig.squeezefs(&.{ "job", "pause", rig.mp, id });
+            defer rig.freeRun(p);
+            try testing.expect(p.term.success());
+        }
+        try awaitJobState(rig, id, "paused", 60 * std.time.ns_per_s);
+        {
+            const p = try rig.squeezefs(&.{ "job", "resume", rig.mp, id });
+            defer rig.freeRun(p);
+            try testing.expect(p.term.success());
+        }
+        try awaitJobMidRun(rig, id, 120 * std.time.ns_per_s);
+        try rig.kill();
+        mark = try rig.logLen();
+        try rig.spawnMount(&.{});
+        _ = try rig.awaitReady(mark);
+        {
+            const text = try rig.readLog();
+            defer gpa.free(text);
+            try testing.expect(std.mem.indexOf(u8, text[mark..], "job(s) adopted") != null);
+        }
+        // The adopted job regenerates its plan at full duty: the remaining
+        // candidates compact and merge.
+        {
+            const t = try rig.squeezefs(&.{ "job", "throttle", rig.mp, id, "100" });
+            defer rig.freeRun(t);
+            if (!t.term.success()) try testing.expect(std.mem.indexOf(u8, t.stderr, "the job is terminal") != null);
+        }
+        try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, id, 600 * std.time.ns_per_s));
+    }
+    // 2c. A third pass at full duty converges to nothing left to do.
+    {
+        const r = try rig.squeezefs(&.{ "defrag", "--meta", rig.mp });
+        defer rig.freeRun(r);
+        try testing.expect(r.term.success());
+        const id = jobIdIn(r.stdout) orelse return error.NoMetaJob;
+        try testing.expectEqualStrings("completed", try awaitJobTerminal(rig, id, 600 * std.time.ns_per_s));
+    }
+    {
+        // AFTER: the online fsck pages every tree again (the remount's cache
+        // was cold), then a settled read — the compactions' retired
+        // extents return at the barriered cycles that follow the jobs.
+        var got = try fsckJsonTarget(rig, rig.mp, &.{"--online"});
+        defer got.report.deinit(gpa);
+        const st = try heapSettledStats(rig);
+        defer gpa.free(st);
+        const kicked = (numberAfter(st, "\"defrag_meta_compactions_kicked\":") orelse 0) - kicked0;
+        const merges = (numberAfter(st, "\"defrag_meta_merges\":") orelse 0) - merges0;
+        const laps = (numberAfter(st, "\"meta_kv_merge_laps\":") orelse 0) - laps0;
+        const after = numberAfter(st, "\"resident_leaves\":") orelse 0;
+        const heap_after = (numberAfter(st, "\"heap_total_extents\":") orelse 0) - (numberAfter(st, "\"heap_free_extents\":") orelse 0);
+        std.debug.print("smoke[defrag]: --meta over {d} files cut to 800 and rewritten {d}×: {d} compaction(s) kicked, {d} merge(s), {d} whole merge lap(s) (the cancelled, the kill-resumed and the converging job together); leaves {d} → {d} (interior {d}); meta heap {d} → {d} allocated extent(s), {d} pending free; merge candidates {d}; fsck --online {d} finding(s)\n", .{ defrag_forest_files, defrag_rewrite_rounds, kicked, merges, laps, before, after, numberAfter(st, "\"resident_interior\":") orelse 0, heap_before, heap_after, numberAfter(st, "\"heap_pending_free\":") orelse 0, numberAfter(st, "\"meta_kv_merge_candidates\":") orelse 0, got.report.findings.len });
+        if (got.report.findings.len != 0) for (got.report.findings) |f| std.debug.print("  unexpected: {f}\n", .{f});
+        try testing.expectEqual(@as(usize, 0), got.report.findings.len);
+        try testing.expect(kicked >= 1);
+        // Three jobs over one meta volume: the converging one's lap at
+        // least (a cancel or the kill may land inside a lap).
+        try testing.expect(laps >= 1);
+        try testing.expect(after <= before);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"meta_kv_merge_candidates\":") orelse 0);
+        try testing.expectEqual(@as(u64, 0), numberAfter(st, "\"invariant_tripwires\":") orelse 0);
+    }
+    {
+        const out = try rig.onMount("test \"$(ls m | wc -l)\" = 800 && test \"$(cat m/f0)\" = m0-r3 && test \"$(cat m/f7990)\" = m7990-r3 && echo forest-ok");
+        defer gpa.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "forest-ok") != null);
+    }
+    try rig.expectAlive("the defrag row");
+    try rig.umount();
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try rig.waitChild());
+    _ = try fsckClean(rig, "the defrag row");
+}
+
+const extent_overlay = @import("../data/extent_overlay.zig");
+
 /// The `key id {16 hex}` the rekey verb prints (the new key's id).
 fn keyIdIn(text: []const u8) ?[]const u8 {
     const i = std.mem.indexOf(u8, text, "onto key id ") orelse return null;

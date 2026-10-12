@@ -892,6 +892,62 @@ pub const PlaneDefrag = struct {
     }
 };
 
+/// `bodies.FoldSeam` over the plane (D3, `defrag --fold`): the write
+/// side's parked W2 extents are the targets; the kick is the write side's
+/// own fold (`plane.foldKick` → `accumulate.foldExtentBlock`).
+pub const PlaneFold = struct {
+    plane: *plane_mod.DataPlane,
+
+    pub fn seam(self: *PlaneFold) defrag_bodies.FoldSeam {
+        return .{ .ctx = self, .vtable = &vt };
+    }
+
+    const vt: defrag_bodies.FoldSeam.VTable = .{ .targets = &targets, .kick = &kick };
+
+    fn targets(ctx: *anyopaque, gpa: Allocator) Allocator.Error![]u64 {
+        const self: *PlaneFold = @ptrCast(@alignCast(ctx));
+        return self.plane.foldTargets(gpa);
+    }
+
+    fn kick(ctx: *anyopaque, io: Io, ino: u64) bool {
+        const self: *PlaneFold = @ptrCast(@alignCast(ctx));
+        return self.plane.foldKick(io, ino) > 0;
+    }
+};
+
+/// `bodies.MetaSeam` over the meta set (D4, `defrag --meta`): per volume
+/// the backend's compaction nudge and merge lap, each under the volume's
+/// SMO lock (`backend.defragNudgeCompactions` / `defragMergeLap`).
+pub const PlaneMeta = struct {
+    set: *meta_set.MetaSet,
+    gpa: Allocator,
+
+    pub fn seam(self: *PlaneMeta) defrag_bodies.MetaSeam {
+        return .{ .ctx = self, .vtable = &vt };
+    }
+
+    const vt: defrag_bodies.MetaSeam.VTable = .{ .volumes = &volumes, .nudge = &nudge, .mergeLap = &mergeLap };
+
+    fn volumes(ctx: *anyopaque) u32 {
+        const self: *PlaneMeta = @ptrCast(@alignCast(ctx));
+        return @intCast(self.set.volumes.len);
+    }
+
+    fn nudge(ctx: *anyopaque, _: Io, v: u32, n: u32) u32 {
+        const self: *PlaneMeta = @ptrCast(@alignCast(ctx));
+        const be = self.set.volumes[v];
+        if (be.posture == .reader) return 0;
+        return be.defragNudgeCompactions(self.gpa, n) catch 0;
+    }
+
+    fn mergeLap(ctx: *anyopaque, _: Io, v: u32) u64 {
+        const self: *PlaneMeta = @ptrCast(@alignCast(ctx));
+        const be = self.set.volumes[v];
+        if (be.posture == .reader) return 0;
+        return be.defragMergeLap();
+    }
+};
+
 /// `rekey.RekeySeam` over the plane: the mover's table with the plane's
 /// rewrite hook bound, the classifier off the device, the confirming
 /// census's universe, the plane's quiescence, and the CLOSE — ONE config
@@ -1244,6 +1300,12 @@ pub const Node = struct {
     pack_body: defrag_bodies.DefragPackBody,
     rekey_: PlaneRekey,
     rekey_body: rekey_mod.RekeyBody,
+    fold_: PlaneFold,
+    fold_body: defrag_bodies.DefragFoldBody,
+    /// D4 over the meta set (null on a node created without the set: the
+    /// offline verbs' and tests' shape — `defrag --meta` then fails typed).
+    meta_: ?PlaneMeta,
+    meta_body: defrag_bodies.DefragMetaBody,
     noop_body: fabric_mod.NoopBody = .{},
     /// The fsck engine over the LIVE binding (null until `bindFsck`).
     fsck_body: ?*fsck_runner.linux.JobBody = null,
@@ -1285,6 +1347,9 @@ pub const Node = struct {
         /// mount with no wire (then `volume add-data` on the live mount
         /// refuses `io` — the offline verb is the path).
         data_arm: ?DataArm = null,
+        /// The meta set the D4 arm (`defrag --meta`) compacts and merges;
+        /// null = the arm is not bound (the body fails typed).
+        meta_set: ?*meta_set.MetaSet = null,
     };
 
     pub fn create(gpa: Allocator, io: Io, opts: Options, in: Init) Allocator.Error!*Node {
@@ -1313,6 +1378,10 @@ pub const Node = struct {
             .pack_body = undefined,
             .rekey_ = undefined,
             .rekey_body = undefined,
+            .fold_ = .{ .plane = in.plane },
+            .fold_body = undefined,
+            .meta_ = if (in.meta_set) |s| .{ .set = s, .gpa = gpa } else null,
+            .meta_body = undefined,
             .admin_ = undefined,
             .admin_svc = undefined,
         };
@@ -1336,6 +1405,13 @@ pub const Node = struct {
         n.rekey_ = PlaneRekey.init(in.plane, io, in.backend, &n.mover_);
         n.rekey_body = .{ .gpa = gpa, .seam = n.rekey_.seam() };
         n.fabric.registerBody(.rekey, n.rekey_body.body());
+        // D3 over the plane's write side; D4 over the meta set when bound.
+        n.fold_body = .{ .gpa = gpa, .seam = n.fold_.seam() };
+        n.fabric.registerBody(.defrag_fold, n.fold_body.body());
+        if (n.meta_) |*m| {
+            n.meta_body = .{ .gpa = gpa, .seam = m.seam() };
+            n.fabric.registerBody(.defrag_meta, n.meta_body.body());
+        }
         n.admin_ = .{ .node = n, .world_ = n.world_, .arm = in.data_arm };
         n.admin_svc = .{ .io = io, .fabric = &n.fabric, .world = n.admin_.world() };
         return n;

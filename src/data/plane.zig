@@ -2971,6 +2971,17 @@ pub const DataPlane = struct {
         return !self.wp.writeSideView().hasCustody(ino, block_index);
     }
 
+    /// D3's seam (`defrag --fold`): the inos holding parked W2 extents, and
+    /// the kick through the write side's own fold (the block lock (3) is
+    /// the only lock the kick takes — the job's worker holds none).
+    pub fn foldTargets(self: *DataPlane, gpa: Allocator) Allocator.Error![]u64 {
+        return self.wp.foldTargets(gpa);
+    }
+
+    pub fn foldKick(self: *DataPlane, io: Io, ino: u64) u32 {
+        return self.wp.foldParked(io, ino);
+    }
+
     /// Every binding of every live file (the census walk the movers plan
     /// from): the inline map's and the packed tenant's off the record, a
     /// block-map-tree head's off its tree below the live sweep cursor (the

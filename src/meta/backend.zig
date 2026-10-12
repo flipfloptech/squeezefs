@@ -95,6 +95,7 @@ const mem_budget = @import("../mem/budget.zig");
 const node_seq = @import("node_seq.zig");
 const tree = @import("tree.zig");
 const smo = @import("smo.zig");
+const leaf_merge = @import("leaf_merge.zig");
 const jc = @import("journal_core.zig");
 const journal = @import("journal.zig");
 const journal_lane = @import("journal_lane.zig");
@@ -2324,6 +2325,123 @@ pub const KvBackend = struct {
         return be.cp.checkpointNow();
     }
 
+    // @anchor:ops_defrag_meta_faces — the D4 arm's two faces (rung 10).
+
+    /// The resident node census (`.stats`: the D4 before/after words): live
+    /// leaves and interior nodes of every tree mapped in the cache — no
+    /// device read, so an evicted node is not counted.
+    pub const NodeCensus = struct { leaves: u64 = 0, interior: u64 = 0 };
+
+    pub fn residentNodeCensus(be: *KvBackend) NodeCensus {
+        const Count = struct {
+            out: NodeCensus = .{},
+            fn visit(self: *@This(), n: *node_cache.CachedNode) void {
+                if (n.state.isSuperseded()) return;
+                if (n.level == 0) self.out.leaves += 1 else self.out.interior += 1;
+            }
+        };
+        var c: Count = .{};
+        be.cache.forEachNode(&c, Count.visit);
+        return c.out;
+    }
+
+    /// D4 (`defrag --meta`, `ops_jobs_lifecycle.md` §3.1): under the SMO
+    /// lock — the same serialization every structural task runs in — the
+    /// resident leaves of every tree are measured
+    /// (`leaf_merge.leafOccupancy`), the ones at or past
+    /// `smo.DEFRAG_COMPACT_DEAD_PERMILLE` ranked by the bytes a compaction
+    /// reclaims, and up to `n` of them compact through the §4.6 replacement
+    /// (`smo.compactForDefrag`). A refusal a barriered cycle remedies (the
+    /// FIFO valve, the ring reserve) runs ONE cycle here and retries the
+    /// node once; the compaction floor (`NoSpace`) ends the chunk — the
+    /// next cycle returns extents. Returns the count compacted.
+    pub fn defragNudgeCompactions(be: *KvBackend, gpa: Allocator, n: u32) Allocator.Error!u32 {
+        std.debug.assert(be.posture != .reader);
+        const Cand = struct { t: *tree.KvTree, addr: u64, dead: u64 };
+        var cands: std.ArrayList(Cand) = .empty;
+        defer cands.deinit(gpa);
+        be.smo_lock.lockUncancelable(be.io);
+        defer be.smo_lock.unlock(be.io);
+        for (be.trees.load()) |t| {
+            const leaves = try leaf_merge.residentNodesAt(t, gpa, 0, "");
+            defer gpa.free(leaves);
+            for (leaves) |l| {
+                const c = be.cache.tryGet(l.addr) orelse continue;
+                defer c.release();
+                if (c.state.isSuperseded() or !t.owns(c)) continue;
+                const occ = leaf_merge.leafOccupancy(t, c);
+                if (occ.deadPermille() < smo.DEFRAG_COMPACT_DEAD_PERMILLE) continue;
+                try cands.append(gpa, .{ .t = t, .addr = l.addr, .dead = occ.deadBytes() });
+            }
+        }
+        std.mem.sort(Cand, cands.items, {}, struct {
+            fn more(_: void, a: Cand, b: Cand) bool {
+                return a.dead > b.dead;
+            }
+        }.more);
+        var compacted: u32 = 0;
+        for (cands.items) |c| {
+            if (compacted >= n) break;
+            const node_ = be.cache.tryGet(c.addr) orelse continue;
+            defer node_.release();
+            var out: smo.MaintenanceOutcome = .{};
+            var retried = false;
+            while (true) {
+                const did = smo.compactForDefrag(c.t, &be.smo_ctx, node_, &out) catch |e| switch (e) {
+                    error.NoSpace => return compacted,
+                    error.PendingFreeFull, error.JournalReserveExhausted => {
+                        if (retried) break;
+                        retried = true;
+                        be.cp.checkpointNow() catch break;
+                        continue;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        log.warn("defrag --meta: leaf 0x{x} on {s} did not compact ({s}); left to the flush pass", .{ c.addr, be.path, @errorName(e) });
+                        break;
+                    },
+                };
+                if (did) compacted += 1;
+                break;
+            }
+        }
+        return compacted;
+    }
+
+    /// D4's merge lap (`defrag --meta`): ONE whole lap of the §4.6a sweep
+    /// per tree, a tree's lap completing before the next tree's starts —
+    /// bounded calls of one tick period each under the SMO lock, the lock
+    /// DROPPED between calls so a committer's space retry or the cadence's
+    /// cycle interleaves, the FIFO valve KEPT (the cycle's sweep runs
+    /// forced; a maintenance job does not) and answered the way the D4 arm
+    /// does: a barriered cycle covers the pending frees, the parked cursor
+    /// resumes. Returns the merges + root collapses of the lap.
+    pub fn defragMergeLap(be: *KvBackend) u64 {
+        std.debug.assert(be.posture != .reader);
+        var merged: u64 = 0;
+        const budget_ns = checkpoint.mergeSweepBudgetMs(be.cp.cfg.flush_interval_ms) * std.time.ns_per_ms;
+        // A lap projects every resident node once per level and once in
+        // its count; two calls per resident node bounds the laps a tree the
+        // budget keeps cutting can take — past it the lap is the cadence's.
+        var calls: u64 = 0;
+        const calls_max: u64 = @max(16, be.cache.mappedCount() * 2);
+        for (be.trees.load()) |t| {
+            while (calls < calls_max) : (calls += 1) {
+                be.smo_lock.lockUncancelable(be.io);
+                const s = leaf_merge.mergeUnderfull(t, &be.smo_ctx, false, clock.monotonicNs() + budget_ns) catch |e| {
+                    be.smo_lock.unlock(be.io);
+                    log.warn("defrag --meta: the merge lap on {s} stopped ({s}); the cursor stands for the cadence's sweep", .{ be.path, @errorName(e) });
+                    return merged;
+                };
+                be.smo_lock.unlock(be.io);
+                merged += s.outcome.merges + s.outcome.root_collapses;
+                if (s.lap_complete) break;
+                if (s.refusal != null) be.checkpointNow() catch return merged;
+            }
+        }
+        return merged;
+    }
+
     pub fn allocateIno(be: *KvBackend) u64 {
         return be.ino.allocate();
     }
@@ -2671,6 +2789,95 @@ test "the block-map-tree ratchet: a fresh format carries no bit; the first stamp
         try testing.expectEqual(gen + 1, be.sb_generation);
         be.close();
     }
+}
+
+test "the D4 faces on a device-backed volume: one xattr band rewritten across checkpoints leaves a leaf mostly dead → `defragNudgeCompactions(8)` compacts it (≥ 1, every value current); a tree grown to many leaves then emptied by deletes → `defragMergeLap` merges (≥ 1) and a second lap finds nothing; both under the SMO lock, the cadence task live" {
+    const gpa = testing.allocator;
+    const v = try TestVol.create(gpa, "d4-faces", null);
+    defer v.destroy();
+    const be = try v.open();
+    defer be.close();
+    const ino = try commitCreate(be, "d4");
+    // The band: 32 xattr values of 256 B (≈ 9.5 KiB a round with keys and
+    // frames), rewritten 4 times with a checkpoint between rounds (the
+    // rewrites must be ON the serialized log — the open delta is RAM —
+    // for the dead share to grow): ≈ 38 KiB of log inside the 64 KiB node
+    // (the threshold maintenance never fires), three quarters of it dead.
+    var pad: [256]u8 = undefined;
+    var round: u8 = 0;
+    while (round < 4) : (round += 1) {
+        const t = try be.begin(@src());
+        var i: u64 = 0;
+        while (i < 32) : (i += 1) {
+            @memset(&pad, round +% @as(u8, @intCast(i)));
+            var nb: [16]u8 = undefined;
+            const name = try std.fmt.bufPrint(&nb, "user.b{d}", .{i});
+            var xb: [1024]u8 = undefined;
+            const xv = try (record.XattrValue{ .name = name, .value = &pad }).encodeInto(&xb);
+            try t.stagePut(key.TREE_XATTRS, &key.xattrKey(ino, key.xattrNameHash56(name, be.nameKey()), 0), xv);
+        }
+        try be.commit(t);
+        try be.checkpointNow();
+    }
+    const c0 = smo.stats.meta_kv_node_compactions.load();
+    const kicked = try be.defragNudgeCompactions(gpa, 8);
+    try testing.expect(kicked >= 1);
+    try testing.expectEqual(c0 + kicked, smo.stats.meta_kv_node_compactions.load());
+    // A second nudge finds the band compact.
+    try testing.expectEqual(@as(u32, 0), try be.defragNudgeCompactions(gpa, 8));
+    {
+        var nb: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "user.b{d}", .{7});
+        const got = (try be.lookup(gpa, key.TREE_XATTRS, &key.xattrKey(ino, key.xattrNameHash56(name, be.nameKey()), 0))) orelse return error.TestExpectedLive;
+        defer gpa.free(got);
+        const xv = try record.XattrValue.decode(got);
+        try testing.expectEqual(@as(u8, 3 +% 7), xv.value[0]);
+    }
+    // The merge lap: 3,000 creates with 2 KiB xattrs span many leaves;
+    // delete every one but each 50th and the leaves fall under ¼.
+    var inos_: std.ArrayList(u64) = .empty;
+    defer inos_.deinit(gpa);
+    var n: usize = 0;
+    while (n < 3000) : (n += 1) {
+        const t = try be.begin(@src());
+        var nb: [24]u8 = undefined;
+        try inos_.append(gpa, try stageCreate(be, t, try std.fmt.bufPrint(&nb, "m{d}", .{n}), 2048));
+        try be.commit(t);
+    }
+    try be.checkpointNow();
+    const leaves_before = try leaf_merge.residentNodesAt(be.treeOf(.native).?, gpa, 0, "");
+    defer gpa.free(leaves_before);
+    try testing.expect(leaves_before.len >= 8);
+    const census_before = be.residentNodeCensus();
+    try testing.expect(census_before.leaves >= leaves_before.len);
+    try testing.expect(census_before.interior >= 1);
+    for (inos_.items, 0..) |i, k| {
+        if (k % 50 == 0) continue;
+        const t = try be.begin(@src());
+        try t.stageDelete(key.TREE_XATTRS, &key.xattrKey(i, key.xattrNameHash56("user.pad", be.nameKey()), 0));
+        try t.stageDelete(key.TREE_INODES, &key.inodeKey(i));
+        try be.commit(t);
+    }
+    try be.checkpointNow();
+    const m0 = leaf_merge.stats.meta_kv_node_merges.load();
+    const merged = be.defragMergeLap();
+    try testing.expect(merged >= 1);
+    try testing.expect(leaf_merge.stats.meta_kv_node_merges.load() >= m0 + 1);
+    try be.checkpointNow();
+    // The lap converges: a second lap after the cover merges nothing new
+    // once the recovery wave settles (bounded laps; each pairs what the
+    // previous one's successors allow).
+    var laps: u32 = 0;
+    while (laps < 8) : (laps += 1) {
+        if (be.defragMergeLap() == 0) break;
+        try be.checkpointNow();
+    }
+    try testing.expect(laps < 8);
+    const leaves_after = try leaf_merge.residentNodesAt(be.treeOf(.native).?, gpa, 0, "");
+    defer gpa.free(leaves_after);
+    try testing.expect(leaves_after.len < leaves_before.len);
+    try testing.expect(be.residentNodeCensus().leaves < census_before.leaves);
+    for (inos_.items, 0..) |i, k| try testing.expectEqual(k % 50 == 0, try present(be, i));
 }
 
 test "format (device path) → open → N creates (singles + a group of 8) → lookup each → checkpointNow → close → reopen: every record present, a clean unmount; the mount is the one-member forest" {

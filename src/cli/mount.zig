@@ -516,6 +516,7 @@ fn mountMain(ctx: *Ctx) u8 {
             .held = true,
             .random = &jobRandom,
             .data_arm = if (wire != null) data_arm.arm() else null,
+            .meta_set = be,
         }) catch return ctx.failed("out of memory (job fabric)", .{});
         node = n;
         n.setManager(if (wire) |wp| wp.posture == .manager else true);

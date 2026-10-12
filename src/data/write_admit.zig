@@ -1247,6 +1247,46 @@ pub const WritePath = struct {
         self.overlay.tasks.wait(io) catch {};
     }
 
+    /// The D3 fold targets (`defrag --fold`, `ops_jobs_lifecycle.md` §3.1):
+    /// the distinct inos holding a parked W2 extent entry, ascending; owned
+    /// by `gpa`.
+    pub fn foldTargets(self: *WritePath, gpa: Allocator) Allocator.Error![]u64 {
+        const keys = try self.table.extentKeys(gpa);
+        defer gpa.free(keys);
+        var inos: std.ArrayList(u64) = .empty;
+        errdefer inos.deinit(gpa);
+        for (keys) |k| {
+            var seen = false;
+            for (inos.items) |i| if (i == k.ino) {
+                seen = true;
+                break;
+            };
+            if (!seen) try inos.append(gpa, k.ino);
+        }
+        std.mem.sort(u64, inos.items, {}, std.sort.asc(u64));
+        return inos.toOwnedSlice(gpa);
+    }
+
+    /// The D3 kick: every parked extent entry of `ino` through the
+    /// EXISTING W2 fold (`accumulate.foldExtentBlock`: in place at the
+    /// page grain for a sole-owner passthrough block, else the seeded
+    /// escalation that parks a content-valid full buffer) — never a
+    /// reimplementation. Returns the entries that left the extent class
+    /// (retired, or escalated to a full buffer); an entry the pool cap
+    /// kept parked counts 0 and the next pass sees it again.
+    pub fn foldParked(self: *WritePath, io: Io, ino: u64) u32 {
+        var blocks: [64]u32 = undefined;
+        var folded: u32 = 0;
+        for (self.table.blocksOf(ino, &blocks)) |b| {
+            const was_extent = if (self.table.get(ino, b)) |e| e.repr == .extent else false;
+            if (!was_extent) continue;
+            accumulate.foldExtentBlock(&self.table, self.uploadDeps(), io, ino, b);
+            const still_extent = if (self.table.get(ino, b)) |e| e.repr == .extent else false;
+            if (!still_extent) folded += 1;
+        }
+        return folded;
+    }
+
     /// RELEASE / unmount: every parked block of `ino` flushes durably, the
     /// overlay drains (write-back class), the epoch closes.
     pub fn flushIno(self: *WritePath, io: Io, ino: u64) void {
@@ -1694,6 +1734,69 @@ test "W2 amplification law, a mapped sole-owner passthrough block folds IN PLACE
     try testing.expectEqualSlices(u8, &sector, got[7 * PAGE .. 7 * PAGE + 512]);
     try testing.expect(std.mem.allEqual(u8, got[7 * PAGE + 512 .. 8 * PAGE], 0xCC));
     try testing.expectEqual(ip0 + 4 * PAGE + 4 * PAGE + PAGE, extent.stats.fold_inplace_write_bytes.load());
+}
+
+test "the D3 fold seam (defrag --fold): `foldTargets` names the inos holding parked W2 extents (ascending, deduped — a full-buffer park is not a target), `foldParked` kicks each through the EXISTING fold — sole-owner passthrough blocks land in place at the page grain and retire, device ÷ user ≤ the §J in-place bound, the bindings unchanged, bytes exact; nothing left parked as an extent; a second census is empty" {
+    const io = testing.io;
+    const w = try World.init(testing.allocator, .sync_inline, false);
+    defer w.deinit(testing.allocator);
+    const gpa = testing.allocator;
+    // Three files: 51 (two blocks, a lone 512 B write in each), 52 (one),
+    // 50 (a HALF-block accumulation park: a full buffer, never a D3 target).
+    for ([_]u64{ 51, 52 }) |ino| {
+        _ = try w.f.publishBlock(ino, 0, 0xAA);
+        _ = try w.f.publishBlock(ino, 1, 0xBB);
+    }
+    try w.f.map.create(50, .striped, 0);
+    var half: [wt.BS / 2 + 100]u8 = undefined;
+    fill(&half, 3);
+    const o = try w.wp.write(io, .{ .ino = 50, .offset = 0, .payload = .{ .bytes = &half }, .class = .entire_op, .file = World.striped(0) });
+    try testing.expectEqual(@as(u32, 1), o.count(.accumulate_park));
+    var sector: [512]u8 = undefined;
+    const file = World.striped(2 * wt.BS);
+    const parks = [_]struct { ino: u64, block: u64, page: u64 }{ .{ .ino = 52, .block = 0, .page = 3 }, .{ .ino = 51, .block = 1, .page = 6 }, .{ .ino = 51, .block = 0, .page = 2 } };
+    for (parks, 0..) |p, i| {
+        fill(&sector, @intCast(0x30 + i));
+        const r = try w.wp.write(io, .{ .ino = p.ino, .offset = p.block * wt.BS + p.page * PAGE + 512, .payload = .{ .bytes = &sector }, .class = .shared, .file = file });
+        try testing.expectEqual(@as(u32, 1), r.count(.extent));
+        try testing.expect(w.wp.table.has(p.ino, @intCast(p.block)));
+    }
+    const gauge_parked = extent.stats.parked_extent_bytes.load();
+    try testing.expect(gauge_parked >= 3 * PAGE);
+    // The census: 51 and 52, ascending; 50's full buffer is not an extent.
+    const targets = try w.wp.foldTargets(gpa);
+    defer gpa.free(targets);
+    try testing.expectEqualSlices(u64, &.{ 51, 52 }, targets);
+    const used = w.f.alloc_a.usedBlocks();
+    const merges = w.f.map.merges.items.len;
+    w.f.dev.resetLedger();
+    const passes0 = extent.stats.fold_inplace_passes.load();
+    var folded: u32 = 0;
+    for (targets) |ino| folded += w.wp.foldParked(io, ino);
+    try testing.expectEqual(@as(u32, 3), folded);
+    try testing.expectEqual(passes0 + 3, extent.stats.fold_inplace_passes.load());
+    for (parks) |p| try testing.expect(!w.wp.table.has(p.ino, @intCast(p.block)));
+    try testing.expect(w.wp.table.has(50, 0)); // the full buffer stays parked (its flush is the release's)
+    try testing.expect(extent.stats.parked_extent_bytes.load() + 3 * PAGE <= gauge_parked);
+    // The §J bound: 3 × 512 B of user bytes landed as 3 page DMAs (8×).
+    try testing.expectEqual(@as(u64, 3 * PAGE), w.f.dev.writeBytesTotal());
+    try testing.expect(w.f.dev.writeBytesTotal() * 1_000_000 / (3 * 512) <= extent.inPlaceBoundPpm(512, 512));
+    try testing.expectEqual(used, w.f.alloc_a.usedBlocks());
+    try testing.expectEqual(merges, w.f.map.merges.items.len);
+    var got: [wt.BS]u8 = undefined;
+    for (parks, 0..) |p, i| {
+        const b = w.f.map.seam().lookup(p.ino, @intCast(p.block)).?;
+        w.f.dev.peek(b.vol_tag, b.offset, &got);
+        fill(&sector, @intCast(0x30 + i));
+        try testing.expectEqualSlices(u8, &sector, got[p.page * PAGE + 512 .. p.page * PAGE + 1024]);
+        try testing.expect(std.mem.allEqual(u8, got[p.page * PAGE .. p.page * PAGE + 512], if (p.block == 0) 0xAA else 0xBB));
+    }
+    const again = try w.wp.foldTargets(gpa);
+    defer gpa.free(again);
+    try testing.expectEqual(@as(usize, 0), again.len);
+    // A kick on an ino with nothing parked folds nothing.
+    try testing.expectEqual(@as(u32, 0), w.wp.foldParked(io, 51));
+    w.wp.flushIno(io, 50);
 }
 
 test "W2 amplification law, CoW bases land whole ONCE per parked episode: a cloned (pinned) block declines the in-place arm, escalates seeded (one whole read) and PARKS — later small writes are memcpys and the release uploads one block to a fresh destination; a transformed volume's block takes the seeded checkout (one decode) and likewise lands once" {

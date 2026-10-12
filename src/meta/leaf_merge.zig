@@ -129,6 +129,37 @@ pub fn isMergeCandidate(t: *KvTree, n: *CachedNode) bool {
     return isMergeCandidateAt(t, n, t.durableTail());
 }
 
+/// D4's per-leaf occupancy (`ops_jobs_lifecycle.md` §3.1): the serialized
+/// bset log's bytes past the header page (`indexed` — every frame ever
+/// appended) against the ON-DISK length of the one frame a compaction
+/// writes for the K1 fold's upper bound (`live`, page-rounded like the
+/// log it replaces — a leaf already one frame long reads 0 dead, so the
+/// nudge never rewrites what it cannot shrink: the first live row kicked
+/// 7,742 rewrites of one-page leaves); the dead share is `1 − live/indexed`.
+pub const LeafOccupancy = struct {
+    log_bytes: u64,
+    fold_frame_bytes: u64,
+
+    pub fn deadPermille(self: LeafOccupancy) u64 {
+        if (self.log_bytes == 0 or self.fold_frame_bytes >= self.log_bytes) return 0;
+        return (self.log_bytes - self.fold_frame_bytes) * 1000 / self.log_bytes; // permille: the gauge unit the D4 ratios share
+    }
+
+    /// The bytes a compaction reclaims (the nudge's ranking key).
+    pub fn deadBytes(self: LeafOccupancy) u64 {
+        return self.log_bytes -| self.fold_frame_bytes;
+    }
+};
+
+pub fn leafOccupancy(t: *KvTree, n: *CachedNode) LeafOccupancy {
+    const log_bytes: u64 = blk: {
+        const d = n.lockRead(t.cache.io);
+        defer n.unlockRead(t.cache.io);
+        break :blk d.tailOffset() -| node.NODE_PAGE;
+    };
+    return .{ .log_bytes = log_bytes, .fold_frame_bytes = t.cache.cfg.layout.appendFrameLen(foldUpper(t, n)) };
+}
+
 /// One resident node of a level: its `min_key` (the sweep's resume
 /// cursor) and address.
 pub const ResidentNode = struct {

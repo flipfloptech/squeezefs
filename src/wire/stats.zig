@@ -66,6 +66,24 @@ pub var cluster_wire_sessions_poisoned: counters.ShardedCounter = .{};
 pub var cluster_wire_header_refusals: counters.ShardedCounter = .{};
 /// Body reads that hit the 30 s class deadline (a dribbling peer).
 pub var cluster_wire_body_timeouts: counters.ShardedCounter = .{};
+/// The channel class this process's wire runs (0 plaintext, 1 mutual_tls:
+/// `tls.install`).
+pub var cluster_wire_channel_mutual_tls: counters.Gauge = .{};
+/// TLS handshakes completed (both roles).
+pub var cluster_wire_tls_handshakes: counters.ShardedCounter = .{};
+/// Peers refused at a MutualTls listener because their leaf is not under
+/// the set's CA, missing, or its CertificateVerify/Finished failed.
+pub var cluster_wire_tls_refused_untrusted: counters.ShardedCounter = .{};
+/// Peers refused for a leaf outside its validity window.
+pub var cluster_wire_tls_refused_expired: counters.ShardedCounter = .{};
+/// Peers refused for a malformed handshake / no common profile / a
+/// transport failure mid-handshake.
+pub var cluster_wire_tls_refused_protocol: counters.ShardedCounter = .{};
+/// Plaintext peers refused at a MutualTls channel (the frame magic where
+/// a ClientHello / ServerHello should be).
+pub var cluster_wire_plaintext_refused: counters.ShardedCounter = .{};
+/// KeyUpdates this side sent (the record ceiling or a peer's request).
+pub var cluster_wire_tls_key_updates: counters.ShardedCounter = .{};
 
 comptime {
     std.debug.assert(cluster_wire_refusals_by_class.len == @typeInfo(frame.RefusalClass).@"enum".field_names.len);

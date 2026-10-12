@@ -25,6 +25,7 @@ pub const verbs = @import("verbs.zig");
 pub const screen = @import("screen.zig");
 pub const auth = @import("auth.zig");
 pub const pki = @import("pki.zig");
+pub const tls = @import("tls.zig");
 pub const endpoint = @import("endpoint.zig");
 pub const service = @import("service.zig");
 pub const session = @import("session.zig");
@@ -51,6 +52,7 @@ test {
     _ = screen;
     _ = auth;
     _ = pki;
+    _ = tls;
     _ = endpoint;
     _ = service;
     _ = session;

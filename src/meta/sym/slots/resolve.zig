@@ -83,6 +83,11 @@ pub const SlotHolderCache = struct {
     /// reaches the ledger only at the next cycle); a LOWER `g` than the
     /// table's is a stale view and ignored.
     learnt: std.AutoHashMapUnmanaged(u16, SlotHolder) = .empty,
+    /// Slots the manager answered UNLEASED to a joiner's `ResolveSlot`
+    /// (the table knows nothing of them): remembered so the one ask per
+    /// slot is not an ask per op; a grant seen later (`learn`) or a
+    /// redirect supersedes it, a release notice re-marks it.
+    known_unleased: std.AutoHashMapUnmanaged(u16, void) = .empty,
     lock: jc.SpinLock = .{},
 
     pub fn init(gpa: Allocator, table: *lt.LeaseTable, own_ctx: *anyopaque, own: *const fn (ctx: *anyopaque, id: AppenderId) bool) SlotHolderCache {
@@ -92,6 +97,16 @@ pub const SlotHolderCache = struct {
     pub fn deinit(self: *SlotHolderCache) void {
         self.endpoints.deinit(self.gpa);
         self.learnt.deinit(self.gpa);
+        self.known_unleased.deinit(self.gpa);
+    }
+
+    /// Does this cache know anything of `slot` beyond its table — a learnt
+    /// holder or a manager's "unleased"? A joiner's resolver asks the
+    /// manager ONCE for a slot it knows nothing of.
+    pub fn knows(self: *SlotHolderCache, slot: u16) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.learnt.contains(slot) or self.known_unleased.contains(slot);
     }
 
     /// The holder of `slot` as this mount sees it: the table's word, or a
@@ -114,14 +129,17 @@ pub const SlotHolderCache = struct {
         defer self.lock.unlock();
         if (self.learnt.get(slot)) |l| if (l.g > h.g) return;
         if (self.table.gOf(slot) > h.g) return;
+        _ = self.known_unleased.remove(slot);
         try self.learnt.put(self.gpa, slot, h);
     }
 
-    /// A release observed: the view drops (the table is the truth again).
+    /// A release observed (or the manager's "unleased"): the view drops
+    /// (the table is the truth again) and the slot is known unleased.
     pub fn forget(self: *SlotHolderCache, slot: u16) void {
         self.lock.lock();
         defer self.lock.unlock();
         _ = self.learnt.remove(slot);
+        self.known_unleased.put(self.gpa, slot, {}) catch {};
     }
 
     pub fn setEndpoint(self: *SlotHolderCache, id: AppenderId, ep: Endpoint) Allocator.Error!void {
@@ -291,4 +309,38 @@ test "ResolveSlot fallback: the manager's word is learnt (holder) or forgotten (
     Mgr.answer = .{ .kind = 1, .reserved = @splat(0), .appender_id = 0, .g = 1, .reserved2 = 0 };
     try testing.expectEqual(@as(?SlotHolder, null), try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 9));
     try testing.expectEqual(@as(?SlotHolder, null), c.holderOf(9));
+}
+
+test "a joiner's knowledge of a slot beyond its table (found by the shared hot directory row: a third appender's slot read as the manager's on a joiner — every step bounced `not_holder` and the striping census saw one creator for all): unknown until the manager answered once; a holder learnt or an `unleased` answer makes it known; a later grant supersedes the unleased mark, a release re-marks it" {
+    const gpa = testing.allocator;
+    const t = try lt.LeaseTable.init(gpa);
+    defer t.deinit();
+    var dummy: u8 = 0;
+    var c = SlotHolderCache.init(gpa, t, &dummy, ownsOne);
+    defer c.deinit();
+    const Mgr = struct {
+        var answer: verbs.SlotHolderReply = .{ .kind = 1, .reserved = @splat(0), .appender_id = 0, .g = 1, .reserved2 = 0 };
+        fn call(_: *anyopaque, _: verbs.Request) errors.Error!verbs.Reply {
+            return .{ .resolve_slot = answer };
+        }
+    };
+    try testing.expect(!c.knows(7));
+    // The manager says unleased: remembered (the next op asks nobody).
+    try testing.expectEqual(@as(?SlotHolder, null), try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 7));
+    try testing.expect(c.knows(7));
+    try testing.expectEqual(StepHome.local, c.stepHome(7));
+    // A third appender leases it since: the grant learnt supersedes.
+    try c.setEndpoint(3, endpointOfByte(3));
+    try c.learn(7, .{ .appender_id = 3, .g = 2 });
+    try testing.expect(c.knows(7));
+    try testing.expectEqual(@as(u32, 3), c.stepHome(7).foreign.holder);
+    // A release observed: unleased again, and still known.
+    c.forget(7);
+    try testing.expect(c.knows(7));
+    try testing.expectEqual(StepHome.local, c.stepHome(7));
+    // A slot the manager names a holder for on the first ask.
+    Mgr.answer = .{ .kind = 0, .reserved = @splat(0), .appender_id = 3, .g = 4, .reserved2 = 0 };
+    try testing.expect(!c.knows(8));
+    try testing.expectEqual(@as(u32, 3), (try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 8)).?.appender_id);
+    try testing.expect(c.knows(8));
 }

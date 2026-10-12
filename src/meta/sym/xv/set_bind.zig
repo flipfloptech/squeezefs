@@ -76,10 +76,20 @@ pub const Bound = struct {
         if (!be.slots.armed) return .{ .local = .{ .volume = v } };
         const holder: u32 = switch (be.slots.cache.stepHome(slot)) {
             .local => {
-                // A joiner's unleased slot is the manager's (it maintains
-                // every unleased tree): its step ships there.
                 const view = be.slots.table.view(slot);
-                if (be.joined != null and !view.leasedBy(be.slots.me)) return self.foreign(0);
+                if (be.joined) |js| if (!view.leasedBy(be.slots.me)) {
+                    // A joiner's table knows its own leases and what it
+                    // learnt: a slot it knows nothing of is resolved at the
+                    // manager ONCE (a third appender's slot would otherwise
+                    // read as the manager's — every step bounced `not_holder`
+                    // and the striping census saw one creator for all);
+                    // the manager's "unleased" is remembered and its tree is
+                    // the manager's to serve.
+                    if (!be.slots.cache.knows(slot)) {
+                        if (be.slots.cache.resolveViaManager(.{ .ctx = &js.link, .call = &@import("../joined.zig").SharedLink.callFn }, be.index, slot) catch null) |h| return self.foreign(h.appender_id);
+                    }
+                    return self.foreign(0);
+                };
                 return .{ .local = .{ .volume = v, .g = view.g } };
             },
             .foreign => |f| f.holder,

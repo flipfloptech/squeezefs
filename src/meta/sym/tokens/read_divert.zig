@@ -57,6 +57,10 @@ pub const stats = struct {
     /// A fail-closed channel re-pointed and re-probed ONCE inside the
     /// same op (the serve then retries on a fresh grant).
     pub var dlm_token_reader_channel_reprobes: counters.ShardedCounter = .{};
+    /// A holder that could not be reached: the slot re-resolved ONCE
+    /// inside the same op (a dead holder's recovered slot is served from
+    /// its new home).
+    pub var dlm_token_reader_unreachable_resolves: counters.ShardedCounter = .{};
     /// Serves answered locally because the slot is this mount's (or
     /// unleased on the manager): the writer's "reads locally" verdict.
     pub var dlm_token_local_reads: counters.ShardedCounter = .{};
@@ -226,7 +230,11 @@ pub const Divert = struct {
                     stats.dlm_token_local_reads.inc();
                     return null;
                 },
-                .unreachable_, .dead => return error.HolderUnreachable,
+                .unreachable_ => |u| {
+                    home = self.reresolveUnreachable(slot, u.holder, &followed) orelse return error.HolderUnreachable;
+                    continue;
+                },
+                .dead => return error.HolderUnreachable,
                 .foreign => |f| {
                     stats.dlm_token_reader_holder_resolves.inc();
                     const plane = try self.planeFor(io, f.identity, f.holder);
@@ -246,12 +254,19 @@ pub const Divert = struct {
                             // it): the plane re-probes ONCE inside the same
                             // op — the link re-resolved and re-dialled, the
                             // probe round deciding — and the serve retries
-                            // on a fresh grant; a probe that fails leaves
-                            // the typed EAGAIN and the cache intact.
-                            if (reprobed) return e;
-                            reprobed = true;
-                            stats.dlm_token_reader_channel_reprobes.inc();
-                            if (!self.reprobe(io, f.identity, f.holder)) return e;
+                            // on a fresh grant; a probe that fails
+                            // re-resolves the slot (below), else leaves the
+                            // typed EAGAIN and the cache intact.
+                            if (!reprobed) {
+                                reprobed = true;
+                                stats.dlm_token_reader_channel_reprobes.inc();
+                                if (self.reprobe(io, f.identity, f.holder)) continue;
+                            }
+                            home = self.reresolveUnreachable(slot, f.holder, &followed) orelse return e;
+                            continue;
+                        },
+                        error.HolderUnreachable, error.Wire => {
+                            home = self.reresolveUnreachable(slot, f.holder, &followed) orelse return e;
                             continue;
                         },
                         else => return e,
@@ -261,6 +276,25 @@ pub const Divert = struct {
                 },
             }
         }
+    }
+
+    /// The holder `holder` could not be reached (refused, no endpoint, a
+    /// lost session): the slot's home is re-resolved off durable state
+    /// ONCE per op (shared with the redirect's follow) — a DEAD holder's
+    /// slot the manager has since recovered is served from its new home
+    /// instead of answering EAGAIN until this mount's view ages out. Null
+    /// = already followed, or the manager names the same holder.
+    fn reresolveUnreachable(self: *Divert, slot: u16, holder: u32, followed: *bool) ?Home {
+        if (followed.*) return null;
+        followed.* = true;
+        stats.dlm_token_reader_unreachable_resolves.inc();
+        const h = self.resolver.refresh(self.resolver.ctx, slot, holder);
+        return switch (h) {
+            .foreign => |f| if (f.holder == holder) null else h,
+            .unreachable_ => |u| if (u.holder == holder) null else h,
+            .dead => null,
+            .local => h,
+        };
     }
 
     fn rememberRoot(self: *Divert, attrs: record.InodeValue) void {
@@ -587,6 +621,55 @@ test "a foreign slot whose holder has no endpoint is refused retryable (never th
     try testing.expectEqual(errors.Error.HolderUnreachable, coreError(error.ReaderUnbound));
     const dead_object = route_table.effectiveIno(inos.makeGlobalIno(5, 4, inos.ROUTING_WIDTH));
     try testing.expectError(error.HolderUnreachable, d.serve(io, dead_object, .{}));
+}
+
+test "a holder that cannot be reached re-resolves the slot ONCE inside the op (found by the shared hot directory row: C's `ls` of the striped directory answered EAGAIN for every stripe the killed B had held, long after the manager recovered them): a home that changed serves from it; an unchanged one is the typed EAGAIN; a holder with no endpoint re-resolves the same way" {
+    const io = testing.io;
+    const R = struct {
+        refreshes: u32 = 0,
+        /// What the manager answers after the recovery (null = B still
+        /// holds the slot).
+        recovered: bool = true,
+        fn homeOf(_: *anyopaque, slot: u16) Home {
+            return if (slot == 3) .{ .foreign = .{ .holder = 9, .identity = 0x9 } } else .{ .unreachable_ = .{ .holder = 9 } };
+        }
+        fn refresh(ctx: *anyopaque, _: u16, _: u32) Home {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.refreshes += 1;
+            return if (self.recovered) .local else .{ .foreign = .{ .holder = 9, .identity = 0x9 } };
+        }
+        fn dial(_: *anyopaque, _: ClientId, _: u32) ?Link {
+            return .{ .ctx = @ptrFromInt(8), .call = &deadCall };
+        }
+        /// B's listener is gone: every call is refused.
+        fn deadCall(_: *anyopaque, _: verbs.Request) errors.Error!verbs.Reply {
+            return error.HolderUnreachable;
+        }
+    };
+    var r: R = .{};
+    const resolver: Resolver = .{ .ctx = &r, .homeOf = &R.homeOf, .refresh = &R.refresh, .dial = &R.dial };
+    var d = Divert.init(testing.allocator, io, resolver, 1, 0, cache.RecallSink.none, cache.SelfLease.always, 1 << 20);
+    defer d.deinit();
+    const foreign_object = route_table.effectiveIno(inos.makeGlobalIno(5, 3, inos.ROUTING_WIDTH));
+    // The manager recovered the dead holder's slot: the serve reads at
+    // the slot's new home (here this mount's own, local).
+    const local0 = stats.dlm_token_local_reads.load();
+    try testing.expectEqual(@as(?cache.Serve, null), try d.serve(io, foreign_object, .{}));
+    try testing.expectEqual(@as(u32, 1), r.refreshes);
+    try testing.expectEqual(local0 + 1, stats.dlm_token_local_reads.load());
+    // Not yet recovered: the re-resolve names the same dead holder — the
+    // typed EAGAIN, one re-resolve, never a loop (the channel is closed
+    // now: the re-probe redials, fails, and re-resolves).
+    r.recovered = false;
+    r.refreshes = 0;
+    try testing.expectError(error.TokenChannelStale, d.serve(io, foreign_object, .{}));
+    try testing.expectEqual(@as(u32, 1), r.refreshes);
+    // No endpoint for the holder: the same single re-resolve.
+    r.recovered = true;
+    r.refreshes = 0;
+    const no_ep_object = route_table.effectiveIno(inos.makeGlobalIno(5, 4, inos.ROUTING_WIDTH));
+    try testing.expectEqual(@as(?cache.Serve, null), try d.serve(io, no_ep_object, .{}));
+    try testing.expectEqual(@as(u32, 1), r.refreshes);
 }
 
 test "the kernel invalidator: INVAL_INODE then PRUNE on the GLOBAL ino; a full sideband is counted, never a failure" {

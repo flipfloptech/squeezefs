@@ -261,22 +261,28 @@ pub const RttEstimator = struct {
 /// regime measured 0.61–0.65 of `rand-4k-write`'s 1.3; an EWMA seeded by
 /// the burst's first, unpaced hold still weighed it 0.39 after eight and
 /// read 0.92–0.94). An ON gate tracks the RFC 6298 mean per hold and
-/// closes below `GAIN_THRESHOLD`.
-pub fn holdWorthIt(gain_mean: ?u64) bool {
-    return (gain_mean orelse 0) >= GAIN_THRESHOLD;
+/// closes below `GAIN_CLOSE` (opened at `GAIN_OPEN`: the band).
+pub fn holdWorthIt(gain_mean: ?u64, open: bool) bool {
+    return (gain_mean orelse 0) >= (if (open) GAIN_CLOSE else GAIN_OPEN);
 }
 
 /// The gain estimator's fixed point: one collected entry = 1024 (the
 /// EWMA's eighth of a difference stays whole down to 1/128 of an entry).
 pub const GAIN_UNIT: u64 = 1024;
-/// The gate opens at HALF an entry per hold: the measured dividing line
+/// The gate OPENS at half an entry per hold: the measured dividing line
 /// between the shapes where the hold waited for nobody (`fsync-4k` 0.09,
 /// `frag-512b-write` 0.35 — both lost throughput ungated) and the one
-/// where it paid (`rand-4k-write` 0.9–1.3 per hold: −35 % META bytes at
-/// unchanged IOPS and p50). Below ½ a hold saves less than a grain per two
-/// round trips; a venue whose round trip is cheap against a grain's device
-/// time moves the line with a counted A/B, never by hand.
-pub const GAIN_THRESHOLD: u64 = GAIN_UNIT / 2;
+/// where it paid (`rand-4k-write` 0.9–1.3 per hold ungated: −35 % META
+/// bytes at unchanged IOPS and p50; its probe bursts read 0.4–0.9 on the
+/// venue). Below ½ a hold saves less than a grain per two round trips; a
+/// venue whose round trip is cheap against a grain's device time moves the
+/// line with a counted A/B, never by hand.
+pub const GAIN_OPEN: u64 = GAIN_UNIT / 2;
+/// … and CLOSES at a quarter: a 2:1 band, because a hold's collection is
+/// Poisson-shaped (variance ≈ mean) and an open gate tracking an EWMA at
+/// the line itself flapped (`rand-4k-write` at a single ½ line: open a
+/// third of the time, 0.71 → 0.62 × user; ungated 0.46).
+pub const GAIN_CLOSE: u64 = GAIN_UNIT / 4;
 /// The holds a probe burst pays before it samples: the cohort forms at the
 /// first held window's landing (its members acked together) and re-arrives
 /// during the second's flight — the first sampled hold is the third.
@@ -296,6 +302,9 @@ pub const HOLD_PROBE_PERIOD: u32 = 16 * (HOLD_PROBE_FORMING + HOLD_PROBE_BURST);
 /// tally.
 pub const WorthGate = struct {
     gain: RttEstimator = .{},
+    /// The gate is open: holds are paid and tracked until the EWMA falls
+    /// under `GAIN_CLOSE`.
+    open: bool = false,
     /// Eligible windows declined since the last burst.
     countdown: u32 = 0,
     /// Holds left in the running burst (0 = none running).
@@ -308,7 +317,10 @@ pub const WorthGate = struct {
     /// Whether an eligible pad-majority window is held: by the ON gate, by
     /// a running or due probe burst, or declined.
     pub fn decide(self: *WorthGate) Verdict {
-        if (self.burst_left == 0 and holdWorthIt(self.gain.mean())) return .hold;
+        if (self.open) {
+            if (holdWorthIt(self.gain.mean(), true)) return .hold;
+            self.open = false;
+        }
         if (self.burst_left == 0) {
             self.countdown += 1;
             if (self.countdown < HOLD_PROBE_PERIOD) return .decline;
@@ -337,6 +349,7 @@ pub const WorthGate = struct {
                 if (self.burst_left == 0) {
                     self.gain = .{};
                     self.gain.sample(if (self.burst_n == 0) 0 else self.burst_sum / self.burst_n);
+                    self.open = holdWorthIt(self.gain.mean(), false);
                 }
             },
             .decline => unreachable,
@@ -3530,11 +3543,15 @@ test "§L tie: the RFC 6298 round-trip predictor — first sample seeds srtt = R
     try testing.expectEqual(e.srtt_ns.load(.monotonic), e.mean().?);
 }
 
-test "§L tie: the worth gate — OFF declines 159 eligible windows then probes 2 forming + 8 sampled holds whose MEAN opens it at ½ an entry; ON tracks the EWMA per hold and closes below ½; a burst's mean below ½ leaves it closed" {
-    try testing.expect(!holdWorthIt(null));
-    try testing.expect(!holdWorthIt(GAIN_THRESHOLD - 1));
-    try testing.expect(holdWorthIt(GAIN_THRESHOLD));
-    try testing.expectEqual(GAIN_UNIT / 2, GAIN_THRESHOLD);
+test "§L tie: the worth gate — OFF declines 159 eligible windows then probes 2 forming + 8 sampled holds whose MEAN opens it at ½ an entry; ON tracks the EWMA per hold and closes below ¼ (the 2:1 band); a burst's mean below ½ leaves it closed" {
+    try testing.expect(!holdWorthIt(null, false) and !holdWorthIt(null, true));
+    try testing.expect(!holdWorthIt(GAIN_OPEN - 1, false));
+    try testing.expect(holdWorthIt(GAIN_OPEN, false));
+    // The band: an open gate stays open down to a quarter.
+    try testing.expect(holdWorthIt(GAIN_CLOSE, true) and !holdWorthIt(GAIN_CLOSE - 1, true));
+    try testing.expect(holdWorthIt(GAIN_OPEN - 1, true));
+    try testing.expectEqual(GAIN_UNIT / 2, GAIN_OPEN);
+    try testing.expectEqual(GAIN_UNIT / 4, GAIN_CLOSE);
     try testing.expectEqual(@as(u32, 2), HOLD_PROBE_FORMING);
     try testing.expectEqual(@as(u32, 8), HOLD_PROBE_BURST);
     try testing.expectEqual(@as(u32, 160), HOLD_PROBE_PERIOD);
@@ -3553,11 +3570,11 @@ test "§L tie: the worth gate — OFF declines 159 eligible windows then probes 
     }
     try testing.expectEqual(@as(u64, 1375), g.gainMilli()); // 11/8 entries per hold
     try testing.expectEqual(WorthGate.Verdict.hold, g.decide());
-    // ON: the EWMA tracks; empty holds close it in eight (1.375 × 0.875⁸ <
-    // ½), after which it declines again.
+    // ON: the EWMA tracks; empty holds close it in thirteen (1.375 ×
+    // 0.875¹³ < ¼ — the band's lower line), after which it declines again.
     var holds_until_closed: u32 = 0;
     while (g.decide() == .hold) : (holds_until_closed += 1) g.observe(.hold, 0);
-    try testing.expectEqual(@as(u32, 8), holds_until_closed);
+    try testing.expectEqual(@as(u32, 13), holds_until_closed);
     // fsync-4k's shape: a burst whose mean is 0.125 leaves the gate closed.
     var f: WorthGate = .{};
     for (0..HOLD_PROBE_PERIOD - 1) |_| _ = f.decide();
@@ -3724,7 +3741,7 @@ test "§L: the window-fill hold — 48 closed-loop committers of 76 B entries ag
     // The gate learned: one probe turned it on and it stayed on.
     try testing.expect(h.cv.stats.hold_probes.load() >= HOLD_PROBE_FORMING + HOLD_PROBE_BURST);
     try testing.expect(h.cv.stats.holds_not_worth.load() < 2 * HOLD_PROBE_PERIOD);
-    try testing.expect(holdWorthIt(h.cv.stats.hold_gain_milli.load() * GAIN_UNIT / 1000));
+    try testing.expect(holdWorthIt(h.cv.stats.hold_gain_milli.load() * GAIN_UNIT / 1000, true));
     try testing.expect(h.cv.stats.hold_landings.load() >= h.cv.stats.hold_deadlines.load());
     // Every Δ landed: the fold's newest size per inode is the last write's.
     for (inos) |ino| try testing.expect(try h.present(ino));

@@ -2301,6 +2301,76 @@ test "seams: a grant window is the ONE mint source when armed; a finish-free sin
     try testing.expectEqual(State.limbo, a.stateOf(8)); // nothing inserted locally either
 }
 
+test "the holder's free-list publication: a carve and a mint landing the instant the sink's critical section ends find the block published — the minted block reads allocated, the carve debited the one credit, nothing is clobbered (0003 §W.1)" {
+    const a = try testAlloc(16);
+    defer a.deinit();
+    // The holder's own window over block 0; the same window serves the
+    // re-mint the seam runs.
+    const Window = struct {
+        next: u64 = 0,
+        end: u64 = 1,
+        fn mint(ctx: *anyopaque) MintAnswer {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            if (w.next >= w.end) return .full;
+            w.next += 1;
+            return .{ .minted = w.next - 1 };
+        }
+        fn giveBack(_: *anyopaque, _: u64) bool {
+            return false;
+        }
+        fn remaining(ctx: *anyopaque) u64 {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            return w.end - w.next;
+        }
+        fn wantsTopup(_: *anyopaque) bool {
+            return false;
+        }
+        fn noteExhausted(_: *anyopaque) void {}
+        const vtable: GrantSource.VTable = .{ .mint = &mint, .giveBack = &giveBack, .remaining = &remaining, .wantsTopup = &wantsTopup, .noteExhausted = &noteExhausted };
+    };
+    var w: Window = .{};
+    a.grant_source = .{ .ctx = &w, .vtable = &Window.vtable };
+    const first = try a.allocateBlock();
+    try testing.expectEqual(@as(u64, 0), first.idx);
+    // The seam holds the publication's window: the sink runs the holder's
+    // critical section, then — before `publishFreeList` resumes — the
+    // carve takes the block (`DataBitmap.carveRun`'s take) and the holder's
+    // window mints it.
+    const Seam = struct {
+        alloc: *BlockAllocator,
+        window: *Window,
+        reminted: ?u64 = null,
+        fn note(ctx: ?*anyopaque, _: u64, idx: u64) bool {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (!s.alloc.holderClearBitRaw(idx)) return false;
+            if (!s.alloc.holderTakeBit(idx)) return true;
+            s.window.* = .{ .next = idx, .end = idx + 1 };
+            s.reminted = (s.alloc.allocateBlock() catch return true).idx;
+            return true;
+        }
+    };
+    var seam: Seam = .{ .alloc = a, .window = &w };
+    a.finish_free_sink = .{ .ctx = &seam, .noteFinishFree = &Seam.note };
+    const anomalies0 = counters.tripwireCount("block_claim_anomalies");
+    try testing.expectEqual(BeginFree.terminal, try a.freeBlock(0));
+    try testing.expectEqual(@as(?u64, 0), seam.reminted);
+    // The re-minted lifetime stands: allocated, counted once, no credit.
+    try testing.expectEqual(State.allocated, a.stateOf(0));
+    try testing.expectEqual(@as(?u32, 1), a.refcount(0));
+    try testing.expectEqual(@as(u64, 0), a.freeBlocksCount());
+    try testing.expect(a.bitIsSet(0));
+    try testing.expect(a.fillDepositable(0));
+    try testing.expectEqual(anomalies0, counters.tripwireCount("block_claim_anomalies"));
+    // A dead-epoch quarantine of the live block flags it and nothing else
+    // (a `free` reading would have asserted on its lost take).
+    try testing.expect(a.quarantineBlock(0, 3));
+    try testing.expectEqual(State.allocated, a.stateOf(0));
+    var out: [1]u64 = undefined;
+    try testing.expectEqual(@as(usize, 0), a.releaseQuarantine(3, &.{0}, &out));
+    a.finish_free_sink = null;
+    a.grant_source = null;
+}
+
 test "the forensics tape pairs the two SITES of a double free without strings; the budget component is non-sheddable" {
     const a = try BlockAllocator.init(testing.allocator, .{ .vol_tag = 1, .vol = 3, .block_size = 4096, .capacity_bytes = 4 * 4096, .forensics = true });
     defer a.deinit();

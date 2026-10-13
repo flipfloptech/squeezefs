@@ -124,6 +124,7 @@ pub const data = struct {
     pub const router = @import("data/router.zig");
     pub const block_alloc = @import("data/block_alloc.zig");
     pub const incarnation_model = @import("data/incarnation_model.zig");
+    pub const free_list_model = @import("data/free_list_model.zig");
     pub const block_refs = @import("data/block_refs.zig");
     pub const reclaim = @import("data/reclaim.zig");
     pub const enospc = @import("data/enospc.zig");
@@ -250,6 +251,7 @@ test {
     _ = data.router;
     _ = data.block_alloc;
     _ = data.incarnation_model;
+    _ = data.free_list_model;
     _ = data.block_refs;
     _ = data.reclaim;
     _ = data.enospc;

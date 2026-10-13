@@ -234,6 +234,8 @@ const JoinedHalf = struct {
     /// guard scopes' sweep for every member but the manager (whose word is
     /// this member's own lease).
     census: membership.census_view.CensusView,
+    /// The members the last census commit retired (the beat's buffer).
+    departed: std.ArrayList(membership.census_view.Departure) = .empty,
 
     /// A tenth of the shipped `T_self` floor (the smoke's `T_owner` of
     /// 3 s derives a 797 ms `T_self`; a tick every 80 ms meets a 265 ms
@@ -309,20 +311,25 @@ const JoinedHalf = struct {
             grace_open = pg.head.grace_open != 0;
             var rows = pg.rows();
             // `state` passed the row screen at the decode (≤ 2).
-            while (rows.next()) |row| self.census.stage(clientIdOf(row.head.id), @fromBackingInt(@intCast(row.head.state))) catch {
+            while (rows.next()) |row| self.census.stage(clientIdOf(row.head.id), @fromBackingInt(@intCast(row.head.state)), row.head.endpoint) catch {
                 self.census.abandon();
                 return;
             };
             if (pg.head.has_next == 0) break;
             cursor = pg.head.next;
         }
-        self.census.commit(grace_open, now);
+        self.departed.clearRetainingCapacity();
+        // Out of memory naming the departures loses only the reader half
+        // below; the holder's sweep judges by the verdict regardless.
+        self.census.commit(grace_open, now, &self.departed) catch {};
         // The joiner's death fan-out: the census is the only word it gets
         // of an eviction, so the token holder sweeps against it at once —
         // a recall waiting on the dead reader completes now, not at the
         // pass's next expiry tick (11.25 s, past every caller's reply
-        // bound while the pass holds a served step).
+        // bound while the pass holds a served step) — and every reader
+        // plane bound to a departed member's listener drops its tokens.
         _ = self.plane.holder.sweepExpired(self.plane.io, clock.monotonicNs());
+        for (self.departed.items) |d| self.plane.holderDeparted(d.endpoint);
     }
 
     fn selfLive(ctx: ?*anyopaque, _: u64) bool {
@@ -747,6 +754,7 @@ pub const WirePlane = struct {
         }
         if (self.joined) |j| {
             j.census.deinit();
+            j.departed.deinit(self.gpa);
             self.gpa.free(j.decl_buf);
             self.gpa.destroy(j);
             self.joined = null;
@@ -818,6 +826,22 @@ pub const WirePlane = struct {
         if (bytes.len > scratch.len or bytes.len > verbs.SET_CONFIG_MAX) return service.Answer.refused(error.ValueTooLarge, "set_config record exceeds the reply scratch");
         @memcpy(scratch[0..bytes.len], bytes);
         return .{ .ok = .{ .resolve_set_config = .{ .head = .{ .generation = generation, .len = @intCast(bytes.len), .reserved = 0 }, .bytes = scratch[0..bytes.len] } } };
+    }
+
+    /// A member the owner's census retired, by the listener it advertised
+    /// (a joiner's death fan-out): the tokens this mount holds from the
+    /// dead member's HOLDER role are void — its slots go to the manager's
+    /// recovery and a new writer's commits recall nobody's tokens from
+    /// that table — so every reader plane bound to the listener is
+    /// re-pointed with every token dropped (the next serve re-resolves the
+    /// slot and fetches from its new home), and its sessions retire.
+    fn holderDeparted(self: *WirePlane, ep: endpoint.EndpointWire) void {
+        var holders: std.ArrayList(u32) = .empty;
+        defer holders.deinit(self.gpa);
+        self.peers.retireListener(ep, &holders) catch {};
+        for (holders.items) |h| {
+            if (self.divert.repoint(self.io, h, h)) joined.stats.joined_dead_holder_planes_dropped.inc();
+        }
     }
 
     /// A joiner learns an online `volume add-data` / `remove-data`
@@ -1678,6 +1702,26 @@ const PeerLinks = struct {
                 joined.stats.peer_links_invalidated.inc();
             }
         }
+    }
+
+    /// A departed member's listener: every holder link at it (and its
+    /// token client link) retired now; the holders it served are
+    /// appended to `out` (the reader planes to drop).
+    fn retireListener(self: *PeerLinks, ep: endpoint.EndpointWire, out: *std.ArrayList(u32)) Allocator.Error!void {
+        self.lock.lockUncancelable(self.plane.io);
+        defer self.lock.unlock(self.plane.io);
+        var it = self.by_holder.iterator();
+        while (it.next()) |e| {
+            if (!e.value_ptr.*.link.endpointNow().eql(ep)) continue;
+            e.value_ptr.*.link.invalidate();
+            joined.stats.peer_links_invalidated.inc();
+            try out.append(self.plane.gpa, e.key_ptr.*);
+        }
+        var ic = self.by_client.valueIterator();
+        while (ic.next()) |p| if (p.*.link.endpointNow().eql(ep)) {
+            p.*.link.invalidate();
+            joined.stats.peer_links_invalidated.inc();
+        };
     }
 
     /// The endpoint of `holder`'s listener.

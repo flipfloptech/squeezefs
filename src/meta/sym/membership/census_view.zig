@@ -23,6 +23,14 @@
 //! silence is unknown); a view never committed, or older than its
 //! validity, answers unknown for everyone — the grace belt, never a false
 //! death.
+//!
+//! The commit also names the DEPARTURES — a member the standing view
+//! listed live (or in grace) that the new view lists departed, or no
+//! longer lists while the window is closed — with the listener it
+//! advertised: the joiner's death fan-out (the token holder's sweep, and
+//! the reader planes of a dead HOLDER dropped: the tokens it granted are
+//! void once its slots are recovered, and nothing else would ever recall
+//! them).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -41,14 +49,29 @@ pub const Verdict = token_table.LeaseVerdict;
 /// of this member itself.
 pub const VALIDITY_RENEWALS: u64 = 2;
 
+/// One member's row as the owner listed it.
+pub const Row = struct {
+    state: verbs.MemberState,
+    endpoint: verbs.EndpointWire,
+};
+
+/// A member the new view retires, with the listener it advertised.
+pub const Departure = struct {
+    client: ClientId,
+    endpoint: verbs.EndpointWire,
+};
+
 pub const CensusView = struct {
     gpa: Allocator,
     io: Io,
     lock: sync.Mutex = .init,
     /// The standing view (what verdicts read).
-    states: std.AutoHashMapUnmanaged(ClientId, verbs.MemberState) = .empty,
+    states: std.AutoHashMapUnmanaged(ClientId, Row) = .empty,
     /// The pull in progress (the beat's alone until `commit` swaps it in).
-    staging: std.AutoHashMapUnmanaged(ClientId, verbs.MemberState) = .empty,
+    staging: std.AutoHashMapUnmanaged(ClientId, Row) = .empty,
+    /// Members a view under the owner's grace window no longer listed:
+    /// neither live nor departed until a commit with the window closed.
+    limbo: std.AutoHashMapUnmanaged(ClientId, verbs.EndpointWire) = .empty,
     grace_open: bool = false,
     /// The instant the standing view was committed (0 = never).
     committed_ns: u64 = 0,
@@ -70,21 +93,51 @@ pub const CensusView = struct {
     pub fn deinit(self: *CensusView) void {
         self.states.deinit(self.gpa);
         self.staging.deinit(self.gpa);
+        self.limbo.deinit(self.gpa);
     }
 
     /// One census row into the pull in progress.
-    pub fn stage(self: *CensusView, client: ClientId, state: verbs.MemberState) Allocator.Error!void {
-        try self.staging.put(self.gpa, client, state);
+    pub fn stage(self: *CensusView, client: ClientId, state: verbs.MemberState, endpoint: verbs.EndpointWire) Allocator.Error!void {
+        try self.staging.put(self.gpa, client, .{ .state = state, .endpoint = endpoint });
     }
 
-    /// The pull completed: the staged rows become the standing view.
-    pub fn commit(self: *CensusView, grace_open: bool, now_ns: u64) void {
+    /// The pull completed: the staged rows become the standing view; the
+    /// members it retires are appended to `departed` with the view's
+    /// allocator (a member listed live or in grace before, now `departed`
+    /// or — the owner's grace window closed — absent; each reported once).
+    pub fn commit(self: *CensusView, grace_open: bool, now_ns: u64, departed: *std.ArrayList(Departure)) Allocator.Error!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        std.mem.swap(std.AutoHashMapUnmanaged(ClientId, verbs.MemberState), &self.states, &self.staging);
+        // A member silent under the window is held in limbo and judged by
+        // the first commit with the window closed.
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.state == .departed) continue;
+            try self.judge(e.key_ptr.*, e.value_ptr.endpoint, grace_open, departed);
+        }
+        var held: std.ArrayList(ClientId) = .empty;
+        defer held.deinit(self.gpa);
+        var li = self.limbo.keyIterator();
+        while (li.next()) |c| if (!self.states.contains(c.*)) try held.append(self.gpa, c.*);
+        for (held.items) |c| {
+            const ep = self.limbo.fetchRemove(c).?.value;
+            try self.judge(c, ep, grace_open, departed);
+        }
+        std.mem.swap(std.AutoHashMapUnmanaged(ClientId, Row), &self.states, &self.staging);
         self.staging.clearRetainingCapacity();
         self.grace_open = grace_open;
         self.committed_ns = now_ns;
+    }
+
+    /// One previously listed member against the pull in progress: relisted
+    /// `departed` ⇒ a departure; absent ⇒ a departure, or limbo while the
+    /// owner's grace window stands; relisted live ⇒ nothing.
+    fn judge(self: *CensusView, client: ClientId, endpoint: verbs.EndpointWire, grace_open: bool, departed: *std.ArrayList(Departure)) Allocator.Error!void {
+        if (self.staging.get(client)) |n| {
+            if (n.state == .departed) try departed.append(self.gpa, .{ .client = client, .endpoint = endpoint });
+        } else if (grace_open) {
+            try self.limbo.put(self.gpa, client, endpoint);
+        } else try departed.append(self.gpa, .{ .client = client, .endpoint = endpoint });
     }
 
     /// The pull failed: the staged rows go, the standing view answers
@@ -105,7 +158,7 @@ pub const CensusView = struct {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         if (self.committed_ns == 0 or now_ns -| self.committed_ns > self.valid_ns) return .unknown;
-        if (self.states.get(client)) |s| return switch (s) {
+        if (self.states.get(client)) |r| return switch (r.state) {
             .live, .grace => .live,
             .departed => .expired,
         };
@@ -119,18 +172,26 @@ pub const CensusView = struct {
 
 const testing = std.testing;
 
+fn epOf(n: u16) verbs.EndpointWire {
+    var e: verbs.EndpointWire = .none;
+    e.port = n;
+    return e;
+}
+
 test "the census view: unknown before a commit; live/grace rows live, a departed row expired; an absent member is expired only to an asker whose contact predates the view (a scope parked before the pull) and while the owner's grace window is closed — unknown to one in contact now, or under the window; a stale view answers unknown; an abandoned pull leaves the standing view; a pull is due once per renew interval" {
     const renew_ns: u64 = 1000;
     var v = CensusView.init(testing.allocator, testing.io);
     defer v.deinit();
+    var departed: std.ArrayList(Departure) = .empty;
+    defer departed.deinit(testing.allocator);
     v.setRenewInterval(renew_ns);
     try testing.expectEqual(2 * renew_ns, v.valid_ns);
     try testing.expectEqual(Verdict.unknown, v.verdict(1, 10, 10));
     try testing.expect(v.due(10, renew_ns));
-    try v.stage(1, .live);
-    try v.stage(2, .departed);
-    try v.stage(3, .grace);
-    v.commit(false, 100);
+    try v.stage(1, .live, epOf(1));
+    try v.stage(2, .departed, epOf(2));
+    try v.stage(3, .grace, epOf(3));
+    try v.commit(false, 100, &departed);
     try testing.expect(!v.due(100, renew_ns));
     try testing.expect(v.due(1100, renew_ns));
     try testing.expectEqual(Verdict.live, v.verdict(1, 50, 100));
@@ -142,16 +203,16 @@ test "the census view: unknown before a commit; live/grace rows live, a departed
     try testing.expectEqual(Verdict.unknown, v.verdict(4, 100, 100));
     try testing.expectEqual(Verdict.unknown, v.verdict(4, 150, 150));
     // The grace window: silence is unknown, a listed row still speaks.
-    try v.stage(1, .live);
-    v.commit(true, 200);
+    try v.stage(1, .live, epOf(1));
+    try v.commit(true, 200, &departed);
     try testing.expectEqual(Verdict.unknown, v.verdict(4, 50, 200));
     try testing.expectEqual(Verdict.live, v.verdict(1, 50, 200));
     // Member 2 left the page (evicted): absent, and the window closed again.
-    try v.stage(1, .live);
-    v.commit(false, 300);
+    try v.stage(1, .live, epOf(1));
+    try v.commit(false, 300, &departed);
     try testing.expectEqual(Verdict.expired, v.verdict(2, 50, 300));
     // A failed pull: the standing view keeps answering.
-    try v.stage(9, .live);
+    try v.stage(9, .live, epOf(9));
     v.abandon();
     try testing.expectEqual(Verdict.live, v.verdict(1, 50, 300));
     try testing.expectEqual(Verdict.expired, v.verdict(9, 50, 300));
@@ -159,4 +220,48 @@ test "the census view: unknown before a commit; live/grace rows live, a departed
     try testing.expectEqual(Verdict.live, v.verdict(1, 50, 300 + v.valid_ns));
     try testing.expectEqual(Verdict.unknown, v.verdict(1, 50, 301 + v.valid_ns));
     try testing.expectEqual(Verdict.unknown, v.verdict(2, 50, 301 + v.valid_ns));
+}
+
+test "the census view's departures: a member listed live or in grace that the next view lists departed, or no longer lists with the owner's window closed, is reported ONCE with the listener it advertised; one silent under the window waits in limbo — relisted it is nothing, still absent at the first closed-window view it departs; a member never listed reports nothing" {
+    var v = CensusView.init(testing.allocator, testing.io);
+    defer v.deinit();
+    var departed: std.ArrayList(Departure) = .empty;
+    defer departed.deinit(testing.allocator);
+    v.setRenewInterval(1000);
+    try v.stage(1, .live, epOf(1));
+    try v.stage(2, .live, epOf(2));
+    try v.stage(3, .grace, epOf(3));
+    try v.stage(4, .live, epOf(4));
+    try v.commit(false, 100, &departed);
+    try testing.expectEqual(@as(usize, 0), departed.items.len);
+    // 2 is listed departed, 3 vanished with the window closed, 5 is new.
+    try v.stage(1, .live, epOf(1));
+    try v.stage(2, .departed, epOf(2));
+    try v.stage(4, .live, epOf(4));
+    try v.stage(5, .live, epOf(5));
+    try v.commit(false, 200, &departed);
+    try testing.expectEqual(@as(usize, 2), departed.items.len);
+    for (departed.items) |d| {
+        try testing.expect(d.client == 2 or d.client == 3);
+        try testing.expect(d.endpoint.eql(epOf(@intCast(d.client))));
+    }
+    departed.clearRetainingCapacity();
+    // 2 stays departed (reported once); 4 and 5 fall silent under the
+    // window: limbo, nothing reported.
+    try v.stage(1, .live, epOf(1));
+    try v.stage(2, .departed, epOf(2));
+    try v.commit(true, 300, &departed);
+    try testing.expectEqual(@as(usize, 0), departed.items.len);
+    // The window closes: 5 is back, 4 is still absent — 4 departs.
+    try v.stage(1, .live, epOf(1));
+    try v.stage(5, .live, epOf(5));
+    try v.commit(false, 400, &departed);
+    try testing.expectEqual(@as(usize, 1), departed.items.len);
+    try testing.expectEqual(@as(ClientId, 4), departed.items[0].client);
+    try testing.expect(departed.items[0].endpoint.eql(epOf(4)));
+    departed.clearRetainingCapacity();
+    try v.stage(1, .live, epOf(1));
+    try v.stage(5, .live, epOf(5));
+    try v.commit(false, 500, &departed);
+    try testing.expectEqual(@as(usize, 0), departed.items.len);
 }

@@ -102,6 +102,11 @@ pub const stats = struct {
     pub var peer_links_repointed: counters.ShardedCounter = .{};
     /// Peer links retired at a member's eviction (the death fan-out).
     pub var peer_links_invalidated: counters.ShardedCounter = .{};
+    /// Reader planes a joiner dropped (every token void) because the
+    /// owner's census retired the member whose listener they were bound
+    /// to: a dead holder's grants are recalled by no one once its slots
+    /// are recovered.
+    pub var joined_dead_holder_planes_dropped: counters.ShardedCounter = .{};
 };
 
 /// `mount_slot` of a joiner (charter §5.7 "a remount at another mount

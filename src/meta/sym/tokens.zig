@@ -802,22 +802,24 @@ test "a joiner's holder and a reader the owner evicted (found by the shared hot 
     defer f.deinit();
     var co: CensusOracle = .{ .view = census_view.CensusView.init(gpa, io) };
     defer co.view.deinit();
+    var departed: std.ArrayList(census_view.Departure) = .empty;
+    defer departed.deinit(gpa);
     // A view that answers for the whole test (two renew intervals).
     co.view.setRenewInterval(table.T_OWNER_NS);
     f.holder.oracle = co.oracle();
     // The deadline a corpse used to cost, shortened so the red run ends.
     f.holder.seams.recall_deadline_ns = 4 * std.time.ns_per_s;
     // The view before the grants lists both readers.
-    try co.view.stage(1, .live);
-    try co.view.stage(2, .live);
-    co.view.commit(false, clock.monotonicNs());
+    try co.view.stage(1, .live, .none);
+    try co.view.stage(2, .live, .none);
+    try co.view.commit(false, clock.monotonicNs(), &departed);
     var s = (try f.reader(0).serve(io, objectOf(3), .{})).?;
     s.release(io);
     // B1 dies: unreachable, and the next census (newer than its grant,
     // the owner's grace window closed) no longer lists it.
     f.peers.unreachable_[0] = true;
-    try co.view.stage(2, .live);
-    co.view.commit(false, clock.monotonicNs() + 1);
+    try co.view.stage(2, .live, .none);
+    try co.view.commit(false, clock.monotonicNs() + 1, &departed);
     const live0 = table.stats.dlm_token_recall_timeouts_live.load();
     const swept0 = table.stats.dlm_token_lease_swept_grants.load();
     const t0 = clock.monotonicNs();
@@ -851,8 +853,11 @@ test "a joiner's holder and a reader the owner evicted (found by the shared hot 
         std.Thread.yield() catch {};
     }
     try testing.expectEqual(@as(u32, 0), f.holder.sweepExpired(io, clock.monotonicNs()));
-    co.view.commit(false, clock.monotonicNs() + 1);
-    try testing.expect(f.holder.sweepExpired(io, clock.monotonicNs()) >= 1);
+    try co.view.commit(false, clock.monotonicNs() + 1, &departed);
+    // The commit's sweep wakes a pass already waiting; a pass not yet in
+    // its wait finds the new word at its own loop head (it may retire the
+    // frame before this sweep looks — either way the pass ends now).
+    _ = f.holder.sweepExpired(io, clock.monotonicNs());
     t.join();
     try testing.expectEqual(@as(u32, 1), pass.sum.?.expired_with_lease);
     try testing.expect(pass.waited_ns < table.expiryTickNs(table.RECALL_DEADLINE_NS) / 2);

@@ -483,8 +483,8 @@ src/meta/sym/tokens/token_table.zig:151 | 9 | OWED: derive it or document it on 
 src/meta/sym/tokens/token_table.zig:152 | 10 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:152 | 64 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/tokens/token_table.zig:153 | 11 | OWED: derive it or document it on the line (charter §1.5)
-src/meta/sym/wire_plane.zig:262 | 3 | a table entry (switch/range arm) — the codec or classification table
-src/meta/sym/wire_plane.zig:263 | 4 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:264 | 3 | a table entry (switch/range arm) — the codec or classification table
+src/meta/sym/wire_plane.zig:265 | 4 | a table entry (switch/range arm) — the codec or classification table
 src/meta/sym/xv/applier.zig:295 | 12 | a size — OWED: derive from derive.Facts or document the physical/format reason
 src/meta/sym/xv/intent.zig:160 | 8 | OWED: derive it or document it on the line (charter §1.5)
 src/meta/sym/xv/intent.zig:191 | 8 | OWED: derive it or document it on the line (charter §1.5)

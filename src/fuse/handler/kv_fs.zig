@@ -357,12 +357,42 @@ pub const FoundT = struct {
     }
 };
 
+/// The keys of one `(parent, hash54)` dentry chain. A chain is one key long
+/// but for a 54-bit hash collision, so the keys sit inline and spill to the
+/// heap past `CHAIN_INLINE`: ReleaseSafe fills every `undefined` array on
+/// its declaration, and the 256-slot array this replaced cost 4 KiB of fill
+/// per lookup and per create (`docs/evidence/rung-10-dev-perf.md` §3.6).
 const ChainBuf = struct {
-    keys: [256][]const u8 = undefined,
+    /// Four keys: three collisions in one directory's chain before a spill.
+    const CHAIN_INLINE = 4;
+
+    gpa: Allocator,
+    inline_keys: [CHAIN_INLINE][]const u8 = undefined,
+    spill: std.ArrayList([]const u8) = .empty,
     len: usize = 0,
 
+    fn push(self: *ChainBuf, k: []const u8) Allocator.Error!void {
+        if (self.len < CHAIN_INLINE) {
+            self.inline_keys[self.len] = k;
+        } else {
+            if (self.spill.items.len == 0) try self.spill.appendSlice(self.gpa, &self.inline_keys);
+            try self.spill.append(self.gpa, k);
+        }
+        self.len += 1;
+    }
+
+    fn reset(self: *ChainBuf) void {
+        self.spill.clearRetainingCapacity();
+        self.len = 0;
+    }
+
     fn slice(self: *const ChainBuf) []const []const u8 {
-        return self.keys[0..self.len];
+        if (self.len > CHAIN_INLINE) return self.spill.items;
+        return self.inline_keys[0..self.len];
+    }
+
+    fn deinit(self: *ChainBuf) void {
+        self.spill.deinit(self.gpa);
     }
 };
 
@@ -953,10 +983,9 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const r = tx.dentryChainRange(parent, key.dentryNameHash54(name, self.store.nameKey()));
             self.store.range(self.gpa, key.TREE_DENTRIES, &r.start, &r.end, 256, kvs) catch |e| return storeErr(e);
             var found: ?Found = null;
-            buf.len = 0;
+            buf.reset();
             for (kvs.items) |kv| {
-                buf.keys[buf.len] = kv.key;
-                buf.len += 1;
+                try buf.push(kv.key);
                 const dv = record.DentryValue.decode(kv.value) catch return error.InputOutput;
                 if (std.mem.eql(u8, dv.name, name)) {
                     var pos: economy.DentryPos = .{ .key = undefined, .child_ino = dv.child_ino, .file_type = dv.file_type };
@@ -981,7 +1010,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
                 if (e.coversName(hash54)) return null;
                 wants.after = e.lastCookie();
             }
-            var buf: ChainBuf = .{};
+            var buf: ChainBuf = .{ .gpa = self.gpa };
+            defer buf.deinit();
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             return self.scanChain(parent, name, &buf, &kvs);
@@ -1923,7 +1953,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             const pv = try self.readDir(parent);
-            var chain: ChainBuf = .{};
+            var chain: ChainBuf = .{ .gpa = self.gpa };
+            defer chain.deinit();
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             if (try self.scanChain(parent, name, &chain, &kvs)) |f| {
@@ -2143,12 +2174,14 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             var t_owned = true;
             errdefer if (t_owned) self.store.abandon(t);
             // Phase 2: revalidate and read under the guards.
-            var old_chain: ChainBuf = .{};
+            var old_chain: ChainBuf = .{ .gpa = self.gpa };
+            defer old_chain.deinit();
             var old_kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &old_kvs);
             const old = (try self.scanChain(old_parent, a.name, &old_chain, &old_kvs)) orelse return error.FileNotFound;
             if (old.global != old0.global) return error.FileNotFound;
-            var new_chain: ChainBuf = .{};
+            var new_chain: ChainBuf = .{ .gpa = self.gpa };
+            defer new_chain.deinit();
             var new_kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &new_kvs);
             const new = try self.scanChain(new_parent, a.newname, &new_chain, &new_kvs);
@@ -2386,7 +2419,8 @@ pub fn KvFs(comptime Store: type, comptime Data: type) type {
             const pv = try self.readDir(parent);
             const cv = try self.readInode(child);
             if (economy.isDirMode(cv.mode)) return error.AccessDenied;
-            var chain: ChainBuf = .{};
+            var chain: ChainBuf = .{ .gpa = self.gpa };
+            defer chain.deinit();
             var kvs: std.ArrayList(tree.KeyValue) = .empty;
             defer tree.deinitKeyValues(self.gpa, &kvs);
             if (try self.scanChain(parent, a.newname, &chain, &kvs) != null) return error.PathAlreadyExists;

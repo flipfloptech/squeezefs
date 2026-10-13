@@ -193,6 +193,12 @@ pub const SlotHolderCache = struct {
         const r = rep.resolve_slot;
         if (r.kind == @backingInt(verbs.SlotHolderKind.unleased)) {
             self.forget(slot);
+            // The table's own projection of a foreign holder (a refused
+            // first touch loads it) goes too, else `holderOf` keeps
+            // answering a holder the manager has released — a dead one
+            // forever.
+            const v = self.table.view(slot);
+            if (v.state != .unleased and v.state != .migrating and !self.own(self.own_ctx, v.holder)) self.table.dropForeign(slot, v.holder, r.g);
             return null;
         }
         const h: SlotHolder = .{ .appender_id = r.appender_id, .g = r.g };
@@ -343,4 +349,34 @@ test "a joiner's knowledge of a slot beyond its table (found by the shared hot d
     try testing.expect(!c.knows(8));
     try testing.expectEqual(@as(u32, 3), (try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 8)).?.appender_id);
     try testing.expect(c.knows(8));
+}
+
+test "a joiner's table drops a FOREIGN lease the manager answers unleased (found by the shared hot directory row: a refused first touch had loaded the dead holder B into C's table, and after the manager recovered B's slot every read of the striped directory at C resolved to the corpse — the answer dropped only the learnt view): the table's word goes unleased at the manager's generation; this process's own lease and a newer generation are left" {
+    const gpa = testing.allocator;
+    const t = try lt.LeaseTable.init(gpa);
+    defer t.deinit();
+    var dummy: u8 = 0;
+    var c = SlotHolderCache.init(gpa, t, &dummy, ownsOne);
+    defer c.deinit();
+    try c.setEndpoint(3, endpointOfByte(3));
+    const Mgr = struct {
+        var g: u32 = 3;
+        fn call(_: *anyopaque, _: verbs.Request) errors.Error!verbs.Reply {
+            return .{ .resolve_slot = .{ .kind = @backingInt(verbs.SlotHolderKind.unleased), .reserved = @splat(0), .appender_id = 0, .g = g, .reserved2 = 0 } };
+        }
+    };
+    // A refused acquire loaded B (3) as slot 7's holder at g 2.
+    try t.load(7, .{ .variant = .leased, .appender_id = 3, .g = 2, .root = .{ .addr = 0, .seq = 0 }, .cursor = 2 });
+    try testing.expectEqual(@as(u32, 3), c.stepHome(7).foreign.holder);
+    try testing.expectEqual(@as(?SlotHolder, null), try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 7));
+    try testing.expectEqual(StepHome.local, c.stepHome(7));
+    try testing.expectEqual(@as(u32, 3), t.gOf(7));
+    // This process's own lease is never dropped by the answer.
+    try t.load(8, .{ .variant = .leased, .appender_id = 1, .g = 2, .root = .{ .addr = 0, .seq = 0 }, .cursor = 2 });
+    _ = try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 8);
+    try testing.expect(t.view(8).leasedBy(1));
+    // An answer older than the table's word leaves it.
+    try t.load(9, .{ .variant = .leased, .appender_id = 3, .g = 5, .root = .{ .addr = 0, .seq = 0 }, .cursor = 2 });
+    _ = try c.resolveViaManager(.{ .ctx = &dummy, .call = Mgr.call }, 0, 9);
+    try testing.expectEqual(@as(u32, 3), c.stepHome(9).foreign.holder);
 }

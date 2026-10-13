@@ -336,6 +336,21 @@ pub const LeaseTable = struct {
         }
     }
 
+    /// A joiner's projection of a FOREIGN lease that the manager has
+    /// since answered unleased at `g` (a refused first touch loaded the
+    /// holder; a release or the recovery of a dead holder freed it): the
+    /// word drops to unleased at `g`. A word that changed meanwhile, or a
+    /// generation newer than the answer, is left.
+    pub fn dropForeign(self: *LeaseTable, slot: u16, holder: AppenderId, g: u32) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const v = self.view(slot);
+        if (v.state == .unleased or v.state == .migrating or v.holder != holder or v.g > g) return;
+        self.dropHeld(holder, slot);
+        self.cells[slot].g.store(g, .release);
+        self.storeWord(slot, .unleased, MANAGER, false, false);
+    }
+
     // ---- T1: the grant ----
 
     /// `unleased → leased{holder}` with `g += 1`. A standing lease refuses

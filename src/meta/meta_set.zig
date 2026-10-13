@@ -553,23 +553,26 @@ pub const MetaSet = struct {
         return out[0..self.volumes.len];
     }
 
-    /// Mint a child of `parent_eff` (charter §5.4 "Mint spread": round-
-    /// robin over the healthy members; charter §5.5 "Slot acquisition and
-    /// minting": on an armed member the plane's decision — `gather`, the
-    /// parent's slot under the affinity ceiling, else the rotor tree with
-    /// the most headroom, an overflow rotor past the cap — else the
-    /// member's rotor). `prefer_parent` keeps the mint on the parent's
-    /// member (a rename's whiteout: the op stays on two members at most).
-    /// The child's slot takes its door token at the commit (the record
-    /// names it). Returns the child's EFFECTIVE (key) ino; `globalIno`
-    /// inverts it.
+    /// Mint a child of `parent_eff` (charter §5.5 "Slot acquisition and
+    /// minting" first: a child of a directory this mount leases outside the
+    /// native slot stays on its parent's member — `Plane.homesChildren`,
+    /// decision 0003 §AA.1; else charter §5.4 "Mint spread": round-robin
+    /// over the healthy members. On an armed member the plane's decision —
+    /// `gather`, the parent's slot under the affinity ceiling, else the
+    /// rotor tree with the most headroom, an overflow rotor past the cap —
+    /// else the member's rotor). `prefer_parent` keeps the mint on the
+    /// parent's member (a rename's whiteout: the op stays on two members at
+    /// most). The child's slot takes its door token at the commit (the
+    /// record names it). Returns the child's EFFECTIVE (key) ino;
+    /// `globalIno` inverts it.
     pub fn allocateIno(self: *MetaSet, parent_eff: u64, prefer_parent: bool, gather: bool) Error!u64 {
-        const parent_v = self.route.volumeOfEffective(parent_eff);
-        var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
-        const v: route_table.VolumeIndex = if (prefer_parent or self.volumes.len == 1) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
-        if (v != parent_v) rstats.routing_mint_volume_picks.inc();
         if (self.posture == .reader) return error.PartitionRefused;
+        const parent_v = self.route.volumeOfEffective(parent_eff);
         const parent_slot = route_table.slotOfEffective(parent_eff);
+        const home = prefer_parent or self.volumes.len == 1 or self.volumes[parent_v].slots.homesChildren(parent_slot);
+        var hb: [route_table.MAX_VOLUMES]?u32 = undefined;
+        const v: route_table.VolumeIndex = if (home) parent_v else @intCast(router.pickMintVolume(parent_v, self.healths(hb[0..self.volumes.len]), &self.mint_rr));
+        if (v != parent_v) rstats.routing_mint_volume_picks.inc();
         const rr = self.slot_rr.fetchAdd(1, .monotonic);
         const slot = self.volumes[v].slots.mintSlot(parent_slot, v == parent_v, gather, rr) orelse self.rotors[v].pickSlot();
         const be = self.volumeOfSlot(slot);
@@ -803,6 +806,11 @@ fn truncateFile(path: []const u8, len: u64) !void {
 /// another member — the cross-owner INTENT over a plane bound to the set
 /// (the product's `kv_fs` arm). Returns the GLOBAL ino.
 pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
+    return createChild(set, parent_global, name, economy.S.IFREG | 0o644);
+}
+
+/// `createFile` for any mode (a directory parent for the mint-placement rows).
+pub fn createChild(set: *MetaSet, parent_global: u64, name: []const u8, mode: u32) !u64 {
     const parent = set.effectiveIno(parent_global);
     const pv_bytes = (try set.lookup(set.gpa, key.TREE_INODES, &key.inodeKey(parent))) orelse return error.ParentMissing;
     defer set.gpa.free(pv_bytes);
@@ -815,7 +823,7 @@ pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
         defer locks.deinit();
         const bound = try xv.set_bind.Bound.create(set.gpa, set.io, set, &locks, set.env);
         defer bound.destroy(set.gpa);
-        const plan = xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .now = 1000 });
+        const plan = xv.steps.planCreate(.{ .parent = parent_global, .name = name, .child = global, .mode = mode, .uid = 0, .gid = 0, .now = 1000 });
         const scope = bound.plane.mintScope();
         var held = try bound.plane.acquirePlanGuards(&plan, scope, false);
         defer held.release(set.gpa);
@@ -824,7 +832,7 @@ pub fn createFile(set: *MetaSet, parent_global: u64, name: []const u8) !u64 {
         return global;
     }
     const t = try set.begin(@src());
-    _ = economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = economy.S.IFREG | 0o644, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global }) catch |e| {
+    _ = economy.stageCreate(t, .{ .name_key = set.nameKey(), .now = 1000, .parent = parent, .parent_value = pv, .name = name, .mode = mode, .uid = 0, .gid = 0, .local_ino = child, .global_ino = global }) catch |e| {
         set.abandon(t);
         return e;
     };
@@ -895,6 +903,34 @@ test "a two-member set: format → open (either URI order) → 200 creates sprea
         try testing.expect(try present(set, fresh));
         try testing.expectEqual(@as(u64, 201), set.allocatedInos());
     }
+}
+
+test "a child of a directory this mount leases outside the native slot mints on the directory's member (charter §5.5's affinity ranks above §5.4's round-robin): 100 creates under such a directory mint ZERO cross-owner intents — each a single-member entry, no intent barriers; the root's children still spread over both members" {
+    const gpa = testing.allocator;
+    const s = try TestSet.create(gpa, "home", 2);
+    defer s.destroy();
+    const set = try s.open();
+    defer set.close();
+    var nb: [16]u8 = undefined;
+    // The root's children (the native slot) spread: both members take some.
+    var dirs: [8]u64 = undefined;
+    var on: [2]u32 = @splat(0);
+    for (&dirs, 0..) |*d, i| {
+        d.* = try createChild(set, inos.ROOT_INO, try std.fmt.bufPrint(&nb, "d{d}", .{i}), economy.S.IFDIR | 0o755);
+        on[set.volumeIndexOfSlot(route_table.slotOf(d.*))] += 1;
+    }
+    try testing.expect(on[0] > 0 and on[1] > 0);
+    // Under each directory: every child on the directory's member, no intent.
+    const minted0 = xv.intent.stats.xv_cross_owner_intents_minted.load();
+    for (dirs, 0..) |d, di| {
+        const home = set.volumeIndexOfSlot(route_table.slotOf(d));
+        for (0..100 / dirs.len + 1) |i| {
+            const c = try createFile(set, d, try std.fmt.bufPrint(&nb, "f{d}.{d}", .{ di, i }));
+            try testing.expectEqual(home, set.volumeIndexOfSlot(route_table.slotOf(c)));
+            try testing.expect(try present(set, c));
+        }
+    }
+    try testing.expectEqual(minted0, xv.intent.stats.xv_cross_owner_intents_minted.load());
 }
 
 test "a refs range always merges every slot tree: one volume's references owned by inos in three slots on two members come back together, in key order, through the volume range and through one block's range" {

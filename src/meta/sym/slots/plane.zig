@@ -1290,6 +1290,23 @@ pub const Plane = struct {
 
     // ---- the mint policy (the set's `allocateIno`) ----
 
+    /// Does a child of `parent_slot` (a slot this volume hosts) mint on
+    /// THIS volume rather than on the set's round-robin pick? Charter
+    /// §5.5's parent affinity ranks above §5.4's member round-robin
+    /// (decision 0003 §AA.1): a child on another member than its parent
+    /// is a cross-owner intent — two device barriers per create, unlink,
+    /// rename — where one member's single entry would do. Yes iff the
+    /// parent is outside the native slot (`/` and the control records:
+    /// the root's children are what spreads a set over its members) and,
+    /// on an armed volume, this mount leases it (a foreign directory's
+    /// child mints in the creator's rotor, §5.5).
+    pub fn homesChildren(self: *Plane, parent_slot: u16) bool {
+        if (self.be.stamp.native_slot == parent_slot) return false;
+        if (!self.armed) return true;
+        const pv = self.table.view(parent_slot);
+        return pv.leasedBy(self.me) and pv.state != .releasing;
+    }
+
     /// The slot a child of `parent_slot` mints into on this volume: the
     /// gather arm first, then `mint_choice` over the rotor; null = the
     /// caller's rotor (an unarmed plane).

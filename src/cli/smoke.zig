@@ -6792,6 +6792,26 @@ const frozen_after_abort_s: u64 = frozen_check_s;
 /// bound); past it the row fails rather than hang.
 const frozen_writeback_wait_ns: u64 = 120 * std.time.ns_per_s;
 
+/// The first STOPPED task on the host other than `except` (`/proc/<pid>/stat`
+/// state `T`/`t`), or null: a host-wide sync waits on every FUSE server, so
+/// another frozen one (another row's, another run's) would be what the
+/// frozen-daemon row measures.
+fn otherStoppedTask(io: Io, except: linux.pid_t) !?linux.pid_t {
+    var proc_dir = try Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true });
+    defer proc_dir.close(io);
+    var it = proc_dir.iterate();
+    while (try it.next(io)) |e| {
+        const pid = std.fmt.parseInt(linux.pid_t, e.name, 10) catch continue;
+        if (pid == except) continue;
+        var pb: [64]u8 = undefined;
+        var buf: [512]u8 = undefined;
+        const text = Io.Dir.cwd().readFile(io, std.fmt.bufPrint(&pb, "/proc/{d}/stat", .{pid}) catch continue, &buf) catch continue;
+        const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse continue;
+        if (close + 2 < text.len and (text[close + 2] == 'T' or text[close + 2] == 't')) return pid;
+    }
+    return null;
+}
+
 /// Does `/proc/<pid>/stack` name `needle` — a kernel function the task is
 /// blocked in (root reads it)?
 fn stackHas(pid: linux.pid_t, needle: []const u8) bool {
@@ -6833,6 +6853,14 @@ test "smoke: A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (0003 §Z) — format
         defer gpa.free(out);
         try testing.expect(std.mem.indexOf(u8, out, "written") != null);
     }
+    // A host-wide sync waits on EVERY FUSE server: another frozen one would
+    // be what this row measures.
+    if (try otherStoppedTask(io, rig.child_pid)) |pid| {
+        try rig.umount();
+        _ = try rig.waitChild();
+        var detail: [160]u8 = undefined;
+        return testkit.skip(@src(), .external_interference, std.fmt.bufPrint(&detail, "task {d} is stopped on this host: a host-wide sync would wait on it, not on this row's frozen daemon", .{pid}) catch "another task is stopped on this host");
+    }
     // Freeze: every thread of the daemon stops; nothing answers the kernel.
     _ = linux.kill(rig.child_pid, .STOP);
     var resumed = false;
@@ -6859,12 +6887,18 @@ test "smoke: A FROZEN DAEMON NEVER HANGS THE HOST'S `sync` (0003 §Z) — format
         sleepMs(20);
     }
     if (returned_at == null) {
-        // Only the daemon's answer frees a sync whose request it was handed
-        // (the wait is uninterruptible): resume it, then fail.
+        // Only an answer frees a sync whose request a server was handed (the
+        // wait is uninterruptible): resume ours, then fail — waiting on the
+        // sync only as long as ours can hold it (a foreign frozen server
+        // that froze after the census holds it longer; it is left behind).
+        std.debug.print("\nsmoke[frozen]: the host-wide sync was still held {d} ms after it began waiting on the frozen mount (spawned {d} ms before that; waiting seen: {})\n", .{ (clock.monotonicNs() - (waiting_at orelse spawned_at)) / std.time.ns_per_ms, ((waiting_at orelse spawned_at) - spawned_at) / std.time.ns_per_ms, waiting_at != null });
         _ = linux.kill(rig.child_pid, .CONT);
         resumed = true;
-        _ = try sync_child.wait(io);
-        std.debug.print("\nsmoke[frozen]: the host-wide sync was still held {d} ms after it began waiting on the frozen mount (spawned {d} ms before that; waiting seen: {})\n", .{ (clock.monotonicNs() - (waiting_at orelse spawned_at)) / std.time.ns_per_ms, ((waiting_at orelse spawned_at) - spawned_at) / std.time.ns_per_ms, waiting_at != null });
+        const freed_by = clock.monotonicNs() + frozen_after_abort_s * std.time.ns_per_s;
+        while (alive(sync_pid) and clock.monotonicNs() < freed_by) sleepMs(20);
+        if (alive(sync_pid)) {
+            std.debug.print("smoke[frozen]: the sync still waits after the daemon resumed — on another server (left behind)\n", .{});
+        } else _ = try sync_child.wait(io);
         return error.HostSyncHeld;
     }
     _ = try sync_child.wait(io);

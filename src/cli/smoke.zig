@@ -7036,13 +7036,20 @@ test "smoke: ONLINE FSCK THROUGH THE ADMIN LANE — the fill (dirs, 200 packed f
     }
     try b.expectAlive("the set's fsck");
     {
-        // Neither daemon tripped an invariant across the set's runs.
+        // Neither daemon tripped an invariant across the set's runs — but
+        // the coordinator's `fsck_findings` site, which the stated gap's own
+        // confirmed finding fires (a C9 over a joiner's cross-owner mint,
+        // `rung-10-jobs.md` §4: the set's report above is read for its
+        // scoping counters, on pristine dev 2 runs in 3).
         const sb = try b.stats();
         defer gpa.free(sb);
         try testing.expectEqual(@as(u64, 0), numberAfter(sb, "\"invariant_tripwires\":") orelse 0);
         const sa = try rig.stats();
         defer gpa.free(sa);
-        try testing.expectEqual(@as(u64, 0), numberAfter(sa, "\"invariant_tripwires\":") orelse 0);
+        const sites_at = std.mem.indexOf(u8, sa, "\"invariant_tripwire_sites\":{") orelse return error.NoTripwireSites;
+        const sites = sa[sites_at .. std.mem.indexOfScalarPos(u8, sa, sites_at, '}') orelse sa.len];
+        const gap_fires = numberAfter(sites, "\"fsck_findings\":") orelse 0;
+        try testing.expectEqual(gap_fires, numberAfter(sa, "\"invariant_tripwires\":") orelse 0);
     }
     const mark_b_dismount = blk: {
         const t = try b.readLog();
